@@ -11,49 +11,48 @@
 class ReplayManager : public QObject
 {
     Q_OBJECT
-    // Define properties if you want to track status in QML
-    Q_PROPERTY(bool isRecording READ isRecording NOTIFY isRecordingChanged)
-    Q_PROPERTY(int trackCount READ trackCount WRITE setTrackCount NOTIFY trackCountChanged)
-    Q_PROPERTY(QStringList trackUrls READ trackUrls NOTIFY trackUrlsChanged)
 
 public:
     explicit ReplayManager(QObject *parent = nullptr);
     ~ReplayManager();
 
-    // Property Accessors
-    int trackCount() const;
-    QStringList trackUrls() const;
-    bool isRecording() const;
+    // Engine Controls used by UIManager
+    void startRecording();
+    void stopRecording();
+    bool isRecording() const { return m_isRecording; }
 
-    // QML Invokable Methods
-    Q_INVOKABLE void setTrackCount(int count);
-    Q_INVOKABLE void setTrackUrl(int index, const QString &url);
-    Q_INVOKABLE void startRecording(const QString &path);
-    Q_INVOKABLE void stopRecording();
-    Q_INVOKABLE void applyTrackSource(int index, const QString &url);
+    // Configuration Setters (invoked by UIManager)
+    void setStreamUrls(const QStringList &urls) { m_trackUrls = urls; }
+    void setOutputDirectory(const QString &path) { m_outputDir = path; }
+    void setBaseFileName(const QString &name) { m_baseFileName = name; }
+    void updateTrackUrl(int index, const QString &url);
+
+    // Getters
+    QStringList getStreamUrls() const { return m_trackUrls; }
+    QString getOutputDirectory() const { return m_outputDir; }
+    QString getBaseFileName() const { return m_baseFileName; }
 
     int64_t currentStreamTimeMs();
 signals:
-    void trackCountChanged();
-    void trackUrlsChanged();
-    void isRecordingChanged();
-    void errorOccurred(QString message);
     void masterPulse(int64_t frameIndex, int64_t wallClockUs);
 
 private slots:
     void onTimerTick();
 
 private:
-    QTimer* m_heartbeat;
-    int64_t m_globalFrameCount = 0;
-    RecordingClock* m_clock;
+    QString getFullOutputPath();
 
-    Muxer *m_muxer;
     bool m_isRecording = false;
-    QStringList m_trackUrls;
-    QMap<int, StreamWorker*> m_workers;
+    int64_t m_globalFrameCount = 0;
 
-    void startWorker(int index, const QString &url);
+    QStringList m_trackUrls;
+    QString m_outputDir;
+    QString m_baseFileName;
+
+    QTimer* m_heartbeat;
+    Muxer* m_muxer;
+    RecordingClock* m_clock;
+    QList<StreamWorker*> m_workers;
 };
 
 #endif // REPLAYMANAGER_H

@@ -1,7 +1,9 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QQuickStyle>
 #include "recorder_engine/replaymanager.h"
+#include "uimanager.h"
 
 #include <QString>
 using namespace Qt::StringLiterals;
@@ -10,24 +12,26 @@ int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
 
-    ReplayManager manager;
+    ReplayManager replayManager;
+    UIManager uiManager(&replayManager);
 
-    QQmlApplicationEngine engine;
+    uiManager.loadSettings();
 
-    // This makes the 'replayManager' object globally available in QML
-    engine.rootContext()->setContextProperty("replayManager", &manager);
+    QQmlApplicationEngine qmlEngine;
+
+    // This makes the 'uiManager' object globally available in QML
+    qmlEngine.rootContext()->setContextProperty("uiManager", &uiManager);
 
     QObject::connect(
-        &engine,
+        &qmlEngine,
         &QQmlApplicationEngine::objectCreationFailed,
         &app,
         []() { QCoreApplication::exit(-1); },
         Qt::QueuedConnection);
 
-    engine.loadFromModule("OpenLiveReplay", "Main");
-
-    /*const QUrl url(u"qrc:/ReplaySystem/Main.qml"_s);
-    engine.load(url);*/
+    //const QUrl url(QStringLiteral("qrc:/Main.qml"));
+    //qmlEngine.loadFromModule("OpenLiveReplay", "Main");
+    qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
 
     return app.exec();
 }

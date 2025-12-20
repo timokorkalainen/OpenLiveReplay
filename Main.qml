@@ -1,96 +1,154 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Qt.labs.platform 1.1
+import QtQuick.Controls.Universal 2.15 // Necessary for attached properties
 
-Window {
+ApplicationWindow {
+    visible: true
     width: 800
     height: 600
-    visible: true
-    title: "Multi-Track Replay System"
-    color: "#1e1e1e" // Professional dark theme
+    title: "OpenLiveReplay"
+
+    // FORCE THE THEME HERE
+    Universal.theme: Universal.Dark
+    Universal.accent: Universal.Red
+
+    FolderDialog {
+        id: folderDialog
+        title: "Select Recording Folder"
+        currentFolder: uiManager.saveLocation ? "file://" + uiManager.saveLocation : ""
+        onAccepted: {
+            uiManager.setSaveLocationFromUrl(folderDialog.folder)
+        }
+    }
 
     ColumnLayout {
-        anchors.fill: parent; anchors.margins: 30; spacing: 20
+        anchors.fill: parent
+        anchors.margins: 20
+        spacing: 15
 
-        // 1. TRACK COUNT SELECTOR
-        RowLayout {
-            Label { text: "NUMBER OF TRACKS:"; color: "white"; font.bold: true }
-            SpinBox {
-                id: countSelector
-                from: 1; to: 16
-                value: 4
-                enabled: !replayManager.isRecording // LOCK during recording
-                onValueModified: replayManager.setTrackCount(value)
+        Text {
+            text: "Session Settings"
+            font.bold: true
+            color: "#eee"
+        }
+
+        GridLayout {
+            columns: 3 // Changed to 3 to fit the Browse button
+            Layout.fillWidth: true
+
+
+            Label { text: "Project Name"; }
+
+            TextField {
+                Layout.fillWidth: true
+                Layout.columnSpan: 2 // Span across to the end
+                text: uiManager.fileName
+                onEditingFinished: uiManager.fileName = text
+            }
+
+            Label { text: "Save Location"; }
+
+            TextField {
+                id: pathField
+                Layout.fillWidth: true
+                text: uiManager.saveLocation
+                placeholderText: "Select folder..."
+                onEditingFinished: uiManager.saveLocation = text
+            }
+
+            Button {
+                text: "Browse..."
+                onClicked: folderDialog.open()
             }
         }
 
-        // 2. DYNAMIC INPUT LIST
-        ScrollView {
-            Layout.fillWidth: true; Layout.fillHeight: true
-            clip: true
+        // --- Stream URLs Header with Add Button ---
+        RowLayout {
+            Layout.fillWidth: true
+            Text {
+                text: "Input Sources"
+                Layout.fillWidth: true
+                color: "#eee"
+                font.bold: true
+            }
 
-            ColumnLayout {
-                width: parent.width
+            Button {
+                text: "+ Add Stream"
+                onClicked: uiManager.addStream()
+                enabled: !uiManager.isRecording
+            }
+        }
+
+        ListView {
+            id: streamList
+            Layout.fillHeight: true
+            Layout.fillWidth: true
+            clip: true
+            model: uiManager.streamUrls
+            spacing: 8
+
+            delegate: RowLayout {
+                width: streamList.width
                 spacing: 10
 
-                Repeater {
-                    model: replayManager.trackUrls
+                Label {
+                    text: (index + 1) + ":"
+                    width: 20
+                }
 
-                    delegate: RowLayout {
-                        width: parent.width
-                        spacing: 10
+                TextField {
+                    Layout.fillWidth: true
+                    text: modelData
+                    placeholderText: "rtmp://..."
+                    // We use the specific updateUrl method to handle C++ indexing
+                    onEditingFinished: uiManager.updateUrl(index, text)
+                }
 
-                        Rectangle {
-                            width: 50; height: 35; color: "#222"; radius: 4
-                            Text { anchors.centerIn: parent; text: "CH" + (index + 1); color: "white"; font.bold: true }
-                        }
-
-                        TextField {
-                            id: urlInput
-                            Layout.fillWidth: true
-                            placeholderText: "Stream URL..."
-                            text: modelData
-                            color: "white"
-                            font.family: "Monospace"
-                            background: Rectangle { color: "#1a1a1a"; border.color: "#333"; radius: 4 }
-                        }
-
-                        Button {
-                            text: "APPLY"
-                            // Layout hint for professional look
-                            implicitWidth: 80
-                            implicitHeight: 35
-
-                            // Visual feedback: Highlight if the URL in the box differs from what ReplayManager has
-                            palette.buttonText: urlInput.text !== modelData ? "#4CAF50" : "white"
-
-                            onClicked: {
-                                replayManager.applyTrackSource(index, urlInput.text)
-                                urlInput.focus = false // Clear focus to show it was accepted
-                            }
-                        }
-
-                        // Status Indicator
-                        Rectangle {
-                            width: 10; height: 10; radius: 5
-                            color: (replayManager.isRecording && urlInput.text === modelData && urlInput.text !== "") ? "#4CAF50" : "#333"
-                            ToolTip.visible: ma.containsMouse
-                            ToolTip.text: "Active stream"
-                            MouseArea { id: ma; anchors.fill: parent; hoverEnabled: true }
-                        }
-                    }
+                Button {
+                    text: "×"
+                    width: 30
+                    flat: true
+                    onClicked: uiManager.removeStream(index)
+                    visible: !uiManager.isRecording
                 }
             }
         }
 
-        // 3. MASTER START/STOP
-        Button {
-            Layout.fillWidth: true; Layout.preferredHeight: 60
-            text: replayManager.isRecording ? "STOP" : "START RECORDING (" + countSelector.value + " TRACKS)"
-            onClicked: {
-                if (replayManager.isRecording) replayManager.stopRecording()
-                else replayManager.startRecording("file:///Users/timo.korkalainen/Desktop/replay.mkv")
+        // --- Bottom Action Bar ---
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 10
+
+            Button {
+                text: "Save Config"
+                onClicked: uiManager.saveSettings()
             }
+
+            Item { Layout.fillWidth: true } // Spacer
+
+            Button {
+                id: recordButton
+                text: uiManager.isRecording ? "STOP RECORDING" : "START RECORDING"
+                padding: 15
+
+                // Red/Green Toggle Logic
+                background: Rectangle {
+                    color: uiManager.isRecording ? "#d32f2f" : "#2e7d32"
+                }
+
+                contentItem: Text {
+                    text: recordButton.text
+                }
+
+                onClicked: uiManager.isRecording ? uiManager.stopRecording() : uiManager.startRecording()
+            }
+        }
+
+        Text {
+            text: uiManager.isRecording ? "● RECORDING LIVE" : "IDLE"
+            color: uiManager.isRecording ? "#ff5252" : "#666"
         }
     }
 }

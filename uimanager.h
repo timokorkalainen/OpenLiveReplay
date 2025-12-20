@@ -1,0 +1,65 @@
+#ifndef UIMANAGER_H
+#define UIMANAGER_H
+
+#include <QObject>
+#include <QString>
+#include <QUrl>
+#include "settingsmanager.h"
+#include "recorder_engine/replaymanager.h"
+
+class UIManager : public QObject {
+    Q_OBJECT
+    // These allow QML to bind to your settings automatically
+    Q_PROPERTY(QStringList streamUrls READ streamUrls WRITE setStreamUrls NOTIFY streamUrlsChanged)
+    Q_PROPERTY(QString saveLocation READ saveLocation WRITE setSaveLocation NOTIFY saveLocationChanged)
+    Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
+    Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
+
+public:
+    explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
+
+    // Getters for QML
+    QStringList streamUrls() const;
+    QString saveLocation() const;
+    QString fileName() const;
+    bool isRecording() const;
+
+    // Setters
+    void setStreamUrls(const QStringList &urls);
+    void setSaveLocation(const QString &path);
+    void setFileName(const QString &name);
+
+    // Logic
+    Q_INVOKABLE void startRecording();
+    Q_INVOKABLE void stopRecording();
+    Q_INVOKABLE void updateUrl(int index, const QString &url);
+    Q_INVOKABLE void loadSettings();
+    Q_INVOKABLE void addStream();             // Increases stream count
+    Q_INVOKABLE void removeStream(int index); // (Optional) for better UX
+    Q_INVOKABLE void saveSettings();          // Manual save trigger
+    Q_INVOKABLE void setSaveLocationFromUrl(const QUrl &folderUrl);
+
+signals:
+    void streamUrlsChanged();
+    void saveLocationChanged();
+    void fileNameChanged();
+    void recordingStatusChanged();
+
+public slots:
+    // Called when the user clicks "Record" in the UI
+    void onStartRequested();
+
+    // Called when the user clicks "Stop"
+    void onStopRequested();
+
+    // Called when a URL is changed in the UI text fields
+    void updateStreamUrl(int index, const QString& url);
+
+private:
+    ReplayManager* m_replayManager;
+    AppSettings m_currentSettings;
+    SettingsManager* m_settingsManager;
+    const QString m_configPath = "config.json";
+};
+
+#endif // UIMANAGER_H

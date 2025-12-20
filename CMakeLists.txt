@@ -4,7 +4,7 @@ project(OpenLiveReplay VERSION 0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2)
 
 qt_standard_project_setup(REQUIRES 6.8)
 
@@ -19,6 +19,7 @@ set(FFMPEG_LIBS
     avutil
     swscale
 )
+set(CMAKE_AUTORCC ON) # This tells CMake to handle .qrc files
 
 qt_add_executable(appOpenLiveReplay
     main.cpp
@@ -32,8 +33,11 @@ qt_add_qml_module(appOpenLiveReplay
         SOURCES recorder_engine/replaymanager.h
         SOURCES recorder_engine/muxer.h recorder_engine/muxer.cpp
         SOURCES recorder_engine/streamworker.h recorder_engine/streamworker.cpp
-        SOURCES
         SOURCES recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
+        SOURCES settingsmanager.h settingsmanager.cpp
+        SOURCES uimanager.h uimanager.cpp
+        RESOURCES qtquickcontrols2.conf
+        RESOURCES resources.qrc
 )
 
 # Qt for iOS sets MACOSX_BUNDLE_GUI_IDENTIFIER automatically since Qt 6.1.
@@ -55,6 +59,7 @@ target_link_libraries(appOpenLiveReplay
     PRIVATE Qt6::Quick
     PRIVATE Qt6::Concurrent
     PRIVATE Qt6::Multimedia
+    Qt6::QuickControls2
     ${FFMPEG_LIBS}
 )
 
