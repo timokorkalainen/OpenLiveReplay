@@ -200,6 +200,10 @@ void StreamWorker::captureLoop() {
 bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl currentUrl) {
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "stimeout", "100000", 0); // 100ms timeout for network
+    av_dict_set(&opts, "rtmp_buffer", "5000", 0); // Buffer in milliseconds
+    av_dict_set(&opts, "rw_timeout", "5000000", 0); // 5 second timeout for "stalled" streams
+    av_dict_set(&opts, "recv_buffer_size", "15048000", 0);
+    av_dict_set(&opts, "rtmp_live", "live", 0);
 
     if (avformat_open_input(inCtx, currentUrl.toString().toUtf8().constData(), nullptr, &opts) < 0) return false;
 
@@ -214,6 +218,8 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
 
     *decCtx = avcodec_alloc_context3(decoder);
     avcodec_parameters_to_context(*decCtx, (*inCtx)->streams[videoStreamIdx]->codecpar);
+
+    if (opts) av_dict_free(&opts);
     return avcodec_open2(*decCtx, decoder, nullptr) >= 0;
 }
 
