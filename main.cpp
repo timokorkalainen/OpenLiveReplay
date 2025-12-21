@@ -4,6 +4,7 @@
 #include <QQuickStyle>
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
+#include "playback/frameprovider.h"
 
 #include <QString>
 using namespace Qt::StringLiterals;
@@ -17,6 +18,8 @@ int main(int argc, char *argv[])
 
     uiManager.loadSettings();
 
+    qmlRegisterType<FrameProvider>("Recorder.Types", 1, 0, "FrameProvider");
+
     QQmlApplicationEngine qmlEngine;
 
     // This makes the 'uiManager' object globally available in QML
@@ -29,8 +32,6 @@ int main(int argc, char *argv[])
         []() { QCoreApplication::exit(-1); },
         Qt::QueuedConnection);
 
-    //const QUrl url(QStringLiteral("qrc:/Main.qml"));
-    //qmlEngine.loadFromModule("OpenLiveReplay", "Main");
     qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
 
     return app.exec();

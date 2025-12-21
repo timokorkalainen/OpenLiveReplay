@@ -6,6 +6,9 @@
 #include <QUrl>
 #include "settingsmanager.h"
 #include "recorder_engine/replaymanager.h"
+#include "playback/frameprovider.h"
+#include "playback/playbackworker.h"
+#include "playback/playbacktransport.h"
 
 class UIManager : public QObject {
     Q_OBJECT
@@ -14,6 +17,7 @@ class UIManager : public QObject {
     Q_PROPERTY(QString saveLocation READ saveLocation WRITE setSaveLocation NOTIFY saveLocationChanged)
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
+    Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -23,11 +27,14 @@ public:
     QString saveLocation() const;
     QString fileName() const;
     bool isRecording() const;
+    QVariantList playbackProviders() const;
 
     // Setters
     void setStreamUrls(const QStringList &urls);
     void setSaveLocation(const QString &path);
     void setFileName(const QString &name);
+
+    void refreshProviders();
 
     // Logic
     Q_INVOKABLE void startRecording();
@@ -39,11 +46,17 @@ public:
     Q_INVOKABLE void saveSettings();          // Manual save trigger
     Q_INVOKABLE void setSaveLocationFromUrl(const QUrl &folderUrl);
 
+    //Playback
+    Q_INVOKABLE void seekPlayback(int64_t ms);
+
 signals:
     void streamUrlsChanged();
     void saveLocationChanged();
     void fileNameChanged();
     void recordingStatusChanged();
+    void playbackProvidersChanged();
+    void recordingStarted();  // Must be lowerCamelCase
+    void recordingStopped();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -60,6 +73,9 @@ private:
     AppSettings m_currentSettings;
     SettingsManager* m_settingsManager;
     const QString m_configPath = "config.json";
+    PlaybackWorker* m_playbackWorker = nullptr;
+    QList<FrameProvider*> m_providers;
+    PlaybackTransport *m_transport;
 };
 
 #endif // UIMANAGER_H

@@ -38,6 +38,10 @@ qt_add_qml_module(appOpenLiveReplay
         SOURCES uimanager.h uimanager.cpp
         RESOURCES qtquickcontrols2.conf
         RESOURCES resources.qrc
+        SOURCES playback/playbackworker.h playback/playbackworker.cpp
+        SOURCES playback/frameprovider.h playback/frameprovider.cpp
+        QML_FILES PreviewWindow.qml
+        SOURCES playback/playbacktransport.h playback/playbacktransport.cpp
 )
 
 # Qt for iOS sets MACOSX_BUNDLE_GUI_IDENTIFIER automatically since Qt 6.1.

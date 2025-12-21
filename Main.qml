@@ -3,6 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Qt.labs.platform 1.1
 import QtQuick.Controls.Universal 2.15 // Necessary for attached properties
+import Recorder.Types 1.0
 
 ApplicationWindow {
     visible: true
@@ -150,5 +151,32 @@ ApplicationWindow {
             text: uiManager.isRecording ? "● RECORDING LIVE" : "IDLE"
             color: uiManager.isRecording ? "#ff5252" : "#666"
         }
+    }
+
+    PreviewWindow {
+        id: monitorWindow
+    }
+
+    Connections {
+        target: uiManager
+
+        // Signal is "recordingStarted", so handler is "onRecordingStarted"
+        function onRecordingStarted() {
+            console.log("UI: Recording signal received");
+            monitorWindow.visible = true;
+            startTimer.start();
+        }
+
+        // Signal is "recordingStopped", so handler is "onRecordingStopped"
+        function onRecordingStopped() {
+            console.log("UI: Stop signal received");
+            // monitorWindow.visible = false; // Optional: keep it open to review
+        }
+    }
+
+    Timer {
+        id: startTimer
+        interval: 500
+        onTriggered: monitorWindow.refresh()
     }
 }

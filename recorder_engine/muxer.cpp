@@ -52,6 +52,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount) {
     }
 
     if (avformat_write_header(m_outCtx, &opts) < 0) return false;
+    avio_flush(m_outCtx->pb); // Forces the EBML header to be visible to the reader
 
     m_lastDts = new QMap<int, int64_t>();
 
@@ -76,6 +77,8 @@ void Muxer::writePacket(AVPacket* pkt) {
     if (ret < 0) {
         av_packet_free(&localPkt);
     }
+
+    avio_flush(m_outCtx->pb);
 }
 
 AVStream* Muxer::getStream(int index) {

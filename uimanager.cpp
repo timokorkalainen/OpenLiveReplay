@@ -3,6 +3,8 @@
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
     : QObject(parent), m_replayManager(engine) {
     m_settingsManager = new SettingsManager();
+    m_transport = new PlaybackTransport(this);
+    refreshProviders();
 }
 
 QStringList UIManager::streamUrls() const { return m_currentSettings.streamUrls; }
@@ -14,6 +16,7 @@ void UIManager::setStreamUrls(const QStringList &urls) {
     if (m_currentSettings.streamUrls != urls) {
         m_currentSettings.streamUrls = urls;
         m_replayManager->setStreamUrls(urls);
+        refreshProviders();
         emit streamUrlsChanged();
     }
 }
@@ -42,13 +45,44 @@ void UIManager::setFileName(const QString &name) {
 }
 
 void UIManager::startRecording() {
+    refreshProviders();
     m_replayManager->startRecording();
+
+    // 1. Initialize the Playback Worker with our providers
+    if (m_playbackWorker) {
+        m_playbackWorker->stop();
+        delete m_playbackWorker;
+    }
+
+    m_playbackWorker = new PlaybackWorker(m_providers, m_transport, this);
+
+    // 2. Point it to the file being recorded
+    QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
+    m_playbackWorker->openFile(filePath);
+
+    m_playbackWorker->start();
+    m_transport->seek(0);
+    m_transport->setPlaying(true);
+
     emit recordingStatusChanged();
+    emit recordingStarted();
 }
 
 void UIManager::stopRecording() {
     m_replayManager->stopRecording();
+    m_transport->setPlaying(false);
+    if (m_playbackWorker) {
+        m_playbackWorker->stop();
+    }
+
     emit recordingStatusChanged();
+    emit recordingStopped();
+}
+
+void UIManager::seekPlayback(int64_t ms) {
+    if (m_transport) {
+        m_transport->seek(ms);
+    }
 }
 
 void UIManager::updateUrl(int index, const QString &url) {
@@ -122,3 +156,23 @@ void UIManager::updateStreamUrl(int index, const QString& url) {
     m_settingsManager->save(m_configPath, current);
 }
 
+QVariantList UIManager::playbackProviders() const {
+    QVariantList list;
+    for (auto* p : m_providers) {
+        list.append(QVariant::fromValue(p));
+    }
+    return list;
+}
+
+void UIManager::refreshProviders() {
+    // Cleanup old providers
+    qDeleteAll(m_providers);
+    m_providers.clear();
+
+    // Create a provider for every stream URL
+    int count = m_replayManager->getStreamUrls().size();
+    for (int i = 0; i < count; ++i) {
+        m_providers.append(new FrameProvider(this));
+    }
+    emit playbackProvidersChanged();
+}
