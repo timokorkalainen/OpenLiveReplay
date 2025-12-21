@@ -1,5 +1,7 @@
 *.DS_Store
 build/
+*.qmlls.ini
+launch.json
 
 # C++ objects and libs
 *.slo
