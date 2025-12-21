@@ -2,8 +2,12 @@
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
     : QObject(parent), m_replayManager(engine) {
+    connect(m_replayManager, &ReplayManager::masterPulse,
+            this, &UIManager::onRecorderPulse,
+            Qt::QueuedConnection);
     m_settingsManager = new SettingsManager();
     m_transport = new PlaybackTransport(this);
+    m_transport->seek(0);
     refreshProviders();
 }
 
@@ -175,4 +179,26 @@ void UIManager::refreshProviders() {
         m_providers.append(new FrameProvider(this));
     }
     emit playbackProvidersChanged();
+}
+
+int64_t UIManager::recordedDurationMs() {
+    // Get this from your Master Clock / Recording Engine
+    return m_replayManager->getElapsedMs();
+}
+
+int64_t UIManager::scrubPosition() {
+
+    if(!m_transport) return 0;
+    if(!m_replayManager) return 0;
+
+    return qMin(qMax(0, m_transport->currentPos()), m_replayManager->getElapsedMs());
+}
+
+void UIManager::scrubToLive() {
+    m_transport->seek(m_replayManager->getElapsedMs()-1);
+}
+
+void UIManager::onRecorderPulse(int64_t elapsed, int64_t frameCount) {
+    emit recordedDurationMsChanged();
+    emit scrubPositionChanged();
 }

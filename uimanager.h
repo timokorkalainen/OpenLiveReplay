@@ -18,6 +18,9 @@ class UIManager : public QObject {
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
+    Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
+    Q_PROPERTY(int64_t scrubPosition READ scrubPosition NOTIFY scrubPositionChanged)
+    Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -28,6 +31,9 @@ public:
     QString fileName() const;
     bool isRecording() const;
     QVariantList playbackProviders() const;
+    int64_t recordedDurationMs();
+    int64_t scrubPosition();
+    PlaybackTransport* transport() const { return m_transport; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -45,9 +51,11 @@ public:
     Q_INVOKABLE void removeStream(int index); // (Optional) for better UX
     Q_INVOKABLE void saveSettings();          // Manual save trigger
     Q_INVOKABLE void setSaveLocationFromUrl(const QUrl &folderUrl);
+    Q_INVOKABLE void scrubToLive();
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
+
 
 signals:
     void streamUrlsChanged();
@@ -55,8 +63,10 @@ signals:
     void fileNameChanged();
     void recordingStatusChanged();
     void playbackProvidersChanged();
-    void recordingStarted();  // Must be lowerCamelCase
+    void recordingStarted();
     void recordingStopped();
+    void recordedDurationMsChanged();
+    void scrubPositionChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -67,6 +77,8 @@ public slots:
 
     // Called when a URL is changed in the UI text fields
     void updateStreamUrl(int index, const QString& url);
+
+    void onRecorderPulse(int64_t elapsed, int64_t frameCount);
 
 private:
     ReplayManager* m_replayManager;

@@ -101,3 +101,8 @@ QString ReplayManager::getFullOutputPath() {
     // Combines directory and filename safely for the current OS
     return dir.absoluteFilePath(m_baseFileName + ".mkv");
 }
+
+int64_t ReplayManager::getElapsedMs() {
+    if(!m_clock) return -1;
+    return m_clock->elapsedMs();
+}

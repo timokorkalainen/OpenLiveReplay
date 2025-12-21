@@ -19,6 +19,7 @@ int main(int argc, char *argv[])
     uiManager.loadSettings();
 
     qmlRegisterType<FrameProvider>("Recorder.Types", 1, 0, "FrameProvider");
+    qmlRegisterType<PlaybackTransport>("Recorder.Types", 1, 0, "PlaybackTransport");
 
     QQmlApplicationEngine qmlEngine;
 

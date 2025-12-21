@@ -5,6 +5,7 @@ PlaybackTransport::PlaybackTransport(QObject *parent)
 {
     connect(m_tickTimer, &QTimer::timeout, this, &PlaybackTransport::onTick);
     m_tickTimer->setInterval(m_timerIntervalMs);
+    m_currentPos = 0;
 }
 
 int64_t PlaybackTransport::currentPos() const {
@@ -35,6 +36,7 @@ void PlaybackTransport::setPlaying(bool playing) {
 
 void PlaybackTransport::setSpeed(double speed) {
     if (qFuzzyCompare(m_speed, speed)) return;
+    speed = qRound(speed * 100.0) / 100.0;
     m_speed = speed;
     emit speedChanged(m_speed);
 }
@@ -61,7 +63,6 @@ void PlaybackTransport::onTick() {
 
     // Apply speed multiplier to the delta
     m_currentPos += static_cast<int64_t>(elapsed * m_speed);
-
     // Bounds checking (prevent negative time)
     if (m_currentPos < 0) {
         m_currentPos = 0;

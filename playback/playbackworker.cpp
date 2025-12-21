@@ -7,12 +7,6 @@ PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackT
 {
     m_transport = transport;
     m_providers = providers;
-    // Initialize the bank based on providers passed from UIManager
-    /*for (auto* p : providers) {
-        DecoderTrack* track = new DecoderTrack();
-        track->provider = p;
-        m_decoderBank.append(track);
-    }*/
 }
 
 PlaybackWorker::~PlaybackWorker() {
@@ -35,7 +29,7 @@ void PlaybackWorker::stop() {
 }
 
 void PlaybackWorker::run() {
-    msleep(5000);
+    msleep(500);
     m_transport->seek(0);
 
     if (m_currentFilePath.isEmpty()) return;
@@ -95,8 +89,6 @@ void PlaybackWorker::run() {
 
             // Map MS to stream timebase (using the first video track as reference)
             AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
-            qDebug() << target;
-            qDebug() << vStream->time_base.num;
             int64_t seekPts = av_rescale_q(target, {1, 1000}, vStream->time_base);
 
             av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
@@ -134,8 +126,6 @@ void PlaybackWorker::run() {
                             AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
                             lastProcessedPtsMs = av_rescale_q(frame->pts, tb, {1, 1000});
 
-                            // Deliver decoded frame to GPU
-                            qDebug() << "deliver frame";
                             track->provider->deliverFrame(convertToQVideoFrame(frame));
                         }
                     }

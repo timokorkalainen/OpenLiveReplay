@@ -32,7 +32,7 @@ public:
     QString getOutputDirectory() const { return m_outputDir; }
     QString getBaseFileName() const { return m_baseFileName; }
 
-    int64_t currentStreamTimeMs();
+    int64_t getElapsedMs();
 signals:
     void masterPulse(int64_t frameIndex, int64_t wallClockUs);
 
