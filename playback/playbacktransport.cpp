@@ -5,6 +5,7 @@ PlaybackTransport::PlaybackTransport(QObject *parent)
 {
     connect(m_tickTimer, &QTimer::timeout, this, &PlaybackTransport::onTick);
     m_tickTimer->setInterval(m_timerIntervalMs);
+    m_tickTimer->setTimerType(Qt::PreciseTimer);
     m_currentPos = 0;
 }
 
@@ -26,7 +27,8 @@ void PlaybackTransport::setPlaying(bool playing) {
 
     m_isPlaying = playing;
     if (m_isPlaying) {
-        m_frameTimer.start();
+        m_playStartPos = m_currentPos;
+        m_playStartTime.start();
         m_tickTimer->start();
     } else {
         m_tickTimer->stop();
@@ -38,12 +40,20 @@ void PlaybackTransport::setSpeed(double speed) {
     if (qFuzzyCompare(m_speed, speed)) return;
     speed = qRound(speed * 100.0) / 100.0;
     m_speed = speed;
+    if (m_isPlaying) {
+        m_playStartPos = currentPos();
+        m_playStartTime.restart();
+    }
     emit speedChanged(m_speed);
 }
 
 void PlaybackTransport::seek(int64_t posMs) {
     QMutexLocker locker(&m_mutex);
     m_currentPos = qMax(int64_t(0), posMs);
+    if (m_isPlaying) {
+        m_playStartPos = m_currentPos;
+        m_playStartTime.restart();
+    }
     emit posChanged(m_currentPos);
 }
 
@@ -58,11 +68,9 @@ void PlaybackTransport::onTick() {
 
     QMutexLocker locker(&m_mutex);
 
-    // Calculate delta time in real-world ms
-    int64_t elapsed = m_frameTimer.restart();
-
-    // Apply speed multiplier to the delta
-    m_currentPos += static_cast<int64_t>(elapsed * m_speed);
+    // Calculate position from play start to avoid cumulative drift
+    int64_t elapsed = m_playStartTime.elapsed();
+    m_currentPos = m_playStartPos + static_cast<int64_t>(elapsed * m_speed);
     // Bounds checking (prevent negative time)
     if (m_currentPos < 0) {
         m_currentPos = 0;

@@ -3,7 +3,10 @@
 #include <QDateTime>
 
 StreamWorker::StreamWorker(const QString& url, int trackIndex, Muxer* muxer, RecordingClock *clock, QObject* parent)
-    : QThread(parent), m_url(url), m_trackIndex(trackIndex), m_muxer(muxer), m_sharedClock(clock) {}
+    : QThread(parent), m_url(url), m_trackIndex(trackIndex), m_muxer(muxer), m_sharedClock(clock) {
+    m_restartCapture = 0;
+    m_internalFrameCount = 0;
+}
 
 StreamWorker::~StreamWorker() { stop(); wait(); }
 
@@ -12,7 +15,11 @@ void debugTimestamp(const QString &prefix, int trackIndex) {
     qDebug() << "[" << timeStr << "] [Track" << trackIndex << "]" << prefix;
 }
 
-void StreamWorker::stop() { m_captureRunning = false; this->quit(); }
+void StreamWorker::stop() {
+    m_restartCapture = 1;
+    m_captureRunning = false;
+    this->quit();
+}
 
 int StreamWorker::ffmpegInterruptCallback(void* opaque) {
     StreamWorker* worker = static_cast<StreamWorker*>(opaque);
@@ -48,6 +55,13 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     m_internalFrameCount = frameIndex;
 
     if (!m_persistentEncCtx) return;
+
+    if (m_captureRunning && m_lastFrameEnqueueTimer.isValid()
+        && m_lastFrameEnqueueTimer.elapsed() > m_stallTimeoutMs) {
+        qDebug() << "Track" << m_trackIndex << "No frames queued. Forcing restart...";
+        m_restartCapture = 1;
+        m_captureRunning = false;
+    }
 
     if (m_restartCapture || !m_captureRunning) {
         if (m_captureFuture.isRunning()) {
@@ -145,6 +159,7 @@ void StreamWorker::captureLoop() {
         int64_t firstPacketDts = -1;
 
         m_lastPacketTimer.restart();
+        m_lastFrameEnqueueTimer.restart();
 
         while (m_captureRunning && !m_restartCapture) {
             int readResult = av_read_frame(inCtx, pkt);
@@ -202,6 +217,8 @@ void StreamWorker::captureLoop() {
                             QMutexLocker locker(&m_frameMutex);
                             m_frameQueue.enqueue(qf);
 
+                            m_lastFrameEnqueueTimer.restart();
+
                             while (m_frameQueue.size() > 1000) {
                                 auto old = m_frameQueue.dequeue();
                                 av_frame_free(&old.frame);
@@ -219,6 +236,9 @@ void StreamWorker::captureLoop() {
                     break;
                 }
                 QThread::msleep(10);
+            } else if (readResult == AVERROR(ETIMEDOUT) || readResult == AVERROR_EXIT) {
+                qDebug() << "Track" << m_trackIndex << "Timeout/Exit. Restarting...";
+                break;
             } else if (readResult == AVERROR_EOF) {
                 qDebug() << "Track" << m_trackIndex << "End of stream. Restarting...";
                 break;
@@ -266,7 +286,11 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
     (*inCtx)->interrupt_callback.callback = &StreamWorker::ffmpegInterruptCallback;
     (*inCtx)->interrupt_callback.opaque = this;
 
-    if (avformat_open_input(inCtx, currentUrl.toString().toUtf8().constData(), nullptr, &opts) < 0) {
+    int openResult = avformat_open_input(inCtx, currentUrl.toString().toUtf8().constData(), nullptr, &opts);
+    if (openResult < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(openResult, errbuf, sizeof(errbuf));
+        qDebug() << "Track" << m_trackIndex << "avformat_open_input failed:" << errbuf;
         avformat_free_context(*inCtx);
         *inCtx = nullptr;
         if (opts) av_dict_free(&opts);
@@ -275,7 +299,11 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
 
     // Keep blocking reads and rely on interrupt callback for stalls
 
-    if (avformat_find_stream_info(*inCtx, nullptr) < 0) {
+    int infoResult = avformat_find_stream_info(*inCtx, nullptr);
+    if (infoResult < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(infoResult, errbuf, sizeof(errbuf));
+        qDebug() << "Track" << m_trackIndex << "avformat_find_stream_info failed:" << errbuf;
         avformat_close_input(inCtx);
         if (opts) av_dict_free(&opts);
         return false;
@@ -284,6 +312,7 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
     const AVCodec* decoder = nullptr;
     int foundStreamIdx = av_find_best_stream(*inCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if (foundStreamIdx < 0) {
+        qDebug() << "Track" << m_trackIndex << "No video stream found.";
         avformat_close_input(inCtx);
         if (opts) av_dict_free(&opts);
         return false;
@@ -293,7 +322,11 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
     avcodec_parameters_to_context(*decCtx, (*inCtx)->streams[foundStreamIdx]->codecpar);
 
     if (opts) av_dict_free(&opts);
-    if (avcodec_open2(*decCtx, decoder, nullptr) < 0) {
+    int codecResult = avcodec_open2(*decCtx, decoder, nullptr);
+    if (codecResult < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(codecResult, errbuf, sizeof(errbuf));
+        qDebug() << "Track" << m_trackIndex << "avcodec_open2 failed:" << errbuf;
         avcodec_free_context(decCtx);
         avformat_close_input(inCtx);
         return false;

@@ -36,8 +36,10 @@ private:
     mutable QMutex m_mutex;
     QTimer *m_tickTimer;
     QElapsedTimer m_frameTimer;
+    QElapsedTimer m_playStartTime;
 
     int64_t m_currentPos = 0;
+    int64_t m_playStartPos = 0;
     double m_speed = 1.0;
     bool m_isPlaying = false;
 

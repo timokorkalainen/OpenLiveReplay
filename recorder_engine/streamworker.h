@@ -68,6 +68,7 @@ private:
     void captureLoop();
     std::atomic<bool> m_captureRunning{false};
     QElapsedTimer m_lastPacketTimer;
+    QElapsedTimer m_lastFrameEnqueueTimer;
     int m_stallTimeoutMs = 8000;
 
     static int ffmpegInterruptCallback(void* opaque);

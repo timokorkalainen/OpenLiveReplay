@@ -94,8 +94,13 @@ void ReplayManager::updateTrackUrl(int index, const QString &url) {
 void ReplayManager::onTimerTick() {
     if (!m_clock) return;
 
-    // We send the exact elapsed time from our shared clock
-    emit masterPulse(m_globalFrameCount++, m_clock->elapsedMs());
+    // Derive frame index from elapsed time to avoid drift
+    const int64_t elapsedMs = m_clock->elapsedMs();
+    const int64_t derivedFrame = (elapsedMs * 30) / 1000;
+    if (derivedFrame > m_globalFrameCount) {
+        m_globalFrameCount = derivedFrame;
+    }
+    emit masterPulse(m_globalFrameCount, elapsedMs);
 }
 
 QString ReplayManager::getFullOutputPath() {
