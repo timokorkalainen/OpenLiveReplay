@@ -1,8 +1,11 @@
 *.DS_Store
 build/
+ios_build/
+ios_build*
 *.qmlls.ini
 launch.json
 *.cache/
+
 # C++ objects and libs
 *.slo
 *.lo
