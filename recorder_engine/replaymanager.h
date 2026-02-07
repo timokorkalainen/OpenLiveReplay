@@ -23,6 +23,7 @@ public:
 
     // Configuration Setters (invoked by UIManager)
     void setStreamUrls(const QStringList &urls) { m_trackUrls = urls; }
+    void setStreamNames(const QStringList &names) { m_streamNames = names; }
     void setOutputDirectory(const QString &path) { m_outputDir = path; }
     void setBaseFileName(const QString &name) { m_baseFileName = name; }
     void setVideoWidth(int width) { m_videoWidth = width; }
@@ -32,6 +33,7 @@ public:
 
     // Getters
     QStringList getStreamUrls() const { return m_trackUrls; }
+    QStringList getStreamNames() const { return m_streamNames; }
     QString getOutputDirectory() const { return m_outputDir; }
     QString getBaseFileName() const { return m_baseFileName; }
     int getVideoWidth() const { return m_videoWidth; }
@@ -53,6 +55,7 @@ private:
     int64_t m_globalFrameCount = 0;
 
     QStringList m_trackUrls;
+    QStringList m_streamNames;
     QString m_outputDir;
     QString m_baseFileName;
     QString m_sessionFileName;

@@ -22,6 +22,10 @@ bool PlaybackTransport::isPlaying() const {
     return m_isPlaying;
 }
 
+int PlaybackTransport::fps() const {
+    return m_fps;
+}
+
 void PlaybackTransport::setPlaying(bool playing) {
     if (m_isPlaying == playing) return;
 
@@ -47,6 +51,13 @@ void PlaybackTransport::setSpeed(double speed) {
     emit speedChanged(m_speed);
 }
 
+void PlaybackTransport::setFps(int fps) {
+    if (fps <= 0) return;
+    if (m_fps == fps) return;
+    m_fps = fps;
+    emit fpsChanged(m_fps);
+}
+
 void PlaybackTransport::seek(int64_t posMs) {
     QMutexLocker locker(&m_mutex);
     m_currentPos = qMax(int64_t(0), posMs);
@@ -58,8 +69,9 @@ void PlaybackTransport::seek(int64_t posMs) {
 }
 
 void PlaybackTransport::step(int frames) {
-    // Assume 30fps for simple stepping logic (33.33ms per frame)
-    int64_t stepSize = frames * 33;
+    // Step by exact frame duration based on configured FPS
+    int fps = qMax(1, m_fps);
+    int64_t stepSize = static_cast<int64_t>(frames * (1000.0 / fps));
     seek(currentPos() + stepSize);
 }
 

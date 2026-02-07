@@ -7,7 +7,7 @@ Muxer::Muxer() {}
 
 Muxer::~Muxer() { close(); }
 
-bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps) {
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames) {
     QMutexLocker locker(&m_mutex);
 
     if (width <= 0) width = 1920;
@@ -41,6 +41,13 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
 
         // For MPEG-2, you can also set the 'closed gop' and 'fixed fps' flags in codecpar
         st->codecpar->video_delay = 0;
+
+        if (i < streamNames.size()) {
+            const QString name = streamNames[i].trimmed();
+            if (!name.isEmpty()) {
+                av_dict_set(&st->metadata, "title", name.toUtf8().constData(), 0);
+            }
+        }
     }
 
     // 3. Set Matroska specific options for Chase Play
@@ -49,6 +56,10 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     av_dict_set(&opts, "cluster_size_limit", "1M", 0);      // Flush data often
     av_dict_set(&opts, "cluster_time_limit", "100", 0); // Flush data to disk every 100ms
     av_dict_set(&opts, "live", "1", 0);                 // Signal this is a live-streamed file
+
+    // 3b. Store recording start time metadata (UTC ISO-8601)
+    const QString startIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
+    av_dict_set(&m_outCtx->metadata, "recording_start_time", startIso.toUtf8().constData(), 0);
 
     // 4. Open file and write header
     if (!(m_outCtx->oformat->flags & AVFMT_NOFILE)) {

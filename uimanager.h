@@ -14,6 +14,7 @@ class UIManager : public QObject {
     Q_OBJECT
     // These allow QML to bind to your settings automatically
     Q_PROPERTY(QStringList streamUrls READ streamUrls WRITE setStreamUrls NOTIFY streamUrlsChanged)
+    Q_PROPERTY(QStringList streamNames READ streamNames WRITE setStreamNames NOTIFY streamNamesChanged)
     Q_PROPERTY(QString saveLocation READ saveLocation WRITE setSaveLocation NOTIFY saveLocationChanged)
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
@@ -30,6 +31,7 @@ public:
 
     // Getters for QML
     QStringList streamUrls() const;
+    QStringList streamNames() const;
     QString saveLocation() const;
     QString fileName() const;
     int recordWidth() const;
@@ -43,6 +45,7 @@ public:
 
     // Setters
     void setStreamUrls(const QStringList &urls);
+    void setStreamNames(const QStringList &names);
     void setSaveLocation(const QString &path);
     void setFileName(const QString &name);
     void setRecordWidth(int width);
@@ -56,6 +59,7 @@ public:
     Q_INVOKABLE void startRecording();
     Q_INVOKABLE void stopRecording();
     Q_INVOKABLE void updateUrl(int index, const QString &url);
+    Q_INVOKABLE void updateStreamName(int index, const QString &name);
     Q_INVOKABLE void loadSettings();
     Q_INVOKABLE void addStream();             // Increases stream count
     Q_INVOKABLE void removeStream(int index); // (Optional) for better UX
@@ -70,6 +74,7 @@ public:
     QString getSettingsPath(QString fileName);
 signals:
     void streamUrlsChanged();
+    void streamNamesChanged();
     void saveLocationChanged();
     void fileNameChanged();
     void recordWidthChanged();

@@ -28,7 +28,7 @@ void ReplayManager::startRecording() {
     // 2. Initialize Muxer with timestamped filename to avoid overwrites
     const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     m_sessionFileName = m_baseFileName + "_" + timestamp;
-    if (!m_muxer->init(m_sessionFileName, m_trackUrls.size(), m_videoWidth, m_videoHeight, m_fps)) {
+    if (!m_muxer->init(m_sessionFileName, m_trackUrls.size(), m_videoWidth, m_videoHeight, m_fps, m_streamNames)) {
         qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
     }

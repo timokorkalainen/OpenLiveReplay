@@ -9,10 +9,12 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_configPath = getSettingsPath("config.json");
     m_transport = new PlaybackTransport(this);
     m_transport->seek(0);
+    m_transport->setFps(m_currentSettings.fps);
     refreshProviders();
 }
 
 QStringList UIManager::streamUrls() const { return m_currentSettings.streamUrls; }
+QStringList UIManager::streamNames() const { return m_currentSettings.streamNames; }
 QString UIManager::saveLocation() const { return m_currentSettings.saveLocation; }
 QString UIManager::fileName() const { return m_currentSettings.fileName; }
 int UIManager::recordWidth() const { return m_currentSettings.videoWidth; }
@@ -24,11 +26,35 @@ void UIManager::setStreamUrls(const QStringList &urls) {
     if (m_currentSettings.streamUrls != urls) {
         m_currentSettings.streamUrls = urls;
         m_replayManager->setStreamUrls(urls);
+        if (m_currentSettings.streamNames.size() < urls.size()) {
+            while (m_currentSettings.streamNames.size() < urls.size()) {
+                m_currentSettings.streamNames.append("");
+            }
+        } else if (m_currentSettings.streamNames.size() > urls.size()) {
+            m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, urls.size());
+        }
+        m_replayManager->setStreamNames(m_currentSettings.streamNames);
         refreshProviders();
         if (m_replayManager->isRecording()) {
             restartPlaybackWorker();
         }
         emit streamUrlsChanged();
+        emit streamNamesChanged();
+    }
+}
+
+void UIManager::setStreamNames(const QStringList &names) {
+    if (m_currentSettings.streamNames != names) {
+        m_currentSettings.streamNames = names;
+        if (m_currentSettings.streamNames.size() < m_currentSettings.streamUrls.size()) {
+            while (m_currentSettings.streamNames.size() < m_currentSettings.streamUrls.size()) {
+                m_currentSettings.streamNames.append("");
+            }
+        } else if (m_currentSettings.streamNames.size() > m_currentSettings.streamUrls.size()) {
+            m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, m_currentSettings.streamUrls.size());
+        }
+        m_replayManager->setStreamNames(m_currentSettings.streamNames);
+        emit streamNamesChanged();
     }
 }
 
@@ -78,6 +104,9 @@ void UIManager::setRecordFps(int fps) {
     if (m_currentSettings.fps != fps) {
         m_currentSettings.fps = fps;
         m_replayManager->setFps(fps);
+        if (m_transport) {
+            m_transport->setFps(fps);
+        }
         emit recordFpsChanged();
     }
 }
@@ -159,6 +188,15 @@ void UIManager::updateUrl(int index, const QString &url) {
     }
 }
 
+void UIManager::updateStreamName(int index, const QString& name) {
+    if (index >= 0 && index < m_currentSettings.streamNames.size()) {
+        m_currentSettings.streamNames[index] = name;
+        m_replayManager->setStreamNames(m_currentSettings.streamNames);
+        emit streamNamesChanged();
+        m_settingsManager->save(m_configPath, m_currentSettings);
+    }
+}
+
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         // Apply to engine
@@ -168,11 +206,24 @@ void UIManager::loadSettings() {
         m_replayManager->setVideoWidth(m_currentSettings.videoWidth);
         m_replayManager->setVideoHeight(m_currentSettings.videoHeight);
         m_replayManager->setFps(m_currentSettings.fps);
+        if (m_currentSettings.streamNames.size() < m_currentSettings.streamUrls.size()) {
+            while (m_currentSettings.streamNames.size() < m_currentSettings.streamUrls.size()) {
+                m_currentSettings.streamNames.append("");
+            }
+        } else if (m_currentSettings.streamNames.size() > m_currentSettings.streamUrls.size()) {
+            m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, m_currentSettings.streamUrls.size());
+        }
+        m_replayManager->setStreamNames(m_currentSettings.streamNames);
+        if (m_transport) {
+            m_transport->setFps(m_currentSettings.fps);
+        }
 
         refreshProviders();
 
         // Sync QML
         emit streamUrlsChanged();
+        emit streamNamesChanged();
+        emit streamNamesChanged();
         emit saveLocationChanged();
         emit fileNameChanged();
         emit recordWidthChanged();
@@ -185,6 +236,8 @@ void UIManager::addStream() {
     QStringList urls = m_currentSettings.streamUrls;
     urls.append(""); // Add an empty entry
     setStreamUrls(urls);
+    m_currentSettings.streamNames.append("");
+    setStreamNames(m_currentSettings.streamNames);
     // Note: ReplayManager handles the worker creation during startRecording()
 }
 
@@ -193,6 +246,10 @@ void UIManager::removeStream(int index) {
     if (index >= 0 && index < urls.size()) {
         urls.removeAt(index);
         setStreamUrls(urls);
+        if (index >= 0 && index < m_currentSettings.streamNames.size()) {
+            m_currentSettings.streamNames.removeAt(index);
+            setStreamNames(m_currentSettings.streamNames);
+        }
     }
 }
 
@@ -221,6 +278,7 @@ void UIManager::updateStreamUrl(int index, const QString& url) {
     // Auto-save whenever a URL is modified
     AppSettings current;
     current.streamUrls = m_replayManager->getStreamUrls();
+    current.streamNames = m_replayManager->getStreamNames();
     current.saveLocation = m_replayManager->getOutputDirectory();
     current.fileName = m_replayManager->getBaseFileName();
     m_settingsManager->save(m_configPath, current);

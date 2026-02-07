@@ -11,6 +11,7 @@
 // Simple data structure to hold our application state
 struct AppSettings {
     QStringList streamUrls;
+    QStringList streamNames;
     QString saveLocation;
     QString fileName;
     int videoWidth = 1920;

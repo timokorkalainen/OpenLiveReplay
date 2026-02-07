@@ -202,7 +202,11 @@ ApplicationWindow {
                         }
 
                         Text {
-                            text: playbackTab.selectedIndex >= 0 ? ("CAM " + (playbackTab.selectedIndex + 1)) : ""
+                                     text: playbackTab.selectedIndex >= 0
+                                             ? ((playbackTab.selectedIndex < uiManager.streamNames.length && uiManager.streamNames[playbackTab.selectedIndex].length > 0)
+                                                 ? uiManager.streamNames[playbackTab.selectedIndex]
+                                                 : ("CAM " + (playbackTab.selectedIndex + 1)))
+                                             : ""
                             color: "white"
                             anchors.bottom: parent.bottom
                             anchors.left: parent.left
@@ -268,7 +272,9 @@ ApplicationWindow {
                             }
 
                             Text {
-                                text: "CAM " + (streamIndex + 1)
+                                text: (streamIndex < uiManager.streamNames.length && uiManager.streamNames[streamIndex].length > 0)
+                                      ? uiManager.streamNames[streamIndex]
+                                      : ("CAM " + (streamIndex + 1))
                                 color: "white"
                                 anchors.bottom: parent.bottom
                                 anchors.left: parent.left
@@ -523,6 +529,13 @@ ApplicationWindow {
                         Label {
                             text: (parent.index + 1) + ":"
                             width: 20
+                        }
+
+                        TextField {
+                            Layout.preferredWidth: 140
+                            text: uiManager.streamNames.length > parent.index ? uiManager.streamNames[parent.index] : ""
+                            placeholderText: "Name"
+                            onEditingFinished: uiManager.updateStreamName(parent.index, text)
                         }
 
                         TextField {

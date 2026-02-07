@@ -22,6 +22,12 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     }
     root["streams"] = urlArray;
 
+    QJsonArray nameArray;
+    for (const QString &name : settings.streamNames) {
+        nameArray.append(name);
+    }
+    root["streamNames"] = nameArray;
+
     QJsonDocument doc(root);
     QFile file(path);
 
@@ -81,6 +87,12 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.streamUrls.clear();
     QJsonArray urlArray = root["streams"].toArray();
     extracted(settings, urlArray);
+
+    settings.streamNames.clear();
+    QJsonArray nameArray = root["streamNames"].toArray();
+    for (const QJsonValue &val : nameArray) {
+        settings.streamNames.append(val.toString());
+    }
 
     return true;
 }

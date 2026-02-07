@@ -19,7 +19,7 @@ public:
     Muxer();
     ~Muxer();
 
-    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps);
+    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames);
     void writePacket(AVPacket* pkt);
     AVStream* getStream(int index);
     void close();
