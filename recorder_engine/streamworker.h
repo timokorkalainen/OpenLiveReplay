@@ -70,6 +70,9 @@ private:
     QElapsedTimer m_lastPacketTimer;
     QElapsedTimer m_lastFrameEnqueueTimer;
     int m_stallTimeoutMs = 8000;
+    std::atomic<bool> m_connected{false};
+    int m_connectBackoffMs = 1000;
+    int m_jitterBufferMs = 200;
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;

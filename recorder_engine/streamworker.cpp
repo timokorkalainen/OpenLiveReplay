@@ -28,7 +28,7 @@ int StreamWorker::ffmpegInterruptCallback(void* opaque) {
 
 bool StreamWorker::shouldInterrupt() const {
     if (!m_captureRunning || m_restartCapture) return true;
-    if (m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) return true;
+    if (m_connected && m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) return true;
     return false;
 }
 
@@ -56,7 +56,7 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
 
     if (!m_persistentEncCtx) return;
 
-    if (m_captureRunning && m_lastFrameEnqueueTimer.isValid()
+    if (m_captureRunning && m_connected && m_lastFrameEnqueueTimer.isValid()
         && m_lastFrameEnqueueTimer.elapsed() > m_stallTimeoutMs) {
         qDebug() << "Track" << m_trackIndex << "No frames queued. Forcing restart...";
         m_restartCapture = 1;
@@ -85,9 +85,11 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     // Theoretical time for this frame in the master timeline
     int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / 30;
+    int64_t targetTimeMs = currentRecordingTimeMs - m_jitterBufferMs;
+    if (targetTimeMs < 0) targetTimeMs = 0;
 
     // Jitter buffer pull...
-    while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= currentRecordingTimeMs) {
+    while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
         QueuedFrame top = m_frameQueue.dequeue();
         av_frame_unref(m_latestFrame);
         av_frame_move_ref(m_latestFrame, top.frame);
@@ -125,15 +127,21 @@ void StreamWorker::captureLoop() {
         { QMutexLocker locker(&m_urlMutex); currentUrl = m_url; }
 
         qDebug() << "Track" << m_trackIndex << "Attempting connection to:" << currentUrl;
+        m_connected = false;
 
         int videoStreamIdx = -1;
         if (!setupDecoder(&inCtx, &decCtx, currentUrl, &videoStreamIdx)) {
-            qDebug() << "Track" << m_trackIndex << "Connect failed. Retrying in 1s...";
+            qDebug() << "Track" << m_trackIndex << "Connect failed. Retrying in" << (m_connectBackoffMs / 1000.0) << "s...";
             // Sleep in small increments so we stay responsive to stop/restart requests
-            for(int i=0; i<10 && m_captureRunning && !m_restartCapture; ++i)
+            const int steps = qMax(1, m_connectBackoffMs / 100);
+            for (int i = 0; i < steps && m_captureRunning && !m_restartCapture; ++i) {
                 QThread::msleep(100);
+            }
+            m_connectBackoffMs = qMin(10000, m_connectBackoffMs * 2);
             continue;
         }
+        m_connected = true;
+        m_connectBackoffMs = 1000;
 
         if (!m_sharedClock) {
             qDebug() << "Track" << m_trackIndex << "No shared clock. Restarting...";
@@ -231,7 +239,7 @@ void StreamWorker::captureLoop() {
                 }
                 av_packet_unref(pkt);
             } else if (readResult == AVERROR(EAGAIN)) {
-                if (m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) {
+                if (m_connected && m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) {
                     qDebug() << "Track" << m_trackIndex << "Stalled stream. Restarting...";
                     break;
                 }
@@ -253,6 +261,7 @@ void StreamWorker::captureLoop() {
         av_frame_free(&rawFrame);
         avcodec_free_context(&decCtx);
         avformat_close_input(&inCtx);
+        m_connected = false;
     }
 
     m_captureRunning = false;
@@ -268,6 +277,10 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
 
     if (scheme == "srt") {
         av_dict_set(&opts, "connect_timeout", "5000000", 0); // 5 second connect timeout
+        // Increase SRT latency to smooth short network jitter (milliseconds)
+        av_dict_set(&opts, "latency", "500", 0);
+        av_dict_set(&opts, "rcvlatency", "500", 0);
+        av_dict_set(&opts, "peerlatency", "500", 0);
     }
 
     if (scheme == "rtmp" || scheme == "rtmps") {
