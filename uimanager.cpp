@@ -28,7 +28,7 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         const int statusType = status & 0xF0;
         const bool isNoteOff = (statusType == 0x80) || (statusType == 0x90 && data2 <= 0);
         const bool isControlRelease = (statusType == 0xB0 && data2 <= 0);
-        if (isNoteOff || isControlRelease) return;
+        const bool isRelease = isNoteOff || isControlRelease;
 
         if (m_midiLearnAction >= 0) {
             m_midiBindings[m_midiLearnAction] = {status, data1};
@@ -51,18 +51,64 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         if (matchedAction < 0) return;
 
         switch (matchedAction) {
-        case 0: playPause(); break;
-        case 1: rewind5x(); break;
-        case 2: forward5x(); break;
-        case 3: stepFrame(); break;
-        case 4: goLive(); break;
-        case 5: captureCurrent(); break;
+        case 0:
+            if (!isRelease) playPause();
+            break;
+        case 1:
+            if (isRelease) {
+                if (m_midiHoldAction == 1) {
+                    if (m_transport) {
+                        m_transport->setSpeed(1.0);
+                        m_transport->setPlaying(m_midiHoldWasPlaying);
+                    }
+                    m_midiHoldAction = -1;
+                }
+            } else {
+                cancelFollowLive();
+                m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
+                m_midiHoldAction = 1;
+                if (m_transport) {
+                    m_transport->setSpeed(-5.0);
+                    m_transport->setPlaying(true);
+                }
+            }
+            break;
+        case 2:
+            if (isRelease) {
+                if (m_midiHoldAction == 2) {
+                    if (m_transport) {
+                        m_transport->setSpeed(1.0);
+                        m_transport->setPlaying(m_midiHoldWasPlaying);
+                    }
+                    m_midiHoldAction = -1;
+                }
+            } else {
+                cancelFollowLive();
+                m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
+                m_midiHoldAction = 2;
+                if (m_transport) {
+                    m_transport->setSpeed(5.0);
+                    m_transport->setPlaying(true);
+                }
+            }
+            break;
+        case 3:
+            if (!isRelease) stepFrame();
+            break;
+        case 4:
+            if (!isRelease) goLive();
+            break;
+        case 5:
+            if (!isRelease) captureCurrent();
+            break;
         case 6:
-            setPlaybackViewState(false, -1);
-            emit multiviewRequested();
+            if (!isRelease) {
+                setPlaybackViewState(false, -1);
+                emit multiviewRequested();
+            }
             break;
         default:
-            if (matchedAction >= 100 && matchedAction < 108) {
+            if (!isRelease && matchedAction >= 100 && matchedAction < 108) {
                 emit feedSelectRequested(matchedAction - 100);
             }
             break;
@@ -272,17 +318,20 @@ QString UIManager::midiBindingLabel(int action) const {
 
 void UIManager::playPause() {
     if (!m_transport) return;
+    cancelFollowLive();
     m_transport->setPlaying(!m_transport->isPlaying());
 }
 
 void UIManager::rewind5x() {
     if (!m_transport) return;
+    cancelFollowLive();
     m_transport->setSpeed(-5.0);
     m_transport->setPlaying(true);
 }
 
 void UIManager::forward5x() {
     if (!m_transport) return;
+    cancelFollowLive();
     m_transport->setSpeed(5.0);
     m_transport->setPlaying(true);
 }
@@ -291,12 +340,17 @@ void UIManager::stepFrame() {
     if (!m_transport) return;
     m_transport->step(1);
     m_transport->setPlaying(false);
+    cancelFollowLive();
 }
 
 void UIManager::goLive() {
     if (!m_transport) return;
     m_transport->setSpeed(1.0);
     scrubToLive();
+}
+
+void UIManager::cancelFollowLive() {
+    m_followLive = false;
 }
 
 void UIManager::captureCurrent() {

@@ -466,6 +466,7 @@ ApplicationWindow {
                     Button {
                         text: "REV 5.0x"
                         onPressed: {
+                            uiManager.cancelFollowLive()
                             playbackTab.holdWasPlaying = uiManager.transport.isPlaying
                             uiManager.transport.setSpeed(-5.0)
                             uiManager.transport.setPlaying(true)
@@ -483,6 +484,7 @@ ApplicationWindow {
                     Button {
                         text: "FWD 5.0x"
                         onPressed: {
+                            uiManager.cancelFollowLive()
                             playbackTab.holdWasPlaying = uiManager.transport.isPlaying
                             uiManager.transport.setSpeed(5.0)
                             uiManager.transport.setPlaying(true)

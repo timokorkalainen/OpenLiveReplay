@@ -102,6 +102,7 @@ public:
     Q_INVOKABLE void goLive();
     Q_INVOKABLE void captureCurrent();
     Q_INVOKABLE void setPlaybackViewState(bool singleView, int selectedIndex);
+    Q_INVOKABLE void cancelFollowLive();
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -165,6 +166,8 @@ private:
     bool m_playbackSingleView = false;
     int m_playbackSelectedIndex = -1;
     int m_midiBindingsVersion = 0;
+    bool m_midiHoldWasPlaying = false;
+    int m_midiHoldAction = -1;
     QElapsedTimer m_xTouchLastSend;
     QString m_xTouchLastText;
     int m_xTouchMinIntervalMs = 25;
