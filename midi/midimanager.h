@@ -28,6 +28,7 @@ public:
     Q_INVOKABLE bool isXTouchConnected() const { return m_isXTouch && m_connected && m_outputConnected; }
     Q_INVOKABLE void sendXTouchTimecode(int hours, int minutes, int seconds, int frames, int fps);
     Q_INVOKABLE void sendXTouchSegmentDisplay(const QString &digits, quint8 dots1, quint8 dots2);
+    Q_INVOKABLE void sendXTouchLcdText(const QString &text);
 
 signals:
     void portsChanged();
@@ -55,6 +56,7 @@ private:
     bool m_outputConnected = false;
     bool m_isXTouch = false;
     int m_segmentDebugCount = 0;
+    int m_lcdDebugCount = 0;
 };
 
 #endif // MIDIMANAGER_H

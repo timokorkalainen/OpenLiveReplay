@@ -146,6 +146,7 @@ public slots:
     void onRecorderPulse(int64_t elapsed, int64_t frameCount);
 
 private:
+    void updateXTouchLcd();
     void updateXTouchDisplay();
 
     void restartPlaybackWorker();

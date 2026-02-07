@@ -11,6 +11,8 @@ MidiManager::MidiManager(QObject *parent)
     try {
         m_midiIn = std::make_unique<RtMidiIn>();
         m_midiIn->ignoreTypes(false, false, false);
+        m_midiIn->setCallback(&MidiManager::midiCallback, this);
+        m_callbackSet = true;
     } catch (...) {
         m_midiIn.reset();
     }
@@ -55,10 +57,6 @@ void MidiManager::openPort(int index) {
 
     try {
         m_midiIn->openPort(static_cast<unsigned int>(index));
-        if (!m_callbackSet) {
-            m_midiIn->setCallback(&MidiManager::midiCallback, this);
-            m_callbackSet = true;
-        }
         m_currentPort = index;
         m_currentPortName = m_ports.value(index);
         const QString portLower = m_currentPortName.toLower();
@@ -95,7 +93,6 @@ void MidiManager::closePort() {
         } catch (...) {
         }
     }
-    m_callbackSet = false;
     closeOutput();
     m_currentPort = -1;
     m_currentPortName.clear();
@@ -285,6 +282,75 @@ void MidiManager::sendXTouchSegmentDisplay(const QString &digits, quint8 dots1, 
         }
     } catch (...) {
         std::fprintf(stderr, "MIDI: Failed to send Segment Display\n");
+    }
+}
+
+void MidiManager::sendXTouchLcdText(const QString &text) {
+    if (!isXTouchConnected() || !m_midiOut) return;
+
+    QString trimmed = text.trimmed();
+    trimmed.replace(QChar(0x00E4), "a"); // ä
+    trimmed.replace(QChar(0x00C4), "A"); // Ä
+    trimmed.replace(QChar(0x00E5), "a"); // å
+    trimmed.replace(QChar(0x00C5), "A"); // Å
+    trimmed.replace(QChar(0x00F6), "o"); // ö
+    trimmed.replace(QChar(0x00D6), "O"); // Ö
+    trimmed.replace(QChar(0x00E9), "e"); // é
+    trimmed.replace(QChar(0x00C9), "E"); // É
+    trimmed.replace(QChar(0x00FC), "u"); // ü
+    trimmed.replace(QChar(0x00DC), "U"); // Ü
+    trimmed.replace(QChar(0x00F1), "n"); // ñ
+    trimmed.replace(QChar(0x00D1), "N"); // Ñ
+    if (trimmed.isEmpty()) trimmed = " ";
+
+    QByteArray ascii = trimmed.toLatin1();
+    QByteArray display(56, ' ');
+    const int copyLen = qMin(display.size(), ascii.size());
+    for (int i = 0; i < copyLen; ++i) {
+        unsigned char ch = static_cast<unsigned char>(ascii.at(i));
+        display[i] = (ch < 0x20 || ch > 0x7F) ? ' ' : static_cast<char>(ch & 0x7F);
+    }
+
+    std::vector<unsigned char> msg;
+    msg.reserve(6 + 2 + 14 + 1);
+    // Behringer-style LCD SysEx (X-Touch MIDI mode)
+    msg.push_back(0xF0);
+    msg.push_back(0x00);
+    msg.push_back(0x20);
+    msg.push_back(0x32);
+    msg.push_back(0x41);
+    msg.push_back(0x4C);
+    msg.push_back(0x00);
+
+    unsigned char cc = 0x07; // white backlight, no invert
+    msg.push_back(cc);
+
+    QByteArray upper = display.left(7);
+    if (upper.size() < 7) upper = upper.leftJustified(7, ' ');
+    QByteArray lower(7, ' ');
+
+    for (int i = 0; i < 7; ++i) {
+        msg.push_back(static_cast<unsigned char>(upper.at(i)));
+    }
+    for (int i = 0; i < 7; ++i) {
+        msg.push_back(static_cast<unsigned char>(lower.at(i)));
+    }
+
+    msg.push_back(0xF7);
+
+    try {
+        m_midiOut->sendMessage(&msg);
+        std::fprintf(stderr, "MIDI: Sent LCD text '%s' (behringer upper)\n", qPrintable(trimmed));
+        if (m_lcdDebugCount < 10) {
+            m_lcdDebugCount++;
+            std::fprintf(stderr, "MIDI: LCD Behringer SysEx bytes:");
+            for (const auto &b : msg) {
+                std::fprintf(stderr, " %02X", b);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    } catch (...) {
+        std::fprintf(stderr, "MIDI: Failed to send LCD text\n");
     }
 }
 

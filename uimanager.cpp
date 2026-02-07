@@ -73,6 +73,13 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     connect(m_midiManager, &MidiManager::connectedChanged, this, &UIManager::midiConnectedChanged);
     connect(this, &UIManager::midiConnectedChanged, this, [this]() {
         updateXTouchDisplay();
+        updateXTouchLcd();
+    });
+    connect(this, &UIManager::streamNamesChanged, this, [this]() {
+        updateXTouchLcd();
+    });
+    connect(this, &UIManager::feedSelectRequested, this, [this]() {
+        updateXTouchLcd();
     });
     connect(this, &UIManager::timeOfDayModeChanged, this, [this]() {
         updateXTouchDisplay();
@@ -299,6 +306,7 @@ void UIManager::captureCurrent() {
 void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
     m_playbackSingleView = singleView;
     m_playbackSelectedIndex = selectedIndex;
+    updateXTouchLcd();
 }
 
 void UIManager::openStreams() {
@@ -622,6 +630,23 @@ void UIManager::updateXTouchDisplay() {
     const quint8 dots1 = (1 << 4) | (1 << 6);
     const quint8 dots2 = 0;
     m_midiManager->sendXTouchSegmentDisplay(digits, dots1, dots2);
+}
+
+void UIManager::updateXTouchLcd() {
+    if (!m_midiManager || !m_midiManager->isXTouchConnected()) return;
+
+    QString label;
+    if (m_playbackSingleView && m_playbackSelectedIndex >= 0
+        && m_playbackSelectedIndex < m_currentSettings.streamNames.size()) {
+        const QString name = m_currentSettings.streamNames[m_playbackSelectedIndex].trimmed();
+        label = name.isEmpty()
+                    ? QString("CAM %1").arg(m_playbackSelectedIndex + 1)
+                    : name;
+    } else if (m_playbackSingleView && m_playbackSelectedIndex >= 0) {
+        label = QString("CAM %1").arg(m_playbackSelectedIndex + 1);
+    }
+
+    m_midiManager->sendXTouchLcdText(label);
 }
 
 void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t playheadMs) {
