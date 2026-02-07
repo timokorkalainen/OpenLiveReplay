@@ -319,7 +319,7 @@ ApplicationWindow {
                     id: scrubBar
                     Layout.fillWidth: true
                     from: 0
-                    to: uiManager.recordedDurationMs
+                    to: Math.max(0, uiManager.recordedDurationMs - uiManager.liveBufferMs)
                     value: uiManager.scrubPosition
 
                     onMoved: {

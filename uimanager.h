@@ -26,6 +26,7 @@ class UIManager : public QObject {
     Q_PROPERTY(int64_t scrubPosition READ scrubPosition NOTIFY scrubPositionChanged)
     Q_PROPERTY(qint64 recordingStartEpochMs READ recordingStartEpochMs NOTIFY recordingStartEpochMsChanged)
     Q_PROPERTY(bool timeOfDayMode READ timeOfDayMode WRITE setTimeOfDayMode NOTIFY timeOfDayModeChanged)
+    Q_PROPERTY(int liveBufferMs READ liveBufferMs CONSTANT)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
 
 public:
@@ -45,6 +46,7 @@ public:
     int64_t scrubPosition();
     qint64 recordingStartEpochMs() const;
     bool timeOfDayMode() const;
+    int liveBufferMs() const;
     PlaybackTransport* transport() const { return m_transport; }
 
     // Setters
@@ -118,7 +120,7 @@ private:
     QList<FrameProvider*> m_providers;
     PlaybackTransport *m_transport;
     bool m_followLive = false;
-    int m_liveBufferMs = 200;
+    int m_liveBufferMs = 1000;
 };
 
 #endif // UIMANAGER_H

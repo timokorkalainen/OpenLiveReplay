@@ -33,6 +33,10 @@ bool UIManager::timeOfDayMode() const {
     return m_currentSettings.showTimeOfDay;
 }
 
+int UIManager::liveBufferMs() const {
+    return m_liveBufferMs;
+}
+
 void UIManager::setStreamUrls(const QStringList &urls) {
     if (m_currentSettings.streamUrls != urls) {
         m_currentSettings.streamUrls = urls;
