@@ -4,6 +4,8 @@
 #include <QObject>
 #include <QVideoSink>
 #include <QVideoFrame>
+#include <QImage>
+#include <QMutex>
 
 class FrameProvider : public QObject
 {
@@ -19,11 +21,16 @@ public:
     // This method is called by the PlaybackWorker to push new frames to the UI
     void deliverFrame(const QVideoFrame &frame);
 
+    // Retrieve the latest frame as an image (for screenshots)
+    QImage latestImage() const;
+
 signals:
     void videoSinkChanged();
 
 private:
     QVideoSink *m_sink = nullptr;
+    mutable QMutex m_frameMutex;
+    QVideoFrame m_lastFrame;
 };
 
 #endif // FRAMEPROVIDER_H

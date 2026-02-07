@@ -422,6 +422,15 @@ ApplicationWindow {
                         }
                     }
 
+                    Button {
+                        text: "Capture"
+                        onClicked: {
+                            uiManager.captureSnapshot(playbackTab.viewMode === "single",
+                                                       playbackTab.selectedIndex,
+                                                       uiManager.scrubPosition)
+                        }
+                    }
+
                     Item { Layout.fillWidth: true }
 
                     Text {

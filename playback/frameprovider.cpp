@@ -25,6 +25,11 @@ void FrameProvider::setVideoSink(QVideoSink *sink)
 
 void FrameProvider::deliverFrame(const QVideoFrame &frame)
 {
+    {
+        QMutexLocker locker(&m_frameMutex);
+        m_lastFrame = frame;
+    }
+
     if (!m_sink) return;
 
     if (m_sink->thread() == QThread::currentThread()) {
@@ -36,4 +41,14 @@ void FrameProvider::deliverFrame(const QVideoFrame &frame)
     QMetaObject::invokeMethod(m_sink, [sink = m_sink, copy]() mutable {
         if (sink) sink->setVideoFrame(copy);
     }, Qt::QueuedConnection);
+}
+
+QImage FrameProvider::latestImage() const
+{
+    QMutexLocker locker(&m_frameMutex);
+    if (!m_lastFrame.isValid()) return QImage();
+
+    QVideoFrame frameCopy = m_lastFrame;
+    QImage img = frameCopy.toImage();
+    return img;
 }

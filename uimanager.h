@@ -71,6 +71,7 @@ public:
     Q_INVOKABLE void saveSettings();          // Manual save trigger
     Q_INVOKABLE void setSaveLocationFromUrl(const QUrl &folderUrl);
     Q_INVOKABLE void scrubToLive();
+    Q_INVOKABLE void captureSnapshot(bool singleView, int selectedIndex, int64_t playheadMs);
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);

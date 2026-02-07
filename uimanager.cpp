@@ -1,4 +1,9 @@
 #include "uimanager.h"
+#include <QDateTime>
+#include <QDir>
+#include <QImageWriter>
+#include <QRegularExpression>
+#include <QStandardPaths>
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
     : QObject(parent), m_replayManager(engine) {
@@ -338,6 +343,76 @@ void UIManager::scrubToLive() {
     const int64_t liveEdge = recordedDurationMs();
     const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
     m_transport->seek(target);
+}
+
+static QString sanitizeFileToken(const QString& input) {
+    QString out = input.trimmed();
+    out.replace(QRegularExpression("[\\\\/:*?\"<>|]+"), "_");
+    out.replace(QRegularExpression("\\s+"), "_");
+    if (out.isEmpty()) return QString("UNNAMED");
+    return out;
+}
+
+static QString formatTimecodeForFile(int64_t ms, int fps) {
+    if (ms < 0) ms = 0;
+    int totalSeconds = static_cast<int>(ms / 1000);
+    int hours = totalSeconds / 3600;
+    int minutes = (totalSeconds % 3600) / 60;
+    int seconds = totalSeconds % 60;
+    int frames = static_cast<int>((ms % 1000) / (1000.0 / qMax(1, fps)));
+
+    return QString("%1%2%3%4")
+        .arg(hours, 2, 10, QChar('0'))
+        .arg(minutes, 2, 10, QChar('0'))
+        .arg(seconds, 2, 10, QChar('0'))
+        .arg(frames, 2, 10, QChar('0'));
+}
+
+void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t playheadMs) {
+    if (m_providers.isEmpty()) return;
+
+    const QString projectName = sanitizeFileToken(m_currentSettings.fileName);
+    const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
+
+    const qint64 startEpochMs = m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
+    const qint64 playheadEpochMs = (startEpochMs > 0) ? (startEpochMs + playheadMs) : QDateTime::currentMSecsSinceEpoch();
+
+    const QString recTimeOfDay = QDateTime::fromMSecsSinceEpoch(playheadEpochMs).toString("HHmmss");
+    const QString playheadTime = formatTimecodeForFile(playheadMs, fps);
+
+    QString outputDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/videos";
+    QDir dir(outputDir);
+    if (!dir.exists()) dir.mkpath(".");
+
+    auto saveImageForIndex = [&](int index) {
+        if (index < 0 || index >= m_providers.size()) return;
+
+        const QString feedName = (index < m_currentSettings.streamNames.size() && !m_currentSettings.streamNames[index].trimmed().isEmpty())
+                                 ? sanitizeFileToken(m_currentSettings.streamNames[index])
+                                 : QString("CAM%1").arg(index + 1);
+
+        QImage image = m_providers[index]->latestImage();
+        if (image.isNull()) return;
+
+        const QString fileName = QString("%1_%2_%3_%4.jpg")
+            .arg(projectName)
+            .arg(feedName)
+            .arg(recTimeOfDay)
+            .arg(playheadTime);
+
+        const QString fullPath = dir.absoluteFilePath(fileName);
+        QImageWriter writer(fullPath, "jpg");
+        writer.setQuality(95);
+        writer.write(image);
+    };
+
+    if (singleView) {
+        saveImageForIndex(selectedIndex);
+    } else {
+        for (int i = 0; i < m_providers.size(); ++i) {
+            saveImageForIndex(i);
+        }
+    }
 }
 
 void UIManager::onRecorderPulse(int64_t elapsed, int64_t frameCount) {
