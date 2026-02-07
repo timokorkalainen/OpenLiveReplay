@@ -17,7 +17,6 @@ qt_add_qml_module(appOpenLiveReplay
     VERSION 1.0
     QML_FILES
         Main.qml
-        PreviewWindow.qml
     SOURCES
         recorder_engine/replaymanager.cpp recorder_engine/replaymanager.h
         recorder_engine/muxer.h recorder_engine/muxer.cpp

@@ -1,7 +1,7 @@
+<!DOCTYPE RCC>
 <RCC>
-    <qresource prefix="/">
-        <file>qtquickcontrols2.conf</file>
-        <file>Main.qml</file>
-        <file>PreviewWindow.qml</file>
-    </qresource>
+  <qresource prefix="/">
+    <file>qtquickcontrols2.conf</file>
+    <file>Main.qml</file>
+  </qresource>
 </RCC>
