@@ -9,6 +9,7 @@
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
 #include "playback/playbacktransport.h"
+#include "midi/midimanager.h"
 
 class UIManager : public QObject {
     Q_OBJECT
@@ -27,6 +28,9 @@ class UIManager : public QObject {
     Q_PROPERTY(qint64 recordingStartEpochMs READ recordingStartEpochMs NOTIFY recordingStartEpochMsChanged)
     Q_PROPERTY(bool timeOfDayMode READ timeOfDayMode WRITE setTimeOfDayMode NOTIFY timeOfDayModeChanged)
     Q_PROPERTY(int liveBufferMs READ liveBufferMs CONSTANT)
+    Q_PROPERTY(QStringList midiPorts READ midiPorts NOTIFY midiPortsChanged)
+    Q_PROPERTY(int midiPortIndex READ midiPortIndex WRITE setMidiPortIndex NOTIFY midiPortIndexChanged)
+    Q_PROPERTY(bool midiConnected READ midiConnected NOTIFY midiConnectedChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
 
 public:
@@ -47,6 +51,9 @@ public:
     qint64 recordingStartEpochMs() const;
     bool timeOfDayMode() const;
     int liveBufferMs() const;
+    QStringList midiPorts() const;
+    int midiPortIndex() const;
+    bool midiConnected() const;
     PlaybackTransport* transport() const { return m_transport; }
 
     // Setters
@@ -74,6 +81,8 @@ public:
     Q_INVOKABLE void setSaveLocationFromUrl(const QUrl &folderUrl);
     Q_INVOKABLE void scrubToLive();
     Q_INVOKABLE void captureSnapshot(bool singleView, int selectedIndex, int64_t playheadMs);
+    Q_INVOKABLE void refreshMidiPorts();
+    Q_INVOKABLE void setMidiPortIndex(int index);
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -96,6 +105,9 @@ signals:
     void scrubPositionChanged();
     void recordingStartEpochMsChanged();
     void timeOfDayModeChanged();
+    void midiPortsChanged();
+    void midiPortIndexChanged();
+    void midiConnectedChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -121,6 +133,7 @@ private:
     PlaybackTransport *m_transport;
     bool m_followLive = false;
     int m_liveBufferMs = 1000;
+    MidiManager* m_midiManager = nullptr;
 };
 
 #endif // UIMANAGER_H

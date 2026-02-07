@@ -15,6 +15,15 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_transport = new PlaybackTransport(this);
     m_transport->seek(0);
     m_transport->setFps(m_currentSettings.fps);
+    m_midiManager = new MidiManager(this);
+    connect(m_midiManager, &MidiManager::midiTriggered, this, [this]() {
+        if (m_transport) {
+            m_transport->setPlaying(!m_transport->isPlaying());
+        }
+    });
+    connect(m_midiManager, &MidiManager::portsChanged, this, &UIManager::midiPortsChanged);
+    connect(m_midiManager, &MidiManager::currentPortChanged, this, &UIManager::midiPortIndexChanged);
+    connect(m_midiManager, &MidiManager::connectedChanged, this, &UIManager::midiConnectedChanged);
     refreshProviders();
 }
 
@@ -35,6 +44,18 @@ bool UIManager::timeOfDayMode() const {
 
 int UIManager::liveBufferMs() const {
     return m_liveBufferMs;
+}
+
+QStringList UIManager::midiPorts() const {
+    return m_midiManager ? m_midiManager->ports() : QStringList();
+}
+
+int UIManager::midiPortIndex() const {
+    return m_midiManager ? m_midiManager->currentPort() : -1;
+}
+
+bool UIManager::midiConnected() const {
+    return m_midiManager ? m_midiManager->connected() : false;
 }
 
 void UIManager::setStreamUrls(const QStringList &urls) {
@@ -133,11 +154,24 @@ void UIManager::setTimeOfDayMode(bool enabled) {
     m_settingsManager->save(m_configPath, m_currentSettings);
 }
 
+void UIManager::setMidiPortIndex(int index) {
+    if (!m_midiManager) return;
+    if (index < 0) {
+        m_midiManager->closePort();
+        return;
+    }
+    m_midiManager->openPort(index);
+}
+
 void UIManager::openStreams() {
     refreshProviders();
     if (m_replayManager->isRecording()) {
         restartPlaybackWorker();
     }
+}
+
+void UIManager::refreshMidiPorts() {
+    if (m_midiManager) m_midiManager->refreshPorts();
 }
 
 void UIManager::startRecording() {

@@ -64,6 +64,34 @@ ApplicationWindow {
                     color: "#eee"
                 }
 
+                GroupBox {
+                    title: "MIDI"
+                    Layout.fillWidth: true
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+
+                        ComboBox {
+                            Layout.fillWidth: true
+                            model: uiManager.midiPorts
+                            currentIndex: uiManager.midiPortIndex
+                            onActivated: uiManager.setMidiPortIndex(currentIndex)
+                        }
+
+                        Button {
+                            text: "Refresh"
+                            onClicked: uiManager.refreshMidiPorts()
+                        }
+
+                        Text {
+                            text: uiManager.midiConnected ? "Connected" : "Disconnected"
+                            color: uiManager.midiConnected ? "#4CAF50" : "#777"
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+                }
+
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 12

@@ -4,6 +4,19 @@ project(OpenLiveReplay VERSION 0.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(FetchContent)
+set(RTMIDI_API_COREMIDI ON CACHE BOOL "" FORCE)
+set(RTMIDI_API_ALSA OFF CACHE BOOL "" FORCE)
+set(RTMIDI_API_JACK OFF CACHE BOOL "" FORCE)
+set(RTMIDI_API_WINMM OFF CACHE BOOL "" FORCE)
+set(RTMIDI_API_DUMMY OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    rtmidi
+    GIT_REPOSITORY https://github.com/thestk/rtmidi.git
+    GIT_TAG 6.0.0
+)
+FetchContent_MakeAvailable(rtmidi)
+
 # 1. Find Qt
 find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2)
 qt_standard_project_setup(REQUIRES 6.8)
@@ -27,6 +40,7 @@ qt_add_qml_module(appOpenLiveReplay
         playback/playbackworker.h playback/playbackworker.cpp
         playback/frameprovider.h playback/frameprovider.cpp
         playback/playbacktransport.h playback/playbacktransport.cpp
+        midi/midimanager.h midi/midimanager.cpp
     RESOURCES
         qtquickcontrols2.conf
         resources.qrc
@@ -66,6 +80,7 @@ elseif(APPLE) # macOS Desktop
     target_link_directories(appOpenLiveReplay PRIVATE /opt/homebrew/lib)
     target_link_libraries(appOpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample)
     set_target_properties(appOpenLiveReplay PROPERTIES INSTALL_RPATH "/opt/homebrew/lib")
+    target_link_libraries(appOpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
 endif()
 
 # 5. Standard Qt Linking
@@ -75,6 +90,7 @@ target_link_libraries(appOpenLiveReplay PRIVATE
     Qt6::Concurrent
     Qt6::Multimedia
     Qt6::QuickControls2
+    rtmidi
 )
 
 # 6. Bundle Properties
