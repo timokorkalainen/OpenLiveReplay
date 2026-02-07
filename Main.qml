@@ -120,6 +120,20 @@ ApplicationWindow {
                 property int gridColumns: Math.max(1, Math.ceil(Math.sqrt(Math.max(1, streamCount))))
                 property int gridRows: Math.ceil(Math.max(1, streamCount) / gridColumns)
 
+                function formatTimecode(ms) {
+                    var totalSeconds = Math.floor(ms / 1000)
+                    var hours = Math.floor(totalSeconds / 3600)
+                    var minutes = Math.floor((totalSeconds % 3600) / 60)
+                    var seconds = totalSeconds % 60
+                    var frames = Math.floor((ms % 1000) / (1000 / 30))
+
+                    var hh = hours < 10 ? "0" + hours : "" + hours
+                    var mm = minutes < 10 ? "0" + minutes : "" + minutes
+                    var ss = seconds < 10 ? "0" + seconds : "" + seconds
+                    var ff = frames < 10 ? "0" + frames : "" + frames
+                    return hh + ":" + mm + ":" + ss + "." + ff
+                }
+
                 function updateVisibleStreams() {
                     var indexes = []
                     var total = Math.max(uiManager.streamUrls.length, uiManager.playbackProviders.length)
@@ -192,7 +206,7 @@ ApplicationWindow {
                             anchors.bottom: parent.bottom
                             anchors.left: parent.left
                             anchors.margins: 6
-                            font.family: "Monospace"
+                            font.family: "Menlo"
                             font.pixelSize: 14
                         }
 
@@ -258,7 +272,7 @@ ApplicationWindow {
                                 anchors.bottom: parent.bottom
                                 anchors.left: parent.left
                                 anchors.margins: 5
-                                font.family: "Monospace"
+                                font.family: "Menlo"
                                 font.pixelSize: 12
                                 z: 5
                             }
@@ -302,6 +316,17 @@ ApplicationWindow {
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter
                     Layout.fillWidth: true
+                    spacing: 12
+
+                    Text {
+                        text: playbackTab.formatTimecode(uiManager.scrubPosition)
+                        color: "#eee"
+                        font.family: "Menlo"
+                        font.pixelSize: 14
+                        Layout.alignment: Qt.AlignVCenter
+                    }
+
+                    Item { Layout.fillWidth: true }
 
                     Button {
                         text: "REV 5.0x"
@@ -363,6 +388,16 @@ ApplicationWindow {
                             uiManager.transport.setSpeed(1.0)
                             uiManager.scrubToLive();
                         }
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    Text {
+                        text: playbackTab.formatTimecode(uiManager.recordedDurationMs)
+                        color: "#eee"
+                        font.family: "Menlo"
+                        font.pixelSize: 14
+                        Layout.alignment: Qt.AlignVCenter
                     }
                 }
             }
