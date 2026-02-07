@@ -16,6 +16,9 @@ class UIManager : public QObject {
     Q_PROPERTY(QStringList streamUrls READ streamUrls WRITE setStreamUrls NOTIFY streamUrlsChanged)
     Q_PROPERTY(QString saveLocation READ saveLocation WRITE setSaveLocation NOTIFY saveLocationChanged)
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
+    Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
+    Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
+    Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
     Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
@@ -29,6 +32,9 @@ public:
     QStringList streamUrls() const;
     QString saveLocation() const;
     QString fileName() const;
+    int recordWidth() const;
+    int recordHeight() const;
+    int recordFps() const;
     bool isRecording() const;
     QVariantList playbackProviders() const;
     int64_t recordedDurationMs();
@@ -39,6 +45,9 @@ public:
     void setStreamUrls(const QStringList &urls);
     void setSaveLocation(const QString &path);
     void setFileName(const QString &name);
+    void setRecordWidth(int width);
+    void setRecordHeight(int height);
+    void setRecordFps(int fps);
 
     void refreshProviders();
 
@@ -63,6 +72,9 @@ signals:
     void streamUrlsChanged();
     void saveLocationChanged();
     void fileNameChanged();
+    void recordWidthChanged();
+    void recordHeightChanged();
+    void recordFpsChanged();
     void recordingStatusChanged();
     void playbackProvidersChanged();
     void recordingStarted();
@@ -88,7 +100,7 @@ private:
     ReplayManager* m_replayManager;
     AppSettings m_currentSettings;
     SettingsManager* m_settingsManager;
-    const QString m_configPath = "config.json";
+    QString m_configPath;
     PlaybackWorker* m_playbackWorker = nullptr;
     QList<FrameProvider*> m_providers;
     PlaybackTransport *m_transport;

@@ -7,8 +7,12 @@ Muxer::Muxer() {}
 
 Muxer::~Muxer() { close(); }
 
-bool Muxer::init(const QString& filename, int videoTrackCount) {
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps) {
     QMutexLocker locker(&m_mutex);
+
+    if (width <= 0) width = 1920;
+    if (height <= 0) height = 1080;
+    if (fps <= 0) fps = 30;
 
     // 1. Create Format Context for Matroska
     avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska", getVideoPath(filename).toUtf8().constData());
@@ -22,18 +26,18 @@ bool Muxer::init(const QString& filename, int videoTrackCount) {
         // 1. Set parameters
         st->codecpar->codec_id = AV_CODEC_ID_MPEG2VIDEO;
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-        st->codecpar->width = 1920;
-        st->codecpar->height = 1080;
+        st->codecpar->width = width;
+        st->codecpar->height = height;
         st->codecpar->format = AV_PIX_FMT_YUV420P;
         st->codecpar->bit_rate = 30000000;
 
         // 2. CRITICAL: Set the stream timebase to match the ENCODER first
         // This tells FFmpeg: "The data coming in is at 30fps"
-        st->time_base = {1, 30};
+        st->time_base = {1, fps};
 
         // 3. Set the metadata hints
-        st->avg_frame_rate = {30, 1};
-        st->r_frame_rate = {30, 1};
+        st->avg_frame_rate = {fps, 1};
+        st->r_frame_rate = {fps, 1};
 
         // For MPEG-2, you can also set the 'closed gop' and 'fixed fps' flags in codecpar
         st->codecpar->video_delay = 0;

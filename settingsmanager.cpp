@@ -11,6 +11,9 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     // Save the separate file path strings
     root["saveLocation"] = settings.saveLocation;
     root["fileName"] = settings.fileName;
+    root["videoWidth"] = settings.videoWidth;
+    root["videoHeight"] = settings.videoHeight;
+    root["fps"] = settings.fps;
 
     // Convert QStringList to QJsonArray
     QJsonArray urlArray;
@@ -70,6 +73,9 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     // Parse individual settings
     settings.saveLocation = root["saveLocation"].toString();
     settings.fileName = root["fileName"].toString();
+    settings.videoWidth = root["videoWidth"].toInt(settings.videoWidth);
+    settings.videoHeight = root["videoHeight"].toInt(settings.videoHeight);
+    settings.fps = root["fps"].toInt(settings.fps);
 
     // Parse the stream list
     settings.streamUrls.clear();

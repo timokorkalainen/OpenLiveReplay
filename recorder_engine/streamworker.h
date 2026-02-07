@@ -35,7 +35,8 @@ public:
 class StreamWorker : public QThread {
     Q_OBJECT
 public:
-    StreamWorker(const QString& url, int trackIndex, Muxer* muxer, RecordingClock* clock, QObject* parent = nullptr);
+    StreamWorker(const QString& url, int trackIndex, Muxer* muxer, RecordingClock* clock,
+                 int targetWidth, int targetHeight, int targetFps, QObject* parent = nullptr);
     ~StreamWorker();
 
     void changeSource(const QString& newUrl);
@@ -73,6 +74,10 @@ private:
     std::atomic<bool> m_connected{false};
     int m_connectBackoffMs = 1000;
     int m_jitterBufferMs = 200;
+
+    int m_targetWidth = 1920;
+    int m_targetHeight = 1080;
+    int m_targetFps = 30;
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;

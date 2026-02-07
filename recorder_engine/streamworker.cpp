@@ -2,10 +2,14 @@
 #include <QDebug>
 #include <QDateTime>
 
-StreamWorker::StreamWorker(const QString& url, int trackIndex, Muxer* muxer, RecordingClock *clock, QObject* parent)
+StreamWorker::StreamWorker(const QString& url, int trackIndex, Muxer* muxer, RecordingClock *clock,
+                           int targetWidth, int targetHeight, int targetFps, QObject* parent)
     : QThread(parent), m_url(url), m_trackIndex(trackIndex), m_muxer(muxer), m_sharedClock(clock) {
     m_restartCapture = 0;
     m_internalFrameCount = 0;
+    if (targetWidth > 0) m_targetWidth = targetWidth;
+    if (targetHeight > 0) m_targetHeight = targetHeight;
+    if (targetFps > 0) m_targetFps = targetFps;
 }
 
 StreamWorker::~StreamWorker() { stop(); wait(); }
@@ -84,7 +88,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     QMutexLocker locker(&m_frameMutex);
 
     // Theoretical time for this frame in the master timeline
-    int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / 30;
+    int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
     int64_t targetTimeMs = currentRecordingTimeMs - m_jitterBufferMs;
     if (targetTimeMs < 0) targetTimeMs = 0;
 
@@ -199,14 +203,14 @@ void StreamWorker::captureLoop() {
                             QueuedFrame qf;
                             qf.frame = av_frame_alloc();
                             qf.frame->format = AV_PIX_FMT_YUV420P;
-                            qf.frame->width = 1920;
-                            qf.frame->height = 1080;
+                            qf.frame->width = m_targetWidth;
+                            qf.frame->height = m_targetHeight;
                             av_frame_get_buffer(qf.frame, 0);
 
                             // 3. Scale
                             m_swsCtx = sws_getCachedContext(m_swsCtx,
                                                             rawFrame->width, rawFrame->height, (AVPixelFormat)rawFrame->format,
-                                                            1920, 1080, AV_PIX_FMT_YUV420P,
+                                                            m_targetWidth, m_targetHeight, AV_PIX_FMT_YUV420P,
                                                             SWS_BICUBIC, nullptr, nullptr, nullptr);
 
                             sws_scale(m_swsCtx, rawFrame->data, rawFrame->linesize, 0, rawFrame->height,
@@ -354,12 +358,12 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     *encCtx = avcodec_alloc_context3(encoder);
     if (!*encCtx) return false;
 
-    (*encCtx)->width = 1920;
-    (*encCtx)->height = 1080;
+    (*encCtx)->width = m_targetWidth;
+    (*encCtx)->height = m_targetHeight;
 
     // --- CHANGE THIS: Use a standard MPEG-2 rate ---
-    (*encCtx)->time_base = {1, 30};      // Internal codec clock (30fps)
-    (*encCtx)->framerate = {30, 1};      // Target framerate
+    (*encCtx)->time_base = {1, m_targetFps};      // Internal codec clock
+    (*encCtx)->framerate = {m_targetFps, 1};      // Target framerate
     // -----------------------------------------------
 
     (*encCtx)->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -369,8 +373,8 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     m_latestFrame = av_frame_alloc();
     if (!m_latestFrame) return false;
     m_latestFrame->format = AV_PIX_FMT_YUV420P;
-    m_latestFrame->width = 1920;   // Your target width
-    m_latestFrame->height = 1080;  // Your target height
+    m_latestFrame->width = m_targetWidth;
+    m_latestFrame->height = m_targetHeight;
     if (av_frame_get_buffer(m_latestFrame, 0) < 0) return false; // Allocate actual pixel memory
 
     // Paint blue frame

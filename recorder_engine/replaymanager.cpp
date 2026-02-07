@@ -28,7 +28,7 @@ void ReplayManager::startRecording() {
     // 2. Initialize Muxer with timestamped filename to avoid overwrites
     const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     m_sessionFileName = m_baseFileName + "_" + timestamp;
-    if (!m_muxer->init(m_sessionFileName, m_trackUrls.size())) {
+    if (!m_muxer->init(m_sessionFileName, m_trackUrls.size(), m_videoWidth, m_videoHeight, m_fps)) {
         qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
     }
@@ -36,7 +36,8 @@ void ReplayManager::startRecording() {
     // 3. Launch Workers
     m_globalFrameCount = 0;
     for (int i = 0; i < m_trackUrls.size(); ++i) {
-        StreamWorker* worker = new StreamWorker(m_trackUrls[i], i, m_muxer, m_clock);
+        StreamWorker* worker = new StreamWorker(m_trackUrls[i], i, m_muxer, m_clock,
+                            m_videoWidth, m_videoHeight, m_fps);
 
         // Connect the pulse signal using QueuedConnection for thread safety
         connect(this, &ReplayManager::masterPulse,
@@ -47,7 +48,8 @@ void ReplayManager::startRecording() {
         worker->start(QThread::HighPriority);
     }
 
-    m_heartbeat->start(33); // ~30.3 fps
+    const int intervalMs = qMax(1, static_cast<int>(1000.0 / m_fps));
+    m_heartbeat->start(intervalMs);
     m_isRecording = true;
     qDebug() << "ReplayManager: Recording started.";
 }
@@ -96,7 +98,7 @@ void ReplayManager::onTimerTick() {
 
     // Derive frame index from elapsed time to avoid drift
     const int64_t elapsedMs = m_clock->elapsedMs();
-    const int64_t derivedFrame = (elapsedMs * 30) / 1000;
+    const int64_t derivedFrame = (elapsedMs * m_fps) / 1000;
     if (derivedFrame > m_globalFrameCount) {
         m_globalFrameCount = derivedFrame;
     }

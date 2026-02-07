@@ -6,6 +6,7 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             this, &UIManager::onRecorderPulse,
             Qt::QueuedConnection);
     m_settingsManager = new SettingsManager();
+    m_configPath = getSettingsPath("config.json");
     m_transport = new PlaybackTransport(this);
     m_transport->seek(0);
     refreshProviders();
@@ -14,6 +15,9 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
 QStringList UIManager::streamUrls() const { return m_currentSettings.streamUrls; }
 QString UIManager::saveLocation() const { return m_currentSettings.saveLocation; }
 QString UIManager::fileName() const { return m_currentSettings.fileName; }
+int UIManager::recordWidth() const { return m_currentSettings.videoWidth; }
+int UIManager::recordHeight() const { return m_currentSettings.videoHeight; }
+int UIManager::recordFps() const { return m_currentSettings.fps; }
 bool UIManager::isRecording() const { return m_replayManager->isRecording(); }
 
 void UIManager::setStreamUrls(const QStringList &urls) {
@@ -48,6 +52,33 @@ void UIManager::setFileName(const QString &name) {
         m_currentSettings.fileName = name;
         m_replayManager->setBaseFileName(name);
         emit fileNameChanged();
+    }
+}
+
+void UIManager::setRecordWidth(int width) {
+    if (width <= 0) return;
+    if (m_currentSettings.videoWidth != width) {
+        m_currentSettings.videoWidth = width;
+        m_replayManager->setVideoWidth(width);
+        emit recordWidthChanged();
+    }
+}
+
+void UIManager::setRecordHeight(int height) {
+    if (height <= 0) return;
+    if (m_currentSettings.videoHeight != height) {
+        m_currentSettings.videoHeight = height;
+        m_replayManager->setVideoHeight(height);
+        emit recordHeightChanged();
+    }
+}
+
+void UIManager::setRecordFps(int fps) {
+    if (fps <= 0) return;
+    if (m_currentSettings.fps != fps) {
+        m_currentSettings.fps = fps;
+        m_replayManager->setFps(fps);
+        emit recordFpsChanged();
     }
 }
 
@@ -124,16 +155,19 @@ void UIManager::updateUrl(int index, const QString &url) {
         emit streamUrlsChanged();
 
         // Auto-save to JSON
-        m_settingsManager->save(getSettingsPath("config.json"), m_currentSettings);
+        m_settingsManager->save(m_configPath, m_currentSettings);
     }
 }
 
 void UIManager::loadSettings() {
-    if (m_settingsManager->load(getSettingsPath("config.json"), m_currentSettings)) {
+    if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         // Apply to engine
         m_replayManager->setStreamUrls(m_currentSettings.streamUrls);
         m_replayManager->setOutputDirectory(m_currentSettings.saveLocation);
         m_replayManager->setBaseFileName(m_currentSettings.fileName);
+        m_replayManager->setVideoWidth(m_currentSettings.videoWidth);
+        m_replayManager->setVideoHeight(m_currentSettings.videoHeight);
+        m_replayManager->setFps(m_currentSettings.fps);
 
         refreshProviders();
 
@@ -141,6 +175,9 @@ void UIManager::loadSettings() {
         emit streamUrlsChanged();
         emit saveLocationChanged();
         emit fileNameChanged();
+        emit recordWidthChanged();
+        emit recordHeightChanged();
+        emit recordFpsChanged();
     }
 }
 
@@ -160,11 +197,10 @@ void UIManager::removeStream(int index) {
 }
 
 void UIManager::saveSettings() {
-    if (m_settingsManager->save(getSettingsPath("config.json"), m_currentSettings)) {
+    if (m_settingsManager->save(m_configPath, m_currentSettings)) {
         qDebug() << "Settings saved successfully.";
     }
 }
-
 void UIManager::onStartRequested() {
     // UI Manager can do final validation before telling engine to work
     if (m_replayManager->isRecording()) return;

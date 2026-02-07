@@ -25,12 +25,18 @@ public:
     void setStreamUrls(const QStringList &urls) { m_trackUrls = urls; }
     void setOutputDirectory(const QString &path) { m_outputDir = path; }
     void setBaseFileName(const QString &name) { m_baseFileName = name; }
+    void setVideoWidth(int width) { m_videoWidth = width; }
+    void setVideoHeight(int height) { m_videoHeight = height; }
+    void setFps(int fps) { m_fps = fps; }
     void updateTrackUrl(int index, const QString &url);
 
     // Getters
     QStringList getStreamUrls() const { return m_trackUrls; }
     QString getOutputDirectory() const { return m_outputDir; }
     QString getBaseFileName() const { return m_baseFileName; }
+    int getVideoWidth() const { return m_videoWidth; }
+    int getVideoHeight() const { return m_videoHeight; }
+    int getFps() const { return m_fps; }
 
     int64_t getElapsedMs();
     QString getVideoPath();
@@ -50,6 +56,10 @@ private:
     QString m_outputDir;
     QString m_baseFileName;
     QString m_sessionFileName;
+
+    int m_videoWidth = 1920;
+    int m_videoHeight = 1080;
+    int m_fps = 30;
 
     QTimer* m_heartbeat;
     Muxer* m_muxer;

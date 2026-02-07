@@ -17,7 +17,7 @@ ApplicationWindow {
         uiManager.loadSettings()
         uiManager.openStreams()
         playbackTab.selectedIndex = -1
-        playbackTab.singleViewActive = false
+        playbackTab.viewMode = "multi"
     }
 
     // FORCE THE THEME HERE
@@ -125,7 +125,8 @@ ApplicationWindow {
                     var hours = Math.floor(totalSeconds / 3600)
                     var minutes = Math.floor((totalSeconds % 3600) / 60)
                     var seconds = totalSeconds % 60
-                    var frames = Math.floor((ms % 1000) / (1000 / 30))
+                    var fps = Math.max(1, uiManager.recordFps)
+                    var frames = Math.floor((ms % 1000) / (1000 / fps))
 
                     var hh = hours < 10 ? "0" + hours : "" + hours
                     var mm = minutes < 10 ? "0" + minutes : "" + minutes
@@ -440,6 +441,53 @@ ApplicationWindow {
                         text: "Browse..."
                         onClicked: folderDialog.open()
                     }
+                }
+
+                GridLayout {
+                    columns: 5
+                    Layout.fillWidth: true
+
+                    Label { text: "Resolution"; }
+
+                    SpinBox {
+                        from: 320
+                        to: 7680
+                        stepSize: 10
+                        editable: true
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        value: uiManager.recordWidth
+                        onValueModified: uiManager.recordWidth = value
+                    }
+
+                    Label { text: "x"; }
+
+                    SpinBox {
+                        from: 240
+                        to: 4320
+                        stepSize: 10
+                        editable: true
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        value: uiManager.recordHeight
+                        onValueModified: uiManager.recordHeight = value
+                    }
+
+                    Item { }
+
+                    Label { text: "FPS"; }
+
+                    SpinBox {
+                        from: 1
+                        to: 120
+                        stepSize: 1
+                        editable: true
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        value: uiManager.recordFps
+                        onValueModified: uiManager.recordFps = value
+                    }
+
+                    Item { }
+                    Item { }
+                    Item { }
                 }
 
                 RowLayout {

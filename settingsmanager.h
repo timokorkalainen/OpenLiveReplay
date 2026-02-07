@@ -13,6 +13,9 @@ struct AppSettings {
     QStringList streamUrls;
     QString saveLocation;
     QString fileName;
+    int videoWidth = 1920;
+    int videoHeight = 1080;
+    int fps = 30;
 };
 
 class SettingsManager {
