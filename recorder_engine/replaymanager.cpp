@@ -24,6 +24,7 @@ void ReplayManager::startRecording() {
 
     m_clock = new RecordingClock();
     m_clock->start();
+    m_recordingStartEpochMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
 
     // 2. Initialize Muxer with timestamped filename to avoid overwrites
     const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
@@ -73,6 +74,7 @@ void ReplayManager::stopRecording() {
     m_workers.clear();
 
     m_muxer->close();
+    m_recordingStartEpochMs = 0;
 
     // Safe to delete clock after all workers have stopped accessing it
     if (m_clock) {

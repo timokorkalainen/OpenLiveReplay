@@ -21,6 +21,12 @@ int UIManager::recordWidth() const { return m_currentSettings.videoWidth; }
 int UIManager::recordHeight() const { return m_currentSettings.videoHeight; }
 int UIManager::recordFps() const { return m_currentSettings.fps; }
 bool UIManager::isRecording() const { return m_replayManager->isRecording(); }
+qint64 UIManager::recordingStartEpochMs() const {
+    return m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
+}
+bool UIManager::timeOfDayMode() const {
+    return m_currentSettings.showTimeOfDay;
+}
 
 void UIManager::setStreamUrls(const QStringList &urls) {
     if (m_currentSettings.streamUrls != urls) {
@@ -111,6 +117,13 @@ void UIManager::setRecordFps(int fps) {
     }
 }
 
+void UIManager::setTimeOfDayMode(bool enabled) {
+    if (m_currentSettings.showTimeOfDay == enabled) return;
+    m_currentSettings.showTimeOfDay = enabled;
+    emit timeOfDayModeChanged();
+    m_settingsManager->save(m_configPath, m_currentSettings);
+}
+
 void UIManager::openStreams() {
     refreshProviders();
     if (m_replayManager->isRecording()) {
@@ -140,6 +153,7 @@ void UIManager::startRecording() {
 
     emit recordingStatusChanged();
     emit recordingStarted();
+    emit recordingStartEpochMsChanged();
 }
 
 void UIManager::restartPlaybackWorker() {
@@ -167,6 +181,7 @@ void UIManager::stopRecording() {
 
     emit recordingStatusChanged();
     emit recordingStopped();
+    emit recordingStartEpochMsChanged();
 }
 
 void UIManager::seekPlayback(int64_t ms) {
@@ -223,12 +238,12 @@ void UIManager::loadSettings() {
         // Sync QML
         emit streamUrlsChanged();
         emit streamNamesChanged();
-        emit streamNamesChanged();
         emit saveLocationChanged();
         emit fileNameChanged();
         emit recordWidthChanged();
         emit recordHeightChanged();
         emit recordFpsChanged();
+        emit timeOfDayModeChanged();
     }
 }
 
@@ -328,6 +343,7 @@ void UIManager::scrubToLive() {
 void UIManager::onRecorderPulse(int64_t elapsed, int64_t frameCount) {
     emit recordedDurationMsChanged();
     emit scrubPositionChanged();
+    emit recordingStartEpochMsChanged();
 
     if (m_followLive && m_transport && m_transport->isPlaying()) {
         const int64_t liveEdge = recordedDurationMs();

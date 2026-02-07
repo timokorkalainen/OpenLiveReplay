@@ -119,6 +119,8 @@ ApplicationWindow {
                 property string viewMode: "multi"
                 property int gridColumns: Math.max(1, Math.ceil(Math.sqrt(Math.max(1, streamCount))))
                 property int gridRows: Math.ceil(Math.max(1, streamCount) / gridColumns)
+                property bool showTimeOfDay: uiManager.timeOfDayMode
+                property int clockTick: 0
 
                 function formatTimecode(ms) {
                     var totalSeconds = Math.floor(ms / 1000)
@@ -133,6 +135,23 @@ ApplicationWindow {
                     var ss = seconds < 10 ? "0" + seconds : "" + seconds
                     var ff = frames < 10 ? "0" + frames : "" + frames
                     return hh + ":" + mm + ":" + ss + "." + ff
+                }
+
+                function formatTimeOfDay(epochMs) {
+                    if (epochMs <= 0) return "--:--:--"
+                    var d = new Date(epochMs)
+                    var hh = d.getHours() < 10 ? "0" + d.getHours() : "" + d.getHours()
+                    var mm = d.getMinutes() < 10 ? "0" + d.getMinutes() : "" + d.getMinutes()
+                    var ss = d.getSeconds() < 10 ? "0" + d.getSeconds() : "" + d.getSeconds()
+                    return hh + ":" + mm + ":" + ss
+                }
+
+                Timer {
+                    id: clockTimer
+                    interval: 500
+                    running: playbackTab.showTimeOfDay
+                    repeat: true
+                    onTriggered: playbackTab.clockTick = playbackTab.clockTick + 1
                 }
 
                 function updateVisibleStreams() {
@@ -326,11 +345,17 @@ ApplicationWindow {
                     spacing: 12
 
                     Text {
-                        text: playbackTab.formatTimecode(uiManager.scrubPosition)
+                        text: playbackTab.showTimeOfDay && uiManager.recordingStartEpochMs > 0
+                              ? playbackTab.formatTimeOfDay(uiManager.recordingStartEpochMs + uiManager.scrubPosition)
+                              : playbackTab.formatTimecode(uiManager.scrubPosition)
                         color: "#eee"
                         font.family: "Menlo"
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: uiManager.timeOfDayMode = !uiManager.timeOfDayMode
+                        }
                     }
 
                     Item { Layout.fillWidth: true }
@@ -400,11 +425,18 @@ ApplicationWindow {
                     Item { Layout.fillWidth: true }
 
                     Text {
-                        text: playbackTab.formatTimecode(uiManager.recordedDurationMs)
+                        text: playbackTab.showTimeOfDay
+                              ? (playbackTab.clockTick, playbackTab.formatTimeOfDay(Date.now()))
+                              : playbackTab.formatTimecode(uiManager.recordedDurationMs)
                         color: "#eee"
                         font.family: "Menlo"
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: uiManager.timeOfDayMode = !uiManager.timeOfDayMode
+                        }
+                        onVisibleChanged: clockTimer.restart()
                     }
                 }
             }

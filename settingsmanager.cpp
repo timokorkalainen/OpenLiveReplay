@@ -14,6 +14,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["videoWidth"] = settings.videoWidth;
     root["videoHeight"] = settings.videoHeight;
     root["fps"] = settings.fps;
+    root["showTimeOfDay"] = settings.showTimeOfDay;
 
     // Convert QStringList to QJsonArray
     QJsonArray urlArray;
@@ -82,6 +83,7 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.videoWidth = root["videoWidth"].toInt(settings.videoWidth);
     settings.videoHeight = root["videoHeight"].toInt(settings.videoHeight);
     settings.fps = root["fps"].toInt(settings.fps);
+    settings.showTimeOfDay = root["showTimeOfDay"].toBool(settings.showTimeOfDay);
 
     // Parse the stream list
     settings.streamUrls.clear();

@@ -24,6 +24,8 @@ class UIManager : public QObject {
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
     Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
     Q_PROPERTY(int64_t scrubPosition READ scrubPosition NOTIFY scrubPositionChanged)
+    Q_PROPERTY(qint64 recordingStartEpochMs READ recordingStartEpochMs NOTIFY recordingStartEpochMsChanged)
+    Q_PROPERTY(bool timeOfDayMode READ timeOfDayMode WRITE setTimeOfDayMode NOTIFY timeOfDayModeChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
 
 public:
@@ -41,6 +43,8 @@ public:
     QVariantList playbackProviders() const;
     int64_t recordedDurationMs();
     int64_t scrubPosition();
+    qint64 recordingStartEpochMs() const;
+    bool timeOfDayMode() const;
     PlaybackTransport* transport() const { return m_transport; }
 
     // Setters
@@ -51,6 +55,7 @@ public:
     void setRecordWidth(int width);
     void setRecordHeight(int height);
     void setRecordFps(int fps);
+    void setTimeOfDayMode(bool enabled);
 
     void refreshProviders();
 
@@ -86,6 +91,8 @@ signals:
     void recordingStopped();
     void recordedDurationMsChanged();
     void scrubPositionChanged();
+    void recordingStartEpochMsChanged();
+    void timeOfDayModeChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI

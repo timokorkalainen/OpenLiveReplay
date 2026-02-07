@@ -17,6 +17,7 @@ struct AppSettings {
     int videoWidth = 1920;
     int videoHeight = 1080;
     int fps = 30;
+    bool showTimeOfDay = false;
 };
 
 class SettingsManager {

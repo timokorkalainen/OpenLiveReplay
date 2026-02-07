@@ -42,6 +42,7 @@ public:
 
     int64_t getElapsedMs();
     QString getVideoPath();
+    qint64 getRecordingStartEpochMs() const { return m_recordingStartEpochMs; }
 signals:
     void masterPulse(int64_t frameIndex, int64_t wallClockUs);
 
@@ -68,6 +69,7 @@ private:
     Muxer* m_muxer;
     RecordingClock* m_clock;
     QList<StreamWorker*> m_workers;
+    qint64 m_recordingStartEpochMs = 0;
 };
 
 #endif // REPLAYMANAGER_H
