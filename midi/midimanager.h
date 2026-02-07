@@ -30,6 +30,7 @@ signals:
     void currentPortChanged();
     void connectedChanged();
     void midiTriggered();
+    void midiMessage(int status, int data1, int data2);
 
 private:
     static void midiCallback(double deltaTime, std::vector<unsigned char> *message, void *userData);

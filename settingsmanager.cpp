@@ -15,6 +15,17 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["videoHeight"] = settings.videoHeight;
     root["fps"] = settings.fps;
     root["showTimeOfDay"] = settings.showTimeOfDay;
+    root["midiPortName"] = settings.midiPortName;
+
+    QJsonArray midiArray;
+    for (auto it = settings.midiBindings.constBegin(); it != settings.midiBindings.constEnd(); ++it) {
+        QJsonObject obj;
+        obj["action"] = it.key();
+        obj["status"] = it.value().first;
+        obj["data1"] = it.value().second;
+        midiArray.append(obj);
+    }
+    root["midiBindings"] = midiArray;
 
     // Convert QStringList to QJsonArray
     QJsonArray urlArray;
@@ -84,6 +95,18 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.videoHeight = root["videoHeight"].toInt(settings.videoHeight);
     settings.fps = root["fps"].toInt(settings.fps);
     settings.showTimeOfDay = root["showTimeOfDay"].toBool(settings.showTimeOfDay);
+    settings.midiPortName = root["midiPortName"].toString();
+    settings.midiBindings.clear();
+    QJsonArray midiArray = root["midiBindings"].toArray();
+    for (const QJsonValue &val : midiArray) {
+        QJsonObject obj = val.toObject();
+        int action = obj["action"].toInt(-1);
+        int status = obj["status"].toInt(-1);
+        int data1 = obj["data1"].toInt(-1);
+        if (action >= 0 && status >= 0 && data1 >= 0) {
+            settings.midiBindings.insert(action, qMakePair(status, data1));
+        }
+    }
 
     // Parse the stream list
     settings.streamUrls.clear();

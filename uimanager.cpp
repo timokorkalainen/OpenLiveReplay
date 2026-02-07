@@ -16,14 +16,61 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_transport->seek(0);
     m_transport->setFps(m_currentSettings.fps);
     m_midiManager = new MidiManager(this);
-    connect(m_midiManager, &MidiManager::midiTriggered, this, [this]() {
-        if (m_transport) {
-            m_transport->setPlaying(!m_transport->isPlaying());
+    connect(m_midiManager, &MidiManager::midiMessage, this, [this](int status, int data1, int data2) {
+        if (status < 0 || data1 < 0) return;
+
+        const int statusType = status & 0xF0;
+        const bool isNoteOff = (statusType == 0x80) || (statusType == 0x90 && data2 <= 0);
+        const bool isControlRelease = (statusType == 0xB0 && data2 <= 0);
+        if (isNoteOff || isControlRelease) return;
+
+        if (m_midiLearnAction >= 0) {
+            m_midiBindings[m_midiLearnAction] = {status, data1};
+            m_currentSettings.midiBindings.insert(m_midiLearnAction, qMakePair(status, data1));
+            m_settingsManager->save(m_configPath, m_currentSettings);
+            m_midiLearnAction = -1;
+            emit midiLearnActionChanged();
+            m_midiBindingsVersion++;
+            emit midiBindingsChanged();
+            return;
+        }
+
+        int matchedAction = -1;
+        for (auto it = m_midiBindings.constBegin(); it != m_midiBindings.constEnd(); ++it) {
+            if (it.value().status == status && it.value().data1 == data1) {
+                matchedAction = it.key();
+                break;
+            }
+        }
+        if (matchedAction < 0) return;
+
+        switch (matchedAction) {
+        case 0: playPause(); break;
+        case 1: rewind5x(); break;
+        case 2: forward5x(); break;
+        case 3: stepFrame(); break;
+        case 4: goLive(); break;
+        case 5: captureCurrent(); break;
+        case 6:
+            setPlaybackViewState(false, -1);
+            emit multiviewRequested();
+            break;
+        default:
+            if (matchedAction >= 100 && matchedAction < 108) {
+                emit feedSelectRequested(matchedAction - 100);
+            }
+            break;
         }
     });
     connect(m_midiManager, &MidiManager::portsChanged, this, &UIManager::midiPortsChanged);
     connect(m_midiManager, &MidiManager::currentPortChanged, this, &UIManager::midiPortIndexChanged);
     connect(m_midiManager, &MidiManager::connectedChanged, this, &UIManager::midiConnectedChanged);
+    connect(m_midiManager, &MidiManager::portsChanged, this, [this]() {
+        if (!m_currentSettings.midiPortName.isEmpty()) {
+            int idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
+            if (idx >= 0) m_midiManager->openPort(idx);
+        }
+    });
     refreshProviders();
 }
 
@@ -56,6 +103,18 @@ int UIManager::midiPortIndex() const {
 
 bool UIManager::midiConnected() const {
     return m_midiManager ? m_midiManager->connected() : false;
+}
+
+int UIManager::midiLearnAction() const {
+    return m_midiLearnAction;
+}
+
+QString UIManager::midiPortName() const {
+    return m_currentSettings.midiPortName;
+}
+
+int UIManager::midiBindingsVersion() const {
+    return m_midiBindingsVersion;
 }
 
 void UIManager::setStreamUrls(const QStringList &urls) {
@@ -161,6 +220,70 @@ void UIManager::setMidiPortIndex(int index) {
         return;
     }
     m_midiManager->openPort(index);
+    if (index >= 0 && index < m_midiManager->ports().size()) {
+        m_currentSettings.midiPortName = m_midiManager->ports().at(index);
+        emit midiPortNameChanged();
+        m_settingsManager->save(m_configPath, m_currentSettings);
+    }
+}
+
+void UIManager::beginMidiLearn(int action) {
+    if (m_midiLearnAction == action) return;
+    m_midiLearnAction = action;
+    emit midiLearnActionChanged();
+}
+
+void UIManager::clearMidiBinding(int action) {
+    m_midiBindings.remove(action);
+    m_currentSettings.midiBindings.remove(action);
+    m_settingsManager->save(m_configPath, m_currentSettings);
+    m_midiBindingsVersion++;
+    emit midiBindingsChanged();
+}
+
+QString UIManager::midiBindingLabel(int action) const {
+    if (!m_midiBindings.contains(action)) return QString("Unassigned");
+    const auto binding = m_midiBindings.value(action);
+    if (binding.status < 0 || binding.data1 < 0) return QString("Unassigned");
+    return QString("0x%1 0x%2").arg(binding.status, 2, 16, QChar('0')).arg(binding.data1, 2, 16, QChar('0')).toUpper();
+}
+
+void UIManager::playPause() {
+    if (!m_transport) return;
+    m_transport->setPlaying(!m_transport->isPlaying());
+}
+
+void UIManager::rewind5x() {
+    if (!m_transport) return;
+    m_transport->setSpeed(-5.0);
+    m_transport->setPlaying(true);
+}
+
+void UIManager::forward5x() {
+    if (!m_transport) return;
+    m_transport->setSpeed(5.0);
+    m_transport->setPlaying(true);
+}
+
+void UIManager::stepFrame() {
+    if (!m_transport) return;
+    m_transport->step(1);
+    m_transport->setPlaying(false);
+}
+
+void UIManager::goLive() {
+    if (!m_transport) return;
+    m_transport->setSpeed(1.0);
+    scrubToLive();
+}
+
+void UIManager::captureCurrent() {
+    captureSnapshot(m_playbackSingleView, m_playbackSelectedIndex, scrubPosition());
+}
+
+void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
+    m_playbackSingleView = singleView;
+    m_playbackSelectedIndex = selectedIndex;
 }
 
 void UIManager::openStreams() {
@@ -276,6 +399,18 @@ void UIManager::loadSettings() {
             m_transport->setFps(m_currentSettings.fps);
         }
 
+        m_midiBindings.clear();
+        for (auto it = m_currentSettings.midiBindings.constBegin(); it != m_currentSettings.midiBindings.constEnd(); ++it) {
+            m_midiBindings.insert(it.key(), {it.value().first, it.value().second});
+        }
+        m_midiBindingsVersion++;
+        emit midiBindingsChanged();
+
+        if (m_midiManager && !m_currentSettings.midiPortName.isEmpty()) {
+            int idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
+            if (idx >= 0) m_midiManager->openPort(idx);
+        }
+
         refreshProviders();
 
         // Sync QML
@@ -287,6 +422,7 @@ void UIManager::loadSettings() {
         emit recordHeightChanged();
         emit recordFpsChanged();
         emit timeOfDayModeChanged();
+        emit midiPortNameChanged();
     }
 }
 

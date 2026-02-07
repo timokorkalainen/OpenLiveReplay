@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QUrl>
+#include <QHash>
 #include "settingsmanager.h"
 #include "recorder_engine/replaymanager.h"
 #include "playback/frameprovider.h"
@@ -31,6 +32,9 @@ class UIManager : public QObject {
     Q_PROPERTY(QStringList midiPorts READ midiPorts NOTIFY midiPortsChanged)
     Q_PROPERTY(int midiPortIndex READ midiPortIndex WRITE setMidiPortIndex NOTIFY midiPortIndexChanged)
     Q_PROPERTY(bool midiConnected READ midiConnected NOTIFY midiConnectedChanged)
+    Q_PROPERTY(int midiLearnAction READ midiLearnAction NOTIFY midiLearnActionChanged)
+    Q_PROPERTY(QString midiPortName READ midiPortName NOTIFY midiPortNameChanged)
+    Q_PROPERTY(int midiBindingsVersion READ midiBindingsVersion NOTIFY midiBindingsChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
 
 public:
@@ -54,6 +58,9 @@ public:
     QStringList midiPorts() const;
     int midiPortIndex() const;
     bool midiConnected() const;
+    int midiLearnAction() const;
+    QString midiPortName() const;
+    int midiBindingsVersion() const;
     PlaybackTransport* transport() const { return m_transport; }
 
     // Setters
@@ -83,6 +90,16 @@ public:
     Q_INVOKABLE void captureSnapshot(bool singleView, int selectedIndex, int64_t playheadMs);
     Q_INVOKABLE void refreshMidiPorts();
     Q_INVOKABLE void setMidiPortIndex(int index);
+    Q_INVOKABLE void beginMidiLearn(int action);
+    Q_INVOKABLE void clearMidiBinding(int action);
+    Q_INVOKABLE QString midiBindingLabel(int action) const;
+    Q_INVOKABLE void playPause();
+    Q_INVOKABLE void rewind5x();
+    Q_INVOKABLE void forward5x();
+    Q_INVOKABLE void stepFrame();
+    Q_INVOKABLE void goLive();
+    Q_INVOKABLE void captureCurrent();
+    Q_INVOKABLE void setPlaybackViewState(bool singleView, int selectedIndex);
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -108,6 +125,11 @@ signals:
     void midiPortsChanged();
     void midiPortIndexChanged();
     void midiConnectedChanged();
+    void midiLearnActionChanged();
+    void midiBindingsChanged();
+    void midiPortNameChanged();
+    void feedSelectRequested(int index);
+    void multiviewRequested();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -134,6 +156,16 @@ private:
     bool m_followLive = false;
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;
+    int m_midiLearnAction = -1;
+    bool m_playbackSingleView = false;
+    int m_playbackSelectedIndex = -1;
+    int m_midiBindingsVersion = 0;
+
+    struct MidiBinding {
+        int status = -1;
+        int data1 = -1;
+    };
+    QHash<int, MidiBinding> m_midiBindings;
 };
 
 #endif // UIMANAGER_H

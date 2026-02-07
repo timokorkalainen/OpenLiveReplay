@@ -79,7 +79,17 @@ void MidiManager::closePort() {
 void MidiManager::midiCallback(double, std::vector<unsigned char> *message, void *userData) {
     auto *self = static_cast<MidiManager *>(userData);
     if (!self || !message || message->empty()) return;
+    int status = static_cast<int>((*message)[0]);
+    int data1 = message->size() > 1 ? static_cast<int>((*message)[1]) : -1;
+    int data2 = message->size() > 2 ? static_cast<int>((*message)[2]) : -1;
     self->emitTriggered();
+    if (self->thread() == QThread::currentThread()) {
+        emit self->midiMessage(status, data1, data2);
+        return;
+    }
+    QMetaObject::invokeMethod(self, [self, status, data1, data2]() {
+        emit self->midiMessage(status, data1, data2);
+    }, Qt::QueuedConnection);
 }
 
 void MidiManager::emitTriggered() {

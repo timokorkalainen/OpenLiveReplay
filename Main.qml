@@ -53,82 +53,140 @@ ApplicationWindow {
             currentIndex: mainTabs.currentIndex
 
             // --- Control Tab ---
-            ColumnLayout {
-                spacing: 16
+            ScrollView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                Text {
-                    text: "Runtime Control"
-                    font.bold: true
-                    color: "#eee"
-                }
-
-                GroupBox {
-                    title: "MIDI"
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 16
                     Layout.fillWidth: true
+
+                    Text {
+                        text: "Runtime Control"
+                        font.bold: true
+                        color: "#eee"
+                    }
 
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 12
 
-                        ComboBox {
-                            Layout.fillWidth: true
-                            model: uiManager.midiPorts
-                            currentIndex: uiManager.midiPortIndex
-                            onActivated: uiManager.setMidiPortIndex(currentIndex)
-                        }
-
                         Button {
-                            text: "Refresh"
-                            onClicked: uiManager.refreshMidiPorts()
+                            id: recordButton
+                            text: uiManager.isRecording ? "STOP RECORDING" : "START RECORDING"
+                            padding: 18
+
+                            background: Rectangle {
+                                color: uiManager.isRecording ? "#d32f2f" : "#2e7d32"
+                                radius: 6
+                            }
+
+                            contentItem: Text {
+                                text: recordButton.text
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+
+                            onClicked: uiManager.isRecording ? uiManager.stopRecording() : uiManager.startRecording()
                         }
 
-                        Text {
-                            text: uiManager.midiConnected ? "Connected" : "Disconnected"
-                            color: uiManager.midiConnected ? "#4CAF50" : "#777"
-                            verticalAlignment: Text.AlignVCenter
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    Text {
+                        text: uiManager.isRecording ? "● RECORDING LIVE" : "IDLE"
+                        color: uiManager.isRecording ? "#ff5252" : "#666"
+                    }
+
+                    GroupBox {
+                        title: "MIDI"
+                        Layout.fillWidth: true
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 12
+
+                            ComboBox {
+                                Layout.fillWidth: true
+                                model: uiManager.midiPorts
+                                currentIndex: uiManager.midiPortIndex
+                                onActivated: uiManager.setMidiPortIndex(currentIndex)
+                            }
+
+                            Button {
+                                text: "Refresh"
+                                onClicked: uiManager.refreshMidiPorts()
+                            }
+
+                            Text {
+                                text: uiManager.midiConnected ? "Connected" : "Disconnected"
+                                color: uiManager.midiConnected ? "#4CAF50" : "#777"
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                        }
+                    }
+
+                    GroupBox {
+                        title: "MIDI Mapping"
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Repeater {
+                                model: [
+                                    { name: "Play/Pause", action: 0 },
+                                    { name: "Rewind 5.0x", action: 1 },
+                                    { name: "Forward 5.0x", action: 2 },
+                                    { name: "Next Frame", action: 3 },
+                                    { name: "Go Live", action: 4 },
+                                    { name: "Capture", action: 5 },
+                                    { name: "Multiview", action: 6 },
+                                    { name: "Feed 1", action: 100 },
+                                    { name: "Feed 2", action: 101 },
+                                    { name: "Feed 3", action: 102 },
+                                    { name: "Feed 4", action: 103 },
+                                    { name: "Feed 5", action: 104 },
+                                    { name: "Feed 6", action: 105 },
+                                    { name: "Feed 7", action: 106 },
+                                    { name: "Feed 8", action: 107 }
+                                ]
+
+                                delegate: RowLayout {
+                                    required property var modelData
+                                    Layout.fillWidth: true
+                                    spacing: 8
+
+                                    Text {
+                                        text: modelData.name
+                                        Layout.preferredWidth: 130
+                                        color: "#eee"
+                                    }
+
+                                    Text {
+                                             text: (uiManager.midiBindingsVersion >= 0
+                                                 ? uiManager.midiBindingLabel(modelData.action)
+                                                 : uiManager.midiBindingLabel(modelData.action))
+                                        color: uiManager.midiLearnAction === modelData.action ? "#ff9800" : "#aaa"
+                                        Layout.fillWidth: true
+                                    }
+
+                                    Button {
+                                        text: uiManager.midiLearnAction === modelData.action ? "Listening..." : "Learn"
+                                        onClicked: uiManager.beginMidiLearn(modelData.action)
+                                    }
+
+                                    Button {
+                                        text: "Clear"
+                                        onClicked: uiManager.clearMidiBinding(modelData.action)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 12
-
-                    Button {
-                        id: recordButton
-                        text: uiManager.isRecording ? "STOP RECORDING" : "START RECORDING"
-                        padding: 18
-
-                        background: Rectangle {
-                            color: uiManager.isRecording ? "#d32f2f" : "#2e7d32"
-                            radius: 6
-                        }
-
-                        contentItem: Text {
-                            text: recordButton.text
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-
-                        onClicked: uiManager.isRecording ? uiManager.stopRecording() : uiManager.startRecording()
-                    }
-
-                    Button {
-                        id: controlSpacer
-                        visible: false
-                    }
-
-                    Item { Layout.fillWidth: true }
-                }
-
-                Text {
-                    text: uiManager.isRecording ? "● RECORDING LIVE" : "IDLE"
-                    color: uiManager.isRecording ? "#ff5252" : "#666"
-                }
-
-                Item { Layout.fillHeight: true }
             }
 
             // --- Playback Tab ---
@@ -149,6 +207,7 @@ ApplicationWindow {
                 property int gridRows: Math.ceil(Math.max(1, streamCount) / gridColumns)
                 property bool showTimeOfDay: uiManager.timeOfDayMode
                 property int clockTick: 0
+                property bool holdWasPlaying: false
 
                 function formatTimecode(ms) {
                     var totalSeconds = Math.floor(ms / 1000)
@@ -213,11 +272,24 @@ ApplicationWindow {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
+                        uiManager.setPlaybackViewState(false, -1)
                     }
                     function onStreamUrlsChanged() {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
+                        uiManager.setPlaybackViewState(false, -1)
+                    }
+                    function onFeedSelectRequested(index) {
+                        playbackTab.selectedIndex = index
+                        playbackTab.viewMode = "single"
+                        uiManager.setPlaybackViewState(true, index)
+                    }
+                    function onMultiviewRequested() {
+                        playbackTab.selectedIndex = -1
+                        playbackTab.viewMode = "multi"
+                        playbackTab.updateVisibleStreams()
+                        uiManager.setPlaybackViewState(false, -1)
                     }
                 }
 
@@ -226,6 +298,7 @@ ApplicationWindow {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
+                        uiManager.setPlaybackViewState(false, -1)
                     }
                 }
 
@@ -249,11 +322,11 @@ ApplicationWindow {
                         }
 
                         Text {
-                                     text: playbackTab.selectedIndex >= 0
-                                             ? ((playbackTab.selectedIndex < uiManager.streamNames.length && uiManager.streamNames[playbackTab.selectedIndex].length > 0)
-                                                 ? uiManager.streamNames[playbackTab.selectedIndex]
-                                                 : ("CAM " + (playbackTab.selectedIndex + 1)))
-                                             : ""
+                            text: playbackTab.selectedIndex >= 0
+                                  ? ((playbackTab.selectedIndex < uiManager.streamNames.length && uiManager.streamNames[playbackTab.selectedIndex].length > 0)
+                                     ? uiManager.streamNames[playbackTab.selectedIndex]
+                                     : ("CAM " + (playbackTab.selectedIndex + 1)))
+                                  : ""
                             color: "white"
                             anchors.bottom: parent.bottom
                             anchors.left: parent.left
@@ -267,6 +340,7 @@ ApplicationWindow {
                             onClicked: {
                                 playbackTab.selectedIndex = -1
                                 playbackTab.viewMode = "multi"
+                                uiManager.setPlaybackViewState(false, -1)
                             }
                         }
 
@@ -304,8 +378,8 @@ ApplicationWindow {
                                 fillMode: VideoOutput.PreserveAspectFit
                                 z: 1
                                 Component.onCompleted: {
-                                        if (streamIndex < uiManager.playbackProviders.length) {
-                                            uiManager.playbackProviders[streamIndex].videoSink = vOutput.videoSink
+                                    if (streamIndex < uiManager.playbackProviders.length) {
+                                        uiManager.playbackProviders[streamIndex].videoSink = vOutput.videoSink
                                     }
                                 }
                             }
@@ -337,6 +411,7 @@ ApplicationWindow {
                                 onClicked: {
                                     playbackTab.selectedIndex = streamIndex
                                     playbackTab.viewMode = "single"
+                                    uiManager.setPlaybackViewState(true, streamIndex)
                                 }
                             }
                         }
@@ -390,24 +465,47 @@ ApplicationWindow {
 
                     Button {
                         text: "REV 5.0x"
-                        onClicked: {
+                        onPressed: {
+                            playbackTab.holdWasPlaying = uiManager.transport.isPlaying
                             uiManager.transport.setSpeed(-5.0)
                             uiManager.transport.setPlaying(true)
+                        }
+                        onReleased: {
+                            uiManager.transport.setSpeed(1.0)
+                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                        onCanceled: {
+                            uiManager.transport.setSpeed(1.0)
+                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                    }
+
+                    Button {
+                        text: "FWD 5.0x"
+                        onPressed: {
+                            playbackTab.holdWasPlaying = uiManager.transport.isPlaying
+                            uiManager.transport.setSpeed(5.0)
+                            uiManager.transport.setPlaying(true)
+                        }
+                        onReleased: {
+                            uiManager.transport.setSpeed(1.0)
+                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                        onCanceled: {
+                            uiManager.transport.setSpeed(1.0)
+                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
                         }
                     }
 
                     Button {
                         text: uiManager.transport.isPlaying ? "PAUSE" : "PLAY"
-                        onClicked: uiManager.transport.setPlaying(!uiManager.transport.isPlaying);
+                        onClicked: uiManager.playPause()
                         highlighted: uiManager.transport.isPlaying
                     }
 
                     Button {
                         text: ">"
-                        onClicked: {
-                            uiManager.transport.step(1)
-                            uiManager.transport.setPlaying(false)
-                        }
+                        onClicked: uiManager.stepFrame()
                     }
 
                     Button {
@@ -444,27 +542,22 @@ ApplicationWindow {
 
                     Button {
                         text: "Live"
-                        onClicked: {
-                            uiManager.transport.setSpeed(1.0)
-                            uiManager.scrubToLive();
-                        }
+                        onClicked: uiManager.goLive()
                     }
 
                     Button {
                         text: "Capture"
-                        onClicked: {
-                            uiManager.captureSnapshot(playbackTab.viewMode === "single",
-                                                       playbackTab.selectedIndex,
-                                                       uiManager.scrubPosition)
-                        }
+                        onClicked: uiManager.captureCurrent()
                     }
 
                     Item { Layout.fillWidth: true }
 
                     Text {
                         text: playbackTab.showTimeOfDay
-                              ? (playbackTab.clockTick, playbackTab.formatTimeOfDay(Date.now()))
-                              : playbackTab.formatTimecode(uiManager.recordedDurationMs)
+                            ? (playbackTab.clockTick >= 0
+                               ? playbackTab.formatTimeOfDay(Date.now())
+                               : playbackTab.formatTimeOfDay(Date.now()))
+                            : playbackTab.formatTimecode(uiManager.recordedDurationMs)
                         color: "#eee"
                         font.family: "Menlo"
                         font.pixelSize: 14

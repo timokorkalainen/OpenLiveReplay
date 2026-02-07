@@ -18,6 +18,8 @@ struct AppSettings {
     int videoHeight = 1080;
     int fps = 30;
     bool showTimeOfDay = false;
+    QString midiPortName;
+    QMap<int, QPair<int,int>> midiBindings;
 };
 
 class SettingsManager {
