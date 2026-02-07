@@ -1,3 +1,4 @@
+pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -11,6 +12,13 @@ ApplicationWindow {
     width: 800
     height: 600
     title: "OpenLiveReplay"
+
+    Component.onCompleted: {
+        uiManager.loadSettings()
+        uiManager.openStreams()
+        playbackTab.selectedIndex = -1
+        playbackTab.singleViewActive = false
+    }
 
     // FORCE THE THEME HERE
     Universal.theme: Universal.Dark
@@ -97,43 +105,171 @@ ApplicationWindow {
 
             // --- Playback Tab ---
             ColumnLayout {
+                id: playbackTab
                 spacing: 12
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                GridLayout {
+                property int selectedIndex: -1
+                property var visibleStreamIndexes: []
+                property int streamCount: visibleStreamIndexes.length
+                property var selectedProvider: (selectedIndex >= 0 && selectedIndex < uiManager.playbackProviders.length)
+                                               ? uiManager.playbackProviders[selectedIndex]
+                                               : null
+                property string viewMode: "multi"
+                property int gridColumns: Math.max(1, Math.ceil(Math.sqrt(Math.max(1, streamCount))))
+                property int gridRows: Math.ceil(Math.max(1, streamCount) / gridColumns)
+
+                function updateVisibleStreams() {
+                    var indexes = []
+                    var total = Math.max(uiManager.streamUrls.length, uiManager.playbackProviders.length)
+                    if (uiManager.streamUrls.length > 0) {
+                        for (var i = 0; i < uiManager.streamUrls.length; ++i) {
+                            var url = uiManager.streamUrls[i]
+                            if (url && url.trim().length > 0) {
+                                indexes.push(i)
+                            }
+                        }
+                    }
+                    if (indexes.length === 0 && total > 0) {
+                        for (var j = 0; j < total; ++j) {
+                            indexes.push(j)
+                        }
+                    }
+                    visibleStreamIndexes = indexes
+                }
+
+                Component.onCompleted: {
+                    selectedIndex = -1
+                    viewMode = "multi"
+                    updateVisibleStreams()
+                }
+
+                Connections {
+                    target: uiManager
+                    function onPlaybackProvidersChanged() {
+                        playbackTab.selectedIndex = -1
+                        playbackTab.viewMode = "multi"
+                        playbackTab.updateVisibleStreams()
+                    }
+                    function onStreamUrlsChanged() {
+                        playbackTab.selectedIndex = -1
+                        playbackTab.viewMode = "multi"
+                        playbackTab.updateVisibleStreams()
+                    }
+                }
+
+                onVisibleChanged: {
+                    if (visible) {
+                        playbackTab.selectedIndex = -1
+                        playbackTab.viewMode = "multi"
+                        playbackTab.updateVisibleStreams()
+                    }
+                }
+
+                Item {
+                    id: playbackView
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    anchors.margins: 2
-                    columns: Math.ceil(Math.sqrt(uiManager.playbackProviders.length))
 
-                    Repeater {
-                        model: uiManager.playbackProviders
+                    Rectangle {
+                        id: singleView
+                        anchors.fill: parent
+                        color: "black"
+                        border.color: "#00C853"
+                        border.width: 2
+                        visible: playbackTab.viewMode === "single" && playbackTab.selectedIndex >= 0 && uiManager.playbackProviders.length > 0
 
-                        Rectangle {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
+                        VideoOutput {
+                            id: singleOutput
+                            anchors.fill: parent
+                            fillMode: VideoOutput.PreserveAspectFit
+                        }
+
+                        Text {
+                            text: playbackTab.selectedIndex >= 0 ? ("CAM " + (playbackTab.selectedIndex + 1)) : ""
+                            color: "white"
+                            anchors.bottom: parent.bottom
+                            anchors.left: parent.left
+                            anchors.margins: 6
+                            font.family: "Monospace"
+                            font.pixelSize: 14
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                playbackTab.selectedIndex = -1
+                                playbackTab.viewMode = "multi"
+                            }
+                        }
+
+                        onVisibleChanged: {
+                            if (visible && playbackTab.selectedProvider) {
+                                playbackTab.selectedProvider.videoSink = singleOutput.videoSink
+                            }
+                        }
+                    }
+
+                    GridView {
+                        id: multiViewGrid
+                        anchors.fill: parent
+                        anchors.margins: 0
+                        visible: playbackTab.viewMode === "multi"
+                        clip: true
+                        interactive: false
+                        cellHeight: parent.height / playbackTab.gridRows
+                        cellWidth: parent.width / playbackTab.gridColumns
+
+                        model: playbackTab.visibleStreamIndexes
+
+                        delegate: Rectangle {
+                            required property var modelData
+                            property int streamIndex: modelData
                             color: "black"
                             border.color: "red"
                             border.width: 2
+                            width: multiViewGrid.cellWidth
+                            height: multiViewGrid.cellHeight
 
                             VideoOutput {
                                 id: vOutput
                                 anchors.fill: parent
                                 fillMode: VideoOutput.PreserveAspectFit
+                                z: 1
                                 Component.onCompleted: {
-                                    modelData.videoSink = vOutput.videoSink
+                                        if (streamIndex < uiManager.playbackProviders.length) {
+                                            uiManager.playbackProviders[streamIndex].videoSink = vOutput.videoSink
+                                    }
+                                }
+                            }
+
+                            onVisibleChanged: {
+                                if (visible) {
+                                    if (streamIndex < uiManager.playbackProviders.length) {
+                                        uiManager.playbackProviders[streamIndex].videoSink = vOutput.videoSink
+                                    }
                                 }
                             }
 
                             Text {
-                                text: "CAM " + (index + 1)
+                                text: "CAM " + (streamIndex + 1)
                                 color: "white"
                                 anchors.bottom: parent.bottom
                                 anchors.left: parent.left
                                 anchors.margins: 5
                                 font.family: "Monospace"
                                 font.pixelSize: 12
+                                z: 5
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                z: 2
+                                onClicked: {
+                                    playbackTab.selectedIndex = streamIndex
+                                    playbackTab.viewMode = "single"
+                                }
                             }
                         }
                     }
@@ -296,19 +432,21 @@ ApplicationWindow {
                     spacing: 8
 
                     delegate: RowLayout {
+                        required property string modelData
+                        required property int index
                         width: streamList.width
                         spacing: 10
 
                         Label {
-                            text: (index + 1) + ":"
+                            text: (parent.index + 1) + ":"
                             width: 20
                         }
 
                         TextField {
                             Layout.fillWidth: true
-                            text: modelData
+                            text: parent.modelData
                             placeholderText: "rtmp://..."
-                            onEditingFinished: uiManager.updateUrl(index, text)
+                            onEditingFinished: uiManager.updateUrl(parent.index, text)
                         }
 
                         Button {
