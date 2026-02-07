@@ -4,6 +4,9 @@
 #include <QImageWriter>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QElapsedTimer>
+#include <QTimer>
+#include <cstdio>
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
     : QObject(parent), m_replayManager(engine) {
@@ -15,6 +18,9 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_transport = new PlaybackTransport(this);
     m_transport->seek(0);
     m_transport->setFps(m_currentSettings.fps);
+    connect(m_transport, &PlaybackTransport::posChanged, this, [this]() {
+        updateXTouchDisplay();
+    });
     m_midiManager = new MidiManager(this);
     connect(m_midiManager, &MidiManager::midiMessage, this, [this](int status, int data1, int data2) {
         if (status < 0 || data1 < 0) return;
@@ -65,6 +71,15 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     connect(m_midiManager, &MidiManager::portsChanged, this, &UIManager::midiPortsChanged);
     connect(m_midiManager, &MidiManager::currentPortChanged, this, &UIManager::midiPortIndexChanged);
     connect(m_midiManager, &MidiManager::connectedChanged, this, &UIManager::midiConnectedChanged);
+    connect(this, &UIManager::midiConnectedChanged, this, [this]() {
+        updateXTouchDisplay();
+    });
+    connect(this, &UIManager::timeOfDayModeChanged, this, [this]() {
+        updateXTouchDisplay();
+    });
+    connect(this, &UIManager::recordingStartEpochMsChanged, this, [this]() {
+        updateXTouchDisplay();
+    });
     connect(m_midiManager, &MidiManager::portsChanged, this, [this]() {
         if (!m_currentSettings.midiPortName.isEmpty()) {
             int idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
@@ -449,19 +464,19 @@ void UIManager::removeStream(int index) {
 
 void UIManager::saveSettings() {
     if (m_settingsManager->save(m_configPath, m_currentSettings)) {
-        qDebug() << "Settings saved successfully.";
+        std::fprintf(stderr, "Settings saved successfully.\n");
     }
 }
 void UIManager::onStartRequested() {
     // UI Manager can do final validation before telling engine to work
     if (m_replayManager->isRecording()) return;
 
-    qDebug() << "UIManager: Requesting engine start...";
+    std::fprintf(stderr, "UIManager: Requesting engine start...\n");
     m_replayManager->startRecording();
 }
 
 void UIManager::onStopRequested() {
-    qDebug() << "UIManager: Requesting engine stop...";
+    std::fprintf(stderr, "UIManager: Requesting engine stop...\n");
     m_replayManager->stopRecording();
 }
 
@@ -542,6 +557,73 @@ static QString formatTimecodeForFile(int64_t ms, int fps) {
         .arg(frames, 2, 10, QChar('0'));
 }
 
+static QString formatTimecodeForDisplay(int64_t ms, int fps) {
+    if (ms < 0) ms = 0;
+    const int totalSeconds = static_cast<int>(ms / 1000);
+    const int hours = totalSeconds / 3600;
+    const int minutes = (totalSeconds % 3600) / 60;
+    const int seconds = totalSeconds % 60;
+    const int frames = static_cast<int>((ms % 1000) / (1000.0 / qMax(1, fps)));
+    return QString("%1:%2:%3:%4")
+        .arg(hours, 2, 10, QChar('0'))
+        .arg(minutes, 2, 10, QChar('0'))
+        .arg(seconds, 2, 10, QChar('0'))
+        .arg(frames, 2, 10, QChar('0'));
+}
+
+void UIManager::updateXTouchDisplay() {
+    if (!m_midiManager || !m_midiManager->isXTouchConnected()) return;
+
+    const int64_t playheadMs = scrubPosition();
+    QString displayText;
+    int hours = 0;
+    int minutes = 0;
+    int seconds = 0;
+    int frames = 0;
+    const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
+
+    const qint64 startEpochMs = m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
+    const bool showTimeOfDay = m_currentSettings.showTimeOfDay && startEpochMs > 0;
+
+    if (showTimeOfDay) {
+        const qint64 epochMs = startEpochMs + playheadMs;
+        const QDateTime dt = QDateTime::fromMSecsSinceEpoch(epochMs);
+        hours = dt.time().hour();
+        minutes = dt.time().minute();
+        seconds = dt.time().second();
+        displayText = dt.toString("HH:mm:ss");
+    } else {
+        const int totalSeconds = static_cast<int>(playheadMs / 1000);
+        hours = totalSeconds / 3600;
+        minutes = (totalSeconds % 3600) / 60;
+        seconds = totalSeconds % 60;
+        displayText = formatTimecodeForDisplay(playheadMs, fps);
+    }
+
+    frames = static_cast<int>((playheadMs % 1000) / (1000.0 / qMax(1, fps)));
+
+    if (!m_xTouchLastSend.isValid()) {
+        m_xTouchLastSend.start();
+    }
+
+    if (m_xTouchLastSend.elapsed() < m_xTouchMinIntervalMs) {
+        return;
+    }
+
+    if (displayText != m_xTouchLastText) {
+        m_xTouchLastText = displayText;
+    }
+    m_xTouchLastSend.restart();
+    const QString digits = QString("   %1%2%3%4")
+                               .arg(hours, 2, 10, QChar('0'))
+                               .arg(minutes, 2, 10, QChar('0'))
+                               .arg(seconds, 2, 10, QChar('0'))
+                               .arg(frames, 2, 10, QChar('0'));
+    const quint8 dots1 = (1 << 4) | (1 << 6);
+    const quint8 dots2 = 0;
+    m_midiManager->sendXTouchSegmentDisplay(digits, dots1, dots2);
+}
+
 void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t playheadMs) {
     if (m_providers.isEmpty()) return;
 
@@ -593,6 +675,7 @@ void UIManager::onRecorderPulse(int64_t elapsed, int64_t frameCount) {
     emit recordedDurationMsChanged();
     emit scrubPositionChanged();
     emit recordingStartEpochMsChanged();
+    updateXTouchDisplay();
 
     if (m_followLive && m_transport && m_transport->isPlaying()) {
         const int64_t liveEdge = recordedDurationMs();

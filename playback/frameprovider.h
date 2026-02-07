@@ -6,6 +6,7 @@
 #include <QVideoFrame>
 #include <QImage>
 #include <QMutex>
+#include <QPointer>
 
 class FrameProvider : public QObject
 {
@@ -28,7 +29,7 @@ signals:
     void videoSinkChanged();
 
 private:
-    QVideoSink *m_sink = nullptr;
+    QPointer<QVideoSink> m_sink;
     mutable QMutex m_frameMutex;
     QVideoFrame m_lastFrame;
 };

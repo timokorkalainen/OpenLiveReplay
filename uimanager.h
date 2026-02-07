@@ -5,6 +5,8 @@
 #include <QString>
 #include <QUrl>
 #include <QHash>
+#include <QElapsedTimer>
+#include <QTimer>
 #include "settingsmanager.h"
 #include "recorder_engine/replaymanager.h"
 #include "playback/frameprovider.h"
@@ -144,6 +146,8 @@ public slots:
     void onRecorderPulse(int64_t elapsed, int64_t frameCount);
 
 private:
+    void updateXTouchDisplay();
+
     void restartPlaybackWorker();
 
     ReplayManager* m_replayManager;
@@ -160,6 +164,10 @@ private:
     bool m_playbackSingleView = false;
     int m_playbackSelectedIndex = -1;
     int m_midiBindingsVersion = 0;
+    QElapsedTimer m_xTouchLastSend;
+    QString m_xTouchLastText;
+    int m_xTouchMinIntervalMs = 25;
+    bool m_xTouchTestSent = false;
 
     struct MidiBinding {
         int status = -1;

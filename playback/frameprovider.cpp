@@ -17,7 +17,15 @@ QVideoSink* FrameProvider::videoSink() const
 void FrameProvider::setVideoSink(QVideoSink *sink)
 {
     if (m_sink != sink) {
+        if (m_sink) {
+            disconnect(m_sink, nullptr, this, nullptr);
+        }
         m_sink = sink;
+        if (m_sink) {
+            connect(m_sink, &QObject::destroyed, this, [this]() {
+                m_sink = nullptr;
+            });
+        }
         emit videoSinkChanged();
         qDebug() << "C++: Video Sink successfully connected from QML";
     }
@@ -30,15 +38,16 @@ void FrameProvider::deliverFrame(const QVideoFrame &frame)
         m_lastFrame = frame;
     }
 
-    if (!m_sink) return;
+    QPointer<QVideoSink> sink = m_sink;
+    if (!sink) return;
 
-    if (m_sink->thread() == QThread::currentThread()) {
-        m_sink->setVideoFrame(frame);
+    if (sink->thread() == QThread::currentThread()) {
+        sink->setVideoFrame(frame);
         return;
     }
 
     QVideoFrame copy = frame;
-    QMetaObject::invokeMethod(m_sink, [sink = m_sink, copy]() mutable {
+    QMetaObject::invokeMethod(sink, [sink, copy]() mutable {
         if (sink) sink->setVideoFrame(copy);
     }, Qt::QueuedConnection);
 }

@@ -59,13 +59,17 @@ void PlaybackTransport::setFps(int fps) {
 }
 
 void PlaybackTransport::seek(int64_t posMs) {
-    QMutexLocker locker(&m_mutex);
-    m_currentPos = qMax(int64_t(0), posMs);
-    if (m_isPlaying) {
-        m_playStartPos = m_currentPos;
-        m_playStartTime.restart();
+    int64_t newPos = 0;
+    {
+        QMutexLocker locker(&m_mutex);
+        m_currentPos = qMax(int64_t(0), posMs);
+        if (m_isPlaying) {
+            m_playStartPos = m_currentPos;
+            m_playStartTime.restart();
+        }
+        newPos = m_currentPos;
     }
-    emit posChanged(m_currentPos);
+    emit posChanged(newPos);
 }
 
 void PlaybackTransport::step(int frames) {
@@ -78,16 +82,24 @@ void PlaybackTransport::step(int frames) {
 void PlaybackTransport::onTick() {
     if (!m_isPlaying) return;
 
-    QMutexLocker locker(&m_mutex);
+    int64_t newPos = 0;
+    bool shouldStop = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        // Calculate position from play start to avoid cumulative drift
+        int64_t elapsed = m_playStartTime.elapsed();
+        m_currentPos = m_playStartPos + static_cast<int64_t>(elapsed * m_speed);
+        // Bounds checking (prevent negative time)
+        if (m_currentPos < 0) {
+            m_currentPos = 0;
+            shouldStop = true;
+        }
+        newPos = m_currentPos;
+    }
 
-    // Calculate position from play start to avoid cumulative drift
-    int64_t elapsed = m_playStartTime.elapsed();
-    m_currentPos = m_playStartPos + static_cast<int64_t>(elapsed * m_speed);
-    // Bounds checking (prevent negative time)
-    if (m_currentPos < 0) {
-        m_currentPos = 0;
+    if (shouldStop) {
         setPlaying(false);
     }
 
-    emit posChanged(m_currentPos);
+    emit posChanged(newPos);
 }
