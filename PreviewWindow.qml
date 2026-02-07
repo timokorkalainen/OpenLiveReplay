@@ -73,7 +73,7 @@ Window {
 
             // When the user starts dragging, we update the Transport
             onMoved: {
-                uiManager.transport.seek(value)
+                uiManager.seekPlayback(value)
             }
 
             // Custom styling for a "pro" look

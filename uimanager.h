@@ -92,6 +92,8 @@ private:
     PlaybackWorker* m_playbackWorker = nullptr;
     QList<FrameProvider*> m_providers;
     PlaybackTransport *m_transport;
+    bool m_followLive = false;
+    int m_liveBufferMs = 200;
 };
 
 #endif // UIMANAGER_H

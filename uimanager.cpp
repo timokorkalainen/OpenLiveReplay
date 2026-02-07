@@ -60,6 +60,7 @@ void UIManager::openStreams() {
 
 void UIManager::startRecording() {
     m_replayManager->startRecording();
+    m_followLive = true;
 
     // 1. Initialize the Playback Worker with our providers
     if (m_playbackWorker) {
@@ -93,11 +94,13 @@ void UIManager::restartPlaybackWorker() {
     m_playbackWorker->start();
     m_transport->seek(0);
     m_transport->setPlaying(true);
+    m_followLive = true;
 }
 
 void UIManager::stopRecording() {
     m_replayManager->stopRecording();
     m_transport->setPlaying(false);
+    m_followLive = false;
     if (m_playbackWorker) {
         m_playbackWorker->stop();
     }
@@ -109,6 +112,8 @@ void UIManager::stopRecording() {
 void UIManager::seekPlayback(int64_t ms) {
     if (m_transport) {
         m_transport->seek(ms);
+        // Manual seek disables live-follow; user can re-enable via "Live"
+        m_followLive = false;
     }
 }
 
@@ -220,12 +225,24 @@ int64_t UIManager::scrubPosition() {
 }
 
 void UIManager::scrubToLive() {
-    m_transport->seek(m_replayManager->getElapsedMs()-1);
+    m_followLive = true;
+    const int64_t liveEdge = recordedDurationMs();
+    const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
+    m_transport->seek(target);
 }
 
 void UIManager::onRecorderPulse(int64_t elapsed, int64_t frameCount) {
     emit recordedDurationMsChanged();
     emit scrubPositionChanged();
+
+    if (m_followLive && m_transport && m_transport->isPlaying()) {
+        const int64_t liveEdge = recordedDurationMs();
+        const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
+        const int64_t current = m_transport->currentPos();
+        if (qAbs(current - target) > 50) {
+            m_transport->seek(target);
+        }
+    }
 }
 
 QString UIManager::getSettingsPath(QString fileName) {

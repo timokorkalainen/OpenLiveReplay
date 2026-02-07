@@ -145,6 +145,15 @@ ApplicationWindow {
 
                 onClicked: uiManager.isRecording ? uiManager.stopRecording() : uiManager.startRecording()
             }
+
+            Button {
+                text: "LIVE"
+                enabled: uiManager.isRecording
+                onClicked: {
+                    uiManager.transport.setSpeed(1.0)
+                    uiManager.scrubToLive()
+                }
+            }
         }
 
         Text {
