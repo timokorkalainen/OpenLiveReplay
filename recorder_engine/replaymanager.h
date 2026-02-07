@@ -33,6 +33,7 @@ public:
     QString getBaseFileName() const { return m_baseFileName; }
 
     int64_t getElapsedMs();
+    QString getVideoPath();
 signals:
     void masterPulse(int64_t frameIndex, int64_t wallClockUs);
 

@@ -11,8 +11,8 @@ Window {
     color: "black"
 
     // FORCE THE THEME HERE
-    Universal.theme: Universal.Dark
-    Universal.accent: Universal.Red
+    //Universal.theme: Universal.Dark
+    //Universal.accent: Universal.Red
 
     // THIS MUST BE AT THE TOP LEVEL
     function refresh() {

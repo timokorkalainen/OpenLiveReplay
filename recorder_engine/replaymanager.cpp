@@ -25,9 +25,8 @@ void ReplayManager::startRecording() {
     m_clock->start();
 
     // 2. Initialize Muxer
-    QString fullPath = getFullOutputPath();
-    if (!m_muxer->init(fullPath, m_trackUrls.size())) {
-        qDebug() << "ReplayManager: Failed to init Muxer at" << fullPath;
+    if (!m_muxer->init(m_baseFileName, m_trackUrls.size())) {
+        qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_baseFileName;
         return;
     }
 
@@ -105,4 +104,8 @@ QString ReplayManager::getFullOutputPath() {
 int64_t ReplayManager::getElapsedMs() {
     if(!m_clock) return -1;
     return m_clock->elapsedMs();
+}
+
+QString ReplayManager::getVideoPath() {
+    return m_muxer->getVideoPath(m_baseFileName);
 }

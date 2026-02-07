@@ -57,6 +57,7 @@ public:
     Q_INVOKABLE void seekPlayback(int64_t ms);
 
 
+    QString getSettingsPath(QString fileName);
 signals:
     void streamUrlsChanged();
     void saveLocationChanged();

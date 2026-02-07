@@ -1,6 +1,10 @@
 #ifndef STREAMWORKER_H
 #define STREAMWORKER_H
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include <QThread>
 #include <QString>
 #include <QFuture>
@@ -11,10 +15,10 @@
 #include "muxer.h"
 
 extern "C" {
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libavutil/time.h>
-#include <libswscale/swscale.h>
+    #include <libavformat/avformat.h>
+    #include <libavcodec/avcodec.h>
+    #include <libavutil/time.h>
+    #include <libswscale/swscale.h>
 }
 
 class IngestWorker : public QObject {

@@ -2,7 +2,7 @@
 build/
 *.qmlls.ini
 launch.json
-
+*.cache/
 # C++ objects and libs
 *.slo
 *.lo

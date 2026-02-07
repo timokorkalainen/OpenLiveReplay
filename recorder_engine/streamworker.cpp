@@ -37,20 +37,17 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     m_internalFrameCount = frameIndex;
 
     if (m_restartCapture || !m_captureRunning) {
-        // If the future is valid and running, wait for it to cleanly exit
-        // before starting a new source
-        if (!m_captureFuture.isFinished() && m_captureFuture.isValid()) {
+        if (m_captureFuture.isRunning()) {
+            // A capture is running. Signal it to stop, and wait for the next pulse to restart.
             m_captureRunning = false;
-            m_captureFuture.waitForFinished();
+        } else {
+            // No capture is running, so let's start one.
+            m_restartCapture = 0;
+            m_captureRunning = true;
+            m_captureFuture = QtConcurrent::run([this]() {
+                this->captureLoop();
+            });
         }
-
-        m_restartCapture = 0;
-        m_captureRunning = true;
-
-        // Assign the new future here
-        m_captureFuture = QtConcurrent::run([this]() {
-            this->captureLoop();
-        });
     }
 
     processEncoderTick(m_persistentEncCtx, streamTimeMs);

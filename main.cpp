@@ -5,6 +5,8 @@
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
 #include "playback/frameprovider.h"
+#include <QDirIterator>
+#include <QDebug>
 
 #include <QString>
 using namespace Qt::StringLiterals;
@@ -15,6 +17,11 @@ int main(int argc, char *argv[])
 
     ReplayManager replayManager;
     UIManager uiManager(&replayManager);
+
+    /*QDirIterator it(":", QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        qDebug() << it.next();
+    }*/
 
     uiManager.loadSettings();
 
@@ -33,7 +40,9 @@ int main(int argc, char *argv[])
         []() { QCoreApplication::exit(-1); },
         Qt::QueuedConnection);
 
-    qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
+    //qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
+    //qmlEngine.load(QUrl(u":/qt/qml/OpenLiveReplay/Main.qml"_s));
+    qmlEngine.load(QUrl(u"qrc:/qt/qml/OpenLiveReplay/Main.qml"_s));
 
     return app.exec();
 }

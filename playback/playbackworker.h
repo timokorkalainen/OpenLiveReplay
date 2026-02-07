@@ -1,6 +1,10 @@
 #ifndef PLAYBACKWORKER_H
 #define PLAYBACKWORKER_H
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 #include <QThread>
 #include <QVector>
 #include <QMutex>
@@ -11,10 +15,9 @@
 #include "playback/playbacktransport.h"
 
 extern "C" {
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libavutil/imgutils.h>
-#include <libavformat/avio.h>
+    #include <libavformat/avformat.h>
+    #include <libavcodec/avcodec.h>
+    #include <libavutil/imgutils.h>
 }
 
 struct DecoderTrack {

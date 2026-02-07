@@ -1,5 +1,7 @@
 #include "muxer.h"
 #include <QDebug>
+#include <QStandardPaths>
+#include <QDir>
 
 Muxer::Muxer() {}
 
@@ -9,7 +11,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount) {
     QMutexLocker locker(&m_mutex);
 
     // 1. Create Format Context for Matroska
-    avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska", filename.toUtf8().constData());
+    avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska", getVideoPath(filename).toUtf8().constData());
     if (!m_outCtx) return false;
 
     // 2. Pre-allocate Video Tracks
@@ -46,7 +48,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount) {
 
     // 4. Open file and write header
     if (!(m_outCtx->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&m_outCtx->pb, filename.toUtf8().constData(), AVIO_FLAG_WRITE) < 0) {
+        if (avio_open(&m_outCtx->pb, m_outCtx->url, AVIO_FLAG_WRITE) < 0) {
             return false;
         }
     }
@@ -102,3 +104,18 @@ void Muxer::close() {
         m_outCtx = nullptr;
     }
 }
+
+QString Muxer::getVideoPath(QString fileName) {
+    // 1. Get the Documents directory for your app
+    QString docPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+
+    // 2. Create a subfolder if you want to be organized
+    QDir dir(docPath);
+    if (!dir.exists("videos")) {
+        dir.mkdir("videos");
+    }
+
+    // 3. Construct the full filename
+    return docPath + "/videos/" + fileName+".mkv";
+}
+

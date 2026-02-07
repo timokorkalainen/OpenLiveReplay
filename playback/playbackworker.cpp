@@ -32,6 +32,8 @@ void PlaybackWorker::run() {
     msleep(500);
     m_transport->seek(0);
 
+    qDebug() << "Opening file: "<<m_currentFilePath;
+
     if (m_currentFilePath.isEmpty()) return;
 
     // --- 1. OPENING & INITIALIZATION ---

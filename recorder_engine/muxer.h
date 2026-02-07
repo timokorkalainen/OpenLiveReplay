@@ -4,10 +4,14 @@
 #include <QMutex>
 #include <QString>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 extern "C" {
-#include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
-#include <libavutil/opt.h>
+    #include <libavformat/avformat.h>
+    #include <libavcodec/avcodec.h>
+    #include <libavutil/opt.h>
 }
 
 class Muxer {
@@ -20,6 +24,7 @@ public:
     AVStream* getStream(int index);
     void close();
 
+    QString getVideoPath(QString fileName);
 private:
     AVFormatContext* m_outCtx = nullptr;
     // Track the last timestamp for each stream to ensure they always increase

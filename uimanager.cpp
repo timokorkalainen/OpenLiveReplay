@@ -48,6 +48,10 @@ void UIManager::setFileName(const QString &name) {
     }
 }
 
+void UIManager::openStreams() {
+    refreshProviders();
+}
+
 void UIManager::startRecording() {
     refreshProviders();
     m_replayManager->startRecording();
@@ -61,8 +65,8 @@ void UIManager::startRecording() {
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, this);
 
     // 2. Point it to the file being recorded
-    QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
-    m_playbackWorker->openFile(filePath);
+    //QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
+    m_playbackWorker->openFile(m_replayManager->getVideoPath());
 
     m_playbackWorker->start();
     m_transport->seek(0);
@@ -96,12 +100,12 @@ void UIManager::updateUrl(int index, const QString &url) {
         emit streamUrlsChanged();
 
         // Auto-save to JSON
-        m_settingsManager->save("./config.json", m_currentSettings);
+        m_settingsManager->save(getSettingsPath("config.json"), m_currentSettings);
     }
 }
 
 void UIManager::loadSettings() {
-    if (m_settingsManager->load("./config.json", m_currentSettings)) {
+    if (m_settingsManager->load(getSettingsPath("config.json"), m_currentSettings)) {
         // Apply to engine
         m_replayManager->setStreamUrls(m_currentSettings.streamUrls);
         m_replayManager->setOutputDirectory(m_currentSettings.saveLocation);
@@ -130,7 +134,7 @@ void UIManager::removeStream(int index) {
 }
 
 void UIManager::saveSettings() {
-    if (m_settingsManager->save("config.json", m_currentSettings)) {
+    if (m_settingsManager->save(getSettingsPath("config.json"), m_currentSettings)) {
         qDebug() << "Settings saved successfully.";
     }
 }
@@ -201,4 +205,18 @@ void UIManager::scrubToLive() {
 void UIManager::onRecorderPulse(int64_t elapsed, int64_t frameCount) {
     emit recordedDurationMsChanged();
     emit scrubPositionChanged();
+}
+
+QString UIManager::getSettingsPath(QString fileName) {
+    // 1. Get the Documents directory for your app
+    QString docPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+
+    // 2. Create a subfolder if you want to be organized
+    QDir dir(docPath);
+    if (!dir.exists("settings")) {
+        dir.mkdir("settings");
+    }
+
+    // 3. Construct the full filename
+    return docPath + "/settings/" + fileName;
 }
