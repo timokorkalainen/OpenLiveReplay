@@ -14,6 +14,17 @@ void debugTimestamp(const QString &prefix, int trackIndex) {
 
 void StreamWorker::stop() { m_captureRunning = false; this->quit(); }
 
+int StreamWorker::ffmpegInterruptCallback(void* opaque) {
+    StreamWorker* worker = static_cast<StreamWorker*>(opaque);
+    return worker ? worker->shouldInterrupt() : 0;
+}
+
+bool StreamWorker::shouldInterrupt() const {
+    if (!m_captureRunning || m_restartCapture) return true;
+    if (m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) return true;
+    return false;
+}
+
 void StreamWorker::run() {
     // 1. Setup the persistent encoder context
     if (!setupEncoder(&m_persistentEncCtx)) return;
@@ -35,6 +46,8 @@ void StreamWorker::run() {
 void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     // This runs on the StreamWorker's thread thanks to QueuedConnection
     m_internalFrameCount = frameIndex;
+
+    if (!m_persistentEncCtx) return;
 
     if (m_restartCapture || !m_captureRunning) {
         if (m_captureFuture.isRunning()) {
@@ -99,7 +112,8 @@ void StreamWorker::captureLoop() {
 
         qDebug() << "Track" << m_trackIndex << "Attempting connection to:" << currentUrl;
 
-        if (!setupDecoder(&inCtx, &decCtx, currentUrl)) {
+        int videoStreamIdx = -1;
+        if (!setupDecoder(&inCtx, &decCtx, currentUrl, &videoStreamIdx)) {
             qDebug() << "Track" << m_trackIndex << "Connect failed. Retrying in 1s...";
             // Sleep in small increments so we stay responsive to stop/restart requests
             for(int i=0; i<10 && m_captureRunning && !m_restartCapture; ++i)
@@ -107,26 +121,47 @@ void StreamWorker::captureLoop() {
             continue;
         }
 
-        if (!m_sharedClock) return;
+        if (!m_sharedClock) {
+            qDebug() << "Track" << m_trackIndex << "No shared clock. Restarting...";
+            m_restartCapture = 1;
+            m_captureRunning = false;
+            break;
+        }
 
         AVPacket* pkt = av_packet_alloc();
         AVFrame* rawFrame = av_frame_alloc();
-
-        const AVCodec* decoder = nullptr;
-        int videoStreamIdx = av_find_best_stream(inCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+        if (!pkt || !rawFrame) {
+            qDebug() << "Track" << m_trackIndex << "Failed to allocate packet/frame.";
+            if (pkt) av_packet_free(&pkt);
+            if (rawFrame) av_frame_free(&rawFrame);
+            avcodec_free_context(&decCtx);
+            avformat_close_input(&inCtx);
+            continue;
+        }
 
         int firstSourcePts = -1;
 
         int64_t anchorStreamTimeMs = -1;
         int64_t firstPacketDts = -1;
 
+        m_lastPacketTimer.restart();
+
         while (m_captureRunning && !m_restartCapture) {
-            if (av_read_frame(inCtx, pkt) >= 0) {
+            int readResult = av_read_frame(inCtx, pkt);
+            if (readResult >= 0) {
+                m_lastPacketTimer.restart();
                 if (pkt->stream_index == videoStreamIdx) {
+
+                    int64_t pktDts = pkt->dts;
+                    if (pktDts == AV_NOPTS_VALUE) pktDts = pkt->pts;
+                    if (pktDts == AV_NOPTS_VALUE) {
+                        av_packet_unref(pkt);
+                        continue;
+                    }
 
                     // 1. Establish the Anchor on the very first packet of this URL session
                     if (firstPacketDts == -1) {
-                        firstPacketDts = pkt->dts;
+                        firstPacketDts = pktDts;
                         // Where are we in the global recording right now?
                         anchorStreamTimeMs = m_sharedClock->elapsedMs();
                     }
@@ -135,7 +170,7 @@ void StreamWorker::captureLoop() {
                         while (avcodec_receive_frame(decCtx, rawFrame) >= 0) {
 
                             // 1. Initialize start time correctly using the packet DTS
-                            if (firstSourcePts == -1) firstSourcePts = pkt->dts;
+                            if (firstSourcePts == -1) firstSourcePts = pktDts;
 
                             // 2. Prepare the container for the scaled frame
                             QueuedFrame qf;
@@ -155,7 +190,7 @@ void StreamWorker::captureLoop() {
                                       qf.frame->data, qf.frame->linesize);
 
                             // 2. Calculate the RELATIVE offset of this packet in its own stream
-                            int64_t relativeMs = av_rescale_q(pkt->dts - firstPacketDts,
+                            int64_t relativeMs = av_rescale_q(pktDts - firstPacketDts,
                                                               inCtx->streams[videoStreamIdx]->time_base,
                                                               {1, 1000});
 
@@ -178,7 +213,16 @@ void StreamWorker::captureLoop() {
                     }
                 }
                 av_packet_unref(pkt);
-            }else {
+            } else if (readResult == AVERROR(EAGAIN)) {
+                if (m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) {
+                    qDebug() << "Track" << m_trackIndex << "Stalled stream. Restarting...";
+                    break;
+                }
+                QThread::msleep(10);
+            } else if (readResult == AVERROR_EOF) {
+                qDebug() << "Track" << m_trackIndex << "End of stream. Restarting...";
+                break;
+            } else {
                 qDebug() << "Track" << m_trackIndex << "Read error (Disconnect).";
                 break; // Break inner loop to trigger setupDecoder retry
             }
@@ -194,35 +238,75 @@ void StreamWorker::captureLoop() {
     m_captureRunning = false;
 }
 
-bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl currentUrl) {
+bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl currentUrl, int* videoStreamIdx) {
     AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "stimeout", "100000", 0); // 100ms timeout for network
-    av_dict_set(&opts, "rtmp_buffer", "5000", 0); // Buffer in milliseconds
+    const QString scheme = currentUrl.scheme().toLower();
+
     av_dict_set(&opts, "rw_timeout", "5000000", 0); // 5 second timeout for "stalled" streams
+    av_dict_set(&opts, "timeout", "5000000", 0); // 5 second socket timeout (microseconds)
     av_dict_set(&opts, "recv_buffer_size", "15048000", 0);
-    av_dict_set(&opts, "rtmp_live", "live", 0);
 
-    if (avformat_open_input(inCtx, currentUrl.toString().toUtf8().constData(), nullptr, &opts) < 0) return false;
+    if (scheme == "srt") {
+        av_dict_set(&opts, "connect_timeout", "5000000", 0); // 5 second connect timeout
+    }
 
-    // Set the context to non-blocking mode
-    (*inCtx)->flags |= AVFMT_FLAG_NONBLOCK;
+    if (scheme == "rtmp" || scheme == "rtmps") {
+        av_dict_set(&opts, "rtmp_buffer", "5000", 0); // Buffer in milliseconds
+        av_dict_set(&opts, "rtmp_live", "live", 0);
+    }
 
-    if (avformat_find_stream_info(*inCtx, nullptr) < 0) return false;
+    *inCtx = avformat_alloc_context();
+    if (!*inCtx) {
+        if (opts) av_dict_free(&opts);
+        return false;
+    }
+
+    m_lastPacketTimer.restart();
+
+    (*inCtx)->interrupt_callback.callback = &StreamWorker::ffmpegInterruptCallback;
+    (*inCtx)->interrupt_callback.opaque = this;
+
+    if (avformat_open_input(inCtx, currentUrl.toString().toUtf8().constData(), nullptr, &opts) < 0) {
+        avformat_free_context(*inCtx);
+        *inCtx = nullptr;
+        if (opts) av_dict_free(&opts);
+        return false;
+    }
+
+    // Keep blocking reads and rely on interrupt callback for stalls
+
+    if (avformat_find_stream_info(*inCtx, nullptr) < 0) {
+        avformat_close_input(inCtx);
+        if (opts) av_dict_free(&opts);
+        return false;
+    }
 
     const AVCodec* decoder = nullptr;
-    int videoStreamIdx = av_find_best_stream(*inCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
-    if (videoStreamIdx < 0) return false;
+    int foundStreamIdx = av_find_best_stream(*inCtx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
+    if (foundStreamIdx < 0) {
+        avformat_close_input(inCtx);
+        if (opts) av_dict_free(&opts);
+        return false;
+    }
 
     *decCtx = avcodec_alloc_context3(decoder);
-    avcodec_parameters_to_context(*decCtx, (*inCtx)->streams[videoStreamIdx]->codecpar);
+    avcodec_parameters_to_context(*decCtx, (*inCtx)->streams[foundStreamIdx]->codecpar);
 
     if (opts) av_dict_free(&opts);
-    return avcodec_open2(*decCtx, decoder, nullptr) >= 0;
+    if (avcodec_open2(*decCtx, decoder, nullptr) < 0) {
+        avcodec_free_context(decCtx);
+        avformat_close_input(inCtx);
+        return false;
+    }
+    if (videoStreamIdx) *videoStreamIdx = foundStreamIdx;
+    return true;
 }
 
 bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
+    if (!encoder) return false;
     *encCtx = avcodec_alloc_context3(encoder);
+    if (!*encCtx) return false;
 
     (*encCtx)->width = 1920;
     (*encCtx)->height = 1080;
@@ -237,10 +321,11 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     (*encCtx)->bit_rate = 30000000;
 
     m_latestFrame = av_frame_alloc();
+    if (!m_latestFrame) return false;
     m_latestFrame->format = AV_PIX_FMT_YUV420P;
     m_latestFrame->width = 1920;   // Your target width
     m_latestFrame->height = 1080;  // Your target height
-    av_frame_get_buffer(m_latestFrame, 0); // Allocate actual pixel memory
+    if (av_frame_get_buffer(m_latestFrame, 0) < 0) return false; // Allocate actual pixel memory
 
     // Paint blue frame
     // Y plane (Brightness) - set to medium

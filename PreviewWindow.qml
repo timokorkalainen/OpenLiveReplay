@@ -36,8 +36,8 @@ Window {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     color: "black"
-                    border.color: "#333"
-                    border.width: 1
+                    border.color: "red"
+                    border.width: 2
 
                     VideoOutput {
                         id: vOutput

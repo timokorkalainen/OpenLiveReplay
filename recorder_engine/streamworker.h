@@ -9,6 +9,7 @@
 #include <QString>
 #include <QFuture>
 #include <QtConcurrent>
+#include <QElapsedTimer>
 #include <atomic>
 
 #include "recordingclock.h"
@@ -17,7 +18,9 @@
 extern "C" {
     #include <libavformat/avformat.h>
     #include <libavcodec/avcodec.h>
+    #include <libavutil/avutil.h>
     #include <libavutil/time.h>
+    #include <libavutil/error.h>
     #include <libswscale/swscale.h>
 }
 
@@ -64,6 +67,11 @@ private:
     QThread* m_ingestThread = nullptr;
     void captureLoop();
     std::atomic<bool> m_captureRunning{false};
+    QElapsedTimer m_lastPacketTimer;
+    int m_stallTimeoutMs = 8000;
+
+    static int ffmpegInterruptCallback(void* opaque);
+    bool shouldInterrupt() const;
 
     // FFmpeg context management
     struct QueuedFrame {
@@ -74,10 +82,10 @@ private:
     struct SwsContext* m_swsCtx = nullptr;
     AVFrame* m_scaledFrame = nullptr;
     QQueue<QueuedFrame> m_frameQueue;
-    AVCodecContext* m_persistentEncCtx;
+    AVCodecContext* m_persistentEncCtx = nullptr;
 
     // FFmpeg helpers
-    bool setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl url);
+    bool setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl url, int* videoStreamIdx);
     bool setupEncoder(AVCodecContext** encCtx);
     void processEncoderTick(AVCodecContext *encCtx, int64_t streamTimeMs);
 };

@@ -1,5 +1,7 @@
 #include "frameprovider.h"
 #include <QtCore/qdebug.h>
+#include <QMetaObject>
+#include <QThread>
 
 FrameProvider::FrameProvider(QObject *parent)
     : QObject(parent)
@@ -23,7 +25,15 @@ void FrameProvider::setVideoSink(QVideoSink *sink)
 
 void FrameProvider::deliverFrame(const QVideoFrame &frame)
 {
-    if (m_sink) {
+    if (!m_sink) return;
+
+    if (m_sink->thread() == QThread::currentThread()) {
         m_sink->setVideoFrame(frame);
+        return;
     }
+
+    QVideoFrame copy = frame;
+    QMetaObject::invokeMethod(m_sink, [sink = m_sink, copy]() mutable {
+        if (sink) sink->setVideoFrame(copy);
+    }, Qt::QueuedConnection);
 }

@@ -49,6 +49,7 @@ private:
     QStringList m_trackUrls;
     QString m_outputDir;
     QString m_baseFileName;
+    QString m_sessionFileName;
 
     QTimer* m_heartbeat;
     Muxer* m_muxer;

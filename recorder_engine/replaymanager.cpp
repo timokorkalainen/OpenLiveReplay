@@ -2,6 +2,7 @@
 #include <QDebug>
 #include <QUrl>
 #include <QDir>
+#include <QDateTime>
 
 ReplayManager::ReplayManager(QObject *parent) : QObject(parent) {
     m_muxer = new Muxer();
@@ -24,9 +25,11 @@ void ReplayManager::startRecording() {
     m_clock = new RecordingClock();
     m_clock->start();
 
-    // 2. Initialize Muxer
-    if (!m_muxer->init(m_baseFileName, m_trackUrls.size())) {
-        qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_baseFileName;
+    // 2. Initialize Muxer with timestamped filename to avoid overwrites
+    const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+    m_sessionFileName = m_baseFileName + "_" + timestamp;
+    if (!m_muxer->init(m_sessionFileName, m_trackUrls.size())) {
+        qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
     }
 
@@ -107,5 +110,8 @@ int64_t ReplayManager::getElapsedMs() {
 }
 
 QString ReplayManager::getVideoPath() {
+    if (!m_sessionFileName.isEmpty()) {
+        return m_muxer->getVideoPath(m_sessionFileName);
+    }
     return m_muxer->getVideoPath(m_baseFileName);
 }

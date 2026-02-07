@@ -21,6 +21,9 @@ void UIManager::setStreamUrls(const QStringList &urls) {
         m_currentSettings.streamUrls = urls;
         m_replayManager->setStreamUrls(urls);
         refreshProviders();
+        if (m_replayManager->isRecording()) {
+            restartPlaybackWorker();
+        }
         emit streamUrlsChanged();
     }
 }
@@ -50,10 +53,12 @@ void UIManager::setFileName(const QString &name) {
 
 void UIManager::openStreams() {
     refreshProviders();
+    if (m_replayManager->isRecording()) {
+        restartPlaybackWorker();
+    }
 }
 
 void UIManager::startRecording() {
-    refreshProviders();
     m_replayManager->startRecording();
 
     // 1. Initialize the Playback Worker with our providers
@@ -74,6 +79,20 @@ void UIManager::startRecording() {
 
     emit recordingStatusChanged();
     emit recordingStarted();
+}
+
+void UIManager::restartPlaybackWorker() {
+    if (m_playbackWorker) {
+        m_playbackWorker->stop();
+        delete m_playbackWorker;
+        m_playbackWorker = nullptr;
+    }
+
+    m_playbackWorker = new PlaybackWorker(m_providers, m_transport, this);
+    m_playbackWorker->openFile(m_replayManager->getVideoPath());
+    m_playbackWorker->start();
+    m_transport->seek(0);
+    m_transport->setPlaying(true);
 }
 
 void UIManager::stopRecording() {
@@ -110,6 +129,8 @@ void UIManager::loadSettings() {
         m_replayManager->setStreamUrls(m_currentSettings.streamUrls);
         m_replayManager->setOutputDirectory(m_currentSettings.saveLocation);
         m_replayManager->setBaseFileName(m_currentSettings.fileName);
+
+        refreshProviders();
 
         // Sync QML
         emit streamUrlsChanged();

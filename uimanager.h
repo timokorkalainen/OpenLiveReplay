@@ -43,6 +43,7 @@ public:
     void refreshProviders();
 
     // Logic
+    Q_INVOKABLE void openStreams();
     Q_INVOKABLE void startRecording();
     Q_INVOKABLE void stopRecording();
     Q_INVOKABLE void updateUrl(int index, const QString &url);
@@ -82,6 +83,8 @@ public slots:
     void onRecorderPulse(int64_t elapsed, int64_t frameCount);
 
 private:
+    void restartPlaybackWorker();
+
     ReplayManager* m_replayManager;
     AppSettings m_currentSettings;
     SettingsManager* m_settingsManager;

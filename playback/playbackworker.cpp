@@ -36,43 +36,83 @@ void PlaybackWorker::run() {
 
     if (m_currentFilePath.isEmpty()) return;
 
-    // --- 1. OPENING & INITIALIZATION ---
-    if (avformat_open_input(&m_fmtCtx, m_currentFilePath.toUtf8().constData(), nullptr, nullptr) < 0) return;
-    if (avformat_find_stream_info(m_fmtCtx, nullptr) < 0) return;
+    m_running = true;
 
-    // --- INITIALIZE DECODER BANK ---
-    int providerIndex = 0;
-    for (unsigned int i = 0; i < m_fmtCtx->nb_streams; i++) {
-        AVStream* stream = m_fmtCtx->streams[i];
-        AVCodecParameters* codecParams = stream->codecpar;
-
-        if (codecParams->codec_type == AVMEDIA_TYPE_VIDEO) {
-            // Safety: Don't exceed the number of providers we have in the UI
-            if (providerIndex >= m_providers.size()) break;
-
-            const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
-            AVCodecContext* ctx = avcodec_alloc_context3(codec);
-            avcodec_parameters_to_context(ctx, codecParams);
-
-            // Enable Multi-threading for the decoder itself
-            ctx->thread_count = 0;
-
-            if (avcodec_open2(ctx, codec, nullptr) < 0) continue;
-
-            DecoderTrack* track = new DecoderTrack();
-            track->streamIndex = i;
-            track->codecCtx = ctx;
-            track->provider = m_providers[providerIndex];
-
-            m_decoderBank.append(track);
-            m_streamMap.insert(i, track);
-
-            providerIndex++;
-            qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider" << (providerIndex-1);
+    auto clearDecoders = [this]() {
+        for (auto* track : m_decoderBank) {
+            if (track->codecCtx) avcodec_free_context(&track->codecCtx);
+            delete track;
         }
+        m_decoderBank.clear();
+        m_streamMap.clear();
+    };
+
+    // --- 1. OPENING & INITIALIZATION (retry until tracks available or stop) ---
+    while (m_running) {
+        if (m_fmtCtx) {
+            avformat_close_input(&m_fmtCtx);
+        }
+        clearDecoders();
+
+        if (avformat_open_input(&m_fmtCtx, m_currentFilePath.toUtf8().constData(), nullptr, nullptr) < 0) {
+            msleep(200);
+            continue;
+        }
+        if (avformat_find_stream_info(m_fmtCtx, nullptr) < 0) {
+            avformat_close_input(&m_fmtCtx);
+            msleep(200);
+            continue;
+        }
+
+        int providerIndex = 0;
+        for (unsigned int i = 0; i < m_fmtCtx->nb_streams; i++) {
+            AVStream* stream = m_fmtCtx->streams[i];
+            AVCodecParameters* codecParams = stream->codecpar;
+
+            if (codecParams->codec_type == AVMEDIA_TYPE_VIDEO) {
+                // Safety: Don't exceed the number of providers we have in the UI
+                if (providerIndex >= m_providers.size()) break;
+
+                const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+                if (!codec) continue;
+
+                AVCodecContext* ctx = avcodec_alloc_context3(codec);
+                if (!ctx) continue;
+                avcodec_parameters_to_context(ctx, codecParams);
+
+                // Enable Multi-threading for the decoder itself
+                ctx->thread_count = 0;
+
+                if (avcodec_open2(ctx, codec, nullptr) < 0) {
+                    avcodec_free_context(&ctx);
+                    continue;
+                }
+
+                DecoderTrack* track = new DecoderTrack();
+                track->streamIndex = i;
+                track->codecCtx = ctx;
+                track->provider = m_providers[providerIndex];
+
+                m_decoderBank.append(track);
+                m_streamMap.insert(i, track);
+
+                providerIndex++;
+                qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider" << (providerIndex-1);
+            }
+        }
+
+        if (!m_decoderBank.isEmpty()) break;
+
+        qDebug() << "PlaybackWorker: No video tracks yet. Retrying...";
+        avformat_close_input(&m_fmtCtx);
+        msleep(500);
     }
 
-    m_running = true;
+    if (!m_running || m_decoderBank.isEmpty()) {
+        clearDecoders();
+        if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
+        return;
+    }
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
 
@@ -86,10 +126,15 @@ void PlaybackWorker::run() {
         // --- 3. CHECK FOR EXTERNAL SEEK (SCRUBBING) ---
         // If the master clock is far away from our last frame, trigger a hard seek
         m_mutex.lock();
-        if (m_seekTargetMs >= 0 || qAbs(masterTimeMs - lastProcessedPtsMs) > 500) {
+        if (m_seekTargetMs >= 0 || (lastProcessedPtsMs >= 0 && qAbs(masterTimeMs - lastProcessedPtsMs) > 500)) {
             int64_t target = (m_seekTargetMs >= 0) ? m_seekTargetMs : masterTimeMs;
 
             // Map MS to stream timebase (using the first video track as reference)
+            if (m_decoderBank.isEmpty()) {
+                m_mutex.unlock();
+                msleep(10);
+                continue;
+            }
             AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
             int64_t seekPts = av_rescale_q(target, {1, 1000}, vStream->time_base);
 
@@ -124,9 +169,17 @@ void PlaybackWorker::run() {
                     if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
                         while (avcodec_receive_frame(track->codecCtx, frame) == 0) {
 
-                            // Convert frame PTS to Milliseconds
+                            // Convert frame PTS to Milliseconds (with fallback)
+                            int64_t framePts = frame->pts;
+                            if (framePts == AV_NOPTS_VALUE) framePts = frame->best_effort_timestamp;
                             AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
-                            lastProcessedPtsMs = av_rescale_q(frame->pts, tb, {1, 1000});
+                            if (framePts != AV_NOPTS_VALUE) {
+                                lastProcessedPtsMs = av_rescale_q(framePts, tb, {1, 1000});
+                            } else if (lastProcessedPtsMs >= 0) {
+                                lastProcessedPtsMs += 33; // fallback 30fps
+                            } else {
+                                lastProcessedPtsMs = masterTimeMs;
+                            }
 
                             track->provider->deliverFrame(convertToQVideoFrame(frame));
                         }
@@ -150,6 +203,8 @@ void PlaybackWorker::run() {
     // --- 6. CLEANUP ---
     av_packet_free(&pkt);
     av_frame_free(&frame);
+    clearDecoders();
+    if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
 }
 
 QVideoFrame PlaybackWorker::convertToQVideoFrame(AVFrame* frame) {
