@@ -916,6 +916,78 @@ void UIManager::updateStreamId(int index, const QString& id) {
     }
 }
 
+QVariantList UIManager::metadataFieldDefinitions() const {
+    QVariantList items;
+    const QJsonArray &arr = m_currentSettings.metadataFields;
+    for (const QJsonValue &val : arr) {
+        const QJsonObject obj = val.toObject();
+        QVariantMap row;
+        row.insert("name", obj.value("name").toString());
+        row.insert("display", obj.contains("display") ? obj.value("display").toBool() : true);
+        items.append(row);
+    }
+    return items;
+}
+
+void UIManager::setMetadataFieldDefinitions(const QVariantList &fields) {
+    QJsonArray arr;
+    for (const auto &item : fields) {
+        const QVariantMap row = item.toMap();
+        const QString name = row.value("name").toString().trimmed();
+        if (name.isEmpty()) continue;
+        QJsonObject obj;
+        obj.insert("name", name);
+        const bool display = row.value("display", true).toBool();
+        if (!display) {
+            obj.insert("display", false);
+        }
+        arr.append(obj);
+    }
+    m_currentSettings.metadataFields = arr;
+}
+
+QVariantList UIManager::sourceMetadataItems(int index) const {
+    QVariantList items;
+    if (index < 0 || index >= m_currentSettings.sources.size()) return items;
+
+    // Build a lookup from the source's stored metadata values
+    QHash<QString, QString> valueMap;
+    const QJsonArray &arr = m_currentSettings.sources[index].metadata;
+    for (const QJsonValue &val : arr) {
+        const QJsonObject obj = val.toObject();
+        valueMap.insert(obj.value("name").toString(), obj.value("value").toString());
+    }
+
+    // Return one row per globally-defined field, merged with any stored value
+    const QJsonArray &fields = m_currentSettings.metadataFields;
+    for (const QJsonValue &val : fields) {
+        const QJsonObject fieldDef = val.toObject();
+        const QString fieldName = fieldDef.value("name").toString();
+        QVariantMap row;
+        row.insert("name", fieldName);
+        row.insert("value", valueMap.value(fieldName, ""));
+        items.append(row);
+    }
+    return items;
+}
+
+void UIManager::setSourceMetadataItems(int index, const QVariantList &items) {
+    if (index < 0 || index >= m_currentSettings.sources.size()) return;
+    QJsonArray arr;
+    for (const auto &item : items) {
+        const QVariantMap row = item.toMap();
+        const QString name = row.value("name").toString().trimmed();
+        if (name.isEmpty()) continue;
+        const QString value = row.value("value").toString();
+        if (value.isEmpty()) continue; // Only store non-empty values
+        QJsonObject obj;
+        obj.insert("name", name);
+        obj.insert("value", value);
+        arr.append(obj);
+    }
+    m_currentSettings.sources[index].metadata = arr;
+}
+
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         int nextId = nextSourceIdSeed(m_currentSettings.sources);

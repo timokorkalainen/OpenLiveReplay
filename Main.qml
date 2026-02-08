@@ -886,6 +886,11 @@ ApplicationWindow {
                     }
 
                     Button {
+                        text: "Metadata Fields"
+                        onClicked: metadataFieldsEditor.openEditor()
+                    }
+
+                    Button {
                         text: "+ Add Stream"
                         onClicked: appWindow.uiManagerRef.addStream()
                         enabled: !appWindow.uiManagerRef.isRecording
@@ -937,6 +942,12 @@ ApplicationWindow {
                             onEditingFinished: appWindow.uiManagerRef.updateStreamName(streamRow.index, text)
                         }
 
+                        Button {
+                            text: "Metadata"
+                            Layout.preferredWidth: 90
+                            onClicked: metadataEditor.openFor(streamRow.index)
+                        }
+
                         TextField {
                             Layout.fillWidth: true
                             text: streamRow.modelData
@@ -950,6 +961,302 @@ ApplicationWindow {
                             flat: true
                             onClicked: appWindow.uiManagerRef.removeStream(streamRow.index)
                             visible: !appWindow.uiManagerRef.isRecording
+                        }
+                    }
+                }
+
+                // ─── Global Metadata Fields Editor ───
+                Popup {
+                    id: metadataFieldsEditor
+                    modal: true
+                    focus: true
+                    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                    anchors.centerIn: Overlay.overlay
+                    width: Math.min(appWindow.width * 0.9, 600)
+                    height: Math.min(appWindow.height * 0.8, 480)
+
+                    ListModel {
+                        id: fieldsModel
+                    }
+
+                    function openEditor() {
+                        fieldsModel.clear()
+                        var defs = appWindow.uiManagerRef.metadataFieldDefinitions()
+                        if (defs && defs.length > 0) {
+                            for (var i = 0; i < defs.length; ++i) {
+                                var d = defs[i]
+                                fieldsModel.append({
+                                    name: d.name || "",
+                                    display: d.display !== undefined ? d.display : true
+                                })
+                            }
+                        } else {
+                            fieldsModel.append({ name: "", display: true })
+                        }
+                        open()
+                    }
+
+                    function buildFields() {
+                        var result = []
+                        for (var i = 0; i < fieldsModel.count; ++i) {
+                            var row = fieldsModel.get(i)
+                            var name = (row.name || "").trim()
+                            if (name.length === 0) continue
+                            result.push({
+                                name: name,
+                                display: row.display !== undefined ? row.display : true
+                            })
+                        }
+                        return result
+                    }
+
+                    contentItem: Rectangle {
+                        color: "#1f1f1f"
+                        radius: 0
+                        border.color: "#333"
+                        border.width: 1
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: 16
+                            spacing: 12
+
+                            RowLayout {
+                                Layout.fillWidth: true
+
+                                Text {
+                                    text: "Metadata Field Definitions"
+                                    color: "#eeeeee"
+                                    font.pixelSize: 18
+                                    font.bold: true
+                                    Layout.fillWidth: true
+                                }
+
+                                Button {
+                                    text: "+ Field"
+                                    onClicked: fieldsModel.append({ name: "", display: true })
+                                }
+                            }
+
+                            Text {
+                                text: "Define the metadata fields available for all sources. Each source can then fill in its own values."
+                                color: "#b0b0b0"
+                                font.pixelSize: 12
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+
+                            ScrollView {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                clip: true
+
+                                ListView {
+                                    id: fieldsList
+                                    model: fieldsModel
+                                    spacing: 8
+                                    boundsBehavior: Flickable.StopAtBounds
+
+                                    delegate: RowLayout {
+                                        id: fieldRow
+                                        required property string name
+                                        required property bool display
+                                        required property int index
+                                        width: fieldsList.width
+                                        spacing: 8
+
+                                        TextField {
+                                            Layout.fillWidth: true
+                                            placeholderText: "Field name"
+                                            text: fieldRow.name
+                                            onTextEdited: fieldsModel.setProperty(fieldRow.index, "name", text)
+                                        }
+
+                                        CheckBox {
+                                            text: "Show"
+                                            checked: fieldRow.display
+                                            onToggled: fieldsModel.setProperty(fieldRow.index, "display", checked)
+                                        }
+
+                                        Button {
+                                            text: "Remove"
+                                            onClicked: fieldsModel.remove(fieldRow.index)
+                                            enabled: fieldsModel.count > 1
+                                        }
+                                    }
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+
+                                Item { Layout.fillWidth: true }
+
+                                Button {
+                                    text: "Cancel"
+                                    onClicked: metadataFieldsEditor.close()
+                                }
+
+                                Button {
+                                    text: "Save"
+                                    onClicked: {
+                                        appWindow.uiManagerRef.setMetadataFieldDefinitions(
+                                            metadataFieldsEditor.buildFields()
+                                        )
+                                        appWindow.uiManagerRef.saveSettings()
+                                        metadataFieldsEditor.close()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ─── Per-Source Metadata Values Editor ───
+                Popup {
+                    id: metadataEditor
+                    modal: true
+                    focus: true
+                    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                    anchors.centerIn: Overlay.overlay
+                    width: Math.min(appWindow.width * 0.9, 600)
+                    height: Math.min(appWindow.height * 0.8, 480)
+
+                    property int sourceIndex: -1
+                    property string sourceLabel: ""
+
+                    ListModel {
+                        id: metadataModel
+                    }
+
+                    function openFor(index) {
+                        sourceIndex = index
+                        var label = "Source " + (index + 1)
+                        if (appWindow.uiManagerRef.streamNames.length > index
+                                && appWindow.uiManagerRef.streamNames[index].length > 0) {
+                            label = appWindow.uiManagerRef.streamNames[index]
+                        }
+                        sourceLabel = label
+                        metadataModel.clear()
+                        var items = appWindow.uiManagerRef.sourceMetadataItems(index)
+                        if (items && items.length > 0) {
+                            for (var i = 0; i < items.length; ++i) {
+                                var row = items[i]
+                                metadataModel.append({
+                                    name: row.name || "",
+                                    value: row.value || ""
+                                })
+                            }
+                        }
+                        open()
+                    }
+
+                    function buildItems() {
+                        var result = []
+                        for (var i = 0; i < metadataModel.count; ++i) {
+                            var row = metadataModel.get(i)
+                            var name = (row.name || "").trim()
+                            if (name.length === 0) continue
+                            result.push({
+                                name: name,
+                                value: row.value === undefined ? "" : String(row.value)
+                            })
+                        }
+                        return result
+                    }
+
+                    contentItem: Rectangle {
+                        color: "#1f1f1f"
+                        radius: 0
+                        border.color: "#333"
+                        border.width: 1
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: 16
+                            spacing: 12
+
+                            Text {
+                                text: "Metadata — " + metadataEditor.sourceLabel
+                                color: "#eeeeee"
+                                font.pixelSize: 18
+                                font.bold: true
+                                Layout.fillWidth: true
+                            }
+
+                            Text {
+                                text: metadataModel.count > 0
+                                      ? "Fill in values for this source. Fields are defined in Metadata Fields."
+                                      : "No metadata fields defined. Use the Metadata Fields button to add fields first."
+                                color: "#b0b0b0"
+                                font.pixelSize: 12
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+
+                            ScrollView {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                clip: true
+
+                                ListView {
+                                    id: metadataList
+                                    model: metadataModel
+                                    spacing: 8
+                                    boundsBehavior: Flickable.StopAtBounds
+
+                                    delegate: RowLayout {
+                                        id: metaRow
+                                        required property string name
+                                        required property string value
+                                        required property int index
+                                        width: metadataList.width
+                                        spacing: 8
+
+                                        Label {
+                                            text: metaRow.name
+                                            Layout.preferredWidth: 180
+                                            color: "#cccccc"
+                                            font.bold: true
+                                            elide: Text.ElideRight
+                                        }
+
+                                        TextField {
+                                            Layout.fillWidth: true
+                                            placeholderText: "Value"
+                                            text: metaRow.value
+                                            onTextEdited: metadataModel.setProperty(metaRow.index, "value", text)
+                                        }
+                                    }
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+
+                                Item { Layout.fillWidth: true }
+
+                                Button {
+                                    text: "Cancel"
+                                    onClicked: metadataEditor.close()
+                                }
+
+                                Button {
+                                    text: "Save"
+                                    onClicked: {
+                                        if (metadataEditor.sourceIndex >= 0) {
+                                            appWindow.uiManagerRef.setSourceMetadataItems(
+                                                metadataEditor.sourceIndex,
+                                                metadataEditor.buildItems()
+                                            )
+                                            appWindow.uiManagerRef.saveSettings()
+                                        }
+                                        metadataEditor.close()
+                                    }
+                                }
+                            }
                         }
                     }
                 }

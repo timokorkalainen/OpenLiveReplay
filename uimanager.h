@@ -8,6 +8,7 @@
 #include <QElapsedTimer>
 #include <QTimer>
 #include <QVariantList>
+#include <QVariantMap>
 #include "settingsmanager.h"
 #include "recorder_engine/replaymanager.h"
 #include "playback/frameprovider.h"
@@ -107,6 +108,10 @@ public:
     Q_INVOKABLE void updateUrl(int index, const QString &url);
     Q_INVOKABLE void updateStreamName(int index, const QString &name);
     Q_INVOKABLE void updateStreamId(int index, const QString &id);
+    Q_INVOKABLE QVariantList metadataFieldDefinitions() const;
+    Q_INVOKABLE void setMetadataFieldDefinitions(const QVariantList &fields);
+    Q_INVOKABLE QVariantList sourceMetadataItems(int index) const;
+    Q_INVOKABLE void setSourceMetadataItems(int index, const QVariantList &items);
     Q_INVOKABLE void loadSettings();
     Q_INVOKABLE void addStream();             // Increases stream count
     Q_INVOKABLE void removeStream(int index); // (Optional) for better UX

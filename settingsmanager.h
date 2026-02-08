@@ -15,11 +15,12 @@ struct SourceSettings {
     QString id;
     QString name;
     QString url;
-    QJsonObject metadata;
+    QJsonArray metadata;
 };
 
 struct AppSettings {
     QList<SourceSettings> sources;
+    QJsonArray metadataFields; // Global field definitions: [{name, display}]
     QString saveLocation;
     QString fileName;
     int videoWidth = 1920;

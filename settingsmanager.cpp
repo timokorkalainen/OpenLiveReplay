@@ -45,6 +45,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
         sourcesArray.append(obj);
     }
     root["sources"] = sourcesArray;
+    root["metadataFields"] = settings.metadataFields;
 
     QJsonDocument doc(root);
     QFile file(path);
@@ -134,9 +135,11 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
         source.id = obj["id"].toString();
         source.name = obj["name"].toString();
         source.url = obj["url"].toString();
-        source.metadata = obj["metadata"].toObject();
+        source.metadata = obj["metadata"].toArray();
         settings.sources.append(source);
     }
+
+    settings.metadataFields = root["metadataFields"].toArray();
 
     return true;
 }
