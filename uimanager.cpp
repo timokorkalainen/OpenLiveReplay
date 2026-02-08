@@ -296,20 +296,166 @@ int UIManager::activeViewCount() const {
     return qBound(1, m_currentSettings.multiviewCount, 16);
 }
 
+void UIManager::ensureSourceEnabledSize() {
+    while (m_sourceEnabled.size() < m_currentSettings.streamUrls.size()) {
+        m_sourceEnabled.append(true);
+    }
+}
+
+void UIManager::rebuildSlotMap() {
+    const int viewCount = activeViewCount();
+    const int sourceCount = m_currentSettings.streamUrls.size();
+    ensureSourceEnabledSize();
+
+    // Preserve existing assignments: a source already in a slot stays there
+    QList<int> newMap(viewCount, -1);
+    QSet<int> assignedSources;
+
+    // 1. Keep sources that are still enabled and were already in a slot
+    for (int v = 0; v < qMin(viewCount, m_viewSlotMap.size()); ++v) {
+        int src = m_viewSlotMap[v];
+        if (src >= 0 && src < sourceCount && m_sourceEnabled[src]) {
+            newMap[v] = src;
+            assignedSources.insert(src);
+        }
+    }
+
+    // 2. Fill empty slots with enabled sources that aren't assigned yet (in order)
+    int nextFreeSlot = 0;
+    for (int s = 0; s < sourceCount; ++s) {
+        if (!m_sourceEnabled[s] || assignedSources.contains(s)) continue;
+        // Find next empty slot
+        while (nextFreeSlot < viewCount && newMap[nextFreeSlot] != -1) {
+            ++nextFreeSlot;
+        }
+        if (nextFreeSlot >= viewCount) break; // No more room
+        newMap[nextFreeSlot] = s;
+        assignedSources.insert(s);
+        ++nextFreeSlot;
+    }
+
+    m_viewSlotMap = newMap;
+}
+
 QStringList UIManager::activeStreamUrls() const {
-    return m_currentSettings.streamUrls.mid(0, activeViewCount());
+    QStringList urls;
+    for (int v = 0; v < m_viewSlotMap.size(); ++v) {
+        int src = m_viewSlotMap[v];
+        if (src >= 0 && src < m_currentSettings.streamUrls.size()) {
+            urls.append(m_currentSettings.streamUrls[src]);
+        } else {
+            urls.append(""); // Empty = blue view
+        }
+    }
+    return urls;
 }
 
 QStringList UIManager::activeStreamNames() const {
-    return m_currentSettings.streamNames.mid(0, activeViewCount());
+    QStringList names;
+    for (int v = 0; v < m_viewSlotMap.size(); ++v) {
+        int src = m_viewSlotMap[v];
+        if (src >= 0 && src < m_currentSettings.streamNames.size()) {
+            names.append(m_currentSettings.streamNames[src]);
+        } else {
+            names.append("");
+        }
+    }
+    return names;
 }
 
 void UIManager::syncActiveStreams() {
-    const QStringList urls = activeStreamUrls();
-    const QStringList names = activeStreamNames();
-    m_replayManager->setStreamUrls(urls);
-    m_replayManager->setStreamNames(names);
+    rebuildSlotMap();
+
+    // Source configuration: ALL source URLs go to the engine (one worker per source)
+    m_replayManager->setSourceUrls(m_currentSettings.streamUrls);
+    m_replayManager->setSourceNames(m_currentSettings.streamNames);
+
+    // View configuration: how many recording tracks, and their display names
+    m_replayManager->setViewCount(activeViewCount());
+    m_replayManager->setViewNames(activeStreamNames());
+
+    // Pass the current view→source mapping (purely virtual)
+    m_replayManager->updateViewMapping(m_viewSlotMap);
+
     refreshProviders();
+    emit viewSlotMapChanged();
+}
+
+QVariantList UIManager::viewSlotMap() const {
+    QVariantList list;
+    for (int src : m_viewSlotMap) {
+        list.append(src);
+    }
+    return list;
+}
+
+void UIManager::toggleSourceEnabled(int sourceIndex) {
+    ensureSourceEnabledSize();
+    if (sourceIndex < 0 || sourceIndex >= m_sourceEnabled.size()) return;
+
+    const bool enabling = !m_sourceEnabled[sourceIndex];
+    m_sourceEnabled[sourceIndex] = enabling;
+    m_sourceEnabledVersion++;
+    emit sourceEnabledChanged();
+
+    if (!enabling) {
+        // Toggle OFF: find this source's current slot and clear it
+        for (int v = 0; v < m_viewSlotMap.size(); ++v) {
+            if (m_viewSlotMap[v] == sourceIndex) {
+                m_viewSlotMap[v] = -1;
+                break;
+            }
+        }
+
+        // Auto-fill: if there are enabled sources not currently in any
+        // view, put them into the now-empty slot(s).  Example: 2 Views,
+        // 4 Sources — turning Source 1 off frees View 1, so Source 3
+        // (first unassigned enabled source) instantly takes its place.
+        for (int v = 0; v < m_viewSlotMap.size(); ++v) {
+            if (m_viewSlotMap[v] != -1) continue; // slot occupied
+            for (int s = 0; s < m_currentSettings.streamUrls.size(); ++s) {
+                if (!m_sourceEnabled[s]) continue;
+                bool inUse = false;
+                for (int vv = 0; vv < m_viewSlotMap.size(); ++vv) {
+                    if (m_viewSlotMap[vv] == s) { inUse = true; break; }
+                }
+                if (!inUse) {
+                    m_viewSlotMap[v] = s;
+                    break;
+                }
+            }
+        }
+    } else {
+        // Toggle ON: put the source into the first empty slot
+        for (int v = 0; v < m_viewSlotMap.size(); ++v) {
+            if (m_viewSlotMap[v] == -1) {
+                m_viewSlotMap[v] = sourceIndex;
+                break;
+            }
+        }
+    }
+
+    if (m_replayManager->isRecording()) {
+        // Purely virtual: just update which source writes to which view-track.
+        // ZERO FFmpeg impact — no URL changes, no reconnects.
+        m_replayManager->updateViewMapping(m_viewSlotMap);
+        m_replayManager->setViewNames(activeStreamNames());
+    } else {
+        // Not recording: update pre-configured URLs/names and providers
+        m_replayManager->setSourceUrls(m_currentSettings.streamUrls);
+        m_replayManager->setSourceNames(m_currentSettings.streamNames);
+        m_replayManager->setViewCount(activeViewCount());
+        m_replayManager->setViewNames(activeStreamNames());
+        m_replayManager->updateViewMapping(m_viewSlotMap);
+        refreshProviders();
+    }
+
+    emit viewSlotMapChanged();
+}
+
+bool UIManager::isSourceEnabled(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= m_sourceEnabled.size()) return true;
+    return m_sourceEnabled[sourceIndex];
 }
 
 void UIManager::setStreamUrls(const QStringList &urls) {
@@ -341,7 +487,8 @@ void UIManager::setStreamNames(const QStringList &names) {
         } else if (m_currentSettings.streamNames.size() > m_currentSettings.streamUrls.size()) {
             m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, m_currentSettings.streamUrls.size());
         }
-        m_replayManager->setStreamNames(activeStreamNames());
+        m_replayManager->setSourceNames(m_currentSettings.streamNames);
+        m_replayManager->setViewNames(activeStreamNames());
         emit streamNamesChanged();
     }
 }
@@ -411,6 +558,7 @@ void UIManager::setMultiviewCount(int count) {
             restartPlaybackWorker();
         }
         emit multiviewCountChanged();
+        emit viewSlotMapChanged();
         m_settingsManager->save(m_configPath, m_currentSettings);
     }
 }
@@ -637,9 +785,8 @@ void UIManager::seekPlayback(int64_t ms) {
 void UIManager::updateUrl(int index, const QString &url) {
     if (index >= 0 && index < m_currentSettings.streamUrls.size()) {
         m_currentSettings.streamUrls[index] = url;
-        if (index < activeStreamUrls().size()) {
-            m_replayManager->updateTrackUrl(index, url); // Hot-swap if recording
-        }
+        // Update the source worker directly (real FFmpeg reconnect)
+        m_replayManager->updateSourceUrl(index, url);
         emit streamUrlsChanged();
 
         // Auto-save to JSON
@@ -650,8 +797,11 @@ void UIManager::updateUrl(int index, const QString &url) {
 void UIManager::updateStreamName(int index, const QString& name) {
     if (index >= 0 && index < m_currentSettings.streamNames.size()) {
         m_currentSettings.streamNames[index] = name;
-        m_replayManager->setStreamNames(activeStreamNames());
+        rebuildSlotMap();
+        m_replayManager->setSourceNames(m_currentSettings.streamNames);
+        m_replayManager->setViewNames(activeStreamNames());
         emit streamNamesChanged();
+        emit viewSlotMapChanged();
         m_settingsManager->save(m_configPath, m_currentSettings);
     }
 }
@@ -672,6 +822,7 @@ void UIManager::loadSettings() {
             m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, m_currentSettings.streamUrls.size());
         }
         m_currentSettings.multiviewCount = qBound(1, m_currentSettings.multiviewCount, 16);
+        ensureSourceEnabledSize();
         syncActiveStreams();
         if (m_transport) {
             m_transport->setFps(m_currentSettings.fps);
@@ -711,15 +862,20 @@ void UIManager::loadSettings() {
         emit multiviewCountChanged();
         emit timeOfDayModeChanged();
         emit midiPortNameChanged();
+        emit viewSlotMapChanged();
+        emit sourceEnabledChanged();
     }
 }
 
 void UIManager::addStream() {
     QStringList urls = m_currentSettings.streamUrls;
     urls.append(""); // Add an empty entry
+    m_sourceEnabled.append(true);
     setStreamUrls(urls);
     m_currentSettings.streamNames.append("");
     setStreamNames(m_currentSettings.streamNames);
+    m_sourceEnabledVersion++;
+    emit sourceEnabledChanged();
     // Note: ReplayManager handles the worker creation during startRecording()
 }
 
@@ -727,11 +883,16 @@ void UIManager::removeStream(int index) {
     QStringList urls = m_currentSettings.streamUrls;
     if (index >= 0 && index < urls.size()) {
         urls.removeAt(index);
+        if (index >= 0 && index < m_sourceEnabled.size()) {
+            m_sourceEnabled.removeAt(index);
+        }
         setStreamUrls(urls);
         if (index >= 0 && index < m_currentSettings.streamNames.size()) {
             m_currentSettings.streamNames.removeAt(index);
             setStreamNames(m_currentSettings.streamNames);
         }
+        m_sourceEnabledVersion++;
+        emit sourceEnabledChanged();
     }
 }
 
@@ -754,15 +915,13 @@ void UIManager::onStopRequested() {
 }
 
 void UIManager::updateStreamUrl(int index, const QString& url) {
-    // This allows hot-swapping through the UI
-    if (index >= 0 && index < activeStreamUrls().size()) {
-        m_replayManager->updateTrackUrl(index, url);
-    }
+    // Hot-swap: update the source worker directly (real FFmpeg reconnect)
+    m_replayManager->updateSourceUrl(index, url);
 
     // Auto-save whenever a URL is modified
     AppSettings current;
-    current.streamUrls = m_replayManager->getStreamUrls();
-    current.streamNames = m_replayManager->getStreamNames();
+    current.streamUrls = m_replayManager->getSourceUrls();
+    current.streamNames = m_replayManager->getSourceNames();
     current.saveLocation = m_replayManager->getOutputDirectory();
     current.fileName = m_replayManager->getBaseFileName();
     m_settingsManager->save(m_configPath, current);

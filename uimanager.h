@@ -47,6 +47,8 @@ class UIManager : public QObject {
     Q_PROPERTY(QVariantList screenOptions READ screenOptions NOTIFY screensChanged)
     Q_PROPERTY(bool screensReady READ screensReady NOTIFY screensChanged)
     Q_PROPERTY(int screenCount READ screenCount NOTIFY screensChanged)
+    Q_PROPERTY(QVariantList viewSlotMap READ viewSlotMap NOTIFY viewSlotMapChanged)
+    Q_PROPERTY(int sourceEnabledVersion READ sourceEnabledVersion NOTIFY sourceEnabledChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -79,6 +81,8 @@ public:
     QVariantList screenOptions() const;
     bool screensReady() const;
     int screenCount() const;
+    QVariantList viewSlotMap() const;
+    int sourceEnabledVersion() const { return m_sourceEnabledVersion; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -127,6 +131,8 @@ public:
 
     Q_INVOKABLE void refreshScreens();
     Q_INVOKABLE QScreen* screenAt(int index) const;
+    Q_INVOKABLE void toggleSourceEnabled(int sourceIndex);
+    Q_INVOKABLE bool isSourceEnabled(int sourceIndex) const;
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -160,6 +166,8 @@ signals:
     void feedSelectRequested(int index);
     void multiviewRequested();
     void screensChanged();
+    void viewSlotMapChanged();
+    void sourceEnabledChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -178,6 +186,8 @@ private:
     int activeViewCount() const;
     QStringList activeStreamUrls() const;
     QStringList activeStreamNames() const;
+    void rebuildSlotMap();
+    void ensureSourceEnabledSize();
     void updateXTouchLcd();
     void updateXTouchDisplay();
 
@@ -215,6 +225,10 @@ private:
     QHash<int, int> m_midiLastValues;
     QHash<int, int> m_midiBindingData2Forward;
     QHash<int, int> m_midiBindingData2Backward;
+
+    QList<bool> m_sourceEnabled;
+    QList<int> m_viewSlotMap;       // viewSlotMap[viewIndex] = sourceIndex or -1
+    int m_sourceEnabledVersion = 0;
 
     QList<QScreen*> m_screens;
     QVariantList m_screenOptions;

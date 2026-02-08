@@ -43,8 +43,13 @@ Window {
                 id: streamTile
                 required property var modelData
                 property int streamIndex: modelData
-                color: "black"
-                border.color: "#d32f2f"
+                property int sourceForView: {
+                    var map = multiviewWindow.uiManager.viewSlotMap
+                    return (streamTile.streamIndex >= 0 && streamTile.streamIndex < map.length)
+                           ? map[streamTile.streamIndex] : -1
+                }
+                color: sourceForView < 0 ? "#003080" : "black"
+                border.color: sourceForView < 0 ? "#1565C0" : "#d32f2f"
                 border.width: 2
                 width: multiViewGrid.cellWidth
                 height: multiViewGrid.cellHeight
@@ -53,6 +58,7 @@ Window {
                     id: vOutput
                     anchors.fill: parent
                     fillMode: VideoOutput.PreserveAspectFit
+                    visible: streamTile.sourceForView >= 0
                     z: 1
                     Component.onCompleted: {
                         if (streamTile.streamIndex < multiviewWindow.uiManager.playbackProviders.length) {
@@ -67,10 +73,14 @@ Window {
                 }
 
                 Text {
-                      text: (streamTile.streamIndex < multiviewWindow.uiManager.streamNames.length
-                          && multiviewWindow.uiManager.streamNames[streamTile.streamIndex].length > 0)
-                          ? multiviewWindow.uiManager.streamNames[streamTile.streamIndex]
-                          : ("CAM " + (streamTile.streamIndex + 1))
+                    text: {
+                        var src = streamTile.sourceForView
+                        if (src < 0) return "VIEW " + (streamTile.streamIndex + 1)
+                        return (src < multiviewWindow.uiManager.streamNames.length
+                                && multiviewWindow.uiManager.streamNames[src].length > 0)
+                            ? multiviewWindow.uiManager.streamNames[src]
+                            : ("CAM " + (src + 1))
+                    }
                     color: "white"
                     anchors.bottom: parent.bottom
                     anchors.left: parent.left

@@ -18,6 +18,7 @@ extern "C" {
     #include <libavformat/avformat.h>
     #include <libavcodec/avcodec.h>
     #include <libavutil/imgutils.h>
+    #include <libavutil/error.h>
 }
 
 struct BufferedFrame {
@@ -50,6 +51,9 @@ protected:
 private:
     // High-performance conversion from FFmpeg AVFrame to QVideoFrame (YUV420P)
     QVideoFrame convertToQVideoFrame(AVFrame* frame);
+
+    static int ffmpegInterruptCallback(void* opaque);
+    bool shouldInterrupt() const;
 
     QList<FrameProvider*> m_providers;
     QVector<DecoderTrack*> m_decoderBank;

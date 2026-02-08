@@ -501,8 +501,13 @@ ApplicationWindow {
                     Rectangle {
                         id: singleView
                         anchors.fill: parent
-                        color: "black"
-                        border.color: "#00C853"
+                        property int sourceForView: {
+                            var map = appWindow.uiManagerRef.viewSlotMap
+                            return (playbackTab.selectedIndex >= 0 && playbackTab.selectedIndex < map.length)
+                                   ? map[playbackTab.selectedIndex] : -1
+                        }
+                        color: sourceForView < 0 ? "#003080" : "black"
+                        border.color: sourceForView < 0 ? "#1565C0" : "#00C853"
                         border.width: 2
                         visible: playbackTab.viewMode === "single" && playbackTab.selectedIndex >= 0 && appWindow.uiManagerRef.playbackProviders.length > 0
 
@@ -510,14 +515,18 @@ ApplicationWindow {
                             id: singleOutput
                             anchors.fill: parent
                             fillMode: VideoOutput.PreserveAspectFit
+                            visible: singleView.sourceForView >= 0
                         }
 
                         Text {
-                            text: playbackTab.selectedIndex >= 0
-                                             ? ((playbackTab.selectedIndex < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[playbackTab.selectedIndex].length > 0)
-                                                 ? appWindow.uiManagerRef.streamNames[playbackTab.selectedIndex]
-                                     : ("CAM " + (playbackTab.selectedIndex + 1)))
-                                  : ""
+                            text: {
+                                var src = singleView.sourceForView
+                                if (playbackTab.selectedIndex < 0) return ""
+                                if (src < 0) return "VIEW " + (playbackTab.selectedIndex + 1)
+                                return (src < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[src].length > 0)
+                                    ? appWindow.uiManagerRef.streamNames[src]
+                                    : ("CAM " + (src + 1))
+                            }
                             color: "white"
                             anchors.bottom: parent.bottom
                             anchors.left: parent.left
@@ -558,8 +567,13 @@ ApplicationWindow {
                             id: multiViewDelegate
                             required property var modelData
                             property int streamIndex: modelData
-                            color: "black"
-                            border.color: "red"
+                            property int sourceForView: {
+                                var map = appWindow.uiManagerRef.viewSlotMap
+                                return (multiViewDelegate.streamIndex >= 0 && multiViewDelegate.streamIndex < map.length)
+                                       ? map[multiViewDelegate.streamIndex] : -1
+                            }
+                            color: sourceForView < 0 ? "#003080" : "black"
+                            border.color: sourceForView < 0 ? "#1565C0" : "red"
                             border.width: 2
                             width: multiViewGrid.cellWidth
                             height: multiViewGrid.cellHeight
@@ -568,6 +582,7 @@ ApplicationWindow {
                                 id: vOutput
                                 anchors.fill: parent
                                 fillMode: VideoOutput.PreserveAspectFit
+                                visible: multiViewDelegate.sourceForView >= 0
                                 z: 1
                                 Component.onCompleted: {
                                     if (multiViewDelegate.streamIndex < appWindow.uiManagerRef.playbackProviders.length) {
@@ -585,9 +600,13 @@ ApplicationWindow {
                             }
 
                             Text {
-                                  text: (multiViewDelegate.streamIndex < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[multiViewDelegate.streamIndex].length > 0)
-                                      ? appWindow.uiManagerRef.streamNames[multiViewDelegate.streamIndex]
-                                      : ("CAM " + (multiViewDelegate.streamIndex + 1))
+                                text: {
+                                    var src = multiViewDelegate.sourceForView
+                                    if (src < 0) return "VIEW " + (multiViewDelegate.streamIndex + 1)
+                                    return (src < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[src].length > 0)
+                                        ? appWindow.uiManagerRef.streamNames[src]
+                                        : ("CAM " + (src + 1))
+                                }
                                 color: "white"
                                 anchors.bottom: parent.bottom
                                 anchors.left: parent.left
@@ -891,6 +910,17 @@ ApplicationWindow {
                         Label {
                             text: (streamRow.index + 1) + ":"
                             Layout.preferredWidth: 20
+                        }
+
+                        Button {
+                            text: (appWindow.uiManagerRef.sourceEnabledVersion >= 0
+                                   && appWindow.uiManagerRef.isSourceEnabled(streamRow.index))
+                                  ? "ON" : "OFF"
+                            Layout.preferredWidth: 50
+                            palette.button: (appWindow.uiManagerRef.sourceEnabledVersion >= 0
+                                             && appWindow.uiManagerRef.isSourceEnabled(streamRow.index))
+                                            ? "#2e7d32" : "#555"
+                            onClicked: appWindow.uiManagerRef.toggleSourceEnabled(streamRow.index)
                         }
 
                         TextField {

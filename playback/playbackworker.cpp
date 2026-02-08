@@ -35,7 +35,22 @@ void PlaybackWorker::setFrameBufferMax(int maxFrames) {
 
 void PlaybackWorker::stop() {
     m_running = false;
-    wait();
+    requestInterruption();
+    if (m_fmtCtx && m_fmtCtx->pb) {
+        m_fmtCtx->pb->error = AVERROR_EXIT;
+    }
+    if (QThread::currentThread() != this) {
+        wait();
+    }
+}
+
+int PlaybackWorker::ffmpegInterruptCallback(void* opaque) {
+    PlaybackWorker* worker = static_cast<PlaybackWorker*>(opaque);
+    return worker ? worker->shouldInterrupt() : 0;
+}
+
+bool PlaybackWorker::shouldInterrupt() const {
+    return !m_running || isInterruptionRequested();
 }
 
 void PlaybackWorker::run() {
@@ -65,10 +80,20 @@ void PlaybackWorker::run() {
         }
         clearDecoders();
 
-        if (avformat_open_input(&m_fmtCtx, m_currentFilePath.toUtf8().constData(), nullptr, nullptr) < 0) {
+        AVFormatContext* newCtx = avformat_alloc_context();
+        if (!newCtx) {
             msleep(200);
             continue;
         }
+        newCtx->interrupt_callback.callback = &PlaybackWorker::ffmpegInterruptCallback;
+        newCtx->interrupt_callback.opaque = this;
+
+        if (avformat_open_input(&newCtx, m_currentFilePath.toUtf8().constData(), nullptr, nullptr) < 0) {
+            avformat_close_input(&newCtx);
+            msleep(200);
+            continue;
+        }
+        m_fmtCtx = newCtx;
         if (avformat_find_stream_info(m_fmtCtx, nullptr) < 0) {
             avformat_close_input(&m_fmtCtx);
             msleep(200);

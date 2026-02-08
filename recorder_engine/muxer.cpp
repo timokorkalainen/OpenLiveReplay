@@ -1,6 +1,7 @@
 #include "muxer.h"
 #include <QStandardPaths>
 #include <QDir>
+#include <QDebug>
 
 Muxer::Muxer() {}
 
@@ -80,18 +81,31 @@ void Muxer::writePacket(AVPacket* pkt) {
     QMutexLocker locker(&m_mutex);
     if (!m_initialized || !m_outCtx) return;
 
-    // Use a local copy of the packet for the interleaver
-    // This ensures that even if the Worker thread moves on,
-    // the Muxer has its own reference to the data.
+    // Ensure monotonic DTS per stream — bump forward if needed.
+    // Dropping was too aggressive: when a source was re-mapped to a view
+    // track that had blue-frame DTS ahead of the source encoder's counter,
+    // every packet was silently lost.  Bumping preserves the data.
+    int idx = pkt->stream_index;
+    if (m_lastDts->contains(idx) && pkt->dts <= (*m_lastDts)[idx]) {
+        pkt->dts = (*m_lastDts)[idx] + 1;
+        if (pkt->pts < pkt->dts) pkt->pts = pkt->dts;
+    }
+    (*m_lastDts)[idx] = pkt->dts;
+
+    // Use av_write_frame (non-interleaved) so that each stream writes
+    // independently. av_interleaved_write_frame buffers packets across
+    // ALL streams and won't flush stream A until stream B catches up,
+    // causing one disrupted source to freeze every other source.
     AVPacket* localPkt = av_packet_clone(pkt);
     if (!localPkt) return;
 
-    // av_interleaved_write_frame takes ownership of the packet reference
-    // and will free it automatically.
-    int ret = av_interleaved_write_frame(m_outCtx, localPkt);
+    int ret = av_write_frame(m_outCtx, localPkt);
+    av_packet_free(&localPkt); // av_write_frame does NOT take ownership
 
     if (ret < 0) {
-        av_packet_free(&localPkt);
+        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
     }
 
     avio_flush(m_outCtx->pb);
@@ -116,6 +130,10 @@ void Muxer::close() {
         avformat_free_context(m_outCtx);
         m_initialized = false;
         m_outCtx = nullptr;
+    }
+    if (m_lastDts) {
+        delete m_lastDts;
+        m_lastDts = nullptr;
     }
 }
 
