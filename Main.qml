@@ -687,7 +687,13 @@ ApplicationWindow {
                     Item { Layout.fillWidth: true }
 
                     Button {
-                        text: "REV 5.0x"
+                        text: appWindow.uiManagerRef.transport.isPlaying ? "PAUSE" : "PLAY"
+                        onClicked: appWindow.uiManagerRef.playPause()
+                        highlighted: appWindow.uiManagerRef.transport.isPlaying
+                    }
+
+                    Button {
+                        text: "-5.0x"
                         onPressed: {
                             appWindow.uiManagerRef.cancelFollowLive()
                             playbackTab.holdWasPlaying = appWindow.uiManagerRef.transport.isPlaying
@@ -705,7 +711,71 @@ ApplicationWindow {
                     }
 
                     Button {
-                        text: "FWD 5.0x"
+                        text: "<"
+                        onClicked: appWindow.uiManagerRef.stepFrameBack()
+                    }
+
+                    Button {
+                        text: ">"
+                        onClicked: appWindow.uiManagerRef.stepFrame()
+                    }
+
+                    Button {
+                        text: "0.25x"
+                        onPressed: {
+                            appWindow.uiManagerRef.cancelFollowLive()
+                            playbackTab.holdWasPlaying = appWindow.uiManagerRef.transport.isPlaying
+                            appWindow.uiManagerRef.transport.setSpeed(0.25)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
+                        }
+                        onReleased: {
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                        onCanceled: {
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                    }
+
+                    Button {
+                        text: "0.5x"
+                        onPressed: {
+                            appWindow.uiManagerRef.cancelFollowLive()
+                            playbackTab.holdWasPlaying = appWindow.uiManagerRef.transport.isPlaying
+                            appWindow.uiManagerRef.transport.setSpeed(0.5)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
+                        }
+                        onReleased: {
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                        onCanceled: {
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                    }
+
+                    Button {
+                        text: "2.0x"
+                        onPressed: {
+                            appWindow.uiManagerRef.cancelFollowLive()
+                            playbackTab.holdWasPlaying = appWindow.uiManagerRef.transport.isPlaying
+                            appWindow.uiManagerRef.transport.setSpeed(2.0)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
+                        }
+                        onReleased: {
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                        onCanceled: {
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
+                        }
+                    }
+
+                    Button {
+                        text: "5.0x"
                         onPressed: {
                             appWindow.uiManagerRef.cancelFollowLive()
                             playbackTab.holdWasPlaying = appWindow.uiManagerRef.transport.isPlaying
@@ -723,56 +793,12 @@ ApplicationWindow {
                     }
 
                     Button {
-                        text: appWindow.uiManagerRef.transport.isPlaying ? "PAUSE" : "PLAY"
-                        onClicked: appWindow.uiManagerRef.playPause()
-                        highlighted: appWindow.uiManagerRef.transport.isPlaying
-                    }
-
-                    Button {
-                        text: "<"
-                        onClicked: appWindow.uiManagerRef.stepFrameBack()
-                    }
-
-                    Button {
-                        text: ">"
-                        onClicked: appWindow.uiManagerRef.stepFrame()
-                    }
-
-                    Button {
-                        text: "0.25x"
-                        onClicked: {
-                            appWindow.uiManagerRef.transport.setSpeed(0.25)
-                            appWindow.uiManagerRef.transport.setPlaying(true)
-                        }
-                    }
-
-                    Button {
-                        text: "0.5x"
-                        onClicked: {
-                            appWindow.uiManagerRef.transport.setSpeed(0.5)
-                            appWindow.uiManagerRef.transport.setPlaying(true)
-                        }
-                    }
-
-                    Button {
-                        text: "1.0x"
-                        onClicked: {
-                            appWindow.uiManagerRef.transport.setSpeed(1)
-                            appWindow.uiManagerRef.transport.setPlaying(true)
-                        }
-                    }
-
-                    Button {
-                        text: "2.0x"
-                        onClicked: {
-                            appWindow.uiManagerRef.transport.setSpeed(2.0)
-                            appWindow.uiManagerRef.transport.setPlaying(true)
-                        }
-                    }
-
-                    Button {
                         text: "Live"
-                        onClicked: appWindow.uiManagerRef.goLive()
+                        onClicked: {
+                            appWindow.uiManagerRef.goLive()
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
+                        }
                     }
 
                     Button {
