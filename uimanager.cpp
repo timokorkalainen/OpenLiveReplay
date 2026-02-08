@@ -1,5 +1,6 @@
 #include "uimanager.h"
 #include <QDateTime>
+#include <algorithm>
 #include <QDir>
 #include <QImageWriter>
 #include <QRegularExpression>
@@ -61,14 +62,44 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             return;
         }
 
-        int matchedAction = -1;
+        QVector<int> candidates;
         for (auto it = m_midiBindings.constBegin(); it != m_midiBindings.constEnd(); ++it) {
             if (it.value().status == status && it.value().data1 == data1) {
-                matchedAction = it.key();
+                candidates.append(it.key());
+            }
+        }
+        if (candidates.isEmpty()) return;
+
+        auto matchesJogValue = [&](int action) {
+            if (action != 8) return false;
+            int forwardValue = m_midiBindingData2Forward.value(action, -1);
+            int backwardValue = m_midiBindingData2Backward.value(action, -1);
+            return (forwardValue >= 0 && data2 == forwardValue) || (backwardValue >= 0 && data2 == backwardValue);
+        };
+
+        auto matchesData2 = [&](int action) {
+            const auto binding = m_midiBindings.value(action);
+            return (binding.data2 >= 0 && data2 == binding.data2);
+        };
+
+        int matchedAction = -1;
+        for (int action : candidates) {
+            if (matchesJogValue(action)) {
+                matchedAction = action;
                 break;
             }
         }
-        if (matchedAction < 0) return;
+        if (matchedAction < 0) {
+            for (int action : candidates) {
+                if (matchesData2(action)) {
+                    matchedAction = action;
+                    break;
+                }
+            }
+        }
+        if (matchedAction < 0) {
+            matchedAction = *std::min_element(candidates.constBegin(), candidates.constEnd());
+        }
 
         if (!m_midiLastValues.contains(matchedAction) || m_midiLastValues.value(matchedAction) != data2) {
             m_midiLastValues[matchedAction] = data2;
@@ -125,7 +156,6 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             if (!isRelease) stepFrameBack();
             break;
         case 8: {
-            if (isRelease) break;
             if (!m_transport) break;
 
             int forwardValue = m_midiBindingData2Forward.value(matchedAction, -1);
