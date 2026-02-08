@@ -20,6 +20,9 @@ struct AppSettings {
     bool showTimeOfDay = false;
     QString midiPortName;
     QMap<int, QPair<int,int>> midiBindings;
+    QMap<int, int> midiBindingData2;
+    QMap<int, int> midiBindingData2Forward;
+    QMap<int, int> midiBindingData2Backward;
 };
 
 class SettingsManager {

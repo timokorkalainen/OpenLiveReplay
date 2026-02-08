@@ -142,6 +142,7 @@ ApplicationWindow {
                                     { name: "Forward 5.0x", action: 2 },
                                     { name: "Prev Frame", action: 7 },
                                     { name: "Next Frame", action: 3 },
+                                    { name: "Jogwheel", action: 8 },
                                     { name: "Go Live", action: 4 },
                                     { name: "Capture", action: 5 },
                                     { name: "Multiview", action: 6 },
@@ -174,9 +175,42 @@ ApplicationWindow {
                                         Layout.fillWidth: true
                                     }
 
+                                    Text {
+                                        text: (uiManager.midiLastValuesVersion >= 0
+                                              ? "Last: " + uiManager.midiLastValue(modelData.action)
+                                              : "Last: " + uiManager.midiLastValue(modelData.action))
+                                        color: "#666"
+                                        Layout.preferredWidth: 80
+                                    }
+
                                     Button {
+                                        visible: modelData.action !== 8
                                         text: uiManager.midiLearnAction === modelData.action ? "Listening..." : "Learn"
                                         onClicked: uiManager.beginMidiLearn(modelData.action)
+                                    }
+
+                                    Button {
+                                        visible: modelData.action === 8
+                                        text: (uiManager.midiLearnAction === modelData.action && uiManager.midiLearnMode === 0)
+                                              ? "Listening..."
+                                              : "Learn Ctrl"
+                                        onClicked: uiManager.beginMidiLearn(modelData.action)
+                                    }
+
+                                    Button {
+                                        visible: modelData.action === 8
+                                        text: (uiManager.midiLearnAction === modelData.action && uiManager.midiLearnMode === 1)
+                                              ? "Listening..."
+                                              : "Learn Fwd"
+                                        onClicked: uiManager.beginMidiLearnJogForward(modelData.action)
+                                    }
+
+                                    Button {
+                                        visible: modelData.action === 8
+                                        text: (uiManager.midiLearnAction === modelData.action && uiManager.midiLearnMode === 2)
+                                              ? "Listening..."
+                                              : "Learn Back"
+                                        onClicked: uiManager.beginMidiLearnJogBackward(modelData.action)
                                     }
 
                                     Button {

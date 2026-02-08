@@ -23,6 +23,15 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
         obj["action"] = it.key();
         obj["status"] = it.value().first;
         obj["data1"] = it.value().second;
+        if (settings.midiBindingData2.contains(it.key())) {
+            obj["data2"] = settings.midiBindingData2.value(it.key());
+        }
+        if (settings.midiBindingData2Forward.contains(it.key())) {
+            obj["data2Forward"] = settings.midiBindingData2Forward.value(it.key());
+        }
+        if (settings.midiBindingData2Backward.contains(it.key())) {
+            obj["data2Backward"] = settings.midiBindingData2Backward.value(it.key());
+        }
         midiArray.append(obj);
     }
     root["midiBindings"] = midiArray;
@@ -97,14 +106,29 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.showTimeOfDay = root["showTimeOfDay"].toBool(settings.showTimeOfDay);
     settings.midiPortName = root["midiPortName"].toString();
     settings.midiBindings.clear();
+    settings.midiBindingData2.clear();
+    settings.midiBindingData2Forward.clear();
+    settings.midiBindingData2Backward.clear();
     QJsonArray midiArray = root["midiBindings"].toArray();
     for (const QJsonValue &val : midiArray) {
         QJsonObject obj = val.toObject();
         int action = obj["action"].toInt(-1);
         int status = obj["status"].toInt(-1);
         int data1 = obj["data1"].toInt(-1);
+        int data2 = obj["data2"].toInt(-1);
+        int data2Forward = obj["data2Forward"].toInt(-1);
+        int data2Backward = obj["data2Backward"].toInt(-1);
         if (action >= 0 && status >= 0 && data1 >= 0) {
             settings.midiBindings.insert(action, qMakePair(status, data1));
+            if (data2 >= 0) {
+                settings.midiBindingData2.insert(action, data2);
+            }
+            if (data2Forward >= 0) {
+                settings.midiBindingData2Forward.insert(action, data2Forward);
+            }
+            if (data2Backward >= 0) {
+                settings.midiBindingData2Backward.insert(action, data2Backward);
+            }
         }
     }
 

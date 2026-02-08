@@ -35,8 +35,10 @@ class UIManager : public QObject {
     Q_PROPERTY(int midiPortIndex READ midiPortIndex WRITE setMidiPortIndex NOTIFY midiPortIndexChanged)
     Q_PROPERTY(bool midiConnected READ midiConnected NOTIFY midiConnectedChanged)
     Q_PROPERTY(int midiLearnAction READ midiLearnAction NOTIFY midiLearnActionChanged)
+    Q_PROPERTY(int midiLearnMode READ midiLearnMode NOTIFY midiLearnActionChanged)
     Q_PROPERTY(QString midiPortName READ midiPortName NOTIFY midiPortNameChanged)
     Q_PROPERTY(int midiBindingsVersion READ midiBindingsVersion NOTIFY midiBindingsChanged)
+    Q_PROPERTY(int midiLastValuesVersion READ midiLastValuesVersion NOTIFY midiLastValuesChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
 
 public:
@@ -61,8 +63,10 @@ public:
     int midiPortIndex() const;
     bool midiConnected() const;
     int midiLearnAction() const;
+    int midiLearnMode() const { return m_midiLearnMode; }
     QString midiPortName() const;
     int midiBindingsVersion() const;
+    int midiLastValuesVersion() const;
     PlaybackTransport* transport() const { return m_transport; }
 
     // Setters
@@ -93,8 +97,11 @@ public:
     Q_INVOKABLE void refreshMidiPorts();
     Q_INVOKABLE void setMidiPortIndex(int index);
     Q_INVOKABLE void beginMidiLearn(int action);
+    Q_INVOKABLE void beginMidiLearnJogForward(int action);
+    Q_INVOKABLE void beginMidiLearnJogBackward(int action);
     Q_INVOKABLE void clearMidiBinding(int action);
     Q_INVOKABLE QString midiBindingLabel(int action) const;
+    Q_INVOKABLE int midiLastValue(int action) const;
     Q_INVOKABLE void playPause();
     Q_INVOKABLE void rewind5x();
     Q_INVOKABLE void forward5x();
@@ -131,6 +138,7 @@ signals:
     void midiConnectedChanged();
     void midiLearnActionChanged();
     void midiBindingsChanged();
+    void midiLastValuesChanged();
     void midiPortNameChanged();
     void feedSelectRequested(int index);
     void multiviewRequested();
@@ -167,18 +175,31 @@ private:
     bool m_playbackSingleView = false;
     int m_playbackSelectedIndex = -1;
     int m_midiBindingsVersion = 0;
+    int m_midiLastValuesVersion = 0;
     bool m_midiHoldWasPlaying = false;
     int m_midiHoldAction = -1;
     QElapsedTimer m_xTouchLastSend;
     QString m_xTouchLastText;
     int m_xTouchMinIntervalMs = 25;
     bool m_xTouchTestSent = false;
+    QElapsedTimer m_jogTimer;
 
     struct MidiBinding {
         int status = -1;
         int data1 = -1;
+        int data2 = -1;
     };
     QHash<int, MidiBinding> m_midiBindings;
+    QHash<int, int> m_midiLastValues;
+    QHash<int, int> m_midiBindingData2Forward;
+    QHash<int, int> m_midiBindingData2Backward;
+
+    enum MidiLearnMode {
+        LearnControl = 0,
+        LearnJogForward = 1,
+        LearnJogBackward = 2
+    };
+    int m_midiLearnMode = LearnControl;
 };
 
 #endif // UIMANAGER_H

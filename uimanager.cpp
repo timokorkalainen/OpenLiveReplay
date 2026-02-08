@@ -10,6 +10,7 @@
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
     : QObject(parent), m_replayManager(engine) {
+    m_jogTimer.start();
     connect(m_replayManager, &ReplayManager::masterPulse,
             this, &UIManager::onRecorderPulse,
             Qt::QueuedConnection);
@@ -31,10 +32,29 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         const bool isRelease = isNoteOff || isControlRelease;
 
         if (m_midiLearnAction >= 0) {
-            m_midiBindings[m_midiLearnAction] = {status, data1};
-            m_currentSettings.midiBindings.insert(m_midiLearnAction, qMakePair(status, data1));
+            if (m_midiLearnMode == LearnControl) {
+                m_midiBindings[m_midiLearnAction] = {status, data1, data2};
+                m_currentSettings.midiBindings.insert(m_midiLearnAction, qMakePair(status, data1));
+                m_currentSettings.midiBindingData2.insert(m_midiLearnAction, data2);
+            } else if (m_midiLearnMode == LearnJogForward || m_midiLearnMode == LearnJogBackward) {
+                const auto existing = m_midiBindings.value(m_midiLearnAction, MidiBinding{});
+                if (existing.status < 0 || existing.data1 < 0) {
+                    m_midiBindings[m_midiLearnAction] = {status, data1, existing.data2};
+                    m_currentSettings.midiBindings.insert(m_midiLearnAction, qMakePair(status, data1));
+                }
+
+                if (m_midiLearnMode == LearnJogForward) {
+                    m_midiBindingData2Forward[m_midiLearnAction] = data2;
+                    m_currentSettings.midiBindingData2Forward.insert(m_midiLearnAction, data2);
+                } else {
+                    m_midiBindingData2Backward[m_midiLearnAction] = data2;
+                    m_currentSettings.midiBindingData2Backward.insert(m_midiLearnAction, data2);
+                }
+            }
+
             m_settingsManager->save(m_configPath, m_currentSettings);
             m_midiLearnAction = -1;
+            m_midiLearnMode = LearnControl;
             emit midiLearnActionChanged();
             m_midiBindingsVersion++;
             emit midiBindingsChanged();
@@ -49,6 +69,12 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             }
         }
         if (matchedAction < 0) return;
+
+        if (!m_midiLastValues.contains(matchedAction) || m_midiLastValues.value(matchedAction) != data2) {
+            m_midiLastValues[matchedAction] = data2;
+            m_midiLastValuesVersion++;
+            emit midiLastValuesChanged();
+        }
 
         switch (matchedAction) {
         case 0:
@@ -98,6 +124,34 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         case 7:
             if (!isRelease) stepFrameBack();
             break;
+        case 8: {
+            if (isRelease) break;
+            if (!m_transport) break;
+
+            int forwardValue = m_midiBindingData2Forward.value(matchedAction, -1);
+            int backwardValue = m_midiBindingData2Backward.value(matchedAction, -1);
+
+            int deltaSign = 0;
+            if (forwardValue >= 0 && data2 == forwardValue) {
+                deltaSign = 1;
+            } else if (backwardValue >= 0 && data2 == backwardValue) {
+                deltaSign = -1;
+            } else {
+                break;
+            }
+
+            m_transport->setPlaying(false);
+            cancelFollowLive();
+
+            m_transport->step(deltaSign);
+
+            if (m_playbackWorker) {
+                int64_t targetMs = m_transport->currentPos();
+                m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
+                m_playbackWorker->seekTo(targetMs);
+            }
+            break;
+        }
         case 4:
             if (!isRelease) goLive();
             break;
@@ -186,6 +240,10 @@ QString UIManager::midiPortName() const {
 
 int UIManager::midiBindingsVersion() const {
     return m_midiBindingsVersion;
+}
+
+int UIManager::midiLastValuesVersion() const {
+    return m_midiLastValuesVersion;
 }
 
 void UIManager::setStreamUrls(const QStringList &urls) {
@@ -304,12 +362,33 @@ void UIManager::setMidiPortIndex(int index) {
 void UIManager::beginMidiLearn(int action) {
     if (m_midiLearnAction == action) return;
     m_midiLearnAction = action;
+    m_midiLearnMode = LearnControl;
+    emit midiLearnActionChanged();
+}
+
+void UIManager::beginMidiLearnJogForward(int action) {
+    if (m_midiLearnAction == action && m_midiLearnMode == LearnJogForward) return;
+    m_midiLearnAction = action;
+    m_midiLearnMode = LearnJogForward;
+    emit midiLearnActionChanged();
+}
+
+void UIManager::beginMidiLearnJogBackward(int action) {
+    if (m_midiLearnAction == action && m_midiLearnMode == LearnJogBackward) return;
+    m_midiLearnAction = action;
+    m_midiLearnMode = LearnJogBackward;
     emit midiLearnActionChanged();
 }
 
 void UIManager::clearMidiBinding(int action) {
     m_midiBindings.remove(action);
     m_currentSettings.midiBindings.remove(action);
+    m_currentSettings.midiBindingData2.remove(action);
+    m_midiBindingData2Forward.remove(action);
+    m_midiBindingData2Backward.remove(action);
+    m_currentSettings.midiBindingData2Forward.remove(action);
+    m_currentSettings.midiBindingData2Backward.remove(action);
+    m_midiLastValues.remove(action);
     m_settingsManager->save(m_configPath, m_currentSettings);
     m_midiBindingsVersion++;
     emit midiBindingsChanged();
@@ -319,7 +398,23 @@ QString UIManager::midiBindingLabel(int action) const {
     if (!m_midiBindings.contains(action)) return QString("Unassigned");
     const auto binding = m_midiBindings.value(action);
     if (binding.status < 0 || binding.data1 < 0) return QString("Unassigned");
-    return QString("0x%1 0x%2").arg(binding.status, 2, 16, QChar('0')).arg(binding.data1, 2, 16, QChar('0')).toUpper();
+    QString base = QString("0x%1 0x%2").arg(binding.status, 2, 16, QChar('0')).arg(binding.data1, 2, 16, QChar('0')).toUpper();
+    if (binding.data2 >= 0) {
+        base += QString(" (0x%1)").arg(binding.data2, 2, 16, QChar('0')).toUpper();
+    }
+    if (m_midiBindingData2Forward.contains(action) || m_midiBindingData2Backward.contains(action)) {
+        if (m_midiBindingData2Forward.contains(action)) {
+            base += QString(" F:0x%1").arg(m_midiBindingData2Forward.value(action), 2, 16, QChar('0')).toUpper();
+        }
+        if (m_midiBindingData2Backward.contains(action)) {
+            base += QString(" B:0x%1").arg(m_midiBindingData2Backward.value(action), 2, 16, QChar('0')).toUpper();
+        }
+    }
+    return base;
+}
+
+int UIManager::midiLastValue(int action) const {
+    return m_midiLastValues.value(action, -1);
 }
 
 void UIManager::playPause() {
@@ -498,8 +593,17 @@ void UIManager::loadSettings() {
         }
 
         m_midiBindings.clear();
+        m_midiBindingData2Forward.clear();
+        m_midiBindingData2Backward.clear();
         for (auto it = m_currentSettings.midiBindings.constBegin(); it != m_currentSettings.midiBindings.constEnd(); ++it) {
-            m_midiBindings.insert(it.key(), {it.value().first, it.value().second});
+            int data2 = m_currentSettings.midiBindingData2.value(it.key(), -1);
+            m_midiBindings.insert(it.key(), {it.value().first, it.value().second, data2});
+        }
+        for (auto it = m_currentSettings.midiBindingData2Forward.constBegin(); it != m_currentSettings.midiBindingData2Forward.constEnd(); ++it) {
+            m_midiBindingData2Forward.insert(it.key(), it.value());
+        }
+        for (auto it = m_currentSettings.midiBindingData2Backward.constBegin(); it != m_currentSettings.midiBindingData2Backward.constEnd(); ++it) {
+            m_midiBindingData2Backward.insert(it.key(), it.value());
         }
         m_midiBindingsVersion++;
         emit midiBindingsChanged();
