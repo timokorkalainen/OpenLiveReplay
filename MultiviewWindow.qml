@@ -1,7 +1,6 @@
+pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Window
-import QtQuick.Controls
-import QtQuick.Layouts
 import QtMultimedia
 
 Window {
@@ -41,6 +40,7 @@ Window {
             model: multiviewWindow.visibleStreamIndexes
 
             delegate: Rectangle {
+                id: streamTile
                 required property var modelData
                 property int streamIndex: modelData
                 color: "black"
@@ -55,22 +55,22 @@ Window {
                     fillMode: VideoOutput.PreserveAspectFit
                     z: 1
                     Component.onCompleted: {
-                        if (streamIndex < multiviewWindow.uiManager.playbackProviders.length) {
-                            multiviewWindow.uiManager.playbackProviders[streamIndex].addVideoSink(vOutput.videoSink)
+                        if (streamTile.streamIndex < multiviewWindow.uiManager.playbackProviders.length) {
+                            multiviewWindow.uiManager.playbackProviders[streamTile.streamIndex].addVideoSink(vOutput.videoSink)
                         }
                     }
                     Component.onDestruction: {
-                        if (streamIndex < multiviewWindow.uiManager.playbackProviders.length) {
-                            multiviewWindow.uiManager.playbackProviders[streamIndex].removeVideoSink(vOutput.videoSink)
+                        if (streamTile.streamIndex < multiviewWindow.uiManager.playbackProviders.length) {
+                            multiviewWindow.uiManager.playbackProviders[streamTile.streamIndex].removeVideoSink(vOutput.videoSink)
                         }
                     }
                 }
 
                 Text {
-                    text: (streamIndex < multiviewWindow.uiManager.streamNames.length
-                          && multiviewWindow.uiManager.streamNames[streamIndex].length > 0)
-                          ? multiviewWindow.uiManager.streamNames[streamIndex]
-                          : ("CAM " + (streamIndex + 1))
+                      text: (streamTile.streamIndex < multiviewWindow.uiManager.streamNames.length
+                          && multiviewWindow.uiManager.streamNames[streamTile.streamIndex].length > 0)
+                          ? multiviewWindow.uiManager.streamNames[streamTile.streamIndex]
+                          : ("CAM " + (streamTile.streamIndex + 1))
                     color: "white"
                     anchors.bottom: parent.bottom
                     anchors.left: parent.left

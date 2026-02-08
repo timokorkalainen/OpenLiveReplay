@@ -1,5 +1,6 @@
 pragma ComponentBehavior: Bound
 import QtQuick
+import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
 import Qt.labs.platform 1.1
@@ -18,36 +19,37 @@ ApplicationWindow {
     property int multiviewScreenIndex: 0
     property var screenOptions: []
     property bool screensReady: false
+    property var uiManagerRef: uiManager
 
     Component.onCompleted: {
-        uiManager.loadSettings()
-        uiManager.openStreams()
-        playbackTab.selectedIndex = -1
-        playbackTab.viewMode = "multi"
-        refreshScreenOptions()
-        if (!screensReady) screenProbe.start()
+        appWindow.uiManagerRef.loadSettings()
+        appWindow.uiManagerRef.openStreams()
+        appWindow.playbackTab.selectedIndex = -1
+        appWindow.playbackTab.viewMode = "multi"
+        appWindow.refreshScreenOptions()
+        if (!appWindow.screensReady) appWindow.screenProbe.start()
     }
 
     function openMultiviewWindow() {
-        uiManager.requestNewWindowScene()
-        if (multiviewWindow) {
-            multiviewWindow.visible = true
-            multiviewWindow.raise()
-            multiviewWindow.requestActivate()
+        appWindow.uiManagerRef.requestNewWindowScene()
+        if (appWindow.multiviewWindow) {
+            appWindow.multiviewWindow.visible = true
+            appWindow.multiviewWindow.raise()
+            appWindow.multiviewWindow.requestActivate()
             return
         }
 
         var component = Qt.createComponent("qrc:/qt/qml/OpenLiveReplay/MultiviewWindow.qml")
         if (component.status === Component.Ready) {
-            multiviewWindow = component.createObject(appWindow, {
-                uiManager: uiManager,
+            appWindow.multiviewWindow = component.createObject(appWindow, {
+                uiManager: appWindow.uiManagerRef,
                 owner: appWindow
             })
-            if (multiviewWindow) {
-                multiviewWindow.visibleStreamIndexes = Qt.binding(function() {
-                    return playbackTab.visibleStreamIndexes
+            if (appWindow.multiviewWindow) {
+                appWindow.multiviewWindow.visibleStreamIndexes = Qt.binding(function() {
+                    return appWindow.playbackTab.visibleStreamIndexes
                 })
-                updateMultiviewScreen()
+                appWindow.updateMultiviewScreen()
             }
         } else {
             console.error("Failed to load MultiviewWindow.qml:", component.errorString())
@@ -60,35 +62,35 @@ ApplicationWindow {
             return
         }
 
-        if (!multiviewWindow) {
-            openMultiviewWindow()
-            if (!multiviewWindow) return
+        if (!appWindow.multiviewWindow) {
+            appWindow.openMultiviewWindow()
+            if (!appWindow.multiviewWindow) return
         }
 
-        var targetIndex = Math.min(Math.max(0, multiviewScreenIndex), Qt.application.screens.length - 1)
-        multiviewWindow.screen = Qt.application.screens[targetIndex]
-        multiviewWindow.visibility = Window.FullScreen
-        multiviewWindow.visible = true
-        multiviewWindow.raise()
-        multiviewWindow.requestActivate()
+        var targetIndex = Math.min(Math.max(0, appWindow.multiviewScreenIndex), Qt.application.screens.length - 1)
+        appWindow.multiviewWindow.screen = Qt.application.screens[targetIndex]
+        appWindow.multiviewWindow.visibility = Window.FullScreen
+        appWindow.multiviewWindow.visible = true
+        appWindow.multiviewWindow.raise()
+        appWindow.multiviewWindow.requestActivate()
     }
 
     function updateMultiviewScreen() {
-        if (!multiviewWindow || !Qt.application) return
+        if (!appWindow.multiviewWindow || !Qt.application) return
 
         if (Qt.application.screens.length > 0) {
-            if (multiviewScreenIndex < 0 || multiviewScreenIndex >= Qt.application.screens.length) {
-                multiviewScreenIndex = 0
+            if (appWindow.multiviewScreenIndex < 0 || appWindow.multiviewScreenIndex >= Qt.application.screens.length) {
+                appWindow.multiviewScreenIndex = 0
             }
-            multiviewWindow.screen = Qt.application.screens[multiviewScreenIndex]
-            multiviewWindow.visibility = Window.FullScreen
+            appWindow.multiviewWindow.screen = Qt.application.screens[appWindow.multiviewScreenIndex]
+            appWindow.multiviewWindow.visibility = Window.FullScreen
         }
     }
 
     function refreshScreenOptions() {
         if (!Qt.application) {
-            screenOptions = []
-            screensReady = false
+            appWindow.screenOptions = []
+            appWindow.screensReady = false
             return
         }
 
@@ -104,24 +106,32 @@ ApplicationWindow {
             var label = size.length > 0 ? (name + " — " + size) : name
             options.push({ index: i, label: label })
         }
-        screenOptions = options
-        screensReady = options.length > 0
+        appWindow.screenOptions = options
+        appWindow.screensReady = options.length > 0
     }
 
     function showScreenMenu(anchor) {
         // unused, kept for compat
     }
 
+    Component {
+        id: screenActionComponent
+        Action {
+            property int screenIdx: -1
+        }
+    }
+
     function buildScreenMenu() {
         while (screenMenu.count > 0)
             screenMenu.removeItem(screenMenu.itemAt(0))
 
-        for (var i = 0; i < screenOptions.length; ++i) {
-            var action = Qt.createQmlObject(
-                'import QtQuick.Controls; Action { text: "' + screenOptions[i].label.replace(/"/g, '\\"') + '"; property int screenIdx: ' + screenOptions[i].index + ' }',
-                screenMenu
-            )
-            action.triggered.connect(makeScreenHandler(action.screenIdx))
+        for (var i = 0; i < appWindow.screenOptions.length; ++i) {
+            var action = screenActionComponent.createObject(screenMenu, {
+                text: appWindow.screenOptions[i].label,
+                screenIdx: appWindow.screenOptions[i].index
+            })
+            if (!action) continue
+            action.triggered.connect(appWindow.makeScreenHandler(action.screenIdx))
             screenMenu.addAction(action)
         }
     }
@@ -136,8 +146,8 @@ ApplicationWindow {
     Connections {
         target: Qt.application
         function onScreensChanged() {
-            refreshScreenOptions()
-            updateMultiviewScreen()
+            appWindow.refreshScreenOptions()
+            appWindow.updateMultiviewScreen()
         }
     }
 
@@ -146,8 +156,8 @@ ApplicationWindow {
         interval: 150
         repeat: true
         onTriggered: {
-            refreshScreenOptions()
-            if (screensReady) stop()
+            appWindow.refreshScreenOptions()
+            if (appWindow.screensReady) stop()
         }
     }
 
@@ -158,9 +168,9 @@ ApplicationWindow {
     FolderDialog {
         id: folderDialog
         title: "Select Recording Folder"
-        currentFolder: uiManager.saveLocation ? "file://" + uiManager.saveLocation : ""
+        currentFolder: appWindow.uiManagerRef.saveLocation ? "file://" + appWindow.uiManagerRef.saveLocation : ""
         onAccepted: {
-            uiManager.setSaveLocationFromUrl(folderDialog.folder)
+            appWindow.uiManagerRef.setSaveLocationFromUrl(folderDialog.folder)
         }
     }
 
@@ -205,11 +215,11 @@ ApplicationWindow {
 
                         Button {
                             id: recordButton
-                            text: uiManager.isRecording ? "STOP RECORDING" : "START RECORDING"
+                            text: appWindow.uiManagerRef.isRecording ? "STOP RECORDING" : "START RECORDING"
                             padding: 18
 
                             background: Rectangle {
-                                color: uiManager.isRecording ? "#d32f2f" : "#2e7d32"
+                                color: appWindow.uiManagerRef.isRecording ? "#d32f2f" : "#2e7d32"
                                 radius: 6
                             }
 
@@ -219,7 +229,7 @@ ApplicationWindow {
                                 verticalAlignment: Text.AlignVCenter
                             }
 
-                            onClicked: uiManager.isRecording ? uiManager.stopRecording() : uiManager.startRecording()
+                            onClicked: appWindow.uiManagerRef.isRecording ? appWindow.uiManagerRef.stopRecording() : appWindow.uiManagerRef.startRecording()
                         }
 
                         Item { Layout.fillWidth: true }
@@ -243,8 +253,8 @@ ApplicationWindow {
                     }
 
                     Text {
-                        text: uiManager.isRecording ? "● RECORDING LIVE" : "IDLE"
-                        color: uiManager.isRecording ? "#ff5252" : "#666"
+                        text: appWindow.uiManagerRef.isRecording ? "● RECORDING LIVE" : "IDLE"
+                        color: appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666"
                     }
 
                     GroupBox {
@@ -257,19 +267,19 @@ ApplicationWindow {
 
                             ComboBox {
                                 Layout.fillWidth: true
-                                model: uiManager.midiPorts
-                                currentIndex: uiManager.midiPortIndex
-                                onActivated: uiManager.setMidiPortIndex(currentIndex)
+                                model: appWindow.uiManagerRef.midiPorts
+                                currentIndex: appWindow.uiManagerRef.midiPortIndex
+                                onActivated: appWindow.uiManagerRef.setMidiPortIndex(currentIndex)
                             }
 
                             Button {
                                 text: "Refresh"
-                                onClicked: uiManager.refreshMidiPorts()
+                                onClicked: appWindow.uiManagerRef.refreshMidiPorts()
                             }
 
                             Text {
-                                text: uiManager.midiConnected ? "Connected" : "Disconnected"
-                                color: uiManager.midiConnected ? "#4CAF50" : "#777"
+                                text: appWindow.uiManagerRef.midiConnected ? "Connected" : "Disconnected"
+                                color: appWindow.uiManagerRef.midiConnected ? "#4CAF50" : "#777"
                                 verticalAlignment: Text.AlignVCenter
                             }
                         }
@@ -305,65 +315,66 @@ ApplicationWindow {
                                 ]
 
                                 delegate: RowLayout {
+                                    id: midiRow
                                     required property var modelData
                                     Layout.fillWidth: true
                                     spacing: 8
 
                                     Text {
-                                        text: modelData.name
+                                        text: midiRow.modelData.name
                                         Layout.preferredWidth: 130
                                         color: "#eee"
                                     }
 
                                     Text {
-                                             text: (uiManager.midiBindingsVersion >= 0
-                                                 ? uiManager.midiBindingLabel(modelData.action)
-                                                 : uiManager.midiBindingLabel(modelData.action))
-                                        color: uiManager.midiLearnAction === modelData.action ? "#ff9800" : "#aaa"
+                                             text: (appWindow.uiManagerRef.midiBindingsVersion >= 0
+                                                  ? appWindow.uiManagerRef.midiBindingLabel(midiRow.modelData.action)
+                                                  : appWindow.uiManagerRef.midiBindingLabel(midiRow.modelData.action))
+                                        color: appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action ? "#ff9800" : "#aaa"
                                         Layout.fillWidth: true
                                     }
 
                                     Text {
-                                        text: (uiManager.midiLastValuesVersion >= 0
-                                              ? "Last: " + uiManager.midiLastValue(modelData.action)
-                                              : "Last: " + uiManager.midiLastValue(modelData.action))
+                                        text: (appWindow.uiManagerRef.midiLastValuesVersion >= 0
+                                              ? "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action)
+                                              : "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action))
                                         color: "#666"
                                         Layout.preferredWidth: 80
                                     }
 
                                     Button {
-                                        visible: modelData.action !== 8
-                                        text: uiManager.midiLearnAction === modelData.action ? "Listening..." : "Learn"
-                                        onClicked: uiManager.beginMidiLearn(modelData.action)
+                                        visible: midiRow.modelData.action !== 8
+                                        text: appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action ? "Listening..." : "Learn"
+                                        onClicked: appWindow.uiManagerRef.beginMidiLearn(midiRow.modelData.action)
                                     }
 
                                     Button {
-                                        visible: modelData.action === 8
-                                        text: (uiManager.midiLearnAction === modelData.action && uiManager.midiLearnMode === 0)
+                                        visible: midiRow.modelData.action === 8
+                                        text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 0)
                                               ? "Listening..."
                                               : "Learn Ctrl"
-                                        onClicked: uiManager.beginMidiLearn(modelData.action)
+                                        onClicked: appWindow.uiManagerRef.beginMidiLearn(midiRow.modelData.action)
                                     }
 
                                     Button {
-                                        visible: modelData.action === 8
-                                        text: (uiManager.midiLearnAction === modelData.action && uiManager.midiLearnMode === 1)
+                                        visible: midiRow.modelData.action === 8
+                                        text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 1)
                                               ? "Listening..."
                                               : "Learn Fwd"
-                                        onClicked: uiManager.beginMidiLearnJogForward(modelData.action)
+                                        onClicked: appWindow.uiManagerRef.beginMidiLearnJogForward(midiRow.modelData.action)
                                     }
 
                                     Button {
-                                        visible: modelData.action === 8
-                                        text: (uiManager.midiLearnAction === modelData.action && uiManager.midiLearnMode === 2)
+                                        visible: midiRow.modelData.action === 8
+                                        text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 2)
                                               ? "Listening..."
                                               : "Learn Back"
-                                        onClicked: uiManager.beginMidiLearnJogBackward(modelData.action)
+                                        onClicked: appWindow.uiManagerRef.beginMidiLearnJogBackward(midiRow.modelData.action)
                                     }
 
                                     Button {
                                         text: "Clear"
-                                        onClicked: uiManager.clearMidiBinding(modelData.action)
+                                        onClicked: appWindow.uiManagerRef.clearMidiBinding(midiRow.modelData.action)
                                     }
                                 }
                             }
@@ -382,13 +393,13 @@ ApplicationWindow {
                 property int selectedIndex: -1
                 property var visibleStreamIndexes: []
                 property int streamCount: visibleStreamIndexes.length
-                property var selectedProvider: (selectedIndex >= 0 && selectedIndex < uiManager.playbackProviders.length)
-                                               ? uiManager.playbackProviders[selectedIndex]
+                property var selectedProvider: (selectedIndex >= 0 && selectedIndex < appWindow.uiManagerRef.playbackProviders.length)
+                                                ? appWindow.uiManagerRef.playbackProviders[selectedIndex]
                                                : null
                 property string viewMode: "multi"
                 property int gridColumns: Math.max(1, Math.ceil(Math.sqrt(Math.max(1, streamCount))))
                 property int gridRows: Math.ceil(Math.max(1, streamCount) / gridColumns)
-                property bool showTimeOfDay: uiManager.timeOfDayMode
+                property bool showTimeOfDay: appWindow.uiManagerRef.timeOfDayMode
                 property int clockTick: 0
                 property bool holdWasPlaying: false
 
@@ -397,7 +408,7 @@ ApplicationWindow {
                     var hours = Math.floor(totalSeconds / 3600)
                     var minutes = Math.floor((totalSeconds % 3600) / 60)
                     var seconds = totalSeconds % 60
-                    var fps = Math.max(1, uiManager.recordFps)
+                    var fps = Math.max(1, appWindow.uiManagerRef.recordFps)
                     var frames = Math.floor((ms % 1000) / (1000 / fps))
 
                     var hh = hours < 10 ? "0" + hours : "" + hours
@@ -426,10 +437,10 @@ ApplicationWindow {
 
                 function updateVisibleStreams() {
                     var indexes = []
-                    var total = Math.max(uiManager.streamUrls.length, uiManager.playbackProviders.length)
-                    if (uiManager.streamUrls.length > 0) {
-                        for (var i = 0; i < uiManager.streamUrls.length; ++i) {
-                            var url = uiManager.streamUrls[i]
+                    var total = Math.max(appWindow.uiManagerRef.streamUrls.length, appWindow.uiManagerRef.playbackProviders.length)
+                    if (appWindow.uiManagerRef.streamUrls.length > 0) {
+                        for (var i = 0; i < appWindow.uiManagerRef.streamUrls.length; ++i) {
+                            var url = appWindow.uiManagerRef.streamUrls[i]
                             if (url && url.trim().length > 0) {
                                 indexes.push(i)
                             }
@@ -456,29 +467,29 @@ ApplicationWindow {
                 }
 
                 Connections {
-                    target: uiManager
+                    target: appWindow.uiManagerRef
                     function onPlaybackProvidersChanged() {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
-                        uiManager.setPlaybackViewState(false, -1)
+                        appWindow.uiManagerRef.setPlaybackViewState(false, -1)
                     }
                     function onStreamUrlsChanged() {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
-                        uiManager.setPlaybackViewState(false, -1)
+                        appWindow.uiManagerRef.setPlaybackViewState(false, -1)
                     }
                     function onFeedSelectRequested(index) {
                         playbackTab.selectedIndex = index
                         playbackTab.viewMode = "single"
-                        uiManager.setPlaybackViewState(true, index)
+                        appWindow.uiManagerRef.setPlaybackViewState(true, index)
                     }
                     function onMultiviewRequested() {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
-                        uiManager.setPlaybackViewState(false, -1)
+                        appWindow.uiManagerRef.setPlaybackViewState(false, -1)
                     }
                 }
 
@@ -487,7 +498,7 @@ ApplicationWindow {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
-                        uiManager.setPlaybackViewState(false, -1)
+                        appWindow.uiManagerRef.setPlaybackViewState(false, -1)
                     }
                 }
 
@@ -502,7 +513,7 @@ ApplicationWindow {
                         color: "black"
                         border.color: "#00C853"
                         border.width: 2
-                        visible: playbackTab.viewMode === "single" && playbackTab.selectedIndex >= 0 && uiManager.playbackProviders.length > 0
+                        visible: playbackTab.viewMode === "single" && playbackTab.selectedIndex >= 0 && appWindow.uiManagerRef.playbackProviders.length > 0
 
                         VideoOutput {
                             id: singleOutput
@@ -512,8 +523,8 @@ ApplicationWindow {
 
                         Text {
                             text: playbackTab.selectedIndex >= 0
-                                  ? ((playbackTab.selectedIndex < uiManager.streamNames.length && uiManager.streamNames[playbackTab.selectedIndex].length > 0)
-                                     ? uiManager.streamNames[playbackTab.selectedIndex]
+                                             ? ((playbackTab.selectedIndex < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[playbackTab.selectedIndex].length > 0)
+                                                 ? appWindow.uiManagerRef.streamNames[playbackTab.selectedIndex]
                                      : ("CAM " + (playbackTab.selectedIndex + 1)))
                                   : ""
                             color: "white"
@@ -529,7 +540,7 @@ ApplicationWindow {
                             onClicked: {
                                 playbackTab.selectedIndex = -1
                                 playbackTab.viewMode = "multi"
-                                uiManager.setPlaybackViewState(false, -1)
+                                appWindow.uiManagerRef.setPlaybackViewState(false, -1)
                             }
                         }
 
@@ -553,6 +564,7 @@ ApplicationWindow {
                         model: playbackTab.visibleStreamIndexes
 
                         delegate: Rectangle {
+                            id: multiViewDelegate
                             required property var modelData
                             property int streamIndex: modelData
                             color: "black"
@@ -567,24 +579,24 @@ ApplicationWindow {
                                 fillMode: VideoOutput.PreserveAspectFit
                                 z: 1
                                 Component.onCompleted: {
-                                    if (streamIndex < uiManager.playbackProviders.length) {
-                                        uiManager.playbackProviders[streamIndex].videoSink = vOutput.videoSink
+                                    if (multiViewDelegate.streamIndex < appWindow.uiManagerRef.playbackProviders.length) {
+                                        appWindow.uiManagerRef.playbackProviders[multiViewDelegate.streamIndex].videoSink = vOutput.videoSink
                                     }
                                 }
                             }
 
                             onVisibleChanged: {
                                 if (visible) {
-                                    if (streamIndex < uiManager.playbackProviders.length) {
-                                        uiManager.playbackProviders[streamIndex].videoSink = vOutput.videoSink
+                                    if (multiViewDelegate.streamIndex < appWindow.uiManagerRef.playbackProviders.length) {
+                                        appWindow.uiManagerRef.playbackProviders[multiViewDelegate.streamIndex].videoSink = vOutput.videoSink
                                     }
                                 }
                             }
 
                             Text {
-                                text: (streamIndex < uiManager.streamNames.length && uiManager.streamNames[streamIndex].length > 0)
-                                      ? uiManager.streamNames[streamIndex]
-                                      : ("CAM " + (streamIndex + 1))
+                                  text: (multiViewDelegate.streamIndex < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[multiViewDelegate.streamIndex].length > 0)
+                                      ? appWindow.uiManagerRef.streamNames[multiViewDelegate.streamIndex]
+                                      : ("CAM " + (multiViewDelegate.streamIndex + 1))
                                 color: "white"
                                 anchors.bottom: parent.bottom
                                 anchors.left: parent.left
@@ -598,9 +610,9 @@ ApplicationWindow {
                                 anchors.fill: parent
                                 z: 2
                                 onClicked: {
-                                    playbackTab.selectedIndex = streamIndex
+                                    playbackTab.selectedIndex = multiViewDelegate.streamIndex
                                     playbackTab.viewMode = "single"
-                                    uiManager.setPlaybackViewState(true, streamIndex)
+                                    appWindow.uiManagerRef.setPlaybackViewState(true, multiViewDelegate.streamIndex)
                                 }
                             }
                         }
@@ -611,11 +623,11 @@ ApplicationWindow {
                     id: scrubBar
                     Layout.fillWidth: true
                     from: 0
-                    to: Math.max(0, uiManager.recordedDurationMs - uiManager.liveBufferMs)
-                    value: uiManager.scrubPosition
+                    to: Math.max(0, appWindow.uiManagerRef.recordedDurationMs - appWindow.uiManagerRef.liveBufferMs)
+                    value: appWindow.uiManagerRef.scrubPosition
 
                     onMoved: {
-                        uiManager.seekPlayback(value)
+                        appWindow.uiManagerRef.seekPlayback(value)
                     }
 
                     background: Rectangle {
@@ -637,16 +649,16 @@ ApplicationWindow {
                     spacing: 12
 
                     Text {
-                        text: playbackTab.showTimeOfDay && uiManager.recordingStartEpochMs > 0
-                              ? playbackTab.formatTimeOfDay(uiManager.recordingStartEpochMs + uiManager.scrubPosition)
-                              : playbackTab.formatTimecode(uiManager.scrubPosition)
+                        text: playbackTab.showTimeOfDay && appWindow.uiManagerRef.recordingStartEpochMs > 0
+                            ? playbackTab.formatTimeOfDay(appWindow.uiManagerRef.recordingStartEpochMs + appWindow.uiManagerRef.scrubPosition)
+                            : playbackTab.formatTimecode(appWindow.uiManagerRef.scrubPosition)
                         color: "#eee"
                         font.family: "Menlo"
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
                         MouseArea {
                             anchors.fill: parent
-                            onClicked: uiManager.timeOfDayMode = !uiManager.timeOfDayMode
+                            onClicked: appWindow.uiManagerRef.timeOfDayMode = !appWindow.uiManagerRef.timeOfDayMode
                         }
                     }
 
@@ -655,95 +667,95 @@ ApplicationWindow {
                     Button {
                         text: "REV 5.0x"
                         onPressed: {
-                            uiManager.cancelFollowLive()
-                            playbackTab.holdWasPlaying = uiManager.transport.isPlaying
-                            uiManager.transport.setSpeed(-5.0)
-                            uiManager.transport.setPlaying(true)
+                            appWindow.uiManagerRef.cancelFollowLive()
+                            playbackTab.holdWasPlaying = appWindow.uiManagerRef.transport.isPlaying
+                            appWindow.uiManagerRef.transport.setSpeed(-5.0)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
                         }
                         onReleased: {
-                            uiManager.transport.setSpeed(1.0)
-                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
                         }
                         onCanceled: {
-                            uiManager.transport.setSpeed(1.0)
-                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
                         }
                     }
 
                     Button {
                         text: "FWD 5.0x"
                         onPressed: {
-                            uiManager.cancelFollowLive()
-                            playbackTab.holdWasPlaying = uiManager.transport.isPlaying
-                            uiManager.transport.setSpeed(5.0)
-                            uiManager.transport.setPlaying(true)
+                            appWindow.uiManagerRef.cancelFollowLive()
+                            playbackTab.holdWasPlaying = appWindow.uiManagerRef.transport.isPlaying
+                            appWindow.uiManagerRef.transport.setSpeed(5.0)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
                         }
                         onReleased: {
-                            uiManager.transport.setSpeed(1.0)
-                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
                         }
                         onCanceled: {
-                            uiManager.transport.setSpeed(1.0)
-                            uiManager.transport.setPlaying(playbackTab.holdWasPlaying)
+                            appWindow.uiManagerRef.transport.setSpeed(1.0)
+                            appWindow.uiManagerRef.transport.setPlaying(playbackTab.holdWasPlaying)
                         }
                     }
 
                     Button {
-                        text: uiManager.transport.isPlaying ? "PAUSE" : "PLAY"
-                        onClicked: uiManager.playPause()
-                        highlighted: uiManager.transport.isPlaying
+                        text: appWindow.uiManagerRef.transport.isPlaying ? "PAUSE" : "PLAY"
+                        onClicked: appWindow.uiManagerRef.playPause()
+                        highlighted: appWindow.uiManagerRef.transport.isPlaying
                     }
 
                     Button {
                         text: "<"
-                        onClicked: uiManager.stepFrameBack()
+                        onClicked: appWindow.uiManagerRef.stepFrameBack()
                     }
 
                     Button {
                         text: ">"
-                        onClicked: uiManager.stepFrame()
+                        onClicked: appWindow.uiManagerRef.stepFrame()
                     }
 
                     Button {
                         text: "0.25x"
                         onClicked: {
-                            uiManager.transport.setSpeed(0.25)
-                            uiManager.transport.setPlaying(true)
+                            appWindow.uiManagerRef.transport.setSpeed(0.25)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
                         }
                     }
 
                     Button {
                         text: "0.5x"
                         onClicked: {
-                            uiManager.transport.setSpeed(0.5)
-                            uiManager.transport.setPlaying(true)
+                            appWindow.uiManagerRef.transport.setSpeed(0.5)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
                         }
                     }
 
                     Button {
                         text: "1.0x"
                         onClicked: {
-                            uiManager.transport.setSpeed(1)
-                            uiManager.transport.setPlaying(true)
+                            appWindow.uiManagerRef.transport.setSpeed(1)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
                         }
                     }
 
                     Button {
                         text: "2.0x"
                         onClicked: {
-                            uiManager.transport.setSpeed(2.0)
-                            uiManager.transport.setPlaying(true)
+                            appWindow.uiManagerRef.transport.setSpeed(2.0)
+                            appWindow.uiManagerRef.transport.setPlaying(true)
                         }
                     }
 
                     Button {
                         text: "Live"
-                        onClicked: uiManager.goLive()
+                        onClicked: appWindow.uiManagerRef.goLive()
                     }
 
                     Button {
                         text: "Capture"
-                        onClicked: uiManager.captureCurrent()
+                        onClicked: appWindow.uiManagerRef.captureCurrent()
                     }
 
                     Item { Layout.fillWidth: true }
@@ -753,14 +765,14 @@ ApplicationWindow {
                             ? (playbackTab.clockTick >= 0
                                ? playbackTab.formatTimeOfDay(Date.now())
                                : playbackTab.formatTimeOfDay(Date.now()))
-                            : playbackTab.formatTimecode(uiManager.recordedDurationMs)
+                            : playbackTab.formatTimecode(appWindow.uiManagerRef.recordedDurationMs)
                         color: "#eee"
                         font.family: "Menlo"
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
                         MouseArea {
                             anchors.fill: parent
-                            onClicked: uiManager.timeOfDayMode = !uiManager.timeOfDayMode
+                            onClicked: appWindow.uiManagerRef.timeOfDayMode = !appWindow.uiManagerRef.timeOfDayMode
                         }
                         onVisibleChanged: clockTimer.restart()
                     }
@@ -788,17 +800,17 @@ ApplicationWindow {
                     TextField {
                         Layout.fillWidth: true
                         Layout.columnSpan: 2
-                        text: uiManager.fileName
-                        onEditingFinished: uiManager.fileName = text
+                        text: appWindow.uiManagerRef.fileName
+                        onEditingFinished: appWindow.uiManagerRef.fileName = text
                     }
 
                     Label { text: "Save Location"; }
 
                     TextField {
                         Layout.fillWidth: true
-                        text: uiManager.saveLocation
+                        text: appWindow.uiManagerRef.saveLocation
                         placeholderText: "Select folder..."
-                        onEditingFinished: uiManager.saveLocation = text
+                        onEditingFinished: appWindow.uiManagerRef.saveLocation = text
                     }
 
                     Button {
@@ -819,8 +831,8 @@ ApplicationWindow {
                         stepSize: 10
                         editable: true
                         inputMethodHints: Qt.ImhDigitsOnly
-                        value: uiManager.recordWidth
-                        onValueModified: uiManager.recordWidth = value
+                        value: appWindow.uiManagerRef.recordWidth
+                        onValueModified: appWindow.uiManagerRef.recordWidth = value
                     }
 
                     Label { text: "x"; }
@@ -831,8 +843,8 @@ ApplicationWindow {
                         stepSize: 10
                         editable: true
                         inputMethodHints: Qt.ImhDigitsOnly
-                        value: uiManager.recordHeight
-                        onValueModified: uiManager.recordHeight = value
+                        value: appWindow.uiManagerRef.recordHeight
+                        onValueModified: appWindow.uiManagerRef.recordHeight = value
                     }
 
                     Item { }
@@ -845,8 +857,8 @@ ApplicationWindow {
                         stepSize: 1
                         editable: true
                         inputMethodHints: Qt.ImhDigitsOnly
-                        value: uiManager.recordFps
-                        onValueModified: uiManager.recordFps = value
+                        value: appWindow.uiManagerRef.recordFps
+                        onValueModified: appWindow.uiManagerRef.recordFps = value
                     }
 
                     Item { }
@@ -865,8 +877,8 @@ ApplicationWindow {
 
                     Button {
                         text: "+ Add Stream"
-                        onClicked: uiManager.addStream()
-                        enabled: !uiManager.isRecording
+                        onClicked: appWindow.uiManagerRef.addStream()
+                        enabled: !appWindow.uiManagerRef.isRecording
                     }
                 }
 
@@ -875,40 +887,41 @@ ApplicationWindow {
                     Layout.fillHeight: true
                     Layout.fillWidth: true
                     clip: true
-                    model: uiManager.streamUrls
+                    model: appWindow.uiManagerRef.streamUrls
                     spacing: 8
 
                     delegate: RowLayout {
+                        id: streamRow
                         required property string modelData
                         required property int index
                         width: streamList.width
                         spacing: 10
 
                         Label {
-                            text: (parent.index + 1) + ":"
+                            text: (streamRow.index + 1) + ":"
                             width: 20
                         }
 
                         TextField {
                             Layout.preferredWidth: 140
-                            text: uiManager.streamNames.length > parent.index ? uiManager.streamNames[parent.index] : ""
+                            text: appWindow.uiManagerRef.streamNames.length > streamRow.index ? appWindow.uiManagerRef.streamNames[streamRow.index] : ""
                             placeholderText: "Name"
-                            onEditingFinished: uiManager.updateStreamName(parent.index, text)
+                            onEditingFinished: appWindow.uiManagerRef.updateStreamName(streamRow.index, text)
                         }
 
                         TextField {
                             Layout.fillWidth: true
-                            text: parent.modelData
+                            text: streamRow.modelData
                             placeholderText: "rtmp://..."
-                            onEditingFinished: uiManager.updateUrl(parent.index, text)
+                            onEditingFinished: appWindow.uiManagerRef.updateUrl(streamRow.index, text)
                         }
 
                         Button {
                             text: "×"
                             width: 30
                             flat: true
-                            onClicked: uiManager.removeStream(index)
-                            visible: !uiManager.isRecording
+                            onClicked: appWindow.uiManagerRef.removeStream(streamRow.index)
+                            visible: !appWindow.uiManagerRef.isRecording
                         }
                     }
                 }
@@ -919,7 +932,7 @@ ApplicationWindow {
 
                     Button {
                         text: "Save Config"
-                        onClicked: uiManager.saveSettings()
+                        onClicked: appWindow.uiManagerRef.saveSettings()
                     }
 
                     Item { Layout.fillWidth: true }
