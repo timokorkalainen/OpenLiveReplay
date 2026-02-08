@@ -3,5 +3,6 @@
   <qresource prefix="/">
     <file>qtquickcontrols2.conf</file>
     <file>Main.qml</file>
+    <file>MultiviewWindow.qml</file>
   </qresource>
 </RCC>

@@ -109,6 +109,7 @@ public:
     Q_INVOKABLE void stepFrameBack();
     Q_INVOKABLE void goLive();
     Q_INVOKABLE void captureCurrent();
+    Q_INVOKABLE void requestNewWindowScene();
     Q_INVOKABLE void setPlaybackViewState(bool singleView, int selectedIndex);
     Q_INVOKABLE void cancelFollowLive();
 

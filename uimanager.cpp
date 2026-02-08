@@ -2,6 +2,10 @@
 #include <QDateTime>
 #include <algorithm>
 #include <QDir>
+#include <QGuiApplication>
+#if defined(Q_OS_IOS)
+#include "ios/ios_scene.h"
+#endif
 #include <QImageWriter>
 #include <QRegularExpression>
 #include <QStandardPaths>
@@ -499,6 +503,12 @@ void UIManager::cancelFollowLive() {
 
 void UIManager::captureCurrent() {
     captureSnapshot(m_playbackSingleView, m_playbackSelectedIndex, scrubPosition());
+}
+
+void UIManager::requestNewWindowScene() {
+#if defined(Q_OS_IOS)
+    requestIosNewScene();
+#endif
 }
 
 void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {

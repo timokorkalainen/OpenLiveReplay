@@ -16,38 +16,70 @@ QVideoSink* FrameProvider::videoSink() const
 
 void FrameProvider::setVideoSink(QVideoSink *sink)
 {
-    if (m_sink != sink) {
-        if (m_sink) {
-            disconnect(m_sink, nullptr, this, nullptr);
-        }
-        m_sink = sink;
-        if (m_sink) {
-            connect(m_sink, &QObject::destroyed, this, [this]() {
-                m_sink = nullptr;
-            });
-        }
-        emit videoSinkChanged();
-        qDebug() << "C++: Video Sink successfully connected from QML";
+    if (m_sink == sink) return;
 
-        // Push the last available frame immediately for fast switching
-        if (m_sink) {
-            QVideoFrame lastFrameCopy;
-            {
-                QMutexLocker locker(&m_frameMutex);
-                lastFrameCopy = m_lastFrame;
-            }
-            if (lastFrameCopy.isValid()) {
-                if (m_sink->thread() == QThread::currentThread()) {
-                    m_sink->setVideoFrame(lastFrameCopy);
-                } else {
-                    QPointer<QVideoSink> sinkPtr = m_sink;
-                    QVideoFrame copy = lastFrameCopy;
-                    QMetaObject::invokeMethod(m_sink, [sinkPtr, copy]() mutable {
-                        if (sinkPtr) sinkPtr->setVideoFrame(copy);
-                    }, Qt::QueuedConnection);
-                }
-            }
+    QPointer<QVideoSink> oldSink = m_sink;
+    m_sink = sink;
+
+    if (oldSink) {
+        removeVideoSink(oldSink);
+    }
+
+    if (m_sink) {
+        addVideoSink(m_sink);
+    }
+
+    emit videoSinkChanged();
+    qDebug() << "C++: Video Sink successfully connected from QML";
+}
+
+void FrameProvider::addVideoSink(QVideoSink *sink)
+{
+    if (!sink) return;
+
+    {
+        QMutexLocker locker(&m_sinkMutex);
+        for (const auto &existing : m_sinks) {
+            if (existing == sink) return;
         }
+        m_sinks.append(sink);
+    }
+
+    connect(sink, &QObject::destroyed, this, [this, sink]() {
+        removeVideoSink(sink);
+    });
+
+    QVideoFrame lastFrameCopy;
+    {
+        QMutexLocker locker(&m_frameMutex);
+        lastFrameCopy = m_lastFrame;
+    }
+    if (lastFrameCopy.isValid()) {
+        if (sink->thread() == QThread::currentThread()) {
+            sink->setVideoFrame(lastFrameCopy);
+        } else {
+            QPointer<QVideoSink> sinkPtr = sink;
+            QVideoFrame copy = lastFrameCopy;
+            QMetaObject::invokeMethod(sink, [sinkPtr, copy]() mutable {
+                if (sinkPtr) sinkPtr->setVideoFrame(copy);
+            }, Qt::QueuedConnection);
+        }
+    }
+}
+
+void FrameProvider::removeVideoSink(QVideoSink *sink)
+{
+    if (!sink) return;
+
+    QMutexLocker locker(&m_sinkMutex);
+    for (int i = m_sinks.size() - 1; i >= 0; --i) {
+        if (!m_sinks[i] || m_sinks[i] == sink) {
+            m_sinks.removeAt(i);
+        }
+    }
+
+    if (m_sink == sink) {
+        m_sink = nullptr;
     }
 }
 
@@ -58,18 +90,26 @@ void FrameProvider::deliverFrame(const QVideoFrame &frame)
         m_lastFrame = frame;
     }
 
-    QPointer<QVideoSink> sink = m_sink;
-    if (!sink) return;
-
-    if (sink->thread() == QThread::currentThread()) {
-        sink->setVideoFrame(frame);
-        return;
+    QList<QPointer<QVideoSink>> sinksCopy;
+    {
+        QMutexLocker locker(&m_sinkMutex);
+        sinksCopy = m_sinks;
     }
 
-    QVideoFrame copy = frame;
-    QMetaObject::invokeMethod(sink, [sink, copy]() mutable {
-        if (sink) sink->setVideoFrame(copy);
-    }, Qt::QueuedConnection);
+    if (sinksCopy.isEmpty()) return;
+
+    for (const auto &sink : sinksCopy) {
+        if (!sink) continue;
+        if (sink->thread() == QThread::currentThread()) {
+            sink->setVideoFrame(frame);
+        } else {
+            QVideoFrame copy = frame;
+            QPointer<QVideoSink> sinkPtr = sink;
+            QMetaObject::invokeMethod(sink, [sinkPtr, copy]() mutable {
+                if (sinkPtr) sinkPtr->setVideoFrame(copy);
+            }, Qt::QueuedConnection);
+        }
+    }
 }
 
 QImage FrameProvider::latestImage() const

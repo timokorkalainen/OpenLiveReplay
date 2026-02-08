@@ -8,16 +8,147 @@ import QtMultimedia
 import Recorder.Types 1.0
 
 ApplicationWindow {
+    id: appWindow
     visible: true
     width: 800
     height: 600
     title: "OpenLiveReplay"
+
+    property var multiviewWindow: null
+    property int multiviewScreenIndex: 0
+    property var screenOptions: []
+    property bool screensReady: false
 
     Component.onCompleted: {
         uiManager.loadSettings()
         uiManager.openStreams()
         playbackTab.selectedIndex = -1
         playbackTab.viewMode = "multi"
+        refreshScreenOptions()
+        if (!screensReady) screenProbe.start()
+    }
+
+    function openMultiviewWindow() {
+        uiManager.requestNewWindowScene()
+        if (multiviewWindow) {
+            multiviewWindow.visible = true
+            multiviewWindow.raise()
+            multiviewWindow.requestActivate()
+            return
+        }
+
+        var component = Qt.createComponent("qrc:/qt/qml/OpenLiveReplay/MultiviewWindow.qml")
+        if (component.status === Component.Ready) {
+            multiviewWindow = component.createObject(appWindow, {
+                uiManager: uiManager,
+                owner: appWindow
+            })
+            if (multiviewWindow) {
+                multiviewWindow.visibleStreamIndexes = Qt.binding(function() {
+                    return playbackTab.visibleStreamIndexes
+                })
+                updateMultiviewScreen()
+            }
+        } else {
+            console.error("Failed to load MultiviewWindow.qml:", component.errorString())
+        }
+    }
+
+    function openMultiviewOnExternalDisplay() {
+        if (!Qt.application || Qt.application.screens.length === 0) {
+            console.warn("No screens detected")
+            return
+        }
+
+        if (!multiviewWindow) {
+            openMultiviewWindow()
+            if (!multiviewWindow) return
+        }
+
+        var targetIndex = Math.min(Math.max(0, multiviewScreenIndex), Qt.application.screens.length - 1)
+        multiviewWindow.screen = Qt.application.screens[targetIndex]
+        multiviewWindow.visibility = Window.FullScreen
+        multiviewWindow.visible = true
+        multiviewWindow.raise()
+        multiviewWindow.requestActivate()
+    }
+
+    function updateMultiviewScreen() {
+        if (!multiviewWindow || !Qt.application) return
+
+        if (Qt.application.screens.length > 0) {
+            if (multiviewScreenIndex < 0 || multiviewScreenIndex >= Qt.application.screens.length) {
+                multiviewScreenIndex = 0
+            }
+            multiviewWindow.screen = Qt.application.screens[multiviewScreenIndex]
+            multiviewWindow.visibility = Window.FullScreen
+        }
+    }
+
+    function refreshScreenOptions() {
+        if (!Qt.application) {
+            screenOptions = []
+            screensReady = false
+            return
+        }
+
+        var options = []
+        var screens = Qt.application.screens
+        if (!screens || screens.length === 0) {
+            screens = [appWindow.screen]
+        }
+        for (var i = 0; i < screens.length; ++i) {
+            var s = screens[i]
+            var name = s.name && s.name.length > 0 ? s.name : ("Display " + (i + 1))
+            var size = s.size ? (s.size.width + "×" + s.size.height) : ""
+            var label = size.length > 0 ? (name + " — " + size) : name
+            options.push({ index: i, label: label })
+        }
+        screenOptions = options
+        screensReady = options.length > 0
+    }
+
+    function showScreenMenu(anchor) {
+        // unused, kept for compat
+    }
+
+    function buildScreenMenu() {
+        while (screenMenu.count > 0)
+            screenMenu.removeItem(screenMenu.itemAt(0))
+
+        for (var i = 0; i < screenOptions.length; ++i) {
+            var action = Qt.createQmlObject(
+                'import QtQuick.Controls; Action { text: "' + screenOptions[i].label.replace(/"/g, '\\"') + '"; property int screenIdx: ' + screenOptions[i].index + ' }',
+                screenMenu
+            )
+            action.triggered.connect(makeScreenHandler(action.screenIdx))
+            screenMenu.addAction(action)
+        }
+    }
+
+    function makeScreenHandler(screenIdx) {
+        return function() {
+            appWindow.multiviewScreenIndex = screenIdx
+            appWindow.openMultiviewOnExternalDisplay()
+        }
+    }
+
+    Connections {
+        target: Qt.application
+        function onScreensChanged() {
+            refreshScreenOptions()
+            updateMultiviewScreen()
+        }
+    }
+
+    Timer {
+        id: screenProbe
+        interval: 150
+        repeat: true
+        onTriggered: {
+            refreshScreenOptions()
+            if (screensReady) stop()
+        }
     }
 
     // FORCE THE THEME HERE
@@ -92,6 +223,23 @@ ApplicationWindow {
                         }
 
                         Item { Layout.fillWidth: true }
+
+                        Button {
+                            id: multiviewMenuButton
+                            text: "Fullscreen Multiview ▾"
+                            padding: 12
+                            onClicked: {
+                                appWindow.refreshScreenOptions()
+                                appWindow.buildScreenMenu()
+                                screenMenu.x = 0
+                                screenMenu.y = multiviewMenuButton.height + 4
+                                screenMenu.open()
+                            }
+
+                            Menu {
+                                id: screenMenu
+                            }
+                        }
                     }
 
                     Text {

@@ -31,6 +31,7 @@ qt_add_qml_module(appOpenLiveReplay
     VERSION 1.0
     QML_FILES
         Main.qml
+        MultiviewWindow.qml
     SOURCES
         recorder_engine/replaymanager.cpp recorder_engine/replaymanager.h
         recorder_engine/muxer.h recorder_engine/muxer.cpp
@@ -58,6 +59,13 @@ target_link_libraries(OpenLiveReplayMidi PRIVATE
 
 # 4. Handle Platform Specifics (FFmpeg)
 if(IOS)
+    target_sources(appOpenLiveReplay PRIVATE
+        ios/ios_scene.h
+        ios/ios_scene.mm
+    )
+    set_target_properties(appOpenLiveReplay PROPERTIES
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/ios/Info.plist"
+    )
     # ==============================================================================
     # INTEGRATED FFMPEG IOS BUILDER
     # ==============================================================================
