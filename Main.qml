@@ -518,21 +518,27 @@ ApplicationWindow {
                             visible: singleView.sourceForView >= 0
                         }
 
-                        Text {
-                            text: {
-                                var src = singleView.sourceForView
-                                if (playbackTab.selectedIndex < 0) return ""
-                                if (src < 0) return "VIEW " + (playbackTab.selectedIndex + 1)
-                                return (src < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[src].length > 0)
-                                    ? appWindow.uiManagerRef.streamNames[src]
-                                    : ("CAM " + (src + 1))
-                            }
-                            color: "white"
+                        Rectangle {
                             anchors.bottom: parent.bottom
                             anchors.left: parent.left
                             anchors.margins: 6
-                            font.family: "Menlo"
-                            font.pixelSize: 14
+                            color: Qt.rgba(0, 0, 0, 0.5)
+                            width: singleViewLabel.implicitWidth + 12
+                            height: singleViewLabel.implicitHeight + 6
+
+                            Text {
+                                id: singleViewLabel
+                                anchors.centerIn: parent
+                                text: {
+                                    var src = singleView.sourceForView
+                                    if (playbackTab.selectedIndex < 0) return ""
+                                    if (src < 0) return "VIEW " + (playbackTab.selectedIndex + 1)
+                                    return appWindow.uiManagerRef.sourceDisplayLabel(src)
+                                }
+                                color: "white"
+                                font.family: "monospace"
+                                font.pixelSize: 14
+                            }
                         }
 
                         MouseArea {
@@ -599,21 +605,27 @@ ApplicationWindow {
                                 }
                             }
 
-                            Text {
-                                text: {
-                                    var src = multiViewDelegate.sourceForView
-                                    if (src < 0) return "VIEW " + (multiViewDelegate.streamIndex + 1)
-                                    return (src < appWindow.uiManagerRef.streamNames.length && appWindow.uiManagerRef.streamNames[src].length > 0)
-                                        ? appWindow.uiManagerRef.streamNames[src]
-                                        : ("CAM " + (src + 1))
-                                }
-                                color: "white"
+                            Rectangle {
                                 anchors.bottom: parent.bottom
                                 anchors.left: parent.left
                                 anchors.margins: 5
-                                font.family: "Menlo"
-                                font.pixelSize: 12
+                                color: Qt.rgba(0, 0, 0, 0.5)
+                                width: multiViewLabel.implicitWidth + 10
+                                height: multiViewLabel.implicitHeight + 4
                                 z: 5
+
+                                Text {
+                                    id: multiViewLabel
+                                    anchors.centerIn: parent
+                                    text: {
+                                        var src = multiViewDelegate.sourceForView
+                                        if (src < 0) return "VIEW " + (multiViewDelegate.streamIndex + 1)
+                                        return appWindow.uiManagerRef.sourceDisplayLabel(src)
+                                    }
+                                    color: "white"
+                                    font.family: "monospace"
+                                    font.pixelSize: 12
+                                }
                             }
 
                             MouseArea {

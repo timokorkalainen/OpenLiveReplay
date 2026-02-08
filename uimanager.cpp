@@ -916,6 +916,40 @@ void UIManager::updateStreamId(int index, const QString& id) {
     }
 }
 
+QString UIManager::sourceDisplayLabel(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= m_currentSettings.sources.size())
+        return QString();
+
+    const SourceSettings &src = m_currentSettings.sources[sourceIndex];
+
+    // Build "ID Name" header
+    QString label = src.id;
+    if (!src.name.trimmed().isEmpty()) {
+        label += " " + src.name.trimmed();
+    }
+
+    // Build a lookup of stored values for this source
+    QHash<QString, QString> valueMap;
+    for (const QJsonValue &val : src.metadata) {
+        const QJsonObject obj = val.toObject();
+        valueMap.insert(obj.value("name").toString(), obj.value("value").toString());
+    }
+
+    // Append metadata fields with display=true
+    for (const QJsonValue &val : m_currentSettings.metadataFields) {
+        const QJsonObject fieldDef = val.toObject();
+        const bool display = fieldDef.contains("display") ? fieldDef.value("display").toBool() : true;
+        if (!display) continue;
+        const QString fieldName = fieldDef.value("name").toString();
+        const QString fieldValue = valueMap.value(fieldName);
+        if (!fieldValue.trimmed().isEmpty()) {
+            label += "    " + fieldName + ": " + fieldValue;
+        }
+    }
+
+    return label;
+}
+
 QVariantList UIManager::metadataFieldDefinitions() const {
     QVariantList items;
     const QJsonArray &arr = m_currentSettings.metadataFields;

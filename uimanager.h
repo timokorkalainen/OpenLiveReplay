@@ -108,6 +108,7 @@ public:
     Q_INVOKABLE void updateUrl(int index, const QString &url);
     Q_INVOKABLE void updateStreamName(int index, const QString &name);
     Q_INVOKABLE void updateStreamId(int index, const QString &id);
+    Q_INVOKABLE QString sourceDisplayLabel(int sourceIndex) const;
     Q_INVOKABLE QVariantList metadataFieldDefinitions() const;
     Q_INVOKABLE void setMetadataFieldDefinitions(const QVariantList &fields);
     Q_INVOKABLE QVariantList sourceMetadataItems(int index) const;

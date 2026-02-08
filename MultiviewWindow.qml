@@ -72,22 +72,27 @@ Window {
                     }
                 }
 
-                Text {
-                    text: {
-                        var src = streamTile.sourceForView
-                        if (src < 0) return "VIEW " + (streamTile.streamIndex + 1)
-                        return (src < multiviewWindow.uiManager.streamNames.length
-                                && multiviewWindow.uiManager.streamNames[src].length > 0)
-                            ? multiviewWindow.uiManager.streamNames[src]
-                            : ("CAM " + (src + 1))
-                    }
-                    color: "white"
+                Rectangle {
                     anchors.bottom: parent.bottom
                     anchors.left: parent.left
                     anchors.margins: 5
-                    font.family: "Menlo"
-                    font.pixelSize: 12
+                    color: Qt.rgba(0, 0, 0, 0.5)
+                    width: mvwLabel.implicitWidth + 10
+                    height: mvwLabel.implicitHeight + 4
                     z: 5
+
+                    Text {
+                        id: mvwLabel
+                        anchors.centerIn: parent
+                        text: {
+                            var src = streamTile.sourceForView
+                            if (src < 0) return "VIEW " + (streamTile.streamIndex + 1)
+                            return multiviewWindow.uiManager.sourceDisplayLabel(src)
+                        }
+                        color: "white"
+                        font.family: "monospace"
+                        font.pixelSize: 12
+                    }
                 }
             }
         }
