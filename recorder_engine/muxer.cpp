@@ -31,9 +31,9 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->codecpar->format = AV_PIX_FMT_YUV420P;
         st->codecpar->bit_rate = 30000000;
 
-        // 2. CRITICAL: Set the stream timebase to match the ENCODER first
-        // This tells FFmpeg: "The data coming in is at 30fps"
-        st->time_base = {1, fps};
+        // 2. Use millisecond timebase for Matroska
+        // This keeps timeline duration consistent across players.
+        st->time_base = {1, 1000};
 
         // 3. Set the metadata hints
         st->avg_frame_rate = {fps, 1};
@@ -54,7 +54,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->id = videoTrackCount + i;
         st->codecpar->codec_id    = AV_CODEC_ID_TEXT;
         st->codecpar->codec_type  = AVMEDIA_TYPE_SUBTITLE;
-        st->time_base = {1, fps};
+        st->time_base = {1, 1000};
 
         const QString subTitle = QString("Track %1 Metadata").arg(i + 1);
         av_dict_set(&st->metadata, "title", subTitle.toUtf8().constData(), 0);
@@ -121,11 +121,14 @@ void Muxer::writePacket(AVPacket* pkt) {
     avio_flush(m_outCtx->pb);
 }
 
-void Muxer::writeMetadataPacket(int viewTrack, int64_t pts, const QByteArray& jsonData) {
+void Muxer::writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData) {
     if (!m_initialized || !m_outCtx || jsonData.isEmpty()) return;
 
     const int subTrackIndex = m_subtitleTrackOffset + viewTrack;
     if (subTrackIndex < 0 || subTrackIndex >= (int)m_outCtx->nb_streams) return;
+
+    AVStream* st = m_outCtx->streams[subTrackIndex];
+    if (!st) return;
 
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) return;
@@ -137,9 +140,9 @@ void Muxer::writeMetadataPacket(int viewTrack, int64_t pts, const QByteArray& js
     memcpy(pkt->data, jsonData.constData(), jsonData.size());
 
     pkt->stream_index = subTrackIndex;
-    pkt->pts      = pts;
-    pkt->dts      = pts;
-    pkt->duration = 1;
+    pkt->pts      = av_rescale_q(ptsMs, {1, 1000}, st->time_base);
+    pkt->dts      = pkt->pts;
+    pkt->duration = av_rescale_q(1, {1, 1000}, st->time_base);
 
     writePacket(pkt);
     av_packet_free(&pkt);

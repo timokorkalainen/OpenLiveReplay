@@ -201,10 +201,10 @@ void ReplayManager::onTimerTick() {
     emit masterPulse(m_globalFrameCount, elapsedMs);
 
     // 2. Write blue frames for any unmapped view-tracks
-    writeBlueFrames();
+    writeBlueFrames(elapsedMs);
 }
 
-void ReplayManager::writeBlueFrames() {
+void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
     if (!m_blueEncCtx || !m_blueFrame || !m_muxer) return;
 
     // Encode one blue frame per tick (all unmapped views share the same packet data)
@@ -235,7 +235,7 @@ void ReplayManager::writeBlueFrames() {
 
         // Write an empty metadata subtitle for unmapped views
         static const QByteArray emptyMeta("{}");
-        m_muxer->writeMetadataPacket(v, m_globalFrameCount, emptyMeta);
+        m_muxer->writeMetadataPacket(v, elapsedMs, emptyMeta);
     }
 
     av_packet_free(&basePkt);

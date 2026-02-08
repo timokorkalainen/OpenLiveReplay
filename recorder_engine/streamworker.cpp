@@ -147,7 +147,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         QByteArray metaJson;
         { QMutexLocker locker(&m_metadataMutex); metaJson = m_sourceMetadataJson; }
         if (!metaJson.isEmpty()) {
-            m_muxer->writeMetadataPacket(track, m_internalFrameCount, metaJson);
+            m_muxer->writeMetadataPacket(track, streamTimeMs, metaJson);
         }
     }
     av_packet_free(&outPkt);

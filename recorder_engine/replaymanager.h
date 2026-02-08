@@ -67,7 +67,7 @@ private slots:
 
 private:
     QString getFullOutputPath();
-    void writeBlueFrames();
+    void writeBlueFrames(int64_t elapsedMs);
 
     bool m_isRecording = false;
     int64_t m_globalFrameCount = 0;

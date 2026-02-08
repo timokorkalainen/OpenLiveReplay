@@ -21,7 +21,7 @@ public:
 
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames);
     void writePacket(AVPacket* pkt);
-    void writeMetadataPacket(int viewTrack, int64_t pts, const QByteArray& jsonData);
+    void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     AVStream* getStream(int index);
     void close();
 
