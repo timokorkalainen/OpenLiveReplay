@@ -41,6 +41,12 @@ public:
     void setViewTrack(int track) { m_viewTrack.store(track, std::memory_order_relaxed); }
     int viewTrack() const { return m_viewTrack.load(std::memory_order_relaxed); }
 
+    // Per-source metadata JSON blob written to the subtitle track each frame
+    void setSourceMetadata(const QByteArray& json) {
+        QMutexLocker locker(&m_metadataMutex);
+        m_sourceMetadataJson = json;
+    }
+
     void stop();
 
     int sourceIndex() const { return m_sourceIndex; }
@@ -67,6 +73,8 @@ private:
     //Mutexes & Threads
     QMutex m_frameMutex;
     QMutex m_urlMutex;
+    QMutex m_metadataMutex;
+    QByteArray m_sourceMetadataJson;    // JSON blob for per-frame subtitle track
     QFuture<void> m_captureFuture;
 
     void captureLoop();

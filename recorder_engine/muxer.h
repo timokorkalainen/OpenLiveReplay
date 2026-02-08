@@ -21,8 +21,11 @@ public:
 
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames);
     void writePacket(AVPacket* pkt);
+    void writeMetadataPacket(int viewTrack, int64_t pts, const QByteArray& jsonData);
     AVStream* getStream(int index);
     void close();
+
+    int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
 
     QString getVideoPath(QString fileName);
 private:
@@ -31,6 +34,7 @@ private:
     QMap<int, int64_t>* m_lastDts;
     QMutex m_mutex;
     bool m_initialized = false;
+    int m_subtitleTrackOffset = 0;  // Index of first subtitle track
 };
 
 #endif // MUXER_H

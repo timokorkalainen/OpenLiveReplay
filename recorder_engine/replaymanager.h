@@ -23,6 +23,7 @@ public:
     // Source configuration (N sources)
     void setSourceUrls(const QStringList &urls) { m_sourceUrls = urls; }
     void setSourceNames(const QStringList &names) { m_sourceNames = names; }
+    void setSourceMetadata(const QList<QByteArray> &metadata) { m_sourceMetadata = metadata; }
     QStringList getSourceUrls() const { return m_sourceUrls; }
     QStringList getSourceNames() const { return m_sourceNames; }
 
@@ -74,6 +75,7 @@ private:
     // Source config
     QStringList m_sourceUrls;
     QStringList m_sourceNames;
+    QList<QByteArray> m_sourceMetadata;  // One JSON blob per source
 
     // View config
     int m_viewCount = 4;

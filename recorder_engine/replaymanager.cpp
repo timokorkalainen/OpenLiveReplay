@@ -97,6 +97,11 @@ void ReplayManager::startRecording() {
             m_sourceUrls[s], s, m_muxer, m_clock,
             m_videoWidth, m_videoHeight, m_fps);
 
+        // Set per-source metadata JSON for the subtitle track
+        if (s < m_sourceMetadata.size()) {
+            worker->setSourceMetadata(m_sourceMetadata[s]);
+        }
+
         connect(this, &ReplayManager::masterPulse,
                 worker, &StreamWorker::onMasterPulse,
                 Qt::QueuedConnection);
@@ -227,6 +232,10 @@ void ReplayManager::writeBlueFrames() {
         }
         m_muxer->writePacket(pkt);
         av_packet_free(&pkt);
+
+        // Write an empty metadata subtitle for unmapped views
+        static const QByteArray emptyMeta("{}");
+        m_muxer->writeMetadataPacket(v, m_globalFrameCount, emptyMeta);
     }
 
     av_packet_free(&basePkt);

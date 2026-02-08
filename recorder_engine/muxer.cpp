@@ -42,12 +42,22 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         // For MPEG-2, you can also set the 'closed gop' and 'fixed fps' flags in codecpar
         st->codecpar->video_delay = 0;
 
-        if (i < streamNames.size()) {
-            const QString name = streamNames[i].trimmed();
-            if (!name.isEmpty()) {
-                av_dict_set(&st->metadata, "title", name.toUtf8().constData(), 0);
-            }
-        }
+        // Always name video tracks generically: "Track 1", "Track 2", ...
+        const QString trackTitle = QString("Track %1").arg(i + 1);
+        av_dict_set(&st->metadata, "title", trackTitle.toUtf8().constData(), 0);
+    }
+
+    // 2b. Add one subtitle track per video track for per-frame source metadata
+    m_subtitleTrackOffset = videoTrackCount;
+    for (int i = 0; i < videoTrackCount; i++) {
+        AVStream* st = avformat_new_stream(m_outCtx, nullptr);
+        st->id = videoTrackCount + i;
+        st->codecpar->codec_id    = AV_CODEC_ID_TEXT;
+        st->codecpar->codec_type  = AVMEDIA_TYPE_SUBTITLE;
+        st->time_base = {1, fps};
+
+        const QString subTitle = QString("Track %1 Metadata").arg(i + 1);
+        av_dict_set(&st->metadata, "title", subTitle.toUtf8().constData(), 0);
     }
 
     // 3. Set Matroska specific options for Chase Play
@@ -109,6 +119,30 @@ void Muxer::writePacket(AVPacket* pkt) {
     }
 
     avio_flush(m_outCtx->pb);
+}
+
+void Muxer::writeMetadataPacket(int viewTrack, int64_t pts, const QByteArray& jsonData) {
+    if (!m_initialized || !m_outCtx || jsonData.isEmpty()) return;
+
+    const int subTrackIndex = m_subtitleTrackOffset + viewTrack;
+    if (subTrackIndex < 0 || subTrackIndex >= (int)m_outCtx->nb_streams) return;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return;
+
+    if (av_new_packet(pkt, jsonData.size()) < 0) {
+        av_packet_free(&pkt);
+        return;
+    }
+    memcpy(pkt->data, jsonData.constData(), jsonData.size());
+
+    pkt->stream_index = subTrackIndex;
+    pkt->pts      = pts;
+    pkt->dts      = pts;
+    pkt->duration = 1;
+
+    writePacket(pkt);
+    av_packet_free(&pkt);
 }
 
 AVStream* Muxer::getStream(int index) {

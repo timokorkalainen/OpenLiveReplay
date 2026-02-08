@@ -142,6 +142,13 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     if (havePacket) {
         m_muxer->writePacket(outPkt);
+
+        // Write the per-frame source metadata to the paired subtitle track
+        QByteArray metaJson;
+        { QMutexLocker locker(&m_metadataMutex); metaJson = m_sourceMetadataJson; }
+        if (!metaJson.isEmpty()) {
+            m_muxer->writeMetadataPacket(track, m_internalFrameCount, metaJson);
+        }
     }
     av_packet_free(&outPkt);
 }

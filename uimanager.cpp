@@ -1,5 +1,7 @@
 #include "uimanager.h"
 #include <QDateTime>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <algorithm>
 #include <QDir>
 #include <QGuiApplication>
@@ -404,16 +406,26 @@ void UIManager::syncActiveStreams() {
 
     QStringList urls;
     QStringList names;
+    QList<QByteArray> metadata;
     urls.reserve(m_currentSettings.sources.size());
     names.reserve(m_currentSettings.sources.size());
+    metadata.reserve(m_currentSettings.sources.size());
     for (const auto &source : m_currentSettings.sources) {
         urls.append(source.url);
         names.append(source.name);
+
+        // Build a compact JSON blob for per-frame subtitle metadata
+        QJsonObject obj;
+        obj.insert("id", source.id);
+        obj.insert("name", source.name);
+        obj.insert("metadata", source.metadata); // QJsonArray
+        metadata.append(QJsonDocument(obj).toJson(QJsonDocument::Compact));
     }
 
     // Source configuration: ALL source URLs go to the engine (one worker per source)
     m_replayManager->setSourceUrls(urls);
     m_replayManager->setSourceNames(names);
+    m_replayManager->setSourceMetadata(metadata);
 
     // View configuration: how many recording tracks, and their display names
     m_replayManager->setViewCount(activeViewCount());
@@ -489,14 +501,22 @@ void UIManager::toggleSourceEnabled(int sourceIndex) {
         // Not recording: update pre-configured URLs/names and providers
         QStringList urls;
         QStringList names;
+        QList<QByteArray> metadata;
         urls.reserve(m_currentSettings.sources.size());
         names.reserve(m_currentSettings.sources.size());
+        metadata.reserve(m_currentSettings.sources.size());
         for (const auto &source : m_currentSettings.sources) {
             urls.append(source.url);
             names.append(source.name);
+            QJsonObject obj;
+            obj.insert("id", source.id);
+            obj.insert("name", source.name);
+            obj.insert("metadata", source.metadata);
+            metadata.append(QJsonDocument(obj).toJson(QJsonDocument::Compact));
         }
         m_replayManager->setSourceUrls(urls);
         m_replayManager->setSourceNames(names);
+        m_replayManager->setSourceMetadata(metadata);
         m_replayManager->setViewCount(activeViewCount());
         m_replayManager->setViewNames(activeStreamNames());
         m_replayManager->updateViewMapping(m_viewSlotMap);
