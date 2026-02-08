@@ -160,6 +160,8 @@ ApplicationWindow {
             ScrollView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                contentWidth: availableWidth
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
                 ColumnLayout {
                     width: parent.width
@@ -252,124 +254,167 @@ ApplicationWindow {
                         Item { Layout.fillWidth: true }
                     }
 
-                    GroupBox {
-                        title: "MIDI"
+                    Frame {
+                        id: midiCard
                         Layout.fillWidth: true
+                        property bool expanded: false
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 12
-
-                            ComboBox {
-                                Layout.fillWidth: true
-                                model: appWindow.uiManagerRef.midiPorts
-                                currentIndex: appWindow.uiManagerRef.midiPortIndex
-                                onActivated: appWindow.uiManagerRef.setMidiPortIndex(currentIndex)
-                            }
-
-                            Button {
-                                text: "Refresh"
-                                onClicked: appWindow.uiManagerRef.refreshMidiPorts()
-                            }
-
-                            Text {
-                                text: appWindow.uiManagerRef.midiConnected ? "Connected" : "Disconnected"
-                                color: appWindow.uiManagerRef.midiConnected ? "#4CAF50" : "#777"
-                                verticalAlignment: Text.AlignVCenter
-                            }
+                        background: Rectangle {
+                            color: "#1b1b1b"
+                            radius: 6
+                            border.color: "#333"
+                            border.width: 1
                         }
-                    }
 
-                    GroupBox {
-                        title: "MIDI Mapping"
-                        Layout.fillWidth: true
-
-                        ColumnLayout {
+                        contentItem: ColumnLayout {
                             Layout.fillWidth: true
                             spacing: 8
 
-                            Repeater {
-                                model: [
-                                    { name: "Play/Pause", action: 0 },
-                                    { name: "Rewind 5.0x", action: 1 },
-                                    { name: "Forward 5.0x", action: 2 },
-                                    { name: "Prev Frame", action: 7 },
-                                    { name: "Next Frame", action: 3 },
-                                    { name: "Jogwheel", action: 8 },
-                                    { name: "Go Live", action: 4 },
-                                    { name: "Capture", action: 5 },
-                                    { name: "Multiview", action: 6 },
-                                    { name: "Feed 1", action: 100 },
-                                    { name: "Feed 2", action: 101 },
-                                    { name: "Feed 3", action: 102 },
-                                    { name: "Feed 4", action: 103 },
-                                    { name: "Feed 5", action: 104 },
-                                    { name: "Feed 6", action: 105 },
-                                    { name: "Feed 7", action: 106 },
-                                    { name: "Feed 8", action: 107 }
-                                ]
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
 
-                                delegate: RowLayout {
-                                    id: midiRow
-                                    required property var modelData
+                                Text {
+                                    text: "MIDI Controller"
+                                    color: "#eeeeee"
+                                    font.bold: true
+                                    Layout.alignment: Qt.AlignVCenter
+                                }
+
+                                Item { Layout.fillWidth: true }
+
+                                ToolButton {
+                                    text: midiCard.expanded ? "▾" : "▸"
+                                    onClicked: midiCard.expanded = !midiCard.expanded
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 12
+                                visible: midiCard.expanded
+
+                                GroupBox {
+                                    title: "MIDI"
                                     Layout.fillWidth: true
-                                    spacing: 8
 
-                                    Text {
-                                        text: midiRow.modelData.name
-                                        Layout.preferredWidth: 130
-                                        color: "#eeeeee"
-                                    }
-
-                                    Text {
-                                             text: (appWindow.uiManagerRef.midiBindingsVersion >= 0
-                                                  ? appWindow.uiManagerRef.midiBindingLabel(midiRow.modelData.action)
-                                                  : appWindow.uiManagerRef.midiBindingLabel(midiRow.modelData.action))
-                                        color: appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action ? "#ff9800" : "#aaa"
+                                    RowLayout {
                                         Layout.fillWidth: true
-                                    }
+                                        spacing: 12
 
-                                    Text {
-                                        text: (appWindow.uiManagerRef.midiLastValuesVersion >= 0
-                                              ? "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action)
-                                              : "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action))
-                                        color: "#666666"
-                                        Layout.preferredWidth: 80
-                                    }
+                                        ComboBox {
+                                            Layout.fillWidth: true
+                                            model: appWindow.uiManagerRef.midiPorts
+                                            currentIndex: appWindow.uiManagerRef.midiPortIndex
+                                            onActivated: appWindow.uiManagerRef.setMidiPortIndex(currentIndex)
+                                        }
 
-                                    Button {
-                                        visible: midiRow.modelData.action !== 8
-                                        text: appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action ? "Listening..." : "Learn"
-                                        onClicked: appWindow.uiManagerRef.beginMidiLearn(midiRow.modelData.action)
-                                    }
+                                        Button {
+                                            text: "Refresh"
+                                            onClicked: appWindow.uiManagerRef.refreshMidiPorts()
+                                        }
 
-                                    Button {
-                                        visible: midiRow.modelData.action === 8
-                                        text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 0)
-                                              ? "Listening..."
-                                              : "Learn Ctrl"
-                                        onClicked: appWindow.uiManagerRef.beginMidiLearn(midiRow.modelData.action)
+                                        Text {
+                                            text: appWindow.uiManagerRef.midiConnected ? "Connected" : "Disconnected"
+                                            color: appWindow.uiManagerRef.midiConnected ? "#4CAF50" : "#777"
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
                                     }
+                                }
 
-                                    Button {
-                                        visible: midiRow.modelData.action === 8
-                                        text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 1)
-                                              ? "Listening..."
-                                              : "Learn Fwd"
-                                        onClicked: appWindow.uiManagerRef.beginMidiLearnJogForward(midiRow.modelData.action)
-                                    }
+                                GroupBox {
+                                    title: "MIDI Mapping"
+                                    Layout.fillWidth: true
 
-                                    Button {
-                                        visible: midiRow.modelData.action === 8
-                                        text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 2)
-                                              ? "Listening..."
-                                              : "Learn Back"
-                                        onClicked: appWindow.uiManagerRef.beginMidiLearnJogBackward(midiRow.modelData.action)
-                                    }
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
 
-                                    Button {
-                                        text: "Clear"
-                                        onClicked: appWindow.uiManagerRef.clearMidiBinding(midiRow.modelData.action)
+                                        Repeater {
+                                            model: [
+                                                { name: "Play/Pause", action: 0 },
+                                                { name: "Rewind 5.0x", action: 1 },
+                                                { name: "Forward 5.0x", action: 2 },
+                                                { name: "Prev Frame", action: 7 },
+                                                { name: "Next Frame", action: 3 },
+                                                { name: "Jogwheel", action: 8 },
+                                                { name: "Go Live", action: 4 },
+                                                { name: "Capture", action: 5 },
+                                                { name: "Multiview", action: 6 },
+                                                { name: "Feed 1", action: 100 },
+                                                { name: "Feed 2", action: 101 },
+                                                { name: "Feed 3", action: 102 },
+                                                { name: "Feed 4", action: 103 },
+                                                { name: "Feed 5", action: 104 },
+                                                { name: "Feed 6", action: 105 },
+                                                { name: "Feed 7", action: 106 },
+                                                { name: "Feed 8", action: 107 }
+                                            ]
+
+                                            delegate: RowLayout {
+                                                id: midiRow
+                                                required property var modelData
+                                                Layout.fillWidth: true
+                                                spacing: 8
+
+                                                Text {
+                                                    text: midiRow.modelData.name
+                                                    Layout.preferredWidth: 130
+                                                    color: "#eeeeee"
+                                                }
+
+                                                Text {
+                                                     text: (appWindow.uiManagerRef.midiBindingsVersion >= 0
+                                                          ? appWindow.uiManagerRef.midiBindingLabel(midiRow.modelData.action)
+                                                          : appWindow.uiManagerRef.midiBindingLabel(midiRow.modelData.action))
+                                                    color: appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action ? "#ff9800" : "#aaa"
+                                                    Layout.fillWidth: true
+                                                }
+
+                                                Text {
+                                                    text: (appWindow.uiManagerRef.midiLastValuesVersion >= 0
+                                                          ? "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action)
+                                                          : "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action))
+                                                    color: "#666666"
+                                                    Layout.preferredWidth: 80
+                                                }
+
+                                                Button {
+                                                    visible: midiRow.modelData.action !== 8
+                                                    text: appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action ? "Listening..." : "Learn"
+                                                    onClicked: appWindow.uiManagerRef.beginMidiLearn(midiRow.modelData.action)
+                                                }
+
+                                                Button {
+                                                    visible: midiRow.modelData.action === 8
+                                                    text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 0)
+                                                          ? "Listening..."
+                                                          : "Learn Ctrl"
+                                                    onClicked: appWindow.uiManagerRef.beginMidiLearn(midiRow.modelData.action)
+                                                }
+
+                                                Button {
+                                                    visible: midiRow.modelData.action === 8
+                                                    text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 1)
+                                                          ? "Listening..."
+                                                          : "Learn Fwd"
+                                                    onClicked: appWindow.uiManagerRef.beginMidiLearnJogForward(midiRow.modelData.action)
+                                                }
+
+                                                Button {
+                                                    visible: midiRow.modelData.action === 8
+                                                    text: (appWindow.uiManagerRef.midiLearnAction === midiRow.modelData.action && appWindow.uiManagerRef.midiLearnMode === 2)
+                                                          ? "Listening..."
+                                                          : "Learn Back"
+                                                    onClicked: appWindow.uiManagerRef.beginMidiLearnJogBackward(midiRow.modelData.action)
+                                                }
+
+                                                Button {
+                                                    text: "Clear"
+                                                    onClicked: appWindow.uiManagerRef.clearMidiBinding(midiRow.modelData.action)
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
