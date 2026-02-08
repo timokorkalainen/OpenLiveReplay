@@ -7,11 +7,19 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QFile>
+#include <QList>
+#include <QMap>
 
 // Simple data structure to hold our application state
+struct SourceSettings {
+    QString id;
+    QString name;
+    QString url;
+    QJsonObject metadata;
+};
+
 struct AppSettings {
-    QStringList streamUrls;
-    QStringList streamNames;
+    QList<SourceSettings> sources;
     QString saveLocation;
     QString fileName;
     int videoWidth = 1920;
@@ -33,7 +41,6 @@ public:
     bool save(const QString &path, const AppSettings &settings);
 
     // Loads settings from a JSON file into the provided struct reference
-    void extracted(AppSettings &settings, QJsonArray &urlArray);
     bool load(const QString &path, AppSettings &settings);
 };
 

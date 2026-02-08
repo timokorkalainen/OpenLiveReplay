@@ -924,6 +924,13 @@ ApplicationWindow {
                         }
 
                         TextField {
+                            Layout.preferredWidth: 160
+                            text: appWindow.uiManagerRef.streamIds.length > streamRow.index ? appWindow.uiManagerRef.streamIds[streamRow.index] : ""
+                            placeholderText: "ID"
+                            onEditingFinished: appWindow.uiManagerRef.updateStreamId(streamRow.index, text)
+                        }
+
+                        TextField {
                             Layout.preferredWidth: 140
                             text: appWindow.uiManagerRef.streamNames.length > streamRow.index ? appWindow.uiManagerRef.streamNames[streamRow.index] : ""
                             placeholderText: "Name"

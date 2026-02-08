@@ -35,18 +35,16 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     }
     root["midiBindings"] = midiArray;
 
-    // Convert QStringList to QJsonArray
-    QJsonArray urlArray;
-    for (const QString &url : settings.streamUrls) {
-        urlArray.append(url);
+    QJsonArray sourcesArray;
+    for (const auto &source : settings.sources) {
+        QJsonObject obj;
+        obj["id"] = source.id;
+        obj["name"] = source.name;
+        obj["url"] = source.url;
+        obj["metadata"] = source.metadata;
+        sourcesArray.append(obj);
     }
-    root["streams"] = urlArray;
-
-    QJsonArray nameArray;
-    for (const QString &name : settings.streamNames) {
-        nameArray.append(name);
-    }
-    root["streamNames"] = nameArray;
+    root["sources"] = sourcesArray;
 
     QJsonDocument doc(root);
     QFile file(path);
@@ -61,11 +59,6 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     return true;
 }
 
-void SettingsManager::extracted(AppSettings &settings, QJsonArray &urlArray) {
-    for (const QJsonValue &val : urlArray) {
-        settings.streamUrls.append(val.toString());
-    }
-}
 bool SettingsManager::load(const QString &path, AppSettings &settings) {
     QFile file(path);
 
@@ -132,15 +125,17 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
         }
     }
 
-    // Parse the stream list
-    settings.streamUrls.clear();
-    QJsonArray urlArray = root["streams"].toArray();
-    extracted(settings, urlArray);
-
-    settings.streamNames.clear();
-    QJsonArray nameArray = root["streamNames"].toArray();
-    for (const QJsonValue &val : nameArray) {
-        settings.streamNames.append(val.toString());
+    // Parse the sources list
+    settings.sources.clear();
+    QJsonArray sourcesArray = root["sources"].toArray();
+    for (const QJsonValue &val : sourcesArray) {
+        QJsonObject obj = val.toObject();
+        SourceSettings source;
+        source.id = obj["id"].toString();
+        source.name = obj["name"].toString();
+        source.url = obj["url"].toString();
+        source.metadata = obj["metadata"].toObject();
+        settings.sources.append(source);
     }
 
     return true;
