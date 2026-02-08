@@ -160,9 +160,72 @@ void PlaybackWorker::run() {
                 if(track->codecCtx) avcodec_flush_buffers(track->codecCtx);
             }
 
+            // Clear stale frames from the buffer to prevent visual artifacts
+            {
+                QMutexLocker bufferLocker(&m_bufferMutex);
+                for (auto* track : m_decoderBank) {
+                    track->buffer.clear();
+                }
+            }
+
             lastProcessedPtsMs = target;
             m_seekTargetMs = -1;
             m_mutex.unlock();
+
+            // Burst-decode to pre-fill the buffer so backward stepping works immediately after seek
+            {
+                int burstCount = 0;
+                int packetCount = 0;
+                const int bufMax = m_frameBufferMax;
+                const int packetMax = bufMax * 4; // Safety limit for non-video packets
+                while (m_running && burstCount < bufMax && packetCount < packetMax) {
+                    // Abort burst if a new seek was requested
+                    {
+                        QMutexLocker locker(&m_mutex);
+                        if (m_seekTargetMs >= 0) break;
+                    }
+
+                    int ret = av_read_frame(m_fmtCtx, pkt);
+                    if (ret < 0) break;
+                    packetCount++;
+
+                    for (auto* track : m_decoderBank) {
+                        if (pkt->stream_index == track->streamIndex) {
+                            if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
+                                while (avcodec_receive_frame(track->codecCtx, frame) == 0) {
+                                    int64_t framePts = frame->pts;
+                                    if (framePts == AV_NOPTS_VALUE) framePts = frame->best_effort_timestamp;
+                                    AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
+                                    int64_t framePtsMs = lastProcessedPtsMs;
+                                    if (framePts != AV_NOPTS_VALUE) {
+                                        framePtsMs = av_rescale_q(framePts, tb, {1, 1000});
+                                        lastProcessedPtsMs = framePtsMs;
+                                    } else if (lastProcessedPtsMs >= 0) {
+                                        framePtsMs = lastProcessedPtsMs + 33;
+                                        lastProcessedPtsMs = framePtsMs;
+                                    }
+
+                                    QVideoFrame qFrame = convertToQVideoFrame(frame);
+                                    {
+                                        QMutexLocker bufferLocker(&m_bufferMutex);
+                                        track->buffer.append({framePtsMs, qFrame});
+                                        if (track->buffer.size() > m_frameBufferMax) {
+                                            track->buffer.remove(0, track->buffer.size() - m_frameBufferMax);
+                                        }
+                                    }
+                                    burstCount++;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    av_packet_unref(pkt);
+                }
+
+                // Deliver the best buffered frame for the seek target
+                deliverBufferedFrameAtOrBefore(target);
+            }
+
             continue;
         }
 
