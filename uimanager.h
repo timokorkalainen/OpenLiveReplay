@@ -7,12 +7,15 @@
 #include <QHash>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QVariantList>
 #include "settingsmanager.h"
 #include "recorder_engine/replaymanager.h"
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
 #include "playback/playbacktransport.h"
 #include "midi/midimanager.h"
+
+class QScreen;
 
 class UIManager : public QObject {
     Q_OBJECT
@@ -40,6 +43,9 @@ class UIManager : public QObject {
     Q_PROPERTY(int midiBindingsVersion READ midiBindingsVersion NOTIFY midiBindingsChanged)
     Q_PROPERTY(int midiLastValuesVersion READ midiLastValuesVersion NOTIFY midiLastValuesChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
+    Q_PROPERTY(QVariantList screenOptions READ screenOptions NOTIFY screensChanged)
+    Q_PROPERTY(bool screensReady READ screensReady NOTIFY screensChanged)
+    Q_PROPERTY(int screenCount READ screenCount NOTIFY screensChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -68,6 +74,9 @@ public:
     int midiBindingsVersion() const;
     int midiLastValuesVersion() const;
     PlaybackTransport* transport() const { return m_transport; }
+    QVariantList screenOptions() const;
+    bool screensReady() const;
+    int screenCount() const;
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -113,6 +122,9 @@ public:
     Q_INVOKABLE void setPlaybackViewState(bool singleView, int selectedIndex);
     Q_INVOKABLE void cancelFollowLive();
 
+    Q_INVOKABLE void refreshScreens();
+    Q_INVOKABLE QScreen* screenAt(int index) const;
+
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
 
@@ -143,6 +155,7 @@ signals:
     void midiPortNameChanged();
     void feedSelectRequested(int index);
     void multiviewRequested();
+    void screensChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -194,6 +207,9 @@ private:
     QHash<int, int> m_midiLastValues;
     QHash<int, int> m_midiBindingData2Forward;
     QHash<int, int> m_midiBindingData2Backward;
+
+    QList<QScreen*> m_screens;
+    QVariantList m_screenOptions;
 
     enum MidiLearnMode {
         LearnControl = 0,

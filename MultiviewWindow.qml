@@ -26,7 +26,7 @@ Window {
 
     Rectangle {
         anchors.fill: parent
-        color: "#111"
+        color: "#111111"
 
         GridView {
             id: multiViewGrid

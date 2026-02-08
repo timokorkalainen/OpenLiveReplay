@@ -47,6 +47,51 @@ qt_add_qml_module(appOpenLiveReplay
         resources.qrc
 )
 
+# Generate qmllint.ini with stable import paths and QML dirs for all installed kits.
+set(QMLLINT_IMPORT_PATHS "build/qmllint-imports")
+if (Qt6_DIR)
+    # Add the active kit's QML dir.
+    get_filename_component(_qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
+    set(_qt_qml_dir "${_qt_prefix}/qml")
+    if (EXISTS "${_qt_qml_dir}")
+        list(APPEND QMLLINT_IMPORT_PATHS "${_qt_qml_dir}")
+    endif()
+    # Also add sibling kits (e.g. macos, ios) so the .ini works for both targets.
+    get_filename_component(_qt_version_dir "${_qt_prefix}/.." ABSOLUTE)
+    file(GLOB _qt_kit_dirs "${_qt_version_dir}/*")
+    foreach(_kit_dir ${_qt_kit_dirs})
+        set(_kit_qml_dir "${_kit_dir}/qml")
+        if (EXISTS "${_kit_qml_dir}" AND NOT "${_kit_qml_dir}" STREQUAL "${_qt_qml_dir}")
+            list(APPEND QMLLINT_IMPORT_PATHS "${_kit_qml_dir}")
+        endif()
+    endforeach()
+endif()
+string(JOIN ";" QMLLINT_IMPORT_PATHS ${QMLLINT_IMPORT_PATHS})
+configure_file(
+    "${CMAKE_SOURCE_DIR}/qmllint.ini.in"
+    "${CMAKE_SOURCE_DIR}/qmllint.ini"
+    @ONLY
+)
+
+# Keep a stable QML import path for qmllint (symlink to the active build).
+# This avoids hard-coding kit-specific build directories in qmllint.ini.
+set(QMLLINT_IMPORT_LINK "${CMAKE_SOURCE_DIR}/build/qmllint-imports")
+add_custom_target(qmllint_imports ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/build"
+    COMMAND ${CMAKE_COMMAND} -E remove -f "${QMLLINT_IMPORT_LINK}"
+    COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_BINARY_DIR}/OpenLiveReplay" "${QMLLINT_IMPORT_LINK}"
+    COMMENT "Updating qmllint import path symlink"
+)
+
+# Ensure qmllint can find the generated qmltypes file in the module output directory.
+add_custom_command(TARGET appOpenLiveReplay POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/OpenLiveReplay"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_BINARY_DIR}/.qt/qmltypes/appOpenLiveReplay.qmltypes"
+        "${CMAKE_BINARY_DIR}/OpenLiveReplay/appOpenLiveReplay.qmltypes"
+    COMMENT "Copying appOpenLiveReplay.qmltypes for qmllint"
+)
+
 add_library(OpenLiveReplayMidi STATIC
     midi/midimanager.h
     midi/midimanager.cpp

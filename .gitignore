@@ -3,6 +3,7 @@ build/
 ios_build/
 ios_build*
 *.qmlls.ini
+qmllint.ini
 launch.json
 *.cache/
 

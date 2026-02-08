@@ -2,6 +2,7 @@
 #include <QDateTime>
 #include <algorithm>
 #include <QDir>
+#include <QGuiApplication>
 #if defined(Q_OS_IOS)
 #include "ios/ios_scene.h"
 #endif
@@ -10,6 +11,8 @@
 #include <QStandardPaths>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QScreen>
+#include <QVariantMap>
 #include <cstdio>
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
@@ -229,6 +232,15 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             if (idx >= 0) m_midiManager->openPort(idx);
         }
     });
+    if (auto *app = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
+        connect(app, &QGuiApplication::screenAdded, this, [this](QScreen*) {
+            refreshScreens();
+        });
+        connect(app, &QGuiApplication::screenRemoved, this, [this](QScreen*) {
+            refreshScreens();
+        });
+    }
+    refreshScreens();
     refreshProviders();
 }
 
@@ -725,6 +737,55 @@ QVariantList UIManager::playbackProviders() const {
         list.append(QVariant::fromValue(p));
     }
     return list;
+}
+
+QVariantList UIManager::screenOptions() const {
+    return m_screenOptions;
+}
+
+bool UIManager::screensReady() const {
+    return !m_screenOptions.isEmpty();
+}
+
+int UIManager::screenCount() const {
+    return m_screens.size();
+}
+
+void UIManager::refreshScreens() {
+    QList<QScreen*> screens = QGuiApplication::screens();
+    if (screens.isEmpty()) {
+        if (auto *primary = QGuiApplication::primaryScreen()) {
+            screens.append(primary);
+        }
+    }
+
+    m_screens = screens;
+    m_screenOptions.clear();
+
+    for (int i = 0; i < screens.size(); ++i) {
+        QScreen* screen = screens.at(i);
+        QString name = screen ? screen->name().trimmed() : QString();
+        QSize size = screen ? screen->size() : QSize();
+
+        QString label = name.isEmpty()
+                            ? QString("Display %1").arg(i + 1)
+                            : name;
+        if (size.isValid()) {
+            label = QString("%1 — %2×%3").arg(label).arg(size.width()).arg(size.height());
+        }
+
+        QVariantMap entry;
+        entry.insert("index", i);
+        entry.insert("label", label);
+        m_screenOptions.append(entry);
+    }
+
+    emit screensChanged();
+}
+
+QScreen* UIManager::screenAt(int index) const {
+    if (index < 0 || index >= m_screens.size()) return nullptr;
+    return m_screens.at(index);
 }
 
 void UIManager::refreshProviders() {

@@ -6,7 +6,6 @@ import QtQuick.Layouts
 import Qt.labs.platform 1.1
 import QtQuick.Controls.Universal 2.15 // Necessary for attached properties
 import QtMultimedia
-import Recorder.Types 1.0
 
 ApplicationWindow {
     id: appWindow
@@ -17,9 +16,11 @@ ApplicationWindow {
 
     property var multiviewWindow: null
     property int multiviewScreenIndex: 0
-    property var screenOptions: []
-    property bool screensReady: false
+    property var screenOptions: appWindow.uiManagerRef ? appWindow.uiManagerRef.screenOptions : []
+    property bool screensReady: appWindow.uiManagerRef ? appWindow.uiManagerRef.screensReady : false
     property var uiManagerRef: uiManager
+    property alias playbackTab: playbackTab
+    property alias screenProbe: screenProbe
 
     Component.onCompleted: {
         appWindow.uiManagerRef.loadSettings()
@@ -57,7 +58,7 @@ ApplicationWindow {
     }
 
     function openMultiviewOnExternalDisplay() {
-        if (!Qt.application || Qt.application.screens.length === 0) {
+        if (!appWindow.uiManagerRef || appWindow.uiManagerRef.screenCount === 0) {
             console.warn("No screens detected")
             return
         }
@@ -67,8 +68,11 @@ ApplicationWindow {
             if (!appWindow.multiviewWindow) return
         }
 
-        var targetIndex = Math.min(Math.max(0, appWindow.multiviewScreenIndex), Qt.application.screens.length - 1)
-        appWindow.multiviewWindow.screen = Qt.application.screens[targetIndex]
+        var targetIndex = Math.min(Math.max(0, appWindow.multiviewScreenIndex), appWindow.uiManagerRef.screenCount - 1)
+        var targetScreen = appWindow.uiManagerRef.screenAt(targetIndex)
+        if (targetScreen) {
+            appWindow.multiviewWindow.screen = targetScreen
+        }
         appWindow.multiviewWindow.visibility = Window.FullScreen
         appWindow.multiviewWindow.visible = true
         appWindow.multiviewWindow.raise()
@@ -76,63 +80,23 @@ ApplicationWindow {
     }
 
     function updateMultiviewScreen() {
-        if (!appWindow.multiviewWindow || !Qt.application) return
+        if (!appWindow.multiviewWindow || !appWindow.uiManagerRef) return
 
-        if (Qt.application.screens.length > 0) {
-            if (appWindow.multiviewScreenIndex < 0 || appWindow.multiviewScreenIndex >= Qt.application.screens.length) {
+        if (appWindow.uiManagerRef.screenCount > 0) {
+            if (appWindow.multiviewScreenIndex < 0 || appWindow.multiviewScreenIndex >= appWindow.uiManagerRef.screenCount) {
                 appWindow.multiviewScreenIndex = 0
             }
-            appWindow.multiviewWindow.screen = Qt.application.screens[appWindow.multiviewScreenIndex]
+            var screenObj = appWindow.uiManagerRef.screenAt(appWindow.multiviewScreenIndex)
+            if (screenObj) {
+                appWindow.multiviewWindow.screen = screenObj
+            }
             appWindow.multiviewWindow.visibility = Window.FullScreen
         }
     }
 
     function refreshScreenOptions() {
-        if (!Qt.application) {
-            appWindow.screenOptions = []
-            appWindow.screensReady = false
-            return
-        }
-
-        var options = []
-        var screens = Qt.application.screens
-        if (!screens || screens.length === 0) {
-            screens = [appWindow.screen]
-        }
-        for (var i = 0; i < screens.length; ++i) {
-            var s = screens[i]
-            var name = s.name && s.name.length > 0 ? s.name : ("Display " + (i + 1))
-            var size = s.size ? (s.size.width + "×" + s.size.height) : ""
-            var label = size.length > 0 ? (name + " — " + size) : name
-            options.push({ index: i, label: label })
-        }
-        appWindow.screenOptions = options
-        appWindow.screensReady = options.length > 0
-    }
-
-    function showScreenMenu(anchor) {
-        // unused, kept for compat
-    }
-
-    Component {
-        id: screenActionComponent
-        Action {
-            property int screenIdx: -1
-        }
-    }
-
-    function buildScreenMenu() {
-        while (screenMenu.count > 0)
-            screenMenu.removeItem(screenMenu.itemAt(0))
-
-        for (var i = 0; i < appWindow.screenOptions.length; ++i) {
-            var action = screenActionComponent.createObject(screenMenu, {
-                text: appWindow.screenOptions[i].label,
-                screenIdx: appWindow.screenOptions[i].index
-            })
-            if (!action) continue
-            action.triggered.connect(appWindow.makeScreenHandler(action.screenIdx))
-            screenMenu.addAction(action)
+        if (appWindow.uiManagerRef) {
+            appWindow.uiManagerRef.refreshScreens()
         }
     }
 
@@ -144,9 +108,8 @@ ApplicationWindow {
     }
 
     Connections {
-        target: Qt.application
+        target: appWindow.uiManagerRef
         function onScreensChanged() {
-            appWindow.refreshScreenOptions()
             appWindow.updateMultiviewScreen()
         }
     }
@@ -206,7 +169,7 @@ ApplicationWindow {
                     Text {
                         text: "Runtime Control"
                         font.bold: true
-                        color: "#eee"
+                        color: "#eeeeee"
                     }
 
                     RowLayout {
@@ -240,7 +203,6 @@ ApplicationWindow {
                             padding: 12
                             onClicked: {
                                 appWindow.refreshScreenOptions()
-                                appWindow.buildScreenMenu()
                                 screenMenu.x = 0
                                 screenMenu.y = multiviewMenuButton.height + 4
                                 screenMenu.open()
@@ -248,6 +210,15 @@ ApplicationWindow {
 
                             Menu {
                                 id: screenMenu
+                                Repeater {
+                                    model: appWindow.screenOptions
+                                    delegate: MenuItem {
+                                        id: screenMenuItem
+                                        required property var modelData
+                                        text: modelData.label
+                                        onTriggered: appWindow.makeScreenHandler(modelData.index)()
+                                    }
+                                }
                             }
                         }
                     }
@@ -323,7 +294,7 @@ ApplicationWindow {
                                     Text {
                                         text: midiRow.modelData.name
                                         Layout.preferredWidth: 130
-                                        color: "#eee"
+                                        color: "#eeeeee"
                                     }
 
                                     Text {
@@ -338,7 +309,7 @@ ApplicationWindow {
                                         text: (appWindow.uiManagerRef.midiLastValuesVersion >= 0
                                               ? "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action)
                                               : "Last: " + appWindow.uiManagerRef.midiLastValue(midiRow.modelData.action))
-                                        color: "#666"
+                                        color: "#666666"
                                         Layout.preferredWidth: 80
                                     }
 
@@ -633,7 +604,7 @@ ApplicationWindow {
                     background: Rectangle {
                         height: 6
                         radius: 3
-                        color: "#333"
+                        color: "#333333"
                         Rectangle {
                             width: scrubBar.visualPosition * parent.width
                             height: parent.height
@@ -652,7 +623,7 @@ ApplicationWindow {
                         text: playbackTab.showTimeOfDay && appWindow.uiManagerRef.recordingStartEpochMs > 0
                             ? playbackTab.formatTimeOfDay(appWindow.uiManagerRef.recordingStartEpochMs + appWindow.uiManagerRef.scrubPosition)
                             : playbackTab.formatTimecode(appWindow.uiManagerRef.scrubPosition)
-                        color: "#eee"
+                        color: "#eeeeee"
                         font.family: "Menlo"
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
@@ -766,7 +737,7 @@ ApplicationWindow {
                                ? playbackTab.formatTimeOfDay(Date.now())
                                : playbackTab.formatTimeOfDay(Date.now()))
                             : playbackTab.formatTimecode(appWindow.uiManagerRef.recordedDurationMs)
-                        color: "#eee"
+                        color: "#eeeeee"
                         font.family: "Menlo"
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
@@ -788,7 +759,7 @@ ApplicationWindow {
                 Text {
                     text: "Project Settings"
                     font.bold: true
-                    color: "#eee"
+                    color: "#eeeeee"
                 }
 
                 GridLayout {
@@ -871,7 +842,7 @@ ApplicationWindow {
                     Text {
                         text: "Input Sources"
                         Layout.fillWidth: true
-                        color: "#eee"
+                        color: "#eeeeee"
                         font.bold: true
                     }
 
@@ -899,7 +870,7 @@ ApplicationWindow {
 
                         Label {
                             text: (streamRow.index + 1) + ":"
-                            width: 20
+                            Layout.preferredWidth: 20
                         }
 
                         TextField {
@@ -918,7 +889,7 @@ ApplicationWindow {
 
                         Button {
                             text: "×"
-                            width: 30
+                            Layout.preferredWidth: 30
                             flat: true
                             onClicked: appWindow.uiManagerRef.removeStream(streamRow.index)
                             visible: !appWindow.uiManagerRef.isRecording
