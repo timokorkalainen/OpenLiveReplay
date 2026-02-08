@@ -13,7 +13,6 @@
 #include <QTimer>
 #include <QScreen>
 #include <QVariantMap>
-#include <QUuid>
 #include <cstdio>
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
@@ -245,8 +244,16 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     refreshProviders();
 }
 
-static QString generateSourceId() {
-    return QUuid::createUuid().toString(QUuid::WithoutBraces);
+static int nextSourceIdSeed(const QList<SourceSettings> &sources) {
+    int maxId = 0;
+    for (const auto &source : sources) {
+        bool ok = false;
+        const int value = source.id.trimmed().toInt(&ok);
+        if (ok && value > maxId) {
+            maxId = value;
+        }
+    }
+    return maxId + 1;
 }
 
 QStringList UIManager::streamUrls() const {
@@ -512,9 +519,10 @@ void UIManager::setStreamUrls(const QStringList &urls) {
             updated[i].url = urls[i];
         }
         if (urls.size() > updated.size()) {
+            int nextId = nextSourceIdSeed(updated);
             for (int i = updated.size(); i < urls.size(); ++i) {
                 SourceSettings source;
-                source.id = generateSourceId();
+                source.id = QString::number(nextId++);
                 source.name = "";
                 source.url = urls[i];
                 updated.append(source);
@@ -541,9 +549,10 @@ void UIManager::setStreamNames(const QStringList &names) {
             updated[i].name = names[i];
         }
         if (names.size() > updated.size()) {
+            int nextId = nextSourceIdSeed(updated);
             for (int i = updated.size(); i < names.size(); ++i) {
                 SourceSettings source;
-                source.id = generateSourceId();
+                source.id = QString::number(nextId++);
                 source.name = names[i];
                 source.url = "";
                 updated.append(source);
@@ -909,9 +918,10 @@ void UIManager::updateStreamId(int index, const QString& id) {
 
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
+        int nextId = nextSourceIdSeed(m_currentSettings.sources);
         for (auto &source : m_currentSettings.sources) {
             if (source.id.trimmed().isEmpty()) {
-                source.id = generateSourceId();
+                source.id = QString::number(nextId++);
             }
         }
         // Apply to engine
@@ -969,7 +979,8 @@ void UIManager::loadSettings() {
 
 void UIManager::addStream() {
     SourceSettings source;
-    source.id = generateSourceId();
+    const int nextId = nextSourceIdSeed(m_currentSettings.sources);
+    source.id = QString::number(nextId);
     source.name = "";
     source.url = "";
     m_currentSettings.sources.append(source);
