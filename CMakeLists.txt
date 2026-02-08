@@ -23,10 +23,10 @@ find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickContr
 qt_standard_project_setup(REQUIRES 6.8)
 
 # 2. Create the Executable Target FIRST
-qt_add_executable(appOpenLiveReplay main.cpp)
+qt_add_executable(OpenLiveReplay main.cpp)
 
 # 3. Define QML Module and Sources
-qt_add_qml_module(appOpenLiveReplay
+qt_add_qml_module(OpenLiveReplay
     URI OpenLiveReplay
     VERSION 1.0
     QML_FILES
@@ -84,12 +84,12 @@ add_custom_target(qmllint_imports ALL
 )
 
 # Ensure qmllint can find the generated qmltypes file in the module output directory.
-add_custom_command(TARGET appOpenLiveReplay POST_BUILD
+add_custom_command(TARGET OpenLiveReplay POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/OpenLiveReplay"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_BINARY_DIR}/.qt/qmltypes/appOpenLiveReplay.qmltypes"
-        "${CMAKE_BINARY_DIR}/OpenLiveReplay/appOpenLiveReplay.qmltypes"
-    COMMENT "Copying appOpenLiveReplay.qmltypes for qmllint"
+        "${CMAKE_BINARY_DIR}/.qt/qmltypes/OpenLiveReplay.qmltypes"
+        "${CMAKE_BINARY_DIR}/OpenLiveReplay/OpenLiveReplay.qmltypes"
+    COMMENT "Copying OpenLiveReplay.qmltypes for qmllint"
 )
 
 add_library(OpenLiveReplayMidi STATIC
@@ -104,11 +104,11 @@ target_link_libraries(OpenLiveReplayMidi PRIVATE
 
 # 4. Handle Platform Specifics (FFmpeg)
 if(IOS)
-    target_sources(appOpenLiveReplay PRIVATE
+    target_sources(OpenLiveReplay PRIVATE
         ios/ios_scene.h
         ios/ios_scene.mm
     )
-    set_target_properties(appOpenLiveReplay PROPERTIES
+    set_target_properties(OpenLiveReplay PROPERTIES
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/ios/Info.plist"
     )
     # ==============================================================================
@@ -182,7 +182,7 @@ if(IOS)
     add_dependencies(ffmpeg_srt BuildFFmpegDependencies)
 
     # Include dirs for headers
-    target_include_directories(appOpenLiveReplay PRIVATE
+    target_include_directories(OpenLiveReplay PRIVATE
         "${FFMPEG_IOS_DIR}/libavcodec.xcframework/ios-arm64/Headers"
         "${FFMPEG_IOS_DIR}/libavformat.xcframework/ios-arm64/Headers"
         "${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/Headers"
@@ -193,9 +193,9 @@ if(IOS)
     # ==============================================================================
     # 5. LINK TO YOUR APP
     # ==============================================================================
-    add_dependencies(appOpenLiveReplay BuildFFmpegDependencies)
+    add_dependencies(OpenLiveReplay BuildFFmpegDependencies)
 
-    target_link_libraries(appOpenLiveReplay PRIVATE
+    target_link_libraries(OpenLiveReplay PRIVATE
         ffmpeg_avcodec
         ffmpeg_avformat
         ffmpeg_avutil
@@ -216,7 +216,7 @@ if(IOS)
     # ==============================================================================
     # 6. EMBED DYLIBS INTO APP BUNDLE (Xcode native embedding)
     # ==============================================================================
-    set_target_properties(appOpenLiveReplay PROPERTIES
+    set_target_properties(OpenLiveReplay PROPERTIES
         BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "@executable_path/Frameworks"
         XCODE_EMBED_FRAMEWORKS
@@ -233,24 +233,24 @@ if [ -f \"\${FW_DIR}/librtmidi.7.0.0.dylib\" ] && [ ! -e \"\${FW_DIR}/librtmidi.
     mv librtmidi.7.0.0.dylib librtmidi.7.dylib
 fi
 ")
-    set_target_properties(appOpenLiveReplay PROPERTIES
+    set_target_properties(OpenLiveReplay PROPERTIES
         XCODE_ATTRIBUTE_OPENLIVEREPLAY_FIX_RTMIDI_EMBED "YES"
     )
-    add_custom_command(TARGET appOpenLiveReplay POST_BUILD
+    add_custom_command(TARGET OpenLiveReplay POST_BUILD
         COMMAND bash "${RTMIDI_FIX_SCRIPT}"
         COMMENT "[rtmidi] Renaming librtmidi.7.0.0.dylib -> librtmidi.7.dylib in Frameworks"
     )
 
 elseif(APPLE) # macOS Desktop
-    target_include_directories(appOpenLiveReplay PRIVATE /opt/homebrew/include)
-    target_link_directories(appOpenLiveReplay PRIVATE /opt/homebrew/lib)
-    target_link_libraries(appOpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample)
-    set_target_properties(appOpenLiveReplay PROPERTIES INSTALL_RPATH "/opt/homebrew/lib")
-    target_link_libraries(appOpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
+    target_include_directories(OpenLiveReplay PRIVATE /opt/homebrew/include)
+    target_link_directories(OpenLiveReplay PRIVATE /opt/homebrew/lib)
+    target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample)
+    set_target_properties(OpenLiveReplay PROPERTIES INSTALL_RPATH "/opt/homebrew/lib")
+    target_link_libraries(OpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
 endif()
 
 # 5. Standard Qt Linking
-target_link_libraries(appOpenLiveReplay PRIVATE
+target_link_libraries(OpenLiveReplay PRIVATE
     Qt6::Core
     Qt6::Quick
     Qt6::Concurrent
@@ -261,9 +261,9 @@ target_link_libraries(appOpenLiveReplay PRIVATE
 )
 
 # 6. Bundle Properties
-set_target_properties(appOpenLiveReplay PROPERTIES
-    MACOSX_BUNDLE_GUI_IDENTIFIER com.timokorkalainen.appOpenLiveReplay
-    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.timokorkalainen.appOpenLiveReplay
+set_target_properties(OpenLiveReplay PROPERTIES
+    MACOSX_BUNDLE_GUI_IDENTIFIER com.timokorkalainen.OpenLiveReplay
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.timokorkalainen.OpenLiveReplay
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
     MACOSX_BUNDLE TRUE
 )
