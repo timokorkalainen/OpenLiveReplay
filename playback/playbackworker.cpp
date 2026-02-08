@@ -1,6 +1,5 @@
 #include "playback/playbackworker.h"
 #include <QDebug>
-#include <QElapsedTimer>
 #include <QMutexLocker>
 
 PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport, QObject *parent)

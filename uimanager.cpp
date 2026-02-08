@@ -2,7 +2,6 @@
 #include <QDateTime>
 #include <algorithm>
 #include <QDir>
-#include <QGuiApplication>
 #if defined(Q_OS_IOS)
 #include "ios/ios_scene.h"
 #endif

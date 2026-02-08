@@ -1,7 +1,5 @@
 #include "settingsmanager.h"
 #include <QDebug>
-#include <QStandardPaths>
-#include <QDir>
 
 SettingsManager::SettingsManager() {}
 

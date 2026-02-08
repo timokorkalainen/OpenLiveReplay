@@ -1,6 +1,5 @@
 #include "replaymanager.h"
 #include <QDebug>
-#include <QUrl>
 #include <QDir>
 #include <QDateTime>
 

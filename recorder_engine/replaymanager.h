@@ -2,7 +2,6 @@
 #define REPLAYMANAGER_H
 
 #include <QObject>
-#include <QMap>
 #include <QString>
 #include "recordingclock.h"
 #include "muxer.h"
