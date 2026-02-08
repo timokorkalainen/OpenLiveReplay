@@ -807,6 +807,7 @@ void UIManager::stepFrameBack() {
 void UIManager::goLive() {
     if (!m_transport) return;
     m_transport->setSpeed(1.0);
+    m_transport->setPlaying(true);
     scrubToLive();
 }
 
