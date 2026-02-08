@@ -10,6 +10,7 @@ set(RTMIDI_API_ALSA OFF CACHE BOOL "" FORCE)
 set(RTMIDI_API_JACK OFF CACHE BOOL "" FORCE)
 set(RTMIDI_API_WINMM OFF CACHE BOOL "" FORCE)
 set(RTMIDI_API_DUMMY OFF CACHE BOOL "" FORCE)
+set(RTMIDI_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     rtmidi
     GIT_REPOSITORY https://github.com/thestk/rtmidi.git
@@ -40,40 +41,96 @@ qt_add_qml_module(appOpenLiveReplay
         playback/playbackworker.h playback/playbackworker.cpp
         playback/frameprovider.h playback/frameprovider.cpp
         playback/playbacktransport.h playback/playbacktransport.cpp
-        midi/midimanager.h midi/midimanager.cpp
     RESOURCES
         qtquickcontrols2.conf
         resources.qrc
 )
 
+add_library(OpenLiveReplayMidi STATIC
+    midi/midimanager.h
+    midi/midimanager.cpp
+)
+
+target_link_libraries(OpenLiveReplayMidi PRIVATE
+    Qt6::Core
+    rtmidi
+)
+
 # 4. Handle Platform Specifics (FFmpeg)
 if(IOS)
-    # 1. Point this to the folder WHERE your .framework folders are located
-        # Example: if your file is /Users/timo/build/libavformat.framework, set path to /Users/timo/build
-        set(MY_FFMPEG_DIR "/Users/timo.korkalainen/Development/ffmpeg/installed")
+    # ==============================================================================
+    # INTEGRATED FFMPEG IOS BUILDER
+    # ==============================================================================
 
-        # 2. Add Include Paths
-        # We point directly to the Headers folder inside each framework you built
-        target_include_directories(appOpenLiveReplay PRIVATE
-            "${MY_FFMPEG_DIR}/include"
-        )
+    # 1. DEFINE PATHS
+    set(FFMPEG_SCRIPT "${CMAKE_SOURCE_DIR}/build-scripts/build_ffmpeg_ios_srt.sh")
+    set(FFMPEG_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/ios_build/xcframeworks")
 
-        # 3. Link them
-        target_link_libraries(appOpenLiveReplay PRIVATE
-            "${MY_FFMPEG_DIR}/framework/libavformat.framework"
-            "${MY_FFMPEG_DIR}/framework/libavcodec.framework"
-            "${MY_FFMPEG_DIR}/framework/libavutil.framework"
-            "${MY_FFMPEG_DIR}/framework/libswscale.framework"
-            "${MY_FFMPEG_DIR}/framework/libswresample.framework"
-        )
+    # Define the expected artifacts (used to check if build is needed)
+    set(EXPECTED_LIBS
+        "${FFMPEG_OUTPUT_DIR}/libavcodec.xcframework"
+        "${FFMPEG_OUTPUT_DIR}/libsrt.xcframework"
+    )
 
-        # 4. Embed them into the app bundle so it doesn't crash on launch
-        set_target_properties(appOpenLiveReplay PROPERTIES
-            XCODE_EMBED_FRAMEWORKS "${MY_FFMPEG_DIR}/framework/libavformat.framework;${MY_FFMPEG_DIR}/framework/libavcodec.framework;${MY_FFMPEG_DIR}/framework/libavutil.framework;${MY_FFMPEG_DIR}/framework/libswscale.framework;${MY_FFMPEG_DIR}/framework/libswresample.framework"
-            XCODE_EMBED_FRAMEWORKS_CODE_SIGN_ON_COPY ON
-            BUILD_WITH_INSTALL_RPATH TRUE
-            INSTALL_RPATH "@executable_path/Frameworks"
+    # 2. CREATE A CUSTOM BUILD STEP
+    add_custom_command(
+        OUTPUT ${EXPECTED_LIBS}
+        COMMAND chmod +x ${FFMPEG_SCRIPT}
+        COMMAND ${FFMPEG_SCRIPT}
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "[FFmpeg] Binaries missing. Compiling FFmpeg+SRT for iOS... (This takes ~20 mins)"
+        VERBATIM
+    )
+
+    # 3. DEFINE A TARGET
+    add_custom_target(BuildFFmpegDependencies DEPENDS ${EXPECTED_LIBS})
+
+    # ==============================================================================
+    # 4. IMPORT THE LIBRARIES (Explicitly)
+    # ==============================================================================
+    function(add_ffmpeg_xcframework NAME FILENAME)
+        add_library(${NAME} INTERFACE IMPORTED)
+        set_target_properties(${NAME} PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${FFMPEG_OUTPUT_DIR}/${FILENAME}"
+            INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_OUTPUT_DIR}"
         )
+        add_dependencies(${NAME} BuildFFmpegDependencies)
+    endfunction()
+
+    add_ffmpeg_xcframework(FFMPEG::avcodec    "libavcodec.xcframework")
+    add_ffmpeg_xcframework(FFMPEG::avformat   "libavformat.xcframework")
+    add_ffmpeg_xcframework(FFMPEG::avutil     "libavutil.xcframework")
+    add_ffmpeg_xcframework(FFMPEG::swscale    "libswscale.xcframework")
+    add_ffmpeg_xcframework(FFMPEG::swresample "libswresample.xcframework")
+    add_ffmpeg_xcframework(FFMPEG::srt        "libsrt.xcframework")
+
+    # ==============================================================================
+    # 5. LINK TO YOUR APP
+    # ==============================================================================
+    add_dependencies(appOpenLiveReplay BuildFFmpegDependencies)
+
+    target_link_libraries(appOpenLiveReplay PRIVATE
+        FFMPEG::avcodec
+        FFMPEG::avformat
+        FFMPEG::avutil
+        FFMPEG::swscale
+        FFMPEG::swresample
+        FFMPEG::srt
+        "-framework AudioToolbox"
+        "-framework CoreMIDI"
+        "-framework CoreAudio"
+        "-framework CoreFoundation"
+        "-framework VideoToolbox"
+        "-framework CoreMedia"
+        "-framework AVFoundation"
+        "-framework CoreVideo"
+        "-lz" "-lbz2" "-liconv" "-lc++"
+    )
+
+    set_target_properties(appOpenLiveReplay PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "@executable_path/Frameworks"
+    )
 
 elseif(APPLE) # macOS Desktop
     target_include_directories(appOpenLiveReplay PRIVATE /opt/homebrew/include)
@@ -91,11 +148,13 @@ target_link_libraries(appOpenLiveReplay PRIVATE
     Qt6::Multimedia
     Qt6::QuickControls2
     rtmidi
+    OpenLiveReplayMidi
 )
 
 # 6. Bundle Properties
 set_target_properties(appOpenLiveReplay PROPERTIES
     MACOSX_BUNDLE_GUI_IDENTIFIER com.timokorkalainen.appOpenLiveReplay
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.timokorkalainen.appOpenLiveReplay
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
     MACOSX_BUNDLE TRUE
 )
