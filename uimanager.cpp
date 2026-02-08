@@ -789,6 +789,12 @@ void UIManager::stepFrame() {
     m_transport->step(1);
     m_transport->setPlaying(false);
     cancelFollowLive();
+
+    if (m_playbackWorker) {
+        int64_t targetMs = m_transport->currentPos();
+        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
+        m_playbackWorker->seekTo(targetMs);
+    }
 }
 
 void UIManager::stepFrameBack() {
