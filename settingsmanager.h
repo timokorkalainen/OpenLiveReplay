@@ -17,6 +17,7 @@ struct AppSettings {
     int videoWidth = 1920;
     int videoHeight = 1080;
     int fps = 30;
+    int multiviewCount = 4;
     bool showTimeOfDay = false;
     QString midiPortName;
     QMap<int, QPair<int,int>> midiBindings;

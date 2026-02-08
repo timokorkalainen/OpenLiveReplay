@@ -251,6 +251,7 @@ QString UIManager::fileName() const { return m_currentSettings.fileName; }
 int UIManager::recordWidth() const { return m_currentSettings.videoWidth; }
 int UIManager::recordHeight() const { return m_currentSettings.videoHeight; }
 int UIManager::recordFps() const { return m_currentSettings.fps; }
+int UIManager::multiviewCount() const { return m_currentSettings.multiviewCount; }
 bool UIManager::isRecording() const { return m_replayManager->isRecording(); }
 qint64 UIManager::recordingStartEpochMs() const {
     return m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
@@ -291,10 +292,29 @@ int UIManager::midiLastValuesVersion() const {
     return m_midiLastValuesVersion;
 }
 
+int UIManager::activeViewCount() const {
+    return qBound(1, m_currentSettings.multiviewCount, 16);
+}
+
+QStringList UIManager::activeStreamUrls() const {
+    return m_currentSettings.streamUrls.mid(0, activeViewCount());
+}
+
+QStringList UIManager::activeStreamNames() const {
+    return m_currentSettings.streamNames.mid(0, activeViewCount());
+}
+
+void UIManager::syncActiveStreams() {
+    const QStringList urls = activeStreamUrls();
+    const QStringList names = activeStreamNames();
+    m_replayManager->setStreamUrls(urls);
+    m_replayManager->setStreamNames(names);
+    refreshProviders();
+}
+
 void UIManager::setStreamUrls(const QStringList &urls) {
     if (m_currentSettings.streamUrls != urls) {
         m_currentSettings.streamUrls = urls;
-        m_replayManager->setStreamUrls(urls);
         if (m_currentSettings.streamNames.size() < urls.size()) {
             while (m_currentSettings.streamNames.size() < urls.size()) {
                 m_currentSettings.streamNames.append("");
@@ -302,8 +322,7 @@ void UIManager::setStreamUrls(const QStringList &urls) {
         } else if (m_currentSettings.streamNames.size() > urls.size()) {
             m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, urls.size());
         }
-        m_replayManager->setStreamNames(m_currentSettings.streamNames);
-        refreshProviders();
+        syncActiveStreams();
         if (m_replayManager->isRecording()) {
             restartPlaybackWorker();
         }
@@ -322,7 +341,7 @@ void UIManager::setStreamNames(const QStringList &names) {
         } else if (m_currentSettings.streamNames.size() > m_currentSettings.streamUrls.size()) {
             m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, m_currentSettings.streamUrls.size());
         }
-        m_replayManager->setStreamNames(m_currentSettings.streamNames);
+        m_replayManager->setStreamNames(activeStreamNames());
         emit streamNamesChanged();
     }
 }
@@ -380,6 +399,19 @@ void UIManager::setRecordFps(int fps) {
             m_playbackWorker->setFrameBufferMax(fps);
         }
         emit recordFpsChanged();
+    }
+}
+
+void UIManager::setMultiviewCount(int count) {
+    const int clamped = qBound(1, count, 16);
+    if (m_currentSettings.multiviewCount != clamped) {
+        m_currentSettings.multiviewCount = clamped;
+        syncActiveStreams();
+        if (m_replayManager->isRecording()) {
+            restartPlaybackWorker();
+        }
+        emit multiviewCountChanged();
+        m_settingsManager->save(m_configPath, m_currentSettings);
     }
 }
 
@@ -605,7 +637,9 @@ void UIManager::seekPlayback(int64_t ms) {
 void UIManager::updateUrl(int index, const QString &url) {
     if (index >= 0 && index < m_currentSettings.streamUrls.size()) {
         m_currentSettings.streamUrls[index] = url;
-        m_replayManager->updateTrackUrl(index, url); // Hot-swap if recording
+        if (index < activeStreamUrls().size()) {
+            m_replayManager->updateTrackUrl(index, url); // Hot-swap if recording
+        }
         emit streamUrlsChanged();
 
         // Auto-save to JSON
@@ -616,7 +650,7 @@ void UIManager::updateUrl(int index, const QString &url) {
 void UIManager::updateStreamName(int index, const QString& name) {
     if (index >= 0 && index < m_currentSettings.streamNames.size()) {
         m_currentSettings.streamNames[index] = name;
-        m_replayManager->setStreamNames(m_currentSettings.streamNames);
+        m_replayManager->setStreamNames(activeStreamNames());
         emit streamNamesChanged();
         m_settingsManager->save(m_configPath, m_currentSettings);
     }
@@ -625,7 +659,6 @@ void UIManager::updateStreamName(int index, const QString& name) {
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         // Apply to engine
-        m_replayManager->setStreamUrls(m_currentSettings.streamUrls);
         m_replayManager->setOutputDirectory(m_currentSettings.saveLocation);
         m_replayManager->setBaseFileName(m_currentSettings.fileName);
         m_replayManager->setVideoWidth(m_currentSettings.videoWidth);
@@ -638,7 +671,8 @@ void UIManager::loadSettings() {
         } else if (m_currentSettings.streamNames.size() > m_currentSettings.streamUrls.size()) {
             m_currentSettings.streamNames = m_currentSettings.streamNames.mid(0, m_currentSettings.streamUrls.size());
         }
-        m_replayManager->setStreamNames(m_currentSettings.streamNames);
+        m_currentSettings.multiviewCount = qBound(1, m_currentSettings.multiviewCount, 16);
+        syncActiveStreams();
         if (m_transport) {
             m_transport->setFps(m_currentSettings.fps);
         }
@@ -674,6 +708,7 @@ void UIManager::loadSettings() {
         emit recordWidthChanged();
         emit recordHeightChanged();
         emit recordFpsChanged();
+        emit multiviewCountChanged();
         emit timeOfDayModeChanged();
         emit midiPortNameChanged();
     }
@@ -720,7 +755,9 @@ void UIManager::onStopRequested() {
 
 void UIManager::updateStreamUrl(int index, const QString& url) {
     // This allows hot-swapping through the UI
-    m_replayManager->updateTrackUrl(index, url);
+    if (index >= 0 && index < activeStreamUrls().size()) {
+        m_replayManager->updateTrackUrl(index, url);
+    }
 
     // Auto-save whenever a URL is modified
     AppSettings current;
@@ -794,7 +831,7 @@ void UIManager::refreshProviders() {
     m_providers.clear();
 
     // Create a provider for every stream URL
-    int count = m_replayManager->getStreamUrls().size();
+    int count = activeStreamUrls().size();
     for (int i = 0; i < count; ++i) {
         m_providers.append(new FrameProvider(this));
     }

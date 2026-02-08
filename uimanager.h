@@ -27,6 +27,7 @@ class UIManager : public QObject {
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
+    Q_PROPERTY(int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
     Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
@@ -58,6 +59,7 @@ public:
     int recordWidth() const;
     int recordHeight() const;
     int recordFps() const;
+    int multiviewCount() const;
     bool isRecording() const;
     QVariantList playbackProviders() const;
     int64_t recordedDurationMs();
@@ -86,6 +88,7 @@ public:
     void setRecordWidth(int width);
     void setRecordHeight(int height);
     void setRecordFps(int fps);
+    void setMultiviewCount(int count);
     void setTimeOfDayMode(bool enabled);
 
     void refreshProviders();
@@ -138,6 +141,7 @@ signals:
     void recordWidthChanged();
     void recordHeightChanged();
     void recordFpsChanged();
+    void multiviewCountChanged();
     void recordingStatusChanged();
     void playbackProvidersChanged();
     void recordingStarted();
@@ -170,6 +174,10 @@ public slots:
     void onRecorderPulse(int64_t elapsed, int64_t frameCount);
 
 private:
+    void syncActiveStreams();
+    int activeViewCount() const;
+    QStringList activeStreamUrls() const;
+    QStringList activeStreamNames() const;
     void updateXTouchLcd();
     void updateXTouchDisplay();
 

@@ -228,6 +228,30 @@ ApplicationWindow {
                         color: appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666"
                     }
 
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+
+                        Text {
+                            text: "Multiview Views"
+                            color: "#eeeeee"
+                            Layout.alignment: Qt.AlignVCenter
+                        }
+
+                        SpinBox {
+                            from: 1
+                            to: 16
+                            stepSize: 1
+                            editable: true
+                            inputMethodHints: Qt.ImhDigitsOnly
+                            value: appWindow.uiManagerRef.multiviewCount
+                            enabled: !appWindow.uiManagerRef.isRecording
+                            onValueModified: appWindow.uiManagerRef.multiviewCount = value
+                        }
+
+                        Item { Layout.fillWidth: true }
+                    }
+
                     GroupBox {
                         title: "MIDI"
                         Layout.fillWidth: true
@@ -408,19 +432,9 @@ ApplicationWindow {
 
                 function updateVisibleStreams() {
                     var indexes = []
-                    var total = Math.max(appWindow.uiManagerRef.streamUrls.length, appWindow.uiManagerRef.playbackProviders.length)
-                    if (appWindow.uiManagerRef.streamUrls.length > 0) {
-                        for (var i = 0; i < appWindow.uiManagerRef.streamUrls.length; ++i) {
-                            var url = appWindow.uiManagerRef.streamUrls[i]
-                            if (url && url.trim().length > 0) {
-                                indexes.push(i)
-                            }
-                        }
-                    }
-                    if (indexes.length === 0 && total > 0) {
-                        for (var j = 0; j < total; ++j) {
-                            indexes.push(j)
-                        }
+                    var viewCount = Math.max(1, Math.min(16, appWindow.uiManagerRef.multiviewCount))
+                    for (var i = 0; i < viewCount; ++i) {
+                        indexes.push(i)
                     }
                     visibleStreamIndexes = indexes
                 }
@@ -446,6 +460,12 @@ ApplicationWindow {
                         appWindow.uiManagerRef.setPlaybackViewState(false, -1)
                     }
                     function onStreamUrlsChanged() {
+                        playbackTab.selectedIndex = -1
+                        playbackTab.viewMode = "multi"
+                        playbackTab.updateVisibleStreams()
+                        appWindow.uiManagerRef.setPlaybackViewState(false, -1)
+                    }
+                    function onMultiviewCountChanged() {
                         playbackTab.selectedIndex = -1
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()

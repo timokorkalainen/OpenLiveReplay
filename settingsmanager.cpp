@@ -12,6 +12,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["videoWidth"] = settings.videoWidth;
     root["videoHeight"] = settings.videoHeight;
     root["fps"] = settings.fps;
+    root["multiviewCount"] = settings.multiviewCount;
     root["showTimeOfDay"] = settings.showTimeOfDay;
     root["midiPortName"] = settings.midiPortName;
 
@@ -101,6 +102,7 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.videoWidth = root["videoWidth"].toInt(settings.videoWidth);
     settings.videoHeight = root["videoHeight"].toInt(settings.videoHeight);
     settings.fps = root["fps"].toInt(settings.fps);
+    settings.multiviewCount = root["multiviewCount"].toInt(settings.multiviewCount);
     settings.showTimeOfDay = root["showTimeOfDay"].toBool(settings.showTimeOfDay);
     settings.midiPortName = root["midiPortName"].toString();
     settings.midiBindings.clear();
