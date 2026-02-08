@@ -20,10 +20,16 @@ extern "C" {
     #include <libavutil/imgutils.h>
 }
 
+struct BufferedFrame {
+    int64_t ptsMs = -1;
+    QVideoFrame frame;
+};
+
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
     FrameProvider* provider = nullptr;
     int streamIndex = -1;
+    QVector<BufferedFrame> buffer;
 };
 
 class PlaybackWorker : public QThread {
@@ -34,6 +40,8 @@ public:
 
     void openFile(const QString &filePath);
     void seekTo(int64_t timestampMs);
+    bool deliverBufferedFrameAtOrBefore(int64_t targetMs);
+    void setFrameBufferMax(int maxFrames);
     void stop();
 
 protected:
@@ -53,7 +61,10 @@ private:
     QString m_currentFilePath;
     PlaybackTransport *m_transport;
 
+    int m_frameBufferMax = 30;
+
     QMutex m_mutex;
+    QMutex m_bufferMutex;
 };
 
 #endif // PLAYBACKWORKER_H

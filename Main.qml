@@ -140,6 +140,7 @@ ApplicationWindow {
                                     { name: "Play/Pause", action: 0 },
                                     { name: "Rewind 5.0x", action: 1 },
                                     { name: "Forward 5.0x", action: 2 },
+                                    { name: "Prev Frame", action: 7 },
                                     { name: "Next Frame", action: 3 },
                                     { name: "Go Live", action: 4 },
                                     { name: "Capture", action: 5 },
@@ -509,6 +510,11 @@ ApplicationWindow {
                         text: uiManager.transport.isPlaying ? "PAUSE" : "PLAY"
                         onClicked: uiManager.playPause()
                         highlighted: uiManager.transport.isPlaying
+                    }
+
+                    Button {
+                        text: "<"
+                        onClicked: uiManager.stepFrameBack()
                     }
 
                     Button {

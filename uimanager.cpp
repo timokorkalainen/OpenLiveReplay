@@ -95,6 +95,9 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         case 3:
             if (!isRelease) stepFrame();
             break;
+        case 7:
+            if (!isRelease) stepFrameBack();
+            break;
         case 4:
             if (!isRelease) goLive();
             break;
@@ -270,6 +273,9 @@ void UIManager::setRecordFps(int fps) {
         if (m_transport) {
             m_transport->setFps(fps);
         }
+        if (m_playbackWorker) {
+            m_playbackWorker->setFrameBufferMax(fps);
+        }
         emit recordFpsChanged();
     }
 }
@@ -343,6 +349,19 @@ void UIManager::stepFrame() {
     cancelFollowLive();
 }
 
+void UIManager::stepFrameBack() {
+    if (!m_transport) return;
+    m_transport->step(-1);
+    m_transport->setPlaying(false);
+    cancelFollowLive();
+
+    if (m_playbackWorker) {
+        int64_t targetMs = m_transport->currentPos();
+        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
+        m_playbackWorker->seekTo(targetMs);
+    }
+}
+
 void UIManager::goLive() {
     if (!m_transport) return;
     m_transport->setSpeed(1.0);
@@ -385,6 +404,7 @@ void UIManager::startRecording() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, this);
+    m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
 
     // 2. Point it to the file being recorded
     //QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
@@ -407,6 +427,7 @@ void UIManager::restartPlaybackWorker() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, this);
+    m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
     m_transport->seek(0);

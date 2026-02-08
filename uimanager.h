@@ -99,6 +99,7 @@ public:
     Q_INVOKABLE void rewind5x();
     Q_INVOKABLE void forward5x();
     Q_INVOKABLE void stepFrame();
+    Q_INVOKABLE void stepFrameBack();
     Q_INVOKABLE void goLive();
     Q_INVOKABLE void captureCurrent();
     Q_INVOKABLE void setPlaybackViewState(bool singleView, int selectedIndex);

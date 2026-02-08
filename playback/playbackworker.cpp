@@ -1,6 +1,7 @@
 #include "playback/playbackworker.h"
 #include <QDebug>
 #include <QElapsedTimer>
+#include <QMutexLocker>
 
 PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport, QObject *parent)
     : QThread(parent)
@@ -23,6 +24,16 @@ void PlaybackWorker::openFile(const QString &filePath) {
     m_currentFilePath = filePath;
 }
 
+void PlaybackWorker::seekTo(int64_t timestampMs) {
+    QMutexLocker locker(&m_mutex);
+    m_seekTargetMs = qMax<int64_t>(0, timestampMs);
+}
+
+void PlaybackWorker::setFrameBufferMax(int maxFrames) {
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    m_frameBufferMax = qMax(1, maxFrames);
+}
+
 void PlaybackWorker::stop() {
     m_running = false;
     wait();
@@ -39,6 +50,7 @@ void PlaybackWorker::run() {
     m_running = true;
 
     auto clearDecoders = [this]() {
+        QMutexLocker bufferLocker(&m_bufferMutex);
         for (auto* track : m_decoderBank) {
             if (track->codecCtx) avcodec_free_context(&track->codecCtx);
             delete track;
@@ -93,8 +105,11 @@ void PlaybackWorker::run() {
                 track->codecCtx = ctx;
                 track->provider = m_providers[providerIndex];
 
-                m_decoderBank.append(track);
-                m_streamMap.insert(i, track);
+                {
+                    QMutexLocker bufferLocker(&m_bufferMutex);
+                    m_decoderBank.append(track);
+                    m_streamMap.insert(i, track);
+                }
 
                 providerIndex++;
                 qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider" << (providerIndex-1);
@@ -173,15 +188,27 @@ void PlaybackWorker::run() {
                             int64_t framePts = frame->pts;
                             if (framePts == AV_NOPTS_VALUE) framePts = frame->best_effort_timestamp;
                             AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
+                            int64_t framePtsMs = lastProcessedPtsMs;
                             if (framePts != AV_NOPTS_VALUE) {
-                                lastProcessedPtsMs = av_rescale_q(framePts, tb, {1, 1000});
+                                framePtsMs = av_rescale_q(framePts, tb, {1, 1000});
+                                lastProcessedPtsMs = framePtsMs;
                             } else if (lastProcessedPtsMs >= 0) {
-                                lastProcessedPtsMs += 33; // fallback 30fps
+                                framePtsMs = lastProcessedPtsMs + 33; // fallback 30fps
+                                lastProcessedPtsMs = framePtsMs;
                             } else {
-                                lastProcessedPtsMs = masterTimeMs;
+                                framePtsMs = masterTimeMs;
+                                lastProcessedPtsMs = framePtsMs;
+                            }
+                            QVideoFrame qFrame = convertToQVideoFrame(frame);
+                            {
+                                QMutexLocker bufferLocker(&m_bufferMutex);
+                                track->buffer.append({framePtsMs, qFrame});
+                                if (track->buffer.size() > m_frameBufferMax) {
+                                    track->buffer.remove(0, track->buffer.size() - m_frameBufferMax);
+                                }
                             }
 
-                            track->provider->deliverFrame(convertToQVideoFrame(frame));
+                            track->provider->deliverFrame(qFrame);
                         }
                     }
                     break;
@@ -205,6 +232,35 @@ void PlaybackWorker::run() {
     av_frame_free(&frame);
     clearDecoders();
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
+}
+
+bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
+    struct PendingDeliver {
+        FrameProvider* provider = nullptr;
+        QVideoFrame frame;
+    };
+
+    QVector<PendingDeliver> pending;
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        for (auto* track : m_decoderBank) {
+            if (!track || !track->provider) continue;
+            if (track->buffer.isEmpty()) continue;
+            for (int i = track->buffer.size() - 1; i >= 0; --i) {
+                if (track->buffer[i].ptsMs <= targetMs) {
+                    pending.append({track->provider, track->buffer[i].frame});
+                    break;
+                }
+            }
+        }
+    }
+
+    if (pending.isEmpty()) return false;
+
+    for (const auto &item : pending) {
+        if (item.provider) item.provider->deliverFrame(item.frame);
+    }
+    return true;
 }
 
 QVideoFrame PlaybackWorker::convertToQVideoFrame(AVFrame* frame) {
