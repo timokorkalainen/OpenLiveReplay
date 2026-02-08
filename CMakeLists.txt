@@ -86,23 +86,56 @@ if(IOS)
     add_custom_target(BuildFFmpegDependencies DEPENDS ${EXPECTED_LIBS})
 
     # ==============================================================================
-    # 4. IMPORT THE LIBRARIES (Explicitly)
+    # 4. IMPORT THE LIBRARIES AS SHARED (for proper Xcode embedding)
     # ==============================================================================
-    function(add_ffmpeg_xcframework NAME FILENAME)
-        add_library(${NAME} INTERFACE IMPORTED)
-        set_target_properties(${NAME} PROPERTIES
-            INTERFACE_LINK_LIBRARIES "${FFMPEG_OUTPUT_DIR}/${FILENAME}"
-            INTERFACE_INCLUDE_DIRECTORIES "${FFMPEG_OUTPUT_DIR}"
-        )
-        add_dependencies(${NAME} BuildFFmpegDependencies)
-    endfunction()
+    set(FFMPEG_IOS_DIR "${FFMPEG_OUTPUT_DIR}")
 
-    add_ffmpeg_xcframework(FFMPEG::avcodec    "libavcodec.xcframework")
-    add_ffmpeg_xcframework(FFMPEG::avformat   "libavformat.xcframework")
-    add_ffmpeg_xcframework(FFMPEG::avutil     "libavutil.xcframework")
-    add_ffmpeg_xcframework(FFMPEG::swscale    "libswscale.xcframework")
-    add_ffmpeg_xcframework(FFMPEG::swresample "libswresample.xcframework")
-    add_ffmpeg_xcframework(FFMPEG::srt        "libsrt.xcframework")
+    # Import each FFmpeg dylib as a proper SHARED IMPORTED target
+    add_library(ffmpeg_avcodec SHARED IMPORTED)
+    set_target_properties(ffmpeg_avcodec PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavcodec.xcframework/ios-arm64/libavcodec.dylib"
+    )
+    add_dependencies(ffmpeg_avcodec BuildFFmpegDependencies)
+
+    add_library(ffmpeg_avformat SHARED IMPORTED)
+    set_target_properties(ffmpeg_avformat PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavformat.xcframework/ios-arm64/libavformat.dylib"
+    )
+    add_dependencies(ffmpeg_avformat BuildFFmpegDependencies)
+
+    add_library(ffmpeg_avutil SHARED IMPORTED)
+    set_target_properties(ffmpeg_avutil PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/libavutil.dylib"
+    )
+    add_dependencies(ffmpeg_avutil BuildFFmpegDependencies)
+
+    add_library(ffmpeg_swscale SHARED IMPORTED)
+    set_target_properties(ffmpeg_swscale PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libswscale.xcframework/ios-arm64/libswscale.dylib"
+    )
+    add_dependencies(ffmpeg_swscale BuildFFmpegDependencies)
+
+    add_library(ffmpeg_swresample SHARED IMPORTED)
+    set_target_properties(ffmpeg_swresample PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libswresample.xcframework/ios-arm64/libswresample.dylib"
+    )
+    add_dependencies(ffmpeg_swresample BuildFFmpegDependencies)
+
+    # SRT is static
+    add_library(ffmpeg_srt STATIC IMPORTED)
+    set_target_properties(ffmpeg_srt PROPERTIES
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libsrt.xcframework/ios-arm64/libsrt.a"
+    )
+    add_dependencies(ffmpeg_srt BuildFFmpegDependencies)
+
+    # Include dirs for headers
+    target_include_directories(appOpenLiveReplay PRIVATE
+        "${FFMPEG_IOS_DIR}/libavcodec.xcframework/ios-arm64/Headers"
+        "${FFMPEG_IOS_DIR}/libavformat.xcframework/ios-arm64/Headers"
+        "${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/Headers"
+        "${FFMPEG_IOS_DIR}/libswscale.xcframework/ios-arm64/Headers"
+        "${FFMPEG_IOS_DIR}/libswresample.xcframework/ios-arm64/Headers"
+    )
 
     # ==============================================================================
     # 5. LINK TO YOUR APP
@@ -110,12 +143,12 @@ if(IOS)
     add_dependencies(appOpenLiveReplay BuildFFmpegDependencies)
 
     target_link_libraries(appOpenLiveReplay PRIVATE
-        FFMPEG::avcodec
-        FFMPEG::avformat
-        FFMPEG::avutil
-        FFMPEG::swscale
-        FFMPEG::swresample
-        FFMPEG::srt
+        ffmpeg_avcodec
+        ffmpeg_avformat
+        ffmpeg_avutil
+        ffmpeg_swscale
+        ffmpeg_swresample
+        ffmpeg_srt
         "-framework AudioToolbox"
         "-framework CoreMIDI"
         "-framework CoreAudio"
@@ -127,9 +160,32 @@ if(IOS)
         "-lz" "-lbz2" "-liconv" "-lc++"
     )
 
+    # ==============================================================================
+    # 6. EMBED DYLIBS INTO APP BUNDLE (Xcode native embedding)
+    # ==============================================================================
     set_target_properties(appOpenLiveReplay PROPERTIES
         BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "@executable_path/Frameworks"
+        XCODE_EMBED_FRAMEWORKS
+            "${FFMPEG_IOS_DIR}/libavcodec.xcframework/ios-arm64/libavcodec.dylib;${FFMPEG_IOS_DIR}/libavformat.xcframework/ios-arm64/libavformat.dylib;${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/libavutil.dylib;${FFMPEG_IOS_DIR}/libswscale.xcframework/ios-arm64/libswscale.dylib;${FFMPEG_IOS_DIR}/libswresample.xcframework/ios-arm64/libswresample.dylib;rtmidi"
+        XCODE_EMBED_FRAMEWORKS_CODE_SIGN_ON_COPY TRUE
+    )
+
+    # Fix rtmidi: Xcode copies librtmidi.7.0.0.dylib but install name expects librtmidi.7.dylib
+    set(RTMIDI_FIX_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/fix_rtmidi_embed.sh")
+    file(WRITE "${RTMIDI_FIX_SCRIPT}" "#!/bin/bash
+FW_DIR=\"\${BUILT_PRODUCTS_DIR}/\${FRAMEWORKS_FOLDER_PATH}\"
+if [ -f \"\${FW_DIR}/librtmidi.7.0.0.dylib\" ] && [ ! -e \"\${FW_DIR}/librtmidi.7.dylib\" ]; then
+    cd \"\${FW_DIR}\"
+    mv librtmidi.7.0.0.dylib librtmidi.7.dylib
+fi
+")
+    set_target_properties(appOpenLiveReplay PROPERTIES
+        XCODE_ATTRIBUTE_OPENLIVEREPLAY_FIX_RTMIDI_EMBED "YES"
+    )
+    add_custom_command(TARGET appOpenLiveReplay POST_BUILD
+        COMMAND bash "${RTMIDI_FIX_SCRIPT}"
+        COMMENT "[rtmidi] Renaming librtmidi.7.0.0.dylib -> librtmidi.7.dylib in Frameworks"
     )
 
 elseif(APPLE) # macOS Desktop
