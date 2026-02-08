@@ -663,6 +663,14 @@ ApplicationWindow {
                             radius: 3
                         }
                     }
+
+                    handle: Rectangle {
+                        implicitWidth: 0
+                        implicitHeight: 0
+                        width: 0
+                        height: 0
+                        visible: false
+                    }
                 }
 
                 RowLayout {
