@@ -266,6 +266,12 @@ ApplicationWindow {
                     updateVisibleStreams()
                 }
 
+                onSelectedProviderChanged: {
+                    if (viewMode === "single" && selectedProvider) {
+                        selectedProvider.videoSink = singleOutput.videoSink
+                    }
+                }
+
                 Connections {
                     target: uiManager
                     function onPlaybackProvidersChanged() {

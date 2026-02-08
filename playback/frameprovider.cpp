@@ -28,6 +28,26 @@ void FrameProvider::setVideoSink(QVideoSink *sink)
         }
         emit videoSinkChanged();
         qDebug() << "C++: Video Sink successfully connected from QML";
+
+        // Push the last available frame immediately for fast switching
+        if (m_sink) {
+            QVideoFrame lastFrameCopy;
+            {
+                QMutexLocker locker(&m_frameMutex);
+                lastFrameCopy = m_lastFrame;
+            }
+            if (lastFrameCopy.isValid()) {
+                if (m_sink->thread() == QThread::currentThread()) {
+                    m_sink->setVideoFrame(lastFrameCopy);
+                } else {
+                    QPointer<QVideoSink> sinkPtr = m_sink;
+                    QVideoFrame copy = lastFrameCopy;
+                    QMetaObject::invokeMethod(m_sink, [sinkPtr, copy]() mutable {
+                        if (sinkPtr) sinkPtr->setVideoFrame(copy);
+                    }, Qt::QueuedConnection);
+                }
+            }
+        }
     }
 }
 
