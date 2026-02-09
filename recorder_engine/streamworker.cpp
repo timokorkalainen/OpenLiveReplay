@@ -202,14 +202,52 @@ void StreamWorker::captureLoop() {
 
         AVPacket* pkt = av_packet_alloc();
         AVFrame* rawFrame = av_frame_alloc();
-        if (!pkt || !rawFrame) {
+        AVFrame* audioFrame = av_frame_alloc();
+        if (!pkt || !rawFrame || !audioFrame) {
             qDebug() << "Source" << m_sourceIndex << "Failed to allocate packet/frame.";
             if (pkt) av_packet_free(&pkt);
             if (rawFrame) av_frame_free(&rawFrame);
+            if (audioFrame) av_frame_free(&audioFrame);
             avcodec_free_context(&decCtx);
             avformat_close_input(&inCtx);
             continue;
         }
+
+        // ── Audio decoder & resampler setup ─────────────────────────
+        int audioStreamIdx = -1;
+        AVCodecContext* audioDecCtx = nullptr;
+        SwrContext* swrCtx = nullptr;
+        {
+            const AVCodec* audioDecoder = nullptr;
+            int foundAudioIdx = av_find_best_stream(inCtx, AVMEDIA_TYPE_AUDIO, -1, -1, &audioDecoder, 0);
+            if (foundAudioIdx >= 0 && audioDecoder) {
+                audioDecCtx = avcodec_alloc_context3(audioDecoder);
+                avcodec_parameters_to_context(audioDecCtx, inCtx->streams[foundAudioIdx]->codecpar);
+                if (avcodec_open2(audioDecCtx, audioDecoder, nullptr) >= 0) {
+                    audioStreamIdx = foundAudioIdx;
+
+                    AVChannelLayout outLayout;
+                    av_channel_layout_default(&outLayout, 2);
+                    int ret = swr_alloc_set_opts2(&swrCtx,
+                        &outLayout, AV_SAMPLE_FMT_S16, 48000,
+                        &audioDecCtx->ch_layout, audioDecCtx->sample_fmt, audioDecCtx->sample_rate,
+                        0, nullptr);
+                    av_channel_layout_uninit(&outLayout);
+                    if (ret < 0 || swr_init(swrCtx) < 0) {
+                        if (swrCtx) swr_free(&swrCtx);
+                        swrCtx = nullptr;
+                        qDebug() << "Source" << m_sourceIndex << "Failed to init audio resampler";
+                    } else {
+                        qDebug() << "Source" << m_sourceIndex << "Audio: rate=" << audioDecCtx->sample_rate
+                                 << "ch=" << audioDecCtx->ch_layout.nb_channels << "→ 48000 Hz stereo";
+                    }
+                } else {
+                    avcodec_free_context(&audioDecCtx);
+                    audioDecCtx = nullptr;
+                }
+            }
+        }
+        int64_t containerStartMs = -1; // ms offset of the first video DTS
 
         int firstSourcePts = -1;
         int64_t anchorStreamTimeMs = -1;
@@ -236,6 +274,8 @@ void StreamWorker::captureLoop() {
                         firstPacketDts = pktDts;
                         // Where are we in the global recording right now?
                         anchorStreamTimeMs = m_sharedClock->elapsedMs();
+                        containerStartMs = av_rescale_q(pktDts,
+                            inCtx->streams[videoStreamIdx]->time_base, {1, 1000});
                     }
 
                     if (avcodec_send_packet(decCtx, pkt) >= 0) {
@@ -286,6 +326,66 @@ void StreamWorker::captureLoop() {
                         }
                     }
                 }
+                // ── Audio packet handling ───────────────────────────────
+                else if (pkt->stream_index == audioStreamIdx && swrCtx && audioDecCtx
+                         && anchorStreamTimeMs >= 0) {
+                    if (avcodec_send_packet(audioDecCtx, pkt) >= 0) {
+                        while (avcodec_receive_frame(audioDecCtx, audioFrame) >= 0) {
+                            int64_t aFramePts = audioFrame->pts;
+                            if (aFramePts == AV_NOPTS_VALUE)
+                                aFramePts = audioFrame->best_effort_timestamp;
+                            if (aFramePts == AV_NOPTS_VALUE) {
+                                av_frame_unref(audioFrame);
+                                continue;
+                            }
+
+                            int64_t audioMs = av_rescale_q(aFramePts,
+                                inCtx->streams[audioStreamIdx]->time_base, {1, 1000});
+                            int64_t relMs = audioMs - containerStartMs;
+                            int64_t recPtsMs = anchorStreamTimeMs + relMs;
+                            if (recPtsMs < 0) { av_frame_unref(audioFrame); continue; }
+
+                            // Resample to 48 kHz stereo S16
+                            int outSamples = av_rescale_rnd(
+                                swr_get_delay(swrCtx, audioDecCtx->sample_rate) + audioFrame->nb_samples,
+                                48000, audioDecCtx->sample_rate, AV_ROUND_UP);
+                            int outBufSize = av_samples_get_buffer_size(
+                                nullptr, 2, outSamples, AV_SAMPLE_FMT_S16, 0);
+                            uint8_t* outBuffer = (uint8_t*)av_malloc(outBufSize);
+                            uint8_t* outBuf[1] = { outBuffer };
+
+                            int converted = swr_convert(swrCtx,
+                                outBuf, outSamples,
+                                (const uint8_t**)audioFrame->extended_data, audioFrame->nb_samples);
+
+                            if (converted > 0) {
+                                int track = m_viewTrack.load(std::memory_order_relaxed);
+                                if (track >= 0) {
+                                    int audioTrackIdx = m_muxer->audioTrackOffset() + track;
+                                    int dataSize = converted * 2 * int(sizeof(int16_t));
+
+                                    AVPacket* audioPkt = av_packet_alloc();
+                                    av_new_packet(audioPkt, dataSize);
+                                    memcpy(audioPkt->data, outBuffer, dataSize);
+
+                                    audioPkt->stream_index = audioTrackIdx;
+                                    AVStream* st = m_muxer->getStream(audioTrackIdx);
+                                    if (st) {
+                                        audioPkt->pts = av_rescale_q(recPtsMs, {1, 1000}, st->time_base);
+                                        audioPkt->dts = audioPkt->pts;
+                                        audioPkt->duration = av_rescale_q(converted,
+                                            {1, 48000}, st->time_base);
+                                    }
+                                    m_muxer->writePacket(audioPkt);
+                                    av_packet_free(&audioPkt);
+                                }
+                            }
+
+                            av_freep(&outBuffer);
+                            av_frame_unref(audioFrame);
+                        }
+                    }
+                }
                 av_packet_unref(pkt);
             } else if (readResult == AVERROR(EAGAIN)) {
                 if (m_connected && m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) {
@@ -308,14 +408,30 @@ void StreamWorker::captureLoop() {
         // CLEANUP INSIDE LOOP: Critical to prevent memory leaks on swap
         av_packet_free(&pkt);
         av_frame_free(&rawFrame);
+        av_frame_free(&audioFrame);
+
+        // Flush any remaining samples from the resampler
+        if (swrCtx) {
+            int flushed = 1;
+            while (flushed > 0) {
+                uint8_t* flushBuf = (uint8_t*)av_malloc(4096);
+                uint8_t* flushBufs[1] = { flushBuf };
+                flushed = swr_convert(swrCtx, flushBufs, 1024, nullptr, 0);
+                av_freep(&flushBuf);
+            }
+        }
 
         // Detach the slow network close to a background thread.
         // avformat_close_input can block for seconds (SRT linger, RTMP
         // teardown), and protocol libraries may hold global locks that
         // stall OTHER workers' av_read_frame calls.
         AVCodecContext* decToFree = decCtx;
+        AVCodecContext* audioDecToFree = audioDecCtx;
+        SwrContext* swrToFree = swrCtx;
         AVFormatContext* fmtToClose = inCtx;
         decCtx = nullptr;
+        audioDecCtx = nullptr;
+        swrCtx = nullptr;
         inCtx = nullptr;
         if (fmtToClose) {
             // Install a static always-interrupt callback so the async close
@@ -326,8 +442,10 @@ void StreamWorker::captureLoop() {
             fmtToClose->interrupt_callback.callback = [](void*) -> int { return 1; };
             fmtToClose->interrupt_callback.opaque = nullptr;
         }
-        QThreadPool::globalInstance()->start([decToFree, fmtToClose]() mutable {
+        QThreadPool::globalInstance()->start([decToFree, audioDecToFree, swrToFree, fmtToClose]() mutable {
             if (decToFree) avcodec_free_context(&decToFree);
+            if (audioDecToFree) avcodec_free_context(&audioDecToFree);
+            if (swrToFree) swr_free(&swrToFree);
             if (fmtToClose) avformat_close_input(&fmtToClose);
         });
 

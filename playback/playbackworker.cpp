@@ -2,11 +2,13 @@
 #include <QDebug>
 #include <QMutexLocker>
 
-PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport, QObject *parent)
+PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport,
+                               AudioPlayer *audioPlayer, QObject *parent)
     : QThread(parent)
 {
     m_transport = transport;
     m_providers = providers;
+    m_audioPlayer = audioPlayer;
 }
 
 PlaybackWorker::~PlaybackWorker() {
@@ -14,6 +16,10 @@ PlaybackWorker::~PlaybackWorker() {
     for (auto* track : m_decoderBank) {
         if (track->codecCtx) avcodec_free_context(&track->codecCtx);
         delete track;
+    }
+    for (auto* aTrack : m_audioDecoderBank) {
+        if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+        delete aTrack;
     }
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
 }
@@ -31,6 +37,11 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
 void PlaybackWorker::setFrameBufferMax(int maxFrames) {
     QMutexLocker bufferLocker(&m_bufferMutex);
     m_frameBufferMax = qMax(1, maxFrames);
+}
+
+void PlaybackWorker::setActiveAudioView(int viewIndex) {
+    m_activeAudioView.store(viewIndex, std::memory_order_relaxed);
+    if (m_audioPlayer) m_audioPlayer->clear();
 }
 
 void PlaybackWorker::stop() {
@@ -71,6 +82,11 @@ void PlaybackWorker::run() {
         }
         m_decoderBank.clear();
         m_streamMap.clear();
+        for (auto* aTrack : m_audioDecoderBank) {
+            if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+            delete aTrack;
+        }
+        m_audioDecoderBank.clear();
     };
 
     // --- 1. OPENING & INITIALIZATION (retry until tracks available or stop) ---
@@ -140,6 +156,37 @@ void PlaybackWorker::run() {
             }
         }
 
+        // Also detect audio streams (paired with video by order)
+        int audioViewIdx = 0;
+        for (unsigned int i = 0; i < m_fmtCtx->nb_streams; i++) {
+            AVCodecParameters* codecParams = m_fmtCtx->streams[i]->codecpar;
+            if (codecParams->codec_type == AVMEDIA_TYPE_AUDIO) {
+                const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+                if (!codec) { audioViewIdx++; continue; }
+
+                AVCodecContext* ctx = avcodec_alloc_context3(codec);
+                if (!ctx) { audioViewIdx++; continue; }
+                avcodec_parameters_to_context(ctx, codecParams);
+                ctx->thread_count = 0;
+
+                if (avcodec_open2(ctx, codec, nullptr) < 0) {
+                    avcodec_free_context(&ctx);
+                    audioViewIdx++;
+                    continue;
+                }
+
+                AudioDecoderTrack* aTrack = new AudioDecoderTrack();
+                aTrack->streamIndex = i;
+                aTrack->codecCtx = ctx;
+                aTrack->viewIndex = audioViewIdx;
+                m_audioDecoderBank.append(aTrack);
+
+                qDebug() << "Worker: Initialized Audio Decoder for Stream" << i
+                         << "view" << audioViewIdx;
+                audioViewIdx++;
+            }
+        }
+
         if (!m_decoderBank.isEmpty()) break;
 
         qDebug() << "PlaybackWorker: No video tracks yet. Retrying...";
@@ -154,6 +201,7 @@ void PlaybackWorker::run() {
     }
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
+    AVFrame* audioFrame = av_frame_alloc();
 
     int64_t lastProcessedPtsMs = -1;
     m_seekTargetMs = -1;
@@ -183,6 +231,10 @@ void PlaybackWorker::run() {
             for(auto* track : m_decoderBank) {
                 if(track->codecCtx) avcodec_flush_buffers(track->codecCtx);
             }
+            for (auto* aTrack : m_audioDecoderBank) {
+                if (aTrack->codecCtx) avcodec_flush_buffers(aTrack->codecCtx);
+            }
+            if (m_audioPlayer) m_audioPlayer->clear();
 
             // Clear stale frames from the buffer to prevent visual artifacts
             {
@@ -301,6 +353,31 @@ void PlaybackWorker::run() {
                     break;
                 }
             }
+
+            // --- AUDIO DECODE: deliver to AudioPlayer for the active view ---
+            int activeView = m_activeAudioView.load(std::memory_order_relaxed);
+            if (activeView >= 0 && m_audioPlayer) {
+                for (auto* aTrack : m_audioDecoderBank) {
+                    if (pkt->stream_index == aTrack->streamIndex && aTrack->viewIndex == activeView) {
+                        // Only play audio at normal speed (±1%)
+                        double spd = m_transport->speed();
+                        bool normalSpeed = (spd > 0.99 && spd < 1.01);
+                        if (normalSpeed && m_transport->isPlaying()) {
+                            if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
+                                while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
+                                    int dataSize = audioFrame->nb_samples
+                                                   * audioFrame->ch_layout.nb_channels
+                                                   * int(sizeof(int16_t));
+                                    m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                                    av_frame_unref(audioFrame);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
             av_packet_unref(pkt);
         }
         else if (readResult == AVERROR_EOF) {
@@ -317,6 +394,7 @@ void PlaybackWorker::run() {
     // --- 6. CLEANUP ---
     av_packet_free(&pkt);
     av_frame_free(&frame);
+    av_frame_free(&audioFrame);
     clearDecoders();
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
 }

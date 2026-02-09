@@ -22,6 +22,7 @@ extern "C" {
     #include <libavutil/time.h>
     #include <libavutil/error.h>
     #include <libswscale/swscale.h>
+    #include <libswresample/swresample.h>
 }
 
 class StreamWorker : public QThread {

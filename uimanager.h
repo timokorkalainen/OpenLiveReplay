@@ -14,6 +14,7 @@
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
 #include "playback/playbacktransport.h"
+#include "playback/audioplayer.h"
 #include "midi/midimanager.h"
 
 class QScreen;
@@ -211,6 +212,7 @@ private:
     PlaybackWorker* m_playbackWorker = nullptr;
     QList<FrameProvider*> m_providers;
     PlaybackTransport *m_transport;
+    AudioPlayer *m_audioPlayer = nullptr;
     bool m_followLive = false;
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;

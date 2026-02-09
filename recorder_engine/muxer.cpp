@@ -7,7 +7,8 @@ Muxer::Muxer() {}
 
 Muxer::~Muxer() { close(); }
 
-bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames) {
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
+                 int audioSampleRate, int audioChannels) {
     QMutexLocker locker(&m_mutex);
 
     if (width <= 0) width = 1920;
@@ -47,11 +48,29 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         av_dict_set(&st->metadata, "title", trackTitle.toUtf8().constData(), 0);
     }
 
-    // 2b. Add one subtitle track per video track for per-frame source metadata
-    m_subtitleTrackOffset = videoTrackCount;
+    // 2a. Add one audio track per video track (PCM S16LE, 48 kHz stereo)
+    m_audioTrackOffset = videoTrackCount;
     for (int i = 0; i < videoTrackCount; i++) {
         AVStream* st = avformat_new_stream(m_outCtx, nullptr);
         st->id = videoTrackCount + i;
+        st->codecpar->codec_id    = AV_CODEC_ID_PCM_S16LE;
+        st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->sample_rate = audioSampleRate;
+        st->codecpar->format      = AV_SAMPLE_FMT_S16;
+        st->codecpar->bit_rate    = audioSampleRate * audioChannels * 16;
+        st->codecpar->frame_size  = 0; // PCM has no fixed frame size
+        av_channel_layout_default(&st->codecpar->ch_layout, audioChannels);
+        st->time_base = {1, 1000};
+
+        const QString audioTitle = QString("Track %1 Audio").arg(i + 1);
+        av_dict_set(&st->metadata, "title", audioTitle.toUtf8().constData(), 0);
+    }
+
+    // 2b. Add one subtitle track per video track for per-frame source metadata
+    m_subtitleTrackOffset = videoTrackCount * 2;
+    for (int i = 0; i < videoTrackCount; i++) {
+        AVStream* st = avformat_new_stream(m_outCtx, nullptr);
+        st->id = m_subtitleTrackOffset + i;
         st->codecpar->codec_id    = AV_CODEC_ID_TEXT;
         st->codecpar->codec_type  = AVMEDIA_TYPE_SUBTITLE;
         st->time_base = {1, 1000};

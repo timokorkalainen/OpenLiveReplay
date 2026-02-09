@@ -19,12 +19,14 @@ public:
     Muxer();
     ~Muxer();
 
-    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames);
+    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
+             int audioSampleRate = 48000, int audioChannels = 2);
     void writePacket(AVPacket* pkt);
     void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     AVStream* getStream(int index);
     void close();
 
+    int audioTrackOffset() const { return m_audioTrackOffset; }
     int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
 
     QString getVideoPath(QString fileName);
@@ -34,6 +36,7 @@ private:
     QMap<int, int64_t>* m_lastDts;
     QMutex m_mutex;
     bool m_initialized = false;
+    int m_audioTrackOffset = 0;     // Index of first audio track
     int m_subtitleTrackOffset = 0;  // Index of first subtitle track
 };
 

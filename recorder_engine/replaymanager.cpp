@@ -233,6 +233,27 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         m_muxer->writePacket(pkt);
         av_packet_free(&pkt);
 
+        // Write silence audio for unmapped views (PCM S16LE zero-fill)
+        {
+            const int silenceSamples = 48000 / m_fps;
+            const int silenceBytes = silenceSamples * 2 * int(sizeof(int16_t)); // stereo
+            int audioTrackIdx = m_muxer->audioTrackOffset() + v;
+            AVPacket* aPkt = av_packet_alloc();
+            if (aPkt) {
+                av_new_packet(aPkt, silenceBytes);
+                memset(aPkt->data, 0, silenceBytes);
+                aPkt->stream_index = audioTrackIdx;
+                AVStream* aSt = m_muxer->getStream(audioTrackIdx);
+                if (aSt) {
+                    aPkt->pts = av_rescale_q(elapsedMs, {1, 1000}, aSt->time_base);
+                    aPkt->dts = aPkt->pts;
+                    aPkt->duration = av_rescale_q(silenceSamples, {1, 48000}, aSt->time_base);
+                }
+                m_muxer->writePacket(aPkt);
+                av_packet_free(&aPkt);
+            }
+        }
+
         // Write an empty metadata subtitle for unmapped views
         static const QByteArray emptyMeta("{}");
         m_muxer->writeMetadataPacket(v, elapsedMs, emptyMeta);
