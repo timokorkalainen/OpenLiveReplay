@@ -11,14 +11,14 @@ Provide a reliable, low-latency platform for recording and replaying multiple ca
 
 **Project status:**
 - Prototype stage. Core functionality implemented.
-- macOS and iOS builds are available and functional.
+- MacOS and iOS builds are functional via automated CMake based pipeline.
 - SRT-based recording has been found reliable in testing; project is approaching MVP readiness.
 
 **Key features:**
 - Multi-track synchronized recording (video only)
 - Low-latency ingest and replay pipeline
-- Support for SRT streaming and local muxing
-- Modular playback and recording components for easy integration
+- Support for SRT and RMPT streams, local recording and screenshotting
+- MIDI controller support, tested with Behringer X-Touch One
 
 Getting started
 -------------
