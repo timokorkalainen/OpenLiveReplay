@@ -26,6 +26,25 @@ void AudioRingBuffer::clear() {
     m_buf.clear();
 }
 
+void AudioRingBuffer::fadeOutAndClear(int channels) {
+    QMutexLocker locker(&m_mutex);
+    if (m_buf.isEmpty()) return;
+
+    // Keep at most ~5 ms of audio for the fade-out tail (240 samples @ 48 kHz)
+    const int kFadeSamples = 240 * channels;  // per-channel pairs
+    const int kFadeBytes   = kFadeSamples * int(sizeof(int16_t));
+
+    if (m_buf.size() > kFadeBytes)
+        m_buf = m_buf.left(kFadeBytes);  // trim to just what's next to play
+
+    int16_t* samples = reinterpret_cast<int16_t*>(m_buf.data());
+    int nSamples = m_buf.size() / int(sizeof(int16_t));
+    for (int i = 0; i < nSamples; ++i) {
+        double gain = 1.0 - double(i) / double(nSamples);
+        samples[i] = int16_t(samples[i] * gain);
+    }
+}
+
 qint64 AudioRingBuffer::bytesAvailable() const {
     QMutexLocker locker(&m_mutex);
     return m_buf.size() + QIODevice::bytesAvailable();
@@ -122,21 +141,46 @@ void AudioPlayer::stop() {
 void AudioPlayer::pushSamples(const uint8_t *data, int numBytes) {
     QMutexLocker locker(&m_mutex);
     if (!m_started || m_muted || !m_ringBuffer || numBytes <= 0) return;
-    m_ringBuffer->push(reinterpret_cast<const char*>(data), numBytes);
+
+    // Apply a short linear fade-in ramp after unmute / view switch
+    // to eliminate the click from an abrupt sample transition.
+    if (m_fadeInRemaining > 0) {
+        // Work on a mutable copy so we don't alter the caller's buffer
+        QByteArray tmp(reinterpret_cast<const char*>(data), numBytes);
+        int16_t* samples = reinterpret_cast<int16_t*>(tmp.data());
+        int totalSamples = numBytes / int(sizeof(int16_t));
+        for (int i = 0; i < totalSamples && m_fadeInRemaining > 0; ++i, --m_fadeInRemaining) {
+            // Per-channel sample index in the fade ramp
+            int rampPos = kFadeInSamples * m_channels - m_fadeInRemaining;
+            double gain = double(rampPos) / double(kFadeInSamples * m_channels);
+            samples[i] = int16_t(samples[i] * gain);
+        }
+        m_ringBuffer->push(tmp.constData(), numBytes);
+    } else {
+        m_ringBuffer->push(reinterpret_cast<const char*>(data), numBytes);
+    }
 }
 
 void AudioPlayer::clear() {
     QMutexLocker locker(&m_mutex);
     if (m_ringBuffer) {
-        m_ringBuffer->clear();
+        m_ringBuffer->fadeOutAndClear(m_channels);
     }
+    // Re-arm fade-in so the next samples after a clear get ramped
+    m_fadeInRemaining = kFadeInSamples * m_channels;
 }
 
 void AudioPlayer::setMuted(bool muted) {
     QMutexLocker locker(&m_mutex);
+    bool wasM = m_muted;
     m_muted = muted;
     if (muted && m_ringBuffer) {
         m_ringBuffer->clear();
+    }
+    // Arm fade-in ramp when transitioning from muted → unmuted
+    if (wasM && !muted) {
+        m_fadeInRemaining = kFadeInSamples * m_channels;
+        if (m_ringBuffer) m_ringBuffer->clear();
     }
 }
 

@@ -24,6 +24,9 @@ public:
     /// Discard all buffered data.
     void clear();
 
+    /// Apply a short fade-out to remaining data, then discard the rest.
+    void fadeOutAndClear(int channels);
+
     // QIODevice sequential interface
     bool isSequential() const override { return true; }
     qint64 bytesAvailable() const override;
@@ -77,6 +80,8 @@ private:
     bool m_started = false;
     int  m_sampleRate = 48000;
     int  m_channels   = 2;
+    int  m_fadeInRemaining = 0;      // samples remaining in fade-in ramp
+    static constexpr int kFadeInSamples = 480;  // 10 ms @ 48 kHz
 };
 
 #endif // AUDIOPLAYER_H

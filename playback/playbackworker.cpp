@@ -40,7 +40,14 @@ void PlaybackWorker::setFrameBufferMax(int maxFrames) {
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
-    m_activeAudioView.store(viewIndex, std::memory_order_relaxed);
+    int prev = m_activeAudioView.exchange(viewIndex, std::memory_order_relaxed);
+    if (prev == viewIndex) return;   // no actual change
+
+    // Clear the ring buffer so stale samples from the old view don't
+    // bleed into the new one.  We do NOT flush the codec contexts here:
+    // they live on the worker thread and flushing from the UI thread is
+    // a data race.  Instead, all decoders run continuously (see run()),
+    // so the new view's decoder is already warm and ready.
     if (m_audioPlayer) m_audioPlayer->clear();
 }
 
@@ -207,8 +214,16 @@ void PlaybackWorker::run() {
     m_seekTargetMs = -1;
 
     while (m_running) {
+
         // --- 2. GET MASTER TIME FROM TRANSPORT ---
         int64_t masterTimeMs = m_transport->currentPos();
+
+        // --- PAUSE HANDLING ---
+        // If playback is paused, block here until resumed.
+        while (m_running && !m_transport->isPlaying()) {
+            msleep(10);
+            masterTimeMs = m_transport->currentPos();
+        }
 
         // --- 3. CHECK FOR EXTERNAL SEEK (SCRUBBING) ---
         // If the master clock is far away from our last frame, trigger a hard seek
@@ -295,6 +310,31 @@ void PlaybackWorker::run() {
                             break;
                         }
                     }
+
+                    // Also keep audio decoders warm during burst (discard output)
+                    for (auto* aTrack : m_audioDecoderBank) {
+                        if (pkt->stream_index == aTrack->streamIndex) {
+                            if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
+                                while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
+                                    // If this is the active audio view, push to the ring buffer
+                                    int activeView = m_activeAudioView.load(std::memory_order_relaxed);
+                                    if (activeView == aTrack->viewIndex && m_audioPlayer) {
+                                        double spd = m_transport->speed();
+                                        bool normalSpeed = (spd > 0.99 && spd < 1.01);
+                                        if (normalSpeed && m_transport->isPlaying()) {
+                                            int dataSize = audioFrame->nb_samples
+                                                           * audioFrame->ch_layout.nb_channels
+                                                           * int(sizeof(int16_t));
+                                            m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                                        }
+                                    }
+                                    av_frame_unref(audioFrame);
+                                }
+                            }
+                            break;
+                        }
+                    }
+
                     av_packet_unref(pkt);
                 }
 
@@ -302,19 +342,20 @@ void PlaybackWorker::run() {
                 deliverBufferedFrameAtOrBefore(target);
             }
 
+            // Reset to the seek target so the pace control doesn't see
+            // the burst-decoded PTS (which is ~1 s ahead) and gate audio.
+            lastProcessedPtsMs = target;
+
             continue;
         }
 
         m_mutex.unlock();
 
-        // --- 4. PACE CONTROL (SYNC) ---
-        // If our last frame is in the future compared to the Master Clock, wait.
-        if (lastProcessedPtsMs > masterTimeMs) {
-            msleep(5); // Smallest sleep to remain responsive to transport changes
-            continue;
-        }
-
-        // --- 5. READ & DECODE ---
+        // --- 4. & 5. READ & DECODE ---
+        // Always read packets — video and audio are interleaved in the MKV,
+        // so blocking the read loop to pace video also starves audio.
+        // Video frames are buffered; the existing buffer-cap prevents runaway
+        // memory.  Pace control (sleep) happens AFTER the read, not before it.
         int readResult = av_read_frame(m_fmtCtx, pkt);
 
         if (readResult >= 0) {
@@ -354,28 +395,30 @@ void PlaybackWorker::run() {
                 }
             }
 
-            // --- AUDIO DECODE: deliver to AudioPlayer for the active view ---
-            int activeView = m_activeAudioView.load(std::memory_order_relaxed);
-            if (activeView >= 0 && m_audioPlayer) {
-                for (auto* aTrack : m_audioDecoderBank) {
-                    if (pkt->stream_index == aTrack->streamIndex && aTrack->viewIndex == activeView) {
-                        // Only play audio at normal speed (±1%)
-                        double spd = m_transport->speed();
-                        bool normalSpeed = (spd > 0.99 && spd < 1.01);
-                        if (normalSpeed && m_transport->isPlaying()) {
-                            if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
-                                while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
-                                    int dataSize = audioFrame->nb_samples
-                                                   * audioFrame->ch_layout.nb_channels
-                                                   * int(sizeof(int16_t));
-                                    m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
-                                    av_frame_unref(audioFrame);
-                                }
+            // --- AUDIO DECODE: keep ALL decoders running, route active view ---
+            // Decoding every audio stream continuously (PCM = near-zero cost)
+            // ensures that switching views is instant — no cold-start gap.
+            for (auto* aTrack : m_audioDecoderBank) {
+                if (pkt->stream_index != aTrack->streamIndex) continue;
+
+                if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
+                    while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
+                        // Only push to speaker if this is the selected view
+                        int activeView = m_activeAudioView.load(std::memory_order_relaxed);
+                        if (activeView == aTrack->viewIndex && m_audioPlayer) {
+                            double spd = m_transport->speed();
+                            bool normalSpeed = (spd > 0.99 && spd < 1.01);
+                            if (normalSpeed && m_transport->isPlaying()) {
+                                int dataSize = audioFrame->nb_samples
+                                               * audioFrame->ch_layout.nb_channels
+                                               * int(sizeof(int16_t));
+                                m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
                             }
                         }
-                        break;
+                        av_frame_unref(audioFrame);
                     }
                 }
+                break;  // packet matched this track, no need to check others
             }
 
             av_packet_unref(pkt);
@@ -388,6 +431,17 @@ void PlaybackWorker::run() {
             }
             msleep(10);
             avformat_flush(m_fmtCtx);
+        }
+
+        // --- PACE CONTROL ---
+        // Throttle when we've decoded well ahead of the master clock.
+        // This MUST happen after reading/decoding so that audio packets
+        // (interleaved with video in the MKV) are never starved.
+        // The 100 ms margin keeps the audio ring buffer healthy — without
+        // it, the pace gate starves audio delivery and causes underruns
+        // (audible as a rattle after seek).
+        if (lastProcessedPtsMs > masterTimeMs + 100) {
+            msleep(5);
         }
     }
 
