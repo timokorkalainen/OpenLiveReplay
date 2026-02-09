@@ -226,12 +226,28 @@ void StreamWorker::captureLoop() {
                 if (avcodec_open2(audioDecCtx, audioDecoder, nullptr) >= 0) {
                     audioStreamIdx = foundAudioIdx;
 
+                    // Always output stereo: mono → duplicate, >2ch → first two
                     AVChannelLayout outLayout;
                     av_channel_layout_default(&outLayout, 2);
+
+                    // If input is mono, set mapping to duplicate channel
+                    int* chMap = nullptr;
+                    if (audioDecCtx->ch_layout.nb_channels == 1) {
+                        chMap = (int*)av_malloc(2 * sizeof(int));
+                        chMap[0] = 0; // L
+                        chMap[1] = 0; // R
+                    } else if (audioDecCtx->ch_layout.nb_channels > 2) {
+                        chMap = (int*)av_malloc(2 * sizeof(int));
+                        chMap[0] = 0; // L = first channel
+                        chMap[1] = 1; // R = second channel
+                    }
+
                     int ret = swr_alloc_set_opts2(&swrCtx,
                         &outLayout, AV_SAMPLE_FMT_S16, 48000,
                         &audioDecCtx->ch_layout, audioDecCtx->sample_fmt, audioDecCtx->sample_rate,
                         0, nullptr);
+                    if (chMap && swrCtx) swr_set_channel_mapping(swrCtx, chMap);
+                    if (chMap) av_free(chMap);
                     av_channel_layout_uninit(&outLayout);
                     if (ret < 0 || swr_init(swrCtx) < 0) {
                         if (swrCtx) swr_free(&swrCtx);
