@@ -33,6 +33,7 @@ struct DecoderTrack {
     FrameProvider* provider = nullptr;
     int streamIndex = -1;
     QVector<BufferedFrame> buffer;
+    int64_t lastDeliveredPtsMs = -1;   // last frame released to the provider
 };
 
 struct AudioDecoderTrack {
@@ -51,6 +52,7 @@ public:
     void openFile(const QString &filePath);
     void seekTo(int64_t timestampMs);
     bool deliverBufferedFrameAtOrBefore(int64_t targetMs);
+    void deliverDueFrames(int64_t masterTimeMs);
     void setFrameBufferMax(int maxFrames);
     void setActiveAudioView(int viewIndex);
     void stop();
