@@ -322,10 +322,7 @@ void PlaybackWorker::run() {
                                         double spd = m_transport->speed();
                                         bool normalSpeed = (spd > 0.99 && spd < 1.01);
                                         if (normalSpeed && m_transport->isPlaying()) {
-                                            int dataSize = audioFrame->nb_samples
-                                                           * audioFrame->ch_layout.nb_channels
-                                                           * int(sizeof(int16_t));
-                                            m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                                            pushAudioFrame(aTrack, audioFrame);
                                         }
                                     }
                                     av_frame_unref(audioFrame);
@@ -409,10 +406,7 @@ void PlaybackWorker::run() {
                             double spd = m_transport->speed();
                             bool normalSpeed = (spd > 0.99 && spd < 1.01);
                             if (normalSpeed && m_transport->isPlaying()) {
-                                int dataSize = audioFrame->nb_samples
-                                               * audioFrame->ch_layout.nb_channels
-                                               * int(sizeof(int16_t));
-                                m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                                pushAudioFrame(aTrack, audioFrame);
                             }
                         }
                         av_frame_unref(audioFrame);
@@ -451,6 +445,35 @@ void PlaybackWorker::run() {
     av_frame_free(&audioFrame);
     clearDecoders();
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
+}
+
+void PlaybackWorker::pushAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame) {
+    // The app's recordings carry PCM S16LE 48 kHz stereo; anything else
+    // would need resampling before it can go to the audio device.
+    if (audioFrame->format != AV_SAMPLE_FMT_S16
+        || audioFrame->sample_rate != 48000
+        || audioFrame->ch_layout.nb_channels != 2) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            qWarning() << "PlaybackWorker: unsupported audio frame format"
+                       << audioFrame->format << audioFrame->sample_rate
+                       << audioFrame->ch_layout.nb_channels;
+        }
+        return;
+    }
+
+    int64_t pts = audioFrame->pts;
+    if (pts == AV_NOPTS_VALUE) pts = audioFrame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) return;
+
+    const AVRational tb = m_fmtCtx->streams[aTrack->streamIndex]->time_base;
+    const int64_t ptsMs = av_rescale_q(pts, tb, {1, 1000});
+    const int dataSize = audioFrame->nb_samples
+                         * audioFrame->ch_layout.nb_channels
+                         * int(sizeof(int16_t));
+    m_audioPlayer->pushSamples(audioFrame->data[0], dataSize,
+                               ptsMs, m_transport->currentPos());
 }
 
 bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
