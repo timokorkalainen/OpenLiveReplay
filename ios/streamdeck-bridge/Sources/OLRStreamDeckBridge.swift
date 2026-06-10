@@ -3,6 +3,7 @@ import UIKit
 
 /// Objective-C facade consumed by the Qt app (streamdeck/streamdeckmanager.mm).
 /// No Swift types cross this boundary.
+@MainActor
 @objc(OLRStreamDeckBridge)
 public final class OLRStreamDeckBridge: NSObject {
 
