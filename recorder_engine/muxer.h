@@ -30,8 +30,14 @@ public:
     int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
 
     QString getVideoPath(QString fileName);
+
+    // Test seam: override the base directory for output files. When empty
+    // (the default) getVideoPath() uses the platform Documents location.
+    void setOutputBaseDir(const QString& dir) { m_outputBaseDir = dir; }
+
 private:
     AVFormatContext* m_outCtx = nullptr;
+    QString m_outputBaseDir; // empty -> platform Documents location
     // Track the last timestamp for each stream to ensure they always increase
     QMap<int, int64_t>* m_lastDts;
     QMutex m_mutex;

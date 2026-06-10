@@ -56,6 +56,10 @@ int main(int argc, char** argv) {
     rm.setFps(fps);
 
     rm.startRecording();
+    if (!rm.isRecording()) {
+        fprintf(stderr, "record_harness: startRecording() failed (engine not recording)\n");
+        return 4;
+    }
     // Map view 0 -> source 0 (must happen after the workers exist).
     rm.updateViewMapping({0});
 

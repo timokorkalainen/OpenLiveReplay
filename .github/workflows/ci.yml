@@ -65,8 +65,12 @@ jobs:
           SDK="$(xcrun --show-sdk-path)"
           base="${{ github.event.pull_request.base.sha }}"
           [ -z "$base" ] && base="${{ github.event.before }}"
-          [ -z "$base" ] && base="HEAD~1"
-          files=$(git diff --name-only "$base"...HEAD -- \
+          # All-zeros SHA (new branch) or an unreachable base -> diff vs parent.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          files=$(git diff --name-only "$base" HEAD -- \
                     'recorder_engine/*.cpp' 'playback/*.cpp' \
                     'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)
           if [ -z "$files" ]; then echo "No first-party C++ changes."; exit 0; fi
@@ -91,22 +95,35 @@ jobs:
           host: mac
           target: desktop
           arch: clang_64
+          modules: qtmultimedia   # Main.qml imports QtMultimedia (VideoOutput)
           cache: true
 
-      - name: clang-format (changed C++ files)
+      - name: clang-format (changed lines)
         run: |
-          # Use Xcode's clang-format so CI matches the developer toolchain.
-          CF="$(xcrun -f clang-format)"
+          # Homebrew LLVM clang-format (Xcode does not reliably ship clang-format);
+          # committed sources are formatted with the same tool. Only the lines
+          # changed in this PR are checked (git-clang-format), so pre-existing
+          # formatting in a touched file is not retroactively enforced.
+          brew install llvm
+          PREFIX="$(brew --prefix llvm)"
+          CF="$PREFIX/bin/clang-format"
+          GCF="$PREFIX/bin/git-clang-format"
           "$CF" --version
           base="${{ github.event.pull_request.base.sha }}"
           [ -z "$base" ] && base="${{ github.event.before }}"
-          [ -z "$base" ] && base="HEAD~1"
-          files=$(git diff --name-only "$base"...HEAD -- \
-                    '*.cpp' '*.h' '*.hpp' '*.mm' \
-                    | grep -vE '^(build|ios_build)/' || true)
-          if [ -z "$files" ]; then echo "No C++ changes to format-check."; exit 0; fi
-          echo "$files"
-          "$CF" --dry-run --Werror $files
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          diff="$("$GCF" --binary "$CF" --commit "$base" --diff --extensions cpp,h,hpp,mm,c || true)"
+          case "$diff" in
+            "no modified files to format"|"clang-format did not modify any files"|"")
+              echo "clang-format: changed lines OK" ;;
+            *)
+              echo "$diff"
+              echo "::error::clang-format violations in changed lines (run: git clang-format $base)"
+              exit 1 ;;
+          esac
 
       - name: qmllint
         run: |
@@ -189,6 +206,10 @@ jobs:
           modules: qtmultimedia
           cache: true
 
+      # Capture the desktop Qt root before the iOS install overwrites QT_ROOT_DIR.
+      - name: Save host Qt path
+        run: echo "QT_HOST_DIR=$QT_ROOT_DIR" >> "$GITHUB_ENV"
+
       - name: Install Qt (iOS)
         uses: jurplel/install-qt-action@v4
         with:
@@ -208,9 +229,11 @@ jobs:
           key: ios-ffmpeg-${{ hashFiles('build-scripts/build_ffmpeg_ios_srt.sh') }}
 
       - name: Configure (iOS)
+        # After the iOS install, QT_ROOT_DIR points at the iOS kit (its qt-cmake);
+        # QT_HOST_DIR (saved above) is the desktop kit used for host tools.
         run: >
-          "$IOS_QT_ROOT_DIR/bin/qt-cmake" -S . -B build-ios -G Xcode
-          -DQT_HOST_PATH="$QT_ROOT_DIR"
+          "$QT_ROOT_DIR/bin/qt-cmake" -S . -B build-ios -G Xcode
+          -DQT_HOST_PATH="$QT_HOST_DIR"
           -DCMAKE_OSX_ARCHITECTURES=arm64
 
       - name: Build (iOS, no signing)

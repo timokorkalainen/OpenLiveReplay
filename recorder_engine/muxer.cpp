@@ -206,8 +206,11 @@ void Muxer::close() {
 }
 
 QString Muxer::getVideoPath(QString fileName) {
-    // 1. Get the Documents directory for your app
-    QString docPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    // 1. Base directory: an explicit override (used by tests to stay hermetic)
+    //    or the platform Documents directory for the app.
+    QString docPath = m_outputBaseDir.isEmpty()
+                          ? QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)
+                          : m_outputBaseDir;
 
     // 2. Create a subfolder if you want to be organized
     QDir dir(docPath);

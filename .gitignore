@@ -38,6 +38,10 @@ ui_*.h
 *.jsc
 Makefile*
 *build-*
+# ...but keep the committed iOS FFmpeg/SRT build script (required by CMakeLists
+# and by the iOS CI build).
+!build-scripts/
+!build-scripts/*.sh
 *.qm
 *.prl
 

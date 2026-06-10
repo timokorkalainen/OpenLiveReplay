@@ -7,7 +7,12 @@
 #       - video + audio streams exist
 #       - output audio is stereo (mono inputs MUST be rematrixed up, not crash)
 #       - frame count is in the right ballpark for fps * duration
-#       - audio and video durations track each other (gapless / in sync)
+#       - audio and video end timestamps track each other (A/V in sync, gapless)
+#
+# Output location: the recorder always writes to <Documents>/videos (see
+# Muxer::getVideoPath). That cannot be redirected via $HOME on macOS, so this
+# script is NOT fully hermetic — instead the harness prints the exact artifact
+# path and the cleanup trap deletes it, leaving nothing behind.
 #
 # Modes:
 #   stereo  synthetic stereo sine  -> baseline happy path
@@ -26,20 +31,19 @@ command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
 
 if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
 
-WORKDIR="$(mktemp -d)"
-# Redirect $HOME so <Documents>/videos resolves inside the temp dir (hermetic).
-export HOME="$WORKDIR"
-mkdir -p "$WORKDIR/Documents/videos"
-
 FFPID=""
+OUT_MKV=""
 cleanup() {
     [ -n "$FFPID" ] && kill "$FFPID" 2>/dev/null
     wait "$FFPID" 2>/dev/null
-    rm -rf "$WORKDIR"
+    # Remove the recording this run produced (it lands in the real Documents dir).
+    [ -n "$OUT_MKV" ] && [ -f "$OUT_MKV" ] && rm -f "$OUT_MKV"
 }
 trap cleanup EXIT
 
-echo "[e2e] mode=$MODE channels=$CH port=$PORT workdir=$WORKDIR"
+echo "[e2e] mode=$MODE channels=$CH port=$PORT"
+
+is_num() { case "${1:-}" in '' | *[!0-9.]*) return 1 ;; *) return 0 ;; esac; }
 
 # --- 1. Producer: synthetic live stream (testsrc2 video + sine audio) --------
 # h264 video + aac audio in MPEG-TS over UDP, paced in real time (-re).
@@ -51,7 +55,7 @@ ffmpeg -hide_banner -loglevel error -re \
     -c:a aac -b:a 128k \
     -f mpegts "udp://127.0.0.1:${PORT}?pkt_size=1316" &
 FFPID=$!
-sleep 0.5  # let the producer come up before the consumer binds
+sleep 0.5 # let the producer come up before the consumer binds
 
 # --- 2. Consumer: the real recording engine ----------------------------------
 URL="udp://127.0.0.1:${PORT}?fifo_size=1000000&overrun_nonfatal=1"
@@ -67,38 +71,57 @@ fi
 OUT_MKV="$(printf '%s\n' "$HARNESS_OUT" | tail -n 1)"
 echo "[e2e] harness output: $OUT_MKV"
 
-if [ ! -s "$OUT_MKV" ]; then
+if [ -z "$OUT_MKV" ] || [ ! -s "$OUT_MKV" ]; then
     echo "FAIL: no (or empty) output file at '$OUT_MKV'"
     exit 1
 fi
 
 # --- 3. Probe + assert -------------------------------------------------------
 probe() { ffprobe -v error "$@" "$OUT_MKV"; }
+# Last presentation timestamp on a stream (for A/V end-alignment).
+last_pts() {
+    probe -select_streams "$1" -show_entries packet=pts_time -of csv=p=0 \
+        | awk 'NF{v=$1} END{print v}'
+}
 
-V_PACKETS="$(probe -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 | head -n1)"
-A_CHANNELS="$(probe -select_streams a:0 -show_entries stream=channels -of csv=p=0 | head -n1)"
-DURATION="$(probe -show_entries format=duration -of csv=p=0 | head -n1)"
+# default=nokey gives a clean scalar; csv=p=0 appends a stray trailing comma.
+scalar() { probe "$@" -of default=noprint_wrappers=1:nokey=1 | head -n1; }
+V_PACKETS="$(scalar -select_streams v:0 -count_packets -show_entries stream=nb_read_packets)"
+A_CHANNELS="$(scalar -select_streams a:0 -show_entries stream=channels)"
+DURATION="$(scalar -show_entries format=duration)"
+V_LAST="$(last_pts v:0)"
+A_LAST="$(last_pts a:0)"
 
-echo "[e2e] video_packets=${V_PACKETS:-?} audio_channels=${A_CHANNELS:-?} duration=${DURATION:-?}s"
+echo "[e2e] video_packets=${V_PACKETS:-?} audio_channels=${A_CHANNELS:-?} duration=${DURATION:-?}s v_last=${V_LAST:-?} a_last=${A_LAST:-?}"
 
 fail=0
-if [ -z "${A_CHANNELS:-}" ]; then
-    echo "FAIL: no audio stream in output"; fail=1
-elif [ "$A_CHANNELS" != "2" ]; then
-    # The engine conforms ALL inputs (incl. mono) to 48kHz stereo S16.
-    echo "FAIL: expected stereo (2ch) output, got ${A_CHANNELS}ch"; fail=1
+
+# Audio must be present and conformed to stereo (mono inputs rematrixed up).
+if [ "${A_CHANNELS:-}" != "2" ]; then
+    echo "FAIL: expected stereo (2ch) output, got '${A_CHANNELS:-none}'"
+    fail=1
 fi
 
-# Expect at least half of the nominal frames (fps*seconds), allowing for the
-# UDP warm-up gap and CI jitter.
-MIN_FRAMES=$(( 30 * SECONDS_TO_RECORD / 2 ))
-if [ -z "${V_PACKETS:-}" ] || [ "${V_PACKETS:-0}" -lt "$MIN_FRAMES" ]; then
-    echo "FAIL: too few video frames (${V_PACKETS:-0} < ${MIN_FRAMES})"; fail=1
+# Frame count: at least half the nominal fps*seconds (UDP warm-up + CI jitter).
+# A non-numeric value (e.g. ffprobe 'N/A' from a truncated file) is a failure.
+MIN_FRAMES=$((30 * SECONDS_TO_RECORD / 2))
+if ! is_num "${V_PACKETS:-}" || [ "${V_PACKETS%.*}" -lt "$MIN_FRAMES" ]; then
+    echo "FAIL: too few/invalid video frames (got '${V_PACKETS:-none}', need >= ${MIN_FRAMES})"
+    fail=1
+fi
+
+# A/V sync / gaplessness: audio and video must end within 0.75s of each other.
+if ! is_num "${V_LAST:-}" || ! is_num "${A_LAST:-}"; then
+    echo "FAIL: could not read stream end timestamps (v='${V_LAST:-}' a='${A_LAST:-}')"
+    fail=1
+elif ! awk -v v="$V_LAST" -v a="$A_LAST" 'BEGIN{d=v-a; if(d<0)d=-d; exit !(d<0.75)}'; then
+    echo "FAIL: audio/video end timestamps diverge >0.75s (v=$V_LAST a=$A_LAST)"
+    fail=1
 fi
 
 if [ $fail -ne 0 ]; then
     exit 1
 fi
 
-echo "PASS: e2e recording ($MODE) produced a valid stereo A/V file"
+echo "PASS: e2e recording ($MODE) — stereo A/V, ${V_PACKETS} frames, A/V end-aligned"
 exit 0
