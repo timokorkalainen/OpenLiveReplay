@@ -85,19 +85,19 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     int track = -1;
     const int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
 
+    AVFrame* pulled = nullptr;
+    const bool paintBlue = m_paintBlue.fetchAndStoreRelaxed(0) != 0;
+
+    // The mutex only guards m_frameQueue (shared with the capture
+    // thread).  m_latestFrame and the encoder are tick-thread-only,
+    // so painting/encoding happens outside the lock.
     {
         QMutexLocker locker(&m_frameMutex);
 
-        // Handle deferred blue paint from changeSource
-        if (m_paintBlue.fetchAndStoreRelaxed(0)) {
+        if (paintBlue) {
             while (!m_frameQueue.isEmpty()) {
                 auto qf = m_frameQueue.dequeue();
                 av_frame_free(&qf.frame);
-            }
-            if (m_latestFrame && m_latestFrame->data[0]) {
-                memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
-                memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
-                memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
             }
         }
 
@@ -109,36 +109,43 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
         while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
             QueuedFrame top = m_frameQueue.dequeue();
-            av_frame_unref(m_latestFrame);
-            av_frame_move_ref(m_latestFrame, top.frame);
-            av_frame_free(&top.frame);
+            if (pulled) av_frame_free(&pulled);
+            pulled = top.frame;
         }
+    }
 
-        // Read the current view-track assignment (atomic, set by UIManager).
-        // -1 = this source is not assigned to any view, skip encoding.
-        track = m_viewTrack.load(std::memory_order_relaxed);
+    if (paintBlue && m_latestFrame && m_latestFrame->data[0]) {
+        memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
+        memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
+        memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+    }
+    if (pulled) {
+        av_frame_unref(m_latestFrame);
+        av_frame_move_ref(m_latestFrame, pulled);
+        av_frame_free(&pulled);
+    }
 
-        if (track >= 0 && m_latestFrame && m_latestFrame->data[0]) {
-            // Set PTS on the FRAME, not the packet. avcodec_receive_packet
-            // overwrites the packet entirely, so any PTS/DTS set on it
-            // before encoding is lost.  The encoder propagates the frame
-            // PTS into the output packet, keeping it in sync with the
-            // global frame counter even after gaps (source was unmapped).
-            m_latestFrame->pts = m_internalFrameCount;
+    // Read the current view-track assignment (atomic, set by UIManager).
+    // -1 = this source is not assigned to any view, skip encoding.
+    track = m_viewTrack.load(std::memory_order_relaxed);
 
-            if (avcodec_send_frame(encCtx, m_latestFrame) == 0) {
-                if (avcodec_receive_packet(encCtx, outPkt) == 0) {
-                    outPkt->stream_index = track;
-                    outPkt->duration = 1;
-                    AVStream* st = m_muxer->getStream(track);
-                    if (st) {
-                        av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
-                        havePacket = true;
-                    }
+    if (track >= 0 && m_latestFrame && m_latestFrame->data[0]) {
+        // Set PTS on the FRAME, not the packet (avcodec_receive_packet
+        // overwrites the packet entirely).
+        m_latestFrame->pts = m_internalFrameCount;
+
+        if (avcodec_send_frame(encCtx, m_latestFrame) == 0) {
+            if (avcodec_receive_packet(encCtx, outPkt) == 0) {
+                outPkt->stream_index = track;
+                outPkt->duration = 1;
+                AVStream* st = m_muxer->getStream(track);
+                if (st) {
+                    av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
+                    havePacket = true;
                 }
             }
         }
-    } // m_frameMutex released BEFORE the muxer write
+    }
 
     if (havePacket) {
         m_muxer->writePacket(outPkt);
