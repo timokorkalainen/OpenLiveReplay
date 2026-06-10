@@ -52,6 +52,7 @@ class UIManager : public QObject {
     Q_PROPERTY(int screenCount READ screenCount NOTIFY screensChanged)
     Q_PROPERTY(QVariantList viewSlotMap READ viewSlotMap NOTIFY viewSlotMapChanged)
     Q_PROPERTY(int sourceEnabledVersion READ sourceEnabledVersion NOTIFY sourceEnabledChanged)
+    Q_PROPERTY(bool followLive READ followLive NOTIFY followLiveChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -87,6 +88,7 @@ public:
     int screenCount() const;
     QVariantList viewSlotMap() const;
     int sourceEnabledVersion() const { return m_sourceEnabledVersion; }
+    bool followLive() const { return m_followLive; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -180,6 +182,7 @@ signals:
     void screensChanged();
     void viewSlotMapChanged();
     void sourceEnabledChanged();
+    void followLiveChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -212,6 +215,7 @@ private:
     // Stream Deck. Action ids documented in streamdeck/streamdeckmanager.h.
     void dispatchControlAction(int action, bool isRelease);
     void jogStep(int delta);
+    void setFollowLive(bool on);
 
     ReplayManager* m_replayManager;
     AppSettings m_currentSettings;

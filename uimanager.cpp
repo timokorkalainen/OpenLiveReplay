@@ -282,6 +282,13 @@ void UIManager::jogStep(int delta)
     }
 }
 
+void UIManager::setFollowLive(bool on)
+{
+    if (m_followLive == on) return;
+    m_followLive = on;
+    emit followLiveChanged();
+}
+
 static int nextSourceIdSeed(const QList<SourceSettings> &sources) {
     int maxId = 0;
     for (const auto &source : sources) {
@@ -854,7 +861,7 @@ void UIManager::goLive() {
 }
 
 void UIManager::cancelFollowLive() {
-    m_followLive = false;
+    setFollowLive(false);
 }
 
 void UIManager::captureCurrent() {
@@ -896,7 +903,7 @@ void UIManager::refreshMidiPorts() {
 
 void UIManager::startRecording() {
     m_replayManager->startRecording();
-    m_followLive = true;
+    setFollowLive(true);
 
     // 1. Initialize the Playback Worker with our providers
     if (m_playbackWorker) {
@@ -933,13 +940,13 @@ void UIManager::restartPlaybackWorker() {
     m_playbackWorker->start();
     m_transport->seek(0);
     m_transport->setPlaying(true);
-    m_followLive = true;
+    setFollowLive(true);
 }
 
 void UIManager::stopRecording() {
     m_replayManager->stopRecording();
     m_transport->setPlaying(false);
-    m_followLive = false;
+    setFollowLive(false);
     if (m_playbackWorker) {
         m_playbackWorker->stop();
     }
@@ -953,7 +960,7 @@ void UIManager::seekPlayback(int64_t ms) {
     if (m_transport) {
         m_transport->seek(ms);
         // Manual seek disables live-follow; user can re-enable via "Live"
-        m_followLive = false;
+        setFollowLive(false);
     }
     if (m_audioPlayer) m_audioPlayer->clear();
 }
@@ -1313,7 +1320,7 @@ int64_t UIManager::scrubPosition() {
 }
 
 void UIManager::scrubToLive() {
-    m_followLive = true;
+    setFollowLive(true);
     const int64_t liveEdge = recordedDurationMs();
     const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
     m_transport->seek(target);
