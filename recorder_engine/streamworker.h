@@ -95,6 +95,11 @@ private:
     std::atomic<bool> m_connected{false};
     int m_connectBackoffMs = 1000;
 
+    // Last jitter-pull gate published by the tick thread (file-timeline ms,
+    // -1 until the first tick).  The capture thread uses it to pre-drain
+    // frames the next tick would discard anyway.
+    std::atomic<int64_t> m_lastTickTargetMs{-1};
+
     // Audio FIFO: the capture thread produces resampled 48 kHz stereo S16
     // stamped on the global recording timeline; the master-pulse tick
     // consumes it on a sample-accurate cursor (gap-filled with silence).
