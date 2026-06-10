@@ -1,4 +1,5 @@
 #include "uimanager.h"
+#include "playback/audioplayer.h"
 #include <QDateTime>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -31,6 +32,26 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     connect(m_transport, &PlaybackTransport::posChanged, this, [this]() {
         updateXTouchDisplay();
     });
+
+    // Audio output for single-view playback
+    m_audioPlayer = new AudioPlayer(this);
+    m_audioPlayer->start(48000, 2);
+    m_audioPlayer->setMuted(true); // start muted until a single view is selected
+
+    // Mute audio when speed is not 1.0
+    connect(m_transport, &PlaybackTransport::speedChanged, this, [this](double speed) {
+        if (m_audioPlayer) {
+            bool normalSpeed = (speed > 0.99 && speed < 1.01);
+            m_audioPlayer->setMuted(!normalSpeed || !m_playbackSingleView);
+        }
+    });
+    // Clear audio buffer when pausing
+    connect(m_transport, &PlaybackTransport::playingChanged, this, [this](bool playing) {
+        if (m_audioPlayer && !playing) {
+            m_audioPlayer->clear();
+        }
+    });
+
     m_midiManager = new MidiManager(this);
     connect(m_midiManager, &MidiManager::midiMessage, this, [this](int status, int data1, int data2) {
         if (status < 0 || data1 < 0) return;
@@ -834,6 +855,16 @@ void UIManager::requestNewWindowScene() {
 void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
     m_playbackSingleView = singleView;
     m_playbackSelectedIndex = selectedIndex;
+
+    // Route audio for the selected track (or mute in multiview)
+    if (m_playbackWorker) {
+        m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
+    }
+    if (m_audioPlayer) {
+        bool normalSpeed = m_transport && (m_transport->speed() > 0.99 && m_transport->speed() < 1.01);
+        m_audioPlayer->setMuted(!singleView || selectedIndex < 0 || !normalSpeed);
+    }
+
     updateXTouchLcd();
 }
 
@@ -858,7 +889,7 @@ void UIManager::startRecording() {
         delete m_playbackWorker;
     }
 
-    m_playbackWorker = new PlaybackWorker(m_providers, m_transport, this);
+    m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
 
     // 2. Point it to the file being recorded
@@ -881,7 +912,7 @@ void UIManager::restartPlaybackWorker() {
         m_playbackWorker = nullptr;
     }
 
-    m_playbackWorker = new PlaybackWorker(m_providers, m_transport, this);
+    m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
@@ -909,6 +940,7 @@ void UIManager::seekPlayback(int64_t ms) {
         // Manual seek disables live-follow; user can re-enable via "Live"
         m_followLive = false;
     }
+    if (m_audioPlayer) m_audioPlayer->clear();
 }
 
 void UIManager::updateUrl(int index, const QString &url) {

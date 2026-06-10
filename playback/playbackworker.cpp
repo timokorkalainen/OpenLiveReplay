@@ -2,11 +2,13 @@
 #include <QDebug>
 #include <QMutexLocker>
 
-PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport, QObject *parent)
+PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport,
+                               AudioPlayer *audioPlayer, QObject *parent)
     : QThread(parent)
 {
     m_transport = transport;
     m_providers = providers;
+    m_audioPlayer = audioPlayer;
 }
 
 PlaybackWorker::~PlaybackWorker() {
@@ -14,6 +16,10 @@ PlaybackWorker::~PlaybackWorker() {
     for (auto* track : m_decoderBank) {
         if (track->codecCtx) avcodec_free_context(&track->codecCtx);
         delete track;
+    }
+    for (auto* aTrack : m_audioDecoderBank) {
+        if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+        delete aTrack;
     }
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
 }
@@ -31,6 +37,18 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
 void PlaybackWorker::setFrameBufferMax(int maxFrames) {
     QMutexLocker bufferLocker(&m_bufferMutex);
     m_frameBufferMax = qMax(1, maxFrames);
+}
+
+void PlaybackWorker::setActiveAudioView(int viewIndex) {
+    int prev = m_activeAudioView.exchange(viewIndex, std::memory_order_relaxed);
+    if (prev == viewIndex) return;   // no actual change
+
+    // Clear the ring buffer so stale samples from the old view don't
+    // bleed into the new one.  We do NOT flush the codec contexts here:
+    // they live on the worker thread and flushing from the UI thread is
+    // a data race.  Instead, all decoders run continuously (see run()),
+    // so the new view's decoder is already warm and ready.
+    if (m_audioPlayer) m_audioPlayer->clear();
 }
 
 void PlaybackWorker::stop() {
@@ -71,6 +89,11 @@ void PlaybackWorker::run() {
         }
         m_decoderBank.clear();
         m_streamMap.clear();
+        for (auto* aTrack : m_audioDecoderBank) {
+            if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+            delete aTrack;
+        }
+        m_audioDecoderBank.clear();
     };
 
     // --- 1. OPENING & INITIALIZATION (retry until tracks available or stop) ---
@@ -140,6 +163,37 @@ void PlaybackWorker::run() {
             }
         }
 
+        // Also detect audio streams (paired with video by order)
+        int audioViewIdx = 0;
+        for (unsigned int i = 0; i < m_fmtCtx->nb_streams; i++) {
+            AVCodecParameters* codecParams = m_fmtCtx->streams[i]->codecpar;
+            if (codecParams->codec_type == AVMEDIA_TYPE_AUDIO) {
+                const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+                if (!codec) { audioViewIdx++; continue; }
+
+                AVCodecContext* ctx = avcodec_alloc_context3(codec);
+                if (!ctx) { audioViewIdx++; continue; }
+                avcodec_parameters_to_context(ctx, codecParams);
+                ctx->thread_count = 0;
+
+                if (avcodec_open2(ctx, codec, nullptr) < 0) {
+                    avcodec_free_context(&ctx);
+                    audioViewIdx++;
+                    continue;
+                }
+
+                AudioDecoderTrack* aTrack = new AudioDecoderTrack();
+                aTrack->streamIndex = i;
+                aTrack->codecCtx = ctx;
+                aTrack->viewIndex = audioViewIdx;
+                m_audioDecoderBank.append(aTrack);
+
+                qDebug() << "Worker: Initialized Audio Decoder for Stream" << i
+                         << "view" << audioViewIdx;
+                audioViewIdx++;
+            }
+        }
+
         if (!m_decoderBank.isEmpty()) break;
 
         qDebug() << "PlaybackWorker: No video tracks yet. Retrying...";
@@ -154,13 +208,22 @@ void PlaybackWorker::run() {
     }
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
+    AVFrame* audioFrame = av_frame_alloc();
 
     int64_t lastProcessedPtsMs = -1;
     m_seekTargetMs = -1;
 
     while (m_running) {
+
         // --- 2. GET MASTER TIME FROM TRANSPORT ---
         int64_t masterTimeMs = m_transport->currentPos();
+
+        // --- PAUSE HANDLING ---
+        // If playback is paused, block here until resumed.
+        while (m_running && !m_transport->isPlaying()) {
+            msleep(10);
+            masterTimeMs = m_transport->currentPos();
+        }
 
         // --- 3. CHECK FOR EXTERNAL SEEK (SCRUBBING) ---
         // If the master clock is far away from our last frame, trigger a hard seek
@@ -183,6 +246,10 @@ void PlaybackWorker::run() {
             for(auto* track : m_decoderBank) {
                 if(track->codecCtx) avcodec_flush_buffers(track->codecCtx);
             }
+            for (auto* aTrack : m_audioDecoderBank) {
+                if (aTrack->codecCtx) avcodec_flush_buffers(aTrack->codecCtx);
+            }
+            if (m_audioPlayer) m_audioPlayer->clear();
 
             // Clear stale frames from the buffer to prevent visual artifacts
             {
@@ -243,6 +310,31 @@ void PlaybackWorker::run() {
                             break;
                         }
                     }
+
+                    // Also keep audio decoders warm during burst (discard output)
+                    for (auto* aTrack : m_audioDecoderBank) {
+                        if (pkt->stream_index == aTrack->streamIndex) {
+                            if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
+                                while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
+                                    // If this is the active audio view, push to the ring buffer
+                                    int activeView = m_activeAudioView.load(std::memory_order_relaxed);
+                                    if (activeView == aTrack->viewIndex && m_audioPlayer) {
+                                        double spd = m_transport->speed();
+                                        bool normalSpeed = (spd > 0.99 && spd < 1.01);
+                                        if (normalSpeed && m_transport->isPlaying()) {
+                                            int dataSize = audioFrame->nb_samples
+                                                           * audioFrame->ch_layout.nb_channels
+                                                           * int(sizeof(int16_t));
+                                            m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                                        }
+                                    }
+                                    av_frame_unref(audioFrame);
+                                }
+                            }
+                            break;
+                        }
+                    }
+
                     av_packet_unref(pkt);
                 }
 
@@ -250,19 +342,20 @@ void PlaybackWorker::run() {
                 deliverBufferedFrameAtOrBefore(target);
             }
 
+            // Reset to the seek target so the pace control doesn't see
+            // the burst-decoded PTS (which is ~1 s ahead) and gate audio.
+            lastProcessedPtsMs = target;
+
             continue;
         }
 
         m_mutex.unlock();
 
-        // --- 4. PACE CONTROL (SYNC) ---
-        // If our last frame is in the future compared to the Master Clock, wait.
-        if (lastProcessedPtsMs > masterTimeMs) {
-            msleep(5); // Smallest sleep to remain responsive to transport changes
-            continue;
-        }
-
-        // --- 5. READ & DECODE ---
+        // --- 4. & 5. READ & DECODE ---
+        // Always read packets — video and audio are interleaved in the MKV,
+        // so blocking the read loop to pace video also starves audio.
+        // Video frames are buffered; the existing buffer-cap prevents runaway
+        // memory.  Pace control (sleep) happens AFTER the read, not before it.
         int readResult = av_read_frame(m_fmtCtx, pkt);
 
         if (readResult >= 0) {
@@ -301,6 +394,33 @@ void PlaybackWorker::run() {
                     break;
                 }
             }
+
+            // --- AUDIO DECODE: keep ALL decoders running, route active view ---
+            // Decoding every audio stream continuously (PCM = near-zero cost)
+            // ensures that switching views is instant — no cold-start gap.
+            for (auto* aTrack : m_audioDecoderBank) {
+                if (pkt->stream_index != aTrack->streamIndex) continue;
+
+                if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
+                    while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
+                        // Only push to speaker if this is the selected view
+                        int activeView = m_activeAudioView.load(std::memory_order_relaxed);
+                        if (activeView == aTrack->viewIndex && m_audioPlayer) {
+                            double spd = m_transport->speed();
+                            bool normalSpeed = (spd > 0.99 && spd < 1.01);
+                            if (normalSpeed && m_transport->isPlaying()) {
+                                int dataSize = audioFrame->nb_samples
+                                               * audioFrame->ch_layout.nb_channels
+                                               * int(sizeof(int16_t));
+                                m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                            }
+                        }
+                        av_frame_unref(audioFrame);
+                    }
+                }
+                break;  // packet matched this track, no need to check others
+            }
+
             av_packet_unref(pkt);
         }
         else if (readResult == AVERROR_EOF) {
@@ -312,11 +432,23 @@ void PlaybackWorker::run() {
             msleep(10);
             avformat_flush(m_fmtCtx);
         }
+
+        // --- PACE CONTROL ---
+        // Throttle when we've decoded well ahead of the master clock.
+        // This MUST happen after reading/decoding so that audio packets
+        // (interleaved with video in the MKV) are never starved.
+        // The 100 ms margin keeps the audio ring buffer healthy — without
+        // it, the pace gate starves audio delivery and causes underruns
+        // (audible as a rattle after seek).
+        if (lastProcessedPtsMs > masterTimeMs + 100) {
+            msleep(5);
+        }
     }
 
     // --- 6. CLEANUP ---
     av_packet_free(&pkt);
     av_frame_free(&frame);
+    av_frame_free(&audioFrame);
     clearDecoders();
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
 }
