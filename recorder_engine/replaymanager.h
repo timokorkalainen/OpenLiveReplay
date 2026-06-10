@@ -101,6 +101,10 @@ private:
     AVFrame* m_blueFrame = nullptr;
     bool setupBlueEncoder();
     void cleanupBlueEncoder();
+
+    // Per-view silence cursor (sample index @ 48 kHz) so unmapped views
+    // get gap-free audio even when heartbeat ticks are missed.
+    QVector<int64_t> m_blueAudioCursor;
 };
 
 #endif // REPLAYMANAGER_H

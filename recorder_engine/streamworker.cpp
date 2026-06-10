@@ -83,6 +83,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     AVPacket* outPkt = av_packet_alloc();
     bool havePacket = false;
     int track = -1;
+    const int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
 
     {
         QMutexLocker locker(&m_frameMutex);
@@ -103,8 +104,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // ALWAYS do jitter pull to keep m_latestFrame fresh, even when
         // not assigned to a view.  This ensures frames are ready the
         // instant this source gets mapped to a view.
-        int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
-        int64_t targetTimeMs = currentRecordingTimeMs - m_jitterBufferMs;
+        int64_t targetTimeMs = currentRecordingTimeMs - kJitterBufferMs;
         if (targetTimeMs < 0) targetTimeMs = 0;
 
         while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
@@ -151,6 +151,10 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         }
     }
     av_packet_free(&outPkt);
+
+    // Write this tick's worth of audio for the assigned view track
+    // (sample-accurate cursor, silence-filled where capture had nothing).
+    writeAudioForTick(currentRecordingTimeMs, track);
 }
 
 void StreamWorker::captureLoop() {
@@ -265,7 +269,6 @@ void StreamWorker::captureLoop() {
         }
         int64_t containerStartMs = -1; // ms offset of the first video DTS
 
-        int firstSourcePts = -1;
         int64_t anchorStreamTimeMs = -1;
         int64_t firstPacketDts = -1;
 
@@ -296,9 +299,6 @@ void StreamWorker::captureLoop() {
 
                     if (avcodec_send_packet(decCtx, pkt) >= 0) {
                         while (avcodec_receive_frame(decCtx, rawFrame) >= 0) {
-
-                            // 1. Initialize start time correctly using the packet DTS
-                            if (firstSourcePts == -1) firstSourcePts = pktDts;
 
                             // 2. Prepare the container for the scaled frame
                             QueuedFrame qf;
@@ -375,26 +375,14 @@ void StreamWorker::captureLoop() {
                                 (const uint8_t**)audioFrame->extended_data, audioFrame->nb_samples);
 
                             if (converted > 0) {
-                                int track = m_viewTrack.load(std::memory_order_relaxed);
-                                if (track >= 0) {
-                                    int audioTrackIdx = m_muxer->audioTrackOffset() + track;
-                                    int dataSize = converted * 2 * int(sizeof(int16_t));
-
-                                    AVPacket* audioPkt = av_packet_alloc();
-                                    av_new_packet(audioPkt, dataSize);
-                                    memcpy(audioPkt->data, outBuffer, dataSize);
-
-                                    audioPkt->stream_index = audioTrackIdx;
-                                    AVStream* st = m_muxer->getStream(audioTrackIdx);
-                                    if (st) {
-                                        audioPkt->pts = av_rescale_q(recPtsMs, {1, 1000}, st->time_base);
-                                        audioPkt->dts = audioPkt->pts;
-                                        audioPkt->duration = av_rescale_q(converted,
-                                            {1, 48000}, st->time_base);
-                                    }
-                                    m_muxer->writePacket(audioPkt);
-                                    av_packet_free(&audioPkt);
-                                }
+                                // Stamp with the global recording timeline and
+                                // hand off to the FIFO.  The master-pulse tick
+                                // writes it to the muxer with the same jitter
+                                // delay as video, sample-accurate and gap-filled,
+                                // regardless of which view this source is in.
+                                const int64_t startSample =
+                                    recPtsMs * kAudioSampleRate / 1000;
+                                enqueueAudio(startSample, outBuffer, converted);
                             }
 
                             av_freep(&outBuffer);
@@ -426,13 +414,15 @@ void StreamWorker::captureLoop() {
         av_frame_free(&rawFrame);
         av_frame_free(&audioFrame);
 
-        // Flush any remaining samples from the resampler
+        // Flush any remaining samples from the resampler into the FIFO
+        // (continuation append at the FIFO end, -1 = "no timestamp").
         if (swrCtx) {
             int flushed = 1;
             while (flushed > 0) {
                 uint8_t* flushBuf = (uint8_t*)av_malloc(4096);
                 uint8_t* flushBufs[1] = { flushBuf };
                 flushed = swr_convert(swrCtx, flushBufs, 1024, nullptr, 0);
+                if (flushed > 0) enqueueAudio(-1, flushBuf, flushed);
                 av_freep(&flushBuf);
             }
         }
@@ -605,4 +595,134 @@ void StreamWorker::changeSource(const QString& newUrl) {
     }
 
     m_restartCapture = 1;
+}
+
+// ─── Audio FIFO ─────────────────────────────────────────────────────────
+
+void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int numSamples) {
+    if (numSamples <= 0) return;
+    const qint64 numBytes = qint64(numSamples) * kAudioBytesPerSample;
+    QMutexLocker locker(&m_audioFifoMutex);
+
+    if (m_audioFifoStartSample < 0 || m_audioFifo.isEmpty()) {
+        if (startSample < 0) return;  // continuation data with no stream yet
+        m_audioFifoStartSample = startSample;
+        m_audioFifo.append(reinterpret_cast<const char*>(data), numBytes);
+    } else {
+        const int64_t expected = m_audioFifoStartSample
+                                 + m_audioFifo.size() / kAudioBytesPerSample;
+        const int64_t delta = (startSample < 0) ? 0 : startSample - expected;
+        const int64_t jitterTol = kAudioSampleRate / 100;  // 10 ms
+
+        if (qAbs(delta) <= jitterTol) {
+            // Continuous (within PTS rounding jitter): plain append
+            m_audioFifo.append(reinterpret_cast<const char*>(data), numBytes);
+        } else if (delta > 0) {
+            // Gap (packet loss / reconnect): zero-fill so the track
+            // stays sample-contiguous
+            const int64_t maxFill = int64_t(kAudioSampleRate) * 10;
+            if (delta > maxFill) {
+                // Huge jump: restart the FIFO at the new position
+                m_audioFifo.clear();
+                m_audioFifoStartSample = startSample;
+            } else {
+                m_audioFifo.append(QByteArray(int(delta * kAudioBytesPerSample), '\0'));
+            }
+            m_audioFifo.append(reinterpret_cast<const char*>(data), numBytes);
+        } else {
+            // Overlap: drop the part we already have
+            const int64_t drop = -delta;
+            if (drop >= numSamples) return;
+            m_audioFifo.append(reinterpret_cast<const char*>(data) + drop * kAudioBytesPerSample,
+                               numBytes - drop * kAudioBytesPerSample);
+        }
+    }
+
+    // Cap the FIFO at ~10 s
+    const int maxBytes = kAudioSampleRate * 10 * kAudioBytesPerSample;
+    if (m_audioFifo.size() > maxBytes) {
+        const int excess = m_audioFifo.size() - maxBytes;
+        m_audioFifo.remove(0, excess);
+        m_audioFifoStartSample += excess / kAudioBytesPerSample;
+    }
+}
+
+void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track) {
+    // Audio shares the video path's jitter delay so both land on the
+    // same timeline: a video frame written at file-time T shows source
+    // content from T - jitter.  The cursor runs on the FILE timeline;
+    // the FIFO holds source-timeline samples, so file position P maps
+    // to FIFO position P - jitter.
+    const int64_t jitterSamples = int64_t(kJitterBufferMs) * kAudioSampleRate / 1000;
+    const int64_t targetEnd = recordingTimeMs * kAudioSampleRate / 1000;
+    if (targetEnd <= 0) return;
+
+    if (track < 0) {
+        // Not mapped to a view: discard consumed FIFO data and keep the
+        // cursor pinned to "now" so mapping in resumes at current time.
+        m_audioWriteCursor = targetEnd;
+        QMutexLocker locker(&m_audioFifoMutex);
+        if (m_audioFifoStartSample >= 0) {
+            const int64_t dropSamples = (targetEnd - jitterSamples) - m_audioFifoStartSample;
+            if (dropSamples > 0) {
+                const int dropBytes = int(qMin<int64_t>(dropSamples * kAudioBytesPerSample,
+                                                        m_audioFifo.size()));
+                m_audioFifo.remove(0, dropBytes);
+                m_audioFifoStartSample += dropBytes / kAudioBytesPerSample;
+            }
+        }
+        return;
+    }
+
+    if (m_audioWriteCursor < 0) {
+        m_audioWriteCursor = qMax<int64_t>(0, targetEnd - kAudioSampleRate / m_targetFps);
+    }
+    if (targetEnd <= m_audioWriteCursor) return;
+
+    // Catch up at most 1 s per tick: the track stays contiguous, a large
+    // backlog (stalled event loop) just drains over several ticks.
+    const int64_t n = qMin<int64_t>(targetEnd - m_audioWriteCursor, kAudioSampleRate);
+    const int64_t start = m_audioWriteCursor;        // file timeline
+    const int64_t srcStart = start - jitterSamples;  // source timeline
+
+    QByteArray chunk(int(n * kAudioBytesPerSample), '\0');
+    {
+        QMutexLocker locker(&m_audioFifoMutex);
+        if (m_audioFifoStartSample >= 0 && !m_audioFifo.isEmpty()) {
+            const int64_t fifoStart = m_audioFifoStartSample;
+            const int64_t fifoEnd = fifoStart + m_audioFifo.size() / kAudioBytesPerSample;
+            const int64_t copyFrom = qMax(srcStart, fifoStart);
+            const int64_t copyTo = qMin(srcStart + n, fifoEnd);
+            if (copyTo > copyFrom) {
+                memcpy(chunk.data() + (copyFrom - srcStart) * kAudioBytesPerSample,
+                       m_audioFifo.constData() + (copyFrom - fifoStart) * kAudioBytesPerSample,
+                       size_t((copyTo - copyFrom) * kAudioBytesPerSample));
+            }
+            // Trim everything we just consumed (or skipped past)
+            const int64_t dropSamples = (srcStart + n) - fifoStart;
+            if (dropSamples > 0) {
+                const int dropBytes = int(qMin<int64_t>(dropSamples * kAudioBytesPerSample,
+                                                        m_audioFifo.size()));
+                m_audioFifo.remove(0, dropBytes);
+                m_audioFifoStartSample += dropBytes / kAudioBytesPerSample;
+            }
+        }
+    }
+    m_audioWriteCursor = start + n;
+
+    const int audioTrackIdx = m_muxer->audioTrackOffset() + track;
+    AVStream* st = m_muxer->getStream(audioTrackIdx);
+    if (!st) return;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return;
+    if (av_new_packet(pkt, chunk.size()) == 0) {
+        memcpy(pkt->data, chunk.constData(), size_t(chunk.size()));
+        pkt->stream_index = audioTrackIdx;
+        pkt->pts = av_rescale_q(start, {1, kAudioSampleRate}, st->time_base);
+        pkt->dts = pkt->pts;
+        pkt->duration = av_rescale_q(n, {1, kAudioSampleRate}, st->time_base);
+        m_muxer->writePacket(pkt);
+    }
+    av_packet_free(&pkt);
 }

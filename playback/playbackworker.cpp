@@ -219,8 +219,15 @@ void PlaybackWorker::run() {
         int64_t masterTimeMs = m_transport->currentPos();
 
         // --- PAUSE HANDLING ---
-        // If playback is paused, block here until resumed.
+        // If playback is paused, block here until resumed — but still
+        // react to pending seeks: paused scrubbing and frame stepping
+        // must seek + burst-decode, or the frame buffer has nothing at
+        // the target and the picture freezes.
         while (m_running && !m_transport->isPlaying()) {
+            {
+                QMutexLocker locker(&m_mutex);
+                if (m_seekTargetMs >= 0) break;
+            }
             msleep(10);
             masterTimeMs = m_transport->currentPos();
         }
@@ -322,10 +329,7 @@ void PlaybackWorker::run() {
                                         double spd = m_transport->speed();
                                         bool normalSpeed = (spd > 0.99 && spd < 1.01);
                                         if (normalSpeed && m_transport->isPlaying()) {
-                                            int dataSize = audioFrame->nb_samples
-                                                           * audioFrame->ch_layout.nb_channels
-                                                           * int(sizeof(int16_t));
-                                            m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                                            pushAudioFrame(aTrack, audioFrame);
                                         }
                                     }
                                     av_frame_unref(audioFrame);
@@ -387,8 +391,10 @@ void PlaybackWorker::run() {
                                     track->buffer.remove(0, track->buffer.size() - m_frameBufferMax);
                                 }
                             }
-
-                            track->provider->deliverFrame(qFrame);
+                            // NOTE: no immediate delivery here — frames are
+                            // released against the master clock below, so the
+                            // picture is not shown up to 100 ms early (the
+                            // decode lead allowed by the pace gate).
                         }
                     }
                     break;
@@ -409,10 +415,7 @@ void PlaybackWorker::run() {
                             double spd = m_transport->speed();
                             bool normalSpeed = (spd > 0.99 && spd < 1.01);
                             if (normalSpeed && m_transport->isPlaying()) {
-                                int dataSize = audioFrame->nb_samples
-                                               * audioFrame->ch_layout.nb_channels
-                                               * int(sizeof(int16_t));
-                                m_audioPlayer->pushSamples(audioFrame->data[0], dataSize);
+                                pushAudioFrame(aTrack, audioFrame);
                             }
                         }
                         av_frame_unref(audioFrame);
@@ -432,6 +435,12 @@ void PlaybackWorker::run() {
             msleep(10);
             avformat_flush(m_fmtCtx);
         }
+
+        // --- DELIVER DUE FRAMES ---
+        // Release the newest buffered frame whose PTS is due on the
+        // master clock.  Decode runs ahead (see pace control), so
+        // delivering at decode time would show frames early and jittery.
+        deliverDueFrames(m_transport->currentPos());
 
         // --- PACE CONTROL ---
         // Throttle when we've decoded well ahead of the master clock.
@@ -453,6 +462,35 @@ void PlaybackWorker::run() {
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
 }
 
+void PlaybackWorker::pushAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame) {
+    // The app's recordings carry PCM S16LE 48 kHz stereo; anything else
+    // would need resampling before it can go to the audio device.
+    if (audioFrame->format != AV_SAMPLE_FMT_S16
+        || audioFrame->sample_rate != 48000
+        || audioFrame->ch_layout.nb_channels != 2) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            qWarning() << "PlaybackWorker: unsupported audio frame format"
+                       << audioFrame->format << audioFrame->sample_rate
+                       << audioFrame->ch_layout.nb_channels;
+        }
+        return;
+    }
+
+    int64_t pts = audioFrame->pts;
+    if (pts == AV_NOPTS_VALUE) pts = audioFrame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) return;
+
+    const AVRational tb = m_fmtCtx->streams[aTrack->streamIndex]->time_base;
+    const int64_t ptsMs = av_rescale_q(pts, tb, {1, 1000});
+    const int dataSize = audioFrame->nb_samples
+                         * audioFrame->ch_layout.nb_channels
+                         * int(sizeof(int16_t));
+    m_audioPlayer->pushSamples(audioFrame->data[0], dataSize,
+                               ptsMs, m_transport->currentPos());
+}
+
 bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
     struct PendingDeliver {
         FrameProvider* provider = nullptr;
@@ -467,6 +505,7 @@ bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
             if (track->buffer.isEmpty()) continue;
             for (int i = track->buffer.size() - 1; i >= 0; --i) {
                 if (track->buffer[i].ptsMs <= targetMs) {
+                    track->lastDeliveredPtsMs = track->buffer[i].ptsMs;
                     pending.append({track->provider, track->buffer[i].frame});
                     break;
                 }
@@ -480,6 +519,35 @@ bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
         if (item.provider) item.provider->deliverFrame(item.frame);
     }
     return true;
+}
+
+void PlaybackWorker::deliverDueFrames(int64_t masterTimeMs) {
+    struct PendingDeliver {
+        FrameProvider* provider = nullptr;
+        QVideoFrame frame;
+    };
+
+    QVector<PendingDeliver> pending;
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        for (auto* track : m_decoderBank) {
+            if (!track || !track->provider) continue;
+            if (track->buffer.isEmpty()) continue;
+            for (int i = track->buffer.size() - 1; i >= 0; --i) {
+                if (track->buffer[i].ptsMs <= masterTimeMs) {
+                    if (track->buffer[i].ptsMs != track->lastDeliveredPtsMs) {
+                        track->lastDeliveredPtsMs = track->buffer[i].ptsMs;
+                        pending.append({track->provider, track->buffer[i].frame});
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    for (const auto &item : pending) {
+        if (item.provider) item.provider->deliverFrame(item.frame);
+    }
 }
 
 QVideoFrame PlaybackWorker::convertToQVideoFrame(AVFrame* frame) {
