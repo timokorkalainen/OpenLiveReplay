@@ -60,7 +60,10 @@ public:
     qint64 getRecordingStartEpochMs() const { return m_recordingStartEpochMs; }
 
 signals:
-    void masterPulse(int64_t frameIndex, int64_t wallClockUs);
+    // Emitted once per advanced frame: (global frame index, elapsed ms
+    // since recording start).  The second value is MILLISECONDS — it was
+    // previously named wallClockUs.
+    void masterPulse(int64_t frameIndex, int64_t elapsedMs);
 
 private slots:
     void onTimerTick();

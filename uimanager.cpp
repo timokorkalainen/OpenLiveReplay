@@ -1261,6 +1261,17 @@ QScreen* UIManager::screenAt(int index) const {
 }
 
 void UIManager::refreshProviders() {
+    // The playback worker holds raw pointers to the providers: stop it
+    // before deleting them or its decode thread dereferences freed
+    // FrameProviders. Callers that need playback running afterwards
+    // (openStreams, setStreamUrls, ...) restart it via
+    // restartPlaybackWorker().
+    if (m_playbackWorker) {
+        m_playbackWorker->stop();
+        delete m_playbackWorker;
+        m_playbackWorker = nullptr;
+    }
+
     // Cleanup old providers
     qDeleteAll(m_providers);
     m_providers.clear();
@@ -1447,7 +1458,9 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
     }
 }
 
-void UIManager::onRecorderPulse(int64_t elapsed, int64_t frameCount) {
+void UIManager::onRecorderPulse(int64_t frameIndex, int64_t elapsedMs) {
+    Q_UNUSED(frameIndex);
+    Q_UNUSED(elapsedMs);
     emit recordedDurationMsChanged();
     emit scrubPositionChanged();
     emit recordingStartEpochMsChanged();
