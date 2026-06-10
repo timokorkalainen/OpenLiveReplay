@@ -1,0 +1,219 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: 6.10.1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the macOS app + test suite and run CTest. This is the primary gate.
+  # ---------------------------------------------------------------------------
+  build-test-macos:
+    name: Build + Test (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # clang-tidy diff needs history
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia
+          cache: true
+
+      - name: Install build deps
+        run: brew install ninja ffmpeg
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOLR_BUILD_TESTS=ON
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build (app + tests)
+        run: cmake --build build
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --repeat until-pass:2
+
+      # clang-tidy is advisory: it reports on changed first-party files using the
+      # generated compile_commands.json but never fails the build (yet).
+      - name: clang-tidy (advisory, changed files)
+        continue-on-error: true
+        run: |
+          brew install llvm
+          TIDY="$(brew --prefix llvm)/bin/clang-tidy"
+          SDK="$(xcrun --show-sdk-path)"
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          [ -z "$base" ] && base="HEAD~1"
+          files=$(git diff --name-only "$base"...HEAD -- \
+                    'recorder_engine/*.cpp' 'playback/*.cpp' \
+                    'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)
+          if [ -z "$files" ]; then echo "No first-party C++ changes."; exit 0; fi
+          echo "$files"
+          "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" $files
+
+  # ---------------------------------------------------------------------------
+  # Lightweight static checks: formatting + QML. No full configure needed.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (format + QML)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Qt (for qmllint)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          cache: true
+
+      - name: clang-format (changed C++ files)
+        run: |
+          # Use Xcode's clang-format so CI matches the developer toolchain.
+          CF="$(xcrun -f clang-format)"
+          "$CF" --version
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          [ -z "$base" ] && base="HEAD~1"
+          files=$(git diff --name-only "$base"...HEAD -- \
+                    '*.cpp' '*.h' '*.hpp' '*.mm' \
+                    | grep -vE '^(build|ios_build)/' || true)
+          if [ -z "$files" ]; then echo "No C++ changes to format-check."; exit 0; fi
+          echo "$files"
+          "$CF" --dry-run --Werror $files
+
+      - name: qmllint
+        run: |
+          "$QT_ROOT_DIR/bin/qmllint" -I "$QT_ROOT_DIR/qml" Main.qml MultiviewWindow.qml
+
+  # ---------------------------------------------------------------------------
+  # Sanitizers over the test suite (incl. the threaded recording pipeline).
+  # ASan+UBSan gates; ThreadSanitizer is advisory while it is being tuned
+  # against FFmpeg's internal threads.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: Sanitizers
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: "address;undefined"
+            label: asan-ubsan
+            advisory: false
+          - sanitizer: "thread"
+            label: tsan
+            advisory: true
+    continue-on-error: ${{ matrix.advisory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia
+          cache: true
+
+      - name: Install build deps
+        run: brew install ninja ffmpeg
+
+      - name: Configure (${{ matrix.label }})
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOLR_BUILD_TESTS=ON
+          -DOLR_SANITIZER="${{ matrix.sanitizer }}"
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build tests
+        run: cmake --build build --target tst_recordingclock tst_settingsmanager tst_playbacktransport tst_muxer record_harness
+
+      - name: Run tests under sanitizer
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --output-on-failure --repeat until-pass:2
+
+  # ---------------------------------------------------------------------------
+  # iOS cross-build. FFmpeg+SRT is compiled from source (~20 min) by the CMake
+  # custom command, so the resulting xcframeworks are cached on the build
+  # script's hash. ADVISORY until validated on a real runner — flip
+  # continue-on-error to false once it is green.
+  # ---------------------------------------------------------------------------
+  build-ios:
+    name: Build (iOS)
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt (host desktop, for moc/rcc)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia
+          cache: true
+
+      - name: Install Qt (iOS)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: ios
+          modules: qtmultimedia
+          cache: true
+
+      - name: Install build deps
+        run: brew install ninja
+
+      - name: Cache iOS FFmpeg+SRT xcframeworks
+        uses: actions/cache@v4
+        with:
+          path: ios_build/xcframeworks
+          key: ios-ffmpeg-${{ hashFiles('build-scripts/build_ffmpeg_ios_srt.sh') }}
+
+      - name: Configure (iOS)
+        run: >
+          "$IOS_QT_ROOT_DIR/bin/qt-cmake" -S . -B build-ios -G Xcode
+          -DQT_HOST_PATH="$QT_ROOT_DIR"
+          -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build (iOS, no signing)
+        run: >
+          cmake --build build-ios --config Debug --
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
