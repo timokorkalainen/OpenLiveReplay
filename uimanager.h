@@ -208,6 +208,11 @@ private:
 
     void restartPlaybackWorker();
 
+    // Shared control-action dispatch used by both MIDI bindings and the
+    // Stream Deck. Action ids documented in streamdeck/streamdeckmanager.h.
+    void dispatchControlAction(int action, bool isRelease);
+    void jogStep(int delta);
+
     ReplayManager* m_replayManager;
     AppSettings m_currentSettings;
     SettingsManager* m_settingsManager;

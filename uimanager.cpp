@@ -136,57 +136,7 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             emit midiLastValuesChanged();
         }
 
-        switch (matchedAction) {
-        case 0:
-            if (!isRelease) playPause();
-            break;
-        case 1:
-            if (isRelease) {
-                if (m_midiHoldAction == 1) {
-                    if (m_transport) {
-                        m_transport->setSpeed(1.0);
-                        m_transport->setPlaying(m_midiHoldWasPlaying);
-                    }
-                    m_midiHoldAction = -1;
-                }
-            } else {
-                cancelFollowLive();
-                m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
-                m_midiHoldAction = 1;
-                if (m_transport) {
-                    m_transport->setSpeed(-5.0);
-                    m_transport->setPlaying(true);
-                }
-            }
-            break;
-        case 2:
-            if (isRelease) {
-                if (m_midiHoldAction == 2) {
-                    if (m_transport) {
-                        m_transport->setSpeed(1.0);
-                        m_transport->setPlaying(m_midiHoldWasPlaying);
-                    }
-                    m_midiHoldAction = -1;
-                }
-            } else {
-                cancelFollowLive();
-                m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
-                m_midiHoldAction = 2;
-                if (m_transport) {
-                    m_transport->setSpeed(5.0);
-                    m_transport->setPlaying(true);
-                }
-            }
-            break;
-        case 3:
-            if (!isRelease) stepFrame();
-            break;
-        case 7:
-            if (!isRelease) stepFrameBack();
-            break;
-        case 8: {
-            if (!m_transport) break;
-
+        if (matchedAction == 8) {
             int forwardValue = m_midiBindingData2Forward.value(matchedAction, -1);
             int backwardValue = m_midiBindingData2Backward.value(matchedAction, -1);
 
@@ -196,38 +146,11 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             } else if (backwardValue >= 0 && data2 == backwardValue) {
                 deltaSign = -1;
             } else {
-                break;
+                return;
             }
-
-            m_transport->setPlaying(false);
-            cancelFollowLive();
-
-            m_transport->step(deltaSign);
-
-            if (m_playbackWorker) {
-                int64_t targetMs = m_transport->currentPos();
-                m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
-                m_playbackWorker->seekTo(targetMs);
-            }
-            break;
-        }
-        case 4:
-            if (!isRelease) goLive();
-            break;
-        case 5:
-            if (!isRelease) captureCurrent();
-            break;
-        case 6:
-            if (!isRelease) {
-                setPlaybackViewState(false, -1);
-                emit multiviewRequested();
-            }
-            break;
-        default:
-            if (!isRelease && matchedAction >= 100 && matchedAction < 108) {
-                emit feedSelectRequested(matchedAction - 100);
-            }
-            break;
+            jogStep(deltaSign);
+        } else {
+            dispatchControlAction(matchedAction, isRelease);
         }
     });
     connect(m_midiManager, &MidiManager::portsChanged, this, &UIManager::midiPortsChanged);
@@ -265,6 +188,98 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     }
     refreshScreens();
     refreshProviders();
+}
+
+void UIManager::dispatchControlAction(int action, bool isRelease)
+{
+    switch (action) {
+    case 0:
+        if (!isRelease) playPause();
+        break;
+    case 1:
+        if (isRelease) {
+            if (m_midiHoldAction == 1) {
+                if (m_transport) {
+                    m_transport->setSpeed(1.0);
+                    m_transport->setPlaying(m_midiHoldWasPlaying);
+                }
+                m_midiHoldAction = -1;
+            }
+        } else {
+            cancelFollowLive();
+            m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
+            m_midiHoldAction = 1;
+            if (m_transport) {
+                m_transport->setSpeed(-5.0);
+                m_transport->setPlaying(true);
+            }
+        }
+        break;
+    case 2:
+        if (isRelease) {
+            if (m_midiHoldAction == 2) {
+                if (m_transport) {
+                    m_transport->setSpeed(1.0);
+                    m_transport->setPlaying(m_midiHoldWasPlaying);
+                }
+                m_midiHoldAction = -1;
+            }
+        } else {
+            cancelFollowLive();
+            m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
+            m_midiHoldAction = 2;
+            if (m_transport) {
+                m_transport->setSpeed(5.0);
+                m_transport->setPlaying(true);
+            }
+        }
+        break;
+    case 3:
+        if (!isRelease) stepFrame();
+        break;
+    case 7:
+        if (!isRelease) stepFrameBack();
+        break;
+    case 4:
+        if (!isRelease) goLive();
+        break;
+    case 5:
+        if (!isRelease) captureCurrent();
+        break;
+    case 6:
+        if (!isRelease) {
+            setPlaybackViewState(false, -1);
+            emit multiviewRequested();
+        }
+        break;
+    case 9:
+        if (!isRelease) {
+            if (isRecording()) stopRecording();
+            else startRecording();
+        }
+        break;
+    default:
+        if (!isRelease && action >= 100 && action < 108) {
+            emit feedSelectRequested(action - 100);
+        }
+        break;
+    }
+}
+
+void UIManager::jogStep(int delta)
+{
+    if (!m_transport || delta == 0) return;
+
+    m_transport->setPlaying(false);
+    cancelFollowLive();
+
+    m_transport->step(delta);
+
+    if (m_playbackWorker) {
+        int64_t targetMs = m_transport->currentPos();
+        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
+        m_playbackWorker->seekTo(targetMs);
+    }
 }
 
 static int nextSourceIdSeed(const QList<SourceSettings> &sources) {
