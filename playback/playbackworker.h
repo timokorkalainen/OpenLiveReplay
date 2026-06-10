@@ -62,6 +62,9 @@ private:
     // High-performance conversion from FFmpeg AVFrame to QVideoFrame (YUV420P)
     QVideoFrame convertToQVideoFrame(AVFrame* frame);
 
+    // Push a decoded audio frame, PTS-tagged, to the audio player
+    void pushAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame);
+
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
 
