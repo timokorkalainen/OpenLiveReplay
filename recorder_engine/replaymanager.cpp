@@ -103,6 +103,12 @@ void ReplayManager::startRecording() {
             worker->setSourceMetadata(m_sourceMetadata[s]);
         }
 
+        // The worker QObject must live on its own thread, otherwise the
+        // queued masterPulse slot (jitter pull + encode + mux write) runs
+        // on the MAIN thread: QThread object affinity is the creating
+        // thread, and run()/exec() alone does not change it.
+        worker->moveToThread(worker);
+
         connect(this, &ReplayManager::masterPulse,
                 worker, &StreamWorker::onMasterPulse,
                 Qt::QueuedConnection);
