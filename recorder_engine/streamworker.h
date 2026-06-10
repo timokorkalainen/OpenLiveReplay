@@ -28,6 +28,15 @@ extern "C" {
 class StreamWorker : public QThread {
     Q_OBJECT
 public:
+    // Delay applied to captured media before it is written to the file.
+    // Video frames sit in the jitter queue this long; audio shares the
+    // same delay so both land on the same timeline.
+    static constexpr int kJitterBufferMs = 200;
+
+    // Recorded audio format (48 kHz stereo S16, conformed by swresample)
+    static constexpr int kAudioSampleRate = 48000;
+    static constexpr int kAudioBytesPerSample = 2 * int(sizeof(int16_t));
+
     // sourceIndex: fixed identity of this source (for logging)
     // initialViewTrack: which muxer track to encode into (-1 = no view assigned)
     StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
@@ -85,7 +94,16 @@ private:
     int m_stallTimeoutMs = 8000;
     std::atomic<bool> m_connected{false};
     int m_connectBackoffMs = 1000;
-    int m_jitterBufferMs = 200;
+
+    // Audio FIFO: the capture thread produces resampled 48 kHz stereo S16
+    // stamped on the global recording timeline; the master-pulse tick
+    // consumes it on a sample-accurate cursor (gap-filled with silence).
+    QMutex m_audioFifoMutex;
+    QByteArray m_audioFifo;
+    int64_t m_audioFifoStartSample = -1;  // timeline sample index of m_audioFifo[0]
+    int64_t m_audioWriteCursor = -1;      // next sample to mux (tick thread only)
+    void enqueueAudio(int64_t startSample, const uint8_t* data, int numSamples);
+    void writeAudioForTick(int64_t recordingTimeMs, int track);
 
     int m_targetWidth = 1920;
     int m_targetHeight = 1080;

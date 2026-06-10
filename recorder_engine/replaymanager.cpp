@@ -90,6 +90,7 @@ void ReplayManager::startRecording() {
     //    Workers capture from their URL and encode into whichever view-track
     //    they are currently mapped to (or skip encoding when m_viewTrack == -1).
     m_globalFrameCount = 0;
+    m_blueAudioCursor = QVector<int64_t>(m_viewCount, -1);
     const int sourceCount = m_sourceUrls.size();
 
     for (int s = 0; s < sourceCount; ++s) {
@@ -217,10 +218,20 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         return;
     }
 
+    // Frame-count-derived recording time on the FILE timeline: same as
+    // the source workers' audio cursor, so silence and source audio tile
+    // seamlessly when a view's mapping changes.
+    const int64_t recMs = (m_globalFrameCount * 1000) / m_fps;
+    const int64_t silenceTargetEnd = recMs * StreamWorker::kAudioSampleRate / 1000;
+
     for (int v = 0; v < m_viewCount; ++v) {
         // Skip views that have a source assigned (those get real frames
-        // from the source worker's processEncoderTick).
-        if (v < m_viewSlotMap.size() && m_viewSlotMap[v] >= 0) continue;
+        // from the source worker's processEncoderTick).  Reset the
+        // silence cursor so an unmap later resumes at current time.
+        if (v < m_viewSlotMap.size() && m_viewSlotMap[v] >= 0) {
+            if (v < m_blueAudioCursor.size()) m_blueAudioCursor[v] = -1;
+            continue;
+        }
 
         AVPacket* pkt = av_packet_clone(basePkt);
         if (!pkt) continue;
@@ -233,24 +244,37 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         m_muxer->writePacket(pkt);
         av_packet_free(&pkt);
 
-        // Write silence audio for unmapped views (PCM S16LE zero-fill)
-        {
-            const int silenceSamples = 48000 / m_fps;
-            const int silenceBytes = silenceSamples * 2 * int(sizeof(int16_t)); // stereo
-            int audioTrackIdx = m_muxer->audioTrackOffset() + v;
-            AVPacket* aPkt = av_packet_alloc();
-            if (aPkt) {
-                av_new_packet(aPkt, silenceBytes);
-                memset(aPkt->data, 0, silenceBytes);
-                aPkt->stream_index = audioTrackIdx;
-                AVStream* aSt = m_muxer->getStream(audioTrackIdx);
-                if (aSt) {
-                    aPkt->pts = av_rescale_q(elapsedMs, {1, 1000}, aSt->time_base);
-                    aPkt->dts = aPkt->pts;
-                    aPkt->duration = av_rescale_q(silenceSamples, {1, 48000}, aSt->time_base);
+        // Write gap-free silence for unmapped views (PCM S16LE zero-fill).
+        // Cursor-based: missed heartbeat ticks are filled on the next one
+        // instead of leaving holes in the PCM track, and the same jitter
+        // delay as source audio keeps mapping transitions seamless.
+        if (silenceTargetEnd > 0 && v < m_blueAudioCursor.size()) {
+            int64_t &cursor = m_blueAudioCursor[v];
+            if (cursor < 0) {
+                cursor = qMax<int64_t>(0, silenceTargetEnd
+                                          - StreamWorker::kAudioSampleRate / m_fps);
+            }
+            if (silenceTargetEnd > cursor) {
+                const int64_t n = qMin<int64_t>(silenceTargetEnd - cursor,
+                                                StreamWorker::kAudioSampleRate);
+                const int silenceBytes = int(n) * StreamWorker::kAudioBytesPerSample;
+                int audioTrackIdx = m_muxer->audioTrackOffset() + v;
+                AVPacket* aPkt = av_packet_alloc();
+                if (aPkt && av_new_packet(aPkt, silenceBytes) == 0) {
+                    memset(aPkt->data, 0, silenceBytes);
+                    aPkt->stream_index = audioTrackIdx;
+                    AVStream* aSt = m_muxer->getStream(audioTrackIdx);
+                    if (aSt) {
+                        aPkt->pts = av_rescale_q(cursor,
+                            {1, StreamWorker::kAudioSampleRate}, aSt->time_base);
+                        aPkt->dts = aPkt->pts;
+                        aPkt->duration = av_rescale_q(n,
+                            {1, StreamWorker::kAudioSampleRate}, aSt->time_base);
+                    }
+                    m_muxer->writePacket(aPkt);
                 }
-                m_muxer->writePacket(aPkt);
-                av_packet_free(&aPkt);
+                if (aPkt) av_packet_free(&aPkt);
+                cursor += n;
             }
         }
 
