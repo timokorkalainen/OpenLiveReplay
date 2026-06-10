@@ -57,6 +57,12 @@ void StreamWorker::run() {
 void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     m_internalFrameCount = frameIndex;
 
+    // Publish this tick's jitter-pull gate for the capture thread's
+    // queue pre-drain (see captureLoop).
+    m_lastTickTargetMs.store(
+        qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - kJitterBufferMs),
+        std::memory_order_relaxed);
+
     if (!m_persistentEncCtx) return;
 
     // Stall detection: if connected but no frames for too long, signal restart.
@@ -330,7 +336,24 @@ void StreamWorker::captureLoop() {
 
                             m_lastFrameEnqueueTimer.restart();
 
-                            while (m_frameQueue.size() > 1000) {
+                            // Pre-drain frames the next tick would discard
+                            // anyway: the tick keeps only the newest frame
+                            // at-or-before its gate, so the head is garbage
+                            // as soon as a SECOND frame is inside the gate.
+                            // Never drops the newest gated frame — a lagging
+                            // source shows late-but-updating video instead
+                            // of freezing.
+                            const int64_t tickGateMs =
+                                m_lastTickTargetMs.load(std::memory_order_relaxed);
+                            while (tickGateMs >= 0 && m_frameQueue.size() >= 2
+                                   && m_frameQueue.at(1).sourcePts <= tickGateMs) {
+                                auto old = m_frameQueue.dequeue();
+                                av_frame_free(&old.frame);
+                            }
+                            // Count backstop (~10 s of frames) against
+                            // future-stamped bursts after a re-anchor.
+                            const int backstopFrames = 10 * m_targetFps;
+                            while (m_frameQueue.size() > backstopFrames) {
                                 auto old = m_frameQueue.dequeue();
                                 av_frame_free(&old.frame);
                             }
