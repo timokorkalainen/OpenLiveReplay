@@ -191,7 +191,10 @@ public slots:
     // Called when a URL is changed in the UI text fields
     void updateStreamUrl(int index, const QString& url);
 
-    void onRecorderPulse(int64_t elapsed, int64_t frameCount);
+    // Receives ReplayManager::masterPulse(frameIndex, elapsedMs).
+    // NOTE: parameter order is (frame index, elapsed ms) — they were
+    // previously named in the opposite order, which was a landmine.
+    void onRecorderPulse(int64_t frameIndex, int64_t elapsedMs);
 
 private:
     void syncActiveStreams();
