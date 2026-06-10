@@ -2,10 +2,16 @@ import Combine
 import Foundation
 
 /// Single source of truth for everything rendered on connected decks.
-/// All setters guard against no-op writes so SwiftUI only invalidates (and
-/// the SDK only re-transmits over USB) keys whose content actually changed.
-/// Main-thread only — written from bridge calls, read by layout views.
+/// All setters guard against no-op writes, so a no-op state push never
+/// publishes (idle deck → zero re-renders). Per-key USB economy is the
+/// layout's responsibility: only container views observe this object and
+/// leaf key views are Equatable (see ReplayDeckLayout).
+@MainActor
 final class DeckState: ObservableObject {
+
+    /// Sub-pixel on the widest (~2000 px) touch strip — can never suppress
+    /// a visible scrub-bar change.
+    private static let positionEpsilon = 0.0005
 
     /// model identifier ("mini", "plus", ...) → key-index → action id.
     @Published private(set) var keyMappings: [String: [Int]] = [:]
@@ -34,7 +40,7 @@ final class DeckState: ObservableObject {
 
     func setPosition(timecodeText: String, positionFraction: Double) {
         if self.timecodeText != timecodeText { self.timecodeText = timecodeText }
-        if abs(self.positionFraction - positionFraction) > 0.0005 {
+        if abs(self.positionFraction - positionFraction) > Self.positionEpsilon {
             self.positionFraction = positionFraction
         }
     }

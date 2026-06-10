@@ -2,6 +2,7 @@ import Combine
 import XCTest
 @testable import StreamDeckBridge
 
+@MainActor
 final class DeckStateTests: XCTestCase {
 
     private var cancellables = Set<AnyCancellable>()
@@ -56,6 +57,24 @@ final class DeckStateTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
+    func testUnchangedKeyMappingDoesNotPublish() {
+        let state = DeckState()
+        state.setKeyMapping([9, 0], forModel: "mini")
+        let count = changeCount(of: state) {
+            state.setKeyMapping([9, 0], forModel: "mini")
+        }
+        XCTAssertEqual(count, 0)
+    }
+
+    func testChangedTimecodeAlonePublishesExactlyOnce() {
+        let state = DeckState()
+        state.setPosition(timecodeText: "00:00:00:01", positionFraction: 0.5)
+        let count = changeCount(of: state) {
+            state.setPosition(timecodeText: "00:00:00:02", positionFraction: 0.5)
+        }
+        XCTAssertEqual(count, 1)
+    }
+
     // MARK: Key mapping lookup
 
     func testActionForKeyUsesModelMapping() {
@@ -89,6 +108,13 @@ final class DeckStateTests: XCTestCase {
         XCTAssertEqual(mapping.count, 15)
         XCTAssertEqual(Array(mapping.prefix(11)), [9, 0, 4, 5, 7, 3, 1, 2, 6, 20, 21])
         XCTAssertEqual(Array(mapping.suffix(4)), [-1, -1, -1, -1])
+    }
+
+    func testDefaultMappingPedalClampsToKeyCount() {
+        XCTAssertEqual(
+            DeckAction.defaultMapping(modelIdentifier: "pedal", keyCount: 2),
+            [0, 7]
+        )
     }
 
     func testDefaultMappingPlusTopEight() {

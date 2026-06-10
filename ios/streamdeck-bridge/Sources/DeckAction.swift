@@ -54,6 +54,10 @@ extension DeckAction {
         }
     }
 
+    /// Model identifier for the key-less Stream Deck Pedal (must match
+    /// deckModelIdentifier(for:) in OLRStreamDeckBridge.swift).
+    static let pedalModelIdentifier = "pedal"
+
     /// Keys are filled from this list, top priority first.
     static let keyPriority: [DeckAction] = [
         .record, .playPause, .goLive, .capture,
@@ -66,11 +70,15 @@ extension DeckAction {
     /// OLRStreamDeckBridge.setKeyMapping(_:forModel:) (future remapping).
     static func defaultMapping(modelIdentifier: String, keyCount: Int) -> [Int] {
         guard keyCount > 0 else { return [] }
-        if modelIdentifier == "pedal" {
+        if modelIdentifier == pedalModelIdentifier {
             // Foot switches, no displays: play/pause, step back, step forward.
-            return [DeckAction.playPause.rawValue,
-                    DeckAction.stepBackward.rawValue,
-                    DeckAction.stepForward.rawValue]
+            let pedalActions = [DeckAction.playPause.rawValue,
+                                DeckAction.stepBackward.rawValue,
+                                DeckAction.stepForward.rawValue]
+            if pedalActions.count >= keyCount {
+                return Array(pedalActions.prefix(keyCount))
+            }
+            return pedalActions + Array(repeating: -1, count: keyCount - pedalActions.count)
         }
         var mapping = keyPriority.prefix(keyCount).map(\.rawValue)
         if mapping.count < keyCount {
