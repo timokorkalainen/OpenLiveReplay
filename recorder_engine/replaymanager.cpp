@@ -73,6 +73,8 @@ void ReplayManager::startRecording() {
     // 2. Initialize Muxer with M view-tracks (not N source-tracks)
     const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     m_sessionFileName = m_baseFileName + "_" + timestamp;
+    // Recordings go to the user-configured location (empty = default)
+    m_muxer->setOutputDirectory(m_outputDir);
     if (!m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames)) {
         qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
@@ -102,6 +104,12 @@ void ReplayManager::startRecording() {
         if (s < m_sourceMetadata.size()) {
             worker->setSourceMetadata(m_sourceMetadata[s]);
         }
+
+        // The worker QObject must live on its own thread, otherwise the
+        // queued masterPulse slot (jitter pull + encode + mux write) runs
+        // on the MAIN thread: QThread object affinity is the creating
+        // thread, and run()/exec() alone does not change it.
+        worker->moveToThread(worker);
 
         connect(this, &ReplayManager::masterPulse,
                 worker, &StreamWorker::onMasterPulse,
@@ -287,11 +295,6 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
 }
 
 // ─── Utility ───────────────────────────────────────────────────────────
-QString ReplayManager::getFullOutputPath() {
-    QDir dir(m_outputDir);
-    return dir.absoluteFilePath(m_baseFileName + ".mkv");
-}
-
 int64_t ReplayManager::getElapsedMs() {
     if(!m_clock) return -1;
     return m_clock->elapsedMs();
