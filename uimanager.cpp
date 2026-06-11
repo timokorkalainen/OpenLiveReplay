@@ -951,9 +951,10 @@ void UIManager::startRecording() {
 
     m_replayManager->startRecording();
     if (!m_replayManager->isRecording()) {
-        const QString reason = hadSources
-            ? QStringLiteral("Failed to start recording (could not initialize output file)")
-            : QStringLiteral("Failed to start recording (no input sources configured)");
+        const QString reason =
+            hadSources
+                ? QStringLiteral("Failed to start recording (could not initialize output file)")
+                : QStringLiteral("Failed to start recording (no input sources configured)");
         qWarning() << "UIManager:" << reason << "; not launching playback";
         emit recordingFailed(reason);
         return;

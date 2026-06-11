@@ -165,7 +165,7 @@ signals:
     void playbackProvidersChanged();
     void recordingStarted();
     void recordingStopped();
-    void recordingFailed(const QString &reason);
+    void recordingFailed(const QString& reason);
     void recordedDurationMsChanged();
     void scrubPositionChanged();
     void recordingStartEpochMsChanged();
