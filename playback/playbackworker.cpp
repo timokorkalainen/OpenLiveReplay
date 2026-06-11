@@ -1,7 +1,10 @@
 #include "playback/playbackworker.h"
 #include <QDebug>
 #include <QMutexLocker>
+#include <QElapsedTimer>
 #include <cstdio>
+#include <cmath>
+#include <cstdint>
 
 PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport,
                                AudioPlayer *audioPlayer, QObject *parent)
@@ -35,11 +38,6 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     m_seekTargetMs = qMax<int64_t>(0, timestampMs);
 }
 
-void PlaybackWorker::setFrameBufferMax(int maxFrames) {
-    QMutexLocker bufferLocker(&m_bufferMutex);
-    m_frameBufferMax = qMax(1, maxFrames);
-}
-
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
     int prev = m_activeAudioView.exchange(viewIndex, std::memory_order_relaxed);
     if (prev == viewIndex) return;   // no actual change
@@ -50,6 +48,9 @@ void PlaybackWorker::setActiveAudioView(int viewIndex) {
     // a data race.  Instead, all decoders run continuously (see run()),
     // so the new view's decoder is already warm and ready.
     if (m_audioPlayer) m_audioPlayer->clear();
+    // The worker-side AudioFrameQueue is worker-thread-owned; signal the
+    // worker to drop it + re-prime (spec §6.7) rather than touch it here.
+    m_audioReprime.store(true, std::memory_order_relaxed);
 }
 
 void PlaybackWorker::stop() {
@@ -174,6 +175,25 @@ int64_t PlaybackWorker::refNewestPts() const {
     return m_decoderBank[0]->buffer.newestPts();
 }
 
+int64_t PlaybackWorker::refOldestPts() const {
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    if (m_decoderBank.isEmpty()) return -1;
+    return m_decoderBank[0]->buffer.oldestPts();
+}
+
+void PlaybackWorker::resetDedup() {
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    for (auto* track : m_decoderBank) track->lastDeliveredPtsMs = -1;
+}
+
+void PlaybackWorker::clearAllBuffers() {
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    for (auto* track : m_decoderBank) {
+        track->buffer.clear();
+        track->decimateCounter = 0;
+    }
+}
+
 bool PlaybackWorker::reuseAt(int64_t target) {
     // True iff the bank is non-empty AND every track has a decoded frame
     // within frameDurMs/2 of target.
@@ -186,11 +206,197 @@ bool PlaybackWorker::reuseAt(int64_t target) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// enqueueAudioFrame — format-guarded enqueue of active-view audio (spec §6.7).
+// Mirrors the old pushAudioFrame format guard (S16 / 48k / stereo) but routes
+// the PCM into the worker-side queue instead of pushing to AudioPlayer.
+// ---------------------------------------------------------------------------
+void PlaybackWorker::enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame,
+                                      bool dedupTail) {
+    if (audioFrame->format != AV_SAMPLE_FMT_S16
+        || audioFrame->sample_rate != 48000
+        || audioFrame->ch_layout.nb_channels != 2) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            qWarning() << "PlaybackWorker: unsupported audio frame format"
+                       << audioFrame->format << audioFrame->sample_rate
+                       << audioFrame->ch_layout.nb_channels;
+        }
+        return;
+    }
+
+    int64_t pts = audioFrame->pts;
+    if (pts == AV_NOPTS_VALUE) pts = audioFrame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) return;
+
+    const AVRational tb = m_fmtCtx->streams[aTrack->streamIndex]->time_base;
+    const int64_t ptsMs = av_rescale_q(pts, tb, {1, 1000});
+
+    // Dedup-before-decode after EOF un-latch (§6.8): a re-read tail cluster's
+    // audio is already queued/played — skip it to avoid duplicate audio.
+    if (dedupTail && aTrack->lastEnqueuedPtsMs >= 0 && ptsMs <= aTrack->lastEnqueuedPtsMs)
+        return;
+
+    const int dataSize = audioFrame->nb_samples
+                         * audioFrame->ch_layout.nb_channels
+                         * int(sizeof(int16_t));
+    m_audioQueue.enqueue(ptsMs, reinterpret_cast<const char*>(audioFrame->data[0]), dataSize);
+    aTrack->lastEnqueuedPtsMs = ptsMs;
+}
+
+// ---------------------------------------------------------------------------
+// decodePacketIntoBank — decode one read packet into the bank.
+//  * video: optional count-based decimation (§6.3); insert with window cap;
+//           framesDropped++ on cap drop. dedupTail skips frames whose PTS is
+//           <= the owning track's current newest (post-EOF re-read, §6.8).
+//  * audio: keep ALL decoders warm; enqueue only the active view when audioOn.
+// Returns the ms-PTS of the last video frame inserted, or INT64_MIN if none.
+// Caller must NOT hold m_bufferMutex (we lock it for the insert).
+// ---------------------------------------------------------------------------
+int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame* af,
+                                             int64_t P, int dir, int trackCount,
+                                             bool decimate, int decimateStep,
+                                             bool audioOn, bool dedupTail) {
+    int64_t lastVideoPtsMs = INT64_MIN;
+    const int cap = capFrames(trackCount);
+    // Protect the active fill range in the travel direction (spec §6.6) so the
+    // cap can never evict a frame the window still needs:
+    //   forward: [P, P + kLeadMs]   reverse: [P - kLeadMs, P]
+    const int64_t protectLo = (dir >= 0) ? P : (P - kLeadMs);
+    const int64_t protectHi = (dir >= 0) ? (P + kLeadMs) : P;
+
+    for (auto* track : m_decoderBank) {
+        if (pkt->stream_index != track->streamIndex) continue;
+
+        // Count-based decimation: keep every decimateStep-th decoded frame.
+        // The keep-counter is per-track and advances per decoded *frame*, so a
+        // DTS-bumped on-disk PTS lattice is irrelevant (spec §6.3).
+        if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
+            while (avcodec_receive_frame(track->codecCtx, vf) == 0) {
+                bool keep = true;
+                if (decimate) {
+                    keep = (track->decimateCounter % decimateStep) == 0;
+                    track->decimateCounter++;
+                }
+                if (!keep) { av_frame_unref(vf); continue; }
+
+                int64_t framePts = vf->pts;
+                if (framePts == AV_NOPTS_VALUE) framePts = vf->best_effort_timestamp;
+                AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
+                int64_t framePtsMs;
+                if (framePts != AV_NOPTS_VALUE) {
+                    framePtsMs = av_rescale_q(framePts, tb, {1, 1000});
+                } else {
+                    // No PTS: synthesize from the last known, or fall back to P.
+                    framePtsMs = (lastVideoPtsMs != INT64_MIN)
+                                     ? lastVideoPtsMs + frameDurMs()
+                                     : P;
+                }
+
+                // Dedup-before-decode after EOF un-latch: a re-read tail cluster
+                // already in the buffer is skipped (read cost only, no dup).
+                if (dedupTail) {
+                    int64_t nv;
+                    { QMutexLocker bufferLocker(&m_bufferMutex);
+                      nv = track->buffer.newestPts(); }
+                    if (nv >= 0 && framePtsMs <= nv) { av_frame_unref(vf); continue; }
+                }
+
+                QVideoFrame qFrame = convertToQVideoFrame(vf);
+                {
+                    QMutexLocker bufferLocker(&m_bufferMutex);
+                    if (!track->buffer.insert(framePtsMs, qFrame, cap, protectLo, protectHi))
+                        m_counters.framesDropped++;
+                }
+                lastVideoPtsMs = framePtsMs;
+                av_frame_unref(vf);
+            }
+        }
+        return lastVideoPtsMs;
+    }
+
+    // Audio: keep every decoder warm (instant view switch); enqueue active view.
+    for (auto* aTrack : m_audioDecoderBank) {
+        if (pkt->stream_index != aTrack->streamIndex) continue;
+        if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
+            while (avcodec_receive_frame(aTrack->codecCtx, af) == 0) {
+                int activeView = m_activeAudioView.load(std::memory_order_relaxed);
+                if (audioOn && activeView == aTrack->viewIndex) {
+                    enqueueAudioFrame(aTrack, af, dedupTail);
+                }
+                av_frame_unref(af);
+            }
+        }
+        return lastVideoPtsMs;
+    }
+
+    return lastVideoPtsMs;
+}
+
+// ---------------------------------------------------------------------------
+// repositionTo (spec §6.2) — reuse fast-path or full trail-covering reposition.
+// ---------------------------------------------------------------------------
 void PlaybackWorker::repositionTo(int64_t target, int dir,
                                   AVPacket* pkt, AVFrame* vf, AVFrame* af) {
-    // TODO Task 5: implement the windowed reposition (reuse fast-path + full
-    // seek/decode-forward fill). Not called by the existing loop this task.
-    (void)target; (void)dir; (void)pkt; (void)vf; (void)af;
+    const int trackCount = qMax(1, int(m_decoderBank.size()));
+
+    // --- Reuse fast-path: every track already has a real frame at target. ---
+    if (reuseAt(target)) {
+        resetDedup();
+        deliverDueFrames(target, dir);
+        // Backward reuse-seek is an audio reposition (§6.7): clear + re-prime,
+        // never a silent re-release (AudioPlayer's overlap-trim would swallow it).
+        if (dir < 0) {
+            m_audioQueue.clear();
+            if (m_audioPlayer) m_audioPlayer->clear();
+        }
+        m_counters.reuseSeek++;
+        return;
+    }
+
+    // --- Full reposition: clear everything, seek behind target, fill forward. ---
+    clearAllBuffers();
+    m_audioQueue.clear();
+    for (auto* aTrack : m_audioDecoderBank) aTrack->lastEnqueuedPtsMs = -1;
+    if (m_audioPlayer) m_audioPlayer->clear();
+
+    const int64_t anchor = qMax<int64_t>(0, target - (dir < 0 ? kLeadMs : kTrailMs));
+
+    AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
+    int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
+    av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
+    // Intra-only: no avcodec_flush_buffers needed (spec §6.2); the seek itself
+    // restarts the read cursor and the next sent packet decodes standalone.
+
+    // Decode forward through target + frameDurMs, inserting all tracks. Audio is
+    // re-primed by the normal forward release after the reposition, so we do NOT
+    // enqueue here (audio queue stays empty until forward fill repopulates it).
+    const int64_t fillTo = target + frameDurMs();
+    int packets = 0;
+    const int packetBudget = (capFrames(trackCount) + 4) * trackCount * 2;
+    while (!shouldInterrupt()) {
+        // A newer explicit seek supersedes this fill.
+        { QMutexLocker locker(&m_mutex); if (m_seekTargetMs >= 0) break; }
+
+        int ret = av_read_frame(m_fmtCtx, pkt);
+        if (ret < 0) break;   // EOF/short file: deliver what we have
+
+        // Reposition decodes forward from the anchor; protect the [target,
+        // target+kLead] span (dir=+1) — the trail below target is also kept by
+        // the anchor being kTrailMs/kLeadMs below it.
+        decodePacketIntoBank(pkt, vf, af, target, /*dir*/1, trackCount,
+                             /*decimate*/false, /*step*/1,
+                             /*audioOn*/false, /*dedupTail*/false);
+        av_packet_unref(pkt);
+
+        if (++packets > packetBudget) break;          // safety bound
+        if (newestPtsMin() >= fillTo) break;           // covered the target
+    }
+
+    resetDedup();
+    deliverDueFrames(target, dir);
+    m_counters.reposition++;
 }
 
 void PlaybackWorker::run() {
@@ -332,251 +538,288 @@ void PlaybackWorker::run() {
     AVFrame* frame = av_frame_alloc();
     AVFrame* audioFrame = av_frame_alloc();
 
-    int64_t lastProcessedPtsMs = -1;
     { QMutexLocker locker(&m_mutex); m_seekTargetMs = -1; }
 
+    // Telemetry: emit a SEC line once per wall-second.
+    int64_t lastTelemetryMs = 0;
+    QElapsedTimer wallClock; wallClock.start();
+    // EOF read-error backoff bound (non-EOF errors; §6.8).
+    int readErrStreak = 0;
+    const int kMaxReadErrStreak = 200;
+
+    // ----------------------------------------------------------------------
+    // THE WINDOWED SCHEDULER (spec §6).
+    // ----------------------------------------------------------------------
     while (!shouldInterrupt()) {
 
-        // --- 2. GET MASTER TIME FROM TRANSPORT ---
-        int64_t masterTimeMs = m_transport->currentPos();
+        // --- Sample state (spec §6.1) ---
+        int64_t P        = m_transport->currentPos();
+        bool    playing  = m_transport->isPlaying();
+        double  speed    = m_transport->speed();
+        const double aspeed = qAbs(speed);
+        int     dir      = playing ? (speed < 0 ? -1 : 1) : m_lastMoveDir;
+        const int trackCount = qMax(1, int(m_decoderBank.size()));
 
-        // --- PAUSE HANDLING ---
-        // If playback is paused, block here until resumed — but still
-        // react to pending seeks: paused scrubbing and frame stepping
-        // must seek + burst-decode, or the frame buffer has nothing at
-        // the target and the picture freezes.
-        while (!shouldInterrupt() && !m_transport->isPlaying()) {
-            {
-                QMutexLocker locker(&m_mutex);
-                if (m_seekTargetMs >= 0) break;
-            }
-            msleep(10);
-            masterTimeMs = m_transport->currentPos();
+        // --- Audio re-prime request from setActiveAudioView (UI thread) ---
+        if (m_audioReprime.exchange(false, std::memory_order_relaxed)) {
+            m_audioQueue.clear();
+            if (m_audioPlayer) m_audioPlayer->clear();
         }
 
-        // --- 3. CHECK FOR EXTERNAL SEEK (SCRUBBING) ---
-        // If the master clock is far away from our last frame, trigger a hard seek
-        m_mutex.lock();
-        if (m_seekTargetMs >= 0 || (lastProcessedPtsMs >= 0 && qAbs(masterTimeMs - lastProcessedPtsMs) > 500)) {
-            int64_t target = (m_seekTargetMs >= 0) ? m_seekTargetMs : masterTimeMs;
+        // --- Telemetry: once per wall-second (spec §11.1) ---
+        const int64_t nowMs = wallClock.elapsed();
+        if (nowMs - lastTelemetryMs >= 1000) {
+            lastTelemetryMs = nowMs;
+            emitTelemetry(P, newestPtsMax(), speed);
+        }
 
-            // Map MS to stream timebase (using the first video track as reference)
-            if (m_decoderBank.isEmpty()) {
-                m_mutex.unlock();
-                msleep(10);
-                continue;
-            }
-            AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
-            int64_t seekPts = av_rescale_q(target, {1, 1000}, vStream->time_base);
-
-            av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
-
-            // Flush all decoders in the bank
-            for(auto* track : m_decoderBank) {
-                if(track->codecCtx) avcodec_flush_buffers(track->codecCtx);
-            }
-            for (auto* aTrack : m_audioDecoderBank) {
-                if (aTrack->codecCtx) avcodec_flush_buffers(aTrack->codecCtx);
-            }
-            if (m_audioPlayer) m_audioPlayer->clear();
-
-            // Clear stale frames from the buffer to prevent visual artifacts
+        // --- Pause handling (§6.9): block, but wake on a pending seek OR when
+        //     P has left the currently delivered frame's interval. ---
+        if (!playing) {
+            // Recompute dir for the paused case from the last explicit move.
+            dir = m_lastMoveDir;
+            // Has the playhead left the delivered frame's interval? If the
+            // reference track has no frame at P, we must (re)deliver/reposition.
+            bool needWork = false;
             {
+                QMutexLocker locker(&m_mutex);
+                if (m_seekTargetMs >= 0) needWork = true;
+            }
+            if (!needWork) {
+                // If a frame at P exists and is already the delivered one, idle.
                 QMutexLocker bufferLocker(&m_bufferMutex);
-                for (auto* track : m_decoderBank) {
-                    track->buffer.clear();
+                if (!m_decoderBank.isEmpty()) {
+                    QVideoFrame f; int64_t p = -1;
+                    DecoderTrack* ref = m_decoderBank[0];
+                    if (!ref->buffer.frameAt(P, f, p) || p != ref->lastDeliveredPtsMs)
+                        needWork = true;
+                } else {
+                    needWork = true;
                 }
             }
+            if (!needWork) { msleep(10); continue; }
+            // else: fall through to classify→deliver while paused.
+        }
 
-            lastProcessedPtsMs = target;
-            m_seekTargetMs = -1;
-            m_mutex.unlock();
+        // === CLASSIFY (spec §6.1, priority order) ===
 
-            // Burst-decode to pre-fill the buffer so backward stepping works immediately after seek
-            {
-                int packetCount = 0;
-                const int bufMax = m_frameBufferMax;
-                const int trackCount = qMax(1, int(m_decoderBank.size()));
-                // Budget per track: a global frame count gave each track
-                // only bufMax/N frames of back-step room with N tracks.
-                const int packetMax = bufMax * 4 * trackCount;
-                QHash<DecoderTrack*, int> burstDecoded;
-                auto allTracksFull = [&]() {
-                    for (auto* t : m_decoderBank)
-                        if (burstDecoded.value(t, 0) < bufMax) return false;
-                    return true;
-                };
-                while (!shouldInterrupt() && !allTracksFull() && packetCount < packetMax) {
-                    // Abort burst if a new seek was requested
-                    {
-                        QMutexLocker locker(&m_mutex);
-                        if (m_seekTargetMs >= 0) break;
-                    }
-
-                    int ret = av_read_frame(m_fmtCtx, pkt);
-                    if (ret < 0) break;
-                    packetCount++;
-
-                    for (auto* track : m_decoderBank) {
-                        if (pkt->stream_index == track->streamIndex) {
-                            if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
-                                while (avcodec_receive_frame(track->codecCtx, frame) == 0) {
-                                    int64_t framePts = frame->pts;
-                                    if (framePts == AV_NOPTS_VALUE) framePts = frame->best_effort_timestamp;
-                                    AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
-                                    int64_t framePtsMs = lastProcessedPtsMs;
-                                    if (framePts != AV_NOPTS_VALUE) {
-                                        framePtsMs = av_rescale_q(framePts, tb, {1, 1000});
-                                        lastProcessedPtsMs = framePtsMs;
-                                    } else if (lastProcessedPtsMs >= 0) {
-                                        framePtsMs = lastProcessedPtsMs + 33;
-                                        lastProcessedPtsMs = framePtsMs;
-                                    }
-
-                                    QVideoFrame qFrame = convertToQVideoFrame(frame);
-                                    {
-                                        QMutexLocker bufferLocker(&m_bufferMutex);
-                                        track->buffer.insert(framePtsMs, qFrame, m_frameBufferMax,
-                                                             framePtsMs, framePtsMs);
-                                    }
-                                    burstDecoded[track]++;
-                                }
-                            }
-                            break;
-                        }
-                    }
-
-                    // Also keep audio decoders warm during burst (discard output)
-                    for (auto* aTrack : m_audioDecoderBank) {
-                        if (pkt->stream_index == aTrack->streamIndex) {
-                            if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
-                                while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
-                                    // If this is the active audio view, push to the ring buffer
-                                    int activeView = m_activeAudioView.load(std::memory_order_relaxed);
-                                    if (activeView == aTrack->viewIndex && m_audioPlayer) {
-                                        double spd = m_transport->speed();
-                                        bool normalSpeed = (spd > 0.99 && spd < 1.01);
-                                        if (normalSpeed && m_transport->isPlaying()) {
-                                            pushAudioFrame(aTrack, audioFrame);
-                                        }
-                                    }
-                                    av_frame_unref(audioFrame);
-                                }
-                            }
-                            break;
-                        }
-                    }
-
-                    av_packet_unref(pkt);
-                }
-
-                // Deliver the best buffered frame for the seek target
-                deliverBufferedFrameAtOrBefore(target);
-            }
-
-            // Reset to the seek target so the pace control doesn't see
-            // the burst-decoded PTS (which is ~1 s ahead) and gate audio.
-            lastProcessedPtsMs = target;
-
+        // (1) Explicit seek — coalesce to the latest target, clear it. → §6.2.
+        int64_t seekTarget = -1;
+        {
+            QMutexLocker locker(&m_mutex);
+            if (m_seekTargetMs >= 0) { seekTarget = m_seekTargetMs; m_seekTargetMs = -1; }
+        }
+        if (seekTarget >= 0) {
+            // Anchor direction by the recorded move sign (seekTo sets it in T6).
+            int seekDir = m_lastMoveDir;
+            repositionTo(seekTarget, seekDir, pkt, frame, audioFrame);
             continue;
         }
 
-        m_mutex.unlock();
-
-        // --- 4. & 5. READ & DECODE ---
-        // Always read packets — video and audio are interleaved in the MKV,
-        // so blocking the read loop to pace video also starves audio.
-        // Video frames are buffered; the existing buffer-cap prevents runaway
-        // memory.  Pace control (sleep) happens AFTER the read, not before it.
-        int readResult = av_read_frame(m_fmtCtx, pkt);
-
-        if (readResult >= 0) {
-            for (auto* track : m_decoderBank) {
-                if (pkt->stream_index == track->streamIndex) {
-                    if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
-                        while (avcodec_receive_frame(track->codecCtx, frame) == 0) {
-
-                            // Convert frame PTS to Milliseconds (with fallback)
-                            int64_t framePts = frame->pts;
-                            if (framePts == AV_NOPTS_VALUE) framePts = frame->best_effort_timestamp;
-                            AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
-                            int64_t framePtsMs = lastProcessedPtsMs;
-                            if (framePts != AV_NOPTS_VALUE) {
-                                framePtsMs = av_rescale_q(framePts, tb, {1, 1000});
-                                lastProcessedPtsMs = framePtsMs;
-                            } else if (lastProcessedPtsMs >= 0) {
-                                framePtsMs = lastProcessedPtsMs + 33; // fallback 30fps
-                                lastProcessedPtsMs = framePtsMs;
-                            } else {
-                                framePtsMs = masterTimeMs;
-                                lastProcessedPtsMs = framePtsMs;
-                            }
-                            QVideoFrame qFrame = convertToQVideoFrame(frame);
-                            {
-                                QMutexLocker bufferLocker(&m_bufferMutex);
-                                track->buffer.insert(framePtsMs, qFrame, m_frameBufferMax,
-                                                     framePtsMs, framePtsMs);
-                            }
-                            // NOTE: no immediate delivery here — frames are
-                            // released against the master clock below, so the
-                            // picture is not shown up to 100 ms early (the
-                            // decode lead allowed by the pace gate).
-                        }
-                    }
-                    break;
-                }
-            }
-
-            // --- AUDIO DECODE: keep ALL decoders running, route active view ---
-            // Decoding every audio stream continuously (PCM = near-zero cost)
-            // ensures that switching views is instant — no cold-start gap.
-            for (auto* aTrack : m_audioDecoderBank) {
-                if (pkt->stream_index != aTrack->streamIndex) continue;
-
-                if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
-                    while (avcodec_receive_frame(aTrack->codecCtx, audioFrame) == 0) {
-                        // Only push to speaker if this is the selected view
-                        int activeView = m_activeAudioView.load(std::memory_order_relaxed);
-                        if (activeView == aTrack->viewIndex && m_audioPlayer) {
-                            double spd = m_transport->speed();
-                            bool normalSpeed = (spd > 0.99 && spd < 1.01);
-                            if (normalSpeed && m_transport->isPlaying()) {
-                                pushAudioFrame(aTrack, audioFrame);
-                            }
-                        }
-                        av_frame_unref(audioFrame);
-                    }
-                }
-                break;  // packet matched this track, no need to check others
-            }
-
-            av_packet_unref(pkt);
-        }
-        else if (readResult == AVERROR_EOF) {
-            // Live-file handling: Reset EOF flags and wait for Muxer
-            if (m_fmtCtx->pb) {
-                m_fmtCtx->pb->eof_reached = 0;
-                m_fmtCtx->pb->error = 0;
-            }
-            msleep(10);
-            avformat_flush(m_fmtCtx);
+        // (2) Backward jump: P fell below everything buffered. → §6.2, reverse.
+        const int64_t oMin = oldestPtsMin();   // -1 if empty
+        if (oMin >= 0 && P < oMin - kBackJumpSlackMs) {
+            repositionTo(P, /*dir*/-1, pkt, frame, audioFrame);
+            continue;
         }
 
-        // --- DELIVER DUE FRAMES ---
-        // Release the newest buffered frame whose PTS is due on the
-        // master clock.  Decode runs ahead (see pace control), so
-        // delivering at decode time would show frames early and jittery.
-        deliverDueFrames(m_transport->currentPos());
+        // (3) Forward lag / overrun (playing, dir=+1): decode/playhead is ahead
+        //     of what's buffered. NEVER a reposition — skip-forward or tail-hold.
+        const int64_t nMin = newestPtsMin();   // -1 if empty
+        if (playing && dir == 1 && nMin >= 0 && nMin < P - kLeadMs) {
+            const int64_t nMax = newestPtsMax();
+            if (P > nMax) {
+                // §6.8 tail-hold: P is past the written tail. Hold last frame,
+                // poll for growth (handled below in the EOF path / idle).
+                // Fall through to deliver(last)+wait; no seek.
+            } else {
+                // §6.5 skip-forward: seek back a trail, resume decimated fill.
+                AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
+                int64_t anchor = qMax<int64_t>(0, P - kTrailMs);
+                int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
+                av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
+                clearAllBuffers();
+                m_audioQueue.clear();
+                if (m_audioPlayer) m_audioPlayer->clear();
+                m_counters.skipForward++;
+                // Fall through into the fill below (decimated) to repopulate.
+            }
+        }
 
-        // --- PACE CONTROL ---
-        // Throttle when we've decoded well ahead of the master clock.
-        // This MUST happen after reading/decoding so that audio packets
-        // (interleaved with video in the MKV) are never starved.
-        // The 100 ms margin keeps the audio ring buffer healthy — without
-        // it, the pace gate starves audio delivery and causes underruns
-        // (audible as a rattle after seek).
-        if (lastProcessedPtsMs > masterTimeMs + 100) {
-            msleep(5);
+        // === (4) DELIVER → FILL → TRIM → AUDIO → WAIT ===
+
+        // --- Deliver the frame at P (direction-aware dedup, §5) ---
+        deliverDueFrames(P, dir);
+
+        // --- FILL (direction-aware) ---
+        const bool decimate = aspeed > kDecimateAbove;
+        const int  decStep  = decimate ? int(std::ceil(aspeed)) : 1;
+        bool hitEof = false;
+        bool nonEofErr = false;
+        int  packetsThisIter = 0;
+
+        if (dir >= 0) {
+            // --- Forward fill (§6.3): bounded to the window + one batch. ---
+            const int kFillBatch = 4 * trackCount;
+            int batch = 0;
+            while (!shouldInterrupt() && batch < kFillBatch) {
+                // Stop once the buffered min-newest reaches the lead edge.
+                int64_t nm = newestPtsMin();
+                if (nm >= 0 && nm >= P + kLeadMs) break;
+                // Abort fill if a seek arrived.
+                { QMutexLocker locker(&m_mutex); if (m_seekTargetMs >= 0) break; }
+
+                int ret = av_read_frame(m_fmtCtx, pkt);
+                if (ret == AVERROR_EOF) { hitEof = true; break; }
+                if (ret < 0) { nonEofErr = true; break; }
+                readErrStreak = 0;
+                batch++;
+                packetsThisIter++;
+
+                // Audio enqueue only when at 1× forward single-view playing.
+                bool audioOn = playing && dir == 1 && (speed > 0.99 && speed < 1.01);
+                int64_t lastV = decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/1,
+                                                     trackCount, decimate, decStep, audioOn,
+                                                     /*dedupTail*/false);
+                av_packet_unref(pkt);
+
+                // Terminate when the just-read video packet crosses the slack edge.
+                if (lastV != INT64_MIN && lastV > P + kLeadMs + kSlackMs) break;
+            }
+        } else {
+            // --- Reverse fill (§6.4): fill-then-deliver one chunk atomically. ---
+            const int64_t rOldest = refOldestPts();
+            if (rOldest < 0 || (rOldest > P - kLeadMs && P > 0)) {
+                // Record the avio position of the current oldest (file-position
+                // terminator: well-defined under non-interleave skew).
+                const int64_t stopPos = (m_fmtCtx->pb) ? avio_tell(m_fmtCtx->pb) : -1;
+
+                AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
+                int64_t anchor = qMax<int64_t>(0, P - kLeadMs - kChunkMs);
+                int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
+                av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
+                m_counters.reverseChunkSeek++;
+
+                const int kReverseChunkBudget =
+                    int(std::ceil(double(kChunkMs) / qMax<int64_t>(1, frameDurMs())))
+                    * trackCount * 2;
+                int packets = 0;
+                while (!shouldInterrupt() && packets < kReverseChunkBudget) {
+                    { QMutexLocker locker(&m_mutex); if (m_seekTargetMs >= 0) break; }
+                    int ret = av_read_frame(m_fmtCtx, pkt);
+                    if (ret == AVERROR_EOF) { hitEof = true; break; }
+                    if (ret < 0) { nonEofErr = true; break; }
+                    readErrStreak = 0;
+                    packets++;
+                    packetsThisIter++;
+
+                    // Decode forward WITHOUT delivering partial-chunk frames
+                    // (audio muted in reverse). dir=-1 protects [P-kLead, P].
+                    decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/-1,
+                                         trackCount, decimate, decStep, /*audioOn*/false,
+                                         /*dedupTail*/false);
+
+                    // Terminate when the read cursor reaches the previous oldest
+                    // file position (the chunk above this is already buffered).
+                    int64_t cur = (m_fmtCtx->pb) ? avio_tell(m_fmtCtx->pb) : -1;
+                    av_packet_unref(pkt);
+                    if (stopPos >= 0 && cur >= 0 && cur >= stopPos) break;
+                }
+                // After the chunk is filled, top-down reverse delivery resumes.
+                deliverDueFrames(P, dir);
+            }
+        }
+
+        // --- TRIM (§6.6) + audio queue bound ---
+        {
+            int64_t keepFrom, keepTo;
+            if (dir >= 0) {
+                keepFrom = P - (kTrailMs + kSlackMs);
+                keepTo   = P + (kLeadMs + kSlackMs);
+            } else {
+                keepFrom = P - (kLeadMs + kChunkMs + kSlackMs);
+                keepTo   = P + (kTrailMs + kSlackMs);
+            }
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            for (auto* track : m_decoderBank) track->buffer.trim(keepFrom, keepTo);
+        }
+        m_audioQueue.dropOlderThan(P, kAudioLeadMs);
+
+        // --- AUDIO release (§6.7): only at 1× forward, playing, single active
+        //     view, unmuted. Release queued frames within kAudioLeadMs of P. ---
+        {
+            bool oneX = (speed > 0.99 && speed < 1.01);
+            int activeView = m_activeAudioView.load(std::memory_order_relaxed);
+            bool unmuted = m_audioPlayer && !m_audioPlayer->isMuted();
+            if (playing && dir == 1 && oneX && activeView >= 0 && unmuted) {
+                AudioFrameQueue::Frame af;
+                while (m_audioQueue.releaseDue(P, kAudioLeadMs, af)) {
+                    m_audioPlayer->pushSamples(
+                        reinterpret_cast<const uint8_t*>(af.pcm.constData()),
+                        af.pcm.size(), af.ptsMs, P);
+                    m_counters.audioPushes++;
+                }
+            } else {
+                // |speed|≠1 / reverse / multiview / muted: drop queued audio so
+                // it can't be stale-re-released on return to 1× (§6.7).
+                if (!m_audioQueue.isEmpty()) m_audioQueue.clear();
+            }
+        }
+
+        // --- EOF / live-growth handling (§6.8) ---
+        if (hitEof) {
+            msleep(kEofSleepMs);
+            int64_t sz = (m_fmtCtx->pb) ? avio_size(m_fmtCtx->pb) : -1;
+            if (sz > m_sizeAtLastEof) {
+                // Grown — un-latch and seek back to the reference newest so the
+                // matroska demuxer's latched 'done' is cleared.
+                if (m_fmtCtx->pb) { m_fmtCtx->pb->eof_reached = 0; m_fmtCtx->pb->error = 0; }
+                avformat_flush(m_fmtCtx);
+                int64_t rNewest = refNewestPts();
+                AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
+                int64_t anchorMs = qMax<int64_t>(0, rNewest);
+                int64_t seekPts = av_rescale_q(anchorMs, {1, 1000}, vStream->time_base);
+                int sret = av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
+                m_sizeAtLastEof = sz;
+                m_counters.eofTailSeek++;
+                if (sret >= 0) {
+                    // Dedup-before-decode: re-read tail clusters cost reads only.
+                    // Drain a bounded number of packets, skipping already-buffered.
+                    bool audioOn = playing && (speed > 0.99 && speed < 1.01);
+                    const int kEofDrain = 4 * trackCount;
+                    for (int i = 0; i < kEofDrain && !shouldInterrupt(); ++i) {
+                        int ret = av_read_frame(m_fmtCtx, pkt);
+                        if (ret < 0) break;
+                        decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/1,
+                                             trackCount, /*decimate*/false, /*step*/1,
+                                             audioOn, /*dedupTail*/true);
+                        av_packet_unref(pkt);
+                    }
+                }
+                // else: seek failed — don't advance m_sizeAtLastEof handling,
+                // retry next poll (sz already stored so we won't re-trigger
+                // until further growth).
+            }
+            // not grown: just slept; finished file costs only the sleep.
+            continue;
+        }
+        if (nonEofErr) {
+            if (++readErrStreak > kMaxReadErrStreak) break;  // bounded: stop cleanly
+            msleep(kReadErrSleepMs);
+            continue;
+        }
+
+        // --- WAIT (§6.9): window full / no read this pass → short idle sleep. ---
+        // Sleeping when no packet was read also covers tail-hold (§6.8, P past
+        // tail) and the bottom-of-file reverse case, preventing a hot spin.
+        if (playing) {
+            int64_t nm = newestPtsMin();
+            bool windowFull = (dir >= 0) ? (nm >= 0 && nm >= P + kLeadMs)
+                                         : (refOldestPts() >= 0 && refOldestPts() <= P - kLeadMs);
+            if (windowFull || packetsThisIter == 0) msleep(kIdleSleepMs);
+        } else {
+            // Paused and we did work this pass: brief sleep before re-checking.
+            msleep(kIdleSleepMs);
         }
     }
 
@@ -586,35 +829,6 @@ void PlaybackWorker::run() {
     av_frame_free(&audioFrame);
     clearDecoders();
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
-}
-
-void PlaybackWorker::pushAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame) {
-    // The app's recordings carry PCM S16LE 48 kHz stereo; anything else
-    // would need resampling before it can go to the audio device.
-    if (audioFrame->format != AV_SAMPLE_FMT_S16
-        || audioFrame->sample_rate != 48000
-        || audioFrame->ch_layout.nb_channels != 2) {
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            qWarning() << "PlaybackWorker: unsupported audio frame format"
-                       << audioFrame->format << audioFrame->sample_rate
-                       << audioFrame->ch_layout.nb_channels;
-        }
-        return;
-    }
-
-    int64_t pts = audioFrame->pts;
-    if (pts == AV_NOPTS_VALUE) pts = audioFrame->best_effort_timestamp;
-    if (pts == AV_NOPTS_VALUE) return;
-
-    const AVRational tb = m_fmtCtx->streams[aTrack->streamIndex]->time_base;
-    const int64_t ptsMs = av_rescale_q(pts, tb, {1, 1000});
-    const int dataSize = audioFrame->nb_samples
-                         * audioFrame->ch_layout.nb_channels
-                         * int(sizeof(int16_t));
-    m_audioPlayer->pushSamples(audioFrame->data[0], dataSize,
-                               ptsMs, m_transport->currentPos());
 }
 
 bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
@@ -645,7 +859,7 @@ bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
     return true;
 }
 
-void PlaybackWorker::deliverDueFrames(int64_t masterTimeMs) {
+void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     struct PendingDeliver {
         FrameProvider* provider = nullptr;
         QVideoFrame frame;
@@ -658,8 +872,17 @@ void PlaybackWorker::deliverDueFrames(int64_t masterTimeMs) {
             if (!track || !track->provider) continue;
             QVideoFrame f;
             int64_t p;
-            if (track->buffer.frameAt(masterTimeMs, f, p)) {
-                if (p != track->lastDeliveredPtsMs) {
+            if (track->buffer.frameAt(P, f, p)) {
+                // Direction-aware dedup (spec §5): forbid out-of-order paints.
+                //  - forward (+1): deliver iff pts moved up (or after a reset);
+                //  - reverse (-1): deliver iff pts moved down (or after a reset).
+                const int64_t last = track->lastDeliveredPtsMs;
+                bool deliver;
+                if (last < 0)            deliver = true;          // post-reset
+                else if (dir >= 0)       deliver = (p > last);
+                else                     deliver = (p < last);
+                if (p == last) deliver = false;                  // already shown
+                if (deliver) {
                     track->lastDeliveredPtsMs = p;
                     pending.append({track->provider, f});
                 }

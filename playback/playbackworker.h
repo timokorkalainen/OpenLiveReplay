@@ -31,12 +31,14 @@ struct DecoderTrack {
     int streamIndex = -1;
     TrackBuffer buffer;                 // was QVector<BufferedFrame>
     int64_t lastDeliveredPtsMs = -1;   // last frame released to the provider
+    int decimateCounter = 0;           // per-track keep-counter (§6.3 decimation)
 };
 
 struct AudioDecoderTrack {
     AVCodecContext* codecCtx = nullptr;
     int streamIndex = -1;
-    int viewIndex   = -1;   // which view (0..N-1) this audio belongs to
+    int viewIndex   = -1;          // which view (0..N-1) this audio belongs to
+    int64_t lastEnqueuedPtsMs = -1; // for dedup-before-decode after EOF un-latch
 };
 
 class PlaybackWorker : public QThread {
@@ -54,8 +56,12 @@ public:
     void openFile(const QString &filePath);
     void seekTo(int64_t timestampMs);
     bool deliverBufferedFrameAtOrBefore(int64_t targetMs);
-    void deliverDueFrames(int64_t masterTimeMs);
-    void setFrameBufferMax(int maxFrames);
+    // Direction-aware delivery (spec §5): forward delivers iff pts moved up,
+    // reverse iff pts moved down (dir = +1 / -1).
+    void deliverDueFrames(int64_t P, int dir);
+    // No-op shim: window sizing now derives from fps() (spec §7). Task 6
+    // removes the three uimanager call sites and this method together.
+    void setFrameBufferMax(int) {}
     void setActiveAudioView(int viewIndex);
     void stop();
 
@@ -82,9 +88,6 @@ private:
     // High-performance conversion from FFmpeg AVFrame to QVideoFrame (YUV420P)
     QVideoFrame convertToQVideoFrame(AVFrame* frame);
 
-    // Push a decoded audio frame, PTS-tagged, to the audio player
-    void pushAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame);
-
     // --- Scheduler helpers (spec §3 symbols / §6). Task 5 wires the loop;
     //     bodies are implemented here except repositionTo (stubbed). ---------
     int     fps() const;                  // m_transport->fps(), clamped >=1
@@ -94,8 +97,23 @@ private:
     int64_t oldestPtsMin() const;         // min-oldest, staleness-excluded; -1 empty
     int64_t newestPtsMax() const;         // cross-track max-newest (ignoring empty); -1 empty
     int64_t refNewestPts() const;         // reference (first) track newest; -1 empty
+    int64_t refOldestPts() const;         // reference (first) track oldest; -1 empty
     void    repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af);
     bool    reuseAt(int64_t target);      // true if every track has a frame within frameDurMs/2
+
+    // Decode one read packet into the bank (video → insert with cap; audio →
+    // enqueue active view). Used by forward fill, reposition, and reverse fill.
+    // `decimate` engages count-based decimation; `audioOn` gates audio enqueue.
+    // `dedupTail` skips video/audio packets at/behind the owning track's newest
+    // (post-EOF-unlatch re-read guard, §6.8). Returns the just-decoded video
+    // PTS (ms) of the last frame produced, or INT64_MIN if none.
+    int64_t decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame* af,
+                                 int64_t P, int dir, int trackCount, bool decimate,
+                                 int decimateStep, bool audioOn, bool dedupTail);
+    // Enqueue a decoded active-view audio frame onto m_audioQueue (format-guarded).
+    void enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
+    void resetDedup();                    // lastDeliveredPtsMs = -1 on every track
+    void clearAllBuffers();               // clear every TrackBuffer (holds m_bufferMutex)
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
@@ -113,9 +131,8 @@ private:
     AudioPlayer *m_audioPlayer = nullptr;
     std::atomic<int> m_activeAudioView{-1};
 
-    int m_frameBufferMax = 30;
-
-    AudioFrameQueue m_audioQueue;
+    AudioFrameQueue m_audioQueue;             // worker-thread-only
+    std::atomic<bool> m_audioReprime{false};  // set by setActiveAudioView (UI thread)
     int m_lastMoveDir = 1;
     int64_t m_sizeAtLastEof = -1;
 
