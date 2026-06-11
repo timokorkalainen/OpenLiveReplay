@@ -5,6 +5,7 @@
 #include <QTimer>
 #include <QElapsedTimer>
 #include <QMutex>
+#include <atomic>
 
 class PlaybackTransport : public QObject {
     Q_OBJECT
@@ -39,14 +40,13 @@ private slots:
 private:
     mutable QMutex m_mutex;
     QTimer *m_tickTimer;
-    QElapsedTimer m_frameTimer;
     QElapsedTimer m_playStartTime;
 
     int64_t m_currentPos = 0;
     int64_t m_playStartPos = 0;
-    double m_speed = 1.0;
-    bool m_isPlaying = false;
-    int m_fps = 30;
+    std::atomic<double> m_speed{1.0};
+    std::atomic<bool> m_isPlaying{false};
+    std::atomic<int> m_fps{30};
 
     const int m_timerIntervalMs = 16; // ~60Hz update rate
 };

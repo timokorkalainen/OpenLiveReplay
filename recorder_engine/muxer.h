@@ -1,6 +1,8 @@
 #ifndef MUXER_H
 #define MUXER_H
 
+#include <QHash>
+#include <QElapsedTimer>
 #include <QMutex>
 #include <QString>
 
@@ -30,10 +32,24 @@ public:
     int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
 
     QString getVideoPath(QString fileName);
+
+    // Directory recordings are written to.  Set BEFORE init()/getVideoPath()
+    // from the main thread; empty = default (~/Documents/videos).
+    // Deliberately unlocked: init() calls getVideoPath() while holding
+    // m_mutex, and the value never changes during a recording session.
+    void setOutputDirectory(const QString& dir) { m_outputDir = dir; }
 private:
+    QString m_outputDir;
+    // Path resolved by init() for the current session; getVideoPath()
+    // returns it while recording so the reader can never diverge from
+    // the file actually being written.
+    QString m_activePath;
     AVFormatContext* m_outCtx = nullptr;
-    // Track the last timestamp for each stream to ensure they always increase
-    QMap<int, int64_t>* m_lastDts;
+    // Last DTS per stream (monotonicity enforcement); guarded by m_mutex
+    QHash<int, int64_t> m_lastDts;
+    // Throttles avio_flush: flushing per packet hammers the disk for no
+    // benefit beyond chase-play visibility (~100 ms is plenty)
+    QElapsedTimer m_lastFlush;
     QMutex m_mutex;
     bool m_initialized = false;
     int m_audioTrackOffset = 0;     // Index of first audio track

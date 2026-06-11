@@ -69,7 +69,6 @@ private slots:
     void onTimerTick();
 
 private:
-    QString getFullOutputPath();
     void writeBlueFrames(int64_t elapsedMs);
 
     bool m_isRecording = false;

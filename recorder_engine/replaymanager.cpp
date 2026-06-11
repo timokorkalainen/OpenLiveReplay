@@ -73,6 +73,8 @@ void ReplayManager::startRecording() {
     // 2. Initialize Muxer with M view-tracks (not N source-tracks)
     const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     m_sessionFileName = m_baseFileName + "_" + timestamp;
+    // Recordings go to the user-configured location (empty = default)
+    m_muxer->setOutputDirectory(m_outputDir);
     if (!m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames)) {
         qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
@@ -102,6 +104,12 @@ void ReplayManager::startRecording() {
         if (s < m_sourceMetadata.size()) {
             worker->setSourceMetadata(m_sourceMetadata[s]);
         }
+
+        // The worker QObject must live on its own thread, otherwise the
+        // queued masterPulse slot (jitter pull + encode + mux write) runs
+        // on the MAIN thread: QThread object affinity is the creating
+        // thread, and run()/exec() alone does not change it.
+        worker->moveToThread(worker);
 
         connect(this, &ReplayManager::masterPulse,
                 worker, &StreamWorker::onMasterPulse,
@@ -196,17 +204,43 @@ void ReplayManager::onTimerTick() {
     // Only emit when the frame count actually advances.
     if (derivedFrame <= m_globalFrameCount) return;
 
-    m_globalFrameCount = derivedFrame;
+    // Emit one pulse PER FRAME so late timer ticks don't leave
+    // frame-index holes in the video tracks.  Catch-up is capped at one
+    // second of backlog (longer stalls resume from the current frame),
+    // and drained a few frames per tick so the catch-up itself never
+    // freezes the main thread — the remainder follows on later ticks.
+    int64_t from = m_globalFrameCount + 1;
+    if (derivedFrame - from >= m_fps) {
+        from = derivedFrame - m_fps + 1;
+    }
+    const int64_t maxPerTick = qMax(1, m_fps / 4);
+    const int64_t to = qMin(derivedFrame, from + maxPerTick - 1);
+    for (int64_t f = from; f <= to; ++f) {
+        m_globalFrameCount = f;
+        const int64_t frameMs = (f * 1000) / m_fps;
 
-    // 1. Emit masterPulse — source workers do jitter pull + encode
-    emit masterPulse(m_globalFrameCount, elapsedMs);
+        // 1. Emit masterPulse — source workers do jitter pull + encode
+        emit masterPulse(f, frameMs);
 
-    // 2. Write blue frames for any unmapped view-tracks
-    writeBlueFrames(elapsedMs);
+        // 2. Write blue frames for any unmapped view-tracks
+        writeBlueFrames(frameMs);
+    }
 }
 
 void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
     if (!m_blueEncCtx || !m_blueFrame || !m_muxer) return;
+
+    // Skip the encode entirely when every view has a source mapped —
+    // but still reset the per-view silence cursors.
+    bool anyUnmapped = false;
+    for (int v = 0; v < m_viewCount; ++v) {
+        if (v < m_viewSlotMap.size() && m_viewSlotMap[v] >= 0) {
+            if (v < m_blueAudioCursor.size()) m_blueAudioCursor[v] = -1;
+        } else {
+            anyUnmapped = true;
+        }
+    }
+    if (!anyUnmapped) return;
 
     // Encode one blue frame per tick (all unmapped views share the same packet data)
     m_blueFrame->pts = m_globalFrameCount;
@@ -287,11 +321,6 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
 }
 
 // ─── Utility ───────────────────────────────────────────────────────────
-QString ReplayManager::getFullOutputPath() {
-    QDir dir(m_outputDir);
-    return dir.absoluteFilePath(m_baseFileName + ".mkv");
-}
-
 int64_t ReplayManager::getElapsedMs() {
     if(!m_clock) return -1;
     return m_clock->elapsedMs();

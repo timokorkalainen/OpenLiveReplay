@@ -7,6 +7,7 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
     : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer), m_sharedClock(clock) {
     m_restartCapture = 0;
     m_internalFrameCount = 0;
+    m_monotonic.start();
     if (targetWidth > 0) m_targetWidth = targetWidth;
     if (targetHeight > 0) m_targetHeight = targetHeight;
     if (targetFps > 0) m_targetFps = targetFps;
@@ -32,7 +33,9 @@ int StreamWorker::ffmpegInterruptCallback(void* opaque) {
 
 bool StreamWorker::shouldInterrupt() const {
     if (!m_captureRunning || m_restartCapture) return true;
-    if (m_connected && m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) return true;
+    const int64_t lastPkt = m_lastPacketAtMs.load(std::memory_order_relaxed);
+    if (m_connected && lastPkt >= 0
+        && m_monotonic.elapsed() - lastPkt > m_stallTimeoutMs) return true;
     return false;
 }
 
@@ -43,10 +46,19 @@ void StreamWorker::run() {
     // 2. Enter the event loop. The thread stays alive, waiting for
     // signals (masterPulse) or concurrent tasks (captureLoop).
     exec();
+
+    // exec() has returned, so no further queued pulse can run on this
+    // thread.  Re-assert shutdown before joining the capture future: a
+    // pulse delivered between stop() and quit() taking effect could have
+    // relaunched captureLoop after stop() cleared the flags, which would
+    // otherwise leave waitForFinished() stuck forever.
+    m_restartCapture = 1;
+    m_captureRunning = false;
     m_captureFuture.waitForFinished();
 
     // Cleanup when exec() returns (on stop)
     avcodec_free_context(&m_persistentEncCtx);
+    av_frame_free(&m_latestFrame);
 
     while(!m_frameQueue.isEmpty()){
         auto qf = m_frameQueue.dequeue();
@@ -57,11 +69,18 @@ void StreamWorker::run() {
 void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     m_internalFrameCount = frameIndex;
 
+    // Publish this tick's jitter-pull gate for the capture thread's
+    // queue pre-drain (see captureLoop).
+    m_lastTickTargetMs.store(
+        qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - kJitterBufferMs),
+        std::memory_order_relaxed);
+
     if (!m_persistentEncCtx) return;
 
     // Stall detection: if connected but no frames for too long, signal restart.
-    if (m_captureRunning && m_connected && m_lastFrameEnqueueTimer.isValid()
-        && m_lastFrameEnqueueTimer.elapsed() > m_stallTimeoutMs) {
+    const int64_t lastEnq = m_lastFrameEnqueueAtMs.load(std::memory_order_relaxed);
+    if (m_captureRunning && m_connected && lastEnq >= 0
+        && m_monotonic.elapsed() - lastEnq > m_stallTimeoutMs) {
         qDebug() << "Source" << m_sourceIndex << "No frames queued. Forcing restart...";
         m_restartCapture = 1;
     }
@@ -85,19 +104,19 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     int track = -1;
     const int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
 
+    AVFrame* pulled = nullptr;
+    const bool paintBlue = m_paintBlue.fetchAndStoreRelaxed(0) != 0;
+
+    // The mutex only guards m_frameQueue (shared with the capture
+    // thread).  m_latestFrame and the encoder are tick-thread-only,
+    // so painting/encoding happens outside the lock.
     {
         QMutexLocker locker(&m_frameMutex);
 
-        // Handle deferred blue paint from changeSource
-        if (m_paintBlue.fetchAndStoreRelaxed(0)) {
+        if (paintBlue) {
             while (!m_frameQueue.isEmpty()) {
                 auto qf = m_frameQueue.dequeue();
                 av_frame_free(&qf.frame);
-            }
-            if (m_latestFrame && m_latestFrame->data[0]) {
-                memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
-                memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
-                memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
             }
         }
 
@@ -109,36 +128,43 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
         while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
             QueuedFrame top = m_frameQueue.dequeue();
-            av_frame_unref(m_latestFrame);
-            av_frame_move_ref(m_latestFrame, top.frame);
-            av_frame_free(&top.frame);
+            if (pulled) av_frame_free(&pulled);
+            pulled = top.frame;
         }
+    }
 
-        // Read the current view-track assignment (atomic, set by UIManager).
-        // -1 = this source is not assigned to any view, skip encoding.
-        track = m_viewTrack.load(std::memory_order_relaxed);
+    if (paintBlue && m_latestFrame && m_latestFrame->data[0]) {
+        memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
+        memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
+        memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+    }
+    if (pulled) {
+        av_frame_unref(m_latestFrame);
+        av_frame_move_ref(m_latestFrame, pulled);
+        av_frame_free(&pulled);
+    }
 
-        if (track >= 0 && m_latestFrame && m_latestFrame->data[0]) {
-            // Set PTS on the FRAME, not the packet. avcodec_receive_packet
-            // overwrites the packet entirely, so any PTS/DTS set on it
-            // before encoding is lost.  The encoder propagates the frame
-            // PTS into the output packet, keeping it in sync with the
-            // global frame counter even after gaps (source was unmapped).
-            m_latestFrame->pts = m_internalFrameCount;
+    // Read the current view-track assignment (atomic, set by UIManager).
+    // -1 = this source is not assigned to any view, skip encoding.
+    track = m_viewTrack.load(std::memory_order_relaxed);
 
-            if (avcodec_send_frame(encCtx, m_latestFrame) == 0) {
-                if (avcodec_receive_packet(encCtx, outPkt) == 0) {
-                    outPkt->stream_index = track;
-                    outPkt->duration = 1;
-                    AVStream* st = m_muxer->getStream(track);
-                    if (st) {
-                        av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
-                        havePacket = true;
-                    }
+    if (track >= 0 && m_latestFrame && m_latestFrame->data[0]) {
+        // Set PTS on the FRAME, not the packet (avcodec_receive_packet
+        // overwrites the packet entirely).
+        m_latestFrame->pts = m_internalFrameCount;
+
+        if (avcodec_send_frame(encCtx, m_latestFrame) == 0) {
+            if (avcodec_receive_packet(encCtx, outPkt) == 0) {
+                outPkt->stream_index = track;
+                outPkt->duration = 1;
+                AVStream* st = m_muxer->getStream(track);
+                if (st) {
+                    av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
+                    havePacket = true;
                 }
             }
         }
-    } // m_frameMutex released BEFORE the muxer write
+    }
 
     if (havePacket) {
         m_muxer->writePacket(outPkt);
@@ -263,13 +289,13 @@ void StreamWorker::captureLoop() {
         int64_t anchorStreamTimeMs = -1;
         int64_t firstPacketDts = -1;
 
-        m_lastPacketTimer.restart();
-        m_lastFrameEnqueueTimer.restart();
+        m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
+        m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
 
         while (m_captureRunning && !m_restartCapture) {
             int readResult = av_read_frame(inCtx, pkt);
             if (readResult >= 0) {
-                m_lastPacketTimer.restart();
+                m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
                 if (pkt->stream_index == videoStreamIdx) {
 
                     int64_t pktDts = pkt->dts;
@@ -321,9 +347,26 @@ void StreamWorker::captureLoop() {
                             QMutexLocker locker(&m_frameMutex);
                             m_frameQueue.enqueue(qf);
 
-                            m_lastFrameEnqueueTimer.restart();
+                            m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
 
-                            while (m_frameQueue.size() > 1000) {
+                            // Pre-drain frames the next tick would discard
+                            // anyway: the tick keeps only the newest frame
+                            // at-or-before its gate, so the head is garbage
+                            // as soon as a SECOND frame is inside the gate.
+                            // Never drops the newest gated frame — a lagging
+                            // source shows late-but-updating video instead
+                            // of freezing.
+                            const int64_t tickGateMs =
+                                m_lastTickTargetMs.load(std::memory_order_relaxed);
+                            while (tickGateMs >= 0 && m_frameQueue.size() >= 2
+                                   && m_frameQueue.at(1).sourcePts <= tickGateMs) {
+                                auto old = m_frameQueue.dequeue();
+                                av_frame_free(&old.frame);
+                            }
+                            // Count backstop (~10 s of frames) against
+                            // future-stamped bursts after a re-anchor.
+                            const int backstopFrames = 10 * m_targetFps;
+                            while (m_frameQueue.size() > backstopFrames) {
                                 auto old = m_frameQueue.dequeue();
                                 av_frame_free(&old.frame);
                             }
@@ -383,7 +426,9 @@ void StreamWorker::captureLoop() {
                 }
                 av_packet_unref(pkt);
             } else if (readResult == AVERROR(EAGAIN)) {
-                if (m_connected && m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) {
+                const int64_t lastPkt = m_lastPacketAtMs.load(std::memory_order_relaxed);
+                if (m_connected && lastPkt >= 0
+                    && m_monotonic.elapsed() - lastPkt > m_stallTimeoutMs) {
                     qDebug() << "Source" << m_sourceIndex << "Stalled stream. Restarting...";
                     break;
                 }
@@ -484,7 +529,7 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
         return false;
     }
 
-    m_lastPacketTimer.restart();
+    m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
 
     (*inCtx)->interrupt_callback.callback = &StreamWorker::ffmpegInterruptCallback;
     (*inCtx)->interrupt_callback.opaque = this;
