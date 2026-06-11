@@ -76,7 +76,7 @@ private:
     QHash<int, DecoderTrack*> m_streamMap;
     AVFormatContext* m_fmtCtx = nullptr;
 
-    bool m_running = false;
+    std::atomic<bool> m_running{false};
     int64_t m_seekTargetMs = -1;
     QString m_currentFilePath;
     PlaybackTransport *m_transport;

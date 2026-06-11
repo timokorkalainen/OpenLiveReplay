@@ -15,47 +15,56 @@ int64_t PlaybackTransport::currentPos() const {
 }
 
 double PlaybackTransport::speed() const {
-    return m_speed;
+    return m_speed.load(std::memory_order_relaxed);
 }
 
 bool PlaybackTransport::isPlaying() const {
-    return m_isPlaying;
+    return m_isPlaying.load(std::memory_order_relaxed);
 }
 
 int PlaybackTransport::fps() const {
-    return m_fps;
+    return m_fps.load(std::memory_order_relaxed);
 }
 
 void PlaybackTransport::setPlaying(bool playing) {
-    if (m_isPlaying == playing) return;
+    if (m_isPlaying.load() == playing) return;
 
-    m_isPlaying = playing;
-    if (m_isPlaying) {
-        m_playStartPos = m_currentPos;
-        m_playStartTime.start();
-        m_tickTimer->start();
-    } else {
-        m_tickTimer->stop();
+    {
+        QMutexLocker locker(&m_mutex);
+        m_isPlaying.store(playing);
+        if (playing) {
+            m_playStartPos = m_currentPos;
+            m_playStartTime.start();
+        }
     }
-    emit playingChanged(m_isPlaying);
+    // QTimer must be driven from its owning (main) thread; setPlaying is
+    // only ever called from the UI/main thread.
+    if (playing) m_tickTimer->start(); else m_tickTimer->stop();
+    emit playingChanged(playing);
 }
 
 void PlaybackTransport::setSpeed(double speed) {
-    if (qFuzzyCompare(m_speed, speed)) return;
     speed = qRound(speed * 100.0) / 100.0;
-    m_speed = speed;
-    if (m_isPlaying) {
-        m_playStartPos = currentPos();
-        m_playStartTime.restart();
+    if (qFuzzyCompare(m_speed.load(), speed)) return;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_isPlaying.load()) {
+            // Bank the position progressed at the OLD speed before the
+            // new one takes effect.
+            m_currentPos = m_playStartPos
+                + static_cast<int64_t>(m_playStartTime.elapsed() * m_speed.load());
+            m_playStartPos = m_currentPos;
+            m_playStartTime.restart();
+        }
+        m_speed.store(speed);
     }
-    emit speedChanged(m_speed);
+    emit speedChanged(speed);
 }
 
 void PlaybackTransport::setFps(int fps) {
     if (fps <= 0) return;
-    if (m_fps == fps) return;
-    m_fps = fps;
-    emit fpsChanged(m_fps);
+    if (m_fps.exchange(fps) == fps) return;
+    emit fpsChanged(fps);
 }
 
 void PlaybackTransport::seek(int64_t posMs) {
@@ -74,13 +83,13 @@ void PlaybackTransport::seek(int64_t posMs) {
 
 void PlaybackTransport::step(int frames) {
     // Step by exact frame duration based on configured FPS
-    int fps = qMax(1, m_fps);
+    int fps = qMax(1, m_fps.load());
     int64_t stepSize = static_cast<int64_t>(frames * (1000.0 / fps));
     seek(currentPos() + stepSize);
 }
 
 void PlaybackTransport::onTick() {
-    if (!m_isPlaying) return;
+    if (!m_isPlaying.load()) return;
 
     int64_t newPos = 0;
     bool shouldStop = false;
@@ -88,8 +97,7 @@ void PlaybackTransport::onTick() {
         QMutexLocker locker(&m_mutex);
         // Calculate position from play start to avoid cumulative drift
         int64_t elapsed = m_playStartTime.elapsed();
-        m_currentPos = m_playStartPos + static_cast<int64_t>(elapsed * m_speed);
-        // Bounds checking (prevent negative time)
+        m_currentPos = m_playStartPos + static_cast<int64_t>(elapsed * m_speed.load());
         if (m_currentPos < 0) {
             m_currentPos = 0;
             shouldStop = true;

@@ -7,6 +7,7 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
     : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer), m_sharedClock(clock) {
     m_restartCapture = 0;
     m_internalFrameCount = 0;
+    m_monotonic.start();
     if (targetWidth > 0) m_targetWidth = targetWidth;
     if (targetHeight > 0) m_targetHeight = targetHeight;
     if (targetFps > 0) m_targetFps = targetFps;
@@ -32,7 +33,9 @@ int StreamWorker::ffmpegInterruptCallback(void* opaque) {
 
 bool StreamWorker::shouldInterrupt() const {
     if (!m_captureRunning || m_restartCapture) return true;
-    if (m_connected && m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) return true;
+    const int64_t lastPkt = m_lastPacketAtMs.load(std::memory_order_relaxed);
+    if (m_connected && lastPkt >= 0
+        && m_monotonic.elapsed() - lastPkt > m_stallTimeoutMs) return true;
     return false;
 }
 
@@ -74,8 +77,9 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     if (!m_persistentEncCtx) return;
 
     // Stall detection: if connected but no frames for too long, signal restart.
-    if (m_captureRunning && m_connected && m_lastFrameEnqueueTimer.isValid()
-        && m_lastFrameEnqueueTimer.elapsed() > m_stallTimeoutMs) {
+    const int64_t lastEnq = m_lastFrameEnqueueAtMs.load(std::memory_order_relaxed);
+    if (m_captureRunning && m_connected && lastEnq >= 0
+        && m_monotonic.elapsed() - lastEnq > m_stallTimeoutMs) {
         qDebug() << "Source" << m_sourceIndex << "No frames queued. Forcing restart...";
         m_restartCapture = 1;
     }
@@ -284,13 +288,13 @@ void StreamWorker::captureLoop() {
         int64_t anchorStreamTimeMs = -1;
         int64_t firstPacketDts = -1;
 
-        m_lastPacketTimer.restart();
-        m_lastFrameEnqueueTimer.restart();
+        m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
+        m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
 
         while (m_captureRunning && !m_restartCapture) {
             int readResult = av_read_frame(inCtx, pkt);
             if (readResult >= 0) {
-                m_lastPacketTimer.restart();
+                m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
                 if (pkt->stream_index == videoStreamIdx) {
 
                     int64_t pktDts = pkt->dts;
@@ -342,7 +346,7 @@ void StreamWorker::captureLoop() {
                             QMutexLocker locker(&m_frameMutex);
                             m_frameQueue.enqueue(qf);
 
-                            m_lastFrameEnqueueTimer.restart();
+                            m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
 
                             // Pre-drain frames the next tick would discard
                             // anyway: the tick keeps only the newest frame
@@ -421,7 +425,9 @@ void StreamWorker::captureLoop() {
                 }
                 av_packet_unref(pkt);
             } else if (readResult == AVERROR(EAGAIN)) {
-                if (m_connected && m_lastPacketTimer.isValid() && m_lastPacketTimer.elapsed() > m_stallTimeoutMs) {
+                const int64_t lastPkt = m_lastPacketAtMs.load(std::memory_order_relaxed);
+                if (m_connected && lastPkt >= 0
+                    && m_monotonic.elapsed() - lastPkt > m_stallTimeoutMs) {
                     qDebug() << "Source" << m_sourceIndex << "Stalled stream. Restarting...";
                     break;
                 }
@@ -522,7 +528,7 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
         return false;
     }
 
-    m_lastPacketTimer.restart();
+    m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
 
     (*inCtx)->interrupt_callback.callback = &StreamWorker::ffmpegInterruptCallback;
     (*inCtx)->interrupt_callback.opaque = this;
