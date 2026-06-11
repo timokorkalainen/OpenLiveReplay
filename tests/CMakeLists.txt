@@ -49,6 +49,15 @@ target_link_libraries(olr_test_engine
            avformat avcodec avutil swscale swresample
     PRIVATE olr_warnings olr_sanitize)
 
+# --- Playback sources (need Qt Multimedia for QVideoFrame; ffmpeg for the worker) ---
+qt_add_library(olr_test_playback STATIC
+    "${CMAKE_SOURCE_DIR}/playback/trackbuffer.cpp"
+)
+target_include_directories(olr_test_playback PUBLIC "${CMAKE_SOURCE_DIR}")
+target_link_libraries(olr_test_playback
+    PUBLIC olr_test_core Qt6::Core Qt6::Multimedia Qt6::Gui
+    PRIVATE olr_warnings olr_sanitize)
+
 add_subdirectory(unit)
 add_subdirectory(smoke)
 add_subdirectory(e2e)
