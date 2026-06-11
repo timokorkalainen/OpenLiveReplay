@@ -1,0 +1,28 @@
+# clang-format for OpenLiveReplay.
+# Tuned to match the existing codebase: 4-space indent, left-aligned
+# pointers (AVFrame* x), attached braces, ~100 column target.
+#
+# NOTE: this is introduced without reformatting the existing tree. CI checks
+# formatting on changed files only (see .github/workflows/ci.yml), so legacy
+# code is not force-reformatted. Run a one-shot repo-wide format later if
+# desired:  git ls-files '*.cpp' '*.h' '*.mm' | xargs clang-format -i
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Left
+ReferenceAlignment: Left
+AccessModifierOffset: -4
+AlwaysBreakTemplateDeclarations: Yes
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+BreakBeforeBraces: Attach
+NamespaceIndentation: None
+SortIncludes: false
+SpaceAfterCStyleCast: true
+Standard: c++17
+IncludeBlocks: Preserve
+...

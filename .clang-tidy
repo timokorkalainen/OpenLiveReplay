@@ -1,0 +1,30 @@
+# clang-tidy for OpenLiveReplay — curated, bug-focused checks.
+#
+# Goal: signal on the bug classes that actually bite a threaded real-time media
+# app (null derefs, narrowing/integer coercion, lifetime/use-after-free — cf.
+# the mono-audio SIGBUS), not a style cudgel. Advisory by default
+# (WarningsAsErrors empty); CI runs it on changed files and reports findings
+# without failing the build. Flip WarningsAsErrors once the backlog is clear.
+#
+# Third-party headers (Qt, FFmpeg, rtmidi) are excluded via HeaderFilterRegex.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  cppcoreguidelines-narrowing-conversions,
+  cppcoreguidelines-pro-type-member-init,
+  misc-misleading-identifier,
+  misc-redundant-expression,
+  readability-misleading-indentation,
+  readability-non-const-parameter,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -clang-analyzer-optin.performance.Padding
+
+WarningsAsErrors: ''
+
+# Only our first-party sources — never Qt / FFmpeg / rtmidi / generated moc.
+HeaderFilterRegex: '.*/(recorder_engine|playback|midi)/.*|.*/(settingsmanager|uimanager)\.h$'
+
+FormatStyle: file

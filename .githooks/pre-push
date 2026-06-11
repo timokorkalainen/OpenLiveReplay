@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Pre-push hook: build the iOS target locally before allowing a push.
+#
+# iOS is deliberately NOT built in GitHub CI — the FFmpeg+SRT+OpenSSL
+# from-source build (~20 min) OOM-kills hosted runners. We validate it here
+# instead. The FFmpeg xcframeworks are cached in ios_build/xcframeworks, so only
+# the first build is slow; later pushes just rebuild the app.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Skip for a single push:  SKIP_IOS_BUILD=1 git push      (or: git push --no-verify)
+set -euo pipefail
+
+if [ "${SKIP_IOS_BUILD:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_IOS_BUILD=1 — skipping iOS build."
+    exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Locate the Qt iOS + host (desktop) kits. Override via env if your Qt lives
+# elsewhere, e.g. QT_IOS_PREFIX=~/Qt/6.9.0/ios.
+QT_IOS_PREFIX="${QT_IOS_PREFIX:-$HOME/Qt/6.10.1/ios}"
+QT_HOST_PREFIX="${QT_HOST_PREFIX:-$HOME/Qt/6.10.1/macos}"
+QT_CMAKE="$QT_IOS_PREFIX/bin/qt-cmake"
+
+if [ ! -x "$QT_CMAKE" ]; then
+    echo "[pre-push] Qt iOS kit not found at $QT_IOS_PREFIX — skipping iOS build."
+    echo "[pre-push] (set QT_IOS_PREFIX/QT_HOST_PREFIX to enable; push allowed.)"
+    exit 0
+fi
+
+echo "[pre-push] Building iOS (FFmpeg deps cached in ios_build/xcframeworks; first run ~20 min)…"
+BUILD_DIR="build/ios-prepush"
+
+"$QT_CMAKE" -S . -B "$BUILD_DIR" -G Xcode \
+    -DQT_HOST_PATH="$QT_HOST_PREFIX" \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 >/dev/null
+
+if cmake --build "$BUILD_DIR" --config Debug -- \
+        CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO; then
+    echo "[pre-push] iOS build OK — push proceeding."
+else
+    echo "[pre-push] iOS build FAILED — push aborted (SKIP_IOS_BUILD=1 to override)." >&2
+    exit 1
+fi
