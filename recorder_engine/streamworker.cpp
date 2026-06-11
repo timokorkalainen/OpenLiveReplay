@@ -63,6 +63,15 @@ void StreamWorker::run() {
     avcodec_free_context(&m_persistentEncCtx);
     av_frame_free(&m_latestFrame);
 
+    // Free the scaler cached across the capture lifetime (Bug 2: this was
+    // never freed, leaking one SwsContext per record/stop cycle per source).
+    // Safe here: the capture thread has been joined, so nothing touches
+    // m_swsCtx after this point.
+    if (m_swsCtx) {
+        sws_freeContext(m_swsCtx);
+        m_swsCtx = nullptr;
+    }
+
     while(!m_frameQueue.isEmpty()){
         auto qf = m_frameQueue.dequeue();
         av_frame_free(&qf.frame);
@@ -230,6 +239,9 @@ void StreamWorker::captureLoop() {
         }
         m_connected = true;
         m_connectBackoffMs = 1000;
+        // A real source connected: stragglers from any previously-cleared
+        // source are gone, so resume enqueuing frames for this new URL.
+        m_suppressEnqueue.store(false, std::memory_order_relaxed);
 
         if (!m_sharedClock) {
             qDebug() << "Source" << m_sourceIndex << "No shared clock. Restarting...";
@@ -325,19 +337,49 @@ void StreamWorker::captureLoop() {
                     if (avcodec_send_packet(decCtx, pkt) >= 0) {
                         while (avcodec_receive_frame(decCtx, rawFrame) >= 0) {
 
+                            // Bug 4: a restart/blue-paint is pending (source
+                            // was cleared to an empty URL).  Drop frames from
+                            // the old source so a late straggler can't
+                            // overwrite the painted blue frame.  Still unref
+                            // rawFrame so the decoder can reuse the buffer.
+                            if (m_suppressEnqueue.load(std::memory_order_relaxed)) {
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
+
                             // 2. Prepare the container for the scaled frame
                             QueuedFrame qf;
                             qf.frame = av_frame_alloc();
+                            // Bug 3: av_frame_alloc can fail under memory
+                            // pressure.  Skip this frame rather than deref NULL.
+                            if (!qf.frame) {
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
                             qf.frame->format = AV_PIX_FMT_YUV420P;
                             qf.frame->width = m_targetWidth;
                             qf.frame->height = m_targetHeight;
-                            av_frame_get_buffer(qf.frame, 0);
+                            // Bug 3: a failed buffer alloc leaves a data-less
+                            // frame; never enqueue that.  Free and skip.
+                            if (av_frame_get_buffer(qf.frame, 0) < 0) {
+                                av_frame_free(&qf.frame);
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
 
                             // 3. Scale
                             m_swsCtx = sws_getCachedContext(m_swsCtx,
                                                             rawFrame->width, rawFrame->height, (AVPixelFormat)rawFrame->format,
                                                             m_targetWidth, m_targetHeight, AV_PIX_FMT_YUV420P,
                                                             SWS_BICUBIC, nullptr, nullptr, nullptr);
+                            // Bug 3: getCachedContext returns NULL on an
+                            // unsupported pixfmt/params.  Don't sws_scale a
+                            // NULL context — free the frame and skip.
+                            if (!m_swsCtx) {
+                                av_frame_free(&qf.frame);
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
 
                             sws_scale(m_swsCtx, rawFrame->data, rawFrame->linesize, 0, rawFrame->height,
                                       qf.frame->data, qf.frame->linesize);
@@ -644,6 +686,13 @@ void StreamWorker::changeSource(const QString& newUrl) {
 
     if (newUrl.trimmed().isEmpty()) {
         m_paintBlue = 1;
+        // Suppress capture-side enqueues until a real (non-empty) URL
+        // connects again.  This stops a late straggler — a frame already
+        // decoded from the now-cleared source — from being enqueued after
+        // the tick clears the queue and paints blue, which would otherwise
+        // overwrite the blue frame and then re-encode that stale frame
+        // every tick forever (empty URL produces no fresh frames).
+        m_suppressEnqueue.store(true, std::memory_order_relaxed);
     }
 
     m_restartCapture = 1;

@@ -83,6 +83,12 @@ private:
     QAtomicInt m_restartCapture;    // Thread-safe flag to signal a source swap
     QAtomicInt m_paintBlue{0};      // Deferred blue-paint flag
 
+    // Set when the source is changed to an empty URL (blue-paint state),
+    // cleared when a non-empty URL actually connects.  While set, the
+    // capture thread refuses to enqueue frames so a late straggler decoded
+    // from the old/cleared source cannot overwrite the painted blue frame.
+    std::atomic<bool> m_suppressEnqueue{false};
+
     //Mutexes & Threads
     QMutex m_frameMutex;
     QMutex m_urlMutex;
