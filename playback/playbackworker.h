@@ -9,7 +9,6 @@
 #include <QVector>
 #include <QMutex>
 #include <QVideoFrame>
-#include <QHash>
 #include <QList>
 #include <atomic>
 #include "frameprovider.h"
@@ -29,7 +28,7 @@ struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
     FrameProvider* provider = nullptr;
     int streamIndex = -1;
-    TrackBuffer buffer;                 // was QVector<BufferedFrame>
+    TrackBuffer buffer;
     int64_t lastDeliveredPtsMs = -1;   // last frame released to the provider
     int decimateCounter = 0;           // per-track keep-counter (§6.3 decimation)
 };
@@ -117,7 +116,6 @@ private:
     QList<FrameProvider*> m_providers;
     QVector<DecoderTrack*> m_decoderBank;
     QVector<AudioDecoderTrack*> m_audioDecoderBank;
-    QHash<int, DecoderTrack*> m_streamMap;
     AVFormatContext* m_fmtCtx = nullptr;
 
     std::atomic<bool> m_running{false};
@@ -129,7 +127,7 @@ private:
 
     AudioFrameQueue m_audioQueue;             // worker-thread-only
     std::atomic<bool> m_audioReprime{false};  // set by setActiveAudioView (UI thread)
-    int m_lastMoveDir = 1;
+    std::atomic<int> m_lastMoveDir{1};
     int64_t m_sizeAtLastEof = -1;
 
     QMutex m_mutex;

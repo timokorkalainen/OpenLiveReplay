@@ -40,7 +40,7 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // drives reverse reposition anchoring, the backward-scrub audio re-prime,
     // and paused dedup direction. m_transport->currentPos() locks the
     // transport's own (independent) mutex, so there is no lock-order concern.
-    m_lastMoveDir = (clamped >= m_transport->currentPos()) ? 1 : -1;
+    m_lastMoveDir.store((clamped >= m_transport->currentPos()) ? 1 : -1, std::memory_order_relaxed);
     m_seekTargetMs = clamped;
 }
 
@@ -422,7 +422,6 @@ void PlaybackWorker::run() {
             delete track;
         }
         m_decoderBank.clear();
-        m_streamMap.clear();
         for (auto* aTrack : m_audioDecoderBank) {
             if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
             delete aTrack;
@@ -489,7 +488,6 @@ void PlaybackWorker::run() {
                 {
                     QMutexLocker bufferLocker(&m_bufferMutex);
                     m_decoderBank.append(track);
-                    m_streamMap.insert(i, track);
                 }
 
                 providerIndex++;
@@ -563,7 +561,7 @@ void PlaybackWorker::run() {
         bool    playing  = m_transport->isPlaying();
         double  speed    = m_transport->speed();
         const double aspeed = qAbs(speed);
-        int     dir      = playing ? (speed < 0 ? -1 : 1) : m_lastMoveDir;
+        int     dir      = playing ? (speed < 0 ? -1 : 1) : m_lastMoveDir.load(std::memory_order_relaxed);
         const int trackCount = qMax(1, int(m_decoderBank.size()));
 
         // --- Audio re-prime request from setActiveAudioView (UI thread) ---
@@ -583,7 +581,7 @@ void PlaybackWorker::run() {
         //     P has left the currently delivered frame's interval. ---
         if (!playing) {
             // Recompute dir for the paused case from the last explicit move.
-            dir = m_lastMoveDir;
+            dir = m_lastMoveDir.load(std::memory_order_relaxed);
             // Has the playhead left the delivered frame's interval? If the
             // reference track has no frame at P, we must (re)deliver/reposition.
             bool needWork = false;
@@ -617,7 +615,7 @@ void PlaybackWorker::run() {
         }
         if (seekTarget >= 0) {
             // Anchor direction by the recorded move sign (seekTo sets it in T6).
-            int seekDir = m_lastMoveDir;
+            int seekDir = m_lastMoveDir.load(std::memory_order_relaxed);
             repositionTo(seekTarget, seekDir, pkt, frame, audioFrame);
             continue;
         }
