@@ -867,16 +867,43 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
 bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!encoder) return false;
+
+    // MPEG-2's 12-bit horizontal_size_value/vertical_size_value cannot encode a
+    // dimension that is a multiple of 4096 (the field would be 0).  avcodec_open2
+    // would otherwise fail with a cryptic message AFTER the muxer header is
+    // already on disk, leaving a stub .mkv.  Fail early with a clear diagnostic.
+    if (m_targetWidth % 4096 == 0 || m_targetHeight % 4096 == 0) {
+        qWarning() << "Source" << m_sourceIndex
+                   << "MPEG-2 cannot encode a dimension that is a multiple of 4096"
+                   << "(" << m_targetWidth << "x" << m_targetHeight
+                   << ") — pick e.g. 3840x2160 instead of 4096x2160.";
+        return false;
+    }
+
     *encCtx = avcodec_alloc_context3(encoder);
     if (!*encCtx) return false;
 
     (*encCtx)->width = m_targetWidth;
     (*encCtx)->height = m_targetHeight;
 
-    // --- CHANGE THIS: Use a standard MPEG-2 rate ---
+    // MPEG-2 can only signal a small set of frame rates in its sequence header
+    // (24/25/30/50/60 and the 1000/1001 variants, times a tiny n/d extension).
+    // For any other integer fps the encoder silently writes the NEAREST
+    // representable rate into the elementary stream while our container stamps
+    // {fps,1}, so the file carries contradictory rates and ES-rate-trusting
+    // tools mis-time the video.  Warn so the operator can pick a standard rate.
+    switch (m_targetFps) {
+    case 24: case 25: case 30: case 50: case 60: break;  // exactly representable
+    default:
+        qWarning() << "Source" << m_sourceIndex << "fps" << m_targetFps
+                   << "is not an exact MPEG-2 rate; the elementary stream will"
+                   << "carry the nearest representable rate (use 24/25/30/50/60"
+                   << "to avoid a container/ES rate mismatch).";
+        break;
+    }
+
     (*encCtx)->time_base = {1, m_targetFps};      // Internal codec clock
     (*encCtx)->framerate = {m_targetFps, 1};      // Target framerate
-    // -----------------------------------------------
 
     (*encCtx)->pix_fmt = AV_PIX_FMT_YUV420P;
     (*encCtx)->gop_size = 1;             // Keep Intra-only for seeking
