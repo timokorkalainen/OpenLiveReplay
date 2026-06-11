@@ -1313,7 +1313,8 @@ int64_t UIManager::scrubPosition() {
     if(!m_transport) return 0;
     if(!m_replayManager) return 0;
 
-    return qMin(qMax(0, m_transport->currentPos()), m_replayManager->getElapsedMs());
+    const int64_t pos = qMax<int64_t>(0, m_transport->currentPos());
+    return qMin<int64_t>(pos, m_replayManager->getElapsedMs());
 }
 
 void UIManager::scrubToLive() {
