@@ -929,9 +929,17 @@ void UIManager::refreshMidiPorts() {
 }
 
 void UIManager::startRecording() {
+    // Distinguish the cheap "no sources" cause up front so the surfaced
+    // message is actionable; otherwise it's a muxer/encoder init failure.
+    const bool hadSources = !m_replayManager->getSourceUrls().isEmpty();
+
     m_replayManager->startRecording();
     if (!m_replayManager->isRecording()) {
-        qWarning() << "UIManager: recording failed to start; not launching playback";
+        const QString reason = hadSources
+            ? QStringLiteral("Failed to start recording (could not initialize output file)")
+            : QStringLiteral("Failed to start recording (no input sources configured)");
+        qWarning() << "UIManager:" << reason << "; not launching playback";
+        emit recordingFailed(reason);
         return;
     }
     m_followLive = true;

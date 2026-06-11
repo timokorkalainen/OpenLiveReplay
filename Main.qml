@@ -21,6 +21,9 @@ ApplicationWindow {
     property var uiManagerRef: uiManager
     property alias playbackTab: playbackTab
     property alias screenProbe: screenProbe
+    // Last recording-start failure reason, surfaced near the record button.
+    // Cleared on a successful recording start.
+    property string recordingError: ""
 
     Component.onCompleted: {
         appWindow.uiManagerRef.loadSettings()
@@ -111,6 +114,12 @@ ApplicationWindow {
         target: appWindow.uiManagerRef
         function onScreensChanged() {
             appWindow.updateMultiviewScreen()
+        }
+        function onRecordingFailed(reason) {
+            appWindow.recordingError = reason
+        }
+        function onRecordingStarted() {
+            appWindow.recordingError = ""
         }
     }
 
@@ -226,8 +235,14 @@ ApplicationWindow {
                     }
 
                     Text {
-                        text: appWindow.uiManagerRef.isRecording ? "● RECORDING LIVE" : "IDLE"
-                        color: appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666"
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: appWindow.recordingError !== ""
+                              ? ("⚠ " + appWindow.recordingError)
+                              : (appWindow.uiManagerRef.isRecording ? "● RECORDING LIVE" : "IDLE")
+                        color: appWindow.recordingError !== ""
+                               ? "#ffb300"
+                               : (appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666")
                     }
 
                     RowLayout {
