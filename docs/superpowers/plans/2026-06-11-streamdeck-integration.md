@@ -2026,6 +2026,15 @@ Then use superpowers:finishing-a-development-branch to merge/PR.
 1. **Default key profiles are computed in Swift** (`DeckAction.defaultMapping`, applied per device in `attach()`), not in C++. Reason: multiple simultaneously connected decks of different shapes each need their own mapping keyed by model; the bridge knows shapes at attach time. The remap-later contract is preserved via `setKeyMapping(_:forModel:)`, which the Qt side will call with persisted overrides when remapping ships.
 2. **Icons are SF Symbols**, not prerendered assets — zero asset-catalog overhead, identical rendering cost (views are snapshotted to images by the SDK either way).
 3. **Action id 6 is "show multiview", not record** — the spec originally mislabeled it; record is the new id 9 (already corrected in the spec).
+4. **Transport/recording pushes are forwarded into DeckState even while no deck
+   is connected** (only position pushes are connection-gated), instead of the
+   spec's "dropped silently". Deliberate: it keeps DeckState warm so a
+   hot-plugged deck renders correct state instantly from `attach()`, and the
+   change-guards make the idle cost zero.
+5. **Driver-missing guidance is text-only** (names the app and the Settings
+   step) rather than the spec's "explainer + link" — a hardcoded App Store URL
+   for Stream Deck Connect risks being wrong/region-dependent; revisit if the
+   canonical link is confirmed.
 
 ## Known follow-ups (out of scope)
 
