@@ -644,9 +644,24 @@ void UIManager::setSaveLocationFromUrl(const QUrl &folderUrl) {
 }
 
 void UIManager::setSaveLocation(const QString &path) {
-    if (m_currentSettings.saveLocation != path) {
-        m_currentSettings.saveLocation = path;
-        m_replayManager->setOutputDirectory(path);
+    // Normalize free-text input: expand ~, clean separators, and refuse
+    // relative paths (they would resolve against the process cwd).
+    QString normalized = path.trimmed();
+    if (normalized == QStringLiteral("~")) {
+        normalized = QDir::homePath();
+    } else if (normalized.startsWith(QStringLiteral("~/"))) {
+        normalized = QDir::homePath() + normalized.mid(1);
+    }
+    if (!normalized.isEmpty()) {
+        normalized = QDir::cleanPath(normalized);
+        if (QDir::isRelativePath(normalized)) {
+            qWarning() << "UIManager: ignoring relative save location" << path;
+            return;
+        }
+    }
+    if (m_currentSettings.saveLocation != normalized) {
+        m_currentSettings.saveLocation = normalized;
+        m_replayManager->setOutputDirectory(normalized);
         emit saveLocationChanged();
     }
 }
@@ -881,6 +896,10 @@ void UIManager::refreshMidiPorts() {
 
 void UIManager::startRecording() {
     m_replayManager->startRecording();
+    if (!m_replayManager->isRecording()) {
+        qWarning() << "UIManager: recording failed to start; not launching playback";
+        return;
+    }
     m_followLive = true;
 
     // 1. Initialize the Playback Worker with our providers
@@ -1294,7 +1313,8 @@ int64_t UIManager::scrubPosition() {
     if(!m_transport) return 0;
     if(!m_replayManager) return 0;
 
-    return qMin(qMax(0, m_transport->currentPos()), m_replayManager->getElapsedMs());
+    const int64_t pos = qMax<int64_t>(0, m_transport->currentPos());
+    return qMin<int64_t>(pos, m_replayManager->getElapsedMs());
 }
 
 void UIManager::scrubToLive() {

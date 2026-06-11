@@ -1,6 +1,7 @@
 #include "muxer.h"
 #include <QStandardPaths>
 #include <QDir>
+#include <QFileInfo>
 #include <QDebug>
 
 Muxer::Muxer() {}
@@ -16,7 +17,8 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     if (fps <= 0) fps = 30;
 
     // 1. Create Format Context for Matroska
-    avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska", getVideoPath(filename).toUtf8().constData());
+    m_activePath = getVideoPath(filename);
+    avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska", m_activePath.toUtf8().constData());
     if (!m_outCtx) return false;
 
     // 2. Pre-allocate Video Tracks
@@ -112,7 +114,8 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     }
     avio_flush(m_outCtx->pb); // Forces the EBML header to be visible to the reader
 
-    m_lastDts = new QMap<int, int64_t>();
+    m_lastDts.clear();
+    m_lastFlush.start();
 
     m_initialized = true;
     return true;
@@ -127,11 +130,12 @@ void Muxer::writePacket(AVPacket* pkt) {
     // track that had blue-frame DTS ahead of the source encoder's counter,
     // every packet was silently lost.  Bumping preserves the data.
     int idx = pkt->stream_index;
-    if (m_lastDts->contains(idx) && pkt->dts <= (*m_lastDts)[idx]) {
-        pkt->dts = (*m_lastDts)[idx] + 1;
+    auto it = m_lastDts.constFind(idx);
+    if (it != m_lastDts.constEnd() && pkt->dts <= it.value()) {
+        pkt->dts = it.value() + 1;
         if (pkt->pts < pkt->dts) pkt->pts = pkt->dts;
     }
-    (*m_lastDts)[idx] = pkt->dts;
+    m_lastDts[idx] = pkt->dts;
 
     // Use av_write_frame (non-interleaved) so that each stream writes
     // independently. av_interleaved_write_frame buffers packets across
@@ -149,7 +153,12 @@ void Muxer::writePacket(AVPacket* pkt) {
         qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
     }
 
-    avio_flush(m_outCtx->pb);
+    // Flush at most every ~100 ms: keeps the chase-play reader within a
+    // cluster of the live edge without a disk flush per packet.
+    if (!m_lastFlush.isValid() || m_lastFlush.elapsed() >= 100) {
+        avio_flush(m_outCtx->pb);
+        m_lastFlush.restart();
+    }
 }
 
 void Muxer::writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData) {
@@ -198,27 +207,44 @@ void Muxer::close() {
         avformat_free_context(m_outCtx);
         m_initialized = false;
         m_outCtx = nullptr;
-    }
-    if (m_lastDts) {
-        delete m_lastDts;
-        m_lastDts = nullptr;
+        m_lastDts.clear();
     }
 }
 
 QString Muxer::getVideoPath(QString fileName) {
-    // 1. Base directory: an explicit override (used by tests to stay hermetic)
-    //    or the platform Documents directory for the app.
-    QString docPath = m_outputBaseDir.isEmpty()
-                          ? QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)
-                          : m_outputBaseDir;
-
-    // 2. Create a subfolder if you want to be organized
-    QDir dir(docPath);
-    if (!dir.exists("videos")) {
-        dir.mkdir("videos");
+    // During a session, return the path resolved at init(): re-running
+    // the fallback logic could silently diverge from the open file.
+    if (m_initialized && !m_activePath.isEmpty()) {
+        return m_activePath;
     }
 
-    // 3. Construct the full filename
-    return docPath + "/videos/" + fileName+".mkv";
+    const QString fallback =
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/videos";
+
+    QString base = m_outputDir.trimmed();
+    if (base.isEmpty()) base = fallback;
+
+    if (QDir::isRelativePath(base)) {
+        // Legacy/unnormalized configs can carry relative paths (incl. a
+        // literal "~/..."); resolving them against the cwd would write
+        // somewhere the user never sees.
+        qWarning() << "Muxer: relative save location refused, using" << fallback
+                   << "(configured:" << base << ")";
+        base = fallback;
+    }
+
+    QDir dir(base);
+    if (!dir.exists()) dir.mkpath(".");
+    const QFileInfo baseInfo(base);
+    if (!baseInfo.isDir() || !baseInfo.isWritable()) {
+        qWarning() << "Muxer: save location unusable, falling back to"
+                   << fallback << "(configured:" << base << ")";
+        // Configured location unusable: fall back to the default
+        base = fallback;
+        QDir fb(base);
+        if (!fb.exists()) fb.mkpath(".");
+    }
+
+    return base + "/" + fileName + ".mkv";
 }
 

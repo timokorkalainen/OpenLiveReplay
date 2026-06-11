@@ -89,11 +89,21 @@ private:
 
     void captureLoop();
     std::atomic<bool> m_captureRunning{false};
-    QElapsedTimer m_lastPacketTimer;
-    QElapsedTimer m_lastFrameEnqueueTimer;
+    // Monotonic clock started once; activity stamps are atomics because
+    // they are written by the capture thread and read by the thread that
+    // delivers the master pulse and by the ffmpeg interrupt callback.
+    // -1 = "not yet valid".
+    QElapsedTimer m_monotonic;
+    std::atomic<int64_t> m_lastPacketAtMs{-1};
+    std::atomic<int64_t> m_lastFrameEnqueueAtMs{-1};
     int m_stallTimeoutMs = 8000;
     std::atomic<bool> m_connected{false};
     int m_connectBackoffMs = 1000;
+
+    // Last jitter-pull gate published by the tick thread (file-timeline ms,
+    // -1 until the first tick).  The capture thread uses it to pre-drain
+    // frames the next tick would discard anyway.
+    std::atomic<int64_t> m_lastTickTargetMs{-1};
 
     // Audio FIFO: the capture thread produces resampled 48 kHz stereo S16
     // stamped on the global recording timeline; the master-pulse tick

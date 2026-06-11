@@ -9,10 +9,9 @@
 #       - frame count is in the right ballpark for fps * duration
 #       - audio and video end timestamps track each other (A/V in sync, gapless)
 #
-# Output location: the recorder always writes to <Documents>/videos (see
-# Muxer::getVideoPath). That cannot be redirected via $HOME on macOS, so this
-# script is NOT fully hermetic — instead the harness prints the exact artifact
-# path and the cleanup trap deletes it, leaving nothing behind.
+# Output location: the harness is pointed at a per-run temp dir via --outdir
+# (the engine honors it through Muxer::setOutputDirectory), so this test is
+# hermetic — the whole temp dir is removed on exit.
 #
 # Modes:
 #   stereo  synthetic stereo sine  -> baseline happy path
@@ -31,13 +30,12 @@ command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
 
 if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
 
+WORKDIR="$(mktemp -d)"
 FFPID=""
-OUT_MKV=""
 cleanup() {
     [ -n "$FFPID" ] && kill "$FFPID" 2>/dev/null
     wait "$FFPID" 2>/dev/null
-    # Remove the recording this run produced (it lands in the real Documents dir).
-    [ -n "$OUT_MKV" ] && [ -f "$OUT_MKV" ] && rm -f "$OUT_MKV"
+    rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
@@ -59,7 +57,7 @@ sleep 0.5 # let the producer come up before the consumer binds
 
 # --- 2. Consumer: the real recording engine ----------------------------------
 URL="udp://127.0.0.1:${PORT}?fifo_size=1000000&overrun_nonfatal=1"
-HARNESS_OUT="$("$HARNESS" --url "$URL" --name "olr_e2e_${MODE}" \
+HARNESS_OUT="$("$HARNESS" --url "$URL" --name "olr_e2e_${MODE}" --outdir "$WORKDIR" \
     --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30)"
 HARNESS_RC=$?
 

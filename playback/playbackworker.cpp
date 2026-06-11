@@ -52,11 +52,11 @@ void PlaybackWorker::setActiveAudioView(int viewIndex) {
 }
 
 void PlaybackWorker::stop() {
+    // The interrupt callback (registered on m_fmtCtx) aborts any blocking
+    // av_read_frame.  Do NOT poke m_fmtCtx->pb from this thread: the
+    // worker owns that object, and writes raced with the EOF handler.
     m_running = false;
     requestInterruption();
-    if (m_fmtCtx && m_fmtCtx->pb) {
-        m_fmtCtx->pb->error = AVERROR_EXIT;
-    }
     if (QThread::currentThread() != this) {
         wait();
     }
@@ -72,13 +72,13 @@ bool PlaybackWorker::shouldInterrupt() const {
 }
 
 void PlaybackWorker::run() {
-    msleep(500);
-    m_transport->seek(0);
-
     qDebug() << "Opening file: "<<m_currentFilePath;
 
     if (m_currentFilePath.isEmpty()) return;
 
+    // A stop() issued before/while we get here sets the interruption
+    // flag, which (unlike m_running, re-set just below) survives — all
+    // loops therefore gate on shouldInterrupt(), not m_running alone.
     m_running = true;
 
     auto clearDecoders = [this]() {
@@ -97,7 +97,7 @@ void PlaybackWorker::run() {
     };
 
     // --- 1. OPENING & INITIALIZATION (retry until tracks available or stop) ---
-    while (m_running) {
+    while (!shouldInterrupt()) {
         if (m_fmtCtx) {
             avformat_close_input(&m_fmtCtx);
         }
@@ -201,7 +201,7 @@ void PlaybackWorker::run() {
         msleep(500);
     }
 
-    if (!m_running || m_decoderBank.isEmpty()) {
+    if (shouldInterrupt() || m_decoderBank.isEmpty()) {
         clearDecoders();
         if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
         return;
@@ -211,9 +211,9 @@ void PlaybackWorker::run() {
     AVFrame* audioFrame = av_frame_alloc();
 
     int64_t lastProcessedPtsMs = -1;
-    m_seekTargetMs = -1;
+    { QMutexLocker locker(&m_mutex); m_seekTargetMs = -1; }
 
-    while (m_running) {
+    while (!shouldInterrupt()) {
 
         // --- 2. GET MASTER TIME FROM TRANSPORT ---
         int64_t masterTimeMs = m_transport->currentPos();
@@ -223,7 +223,7 @@ void PlaybackWorker::run() {
         // react to pending seeks: paused scrubbing and frame stepping
         // must seek + burst-decode, or the frame buffer has nothing at
         // the target and the picture freezes.
-        while (m_running && !m_transport->isPlaying()) {
+        while (!shouldInterrupt() && !m_transport->isPlaying()) {
             {
                 QMutexLocker locker(&m_mutex);
                 if (m_seekTargetMs >= 0) break;
@@ -272,11 +272,19 @@ void PlaybackWorker::run() {
 
             // Burst-decode to pre-fill the buffer so backward stepping works immediately after seek
             {
-                int burstCount = 0;
                 int packetCount = 0;
                 const int bufMax = m_frameBufferMax;
-                const int packetMax = bufMax * 4; // Safety limit for non-video packets
-                while (m_running && burstCount < bufMax && packetCount < packetMax) {
+                const int trackCount = qMax(1, int(m_decoderBank.size()));
+                // Budget per track: a global frame count gave each track
+                // only bufMax/N frames of back-step room with N tracks.
+                const int packetMax = bufMax * 4 * trackCount;
+                QHash<DecoderTrack*, int> burstDecoded;
+                auto allTracksFull = [&]() {
+                    for (auto* t : m_decoderBank)
+                        if (burstDecoded.value(t, 0) < bufMax) return false;
+                    return true;
+                };
+                while (!shouldInterrupt() && !allTracksFull() && packetCount < packetMax) {
                     // Abort burst if a new seek was requested
                     {
                         QMutexLocker locker(&m_mutex);
@@ -311,7 +319,7 @@ void PlaybackWorker::run() {
                                             track->buffer.remove(0, track->buffer.size() - m_frameBufferMax);
                                         }
                                     }
-                                    burstCount++;
+                                    burstDecoded[track]++;
                                 }
                             }
                             break;

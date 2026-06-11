@@ -38,6 +38,10 @@ int main(int argc, char** argv) {
     const int width = argValue(args, QStringLiteral("--width"), QStringLiteral("640")).toInt();
     const int height = argValue(args, QStringLiteral("--height"), QStringLiteral("480")).toInt();
     const int fps = argValue(args, QStringLiteral("--fps"), QStringLiteral("30")).toInt();
+    // Where recordings land. The engine honors this (ReplayManager ->
+    // Muxer::setOutputDirectory); the driver points it at a temp dir so the
+    // test is hermetic. Empty -> engine default (~/Documents/videos).
+    const QString outdir = argValue(args, QStringLiteral("--outdir"), QString());
 
     if (url.isEmpty()) {
         fprintf(stderr, "record_harness: --url is required\n");
@@ -49,7 +53,7 @@ int main(int argc, char** argv) {
     rm.setSourceNames({QStringLiteral("E2E")});
     rm.setViewCount(1);
     rm.setViewNames({QStringLiteral("E2E")});
-    rm.setOutputDirectory(QStringLiteral("/tmp"));
+    if (!outdir.isEmpty()) rm.setOutputDirectory(outdir);
     rm.setBaseFileName(name);
     rm.setVideoWidth(width);
     rm.setVideoHeight(height);

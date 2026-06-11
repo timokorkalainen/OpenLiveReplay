@@ -5,7 +5,7 @@
 // Hermetic: Muxer::getVideoPath() normally writes to <Documents>/videos, which
 // on macOS cannot be redirected via $HOME or QStandardPaths test mode. Each
 // test instead points the muxer at a per-run QTemporaryDir via
-// setOutputBaseDir(), so nothing is written outside the temp dir and the whole
+// setOutputDirectory(), so nothing is written outside the temp dir and the whole
 // tree is auto-removed when the test object is destroyed.
 #include <QtTest>
 #include <QTemporaryDir>
@@ -29,12 +29,14 @@ private:
 };
 
 QString TestMuxer::videoPathFor(const QString& name) const {
-    return m_home.path() + "/videos/" + name + ".mkv";
+    // With an explicit output directory set, the muxer writes <dir>/<name>.mkv
+    // (the "videos" subfolder is only appended for the default Documents path).
+    return m_home.path() + "/" + name + ".mkv";
 }
 
 void TestMuxer::initBuildsTrackLayout() {
     Muxer m;
-    m.setOutputBaseDir(m_home.path());
+    m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A"), QStringLiteral("B")};
     QVERIFY(m.init(QStringLiteral("olr_unit_layout"), 2, 640, 480, 30, names, 48000, 2));
     // 2 video + 2 audio + 2 subtitle, in that order.
@@ -45,7 +47,7 @@ void TestMuxer::initBuildsTrackLayout() {
 
 void TestMuxer::getStreamIsBoundsChecked() {
     Muxer m;
-    m.setOutputBaseDir(m_home.path());
+    m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
     QVERIFY(m.init(QStringLiteral("olr_unit_bounds"), 1, 320, 240, 30, names, 48000, 2));
     // 1 video + 1 audio + 1 subtitle = 3 streams (indices 0..2).
@@ -58,7 +60,7 @@ void TestMuxer::getStreamIsBoundsChecked() {
 
 void TestMuxer::stereoAudioChannelLayout() {
     Muxer m;
-    m.setOutputBaseDir(m_home.path());
+    m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
     QVERIFY(m.init(QStringLiteral("olr_unit_stereo"), 1, 320, 240, 30, names, 48000, 2));
     AVStream* audio = m.getStream(m.audioTrackOffset());
@@ -69,7 +71,7 @@ void TestMuxer::stereoAudioChannelLayout() {
 
 void TestMuxer::monoAudioChannelLayout() {
     Muxer m;
-    m.setOutputBaseDir(m_home.path());
+    m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
     QVERIFY(m.init(QStringLiteral("olr_unit_mono"), 1, 320, 240, 30, names, 48000, 1));
     AVStream* audio = m.getStream(m.audioTrackOffset());
@@ -81,7 +83,7 @@ void TestMuxer::monoAudioChannelLayout() {
 void TestMuxer::initProducesAFile() {
     QVERIFY(m_home.isValid());
     Muxer m;
-    m.setOutputBaseDir(m_home.path());
+    m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
     QVERIFY(m.init(QStringLiteral("olr_unit_file"), 1, 320, 240, 30, names, 48000, 2));
     m.close();
