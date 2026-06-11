@@ -688,22 +688,28 @@ git commit -m "feat: deck action vocabulary, default profiles, change-guarded de
 
 The layout that renders on every model: action keys with state-aware highlighting, display keys (timecode/speed), the Stream Deck + dial strip (jog dial + continuous scrub bar), and the Neo panel. Event handlers funnel into the facade's callbacks (declared here, wired to the session in Task 6).
 
-> **REVISED during execution (Task 4 code review findings):** the original code
-> below put `@EnvironmentObject var state: DeckState` in every key view. Verified
-> against StreamDeckKit 1.3.0 source: any single publish then re-evaluates every
-> key body and the SDK marks every key dirty — a ticking timecode would re-render
-> the whole deck, violating the spec's performance contract. The executed version
-> instead has ONLY the container view (`ReplayDeckLayout`) observe `DeckState`;
-> each key receives an `Equatable` value struct (`KeyContent { action, isActive,
-> title, symbolName }`) and leaf views conform to `Equatable` (compared on content
-> only, `@State isPressed` excluded), so SwiftUI skips unchanged keys entirely.
-> The strip/panel receive plain values the same way. Additional carried-forward
-> fixes: the facade replacement KEEPS `@MainActor` (added in Task 4); `DeckState`
-> gains `@MainActor` + a named `positionEpsilon` constant + an honest doc comment;
-> `DeckAction.defaultMapping` made total for pedal (respects `keyCount`) with a
-> named `pedalModelIdentifier` constant; tests extended (setKeyMapping guard,
-> single-field setPosition publish, pedal clamp). The authoritative code is the
-> committed implementation; snippets below are the pre-revision originals.
+> **REVISED during execution (Task 4 + Task 5 code review findings):** the
+> original code below put `@EnvironmentObject var state: DeckState` in every key
+> view; an intermediate revision observed it only in the container with Equatable
+> leaf pruning. Both fail against StreamDeckKit 1.3.0's dirty-marking: ANY
+> container body re-evaluation fires the SDK's `.onChange(of: _nextID)` with
+> dirty marker `.screen` → full-deck USB re-transmit per publish; and content
+> rendered outside `StreamDeckKeyView` (the SDK's only `.key(i)` marker) never
+> transmits at all. The final executed architecture (commits b256628 + follow-up)
+> is the SDK's own leaf-state pattern: the container is STATIC (holds `state` as
+> a plain unobserved `let`, body never re-evaluates after install); every key
+> renders ALL content branches inside a single `StreamDeckKeyView` wrapper
+> (action closure guards out display-only/unmapped keys); each leaf owns its
+> rendered values as `@State`, seeded in init and updated via an
+> equality-guarded `.onReceive(state.objectWillChange.receive(on: RunLoop.main))`
+> (the runloop hop turns will-change into did-change). `KeyContent` derivation is
+> an extracted, table-tested `@MainActor init(state:keyIndex:model:)`. Additional
+> carried-forward fixes: facade keeps `@MainActor`; `DeckState` gains `@MainActor`
+> + named `positionEpsilon`; `DeckAction.defaultMapping` made total for pedal with
+> a named `pedalModelIdentifier`; tests now 19. Task 6 must render with
+> `device.render(ReplayDeckLayout(state: state))` (init parameter, NOT
+> environmentObject). The authoritative code is the committed implementation;
+> snippets below are the pre-revision originals.
 
 **Files:**
 - Modify: `ios/streamdeck-bridge/Sources/OLRStreamDeckBridge.swift` (add callback vars, shared state, emit helpers, model identifier)
