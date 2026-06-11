@@ -737,6 +737,11 @@ void UIManager::setRecordFps(int fps) {
 }
 
 void UIManager::setMultiviewCount(int count) {
+    // The muxer's stream layout is frozen at startRecording; changing the view
+    // count mid-recording flows through syncActiveStreams -> setViewCount and
+    // makes a raised count write video packets into audio/subtitle tracks.
+    // The QML SpinBox already disables while recording — guard the engine too.
+    if (m_replayManager && m_replayManager->isRecording()) return;
     const int clamped = qBound(1, count, 16);
     if (m_currentSettings.multiviewCount != clamped) {
         m_currentSettings.multiviewCount = clamped;
