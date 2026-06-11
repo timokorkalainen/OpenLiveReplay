@@ -11,7 +11,10 @@
 // playhead are released into the (500ms-capped) AudioPlayer ring.
 class AudioFrameQueue {
 public:
-    struct Frame { int64_t ptsMs; QByteArray pcm; };
+    struct Frame {
+        int64_t ptsMs;
+        QByteArray pcm;
+    };
 
     void enqueue(int64_t ptsMs, const char* data, int bytes);
 
@@ -24,7 +27,7 @@ public:
 
     void clear();
     bool isEmpty() const { return m_q.isEmpty(); }
-    int  spanMs() const; // newest.pts - oldest.pts, 0 if <2
+    int spanMs() const; // newest.pts - oldest.pts, 0 if <2
 
 private:
     QQueue<Frame> m_q;

@@ -4,9 +4,8 @@
 // ---------------------------------------------------------------------------
 // insert
 // ---------------------------------------------------------------------------
-bool TrackBuffer::insert(int64_t ptsMs, const QVideoFrame& f,
-                         int capFrames, int64_t keepNearMs, int64_t protectToMs)
-{
+bool TrackBuffer::insert(int64_t ptsMs, const QVideoFrame& f, int capFrames, int64_t keepNearMs,
+                         int64_t protectToMs) {
     // Binary-search for the insertion position (lower_bound by ptsMs).
     int lo = 0, hi = m_frames.size();
     while (lo < hi) {
@@ -36,8 +35,7 @@ bool TrackBuffer::insert(int64_t ptsMs, const QVideoFrame& f,
 
         for (int i = 0; i < m_frames.size(); ++i) {
             int64_t pts = m_frames[i].ptsMs;
-            if (pts >= keepNearMs && pts <= protectToMs)
-                continue; // protected range — skip
+            if (pts >= keepNearMs && pts <= protectToMs) continue; // protected range — skip
             int64_t dist = pts >= keepNearMs ? (pts - keepNearMs) : (keepNearMs - pts);
             if (dist > maxDist) {
                 maxDist = dist;
@@ -72,10 +70,8 @@ bool TrackBuffer::insert(int64_t ptsMs, const QVideoFrame& f,
 // ---------------------------------------------------------------------------
 // frameAt
 // ---------------------------------------------------------------------------
-bool TrackBuffer::frameAt(int64_t playheadMs, QVideoFrame& out, int64_t& outPtsMs) const
-{
-    if (m_frames.isEmpty())
-        return false;
+bool TrackBuffer::frameAt(int64_t playheadMs, QVideoFrame& out, int64_t& outPtsMs) const {
+    if (m_frames.isEmpty()) return false;
 
     // upper_bound for playheadMs: first index where ptsMs > playheadMs.
     int lo = 0, hi = m_frames.size();
@@ -88,8 +84,7 @@ bool TrackBuffer::frameAt(int64_t playheadMs, QVideoFrame& out, int64_t& outPtsM
     }
     // lo is the first index with ptsMs > playheadMs.
     // The candidate is at lo-1.
-    if (lo == 0)
-        return false; // all frames are > playheadMs
+    if (lo == 0) return false; // all frames are > playheadMs
 
     int idx = lo - 1;
     out = m_frames[idx].frame;
@@ -100,12 +95,10 @@ bool TrackBuffer::frameAt(int64_t playheadMs, QVideoFrame& out, int64_t& outPtsM
 // ---------------------------------------------------------------------------
 // hasFrameNear
 // ---------------------------------------------------------------------------
-bool TrackBuffer::hasFrameNear(int64_t targetMs, int64_t toleranceMs) const
-{
+bool TrackBuffer::hasFrameNear(int64_t targetMs, int64_t toleranceMs) const {
     for (const Frame& fr : m_frames) {
         int64_t diff = fr.ptsMs >= targetMs ? (fr.ptsMs - targetMs) : (targetMs - fr.ptsMs);
-        if (diff <= toleranceMs)
-            return true;
+        if (diff <= toleranceMs) return true;
     }
     return false;
 }
@@ -113,21 +106,18 @@ bool TrackBuffer::hasFrameNear(int64_t targetMs, int64_t toleranceMs) const
 // ---------------------------------------------------------------------------
 // newestPts / oldestPts
 // ---------------------------------------------------------------------------
-int64_t TrackBuffer::newestPts() const
-{
+int64_t TrackBuffer::newestPts() const {
     return m_frames.isEmpty() ? -1 : m_frames.last().ptsMs;
 }
 
-int64_t TrackBuffer::oldestPts() const
-{
+int64_t TrackBuffer::oldestPts() const {
     return m_frames.isEmpty() ? -1 : m_frames.first().ptsMs;
 }
 
 // ---------------------------------------------------------------------------
 // trim
 // ---------------------------------------------------------------------------
-void TrackBuffer::trim(int64_t keepFromMs, int64_t keepToMs)
-{
+void TrackBuffer::trim(int64_t keepFromMs, int64_t keepToMs) {
     // Remove from the front while ptsMs < keepFromMs.
     while (!m_frames.isEmpty() && m_frames.first().ptsMs < keepFromMs)
         m_frames.removeFirst();

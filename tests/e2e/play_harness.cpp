@@ -31,7 +31,7 @@
 #include "playback/playbackworker.h"
 
 namespace {
-constexpr int kFrameDurMs = 33;   // ~30fps step granularity
+constexpr int kFrameDurMs = 33; // ~30fps step granularity
 
 // Probe the fixture's duration so scenarios that seek "near the end" target a
 // real position. Falls back to a conservative default if ffprobe is missing.
@@ -56,7 +56,8 @@ int main(int argc, char** argv) {
     const int views = (argc > 3) ? atoi(argv[3]) : 2;
 
     QList<FrameProvider*> providers;
-    for (int i = 0; i < views; ++i) providers.append(new FrameProvider());
+    for (int i = 0; i < views; ++i)
+        providers.append(new FrameProvider());
 
     PlaybackTransport transport;
     transport.setFps(30);
@@ -70,7 +71,7 @@ int main(int argc, char** argv) {
 
     PlaybackWorker worker(providers, &transport, &audio);
     worker.openFile(file);
-    worker.setActiveAudioView(0);   // route audio for view 0
+    worker.setActiveAudioView(0); // route audio for view 0
     worker.start();
 
     const int64_t durMs = probeDurationMs(file);
@@ -81,8 +82,8 @@ int main(int argc, char** argv) {
         const PlaybackWorker::PlaybackCounters c = worker.counters();
         printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d\n",
-               c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek,
-               c.skipForward, c.audioPushes, c.framesDropped);
+               c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
+               c.audioPushes, c.framesDropped);
         fflush(stdout);
         app.quit();
     };
@@ -90,8 +91,8 @@ int main(int argc, char** argv) {
     // Scenario kickoff at t=1500ms: the worker's run() has an open/retry loop
     // (~500ms+) before the file is decodable, so give it a generous lead.
     QTimer::singleShot(1500, &app, [&]() {
-        fprintf(stderr, "### SCENARIO %s views=%d dur=%lldms ###\n",
-                scen.toUtf8().constData(), views, (long long)durMs);
+        fprintf(stderr, "### SCENARIO %s views=%d dur=%lldms ###\n", scen.toUtf8().constData(),
+                views, (long long) durMs);
 
         if (scen == "play1x") {
             // Steady 1x playback from the start. The headline storm metric:
@@ -130,7 +131,11 @@ int main(int argc, char** argv) {
             int* n = new int(0);
             QTimer* t = new QTimer(&app);
             QObject::connect(t, &QTimer::timeout, &app, [&, n, t]() {
-                if (*n >= 20) { t->stop(); finish(); return; }
+                if (*n >= 20) {
+                    t->stop();
+                    finish();
+                    return;
+                }
                 const int64_t pos = transport.currentPos() - kFrameDurMs;
                 transport.seek(pos);
                 worker.seekTo(pos);
@@ -143,20 +148,28 @@ int main(int argc, char** argv) {
             // worker.seekTo() for each scrub target. Drive a series of in- and
             // out-of-window positions, in both playing and paused states, then
             // assert via counters (in-window scrubs should reuse, not storm).
-            struct Step { int64_t pos; bool play; };
+            struct Step {
+                int64_t pos;
+                bool play;
+            };
             // In-window deltas (a few frames apart) interleaved with larger
             // out-of-window jumps; first paused, later playing.
             auto* steps = new QList<Step>{
-                {6000, false}, {6066, false}, {6132, false}, {6099, false}, // in-window paused
-                {12000, false}, {12066, false}, {12033, false},             // jump + in-window
-                {3000, false}, {3066, false},                               // backward jump + in-window
-                {9000, true},  {9066, true},  {9132, true},                 // in-window playing
-                {15000, true}, {15066, true},                               // jump + in-window playing
+                {6000, false},  {6066, false},  {6132, false},  {6099, false}, // in-window paused
+                {12000, false}, {12066, false}, {12033, false},                // jump + in-window
+                {3000, false},  {3066, false},                // backward jump + in-window
+                {9000, true},   {9066, true},   {9132, true}, // in-window playing
+                {15000, true},  {15066, true},                // jump + in-window playing
             };
             auto* i = new int(0);
             QTimer* t = new QTimer(&app);
             QObject::connect(t, &QTimer::timeout, &app, [&, steps, i, t]() {
-                if (*i >= steps->size()) { t->stop(); steps->clear(); finish(); return; }
+                if (*i >= steps->size()) {
+                    t->stop();
+                    steps->clear();
+                    finish();
+                    return;
+                }
                 const Step s = steps->at(*i);
                 transport.setPlaying(s.play);
                 transport.setSpeed(1.0);
@@ -164,7 +177,7 @@ int main(int argc, char** argv) {
                 worker.seekTo(s.pos);
                 (*i)++;
             });
-            t->start(400);  // give each scrub time to settle in-window
+            t->start(400); // give each scrub time to settle in-window
 
         } else if (scen == "liveedge") {
             // Seek near the end and play forward into EOF. Tests the live-EOF
@@ -177,16 +190,15 @@ int main(int argc, char** argv) {
             QTimer::singleShot(6000, &app, finish);
 
         } else {
-            fprintf(stderr, "play_harness: unknown scenario '%s'\n",
-                    scen.toUtf8().constData());
+            fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());
             // Still print counters (all zero) so the driver gets a line, then
             // exit non-zero via the absence of a recognized scenario.
             worker.stop();
             const PlaybackWorker::PlaybackCounters c = worker.counters();
             printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                    "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d\n",
-                   c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek,
-                   c.skipForward, c.audioPushes, c.framesDropped);
+                   c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
+                   c.audioPushes, c.framesDropped);
             fflush(stdout);
             ::exit(2);
         }
@@ -201,6 +213,7 @@ int main(int argc, char** argv) {
     const int rc = app.exec();
 
     // Release providers (worker is already stopped in finish()).
-    for (auto* p : providers) delete p;
+    for (auto* p : providers)
+        delete p;
     return rc;
 }

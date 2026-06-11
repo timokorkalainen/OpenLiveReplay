@@ -81,10 +81,12 @@ bool PlaybackWorker::shouldInterrupt() const {
 
 void PlaybackWorker::emitTelemetry(int64_t P, int64_t newest, double speed) {
     if (!qEnvironmentVariableIsSet("OLR_PB_TELEMETRY")) return;
-    fprintf(stderr, "SEC repos=%d reuse=%d revseek=%d eof=%d skip=%d apush=%d drop=%d P=%lld newest=%lld spd=%.2f\n",
+    fprintf(stderr,
+            "SEC repos=%d reuse=%d revseek=%d eof=%d skip=%d apush=%d drop=%d P=%lld newest=%lld "
+            "spd=%.2f\n",
             m_counters.reposition, m_counters.reuseSeek, m_counters.reverseChunkSeek,
             m_counters.eofTailSeek, m_counters.skipForward, m_counters.audioPushes,
-            m_counters.framesDropped, (long long)P, (long long)newest, speed);
+            m_counters.framesDropped, (long long) P, (long long) newest, speed);
 }
 
 // ---------------------------------------------------------------------------
@@ -100,15 +102,15 @@ int PlaybackWorker::fps() const {
 }
 
 int64_t PlaybackWorker::frameDurMs() const {
-    return 1000 / fps();   // fps() >= 1 so no divide-by-zero
+    return 1000 / fps(); // fps() >= 1 so no divide-by-zero
 }
 
 int PlaybackWorker::capFrames(int trackCount) const {
     // capFrames = clamp( ceil(windowMs / frameDurMs) + 4, 12,
     //                    max(12, kGlobalFrameBudget / max(1,trackCount)) )
     const int64_t windowMs = int64_t(kLeadMs) + kChunkMs + kTrailMs + 2 * int64_t(kSlackMs);
-    const int64_t dur = qMax<int64_t>(1, frameDurMs());      // never divide by zero
-    const int64_t ceilFrames = (windowMs + dur - 1) / dur;   // integer ceil
+    const int64_t dur = qMax<int64_t>(1, frameDurMs());    // never divide by zero
+    const int64_t ceilFrames = (windowMs + dur - 1) / dur; // integer ceil
     int64_t want = ceilFrames + 4;
 
     const int tc = qMax(1, trackCount);
@@ -130,13 +132,13 @@ int64_t PlaybackWorker::newestPtsMin() const {
         const int64_t n = track->buffer.newestPts();
         if (n > maxNewest) maxNewest = n;
     }
-    if (maxNewest < 0) return -1;  // all tracks empty
+    if (maxNewest < 0) return -1; // all tracks empty
 
     int64_t minNewest = -1;
     for (auto* track : m_decoderBank) {
         const int64_t n = track->buffer.newestPts();
-        if (n < 0) continue;                       // empty track
-        if (n < maxNewest - kLeadMs) continue;     // stalled track — exclude
+        if (n < 0) continue;                   // empty track
+        if (n < maxNewest - kLeadMs) continue; // stalled track — exclude
         if (minNewest < 0 || n < minNewest) minNewest = n;
     }
     return minNewest;
@@ -151,13 +153,13 @@ int64_t PlaybackWorker::oldestPtsMin() const {
         const int64_t n = track->buffer.newestPts();
         if (n > maxNewest) maxNewest = n;
     }
-    if (maxNewest < 0) return -1;  // all tracks empty
+    if (maxNewest < 0) return -1; // all tracks empty
 
     int64_t minOldest = -1;
     for (auto* track : m_decoderBank) {
         const int64_t n = track->buffer.newestPts();
-        if (n < 0) continue;                       // empty track
-        if (n < maxNewest - kLeadMs) continue;     // stalled track — exclude
+        if (n < 0) continue;                   // empty track
+        if (n < maxNewest - kLeadMs) continue; // stalled track — exclude
         const int64_t o = track->buffer.oldestPts();
         if (minOldest < 0 || o < minOldest) minOldest = o;
     }
@@ -189,7 +191,8 @@ int64_t PlaybackWorker::refOldestPts() const {
 
 void PlaybackWorker::resetDedup() {
     QMutexLocker bufferLocker(&m_bufferMutex);
-    for (auto* track : m_decoderBank) track->lastDeliveredPtsMs = -1;
+    for (auto* track : m_decoderBank)
+        track->lastDeliveredPtsMs = -1;
 }
 
 void PlaybackWorker::clearAllBuffers() {
@@ -218,16 +221,14 @@ bool PlaybackWorker::reuseAt(int64_t target) {
 // the PCM into the worker-side queue instead of pushing to AudioPlayer.
 // ---------------------------------------------------------------------------
 void PlaybackWorker::enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame,
-                                      bool dedupTail) {
-    if (audioFrame->format != AV_SAMPLE_FMT_S16
-        || audioFrame->sample_rate != 48000
-        || audioFrame->ch_layout.nb_channels != 2) {
+                                       bool dedupTail) {
+    if (audioFrame->format != AV_SAMPLE_FMT_S16 || audioFrame->sample_rate != 48000 ||
+        audioFrame->ch_layout.nb_channels != 2) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            qWarning() << "PlaybackWorker: unsupported audio frame format"
-                       << audioFrame->format << audioFrame->sample_rate
-                       << audioFrame->ch_layout.nb_channels;
+            qWarning() << "PlaybackWorker: unsupported audio frame format" << audioFrame->format
+                       << audioFrame->sample_rate << audioFrame->ch_layout.nb_channels;
         }
         return;
     }
@@ -241,12 +242,10 @@ void PlaybackWorker::enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audio
 
     // Dedup-before-decode after EOF un-latch (§6.8): a re-read tail cluster's
     // audio is already queued/played — skip it to avoid duplicate audio.
-    if (dedupTail && aTrack->lastEnqueuedPtsMs >= 0 && ptsMs <= aTrack->lastEnqueuedPtsMs)
-        return;
+    if (dedupTail && aTrack->lastEnqueuedPtsMs >= 0 && ptsMs <= aTrack->lastEnqueuedPtsMs) return;
 
-    const int dataSize = audioFrame->nb_samples
-                         * audioFrame->ch_layout.nb_channels
-                         * int(sizeof(int16_t));
+    const int dataSize =
+        audioFrame->nb_samples * audioFrame->ch_layout.nb_channels * int(sizeof(int16_t));
     m_audioQueue.enqueue(ptsMs, reinterpret_cast<const char*>(audioFrame->data[0]), dataSize);
     aTrack->lastEnqueuedPtsMs = ptsMs;
 }
@@ -260,10 +259,9 @@ void PlaybackWorker::enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audio
 // Returns the ms-PTS of the last video frame inserted, or INT64_MIN if none.
 // Caller must NOT hold m_bufferMutex (we lock it for the insert).
 // ---------------------------------------------------------------------------
-int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame* af,
-                                             int64_t P, int dir, int trackCount,
-                                             bool decimate, int decimateStep,
-                                             bool audioOn, bool dedupTail) {
+int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame* af, int64_t P,
+                                             int dir, int trackCount, bool decimate,
+                                             int decimateStep, bool audioOn, bool dedupTail) {
     int64_t lastVideoPtsMs = INT64_MIN;
     const int cap = capFrames(trackCount);
     // Protect the active fill range in the travel direction (spec §6.6) so the
@@ -285,7 +283,10 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     keep = (track->decimateCounter % decimateStep) == 0;
                     track->decimateCounter++;
                 }
-                if (!keep) { av_frame_unref(vf); continue; }
+                if (!keep) {
+                    av_frame_unref(vf);
+                    continue;
+                }
 
                 int64_t framePts = vf->pts;
                 if (framePts == AV_NOPTS_VALUE) framePts = vf->best_effort_timestamp;
@@ -295,18 +296,21 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     framePtsMs = av_rescale_q(framePts, tb, {1, 1000});
                 } else {
                     // No PTS: synthesize from the last known, or fall back to P.
-                    framePtsMs = (lastVideoPtsMs != INT64_MIN)
-                                     ? lastVideoPtsMs + frameDurMs()
-                                     : P;
+                    framePtsMs = (lastVideoPtsMs != INT64_MIN) ? lastVideoPtsMs + frameDurMs() : P;
                 }
 
                 // Dedup-before-decode after EOF un-latch: a re-read tail cluster
                 // already in the buffer is skipped (read cost only, no dup).
                 if (dedupTail) {
                     int64_t nv;
-                    { QMutexLocker bufferLocker(&m_bufferMutex);
-                      nv = track->buffer.newestPts(); }
-                    if (nv >= 0 && framePtsMs <= nv) { av_frame_unref(vf); continue; }
+                    {
+                        QMutexLocker bufferLocker(&m_bufferMutex);
+                        nv = track->buffer.newestPts();
+                    }
+                    if (nv >= 0 && framePtsMs <= nv) {
+                        av_frame_unref(vf);
+                        continue;
+                    }
                 }
 
                 QVideoFrame qFrame = convertToQVideoFrame(vf);
@@ -343,8 +347,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 // ---------------------------------------------------------------------------
 // repositionTo (spec §6.2) — reuse fast-path or full trail-covering reposition.
 // ---------------------------------------------------------------------------
-void PlaybackWorker::repositionTo(int64_t target, int dir,
-                                  AVPacket* pkt, AVFrame* vf, AVFrame* af) {
+void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf,
+                                  AVFrame* af) {
     const int trackCount = qMax(1, int(m_decoderBank.size()));
 
     // --- Reuse fast-path: every track already has a real frame at target. ---
@@ -364,7 +368,8 @@ void PlaybackWorker::repositionTo(int64_t target, int dir,
     // --- Full reposition: clear everything, seek behind target, fill forward. ---
     clearAllBuffers();
     m_audioQueue.clear();
-    for (auto* aTrack : m_audioDecoderBank) aTrack->lastEnqueuedPtsMs = -1;
+    for (auto* aTrack : m_audioDecoderBank)
+        aTrack->lastEnqueuedPtsMs = -1;
     if (m_audioPlayer) m_audioPlayer->clear();
 
     const int64_t anchor = qMax<int64_t>(0, target - (dir < 0 ? kLeadMs : kTrailMs));
@@ -383,21 +388,24 @@ void PlaybackWorker::repositionTo(int64_t target, int dir,
     const int packetBudget = (capFrames(trackCount) + 4) * trackCount * 2;
     while (!shouldInterrupt()) {
         // A newer explicit seek supersedes this fill.
-        { QMutexLocker locker(&m_mutex); if (m_seekTargetMs >= 0) break; }
+        {
+            QMutexLocker locker(&m_mutex);
+            if (m_seekTargetMs >= 0) break;
+        }
 
         int ret = av_read_frame(m_fmtCtx, pkt);
-        if (ret < 0) break;   // EOF/short file: deliver what we have
+        if (ret < 0) break; // EOF/short file: deliver what we have
 
         // Reposition decodes forward from the anchor; protect the [target,
         // target+kLead] span (dir=+1) — the trail below target is also kept by
         // the anchor being kTrailMs/kLeadMs below it.
-        decodePacketIntoBank(pkt, vf, af, target, /*dir*/1, trackCount,
-                             /*decimate*/false, /*step*/1,
-                             /*audioOn*/false, /*dedupTail*/false);
+        decodePacketIntoBank(pkt, vf, af, target, /*dir*/ 1, trackCount,
+                             /*decimate*/ false, /*step*/ 1,
+                             /*audioOn*/ false, /*dedupTail*/ false);
         av_packet_unref(pkt);
 
-        if (++packets > packetBudget) break;          // safety bound
-        if (newestPtsMin() >= fillTo) break;           // covered the target
+        if (++packets > packetBudget) break; // safety bound
+        if (newestPtsMin() >= fillTo) break; // covered the target
     }
 
     resetDedup();
@@ -546,7 +554,8 @@ void PlaybackWorker::run() {
 
     // Telemetry: emit a SEC line once per wall-second.
     int64_t lastTelemetryMs = 0;
-    QElapsedTimer wallClock; wallClock.start();
+    QElapsedTimer wallClock;
+    wallClock.start();
     // EOF read-error backoff bound (non-EOF errors; §6.8).
     int readErrStreak = 0;
     const int kMaxReadErrStreak = 200;
@@ -557,11 +566,11 @@ void PlaybackWorker::run() {
     while (!shouldInterrupt()) {
 
         // --- Sample state (spec §6.1) ---
-        int64_t P        = m_transport->currentPos();
-        bool    playing  = m_transport->isPlaying();
-        double  speed    = m_transport->speed();
+        int64_t P = m_transport->currentPos();
+        bool playing = m_transport->isPlaying();
+        double speed = m_transport->speed();
         const double aspeed = qAbs(speed);
-        int     dir      = playing ? (speed < 0 ? -1 : 1) : m_lastMoveDir.load(std::memory_order_relaxed);
+        int dir = playing ? (speed < 0 ? -1 : 1) : m_lastMoveDir.load(std::memory_order_relaxed);
         const int trackCount = qMax(1, int(m_decoderBank.size()));
 
         // --- Audio re-prime request from setActiveAudioView (UI thread) ---
@@ -593,7 +602,8 @@ void PlaybackWorker::run() {
                 // If a frame at P exists and is already the delivered one, idle.
                 QMutexLocker bufferLocker(&m_bufferMutex);
                 if (!m_decoderBank.isEmpty()) {
-                    QVideoFrame f; int64_t p = -1;
+                    QVideoFrame f;
+                    int64_t p = -1;
                     DecoderTrack* ref = m_decoderBank[0];
                     if (!ref->buffer.frameAt(P, f, p) || p != ref->lastDeliveredPtsMs)
                         needWork = true;
@@ -601,7 +611,10 @@ void PlaybackWorker::run() {
                     needWork = true;
                 }
             }
-            if (!needWork) { msleep(10); continue; }
+            if (!needWork) {
+                msleep(10);
+                continue;
+            }
             // else: fall through to classify→deliver while paused.
         }
 
@@ -611,7 +624,10 @@ void PlaybackWorker::run() {
         int64_t seekTarget = -1;
         {
             QMutexLocker locker(&m_mutex);
-            if (m_seekTargetMs >= 0) { seekTarget = m_seekTargetMs; m_seekTargetMs = -1; }
+            if (m_seekTargetMs >= 0) {
+                seekTarget = m_seekTargetMs;
+                m_seekTargetMs = -1;
+            }
         }
         if (seekTarget >= 0) {
             // Anchor direction by the recorded move sign (seekTo sets it in T6).
@@ -621,15 +637,15 @@ void PlaybackWorker::run() {
         }
 
         // (2) Backward jump: P fell below everything buffered. → §6.2, reverse.
-        const int64_t oMin = oldestPtsMin();   // -1 if empty
+        const int64_t oMin = oldestPtsMin(); // -1 if empty
         if (oMin >= 0 && P < oMin - kBackJumpSlackMs) {
-            repositionTo(P, /*dir*/-1, pkt, frame, audioFrame);
+            repositionTo(P, /*dir*/ -1, pkt, frame, audioFrame);
             continue;
         }
 
         // (3) Forward lag / overrun (playing, dir=+1): decode/playhead is ahead
         //     of what's buffered. NEVER a reposition — skip-forward or tail-hold.
-        const int64_t nMin = newestPtsMin();   // -1 if empty
+        const int64_t nMin = newestPtsMin(); // -1 if empty
         if (playing && dir == 1 && nMin >= 0 && nMin < P - kLeadMs) {
             const int64_t nMax = newestPtsMax();
             if (P > nMax) {
@@ -657,10 +673,10 @@ void PlaybackWorker::run() {
 
         // --- FILL (direction-aware) ---
         const bool decimate = aspeed > kDecimateAbove;
-        const int  decStep  = decimate ? int(std::ceil(aspeed)) : 1;
+        const int decStep = decimate ? int(std::ceil(aspeed)) : 1;
         bool hitEof = false;
         bool nonEofErr = false;
-        int  packetsThisIter = 0;
+        int packetsThisIter = 0;
 
         if (dir >= 0) {
             // --- Forward fill (§6.3): bounded to the window + one batch. ---
@@ -671,20 +687,29 @@ void PlaybackWorker::run() {
                 int64_t nm = newestPtsMin();
                 if (nm >= 0 && nm >= P + kLeadMs) break;
                 // Abort fill if a seek arrived.
-                { QMutexLocker locker(&m_mutex); if (m_seekTargetMs >= 0) break; }
+                {
+                    QMutexLocker locker(&m_mutex);
+                    if (m_seekTargetMs >= 0) break;
+                }
 
                 int ret = av_read_frame(m_fmtCtx, pkt);
-                if (ret == AVERROR_EOF) { hitEof = true; break; }
-                if (ret < 0) { nonEofErr = true; break; }
+                if (ret == AVERROR_EOF) {
+                    hitEof = true;
+                    break;
+                }
+                if (ret < 0) {
+                    nonEofErr = true;
+                    break;
+                }
                 readErrStreak = 0;
                 batch++;
                 packetsThisIter++;
 
                 // Audio enqueue only when at 1× forward single-view playing.
                 bool audioOn = playing && dir == 1 && (speed > 0.99 && speed < 1.01);
-                int64_t lastV = decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/1,
+                int64_t lastV = decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/ 1,
                                                      trackCount, decimate, decStep, audioOn,
-                                                     /*dedupTail*/false);
+                                                     /*dedupTail*/ false);
                 av_packet_unref(pkt);
 
                 // Terminate when the just-read video packet crosses the slack edge.
@@ -705,23 +730,32 @@ void PlaybackWorker::run() {
                 m_counters.reverseChunkSeek++;
 
                 const int kReverseChunkBudget =
-                    int(std::ceil(double(kChunkMs) / qMax<int64_t>(1, frameDurMs())))
-                    * trackCount * 2;
+                    int(std::ceil(double(kChunkMs) / qMax<int64_t>(1, frameDurMs()))) * trackCount *
+                    2;
                 int packets = 0;
                 while (!shouldInterrupt() && packets < kReverseChunkBudget) {
-                    { QMutexLocker locker(&m_mutex); if (m_seekTargetMs >= 0) break; }
+                    {
+                        QMutexLocker locker(&m_mutex);
+                        if (m_seekTargetMs >= 0) break;
+                    }
                     int ret = av_read_frame(m_fmtCtx, pkt);
-                    if (ret == AVERROR_EOF) { hitEof = true; break; }
-                    if (ret < 0) { nonEofErr = true; break; }
+                    if (ret == AVERROR_EOF) {
+                        hitEof = true;
+                        break;
+                    }
+                    if (ret < 0) {
+                        nonEofErr = true;
+                        break;
+                    }
                     readErrStreak = 0;
                     packets++;
                     packetsThisIter++;
 
                     // Decode forward WITHOUT delivering partial-chunk frames
                     // (audio muted in reverse). dir=-1 protects [P-kLead, P].
-                    decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/-1,
-                                         trackCount, decimate, decStep, /*audioOn*/false,
-                                         /*dedupTail*/false);
+                    decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/ -1, trackCount,
+                                         decimate, decStep, /*audioOn*/ false,
+                                         /*dedupTail*/ false);
 
                     // Terminate when the read cursor reaches the previous oldest
                     // file position (the chunk above this is already buffered).
@@ -739,13 +773,14 @@ void PlaybackWorker::run() {
             int64_t keepFrom, keepTo;
             if (dir >= 0) {
                 keepFrom = P - (kTrailMs + kSlackMs);
-                keepTo   = P + (kLeadMs + kSlackMs);
+                keepTo = P + (kLeadMs + kSlackMs);
             } else {
                 keepFrom = P - (kLeadMs + kChunkMs + kSlackMs);
-                keepTo   = P + (kTrailMs + kSlackMs);
+                keepTo = P + (kTrailMs + kSlackMs);
             }
             QMutexLocker bufferLocker(&m_bufferMutex);
-            for (auto* track : m_decoderBank) track->buffer.trim(keepFrom, keepTo);
+            for (auto* track : m_decoderBank)
+                track->buffer.trim(keepFrom, keepTo);
         }
         m_audioQueue.dropOlderThan(P, kAudioLeadMs);
 
@@ -758,9 +793,8 @@ void PlaybackWorker::run() {
             if (playing && dir == 1 && oneX && activeView >= 0 && unmuted) {
                 AudioFrameQueue::Frame af;
                 while (m_audioQueue.releaseDue(P, kAudioLeadMs, af)) {
-                    m_audioPlayer->pushSamples(
-                        reinterpret_cast<const uint8_t*>(af.pcm.constData()),
-                        af.pcm.size(), af.ptsMs, P);
+                    m_audioPlayer->pushSamples(reinterpret_cast<const uint8_t*>(af.pcm.constData()),
+                                               af.pcm.size(), af.ptsMs, P);
                     m_counters.audioPushes++;
                 }
             } else {
@@ -777,7 +811,10 @@ void PlaybackWorker::run() {
             if (sz > m_sizeAtLastEof) {
                 // Grown — un-latch and seek back to the reference newest so the
                 // matroska demuxer's latched 'done' is cleared.
-                if (m_fmtCtx->pb) { m_fmtCtx->pb->eof_reached = 0; m_fmtCtx->pb->error = 0; }
+                if (m_fmtCtx->pb) {
+                    m_fmtCtx->pb->eof_reached = 0;
+                    m_fmtCtx->pb->error = 0;
+                }
                 avformat_flush(m_fmtCtx);
                 int64_t rNewest = refNewestPts();
                 AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
@@ -794,9 +831,9 @@ void PlaybackWorker::run() {
                     for (int i = 0; i < kEofDrain && !shouldInterrupt(); ++i) {
                         int ret = av_read_frame(m_fmtCtx, pkt);
                         if (ret < 0) break;
-                        decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/1,
-                                             trackCount, /*decimate*/false, /*step*/1,
-                                             audioOn, /*dedupTail*/true);
+                        decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/ 1, trackCount,
+                                             /*decimate*/ false, /*step*/ 1, audioOn,
+                                             /*dedupTail*/ true);
                         av_packet_unref(pkt);
                     }
                 }
@@ -808,7 +845,7 @@ void PlaybackWorker::run() {
             continue;
         }
         if (nonEofErr) {
-            if (++readErrStreak > kMaxReadErrStreak) break;  // bounded: stop cleanly
+            if (++readErrStreak > kMaxReadErrStreak) break; // bounded: stop cleanly
             msleep(kReadErrSleepMs);
             continue;
         }
@@ -854,10 +891,13 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
                 //  - reverse (-1): deliver iff pts moved down (or after a reset).
                 const int64_t last = track->lastDeliveredPtsMs;
                 bool deliver;
-                if (last < 0)            deliver = true;          // post-reset
-                else if (dir >= 0)       deliver = (p > last);
-                else                     deliver = (p < last);
-                if (p == last) deliver = false;                  // already shown
+                if (last < 0)
+                    deliver = true; // post-reset
+                else if (dir >= 0)
+                    deliver = (p > last);
+                else
+                    deliver = (p < last);
+                if (p == last) deliver = false; // already shown
                 if (deliver) {
                     track->lastDeliveredPtsMs = p;
                     pending.append({track->provider, f});
@@ -889,8 +929,7 @@ QVideoFrame PlaybackWorker::convertToQVideoFrame(AVFrame* frame) {
 
     QVideoFrame qFrame(format);
     // On map failure, return invalid — never deliver an unmapped/blank frame.
-    if (!qFrame.map(QVideoFrame::WriteOnly))
-        return QVideoFrame();
+    if (!qFrame.map(QVideoFrame::WriteOnly)) return QVideoFrame();
 
     // Efficient copy of the YUV planes. Chroma planes are ceil(w/2) x ceil(h/2)
     // for YUV420P; copying the full ceil extent avoids an uninitialized fringe
@@ -901,7 +940,7 @@ QVideoFrame PlaybackWorker::convertToQVideoFrame(AVFrame* frame) {
         int srcStride = frame->linesize[i];
         int dstStride = qFrame.bytesPerLine(i);
         int height = (i == 0) ? frame->height : (frame->height + 1) / 2;
-        int width  = (i == 0) ? frame->width  : (frame->width + 1) / 2;
+        int width = (i == 0) ? frame->width : (frame->width + 1) / 2;
         int copyW = qMin(width, qMin(srcStride, dstStride));
         for (int y = 0; y < height; ++y) {
             memcpy(dst + y * dstStride, src + y * srcStride, copyW);

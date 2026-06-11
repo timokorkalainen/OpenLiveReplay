@@ -64,13 +64,15 @@ int main(int argc, char** argv) {
     QStringList viewNames;
     viewNames.reserve(vc);
     viewNames << QStringLiteral("TEST");
-    for (int v = 1; v < vc; ++v) viewNames << QString();
+    for (int v = 1; v < vc; ++v)
+        viewNames << QString();
 
     // viewSlotMap: view 0 -> source 0; views 1..vc-1 -> -1 (unmapped/blue).
     QList<int> viewSlotMap;
     viewSlotMap.reserve(vc);
     viewSlotMap << 0;
-    for (int v = 1; v < vc; ++v) viewSlotMap << -1;
+    for (int v = 1; v < vc; ++v)
+        viewSlotMap << -1;
 
     ReplayManager rm;
     rm.setSourceUrls({url});
