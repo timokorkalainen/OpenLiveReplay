@@ -718,6 +718,11 @@ void UIManager::setRecordHeight(int height) {
 
 void UIManager::setRecordFps(int fps) {
     if (fps <= 0) return;
+    // Changing fps mid-recording desyncs the workers (frozen at their
+    // construction-time fps) from the heartbeat: lowering freezes all output,
+    // raising corrupts the timeline. Refuse while recording; the QML SpinBox
+    // also disables, but guard the engine in case that's bypassed.
+    if (m_replayManager && m_replayManager->isRecording()) return;
     if (m_currentSettings.fps != fps) {
         m_currentSettings.fps = fps;
         m_replayManager->setFps(fps);

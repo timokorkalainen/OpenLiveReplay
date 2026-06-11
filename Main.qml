@@ -959,6 +959,7 @@ ApplicationWindow {
                         editable: true
                         inputMethodHints: Qt.ImhDigitsOnly
                         value: appWindow.uiManagerRef.recordFps
+                        enabled: !appWindow.uiManagerRef.isRecording
                         onValueModified: appWindow.uiManagerRef.recordFps = value
                     }
 
