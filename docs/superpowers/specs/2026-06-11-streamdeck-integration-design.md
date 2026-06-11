@@ -1,7 +1,7 @@
 # Stream Deck Integration Design
 
 **Date:** 2026-06-11
-**Status:** Approved design, pending implementation plan
+**Status:** Implemented (see docs/superpowers/plans/2026-06-11-streamdeck-integration.md); hardware verification pending
 **Target:** iPadOS builds of OpenLiveReplay
 
 ## Goal
