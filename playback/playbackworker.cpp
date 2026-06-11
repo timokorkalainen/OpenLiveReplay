@@ -310,7 +310,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                 }
 
                 QVideoFrame qFrame = convertToQVideoFrame(vf);
-                {
+                if (qFrame.isValid()) {
                     QMutexLocker bufferLocker(&m_bufferMutex);
                     if (!track->buffer.insert(framePtsMs, qFrame, cap, protectLo, protectHi))
                         m_counters.framesDropped++;
@@ -872,26 +872,42 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
 }
 
 QVideoFrame PlaybackWorker::convertToQVideoFrame(AVFrame* frame) {
-    // MPEG-2 All-Intra is typically YUV420P
+    // Our recordings are always MPEG-2 all-intra YUV420P. Reject anything else
+    // (a foreign MKV, 10-bit or 4:2:2 content) rather than copying it with the
+    // wrong plane geometry and rendering garbage. Returns an invalid frame the
+    // caller skips.
+    if (frame->format != AV_PIX_FMT_YUV420P || frame->width <= 0 || frame->height <= 0)
+        return QVideoFrame();
+
     QVideoFrameFormat format(QSize(frame->width, frame->height), QVideoFrameFormat::Format_YUV420P);
+    // Signal colorimetry explicitly instead of relying on Qt's "height > 576 =>
+    // BT.709 else BT.601" guess: HD is BT.709, SD BT.601; our MPEG-2 is limited
+    // range. Deterministic and at least as correct as the heuristic.
+    format.setColorSpace(frame->height > 576 ? QVideoFrameFormat::ColorSpace_BT709
+                                             : QVideoFrameFormat::ColorSpace_BT601);
+    format.setColorRange(QVideoFrameFormat::ColorRange_Video);
+
     QVideoFrame qFrame(format);
+    // On map failure, return invalid — never deliver an unmapped/blank frame.
+    if (!qFrame.map(QVideoFrame::WriteOnly))
+        return QVideoFrame();
 
-    if (qFrame.map(QVideoFrame::WriteOnly)) {
-        // Efficient copy of the YUV planes
-        for (int i = 0; i < 3; ++i) {
-            uint8_t* src = frame->data[i];
-            uint8_t* dst = qFrame.bits(i);
-            int srcStride = frame->linesize[i];
-            int dstStride = qFrame.bytesPerLine(i);
-            int height = (i == 0) ? frame->height : frame->height / 2;
-            int width = (i == 0) ? frame->width : frame->width / 2;
-
-            for (int y = 0; y < height; ++y) {
-                memcpy(dst + y * dstStride, src + y * srcStride, width);
-            }
+    // Efficient copy of the YUV planes. Chroma planes are ceil(w/2) x ceil(h/2)
+    // for YUV420P; copying the full ceil extent avoids an uninitialized fringe
+    // on the right/bottom edge for odd recording dimensions.
+    for (int i = 0; i < 3; ++i) {
+        uint8_t* src = frame->data[i];
+        uint8_t* dst = qFrame.bits(i);
+        int srcStride = frame->linesize[i];
+        int dstStride = qFrame.bytesPerLine(i);
+        int height = (i == 0) ? frame->height : (frame->height + 1) / 2;
+        int width  = (i == 0) ? frame->width  : (frame->width + 1) / 2;
+        int copyW = qMin(width, qMin(srcStride, dstStride));
+        for (int y = 0; y < height; ++y) {
+            memcpy(dst + y * dstStride, src + y * srcStride, copyW);
         }
-        qFrame.unmap();
     }
+    qFrame.unmap();
 
     // Qt's VideoSink will automatically handle the OpenGL texture upload
     // when this frame is delivered to the GPU-backed VideoOutput.
