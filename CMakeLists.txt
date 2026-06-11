@@ -103,6 +103,22 @@ target_link_libraries(OpenLiveReplayMidi PRIVATE
     rtmidi
 )
 
+# ==============================================================================
+# Stream Deck (Elgato) support — iPadOS only; stub elsewhere.
+# ==============================================================================
+if(IOS)
+    option(OLR_ENABLE_STREAMDECK "Enable Elgato Stream Deck support" ON)
+else()
+    set(OLR_ENABLE_STREAMDECK OFF)
+endif()
+
+target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager.h)
+if(OLR_ENABLE_STREAMDECK)
+    target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager.mm)
+else()
+    target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager_stub.cpp)
+endif()
+
 # 4. Handle Platform Specifics (FFmpeg)
 if(IOS)
     target_sources(OpenLiveReplay PRIVATE

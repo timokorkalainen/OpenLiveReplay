@@ -178,6 +178,58 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             if (idx >= 0) m_midiManager->openPort(idx);
         }
     });
+
+    // --- Stream Deck (mirrors the MIDI manager pattern; stub on non-iOS) ---
+    m_streamDeckManager = new StreamDeckManager(this);
+
+    connect(m_streamDeckManager, &StreamDeckManager::actionTriggered, this,
+            [this](int actionId, bool pressed) {
+        dispatchControlAction(actionId, !pressed);
+    });
+    connect(m_streamDeckManager, &StreamDeckManager::jogTriggered, this,
+            [this](int delta) {
+        jogStep(delta);
+    });
+    connect(m_streamDeckManager, &StreamDeckManager::scrubTriggered, this,
+            [this](double fraction) {
+        cancelFollowLive();
+        seekPlayback(qint64(fraction * double(recordedDurationMs())));
+    });
+
+    auto pushRecordingState = [this]() {
+        m_streamDeckManager->setRecording(isRecording(),
+                                          isRecording() ? recordedDurationMs() : 0);
+    };
+    auto pushTransportState = [this]() {
+        if (!m_transport) return;
+        m_streamDeckManager->setTransport(m_transport->isPlaying(),
+                                          m_transport->speed(),
+                                          m_followLive);
+    };
+    connect(this, &UIManager::recordingStatusChanged, this, pushRecordingState);
+    connect(this, &UIManager::recordedDurationMsChanged, this, pushRecordingState);
+    connect(m_transport, &PlaybackTransport::playingChanged, this, pushTransportState);
+    connect(m_transport, &PlaybackTransport::speedChanged, this, pushTransportState);
+    connect(this, &UIManager::followLiveChanged, this, pushTransportState);
+    connect(m_transport, &PlaybackTransport::posChanged, this, [this](int64_t pos) {
+        m_streamDeckManager->setPosition(pos, recordedDurationMs(), m_transport->fps());
+    });
+    // Snapshot push so a freshly connected deck lights up correctly even
+    // while playback is paused (no posChanged ticks).
+    connect(m_streamDeckManager, &StreamDeckManager::connectedChanged, this,
+            [this, pushRecordingState, pushTransportState]() {
+        if (!m_streamDeckManager->connected()) return;
+        pushRecordingState();
+        pushTransportState();
+        if (m_transport) {
+            m_streamDeckManager->setPosition(m_transport->currentPos(),
+                                             recordedDurationMs(),
+                                             m_transport->fps());
+        }
+    });
+
+    m_streamDeckManager->start();
+
     if (auto *app = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
         connect(app, &QGuiApplication::screenAdded, this, [this](QScreen*) {
             refreshScreens();
@@ -192,23 +244,26 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
 
 void UIManager::dispatchControlAction(int action, bool isRelease)
 {
+    // Case 8 (jog) intentionally absent: jog events carry a delta and go
+    // through jogStep(), not this press/release dispatch.
     switch (action) {
     case 0:
         if (!isRelease) playPause();
         break;
     case 1:
         if (isRelease) {
-            if (m_midiHoldAction == 1) {
+            if (m_holdAction == 1) {
                 if (m_transport) {
                     m_transport->setSpeed(1.0);
-                    m_transport->setPlaying(m_midiHoldWasPlaying);
+                    m_transport->setPlaying(m_holdWasPlaying);
                 }
-                m_midiHoldAction = -1;
+                m_holdAction = -1;
             }
         } else {
+            if (m_holdAction != -1) break;  // ignore overlapping hold from any device
             cancelFollowLive();
-            m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
-            m_midiHoldAction = 1;
+            m_holdWasPlaying = m_transport ? m_transport->isPlaying() : false;
+            m_holdAction = 1;
             if (m_transport) {
                 m_transport->setSpeed(-5.0);
                 m_transport->setPlaying(true);
@@ -217,17 +272,18 @@ void UIManager::dispatchControlAction(int action, bool isRelease)
         break;
     case 2:
         if (isRelease) {
-            if (m_midiHoldAction == 2) {
+            if (m_holdAction == 2) {
                 if (m_transport) {
                     m_transport->setSpeed(1.0);
-                    m_transport->setPlaying(m_midiHoldWasPlaying);
+                    m_transport->setPlaying(m_holdWasPlaying);
                 }
-                m_midiHoldAction = -1;
+                m_holdAction = -1;
             }
         } else {
+            if (m_holdAction != -1) break;  // ignore overlapping hold from any device
             cancelFollowLive();
-            m_midiHoldWasPlaying = m_transport ? m_transport->isPlaying() : false;
-            m_midiHoldAction = 2;
+            m_holdWasPlaying = m_transport ? m_transport->isPlaying() : false;
+            m_holdAction = 2;
             if (m_transport) {
                 m_transport->setSpeed(5.0);
                 m_transport->setPlaying(true);

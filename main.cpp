@@ -4,6 +4,7 @@
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
 #include "playback/frameprovider.h"
+#include "streamdeck/streamdeckmanager.h"
 
 #include <QString>
 using namespace Qt::StringLiterals;
@@ -24,6 +25,9 @@ int main(int argc, char *argv[])
 
     qmlRegisterType<FrameProvider>("Recorder.Types", 1, 0, "FrameProvider");
     qmlRegisterType<PlaybackTransport>("Recorder.Types", 1, 0, "PlaybackTransport");
+    qmlRegisterUncreatableType<StreamDeckManager>(
+        "Recorder.Types", 1, 0, "StreamDeckManager",
+        "Exposed via uiManager.streamDeck");
 
     QQmlApplicationEngine qmlEngine;
 

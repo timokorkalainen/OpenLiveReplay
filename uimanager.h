@@ -16,6 +16,7 @@
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
 #include "midi/midimanager.h"
+#include "streamdeck/streamdeckmanager.h"
 
 class QScreen;
 
@@ -47,6 +48,7 @@ class UIManager : public QObject {
     Q_PROPERTY(int midiBindingsVersion READ midiBindingsVersion NOTIFY midiBindingsChanged)
     Q_PROPERTY(int midiLastValuesVersion READ midiLastValuesVersion NOTIFY midiLastValuesChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
+    Q_PROPERTY(StreamDeckManager* streamDeck READ streamDeck CONSTANT)
     Q_PROPERTY(QVariantList screenOptions READ screenOptions NOTIFY screensChanged)
     Q_PROPERTY(bool screensReady READ screensReady NOTIFY screensChanged)
     Q_PROPERTY(int screenCount READ screenCount NOTIFY screensChanged)
@@ -83,6 +85,7 @@ public:
     int midiBindingsVersion() const;
     int midiLastValuesVersion() const;
     PlaybackTransport* transport() const { return m_transport; }
+    StreamDeckManager* streamDeck() const { return m_streamDeckManager; }
     QVariantList screenOptions() const;
     bool screensReady() const;
     int screenCount() const;
@@ -228,13 +231,14 @@ private:
     bool m_followLive = false;
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;
+    StreamDeckManager* m_streamDeckManager = nullptr;
     int m_midiLearnAction = -1;
     bool m_playbackSingleView = false;
     int m_playbackSelectedIndex = -1;
     int m_midiBindingsVersion = 0;
     int m_midiLastValuesVersion = 0;
-    bool m_midiHoldWasPlaying = false;
-    int m_midiHoldAction = -1;
+    bool m_holdWasPlaying = false;
+    int m_holdAction = -1;
     QElapsedTimer m_xTouchLastSend;
     QString m_xTouchLastText;
     int m_xTouchMinIntervalMs = 25;
