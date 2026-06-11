@@ -152,7 +152,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     if (paintBlue && m_latestFrame && m_latestFrame->data[0]) {
         memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
-        memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
+        memset(m_latestFrame->data[1], 240, m_latestFrame->linesize[1] * (m_latestFrame->height / 2)); // Cb: 240 = legal max chroma (255 is out-of-range)
         memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
     }
     if (pulled) {
