@@ -45,6 +45,11 @@ struct AudioDecoderTrack {
 class PlaybackWorker : public QThread {
     Q_OBJECT
 public:
+    struct PlaybackCounters {
+        int reposition = 0, reuseSeek = 0, reverseChunkSeek = 0,
+            eofTailSeek = 0, skipForward = 0, audioPushes = 0, framesDropped = 0;
+    };
+
     explicit PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport,
                             AudioPlayer *audioPlayer = nullptr, QObject *parent = nullptr);
     ~PlaybackWorker();
@@ -56,6 +61,8 @@ public:
     void setFrameBufferMax(int maxFrames);
     void setActiveAudioView(int viewIndex);
     void stop();
+
+    PlaybackCounters counters() const { return m_counters; }
 
 protected:
     void run() override;
@@ -87,6 +94,9 @@ private:
 
     QMutex m_mutex;
     QMutex m_bufferMutex;
+
+    PlaybackCounters m_counters;
+    void emitTelemetry(int64_t P, int64_t newest, double speed);
 };
 
 #endif // PLAYBACKWORKER_H

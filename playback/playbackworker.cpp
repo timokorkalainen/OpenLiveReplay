@@ -1,6 +1,7 @@
 #include "playback/playbackworker.h"
 #include <QDebug>
 #include <QMutexLocker>
+#include <cstdio>
 
 PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport,
                                AudioPlayer *audioPlayer, QObject *parent)
@@ -69,6 +70,14 @@ int PlaybackWorker::ffmpegInterruptCallback(void* opaque) {
 
 bool PlaybackWorker::shouldInterrupt() const {
     return !m_running || isInterruptionRequested();
+}
+
+void PlaybackWorker::emitTelemetry(int64_t P, int64_t newest, double speed) {
+    if (!qEnvironmentVariableIsSet("OLR_PB_TELEMETRY")) return;
+    fprintf(stderr, "SEC repos=%d reuse=%d revseek=%d eof=%d skip=%d apush=%d drop=%d P=%lld newest=%lld spd=%.2f\n",
+            m_counters.reposition, m_counters.reuseSeek, m_counters.reverseChunkSeek,
+            m_counters.eofTailSeek, m_counters.skipForward, m_counters.audioPushes,
+            m_counters.framesDropped, (long long)P, (long long)newest, speed);
 }
 
 void PlaybackWorker::run() {

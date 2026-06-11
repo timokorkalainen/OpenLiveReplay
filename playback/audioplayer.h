@@ -92,6 +92,9 @@ public:
     void setMuted(bool muted);
     bool isMuted() const;
 
+    /// Number of times clear() has been called (incremented under m_mutex).
+    int clearCount() const { return m_clearCount; }
+
 private:
     QAudioSink*      m_sink = nullptr;
     AudioRingBuffer* m_ringBuffer = nullptr;
@@ -108,6 +111,7 @@ private:
     static constexpr int kSinkBufferMs  = 60;    // device-side latency budget
     static constexpr int kRingCapMs     = 500;   // ring safety cap
     static constexpr int kJitterTolMs   = 30;    // PTS continuity tolerance
+    int m_clearCount = 0;
 };
 
 #endif // AUDIOPLAYER_H
