@@ -55,6 +55,7 @@ class UIManager : public QObject {
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
+    ~UIManager() override;
 
     // Getters for QML
     QStringList streamUrls() const;

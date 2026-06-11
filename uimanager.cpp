@@ -267,6 +267,30 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     refreshProviders();
 }
 
+UIManager::~UIManager() {
+    // On app quit, ~QObject deletes our child members in creation order:
+    // m_transport, m_audioPlayer, MidiManager, FrameProviders... with the
+    // PlaybackWorker destroyed LAST. Its decode thread holds RAW pointers to
+    // the transport / audio player / providers and keeps dereferencing them
+    // until its own dtor stops it — by which point those objects are already
+    // freed (use-after-free crash on quit-while-recording). Tear down in a
+    // safe order BEFORE the members destruct:
+    //   1. Stop + delete the worker (raw pointers into other members).
+    //   2. Flush the muxer by stopping any in-progress recording.
+    // PlaybackWorker::stop() is idempotent (sets m_running=false,
+    // requestInterruption, wait()), so calling it before delete is safe.
+    // Manually deleting the parented worker and nulling the pointer avoids a
+    // double-delete: QObject removes destroyed children from its child list.
+    if (m_playbackWorker) {
+        m_playbackWorker->stop();
+        delete m_playbackWorker;
+        m_playbackWorker = nullptr;
+    }
+    if (m_replayManager && m_replayManager->isRecording()) {
+        m_replayManager->stopRecording();
+    }
+}
+
 static int nextSourceIdSeed(const QList<SourceSettings> &sources) {
     int maxId = 0;
     for (const auto &source : sources) {
