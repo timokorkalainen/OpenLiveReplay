@@ -1,5 +1,7 @@
+import Combine
 import Foundation
 import StreamDeckKit
+import StreamDeckSimulator
 import UIKit
 
 /// Objective-C facade consumed by the Qt app (streamdeck/streamdeckmanager.mm).
@@ -26,8 +28,83 @@ public final class OLRStreamDeckBridge: NSObject {
 
     let state = DeckState()
 
+    private var started = false
+    private var cancellables = Set<AnyCancellable>()
+
     private override init() {
         super.init()
+    }
+
+    // MARK: Lifecycle.
+
+    /// Call once at app startup. Devices plugged in at any time afterwards
+    /// (including after backgrounding — the SDK re-fires the handler on
+    /// foreground) get the layout attached automatically.
+    @objc public func start() {
+        guard !started else { return }
+        started = true
+
+        StreamDeckSession.setUp(newDeviceHandler: { [weak self] device in
+            self?.attach(device)
+        })
+
+        StreamDeckSession.instance.$devices
+            .receive(on: RunLoop.main)
+            .sink { [weak self] devices in
+                if devices.isEmpty {
+                    self?.onDeviceDisconnected?()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func attach(_ device: StreamDeck) {
+        let model = deckModelIdentifier(for: device)
+        if state.keyMappings[model] == nil {
+            state.setKeyMapping(
+                DeckAction.defaultMapping(
+                    modelIdentifier: model,
+                    keyCount: device.capabilities.keyCount),
+                forModel: model)
+        }
+        device.render(ReplayDeckLayout(state: state))
+        onDeviceConnected?(
+            device.info.productName,
+            model,
+            device.capabilities.keyCount,
+            device.capabilities.dialCount)
+    }
+
+    // MARK: State pushed from the Qt side (forwards into DeckState, which
+    // no-ops unchanged values so only changed keys re-render).
+
+    /// Override a model's key mapping (future user remapping; unused by the
+    /// default flow, which computes mappings in attach()).
+    @objc public func setKeyMapping(_ mapping: [Int], forModel model: String) {
+        state.setKeyMapping(mapping, forModel: model)
+    }
+
+    @objc public func setRecording(_ recording: Bool, elapsedText: String) {
+        state.setRecording(recording, elapsedText: elapsedText)
+    }
+
+    @objc public func setTransport(playing: Bool, speedText: String, followLive: Bool) {
+        state.setTransport(playing: playing, speedText: speedText, followLive: followLive)
+    }
+
+    @objc public func setPosition(timecodeText: String, positionFraction: Double) {
+        state.setPosition(timecodeText: timecodeText, positionFraction: positionFraction)
+    }
+
+    // MARK: Development tooling. The simulator is a dev tool per Elgato's
+    // docs; the Qt side only exposes its UI entry point in debug builds.
+
+    @objc public func showSimulator() {
+        StreamDeckSimulator.show(defaultStreamDeck: .plus)
+    }
+
+    @objc public func closeSimulator() {
+        StreamDeckSimulator.close()
     }
 
     /// True when the Elgato Stream Deck Connect app (which hosts the device
