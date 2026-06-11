@@ -26,6 +26,10 @@
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
+    <key>LSApplicationQueriesSchemes</key>
+    <array>
+        <string>elgato-device-driver</string>
+    </array>
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationLandscapeLeft</string>

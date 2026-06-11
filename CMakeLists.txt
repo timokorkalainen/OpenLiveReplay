@@ -258,6 +258,44 @@ fi
         COMMENT "[rtmidi] Renaming librtmidi.7.0.0.dylib -> librtmidi.7.dylib in Frameworks"
     )
 
+    # ==============================================================================
+    # STREAM DECK BRIDGE (Swift framework, see ios/streamdeck-bridge)
+    # ==============================================================================
+    if(OLR_ENABLE_STREAMDECK)
+        set(STREAMDECK_SCRIPT "${CMAKE_SOURCE_DIR}/build-scripts/build_streamdeck_bridge.sh")
+        set(STREAMDECK_XCF "${CMAKE_SOURCE_DIR}/ios_build/xcframeworks/StreamDeckBridge.xcframework")
+        set(STREAMDECK_FRAMEWORK "${STREAMDECK_XCF}/ios-arm64/StreamDeckBridge.framework")
+
+        add_custom_command(
+            OUTPUT "${STREAMDECK_XCF}"
+            COMMAND chmod +x ${STREAMDECK_SCRIPT}
+            COMMAND ${STREAMDECK_SCRIPT}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            COMMENT "[StreamDeckBridge] Building Swift bridge xcframework (requires xcodegen)..."
+            VERBATIM
+        )
+        add_custom_target(BuildStreamDeckBridge DEPENDS "${STREAMDECK_XCF}")
+        add_dependencies(OpenLiveReplay BuildStreamDeckBridge)
+
+        # The .mm uses ObjC blocks capturing C++ objects — compile with ARC.
+        set_source_files_properties(streamdeck/streamdeckmanager.mm PROPERTIES
+            COMPILE_OPTIONS "-fobjc-arc;-F${STREAMDECK_XCF}/ios-arm64"
+        )
+        target_link_libraries(OpenLiveReplay PRIVATE
+            "-F${STREAMDECK_XCF}/ios-arm64"
+            "-framework StreamDeckBridge"
+        )
+        set_property(TARGET OpenLiveReplay APPEND_STRING PROPERTY
+            XCODE_EMBED_FRAMEWORKS ";${STREAMDECK_FRAMEWORK}")
+
+        # Required for talking to the Stream Deck driver. The app's signing
+        # identity must have the "Communicates with Drivers" capability
+        # (automatic signing adds it for Xcode-managed profiles).
+        set_target_properties(OpenLiveReplay PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${CMAKE_SOURCE_DIR}/ios/OpenLiveReplay.entitlements"
+        )
+    endif()
+
 elseif(APPLE) # macOS Desktop
     target_include_directories(OpenLiveReplay PRIVATE /opt/homebrew/include)
     target_link_directories(OpenLiveReplay PRIVATE /opt/homebrew/lib)
