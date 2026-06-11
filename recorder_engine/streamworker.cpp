@@ -56,8 +56,7 @@ void StreamWorker::run() {
     m_captureRunning = false;
     // The capture thread is started and joined on this (the worker) thread
     // only, so there is no cross-thread race on m_captureThread itself.
-    if (m_captureThread.joinable())
-        m_captureThread.join();
+    if (m_captureThread.joinable()) m_captureThread.join();
 
     // Cleanup when exec() returns (on stop)
     avcodec_free_context(&m_persistentEncCtx);
@@ -107,9 +106,7 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     if (!m_captureThread.joinable()) {
         m_restartCapture = 0;
         m_captureRunning = true;
-        m_captureThread = std::thread([this]() {
-            this->captureLoop();
-        });
+        m_captureThread = std::thread([this]() { this->captureLoop(); });
     }
 
     processEncoderTick(m_persistentEncCtx, streamTimeMs);
@@ -152,7 +149,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     if (paintBlue && m_latestFrame && m_latestFrame->data[0]) {
         memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
-        memset(m_latestFrame->data[1], 240, m_latestFrame->linesize[1] * (m_latestFrame->height / 2)); // Cb: 240 = legal max chroma (255 is out-of-range)
+        memset(m_latestFrame->data[1], 240,
+               m_latestFrame->linesize[1] *
+                   (m_latestFrame->height / 2)); // Cb: 240 = legal max chroma (255 is out-of-range)
         memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
     }
     if (pulled) {
@@ -298,10 +297,8 @@ void StreamWorker::captureLoop() {
             AVChannelLayout outLayout;
             av_channel_layout_default(&outLayout, 2);
 
-            int ret = swr_alloc_set_opts2(&swrCtx,
-                &outLayout, AV_SAMPLE_FMT_S16, 48000,
-                inLayout, inFmt, inRate,
-                0, nullptr);
+            int ret = swr_alloc_set_opts2(&swrCtx, &outLayout, AV_SAMPLE_FMT_S16, 48000, inLayout,
+                                          inFmt, inRate, 0, nullptr);
             av_channel_layout_uninit(&outLayout);
             if (ret < 0 || swr_init(swrCtx) < 0) {
                 if (swrCtx) swr_free(&swrCtx);
@@ -400,14 +397,13 @@ void StreamWorker::captureLoop() {
                     // video-only discontinuity here never corrupts audio.
                     bool needAnchor = (firstPacketDts == AV_NOPTS_VALUE);
                     if (!needAnchor && prevPktDts != AV_NOPTS_VALUE) {
-                        const int64_t deltaMs = av_rescale_q(pktDts - prevPktDts,
-                                                             videoTb, {1, 1000});
+                        const int64_t deltaMs =
+                            av_rescale_q(pktDts - prevPktDts, videoTb, {1, 1000});
                         constexpr int64_t kForwardJumpMs = 3000;
                         constexpr int64_t kBackwardTolMs = -200;
                         if (deltaMs > kForwardJumpMs || deltaMs < kBackwardTolMs) {
-                            qDebug() << "Source" << m_sourceIndex
-                                     << "DTS discontinuity (" << deltaMs
-                                     << "ms jump). Re-anchoring.";
+                            qDebug() << "Source" << m_sourceIndex << "DTS discontinuity ("
+                                     << deltaMs << "ms jump). Re-anchoring.";
                             needAnchor = true;
                         }
                     }
@@ -486,9 +482,8 @@ void StreamWorker::captureLoop() {
                             // fine for that); only this per-frame STAMP changes.
                             int64_t frameTs = rawFrame->best_effort_timestamp;
                             if (frameTs == AV_NOPTS_VALUE) frameTs = pktDts;
-                            int64_t relativeMs = av_rescale_q(frameTs - firstPacketDts,
-                                                              videoTb,
-                                                              {1, 1000});
+                            int64_t relativeMs =
+                                av_rescale_q(frameTs - firstPacketDts, videoTb, {1, 1000});
 
                             // 3. Map it to the Global Timeline
                             // If a burst of 10 frames arrives, relativeMs increases by 33ms each,
@@ -546,8 +541,7 @@ void StreamWorker::captureLoop() {
                                 av_frame_unref(audioFrame);
                                 continue;
                             }
-                            const AVRational audioTb =
-                                inCtx->streams[audioStreamIdx]->time_base;
+                            const AVRational audioTb = inCtx->streams[audioStreamIdx]->time_base;
 
                             // Bug 1: (re)build the resampler BEFORE we use it,
                             // and make the retry reachable when swrCtx is null.
@@ -564,14 +558,16 @@ void StreamWorker::captureLoop() {
                             // plane (segfault) and a rate change resamples at
                             // the wrong ratio (wrong pitch).
                             const int inRate = audioFrame->sample_rate > 0
-                                ? audioFrame->sample_rate : audioDecCtx->sample_rate;
-                            const AVSampleFormat inFmt = (AVSampleFormat)audioFrame->format;
-                            if (!swrCtx || inRate != swrInRate || inFmt != swrInFmt
-                                || av_channel_layout_compare(&audioFrame->ch_layout,
-                                                             &swrInLayout) != 0) {
+                                                   ? audioFrame->sample_rate
+                                                   : audioDecCtx->sample_rate;
+                            const AVSampleFormat inFmt = (AVSampleFormat) audioFrame->format;
+                            if (!swrCtx || inRate != swrInRate || inFmt != swrInFmt ||
+                                av_channel_layout_compare(&audioFrame->ch_layout, &swrInLayout) !=
+                                    0) {
                                 if (swrCtx)
-                                    qDebug() << "Source" << m_sourceIndex
-                                             << "Audio format change mid-stream; rebuilding resampler";
+                                    qDebug()
+                                        << "Source" << m_sourceIndex
+                                        << "Audio format change mid-stream; rebuilding resampler";
                                 configureSwr(inRate, inFmt, &audioFrame->ch_layout);
                             }
                             // Bug 1: if the resampler is STILL null after the
@@ -602,19 +598,16 @@ void StreamWorker::captureLoop() {
                             // packet moment as the video anchor, so end
                             // alignment is identical to before.
                             const int64_t nowMs = m_sharedClock->elapsedMs();
-                            bool needAudioAnchor =
-                                (firstAudioDts == AV_NOPTS_VALUE);
-                            if (!needAudioAnchor
-                                && prevAudioDts != AV_NOPTS_VALUE) {
-                                const int64_t aDeltaMs = av_rescale_q(
-                                    audioTs - prevAudioDts, audioTb, {1, 1000});
+                            bool needAudioAnchor = (firstAudioDts == AV_NOPTS_VALUE);
+                            if (!needAudioAnchor && prevAudioDts != AV_NOPTS_VALUE) {
+                                const int64_t aDeltaMs =
+                                    av_rescale_q(audioTs - prevAudioDts, audioTb, {1, 1000});
                                 constexpr int64_t kForwardJumpMs = 3000;
                                 constexpr int64_t kBackwardTolMs = -200;
-                                if (aDeltaMs > kForwardJumpMs
-                                    || aDeltaMs < kBackwardTolMs) {
-                                    qDebug() << "Source" << m_sourceIndex
-                                             << "Audio DTS discontinuity ("
-                                             << aDeltaMs << "ms jump). Re-anchoring.";
+                                if (aDeltaMs > kForwardJumpMs || aDeltaMs < kBackwardTolMs) {
+                                    qDebug()
+                                        << "Source" << m_sourceIndex << "Audio DTS discontinuity ("
+                                        << aDeltaMs << "ms jump). Re-anchoring.";
                                     needAudioAnchor = true;
                                 }
                             }
@@ -624,9 +617,9 @@ void StreamWorker::captureLoop() {
                             }
                             prevAudioDts = audioTs;
 
-                            int64_t recPtsMs = audioAnchorStreamTimeMs
-                                + av_rescale_q(audioTs - firstAudioDts,
-                                               audioTb, {1, 1000});
+                            int64_t recPtsMs =
+                                audioAnchorStreamTimeMs +
+                                av_rescale_q(audioTs - firstAudioDts, audioTb, {1, 1000});
 
                             // Forward-sanity guard: if a missed jump still maps
                             // this sample absurdly far ahead of the recording
@@ -634,10 +627,8 @@ void StreamWorker::captureLoop() {
                             // audio here rather than enqueuing a far-future
                             // sample (which would stall the FIFO write cursor).
                             if (recPtsMs > nowMs + 10000) {
-                                qDebug() << "Source" << m_sourceIndex
-                                         << "Audio sample" << recPtsMs
-                                         << "ms far ahead of clock" << nowMs
-                                         << "ms. Re-anchoring.";
+                                qDebug() << "Source" << m_sourceIndex << "Audio sample" << recPtsMs
+                                         << "ms far ahead of clock" << nowMs << "ms. Re-anchoring.";
                                 firstAudioDts = audioTs;
                                 audioAnchorStreamTimeMs = nowMs;
                                 prevAudioDts = audioTs;
@@ -646,9 +637,9 @@ void StreamWorker::captureLoop() {
                             if (recPtsMs < 0) { av_frame_unref(audioFrame); continue; }
 
                             // Resample to 48 kHz stereo S16
-                            int outSamples = av_rescale_rnd(
-                                swr_get_delay(swrCtx, inRate) + audioFrame->nb_samples,
-                                48000, inRate, AV_ROUND_UP);
+                            int outSamples = av_rescale_rnd(swr_get_delay(swrCtx, inRate) +
+                                                                audioFrame->nb_samples,
+                                                            48000, inRate, AV_ROUND_UP);
                             int outBufSize = av_samples_get_buffer_size(
                                 nullptr, 2, outSamples, AV_SAMPLE_FMT_S16, 0);
                             uint8_t* outBuffer = (uint8_t*)av_malloc(outBufSize);
@@ -783,8 +774,8 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
     // into find_stream_info, so a separate per-stream options array is not
     // needed (verified: the e2e H.264+AAC MPEG-TS streams still detect).
     av_dict_set(&opts, "fflags", "nobuffer", 0);
-    av_dict_set(&opts, "probesize", "500000", 0);        // ~0.5 MB
-    av_dict_set(&opts, "analyzeduration", "500000", 0);  // ~0.5 s (microseconds)
+    av_dict_set(&opts, "probesize", "500000", 0);       // ~0.5 MB
+    av_dict_set(&opts, "analyzeduration", "500000", 0); // ~0.5 s (microseconds)
 
     if (scheme == "srt") {
         av_dict_set(&opts, "connect_timeout", "5000000", 0); // 5 second connect timeout
@@ -893,7 +884,12 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     // {fps,1}, so the file carries contradictory rates and ES-rate-trusting
     // tools mis-time the video.  Warn so the operator can pick a standard rate.
     switch (m_targetFps) {
-    case 24: case 25: case 30: case 50: case 60: break;  // exactly representable
+    case 24:
+    case 25:
+    case 30:
+    case 50:
+    case 60:
+        break; // exactly representable
     default:
         qWarning() << "Source" << m_sourceIndex << "fps" << m_targetFps
                    << "is not an exact MPEG-2 rate; the elementary stream will"
