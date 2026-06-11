@@ -52,6 +52,7 @@ target_link_libraries(olr_test_engine
 # --- Playback sources (need Qt Multimedia for QVideoFrame; ffmpeg for the worker) ---
 qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/trackbuffer.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/audioframequeue.cpp"
 )
 target_include_directories(olr_test_playback PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(olr_test_playback
