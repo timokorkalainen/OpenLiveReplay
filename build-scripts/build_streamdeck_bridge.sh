@@ -37,21 +37,44 @@ xcodebuild archive \
     -scheme StreamDeckBridge \
     -destination "generic/platform=iOS" \
     -archivePath "$ARCHIVE_PATH" \
+    -derivedDataPath "$ROOT_DIR/ios_build/streamdeck-bridge/DerivedData" \
     SKIP_INSTALL=NO \
-    CODE_SIGNING_ALLOWED=NO \
-    BUILD_LIBRARY_FOR_DISTRIBUTION=YES \
-    OTHER_SWIFT_FLAGS="-no-verify-emitted-module-interface"
+    CODE_SIGNING_ALLOWED=NO
+
+# StreamDeckSimulator (statically linked into the framework) loads its assets
+# via SPM's Bundle.module, which probes the enclosing framework root at runtime.
+# The bundle is built during archive but not folded into the framework, so copy
+# it in manually — otherwise showSimulator() crashes with a Bundle.module fatal.
+echo "[StreamDeckBridge] Embedding StreamDeckSimulator resource bundle..."
+FRAMEWORK_IN_ARCHIVE="$ARCHIVE_PATH/Products/Library/Frameworks/StreamDeckBridge.framework"
+SIM_BUNDLE="$(find "$ROOT_DIR/ios_build/streamdeck-bridge/DerivedData" -type d -name "StreamDeckKit_StreamDeckSimulator.bundle" -path "*iphoneos*" | head -1)"
+if [ -z "$SIM_BUNDLE" ]; then
+    echo "Error: StreamDeckKit_StreamDeckSimulator.bundle not found in DerivedData." >&2
+    echo "       StreamDeckSimulator.show() would crash via Bundle.module at runtime." >&2
+    exit 1
+fi
+cp -R "$SIM_BUNDLE" "$FRAMEWORK_IN_ARCHIVE/"
 
 echo "[StreamDeckBridge] Creating xcframework..."
 mkdir -p "$OUT_DIR"
 rm -rf "$OUT_DIR/StreamDeckBridge.xcframework"
+# Consumed via the generated ObjC header only, so module stability (library
+# evolution / swiftinterface) is unnecessary; -allow-internal-distribution
+# skips the swiftinterface requirement.
 xcodebuild -create-xcframework \
     -framework "$ARCHIVE_PATH/Products/Library/Frameworks/StreamDeckBridge.framework" \
+    -allow-internal-distribution \
     -output "$OUT_DIR/StreamDeckBridge.xcframework"
 
 HEADER="$OUT_DIR/StreamDeckBridge.xcframework/ios-arm64/StreamDeckBridge.framework/Headers/StreamDeckBridge-Swift.h"
 if [ ! -f "$HEADER" ]; then
     echo "Error: generated Objective-C header missing at $HEADER" >&2
+    exit 1
+fi
+
+SIM_BUNDLE_OUT="$OUT_DIR/StreamDeckBridge.xcframework/ios-arm64/StreamDeckBridge.framework/StreamDeckKit_StreamDeckSimulator.bundle"
+if [ ! -d "$SIM_BUNDLE_OUT" ]; then
+    echo "Error: simulator resource bundle missing at $SIM_BUNDLE_OUT" >&2
     exit 1
 fi
 
