@@ -1,6 +1,8 @@
 #ifndef MUXER_H
 #define MUXER_H
 
+#include <QHash>
+#include <QElapsedTimer>
 #include <QMutex>
 #include <QString>
 
@@ -32,8 +34,11 @@ public:
     QString getVideoPath(QString fileName);
 private:
     AVFormatContext* m_outCtx = nullptr;
-    // Track the last timestamp for each stream to ensure they always increase
-    QMap<int, int64_t>* m_lastDts;
+    // Last DTS per stream (monotonicity enforcement); guarded by m_mutex
+    QHash<int, int64_t> m_lastDts;
+    // Throttles avio_flush: flushing per packet hammers the disk for no
+    // benefit beyond chase-play visibility (~100 ms is plenty)
+    QElapsedTimer m_lastFlush;
     QMutex m_mutex;
     bool m_initialized = false;
     int m_audioTrackOffset = 0;     // Index of first audio track

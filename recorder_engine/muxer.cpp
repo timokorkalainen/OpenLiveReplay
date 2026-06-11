@@ -112,7 +112,8 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     }
     avio_flush(m_outCtx->pb); // Forces the EBML header to be visible to the reader
 
-    m_lastDts = new QMap<int, int64_t>();
+    m_lastDts.clear();
+    m_lastFlush.start();
 
     m_initialized = true;
     return true;
@@ -127,11 +128,12 @@ void Muxer::writePacket(AVPacket* pkt) {
     // track that had blue-frame DTS ahead of the source encoder's counter,
     // every packet was silently lost.  Bumping preserves the data.
     int idx = pkt->stream_index;
-    if (m_lastDts->contains(idx) && pkt->dts <= (*m_lastDts)[idx]) {
-        pkt->dts = (*m_lastDts)[idx] + 1;
+    auto it = m_lastDts.constFind(idx);
+    if (it != m_lastDts.constEnd() && pkt->dts <= it.value()) {
+        pkt->dts = it.value() + 1;
         if (pkt->pts < pkt->dts) pkt->pts = pkt->dts;
     }
-    (*m_lastDts)[idx] = pkt->dts;
+    m_lastDts[idx] = pkt->dts;
 
     // Use av_write_frame (non-interleaved) so that each stream writes
     // independently. av_interleaved_write_frame buffers packets across
@@ -149,7 +151,12 @@ void Muxer::writePacket(AVPacket* pkt) {
         qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
     }
 
-    avio_flush(m_outCtx->pb);
+    // Flush at most every ~100 ms: keeps the chase-play reader within a
+    // cluster of the live edge without a disk flush per packet.
+    if (!m_lastFlush.isValid() || m_lastFlush.elapsed() >= 100) {
+        avio_flush(m_outCtx->pb);
+        m_lastFlush.restart();
+    }
 }
 
 void Muxer::writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData) {
@@ -198,10 +205,7 @@ void Muxer::close() {
         avformat_free_context(m_outCtx);
         m_initialized = false;
         m_outCtx = nullptr;
-    }
-    if (m_lastDts) {
-        delete m_lastDts;
-        m_lastDts = nullptr;
+        m_lastDts.clear();
     }
 }
 
