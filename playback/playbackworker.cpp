@@ -72,9 +72,6 @@ bool PlaybackWorker::shouldInterrupt() const {
 }
 
 void PlaybackWorker::run() {
-    msleep(500);
-    m_transport->seek(0);
-
     qDebug() << "Opening file: "<<m_currentFilePath;
 
     if (m_currentFilePath.isEmpty()) return;
@@ -272,11 +269,19 @@ void PlaybackWorker::run() {
 
             // Burst-decode to pre-fill the buffer so backward stepping works immediately after seek
             {
-                int burstCount = 0;
                 int packetCount = 0;
                 const int bufMax = m_frameBufferMax;
-                const int packetMax = bufMax * 4; // Safety limit for non-video packets
-                while (m_running && burstCount < bufMax && packetCount < packetMax) {
+                const int trackCount = qMax(1, int(m_decoderBank.size()));
+                // Budget per track: a global frame count gave each track
+                // only bufMax/N frames of back-step room with N tracks.
+                const int packetMax = bufMax * 4 * trackCount;
+                QHash<DecoderTrack*, int> burstDecoded;
+                auto allTracksFull = [&]() {
+                    for (auto* t : m_decoderBank)
+                        if (burstDecoded.value(t, 0) < bufMax) return false;
+                    return true;
+                };
+                while (m_running && !allTracksFull() && packetCount < packetMax) {
                     // Abort burst if a new seek was requested
                     {
                         QMutexLocker locker(&m_mutex);
@@ -311,7 +316,7 @@ void PlaybackWorker::run() {
                                             track->buffer.remove(0, track->buffer.size() - m_frameBufferMax);
                                         }
                                     }
-                                    burstCount++;
+                                    burstDecoded[track]++;
                                 }
                             }
                             break;

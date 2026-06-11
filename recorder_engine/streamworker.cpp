@@ -47,6 +47,7 @@ void StreamWorker::run() {
 
     // Cleanup when exec() returns (on stop)
     avcodec_free_context(&m_persistentEncCtx);
+    av_frame_free(&m_latestFrame);
 
     while(!m_frameQueue.isEmpty()){
         auto qf = m_frameQueue.dequeue();
