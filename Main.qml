@@ -706,7 +706,11 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     from: 0
                     to: Math.max(0, appWindow.uiManagerRef.recordedDurationMs - appWindow.uiManagerRef.liveBufferMs)
-                    value: appWindow.uiManagerRef.scrubPosition
+                    // While the user is dragging, hold the handle at their drag
+                    // position; otherwise follow the playhead. Without the
+                    // pressed guard, scrubPositionChanged (~30/s while
+                    // recording) yanks the handle back mid-drag.
+                    value: scrubBar.pressed ? scrubBar.value : appWindow.uiManagerRef.scrubPosition
 
                     onMoved: {
                         appWindow.uiManagerRef.seekPlayback(value)

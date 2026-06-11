@@ -204,6 +204,14 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
 
             m_transport->step(deltaSign);
 
+            // Clamp forward jog to the live edge (never backward).
+            if (deltaSign > 0) {
+                const int64_t liveEdge = recordedDurationMs();
+                if (m_transport->currentPos() > liveEdge) {
+                    m_transport->seek(liveEdge);
+                }
+            }
+
             if (m_playbackWorker) {
                 int64_t targetMs = m_transport->currentPos();
                 m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
@@ -859,6 +867,14 @@ void UIManager::stepFrame() {
     m_transport->step(1);
     m_transport->setPlaying(false);
     cancelFollowLive();
+
+    // Clamp the upper bound to the live edge: the transport only clamps >= 0,
+    // so stepping forward past the last recorded frame would walk the hidden
+    // position arbitrarily far ahead (controls look dead, audio goes silent).
+    const int64_t liveEdge = recordedDurationMs();
+    if (m_transport->currentPos() > liveEdge) {
+        m_transport->seek(liveEdge);
+    }
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
