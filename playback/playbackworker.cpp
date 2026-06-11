@@ -34,8 +34,14 @@ void PlaybackWorker::openFile(const QString &filePath) {
 }
 
 void PlaybackWorker::seekTo(int64_t timestampMs) {
+    const int64_t clamped = qMax<int64_t>(0, timestampMs);
     QMutexLocker locker(&m_mutex);
-    m_seekTargetMs = qMax<int64_t>(0, timestampMs);
+    // Record travel direction from the current playhead (spec §4/§5/§6.7):
+    // drives reverse reposition anchoring, the backward-scrub audio re-prime,
+    // and paused dedup direction. m_transport->currentPos() locks the
+    // transport's own (independent) mutex, so there is no lock-order concern.
+    m_lastMoveDir = (clamped >= m_transport->currentPos()) ? 1 : -1;
+    m_seekTargetMs = clamped;
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
@@ -829,34 +835,6 @@ void PlaybackWorker::run() {
     av_frame_free(&audioFrame);
     clearDecoders();
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
-}
-
-bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
-    struct PendingDeliver {
-        FrameProvider* provider = nullptr;
-        QVideoFrame frame;
-    };
-
-    QVector<PendingDeliver> pending;
-    {
-        QMutexLocker bufferLocker(&m_bufferMutex);
-        for (auto* track : m_decoderBank) {
-            if (!track || !track->provider) continue;
-            QVideoFrame f;
-            int64_t p;
-            if (track->buffer.frameAt(targetMs, f, p)) {
-                track->lastDeliveredPtsMs = p;
-                pending.append({track->provider, f});
-            }
-        }
-    }
-
-    if (pending.isEmpty()) return false;
-
-    for (const auto &item : pending) {
-        if (item.provider) item.provider->deliverFrame(item.frame);
-    }
-    return true;
 }
 
 void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {

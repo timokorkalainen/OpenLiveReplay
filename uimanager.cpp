@@ -206,7 +206,6 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
 
             if (m_playbackWorker) {
                 int64_t targetMs = m_transport->currentPos();
-                m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
                 m_playbackWorker->seekTo(targetMs);
             }
             break;
@@ -700,9 +699,6 @@ void UIManager::setRecordFps(int fps) {
         if (m_transport) {
             m_transport->setFps(fps);
         }
-        if (m_playbackWorker) {
-            m_playbackWorker->setFrameBufferMax(fps);
-        }
         emit recordFpsChanged();
     }
 }
@@ -828,7 +824,6 @@ void UIManager::stepFrame() {
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
         m_playbackWorker->seekTo(targetMs);
     }
 }
@@ -841,7 +836,6 @@ void UIManager::stepFrameBack() {
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
         m_playbackWorker->seekTo(targetMs);
     }
 }
@@ -909,7 +903,6 @@ void UIManager::startRecording() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
-    m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
 
     // 2. Point it to the file being recorded
     //QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
@@ -932,7 +925,6 @@ void UIManager::restartPlaybackWorker() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
-    m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
     m_transport->seek(0);
@@ -959,6 +951,9 @@ void UIManager::seekPlayback(int64_t ms) {
         // Manual seek disables live-follow; user can re-enable via "Live"
         m_followLive = false;
     }
+    // Route the scrub through the scheduler so it classifies the seek
+    // (reuse fast-path vs. full reposition) instead of showing a stale frame.
+    if (m_playbackWorker) m_playbackWorker->seekTo(ms);
     if (m_audioPlayer) m_audioPlayer->clear();
 }
 
@@ -1322,6 +1317,9 @@ void UIManager::scrubToLive() {
     const int64_t liveEdge = recordedDurationMs();
     const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
     m_transport->seek(target);
+    // Route the jump-to-live-edge through the scheduler too, or the worker
+    // sees a position discontinuity with no seek and tail-holds a stale frame.
+    if (m_playbackWorker) m_playbackWorker->seekTo(target);
 }
 
 static QString sanitizeFileToken(const QString& input) {
@@ -1492,6 +1490,9 @@ void UIManager::onRecorderPulse(int64_t frameIndex, int64_t elapsedMs) {
         const int64_t current = m_transport->currentPos();
         if (qAbs(current - target) > 50) {
             m_transport->seek(target);
+            // Classify the yank via the scheduler: small in-window corrections
+            // hit the 0-seek reuse path; only a real jump repositions.
+            if (m_playbackWorker) m_playbackWorker->seekTo(target);
         }
     }
 }

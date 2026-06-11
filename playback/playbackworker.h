@@ -55,13 +55,9 @@ public:
 
     void openFile(const QString &filePath);
     void seekTo(int64_t timestampMs);
-    bool deliverBufferedFrameAtOrBefore(int64_t targetMs);
     // Direction-aware delivery (spec §5): forward delivers iff pts moved up,
     // reverse iff pts moved down (dir = +1 / -1).
     void deliverDueFrames(int64_t P, int dir);
-    // No-op shim: window sizing now derives from fps() (spec §7). Task 6
-    // removes the three uimanager call sites and this method together.
-    void setFrameBufferMax(int) {}
     void setActiveAudioView(int viewIndex);
     void stop();
 
