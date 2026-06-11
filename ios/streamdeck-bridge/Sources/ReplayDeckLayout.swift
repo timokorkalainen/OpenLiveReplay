@@ -107,11 +107,22 @@ struct ReplayKeyView: View {
     }
 
     var body: some View {
-        keyBody
-            .onReceive(state.objectWillChange.receive(on: RunLoop.main)) { _ in
-                let new = KeyContent(state: state, keyIndex: keyIndex, model: model)
-                if new != content { content = new }
-            }
+        // Single StreamDeckKeyView wrapper for ALL content: its body is the
+        // SDK's only source of per-key dirty marking, so every content
+        // change — including display keys and unmapped keys — must flow
+        // through it to reach the USB bus.
+        StreamDeckKeyView { pressed in
+            guard let action = content.action,
+                  action != .timecodeDisplay, action != .speedDisplay else { return }
+            isPressed = pressed
+            OLRStreamDeckBridge.shared.emitAction(action.rawValue, pressed: pressed)
+        } content: {
+            keyBody
+        }
+        .onReceive(state.objectWillChange.receive(on: RunLoop.main)) { _ in
+            let new = KeyContent(state: state, keyIndex: keyIndex, model: model)
+            if new != content { content = new }
+        }
     }
 
     @ViewBuilder
@@ -123,7 +134,7 @@ struct ReplayKeyView: View {
             case .speedDisplay:
                 DisplayKey(title: "SPEED", value: content.title)
             default:
-                actionKey(for: action)
+                actionKeyContent(for: action)
             }
         } else {
             Color.black
@@ -134,25 +145,20 @@ struct ReplayKeyView: View {
         content.action == .record ? .red : .green
     }
 
-    private func actionKey(for action: DeckAction) -> some View {
-        StreamDeckKeyView { pressed in
-            isPressed = pressed
-            OLRStreamDeckBridge.shared.emitAction(action.rawValue, pressed: pressed)
-        } content: {
-            VStack(spacing: 2) {
-                if let symbolName = content.symbolName {
-                    Image(systemName: symbolName)
-                        .font(.system(size: 22, weight: .bold))
-                }
-                Text(content.title)
-                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+    private func actionKeyContent(for action: DeckAction) -> some View {
+        VStack(spacing: 2) {
+            if let symbolName = content.symbolName {
+                Image(systemName: symbolName)
+                    .font(.system(size: 22, weight: .bold))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .foregroundColor(content.isActive ? .white : Color(white: 0.75))
-            .background(content.isActive
-                        ? activeColor.opacity(isPressed ? 0.9 : 0.6)
-                        : Color(white: isPressed ? 0.35 : 0.12))
+            Text(content.title)
+                .font(.system(size: 11, weight: .semibold).monospacedDigit())
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .foregroundColor(content.isActive ? .white : Color(white: 0.75))
+        .background(content.isActive
+                    ? activeColor.opacity(isPressed ? 0.9 : 0.6)
+                    : Color(white: isPressed ? 0.35 : 0.12))
     }
 }
 
