@@ -7,10 +7,13 @@
 
 #include <QThread>
 #include <QString>
-#include <QFuture>
-#include <QtConcurrent>
 #include <QElapsedTimer>
+#include <QMutex>
+#include <QQueue>
+#include <QByteArray>
+#include <QUrl>
 #include <atomic>
+#include <thread>
 
 #include "recordingclock.h"
 #include "muxer.h"
@@ -85,7 +88,14 @@ private:
     QMutex m_urlMutex;
     QMutex m_metadataMutex;
     QByteArray m_sourceMetadataJson;    // JSON blob for per-frame subtitle track
-    QFuture<void> m_captureFuture;
+
+    // Dedicated capture thread owned by this worker.  captureLoop() loops
+    // internally on reconnect/URL-change (m_restartCapture), so it is
+    // started exactly once and joined on shutdown.  We do NOT use the
+    // shared global QtConcurrent pool: an infinite captureLoop per source
+    // would saturate it (maxThreadCount == core count), starving extra
+    // sources and the async network-close tasks.
+    std::thread m_captureThread;
 
     void captureLoop();
     std::atomic<bool> m_captureRunning{false};

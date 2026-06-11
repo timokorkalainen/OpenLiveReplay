@@ -48,13 +48,16 @@ void StreamWorker::run() {
     exec();
 
     // exec() has returned, so no further queued pulse can run on this
-    // thread.  Re-assert shutdown before joining the capture future: a
+    // thread.  Re-assert shutdown before joining the capture thread: a
     // pulse delivered between stop() and quit() taking effect could have
-    // relaunched captureLoop after stop() cleared the flags, which would
-    // otherwise leave waitForFinished() stuck forever.
+    // started captureLoop after stop() cleared the flags, which would
+    // otherwise leave join() stuck forever.
     m_restartCapture = 1;
     m_captureRunning = false;
-    m_captureFuture.waitForFinished();
+    // The capture thread is started and joined on this (the worker) thread
+    // only, so there is no cross-thread race on m_captureThread itself.
+    if (m_captureThread.joinable())
+        m_captureThread.join();
 
     // Cleanup when exec() returns (on stop)
     avcodec_free_context(&m_persistentEncCtx);
@@ -85,12 +88,17 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
         m_restartCapture = 1;
     }
 
-    // Launch captureLoop only if it truly isn't running.
-    // Never kill a running captureLoop from here — it handles restarts itself.
-    if (!m_captureRunning && !m_captureFuture.isRunning()) {
+    // Start the dedicated capture thread exactly once, on the first pulse.
+    // captureLoop() loops internally on reconnect/URL-change (m_restartCapture)
+    // and only returns when m_captureRunning goes false, so it never needs
+    // re-launching.  We start it on its own std::thread (not the shared
+    // global pool) so N infinite captureLoops can't saturate that pool.
+    // Both start (here) and join (in run() post-exec) happen on the worker
+    // thread, so m_captureThread is never touched cross-thread.
+    if (!m_captureThread.joinable()) {
         m_restartCapture = 0;
         m_captureRunning = true;
-        m_captureFuture = QtConcurrent::run([this]() {
+        m_captureThread = std::thread([this]() {
             this->captureLoop();
         });
     }
@@ -484,12 +492,20 @@ void StreamWorker::captureLoop() {
             fmtToClose->interrupt_callback.callback = [](void*) -> int { return 1; };
             fmtToClose->interrupt_callback.opaque = nullptr;
         }
-        QThreadPool::globalInstance()->start([decToFree, audioDecToFree, swrToFree, fmtToClose]() mutable {
+        // Fire-and-forget on a detached std::thread (NOT the shared global
+        // pool, which the per-source captureLoops already occupy — queuing
+        // closes there would let old contexts pile up unfreed during
+        // reconnect cycles, leaking sockets and memory).  All four pointers
+        // were moved into locals above and nulled out, so the worker never
+        // touches them again; the close task owns them exclusively.  Each
+        // fmtToClose carries its own always-interrupt callback, so the
+        // detached thread cannot block indefinitely.
+        std::thread([decToFree, audioDecToFree, swrToFree, fmtToClose]() mutable {
             if (decToFree) avcodec_free_context(&decToFree);
             if (audioDecToFree) avcodec_free_context(&audioDecToFree);
             if (swrToFree) swr_free(&swrToFree);
             if (fmtToClose) avformat_close_input(&fmtToClose);
-        });
+        }).detach();
 
         m_connected = false;
     }
