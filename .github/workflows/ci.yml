@@ -183,60 +183,6 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1
         run: ctest --output-on-failure --repeat until-pass:2
 
-  # ---------------------------------------------------------------------------
-  # iOS cross-build. FFmpeg+SRT is compiled from source (~20 min) by the CMake
-  # custom command, so the resulting xcframeworks are cached on the build
-  # script's hash. ADVISORY until validated on a real runner — flip
-  # continue-on-error to false once it is green.
-  # ---------------------------------------------------------------------------
-  build-ios:
-    name: Build (iOS)
-    runs-on: macos-14
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Qt (host desktop, for moc/rcc)
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: desktop
-          arch: clang_64
-          modules: qtmultimedia
-          cache: true
-
-      # Capture the desktop Qt root before the iOS install overwrites QT_ROOT_DIR.
-      - name: Save host Qt path
-        run: echo "QT_HOST_DIR=$QT_ROOT_DIR" >> "$GITHUB_ENV"
-
-      - name: Install Qt (iOS)
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: ios
-          modules: qtmultimedia
-          cache: true
-
-      - name: Install build deps
-        run: brew install ninja
-
-      - name: Cache iOS FFmpeg+SRT xcframeworks
-        uses: actions/cache@v4
-        with:
-          path: ios_build/xcframeworks
-          key: ios-ffmpeg-${{ hashFiles('build-scripts/build_ffmpeg_ios_srt.sh') }}
-
-      - name: Configure (iOS)
-        # After the iOS install, QT_ROOT_DIR points at the iOS kit (its qt-cmake);
-        # QT_HOST_DIR (saved above) is the desktop kit used for host tools.
-        run: >
-          "$QT_ROOT_DIR/bin/qt-cmake" -S . -B build-ios -G Xcode
-          -DQT_HOST_PATH="$QT_HOST_DIR"
-          -DCMAKE_OSX_ARCHITECTURES=arm64
-
-      - name: Build (iOS, no signing)
-        run: >
-          cmake --build build-ios --config Debug --
-          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+# iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
+# (~20 min) OOM-kills hosted runners. It is validated locally instead via the
+# .githooks/pre-push hook. See tests/README.md.

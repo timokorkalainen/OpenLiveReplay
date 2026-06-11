@@ -59,17 +59,31 @@ path that produced the mono-audio crash.
 `.github/workflows/ci.yml` runs on PRs and pushes to `main`:
 
 - **build-test-macos** — build app + tests, run CTest (primary gate).
-- **lint** — `clang-format` (changed files) + `qmllint`.
+- **lint** — `clang-format` (changed lines) + `qmllint`.
 - **sanitizers** — ASan+UBSan (gating) and ThreadSanitizer (advisory).
-- **build-ios** — cross-build with the FFmpeg+SRT xcframeworks cached on the
-  build-script hash. *Advisory until validated on a runner* (the FFmpeg build
-  takes ~20 min on a cache miss).
+
+## iOS build (local pre-push hook, not CI)
+
+iOS is **not** built in GitHub CI: the FFmpeg+SRT+OpenSSL from-source build
+(~20 min) OOM-kills hosted runners. It is validated locally by
+[`.githooks/pre-push`](../.githooks/pre-push), which cross-builds the iOS target
+on `git push`. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The FFmpeg xcframeworks are cached in `ios_build/xcframeworks`, so only the
+first push is slow. Override the Qt location with `QT_IOS_PREFIX` /
+`QT_HOST_PREFIX`. Skip a single push with `SKIP_IOS_BUILD=1 git push` (or
+`git push --no-verify`); if no Qt iOS kit is found the hook skips and allows the
+push.
 
 ## Known follow-ups
 
 - A runtime offscreen QML load test (beyond `qmllint`) needs the app factored
   into a library + thin `main`; today the smoke test is static-only.
-- `clang-tidy` and the iOS job are advisory; flip them to gating once the
-  warning backlog is triaged and the iOS build is confirmed green.
+- `clang-tidy` is advisory; flip it to gating once the warning backlog is
+  triaged.
 - Introducing `-Werror` for the app (currently first-party warnings are
   surfaced but non-fatal) after the existing warning backlog is cleared.
