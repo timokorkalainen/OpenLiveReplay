@@ -15,6 +15,8 @@
 #include "frameprovider.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
+#include "playback/trackbuffer.h"
+#include "playback/audioframequeue.h"
 
 extern "C" {
     #include <libavformat/avformat.h>
@@ -23,16 +25,11 @@ extern "C" {
     #include <libavutil/error.h>
 }
 
-struct BufferedFrame {
-    int64_t ptsMs = -1;
-    QVideoFrame frame;
-};
-
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
     FrameProvider* provider = nullptr;
     int streamIndex = -1;
-    QVector<BufferedFrame> buffer;
+    TrackBuffer buffer;                 // was QVector<BufferedFrame>
     int64_t lastDeliveredPtsMs = -1;   // last frame released to the provider
 };
 
@@ -68,11 +65,37 @@ protected:
     void run() override;
 
 private:
+    // --- Scheduler constants (spec §3) ------------------------------------
+    static constexpr int    kLeadMs           = 500;  // video window ahead of P (travel dir)
+    static constexpr int    kTrailMs          = 300;  // video window behind P
+    static constexpr int    kChunkMs          = 500;  // reverse backward-fetch chunk size
+    static constexpr int    kAudioLeadMs      = 200;  // max lead of pushed audio over P
+    static constexpr int    kAudioQueueMs     = 900;  // worker audio-queue span bound
+    static constexpr int    kSlackMs          = 200;  // trim hysteresis beyond the window
+    static constexpr int    kIdleSleepMs      = 3;    // sleep when window full and playing
+    static constexpr int    kEofSleepMs       = 10;   // sleep between EOF re-checks
+    static constexpr int    kReadErrSleepMs   = 20;   // sleep after a non-EOF read error
+    static constexpr int    kBackJumpSlackMs  = 150;  // P below buffered span by this ⇒ reposition
+    static constexpr int    kGlobalFrameBudget = 256; // aggregate decoded-frame cap (memory)
+    static constexpr double kDecimateAbove    = 1.5;  // |speed| above which decimation engages
+
     // High-performance conversion from FFmpeg AVFrame to QVideoFrame (YUV420P)
     QVideoFrame convertToQVideoFrame(AVFrame* frame);
 
     // Push a decoded audio frame, PTS-tagged, to the audio player
     void pushAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame);
+
+    // --- Scheduler helpers (spec §3 symbols / §6). Task 5 wires the loop;
+    //     bodies are implemented here except repositionTo (stubbed). ---------
+    int     fps() const;                  // m_transport->fps(), clamped >=1
+    int64_t frameDurMs() const;           // 1000 / fps()
+    int     capFrames(int trackCount) const;
+    int64_t newestPtsMin() const;         // min-newest, staleness-excluded; -1 empty
+    int64_t oldestPtsMin() const;         // min-oldest, staleness-excluded; -1 empty
+    int64_t newestPtsMax() const;         // cross-track max-newest (ignoring empty); -1 empty
+    int64_t refNewestPts() const;         // reference (first) track newest; -1 empty
+    void    repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af);
+    bool    reuseAt(int64_t target);      // true if every track has a frame within frameDurMs/2
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
@@ -92,8 +115,12 @@ private:
 
     int m_frameBufferMax = 30;
 
+    AudioFrameQueue m_audioQueue;
+    int m_lastMoveDir = 1;
+    int64_t m_sizeAtLastEof = -1;
+
     QMutex m_mutex;
-    QMutex m_bufferMutex;
+    mutable QMutex m_bufferMutex;
 
     PlaybackCounters m_counters;
     void emitTelemetry(int64_t P, int64_t newest, double speed);

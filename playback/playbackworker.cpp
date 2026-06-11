@@ -80,6 +80,119 @@ void PlaybackWorker::emitTelemetry(int64_t P, int64_t newest, double speed) {
             m_counters.framesDropped, (long long)P, (long long)newest, speed);
 }
 
+// ---------------------------------------------------------------------------
+// Scheduler helpers (spec §3 symbols / §6).
+//
+// These are added for the windowed scheduler that lands in Task 5. The
+// existing (old) playback loop does NOT call them yet — behavior is unchanged
+// this task. They are implemented correctly now (pure/simple) except
+// repositionTo, which is stubbed until Task 5.
+// ---------------------------------------------------------------------------
+int PlaybackWorker::fps() const {
+    return qMax(1, m_transport->fps());
+}
+
+int64_t PlaybackWorker::frameDurMs() const {
+    return 1000 / fps();   // fps() >= 1 so no divide-by-zero
+}
+
+int PlaybackWorker::capFrames(int trackCount) const {
+    // capFrames = clamp( ceil(windowMs / frameDurMs) + 4, 12,
+    //                    max(12, kGlobalFrameBudget / max(1,trackCount)) )
+    const int64_t windowMs = int64_t(kLeadMs) + kChunkMs + kTrailMs + 2 * int64_t(kSlackMs);
+    const int64_t dur = qMax<int64_t>(1, frameDurMs());      // never divide by zero
+    const int64_t ceilFrames = (windowMs + dur - 1) / dur;   // integer ceil
+    int64_t want = ceilFrames + 4;
+
+    const int tc = qMax(1, trackCount);
+    const int64_t hi = qMax<int64_t>(12, int64_t(kGlobalFrameBudget) / tc);
+    const int64_t lo = 12;
+
+    if (want < lo) want = lo;
+    if (want > hi) want = hi;
+    return int(want);
+}
+
+int64_t PlaybackWorker::newestPtsMin() const {
+    // min-newest across non-empty video tracks, EXCLUDING tracks whose newest
+    // PTS lags the cross-track max-newest by more than kLeadMs ("stalled,
+    // will-backfill" tracks per the non-interleaved muxer).
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    int64_t maxNewest = -1;
+    for (auto* track : m_decoderBank) {
+        const int64_t n = track->buffer.newestPts();
+        if (n > maxNewest) maxNewest = n;
+    }
+    if (maxNewest < 0) return -1;  // all tracks empty
+
+    int64_t minNewest = -1;
+    for (auto* track : m_decoderBank) {
+        const int64_t n = track->buffer.newestPts();
+        if (n < 0) continue;                       // empty track
+        if (n < maxNewest - kLeadMs) continue;     // stalled track — exclude
+        if (minNewest < 0 || n < minNewest) minNewest = n;
+    }
+    return minNewest;
+}
+
+int64_t PlaybackWorker::oldestPtsMin() const {
+    // min-oldest across non-empty video tracks, EXCLUDING stalled tracks
+    // (same staleness rule as newestPtsMin, keyed off cross-track max-newest).
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    int64_t maxNewest = -1;
+    for (auto* track : m_decoderBank) {
+        const int64_t n = track->buffer.newestPts();
+        if (n > maxNewest) maxNewest = n;
+    }
+    if (maxNewest < 0) return -1;  // all tracks empty
+
+    int64_t minOldest = -1;
+    for (auto* track : m_decoderBank) {
+        const int64_t n = track->buffer.newestPts();
+        if (n < 0) continue;                       // empty track
+        if (n < maxNewest - kLeadMs) continue;     // stalled track — exclude
+        const int64_t o = track->buffer.oldestPts();
+        if (minOldest < 0 || o < minOldest) minOldest = o;
+    }
+    return minOldest;
+}
+
+int64_t PlaybackWorker::newestPtsMax() const {
+    // plain cross-track max of newestPts, ignoring empty tracks (pts < 0).
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    int64_t maxNewest = -1;
+    for (auto* track : m_decoderBank) {
+        const int64_t n = track->buffer.newestPts();
+        if (n > maxNewest) maxNewest = n;
+    }
+    return maxNewest;
+}
+
+int64_t PlaybackWorker::refNewestPts() const {
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    if (m_decoderBank.isEmpty()) return -1;
+    return m_decoderBank[0]->buffer.newestPts();
+}
+
+bool PlaybackWorker::reuseAt(int64_t target) {
+    // True iff the bank is non-empty AND every track has a decoded frame
+    // within frameDurMs/2 of target.
+    const int64_t tol = frameDurMs() / 2;
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    if (m_decoderBank.isEmpty()) return false;
+    for (auto* track : m_decoderBank) {
+        if (!track->buffer.hasFrameNear(target, tol)) return false;
+    }
+    return true;
+}
+
+void PlaybackWorker::repositionTo(int64_t target, int dir,
+                                  AVPacket* pkt, AVFrame* vf, AVFrame* af) {
+    // TODO Task 5: implement the windowed reposition (reuse fast-path + full
+    // seek/decode-forward fill). Not called by the existing loop this task.
+    (void)target; (void)dir; (void)pkt; (void)vf; (void)af;
+}
+
 void PlaybackWorker::run() {
     qDebug() << "Opening file: "<<m_currentFilePath;
 
@@ -323,10 +436,8 @@ void PlaybackWorker::run() {
                                     QVideoFrame qFrame = convertToQVideoFrame(frame);
                                     {
                                         QMutexLocker bufferLocker(&m_bufferMutex);
-                                        track->buffer.append({framePtsMs, qFrame});
-                                        if (track->buffer.size() > m_frameBufferMax) {
-                                            track->buffer.remove(0, track->buffer.size() - m_frameBufferMax);
-                                        }
+                                        track->buffer.insert(framePtsMs, qFrame, m_frameBufferMax,
+                                                             framePtsMs, framePtsMs);
                                     }
                                     burstDecoded[track]++;
                                 }
@@ -403,10 +514,8 @@ void PlaybackWorker::run() {
                             QVideoFrame qFrame = convertToQVideoFrame(frame);
                             {
                                 QMutexLocker bufferLocker(&m_bufferMutex);
-                                track->buffer.append({framePtsMs, qFrame});
-                                if (track->buffer.size() > m_frameBufferMax) {
-                                    track->buffer.remove(0, track->buffer.size() - m_frameBufferMax);
-                                }
+                                track->buffer.insert(framePtsMs, qFrame, m_frameBufferMax,
+                                                     framePtsMs, framePtsMs);
                             }
                             // NOTE: no immediate delivery here — frames are
                             // released against the master clock below, so the
@@ -519,13 +628,11 @@ bool PlaybackWorker::deliverBufferedFrameAtOrBefore(int64_t targetMs) {
         QMutexLocker bufferLocker(&m_bufferMutex);
         for (auto* track : m_decoderBank) {
             if (!track || !track->provider) continue;
-            if (track->buffer.isEmpty()) continue;
-            for (int i = track->buffer.size() - 1; i >= 0; --i) {
-                if (track->buffer[i].ptsMs <= targetMs) {
-                    track->lastDeliveredPtsMs = track->buffer[i].ptsMs;
-                    pending.append({track->provider, track->buffer[i].frame});
-                    break;
-                }
+            QVideoFrame f;
+            int64_t p;
+            if (track->buffer.frameAt(targetMs, f, p)) {
+                track->lastDeliveredPtsMs = p;
+                pending.append({track->provider, f});
             }
         }
     }
@@ -549,14 +656,12 @@ void PlaybackWorker::deliverDueFrames(int64_t masterTimeMs) {
         QMutexLocker bufferLocker(&m_bufferMutex);
         for (auto* track : m_decoderBank) {
             if (!track || !track->provider) continue;
-            if (track->buffer.isEmpty()) continue;
-            for (int i = track->buffer.size() - 1; i >= 0; --i) {
-                if (track->buffer[i].ptsMs <= masterTimeMs) {
-                    if (track->buffer[i].ptsMs != track->lastDeliveredPtsMs) {
-                        track->lastDeliveredPtsMs = track->buffer[i].ptsMs;
-                        pending.append({track->provider, track->buffer[i].frame});
-                    }
-                    break;
+            QVideoFrame f;
+            int64_t p;
+            if (track->buffer.frameAt(masterTimeMs, f, p)) {
+                if (p != track->lastDeliveredPtsMs) {
+                    track->lastDeliveredPtsMs = p;
+                    pending.append({track->provider, f});
                 }
             }
         }
