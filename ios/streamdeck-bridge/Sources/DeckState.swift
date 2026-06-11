@@ -4,12 +4,13 @@ import Foundation
 /// Single source of truth for everything rendered on connected decks.
 /// All setters guard against no-op writes, so a no-op state push never
 /// publishes (idle deck → zero re-renders). Per-key USB economy is the
-/// layout's responsibility: only container views observe this object and
-/// leaf key views are Equatable (see ReplayDeckLayout).
+/// layout's responsibility: the container view is static and each leaf
+/// subscribes with an equality guard on its own content slice (see
+/// ReplayDeckLayout).
 @MainActor
 final class DeckState: ObservableObject {
 
-    /// Sub-pixel on the widest (~2000 px) touch strip — can never suppress
+    /// Sub-pixel on the widest (1200 px) touch strip — can never suppress
     /// a visible scrub-bar change.
     private static let positionEpsilon = 0.0005
 

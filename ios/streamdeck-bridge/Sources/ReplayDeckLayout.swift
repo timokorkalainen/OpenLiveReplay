@@ -1,94 +1,121 @@
+import Combine
 import StreamDeckKit
 import SwiftUI
 
 /// Adaptive layout rendered on every connected Stream Deck.
 ///
-/// Observation granularity: ONLY this container observes DeckState. Each key
-/// receives a value-type KeyContent and leaf views are Equatable, so SwiftUI
-/// skips re-evaluating keys whose content is unchanged and the SDK
-/// re-transmits only those keys over USB. A ticking timecode re-renders one
-/// key, not the deck.
+/// Observation granularity (matches the SDK's leaf-state pattern): the
+/// container is static — it never re-evaluates after install, because a
+/// container body re-evaluation marks the whole screen dirty and forces a
+/// full USB re-transmit. Instead each leaf owns its rendered values as
+/// @State, updated through an equality-guarded objectWillChange
+/// subscription. A leaf re-evaluates only when its own content changed, so
+/// on key-only devices a ticking timecode re-renders one key, not the deck.
+/// (Window devices — +, + XL, Neo — always receive full frames by SDK
+/// design; the leaf guards still bound how often that happens.)
 struct ReplayDeckLayout: View {
 
     @Environment(\.streamDeckViewContext.device) var streamDeck
-    @EnvironmentObject var state: DeckState
+    /// Plain reference — deliberately NOT observed (see above).
+    let state: DeckState
 
     var body: some View {
+        let model = deckModelIdentifier(for: streamDeck)
         StreamDeckLayout {
             StreamDeckKeyAreaLayout { keyIndex in
-                ReplayKeyView(content: keyContent(forKey: keyIndex))
-                    .equatable()
+                ReplayKeyView(keyIndex: keyIndex, model: model, state: state)
             }
             .background(.black)
         } windowArea: {
             switch streamDeck.info.product {
             case .plus, .plusXL:
                 ReplayDialStrip(
-                    fraction: state.positionFraction,
-                    timecodeText: state.timecodeText,
-                    dialCount: max(streamDeck.capabilities.dialCount, 1)
-                )
+                    state: state,
+                    dialCount: max(streamDeck.capabilities.dialCount, 1))
             case .neo:
-                ReplayNeoPanel(
-                    isRecording: state.isRecording,
-                    timecodeText: state.timecodeText
-                )
+                ReplayNeoPanel(state: state)
             default:
                 Color.black
             }
         }
     }
-
-    private func keyContent(forKey index: Int) -> KeyContent {
-        let model = deckModelIdentifier(for: streamDeck)
-        guard let action = state.action(forKey: index, model: model) else {
-            return KeyContent(action: nil, isActive: false, title: "", symbolName: nil)
-        }
-        switch action {
-        case .timecodeDisplay:
-            return KeyContent(action: action, isActive: false,
-                              title: state.timecodeText, symbolName: nil)
-        case .speedDisplay:
-            return KeyContent(action: action, isActive: false,
-                              title: state.speedText, symbolName: nil)
-        case .record:
-            return KeyContent(action: action, isActive: state.isRecording,
-                              title: state.isRecording ? state.recElapsedText : action.label,
-                              symbolName: action.symbolName)
-        case .playPause:
-            return KeyContent(action: action, isActive: state.isPlaying,
-                              title: action.label, symbolName: action.symbolName)
-        case .goLive:
-            return KeyContent(action: action, isActive: state.followLive,
-                              title: action.label, symbolName: action.symbolName)
-        default:
-            return KeyContent(action: action, isActive: false,
-                              title: action.label, symbolName: action.symbolName)
-        }
-    }
 }
 
-/// Everything a key renders, as a value: equal content means identical
-/// pixels, so Equatable pruning keeps unchanged keys off the USB bus.
+/// Everything a key renders, as an equatable value: the leaf's @State guard
+/// compares old and new content, so a key re-renders only on real change.
+/// Every property a key draws MUST be represented here — a rendered value
+/// missing from KeyContent would freeze on the deck.
 struct KeyContent: Equatable {
     let action: DeckAction?
     let isActive: Bool
     let title: String
     let symbolName: String?
+
+    static let empty = KeyContent(action: nil, isActive: false, title: "", symbolName: nil)
 }
 
-/// One key. Equatable on content only (@State isPressed excluded — SwiftUI
-/// re-renders on its own state changes regardless of ==).
-struct ReplayKeyView: View, Equatable {
+extension KeyContent {
 
-    let content: KeyContent
+    /// Derives one key's content from app state. Pure data transformation —
+    /// covered by table tests in DeckStateTests.
+    @MainActor
+    init(state: DeckState, keyIndex: Int, model: String) {
+        guard let action = state.action(forKey: keyIndex, model: model) else {
+            self = .empty
+            return
+        }
+        switch action {
+        case .timecodeDisplay:
+            self.init(action: action, isActive: false,
+                      title: state.timecodeText, symbolName: nil)
+        case .speedDisplay:
+            self.init(action: action, isActive: false,
+                      title: state.speedText, symbolName: nil)
+        case .record:
+            self.init(action: action, isActive: state.isRecording,
+                      title: state.isRecording ? state.recElapsedText : action.label,
+                      symbolName: action.symbolName)
+        case .playPause:
+            self.init(action: action, isActive: state.isPlaying,
+                      title: action.label, symbolName: action.symbolName)
+        case .goLive:
+            self.init(action: action, isActive: state.followLive,
+                      title: action.label, symbolName: action.symbolName)
+        default:
+            self.init(action: action, isActive: false,
+                      title: action.label, symbolName: action.symbolName)
+        }
+    }
+}
+
+/// One key. Owns its content as @State so its body — and therefore the
+/// SDK's dirty marking for this key — only runs on real content changes.
+struct ReplayKeyView: View {
+
+    let keyIndex: Int
+    let model: String
+    let state: DeckState
+
+    @State private var content: KeyContent
     @State private var isPressed = false
 
-    static func == (lhs: ReplayKeyView, rhs: ReplayKeyView) -> Bool {
-        lhs.content == rhs.content
+    init(keyIndex: Int, model: String, state: DeckState) {
+        self.keyIndex = keyIndex
+        self.model = model
+        self.state = state
+        _content = State(initialValue: KeyContent(state: state, keyIndex: keyIndex, model: model))
     }
 
     var body: some View {
+        keyBody
+            .onReceive(state.objectWillChange.receive(on: RunLoop.main)) { _ in
+                let new = KeyContent(state: state, keyIndex: keyIndex, model: model)
+                if new != content { content = new }
+            }
+    }
+
+    @ViewBuilder
+    private var keyBody: some View {
         if let action = content.action {
             switch action {
             case .timecodeDisplay:
@@ -151,16 +178,27 @@ struct DisplayKey: View {
     }
 }
 
-/// Stream Deck + / + XL touch strip: dial 0 jogs (press = play/pause),
-/// the whole strip is a continuous scrub bar; tapping it seeks.
-/// Receives plain values from the observing container.
+/// Stream Deck + / + XL touch strip: dial 0 jogs (press = play/pause), the
+/// whole strip is a continuous scrub bar; tapping it seeks. Dials 1..n-1
+/// intentionally render scrub segments without rotate/press handlers in
+/// this iteration. Owns its values as @State (same granularity pattern as
+/// keys; these devices receive full frames anyway, so the guards bound
+/// frequency, not size).
 struct ReplayDialStrip: View {
 
-    let fraction: Double
-    let timecodeText: String
+    let state: DeckState
     let dialCount: Int
 
     @Environment(\.streamDeckViewContext.size) var stripSize
+    @State private var fraction: Double
+    @State private var timecodeText: String
+
+    init(state: DeckState, dialCount: Int) {
+        self.state = state
+        self.dialCount = dialCount
+        _fraction = State(initialValue: state.positionFraction)
+        _timecodeText = State(initialValue: state.timecodeText)
+    }
 
     var body: some View {
         StreamDeckDialAreaLayout(
@@ -186,6 +224,10 @@ struct ReplayDialStrip: View {
                 segmentCount: dialCount,
                 fraction: fraction,
                 timecodeText: dialIndex == 0 ? timecodeText : "")
+        }
+        .onReceive(state.objectWillChange.receive(on: RunLoop.main)) { _ in
+            if state.positionFraction != fraction { fraction = state.positionFraction }
+            if state.timecodeText != timecodeText { timecodeText = state.timecodeText }
         }
     }
 }
@@ -225,11 +267,19 @@ struct ScrubBarSegment: View {
 }
 
 /// Stream Deck Neo: the two touch keys step a frame back/forward, the info
-/// panel shows REC state and timecode. Receives plain values.
+/// panel shows REC state and timecode. Owns its values as @State.
 struct ReplayNeoPanel: View {
 
-    let isRecording: Bool
-    let timecodeText: String
+    let state: DeckState
+
+    @State private var isRecording: Bool
+    @State private var timecodeText: String
+
+    init(state: DeckState) {
+        self.state = state
+        _isRecording = State(initialValue: state.isRecording)
+        _timecodeText = State(initialValue: state.timecodeText)
+    }
 
     var body: some View {
         StreamDeckNeoPanelLayout { touched in
@@ -250,6 +300,10 @@ struct ReplayNeoPanel: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color(white: 0.05))
         }
+        .onReceive(state.objectWillChange.receive(on: RunLoop.main)) { _ in
+            if state.isRecording != isRecording { isRecording = state.isRecording }
+            if state.timecodeText != timecodeText { timecodeText = state.timecodeText }
+        }
     }
 }
 
@@ -258,25 +312,29 @@ import StreamDeckSimulator
 
 #Preview("Stream Deck +") {
     StreamDeckSimulator.PreviewView(streamDeck: .plus) { device in
-        let state = DeckState()
-        state.setKeyMapping(
-            DeckAction.defaultMapping(modelIdentifier: "plus", keyCount: 8),
-            forModel: "plus")
-        state.setRecording(true, elapsedText: "00:05:23")
-        state.setTransport(playing: true, speedText: "1.0×", followLive: true)
-        state.setPosition(timecodeText: "00:04:58:12", positionFraction: 0.85)
-        device.render(ReplayDeckLayout().environmentObject(state))
+        MainActor.assumeIsolated {
+            let state = DeckState()
+            state.setKeyMapping(
+                DeckAction.defaultMapping(modelIdentifier: "plus", keyCount: 8),
+                forModel: "plus")
+            state.setRecording(true, elapsedText: "00:05:23")
+            state.setTransport(playing: true, speedText: "1.0×", followLive: true)
+            state.setPosition(timecodeText: "00:04:58:12", positionFraction: 0.85)
+            device.render(ReplayDeckLayout(state: state))
+        }
     }
 }
 
 #Preview("Stream Deck MK.2") {
     StreamDeckSimulator.PreviewView(streamDeck: .regular) { device in
-        let state = DeckState()
-        state.setKeyMapping(
-            DeckAction.defaultMapping(modelIdentifier: "regular", keyCount: 15),
-            forModel: "regular")
-        state.setTransport(playing: false, speedText: "Paused", followLive: false)
-        device.render(ReplayDeckLayout().environmentObject(state))
+        MainActor.assumeIsolated {
+            let state = DeckState()
+            state.setKeyMapping(
+                DeckAction.defaultMapping(modelIdentifier: "regular", keyCount: 15),
+                forModel: "regular")
+            state.setTransport(playing: false, speedText: "Paused", followLive: false)
+            device.render(ReplayDeckLayout(state: state))
+        }
     }
 }
 #endif

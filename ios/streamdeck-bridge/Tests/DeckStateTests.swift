@@ -123,4 +123,64 @@ final class DeckStateTests: XCTestCase {
             [9, 0, 4, 5, 7, 3, 1, 2]
         )
     }
+
+    // MARK: KeyContent derivation
+
+    func testKeyContentForUnmappedKeyIsEmpty() {
+        let state = DeckState()
+        XCTAssertEqual(KeyContent(state: state, keyIndex: 0, model: "mini"), .empty)
+    }
+
+    func testKeyContentRecordIdleShowsLabel() {
+        let state = DeckState()
+        state.setKeyMapping([9], forModel: "mini")
+        let content = KeyContent(state: state, keyIndex: 0, model: "mini")
+        XCTAssertEqual(content.action, .record)
+        XCTAssertFalse(content.isActive)
+        XCTAssertEqual(content.title, "REC")
+        XCTAssertEqual(content.symbolName, "record.circle")
+    }
+
+    func testKeyContentRecordActiveShowsElapsed() {
+        let state = DeckState()
+        state.setKeyMapping([9], forModel: "mini")
+        state.setRecording(true, elapsedText: "00:05:23")
+        let content = KeyContent(state: state, keyIndex: 0, model: "mini")
+        XCTAssertTrue(content.isActive)
+        XCTAssertEqual(content.title, "00:05:23")
+    }
+
+    func testKeyContentTimecodeDisplayCarriesTimecode() {
+        let state = DeckState()
+        state.setKeyMapping([20], forModel: "regular")
+        state.setPosition(timecodeText: "01:02:03:04", positionFraction: 0.5)
+        let content = KeyContent(state: state, keyIndex: 0, model: "regular")
+        XCTAssertEqual(content.action, .timecodeDisplay)
+        XCTAssertEqual(content.title, "01:02:03:04")
+        XCTAssertNil(content.symbolName)
+    }
+
+    func testKeyContentSpeedDisplayCarriesSpeed() {
+        let state = DeckState()
+        state.setKeyMapping([21], forModel: "regular")
+        state.setTransport(playing: true, speedText: "-5.0×", followLive: false)
+        let content = KeyContent(state: state, keyIndex: 0, model: "regular")
+        XCTAssertEqual(content.action, .speedDisplay)
+        XCTAssertEqual(content.title, "-5.0×")
+    }
+
+    func testKeyContentPlayPauseAndGoLiveActiveFlags() {
+        let state = DeckState()
+        state.setKeyMapping([0, 4], forModel: "mini")
+        state.setTransport(playing: true, speedText: "1.0×", followLive: true)
+        XCTAssertTrue(KeyContent(state: state, keyIndex: 0, model: "mini").isActive)
+        XCTAssertTrue(KeyContent(state: state, keyIndex: 1, model: "mini").isActive)
+    }
+
+    func testDefaultMappingPedalPadsWhenMoreKeys() {
+        XCTAssertEqual(
+            DeckAction.defaultMapping(modelIdentifier: "pedal", keyCount: 4),
+            [0, 7, 3, -1]
+        )
+    }
 }
