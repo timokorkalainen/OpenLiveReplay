@@ -89,7 +89,10 @@ bool ReplayManager::setupBlueEncoder() {
 }
 
 void ReplayManager::cleanupBlueEncoder() {
-    if (m_cachedBluePkt) { av_packet_free(&m_cachedBluePkt); m_cachedBluePkt = nullptr; }
+    if (m_cachedBluePkt) {
+        av_packet_free(&m_cachedBluePkt);
+        m_cachedBluePkt = nullptr;
+    }
     if (m_blueFrame) { av_frame_free(&m_blueFrame); m_blueFrame = nullptr; }
     if (m_blueEncCtx) { avcodec_free_context(&m_blueEncCtx); m_blueEncCtx = nullptr; }
 }
