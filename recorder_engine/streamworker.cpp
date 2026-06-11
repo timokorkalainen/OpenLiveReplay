@@ -43,6 +43,14 @@ void StreamWorker::run() {
     // 2. Enter the event loop. The thread stays alive, waiting for
     // signals (masterPulse) or concurrent tasks (captureLoop).
     exec();
+
+    // exec() has returned, so no further queued pulse can run on this
+    // thread.  Re-assert shutdown before joining the capture future: a
+    // pulse delivered between stop() and quit() taking effect could have
+    // relaunched captureLoop after stop() cleared the flags, which would
+    // otherwise leave waitForFinished() stuck forever.
+    m_restartCapture = 1;
+    m_captureRunning = false;
     m_captureFuture.waitForFinished();
 
     // Cleanup when exec() returns (on stop)
