@@ -1123,6 +1123,26 @@ ApplicationWindow {
                             onClicked: appWindow.uiManagerRef.toggleSourceEnabled(streamRow.index)
                         }
 
+                        // Live connection indicator: grey when idle, green
+                        // once the source's feed is up, red while recording
+                        // but the feed has not connected (or has dropped).
+                        Rectangle {
+                            id: connDot
+                            Layout.preferredWidth: 12
+                            Layout.preferredHeight: 12
+                            radius: width / 2
+                            property bool connected: appWindow.uiManagerRef.sourceConnectionVersion >= 0
+                                                     && appWindow.uiManagerRef.isSourceConnected(streamRow.index)
+                            color: !appWindow.uiManagerRef.isRecording
+                                   ? "#555"
+                                   : (connDot.connected ? "#2e7d32" : "#d32f2f")
+                            HoverHandler { id: connHover }
+                            ToolTip.visible: connHover.hovered
+                            ToolTip.text: !appWindow.uiManagerRef.isRecording
+                                          ? "Not recording"
+                                          : (connDot.connected ? "Connected" : "No signal")
+                        }
+
                         TextField {
                             Layout.preferredWidth: 160
                             text: appWindow.uiManagerRef.streamIds.length > streamRow.index ? appWindow.uiManagerRef.streamIds[streamRow.index] : ""
@@ -1148,6 +1168,21 @@ ApplicationWindow {
                             text: streamRow.modelData
                             placeholderText: "rtmp://..."
                             onEditingFinished: appWindow.uiManagerRef.updateUrl(streamRow.index, text)
+                        }
+
+                        // Misconfiguration warning: another source points at
+                        // this same URL (two workers pulling one stream).
+                        // Reading streamUrls keeps the binding reactive to edits.
+                        Label {
+                            text: "⚠"
+                            color: "#ff9800"
+                            font.bold: true
+                            Layout.preferredWidth: 16
+                            visible: appWindow.uiManagerRef.streamUrls.length >= 0
+                                     && appWindow.uiManagerRef.hasDuplicateUrl(streamRow.index)
+                            HoverHandler { id: dupHover }
+                            ToolTip.visible: dupHover.hovered
+                            ToolTip.text: "Duplicate URL — another source uses this same stream"
                         }
 
                         Button {
