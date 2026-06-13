@@ -173,7 +173,7 @@ jobs:
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build tests
-        run: cmake --build build --target tst_recordingclock tst_settingsmanager tst_playbacktransport tst_muxer record_harness
+        run: cmake --build build --target tst_recordingclock tst_settingsmanager tst_playbacktransport tst_muxer tst_trackbuffer tst_audioframequeue record_harness play_harness
 
       - name: Run tests under sanitizer
         working-directory: build
@@ -181,7 +181,11 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1
-        run: ctest --output-on-failure --repeat until-pass:2
+        # Unit tests + e2e_record + the playback storm gate (e2e_play_storm)
+        # run under the sanitizers; the 6 heavier playback scenarios are
+        # excluded here to bound CI time — they run un-sanitized in Build+Test,
+        # and the storm gate already exercises the scheduler/worker concurrency.
+        run: ctest --output-on-failure --repeat until-pass:2 -E 'e2e_play_(seekplay|stepscrub|reverse|sliderscrub|liveedge|4view)'
 
 # iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
 # (~20 min) OOM-kills hosted runners. It is validated locally instead via the

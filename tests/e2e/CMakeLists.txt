@@ -6,7 +6,14 @@ qt_add_executable(record_harness record_harness.cpp)
 target_link_libraries(record_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
+# Headless playback harness: drives the real PlaybackWorker against a recorded
+# fixture and prints its telemetry counters. The storm-regression gate.
+qt_add_executable(play_harness play_harness.cpp)
+target_link_libraries(play_harness PRIVATE
+    Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
+set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
 
 # Baseline happy path: stereo input.
 add_test(NAME e2e_record_stereo
@@ -21,3 +28,46 @@ set_tests_properties(e2e_record_stereo e2e_record_mono PROPERTIES
     LABELS "e2e"
     TIMEOUT 120
     RUN_SERIAL TRUE)  # they bind UDP ports / drive ffmpeg; don't overlap
+
+# Playback acceptance matrix (spec §11.5) as CTest cases. Each records a fresh
+# multi-track fixture, drives the real PlaybackWorker through one scenario, and
+# asserts the §11.2 counter thresholds (see run_playback_e2e.sh for the per-
+# scenario numbers). They RUN_SERIAL (each binds a UDP port + drives ffmpeg) and
+# are additionally handed a UNIQUE port (5th arg = base 23470 + index) so a
+# lingering socket from one case can never bleed into the next.
+#
+# e2e_play_storm is the §11.6 headline gate: 2-view 1x steady playback must
+# report 0 repositions (the old decode loop stormed ~90 hard-seeks/s) and run
+# the audio path (audioPushes>0). e2e_play_4view confirms the multi-track decode
+# path (4 video tracks) also holds repositions at 0.
+add_test(NAME e2e_play_storm
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" play1x 2 23470)
+add_test(NAME e2e_play_seekplay
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" seekplay 2 23471)
+add_test(NAME e2e_play_stepscrub
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" stepscrub 2 23472)
+add_test(NAME e2e_play_reverse
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" reverse 2 23473)
+add_test(NAME e2e_play_sliderscrub
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" sliderscrub 2 23474)
+add_test(NAME e2e_play_liveedge
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" liveedge 2 23475)
+# 4-view multi-track decode path: the "stable" case even under the old code —
+# the new scheduler must also hold it at 0 repositions.
+add_test(NAME e2e_play_4view
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" play1x 4 23476)
+
+set_tests_properties(
+    e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
+    e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view
+    PROPERTIES
+    LABELS "e2e"
+    TIMEOUT 180
+    RUN_SERIAL TRUE)

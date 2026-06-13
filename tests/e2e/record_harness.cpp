@@ -17,6 +17,7 @@
 #include <QStringList>
 #include <QtGlobal>
 #include <cstdio>
+#include <cstdlib>
 
 #include "recorder_engine/replaymanager.h"
 
@@ -48,11 +49,36 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // Multi-track fixtures for playback tests: OLR_VIEWS (default 2) controls
+    // how many view-tracks the recording carries. View 0 maps to the single
+    // real source; the remaining views are unmapped (blue fill). The resulting
+    // .mkv has <vc> video tracks (1 real + vc-1 blue), <vc> audio, and <vc>
+    // subtitle tracks — what the playback worker decodes against.
+    int vc = 2;
+    if (const char* env = std::getenv("OLR_VIEWS")) {
+        const int parsed = atoi(env);
+        if (parsed >= 1) vc = parsed;
+    }
+
+    // viewNames: first = "TEST" (the real source), rest empty (blue fill).
+    QStringList viewNames;
+    viewNames.reserve(vc);
+    viewNames << QStringLiteral("TEST");
+    for (int v = 1; v < vc; ++v)
+        viewNames << QString();
+
+    // viewSlotMap: view 0 -> source 0; views 1..vc-1 -> -1 (unmapped/blue).
+    QList<int> viewSlotMap;
+    viewSlotMap.reserve(vc);
+    viewSlotMap << 0;
+    for (int v = 1; v < vc; ++v)
+        viewSlotMap << -1;
+
     ReplayManager rm;
     rm.setSourceUrls({url});
     rm.setSourceNames({QStringLiteral("E2E")});
-    rm.setViewCount(1);
-    rm.setViewNames({QStringLiteral("E2E")});
+    rm.setViewCount(vc);
+    rm.setViewNames(viewNames);
     if (!outdir.isEmpty()) rm.setOutputDirectory(outdir);
     rm.setBaseFileName(name);
     rm.setVideoWidth(width);
@@ -64,8 +90,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "record_harness: startRecording() failed (engine not recording)\n");
         return 4;
     }
-    // Map view 0 -> source 0 (must happen after the workers exist).
-    rm.updateViewMapping({0});
+    // Apply the view mapping (must happen after the workers exist).
+    rm.updateViewMapping(viewSlotMap);
 
     const QString outPath = rm.getVideoPath();
 

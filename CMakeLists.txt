@@ -76,6 +76,8 @@ qt_add_qml_module(OpenLiveReplay
         playback/frameprovider.h playback/frameprovider.cpp
         playback/playbacktransport.h playback/playbacktransport.cpp
         playback/audioplayer.h playback/audioplayer.cpp
+        playback/trackbuffer.h playback/trackbuffer.cpp
+        playback/audioframequeue.h playback/audioframequeue.cpp
     RESOURCES
         qtquickcontrols2.conf
         resources.qrc
