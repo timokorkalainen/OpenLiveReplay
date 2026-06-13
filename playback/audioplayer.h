@@ -24,7 +24,7 @@ class AudioRingBuffer : public QIODevice {
 public:
     explicit AudioRingBuffer(QObject *parent = nullptr);
 
-    /// Thread-safe append of PCM data.
+    /// Thread-safe append of PCM data (append + safety cap-trim only).
     void push(const char *data, qint64 len);
 
     /// Discard all buffered data and reset underrun accounting.
@@ -35,6 +35,18 @@ public:
 
     /// Safety cap for buffered data (bytes).
     void setMaxBufBytes(int bytes) { m_maxBufBytes = qMax(1, bytes); }
+
+    /// Return and clear the accumulated underrun debt (bytes the device
+    /// played as silence in place of due stream data).  Drained by
+    /// AudioPlayer::pushSamples so it can repay the debt and fade the splice.
+    /// Locks the ring mutex.
+    qint64 takeUnderrunDebt();
+
+    /// Return and clear the overflow flag.  Set when push() had to trim the
+    /// oldest (due-next) bytes because the buffer exceeded the safety cap;
+    /// AudioPlayer uses it to force a re-alignment instead of permanently
+    /// desyncing.  Locks the ring mutex.
+    bool takeOverflowed();
 
     // QIODevice sequential interface
     bool isSequential() const override { return true; }
@@ -50,6 +62,7 @@ private:
     int m_maxBufBytes = 48000 * 2 * 2;  // ~500 ms @ 48 kHz stereo S16 (safety cap)
     qint64 m_underrunDebt = 0;          // silence played in place of due data
     bool m_streamActive = false;        // true once real data flowed since last clear
+    bool m_overflowed = false;          // push() cap-trimmed due-next bytes
 };
 
 /**
@@ -106,11 +119,24 @@ private:
     qint64 m_sinkLatencyBytes = 0;   // granted sink buffer size (always full)
     bool m_aligned = false;          // stream start aligned to master clock
     int64_t m_expectedNextPtsSamples = 0;  // continuity tracking (sample frames)
-    int  m_fadeInRemaining = 0;      // samples remaining in fade-in ramp
+    int  m_fadeInRemaining = 0;      // FRAMES remaining in fade-in ramp
+    int  m_fadeInLen = 0;            // FRAMES in the current fade-in ramp (the
+                                     // ramp denominator; set when the fade is armed)
     static constexpr int kFadeInSamples = 480;   // 10 ms @ 48 kHz
     static constexpr int kSinkBufferMs  = 60;    // device-side latency budget
     static constexpr int kRingCapMs     = 500;   // ring safety cap
     static constexpr int kJitterTolMs   = 30;    // PTS continuity tolerance
+    static constexpr int kSpliceFadeSamples = 120;  // 2.5 ms de-click ramp after a splice
+    static constexpr int kResyncThresholdMs = 250;  // aligned-branch master-clock divergence
+                                                     // that forces a re-align (>> kJitterTolMs)
+    // Extra output latency (ms) beyond the QAudioSink buffer to compensate
+    // for when aligning the stream start.  Qt's QAudioSink exposes NO API to
+    // query real hardware/driver/Bluetooth output latency (typically
+    // 100-300 ms for BT), so exact automatic compensation is impossible.
+    // This is a manual knob an integrator can raise for high-latency outputs;
+    // a future user-facing "audio offset" setting could drive it.  0 keeps
+    // current behavior for wired output (the assumption made explicit/correctable).
+    static constexpr int kOutputLatencyOffsetMs = 0;
     int m_clearCount = 0;
 };
 
