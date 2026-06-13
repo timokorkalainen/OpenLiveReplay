@@ -74,6 +74,17 @@ qint64 AudioRingBuffer::takeUnderrunDebt() {
     return debt;
 }
 
+void AudioRingBuffer::addUnderrunDebt(qint64 bytes) {
+    if (bytes <= 0) return;
+    QMutexLocker locker(&m_mutex);
+    m_underrunDebt += bytes;
+    // Cap to one ring's worth (consistent with readData's cap) so a large stall
+    // cannot grow the carried-forward debt beyond ~500 ms of audio.
+    if (m_underrunDebt > m_maxBufBytes) {
+        m_underrunDebt = m_maxBufBytes;
+    }
+}
+
 bool AudioRingBuffer::takeOverflowed() {
     QMutexLocker locker(&m_mutex);
     const bool f = m_overflowed;
@@ -286,9 +297,15 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     // payload head to stay aligned with the device clock.  Draining the debt
     // under the ring mutex (takeUnderrunDebt) matches readData's accrual under
     // the same mutex — no double-count, no loss.
+    // If the payload is smaller than the total debt, the leftover is written
+    // back via addUnderrunDebt so it is repaid on the next push — one push
+    // repays at most one payload's worth, keeping debt reduction frame-aligned.
     const qint64 debt = m_ringBuffer->takeUnderrunDebt();
     if (debt > 0) {
         const qint64 drop = qMin(debt, payloadBytes);
+        if (debt - drop > 0) {
+            m_ringBuffer->addUnderrunDebt(debt - drop);  // carry leftover into next push
+        }
         if (drop > 0) {
             payload      += drop;
             payloadBytes -= drop;

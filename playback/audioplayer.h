@@ -42,6 +42,14 @@ public:
     /// Locks the ring mutex.
     qint64 takeUnderrunDebt();
 
+    /// Add back un-repaid underrun debt so it is carried into the next push.
+    /// Called by AudioPlayer::pushSamples when the current payload is smaller
+    /// than the outstanding debt (one push repays at most one payload's worth).
+    /// Uses ADD semantics so concurrent readData increments on the device
+    /// thread are preserved; clamps to m_maxBufBytes consistent with readData.
+    /// Locks the ring mutex.
+    void addUnderrunDebt(qint64 bytes);
+
     /// Return and clear the overflow flag.  Set when push() had to trim the
     /// oldest (due-next) bytes because the buffer exceeded the safety cap;
     /// AudioPlayer uses it to force a re-alignment instead of permanently
@@ -129,6 +137,14 @@ private:
     static constexpr int kSpliceFadeSamples = 120;  // 2.5 ms de-click ramp after a splice
     static constexpr int kResyncThresholdMs = 250;  // aligned-branch master-clock divergence
                                                      // that forces a re-align (>> kJitterTolMs)
+                                                     // COUPLING: if kOutputLatencyOffsetMs is
+                                                     // raised for a high-latency output (e.g.
+                                                     // Bluetooth 100-300 ms), the steady-state
+                                                     // pts-vs-master divergence grows by that
+                                                     // amount.  kResyncThresholdMs must be kept
+                                                     // above kOutputLatencyOffsetMs + headroom;
+                                                     // otherwise the aligned branch re-aligns on
+                                                     // every push.
     // Extra output latency (ms) beyond the QAudioSink buffer to compensate
     // for when aligning the stream start.  Qt's QAudioSink exposes NO API to
     // query real hardware/driver/Bluetooth output latency (typically
@@ -136,6 +152,8 @@ private:
     // This is a manual knob an integrator can raise for high-latency outputs;
     // a future user-facing "audio offset" setting could drive it.  0 keeps
     // current behavior for wired output (the assumption made explicit/correctable).
+    // COUPLING: raising this value increases steady-state pts-vs-master divergence
+    // in the aligned branch by the same amount — see kResyncThresholdMs above.
     static constexpr int kOutputLatencyOffsetMs = 0;
     int m_clearCount = 0;
 };
