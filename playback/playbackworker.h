@@ -129,6 +129,12 @@ private:
     std::atomic<bool> m_audioReprime{false}; // set by setActiveAudioView (UI thread)
     std::atomic<int> m_lastMoveDir{1};
     int64_t m_sizeAtLastEof = -1;
+    // Lowest reverse-fetch anchor (ms) issued in the current reverse run.
+    // Reverse chunks only re-fetch once the anchor has descended a full
+    // kChunkMs, so consecutive chunks tile contiguously instead of
+    // re-decoding an overlapping window every iteration. INT64_MAX = no
+    // fetch yet this run; reset on reposition and whenever travelling forward.
+    int64_t m_reverseAnchorMs = INT64_MAX;
 
     QMutex m_mutex;
     mutable QMutex m_bufferMutex;
