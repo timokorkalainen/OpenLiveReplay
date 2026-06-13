@@ -367,7 +367,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 
     // --- Full reposition: clear everything, seek behind target, fill forward. ---
     clearAllBuffers();
-    m_reverseAnchorMs = INT64_MAX;  // a seek invalidates the reverse-fetch run
+    m_reverseAnchorMs = INT64_MAX; // a seek invalidates the reverse-fetch run
     m_audioQueue.clear();
     for (auto* aTrack : m_audioDecoderBank)
         aTrack->lastEnqueuedPtsMs = -1;

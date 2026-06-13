@@ -230,14 +230,14 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     // hardware/driver/Bluetooth output latency Qt cannot report (see header).
     const int bytesPerSecond = m_sampleRate * m_channels * int(sizeof(int16_t));
     const int64_t latencySamples =
-        (m_sinkLatencyBytes + int64_t(kOutputLatencyOffsetMs) * bytesPerSecond / 1000)
-        / bytesPerFrame;
+        (m_sinkLatencyBytes + int64_t(kOutputLatencyOffsetMs) * bytesPerSecond / 1000) /
+        bytesPerFrame;
     const int64_t dueSamples = masterTimeMs * m_sampleRate / 1000 + latencySamples;
 
     const char* payload = reinterpret_cast<const char*>(data);
     qint64 payloadBytes = qint64(nFrames) * bytesPerFrame;
     qint64 silencePrefixBytes = 0;
-    bool spliced = false;  // true if this push jumps the waveform → needs a fade
+    bool spliced = false; // true if this push jumps the waveform → needs a fade
 
     // Defensive self-heal: if a seek moved the playhead without an
     // AudioPlayer::clear(), the aligned branch (which tracks PTS continuity
@@ -304,12 +304,12 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     if (debt > 0) {
         const qint64 drop = qMin(debt, payloadBytes);
         if (debt - drop > 0) {
-            m_ringBuffer->addUnderrunDebt(debt - drop);  // carry leftover into next push
+            m_ringBuffer->addUnderrunDebt(debt - drop); // carry leftover into next push
         }
         if (drop > 0) {
-            payload      += drop;
+            payload += drop;
             payloadBytes -= drop;
-            spliced = true;  // skipping to a mid-waveform sample → fade it in
+            spliced = true; // skipping to a mid-waveform sample → fade it in
             if (payloadBytes <= 0) {
                 // Debt consumed the whole payload; nothing to enqueue but the
                 // continuity position still advances past these samples.
@@ -327,7 +327,7 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     if (spliced) {
         if (m_fadeInRemaining <= 0 || kSpliceFadeSamples < m_fadeInRemaining) {
             m_fadeInRemaining = kSpliceFadeSamples;
-            m_fadeInLen       = kSpliceFadeSamples;
+            m_fadeInLen = kSpliceFadeSamples;
         }
     }
 
@@ -367,7 +367,7 @@ void AudioPlayer::clear() {
     // m_fadeInRemaining / m_fadeInLen count FRAMES (kFadeInSamples = 10 ms).
     m_aligned = false;
     m_fadeInRemaining = kFadeInSamples;
-    m_fadeInLen       = kFadeInSamples;
+    m_fadeInLen = kFadeInSamples;
 }
 
 void AudioPlayer::setMuted(bool muted) {
@@ -381,7 +381,7 @@ void AudioPlayer::setMuted(bool muted) {
     // m_fadeInRemaining / m_fadeInLen count FRAMES (kFadeInSamples = 10 ms).
     if (wasM && !muted) {
         m_fadeInRemaining = kFadeInSamples;
-        m_fadeInLen       = kFadeInSamples;
+        m_fadeInLen = kFadeInSamples;
         m_aligned = false;
         if (m_ringBuffer) m_ringBuffer->clear();
     }

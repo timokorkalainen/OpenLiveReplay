@@ -127,24 +127,24 @@ private:
     qint64 m_sinkLatencyBytes = 0;   // granted sink buffer size (always full)
     bool m_aligned = false;          // stream start aligned to master clock
     int64_t m_expectedNextPtsSamples = 0;  // continuity tracking (sample frames)
-    int  m_fadeInRemaining = 0;      // FRAMES remaining in fade-in ramp
-    int  m_fadeInLen = 0;            // FRAMES in the current fade-in ramp (the
-                                     // ramp denominator; set when the fade is armed)
+    int m_fadeInRemaining = 0;             // FRAMES remaining in fade-in ramp
+    int m_fadeInLen = 0;                   // FRAMES in the current fade-in ramp (the
+                                           // ramp denominator; set when the fade is armed)
     static constexpr int kFadeInSamples = 480;   // 10 ms @ 48 kHz
     static constexpr int kSinkBufferMs  = 60;    // device-side latency budget
     static constexpr int kRingCapMs     = 500;   // ring safety cap
     static constexpr int kJitterTolMs   = 30;    // PTS continuity tolerance
-    static constexpr int kSpliceFadeSamples = 120;  // 2.5 ms de-click ramp after a splice
-    static constexpr int kResyncThresholdMs = 250;  // aligned-branch master-clock divergence
-                                                     // that forces a re-align (>> kJitterTolMs)
-                                                     // COUPLING: if kOutputLatencyOffsetMs is
-                                                     // raised for a high-latency output (e.g.
-                                                     // Bluetooth 100-300 ms), the steady-state
-                                                     // pts-vs-master divergence grows by that
-                                                     // amount.  kResyncThresholdMs must be kept
-                                                     // above kOutputLatencyOffsetMs + headroom;
-                                                     // otherwise the aligned branch re-aligns on
-                                                     // every push.
+    static constexpr int kSpliceFadeSamples = 120; // 2.5 ms de-click ramp after a splice
+    static constexpr int kResyncThresholdMs = 250; // aligned-branch master-clock divergence
+                                                   // that forces a re-align (>> kJitterTolMs)
+                                                   // COUPLING: if kOutputLatencyOffsetMs is
+                                                   // raised for a high-latency output (e.g.
+                                                   // Bluetooth 100-300 ms), the steady-state
+                                                   // pts-vs-master divergence grows by that
+                                                   // amount.  kResyncThresholdMs must be kept
+                                                   // above kOutputLatencyOffsetMs + headroom;
+                                                   // otherwise the aligned branch re-aligns on
+                                                   // every push.
     // Extra output latency (ms) beyond the QAudioSink buffer to compensate
     // for when aligning the stream start.  Qt's QAudioSink exposes NO API to
     // query real hardware/driver/Bluetooth output latency (typically
