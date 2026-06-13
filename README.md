@@ -39,9 +39,31 @@ Project layout (high level)
 - `midi/` — MIDI integration and manager
 - `settingsmanager.*`, `uimanager.*` — app settings and UI glue
 
+Development (testing, linting, CI)
+----------------------------------
+Tests are opt-in and headless. Configure with `-DOLR_BUILD_TESTS=ON`, then:
+
+```bash
+cmake -S . -B build -G Ninja -DOLR_BUILD_TESTS=ON -DCMAKE_PREFIX_PATH=~/Qt/6.10.1/macos
+cmake --build build
+ctest --test-dir build --output-on-failure   # unit + smoke + e2e
+```
+
+- **Unit** tests (Qt Test) cover the recording clock, settings persistence,
+  playback transport, and muxer.
+- A **smoke** test runs `qmllint` over the QML.
+- **E2E** tests drive the real recording engine against a synthetic FFmpeg
+  stream, including a regression for the mono-audio recording crash.
+- **Sanitizers**: add `-DOLR_SANITIZER="address;undefined"` (or `thread`).
+- **Formatting/linting**: `.clang-format`, `.editorconfig`, `.clang-tidy`.
+- **CI**: `.github/workflows/ci.yml` (build+test, lint, sanitizers). iOS is built
+  locally via a pre-push hook — enable with `git config core.hooksPath .githooks`.
+
+See [`tests/README.md`](tests/README.md) for full details.
+
 Contributing
 ------------
-Contributions, issues and feature requests are welcome. Please open issues describing the problem or enhancement and follow the repository's contribution guidelines when submitting pull requests.
+Contributions, issues and feature requests are welcome. Please open issues describing the problem or enhancement and follow the repository's contribution guidelines when submitting pull requests. Before opening a PR, run the test suite and format any changed C++ with `xcrun clang-format -i`.
 
 License
 -------

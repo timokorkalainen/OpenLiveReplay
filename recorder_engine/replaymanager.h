@@ -3,6 +3,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QTimer>
 #include "recordingclock.h"
 #include "muxer.h"
 #include "streamworker.h"
@@ -98,9 +99,21 @@ private:
     QList<StreamWorker*> m_workers;  // One per SOURCE (not per view)
     qint64 m_recordingStartEpochMs = 0;
 
+    // Final elapsed captured at stopRecording (before m_clock is deleted) so
+    // getElapsedMs() never returns -1 after stop — keeps post-stop snapshot
+    // timecodes and QML duration bindings sane.
+    int64_t m_lastKnownDurationMs = 0;
+
     // Blue frame encoder for unmapped views
     AVCodecContext* m_blueEncCtx = nullptr;
     AVFrame* m_blueFrame = nullptr;
+    // The blue frame is a static solid color, so its compressed video packet
+    // never changes.  We encode it ONCE per recording session and cache the
+    // resulting (intra, self-contained) packet here; writeBlueFrames then
+    // just clones + re-stamps it per view per pulse — no per-pulse encode on
+    // the GUI thread.  Owned by this session: built in setupBlueEncoder,
+    // freed in cleanupBlueEncoder.
+    AVPacket* m_cachedBluePkt = nullptr;
     bool setupBlueEncoder();
     void cleanupBlueEncoder();
 

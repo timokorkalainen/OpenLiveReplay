@@ -21,6 +21,9 @@ ApplicationWindow {
     property var uiManagerRef: uiManager
     property alias playbackTab: playbackTab
     property alias screenProbe: screenProbe
+    // Last recording-start failure reason, surfaced near the record button.
+    // Cleared on a successful recording start.
+    property string recordingError: ""
 
     Component.onCompleted: {
         appWindow.uiManagerRef.loadSettings()
@@ -111,6 +114,12 @@ ApplicationWindow {
         target: appWindow.uiManagerRef
         function onScreensChanged() {
             appWindow.updateMultiviewScreen()
+        }
+        function onRecordingFailed(reason) {
+            appWindow.recordingError = reason
+        }
+        function onRecordingStarted() {
+            appWindow.recordingError = ""
         }
     }
 
@@ -226,8 +235,14 @@ ApplicationWindow {
                     }
 
                     Text {
-                        text: appWindow.uiManagerRef.isRecording ? "● RECORDING LIVE" : "IDLE"
-                        color: appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666"
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        text: appWindow.recordingError !== ""
+                              ? ("⚠ " + appWindow.recordingError)
+                              : (appWindow.uiManagerRef.isRecording ? "● RECORDING LIVE" : "IDLE")
+                        color: appWindow.recordingError !== ""
+                               ? "#ffb300"
+                               : (appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666")
                     }
 
                     RowLayout {
@@ -775,7 +790,11 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     from: 0
                     to: Math.max(0, appWindow.uiManagerRef.recordedDurationMs - appWindow.uiManagerRef.liveBufferMs)
-                    value: appWindow.uiManagerRef.scrubPosition
+                    // While the user is dragging, hold the handle at their drag
+                    // position; otherwise follow the playhead. Without the
+                    // pressed guard, scrubPositionChanged (~30/s while
+                    // recording) yanks the handle back mid-drag.
+                    value: scrubBar.pressed ? scrubBar.value : appWindow.uiManagerRef.scrubPosition
 
                     onMoved: {
                         appWindow.uiManagerRef.seekPlayback(value)
@@ -1043,6 +1062,7 @@ ApplicationWindow {
                         editable: true
                         inputMethodHints: Qt.ImhDigitsOnly
                         value: appWindow.uiManagerRef.recordFps
+                        enabled: !appWindow.uiManagerRef.isRecording
                         onValueModified: appWindow.uiManagerRef.recordFps = value
                     }
 

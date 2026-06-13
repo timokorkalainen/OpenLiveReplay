@@ -118,46 +118,100 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     m_lastFlush.start();
 
     m_initialized = true;
+
+    // Start the dedicated writer thread now that the header is written and
+    // m_outCtx is fully ready. From here until close() joins it, the writer
+    // thread is the ONLY thread that touches m_outCtx (av_write_frame/flush).
+    m_writerRunning = true;
+    m_writerThread = std::thread(&Muxer::writerLoop, this);
+
     return true;
 }
 
 void Muxer::writePacket(AVPacket* pkt) {
-    QMutexLocker locker(&m_mutex);
-    if (!m_initialized || !m_outCtx) return;
+    // ENQUEUE-ONLY. Clone the caller's packet (the caller still owns theirs,
+    // exactly as before) and hand the clone to the writer thread, then return
+    // immediately. The DTS-bump, av_write_frame and avio_flush all happen on
+    // the writer thread — so a stalled disk no longer blocks the caller.
+    if (!m_writerRunning.load(std::memory_order_acquire)) return;
 
-    // Ensure monotonic DTS per stream — bump forward if needed.
-    // Dropping was too aggressive: when a source was re-mapped to a view
-    // track that had blue-frame DTS ahead of the source encoder's counter,
-    // every packet was silently lost.  Bumping preserves the data.
-    int idx = pkt->stream_index;
-    auto it = m_lastDts.constFind(idx);
-    if (it != m_lastDts.constEnd() && pkt->dts <= it.value()) {
-        pkt->dts = it.value() + 1;
-        if (pkt->pts < pkt->dts) pkt->pts = pkt->dts;
-    }
-    m_lastDts[idx] = pkt->dts;
-
-    // Use av_write_frame (non-interleaved) so that each stream writes
-    // independently. av_interleaved_write_frame buffers packets across
-    // ALL streams and won't flush stream A until stream B catches up,
-    // causing one disrupted source to freeze every other source.
     AVPacket* localPkt = av_packet_clone(pkt);
     if (!localPkt) return;
 
-    int ret = av_write_frame(m_outCtx, localPkt);
-    av_packet_free(&localPkt); // av_write_frame does NOT take ownership
-
-    if (ret < 0) {
-        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
+    std::unique_lock<std::mutex> lk(m_qMutex);
+    // Backpressure: never drop (dropping corrupts the file) and never grow
+    // unbounded. A transient stall is absorbed by the queue; a SUSTAINED
+    // disk-too-slow eventually blocks the caller here — unavoidable, the disk
+    // literally cannot keep up — but it is still strictly better than blocking
+    // on every single packet. Re-check m_writerRunning so close() can wake us.
+    m_qCv.wait(lk, [this] {
+        return m_pktQueue.size() < kMaxQueued || !m_writerRunning.load(std::memory_order_acquire);
+    });
+    if (!m_writerRunning.load(std::memory_order_acquire)) {
+        // Shutting down; do not enqueue (close() is draining/finishing).
+        av_packet_free(&localPkt);
+        return;
     }
+    m_pktQueue.push(localPkt);
+    lk.unlock();
+    m_qCv.notify_one();
+}
 
-    // Flush at most every ~100 ms: keeps the chase-play reader within a
-    // cluster of the live edge without a disk flush per packet.
-    if (!m_lastFlush.isValid() || m_lastFlush.elapsed() >= 100) {
-        avio_flush(m_outCtx->pb);
-        m_lastFlush.restart();
+void Muxer::writerLoop() {
+    for (;;) {
+        AVPacket* pkt = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(m_qMutex);
+            // Wait for work, or for shutdown. Keep draining while the queue is
+            // non-empty even after running==false, so every queued packet is
+            // written before we exit (close() relies on this for the trailer).
+            m_qCv.wait(lk, [this] {
+                return !m_pktQueue.empty() || !m_writerRunning.load(std::memory_order_acquire);
+            });
+            if (m_pktQueue.empty()) {
+                // Queue drained AND shutdown requested → done.
+                if (!m_writerRunning.load(std::memory_order_acquire)) return;
+                continue;
+            }
+            pkt = m_pktQueue.front();
+            m_pktQueue.pop();
+        }
+        // Notify a possibly back-pressured producer that there is now room.
+        m_qCv.notify_one();
+
+        // ── No q lock held below; only this thread touches m_outCtx/m_lastDts.
+
+        // Ensure monotonic DTS per stream — bump forward if needed.
+        // Dropping was too aggressive: when a source was re-mapped to a view
+        // track that had blue-frame DTS ahead of the source encoder's counter,
+        // every packet was silently lost.  Bumping preserves the data.
+        const int idx = pkt->stream_index;
+        auto it = m_lastDts.constFind(idx);
+        if (it != m_lastDts.constEnd() && pkt->dts <= it.value()) {
+            pkt->dts = it.value() + 1;
+            if (pkt->pts < pkt->dts) pkt->pts = pkt->dts;
+        }
+        m_lastDts[idx] = pkt->dts;
+
+        // Use av_write_frame (non-interleaved) so that each stream writes
+        // independently. av_interleaved_write_frame buffers packets across
+        // ALL streams and won't flush stream A until stream B catches up,
+        // causing one disrupted source to freeze every other source.
+        const int ret = av_write_frame(m_outCtx, pkt);
+        av_packet_free(&pkt); // av_write_frame does NOT take ownership
+
+        if (ret < 0) {
+            char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
+        }
+
+        // Flush at most every ~100 ms: keeps the chase-play reader within a
+        // cluster of the live edge without a disk flush per packet.
+        if (!m_lastFlush.isValid() || m_lastFlush.elapsed() >= 100) {
+            avio_flush(m_outCtx->pb);
+            m_lastFlush.restart();
+        }
     }
 }
 
@@ -199,7 +253,36 @@ AVStream* Muxer::getStream(int index) {
 
 void Muxer::close() {
     QMutexLocker locker(&m_mutex);
+
+    // Stop accepting new packets, then DRAIN: signal the writer to finish and
+    // join it. writerLoop keeps draining while the queue is non-empty even
+    // after running==false, so every queued packet is written to m_outCtx
+    // BEFORE we proceed to the trailer. Caller contract (ReplayManager):
+    // workers are stopped+joined and the heartbeat is stopped before close(),
+    // so no thread enqueues concurrently here.
+    if (m_writerRunning.exchange(false)) {
+        m_qCv.notify_all();
+        if (m_writerThread.joinable()) m_writerThread.join();
+    } else if (m_writerThread.joinable()) {
+        // init() started a thread but writerRunning was already cleared
+        // (e.g. a second close()): still join to avoid a dangling thread.
+        m_writerThread.join();
+    }
+
+    // Defensive: on a clean close the writer drains fully, so the queue is
+    // empty here. Free anything left only to guarantee no leak on an abnormal
+    // path (would have been written before the trailer otherwise).
+    {
+        std::lock_guard<std::mutex> lk(m_qMutex);
+        while (!m_pktQueue.empty()) {
+            AVPacket* p = m_pktQueue.front();
+            m_pktQueue.pop();
+            av_packet_free(&p);
+        }
+    }
+
     if (m_initialized && m_outCtx) {
+        // Writer thread has joined: this thread now solely owns m_outCtx.
         av_write_trailer(m_outCtx);
         if (!(m_outCtx->oformat->flags & AVFMT_NOFILE)) {
             avio_closep(&m_outCtx->pb);

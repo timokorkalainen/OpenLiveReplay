@@ -4,6 +4,39 @@ project(OpenLiveReplay VERSION 0.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Export compile_commands.json for clang-tidy / clangd / editors.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ---------------------------------------------------------------------------
+# Build options: testing, strict warnings, sanitizers
+# ---------------------------------------------------------------------------
+option(OLR_BUILD_TESTS "Build the OpenLiveReplay test suite" OFF)
+option(OLR_WERROR "Treat warnings as errors for first-party targets" OFF)
+set(OLR_SANITIZER "" CACHE STRING
+    "Sanitizers to enable, e.g. address, thread, undefined, or 'address;undefined'")
+
+# Warning flags applied to first-party targets only (never third-party deps
+# like rtmidi/ffmpeg). Introduced non-fatally: -Werror is opt-in via OLR_WERROR.
+add_library(olr_warnings INTERFACE)
+if(MSVC)
+    target_compile_options(olr_warnings INTERFACE /W4)
+else()
+    target_compile_options(olr_warnings INTERFACE -Wall -Wextra)
+endif()
+if(OLR_WERROR AND NOT MSVC)
+    target_compile_options(olr_warnings INTERFACE -Werror)
+endif()
+
+# Sanitizer flags (compile + link), applied only when OLR_SANITIZER is set.
+add_library(olr_sanitize INTERFACE)
+if(OLR_SANITIZER)
+    string(REPLACE ";" "," _olr_san "${OLR_SANITIZER}")
+    target_compile_options(olr_sanitize INTERFACE
+        -fsanitize=${_olr_san} -fno-omit-frame-pointer -g)
+    target_link_options(olr_sanitize INTERFACE -fsanitize=${_olr_san})
+    message(STATUS "OpenLiveReplay: sanitizer(s) enabled -> ${_olr_san}")
+endif()
+
 include(FetchContent)
 set(RTMIDI_API_COREMIDI ON CACHE BOOL "" FORCE)
 set(RTMIDI_API_ALSA OFF CACHE BOOL "" FORCE)
@@ -43,6 +76,8 @@ qt_add_qml_module(OpenLiveReplay
         playback/frameprovider.h playback/frameprovider.cpp
         playback/playbacktransport.h playback/playbacktransport.cpp
         playback/audioplayer.h playback/audioplayer.cpp
+        playback/trackbuffer.h playback/trackbuffer.cpp
+        playback/audioframequeue.h playback/audioframequeue.cpp
     RESOURCES
         qtquickcontrols2.conf
         resources.qrc
@@ -101,6 +136,8 @@ add_library(OpenLiveReplayMidi STATIC
 target_link_libraries(OpenLiveReplayMidi PRIVATE
     Qt6::Core
     rtmidi
+    olr_warnings
+    olr_sanitize
 )
 
 # ==============================================================================
@@ -313,6 +350,8 @@ target_link_libraries(OpenLiveReplay PRIVATE
     Qt6::QuickControls2
     rtmidi
     OpenLiveReplayMidi
+    olr_warnings
+    olr_sanitize
 )
 
 # 6. Bundle Properties
@@ -322,3 +361,13 @@ set_target_properties(OpenLiveReplay PROPERTIES
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
     MACOSX_BUNDLE TRUE
 )
+
+# ---------------------------------------------------------------------------
+# 7. Tests (opt-in: -DOLR_BUILD_TESTS=ON). Desktop/macOS only — the test
+#    targets link homebrew FFmpeg and run headless, so they are skipped for
+#    the iOS cross-build.
+# ---------------------------------------------------------------------------
+if(OLR_BUILD_TESTS AND NOT IOS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

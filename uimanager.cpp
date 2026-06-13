@@ -242,6 +242,30 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     refreshProviders();
 }
 
+UIManager::~UIManager() {
+    // On app quit, ~QObject deletes our child members in creation order:
+    // m_transport, m_audioPlayer, MidiManager, FrameProviders... with the
+    // PlaybackWorker destroyed LAST. Its decode thread holds RAW pointers to
+    // the transport / audio player / providers and keeps dereferencing them
+    // until its own dtor stops it — by which point those objects are already
+    // freed (use-after-free crash on quit-while-recording). Tear down in a
+    // safe order BEFORE the members destruct:
+    //   1. Stop + delete the worker (raw pointers into other members).
+    //   2. Flush the muxer by stopping any in-progress recording.
+    // PlaybackWorker::stop() is idempotent (sets m_running=false,
+    // requestInterruption, wait()), so calling it before delete is safe.
+    // Manually deleting the parented worker and nulling the pointer avoids a
+    // double-delete: QObject removes destroyed children from its child list.
+    if (m_playbackWorker) {
+        m_playbackWorker->stop();
+        delete m_playbackWorker;
+        m_playbackWorker = nullptr;
+    }
+    if (m_replayManager && m_replayManager->isRecording()) {
+        m_replayManager->stopRecording();
+    }
+}
+
 void UIManager::dispatchControlAction(int action, bool isRelease)
 {
     // Case 8 (jog) intentionally absent: jog events carry a delta and go
@@ -331,10 +355,16 @@ void UIManager::jogStep(int delta)
 
     m_transport->step(delta);
 
+    // Clamp forward jog to the live edge (never backward).
+    if (delta > 0) {
+        const int64_t liveEdge = recordedDurationMs();
+        if (m_transport->currentPos() > liveEdge) {
+            m_transport->seek(liveEdge);
+        }
+    }
+
     if (m_playbackWorker) {
-        int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
-        m_playbackWorker->seekTo(targetMs);
+        m_playbackWorker->seekTo(m_transport->currentPos());
     }
 }
 
@@ -772,20 +802,27 @@ void UIManager::setRecordHeight(int height) {
 
 void UIManager::setRecordFps(int fps) {
     if (fps <= 0) return;
+    // Changing fps mid-recording desyncs the workers (frozen at their
+    // construction-time fps) from the heartbeat: lowering freezes all output,
+    // raising corrupts the timeline. Refuse while recording; the QML SpinBox
+    // also disables, but guard the engine in case that's bypassed.
+    if (m_replayManager && m_replayManager->isRecording()) return;
     if (m_currentSettings.fps != fps) {
         m_currentSettings.fps = fps;
         m_replayManager->setFps(fps);
         if (m_transport) {
             m_transport->setFps(fps);
         }
-        if (m_playbackWorker) {
-            m_playbackWorker->setFrameBufferMax(fps);
-        }
         emit recordFpsChanged();
     }
 }
 
 void UIManager::setMultiviewCount(int count) {
+    // The muxer's stream layout is frozen at startRecording; changing the view
+    // count mid-recording flows through syncActiveStreams -> setViewCount and
+    // makes a raised count write video packets into audio/subtitle tracks.
+    // The QML SpinBox already disables while recording — guard the engine too.
+    if (m_replayManager && m_replayManager->isRecording()) return;
     const int clamped = qBound(1, count, 16);
     if (m_currentSettings.multiviewCount != clamped) {
         m_currentSettings.multiviewCount = clamped;
@@ -904,9 +941,16 @@ void UIManager::stepFrame() {
     m_transport->setPlaying(false);
     cancelFollowLive();
 
+    // Clamp the upper bound to the live edge: the transport only clamps >= 0,
+    // so stepping forward past the last recorded frame would walk the hidden
+    // position arbitrarily far ahead (controls look dead, audio goes silent).
+    const int64_t liveEdge = recordedDurationMs();
+    if (m_transport->currentPos() > liveEdge) {
+        m_transport->seek(liveEdge);
+    }
+
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
         m_playbackWorker->seekTo(targetMs);
     }
 }
@@ -919,7 +963,6 @@ void UIManager::stepFrameBack() {
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->deliverBufferedFrameAtOrBefore(targetMs);
         m_playbackWorker->seekTo(targetMs);
     }
 }
@@ -973,9 +1016,18 @@ void UIManager::refreshMidiPorts() {
 }
 
 void UIManager::startRecording() {
+    // Distinguish the cheap "no sources" cause up front so the surfaced
+    // message is actionable; otherwise it's a muxer/encoder init failure.
+    const bool hadSources = !m_replayManager->getSourceUrls().isEmpty();
+
     m_replayManager->startRecording();
     if (!m_replayManager->isRecording()) {
-        qWarning() << "UIManager: recording failed to start; not launching playback";
+        const QString reason =
+            hadSources
+                ? QStringLiteral("Failed to start recording (could not initialize output file)")
+                : QStringLiteral("Failed to start recording (no input sources configured)");
+        qWarning() << "UIManager:" << reason << "; not launching playback";
+        emit recordingFailed(reason);
         return;
     }
     setFollowLive(true);
@@ -987,7 +1039,6 @@ void UIManager::startRecording() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
-    m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
 
     // 2. Point it to the file being recorded
     //QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
@@ -1010,7 +1061,6 @@ void UIManager::restartPlaybackWorker() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
-    m_playbackWorker->setFrameBufferMax(m_currentSettings.fps);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
     m_transport->seek(0);
@@ -1037,6 +1087,9 @@ void UIManager::seekPlayback(int64_t ms) {
         // Manual seek disables live-follow; user can re-enable via "Live"
         setFollowLive(false);
     }
+    // Route the scrub through the scheduler so it classifies the seek
+    // (reuse fast-path vs. full reposition) instead of showing a stale frame.
+    if (m_playbackWorker) m_playbackWorker->seekTo(ms);
     if (m_audioPlayer) m_audioPlayer->clear();
 }
 
@@ -1400,6 +1453,9 @@ void UIManager::scrubToLive() {
     const int64_t liveEdge = recordedDurationMs();
     const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
     m_transport->seek(target);
+    // Route the jump-to-live-edge through the scheduler too, or the worker
+    // sees a position discontinuity with no seek and tail-holds a stale frame.
+    if (m_playbackWorker) m_playbackWorker->seekTo(target);
 }
 
 static QString sanitizeFileToken(const QString& input) {
@@ -1570,6 +1626,9 @@ void UIManager::onRecorderPulse(int64_t frameIndex, int64_t elapsedMs) {
         const int64_t current = m_transport->currentPos();
         if (qAbs(current - target) > 50) {
             m_transport->seek(target);
+            // Classify the yank via the scheduler: small in-window corrections
+            // hit the 0-seek reuse path; only a real jump repositions.
+            if (m_playbackWorker) m_playbackWorker->seekTo(target);
         }
     }
 }

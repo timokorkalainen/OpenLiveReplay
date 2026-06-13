@@ -250,6 +250,7 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
 
 void AudioPlayer::clear() {
     QMutexLocker locker(&m_mutex);
+    ++m_clearCount;
     if (m_ringBuffer) {
         m_ringBuffer->fadeOutAndClear(m_channels);
     }

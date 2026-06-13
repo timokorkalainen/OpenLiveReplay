@@ -1,0 +1,192 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  QT_VERSION: 6.10.1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build the macOS app + test suite and run CTest. This is the primary gate.
+  # ---------------------------------------------------------------------------
+  build-test-macos:
+    name: Build + Test (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # clang-tidy diff needs history
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia
+          cache: true
+
+      - name: Install build deps
+        run: brew install ninja ffmpeg
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOLR_BUILD_TESTS=ON
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build (app + tests)
+        run: cmake --build build
+
+      - name: Run tests
+        working-directory: build
+        run: ctest --output-on-failure --repeat until-pass:2
+
+      # clang-tidy is advisory: it reports on changed first-party files using the
+      # generated compile_commands.json but never fails the build (yet).
+      - name: clang-tidy (advisory, changed files)
+        continue-on-error: true
+        run: |
+          brew install llvm
+          TIDY="$(brew --prefix llvm)/bin/clang-tidy"
+          SDK="$(xcrun --show-sdk-path)"
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          # All-zeros SHA (new branch) or an unreachable base -> diff vs parent.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          files=$(git diff --name-only "$base" HEAD -- \
+                    'recorder_engine/*.cpp' 'playback/*.cpp' \
+                    'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)
+          if [ -z "$files" ]; then echo "No first-party C++ changes."; exit 0; fi
+          echo "$files"
+          "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" $files
+
+  # ---------------------------------------------------------------------------
+  # Lightweight static checks: formatting + QML. No full configure needed.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (format + QML)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Qt (for qmllint)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia   # Main.qml imports QtMultimedia (VideoOutput)
+          cache: true
+
+      - name: clang-format (changed lines)
+        run: |
+          # Homebrew LLVM clang-format (Xcode does not reliably ship clang-format);
+          # committed sources are formatted with the same tool. Only the lines
+          # changed in this PR are checked (git-clang-format), so pre-existing
+          # formatting in a touched file is not retroactively enforced.
+          brew install llvm
+          PREFIX="$(brew --prefix llvm)"
+          CF="$PREFIX/bin/clang-format"
+          GCF="$PREFIX/bin/git-clang-format"
+          "$CF" --version
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          diff="$("$GCF" --binary "$CF" --commit "$base" --diff --extensions cpp,h,hpp,mm,c || true)"
+          case "$diff" in
+            "no modified files to format"|"clang-format did not modify any files"|"")
+              echo "clang-format: changed lines OK" ;;
+            *)
+              echo "$diff"
+              echo "::error::clang-format violations in changed lines (run: git clang-format $base)"
+              exit 1 ;;
+          esac
+
+      - name: qmllint
+        run: |
+          "$QT_ROOT_DIR/bin/qmllint" -I "$QT_ROOT_DIR/qml" Main.qml MultiviewWindow.qml
+
+  # ---------------------------------------------------------------------------
+  # Sanitizers over the test suite (incl. the threaded recording pipeline).
+  # ASan+UBSan gates; ThreadSanitizer is advisory while it is being tuned
+  # against FFmpeg's internal threads.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: Sanitizers
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: "address;undefined"
+            label: asan-ubsan
+            advisory: false
+          - sanitizer: "thread"
+            label: tsan
+            advisory: true
+    continue-on-error: ${{ matrix.advisory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia
+          cache: true
+
+      - name: Install build deps
+        run: brew install ninja ffmpeg
+
+      - name: Configure (${{ matrix.label }})
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOLR_BUILD_TESTS=ON
+          -DOLR_SANITIZER="${{ matrix.sanitizer }}"
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build tests
+        run: cmake --build build --target tst_recordingclock tst_settingsmanager tst_playbacktransport tst_muxer tst_trackbuffer tst_audioframequeue record_harness play_harness
+
+      - name: Run tests under sanitizer
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        # Unit tests + e2e_record + the playback storm gate (e2e_play_storm)
+        # run under the sanitizers; the 6 heavier playback scenarios are
+        # excluded here to bound CI time — they run un-sanitized in Build+Test,
+        # and the storm gate already exercises the scheduler/worker concurrency.
+        run: ctest --output-on-failure --repeat until-pass:2 -E 'e2e_play_(seekplay|stepscrub|reverse|sliderscrub|liveedge|4view)'
+
+# iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
+# (~20 min) OOM-kills hosted runners. It is validated locally instead via the
+# .githooks/pre-push hook. See tests/README.md.
