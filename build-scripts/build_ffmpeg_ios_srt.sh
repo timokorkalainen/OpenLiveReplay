@@ -11,6 +11,17 @@ OPENSSL_VERSION="3.2.0"
 # Directories (anchor to repository root, not current working dir)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Skip the ~20 minute rebuild when the artifacts already exist — matches the
+# CMake custom command's only-when-missing semantics, and lets prebuilt
+# xcframeworks be staged into ios_build/xcframeworks/ (e.g. from another
+# checkout) without triggering a full rebuild.
+if [ -d "$ROOT_DIR/ios_build/xcframeworks/libavcodec.xcframework" ] && \
+   [ -d "$ROOT_DIR/ios_build/xcframeworks/libsrt.xcframework" ]; then
+    echo "[FFmpeg] Prebuilt xcframeworks already present; skipping rebuild."
+    exit 0
+fi
+
 WORK_DIR="$ROOT_DIR/ios_build"
 SRC_DIR="$WORK_DIR/src"
 DIST_DIR="$WORK_DIR/dist"

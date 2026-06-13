@@ -435,6 +435,90 @@ ApplicationWindow {
                             }
                         }
                     }
+
+                    Frame {
+                        id: streamDeckCard
+                        Layout.fillWidth: true
+                        property bool expanded: false
+                        visible: appWindow.uiManagerRef.streamDeck.supported
+
+                        background: Rectangle {
+                            color: "#1b1b1b"
+                            radius: 6
+                            border.color: "#333"
+                            border.width: 1
+                        }
+
+                        contentItem: ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 8
+
+                                Text {
+                                    text: "Stream Deck"
+                                    color: "#eeeeee"
+                                    font.bold: true
+                                    Layout.alignment: Qt.AlignVCenter
+                                }
+
+                                Item { Layout.fillWidth: true }
+
+                                Text {
+                                    text: appWindow.uiManagerRef.streamDeck.connected
+                                          ? appWindow.uiManagerRef.streamDeck.deviceName
+                                          : "Disconnected"
+                                    color: appWindow.uiManagerRef.streamDeck.connected ? "#4CAF50" : "#777"
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+
+                                ToolButton {
+                                    text: streamDeckCard.expanded ? "▾" : "▸"
+                                    onClicked: streamDeckCard.expanded = !streamDeckCard.expanded
+                                }
+                            }
+
+                            ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 12
+                                visible: streamDeckCard.expanded
+
+                                GroupBox {
+                                    title: "Stream Deck"
+                                    Layout.fillWidth: true
+
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+
+                                        Text {
+                                            text: appWindow.uiManagerRef.streamDeck.connected
+                                                  ? "Connected: " + appWindow.uiManagerRef.streamDeck.deviceName
+                                                    + " (" + appWindow.uiManagerRef.streamDeck.deviceModel + ")"
+                                                  : "No Stream Deck connected"
+                                            color: appWindow.uiManagerRef.streamDeck.connected ? "#4CAF50" : "#aaa"
+                                        }
+
+                                        Text {
+                                            visible: !appWindow.uiManagerRef.streamDeck.driverAppInstalled
+                                            text: "Install “Elgato Stream Deck Connect” from the App Store and enable the Stream Deck Device Driver in the iPadOS Settings app, then connect the deck via USB-C."
+                                            color: "#ff9800"
+                                            wrapMode: Text.WordWrap
+                                            Layout.fillWidth: true
+                                        }
+
+                                        Button {
+                                            visible: appWindow.uiManagerRef.streamDeck.simulatorAvailable
+                                            text: "Show Stream Deck Simulator"
+                                            onClicked: appWindow.uiManagerRef.streamDeck.showSimulator()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
