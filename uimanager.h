@@ -55,6 +55,7 @@ class UIManager : public QObject {
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
+    ~UIManager() override;
 
     // Getters for QML
     QStringList streamUrls() const;
@@ -164,6 +165,7 @@ signals:
     void playbackProvidersChanged();
     void recordingStarted();
     void recordingStopped();
+    void recordingFailed(const QString& reason);
     void recordedDurationMsChanged();
     void scrubPositionChanged();
     void recordingStartEpochMsChanged();

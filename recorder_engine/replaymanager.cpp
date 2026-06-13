@@ -101,13 +101,9 @@ void ReplayManager::cleanupBlueEncoder() {
 void ReplayManager::startRecording() {
     if (m_isRecording || m_sourceUrls.isEmpty()) return;
 
-    // 1. Setup the session clock
-    if (m_clock) delete m_clock;
-    m_clock = new RecordingClock();
-    m_clock->start();
-    m_recordingStartEpochMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
-
-    // 2. Initialize Muxer with M view-tracks (not N source-tracks)
+    // 1. Initialize Muxer with M view-tracks (not N source-tracks).
+    //    Do this BEFORE starting the clock / stamping the epoch: a failure
+    //    here must not leave a phantom advancing clock behind for the idle UI.
     const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     m_sessionFileName = m_baseFileName + "_" + timestamp;
     // Recordings go to the user-configured location (empty = default)
@@ -117,13 +113,20 @@ void ReplayManager::startRecording() {
         return;
     }
 
-    // 3. Setup the blue-frame encoder for unmapped views
+    // 2. Setup the blue-frame encoder for unmapped views
     cleanupBlueEncoder();
     if (!setupBlueEncoder()) {
         qDebug() << "ReplayManager: Failed to init blue frame encoder.";
         m_muxer->close();
         return;
     }
+
+    // 3. Setup the session clock — only now that init + encoder have succeeded,
+    //    so a failure above never leaves a running clock / stamped epoch.
+    if (m_clock) delete m_clock;
+    m_clock = new RecordingClock();
+    m_clock->start();
+    m_recordingStartEpochMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
 
     // 4. Launch one StreamWorker PER SOURCE (not per view).
     //    Workers capture from their URL and encode into whichever view-track
@@ -189,6 +192,9 @@ void ReplayManager::stopRecording() {
     m_recordingStartEpochMs = 0;
 
     if (m_clock) {
+        // Capture the final duration before deleting the clock so callers
+        // (recordedDurationMs / scrubPosition) keep getting a valid value.
+        m_lastKnownDurationMs = qMax<int64_t>(0, m_clock->elapsedMs());
         delete m_clock;
         m_clock = nullptr;
     }
@@ -391,8 +397,11 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
 
 // ─── Utility ───────────────────────────────────────────────────────────
 int64_t ReplayManager::getElapsedMs() {
-    if(!m_clock) return -1;
-    return m_clock->elapsedMs();
+    // While recording the live clock is authoritative; after stop it is gone,
+    // so fall back to the duration captured at stopRecording. Never return -1
+    // (that produced garbage snapshot timecodes / QML binding values).
+    if (m_clock) return qMax<int64_t>(0, m_clock->elapsedMs());
+    return m_lastKnownDurationMs;
 }
 
 QString ReplayManager::getVideoPath() {

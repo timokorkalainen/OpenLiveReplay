@@ -99,6 +99,11 @@ private:
     QList<StreamWorker*> m_workers;  // One per SOURCE (not per view)
     qint64 m_recordingStartEpochMs = 0;
 
+    // Final elapsed captured at stopRecording (before m_clock is deleted) so
+    // getElapsedMs() never returns -1 after stop — keeps post-stop snapshot
+    // timecodes and QML duration bindings sane.
+    int64_t m_lastKnownDurationMs = 0;
+
     // Blue frame encoder for unmapped views
     AVCodecContext* m_blueEncCtx = nullptr;
     AVFrame* m_blueFrame = nullptr;

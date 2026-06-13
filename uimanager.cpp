@@ -204,6 +204,14 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
 
             m_transport->step(deltaSign);
 
+            // Clamp forward jog to the live edge (never backward).
+            if (deltaSign > 0) {
+                const int64_t liveEdge = recordedDurationMs();
+                if (m_transport->currentPos() > liveEdge) {
+                    m_transport->seek(liveEdge);
+                }
+            }
+
             if (m_playbackWorker) {
                 int64_t targetMs = m_transport->currentPos();
                 m_playbackWorker->seekTo(targetMs);
@@ -264,6 +272,30 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     }
     refreshScreens();
     refreshProviders();
+}
+
+UIManager::~UIManager() {
+    // On app quit, ~QObject deletes our child members in creation order:
+    // m_transport, m_audioPlayer, MidiManager, FrameProviders... with the
+    // PlaybackWorker destroyed LAST. Its decode thread holds RAW pointers to
+    // the transport / audio player / providers and keeps dereferencing them
+    // until its own dtor stops it — by which point those objects are already
+    // freed (use-after-free crash on quit-while-recording). Tear down in a
+    // safe order BEFORE the members destruct:
+    //   1. Stop + delete the worker (raw pointers into other members).
+    //   2. Flush the muxer by stopping any in-progress recording.
+    // PlaybackWorker::stop() is idempotent (sets m_running=false,
+    // requestInterruption, wait()), so calling it before delete is safe.
+    // Manually deleting the parented worker and nulling the pointer avoids a
+    // double-delete: QObject removes destroyed children from its child list.
+    if (m_playbackWorker) {
+        m_playbackWorker->stop();
+        delete m_playbackWorker;
+        m_playbackWorker = nullptr;
+    }
+    if (m_replayManager && m_replayManager->isRecording()) {
+        m_replayManager->stopRecording();
+    }
 }
 
 static int nextSourceIdSeed(const QList<SourceSettings> &sources) {
@@ -693,6 +725,11 @@ void UIManager::setRecordHeight(int height) {
 
 void UIManager::setRecordFps(int fps) {
     if (fps <= 0) return;
+    // Changing fps mid-recording desyncs the workers (frozen at their
+    // construction-time fps) from the heartbeat: lowering freezes all output,
+    // raising corrupts the timeline. Refuse while recording; the QML SpinBox
+    // also disables, but guard the engine in case that's bypassed.
+    if (m_replayManager && m_replayManager->isRecording()) return;
     if (m_currentSettings.fps != fps) {
         m_currentSettings.fps = fps;
         m_replayManager->setFps(fps);
@@ -704,6 +741,11 @@ void UIManager::setRecordFps(int fps) {
 }
 
 void UIManager::setMultiviewCount(int count) {
+    // The muxer's stream layout is frozen at startRecording; changing the view
+    // count mid-recording flows through syncActiveStreams -> setViewCount and
+    // makes a raised count write video packets into audio/subtitle tracks.
+    // The QML SpinBox already disables while recording — guard the engine too.
+    if (m_replayManager && m_replayManager->isRecording()) return;
     const int clamped = qBound(1, count, 16);
     if (m_currentSettings.multiviewCount != clamped) {
         m_currentSettings.multiviewCount = clamped;
@@ -822,6 +864,14 @@ void UIManager::stepFrame() {
     m_transport->setPlaying(false);
     cancelFollowLive();
 
+    // Clamp the upper bound to the live edge: the transport only clamps >= 0,
+    // so stepping forward past the last recorded frame would walk the hidden
+    // position arbitrarily far ahead (controls look dead, audio goes silent).
+    const int64_t liveEdge = recordedDurationMs();
+    if (m_transport->currentPos() > liveEdge) {
+        m_transport->seek(liveEdge);
+    }
+
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
         m_playbackWorker->seekTo(targetMs);
@@ -889,9 +939,18 @@ void UIManager::refreshMidiPorts() {
 }
 
 void UIManager::startRecording() {
+    // Distinguish the cheap "no sources" cause up front so the surfaced
+    // message is actionable; otherwise it's a muxer/encoder init failure.
+    const bool hadSources = !m_replayManager->getSourceUrls().isEmpty();
+
     m_replayManager->startRecording();
     if (!m_replayManager->isRecording()) {
-        qWarning() << "UIManager: recording failed to start; not launching playback";
+        const QString reason =
+            hadSources
+                ? QStringLiteral("Failed to start recording (could not initialize output file)")
+                : QStringLiteral("Failed to start recording (no input sources configured)");
+        qWarning() << "UIManager:" << reason << "; not launching playback";
+        emit recordingFailed(reason);
         return;
     }
     m_followLive = true;
