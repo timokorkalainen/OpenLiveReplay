@@ -3,6 +3,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QTimer>
 #include "recordingclock.h"
 #include "muxer.h"
 #include "streamworker.h"

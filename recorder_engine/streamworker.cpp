@@ -48,17 +48,28 @@ void StreamWorker::run() {
     exec();
 
     // exec() has returned, so no further queued pulse can run on this
-    // thread.  Re-assert shutdown before joining the capture future: a
+    // thread.  Re-assert shutdown before joining the capture thread: a
     // pulse delivered between stop() and quit() taking effect could have
-    // relaunched captureLoop after stop() cleared the flags, which would
-    // otherwise leave waitForFinished() stuck forever.
+    // started captureLoop after stop() cleared the flags, which would
+    // otherwise leave join() stuck forever.
     m_restartCapture = 1;
     m_captureRunning = false;
-    m_captureFuture.waitForFinished();
+    // The capture thread is started and joined on this (the worker) thread
+    // only, so there is no cross-thread race on m_captureThread itself.
+    if (m_captureThread.joinable()) m_captureThread.join();
 
     // Cleanup when exec() returns (on stop)
     avcodec_free_context(&m_persistentEncCtx);
     av_frame_free(&m_latestFrame);
+
+    // Free the scaler cached across the capture lifetime (Bug 2: this was
+    // never freed, leaking one SwsContext per record/stop cycle per source).
+    // Safe here: the capture thread has been joined, so nothing touches
+    // m_swsCtx after this point.
+    if (m_swsCtx) {
+        sws_freeContext(m_swsCtx);
+        m_swsCtx = nullptr;
+    }
 
     while(!m_frameQueue.isEmpty()){
         auto qf = m_frameQueue.dequeue();
@@ -85,14 +96,17 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
         m_restartCapture = 1;
     }
 
-    // Launch captureLoop only if it truly isn't running.
-    // Never kill a running captureLoop from here — it handles restarts itself.
-    if (!m_captureRunning && !m_captureFuture.isRunning()) {
+    // Start the dedicated capture thread exactly once, on the first pulse.
+    // captureLoop() loops internally on reconnect/URL-change (m_restartCapture)
+    // and only returns when m_captureRunning goes false, so it never needs
+    // re-launching.  We start it on its own std::thread (not the shared
+    // global pool) so N infinite captureLoops can't saturate that pool.
+    // Both start (here) and join (in run() post-exec) happen on the worker
+    // thread, so m_captureThread is never touched cross-thread.
+    if (!m_captureThread.joinable()) {
         m_restartCapture = 0;
         m_captureRunning = true;
-        m_captureFuture = QtConcurrent::run([this]() {
-            this->captureLoop();
-        });
+        m_captureThread = std::thread([this]() { this->captureLoop(); });
     }
 
     processEncoderTick(m_persistentEncCtx, streamTimeMs);
@@ -135,7 +149,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     if (paintBlue && m_latestFrame && m_latestFrame->data[0]) {
         memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
-        memset(m_latestFrame->data[1], 255, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
+        memset(m_latestFrame->data[1], 240,
+               m_latestFrame->linesize[1] *
+                   (m_latestFrame->height / 2)); // Cb: 240 = legal max chroma (255 is out-of-range)
         memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
     }
     if (pulled) {
@@ -222,6 +238,9 @@ void StreamWorker::captureLoop() {
         }
         m_connected = true;
         m_connectBackoffMs = 1000;
+        // A real source connected: stragglers from any previously-cleared
+        // source are gone, so resume enqueuing frames for this new URL.
+        m_suppressEnqueue.store(false, std::memory_order_relaxed);
 
         if (!m_sharedClock) {
             qDebug() << "Source" << m_sourceIndex << "No shared clock. Restarting...";
@@ -247,6 +266,53 @@ void StreamWorker::captureLoop() {
         int audioStreamIdx = -1;
         AVCodecContext* audioDecCtx = nullptr;
         SwrContext* swrCtx = nullptr;
+
+        // Fix 4: the input audio config can change mid-stream (5.1->stereo at
+        // ad breaks, stereo->mono, sample-rate change).  swrCtx is configured
+        // once, so a stale resampler then reads a non-existent extended_data
+        // plane on a layout shrink (segfault) or resamples at the wrong ratio
+        // on a rate change (wrong pitch + FIFO drift).  We remember the input
+        // params swrCtx was built with and, before each frame, rebuild swr if
+        // the live frame's params differ.  The OUTPUT stays invariant (48 kHz
+        // stereo S16).
+        int swrInRate = 0;
+        AVSampleFormat swrInFmt = AV_SAMPLE_FMT_NONE;
+        AVChannelLayout swrInLayout;
+        memset(&swrInLayout, 0, sizeof(swrInLayout));
+
+        // Build (or rebuild) swrCtx for the given input params.  Frees any
+        // existing context first, records the configured input params on
+        // success, and leaves swrCtx == nullptr on failure (caller skips the
+        // frame rather than crashing).  Output is always 48 kHz stereo S16.
+        auto configureSwr = [&](int inRate, AVSampleFormat inFmt,
+                                const AVChannelLayout* inLayout) -> bool {
+            if (swrCtx) swr_free(&swrCtx);
+            av_channel_layout_uninit(&swrInLayout);
+
+            // Always output stereo.  swresample's standard rematrixing handles
+            // the channel conversion: mono is duplicated into L/R,
+            // multichannel is downmixed.  (A manual swr_set_channel_mapping
+            // with 2 entries for a 1-channel input layout corrupts the
+            // resampler state and crashes with SIGBUS inside swr_convert.)
+            AVChannelLayout outLayout;
+            av_channel_layout_default(&outLayout, 2);
+
+            int ret = swr_alloc_set_opts2(&swrCtx, &outLayout, AV_SAMPLE_FMT_S16, 48000, inLayout,
+                                          inFmt, inRate, 0, nullptr);
+            av_channel_layout_uninit(&outLayout);
+            if (ret < 0 || swr_init(swrCtx) < 0) {
+                if (swrCtx) swr_free(&swrCtx);
+                swrCtx = nullptr;
+                qDebug() << "Source" << m_sourceIndex << "Failed to init audio resampler";
+                return false;
+            }
+            swrInRate = inRate;
+            swrInFmt = inFmt;
+            av_channel_layout_copy(&swrInLayout, inLayout);
+            qDebug() << "Source" << m_sourceIndex << "Audio: rate=" << inRate
+                     << "ch=" << inLayout->nb_channels << "→ 48000 Hz stereo";
+            return true;
+        };
         {
             const AVCodec* audioDecoder = nullptr;
             int foundAudioIdx = av_find_best_stream(inCtx, AVMEDIA_TYPE_AUDIO, -1, -1, &audioDecoder, 0);
@@ -255,39 +321,38 @@ void StreamWorker::captureLoop() {
                 avcodec_parameters_to_context(audioDecCtx, inCtx->streams[foundAudioIdx]->codecpar);
                 if (avcodec_open2(audioDecCtx, audioDecoder, nullptr) >= 0) {
                     audioStreamIdx = foundAudioIdx;
-
-                    // Always output stereo.  swresample's standard
-                    // rematrixing handles the channel conversion: mono is
-                    // duplicated into L/R, multichannel is downmixed.
-                    // (A manual swr_set_channel_mapping with 2 entries for
-                    // a 1-channel input layout corrupts the resampler state
-                    // and crashes with SIGBUS inside swr_convert.)
-                    AVChannelLayout outLayout;
-                    av_channel_layout_default(&outLayout, 2);
-
-                    int ret = swr_alloc_set_opts2(&swrCtx,
-                        &outLayout, AV_SAMPLE_FMT_S16, 48000,
-                        &audioDecCtx->ch_layout, audioDecCtx->sample_fmt, audioDecCtx->sample_rate,
-                        0, nullptr);
-                    av_channel_layout_uninit(&outLayout);
-                    if (ret < 0 || swr_init(swrCtx) < 0) {
-                        if (swrCtx) swr_free(&swrCtx);
-                        swrCtx = nullptr;
-                        qDebug() << "Source" << m_sourceIndex << "Failed to init audio resampler";
-                    } else {
-                        qDebug() << "Source" << m_sourceIndex << "Audio: rate=" << audioDecCtx->sample_rate
-                                 << "ch=" << audioDecCtx->ch_layout.nb_channels << "→ 48000 Hz stereo";
-                    }
+                    configureSwr(audioDecCtx->sample_rate, audioDecCtx->sample_fmt,
+                                 &audioDecCtx->ch_layout);
                 } else {
                     avcodec_free_context(&audioDecCtx);
                     audioDecCtx = nullptr;
                 }
             }
         }
-        int64_t containerStartMs = -1; // ms offset of the first video DTS
-
         int64_t anchorStreamTimeMs = -1;
-        int64_t firstPacketDts = -1;
+        // Fix 3: use AV_NOPTS_VALUE (INT64_MIN) as the unset sentinel, not
+        // -1.  A stream whose first video packet legitimately has dts == -1
+        // (negative start offset / encoder priming) would keep matching a
+        // -1 sentinel and re-anchor on every packet until a non--1 DTS
+        // arrives, glitching session start.  -1 is a valid DTS; INT64_MIN
+        // is not, and it matches the missing-timestamp checks used elsewhere.
+        int64_t firstPacketDts = AV_NOPTS_VALUE;
+        // Fix 2: DTS of the previous video packet (in this stream's own
+        // time_base), used to detect mid-stream discontinuities.
+        int64_t prevPktDts = AV_NOPTS_VALUE;
+
+        // Audio gets its OWN anchor + discontinuity detection, independent of
+        // video.  Sources where audio and video carry independent timestamp
+        // domains (RTMP), or where only one of the two has a discontinuity,
+        // must not let a video-side re-anchor shift the audio mapping (and
+        // vice versa).  These mirror the video anchor locals but live entirely
+        // on the audio stream's own presentation timestamps / time_base.  On a
+        // clean MPEG-TS stream where A/V share the clock, both anchors sample
+        // m_sharedClock->elapsedMs() at ~the same first-packet moment, so the
+        // alignment is identical to the old containerStartMs-based mapping.
+        int64_t firstAudioDts = AV_NOPTS_VALUE;
+        int64_t audioAnchorStreamTimeMs = -1;
+        int64_t prevAudioDts = AV_NOPTS_VALUE;
 
         m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
         m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
@@ -305,39 +370,120 @@ void StreamWorker::captureLoop() {
                         continue;
                     }
 
-                    // 1. Establish the Anchor on the very first packet of this URL session
-                    if (firstPacketDts == -1) {
+                    const AVRational videoTb = inCtx->streams[videoStreamIdx]->time_base;
+
+                    // 1. Establish (or re-establish) the Anchor.
+                    //
+                    // Fix 2 — discontinuity / wrap re-anchor.  The anchor is
+                    // otherwise set ONCE per connection.  A mid-stream MPEG-TS
+                    // discontinuity, upstream encoder restart, RTMP timestamp
+                    // reset, or 33-bit PCR wrap makes pktDts jump by a large
+                    // amount.  A forward jump would push sourcePts far into the
+                    // future (never passes the tick gate -> video frozen on the
+                    // last pre-jump frame); a backward jump (wrap) would map
+                    // audio hours behind the cursor -> permanent silence.  The
+                    // stall detector never fires because packets keep arriving.
+                    //
+                    // We detect a jump by comparing this packet's DTS to the
+                    // previous one, in real-time milliseconds.  Normal
+                    // inter-packet deltas are a frame duration (tens of ms); a
+                    // real discontinuity is seconds.  Threshold: a forward jump
+                    // > 3000 ms, OR any backward step beyond a small tolerance
+                    // (-200 ms; allows benign B-frame/PTS reordering jitter but
+                    // catches a wrap).  On a jump we re-anchor exactly like the
+                    // initial anchor: firstPacketDts from THIS packet,
+                    // anchorStreamTimeMs = now.  The audio path keeps its OWN
+                    // anchor (firstAudioDts / audioAnchorStreamTimeMs), so a
+                    // video-only discontinuity here never corrupts audio.
+                    bool needAnchor = (firstPacketDts == AV_NOPTS_VALUE);
+                    if (!needAnchor && prevPktDts != AV_NOPTS_VALUE) {
+                        const int64_t deltaMs =
+                            av_rescale_q(pktDts - prevPktDts, videoTb, {1, 1000});
+                        constexpr int64_t kForwardJumpMs = 3000;
+                        constexpr int64_t kBackwardTolMs = -200;
+                        if (deltaMs > kForwardJumpMs || deltaMs < kBackwardTolMs) {
+                            qDebug() << "Source" << m_sourceIndex << "DTS discontinuity ("
+                                     << deltaMs << "ms jump). Re-anchoring.";
+                            needAnchor = true;
+                        }
+                    }
+                    if (needAnchor) {
                         firstPacketDts = pktDts;
                         // Where are we in the global recording right now?
                         anchorStreamTimeMs = m_sharedClock->elapsedMs();
-                        containerStartMs = av_rescale_q(pktDts,
-                            inCtx->streams[videoStreamIdx]->time_base, {1, 1000});
                     }
+                    prevPktDts = pktDts;
 
                     if (avcodec_send_packet(decCtx, pkt) >= 0) {
                         while (avcodec_receive_frame(decCtx, rawFrame) >= 0) {
 
+                            // Bug 4: a restart/blue-paint is pending (source
+                            // was cleared to an empty URL).  Drop frames from
+                            // the old source so a late straggler can't
+                            // overwrite the painted blue frame.  Still unref
+                            // rawFrame so the decoder can reuse the buffer.
+                            if (m_suppressEnqueue.load(std::memory_order_relaxed)) {
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
+
                             // 2. Prepare the container for the scaled frame
                             QueuedFrame qf;
                             qf.frame = av_frame_alloc();
+                            // Bug 3: av_frame_alloc can fail under memory
+                            // pressure.  Skip this frame rather than deref NULL.
+                            if (!qf.frame) {
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
                             qf.frame->format = AV_PIX_FMT_YUV420P;
                             qf.frame->width = m_targetWidth;
                             qf.frame->height = m_targetHeight;
-                            av_frame_get_buffer(qf.frame, 0);
+                            // Bug 3: a failed buffer alloc leaves a data-less
+                            // frame; never enqueue that.  Free and skip.
+                            if (av_frame_get_buffer(qf.frame, 0) < 0) {
+                                av_frame_free(&qf.frame);
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
 
                             // 3. Scale
                             m_swsCtx = sws_getCachedContext(m_swsCtx,
                                                             rawFrame->width, rawFrame->height, (AVPixelFormat)rawFrame->format,
                                                             m_targetWidth, m_targetHeight, AV_PIX_FMT_YUV420P,
                                                             SWS_BICUBIC, nullptr, nullptr, nullptr);
+                            // Bug 3: getCachedContext returns NULL on an
+                            // unsupported pixfmt/params.  Don't sws_scale a
+                            // NULL context — free the frame and skip.
+                            if (!m_swsCtx) {
+                                av_frame_free(&qf.frame);
+                                av_frame_unref(rawFrame);
+                                continue;
+                            }
 
                             sws_scale(m_swsCtx, rawFrame->data, rawFrame->linesize, 0, rawFrame->height,
                                       qf.frame->data, qf.frame->linesize);
 
-                            // 2. Calculate the RELATIVE offset of this packet in its own stream
-                            int64_t relativeMs = av_rescale_q(pktDts - firstPacketDts,
-                                                              inCtx->streams[videoStreamIdx]->time_base,
-                                                              {1, 1000});
+                            // 2. Calculate the RELATIVE offset of THIS decoded
+                            // frame in its own stream.
+                            //
+                            // Bug 3: every frame drained from this one
+                            // avcodec_receive_frame loop must be stamped from
+                            // ITS OWN display timestamp, not the shared outer
+                            // pktDts.  On B-frame sources (common H.264) one
+                            // packet yields several frames in display order;
+                            // stamping them all from pktDts gives identical
+                            // sourcePts, and the pre-drain keeps only one of
+                            // each duplicate -> dropped frames / choppy video.
+                            // best_effort_timestamp is the frame's display PTS
+                            // in the video stream's time_base (fall back to
+                            // pktDts when absent).  Discontinuity detection and
+                            // the anchor stay on pktDts above (packet-level is
+                            // fine for that); only this per-frame STAMP changes.
+                            int64_t frameTs = rawFrame->best_effort_timestamp;
+                            if (frameTs == AV_NOPTS_VALUE) frameTs = pktDts;
+                            int64_t relativeMs =
+                                av_rescale_q(frameTs - firstPacketDts, videoTb, {1, 1000});
 
                             // 3. Map it to the Global Timeline
                             // If a burst of 10 frames arrives, relativeMs increases by 33ms each,
@@ -377,28 +523,123 @@ void StreamWorker::captureLoop() {
                     }
                 }
                 // ── Audio packet handling ───────────────────────────────
-                else if (pkt->stream_index == audioStreamIdx && swrCtx && audioDecCtx
-                         && anchorStreamTimeMs >= 0) {
+                // Bug 1: the outer gate must NOT require swrCtx to be non-null.
+                // swrCtx can be null because the INITIAL configureSwr failed
+                // (e.g. sample_rate == 0 at codec-open for some parsers) or a
+                // mid-stream rebuild failed.  If we gated on swrCtx here, no
+                // future audio packet would ever enter the branch again and
+                // audio would be dead for the rest of the connection.  Gate on
+                // audioDecCtx only; the (re)build/retry lives INSIDE, reachable
+                // whenever audio packets are still arriving.
+                else if (pkt->stream_index == audioStreamIdx && audioDecCtx) {
                     if (avcodec_send_packet(audioDecCtx, pkt) >= 0) {
                         while (avcodec_receive_frame(audioDecCtx, audioFrame) >= 0) {
-                            int64_t aFramePts = audioFrame->pts;
-                            if (aFramePts == AV_NOPTS_VALUE)
-                                aFramePts = audioFrame->best_effort_timestamp;
-                            if (aFramePts == AV_NOPTS_VALUE) {
+                            int64_t audioTs = audioFrame->pts;
+                            if (audioTs == AV_NOPTS_VALUE)
+                                audioTs = audioFrame->best_effort_timestamp;
+                            if (audioTs == AV_NOPTS_VALUE) {
+                                av_frame_unref(audioFrame);
+                                continue;
+                            }
+                            const AVRational audioTb = inCtx->streams[audioStreamIdx]->time_base;
+
+                            // Bug 1: (re)build the resampler BEFORE we use it,
+                            // and make the retry reachable when swrCtx is null.
+                            // Rebuild if swr was never built / a prior build
+                            // failed (swrCtx == nullptr), OR this frame's input
+                            // params differ from what swr was configured with
+                            // (mid-stream sample-rate / channel-layout /
+                            // sample-format change at ad breaks, 5.1->stereo,
+                            // etc.).  Use the frame's actual sample_rate (guard
+                            // >0; fall back to the decoder ctx) so a
+                            // sample_rate-0-at-open case recovers once a real
+                            // rate arrives.  On a stale resampler a layout
+                            // shrink makes swr_convert read a NULL extended_data
+                            // plane (segfault) and a rate change resamples at
+                            // the wrong ratio (wrong pitch).
+                            const int inRate = audioFrame->sample_rate > 0
+                                                   ? audioFrame->sample_rate
+                                                   : audioDecCtx->sample_rate;
+                            const AVSampleFormat inFmt = (AVSampleFormat) audioFrame->format;
+                            if (!swrCtx || inRate != swrInRate || inFmt != swrInFmt ||
+                                av_channel_layout_compare(&audioFrame->ch_layout, &swrInLayout) !=
+                                    0) {
+                                if (swrCtx)
+                                    qDebug()
+                                        << "Source" << m_sourceIndex
+                                        << "Audio format change mid-stream; rebuilding resampler";
+                                configureSwr(inRate, inFmt, &audioFrame->ch_layout);
+                            }
+                            // Bug 1: if the resampler is STILL null after the
+                            // (re)build attempt, skip just THIS frame; the next
+                            // packet re-enters this branch and retries, so a
+                            // transient failure is recoverable instead of
+                            // permanently silencing audio.
+                            if (!swrCtx) {
                                 av_frame_unref(audioFrame);
                                 continue;
                             }
 
-                            int64_t audioMs = av_rescale_q(aFramePts,
-                                inCtx->streams[audioStreamIdx]->time_base, {1, 1000});
-                            int64_t relMs = audioMs - containerStartMs;
-                            int64_t recPtsMs = anchorStreamTimeMs + relMs;
+                            // Bug 2: map audio onto the recording timeline using
+                            // AUDIO'S OWN anchor and discontinuity detection,
+                            // fully decoupled from the video anchor.  For RTMP
+                            // (independent A/V timestamp domains) or any source
+                            // where only video has a discontinuity, the old
+                            // mapping (relMs = audioMs - containerStartMs, with
+                            // containerStartMs set/re-anchored by VIDEO) shifted
+                            // audio by seconds when video re-anchored but audio
+                            // did not.  Here audio anchors on its own first
+                            // packet and re-anchors on its own jumps (same
+                            // >3000 ms-fwd / <-200 ms-back rule, on the audio
+                            // timeline), so a video-only re-anchor cannot touch
+                            // it.  On a normal MPEG-TS stream where A/V share
+                            // the clock, audioAnchorStreamTimeMs samples
+                            // m_sharedClock->elapsedMs() at ~the same first-
+                            // packet moment as the video anchor, so end
+                            // alignment is identical to before.
+                            const int64_t nowMs = m_sharedClock->elapsedMs();
+                            bool needAudioAnchor = (firstAudioDts == AV_NOPTS_VALUE);
+                            if (!needAudioAnchor && prevAudioDts != AV_NOPTS_VALUE) {
+                                const int64_t aDeltaMs =
+                                    av_rescale_q(audioTs - prevAudioDts, audioTb, {1, 1000});
+                                constexpr int64_t kForwardJumpMs = 3000;
+                                constexpr int64_t kBackwardTolMs = -200;
+                                if (aDeltaMs > kForwardJumpMs || aDeltaMs < kBackwardTolMs) {
+                                    qDebug()
+                                        << "Source" << m_sourceIndex << "Audio DTS discontinuity ("
+                                        << aDeltaMs << "ms jump). Re-anchoring.";
+                                    needAudioAnchor = true;
+                                }
+                            }
+                            if (needAudioAnchor) {
+                                firstAudioDts = audioTs;
+                                audioAnchorStreamTimeMs = nowMs;
+                            }
+                            prevAudioDts = audioTs;
+
+                            int64_t recPtsMs =
+                                audioAnchorStreamTimeMs +
+                                av_rescale_q(audioTs - firstAudioDts, audioTb, {1, 1000});
+
+                            // Forward-sanity guard: if a missed jump still maps
+                            // this sample absurdly far ahead of the recording
+                            // clock, treat it as a discontinuity and re-anchor
+                            // audio here rather than enqueuing a far-future
+                            // sample (which would stall the FIFO write cursor).
+                            if (recPtsMs > nowMs + 10000) {
+                                qDebug() << "Source" << m_sourceIndex << "Audio sample" << recPtsMs
+                                         << "ms far ahead of clock" << nowMs << "ms. Re-anchoring.";
+                                firstAudioDts = audioTs;
+                                audioAnchorStreamTimeMs = nowMs;
+                                prevAudioDts = audioTs;
+                                recPtsMs = nowMs;
+                            }
                             if (recPtsMs < 0) { av_frame_unref(audioFrame); continue; }
 
                             // Resample to 48 kHz stereo S16
-                            int outSamples = av_rescale_rnd(
-                                swr_get_delay(swrCtx, audioDecCtx->sample_rate) + audioFrame->nb_samples,
-                                48000, audioDecCtx->sample_rate, AV_ROUND_UP);
+                            int outSamples = av_rescale_rnd(swr_get_delay(swrCtx, inRate) +
+                                                                audioFrame->nb_samples,
+                                                            48000, inRate, AV_ROUND_UP);
                             int outBufSize = av_samples_get_buffer_size(
                                 nullptr, 2, outSamples, AV_SAMPLE_FMT_S16, 0);
                             uint8_t* outBuffer = (uint8_t*)av_malloc(outBufSize);
@@ -463,6 +704,10 @@ void StreamWorker::captureLoop() {
             }
         }
 
+        // Release the tracked input channel layout (Fix 4).  swrCtx itself is
+        // freed by the detached close thread below; the layout copy is ours.
+        av_channel_layout_uninit(&swrInLayout);
+
         // Detach the slow network close to a background thread.
         // avformat_close_input can block for seconds (SRT linger, RTMP
         // teardown), and protocol libraries may hold global locks that
@@ -484,12 +729,20 @@ void StreamWorker::captureLoop() {
             fmtToClose->interrupt_callback.callback = [](void*) -> int { return 1; };
             fmtToClose->interrupt_callback.opaque = nullptr;
         }
-        QThreadPool::globalInstance()->start([decToFree, audioDecToFree, swrToFree, fmtToClose]() mutable {
+        // Fire-and-forget on a detached std::thread (NOT the shared global
+        // pool, which the per-source captureLoops already occupy — queuing
+        // closes there would let old contexts pile up unfreed during
+        // reconnect cycles, leaking sockets and memory).  All four pointers
+        // were moved into locals above and nulled out, so the worker never
+        // touches them again; the close task owns them exclusively.  Each
+        // fmtToClose carries its own always-interrupt callback, so the
+        // detached thread cannot block indefinitely.
+        std::thread([decToFree, audioDecToFree, swrToFree, fmtToClose]() mutable {
             if (decToFree) avcodec_free_context(&decToFree);
             if (audioDecToFree) avcodec_free_context(&audioDecToFree);
             if (swrToFree) swr_free(&swrToFree);
             if (fmtToClose) avformat_close_input(&fmtToClose);
-        });
+        }).detach();
 
         m_connected = false;
     }
@@ -504,6 +757,25 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
     av_dict_set(&opts, "rw_timeout", "5000000", 0); // 5 second timeout for "stalled" streams
     av_dict_set(&opts, "timeout", "5000000", 0); // 5 second socket timeout (microseconds)
     av_dict_set(&opts, "recv_buffer_size", "15048000", 0);
+
+    // Fix 1: low-latency probing.  By default avformat_find_stream_info
+    // buffers seconds of the stream (large probesize/analyzeduration) and
+    // then replays it, so the FIRST av_read_frame returns content that was
+    // captured seconds ago.  captureLoop anchors anchorStreamTimeMs to
+    // "now" on that first packet, baking the entire probe backlog in as a
+    // constant latency — and since every source probes for a different
+    // duration, multiview cameras desync by up to seconds.
+    //
+    // "nobuffer" tells the demuxer not to accumulate a replay buffer, and
+    // the probesize/analyzeduration caps bound how much it reads to detect
+    // the streams.  0.5 MB / 0.5 s is the widely-used low-latency live
+    // setting and reliably detects H.264 + AAC; the anchor's backlog drops
+    // from seconds to sub-100 ms.  These propagate from avformat_open_input
+    // into find_stream_info, so a separate per-stream options array is not
+    // needed (verified: the e2e H.264+AAC MPEG-TS streams still detect).
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "probesize", "500000", 0);       // ~0.5 MB
+    av_dict_set(&opts, "analyzeduration", "500000", 0); // ~0.5 s (microseconds)
 
     if (scheme == "srt") {
         av_dict_set(&opts, "connect_timeout", "5000000", 0); // 5 second connect timeout
@@ -586,16 +858,48 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
 bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!encoder) return false;
+
+    // MPEG-2's 12-bit horizontal_size_value/vertical_size_value cannot encode a
+    // dimension that is a multiple of 4096 (the field would be 0).  avcodec_open2
+    // would otherwise fail with a cryptic message AFTER the muxer header is
+    // already on disk, leaving a stub .mkv.  Fail early with a clear diagnostic.
+    if (m_targetWidth % 4096 == 0 || m_targetHeight % 4096 == 0) {
+        qWarning() << "Source" << m_sourceIndex
+                   << "MPEG-2 cannot encode a dimension that is a multiple of 4096"
+                   << "(" << m_targetWidth << "x" << m_targetHeight
+                   << ") — pick e.g. 3840x2160 instead of 4096x2160.";
+        return false;
+    }
+
     *encCtx = avcodec_alloc_context3(encoder);
     if (!*encCtx) return false;
 
     (*encCtx)->width = m_targetWidth;
     (*encCtx)->height = m_targetHeight;
 
-    // --- CHANGE THIS: Use a standard MPEG-2 rate ---
+    // MPEG-2 can only signal a small set of frame rates in its sequence header
+    // (24/25/30/50/60 and the 1000/1001 variants, times a tiny n/d extension).
+    // For any other integer fps the encoder silently writes the NEAREST
+    // representable rate into the elementary stream while our container stamps
+    // {fps,1}, so the file carries contradictory rates and ES-rate-trusting
+    // tools mis-time the video.  Warn so the operator can pick a standard rate.
+    switch (m_targetFps) {
+    case 24:
+    case 25:
+    case 30:
+    case 50:
+    case 60:
+        break; // exactly representable
+    default:
+        qWarning() << "Source" << m_sourceIndex << "fps" << m_targetFps
+                   << "is not an exact MPEG-2 rate; the elementary stream will"
+                   << "carry the nearest representable rate (use 24/25/30/50/60"
+                   << "to avoid a container/ES rate mismatch).";
+        break;
+    }
+
     (*encCtx)->time_base = {1, m_targetFps};      // Internal codec clock
     (*encCtx)->framerate = {m_targetFps, 1};      // Target framerate
-    // -----------------------------------------------
 
     (*encCtx)->pix_fmt = AV_PIX_FMT_YUV420P;
     (*encCtx)->gop_size = 1;             // Keep Intra-only for seeking
@@ -628,6 +932,13 @@ void StreamWorker::changeSource(const QString& newUrl) {
 
     if (newUrl.trimmed().isEmpty()) {
         m_paintBlue = 1;
+        // Suppress capture-side enqueues until a real (non-empty) URL
+        // connects again.  This stops a late straggler — a frame already
+        // decoded from the now-cleared source — from being enqueued after
+        // the tick clears the queue and paints blue, which would otherwise
+        // overwrite the blue frame and then re-encode that stale frame
+        // every tick forever (empty URL produces no fresh frames).
+        m_suppressEnqueue.store(true, std::memory_order_relaxed);
     }
 
     m_restartCapture = 1;
