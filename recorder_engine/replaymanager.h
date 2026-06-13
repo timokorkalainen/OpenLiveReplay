@@ -66,6 +66,10 @@ signals:
     // previously named wallClockUs.
     void masterPulse(int64_t frameIndex, int64_t elapsedMs);
 
+    // Relayed from each StreamWorker when its connection state flips.
+    // sourceIndex is the fixed source identity (not a view slot).
+    void sourceConnectionChanged(int sourceIndex, bool connected);
+
 private slots:
     void onTimerTick();
 
