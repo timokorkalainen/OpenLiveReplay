@@ -47,15 +47,52 @@ bool ReplayManager::setupBlueEncoder() {
         return false;
     }
 
-    // Paint solid blue (YUV 128 / 255 / 107)
+    // Paint solid blue (YUV).  Cb is clamped to 240 (broadcast-legal chroma
+    // max) instead of the illegal 255, matching the StreamWorker blue paints
+    // so every blue placeholder is identical.  Must run BEFORE the
+    // encode-once below.
     memset(m_blueFrame->data[0], 128, m_blueFrame->linesize[0] * m_blueFrame->height);
-    memset(m_blueFrame->data[1], 255, m_blueFrame->linesize[1] * (m_blueFrame->height / 2));
+    memset(m_blueFrame->data[1], 240, m_blueFrame->linesize[1] * (m_blueFrame->height / 2));
     memset(m_blueFrame->data[2], 107, m_blueFrame->linesize[2] * (m_blueFrame->height / 2));
+
+    // Encode the blue frame ONCE and cache the compressed packet.  gop_size=1
+    // (intra) means a single send yields one self-contained keyframe packet,
+    // perfect to reuse for every unmapped view on every pulse.  writeBlueFrames
+    // clones this and re-stamps pts/dts per write, so NO encode happens on the
+    // GUI thread in the heartbeat hot path.
+    m_blueFrame->pts = 0;
+    if (avcodec_send_frame(m_blueEncCtx, m_blueFrame) != 0) {
+        av_frame_free(&m_blueFrame);
+        avcodec_free_context(&m_blueEncCtx);
+        return false;
+    }
+    m_cachedBluePkt = av_packet_alloc();
+    if (!m_cachedBluePkt) {
+        av_frame_free(&m_blueFrame);
+        avcodec_free_context(&m_blueEncCtx);
+        return false;
+    }
+    int recvRet = avcodec_receive_packet(m_blueEncCtx, m_cachedBluePkt);
+    if (recvRet == AVERROR(EAGAIN)) {
+        // Intra encoder buffered the frame: drain it out.
+        avcodec_send_frame(m_blueEncCtx, nullptr);
+        recvRet = avcodec_receive_packet(m_blueEncCtx, m_cachedBluePkt);
+    }
+    if (recvRet != 0) {
+        av_packet_free(&m_cachedBluePkt);
+        av_frame_free(&m_blueFrame);
+        avcodec_free_context(&m_blueEncCtx);
+        return false;
+    }
 
     return true;
 }
 
 void ReplayManager::cleanupBlueEncoder() {
+    if (m_cachedBluePkt) {
+        av_packet_free(&m_cachedBluePkt);
+        m_cachedBluePkt = nullptr;
+    }
     if (m_blueFrame) { av_frame_free(&m_blueFrame); m_blueFrame = nullptr; }
     if (m_blueEncCtx) { avcodec_free_context(&m_blueEncCtx); m_blueEncCtx = nullptr; }
 }
@@ -160,6 +197,34 @@ void ReplayManager::stopRecording() {
 }
 
 // ─── View mapping: purely virtual, ZERO FFmpeg impact ──────────────────
+//
+// Mapping-transition behavior (a known minor, with a safety net):
+//   This runs on the main thread and flips both m_viewSlotMap (read
+//   synchronously by writeBlueFrames) and each worker's atomic view-track
+//   (read by the worker when it PROCESSES a queued masterPulse — async).
+//   Because writeBlueFrames decides at emit time while the worker decides
+//   at process time, there is a one-tick skew at a transition:
+//     • map-in:  writeBlueFrames stops writing blue for the view the instant
+//                the mapping flips, but any masterPulses already QUEUED to
+//                the worker before the flip are processed with the NEW
+//                view-track, so the worker re-encodes a real frame for a
+//                frame index whose blue placeholder was already written.
+//                Result: a brief video duplicate (+ ~33 ms overlapping audio)
+//                on that view track.
+//     • unmap:   symmetric — a brief one-frame hole is possible.
+//   The muxer's per-stream monotonic-DTS bump (Muxer::writePacket) absorbs
+//   the duplicate without corrupting the file (the later packet is nudged to
+//   lastDts+1 rather than dropped), and the audio cursors on both sides
+//   (m_blueAudioCursor here, m_audioWriteCursor in StreamWorker) are anchored
+//   to the SAME recording-time→48 kHz sample mapping, so silence tiles
+//   seamlessly onto source audio across an unmap with no gap.
+//   A "skip blue for one tick after map-in" mitigation was considered and
+//   rejected: writeBlueFrames already stops the instant the mapping flips, so
+//   the residual duplicate comes purely from worker BACKLOG (old frame
+//   indices), which such a skip cannot address and would instead turn into a
+//   hole.  Eliminating the 1-frame skew cleanly would require per-pulse
+//   view-track snapshots in the worker — out of scope here; left as-is behind
+//   the DTS-bump safety net.
 void ReplayManager::updateViewMapping(const QList<int>& viewSlotMap) {
     m_viewSlotMap = viewSlotMap;
 
@@ -228,7 +293,7 @@ void ReplayManager::onTimerTick() {
 }
 
 void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
-    if (!m_blueEncCtx || !m_blueFrame || !m_muxer) return;
+    if (!m_blueEncCtx || !m_cachedBluePkt || !m_muxer) return;
 
     // Skip the encode entirely when every view has a source mapped —
     // but still reset the per-view silence cursors.
@@ -242,15 +307,11 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
     }
     if (!anyUnmapped) return;
 
-    // Encode one blue frame per tick (all unmapped views share the same packet data)
-    m_blueFrame->pts = m_globalFrameCount;
-    if (avcodec_send_frame(m_blueEncCtx, m_blueFrame) != 0) return;
-
-    AVPacket* basePkt = av_packet_alloc();
-    if (avcodec_receive_packet(m_blueEncCtx, basePkt) != 0) {
-        av_packet_free(&basePkt);
-        return;
-    }
+    // The blue video packet is static and was encoded ONCE in
+    // setupBlueEncoder.  We reuse m_cachedBluePkt below — clone + re-stamp
+    // pts/dts per view per pulse.  NO avcodec_send_frame/receive_packet here:
+    // that's the whole point of the cache (the heartbeat can fire up to
+    // fps/4 pulses per tick on the GUI thread).
 
     // Frame-count-derived recording time on the FILE timeline: same as
     // the source workers' audio cursor, so silence and source audio tile
@@ -267,9 +328,17 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
             continue;
         }
 
-        AVPacket* pkt = av_packet_clone(basePkt);
+        AVPacket* pkt = av_packet_clone(m_cachedBluePkt);
         if (!pkt) continue;
 
+        // RE-STAMP: the cached packet carries the fixed pts/dts from its
+        // one-time encode.  Overwrite both with the CURRENT frame index on
+        // the encoder timeline ({1, m_fps}) — exactly what the old per-pulse
+        // path produced via m_blueFrame->pts = m_globalFrameCount — then
+        // rescale to the stream timebase.  Without this the muxer's
+        // monotonic-DTS bump would fire on every write.
+        pkt->pts = m_globalFrameCount;
+        pkt->dts = m_globalFrameCount;
         pkt->stream_index = v;
         AVStream* st = m_muxer->getStream(v);
         if (st) {
@@ -316,8 +385,8 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         static const QByteArray emptyMeta("{}");
         m_muxer->writeMetadataPacket(v, elapsedMs, emptyMeta);
     }
-
-    av_packet_free(&basePkt);
+    // NOTE: m_cachedBluePkt is NOT freed here — it is session-scoped and
+    // reused every pulse; cleanupBlueEncoder() frees it at teardown.
 }
 
 // ─── Utility ───────────────────────────────────────────────────────────
