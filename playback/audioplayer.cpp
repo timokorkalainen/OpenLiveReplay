@@ -15,24 +15,20 @@ void AudioRingBuffer::push(const char *data, qint64 len) {
     if (len <= 0) return;
     QMutexLocker locker(&m_mutex);
 
-    // Repay underrun debt: the device already played silence in place of
-    // this data, so skip the equivalent amount to stay aligned with the
-    // device clock instead of drifting later after every underrun.
-    if (m_underrunDebt > 0) {
-        const qint64 drop = qMin(m_underrunDebt, len);
-        data += drop;
-        len  -= drop;
-        m_underrunDebt -= drop;
-        if (len <= 0) return;
-    }
-
+    // Plain append + safety cap-trim.  Underrun-debt repayment now lives in
+    // AudioPlayer::pushSamples (so the splice can be faded); this method does
+    // not touch m_underrunDebt.
     m_buf.append(data, len);
     m_streamActive = true;
 
     // Safety cap to avoid unbounded growth.  Should not trigger in normal
-    // operation: the producer paces itself against the master clock.
+    // operation: the producer paces itself against the master clock.  Trimming
+    // the OLDEST (due-next) bytes shifts the stream early with no alignment
+    // adjustment, so flag it: AudioPlayer will force a re-align on the next
+    // push instead of compounding a permanent desync.
     if (m_buf.size() > m_maxBufBytes) {
         m_buf.remove(0, m_buf.size() - m_maxBufBytes);
+        m_overflowed = true;
     }
 }
 
@@ -41,12 +37,14 @@ void AudioRingBuffer::clear() {
     m_buf.clear();
     m_underrunDebt = 0;
     m_streamActive = false;
+    m_overflowed = false;
 }
 
 void AudioRingBuffer::fadeOutAndClear(int channels) {
     QMutexLocker locker(&m_mutex);
     m_underrunDebt = 0;
     m_streamActive = false;
+    m_overflowed = false;
     if (m_buf.isEmpty()) return;
 
     // Keep at most ~5 ms of audio for the fade-out tail (240 samples @ 48 kHz)
@@ -58,10 +56,40 @@ void AudioRingBuffer::fadeOutAndClear(int channels) {
 
     int16_t* samples = reinterpret_cast<int16_t*>(m_buf.data());
     int nSamples = m_buf.size() / int(sizeof(int16_t));
+    // Ramp per channel-FRAME so both channels of a stereo frame get the same
+    // gain (otherwise L and R diverge by 1/nFrames across the tail).
+    const int ch = qMax(1, channels);
+    const int nFrames = nSamples / ch;
     for (int i = 0; i < nSamples; ++i) {
-        double gain = 1.0 - double(i) / double(nSamples);
+        const int frame = i / ch;
+        const double gain = (nFrames > 0) ? 1.0 - double(frame) / double(nFrames) : 0.0;
         samples[i] = int16_t(samples[i] * gain);
     }
+}
+
+qint64 AudioRingBuffer::takeUnderrunDebt() {
+    QMutexLocker locker(&m_mutex);
+    const qint64 debt = m_underrunDebt;
+    m_underrunDebt = 0;
+    return debt;
+}
+
+void AudioRingBuffer::addUnderrunDebt(qint64 bytes) {
+    if (bytes <= 0) return;
+    QMutexLocker locker(&m_mutex);
+    m_underrunDebt += bytes;
+    // Cap to one ring's worth (consistent with readData's cap) so a large stall
+    // cannot grow the carried-forward debt beyond ~500 ms of audio.
+    if (m_underrunDebt > m_maxBufBytes) {
+        m_underrunDebt = m_maxBufBytes;
+    }
+}
+
+bool AudioRingBuffer::takeOverflowed() {
+    QMutexLocker locker(&m_mutex);
+    const bool f = m_overflowed;
+    m_overflowed = false;
+    return f;
 }
 
 qint64 AudioRingBuffer::bytesAvailable() const {
@@ -83,6 +111,12 @@ qint64 AudioRingBuffer::readData(char *data, qint64 maxSize) {
         memset(data + toRead, 0, maxSize - toRead);
         if (m_streamActive) {
             m_underrunDebt += maxSize - toRead;
+            // Cap the debt at one ring's worth so a long stall (e.g. a pause
+            // with a stray late push leaving m_streamActive true) can swallow
+            // at most ~500 ms of real audio on resume, not the whole pause.
+            if (m_underrunDebt > m_maxBufBytes) {
+                m_underrunDebt = m_maxBufBytes;
+            }
         }
     }
     return maxSize;
@@ -178,22 +212,49 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     QMutexLocker locker(&m_mutex);
     if (!m_started || m_muted || !m_ringBuffer || numBytes <= 0) return;
 
+    // If the ring had to cap-trim due-next bytes since the last push, the
+    // stream shifted early with no alignment fix.  Force a re-align so this
+    // push re-anchors to the master clock instead of compounding the desync.
+    if (m_ringBuffer->takeOverflowed()) {
+        m_aligned = false;
+    }
+
     const int bytesPerFrame = m_channels * int(sizeof(int16_t));
     const int nFrames = numBytes / bytesPerFrame;
     if (nFrames <= 0) return;
 
     const int64_t ptsSamples = ptsMs * m_sampleRate / 1000;
     const int64_t jitterTolSamples = int64_t(kJitterTolMs) * m_sampleRate / 1000;
+
+    // Playout latency = the always-full sink buffer plus a manual offset for
+    // hardware/driver/Bluetooth output latency Qt cannot report (see header).
+    const int bytesPerSecond = m_sampleRate * m_channels * int(sizeof(int16_t));
+    const int64_t latencySamples =
+        (m_sinkLatencyBytes + int64_t(kOutputLatencyOffsetMs) * bytesPerSecond / 1000) /
+        bytesPerFrame;
+    const int64_t dueSamples = masterTimeMs * m_sampleRate / 1000 + latencySamples;
+
     const char* payload = reinterpret_cast<const char*>(data);
     qint64 payloadBytes = qint64(nFrames) * bytesPerFrame;
     qint64 silencePrefixBytes = 0;
+    bool spliced = false; // true if this push jumps the waveform → needs a fade
+
+    // Defensive self-heal: if a seek moved the playhead without an
+    // AudioPlayer::clear(), the aligned branch (which tracks PTS continuity
+    // only) would stay mis-positioned forever.  Detect a large divergence from
+    // the master clock and re-align.  The threshold is far beyond the jitter
+    // tolerance, so normal 1x play (ptsMs ≈ playhead) never trips it.
+    if (m_aligned) {
+        const int64_t resyncSamples = int64_t(kResyncThresholdMs) * m_sampleRate / 1000;
+        if (qAbs(ptsSamples - dueSamples) > resyncSamples) {
+            m_aligned = false;
+        }
+    }
 
     if (!m_aligned) {
         // Position the stream start on the timeline.  The sink's internal
         // buffer is always full (silence-padded reads), so data pushed now
-        // starts playing ~sinkLatency later: schedule against that.
-        const int64_t latencySamples = m_sinkLatencyBytes / bytesPerFrame;
-        const int64_t dueSamples = masterTimeMs * m_sampleRate / 1000 + latencySamples;
+        // starts playing ~latency later: schedule against that.
         const int64_t lead = ptsSamples - dueSamples;
         if (lead + nFrames <= 0) {
             return;  // entirely in the past; wait for newer data
@@ -212,10 +273,12 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
             // Gap in the recording: bridge with silence to hold sync.
             silencePrefixBytes = qMin<int64_t>(delta, 2 * m_sampleRate) * bytesPerFrame;
         } else if (delta < -jitterTolSamples) {
-            // Overlap: drop the part that already played.
+            // Overlap: drop the part that already played.  This splices the
+            // waveform mid-stream, so fade the remainder in to avoid a click.
             const int64_t trimFrames = qMin<int64_t>(-delta, nFrames);
             payload      += trimFrames * bytesPerFrame;
             payloadBytes -= trimFrames * bytesPerFrame;
+            spliced = true;
             if (payloadBytes <= 0) {
                 m_expectedNextPtsSamples = ptsSamples + nFrames;
                 return;
@@ -229,18 +292,64 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
         m_ringBuffer->push(silence.constData(), silence.size());
     }
 
-    // Apply a short linear fade-in ramp after unmute / view switch
-    // to eliminate the click from an abrupt sample transition.
-    if (m_fadeInRemaining > 0) {
+    // Repay underrun debt here (moved out of AudioRingBuffer::push): the
+    // device already played this many bytes as silence, so skip them from the
+    // payload head to stay aligned with the device clock.  Draining the debt
+    // under the ring mutex (takeUnderrunDebt) matches readData's accrual under
+    // the same mutex — no double-count, no loss.
+    // If the payload is smaller than the total debt, the leftover is written
+    // back via addUnderrunDebt so it is repaid on the next push — one push
+    // repays at most one payload's worth, keeping debt reduction frame-aligned.
+    const qint64 debt = m_ringBuffer->takeUnderrunDebt();
+    if (debt > 0) {
+        const qint64 drop = qMin(debt, payloadBytes);
+        if (debt - drop > 0) {
+            m_ringBuffer->addUnderrunDebt(debt - drop); // carry leftover into next push
+        }
+        if (drop > 0) {
+            payload += drop;
+            payloadBytes -= drop;
+            spliced = true; // skipping to a mid-waveform sample → fade it in
+            if (payloadBytes <= 0) {
+                // Debt consumed the whole payload; nothing to enqueue but the
+                // continuity position still advances past these samples.
+                return;
+            }
+        }
+    }
+
+    // Whenever the waveform was spliced (debt-skip or overlap-trim), arm a
+    // short de-click fade so the post-splice payload ramps in instead of
+    // jumping from device-played silence to a mid-waveform sample.
+    // m_fadeInRemaining / m_fadeInLen count FRAMES (see fade-in loop below).
+    // If a longer fade (clear/unmute) is already in flight, keep the shorter
+    // splice fade so we don't over-attenuate; otherwise arm a fresh one.
+    if (spliced) {
+        if (m_fadeInRemaining <= 0 || kSpliceFadeSamples < m_fadeInRemaining) {
+            m_fadeInRemaining = kSpliceFadeSamples;
+            m_fadeInLen = kSpliceFadeSamples;
+        }
+    }
+
+    // Apply a short linear fade-in ramp (after unmute / view switch / splice)
+    // to eliminate the click from an abrupt sample transition.  The ramp is
+    // indexed per channel-FRAME (m_fadeInRemaining counts frames) so both
+    // channels of a stereo frame share one gain — otherwise L and R would
+    // diverge by 1/ramp-length across the ramp.  m_fadeInLen is the ramp
+    // denominator so the gain always starts at ~0 regardless of ramp length.
+    if (m_fadeInRemaining > 0 && m_fadeInLen > 0) {
         // Work on a mutable copy so we don't alter the caller's buffer
         QByteArray tmp(payload, payloadBytes);
         int16_t* samples = reinterpret_cast<int16_t*>(tmp.data());
         int totalSamples = int(payloadBytes) / int(sizeof(int16_t));
-        for (int i = 0; i < totalSamples && m_fadeInRemaining > 0; ++i, --m_fadeInRemaining) {
-            // Per-channel sample index in the fade ramp
-            int rampPos = kFadeInSamples * m_channels - m_fadeInRemaining;
-            double gain = double(rampPos) / double(kFadeInSamples * m_channels);
+        for (int i = 0; i < totalSamples && m_fadeInRemaining > 0; ++i) {
+            const int rampPos = m_fadeInLen - m_fadeInRemaining;
+            const double gain = double(rampPos) / double(m_fadeInLen);
             samples[i] = int16_t(samples[i] * gain);
+            // Advance the ramp once per frame so all channels share the gain.
+            if ((i % m_channels) == (m_channels - 1)) {
+                --m_fadeInRemaining;
+            }
         }
         m_ringBuffer->push(tmp.constData(), tmp.size());
     } else {
@@ -254,9 +363,11 @@ void AudioPlayer::clear() {
     if (m_ringBuffer) {
         m_ringBuffer->fadeOutAndClear(m_channels);
     }
-    // Re-arm timeline alignment and fade-in for the next pushed samples
+    // Re-arm timeline alignment and fade-in for the next pushed samples.
+    // m_fadeInRemaining / m_fadeInLen count FRAMES (kFadeInSamples = 10 ms).
     m_aligned = false;
-    m_fadeInRemaining = kFadeInSamples * m_channels;
+    m_fadeInRemaining = kFadeInSamples;
+    m_fadeInLen = kFadeInSamples;
 }
 
 void AudioPlayer::setMuted(bool muted) {
@@ -266,9 +377,11 @@ void AudioPlayer::setMuted(bool muted) {
     if (muted && m_ringBuffer) {
         m_ringBuffer->clear();
     }
-    // Arm fade-in ramp and re-alignment when transitioning muted → unmuted
+    // Arm fade-in ramp and re-alignment when transitioning muted → unmuted.
+    // m_fadeInRemaining / m_fadeInLen count FRAMES (kFadeInSamples = 10 ms).
     if (wasM && !muted) {
-        m_fadeInRemaining = kFadeInSamples * m_channels;
+        m_fadeInRemaining = kFadeInSamples;
+        m_fadeInLen = kFadeInSamples;
         m_aligned = false;
         if (m_ringBuffer) m_ringBuffer->clear();
     }
