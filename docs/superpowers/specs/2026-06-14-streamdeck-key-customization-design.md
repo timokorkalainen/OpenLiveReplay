@@ -27,8 +27,9 @@ strip), but the design adapts to every model. Mappings persist per deck model.
 ## Non-goals (YAGNI)
 
 - Making the touch strip's content selectable (stays scrub + timecode).
-- New continuous (rotate) actions beyond Jog. Dial-turn binds Jog only; the
-  model is extensible but no new rotate actions ship here.
+- Continuous (rotate) actions beyond Jog and Shuttle. The model carries the
+  rotate action id per dial, so more can be added later, but only these two
+  ship here.
 - Editing mappings while no deck is connected (learn-style needs the device).
 - Multiple simultaneous decks of the same model with distinct maps (one map
   per model id).
@@ -58,11 +59,33 @@ tables are new. Keys are model ids (`"plusXL"`, `"mini"`, …); `-1` = unbound.
 | Prev Frame | 7 | key or dial-press |
 | Jog | 8 | **dial-turn only** |
 | Record | 9 | key or dial-press |
+| Shuttle | 10 | **dial-turn only** (new action) |
 | Timecode | 20 | **key only** (display) |
 | Speed | 21 | **key only** (display) |
 
-Action ids are unchanged from the integration spec; this feature only changes
-*which control* maps to each id.
+Action ids 0–9, 20, 21 are unchanged from the integration spec; this feature
+adds **Shuttle = 10** and changes *which control* maps to each id.
+
+### Rotate actions: Jog vs Shuttle
+
+Two continuous actions bind to a dial-turn. Each dial reports its bound rotate
+action so the C++ side dispatches the right one (the existing jog-only path
+generalizes — see Dispatch generalization below).
+
+- **Jog (8):** frame-by-frame scrub. Each detent steps the transport ±1 frame
+  (pauses playback first), clamped to the live edge — the current behavior,
+  now reachable on any dial.
+- **Shuttle (10):** sustained variable-speed playback via a speed ladder
+  `[-5, -2, -1, 0, +1, +2, +5]`. The dial holds a ladder index (snapped to the
+  nearest rung from the current speed on first turn); a right detent moves up,
+  left moves down, clamped at the ends. Index `0` → `setPlaying(false)`; any
+  other rung → `setSpeed(value)` + `setPlaying(true)`. Like jog, a shuttle
+  change calls `cancelFollowLive()`. The bound dial's screen section shows the
+  current speed (e.g. `2×`); the existing Speed display key/strip reflect it
+  too.
+
+Shuttle is **not** in the built-in default layout (default stays Jog-on-a-dial);
+it is opt-in via the editor.
 
 ### Move / displace semantics (MIDI parity)
 
@@ -85,7 +108,7 @@ The bridge reports the learned control as an `elementType` int:
 
 Enforced in C++ before a binding is applied (invalid input is ignored and
 learn mode keeps listening):
-- Jog (8): only `dial-turn`.
+- Jog (8) / Shuttle (10): only `dial-turn`.
 - Timecode (20) / Speed (21): only `key`.
 - All other actions: `key` or `dial-press`.
 
@@ -161,9 +184,17 @@ validates (Jog needs turn ✓) → `store.bind(8, turn, 2)` (move/displace) →
 `DeckState` → deck re-renders live → `setLearnMode(false)`,
 `streamDeckLearnAction=-1`, `streamDeckBindingsVersion++` → QML refreshes.
 
-**Normal dispatch (unchanged ids):** key press → `keyMap` → `actionTriggered`;
-dial press → `dialPressMap` → `actionTriggered`; dial turn → `dialRotateMap`
-→ `jogTriggered`. All flow through the existing `UIManager` dispatch.
+**Normal dispatch:** key press → `keyMap` → `actionTriggered`; dial press →
+`dialPressMap` → `actionTriggered`; dial turn → `dialRotateMap` →
+`rotateTriggered(actionId, delta)`.
+
+**Dispatch generalization.** The integration's jog-only rotate path is
+generalized to carry the bound action: the bridge's `onJog((Int)->Void)`
+becomes `onRotate((Int, Int)->Void)` (actionId, delta); `StreamDeckManager`'s
+`jogTriggered(int)` becomes `rotateTriggered(int actionId, int delta)`;
+`UIManager` routes `8 → jogStep(delta)`, `10 → shuttleStep(delta)`.
+`shuttleStep` is a new `UIManager` method applying the speed-ladder rules
+above. `scrubTriggered` (touch-strip seek) is unchanged.
 
 **Connect:** on `onDeviceConnected(name, model, keyCount, dialCount)`,
 UIManager pushes the persisted (or default) maps for `model` before the first
@@ -173,12 +204,12 @@ render, so a freshly connected deck shows the user's layout.
 
 New "Button Mapping" `GroupBox` in the Stream Deck card. Visible only when
 `streamDeck.connected`; otherwise a hint to connect the deck. A `Repeater`
-over the 12 items renders rows of: name · binding label
+over the 13 items renders rows of: name · binding label
 (`streamDeckBindingLabel(action)`) · **Learn** (→ "Listening…" when
 `streamDeckLearnAction === action`) · **Clear**. A header row carries **Reset
-to default**. Learn buttons hint the gesture ("turn a dial" for Jog, "press a
-key" for Timecode/Speed). Refresh is driven by `streamDeckBindingsVersion`,
-exactly like `midiBindingsVersion`.
+to default**. Learn buttons hint the gesture ("turn a dial" for Jog/Shuttle,
+"press a key" for Timecode/Speed). Refresh is driven by
+`streamDeckBindingsVersion`, exactly like `midiBindingsVersion`.
 
 ## Error handling & edge cases
 
@@ -197,15 +228,19 @@ exactly like `midiBindingsVersion`.
 ## Testing
 
 - **`StreamDeckMappingStore` unit tests** (new, cross-platform — the core
-  payoff): move/displace semantics; validation (Jog→turn only, TC/Speed→key
-  only, others key|press); per-model isolation; JSON round-trip; reset-to-
-  default reproduces the built-in layout; out-of-range pruning on load.
+  payoff): move/displace semantics; validation (Jog/Shuttle→turn only,
+  TC/Speed→key only, others key|press); per-model isolation; JSON round-trip;
+  reset-to-default reproduces the built-in layout; out-of-range pruning on load.
+- **Shuttle ladder unit test**: `shuttleStep` walks `[-5,-2,-1,0,1,2,5]`,
+  snaps from the current speed, clamps at the ends, and toggles `playing` at
+  rung `0`. Lives with the `PlaybackTransport`/UIManager-adjacent tests.
 - **Swift bridge XCTest** (extend): `DeckState` dial tables change-guarding;
   `rotateAction/pressAction(forDial:)` lookups; learn-mode routing reports raw
   elements and suppresses dispatch.
 - **Simulator pass**: via the debug Stream Deck simulator, learn a key, a
-  dial-press, and Jog onto a dial; confirm live re-render, displace behavior,
-  Clear, Reset, and persistence across relaunch.
+  dial-press, Jog onto a dial, and Shuttle onto another; confirm live
+  re-render, displace behavior, the speed ladder, Clear, Reset, and
+  persistence across relaunch.
 
 No C++ test harness predates this; `StreamDeckMappingStore` tests slot into
 the existing `tests/unit` suite (added by the playback work on main).
@@ -221,13 +256,17 @@ the existing `tests/unit` suite (added by the playback work on main).
   mode, `onLearnInput`, `setDialMapping`)
 - Modify: `ios/streamdeck-bridge/Sources/DeckState.swift` (dial tables +
   lookups)
+- Modify: `ios/streamdeck-bridge/Sources/DeckAction.swift` (add `.shuttle`
+  case: id 10, label/symbol, rotate-only classification)
 - Modify: `ios/streamdeck-bridge/Sources/ReplayDeckLayout.swift`
-  (`ReplayDialStrip` per-dial labels + bound press/rotate)
+  (`ReplayDialStrip` per-dial labels + bound press/rotate; shuttle section
+  shows live speed)
 - Modify: `ios/streamdeck-bridge/Tests/DeckStateTests.swift` (dial tables,
   learn routing)
 - Modify: `settingsmanager.h` (`AppSettings` gains the three per-model tables)
   + `settingsmanager.cpp` (serialize/deserialize)
-- Modify: `uimanager.{h,cpp}` (own the store, QML API, wiring)
+- Modify: `uimanager.{h,cpp}` (own the store, QML API, wiring, new
+  `shuttleStep(delta)` + generalized `rotateTriggered` routing)
 - Modify: `Main.qml` (Button Mapping group)
 
 ## Approaches considered
