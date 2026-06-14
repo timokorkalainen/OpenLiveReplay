@@ -554,7 +554,15 @@ ApplicationWindow {
                                                 { name: "Jog",         action: 8,  gesture: "turn a dial" },
                                                 { name: "Shuttle",     action: 10, gesture: "turn a dial" },
                                                 { name: "Timecode",    action: 20, gesture: "press a key" },
-                                                { name: "Speed",       action: 21, gesture: "press a key" }
+                                                { name: "Speed",       action: 21, gesture: "press a key" },
+                                                { name: "Feed 1",      action: 100, gesture: "key or dial" },
+                                                { name: "Feed 2",      action: 101, gesture: "key or dial" },
+                                                { name: "Feed 3",      action: 102, gesture: "key or dial" },
+                                                { name: "Feed 4",      action: 103, gesture: "key or dial" },
+                                                { name: "Feed 5",      action: 104, gesture: "key or dial" },
+                                                { name: "Feed 6",      action: 105, gesture: "key or dial" },
+                                                { name: "Feed 7",      action: 106, gesture: "key or dial" },
+                                                { name: "Feed 8",      action: 107, gesture: "key or dial" }
                                             ]
 
                                             delegate: RowLayout {
