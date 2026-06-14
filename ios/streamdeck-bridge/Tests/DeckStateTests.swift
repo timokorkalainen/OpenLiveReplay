@@ -191,6 +191,19 @@ final class DeckStateTests: XCTestCase {
         XCTAssertEqual(DeckAction.shuttle.label, "Shuttle")
     }
 
+    func testFeedActionsResolveAndLabel() {
+        XCTAssertEqual(DeckAction(rawValue: 100), .feed1)
+        XCTAssertEqual(DeckAction(rawValue: 107), .feed8)
+        XCTAssertEqual(DeckAction.feed1.label, "Feed 1")
+        XCTAssertEqual(DeckAction.feed8.label, "Feed 8")
+        XCTAssertEqual(DeckAction.feed3.symbolName, "3.square.fill")
+        // A feed-bound key resolves so the deck can render + dispatch it.
+        let state = DeckState()
+        state.setKeyMapping([100, 107], forModel: "plusXL")
+        XCTAssertEqual(state.action(forKey: 0, model: "plusXL"), .feed1)
+        XCTAssertEqual(state.action(forKey: 1, model: "plusXL"), .feed8)
+    }
+
     func testDialMappingLookups() {
         let state = DeckState()
         state.setDialMapping(rotate: [8, 10, -1], press: [0, -1, 5], forModel: "plusXL")

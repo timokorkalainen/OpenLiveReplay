@@ -20,6 +20,7 @@ private slots:
     void resetRestoresDefault();
     void shuttleLadderSnapsClampsAndPauses();
     void defaultPedalLayout();
+    void feedsBindToKeyOrPress();
 };
 
 void TestStreamDeckMappingStore::defaultLayoutMatchesPriority() {
@@ -132,6 +133,18 @@ void TestStreamDeckMappingStore::defaultPedalLayout() {
     StreamDeckMappingStore s;
     s.resetToDefault("pedal", 3, 0);
     QCOMPARE(s.keyMap("pedal"), (QList<int>{0, 7, 3}));
+}
+
+void TestStreamDeckMappingStore::feedsBindToKeyOrPress() {
+    // Feed-select actions (100..107, MIDI parity) bind like any discrete
+    // action: a key or a dial-press, but never a dial-turn.
+    StreamDeckMappingStore s;
+    s.resetToDefault("plusXL", 36, 6);
+    QVERIFY(s.bind("plusXL", 100, ET::Key, 30, 36, 6));
+    QCOMPARE(s.bindingLabel("plusXL", 100), QStringLiteral("Key 30"));
+    QVERIFY(s.bind("plusXL", 101, ET::DialPress, 2, 36, 6));
+    QCOMPARE(s.bindingLabel("plusXL", 101), QStringLiteral("Dial 2 press"));
+    QVERIFY(!s.bind("plusXL", 107, ET::DialTurn, 1, 36, 6));   // feeds aren't rotate actions
 }
 
 QTEST_MAIN(TestStreamDeckMappingStore)

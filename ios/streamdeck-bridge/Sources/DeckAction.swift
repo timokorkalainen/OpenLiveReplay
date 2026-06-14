@@ -17,6 +17,16 @@ enum DeckAction: Int {
     case shuttle = 10       // dial rotation only, variable-speed
     case timecodeDisplay = 20
     case speedDisplay = 21
+    // Feed/camera select (parity with the MIDI mapping). Ids 100..107 ->
+    // UIManager dispatches feedSelectRequested(id - 100).
+    case feed1 = 100
+    case feed2 = 101
+    case feed3 = 102
+    case feed4 = 103
+    case feed5 = 104
+    case feed6 = 105
+    case feed7 = 106
+    case feed8 = 107
 }
 
 extension DeckAction {
@@ -36,6 +46,8 @@ extension DeckAction {
         case .shuttle: return "dial.high.fill"
         case .timecodeDisplay: return "timer"
         case .speedDisplay: return "gauge.with.needle"
+        case .feed1, .feed2, .feed3, .feed4, .feed5, .feed6, .feed7, .feed8:
+            return "\(rawValue - 99).square.fill"
         }
     }
 
@@ -54,6 +66,8 @@ extension DeckAction {
         case .shuttle: return "Shuttle"
         case .timecodeDisplay: return ""
         case .speedDisplay: return ""
+        case .feed1, .feed2, .feed3, .feed4, .feed5, .feed6, .feed7, .feed8:
+            return "Feed \(rawValue - 99)"
         }
     }
 
