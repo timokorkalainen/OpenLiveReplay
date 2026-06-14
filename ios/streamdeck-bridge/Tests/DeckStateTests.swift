@@ -211,4 +211,30 @@ final class DeckStateTests: XCTestCase {
         }
         XCTAssertEqual(count, 0)
     }
+
+    // MARK: Learn mode
+
+    @MainActor
+    func testLearnModeReportsRawElementsAndSuppressesDispatch() {
+        let bridge = OLRStreamDeckBridge.shared
+        var learned: [(Int, Int)] = []
+        var dispatched: [Int] = []
+        bridge.onLearnInput = { learned.append(($0, $1)) }
+        bridge.onAction = { id, _ in dispatched.append(id) }
+        bridge.state.setKeyMapping([9, 0, 4], forModel: "plusXL")
+        bridge.setDialMapping(rotate: [8], press: [0], forModel: "plusXL")
+        bridge._setCurrentModelForTesting("plusXL")
+
+        bridge.setLearnMode(true)
+        bridge.emitKey(1, pressed: true)        // would be play(0) normally
+        bridge.emitDialRotate(0, delta: 1)      // would be jog normally
+        XCTAssertEqual(dispatched, [])          // suppressed
+        XCTAssertEqual(learned.count, 2)
+        XCTAssertEqual(learned[0].0, 0)         // key element
+        XCTAssertEqual(learned[1].0, 2)         // dial-turn element
+
+        bridge.setLearnMode(false)
+        bridge.onLearnInput = nil
+        bridge.onAction = nil
+    }
 }
