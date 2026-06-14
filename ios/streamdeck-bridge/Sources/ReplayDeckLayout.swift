@@ -31,7 +31,8 @@ struct ReplayDeckLayout: View {
             case .plus, .plusXL:
                 ReplayDialStrip(
                     state: state,
-                    dialCount: max(streamDeck.capabilities.dialCount, 1))
+                    dialCount: max(streamDeck.capabilities.dialCount, 1),
+                    model: model)
             case .neo:
                 ReplayNeoPanel(state: state)
             default:
@@ -112,10 +113,8 @@ struct ReplayKeyView: View {
         // change — including display keys and unmapped keys — must flow
         // through it to reach the USB bus.
         StreamDeckKeyView { pressed in
-            guard let action = content.action,
-                  action != .timecodeDisplay, action != .speedDisplay else { return }
             isPressed = pressed
-            OLRStreamDeckBridge.shared.emitAction(action.rawValue, pressed: pressed)
+            OLRStreamDeckBridge.shared.emitKey(keyIndex, pressed: pressed)
         } content: {
             keyBody
         }
@@ -184,40 +183,55 @@ struct DisplayKey: View {
     }
 }
 
-/// Stream Deck + / + XL touch strip: dial 0 jogs (press = play/pause), the
-/// whole strip is a continuous scrub bar; tapping it seeks. Dials 1..n-1
-/// intentionally render scrub segments without rotate/press handlers in
-/// this iteration. Owns its values as @State (same granularity pattern as
-/// keys; these devices receive full frames anyway, so the guards bound
-/// frequency, not size).
+/// Stream Deck + / + XL touch strip: each dial fires per-dial bound actions,
+/// the whole strip is a continuous scrub bar; tapping it seeks. Owns its values
+/// as @State (same granularity pattern as keys; these devices receive full
+/// frames anyway, so the guards bound frequency, not size).
 struct ReplayDialStrip: View {
 
     let state: DeckState
     let dialCount: Int
+    let model: String
 
     @Environment(\.streamDeckViewContext.size) var stripSize
     @State private var fraction: Double
     @State private var timecodeText: String
+    @State private var speedText: String
+    @State private var pressLabels: [String]
+    @State private var rotateLabels: [String]
 
-    init(state: DeckState, dialCount: Int) {
+    init(state: DeckState, dialCount: Int, model: String) {
         self.state = state
         self.dialCount = dialCount
+        self.model = model
         _fraction = State(initialValue: state.positionFraction)
         _timecodeText = State(initialValue: state.timecodeText)
+        _speedText = State(initialValue: state.speedText)
+        _pressLabels = State(initialValue: Self.labels(state.dialPressMappings[model], count: dialCount))
+        _rotateLabels = State(initialValue: Self.labels(state.dialRotateMappings[model], count: dialCount))
+    }
+
+    private func refreshLabels() {
+        let p = Self.labels(state.dialPressMappings[model], count: dialCount)
+        let r = Self.labels(state.dialRotateMappings[model], count: dialCount)
+        if p != pressLabels { pressLabels = p }
+        if r != rotateLabels { rotateLabels = r }
+    }
+
+    private static func labels(_ row: [Int]?, count: Int) -> [String] {
+        (0..<count).map { i in
+            guard let row, i < row.count, let a = DeckAction(rawValue: row[i]) else { return "" }
+            return a.label
+        }
     }
 
     var body: some View {
         StreamDeckDialAreaLayout(
             rotate: { dialIndex, rotation in
-                if dialIndex == 0 {
-                    OLRStreamDeckBridge.shared.emitJog(rotation)
-                }
+                OLRStreamDeckBridge.shared.emitDialRotate(dialIndex, delta: rotation)
             },
             press: { dialIndex, pressed in
-                if dialIndex == 0 {
-                    OLRStreamDeckBridge.shared.emitAction(
-                        DeckAction.playPause.rawValue, pressed: pressed)
-                }
+                OLRStreamDeckBridge.shared.emitDialPress(dialIndex, pressed: pressed)
             },
             touch: { location in
                 guard stripSize.width > 0 else { return }
@@ -225,48 +239,63 @@ struct ReplayDialStrip: View {
                 OLRStreamDeckBridge.shared.emitScrub(Double(f))
             }
         ) { dialIndex in
-            ScrubBarSegment(
+            DialSegment(
                 segmentIndex: dialIndex,
                 segmentCount: dialCount,
                 fraction: fraction,
-                timecodeText: dialIndex == 0 ? timecodeText : "")
+                timecodeText: dialIndex == 0 ? timecodeText : "",
+                pressLabel: pressLabels.indices.contains(dialIndex) ? pressLabels[dialIndex] : "",
+                rotateLabel: rotateLabels.indices.contains(dialIndex) ? rotateLabels[dialIndex] : "",
+                speedText: speedText)
         }
         .onReceive(state.objectWillChange.receive(on: RunLoop.main)) { _ in
             if state.positionFraction != fraction { fraction = state.positionFraction }
             if state.timecodeText != timecodeText { timecodeText = state.timecodeText }
+            if state.speedText != speedText { speedText = state.speedText }
+            refreshLabels()
         }
     }
 }
 
-/// One dial-width segment of the continuous scrub bar. Segment i fills for
-/// the global fraction range [i/n, (i+1)/n]; segment 0 overlays the timecode.
-struct ScrubBarSegment: View {
+/// One dial section: scrub-bar background (shared across the strip) + this
+/// dial's bound action labels. Segment 0 also shows the timecode. A dial whose
+/// rotate label is "Shuttle" shows the live speed instead of the timecode slot.
+struct DialSegment: View {
 
     let segmentIndex: Int
     let segmentCount: Int
     let fraction: Double
     let timecodeText: String
+    let pressLabel: String
+    let rotateLabel: String
+    let speedText: String
 
     var body: some View {
         GeometryReader { geo in
             let globalProgress = fraction * Double(segmentCount)
             let localFill = min(max(globalProgress - Double(segmentIndex), 0), 1)
-            ZStack(alignment: .leading) {
+            ZStack(alignment: .topLeading) {
                 Rectangle().fill(Color(white: 0.15))
-                Rectangle()
-                    .fill(Color.blue)
-                    .frame(width: geo.size.width * localFill)
-                if segmentIndex == 0 {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text("JOG / SCRUB")
+                Rectangle().fill(Color.blue).frame(width: geo.size.width * localFill)
+                VStack(alignment: .leading, spacing: 0) {
+                    if !rotateLabel.isEmpty {
+                        Text(rotateLabel == "Shuttle" ? "Shuttle \(speedText)" : rotateLabel)
                             .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(Color(white: 0.6))
+                            .foregroundColor(Color(white: 0.85))
+                    }
+                    if !pressLabel.isEmpty {
+                        Text("• \(pressLabel)")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(Color(white: 0.7))
+                    }
+                    if segmentIndex == 0 {
                         Text(timecodeText)
-                            .font(.system(size: 14, weight: .bold).monospacedDigit())
+                            .font(.system(size: 13, weight: .bold).monospacedDigit())
                             .foregroundColor(.white)
                     }
-                    .padding(.leading, 8)
                 }
+                .padding(.leading, 6)
+                .padding(.top, 4)
             }
         }
     }
@@ -323,6 +352,7 @@ import StreamDeckSimulator
             state.setKeyMapping(
                 DeckAction.defaultMapping(modelIdentifier: "plus", keyCount: 8),
                 forModel: "plus")
+            state.setDialMapping(rotate: [8, 10, -1, -1], press: [0, 5, -1, -1], forModel: "plus")
             state.setRecording(true, elapsedText: "00:05:23")
             state.setTransport(playing: true, speedText: "1.0×", followLive: true)
             state.setPosition(timecodeText: "00:04:58:12", positionFraction: 0.85)

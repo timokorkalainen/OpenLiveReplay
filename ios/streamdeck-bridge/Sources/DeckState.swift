@@ -16,6 +16,10 @@ final class DeckState: ObservableObject {
 
     /// model identifier ("mini", "plus", ...) → key-index → action id.
     @Published private(set) var keyMappings: [String: [Int]] = [:]
+    /// model id -> dial-index -> rotate action id (-1 unbound).
+    @Published private(set) var dialRotateMappings: [String: [Int]] = [:]
+    /// model id -> dial-index -> press action id (-1 unbound).
+    @Published private(set) var dialPressMappings: [String: [Int]] = [:]
     @Published private(set) var isRecording = false
     @Published private(set) var recElapsedText = ""
     @Published private(set) var isPlaying = false
@@ -26,6 +30,21 @@ final class DeckState: ObservableObject {
 
     func setKeyMapping(_ mapping: [Int], forModel model: String) {
         if keyMappings[model] != mapping { keyMappings[model] = mapping }
+    }
+
+    func setDialMapping(rotate: [Int], press: [Int], forModel model: String) {
+        if dialRotateMappings[model] != rotate { dialRotateMappings[model] = rotate }
+        if dialPressMappings[model] != press { dialPressMappings[model] = press }
+    }
+
+    func rotateAction(forDial index: Int, model: String) -> DeckAction? {
+        guard let m = dialRotateMappings[model], index >= 0, index < m.count else { return nil }
+        return DeckAction(rawValue: m[index])
+    }
+
+    func pressAction(forDial index: Int, model: String) -> DeckAction? {
+        guard let m = dialPressMappings[model], index >= 0, index < m.count else { return nil }
+        return DeckAction(rawValue: m[index])
     }
 
     func setRecording(_ recording: Bool, elapsedText: String) {

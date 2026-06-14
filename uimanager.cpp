@@ -188,9 +188,29 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             [this](int actionId, bool pressed) {
         dispatchControlAction(actionId, !pressed);
     });
-    connect(m_streamDeckManager, &StreamDeckManager::jogTriggered, this,
-            [this](int delta) {
-        jogStep(delta);
+    connect(m_streamDeckManager, &StreamDeckManager::rotateTriggered, this,
+            [this](int actionId, int delta) {
+        if (actionId == 10) shuttleStep(delta);
+        else jogStep(delta);
+    });
+
+    connect(m_streamDeckManager, &StreamDeckManager::learnInput, this,
+            [this](int elementType, int index) {
+        if (m_streamDeckLearnAction < 0) return;
+        const QString model = m_streamDeckManager->deviceModel();
+        const bool ok = m_streamDeckStore.bind(
+            model, m_streamDeckLearnAction,
+            static_cast<StreamDeckMappingStore::ElementType>(elementType), index,
+            m_streamDeckManager->keyCount(), m_streamDeckManager->dialCount());
+        if (!ok) return;  // invalid pairing — keep listening
+        m_streamDeckStore.writeTo(m_currentSettings);
+        m_settingsManager->save(m_configPath, m_currentSettings);
+        pushStreamDeckMaps();
+        m_streamDeckManager->setLearnMode(false);
+        m_streamDeckLearnAction = -1;
+        emit streamDeckLearnActionChanged();
+        m_streamDeckBindingsVersion++;
+        emit streamDeckBindingsChanged();
     });
     connect(m_streamDeckManager, &StreamDeckManager::scrubTriggered, this,
             [this](double fraction) {
@@ -220,13 +240,28 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     // while playback is paused (no posChanged ticks).
     connect(m_streamDeckManager, &StreamDeckManager::connectedChanged, this,
             [this, pushRecordingState, pushTransportState]() {
-        if (!m_streamDeckManager->connected()) return;
-        pushRecordingState();
-        pushTransportState();
-        if (m_transport) {
-            m_streamDeckManager->setPosition(m_transport->currentPos(),
-                                             recordedDurationMs(),
-                                             m_transport->fps());
+        if (m_streamDeckManager->connected()) {
+            pushRecordingState();
+            pushTransportState();
+            if (m_transport) {
+                m_streamDeckManager->setPosition(m_transport->currentPos(),
+                                                 recordedDurationMs(),
+                                                 m_transport->fps());
+            }
+            // Creates the default layout for a new model, or clamps saved rows
+            // to the live geometry for a known one.
+            const QString model = m_streamDeckManager->deviceModel();
+            m_streamDeckStore.clampToGeometry(model,
+                m_streamDeckManager->keyCount(), m_streamDeckManager->dialCount());
+            pushStreamDeckMaps();
+            m_streamDeckBindingsVersion++;
+            emit streamDeckBindingsChanged();
+        } else if (m_streamDeckLearnAction >= 0) {
+            // Deck unplugged mid-learn — cancel listening on BOTH sides
+            // (the Swift learning flag is a persistent singleton).
+            m_streamDeckManager->setLearnMode(false);
+            m_streamDeckLearnAction = -1;
+            emit streamDeckLearnActionChanged();
         }
     });
 
@@ -954,7 +989,12 @@ int UIManager::midiLastValue(int action) const {
 void UIManager::playPause() {
     if (!m_transport) return;
     cancelFollowLive();
-    m_transport->setPlaying(!m_transport->isPlaying());
+    const bool willPlay = !m_transport->isPlaying();
+    // A shuttle dial can pause at speed 0; resuming must not "play" frozen.
+    if (willPlay && qAbs(m_transport->speed()) < 0.01) {
+        m_transport->setSpeed(1.0);
+    }
+    m_transport->setPlaying(willPlay);
 }
 
 void UIManager::rewind5x() {
@@ -1280,6 +1320,7 @@ void UIManager::setSourceMetadataItems(int index, const QVariantList &items) {
 
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
+        m_streamDeckStore.loadFrom(m_currentSettings);
         int nextId = nextSourceIdSeed(m_currentSettings.sources);
         for (auto &source : m_currentSettings.sources) {
             if (source.id.trimmed().isEmpty()) {
@@ -1692,4 +1733,71 @@ QString UIManager::getSettingsPath(QString fileName) {
 
     // 3. Construct the full filename
     return docPath + "/settings/" + fileName;
+}
+
+void UIManager::pushStreamDeckMaps()
+{
+    if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
+    const QString model = m_streamDeckManager->deviceModel();
+    m_streamDeckManager->pushKeyMap(model, m_streamDeckStore.keyMap(model));
+    m_streamDeckManager->pushDialMaps(model,
+        m_streamDeckStore.dialRotateMap(model),
+        m_streamDeckStore.dialPressMap(model));
+}
+
+void UIManager::beginStreamDeckLearn(int action)
+{
+    if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
+    if (m_streamDeckLearnAction == action) {       // toggle off
+        m_streamDeckLearnAction = -1;
+        m_streamDeckManager->setLearnMode(false);
+        emit streamDeckLearnActionChanged();
+        return;
+    }
+    m_streamDeckLearnAction = action;
+    m_streamDeckManager->setLearnMode(true);
+    emit streamDeckLearnActionChanged();
+}
+
+void UIManager::clearStreamDeckBinding(int action)
+{
+    if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
+    const QString model = m_streamDeckManager->deviceModel();
+    m_streamDeckStore.clear(model, action);
+    m_streamDeckStore.writeTo(m_currentSettings);
+    m_settingsManager->save(m_configPath, m_currentSettings);
+    pushStreamDeckMaps();
+    m_streamDeckBindingsVersion++;
+    emit streamDeckBindingsChanged();
+}
+
+void UIManager::resetStreamDeckDefaults()
+{
+    if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
+    const QString model = m_streamDeckManager->deviceModel();
+    m_streamDeckStore.resetToDefault(model,
+        m_streamDeckManager->keyCount(), m_streamDeckManager->dialCount());
+    m_streamDeckStore.writeTo(m_currentSettings);
+    m_settingsManager->save(m_configPath, m_currentSettings);
+    pushStreamDeckMaps();
+    m_streamDeckBindingsVersion++;
+    emit streamDeckBindingsChanged();
+}
+
+QString UIManager::streamDeckBindingLabel(int action) const
+{
+    if (!m_streamDeckManager) return QStringLiteral("Unassigned");
+    return m_streamDeckStore.bindingLabel(m_streamDeckManager->deviceModel(), action);
+}
+
+void UIManager::shuttleStep(int delta)
+{
+    if (!m_transport) return;
+    cancelFollowLive();
+    const ShuttleResult r = shuttleLadderStep(m_transport->speed(), delta);
+    m_transport->setSpeed(r.speed);
+    m_transport->setPlaying(r.playing);
+    if (m_playbackWorker && !r.playing) {
+        m_playbackWorker->seekTo(m_transport->currentPos());
+    }
 }

@@ -91,9 +91,13 @@ scrub position) rendered on the device.
      streamdeck-kit-ipad 1.3.0), then xcodebuild archive → xcframework into
      the gitignored `ios_build/xcframeworks/` (same pattern as
      `build_ffmpeg_ios_srt.sh`). Requires `brew install xcodegen`.
-   - CMake: `OLR_ENABLE_STREAMDECK` option, default ON for iOS, forced OFF
-     elsewhere; links + embeds the xcframework; fatal configure error naming
-     the build script if the framework is missing
+   - CMake: `OLR_ENABLE_STREAMDECK` option, **default OFF** (opt-in via
+     `-DOLR_ENABLE_STREAMDECK=ON`), forced OFF on non-iOS; links + embeds the
+     xcframework; fatal configure error naming the build script if the
+     framework is missing. Default is OFF because the driver-link entitlement
+     (`com.apple.developer.driverkit.communicates-with-drivers`) is only
+     provisionable on a paid Apple Developer Program team — personal/free
+     teams are refused, so a default-ON build can't be signed for a device.
    - Entitlements file gains
      `com.apple.developer.driverkit.communicates-with-drivers`
    - `ios/Info.plist` gains `LSApplicationQueriesSchemes: elgato-device-driver`

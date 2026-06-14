@@ -17,8 +17,10 @@ public final class OLRStreamDeckBridge: NSObject {
 
     /// (actionId, pressed). See DeckAction for the id vocabulary.
     @objc public var onAction: ((Int, Bool) -> Void)?
-    /// Signed dial-rotation delta (positive = clockwise).
-    @objc public var onJog: ((Int) -> Void)?
+    /// (rotateActionId, signed delta). Fired only outside learn mode.
+    @objc public var onRotate: ((Int, Int) -> Void)?
+    /// (elementType, index) during learn mode: 0 = key, 1 = dial-press, 2 = dial-turn.
+    @objc public var onLearnInput: ((Int, Int) -> Void)?
     /// Touch-strip scrub position, 0.0 ... 1.0.
     @objc public var onScrub: ((Double) -> Void)?
     /// (productName, modelIdentifier, keyCount, dialCount).
@@ -30,6 +32,8 @@ public final class OLRStreamDeckBridge: NSObject {
 
     private var started = false
     private var cancellables = Set<AnyCancellable>()
+    private var learning = false
+    private var currentModel = "unknown"
 
     private override init() {
         super.init()
@@ -60,6 +64,7 @@ public final class OLRStreamDeckBridge: NSObject {
 
     private func attach(_ device: StreamDeck) {
         let model = deckModelIdentifier(for: device)
+        currentModel = model
         if state.keyMappings[model] == nil {
             state.setKeyMapping(
                 DeckAction.defaultMapping(
@@ -82,6 +87,12 @@ public final class OLRStreamDeckBridge: NSObject {
     /// default flow, which computes mappings in attach()).
     @objc public func setKeyMapping(_ mapping: [Int], forModel model: String) {
         state.setKeyMapping(mapping, forModel: model)
+    }
+
+    @objc public func setLearnMode(_ active: Bool) { learning = active }
+
+    @objc public func setDialMapping(rotate: [Int], press: [Int], forModel model: String) {
+        state.setDialMapping(rotate: rotate, press: press, forModel: model)
     }
 
     @objc public func setRecording(_ recording: Bool, elapsedText: String) {
@@ -118,9 +129,43 @@ public final class OLRStreamDeckBridge: NSObject {
     // MARK: Internal event funnel (called from layout views).
 
     func emitAction(_ actionId: Int, pressed: Bool) { onAction?(actionId, pressed) }
-    func emitJog(_ delta: Int) { onJog?(delta) }
+
+    func emitKey(_ keyIndex: Int, pressed: Bool) {
+        if learning {
+            if pressed { onLearnInput?(0, keyIndex) }
+            return
+        }
+        guard let action = state.action(forKey: keyIndex, model: currentModel),
+              action != .timecodeDisplay, action != .speedDisplay else { return }
+        onAction?(action.rawValue, pressed)
+    }
+
+    func emitDialPress(_ dial: Int, pressed: Bool) {
+        if learning {
+            if pressed { onLearnInput?(1, dial) }
+            return
+        }
+        guard let action = state.pressAction(forDial: dial, model: currentModel) else { return }
+        onAction?(action.rawValue, pressed)
+    }
+
+    func emitDialRotate(_ dial: Int, delta: Int) {
+        if learning {
+            onLearnInput?(2, dial)
+            return
+        }
+        guard let action = state.rotateAction(forDial: dial, model: currentModel) else { return }
+        onRotate?(action.rawValue, delta)
+    }
+
     func emitScrub(_ fraction: Double) { onScrub?(fraction) }
 }
+
+#if DEBUG
+extension OLRStreamDeckBridge {
+    @objc func _setCurrentModelForTesting(_ model: String) { currentModel = model }
+}
+#endif
 
 /// Stable model identifier shared with the Qt side and used as the
 /// key-mapping dictionary key.

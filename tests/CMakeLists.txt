@@ -27,6 +27,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/recordingclock.cpp"
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
     "${CMAKE_SOURCE_DIR}/playback/playbacktransport.cpp"
+    "${CMAKE_SOURCE_DIR}/streamdeck/streamdeckmappingstore.cpp"
 )
 target_include_directories(olr_test_core PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(olr_test_core

@@ -21,3 +21,7 @@ void StreamDeckManager::start() {}
 void StreamDeckManager::setRecording(bool, qint64) {}
 void StreamDeckManager::setTransport(bool, double, bool) {}
 void StreamDeckManager::setPosition(qint64, qint64, int) {}
+
+void StreamDeckManager::setLearnMode(bool) {}
+void StreamDeckManager::pushKeyMap(const QString &, const QList<int> &) {}
+void StreamDeckManager::pushDialMaps(const QString &, const QList<int> &, const QList<int> &) {}

@@ -46,6 +46,14 @@ AppSettings TestSettingsManager::sampleSettings() {
     s.midiBindingData2.insert(1, 100);
     s.midiBindingData2Forward.insert(1, 1);
     s.midiBindingData2Backward.insert(1, 127);
+
+    // Stream Deck per-model mapping tables (model id -> index -> action id).
+    s.streamDeckKeyMaps.insert(QStringLiteral("plusXL"),
+                               QList<int>{9, 0, 4, -1, -1});
+    s.streamDeckDialPressMaps.insert(QStringLiteral("plusXL"),
+                                     QList<int>{0, 5, -1, -1, -1, -1});
+    s.streamDeckDialRotateMaps.insert(QStringLiteral("plusXL"),
+                                      QList<int>{8, 10, -1, -1, -1, -1});
     return s;
 }
 
@@ -84,6 +92,10 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.midiBindingData2.value(1), 100);
     QCOMPARE(out.midiBindingData2Forward.value(1), 1);
     QCOMPARE(out.midiBindingData2Backward.value(1), 127);
+
+    QCOMPARE(out.streamDeckKeyMaps, in.streamDeckKeyMaps);
+    QCOMPARE(out.streamDeckDialPressMaps, in.streamDeckDialPressMaps);
+    QCOMPARE(out.streamDeckDialRotateMaps, in.streamDeckDialRotateMaps);
 }
 
 void TestSettingsManager::loadMissingFileReturnsFalse() {

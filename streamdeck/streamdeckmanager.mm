@@ -25,7 +25,8 @@ StreamDeckManager::~StreamDeckManager()
 {
     OLRStreamDeckBridge *bridge = [OLRStreamDeckBridge shared];
     bridge.onAction = nil;
-    bridge.onJog = nil;
+    bridge.onRotate = nil;
+    bridge.onLearnInput = nil;
     bridge.onScrub = nil;
     bridge.onDeviceConnected = nil;
     bridge.onDeviceDisconnected = nil;
@@ -70,11 +71,19 @@ void StreamDeckManager::start()
         }, Qt::QueuedConnection);
     };
 
-    bridge.onJog = ^(NSInteger delta) {
+    bridge.onRotate = ^(NSInteger actionId, NSInteger delta) {
         StreamDeckManager *s = self.data();
         if (!s) return;
-        QMetaObject::invokeMethod(s, [s, delta]() {
-            emit s->jogTriggered(int(delta));
+        QMetaObject::invokeMethod(s, [s, actionId, delta]() {
+            emit s->rotateTriggered(int(actionId), int(delta));
+        }, Qt::QueuedConnection);
+    };
+
+    bridge.onLearnInput = ^(NSInteger elementType, NSInteger index) {
+        StreamDeckManager *s = self.data();
+        if (!s) return;
+        QMetaObject::invokeMethod(s, [s, elementType, index]() {
+            emit s->learnInput(int(elementType), int(index));
         }, Qt::QueuedConnection);
     };
 
@@ -88,14 +97,14 @@ void StreamDeckManager::start()
 
     bridge.onDeviceConnected = ^(NSString *name, NSString *model,
                                  NSInteger keyCount, NSInteger dialCount) {
-        Q_UNUSED(keyCount)
-        Q_UNUSED(dialCount)
         StreamDeckManager *s = self.data();
         if (!s) return;
         const QString qname = QString::fromNSString(name);
         const QString qmodel = QString::fromNSString(model);
-        QMetaObject::invokeMethod(s, [s, qname, qmodel]() {
-            s->handleDeviceConnected(qname, qmodel);
+        const int kc = int(keyCount);
+        const int dc = int(dialCount);
+        QMetaObject::invokeMethod(s, [s, qname, qmodel, kc, dc]() {
+            s->handleDeviceConnected(qname, qmodel, kc, dc);
         }, Qt::QueuedConnection);
     };
 
@@ -119,10 +128,13 @@ void StreamDeckManager::start()
     }
 }
 
-void StreamDeckManager::handleDeviceConnected(const QString &name, const QString &model)
+void StreamDeckManager::handleDeviceConnected(const QString &name, const QString &model,
+                                              int keyCount, int dialCount)
 {
     m_deviceName = name;
     m_deviceModel = model;
+    m_keyCount = keyCount;
+    m_dialCount = dialCount;
     m_connected = true;
     emit connectedChanged();
 }
@@ -133,6 +145,8 @@ void StreamDeckManager::handleDeviceDisconnected()
     m_connected = false;
     m_deviceName.clear();
     m_deviceModel.clear();
+    m_keyCount = 0;
+    m_dialCount = 0;
     // A hold action (rewind/forward 5x) never gets its release once the deck
     // is gone — synthesize releases so the transport can't stay stuck at 5x.
     emit actionTriggered(1, false);
@@ -211,4 +225,30 @@ QString StreamDeckManager::formatSpeed(bool playing, double speed)
 {
     if (!playing) return QStringLiteral("Paused");
     return QString::number(speed, 'f', 1) + QStringLiteral("×");
+}
+
+void StreamDeckManager::setLearnMode(bool active)
+{
+    [[OLRStreamDeckBridge shared] setLearnMode:active];
+}
+
+static NSArray<NSNumber *> *toNSNumbers(const QList<int> &list)
+{
+    NSMutableArray<NSNumber *> *arr = [NSMutableArray arrayWithCapacity:list.size()];
+    for (int v : list) [arr addObject:@(v)];
+    return arr;
+}
+
+void StreamDeckManager::pushKeyMap(const QString &model, const QList<int> &keyMap)
+{
+    [[OLRStreamDeckBridge shared] setKeyMapping:toNSNumbers(keyMap)
+                                       forModel:model.toNSString()];
+}
+
+void StreamDeckManager::pushDialMaps(const QString &model,
+                                     const QList<int> &rotateMap, const QList<int> &pressMap)
+{
+    [[OLRStreamDeckBridge shared] setDialMappingWithRotate:toNSNumbers(rotateMap)
+                                                     press:toNSNumbers(pressMap)
+                                                  forModel:model.toNSString()];
 }

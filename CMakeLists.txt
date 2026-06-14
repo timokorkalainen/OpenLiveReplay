@@ -142,14 +142,23 @@ target_link_libraries(OpenLiveReplayMidi PRIVATE
 
 # ==============================================================================
 # Stream Deck (Elgato) support — iPadOS only; stub elsewhere.
+#
+# OFF by default: the Stream Deck driver link requires the
+# com.apple.developer.driverkit.communicates-with-drivers entitlement, which
+# Apple only provisions for paid Apple Developer Program teams (personal/free
+# teams are refused, so the app can't be signed/installed with it enabled).
+# Enable explicitly on a paid team:  -DOLR_ENABLE_STREAMDECK=ON
 # ==============================================================================
 if(IOS)
-    option(OLR_ENABLE_STREAMDECK "Enable Elgato Stream Deck support" ON)
+    option(OLR_ENABLE_STREAMDECK "Enable Elgato Stream Deck support (needs paid Apple Developer team)" OFF)
 else()
     set(OLR_ENABLE_STREAMDECK OFF)
 endif()
 
-target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager.h)
+target_sources(OpenLiveReplay PRIVATE
+    streamdeck/streamdeckmanager.h
+    streamdeck/streamdeckmappingstore.h
+    streamdeck/streamdeckmappingstore.cpp)
 if(OLR_ENABLE_STREAMDECK)
     target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager.mm)
 else()

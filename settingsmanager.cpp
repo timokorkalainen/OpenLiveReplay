@@ -1,5 +1,31 @@
 #include "settingsmanager.h"
 #include <QDebug>
+#include <QJsonValue>
+
+namespace {
+// model id -> [action ids]  <->  JSON object of arrays.
+QJsonObject streamDeckMapsToJson(const QMap<QString, QList<int>> &maps) {
+    QJsonObject obj;
+    for (auto it = maps.constBegin(); it != maps.constEnd(); ++it) {
+        QJsonArray arr;
+        for (int v : it.value()) arr.append(v);
+        obj.insert(it.key(), arr);
+    }
+    return obj;
+}
+
+QMap<QString, QList<int>> streamDeckMapsFromJson(const QJsonValue &val) {
+    QMap<QString, QList<int>> maps;
+    if (!val.isObject()) return maps;
+    const QJsonObject obj = val.toObject();
+    for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
+        QList<int> row;
+        for (const QJsonValue &v : it.value().toArray()) row.append(v.toInt(-1));
+        maps.insert(it.key(), row);
+    }
+    return maps;
+}
+} // namespace
 
 SettingsManager::SettingsManager() {}
 
@@ -46,6 +72,10 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     }
     root["sources"] = sourcesArray;
     root["metadataFields"] = settings.metadataFields;
+
+    root["streamDeckKeyMaps"] = streamDeckMapsToJson(settings.streamDeckKeyMaps);
+    root["streamDeckDialPressMaps"] = streamDeckMapsToJson(settings.streamDeckDialPressMaps);
+    root["streamDeckDialRotateMaps"] = streamDeckMapsToJson(settings.streamDeckDialRotateMaps);
 
     QJsonDocument doc(root);
     QFile file(path);
@@ -140,6 +170,10 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     }
 
     settings.metadataFields = root["metadataFields"].toArray();
+
+    settings.streamDeckKeyMaps = streamDeckMapsFromJson(root.value("streamDeckKeyMaps"));
+    settings.streamDeckDialPressMaps = streamDeckMapsFromJson(root.value("streamDeckDialPressMaps"));
+    settings.streamDeckDialRotateMaps = streamDeckMapsFromJson(root.value("streamDeckDialRotateMaps"));
 
     return true;
 }

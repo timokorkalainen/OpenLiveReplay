@@ -14,6 +14,7 @@ enum DeckAction: Int {
     case stepBackward = 7
     case jog = 8            // dial rotation only, never on a key
     case record = 9
+    case shuttle = 10       // dial rotation only, variable-speed
     case timecodeDisplay = 20
     case speedDisplay = 21
 }
@@ -32,6 +33,7 @@ extension DeckAction {
         case .stepBackward: return "backward.frame.fill"
         case .jog: return "dial.medium.fill"
         case .record: return "record.circle"
+        case .shuttle: return "dial.high.fill"
         case .timecodeDisplay: return "timer"
         case .speedDisplay: return "gauge.with.needle"
         }
@@ -49,6 +51,7 @@ extension DeckAction {
         case .stepBackward: return "-1f"
         case .jog: return "Jog"
         case .record: return "REC"
+        case .shuttle: return "Shuttle"
         case .timecodeDisplay: return ""
         case .speedDisplay: return ""
         }
