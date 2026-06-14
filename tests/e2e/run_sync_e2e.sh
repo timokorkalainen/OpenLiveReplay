@@ -130,6 +130,33 @@ case "$SCENARIO" in
     exit 0
     ;;
 
+  intercam_skew)
+    # Two independent producers; source B started D ms after A models a
+    # camera whose timeline is offset by D. The engine anchors each to its own
+    # first-packet arrival, so it bakes the offset in (no shared reference).
+    D_MS=${SKEW_MS:-250}
+    P0=$BASE_PORT; P1=$((BASE_PORT+1))
+    produce "$P0" 30 0
+    sleep "$(awk -v d="$D_MS" 'BEGIN{printf "%.3f", d/1000}')"
+    produce "$P1" 30 0
+    sleep 0.5
+    MKV=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \
+            --outdir "$WORKDIR" --name intercam_skew --seconds 8 --fps 30 | tail -n1)
+    if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=intercam_skew ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
+    expect_video_tracks "$MKV" 2 || { echo "PASS: report emitted (diagnostic)"; exit 0; }
+
+    flash_pts_series "$MKV" 0 > "$WORKDIR/v0.txt"
+    flash_pts_series "$MKV" 1 > "$WORKDIR/v1.txt"
+    # Index-pair flashes; signed mean Δ (view0 - view1) and stdev, in ms.
+    STATS=$(paste "$WORKDIR/v0.txt" "$WORKDIR/v1.txt" | awk '
+        NF==2 { d=($1-$2)*1000; s+=d; ss+=d*d; n++ }
+        END { if(n>0){ m=s/n; v=ss/n-m*m; if(v<0)v=0; printf "%d %.1f %.1f", n, m, sqrt(v) } else printf "0 nan nan" }')
+    read -r NP MEAN STDEV <<<"$STATS"
+    emit "[sync] scenario=intercam_skew flashes_paired=${NP} intercam_offset_ms: mean=${MEAN} stdev=${STDEV} (D_injected=${D_MS})"
+    echo "PASS: report emitted (diagnostic, non-gating)"
+    exit 0
+    ;;
+
   *)
     echo "ERROR: unknown scenario '$SCENARIO'"
     echo "PASS: report emitted (diagnostic)"
