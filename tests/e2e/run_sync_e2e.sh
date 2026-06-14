@@ -157,6 +157,37 @@ case "$SCENARIO" in
     exit 0
     ;;
 
+  drift_2997)
+    # One source paced at 29.97 (30000/1001) while the session runs int fps=30.
+    # Flash every source-second; measure how the flash PTS slope deviates from
+    # 1.0 (drift) over a long run. Quantifies FRAC-1.
+    P0=$BASE_PORT
+    DUR=${DRIFT_SECONDS:-60}
+    produce "$P0" "30000/1001" 0
+    sleep 0.5
+    MKV=$("$HARNESS" --url "$(url "$P0")" \
+            --outdir "$WORKDIR" --name drift_2997 --seconds "$DUR" --fps 30 | tail -n1)
+    if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=drift_2997 ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
+
+    flash_pts_series "$MKV" 0 > "$WORKDIR/v0.txt"
+    # Least-squares slope of (flash_pts vs flash_index); index k=0,1,2,...
+    # Each flash is one source-second apart, so an ideal timeline has slope 1.0.
+    STATS=$(awk '
+        { x=NR-1; y=$1; sx+=x; sy+=y; sxx+=x*x; sxy+=x*y; n++ }
+        END {
+            if (n>=2) {
+                slope=(n*sxy - sx*sy)/(n*sxx - sx*sx);
+                ppm=(slope-1.0)*1e6;
+                slip=(slope-1.0)*30*(y);          # frames of slip over the run
+                printf "%d %.6f %.0f %.2f", n, slope, ppm, slip
+            } else printf "0 nan nan nan"
+        }' "$WORKDIR/v0.txt")
+    read -r NF SLOPE PPM SLIP <<<"$STATS"
+    emit "[sync] scenario=drift_2997 flashes=${NF} slope=${SLOPE} drift_ppm=${PPM} drift_frames_slip=${SLIP}"
+    echo "PASS: report emitted (diagnostic, non-gating)"
+    exit 0
+    ;;
+
   *)
     echo "ERROR: unknown scenario '$SCENARIO'"
     echo "PASS: report emitted (diagnostic)"
