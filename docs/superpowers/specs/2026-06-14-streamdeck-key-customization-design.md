@@ -1,7 +1,7 @@
 # Stream Deck Key Customization Design
 
 **Date:** 2026-06-14
-**Status:** Approved design, pending implementation plan
+**Status:** Implemented
 **Target:** iPadOS builds of OpenLiveReplay (Stream Deck integration)
 **Builds on:** `docs/superpowers/specs/2026-06-11-streamdeck-integration-design.md`
 
