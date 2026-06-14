@@ -33,6 +33,11 @@ struct AppSettings {
     QMap<int, int> midiBindingData2;
     QMap<int, int> midiBindingData2Forward;
     QMap<int, int> midiBindingData2Backward;
+
+    // Stream Deck per-model mappings: model id -> (index -> action id, -1 = unbound).
+    QMap<QString, QList<int>> streamDeckKeyMaps;
+    QMap<QString, QList<int>> streamDeckDialPressMaps;
+    QMap<QString, QList<int>> streamDeckDialRotateMaps;
 };
 
 class SettingsManager {
