@@ -19,6 +19,7 @@ private slots:
     void loadPrunesOutOfRangeIndices();
     void resetRestoresDefault();
     void shuttleLadderSnapsClampsAndPauses();
+    void defaultPedalLayout();
 };
 
 void TestStreamDeckMappingStore::defaultLayoutMatchesPriority() {
@@ -125,6 +126,12 @@ void TestStreamDeckMappingStore::shuttleLadderSnapsClampsAndPauses() {
     QCOMPARE(r.speed, 5.0);
     r = shuttleLadderStep(3.0, +1);
     QCOMPARE(r.speed, 5.0);
+}
+
+void TestStreamDeckMappingStore::defaultPedalLayout() {
+    StreamDeckMappingStore s;
+    s.resetToDefault("pedal", 3, 0);
+    QCOMPARE(s.keyMap("pedal"), (QList<int>{0, 7, 3}));
 }
 
 QTEST_MAIN(TestStreamDeckMappingStore)

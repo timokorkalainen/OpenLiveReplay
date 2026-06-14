@@ -255,7 +255,9 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             m_streamDeckBindingsVersion++;
             emit streamDeckBindingsChanged();
         } else if (m_streamDeckLearnAction >= 0) {
-            // Deck unplugged mid-learn — cancel the listening state.
+            // Deck unplugged mid-learn — cancel listening on BOTH sides
+            // (the Swift learning flag is a persistent singleton).
+            m_streamDeckManager->setLearnMode(false);
             m_streamDeckLearnAction = -1;
             emit streamDeckLearnActionChanged();
         }
@@ -951,7 +953,12 @@ int UIManager::midiLastValue(int action) const {
 void UIManager::playPause() {
     if (!m_transport) return;
     cancelFollowLive();
-    m_transport->setPlaying(!m_transport->isPlaying());
+    const bool willPlay = !m_transport->isPlaying();
+    // A shuttle dial can pause at speed 0; resuming must not "play" frozen.
+    if (willPlay && qAbs(m_transport->speed()) < 0.01) {
+        m_transport->setSpeed(1.0);
+    }
+    m_transport->setPlaying(willPlay);
 }
 
 void UIManager::rewind5x() {

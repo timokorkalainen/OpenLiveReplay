@@ -47,7 +47,16 @@ bool StreamDeckMappingStore::isValidBinding(int action, ElementType type) {
 }
 
 void StreamDeckMappingStore::resetToDefault(const QString &model, int keyCount, int dialCount) {
-    m_keyMaps[model] = defaultKeyRow(keyCount);
+    if (model == QLatin1String("pedal")) {
+        // Foot switches, no displays: play/pause, step back, step forward.
+        QList<int> row;
+        const int pedal[3] = {0, 7, 3};
+        for (int i = 0; i < keyCount; ++i)
+            row.append(i < 3 ? pedal[i] : -1);
+        m_keyMaps[model] = row;
+    } else {
+        m_keyMaps[model] = defaultKeyRow(keyCount);
+    }
     QList<int> rotate = blankRow(dialCount);
     QList<int> press = blankRow(dialCount);
     if (dialCount > 0) {
