@@ -186,8 +186,8 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             [this](int actionId, bool pressed) {
         dispatchControlAction(actionId, !pressed);
     });
-    connect(m_streamDeckManager, &StreamDeckManager::jogTriggered, this,
-            [this](int delta) {
+    connect(m_streamDeckManager, &StreamDeckManager::rotateTriggered, this,
+            [this](int, int delta) {
         jogStep(delta);
     });
     connect(m_streamDeckManager, &StreamDeckManager::scrubTriggered, this,
