@@ -117,11 +117,16 @@ set_tests_properties(sync_intercam_matched sync_intercam_skew sync_drift_2997 sy
 
 The `sync-report` label is **distinct** from `e2e`, so existing `ctest`/CI
 invocations that select or exclude `e2e` are unaffected, and these can be run on
-demand with `ctest -L sync-report`. They are excluded from the sanitizer job's
-explicit build-target list (they are diagnostic, not gates) — and the CI lesson
-from prior PRs applies: any new test executable referenced by a build must be
-added to `.github/workflows/ci.yml`'s target list, so we deliberately keep these
-OFF that list and out of the gating ctest selection.
+demand with `ctest -L sync-report`.
+
+**As built, CI handling is:** both `ctest` invocations in
+`.github/workflows/ci.yml` (the Build+Test job and the sanitizer job) add
+`-LE sync-report`, so the four diagnostic tests never run in CI and can never
+gate it — but `sync_harness` is still compiled by the Build+Test job's
+`cmake --build`, so it stays regression-proof. `sync_harness` is intentionally
+**omitted** from the sanitizer job's explicit `--target` list (it is a
+diagnostic harness, not a sanitized gate); the `-LE sync-report` exclusion is
+what keeps that omission from producing missing-binary test runs there.
 
 ## 4. Measurement methodology
 
@@ -148,12 +153,14 @@ beep** for audio timing. Flash/beep onset PTS is extracted with `ffmpeg
 
 - **Producer:** TWO independent `-re` producers to ports `base`, `base+1`. Source
   B is started a **known delay D** after source A (default `D=250 ms`, shell
-  `sleep`). Each emits a distinctive **3-flash "clap" at start** followed by a
-  1 s flash cadence, so flash #k is unambiguously pairable across tracks despite
-  the phase offset.
+  `sleep`). Each emits a 1 s flash cadence.
 - **Record:** 2-view MKV as above.
-- **Analyze:** align the two flash series by their start-clap, then metric = mean
-  `PTS_view0(k) − PTS_view1(k)` and its drift over the run.
+- **Analyze:** **as built**, the two per-track flash series are paired by index
+  (flash #k on view 0 with flash #k on view 1); the planned 3-flash "clap" was
+  simplified to index-pairing, which is equivalent for these controlled synthetic
+  sources (`FLASH_THRESH=180` excludes the h264 cold-start gray, so each series
+  starts at the first true flash). Metric = signed mean `PTS_view0(k) −
+  PTS_view1(k)` (ms) and its stdev across the run.
 - **Interpretation:** the engine anchors each source to its own first-packet
   arrival with no shared reference, so it should bake in ≈ D. The number
   quantifies how much (and whether it stays constant). `D_injected` is printed
