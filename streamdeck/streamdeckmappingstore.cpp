@@ -27,6 +27,7 @@ void removeAction(QList<int> &row, int action) {
 }
 
 QList<int> fit(const QList<int> &saved, int n) {
+    if (n <= 0) return {};
     QList<int> row = saved.mid(0, n);
     while (row.size() < n) row.append(kUnbound);
     return row;
@@ -50,8 +51,10 @@ void StreamDeckMappingStore::resetToDefault(const QString &model, int keyCount, 
     QList<int> rotate = blankRow(dialCount);
     QList<int> press = blankRow(dialCount);
     if (dialCount > 0) {
-        rotate[0] = 8;
-        press[0] = 0;
+        rotate[0] = 8;   // jog wheel on dial 0
+        // Dial presses default unbound: play/pause lives on a key, and the
+        // move/displace model forbids one action on two controls. Users can
+        // learn a dial press explicitly.
     }
     m_dialRotateMaps[model] = rotate;
     m_dialPressMaps[model] = press;
@@ -85,7 +88,7 @@ bool StreamDeckMappingStore::bind(const QString &model, int action, ElementType 
     removeAction(m_keyMaps[model], action);
     removeAction(m_dialPressMaps[model], action);
     removeAction(m_dialRotateMaps[model], action);
-    rowFor(type, model)[index] = action;
+    target[index] = action;
     return true;
 }
 

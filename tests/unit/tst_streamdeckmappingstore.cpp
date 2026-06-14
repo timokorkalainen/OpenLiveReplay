@@ -29,7 +29,7 @@ void TestStreamDeckMappingStore::defaultLayoutMatchesPriority() {
     QCOMPARE(keys.mid(0, 11), (QList<int>{9, 0, 4, 5, 7, 3, 1, 2, 6, 20, 21}));
     QCOMPARE(keys.at(11), -1);
     QCOMPARE(s.dialRotateMap("plusXL").at(0), 8);
-    QCOMPARE(s.dialPressMap("plusXL").at(0), 0);
+    QCOMPARE(s.dialPressMap("plusXL").at(0), -1);   // dial presses default unbound
     QCOMPARE(s.dialRotateMap("plusXL").at(1), -1);
 }
 
