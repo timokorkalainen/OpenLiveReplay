@@ -1707,7 +1707,7 @@ void UIManager::beginStreamDeckLearn(int action)
 
 void UIManager::clearStreamDeckBinding(int action)
 {
-    if (!m_streamDeckManager) return;
+    if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
     const QString model = m_streamDeckManager->deviceModel();
     m_streamDeckStore.clear(model, action);
     m_streamDeckStore.writeTo(m_currentSettings);

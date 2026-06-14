@@ -232,6 +232,8 @@ private:
     void dispatchControlAction(int action, bool isRelease);
     void jogStep(int delta);
     void setFollowLive(bool on);
+    void pushStreamDeckMaps();
+    void shuttleStep(int delta);
 
     ReplayManager* m_replayManager;
     AppSettings m_currentSettings;
@@ -248,8 +250,6 @@ private:
     StreamDeckMappingStore m_streamDeckStore;
     int m_streamDeckLearnAction = -1;
     int m_streamDeckBindingsVersion = 0;
-    void pushStreamDeckMaps();
-    void shuttleStep(int delta);
     int m_midiLearnAction = -1;
     bool m_playbackSingleView = false;
     int m_playbackSelectedIndex = -1;
