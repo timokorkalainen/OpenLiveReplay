@@ -155,7 +155,10 @@ else()
     set(OLR_ENABLE_STREAMDECK OFF)
 endif()
 
-target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager.h)
+target_sources(OpenLiveReplay PRIVATE
+    streamdeck/streamdeckmanager.h
+    streamdeck/streamdeckmappingstore.h
+    streamdeck/streamdeckmappingstore.cpp)
 if(OLR_ENABLE_STREAMDECK)
     target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager.mm)
 else()

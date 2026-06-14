@@ -17,6 +17,7 @@
 #include "playback/audioplayer.h"
 #include "midi/midimanager.h"
 #include "streamdeck/streamdeckmanager.h"
+#include "streamdeck/streamdeckmappingstore.h"
 
 class QScreen;
 
@@ -49,6 +50,8 @@ class UIManager : public QObject {
     Q_PROPERTY(int midiLastValuesVersion READ midiLastValuesVersion NOTIFY midiLastValuesChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
     Q_PROPERTY(StreamDeckManager* streamDeck READ streamDeck CONSTANT)
+    Q_PROPERTY(int streamDeckLearnAction READ streamDeckLearnAction NOTIFY streamDeckLearnActionChanged)
+    Q_PROPERTY(int streamDeckBindingsVersion READ streamDeckBindingsVersion NOTIFY streamDeckBindingsChanged)
     Q_PROPERTY(QVariantList screenOptions READ screenOptions NOTIFY screensChanged)
     Q_PROPERTY(bool screensReady READ screensReady NOTIFY screensChanged)
     Q_PROPERTY(int screenCount READ screenCount NOTIFY screensChanged)
@@ -87,6 +90,8 @@ public:
     int midiLastValuesVersion() const;
     PlaybackTransport* transport() const { return m_transport; }
     StreamDeckManager* streamDeck() const { return m_streamDeckManager; }
+    int streamDeckLearnAction() const { return m_streamDeckLearnAction; }
+    int streamDeckBindingsVersion() const { return m_streamDeckBindingsVersion; }
     QVariantList screenOptions() const;
     bool screensReady() const;
     int screenCount() const;
@@ -134,6 +139,10 @@ public:
     Q_INVOKABLE void beginMidiLearnJogBackward(int action);
     Q_INVOKABLE void clearMidiBinding(int action);
     Q_INVOKABLE QString midiBindingLabel(int action) const;
+    Q_INVOKABLE void beginStreamDeckLearn(int action);
+    Q_INVOKABLE void clearStreamDeckBinding(int action);
+    Q_INVOKABLE void resetStreamDeckDefaults();
+    Q_INVOKABLE QString streamDeckBindingLabel(int action) const;
     Q_INVOKABLE int midiLastValue(int action) const;
     Q_INVOKABLE void playPause();
     Q_INVOKABLE void rewind5x();
@@ -188,6 +197,8 @@ signals:
     void viewSlotMapChanged();
     void sourceEnabledChanged();
     void followLiveChanged();
+    void streamDeckLearnActionChanged();
+    void streamDeckBindingsChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -234,6 +245,11 @@ private:
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;
     StreamDeckManager* m_streamDeckManager = nullptr;
+    StreamDeckMappingStore m_streamDeckStore;
+    int m_streamDeckLearnAction = -1;
+    int m_streamDeckBindingsVersion = 0;
+    void pushStreamDeckMaps();
+    void shuttleStep(int delta);
     int m_midiLearnAction = -1;
     bool m_playbackSingleView = false;
     int m_playbackSelectedIndex = -1;
