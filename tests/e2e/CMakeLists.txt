@@ -77,3 +77,23 @@ set_tests_properties(
     LABELS "e2e"
     TIMEOUT 180
     RUN_SERIAL TRUE)
+
+# --- Report-only frame-sync scoreboard (NON-GATING) -------------------------
+# These drive sync_harness through synthetic synchronized sources and print
+# measured inter-camera offset / drift / lip-sync numbers. They ALWAYS exit 0
+# (diagnostic, not a gate) and carry the distinct "sync-report" label so the
+# gating e2e selection and the sanitizer build-target list are unaffected.
+# Run on demand with:  ctest -L sync-report
+set(_sync_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_sync_e2e.sh")
+add_test(NAME sync_intercam_matched
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" intercam_matched 23480)
+add_test(NAME sync_intercam_skew
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" intercam_skew 23482)
+add_test(NAME sync_drift_2997
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" drift_2997 23484)
+add_test(NAME sync_lipsync
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 23486)
+
+set_tests_properties(
+    sync_intercam_matched sync_intercam_skew sync_drift_2997 sync_lipsync
+    PROPERTIES LABELS "sync-report" TIMEOUT 180 RUN_SERIAL TRUE)
