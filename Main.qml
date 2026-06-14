@@ -516,6 +516,80 @@ ApplicationWindow {
                                         }
                                     }
                                 }
+
+                                GroupBox {
+                                    title: "Button Mapping"
+                                    Layout.fillWidth: true
+                                    visible: appWindow.uiManagerRef.streamDeck.connected
+
+                                    ColumnLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 8
+
+                                        RowLayout {
+                                            Layout.fillWidth: true
+                                            Text {
+                                                text: "Click Learn, then press a key or turn/press a dial."
+                                                color: "#aaaaaa"
+                                                Layout.fillWidth: true
+                                                wrapMode: Text.WordWrap
+                                            }
+                                            Button {
+                                                text: "Reset to default"
+                                                onClicked: appWindow.uiManagerRef.resetStreamDeckDefaults()
+                                            }
+                                        }
+
+                                        Repeater {
+                                            model: [
+                                                { name: "Record",      action: 9,  gesture: "key or dial" },
+                                                { name: "Play/Pause",  action: 0,  gesture: "key or dial" },
+                                                { name: "Go Live",     action: 4,  gesture: "key or dial" },
+                                                { name: "Capture",     action: 5,  gesture: "key or dial" },
+                                                { name: "Prev Frame",  action: 7,  gesture: "key or dial" },
+                                                { name: "Next Frame",  action: 3,  gesture: "key or dial" },
+                                                { name: "Rewind 5×",   action: 1,  gesture: "key or dial" },
+                                                { name: "Forward 5×",  action: 2,  gesture: "key or dial" },
+                                                { name: "Multiview",   action: 6,  gesture: "key or dial" },
+                                                { name: "Jog",         action: 8,  gesture: "turn a dial" },
+                                                { name: "Shuttle",     action: 10, gesture: "turn a dial" },
+                                                { name: "Timecode",    action: 20, gesture: "press a key" },
+                                                { name: "Speed",       action: 21, gesture: "press a key" }
+                                            ]
+
+                                            delegate: RowLayout {
+                                                id: sdRow
+                                                required property var modelData
+                                                Layout.fillWidth: true
+                                                spacing: 8
+
+                                                Text {
+                                                    text: sdRow.modelData.name
+                                                    color: "#eeeeee"
+                                                    Layout.preferredWidth: 110
+                                                }
+                                                Text {
+                                                    text: (appWindow.uiManagerRef.streamDeckBindingsVersion >= 0
+                                                           ? appWindow.uiManagerRef.streamDeckBindingLabel(sdRow.modelData.action)
+                                                           : "")
+                                                    color: appWindow.uiManagerRef.streamDeckLearnAction === sdRow.modelData.action
+                                                           ? "#ff9800" : "#aaa"
+                                                    Layout.fillWidth: true
+                                                }
+                                                Button {
+                                                    text: appWindow.uiManagerRef.streamDeckLearnAction === sdRow.modelData.action
+                                                          ? "Listening… (" + sdRow.modelData.gesture + ")"
+                                                          : "Learn"
+                                                    onClicked: appWindow.uiManagerRef.beginStreamDeckLearn(sdRow.modelData.action)
+                                                }
+                                                Button {
+                                                    text: "Clear"
+                                                    onClicked: appWindow.uiManagerRef.clearStreamDeckBinding(sdRow.modelData.action)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
