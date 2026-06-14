@@ -116,7 +116,7 @@ case "$SCENARIO" in
     MKV=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \
             --outdir "$WORKDIR" --name intercam_matched --seconds 8 --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=intercam_matched ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
-    expect_video_tracks "$MKV" 2 || { echo "PASS: report emitted (diagnostic)"; exit 0; }
+    expect_video_tracks "$MKV" 2 || { emit "[sync] scenario=intercam_matched ERROR=wrong_track_count"; echo "PASS: report emitted (diagnostic)"; exit 0; }
 
     flash_pts_series "$MKV" 0 > "$WORKDIR/v0.txt"
     flash_pts_series "$MKV" 1 > "$WORKDIR/v1.txt"
@@ -143,7 +143,7 @@ case "$SCENARIO" in
     MKV=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \
             --outdir "$WORKDIR" --name intercam_skew --seconds 8 --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=intercam_skew ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
-    expect_video_tracks "$MKV" 2 || { echo "PASS: report emitted (diagnostic)"; exit 0; }
+    expect_video_tracks "$MKV" 2 || { emit "[sync] scenario=intercam_skew ERROR=wrong_track_count"; echo "PASS: report emitted (diagnostic)"; exit 0; }
 
     flash_pts_series "$MKV" 0 > "$WORKDIR/v0.txt"
     flash_pts_series "$MKV" 1 > "$WORKDIR/v1.txt"
@@ -168,6 +168,7 @@ case "$SCENARIO" in
     MKV=$("$HARNESS" --url "$(url "$P0")" \
             --outdir "$WORKDIR" --name drift_2997 --seconds "$DUR" --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=drift_2997 ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
+    expect_video_tracks "$MKV" 1 || { emit "[sync] scenario=drift_2997 ERROR=wrong_track_count"; echo "PASS: report emitted (diagnostic)"; exit 0; }
 
     flash_pts_series "$MKV" 0 > "$WORKDIR/v0.txt"
     # Least-squares slope of (flash_pts vs flash_index); index k=0,1,2,...
@@ -197,6 +198,7 @@ case "$SCENARIO" in
     MKV=$("$HARNESS" --url "$(url "$P0")" \
             --outdir "$WORKDIR" --name lipsync --seconds 8 --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=lipsync ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
+    expect_video_tracks "$MKV" 1 || { emit "[sync] scenario=lipsync ERROR=wrong_track_count"; echo "PASS: report emitted (diagnostic)"; exit 0; }
 
     flash_pts_series "$MKV" 0 > "$WORKDIR/v.txt"
     beep_pts_series  "$MKV" 0 > "$WORKDIR/a.txt"
