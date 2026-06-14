@@ -70,7 +70,7 @@ flash_pts_series() {
 # Beep-onset pts_time series for one audio track (silence->sound rising edges).
 # $1=mkv $2=audio-track-index.
 beep_pts_series() {
-    ffmpeg -hide_banner -loglevel error -i "$1" -map "0:a:$2" \
+    ffmpeg -hide_banner -loglevel info -i "$1" -map "0:a:$2" \
         -af "silencedetect=noise=-30dB:duration=0.03" -f null - 2>&1 \
     | awk '/silence_end:/ { for (i=1;i<=NF;i++) if ($i=="silence_end:") printf "%.6f\n", $(i+1) }'
 }
@@ -184,6 +184,28 @@ case "$SCENARIO" in
         }' "$WORKDIR/v0.txt")
     read -r NF SLOPE PPM SLIP <<<"$STATS"
     emit "[sync] scenario=drift_2997 flashes=${NF} slope=${SLOPE} drift_ppm=${PPM} drift_frames_slip=${SLIP}"
+    echo "PASS: report emitted (diagnostic, non-gating)"
+    exit 0
+    ;;
+
+  lipsync)
+    # One source with a co-timed flash + beep every second. Measure audio-onset
+    # minus video-flash PTS (signed ms). EBU R37 band is +40/-60 ms (context).
+    P0=$BASE_PORT
+    produce "$P0" 30 1
+    sleep 0.5
+    MKV=$("$HARNESS" --url "$(url "$P0")" \
+            --outdir "$WORKDIR" --name lipsync --seconds 8 --fps 30 | tail -n1)
+    if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=lipsync ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
+
+    flash_pts_series "$MKV" 0 > "$WORKDIR/v.txt"
+    beep_pts_series  "$MKV" 0 > "$WORKDIR/a.txt"
+    # Pair the k-th flash with the k-th beep; signed mean/max (audio - video) ms.
+    STATS=$(paste "$WORKDIR/v.txt" "$WORKDIR/a.txt" | awk '
+        NF==2 { d=($2-$1)*1000; s+=d; ad=(d<0?-d:d); if(ad>mx)mx=ad; n++ }
+        END { if(n>0) printf "%d %.1f %.1f", n, s/n, mx; else printf "0 nan nan" }')
+    read -r NP MEAN MAX <<<"$STATS"
+    emit "[sync] scenario=lipsync pairs=${NP} av_offset_ms: mean=${MEAN} max=${MAX} (EBU_R37_band=+40/-60)"
     echo "PASS: report emitted (diagnostic, non-gating)"
     exit 0
     ;;
