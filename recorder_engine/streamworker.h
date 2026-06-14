@@ -64,6 +64,12 @@ public:
 
     int sourceIndex() const { return m_sourceIndex; }
 
+signals:
+    // Emitted from the capture thread ONLY when the connection state flips
+    // (debounced via setConnected). Cross-thread: relayed to the UI through
+    // ReplayManager with a queued connection.
+    void connectionChanged(int sourceIndex, bool connected);
+
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
 
@@ -115,6 +121,9 @@ private:
     int m_stallTimeoutMs = 8000;
     std::atomic<bool> m_connected{false};
     int m_connectBackoffMs = 1000;
+    // Atomically update m_connected and emit connectionChanged on a real
+    // transition (false<->true). Called from the capture thread.
+    void setConnected(bool c);
 
     // Last jitter-pull gate published by the tick thread (file-timeline ms,
     // -1 until the first tick).  The capture thread uses it to pre-drain

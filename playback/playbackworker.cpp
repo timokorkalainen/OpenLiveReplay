@@ -367,6 +367,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 
     // --- Full reposition: clear everything, seek behind target, fill forward. ---
     clearAllBuffers();
+    m_reverseAnchorMs = INT64_MAX; // a seek invalidates the reverse-fetch run
     m_audioQueue.clear();
     for (auto* aTrack : m_audioDecoderBank)
         aTrack->lastEnqueuedPtsMs = -1;
@@ -679,6 +680,8 @@ void PlaybackWorker::run() {
         int packetsThisIter = 0;
 
         if (dir >= 0) {
+            // Travelling forward: a fresh reverse run later starts clean.
+            m_reverseAnchorMs = INT64_MAX;
             // --- Forward fill (§6.3): bounded to the window + one batch. ---
             const int kFillBatch = 4 * trackCount;
             int batch = 0;
@@ -718,13 +721,22 @@ void PlaybackWorker::run() {
         } else {
             // --- Reverse fill (§6.4): fill-then-deliver one chunk atomically. ---
             const int64_t rOldest = refOldestPts();
-            if (rOldest < 0 || (rOldest > P - kLeadMs && P > 0)) {
+            const int64_t newAnchor = qMax<int64_t>(0, P - kLeadMs - kChunkMs);
+            // Re-fetch only when the window needs filling AND the anchor has
+            // descended a full chunk since the last fetch — otherwise
+            // consecutive iterations (P drops < kChunkMs apart) re-decode an
+            // overlapping window (~2-5x wasted decode under load).
+            const bool needFill = (rOldest < 0 || (rOldest > P - kLeadMs && P > 0));
+            const bool anchorMoved =
+                (m_reverseAnchorMs == INT64_MAX) || (m_reverseAnchorMs - newAnchor >= kChunkMs);
+            if (needFill && anchorMoved) {
+                m_reverseAnchorMs = newAnchor;
                 // Record the avio position of the current oldest (file-position
                 // terminator: well-defined under non-interleave skew).
                 const int64_t stopPos = (m_fmtCtx->pb) ? avio_tell(m_fmtCtx->pb) : -1;
 
                 AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
-                int64_t anchor = qMax<int64_t>(0, P - kLeadMs - kChunkMs);
+                int64_t anchor = newAnchor;
                 int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
                 av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
                 m_counters.reverseChunkSeek++;

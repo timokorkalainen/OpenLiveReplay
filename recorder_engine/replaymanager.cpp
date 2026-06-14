@@ -155,6 +155,13 @@ void ReplayManager::startRecording() {
                 worker, &StreamWorker::onMasterPulse,
                 Qt::QueuedConnection);
 
+        // Relay the worker's connection-state transitions to the UI. The
+        // worker emits from its capture thread, so deliver queued onto the
+        // thread ReplayManager lives on (main); UIManager then receives it
+        // there and updates its per-source connected state.
+        connect(worker, &StreamWorker::connectionChanged, this,
+                &ReplayManager::sourceConnectionChanged, Qt::QueuedConnection);
+
         m_workers.append(worker);
         worker->start(QThread::HighPriority);
     }

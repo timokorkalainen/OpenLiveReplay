@@ -24,6 +24,8 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     connect(m_replayManager, &ReplayManager::masterPulse,
             this, &UIManager::onRecorderPulse,
             Qt::QueuedConnection);
+    connect(m_replayManager, &ReplayManager::sourceConnectionChanged, this,
+            &UIManager::onSourceConnectionChanged, Qt::QueuedConnection);
     m_settingsManager = new SettingsManager();
     m_configPath = getSettingsPath("config.json");
     m_transport = new PlaybackTransport(this);
@@ -695,6 +697,40 @@ bool UIManager::isSourceEnabled(int sourceIndex) const {
     return m_sourceEnabled[sourceIndex];
 }
 
+bool UIManager::isSourceConnected(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= m_sourceConnected.size()) return false;
+    return m_sourceConnected[sourceIndex];
+}
+
+bool UIManager::hasDuplicateUrl(int sourceIndex) const {
+    const QList<SourceSettings>& sources = m_currentSettings.sources;
+    if (sourceIndex < 0 || sourceIndex >= sources.size()) return false;
+    const QString mine = sources[sourceIndex].url.trimmed();
+    if (mine.isEmpty()) return false; // empty = "no source", never a clash
+    for (int i = 0; i < sources.size(); ++i) {
+        if (i == sourceIndex) continue;
+        if (sources[i].url.trimmed() == mine) return true;
+    }
+    return false;
+}
+
+void UIManager::resetSourceConnection() {
+    if (m_sourceConnected.isEmpty()) return;
+    m_sourceConnected.fill(false);
+    m_sourceConnectionVersion++;
+    emit sourceConnectionChanged();
+}
+
+void UIManager::onSourceConnectionChanged(int sourceIndex, bool connected) {
+    if (sourceIndex < 0) return;
+    while (m_sourceConnected.size() <= sourceIndex)
+        m_sourceConnected.append(false);
+    if (m_sourceConnected[sourceIndex] == connected) return; // no UI churn
+    m_sourceConnected[sourceIndex] = connected;
+    m_sourceConnectionVersion++;
+    emit sourceConnectionChanged();
+}
+
 void UIManager::setStreamUrls(const QStringList &urls) {
     if (streamUrls() != urls) {
         QList<SourceSettings> updated = m_currentSettings.sources;
@@ -1072,6 +1108,13 @@ void UIManager::startRecording() {
     }
     setFollowLive(true);
 
+    // Start every source in the "not connected" state; the workers report
+    // their real state as each feed comes up. Sizing to the source count
+    // makes the reset emit so the indicators repaint on a re-start.
+    m_sourceConnected = QList<bool>(m_replayManager->getSourceUrls().size(), false);
+    m_sourceConnectionVersion++;
+    emit sourceConnectionChanged();
+
     // 1. Initialize the Playback Worker with our providers
     if (m_playbackWorker) {
         m_playbackWorker->stop();
@@ -1115,6 +1158,10 @@ void UIManager::stopRecording() {
     if (m_playbackWorker) {
         m_playbackWorker->stop();
     }
+
+    // Workers are torn down above; any queued connectionChanged is dropped
+    // with them, so clear the state ourselves to avoid a stale "connected".
+    resetSourceConnection();
 
     emit recordingStatusChanged();
     emit recordingStopped();

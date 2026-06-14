@@ -15,6 +15,15 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
 
 StreamWorker::~StreamWorker() { stop(); wait(); }
 
+void StreamWorker::setConnected(bool c) {
+    // exchange first so the emit fires exactly once per real transition,
+    // even if two capture-thread call sites race the same value.
+    const bool prev = m_connected.exchange(c, std::memory_order_relaxed);
+    if (prev != c) {
+        emit connectionChanged(m_sourceIndex, c);
+    }
+}
+
 void debugTimestamp(const QString &prefix, int trackIndex) {
     QString timeStr = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
     qDebug() << "[" << timeStr << "] [Track" << trackIndex << "]" << prefix;
@@ -214,7 +223,7 @@ void StreamWorker::captureLoop() {
         // If URL is empty, don't attempt to connect. Just idle until
         // a new URL is set via changeSource() which sets m_restartCapture.
         if (currentUrl.trimmed().isEmpty()) {
-            m_connected = false;
+            setConnected(false);
             while (m_captureRunning && !m_restartCapture) {
                 QThread::msleep(100);
             }
@@ -222,7 +231,7 @@ void StreamWorker::captureLoop() {
         }
 
         qDebug() << "Source" << m_sourceIndex << "Attempting connection to:" << currentUrl;
-        m_connected = false;
+        setConnected(false);
 
         int videoStreamIdx = -1;
         if (!setupDecoder(&inCtx, &decCtx, currentUrl, &videoStreamIdx)) {
@@ -236,7 +245,7 @@ void StreamWorker::captureLoop() {
             }
             continue;
         }
-        m_connected = true;
+        setConnected(true);
         m_connectBackoffMs = 1000;
         // A real source connected: stragglers from any previously-cleared
         // source are gone, so resume enqueuing frames for this new URL.
@@ -744,7 +753,7 @@ void StreamWorker::captureLoop() {
             if (fmtToClose) avformat_close_input(&fmtToClose);
         }).detach();
 
-        m_connected = false;
+        setConnected(false);
     }
 
     m_captureRunning = false;

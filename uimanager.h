@@ -58,6 +58,10 @@ class UIManager : public QObject {
     Q_PROPERTY(QVariantList viewSlotMap READ viewSlotMap NOTIFY viewSlotMapChanged)
     Q_PROPERTY(int sourceEnabledVersion READ sourceEnabledVersion NOTIFY sourceEnabledChanged)
     Q_PROPERTY(bool followLive READ followLive NOTIFY followLiveChanged)
+    // Bumped whenever any source's live connection state changes; QML reads
+    // it to re-evaluate isSourceConnected() bindings.
+    Q_PROPERTY(
+        int sourceConnectionVersion READ sourceConnectionVersion NOTIFY sourceConnectionChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -98,6 +102,7 @@ public:
     QVariantList viewSlotMap() const;
     int sourceEnabledVersion() const { return m_sourceEnabledVersion; }
     bool followLive() const { return m_followLive; }
+    int sourceConnectionVersion() const { return m_sourceConnectionVersion; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -159,6 +164,12 @@ public:
     Q_INVOKABLE QScreen* screenAt(int index) const;
     Q_INVOKABLE void toggleSourceEnabled(int sourceIndex);
     Q_INVOKABLE bool isSourceEnabled(int sourceIndex) const;
+    // True only while recording and the source's worker reports a live feed.
+    Q_INVOKABLE bool isSourceConnected(int sourceIndex) const;
+    // Config-time check: another source carries the same non-empty URL.
+    // Surfaces the duplicate-stream misconfiguration that two workers
+    // pulling one URL otherwise hides.
+    Q_INVOKABLE bool hasDuplicateUrl(int sourceIndex) const;
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -199,6 +210,7 @@ signals:
     void followLiveChanged();
     void streamDeckLearnActionChanged();
     void streamDeckBindingsChanged();
+    void sourceConnectionChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -214,6 +226,9 @@ public slots:
     // NOTE: parameter order is (frame index, elapsed ms) — they were
     // previously named in the opposite order, which was a landmine.
     void onRecorderPulse(int64_t frameIndex, int64_t elapsedMs);
+
+    // Receives ReplayManager::sourceConnectionChanged on the main thread.
+    void onSourceConnectionChanged(int sourceIndex, bool connected);
 
 private:
     void syncActiveStreams();
@@ -276,6 +291,13 @@ private:
     QList<bool> m_sourceEnabled;
     QList<int> m_viewSlotMap;       // viewSlotMap[viewIndex] = sourceIndex or -1
     int m_sourceEnabledVersion = 0;
+
+    // Live connection state per source index, mirrored from the workers via
+    // ReplayManager::sourceConnectionChanged. Reset to all-false on
+    // start/stop so a stale "connected" never lingers across sessions.
+    QList<bool> m_sourceConnected;
+    int m_sourceConnectionVersion = 0;
+    void resetSourceConnection();
 
     QList<QScreen*> m_screens;
     QVariantList m_screenOptions;
