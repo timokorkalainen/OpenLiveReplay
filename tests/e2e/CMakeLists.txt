@@ -12,6 +12,12 @@ qt_add_executable(play_harness play_harness.cpp)
 target_link_libraries(play_harness PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
 
+# Headless multi-source sync-measurement harness: records N synthetic sources
+# into an N-view MKV for the report-only frame-sync scoreboard (run_sync_e2e.sh).
+qt_add_executable(sync_harness sync_harness.cpp)
+target_link_libraries(sync_harness PRIVATE
+    Qt6::Core olr_test_engine olr_warnings olr_sanitize)
+
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
 set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
 
