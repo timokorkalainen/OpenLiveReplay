@@ -183,4 +183,32 @@ final class DeckStateTests: XCTestCase {
             [0, 7, 3, -1]
         )
     }
+
+    // MARK: Shuttle action
+
+    func testShuttleActionExists() {
+        XCTAssertEqual(DeckAction(rawValue: 10), .shuttle)
+        XCTAssertEqual(DeckAction.shuttle.label, "Shuttle")
+    }
+
+    func testDialMappingLookups() {
+        let state = DeckState()
+        state.setDialMapping(rotate: [8, 10, -1], press: [0, -1, 5], forModel: "plusXL")
+        XCTAssertEqual(state.rotateAction(forDial: 0, model: "plusXL"), .jog)
+        XCTAssertEqual(state.rotateAction(forDial: 1, model: "plusXL"), .shuttle)
+        XCTAssertNil(state.rotateAction(forDial: 2, model: "plusXL"))
+        XCTAssertEqual(state.pressAction(forDial: 0, model: "plusXL"), .playPause)
+        XCTAssertNil(state.pressAction(forDial: 1, model: "plusXL"))
+        XCTAssertEqual(state.pressAction(forDial: 2, model: "plusXL"), .capture)
+        XCTAssertNil(state.rotateAction(forDial: 9, model: "plusXL"))   // out of range
+    }
+
+    func testUnchangedDialMappingDoesNotPublish() {
+        let state = DeckState()
+        state.setDialMapping(rotate: [8], press: [0], forModel: "plus")
+        let count = changeCount(of: state) {
+            state.setDialMapping(rotate: [8], press: [0], forModel: "plus")
+        }
+        XCTAssertEqual(count, 0)
+    }
 }
