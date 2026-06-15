@@ -1217,6 +1217,20 @@ ApplicationWindow {
                                           : (connDot.connected ? "Connected" : "No signal")
                         }
 
+                        SpinBox {
+                            id: trimSpin
+                            from: -500
+                            to: 500
+                            stepSize: 33   // ≈ 1 frame @30fps; stored value is ms
+                            editable: true
+                            Layout.preferredWidth: 96
+                            value: appWindow.uiManagerRef.sourceTrimVersion >= 0
+                                   ? appWindow.uiManagerRef.sourceTrimOffset(streamRow.index) : 0
+                            onValueModified: appWindow.uiManagerRef.setSourceTrimOffset(streamRow.index, value)
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Timeline trim (ms): + delays this camera, − advances it"
+                        }
+
                         TextField {
                             Layout.preferredWidth: 160
                             text: appWindow.uiManagerRef.streamIds.length > streamRow.index ? appWindow.uiManagerRef.streamIds[streamRow.index] : ""
