@@ -158,6 +158,15 @@ redistributable.
 
 - The **`e2e_srt_smoke`** test IS the verification: `srt://` in → valid MKV out
   proves the engine's SRT ingest path works against real SRT.
+  - **As built (hardening beyond §3.3's structural checks):** because
+    `record_harness` writes blue-fill video + **silence** for the whole duration
+    even when no source connects, the structural checks (frame count, channel
+    count) would *falsely pass* without SRT. The smoke therefore adds a **positive
+    audio-content proof** — the recorded audio must carry the producer's 1 kHz tone
+    (overall RMS `> -60 dB`), not silence (`-inf`). A teeth-check confirms the
+    discriminator: SRT build → RMS ≈ −25 dB → PASS; SRT-less brew build → RMS
+    `-inf` → FAIL. That content proof is what actually verifies SRT *content* was
+    ingested.
 - Manual sanity: run it locally after the build; confirm PASS. Confirm the
   default (no SRT prefix) build + CI are unchanged (`ctest -L e2e` still 10/10).
 
