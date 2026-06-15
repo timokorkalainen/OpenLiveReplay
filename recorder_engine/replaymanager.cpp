@@ -2,6 +2,8 @@
 #include <QDebug>
 #include <QDir>
 #include <QDateTime>
+#include <QJsonDocument>
+#include <QtGlobal>
 
 ReplayManager::ReplayManager(QObject *parent) : QObject(parent) {
     m_muxer = new Muxer();
@@ -14,6 +16,52 @@ ReplayManager::~ReplayManager() {
     stopRecording();
     cleanupBlueEncoder();
     delete m_muxer;
+}
+
+void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
+                                      const QStringList &feedNames,
+                                      const QList<int> &telemetryDelaysMs) {
+    m_telemetryFeedIds = feedIds;
+    m_telemetryFeedNames = feedNames;
+    m_telemetryDelaysMs = telemetryDelaysMs;
+    m_telemetryFeedIndexById.clear();
+
+    for (int i = 0; i < m_telemetryFeedIds.size(); ++i) {
+        if (!m_telemetryFeedIds.at(i).isEmpty()) {
+            m_telemetryFeedIndexById.insert(m_telemetryFeedIds.at(i), i);
+        }
+    }
+}
+
+bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObject &payload) {
+    if (!m_isRecording || !m_muxer || !m_clock) {
+        return false;
+    }
+
+    const auto feedIt = m_telemetryFeedIndexById.constFind(feedId);
+    if (feedIt == m_telemetryFeedIndexById.constEnd()) {
+        return false;
+    }
+
+    const int feedIndex = feedIt.value();
+    const int configuredDelayMs = feedIndex < m_telemetryDelaysMs.size()
+        ? m_telemetryDelaysMs.at(feedIndex)
+        : 0;
+    const int delayMs = qBound(0, configuredDelayMs, 10000);
+    const int64_t receiveMs = qMax<int64_t>(0, m_clock->elapsedMs());
+    const int64_t effectiveMs = receiveMs + delayMs;
+
+    QJsonObject recorded = payload;
+    recorded.insert(QStringLiteral("feedId"), feedId);
+    recorded.insert(QStringLiteral("olrReceiveMs"), receiveMs);
+    recorded.insert(QStringLiteral("olrEffectiveMs"), effectiveMs);
+    recorded.insert(QStringLiteral("olrTelemetryDelayMs"), delayMs);
+
+    m_muxer->writeTelemetryPacket(
+        feedIndex,
+        effectiveMs,
+        QJsonDocument(recorded).toJson(QJsonDocument::Compact));
+    return true;
 }
 
 // ─── Blue-frame encoder for unmapped view tracks ───────────────────────
@@ -108,7 +156,11 @@ void ReplayManager::startRecording() {
     m_sessionFileName = m_baseFileName + "_" + timestamp;
     // Recordings go to the user-configured location (empty = default)
     m_muxer->setOutputDirectory(m_outputDir);
-    if (!m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames)) {
+    const bool muxerReady = m_telemetryFeedIds.isEmpty()
+        ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames)
+        : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
+                        m_telemetryFeedIds, m_telemetryFeedNames);
+    if (!muxerReady) {
         qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
     }

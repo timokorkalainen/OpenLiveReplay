@@ -1,8 +1,12 @@
 #ifndef REPLAYMANAGER_H
 #define REPLAYMANAGER_H
 
+#include <QHash>
+#include <QJsonObject>
+#include <QList>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
 #include "recordingclock.h"
 #include "muxer.h"
@@ -28,6 +32,11 @@ public:
     void setSourceTrims(const QList<int>& trims) { m_sourceTrims = trims; }
     QStringList getSourceUrls() const { return m_sourceUrls; }
     QStringList getSourceNames() const { return m_sourceNames; }
+
+    // Per-feed telemetry tracks recorded alongside the replay.
+    void setTelemetryFeeds(const QStringList &feedIds, const QStringList &feedNames,
+                           const QList<int> &telemetryDelaysMs);
+    bool recordTelemetryEvent(const QString &feedId, const QJsonObject &payload);
 
     // View configuration (M views/tracks)
     void setViewCount(int count) { m_viewCount = count; }
@@ -86,6 +95,12 @@ private:
     QStringList m_sourceNames;
     QList<QByteArray> m_sourceMetadata;  // One JSON blob per source
     QList<int> m_sourceTrims;            // per-source initial trim ms (parallel to m_sourceUrls)
+
+    // Feed telemetry config
+    QStringList m_telemetryFeedIds;
+    QStringList m_telemetryFeedNames;
+    QList<int> m_telemetryDelaysMs;
+    QHash<QString, int> m_telemetryFeedIndexById;
 
     // View config
     int m_viewCount = 4;
