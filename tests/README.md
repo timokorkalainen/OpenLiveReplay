@@ -59,10 +59,18 @@ the playback storm gate that records a fixture and drives the worker pipeline.
 
 `.github/workflows/ci.yml` runs on PRs and pushes to `main`:
 
-- **build-test-macos** — build app + tests, run CTest (primary gate).
-- **lint** — `clang-format` (changed lines) + `qmllint`.
-- **sanitizers** — focused ASan+UBSan spot checks (gating) and a focused
-  ThreadSanitizer spot check (advisory).
+- **changes** — classifies the diff first. Docs/workflow-only PRs do not run
+  app builds, tests, or sanitizers.
+- **workflow-lint** — `actionlint` for workflow changes.
+- **build-test-macos** — app/test changes only; builds app + tests and runs
+  CTest (primary gate).
+- **lint** — source/QML changes only; runs changed-line `clang-format` and/or
+  `qmllint` only when those file types changed.
+- **sanitizers** — native-code/CMake changes only; focused ASan+UBSan spot
+  checks (gating) and a focused ThreadSanitizer spot check (advisory).
+
+macOS jobs cache Qt via `install-qt-action`, Homebrew downloads via
+`actions/cache`, and C/C++ compiler outputs via `ccache`.
 
 ## iOS build (local pre-push hook, not CI)
 
