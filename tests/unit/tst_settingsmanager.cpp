@@ -9,6 +9,7 @@ class TestSettingsManager : public QObject {
     Q_OBJECT
 private slots:
     void roundTripPreservesEverything();
+    void loadClampsTelemetryDelayMs();
     void loadMissingFileReturnsFalse();
     void loadMalformedJsonReturnsFalse();
     void saveToUnwritablePathReturnsFalse();
@@ -108,6 +109,31 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.streamDeckKeyMaps, in.streamDeckKeyMaps);
     QCOMPARE(out.streamDeckDialPressMaps, in.streamDeckDialPressMaps);
     QCOMPARE(out.streamDeckDialRotateMaps, in.streamDeckDialRotateMaps);
+}
+
+void TestSettingsManager::loadClampsTelemetryDelayMs() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("settings.json"));
+
+    QJsonArray sources;
+    sources.append(QJsonObject{{"id", "negative"}, {"telemetryDelayMs", -1}});
+    sources.append(QJsonObject{{"id", "too-high"}, {"telemetryDelayMs", 10001}});
+    sources.append(QJsonObject{{"id", "missing"}});
+
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(QJsonDocument(QJsonObject{{"sources", sources}}).toJson());
+    f.close();
+
+    SettingsManager mgr;
+    AppSettings out;
+    QVERIFY(mgr.load(path, out));
+
+    QCOMPARE(out.sources.size(), 3);
+    QCOMPARE(out.sources[0].telemetryDelayMs, 0);
+    QCOMPARE(out.sources[1].telemetryDelayMs, 10000);
+    QCOMPARE(out.sources[2].telemetryDelayMs, 0);
 }
 
 void TestSettingsManager::loadMissingFileReturnsFalse() {
