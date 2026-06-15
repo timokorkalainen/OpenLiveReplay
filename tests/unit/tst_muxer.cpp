@@ -11,6 +11,7 @@
 #include <QTemporaryDir>
 #include <QFileInfo>
 #include <QDir>
+#include <QScopeGuard>
 
 #include "recorder_engine/muxer.h"
 
@@ -23,6 +24,7 @@ private slots:
     void monoAudioChannelLayout();
     void initProducesAFile();
     void initBuildsTelemetryTrackLayoutAndMetadata();
+    void initFailureResetsTelemetryTrackState();
     void writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed();
 
 private:
@@ -159,6 +161,28 @@ void TestMuxer::initBuildsTelemetryTrackLayoutAndMetadata() {
     m.close();
 }
 
+void TestMuxer::initFailureResetsTelemetryTrackState() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QStringList names{QStringLiteral("View A")};
+    const QStringList feedIds{QStringLiteral("feed-alpha")};
+    const QStringList feedNames{QStringLiteral("Alpha Feed")};
+
+    QVERIFY(!m.init(QStringLiteral("missing/olr_unit_telemetry_init_fail"),
+                    1,
+                    320,
+                    240,
+                    30,
+                    names,
+                    feedIds,
+                    feedNames,
+                    48000,
+                    2));
+
+    QCOMPARE(m.telemetryTrackOffset(), 0);
+    QVERIFY(m.getStream(0) == nullptr);
+}
+
 void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
     QVERIFY(m_home.isValid());
     Muxer m;
@@ -166,6 +190,7 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
     const QStringList names{QStringLiteral("View A")};
     const QStringList feedIds{QStringLiteral("feed-alpha")};
     const QStringList feedNames{QStringLiteral("Alpha Feed")};
+    const QByteArray validPayload = QByteArrayLiteral("{\"speed\":42}");
 
     QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_write"),
                    1,
@@ -178,7 +203,7 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
                    48000,
                    2));
 
-    m.writeTelemetryPacket(0, 123, QByteArrayLiteral("{\"speed\":42}"));
+    m.writeTelemetryPacket(0, 123, validPayload);
     m.writeTelemetryPacket(1, 124, QByteArrayLiteral("{\"ignored\":true}"));
     m.writeTelemetryPacket(-1, 125, QByteArrayLiteral("{\"ignored\":true}"));
     m.writeTelemetryPacket(0, 126, QByteArray());
@@ -187,6 +212,54 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
     const QFileInfo fi(videoPathFor(QStringLiteral("olr_unit_telemetry_write")));
     QVERIFY2(fi.exists(), qPrintable("expected output at " + fi.filePath()));
     QVERIFY(fi.size() > 0);
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray filePath = fi.filePath().toUtf8();
+    QVERIFY(avformat_open_input(&ctx, filePath.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] {
+        avformat_close_input(&ctx);
+    });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+
+    int telemetryStreamIndex = -1;
+    AVStream* telemetryStream = nullptr;
+    for (unsigned int i = 0; i < ctx->nb_streams; ++i) {
+        AVStream* st = ctx->streams[i];
+        AVDictionaryEntry* trackType = av_dict_get(st->metadata, "olr_track_type", nullptr, 0);
+        AVDictionaryEntry* feedId = av_dict_get(st->metadata, "olr_feed_id", nullptr, 0);
+        if (trackType && feedId &&
+            QString::fromUtf8(trackType->value) == QStringLiteral("feed_telemetry") &&
+            QString::fromUtf8(feedId->value) == QStringLiteral("feed-alpha")) {
+            QVERIFY2(telemetryStreamIndex == -1, "expected exactly one telemetry stream for feed-alpha");
+            telemetryStreamIndex = static_cast<int>(i);
+            telemetryStream = st;
+        }
+    }
+    QVERIFY(telemetryStream != nullptr);
+
+    AVPacket* pkt = av_packet_alloc();
+    QVERIFY(pkt != nullptr);
+    const auto freePacket = qScopeGuard([&pkt] {
+        av_packet_free(&pkt);
+    });
+
+    int totalPackets = 0;
+    int telemetryPackets = 0;
+    int ret = 0;
+    while ((ret = av_read_frame(ctx, pkt)) >= 0) {
+        ++totalPackets;
+        if (pkt->stream_index == telemetryStreamIndex) {
+            ++telemetryPackets;
+            QCOMPARE(pkt->stream_index, telemetryStreamIndex);
+            QCOMPARE(pkt->pts, av_rescale_q(123, AVRational{1, 1000}, telemetryStream->time_base));
+            QCOMPARE(av_rescale_q(pkt->pts, telemetryStream->time_base, AVRational{1, 1000}), int64_t(123));
+            QCOMPARE(QByteArray(reinterpret_cast<const char*>(pkt->data), pkt->size), validPayload);
+        }
+        av_packet_unref(pkt);
+    }
+    QCOMPARE(ret, AVERROR_EOF);
+    QCOMPARE(totalPackets, 1);
+    QCOMPARE(telemetryPackets, 1);
 }
 
 QTEST_GUILESS_MAIN(TestMuxer)
