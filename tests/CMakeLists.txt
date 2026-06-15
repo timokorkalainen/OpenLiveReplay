@@ -41,6 +41,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectsettingsimporter.cpp"
     "${CMAKE_SOURCE_DIR}/playback/playbacktransport.cpp"
+    "${CMAKE_SOURCE_DIR}/telemetry/sseparser.cpp"
     "${CMAKE_SOURCE_DIR}/streamdeck/streamdeckmappingstore.cpp"
 )
 target_include_directories(olr_test_core PUBLIC "${CMAKE_SOURCE_DIR}")
