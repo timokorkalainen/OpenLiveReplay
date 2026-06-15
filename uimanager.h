@@ -37,6 +37,7 @@ class UIManager : public QObject {
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
     Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
     Q_PROPERTY(int64_t scrubPosition READ scrubPosition NOTIFY scrubPositionChanged)
+    Q_PROPERTY(QString playbackTimecode READ playbackTimecode NOTIFY playbackTimecodeChanged)
     Q_PROPERTY(qint64 recordingStartEpochMs READ recordingStartEpochMs NOTIFY recordingStartEpochMsChanged)
     Q_PROPERTY(bool timeOfDayMode READ timeOfDayMode WRITE setTimeOfDayMode NOTIFY timeOfDayModeChanged)
     Q_PROPERTY(int liveBufferMs READ liveBufferMs CONSTANT)
@@ -81,6 +82,10 @@ public:
     QVariantList playbackProviders() const;
     int64_t recordedDurationMs();
     int64_t scrubPosition();
+    // The exact timecode the playback UI shows — the single source of truth for
+    // both the on-screen label and the Stream Deck (time-of-day aware; HH:MM:SS.FF
+    // from scrubPosition otherwise). The deck must never compute its own.
+    QString playbackTimecode();
     qint64 recordingStartEpochMs() const;
     bool timeOfDayMode() const;
     int liveBufferMs() const;
@@ -193,6 +198,7 @@ signals:
     void recordingFailed(const QString& reason);
     void recordedDurationMsChanged();
     void scrubPositionChanged();
+    void playbackTimecodeChanged();
     void recordingStartEpochMsChanged();
     void timeOfDayModeChanged();
     void midiPortsChanged();
@@ -248,6 +254,7 @@ private:
     void jogStep(int delta);
     void setFollowLive(bool on);
     void pushStreamDeckMaps();
+    void pushDeckTimecode();
     void shuttleStep(int delta);
 
     ReplayManager* m_replayManager;

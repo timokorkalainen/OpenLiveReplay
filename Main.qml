@@ -909,9 +909,9 @@ ApplicationWindow {
                     spacing: 12
 
                     Text {
-                        text: playbackTab.showTimeOfDay && appWindow.uiManagerRef.recordingStartEpochMs > 0
-                            ? playbackTab.formatTimeOfDay(appWindow.uiManagerRef.recordingStartEpochMs + appWindow.uiManagerRef.scrubPosition)
-                            : playbackTab.formatTimecode(appWindow.uiManagerRef.scrubPosition)
+                        // Single source of truth (UIManager): the same string the
+                        // Stream Deck shows. Do not reformat here.
+                        text: appWindow.uiManagerRef.playbackTimecode
                         color: "#eeeeee"
                         font.family: "Menlo"
                         font.pixelSize: 14
