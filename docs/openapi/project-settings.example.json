@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "olr.project-settings.v1",
+  "project": {
+    "id": "event-2026-final",
+    "name": "Final Match"
+  },
+  "links": {
+    "openapi": "https://provider.example/openapi/olr-provider-v1.openapi.yaml"
+  },
+  "telemetry": {
+    "sseUrl": "https://provider.example/events/final/telemetry"
+  },
+  "metadataFields": [
+    { "name": "angle", "display": true },
+    { "name": "operator", "display": true }
+  ],
+  "feeds": [
+    {
+      "id": "cam-main",
+      "name": "Main",
+      "url": "srt://10.0.0.20:9000",
+      "telemetryDelayMs": 800,
+      "metadata": [
+        { "name": "angle", "value": "wide" },
+        { "name": "operator", "value": "Aino" }
+      ]
+    },
+    {
+      "id": "cam-reverse",
+      "name": "Reverse",
+      "url": "srt://10.0.0.21:9001",
+      "telemetryDelayMs": 0,
+      "metadata": [
+        { "name": "angle", "value": "reverse" }
+      ]
+    }
+  ]
+}
