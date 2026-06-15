@@ -1,6 +1,7 @@
 #include "settingsmanager.h"
 #include <QDebug>
 #include <QJsonValue>
+#include <QtGlobal>
 
 namespace {
 // model id -> [action ids]  <->  JSON object of arrays.
@@ -69,10 +70,13 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
         obj["url"] = source.url;
         obj["metadata"] = source.metadata;
         obj["trimOffsetMs"] = source.trimOffsetMs;
+        obj["telemetryDelayMs"] = source.telemetryDelayMs;
         sourcesArray.append(obj);
     }
     root["sources"] = sourcesArray;
     root["metadataFields"] = settings.metadataFields;
+    root["importSettingsUrl"] = settings.importSettingsUrl;
+    root["telemetrySseUrl"] = settings.telemetrySseUrl;
 
     root["streamDeckKeyMaps"] = streamDeckMapsToJson(settings.streamDeckKeyMaps);
     root["streamDeckDialPressMaps"] = streamDeckMapsToJson(settings.streamDeckDialPressMaps);
@@ -168,10 +172,13 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
         source.url = obj["url"].toString();
         source.metadata = obj["metadata"].toArray();
         source.trimOffsetMs = obj["trimOffsetMs"].toInt(0);
+        source.telemetryDelayMs = qBound(0, obj["telemetryDelayMs"].toInt(0), 10000);
         settings.sources.append(source);
     }
 
     settings.metadataFields = root["metadataFields"].toArray();
+    settings.importSettingsUrl = root["importSettingsUrl"].toString();
+    settings.telemetrySseUrl = root["telemetrySseUrl"].toString();
 
     settings.streamDeckKeyMaps = streamDeckMapsFromJson(root.value("streamDeckKeyMaps"));
     settings.streamDeckDialPressMaps = streamDeckMapsFromJson(root.value("streamDeckDialPressMaps"));
