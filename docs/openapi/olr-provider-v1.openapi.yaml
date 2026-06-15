@@ -156,7 +156,7 @@ components:
           minimum: 0
           maximum: 10000
           default: 0
-          description: Positive delay applied to telemetry replay time to match video.
+          description: Non-negative delay applied to telemetry replay time to match video.
         metadata:
           type: array
           default: []
@@ -172,17 +172,6 @@ components:
           type: string
           minLength: 1
           description: Must match one configured Feed.id.
-        timestamp:
-          type: string
-          format: date-time
-          description: Optional provider event time preserved for replay/audit.
-        status:
-          type: string
-          description: Provider-defined status such as ok, warning, error, or offline.
-        values:
-          type: object
-          additionalProperties: true
-          description: Flexible provider telemetry payload.
   examples:
     ProjectSettingsFinalMatch:
       value:
