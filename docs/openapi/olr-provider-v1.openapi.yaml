@@ -1,0 +1,218 @@
+openapi: 3.1.0
+info:
+  title: OpenLiveReplay Provider Settings And Telemetry API
+  version: 1.0.0
+  description: >
+    Consumer contract for importing OpenLiveReplay project/feed settings from one
+    operator-entered HTTPS URL and receiving per-feed telemetry from one
+    project-level SSE stream.
+servers:
+  - url: https://provider.example
+paths:
+  /project-settings:
+    get:
+      operationId: getProjectSettings
+      summary: Read project and feed settings
+      description: >
+        Returns the direct JSON settings document that an OpenLiveReplay operator
+        imports, previews, and applies. The operator-entered URL may be this path
+        or any public/pre-signed HTTPS URL returning this schema.
+      responses:
+        "200":
+          description: Project/feed settings for import preview.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectSettings"
+              examples:
+                finalMatch:
+                  $ref: "#/components/examples/ProjectSettingsFinalMatch"
+  /telemetry:
+    get:
+      operationId: streamTelemetry
+      summary: Stream per-feed telemetry
+      description: >
+        Single project-level Server-Sent Events stream. Every JSON event carries
+        a feedId that matches one configured feed from the settings document.
+      responses:
+        "200":
+          description: SSE stream carrying JSON telemetry events.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                telemetryEvent:
+                  summary: SSE JSON data event
+                  value: |
+                    event: telemetry
+                    data: {"feedId":"cam-main","timestamp":"2026-06-15T12:00:01.250Z","status":"ok","values":{"batteryPercent":91,"signalDb":-63}}
+
+components:
+  schemas:
+    ProjectSettings:
+      type: object
+      additionalProperties: false
+      required:
+        - project
+        - telemetry
+        - feeds
+      properties:
+        schemaVersion:
+          type: string
+          description: Optional schema marker. Missing means the v1 shape is inferred.
+          const: olr.project-settings.v1
+        project:
+          $ref: "#/components/schemas/ProjectIdentity"
+        links:
+          type: object
+          additionalProperties: true
+          properties:
+            openapi:
+              type: string
+              format: uri
+              pattern: "^https://"
+              description: Optional public/pre-signed HTTPS URL for this OpenAPI document.
+        telemetry:
+          $ref: "#/components/schemas/TelemetryConfig"
+        metadataFields:
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/MetadataField"
+        feeds:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/Feed"
+    ProjectIdentity:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          minLength: 1
+        name:
+          type: string
+          minLength: 1
+    TelemetryConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - sseUrl
+      properties:
+        sseUrl:
+          type: string
+          format: uri
+          pattern: "^https://"
+          description: One single project-level SSE URL for all feed telemetry.
+    MetadataField:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+        display:
+          type: boolean
+          default: true
+    MetadataEntry:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - value
+      properties:
+        name:
+          type: string
+          minLength: 1
+        value:
+          type: string
+    Feed:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - name
+        - url
+      properties:
+        id:
+          type: string
+          minLength: 1
+          description: Stable feed ID used by telemetry events and recordings.
+        name:
+          type: string
+        url:
+          type: string
+          minLength: 1
+          description: Video input URL consumed by OpenLiveReplay.
+        telemetryDelayMs:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          default: 0
+          description: Positive delay applied to telemetry replay time to match video.
+        metadata:
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/MetadataEntry"
+    TelemetryEvent:
+      type: object
+      additionalProperties: true
+      required:
+        - feedId
+      properties:
+        feedId:
+          type: string
+          minLength: 1
+          description: Must match one configured Feed.id.
+        timestamp:
+          type: string
+          format: date-time
+          description: Optional provider event time preserved for replay/audit.
+        status:
+          type: string
+          description: Provider-defined status such as ok, warning, error, or offline.
+        values:
+          type: object
+          additionalProperties: true
+          description: Flexible provider telemetry payload.
+  examples:
+    ProjectSettingsFinalMatch:
+      value:
+        schemaVersion: olr.project-settings.v1
+        project:
+          id: event-2026-final
+          name: Final Match
+        links:
+          openapi: https://provider.example/openapi/olr-provider-v1.openapi.yaml
+        telemetry:
+          sseUrl: https://provider.example/events/final/telemetry
+        metadataFields:
+          - name: angle
+            display: true
+          - name: operator
+            display: true
+        feeds:
+          - id: cam-main
+            name: Main
+            url: srt://10.0.0.20:9000
+            telemetryDelayMs: 800
+            metadata:
+              - name: angle
+                value: wide
+              - name: operator
+                value: Aino
+          - id: cam-reverse
+            name: Reverse
+            url: srt://10.0.0.21:9001
+            telemetryDelayMs: 0
+            metadata:
+              - name: angle
+                value: reverse

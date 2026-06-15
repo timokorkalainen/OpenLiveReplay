@@ -1,0 +1,6 @@
+event: telemetry
+data: {"feedId":"cam-main","timestamp":"2026-06-15T12:00:01.250Z","status":"ok","values":{"batteryPercent":91,"signalDb":-63,"gps":{"lat":60.1699,"lon":24.9384}}}
+
+event: telemetry
+data: {"feedId":"cam-reverse","timestamp":"2026-06-15T12:00:01.330Z","status":"warning","values":{"batteryPercent":24,"signalDb":-78}}
+
