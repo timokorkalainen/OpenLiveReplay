@@ -1,6 +1,8 @@
 #include "streamworker.h"
 #include <QDebug>
 #include <QDateTime>
+#include <QUrl>
+#include <QUrlQuery>
 
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock *clock,
                            int targetWidth, int targetHeight, int targetFps, QObject* parent)
@@ -798,10 +800,21 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
         av_dict_set(&opts, "rcvlatency", "500", 0);
         av_dict_set(&opts, "peerlatency", "500", 0);
         av_dict_set(&opts, "transtype", "live", 0);
-        // Linger=0: on close, drop immediately instead of waiting to
-        // flush send buffers.  srt_close() holds a global SRT library
-        // lock, so any linger stalls ALL other SRT sockets' reads.
-        av_dict_set(&opts, "linger", "0", 0);
+        // Linger=0: on close, drop immediately instead of waiting to flush send
+        // buffers.  SRT's default linger is 180 s and srt_close() holds a global
+        // SRT library lock, so a closing socket (a source that never connected,
+        // or any source at stopRecording) stalls teardown for minutes and blocks
+        // every other SRT source meanwhile.  The engine is receive-only, so there
+        // is nothing to flush.
+        //
+        // It MUST go in the URL query: SRT-private options set on the
+        // avformat_open_input() dict do NOT propagate to the nested SRT
+        // URLContext (only generic options like rw_timeout do), so a dict-set
+        // "linger" is silently ignored and the 180 s default applies.
+        QUrlQuery srtQuery(currentUrl);
+        if (!srtQuery.hasQueryItem(QStringLiteral("linger")))
+            srtQuery.addQueryItem(QStringLiteral("linger"), QStringLiteral("0"));
+        currentUrl.setQuery(srtQuery);
     }
 
     if (scheme == "rtmp" || scheme == "rtmps") {
