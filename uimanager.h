@@ -346,7 +346,7 @@ private:
     void resetSourceConnection();
     void updateReplayTelemetryFeeds();
     void clearImportPreview();
-    bool loadTelemetryTimeline(const QString &filePath);
+    bool loadTelemetryTimeline(const QString &filePath, bool notify = true);
     QVariantMap recordingTelemetryStateAt(qint64 playheadMs) const;
 
     struct TelemetryTimelineEntry {
