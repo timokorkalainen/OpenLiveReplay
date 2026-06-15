@@ -75,6 +75,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/playbackworker.h playback/playbackworker.cpp
         playback/frameprovider.h playback/frameprovider.cpp
         playback/playbacktransport.h playback/playbacktransport.cpp
+        playback/telemetrytimelinereader.h playback/telemetrytimelinereader.cpp
         playback/audioplayer.h playback/audioplayer.cpp
         playback/trackbuffer.h playback/trackbuffer.cpp
         playback/audioframequeue.h playback/audioframequeue.cpp

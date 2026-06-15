@@ -72,6 +72,7 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/audioframequeue.cpp"
     "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp"
     "${CMAKE_SOURCE_DIR}/playback/frameprovider.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/telemetrytimelinereader.cpp"
     "${CMAKE_SOURCE_DIR}/playback/audioplayer.cpp"
 )
 target_include_directories(olr_test_playback PUBLIC
