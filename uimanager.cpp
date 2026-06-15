@@ -1431,6 +1431,8 @@ void UIManager::loadSettings() {
         emit sourceEnabledChanged();
         m_sourceTrimVersion++;
         emit sourceTrimChanged();
+        m_currentSettings.audioOutputLatencyMs =
+            qBound(0, m_currentSettings.audioOutputLatencyMs, 500);
         if (m_audioPlayer)
             m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs);
         emit audioOutputLatencyChanged();
