@@ -233,8 +233,20 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     connect(m_transport, &PlaybackTransport::playingChanged, this, pushTransportState);
     connect(m_transport, &PlaybackTransport::speedChanged, this, pushTransportState);
     connect(this, &UIManager::followLiveChanged, this, pushTransportState);
-    connect(m_transport, &PlaybackTransport::posChanged, this, [this](int64_t pos) {
-        m_streamDeckManager->setPosition(pos, recordedDurationMs(), m_transport->fps());
+    connect(m_transport, &PlaybackTransport::posChanged, this, [this](int64_t) {
+        pushDeckTimecode();
+        emit playbackTimecodeChanged();
+    });
+    // The displayed timecode also changes when the time-of-day toggle flips or
+    // the recording's wall-clock anchor is (re)established — keep both the UI
+    // and the deck in lockstep on those too.
+    connect(this, &UIManager::timeOfDayModeChanged, this, [this]() {
+        pushDeckTimecode();
+        emit playbackTimecodeChanged();
+    });
+    connect(this, &UIManager::recordingStartEpochMsChanged, this, [this]() {
+        pushDeckTimecode();
+        emit playbackTimecodeChanged();
     });
     // Snapshot push so a freshly connected deck lights up correctly even
     // while playback is paused (no posChanged ticks).
@@ -243,11 +255,7 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         if (m_streamDeckManager->connected()) {
             pushRecordingState();
             pushTransportState();
-            if (m_transport) {
-                m_streamDeckManager->setPosition(m_transport->currentPos(),
-                                                 recordedDurationMs(),
-                                                 m_transport->fps());
-            }
+            pushDeckTimecode();
             // Creates the default layout for a new model, or clamps saved rows
             // to the live geometry for a known one.
             const QString model = m_streamDeckManager->deviceModel();
@@ -1770,6 +1778,36 @@ void UIManager::pushStreamDeckMaps()
     m_streamDeckManager->pushDialMaps(model,
         m_streamDeckStore.dialRotateMap(model),
         m_streamDeckStore.dialPressMap(model));
+}
+
+QString UIManager::playbackTimecode()
+{
+    // MUST stay identical to the QML playback timecode (Main.qml): the deck and
+    // the on-screen label render this one string. Source = scrubPosition.
+    const qint64 pos = scrubPosition();
+    if (m_currentSettings.showTimeOfDay && recordingStartEpochMs() > 0) {
+        // Wall-clock time at the playhead (not a live clock — moves with pos).
+        return QDateTime::fromMSecsSinceEpoch(recordingStartEpochMs() + pos)
+            .toString(QStringLiteral("HH:mm:ss"));
+    }
+    const qint64 ms = pos < 0 ? 0 : pos;
+    const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
+    const qint64 totalSeconds = ms / 1000;
+    const int frames = int(double(ms % 1000) / (1000.0 / double(fps)));
+    return QStringLiteral("%1:%2:%3.%4")
+        .arg(totalSeconds / 3600, 2, 10, QLatin1Char('0'))
+        .arg((totalSeconds / 60) % 60, 2, 10, QLatin1Char('0'))
+        .arg(totalSeconds % 60, 2, 10, QLatin1Char('0'))
+        .arg(frames, 2, 10, QLatin1Char('0'));
+}
+
+void UIManager::pushDeckTimecode()
+{
+    if (!m_streamDeckManager) return;
+    const qint64 dur = recordedDurationMs();
+    const qint64 pos = scrubPosition();
+    const double frac = dur > 0 ? qBound(0.0, double(pos) / double(dur), 1.0) : 0.0;
+    m_streamDeckManager->setPosition(playbackTimecode(), frac);
 }
 
 void UIManager::beginStreamDeckLearn(int action)

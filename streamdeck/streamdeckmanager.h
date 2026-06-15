@@ -57,7 +57,9 @@ public slots:
     // App state pushed to the deck. Cheap no-ops when nothing is connected.
     void setRecording(bool recording, qint64 elapsedMs);
     void setTransport(bool playing, double speed, bool followLive);
-    void setPosition(qint64 posMs, qint64 durationMs, int fps);
+    // timecodeText is the exact string the app's playback UI shows (the deck
+    // never formats its own); fraction is the scrub-bar position (0..1).
+    void setPosition(const QString &timecodeText, double fraction);
 
 signals:
     void connectedChanged();
@@ -73,7 +75,6 @@ private:
                                int keyCount, int dialCount);
     void handleDeviceDisconnected();
     void pushPendingPosition();
-    static QString formatTimecode(qint64 ms, int fps);
     static QString formatElapsed(qint64 ms);
     static QString formatSpeed(bool playing, double speed);
 

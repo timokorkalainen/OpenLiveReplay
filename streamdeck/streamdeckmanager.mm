@@ -42,7 +42,8 @@ bool StreamDeckManager::driverAppInstalled() const
 bool StreamDeckManager::simulatorAvailable() const
 {
 #ifdef QT_DEBUG
-    return true;
+    // Only when the simulator is actually compiled into the bridge.
+    return [OLRStreamDeckBridge shared].simulatorSupported;
 #else
     return false;
 #endif
@@ -171,15 +172,13 @@ void StreamDeckManager::setTransport(bool playing, double speed, bool followLive
                                                followLive:followLive];
 }
 
-void StreamDeckManager::setPosition(qint64 posMs, qint64 durationMs, int fps)
+void StreamDeckManager::setPosition(const QString &timecodeText, double fraction)
 {
     if (!m_connected) return;
 
-    m_pendingTimecode = formatTimecode(posMs, fps);
-    // durationMs is -1 before the recording clock exists; treat as no extent.
-    m_pendingFraction = durationMs > 0
-        ? qBound(0.0, double(posMs) / double(durationMs), 1.0)
-        : 0.0;
+    // The app already formatted this — the deck mirrors it verbatim.
+    m_pendingTimecode = timecodeText;
+    m_pendingFraction = qBound(0.0, fraction, 1.0);
     if (m_pendingTimecode == m_lastPushedTimecode) return;
 
     const qint64 sinceLast = m_lastPositionPush.elapsed();
@@ -196,19 +195,6 @@ void StreamDeckManager::pushPendingPosition()
     m_lastPushedTimecode = m_pendingTimecode;
     [[OLRStreamDeckBridge shared] setPositionWithTimecodeText:m_pendingTimecode.toNSString()
                                              positionFraction:m_pendingFraction];
-}
-
-QString StreamDeckManager::formatTimecode(qint64 ms, int fps)
-{
-    if (ms < 0) ms = 0;
-    if (fps <= 0) fps = 30;
-    const qint64 totalSeconds = ms / 1000;
-    const int frames = int((ms % 1000) * fps / 1000);
-    return QString("%1:%2:%3:%4")
-        .arg(totalSeconds / 3600, 2, 10, QLatin1Char('0'))
-        .arg((totalSeconds / 60) % 60, 2, 10, QLatin1Char('0'))
-        .arg(totalSeconds % 60, 2, 10, QLatin1Char('0'))
-        .arg(frames, 2, 10, QLatin1Char('0'));
 }
 
 QString StreamDeckManager::formatElapsed(qint64 ms)

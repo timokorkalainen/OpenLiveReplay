@@ -342,7 +342,7 @@ struct ReplayNeoPanel: View {
     }
 }
 
-#if DEBUG
+#if DEBUG && canImport(StreamDeckSimulator)
 import StreamDeckSimulator
 
 #Preview("Stream Deck +") {
