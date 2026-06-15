@@ -91,8 +91,38 @@ This intentionally proves the native SRT path is carrying the stream: the defaul
 Homebrew FFmpeg used by the harness does not provide `srt://`, so a fallback to
 FFmpeg records blue-fill/silence and fails the content checks.
 
-## Next (Phase 2c)
+## Phase 2c-a: disconnect/reconnect survival
 
-Disconnect/reconnect mid-recording, packet-loss / jitter injection, reconnect
-re-anchoring, and long-run drift over SRT — each its own spec under
-`docs/superpowers/specs/`.
+`e2e_native_srt_reconnect` (in the `native-apple-ingest` label) proves the engine
+survives a mid-recording source drop. Two independent flash sources record (src0
+control, src1 victim); the script kills src1's `srt-live-transmit` bridge mid-record
+and restarts it on the same port, then asserts:
+
+- **src1 reconnected:** its `conn_events` timeline (from
+  `sync_harness --report-connection-events`) shows `up`(before kill) → `down`(after
+  kill) → `up`(reconnect) — a true reconnect, not a flaky warm-up.
+- **content resumed:** src1's view has flashes both before the kill and in a late
+  post-reconnect window — real frames resumed, not a frozen frame or blue-fill.
+- **control fully isolated:** src0 has **no mid-record disconnect and no content
+  gap** through the whole outage.
+
+The outage must exceed the ~8 s stall window (kill@10 s, restart@20 s, record 38 s,
+`TIMEOUT 240`; all env-overridable via `OLR_SRT_RECONN_*`). Teeth:
+`OLR_SRT_RECONN_NO_RESTART=1` skips the restart → src1 never reconnects → FAIL.
+
+**Why native-only — a real ingest difference.** Building this gate uncovered a
+cross-source coupling in the **legacy ffmpeg ingest**: a dead source's avformat
+reconnect churn (repeated socket create → connect-fail → destroy) monopolizes
+libsrt's *single global receive thread*, starving packet delivery to the other
+healthy sources (~2 s of content lost per reconnect cycle — confirmed by a thread
+sample parked in `srt epoll_wait`/`CGlobEvent`). No engine-side retry/throttle
+mitigates it (the starvation is continuous during the churn). The **native ingest**
+gives each source its own libsrt socket, so a dead source's reconnect no longer
+perturbs the others — the control source records 37/37 flashes with zero gaps. So
+the strict-isolation gate runs on the native path; the ffmpeg path's coupling is a
+known limitation that motivates native ingest on Apple.
+
+## Next (Phase 2c-b / 2c-c)
+
+Packet-loss / jitter injection (needs privileged macOS network emulation) and
+long-run drift over SRT — each its own spec under `docs/superpowers/specs/`.
