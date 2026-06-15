@@ -6,10 +6,6 @@
 
 namespace {
 constexpr qsizetype MaxSseBufferSize = 1024 * 1024;
-
-bool hasEventSeparator(const QByteArray &buffer) {
-    return buffer.indexOf("\n\n") >= 0 || buffer.indexOf("\r\n\r\n") >= 0;
-}
 } // namespace
 
 void SseParser::reset() {
@@ -19,12 +15,15 @@ void SseParser::reset() {
 }
 
 QList<TelemetryEvent> SseParser::push(const QByteArray &chunk) {
-    m_buffer.append(chunk);
-    if (m_buffer.size() > MaxSseBufferSize && !hasEventSeparator(m_buffer)) {
+    m_lastError.clear();
+
+    if (chunk.size() > MaxSseBufferSize || m_buffer.size() > MaxSseBufferSize - chunk.size()) {
         m_buffer.clear();
         m_lastError = QStringLiteral("SSE buffer exceeded maximum size");
         return {};
     }
+
+    m_buffer.append(chunk);
     return parseBufferedEvents();
 }
 
@@ -110,6 +109,5 @@ void SseParser::parseEventBlock(const QByteArray &block, QList<TelemetryEvent> *
     event.eventType = eventType.isEmpty() ? QStringLiteral("message") : eventType;
     event.lastEventId = m_lastEventId;
     event.payload = payload;
-    m_lastError.clear();
     events->append(event);
 }
