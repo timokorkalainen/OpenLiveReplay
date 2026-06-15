@@ -27,6 +27,7 @@ AppSettings TestSettingsManager::sampleSettings() {
     s.multiviewCount = 6;
     s.showTimeOfDay = true;
     s.midiPortName = QStringLiteral("X-Touch One");
+    s.audioOutputLatencyMs = 180;
 
     SourceSettings a;
     a.id = QStringLiteral("src-a");
@@ -76,6 +77,7 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.videoWidth, in.videoWidth);
     QCOMPARE(out.videoHeight, in.videoHeight);
     QCOMPARE(out.fps, in.fps);
+    QCOMPARE(out.audioOutputLatencyMs, in.audioOutputLatencyMs);
     QCOMPARE(out.multiviewCount, in.multiviewCount);
     QCOMPARE(out.showTimeOfDay, in.showTimeOfDay);
     QCOMPARE(out.midiPortName, in.midiPortName);

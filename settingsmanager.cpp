@@ -40,6 +40,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["fps"] = settings.fps;
     root["multiviewCount"] = settings.multiviewCount;
     root["showTimeOfDay"] = settings.showTimeOfDay;
+    root["audioOutputLatencyMs"] = settings.audioOutputLatencyMs;
     root["midiPortName"] = settings.midiPortName;
 
     QJsonArray midiArray;
@@ -129,6 +130,7 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.fps = root["fps"].toInt(settings.fps);
     settings.multiviewCount = root["multiviewCount"].toInt(settings.multiviewCount);
     settings.showTimeOfDay = root["showTimeOfDay"].toBool(settings.showTimeOfDay);
+    settings.audioOutputLatencyMs = root["audioOutputLatencyMs"].toInt(settings.audioOutputLatencyMs);
     settings.midiPortName = root["midiPortName"].toString();
     settings.midiBindings.clear();
     settings.midiBindingData2.clear();
