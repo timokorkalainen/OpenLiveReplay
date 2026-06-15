@@ -102,3 +102,12 @@ add_test(NAME sync_intercam_trim
 set_tests_properties(
     sync_intercam_matched sync_intercam_skew sync_drift_2997 sync_lipsync sync_intercam_trim
     PROPERTIES LABELS "sync-report" TIMEOUT 180 RUN_SERIAL TRUE)
+
+# --- Local-only SRT e2e (NOT in CI) -----------------------------------------
+# Proves the real engine ingests srt://. Requires a build configured with
+# -DOLR_FFMPEG_SRT_PREFIX (an SRT-enabled ffmpeg); under the default brew ffmpeg
+# the engine cannot open srt:// and this fails — by design. The distinct "srt"
+# label keeps it out of CI's e2e selection. Run locally with: ctest -L srt
+add_test(NAME e2e_srt_smoke
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_smoke.sh" "$<TARGET_FILE:record_harness>" 23501)
+set_tests_properties(e2e_srt_smoke PROPERTIES LABELS "srt" TIMEOUT 120 RUN_SERIAL TRUE)
