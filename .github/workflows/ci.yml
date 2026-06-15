@@ -15,14 +15,129 @@ permissions:
 
 env:
   QT_VERSION: 6.10.1
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Classify changed files once so workflow/docs-only PRs do not pay for app CI.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.classify.outputs.app }}
+      format: ${{ steps.classify.outputs.format }}
+      qml: ${{ steps.classify.outputs.qml }}
+      native: ${{ steps.classify.outputs.native }}
+      workflow: ${{ steps.classify.outputs.workflow }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            {
+              echo "app=true"
+              echo "format=true"
+              echo "qml=true"
+              echo "native=true"
+              echo "workflow=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+
+          app=false
+          format=false
+          qml=false
+          native=false
+          workflow=false
+          files="$(git diff --name-only "$base" HEAD || true)"
+
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+
+            case "$file" in
+              .github/workflows/*)
+                workflow=true
+                ;;
+            esac
+
+            case "$file" in
+              .github/workflows/*|*.md|docs/*)
+                ;;
+              *.cpp|*.c|*.h|*.hpp|*.mm)
+                app=true
+                format=true
+                native=true
+                ;;
+              *.qml)
+                app=true
+                qml=true
+                ;;
+              CMakeLists.txt|*/CMakeLists.txt|*.cmake|CMakePresets.json)
+                app=true
+                native=true
+                ;;
+              recorder_engine/*|playback/*|project/*|telemetry/*|midi/*|streamdeck/*|ios/*|tests/*|build-scripts/*|*.qrc|*.plist|*.entitlements)
+                app=true
+                ;;
+              *)
+                app=true
+                ;;
+            esac
+          done <<< "$files"
+
+          {
+            echo "app=$app"
+            echo "format=$format"
+            echo "qml=$qml"
+            echo "native=$native"
+            echo "workflow=$workflow"
+          } >> "$GITHUB_OUTPUT"
+
+  workflow-lint:
+    name: Workflow lint
+    runs-on: macos-14
+    needs: changes
+    if: ${{ needs.changes.outputs.workflow == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-homebrew-workflow-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-homebrew-workflow-
+            ${{ runner.os }}-homebrew-
+
+      - name: Install actionlint
+        run: brew install actionlint shellcheck
+
+      - name: actionlint
+        run: actionlint .github/workflows/ci.yml
+
   # ---------------------------------------------------------------------------
   # Build the macOS app + test suite and run CTest. This is the primary gate.
   # ---------------------------------------------------------------------------
   build-test-macos:
     name: Build + Test (macOS)
     runs-on: macos-14
+    needs: changes
+    if: ${{ needs.changes.outputs.app == 'true' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,18 +153,47 @@ jobs:
           modules: qtmultimedia
           cache: true
 
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-homebrew-build-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-homebrew-build-
+            ${{ runner.os }}-homebrew-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-build-test-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-build-test-
+            ${{ runner.os }}-ccache-
+
       - name: Install build deps
-        run: brew install ninja ffmpeg srt
+        run: brew install ninja ffmpeg srt ccache
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --zero-stats
 
       - name: Configure
         run: >
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
           -DOLR_BUILD_TESTS=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build (app + tests)
         run: cmake --build build
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
 
       - name: Run tests
         working-directory: build
@@ -61,6 +205,7 @@ jobs:
       # clang-tidy is advisory: it reports on changed first-party files using the
       # generated compile_commands.json but never fails the build (yet).
       - name: clang-tidy (advisory, changed files)
+        if: ${{ needs.changes.outputs.format == 'true' }}
         continue-on-error: true
         run: |
           brew install llvm
@@ -77,31 +222,37 @@ jobs:
                     'recorder_engine/*.cpp' 'playback/*.cpp' \
                     'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)
           if [ -z "$files" ]; then echo "No first-party C++ changes."; exit 0; fi
-          echo "$files"
-          "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" $files
+          printf '%s\n' "$files"
+          printf '%s\n' "$files" | while IFS= read -r file; do
+            "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" "$file"
+          done
 
   # ---------------------------------------------------------------------------
-  # Lightweight static checks: formatting + QML. No full configure needed.
+  # Lightweight static checks. Each setup step is gated by the file types that
+  # need it, so C++ formatting and QML linting do not force each other's deps.
   # ---------------------------------------------------------------------------
   lint:
-    name: Lint (format + QML)
+    name: Lint
     runs-on: macos-14
+    needs: changes
+    if: ${{ needs.changes.outputs.format == 'true' || needs.changes.outputs.qml == 'true' }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install Qt (for qmllint)
-        uses: jurplel/install-qt-action@v4
+      - name: Cache Homebrew downloads
+        if: ${{ needs.changes.outputs.format == 'true' }}
+        uses: actions/cache@v4
         with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: desktop
-          arch: clang_64
-          modules: qtmultimedia   # Main.qml imports QtMultimedia (VideoOutput)
-          cache: true
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-homebrew-lint-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-homebrew-lint-
+            ${{ runner.os }}-homebrew-
 
       - name: clang-format (changed lines)
+        if: ${{ needs.changes.outputs.format == 'true' }}
         run: |
           # Homebrew LLVM clang-format (Xcode does not reliably ship clang-format);
           # committed sources are formatted with the same tool. Only the lines
@@ -128,7 +279,19 @@ jobs:
               exit 1 ;;
           esac
 
+      - name: Install Qt (for qmllint)
+        if: ${{ needs.changes.outputs.qml == 'true' }}
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia   # Main.qml imports QtMultimedia (VideoOutput)
+          cache: true
+
       - name: qmllint
+        if: ${{ needs.changes.outputs.qml == 'true' }}
         run: |
           "$QT_ROOT_DIR/bin/qmllint" -I "$QT_ROOT_DIR/qml" Main.qml MultiviewWindow.qml
 
@@ -141,6 +304,8 @@ jobs:
   sanitizers:
     name: Sanitizers
     runs-on: macos-14
+    needs: changes
+    if: ${{ needs.changes.outputs.native == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -169,8 +334,32 @@ jobs:
           modules: qtmultimedia
           cache: true
 
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-homebrew-sanitizers-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-homebrew-sanitizers-
+            ${{ runner.os }}-homebrew-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-sanitizers-${{ matrix.label }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-sanitizers-${{ matrix.label }}-
+            ${{ runner.os }}-ccache-sanitizers-
+            ${{ runner.os }}-ccache-
+
       - name: Install build deps
-        run: brew install ninja ffmpeg srt
+        run: brew install ninja ffmpeg srt ccache
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --zero-stats
 
       - name: Configure (${{ matrix.label }})
         run: >
@@ -178,10 +367,16 @@ jobs:
           -DCMAKE_BUILD_TYPE=Debug
           -DOLR_BUILD_TESTS=ON
           -DOLR_SANITIZER="${{ matrix.sanitizer }}"
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build tests
         run: cmake --build build --target ${{ matrix.build_targets }}
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
 
       - name: Run sanitizer spot checks
         working-directory: build
