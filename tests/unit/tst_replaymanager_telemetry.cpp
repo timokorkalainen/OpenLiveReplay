@@ -1,7 +1,9 @@
 #include <QtTest>
 #include <QFileInfo>
+#include <QFuture>
 #include <QJsonObject>
 #include <QTemporaryDir>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include "playback/telemetrytimelinereader.h"
 #include "recorder_engine/replaymanager.h"
@@ -13,6 +15,9 @@ private slots:
     void recordTelemetryEventWritesDelayedPayload();
     void recordTelemetryEventRejectsInvalidStates();
     void recordTelemetryEventClampsDelay();
+    void telemetryFeedConfigIgnoresEmptyAndKeepsFirstDuplicate();
+    void setTelemetryFeedsDuringRecordingDoesNotRemapActiveLayout();
+    void recordTelemetryEventWorksFromWorkerThread();
 
 private:
     static void configureMinimalRecording(ReplayManager &manager, const QString &outputDir);
@@ -118,6 +123,104 @@ void TestReplayManagerTelemetry::recordTelemetryEventClampsDelay() {
     QCOMPARE(event.value(QStringLiteral("olrTelemetryDelayMs")).toInt(), 10000);
     QCOMPARE(event.value(QStringLiteral("olrEffectiveMs")).toLongLong(),
              event.value(QStringLiteral("olrReceiveMs")).toLongLong() + 10000);
+}
+
+void TestReplayManagerTelemetry::telemetryFeedConfigIgnoresEmptyAndKeepsFirstDuplicate() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ReplayManager manager;
+    configureMinimalRecording(manager, dir.path());
+    manager.setTelemetryFeeds(
+        {QString(), QStringLiteral("cam-main"), QStringLiteral("cam-main"), QStringLiteral("cam-side")},
+        {QStringLiteral("Empty"), QStringLiteral("Main First"), QStringLiteral("Main Duplicate"),
+         QStringLiteral("Side")},
+        {50, 200, 900, 300});
+
+    manager.startRecording();
+    QVERIFY(manager.isRecording());
+    QVERIFY(!manager.recordTelemetryEvent(QString(), QJsonObject{}));
+    QVERIFY(manager.recordTelemetryEvent(QStringLiteral("cam-main"),
+                                         QJsonObject{{QStringLiteral("sequence"), 1}}));
+    QVERIFY(manager.recordTelemetryEvent(QStringLiteral("cam-side"),
+                                         QJsonObject{{QStringLiteral("sequence"), 2}}));
+
+    const QString recordingPath = manager.getVideoPath();
+    manager.stopRecording();
+
+    TelemetryTimelineReader reader;
+    QVERIFY2(reader.load(recordingPath), qPrintable(reader.lastError()));
+    QCOMPARE(reader.feedIds(), QStringList({QStringLiteral("cam-main"), QStringLiteral("cam-side")}));
+
+    const QVariantMap main = reader.stateAt(20000).value(QStringLiteral("cam-main")).toMap();
+    QCOMPARE(main.value(QStringLiteral("sequence")).toInt(), 1);
+    QCOMPARE(main.value(QStringLiteral("olrTelemetryDelayMs")).toInt(), 200);
+    QCOMPARE(main.value(QStringLiteral("olrEffectiveMs")).toLongLong(),
+             main.value(QStringLiteral("olrReceiveMs")).toLongLong() + 200);
+}
+
+void TestReplayManagerTelemetry::setTelemetryFeedsDuringRecordingDoesNotRemapActiveLayout() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ReplayManager manager;
+    configureMinimalRecording(manager, dir.path());
+    manager.setTelemetryFeeds({QStringLiteral("cam-main")},
+                              {QStringLiteral("Main Camera")},
+                              {0});
+
+    manager.startRecording();
+    QVERIFY(manager.isRecording());
+    manager.setTelemetryFeeds({QStringLiteral("cam-side")},
+                              {QStringLiteral("Side Camera")},
+                              {0});
+
+    QVERIFY(!manager.recordTelemetryEvent(QStringLiteral("cam-side"),
+                                          QJsonObject{{QStringLiteral("ignored"), true}}));
+    QVERIFY(manager.recordTelemetryEvent(QStringLiteral("cam-main"),
+                                         QJsonObject{{QStringLiteral("active"), true}}));
+
+    const QString recordingPath = manager.getVideoPath();
+    manager.stopRecording();
+
+    TelemetryTimelineReader reader;
+    QVERIFY2(reader.load(recordingPath), qPrintable(reader.lastError()));
+    QCOMPARE(reader.feedIds(), QStringList{QStringLiteral("cam-main")});
+    const QVariantMap state = reader.stateAt(20000);
+    QVERIFY(state.contains(QStringLiteral("cam-main")));
+    QVERIFY(!state.contains(QStringLiteral("cam-side")));
+    QCOMPARE(state.value(QStringLiteral("cam-main")).toMap().value(QStringLiteral("active")).toBool(), true);
+}
+
+void TestReplayManagerTelemetry::recordTelemetryEventWorksFromWorkerThread() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    ReplayManager manager;
+    configureMinimalRecording(manager, dir.path());
+    manager.setTelemetryFeeds({QStringLiteral("cam-main")},
+                              {QStringLiteral("Main Camera")},
+                              {100});
+
+    manager.startRecording();
+    QVERIFY(manager.isRecording());
+
+    QFuture<bool> result = QtConcurrent::run([&manager] {
+        return manager.recordTelemetryEvent(
+            QStringLiteral("cam-main"),
+            QJsonObject{{QStringLiteral("threaded"), true}});
+    });
+    result.waitForFinished();
+    QVERIFY(result.result());
+
+    const QString recordingPath = manager.getVideoPath();
+    manager.stopRecording();
+
+    TelemetryTimelineReader reader;
+    QVERIFY2(reader.load(recordingPath), qPrintable(reader.lastError()));
+    const QVariantMap event = reader.stateAt(20000).value(QStringLiteral("cam-main")).toMap();
+    QCOMPARE(event.value(QStringLiteral("threaded")).toBool(), true);
+    QCOMPARE(event.value(QStringLiteral("olrTelemetryDelayMs")).toInt(), 100);
 }
 
 QTEST_GUILESS_MAIN(TestReplayManagerTelemetry)

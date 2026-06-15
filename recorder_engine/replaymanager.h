@@ -4,6 +4,7 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QList>
+#include <QMutex>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -23,7 +24,10 @@ public:
     // Engine Controls used by UIManager
     void startRecording();
     void stopRecording();
-    bool isRecording() const { return m_isRecording; }
+    bool isRecording() const {
+        QMutexLocker locker(&m_stateMutex);
+        return m_isRecording;
+    }
 
     // Source configuration (N sources)
     void setSourceUrls(const QStringList &urls) { m_sourceUrls = urls; }
@@ -87,6 +91,7 @@ private slots:
 private:
     void writeBlueFrames(int64_t elapsedMs);
 
+    mutable QMutex m_stateMutex;
     bool m_isRecording = false;
     int64_t m_globalFrameCount = 0;
 
