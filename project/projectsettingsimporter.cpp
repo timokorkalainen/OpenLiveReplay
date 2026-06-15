@@ -37,12 +37,14 @@ bool ProjectSettingsImporter::isValidSourceMetadata(const QJsonArray &metadata, 
             return false;
         }
         const QJsonObject obj = value.toObject();
-        if (obj.value("k").toString().trimmed().isEmpty()) {
-            *error = QStringLiteral("feed metadata entries require non-empty k");
+        const QJsonValue nameValue = obj.value("name");
+        if (!nameValue.isString() || nameValue.toString().trimmed().isEmpty()) {
+            *error = QStringLiteral("feed metadata entries require non-empty name");
             return false;
         }
-        if (!obj.contains("v")) {
-            *error = QStringLiteral("feed metadata entries require v");
+        const QJsonValue valueValue = obj.value("value");
+        if (!valueValue.isString()) {
+            *error = QStringLiteral("feed metadata entries require string value");
             return false;
         }
     }
@@ -113,7 +115,6 @@ ProjectSettingsImportResult ProjectSettingsImporter::importJson(
         source.id = obj.value("id").toString().trimmed();
         source.name = obj.value("name").toString();
         source.url = obj.value("url").toString().trimmed();
-        source.trimOffsetMs = obj.value("trimOffsetMs").toInt(0);
 
         if (source.id.isEmpty()) {
             result.error = QStringLiteral("feed id must be non-empty");

@@ -32,7 +32,7 @@ feed identity, independent of the operator's current multiview layout.
 - The user keeps local control of project filename, save location, output
   resolution, FPS, multiview count, and which configured feeds are displayed.
 - Static feed metadata uses the current OLR format: global `metadataFields` plus
-  per-feed `metadata` entries shaped as `{ "k": "...", "v": "..." }`.
+  per-feed `metadata` entries shaped as `{ "name": "...", "value": "..." }`.
 - Telemetry timing uses OLR receive time on the recording timeline, plus a
   per-feed positive `telemetryDelayMs` in the range `0..10000`. Provider event
   timestamps are preserved for audit/debug but do not decide replay position.
@@ -70,8 +70,8 @@ Example settings response:
       "url": "srt://10.0.0.20:9000",
       "telemetryDelayMs": 800,
       "metadata": [
-        { "k": "angle", "v": "wide" },
-        { "k": "operator", "v": "Aino" }
+        { "name": "angle", "value": "wide" },
+        { "name": "operator", "value": "Aino" }
       ]
     }
   ]

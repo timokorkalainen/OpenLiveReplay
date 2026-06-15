@@ -13,8 +13,12 @@ private slots:
     void missingTelemetryUrlFails();
     void invalidDelayFails();
     void metadataShapeIsPreserved();
+    void importedMetadataUsesUiConsumedShape();
+    void providerTrimOffsetIsIgnored();
     void nonArrayMetadataFieldsFails();
     void nonArrayFeedMetadataFails();
+    void invalidFeedMetadataEntriesFail_data();
+    void invalidFeedMetadataEntriesFail();
     void nonIntegerTelemetryDelayFails_data();
     void nonIntegerTelemetryDelayFails();
     void invalidProjectIdentityFails_data();
@@ -38,8 +42,8 @@ static QJsonObject validRoot() {
                 {"url", "srt://10.0.0.20:9000"},
                 {"telemetryDelayMs", 800},
                 {"metadata", QJsonArray{
-                    QJsonObject{{"k", "angle"}, {"v", "wide"}},
-                    QJsonObject{{"k", "operator"}, {"v", "Aino"}}
+                    QJsonObject{{"name", "angle"}, {"value", "wide"}},
+                    QJsonObject{{"name", "operator"}, {"value", "Aino"}}
                 }}
             },
             QJsonObject{
@@ -117,8 +121,36 @@ void TestProjectSettingsImporter::metadataShapeIsPreserved() {
 
     QVERIFY(result.ok);
     QCOMPARE(result.sources[0].metadata,
-             QJsonArray({QJsonObject{{"k", "angle"}, {"v", "wide"}},
-                         QJsonObject{{"k", "operator"}, {"v", "Aino"}}}));
+             QJsonArray({QJsonObject{{"name", "angle"}, {"value", "wide"}},
+                         QJsonObject{{"name", "operator"}, {"value", "Aino"}}}));
+}
+
+void TestProjectSettingsImporter::importedMetadataUsesUiConsumedShape() {
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(validRoot(), QStringLiteral("https://provider.example/project.json"));
+
+    QVERIFY(result.ok);
+    const QJsonObject metadata = result.sources[0].metadata.at(0).toObject();
+    QCOMPARE(metadata.value("name").toString(), QStringLiteral("angle"));
+    QCOMPARE(metadata.value("value").toString(), QStringLiteral("wide"));
+    QVERIFY(!metadata.contains("k"));
+    QVERIFY(!metadata.contains("v"));
+}
+
+void TestProjectSettingsImporter::providerTrimOffsetIsIgnored() {
+    QJsonObject root = validRoot();
+    QJsonArray feeds = root.value("feeds").toArray();
+    QJsonObject first = feeds.at(0).toObject();
+    first["trimOffsetMs"] = 250;
+    feeds[0] = first;
+    root["feeds"] = feeds;
+
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(root, QStringLiteral("https://provider.example/project.json"));
+    QVERIFY(result.ok);
+    QCOMPARE(result.sources[0].trimOffsetMs, 0);
 }
 
 void TestProjectSettingsImporter::nonArrayMetadataFieldsFails() {
@@ -137,6 +169,34 @@ void TestProjectSettingsImporter::nonArrayFeedMetadataFails() {
     QJsonArray feeds = root.value("feeds").toArray();
     QJsonObject first = feeds.at(0).toObject();
     first["metadata"] = QStringLiteral("bad");
+    feeds[0] = first;
+    root["feeds"] = feeds;
+
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(root, QStringLiteral("https://provider.example/project.json"));
+    QVERIFY(!result.ok);
+    QVERIFY(result.error.contains(QStringLiteral("metadata")));
+}
+
+void TestProjectSettingsImporter::invalidFeedMetadataEntriesFail_data() {
+    QTest::addColumn<QJsonObject>("metadataEntry");
+
+    QTest::newRow("missing-name") << QJsonObject{{"value", "wide"}};
+    QTest::newRow("empty-name") << QJsonObject{{"name", ""}, {"value", "wide"}};
+    QTest::newRow("non-string-name") << QJsonObject{{"name", 7}, {"value", "wide"}};
+    QTest::newRow("missing-value") << QJsonObject{{"name", "angle"}};
+    QTest::newRow("non-string-value") << QJsonObject{{"name", "angle"}, {"value", 7}};
+    QTest::newRow("legacy-kv-shape") << QJsonObject{{"k", "angle"}, {"v", "wide"}};
+}
+
+void TestProjectSettingsImporter::invalidFeedMetadataEntriesFail() {
+    QFETCH(QJsonObject, metadataEntry);
+
+    QJsonObject root = validRoot();
+    QJsonArray feeds = root.value("feeds").toArray();
+    QJsonObject first = feeds.at(0).toObject();
+    first["metadata"] = QJsonArray{metadataEntry};
     feeds[0] = first;
     root["feeds"] = feeds;
 
