@@ -125,7 +125,8 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     processEncoderTick(m_persistentEncCtx, streamTimeMs, trimMs);
 }
 
-void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs) {
+void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs,
+                                      int64_t trimMs) {
     AVPacket* outPkt = av_packet_alloc();
     bool havePacket = false;
     int track = -1;
@@ -1044,8 +1045,8 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
     // Catch up at most 1 s per tick: the track stays contiguous, a large
     // backlog (stalled event loop) just drains over several ticks.
     const int64_t n = qMin<int64_t>(targetEnd - m_audioWriteCursor, kAudioSampleRate);
-    const int64_t start = m_audioWriteCursor;                          // file timeline
-    const int64_t srcStart = start - jitterSamples - trimSamples;  // source timeline (+trim)
+    const int64_t start = m_audioWriteCursor;                     // file timeline
+    const int64_t srcStart = start - jitterSamples - trimSamples; // source timeline (+trim)
 
     QByteArray chunk(int(n * kAudioBytesPerSample), '\0');
     {

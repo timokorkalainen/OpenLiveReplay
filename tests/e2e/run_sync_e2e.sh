@@ -175,6 +175,7 @@ case "$SCENARIO" in
             -map 0:v \
             -f tee "[f=mpegts]udp://127.0.0.1:${P0}?pkt_size=1316|[f=mpegts]udp://127.0.0.1:${P1}?pkt_size=1316" &
         local pid=$!
+        PIDS+=("$pid")
         sleep 0.5
         local mkv
         mkv=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \

@@ -33,12 +33,12 @@ AppSettings TestSettingsManager::sampleSettings() {
     a.name = QStringLiteral("Cam A");
     a.url = QStringLiteral("srt://10.0.0.2:9000");
     a.metadata = QJsonArray{QJsonObject{{"k", "angle"}, {"v", "wide"}}};
-    a.trimOffsetMs = -66;   // advance
+    a.trimOffsetMs = -66; // advance
     SourceSettings b;
     b.id = QStringLiteral("src-b");
     b.name = QStringLiteral("Cam B");
     b.url = QStringLiteral("udp://10.0.0.3:9001");
-    b.trimOffsetMs = 132;   // delay
+    b.trimOffsetMs = 132; // delay
     s.sources = {a, b};
 
     s.metadataFields = QJsonArray{QJsonObject{{"name", "angle"}, {"display", "Angle"}}};

@@ -16,7 +16,7 @@ struct SourceSettings {
     QString name;
     QString url;
     QJsonArray metadata;
-    int trimOffsetMs = 0;  // per-source timeline trim (+delay / -advance), ms
+    int trimOffsetMs = 0; // per-source timeline trim (+delay / -advance), ms
 };
 
 struct AppSettings {

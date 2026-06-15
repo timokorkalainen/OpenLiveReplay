@@ -175,7 +175,7 @@ private:
     // FFmpeg helpers
     bool setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl url, int* videoStreamIdx);
     bool setupEncoder(AVCodecContext** encCtx);
-    void processEncoderTick(AVCodecContext *encCtx, int64_t streamTimeMs, int64_t trimMs);
+    void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs);
 };
 
 #endif // STREAMWORKER_H
