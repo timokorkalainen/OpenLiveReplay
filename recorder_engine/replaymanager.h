@@ -85,6 +85,9 @@ signals:
     // sourceIndex is the fixed source identity (not a view slot).
     void sourceConnectionChanged(int sourceIndex, bool connected);
 
+    // Emitted after a per-feed telemetry packet has been stamped and written.
+    void telemetryRecorded(const QString &feedId, const QJsonObject &payload, qint64 effectiveMs);
+
 private slots:
     void onTimerTick();
 

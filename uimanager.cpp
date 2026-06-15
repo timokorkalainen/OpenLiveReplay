@@ -20,8 +20,33 @@
 #include <QElapsedTimer>
 #include <QTimer>
 #include <QScreen>
+#include <QSet>
 #include <QVariantMap>
 #include <cstdio>
+
+namespace {
+
+QString telemetryValueToString(const QVariant &value) {
+    const QJsonValue json = QJsonValue::fromVariant(value);
+    if (json.isObject()) {
+        return QString::fromUtf8(QJsonDocument(json.toObject()).toJson(QJsonDocument::Compact));
+    }
+    if (json.isArray()) {
+        return QString::fromUtf8(QJsonDocument(json.toArray()).toJson(QJsonDocument::Compact));
+    }
+    if (json.isBool()) {
+        return json.toBool() ? QStringLiteral("true") : QStringLiteral("false");
+    }
+    if (json.isDouble()) {
+        return QString::number(json.toDouble());
+    }
+    if (json.isNull() || json.isUndefined()) {
+        return QString();
+    }
+    return json.toString();
+}
+
+} // namespace
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
     : QObject(parent), m_replayManager(engine) {
@@ -31,6 +56,17 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             Qt::QueuedConnection);
     connect(m_replayManager, &ReplayManager::sourceConnectionChanged, this,
             &UIManager::onSourceConnectionChanged, Qt::QueuedConnection);
+    connect(m_replayManager, &ReplayManager::telemetryRecorded, this,
+            [this](const QString &feedId, const QJsonObject &payload, qint64 effectiveMs) {
+        if (feedId.trimmed().isEmpty()) return;
+        TelemetryTimelineEntry entry;
+        entry.ptsMs = effectiveMs;
+        entry.payload = payload.toVariantMap();
+        entry.payload.insert(QStringLiteral("feedId"), feedId);
+        m_recordingTelemetry[feedId].append(entry);
+        m_telemetryVersion++;
+        emit telemetryChanged();
+    });
     m_settingsManager = new SettingsManager();
     m_importClient = new ProjectImportClient(this);
     connect(m_importClient, &ProjectImportClient::finished, this,
@@ -341,6 +377,8 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     connect(m_transport, &PlaybackTransport::posChanged, this, [this](int64_t) {
         pushDeckTimecode();
         emit playbackTimecodeChanged();
+        m_telemetryVersion++;
+        emit telemetryChanged();
     });
     // The displayed timecode also changes when the time-of-day toggle flips or
     // the recording's wall-clock anchor is (re)established — keep both the UI
@@ -874,6 +912,42 @@ void UIManager::clearImportPreview() {
     m_importPreviewError.clear();
 }
 
+bool UIManager::loadTelemetryTimeline(const QString &filePath) {
+    m_hasTelemetryTimeline = false;
+    if (filePath.trimmed().isEmpty()) {
+        return false;
+    }
+
+    if (!m_telemetryTimelineReader.load(filePath)) {
+        qWarning() << "UIManager: failed to load telemetry timeline"
+                   << filePath << m_telemetryTimelineReader.lastError();
+        return false;
+    }
+
+    m_hasTelemetryTimeline = true;
+    m_telemetryVersion++;
+    emit telemetryChanged();
+    return true;
+}
+
+QVariantMap UIManager::recordingTelemetryStateAt(qint64 playheadMs) const {
+    QVariantMap state;
+    for (auto it = m_recordingTelemetry.constBegin(); it != m_recordingTelemetry.constEnd(); ++it) {
+        const QList<TelemetryTimelineEntry> &entries = it.value();
+        const TelemetryTimelineEntry *latest = nullptr;
+        for (const TelemetryTimelineEntry &entry : entries) {
+            if (entry.ptsMs > playheadMs) {
+                break;
+            }
+            latest = &entry;
+        }
+        if (latest) {
+            state.insert(it.key(), latest->payload);
+        }
+    }
+    return state;
+}
+
 void UIManager::onSourceConnectionChanged(int sourceIndex, bool connected) {
     if (sourceIndex < 0) return;
     while (m_sourceConnected.size() <= sourceIndex)
@@ -1284,6 +1358,8 @@ void UIManager::startRecording() {
     // Distinguish the cheap "no sources" cause up front so the surfaced
     // message is actionable; otherwise it's a muxer/encoder init failure.
     const bool hadSources = !m_replayManager->getSourceUrls().isEmpty();
+    m_recordingTelemetry.clear();
+    m_hasTelemetryTimeline = false;
 
     m_replayManager->startRecording();
     if (!m_replayManager->isRecording()) {
@@ -1357,7 +1433,9 @@ void UIManager::stopRecording() {
         m_telemetryClient->stop();
     }
 
+    const QString recordingPath = m_replayManager->getVideoPath();
     m_replayManager->stopRecording();
+    loadTelemetryTimeline(recordingPath);
     m_transport->setPlaying(false);
     setFollowLive(false);
     if (m_playbackWorker) {
@@ -1572,6 +1650,8 @@ void UIManager::applyImportPreview() {
     m_sourceConnectionVersion++;
     m_sourceTrimVersion++;
     m_liveTelemetry.clear();
+    m_recordingTelemetry.clear();
+    m_hasTelemetryTimeline = false;
     m_telemetryVersion++;
 
     syncActiveStreams();
@@ -1593,8 +1673,66 @@ void UIManager::applyImportPreview() {
     emit importPreviewChanged();
 }
 
-QVariantMap UIManager::telemetryAtPlayhead() const {
+QVariantMap UIManager::telemetryAtPlayhead() {
+    const qint64 playheadMs = scrubPosition();
+    if (m_replayManager && m_replayManager->isRecording() && !m_recordingTelemetry.isEmpty()) {
+        return recordingTelemetryStateAt(playheadMs);
+    }
+    if (m_hasTelemetryTimeline) {
+        return m_telemetryTimelineReader.stateAt(playheadMs);
+    }
+    if (!m_recordingTelemetry.isEmpty()) {
+        return recordingTelemetryStateAt(playheadMs);
+    }
     return m_liveTelemetry;
+}
+
+QVariantList UIManager::telemetryRowsAtPlayhead() {
+    const QVariantMap state = telemetryAtPlayhead();
+    QVariantList rows;
+    QSet<QString> emitted;
+
+    auto appendRow = [&rows, &emitted, &state](const QString &feedId, const QString &feedName) {
+        const QVariant value = state.value(feedId);
+        if (!value.isValid()) return;
+
+        QVariantMap payload = value.toMap();
+        QVariantList items;
+        QStringList summaryParts;
+        for (auto it = payload.constBegin(); it != payload.constEnd(); ++it) {
+            const QString key = it.key();
+            if (key == QStringLiteral("feedId")) continue;
+            const QString displayValue = telemetryValueToString(it.value());
+
+            QVariantMap item;
+            item.insert(QStringLiteral("name"), key);
+            item.insert(QStringLiteral("value"), displayValue);
+            items.append(item);
+            if (summaryParts.size() < 6 && !displayValue.isEmpty()) {
+                summaryParts.append(key + QStringLiteral("=") + displayValue);
+            }
+        }
+
+        QVariantMap row;
+        row.insert(QStringLiteral("feedId"), feedId);
+        row.insert(QStringLiteral("feedName"), feedName);
+        row.insert(QStringLiteral("items"), items);
+        row.insert(QStringLiteral("summary"), summaryParts.join(QStringLiteral("  ")));
+        rows.append(row);
+        emitted.insert(feedId);
+    };
+
+    for (const SourceSettings &source : m_currentSettings.sources) {
+        appendRow(source.id, source.name);
+    }
+
+    for (auto it = state.constBegin(); it != state.constEnd(); ++it) {
+        if (!emitted.contains(it.key())) {
+            appendRow(it.key(), QString());
+        }
+    }
+
+    return rows;
 }
 
 void UIManager::loadSettings() {

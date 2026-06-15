@@ -874,6 +874,59 @@ ApplicationWindow {
                     }
                 }
 
+                GroupBox {
+                    id: playbackTelemetryPanel
+                    title: "Telemetry"
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 110
+                    visible: telemetryRows.length > 0
+                    property var telemetryRows: appWindow.uiManagerRef.telemetryVersion >= 0
+                                                ? appWindow.uiManagerRef.telemetryRowsAtPlayhead()
+                                                : []
+
+                    ScrollView {
+                        anchors.fill: parent
+                        clip: true
+                        contentWidth: availableWidth
+                        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+                        ColumnLayout {
+                            width: parent.width
+                            spacing: 6
+
+                            Repeater {
+                                model: playbackTelemetryPanel.telemetryRows
+
+                                delegate: RowLayout {
+                                    id: telemetryRow
+                                    required property var modelData
+                                    width: parent.width
+                                    spacing: 10
+
+                                    Text {
+                                        text: {
+                                            var name = telemetryRow.modelData.feedName || ""
+                                            var idText = telemetryRow.modelData.feedId || ""
+                                            return name.length > 0 ? (idText + " " + name) : idText
+                                        }
+                                        color: "#eeeeee"
+                                        font.bold: true
+                                        elide: Text.ElideRight
+                                        Layout.preferredWidth: 180
+                                    }
+
+                                    Text {
+                                        text: telemetryRow.modelData.summary || ""
+                                        color: "#b0b0b0"
+                                        elide: Text.ElideRight
+                                        Layout.fillWidth: true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 Slider {
                     id: scrubBar
                     Layout.fillWidth: true
