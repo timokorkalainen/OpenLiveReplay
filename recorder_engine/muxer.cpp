@@ -10,7 +10,17 @@ Muxer::~Muxer() { close(); }
 
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
                  int audioSampleRate, int audioChannels) {
+    return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate, audioChannels);
+}
+
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
+                 const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
+                 int audioSampleRate, int audioChannels) {
     QMutexLocker locker(&m_mutex);
+    Q_UNUSED(streamNames);
+
+    m_telemetryTrackOffset = 0;
+    m_telemetryTrackCount = 0;
 
     if (width <= 0) width = 1920;
     if (height <= 0) height = 1080;
@@ -79,6 +89,25 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
 
         const QString subTitle = QString("Track %1 Metadata").arg(i + 1);
         av_dict_set(&st->metadata, "title", subTitle.toUtf8().constData(), 0);
+    }
+
+    // 2c. Add one subtitle track per configured feed for feed telemetry
+    m_telemetryTrackOffset = m_subtitleTrackOffset + videoTrackCount;
+    m_telemetryTrackCount = telemetryFeedIds.size();
+    for (int i = 0; i < telemetryFeedIds.size(); ++i) {
+        AVStream* st = avformat_new_stream(m_outCtx, nullptr);
+        st->id = m_telemetryTrackOffset + i;
+        st->codecpar->codec_id = AV_CODEC_ID_TEXT;
+        st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+        st->time_base = {1, 1000};
+
+        const QString feedId = telemetryFeedIds.at(i);
+        const QString feedName = i < telemetryFeedNames.size() ? telemetryFeedNames.at(i) : QString();
+        const QString title = QString("Feed %1 Telemetry").arg(feedId);
+        av_dict_set(&st->metadata, "title", title.toUtf8().constData(), 0);
+        av_dict_set(&st->metadata, "olr_track_type", "feed_telemetry", 0);
+        av_dict_set(&st->metadata, "olr_feed_id", feedId.toUtf8().constData(), 0);
+        av_dict_set(&st->metadata, "olr_feed_name", feedName.toUtf8().constData(), 0);
     }
 
     // 3. Set Matroska specific options for Chase Play
@@ -242,6 +271,34 @@ void Muxer::writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& 
     av_packet_free(&pkt);
 }
 
+void Muxer::writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData) {
+    if (!m_initialized || !m_outCtx || jsonData.isEmpty()) return;
+    if (feedIndex < 0 || feedIndex >= m_telemetryTrackCount) return;
+
+    const int trackIndex = m_telemetryTrackOffset + feedIndex;
+    if (trackIndex < 0 || trackIndex >= (int)m_outCtx->nb_streams) return;
+
+    AVStream* st = m_outCtx->streams[trackIndex];
+    if (!st) return;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return;
+
+    if (av_new_packet(pkt, jsonData.size()) < 0) {
+        av_packet_free(&pkt);
+        return;
+    }
+    memcpy(pkt->data, jsonData.constData(), jsonData.size());
+
+    pkt->stream_index = trackIndex;
+    pkt->pts      = av_rescale_q(ptsMs, {1, 1000}, st->time_base);
+    pkt->dts      = pkt->pts;
+    pkt->duration = av_rescale_q(1, {1, 1000}, st->time_base);
+
+    writePacket(pkt);
+    av_packet_free(&pkt);
+}
+
 AVStream* Muxer::getStream(int index) {
     // REMOVED LOCKER HERE: Reading nb_streams and streams is safe
     // after init() is finished and before close() starts.
@@ -292,6 +349,8 @@ void Muxer::close() {
         m_outCtx = nullptr;
         m_lastDts.clear();
     }
+    m_telemetryTrackOffset = 0;
+    m_telemetryTrackCount = 0;
 }
 
 QString Muxer::getVideoPath(QString fileName) {
@@ -330,4 +389,3 @@ QString Muxer::getVideoPath(QString fileName) {
 
     return base + "/" + fileName + ".mkv";
 }
-

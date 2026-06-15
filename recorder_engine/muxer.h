@@ -5,6 +5,7 @@
 #include <QElapsedTimer>
 #include <QMutex>
 #include <QString>
+#include <QStringList>
 
 #include <atomic>
 #include <condition_variable>
@@ -29,13 +30,18 @@ public:
 
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
              int audioSampleRate = 48000, int audioChannels = 2);
+    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
+             const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
+             int audioSampleRate = 48000, int audioChannels = 2);
     void writePacket(AVPacket* pkt);
     void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
+    void writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);
     AVStream* getStream(int index);
     void close();
 
     int audioTrackOffset() const { return m_audioTrackOffset; }
     int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
+    int telemetryTrackOffset() const { return m_telemetryTrackOffset; }
 
     QString getVideoPath(QString fileName);
 
@@ -70,6 +76,8 @@ private:
     bool m_initialized = false;
     int m_audioTrackOffset = 0;     // Index of first audio track
     int m_subtitleTrackOffset = 0;  // Index of first subtitle track
+    int m_telemetryTrackOffset = 0; // Index of first per-feed telemetry track
+    int m_telemetryTrackCount = 0;
 
     // ─── Dedicated writer thread (decouples callers from the disk) ─────────
     // writePacket() enqueues a cloned packet and returns immediately; the
