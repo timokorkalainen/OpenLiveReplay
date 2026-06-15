@@ -1,7 +1,9 @@
 import Combine
 import Foundation
 import StreamDeckKit
+#if canImport(StreamDeckSimulator)
 import StreamDeckSimulator
+#endif
 import UIKit
 
 /// Objective-C facade consumed by the Qt app (streamdeck/streamdeckmanager.mm).
@@ -111,11 +113,26 @@ public final class OLRStreamDeckBridge: NSObject {
     // docs; the Qt side only exposes its UI entry point in debug builds.
 
     @objc public func showSimulator() {
+        #if canImport(StreamDeckSimulator)
         StreamDeckSimulator.show(defaultStreamDeck: .plus)
+        #endif
     }
 
     @objc public func closeSimulator() {
+        #if canImport(StreamDeckSimulator)
         StreamDeckSimulator.close()
+        #endif
+    }
+
+    /// Whether the in-app Stream Deck simulator is compiled in. False while the
+    /// StreamDeckSimulator SPM product is dropped (Xcode 26.5 asset-catalog
+    /// incompatibility) — lets the Qt side hide its now-inert button.
+    @objc public var simulatorSupported: Bool {
+        #if canImport(StreamDeckSimulator)
+        return true
+        #else
+        return false
+        #endif
     }
 
     /// True when the Elgato Stream Deck Connect app (which hosts the device

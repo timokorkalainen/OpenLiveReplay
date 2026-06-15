@@ -42,7 +42,8 @@ bool StreamDeckManager::driverAppInstalled() const
 bool StreamDeckManager::simulatorAvailable() const
 {
 #ifdef QT_DEBUG
-    return true;
+    // Only when the simulator is actually compiled into the bridge.
+    return [OLRStreamDeckBridge shared].simulatorSupported;
 #else
     return false;
 #endif

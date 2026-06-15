@@ -45,15 +45,16 @@ xcodebuild archive \
 # via SPM's Bundle.module, which probes the enclosing framework root at runtime.
 # The bundle is built during archive but not folded into the framework, so copy
 # it in manually — otherwise showSimulator() crashes with a Bundle.module fatal.
-echo "[StreamDeckBridge] Embedding StreamDeckSimulator resource bundle..."
+# When the simulator product is not a dependency (it's dropped under Xcode 26.5),
+# the bundle won't exist and there is nothing to embed — skip it.
 FRAMEWORK_IN_ARCHIVE="$ARCHIVE_PATH/Products/Library/Frameworks/StreamDeckBridge.framework"
 SIM_BUNDLE="$(find "$ROOT_DIR/ios_build/streamdeck-bridge/DerivedData" -type d -name "StreamDeckKit_StreamDeckSimulator.bundle" -path "*iphoneos*" | head -1)"
-if [ -z "$SIM_BUNDLE" ]; then
-    echo "Error: StreamDeckKit_StreamDeckSimulator.bundle not found in DerivedData." >&2
-    echo "       StreamDeckSimulator.show() would crash via Bundle.module at runtime." >&2
-    exit 1
+if [ -n "$SIM_BUNDLE" ]; then
+    echo "[StreamDeckBridge] Embedding StreamDeckSimulator resource bundle..."
+    cp -R "$SIM_BUNDLE" "$FRAMEWORK_IN_ARCHIVE/"
+else
+    echo "[StreamDeckBridge] StreamDeckSimulator not built — skipping bundle embed (simulator disabled)."
 fi
-cp -R "$SIM_BUNDLE" "$FRAMEWORK_IN_ARCHIVE/"
 
 echo "[StreamDeckBridge] Creating xcframework..."
 mkdir -p "$OUT_DIR"
@@ -72,8 +73,10 @@ if [ ! -f "$HEADER" ]; then
     exit 1
 fi
 
+# Verify the simulator bundle landed only when the simulator was actually built
+# (it is dropped under Xcode 26.5 — see the embed step above).
 SIM_BUNDLE_OUT="$OUT_DIR/StreamDeckBridge.xcframework/ios-arm64/StreamDeckBridge.framework/StreamDeckKit_StreamDeckSimulator.bundle"
-if [ ! -d "$SIM_BUNDLE_OUT" ]; then
+if [ -n "$SIM_BUNDLE" ] && [ ! -d "$SIM_BUNDLE_OUT" ]; then
     echo "Error: simulator resource bundle missing at $SIM_BUNDLE_OUT" >&2
     exit 1
 fi
