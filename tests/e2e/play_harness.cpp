@@ -69,6 +69,9 @@ int main(int argc, char** argv) {
     // enqueues/releases and counts.
     audio.setMuted(false);
 
+    // Optional output-latency offset for the resync-coupling e2e (default 0).
+    audio.setOutputLatencyOffsetMs(qEnvironmentVariableIntValue("OLR_AUDIO_LATENCY_MS"));
+
     PlaybackWorker worker(providers, &transport, &audio);
     worker.openFile(file);
     worker.setActiveAudioView(0); // route audio for view 0
@@ -81,9 +84,9 @@ int main(int argc, char** argv) {
         worker.stop();
         const PlaybackWorker::PlaybackCounters c = worker.counters();
         printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
-               "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d\n",
+               "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d\n",
                c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-               c.audioPushes, c.framesDropped);
+               c.audioPushes, c.framesDropped, audio.resyncCount());
         fflush(stdout);
         app.quit();
     };
@@ -196,9 +199,9 @@ int main(int argc, char** argv) {
             worker.stop();
             const PlaybackWorker::PlaybackCounters c = worker.counters();
             printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
-                   "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d\n",
+                   "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-                   c.audioPushes, c.framesDropped);
+                   c.audioPushes, c.framesDropped, audio.resyncCount());
             fflush(stdout);
             ::exit(2);
         }

@@ -69,10 +69,13 @@ add_test(NAME e2e_play_liveedge
 add_test(NAME e2e_play_4view
     COMMAND bash "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" play1x 4 23476)
+add_test(NAME e2e_play_latency
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" latency 2 23491)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
-    e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view
+    e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180

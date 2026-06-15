@@ -29,6 +29,7 @@ struct AppSettings {
     int fps = 30;
     int multiviewCount = 4;
     bool showTimeOfDay = false;
+    int audioOutputLatencyMs = 0; // playback output-device latency comp, ms (0..500)
     QString midiPortName;
     QMap<int, QPair<int,int>> midiBindings;
     QMap<int, int> midiBindingData2;

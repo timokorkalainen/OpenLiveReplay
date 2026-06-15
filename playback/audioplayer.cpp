@@ -229,9 +229,9 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     // Playout latency = the always-full sink buffer plus a manual offset for
     // hardware/driver/Bluetooth output latency Qt cannot report (see header).
     const int bytesPerSecond = m_sampleRate * m_channels * int(sizeof(int16_t));
+    const int outLatencyMs = m_outputLatencyOffsetMs.load(std::memory_order_relaxed);
     const int64_t latencySamples =
-        (m_sinkLatencyBytes + int64_t(kOutputLatencyOffsetMs) * bytesPerSecond / 1000) /
-        bytesPerFrame;
+        (m_sinkLatencyBytes + int64_t(outLatencyMs) * bytesPerSecond / 1000) / bytesPerFrame;
     const int64_t dueSamples = masterTimeMs * m_sampleRate / 1000 + latencySamples;
 
     const char* payload = reinterpret_cast<const char*>(data);
@@ -245,9 +245,11 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     // the master clock and re-align.  The threshold is far beyond the jitter
     // tolerance, so normal 1x play (ptsMs ≈ playhead) never trips it.
     if (m_aligned) {
-        const int64_t resyncSamples = int64_t(kResyncThresholdMs) * m_sampleRate / 1000;
+        const int64_t resyncSamples =
+            int64_t(kResyncHeadroomMs + outLatencyMs) * m_sampleRate / 1000;
         if (qAbs(ptsSamples - dueSamples) > resyncSamples) {
             m_aligned = false;
+            ++m_resyncCount;
         }
     }
 

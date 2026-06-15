@@ -904,6 +904,25 @@ void UIManager::setRecordFps(int fps) {
     }
 }
 
+int UIManager::audioOutputLatencyMs() const {
+    return m_currentSettings.audioOutputLatencyMs;
+}
+
+void UIManager::setAudioOutputLatencyMs(int ms) {
+    const int clamped = qBound(0, ms, 500); // keep in sync with AudioPlayer::kMaxOutputLatencyMs
+    if (m_currentSettings.audioOutputLatencyMs == clamped) return;
+    m_currentSettings.audioOutputLatencyMs = clamped;
+    if (m_audioPlayer) {
+        m_audioPlayer->setOutputLatencyOffsetMs(clamped);
+        // A runtime offset change only re-positions an already-aligned stream via a
+        // re-align; clear() drops alignment so the next push adopts the new latency
+        // (with a de-click fade). Without this the change is inaudible until a seek.
+        m_audioPlayer->clear();
+    }
+    emit audioOutputLatencyChanged();
+    m_settingsManager->save(m_configPath, m_currentSettings);
+}
+
 void UIManager::setMultiviewCount(int count) {
     // The muxer's stream layout is frozen at startRecording; changing the view
     // count mid-recording flows through syncActiveStreams -> setViewCount and
@@ -1412,6 +1431,11 @@ void UIManager::loadSettings() {
         emit sourceEnabledChanged();
         m_sourceTrimVersion++;
         emit sourceTrimChanged();
+        m_currentSettings.audioOutputLatencyMs =
+            qBound(0, m_currentSettings.audioOutputLatencyMs, 500);
+        if (m_audioPlayer)
+            m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs);
+        emit audioOutputLatencyChanged();
     }
 }
 

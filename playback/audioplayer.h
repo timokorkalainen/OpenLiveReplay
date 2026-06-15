@@ -7,6 +7,8 @@
 #include <QIODevice>
 #include <QMutex>
 #include <QByteArray>
+#include <QtGlobal>
+#include <atomic>
 
 /**
  * Thread-safe FIFO QIODevice feeding QAudioSink in pull mode.
@@ -116,6 +118,18 @@ public:
     /// Number of times clear() has been called (incremented under m_mutex).
     int clearCount() const { return m_clearCount; }
 
+    /// Set output-device latency compensation (ms, clamped 0..kMaxOutputLatencyMs).
+    /// Folded into the playout latency AND the resync threshold (which scales with
+    /// it, so a high offset does not storm re-aligns). Takes effect on the next push;
+    /// for an already-aligned live stream the caller should clear() to re-align now.
+    void setOutputLatencyOffsetMs(int ms) {
+        m_outputLatencyOffsetMs.store(qBound(0, ms, kMaxOutputLatencyMs),
+                                      std::memory_order_relaxed);
+    }
+    /// Number of times the aligned branch re-aligned (incremented under m_mutex in
+    /// pushSamples). Used by the e2e to assert no re-align storm under a high offset.
+    int resyncCount() const { return m_resyncCount; }
+
 private:
     QAudioSink*      m_sink = nullptr;
     AudioRingBuffer* m_ringBuffer = nullptr;
@@ -135,27 +149,23 @@ private:
     static constexpr int kRingCapMs     = 500;   // ring safety cap
     static constexpr int kJitterTolMs   = 30;    // PTS continuity tolerance
     static constexpr int kSpliceFadeSamples = 120; // 2.5 ms de-click ramp after a splice
-    static constexpr int kResyncThresholdMs = 250; // aligned-branch master-clock divergence
-                                                   // that forces a re-align (>> kJitterTolMs)
-                                                   // COUPLING: if kOutputLatencyOffsetMs is
-                                                   // raised for a high-latency output (e.g.
-                                                   // Bluetooth 100-300 ms), the steady-state
-                                                   // pts-vs-master divergence grows by that
-                                                   // amount.  kResyncThresholdMs must be kept
-                                                   // above kOutputLatencyOffsetMs + headroom;
-                                                   // otherwise the aligned branch re-aligns on
-                                                   // every push.
+    static constexpr int kMaxOutputLatencyMs = 500; // user offset ceiling
+    static constexpr int kResyncHeadroomMs = 250;   // genuine-desync margin ABOVE the
+                                                    // expected steady-state offset divergence;
+                                                    // resync trigger = kResyncHeadroomMs + offset
     // Extra output latency (ms) beyond the QAudioSink buffer to compensate
     // for when aligning the stream start.  Qt's QAudioSink exposes NO API to
     // query real hardware/driver/Bluetooth output latency (typically
     // 100-300 ms for BT), so exact automatic compensation is impossible.
-    // This is a manual knob an integrator can raise for high-latency outputs;
-    // a future user-facing "audio offset" setting could drive it.  0 keeps
-    // current behavior for wired output (the assumption made explicit/correctable).
-    // COUPLING: raising this value increases steady-state pts-vs-master divergence
-    // in the aligned branch by the same amount — see kResyncThresholdMs above.
-    static constexpr int kOutputLatencyOffsetMs = 0;
+    // Driven by a user-facing "audio offset" setting via setOutputLatencyOffsetMs().
+    // The resync threshold scales with this offset so a high offset does not
+    // storm re-aligns in the aligned branch.
     int m_clearCount = 0;
+    // Output-device latency compensation (ms, 0..kMaxOutputLatencyMs). Folded into
+    // the playout latency AND the resync threshold (which scales with it). Written
+    // by the UI thread, read on the push path — relaxed: standalone scalar.
+    std::atomic<int> m_outputLatencyOffsetMs{0};
+    int m_resyncCount = 0; // times the aligned branch re-aligned (push thread)
 };
 
 #endif // AUDIOPLAYER_H

@@ -31,6 +31,8 @@ class UIManager : public QObject {
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
+    Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs
+                   NOTIFY audioOutputLatencyChanged)
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
     Q_PROPERTY(int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
@@ -80,6 +82,8 @@ public:
     int recordWidth() const;
     int recordHeight() const;
     int recordFps() const;
+    int audioOutputLatencyMs() const;
+    void setAudioOutputLatencyMs(int ms);
     int multiviewCount() const;
     bool isRecording() const;
     QVariantList playbackProviders() const;
@@ -196,6 +200,7 @@ signals:
     void recordWidthChanged();
     void recordHeightChanged();
     void recordFpsChanged();
+    void audioOutputLatencyChanged();
     void multiviewCountChanged();
     void recordingStatusChanged();
     void playbackProvidersChanged();

@@ -103,7 +103,12 @@ VTRACKS="$(ffprobe -v error -select_streams v -show_entries stream=index -of csv
 echo "[pb-e2e] fixture video tracks: ${VTRACKS:-?} (expected $VIEWS)"
 
 # --- 3. Drive the real PlaybackWorker ----------------------------------------
-PLAY_OUT="$("$PLAY" "$FIXTURE" "$SCENARIO" "$VIEWS")"
+PH_SCENARIO="$SCENARIO"
+if [ "$SCENARIO" = "latency" ]; then
+    export OLR_AUDIO_LATENCY_MS="${OLR_AUDIO_LATENCY_MS:-300}"
+    PH_SCENARIO="play1x"
+fi
+PLAY_OUT="$("$PLAY" "$FIXTURE" "$PH_SCENARIO" "$VIEWS")"
 PLAY_RC=$?
 echo "[pb-e2e] play_harness rc=$PLAY_RC"
 
@@ -126,6 +131,7 @@ eofTailSeek="$(get eofTailSeek)"
 skipForward="$(get skipForward)"
 audioPushes="$(get audioPushes)"
 framesDropped="$(get framesDropped)"
+resyncCount="$(get resyncCount)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -133,6 +139,7 @@ framesDropped="$(get framesDropped)"
 [ -n "$skipForward" ] || skipForward="?"
 [ -n "$audioPushes" ] || audioPushes="?"
 [ -n "$framesDropped" ] || framesDropped="?"
+[ -n "$resyncCount" ] || resyncCount="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -239,13 +246,27 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    latency)
+        # 1x playback with a 300 ms output-latency offset must NOT storm re-aligns:
+        # the resync threshold scales with the offset (kResyncHeadroomMs + offset),
+        # so the steady offset divergence is tolerated. resyncCount must stay 0.
+        # (reposition not re-asserted here — PH_SCENARIO=play1x, and e2e_play_storm owns that gate)
+        if ! num "$audioPushes" || [ "$audioPushes" -le 0 ]; then
+            echo "FAIL: latency produced no audio (audioPushes=$audioPushes) — audio path dead"
+            fail=1
+        fi
+        if ! num "$resyncCount" || [ "$resyncCount" -ne 0 ]; then
+            echo "FAIL: latency re-align storm (resyncCount=$resyncCount, expected 0) — resync threshold not scaled with offset"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"
