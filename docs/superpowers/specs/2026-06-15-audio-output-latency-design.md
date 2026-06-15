@@ -63,12 +63,13 @@ genuine desync is still caught when it exceeds the expected 300 ms divergence by
 | `settingsmanager.cpp` | `save()`: `root["audioOutputLatencyMs"] = settings.audioOutputLatencyMs;`  `load()`: `settings.audioOutputLatencyMs = root["audioOutputLatencyMs"].toInt(settings.audioOutputLatencyMs);` (mirrors `showTimeOfDay`) | persistence |
 | `playback/audioplayer.h` | remove `static constexpr int kOutputLatencyOffsetMs = 0;`; add `std::atomic<int> m_outputLatencyOffsetMs{0};` + `void setOutputLatencyOffsetMs(int ms)` (clamped `qBound(0, ms, kMaxOutputLatencyMs)`, `kMaxOutputLatencyMs = 500`); rename `kResyncThresholdMs` → `kResyncHeadroomMs` (value unchanged, 250) | runtime offset state |
 | `playback/audioplayer.cpp` | latency math (`:233`): use `m_outputLatencyOffsetMs.load()` instead of the constant; resync (`:248`): `resyncSamples = int64_t(kResyncHeadroomMs + m_outputLatencyOffsetMs.load()) * m_sampleRate / 1000` | apply offset + scaled resync |
-| `uimanager.h/.cpp` | `Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs NOTIFY audioOutputLatencyChanged)` (mirrors `recordWidth`); getter returns `m_currentSettings.audioOutputLatencyMs`; setter clamps 0–500, writes the setting, calls `m_audioPlayer->setOutputLatencyOffsetMs(...)`, saves config, emits; **seed** `m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs)` after settings load (the AudioPlayer is created in the ctor; settings load applies the saved value) | expose, persist, route |
+| `uimanager.h/.cpp` | `Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs NOTIFY audioOutputLatencyChanged)` (mirrors `recordWidth`); getter returns `m_currentSettings.audioOutputLatencyMs`; setter clamps 0–500, writes the setting, calls `m_audioPlayer->setOutputLatencyOffsetMs(...)` **then `m_audioPlayer->clear()`** (see §5 — a runtime change only takes effect via a re-align), saves config, emits; **seed** `m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs)` after settings load (no `clear()` on seed — nothing is playing yet) | expose, persist, route |
 | `Main.qml` | a ms `SpinBox` (`from: 0  to: 500  stepSize: 10`) in the settings area next to the record-format SpinBoxes, bound to `uiManagerRef.audioOutputLatencyMs`, with a label "Audio output latency (ms)" + tooltip | operator control |
 
 **Live edit flow:** SpinBox → `setAudioOutputLatencyMs(ms)` → clamp →
 `m_currentSettings.audioOutputLatencyMs = ms` → `m_audioPlayer->setOutputLatencyOffsetMs(ms)`
-(atomic; the push/align path reads it next push) → save config → emit.
+(atomic) → `m_audioPlayer->clear()` (force the already-aligned stream to re-align to
+the new latency — see §5) → save config → emit.
 
 **Concurrency:** `m_outputLatencyOffsetMs` is written by the UI thread and read in
 `pushSamples` (align path). `std::atomic<int>` with `memory_order_relaxed` — a
@@ -79,10 +80,16 @@ per-source trim's `m_trimOffsetMs`).
 
 - Both `setOutputLatencyOffsetMs` (engine) and `setAudioOutputLatencyMs` (UI) clamp
   to `[0, 500]`; an out-of-range config value loads clamped.
-- A live change takes effect on the next `pushSamples`; an in-flight aligned stream
-  simply re-evaluates against the new (scaled) threshold — at worst one benign
-  re-align at the moment of a large change (a brief de-click, already handled by the
-  existing splice fade). Acceptable for a set-once calibration knob.
+- **Why the setter calls `clear()`:** the scaled resync threshold (`250 + offset`)
+  deliberately tolerates the steady-state offset divergence so it does **not** storm
+  re-aligns. But `dueSamples` only positions the stream at *alignment* time — once
+  aligned, the playout tracks `m_expectedNextPtsSamples` contiguously, so simply
+  changing the offset does **not** re-position an already-playing stream (the new
+  latency would not be heard until the next seek). To make a live calibration change
+  audible immediately, `setAudioOutputLatencyMs` calls `m_audioPlayer->clear()` after
+  the offset store, which drops `m_aligned` → the next push re-aligns to the new
+  latency with a fade-in (de-click). A brief blip while calibrating is acceptable for
+  a set-once knob. (Seed-at-load does **not** clear — nothing is playing yet.)
 
 ## 6. Testing
 
