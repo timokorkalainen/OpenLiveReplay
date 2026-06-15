@@ -78,8 +78,11 @@ per-source trim's `m_trimOffsetMs`).
 
 ## 5. Error handling / bounds
 
-- Both `setOutputLatencyOffsetMs` (engine) and `setAudioOutputLatencyMs` (UI) clamp
-  to `[0, 500]`; an out-of-range config value loads clamped.
+- `setOutputLatencyOffsetMs` (engine), `setAudioOutputLatencyMs` (UI), AND
+  `loadSettings` (which `qBound`s the freshly-loaded `m_currentSettings` value) all
+  clamp to `[0, 500]`, so a hand-edited `config.json` out-of-range value cannot reach
+  the engine, the SpinBox display, or a re-save. (`SettingsManager` itself stays a
+  pure (de)serializer and does not clamp.)
 - **Why the setter calls `clear()`:** the scaled resync threshold (`250 + offset`)
   deliberately tolerates the steady-state offset divergence so it does **not** storm
   re-aligns. But `dueSamples` only positions the stream at *alignment* time — once
@@ -94,7 +97,8 @@ per-source trim's `m_trimOffsetMs`).
 ## 6. Testing
 
 - **Unit (`tests/unit/`):** `tst_settingsmanager` round-trips `audioOutputLatencyMs`
-  through save/load (and clamps an out-of-range loaded value). (A standalone
+  through save/load (the out-of-range clamp lives in `UIManager::loadSettings`, a
+  one-line `qBound` not separately unit-tested). (A standalone
   AudioPlayer align unit test is not pursued — `start()` needs a real `QAudioSink`
   backend that is unreliable headless; the resync behavior is proven by the e2e
   `resyncCount` gate instead.)
