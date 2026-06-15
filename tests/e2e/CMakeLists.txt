@@ -133,3 +133,24 @@ set_tests_properties(e2e_srt_trim PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL
 add_test(NAME e2e_srt_connect
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_connect.sh" "$<TARGET_FILE:sync_harness>" 23540)
 set_tests_properties(e2e_srt_connect PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
+
+if(APPLE)
+    add_test(NAME e2e_native_srt_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_smoke.sh" "$<TARGET_FILE:record_harness>" 23601)
+    add_test(NAME e2e_native_srt_4cam
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_4cam.sh" "$<TARGET_FILE:sync_harness>" 23610)
+    add_test(NAME e2e_native_srt_sync
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_sync.sh" "$<TARGET_FILE:sync_harness>" 23620)
+    add_test(NAME e2e_native_srt_trim
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_trim.sh" "$<TARGET_FILE:sync_harness>" 23630)
+    add_test(NAME e2e_native_srt_connect
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_connect.sh" "$<TARGET_FILE:sync_harness>" 23640)
+    set_tests_properties(
+        e2e_native_srt_smoke e2e_native_srt_4cam e2e_native_srt_sync
+        e2e_native_srt_trim e2e_native_srt_connect
+        PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
+endif()

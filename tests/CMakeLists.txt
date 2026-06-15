@@ -82,9 +82,14 @@ target_link_libraries(olr_test_engine
 
 if(APPLE)
     target_sources(olr_test_engine PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtingestsession.cpp"
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/videotoolboxdecoder.mm")
+    target_compile_definitions(olr_test_engine PUBLIC OLR_NATIVE_SRT_AVAILABLE=1)
+    target_include_directories(olr_test_engine PUBLIC "${OLR_BREW_PREFIX}/opt/srt/include")
+    target_link_directories(olr_test_engine PUBLIC "${OLR_BREW_PREFIX}/opt/srt/lib")
     target_link_libraries(olr_test_engine
-        PRIVATE "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
+        PRIVATE srt "-framework VideoToolbox" "-framework CoreMedia"
+                "-framework CoreFoundation" "-framework CoreVideo")
 else()
     target_sources(olr_test_engine PRIVATE
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/videotoolboxdecoder_stub.cpp")

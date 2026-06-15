@@ -1,7 +1,7 @@
 #include "streamworker.h"
 #include "ingest/ffmpegingestsession.h"
 #include "ingest/ingestsession.h"
-#if defined(Q_OS_IOS)
+#if defined(OLR_NATIVE_SRT_AVAILABLE)
 #include "ingest/nativesrtingestsession.h"
 #endif
 #include <QDebug>
@@ -282,17 +282,17 @@ void StreamWorker::captureLoop() {
 
         IngestBackendOptions backendOptions;
         const QUrl sourceUrl(currentUrl);
-#if defined(Q_OS_IOS)
+#if defined(OLR_NATIVE_SRT_AVAILABLE)
         backendOptions.preferNativeSrt = qEnvironmentVariableIsSet("OLR_NATIVE_SRT")
                                          && NativeSrtIngestSession::supportsUrl(sourceUrl);
 #endif
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
-#if !defined(Q_OS_IOS)
+#if !defined(OLR_NATIVE_SRT_AVAILABLE)
         Q_UNUSED(backendKind);
 #endif
 
         std::unique_ptr<IngestSession> session;
-#if defined(Q_OS_IOS)
+#if defined(OLR_NATIVE_SRT_AVAILABLE)
         if (backendKind == IngestBackendKind::NativeSrt) {
             session = std::make_unique<NativeSrtIngestSession>(
                 m_sourceIndex, m_targetWidth, m_targetHeight, &m_captureRunning);
