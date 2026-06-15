@@ -24,7 +24,7 @@ Run a subset by label: `ctest --test-dir build -L unit` (or `smoke`, `e2e`).
 | Layer | Where | What it checks |
 |-------|-------|----------------|
 | **Unit** (`-L unit`) | `tests/unit/` | `RecordingClock` (monotonic timeline), `SettingsManager` (JSON save/load round-trip + failure modes), `PlaybackTransport` (seek/step/speed/fps math + signals), `Muxer` (track layout, stream bounds, stereo/mono channel layout, file output). Qt Test + CTest. |
-| **Smoke** (`-L smoke`) | `tests/smoke/` | `qmllint` over `Main.qml` / `MultiviewWindow.qml` — fails on QML syntax/type errors, tolerates the project's existing style warnings. |
+| **Smoke** (`-L smoke`) | `tests/smoke/` | `qmllint` over `Main.qml` / `MultiviewWindow.qml` — fails on QML syntax/type errors, tolerates the project's existing style warnings. Also checks the iOS FFmpeg build config stays static, GPL/nonfree-free, SecureTransport-based, and RTMP/RTMPS-capable. |
 | **E2E** (`-L e2e`) | `tests/e2e/` | A headless `record_harness` drives the real `ReplayManager` against a synthetic FFmpeg stream, then `ffprobe` asserts the output: stream layout, ~correct frame count, and **stereo** audio. Includes the **mono-audio regression** (a mono source must record without the SIGBUS crash from commit `3c7d9b4` and be rematrixed up to stereo). |
 
 The E2E tests need `ffmpeg`/`ffprobe` on `PATH` (they `SKIP` cleanly if absent)
@@ -64,7 +64,7 @@ path that produced the mono-audio crash.
 
 ## iOS build (local pre-push hook, not CI)
 
-iOS is **not** built in GitHub CI: the FFmpeg+SRT+OpenSSL from-source build
+iOS is **not** built in GitHub CI: the FFmpeg+SRT from-source build
 (~20 min) OOM-kills hosted runners. It is validated locally by
 [`.githooks/pre-push`](../.githooks/pre-push), which cross-builds the iOS target
 on `git push`. Enable it once per clone:
@@ -78,6 +78,11 @@ first push is slow. Override the Qt location with `QT_IOS_PREFIX` /
 `QT_HOST_PREFIX`. Skip a single push with `SKIP_IOS_BUILD=1 git push` (or
 `git push --no-verify`); if no Qt iOS kit is found the hook skips and allows the
 push.
+
+The iOS FFmpeg slice uses SecureTransport for TLS/RTMPS and builds libsrt
+without OpenSSL/mbedTLS encryption support. Encrypted native SRT is intentionally
+out of scope for this slice. FFmpeg also intentionally excludes HEVC; SRT HEVC
+ingest uses the native VideoToolbox path instead.
 
 ## Known follow-ups
 
