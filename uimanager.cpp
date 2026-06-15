@@ -1697,11 +1697,20 @@ void UIManager::applyImportPreview() {
 
 QVariantMap UIManager::telemetryAtPlayhead() {
     const qint64 playheadMs = scrubPosition();
+    if (m_replayManager && m_replayManager->isRecording()) {
+        QVariantMap state = m_hasTelemetryTimeline
+            ? m_telemetryTimelineReader.stateAt(playheadMs)
+            : QVariantMap{};
+        const QVariantMap pendingState = recordingTelemetryStateAt(playheadMs);
+        for (auto it = pendingState.constBegin(); it != pendingState.constEnd(); ++it) {
+            state.insert(it.key(), it.value());
+        }
+        if (!state.isEmpty()) {
+            return state;
+        }
+    }
     if (m_hasTelemetryTimeline) {
         return m_telemetryTimelineReader.stateAt(playheadMs);
-    }
-    if (m_replayManager && m_replayManager->isRecording() && !m_recordingTelemetry.isEmpty()) {
-        return recordingTelemetryStateAt(playheadMs);
     }
     if (!m_recordingTelemetry.isEmpty()) {
         return recordingTelemetryStateAt(playheadMs);
