@@ -12,9 +12,12 @@ private slots:
     void ignoresCommentsAndKeepsEventType();
     void ignoresBlocksWithoutDataField();
     void rejectsMalformedJson();
+    void keepsErrorWhenLaterEventInSamePushSucceeds();
+    void clearsStaleErrorForNoDataAndIncompletePushes();
     void rejectsOversizedIncompleteBuffer();
     void rejectsOversizedCompleteEvent();
     void inheritsLastEventIdAcrossEvents();
+    void blankIdResetsLastEventId();
     void resetClearsLastEventId();
     void rejectsEmptyDataField();
     void clearsLastErrorAfterSuccessfulEvent();
@@ -95,6 +98,34 @@ void TestSseParser::rejectsMalformedJson() {
     QVERIFY(parser.lastError().contains(QStringLiteral("JSON")));
 }
 
+void TestSseParser::keepsErrorWhenLaterEventInSamePushSucceeds() {
+    SseParser parser;
+    const QList<TelemetryEvent> events = parser.push(
+        "data: { nope }\n"
+        "\n"
+        "data: {\"feedId\":\"cam-main\",\"values\":{}}\n"
+        "\n");
+
+    QCOMPARE(events.size(), 1);
+    QCOMPARE(events[0].feedId, QStringLiteral("cam-main"));
+    QVERIFY(parser.lastError().contains(QStringLiteral("JSON")));
+}
+
+void TestSseParser::clearsStaleErrorForNoDataAndIncompletePushes() {
+    SseParser parser;
+    QVERIFY(parser.push("data: { nope }\n\n").isEmpty());
+    QVERIFY(!parser.lastError().isEmpty());
+
+    QVERIFY(parser.push(": heartbeat\n\n").isEmpty());
+    QVERIFY(parser.lastError().isEmpty());
+
+    QVERIFY(parser.push("data: { nope }\n\n").isEmpty());
+    QVERIFY(!parser.lastError().isEmpty());
+
+    QVERIFY(parser.push("data: {\"feedId\":\"cam-main\"").isEmpty());
+    QVERIFY(parser.lastError().isEmpty());
+}
+
 void TestSseParser::rejectsOversizedIncompleteBuffer() {
     SseParser parser;
     const QList<TelemetryEvent> events = parser.push(QByteArray(1024 * 1024 + 1, 'x'));
@@ -127,6 +158,22 @@ void TestSseParser::inheritsLastEventIdAcrossEvents() {
     QCOMPARE(events[0].lastEventId, QStringLiteral("42"));
     QCOMPARE(events[1].feedId, QStringLiteral("cam-side"));
     QCOMPARE(events[1].lastEventId, QStringLiteral("42"));
+}
+
+void TestSseParser::blankIdResetsLastEventId() {
+    SseParser parser;
+    const QList<TelemetryEvent> events = parser.push(
+        "id: 42\n"
+        "data: {\"feedId\":\"cam-main\",\"values\":{}}\n"
+        "\n"
+        "id:\n"
+        "\n"
+        "data: {\"feedId\":\"cam-side\",\"values\":{}}\n"
+        "\n");
+
+    QCOMPARE(events.size(), 2);
+    QCOMPARE(events[0].lastEventId, QStringLiteral("42"));
+    QVERIFY(events[1].lastEventId.isEmpty());
 }
 
 void TestSseParser::resetClearsLastEventId() {
