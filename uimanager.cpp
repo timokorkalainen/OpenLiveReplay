@@ -1207,7 +1207,8 @@ int UIManager::sourceTrimOffset(int sourceIndex) const {
 
 void UIManager::setSourceTrimOffset(int sourceIndex, int ms) {
     if (sourceIndex < 0 || sourceIndex >= m_currentSettings.sources.size()) return;
-    const int clamped = qBound(-500, ms, 500);
+    const int clamped = qBound(
+        -500, ms, 500); // keep in sync with StreamWorker::kMaxTrimMs + Main.qml SpinBox range
     if (m_currentSettings.sources[sourceIndex].trimOffsetMs == clamped) return;
     m_currentSettings.sources[sourceIndex].trimOffsetMs = clamped;
     m_replayManager->updateSourceTrim(sourceIndex, clamped); // live (no-op if not recording)
@@ -1401,6 +1402,8 @@ void UIManager::loadSettings() {
         emit midiPortNameChanged();
         emit viewSlotMapChanged();
         emit sourceEnabledChanged();
+        m_sourceTrimVersion++;
+        emit sourceTrimChanged();
     }
 }
 
