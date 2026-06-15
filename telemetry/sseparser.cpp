@@ -4,13 +4,27 @@
 #include <QJsonParseError>
 #include <QJsonValue>
 
+namespace {
+constexpr qsizetype MaxSseBufferSize = 1024 * 1024;
+
+bool hasEventSeparator(const QByteArray &buffer) {
+    return buffer.indexOf("\n\n") >= 0 || buffer.indexOf("\r\n\r\n") >= 0;
+}
+} // namespace
+
 void SseParser::reset() {
     m_buffer.clear();
     m_lastError.clear();
+    m_lastEventId.clear();
 }
 
 QList<TelemetryEvent> SseParser::push(const QByteArray &chunk) {
     m_buffer.append(chunk);
+    if (m_buffer.size() > MaxSseBufferSize && !hasEventSeparator(m_buffer)) {
+        m_buffer.clear();
+        m_lastError = QStringLiteral("SSE buffer exceeded maximum size");
+        return {};
+    }
     return parseBufferedEvents();
 }
 
@@ -28,7 +42,15 @@ QList<TelemetryEvent> SseParser::parseBufferedEvents() {
 
         const QByteArray block = m_buffer.left(sep);
         m_buffer.remove(0, sep + sepLen);
+        if (block.size() > MaxSseBufferSize) {
+            m_lastError = QStringLiteral("SSE buffer exceeded maximum event size");
+            continue;
+        }
         parseEventBlock(block, &events);
+    }
+    if (m_buffer.size() > MaxSseBufferSize) {
+        m_buffer.clear();
+        m_lastError = QStringLiteral("SSE buffer exceeded maximum size");
     }
     return events;
 }
@@ -36,7 +58,7 @@ QList<TelemetryEvent> SseParser::parseBufferedEvents() {
 void SseParser::parseEventBlock(const QByteArray &block, QList<TelemetryEvent> *events) {
     QByteArray data;
     QString eventType;
-    QString lastEventId;
+    bool hasDataField = false;
 
     const QList<QByteArray> lines = block.split('\n');
     for (QByteArray line : lines) {
@@ -51,19 +73,28 @@ void SseParser::parseEventBlock(const QByteArray &block, QList<TelemetryEvent> *
         if (field == "event") {
             eventType = QString::fromUtf8(value);
         } else if (field == "id") {
-            lastEventId = QString::fromUtf8(value);
+            m_lastEventId = QString::fromUtf8(value);
         } else if (field == "data") {
+            hasDataField = true;
             if (!data.isEmpty()) data.append('\n');
             data.append(value);
         }
     }
 
-    if (data.isEmpty()) return;
+    if (!hasDataField) return;
+    if (data.isEmpty()) {
+        m_lastError = QStringLiteral("SSE event has empty data");
+        return;
+    }
 
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+    if (parseError.error != QJsonParseError::NoError) {
         m_lastError = QStringLiteral("SSE data JSON parse error: ") + parseError.errorString();
+        return;
+    }
+    if (!doc.isObject()) {
+        m_lastError = QStringLiteral("SSE data must be a JSON object");
         return;
     }
 
@@ -77,7 +108,8 @@ void SseParser::parseEventBlock(const QByteArray &block, QList<TelemetryEvent> *
     TelemetryEvent event;
     event.feedId = feedId;
     event.eventType = eventType.isEmpty() ? QStringLiteral("message") : eventType;
-    event.lastEventId = lastEventId;
+    event.lastEventId = m_lastEventId;
     event.payload = payload;
+    m_lastError.clear();
     events->append(event);
 }

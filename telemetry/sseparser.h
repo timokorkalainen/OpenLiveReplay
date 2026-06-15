@@ -19,6 +19,7 @@ private:
 
     QByteArray m_buffer;
     QString m_lastError;
+    QString m_lastEventId;
 };
 
 #endif // SSEPARSER_H
