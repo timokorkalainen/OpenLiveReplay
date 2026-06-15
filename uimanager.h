@@ -10,6 +10,7 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include "settingsmanager.h"
+#include "project/projectsettingsimporter.h"
 #include "recorder_engine/replaymanager.h"
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
@@ -20,6 +21,8 @@
 #include "streamdeck/streamdeckmappingstore.h"
 
 class QScreen;
+class ProjectImportClient;
+class TelemetryClient;
 
 class UIManager : public QObject {
     Q_OBJECT
@@ -68,6 +71,12 @@ class UIManager : public QObject {
     // Bumped when any source's trim changes (config load / programmatic set) so
     // QML re-reads sourceTrimOffset() bindings.
     Q_PROPERTY(int sourceTrimVersion READ sourceTrimVersion NOTIFY sourceTrimChanged)
+    Q_PROPERTY(QString importSettingsUrl READ importSettingsUrl WRITE setImportSettingsUrl NOTIFY importSettingsUrlChanged)
+    Q_PROPERTY(QString importPreviewError READ importPreviewError NOTIFY importPreviewChanged)
+    Q_PROPERTY(QVariantMap importPreview READ importPreview NOTIFY importPreviewChanged)
+    Q_PROPERTY(bool importPreviewReady READ importPreviewReady NOTIFY importPreviewChanged)
+    Q_PROPERTY(QString telemetrySseUrl READ telemetrySseUrl NOTIFY telemetryConfigChanged)
+    Q_PROPERTY(int telemetryVersion READ telemetryVersion NOTIFY telemetryChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -116,6 +125,12 @@ public:
     bool followLive() const { return m_followLive; }
     int sourceConnectionVersion() const { return m_sourceConnectionVersion; }
     int sourceTrimVersion() const { return m_sourceTrimVersion; }
+    QString importSettingsUrl() const;
+    QString importPreviewError() const { return m_importPreviewError; }
+    QVariantMap importPreview() const { return m_importPreview; }
+    bool importPreviewReady() const { return m_hasPendingImport && m_pendingImport.ok; }
+    QString telemetrySseUrl() const { return m_currentSettings.telemetrySseUrl; }
+    int telemetryVersion() const { return m_telemetryVersion; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -128,6 +143,7 @@ public:
     void setRecordFps(int fps);
     void setMultiviewCount(int count);
     void setTimeOfDayMode(bool enabled);
+    void setImportSettingsUrl(const QString &url);
 
     void refreshProviders();
 
@@ -185,6 +201,9 @@ public:
     Q_INVOKABLE bool hasDuplicateUrl(int sourceIndex) const;
     Q_INVOKABLE int sourceTrimOffset(int sourceIndex) const;
     Q_INVOKABLE void setSourceTrimOffset(int sourceIndex, int ms);
+    Q_INVOKABLE void readImportSettings();
+    Q_INVOKABLE void applyImportPreview();
+    Q_INVOKABLE QVariantMap telemetryAtPlayhead() const;
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -229,6 +248,10 @@ signals:
     void streamDeckBindingsChanged();
     void sourceConnectionChanged();
     void sourceTrimChanged();
+    void importSettingsUrlChanged();
+    void importPreviewChanged();
+    void telemetryConfigChanged();
+    void telemetryChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -318,9 +341,21 @@ private:
     int m_sourceConnectionVersion = 0;
     int m_sourceTrimVersion = 0;
     void resetSourceConnection();
+    void updateReplayTelemetryFeeds();
+    void clearImportPreview();
 
     QList<QScreen*> m_screens;
     QVariantList m_screenOptions;
+
+    ProjectImportClient *m_importClient = nullptr;
+    TelemetryClient *m_telemetryClient = nullptr;
+    ProjectSettingsImporter m_settingsImporter;
+    ProjectSettingsImportResult m_pendingImport;
+    bool m_hasPendingImport = false;
+    QString m_importPreviewError;
+    QVariantMap m_importPreview;
+    QVariantMap m_liveTelemetry;
+    int m_telemetryVersion = 0;
 
     enum MidiLearnMode {
         LearnControl = 0,

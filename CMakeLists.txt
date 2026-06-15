@@ -80,6 +80,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/trackbuffer.h playback/trackbuffer.cpp
         playback/audioframequeue.h playback/audioframequeue.cpp
         project/projectsettingsimporter.h project/projectsettingsimporter.cpp
+        project/projectimportclient.h project/projectimportclient.cpp
         telemetry/telemetryevent.h
         telemetry/sseparser.h telemetry/sseparser.cpp
         telemetry/telemetryclient.h telemetry/telemetryclient.cpp

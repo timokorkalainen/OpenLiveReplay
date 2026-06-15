@@ -1,11 +1,16 @@
 #include "uimanager.h"
 #include "playback/audioplayer.h"
+#include "project/projectimportclient.h"
+#include "telemetry/telemetryclient.h"
 #include <QDateTime>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <algorithm>
 #include <QDir>
 #include <QGuiApplication>
+#include <QDebug>
 #if defined(Q_OS_IOS)
 #include "ios/ios_scene.h"
 #endif
@@ -27,6 +32,92 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     connect(m_replayManager, &ReplayManager::sourceConnectionChanged, this,
             &UIManager::onSourceConnectionChanged, Qt::QueuedConnection);
     m_settingsManager = new SettingsManager();
+    m_importClient = new ProjectImportClient(this);
+    connect(m_importClient, &ProjectImportClient::finished, this,
+            [this](const QByteArray &body, const QString &finalUrl) {
+        QJsonParseError parseError;
+        const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            m_pendingImport = ProjectSettingsImportResult{};
+            m_hasPendingImport = false;
+            m_importPreview.clear();
+            m_importPreviewError = parseError.error == QJsonParseError::NoError
+                ? QStringLiteral("Import settings response must be a JSON object")
+                : parseError.errorString();
+            emit importPreviewChanged();
+            return;
+        }
+
+        ProjectSettingsImportResult result = m_settingsImporter.importJson(doc.object(), finalUrl);
+        if (!result.ok) {
+            m_pendingImport = ProjectSettingsImportResult{};
+            m_hasPendingImport = false;
+            m_importPreview.clear();
+            m_importPreviewError = result.error;
+            emit importPreviewChanged();
+            return;
+        }
+
+        QVariantList feeds;
+        feeds.reserve(result.sources.size());
+        for (const SourceSettings &source : result.sources) {
+            QVariantMap feed;
+            feed.insert(QStringLiteral("id"), source.id);
+            feed.insert(QStringLiteral("name"), source.name);
+            feed.insert(QStringLiteral("url"), source.url);
+            feed.insert(QStringLiteral("telemetryDelayMs"), source.telemetryDelayMs);
+            feed.insert(QStringLiteral("metadata"), source.metadata.toVariantList());
+            feeds.append(feed);
+        }
+
+        QVariantList metadataFields;
+        metadataFields.reserve(result.metadataFields.size());
+        for (const QJsonValue &field : result.metadataFields) {
+            metadataFields.append(field.toObject().toVariantMap());
+        }
+
+        QVariantMap preview;
+        preview.insert(QStringLiteral("projectId"), result.projectId);
+        preview.insert(QStringLiteral("projectName"), result.projectName);
+        preview.insert(QStringLiteral("importSettingsUrl"), result.importSettingsUrl);
+        preview.insert(QStringLiteral("telemetrySseUrl"), result.telemetrySseUrl);
+        preview.insert(QStringLiteral("feedCount"), result.sources.size());
+        preview.insert(QStringLiteral("metadataFields"), metadataFields);
+        preview.insert(QStringLiteral("feeds"), feeds);
+
+        m_pendingImport = result;
+        m_hasPendingImport = true;
+        m_importPreview = preview;
+        m_importPreviewError.clear();
+        emit importPreviewChanged();
+    });
+    connect(m_importClient, &ProjectImportClient::failed, this, [this](const QString &message) {
+        m_pendingImport = ProjectSettingsImportResult{};
+        m_hasPendingImport = false;
+        m_importPreview.clear();
+        m_importPreviewError = message;
+        emit importPreviewChanged();
+    });
+
+    m_telemetryClient = new TelemetryClient(this);
+    connect(m_telemetryClient, &TelemetryClient::telemetryEvent, this,
+            [this](const TelemetryEvent &event) {
+        if (event.feedId.trimmed().isEmpty()) return;
+
+        QJsonObject payload = event.payload;
+        payload.insert(QStringLiteral("feedId"), event.feedId);
+        m_liveTelemetry.insert(event.feedId, payload.toVariantMap());
+        m_telemetryVersion++;
+        emit telemetryChanged();
+
+        if (m_replayManager && m_replayManager->isRecording()) {
+            m_replayManager->recordTelemetryEvent(event.feedId, payload);
+        }
+    });
+    connect(m_telemetryClient, &TelemetryClient::errorOccurred, this,
+            [](const QString &message) {
+        qWarning() << "TelemetryClient:" << message;
+    });
     m_configPath = getSettingsPath("config.json");
     m_transport = new PlaybackTransport(this);
     m_transport->seek(0);
@@ -306,6 +397,9 @@ UIManager::~UIManager() {
         delete m_playbackWorker;
         m_playbackWorker = nullptr;
     }
+    if (m_telemetryClient) {
+        m_telemetryClient->stop();
+    }
     if (m_replayManager && m_replayManager->isRecording()) {
         m_replayManager->stopRecording();
     }
@@ -472,6 +566,10 @@ bool UIManager::timeOfDayMode() const {
     return m_currentSettings.showTimeOfDay;
 }
 
+QString UIManager::importSettingsUrl() const {
+    return m_currentSettings.importSettingsUrl;
+}
+
 int UIManager::liveBufferMs() const {
     return m_liveBufferMs;
 }
@@ -604,6 +702,7 @@ void UIManager::syncActiveStreams() {
     m_replayManager->setSourceNames(names);
     m_replayManager->setSourceMetadata(metadata);
     m_replayManager->setSourceTrims(trims);
+    updateReplayTelemetryFeeds();
 
     // View configuration: how many recording tracks, and their display names
     m_replayManager->setViewCount(activeViewCount());
@@ -737,6 +836,30 @@ void UIManager::resetSourceConnection() {
     emit sourceConnectionChanged();
 }
 
+void UIManager::updateReplayTelemetryFeeds() {
+    if (!m_replayManager) return;
+
+    QStringList feedIds;
+    QStringList feedNames;
+    QList<int> telemetryDelaysMs;
+    feedIds.reserve(m_currentSettings.sources.size());
+    feedNames.reserve(m_currentSettings.sources.size());
+    telemetryDelaysMs.reserve(m_currentSettings.sources.size());
+    for (const SourceSettings &source : m_currentSettings.sources) {
+        feedIds.append(source.id);
+        feedNames.append(source.name);
+        telemetryDelaysMs.append(source.telemetryDelayMs);
+    }
+    m_replayManager->setTelemetryFeeds(feedIds, feedNames, telemetryDelaysMs);
+}
+
+void UIManager::clearImportPreview() {
+    m_pendingImport = ProjectSettingsImportResult{};
+    m_hasPendingImport = false;
+    m_importPreview.clear();
+    m_importPreviewError.clear();
+}
+
 void UIManager::onSourceConnectionChanged(int sourceIndex, bool connected) {
     if (sourceIndex < 0) return;
     while (m_sourceConnected.size() <= sourceIndex)
@@ -800,6 +923,7 @@ void UIManager::setStreamNames(const QStringList &names) {
         QStringList sourceNames = streamNames();
         m_replayManager->setSourceNames(sourceNames);
         m_replayManager->setViewNames(activeStreamNames());
+        updateReplayTelemetryFeeds();
         emit streamNamesChanged();
         emit streamUrlsChanged();
         emit streamIdsChanged();
@@ -825,6 +949,7 @@ void UIManager::setStreamIds(const QStringList &ids) {
             updated = updated.mid(0, ids.size());
         }
         m_currentSettings.sources = updated;
+        updateReplayTelemetryFeeds();
         emit streamIdsChanged();
         emit streamUrlsChanged();
         emit streamNamesChanged();
@@ -947,6 +1072,14 @@ void UIManager::setTimeOfDayMode(bool enabled) {
     m_currentSettings.showTimeOfDay = enabled;
     emit timeOfDayModeChanged();
     m_settingsManager->save(m_configPath, m_currentSettings);
+}
+
+void UIManager::setImportSettingsUrl(const QString &url) {
+    const QString trimmed = url.trimmed();
+    if (m_currentSettings.importSettingsUrl == trimmed) return;
+
+    m_currentSettings.importSettingsUrl = trimmed;
+    emit importSettingsUrlChanged();
 }
 
 void UIManager::setMidiPortIndex(int index) {
@@ -1141,6 +1274,18 @@ void UIManager::startRecording() {
         emit recordingFailed(reason);
         return;
     }
+
+    if (m_telemetryClient) {
+        m_telemetryClient->stop();
+    }
+    const QString telemetryUrl = m_currentSettings.telemetrySseUrl.trimmed();
+    if (!telemetryUrl.isEmpty() && m_telemetryClient) {
+        m_liveTelemetry.clear();
+        m_telemetryVersion++;
+        emit telemetryChanged();
+        m_telemetryClient->start(QUrl(telemetryUrl));
+    }
+
     setFollowLive(true);
 
     // Start every source in the "not connected" state; the workers report
@@ -1187,6 +1332,10 @@ void UIManager::restartPlaybackWorker() {
 }
 
 void UIManager::stopRecording() {
+    if (m_telemetryClient) {
+        m_telemetryClient->stop();
+    }
+
     m_replayManager->stopRecording();
     m_transport->setPlaying(false);
     setFollowLive(false);
@@ -1250,6 +1399,7 @@ void UIManager::updateStreamName(int index, const QString& name) {
         rebuildSlotMap();
         m_replayManager->setSourceNames(streamNames());
         m_replayManager->setViewNames(activeStreamNames());
+        updateReplayTelemetryFeeds();
         emit streamNamesChanged();
         emit viewSlotMapChanged();
         m_settingsManager->save(m_configPath, m_currentSettings);
@@ -1259,6 +1409,7 @@ void UIManager::updateStreamName(int index, const QString& name) {
 void UIManager::updateStreamId(int index, const QString& id) {
     if (index >= 0 && index < m_currentSettings.sources.size()) {
         m_currentSettings.sources[index].id = id;
+        updateReplayTelemetryFeeds();
         emit streamIdsChanged();
         m_settingsManager->save(m_configPath, m_currentSettings);
     }
@@ -1370,6 +1521,61 @@ void UIManager::setSourceMetadataItems(int index, const QVariantList &items) {
     m_currentSettings.sources[index].metadata = arr;
 }
 
+void UIManager::readImportSettings() {
+    clearImportPreview();
+    emit importPreviewChanged();
+
+    const QString url = m_currentSettings.importSettingsUrl.trimmed();
+    if (url.isEmpty()) {
+        m_importPreviewError = QStringLiteral("Import settings URL is empty");
+        emit importPreviewChanged();
+        return;
+    }
+
+    m_importClient->fetch(QUrl(url));
+}
+
+void UIManager::applyImportPreview() {
+    if (!m_hasPendingImport || !m_pendingImport.ok) return;
+    if (m_replayManager && m_replayManager->isRecording()) return;
+
+    const QString previousImportUrl = m_currentSettings.importSettingsUrl;
+    m_currentSettings.sources = m_pendingImport.sources;
+    m_currentSettings.metadataFields = m_pendingImport.metadataFields;
+    m_currentSettings.importSettingsUrl = m_pendingImport.importSettingsUrl;
+    m_currentSettings.telemetrySseUrl = m_pendingImport.telemetrySseUrl;
+
+    m_sourceEnabled = QList<bool>(m_currentSettings.sources.size(), true);
+    m_sourceEnabledVersion++;
+    m_sourceConnected = QList<bool>(m_currentSettings.sources.size(), false);
+    m_sourceConnectionVersion++;
+    m_sourceTrimVersion++;
+    m_liveTelemetry.clear();
+    m_telemetryVersion++;
+
+    syncActiveStreams();
+    m_settingsManager->save(m_configPath, m_currentSettings);
+
+    clearImportPreview();
+
+    emit streamUrlsChanged();
+    emit streamNamesChanged();
+    emit streamIdsChanged();
+    if (m_currentSettings.importSettingsUrl != previousImportUrl) {
+        emit importSettingsUrlChanged();
+    }
+    emit telemetryConfigChanged();
+    emit sourceEnabledChanged();
+    emit sourceConnectionChanged();
+    emit sourceTrimChanged();
+    emit telemetryChanged();
+    emit importPreviewChanged();
+}
+
+QVariantMap UIManager::telemetryAtPlayhead() const {
+    return m_liveTelemetry;
+}
+
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         m_streamDeckStore.loadFrom(m_currentSettings);
@@ -1426,6 +1632,8 @@ void UIManager::loadSettings() {
         emit recordFpsChanged();
         emit multiviewCountChanged();
         emit timeOfDayModeChanged();
+        emit importSettingsUrlChanged();
+        emit telemetryConfigChanged();
         emit midiPortNameChanged();
         emit viewSlotMapChanged();
         emit sourceEnabledChanged();
@@ -1481,12 +1689,12 @@ void UIManager::onStartRequested() {
     if (m_replayManager->isRecording()) return;
 
     std::fprintf(stderr, "UIManager: Requesting engine start...\n");
-    m_replayManager->startRecording();
+    startRecording();
 }
 
 void UIManager::onStopRequested() {
     std::fprintf(stderr, "UIManager: Requesting engine stop...\n");
-    m_replayManager->stopRecording();
+    stopRecording();
 }
 
 void UIManager::updateStreamUrl(int index, const QString& url) {
