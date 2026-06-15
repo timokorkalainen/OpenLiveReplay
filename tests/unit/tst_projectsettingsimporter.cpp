@@ -13,6 +13,12 @@ private slots:
     void missingTelemetryUrlFails();
     void invalidDelayFails();
     void metadataShapeIsPreserved();
+    void nonArrayMetadataFieldsFails();
+    void nonArrayFeedMetadataFails();
+    void nonIntegerTelemetryDelayFails_data();
+    void nonIntegerTelemetryDelayFails();
+    void invalidProjectIdentityFails_data();
+    void invalidProjectIdentityFails();
 };
 
 static QJsonObject validRoot() {
@@ -113,6 +119,85 @@ void TestProjectSettingsImporter::metadataShapeIsPreserved() {
     QCOMPARE(result.sources[0].metadata,
              QJsonArray({QJsonObject{{"k", "angle"}, {"v", "wide"}},
                          QJsonObject{{"k", "operator"}, {"v", "Aino"}}}));
+}
+
+void TestProjectSettingsImporter::nonArrayMetadataFieldsFails() {
+    QJsonObject root = validRoot();
+    root["metadataFields"] = QJsonObject{};
+
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(root, QStringLiteral("https://provider.example/project.json"));
+    QVERIFY(!result.ok);
+    QVERIFY(result.error.contains(QStringLiteral("metadataFields")));
+}
+
+void TestProjectSettingsImporter::nonArrayFeedMetadataFails() {
+    QJsonObject root = validRoot();
+    QJsonArray feeds = root.value("feeds").toArray();
+    QJsonObject first = feeds.at(0).toObject();
+    first["metadata"] = QStringLiteral("bad");
+    feeds[0] = first;
+    root["feeds"] = feeds;
+
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(root, QStringLiteral("https://provider.example/project.json"));
+    QVERIFY(!result.ok);
+    QVERIFY(result.error.contains(QStringLiteral("metadata")));
+}
+
+void TestProjectSettingsImporter::nonIntegerTelemetryDelayFails_data() {
+    QTest::addColumn<QJsonValue>("delayValue");
+
+    QTest::newRow("string") << QJsonValue(QStringLiteral("800"));
+    QTest::newRow("object") << QJsonValue(QJsonObject{});
+}
+
+void TestProjectSettingsImporter::nonIntegerTelemetryDelayFails() {
+    QFETCH(QJsonValue, delayValue);
+
+    QJsonObject root = validRoot();
+    QJsonArray feeds = root.value("feeds").toArray();
+    QJsonObject first = feeds.at(0).toObject();
+    first["telemetryDelayMs"] = delayValue;
+    feeds[0] = first;
+    root["feeds"] = feeds;
+
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(root, QStringLiteral("https://provider.example/project.json"));
+    QVERIFY(!result.ok);
+    QVERIFY(result.error.contains(QStringLiteral("telemetryDelayMs")));
+}
+
+void TestProjectSettingsImporter::invalidProjectIdentityFails_data() {
+    QTest::addColumn<QJsonValue>("projectValue");
+
+    QTest::newRow("missing-project") << QJsonValue(QJsonValue::Undefined);
+    QTest::newRow("non-object-project") << QJsonValue(QStringLiteral("event-1"));
+    QTest::newRow("missing-id") << QJsonValue(QJsonObject{{"name", "Final"}});
+    QTest::newRow("missing-name") << QJsonValue(QJsonObject{{"id", "event-1"}});
+    QTest::newRow("empty-id") << QJsonValue(QJsonObject{{"id", ""}, {"name", "Final"}});
+    QTest::newRow("non-string-id") << QJsonValue(QJsonObject{{"id", 7}, {"name", "Final"}});
+    QTest::newRow("non-string-name") << QJsonValue(QJsonObject{{"id", "event-1"}, {"name", 7}});
+}
+
+void TestProjectSettingsImporter::invalidProjectIdentityFails() {
+    QFETCH(QJsonValue, projectValue);
+
+    QJsonObject root = validRoot();
+    if (projectValue.isUndefined()) {
+        root.remove("project");
+    } else {
+        root["project"] = projectValue;
+    }
+
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(root, QStringLiteral("https://provider.example/project.json"));
+    QVERIFY(!result.ok);
+    QVERIFY(result.error.contains(QStringLiteral("project")));
 }
 
 QTEST_GUILESS_MAIN(TestProjectSettingsImporter)

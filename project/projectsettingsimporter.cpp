@@ -1,5 +1,7 @@
 #include "project/projectsettingsimporter.h"
 
+#include <cmath>
+
 #include <QJsonValue>
 #include <QSet>
 #include <QUrl>
@@ -65,14 +67,34 @@ ProjectSettingsImportResult ProjectSettingsImporter::importJson(
         return result;
     }
 
-    result.metadataFields = root.value("metadataFields").toArray();
+    const QJsonValue metadataFieldsValue = root.value("metadataFields");
+    if (!metadataFieldsValue.isUndefined() && !metadataFieldsValue.isArray()) {
+        result.error = QStringLiteral("metadataFields must be an array");
+        return result;
+    }
+    result.metadataFields = metadataFieldsValue.toArray();
     if (!isValidMetadataFields(result.metadataFields, &result.error)) {
         return result;
     }
 
-    const QJsonObject project = root.value("project").toObject();
-    result.projectId = project.value("id").toString();
-    result.projectName = project.value("name").toString();
+    const QJsonValue projectValue = root.value("project");
+    if (!projectValue.isObject()) {
+        result.error = QStringLiteral("project must be an object");
+        return result;
+    }
+    const QJsonObject project = projectValue.toObject();
+    const QJsonValue projectIdValue = project.value("id");
+    if (!projectIdValue.isString() || projectIdValue.toString().trimmed().isEmpty()) {
+        result.error = QStringLiteral("project.id must be a non-empty string");
+        return result;
+    }
+    const QJsonValue projectNameValue = project.value("name");
+    if (!projectNameValue.isString() || projectNameValue.toString().trimmed().isEmpty()) {
+        result.error = QStringLiteral("project.name must be a non-empty string");
+        return result;
+    }
+    result.projectId = projectIdValue.toString().trimmed();
+    result.projectName = projectNameValue.toString().trimmed();
 
     const QJsonArray feeds = root.value("feeds").toArray();
     if (feeds.isEmpty()) {
@@ -91,9 +113,7 @@ ProjectSettingsImportResult ProjectSettingsImporter::importJson(
         source.id = obj.value("id").toString().trimmed();
         source.name = obj.value("name").toString();
         source.url = obj.value("url").toString().trimmed();
-        source.metadata = obj.value("metadata").toArray();
         source.trimOffsetMs = obj.value("trimOffsetMs").toInt(0);
-        source.telemetryDelayMs = obj.value("telemetryDelayMs").toInt(0);
 
         if (source.id.isEmpty()) {
             result.error = QStringLiteral("feed id must be non-empty");
@@ -109,10 +129,31 @@ ProjectSettingsImportResult ProjectSettingsImporter::importJson(
             result.error = QStringLiteral("feed url must be non-empty: ") + source.id;
             return result;
         }
-        if (source.telemetryDelayMs < 0 || source.telemetryDelayMs > 10000) {
-            result.error = QStringLiteral("telemetryDelayMs must be 0..10000 for feed: ") + source.id;
+
+        const QJsonValue telemetryDelayValue = obj.value("telemetryDelayMs");
+        if (!telemetryDelayValue.isUndefined()) {
+            if (!telemetryDelayValue.isDouble()) {
+                result.error = QStringLiteral("telemetryDelayMs must be an integer for feed: ") + source.id;
+                return result;
+            }
+            const double delay = telemetryDelayValue.toDouble();
+            if (delay != std::trunc(delay)) {
+                result.error = QStringLiteral("telemetryDelayMs must be an integer for feed: ") + source.id;
+                return result;
+            }
+            if (delay < 0 || delay > 10000) {
+                result.error = QStringLiteral("telemetryDelayMs must be 0..10000 for feed: ") + source.id;
+                return result;
+            }
+            source.telemetryDelayMs = static_cast<int>(delay);
+        }
+
+        const QJsonValue metadataValue = obj.value("metadata");
+        if (!metadataValue.isUndefined() && !metadataValue.isArray()) {
+            result.error = QStringLiteral("feed metadata must be an array for feed: ") + source.id;
             return result;
         }
+        source.metadata = metadataValue.toArray();
         if (!isValidSourceMetadata(source.metadata, &result.error)) {
             result.error += QStringLiteral(" for feed: ") + source.id;
             return result;
