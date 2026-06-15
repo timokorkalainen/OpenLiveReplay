@@ -144,6 +144,9 @@ void ReplayManager::startRecording() {
         if (s < m_sourceMetadata.size()) {
             worker->setSourceMetadata(m_sourceMetadata[s]);
         }
+        if (s < m_sourceTrims.size()) {
+            worker->setTrimOffsetMs(m_sourceTrims[s]);
+        }
 
         // The worker QObject must live on its own thread, otherwise the
         // queued masterPulse slot (jitter pull + encode + mux write) runs
@@ -269,6 +272,14 @@ void ReplayManager::updateSourceUrl(int sourceIndex, const QString &url) {
         if (m_isRecording && sourceIndex < m_workers.size()) {
             m_workers[sourceIndex]->changeSource(url);
         }
+    }
+}
+
+void ReplayManager::updateSourceTrim(int sourceIndex, int ms) {
+    if (sourceIndex < 0) return;
+    if (sourceIndex < m_sourceTrims.size()) m_sourceTrims[sourceIndex] = ms;
+    if (m_isRecording && sourceIndex < m_workers.size()) {
+        m_workers[sourceIndex]->setTrimOffsetMs(ms);
     }
 }
 
