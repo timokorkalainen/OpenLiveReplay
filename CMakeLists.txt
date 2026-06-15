@@ -76,6 +76,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/videotoolboxdecoder.h
+        recorder_engine/ingest/nativesrtingestsession.h
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp
@@ -190,6 +191,9 @@ endif()
 # 4. Handle Platform Specifics (FFmpeg)
 if(IOS)
     target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/ingest/nativesrtingestsession.cpp
+    )
+    target_sources(OpenLiveReplay PRIVATE
         ios/ios_scene.h
         ios/ios_scene.mm
     )
@@ -273,6 +277,7 @@ if(IOS)
         "${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/Headers"
         "${FFMPEG_IOS_DIR}/libswscale.xcframework/ios-arm64/Headers"
         "${FFMPEG_IOS_DIR}/libswresample.xcframework/ios-arm64/Headers"
+        "${FFMPEG_IOS_DIR}/libsrt.xcframework/ios-arm64/Headers"
     )
 
     # ==============================================================================

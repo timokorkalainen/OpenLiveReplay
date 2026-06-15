@@ -1,8 +1,15 @@
 #include "streamworker.h"
 #include "ingest/ffmpegingestsession.h"
+#include "ingest/ingestsession.h"
+#if defined(Q_OS_IOS)
+#include "ingest/nativesrtingestsession.h"
+#endif
 #include <QDebug>
 #include <QDateTime>
 #include <QUrl>
+#include <QtGlobal>
+
+#include <memory>
 
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock *clock,
                            int targetWidth, int targetHeight, int targetFps, QObject* parent)
@@ -269,9 +276,34 @@ void StreamWorker::captureLoop() {
                          reinterpret_cast<const uint8_t*>(chunk.pcmS16Stereo.constData()),
                          chunk.pcmS16Stereo.size() / kAudioBytesPerSample);
         };
+        callbacks.setConnected = [this](bool connected) {
+            setConnected(connected);
+        };
 
-        FfmpegIngestSession session(m_sourceIndex, m_targetWidth, m_targetHeight, m_targetFps);
-        if (!session.open(QUrl(currentUrl), callbacks)) {
+        IngestBackendOptions backendOptions;
+        const QUrl sourceUrl(currentUrl);
+#if defined(Q_OS_IOS)
+        backendOptions.preferNativeSrt = qEnvironmentVariableIsSet("OLR_NATIVE_SRT")
+                                         && NativeSrtIngestSession::supportsUrl(sourceUrl);
+#endif
+        const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
+#if !defined(Q_OS_IOS)
+        Q_UNUSED(backendKind);
+#endif
+
+        std::unique_ptr<IngestSession> session;
+#if defined(Q_OS_IOS)
+        if (backendKind == IngestBackendKind::NativeSrt) {
+            session = std::make_unique<NativeSrtIngestSession>(
+                m_sourceIndex, m_targetWidth, m_targetHeight, &m_captureRunning);
+        } else
+#endif
+        {
+            session = std::make_unique<FfmpegIngestSession>(
+                m_sourceIndex, m_targetWidth, m_targetHeight, m_targetFps);
+        }
+
+        if (!session->open(sourceUrl, callbacks)) {
             qDebug() << "Source" << m_sourceIndex << "Connect failed. Retrying in" << (m_connectBackoffMs / 1000.0) << "s...";
             const int steps = qMax(1, m_connectBackoffMs / 100);
             for (int i = 0; i < steps && m_captureRunning && !m_restartCapture; ++i) {
@@ -297,7 +329,7 @@ void StreamWorker::captureLoop() {
             break;
         }
 
-        session.run();
+        session->run();
 
         setConnected(false);
     }
