@@ -239,8 +239,8 @@ static QJsonObject validRoot() {
                 {"url", "srt://10.0.0.20:9000"},
                 {"telemetryDelayMs", 800},
                 {"metadata", QJsonArray{
-                    QJsonObject{{"k", "angle"}, {"v", "wide"}},
-                    QJsonObject{{"k", "operator"}, {"v", "Aino"}}
+                    QJsonObject{{"name", "angle"}, {"value", "wide"}},
+                    QJsonObject{{"name", "operator"}, {"value", "Aino"}}
                 }}
             },
             QJsonObject{
@@ -318,8 +318,8 @@ void TestProjectSettingsImporter::metadataShapeIsPreserved() {
 
     QVERIFY(result.ok);
     QCOMPARE(result.sources[0].metadata,
-             QJsonArray({QJsonObject{{"k", "angle"}, {"v", "wide"}},
-                         QJsonObject{{"k", "operator"}, {"v", "Aino"}}}));
+             QJsonArray({QJsonObject{{"name", "angle"}, {"value", "wide"}},
+                         QJsonObject{{"name", "operator"}, {"value", "Aino"}}}));
 }
 
 QTEST_GUILESS_MAIN(TestProjectSettingsImporter)
@@ -437,12 +437,12 @@ bool ProjectSettingsImporter::isValidSourceMetadata(const QJsonArray &metadata, 
             return false;
         }
         const QJsonObject obj = value.toObject();
-        if (obj.value("k").toString().trimmed().isEmpty()) {
-            *error = QStringLiteral("feed metadata entries require non-empty k");
+        if (obj.value("name").toString().trimmed().isEmpty()) {
+            *error = QStringLiteral("feed metadata entries require non-empty name");
             return false;
         }
-        if (!obj.contains("v")) {
-            *error = QStringLiteral("feed metadata entries require v");
+        if (!obj.contains("value")) {
+            *error = QStringLiteral("feed metadata entries require value");
             return false;
         }
     }
