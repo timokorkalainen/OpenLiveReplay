@@ -105,14 +105,21 @@ per-source trim's `m_trimOffsetMs`).
   getter. `play_harness` reads `OLR_AUDIO_LATENCY_MS` (default 0) → `audio.setOutputLatencyOffsetMs(...)`,
   and appends `resyncCount=<n>` to its `COUNTERS` line. A new driver scenario
   `latency` exports `OLR_AUDIO_LATENCY_MS=300`, runs the `play1x` playback, and
-  asserts **`resyncCount == 0`** (no re-align storm) and `audioPushes > 0`. This
-  headlessly proves the coupling fix: without the threshold scaling, a 300 ms
-  offset would storm re-aligns and `resyncCount` would climb.
-  - **Note:** the e2e proves the *no-storm* direction (the change's main risk). The
-    complementary "still catches a genuine >threshold desync" is a defensive
-    self-heal backstop (for an uncleaned seek the normal `clear()` path never
-    hits); the scaling keeps the threshold finite (`250 + offset`), so detection is
-    preserved by construction — not separately e2e-tested.
+  asserts **`resyncCount == 0`** (no re-align storm) and `audioPushes > 0`. It is a
+  **no-regression smoke gate**: it proves the offset is applied, the audio path runs,
+  and steady 1× playback does not storm re-aligns.
+  - **Honest limitation (verified during implementation):** this gate is **not
+    discriminating** for the threshold scaling. A teeth-check (temporarily removing
+    `+ outLatencyMs` from the resync threshold) still produced `resyncCount == 0` —
+    the headless harness's `QAudioSink` has no real device buffer and steady 1×
+    playback keeps `|pts − due|` small, so the documented steady-state storm does
+    **not** reproduce headlessly regardless of the scaling. The scaling is therefore
+    **retained as defensive**, on the strength of the original `audioplayer.h`
+    coupling note (written against real hardware: "the aligned branch re-aligns on
+    every push" if the threshold is not kept above `offset + headroom`). Its
+    necessity is asserted by that design note + manual real-device check, not by a
+    discriminating automated test. At offset 0 the scaling is a no-op (identical to
+    prior behavior), so the change cannot regress the default path.
 - **Manual:** set the offset in-app on a Bluetooth output and confirm lip-sync.
 
 ## 7. Out of scope (YAGNI)
@@ -128,6 +135,12 @@ per-source trim's `m_trimOffsetMs`).
 - **Headless audio in CI:** `QAudioSink` may not emit real audio on the CI runner,
   so the e2e check validates the *internal* align/resync behavior (clear/push
   counters), not actual audibility. True A/V is a manual check. Documented.
-- **Resync-coupling correctness** is the load-bearing claim; the unit test (offset
-  tolerated, genuine desync still caught) plus the e2e no-storm gate are designed
-  specifically to catch a regression in the threshold-scaling.
+- **Resync-coupling is unprovable headlessly (accepted).** The steady-state storm
+  the scaling guards against does not reproduce in the headless harness (no real
+  device buffer; steady 1× keeps `|pts − due|` small), so no automated test can
+  *discriminate* the scaling — confirmed by a teeth-check. The scaling is kept as a
+  low-risk defensive measure faithful to the original author's hardware-tested
+  coupling note; it is a no-op at offset 0. If a future maintainer judges the
+  scaling unnecessary, removing it is safe to consider — but only with a real-device
+  test, not the headless gate. The `latency` e2e remains as a no-regression smoke
+  check (offset applied, audio runs, no 1× storm).
