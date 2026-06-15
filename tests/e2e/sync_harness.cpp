@@ -13,6 +13,7 @@
 #include <QTimer>
 #include <QString>
 #include <QStringList>
+#include <QSet>
 #include <QtGlobal>
 #include <cstdio>
 
@@ -47,6 +48,7 @@ int main(int argc, char** argv) {
     // is hermetic. Empty -> engine default (~/Documents/videos).
     const QString outdir = argValue(args, QStringLiteral("--outdir"), QString());
     const int trimMs = argValue(args, QStringLiteral("--trim"), QStringLiteral("0")).toInt();
+    const bool reportConnections = args.contains(QStringLiteral("--report-connections"));
 
     if (urls.isEmpty()) {
         fprintf(stderr, "sync_harness: at least one --url is required\n");
@@ -79,6 +81,15 @@ int main(int argc, char** argv) {
     rm.setVideoHeight(height);
     rm.setFps(fps);
 
+    // Count distinct sources that reach the connected state. Queued to the app
+    // (main) thread — the signal is emitted from a worker thread. Connected
+    // before startRecording() so no early connect is missed.
+    QSet<int> connectedSources;
+    QObject::connect(&rm, &ReplayManager::sourceConnectionChanged, &app,
+                     [&connectedSources](int sourceIndex, bool connected) {
+                         if (connected) connectedSources.insert(sourceIndex);
+                     });
+
     rm.startRecording();
     if (!rm.isRecording()) {
         fprintf(stderr, "sync_harness: startRecording() failed (engine not recording)\n");
@@ -103,6 +114,10 @@ int main(int argc, char** argv) {
             } else {
                 printf("%s\n", qPrintable(outPath));
                 fflush(stdout);
+            }
+            if (reportConnections) {
+                fprintf(stderr, "connected=%d\n", int(connectedSources.size()));
+                fflush(stderr);
             }
             app.quit();
         });
