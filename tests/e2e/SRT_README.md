@@ -32,8 +32,15 @@ tone, not the blue-fill/silence the engine emits when no source connects). Witho
 `-DOLR_FFMPEG_SRT_PREFIX` the engine's avformat lacks SRT and the test fails by
 design.
 
+`e2e_srt_4cam` goes further: it stands up **4** SRT cameras, each emitting a
+distinct audio tone (1/2/3/4 kHz), records them into a 4-view MKV, and asserts
+each recorded view carries its own camera's tone — proving 4 real SRT streams
+connect and **route correctly** (view *i* = camera *i*), not blue-fill silence.
+Run it with the same SRT build via `ctest -L srt`.
+
 ## Next (Phase 2)
 
-A 4-source SRT framework (per-camera identity; inter-camera sync, per-source
-trim, audio latency, connection-status, disconnect/loss injection) builds on this
-infra — see `docs/superpowers/specs/`.
+Phase 2a (4-source routing) is implemented here (`e2e_srt_4cam`). Phase 2b
+(inter-camera sync, per-source trim, connection-status) and 2c
+(disconnect/reconnect, packet loss) follow as their own specs — see
+`docs/superpowers/specs/`.
