@@ -39,6 +39,7 @@ endif()
 qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/recordingclock.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectsettingsimporter.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectimportclient.cpp"
