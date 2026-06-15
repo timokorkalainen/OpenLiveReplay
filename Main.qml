@@ -1153,6 +1153,72 @@ ApplicationWindow {
                     Item { }
                 }
 
+                GroupBox {
+                    title: "External Input Settings"
+                    Layout.fillWidth: true
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 8
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            TextField {
+                                id: importSettingsUrlField
+                                Layout.fillWidth: true
+                                text: appWindow.uiManagerRef.importSettingsUrl
+                                placeholderText: "https://provider.example/project-settings.json"
+                                enabled: !appWindow.uiManagerRef.isRecording
+                                onEditingFinished: appWindow.uiManagerRef.importSettingsUrl = text
+                            }
+
+                            Button {
+                                text: "Read/Import"
+                                enabled: !appWindow.uiManagerRef.isRecording
+                                onClicked: {
+                                    appWindow.uiManagerRef.importSettingsUrl = importSettingsUrlField.text
+                                    appWindow.uiManagerRef.readImportSettings()
+                                }
+                            }
+                        }
+
+                        Text {
+                            visible: appWindow.uiManagerRef.importPreviewError !== ""
+                            text: appWindow.uiManagerRef.importPreviewError
+                            color: "#ff9800"
+                            wrapMode: Text.WordWrap
+                            Layout.fillWidth: true
+                        }
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 8
+
+                            Button {
+                                visible: appWindow.uiManagerRef.importPreviewReady
+                                text: "Preview Imported Sources"
+                                enabled: appWindow.uiManagerRef.importPreviewReady
+                                onClicked: importPreviewPopup.open()
+                            }
+
+                            Text {
+                                visible: appWindow.uiManagerRef.importPreviewReady
+                                text: {
+                                    var p = appWindow.uiManagerRef.importPreview
+                                    var count = p.feedCount !== undefined ? p.feedCount : ((p.feeds || []).length)
+                                    return count + " imported feed" + (count === 1 ? "" : "s") + " ready"
+                                }
+                                color: "#8bc34a"
+                                Layout.alignment: Qt.AlignVCenter
+                            }
+
+                            Item { Layout.fillWidth: true }
+                        }
+                    }
+                }
+
                 RowLayout {
                     Layout.fillWidth: true
                     Text {
@@ -1287,6 +1353,200 @@ ApplicationWindow {
                             flat: true
                             onClicked: appWindow.uiManagerRef.removeStream(streamRow.index)
                             visible: !appWindow.uiManagerRef.isRecording
+                        }
+                    }
+                }
+
+                // ─── Imported Input Settings Preview ───
+                Popup {
+                    id: importPreviewPopup
+                    modal: true
+                    focus: true
+                    closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                    anchors.centerIn: Overlay.overlay
+                    width: Math.min(appWindow.width * 0.92, 760)
+                    height: Math.min(appWindow.height * 0.84, 580)
+
+                    function metadataSummary(metadata) {
+                        if (!metadata || metadata.length === 0) return "metadata 0"
+
+                        var parts = []
+                        for (var i = 0; i < metadata.length && i < 3; ++i) {
+                            var row = metadata[i] || {}
+                            var name = row.name || ""
+                            var value = row.value !== undefined ? String(row.value) : ""
+                            if (name.length === 0 && value.length === 0) continue
+                            parts.push(value.length > 0 ? (name + "=" + value) : name)
+                        }
+
+                        var suffix = metadata.length > parts.length ? " +" + (metadata.length - parts.length) : ""
+                        return "metadata " + metadata.length + (parts.length > 0 ? ": " + parts.join(", ") + suffix : "")
+                    }
+
+                    contentItem: Rectangle {
+                        color: "#1f1f1f"
+                        radius: 0
+                        border.color: "#333"
+                        border.width: 1
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: 16
+                            spacing: 12
+
+                            Text {
+                                text: "Imported Input Settings"
+                                color: "#eeeeee"
+                                font.pixelSize: 18
+                                font.bold: true
+                                Layout.fillWidth: true
+                            }
+
+                            GridLayout {
+                                columns: 2
+                                Layout.fillWidth: true
+                                columnSpacing: 14
+                                rowSpacing: 4
+
+                                Label {
+                                    text: "Project"
+                                    color: "#999999"
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: {
+                                        var p = appWindow.uiManagerRef.importPreview
+                                        var name = p.projectName || "Imported project"
+                                        var idText = p.projectId ? " (" + p.projectId + ")" : ""
+                                        return name + idText
+                                    }
+                                    color: "#eeeeee"
+                                    elide: Text.ElideRight
+                                }
+
+                                Label {
+                                    text: "Feeds"
+                                    color: "#999999"
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: {
+                                        var p = appWindow.uiManagerRef.importPreview
+                                        return p.feedCount !== undefined ? p.feedCount : ((p.feeds || []).length)
+                                    }
+                                    color: "#eeeeee"
+                                }
+
+                                Label {
+                                    text: "Telemetry SSE"
+                                    color: "#999999"
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: appWindow.uiManagerRef.importPreview.telemetrySseUrl || ""
+                                    color: "#b0b0b0"
+                                    elide: Text.ElideMiddle
+                                }
+                            }
+
+                            Text {
+                                text: "Applying will replace the current input sources."
+                                color: "#ffcc80"
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                            }
+
+                            ScrollView {
+                                Layout.fillWidth: true
+                                Layout.fillHeight: true
+                                clip: true
+                                contentWidth: availableWidth
+                                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+                                ListView {
+                                    id: importFeedsList
+                                    width: parent.width
+                                    model: appWindow.uiManagerRef.importPreview.feeds || []
+                                    spacing: 8
+                                    boundsBehavior: Flickable.StopAtBounds
+
+                                    delegate: Rectangle {
+                                        id: importFeedRow
+                                        required property var modelData
+                                        width: importFeedsList.width
+                                        height: feedLayout.implicitHeight + 16
+                                        color: "#181818"
+                                        border.color: "#333"
+                                        border.width: 1
+                                        radius: 4
+
+                                        ColumnLayout {
+                                            id: feedLayout
+                                            anchors.fill: parent
+                                            anchors.margins: 8
+                                            spacing: 4
+
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: {
+                                                    var name = importFeedRow.modelData.name || "Unnamed feed"
+                                                    var idText = importFeedRow.modelData.id || ""
+                                                    return idText.length > 0 ? (name + " · " + idText) : name
+                                                }
+                                                color: "#eeeeee"
+                                                font.bold: true
+                                                elide: Text.ElideRight
+                                            }
+
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: importFeedRow.modelData.url || ""
+                                                color: "#aaaaaa"
+                                                elide: Text.ElideMiddle
+                                            }
+
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: "telemetryDelayMs " + (importFeedRow.modelData.telemetryDelayMs || 0)
+                                                color: "#888888"
+                                                elide: Text.ElideRight
+                                            }
+
+                                            Text {
+                                                Layout.fillWidth: true
+                                                text: importPreviewPopup.metadataSummary(importFeedRow.modelData.metadata)
+                                                color: "#777777"
+                                                elide: Text.ElideRight
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 10
+
+                                Item { Layout.fillWidth: true }
+
+                                Button {
+                                    text: "Cancel"
+                                    onClicked: importPreviewPopup.close()
+                                }
+
+                                Button {
+                                    text: "Apply"
+                                    enabled: appWindow.uiManagerRef.importPreviewReady
+                                             && !appWindow.uiManagerRef.isRecording
+                                    onClicked: {
+                                        appWindow.uiManagerRef.applyImportPreview()
+                                        importPreviewPopup.close()
+                                    }
+                                }
+                            }
                         }
                     }
                 }
