@@ -21,6 +21,10 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
 
     m_telemetryTrackOffset = 0;
     m_telemetryTrackCount = 0;
+    const auto resetTelemetryTracks = [this] {
+        m_telemetryTrackOffset = 0;
+        m_telemetryTrackCount = 0;
+    };
 
     if (width <= 0) width = 1920;
     if (height <= 0) height = 1080;
@@ -127,6 +131,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
             av_dict_free(&opts);
             avformat_free_context(m_outCtx);
             m_outCtx = nullptr;
+            resetTelemetryTracks();
             return false;
         }
     }
@@ -139,6 +144,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         }
         avformat_free_context(m_outCtx);
         m_outCtx = nullptr;
+        resetTelemetryTracks();
         return false;
     }
     avio_flush(m_outCtx->pb); // Forces the EBML header to be visible to the reader
