@@ -62,6 +62,9 @@ class UIManager : public QObject {
     // it to re-evaluate isSourceConnected() bindings.
     Q_PROPERTY(
         int sourceConnectionVersion READ sourceConnectionVersion NOTIFY sourceConnectionChanged)
+    // Bumped when any source's trim changes (config load / programmatic set) so
+    // QML re-reads sourceTrimOffset() bindings.
+    Q_PROPERTY(int sourceTrimVersion READ sourceTrimVersion NOTIFY sourceTrimChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -103,6 +106,7 @@ public:
     int sourceEnabledVersion() const { return m_sourceEnabledVersion; }
     bool followLive() const { return m_followLive; }
     int sourceConnectionVersion() const { return m_sourceConnectionVersion; }
+    int sourceTrimVersion() const { return m_sourceTrimVersion; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -170,6 +174,8 @@ public:
     // Surfaces the duplicate-stream misconfiguration that two workers
     // pulling one URL otherwise hides.
     Q_INVOKABLE bool hasDuplicateUrl(int sourceIndex) const;
+    Q_INVOKABLE int sourceTrimOffset(int sourceIndex) const;
+    Q_INVOKABLE void setSourceTrimOffset(int sourceIndex, int ms);
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -211,6 +217,7 @@ signals:
     void streamDeckLearnActionChanged();
     void streamDeckBindingsChanged();
     void sourceConnectionChanged();
+    void sourceTrimChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -297,6 +304,7 @@ private:
     // start/stop so a stale "connected" never lingers across sessions.
     QList<bool> m_sourceConnected;
     int m_sourceConnectionVersion = 0;
+    int m_sourceTrimVersion = 0;
     void resetSourceConnection();
 
     QList<QScreen*> m_screens;
