@@ -121,6 +121,11 @@ ApplicationWindow {
         function onRecordingStarted() {
             appWindow.recordingError = ""
         }
+        function onImportPreviewChanged() {
+            if (appWindow.uiManagerRef.importPreviewReady && !importPreviewPopup.opened) {
+                importPreviewPopup.open()
+            }
+        }
     }
 
     Timer {
@@ -1193,7 +1198,7 @@ ApplicationWindow {
                             }
 
                             Button {
-                                text: "Read/Import"
+                                text: "Read Settings"
                                 enabled: !appWindow.uiManagerRef.isRecording
                                 onClicked: {
                                     appWindow.uiManagerRef.importSettingsUrl = importSettingsUrlField.text
