@@ -1151,6 +1151,25 @@ ApplicationWindow {
                     Item { }
                     Item { }
                     Item { }
+
+                    Label { text: "Audio output latency (ms)"; }
+
+                    SpinBox {
+                        id: audioLatencySpin
+                        from: 0
+                        to: 500
+                        stepSize: 10
+                        editable: true
+                        inputMethodHints: Qt.ImhDigitsOnly
+                        value: appWindow.uiManagerRef.audioOutputLatencyMs
+                        onValueModified: appWindow.uiManagerRef.audioOutputLatencyMs = value
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Compensate audio-output device delay (HDMI/Bluetooth). Raise until lip-sync is correct on this output."
+                    }
+
+                    Item { }
+                    Item { }
+                    Item { }
                 }
 
                 RowLayout {
