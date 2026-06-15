@@ -75,6 +75,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/pespacket.h
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
+        recorder_engine/ingest/videotoolboxdecoder.h
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp
@@ -174,6 +175,16 @@ if(OLR_ENABLE_STREAMDECK)
     target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager.mm)
 else()
     target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager_stub.cpp)
+endif()
+
+if(APPLE)
+    target_sources(OpenLiveReplay PRIVATE recorder_engine/ingest/videotoolboxdecoder.mm)
+    target_link_libraries(OpenLiveReplay PRIVATE
+        "-framework VideoToolbox"
+        "-framework CoreMedia"
+        "-framework CoreVideo")
+else()
+    target_sources(OpenLiveReplay PRIVATE recorder_engine/ingest/videotoolboxdecoder_stub.cpp)
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)

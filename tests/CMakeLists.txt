@@ -71,6 +71,16 @@ target_link_libraries(olr_test_engine
            avformat avcodec avutil swscale swresample
     PRIVATE olr_warnings olr_sanitize)
 
+if(APPLE)
+    target_sources(olr_test_engine PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/videotoolboxdecoder.mm")
+    target_link_libraries(olr_test_engine
+        PRIVATE "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
+else()
+    target_sources(olr_test_engine PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/videotoolboxdecoder_stub.cpp")
+endif()
+
 # --- Playback sources (need Qt Multimedia for QVideoFrame; ffmpeg for the
 #     worker, which #includes <libavformat/...> and demuxes the fixture). -----
 qt_add_library(olr_test_playback STATIC
