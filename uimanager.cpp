@@ -102,16 +102,26 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_telemetryClient = new TelemetryClient(this);
     connect(m_telemetryClient, &TelemetryClient::telemetryEvent, this,
             [this](const TelemetryEvent &event) {
-        if (event.feedId.trimmed().isEmpty()) return;
+        const QString feedId = event.feedId.trimmed();
+        if (feedId.isEmpty()) return;
+        const auto matchesFeedId = [&feedId](const SourceSettings &source) {
+            return source.id == feedId;
+        };
+        if (std::none_of(m_currentSettings.sources.cbegin(),
+                         m_currentSettings.sources.cend(),
+                         matchesFeedId)) {
+            qWarning() << "TelemetryClient: ignoring telemetry for unknown feedId" << feedId;
+            return;
+        }
 
         QJsonObject payload = event.payload;
-        payload.insert(QStringLiteral("feedId"), event.feedId);
-        m_liveTelemetry.insert(event.feedId, payload.toVariantMap());
+        payload.insert(QStringLiteral("feedId"), feedId);
+        m_liveTelemetry.insert(feedId, payload.toVariantMap());
         m_telemetryVersion++;
         emit telemetryChanged();
 
         if (m_replayManager && m_replayManager->isRecording()) {
-            m_replayManager->recordTelemetryEvent(event.feedId, payload);
+            m_replayManager->recordTelemetryEvent(feedId, payload);
         }
     });
     connect(m_telemetryClient, &TelemetryClient::errorOccurred, this,
