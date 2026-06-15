@@ -89,10 +89,14 @@ void StreamWorker::run() {
 void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     m_internalFrameCount = frameIndex;
 
+    // Snapshot the trim once per pulse so video and audio of this tick use the
+    // SAME offset even if the UI thread changes it mid-pulse (keeps A/V locked).
+    const int64_t trimMs = m_trimOffsetMs.load(std::memory_order_relaxed);
+
     // Publish this tick's jitter-pull gate for the capture thread's
     // queue pre-drain (see captureLoop).
     m_lastTickTargetMs.store(
-        qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - kJitterBufferMs),
+        qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - kJitterBufferMs - trimMs),
         std::memory_order_relaxed);
 
     if (!m_persistentEncCtx) return;
@@ -118,10 +122,10 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
         m_captureThread = std::thread([this]() { this->captureLoop(); });
     }
 
-    processEncoderTick(m_persistentEncCtx, streamTimeMs);
+    processEncoderTick(m_persistentEncCtx, streamTimeMs, trimMs);
 }
 
-void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs) {
+void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs) {
     AVPacket* outPkt = av_packet_alloc();
     bool havePacket = false;
     int track = -1;
@@ -146,7 +150,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // ALWAYS do jitter pull to keep m_latestFrame fresh, even when
         // not assigned to a view.  This ensures frames are ready the
         // instant this source gets mapped to a view.
-        int64_t targetTimeMs = currentRecordingTimeMs - kJitterBufferMs;
+        int64_t targetTimeMs = currentRecordingTimeMs - kJitterBufferMs - trimMs;
         if (targetTimeMs < 0) targetTimeMs = 0;
 
         while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
@@ -205,7 +209,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     // Write this tick's worth of audio for the assigned view track
     // (sample-accurate cursor, silence-filled where capture had nothing).
-    writeAudioForTick(currentRecordingTimeMs, track);
+    writeAudioForTick(currentRecordingTimeMs, track, trimMs);
 }
 
 void StreamWorker::captureLoop() {
@@ -1003,13 +1007,14 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
     }
 }
 
-void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track) {
+void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs) {
     // Audio shares the video path's jitter delay so both land on the
     // same timeline: a video frame written at file-time T shows source
     // content from T - jitter.  The cursor runs on the FILE timeline;
     // the FIFO holds source-timeline samples, so file position P maps
     // to FIFO position P - jitter.
     const int64_t jitterSamples = int64_t(kJitterBufferMs) * kAudioSampleRate / 1000;
+    const int64_t trimSamples = trimMs * kAudioSampleRate / 1000;
     const int64_t targetEnd = recordingTimeMs * kAudioSampleRate / 1000;
     if (targetEnd <= 0) return;
 
@@ -1019,7 +1024,8 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track) {
         m_audioWriteCursor = targetEnd;
         QMutexLocker locker(&m_audioFifoMutex);
         if (m_audioFifoStartSample >= 0) {
-            const int64_t dropSamples = (targetEnd - jitterSamples) - m_audioFifoStartSample;
+            const int64_t dropSamples =
+                (targetEnd - jitterSamples - trimSamples) - m_audioFifoStartSample;
             if (dropSamples > 0) {
                 const int dropBytes = int(qMin<int64_t>(dropSamples * kAudioBytesPerSample,
                                                         m_audioFifo.size()));
@@ -1038,8 +1044,8 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track) {
     // Catch up at most 1 s per tick: the track stays contiguous, a large
     // backlog (stalled event loop) just drains over several ticks.
     const int64_t n = qMin<int64_t>(targetEnd - m_audioWriteCursor, kAudioSampleRate);
-    const int64_t start = m_audioWriteCursor;        // file timeline
-    const int64_t srcStart = start - jitterSamples;  // source timeline
+    const int64_t start = m_audioWriteCursor;                          // file timeline
+    const int64_t srcStart = start - jitterSamples - trimSamples;  // source timeline (+trim)
 
     QByteArray chunk(int(n * kAudioBytesPerSample), '\0');
     {
