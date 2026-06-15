@@ -25,6 +25,7 @@ public:
     void setSourceUrls(const QStringList &urls) { m_sourceUrls = urls; }
     void setSourceNames(const QStringList &names) { m_sourceNames = names; }
     void setSourceMetadata(const QList<QByteArray> &metadata) { m_sourceMetadata = metadata; }
+    void setSourceTrims(const QList<int>& trims) { m_sourceTrims = trims; }
     QStringList getSourceUrls() const { return m_sourceUrls; }
     QStringList getSourceNames() const { return m_sourceNames; }
 
@@ -38,6 +39,7 @@ public:
 
     // For user editing a source URL during recording (real FFmpeg reconnect)
     void updateSourceUrl(int sourceIndex, const QString &url);
+    void updateSourceTrim(int sourceIndex, int ms);
 
     // Stream names for view tracks in the muxer
     void setViewNames(const QStringList &names) { m_viewNames = names; }
@@ -83,6 +85,7 @@ private:
     QStringList m_sourceUrls;
     QStringList m_sourceNames;
     QList<QByteArray> m_sourceMetadata;  // One JSON blob per source
+    QList<int> m_sourceTrims;            // per-source initial trim ms (parallel to m_sourceUrls)
 
     // View config
     int m_viewCount = 4;

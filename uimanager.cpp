@@ -573,12 +573,15 @@ void UIManager::syncActiveStreams() {
     QStringList urls;
     QStringList names;
     QList<QByteArray> metadata;
+    QList<int> trims;
     urls.reserve(m_currentSettings.sources.size());
     names.reserve(m_currentSettings.sources.size());
     metadata.reserve(m_currentSettings.sources.size());
+    trims.reserve(m_currentSettings.sources.size());
     for (const auto &source : m_currentSettings.sources) {
         urls.append(source.url);
         names.append(source.name);
+        trims.append(source.trimOffsetMs);
 
         // Build a compact JSON blob for per-frame subtitle metadata
         QJsonObject obj;
@@ -592,6 +595,7 @@ void UIManager::syncActiveStreams() {
     m_replayManager->setSourceUrls(urls);
     m_replayManager->setSourceNames(names);
     m_replayManager->setSourceMetadata(metadata);
+    m_replayManager->setSourceTrims(trims);
 
     // View configuration: how many recording tracks, and their display names
     m_replayManager->setViewCount(activeViewCount());
@@ -668,12 +672,15 @@ void UIManager::toggleSourceEnabled(int sourceIndex) {
         QStringList urls;
         QStringList names;
         QList<QByteArray> metadata;
+        QList<int> trims;
         urls.reserve(m_currentSettings.sources.size());
         names.reserve(m_currentSettings.sources.size());
         metadata.reserve(m_currentSettings.sources.size());
+        trims.reserve(m_currentSettings.sources.size());
         for (const auto &source : m_currentSettings.sources) {
             urls.append(source.url);
             names.append(source.name);
+            trims.append(source.trimOffsetMs);
             QJsonObject obj;
             obj.insert("id", source.id);
             obj.insert("name", source.name);
@@ -683,6 +690,7 @@ void UIManager::toggleSourceEnabled(int sourceIndex) {
         m_replayManager->setSourceUrls(urls);
         m_replayManager->setSourceNames(names);
         m_replayManager->setSourceMetadata(metadata);
+        m_replayManager->setSourceTrims(trims);
         m_replayManager->setViewCount(activeViewCount());
         m_replayManager->setViewNames(activeStreamNames());
         m_replayManager->updateViewMapping(m_viewSlotMap);
@@ -1192,6 +1200,23 @@ void UIManager::updateUrl(int index, const QString &url) {
     }
 }
 
+int UIManager::sourceTrimOffset(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= m_currentSettings.sources.size()) return 0;
+    return m_currentSettings.sources[sourceIndex].trimOffsetMs;
+}
+
+void UIManager::setSourceTrimOffset(int sourceIndex, int ms) {
+    if (sourceIndex < 0 || sourceIndex >= m_currentSettings.sources.size()) return;
+    const int clamped = qBound(
+        -500, ms, 500); // keep in sync with StreamWorker::kMaxTrimMs + Main.qml SpinBox range
+    if (m_currentSettings.sources[sourceIndex].trimOffsetMs == clamped) return;
+    m_currentSettings.sources[sourceIndex].trimOffsetMs = clamped;
+    m_replayManager->updateSourceTrim(sourceIndex, clamped); // live (no-op if not recording)
+    m_sourceTrimVersion++;
+    emit sourceTrimChanged();
+    m_settingsManager->save(m_configPath, m_currentSettings);
+}
+
 void UIManager::updateStreamName(int index, const QString& name) {
     if (index >= 0 && index < m_currentSettings.sources.size()) {
         m_currentSettings.sources[index].name = name;
@@ -1377,6 +1402,8 @@ void UIManager::loadSettings() {
         emit midiPortNameChanged();
         emit viewSlotMapChanged();
         emit sourceEnabledChanged();
+        m_sourceTrimVersion++;
+        emit sourceTrimChanged();
     }
 }
 

@@ -36,6 +36,9 @@ public:
     // same delay so both land on the same timeline.
     static constexpr int kJitterBufferMs = 200;
 
+    // Max magnitude of the per-source timeline trim (ms). +delay / -advance.
+    static constexpr int kMaxTrimMs = 500;
+
     // Recorded audio format (48 kHz stereo S16, conformed by swresample)
     static constexpr int kAudioSampleRate = 48000;
     static constexpr int kAudioBytesPerSample = 2 * int(sizeof(int16_t));
@@ -53,6 +56,15 @@ public:
     // -1 = not assigned to any view (still captures, just doesn't encode).
     void setViewTrack(int track) { m_viewTrack.store(track, std::memory_order_relaxed); }
     int viewTrack() const { return m_viewTrack.load(std::memory_order_relaxed); }
+
+    // Per-source timeline trim in ms (+delay / -advance), clamped to ±kMaxTrimMs.
+    // Read once per pulse, so it takes effect live. NOTE: increasing the trim
+    // mid-recording briefly silences/repeats up to the trim delta while the
+    // audio FIFO accumulates the newly-needed history; a set-and-leave trim is
+    // unaffected.
+    void setTrimOffsetMs(int ms) {
+        m_trimOffsetMs.store(qBound(-kMaxTrimMs, ms, kMaxTrimMs), std::memory_order_relaxed);
+    }
 
     // Per-source metadata JSON blob written to the subtitle track each frame
     void setSourceMetadata(const QByteArray& json) {
@@ -120,6 +132,9 @@ private:
     std::atomic<int64_t> m_lastFrameEnqueueAtMs{-1};
     int m_stallTimeoutMs = 8000;
     std::atomic<bool> m_connected{false};
+    // signed ms (+delay / -advance). Relaxed: standalone value, no associated
+    // data to synchronize. Only setTrimOffsetMs() (clamped) writes it.
+    std::atomic<int> m_trimOffsetMs{0};
     int m_connectBackoffMs = 1000;
     // Atomically update m_connected and emit connectionChanged on a real
     // transition (false<->true). Called from the capture thread.
@@ -138,7 +153,7 @@ private:
     int64_t m_audioFifoStartSample = -1;  // timeline sample index of m_audioFifo[0]
     int64_t m_audioWriteCursor = -1;      // next sample to mux (tick thread only)
     void enqueueAudio(int64_t startSample, const uint8_t* data, int numSamples);
-    void writeAudioForTick(int64_t recordingTimeMs, int track);
+    void writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs);
 
     int m_targetWidth = 1920;
     int m_targetHeight = 1080;
@@ -160,7 +175,7 @@ private:
     // FFmpeg helpers
     bool setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl url, int* videoStreamIdx);
     bool setupEncoder(AVCodecContext** encCtx);
-    void processEncoderTick(AVCodecContext *encCtx, int64_t streamTimeMs);
+    void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs);
 };
 
 #endif // STREAMWORKER_H

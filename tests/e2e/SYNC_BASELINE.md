@@ -10,3 +10,4 @@ Report-only; these are diagnostics, not pass/fail thresholds.
 [sync] scenario=intercam_skew flashes_paired=6 intercam_offset_ms: mean=-267.0 stdev=0.0 (D_injected=250)
 [sync] scenario=drift_2997 flashes=58 slope=1.000220 drift_ppm=220 drift_frames_slip=0.39
 [sync] scenario=lipsync pairs=7 av_offset_ms: mean=63.3 max=71.7 (EBU_R37_band=+40/-60)
+[sync] scenario=intercam_trim untrimmed_ms=0.0 trimmed_ms=-266.0 (trim_applied=250; delay => trimmed ≈ untrimmed − 250)

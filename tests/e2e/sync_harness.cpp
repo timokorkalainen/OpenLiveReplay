@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     // Where recordings land; the driver points this at a temp dir so the test
     // is hermetic. Empty -> engine default (~/Documents/videos).
     const QString outdir = argValue(args, QStringLiteral("--outdir"), QString());
+    const int trimMs = argValue(args, QStringLiteral("--trim"), QStringLiteral("0")).toInt();
 
     if (urls.isEmpty()) {
         fprintf(stderr, "sync_harness: at least one --url is required\n");
@@ -84,6 +85,10 @@ int main(int argc, char** argv) {
         return 4;
     }
     rm.updateViewMapping(viewSlotMap);
+
+    if (trimMs != 0 && n >= 1) {
+        rm.updateSourceTrim(n - 1, trimMs);
+    }
 
     const QString outPath = rm.getVideoPath();
 

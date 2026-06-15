@@ -68,6 +68,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
         obj["name"] = source.name;
         obj["url"] = source.url;
         obj["metadata"] = source.metadata;
+        obj["trimOffsetMs"] = source.trimOffsetMs;
         sourcesArray.append(obj);
     }
     root["sources"] = sourcesArray;
@@ -166,6 +167,7 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
         source.name = obj["name"].toString();
         source.url = obj["url"].toString();
         source.metadata = obj["metadata"].toArray();
+        source.trimOffsetMs = obj["trimOffsetMs"].toInt(0);
         settings.sources.append(source);
     }
 
