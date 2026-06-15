@@ -95,8 +95,17 @@ bool TelemetryTimelineReader::load(const QString &filePath) {
         av_packet_unref(packet);
     }
 
+    const int readResult = ret;
+
     av_packet_free(&packet);
     avformat_close_input(&formatContext);
+
+    if (readResult != AVERROR_EOF) {
+        m_feedIds.clear();
+        m_events.clear();
+        m_lastError = QStringLiteral("Failed to read telemetry packet: ") + avErrorString(readResult);
+        return false;
+    }
 
     for (auto it = m_events.begin(); it != m_events.end(); ++it) {
         std::stable_sort(it.value().begin(), it.value().end(), [](const Entry &a, const Entry &b) {
