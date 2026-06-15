@@ -2,13 +2,13 @@
 #define TELEMETRYCLIENT_H
 
 #include <QObject>
-#include <QNetworkAccessManager>
 #include <QString>
 
 #include "telemetry/sseparser.h"
 #include "telemetry/telemetryevent.h"
 
 class QNetworkReply;
+class QNetworkAccessManager;
 class QUrl;
 
 class TelemetryClient : public QObject {
@@ -30,17 +30,23 @@ signals:
     void errorOccurred(const QString &message);
 
 private slots:
+    void onMetaDataChanged();
     void onReadyRead();
     void onFinished();
     void onError();
 
 private:
+    bool establishConnectionIfUsable(QNetworkReply *reply, bool allowMissingHttpStatus);
+    bool handleHttpErrorStatus(QNetworkReply *reply);
+    void establishConnected();
+    void clearReply(QNetworkReply *reply);
     void setLastError(const QString &message);
 
-    QNetworkAccessManager m_networkAccessManager;
+    QNetworkAccessManager *m_networkAccessManager = nullptr;
     QNetworkReply *m_reply = nullptr;
     SseParser m_parser;
     QString m_lastError;
+    bool m_connected = false;
 };
 
 #endif // TELEMETRYCLIENT_H
