@@ -115,3 +115,9 @@ set_tests_properties(e2e_srt_smoke PROPERTIES LABELS "srt" TIMEOUT 120 RUN_SERIA
 add_test(NAME e2e_srt_4cam
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_4cam.sh" "$<TARGET_FILE:sync_harness>" 23510)
 set_tests_properties(e2e_srt_4cam PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
+
+# Phase 2b: inter-camera sync over 4 real SRT streams (generous bound + per-view
+# flash-count content gate). Base port 23520.
+add_test(NAME e2e_srt_sync
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_sync.sh" "$<TARGET_FILE:sync_harness>" 23520)
+set_tests_properties(e2e_srt_sync PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
