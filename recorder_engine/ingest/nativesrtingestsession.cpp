@@ -1,0 +1,633 @@
+#include "nativesrtingestsession.h"
+
+#include <QDebug>
+#include <QThread>
+#include <QUrlQuery>
+
+#include <algorithm>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <mutex>
+#include <sys/socket.h>
+#include <utility>
+
+#include <srt/srt.h>
+
+namespace {
+constexpr int kSrtReceiveBufferSize = 1316;
+constexpr int kSrtLatencyMs = 500;
+constexpr int kSrtConnectTimeoutMs = 5000;
+constexpr int kPollSleepMs = 10;
+constexpr int kConnectPollSleepMs = 50;
+constexpr int kStallTimeoutMs = 8000;
+constexpr int64_t kForwardJump90k = 3000 * 90;
+constexpr int64_t kBackwardTolerance90k = -200 * 90;
+constexpr int kTsPacketSize = 188;
+constexpr int kAudioSampleRate = 48000;
+constexpr int kMaxAdtsFrameSize = 8191;
+constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
+
+std::mutex srtLibraryMutex;
+int srtLibraryRefs = 0;
+
+bool isNumericIpv4Host(const QString& host) {
+    sockaddr_in address {};
+    return inet_pton(AF_INET, host.toUtf8().constData(), &address.sin_addr) == 1;
+}
+
+bool acquireSrtLibrary(QString* error) {
+    std::lock_guard<std::mutex> lock(srtLibraryMutex);
+    if (srtLibraryRefs == 0 && srt_startup() == SRT_ERROR) {
+        if (error) {
+            *error = QStringLiteral("Native SRT startup failed: %1")
+                         .arg(QString::fromUtf8(srt_getlasterror_str()));
+        }
+        return false;
+    }
+    ++srtLibraryRefs;
+    return true;
+}
+
+void releaseSrtLibrary() {
+    std::lock_guard<std::mutex> lock(srtLibraryMutex);
+    if (srtLibraryRefs <= 0) {
+        return;
+    }
+    --srtLibraryRefs;
+    if (srtLibraryRefs == 0) {
+        srt_cleanup();
+    }
+}
+
+bool setSrtOption(SRTSOCKET socket, SRT_SOCKOPT option, const void* value, int size,
+                  QString* error, const QString& name) {
+    if (srt_setsockopt(socket, 0, option, value, size) == SRT_ERROR) {
+        if (error) {
+            *error = QStringLiteral("Native SRT %1 failed: %2")
+                         .arg(name, QString::fromUtf8(srt_getlasterror_str()));
+        }
+        return false;
+    }
+    return true;
+}
+
+bool isAsyncReceivePending() {
+    int osError = 0;
+    const int code = srt_getlasterror(&osError);
+    Q_UNUSED(osError);
+    return code == SRT_EASYNCRCV;
+}
+
+int findAlignedSyncOffset(const QByteArray& bytes) {
+    for (int i = 0; i < bytes.size(); ++i) {
+        if (bytes.at(i) != char(0x47)) {
+            continue;
+        }
+        if (i + kTsPacketSize >= bytes.size() || bytes.at(i + kTsPacketSize) == char(0x47)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+qint64 samplesTo90k(qint64 samples, int sampleRate) {
+    if (samples <= 0 || sampleRate <= 0) {
+        return 0;
+    }
+    return (samples * 90000 + sampleRate / 2) / sampleRate;
+}
+
+} // namespace
+
+NativeSrtIngestSession::NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
+                                               std::atomic<bool>* captureRunning)
+    : m_sourceIndex(sourceIndex)
+    , m_outputWidth(outputWidth)
+    , m_outputHeight(outputHeight)
+    , m_captureRunning(captureRunning) {
+    m_monotonic.start();
+}
+
+NativeSrtIngestSession::~NativeSrtIngestSession() {
+    requestStop();
+    closeSocket();
+}
+
+bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
+    if (url.scheme().toLower() != QStringLiteral("srt")) {
+        return false;
+    }
+
+    const QUrlQuery query(url);
+    const QString mode = query.queryItemValue(QStringLiteral("mode")).toLower();
+    if (!mode.isEmpty() && mode != QStringLiteral("caller")) {
+        return false;
+    }
+    if (query.hasQueryItem(QStringLiteral("passphrase"))
+        || query.hasQueryItem(QStringLiteral("pbkeylen"))) {
+        return false;
+    }
+
+    return isNumericIpv4Host(url.host());
+}
+
+bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
+    closeSocket();
+    m_url = url;
+    m_callbacks = callbacks;
+    m_stopRequested.store(false, std::memory_order_relaxed);
+    m_tsBuffer.clear();
+    m_tsParser = MpegTsParser();
+    m_activeCodec = NativeVideoCodec::Unknown;
+    m_splitter.reset();
+    m_decoder.reset();
+    m_audioDecoder.reset();
+    m_audioRemainder.clear();
+    m_firstDts90k = -1;
+    m_prevDts90k = -1;
+    m_anchorStreamTimeMs = -1;
+    m_firstAudioPts90k = -1;
+    m_prevAudioPts90k = -1;
+    m_audioAnchorStreamTimeMs = -1;
+    m_audioRemainderPts90k = -1;
+    m_lastPacketAtMs = m_monotonic.elapsed();
+    m_loggedLatmUnsupported = false;
+
+    QString error;
+    if (!openSocket(&error)) {
+        log(error);
+        return false;
+    }
+
+    if (m_callbacks.setConnected) {
+        m_callbacks.setConnected(true);
+    }
+    log(QStringLiteral("Native SRT connected."));
+    return true;
+}
+
+void NativeSrtIngestSession::run() {
+    if (m_socket == SRT_INVALID_SOCK) {
+        return;
+    }
+
+    QByteArray buffer(kSrtReceiveBufferSize, Qt::Uninitialized);
+    while (!shouldStop()) {
+        const int received = srt_recv(m_socket, buffer.data(), int(buffer.size()));
+        if (received > 0) {
+            m_lastPacketAtMs = m_monotonic.elapsed();
+            processReceivedBytes(buffer.constData(), received);
+            continue;
+        }
+
+        if (isAsyncReceivePending()) {
+            if (m_lastPacketAtMs >= 0 && m_monotonic.elapsed() - m_lastPacketAtMs > kStallTimeoutMs) {
+                log(QStringLiteral("Native SRT stalled. Restarting..."));
+                break;
+            }
+            QThread::msleep(kPollSleepMs);
+            continue;
+        }
+
+        const SRT_SOCKSTATUS state = srt_getsockstate(m_socket);
+        if (state == SRTS_BROKEN || state == SRTS_NONEXIST || state == SRTS_CLOSED) {
+            log(QStringLiteral("Native SRT disconnected."));
+        } else {
+            log(QStringLiteral("Native SRT receive failed: %1")
+                    .arg(QString::fromUtf8(srt_getlasterror_str())));
+        }
+        break;
+    }
+
+    if (m_callbacks.setConnected) {
+        m_callbacks.setConnected(false);
+    }
+}
+
+void NativeSrtIngestSession::requestStop() {
+    m_stopRequested.store(true, std::memory_order_relaxed);
+    closeSocket();
+}
+
+bool NativeSrtIngestSession::openSocket(QString* error) {
+    if (!acquireSrtLibrary(error)) {
+        return false;
+    }
+    m_srtLibraryStarted = true;
+
+    m_socket = srt_create_socket();
+    if (m_socket == SRT_INVALID_SOCK) {
+        if (error) {
+            *error = QStringLiteral("Native SRT socket creation failed: %1")
+                         .arg(QString::fromUtf8(srt_getlasterror_str()));
+        }
+        closeSocket();
+        return false;
+    }
+
+    const int no = 0;
+    const int yes = 1;
+    const int latency = kSrtLatencyMs;
+    const int connectTimeout = kSrtConnectTimeoutMs;
+    const SRT_TRANSTYPE transType = SRTT_LIVE;
+
+    if (!setSrtOption(m_socket, SRTO_SNDSYN, &no, sizeof(no), error,
+                      QStringLiteral("SRTO_SNDSYN"))
+        || !setSrtOption(m_socket, SRTO_RCVSYN, &no, sizeof(no), error,
+                         QStringLiteral("SRTO_RCVSYN"))
+        || !setSrtOption(m_socket, SRTO_TRANSTYPE, &transType, sizeof(transType), error,
+                         QStringLiteral("SRTO_TRANSTYPE"))
+        || !setSrtOption(m_socket, SRTO_LATENCY, &latency, sizeof(latency), error,
+                         QStringLiteral("SRTO_LATENCY"))
+        || !setSrtOption(m_socket, SRTO_CONNTIMEO, &connectTimeout, sizeof(connectTimeout), error,
+                         QStringLiteral("SRTO_CONNTIMEO"))
+        || !setSrtOption(m_socket, SRTO_REUSEADDR, &yes, sizeof(yes), error,
+                         QStringLiteral("SRTO_REUSEADDR"))) {
+        closeSocket();
+        return false;
+    }
+
+    const QByteArray host = m_url.host().toUtf8();
+    if (host.isEmpty()) {
+        if (error) *error = QStringLiteral("Native SRT URL is missing a host.");
+        closeSocket();
+        return false;
+    }
+
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(quint16(m_url.port(9000)));
+    if (inet_pton(AF_INET, host.constData(), &address.sin_addr) != 1) {
+        if (error) {
+            *error = QStringLiteral("Native SRT currently requires a numeric IPv4 host.");
+        }
+        closeSocket();
+        return false;
+    }
+
+    const int connectResult =
+        srt_connect(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    if (connectResult == SRT_ERROR) {
+        int osError = 0;
+        const int code = srt_getlasterror(&osError);
+        Q_UNUSED(osError);
+        if (code != SRT_EASYNCSND) {
+            if (error) {
+                *error = QStringLiteral("Native SRT connect failed: %1")
+                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+            }
+            closeSocket();
+            return false;
+        }
+    }
+
+    QElapsedTimer connectTimer;
+    connectTimer.start();
+    while (!shouldStop()) {
+        const SRT_SOCKSTATUS state = srt_getsockstate(m_socket);
+        if (state == SRTS_CONNECTED) {
+            return true;
+        }
+        if (state == SRTS_BROKEN || state == SRTS_NONEXIST || state == SRTS_CLOSED) {
+            if (error) {
+                *error = QStringLiteral("Native SRT connect failed: %1")
+                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+            }
+            closeSocket();
+            return false;
+        }
+        if (connectTimer.elapsed() > kSrtConnectTimeoutMs) {
+            if (error) *error = QStringLiteral("Native SRT connect timed out.");
+            closeSocket();
+            return false;
+        }
+        QThread::msleep(kConnectPollSleepMs);
+    }
+
+    if (error) *error = QStringLiteral("Native SRT connect cancelled.");
+    closeSocket();
+    return false;
+}
+
+void NativeSrtIngestSession::closeSocket() {
+    if (m_socket != SRT_INVALID_SOCK) {
+        srt_close(m_socket);
+        m_socket = SRT_INVALID_SOCK;
+    }
+    if (m_srtLibraryStarted) {
+        m_srtLibraryStarted = false;
+        releaseSrtLibrary();
+    }
+}
+
+bool NativeSrtIngestSession::shouldStop() const {
+    if (m_stopRequested.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    if (m_captureRunning && !m_captureRunning->load(std::memory_order_relaxed)) {
+        return true;
+    }
+    return m_callbacks.shouldStop ? m_callbacks.shouldStop() : false;
+}
+
+void NativeSrtIngestSession::log(const QString& message) const {
+    if (message.isEmpty()) {
+        return;
+    }
+    if (m_callbacks.logInfo) {
+        m_callbacks.logInfo(message);
+    } else {
+        qDebug() << "Source" << m_sourceIndex << message;
+    }
+}
+
+void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
+    if (!data || size <= 0) {
+        return;
+    }
+
+    m_tsBuffer.append(data, size);
+    while (m_tsBuffer.size() >= kTsPacketSize) {
+        if (m_tsBuffer.at(0) != char(0x47)) {
+            const int syncOffset = findAlignedSyncOffset(m_tsBuffer);
+            if (syncOffset < 0) {
+                const int bytesToDrop =
+                    std::max(1, int(m_tsBuffer.size()) - (kTsPacketSize - 1));
+                m_tsBuffer.remove(0, bytesToDrop);
+                return;
+            }
+            m_tsBuffer.remove(0, syncOffset);
+            if (m_tsBuffer.size() < kTsPacketSize) {
+                return;
+            }
+        }
+
+        const QByteArray packet = m_tsBuffer.left(kTsPacketSize);
+
+        QList<PesPacket> completedPes;
+        if (!m_tsParser.pushTsPacket(packet, &completedPes)) {
+            m_tsBuffer.remove(0, 1);
+            continue;
+        }
+        m_tsBuffer.remove(0, kTsPacketSize);
+        for (const PesPacket& pes : std::as_const(completedPes)) {
+            processPesPacket(pes);
+        }
+    }
+}
+
+void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
+    if (pes.kind == NativeElementaryStreamKind::AudioAacLatm) {
+        if (!m_loggedLatmUnsupported) {
+            log(QStringLiteral("Native SRT LATM/LOAS AAC is unsupported; continuing video."));
+            m_loggedLatmUnsupported = true;
+        }
+        m_audioRemainder.clear();
+        m_audioRemainderPts90k = -1;
+        return;
+    }
+
+    if (pes.kind == NativeElementaryStreamKind::AudioAac) {
+        processAudioPesPacket(pes);
+        return;
+    }
+
+    if (pes.kind != NativeElementaryStreamKind::Video
+        || pes.videoCodec == NativeVideoCodec::Unknown) {
+        return;
+    }
+
+    if (!m_splitter || m_activeCodec != pes.videoCodec) {
+        m_activeCodec = pes.videoCodec;
+        m_splitter = std::make_unique<H26xAccessUnitSplitter>(pes.videoCodec);
+        m_decoder.reset();
+        m_firstDts90k = -1;
+        m_prevDts90k = -1;
+        m_anchorStreamTimeMs = -1;
+    }
+
+    const QList<CompressedAccessUnit> units =
+        m_splitter->pushPesPayload(pes.payload, pes.pts90k, pes.dts90k);
+    if (units.isEmpty()) {
+        return;
+    }
+
+    if (!m_decoder) {
+        m_decoder = std::make_unique<VideoToolboxDecoder>(m_outputWidth, m_outputHeight);
+    }
+
+    for (const CompressedAccessUnit& unit : units) {
+        const int64_t sourcePtsMs = sourcePtsMsForUnit(unit);
+        if (sourcePtsMs < 0) {
+            continue;
+        }
+
+        QString error;
+        const bool decoded = m_decoder->decode(
+            unit,
+            [this, sourcePtsMs](AVFrame* frame) {
+                if (!frame) {
+                    return;
+                }
+                if (!m_callbacks.onVideoFrame) {
+                    av_frame_free(&frame);
+                    return;
+                }
+
+                DecodedVideoFrame decodedFrame;
+                decodedFrame.frame = frame;
+                decodedFrame.sourcePtsMs = sourcePtsMs;
+                m_callbacks.onVideoFrame(decodedFrame);
+            },
+            &error);
+        if (!decoded && !error.isEmpty()) {
+            log(error);
+        }
+    }
+}
+
+void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
+    if (!m_callbacks.onAudioChunk || pes.pts90k < 0 || pes.payload.isEmpty()) {
+        return;
+    }
+
+    if (!m_audioDecoder) {
+        m_audioDecoder = std::make_unique<AudioToolboxAacDecoder>();
+    }
+
+    if (!m_audioRemainder.isEmpty()) {
+        const bool currentPesStartsFrame =
+            AudioToolboxAacDecoder::hasAdtsSync(pes.payload, 0)
+            || AudioToolboxAacDecoder::hasLatmLoasSync(pes.payload, 0);
+        const qint64 delta90k = pes.pts90k - m_audioRemainderPts90k;
+        if (currentPesStartsFrame || m_audioRemainderPts90k < 0
+            || delta90k > kAudioRemainderPtsTolerance90k
+            || delta90k < -kAudioRemainderPtsTolerance90k) {
+            m_audioRemainder.clear();
+            m_audioRemainderPts90k = -1;
+        }
+    }
+
+    const int remainderSize = m_audioRemainder.size();
+    qint64 basePts90k = pes.pts90k;
+    if (remainderSize > 0 && m_audioRemainderPts90k >= 0) {
+        basePts90k = m_audioRemainderPts90k;
+    } else {
+        m_audioRemainder.clear();
+    }
+
+    QByteArray bytes = m_audioRemainder;
+    bytes.append(pes.payload);
+    m_audioRemainder.clear();
+    m_audioRemainderPts90k = -1;
+
+    int offset = 0;
+    qint64 consumedSamples = 0;
+    int consumedSampleRate = 0;
+    while (offset < bytes.size()) {
+        AacAdtsFrameInfo info;
+        if (!AudioToolboxAacDecoder::parseAdtsFrame(bytes, offset, &info)) {
+            if (AudioToolboxAacDecoder::hasLatmLoasSync(bytes, offset)) {
+                if (!m_loggedLatmUnsupported) {
+                    log(QStringLiteral("Native SRT LATM/LOAS AAC is unsupported; continuing video."));
+                    m_loggedLatmUnsupported = true;
+                }
+                m_audioRemainder.clear();
+                return;
+            }
+
+            int nextOffset = -1;
+            for (int i = offset + 1; i < bytes.size(); ++i) {
+                if (AudioToolboxAacDecoder::parseAdtsFrame(bytes, i, nullptr)
+                    || AudioToolboxAacDecoder::hasLatmLoasSync(bytes, i)) {
+                    nextOffset = i;
+                    break;
+                }
+            }
+
+            if (nextOffset < 0) {
+                m_audioRemainder = bytes.mid(offset);
+                if (m_audioRemainder.size() > kMaxAdtsFrameSize) {
+                    m_audioRemainder = m_audioRemainder.right(kMaxAdtsFrameSize);
+                    basePts90k = pes.pts90k;
+                    consumedSamples = 0;
+                    consumedSampleRate = 0;
+                }
+                m_audioRemainderPts90k =
+                    basePts90k + samplesTo90k(consumedSamples, consumedSampleRate);
+                return;
+            }
+            if (nextOffset >= remainderSize) {
+                basePts90k = pes.pts90k;
+                consumedSamples = 0;
+                consumedSampleRate = 0;
+            }
+            offset = nextOffset;
+            continue;
+        }
+
+        if (consumedSampleRate == 0) {
+            consumedSampleRate = info.sampleRate;
+        } else if (info.sampleRate != consumedSampleRate) {
+            basePts90k += samplesTo90k(consumedSamples, consumedSampleRate);
+            consumedSamples = 0;
+            consumedSampleRate = info.sampleRate;
+            if (m_audioDecoder) {
+                m_audioDecoder->reset();
+            }
+        }
+
+        const qint64 framePts90k = basePts90k + samplesTo90k(consumedSamples, consumedSampleRate);
+        const int64_t sourcePtsMs = sourcePtsMsForAudio(framePts90k);
+        if (sourcePtsMs >= 0) {
+            const QByteArray frame = bytes.mid(offset, info.frameSize);
+            QByteArray pcm;
+            QString error;
+            if (m_audioDecoder->decodeAdtsFrame(frame, info, &pcm, &error)) {
+                if (!pcm.isEmpty()) {
+                    DecodedAudioChunk chunk;
+                    chunk.startSample = sourcePtsMs * kAudioSampleRate / 1000;
+                    chunk.pcmS16Stereo = std::move(pcm);
+                    m_callbacks.onAudioChunk(std::move(chunk));
+                }
+            } else if (!error.isEmpty()) {
+                log(error);
+            }
+        }
+
+        consumedSamples += info.samplesPerFrame;
+        offset += info.frameSize;
+    }
+}
+
+int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& unit) {
+    const int64_t unitDts90k = unit.dts90k >= 0 ? unit.dts90k : unit.pts90k;
+    const int64_t unitPts90k = unit.pts90k >= 0 ? unit.pts90k : unitDts90k;
+    if (unitDts90k < 0 || unitPts90k < 0) {
+        return -1;
+    }
+
+    bool needAnchor = m_firstDts90k < 0;
+    if (!needAnchor && m_prevDts90k >= 0) {
+        const int64_t delta90k = unitDts90k - m_prevDts90k;
+        if (delta90k > kForwardJump90k || delta90k < kBackwardTolerance90k) {
+            log(QStringLiteral("Native SRT DTS discontinuity (%1 ms jump). Re-anchoring.")
+                    .arg(delta90k / 90));
+            needAnchor = true;
+        }
+    }
+
+    if (needAnchor) {
+        m_firstDts90k = unitDts90k;
+        m_anchorStreamTimeMs =
+            m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    }
+    m_prevDts90k = unitDts90k;
+
+    if (m_anchorStreamTimeMs < 0) {
+        return -1;
+    }
+    return m_anchorStreamTimeMs + ((unitPts90k - m_firstDts90k) / 90);
+}
+
+int64_t NativeSrtIngestSession::sourcePtsMsForAudio(qint64 pts90k) {
+    if (pts90k < 0) {
+        return -1;
+    }
+
+    bool needAnchor = m_firstAudioPts90k < 0;
+    if (!needAnchor && m_prevAudioPts90k >= 0) {
+        const int64_t delta90k = pts90k - m_prevAudioPts90k;
+        if (delta90k > kForwardJump90k || delta90k < kBackwardTolerance90k) {
+            log(QStringLiteral("Native SRT audio PTS discontinuity (%1 ms jump). Re-anchoring.")
+                    .arg(delta90k / 90));
+            needAnchor = true;
+            if (m_audioDecoder) {
+                m_audioDecoder->reset();
+            }
+        }
+    }
+
+    const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    if (needAnchor) {
+        m_firstAudioPts90k = pts90k;
+        m_audioAnchorStreamTimeMs = nowMs;
+    }
+    m_prevAudioPts90k = pts90k;
+
+    if (m_audioAnchorStreamTimeMs < 0) {
+        return -1;
+    }
+
+    int64_t sourcePtsMs = m_audioAnchorStreamTimeMs + ((pts90k - m_firstAudioPts90k) / 90);
+    if (nowMs >= 0 && sourcePtsMs > nowMs + 10000) {
+        log(QStringLiteral("Native SRT audio sample %1 ms far ahead of clock %2 ms. Re-anchoring.")
+                .arg(sourcePtsMs)
+                .arg(nowMs));
+        m_firstAudioPts90k = pts90k;
+        m_prevAudioPts90k = pts90k;
+        m_audioAnchorStreamTimeMs = nowMs;
+        sourcePtsMs = nowMs;
+    }
+    return sourcePtsMs;
+}

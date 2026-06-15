@@ -38,6 +38,9 @@ endif()
 # --- Engine sources that need NO FFmpeg (pure Qt Core) ----------------------
 qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/recordingclock.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xaccessunit.cpp"
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectsettingsimporter.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectimportclient.cpp"
@@ -51,8 +54,18 @@ target_link_libraries(olr_test_core
     PUBLIC Qt6::Core Qt6::Network
     PRIVATE olr_warnings olr_sanitize)
 
+if(APPLE)
+    target_sources(olr_test_core PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/audiotoolboxaacdecoder.mm")
+    target_link_libraries(olr_test_core PRIVATE "-framework AudioToolbox")
+else()
+    target_sources(olr_test_core PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/audiotoolboxaacdecoder_stub.cpp")
+endif()
+
 # --- Engine sources that DO need FFmpeg (muxer / capture / recording) -------
 qt_add_library(olr_test_engine STATIC
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ffmpegingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/muxer.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/streamworker.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/replaymanager.cpp"
@@ -66,6 +79,21 @@ target_link_libraries(olr_test_engine
     PUBLIC olr_test_core Qt6::Core Qt6::Concurrent
            avformat avcodec avutil swscale swresample
     PRIVATE olr_warnings olr_sanitize)
+
+if(APPLE)
+    target_sources(olr_test_engine PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtingestsession.cpp"
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/videotoolboxdecoder.mm")
+    target_compile_definitions(olr_test_engine PUBLIC OLR_NATIVE_SRT_AVAILABLE=1)
+    target_include_directories(olr_test_engine PUBLIC "${OLR_BREW_PREFIX}/opt/srt/include")
+    target_link_directories(olr_test_engine PUBLIC "${OLR_BREW_PREFIX}/opt/srt/lib")
+    target_link_libraries(olr_test_engine
+        PRIVATE srt "-framework VideoToolbox" "-framework CoreMedia"
+                "-framework CoreFoundation" "-framework CoreVideo")
+else()
+    target_sources(olr_test_engine PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/videotoolboxdecoder_stub.cpp")
+endif()
 
 # --- Playback sources (need Qt Multimedia for QVideoFrame; ffmpeg for the
 #     worker, which #includes <libavformat/...> and demuxes the fixture). -----
@@ -87,5 +115,6 @@ target_link_libraries(olr_test_playback
     PRIVATE olr_warnings olr_sanitize)
 
 add_subdirectory(unit)
+target_link_libraries(tst_ingestbackendselector PRIVATE olr_test_engine)
 add_subdirectory(smoke)
 add_subdirectory(e2e)

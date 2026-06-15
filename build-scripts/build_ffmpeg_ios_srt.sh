@@ -4,22 +4,83 @@ set -e
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-FFMPEG_VERSION="8.0"
+FFMPEG_VERSION="8.1.1"
 SRT_VERSION="1.5.5-rc.0"
-OPENSSL_VERSION="3.2.0"
 
 # Directories (anchor to repository root, not current working dir)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILD_CONFIG_STAMP="$ROOT_DIR/ios_build/xcframeworks/.ffmpeg-8.1.1-securetransport-no-hevc-no-avfilter.stamp"
+BUILD_CONFIG_ID="ffmpeg-8.1.1-securetransport-no-hevc-no-avfilter"
+EXPECTED_ARCHIVES=(
+    "$ROOT_DIR/ios_build/xcframeworks/libavcodec.xcframework/ios-arm64/libavcodec.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libavcodec.xcframework/ios-arm64-simulator/libavcodec.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libavformat.xcframework/ios-arm64/libavformat.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libavformat.xcframework/ios-arm64-simulator/libavformat.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libavutil.xcframework/ios-arm64/libavutil.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libavutil.xcframework/ios-arm64-simulator/libavutil.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libswscale.xcframework/ios-arm64/libswscale.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libswscale.xcframework/ios-arm64-simulator/libswscale.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libswresample.xcframework/ios-arm64/libswresample.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libswresample.xcframework/ios-arm64-simulator/libswresample.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libsrt.xcframework/ios-arm64/libsrt.a"
+    "$ROOT_DIR/ios_build/xcframeworks/libsrt.xcframework/ios-arm64-simulator/libsrt.a"
+)
+
+remove_stale_crypto_xcframeworks() {
+    for artifact in \
+        "$ROOT_DIR/ios_build/xcframeworks/libmbedtls.xcframework" \
+        "$ROOT_DIR/ios_build/xcframeworks/libmbedx509.xcframework" \
+        "$ROOT_DIR/ios_build/xcframeworks/libmbedcrypto.xcframework" \
+        "$ROOT_DIR/ios_build/xcframeworks/libssl.xcframework" \
+        "$ROOT_DIR/ios_build/xcframeworks/libcrypto.xcframework" \
+        "$ROOT_DIR/ios_build/dist/iphoneos-arm64/mbedtls" \
+        "$ROOT_DIR/ios_build/dist/iphonesimulator-arm64/mbedtls" \
+        "$ROOT_DIR/ios_build/dist/iphoneos-arm64/openssl" \
+        "$ROOT_DIR/ios_build/dist/iphonesimulator-arm64/openssl"; do
+        if [ -e "$artifact" ]; then
+            echo "[FFmpeg] Removing stale crypto artifact: $artifact"
+            rm -rf "$artifact"
+        fi
+    done
+}
+
+libsrt_has_forbidden_crypto_symbols() {
+    local srt_lib="$1"
+
+    if [ ! -f "$srt_lib" ] || ! command -v nm >/dev/null 2>&1; then
+        return 1
+    fi
+
+    nm -u "$srt_lib" 2>/dev/null | grep -E '_mbedtls_|_SSL_|_OPENSSL_|_CRYPTO_|_EVP_|_RAND_' >/dev/null
+}
+
+all_expected_archives_exist() {
+    local archive
+
+    for archive in "${EXPECTED_ARCHIVES[@]}"; do
+        if [ ! -f "$archive" ]; then
+            return 1
+        fi
+    done
+}
+
+remove_stale_crypto_xcframeworks
 
 # Skip the ~20 minute rebuild when the artifacts already exist — matches the
 # CMake custom command's only-when-missing semantics, and lets prebuilt
 # xcframeworks be staged into ios_build/xcframeworks/ (e.g. from another
 # checkout) without triggering a full rebuild.
-if [ -d "$ROOT_DIR/ios_build/xcframeworks/libavcodec.xcframework" ] && \
-   [ -d "$ROOT_DIR/ios_build/xcframeworks/libsrt.xcframework" ]; then
-    echo "[FFmpeg] Prebuilt xcframeworks already present; skipping rebuild."
-    exit 0
+if [ -f "$BUILD_CONFIG_STAMP" ] && grep -Fxq "$BUILD_CONFIG_ID" "$BUILD_CONFIG_STAMP" && all_expected_archives_exist; then
+    if libsrt_has_forbidden_crypto_symbols "$ROOT_DIR/ios_build/xcframeworks/libsrt.xcframework/ios-arm64/libsrt.a" || \
+       libsrt_has_forbidden_crypto_symbols "$ROOT_DIR/ios_build/xcframeworks/libsrt.xcframework/ios-arm64-simulator/libsrt.a"; then
+        echo "[FFmpeg] Cached libsrt references OpenSSL/mbedTLS symbols; rebuilding."
+        rm -f "$BUILD_CONFIG_STAMP"
+    else
+        echo "[FFmpeg] Prebuilt xcframeworks already present; skipping rebuild."
+        touch "$BUILD_CONFIG_STAMP"
+        exit 0
+    fi
 fi
 
 WORK_DIR="$ROOT_DIR/ios_build"
@@ -29,7 +90,6 @@ mkdir -p "$SRC_DIR" "$DIST_DIR"
 
 # iOS SDK setup
 IOS_MIN_VERSION="13.0"
-XCODE_PATH=$(xcode-select -p)
 
 # CMake (Xcode build environment may not have PATH)
 if [ -z "${CMAKE_BIN}" ]; then
@@ -61,7 +121,7 @@ if [ -z "${PKG_CONFIG_BIN}" ]; then
     fi
 fi
 
-echo "Starting Build: FFmpeg + SRT + OpenSSL for iOS"
+echo "Starting Build: FFmpeg + SRT for iOS"
 
 # ==============================================================================
 # 1. DOWNLOAD SOURCES
@@ -69,12 +129,6 @@ echo "Starting Build: FFmpeg + SRT + OpenSSL for iOS"
 download_src() {
     echo "Downloading sources..."
     cd "$SRC_DIR"
-    
-    if [ ! -d "openssl-$OPENSSL_VERSION" ]; then
-        echo "Downloading OpenSSL..."
-        curl -L -O "https://www.openssl.org/source/openssl-$OPENSSL_VERSION.tar.gz"
-        tar xf "openssl-$OPENSSL_VERSION.tar.gz"
-    fi
 
     if [ ! -d "srt-$SRT_VERSION" ]; then
         echo "Downloading SRT..."
@@ -90,63 +144,7 @@ download_src() {
 }
 
 # ==============================================================================
-# 2. BUILD OPENSSL
-# ==============================================================================
-build_openssl() {
-    ARCH=$1
-    PLATFORM=$2
-    echo "----------------------------------------------------------------"
-    echo "Building OpenSSL for $ARCH ($PLATFORM)..."
-    echo "----------------------------------------------------------------"
-
-    cd "$SRC_DIR/openssl-$OPENSSL_VERSION"
-
-    # CRITICAL: Clean thoroughly between builds
-    make distclean || true
-    rm -rf Makefile config.status
-    # OpenSSL 3.2.0 ships with include/openssl/opensslconf.h in the tarball.
-    # Don't remove it (Configure won't regenerate it).
-    if [ ! -f include/openssl/opensslconf.h ]; then
-        echo "Re-extracting opensslconf.h from tarball..."
-        tar --strip-components=1 -xf "$SRC_DIR/openssl-$OPENSSL_VERSION.tar.gz" \
-            "openssl-$OPENSSL_VERSION/include/openssl/opensslconf.h"
-    fi
-
-    SDK_PATH=$(xcrun --sdk $PLATFORM --show-sdk-path)
-    
-    # Platform-specific configuration
-    if [ "$PLATFORM" == "iphonesimulator" ]; then
-        # For Simulator (especially arm64), we MUST force the target via CC
-        # to prevent OpenSSL from confusing host-arm64 with simulator-arm64
-        TARGET="iossimulator-xcrun"
-        export CC="$(xcrun -find -sdk $PLATFORM clang) -target $ARCH-apple-ios$IOS_MIN_VERSION-simulator"
-        export CFLAGS="-isysroot $SDK_PATH -Wno-unused-command-line-argument"
-    else
-        # For Device, standard configuration works best
-        TARGET="ios64-xcrun"
-        export CC="$(xcrun -find -sdk $PLATFORM clang) -target $ARCH-apple-ios$IOS_MIN_VERSION"
-        export CFLAGS="-isysroot $SDK_PATH -Wno-unused-command-line-argument"
-    fi
-
-    export CROSS_TOP="$XCODE_PATH/Platforms/$PLATFORM.platform/Developer"
-    export CROSS_SDK="$PLATFORM.sdk"
-
-    echo "Configuring OpenSSL..."
-    # no-async: Disable async to prevent build errors on iOS
-    ./Configure $TARGET no-shared no-tests no-async \
-        --prefix="$DIST_DIR/$PLATFORM-$ARCH/openssl" \
-        --openssldir="$DIST_DIR/$PLATFORM-$ARCH/openssl" \
-        "$CFLAGS"
-
-    echo "Compiling OpenSSL..."
-    make -j$(sysctl -n hw.ncpu)
-    make install_sw
-    
-    unset CC CFLAGS CROSS_TOP CROSS_SDK
-}
-
-# ==============================================================================
-# 3. BUILD SRT
+# 2. BUILD SRT
 # ==============================================================================
 build_srt() {
     ARCH=$1
@@ -161,7 +159,6 @@ build_srt() {
     cd "build-$PLATFORM-$ARCH"
 
     SDK_PATH=$(xcrun --sdk $PLATFORM --show-sdk-path)
-    OPENSSL_ROOT="$DIST_DIR/$PLATFORM-$ARCH/openssl"
 
     # Set target flags explicitly for CMake
     if [ "$PLATFORM" == "iphonesimulator" ]; then
@@ -181,13 +178,8 @@ build_srt() {
         -DENABLE_SHARED=OFF \
         -DENABLE_STATIC=ON \
         -DENABLE_APPS=OFF \
+        -DENABLE_ENCRYPTION=OFF \
         -DENABLE_C_DEPS=ON \
-        -DUSE_OPENSSL_PC=OFF \
-        -DOPENSSL_USE_STATIC_LIBS=ON \
-        -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" \
-        -DOPENSSL_INCLUDE_DIR="$OPENSSL_ROOT/include" \
-        -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_ROOT/lib/libcrypto.a" \
-        -DOPENSSL_SSL_LIBRARY="$OPENSSL_ROOT/lib/libssl.a" \
         -DCMAKE_INSTALL_PREFIX="$DIST_DIR/$PLATFORM-$ARCH/srt"
 
     echo "Compiling SRT..."
@@ -196,7 +188,7 @@ build_srt() {
 }
 
 # ==============================================================================
-# 4. BUILD FFMPEG
+# 3. BUILD FFMPEG
 # ==============================================================================
 build_ffmpeg() {
     ARCH=$1
@@ -212,15 +204,14 @@ build_ffmpeg() {
 
     SDK_PATH=$(xcrun --sdk $PLATFORM --show-sdk-path)
     SRT_ROOT="$DIST_DIR/$PLATFORM-$ARCH/srt"
-    OPENSSL_ROOT="$DIST_DIR/$PLATFORM-$ARCH/openssl"
 
     # 1. PKG_CONFIG setup
     export PKG_CONFIG="$PKG_CONFIG_BIN"
-    export PKG_CONFIG_PATH="$SRT_ROOT/lib/pkgconfig:$OPENSSL_ROOT/lib/pkgconfig"
+    export PKG_CONFIG_PATH="$SRT_ROOT/lib/pkgconfig"
     export PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
     export PATH="$(dirname "$PKG_CONFIG_BIN"):$PATH"
 
-    # Verify pkg-config can see SRT and OpenSSL
+    # Verify pkg-config can see SRT
     if ! "$PKG_CONFIG_BIN" --modversion srt >/dev/null 2>&1; then
         echo "Error: pkg-config cannot find srt.pc for $PLATFORM-$ARCH." >&2
         echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH" >&2
@@ -228,12 +219,11 @@ build_ffmpeg() {
         exit 1
     fi
 
-    # 2. Patch srt.pc for static linking
-    # We must append standard C++ libs because SRT is static
+    # 2. Patch srt.pc for static linking. SRT is static C++ code.
     PC_FILE="$SRT_ROOT/lib/pkgconfig/srt.pc"
     if [ -f "$PC_FILE" ]; then
         echo "Patching srt.pc for static linking..."
-        sed -i.bak 's/Libs.private:/Libs.private: -lc++ -lssl -lcrypto/g' "$PC_FILE"
+        sed -i.bak 's/Libs.private:/Libs.private: -lc++/g' "$PC_FILE"
     fi
 
     # 3. Setup flags
@@ -243,8 +233,8 @@ build_ffmpeg() {
         TARGET_FLAGS="-target $ARCH-apple-ios$IOS_MIN_VERSION"
     fi
 
-    CFLAGS="$TARGET_FLAGS -isysroot $SDK_PATH -I$SRT_ROOT/include -I$OPENSSL_ROOT/include"
-    LDFLAGS="$TARGET_FLAGS -isysroot $SDK_PATH -L$SRT_ROOT/lib -L$OPENSSL_ROOT/lib"
+    CFLAGS="$TARGET_FLAGS -isysroot $SDK_PATH -I$SRT_ROOT/include"
+    LDFLAGS="$TARGET_FLAGS -isysroot $SDK_PATH -L$SRT_ROOT/lib"
 
     echo "Configuring FFmpeg..."
     ./configure \
@@ -257,21 +247,60 @@ build_ffmpeg() {
         --extra-cflags="$CFLAGS" \
         --extra-ldflags="$LDFLAGS" \
         --extra-libs="-lc++" \
-        --enable-gpl \
-        --enable-version3 \
-        --enable-nonfree \
-        --disable-static \
-        --enable-shared \
+        --enable-static \
+        --disable-shared \
+        --disable-gpl \
+        --disable-nonfree \
+        --disable-autodetect \
+        --disable-everything \
         --disable-doc \
         --disable-programs \
         --disable-avdevice \
-        --disable-indevs \
-        --disable-outdevs \
-        --disable-filter=scale_vt \
+        --disable-avfilter \
+        --enable-avcodec \
+        --enable-avformat \
+        --enable-avutil \
+        --enable-swscale \
+        --enable-swresample \
+        --enable-network \
         --enable-videotoolbox \
+        --enable-audiotoolbox \
+        --enable-securetransport \
         --enable-libsrt \
-        --enable-openssl \
+        --enable-protocol=file \
         --enable-protocol=libsrt \
+        --enable-protocol=tcp \
+        --enable-protocol=rtmp \
+        --enable-protocol=tls \
+        --enable-protocol=rtmps \
+        --enable-demuxer=mpegts \
+        --enable-demuxer=matroska \
+        --enable-demuxer=flv \
+        --enable-demuxer=live_flv \
+        --enable-muxer=matroska \
+        --enable-parser=h264 \
+        --enable-parser=av1 \
+        --enable-parser=vp9 \
+        --enable-parser=prores \
+        --enable-parser=mpegvideo \
+        --enable-parser=aac \
+        --enable-decoder=h264 \
+        --enable-decoder=av1 \
+        --enable-decoder=vp9 \
+        --enable-decoder=prores \
+        --enable-decoder=mpeg2video \
+        --enable-decoder=aac \
+        --enable-decoder=aac_at \
+        --enable-decoder=pcm_s16le \
+        --enable-encoder=mpeg2video \
+        --enable-encoder=pcm_s16le \
+        --enable-encoder=h264_videotoolbox \
+        --enable-encoder=prores_videotoolbox \
+        --enable-hwaccel=h264_videotoolbox \
+        --enable-hwaccel=av1_videotoolbox \
+        --enable-hwaccel=vp9_videotoolbox \
+        --enable-hwaccel=prores_videotoolbox \
+        --enable-hwaccel=mpeg2_videotoolbox \
         --pkg-config="$PKG_CONFIG_BIN" \
         --pkg-config-flags="--static"
 
@@ -279,54 +308,20 @@ build_ffmpeg() {
     make -j$(sysctl -n hw.ncpu)
     make install
 
-    # 4. Fix install names for iOS runtime (avoid absolute build paths)
-    LIBDIR="$DIST_DIR/$PLATFORM-$ARCH/ffmpeg/lib"
-    LIBS=("libavcodec" "libavformat" "libavutil" "libswscale" "libswresample" "libavfilter")
-
-    resolve_realpath() {
-        python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$1"
-    }
-
-    echo "Fixing install names in $LIBDIR..."
-    # Step 1: Fix the -id of each dylib
-    for lib in "${LIBS[@]}"; do
-        real_lib="$(resolve_realpath "$LIBDIR/$lib.dylib")"
-        if [ -f "$real_lib" ]; then
-            install_name_tool -id "@rpath/$lib.dylib" "$real_lib"
-        fi
-    done
-
-    # Step 2: Fix inter-library dependencies
-    # The dependencies use versioned names like libavutil.60.dylib with the full install prefix
-    for lib in "${LIBS[@]}"; do
-        real_lib="$(resolve_realpath "$LIBDIR/$lib.dylib")"
-        if [ -f "$real_lib" ]; then
-            # Find all dependencies pointing to our build dir and fix them
-            otool -L "$real_lib" | grep "$LIBDIR" | awk '{print $1}' | while read -r old_dep; do
-                # Extract base lib name: /path/to/libavutil.60.dylib -> libavutil
-                dep_basename="$(basename "$old_dep")"
-                dep_name="$(echo "$dep_basename" | sed 's/\.[0-9]*\.dylib/.dylib/')"
-                install_name_tool -change "$old_dep" "@rpath/$dep_name" "$real_lib" 2>/dev/null || true
-            done
-        fi
-    done
-    
-    unset PKG_CONFIG_PATH
+    unset PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG
 }
 
 # ==============================================================================
-# 5. EXECUTION & PACKAGING
+# 4. EXECUTION & PACKAGING
 # ==============================================================================
 
 download_src
 
 # --- Build for Device (arm64) ---
-build_openssl "arm64" "iphoneos"
 build_srt     "arm64" "iphoneos"
 build_ffmpeg  "arm64" "iphoneos"
 
 # --- Build for Simulator (arm64) ---
-build_openssl "arm64" "iphonesimulator"
 build_srt     "arm64" "iphonesimulator"
 build_ffmpeg  "arm64" "iphonesimulator"
 
@@ -339,43 +334,37 @@ create_xcframework() {
     echo "Creating $LIB_NAME.xcframework..."
     rm -rf "$WORK_DIR/xcframeworks/$LIB_NAME.xcframework"
 
-    LIB_DEV="$DIST_DIR/iphoneos-arm64/ffmpeg/lib/$LIB_NAME.dylib"
-    LIB_SIM="$DIST_DIR/iphonesimulator-arm64/ffmpeg/lib/$LIB_NAME.dylib"
-    LIB_DEV_REAL="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$LIB_DEV")"
-    LIB_SIM_REAL="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$LIB_SIM")"
-
     xcodebuild -create-xcframework \
-        -library "$LIB_DEV_REAL" \
+        -library "$DIST_DIR/iphoneos-arm64/ffmpeg/lib/$LIB_NAME.a" \
         -headers "$DIST_DIR/iphoneos-arm64/ffmpeg/include" \
-        -library "$LIB_SIM_REAL" \
+        -library "$DIST_DIR/iphonesimulator-arm64/ffmpeg/lib/$LIB_NAME.a" \
         -headers "$DIST_DIR/iphonesimulator-arm64/ffmpeg/include" \
         -output "$WORK_DIR/xcframeworks/$LIB_NAME.xcframework"
+}
 
-    # Ensure a stable lib name exists for linkers expecting lib<name>.dylib
-    DEV_SLICE="$WORK_DIR/xcframeworks/$LIB_NAME.xcframework/ios-arm64"
-    SIM_SLICE="$WORK_DIR/xcframeworks/$LIB_NAME.xcframework/ios-arm64-simulator"
-    DEV_BASENAME="$(basename "$LIB_DEV_REAL")"
-    SIM_BASENAME="$(basename "$LIB_SIM_REAL")"
-    if [ -d "$DEV_SLICE" ]; then
-        ln -sf "$DEV_BASENAME" "$DEV_SLICE/$LIB_NAME.dylib"
-    fi
-    if [ -d "$SIM_SLICE" ]; then
-        ln -sf "$SIM_BASENAME" "$SIM_SLICE/$LIB_NAME.dylib"
-    fi
+create_dependency_xcframework() {
+    LIB_NAME=$1
+    DEP_NAME=$2
+    echo "Creating $LIB_NAME.xcframework..."
+    rm -rf "$WORK_DIR/xcframeworks/$LIB_NAME.xcframework"
+
+    xcodebuild -create-xcframework \
+        -library "$DIST_DIR/iphoneos-arm64/$DEP_NAME/lib/$LIB_NAME.a" \
+        -headers "$DIST_DIR/iphoneos-arm64/$DEP_NAME/include" \
+        -library "$DIST_DIR/iphonesimulator-arm64/$DEP_NAME/lib/$LIB_NAME.a" \
+        -headers "$DIST_DIR/iphonesimulator-arm64/$DEP_NAME/include" \
+        -output "$WORK_DIR/xcframeworks/$LIB_NAME.xcframework"
 }
 
 # Create FFmpeg frameworks
-LIBS=("libavcodec" "libavfilter" "libavformat" "libavutil" "libswresample" "libswscale")
+LIBS=("libavcodec" "libavformat" "libavutil" "libswresample" "libswscale")
 for LIB in "${LIBS[@]}"; do
     create_xcframework $LIB
 done
 
-# Create SRT framework (Static)
-echo "Creating libsrt.xcframework..."
-rm -rf "$WORK_DIR/xcframeworks/libsrt.xcframework"
-xcodebuild -create-xcframework \
-    -library "$DIST_DIR/iphoneos-arm64/srt/lib/libsrt.a" \
-    -library "$DIST_DIR/iphonesimulator-arm64/srt/lib/libsrt.a" \
-    -output "$WORK_DIR/xcframeworks/libsrt.xcframework"
+# Create dependency frameworks
+create_dependency_xcframework "libsrt" "srt"
+
+printf '%s\n' "$BUILD_CONFIG_ID" > "$BUILD_CONFIG_STAMP"
 
 echo "DONE! XCFrameworks are in: $WORK_DIR/xcframeworks"

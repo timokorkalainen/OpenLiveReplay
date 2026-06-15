@@ -67,6 +67,30 @@ The gate thresholds are validated against real local runs; if one proves flaky,
 widen the bound (never delete the gate) — the content gates (per-view flash count,
 connection count) carry the discrimination.
 
+## Native Apple SRT path
+
+The Apple native ingest path can be tested on macOS without an SRT-enabled
+FFmpeg build. It uses the same SRT producers, but runs the engine with
+`OLR_NATIVE_SRT=1`, so `srt://` input goes through:
+
+```text
+libsrt -> MPEG-TS parser -> H.264/H.265 access-unit splitter -> VideoToolbox
+```
+
+Configure against the normal Homebrew FFmpeg (no `OLR_FFMPEG_SRT_PREFIX`) and run
+the `native-apple-ingest` label:
+
+```bash
+cmake -S . -B build/native-srt -G Ninja -DOLR_BUILD_TESTS=ON \
+  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.10.1/macos"
+ninja -C build/native-srt record_harness sync_harness
+( cd build/native-srt && ctest -L native-apple-ingest --output-on-failure )
+```
+
+This intentionally proves the native SRT path is carrying the stream: the default
+Homebrew FFmpeg used by the harness does not provide `srt://`, so a fallback to
+FFmpeg records blue-fill/silence and fails the content checks.
+
 ## Next (Phase 2c)
 
 Disconnect/reconnect mid-recording, packet-loss / jitter injection, reconnect

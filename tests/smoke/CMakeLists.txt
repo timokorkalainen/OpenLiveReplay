@@ -20,3 +20,7 @@ if(OLR_QMLLINT)
 else()
     message(WARNING "qmllint not found under ${_qt_prefix}/bin; qml_smoke test disabled")
 endif()
+
+add_test(NAME ios_ffmpeg_build_config
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_ffmpeg_build_config.sh")
+set_tests_properties(ios_ffmpeg_build_config PROPERTIES LABELS "smoke" TIMEOUT 10)

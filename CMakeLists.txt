@@ -70,6 +70,14 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
         recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
+        recorder_engine/ingest/ingestsession.h recorder_engine/ingest/ingestsession.cpp
+        recorder_engine/ingest/ffmpegingestsession.h recorder_engine/ingest/ffmpegingestsession.cpp
+        recorder_engine/ingest/pespacket.h
+        recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
+        recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
+        recorder_engine/ingest/audiotoolboxaacdecoder.h
+        recorder_engine/ingest/videotoolboxdecoder.h
+        recorder_engine/ingest/nativesrtingestsession.h
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp
@@ -171,6 +179,22 @@ else()
     target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager_stub.cpp)
 endif()
 
+if(APPLE)
+    target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/ingest/videotoolboxdecoder.mm
+        recorder_engine/ingest/nativesrtingestsession.cpp
+        recorder_engine/ingest/audiotoolboxaacdecoder.mm)
+    target_compile_definitions(OpenLiveReplay PRIVATE OLR_NATIVE_SRT_AVAILABLE=1)
+    target_link_libraries(OpenLiveReplay PRIVATE
+        "-framework AudioToolbox"
+        "-framework VideoToolbox"
+        "-framework CoreMedia"
+        "-framework CoreFoundation"
+        "-framework CoreVideo")
+else()
+    target_sources(OpenLiveReplay PRIVATE recorder_engine/ingest/videotoolboxdecoder_stub.cpp)
+endif()
+
 # 4. Handle Platform Specifics (FFmpeg)
 if(IOS)
     target_sources(OpenLiveReplay PRIVATE
@@ -189,75 +213,89 @@ if(IOS)
     set(FFMPEG_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/ios_build/xcframeworks")
 
     # Define the expected artifacts (used to check if build is needed)
-    set(EXPECTED_LIBS
-        "${FFMPEG_OUTPUT_DIR}/libavcodec.xcframework"
-        "${FFMPEG_OUTPUT_DIR}/libsrt.xcframework"
+    set(FFMPEG_CONFIG_STAMP "${FFMPEG_OUTPUT_DIR}/.ffmpeg-8.1.1-securetransport-no-hevc-no-avfilter.stamp")
+    set(FFMPEG_EXPECTED_ARCHIVES
+        "${FFMPEG_OUTPUT_DIR}/libavcodec.xcframework/ios-arm64/libavcodec.a"
+        "${FFMPEG_OUTPUT_DIR}/libavcodec.xcframework/ios-arm64-simulator/libavcodec.a"
+        "${FFMPEG_OUTPUT_DIR}/libavformat.xcframework/ios-arm64/libavformat.a"
+        "${FFMPEG_OUTPUT_DIR}/libavformat.xcframework/ios-arm64-simulator/libavformat.a"
+        "${FFMPEG_OUTPUT_DIR}/libavutil.xcframework/ios-arm64/libavutil.a"
+        "${FFMPEG_OUTPUT_DIR}/libavutil.xcframework/ios-arm64-simulator/libavutil.a"
+        "${FFMPEG_OUTPUT_DIR}/libswscale.xcframework/ios-arm64/libswscale.a"
+        "${FFMPEG_OUTPUT_DIR}/libswscale.xcframework/ios-arm64-simulator/libswscale.a"
+        "${FFMPEG_OUTPUT_DIR}/libswresample.xcframework/ios-arm64/libswresample.a"
+        "${FFMPEG_OUTPUT_DIR}/libswresample.xcframework/ios-arm64-simulator/libswresample.a"
+        "${FFMPEG_OUTPUT_DIR}/libsrt.xcframework/ios-arm64/libsrt.a"
+        "${FFMPEG_OUTPUT_DIR}/libsrt.xcframework/ios-arm64-simulator/libsrt.a"
     )
 
-    # 2. CREATE A CUSTOM BUILD STEP
-    add_custom_command(
-        OUTPUT ${EXPECTED_LIBS}
+    # 2. DEFINE A CUSTOM BUILD TARGET
+    # Always invoke the script from Xcode/CMake; the script owns the config-id
+    # cache validation and exits quickly when the checked artifacts are current.
+    add_custom_target(BuildFFmpegDependencies
+        BYPRODUCTS ${FFMPEG_EXPECTED_ARCHIVES}
         COMMAND chmod +x ${FFMPEG_SCRIPT}
         COMMAND ${FFMPEG_SCRIPT}
+        DEPENDS "${FFMPEG_SCRIPT}"
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
         COMMENT "[FFmpeg] Binaries missing. Compiling FFmpeg+SRT for iOS... (This takes ~20 mins)"
         VERBATIM
     )
 
-    # 3. DEFINE A TARGET
-    add_custom_target(BuildFFmpegDependencies DEPENDS ${EXPECTED_LIBS})
-
     # ==============================================================================
-    # 4. IMPORT THE LIBRARIES AS SHARED (for proper Xcode embedding)
+    # 4. IMPORT THE LIBRARIES AS STATIC XCFRAMEWORK SLICES
     # ==============================================================================
     set(FFMPEG_IOS_DIR "${FFMPEG_OUTPUT_DIR}")
+    set(FFMPEG_XCODE_SLICE "$(OLR_FFMPEG_SLICE)")
 
-    # Import each FFmpeg dylib as a proper SHARED IMPORTED target
-    add_library(ffmpeg_avcodec SHARED IMPORTED)
+    add_library(ffmpeg_avcodec STATIC IMPORTED)
     set_target_properties(ffmpeg_avcodec PROPERTIES
-        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavcodec.xcframework/ios-arm64/libavcodec.dylib"
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavcodec.xcframework/${FFMPEG_XCODE_SLICE}/libavcodec.a"
     )
     add_dependencies(ffmpeg_avcodec BuildFFmpegDependencies)
 
-    add_library(ffmpeg_avformat SHARED IMPORTED)
+    add_library(ffmpeg_avformat STATIC IMPORTED)
     set_target_properties(ffmpeg_avformat PROPERTIES
-        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavformat.xcframework/ios-arm64/libavformat.dylib"
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavformat.xcframework/${FFMPEG_XCODE_SLICE}/libavformat.a"
     )
     add_dependencies(ffmpeg_avformat BuildFFmpegDependencies)
 
-    add_library(ffmpeg_avutil SHARED IMPORTED)
+    add_library(ffmpeg_avutil STATIC IMPORTED)
     set_target_properties(ffmpeg_avutil PROPERTIES
-        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/libavutil.dylib"
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libavutil.xcframework/${FFMPEG_XCODE_SLICE}/libavutil.a"
     )
     add_dependencies(ffmpeg_avutil BuildFFmpegDependencies)
 
-    add_library(ffmpeg_swscale SHARED IMPORTED)
+    add_library(ffmpeg_swscale STATIC IMPORTED)
     set_target_properties(ffmpeg_swscale PROPERTIES
-        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libswscale.xcframework/ios-arm64/libswscale.dylib"
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libswscale.xcframework/${FFMPEG_XCODE_SLICE}/libswscale.a"
     )
     add_dependencies(ffmpeg_swscale BuildFFmpegDependencies)
 
-    add_library(ffmpeg_swresample SHARED IMPORTED)
+    add_library(ffmpeg_swresample STATIC IMPORTED)
     set_target_properties(ffmpeg_swresample PROPERTIES
-        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libswresample.xcframework/ios-arm64/libswresample.dylib"
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libswresample.xcframework/${FFMPEG_XCODE_SLICE}/libswresample.a"
     )
     add_dependencies(ffmpeg_swresample BuildFFmpegDependencies)
 
-    # SRT is static
     add_library(ffmpeg_srt STATIC IMPORTED)
     set_target_properties(ffmpeg_srt PROPERTIES
-        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libsrt.xcframework/ios-arm64/libsrt.a"
+        IMPORTED_LOCATION "${FFMPEG_IOS_DIR}/libsrt.xcframework/${FFMPEG_XCODE_SLICE}/libsrt.a"
     )
     add_dependencies(ffmpeg_srt BuildFFmpegDependencies)
 
-    # Include dirs for headers
     target_include_directories(OpenLiveReplay PRIVATE
-        "${FFMPEG_IOS_DIR}/libavcodec.xcframework/ios-arm64/Headers"
-        "${FFMPEG_IOS_DIR}/libavformat.xcframework/ios-arm64/Headers"
-        "${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/Headers"
-        "${FFMPEG_IOS_DIR}/libswscale.xcframework/ios-arm64/Headers"
-        "${FFMPEG_IOS_DIR}/libswresample.xcframework/ios-arm64/Headers"
+        "${FFMPEG_IOS_DIR}/libavcodec.xcframework/${FFMPEG_XCODE_SLICE}/Headers"
+        "${FFMPEG_IOS_DIR}/libavformat.xcframework/${FFMPEG_XCODE_SLICE}/Headers"
+        "${FFMPEG_IOS_DIR}/libavutil.xcframework/${FFMPEG_XCODE_SLICE}/Headers"
+        "${FFMPEG_IOS_DIR}/libswscale.xcframework/${FFMPEG_XCODE_SLICE}/Headers"
+        "${FFMPEG_IOS_DIR}/libswresample.xcframework/${FFMPEG_XCODE_SLICE}/Headers"
+        "${FFMPEG_IOS_DIR}/libsrt.xcframework/${FFMPEG_XCODE_SLICE}/Headers"
     )
+
+    set_property(TARGET OpenLiveReplay PROPERTY XCODE_ATTRIBUTE_OLR_FFMPEG_SLICE "ios-arm64")
+    set_property(TARGET OpenLiveReplay PROPERTY "XCODE_ATTRIBUTE_OLR_FFMPEG_SLICE[sdk=iphoneos*]" "ios-arm64")
+    set_property(TARGET OpenLiveReplay PROPERTY "XCODE_ATTRIBUTE_OLR_FFMPEG_SLICE[sdk=iphonesimulator*]" "ios-arm64-simulator")
 
     # ==============================================================================
     # 5. LINK TO YOUR APP
@@ -265,16 +303,17 @@ if(IOS)
     add_dependencies(OpenLiveReplay BuildFFmpegDependencies)
 
     target_link_libraries(OpenLiveReplay PRIVATE
-        ffmpeg_avcodec
         ffmpeg_avformat
-        ffmpeg_avutil
+        ffmpeg_avcodec
         ffmpeg_swscale
         ffmpeg_swresample
+        ffmpeg_avutil
         ffmpeg_srt
         "-framework AudioToolbox"
         "-framework CoreMIDI"
         "-framework CoreAudio"
         "-framework CoreFoundation"
+        "-framework Security"
         "-framework VideoToolbox"
         "-framework CoreMedia"
         "-framework AVFoundation"
@@ -283,13 +322,12 @@ if(IOS)
     )
 
     # ==============================================================================
-    # 6. EMBED DYLIBS INTO APP BUNDLE (Xcode native embedding)
+    # 6. EMBED RUNTIME DYLIBS INTO APP BUNDLE
     # ==============================================================================
     set_target_properties(OpenLiveReplay PROPERTIES
         BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "@executable_path/Frameworks"
-        XCODE_EMBED_FRAMEWORKS
-            "${FFMPEG_IOS_DIR}/libavcodec.xcframework/ios-arm64/libavcodec.dylib;${FFMPEG_IOS_DIR}/libavformat.xcframework/ios-arm64/libavformat.dylib;${FFMPEG_IOS_DIR}/libavutil.xcframework/ios-arm64/libavutil.dylib;${FFMPEG_IOS_DIR}/libswscale.xcframework/ios-arm64/libswscale.dylib;${FFMPEG_IOS_DIR}/libswresample.xcframework/ios-arm64/libswresample.dylib;rtmidi"
+        XCODE_EMBED_FRAMEWORKS "rtmidi"
         XCODE_EMBED_FRAMEWORKS_CODE_SIGN_ON_COPY TRUE
     )
 
@@ -351,10 +389,21 @@ fi
     endif()
 
 elseif(APPLE) # macOS Desktop
-    target_include_directories(OpenLiveReplay PRIVATE /opt/homebrew/include)
-    target_link_directories(OpenLiveReplay PRIVATE /opt/homebrew/lib)
-    target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample)
-    set_target_properties(OpenLiveReplay PROPERTIES INSTALL_RPATH "/opt/homebrew/lib")
+    if(NOT DEFINED OLR_BREW_PREFIX)
+        execute_process(COMMAND brew --prefix
+            OUTPUT_VARIABLE OLR_BREW_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    if(NOT OLR_BREW_PREFIX OR NOT EXISTS "${OLR_BREW_PREFIX}")
+        set(OLR_BREW_PREFIX /opt/homebrew)
+    endif()
+    target_include_directories(OpenLiveReplay PRIVATE
+        "${OLR_BREW_PREFIX}/include"
+        "${OLR_BREW_PREFIX}/opt/srt/include")
+    target_link_directories(OpenLiveReplay PRIVATE
+        "${OLR_BREW_PREFIX}/lib"
+        "${OLR_BREW_PREFIX}/opt/srt/lib")
+    target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
+    set_target_properties(OpenLiveReplay PROPERTIES INSTALL_RPATH "${OLR_BREW_PREFIX}/lib")
     target_link_libraries(OpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
 endif()
 

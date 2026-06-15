@@ -123,12 +123,7 @@ private:
 
     void captureLoop();
     std::atomic<bool> m_captureRunning{false};
-    // Monotonic clock started once; activity stamps are atomics because
-    // they are written by the capture thread and read by the thread that
-    // delivers the master pulse and by the ffmpeg interrupt callback.
-    // -1 = "not yet valid".
     QElapsedTimer m_monotonic;
-    std::atomic<int64_t> m_lastPacketAtMs{-1};
     std::atomic<int64_t> m_lastFrameEnqueueAtMs{-1};
     int m_stallTimeoutMs = 8000;
     std::atomic<bool> m_connected{false};
@@ -159,21 +154,16 @@ private:
     int m_targetHeight = 1080;
     int m_targetFps = 30;
 
-    static int ffmpegInterruptCallback(void* opaque);
-    bool shouldInterrupt() const;
-
     // FFmpeg context management
     struct QueuedFrame {
         AVFrame* frame;
         int64_t sourcePts;
     };
 
-    struct SwsContext* m_swsCtx = nullptr;
     QQueue<QueuedFrame> m_frameQueue;
     AVCodecContext* m_persistentEncCtx = nullptr;
 
     // FFmpeg helpers
-    bool setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx, QUrl url, int* videoStreamIdx);
     bool setupEncoder(AVCodecContext** encCtx);
     void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs);
 };
