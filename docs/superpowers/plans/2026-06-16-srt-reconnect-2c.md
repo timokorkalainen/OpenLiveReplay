@@ -2,6 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Implementation outcome (superseding Task 2/3 names below):** the gate uncovered a
+> cross-source coupling on the **ffmpeg** ingest (a dead source's avformat reconnect
+> churn starves the other sources via libsrt's global receive thread). The **native
+> Apple SRT ingest** (`OLR_NATIVE_SRT=1`) does not, so the shipped gate is
+> **`e2e_native_srt_reconnect`** in the **`native-apple-ingest`** label (not
+> `e2e_srt_reconnect`/`srt`), and the control-isolation check is **strict** (no
+> mid-record disconnect, no content gap). The shipped `run_srt_reconnect.sh` isolation
+> check is gap-based, not the in-window-flash sample below. See `tests/e2e/SRT_README.md`.
+
 **Goal:** Prove over real `srt://` that the engine survives a mid-recording source drop — observes the disconnect, reconnects when the source returns, and resumes recording real frames (not frozen/blue-fill).
 
 **Architecture:** A new local-only e2e gate (`run_srt_reconnect.sh` → CTest `e2e_srt_reconnect`) orchestrates kill/restart of a victim SRT bridge mid-record while a control source stays live, asserting a per-source connection-transition sequence + flash-PTS content resumption. One additive `sync_harness` flag (`--report-connection-events`) exposes the timestamped transitions. Builds on Phase 2b's `srt_lib.sh`.

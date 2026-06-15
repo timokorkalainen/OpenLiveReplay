@@ -75,7 +75,7 @@ else
     sleep "$(( RESTART_TIME - KILL_TIME ))"
     echo "[srt-reconn] restarting src1 bridge at ~${RESTART_TIME}s"
     # Retry the rebind in case the OS briefly holds the port after the kill.
-    for attempt in 1 2 3 4 5; do
+    for _ in 1 2 3 4 5; do
         srt_bridge "$UDP1" "$SRT1"; SRC1_BRIDGE_PID=$SRT_LAST_PID
         sleep 0.3
         if kill -0 "$SRC1_BRIDGE_PID" 2>/dev/null; then break; fi
@@ -135,7 +135,13 @@ fi
 flash_pts_series "$MKV" 0 > "$WORKDIR/v0.txt"
 GAP0="$(awk 'NR>1{d=$1-p; if(d>1.5)g++} {p=$1} END{print g+0}' "$WORKDIR/v0.txt")"
 N0="$(wc -l < "$WORKDIR/v0.txt" | tr -d ' ')"
-echo "[srt-reconn] src0 control: flashes=$N0 content_gaps>1.5s=$GAP0 (want 0 gaps)"
+MIN0=$(( DURATION / 2 ))  # ~1 flash/s; a continuous control track has ~DURATION of them
+echo "[srt-reconn] src0 control: flashes=$N0 content_gaps>1.5s=$GAP0 (want >=$MIN0 flashes, 0 gaps)"
+# Require a near-full flash count so the gap check can't pass vacuously on a
+# near-empty track (a 0/1-flash series has no measurable gap).
+if [ "${N0:-0}" -lt "$MIN0" ]; then
+    echo "FAIL: control src0 has only ${N0} flashes (< ${MIN0}) — not recording continuous content"; fail=1
+fi
 if [ "${GAP0:-1}" -gt 0 ]; then
     echo "FAIL: control src0 lost content (${GAP0} gap(s) >1.5s) during src1's outage — cross-source coupling"; fail=1
 fi

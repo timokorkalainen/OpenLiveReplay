@@ -1,6 +1,14 @@
 # SRT Disconnect/Reconnect Survival (Phase 2c-a) — Design
 
-**Status:** approved (hardened after an adversarial design review)
+**Status:** implemented — but **superseded on one point** by what the build revealed.
+This doc designs the gate against the **ffmpeg** ingest. During implementation the
+gate uncovered a real cross-source coupling on that path (a dead source's avformat
+reconnect churn monopolizes libsrt's single global receive thread and starves the
+other sources). The **native Apple SRT ingest** (`OLR_NATIVE_SRT=1`, landed on `main`
+separately) does not have it, so the shipped gate is **`e2e_native_srt_reconnect`**
+in the **`native-apple-ingest`** label (not `e2e_srt_reconnect` in `srt`), with the
+control-isolation assertion made **strict** (no mid-record disconnect, no content
+gap). See `tests/e2e/SRT_README.md` (Phase 2c-a) for the final rationale.
 **Date:** 2026-06-16
 **Depends on:** Phase 2b SRT feature-validation gates (`srt_lib.sh`, `sync_harness`,
 `--report-connections`, the `linger=0` teardown fix) — all on `main`.
