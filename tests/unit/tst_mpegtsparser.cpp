@@ -144,6 +144,7 @@ private slots:
     void parsesH264VideoPidAndCodec();
     void parsesHevcVideoPidAndCodec();
     void parsesAacPid();
+    void parsesLatmAacPid();
     void malformedPmtDoesNotPartiallyApply();
     void validPmtResetsAbsentStreams();
     void reassemblesPesAcrossPacketsAndExtractsPts();
@@ -205,6 +206,25 @@ void TestMpegTsParser::parsesAacPid()
                                          pmtSection({{0x1b, 0x0101}, {0x0f, 0x0103}}, 0x0101)),
                                 &out));
     QCOMPARE(parser.audioPid(), quint16(0x0103));
+}
+
+void TestMpegTsParser::parsesLatmAacPid()
+{
+    MpegTsParser parser;
+    QList<PesPacket> out;
+
+    QVERIFY(parser.pushTsPacket(tsPacket(0x0000, true, patSection(0x1000)), &out));
+    QVERIFY(parser.pushTsPacket(tsPacket(0x1000, true,
+                                         pmtSection({{0x1b, 0x0101}, {0x11, 0x0104}}, 0x0101)),
+                                &out));
+    QCOMPARE(parser.audioPid(), quint16(0x0104));
+
+    const QByteArray payload = QByteArray::fromHex("56e000");
+    QVERIFY(parser.pushTsPacket(tsPacket(0x0104, true, pesPacket(0xc0, payload, 90000), 0),
+                                &out));
+    QCOMPARE(out.size(), 1);
+    QCOMPARE(out.first().kind, NativeElementaryStreamKind::AudioAacLatm);
+    QCOMPARE(out.first().payload, payload);
 }
 
 void TestMpegTsParser::malformedPmtDoesNotPartiallyApply()

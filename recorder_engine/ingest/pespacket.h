@@ -14,6 +14,7 @@ enum class NativeElementaryStreamKind {
     Unknown,
     Video,
     AudioAac,
+    AudioAacLatm,
 };
 
 struct PesPacket {

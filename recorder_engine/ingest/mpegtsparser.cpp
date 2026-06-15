@@ -54,13 +54,14 @@ int sectionPayloadEnd(const QByteArray& payload, int sectionOffset)
     return sectionEndWithCrc - 4;
 }
 
-NativeElementaryStreamKind kindForPid(quint16 pid, quint16 videoPid, quint16 audioPid)
+NativeElementaryStreamKind kindForPid(quint16 pid, quint16 videoPid, quint16 audioPid,
+                                      NativeElementaryStreamKind audioKind)
 {
     if (pid == videoPid) {
         return NativeElementaryStreamKind::Video;
     }
     if (pid == audioPid) {
-        return NativeElementaryStreamKind::AudioAac;
+        return audioKind;
     }
     return NativeElementaryStreamKind::Unknown;
 }
@@ -165,6 +166,7 @@ void MpegTsParser::parsePmt(const QByteArray& payload, bool payloadStart)
     quint16 candidateVideoPid = 0xffff;
     NativeVideoCodec candidateVideoCodec = NativeVideoCodec::Unknown;
     quint16 candidateAudioPid = 0xffff;
+    NativeElementaryStreamKind candidateAudioKind = NativeElementaryStreamKind::Unknown;
 
     while (es + 5 <= end) {
         const quint8 streamType = byteAt(payload, es);
@@ -184,6 +186,10 @@ void MpegTsParser::parsePmt(const QByteArray& payload, bool payloadStart)
             candidateVideoCodec = NativeVideoCodec::Hevc;
         } else if (streamType == 0x0f) {
             candidateAudioPid = pid;
+            candidateAudioKind = NativeElementaryStreamKind::AudioAac;
+        } else if (streamType == 0x11) {
+            candidateAudioPid = pid;
+            candidateAudioKind = NativeElementaryStreamKind::AudioAacLatm;
         }
 
         es += 5 + esInfoLength;
@@ -192,6 +198,7 @@ void MpegTsParser::parsePmt(const QByteArray& payload, bool payloadStart)
     m_videoPid = candidateVideoPid;
     m_videoCodec = candidateVideoCodec;
     m_audioPid = candidateAudioPid;
+    m_audioKind = candidateAudioKind;
 }
 
 void MpegTsParser::pushPesPayload(quint16 pid, bool payloadStart, const QByteArray& payload,
@@ -205,7 +212,7 @@ void MpegTsParser::pushPesPayload(quint16 pid, bool payloadStart, const QByteArr
     }
 
     PesAssembly& assembly = m_pes[pid];
-    assembly.kind = kindForPid(pid, m_videoPid, m_audioPid);
+    assembly.kind = kindForPid(pid, m_videoPid, m_audioPid, m_audioKind);
     assembly.videoCodec = (pid == m_videoPid) ? m_videoCodec : NativeVideoCodec::Unknown;
     assembly.bytes.append(payload);
     updateExpectedPesSize(&assembly);

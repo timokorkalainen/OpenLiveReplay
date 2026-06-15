@@ -23,6 +23,9 @@ constexpr int kStallTimeoutMs = 8000;
 constexpr int64_t kForwardJump90k = 3000 * 90;
 constexpr int64_t kBackwardTolerance90k = -200 * 90;
 constexpr int kTsPacketSize = 188;
+constexpr int kAudioSampleRate = 48000;
+constexpr int kMaxAdtsFrameSize = 8191;
+constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
 
 std::mutex srtLibraryMutex;
 int srtLibraryRefs = 0;
@@ -87,6 +90,13 @@ int findAlignedSyncOffset(const QByteArray& bytes) {
     return -1;
 }
 
+qint64 samplesTo90k(qint64 samples, int sampleRate) {
+    if (samples <= 0 || sampleRate <= 0) {
+        return 0;
+    }
+    return (samples * 90000 + sampleRate / 2) / sampleRate;
+}
+
 } // namespace
 
 NativeSrtIngestSession::NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
@@ -131,10 +141,17 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_activeCodec = NativeVideoCodec::Unknown;
     m_splitter.reset();
     m_decoder.reset();
+    m_audioDecoder.reset();
+    m_audioRemainder.clear();
     m_firstDts90k = -1;
     m_prevDts90k = -1;
     m_anchorStreamTimeMs = -1;
+    m_firstAudioPts90k = -1;
+    m_prevAudioPts90k = -1;
+    m_audioAnchorStreamTimeMs = -1;
+    m_audioRemainderPts90k = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
+    m_loggedLatmUnsupported = false;
 
     QString error;
     if (!openSocket(&error)) {
@@ -360,6 +377,21 @@ void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
 }
 
 void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
+    if (pes.kind == NativeElementaryStreamKind::AudioAacLatm) {
+        if (!m_loggedLatmUnsupported) {
+            log(QStringLiteral("Native SRT LATM/LOAS AAC is unsupported; continuing video."));
+            m_loggedLatmUnsupported = true;
+        }
+        m_audioRemainder.clear();
+        m_audioRemainderPts90k = -1;
+        return;
+    }
+
+    if (pes.kind == NativeElementaryStreamKind::AudioAac) {
+        processAudioPesPacket(pes);
+        return;
+    }
+
     if (pes.kind != NativeElementaryStreamKind::Video
         || pes.videoCodec == NativeVideoCodec::Unknown) {
         return;
@@ -414,6 +446,120 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
     }
 }
 
+void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
+    if (!m_callbacks.onAudioChunk || pes.pts90k < 0 || pes.payload.isEmpty()) {
+        return;
+    }
+
+    if (!m_audioDecoder) {
+        m_audioDecoder = std::make_unique<AudioToolboxAacDecoder>();
+    }
+
+    if (!m_audioRemainder.isEmpty()) {
+        const bool currentPesStartsFrame =
+            AudioToolboxAacDecoder::hasAdtsSync(pes.payload, 0)
+            || AudioToolboxAacDecoder::hasLatmLoasSync(pes.payload, 0);
+        const qint64 delta90k = pes.pts90k - m_audioRemainderPts90k;
+        if (currentPesStartsFrame || m_audioRemainderPts90k < 0
+            || delta90k > kAudioRemainderPtsTolerance90k
+            || delta90k < -kAudioRemainderPtsTolerance90k) {
+            m_audioRemainder.clear();
+            m_audioRemainderPts90k = -1;
+        }
+    }
+
+    const int remainderSize = m_audioRemainder.size();
+    qint64 basePts90k = pes.pts90k;
+    if (remainderSize > 0 && m_audioRemainderPts90k >= 0) {
+        basePts90k = m_audioRemainderPts90k;
+    } else {
+        m_audioRemainder.clear();
+    }
+
+    QByteArray bytes = m_audioRemainder;
+    bytes.append(pes.payload);
+    m_audioRemainder.clear();
+    m_audioRemainderPts90k = -1;
+
+    int offset = 0;
+    qint64 consumedSamples = 0;
+    int consumedSampleRate = 0;
+    while (offset < bytes.size()) {
+        AacAdtsFrameInfo info;
+        if (!AudioToolboxAacDecoder::parseAdtsFrame(bytes, offset, &info)) {
+            if (AudioToolboxAacDecoder::hasLatmLoasSync(bytes, offset)) {
+                if (!m_loggedLatmUnsupported) {
+                    log(QStringLiteral("Native SRT LATM/LOAS AAC is unsupported; continuing video."));
+                    m_loggedLatmUnsupported = true;
+                }
+                m_audioRemainder.clear();
+                return;
+            }
+
+            int nextOffset = -1;
+            for (int i = offset + 1; i < bytes.size(); ++i) {
+                if (AudioToolboxAacDecoder::parseAdtsFrame(bytes, i, nullptr)
+                    || AudioToolboxAacDecoder::hasLatmLoasSync(bytes, i)) {
+                    nextOffset = i;
+                    break;
+                }
+            }
+
+            if (nextOffset < 0) {
+                m_audioRemainder = bytes.mid(offset);
+                if (m_audioRemainder.size() > kMaxAdtsFrameSize) {
+                    m_audioRemainder = m_audioRemainder.right(kMaxAdtsFrameSize);
+                    basePts90k = pes.pts90k;
+                    consumedSamples = 0;
+                    consumedSampleRate = 0;
+                }
+                m_audioRemainderPts90k =
+                    basePts90k + samplesTo90k(consumedSamples, consumedSampleRate);
+                return;
+            }
+            if (nextOffset >= remainderSize) {
+                basePts90k = pes.pts90k;
+                consumedSamples = 0;
+                consumedSampleRate = 0;
+            }
+            offset = nextOffset;
+            continue;
+        }
+
+        if (consumedSampleRate == 0) {
+            consumedSampleRate = info.sampleRate;
+        } else if (info.sampleRate != consumedSampleRate) {
+            basePts90k += samplesTo90k(consumedSamples, consumedSampleRate);
+            consumedSamples = 0;
+            consumedSampleRate = info.sampleRate;
+            if (m_audioDecoder) {
+                m_audioDecoder->reset();
+            }
+        }
+
+        const qint64 framePts90k = basePts90k + samplesTo90k(consumedSamples, consumedSampleRate);
+        const int64_t sourcePtsMs = sourcePtsMsForAudio(framePts90k);
+        if (sourcePtsMs >= 0) {
+            const QByteArray frame = bytes.mid(offset, info.frameSize);
+            QByteArray pcm;
+            QString error;
+            if (m_audioDecoder->decodeAdtsFrame(frame, info, &pcm, &error)) {
+                if (!pcm.isEmpty()) {
+                    DecodedAudioChunk chunk;
+                    chunk.startSample = sourcePtsMs * kAudioSampleRate / 1000;
+                    chunk.pcmS16Stereo = std::move(pcm);
+                    m_callbacks.onAudioChunk(std::move(chunk));
+                }
+            } else if (!error.isEmpty()) {
+                log(error);
+            }
+        }
+
+        consumedSamples += info.samplesPerFrame;
+        offset += info.frameSize;
+    }
+}
+
 int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& unit) {
     const int64_t unitDts90k = unit.dts90k >= 0 ? unit.dts90k : unit.pts90k;
     const int64_t unitPts90k = unit.pts90k >= 0 ? unit.pts90k : unitDts90k;
@@ -442,4 +588,46 @@ int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& u
         return -1;
     }
     return m_anchorStreamTimeMs + ((unitPts90k - m_firstDts90k) / 90);
+}
+
+int64_t NativeSrtIngestSession::sourcePtsMsForAudio(qint64 pts90k) {
+    if (pts90k < 0) {
+        return -1;
+    }
+
+    bool needAnchor = m_firstAudioPts90k < 0;
+    if (!needAnchor && m_prevAudioPts90k >= 0) {
+        const int64_t delta90k = pts90k - m_prevAudioPts90k;
+        if (delta90k > kForwardJump90k || delta90k < kBackwardTolerance90k) {
+            log(QStringLiteral("Native SRT audio PTS discontinuity (%1 ms jump). Re-anchoring.")
+                    .arg(delta90k / 90));
+            needAnchor = true;
+            if (m_audioDecoder) {
+                m_audioDecoder->reset();
+            }
+        }
+    }
+
+    const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    if (needAnchor) {
+        m_firstAudioPts90k = pts90k;
+        m_audioAnchorStreamTimeMs = nowMs;
+    }
+    m_prevAudioPts90k = pts90k;
+
+    if (m_audioAnchorStreamTimeMs < 0) {
+        return -1;
+    }
+
+    int64_t sourcePtsMs = m_audioAnchorStreamTimeMs + ((pts90k - m_firstAudioPts90k) / 90);
+    if (nowMs >= 0 && sourcePtsMs > nowMs + 10000) {
+        log(QStringLiteral("Native SRT audio sample %1 ms far ahead of clock %2 ms. Re-anchoring.")
+                .arg(sourcePtsMs)
+                .arg(nowMs));
+        m_firstAudioPts90k = pts90k;
+        m_prevAudioPts90k = pts90k;
+        m_audioAnchorStreamTimeMs = nowMs;
+        sourcePtsMs = nowMs;
+    }
+    return sourcePtsMs;
 }

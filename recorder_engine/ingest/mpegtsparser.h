@@ -28,6 +28,7 @@ private:
     quint16 m_videoPid = 0xffff;
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
     quint16 m_audioPid = 0xffff;
+    NativeElementaryStreamKind m_audioKind = NativeElementaryStreamKind::Unknown;
     QHash<quint16, PesAssembly> m_pes;
     QHash<quint16, quint8> m_lastContinuityCounter;
     QSet<quint16> m_waitingForPayloadStart;

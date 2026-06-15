@@ -75,6 +75,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/pespacket.h
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
+        recorder_engine/ingest/audiotoolboxaacdecoder.h
         recorder_engine/ingest/videotoolboxdecoder.h
         recorder_engine/ingest/nativesrtingestsession.h
         settingsmanager.h settingsmanager.cpp
@@ -192,6 +193,7 @@ endif()
 if(IOS)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativesrtingestsession.cpp
+        recorder_engine/ingest/audiotoolboxaacdecoder.mm
     )
     target_sources(OpenLiveReplay PRIVATE
         ios/ios_scene.h

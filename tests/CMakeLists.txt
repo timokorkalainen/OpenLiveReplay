@@ -54,6 +54,15 @@ target_link_libraries(olr_test_core
     PUBLIC Qt6::Core Qt6::Network
     PRIVATE olr_warnings olr_sanitize)
 
+if(APPLE)
+    target_sources(olr_test_core PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/audiotoolboxaacdecoder.mm")
+    target_link_libraries(olr_test_core PRIVATE "-framework AudioToolbox")
+else()
+    target_sources(olr_test_core PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/audiotoolboxaacdecoder_stub.cpp")
+endif()
+
 # --- Engine sources that DO need FFmpeg (muxer / capture / recording) -------
 qt_add_library(olr_test_engine STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ffmpegingestsession.cpp"
