@@ -121,3 +121,9 @@ set_tests_properties(e2e_srt_4cam PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL
 add_test(NAME e2e_srt_sync
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_sync.sh" "$<TARGET_FILE:sync_harness>" 23520)
 set_tests_properties(e2e_srt_sync PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
+
+# Phase 2b: per-source trim (#28) over real SRT — +T on view1 delays it by ~T.
+# Base port 23530.
+add_test(NAME e2e_srt_trim
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_trim.sh" "$<TARGET_FILE:sync_harness>" 23530)
+set_tests_properties(e2e_srt_trim PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
