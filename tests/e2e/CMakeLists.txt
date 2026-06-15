@@ -12,6 +12,12 @@ qt_add_executable(play_harness play_harness.cpp)
 target_link_libraries(play_harness PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
 
+# Headless multi-source sync-measurement harness: records N synthetic sources
+# into an N-view MKV for the report-only frame-sync scoreboard (run_sync_e2e.sh).
+qt_add_executable(sync_harness sync_harness.cpp)
+target_link_libraries(sync_harness PRIVATE
+    Qt6::Core olr_test_engine olr_warnings olr_sanitize)
+
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
 set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
 
@@ -71,3 +77,23 @@ set_tests_properties(
     LABELS "e2e"
     TIMEOUT 180
     RUN_SERIAL TRUE)
+
+# --- Report-only frame-sync scoreboard (NON-GATING) -------------------------
+# These drive sync_harness through synthetic synchronized sources and print
+# measured inter-camera offset / drift / lip-sync numbers. They ALWAYS exit 0
+# (diagnostic, not a gate) and carry the distinct "sync-report" label so the
+# gating e2e selection and the sanitizer build-target list are unaffected.
+# Run on demand with:  ctest -L sync-report
+set(_sync_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_sync_e2e.sh")
+add_test(NAME sync_intercam_matched
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" intercam_matched 23480)
+add_test(NAME sync_intercam_skew
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" intercam_skew 23482)
+add_test(NAME sync_drift_2997
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" drift_2997 23484)
+add_test(NAME sync_lipsync
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 23486)
+
+set_tests_properties(
+    sync_intercam_matched sync_intercam_skew sync_drift_2997 sync_lipsync
+    PROPERTIES LABELS "sync-report" TIMEOUT 180 RUN_SERIAL TRUE)

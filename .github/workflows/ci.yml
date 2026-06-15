@@ -53,7 +53,10 @@ jobs:
 
       - name: Run tests
         working-directory: build
-        run: ctest --output-on-failure --repeat until-pass:2
+        # -LE sync-report excludes the report-only frame-sync scoreboard tests:
+        # they are on-demand diagnostics (always exit 0), not gates. sync_harness
+        # is still compiled by the build step above, so it stays regression-proof.
+        run: ctest --output-on-failure --repeat until-pass:2 -LE sync-report
 
       # clang-tidy is advisory: it reports on changed first-party files using the
       # generated compile_commands.json but never fails the build (yet).
@@ -185,7 +188,7 @@ jobs:
         # run under the sanitizers; the 6 heavier playback scenarios are
         # excluded here to bound CI time — they run un-sanitized in Build+Test,
         # and the storm gate already exercises the scheduler/worker concurrency.
-        run: ctest --output-on-failure --repeat until-pass:2 -E 'e2e_play_(seekplay|stepscrub|reverse|sliderscrub|liveedge|4view)'
+        run: ctest --output-on-failure --repeat until-pass:2 -E 'e2e_play_(seekplay|stepscrub|reverse|sliderscrub|liveedge|4view)' -LE sync-report
 
 # iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
 # (~20 min) OOM-kills hosted runners. It is validated locally instead via the
