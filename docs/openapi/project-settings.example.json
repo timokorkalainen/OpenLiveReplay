@@ -5,7 +5,7 @@
     "name": "Final Match"
   },
   "links": {
-    "openapi": "https://provider.example/openapi/olr-provider-v1.openapi.yaml"
+    "openapi": "https://provider.example/openapi/olr-provider-v1.openapi.json"
   },
   "telemetry": {
     "sseUrl": "https://provider.example/events/final/telemetry"

@@ -7,7 +7,7 @@ confirmation.
 
 Files:
 
-- `olr-provider-v1.openapi.yaml` describes the provider contract.
+- `olr-provider-v1.openapi.json` describes the provider contract.
 - `project-settings.example.json` is an importable settings response.
 - `telemetry.sse.example` shows the single SSE stream format.
 
@@ -21,4 +21,3 @@ Contract summary:
 - Every telemetry event must include `feedId`, matching one configured feed.
 - `telemetryDelayMs` is per feed, defaults to `0`, and must be `0..10000`.
 - Feed metadata uses the OpenLiveReplay shape `{ "name": "...", "value": "..." }`.
-
