@@ -182,8 +182,16 @@ void TestSseParser::resetClearsLastEventId() {
         "id: 42\n"
         "data: {\"feedId\":\"cam-main\",\"values\":{}}\n"
         "\n").size(), 1);
+    QVERIFY(parser.push("data: { nope }\n\n").isEmpty());
+    QVERIFY(!parser.lastError().isEmpty());
+    QVERIFY(parser.push("data: {\"feed").isEmpty());
 
     parser.reset();
+    QVERIFY(parser.lastError().isEmpty());
+
+    const QList<TelemetryEvent> orphanedTailEvents = parser.push("Id\":\"cam-main\",\"values\":{}}\n\n");
+    QVERIFY(orphanedTailEvents.isEmpty());
+    QVERIFY(parser.lastError().isEmpty());
 
     const QList<TelemetryEvent> events = parser.push(
         "data: {\"feedId\":\"cam-side\",\"values\":{}}\n"
