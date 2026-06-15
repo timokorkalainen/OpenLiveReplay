@@ -111,3 +111,7 @@ set_tests_properties(
 add_test(NAME e2e_srt_smoke
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_smoke.sh" "$<TARGET_FILE:record_harness>" 23501)
 set_tests_properties(e2e_srt_smoke PROPERTIES LABELS "srt" TIMEOUT 120 RUN_SERIAL TRUE)
+
+add_test(NAME e2e_srt_4cam
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_4cam.sh" "$<TARGET_FILE:sync_harness>" 23510)
+set_tests_properties(e2e_srt_4cam PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
