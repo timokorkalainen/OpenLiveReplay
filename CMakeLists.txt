@@ -52,7 +52,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(rtmidi)
 
 # 1. Find Qt
-find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2)
+find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network)
 qt_standard_project_setup(REQUIRES 6.8)
 
 # 2. Create the Executable Target FIRST
@@ -82,6 +82,7 @@ qt_add_qml_module(OpenLiveReplay
         project/projectsettingsimporter.h project/projectsettingsimporter.cpp
         telemetry/telemetryevent.h
         telemetry/sseparser.h telemetry/sseparser.cpp
+        telemetry/telemetryclient.h telemetry/telemetryclient.cpp
     RESOURCES
         qtquickcontrols2.conf
         resources.qrc
@@ -361,6 +362,7 @@ target_link_libraries(OpenLiveReplay PRIVATE
     Qt6::Concurrent
     Qt6::Multimedia
     Qt6::QuickControls2
+    Qt6::Network
     rtmidi
     OpenLiveReplayMidi
     olr_warnings
