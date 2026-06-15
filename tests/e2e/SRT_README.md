@@ -38,9 +38,37 @@ each recorded view carries its own camera's tone — proving 4 real SRT streams
 connect and **route correctly** (view *i* = camera *i*), not blue-fill silence.
 Run it with the same SRT build via `ctest -L srt`.
 
-## Next (Phase 2)
+## Phase 2b: feature validation over real SRT
 
-Phase 2a (4-source routing) is implemented here (`e2e_srt_4cam`). Phase 2b
-(inter-camera sync, per-source trim, connection-status) and 2c
-(disconnect/reconnect, packet loss) follow as their own specs — see
+Three gates validate shipped features over real `srt://` ingest (same SRT build,
+`ctest -L srt`). They build on `srt_lib.sh` (bridge + tee'd full-frame-flash
+producer + the `flash_pts_series` extractor reused from `run_sync_e2e.sh`):
+
+- `e2e_srt_sync` — one flash source tee'd to **4** coincident SRT views; asserts
+  every view carries the live flash (≥4 flashes — a disconnected view is blue-fill
+  with 0 and FAILS) and the per-flash inter-view spread stays within a **generous**
+  bound (250 ms). The bound is generous by design: the engine anchors each source
+  to first-packet **arrival** (no genlock, audit REF-2), so coincident SRT is
+  phase-locked-within-bounds, not zero-skew (typical measured spread ≈ 30 ms).
+  Teeth: `OLR_SRT_SYNC_DROP_VIEW=<i>`.
+- `e2e_srt_trim` — flash source tee'd to **2** coincident SRT views; trims view1 by
+  `T` (default 300 ms) and asserts the measured (view0−view1) flash offset shifts by
+  ≈ **−T** (the trim delays view1). Proves per-source trim (#28) works over SRT.
+- `e2e_srt_connect` — records 4 SRT URLs with `sync_harness --report-connections`
+  and asserts `connected=4`; a second run with the 4th URL pointed at a dead port
+  asserts `connected=3`. Proves connection-status (#24) detects and discriminates.
+  This gate also guards a teardown-robustness fix: a closing SRT socket used to
+  stall `stopRecording()` for minutes (SRT's 180 s default linger × the global
+  `srt_close()` lock), so the dead-source run hung ~7 min; the engine now sets
+  `linger=0` in the SRT URL query (it is receive-only) and the run completes in
+  ~10 s. See the `fix(srt): set linger=0` commit.
+
+The gate thresholds are validated against real local runs; if one proves flaky,
+widen the bound (never delete the gate) — the content gates (per-view flash count,
+connection count) carry the discrimination.
+
+## Next (Phase 2c)
+
+Disconnect/reconnect mid-recording, packet-loss / jitter injection, reconnect
+re-anchoring, and long-run drift over SRT — each its own spec under
 `docs/superpowers/specs/`.
