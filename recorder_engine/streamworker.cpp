@@ -795,7 +795,13 @@ bool StreamWorker::setupDecoder(AVFormatContext** inCtx, AVCodecContext** decCtx
 
     if (scheme == "srt") {
         av_dict_set(&opts, "connect_timeout", "5000000", 0); // 5 second connect timeout
-        // Increase SRT latency to smooth short network jitter (milliseconds)
+        // Increase SRT latency to smooth short network jitter (milliseconds).
+        // NOTE: like linger below, these SRT-private options are set on the opts
+        // dict and so do NOT currently reach the SRT URLContext (see the linger
+        // comment) — the *latency tuning here is presently inert (SRT default
+        // applies). Left in place; moving it to the URL query is a separate,
+        // behavior-changing follow-up. transtype is saved only because the
+        // caller URL already carries ?transtype=live.
         av_dict_set(&opts, "latency", "500", 0);
         av_dict_set(&opts, "rcvlatency", "500", 0);
         av_dict_set(&opts, "peerlatency", "500", 0);
