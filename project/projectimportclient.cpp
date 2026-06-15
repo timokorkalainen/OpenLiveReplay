@@ -21,6 +21,7 @@ void ProjectImportClient::fetch(const QUrl &url) {
         emit failed(QStringLiteral("Import settings URL must be a valid HTTPS URL"));
         return;
     }
+    m_requestedUrl = url.toString();
 
     QNetworkRequest request(url);
     request.setRawHeader("Accept", "application/json");
@@ -55,22 +56,31 @@ void ProjectImportClient::onFinished() {
     } else if (reply->error() != QNetworkReply::NoError) {
         emit failed(reply->errorString());
     } else {
-        emit finished(reply->readAll(), finalUrl.toString());
+        emit finished(reply->readAll(), m_requestedUrl);
     }
 
     reply->deleteLater();
+    m_requestedUrl.clear();
 }
 
 bool ProjectImportClient::isAllowedUrl(const QUrl &url) const {
     return url.isValid() && url.scheme() == QStringLiteral("https") && !url.host().isEmpty();
 }
 
+void ProjectImportClient::cancel() {
+    clearReply();
+}
+
 void ProjectImportClient::clearReply() {
-    if (!m_reply) return;
+    if (!m_reply) {
+        m_requestedUrl.clear();
+        return;
+    }
 
     QNetworkReply *reply = m_reply;
     m_reply = nullptr;
     disconnect(reply, nullptr, this, nullptr);
     reply->abort();
     reply->deleteLater();
+    m_requestedUrl.clear();
 }

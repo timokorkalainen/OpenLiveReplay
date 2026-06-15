@@ -17,9 +17,10 @@ public:
     ~ProjectImportClient() override;
 
     void fetch(const QUrl &url);
+    void cancel();
 
 signals:
-    void finished(const QByteArray &body, const QString &finalUrl);
+    void finished(const QByteArray &body, const QString &sourceUrl);
     void failed(const QString &message);
 
 private slots:
@@ -31,6 +32,7 @@ private:
 
     QNetworkAccessManager *m_networkAccessManager = nullptr;
     QNetworkReply *m_reply = nullptr;
+    QString m_requestedUrl;
 };
 
 #endif // PROJECTIMPORTCLIENT_H

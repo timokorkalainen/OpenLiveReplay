@@ -56,10 +56,13 @@ ProjectSettingsImportResult ProjectSettingsImporter::importJson(
     ProjectSettingsImportResult result;
     result.importSettingsUrl = sourceUrl;
 
-    const QString schemaVersion = root.value("schemaVersion").toString();
-    if (schemaVersion != QStringLiteral("olr.project-settings.v1")) {
-        result.error = QStringLiteral("unsupported schemaVersion");
-        return result;
+    const QJsonValue schemaVersionValue = root.value("schemaVersion");
+    if (!schemaVersionValue.isUndefined()) {
+        const QString schemaVersion = schemaVersionValue.toString();
+        if (schemaVersion != QStringLiteral("olr.project-settings.v1")) {
+            result.error = QStringLiteral("unsupported schemaVersion");
+            return result;
+        }
     }
 
     const QJsonObject telemetry = root.value("telemetry").toObject();

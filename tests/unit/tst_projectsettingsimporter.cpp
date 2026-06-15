@@ -9,6 +9,7 @@ class TestProjectSettingsImporter : public QObject {
     Q_OBJECT
 private slots:
     void validSettingsConvertToAppSettingsPatch();
+    void missingSchemaVersionIsAllowed();
     void duplicateFeedIdsFail();
     void missingTelemetryUrlFails();
     void invalidDelayFails();
@@ -71,6 +72,19 @@ void TestProjectSettingsImporter::validSettingsConvertToAppSettingsPatch() {
     QCOMPARE(result.sources[0].url, QStringLiteral("srt://10.0.0.20:9000"));
     QCOMPARE(result.sources[0].telemetryDelayMs, 800);
     QCOMPARE(result.sources[1].telemetryDelayMs, 0);
+}
+
+void TestProjectSettingsImporter::missingSchemaVersionIsAllowed() {
+    QJsonObject root = validRoot();
+    root.remove(QStringLiteral("schemaVersion"));
+
+    ProjectSettingsImporter importer;
+    ProjectSettingsImportResult result =
+        importer.importJson(root, QStringLiteral("https://provider.example/project.json"));
+
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QCOMPARE(result.sources.size(), 2);
+    QCOMPARE(result.telemetrySseUrl, QStringLiteral("https://provider.example/telemetry"));
 }
 
 void TestProjectSettingsImporter::duplicateFeedIdsFail() {
