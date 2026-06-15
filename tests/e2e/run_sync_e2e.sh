@@ -157,6 +157,44 @@ case "$SCENARIO" in
     exit 0
     ;;
 
+  intercam_trim)
+    # Proof that the per-source trim shifts a source by the set amount, in the
+    # robust DELAY direction. ONE tee'd source feeds both views (identical content,
+    # simultaneous), so the untrimmed inter-view offset is ≈0; a +TRIM on source 1
+    # delays it, so the measured offset (view0-view1) shifts to ≈ -TRIM.
+    TRIM_MS=${TRIM_MS:-250}
+    P0=$BASE_PORT; P1=$((BASE_PORT+1))
+    vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
+
+    # Records the tee'd 2-view setup with a given trim on source 1; echoes the
+    # mean (view0-view1) ms, or "nan". Restarts a fresh producer each sub-run.
+    measure_trim() {
+        ffmpeg -hide_banner -loglevel error -re \
+            -f lavfi -i "color=c=black:s=320x240:r=30" -vf "$vflt" \
+            -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+            -map 0:v \
+            -f tee "[f=mpegts]udp://127.0.0.1:${P0}?pkt_size=1316|[f=mpegts]udp://127.0.0.1:${P1}?pkt_size=1316" &
+        local pid=$!
+        sleep 0.5
+        local mkv
+        mkv=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \
+                --outdir "$WORKDIR" --name "trim_$1" --seconds 8 --fps 30 --trim "$1" | tail -n1)
+        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+        if [ -z "$mkv" ] || [ ! -s "$mkv" ]; then echo "nan"; return; fi
+        flash_pts_series "$mkv" 0 > "$WORKDIR/t0.txt"
+        flash_pts_series "$mkv" 1 > "$WORKDIR/t1.txt"
+        paste "$WORKDIR/t0.txt" "$WORKDIR/t1.txt" | awk '
+            NF==2 { d=($1-$2)*1000; s+=d; n++ }
+            END { if(n>0) printf "%.1f", s/n; else printf "nan" }'
+    }
+
+    BASE=$(measure_trim 0)
+    TRIMMED=$(measure_trim "$TRIM_MS")
+    emit "[sync] scenario=intercam_trim untrimmed_ms=${BASE} trimmed_ms=${TRIMMED} (trim_applied=${TRIM_MS}; delay => trimmed ≈ untrimmed − ${TRIM_MS})"
+    echo "PASS: report emitted (diagnostic, non-gating)"
+    exit 0
+    ;;
+
   drift_2997)
     # One source paced at 29.97 (30000/1001) while the session runs int fps=30.
     # Flash every source-second; measure how the flash PTS slope deviates from

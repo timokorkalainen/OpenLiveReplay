@@ -93,7 +93,9 @@ add_test(NAME sync_drift_2997
     COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" drift_2997 23484)
 add_test(NAME sync_lipsync
     COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 23486)
+add_test(NAME sync_intercam_trim
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" intercam_trim 23488)
 
 set_tests_properties(
-    sync_intercam_matched sync_intercam_skew sync_drift_2997 sync_lipsync
+    sync_intercam_matched sync_intercam_skew sync_drift_2997 sync_lipsync sync_intercam_trim
     PROPERTIES LABELS "sync-report" TIMEOUT 180 RUN_SERIAL TRUE)
