@@ -8,7 +8,7 @@
 #   smoke/  QML static-load smoke check (qmllint over the QML module)
 #   e2e/    end-to-end recording harness driven by synthetic FFmpeg streams
 
-find_package(Qt6 REQUIRED COMPONENTS Test Core Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Test Core Concurrent Network)
 
 # --- Locate homebrew FFmpeg (Apple Silicon or Intel) ------------------------
 if(NOT DEFINED OLR_BREW_PREFIX)
@@ -29,11 +29,12 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/project/projectsettingsimporter.cpp"
     "${CMAKE_SOURCE_DIR}/playback/playbacktransport.cpp"
     "${CMAKE_SOURCE_DIR}/telemetry/sseparser.cpp"
+    "${CMAKE_SOURCE_DIR}/telemetry/telemetryclient.cpp"
     "${CMAKE_SOURCE_DIR}/streamdeck/streamdeckmappingstore.cpp"
 )
 target_include_directories(olr_test_core PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(olr_test_core
-    PUBLIC Qt6::Core
+    PUBLIC Qt6::Core Qt6::Network
     PRIVATE olr_warnings olr_sanitize)
 
 # --- Engine sources that DO need FFmpeg (muxer / capture / recording) -------
