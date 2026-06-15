@@ -122,7 +122,9 @@ ApplicationWindow {
             appWindow.recordingError = ""
         }
         function onImportPreviewChanged() {
-            if (appWindow.uiManagerRef.importPreviewReady && !importPreviewPopup.opened) {
+            if (appWindow.uiManagerRef.importPreviewReady
+                    && !appWindow.uiManagerRef.isRecording
+                    && !importPreviewPopup.opened) {
                 importPreviewPopup.open()
             }
         }
