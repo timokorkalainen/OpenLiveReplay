@@ -46,6 +46,19 @@ QString telemetryValueToString(const QVariant &value) {
     return json.toString();
 }
 
+QString metadataSummary(const QJsonArray &metadata) {
+    QStringList parts;
+    for (const QJsonValue &value : metadata) {
+        const QJsonObject object = value.toObject();
+        const QString name = object.value(QStringLiteral("name")).toString().trimmed();
+        const QString entryValue = object.value(QStringLiteral("value")).toString();
+        if (name.isEmpty() || entryValue.isEmpty()) continue;
+        parts.append(name + QStringLiteral("=") + entryValue);
+        if (parts.size() >= 4) break;
+    }
+    return parts.join(QStringLiteral("  "));
+}
+
 } // namespace
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
@@ -64,6 +77,9 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         entry.payload = payload.toVariantMap();
         entry.payload.insert(QStringLiteral("feedId"), feedId);
         m_recordingTelemetry[feedId].append(entry);
+        if (m_replayManager && m_replayManager->isRecording()) {
+            loadTelemetryTimeline(m_replayManager->getVideoPath(), false);
+        }
         m_telemetryVersion++;
         emit telemetryChanged();
     });
@@ -912,21 +928,26 @@ void UIManager::clearImportPreview() {
     m_importPreviewError.clear();
 }
 
-bool UIManager::loadTelemetryTimeline(const QString &filePath) {
+bool UIManager::loadTelemetryTimeline(const QString &filePath, bool notify) {
     m_hasTelemetryTimeline = false;
     if (filePath.trimmed().isEmpty()) {
         return false;
     }
 
     if (!m_telemetryTimelineReader.load(filePath)) {
+        if (!notify) {
+            return false;
+        }
         qWarning() << "UIManager: failed to load telemetry timeline"
                    << filePath << m_telemetryTimelineReader.lastError();
         return false;
     }
 
     m_hasTelemetryTimeline = true;
-    m_telemetryVersion++;
-    emit telemetryChanged();
+    if (notify) {
+        m_telemetryVersion++;
+        emit telemetryChanged();
+    }
     return true;
 }
 
@@ -1356,11 +1377,12 @@ void UIManager::startRecording() {
     if (m_telemetryClient) {
         m_telemetryClient->stop();
     }
+    m_liveTelemetry.clear();
+    m_telemetryVersion++;
+    emit telemetryChanged();
+
     const QString telemetryUrl = m_currentSettings.telemetrySseUrl.trimmed();
     if (!telemetryUrl.isEmpty() && m_telemetryClient) {
-        m_liveTelemetry.clear();
-        m_telemetryVersion++;
-        emit telemetryChanged();
         m_telemetryClient->start(QUrl(telemetryUrl));
     }
 
@@ -1656,11 +1678,11 @@ void UIManager::applyImportPreview() {
 
 QVariantMap UIManager::telemetryAtPlayhead() {
     const qint64 playheadMs = scrubPosition();
-    if (m_replayManager && m_replayManager->isRecording() && !m_recordingTelemetry.isEmpty()) {
-        return recordingTelemetryStateAt(playheadMs);
-    }
     if (m_hasTelemetryTimeline) {
         return m_telemetryTimelineReader.stateAt(playheadMs);
+    }
+    if (m_replayManager && m_replayManager->isRecording() && !m_recordingTelemetry.isEmpty()) {
+        return recordingTelemetryStateAt(playheadMs);
     }
     if (!m_recordingTelemetry.isEmpty()) {
         return recordingTelemetryStateAt(playheadMs);
@@ -1673,11 +1695,12 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
     QVariantList rows;
     QSet<QString> emitted;
 
-    auto appendRow = [&rows, &emitted, &state](const QString &feedId, const QString &feedName) {
+    auto appendRow = [&rows, &emitted, &state](
+                         const QString &feedId,
+                         const QString &feedName,
+                         const QJsonArray &metadata = {}) {
         const QVariant value = state.value(feedId);
-        if (!value.isValid()) return;
-
-        QVariantMap payload = value.toMap();
+        const QVariantMap payload = value.isValid() ? value.toMap() : QVariantMap{};
         QVariantList items;
         QStringList summaryParts;
         for (auto it = payload.constBegin(); it != payload.constEnd(); ++it) {
@@ -1693,6 +1716,13 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
                 summaryParts.append(key + QStringLiteral("=") + displayValue);
             }
         }
+        const QString staticSummary = metadataSummary(metadata);
+        if (summaryParts.isEmpty()) {
+            summaryParts.append(QStringLiteral("No telemetry at playhead"));
+        }
+        if (!staticSummary.isEmpty()) {
+            summaryParts.append(QStringLiteral("metadata: ") + staticSummary);
+        }
 
         QVariantMap row;
         row.insert(QStringLiteral("feedId"), feedId);
@@ -1704,7 +1734,7 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
     };
 
     for (const SourceSettings &source : m_currentSettings.sources) {
-        appendRow(source.id, source.name);
+        appendRow(source.id, source.name, source.metadata);
     }
 
     for (auto it = state.constBegin(); it != state.constEnd(); ++it) {
