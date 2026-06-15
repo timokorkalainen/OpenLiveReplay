@@ -296,9 +296,11 @@ if(IOS)
     # Fix rtmidi: Xcode copies librtmidi.7.0.0.dylib but install name expects librtmidi.7.dylib
     set(RTMIDI_FIX_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/fix_rtmidi_embed.sh")
     file(WRITE "${RTMIDI_FIX_SCRIPT}" "#!/bin/bash
+set -euo pipefail
 FW_DIR=\"\${BUILT_PRODUCTS_DIR}/\${FRAMEWORKS_FOLDER_PATH}\"
-if [ -f \"\${FW_DIR}/librtmidi.7.0.0.dylib\" ] && [ ! -e \"\${FW_DIR}/librtmidi.7.dylib\" ]; then
+if [ -f \"\${FW_DIR}/librtmidi.7.0.0.dylib\" ]; then
     cd \"\${FW_DIR}\"
+    rm -f librtmidi.7.dylib librtmidi.dylib
     mv librtmidi.7.0.0.dylib librtmidi.7.dylib
 fi
 ")
