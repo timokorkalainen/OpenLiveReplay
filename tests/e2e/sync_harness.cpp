@@ -142,8 +142,8 @@ int main(int argc, char** argv) {
                     QString line = QStringLiteral("conn_events src=%1").arg(src);
                     const QVector<QPair<qint64, bool>>& evs = connEvents.value(src);
                     for (const QPair<qint64, bool>& ev : evs)
-                        line += QStringLiteral(" %1:%2").arg(ev.first)
-                                    .arg(ev.second ? QStringLiteral("up") : QStringLiteral("down"));
+                        line += QStringLiteral(" %1:%2").arg(ev.first).arg(
+                            ev.second ? QStringLiteral("up") : QStringLiteral("down"));
                     fprintf(stderr, "%s\n", qPrintable(line));
                 }
                 fflush(stderr);
