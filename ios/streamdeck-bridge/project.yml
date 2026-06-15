@@ -21,8 +21,12 @@ targets:
     dependencies:
       - package: StreamDeckKit
         product: StreamDeckKit
-      - package: StreamDeckKit
-        product: StreamDeckSimulator
+      # StreamDeckSimulator (dev-only) temporarily dropped: its asset catalog
+      # fails to compile under Xcode 26.5 (simulator SDK 23F73 has no matching
+      # runtime). The Swift code is preserved behind `#if canImport(...)`, so
+      # re-adding these two lines restores the in-app simulator automatically.
+      # - package: StreamDeckKit
+      #   product: StreamDeckSimulator
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
