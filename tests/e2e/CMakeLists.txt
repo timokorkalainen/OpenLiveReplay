@@ -127,3 +127,9 @@ set_tests_properties(e2e_srt_sync PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL
 add_test(NAME e2e_srt_trim
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_trim.sh" "$<TARGET_FILE:sync_harness>" 23530)
 set_tests_properties(e2e_srt_trim PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
+
+# Phase 2b: per-source connection-status (#24) over real SRT — 4 live => 4,
+# 1 dead port => 3. Base port 23540.
+add_test(NAME e2e_srt_connect
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_connect.sh" "$<TARGET_FILE:sync_harness>" 23540)
+set_tests_properties(e2e_srt_connect PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
