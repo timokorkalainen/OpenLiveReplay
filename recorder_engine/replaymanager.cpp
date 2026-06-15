@@ -46,34 +46,40 @@ void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
 }
 
 bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObject &payload) {
-    QMutexLocker locker(&m_stateMutex);
-    if (!m_isRecording || !m_muxer || !m_clock) {
-        return false;
+    QJsonObject recorded;
+    int64_t effectiveMs = 0;
+    {
+        QMutexLocker locker(&m_stateMutex);
+        if (!m_isRecording || !m_muxer || !m_clock) {
+            return false;
+        }
+
+        const auto feedIt = m_telemetryFeedIndexById.constFind(feedId);
+        if (feedIt == m_telemetryFeedIndexById.constEnd()) {
+            return false;
+        }
+
+        const int feedIndex = feedIt.value();
+        const int configuredDelayMs = feedIndex < m_telemetryDelaysMs.size()
+            ? m_telemetryDelaysMs.at(feedIndex)
+            : 0;
+        const int delayMs = qBound(0, configuredDelayMs, 10000);
+        const int64_t receiveMs = qMax<int64_t>(0, m_clock->elapsedMs());
+        effectiveMs = receiveMs + delayMs;
+
+        recorded = payload;
+        recorded.insert(QStringLiteral("feedId"), feedId);
+        recorded.insert(QStringLiteral("olrReceiveMs"), receiveMs);
+        recorded.insert(QStringLiteral("olrEffectiveMs"), effectiveMs);
+        recorded.insert(QStringLiteral("olrTelemetryDelayMs"), delayMs);
+
+        m_muxer->writeTelemetryPacket(
+            feedIndex,
+            effectiveMs,
+            QJsonDocument(recorded).toJson(QJsonDocument::Compact));
     }
 
-    const auto feedIt = m_telemetryFeedIndexById.constFind(feedId);
-    if (feedIt == m_telemetryFeedIndexById.constEnd()) {
-        return false;
-    }
-
-    const int feedIndex = feedIt.value();
-    const int configuredDelayMs = feedIndex < m_telemetryDelaysMs.size()
-        ? m_telemetryDelaysMs.at(feedIndex)
-        : 0;
-    const int delayMs = qBound(0, configuredDelayMs, 10000);
-    const int64_t receiveMs = qMax<int64_t>(0, m_clock->elapsedMs());
-    const int64_t effectiveMs = receiveMs + delayMs;
-
-    QJsonObject recorded = payload;
-    recorded.insert(QStringLiteral("feedId"), feedId);
-    recorded.insert(QStringLiteral("olrReceiveMs"), receiveMs);
-    recorded.insert(QStringLiteral("olrEffectiveMs"), effectiveMs);
-    recorded.insert(QStringLiteral("olrTelemetryDelayMs"), delayMs);
-
-    m_muxer->writeTelemetryPacket(
-        feedIndex,
-        effectiveMs,
-        QJsonDocument(recorded).toJson(QJsonDocument::Compact));
+    emit telemetryRecorded(feedId, recorded, effectiveMs);
     return true;
 }
 

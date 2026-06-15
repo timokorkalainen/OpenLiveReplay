@@ -9,6 +9,7 @@
 #include <QTimer>
 #include <QVariantList>
 #include <QVariantMap>
+#include <QMap>
 #include "settingsmanager.h"
 #include "project/projectsettingsimporter.h"
 #include "recorder_engine/replaymanager.h"
@@ -16,6 +17,7 @@
 #include "playback/playbackworker.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
+#include "playback/telemetrytimelinereader.h"
 #include "midi/midimanager.h"
 #include "streamdeck/streamdeckmanager.h"
 #include "streamdeck/streamdeckmappingstore.h"
@@ -199,7 +201,8 @@ public:
     Q_INVOKABLE void setSourceTrimOffset(int sourceIndex, int ms);
     Q_INVOKABLE void readImportSettings();
     Q_INVOKABLE void applyImportPreview();
-    Q_INVOKABLE QVariantMap telemetryAtPlayhead() const;
+    Q_INVOKABLE QVariantMap telemetryAtPlayhead();
+    Q_INVOKABLE QVariantList telemetryRowsAtPlayhead();
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -338,6 +341,13 @@ private:
     void resetSourceConnection();
     void updateReplayTelemetryFeeds();
     void clearImportPreview();
+    bool loadTelemetryTimeline(const QString &filePath);
+    QVariantMap recordingTelemetryStateAt(qint64 playheadMs) const;
+
+    struct TelemetryTimelineEntry {
+        qint64 ptsMs = 0;
+        QVariantMap payload;
+    };
 
     QList<QScreen*> m_screens;
     QVariantList m_screenOptions;
@@ -350,6 +360,9 @@ private:
     QString m_importPreviewError;
     QVariantMap m_importPreview;
     QVariantMap m_liveTelemetry;
+    QMap<QString, QList<TelemetryTimelineEntry>> m_recordingTelemetry;
+    TelemetryTimelineReader m_telemetryTimelineReader;
+    bool m_hasTelemetryTimeline = false;
     int m_telemetryVersion = 0;
 
     enum MidiLearnMode {
