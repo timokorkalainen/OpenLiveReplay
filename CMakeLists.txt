@@ -79,6 +79,8 @@ qt_add_qml_module(OpenLiveReplay
         playback/trackbuffer.h playback/trackbuffer.cpp
         playback/audioframequeue.h playback/audioframequeue.cpp
         project/projectsettingsimporter.h project/projectsettingsimporter.cpp
+        telemetry/telemetryevent.h
+        telemetry/sseparser.h telemetry/sseparser.cpp
     RESOURCES
         qtquickcontrols2.conf
         resources.qrc
