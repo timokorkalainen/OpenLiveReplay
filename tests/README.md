@@ -40,9 +40,10 @@ cmake --build build-asan
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan --output-on-failure
 ```
 
-`OLR_SANITIZER` instruments the app and tests. Running the E2E suite under
-ASan+UBSan exercises the threaded capture→resample→mux pipeline — the exact
-path that produced the mono-audio crash.
+`OLR_SANITIZER` instruments the app and tests. CI keeps this to spot checks
+instead of rerunning the full suite in every sanitizer leg: ASan+UBSan covers
+mux/parser/audio primitives plus the mono recording regression, while TSan runs
+the playback storm gate that records a fixture and drives the worker pipeline.
 
 ## Linting & formatting
 
@@ -60,7 +61,8 @@ path that produced the mono-audio crash.
 
 - **build-test-macos** — build app + tests, run CTest (primary gate).
 - **lint** — `clang-format` (changed lines) + `qmllint`.
-- **sanitizers** — ASan+UBSan (gating) and ThreadSanitizer (advisory).
+- **sanitizers** — focused ASan+UBSan spot checks (gating) and a focused
+  ThreadSanitizer spot check (advisory).
 
 ## iOS build (local pre-push hook, not CI)
 

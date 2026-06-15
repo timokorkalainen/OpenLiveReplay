@@ -133,7 +133,8 @@ jobs:
           "$QT_ROOT_DIR/bin/qmllint" -I "$QT_ROOT_DIR/qml" Main.qml MultiviewWindow.qml
 
   # ---------------------------------------------------------------------------
-  # Sanitizers over the test suite (incl. the threaded recording pipeline).
+  # Sanitizer spot checks. Build+Test above is the full suite; these legs keep
+  # instrumentation focused so CI does not run the same tests three times.
   # ASan+UBSan gates; ThreadSanitizer is advisory while it is being tuned
   # against FFmpeg's internal threads.
   # ---------------------------------------------------------------------------
@@ -147,9 +148,13 @@ jobs:
           - sanitizer: "address;undefined"
             label: asan-ubsan
             advisory: false
+            build_targets: "tst_muxer tst_mpegtsparser tst_h26xaccessunit tst_audiotoolboxaacdecoder tst_audioframequeue record_harness"
+            ctest_regex: "^(tst_muxer|tst_mpegtsparser|tst_h26xaccessunit|tst_audiotoolboxaacdecoder|tst_audioframequeue|e2e_record_mono)$"
           - sanitizer: "thread"
             label: tsan
             advisory: true
+            build_targets: "record_harness play_harness"
+            ctest_regex: "^(e2e_play_storm)$"
     continue-on-error: ${{ matrix.advisory }}
     steps:
       - uses: actions/checkout@v4
@@ -176,19 +181,19 @@ jobs:
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build tests
-        run: cmake --build build --target tst_recordingclock tst_settingsmanager tst_projectsettingsimporter tst_playbacktransport tst_sseparser tst_telemetryclient tst_muxer tst_ingestbackendselector tst_mpegtsparser tst_h26xaccessunit tst_audiotoolboxaacdecoder tst_telemetrytimelinereader tst_replaymanager_telemetry tst_trackbuffer tst_audioframequeue tst_streamdeckmappingstore record_harness play_harness
+        run: cmake --build build --target ${{ matrix.build_targets }}
 
-      - name: Run tests under sanitizer
+      - name: Run sanitizer spot checks
         working-directory: build
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1
-        # Unit tests + e2e_record + the playback storm gate (e2e_play_storm)
-        # run under the sanitizers; the 6 heavier playback scenarios are
-        # excluded here to bound CI time — they run un-sanitized in Build+Test,
-        # and the storm gate already exercises the scheduler/worker concurrency.
-        run: ctest --output-on-failure --repeat until-pass:2 -E 'e2e_play_(seekplay|stepscrub|reverse|sliderscrub|liveedge|4view)' -LE 'sync-report|srt|native-apple-ingest'
+        # The full suite already runs uninstrumented in Build+Test. Keep
+        # sanitizer coverage to high-signal cases:
+        # - ASan+UBSan: mux/parser/audio primitives plus mono recording.
+        # - TSan: playback storm, which records a fixture and drives workers.
+        run: ctest --output-on-failure --repeat until-pass:2 -R '${{ matrix.ctest_regex }}' -LE 'sync-report|srt|native-apple-ingest'
 
 # iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
 # (~20 min) OOM-kills hosted runners. It is validated locally instead via the
