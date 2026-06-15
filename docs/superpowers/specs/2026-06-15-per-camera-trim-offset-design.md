@@ -68,10 +68,19 @@ within the source is preserved.
 - `+D` (delay) holds frames in the queue ~`D` ms longer (queue depth grows by up to
   ~500 ms ≈ 15 frames @30fps — a modest bounded memory increase) and reads audio
   from further back in the FIFO (which retains enough history).
-- `−D` (advance) past the ~200 ms jitter margin asks for content that has not
-  arrived yet: video freezes on the last frame and audio silence-fills, exactly the
-  existing starvation behavior — graceful, self-correcting, and visible so the
-  operator dials back.
+- `−D` (advance) asks for content closer to "now". Within the ~200 ms jitter
+  margin this works; **past it the source is asking for content that has not
+  arrived yet** — video freezes/repeats and audio silence-fills, and because the
+  capture-thread pre-drain gate also shifts, the queue can over-drain and the
+  result is **erratic (judder), not a clean freeze** (e2e: a −250 ms advance on a
+  250 ms-late source produced unstable offsets). Advance is therefore only
+  dependable for small corrections within the jitter margin.
+- **Recommended operator workflow:** to align a lagging camera, **delay the
+  leading cameras (`+D`)** rather than advancing the laggard (`−D`) — you cannot
+  show content that has not arrived, so delay is the robust direction. The e2e
+  `intercam_trim` proof exercises the delay direction: a +250 ms trim on an
+  otherwise-coincident source shifts its measured offset by ≈ −250 ms (untrimmed
+  ≈ 0 → trimmed ≈ −250), i.e. the trim delays the source by the set amount.
 - **Changing** the offset live causes a one-time discontinuity in the source-read
   position (a small audio click / a single frame jump at the instant of change).
   This is acceptable for a set-and-leave trim that is nudged a few times during
