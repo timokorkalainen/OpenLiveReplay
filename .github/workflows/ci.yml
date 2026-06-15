@@ -176,7 +176,7 @@ jobs:
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build tests
-        run: cmake --build build --target tst_recordingclock tst_settingsmanager tst_playbacktransport tst_muxer tst_trackbuffer tst_audioframequeue tst_streamdeckmappingstore record_harness play_harness
+        run: cmake --build build --target tst_recordingclock tst_settingsmanager tst_projectsettingsimporter tst_playbacktransport tst_sseparser tst_telemetryclient tst_muxer tst_telemetrytimelinereader tst_replaymanager_telemetry tst_trackbuffer tst_audioframequeue tst_streamdeckmappingstore record_harness play_harness
 
       - name: Run tests under sanitizer
         working-directory: build
