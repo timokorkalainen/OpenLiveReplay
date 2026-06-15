@@ -17,11 +17,14 @@ struct SourceSettings {
     QString url;
     QJsonArray metadata;
     int trimOffsetMs = 0; // per-source timeline trim (+delay / -advance), ms
+    int telemetryDelayMs = 0; // positive delay so telemetry aligns with video, ms
 };
 
 struct AppSettings {
     QList<SourceSettings> sources;
     QJsonArray metadataFields; // Global field definitions: [{name, display}]
+    QString importSettingsUrl;
+    QString telemetrySseUrl;
     QString saveLocation;
     QString fileName;
     int videoWidth = 1920;

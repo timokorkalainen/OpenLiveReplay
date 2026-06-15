@@ -26,6 +26,8 @@ AppSettings TestSettingsManager::sampleSettings() {
     s.fps = 50;
     s.multiviewCount = 6;
     s.showTimeOfDay = true;
+    s.importSettingsUrl = QStringLiteral("https://provider.example/project-settings.json");
+    s.telemetrySseUrl = QStringLiteral("https://provider.example/telemetry");
     s.midiPortName = QStringLiteral("X-Touch One");
     s.audioOutputLatencyMs = 180;
 
@@ -35,11 +37,13 @@ AppSettings TestSettingsManager::sampleSettings() {
     a.url = QStringLiteral("srt://10.0.0.2:9000");
     a.metadata = QJsonArray{QJsonObject{{"k", "angle"}, {"v", "wide"}}};
     a.trimOffsetMs = -66; // advance
+    a.telemetryDelayMs = 800;
     SourceSettings b;
     b.id = QStringLiteral("src-b");
     b.name = QStringLiteral("Cam B");
     b.url = QStringLiteral("udp://10.0.0.3:9001");
     b.trimOffsetMs = 132; // delay
+    b.telemetryDelayMs = 1200;
     s.sources = {a, b};
 
     s.metadataFields = QJsonArray{QJsonObject{{"name", "angle"}, {"display", "Angle"}}};
@@ -80,6 +84,8 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.audioOutputLatencyMs, in.audioOutputLatencyMs);
     QCOMPARE(out.multiviewCount, in.multiviewCount);
     QCOMPARE(out.showTimeOfDay, in.showTimeOfDay);
+    QCOMPARE(out.importSettingsUrl, in.importSettingsUrl);
+    QCOMPARE(out.telemetrySseUrl, in.telemetrySseUrl);
     QCOMPARE(out.midiPortName, in.midiPortName);
 
     QCOMPARE(out.sources.size(), 2);
@@ -90,6 +96,8 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.sources[1].url, in.sources[1].url);
     QCOMPARE(out.sources[0].trimOffsetMs, in.sources[0].trimOffsetMs);
     QCOMPARE(out.sources[1].trimOffsetMs, in.sources[1].trimOffsetMs);
+    QCOMPARE(out.sources[0].telemetryDelayMs, in.sources[0].telemetryDelayMs);
+    QCOMPARE(out.sources[1].telemetryDelayMs, in.sources[1].telemetryDelayMs);
 
     QCOMPARE(out.metadataFields, in.metadataFields);
 
