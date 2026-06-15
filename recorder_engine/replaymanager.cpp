@@ -21,19 +21,32 @@ ReplayManager::~ReplayManager() {
 void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
                                       const QStringList &feedNames,
                                       const QList<int> &telemetryDelaysMs) {
-    m_telemetryFeedIds = feedIds;
-    m_telemetryFeedNames = feedNames;
-    m_telemetryDelaysMs = telemetryDelaysMs;
+    QMutexLocker locker(&m_stateMutex);
+    if (m_isRecording) {
+        return;
+    }
+
+    m_telemetryFeedIds.clear();
+    m_telemetryFeedNames.clear();
+    m_telemetryDelaysMs.clear();
     m_telemetryFeedIndexById.clear();
 
-    for (int i = 0; i < m_telemetryFeedIds.size(); ++i) {
-        if (!m_telemetryFeedIds.at(i).isEmpty()) {
-            m_telemetryFeedIndexById.insert(m_telemetryFeedIds.at(i), i);
+    for (int i = 0; i < feedIds.size(); ++i) {
+        const QString feedId = feedIds.at(i);
+        if (feedId.isEmpty() || m_telemetryFeedIndexById.contains(feedId)) {
+            continue;
         }
+
+        const int feedIndex = m_telemetryFeedIds.size();
+        m_telemetryFeedIndexById.insert(feedId, feedIndex);
+        m_telemetryFeedIds.append(feedId);
+        m_telemetryFeedNames.append(i < feedNames.size() ? feedNames.at(i) : QString());
+        m_telemetryDelaysMs.append(i < telemetryDelaysMs.size() ? telemetryDelaysMs.at(i) : 0);
     }
 }
 
 bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObject &payload) {
+    QMutexLocker locker(&m_stateMutex);
     if (!m_isRecording || !m_muxer || !m_clock) {
         return false;
     }
@@ -147,6 +160,7 @@ void ReplayManager::cleanupBlueEncoder() {
 
 // ─── Recording lifecycle ───────────────────────────────────────────────
 void ReplayManager::startRecording() {
+    QMutexLocker locker(&m_stateMutex);
     if (m_isRecording || m_sourceUrls.isEmpty()) return;
 
     // 1. Initialize Muxer with M view-tracks (not N source-tracks).
@@ -233,6 +247,7 @@ void ReplayManager::startRecording() {
 }
 
 void ReplayManager::stopRecording() {
+    QMutexLocker locker(&m_stateMutex);
     if (!m_isRecording)
         return;
 
@@ -470,6 +485,7 @@ int64_t ReplayManager::getElapsedMs() {
     // While recording the live clock is authoritative; after stop it is gone,
     // so fall back to the duration captured at stopRecording. Never return -1
     // (that produced garbage snapshot timecodes / QML binding values).
+    QMutexLocker locker(&m_stateMutex);
     if (m_clock) return qMax<int64_t>(0, m_clock->elapsedMs());
     return m_lastKnownDurationMs;
 }
