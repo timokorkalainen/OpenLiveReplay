@@ -54,6 +54,7 @@ target_link_libraries(olr_test_core
 
 # --- Engine sources that DO need FFmpeg (muxer / capture / recording) -------
 qt_add_library(olr_test_engine STATIC
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ffmpegingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/muxer.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/streamworker.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/replaymanager.cpp"
@@ -88,5 +89,6 @@ target_link_libraries(olr_test_playback
     PRIVATE olr_warnings olr_sanitize)
 
 add_subdirectory(unit)
+target_link_libraries(tst_ingestbackendselector PRIVATE olr_test_engine)
 add_subdirectory(smoke)
 add_subdirectory(e2e)

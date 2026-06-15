@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include "recorder_engine/ingest/ffmpegingestsession.h"
 #include "recorder_engine/ingest/ingestsession.h"
 
 class TestIngestBackendSelector : public QObject {
@@ -7,6 +8,7 @@ class TestIngestBackendSelector : public QObject {
 private slots:
     void defaultRoutesEverythingToFfmpeg();
     void nativeSrtFlagRoutesOnlySrtToNative();
+    void canConstructFfmpegSession();
 };
 
 void TestIngestBackendSelector::defaultRoutesEverythingToFfmpeg() {
@@ -30,6 +32,11 @@ void TestIngestBackendSelector::nativeSrtFlagRoutesOnlySrtToNative() {
              IngestBackendKind::Ffmpeg);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
              IngestBackendKind::Ffmpeg);
+}
+
+void TestIngestBackendSelector::canConstructFfmpegSession() {
+    FfmpegIngestSession session(0);
+    QVERIFY(!session.isOpen());
 }
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)

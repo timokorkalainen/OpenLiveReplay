@@ -71,6 +71,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
         recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
         recorder_engine/ingest/ingestsession.h recorder_engine/ingest/ingestsession.cpp
+        recorder_engine/ingest/ffmpegingestsession.h recorder_engine/ingest/ffmpegingestsession.cpp
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp
