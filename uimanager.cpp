@@ -34,7 +34,11 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_settingsManager = new SettingsManager();
     m_importClient = new ProjectImportClient(this);
     connect(m_importClient, &ProjectImportClient::finished, this,
-            [this](const QByteArray &body, const QString &finalUrl) {
+            [this](const QByteArray &body, const QString &sourceUrl) {
+        if (sourceUrl != m_currentSettings.importSettingsUrl.trimmed()) {
+            return;
+        }
+
         QJsonParseError parseError;
         const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
         if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
@@ -48,7 +52,7 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             return;
         }
 
-        ProjectSettingsImportResult result = m_settingsImporter.importJson(doc.object(), finalUrl);
+        ProjectSettingsImportResult result = m_settingsImporter.importJson(doc.object(), sourceUrl);
         if (!result.ok) {
             m_pendingImport = ProjectSettingsImportResult{};
             m_hasPendingImport = false;
@@ -1089,6 +1093,13 @@ void UIManager::setImportSettingsUrl(const QString &url) {
     if (m_currentSettings.importSettingsUrl == trimmed) return;
 
     m_currentSettings.importSettingsUrl = trimmed;
+    if (m_importClient) {
+        m_importClient->cancel();
+    }
+    if (m_hasPendingImport || !m_importPreview.isEmpty() || !m_importPreviewError.isEmpty()) {
+        clearImportPreview();
+        emit importPreviewChanged();
+    }
     emit importSettingsUrlChanged();
 }
 
