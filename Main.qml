@@ -1155,7 +1155,6 @@ ApplicationWindow {
                     Label { text: "Audio output latency (ms)"; }
 
                     SpinBox {
-                        id: audioLatencySpin
                         from: 0
                         to: 500
                         stepSize: 10

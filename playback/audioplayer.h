@@ -123,7 +123,8 @@ public:
     /// it, so a high offset does not storm re-aligns). Takes effect on the next push;
     /// for an already-aligned live stream the caller should clear() to re-align now.
     void setOutputLatencyOffsetMs(int ms) {
-        m_outputLatencyOffsetMs.store(qBound(0, ms, kMaxOutputLatencyMs), std::memory_order_relaxed);
+        m_outputLatencyOffsetMs.store(qBound(0, ms, kMaxOutputLatencyMs),
+                                      std::memory_order_relaxed);
     }
     /// Number of times the aligned branch re-aligned (incremented under m_mutex in
     /// pushSamples). Used by the e2e to assert no re-align storm under a high offset.
@@ -148,10 +149,10 @@ private:
     static constexpr int kRingCapMs     = 500;   // ring safety cap
     static constexpr int kJitterTolMs   = 30;    // PTS continuity tolerance
     static constexpr int kSpliceFadeSamples = 120; // 2.5 ms de-click ramp after a splice
-    static constexpr int kMaxOutputLatencyMs = 500;  // user offset ceiling
-    static constexpr int kResyncHeadroomMs = 250;  // genuine-desync margin ABOVE the
-                                                   // expected steady-state offset divergence;
-                                                   // resync trigger = kResyncHeadroomMs + offset
+    static constexpr int kMaxOutputLatencyMs = 500; // user offset ceiling
+    static constexpr int kResyncHeadroomMs = 250;   // genuine-desync margin ABOVE the
+                                                    // expected steady-state offset divergence;
+                                                    // resync trigger = kResyncHeadroomMs + offset
     // Extra output latency (ms) beyond the QAudioSink buffer to compensate
     // for when aligning the stream start.  Qt's QAudioSink exposes NO API to
     // query real hardware/driver/Bluetooth output latency (typically
@@ -164,7 +165,7 @@ private:
     // the playout latency AND the resync threshold (which scales with it). Written
     // by the UI thread, read on the push path — relaxed: standalone scalar.
     std::atomic<int> m_outputLatencyOffsetMs{0};
-    int m_resyncCount = 0;  // times the aligned branch re-aligned (push thread)
+    int m_resyncCount = 0; // times the aligned branch re-aligned (push thread)
 };
 
 #endif // AUDIOPLAYER_H

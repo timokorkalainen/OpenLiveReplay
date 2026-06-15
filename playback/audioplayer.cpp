@@ -231,8 +231,7 @@ void AudioPlayer::pushSamples(const uint8_t *data, int numBytes,
     const int bytesPerSecond = m_sampleRate * m_channels * int(sizeof(int16_t));
     const int outLatencyMs = m_outputLatencyOffsetMs.load(std::memory_order_relaxed);
     const int64_t latencySamples =
-        (m_sinkLatencyBytes + int64_t(outLatencyMs) * bytesPerSecond / 1000) /
-        bytesPerFrame;
+        (m_sinkLatencyBytes + int64_t(outLatencyMs) * bytesPerSecond / 1000) / bytesPerFrame;
     const int64_t dueSamples = masterTimeMs * m_sampleRate / 1000 + latencySamples;
 
     const char* payload = reinterpret_cast<const char*>(data);

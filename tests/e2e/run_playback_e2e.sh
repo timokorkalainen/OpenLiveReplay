@@ -250,6 +250,7 @@ case "$SCENARIO" in
         # 1x playback with a 300 ms output-latency offset must NOT storm re-aligns:
         # the resync threshold scales with the offset (kResyncHeadroomMs + offset),
         # so the steady offset divergence is tolerated. resyncCount must stay 0.
+        # (reposition not re-asserted here — PH_SCENARIO=play1x, and e2e_play_storm owns that gate)
         if ! num "$audioPushes" || [ "$audioPushes" -le 0 ]; then
             echo "FAIL: latency produced no audio (audioPushes=$audioPushes) — audio path dead"
             fail=1

@@ -904,10 +904,12 @@ void UIManager::setRecordFps(int fps) {
     }
 }
 
-int UIManager::audioOutputLatencyMs() const { return m_currentSettings.audioOutputLatencyMs; }
+int UIManager::audioOutputLatencyMs() const {
+    return m_currentSettings.audioOutputLatencyMs;
+}
 
 void UIManager::setAudioOutputLatencyMs(int ms) {
-    const int clamped = qBound(0, ms, 500);  // keep in sync with AudioPlayer::kMaxOutputLatencyMs
+    const int clamped = qBound(0, ms, 500); // keep in sync with AudioPlayer::kMaxOutputLatencyMs
     if (m_currentSettings.audioOutputLatencyMs == clamped) return;
     m_currentSettings.audioOutputLatencyMs = clamped;
     if (m_audioPlayer) {
@@ -1429,7 +1431,8 @@ void UIManager::loadSettings() {
         emit sourceEnabledChanged();
         m_sourceTrimVersion++;
         emit sourceTrimChanged();
-        if (m_audioPlayer) m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs);
+        if (m_audioPlayer)
+            m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs);
         emit audioOutputLatencyChanged();
     }
 }
