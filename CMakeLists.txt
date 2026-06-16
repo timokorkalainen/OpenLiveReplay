@@ -72,6 +72,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
         recorder_engine/ingest/ingestsession.h recorder_engine/ingest/ingestsession.cpp
         recorder_engine/ingest/ffmpegingestsession.h recorder_engine/ingest/ffmpegingestsession.cpp
+        recorder_engine/ingest/nativefallbackpolicy.h recorder_engine/ingest/nativefallbackpolicy.cpp
         recorder_engine/ingest/pespacket.h
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp

@@ -49,6 +49,7 @@ public:
     virtual bool open(const QUrl& url, const IngestCallbacks& callbacks) = 0;
     virtual void run() = 0;
     virtual void requestStop() = 0;
+    virtual QString nativeFallbackReason() const { return QString(); }
 };
 
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options);

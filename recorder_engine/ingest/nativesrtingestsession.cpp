@@ -1,5 +1,6 @@
 #include "nativesrtingestsession.h"
 
+#include "nativefallbackpolicy.h"
 #include "nativesrtaddress.h"
 
 #include <QDebug>
@@ -141,6 +142,7 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_decoder.reset();
     m_audioDecoder.reset();
     m_audioRemainder.clear();
+    m_nativeFallbackReason.clear();
     m_firstDts90k = -1;
     m_prevDts90k = -1;
     m_anchorStreamTimeMs = -1;
@@ -205,6 +207,10 @@ void NativeSrtIngestSession::run() {
 void NativeSrtIngestSession::requestStop() {
     m_stopRequested.store(true, std::memory_order_relaxed);
     closeSocket();
+}
+
+QString NativeSrtIngestSession::nativeFallbackReason() const {
+    return m_nativeFallbackReason;
 }
 
 bool NativeSrtIngestSession::openSocket(QString* error) {
@@ -329,6 +335,14 @@ void NativeSrtIngestSession::log(const QString& message) const {
     }
 }
 
+void NativeSrtIngestSession::markNativeFallback(const QString& reason) {
+    if (m_nativeFallbackReason.isEmpty()) {
+        m_nativeFallbackReason = reason;
+        m_stopRequested.store(true, std::memory_order_relaxed);
+        log(reason);
+    }
+}
+
 void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
     if (!data || size <= 0) {
         return;
@@ -429,7 +443,11 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
             },
             &error);
         if (!decoded && !error.isEmpty()) {
-            log(error);
+            if (nativeDecodeErrorRequestsFallback(error)) {
+                markNativeFallback(error);
+            } else {
+                log(error);
+            }
         }
     }
 }

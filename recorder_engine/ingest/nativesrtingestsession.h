@@ -26,6 +26,7 @@ public:
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
     void requestStop() override;
+    QString nativeFallbackReason() const override;
 
 private:
     int m_sourceIndex = -1;
@@ -44,6 +45,7 @@ private:
     std::unique_ptr<AudioToolboxAacDecoder> m_audioDecoder;
     QByteArray m_tsBuffer;
     QByteArray m_audioRemainder;
+    QString m_nativeFallbackReason;
     int m_socket = -1;
     bool m_srtLibraryStarted = false;
     int64_t m_firstDts90k = -1;
@@ -60,6 +62,7 @@ private:
     void closeSocket();
     bool shouldStop() const;
     void log(const QString& message) const;
+    void markNativeFallback(const QString& reason);
     void processReceivedBytes(const char* data, int size);
     void processPesPacket(const PesPacket& pes);
     void processAudioPesPacket(const PesPacket& pes);

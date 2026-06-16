@@ -201,6 +201,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 }
 
 void StreamWorker::captureLoop() {
+    bool suppressNativeForCurrentUrl = false;
+    QString nativeSuppressedUrl;
+
     while (m_captureRunning) {
         // If a restart was requested (e.g. changeSource), acknowledge it
         // and loop back to re-read the URL instead of exiting.
@@ -208,6 +211,11 @@ void StreamWorker::captureLoop() {
 
         QString currentUrl;
         { QMutexLocker locker(&m_urlMutex); currentUrl = m_url; }
+
+        if (nativeSuppressedUrl != currentUrl) {
+            nativeSuppressedUrl = currentUrl;
+            suppressNativeForCurrentUrl = false;
+        }
 
         // If URL is empty, don't attempt to connect. Just idle until
         // a new URL is set via changeSource() which sets m_restartCapture.
@@ -283,7 +291,8 @@ void StreamWorker::captureLoop() {
         IngestBackendOptions backendOptions;
         const QUrl sourceUrl(currentUrl);
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
-        backendOptions.preferNativeSrt = qEnvironmentVariableIsSet("OLR_NATIVE_SRT")
+        backendOptions.preferNativeSrt = !suppressNativeForCurrentUrl
+                                         && qEnvironmentVariableIsSet("OLR_NATIVE_SRT")
                                          && NativeSrtIngestSession::supportsUrl(sourceUrl);
 #endif
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
@@ -330,6 +339,14 @@ void StreamWorker::captureLoop() {
         }
 
         session->run();
+
+        const QString nativeFallbackReason = session->nativeFallbackReason();
+        if (!nativeFallbackReason.isEmpty()) {
+            qDebug() << "Source" << m_sourceIndex
+                     << "Native ingest fallback requested:" << nativeFallbackReason
+                     << "Retrying with FFmpeg for this URL.";
+            suppressNativeForCurrentUrl = true;
+        }
 
         setConnected(false);
     }
