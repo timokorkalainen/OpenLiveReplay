@@ -31,21 +31,31 @@ This will, deterministically and idempotently:
    into `windows_build/dist/` — see `build-scripts/build_ffmpeg_windows_srt.sh`.
 2. Configure with the `windows-mingw-release` CMake preset.
 3. Compile and link `build/OpenLiveReplay.exe`.
-4. Run `windeployqt` and copy the FFmpeg/SRT/rtmidi DLLs into `build/`, leaving a
-   runnable directory.
+4. Run `windeployqt` and assemble a self-contained bundle at
+   `windows_build/dist/OpenLiveReplay/`, zipped to
+   `windows_build/dist/OpenLiveReplay-windows.zip`.
 
 Re-running is cheap: the dependency build skips when its artifacts already exist
 (delete `windows_build/` to force a clean rebuild).
 
 ### Toolchain overrides
 
-If your Qt lives elsewhere, set any of these before running:
+The toolchain is auto-discovered: no Qt or MinGW version is hard-coded. Override
+any of these if your install differs:
 
-| Variable | Default |
+| Variable | How it's resolved |
 | --- | --- |
-| `OLR_QT_ROOT` | `C:/Qt/6.10.2/mingw_64` (else newest `C:/Qt/6.*/mingw_64`) |
-| `OLR_MINGW_ROOT` | `C:/Qt/Tools/mingw1310_64` |
-| `CMAKE_BIN` / `NINJA_BIN` | from `PATH`, else `C:/Qt/Tools/{CMake_64/bin,Ninja}` |
+| `OLR_QT_ROOT` | env → `QT_ROOT_DIR` (set by `install-qt-action` in CI) → newest `C:/Qt/6.*/mingw_64` |
+| `OLR_MINGW_ROOT` | env → newest `mingw*_64` under the Qt `Tools` dir → newest `C:/Qt/Tools/mingw*_64` |
+| `CMAKE_BIN` / `NINJA_BIN` | from `PATH`, else under the Qt `Tools` dir |
+
+## Continuous integration
+
+`.github/workflows/build.yml` is a manually-triggered (`workflow_dispatch`)
+workflow that runs this same script on a clean Windows runner (and builds the
+macOS app via `build-scripts/build_macos_app.sh`), uploading each as an artifact.
+Running on a fresh runner is the proof that the build has no dependency on any
+one developer's machine.
 
 ## Manual / IDE build
 

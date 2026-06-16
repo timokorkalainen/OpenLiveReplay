@@ -1,0 +1,83 @@
+name: Build apps (manual)
+
+# Manually-triggered packaging build. Produces downloadable, self-contained app
+# bundles for Windows and macOS. (Linux is planned for a later PR.)
+on:
+  workflow_dispatch:
+    inputs:
+      qt_version:
+        description: "Qt version to build against"
+        required: false
+        default: "6.10.2"
+
+concurrency:
+  group: build-apps-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows (MinGW)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Qt MinGW kit + the matching MinGW 13.1 toolchain + Ninja. install-qt-action
+      # exports QT_ROOT_DIR; the build scripts discover MinGW/Ninja under it.
+      - name: Install Qt (MinGW) + tools
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ inputs.qt_version || '6.10.2' }}
+          host: windows
+          target: desktop
+          arch: win64_mingw
+          modules: qtmultimedia
+          tools: tools_mingw1310 tools_ninja
+          cache: true
+
+      # One command: builds FFmpeg + SRT from pinned source, configures, builds,
+      # deploys, and zips windows_build/dist/OpenLiveReplay-windows.zip.
+      - name: Build (deps + app + deploy)
+        shell: bash
+        run: |
+          export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
+          ./build-scripts/build_windows_app.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenLiveReplay-windows
+          path: windows_build/dist/OpenLiveReplay-windows.zip
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ inputs.qt_version || '6.10.2' }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia
+          cache: true
+
+      - name: Install build deps
+        run: brew install ninja ffmpeg srt
+
+      - name: Build + package (.app)
+        shell: bash
+        run: ./build-scripts/build_macos_app.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenLiveReplay-macos
+          path: macos_build/dist/OpenLiveReplay-macos.zip
+          if-no-files-found: error
