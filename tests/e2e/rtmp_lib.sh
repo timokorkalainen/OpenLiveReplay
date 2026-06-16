@@ -27,19 +27,16 @@ rtmp_url() {
 }
 
 rtmp_fixture_server_cmd() {
-    if [ -n "${RTMP_FIXTURE_OUT_CHUNK_SIZE:-}" ] && [ -n "${RTMP_FIXTURE_WRITE_FRAGMENT:-}" ]; then
-        python3 "$HERE/rtmp_fixture_server.py" "$@" \
-            --out-chunk-size "$RTMP_FIXTURE_OUT_CHUNK_SIZE" \
-            --write-fragment "$RTMP_FIXTURE_WRITE_FRAGMENT"
-    elif [ -n "${RTMP_FIXTURE_OUT_CHUNK_SIZE:-}" ]; then
-        python3 "$HERE/rtmp_fixture_server.py" "$@" \
-            --out-chunk-size "$RTMP_FIXTURE_OUT_CHUNK_SIZE"
-    elif [ -n "${RTMP_FIXTURE_WRITE_FRAGMENT:-}" ]; then
-        python3 "$HERE/rtmp_fixture_server.py" "$@" \
-            --write-fragment "$RTMP_FIXTURE_WRITE_FRAGMENT"
-    else
-        python3 "$HERE/rtmp_fixture_server.py" "$@"
+    if [ -n "${RTMP_FIXTURE_OUT_CHUNK_SIZE:-}" ]; then
+        set -- "$@" --out-chunk-size "$RTMP_FIXTURE_OUT_CHUNK_SIZE"
     fi
+    if [ -n "${RTMP_FIXTURE_WRITE_FRAGMENT:-}" ]; then
+        set -- "$@" --write-fragment "$RTMP_FIXTURE_WRITE_FRAGMENT"
+    fi
+    if [ -n "${RTMP_FIXTURE_WRITE_FRAGMENT_DELAY:-}" ]; then
+        set -- "$@" --write-fragment-delay "$RTMP_FIXTURE_WRITE_FRAGMENT_DELAY"
+    fi
+    python3 "$HERE/rtmp_fixture_server.py" "$@"
 }
 
 rtmp_generate_tone_flv() { # $1=path $2=freq_hz $3=seconds

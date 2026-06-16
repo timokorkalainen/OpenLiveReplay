@@ -182,10 +182,12 @@ class RtmpWriter:
         conn: socket.socket,
         chunk_size: int = OUT_CHUNK_SIZE,
         write_fragment: int = 0,
+        write_fragment_delay: float = 0.0,
     ) -> None:
         self.conn = conn
         self.chunk_size = chunk_size
         self.write_fragment = write_fragment
+        self.write_fragment_delay = write_fragment_delay
 
     def send_bytes(self, data: bytes) -> None:
         if self.write_fragment <= 0:
@@ -193,7 +195,8 @@ class RtmpWriter:
             return
         for offset in range(0, len(data), self.write_fragment):
             self.conn.sendall(data[offset : offset + self.write_fragment])
-            time.sleep(0.001)
+            if self.write_fragment_delay > 0:
+                time.sleep(self.write_fragment_delay)
 
     def send_message(self, csid: int, message_type: int, stream_id: int, timestamp: int, payload: bytes) -> None:
         header_ts = min(timestamp, 0xFFFFFF)
@@ -443,7 +446,12 @@ def run_server(args: argparse.Namespace) -> None:
             read_exact(conn, 1536)
 
             reader = RtmpReader(conn)
-            writer = RtmpWriter(conn, args.out_chunk_size, args.write_fragment)
+            writer = RtmpWriter(
+                conn,
+                args.out_chunk_size,
+                args.write_fragment,
+                args.write_fragment_delay,
+            )
             writer.set_chunk_size()
             writer.window_ack()
             writer.peer_bandwidth()
@@ -562,9 +570,12 @@ def main() -> int:
     parser.add_argument("--tls-key")
     parser.add_argument("--out-chunk-size", type=int, default=OUT_CHUNK_SIZE)
     parser.add_argument("--write-fragment", type=int, default=0)
+    parser.add_argument("--write-fragment-delay", type=float, default=0.0)
     args = parser.parse_args()
     if args.out_chunk_size <= 0:
         parser.error("--out-chunk-size must be positive")
+    if args.write_fragment_delay < 0:
+        parser.error("--write-fragment-delay must be non-negative")
 
     try:
         run_server(args)
