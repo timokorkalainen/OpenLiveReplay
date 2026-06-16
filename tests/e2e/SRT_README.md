@@ -67,15 +67,49 @@ The gate thresholds are validated against real local runs; if one proves flaky,
 widen the bound (never delete the gate) — the content gates (per-view flash count,
 connection count) carry the discrimination.
 
-## Native Apple SRT path
+## Native SRT path
 
-The Apple native ingest path can be tested on macOS without an SRT-enabled
-FFmpeg build. It uses the same SRT producers, but runs the engine with
-`OLR_NATIVE_SRT=1`, so `srt://` input goes through:
+The native ingest path can be tested without an SRT-enabled FFmpeg build. It
+uses the same SRT producers, but runs the engine with `OLR_NATIVE_SRT=1`, so
+`srt://` input goes through:
 
 ```text
-libsrt -> MPEG-TS parser -> H.264/H.265 access-unit splitter -> VideoToolbox
+libsrt -> MPEG-TS parser -> H.264/H.265 access-unit splitter -> platform native decoder
 ```
+
+Platform native decoders:
+
+- Apple: `VideoToolbox`
+- Windows: `Media Foundation/D3D11` (planned/when implemented)
+
+The native SRT e2e scripts are shared across platforms. CTest registers the
+same `e2e_native_srt_*` test names for each native platform and changes only the
+label:
+
+Shared native test names:
+
+- `e2e_native_srt_smoke`
+- `e2e_native_srt_4cam`
+- `e2e_native_srt_sync`
+- `e2e_native_srt_trim`
+- `e2e_native_srt_connect`
+
+Shared scripts:
+
+- `run_srt_smoke.sh`
+- `run_srt_4cam.sh`
+- `run_srt_sync.sh`
+- `run_srt_trim.sh`
+- `run_srt_connect.sh`
+
+Labels:
+
+- macOS/iOS host builds: `native-apple-ingest`
+- Windows host builds: `native-windows-ingest`
+
+Both labels run with `OLR_NATIVE_SRT=1`. The producer side still uses local
+`ffmpeg` and `srt-live-transmit`; the engine side must not require FFmpeg SRT
+support for native ingest.
 
 Configure against the normal Homebrew FFmpeg (no `OLR_FFMPEG_SRT_PREFIX`) and run
 the `native-apple-ingest` label:
@@ -85,6 +119,14 @@ cmake -S . -B build/native-srt -G Ninja -DOLR_BUILD_TESTS=ON \
   -DCMAKE_PREFIX_PATH="$HOME/Qt/6.10.1/macos"
 ninja -C build/native-srt record_harness sync_harness
 ( cd build/native-srt && ctest -L native-apple-ingest --output-on-failure )
+```
+
+Windows uses the same shared scripts and `e2e_native_srt_*` test names under the
+`native-windows-ingest` label. It requires local producer tools (`ffmpeg`,
+`srt-live-transmit`, and a Bash-compatible shell) and runs:
+
+```powershell
+ctest --test-dir build/windows-native -C Debug -L native-windows-ingest --output-on-failure
 ```
 
 This intentionally proves the native SRT path is carrying the stream: the default

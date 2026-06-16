@@ -134,7 +134,7 @@ add_test(NAME e2e_srt_connect
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_connect.sh" "$<TARGET_FILE:sync_harness>" 23540)
 set_tests_properties(e2e_srt_connect PROPERTIES LABELS "srt" TIMEOUT 180 RUN_SERIAL TRUE)
 
-if(APPLE)
+function(olr_add_native_srt_e2e_tests native_label)
     add_test(NAME e2e_native_srt_smoke
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_smoke.sh" "$<TARGET_FILE:record_harness>" 23601)
     add_test(NAME e2e_native_srt_4cam
@@ -149,8 +149,14 @@ if(APPLE)
         e2e_native_srt_smoke e2e_native_srt_4cam e2e_native_srt_sync
         e2e_native_srt_trim e2e_native_srt_connect
         PROPERTIES
-        LABELS "native-apple-ingest"
+        LABELS "${native_label}"
         TIMEOUT 180
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
+endfunction()
+
+if(APPLE)
+    olr_add_native_srt_e2e_tests("native-apple-ingest")
+elseif(WIN32)
+    olr_add_native_srt_e2e_tests("native-windows-ingest")
 endif()
