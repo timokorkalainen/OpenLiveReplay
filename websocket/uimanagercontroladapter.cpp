@@ -8,19 +8,19 @@
 #include <QJsonObject>
 #include <QJsonValue>
 
-UIManagerControlAdapter::UIManagerControlAdapter(UIManager *uiManager, QObject *parent)
-    : QObject(parent),
-      m_uiManager(uiManager) {}
+UIManagerControlAdapter::UIManagerControlAdapter(UIManager* uiManager, QObject* parent)
+    : QObject(parent), m_uiManager(uiManager) {}
 
 RecordingState UIManagerControlAdapter::recordingState() const {
     if (!m_uiManager) return {};
-    return {m_uiManager->isRecording(), m_uiManager->recordedDurationMs(), m_uiManager->recordingStartEpochMs()};
+    return {m_uiManager->isRecording(), m_uiManager->recordedDurationMs(),
+            m_uiManager->recordingStartEpochMs()};
 }
 
 TransportState UIManagerControlAdapter::transportState() const {
     if (!m_uiManager) return {};
 
-    PlaybackTransport *transport = m_uiManager->transport();
+    PlaybackTransport* transport = m_uiManager->transport();
 
     TransportState state;
     state.positionMs = transport ? transport->currentPos() : 0;
@@ -88,71 +88,55 @@ SettingsState UIManagerControlAdapter::settingsState() const {
 MidiState UIManagerControlAdapter::midiState() const {
     if (!m_uiManager) return {};
 
-    return {
-        m_uiManager->midiPorts(),
-        m_uiManager->midiPortIndex(),
-        m_uiManager->midiPortName(),
-        m_uiManager->midiConnected(),
-        m_uiManager->midiLearnAction(),
-        m_uiManager->midiLearnMode()
-    };
+    return {m_uiManager->midiPorts(),       m_uiManager->midiPortIndex(),
+            m_uiManager->midiPortName(),    m_uiManager->midiConnected(),
+            m_uiManager->midiLearnAction(), m_uiManager->midiLearnMode()};
 }
 
 StreamDeckState UIManagerControlAdapter::streamDeckState() const {
     if (!m_uiManager) return {};
 
-    StreamDeckManager *deck = m_uiManager->streamDeck();
+    StreamDeckManager* deck = m_uiManager->streamDeck();
     if (!deck) return {};
 
-    return {
-        deck->supported(),
-        deck->connected(),
-        deck->deviceName(),
-        deck->deviceModel(),
-        deck->keyCount(),
-        deck->dialCount(),
-        m_uiManager->streamDeckLearnAction()
-    };
+    return {deck->supported(),
+            deck->connected(),
+            deck->deviceName(),
+            deck->deviceModel(),
+            deck->keyCount(),
+            deck->dialCount(),
+            m_uiManager->streamDeckLearnAction()};
 }
 
 ScreensState UIManagerControlAdapter::screensState() const {
     if (!m_uiManager) return {};
 
-    return {
-        m_uiManager->screensReady(),
-        m_uiManager->screenCount(),
-        m_uiManager->screenOptions()
-    };
+    return {m_uiManager->screensReady(), m_uiManager->screenCount(), m_uiManager->screenOptions()};
 }
 
 ImportState UIManagerControlAdapter::importState() const {
     if (!m_uiManager) return {};
 
-    return {
-        m_uiManager->importSettingsUrl(),
-        m_uiManager->telemetrySseUrl(),
-        m_uiManager->importPreviewReady(),
-        m_uiManager->importPreviewError(),
-        m_uiManager->importPreview()
-    };
+    return {m_uiManager->importSettingsUrl(), m_uiManager->telemetrySseUrl(),
+            m_uiManager->importPreviewReady(), m_uiManager->importPreviewError(),
+            m_uiManager->importPreview()};
 }
 
 TelemetryState UIManagerControlAdapter::telemetryState() const {
     if (!m_uiManager) return {};
 
-    return {
-        m_uiManager->telemetryVersion(),
-        m_uiManager->telemetryRowsAtPlayhead(),
-        m_uiManager->telemetryAtPlayhead()
-    };
+    return {m_uiManager->telemetryVersion(), m_uiManager->telemetryRowsAtPlayhead(),
+            m_uiManager->telemetryAtPlayhead()};
 }
 
-CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const QJsonObject &args) {
+CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
+                                                      const QJsonObject& args) {
     if (!m_uiManager) {
-        return CommandResult::failure(QStringLiteral("failed"), QStringLiteral("UIManager is unavailable"));
+        return CommandResult::failure(QStringLiteral("failed"),
+                                      QStringLiteral("UIManager is unavailable"));
     }
 
-    PlaybackTransport *transport = m_uiManager->transport();
+    PlaybackTransport* transport = m_uiManager->transport();
 
     if (name == QStringLiteral("transport.playPause")) {
         m_uiManager->playPause();
@@ -198,7 +182,8 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
     } else if (name == QStringLiteral("transport.stepFrame")) {
         m_uiManager->jogExternal(args.value(QStringLiteral("frames")).toInt());
     } else if (name == QStringLiteral("transport.seek")) {
-        m_uiManager->seekPlayback(args.value(QStringLiteral("positionMs")).toVariant().toLongLong());
+        m_uiManager->seekPlayback(
+            args.value(QStringLiteral("positionMs")).toVariant().toLongLong());
     } else if (name == QStringLiteral("transport.goLive")) {
         m_uiManager->goLive();
     } else if (name == QStringLiteral("transport.cancelFollowLive")) {
@@ -208,11 +193,13 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
     } else if (name == QStringLiteral("recording.stop")) {
         m_uiManager->stopRecording();
     } else if (name == QStringLiteral("recording.toggle")) {
-        if (m_uiManager->isRecording()) m_uiManager->stopRecording();
-        else m_uiManager->startRecording();
+        if (m_uiManager->isRecording())
+            m_uiManager->stopRecording();
+        else
+            m_uiManager->startRecording();
     } else if (name == QStringLiteral("view.setPlaybackViewState")) {
         m_uiManager->setPlaybackViewState(args.value(QStringLiteral("singleView")).toBool(),
-                                         args.value(QStringLiteral("selectedIndex")).toInt());
+                                          args.value(QStringLiteral("selectedIndex")).toInt());
     } else if (name == QStringLiteral("view.showMultiview")) {
         m_uiManager->dispatchExternalAction(6, true);
     } else if (name == QStringLiteral("view.selectFeed")) {
@@ -222,9 +209,10 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
     } else if (name == QStringLiteral("capture.current")) {
         m_uiManager->captureCurrent();
     } else if (name == QStringLiteral("capture.snapshot")) {
-        m_uiManager->captureSnapshot(args.value(QStringLiteral("singleView")).toBool(),
-                                     args.value(QStringLiteral("selectedIndex")).toInt(),
-                                     args.value(QStringLiteral("playheadMs")).toVariant().toLongLong());
+        m_uiManager->captureSnapshot(
+            args.value(QStringLiteral("singleView")).toBool(),
+            args.value(QStringLiteral("selectedIndex")).toInt(),
+            args.value(QStringLiteral("playheadMs")).toVariant().toLongLong());
     } else if (name == QStringLiteral("sources.add")) {
         m_uiManager->addStream();
     } else if (name == QStringLiteral("sources.remove")) {
@@ -234,16 +222,17 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
                                args.value(QStringLiteral("url")).toString());
     } else if (name == QStringLiteral("sources.updateName")) {
         m_uiManager->updateStreamName(args.value(QStringLiteral("index")).toInt(),
-                                     args.value(QStringLiteral("name")).toString());
+                                      args.value(QStringLiteral("name")).toString());
     } else if (name == QStringLiteral("sources.updateId")) {
         m_uiManager->updateStreamId(args.value(QStringLiteral("index")).toInt(),
                                     args.value(QStringLiteral("id")).toString());
     } else if (name == QStringLiteral("sources.setTrimOffset")) {
         m_uiManager->setSourceTrimOffset(args.value(QStringLiteral("index")).toInt(),
-                                        args.value(QStringLiteral("ms")).toInt());
+                                         args.value(QStringLiteral("ms")).toInt());
     } else if (name == QStringLiteral("sources.setMetadata")) {
-        m_uiManager->setSourceMetadataItems(args.value(QStringLiteral("index")).toInt(),
-                                           args.value(QStringLiteral("items")).toArray().toVariantList());
+        m_uiManager->setSourceMetadataItems(
+            args.value(QStringLiteral("index")).toInt(),
+            args.value(QStringLiteral("items")).toArray().toVariantList());
     } else if (name == QStringLiteral("settings.setProject")) {
         if (args.contains(QStringLiteral("fileName"))) {
             m_uiManager->setFileName(args.value(QStringLiteral("fileName")).toString());
@@ -253,7 +242,8 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
         }
     } else if (name == QStringLiteral("settings.setRecordingFormat")) {
         if (m_uiManager->isRecording() && args.contains(QStringLiteral("fps"))) {
-            return CommandResult::failure(QStringLiteral("not_allowed"), QStringLiteral("FPS cannot be changed while recording"));
+            return CommandResult::failure(QStringLiteral("not_allowed"),
+                                          QStringLiteral("FPS cannot be changed while recording"));
         }
         if (args.contains(QStringLiteral("width"))) {
             m_uiManager->setRecordWidth(args.value(QStringLiteral("width")).toInt());
@@ -269,7 +259,8 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
     } else if (name == QStringLiteral("settings.setTimeOfDayMode")) {
         m_uiManager->setTimeOfDayMode(args.value(QStringLiteral("enabled")).toBool());
     } else if (name == QStringLiteral("settings.setMetadataFields")) {
-        m_uiManager->setMetadataFieldDefinitions(args.value(QStringLiteral("fields")).toArray().toVariantList());
+        m_uiManager->setMetadataFieldDefinitions(
+            args.value(QStringLiteral("fields")).toArray().toVariantList());
     } else if (name == QStringLiteral("settings.save")) {
         m_uiManager->saveSettings();
     } else if (name == QStringLiteral("import.setUrl")) {
@@ -304,7 +295,8 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
     } else if (name == QStringLiteral("action.shuttle")) {
         m_uiManager->shuttleExternal(args.value(QStringLiteral("delta")).toInt());
     } else {
-        return CommandResult::failure(QStringLiteral("unknown_command"), QStringLiteral("Unknown command"));
+        return CommandResult::failure(QStringLiteral("unknown_command"),
+                                      QStringLiteral("Unknown command"));
     }
 
     return CommandResult::success();

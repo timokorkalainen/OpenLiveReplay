@@ -25,9 +25,8 @@ private slots:
 };
 
 void TestControlProtocol::parsesCommandWithIdAndArgs() {
-    const QByteArray raw =
-        "{\"type\":\"command\",\"id\":\"abc-1\",\"name\":\"transport.seek\","
-        "\"args\":{\"positionMs\":1234}}";
+    const QByteArray raw = "{\"type\":\"command\",\"id\":\"abc-1\",\"name\":\"transport.seek\","
+                           "\"args\":{\"positionMs\":1234}}";
 
     const ControlProtocol::ParseResult result = ControlProtocol::parseTextMessage(raw);
 
@@ -56,12 +55,9 @@ void TestControlProtocol::rejectsMissingCommandName() {
 }
 
 void TestControlProtocol::validatesSeekArgs() {
-    const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("seek-1"),
-        QStringLiteral("transport.seek"),
-        QJsonObject{{QStringLiteral("positionMs"), 42}}
-    };
+    const ControlCommandMessage command{QStringLiteral("command"), QStringLiteral("seek-1"),
+                                        QStringLiteral("transport.seek"),
+                                        QJsonObject{{QStringLiteral("positionMs"), 42}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -71,11 +67,8 @@ void TestControlProtocol::validatesSeekArgs() {
 
 void TestControlProtocol::validatesSeekArgsAcceptsLargeInteger() {
     const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("seek-large"),
-        QStringLiteral("transport.seek"),
-        QJsonObject{{QStringLiteral("positionMs"), 9007199254740991LL}}
-    };
+        QStringLiteral("command"), QStringLiteral("seek-large"), QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 9007199254740991LL}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -85,12 +78,9 @@ void TestControlProtocol::validatesSeekArgsAcceptsLargeInteger() {
 }
 
 void TestControlProtocol::rejectsSeekWithFractionalPosition() {
-    const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("seek-fraction"),
-        QStringLiteral("transport.seek"),
-        QJsonObject{{QStringLiteral("positionMs"), 42.5}}
-    };
+    const ControlCommandMessage command{QStringLiteral("command"), QStringLiteral("seek-fraction"),
+                                        QStringLiteral("transport.seek"),
+                                        QJsonObject{{QStringLiteral("positionMs"), 42.5}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -100,12 +90,8 @@ void TestControlProtocol::rejectsSeekWithFractionalPosition() {
 }
 
 void TestControlProtocol::rejectsSeekWithoutPosition() {
-    const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("seek-2"),
-        QStringLiteral("transport.seek"),
-        QJsonObject{}
-    };
+    const ControlCommandMessage command{QStringLiteral("command"), QStringLiteral("seek-2"),
+                                        QStringLiteral("transport.seek"), QJsonObject{}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -115,12 +101,9 @@ void TestControlProtocol::rejectsSeekWithoutPosition() {
 }
 
 void TestControlProtocol::validatesHoldSpeedReleaseWithoutSpeed() {
-    const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("hold-release"),
-        QStringLiteral("transport.holdSpeed"),
-        QJsonObject{{QStringLiteral("active"), false}}
-    };
+    const ControlCommandMessage command{QStringLiteral("command"), QStringLiteral("hold-release"),
+                                        QStringLiteral("transport.holdSpeed"),
+                                        QJsonObject{{QStringLiteral("active"), false}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -129,12 +112,9 @@ void TestControlProtocol::validatesHoldSpeedReleaseWithoutSpeed() {
 }
 
 void TestControlProtocol::rejectsHoldSpeedStartWithoutSpeed() {
-    const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("hold-start"),
-        QStringLiteral("transport.holdSpeed"),
-        QJsonObject{{QStringLiteral("active"), true}}
-    };
+    const ControlCommandMessage command{QStringLiteral("command"), QStringLiteral("hold-start"),
+                                        QStringLiteral("transport.holdSpeed"),
+                                        QJsonObject{{QStringLiteral("active"), true}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -144,12 +124,9 @@ void TestControlProtocol::rejectsHoldSpeedStartWithoutSpeed() {
 }
 
 void TestControlProtocol::validatesActionDispatchDefaultsPressed() {
-    const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("action-1"),
-        QStringLiteral("action.dispatch"),
-        QJsonObject{{QStringLiteral("actionId"), 0}}
-    };
+    const ControlCommandMessage command{QStringLiteral("command"), QStringLiteral("action-1"),
+                                        QStringLiteral("action.dispatch"),
+                                        QJsonObject{{QStringLiteral("actionId"), 0}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -160,11 +137,8 @@ void TestControlProtocol::validatesActionDispatchDefaultsPressed() {
 
 void TestControlProtocol::rejectsActionDispatchForShuttleId() {
     const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("action-shuttle-wrong"),
-        QStringLiteral("action.dispatch"),
-        QJsonObject{{QStringLiteral("actionId"), 10}}
-    };
+        QStringLiteral("command"), QStringLiteral("action-shuttle-wrong"),
+        QStringLiteral("action.dispatch"), QJsonObject{{QStringLiteral("actionId"), 10}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -174,12 +148,9 @@ void TestControlProtocol::rejectsActionDispatchForShuttleId() {
 }
 
 void TestControlProtocol::validatesActionShuttleDelta() {
-    const ControlCommandMessage command{
-        QStringLiteral("command"),
-        QStringLiteral("shuttle-1"),
-        QStringLiteral("action.shuttle"),
-        QJsonObject{{QStringLiteral("delta"), -1}}
-    };
+    const ControlCommandMessage command{QStringLiteral("command"), QStringLiteral("shuttle-1"),
+                                        QStringLiteral("action.shuttle"),
+                                        QJsonObject{{QStringLiteral("delta"), -1}}};
 
     const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
 
@@ -196,9 +167,9 @@ void TestControlProtocol::buildsSuccessAck() {
 }
 
 void TestControlProtocol::buildsFailureAck() {
-    const QJsonObject ack = ControlProtocol::ackError(
-        QStringLiteral("abc-2"), QStringLiteral("invalid_args"),
-        QStringLiteral("positionMs must be an integer"));
+    const QJsonObject ack =
+        ControlProtocol::ackError(QStringLiteral("abc-2"), QStringLiteral("invalid_args"),
+                                  QStringLiteral("positionMs must be an integer"));
 
     QCOMPARE(ack.value(QStringLiteral("type")).toString(), QStringLiteral("ack"));
     QCOMPARE(ack.value(QStringLiteral("id")).toString(), QStringLiteral("abc-2"));

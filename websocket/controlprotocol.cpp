@@ -9,7 +9,7 @@
 
 namespace {
 
-bool hasInteger(const QJsonObject &args, const QString &key) {
+bool hasInteger(const QJsonObject& args, const QString& key) {
     const QJsonValue value = args.value(key);
     if (!value.isDouble()) return false;
 
@@ -22,15 +22,15 @@ bool hasInteger(const QJsonObject &args, const QString &key) {
     return number >= static_cast<double>(kSafeIntMin) && number <= static_cast<double>(kSafeIntMax);
 }
 
-bool hasNumber(const QJsonObject &args, const QString &key) {
+bool hasNumber(const QJsonObject& args, const QString& key) {
     return args.value(key).isDouble();
 }
 
-bool hasBool(const QJsonObject &args, const QString &key) {
+bool hasBool(const QJsonObject& args, const QString& key) {
     return args.value(key).isBool();
 }
 
-bool hasString(const QJsonObject &args, const QString &key) {
+bool hasString(const QJsonObject& args, const QString& key) {
     return args.value(key).isString();
 }
 
@@ -41,7 +41,7 @@ ControlProtocol::CommandValidation valid(QJsonObject args = {}) {
     return validation;
 }
 
-ControlProtocol::CommandValidation invalid(const QString &message) {
+ControlProtocol::CommandValidation invalid(const QString& message) {
     ControlProtocol::CommandValidation validation;
     validation.ok = false;
     validation.code = QStringLiteral("invalid_args");
@@ -51,7 +51,7 @@ ControlProtocol::CommandValidation invalid(const QString &message) {
 
 } // namespace
 
-ControlProtocol::ParseResult ControlProtocol::parseTextMessage(const QByteArray &payload) {
+ControlProtocol::ParseResult ControlProtocol::parseTextMessage(const QByteArray& payload) {
     ParseResult result;
 
     QJsonParseError parseError;
@@ -92,7 +92,7 @@ ControlProtocol::ParseResult ControlProtocol::parseTextMessage(const QByteArray 
     return result;
 }
 
-QJsonObject ControlProtocol::ack(const QString &id) {
+QJsonObject ControlProtocol::ack(const QString& id) {
     QJsonObject obj;
     obj.insert(QStringLiteral("type"), QStringLiteral("ack"));
     if (!id.isEmpty()) obj.insert(QStringLiteral("id"), id);
@@ -100,7 +100,8 @@ QJsonObject ControlProtocol::ack(const QString &id) {
     return obj;
 }
 
-QJsonObject ControlProtocol::ackError(const QString &id, const QString &code, const QString &message) {
+QJsonObject ControlProtocol::ackError(const QString& id, const QString& code,
+                                      const QString& message) {
     QJsonObject obj;
     obj.insert(QStringLiteral("type"), QStringLiteral("ack"));
     if (!id.isEmpty()) obj.insert(QStringLiteral("id"), id);
@@ -110,7 +111,7 @@ QJsonObject ControlProtocol::ackError(const QString &id, const QString &code, co
     return obj;
 }
 
-QJsonObject ControlProtocol::error(const QString &code, const QString &message) {
+QJsonObject ControlProtocol::error(const QString& code, const QString& message) {
     QJsonObject obj;
     obj.insert(QStringLiteral("type"), QStringLiteral("error"));
     obj.insert(QStringLiteral("code"), code);
@@ -118,36 +119,31 @@ QJsonObject ControlProtocol::error(const QString &code, const QString &message) 
     return obj;
 }
 
-QByteArray ControlProtocol::compact(const QJsonObject &object) {
+QByteArray ControlProtocol::compact(const QJsonObject& object) {
     return QJsonDocument(object).toJson(QJsonDocument::Compact);
 }
 
-ControlProtocol::CommandValidation ControlProtocol::validateCommand(const ControlCommandMessage &command) {
+ControlProtocol::CommandValidation
+ControlProtocol::validateCommand(const ControlCommandMessage& command) {
     const QJsonObject args = command.args;
     const QString name = command.name;
 
-    if (name == QStringLiteral("transport.playPause") ||
-        name == QStringLiteral("transport.play") ||
-        name == QStringLiteral("transport.pause") ||
-        name == QStringLiteral("transport.goLive") ||
+    if (name == QStringLiteral("transport.playPause") || name == QStringLiteral("transport.play") ||
+        name == QStringLiteral("transport.pause") || name == QStringLiteral("transport.goLive") ||
         name == QStringLiteral("transport.cancelFollowLive") ||
-        name == QStringLiteral("recording.start") ||
-        name == QStringLiteral("recording.stop") ||
+        name == QStringLiteral("recording.start") || name == QStringLiteral("recording.stop") ||
         name == QStringLiteral("recording.toggle") ||
-        name == QStringLiteral("view.showMultiview") ||
-        name == QStringLiteral("capture.current") ||
-        name == QStringLiteral("sources.add") ||
-        name == QStringLiteral("settings.save") ||
-        name == QStringLiteral("import.read") ||
-        name == QStringLiteral("import.applyPreview") ||
+        name == QStringLiteral("view.showMultiview") || name == QStringLiteral("capture.current") ||
+        name == QStringLiteral("sources.add") || name == QStringLiteral("settings.save") ||
+        name == QStringLiteral("import.read") || name == QStringLiteral("import.applyPreview") ||
         name == QStringLiteral("midi.refreshPorts") ||
         name == QStringLiteral("streamDeck.resetDefaults")) {
         return valid(args);
     }
     if (name == QStringLiteral("transport.seek")) {
         return hasInteger(args, QStringLiteral("positionMs"))
-            ? valid(args)
-            : invalid(QStringLiteral("transport.seek requires integer args.positionMs"));
+                   ? valid(args)
+                   : invalid(QStringLiteral("transport.seek requires integer args.positionMs"));
     }
     if (name == QStringLiteral("transport.setSpeed")) {
         if (!hasNumber(args, QStringLiteral("speed"))) {
@@ -162,8 +158,10 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
         if (!hasBool(args, QStringLiteral("active"))) {
             return invalid(QStringLiteral("transport.holdSpeed requires boolean args.active"));
         }
-        if (args.value(QStringLiteral("active")).toBool() && !hasNumber(args, QStringLiteral("speed"))) {
-            return invalid(QStringLiteral("transport.holdSpeed requires number args.speed when active"));
+        if (args.value(QStringLiteral("active")).toBool() &&
+            !hasNumber(args, QStringLiteral("speed"))) {
+            return invalid(
+                QStringLiteral("transport.holdSpeed requires number args.speed when active"));
         }
         if (args.contains(QStringLiteral("speed")) && !hasNumber(args, QStringLiteral("speed"))) {
             return invalid(QStringLiteral("transport.holdSpeed args.speed must be number"));
@@ -172,25 +170,26 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
     }
     if (name == QStringLiteral("transport.stepFrame")) {
         return hasInteger(args, QStringLiteral("frames"))
-            ? valid(args)
-            : invalid(QStringLiteral("transport.stepFrame requires integer args.frames"));
+                   ? valid(args)
+                   : invalid(QStringLiteral("transport.stepFrame requires integer args.frames"));
     }
     if (name == QStringLiteral("view.setPlaybackViewState")) {
         if (!hasBool(args, QStringLiteral("singleView"))) {
-            return invalid(QStringLiteral("view.setPlaybackViewState requires boolean args.singleView"));
+            return invalid(
+                QStringLiteral("view.setPlaybackViewState requires boolean args.singleView"));
         }
         if (!hasInteger(args, QStringLiteral("selectedIndex"))) {
-            return invalid(QStringLiteral("view.setPlaybackViewState requires integer args.selectedIndex"));
+            return invalid(
+                QStringLiteral("view.setPlaybackViewState requires integer args.selectedIndex"));
         }
         return valid(args);
     }
     if (name == QStringLiteral("view.selectFeed") ||
         name == QStringLiteral("view.toggleSourceEnabled") ||
-        name == QStringLiteral("sources.remove") ||
-        name == QStringLiteral("midi.setPortIndex")) {
+        name == QStringLiteral("sources.remove") || name == QStringLiteral("midi.setPortIndex")) {
         return hasInteger(args, QStringLiteral("index"))
-            ? valid(args)
-            : invalid(name + QStringLiteral(" requires integer args.index"));
+                   ? valid(args)
+                   : invalid(name + QStringLiteral(" requires integer args.index"));
     }
     if (name == QStringLiteral("capture.snapshot")) {
         if (!hasBool(args, QStringLiteral("singleView"))) {
@@ -250,20 +249,25 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
         return valid(args);
     }
     if (name == QStringLiteral("settings.setProject")) {
-        if (args.contains(QStringLiteral("fileName")) && !hasString(args, QStringLiteral("fileName"))) {
+        if (args.contains(QStringLiteral("fileName")) &&
+            !hasString(args, QStringLiteral("fileName"))) {
             return invalid(QStringLiteral("settings.setProject args.fileName must be string"));
         }
-        if (args.contains(QStringLiteral("saveLocation")) && !hasString(args, QStringLiteral("saveLocation"))) {
+        if (args.contains(QStringLiteral("saveLocation")) &&
+            !hasString(args, QStringLiteral("saveLocation"))) {
             return invalid(QStringLiteral("settings.setProject args.saveLocation must be string"));
         }
         return valid(args);
     }
     if (name == QStringLiteral("settings.setRecordingFormat")) {
         if (args.contains(QStringLiteral("width")) && !hasInteger(args, QStringLiteral("width"))) {
-            return invalid(QStringLiteral("settings.setRecordingFormat args.width must be integer"));
+            return invalid(
+                QStringLiteral("settings.setRecordingFormat args.width must be integer"));
         }
-        if (args.contains(QStringLiteral("height")) && !hasInteger(args, QStringLiteral("height"))) {
-            return invalid(QStringLiteral("settings.setRecordingFormat args.height must be integer"));
+        if (args.contains(QStringLiteral("height")) &&
+            !hasInteger(args, QStringLiteral("height"))) {
+            return invalid(
+                QStringLiteral("settings.setRecordingFormat args.height must be integer"));
         }
         if (args.contains(QStringLiteral("fps")) && !hasInteger(args, QStringLiteral("fps"))) {
             return invalid(QStringLiteral("settings.setRecordingFormat args.fps must be integer"));
@@ -272,23 +276,26 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
     }
     if (name == QStringLiteral("settings.setAudioOutputLatency")) {
         return hasInteger(args, QStringLiteral("ms"))
-            ? valid(args)
-            : invalid(QStringLiteral("settings.setAudioOutputLatency requires integer args.ms"));
+                   ? valid(args)
+                   : invalid(
+                         QStringLiteral("settings.setAudioOutputLatency requires integer args.ms"));
     }
     if (name == QStringLiteral("settings.setTimeOfDayMode")) {
         return hasBool(args, QStringLiteral("enabled"))
-            ? valid(args)
-            : invalid(QStringLiteral("settings.setTimeOfDayMode requires boolean args.enabled"));
+                   ? valid(args)
+                   : invalid(
+                         QStringLiteral("settings.setTimeOfDayMode requires boolean args.enabled"));
     }
     if (name == QStringLiteral("settings.setMetadataFields")) {
         return args.value(QStringLiteral("fields")).isArray()
-            ? valid(args)
-            : invalid(QStringLiteral("settings.setMetadataFields requires array args.fields"));
+                   ? valid(args)
+                   : invalid(
+                         QStringLiteral("settings.setMetadataFields requires array args.fields"));
     }
     if (name == QStringLiteral("import.setUrl")) {
         return hasString(args, QStringLiteral("url"))
-            ? valid(args)
-            : invalid(QStringLiteral("import.setUrl requires string args.url"));
+                   ? valid(args)
+                   : invalid(QStringLiteral("import.setUrl requires string args.url"));
     }
     if (name == QStringLiteral("midi.beginLearn") ||
         name == QStringLiteral("midi.beginLearnJogForward") ||
@@ -297,15 +304,16 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
         name == QStringLiteral("streamDeck.beginLearn") ||
         name == QStringLiteral("streamDeck.clearBinding")) {
         return hasInteger(args, QStringLiteral("action"))
-            ? valid(args)
-            : invalid(name + QStringLiteral(" requires integer args.action"));
+                   ? valid(args)
+                   : invalid(name + QStringLiteral(" requires integer args.action"));
     }
     if (name == QStringLiteral("action.dispatch")) {
         if (!hasInteger(args, QStringLiteral("actionId"))) {
             return invalid(QStringLiteral("action.dispatch requires integer args.actionId"));
         }
         if (args.value(QStringLiteral("actionId")).toInt() == 10) {
-            return invalid(QStringLiteral("action.dispatch actionId 10 requires action.shuttle with integer args.delta"));
+            return invalid(QStringLiteral(
+                "action.dispatch actionId 10 requires action.shuttle with integer args.delta"));
         }
         QJsonObject normalized = args;
         if (!normalized.contains(QStringLiteral("pressed"))) {
@@ -317,8 +325,8 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
     }
     if (name == QStringLiteral("action.jog") || name == QStringLiteral("action.shuttle")) {
         return hasInteger(args, QStringLiteral("delta"))
-            ? valid(args)
-            : invalid(name + QStringLiteral(" requires integer args.delta"));
+                   ? valid(args)
+                   : invalid(name + QStringLiteral(" requires integer args.delta"));
     }
 
     ControlProtocol::CommandValidation validation;

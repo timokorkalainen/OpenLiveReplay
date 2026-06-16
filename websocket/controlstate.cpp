@@ -8,15 +8,15 @@
 
 namespace {
 
-QJsonArray variantListToArray(const QVariantList &list) {
+QJsonArray variantListToArray(const QVariantList& list) {
     return QJsonArray::fromVariantList(list);
 }
 
-QJsonObject variantMapToObject(const QVariantMap &map) {
+QJsonObject variantMapToObject(const QVariantMap& map) {
     return QJsonObject::fromVariantMap(map);
 }
 
-QJsonObject sourceObject(const SourceState &source) {
+QJsonObject sourceObject(const SourceState& source) {
     QJsonObject obj;
     obj.insert(QStringLiteral("index"), source.index);
     obj.insert(QStringLiteral("id"), source.id);
@@ -32,13 +32,13 @@ QJsonObject sourceObject(const SourceState &source) {
 
 } // namespace
 
-QJsonObject ControlState::snapshotMessage(const ControlApiAdapter &adapter) {
+QJsonObject ControlState::snapshotMessage(const ControlApiAdapter& adapter) {
     QJsonObject state;
     state.insert(QStringLiteral("recording"), recordingObject(adapter));
     state.insert(QStringLiteral("transport"), transportObject(adapter));
 
     QJsonArray sources;
-    for (const SourceState &source : adapter.sourceStates()) {
+    for (const SourceState& source : adapter.sourceStates()) {
         sources.append(sourceObject(source));
     }
     state.insert(QStringLiteral("sources"), sources);
@@ -98,7 +98,7 @@ QJsonObject ControlState::snapshotMessage(const ControlApiAdapter &adapter) {
     return msg;
 }
 
-QJsonObject ControlState::patchMessage(const QString &path, const QJsonObject &value) {
+QJsonObject ControlState::patchMessage(const QString& path, const QJsonObject& value) {
     QJsonObject msg;
     msg.insert(QStringLiteral("type"), QStringLiteral("state.patch"));
     msg.insert(QStringLiteral("path"), path);
@@ -106,7 +106,7 @@ QJsonObject ControlState::patchMessage(const QString &path, const QJsonObject &v
     return msg;
 }
 
-QJsonObject ControlState::timecodeMessage(const ControlApiAdapter &adapter) {
+QJsonObject ControlState::timecodeMessage(const ControlApiAdapter& adapter) {
     const TransportState transport = adapter.transportState();
     QJsonObject msg;
     msg.insert(QStringLiteral("type"), QStringLiteral("timecode"));
@@ -119,7 +119,7 @@ QJsonObject ControlState::timecodeMessage(const ControlApiAdapter &adapter) {
     return msg;
 }
 
-QJsonObject ControlState::recordingObject(const ControlApiAdapter &adapter) {
+QJsonObject ControlState::recordingObject(const ControlApiAdapter& adapter) {
     const RecordingState recording = adapter.recordingState();
     QJsonObject obj;
     obj.insert(QStringLiteral("active"), recording.active);
@@ -128,7 +128,7 @@ QJsonObject ControlState::recordingObject(const ControlApiAdapter &adapter) {
     return obj;
 }
 
-QJsonObject ControlState::transportObject(const ControlApiAdapter &adapter) {
+QJsonObject ControlState::transportObject(const ControlApiAdapter& adapter) {
     const TransportState transport = adapter.transportState();
     QJsonObject obj;
     obj.insert(QStringLiteral("positionMs"), transport.positionMs);
@@ -143,7 +143,7 @@ QJsonObject ControlState::transportObject(const ControlApiAdapter &adapter) {
     return obj;
 }
 
-QJsonObject ControlState::settingsObject(const ControlApiAdapter &adapter) {
+QJsonObject ControlState::settingsObject(const ControlApiAdapter& adapter) {
     const SettingsState settings = adapter.settingsState();
     QJsonObject obj;
     obj.insert(QStringLiteral("fileName"), settings.fileName);
@@ -157,7 +157,7 @@ QJsonObject ControlState::settingsObject(const ControlApiAdapter &adapter) {
     return obj;
 }
 
-QJsonObject ControlState::telemetryObject(const ControlApiAdapter &adapter) {
+QJsonObject ControlState::telemetryObject(const ControlApiAdapter& adapter) {
     const TelemetryState telemetry = adapter.telemetryState();
     QJsonObject obj;
     obj.insert(QStringLiteral("version"), telemetry.version);

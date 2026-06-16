@@ -8,11 +8,12 @@
 #include <QWebSocket>
 #include <QWebSocketServer>
 
-ControlWebSocketServer::ControlWebSocketServer(ControlApiAdapter *adapter, QObject *parent)
-    : QObject(parent),
-      m_adapter(adapter),
-      m_server(new QWebSocketServer(QStringLiteral("OpenLiveReplay Control API"), QWebSocketServer::NonSecureMode, this)) {
-    connect(m_server, &QWebSocketServer::newConnection, this, &ControlWebSocketServer::handleNewConnection);
+ControlWebSocketServer::ControlWebSocketServer(ControlApiAdapter* adapter, QObject* parent)
+    : QObject(parent), m_adapter(adapter),
+      m_server(new QWebSocketServer(QStringLiteral("OpenLiveReplay Control API"),
+                                    QWebSocketServer::NonSecureMode, this)) {
+    connect(m_server, &QWebSocketServer::newConnection, this,
+            &ControlWebSocketServer::handleNewConnection);
 
     m_timecodeTimer.setSingleShot(true);
     connect(&m_timecodeTimer, &QTimer::timeout, this, &ControlWebSocketServer::publishTimecodeNow);
@@ -26,7 +27,7 @@ ControlWebSocketServer::~ControlWebSocketServer() {
     }
 
     const QSet<QWebSocket*> sockets = m_sockets;
-    for (QWebSocket *socket : sockets) {
+    for (QWebSocket* socket : sockets) {
         if (!socket) continue;
         socket->close();
         socket->deleteLater();
@@ -34,7 +35,7 @@ ControlWebSocketServer::~ControlWebSocketServer() {
     m_sockets.clear();
 }
 
-bool ControlWebSocketServer::listen(const QHostAddress &address, quint16 port) {
+bool ControlWebSocketServer::listen(const QHostAddress& address, quint16 port) {
     if (!m_adapter) {
         m_lastError = QStringLiteral("No adapter configured");
         return false;
@@ -57,7 +58,7 @@ QString ControlWebSocketServer::lastError() const {
     return m_lastError;
 }
 
-void ControlWebSocketServer::publishPatch(const QString &path, const QJsonObject &value) {
+void ControlWebSocketServer::publishPatch(const QString& path, const QJsonObject& value) {
     if (!m_adapter) return;
 
     QJsonObject messageValue = value;
@@ -77,11 +78,11 @@ void ControlWebSocketServer::publishPatch(const QString &path, const QJsonObject
     broadcastJson(ControlState::patchMessage(path, messageValue));
 }
 
-void ControlWebSocketServer::publishPatchObject(const QString &path, const QJsonObject &value) {
+void ControlWebSocketServer::publishPatchObject(const QString& path, const QJsonObject& value) {
     broadcastJson(ControlState::patchMessage(path, value));
 }
 
-void ControlWebSocketServer::publishEvent(const QString &name, const QJsonObject &data) {
+void ControlWebSocketServer::publishEvent(const QString& name, const QJsonObject& data) {
     QJsonObject obj;
     obj.insert(QStringLiteral("type"), QStringLiteral("event"));
     obj.insert(QStringLiteral("name"), name);
@@ -104,25 +105,27 @@ void ControlWebSocketServer::scheduleTimecode() {
 }
 
 void ControlWebSocketServer::handleNewConnection() {
-    QWebSocket *socket = m_server->nextPendingConnection();
+    QWebSocket* socket = m_server->nextPendingConnection();
     if (!socket) {
         return;
     }
 
-    socket->setProperty("controlClientId",
-                        QString::number(reinterpret_cast<quintptr>(socket)));
+    socket->setProperty("controlClientId", QString::number(reinterpret_cast<quintptr>(socket)));
     m_sockets.insert(socket);
 
-    connect(socket, &QWebSocket::textMessageReceived, this, &ControlWebSocketServer::handleTextMessage);
-    connect(socket, &QWebSocket::binaryMessageReceived, this, &ControlWebSocketServer::handleBinaryMessage);
-    connect(socket, &QWebSocket::disconnected, this, &ControlWebSocketServer::handleSocketDisconnected);
+    connect(socket, &QWebSocket::textMessageReceived, this,
+            &ControlWebSocketServer::handleTextMessage);
+    connect(socket, &QWebSocket::binaryMessageReceived, this,
+            &ControlWebSocketServer::handleBinaryMessage);
+    connect(socket, &QWebSocket::disconnected, this,
+            &ControlWebSocketServer::handleSocketDisconnected);
 
     sendJson(ControlState::snapshotMessage(*m_adapter), socket);
     sendJson(ControlState::timecodeMessage(*m_adapter), socket);
 }
 
-void ControlWebSocketServer::handleTextMessage(const QString &message) {
-    auto socket = qobject_cast<QWebSocket *>(sender());
+void ControlWebSocketServer::handleTextMessage(const QString& message) {
+    auto socket = qobject_cast<QWebSocket*>(sender());
     if (!socket || !m_adapter) {
         return;
     }
@@ -139,31 +142,31 @@ void ControlWebSocketServer::handleTextMessage(const QString &message) {
 
     const auto validated = ControlProtocol::validateCommand(parsed.message);
     if (!validated.ok) {
-        sendJson(ControlProtocol::ackError(parsed.message.id, validated.code, validated.message), socket);
+        sendJson(ControlProtocol::ackError(parsed.message.id, validated.code, validated.message),
+                 socket);
         return;
     }
 
     QJsonObject commandArgs = validated.normalizedArgs;
-    commandArgs.insert(QStringLiteral("_clientId"),
-                       socket->property("controlClientId").toString());
+    commandArgs.insert(QStringLiteral("_clientId"), socket->property("controlClientId").toString());
 
     const auto result = m_adapter->executeCommand(parsed.message.name, commandArgs);
-    sendJson(result.ok ? ControlProtocol::ack(parsed.message.id) :
-                        ControlProtocol::ackError(parsed.message.id, result.code, result.message),
+    sendJson(result.ok ? ControlProtocol::ack(parsed.message.id)
+                       : ControlProtocol::ackError(parsed.message.id, result.code, result.message),
              socket);
 }
 
-void ControlWebSocketServer::handleBinaryMessage(const QByteArray &) {
-    auto socket = qobject_cast<QWebSocket *>(sender());
+void ControlWebSocketServer::handleBinaryMessage(const QByteArray&) {
+    auto socket = qobject_cast<QWebSocket*>(sender());
     if (!socket) return;
 
     sendJson(ControlProtocol::error(QStringLiteral("unsupported_message"),
-                                   QStringLiteral("Only text messages are supported")),
+                                    QStringLiteral("Only text messages are supported")),
              socket);
 }
 
 void ControlWebSocketServer::handleSocketDisconnected() {
-    auto socket = qobject_cast<QWebSocket *>(sender());
+    auto socket = qobject_cast<QWebSocket*>(sender());
     if (!socket) return;
 
     if (m_adapter) {
@@ -178,14 +181,14 @@ void ControlWebSocketServer::handleSocketDisconnected() {
     socket->deleteLater();
 }
 
-void ControlWebSocketServer::sendJson(const QJsonObject &message, QWebSocket *socket) {
+void ControlWebSocketServer::sendJson(const QJsonObject& message, QWebSocket* socket) {
     if (!socket) return;
     socket->sendTextMessage(QString::fromUtf8(ControlProtocol::compact(message)));
 }
 
-void ControlWebSocketServer::broadcastJson(const QJsonObject &message) {
+void ControlWebSocketServer::broadcastJson(const QJsonObject& message) {
     const QByteArray payload = ControlProtocol::compact(message);
-    for (QWebSocket *socket : m_sockets) {
+    for (QWebSocket* socket : m_sockets) {
         socket->sendTextMessage(QString::fromUtf8(payload));
     }
 }

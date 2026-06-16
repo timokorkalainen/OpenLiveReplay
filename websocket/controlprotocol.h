@@ -28,12 +28,12 @@ public:
         QJsonObject normalizedArgs;
     };
 
-    static ParseResult parseTextMessage(const QByteArray &payload);
-    static CommandValidation validateCommand(const ControlCommandMessage &command);
-    static QJsonObject ack(const QString &id);
-    static QJsonObject ackError(const QString &id, const QString &code, const QString &message);
-    static QJsonObject error(const QString &code, const QString &message);
-    static QByteArray compact(const QJsonObject &object);
+    static ParseResult parseTextMessage(const QByteArray& payload);
+    static CommandValidation validateCommand(const ControlCommandMessage& command);
+    static QJsonObject ack(const QString& id);
+    static QJsonObject ackError(const QString& id, const QString& code, const QString& message);
+    static QJsonObject error(const QString& code, const QString& message);
+    static QByteArray compact(const QJsonObject& object);
 };
 
 #endif

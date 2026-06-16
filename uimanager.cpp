@@ -564,23 +564,19 @@ void UIManager::dispatchControlAction(int action, bool isRelease)
     }
 }
 
-void UIManager::dispatchExternalAction(int action, bool pressed)
-{
+void UIManager::dispatchExternalAction(int action, bool pressed) {
     dispatchControlAction(action, !pressed);
 }
 
-void UIManager::jogExternal(int delta)
-{
+void UIManager::jogExternal(int delta) {
     jogStep(delta);
 }
 
-void UIManager::shuttleExternal(int delta)
-{
+void UIManager::shuttleExternal(int delta) {
     shuttleStep(delta);
 }
 
-void UIManager::selectFeedExternal(int index)
-{
+void UIManager::selectFeedExternal(int index) {
     emit feedSelectRequested(index);
 }
 
@@ -1437,8 +1433,8 @@ void UIManager::requestNewWindowScene() {
 }
 
 void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
-    const bool changed = (m_playbackSingleView != singleView)
-                         || (m_playbackSelectedIndex != selectedIndex);
+    const bool changed =
+        (m_playbackSingleView != singleView) || (m_playbackSelectedIndex != selectedIndex);
     m_playbackSingleView = singleView;
     m_playbackSelectedIndex = selectedIndex;
 
