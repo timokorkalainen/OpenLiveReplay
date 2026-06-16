@@ -53,13 +53,14 @@ set(RTMIDI_API_DUMMY OFF CACHE BOOL "" FORCE)
 set(RTMIDI_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     rtmidi
-    GIT_REPOSITORY https://github.com/thestk/rtmidi.git
-    GIT_TAG 6.0.0
+    URL https://github.com/thestk/rtmidi/archive/refs/tags/6.0.0.tar.gz
+    URL_HASH SHA256=ef7bcda27fee6936b651c29ebe9544c74959d0b1583b716ce80a1c6fea7617f0
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(rtmidi)
 
 # 1. Find Qt
-find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network)
+find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network WebSockets)
 qt_standard_project_setup(REQUIRES 6.8)
 
 # 2. Create the Executable Target FIRST
@@ -73,6 +74,11 @@ qt_add_qml_module(OpenLiveReplay
         Main.qml
         MultiviewWindow.qml
     SOURCES
+        websocket/controlapiadapter.h
+        websocket/controlprotocol.h websocket/controlprotocol.cpp
+        websocket/controlstate.h websocket/controlstate.cpp
+        websocket/controlwebsocketserver.h websocket/controlwebsocketserver.cpp
+        websocket/uimanagercontroladapter.h websocket/uimanagercontroladapter.cpp
         recorder_engine/replaymanager.cpp recorder_engine/replaymanager.h
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
@@ -486,6 +492,7 @@ target_link_libraries(OpenLiveReplay PRIVATE
     Qt6::Multimedia
     Qt6::QuickControls2
     Qt6::Network
+    Qt6::WebSockets
     rtmidi
     OpenLiveReplayMidi
     olr_warnings
