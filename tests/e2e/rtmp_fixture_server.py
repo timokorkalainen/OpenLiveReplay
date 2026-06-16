@@ -249,8 +249,10 @@ def flv_tags(path: str) -> list[tuple[int, int, bytes]]:
 
 
 def run_server(args: argparse.Namespace) -> None:
-    tags = flv_tags(args.flv)
-    if not tags:
+    tags: list[tuple[int, int, bytes]] = []
+    if args.flv:
+        tags = flv_tags(args.flv)
+    if not args.idle_after_play and not tags:
         raise ValueError("FLV fixture contains no RTMP media tags")
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -334,6 +336,10 @@ def run_server(args: argparse.Namespace) -> None:
                 )
                 saw_play = True
 
+        if args.idle_after_play:
+            time.sleep(args.hold_open)
+            return
+
         started = time.monotonic()
         first_ts = tags[0][1]
         for tag_type, timestamp, payload in tags:
@@ -350,10 +356,11 @@ def run_server(args: argparse.Namespace) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--flv", required=True)
+    parser.add_argument("--flv")
     parser.add_argument("--accept-timeout", type=float, default=10.0)
     parser.add_argument("--io-timeout", type=float, default=20.0)
     parser.add_argument("--hold-open", type=float, default=2.0)
+    parser.add_argument("--idle-after-play", action="store_true")
     parser.add_argument("--require-play-query", action="store_true")
     parser.add_argument("--expect-play-path")
     parser.add_argument("--tls-cert")
