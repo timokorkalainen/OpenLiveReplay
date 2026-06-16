@@ -26,6 +26,13 @@ Getting started
 1. Clone the repository
 2. Open the project in Qt Creator (open the project root or `CMakeLists.txt`), configure for your target (macOS or iOS), then build.
 
+For **Windows** (Qt MinGW kit), the dependencies (FFmpeg + SRT) are built from
+source by a one-command script — see [`docs/windows-build.md`](docs/windows-build.md):
+
+```bash
+./build-scripts/build_windows_app.sh
+```
+
 Notes on dependencies
 ---------------------
 - The build config downloads or configures native dependencies during CMake configure step, including FFmpeg and RtMidi for macOS and iOS targets.

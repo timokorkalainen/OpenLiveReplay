@@ -3,6 +3,7 @@ build/
 ios_build/
 ios_build*
 macos_build/
+windows_build/
 *.qmlls.ini
 qmllint.ini
 launch.json

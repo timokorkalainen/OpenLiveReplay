@@ -1,0 +1,29 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21 },
+  "configurePresets": [
+    {
+      "name": "windows-mingw-release",
+      "displayName": "Windows (MinGW, Release)",
+      "description": "Windows build using the Qt MinGW kit. Expects OLR_* env vars (set by build-scripts/build_windows_app.sh, or export them by hand).",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PREFIX_PATH": "$env{OLR_QT_ROOT}",
+        "CMAKE_C_COMPILER": "$env{OLR_MINGW_ROOT}/bin/gcc.exe",
+        "CMAKE_CXX_COMPILER": "$env{OLR_MINGW_ROOT}/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "$env{OLR_NINJA}",
+        "OLR_FFMPEG_ROOT": "$env{OLR_FFMPEG_ROOT}",
+        "OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-mingw-release",
+      "configurePreset": "windows-mingw-release"
+    }
+  ]
+}
