@@ -202,6 +202,14 @@ void NativeSrtIngestSession::run() {
                     m_statLossTotal = perf.pktRcvLossTotal;
                     m_statDropTotal = perf.pktRcvDropTotal;
                     m_statRecvTotal = perf.pktRecvTotal;
+                    if (m_callbacks.reportStats) {
+                        SrtStats stats;
+                        stats.recvTotal = perf.pktRecvTotal;
+                        stats.retransTotal = perf.pktRcvRetrans;
+                        stats.lossTotal = perf.pktRcvLossTotal;
+                        stats.dropTotal = perf.pktRcvDropTotal;
+                        m_callbacks.reportStats(stats);
+                    }
                 }
                 m_lastStatsAtMs = m_monotonic.elapsed();
             }
