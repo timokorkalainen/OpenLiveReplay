@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QList>
 #include <QString>
+#include <QUrl>
 #include <QtGlobal>
 
 struct RtmpMessage {
@@ -16,6 +17,14 @@ struct RtmpMessage {
     QByteArray payload;
 };
 
+struct RtmpUrlParts {
+    QString app;
+    QString playPath;
+    QString tcUrl;
+
+    static RtmpUrlParts fromUrl(const QUrl& url);
+};
+
 namespace RtmpAmf0 {
 QByteArray number(double value);
 QByteArray boolean(bool value);
@@ -23,6 +32,7 @@ QByteArray string(const QString& value);
 QByteArray nullValue();
 QByteArray object(const QList<QPair<QString, QByteArray>>& values);
 QByteArray strictArray(const QList<QByteArray>& values);
+QByteArray connectCommandPayload(const QUrl& url);
 
 bool readString(const QByteArray& data, int* offset, QString* value);
 bool readNumber(const QByteArray& data, int* offset, double* value);

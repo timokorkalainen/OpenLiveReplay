@@ -20,6 +20,8 @@ class TestRtmpProtocol : public QObject {
 private slots:
     void amf0CommandRoundTripsNameAndTransaction();
     void amf0WritesStrictArrayForFourCcList();
+    void rtmpUrlPartsPreserveSignedQueryInPlayPath();
+    void connectPayloadAdvertisesEnhancedCodecCapabilities();
     void amf0SkipsEcmaArrayMetadata();
     void amf0SkipsStrictArray();
     void amf0RejectsMalformedObjectKeyWithoutAdvancingOffset();
@@ -89,6 +91,25 @@ void TestRtmpProtocol::amf0WritesStrictArrayForFourCcList() {
     QVERIFY(RtmpAmf0::readString(array, &offset, &value));
     QCOMPARE(value, QStringLiteral("mp4a"));
     QCOMPARE(offset, array.size());
+}
+
+void TestRtmpProtocol::rtmpUrlPartsPreserveSignedQueryInPlayPath() {
+    const RtmpUrlParts parts =
+        RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmps://host.example:443/live/cam1?token=abc&expires=123")));
+    QCOMPARE(parts.app, QStringLiteral("live"));
+    QCOMPARE(parts.playPath, QStringLiteral("cam1?token=abc&expires=123"));
+    QCOMPARE(parts.tcUrl, QStringLiteral("rtmps://host.example:443/live"));
+}
+
+void TestRtmpProtocol::connectPayloadAdvertisesEnhancedCodecCapabilities() {
+    const QByteArray payload =
+        RtmpAmf0::connectCommandPayload(QUrl(QStringLiteral("rtmp://127.0.0.1/live/stream")));
+    QVERIFY(payload.contains("fourCcList"));
+    QVERIFY(payload.contains("avc1"));
+    QVERIFY(payload.contains("hvc1"));
+    QVERIFY(payload.contains("mp4a"));
+    QVERIFY(payload.contains("videoFourCcInfoMap"));
+    QVERIFY(payload.contains("audioFourCcInfoMap"));
 }
 
 void TestRtmpProtocol::amf0SkipsEcmaArrayMetadata() {

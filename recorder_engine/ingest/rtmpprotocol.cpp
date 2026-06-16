@@ -113,6 +113,22 @@ bool skipAmf0Value(const QByteArray& data, int* offset, int depth) {
 
 } // namespace
 
+RtmpUrlParts RtmpUrlParts::fromUrl(const QUrl& url) {
+    const QString path = url.path().startsWith('/') ? url.path().mid(1) : url.path();
+    RtmpUrlParts parts;
+    parts.app = path.section('/', 0, 0);
+    const QString rest = path.section('/', 1);
+    parts.playPath = rest.isEmpty() ? parts.app : rest;
+    if (!url.query().isEmpty()) {
+        parts.playPath += QStringLiteral("?") + url.query(QUrl::FullyEncoded);
+    }
+    QUrl tc = url;
+    tc.setPath(QStringLiteral("/") + parts.app);
+    tc.setQuery(QString());
+    parts.tcUrl = tc.toString(QUrl::FullyEncoded);
+    return parts;
+}
+
 QByteArray RtmpAmf0::number(double value) {
     quint64 bits = 0;
     static_assert(sizeof(bits) == sizeof(value), "double size");
@@ -172,6 +188,40 @@ QByteArray RtmpAmf0::strictArray(const QList<QByteArray>& values) {
         out.append(value);
     }
     return out;
+}
+
+QByteArray RtmpAmf0::connectCommandPayload(const QUrl& url) {
+    const RtmpUrlParts parts = RtmpUrlParts::fromUrl(url);
+    QByteArray payload;
+    payload.append(RtmpAmf0::string(QStringLiteral("connect")));
+    payload.append(RtmpAmf0::number(1));
+    payload.append(RtmpAmf0::object({
+        {QStringLiteral("app"), RtmpAmf0::string(parts.app)},
+        {QStringLiteral("type"), RtmpAmf0::string(QStringLiteral("nonprivate"))},
+        {QStringLiteral("flashVer"), RtmpAmf0::string(QStringLiteral("FMLE/3.0"))},
+        {QStringLiteral("tcUrl"), RtmpAmf0::string(parts.tcUrl)},
+        {QStringLiteral("fpad"), RtmpAmf0::boolean(false)},
+        {QStringLiteral("capabilities"), RtmpAmf0::number(15)},
+        {QStringLiteral("audioCodecs"), RtmpAmf0::number(4071)},
+        {QStringLiteral("videoCodecs"), RtmpAmf0::number(252)},
+        {QStringLiteral("videoFunction"), RtmpAmf0::number(1)},
+        {QStringLiteral("fourCcList"),
+         RtmpAmf0::strictArray({
+             RtmpAmf0::string(QStringLiteral("avc1")),
+             RtmpAmf0::string(QStringLiteral("hvc1")),
+             RtmpAmf0::string(QStringLiteral("mp4a")),
+         })},
+        {QStringLiteral("videoFourCcInfoMap"),
+         RtmpAmf0::object({
+             {QStringLiteral("avc1"), RtmpAmf0::number(1)},
+             {QStringLiteral("hvc1"), RtmpAmf0::number(1)},
+         })},
+        {QStringLiteral("audioFourCcInfoMap"),
+         RtmpAmf0::object({
+             {QStringLiteral("mp4a"), RtmpAmf0::number(1)},
+         })},
+    }));
+    return payload;
 }
 
 bool RtmpAmf0::readString(const QByteArray& data, int* offset, QString* value) {
