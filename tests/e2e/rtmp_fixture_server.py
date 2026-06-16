@@ -282,6 +282,28 @@ def hevc_is_vcl(nal_type: int) -> bool:
     return 0 <= nal_type <= 31
 
 
+def rbsp_from_payload(payload: bytes) -> bytes:
+    out = bytearray()
+    zeroes = 0
+    for byte in payload:
+        if zeroes >= 2 and byte == 0x03:
+            zeroes = 0
+            continue
+        out.append(byte)
+        if byte == 0:
+            zeroes += 1
+        else:
+            zeroes = 0
+    return bytes(out)
+
+
+def hevc_starts_new_picture(nal: bytes) -> bool:
+    if len(nal) < 3:
+        return False
+    rbsp = rbsp_from_payload(nal[2:])
+    return bool(rbsp) and (rbsp[0] & 0x80) != 0
+
+
 def build_hvcc(vps: list[bytes], sps: list[bytes], pps: list[bytes]) -> bytes:
     if not vps or not sps or not pps:
         raise ValueError("HEVC Annex B source lacks VPS/SPS/PPS")
@@ -333,7 +355,7 @@ def enhanced_hevc_tags(path: str) -> list[tuple[int, int, bytes]]:
             continue
 
         if hevc_is_vcl(nal_type):
-            if current:
+            if current and hevc_starts_new_picture(nal):
                 frames.append(current)
                 current = []
             if prefix:

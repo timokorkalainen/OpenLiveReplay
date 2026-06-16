@@ -39,7 +39,7 @@ echo "[rtmp-hevc-e2e] port=$RTMP_PORT"
 if ! generate_hevc hevc_videotoolbox -allow_sw 1 >/dev/null 2>&1 || [ ! -s "$HEVC" ]; then
     rm -f "$HEVC"
     if ! generate_hevc libx265 -preset ultrafast \
-        -x265-params "log-level=error:keyint=1:min-keyint=1:scenecut=0" >/dev/null 2>&1 \
+        -x265-params "log-level=error:keyint=30:min-keyint=30:scenecut=0" >/dev/null 2>&1 \
         || [ ! -s "$HEVC" ]; then
         echo "SKIP: ffmpeg cannot generate raw Annex B HEVC with hevc_videotoolbox or libx265"
         exit 77
