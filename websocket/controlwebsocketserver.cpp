@@ -77,6 +77,10 @@ void ControlWebSocketServer::publishPatch(const QString &path, const QJsonObject
     broadcastJson(ControlState::patchMessage(path, messageValue));
 }
 
+void ControlWebSocketServer::publishPatchObject(const QString &path, const QJsonObject &value) {
+    broadcastJson(ControlState::patchMessage(path, value));
+}
+
 void ControlWebSocketServer::publishEvent(const QString &name, const QJsonObject &data) {
     QJsonObject obj;
     obj.insert(QStringLiteral("type"), QStringLiteral("event"));

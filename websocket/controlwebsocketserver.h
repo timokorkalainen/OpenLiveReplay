@@ -25,6 +25,7 @@ public:
 
 public slots:
     void publishPatch(const QString &path, const QJsonObject &value = {});
+    void publishPatchObject(const QString &path, const QJsonObject &value);
     void publishEvent(const QString &name, const QJsonObject &data = {});
     void publishTimecodeNow();
     void scheduleTimecode();
