@@ -9,6 +9,10 @@ on:
         description: "Qt version to build against"
         required: false
         default: "6.10.2"
+  # TEMPORARY (remove before merge): lets the workflow be validated on the PR
+  # branch, since workflow_dispatch only fires from the default branch.
+  push:
+    branches: [feat/windows-mingw-build]
 
 concurrency:
   group: build-apps-${{ github.ref }}
@@ -29,7 +33,7 @@ jobs:
       - name: Install Qt (MinGW) + tools
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ inputs.qt_version }}
+          version: ${{ inputs.qt_version || '6.10.2' }}
           host: windows
           target: desktop
           arch: win64_mingw
@@ -61,7 +65,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ inputs.qt_version }}
+          version: ${{ inputs.qt_version || '6.10.2' }}
           host: mac
           target: desktop
           arch: clang_64
