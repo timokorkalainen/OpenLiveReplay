@@ -46,6 +46,25 @@ const GUID kMfVideoFormatHevc = {
 #define OLR_MFVideoFormat_HEVC MFVideoFormat_HEVC
 #endif
 
+bool isSupportedCodec(NativeVideoCodec codec) {
+    return codec == NativeVideoCodec::H264 || codec == NativeVideoCodec::Hevc;
+}
+
+QString codecName(NativeVideoCodec codec) {
+    if (codec == NativeVideoCodec::Hevc) {
+        return QStringLiteral("HEVC");
+    }
+    return QStringLiteral("H.264");
+}
+
+QString decoderUnavailableMessage(NativeVideoCodec codec) {
+    if (codec == NativeVideoCodec::Hevc) {
+        return QStringLiteral(
+            "Windows HEVC decoder is unavailable; install Windows HEVC media support or use FFmpeg fallback");
+    }
+    return QStringLiteral("Media Foundation H.264 decoder is unavailable");
+}
+
 QString hrMessage(const QString& action, HRESULT hr) {
     return QStringLiteral("%1 (HRESULT 0x%2)")
         .arg(action)
@@ -221,6 +240,8 @@ private:
     ComPtr<IMFDXGIDeviceManager> deviceManager;
     ComPtr<ID3D11Device> d3dDevice;
     UINT resetToken = 0;
+    GUID selectedInputSubtype = GUID_NULL;
+    bool hasSelectedInputSubtype = false;
     bool asyncTransform = false;
     int asyncNeedInputEvents = 0;
     bool comInitialized = false;
@@ -306,6 +327,8 @@ void NativeVideoDecoder::Impl::reset() {
     deviceManager.Reset();
     d3dDevice.Reset();
     resetToken = 0;
+    selectedInputSubtype = GUID_NULL;
+    hasSelectedInputSubtype = false;
     asyncTransform = false;
     asyncNeedInputEvents = 0;
     codec = NativeVideoCodec::Unknown;
@@ -371,33 +394,63 @@ bool NativeVideoDecoder::Impl::createD3D(QString* error) {
 }
 
 bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QString* error) {
-    if (nextCodec != NativeVideoCodec::H264) {
+    if (!isSupportedCodec(nextCodec)) {
         if (error) {
             *error = QStringLiteral("Media Foundation native decode unsupported codec for this task");
         }
         return false;
     }
 
-    MFT_REGISTER_TYPE_INFO input {};
-    input.guidMajorType = MFMediaType_Video;
-    input.guidSubtype = MFVideoFormat_H264;
+    std::array<GUID, 2> inputSubtypes {};
+    int inputSubtypeCount = 0;
+    if (nextCodec == NativeVideoCodec::H264) {
+        inputSubtypes[inputSubtypeCount++] = MFVideoFormat_H264;
+    } else {
+        inputSubtypes[inputSubtypeCount++] = OLR_MFVideoFormat_HEVC;
+#ifdef MFVideoFormat_HEVC_ES
+        inputSubtypes[inputSubtypeCount++] = MFVideoFormat_HEVC_ES;
+#endif
+    }
 
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
-    HRESULT hr = MFTEnumEx(
-        MFT_CATEGORY_VIDEO_DECODER,
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT
-            | MFT_ENUM_FLAG_HARDWARE,
-        &input,
-        nullptr,
-        &activates,
-        &count);
-    if (FAILED(hr) || count == 0 || !activates) {
+    HRESULT hr = S_OK;
+    HRESULT firstFailure = S_OK;
+    for (int i = 0; i < inputSubtypeCount; ++i) {
+        MFT_REGISTER_TYPE_INFO input {};
+        input.guidMajorType = MFMediaType_Video;
+        input.guidSubtype = inputSubtypes[i];
+
+        activates = nullptr;
+        count = 0;
+        hr = MFTEnumEx(
+            MFT_CATEGORY_VIDEO_DECODER,
+            MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT
+                | MFT_ENUM_FLAG_HARDWARE,
+            &input,
+            nullptr,
+            &activates,
+            &count);
+        if (SUCCEEDED(hr) && count > 0 && activates) {
+            selectedInputSubtype = inputSubtypes[i];
+            hasSelectedInputSubtype = true;
+            break;
+        }
+        if (FAILED(hr) && SUCCEEDED(firstFailure)) {
+            firstFailure = hr;
+        }
         releaseActivations(activates, count);
+    }
+
+    if (count == 0 || !activates) {
         if (error) {
-            *error = FAILED(hr)
-                ? hrMessage(QStringLiteral("Media Foundation H.264 decoder enumeration failed"), hr)
-                : QStringLiteral("Media Foundation H.264 decoder is unavailable");
+            if (nextCodec == NativeVideoCodec::Hevc) {
+                *error = decoderUnavailableMessage(nextCodec);
+            } else if (FAILED(firstFailure)) {
+                *error = hrMessage(QStringLiteral("Media Foundation H.264 decoder enumeration failed"), firstFailure);
+            } else {
+                *error = decoderUnavailableMessage(nextCodec);
+            }
         }
         return false;
     }
@@ -406,7 +459,9 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
     releaseActivations(activates, count);
     if (FAILED(hr) || !transform) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation H.264 decoder activation failed"), hr);
+            *error = hrMessage(
+                QStringLiteral("Media Foundation %1 decoder activation failed").arg(codecName(nextCodec)),
+                hr);
         }
         return false;
     }
@@ -499,9 +554,9 @@ bool NativeVideoDecoder::Impl::configureTypes(NativeVideoCodec nextCodec, QStrin
         return false;
     }
 
-    const GUID inputSubtype = (nextCodec == NativeVideoCodec::H264)
-        ? MFVideoFormat_H264
-        : OLR_MFVideoFormat_HEVC;
+    const GUID inputSubtype = hasSelectedInputSubtype
+        ? selectedInputSubtype
+        : (nextCodec == NativeVideoCodec::H264 ? MFVideoFormat_H264 : OLR_MFVideoFormat_HEVC);
     hr = inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     if (SUCCEEDED(hr)) {
         hr = inputType->SetGUID(MF_MT_SUBTYPE, inputSubtype);
@@ -522,7 +577,9 @@ bool NativeVideoDecoder::Impl::configureTypes(NativeVideoCodec nextCodec, QStrin
     hr = transform->SetInputType(0, inputType.Get(), 0);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation H.264 input type setup failed"), hr);
+            *error = hrMessage(
+                QStringLiteral("Media Foundation %1 input type setup failed").arg(codecName(nextCodec)),
+                hr);
         }
         return false;
     }
@@ -545,7 +602,7 @@ bool NativeVideoDecoder::Impl::configureTypes(NativeVideoCodec nextCodec, QStrin
 }
 
 bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, QString* error) {
-    if (unit.codec != NativeVideoCodec::H264) {
+    if (!isSupportedCodec(unit.codec)) {
         if (error) {
             *error = QStringLiteral("Media Foundation native decode unsupported codec for this task");
         }
@@ -634,7 +691,9 @@ bool NativeVideoDecoder::Impl::processInputSample(IMFSample* sample, QString* er
     const HRESULT hr = transform->ProcessInput(0, sample, 0);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation H.264 frame decode input failed"), hr);
+            *error = hrMessage(
+                QStringLiteral("Media Foundation %1 frame decode input failed").arg(codecName(codec)),
+                hr);
         }
         return false;
     }
@@ -806,7 +865,9 @@ bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
         if (FAILED(hr)) {
             releaseOutputEvents(&output);
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation H.264 frame decode output failed"), hr);
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation %1 frame decode output failed").arg(codecName(codec)),
+                    hr);
             }
             return false;
         }

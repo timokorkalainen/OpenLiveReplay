@@ -159,4 +159,11 @@ if(APPLE)
     olr_add_native_srt_e2e_tests("native-apple-ingest")
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")
+    add_test(NAME e2e_native_srt_hevc_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+    set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
+        LABELS "native-windows-hevc"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
 endif()

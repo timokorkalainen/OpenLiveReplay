@@ -80,7 +80,8 @@ libsrt -> MPEG-TS parser -> H.264/H.265 access-unit splitter -> platform native 
 Platform native decoders:
 
 - Apple: `VideoToolbox`
-- Windows: `Media Foundation/D3D11` for H.264
+- Windows: `Media Foundation/D3D11` for H.264 and HEVC when Windows HEVC media
+  support is installed
 
 The native SRT e2e scripts are shared across platforms. CTest registers the
 same `e2e_native_srt_*` test names for each native platform and changes only the
@@ -121,13 +122,26 @@ ninja -C build/native-srt record_harness sync_harness
 ( cd build/native-srt && ctest -L native-apple-ingest --output-on-failure )
 ```
 
-Windows uses the same shared scripts and `e2e_native_srt_*` test names under the
-`native-windows-ingest` label. It requires local producer tools (`ffmpeg`,
-`srt-live-transmit`, and a Bash-compatible shell) and runs:
+Windows uses the same shared H.264 parity scripts and `e2e_native_srt_*` test
+names under the `native-windows-ingest` label. It requires local producer tools
+(`ffmpeg`, `srt-live-transmit`, and a Bash-compatible shell) and runs:
 
 ```powershell
 ctest --test-dir build/windows-native -C Debug -L native-windows-ingest --output-on-failure
 ```
+
+Windows also registers separate HEVC coverage as `e2e_native_srt_hevc_smoke`
+under only the `native-windows-hevc` label:
+
+```powershell
+ctest --test-dir build/windows-native -C Debug -L native-windows-hevc --output-on-failure
+```
+
+Its producer is capability-gated: the script skips when local `ffmpeg` has no
+HEVC encoder, prefers `libx265`, then selects an available `hevc_*` encoder from
+a Windows-friendly preference list. The engine side still runs with
+`OLR_NATIVE_SRT=1`; if Windows has no HEVC decoder MFT installed, native ingest
+requests the normal FFmpeg fallback instead of retrying native decode forever.
 
 This intentionally proves the native SRT path is carrying the stream: the default
 Homebrew FFmpeg used by the harness does not provide `srt://`, so a fallback to
