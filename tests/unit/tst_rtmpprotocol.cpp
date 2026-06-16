@@ -33,7 +33,10 @@ private slots:
     void chunkParserRejectsNewFmtTwoBeforeIncompleteAssemblyCompletes();
     void chunkParserRejectsMessagesOverConfiguredLimit();
     void chunkParserRejectsBufferedBytesOverConfiguredLimit();
+    void chunkParserRejectsAssemblyBytesOverConfiguredLimit();
+    void chunkParserRejectsMalformedAbortPayloads();
     void chunkParserAbortClearsInFlightAssembly();
+    void chunkParserFmtThreeAfterAbortDoesNotPoisonState();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -386,6 +389,51 @@ void TestRtmpProtocol::chunkParserRejectsBufferedBytesOverConfiguredLimit() {
     QVERIFY(error.contains(QStringLiteral("limit"), Qt::CaseInsensitive));
 }
 
+void TestRtmpProtocol::chunkParserRejectsAssemblyBytesOverConfiguredLimit() {
+    RtmpChunkParser parser;
+    parser.setInputChunkSizeForTest(2);
+    parser.setMaxAssemblyBytes(3);
+    QList<RtmpMessage> messages;
+    QString error;
+
+    const QByteArray first = RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("abcd", 4), 2);
+    QVERIFY(parser.push(first.left(14), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    const QByteArray second = RtmpChunkWriter::message(7, 9, 1, 0, QByteArray("wxyz", 4), 2);
+    QVERIFY(!parser.push(second.left(14), &messages, &error));
+    QVERIFY(error.contains(QStringLiteral("exceed"), Qt::CaseInsensitive));
+    QVERIFY(error.contains(QStringLiteral("limit"), Qt::CaseInsensitive));
+}
+
+void TestRtmpProtocol::chunkParserRejectsMalformedAbortPayloads() {
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray abort =
+            RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("000006"), 128);
+
+        QVERIFY(!parser.push(abort, &messages, &error));
+        QVERIFY(error.contains(QStringLiteral("abort"), Qt::CaseInsensitive));
+        QVERIFY(error.contains(QStringLiteral("malformed"), Qt::CaseInsensitive));
+    }
+
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray abort =
+            RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("0000000600"), 128);
+
+        QVERIFY(!parser.push(abort, &messages, &error));
+        QVERIFY(error.contains(QStringLiteral("abort"), Qt::CaseInsensitive));
+        QVERIFY(error.contains(QStringLiteral("malformed"), Qt::CaseInsensitive));
+    }
+}
+
 void TestRtmpProtocol::chunkParserAbortClearsInFlightAssembly() {
     RtmpChunkParser parser;
     QList<RtmpMessage> messages;
@@ -408,6 +456,37 @@ void TestRtmpProtocol::chunkParserAbortClearsInFlightAssembly() {
 
     QVERIFY(parser.push(video.mid(14), &messages, &error));
     QVERIFY(messages.isEmpty());
+
+    const QByteArray fresh = RtmpChunkWriter::message(6, 9, 1, 100, QByteArray("xy", 2), 2);
+    QVERIFY(parser.push(fresh, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().type, 9);
+    QCOMPARE(messages.first().timestampMs, qint64(100));
+    QCOMPARE(messages.first().payload, QByteArray("xy", 2));
+}
+
+void TestRtmpProtocol::chunkParserFmtThreeAfterAbortDoesNotPoisonState() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    parser.setInputChunkSizeForTest(2);
+    const QByteArray video = RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("abcdef", 6), 2);
+    QVERIFY(parser.push(video.left(14), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    const QByteArray abort = RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("00000006"), 2);
+    QVERIFY(parser.push(abort, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+
+    QVERIFY(parser.push(video.mid(14, 3), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    const QByteArray fresh = RtmpChunkWriter::message(6, 9, 1, 40, QByteArray("zz", 2), 2);
+    QVERIFY(parser.push(fresh, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().timestampMs, qint64(40));
+    QCOMPARE(messages.first().payload, QByteArray("zz", 2));
 }
 
 void TestRtmpProtocol::parsesAvcSequenceHeaderAndConvertsNalusToAnnexB() {

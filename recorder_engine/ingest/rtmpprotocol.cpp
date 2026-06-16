@@ -192,9 +192,18 @@ void RtmpChunkParser::reset() {
     m_inputChunkSize = 128;
     m_previousHeaders.clear();
     m_assemblies.clear();
+    m_abortedChunkStreams.clear();
 }
 
-bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* error) const {
+int RtmpChunkParser::assemblyPayloadBytes() const {
+    int total = 0;
+    for (auto it = m_assemblies.cbegin(); it != m_assemblies.cend(); ++it) {
+        total += it.value().payload.size();
+    }
+    return total;
+}
+
+bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* error) {
     if (!fragment || m_buffer.isEmpty()) {
         return false;
     }
@@ -215,9 +224,36 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
 
     const bool hasPreviousHeader = m_previousHeaders.contains(csid);
     const bool hasActiveAssembly = m_assemblies.contains(csid);
+    const bool isAborted = m_abortedChunkStreams.contains(csid);
     if (fmt != 0 && !hasPreviousHeader) {
         if (error) *error = QStringLiteral("RTMP chunk header required a previous header.");
         return false;
+    }
+    if (isAborted && fmt == 3) {
+        ChunkHeader previousHeader = m_previousHeaders.value(csid);
+        if (previousHeader.usesExtendedTimestamp) {
+            if (needMore(m_buffer, offset, 4)) return false;
+            offset += 4;
+        }
+
+        const int remaining = m_abortedChunkStreams.value(csid);
+        if (remaining <= 0) {
+            if (error) {
+                *error = QStringLiteral("RTMP aborted chunk stream received stale continuation.");
+            }
+            return false;
+        }
+
+        const int toRead = qMin(m_inputChunkSize, remaining);
+        if (needMore(m_buffer, offset, toRead)) return false;
+
+        parsed.consumed = offset + toRead;
+        parsed.csid = csid;
+        parsed.header = previousHeader;
+        parsed.discarded = true;
+        parsed.discardedPayloadBytes = toRead;
+        *fragment = std::move(parsed);
+        return true;
     }
     if (fmt != 3 && hasActiveAssembly) {
         if (error) {
@@ -313,6 +349,9 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
     parsed.consumed = offset;
     parsed.csid = csid;
     parsed.header = header;
+    if (isAborted && fmt != 3) {
+        m_abortedChunkStreams.remove(csid);
+    }
     *fragment = std::move(parsed);
     return true;
 }
@@ -339,18 +378,35 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
             return true;
         }
 
+        if (fragment.discarded) {
+            const int remaining =
+                qMax(0, m_abortedChunkStreams.value(fragment.csid) - fragment.discardedPayloadBytes);
+            m_abortedChunkStreams.insert(fragment.csid, remaining);
+            m_buffer.remove(0, fragment.consumed);
+            continue;
+        }
+
         ChunkAssembly assembly = m_assemblies.value(fragment.csid);
         if (fragment.startsMessage || assembly.payload.isEmpty()) {
             assembly.header = fragment.header;
         }
-        assembly.payload.append(fragment.fragment);
-        m_previousHeaders.insert(fragment.csid, fragment.header);
-        m_buffer.remove(0, fragment.consumed);
+        const int existingAssemblyBytes = m_assemblies.value(fragment.csid).payload.size();
+        const int projectedPayloadSize = assembly.payload.size() + fragment.fragment.size();
+        if (projectedPayloadSize < assembly.header.messageLength &&
+            assemblyPayloadBytes() - existingAssemblyBytes + projectedPayloadSize >
+                m_maxAssemblyBytes) {
+            if (error) *error = QStringLiteral("RTMP assembly bytes exceed limit.");
+            return false;
+        }
 
+        assembly.payload.append(fragment.fragment);
         if (assembly.payload.size() > assembly.header.messageLength) {
             if (error) *error = QStringLiteral("RTMP chunk overflow.");
             return false;
         }
+
+        m_previousHeaders.insert(fragment.csid, fragment.header);
+        m_buffer.remove(0, fragment.consumed);
 
         if (assembly.payload.size() < assembly.header.messageLength) {
             m_assemblies.insert(fragment.csid, assembly);
@@ -363,9 +419,17 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         message.streamId = assembly.header.messageStreamId;
         message.timestampMs = assembly.header.timestampMs;
         message.payload = std::move(assembly.payload);
-        if (message.type == 2 && message.payload.size() >= 4) {
+        if (message.type == 2) {
+            if (message.payload.size() != 4) {
+                if (error) *error = QStringLiteral("RTMP abort payload was malformed.");
+                return false;
+            }
             const int abortCsid = int(readU32Be(message.payload.constData()));
+            const ChunkAssembly abortedAssembly = m_assemblies.value(abortCsid);
+            const int remaining =
+                qMax(0, abortedAssembly.header.messageLength - abortedAssembly.payload.size());
             m_assemblies.remove(abortCsid);
+            m_abortedChunkStreams.insert(abortCsid, remaining);
         }
         if (message.type == 1) {
             if (message.payload.size() != 4) {

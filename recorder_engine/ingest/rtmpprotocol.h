@@ -39,6 +39,7 @@ public:
     int inputChunkSize() const { return m_inputChunkSize; }
     void setMaxMessageSize(int bytes) { m_maxMessageSize = qMax(1, bytes); }
     void setMaxBufferedBytes(int bytes) { m_maxBufferedBytes = qMax(1, bytes); }
+    void setMaxAssemblyBytes(int bytes) { m_maxAssemblyBytes = qMax(1, bytes); }
     void setInputChunkSizeForTest(int bytes) { m_inputChunkSize = qMax(1, bytes); }
     void reset();
 
@@ -62,16 +63,21 @@ private:
         ChunkHeader header;
         QByteArray fragment;
         bool startsMessage = false;
+        bool discarded = false;
+        int discardedPayloadBytes = 0;
     };
 
-    bool tryParseFragment(ParsedChunkFragment* fragment, QString* error) const;
+    bool tryParseFragment(ParsedChunkFragment* fragment, QString* error);
+    int assemblyPayloadBytes() const;
 
     QByteArray m_buffer;
     int m_inputChunkSize = 128;
     int m_maxMessageSize = 16 * 1024 * 1024;
     int m_maxBufferedBytes = 4 * 1024 * 1024;
+    int m_maxAssemblyBytes = 4 * 1024 * 1024;
     QHash<int, ChunkHeader> m_previousHeaders;
     QHash<int, ChunkAssembly> m_assemblies;
+    QHash<int, int> m_abortedChunkStreams;
 };
 
 struct RtmpAvcConfig {
