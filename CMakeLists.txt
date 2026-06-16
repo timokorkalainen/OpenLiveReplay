@@ -77,6 +77,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/audiotoolboxaacdecoder.h
         recorder_engine/ingest/nativevideodecoder.h
+        recorder_engine/ingest/nativesrtaddress.h recorder_engine/ingest/nativesrtaddress.cpp
         recorder_engine/ingest/nativesrtingestsession.h
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
@@ -420,6 +421,9 @@ target_link_libraries(OpenLiveReplay PRIVATE
     olr_warnings
     olr_sanitize
 )
+if(WIN32)
+    target_link_libraries(OpenLiveReplay PRIVATE ws2_32)
+endif()
 
 # 6. Bundle Properties
 set_target_properties(OpenLiveReplay PROPERTIES

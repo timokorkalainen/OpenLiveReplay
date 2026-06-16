@@ -21,6 +21,7 @@ olr_add_unit_test(tst_muxer            olr_test_engine)
 olr_add_unit_test(tst_ingestbackendselector olr_test_core)
 olr_add_unit_test(tst_mpegtsparser     olr_test_core)
 olr_add_unit_test(tst_h26xaccessunit   olr_test_core)
+olr_add_unit_test(tst_nativesrtaddress olr_test_core)
 olr_add_unit_test(tst_nativevideodecoder olr_test_core)
 if(APPLE)
     add_library(olr_test_nativevideodecoder STATIC

@@ -1,14 +1,13 @@
 #include "nativesrtingestsession.h"
 
+#include "nativesrtaddress.h"
+
 #include <QDebug>
 #include <QThread>
 #include <QUrlQuery>
 
 #include <algorithm>
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <mutex>
-#include <sys/socket.h>
 #include <utility>
 
 #include <srt/srt.h>
@@ -33,11 +32,6 @@ constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
 
 std::mutex srtLibraryMutex;
 int srtLibraryRefs = 0;
-
-bool isNumericIpv4Host(const QString& host) {
-    sockaddr_in address {};
-    return inet_pton(AF_INET, host.toUtf8().constData(), &address.sin_addr) == 1;
-}
 
 bool acquireSrtLibrary(QString* error) {
     std::lock_guard<std::mutex> lock(srtLibraryMutex);
@@ -132,7 +126,7 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
         return false;
     }
 
-    return isNumericIpv4Host(url.host());
+    return nativeSrtIsNumericIpv4Host(url.host());
 }
 
 bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
@@ -251,17 +245,8 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         return false;
     }
 
-    const QByteArray host = m_url.host().toUtf8();
-    if (host.isEmpty()) {
-        if (error) *error = QStringLiteral("Native SRT URL is missing a host.");
-        closeSocket();
-        return false;
-    }
-
-    sockaddr_in address {};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(quint16(m_url.port(9000)));
-    if (inet_pton(AF_INET, host.constData(), &address.sin_addr) != 1) {
+    NativeSrtSockaddr address;
+    if (!nativeSrtMakeIpv4Sockaddr(m_url.host(), quint16(m_url.port(9000)), &address)) {
         if (error) {
             *error = QStringLiteral("Native SRT currently requires a numeric IPv4 host.");
         }
@@ -269,8 +254,7 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         return false;
     }
 
-    const int connectResult =
-        srt_connect(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    const int connectResult = srt_connect(m_socket, address.sockaddrPtr(), address.size);
     if (connectResult == SRT_ERROR) {
         int osError = 0;
         const int code = srt_getlasterror(&osError);

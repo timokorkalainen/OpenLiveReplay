@@ -41,6 +41,8 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xaccessunit.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.h"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.cpp"
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectsettingsimporter.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectimportclient.cpp"
@@ -53,6 +55,9 @@ target_include_directories(olr_test_core PUBLIC "${CMAKE_SOURCE_DIR}")
 target_link_libraries(olr_test_core
     PUBLIC Qt6::Core Qt6::Network
     PRIVATE olr_warnings olr_sanitize)
+if(WIN32)
+    target_link_libraries(olr_test_core PRIVATE ws2_32)
+endif()
 
 if(APPLE)
     target_sources(olr_test_core PRIVATE
