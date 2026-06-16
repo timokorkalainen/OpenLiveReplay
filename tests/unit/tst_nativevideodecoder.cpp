@@ -1,0 +1,20 @@
+#include <QtTest>
+
+#include "recorder_engine/ingest/nativevideodecoder.h"
+
+class TestNativeVideoDecoder : public QObject {
+    Q_OBJECT
+private slots:
+    void defaultCapabilitiesAreFalse();
+};
+
+void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
+    const NativeVideoDecodeCapabilities caps;
+    QVERIFY(!caps.h264);
+    QVERIFY(!caps.hevc);
+    QVERIFY(!caps.d3d11);
+    QVERIFY(caps.detail.isEmpty());
+}
+
+QTEST_GUILESS_MAIN(TestNativeVideoDecoder)
+#include "tst_nativevideodecoder.moc"
