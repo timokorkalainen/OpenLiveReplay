@@ -22,6 +22,9 @@ public:
     ~NativeSrtIngestSession() override;
 
     static bool supportsUrl(const QUrl& url);
+    static int64_t sourcePtsMsFromVideoAnchor(qint64 pts90k,
+                                              int64_t firstDts90k,
+                                              int64_t anchorStreamTimeMs);
 
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
@@ -67,6 +70,7 @@ private:
     void processPesPacket(const PesPacket& pes);
     void processAudioPesPacket(const PesPacket& pes);
     int64_t sourcePtsMsForUnit(const CompressedAccessUnit& unit);
+    int64_t sourcePtsMsForDecodedVideoPts(qint64 pts90k) const;
     int64_t sourcePtsMsForAudio(qint64 pts90k);
 };
 

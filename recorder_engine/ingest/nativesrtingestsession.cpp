@@ -130,6 +130,15 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
     return nativeSrtIsNumericIpv4Host(url.host());
 }
 
+int64_t NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(qint64 pts90k,
+                                                           int64_t firstDts90k,
+                                                           int64_t anchorStreamTimeMs) {
+    if (pts90k < 0 || firstDts90k < 0 || anchorStreamTimeMs < 0) {
+        return -1;
+    }
+    return anchorStreamTimeMs + ((pts90k - firstDts90k) / 90);
+}
+
 bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
     closeSocket();
     m_url = url;
@@ -438,7 +447,8 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
 
                 DecodedVideoFrame decodedFrame;
                 decodedFrame.frame = frame;
-                decodedFrame.sourcePtsMs = sourcePtsMs;
+                const int64_t decodedPtsMs = sourcePtsMsForDecodedVideoPts(frame->pts);
+                decodedFrame.sourcePtsMs = decodedPtsMs >= 0 ? decodedPtsMs : sourcePtsMs;
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);
@@ -593,7 +603,11 @@ int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& u
     if (m_anchorStreamTimeMs < 0) {
         return -1;
     }
-    return m_anchorStreamTimeMs + ((unitPts90k - m_firstDts90k) / 90);
+    return sourcePtsMsForDecodedVideoPts(unitPts90k);
+}
+
+int64_t NativeSrtIngestSession::sourcePtsMsForDecodedVideoPts(qint64 pts90k) const {
+    return sourcePtsMsFromVideoAnchor(pts90k, m_firstDts90k, m_anchorStreamTimeMs);
 }
 
 int64_t NativeSrtIngestSession::sourcePtsMsForAudio(qint64 pts90k) {

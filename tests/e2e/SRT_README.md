@@ -80,7 +80,7 @@ libsrt -> MPEG-TS parser -> H.264/H.265 access-unit splitter -> platform native 
 Platform native decoders:
 
 - Apple: `VideoToolbox`
-- Windows: `Media Foundation/D3D11` (planned/when implemented)
+- Windows: `Media Foundation/D3D11` for H.264
 
 The native SRT e2e scripts are shared across platforms. CTest registers the
 same `e2e_native_srt_*` test names for each native platform and changes only the

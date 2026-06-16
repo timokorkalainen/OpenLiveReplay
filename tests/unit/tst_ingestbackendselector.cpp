@@ -3,6 +3,7 @@
 #include "recorder_engine/ingest/ffmpegingestsession.h"
 #include "recorder_engine/ingest/ingestsession.h"
 #include "recorder_engine/ingest/nativefallbackpolicy.h"
+#include "recorder_engine/ingest/nativesrtingestsession.h"
 
 class TestIngestBackendSelector : public QObject {
     Q_OBJECT
@@ -13,6 +14,7 @@ private slots:
     void nativeFailureReasonStartsEmpty();
     void nativeDecodeCapabilityErrorsRequestFallback();
     void nativeDecodeTransientErrorsDoNotRequestFallback();
+    void decodedVideoPtsUsesVideoAnchor();
 };
 
 class EmptySession final : public IngestSession {
@@ -70,6 +72,13 @@ void TestIngestBackendSelector::nativeDecodeTransientErrorsDoNotRequestFallback(
     QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("H.264 decode requires SPS/PPS before frames.")));
     QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("H.265 decode requires VPS before frames.")));
     QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("Native decoder received an empty access unit.")));
+}
+
+void TestIngestBackendSelector::decodedVideoPtsUsesVideoAnchor() {
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, 90000, 1000), 1200);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(-1, 90000, 1000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, -1, 1000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, 90000, -1), -1);
 }
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)
