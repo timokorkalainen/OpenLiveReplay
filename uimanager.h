@@ -195,6 +195,12 @@ public:
     Q_INVOKABLE void captureCurrent();
     Q_INVOKABLE void requestNewWindowScene();
     Q_INVOKABLE void setPlaybackViewState(bool singleView, int selectedIndex);
+    Q_INVOKABLE bool playbackSingleView() const { return m_playbackSingleView; }
+    Q_INVOKABLE int playbackSelectedIndex() const { return m_playbackSelectedIndex; }
+    Q_INVOKABLE void dispatchExternalAction(int action, bool pressed);
+    Q_INVOKABLE void jogExternal(int delta);
+    Q_INVOKABLE void shuttleExternal(int delta);
+    Q_INVOKABLE void selectFeedExternal(int index);
     Q_INVOKABLE void cancelFollowLive();
 
     Q_INVOKABLE void refreshScreens();
@@ -246,6 +252,7 @@ signals:
     void recordedDurationMsChanged();
     void scrubPositionChanged();
     void playbackTimecodeChanged();
+    void playbackViewStateChanged();
     void recordingStartEpochMsChanged();
     void timeOfDayModeChanged();
     void midiPortsChanged();
@@ -266,6 +273,8 @@ signals:
     void sourceConnectionChanged();
     void sourceStatsChanged();
     void sourceTrimChanged();
+    void metadataFieldsChanged();
+    void sourceMetadataChanged();
     void importSettingsUrlChanged();
     void importPreviewChanged();
     void telemetryConfigChanged();

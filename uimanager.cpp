@@ -564,6 +564,26 @@ void UIManager::dispatchControlAction(int action, bool isRelease)
     }
 }
 
+void UIManager::dispatchExternalAction(int action, bool pressed)
+{
+    dispatchControlAction(action, !pressed);
+}
+
+void UIManager::jogExternal(int delta)
+{
+    jogStep(delta);
+}
+
+void UIManager::shuttleExternal(int delta)
+{
+    shuttleStep(delta);
+}
+
+void UIManager::selectFeedExternal(int index)
+{
+    emit feedSelectRequested(index);
+}
+
 void UIManager::jogStep(int delta)
 {
     if (!m_transport || delta == 0) return;
@@ -1417,6 +1437,8 @@ void UIManager::requestNewWindowScene() {
 }
 
 void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
+    const bool changed = (m_playbackSingleView != singleView)
+                         || (m_playbackSelectedIndex != selectedIndex);
     m_playbackSingleView = singleView;
     m_playbackSelectedIndex = selectedIndex;
 
@@ -1430,6 +1452,9 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
     }
 
     updateXTouchLcd();
+    if (changed) {
+        emit playbackViewStateChanged();
+    }
 }
 
 void UIManager::openStreams() {
@@ -1667,6 +1692,9 @@ void UIManager::setMetadataFieldDefinitions(const QVariantList &fields) {
         arr.append(obj);
     }
     m_currentSettings.metadataFields = arr;
+    emit metadataFieldsChanged();
+    emit viewSlotMapChanged();
+    saveSettings();
 }
 
 QVariantList UIManager::sourceMetadataItems(int index) const {
@@ -1709,6 +1737,9 @@ void UIManager::setSourceMetadataItems(int index, const QVariantList &items) {
         arr.append(obj);
     }
     m_currentSettings.sources[index].metadata = arr;
+    emit sourceMetadataChanged();
+    emit viewSlotMapChanged();
+    saveSettings();
 }
 
 void UIManager::readImportSettings() {
