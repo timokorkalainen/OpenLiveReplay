@@ -73,6 +73,11 @@ qt_add_qml_module(OpenLiveReplay
         Main.qml
         MultiviewWindow.qml
     SOURCES
+        websocket/controlapiadapter.h
+        websocket/controlprotocol.h websocket/controlprotocol.cpp
+        websocket/controlstate.h websocket/controlstate.cpp
+        websocket/controlwebsocketserver.h websocket/controlwebsocketserver.cpp
+        websocket/uimanagercontroladapter.h websocket/uimanagercontroladapter.cpp
         recorder_engine/replaymanager.cpp recorder_engine/replaymanager.h
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
