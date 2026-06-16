@@ -60,6 +60,10 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_prevAudioPtsMs = -1;
     m_audioAnchorStreamTimeMs = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
+    m_seenSupportedVideo = false;
+    m_seenSupportedAudio = false;
+    m_openedAtMs = m_lastPacketAtMs;
+    m_unsupportedReason.clear();
     m_chunkParser.reset();
     m_pendingMessages.clear();
 
@@ -93,6 +97,12 @@ void NativeRtmpIngestSession::run() {
         }
         m_lastPacketAtMs = m_monotonic.elapsed();
         processMessage(message);
+        if (!m_seenSupportedVideo && m_openedAtMs >= 0 &&
+            m_monotonic.elapsed() - m_openedAtMs > 5000) {
+            log(QStringLiteral(
+                "Native RTMP unsupported profile: no supported video within probe window."));
+            break;
+        }
     }
 
     if (m_callbacks.setConnected) {
@@ -406,6 +416,11 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     }
     const int codecId = uchar(payload[0]) & 0x0f;
     if (codecId != 7) {
+        if (m_unsupportedReason.isEmpty()) {
+            m_unsupportedReason =
+                QStringLiteral("unsupported RTMP video codec id %1").arg(codecId);
+            log(QStringLiteral("Native RTMP unsupported profile: %1").arg(m_unsupportedReason));
+        }
         return;
     }
     const int avcPacketType = uchar(payload[1]);
@@ -415,6 +430,8 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         QString error;
         if (!parseAvcSequenceHeader(avcPayload, &error)) {
             log(error);
+        } else {
+            m_seenSupportedVideo = true;
         }
         return;
     }
@@ -471,6 +488,11 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
     }
     const int soundFormat = (uchar(payload[0]) >> 4) & 0x0f;
     if (soundFormat != 10) {
+        if (m_unsupportedReason.isEmpty()) {
+            m_unsupportedReason =
+                QStringLiteral("unsupported RTMP audio format id %1").arg(soundFormat);
+            log(QStringLiteral("Native RTMP unsupported profile: %1").arg(m_unsupportedReason));
+        }
         return;
     }
     const int aacPacketType = uchar(payload[1]);
@@ -479,6 +501,8 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
         QString error;
         if (!parseAacSequenceHeader(aacPayload, &error)) {
             log(error);
+        } else {
+            m_seenSupportedAudio = true;
         }
         return;
     }

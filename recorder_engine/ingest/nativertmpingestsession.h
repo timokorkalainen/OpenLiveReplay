@@ -54,6 +54,10 @@ private:
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_audioAnchorStreamTimeMs = -1;
     int64_t m_lastPacketAtMs = -1;
+    bool m_seenSupportedVideo = false;
+    bool m_seenSupportedAudio = false;
+    int64_t m_openedAtMs = -1;
+    QString m_unsupportedReason;
     RtmpChunkParser m_chunkParser;
     QList<RtmpMessage> m_pendingMessages;
 
