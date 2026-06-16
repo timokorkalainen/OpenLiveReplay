@@ -395,6 +395,25 @@ def enhanced_hevc_tags(path: str) -> list[tuple[int, int, bytes]]:
     return tags
 
 
+def loop_tags(tags: list[tuple[int, int, bytes]], duration_ms: int) -> list[tuple[int, int, bytes]]:
+    if duration_ms <= 0 or not tags:
+        return tags
+    source_duration_ms = max(timestamp for _tag_type, timestamp, _payload in tags) + 33
+    if source_duration_ms <= 0 or source_duration_ms >= duration_ms:
+        return tags
+
+    looped: list[tuple[int, int, bytes]] = []
+    offset_ms = 0
+    while offset_ms < duration_ms:
+        for tag_type, timestamp, payload in tags:
+            shifted = offset_ms + timestamp
+            if shifted > duration_ms:
+                break
+            looped.append((tag_type, shifted, payload))
+        offset_ms += source_duration_ms
+    return looped
+
+
 def run_server(args: argparse.Namespace) -> None:
     tags: list[tuple[int, int, bytes]] = []
     if args.enhanced_hevc:
@@ -403,6 +422,8 @@ def run_server(args: argparse.Namespace) -> None:
         tags = enhanced_hevc_tags(args.hevc_annexb_source)
     elif args.flv:
         tags = flv_tags(args.flv)
+    if args.loop_duration > 0:
+        tags = loop_tags(tags, int(args.loop_duration * 1000))
     if not args.idle_after_play and not tags:
         raise ValueError("FLV fixture contains no RTMP media tags")
 
@@ -573,6 +594,7 @@ def main() -> int:
     parser.add_argument("--out-chunk-size", type=int, default=OUT_CHUNK_SIZE)
     parser.add_argument("--write-fragment", type=int, default=0)
     parser.add_argument("--write-fragment-delay", type=float, default=0.0)
+    parser.add_argument("--loop-duration", type=float, default=0.0)
     args = parser.parse_args()
     if args.out_chunk_size < 4:
         parser.error("--out-chunk-size must be at least 4")
@@ -580,6 +602,8 @@ def main() -> int:
         parser.error("--write-fragment must be non-negative")
     if args.write_fragment_delay < 0:
         parser.error("--write-fragment-delay must be non-negative")
+    if args.loop_duration < 0:
+        parser.error("--loop-duration must be non-negative")
 
     try:
         run_server(args)

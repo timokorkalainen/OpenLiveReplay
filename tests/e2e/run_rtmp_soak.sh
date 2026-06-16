@@ -39,15 +39,19 @@ if [ "$CODEC" = "avc" ]; then
     rtmp_server "$PORT" "$SOURCE" "$SERVER_LOG" || exit 1
 elif [ "$CODEC" = "hevc" ]; then
     SOURCE="$WORKDIR/hevc_source.hevc"
+    HEVC_SOURCE_SECS="$SECS"
+    if [ "$HEVC_SOURCE_SECS" -gt 60 ]; then
+        HEVC_SOURCE_SECS=60
+    fi
     if ! ffmpeg -hide_banner -loglevel error \
         -f lavfi -i "testsrc2=size=640x480:rate=30" \
-        -t "$SECS" -an -pix_fmt yuv420p \
+        -t "$HEVC_SOURCE_SECS" -an -pix_fmt yuv420p \
         -c:v hevc_videotoolbox -allow_sw 1 -g 30 -bf 0 \
         -f hevc "$SOURCE" >/dev/null 2>&1 || [ ! -s "$SOURCE" ]; then
         rm -f "$SOURCE"
         if ! ffmpeg -hide_banner -loglevel error \
             -f lavfi -i "testsrc2=size=640x480:rate=30" \
-            -t "$SECS" -an -pix_fmt yuv420p \
+            -t "$HEVC_SOURCE_SECS" -an -pix_fmt yuv420p \
             -c:v libx265 -preset ultrafast \
             -x265-params "log-level=error:keyint=30:min-keyint=30:scenecut=0" \
             -f hevc "$SOURCE" >/dev/null 2>&1 || [ ! -s "$SOURCE" ]; then
@@ -56,6 +60,7 @@ elif [ "$CODEC" = "hevc" ]; then
         fi
     fi
     rtmp_fixture_server_cmd --port "$PORT" --hevc-annexb-source "$SOURCE" --enhanced-hevc \
+        --loop-duration "$SECS" \
         >"$SERVER_LOG" 2>&1 &
     PIDS+=("$!")
     for _ in $(seq 1 50); do
