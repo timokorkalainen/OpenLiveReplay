@@ -2,6 +2,19 @@
 
 #include "recorder_engine/ingest/rtmpprotocol.h"
 
+namespace {
+void appendU24(QByteArray* bytes, int value) {
+    bytes->append(char((value >> 16) & 0xff));
+    bytes->append(char((value >> 8) & 0xff));
+    bytes->append(char(value & 0xff));
+}
+
+bool errorMentionsPreviousHeader(const QString& error) {
+    return error.contains(QStringLiteral("previous"), Qt::CaseInsensitive) ||
+           error.contains(QStringLiteral("continuation"), Qt::CaseInsensitive);
+}
+} // namespace
+
 class TestRtmpProtocol : public QObject {
     Q_OBJECT
 private slots:
@@ -9,6 +22,12 @@ private slots:
     void chunkParserReassemblesSplitMessageAndUpdatesChunkSize();
     void chunkParserDoesNotDoubleApplyTimestampDeltaWhenPayloadArrivesLater();
     void chunkParserConsumesExtendedTimestampOnContinuationChunks();
+    void chunkParserRejectsFmtOneWithoutPreviousHeader();
+    void chunkParserRejectsFmtTwoWithoutPreviousHeader();
+    void chunkParserAdvancesTimestampForFmtThreeStartingSameHeaderMessage();
+    void chunkParserRejectsUnsafeSetChunkSizeValues();
+    void chunkParserAppliesFragmentedSetChunkSizeOnlyAfterCompletion();
+    void chunkParserRejectsNewHeaderBeforeIncompleteAssemblyCompletes();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -102,6 +121,135 @@ void TestRtmpProtocol::chunkParserConsumesExtendedTimestampOnContinuationChunks(
     QCOMPARE(messages.size(), 1);
     QCOMPARE(messages.first().timestampMs, qint64(0x1000000));
     QCOMPARE(messages.first().payload, payload);
+}
+
+void TestRtmpProtocol::chunkParserRejectsFmtOneWithoutPreviousHeader() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    QByteArray chunk;
+    chunk.append(char((1 << 6) | 6)); // fmt=1, csid=6
+    appendU24(&chunk, 40);
+    appendU24(&chunk, 1);
+    chunk.append(char(9));
+    chunk.append("x", 1);
+
+    QVERIFY(!parser.push(chunk, &messages, &error));
+    QVERIFY(errorMentionsPreviousHeader(error));
+    QVERIFY(messages.isEmpty());
+}
+
+void TestRtmpProtocol::chunkParserRejectsFmtTwoWithoutPreviousHeader() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    QByteArray chunk;
+    chunk.append(char((2 << 6) | 6)); // fmt=2, csid=6
+    appendU24(&chunk, 40);
+
+    QVERIFY(!parser.push(chunk, &messages, &error));
+    QVERIFY(errorMentionsPreviousHeader(error));
+    QVERIFY(messages.isEmpty());
+}
+
+void TestRtmpProtocol::chunkParserAdvancesTimestampForFmtThreeStartingSameHeaderMessage() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    const QByteArray first =
+        RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("aa", 2), 128);
+    QVERIFY(parser.push(first, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().timestampMs, 1000);
+
+    QByteArray second;
+    second.append(char((1 << 6) | 6)); // fmt=1, csid=6
+    appendU24(&second, 40);
+    appendU24(&second, 2);
+    second.append(char(9));
+    second.append("bb", 2);
+
+    QVERIFY(parser.push(second, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().timestampMs, 1040);
+
+    QByteArray third;
+    third.append(char((3 << 6) | 6)); // fmt=3, csid=6
+    third.append("cc", 2);
+
+    QVERIFY(parser.push(third, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().timestampMs, 1080);
+    QCOMPARE(messages.first().payload, QByteArray("cc", 2));
+}
+
+void TestRtmpProtocol::chunkParserRejectsUnsafeSetChunkSizeValues() {
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray chunkSizeZero =
+            RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("00000000"), 128);
+
+        QVERIFY(!parser.push(chunkSizeZero, &messages, &error));
+        QVERIFY(error.contains(QStringLiteral("chunk size"), Qt::CaseInsensitive));
+        QCOMPARE(parser.inputChunkSize(), 128);
+    }
+
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray chunkSizeHighBit =
+            RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("80000000"), 128);
+
+        QVERIFY(!parser.push(chunkSizeHighBit, &messages, &error));
+        QVERIFY(error.contains(QStringLiteral("chunk size"), Qt::CaseInsensitive));
+        QCOMPARE(parser.inputChunkSize(), 128);
+    }
+}
+
+void TestRtmpProtocol::chunkParserAppliesFragmentedSetChunkSizeOnlyAfterCompletion() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    const QByteArray setChunkSize =
+        RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("00000004"), 128);
+
+    QVERIFY(parser.push(setChunkSize.left(setChunkSize.size() - 1), &messages, &error));
+    QVERIFY(messages.isEmpty());
+    QCOMPARE(parser.inputChunkSize(), 128);
+
+    QVERIFY(parser.push(setChunkSize.right(1), &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().type, 1);
+    QCOMPARE(parser.inputChunkSize(), 4);
+}
+
+void TestRtmpProtocol::chunkParserRejectsNewHeaderBeforeIncompleteAssemblyCompletes() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    const QByteArray setChunkSize =
+        RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("00000002"), 128);
+    QVERIFY(parser.push(setChunkSize, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+
+    const QByteArray first = RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("xyzz", 4), 2);
+    const int firstFragmentSize = 1 + 11 + 2;
+    QVERIFY(parser.push(first.left(firstFragmentSize), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    const QByteArray second = RtmpChunkWriter::message(6, 9, 1, 2000, QByteArray("abcd", 4), 128);
+    QVERIFY(!parser.push(second, &messages, &error));
+    QVERIFY(error.contains(QStringLiteral("incomplete"), Qt::CaseInsensitive));
 }
 
 void TestRtmpProtocol::parsesAvcSequenceHeaderAndConvertsNalusToAnnexB() {

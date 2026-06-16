@@ -45,6 +45,7 @@ private:
         int messageLength = 0;
         int messageType = 0;
         int messageStreamId = 0;
+        bool timestampIsDelta = false;
         bool usesExtendedTimestamp = false;
     };
     struct ChunkAssembly {

@@ -214,9 +214,22 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
     }
 
     const bool hasPreviousHeader = m_previousHeaders.contains(csid);
+    const bool hasActiveAssembly = m_assemblies.contains(csid);
+    if (fmt != 0 && !hasPreviousHeader) {
+        if (error) *error = QStringLiteral("RTMP chunk header required a previous header.");
+        return false;
+    }
+    if (fmt != 3 && hasActiveAssembly) {
+        if (error) {
+            *error = QStringLiteral(
+                "RTMP new chunk header arrived before incomplete message assembly completed.");
+        }
+        return false;
+    }
+
     const ChunkHeader previousHeader = m_previousHeaders.value(csid);
     ChunkHeader header = previousHeader;
-    parsed.startsMessage = fmt != 3;
+    parsed.startsMessage = fmt != 3 || !hasActiveAssembly;
 
     if (fmt == 0) {
         if (needMore(m_buffer, offset, 11)) return false;
@@ -226,6 +239,7 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
         header.messageLength = readU24(m_buffer.constData() + offset + 3);
         header.messageType = uchar(m_buffer[offset + 6]);
         header.messageStreamId = int(readU32Le(m_buffer.constData() + offset + 7));
+        header.timestampIsDelta = false;
         header.usesExtendedTimestamp = timestamp == 0xffffff;
         offset += 11;
     } else if (fmt == 1) {
@@ -235,6 +249,7 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
         header.timestampDeltaMs = timestampDelta;
         header.messageLength = readU24(m_buffer.constData() + offset + 3);
         header.messageType = uchar(m_buffer[offset + 6]);
+        header.timestampIsDelta = true;
         header.usesExtendedTimestamp = timestampDelta == 0xffffff;
         if (!header.usesExtendedTimestamp) {
             header.timestampMs += header.timestampDeltaMs;
@@ -245,15 +260,15 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
         const int timestampDelta = readU24(m_buffer.constData() + offset);
         header.timestampMs = previousHeader.timestampMs;
         header.timestampDeltaMs = timestampDelta;
+        header.timestampIsDelta = true;
         header.usesExtendedTimestamp = timestampDelta == 0xffffff;
         if (!header.usesExtendedTimestamp) {
             header.timestampMs += header.timestampDeltaMs;
         }
         offset += 3;
     } else {
-        if (!hasPreviousHeader) {
-            if (error) *error = QStringLiteral("RTMP continuation chunk had no previous header.");
-            return false;
+        if (!hasActiveAssembly && header.timestampIsDelta) {
+            header.timestampMs += header.timestampDeltaMs;
         }
         header.usesExtendedTimestamp = previousHeader.usesExtendedTimestamp;
     }
@@ -335,8 +350,17 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         message.streamId = assembly.header.messageStreamId;
         message.timestampMs = assembly.header.timestampMs;
         message.payload = std::move(assembly.payload);
-        if (message.type == 1 && message.payload.size() >= 4) {
-            m_inputChunkSize = int(readU32Be(message.payload.constData()));
+        if (message.type == 1) {
+            if (message.payload.size() != 4) {
+                if (error) *error = QStringLiteral("RTMP set chunk size payload was malformed.");
+                return false;
+            }
+            const quint32 chunkSize = readU32Be(message.payload.constData());
+            if (chunkSize == 0 || chunkSize > 0x7fffffff) {
+                if (error) *error = QStringLiteral("RTMP set chunk size was invalid.");
+                return false;
+            }
+            m_inputChunkSize = int(chunkSize);
         }
         messages->append(std::move(message));
     }
