@@ -30,7 +30,11 @@ add_test(NAME e2e_record_stereo
 add_test(NAME e2e_record_mono
     COMMAND bash "${_driver}" "$<TARGET_FILE:record_harness>" mono 23457)
 
-set_tests_properties(e2e_record_stereo e2e_record_mono PROPERTIES
+# P1: prove a true fractional 29.97 (30000/1001) recording, not integer 30.
+add_test(NAME e2e_record_2997
+    COMMAND bash "${_driver}" "$<TARGET_FILE:record_harness>" fps2997 23458)
+
+set_tests_properties(e2e_record_stereo e2e_record_mono e2e_record_2997 PROPERTIES
     LABELS "e2e"
     TIMEOUT 120
     RUN_SERIAL TRUE)  # they bind UDP ports / drive ffmpeg; don't overlap
