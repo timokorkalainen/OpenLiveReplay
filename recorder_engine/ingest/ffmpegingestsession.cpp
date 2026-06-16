@@ -2,7 +2,6 @@
 
 #include <QDebug>
 #include <QThread>
-#include <QUrlQuery>
 
 #include <cstring>
 #include <thread>
