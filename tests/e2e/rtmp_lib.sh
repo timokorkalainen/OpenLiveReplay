@@ -26,6 +26,22 @@ rtmp_url() {
     fi
 }
 
+rtmp_fixture_server_cmd() {
+    if [ -n "${RTMP_FIXTURE_OUT_CHUNK_SIZE:-}" ] && [ -n "${RTMP_FIXTURE_WRITE_FRAGMENT:-}" ]; then
+        python3 "$HERE/rtmp_fixture_server.py" "$@" \
+            --out-chunk-size "$RTMP_FIXTURE_OUT_CHUNK_SIZE" \
+            --write-fragment "$RTMP_FIXTURE_WRITE_FRAGMENT"
+    elif [ -n "${RTMP_FIXTURE_OUT_CHUNK_SIZE:-}" ]; then
+        python3 "$HERE/rtmp_fixture_server.py" "$@" \
+            --out-chunk-size "$RTMP_FIXTURE_OUT_CHUNK_SIZE"
+    elif [ -n "${RTMP_FIXTURE_WRITE_FRAGMENT:-}" ]; then
+        python3 "$HERE/rtmp_fixture_server.py" "$@" \
+            --write-fragment "$RTMP_FIXTURE_WRITE_FRAGMENT"
+    else
+        python3 "$HERE/rtmp_fixture_server.py" "$@"
+    fi
+}
+
 rtmp_generate_tone_flv() { # $1=path $2=freq_hz $3=seconds
     local out="$1" freq="$2" secs="$3"
     ffmpeg -hide_banner -loglevel error \
@@ -64,7 +80,7 @@ rtmp_server() { # $1=port $2=flv $3=log
     if [ -n "$expect_play_path" ]; then
         set -- "$@" --expect-play-path "$expect_play_path"
     fi
-    python3 "$HERE/rtmp_fixture_server.py" "$@" >"$log" 2>&1 &
+    rtmp_fixture_server_cmd "$@" >"$log" 2>&1 &
     RTMP_LAST_PID=$!
     PIDS+=("$RTMP_LAST_PID")
 

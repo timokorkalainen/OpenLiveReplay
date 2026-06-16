@@ -55,7 +55,7 @@ if ! is_num "${SOURCE_PACKETS:-}"; then
     exit 1
 fi
 
-python3 "$HERE/rtmp_fixture_server.py" --port "$RTMP_PORT" \
+rtmp_fixture_server_cmd --port "$RTMP_PORT" \
     --enhanced-hevc --hevc-annexb-source "$HEVC" \
     >"$SERVER_LOG" 2>&1 &
 PIDS+=("$!")

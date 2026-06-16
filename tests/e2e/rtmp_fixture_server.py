@@ -177,9 +177,23 @@ class RtmpReader:
 
 
 class RtmpWriter:
-    def __init__(self, conn: socket.socket) -> None:
+    def __init__(
+        self,
+        conn: socket.socket,
+        chunk_size: int = OUT_CHUNK_SIZE,
+        write_fragment: int = 0,
+    ) -> None:
         self.conn = conn
-        self.chunk_size = OUT_CHUNK_SIZE
+        self.chunk_size = chunk_size
+        self.write_fragment = write_fragment
+
+    def send_bytes(self, data: bytes) -> None:
+        if self.write_fragment <= 0:
+            self.conn.sendall(data)
+            return
+        for offset in range(0, len(data), self.write_fragment):
+            self.conn.sendall(data[offset : offset + self.write_fragment])
+            time.sleep(0.001)
 
     def send_message(self, csid: int, message_type: int, stream_id: int, timestamp: int, payload: bytes) -> None:
         header_ts = min(timestamp, 0xFFFFFF)
@@ -197,13 +211,13 @@ class RtmpWriter:
         while offset < len(payload) or (first and not payload):
             chunk = payload[offset : offset + self.chunk_size]
             if first:
-                self.conn.sendall(bytes(header) + chunk)
+                self.send_bytes(bytes(header) + chunk)
                 first = False
             else:
                 continuation = bytes(((3 << 6) | (csid & 0x3F),))
                 if timestamp >= 0xFFFFFF:
                     continuation += struct.pack(">I", timestamp)
-                self.conn.sendall(continuation + chunk)
+                self.send_bytes(continuation + chunk)
             offset += len(chunk)
 
     def set_chunk_size(self) -> None:
@@ -429,7 +443,7 @@ def run_server(args: argparse.Namespace) -> None:
             read_exact(conn, 1536)
 
             reader = RtmpReader(conn)
-            writer = RtmpWriter(conn)
+            writer = RtmpWriter(conn, args.out_chunk_size, args.write_fragment)
             writer.set_chunk_size()
             writer.window_ack()
             writer.peer_bandwidth()
@@ -546,7 +560,11 @@ def main() -> int:
     parser.add_argument("--expect-play-path")
     parser.add_argument("--tls-cert")
     parser.add_argument("--tls-key")
+    parser.add_argument("--out-chunk-size", type=int, default=OUT_CHUNK_SIZE)
+    parser.add_argument("--write-fragment", type=int, default=0)
     args = parser.parse_args()
+    if args.out_chunk_size <= 0:
+        parser.error("--out-chunk-size must be positive")
 
     try:
         run_server(args)

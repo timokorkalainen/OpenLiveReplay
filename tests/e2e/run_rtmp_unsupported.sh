@@ -120,7 +120,7 @@ rtmp_server "$PORT" "$FLV" "$SERVER_LOG" || exit 1
 run_harness_case "unsupported_video" "$PORT" 6 "$SERVER_LOG"
 
 IDLE_SERVER_LOG="$WORKDIR/idle_server.log"
-python3 "$HERE/rtmp_fixture_server.py" --port "$IDLE_PORT" --idle-after-play --hold-open 8 \
+rtmp_fixture_server_cmd --port "$IDLE_PORT" --idle-after-play --hold-open 8 \
     >"$IDLE_SERVER_LOG" 2>&1 &
 PIDS+=("$!")
 for _ in $(seq 1 50); do

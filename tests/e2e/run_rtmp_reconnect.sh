@@ -47,7 +47,7 @@ HARNESS_ERR="$WORKDIR/harness.err"
 echo "[rtmp-reconnect-e2e] port=$PORT seconds=$SECONDS_TO_RECORD"
 rtmp_generate_tone_flv "$FLV" 1000 "$SOURCE_SECONDS"
 
-python3 "$HERE/rtmp_fixture_server.py" \
+rtmp_fixture_server_cmd \
     --port "$PORT" \
     --flv "$FLV" \
     --max-clients 2 \
