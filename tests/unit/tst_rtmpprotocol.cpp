@@ -21,6 +21,8 @@ private slots:
     void amf0CommandRoundTripsNameAndTransaction();
     void amf0WritesStrictArrayForFourCcList();
     void rtmpUrlPartsPreserveSignedQueryInPlayPath();
+    void rtmpUrlPartsPreserveEncodedPathAndQuery();
+    void rtmpUrlPartsUseAppAsPlayPathWhenPathHasNoStream();
     void connectPayloadAdvertisesEnhancedCodecCapabilities();
     void amf0SkipsEcmaArrayMetadata();
     void amf0SkipsStrictArray();
@@ -99,6 +101,22 @@ void TestRtmpProtocol::rtmpUrlPartsPreserveSignedQueryInPlayPath() {
     QCOMPARE(parts.app, QStringLiteral("live"));
     QCOMPARE(parts.playPath, QStringLiteral("cam1?token=abc&expires=123"));
     QCOMPARE(parts.tcUrl, QStringLiteral("rtmps://host.example:443/live"));
+}
+
+void TestRtmpProtocol::rtmpUrlPartsPreserveEncodedPathAndQuery() {
+    const RtmpUrlParts parts =
+        RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmp://host/live/stream%2Fcam?token=a%2Fb&sig=x%3Dy")));
+    QCOMPARE(parts.app, QStringLiteral("live"));
+    QCOMPARE(parts.playPath, QStringLiteral("stream%2Fcam?token=a%2Fb&sig=x%3Dy"));
+    QCOMPARE(parts.tcUrl, QStringLiteral("rtmp://host/live"));
+}
+
+void TestRtmpProtocol::rtmpUrlPartsUseAppAsPlayPathWhenPathHasNoStream() {
+    const RtmpUrlParts parts =
+        RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmp://host/live?token=abc")));
+    QCOMPARE(parts.app, QStringLiteral("live"));
+    QCOMPARE(parts.playPath, QStringLiteral("live?token=abc"));
+    QCOMPARE(parts.tcUrl, QStringLiteral("rtmp://host/live"));
 }
 
 void TestRtmpProtocol::connectPayloadAdvertisesEnhancedCodecCapabilities() {

@@ -302,8 +302,14 @@ def run_server(args: argparse.Namespace) -> None:
             elif name == "play":
                 try:
                     playpath, _ = read_amf0_string(payload, len(amf0_string("play")) + 9 + 1)
-                except Exception:
+                except Exception as exc:
+                    if args.expect_play_path:
+                        raise ValueError("play command omitted expected play path") from exc
                     playpath = "stream"
+                if args.expect_play_path and playpath != args.expect_play_path:
+                    raise ValueError(
+                        f"play path mismatch: expected {args.expect_play_path!r}, got {playpath!r}"
+                    )
                 if args.require_play_query and "?" not in playpath:
                     raise ValueError("play path omitted required query string")
                 writer.user_control(0, STREAM_ID)
@@ -342,6 +348,7 @@ def main() -> int:
     parser.add_argument("--io-timeout", type=float, default=20.0)
     parser.add_argument("--hold-open", type=float, default=2.0)
     parser.add_argument("--require-play-query", action="store_true")
+    parser.add_argument("--expect-play-path")
     parser.add_argument("--tls-cert")
     parser.add_argument("--tls-key")
     args = parser.parse_args()

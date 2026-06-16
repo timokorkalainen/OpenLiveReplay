@@ -47,6 +47,10 @@ rtmp_generate_tone_flv "$FLV" 1000 "$SECONDS_TO_RECORD"
 rtmp_server "$RTMP_PORT" "$FLV" "$SERVER_LOG" || exit 1
 
 URL="$(rtmp_url "$RTMP_PORT")"
+DISPLAY_URL="$URL"
+case "$DISPLAY_URL" in
+    *\?*) DISPLAY_URL="${DISPLAY_URL%%\?*}?<redacted>" ;;
+esac
 OLR_NATIVE_RTMP=1 "$HARNESS" --url "$URL" --name olr_rtmp_smoke --outdir "$WORKDIR" \
     --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 \
     >"$HARNESS_OUT" 2>"$HARNESS_ERR"
@@ -100,5 +104,5 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "PASS: native ${RTMP_SCHEME:-rtmp} ingest — ${V_PACKETS} frames, stereo audio recorded from $URL"
+echo "PASS: native ${RTMP_SCHEME:-rtmp} ingest — ${V_PACKETS} frames, stereo audio recorded from $DISPLAY_URL"
 exit 0

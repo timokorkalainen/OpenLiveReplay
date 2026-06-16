@@ -46,18 +46,18 @@ rtmp_generate_flash_flv() { # $1=path $2=seconds
 
 rtmp_server() { # $1=port $2=flv $3=log
     local port="$1" flv="$2" log="$3" i
-    local require_play_query_arg=""
-    if [ "${RTMP_REQUIRE_PLAY_QUERY:-0}" = "1" ]; then
-        require_play_query_arg="--require-play-query"
+    local expect_play_path="${RTMP_EXPECT_PLAY_PATH:-}"
+    if [ -z "$expect_play_path" ] && [ "${RTMP_REQUIRE_PLAY_QUERY:-0}" = "1" ] && [ -n "${RTMP_URL_QUERY:-}" ]; then
+        expect_play_path="stream?${RTMP_URL_QUERY}"
     fi
+    set -- --port "$port" --flv "$flv"
     if [ -n "${RTMP_SERVER_TLS_CERT:-}" ] || [ -n "${RTMP_SERVER_TLS_KEY:-}" ]; then
-        python3 "$HERE/rtmp_fixture_server.py" --port "$port" --flv "$flv" \
-            --tls-cert "${RTMP_SERVER_TLS_CERT:-}" --tls-key "${RTMP_SERVER_TLS_KEY:-}" \
-            ${require_play_query_arg:+"$require_play_query_arg"} >"$log" 2>&1 &
-    else
-        python3 "$HERE/rtmp_fixture_server.py" --port "$port" --flv "$flv" \
-            ${require_play_query_arg:+"$require_play_query_arg"} >"$log" 2>&1 &
+        set -- "$@" --tls-cert "${RTMP_SERVER_TLS_CERT:-}" --tls-key "${RTMP_SERVER_TLS_KEY:-}"
     fi
+    if [ -n "$expect_play_path" ]; then
+        set -- "$@" --expect-play-path "$expect_play_path"
+    fi
+    python3 "$HERE/rtmp_fixture_server.py" "$@" >"$log" 2>&1 &
     RTMP_LAST_PID=$!
     PIDS+=("$RTMP_LAST_PID")
 

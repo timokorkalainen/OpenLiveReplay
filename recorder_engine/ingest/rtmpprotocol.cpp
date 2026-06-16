@@ -114,7 +114,8 @@ bool skipAmf0Value(const QByteArray& data, int* offset, int depth) {
 } // namespace
 
 RtmpUrlParts RtmpUrlParts::fromUrl(const QUrl& url) {
-    const QString path = url.path().startsWith('/') ? url.path().mid(1) : url.path();
+    const QString encodedPath = url.path(QUrl::FullyEncoded);
+    const QString path = encodedPath.startsWith('/') ? encodedPath.mid(1) : encodedPath;
     RtmpUrlParts parts;
     parts.app = path.section('/', 0, 0);
     const QString rest = path.section('/', 1);
@@ -123,7 +124,7 @@ RtmpUrlParts RtmpUrlParts::fromUrl(const QUrl& url) {
         parts.playPath += QStringLiteral("?") + url.query(QUrl::FullyEncoded);
     }
     QUrl tc = url;
-    tc.setPath(QStringLiteral("/") + parts.app);
+    tc.setPath(QStringLiteral("/") + parts.app, QUrl::StrictMode);
     tc.setQuery(QString());
     parts.tcUrl = tc.toString(QUrl::FullyEncoded);
     return parts;
