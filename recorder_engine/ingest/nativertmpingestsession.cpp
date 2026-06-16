@@ -25,6 +25,11 @@ constexpr int64_t kForwardJumpMs = 3000;
 constexpr int64_t kBackwardToleranceMs = -200;
 constexpr int64_t kSupportedVideoProbeMs = 5000;
 
+bool isVideoToolboxDecodeCapabilityFailure(const QString& error) {
+    return error.startsWith(QStringLiteral("VideoToolbox decompression session creation failed")) ||
+           error.startsWith(QStringLiteral("VideoToolbox is unavailable"));
+}
+
 } // namespace
 
 NativeRtmpIngestSession::NativeRtmpIngestSession(int sourceIndex, int outputWidth, int outputHeight,
@@ -67,6 +72,7 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_seenSupportedAudio = false;
     m_openedAtMs = -1;
     m_unsupportedReason.clear();
+    m_lastFailureKind = IngestFailureKind::None;
     m_chunkParser.reset();
     m_pendingMessages.clear();
 
@@ -95,19 +101,14 @@ void NativeRtmpIngestSession::run() {
                m_monotonic.elapsed() - m_openedAtMs > kSupportedVideoProbeMs;
     };
     const auto logUnsupportedVideoProbe = [this]() {
+        m_lastFailureKind = IngestFailureKind::UnsupportedProfile;
         log(QStringLiteral(
             "Native RTMP unsupported profile: no supported video within probe window."));
-    };
-    const auto stopAfterUnsupportedProfile = [this]() {
-        if (m_captureRunning) {
-            m_captureRunning->store(false, std::memory_order_relaxed);
-        }
     };
 
     while (!shouldStop()) {
         if (supportedVideoProbeExpired()) {
             logUnsupportedVideoProbe();
-            stopAfterUnsupportedProfile();
             break;
         }
 
@@ -116,10 +117,9 @@ void NativeRtmpIngestSession::run() {
         if (!readMessage(&message, &error)) {
             if (!shouldStop()) {
                 if (!m_unsupportedReason.isEmpty()) {
-                    stopAfterUnsupportedProfile();
+                    m_lastFailureKind = IngestFailureKind::UnsupportedProfile;
                 } else if (supportedVideoProbeExpired()) {
                     logUnsupportedVideoProbe();
-                    stopAfterUnsupportedProfile();
                 } else {
                     log(error.isEmpty() ? QStringLiteral("Native RTMP disconnected.") : error);
                 }
@@ -128,13 +128,12 @@ void NativeRtmpIngestSession::run() {
         }
         m_lastPacketAtMs = m_monotonic.elapsed();
         processMessage(message);
-        if (!m_unsupportedReason.isEmpty()) {
-            stopAfterUnsupportedProfile();
+        if (!m_unsupportedReason.isEmpty() ||
+            shouldFallbackToFfmpegAfterNativeFailure(m_lastFailureKind)) {
             break;
         }
         if (supportedVideoProbeExpired()) {
             logUnsupportedVideoProbe();
-            stopAfterUnsupportedProfile();
             break;
         }
     }
@@ -154,6 +153,7 @@ void NativeRtmpIngestSession::requestStop() {
 
 bool NativeRtmpIngestSession::connectAndPlay(QString* error) {
     if (!supportsUrl(m_url)) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
         if (error)
             *error =
                 QStringLiteral("Native RTMP supports rtmp:// and rtmps:// URLs with an app path.");
@@ -171,6 +171,7 @@ bool NativeRtmpIngestSession::connectAndPlay(QString* error) {
         }
         raw->connectToHostEncrypted(m_url.host(), quint16(m_url.port(443)));
         if (!raw->waitForEncrypted(kConnectTimeoutMs)) {
+            m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
                 *error =
                     QStringLiteral("Native RTMPS connect failed: %1").arg(raw->errorString());
@@ -183,6 +184,7 @@ bool NativeRtmpIngestSession::connectAndPlay(QString* error) {
     }
 
     if (!m_socket->waitForConnected(kConnectTimeoutMs)) {
+        m_lastFailureKind = IngestFailureKind::TransientNetwork;
         if (error)
             *error = QStringLiteral("Native RTMP connect failed: %1").arg(m_socket->errorString());
         return false;
@@ -212,6 +214,7 @@ bool NativeRtmpIngestSession::performHandshake(QString* error) {
         return false;
     }
     if (uchar(s0s1s2[0]) != kRtmpVersion) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
         if (error) *error = QStringLiteral("Native RTMP server used unsupported version.");
         return false;
     }
@@ -248,11 +251,13 @@ bool NativeRtmpIngestSession::sendCreateStreamCommand(QString* error) {
     if (!RtmpAmf0::readString(result.payload, &offset, &name) ||
         !RtmpAmf0::readNumber(result.payload, &offset, &transactionId) ||
         !RtmpAmf0::skipValue(result.payload, &offset)) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
         if (error) *error = QStringLiteral("Native RTMP createStream response was malformed.");
         return false;
     }
     double streamNumber = 0;
     if (!RtmpAmf0::readNumber(result.payload, &offset, &streamNumber)) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
         if (error) *error = QStringLiteral("Native RTMP createStream omitted stream id.");
         return false;
     }
@@ -318,6 +323,7 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
     while (!shouldStop()) {
         if (m_socket->bytesAvailable() <= 0 &&
             !m_socket->waitForReadyRead(kIoTimeoutMs)) {
+            m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
                 *error = QStringLiteral("Native RTMP read failed: %1").arg(m_socket->errorString());
             return false;
@@ -330,6 +336,7 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
 
         QList<RtmpMessage> parsed;
         if (!m_chunkParser.push(bytes, &parsed, error)) {
+            m_lastFailureKind = IngestFailureKind::MalformedStream;
             if (error && !error->startsWith(QStringLiteral("Native RTMP"))) {
                 *error = QStringLiteral("Native RTMP parse failed: %1").arg(*error);
             }
@@ -362,6 +369,7 @@ bool NativeRtmpIngestSession::readFully(char* data, qsizetype size, QString* err
             continue;
         }
         if (!m_socket->waitForReadyRead(kIoTimeoutMs)) {
+            m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
                 *error = QStringLiteral("Native RTMP read failed: %1").arg(m_socket->errorString());
             return false;
@@ -378,6 +386,7 @@ bool NativeRtmpIngestSession::writeFully(const QByteArray& bytes, QString* error
     while (written < bytes.size() && !shouldStop()) {
         const qint64 n = m_socket->write(bytes.constData() + written, bytes.size() - written);
         if (n < 0) {
+            m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
                 *error =
                     QStringLiteral("Native RTMP write failed: %1").arg(m_socket->errorString());
@@ -385,6 +394,7 @@ bool NativeRtmpIngestSession::writeFully(const QByteArray& bytes, QString* error
         }
         written += n;
         if (!m_socket->waitForBytesWritten(kIoTimeoutMs)) {
+            m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
                 *error =
                     QStringLiteral("Native RTMP write timed out: %1").arg(m_socket->errorString());
@@ -448,6 +458,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     const auto markUnsupported = [this](const QString& reason) {
         if (m_unsupportedReason.isEmpty()) {
             m_unsupportedReason = reason;
+            m_lastFailureKind = IngestFailureKind::UnsupportedProfile;
             log(QStringLiteral("Native RTMP unsupported profile: %1").arg(m_unsupportedReason));
         }
     };
@@ -458,6 +469,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         if (parseError.isEmpty()) {
             parseError = QStringLiteral("RTMP video packet is malformed.");
         }
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
         log(QStringLiteral("Native RTMP video parse failed: %1").arg(parseError));
         if (!payload.isEmpty() && (uchar(payload[0]) & 0x80) == 0) {
             const int codecId = uchar(payload[0]) & 0x0f;
@@ -502,6 +514,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         QString error;
         if (packet.codec == NativeVideoCodec::Hevc) {
             if (!RtmpFlv::parseHevcSequenceHeader(packet.codecPayload, &m_hevcConfig, &error)) {
+                m_lastFailureKind = IngestFailureKind::MalformedStream;
                 if (!error.startsWith(QStringLiteral("Native RTMP"))) {
                     error = QStringLiteral("Native %1").arg(error);
                 }
@@ -510,6 +523,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
             }
         } else {
             if (!parseAvcSequenceHeader(packet.codecPayload, &error)) {
+                m_lastFailureKind = IngestFailureKind::MalformedStream;
                 log(error);
                 return;
             }
@@ -588,6 +602,9 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         },
         &error);
     if (!decoded && !error.isEmpty()) {
+        if (isVideoToolboxDecodeCapabilityFailure(error)) {
+            m_lastFailureKind = IngestFailureKind::DecodeCapability;
+        }
         log(error);
     }
 }
@@ -610,6 +627,7 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
         if (m_unsupportedReason.isEmpty()) {
             m_unsupportedReason =
                 QStringLiteral("unsupported RTMP audio format id %1").arg(soundFormat);
+            m_lastFailureKind = IngestFailureKind::UnsupportedProfile;
             log(QStringLiteral("Native RTMP unsupported profile: %1").arg(m_unsupportedReason));
         }
         return;
@@ -619,6 +637,7 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
     if (aacPacketType == 0) {
         QString error;
         if (!parseAacSequenceHeader(aacPayload, &error)) {
+            m_lastFailureKind = IngestFailureKind::MalformedStream;
             log(error);
         } else {
             m_seenSupportedAudio = true;

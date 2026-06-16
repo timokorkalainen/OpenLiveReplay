@@ -14,6 +14,7 @@ private slots:
     void environmentKeepsRtmpOnFfmpegByDefaultUntilReady();
     void environmentOptInRoutesRtmpAndRtmpsToNative();
     void environmentCanForceRtmpBackToFfmpeg();
+    void nativeFailureFallbackPolicy();
     void canConstructFfmpegSession();
     void nativeFailureReasonStartsEmpty();
     void nativeDecodeCapabilityErrorsRequestFallback();
@@ -135,6 +136,14 @@ void TestIngestBackendSelector::environmentCanForceRtmpBackToFfmpeg() {
                                                false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
              IngestBackendKind::Ffmpeg);
+}
+
+void TestIngestBackendSelector::nativeFailureFallbackPolicy() {
+    QVERIFY(shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::UnsupportedProfile));
+    QVERIFY(shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::DecodeCapability));
+    QVERIFY(shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::MalformedStream));
+    QVERIFY(!shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::TransientNetwork));
+    QVERIFY(!shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::None));
 }
 
 void TestIngestBackendSelector::canConstructFfmpegSession() {

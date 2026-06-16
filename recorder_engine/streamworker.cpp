@@ -15,6 +15,24 @@
 
 #include <memory>
 
+namespace {
+QString ingestFailureKindForLog(IngestFailureKind failure) {
+    switch (failure) {
+    case IngestFailureKind::UnsupportedProfile:
+        return QStringLiteral("unsupported profile");
+    case IngestFailureKind::DecodeCapability:
+        return QStringLiteral("decode capability failure");
+    case IngestFailureKind::MalformedStream:
+        return QStringLiteral("malformed stream");
+    case IngestFailureKind::TransientNetwork:
+        return QStringLiteral("transient network failure");
+    case IngestFailureKind::None:
+        break;
+    }
+    return QStringLiteral("unknown failure");
+}
+} // namespace
+
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
                            int targetWidth, int targetHeight, int targetFps, QObject* parent)
     : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
@@ -220,6 +238,8 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 void StreamWorker::captureLoop() {
     bool suppressNativeForCurrentUrl = false;
     QString nativeSuppressedUrl;
+    QString forceFfmpegUrl;
+    bool forceFfmpegForCurrentUrl = false;
 
     while (m_captureRunning) {
         // If a restart was requested (e.g. changeSource), acknowledge it
@@ -248,6 +268,11 @@ void StreamWorker::captureLoop() {
             suppressNativeForCurrentUrl = false;
         }
 
+        if (forceFfmpegUrl != currentUrl) {
+            forceFfmpegUrl = currentUrl;
+            forceFfmpegForCurrentUrl = false;
+        }
+
         // If URL is empty, don't attempt to connect. Just idle until
         // a new URL is set via changeSource() which sets m_restartCapture.
         if (currentUrl.trimmed().isEmpty()) {
@@ -258,8 +283,14 @@ void StreamWorker::captureLoop() {
             continue;
         }
 
-        qDebug() << "Source" << m_sourceIndex
-                 << "Attempting connection to:" << RtmpUrlParts::redactedForLog(QUrl(currentUrl));
+        if (forceFfmpegForCurrentUrl) {
+            qDebug() << "Source" << m_sourceIndex
+                     << "Attempting FFmpeg fallback connection for current URL.";
+        } else {
+            qDebug() << "Source" << m_sourceIndex
+                     << "Attempting connection to:"
+                     << RtmpUrlParts::redactedForLog(QUrl(currentUrl));
+        }
         setConnected(false);
 
         IngestCallbacks callbacks;
@@ -332,9 +363,13 @@ void StreamWorker::captureLoop() {
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
         nativeRtmpAvailable = NativeRtmpIngestSession::supportsUrl(sourceUrl);
 #endif
-        const IngestBackendOptions backendOptions =
+        IngestBackendOptions backendOptions =
             ingestBackendOptionsFromEnvironment(sourceUrl, nativeSrtAvailable, nativeRtmpAvailable);
+        if (forceFfmpegForCurrentUrl) {
+            backendOptions.preferNativeRtmp = false;
+        }
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
+        const bool nativeRtmpAttempt = backendKind == IngestBackendKind::NativeRtmp;
 #if !defined(OLR_NATIVE_SRT_AVAILABLE) && !defined(OLR_NATIVE_RTMP_AVAILABLE)
         Q_UNUSED(backendKind);
 #endif
@@ -358,8 +393,30 @@ void StreamWorker::captureLoop() {
         }
 
         if (!session->open(sourceUrl, callbacks)) {
-            qDebug() << "Source" << m_sourceIndex << "Connect failed. Retrying in"
-                     << (m_connectBackoffMs / 1000.0) << "s...";
+            const IngestFailureKind failureKind = session->lastFailureKind();
+            if (nativeRtmpAttempt && shouldFallbackToFfmpegAfterNativeFailure(failureKind)) {
+                if (qEnvironmentVariableIsSet("OLR_NATIVE_RTMP_DISABLE_FALLBACK")) {
+                    qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
+                             << ingestFailureKindForLog(failureKind)
+                             << "and fallback is disabled; stopping capture for this URL.";
+                    m_captureRunning = false;
+                    break;
+                }
+                qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
+                         << ingestFailureKindForLog(failureKind)
+                         << "; retrying FFmpeg for this URL.";
+                forceFfmpegForCurrentUrl = true;
+                m_connectBackoffMs = 1000;
+                continue;
+            }
+            if (forceFfmpegForCurrentUrl && backendKind == IngestBackendKind::Ffmpeg) {
+                qDebug() << "Source" << m_sourceIndex
+                         << "FFmpeg fallback open failed. Retrying in"
+                         << (m_connectBackoffMs / 1000.0) << "s...";
+            } else {
+                qDebug() << "Source" << m_sourceIndex << "Connect failed. Retrying in"
+                         << (m_connectBackoffMs / 1000.0) << "s...";
+            }
             const int steps = qMax(1, m_connectBackoffMs / 100);
             for (int i = 0; i < steps && m_captureRunning && !m_restartCapture; ++i) {
                 QThread::msleep(100);
@@ -395,6 +452,22 @@ void StreamWorker::captureLoop() {
         }
 
         setConnected(false);
+        const IngestFailureKind failureKind = session->lastFailureKind();
+        if (nativeRtmpAttempt && shouldFallbackToFfmpegAfterNativeFailure(failureKind)) {
+            if (qEnvironmentVariableIsSet("OLR_NATIVE_RTMP_DISABLE_FALLBACK")) {
+                qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
+                         << ingestFailureKindForLog(failureKind)
+                         << "and fallback is disabled; stopping capture for this URL.";
+                m_captureRunning = false;
+                break;
+            }
+            qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
+                     << ingestFailureKindForLog(failureKind)
+                     << "; retrying FFmpeg for this URL.";
+            forceFfmpegForCurrentUrl = true;
+            m_connectBackoffMs = 1000;
+            continue;
+        }
     }
 
     m_captureRunning = false;

@@ -29,6 +29,7 @@ public:
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
     void requestStop() override;
+    IngestFailureKind lastFailureKind() const override { return m_lastFailureKind; }
 
 private:
     int m_sourceIndex = -1;
@@ -60,6 +61,7 @@ private:
     bool m_seenSupportedAudio = false;
     int64_t m_openedAtMs = -1;
     QString m_unsupportedReason;
+    IngestFailureKind m_lastFailureKind = IngestFailureKind::None;
     RtmpChunkParser m_chunkParser;
     QList<RtmpMessage> m_pendingMessages;
 

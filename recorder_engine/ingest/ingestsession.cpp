@@ -66,6 +66,12 @@ int jitterWindowMs(const QString& scheme, int srtFloorMs, int defaultMs) {
     return scheme.toLower() == QStringLiteral("srt") ? srtFloorMs : defaultMs;
 }
 
+bool shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind failure) {
+    return failure == IngestFailureKind::UnsupportedProfile ||
+           failure == IngestFailureKind::DecodeCapability ||
+           failure == IngestFailureKind::MalformedStream;
+}
+
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
                                                          bool nativeRtmpAvailable) {
     IngestBackendOptions options;
