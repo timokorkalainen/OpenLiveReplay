@@ -547,6 +547,8 @@ def run_server(args: argparse.Namespace) -> None:
     with listener:
         for client_index in range(1, args.max_clients + 1):
             conn, _ = listener.accept()
+            if client_index == args.max_clients:
+                listener.close()
             serve_client(conn, client_index)
 
 
