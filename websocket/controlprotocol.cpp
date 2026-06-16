@@ -4,13 +4,22 @@
 #include <QJsonParseError>
 #include <QJsonArray>
 #include <QJsonValue>
+#include <cmath>
 #include <QtGlobal>
 
 namespace {
 
 bool hasInteger(const QJsonObject &args, const QString &key) {
     const QJsonValue value = args.value(key);
-    return value.isDouble() && qFuzzyCompare(value.toDouble(), double(value.toInt()));
+    if (!value.isDouble()) return false;
+
+    const double number = value.toDouble();
+    if (!std::isfinite(number)) return false;
+    if (std::floor(number) != number) return false;
+
+    constexpr qint64 kSafeIntMin = -9007199254740991LL;
+    constexpr qint64 kSafeIntMax = 9007199254740991LL;
+    return number >= static_cast<double>(kSafeIntMin) && number <= static_cast<double>(kSafeIntMax);
 }
 
 bool hasNumber(const QJsonObject &args, const QString &key) {

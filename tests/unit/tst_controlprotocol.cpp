@@ -11,6 +11,8 @@ private slots:
     void rejectsMalformedJson();
     void rejectsMissingCommandName();
     void validatesSeekArgs();
+    void validatesSeekArgsAcceptsLargeInteger();
+    void rejectsSeekWithFractionalPosition();
     void rejectsSeekWithoutPosition();
     void validatesActionDispatchDefaultsPressed();
     void buildsSuccessAck();
@@ -61,6 +63,36 @@ void TestControlProtocol::validatesSeekArgs() {
 
     QVERIFY(validation.ok);
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("positionMs")).toInt(), 42);
+}
+
+void TestControlProtocol::validatesSeekArgsAcceptsLargeInteger() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("seek-large"),
+        QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 9007199254740991LL}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("positionMs")).toDouble(),
+             9007199254740991.0);
+}
+
+void TestControlProtocol::rejectsSeekWithFractionalPosition() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("seek-fraction"),
+        QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 42.5}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("positionMs")));
 }
 
 void TestControlProtocol::rejectsSeekWithoutPosition() {
