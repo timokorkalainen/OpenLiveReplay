@@ -179,4 +179,38 @@ if(APPLE)
         TIMEOUT 180
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # Phase 2c-c: long-run STABILITY SOAK (not a drift detector — loopback clocks
+    # match so the flash-PTS slope is ~1.0 by construction). A 30s native-SRT record
+    # must not crash/hang and must keep delivering content. Base 23670.
+    add_test(NAME e2e_native_srt_soak
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_soak.sh" "$<TARGET_FILE:sync_harness>" 23670)
+    set_tests_properties(e2e_native_srt_soak PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # Phase 2d: packet-REORDERING recovery. The lossy_udp_relay.py reorder mode
+    # delays downstream SRT DATA packets to reorder the link; assert SRT's TSBPD
+    # re-orders them (content in-order, pktRcvDropTotal==0) and the relay actually
+    # reordered (reordered>0). Base 23690.
+    add_test(NAME e2e_native_srt_jitter
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_jitter.sh" "$<TARGET_FILE:sync_harness>" 23690)
+    set_tests_properties(e2e_native_srt_jitter PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # Phase 2d: multi-source loss ISOLATION. Two independent native sources, each own
+    # relay; src1 drops 12%, src0 clean. Assert src1 recovers (pktRcvDropTotal=0) AND
+    # src0 fully intact (no drops/gap) — loss on one must not perturb the other. Base 23680.
+    add_test(NAME e2e_native_srt_loss_multi
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_loss_multi.sh" "$<TARGET_FILE:sync_harness>" 23680)
+    set_tests_properties(e2e_native_srt_loss_multi PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
 endif()

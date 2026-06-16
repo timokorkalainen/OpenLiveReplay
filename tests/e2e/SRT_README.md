@@ -147,7 +147,28 @@ finally-unrecovered loss), logged by the native ingest on stop — *not*
 expectedly non-zero under loss). Loss %, seed, and thresholds are env-overridable
 (`OLR_SRT_LOSS_*`); the fixed seed makes drops deterministic.
 
-## Next (Phase 2c-c)
+## Phase 2c-c / 2d: soak, loss isolation, reordering
 
-Long-run drift over SRT, plus (later) multi-source simultaneous loss and
-jitter/reordering injection — each its own spec under `docs/superpowers/specs/`.
+Three more native-ingest gates (`native-apple-ingest` label, `OLR_NATIVE_SRT=1`)
+complete the SRT robustness suite:
+
+- **`e2e_native_srt_soak`** — a 30 s native-SRT record must not crash/hang and must
+  keep delivering content (first flash < 3 s, ≥ `SECS−3` flashes, no gap > 1.5 s).
+  *Not* a drift detector: on one machine the source and recording share the same
+  wall clock, so the flash-PTS slope is ~1.0 by construction (real drift needs two
+  machines). The slope is reported as a diagnostic only.
+- **`e2e_native_srt_loss_multi`** — two independent native sources, src1's link
+  drops 12 % while src0's is clean. Asserts src1 recovers (`pktRcvDropTotal == 0`,
+  full content) AND src0 is **fully isolated** (0 relay drops, `pktRcvDropTotal == 0`,
+  full content, no gap). Extends the 2c-a per-socket isolation finding to the loss
+  dimension: each source owns its own libsrt socket, so one link's loss can't touch
+  another.
+- **`e2e_native_srt_jitter`** — `lossy_udp_relay.py`'s reorder mode delays each
+  downstream SRT DATA packet a random 0–120 ms (control passes immediately),
+  reordering the link; SRT's TSBPD (500 ms window) must re-order it. Asserts the
+  relay actually reordered (`reordered > 0`), the recording is complete + continuous,
+  and `pktRcvDropTotal == 0` (TSBPD recovered, nothing arrived too late to play).
+
+That completes Phase 2 (the SRT real-transport test ladder). Possible later work:
+cross-device clock-drift (two machines), encrypted SRT (passphrase), and surfacing
+the `srt_stats` loss telemetry on the connection-status UI (framesync roadmap JIT-5).
