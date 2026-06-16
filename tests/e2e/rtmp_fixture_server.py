@@ -574,6 +574,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.out_chunk_size <= 0:
         parser.error("--out-chunk-size must be positive")
+    if args.write_fragment < 0:
+        parser.error("--write-fragment must be non-negative")
     if args.write_fragment_delay < 0:
         parser.error("--write-fragment-delay must be non-negative")
 
