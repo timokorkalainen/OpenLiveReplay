@@ -460,21 +460,37 @@ fi
     endif()
 
 elseif(APPLE) # macOS Desktop
-    if(NOT DEFINED OLR_BREW_PREFIX)
-        execute_process(COMMAND brew --prefix
-            OUTPUT_VARIABLE OLR_BREW_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(OLR_FFMPEG_ROOT AND OLR_SRT_ROOT)
+        # Controlled, LGPL, SRT-enabled ffmpeg built from source
+        # (build-scripts/build_ffmpeg_macos_app_srt.sh). Preferred for releases.
+        target_include_directories(OpenLiveReplay PRIVATE
+            "${OLR_FFMPEG_ROOT}/include"
+            "${OLR_SRT_ROOT}/include")
+        target_link_directories(OpenLiveReplay PRIVATE
+            "${OLR_FFMPEG_ROOT}/lib"
+            "${OLR_SRT_ROOT}/lib")
+        set_target_properties(OpenLiveReplay PROPERTIES
+            INSTALL_RPATH "${OLR_FFMPEG_ROOT}/lib;${OLR_SRT_ROOT}/lib")
+    else()
+        # Fallback: Homebrew, for local dev convenience only. NOTE: brew ffmpeg is
+        # --enable-gpl and ships libx264/libx265 — not suitable for redistribution;
+        # set OLR_FFMPEG_ROOT/OLR_SRT_ROOT (from-source) for release builds.
+        if(NOT DEFINED OLR_BREW_PREFIX)
+            execute_process(COMMAND brew --prefix
+                OUTPUT_VARIABLE OLR_BREW_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        endif()
+        if(NOT OLR_BREW_PREFIX OR NOT EXISTS "${OLR_BREW_PREFIX}")
+            set(OLR_BREW_PREFIX /opt/homebrew)
+        endif()
+        target_include_directories(OpenLiveReplay PRIVATE
+            "${OLR_BREW_PREFIX}/include"
+            "${OLR_BREW_PREFIX}/opt/srt/include")
+        target_link_directories(OpenLiveReplay PRIVATE
+            "${OLR_BREW_PREFIX}/lib"
+            "${OLR_BREW_PREFIX}/opt/srt/lib")
+        set_target_properties(OpenLiveReplay PROPERTIES INSTALL_RPATH "${OLR_BREW_PREFIX}/lib")
     endif()
-    if(NOT OLR_BREW_PREFIX OR NOT EXISTS "${OLR_BREW_PREFIX}")
-        set(OLR_BREW_PREFIX /opt/homebrew)
-    endif()
-    target_include_directories(OpenLiveReplay PRIVATE
-        "${OLR_BREW_PREFIX}/include"
-        "${OLR_BREW_PREFIX}/opt/srt/include")
-    target_link_directories(OpenLiveReplay PRIVATE
-        "${OLR_BREW_PREFIX}/lib"
-        "${OLR_BREW_PREFIX}/opt/srt/lib")
     target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
-    set_target_properties(OpenLiveReplay PROPERTIES INSTALL_RPATH "${OLR_BREW_PREFIX}/lib")
     target_link_libraries(OpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
 endif()
 

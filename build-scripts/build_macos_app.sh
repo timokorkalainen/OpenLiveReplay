@@ -2,14 +2,18 @@
 # One-command macOS desktop build of OpenLiveReplay.
 #
 # Pipeline:
-#   1. cmake --preset macos-release   (configure; FFmpeg + SRT from Homebrew)
-#   2. cmake --build --preset macos-release
-#   3. macdeployqt   (bundle Qt frameworks + QML + dependent dylibs into the .app)
-#   4. zip the .app into dist/
+#   1. build_ffmpeg_macos_app_srt.sh   (LGPL FFmpeg + SRT from source; idempotent)
+#   2. cmake --preset macos-release   (configure)
+#   3. cmake --build --preset macos-release
+#   4. macdeployqt   (bundle Qt frameworks + QML + ffmpeg/srt dylibs into the .app)
+#   5. zip the .app into dist/
 #
-# Prerequisites (the CI workflow installs these; install locally with Homebrew):
-#   brew install ninja ffmpeg srt
-#   a Qt 6.x macOS kit (clang_64)
+# FFmpeg + SRT are built FROM SOURCE (not Homebrew) so the bundled ffmpeg is a
+# controlled, SRT-enabled, LGPL build — Homebrew's ffmpeg is GPL and ships
+# libx264/libx265.
+#
+# Prerequisites (CI installs these; locally: brew install ninja pkg-config):
+#   a C/C++ toolchain (Xcode CLT), cmake, ninja, pkg-config, and a Qt 6.x macOS kit.
 #
 # TOOLCHAIN OVERRIDES (env vars; auto-detected otherwise)
 #   OLR_QT_ROOT   Qt macOS kit (default: QT_ROOT_DIR, else newest ~/Qt/6.*/macos)
@@ -18,7 +22,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
-DIST_DIR="$ROOT_DIR/macos_build/dist"
+WORK_DIR="$ROOT_DIR/macos_build"
+DIST_DIR="$WORK_DIR/dist"
 
 newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
 
@@ -35,7 +40,12 @@ command -v ninja >/dev/null 2>&1 || { echo "ERROR: ninja not on PATH (brew insta
 
 echo "==> Qt    : $OLR_QT_ROOT"
 
-# ------------------------------------------------------------------ build
+# ------------------------------------------------------------------ 1. deps (from source)
+"$SCRIPT_DIR/build_ffmpeg_macos_app_srt.sh"
+export OLR_FFMPEG_ROOT="$DIST_DIR/ffmpeg"
+export OLR_SRT_ROOT="$DIST_DIR/srt"
+
+# ------------------------------------------------------------------ 2/3. build
 cd "$ROOT_DIR"   # cmake --preset reads CMakePresets.json from the cwd
 echo "==> Configuring (preset macos-release)"
 cmake --preset macos-release

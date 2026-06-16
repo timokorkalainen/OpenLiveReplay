@@ -9,6 +9,10 @@ on:
         description: "Qt version to build against"
         required: false
         default: "6.10.2"
+  # TEMPORARY (remove before merge): validate on the PR branch, since
+  # workflow_dispatch only fires from the default branch.
+  push:
+    branches: [feat/cross-platform-build]
 
 concurrency:
   group: build-apps-${{ github.ref }}
@@ -68,10 +72,12 @@ jobs:
           modules: qtmultimedia
           cache: true
 
-      - name: Install build deps
-        run: brew install ninja ffmpeg srt
+      - name: Install build tools
+        # ffmpeg + srt are built from source (LGPL, with libsrt) by the script
+        # below; only the build tools come from Homebrew.
+        run: brew install ninja pkg-config
 
-      - name: Build + package (.app)
+      - name: Build (from-source ffmpeg+srt) + package (.app)
         shell: bash
         run: ./build-scripts/build_macos_app.sh
 

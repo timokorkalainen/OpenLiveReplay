@@ -1,9 +1,10 @@
 # Building OpenLiveReplay on Windows
 
 The Windows app builds with the **Qt MinGW kit** plus FFmpeg and SRT compiled
-from source. Unlike macOS (Homebrew) and iOS (Xcode frameworks), Windows has no
-system package manager for these, so the build scripts fetch and build them from
-pinned, integrity-verified sources — analogous to `build_ffmpeg_ios_srt.sh`.
+from pinned, integrity-verified sources — analogous to `build_ffmpeg_ios_srt.sh`
+(iOS) and `build_ffmpeg_macos_app_srt.sh` (macOS). All three produce a
+controlled, **LGPL**, SRT-enabled ffmpeg rather than a distro package (e.g.
+Homebrew's ffmpeg is GPL and ships libx264/libx265).
 
 ## Prerequisites
 
