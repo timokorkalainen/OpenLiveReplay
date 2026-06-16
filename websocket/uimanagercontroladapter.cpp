@@ -292,7 +292,7 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
         m_uiManager->resetStreamDeckDefaults();
     } else if (name == QStringLiteral("action.dispatch")) {
         m_uiManager->dispatchExternalAction(args.value(QStringLiteral("actionId")).toInt(),
-                                           args.value(QStringLiteral("pressed"), true).toBool());
+                                            args.value(QStringLiteral("pressed")).toBool());
     } else if (name == QStringLiteral("action.jog")) {
         m_uiManager->jogExternal(args.value(QStringLiteral("delta")).toInt());
     } else {

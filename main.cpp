@@ -9,7 +9,7 @@
 #include "websocket/controlwebsocketserver.h"
 #include "websocket/uimanagercontroladapter.h"
 #include <QHostAddress>
-#include <QWarning>
+#include <QDebug>
 
 #include <QString>
 using namespace Qt::StringLiterals;
