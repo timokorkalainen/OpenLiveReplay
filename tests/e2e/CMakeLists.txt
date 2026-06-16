@@ -103,6 +103,14 @@ set_tests_properties(
     sync_intercam_matched sync_intercam_skew sync_drift_2997 sync_lipsync sync_intercam_trim
     PROPERTIES LABELS "sync-report" TIMEOUT 180 RUN_SERIAL TRUE)
 
+# AUD-4 A/V lip-sync GATE (ffmpeg/UDP ingest): the shared anchor must keep audio
+# within EBU R37 (-40..+60 ms). Pre-AUD-4 this measured ~+63 ms and FAILS. Base 23492.
+add_test(NAME e2e_av_lipsync
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 23492)
+set_tests_properties(e2e_av_lipsync PROPERTIES
+    LABELS "av-sync" TIMEOUT 120 RUN_SERIAL TRUE
+    ENVIRONMENT "OLR_AV_SYNC_GATE=1")
+
 # --- Local-only SRT e2e (NOT in CI) -----------------------------------------
 # Proves the real engine ingests srt://. Requires a build configured with
 # -DOLR_FFMPEG_SRT_PREFIX (an SRT-enabled ffmpeg); under the default brew ffmpeg

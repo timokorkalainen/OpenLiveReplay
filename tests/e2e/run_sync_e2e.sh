@@ -241,12 +241,33 @@ case "$SCENARIO" in
 
     flash_pts_series "$MKV" 0 > "$WORKDIR/v.txt"
     beep_pts_series  "$MKV" 0 > "$WORKDIR/a.txt"
-    # Pair the k-th flash with the k-th beep; signed mean/max (audio - video) ms.
-    STATS=$(paste "$WORKDIR/v.txt" "$WORKDIR/a.txt" | awk '
-        NF==2 { d=($2-$1)*1000; s+=d; ad=(d<0?-d:d); if(ad>mx)mx=ad; n++ }
-        END { if(n>0) printf "%d %.1f %.1f", n, s/n, mx; else printf "0 nan nan" }')
+    # Pair each flash with its NEAREST beep within 200ms (flash+beep are co-timed per
+    # source-second). Nearest-match (not index pairing) is robust to a spurious extra
+    # silencedetect edge, which would otherwise slip every pair by ~1s. Signed mean/max
+    # (audio - video) ms over matched pairs.
+    STATS=$(awk '
+        FNR==NR { f[FNR]=$1; nf=FNR; next }
+        { b[FNR]=$1; nb=FNR }
+        END {
+            for (i=1;i<=nf;i++) { best=1e9; bj=-1;
+                for (j=1;j<=nb;j++) { dd=b[j]-f[i]; ad=(dd<0?-dd:dd); if(ad<best){best=ad;bj=j} }
+                if (bj>0 && best<=0.2) { d=(b[bj]-f[i])*1000; s+=d; am=(d<0?-d:d); if(am>mx)mx=am; n++ } }
+            if(n>0) printf "%d %.1f %.1f", n, s/n, mx; else printf "0 nan nan"
+        }' "$WORKDIR/v.txt" "$WORKDIR/a.txt")
     read -r NP MEAN MAX <<<"$STATS"
     emit "[sync] scenario=lipsync pairs=${NP} av_offset_ms: mean=${MEAN} max=${MAX} (EBU_R37_band=+40/-60)"
+    if [ "${OLR_AV_SYNC_GATE:-0}" = "1" ]; then
+        # Gate: EBU R37 — audio may lead the picture by <=40ms and lag by <=60ms.
+        # offset = mean(audio_pts - video_pts); positive => audio lags.
+        if [ "${NP:-0}" -lt 3 ]; then
+            echo "FAIL: only ${NP:-0} flash/beep pairs — measurement unreliable"; exit 1
+        fi
+        if awk -v m="$MEAN" 'BEGIN{exit !(m >= -40 && m <= 60)}'; then
+            echo "PASS: A/V offset ${MEAN}ms within EBU R37 (-40..+60)"; exit 0
+        fi
+        echo "FAIL: A/V offset ${MEAN}ms outside EBU R37 (-40..+60) — shared anchor regressed"
+        exit 1
+    fi
     echo "PASS: report emitted (diagnostic, non-gating)"
     exit 0
     ;;
