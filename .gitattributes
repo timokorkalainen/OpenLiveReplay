@@ -1,0 +1,6 @@
+# Shell scripts must keep LF line endings so they run under bash on every
+# platform (CRLF breaks the shebang / `\r` leaks into commands). This matters
+# in particular for a Windows checkout, where core.autocrlf=true would otherwise
+# rewrite them to CRLF.
+*.sh text eol=lf
+.githooks/* text eol=lf

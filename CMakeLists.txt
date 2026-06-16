@@ -38,10 +38,17 @@ if(OLR_SANITIZER)
 endif()
 
 include(FetchContent)
-set(RTMIDI_API_COREMIDI ON CACHE BOOL "" FORCE)
+# Select the native MIDI backend per platform: CoreMIDI on Apple, WinMM on
+# Windows. (Forcing CoreMIDI everywhere leaves Windows with no MIDI API.)
+if(WIN32)
+    set(RTMIDI_API_COREMIDI OFF CACHE BOOL "" FORCE)
+    set(RTMIDI_API_WINMM ON CACHE BOOL "" FORCE)
+else()
+    set(RTMIDI_API_COREMIDI ON CACHE BOOL "" FORCE)
+    set(RTMIDI_API_WINMM OFF CACHE BOOL "" FORCE)
+endif()
 set(RTMIDI_API_ALSA OFF CACHE BOOL "" FORCE)
 set(RTMIDI_API_JACK OFF CACHE BOOL "" FORCE)
-set(RTMIDI_API_WINMM OFF CACHE BOOL "" FORCE)
 set(RTMIDI_API_DUMMY OFF CACHE BOOL "" FORCE)
 set(RTMIDI_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
@@ -128,13 +135,17 @@ configure_file(
 
 # Keep a stable QML import path for qmllint (symlink to the active build).
 # This avoids hard-coding kit-specific build directories in qmllint.ini.
+# Skipped on Windows: cmake -E create_symlink needs Developer Mode/admin there,
+# and qmllint is only run on the macOS CI leg, not the Windows app build.
 set(QMLLINT_IMPORT_LINK "${CMAKE_SOURCE_DIR}/build/qmllint-imports")
-add_custom_target(qmllint_imports ALL
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/build"
-    COMMAND ${CMAKE_COMMAND} -E remove -f "${QMLLINT_IMPORT_LINK}"
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_BINARY_DIR}/OpenLiveReplay" "${QMLLINT_IMPORT_LINK}"
-    COMMENT "Updating qmllint import path symlink"
-)
+if(NOT WIN32)
+    add_custom_target(qmllint_imports ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/build"
+        COMMAND ${CMAKE_COMMAND} -E remove -f "${QMLLINT_IMPORT_LINK}"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_BINARY_DIR}/OpenLiveReplay" "${QMLLINT_IMPORT_LINK}"
+        COMMENT "Updating qmllint import path symlink"
+    )
+endif()
 
 # Ensure qmllint can find the generated qmltypes file in the module output directory.
 add_custom_command(TARGET OpenLiveReplay POST_BUILD
