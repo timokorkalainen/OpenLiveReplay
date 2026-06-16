@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "recorder_engine/framerate.h"
 #include "recorder_engine/replaymanager.h"
 
 namespace {
@@ -38,7 +39,7 @@ int main(int argc, char** argv) {
     const int seconds = argValue(args, QStringLiteral("--seconds"), QStringLiteral("6")).toInt();
     const int width = argValue(args, QStringLiteral("--width"), QStringLiteral("640")).toInt();
     const int height = argValue(args, QStringLiteral("--height"), QStringLiteral("480")).toInt();
-    const int fps = argValue(args, QStringLiteral("--fps"), QStringLiteral("30")).toInt();
+    const FrameRate frameRate = parseFrameRate(argValue(args, QStringLiteral("--fps"), QStringLiteral("30")));
     // Where recordings land. The engine honors this (ReplayManager ->
     // Muxer::setOutputDirectory); the driver points it at a temp dir so the
     // test is hermetic. Empty -> engine default (~/Documents/videos).
@@ -83,7 +84,7 @@ int main(int argc, char** argv) {
     rm.setBaseFileName(name);
     rm.setVideoWidth(width);
     rm.setVideoHeight(height);
-    rm.setFps(fps);
+    rm.setFrameRate(frameRate);
 
     rm.startRecording();
     if (!rm.isRecording()) {

@@ -23,6 +23,7 @@
 #include <QtGlobal>
 #include <cstdio>
 
+#include "recorder_engine/framerate.h"
 #include "recorder_engine/replaymanager.h"
 #include "recorder_engine/ingest/ingestsession.h"
 
@@ -50,7 +51,7 @@ int main(int argc, char** argv) {
     const int seconds = argValue(args, QStringLiteral("--seconds"), QStringLiteral("8")).toInt();
     const int width = argValue(args, QStringLiteral("--width"), QStringLiteral("320")).toInt();
     const int height = argValue(args, QStringLiteral("--height"), QStringLiteral("240")).toInt();
-    const int fps = argValue(args, QStringLiteral("--fps"), QStringLiteral("30")).toInt();
+    const FrameRate frameRate = parseFrameRate(argValue(args, QStringLiteral("--fps"), QStringLiteral("30")));
     // Where recordings land; the driver points this at a temp dir so the test
     // is hermetic. Empty -> engine default (~/Documents/videos).
     const QString outdir = argValue(args, QStringLiteral("--outdir"), QString());
@@ -88,7 +89,7 @@ int main(int argc, char** argv) {
     rm.setBaseFileName(name);
     rm.setVideoWidth(width);
     rm.setVideoHeight(height);
-    rm.setFps(fps);
+    rm.setFrameRate(frameRate);
 
     // Per-source connection observability. connectionChanged fires on EVERY real
     // transition (StreamWorker::setConnected emits only on change), queued to this
