@@ -200,7 +200,7 @@ jobs:
         # PR CI runs only the fast "ci" CTest label. Full e2e coverage stays in
         # the local pre-push hook, while local-only transport/report labels are
         # still excluded defensively.
-        run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest'
+        run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
 
       # clang-tidy is advisory: it reports on changed first-party files using the
       # generated compile_commands.json but never fails the build (yet).
@@ -386,7 +386,7 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1
         # Keep sanitizer coverage to high-signal unit cases. Slow e2e record/play
         # drivers are local pre-push coverage, not CI coverage.
-        run: ctest --output-on-failure --repeat until-pass:2 -R '${{ matrix.ctest_regex }}' -LE 'sync-report|srt|native-apple-ingest'
+        run: ctest --output-on-failure --repeat until-pass:2 -R '${{ matrix.ctest_regex }}' -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
 
 # iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
 # (~20 min) OOM-kills hosted runners. It is validated locally instead via the
