@@ -1359,14 +1359,27 @@ ApplicationWindow {
                             radius: width / 2
                             property bool connected: appWindow.uiManagerRef.sourceConnectionVersion >= 0
                                                      && appWindow.uiManagerRef.isSourceConnected(streamRow.index)
+                            // 0=N/A,1=green,2=amber,3=red (native SRT only; else 0)
+                            property int linkHealth: appWindow.uiManagerRef.sourceStatsVersion >= 0
+                                                     ? appWindow.uiManagerRef.sourceLinkHealth(streamRow.index)
+                                                     : 0
                             color: !appWindow.uiManagerRef.isRecording
                                    ? "#555"
-                                   : (connDot.connected ? "#2e7d32" : "#d32f2f")
+                                   : (!connDot.connected
+                                      ? "#d32f2f"
+                                      : (connDot.linkHealth === 3 ? "#d32f2f"
+                                         : connDot.linkHealth === 2 ? "#f9a825"
+                                         : "#2e7d32"))
                             HoverHandler { id: connHover }
                             ToolTip.visible: connHover.hovered
                             ToolTip.text: !appWindow.uiManagerRef.isRecording
                                           ? "Not recording"
-                                          : (connDot.connected ? "Connected" : "No signal")
+                                          : (!connDot.connected
+                                             ? "No signal"
+                                             : (appWindow.uiManagerRef.sourceStatsVersion >= 0
+                                                && appWindow.uiManagerRef.sourceHasSrtStats(streamRow.index)
+                                                ? appWindow.uiManagerRef.sourceStatsTooltip(streamRow.index)
+                                                : "Connected"))
                         }
 
                         SpinBox {
