@@ -63,7 +63,7 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_seenSupportedVideo = false;
     m_seenSupportedAudio = false;
-    m_openedAtMs = m_lastPacketAtMs;
+    m_openedAtMs = -1;
     m_unsupportedReason.clear();
     m_chunkParser.reset();
     m_pendingMessages.clear();
@@ -86,6 +86,7 @@ void NativeRtmpIngestSession::run() {
     if (!m_socket) {
         return;
     }
+    m_openedAtMs = m_monotonic.elapsed();
 
     const auto supportedVideoProbeExpired = [this]() {
         return !m_seenSupportedVideo && m_openedAtMs >= 0 &&
