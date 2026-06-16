@@ -566,6 +566,9 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     QByteArray annexB =
         RtmpFlv::lengthPrefixedPayloadToAnnexB(packet.codecPayload, nalLengthSize);
     if (annexB.isEmpty()) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
+        log(QStringLiteral(
+            "Native RTMP video parse failed: malformed length-prefixed video payload."));
         return;
     }
 
@@ -619,7 +622,12 @@ void NativeRtmpIngestSession::resetVideoState() {
 }
 
 void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByteArray& payload) {
-    if (!m_callbacks.onAudioChunk || payload.size() < 2) {
+    if (!m_callbacks.onAudioChunk) {
+        return;
+    }
+    if (payload.size() < 2) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
+        log(QStringLiteral("Native RTMP audio parse failed: malformed audio payload."));
         return;
     }
     const int soundFormat = (uchar(payload[0]) >> 4) & 0x0f;
