@@ -130,6 +130,17 @@ RtmpUrlParts RtmpUrlParts::fromUrl(const QUrl& url) {
     return parts;
 }
 
+QString RtmpUrlParts::redactedForLog(const QUrl& url) {
+    QUrl display = url;
+    display.setQuery(QString());
+    display.setFragment(QString());
+    QString out = display.toString(QUrl::FullyEncoded);
+    if (url.hasQuery()) {
+        out += QStringLiteral("?<redacted>");
+    }
+    return out;
+}
+
 QByteArray RtmpAmf0::number(double value) {
     quint64 bits = 0;
     static_assert(sizeof(bits) == sizeof(value), "double size");

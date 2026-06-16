@@ -54,6 +54,7 @@ private slots:
     void rtmpUrlPartsPreserveEmptyQueryMarker();
     void rtmpUrlPartsUseAppAsPlayPathWhenPathHasNoStream();
     void rtmpUrlPartsRejectHostOnlyUrls();
+    void rtmpUrlRedactionForLogHidesQueryValues();
     void connectPayloadAdvertisesEnhancedCodecCapabilities();
     void connectPayloadDefaultProfileAdvertisesOnlyAvcAac();
     void amf0SkipsEcmaArrayMetadata();
@@ -162,6 +163,17 @@ void TestRtmpProtocol::rtmpUrlPartsUseAppAsPlayPathWhenPathHasNoStream() {
 void TestRtmpProtocol::rtmpUrlPartsRejectHostOnlyUrls() {
     const RtmpUrlParts parts = RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmp://host")));
     QVERIFY(!parts.isValid());
+}
+
+void TestRtmpProtocol::rtmpUrlRedactionForLogHidesQueryValues() {
+    const QString redacted = RtmpUrlParts::redactedForLog(
+        QUrl(QStringLiteral("rtmp://host.example:1935/live/stream%2Fcam?token=abc&sig=x%3Dy")));
+    QCOMPARE(redacted, QStringLiteral("rtmp://host.example:1935/live/stream%2Fcam?<redacted>"));
+    QVERIFY(!redacted.contains(QStringLiteral("abc")));
+    QVERIFY(!redacted.contains(QStringLiteral("x%3Dy")));
+
+    QCOMPARE(RtmpUrlParts::redactedForLog(QUrl(QStringLiteral("rtmp://host/live/stream"))),
+             QStringLiteral("rtmp://host/live/stream"));
 }
 
 void TestRtmpProtocol::connectPayloadAdvertisesEnhancedCodecCapabilities() {

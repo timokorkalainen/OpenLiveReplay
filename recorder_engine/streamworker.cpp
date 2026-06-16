@@ -1,6 +1,7 @@
 #include "streamworker.h"
 #include "ingest/ffmpegingestsession.h"
 #include "ingest/ingestsession.h"
+#include "ingest/rtmpprotocol.h"
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
 #include "ingest/nativesrtingestsession.h"
 #endif
@@ -257,7 +258,8 @@ void StreamWorker::captureLoop() {
             continue;
         }
 
-        qDebug() << "Source" << m_sourceIndex << "Attempting connection to:" << currentUrl;
+        qDebug() << "Source" << m_sourceIndex
+                 << "Attempting connection to:" << RtmpUrlParts::redactedForLog(QUrl(currentUrl));
         setConnected(false);
 
         IngestCallbacks callbacks;

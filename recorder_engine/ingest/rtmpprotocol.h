@@ -24,6 +24,7 @@ struct RtmpUrlParts {
 
     bool isValid() const { return !app.isEmpty(); }
     static RtmpUrlParts fromUrl(const QUrl& url);
+    static QString redactedForLog(const QUrl& url);
 };
 
 enum class RtmpConnectCodecProfile {
