@@ -82,6 +82,8 @@ private slots:
     void chunkParserFmtThreeAfterAbortDoesNotPoisonState();
     void chunkParserAbortForInactiveCsidDoesNotCreateTombstone();
     void chunkParserClearsAbortTombstoneAfterDiscardingRemainingBytes();
+    void parsesEnhancedHevcSequenceStartHeader();
+    void parsesEnhancedCodedFramesCompositionTime();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -792,6 +794,40 @@ void TestRtmpProtocol::chunkParserClearsAbortTombstoneAfterDiscardingRemainingBy
     QVERIFY(parser.push(fmtThreeSecond, &messages, &error));
     QCOMPARE(messages.size(), 1);
     QCOMPARE(messages.first().payload, QByteArray("zzqq", 4));
+}
+
+void TestRtmpProtocol::parsesEnhancedHevcSequenceStartHeader() {
+    QByteArray payload;
+    payload.append(char(0x80 | 0)); // enhanced + SequenceStart
+    payload.append("hvc1", 4);
+    payload.append("CONFIG", 6);
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::Enhanced);
+    QCOMPARE(packet.codec, NativeVideoCodec::Hevc);
+    QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::SequenceStart);
+    QCOMPARE(packet.fourCc, QStringLiteral("hvc1"));
+    QCOMPARE(packet.codecPayload, QByteArray("CONFIG", 6));
+}
+
+void TestRtmpProtocol::parsesEnhancedCodedFramesCompositionTime() {
+    QByteArray payload;
+    payload.append(char(0x80 | 1)); // enhanced + CodedFrames
+    payload.append("avc1", 4);
+    payload.append(QByteArray::fromHex("00002a")); // composition time 42
+    payload.append("FRAME", 5);
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::Enhanced);
+    QCOMPARE(packet.codec, NativeVideoCodec::H264);
+    QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::CodedFrames);
+    QCOMPARE(packet.fourCc, QStringLiteral("avc1"));
+    QCOMPARE(packet.compositionTimeMs, 42);
+    QCOMPARE(packet.codecPayload, QByteArray("FRAME", 5));
 }
 
 void TestRtmpProtocol::parsesAvcSequenceHeaderAndConvertsNalusToAnnexB() {

@@ -601,6 +601,113 @@ qint32 RtmpFlv::readS24(const char* data) {
     return value;
 }
 
+bool RtmpFlv::parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packet,
+                               QString* error) {
+    if (!packet || payload.isEmpty()) {
+        if (error) *error = QStringLiteral("RTMP video packet is malformed.");
+        return false;
+    }
+
+    RtmpVideoPacket parsed;
+    const int header = uchar(payload[0]);
+    const bool enhanced = (header & 0x80) != 0;
+    if (!enhanced) {
+        if (payload.size() < 5) {
+            if (error) *error = QStringLiteral("RTMP AVC video packet is malformed.");
+            return false;
+        }
+        const int codecId = header & 0x0f;
+        if (codecId != 7) {
+            if (error) {
+                *error = QStringLiteral("unsupported RTMP video codec id %1").arg(codecId);
+            }
+            return false;
+        }
+
+        const int avcPacketType = uchar(payload[1]);
+        if (avcPacketType == 0) {
+            parsed.enhancedType = RtmpEnhancedVideoPacketType::SequenceStart;
+        } else if (avcPacketType == 1) {
+            parsed.enhancedType = RtmpEnhancedVideoPacketType::CodedFrames;
+        } else if (avcPacketType == 2) {
+            parsed.enhancedType = RtmpEnhancedVideoPacketType::SequenceEnd;
+        } else {
+            if (error) {
+                *error = QStringLiteral("unsupported RTMP AVC packet type %1").arg(avcPacketType);
+            }
+            return false;
+        }
+
+        parsed.codec = NativeVideoCodec::H264;
+        parsed.compositionTimeMs = readS24(payload.constData() + 2);
+        parsed.codecPayload = payload.mid(5);
+        *packet = std::move(parsed);
+        return true;
+    }
+
+    if (payload.size() < 5) {
+        if (error) *error = QStringLiteral("RTMP enhanced video packet is malformed.");
+        return false;
+    }
+
+    parsed.flavor = RtmpVideoPacketFlavor::Enhanced;
+    const int packetType = header & 0x0f;
+    switch (packetType) {
+    case 0:
+        parsed.enhancedType = RtmpEnhancedVideoPacketType::SequenceStart;
+        break;
+    case 1:
+        parsed.enhancedType = RtmpEnhancedVideoPacketType::CodedFrames;
+        break;
+    case 2:
+        parsed.enhancedType = RtmpEnhancedVideoPacketType::SequenceEnd;
+        break;
+    case 3:
+        parsed.enhancedType = RtmpEnhancedVideoPacketType::CodedFramesX;
+        break;
+    case 4:
+        parsed.enhancedType = RtmpEnhancedVideoPacketType::Metadata;
+        break;
+    case 6:
+        parsed.enhancedType = RtmpEnhancedVideoPacketType::Multitrack;
+        break;
+    default:
+        parsed.enhancedType = RtmpEnhancedVideoPacketType::Unknown;
+        break;
+    }
+
+    parsed.fourCc = QString::fromLatin1(payload.constData() + 1, 4);
+    if (parsed.fourCc == QStringLiteral("hvc1")) {
+        parsed.codec = NativeVideoCodec::Hevc;
+    } else if (parsed.fourCc == QStringLiteral("avc1")) {
+        parsed.codec = NativeVideoCodec::H264;
+    }
+
+    int offset = 5;
+    if (parsed.enhancedType == RtmpEnhancedVideoPacketType::CodedFrames) {
+        if (payload.size() < offset + 3) {
+            if (error) *error = QStringLiteral("RTMP enhanced coded video packet is malformed.");
+            return false;
+        }
+        parsed.compositionTimeMs = readS24(payload.constData() + offset);
+        offset += 3;
+    } else if (parsed.enhancedType == RtmpEnhancedVideoPacketType::SequenceStart ||
+               parsed.enhancedType == RtmpEnhancedVideoPacketType::SequenceEnd ||
+               parsed.enhancedType == RtmpEnhancedVideoPacketType::CodedFramesX) {
+        parsed.compositionTimeMs = 0;
+    } else {
+        if (error) {
+            *error =
+                QStringLiteral("unsupported RTMP enhanced video packet type %1").arg(packetType);
+        }
+        return false;
+    }
+
+    parsed.codecPayload = payload.mid(offset);
+    *packet = std::move(parsed);
+    return true;
+}
+
 bool RtmpFlv::parseAvcSequenceHeader(const QByteArray& payload, RtmpAvcConfig* config,
                                      QString* error) {
     if (!config || payload.size() < 7 || uchar(payload[0]) != 1) {

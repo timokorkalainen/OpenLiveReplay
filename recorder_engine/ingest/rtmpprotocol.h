@@ -110,8 +110,34 @@ struct RtmpAacConfig {
     int channelCount = 0;
 };
 
+enum class RtmpVideoPacketFlavor {
+    LegacyAvc,
+    Enhanced,
+};
+
+enum class RtmpEnhancedVideoPacketType {
+    SequenceStart = 0,
+    CodedFrames = 1,
+    SequenceEnd = 2,
+    CodedFramesX = 3,
+    Metadata = 4,
+    Multitrack = 6,
+    Unknown = 255,
+};
+
+struct RtmpVideoPacket {
+    RtmpVideoPacketFlavor flavor = RtmpVideoPacketFlavor::LegacyAvc;
+    NativeVideoCodec codec = NativeVideoCodec::Unknown;
+    RtmpEnhancedVideoPacketType enhancedType = RtmpEnhancedVideoPacketType::Unknown;
+    QString fourCc;
+    qint32 compositionTimeMs = 0;
+    int trackId = 0;
+    QByteArray codecPayload;
+};
+
 namespace RtmpFlv {
 qint32 readS24(const char* data);
+bool parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packet, QString* error);
 bool parseAvcSequenceHeader(const QByteArray& payload, RtmpAvcConfig* config, QString* error);
 QByteArray avcPayloadToAnnexB(const QByteArray& payload, int nalLengthSize);
 bool parseAacSequenceHeader(const QByteArray& payload, RtmpAacConfig* config, QString* error);
