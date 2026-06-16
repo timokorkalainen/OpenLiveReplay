@@ -58,6 +58,9 @@ rtmp_server() { # $1=port $2=flv $3=log
     if [ -n "${RTMP_SERVER_TLS_CERT:-}" ] || [ -n "${RTMP_SERVER_TLS_KEY:-}" ]; then
         set -- "$@" --tls-cert "${RTMP_SERVER_TLS_CERT:-}" --tls-key "${RTMP_SERVER_TLS_KEY:-}"
     fi
+    if [ "${RTMP_REQUIRE_PLAY_QUERY:-0}" = "1" ]; then
+        set -- "$@" --require-play-query
+    fi
     if [ -n "$expect_play_path" ]; then
         set -- "$@" --expect-play-path "$expect_play_path"
     fi
