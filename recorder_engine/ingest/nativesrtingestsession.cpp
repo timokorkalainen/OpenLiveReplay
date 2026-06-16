@@ -19,8 +19,6 @@ extern "C" {
 
 namespace {
 constexpr int kSrtReceiveBufferSize = 1316;
-constexpr int kSrtLatencyMs = 500;
-constexpr int kSrtConnectTimeoutMs = 5000;
 constexpr int kPollSleepMs = 10;
 constexpr int kConnectPollSleepMs = 50;
 constexpr int kStallTimeoutMs = 8000;

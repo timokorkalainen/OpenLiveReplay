@@ -379,18 +379,11 @@ bool FfmpegIngestSession::setupDecoder(const QUrl& url) {
     av_dict_set(&opts, "analyzeduration", "500000", 0);
 
     if (scheme == "srt") {
-        av_dict_set(&opts, "connect_timeout", "5000000", 0);
-        av_dict_set(&opts, "latency", "500", 0);
-        av_dict_set(&opts, "rcvlatency", "500", 0);
-        av_dict_set(&opts, "peerlatency", "500", 0);
-        av_dict_set(&opts, "transtype", "live", 0);
-        // SRT-private options set on the avformat_open_input() dict do not all
-        // propagate to the nested SRT URLContext. Put linger in the URL query
-        // so close drops immediately instead of blocking on SRT's 180 s default.
-        QUrlQuery srtQuery(currentUrl);
-        if (!srtQuery.hasQueryItem(QStringLiteral("linger")))
-            srtQuery.addQueryItem(QStringLiteral("linger"), QStringLiteral("0"));
-        currentUrl.setQuery(srtQuery);
+        // SRT-private options (latency/rcvlatency/peerlatency, transtype,
+        // connect_timeout, linger) only take effect via the URL query. Setting them
+        // on the avformat_open_input() opts dict silently drops them, so SRT ran at
+        // its defaults (and the old latency=500 would have meant 500us -> 0ms).
+        currentUrl = augmentSrtUrl(currentUrl);
     }
 
     if (scheme == "rtmp" || scheme == "rtmps") {
