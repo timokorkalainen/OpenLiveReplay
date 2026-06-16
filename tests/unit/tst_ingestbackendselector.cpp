@@ -28,7 +28,10 @@ private slots:
     void nativeFallbackPolicyIgnoresTransientNetworkFailures();
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
     void malformedLegacyVideoPacketStaysMalformed();
+    void nativeRtmpConnectAdvertisesEnhancedCodecCapabilities();
+    void nativeRtmpAcknowledgesServerReceiveWindows();
     void nativeRtmpAudioUsesVideoTimelineAnchor();
+    void nativeRtmpVideoUsesAudioTimelineAnchorWhenAudioArrivesFirst();
     void nativeRtmpAudioDiscontinuityUsesFreshAudioAnchor();
 #endif
     void canConstructFfmpegSession();
@@ -233,6 +236,32 @@ void TestIngestBackendSelector::malformedLegacyVideoPacketStaysMalformed() {
     }));
 }
 
+void TestIngestBackendSelector::nativeRtmpConnectAdvertisesEnhancedCodecCapabilities() {
+    QCOMPARE(NativeRtmpIngestSession::connectCodecProfile(),
+             RtmpConnectCodecProfile::EnhancedAvcHevcAac);
+}
+
+void TestIngestBackendSelector::nativeRtmpAcknowledgesServerReceiveWindows() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    session.configureAcknowledgementWindow(10);
+    quint32 sequence = 0;
+    QVERIFY(!session.noteIncomingChunkBytes(9, &sequence));
+    QCOMPARE(sequence, quint32(0));
+    QVERIFY(session.noteIncomingChunkBytes(1, &sequence));
+    QCOMPARE(sequence, quint32(10));
+    QVERIFY(!session.noteIncomingChunkBytes(9, &sequence));
+    QCOMPARE(sequence, quint32(0));
+    QVERIFY(session.noteIncomingChunkBytes(1, &sequence));
+    QCOMPARE(sequence, quint32(20));
+
+    NativeRtmpIngestSession alreadyReadSession(0, 640, 480, nullptr);
+    QVERIFY(!alreadyReadSession.noteIncomingChunkBytes(12, &sequence));
+    alreadyReadSession.configureAcknowledgementWindow(10);
+    QVERIFY(alreadyReadSession.noteIncomingChunkBytes(0, &sequence));
+    QCOMPARE(sequence, quint32(12));
+}
+
 void TestIngestBackendSelector::nativeRtmpAudioUsesVideoTimelineAnchor() {
     NativeRtmpIngestSession session(0, 640, 480, nullptr);
 
@@ -245,6 +274,21 @@ void TestIngestBackendSelector::nativeRtmpAudioUsesVideoTimelineAnchor() {
 
     clockMs = 5000;
     QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
+}
+
+void TestIngestBackendSelector::nativeRtmpVideoUsesAudioTimelineAnchorWhenAudioArrivesFirst() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    int64_t clockMs = 100;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
+
+    clockMs = 5000;
+    QCOMPARE(session.sourcePtsMsForVideo(0, 0), int64_t(100));
+    QCOMPARE(session.sourcePtsMsForAudio(40), int64_t(140));
 }
 
 void TestIngestBackendSelector::nativeRtmpAudioDiscontinuityUsesFreshAudioAnchor() {

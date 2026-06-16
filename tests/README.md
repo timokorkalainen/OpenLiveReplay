@@ -42,6 +42,30 @@ unless `OLR_RTMP_INTEROP_PLAY_URL` is set; set `OLR_RTMP_INTEROP_PUBLISH_URL`
 when the publish URL differs, and optionally `OLR_RTMP_INTEROP_SERVER_CMD` to
 start a local server for the duration of the test.
 
+Real-server native RTMP interop:
+
+```bash
+OLR_RTMP_INTEROP_PLAY_URL=rtmp://127.0.0.1/live/stream \
+OLR_RTMP_INTEROP_PUBLISH_URL=rtmp://127.0.0.1/live/stream \
+ctest --test-dir build/native-rtmp -R e2e_native_rtmp_interop --output-on-failure
+```
+
+For HEVC/E-RTMP:
+
+```bash
+OLR_RTMP_INTEROP_CODEC=hevc \
+OLR_RTMP_INTEROP_PLAY_URL=rtmp://127.0.0.1/live/hevc \
+OLR_RTMP_INTEROP_PUBLISH_URL=rtmp://127.0.0.1/live/hevc \
+ctest --test-dir build/native-rtmp -R e2e_native_rtmp_interop --output-on-failure
+```
+
+The long-run soak gate is separate and opt-in:
+
+```bash
+OLR_RTMP_RUN_SOAK=1 OLR_RTMP_SOAK_SECONDS=1800 OLR_RTMP_SOAK_CODEC=avc \
+ctest --test-dir build/native-rtmp -R e2e_native_rtmp_soak --output-on-failure
+```
+
 ## What's covered
 
 | Layer | Where | What it checks |

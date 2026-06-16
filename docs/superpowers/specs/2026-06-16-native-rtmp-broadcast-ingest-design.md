@@ -297,4 +297,3 @@ E-RTMP support can easily sprawl into full multitrack and every modern codec. Th
 HEVC availability is platform-dependent. On Apple platforms, `VideoToolboxDecoder` is the intended native decode boundary. Any VideoToolbox HEVC failure must trigger clear fallback or a clear operator-facing failure.
 
 Defaulting native RTMP too early could regress existing RTMP users. The default flip is intentionally late and gated by real-server and soak evidence.
-

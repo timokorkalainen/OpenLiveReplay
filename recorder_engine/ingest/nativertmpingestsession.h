@@ -60,6 +60,9 @@ private:
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_audioAnchorStreamTimeMs = -1;
     int64_t m_lastPacketAtMs = -1;
+    quint64 m_receivedChunkBytes = 0;
+    quint64 m_nextAcknowledgementAt = 0;
+    quint32 m_acknowledgementWindowSize = 0;
     bool m_seenSupportedVideo = false;
     bool m_seenSupportedAudio = false;
     bool m_reconnectRequested = false;
@@ -72,6 +75,7 @@ private:
     bool connectAndPlay(QString* error);
     bool performHandshake(QString* error);
     bool sendConnectCommand(QString* error);
+    static RtmpConnectCodecProfile connectCodecProfile();
     bool waitForCommandResult(double transactionId, RtmpMessage* result, QString* error);
     bool sendCreateStreamCommand(QString* error);
     bool sendPlayCommand(QString* error);
@@ -80,6 +84,9 @@ private:
                      const QByteArray& payload, QString* error);
     bool readFully(char* data, qsizetype size, QString* error);
     bool writeFully(const QByteArray& bytes, QString* error);
+    void configureAcknowledgementWindow(quint32 windowSize);
+    bool noteIncomingChunkBytes(qint64 byteCount, quint32* acknowledgementSequence);
+    bool acknowledgeIncomingBytes(qint64 byteCount, QString* error);
     bool shouldStop() const;
     void log(const QString& message) const;
     void processMessage(const RtmpMessage& message);

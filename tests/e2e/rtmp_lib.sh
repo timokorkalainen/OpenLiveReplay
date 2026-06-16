@@ -14,7 +14,14 @@ rtmp_require_tools() {
 }
 
 rtmp_redact_log() {
-    sed -E "s#([?&][^=[:space:]'\"]+=)[^&[:space:]'\"]+#\\1<redacted>#g" "$@"
+    sed -E \
+        -e "s|([[:alpha:]][[:alnum:]+.-]*://)[^/@[:space:]'\"]+@|\\1<redacted>@|g" \
+        -e "s|([?&][^=[:space:]'\"]+=)[^&[:space:]'\"#]+|\\1<redacted>|g" \
+        -e "s|#[^[:space:]'\"]*|#<redacted>|g" "$@"
+}
+
+rtmp_redact_value() {
+    printf '%s\n' "$1" | rtmp_redact_log
 }
 
 rtmp_url() {

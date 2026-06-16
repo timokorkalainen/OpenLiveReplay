@@ -391,12 +391,16 @@ bool NativeRtmpIngestSession::performHandshake(QString* error) {
 
 bool NativeRtmpIngestSession::sendConnectCommand(QString* error) {
     const QByteArray payload =
-        RtmpAmf0::connectCommandPayload(m_url, RtmpConnectCodecProfile::AvcAac);
+        RtmpAmf0::connectCommandPayload(m_url, connectCodecProfile());
     if (!sendMessage(3, kMessageCommandAmf0, 0, 0, payload, error)) {
         return false;
     }
     RtmpMessage result;
     return waitForCommandResult(1, &result, error);
+}
+
+RtmpConnectCodecProfile NativeRtmpIngestSession::connectCodecProfile() {
+    return RtmpConnectCodecProfile::EnhancedAvcHevcAac;
 }
 
 bool NativeRtmpIngestSession::sendCreateStreamCommand(QString* error) {
@@ -525,6 +529,9 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
             continue;
         }
         m_lastPacketAtMs = m_monotonic.elapsed();
+        if (!acknowledgeIncomingBytes(bytes.size(), error)) {
+            return false;
+        }
 
         QList<RtmpMessage> parsed;
         if (!m_chunkParser.push(bytes, &parsed, error)) {
@@ -596,6 +603,54 @@ bool NativeRtmpIngestSession::writeFully(const QByteArray& bytes, QString* error
     return written == bytes.size();
 }
 
+void NativeRtmpIngestSession::configureAcknowledgementWindow(quint32 windowSize) {
+    m_acknowledgementWindowSize = windowSize;
+    if (windowSize == 0) {
+        m_nextAcknowledgementAt = 0;
+        return;
+    }
+    m_nextAcknowledgementAt = quint64(windowSize);
+}
+
+bool NativeRtmpIngestSession::noteIncomingChunkBytes(qint64 byteCount,
+                                                     quint32* acknowledgementSequence) {
+    if (acknowledgementSequence) {
+        *acknowledgementSequence = 0;
+    }
+    if (byteCount < 0) {
+        return false;
+    }
+    if (byteCount > 0) {
+        m_receivedChunkBytes += quint64(byteCount);
+    }
+    if (m_acknowledgementWindowSize == 0 || m_nextAcknowledgementAt == 0 ||
+        m_receivedChunkBytes < m_nextAcknowledgementAt) {
+        return false;
+    }
+
+    if (acknowledgementSequence) {
+        *acknowledgementSequence = quint32(m_receivedChunkBytes & 0xffffffffu);
+    }
+    m_nextAcknowledgementAt =
+        ((m_receivedChunkBytes / m_acknowledgementWindowSize) + 1) *
+        quint64(m_acknowledgementWindowSize);
+    return true;
+}
+
+bool NativeRtmpIngestSession::acknowledgeIncomingBytes(qint64 byteCount, QString* error) {
+    quint32 sequence = 0;
+    if (!noteIncomingChunkBytes(byteCount, &sequence)) {
+        return true;
+    }
+
+    QByteArray payload;
+    payload.append(char((sequence >> 24) & 0xff));
+    payload.append(char((sequence >> 16) & 0xff));
+    payload.append(char((sequence >> 8) & 0xff));
+    payload.append(char(sequence & 0xff));
+    return sendMessage(2, kMessageAck, 0, 0, payload, error);
+}
+
 bool NativeRtmpIngestSession::shouldStop() const {
     if (m_stopRequested.load(std::memory_order_relaxed)) {
         return true;
@@ -619,6 +674,28 @@ void NativeRtmpIngestSession::log(const QString& message) const {
 
 void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
     if (message.type == kMessageSetChunkSize) {
+        return;
+    }
+    if (message.type == kMessageWindowAckSize) {
+        if (message.payload.size() != 4) {
+            m_lastFailureKind = IngestFailureKind::MalformedStream;
+            log(QStringLiteral("Native RTMP window acknowledgement size was malformed."));
+            return;
+        }
+        const quint32 windowSize =
+            (quint32(uchar(message.payload[0])) << 24) |
+            (quint32(uchar(message.payload[1])) << 16) |
+            (quint32(uchar(message.payload[2])) << 8) |
+            quint32(uchar(message.payload[3]));
+        configureAcknowledgementWindow(windowSize);
+        QString error;
+        if (!acknowledgeIncomingBytes(0, &error) && !error.isEmpty()) {
+            m_lastFailureKind = IngestFailureKind::TransientNetwork;
+            log(error);
+        }
+        return;
+    }
+    if (message.type == kMessagePeerBandwidth) {
         return;
     }
     if (message.type == kMessageUserControl && message.payload.size() >= 6) {
@@ -648,9 +725,6 @@ void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
         processAudioMessage(message.timestampMs, message.payload);
     } else {
         Q_UNUSED(kMessageAbort);
-        Q_UNUSED(kMessageAck);
-        Q_UNUSED(kMessageWindowAckSize);
-        Q_UNUSED(kMessagePeerBandwidth);
     }
 }
 
@@ -941,7 +1015,12 @@ int64_t NativeRtmpIngestSession::sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs)
     }
     if (needAnchor) {
         m_firstDtsMs = dtsMs;
-        m_anchorStreamTimeMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+        if (m_audioAnchorStreamTimeMs >= 0 && m_firstAudioPtsMs >= 0) {
+            m_anchorStreamTimeMs = m_audioAnchorStreamTimeMs + (dtsMs - m_firstAudioPtsMs);
+        } else {
+            m_anchorStreamTimeMs =
+                m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+        }
     }
     m_prevDtsMs = dtsMs;
     if (m_anchorStreamTimeMs < 0) {
