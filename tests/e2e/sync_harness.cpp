@@ -121,8 +121,32 @@ int main(int argc, char** argv) {
 
     int exitCode = 0;
     QTimer::singleShot(seconds * 1000, &app, [&]() {
+        // Emit connection telemetry BEFORE stopRecording(). The connected-source set
+        // and per-source event timeline are final at the record's end, and a dead or
+        // closing SRT source can stall stopRecording() teardown for minutes (SRT's
+        // global-lock contention under load). Printing here guarantees the count and
+        // timeline reach the driver even when teardown hangs; the driver bounds the
+        // harness with a watchdog and reads these lines. The MKV path still prints
+        // post-flush below (it needs the muxer trailer written).
+        if (reportConnections) {
+            fprintf(stderr, "connected=%d\n", int(connectedSources.size()));
+            fflush(stderr);
+        }
+        if (reportConnectionEvents) {
+            QList<int> srcs = connEvents.keys();
+            std::sort(srcs.begin(), srcs.end());
+            for (int src : srcs) {
+                QString line = QStringLiteral("conn_events src=%1").arg(src);
+                const QVector<QPair<qint64, bool>>& evs = connEvents.value(src);
+                for (const QPair<qint64, bool>& ev : evs)
+                    line += QStringLiteral(" %1:%2").arg(ev.first).arg(
+                        ev.second ? QStringLiteral("up") : QStringLiteral("down"));
+                fprintf(stderr, "%s\n", qPrintable(line));
+            }
+            fflush(stderr);
+        }
         rm.stopRecording();
-        // Give worker threads / muxer trailer a moment to flush, then report.
+        // Give worker threads / muxer trailer a moment to flush, then report the path.
         QTimer::singleShot(700, &app, [&]() {
             if (outPath.isEmpty()) {
                 fprintf(stderr, "sync_harness: engine reported no output path\n");
@@ -130,23 +154,6 @@ int main(int argc, char** argv) {
             } else {
                 printf("%s\n", qPrintable(outPath));
                 fflush(stdout);
-            }
-            if (reportConnections) {
-                fprintf(stderr, "connected=%d\n", int(connectedSources.size()));
-                fflush(stderr);
-            }
-            if (reportConnectionEvents) {
-                QList<int> srcs = connEvents.keys();
-                std::sort(srcs.begin(), srcs.end());
-                for (int src : srcs) {
-                    QString line = QStringLiteral("conn_events src=%1").arg(src);
-                    const QVector<QPair<qint64, bool>>& evs = connEvents.value(src);
-                    for (const QPair<qint64, bool>& ev : evs)
-                        line += QStringLiteral(" %1:%2").arg(ev.first).arg(
-                            ev.second ? QStringLiteral("up") : QStringLiteral("down"));
-                    fprintf(stderr, "%s\n", qPrintable(line));
-                }
-                fflush(stderr);
             }
             app.quit();
         });
