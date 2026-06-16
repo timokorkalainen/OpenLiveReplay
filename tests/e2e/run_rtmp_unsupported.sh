@@ -81,6 +81,10 @@ run_harness_case() {
         fail_case "$case_name" "missing explicit native RTMP unsupported-profile reason" \
             "$harness_rc" "$harness_out" "$harness_err" "$out_mkv" "$server_log"
     fi
+    if [ "$harness_rc" -ne 0 ]; then
+        fail_case "$case_name" "record_harness exited nonzero" "$harness_rc" \
+            "$harness_out" "$harness_err" "$out_mkv" "$server_log"
+    fi
     if source_like_recorded_output "$out_mkv"; then
         fail_case "$case_name" "unsupported stream produced source-like recorded output" \
             "$harness_rc" "$harness_out" "$harness_err" "$out_mkv" "$server_log"
