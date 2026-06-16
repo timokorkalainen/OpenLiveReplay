@@ -14,6 +14,12 @@ constexpr int kOutputSampleRate = 48000;
 constexpr int kOutputChannels = 2;
 constexpr int kBytesPerOutputFrame = kOutputChannels * int(sizeof(int16_t));
 
+// Returned by the input proc when it has no more packets for THIS call. Returning
+// noErr with 0 packets makes AudioConverter treat the stream as ended, after which
+// it permanently stops producing output; a non-noErr sentinel makes it return the
+// partial output for this call while keeping the (reused) converter alive.
+constexpr OSStatus kNoMoreInputData = 'NOMD';
+
 const int kAdtsSampleRates[] = {
     96000, 88200, 64000, 48000, 44100, 32000, 24000,
     22050, 16000, 12000, 11025, 8000, 7350,
@@ -46,7 +52,8 @@ OSStatus compressedInputProc(AudioConverterRef, UInt32* ioNumberDataPackets,
         if (ioNumberDataPackets) {
             *ioNumberDataPackets = 0;
         }
-        return noErr;
+        // Signal "no more data for this call" WITHOUT ending the stream (see above).
+        return kNoMoreInputData;
     }
 
     input->packetDescription.mStartOffset = 0;
@@ -183,7 +190,9 @@ bool AudioToolboxAacDecoder::Impl::decodeAdtsFrame(const QByteArray& frame,
     UInt32 outputPackets = UInt32(estimatedOutputFrames);
     const OSStatus status = AudioConverterFillComplexBuffer(
         converter, compressedInputProc, &input, &outputPackets, &outputBuffers, nullptr);
-    if (status != noErr) {
+    // kNoMoreInputData is our own "ran out of input for this call" sentinel from the
+    // input proc — not a failure; the partial output (this packet's samples) is valid.
+    if (status != noErr && status != kNoMoreInputData) {
         if (error) {
             *error = statusMessage(QStringLiteral("AudioToolbox AAC decode failed"), status);
         }
