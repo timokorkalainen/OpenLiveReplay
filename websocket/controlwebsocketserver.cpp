@@ -19,9 +19,19 @@ ControlWebSocketServer::ControlWebSocketServer(ControlApiAdapter *adapter, QObje
 }
 
 ControlWebSocketServer::~ControlWebSocketServer() {
+    m_timecodeTimer.stop();
+
     if (m_server) {
         m_server->close();
     }
+
+    const QSet<QWebSocket*> sockets = m_sockets;
+    for (QWebSocket *socket : sockets) {
+        if (!socket) continue;
+        socket->close();
+        socket->deleteLater();
+    }
+    m_sockets.clear();
 }
 
 bool ControlWebSocketServer::listen(const QHostAddress &address, quint16 port) {
@@ -48,6 +58,8 @@ QString ControlWebSocketServer::lastError() const {
 }
 
 void ControlWebSocketServer::publishPatch(const QString &path, const QJsonObject &value) {
+    if (!m_adapter) return;
+
     QJsonObject messageValue = value;
 
     if (path == QStringLiteral("recording")) {
@@ -75,6 +87,8 @@ void ControlWebSocketServer::publishEvent(const QString &name, const QJsonObject
 }
 
 void ControlWebSocketServer::publishTimecodeNow() {
+    if (!m_adapter) return;
+
     m_timecodeTimer.stop();
     broadcastJson(ControlState::timecodeMessage(*m_adapter));
 }

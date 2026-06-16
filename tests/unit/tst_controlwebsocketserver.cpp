@@ -66,6 +66,8 @@ private slots:
     void sendsSnapshotAndTimecodeOnConnect();
     void dispatchesCommandAndSendsAck();
     void sendsErrorForBadJson();
+    void publishEventBroadcastsToAllSockets();
+    void rejectsBinaryMessageAsUnsupported();
 };
 
 void TestControlWebSocketServer::sendsSnapshotAndTimecodeOnConnect() {
@@ -129,6 +131,57 @@ void TestControlWebSocketServer::sendsErrorForBadJson() {
     const QJsonObject err = QJsonDocument::fromJson(messages.at(2).at(0).toString().toUtf8()).object();
     QCOMPARE(err.value(QStringLiteral("type")).toString(), QStringLiteral("error"));
     QCOMPARE(err.value(QStringLiteral("code")).toString(), QStringLiteral("bad_json"));
+}
+
+void TestControlWebSocketServer::publishEventBroadcastsToAllSockets() {
+    ServerFakeAdapter adapter;
+    ControlWebSocketServer server(&adapter);
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QWebSocket socketA;
+    QWebSocket socketB;
+    QSignalSpy messagesA(&socketA, &QWebSocket::textMessageReceived);
+    QSignalSpy messagesB(&socketB, &QWebSocket::textMessageReceived);
+
+    socketA.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/api/ws").arg(server.serverPort())));
+    socketB.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/api/ws").arg(server.serverPort())));
+
+    QTRY_COMPARE_WITH_TIMEOUT(messagesA.count(), 2, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(messagesB.count(), 2, 2000);
+
+    const QJsonObject payload{{QStringLiteral("value"), 1}};
+    server.publishEvent(QStringLiteral("recording.started"), payload);
+
+    QTRY_COMPARE_WITH_TIMEOUT(messagesA.count(), 3, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(messagesB.count(), 3, 2000);
+
+    const QJsonObject eventA = QJsonDocument::fromJson(messagesA.at(2).at(0).toString().toUtf8()).object();
+    const QJsonObject eventB = QJsonDocument::fromJson(messagesB.at(2).at(0).toString().toUtf8()).object();
+    QCOMPARE(eventA.value(QStringLiteral("type")).toString(), QStringLiteral("event"));
+    QCOMPARE(eventA.value(QStringLiteral("name")).toString(), QStringLiteral("recording.started"));
+    QCOMPARE(eventA.value(QStringLiteral("data")).toObject().value(QStringLiteral("value")).toInt(), 1);
+    QCOMPARE(eventB.value(QStringLiteral("type")).toString(), QStringLiteral("event"));
+    QCOMPARE(eventB.value(QStringLiteral("name")).toString(), QStringLiteral("recording.started"));
+    QCOMPARE(eventB.value(QStringLiteral("data")).toObject().value(QStringLiteral("value")).toInt(), 1);
+}
+
+void TestControlWebSocketServer::rejectsBinaryMessageAsUnsupported() {
+    ServerFakeAdapter adapter;
+    ControlWebSocketServer server(&adapter);
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QWebSocket socket;
+    QSignalSpy messages(&socket, &QWebSocket::textMessageReceived);
+    socket.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/api/ws").arg(server.serverPort())));
+
+    QTRY_COMPARE_WITH_TIMEOUT(messages.count(), 2, 2000);
+
+    socket.sendBinaryMessage(QByteArrayLiteral("binary"));
+
+    QTRY_COMPARE_WITH_TIMEOUT(messages.count(), 3, 2000);
+    const QJsonObject err = QJsonDocument::fromJson(messages.at(2).at(0).toString().toUtf8()).object();
+    QCOMPARE(err.value(QStringLiteral("type")).toString(), QStringLiteral("error"));
+    QCOMPARE(err.value(QStringLiteral("code")).toString(), QStringLiteral("unsupported_message"));
 }
 
 QTEST_GUILESS_MAIN(TestControlWebSocketServer)
