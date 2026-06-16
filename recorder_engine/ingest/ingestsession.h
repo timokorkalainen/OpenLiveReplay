@@ -13,10 +13,11 @@ extern "C" {
 struct AVFrame;
 }
 
-enum class IngestBackendKind { Ffmpeg, NativeSrt };
+enum class IngestBackendKind { Ffmpeg, NativeSrt, NativeRtmp };
 
 struct IngestBackendOptions {
     bool preferNativeSrt = false;
+    bool preferNativeRtmp = false;
 };
 
 struct DecodedVideoFrame {
@@ -79,6 +80,8 @@ public:
 };
 
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options);
+IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
+                                                         bool nativeRtmpAvailable);
 
 Q_DECLARE_METATYPE(SrtStats)
 
