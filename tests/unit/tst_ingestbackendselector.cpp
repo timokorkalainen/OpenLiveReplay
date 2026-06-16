@@ -4,6 +4,11 @@
 #include "recorder_engine/ingest/ingestsession.h"
 #include "recorder_engine/ingest/nativefallbackpolicy.h"
 #include "recorder_engine/ingest/nativesrtingestsession.h"
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+#include "recorder_engine/ingest/nativertmpingestsession.h"
+#endif
+
+#include <algorithm>
 
 class TestIngestBackendSelector : public QObject {
     Q_OBJECT
@@ -15,6 +20,9 @@ private slots:
     void environmentOptInRoutesRtmpAndRtmpsToNative();
     void environmentCanForceRtmpBackToFfmpeg();
     void nativeFailureFallbackPolicy();
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+    void malformedLegacyVideoPacketStaysMalformed();
+#endif
     void canConstructFfmpegSession();
     void nativeFailureReasonStartsEmpty();
     void nativeDecodeCapabilityErrorsRequestFallback();
@@ -145,6 +153,25 @@ void TestIngestBackendSelector::nativeFailureFallbackPolicy() {
     QVERIFY(!shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::TransientNetwork));
     QVERIFY(!shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::None));
 }
+
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+void TestIngestBackendSelector::malformedLegacyVideoPacketStaysMalformed() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    QStringList logLines;
+    IngestCallbacks callbacks;
+    callbacks.logInfo = [&logLines](const QString& message) { logLines.append(message); };
+    session.m_callbacks = callbacks;
+
+    session.processVideoMessage(0, QByteArray::fromHex("02"));
+
+    QCOMPARE(session.lastFailureKind(), IngestFailureKind::MalformedStream);
+    QVERIFY(session.m_unsupportedReason.isEmpty());
+    QVERIFY(std::any_of(logLines.cbegin(), logLines.cend(), [](const QString& message) {
+        return message.contains(QStringLiteral("Native RTMP video parse failed"));
+    }));
+}
+#endif
 
 void TestIngestBackendSelector::canConstructFfmpegSession() {
     FfmpegIngestSession session(0);

@@ -19,6 +19,9 @@
 class QTcpSocket;
 
 class NativeRtmpIngestSession final : public IngestSession {
+#if defined(QT_TESTLIB_LIB)
+    friend class TestIngestBackendSelector;
+#endif
 public:
     NativeRtmpIngestSession(int sourceIndex, int outputWidth, int outputHeight,
                             std::atomic<bool>* captureRunning);

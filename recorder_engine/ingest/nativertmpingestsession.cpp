@@ -476,7 +476,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         }
         m_lastFailureKind = IngestFailureKind::MalformedStream;
         log(QStringLiteral("Native RTMP video parse failed: %1").arg(parseError));
-        if (!payload.isEmpty() && (uchar(payload[0]) & 0x80) == 0) {
+        if (payload.size() >= 5 && (uchar(payload[0]) & 0x80) == 0) {
             const int codecId = uchar(payload[0]) & 0x0f;
             if (codecId != 7) {
                 markUnsupported(
