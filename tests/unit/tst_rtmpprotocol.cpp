@@ -37,6 +37,8 @@ private slots:
     void chunkParserRejectsMalformedAbortPayloads();
     void chunkParserAbortClearsInFlightAssembly();
     void chunkParserFmtThreeAfterAbortDoesNotPoisonState();
+    void chunkParserAbortForInactiveCsidDoesNotCreateTombstone();
+    void chunkParserClearsAbortTombstoneAfterDiscardingRemainingBytes();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -487,6 +489,90 @@ void TestRtmpProtocol::chunkParserFmtThreeAfterAbortDoesNotPoisonState() {
     QCOMPARE(messages.size(), 1);
     QCOMPARE(messages.first().timestampMs, qint64(40));
     QCOMPARE(messages.first().payload, QByteArray("zz", 2));
+}
+
+void TestRtmpProtocol::chunkParserAbortForInactiveCsidDoesNotCreateTombstone() {
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray abort =
+            RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("00000006"), 128);
+        QVERIFY(parser.push(abort, &messages, &error));
+        QCOMPARE(messages.size(), 1);
+
+        QByteArray fmtThree;
+        fmtThree.append(char((3 << 6) | 6));
+        fmtThree.append("x", 1);
+
+        QVERIFY(!parser.push(fmtThree, &messages, &error));
+        QVERIFY(errorMentionsPreviousHeader(error));
+    }
+
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray first =
+            RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("aa", 2), 128);
+        QVERIFY(parser.push(first, &messages, &error));
+        QCOMPARE(messages.size(), 1);
+
+        const QByteArray abort =
+            RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("00000006"), 128);
+        QVERIFY(parser.push(abort, &messages, &error));
+        QCOMPARE(messages.size(), 1);
+
+        QByteArray fmtThree;
+        fmtThree.append(char((3 << 6) | 6));
+        fmtThree.append("bb", 2);
+
+        QVERIFY(parser.push(fmtThree, &messages, &error));
+        QCOMPARE(messages.size(), 1);
+        QCOMPARE(messages.first().type, 9);
+        QCOMPARE(messages.first().payload, QByteArray("bb", 2));
+
+        const QByteArray fresh =
+            RtmpChunkWriter::message(6, 9, 1, 20, QByteArray("cc", 2), 128);
+        QVERIFY(parser.push(fresh, &messages, &error));
+        QCOMPARE(messages.size(), 1);
+        QCOMPARE(messages.first().timestampMs, qint64(20));
+        QCOMPARE(messages.first().payload, QByteArray("cc", 2));
+    }
+}
+
+void TestRtmpProtocol::chunkParserClearsAbortTombstoneAfterDiscardingRemainingBytes() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    parser.setInputChunkSizeForTest(2);
+    const QByteArray video = RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("abcd", 4), 2);
+    QVERIFY(parser.push(video.left(14), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    const QByteArray abort =
+        RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("00000006"), 2);
+    QVERIFY(parser.push(abort, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+
+    QVERIFY(parser.push(video.mid(14), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    QByteArray fmtThreeFirst;
+    fmtThreeFirst.append(char((3 << 6) | 6));
+    fmtThreeFirst.append("zz", 2);
+    QVERIFY(parser.push(fmtThreeFirst, &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    QByteArray fmtThreeSecond;
+    fmtThreeSecond.append(char((3 << 6) | 6));
+    fmtThreeSecond.append("qq", 2);
+    QVERIFY(parser.push(fmtThreeSecond, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().payload, QByteArray("zzqq", 4));
 }
 
 void TestRtmpProtocol::parsesAvcSequenceHeaderAndConvertsNalusToAnnexB() {

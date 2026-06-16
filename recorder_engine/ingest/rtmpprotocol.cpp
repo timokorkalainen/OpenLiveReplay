@@ -381,7 +381,11 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         if (fragment.discarded) {
             const int remaining =
                 qMax(0, m_abortedChunkStreams.value(fragment.csid) - fragment.discardedPayloadBytes);
-            m_abortedChunkStreams.insert(fragment.csid, remaining);
+            if (remaining > 0) {
+                m_abortedChunkStreams.insert(fragment.csid, remaining);
+            } else {
+                m_abortedChunkStreams.remove(fragment.csid);
+            }
             m_buffer.remove(0, fragment.consumed);
             continue;
         }
@@ -425,11 +429,16 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
                 return false;
             }
             const int abortCsid = int(readU32Be(message.payload.constData()));
-            const ChunkAssembly abortedAssembly = m_assemblies.value(abortCsid);
-            const int remaining =
-                qMax(0, abortedAssembly.header.messageLength - abortedAssembly.payload.size());
-            m_assemblies.remove(abortCsid);
-            m_abortedChunkStreams.insert(abortCsid, remaining);
+            if (m_assemblies.contains(abortCsid)) {
+                const ChunkAssembly abortedAssembly = m_assemblies.take(abortCsid);
+                const int remaining =
+                    qMax(0, abortedAssembly.header.messageLength - abortedAssembly.payload.size());
+                if (remaining > 0) {
+                    m_abortedChunkStreams.insert(abortCsid, remaining);
+                } else {
+                    m_abortedChunkStreams.remove(abortCsid);
+                }
+            }
         }
         if (message.type == 1) {
             if (message.payload.size() != 4) {
