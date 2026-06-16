@@ -12,6 +12,7 @@ function(olr_add_unit_test name)
 endfunction()
 
 olr_add_unit_test(tst_recordingclock   olr_test_core)
+olr_add_unit_test(tst_framerate        olr_test_core)
 olr_add_unit_test(tst_heartbeat        olr_test_core)
 olr_add_unit_test(tst_controlprotocol  olr_test_core)
 olr_add_unit_test(tst_controlwebsocketserver olr_test_core)

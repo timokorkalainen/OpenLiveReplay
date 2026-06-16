@@ -81,6 +81,7 @@ qt_add_qml_module(OpenLiveReplay
         websocket/uimanagercontroladapter.h websocket/uimanagercontroladapter.cpp
         recorder_engine/replaymanager.cpp recorder_engine/replaymanager.h
         recorder_engine/heartbeat.h recorder_engine/heartbeat.cpp
+        recorder_engine/framerate.h recorder_engine/framerate.cpp
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
         recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
