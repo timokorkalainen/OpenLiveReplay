@@ -132,6 +132,8 @@ RtmpUrlParts RtmpUrlParts::fromUrl(const QUrl& url) {
 
 QString RtmpUrlParts::redactedForLog(const QUrl& url) {
     QUrl display = url;
+    display.setUserName(QString());
+    display.setPassword(QString());
     display.setQuery(QString());
     display.setFragment(QString());
     QString out = display.toString(QUrl::FullyEncoded);

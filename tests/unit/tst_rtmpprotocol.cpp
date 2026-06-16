@@ -172,6 +172,15 @@ void TestRtmpProtocol::rtmpUrlRedactionForLogHidesQueryValues() {
     QVERIFY(!redacted.contains(QStringLiteral("abc")));
     QVERIFY(!redacted.contains(QStringLiteral("x%3Dy")));
 
+    const QString redactedUserInfo = RtmpUrlParts::redactedForLog(
+        QUrl(QStringLiteral("rtmp://user:pass@host/live/stream?token=abc#frag")));
+    QCOMPARE(redactedUserInfo, QStringLiteral("rtmp://host/live/stream?<redacted>"));
+    QVERIFY(!redactedUserInfo.contains(QStringLiteral("user")));
+    QVERIFY(!redactedUserInfo.contains(QStringLiteral("pass")));
+    QVERIFY(!redactedUserInfo.contains(QStringLiteral("token")));
+    QVERIFY(!redactedUserInfo.contains(QStringLiteral("abc")));
+    QVERIFY(!redactedUserInfo.contains(QStringLiteral("frag")));
+
     QCOMPARE(RtmpUrlParts::redactedForLog(QUrl(QStringLiteral("rtmp://host/live/stream"))),
              QStringLiteral("rtmp://host/live/stream"));
 }
