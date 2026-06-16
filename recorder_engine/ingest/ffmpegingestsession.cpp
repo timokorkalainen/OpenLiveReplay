@@ -111,13 +111,14 @@ void FfmpegIngestSession::run() {
         }
     }
 
+    // Single shared A/V anchor: stream position anchorMicros maps to wall-clock
+    // anchorStreamTimeMs. Both streams convert their timestamp to microseconds and
+    // map against it, so A/V alignment is the true stream offset (audio/video may
+    // carry different time_bases, so we normalise to one clock).
+    int64_t anchorMicros = AV_NOPTS_VALUE;
     int64_t anchorStreamTimeMs = -1;
-    int64_t firstPacketDts = AV_NOPTS_VALUE;
-    int64_t prevPktDts = AV_NOPTS_VALUE;
-
-    int64_t firstAudioDts = AV_NOPTS_VALUE;
-    int64_t audioAnchorStreamTimeMs = -1;
-    int64_t prevAudioDts = AV_NOPTS_VALUE;
+    int64_t prevVideoMicros = AV_NOPTS_VALUE; // video jump detection (re-anchor authority)
+    int64_t prevAudioMicros = AV_NOPTS_VALUE; // audio jump detection (log only)
 
     m_lastPacketAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
     m_readingConnectedStream.store(true, std::memory_order_relaxed);
@@ -136,25 +137,24 @@ void FfmpegIngestSession::run() {
 
                 const AVRational videoTb = m_inCtx->streams[m_videoStreamIdx]->time_base;
 
-                bool needAnchor = (firstPacketDts == AV_NOPTS_VALUE);
-                if (!needAnchor && prevPktDts != AV_NOPTS_VALUE) {
-                    const int64_t deltaMs =
-                        av_rescale_q(pktDts - prevPktDts, videoTb, {1, 1000});
+                const int64_t pktMicros = av_rescale_q(pktDts, videoTb, AVRational{1, 1000000});
+                if (anchorMicros != AV_NOPTS_VALUE && prevVideoMicros != AV_NOPTS_VALUE) {
+                    const int64_t deltaMs = (pktMicros - prevVideoMicros) / 1000;
                     constexpr int64_t kForwardJumpMs = 3000;
                     constexpr int64_t kBackwardTolMs = -200;
                     if (deltaMs > kForwardJumpMs || deltaMs < kBackwardTolMs) {
                         qDebug() << "Source" << m_sourceIndex << "DTS discontinuity ("
                                  << deltaMs << "ms jump). Re-anchoring.";
-                        needAnchor = true;
+                        anchorMicros = AV_NOPTS_VALUE;
                     }
                 }
-                if (needAnchor) {
-                    firstPacketDts = pktDts;
+                prevVideoMicros = pktMicros;
+                if (anchorMicros == AV_NOPTS_VALUE) {
+                    anchorMicros = pktMicros;
                     anchorStreamTimeMs = m_callbacks.recordingClockMs
                                              ? m_callbacks.recordingClockMs()
                                              : -1;
                 }
-                prevPktDts = pktDts;
 
                 if (avcodec_send_packet(m_decCtx, pkt) >= 0) {
                     while (avcodec_receive_frame(m_decCtx, rawFrame) >= 0) {
@@ -188,12 +188,13 @@ void FfmpegIngestSession::run() {
 
                         int64_t frameTs = rawFrame->best_effort_timestamp;
                         if (frameTs == AV_NOPTS_VALUE) frameTs = pktDts;
-                        int64_t relativeMs =
-                            av_rescale_q(frameTs - firstPacketDts, videoTb, {1, 1000});
+                        const int64_t frameMicros =
+                            av_rescale_q(frameTs, videoTb, AVRational{1, 1000000});
 
                         DecodedVideoFrame decoded;
                         decoded.frame = scaledFrame;
-                        decoded.sourcePtsMs = anchorStreamTimeMs + relativeMs;
+                        decoded.sourcePtsMs =
+                            anchorStreamTimeMs + (frameMicros - anchorMicros) / 1000;
                         if (m_callbacks.onVideoFrame) {
                             m_callbacks.onVideoFrame(decoded);
                         } else {
@@ -237,36 +238,26 @@ void FfmpegIngestSession::run() {
                         const int64_t nowMs = m_callbacks.recordingClockMs
                                                   ? m_callbacks.recordingClockMs()
                                                   : -1;
-                        bool needAudioAnchor = (firstAudioDts == AV_NOPTS_VALUE);
-                        if (!needAudioAnchor && prevAudioDts != AV_NOPTS_VALUE) {
-                            const int64_t aDeltaMs =
-                                av_rescale_q(audioTs - prevAudioDts, audioTb, {1, 1000});
-                            constexpr int64_t kForwardJumpMs = 3000;
-                            constexpr int64_t kBackwardTolMs = -200;
-                            if (aDeltaMs > kForwardJumpMs || aDeltaMs < kBackwardTolMs) {
-                                qDebug() << "Source" << m_sourceIndex
-                                         << "Audio DTS discontinuity (" << aDeltaMs
-                                         << "ms jump). Re-anchoring.";
-                                needAudioAnchor = true;
+                        const int64_t audioMicros =
+                            av_rescale_q(audioTs, audioTb, AVRational{1, 1000000});
+                        if (prevAudioMicros != AV_NOPTS_VALUE) {
+                            const int64_t aDeltaMs = (audioMicros - prevAudioMicros) / 1000;
+                            if (aDeltaMs > 3000 || aDeltaMs < -200) {
+                                qDebug() << "Source" << m_sourceIndex << "Audio discontinuity ("
+                                         << aDeltaMs << "ms).";
                             }
                         }
-                        if (needAudioAnchor) {
-                            firstAudioDts = audioTs;
-                            audioAnchorStreamTimeMs = nowMs;
+                        prevAudioMicros = audioMicros;
+                        // First-of-either fallback: audio sets the shared anchor only
+                        // if nothing has yet; it never re-anchors on its own (that was
+                        // the lip-sync bug). Video owns re-anchoring.
+                        if (anchorMicros == AV_NOPTS_VALUE) {
+                            anchorMicros = audioMicros;
+                            anchorStreamTimeMs = nowMs;
                         }
-                        prevAudioDts = audioTs;
-
-                        int64_t recPtsMs =
-                            audioAnchorStreamTimeMs +
-                            av_rescale_q(audioTs - firstAudioDts, audioTb, {1, 1000});
-
-                        if (recPtsMs > nowMs + 10000) {
-                            qDebug() << "Source" << m_sourceIndex << "Audio sample" << recPtsMs
-                                     << "ms far ahead of clock" << nowMs << "ms. Re-anchoring.";
-                            firstAudioDts = audioTs;
-                            audioAnchorStreamTimeMs = nowMs;
-                            prevAudioDts = audioTs;
-                            recPtsMs = nowMs;
+                        int64_t recPtsMs = anchorStreamTimeMs + (audioMicros - anchorMicros) / 1000;
+                        if (nowMs >= 0 && recPtsMs > nowMs + 10000) {
+                            recPtsMs = nowMs; // safety clamp, no re-anchor
                         }
                         if (recPtsMs < 0) {
                             av_frame_unref(audioFrame);
