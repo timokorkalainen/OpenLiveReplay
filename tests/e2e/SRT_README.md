@@ -280,3 +280,26 @@ snapshots it once per pulse, and applies it to both video and audio (one A/V tim
 `ctest -L srt` proves the ffmpeg options don't break ingest; the native continuity gate scripts
 (`run_srt_soak.sh`/`run_srt_loss.sh`/`run_srt_jitter.sh`/`run_srt_4cam.sh`, `OLR_NATIVE_SRT=1`)
 prove the 80 ms floor keeps content continuous (no gaps).
+
+## AUD-4: single shared A/V anchor per source
+
+Each source anchors audio and video to ONE timeline reference instead of two independent
+first-packet-arrival anchors, which baked in a fixed ~+63 ms lip-sync offset. The native ingest
+recovers the **MPEG-TS PCR** (`MpegTsParser` extracts the 90 kHz base from the PCR PID's adaptation
+field) and anchors both streams to it, falling back to the first PES if no PCR has appeared; the
+ffmpeg path anchors both to the first-of-either packet in a common µs timebase (PCR isn't reachable
+through `avformat`). Audio maps against the shared anchor and no longer re-anchors on its own —
+video/PCR owns re-anchoring on a discontinuity.
+
+**A native AAC decoder bug, found via the lip-sync marker:** the AudioToolbox AAC path's input proc
+returned `noErr`/0-packets when out of data, which AudioConverter reads as end-of-stream — so after
+the first decoded packet the reused converter went terminal and dropped ~99 % of subsequent audio
+(gap-filled with silence). A predominantly-silent stream (the gated beep) decoded to pure silence;
+continuous tone only survived via occasional converter resets. Fixed by returning a non-`noErr`
+sentinel (`kNoMoreInputData`) so the converter yields the partial output and stays alive.
+
+**Gates:** `tst_mpegtsparser_pcr` (unit — PCR extraction) + the `sourcePtsMsFromAnchor` mapping unit
+case; `e2e_av_lipsync` (`av-sync`, ffmpeg/UDP) and `e2e_native_srt_lipsync` (`native-apple-ingest`,
+PCR path) both assert mean `(audio − video)` within EBU R37 (−40..+60 ms) — the pre-AUD-4 +63 ms
+exceeds the +60 lag bound; the shared anchor collapses it toward 0. Flash/beep are paired by nearest
+timestamp (robust to a spurious `silencedetect` edge).
