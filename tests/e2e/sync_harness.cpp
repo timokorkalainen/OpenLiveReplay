@@ -14,6 +14,12 @@
 #include <QString>
 #include <QStringList>
 #include <QSet>
+#include <QHash>
+#include <QVector>
+#include <QPair>
+#include <QList>
+#include <QElapsedTimer>
+#include <algorithm>
 #include <QtGlobal>
 #include <cstdio>
 
@@ -49,6 +55,7 @@ int main(int argc, char** argv) {
     const QString outdir = argValue(args, QStringLiteral("--outdir"), QString());
     const int trimMs = argValue(args, QStringLiteral("--trim"), QStringLiteral("0")).toInt();
     const bool reportConnections = args.contains(QStringLiteral("--report-connections"));
+    const bool reportConnectionEvents = args.contains(QStringLiteral("--report-connection-events"));
 
     if (urls.isEmpty()) {
         fprintf(stderr, "sync_harness: at least one --url is required\n");
@@ -81,13 +88,22 @@ int main(int argc, char** argv) {
     rm.setVideoHeight(height);
     rm.setFps(fps);
 
-    // Count distinct sources that reach the connected state. Queued to the app
-    // (main) thread — the signal is emitted from a worker thread. Connected
-    // before startRecording() so no early connect is missed.
+    // Per-source connection observability. connectionChanged fires on EVERY real
+    // transition (StreamWorker::setConnected emits only on change), queued to this
+    // (main) thread, so the captures below are mutated single-threaded. Wired before
+    // startRecording() so no early connect is missed.
+    //  - connectedSources: distinct sources ever connected (for --report-connections).
+    //  - connEvents: per source, a chronological (elapsedMs, connected) timeline
+    //    (for --report-connection-events), used by the reconnect e2e to verify a
+    //    real up->down->up sequence.
     QSet<int> connectedSources;
+    QHash<int, QVector<QPair<qint64, bool>>> connEvents;
+    QElapsedTimer connTimer;
+    connTimer.start();
     QObject::connect(&rm, &ReplayManager::sourceConnectionChanged, &app,
-                     [&connectedSources](int sourceIndex, bool connected) {
+                     [&connectedSources, &connEvents, &connTimer](int sourceIndex, bool connected) {
                          if (connected) connectedSources.insert(sourceIndex);
+                         connEvents[sourceIndex].append(qMakePair(connTimer.elapsed(), connected));
                      });
 
     rm.startRecording();
@@ -117,6 +133,19 @@ int main(int argc, char** argv) {
             }
             if (reportConnections) {
                 fprintf(stderr, "connected=%d\n", int(connectedSources.size()));
+                fflush(stderr);
+            }
+            if (reportConnectionEvents) {
+                QList<int> srcs = connEvents.keys();
+                std::sort(srcs.begin(), srcs.end());
+                for (int src : srcs) {
+                    QString line = QStringLiteral("conn_events src=%1").arg(src);
+                    const QVector<QPair<qint64, bool>>& evs = connEvents.value(src);
+                    for (const QPair<qint64, bool>& ev : evs)
+                        line += QStringLiteral(" %1:%2").arg(ev.first).arg(
+                            ev.second ? QStringLiteral("up") : QStringLiteral("down"));
+                    fprintf(stderr, "%s\n", qPrintable(line));
+                }
                 fflush(stderr);
             }
             app.quit();

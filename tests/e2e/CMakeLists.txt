@@ -153,4 +153,19 @@ if(APPLE)
         TIMEOUT 180
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # Phase 2c-a: mid-recording disconnect/reconnect survival on the NATIVE SRT
+    # ingest. Kill a victim bridge mid-record, restart it, and prove the victim
+    # reconnects + resumes real content WHILE the control source stays fully
+    # isolated (no disconnect, no content loss). Isolation holds on the native
+    # path (each source owns its libsrt socket); the legacy ffmpeg ingest couples
+    # sources (a dead source's reconnect churn starves the others — see SRT_README),
+    # so this gate runs native-only. Base port 23550; longer record => TIMEOUT 240.
+    add_test(NAME e2e_native_srt_reconnect
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_reconnect.sh" "$<TARGET_FILE:sync_harness>" 23550)
+    set_tests_properties(e2e_native_srt_reconnect PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
 endif()
