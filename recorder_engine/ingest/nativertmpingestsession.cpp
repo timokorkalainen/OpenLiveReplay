@@ -96,10 +96,16 @@ void NativeRtmpIngestSession::run() {
         log(QStringLiteral(
             "Native RTMP unsupported profile: no supported video within probe window."));
     };
+    const auto stopAfterUnsupportedProfile = [this]() {
+        if (m_captureRunning) {
+            m_captureRunning->store(false, std::memory_order_relaxed);
+        }
+    };
 
     while (!shouldStop()) {
         if (supportedVideoProbeExpired()) {
             logUnsupportedVideoProbe();
+            stopAfterUnsupportedProfile();
             break;
         }
 
@@ -107,8 +113,11 @@ void NativeRtmpIngestSession::run() {
         QString error;
         if (!readMessage(&message, &error)) {
             if (!shouldStop()) {
-                if (supportedVideoProbeExpired()) {
+                if (!m_unsupportedReason.isEmpty()) {
+                    stopAfterUnsupportedProfile();
+                } else if (supportedVideoProbeExpired()) {
                     logUnsupportedVideoProbe();
+                    stopAfterUnsupportedProfile();
                 } else {
                     log(error.isEmpty() ? QStringLiteral("Native RTMP disconnected.") : error);
                 }
@@ -117,8 +126,13 @@ void NativeRtmpIngestSession::run() {
         }
         m_lastPacketAtMs = m_monotonic.elapsed();
         processMessage(message);
+        if (!m_unsupportedReason.isEmpty()) {
+            stopAfterUnsupportedProfile();
+            break;
+        }
         if (supportedVideoProbeExpired()) {
             logUnsupportedVideoProbe();
+            stopAfterUnsupportedProfile();
             break;
         }
     }

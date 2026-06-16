@@ -60,6 +60,21 @@ source_like_recorded_output() {
     [ -n "${y_range:-}" ] && awk -v r="$y_range" 'BEGIN{exit !(r > 10)}'
 }
 
+generic_failure_after_unsupported() {
+    local harness_err="$1"
+    awk '
+        /Native RTMP unsupported profile/ { seen=1; next }
+        seen && (/Native RTMP read failed/ ||
+                 /Native RTMP disconnected/ ||
+                 /Native RTMP connect failed/ ||
+                 /Connect failed\. Retrying/ ||
+                 /Attempting connection to:/) {
+            found=1
+        }
+        END { exit found ? 0 : 1 }
+    ' "$harness_err"
+}
+
 run_harness_case() {
     local case_name="$1" port="$2" seconds="$3" server_log="$4"
     local harness_out="$WORKDIR/${case_name}.harness.out"
@@ -84,6 +99,10 @@ run_harness_case() {
     if [ "$harness_rc" -ne 0 ]; then
         fail_case "$case_name" "record_harness exited nonzero" "$harness_rc" \
             "$harness_out" "$harness_err" "$out_mkv" "$server_log"
+    fi
+    if generic_failure_after_unsupported "$harness_err"; then
+        fail_case "$case_name" "generic native RTMP failure or retry after unsupported marker" \
+            "$harness_rc" "$harness_out" "$harness_err" "$out_mkv" "$server_log"
     fi
     if source_like_recorded_output "$out_mkv"; then
         fail_case "$case_name" "unsupported stream produced source-like recorded output" \
