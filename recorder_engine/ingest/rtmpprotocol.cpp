@@ -646,7 +646,9 @@ bool RtmpFlv::parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packe
     }
 
     if (payload.size() < 5) {
-        if (error) *error = QStringLiteral("RTMP enhanced video packet is malformed.");
+        if (error) {
+            *error = QStringLiteral("RTMP enhanced video packet is malformed: missing FourCC.");
+        }
         return false;
     }
 
@@ -686,7 +688,10 @@ bool RtmpFlv::parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packe
     int offset = 5;
     if (parsed.enhancedType == RtmpEnhancedVideoPacketType::CodedFrames) {
         if (payload.size() < offset + 3) {
-            if (error) *error = QStringLiteral("RTMP enhanced coded video packet is malformed.");
+            if (error) {
+                *error = QStringLiteral(
+                    "RTMP enhanced coded video packet is malformed: missing composition time.");
+            }
             return false;
         }
         parsed.compositionTimeMs = readS24(payload.constData() + offset);

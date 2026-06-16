@@ -14,6 +14,10 @@ bool errorMentionsPreviousHeader(const QString& error) {
            error.contains(QStringLiteral("continuation"), Qt::CaseInsensitive);
 }
 
+bool errorMentions(const QString& error, const QString& expected) {
+    return error.contains(expected, Qt::CaseInsensitive);
+}
+
 bool readConnectObjectString(const QByteArray& payload, const QString& wantedKey, QString* value) {
     int offset = 0;
     QString command;
@@ -84,6 +88,14 @@ private slots:
     void chunkParserClearsAbortTombstoneAfterDiscardingRemainingBytes();
     void parsesEnhancedHevcSequenceStartHeader();
     void parsesEnhancedCodedFramesCompositionTime();
+    void rejectsEnhancedVideoPacketWithoutFourCc();
+    void rejectsEnhancedCodedFramesWithoutCompositionTime();
+    void parsesEnhancedNegativeCompositionTime();
+    void parsesEnhancedUnknownFourCcSafely();
+    void rejectsUnsupportedEnhancedMetadataAndMultitrack();
+    void parsesEnhancedCodedFramesXWithoutCompositionTime();
+    void parsesEnhancedSequenceEndWithoutCompositionTime();
+    void parsesLegacyAvcVideoPacket();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -827,6 +839,138 @@ void TestRtmpProtocol::parsesEnhancedCodedFramesCompositionTime() {
     QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::CodedFrames);
     QCOMPARE(packet.fourCc, QStringLiteral("avc1"));
     QCOMPARE(packet.compositionTimeMs, 42);
+    QCOMPARE(packet.codecPayload, QByteArray("FRAME", 5));
+}
+
+void TestRtmpProtocol::rejectsEnhancedVideoPacketWithoutFourCc() {
+    const QList<QByteArray> payloads = {
+        QByteArray(1, char(0x80 | 0)),
+        QByteArray(1, char(0x80 | 0)) + QByteArray("hvc", 3),
+    };
+
+    for (const QByteArray& payload : payloads) {
+        RtmpVideoPacket packet;
+        QString error;
+        QVERIFY(!RtmpFlv::parseVideoPacket(payload, &packet, &error));
+        QVERIFY(errorMentions(error, QStringLiteral("FourCC")));
+        QVERIFY(errorMentions(error, QStringLiteral("malformed")));
+    }
+}
+
+void TestRtmpProtocol::rejectsEnhancedCodedFramesWithoutCompositionTime() {
+    QByteArray payload;
+    payload.append(char(0x80 | 1)); // enhanced + CodedFrames
+    payload.append("avc1", 4);
+    payload.append(QByteArray::fromHex("0000"));
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(!RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QVERIFY(errorMentions(error, QStringLiteral("composition")));
+    QVERIFY(errorMentions(error, QStringLiteral("malformed")));
+}
+
+void TestRtmpProtocol::parsesEnhancedNegativeCompositionTime() {
+    QByteArray payload;
+    payload.append(char(0x80 | 1)); // enhanced + CodedFrames
+    payload.append("avc1", 4);
+    payload.append(QByteArray::fromHex("ffffd6")); // composition time -42
+    payload.append("FRAME", 5);
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::Enhanced);
+    QCOMPARE(packet.codec, NativeVideoCodec::H264);
+    QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::CodedFrames);
+    QCOMPARE(packet.compositionTimeMs, -42);
+    QCOMPARE(packet.codecPayload, QByteArray("FRAME", 5));
+}
+
+void TestRtmpProtocol::parsesEnhancedUnknownFourCcSafely() {
+    QByteArray payload;
+    payload.append(char(0x80 | 3)); // enhanced + CodedFramesX
+    payload.append("zzzz", 4);
+    payload.append("FRAME", 5);
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::Enhanced);
+    QCOMPARE(packet.codec, NativeVideoCodec::Unknown);
+    QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::CodedFramesX);
+    QCOMPARE(packet.fourCc, QStringLiteral("zzzz"));
+    QCOMPARE(packet.compositionTimeMs, 0);
+    QCOMPARE(packet.codecPayload, QByteArray("FRAME", 5));
+}
+
+void TestRtmpProtocol::rejectsUnsupportedEnhancedMetadataAndMultitrack() {
+    const QList<int> packetTypes = {
+        int(RtmpEnhancedVideoPacketType::Metadata),
+        int(RtmpEnhancedVideoPacketType::Multitrack),
+    };
+
+    for (int packetType : packetTypes) {
+        QByteArray payload;
+        payload.append(char(0x80 | packetType));
+        payload.append("avc1", 4);
+        payload.append("DATA", 4);
+
+        RtmpVideoPacket packet;
+        QString error;
+        QVERIFY(!RtmpFlv::parseVideoPacket(payload, &packet, &error));
+        QVERIFY(errorMentions(error, QStringLiteral("unsupported")));
+        QVERIFY(errorMentions(error, QStringLiteral("packet type")));
+    }
+}
+
+void TestRtmpProtocol::parsesEnhancedCodedFramesXWithoutCompositionTime() {
+    QByteArray payload;
+    payload.append(char(0x80 | 3)); // enhanced + CodedFramesX
+    payload.append("hvc1", 4);
+    payload.append("FRAME", 5);
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::Enhanced);
+    QCOMPARE(packet.codec, NativeVideoCodec::Hevc);
+    QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::CodedFramesX);
+    QCOMPARE(packet.compositionTimeMs, 0);
+    QCOMPARE(packet.codecPayload, QByteArray("FRAME", 5));
+}
+
+void TestRtmpProtocol::parsesEnhancedSequenceEndWithoutCompositionTime() {
+    QByteArray payload;
+    payload.append(char(0x80 | 2)); // enhanced + SequenceEnd
+    payload.append("hvc1", 4);
+    payload.append("END", 3);
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::Enhanced);
+    QCOMPARE(packet.codec, NativeVideoCodec::Hevc);
+    QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::SequenceEnd);
+    QCOMPARE(packet.compositionTimeMs, 0);
+    QCOMPARE(packet.codecPayload, QByteArray("END", 3));
+}
+
+void TestRtmpProtocol::parsesLegacyAvcVideoPacket() {
+    QByteArray payload;
+    payload.append(char((1 << 4) | 7)); // keyframe + AVC
+    payload.append(char(1));            // AVC NALU
+    payload.append(QByteArray::fromHex("00002a"));
+    payload.append("FRAME", 5);
+
+    RtmpVideoPacket packet;
+    QString error;
+    QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+    QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::LegacyAvc);
+    QCOMPARE(packet.codec, NativeVideoCodec::H264);
+    QCOMPARE(packet.enhancedType, RtmpEnhancedVideoPacketType::CodedFrames);
+    QCOMPARE(packet.compositionTimeMs, 42);
+    QCOMPARE(packet.trackId, 0);
     QCOMPARE(packet.codecPayload, QByteArray("FRAME", 5));
 }
 
