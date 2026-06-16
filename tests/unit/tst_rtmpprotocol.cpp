@@ -24,6 +24,7 @@ private slots:
     void chunkParserConsumesExtendedTimestampOnContinuationChunks();
     void chunkParserRejectsFmtOneWithoutPreviousHeader();
     void chunkParserRejectsFmtTwoWithoutPreviousHeader();
+    void chunkParserRejectsFmtThreeWithoutPreviousHeader();
     void chunkParserAdvancesTimestampForFmtThreeStartingSameHeaderMessage();
     void chunkParserRejectsUnsafeSetChunkSizeValues();
     void chunkParserAppliesFragmentedSetChunkSizeOnlyAfterCompletion();
@@ -154,6 +155,20 @@ void TestRtmpProtocol::chunkParserRejectsFmtTwoWithoutPreviousHeader() {
     QVERIFY(messages.isEmpty());
 }
 
+void TestRtmpProtocol::chunkParserRejectsFmtThreeWithoutPreviousHeader() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    QByteArray chunk;
+    chunk.append(char((3 << 6) | 6)); // fmt=3, csid=6
+    chunk.append("x", 1);
+
+    QVERIFY(!parser.push(chunk, &messages, &error));
+    QVERIFY(errorMentionsPreviousHeader(error));
+    QVERIFY(messages.isEmpty());
+}
+
 void TestRtmpProtocol::chunkParserAdvancesTimestampForFmtThreeStartingSameHeaderMessage() {
     RtmpChunkParser parser;
     QList<RtmpMessage> messages;
@@ -209,6 +224,34 @@ void TestRtmpProtocol::chunkParserRejectsUnsafeSetChunkSizeValues() {
             RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("80000000"), 128);
 
         QVERIFY(!parser.push(chunkSizeHighBit, &messages, &error));
+        QVERIFY(error.contains(QStringLiteral("chunk size"), Qt::CaseInsensitive));
+        QCOMPARE(parser.inputChunkSize(), 128);
+    }
+
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray shortChunkSize =
+            RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("000004"), 128);
+
+        QVERIFY(!parser.push(shortChunkSize, &messages, &error));
+        QVERIFY(error.contains(QStringLiteral("malformed"), Qt::CaseInsensitive));
+        QVERIFY(error.contains(QStringLiteral("chunk size"), Qt::CaseInsensitive));
+        QCOMPARE(parser.inputChunkSize(), 128);
+    }
+
+    {
+        RtmpChunkParser parser;
+        QList<RtmpMessage> messages;
+        QString error;
+
+        const QByteArray longChunkSize =
+            RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("0000000400"), 128);
+
+        QVERIFY(!parser.push(longChunkSize, &messages, &error));
+        QVERIFY(error.contains(QStringLiteral("malformed"), Qt::CaseInsensitive));
         QVERIFY(error.contains(QStringLiteral("chunk size"), Qt::CaseInsensitive));
         QCOMPARE(parser.inputChunkSize(), 128);
     }
