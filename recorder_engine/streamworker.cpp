@@ -81,10 +81,14 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     // SAME offset even if the UI thread changes it mid-pulse (keeps A/V locked).
     const int64_t trimMs = m_trimOffsetMs.load(std::memory_order_relaxed);
 
+    // Snapshot the jitter window once per pulse too, so video + audio of this tick
+    // share one value even if a URL change flips it mid-pulse (keeps A/V locked).
+    const int64_t jitterMs = m_activeJitterWindowMs.load(std::memory_order_relaxed);
+
     // Publish this tick's jitter-pull gate for the capture thread's
     // queue pre-drain (see captureLoop).
     m_lastTickTargetMs.store(
-        qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - kJitterBufferMs - trimMs),
+        qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - jitterMs - trimMs),
         std::memory_order_relaxed);
 
     if (!m_persistentEncCtx) return;
@@ -110,11 +114,11 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
         m_captureThread = std::thread([this]() { this->captureLoop(); });
     }
 
-    processEncoderTick(m_persistentEncCtx, streamTimeMs, trimMs);
+    processEncoderTick(m_persistentEncCtx, streamTimeMs, trimMs, jitterMs);
 }
 
-void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs,
-                                      int64_t trimMs) {
+void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
+                                      int64_t jitterMs) {
     AVPacket* outPkt = av_packet_alloc();
     bool havePacket = false;
     int track = -1;
@@ -139,7 +143,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // ALWAYS do jitter pull to keep m_latestFrame fresh, even when
         // not assigned to a view.  This ensures frames are ready the
         // instant this source gets mapped to a view.
-        int64_t targetTimeMs = currentRecordingTimeMs - kJitterBufferMs - trimMs;
+        int64_t targetTimeMs = currentRecordingTimeMs - jitterMs - trimMs;
         if (targetTimeMs < 0) targetTimeMs = 0;
 
         while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
@@ -198,7 +202,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     // Write this tick's worth of audio for the assigned view track
     // (sample-accurate cursor, silence-filled where capture had nothing).
-    writeAudioForTick(currentRecordingTimeMs, track, trimMs);
+    writeAudioForTick(currentRecordingTimeMs, track, trimMs, jitterMs);
 }
 
 void StreamWorker::captureLoop() {
@@ -212,6 +216,17 @@ void StreamWorker::captureLoop() {
 
         QString currentUrl;
         { QMutexLocker locker(&m_urlMutex); currentUrl = m_url; }
+
+        {
+            // Right-size the jitter window for this source's transport. SRT (native
+            // or ffmpeg) pre-buffers via TSBPD, so it needs only a small floor.
+            int srtFloor = kSrtJitterFloorMs;
+            const int envFloor = qEnvironmentVariableIntValue("OLR_SRT_JITTER_MS");
+            if (envFloor > 0) srtFloor = envFloor;
+            m_activeJitterWindowMs.store(
+                jitterWindowMs(QUrl(currentUrl).scheme().toLower(), srtFloor, kJitterBufferMs),
+                std::memory_order_relaxed);
+        }
 
         if (nativeSuppressedUrl != currentUrl) {
             nativeSuppressedUrl = currentUrl;
@@ -497,13 +512,14 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
     }
 }
 
-void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs) {
+void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs,
+                                     int64_t jitterMs) {
     // Audio shares the video path's jitter delay so both land on the
     // same timeline: a video frame written at file-time T shows source
     // content from T - jitter.  The cursor runs on the FILE timeline;
     // the FIFO holds source-timeline samples, so file position P maps
     // to FIFO position P - jitter.
-    const int64_t jitterSamples = int64_t(kJitterBufferMs) * kAudioSampleRate / 1000;
+    const int64_t jitterSamples = jitterMs * kAudioSampleRate / 1000;
     const int64_t trimSamples = trimMs * kAudioSampleRate / 1000;
     const int64_t targetEnd = recordingTimeMs * kAudioSampleRate / 1000;
     if (targetEnd <= 0) return;
