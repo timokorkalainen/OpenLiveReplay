@@ -9,6 +9,8 @@ class TestSettingsManager : public QObject {
     Q_OBJECT
 private slots:
     void roundTripPreservesEverything();
+    void roundTripPreservesFractionalFps();
+    void loadLegacyIntegerFps();
     void loadClampsTelemetryDelayMs();
     void loadMissingFileReturnsFalse();
     void loadMalformedJsonReturnsFalse();
@@ -24,7 +26,8 @@ AppSettings TestSettingsManager::sampleSettings() {
     s.fileName = QStringLiteral("match_01");
     s.videoWidth = 1280;
     s.videoHeight = 720;
-    s.fps = 50;
+    s.fpsNum = 50;
+    s.fpsDen = 1;
     s.multiviewCount = 6;
     s.showTimeOfDay = true;
     s.importSettingsUrl = QStringLiteral("https://provider.example/project-settings.json");
@@ -81,7 +84,8 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.fileName, in.fileName);
     QCOMPARE(out.videoWidth, in.videoWidth);
     QCOMPARE(out.videoHeight, in.videoHeight);
-    QCOMPARE(out.fps, in.fps);
+    QCOMPARE(out.fpsNum, in.fpsNum);
+    QCOMPARE(out.fpsDen, in.fpsDen);
     QCOMPARE(out.audioOutputLatencyMs, in.audioOutputLatencyMs);
     QCOMPARE(out.multiviewCount, in.multiviewCount);
     QCOMPARE(out.showTimeOfDay, in.showTimeOfDay);
@@ -111,6 +115,43 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.streamDeckKeyMaps, in.streamDeckKeyMaps);
     QCOMPARE(out.streamDeckDialPressMaps, in.streamDeckDialPressMaps);
     QCOMPARE(out.streamDeckDialRotateMaps, in.streamDeckDialRotateMaps);
+}
+
+void TestSettingsManager::roundTripPreservesFractionalFps() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("settings.json"));
+
+    SettingsManager mgr;
+    AppSettings in;
+    in.fpsNum = 30000;
+    in.fpsDen = 1001; // 29.97
+    QVERIFY(mgr.save(path, in));
+
+    AppSettings out;
+    QVERIFY(mgr.load(path, out));
+
+    QCOMPARE(out.fpsNum, 30000);
+    QCOMPARE(out.fpsDen, 1001);
+}
+
+void TestSettingsManager::loadLegacyIntegerFps() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("settings.json"));
+
+    // Legacy config: a bare integer "fps" with no fpsNum/fpsDen.
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(QJsonDocument(QJsonObject{{"fps", 25}}).toJson());
+    f.close();
+
+    SettingsManager mgr;
+    AppSettings out;
+    QVERIFY(mgr.load(path, out));
+
+    QCOMPARE(out.fpsNum, 25);
+    QCOMPARE(out.fpsDen, 1);
 }
 
 void TestSettingsManager::loadClampsTelemetryDelayMs() {

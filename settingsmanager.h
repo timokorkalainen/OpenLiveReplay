@@ -29,7 +29,8 @@ struct AppSettings {
     QString fileName;
     int videoWidth = 1920;
     int videoHeight = 1080;
-    int fps = 30;
+    int fpsNum = 30;
+    int fpsDen = 1;
     int multiviewCount = 4;
     bool showTimeOfDay = false;
     int audioOutputLatencyMs = 0; // playback output-device latency comp, ms (0..500)

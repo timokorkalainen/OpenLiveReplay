@@ -198,7 +198,7 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_configPath = getSettingsPath("config.json");
     m_transport = new PlaybackTransport(this);
     m_transport->seek(0);
-    m_transport->setFps(m_currentSettings.fps);
+    m_transport->setFps(FrameRate{m_currentSettings.fpsNum, m_currentSettings.fpsDen}.roundedFps());
     connect(m_transport, &PlaybackTransport::posChanged, this, [this]() {
         updateXTouchDisplay();
     });
@@ -651,7 +651,37 @@ QString UIManager::saveLocation() const { return m_currentSettings.saveLocation;
 QString UIManager::fileName() const { return m_currentSettings.fileName; }
 int UIManager::recordWidth() const { return m_currentSettings.videoWidth; }
 int UIManager::recordHeight() const { return m_currentSettings.videoHeight; }
-int UIManager::recordFps() const { return m_currentSettings.fps; }
+int UIManager::recordFps() const {
+    return FrameRate{m_currentSettings.fpsNum, m_currentSettings.fpsDen}.roundedFps();
+}
+
+QStringList UIManager::frameRatePresetLabels() const {
+    QStringList out;
+    for (const FrameRatePreset& p : frameRatePresets())
+        out << QString::fromLatin1(p.label);
+    return out;
+}
+
+int UIManager::frameRateIndex() const {
+    const FrameRate cur{m_currentSettings.fpsNum, m_currentSettings.fpsDen};
+    const auto& presets = frameRatePresets();
+    for (size_t i = 0; i < presets.size(); ++i)
+        if (presets[i].rate == cur) return int(i);
+    return -1; // a non-preset rate loaded from config
+}
+
+void UIManager::setFrameRateIndex(int index) {
+    if (m_replayManager && m_replayManager->isRecording()) return;
+    const auto& presets = frameRatePresets();
+    if (index < 0 || index >= int(presets.size())) return;
+    const FrameRate r = presets[size_t(index)].rate;
+    if (m_currentSettings.fpsNum == r.num && m_currentSettings.fpsDen == r.den) return;
+    m_currentSettings.fpsNum = r.num;
+    m_currentSettings.fpsDen = r.den;
+    if (m_replayManager) m_replayManager->setFrameRate(r);
+    if (m_transport) m_transport->setFps(r.roundedFps());
+    emit frameRateChanged();
+}
 int UIManager::multiviewCount() const { return m_currentSettings.multiviewCount; }
 bool UIManager::isRecording() const { return m_replayManager->isRecording(); }
 qint64 UIManager::recordingStartEpochMs() const {
@@ -1212,13 +1242,15 @@ void UIManager::setRecordFps(int fps) {
     // raising corrupts the timeline. Refuse while recording; the QML SpinBox
     // also disables, but guard the engine in case that's bypassed.
     if (m_replayManager && m_replayManager->isRecording()) return;
-    if (m_currentSettings.fps != fps) {
-        m_currentSettings.fps = fps;
+    // The remote control API speaks integer fps; map it onto a 1/1 rational.
+    if (m_currentSettings.fpsNum != fps || m_currentSettings.fpsDen != 1) {
+        m_currentSettings.fpsNum = fps;
+        m_currentSettings.fpsDen = 1;
         m_replayManager->setFps(fps);
         if (m_transport) {
             m_transport->setFps(fps);
         }
-        emit recordFpsChanged();
+        emit frameRateChanged();
     }
 }
 
@@ -1885,12 +1917,14 @@ void UIManager::loadSettings() {
         m_replayManager->setBaseFileName(m_currentSettings.fileName);
         m_replayManager->setVideoWidth(m_currentSettings.videoWidth);
         m_replayManager->setVideoHeight(m_currentSettings.videoHeight);
-        m_replayManager->setFps(m_currentSettings.fps);
+        m_replayManager->setFrameRate(
+            FrameRate{m_currentSettings.fpsNum, m_currentSettings.fpsDen});
         m_currentSettings.multiviewCount = qBound(1, m_currentSettings.multiviewCount, 16);
         ensureSourceEnabledSize();
         syncActiveStreams();
         if (m_transport) {
-            m_transport->setFps(m_currentSettings.fps);
+            m_transport->setFps(
+                FrameRate{m_currentSettings.fpsNum, m_currentSettings.fpsDen}.roundedFps());
         }
 
         m_midiBindings.clear();
@@ -1924,7 +1958,7 @@ void UIManager::loadSettings() {
         emit fileNameChanged();
         emit recordWidthChanged();
         emit recordHeightChanged();
-        emit recordFpsChanged();
+        emit frameRateChanged();
         emit multiviewCountChanged();
         emit timeOfDayModeChanged();
         emit importSettingsUrlChanged();
@@ -2154,7 +2188,7 @@ void UIManager::updateXTouchDisplay() {
     int minutes = 0;
     int seconds = 0;
     int frames = 0;
-    const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
+    const int fps = recordFps() > 0 ? recordFps() : 30;
 
     const qint64 startEpochMs = m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
     const bool showTimeOfDay = m_currentSettings.showTimeOfDay && startEpochMs > 0;
@@ -2219,7 +2253,7 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
     if (m_providers.isEmpty()) return;
 
     const QString projectName = sanitizeFileToken(m_currentSettings.fileName);
-    const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
+    const int fps = recordFps() > 0 ? recordFps() : 30;
 
     const qint64 startEpochMs = m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
     const qint64 playheadEpochMs = (startEpochMs > 0) ? (startEpochMs + playheadMs) : QDateTime::currentMSecsSinceEpoch();
@@ -2318,7 +2352,7 @@ QString UIManager::playbackTimecode()
             .toString(QStringLiteral("HH:mm:ss"));
     }
     const qint64 ms = pos < 0 ? 0 : pos;
-    const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
+    const int fps = recordFps() > 0 ? recordFps() : 30;
     const qint64 totalSeconds = ms / 1000;
     const int frames = int(double(ms % 1000) / (1000.0 / double(fps)));
     return QStringLiteral("%1:%2:%3.%4")

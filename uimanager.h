@@ -13,6 +13,7 @@
 #include <vector>
 #include "settingsmanager.h"
 #include "project/projectsettingsimporter.h"
+#include "recorder_engine/framerate.h"
 #include "recorder_engine/replaymanager.h"
 #include "recorder_engine/ingest/ingestsession.h"
 #include "playback/frameprovider.h"
@@ -40,7 +41,10 @@ class UIManager : public QObject {
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
     Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs
                    NOTIFY audioOutputLatencyChanged)
-    Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
+    Q_PROPERTY(int recordFps READ recordFps NOTIFY frameRateChanged)
+    Q_PROPERTY(QStringList frameRatePresetLabels READ frameRatePresetLabels CONSTANT)
+    Q_PROPERTY(
+        int frameRateIndex READ frameRateIndex WRITE setFrameRateIndex NOTIFY frameRateChanged)
     Q_PROPERTY(int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
@@ -98,6 +102,9 @@ public:
     int recordWidth() const;
     int recordHeight() const;
     int recordFps() const;
+    QStringList frameRatePresetLabels() const;
+    int frameRateIndex() const;
+    void setFrameRateIndex(int index);
     int audioOutputLatencyMs() const;
     void setAudioOutputLatencyMs(int ms);
     int multiviewCount() const;
@@ -241,7 +248,7 @@ signals:
     void fileNameChanged();
     void recordWidthChanged();
     void recordHeightChanged();
-    void recordFpsChanged();
+    void frameRateChanged();
     void audioOutputLatencyChanged();
     void multiviewCountChanged();
     void recordingStatusChanged();
