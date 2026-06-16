@@ -35,12 +35,13 @@ if(OLR_FFMPEG_SRT_PREFIX)
     message(STATUS "OpenLiveReplay tests: SRT ffmpeg prefix = ${OLR_FFMPEG_SRT_PREFIX}")
 endif()
 
-# --- Engine sources that need NO FFmpeg (pure Qt Core) ----------------------
+# --- Lightweight engine sources used by fast unit tests ---------------------
 qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/recordingclock.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xaccessunit.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeframecopy.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.h"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.cpp"
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
@@ -51,9 +52,12 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/telemetry/telemetryclient.cpp"
     "${CMAKE_SOURCE_DIR}/streamdeck/streamdeckmappingstore.cpp"
 )
-target_include_directories(olr_test_core PUBLIC "${CMAKE_SOURCE_DIR}")
+target_include_directories(olr_test_core PUBLIC
+    "${CMAKE_SOURCE_DIR}"
+    "${OLR_FFMPEG_INCLUDE}")
+target_link_directories(olr_test_core PUBLIC "${OLR_FFMPEG_LIBDIR}")
 target_link_libraries(olr_test_core
-    PUBLIC Qt6::Core Qt6::Network
+    PUBLIC Qt6::Core Qt6::Network avutil
     PRIVATE olr_warnings olr_sanitize)
 if(WIN32)
     target_link_libraries(olr_test_core PRIVATE ws2_32)

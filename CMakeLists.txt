@@ -76,6 +76,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/audiotoolboxaacdecoder.h
+        recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
         recorder_engine/ingest/nativevideodecoder.h
         recorder_engine/ingest/nativesrtaddress.h recorder_engine/ingest/nativesrtaddress.cpp
         recorder_engine/ingest/nativesrtingestsession.h
