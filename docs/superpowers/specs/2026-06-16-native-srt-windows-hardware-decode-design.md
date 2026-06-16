@@ -207,21 +207,24 @@ Integration tests:
 - HEVC absent test should skip or assert graceful fallback, not fail the suite.
 
 The Windows native SRT label should match the Apple native SRT parity set where
-the existing scripts apply:
+the existing scripts apply, without duplicating scripts. Prefer one shared
+CMake registration helper for the native SRT parity set, with the platform only
+selecting the label and any platform-specific environment:
 
 ```text
-e2e_native_windows_srt_smoke
-e2e_native_windows_srt_4cam
-e2e_native_windows_srt_sync
-e2e_native_windows_srt_trim
-e2e_native_windows_srt_connect
+e2e_native_srt_smoke
+e2e_native_srt_4cam
+e2e_native_srt_sync
+e2e_native_srt_trim
+e2e_native_srt_connect
 ```
 
-These tests should run with `OLR_NATIVE_SRT=1` and should not require an
-SRT-enabled FFmpeg build for ingest. FFmpeg and `srt-live-transmit` are still
-allowed as local test producers. As with the Apple native label, fallback to
-FFmpeg ingest should fail the content checks when the build is configured
-without FFmpeg SRT support.
+On Apple, the label remains `native-apple-ingest`. On Windows, the same native
+SRT test names should use `native-windows-ingest`. These tests should run with
+`OLR_NATIVE_SRT=1` and should not require an SRT-enabled FFmpeg build for
+ingest. FFmpeg and `srt-live-transmit` are still allowed as local test
+producers. As with the Apple native label, fallback to FFmpeg ingest should fail
+the content checks when the build is configured without FFmpeg SRT support.
 
 HEVC gets separate coverage because the current SRT e2e scripts generate H.264
 with `libx264`. Add an HEVC producer variant only after the H.264 parity label is
