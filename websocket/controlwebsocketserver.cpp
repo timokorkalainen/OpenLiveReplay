@@ -109,6 +109,8 @@ void ControlWebSocketServer::handleNewConnection() {
         return;
     }
 
+    socket->setProperty("controlClientId",
+                        QString::number(reinterpret_cast<quintptr>(socket)));
     m_sockets.insert(socket);
 
     connect(socket, &QWebSocket::textMessageReceived, this, &ControlWebSocketServer::handleTextMessage);
@@ -141,7 +143,11 @@ void ControlWebSocketServer::handleTextMessage(const QString &message) {
         return;
     }
 
-    const auto result = m_adapter->executeCommand(parsed.message.name, validated.normalizedArgs);
+    QJsonObject commandArgs = validated.normalizedArgs;
+    commandArgs.insert(QStringLiteral("_clientId"),
+                       socket->property("controlClientId").toString());
+
+    const auto result = m_adapter->executeCommand(parsed.message.name, commandArgs);
     sendJson(result.ok ? ControlProtocol::ack(parsed.message.id) :
                         ControlProtocol::ackError(parsed.message.id, result.code, result.message),
              socket);
@@ -159,6 +165,14 @@ void ControlWebSocketServer::handleBinaryMessage(const QByteArray &) {
 void ControlWebSocketServer::handleSocketDisconnected() {
     auto socket = qobject_cast<QWebSocket *>(sender());
     if (!socket) return;
+
+    if (m_adapter) {
+        QJsonObject releaseArgs;
+        releaseArgs.insert(QStringLiteral("active"), false);
+        releaseArgs.insert(QStringLiteral("_clientId"),
+                           socket->property("controlClientId").toString());
+        m_adapter->executeCommand(QStringLiteral("transport.holdSpeed"), releaseArgs);
+    }
 
     m_sockets.remove(socket);
     socket->deleteLater();

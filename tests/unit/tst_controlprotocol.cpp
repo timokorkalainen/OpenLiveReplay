@@ -15,6 +15,8 @@ private slots:
     void rejectsSeekWithFractionalPosition();
     void rejectsSeekWithoutPosition();
     void validatesActionDispatchDefaultsPressed();
+    void rejectsActionDispatchForShuttleId();
+    void validatesActionShuttleDelta();
     void buildsSuccessAck();
     void buildsFailureAck();
     void buildsErrorWithoutId();
@@ -123,6 +125,35 @@ void TestControlProtocol::validatesActionDispatchDefaultsPressed() {
     QVERIFY(validation.ok);
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("actionId")).toInt(), 0);
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("pressed")).toBool(), true);
+}
+
+void TestControlProtocol::rejectsActionDispatchForShuttleId() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("action-shuttle-wrong"),
+        QStringLiteral("action.dispatch"),
+        QJsonObject{{QStringLiteral("actionId"), 10}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("action.shuttle")));
+}
+
+void TestControlProtocol::validatesActionShuttleDelta() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("shuttle-1"),
+        QStringLiteral("action.shuttle"),
+        QJsonObject{{QStringLiteral("delta"), -1}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("delta")).toInt(), -1);
 }
 
 void TestControlProtocol::buildsSuccessAck() {

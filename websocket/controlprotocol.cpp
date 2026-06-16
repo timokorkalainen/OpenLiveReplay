@@ -301,6 +301,9 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
         if (!hasInteger(args, QStringLiteral("actionId"))) {
             return invalid(QStringLiteral("action.dispatch requires integer args.actionId"));
         }
+        if (args.value(QStringLiteral("actionId")).toInt() == 10) {
+            return invalid(QStringLiteral("action.dispatch actionId 10 requires action.shuttle with integer args.delta"));
+        }
         QJsonObject normalized = args;
         if (!normalized.contains(QStringLiteral("pressed"))) {
             normalized.insert(QStringLiteral("pressed"), true);
@@ -309,10 +312,10 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
         }
         return valid(normalized);
     }
-    if (name == QStringLiteral("action.jog")) {
+    if (name == QStringLiteral("action.jog") || name == QStringLiteral("action.shuttle")) {
         return hasInteger(args, QStringLiteral("delta"))
             ? valid(args)
-            : invalid(QStringLiteral("action.jog requires integer args.delta"));
+            : invalid(name + QStringLiteral(" requires integer args.delta"));
     }
 
     ControlProtocol::CommandValidation validation;

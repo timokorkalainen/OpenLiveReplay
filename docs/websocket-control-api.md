@@ -94,6 +94,15 @@ Jog one frame:
 { "type": "command", "id": "jog-1", "name": "action.jog", "args": { "delta": 1 } }
 ```
 
+Shuttle one detent:
+
+```json
+{ "type": "command", "id": "shuttle-1", "name": "action.shuttle", "args": { "delta": 1 } }
+```
+
+StreamDeck action id `10` is a shuttle dial action and requires `action.shuttle`
+with a `delta`; sending it through `action.dispatch` is rejected.
+
 ## Common Commands
 
 - `transport.playPause`

@@ -169,21 +169,23 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
         }
     } else if (name == QStringLiteral("transport.holdSpeed")) {
         const bool active = args.value(QStringLiteral("active")).toBool();
+        const QString clientId = args.value(QStringLiteral("_clientId")).toString();
         if (!active) {
-            if (!m_holdSpeedActive) {
+            auto holdIt = m_holdSpeedByClient.find(clientId);
+            if (holdIt == m_holdSpeedByClient.end() || !holdIt.value().active) {
                 return CommandResult::success();
             }
             if (transport) {
-                transport->setPlaying(m_holdSpeedWasPlaying);
+                transport->setPlaying(holdIt.value().wasPlaying);
                 transport->setSpeed(1.0);
             }
-            m_holdSpeedActive = false;
-            m_holdSpeedWasPlaying = false;
+            m_holdSpeedByClient.remove(clientId);
         } else {
             if (transport) {
-                if (!m_holdSpeedActive) {
-                    m_holdSpeedWasPlaying = transport->isPlaying();
-                    m_holdSpeedActive = true;
+                HoldSpeedState &hold = m_holdSpeedByClient[clientId];
+                if (!hold.active) {
+                    hold.wasPlaying = transport->isPlaying();
+                    hold.active = true;
                 }
                 transport->setSpeed(args.value(QStringLiteral("speed")).toDouble());
                 transport->setPlaying(true);
@@ -295,6 +297,8 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
                                             args.value(QStringLiteral("pressed")).toBool());
     } else if (name == QStringLiteral("action.jog")) {
         m_uiManager->jogExternal(args.value(QStringLiteral("delta")).toInt());
+    } else if (name == QStringLiteral("action.shuttle")) {
+        m_uiManager->shuttleExternal(args.value(QStringLiteral("delta")).toInt());
     } else {
         return CommandResult::failure(QStringLiteral("unknown_command"), QStringLiteral("Unknown command"));
     }
