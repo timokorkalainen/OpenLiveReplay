@@ -73,24 +73,32 @@ to_msys() {
 }
 
 # ------------------------------------------------------------------ toolchain
-QT_MINGW_DIR="${QT_MINGW_DIR:-C:/Qt/Tools/mingw1310_64}"
+# MinGW root: explicit QT_MINGW_DIR, else derive from a Qt kit (QT_ROOT_DIR set
+# by install-qt-action in CI), else the default Qt-installer layout. No MinGW or
+# Qt version is hard-coded — all discovered or overridden.
+newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
+if [ -z "${QT_MINGW_DIR:-}" ]; then
+    if [ -n "${QT_ROOT_DIR:-}" ]; then
+        QT_MINGW_DIR="$(newest "$QT_ROOT_DIR"/../../Tools/mingw*_64)"
+    fi
+    [ -n "${QT_MINGW_DIR:-}" ] || QT_MINGW_DIR="$(newest C:/Qt/Tools/mingw*_64)"
+fi
+[ -n "${QT_MINGW_DIR:-}" ] && [ -x "$QT_MINGW_DIR/bin/gcc.exe" ] || {
+    echo "ERROR: MinGW not found; set QT_MINGW_DIR or QT_ROOT_DIR" >&2; exit 1; }
 export PATH="$(to_msys "$QT_MINGW_DIR")/bin:$PATH"
 
 if [ -z "${CMAKE_BIN:-}" ]; then
-    if command -v cmake >/dev/null 2>&1; then CMAKE_BIN="$(command -v cmake)";
-    elif [ -x "C:/Qt/Tools/CMake_64/bin/cmake.exe" ]; then CMAKE_BIN="C:/Qt/Tools/CMake_64/bin/cmake.exe";
-    else echo "ERROR: cmake not found; set CMAKE_BIN" >&2; exit 1; fi
+    CMAKE_BIN="$(command -v cmake || true)"
+    [ -n "$CMAKE_BIN" ] || CMAKE_BIN="$(newest C:/Qt/Tools/CMake*/bin/cmake.exe)"
 fi
+[ -n "${CMAKE_BIN:-}" ] || { echo "ERROR: cmake not found; set CMAKE_BIN or add to PATH" >&2; exit 1; }
 if [ -z "${NINJA_BIN:-}" ]; then
-    if command -v ninja >/dev/null 2>&1; then NINJA_BIN="$(command -v ninja)";
-    elif [ -x "C:/Qt/Tools/Ninja/ninja.exe" ]; then NINJA_BIN="C:/Qt/Tools/Ninja/ninja.exe";
-    else echo "ERROR: ninja not found; set NINJA_BIN" >&2; exit 1; fi
+    NINJA_BIN="$(command -v ninja || true)"
+    [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest C:/Qt/Tools/Ninja/ninja.exe)"
 fi
+[ -n "${NINJA_BIN:-}" ] || { echo "ERROR: ninja not found; set NINJA_BIN or add to PATH" >&2; exit 1; }
 GCC_BIN="$QT_MINGW_DIR/bin/gcc.exe"
 GXX_BIN="$QT_MINGW_DIR/bin/g++.exe"
-for tool in "$GCC_BIN" "$GXX_BIN"; do
-    [ -x "$tool" ] || { echo "ERROR: missing $tool (set QT_MINGW_DIR)" >&2; exit 1; }
-done
 NPROC="$(nproc 2>/dev/null || echo 8)"
 
 echo "[win-srt] toolchain:"

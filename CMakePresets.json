@@ -18,12 +18,22 @@
         "OLR_FFMPEG_ROOT": "$env{OLR_FFMPEG_ROOT}",
         "OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}"
       }
+    },
+    {
+      "name": "macos-release",
+      "displayName": "macOS (Release)",
+      "description": "macOS desktop build. FFmpeg + SRT come from Homebrew; Qt from OLR_QT_ROOT (or QT_ROOT_DIR). ninja from PATH.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PREFIX_PATH": "$env{OLR_QT_ROOT}"
+      }
     }
   ],
   "buildPresets": [
-    {
-      "name": "windows-mingw-release",
-      "configurePreset": "windows-mingw-release"
-    }
+    { "name": "windows-mingw-release", "configurePreset": "windows-mingw-release" },
+    { "name": "macos-release", "configurePreset": "macos-release" }
   ]
 }
