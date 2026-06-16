@@ -195,12 +195,12 @@ jobs:
         if: always()
         run: ccache --show-stats
 
-      - name: Run tests
+      - name: Run short PR tests
         working-directory: build
-        # -LE sync-report excludes the report-only frame-sync scoreboard tests:
-        # they are on-demand diagnostics (always exit 0), not gates. sync_harness
-        # is still compiled by the build step above, so it stays regression-proof.
-        run: ctest --output-on-failure --repeat until-pass:2 -LE 'sync-report|srt|native-apple-ingest'
+        # PR CI runs only the fast "ci" CTest label. Full e2e coverage stays in
+        # the local pre-push hook, while local-only transport/report labels are
+        # still excluded defensively.
+        run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest'
 
       # clang-tidy is advisory: it reports on changed first-party files using the
       # generated compile_commands.json but never fails the build (yet).
@@ -313,13 +313,13 @@ jobs:
           - sanitizer: "address;undefined"
             label: asan-ubsan
             advisory: false
-            build_targets: "tst_muxer tst_mpegtsparser tst_h26xaccessunit tst_audiotoolboxaacdecoder tst_audioframequeue record_harness"
-            ctest_regex: "^(tst_muxer|tst_mpegtsparser|tst_h26xaccessunit|tst_audiotoolboxaacdecoder|tst_audioframequeue|e2e_record_mono)$"
+            build_targets: "tst_muxer tst_mpegtsparser tst_h26xaccessunit tst_audiotoolboxaacdecoder tst_audioframequeue"
+            ctest_regex: "^(tst_muxer|tst_mpegtsparser|tst_h26xaccessunit|tst_audiotoolboxaacdecoder|tst_audioframequeue)$"
           - sanitizer: "thread"
             label: tsan
             advisory: true
-            build_targets: "record_harness play_harness"
-            ctest_regex: "^(e2e_play_storm)$"
+            build_targets: "tst_trackbuffer tst_audioframequeue"
+            ctest_regex: "^(tst_trackbuffer|tst_audioframequeue)$"
     continue-on-error: ${{ matrix.advisory }}
     steps:
       - uses: actions/checkout@v4
@@ -384,10 +384,8 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1
-        # The full suite already runs uninstrumented in Build+Test. Keep
-        # sanitizer coverage to high-signal cases:
-        # - ASan+UBSan: mux/parser/audio primitives plus mono recording.
-        # - TSan: playback storm, which records a fixture and drives workers.
+        # Keep sanitizer coverage to high-signal unit cases. Slow e2e record/play
+        # drivers are local pre-push coverage, not CI coverage.
         run: ctest --output-on-failure --repeat until-pass:2 -R '${{ matrix.ctest_regex }}' -LE 'sync-report|srt|native-apple-ingest'
 
 # iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
