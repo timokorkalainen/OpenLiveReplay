@@ -29,6 +29,7 @@ private slots:
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
     void malformedLegacyVideoPacketStaysMalformed();
     void nativeRtmpAudioUsesVideoTimelineAnchor();
+    void nativeRtmpAudioDiscontinuityUsesFreshAudioAnchor();
 #endif
     void canConstructFfmpegSession();
     void nativeFailureReasonStartsEmpty();
@@ -244,6 +245,21 @@ void TestIngestBackendSelector::nativeRtmpAudioUsesVideoTimelineAnchor() {
 
     clockMs = 5000;
     QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
+}
+
+void TestIngestBackendSelector::nativeRtmpAudioDiscontinuityUsesFreshAudioAnchor() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    int64_t clockMs = 100;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    QCOMPARE(session.sourcePtsMsForVideo(0, 0), int64_t(100));
+    QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
+
+    clockMs = 5000;
+    QCOMPARE(session.sourcePtsMsForAudio(10000), int64_t(5000));
 }
 #endif
 

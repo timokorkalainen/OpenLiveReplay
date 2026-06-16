@@ -572,8 +572,8 @@ def main() -> int:
     parser.add_argument("--write-fragment", type=int, default=0)
     parser.add_argument("--write-fragment-delay", type=float, default=0.0)
     args = parser.parse_args()
-    if args.out_chunk_size <= 0:
-        parser.error("--out-chunk-size must be positive")
+    if args.out_chunk_size < 4:
+        parser.error("--out-chunk-size must be at least 4")
     if args.write_fragment < 0:
         parser.error("--write-fragment must be non-negative")
     if args.write_fragment_delay < 0:

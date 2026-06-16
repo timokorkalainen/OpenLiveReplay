@@ -951,7 +951,8 @@ int64_t NativeRtmpIngestSession::sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs)
 }
 
 int64_t NativeRtmpIngestSession::sourcePtsMsForAudio(qint64 ptsMs) {
-    bool needAnchor = m_firstAudioPtsMs < 0;
+    const bool firstAudioAnchor = m_firstAudioPtsMs < 0;
+    bool needAnchor = firstAudioAnchor;
     if (!needAnchor && m_prevAudioPtsMs >= 0) {
         const int64_t deltaMs = ptsMs - m_prevAudioPtsMs;
         if (deltaMs > kForwardJumpMs || deltaMs < kBackwardToleranceMs) {
@@ -965,7 +966,7 @@ int64_t NativeRtmpIngestSession::sourcePtsMsForAudio(qint64 ptsMs) {
     }
     const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
     if (needAnchor) {
-        if (m_anchorStreamTimeMs >= 0 && m_firstDtsMs >= 0) {
+        if (firstAudioAnchor && m_anchorStreamTimeMs >= 0 && m_firstDtsMs >= 0) {
             m_firstAudioPtsMs = m_firstDtsMs;
             m_audioAnchorStreamTimeMs = m_anchorStreamTimeMs;
         } else {
