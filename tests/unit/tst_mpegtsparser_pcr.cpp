@@ -72,7 +72,23 @@ class TestMpegTsParserPcr : public QObject {
 private slots:
     void extractsPcrFromPcrPid();
     void noPcrLeavesInfoUnset();
+    void pcrFlagOnNonPcrPidIgnored();
+    void adaptationWithoutPcrFlagLeavesUnset();
+    void discontinuitySurfacesOnPcrPid();
 };
+
+// Adaptation-only TS packet on `pid` with an explicit adaptation-flags byte and no
+// PCR payload (used to exercise the discontinuity_indicator and the PCR_flag guard).
+static QByteArray afFlagsPacket(quint16 pid, quint8 cc, quint8 flags) {
+    QByteArray pkt(188, char(0xff));
+    pkt[0] = char(0x47);
+    pkt[1] = char((pid >> 8) & 0x1f);
+    pkt[2] = char(pid & 0xff);
+    pkt[3] = char(0x20 | (cc & 0x0f));
+    pkt[4] = char(183);
+    pkt[5] = char(flags);
+    return pkt;
+}
 
 void TestMpegTsParserPcr::extractsPcrFromPcrPid() {
     MpegTsParser parser;
@@ -94,6 +110,45 @@ void TestMpegTsParserPcr::noPcrLeavesInfoUnset() {
     // A PAT packet (no adaptation PCR) must not report a PCR.
     parser.pushTsPacket(tsSection(0x0000, patSection(0x1000)), &pes, &info);
     QCOMPARE(info.pcr90k, qint64(-1));
+}
+
+void TestMpegTsParserPcr::pcrFlagOnNonPcrPidIgnored() {
+    MpegTsParser parser;
+    QList<PesPacket> pes;
+    const quint16 pmtPid = 0x1000, pcrPid = 0x0100, videoPid = 0x0100;
+    parser.pushTsPacket(tsSection(0x0000, patSection(pmtPid)), &pes);
+    parser.pushTsPacket(tsSection(pmtPid, pmtSection(pcrPid, videoPid)), &pes);
+
+    // A PCR carried on some OTHER pid must not be reported as the program PCR.
+    MpegTsParser::TsPacketInfo info;
+    parser.pushTsPacket(pcrPacket(0x0200, 0, 555555), &pes, &info);
+    QCOMPARE(info.pcr90k, qint64(-1));
+}
+
+void TestMpegTsParserPcr::adaptationWithoutPcrFlagLeavesUnset() {
+    MpegTsParser parser;
+    QList<PesPacket> pes;
+    const quint16 pmtPid = 0x1000, pcrPid = 0x0100, videoPid = 0x0100;
+    parser.pushTsPacket(tsSection(0x0000, patSection(pmtPid)), &pes);
+    parser.pushTsPacket(tsSection(pmtPid, pmtSection(pcrPid, videoPid)), &pes);
+
+    // Adaptation field on the PCR pid but PCR_flag (0x10) clear -> no PCR.
+    MpegTsParser::TsPacketInfo info;
+    parser.pushTsPacket(afFlagsPacket(pcrPid, 0, 0x00), &pes, &info);
+    QCOMPARE(info.pcr90k, qint64(-1));
+}
+
+void TestMpegTsParserPcr::discontinuitySurfacesOnPcrPid() {
+    MpegTsParser parser;
+    QList<PesPacket> pes;
+    const quint16 pmtPid = 0x1000, pcrPid = 0x0100, videoPid = 0x0100;
+    parser.pushTsPacket(tsSection(0x0000, patSection(pmtPid)), &pes);
+    parser.pushTsPacket(tsSection(pmtPid, pmtSection(pcrPid, videoPid)), &pes);
+
+    // discontinuity_indicator (0x80) on the PCR pid surfaces as info.discontinuity.
+    MpegTsParser::TsPacketInfo info;
+    parser.pushTsPacket(afFlagsPacket(pcrPid, 0, 0x80), &pes, &info);
+    QVERIFY(info.discontinuity);
 }
 
 QTEST_GUILESS_MAIN(TestMpegTsParserPcr)

@@ -408,8 +408,12 @@ void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
         m_tsBuffer.remove(0, kTsPacketSize);
         // PCR is the canonical shared anchor. A program discontinuity forces a
         // re-anchor; the first PCR (or, as a fallback, the first PES below) sets it.
+        // Also clear the per-stream jump trackers so the next unit's jump heuristic
+        // doesn't immediately discard the PCR re-anchor (keeps "PCR wins").
         if (tsInfo.discontinuity) {
             m_anchorTs90k = -1;
+            m_prevDts90k = -1;
+            m_prevAudioPts90k = -1;
         }
         if (m_anchorTs90k < 0 && tsInfo.pcr90k >= 0) {
             m_anchorTs90k = tsInfo.pcr90k;

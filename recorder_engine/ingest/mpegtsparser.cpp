@@ -103,7 +103,7 @@ bool MpegTsParser::pushTsPacket(const QByteArray& packet, QList<PesPacket>* comp
             discontinuity = (afFlags & 0x80) != 0;
             // PCR_flag (0x10): 6-byte PCR follows the flags byte. Surface only the
             // program PCR (on the PCR PID) — that is the shared A/V clock reference.
-            if (info && pid == m_pcrPid && (afFlags & 0x10) != 0 &&
+            if (info && pid == m_pcrPid && (afFlags & 0x10) != 0 && adaptationLength >= 7 &&
                 offset + 2 + 6 <= packet.size()) {
                 info->pcr90k =
                     readPcrBase90k(reinterpret_cast<const uchar*>(packet.constData()) + offset + 2);
