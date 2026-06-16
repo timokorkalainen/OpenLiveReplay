@@ -98,9 +98,9 @@ fi
 
 if [ "$fail" -ne 0 ]; then
     echo "--- harness stderr ---"
-    tail -n 80 "$HARNESS_ERR"
+    rtmp_redact_log "$HARNESS_ERR" | tail -n 80
     echo "--- RTMP server log ---"
-    cat "$SERVER_LOG"
+    rtmp_redact_log "$SERVER_LOG"
     exit 1
 fi
 

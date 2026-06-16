@@ -13,6 +13,10 @@ rtmp_require_tools() {
     command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit 0; }
 }
 
+rtmp_redact_log() {
+    sed -E "s#([?&][^=[:space:]'\"]+=)[^&[:space:]'\"]+#\\1<redacted>#g" "$@"
+}
+
 rtmp_url() {
     local url="${RTMP_SCHEME:-rtmp}://127.0.0.1:${1}/live/stream"
     if [ -n "${RTMP_URL_QUERY:-}" ]; then

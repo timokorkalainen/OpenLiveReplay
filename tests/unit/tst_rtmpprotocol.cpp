@@ -13,6 +13,35 @@ bool errorMentionsPreviousHeader(const QString& error) {
     return error.contains(QStringLiteral("previous"), Qt::CaseInsensitive) ||
            error.contains(QStringLiteral("continuation"), Qt::CaseInsensitive);
 }
+
+bool readConnectObjectString(const QByteArray& payload, const QString& wantedKey, QString* value) {
+    int offset = 0;
+    QString command;
+    double transactionId = 0;
+    if (!RtmpAmf0::readString(payload, &offset, &command) ||
+        !RtmpAmf0::readNumber(payload, &offset, &transactionId) || offset >= payload.size() ||
+        uchar(payload[offset]) != 0x03) {
+        return false;
+    }
+    ++offset;
+    while (offset + 3 <= payload.size()) {
+        if (uchar(payload[offset]) == 0 && uchar(payload[offset + 1]) == 0 &&
+            uchar(payload[offset + 2]) == 0x09) {
+            return false;
+        }
+        const int keySize =
+            (int(uchar(payload[offset])) << 8) | int(uchar(payload[offset + 1]));
+        offset += 2;
+        if (offset + keySize > payload.size()) return false;
+        const QString key = QString::fromUtf8(payload.constData() + offset, keySize);
+        offset += keySize;
+        if (key == wantedKey) {
+            return RtmpAmf0::readString(payload, &offset, value);
+        }
+        if (!RtmpAmf0::skipValue(payload, &offset)) return false;
+    }
+    return false;
+}
 } // namespace
 
 class TestRtmpProtocol : public QObject {
@@ -22,8 +51,11 @@ private slots:
     void amf0WritesStrictArrayForFourCcList();
     void rtmpUrlPartsPreserveSignedQueryInPlayPath();
     void rtmpUrlPartsPreserveEncodedPathAndQuery();
+    void rtmpUrlPartsPreserveEmptyQueryMarker();
     void rtmpUrlPartsUseAppAsPlayPathWhenPathHasNoStream();
+    void rtmpUrlPartsRejectHostOnlyUrls();
     void connectPayloadAdvertisesEnhancedCodecCapabilities();
+    void connectPayloadDefaultProfileAdvertisesOnlyAvcAac();
     void amf0SkipsEcmaArrayMetadata();
     void amf0SkipsStrictArray();
     void amf0RejectsMalformedObjectKeyWithoutAdvancingOffset();
@@ -111,6 +143,14 @@ void TestRtmpProtocol::rtmpUrlPartsPreserveEncodedPathAndQuery() {
     QCOMPARE(parts.tcUrl, QStringLiteral("rtmp://host/live"));
 }
 
+void TestRtmpProtocol::rtmpUrlPartsPreserveEmptyQueryMarker() {
+    const RtmpUrlParts parts =
+        RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmp://host/live/stream?")));
+    QCOMPARE(parts.app, QStringLiteral("live"));
+    QCOMPARE(parts.playPath, QStringLiteral("stream?"));
+    QCOMPARE(parts.tcUrl, QStringLiteral("rtmp://host/live"));
+}
+
 void TestRtmpProtocol::rtmpUrlPartsUseAppAsPlayPathWhenPathHasNoStream() {
     const RtmpUrlParts parts =
         RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmp://host/live?token=abc")));
@@ -119,15 +159,44 @@ void TestRtmpProtocol::rtmpUrlPartsUseAppAsPlayPathWhenPathHasNoStream() {
     QCOMPARE(parts.tcUrl, QStringLiteral("rtmp://host/live"));
 }
 
+void TestRtmpProtocol::rtmpUrlPartsRejectHostOnlyUrls() {
+    const RtmpUrlParts parts = RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmp://host")));
+    QVERIFY(!parts.isValid());
+}
+
 void TestRtmpProtocol::connectPayloadAdvertisesEnhancedCodecCapabilities() {
     const QByteArray payload =
-        RtmpAmf0::connectCommandPayload(QUrl(QStringLiteral("rtmp://127.0.0.1/live/stream")));
+        RtmpAmf0::connectCommandPayload(QUrl(QStringLiteral("rtmp://127.0.0.1/live/stream")),
+                                        RtmpConnectCodecProfile::EnhancedAvcHevcAac);
     QVERIFY(payload.contains("fourCcList"));
     QVERIFY(payload.contains("avc1"));
     QVERIFY(payload.contains("hvc1"));
     QVERIFY(payload.contains("mp4a"));
     QVERIFY(payload.contains("videoFourCcInfoMap"));
     QVERIFY(payload.contains("audioFourCcInfoMap"));
+}
+
+void TestRtmpProtocol::connectPayloadDefaultProfileAdvertisesOnlyAvcAac() {
+    const QByteArray payload =
+        RtmpAmf0::connectCommandPayload(QUrl(QStringLiteral("rtmp://127.0.0.1/live/stream")));
+
+    int offset = 0;
+    QString command;
+    double transactionId = 0;
+    QVERIFY(RtmpAmf0::readString(payload, &offset, &command));
+    QVERIFY(RtmpAmf0::readNumber(payload, &offset, &transactionId));
+    QCOMPARE(command, QStringLiteral("connect"));
+    QCOMPARE(transactionId, 1.0);
+
+    QString value;
+    QVERIFY(readConnectObjectString(payload, QStringLiteral("app"), &value));
+    QCOMPARE(value, QStringLiteral("live"));
+    QVERIFY(readConnectObjectString(payload, QStringLiteral("tcUrl"), &value));
+    QCOMPARE(value, QStringLiteral("rtmp://127.0.0.1/live"));
+    QVERIFY(payload.contains("fourCcList"));
+    QVERIFY(payload.contains("avc1"));
+    QVERIFY(payload.contains("mp4a"));
+    QVERIFY(!payload.contains("hvc1"));
 }
 
 void TestRtmpProtocol::amf0SkipsEcmaArrayMetadata() {

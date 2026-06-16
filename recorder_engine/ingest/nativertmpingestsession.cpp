@@ -40,7 +40,7 @@ NativeRtmpIngestSession::~NativeRtmpIngestSession() {
 bool NativeRtmpIngestSession::supportsUrl(const QUrl& url) {
     const QString scheme = url.scheme().toLower();
     return (scheme == QStringLiteral("rtmp") || scheme == QStringLiteral("rtmps")) &&
-           !url.host().isEmpty();
+           !url.host().isEmpty() && RtmpUrlParts::fromUrl(url).isValid();
 }
 
 bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
@@ -110,7 +110,9 @@ void NativeRtmpIngestSession::requestStop() {
 
 bool NativeRtmpIngestSession::connectAndPlay(QString* error) {
     if (!supportsUrl(m_url)) {
-        if (error) *error = QStringLiteral("Native RTMP supports rtmp:// and rtmps:// URLs only.");
+        if (error)
+            *error =
+                QStringLiteral("Native RTMP supports rtmp:// and rtmps:// URLs with an app path.");
         return false;
     }
 
@@ -173,7 +175,8 @@ bool NativeRtmpIngestSession::performHandshake(QString* error) {
 }
 
 bool NativeRtmpIngestSession::sendConnectCommand(QString* error) {
-    const QByteArray payload = RtmpAmf0::connectCommandPayload(m_url);
+    const QByteArray payload =
+        RtmpAmf0::connectCommandPayload(m_url, RtmpConnectCodecProfile::AvcAac);
     if (!sendMessage(3, kMessageCommandAmf0, 0, 0, payload, error)) {
         return false;
     }

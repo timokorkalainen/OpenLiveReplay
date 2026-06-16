@@ -120,7 +120,7 @@ RtmpUrlParts RtmpUrlParts::fromUrl(const QUrl& url) {
     parts.app = path.section('/', 0, 0);
     const QString rest = path.section('/', 1);
     parts.playPath = rest.isEmpty() ? parts.app : rest;
-    if (!url.query().isEmpty()) {
+    if (url.hasQuery()) {
         parts.playPath += QStringLiteral("?") + url.query(QUrl::FullyEncoded);
     }
     QUrl tc = url;
@@ -191,8 +191,22 @@ QByteArray RtmpAmf0::strictArray(const QList<QByteArray>& values) {
     return out;
 }
 
-QByteArray RtmpAmf0::connectCommandPayload(const QUrl& url) {
+QByteArray RtmpAmf0::connectCommandPayload(const QUrl& url,
+                                           RtmpConnectCodecProfile profile) {
     const RtmpUrlParts parts = RtmpUrlParts::fromUrl(url);
+    const bool includeHevc = profile == RtmpConnectCodecProfile::EnhancedAvcHevcAac;
+    QList<QByteArray> fourCcList = {
+        RtmpAmf0::string(QStringLiteral("avc1")),
+        RtmpAmf0::string(QStringLiteral("mp4a")),
+    };
+    QList<QPair<QString, QByteArray>> videoFourCcInfo = {
+        {QStringLiteral("avc1"), RtmpAmf0::number(1)},
+    };
+    if (includeHevc) {
+        fourCcList.insert(1, RtmpAmf0::string(QStringLiteral("hvc1")));
+        videoFourCcInfo.append({QStringLiteral("hvc1"), RtmpAmf0::number(1)});
+    }
+
     QByteArray payload;
     payload.append(RtmpAmf0::string(QStringLiteral("connect")));
     payload.append(RtmpAmf0::number(1));
@@ -207,16 +221,8 @@ QByteArray RtmpAmf0::connectCommandPayload(const QUrl& url) {
         {QStringLiteral("videoCodecs"), RtmpAmf0::number(252)},
         {QStringLiteral("videoFunction"), RtmpAmf0::number(1)},
         {QStringLiteral("fourCcList"),
-         RtmpAmf0::strictArray({
-             RtmpAmf0::string(QStringLiteral("avc1")),
-             RtmpAmf0::string(QStringLiteral("hvc1")),
-             RtmpAmf0::string(QStringLiteral("mp4a")),
-         })},
-        {QStringLiteral("videoFourCcInfoMap"),
-         RtmpAmf0::object({
-             {QStringLiteral("avc1"), RtmpAmf0::number(1)},
-             {QStringLiteral("hvc1"), RtmpAmf0::number(1)},
-         })},
+         RtmpAmf0::strictArray(fourCcList)},
+        {QStringLiteral("videoFourCcInfoMap"), RtmpAmf0::object(videoFourCcInfo)},
         {QStringLiteral("audioFourCcInfoMap"),
          RtmpAmf0::object({
              {QStringLiteral("mp4a"), RtmpAmf0::number(1)},

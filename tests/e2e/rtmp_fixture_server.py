@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import socket
 import ssl
 import struct
@@ -20,6 +21,10 @@ RTMP_VERSION = 3
 DEFAULT_CHUNK_SIZE = 128
 OUT_CHUNK_SIZE = 65536
 STREAM_ID = 1
+
+
+def redact_query_values(value: str) -> str:
+    return re.sub(r"([?&][^=\s'\"]+=)[^&\s'\"]+", r"\1<redacted>", value)
 
 
 def u24(value: int) -> bytes:
@@ -308,7 +313,9 @@ def run_server(args: argparse.Namespace) -> None:
                     playpath = "stream"
                 if args.expect_play_path and playpath != args.expect_play_path:
                     raise ValueError(
-                        f"play path mismatch: expected {args.expect_play_path!r}, got {playpath!r}"
+                        "play path mismatch: expected "
+                        f"{redact_query_values(args.expect_play_path)!r}, got "
+                        f"{redact_query_values(playpath)!r}"
                     )
                 if args.require_play_query and "?" not in playpath:
                     raise ValueError("play path omitted required query string")
