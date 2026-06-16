@@ -108,6 +108,7 @@ with a `delta`; sending it through `action.dispatch` is rejected.
 - `transport.playPause`
 - `transport.seek` with `{ "positionMs": 1200 }`
 - `transport.setSpeed` with `{ "speed": 0.5, "playing": true }`
+- `transport.holdSpeed` with `{ "active": true, "speed": 0.5 }` on press and `{ "active": false }` on release
 - `recording.toggle`
 - `view.showMultiview`
 - `view.selectFeed` with `{ "index": 0 }`

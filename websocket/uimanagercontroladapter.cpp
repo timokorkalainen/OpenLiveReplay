@@ -171,21 +171,25 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
         const bool active = args.value(QStringLiteral("active")).toBool();
         const QString clientId = args.value(QStringLiteral("_clientId")).toString();
         if (!active) {
-            auto holdIt = m_holdSpeedByClient.find(clientId);
-            if (holdIt == m_holdSpeedByClient.end() || !holdIt.value().active) {
+            if (m_holdSpeedClientId.isEmpty() || m_holdSpeedClientId != clientId) {
                 return CommandResult::success();
             }
             if (transport) {
-                transport->setPlaying(holdIt.value().wasPlaying);
+                transport->setPlaying(m_holdSpeedWasPlaying);
                 transport->setSpeed(1.0);
             }
-            m_holdSpeedByClient.remove(clientId);
+            m_holdSpeedClientId.clear();
+            m_holdSpeedWasPlaying = false;
         } else {
+            if (!m_holdSpeedClientId.isEmpty() && m_holdSpeedClientId != clientId) {
+                return CommandResult::failure(
+                    QStringLiteral("not_allowed"),
+                    QStringLiteral("Another hold speed command is already active"));
+            }
             if (transport) {
-                HoldSpeedState &hold = m_holdSpeedByClient[clientId];
-                if (!hold.active) {
-                    hold.wasPlaying = transport->isPlaying();
-                    hold.active = true;
+                if (m_holdSpeedClientId.isEmpty()) {
+                    m_holdSpeedWasPlaying = transport->isPlaying();
+                    m_holdSpeedClientId = clientId;
                 }
                 transport->setSpeed(args.value(QStringLiteral("speed")).toDouble());
                 transport->setPlaying(true);

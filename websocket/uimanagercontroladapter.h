@@ -3,7 +3,6 @@
 
 #include "controlapiadapter.h"
 
-#include <QHash>
 #include <QObject>
 
 class UIManager;
@@ -26,13 +25,9 @@ public:
     CommandResult executeCommand(const QString &name, const QJsonObject &args) override;
 
 private:
-    struct HoldSpeedState {
-        bool active = false;
-        bool wasPlaying = false;
-    };
-
     UIManager *m_uiManager = nullptr;
-    QHash<QString, HoldSpeedState> m_holdSpeedByClient;
+    QString m_holdSpeedClientId;
+    bool m_holdSpeedWasPlaying = false;
 };
 
 #endif

@@ -65,6 +65,7 @@ class TestControlWebSocketServer : public QObject {
 private slots:
     void sendsSnapshotAndTimecodeOnConnect();
     void dispatchesCommandAndSendsAck();
+    void addsClientIdToCommandsAndReleasesHoldOnDisconnect();
     void sendsErrorForBadJson();
     void publishEventBroadcastsToAllSockets();
     void rejectsBinaryMessageAsUnsupported();
@@ -112,6 +113,35 @@ void TestControlWebSocketServer::dispatchesCommandAndSendsAck() {
 
     QCOMPARE(adapter.lastCommand, QStringLiteral("transport.seek"));
     QCOMPARE(adapter.lastArgs.value(QStringLiteral("positionMs")).toInt(), 321);
+    QVERIFY(adapter.lastArgs.value(QStringLiteral("_clientId")).isString());
+    QVERIFY(!adapter.lastArgs.value(QStringLiteral("_clientId")).toString().isEmpty());
+}
+
+void TestControlWebSocketServer::addsClientIdToCommandsAndReleasesHoldOnDisconnect() {
+    ServerFakeAdapter adapter;
+    ControlWebSocketServer server(&adapter);
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QWebSocket socket;
+    QSignalSpy messages(&socket, &QWebSocket::textMessageReceived);
+    socket.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/api/ws").arg(server.serverPort())));
+
+    QTRY_COMPARE_WITH_TIMEOUT(messages.count(), 2, 2000);
+
+    socket.sendTextMessage(
+        QStringLiteral("{\"type\":\"command\",\"id\":\"hold-1\",\"name\":\"transport.holdSpeed\","
+                       "\"args\":{\"active\":true,\"speed\":0.5}}"));
+
+    QTRY_COMPARE_WITH_TIMEOUT(messages.count(), 3, 2000);
+    QCOMPARE(adapter.lastCommand, QStringLiteral("transport.holdSpeed"));
+    const QString clientId = adapter.lastArgs.value(QStringLiteral("_clientId")).toString();
+    QVERIFY(!clientId.isEmpty());
+
+    socket.close();
+
+    QTRY_COMPARE_WITH_TIMEOUT(adapter.lastArgs.value(QStringLiteral("active")).toBool(), false, 2000);
+    QCOMPARE(adapter.lastCommand, QStringLiteral("transport.holdSpeed"));
+    QCOMPARE(adapter.lastArgs.value(QStringLiteral("_clientId")).toString(), clientId);
 }
 
 void TestControlWebSocketServer::sendsErrorForBadJson() {

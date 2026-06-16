@@ -14,6 +14,8 @@ private slots:
     void validatesSeekArgsAcceptsLargeInteger();
     void rejectsSeekWithFractionalPosition();
     void rejectsSeekWithoutPosition();
+    void validatesHoldSpeedReleaseWithoutSpeed();
+    void rejectsHoldSpeedStartWithoutSpeed();
     void validatesActionDispatchDefaultsPressed();
     void rejectsActionDispatchForShuttleId();
     void validatesActionShuttleDelta();
@@ -110,6 +112,35 @@ void TestControlProtocol::rejectsSeekWithoutPosition() {
     QVERIFY(!validation.ok);
     QCOMPARE(validation.code, QStringLiteral("invalid_args"));
     QVERIFY(validation.message.contains(QStringLiteral("positionMs")));
+}
+
+void TestControlProtocol::validatesHoldSpeedReleaseWithoutSpeed() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("hold-release"),
+        QStringLiteral("transport.holdSpeed"),
+        QJsonObject{{QStringLiteral("active"), false}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("active")).toBool(), false);
+}
+
+void TestControlProtocol::rejectsHoldSpeedStartWithoutSpeed() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("hold-start"),
+        QStringLiteral("transport.holdSpeed"),
+        QJsonObject{{QStringLiteral("active"), true}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("speed")));
 }
 
 void TestControlProtocol::validatesActionDispatchDefaultsPressed() {

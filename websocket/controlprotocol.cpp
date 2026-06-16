@@ -159,11 +159,14 @@ ControlProtocol::CommandValidation ControlProtocol::validateCommand(const Contro
         return valid(args);
     }
     if (name == QStringLiteral("transport.holdSpeed")) {
-        if (!hasNumber(args, QStringLiteral("speed"))) {
-            return invalid(QStringLiteral("transport.holdSpeed requires number args.speed"));
-        }
         if (!hasBool(args, QStringLiteral("active"))) {
             return invalid(QStringLiteral("transport.holdSpeed requires boolean args.active"));
+        }
+        if (args.value(QStringLiteral("active")).toBool() && !hasNumber(args, QStringLiteral("speed"))) {
+            return invalid(QStringLiteral("transport.holdSpeed requires number args.speed when active"));
+        }
+        if (args.contains(QStringLiteral("speed")) && !hasNumber(args, QStringLiteral("speed"))) {
+            return invalid(QStringLiteral("transport.holdSpeed args.speed must be number"));
         }
         return valid(args);
     }
