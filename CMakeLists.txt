@@ -53,8 +53,9 @@ set(RTMIDI_API_DUMMY OFF CACHE BOOL "" FORCE)
 set(RTMIDI_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     rtmidi
-    GIT_REPOSITORY https://github.com/thestk/rtmidi.git
-    GIT_TAG 6.0.0
+    URL https://github.com/thestk/rtmidi/archive/refs/tags/6.0.0.tar.gz
+    URL_HASH SHA256=ef7bcda27fee6936b651c29ebe9544c74959d0b1583b716ce80a1c6fea7617f0
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(rtmidi)
 
