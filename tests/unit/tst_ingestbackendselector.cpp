@@ -2,6 +2,8 @@
 
 #include "recorder_engine/ingest/ffmpegingestsession.h"
 #include "recorder_engine/ingest/ingestsession.h"
+#include "recorder_engine/ingest/nativefallbackpolicy.h"
+#include "recorder_engine/ingest/nativesrtingestsession.h"
 
 class TestIngestBackendSelector : public QObject {
     Q_OBJECT
@@ -9,6 +11,17 @@ private slots:
     void defaultRoutesEverythingToFfmpeg();
     void nativeSrtFlagRoutesOnlySrtToNative();
     void canConstructFfmpegSession();
+    void nativeFailureReasonStartsEmpty();
+    void nativeDecodeCapabilityErrorsRequestFallback();
+    void nativeDecodeTransientErrorsDoNotRequestFallback();
+    void decodedVideoPtsUsesVideoAnchor();
+};
+
+class EmptySession final : public IngestSession {
+public:
+    bool open(const QUrl&, const IngestCallbacks&) override { return false; }
+    void run() override {}
+    void requestStop() override {}
 };
 
 void TestIngestBackendSelector::defaultRoutesEverythingToFfmpeg() {
@@ -37,6 +50,35 @@ void TestIngestBackendSelector::nativeSrtFlagRoutesOnlySrtToNative() {
 void TestIngestBackendSelector::canConstructFfmpegSession() {
     FfmpegIngestSession session(0);
     QVERIFY(!session.isOpen());
+}
+
+void TestIngestBackendSelector::nativeFailureReasonStartsEmpty() {
+    EmptySession session;
+    QVERIFY(session.nativeFallbackReason().isEmpty());
+}
+
+void TestIngestBackendSelector::nativeDecodeCapabilityErrorsRequestFallback() {
+    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Native decoder is unavailable.")));
+    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Media Foundation decode is not implemented.")));
+    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Unsupported codec profile.")));
+    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral(
+        "VideoToolbox decompression session creation failed (-12908).")));
+}
+
+void TestIngestBackendSelector::nativeDecodeTransientErrorsDoNotRequestFallback() {
+    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral(
+        "VideoToolbox format description creation failed (-12712).")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("VideoToolbox needs codec parameter sets before decoding.")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("H.264 decode requires SPS/PPS before frames.")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("H.265 decode requires VPS before frames.")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("Native decoder received an empty access unit.")));
+}
+
+void TestIngestBackendSelector::decodedVideoPtsUsesVideoAnchor() {
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, 90000, 1000), 1200);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(-1, 90000, 1000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, -1, 1000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, 90000, -1), -1);
 }
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)

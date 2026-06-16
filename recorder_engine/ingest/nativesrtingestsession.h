@@ -5,7 +5,7 @@
 #include "h26xaccessunit.h"
 #include "ingestsession.h"
 #include "mpegtsparser.h"
-#include "videotoolboxdecoder.h"
+#include "nativevideodecoder.h"
 
 #include <QByteArray>
 #include <QElapsedTimer>
@@ -22,10 +22,14 @@ public:
     ~NativeSrtIngestSession() override;
 
     static bool supportsUrl(const QUrl& url);
+    static int64_t sourcePtsMsFromVideoAnchor(qint64 pts90k,
+                                              int64_t firstDts90k,
+                                              int64_t anchorStreamTimeMs);
 
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
     void requestStop() override;
+    QString nativeFallbackReason() const override;
 
 private:
     int m_sourceIndex = -1;
@@ -40,10 +44,11 @@ private:
     MpegTsParser m_tsParser;
     NativeVideoCodec m_activeCodec = NativeVideoCodec::Unknown;
     std::unique_ptr<H26xAccessUnitSplitter> m_splitter;
-    std::unique_ptr<VideoToolboxDecoder> m_decoder;
+    std::unique_ptr<NativeVideoDecoder> m_decoder;
     std::unique_ptr<AudioToolboxAacDecoder> m_audioDecoder;
     QByteArray m_tsBuffer;
     QByteArray m_audioRemainder;
+    QString m_nativeFallbackReason;
     int m_socket = -1;
     bool m_srtLibraryStarted = false;
     int64_t m_statRetrans = -1;
@@ -65,10 +70,12 @@ private:
     void closeSocket();
     bool shouldStop() const;
     void log(const QString& message) const;
+    void markNativeFallback(const QString& reason);
     void processReceivedBytes(const char* data, int size);
     void processPesPacket(const PesPacket& pes);
     void processAudioPesPacket(const PesPacket& pes);
     int64_t sourcePtsMsForUnit(const CompressedAccessUnit& unit);
+    int64_t sourcePtsMsForDecodedVideoPts(qint64 pts90k) const;
     int64_t sourcePtsMsForAudio(qint64 pts90k);
 };
 

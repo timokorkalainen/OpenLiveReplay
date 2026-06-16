@@ -1,17 +1,21 @@
 #include "nativesrtingestsession.h"
 
+#include "nativefallbackpolicy.h"
+#include "nativesrtaddress.h"
+
 #include <QDebug>
 #include <QThread>
 #include <QUrlQuery>
 
 #include <algorithm>
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <mutex>
-#include <sys/socket.h>
 #include <utility>
 
 #include <srt/srt.h>
+
+extern "C" {
+#include <libavutil/frame.h>
+}
 
 namespace {
 constexpr int kSrtReceiveBufferSize = 1316;
@@ -29,11 +33,6 @@ constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
 
 std::mutex srtLibraryMutex;
 int srtLibraryRefs = 0;
-
-bool isNumericIpv4Host(const QString& host) {
-    sockaddr_in address {};
-    return inet_pton(AF_INET, host.toUtf8().constData(), &address.sin_addr) == 1;
-}
 
 bool acquireSrtLibrary(QString* error) {
     std::lock_guard<std::mutex> lock(srtLibraryMutex);
@@ -128,7 +127,16 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
         return false;
     }
 
-    return isNumericIpv4Host(url.host());
+    return nativeSrtIsNumericIpv4Host(url.host());
+}
+
+int64_t NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(qint64 pts90k,
+                                                           int64_t firstDts90k,
+                                                           int64_t anchorStreamTimeMs) {
+    if (pts90k < 0 || firstDts90k < 0 || anchorStreamTimeMs < 0) {
+        return -1;
+    }
+    return anchorStreamTimeMs + ((pts90k - firstDts90k) / 90);
 }
 
 bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
@@ -143,6 +151,7 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_decoder.reset();
     m_audioDecoder.reset();
     m_audioRemainder.clear();
+    m_nativeFallbackReason.clear();
     m_firstDts90k = -1;
     m_prevDts90k = -1;
     m_anchorStreamTimeMs = -1;
@@ -238,6 +247,10 @@ void NativeSrtIngestSession::requestStop() {
     closeSocket();
 }
 
+QString NativeSrtIngestSession::nativeFallbackReason() const {
+    return m_nativeFallbackReason;
+}
+
 bool NativeSrtIngestSession::openSocket(QString* error) {
     if (!acquireSrtLibrary(error)) {
         return false;
@@ -276,17 +289,8 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         return false;
     }
 
-    const QByteArray host = m_url.host().toUtf8();
-    if (host.isEmpty()) {
-        if (error) *error = QStringLiteral("Native SRT URL is missing a host.");
-        closeSocket();
-        return false;
-    }
-
-    sockaddr_in address {};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(quint16(m_url.port(9000)));
-    if (inet_pton(AF_INET, host.constData(), &address.sin_addr) != 1) {
+    NativeSrtSockaddr address;
+    if (!nativeSrtMakeIpv4Sockaddr(m_url.host(), quint16(m_url.port(9000)), &address)) {
         if (error) {
             *error = QStringLiteral("Native SRT currently requires a numeric IPv4 host.");
         }
@@ -294,8 +298,7 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         return false;
     }
 
-    const int connectResult =
-        srt_connect(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    const int connectResult = srt_connect(m_socket, address.sockaddrPtr(), address.size);
     if (connectResult == SRT_ERROR) {
         int osError = 0;
         const int code = srt_getlasterror(&osError);
@@ -367,6 +370,14 @@ void NativeSrtIngestSession::log(const QString& message) const {
         m_callbacks.logInfo(message);
     } else {
         qDebug() << "Source" << m_sourceIndex << message;
+    }
+}
+
+void NativeSrtIngestSession::markNativeFallback(const QString& reason) {
+    if (m_nativeFallbackReason.isEmpty()) {
+        m_nativeFallbackReason = reason;
+        m_stopRequested.store(true, std::memory_order_relaxed);
+        log(reason);
     }
 }
 
@@ -442,7 +453,7 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
     }
 
     if (!m_decoder) {
-        m_decoder = std::make_unique<VideoToolboxDecoder>(m_outputWidth, m_outputHeight);
+        m_decoder = std::make_unique<NativeVideoDecoder>(m_outputWidth, m_outputHeight);
     }
 
     for (const CompressedAccessUnit& unit : units) {
@@ -465,12 +476,17 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
 
                 DecodedVideoFrame decodedFrame;
                 decodedFrame.frame = frame;
-                decodedFrame.sourcePtsMs = sourcePtsMs;
+                const int64_t decodedPtsMs = sourcePtsMsForDecodedVideoPts(frame->pts);
+                decodedFrame.sourcePtsMs = decodedPtsMs >= 0 ? decodedPtsMs : sourcePtsMs;
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);
         if (!decoded && !error.isEmpty()) {
-            log(error);
+            if (nativeDecodeErrorRequestsFallback(error)) {
+                markNativeFallback(error);
+            } else {
+                log(error);
+            }
         }
     }
 }
@@ -616,7 +632,11 @@ int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& u
     if (m_anchorStreamTimeMs < 0) {
         return -1;
     }
-    return m_anchorStreamTimeMs + ((unitPts90k - m_firstDts90k) / 90);
+    return sourcePtsMsForDecodedVideoPts(unitPts90k);
+}
+
+int64_t NativeSrtIngestSession::sourcePtsMsForDecodedVideoPts(qint64 pts90k) const {
+    return sourcePtsMsFromVideoAnchor(pts90k, m_firstDts90k, m_anchorStreamTimeMs);
 }
 
 int64_t NativeSrtIngestSession::sourcePtsMsForAudio(qint64 pts90k) {

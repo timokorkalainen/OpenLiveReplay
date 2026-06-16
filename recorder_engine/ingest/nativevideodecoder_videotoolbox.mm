@@ -1,4 +1,4 @@
-#include "videotoolboxdecoder.h"
+#include "nativevideodecoder.h"
 
 #ifdef __APPLE__
 
@@ -11,6 +11,7 @@
 #include <vector>
 
 extern "C" {
+#include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
 }
 
@@ -22,7 +23,7 @@ struct AnnexBNal {
 };
 
 struct DecodeFrameContext {
-    VideoToolboxDecoder::FrameCallback* callback = nullptr;
+    NativeVideoDecoder::FrameCallback* callback = nullptr;
     qint64 pts90k = -1;
     bool emittedFrame = false;
     bool copyFailed = false;
@@ -221,7 +222,7 @@ static void decompressionOutputCallback(void*,
 
 } // namespace
 
-class VideoToolboxDecoder::Impl {
+class NativeVideoDecoder::Impl {
 public:
     Impl(int outputWidth, int outputHeight)
         : width(outputWidth)
@@ -245,7 +246,7 @@ private:
     bool createSession(QString* error);
 };
 
-void VideoToolboxDecoder::Impl::reset() {
+void NativeVideoDecoder::Impl::reset() {
     if (session) {
         VTDecompressionSessionInvalidate(session);
         CFRelease(session);
@@ -259,7 +260,7 @@ void VideoToolboxDecoder::Impl::reset() {
     activeParameterSetKey.clear();
 }
 
-bool VideoToolboxDecoder::Impl::createFormatDescription(const CompressedAccessUnit& unit,
+bool NativeVideoDecoder::Impl::createFormatDescription(const CompressedAccessUnit& unit,
                                                         QString* error) {
     std::vector<const uint8_t*> pointers;
     std::vector<size_t> sizes;
@@ -320,7 +321,7 @@ bool VideoToolboxDecoder::Impl::createFormatDescription(const CompressedAccessUn
     return true;
 }
 
-bool VideoToolboxDecoder::Impl::createSession(QString* error) {
+bool NativeVideoDecoder::Impl::createSession(QString* error) {
     CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     const OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
@@ -354,7 +355,7 @@ bool VideoToolboxDecoder::Impl::createSession(QString* error) {
     return true;
 }
 
-bool VideoToolboxDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, QString* error) {
+bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, QString* error) {
     const QByteArray nextKey = parameterSetKey(unit.codec, unit.parameterSets);
     if (session && unit.codec == codec && (nextKey.isEmpty() || nextKey == activeParameterSetKey)) {
         return true;
@@ -377,7 +378,7 @@ bool VideoToolboxDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, 
     return true;
 }
 
-bool VideoToolboxDecoder::Impl::decode(const CompressedAccessUnit& unit,
+bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
                                        FrameCallback onFrame,
                                        QString* error) {
     if (!onFrame) {
@@ -458,21 +459,29 @@ bool VideoToolboxDecoder::Impl::decode(const CompressedAccessUnit& unit,
     return true;
 }
 
-VideoToolboxDecoder::VideoToolboxDecoder(int outputWidth, int outputHeight)
+NativeVideoDecoder::NativeVideoDecoder(int outputWidth, int outputHeight)
     : m_impl(new Impl(outputWidth, outputHeight)) {}
 
-VideoToolboxDecoder::~VideoToolboxDecoder() {
+NativeVideoDecoder::~NativeVideoDecoder() {
     delete m_impl;
 }
 
-bool VideoToolboxDecoder::decode(const CompressedAccessUnit& unit,
+bool NativeVideoDecoder::decode(const CompressedAccessUnit& unit,
                                  FrameCallback onFrame,
                                  QString* error) {
     return m_impl->decode(unit, std::move(onFrame), error);
 }
 
-void VideoToolboxDecoder::reset() {
+void NativeVideoDecoder::reset() {
     m_impl->reset();
+}
+
+NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
+    NativeVideoDecodeCapabilities caps;
+    caps.h264 = true;
+    caps.hevc = true;
+    caps.detail = QStringLiteral("VideoToolbox native decode available");
+    return caps;
 }
 
 #endif
