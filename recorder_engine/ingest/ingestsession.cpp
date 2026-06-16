@@ -72,6 +72,26 @@ bool shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind failure) {
            failure == IngestFailureKind::MalformedStream;
 }
 
+bool NativeRtmpFfmpegFallbackPolicy::shouldForceFfmpeg(const QString& url) {
+    if (m_url != url) {
+        m_url = url;
+        m_forceFfmpeg = false;
+    }
+    return m_forceFfmpeg;
+}
+
+bool NativeRtmpFfmpegFallbackPolicy::recordNativeFailure(const QString& url,
+                                                         IngestFailureKind failure,
+                                                         bool fallbackEnabled) {
+    shouldForceFfmpeg(url);
+    if (!fallbackEnabled || !shouldFallbackToFfmpegAfterNativeFailure(failure)) {
+        return false;
+    }
+
+    m_forceFfmpeg = true;
+    return true;
+}
+
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
                                                          bool nativeRtmpAvailable) {
     IngestBackendOptions options;
