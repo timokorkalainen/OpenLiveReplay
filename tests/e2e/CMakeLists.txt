@@ -168,4 +168,15 @@ if(APPLE)
         TIMEOUT 240
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # Phase 2c-b: SRT packet-loss recovery on the native ingest. A lossy_udp_relay.py
+    # drops downstream SRT DATA on the link; assert ARQ recovers moderate loss (no
+    # content loss, retransmits happened) and degrades under heavy loss. Base 23660.
+    add_test(NAME e2e_native_srt_loss
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_loss.sh" "$<TARGET_FILE:sync_harness>" 23660)
+    set_tests_properties(e2e_native_srt_loss PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
 endif()

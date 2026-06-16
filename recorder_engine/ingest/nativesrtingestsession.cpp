@@ -151,6 +151,11 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_audioAnchorStreamTimeMs = -1;
     m_audioRemainderPts90k = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
+    m_statRetrans = -1;
+    m_statLossTotal = -1;
+    m_statDropTotal = -1;
+    m_statRecvTotal = -1;
+    m_lastStatsAtMs = -1;
     m_loggedLatmUnsupported = false;
 
     QString error;
@@ -177,6 +182,20 @@ void NativeSrtIngestSession::run() {
         if (received > 0) {
             m_lastPacketAtMs = m_monotonic.elapsed();
             processReceivedBytes(buffer.constData(), received);
+            // Snapshot SRT receiver stats ~1x/s while receiving. The socket is
+            // closed only after this loop returns (the session is torn down on
+            // this same capture thread), so the last in-loop snapshot is what we
+            // log on exit. clear=0 keeps the counters cumulative since connect.
+            if (m_lastStatsAtMs < 0 || m_monotonic.elapsed() - m_lastStatsAtMs > 1000) {
+                SRT_TRACEBSTATS perf;
+                if (srt_bstats(m_socket, &perf, 0) == 0) {
+                    m_statRetrans = perf.pktRcvRetrans;
+                    m_statLossTotal = perf.pktRcvLossTotal;
+                    m_statDropTotal = perf.pktRcvDropTotal;
+                    m_statRecvTotal = perf.pktRecvTotal;
+                }
+                m_lastStatsAtMs = m_monotonic.elapsed();
+            }
             continue;
         }
 
@@ -198,6 +217,16 @@ void NativeSrtIngestSession::run() {
         }
         break;
     }
+
+    // Loss/recovery telemetry. pktRcvRetrans>0 means SRT's ARQ retransmitted;
+    // pktRcvLossTotal counts DETECTED loss (recoverable); pktRcvDropTotal is the
+    // too-late-to-play loss SRT finally gave up on (== the UNRECOVERED loss).
+    log(QStringLiteral(
+            "srt_stats pktRcvRetrans=%1 pktRcvLossTotal=%2 pktRcvDropTotal=%3 pktRecvTotal=%4")
+            .arg(m_statRetrans)
+            .arg(m_statLossTotal)
+            .arg(m_statDropTotal)
+            .arg(m_statRecvTotal));
 
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(false);

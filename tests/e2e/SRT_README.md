@@ -122,7 +122,32 @@ perturbs the others — the control source records 37/37 flashes with zero gaps.
 the strict-isolation gate runs on the native path; the ffmpeg path's coupling is a
 known limitation that motivates native ingest on Apple.
 
-## Next (Phase 2c-b / 2c-c)
+## Phase 2c-b: packet-loss recovery
 
-Packet-loss / jitter injection (needs privileged macOS network emulation) and
-long-run drift over SRT — each its own spec under `docs/superpowers/specs/`.
+`e2e_native_srt_loss` (label `native-apple-ingest`, `OLR_NATIVE_SRT=1`) proves the
+native SRT ingest recovers from packet loss via SRT's ARQ retransmit. A
+`lossy_udp_relay.py` sits on the SRT link between the engine (SRT caller) and
+`srt-live-transmit` (SRT listener) and drops a **seeded % of downstream SRT DATA
+packets only** — SRT control (ACK/NAK/keepalive; first byte high bit `0x80`) always
+passes (no `command -v python3` → SKIP). One source is recorded through the relay at
+three loss levels:
+
+- **0 % baseline** → reference flash count `B`; relay drops nothing.
+- **12 % moderate** → relay dropped data; the native session's `srt_stats` shows
+  `pktRcvRetrans > 0` (ARQ retransmitted) and **`pktRcvDropTotal == 0`** (nothing
+  finally unrecovered); the recorded view keeps ≥ 0.85·`B` flashes with no gap > 1.5 s.
+- **88 % heavy (teeth)** → the run exits cleanly AND content degrades (≤ 0.5·`B`
+  flashes or a gap ≥ 2 s) — proving the injected loss is real and the gate
+  discriminates. (On loopback, SRT's 500 ms ARQ window recovers even 60 % loss, so
+  the teeth needs ~88 %.)
+
+The airtight recovery metric is **`pktRcvDropTotal`** (SRT's too-late-to-play,
+finally-unrecovered loss), logged by the native ingest on stop — *not*
+`pktRcvLossTotal`, which counts *detected* loss that ARQ then retransmits (so it is
+expectedly non-zero under loss). Loss %, seed, and thresholds are env-overridable
+(`OLR_SRT_LOSS_*`); the fixed seed makes drops deterministic.
+
+## Next (Phase 2c-c)
+
+Long-run drift over SRT, plus (later) multi-source simultaneous loss and
+jitter/reordering injection — each its own spec under `docs/superpowers/specs/`.

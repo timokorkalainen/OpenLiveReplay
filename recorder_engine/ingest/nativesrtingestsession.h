@@ -46,6 +46,11 @@ private:
     QByteArray m_audioRemainder;
     int m_socket = -1;
     bool m_srtLibraryStarted = false;
+    int64_t m_statRetrans = -1;
+    int64_t m_statLossTotal = -1;
+    int64_t m_statDropTotal = -1;
+    int64_t m_statRecvTotal = -1;
+    int64_t m_lastStatsAtMs = -1;
     int64_t m_firstDts90k = -1;
     int64_t m_prevDts90k = -1;
     int64_t m_anchorStreamTimeMs = -1;
