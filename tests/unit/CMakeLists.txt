@@ -22,6 +22,21 @@ olr_add_unit_test(tst_ingestbackendselector olr_test_core)
 olr_add_unit_test(tst_mpegtsparser     olr_test_core)
 olr_add_unit_test(tst_h26xaccessunit   olr_test_core)
 olr_add_unit_test(tst_nativevideodecoder olr_test_core)
+if(APPLE)
+    add_library(olr_test_nativevideodecoder STATIC
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_videotoolbox.mm")
+    target_include_directories(olr_test_nativevideodecoder PRIVATE "${OLR_FFMPEG_INCLUDE}")
+    target_link_directories(olr_test_nativevideodecoder PUBLIC "${OLR_FFMPEG_LIBDIR}")
+    target_link_libraries(olr_test_nativevideodecoder
+        PUBLIC Qt6::Core avutil "-framework VideoToolbox" "-framework CoreMedia"
+                "-framework CoreFoundation" "-framework CoreVideo")
+    target_link_libraries(tst_nativevideodecoder PRIVATE olr_test_nativevideodecoder)
+elseif(NOT WIN32)
+    add_library(olr_test_nativevideodecoder STATIC
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_stub.cpp")
+    target_link_libraries(olr_test_nativevideodecoder PUBLIC Qt6::Core)
+    target_link_libraries(tst_nativevideodecoder PRIVATE olr_test_nativevideodecoder)
+endif()
 olr_add_unit_test(tst_audiotoolboxaacdecoder olr_test_core)
 olr_add_unit_test(tst_telemetrytimelinereader olr_test_engine olr_test_playback)
 olr_add_unit_test(tst_replaymanager_telemetry olr_test_engine olr_test_playback)

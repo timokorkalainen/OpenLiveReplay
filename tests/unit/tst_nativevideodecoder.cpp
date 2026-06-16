@@ -6,6 +6,7 @@ class TestNativeVideoDecoder : public QObject {
     Q_OBJECT
 private slots:
     void defaultCapabilitiesAreFalse();
+    void queryCapabilitiesReportsPlatformBackend();
 };
 
 void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
@@ -14,6 +15,25 @@ void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
     QVERIFY(!caps.hevc);
     QVERIFY(!caps.d3d11);
     QVERIFY(caps.detail.isEmpty());
+}
+
+void TestNativeVideoDecoder::queryCapabilitiesReportsPlatformBackend() {
+#if defined(Q_OS_WIN)
+    QSKIP("Windows native video decode capabilities are covered by the Media Foundation task");
+#else
+    const NativeVideoDecodeCapabilities caps = queryNativeVideoDecodeCapabilities();
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS) || defined(Q_OS_TVOS) || defined(Q_OS_WATCHOS)
+    QVERIFY(caps.h264);
+    QVERIFY(caps.hevc);
+    QVERIFY(!caps.d3d11);
+    QVERIFY(caps.detail.contains(QStringLiteral("VideoToolbox")) || !caps.detail.isEmpty());
+#else
+    QVERIFY(!caps.h264);
+    QVERIFY(!caps.hevc);
+    QVERIFY(!caps.d3d11);
+    QVERIFY(!caps.detail.isEmpty());
+#endif
+#endif
 }
 
 QTEST_GUILESS_MAIN(TestNativeVideoDecoder)

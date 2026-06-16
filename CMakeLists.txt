@@ -76,7 +76,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/audiotoolboxaacdecoder.h
-        recorder_engine/ingest/videotoolboxdecoder.h
+        recorder_engine/ingest/nativevideodecoder.h
         recorder_engine/ingest/nativesrtingestsession.h
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
@@ -181,7 +181,7 @@ endif()
 
 if(APPLE)
     target_sources(OpenLiveReplay PRIVATE
-        recorder_engine/ingest/videotoolboxdecoder.mm
+        recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/audiotoolboxaacdecoder.mm)
     target_compile_definitions(OpenLiveReplay PRIVATE OLR_NATIVE_SRT_AVAILABLE=1)
@@ -191,8 +191,8 @@ if(APPLE)
         "-framework CoreMedia"
         "-framework CoreFoundation"
         "-framework CoreVideo")
-else()
-    target_sources(OpenLiveReplay PRIVATE recorder_engine/ingest/videotoolboxdecoder_stub.cpp)
+elseif(NOT WIN32)
+    target_sources(OpenLiveReplay PRIVATE recorder_engine/ingest/nativevideodecoder_stub.cpp)
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)

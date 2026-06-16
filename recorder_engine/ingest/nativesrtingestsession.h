@@ -5,7 +5,7 @@
 #include "h26xaccessunit.h"
 #include "ingestsession.h"
 #include "mpegtsparser.h"
-#include "videotoolboxdecoder.h"
+#include "nativevideodecoder.h"
 
 #include <QByteArray>
 #include <QElapsedTimer>
@@ -40,7 +40,7 @@ private:
     MpegTsParser m_tsParser;
     NativeVideoCodec m_activeCodec = NativeVideoCodec::Unknown;
     std::unique_ptr<H26xAccessUnitSplitter> m_splitter;
-    std::unique_ptr<VideoToolboxDecoder> m_decoder;
+    std::unique_ptr<NativeVideoDecoder> m_decoder;
     std::unique_ptr<AudioToolboxAacDecoder> m_audioDecoder;
     QByteArray m_tsBuffer;
     QByteArray m_audioRemainder;

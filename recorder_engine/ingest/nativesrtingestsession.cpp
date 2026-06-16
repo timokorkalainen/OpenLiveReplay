@@ -13,6 +13,10 @@
 
 #include <srt/srt.h>
 
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 namespace {
 constexpr int kSrtReceiveBufferSize = 1316;
 constexpr int kSrtLatencyMs = 500;
@@ -413,7 +417,7 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
     }
 
     if (!m_decoder) {
-        m_decoder = std::make_unique<VideoToolboxDecoder>(m_outputWidth, m_outputHeight);
+        m_decoder = std::make_unique<NativeVideoDecoder>(m_outputWidth, m_outputHeight);
     }
 
     for (const CompressedAccessUnit& unit : units) {
