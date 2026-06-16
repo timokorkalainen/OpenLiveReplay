@@ -268,6 +268,8 @@ if(APPLE)
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmps_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23771)
     add_test(NAME e2e_native_rtmp_unsupported
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_unsupported.sh" "$<TARGET_FILE:record_harness>" 23760)
+    add_test(NAME e2e_native_rtmp_reconnect
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_reconnect.sh" "$<TARGET_FILE:record_harness>" 23780)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
         LABELS "native-rtmp"
         TIMEOUT 180
@@ -284,6 +286,11 @@ if(APPLE)
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
     set_tests_properties(e2e_native_rtmp_unsupported PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmp_reconnect PROPERTIES
         LABELS "native-rtmp"
         TIMEOUT 180
         RUN_SERIAL TRUE

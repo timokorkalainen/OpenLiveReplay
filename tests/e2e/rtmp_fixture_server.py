@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tiny RTMP play server for OpenLiveReplay E2E tests.
 
-It serves the media tags from a generated FLV file to one RTMP client. The goal
-is a deterministic test fixture, not a general-purpose RTMP server.
+It serves the media tags from a generated FLV file to RTMP clients. The goal is
+a deterministic test fixture, not a general-purpose RTMP server.
 """
 
 from __future__ import annotations
@@ -392,107 +392,152 @@ def run_server(args: argparse.Namespace) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", args.port))
-    listener.listen(1)
+    listener.listen(max(1, args.max_clients))
     listener.settimeout(args.accept_timeout)
     print(f"READY port={args.port}", flush=True)
 
-    conn, _ = listener.accept()
+    tls_context: ssl.SSLContext | None = None
     if args.tls_cert or args.tls_key:
         if not args.tls_cert or not args.tls_key:
             raise ValueError("--tls-cert and --tls-key must be supplied together")
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(args.tls_cert, args.tls_key)
-        conn = context.wrap_socket(conn, server_side=True)
-    with conn:
-        conn.settimeout(args.io_timeout)
-        c0c1 = read_exact(conn, 1537)
-        if c0c1[0] != RTMP_VERSION:
-            raise ValueError("unsupported RTMP version")
-        s1 = struct.pack(">II", int(time.time()), 0) + os.urandom(1528)
-        conn.sendall(bytes((RTMP_VERSION,)) + s1 + c0c1[1:])
-        read_exact(conn, 1536)
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_context.load_cert_chain(args.tls_cert, args.tls_key)
 
-        reader = RtmpReader(conn)
-        writer = RtmpWriter(conn)
-        writer.set_chunk_size()
-        writer.window_ack()
-        writer.peer_bandwidth()
+    def send_reconnect_request(writer: RtmpWriter, timestamp: int) -> None:
+        writer.command(
+            timestamp,
+            "onStatus",
+            0,
+            None,
+            {
+                "level": "status",
+                "code": "NetConnection.Connect.ReconnectRequest",
+                "description": "Reconnect requested.",
+            },
+        )
 
-        saw_play = False
-        playpath = ""
-        while not saw_play:
-            message_type, _stream, _timestamp, payload = reader.read_message()
-            if message_type != 20:
-                continue
-            name, transaction_id = parse_command(payload)
-            if name == "connect":
-                writer.command(
-                    0,
-                    "_result",
-                    transaction_id,
-                    {"fmsVer": "FMS/3,5,7,7009", "capabilities": 31},
-                    {
-                        "level": "status",
-                        "code": "NetConnection.Connect.Success",
-                        "description": "Connection succeeded.",
-                        "objectEncoding": 0,
-                    },
-                )
-            elif name == "createStream":
-                writer.command(0, "_result", transaction_id, None, STREAM_ID)
-            elif name == "play":
-                try:
-                    playpath, _ = read_amf0_string(payload, len(amf0_string("play")) + 9 + 1)
-                except Exception as exc:
-                    if args.expect_play_path:
-                        raise ValueError("play command omitted expected play path") from exc
-                    playpath = "stream"
-                if args.expect_play_path and playpath != args.expect_play_path:
-                    raise ValueError(
-                        "play path mismatch: expected "
-                        f"{redact_query_values(args.expect_play_path)!r}, got "
-                        f"{redact_query_values(playpath)!r}"
+    def serve_client(conn: socket.socket, client_index: int) -> None:
+        if tls_context is not None:
+            conn = tls_context.wrap_socket(conn, server_side=True)
+        with conn:
+            conn.settimeout(args.io_timeout)
+            c0c1 = read_exact(conn, 1537)
+            if c0c1[0] != RTMP_VERSION:
+                raise ValueError("unsupported RTMP version")
+            s1 = struct.pack(">II", int(time.time()), 0) + os.urandom(1528)
+            conn.sendall(bytes((RTMP_VERSION,)) + s1 + c0c1[1:])
+            read_exact(conn, 1536)
+
+            reader = RtmpReader(conn)
+            writer = RtmpWriter(conn)
+            writer.set_chunk_size()
+            writer.window_ack()
+            writer.peer_bandwidth()
+
+            saw_play = False
+            playpath = ""
+            while not saw_play:
+                message_type, _stream, _timestamp, payload = reader.read_message()
+                if message_type != 20:
+                    continue
+                name, transaction_id = parse_command(payload)
+                if name == "connect":
+                    writer.command(
+                        0,
+                        "_result",
+                        transaction_id,
+                        {"fmsVer": "FMS/3,5,7,7009", "capabilities": 31},
+                        {
+                            "level": "status",
+                            "code": "NetConnection.Connect.Success",
+                            "description": "Connection succeeded.",
+                            "objectEncoding": 0,
+                        },
                     )
-                if args.require_play_query and "?" not in playpath:
-                    raise ValueError("play path omitted required query string")
-                writer.user_control(0, STREAM_ID)
-                writer.command(
-                    0,
-                    "onStatus",
-                    0,
-                    None,
-                    {
-                        "level": "status",
-                        "code": "NetStream.Play.Start",
-                        "description": "Start live",
-                        "details": playpath,
-                    },
-                )
-                saw_play = True
+                elif name == "createStream":
+                    writer.command(0, "_result", transaction_id, None, STREAM_ID)
+                elif name == "play":
+                    try:
+                        playpath, _ = read_amf0_string(
+                            payload, len(amf0_string("play")) + 9 + 1
+                        )
+                    except Exception as exc:
+                        if args.expect_play_path:
+                            raise ValueError("play command omitted expected play path") from exc
+                        playpath = "stream"
+                    if args.expect_play_path and playpath != args.expect_play_path:
+                        raise ValueError(
+                            "play path mismatch: expected "
+                            f"{redact_query_values(args.expect_play_path)!r}, got "
+                            f"{redact_query_values(playpath)!r}"
+                        )
+                    if args.require_play_query and "?" not in playpath:
+                        raise ValueError("play path omitted required query string")
+                    writer.user_control(0, STREAM_ID)
+                    writer.command(
+                        0,
+                        "onStatus",
+                        0,
+                        None,
+                        {
+                            "level": "status",
+                            "code": "NetStream.Play.Start",
+                            "description": "Start live",
+                            "details": playpath,
+                        },
+                    )
+                    saw_play = True
 
-        if args.idle_after_play:
+            print(f"CLIENT index={client_index} play={redact_query_values(playpath)}", flush=True)
+            if args.idle_after_play:
+                time.sleep(args.hold_open)
+                return
+
+            disconnect_after_tags = args.disconnect_after_tags
+            if args.max_clients > 1 and client_index == args.max_clients:
+                disconnect_after_tags = 0
+
+            started = time.monotonic()
+            first_ts = tags[0][1]
+            media_tags_sent = 0
+            for tag_type, timestamp, payload in tags:
+                target = (timestamp - first_ts) / 1000.0
+                now = time.monotonic() - started
+                if target > now:
+                    time.sleep(target - now)
+                csid = 4 if tag_type == 8 else 6 if tag_type == 9 else 5
+                writer.send_message(csid, tag_type, STREAM_ID, timestamp, payload)
+                if tag_type in (8, 9):
+                    media_tags_sent += 1
+                    if disconnect_after_tags > 0 and media_tags_sent >= disconnect_after_tags:
+                        if args.send_reconnect_request:
+                            send_reconnect_request(writer, timestamp)
+                        print(
+                            f"DISCONNECT index={client_index} tags={media_tags_sent}",
+                            flush=True,
+                        )
+                        return
+
+            if args.send_reconnect_request and disconnect_after_tags <= 0 and args.max_clients == 1:
+                send_reconnect_request(writer, tags[-1][1])
             time.sleep(args.hold_open)
-            return
 
-        started = time.monotonic()
-        first_ts = tags[0][1]
-        for tag_type, timestamp, payload in tags:
-            target = (timestamp - first_ts) / 1000.0
-            now = time.monotonic() - started
-            if target > now:
-                time.sleep(target - now)
-            csid = 4 if tag_type == 8 else 6 if tag_type == 9 else 5
-            writer.send_message(csid, tag_type, STREAM_ID, timestamp, payload)
-
-        time.sleep(args.hold_open)
+    with listener:
+        for client_index in range(1, args.max_clients + 1):
+            conn, _ = listener.accept()
+            serve_client(conn, client_index)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--flv")
+    parser.add_argument("--source", dest="flv")
     parser.add_argument("--enhanced-hevc", action="store_true")
     parser.add_argument("--hevc-annexb-source")
+    parser.add_argument("--disconnect-after-tags", type=int, default=0)
+    parser.add_argument("--send-reconnect-request", action="store_true")
+    parser.add_argument("--max-clients", type=int, default=1)
     parser.add_argument("--accept-timeout", type=float, default=10.0)
     parser.add_argument("--io-timeout", type=float, default=20.0)
     parser.add_argument("--hold-open", type=float, default=2.0)

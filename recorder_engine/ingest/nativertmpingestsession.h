@@ -62,6 +62,7 @@ private:
     int64_t m_lastPacketAtMs = -1;
     bool m_seenSupportedVideo = false;
     bool m_seenSupportedAudio = false;
+    bool m_reconnectRequested = false;
     int64_t m_openedAtMs = -1;
     QString m_unsupportedReason;
     IngestFailureKind m_lastFailureKind = IngestFailureKind::None;

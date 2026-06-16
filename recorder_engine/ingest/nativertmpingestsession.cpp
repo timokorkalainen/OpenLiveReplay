@@ -1,5 +1,6 @@
 #include "nativertmpingestsession.h"
 
+#include <QAbstractSocket>
 #include <QDateTime>
 #include <QDebug>
 #include <QSslError>
@@ -10,6 +11,7 @@
 namespace {
 constexpr int kConnectTimeoutMs = 5000;
 constexpr int kIoTimeoutMs = 5000;
+constexpr int kStallTimeoutMs = 8000;
 constexpr int kRtmpVersion = 3;
 constexpr int kMessageSetChunkSize = 1;
 constexpr int kMessageAbort = 2;
@@ -24,10 +26,172 @@ constexpr int kAudioSampleRate = 48000;
 constexpr int64_t kForwardJumpMs = 3000;
 constexpr int64_t kBackwardToleranceMs = -200;
 constexpr int64_t kSupportedVideoProbeMs = 5000;
+constexpr int kMaxAmf0ScanDepth = 64;
+constexpr char kReconnectRequestCode[] = "NetConnection.Connect.ReconnectRequest";
+
+enum class Amf0StringScanResult {
+    NotFound,
+    Found,
+    Malformed,
+};
 
 bool isVideoToolboxDecodeCapabilityFailure(const QString& error) {
     return error.startsWith(QStringLiteral("VideoToolbox decompression session creation failed")) ||
            error.startsWith(QStringLiteral("VideoToolbox is unavailable"));
+}
+
+bool needAmf0Bytes(const QByteArray& data, int offset, int size) {
+    return offset < 0 || size < 0 || offset + size > data.size();
+}
+
+bool readAmf0StringBody(const QByteArray& data, int* offset, int sizeBytes, QString* value) {
+    if (!offset || !value || needAmf0Bytes(data, *offset, sizeBytes)) {
+        return false;
+    }
+    quint32 size = 0;
+    for (int i = 0; i < sizeBytes; ++i) {
+        size = (size << 8) | quint32(uchar(data[*offset + i]));
+    }
+    *offset += sizeBytes;
+    if (size > quint32(data.size()) || needAmf0Bytes(data, *offset, int(size))) {
+        return false;
+    }
+    *value = QString::fromUtf8(data.constData() + *offset, int(size));
+    *offset += int(size);
+    return true;
+}
+
+Amf0StringScanResult amf0ValueContainsString(const QByteArray& data, int* offset,
+                                             const QString& needle, int depth);
+
+Amf0StringScanResult scanAmf0ObjectEntries(const QByteArray& data, int* offset,
+                                           const QString& needle, int depth) {
+    if (!offset) {
+        return Amf0StringScanResult::Malformed;
+    }
+    while (!needAmf0Bytes(data, *offset, 3)) {
+        if (uchar(data[*offset]) == 0 && uchar(data[*offset + 1]) == 0 &&
+            uchar(data[*offset + 2]) == 0x09) {
+            *offset += 3;
+            return Amf0StringScanResult::NotFound;
+        }
+
+        QString key;
+        if (!readAmf0StringBody(data, offset, 2, &key)) {
+            return Amf0StringScanResult::Malformed;
+        }
+        Q_UNUSED(key);
+
+        const Amf0StringScanResult result =
+            amf0ValueContainsString(data, offset, needle, depth + 1);
+        if (result != Amf0StringScanResult::NotFound) {
+            return result;
+        }
+    }
+    return Amf0StringScanResult::Malformed;
+}
+
+Amf0StringScanResult amf0ValueContainsString(const QByteArray& data, int* offset,
+                                             const QString& needle, int depth) {
+    if (!offset || depth > kMaxAmf0ScanDepth || needAmf0Bytes(data, *offset, 1)) {
+        return Amf0StringScanResult::Malformed;
+    }
+    int cursor = *offset;
+    const int type = uchar(data[cursor++]);
+    if (type == 0x00) {
+        if (needAmf0Bytes(data, cursor, 8)) return Amf0StringScanResult::Malformed;
+        cursor += 8;
+        *offset = cursor;
+        return Amf0StringScanResult::NotFound;
+    }
+    if (type == 0x01) {
+        if (needAmf0Bytes(data, cursor, 1)) return Amf0StringScanResult::Malformed;
+        cursor += 1;
+        *offset = cursor;
+        return Amf0StringScanResult::NotFound;
+    }
+    if (type == 0x02 || type == 0x0c || type == 0x0f) {
+        QString value;
+        if (!readAmf0StringBody(data, &cursor, type == 0x02 ? 2 : 4, &value)) {
+            return Amf0StringScanResult::Malformed;
+        }
+        *offset = cursor;
+        return value == needle ? Amf0StringScanResult::Found : Amf0StringScanResult::NotFound;
+    }
+    if (type == 0x03 || type == 0x08 || type == 0x10) {
+        if (type == 0x08) {
+            if (needAmf0Bytes(data, cursor, 4)) return Amf0StringScanResult::Malformed;
+            cursor += 4;
+        } else if (type == 0x10) {
+            QString className;
+            if (!readAmf0StringBody(data, &cursor, 2, &className)) {
+                return Amf0StringScanResult::Malformed;
+            }
+            Q_UNUSED(className);
+        }
+        const Amf0StringScanResult result =
+            scanAmf0ObjectEntries(data, &cursor, needle, depth);
+        *offset = cursor;
+        return result;
+    }
+    if (type == 0x0a) {
+        if (needAmf0Bytes(data, cursor, 4)) return Amf0StringScanResult::Malformed;
+        const quint32 count = (quint32(uchar(data[cursor])) << 24) |
+                              (quint32(uchar(data[cursor + 1])) << 16) |
+                              (quint32(uchar(data[cursor + 2])) << 8) |
+                              quint32(uchar(data[cursor + 3]));
+        cursor += 4;
+        for (quint32 i = 0; i < count; ++i) {
+            const Amf0StringScanResult result =
+                amf0ValueContainsString(data, &cursor, needle, depth + 1);
+            if (result != Amf0StringScanResult::NotFound) {
+                *offset = cursor;
+                return result;
+            }
+        }
+        *offset = cursor;
+        return Amf0StringScanResult::NotFound;
+    }
+    if (type == 0x07) {
+        if (needAmf0Bytes(data, cursor, 2)) return Amf0StringScanResult::Malformed;
+        cursor += 2;
+        *offset = cursor;
+        return Amf0StringScanResult::NotFound;
+    }
+    if (type == 0x0b) {
+        if (needAmf0Bytes(data, cursor, 10)) return Amf0StringScanResult::Malformed;
+        cursor += 10;
+        *offset = cursor;
+        return Amf0StringScanResult::NotFound;
+    }
+    if (type == 0x05 || type == 0x06) {
+        *offset = cursor;
+        return Amf0StringScanResult::NotFound;
+    }
+    return Amf0StringScanResult::Malformed;
+}
+
+bool commandPayloadContainsReconnectRequest(const QByteArray& payload) {
+    int offset = 0;
+    QString command;
+    double transactionId = 0;
+    if (!RtmpAmf0::readString(payload, &offset, &command) ||
+        !RtmpAmf0::readNumber(payload, &offset, &transactionId) ||
+        command != QStringLiteral("onStatus")) {
+        return false;
+    }
+    while (offset < payload.size()) {
+        const int previousOffset = offset;
+        const Amf0StringScanResult result = amf0ValueContainsString(
+            payload, &offset, QString::fromLatin1(kReconnectRequestCode), 0);
+        if (result == Amf0StringScanResult::Found) {
+            return true;
+        }
+        if (result == Amf0StringScanResult::Malformed || offset <= previousOffset) {
+            return false;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -70,6 +234,7 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_seenSupportedVideo = false;
     m_seenSupportedAudio = false;
+    m_reconnectRequested = false;
     m_openedAtMs = -1;
     m_unsupportedReason.clear();
     m_lastFailureKind = IngestFailureKind::None;
@@ -128,6 +293,9 @@ void NativeRtmpIngestSession::run() {
         }
         m_lastPacketAtMs = m_monotonic.elapsed();
         processMessage(message);
+        if (m_reconnectRequested) {
+            break;
+        }
         if (!m_unsupportedReason.isEmpty() ||
             shouldFallbackToFfmpegAfterNativeFailure(m_lastFailureKind)) {
             break;
@@ -328,16 +496,35 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
     while (!shouldStop()) {
         if (m_socket->bytesAvailable() <= 0 &&
             !m_socket->waitForReadyRead(kIoTimeoutMs)) {
-            m_lastFailureKind = IngestFailureKind::TransientNetwork;
-            if (error)
-                *error = QStringLiteral("Native RTMP read failed: %1").arg(m_socket->errorString());
-            return false;
+            if (m_socket->state() == QAbstractSocket::UnconnectedState) {
+                m_lastFailureKind = IngestFailureKind::TransientNetwork;
+                if (error)
+                    *error =
+                        QStringLiteral("Native RTMP read failed: %1").arg(m_socket->errorString());
+                return false;
+            }
+
+            if (!m_seenSupportedVideo && m_openedAtMs >= 0 &&
+                m_monotonic.elapsed() - m_openedAtMs >= kSupportedVideoProbeMs) {
+                return false;
+            }
+
+            const int64_t ageMs = m_lastPacketAtMs >= 0
+                                      ? m_monotonic.elapsed() - m_lastPacketAtMs
+                                      : int64_t(kStallTimeoutMs);
+            if (ageMs >= kStallTimeoutMs) {
+                m_lastFailureKind = IngestFailureKind::TransientNetwork;
+                if (error) *error = QStringLiteral("Native RTMP stalled.");
+                return false;
+            }
+            continue;
         }
 
         const QByteArray bytes = m_socket->readAll();
         if (bytes.isEmpty()) {
             continue;
         }
+        m_lastPacketAtMs = m_monotonic.elapsed();
 
         QList<RtmpMessage> parsed;
         if (!m_chunkParser.push(bytes, &parsed, error)) {
@@ -444,6 +631,14 @@ void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
             pong.append(message.payload.constData() + 2, 4);
             QString error;
             sendMessage(2, kMessageUserControl, 0, 0, pong, &error);
+        }
+        return;
+    }
+    if (message.type == kMessageCommandAmf0) {
+        if (commandPayloadContainsReconnectRequest(message.payload)) {
+            m_lastFailureKind = IngestFailureKind::TransientNetwork;
+            m_reconnectRequested = true;
+            log(QStringLiteral("Native RTMP reconnect request received."));
         }
         return;
     }
