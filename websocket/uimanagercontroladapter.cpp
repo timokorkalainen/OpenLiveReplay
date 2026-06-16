@@ -169,7 +169,17 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
         }
     } else if (name == QStringLiteral("transport.holdSpeed")) {
         const bool active = args.value(QStringLiteral("active")).toBool();
-        if (active) {
+        if (!active) {
+            if (!m_holdSpeedActive) {
+                return CommandResult::success();
+            }
+            if (transport) {
+                transport->setPlaying(m_holdSpeedWasPlaying);
+                transport->setSpeed(1.0);
+            }
+            m_holdSpeedActive = false;
+            m_holdSpeedWasPlaying = false;
+        } else {
             if (transport) {
                 if (!m_holdSpeedActive) {
                     m_holdSpeedWasPlaying = transport->isPlaying();
@@ -177,16 +187,6 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
                 }
                 transport->setSpeed(args.value(QStringLiteral("speed")).toDouble());
                 transport->setPlaying(true);
-            }
-        } else {
-            if (m_holdSpeedActive && transport) {
-                transport->setPlaying(m_holdSpeedWasPlaying);
-            }
-            m_holdSpeedActive = false;
-            if (transport) {
-                transport->setSpeed(1.0);
-            } else {
-                m_holdSpeedWasPlaying = false;
             }
         }
     } else if (name == QStringLiteral("transport.stepFrame")) {
