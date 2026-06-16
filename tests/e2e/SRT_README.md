@@ -122,7 +122,53 @@ perturbs the others — the control source records 37/37 flashes with zero gaps.
 the strict-isolation gate runs on the native path; the ffmpeg path's coupling is a
 known limitation that motivates native ingest on Apple.
 
-## Next (Phase 2c-b / 2c-c)
+## Phase 2c-b: packet-loss recovery
 
-Packet-loss / jitter injection (needs privileged macOS network emulation) and
-long-run drift over SRT — each its own spec under `docs/superpowers/specs/`.
+`e2e_native_srt_loss` (label `native-apple-ingest`, `OLR_NATIVE_SRT=1`) proves the
+native SRT ingest recovers from packet loss via SRT's ARQ retransmit. A
+`lossy_udp_relay.py` sits on the SRT link between the engine (SRT caller) and
+`srt-live-transmit` (SRT listener) and drops a **seeded % of downstream SRT DATA
+packets only** — SRT control (ACK/NAK/keepalive; first byte high bit `0x80`) always
+passes (no `command -v python3` → SKIP). One source is recorded through the relay at
+three loss levels:
+
+- **0 % baseline** → reference flash count `B`; relay drops nothing.
+- **12 % moderate** → relay dropped data; the native session's `srt_stats` shows
+  `pktRcvRetrans > 0` (ARQ retransmitted) and **`pktRcvDropTotal == 0`** (nothing
+  finally unrecovered); the recorded view keeps ≥ 0.85·`B` flashes with no gap > 1.5 s.
+- **88 % heavy (teeth)** → the run exits cleanly AND content degrades (≤ 0.5·`B`
+  flashes or a gap ≥ 2 s) — proving the injected loss is real and the gate
+  discriminates. (On loopback, SRT's 500 ms ARQ window recovers even 60 % loss, so
+  the teeth needs ~88 %.)
+
+The airtight recovery metric is **`pktRcvDropTotal`** (SRT's too-late-to-play,
+finally-unrecovered loss), logged by the native ingest on stop — *not*
+`pktRcvLossTotal`, which counts *detected* loss that ARQ then retransmits (so it is
+expectedly non-zero under loss). Loss %, seed, and thresholds are env-overridable
+(`OLR_SRT_LOSS_*`); the fixed seed makes drops deterministic.
+
+## Phase 2c-c / 2d: soak, loss isolation, reordering
+
+Three more native-ingest gates (`native-apple-ingest` label, `OLR_NATIVE_SRT=1`)
+complete the SRT robustness suite:
+
+- **`e2e_native_srt_soak`** — a 30 s native-SRT record must not crash/hang and must
+  keep delivering content (first flash < 3 s, ≥ `SECS−3` flashes, no gap > 1.5 s).
+  *Not* a drift detector: on one machine the source and recording share the same
+  wall clock, so the flash-PTS slope is ~1.0 by construction (real drift needs two
+  machines). The slope is reported as a diagnostic only.
+- **`e2e_native_srt_loss_multi`** — two independent native sources, src1's link
+  drops 12 % while src0's is clean. Asserts src1 recovers (`pktRcvDropTotal == 0`,
+  full content) AND src0 is **fully isolated** (0 relay drops, `pktRcvDropTotal == 0`,
+  full content, no gap). Extends the 2c-a per-socket isolation finding to the loss
+  dimension: each source owns its own libsrt socket, so one link's loss can't touch
+  another.
+- **`e2e_native_srt_jitter`** — `lossy_udp_relay.py`'s reorder mode delays each
+  downstream SRT DATA packet a random 0–120 ms (control passes immediately),
+  reordering the link; SRT's TSBPD (500 ms window) must re-order it. Asserts the
+  relay actually reordered (`reordered > 0`), the recording is complete + continuous,
+  and `pktRcvDropTotal == 0` (TSBPD recovered, nothing arrived too late to play).
+
+That completes Phase 2 (the SRT real-transport test ladder). Possible later work:
+cross-device clock-drift (two machines), encrypted SRT (passphrase), and surfacing
+the `srt_stats` loss telemetry on the connection-status UI (framesync roadmap JIT-5).

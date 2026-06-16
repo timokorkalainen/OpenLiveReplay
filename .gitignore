@@ -72,3 +72,7 @@ ios/streamdeck-bridge/StreamDeckBridge.xcodeproj/
 
 # Local git worktrees
 .worktrees/
+
+# Python bytecode cache (e.g. from tests/e2e/lossy_udp_relay.py)
+__pycache__/
+*.pyc

@@ -28,7 +28,7 @@ trap cleanup EXIT
 # (no listener). Record all 4 URLs with --report-connections; echo the reported
 # connected count (or -1 if the harness printed none).
 run_connected() {  # $1=live_count(1..4) $2=tag
-    local live="$1" tag="$2" i srt_port udp_port err
+    local live="$1" tag="$2" i srt_port udp_port err hp waited
     local localpids=()
     URLS=()
     for i in 0 1 2 3; do
@@ -41,11 +41,23 @@ run_connected() {  # $1=live_count(1..4) $2=tag
     done
     sleep 1.5
     err="$WORKDIR/${tag}.err"
+    # Run the harness under a watchdog. It prints connected=N at the ~SECS mark
+    # (before stopRecording), so the count is captured even when the dead 4th URL
+    # stalls SRT teardown afterward — observed wedging stopRecording for minutes
+    # under load, which used to hang this gate to the ctest timeout. The watchdog
+    # reaps the stalled process once the count is on disk; healthy runs exit on
+    # their own well inside the window, so no latency is added to the common case.
     "$HARNESS" --url "${URLS[0]}" --url "${URLS[1]}" --url "${URLS[2]}" --url "${URLS[3]}" \
         --outdir "$WORKDIR" --name "srtconn_${tag}" --seconds "$SECS" --fps 30 \
-        --report-connections >/dev/null 2>"$err"
+        --report-connections >/dev/null 2>"$err" &
+    hp=$!
+    waited=0
+    while kill -0 "$hp" 2>/dev/null && [ "$waited" -lt $((SECS + 17)) ]; do
+        sleep 1; waited=$((waited + 1))
+    done
+    kill -9 "$hp" 2>/dev/null
     (( ${#localpids[@]} )) && kill "${localpids[@]}" 2>/dev/null
-    wait "${localpids[@]}" 2>/dev/null
+    wait "${localpids[@]}" "$hp" 2>/dev/null
     awk -F= '/^connected=/{print $2; found=1} END{if(!found)print "-1"}' "$err"
 }
 
