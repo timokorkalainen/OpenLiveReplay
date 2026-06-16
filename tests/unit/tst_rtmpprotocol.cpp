@@ -21,6 +21,10 @@ private slots:
     void amf0CommandRoundTripsNameAndTransaction();
     void amf0WritesStrictArrayForFourCcList();
     void amf0SkipsEcmaArrayMetadata();
+    void amf0SkipsStrictArray();
+    void amf0RejectsMalformedObjectKeyWithoutAdvancingOffset();
+    void amf0RejectsMalformedEcmaArrayKeyWithoutAdvancingOffset();
+    void amf0RejectsExcessiveNestingWithoutAdvancingOffset();
     void chunkParserReassemblesSplitMessageAndUpdatesChunkSize();
     void chunkParserDoesNotDoubleApplyTimestampDeltaWhenPayloadArrivesLater();
     void chunkParserConsumesExtendedTimestampOnContinuationChunks();
@@ -102,6 +106,53 @@ void TestRtmpProtocol::amf0SkipsEcmaArrayMetadata() {
     int offset = 0;
     QVERIFY(RtmpAmf0::skipValue(metadata, &offset));
     QCOMPARE(offset, metadata.size());
+}
+
+void TestRtmpProtocol::amf0SkipsStrictArray() {
+    const QByteArray array = RtmpAmf0::strictArray({
+        RtmpAmf0::string(QStringLiteral("avc1")),
+        RtmpAmf0::number(1),
+        RtmpAmf0::boolean(true),
+        RtmpAmf0::nullValue(),
+    });
+
+    int offset = 0;
+    QVERIFY(RtmpAmf0::skipValue(array, &offset));
+    QCOMPARE(offset, array.size());
+}
+
+void TestRtmpProtocol::amf0RejectsMalformedObjectKeyWithoutAdvancingOffset() {
+    QByteArray object;
+    object.append(char(0x03));
+    object.append(QByteArray::fromHex("0005"));
+    object.append("ab", 2);
+
+    int offset = 0;
+    QVERIFY(!RtmpAmf0::skipValue(object, &offset));
+    QCOMPARE(offset, 0);
+}
+
+void TestRtmpProtocol::amf0RejectsMalformedEcmaArrayKeyWithoutAdvancingOffset() {
+    QByteArray ecmaArray;
+    ecmaArray.append(char(0x08));
+    ecmaArray.append(QByteArray::fromHex("00000001"));
+    ecmaArray.append(QByteArray::fromHex("0005"));
+    ecmaArray.append("ab", 2);
+
+    int offset = 0;
+    QVERIFY(!RtmpAmf0::skipValue(ecmaArray, &offset));
+    QCOMPARE(offset, 0);
+}
+
+void TestRtmpProtocol::amf0RejectsExcessiveNestingWithoutAdvancingOffset() {
+    QByteArray value = RtmpAmf0::nullValue();
+    for (int i = 0; i < 130; ++i) {
+        value = RtmpAmf0::strictArray({value});
+    }
+
+    int offset = 0;
+    QVERIFY(!RtmpAmf0::skipValue(value, &offset));
+    QCOMPARE(offset, 0);
 }
 
 void TestRtmpProtocol::chunkParserReassemblesSplitMessageAndUpdatesChunkSize() {
