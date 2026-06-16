@@ -670,17 +670,21 @@ int UIManager::frameRateIndex() const {
     return -1; // a non-preset rate loaded from config
 }
 
+void UIManager::applyFrameRate(const FrameRate &r) {
+    m_currentSettings.fpsNum = r.num;
+    m_currentSettings.fpsDen = r.den;
+    if (m_replayManager) m_replayManager->setFrameRate(r);
+    if (m_transport) m_transport->setFps(r.roundedFps());
+    emit frameRateChanged();
+}
+
 void UIManager::setFrameRateIndex(int index) {
     if (m_replayManager && m_replayManager->isRecording()) return;
     const auto& presets = frameRatePresets();
     if (index < 0 || index >= int(presets.size())) return;
     const FrameRate r = presets[size_t(index)].rate;
     if (m_currentSettings.fpsNum == r.num && m_currentSettings.fpsDen == r.den) return;
-    m_currentSettings.fpsNum = r.num;
-    m_currentSettings.fpsDen = r.den;
-    if (m_replayManager) m_replayManager->setFrameRate(r);
-    if (m_transport) m_transport->setFps(r.roundedFps());
-    emit frameRateChanged();
+    applyFrameRate(r);
 }
 int UIManager::multiviewCount() const { return m_currentSettings.multiviewCount; }
 bool UIManager::isRecording() const { return m_replayManager->isRecording(); }
@@ -1239,19 +1243,13 @@ void UIManager::setRecordFps(int fps) {
     if (fps <= 0) return;
     // Changing fps mid-recording desyncs the workers (frozen at their
     // construction-time fps) from the heartbeat: lowering freezes all output,
-    // raising corrupts the timeline. Refuse while recording; the QML SpinBox
+    // raising corrupts the timeline. Refuse while recording; the QML ComboBox
     // also disables, but guard the engine in case that's bypassed.
     if (m_replayManager && m_replayManager->isRecording()) return;
     // The remote control API speaks integer fps; map it onto a 1/1 rational.
-    if (m_currentSettings.fpsNum != fps || m_currentSettings.fpsDen != 1) {
-        m_currentSettings.fpsNum = fps;
-        m_currentSettings.fpsDen = 1;
-        m_replayManager->setFps(fps);
-        if (m_transport) {
-            m_transport->setFps(fps);
-        }
-        emit frameRateChanged();
-    }
+    const FrameRate r{fps, 1};
+    if (m_currentSettings.fpsNum == r.num && m_currentSettings.fpsDen == r.den) return;
+    applyFrameRate(r);
 }
 
 int UIManager::audioOutputLatencyMs() const {
