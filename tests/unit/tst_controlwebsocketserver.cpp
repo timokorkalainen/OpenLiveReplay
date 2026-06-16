@@ -5,6 +5,7 @@
 #include <QSignalSpy>
 #include <QWebSocket>
 
+#include "websocket/controlapiadapter.h"
 #include "websocket/controlstate.h"
 #include "websocket/controlwebsocketserver.h"
 
