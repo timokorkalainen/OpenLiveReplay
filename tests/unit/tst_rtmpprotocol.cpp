@@ -19,6 +19,8 @@ class TestRtmpProtocol : public QObject {
     Q_OBJECT
 private slots:
     void amf0CommandRoundTripsNameAndTransaction();
+    void amf0WritesStrictArrayForFourCcList();
+    void amf0SkipsEcmaArrayMetadata();
     void chunkParserReassemblesSplitMessageAndUpdatesChunkSize();
     void chunkParserDoesNotDoubleApplyTimestampDeltaWhenPayloadArrivesLater();
     void chunkParserConsumesExtendedTimestampOnContinuationChunks();
@@ -63,6 +65,43 @@ void TestRtmpProtocol::amf0CommandRoundTripsNameAndTransaction() {
     QCOMPARE(command, QStringLiteral("connect"));
     QCOMPARE(transactionId, 1.0);
     QCOMPARE(offset, payload.size());
+}
+
+void TestRtmpProtocol::amf0WritesStrictArrayForFourCcList() {
+    const QByteArray array = RtmpAmf0::strictArray({
+        RtmpAmf0::string(QStringLiteral("avc1")),
+        RtmpAmf0::string(QStringLiteral("hvc1")),
+        RtmpAmf0::string(QStringLiteral("mp4a")),
+    });
+
+    QCOMPARE(uchar(array[0]), 0x0a);
+    QCOMPARE(array.mid(1, 4).toHex(), QByteArray("00000003"));
+    int offset = 5;
+    QString value;
+    QVERIFY(RtmpAmf0::readString(array, &offset, &value));
+    QCOMPARE(value, QStringLiteral("avc1"));
+    QVERIFY(RtmpAmf0::readString(array, &offset, &value));
+    QCOMPARE(value, QStringLiteral("hvc1"));
+    QVERIFY(RtmpAmf0::readString(array, &offset, &value));
+    QCOMPARE(value, QStringLiteral("mp4a"));
+    QCOMPARE(offset, array.size());
+}
+
+void TestRtmpProtocol::amf0SkipsEcmaArrayMetadata() {
+    QByteArray metadata;
+    metadata.append(char(0x08));
+    metadata.append(QByteArray::fromHex("00000002"));
+    metadata.append(QByteArray::fromHex("0005"));
+    metadata.append("width", 5);
+    metadata.append(RtmpAmf0::number(1920));
+    metadata.append(QByteArray::fromHex("000c"));
+    metadata.append("videocodecid", 12);
+    metadata.append(RtmpAmf0::string(QStringLiteral("hvc1")));
+    metadata.append("\0\0\x09", 3);
+
+    int offset = 0;
+    QVERIFY(RtmpAmf0::skipValue(metadata, &offset));
+    QCOMPARE(offset, metadata.size());
 }
 
 void TestRtmpProtocol::chunkParserReassemblesSplitMessageAndUpdatesChunkSize() {

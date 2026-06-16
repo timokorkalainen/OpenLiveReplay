@@ -82,6 +82,20 @@ QByteArray RtmpAmf0::object(const QList<QPair<QString, QByteArray>>& values) {
     return out;
 }
 
+QByteArray RtmpAmf0::strictArray(const QList<QByteArray>& values) {
+    QByteArray out;
+    out.append(char(0x0a));
+    const quint32 count = quint32(values.size());
+    out.append(char((count >> 24) & 0xff));
+    out.append(char((count >> 16) & 0xff));
+    out.append(char((count >> 8) & 0xff));
+    out.append(char(count & 0xff));
+    for (const QByteArray& value : values) {
+        out.append(value);
+    }
+    return out;
+}
+
 bool RtmpAmf0::readString(const QByteArray& data, int* offset, QString* value) {
     if (!offset || !value || needMore(data, *offset, 3) || uchar(data[*offset]) != 0x02) {
         return false;
@@ -141,6 +155,30 @@ bool RtmpAmf0::skipValue(const QByteArray& data, int* offset) {
             if (!skipValue(data, offset)) return false;
         }
         return false;
+    }
+    if (type == 0x08) {
+        if (needMore(data, *offset, 4)) return false;
+        *offset += 4;
+        while (*offset + 3 <= data.size()) {
+            if (uchar(data[*offset]) == 0 && uchar(data[*offset + 1]) == 0 &&
+                uchar(data[*offset + 2]) == 0x09) {
+                *offset += 3;
+                return true;
+            }
+            const int keySize = (int(uchar(data[*offset])) << 8) | int(uchar(data[*offset + 1]));
+            *offset += 2 + keySize;
+            if (!skipValue(data, offset)) return false;
+        }
+        return false;
+    }
+    if (type == 0x0a) {
+        if (needMore(data, *offset, 4)) return false;
+        const quint32 count = readU32Be(data.constData() + *offset);
+        *offset += 4;
+        for (quint32 i = 0; i < count; ++i) {
+            if (!skipValue(data, offset)) return false;
+        }
+        return true;
     }
     return type == 0x05 || type == 0x06;
 }
