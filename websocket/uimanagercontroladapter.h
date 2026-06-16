@@ -26,6 +26,8 @@ public:
 
 private:
     UIManager *m_uiManager = nullptr;
+    bool m_holdSpeedActive = false;
+    bool m_holdSpeedWasPlaying = false;
 };
 
 #endif

@@ -168,12 +168,25 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString &name, const
             }
         }
     } else if (name == QStringLiteral("transport.holdSpeed")) {
-        if (transport) {
-            if (args.value(QStringLiteral("active")).toBool()) {
+        const bool active = args.value(QStringLiteral("active")).toBool();
+        if (active) {
+            if (transport) {
+                if (!m_holdSpeedActive) {
+                    m_holdSpeedWasPlaying = transport->isPlaying();
+                    m_holdSpeedActive = true;
+                }
                 transport->setSpeed(args.value(QStringLiteral("speed")).toDouble());
                 transport->setPlaying(true);
-            } else {
+            }
+        } else {
+            if (m_holdSpeedActive && transport) {
+                transport->setPlaying(m_holdSpeedWasPlaying);
+            }
+            m_holdSpeedActive = false;
+            if (transport) {
                 transport->setSpeed(1.0);
+            } else {
+                m_holdSpeedWasPlaying = false;
             }
         }
     } else if (name == QStringLiteral("transport.stepFrame")) {
