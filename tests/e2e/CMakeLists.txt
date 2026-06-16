@@ -237,6 +237,13 @@ if(APPLE)
         TIMEOUT 120
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # AUD-4: A/V lip-sync over the PCR-anchored native SRT ingest (EBU R37). Base 23710.
+    add_test(NAME e2e_native_srt_lipsync
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_lipsync.sh" "$<TARGET_FILE:sync_harness>" 23710)
+    set_tests_properties(e2e_native_srt_lipsync PROPERTIES
+        LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")
     add_test(NAME e2e_native_srt_hevc_smoke
