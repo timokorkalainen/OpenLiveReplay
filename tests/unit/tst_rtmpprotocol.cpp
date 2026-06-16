@@ -97,6 +97,9 @@ private slots:
     void parsesEnhancedSequenceEndWithoutCompositionTime();
     void parsesLegacyAvcVideoPacket();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
+    void parsesHevcSequenceHeaderAndConvertsNalusToAnnexB();
+    void rejectsMalformedHevcSequenceHeaders();
+    void rejectsMalformedLengthPrefixedNalus();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
 
@@ -1009,6 +1012,75 @@ void TestRtmpProtocol::parsesAvcSequenceHeaderAndConvertsNalusToAnnexB() {
     lengthPrefixed.append(nal);
 
     QCOMPARE(RtmpFlv::avcPayloadToAnnexB(lengthPrefixed, 4), QByteArray::fromHex("0000000165888421"));
+}
+
+void TestRtmpProtocol::parsesHevcSequenceHeaderAndConvertsNalusToAnnexB() {
+    const QByteArray vps = QByteArray::fromHex("40010c01ffff01600000030090000003000003005d959809");
+    const QByteArray sps = QByteArray::fromHex("42010101600000030090000003000003005da00280802d1f");
+    const QByteArray pps = QByteArray::fromHex("4401c172b46240");
+
+    QByteArray config(23, char(0));
+    config[0] = char(1);
+    config[21] = char(0xfc | 3); // 4-byte NAL length
+    config[22] = char(3);        // arrays
+
+    auto appendArray = [&](int nalType, const QByteArray& nal) {
+        config.append(char(0x80 | nalType));
+        config.append(char(0));
+        config.append(char(1));
+        config.append(char((nal.size() >> 8) & 0xff));
+        config.append(char(nal.size() & 0xff));
+        config.append(nal);
+    };
+    appendArray(32, vps);
+    appendArray(33, sps);
+    appendArray(34, pps);
+
+    RtmpHevcConfig parsed;
+    QString error;
+    QVERIFY(RtmpFlv::parseHevcSequenceHeader(config, &parsed, &error));
+    QCOMPARE(parsed.nalLengthSize, 4);
+    QCOMPARE(parsed.parameterSets.hevcVps, QList<QByteArray>{vps});
+    QCOMPARE(parsed.parameterSets.hevcSps, QList<QByteArray>{sps});
+    QCOMPARE(parsed.parameterSets.hevcPps, QList<QByteArray>{pps});
+
+    QByteArray frame;
+    frame.append(QByteArray::fromHex("00000002"));
+    frame.append(QByteArray::fromHex("2601"));
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(frame, 4),
+             QByteArray::fromHex("000000012601"));
+}
+
+void TestRtmpProtocol::rejectsMalformedHevcSequenceHeaders() {
+    RtmpHevcConfig parsed;
+    QString error;
+    QVERIFY(!RtmpFlv::parseHevcSequenceHeader(QByteArray(22, char(0)), &parsed, &error));
+    QVERIFY(errorMentions(error, QStringLiteral("malformed")));
+
+    QByteArray missingParameterSets(23, char(0));
+    missingParameterSets[0] = char(1);
+    missingParameterSets[21] = char(0xfc | 3);
+    missingParameterSets[22] = char(0);
+    error.clear();
+    QVERIFY(!RtmpFlv::parseHevcSequenceHeader(missingParameterSets, &parsed, &error));
+    QVERIFY(errorMentions(error, QStringLiteral("VPS/SPS/PPS")));
+
+    QByteArray truncatedArray(23, char(0));
+    truncatedArray[0] = char(1);
+    truncatedArray[21] = char(0xfc | 3);
+    truncatedArray[22] = char(1);
+    truncatedArray.append(char(0x80 | 32));
+    truncatedArray.append(char(0));
+    error.clear();
+    QVERIFY(!RtmpFlv::parseHevcSequenceHeader(truncatedArray, &parsed, &error));
+    QVERIFY(errorMentions(error, QStringLiteral("truncated")));
+}
+
+void TestRtmpProtocol::rejectsMalformedLengthPrefixedNalus() {
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("00000004aabb"), 4),
+             QByteArray());
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("0001aa"), 0),
+             QByteArray());
 }
 
 void TestRtmpProtocol::parsesAacSequenceHeaderAndBuildsAdtsFrame() {

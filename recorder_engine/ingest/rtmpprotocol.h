@@ -104,6 +104,11 @@ struct RtmpAvcConfig {
     H26xParameterSets parameterSets;
 };
 
+struct RtmpHevcConfig {
+    int nalLengthSize = 4;
+    H26xParameterSets parameterSets;
+};
+
 struct RtmpAacConfig {
     int audioObjectType = 0;
     int sampleRate = 0;
@@ -139,6 +144,8 @@ namespace RtmpFlv {
 qint32 readS24(const char* data);
 bool parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packet, QString* error);
 bool parseAvcSequenceHeader(const QByteArray& payload, RtmpAvcConfig* config, QString* error);
+bool parseHevcSequenceHeader(const QByteArray& payload, RtmpHevcConfig* config, QString* error);
+QByteArray lengthPrefixedPayloadToAnnexB(const QByteArray& payload, int nalLengthSize);
 QByteArray avcPayloadToAnnexB(const QByteArray& payload, int nalLengthSize);
 bool parseAacSequenceHeader(const QByteArray& payload, RtmpAacConfig* config, QString* error);
 QByteArray adtsHeader(const RtmpAacConfig& config, int payloadSize);

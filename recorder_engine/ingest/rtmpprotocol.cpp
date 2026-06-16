@@ -749,23 +749,104 @@ bool RtmpFlv::parseAvcSequenceHeader(const QByteArray& payload, RtmpAvcConfig* c
     return true;
 }
 
-QByteArray RtmpFlv::avcPayloadToAnnexB(const QByteArray& payload, int nalLengthSize) {
+bool RtmpFlv::parseHevcSequenceHeader(const QByteArray& payload, RtmpHevcConfig* config,
+                                      QString* error) {
+    if (!config || payload.size() < 23) {
+        if (error) *error = QStringLiteral("RTMP HEVC sequence header is malformed.");
+        return false;
+    }
+
+    RtmpHevcConfig parsed;
+    parsed.nalLengthSize = (uchar(payload[21]) & 0x03) + 1;
+    const int arrayCount = uchar(payload[22]);
+    int offset = 23;
+
+    for (int i = 0; i < arrayCount; ++i) {
+        if (needMore(payload, offset, 3)) {
+            if (error) {
+                *error = QStringLiteral("RTMP HEVC sequence header has truncated array header.");
+            }
+            return false;
+        }
+
+        const int nalType = uchar(payload[offset++]) & 0x3f;
+        const int nalCount = (int(uchar(payload[offset])) << 8) | int(uchar(payload[offset + 1]));
+        offset += 2;
+
+        for (int j = 0; j < nalCount; ++j) {
+            if (needMore(payload, offset, 2)) {
+                if (error) {
+                    *error =
+                        QStringLiteral("RTMP HEVC sequence header has truncated NAL length.");
+                }
+                return false;
+            }
+            const int size = (int(uchar(payload[offset])) << 8) | int(uchar(payload[offset + 1]));
+            offset += 2;
+            if (size <= 0) {
+                if (error) {
+                    *error = QStringLiteral("RTMP HEVC sequence header has malformed NAL size.");
+                }
+                return false;
+            }
+            if (needMore(payload, offset, size)) {
+                if (error) {
+                    *error = QStringLiteral("RTMP HEVC sequence header has truncated NAL unit.");
+                }
+                return false;
+            }
+
+            const QByteArray nal = payload.mid(offset, size);
+            if (nalType == 32) {
+                parsed.parameterSets.hevcVps.append(nal);
+            } else if (nalType == 33) {
+                parsed.parameterSets.hevcSps.append(nal);
+            } else if (nalType == 34) {
+                parsed.parameterSets.hevcPps.append(nal);
+            }
+            offset += size;
+        }
+    }
+
+    if (parsed.parameterSets.hevcVps.isEmpty() || parsed.parameterSets.hevcSps.isEmpty() ||
+        parsed.parameterSets.hevcPps.isEmpty()) {
+        if (error) *error = QStringLiteral("RTMP HEVC sequence header lacks VPS/SPS/PPS.");
+        return false;
+    }
+
+    *config = std::move(parsed);
+    return true;
+}
+
+QByteArray RtmpFlv::lengthPrefixedPayloadToAnnexB(const QByteArray& payload, int nalLengthSize) {
+    if (nalLengthSize < 1 || nalLengthSize > 4) {
+        return QByteArray();
+    }
+
     QByteArray annexB;
     int offset = 0;
-    while (offset + nalLengthSize <= payload.size()) {
+    while (offset < payload.size()) {
+        if (needMore(payload, offset, nalLengthSize)) {
+            return QByteArray();
+        }
+
         int nalSize = 0;
         for (int i = 0; i < nalLengthSize; ++i) {
             nalSize = (nalSize << 8) | int(uchar(payload[offset + i]));
         }
         offset += nalLengthSize;
-        if (nalSize <= 0 || offset + nalSize > payload.size()) {
-            break;
+        if (nalSize <= 0 || nalSize > payload.size() - offset) {
+            return QByteArray();
         }
         annexB.append("\0\0\0\1", 4);
         annexB.append(payload.constData() + offset, nalSize);
         offset += nalSize;
     }
     return annexB;
+}
+
+QByteArray RtmpFlv::avcPayloadToAnnexB(const QByteArray& payload, int nalLengthSize) {
+    return lengthPrefixedPayloadToAnnexB(payload, nalLengthSize);
 }
 
 bool RtmpFlv::parseAacSequenceHeader(const QByteArray& payload, RtmpAacConfig* config,
