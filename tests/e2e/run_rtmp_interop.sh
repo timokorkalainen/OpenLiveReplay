@@ -52,26 +52,26 @@ if [ "$CODEC" = "avc" ]; then
     rtmp_generate_tone_flv "$SOURCE" 1000 "$SECONDS_TO_RECORD"
     publish_cmd=(ffmpeg -hide_banner -loglevel error -re -stream_loop -1 -i "$SOURCE" -c copy -f flv "$PUBLISH_URL")
 elif [ "$CODEC" = "hevc" ]; then
-    SOURCE="$WORKDIR/interop.hevc"
+    SOURCE="$WORKDIR/interop_hevc.flv"
     if ! ffmpeg -hide_banner -loglevel error \
         -f lavfi -i "testsrc2=size=640x480:rate=30" \
-        -t "$SECONDS_TO_RECORD" -an -pix_fmt yuv420p \
+        -f lavfi -i "sine=frequency=1000:sample_rate=48000" -ac 2 \
+        -t "$SECONDS_TO_RECORD" -pix_fmt yuv420p \
         -c:v hevc_videotoolbox -allow_sw 1 -g 30 -bf 0 \
-        -f hevc "$SOURCE" >/dev/null 2>&1 || [ ! -s "$SOURCE" ]; then
+        -c:a aac -b:a 128k -f flv "$SOURCE" >/dev/null 2>&1 || [ ! -s "$SOURCE" ]; then
         rm -f "$SOURCE"
         if ! ffmpeg -hide_banner -loglevel error \
             -f lavfi -i "testsrc2=size=640x480:rate=30" \
-            -t "$SECONDS_TO_RECORD" -an -pix_fmt yuv420p \
+            -f lavfi -i "sine=frequency=1000:sample_rate=48000" -ac 2 \
+            -t "$SECONDS_TO_RECORD" -pix_fmt yuv420p \
             -c:v libx265 -preset ultrafast \
             -x265-params "log-level=error:keyint=30:min-keyint=30:scenecut=0" \
-            -f hevc "$SOURCE" >/dev/null 2>&1 || [ ! -s "$SOURCE" ]; then
+            -c:a aac -b:a 128k -f flv "$SOURCE" >/dev/null 2>&1 || [ ! -s "$SOURCE" ]; then
             echo "SKIP: local ffmpeg cannot generate HEVC fixture"
             exit 77
         fi
     fi
-    publish_cmd=(ffmpeg -hide_banner -loglevel error -re -stream_loop -1 -f hevc -i "$SOURCE" \
-        -f lavfi -i "sine=frequency=1000:sample_rate=48000" -ac 2 \
-        -c:v copy -c:a aac -b:a 128k -f flv "$PUBLISH_URL")
+    publish_cmd=(ffmpeg -hide_banner -loglevel error -re -stream_loop -1 -i "$SOURCE" -c copy -f flv "$PUBLISH_URL")
 else
     echo "FAIL: unsupported OLR_RTMP_INTEROP_CODEC=$CODEC"
     exit 1
