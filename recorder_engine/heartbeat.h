@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include "framerate.h"
+
 // Inclusive range of frame indices to emit on one heartbeat tick. Empty when to < from.
 struct FrameSpan {
     int64_t from = 1;
@@ -18,7 +20,7 @@ struct FrameSpan {
 //     catch-up never freezes the caller's thread.
 // Returns an empty span (to < from) when the frame count has not advanced or fps<=0.
 // fps is the ONLY frame-rate dependence; P1 (rational fps) swaps it here alone.
-FrameSpan heartbeatFrameSpan(int64_t elapsedMs, int fps, int64_t lastFrame, int maxPerTick,
-                             int64_t maxBacklogFrames);
+FrameSpan heartbeatFrameSpan(int64_t elapsedMs, const FrameRate& rate, int64_t lastFrame,
+                             int maxPerTick, int64_t maxBacklogFrames);
 
 #endif // HEARTBEAT_H

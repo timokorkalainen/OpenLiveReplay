@@ -7,6 +7,8 @@
 #include <QString>
 #include <QStringList>
 
+#include "framerate.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -28,11 +30,12 @@ public:
     Muxer();
     ~Muxer();
 
-    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-             int audioSampleRate = 48000, int audioChannels = 2);
-    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-             const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
-             int audioSampleRate = 48000, int audioChannels = 2);
+    bool init(const QString& filename, int videoTrackCount, int width, int height, FrameRate rate,
+              const QStringList& streamNames, int audioSampleRate = 48000, int audioChannels = 2);
+    bool init(const QString& filename, int videoTrackCount, int width, int height, FrameRate rate,
+              const QStringList& streamNames, const QStringList& telemetryFeedIds,
+              const QStringList& telemetryFeedNames, int audioSampleRate = 48000,
+              int audioChannels = 2);
     void writePacket(AVPacket* pkt);
     void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     void writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);

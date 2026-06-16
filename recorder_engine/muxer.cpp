@@ -8,12 +8,15 @@ Muxer::Muxer() {}
 
 Muxer::~Muxer() { close(); }
 
-bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-                 int audioSampleRate, int audioChannels) {
-    return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate, audioChannels);
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height,
+                 FrameRate rate, const QStringList& streamNames, int audioSampleRate,
+                 int audioChannels) {
+    return init(filename, videoTrackCount, width, height, rate, streamNames, {}, {},
+                audioSampleRate, audioChannels);
 }
 
-bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height,
+                 FrameRate rate, const QStringList& streamNames,
                  const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
                  int audioSampleRate, int audioChannels) {
     QMutexLocker locker(&m_mutex);
@@ -28,7 +31,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
 
     if (width <= 0) width = 1920;
     if (height <= 0) height = 1080;
-    if (fps <= 0) fps = 30;
+    if (!rate.isValid()) rate = FrameRate{30, 1};
 
     // 1. Create Format Context for Matroska
     m_activePath = getVideoPath(filename);
@@ -53,8 +56,8 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->time_base = {1, 1000};
 
         // 3. Set the metadata hints
-        st->avg_frame_rate = {fps, 1};
-        st->r_frame_rate = {fps, 1};
+        st->avg_frame_rate = {rate.num, rate.den};
+        st->r_frame_rate = {rate.num, rate.den};
 
         // For MPEG-2, you can also set the 'closed gop' and 'fixed fps' flags in codecpar
         st->codecpar->video_delay = 0;

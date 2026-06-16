@@ -11,16 +11,17 @@
 
 #include <memory>
 
-StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock *clock,
-                           int targetWidth, int targetHeight, int targetFps, QObject* parent)
-    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer), m_sharedClock(clock) {
+StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
+                           int targetWidth, int targetHeight, FrameRate targetRate, QObject* parent)
+    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
+      m_sharedClock(clock) {
     qRegisterMetaType<SrtStats>("SrtStats");
     m_restartCapture = 0;
     m_internalFrameCount = 0;
     m_monotonic.start();
     if (targetWidth > 0) m_targetWidth = targetWidth;
     if (targetHeight > 0) m_targetHeight = targetHeight;
-    if (targetFps > 0) m_targetFps = targetFps;
+    if (targetRate.isValid()) m_targetRate = targetRate;
 }
 
 StreamWorker::~StreamWorker() { stop(); wait(); }
@@ -88,7 +89,7 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     // Publish this tick's jitter-pull gate for the capture thread's
     // queue pre-drain (see captureLoop).
     m_lastTickTargetMs.store(
-        qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - jitterMs - trimMs),
+        qMax<int64_t>(0, m_targetRate.msForFrame(frameIndex) - jitterMs - trimMs),
         std::memory_order_relaxed);
 
     if (!m_persistentEncCtx) return;
@@ -122,7 +123,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     AVPacket* outPkt = av_packet_alloc();
     bool havePacket = false;
     int track = -1;
-    const int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
+    const int64_t currentRecordingTimeMs = m_targetRate.msForFrame(m_internalFrameCount);
 
     AVFrame* pulled = nullptr;
     const bool paintBlue = m_paintBlue.fetchAndStoreRelaxed(0) != 0;
@@ -289,7 +290,7 @@ void StreamWorker::captureLoop() {
 
             // Count backstop (~10 s of frames) against future-stamped bursts
             // after a re-anchor.
-            const int backstopFrames = 10 * m_targetFps;
+            const int backstopFrames = 10 * m_targetRate.roundedFps();
             while (m_frameQueue.size() > backstopFrames) {
                 auto old = m_frameQueue.dequeue();
                 av_frame_free(&old.frame);
@@ -328,7 +329,7 @@ void StreamWorker::captureLoop() {
 #endif
         {
             session = std::make_unique<FfmpegIngestSession>(
-                m_sourceIndex, m_targetWidth, m_targetHeight, m_targetFps);
+                m_sourceIndex, m_targetWidth, m_targetHeight, m_targetRate.roundedFps());
         }
 
         if (!session->open(sourceUrl, callbacks)) {
@@ -401,23 +402,18 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     // representable rate into the elementary stream while our container stamps
     // {fps,1}, so the file carries contradictory rates and ES-rate-trusting
     // tools mis-time the video.  Warn so the operator can pick a standard rate.
-    switch (m_targetFps) {
-    case 24:
-    case 25:
-    case 30:
-    case 50:
-    case 60:
-        break; // exactly representable
-    default:
-        qWarning() << "Source" << m_sourceIndex << "fps" << m_targetFps
-                   << "is not an exact MPEG-2 rate; the elementary stream will"
-                   << "carry the nearest representable rate (use 24/25/30/50/60"
-                   << "to avoid a container/ES rate mismatch).";
-        break;
+    const int rounded = m_targetRate.roundedFps();
+    const bool exact = m_targetRate.den == 1 && (rounded == 24 || rounded == 25 || rounded == 30 ||
+                                                 rounded == 50 || rounded == 60);
+    if (!exact) {
+        qWarning() << "Source" << m_sourceIndex << "rate" << m_targetRate.num << "/"
+                   << m_targetRate.den
+                   << "is not an exact MPEG-2 rate; the elementary stream will carry the"
+                   << "nearest representable rate.";
     }
 
-    (*encCtx)->time_base = {1, m_targetFps};      // Internal codec clock
-    (*encCtx)->framerate = {m_targetFps, 1};      // Target framerate
+    (*encCtx)->time_base = {m_targetRate.den, m_targetRate.num}; // Internal codec clock
+    (*encCtx)->framerate = {m_targetRate.num, m_targetRate.den}; // Target framerate
 
     (*encCtx)->pix_fmt = AV_PIX_FMT_YUV420P;
     (*encCtx)->gop_size = 1;             // Keep Intra-only for seeking
@@ -543,7 +539,8 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
     }
 
     if (m_audioWriteCursor < 0) {
-        m_audioWriteCursor = qMax<int64_t>(0, targetEnd - kAudioSampleRate / m_targetFps);
+        m_audioWriteCursor =
+            qMax<int64_t>(0, targetEnd - m_targetRate.samplesPerFrame(kAudioSampleRate));
     }
     if (targetEnd <= m_audioWriteCursor) return;
 

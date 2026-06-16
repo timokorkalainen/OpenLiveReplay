@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "recordingclock.h"
+#include "framerate.h"
 #include "muxer.h"
 #include "ingest/ingestsession.h"
 
@@ -52,7 +53,8 @@ public:
     // sourceIndex: fixed identity of this source (for logging)
     // initialViewTrack: which muxer track to encode into (-1 = no view assigned)
     StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
-                 int targetWidth, int targetHeight, int targetFps, QObject* parent = nullptr);
+                 int targetWidth, int targetHeight, FrameRate targetRate,
+                 QObject* parent = nullptr);
     ~StreamWorker();
 
     // Change the source URL (real FFmpeg reconnect — only for user editing a URL)
@@ -166,7 +168,7 @@ private:
 
     int m_targetWidth = 1920;
     int m_targetHeight = 1080;
-    int m_targetFps = 30;
+    FrameRate m_targetRate{30, 1};
 
     // FFmpeg context management
     struct QueuedFrame {
