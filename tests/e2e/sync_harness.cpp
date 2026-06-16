@@ -24,6 +24,7 @@
 #include <cstdio>
 
 #include "recorder_engine/replaymanager.h"
+#include "recorder_engine/ingest/ingestsession.h"
 
 namespace {
 QString argValue(const QStringList& args, const QString& flag, const QString& fallback) {
@@ -56,6 +57,7 @@ int main(int argc, char** argv) {
     const int trimMs = argValue(args, QStringLiteral("--trim"), QStringLiteral("0")).toInt();
     const bool reportConnections = args.contains(QStringLiteral("--report-connections"));
     const bool reportConnectionEvents = args.contains(QStringLiteral("--report-connection-events"));
+    const bool reportStats = args.contains(QStringLiteral("--report-stats"));
 
     if (urls.isEmpty()) {
         fprintf(stderr, "sync_harness: at least one --url is required\n");
@@ -98,12 +100,17 @@ int main(int argc, char** argv) {
     //    real up->down->up sequence.
     QSet<int> connectedSources;
     QHash<int, QVector<QPair<qint64, bool>>> connEvents;
+    QHash<int, SrtStats> latestStats;
     QElapsedTimer connTimer;
     connTimer.start();
     QObject::connect(&rm, &ReplayManager::sourceConnectionChanged, &app,
                      [&connectedSources, &connEvents, &connTimer](int sourceIndex, bool connected) {
                          if (connected) connectedSources.insert(sourceIndex);
                          connEvents[sourceIndex].append(qMakePair(connTimer.elapsed(), connected));
+                     });
+    QObject::connect(&rm, &ReplayManager::sourceStatsUpdated, &app,
+                     [&latestStats](int sourceIndex, SrtStats stats) {
+                         latestStats.insert(sourceIndex, stats);
                      });
 
     rm.startRecording();
@@ -142,6 +149,17 @@ int main(int argc, char** argv) {
                     line += QStringLiteral(" %1:%2").arg(ev.first).arg(
                         ev.second ? QStringLiteral("up") : QStringLiteral("down"));
                 fprintf(stderr, "%s\n", qPrintable(line));
+            }
+            fflush(stderr);
+        }
+        if (reportStats) {
+            QList<int> srcs = latestStats.keys();
+            std::sort(srcs.begin(), srcs.end());
+            for (int src : srcs) {
+                const SrtStats& s = latestStats.value(src);
+                fprintf(stderr, "stats src=%d recv=%lld retrans=%lld loss=%lld drop=%lld\n", src,
+                        (long long) s.recvTotal, (long long) s.retransTotal,
+                        (long long) s.lossTotal, (long long) s.dropTotal);
             }
             fflush(stderr);
         }

@@ -14,6 +14,7 @@
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock *clock,
                            int targetWidth, int targetHeight, int targetFps, QObject* parent)
     : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer), m_sharedClock(clock) {
+    qRegisterMetaType<SrtStats>("SrtStats");
     m_restartCapture = 0;
     m_internalFrameCount = 0;
     m_monotonic.start();
@@ -286,6 +287,9 @@ void StreamWorker::captureLoop() {
         };
         callbacks.setConnected = [this](bool connected) {
             setConnected(connected);
+        };
+        callbacks.reportStats = [this](const SrtStats& stats) {
+            emit statsUpdated(m_sourceIndex, stats);
         };
 
         IngestBackendOptions backendOptions;

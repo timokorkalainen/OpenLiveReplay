@@ -236,6 +236,8 @@ void ReplayManager::startRecording() {
         // there and updates its per-source connected state.
         connect(worker, &StreamWorker::connectionChanged, this,
                 &ReplayManager::sourceConnectionChanged, Qt::QueuedConnection);
+        connect(worker, &StreamWorker::statsUpdated, this, &ReplayManager::sourceStatsUpdated,
+                Qt::QueuedConnection);
 
         m_workers.append(worker);
         worker->start(QThread::HighPriority);

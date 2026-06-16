@@ -7,6 +7,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QLocale>
 #include <algorithm>
 #include <QDir>
 #include <QGuiApplication>
@@ -69,6 +70,16 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             Qt::QueuedConnection);
     connect(m_replayManager, &ReplayManager::sourceConnectionChanged, this,
             &UIManager::onSourceConnectionChanged, Qt::QueuedConnection);
+    connect(m_replayManager, &ReplayManager::sourceStatsUpdated, this,
+            &UIManager::onSourceStatsUpdated, Qt::QueuedConnection);
+    {
+        // Amber lights when the windowed retransmit rate exceeds this fraction of
+        // received packets. ARQ retransmits routinely on healthy lossy links, so
+        // a presence test would be permanently amber; 2% is an early-stress warning.
+        bool ok = false;
+        const double pct = qEnvironmentVariable("OLR_SRT_HEALTH_AMBER_PCT").toDouble(&ok);
+        if (ok && pct > 0.0) m_srtAmberPct = pct;
+    }
     connect(m_replayManager, &ReplayManager::telemetryRecorded, this,
             [this](const QString &feedId, const QJsonObject &payload, qint64 effectiveMs) {
         if (feedId.trimmed().isEmpty()) return;
@@ -902,6 +913,7 @@ void UIManager::resetSourceConnection() {
     m_sourceConnected.fill(false);
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
+    resetSourceStats(int(m_sourceConnected.size()));
 }
 
 void UIManager::updateReplayTelemetryFeeds() {
@@ -975,8 +987,64 @@ void UIManager::onSourceConnectionChanged(int sourceIndex, bool connected) {
         m_sourceConnected.append(false);
     if (m_sourceConnected[sourceIndex] == connected) return; // no UI churn
     m_sourceConnected[sourceIndex] = connected;
+    if (connected) {
+        // Re-baseline SRT stats on a real disconnect->connect transition: the new
+        // socket restarts its cumulative counters from 0. Below the debounce guard
+        // so a redundant connected=true can never wipe a healthy source's baseline.
+        if (sourceIndex < int(m_sourceStats.size())) {
+            m_sourceStats[sourceIndex].seen = false;
+            m_sourceStats[sourceIndex].health = int(SrtHealth::NA);
+        }
+    }
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
+}
+
+void UIManager::onSourceStatsUpdated(int sourceIndex, SrtStats stats) {
+    if (sourceIndex < 0) return;
+    if (int(m_sourceStats.size()) <= sourceIndex) m_sourceStats.resize(sourceIndex + 1);
+    SrtStatsEntry& e = m_sourceStats[sourceIndex];
+    if (!e.seen) {
+        // First snapshot since (re)connect: establish the baseline, render Green.
+        e.seen = true;
+        e.health = int(SrtHealth::Green);
+    } else {
+        e.health = int(srtHealth(e.last, stats, m_srtAmberPct));
+    }
+    e.last = stats;
+    m_sourceStatsVersion++;
+    emit sourceStatsChanged();
+}
+
+int UIManager::sourceLinkHealth(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size())) return int(SrtHealth::NA);
+    return m_sourceStats[sourceIndex].health;
+}
+
+bool UIManager::sourceHasSrtStats(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size())) return false;
+    return m_sourceStats[sourceIndex].seen;
+}
+
+QString UIManager::sourceStatsTooltip(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size()) ||
+        !m_sourceStats[sourceIndex].seen) {
+        return QString();
+    }
+    const SrtStats& s = m_sourceStats[sourceIndex].last;
+    const QLocale loc;
+    QString pct = QStringLiteral("0.0");
+    if (s.recvTotal > 0)
+        pct = QString::number(100.0 * double(s.retransTotal) / double(s.recvTotal), 'f', 1);
+    return QStringLiteral("SRT link\nrecv      %1\nretrans   %2  (%3%)\nloss det  %4\ndropped   %5")
+        .arg(loc.toString(qlonglong(s.recvTotal)), loc.toString(qlonglong(s.retransTotal)), pct,
+             loc.toString(qlonglong(s.lossTotal)), loc.toString(qlonglong(s.dropTotal)));
+}
+
+void UIManager::resetSourceStats(int count) {
+    m_sourceStats.assign(count < 0 ? 0 : count, SrtStatsEntry{});
+    m_sourceStatsVersion++;
+    emit sourceStatsChanged();
 }
 
 void UIManager::setStreamUrls(const QStringList &urls) {
@@ -1413,6 +1481,7 @@ void UIManager::startRecording() {
     m_sourceConnected = QList<bool>(m_replayManager->getSourceUrls().size(), false);
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
+    resetSourceStats(m_replayManager->getSourceUrls().size());
 
     // 1. Initialize the Playback Worker with our providers
     if (m_playbackWorker) {
@@ -1670,6 +1739,7 @@ void UIManager::applyImportPreview() {
     m_sourceEnabledVersion++;
     m_sourceConnected = QList<bool>(m_currentSettings.sources.size(), false);
     m_sourceConnectionVersion++;
+    resetSourceStats(m_currentSettings.sources.size());
     m_sourceTrimVersion++;
     m_liveTelemetry.clear();
     m_recordingTelemetry.clear();

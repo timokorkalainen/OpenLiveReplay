@@ -228,3 +228,34 @@ complete the SRT robustness suite:
 That completes Phase 2 (the SRT real-transport test ladder). Possible later work:
 cross-device clock-drift (two machines), encrypted SRT (passphrase), and surfacing
 the `srt_stats` loss telemetry on the connection-status UI (framesync roadmap JIT-5).
+
+## JIT-5: SRT link telemetry on the connection-status UI
+
+The native SRT ingest samples `srt_bstats` ~1/sec and pushes each cumulative
+snapshot (`SrtStats`: recv / retrans / lossDetected / drop) up the same queued-
+signal path as connection status: `reportStats` → `StreamWorker::statsUpdated` →
+`ReplayManager::sourceStatsUpdated` → `UIManager`. The per-source connection dot
+(`Main.qml`) is graded from the most-recent window:
+
+- **green** — healthy (incl. ARQ quietly recovering everything),
+- **amber** — link stressed: windowed retransmit rate > `OLR_SRT_HEALTH_AMBER_PCT`
+  (default 0.02 = 2 % of received packets),
+- **red** — recent **unrecovered** drops (`pktRcvDropTotal` rose this window), or
+  the source is disconnected.
+
+Hovering the dot shows cumulative `recv / retrans (%) / loss det / dropped`. SRT
+stats are **native-ingest-only** — RTMP/UDP/ffmpeg-SRT sources keep the plain
+green/red dot and no stats tooltip.
+
+**Automated coverage:**
+- `tst_srt_health` (unit) — the pure green/amber/red classifier incl. the
+  counter-reset clamp.
+- `e2e_native_srt_ui_stats` (`native-apple-ingest`) — drives a source through
+  `lossy_udp_relay.py` and asserts `sync_harness --report-stats` (which reads
+  `ReplayManager::sourceStatsUpdated`) carries real telemetry: retrans>0 / drop==0
+  under loss, ~no retrans on a clean link. Proves the whole path **except the QML
+  pixels**.
+
+**Manual UI check** (the harness has no QML): with an SRT build, confirm a clean
+source shows green, a relayed-lossy source goes amber under stress / red on induced
+drops / back to green on recovery, and a non-SRT source stays plain green.

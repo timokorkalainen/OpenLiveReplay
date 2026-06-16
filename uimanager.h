@@ -10,9 +10,11 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <QMap>
+#include <vector>
 #include "settingsmanager.h"
 #include "project/projectsettingsimporter.h"
 #include "recorder_engine/replaymanager.h"
+#include "recorder_engine/ingest/ingestsession.h"
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
 #include "playback/playbacktransport.h"
@@ -70,6 +72,9 @@ class UIManager : public QObject {
     // it to re-evaluate isSourceConnected() bindings.
     Q_PROPERTY(
         int sourceConnectionVersion READ sourceConnectionVersion NOTIFY sourceConnectionChanged)
+    // Bumped on every per-source SRT stats update so QML re-evaluates the dot
+    // color (sourceLinkHealth) and tooltip (sourceStatsTooltip) bindings.
+    Q_PROPERTY(int sourceStatsVersion READ sourceStatsVersion NOTIFY sourceStatsChanged)
     // Bumped when any source's trim changes (config load / programmatic set) so
     // QML re-reads sourceTrimOffset() bindings.
     Q_PROPERTY(int sourceTrimVersion READ sourceTrimVersion NOTIFY sourceTrimChanged)
@@ -126,6 +131,7 @@ public:
     int sourceEnabledVersion() const { return m_sourceEnabledVersion; }
     bool followLive() const { return m_followLive; }
     int sourceConnectionVersion() const { return m_sourceConnectionVersion; }
+    int sourceStatsVersion() const { return m_sourceStatsVersion; }
     int sourceTrimVersion() const { return m_sourceTrimVersion; }
     QString importSettingsUrl() const;
     QString importPreviewError() const { return m_importPreviewError; }
@@ -197,6 +203,14 @@ public:
     Q_INVOKABLE bool isSourceEnabled(int sourceIndex) const;
     // True only while recording and the source's worker reports a live feed.
     Q_INVOKABLE bool isSourceConnected(int sourceIndex) const;
+    // SRT link health for the connection dot. 0=N/A (no SRT stats), 1=green,
+    // 2=amber (stressed), 3=red (recent unrecovered drops).
+    Q_INVOKABLE int sourceLinkHealth(int sourceIndex) const;
+    // True once this source has produced at least one SRT stats snapshot
+    // (native SRT only); false for RTMP/UDP/ffmpeg-SRT sources.
+    Q_INVOKABLE bool sourceHasSrtStats(int sourceIndex) const;
+    // Preformatted multi-line cumulative figures for the dot's hover tooltip.
+    Q_INVOKABLE QString sourceStatsTooltip(int sourceIndex) const;
     // Config-time check: another source carries the same non-empty URL.
     // Surfaces the duplicate-stream misconfiguration that two workers
     // pulling one URL otherwise hides.
@@ -250,6 +264,7 @@ signals:
     void streamDeckLearnActionChanged();
     void streamDeckBindingsChanged();
     void sourceConnectionChanged();
+    void sourceStatsChanged();
     void sourceTrimChanged();
     void importSettingsUrlChanged();
     void importPreviewChanged();
@@ -273,6 +288,9 @@ public slots:
 
     // Receives ReplayManager::sourceConnectionChanged on the main thread.
     void onSourceConnectionChanged(int sourceIndex, bool connected);
+
+    // Receives ReplayManager::sourceStatsUpdated on the main thread.
+    void onSourceStatsUpdated(int sourceIndex, SrtStats stats);
 
 private:
     void syncActiveStreams();
@@ -343,6 +361,19 @@ private:
     QList<bool> m_sourceConnected;
     int m_sourceConnectionVersion = 0;
     int m_sourceTrimVersion = 0;
+    // Per-source SRT link-health state, keyed by sourceIndex (parallel to
+    // m_sourceConnected). last = most recent snapshot (also shown in the tooltip);
+    // seen = false until the first snapshot since (re)connect, so the next snapshot
+    // re-baselines after a counter reset; health = cached SrtHealth (0=N/A..3=red).
+    struct SrtStatsEntry {
+        SrtStats last;
+        bool seen = false;
+        int health = 0;
+    };
+    std::vector<SrtStatsEntry> m_sourceStats;
+    int m_sourceStatsVersion = 0;
+    double m_srtAmberPct = 0.02; // retransmit-rate threshold for Amber
+    void resetSourceStats(int count);
     void resetSourceConnection();
     void updateReplayTelemetryFeeds();
     void clearImportPreview();

@@ -157,15 +157,6 @@ endfunction()
 
 if(APPLE)
     olr_add_native_srt_e2e_tests("native-apple-ingest")
-elseif(WIN32)
-    olr_add_native_srt_e2e_tests("native-windows-ingest")
-    add_test(NAME e2e_native_srt_hevc_smoke
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
-    set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
-        LABELS "native-windows-hevc"
-        TIMEOUT 180
-        RUN_SERIAL TRUE
-        ENVIRONMENT "OLR_NATIVE_SRT=1")
 
     # Phase 2c-a: mid-recording disconnect/reconnect survival on the NATIVE SRT
     # ingest. Kill a victim bridge mid-record, restart it, and prove the victim
@@ -224,6 +215,27 @@ elseif(WIN32)
     set_tests_properties(e2e_native_srt_loss_multi PROPERTIES
         LABELS "native-apple-ingest"
         TIMEOUT 120
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # JIT-5: the SRT loss-telemetry DATA PATH behind the connection-status UI.
+    # native ingest -> reportStats -> StreamWorker -> ReplayManager::sourceStatsUpdated;
+    # sync_harness --report-stats reads it. Assert real telemetry (retrans>0, drop==0)
+    # under relayed loss, ~no retrans on a clean link. Base 23700.
+    add_test(NAME e2e_native_srt_ui_stats
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_ui_stats.sh" "$<TARGET_FILE:sync_harness>" 23700)
+    set_tests_properties(e2e_native_srt_ui_stats PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
+elseif(WIN32)
+    olr_add_native_srt_e2e_tests("native-windows-ingest")
+    add_test(NAME e2e_native_srt_hevc_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+    set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
+        LABELS "native-windows-hevc"
+        TIMEOUT 180
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
 endif()

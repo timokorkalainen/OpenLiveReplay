@@ -17,6 +17,7 @@
 
 #include "recordingclock.h"
 #include "muxer.h"
+#include "ingest/ingestsession.h"
 
 extern "C" {
     #include <libavformat/avformat.h>
@@ -81,6 +82,11 @@ signals:
     // (debounced via setConnected). Cross-thread: relayed to the UI through
     // ReplayManager with a queued connection.
     void connectionChanged(int sourceIndex, bool connected);
+
+    // Emitted ~1/sec from the capture thread with the source's latest cumulative
+    // SRT receiver stats (native SRT ingest only). Cross-thread: relayed to the UI
+    // through ReplayManager with a queued connection, like connectionChanged.
+    void statsUpdated(int sourceIndex, SrtStats stats);
 
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
