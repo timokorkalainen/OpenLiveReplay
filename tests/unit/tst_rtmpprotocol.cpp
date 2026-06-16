@@ -18,6 +18,31 @@ bool errorMentions(const QString& error, const QString& expected) {
     return error.contains(expected, Qt::CaseInsensitive);
 }
 
+void appendHevcArray(QByteArray* config, int nalType, const QByteArray& nal) {
+    config->append(char(0x80 | nalType));
+    config->append(char(0));
+    config->append(char(1));
+    config->append(char((nal.size() >> 8) & 0xff));
+    config->append(char(nal.size() & 0xff));
+    config->append(nal);
+}
+
+QByteArray hevcConfigWithParameterSets(bool includeUnknownArray = false) {
+    const QByteArray vps = QByteArray::fromHex("40010c01ffff01600000030090000003000003005d959809");
+    const QByteArray sps = QByteArray::fromHex("42010101600000030090000003000003005da00280802d1f");
+    const QByteArray pps = QByteArray::fromHex("4401c172b46240");
+
+    QByteArray config(23, char(0));
+    config[0] = char(1);
+    config[21] = char(0xfc | 3);                  // 4-byte NAL length
+    config[22] = char(includeUnknownArray ? 4 : 3); // arrays
+    if (includeUnknownArray) appendHevcArray(&config, 39, QByteArray::fromHex("4e01"));
+    appendHevcArray(&config, 32, vps);
+    appendHevcArray(&config, 33, sps);
+    appendHevcArray(&config, 34, pps);
+    return config;
+}
+
 bool readConnectObjectString(const QByteArray& payload, const QString& wantedKey, QString* value) {
     int offset = 0;
     QString command;
@@ -98,7 +123,10 @@ private slots:
     void parsesLegacyAvcVideoPacket();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesHevcSequenceHeaderAndConvertsNalusToAnnexB();
+    void parsesHevcSequenceHeaderIgnoringUnknownArrays();
     void rejectsMalformedHevcSequenceHeaders();
+    void rejectsInvalidHevcSequenceHeaderVersion();
+    void convertsVariableLengthPrefixedNalusToAnnexB();
     void rejectsMalformedLengthPrefixedNalus();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -1019,22 +1047,7 @@ void TestRtmpProtocol::parsesHevcSequenceHeaderAndConvertsNalusToAnnexB() {
     const QByteArray sps = QByteArray::fromHex("42010101600000030090000003000003005da00280802d1f");
     const QByteArray pps = QByteArray::fromHex("4401c172b46240");
 
-    QByteArray config(23, char(0));
-    config[0] = char(1);
-    config[21] = char(0xfc | 3); // 4-byte NAL length
-    config[22] = char(3);        // arrays
-
-    auto appendArray = [&](int nalType, const QByteArray& nal) {
-        config.append(char(0x80 | nalType));
-        config.append(char(0));
-        config.append(char(1));
-        config.append(char((nal.size() >> 8) & 0xff));
-        config.append(char(nal.size() & 0xff));
-        config.append(nal);
-    };
-    appendArray(32, vps);
-    appendArray(33, sps);
-    appendArray(34, pps);
+    const QByteArray config = hevcConfigWithParameterSets();
 
     RtmpHevcConfig parsed;
     QString error;
@@ -1049,6 +1062,15 @@ void TestRtmpProtocol::parsesHevcSequenceHeaderAndConvertsNalusToAnnexB() {
     frame.append(QByteArray::fromHex("2601"));
     QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(frame, 4),
              QByteArray::fromHex("000000012601"));
+}
+
+void TestRtmpProtocol::parsesHevcSequenceHeaderIgnoringUnknownArrays() {
+    RtmpHevcConfig parsed;
+    QString error;
+    QVERIFY(RtmpFlv::parseHevcSequenceHeader(hevcConfigWithParameterSets(true), &parsed, &error));
+    QCOMPARE(parsed.parameterSets.hevcVps.size(), 1);
+    QCOMPARE(parsed.parameterSets.hevcSps.size(), 1);
+    QCOMPARE(parsed.parameterSets.hevcPps.size(), 1);
 }
 
 void TestRtmpProtocol::rejectsMalformedHevcSequenceHeaders() {
@@ -1076,10 +1098,35 @@ void TestRtmpProtocol::rejectsMalformedHevcSequenceHeaders() {
     QVERIFY(errorMentions(error, QStringLiteral("truncated")));
 }
 
+void TestRtmpProtocol::rejectsInvalidHevcSequenceHeaderVersion() {
+    QByteArray config = hevcConfigWithParameterSets();
+    config[0] = char(2);
+
+    RtmpHevcConfig parsed;
+    QString error;
+    QVERIFY(!RtmpFlv::parseHevcSequenceHeader(config, &parsed, &error));
+    QVERIFY(errorMentions(error, QStringLiteral("version")));
+}
+
+void TestRtmpProtocol::convertsVariableLengthPrefixedNalusToAnnexB() {
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("02aabb"), 1),
+             QByteArray::fromHex("00000001aabb"));
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("0002aabb"), 2),
+             QByteArray::fromHex("00000001aabb"));
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("000002aabb"), 3),
+             QByteArray::fromHex("00000001aabb"));
+}
+
 void TestRtmpProtocol::rejectsMalformedLengthPrefixedNalus() {
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("00000000"), 4),
+             QByteArray());
     QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("00000004aabb"), 4),
              QByteArray());
     QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("0001aa"), 0),
+             QByteArray());
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("0001aa00"), 2),
+             QByteArray());
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(QByteArray::fromHex("ffffffff"), 4),
              QByteArray());
 }
 

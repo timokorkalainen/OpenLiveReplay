@@ -755,6 +755,10 @@ bool RtmpFlv::parseHevcSequenceHeader(const QByteArray& payload, RtmpHevcConfig*
         if (error) *error = QStringLiteral("RTMP HEVC sequence header is malformed.");
         return false;
     }
+    if (uchar(payload[0]) != 1) {
+        if (error) *error = QStringLiteral("RTMP HEVC sequence header has unsupported version.");
+        return false;
+    }
 
     RtmpHevcConfig parsed;
     parsed.nalLengthSize = (uchar(payload[21]) & 0x03) + 1;
@@ -830,17 +834,19 @@ QByteArray RtmpFlv::lengthPrefixedPayloadToAnnexB(const QByteArray& payload, int
             return QByteArray();
         }
 
-        int nalSize = 0;
+        quint32 nalSize = 0;
         for (int i = 0; i < nalLengthSize; ++i) {
-            nalSize = (nalSize << 8) | int(uchar(payload[offset + i]));
+            nalSize = (nalSize << 8) | quint32(uchar(payload[offset + i]));
         }
         offset += nalLengthSize;
-        if (nalSize <= 0 || nalSize > payload.size() - offset) {
+        const int remaining = payload.size() - offset;
+        if (nalSize == 0 || quint64(nalSize) > quint64(remaining)) {
             return QByteArray();
         }
         annexB.append("\0\0\0\1", 4);
-        annexB.append(payload.constData() + offset, nalSize);
-        offset += nalSize;
+        const int nalBytes = int(nalSize);
+        annexB.append(payload.constData() + offset, nalBytes);
+        offset += nalBytes;
     }
     return annexB;
 }
