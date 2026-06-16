@@ -59,7 +59,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(rtmidi)
 
 # 1. Find Qt
-find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network)
+find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network WebSockets)
 qt_standard_project_setup(REQUIRES 6.8)
 
 # 2. Create the Executable Target FIRST
@@ -486,6 +486,7 @@ target_link_libraries(OpenLiveReplay PRIVATE
     Qt6::Multimedia
     Qt6::QuickControls2
     Qt6::Network
+    Qt6::WebSockets
     rtmidi
     OpenLiveReplayMidi
     olr_warnings

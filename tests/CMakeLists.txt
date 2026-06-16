@@ -9,7 +9,7 @@
 #   smoke/  QML static-load smoke check (qmllint over the QML module)
 #   e2e/    end-to-end recording harness driven by synthetic FFmpeg streams
 
-find_package(Qt6 REQUIRED COMPONENTS Test Core Concurrent Network)
+find_package(Qt6 REQUIRED COMPONENTS Test Core Concurrent Network WebSockets)
 
 # --- Locate FFmpeg ----------------------------------------------------------
 if(WIN32)
@@ -111,7 +111,7 @@ if(NOT WIN32)
     target_link_directories(olr_test_core PUBLIC "${OLR_FFMPEG_LIBDIR}")
 endif()
 target_link_libraries(olr_test_core
-    PUBLIC Qt6::Core Qt6::Network "${OLR_FFMPEG_AVUTIL_LIBRARY}"
+    PUBLIC Qt6::Core Qt6::Network Qt6::WebSockets "${OLR_FFMPEG_AVUTIL_LIBRARY}"
     PRIVATE olr_warnings olr_sanitize)
 if(WIN32)
     target_link_libraries(olr_test_core PRIVATE ws2_32)
