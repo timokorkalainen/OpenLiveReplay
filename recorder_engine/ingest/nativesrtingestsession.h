@@ -22,14 +22,17 @@ public:
     ~NativeSrtIngestSession() override;
 
     static bool supportsUrl(const QUrl& url);
-    static int64_t sourcePtsMsFromVideoAnchor(qint64 pts90k,
-                                              int64_t firstDts90k,
-                                              int64_t anchorStreamTimeMs);
 
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
     void requestStop() override;
     QString nativeFallbackReason() const override;
+
+    // Map a 90 kHz stream timestamp onto the recording timeline using the shared
+    // A/V anchor (anchorTs90k <-> anchorStreamMs). Pure: returns -1 if any input is
+    // negative. Static so it can be unit-tested without an instance.
+    static int64_t sourcePtsMsFromAnchor(qint64 pts90k, int64_t anchorTs90k,
+                                         int64_t anchorStreamMs);
 
 private:
     int m_sourceIndex = -1;
@@ -56,12 +59,15 @@ private:
     int64_t m_statDropTotal = -1;
     int64_t m_statRecvTotal = -1;
     int64_t m_lastStatsAtMs = -1;
-    int64_t m_firstDts90k = -1;
-    int64_t m_prevDts90k = -1;
+    // Single shared A/V anchor for this source: stream-time anchorTs90k (PCR base,
+    // or the first PES timestamp if no PCR appeared yet) maps to wall-clock
+    // anchorStreamTimeMs. Both video and audio map against it, so the recorded A/V
+    // offset equals the true stream offset (they share the 90 kHz program clock).
+    int64_t m_anchorTs90k = -1;
     int64_t m_anchorStreamTimeMs = -1;
-    int64_t m_firstAudioPts90k = -1;
+    // Per-stream previous timestamps, for discontinuity (jump) detection only.
+    int64_t m_prevDts90k = -1;
     int64_t m_prevAudioPts90k = -1;
-    int64_t m_audioAnchorStreamTimeMs = -1;
     int64_t m_audioRemainderPts90k = -1;
     int64_t m_lastPacketAtMs = -1;
     bool m_loggedLatmUnsupported = false;
@@ -75,7 +81,6 @@ private:
     void processPesPacket(const PesPacket& pes);
     void processAudioPesPacket(const PesPacket& pes);
     int64_t sourcePtsMsForUnit(const CompressedAccessUnit& unit);
-    int64_t sourcePtsMsForDecodedVideoPts(qint64 pts90k) const;
     int64_t sourcePtsMsForAudio(qint64 pts90k);
 };
 

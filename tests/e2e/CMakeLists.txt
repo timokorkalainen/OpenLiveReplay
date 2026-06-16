@@ -103,6 +103,14 @@ set_tests_properties(
     sync_intercam_matched sync_intercam_skew sync_drift_2997 sync_lipsync sync_intercam_trim
     PROPERTIES LABELS "sync-report" TIMEOUT 180 RUN_SERIAL TRUE)
 
+# AUD-4 A/V lip-sync GATE (ffmpeg/UDP ingest): the shared anchor must keep audio
+# within EBU R37 (-40..+60 ms). Pre-AUD-4 this measured ~+63 ms and FAILS. Base 23492.
+add_test(NAME e2e_av_lipsync
+    COMMAND bash "${_sync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 23492)
+set_tests_properties(e2e_av_lipsync PROPERTIES
+    LABELS "av-sync" TIMEOUT 120 RUN_SERIAL TRUE
+    ENVIRONMENT "OLR_AV_SYNC_GATE=1")
+
 # --- Local-only SRT e2e (NOT in CI) -----------------------------------------
 # Proves the real engine ingests srt://. Requires a build configured with
 # -DOLR_FFMPEG_SRT_PREFIX (an SRT-enabled ffmpeg); under the default brew ffmpeg
@@ -228,6 +236,13 @@ if(APPLE)
         LABELS "native-apple-ingest"
         TIMEOUT 120
         RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # AUD-4: A/V lip-sync over the PCR-anchored native SRT ingest (EBU R37). Base 23710.
+    add_test(NAME e2e_native_srt_lipsync
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_lipsync.sh" "$<TARGET_FILE:sync_harness>" 23710)
+    set_tests_properties(e2e_native_srt_lipsync PROPERTIES
+        LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")

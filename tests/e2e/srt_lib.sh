@@ -64,3 +64,28 @@ flash_pts_series() {
         /YAVG=/     { split($0,b,"="); y=b[2]+0; bright=(y>THRESH);
                       if (bright && !prev) printf "%.6f\n", t; prev=bright }'
 }
+
+# Spawn ONE ffmpeg producer with a co-timed full-frame flash + 1kHz beep (first
+# ~60ms of every source-second), MPEG-TS to a single UDP port. $1=udp_port
+flash_beep_marker_to_udp() {
+    local port="$1"
+    local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
+    ffmpeg -hide_banner -loglevel error -re \
+        -f lavfi -i "color=c=black:s=320x240:r=30" \
+        -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
+        -filter_complex "[0:v]${vflt}[v];[1:a]volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame[a]" \
+        -map "[v]" -map "[a]" \
+        -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+        -c:a aac -b:a 128k \
+        -f mpegts "udp://127.0.0.1:${port}?pkt_size=1316" &
+    SRT_LAST_PID=$!
+    PIDS+=("$SRT_LAST_PID")
+}
+
+# Beep-onset pts_time series for one audio track (silence->sound rising edges).
+# $1=mkv $2=audio-track-index.
+beep_pts_series() {
+    ffmpeg -hide_banner -loglevel info -i "$1" -map "0:a:$2" \
+        -af "silencedetect=noise=-30dB:duration=0.03" -f null - 2>&1 \
+    | awk '/silence_end:/ { for (i=1;i<=NF;i++) if ($i=="silence_end:") printf "%.6f\n", $(i+1) }'
+}

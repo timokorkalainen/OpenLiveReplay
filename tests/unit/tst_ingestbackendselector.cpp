@@ -14,7 +14,7 @@ private slots:
     void nativeFailureReasonStartsEmpty();
     void nativeDecodeCapabilityErrorsRequestFallback();
     void nativeDecodeTransientErrorsDoNotRequestFallback();
-    void decodedVideoPtsUsesVideoAnchor();
+    void sharedAnchorMapsStreamTime();
 };
 
 class EmptySession final : public IngestSession {
@@ -74,11 +74,14 @@ void TestIngestBackendSelector::nativeDecodeTransientErrorsDoNotRequestFallback(
     QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("Native decoder received an empty access unit.")));
 }
 
-void TestIngestBackendSelector::decodedVideoPtsUsesVideoAnchor() {
-    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, 90000, 1000), 1200);
-    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(-1, 90000, 1000), -1);
-    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, -1, 1000), -1);
-    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromVideoAnchor(108000, 90000, -1), -1);
+void TestIngestBackendSelector::sharedAnchorMapsStreamTime() {
+    // The single shared A/V anchor maps a 90kHz stream timestamp onto the recording
+    // timeline: sourceMs = anchorStreamMs + (pts90k - anchorTs90k)/90; -1 on any
+    // negative input. (1000 + (108000-90000)/90 = 1200.)
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(108000, 90000, 1000), 1200);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(-1, 90000, 1000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(108000, -1, 1000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(108000, 90000, -1), -1);
 }
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)

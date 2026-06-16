@@ -9,7 +9,16 @@
 
 class MpegTsParser {
 public:
-    bool pushTsPacket(const QByteArray& packet, QList<PesPacket>* completedPes);
+    // Per-packet side info surfaced to the caller. pcr90k >= 0 iff THIS packet
+    // carried a PCR (33-bit 90 kHz base) on the program's PCR PID; discontinuity
+    // iff the PCR PID's adaptation field set the discontinuity_indicator.
+    struct TsPacketInfo {
+        qint64 pcr90k = -1;
+        bool discontinuity = false;
+    };
+
+    bool pushTsPacket(const QByteArray& packet, QList<PesPacket>* completedPes,
+                      TsPacketInfo* info = nullptr);
 
     quint16 pmtPid() const { return m_pmtPid; }
     quint16 videoPid() const { return m_videoPid; }
@@ -25,6 +34,7 @@ private:
     };
 
     quint16 m_pmtPid = 0xffff;
+    quint16 m_pcrPid = 0xffff;
     quint16 m_videoPid = 0xffff;
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
     quint16 m_audioPid = 0xffff;

@@ -21,6 +21,11 @@ qint64 readPts90k(const uchar* p)
         | (qint64(read16(p + 3) >> 1) & 0x7fff);
 }
 
+qint64 readPcrBase90k(const uchar* p) {
+    return (qint64(p[0]) << 25) | (qint64(p[1]) << 17) | (qint64(p[2]) << 9) | (qint64(p[3]) << 1) |
+           (qint64(p[4]) >> 7);
+}
+
 int sectionStartOffset(const QByteArray& payload, bool payloadStart)
 {
     if (!payloadStart || payload.isEmpty()) {
@@ -68,8 +73,8 @@ NativeElementaryStreamKind kindForPid(quint16 pid, quint16 videoPid, quint16 aud
 
 } // namespace
 
-bool MpegTsParser::pushTsPacket(const QByteArray& packet, QList<PesPacket>* completedPes)
-{
+bool MpegTsParser::pushTsPacket(const QByteArray& packet, QList<PesPacket>* completedPes,
+                                TsPacketInfo* info) {
     if (packet.size() != 188 || byteAt(packet, 0) != 0x47) {
         return false;
     }
@@ -94,7 +99,18 @@ bool MpegTsParser::pushTsPacket(const QByteArray& packet, QList<PesPacket>* comp
             return false;
         }
         if (adaptationLength > 0) {
-            discontinuity = (byteAt(packet, offset + 1) & 0x80) != 0;
+            const quint8 afFlags = byteAt(packet, offset + 1);
+            discontinuity = (afFlags & 0x80) != 0;
+            // PCR_flag (0x10): 6-byte PCR follows the flags byte. Surface only the
+            // program PCR (on the PCR PID) — that is the shared A/V clock reference.
+            if (info && pid == m_pcrPid && (afFlags & 0x10) != 0 && adaptationLength >= 7 &&
+                offset + 2 + 6 <= packet.size()) {
+                info->pcr90k =
+                    readPcrBase90k(reinterpret_cast<const uchar*>(packet.constData()) + offset + 2);
+            }
+        }
+        if (info && pid == m_pcrPid) {
+            info->discontinuity = discontinuity;
         }
         offset += 1 + adaptationLength;
     }
@@ -162,6 +178,8 @@ void MpegTsParser::parsePmt(const QByteArray& payload, bool payloadStart)
     if (es > end) {
         return;
     }
+
+    m_pcrPid = quint16(((byteAt(payload, off + 8) & 0x1f) << 8) | byteAt(payload, off + 9));
 
     quint16 candidateVideoPid = 0xffff;
     NativeVideoCodec candidateVideoCodec = NativeVideoCodec::Unknown;
