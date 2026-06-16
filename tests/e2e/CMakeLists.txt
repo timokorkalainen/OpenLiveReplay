@@ -226,4 +226,16 @@ elseif(WIN32)
         TIMEOUT 120
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
+
+    # JIT-5: the SRT loss-telemetry DATA PATH behind the connection-status UI.
+    # native ingest -> reportStats -> StreamWorker -> ReplayManager::sourceStatsUpdated;
+    # sync_harness --report-stats reads it. Assert real telemetry (retrans>0, drop==0)
+    # under relayed loss, ~no retrans on a clean link. Base 23700.
+    add_test(NAME e2e_native_srt_ui_stats
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_ui_stats.sh" "$<TARGET_FILE:sync_harness>" 23700)
+    set_tests_properties(e2e_native_srt_ui_stats PROPERTIES
+        LABELS "native-apple-ingest"
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        ENVIRONMENT "OLR_NATIVE_SRT=1")
 endif()
