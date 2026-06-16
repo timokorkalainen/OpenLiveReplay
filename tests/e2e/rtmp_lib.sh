@@ -8,9 +8,9 @@
 RTMP_LAST_PID=""
 
 rtmp_require_tools() {
-    command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
-    command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
-    command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit 0; }
+    command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 77; }
+    command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 77; }
+    command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit 77; }
 }
 
 rtmp_redact_log() {

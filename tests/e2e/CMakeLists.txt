@@ -267,7 +267,8 @@ if(APPLE)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
         LABELS "native-rtmp"
         TIMEOUT 180
-        RUN_SERIAL TRUE)
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
     set_tests_properties(e2e_native_rtmp_unsupported PROPERTIES
         LABELS "native-rtmp"
         TIMEOUT 180
