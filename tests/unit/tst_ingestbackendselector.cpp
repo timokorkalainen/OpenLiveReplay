@@ -28,6 +28,7 @@ private slots:
     void nativeFallbackPolicyIgnoresTransientNetworkFailures();
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
     void malformedLegacyVideoPacketStaysMalformed();
+    void nativeRtmpAudioUsesVideoTimelineAnchor();
 #endif
     void canConstructFfmpegSession();
     void nativeFailureReasonStartsEmpty();
@@ -229,6 +230,20 @@ void TestIngestBackendSelector::malformedLegacyVideoPacketStaysMalformed() {
     QVERIFY(std::any_of(logLines.cbegin(), logLines.cend(), [](const QString& message) {
         return message.contains(QStringLiteral("Native RTMP video parse failed"));
     }));
+}
+
+void TestIngestBackendSelector::nativeRtmpAudioUsesVideoTimelineAnchor() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    int64_t clockMs = 100;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    QCOMPARE(session.sourcePtsMsForVideo(0, 0), int64_t(100));
+
+    clockMs = 5000;
+    QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
 }
 #endif
 

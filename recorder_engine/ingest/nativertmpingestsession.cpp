@@ -263,7 +263,7 @@ void NativeRtmpIngestSession::run() {
 
     const auto supportedVideoProbeExpired = [this]() {
         return !m_seenSupportedVideo && m_openedAtMs >= 0 &&
-               m_monotonic.elapsed() - m_openedAtMs > kSupportedVideoProbeMs;
+               m_monotonic.elapsed() - m_openedAtMs >= kSupportedVideoProbeMs;
     };
     const auto logUnsupportedVideoProbe = [this]() {
         m_lastFailureKind = IngestFailureKind::UnsupportedProfile;
@@ -965,8 +965,13 @@ int64_t NativeRtmpIngestSession::sourcePtsMsForAudio(qint64 ptsMs) {
     }
     const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
     if (needAnchor) {
-        m_firstAudioPtsMs = ptsMs;
-        m_audioAnchorStreamTimeMs = nowMs;
+        if (m_anchorStreamTimeMs >= 0 && m_firstDtsMs >= 0) {
+            m_firstAudioPtsMs = m_firstDtsMs;
+            m_audioAnchorStreamTimeMs = m_anchorStreamTimeMs;
+        } else {
+            m_firstAudioPtsMs = ptsMs;
+            m_audioAnchorStreamTimeMs = nowMs;
+        }
     }
     m_prevAudioPtsMs = ptsMs;
     if (m_audioAnchorStreamTimeMs < 0) {
