@@ -182,6 +182,47 @@ else()
     target_sources(OpenLiveReplay PRIVATE streamdeck/streamdeckmanager_stub.cpp)
 endif()
 
+if(WIN32)
+    set(OLR_FFMPEG_ROOT "" CACHE PATH "Root directory of the Windows FFmpeg install")
+    find_path(OLR_FFMPEG_INCLUDE
+        NAMES libavutil/frame.h
+        HINTS "${OLR_FFMPEG_ROOT}/include")
+    find_library(OLR_FFMPEG_AVUTIL_LIBRARY
+        NAMES avutil
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_AVFORMAT_LIBRARY
+        NAMES avformat
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_AVCODEC_LIBRARY
+        NAMES avcodec
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_SWSCALE_LIBRARY
+        NAMES swscale
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_SWRESAMPLE_LIBRARY
+        NAMES swresample
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    if(NOT OLR_FFMPEG_INCLUDE
+            OR NOT OLR_FFMPEG_AVUTIL_LIBRARY
+            OR NOT OLR_FFMPEG_AVFORMAT_LIBRARY
+            OR NOT OLR_FFMPEG_AVCODEC_LIBRARY
+            OR NOT OLR_FFMPEG_SWSCALE_LIBRARY
+            OR NOT OLR_FFMPEG_SWRESAMPLE_LIBRARY)
+        message(FATAL_ERROR "OpenLiveReplay Windows app requires OLR_FFMPEG_ROOT with FFmpeg include and library paths")
+    endif()
+
+    set(OLR_SRT_ROOT "" CACHE PATH "Root directory of the Windows SRT install")
+    find_path(OLR_SRT_INCLUDE_DIR
+        NAMES srt/srt.h
+        HINTS "${OLR_SRT_ROOT}/include")
+    find_library(OLR_SRT_LIBRARY
+        NAMES srt
+        HINTS "${OLR_SRT_ROOT}/lib" "${OLR_SRT_ROOT}/bin")
+    if(NOT OLR_SRT_INCLUDE_DIR OR NOT OLR_SRT_LIBRARY)
+        message(FATAL_ERROR "OpenLiveReplay Windows native SRT requires OLR_SRT_ROOT or SRT include/library paths")
+    endif()
+endif()
+
 if(APPLE)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
@@ -194,6 +235,22 @@ if(APPLE)
         "-framework CoreMedia"
         "-framework CoreFoundation"
         "-framework CoreVideo")
+elseif(WIN32)
+    target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp
+        recorder_engine/ingest/nativesrtingestsession.cpp
+        recorder_engine/ingest/audiotoolboxaacdecoder_stub.cpp)
+    target_compile_definitions(OpenLiveReplay PRIVATE OLR_NATIVE_SRT_AVAILABLE=1)
+    target_include_directories(OpenLiveReplay PRIVATE
+        "${OLR_FFMPEG_INCLUDE}"
+        "${OLR_SRT_INCLUDE_DIR}")
+    target_link_libraries(OpenLiveReplay PRIVATE
+        "${OLR_FFMPEG_AVFORMAT_LIBRARY}"
+        "${OLR_FFMPEG_AVCODEC_LIBRARY}"
+        "${OLR_FFMPEG_AVUTIL_LIBRARY}"
+        "${OLR_FFMPEG_SWSCALE_LIBRARY}"
+        "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
+        mfplat mf mfuuid d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
 elseif(NOT WIN32)
     target_sources(OpenLiveReplay PRIVATE recorder_engine/ingest/nativevideodecoder_stub.cpp)
 endif()

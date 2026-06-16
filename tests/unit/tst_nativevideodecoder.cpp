@@ -18,10 +18,10 @@ void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
 }
 
 void TestNativeVideoDecoder::queryCapabilitiesReportsPlatformBackend() {
-#if defined(Q_OS_WIN)
-    QSKIP("Windows native video decode capabilities are covered by the Media Foundation task");
-#else
     const NativeVideoDecodeCapabilities caps = queryNativeVideoDecodeCapabilities();
+#if defined(Q_OS_WIN)
+    QVERIFY(!caps.detail.isEmpty());
+#else
 #if defined(Q_OS_MACOS) || defined(Q_OS_IOS) || defined(Q_OS_TVOS) || defined(Q_OS_WATCHOS)
     QVERIFY(caps.h264);
     QVERIFY(caps.hevc);

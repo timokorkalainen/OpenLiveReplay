@@ -1,7 +1,8 @@
 # OpenLiveReplay test suite — enabled via -DOLR_BUILD_TESTS=ON.
 #
-# Desktop/macOS only. The engine test library links the homebrew FFmpeg the
-# same way the macOS desktop app does, and every test runs headless.
+# Desktop tests run headless. On Windows, FFmpeg and SRT paths are explicit
+# cache entries; on macOS, the engine test library keeps using Homebrew FFmpeg
+# the same way the desktop app does.
 #
 # Layout:
 #   unit/   fast Qt Test unit tests (logic, no live capture)
@@ -10,29 +11,78 @@
 
 find_package(Qt6 REQUIRED COMPONENTS Test Core Concurrent Network)
 
-# --- Locate homebrew FFmpeg (Apple Silicon or Intel) ------------------------
-if(NOT DEFINED OLR_BREW_PREFIX)
-    execute_process(COMMAND brew --prefix
-        OUTPUT_VARIABLE OLR_BREW_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-endif()
-if(NOT OLR_BREW_PREFIX OR NOT EXISTS "${OLR_BREW_PREFIX}")
-    set(OLR_BREW_PREFIX /opt/homebrew)
-endif()
-set(OLR_FFMPEG_INCLUDE "${OLR_BREW_PREFIX}/include")
-set(OLR_FFMPEG_LIBDIR  "${OLR_BREW_PREFIX}/lib")
-message(STATUS "OpenLiveReplay tests: FFmpeg prefix = ${OLR_BREW_PREFIX}")
+# --- Locate FFmpeg ----------------------------------------------------------
+if(WIN32)
+    set(OLR_FFMPEG_ROOT "" CACHE PATH "Root directory of the Windows FFmpeg install")
+    find_path(OLR_FFMPEG_INCLUDE
+        NAMES libavutil/frame.h
+        HINTS "${OLR_FFMPEG_ROOT}/include")
+    find_library(OLR_FFMPEG_AVUTIL_LIBRARY
+        NAMES avutil
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_AVFORMAT_LIBRARY
+        NAMES avformat
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_AVCODEC_LIBRARY
+        NAMES avcodec
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_SWSCALE_LIBRARY
+        NAMES swscale
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    find_library(OLR_FFMPEG_SWRESAMPLE_LIBRARY
+        NAMES swresample
+        HINTS "${OLR_FFMPEG_ROOT}/lib" "${OLR_FFMPEG_ROOT}/bin")
+    if(NOT OLR_FFMPEG_INCLUDE
+            OR NOT OLR_FFMPEG_AVUTIL_LIBRARY
+            OR NOT OLR_FFMPEG_AVFORMAT_LIBRARY
+            OR NOT OLR_FFMPEG_AVCODEC_LIBRARY
+            OR NOT OLR_FFMPEG_SWSCALE_LIBRARY
+            OR NOT OLR_FFMPEG_SWRESAMPLE_LIBRARY)
+        message(FATAL_ERROR "OpenLiveReplay Windows tests require OLR_FFMPEG_ROOT with FFmpeg include and library paths")
+    endif()
+else()
+    # Locate homebrew FFmpeg (Apple Silicon or Intel).
+    if(NOT DEFINED OLR_BREW_PREFIX)
+        execute_process(COMMAND brew --prefix
+            OUTPUT_VARIABLE OLR_BREW_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    endif()
+    if(NOT OLR_BREW_PREFIX OR NOT EXISTS "${OLR_BREW_PREFIX}")
+        set(OLR_BREW_PREFIX /opt/homebrew)
+    endif()
+    set(OLR_FFMPEG_INCLUDE "${OLR_BREW_PREFIX}/include")
+    set(OLR_FFMPEG_LIBDIR  "${OLR_BREW_PREFIX}/lib")
+    set(OLR_FFMPEG_AVUTIL_LIBRARY avutil)
+    set(OLR_FFMPEG_AVFORMAT_LIBRARY avformat)
+    set(OLR_FFMPEG_AVCODEC_LIBRARY avcodec)
+    set(OLR_FFMPEG_SWSCALE_LIBRARY swscale)
+    set(OLR_FFMPEG_SWRESAMPLE_LIBRARY swresample)
+    message(STATUS "OpenLiveReplay tests: FFmpeg prefix = ${OLR_BREW_PREFIX}")
 
-# Opt-in: link the test engine + harnesses against a libsrt-enabled ffmpeg built
-# by build-scripts/build_ffmpeg_macos_srt.sh, so the local SRT e2e can ingest
-# srt://. Default unset -> brew ffmpeg, so CI and the UDP gates are unaffected.
-set(OLR_FFMPEG_SRT_PREFIX "" CACHE PATH "Path to a libsrt-enabled ffmpeg install (local SRT e2e)")
-if(OLR_FFMPEG_SRT_PREFIX)
-    set(OLR_FFMPEG_INCLUDE "${OLR_FFMPEG_SRT_PREFIX}/include")
-    set(OLR_FFMPEG_LIBDIR  "${OLR_FFMPEG_SRT_PREFIX}/lib")
-    # The ffmpeg dylibs use @rpath install names; give every test executable an
-    # rpath to the SRT lib dir so they resolve at runtime (no DYLD_LIBRARY_PATH).
-    list(APPEND CMAKE_BUILD_RPATH "${OLR_FFMPEG_LIBDIR}")
-    message(STATUS "OpenLiveReplay tests: SRT ffmpeg prefix = ${OLR_FFMPEG_SRT_PREFIX}")
+    # Opt-in: link the test engine + harnesses against a libsrt-enabled ffmpeg built
+    # by build-scripts/build_ffmpeg_macos_srt.sh, so the local SRT e2e can ingest
+    # srt://. Default unset -> brew ffmpeg, so CI and the UDP gates are unaffected.
+    set(OLR_FFMPEG_SRT_PREFIX "" CACHE PATH "Path to a libsrt-enabled ffmpeg install (local SRT e2e)")
+    if(OLR_FFMPEG_SRT_PREFIX)
+        set(OLR_FFMPEG_INCLUDE "${OLR_FFMPEG_SRT_PREFIX}/include")
+        set(OLR_FFMPEG_LIBDIR  "${OLR_FFMPEG_SRT_PREFIX}/lib")
+        # The ffmpeg dylibs use @rpath install names; give every test executable an
+        # rpath to the SRT lib dir so they resolve at runtime (no DYLD_LIBRARY_PATH).
+        list(APPEND CMAKE_BUILD_RPATH "${OLR_FFMPEG_LIBDIR}")
+        message(STATUS "OpenLiveReplay tests: SRT ffmpeg prefix = ${OLR_FFMPEG_SRT_PREFIX}")
+    endif()
+endif()
+
+if(WIN32)
+    set(OLR_SRT_ROOT "" CACHE PATH "Root directory of the Windows SRT install")
+    find_path(OLR_SRT_INCLUDE_DIR
+        NAMES srt/srt.h
+        HINTS "${OLR_SRT_ROOT}/include")
+    find_library(OLR_SRT_LIBRARY
+        NAMES srt
+        HINTS "${OLR_SRT_ROOT}/lib" "${OLR_SRT_ROOT}/bin")
+    if(NOT OLR_SRT_INCLUDE_DIR OR NOT OLR_SRT_LIBRARY)
+        message(FATAL_ERROR "OpenLiveReplay Windows native SRT requires OLR_SRT_ROOT or SRT include/library paths")
+    endif()
 endif()
 
 # --- Lightweight engine sources used by fast unit tests ---------------------
@@ -57,9 +107,11 @@ qt_add_library(olr_test_core STATIC
 target_include_directories(olr_test_core PUBLIC
     "${CMAKE_SOURCE_DIR}"
     "${OLR_FFMPEG_INCLUDE}")
-target_link_directories(olr_test_core PUBLIC "${OLR_FFMPEG_LIBDIR}")
+if(NOT WIN32)
+    target_link_directories(olr_test_core PUBLIC "${OLR_FFMPEG_LIBDIR}")
+endif()
 target_link_libraries(olr_test_core
-    PUBLIC Qt6::Core Qt6::Network avutil
+    PUBLIC Qt6::Core Qt6::Network "${OLR_FFMPEG_AVUTIL_LIBRARY}"
     PRIVATE olr_warnings olr_sanitize)
 if(WIN32)
     target_link_libraries(olr_test_core PRIVATE ws2_32)
@@ -85,10 +137,14 @@ target_include_directories(olr_test_engine PUBLIC
     "${CMAKE_SOURCE_DIR}"
     "${CMAKE_SOURCE_DIR}/recorder_engine"
     "${OLR_FFMPEG_INCLUDE}")
-target_link_directories(olr_test_engine PUBLIC "${OLR_FFMPEG_LIBDIR}")
+if(NOT WIN32)
+    target_link_directories(olr_test_engine PUBLIC "${OLR_FFMPEG_LIBDIR}")
+endif()
 target_link_libraries(olr_test_engine
     PUBLIC olr_test_core Qt6::Core Qt6::Concurrent
-           avformat avcodec avutil swscale swresample
+           "${OLR_FFMPEG_AVFORMAT_LIBRARY}" "${OLR_FFMPEG_AVCODEC_LIBRARY}"
+           "${OLR_FFMPEG_AVUTIL_LIBRARY}" "${OLR_FFMPEG_SWSCALE_LIBRARY}"
+           "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
     PRIVATE olr_warnings olr_sanitize)
 
 if(APPLE)
@@ -101,6 +157,14 @@ if(APPLE)
     target_link_libraries(olr_test_engine
         PRIVATE srt "-framework VideoToolbox" "-framework CoreMedia"
                 "-framework CoreFoundation" "-framework CoreVideo")
+elseif(WIN32)
+    target_sources(olr_test_engine PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtingestsession.cpp"
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp")
+    target_compile_definitions(olr_test_engine PUBLIC OLR_NATIVE_SRT_AVAILABLE=1)
+    target_include_directories(olr_test_engine PUBLIC "${OLR_SRT_INCLUDE_DIR}")
+    target_link_libraries(olr_test_engine
+        PRIVATE mfplat mf mfuuid d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
 elseif(NOT WIN32)
     target_sources(olr_test_engine PRIVATE
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_stub.cpp")
@@ -119,10 +183,14 @@ qt_add_library(olr_test_playback STATIC
 target_include_directories(olr_test_playback PUBLIC
     "${CMAKE_SOURCE_DIR}"
     "${OLR_FFMPEG_INCLUDE}")
-target_link_directories(olr_test_playback PUBLIC "${OLR_FFMPEG_LIBDIR}")
+if(NOT WIN32)
+    target_link_directories(olr_test_playback PUBLIC "${OLR_FFMPEG_LIBDIR}")
+endif()
 target_link_libraries(olr_test_playback
     PUBLIC olr_test_core Qt6::Core Qt6::Multimedia Qt6::Gui
-           avformat avcodec avutil swscale swresample
+           "${OLR_FFMPEG_AVFORMAT_LIBRARY}" "${OLR_FFMPEG_AVCODEC_LIBRARY}"
+           "${OLR_FFMPEG_AVUTIL_LIBRARY}" "${OLR_FFMPEG_SWSCALE_LIBRARY}"
+           "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
     PRIVATE olr_warnings olr_sanitize)
 
 add_subdirectory(unit)

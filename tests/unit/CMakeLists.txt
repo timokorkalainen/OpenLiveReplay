@@ -33,6 +33,13 @@ if(APPLE)
         PUBLIC Qt6::Core avutil "-framework VideoToolbox" "-framework CoreMedia"
                 "-framework CoreFoundation" "-framework CoreVideo")
     target_link_libraries(tst_nativevideodecoder PRIVATE olr_test_nativevideodecoder)
+elseif(WIN32)
+    add_library(olr_test_nativevideodecoder STATIC
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp")
+    target_link_libraries(olr_test_nativevideodecoder
+        PUBLIC Qt6::Core
+        PRIVATE mfplat mf mfuuid d3d11 dxgi ole32)
+    target_link_libraries(tst_nativevideodecoder PRIVATE olr_test_nativevideodecoder)
 elseif(NOT WIN32)
     add_library(olr_test_nativevideodecoder STATIC
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_stub.cpp")
