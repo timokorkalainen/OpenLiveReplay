@@ -3,6 +3,7 @@
 
 #include <QVariantList>
 #include <QVariantMap>
+#include <QJsonObject>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -95,6 +96,21 @@ struct TelemetryState {
     QVariantMap state;
 };
 
+struct CommandResult {
+    bool ok = true;
+    QString code;
+    QString message;
+
+    static CommandResult success() { return {}; }
+    static CommandResult failure(const QString &failureCode, const QString &failureMessage) {
+        CommandResult result;
+        result.ok = false;
+        result.code = failureCode;
+        result.message = failureMessage;
+        return result;
+    }
+};
+
 class ControlApiAdapter {
 public:
     virtual ~ControlApiAdapter() = default;
@@ -109,6 +125,8 @@ public:
     virtual ScreensState screensState() const = 0;
     virtual ImportState importState() const = 0;
     virtual TelemetryState telemetryState() const = 0;
+
+    virtual CommandResult executeCommand(const QString &name, const QJsonObject &args) = 0;
 };
 
 #endif

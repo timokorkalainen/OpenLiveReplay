@@ -10,6 +10,9 @@ private slots:
     void parsesCommandWithIdAndArgs();
     void rejectsMalformedJson();
     void rejectsMissingCommandName();
+    void validatesSeekArgs();
+    void rejectsSeekWithoutPosition();
+    void validatesActionDispatchDefaultsPressed();
     void buildsSuccessAck();
     void buildsFailureAck();
     void buildsErrorWithoutId();
@@ -44,6 +47,50 @@ void TestControlProtocol::rejectsMissingCommandName() {
     QVERIFY(!result.ok);
     QCOMPARE(result.code, QStringLiteral("bad_message"));
     QCOMPARE(result.id, QStringLiteral("abc"));
+}
+
+void TestControlProtocol::validatesSeekArgs() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("seek-1"),
+        QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 42}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("positionMs")).toInt(), 42);
+}
+
+void TestControlProtocol::rejectsSeekWithoutPosition() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("seek-2"),
+        QStringLiteral("transport.seek"),
+        QJsonObject{}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("positionMs")));
+}
+
+void TestControlProtocol::validatesActionDispatchDefaultsPressed() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"),
+        QStringLiteral("action-1"),
+        QStringLiteral("action.dispatch"),
+        QJsonObject{{QStringLiteral("actionId"), 0}}
+    };
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("actionId")).toInt(), 0);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("pressed")).toBool(), true);
 }
 
 void TestControlProtocol::buildsSuccessAck() {

@@ -29,6 +29,7 @@ public:
     ScreensState screensState() const override { return {true, 1, QVariantList{QVariantMap{{QStringLiteral("index"), 0}, {QStringLiteral("label"), QStringLiteral("Display")}}}}; }
     ImportState importState() const override { return {QStringLiteral("http://settings"), QStringLiteral("http://telemetry"), false, QString(), QVariantMap{}}; }
     TelemetryState telemetryState() const override { return {2, QVariantList{QVariantMap{{QStringLiteral("feedId"), QStringLiteral("cam-a")}}}, QVariantMap{{QStringLiteral("cam-a"), QVariantMap{{QStringLiteral("speed"), 88}}}}}; }
+    CommandResult executeCommand(const QString &, const QJsonObject &) override { return CommandResult::success(); }
 };
 
 class TestControlState : public QObject {
