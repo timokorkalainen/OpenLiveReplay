@@ -1,5 +1,7 @@
 #include "ingestsession.h"
 
+#include <QUrlQuery>
+
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options) {
     if (options.preferNativeSrt && url.scheme().toLower() == QStringLiteral("srt")) {
         return IngestBackendKind::NativeSrt;
@@ -19,4 +21,29 @@ SrtHealth srtHealth(const SrtStats& prev, const SrtStats& cur, double amberRetra
         return SrtHealth::Amber;
     }
     return SrtHealth::Green;
+}
+
+QUrl augmentSrtUrl(const QUrl& url) {
+    if (url.scheme().toLower() != QStringLiteral("srt")) {
+        return url;
+    }
+    QUrl out = url;
+    QUrlQuery query(out);
+    const auto addIfAbsent = [&query](const QString& key, const QString& value) {
+        if (!query.hasQueryItem(key)) query.addQueryItem(key, value);
+    };
+    // ffmpeg latency options are microseconds (-> /1000 -> SRTO_LATENCY ms).
+    const QString latencyUs = QString::number(qint64(kSrtLatencyMs) * 1000);
+    addIfAbsent(QStringLiteral("latency"), latencyUs);
+    addIfAbsent(QStringLiteral("rcvlatency"), latencyUs);
+    addIfAbsent(QStringLiteral("peerlatency"), latencyUs);
+    addIfAbsent(QStringLiteral("transtype"), QStringLiteral("live"));
+    addIfAbsent(QStringLiteral("connect_timeout"), QString::number(kSrtConnectTimeoutMs));
+    addIfAbsent(QStringLiteral("linger"), QStringLiteral("0"));
+    out.setQuery(query);
+    return out;
+}
+
+int jitterWindowMs(const QString& scheme, int srtFloorMs, int defaultMs) {
+    return scheme.toLower() == QStringLiteral("srt") ? srtFloorMs : defaultMs;
 }

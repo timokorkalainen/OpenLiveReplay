@@ -259,3 +259,24 @@ green/red dot and no stats tooltip.
 **Manual UI check** (the harness has no QML): with an SRT build, confirm a clean
 source shows green, a relayed-lossy source goes amber under stress / red on induced
 drops / back to green on recovery, and a non-SRT source stays plain green.
+
+## JIT-1: per-transport jitter window + effective SRT options
+
+**Effective SRT options (ffmpeg path).** SRT-private options must ride the URL query;
+on the `avformat_open_input` opts dict they are silently dropped. `augmentSrtUrl()`
+(`recorder_engine/ingest/ingestsession.cpp`) now adds them: `latency`/`rcvlatency`/
+`peerlatency` (ffmpeg units are **microseconds** → `kSrtLatencyMs*1000`), `transtype=live`,
+`connect_timeout` (**ms**), `linger=0`. The native path sets the same `kSrtLatencyMs` /
+`kSrtConnectTimeoutMs` via `srt_setsockopt` directly (those APIs are milliseconds). The old
+dict `latency=500` was doubly wrong: inert, and 500 µs ÷ 1000 = 0 ms even if it had applied.
+
+**Per-transport jitter window.** The engine holds frames a jitter window in the past before
+encoding. SRT sources lean on SRT's TSBPD reorder buffer, so they use a small floor
+(`kSrtJitterFloorMs`, default 80 ms, env-overridable via `OLR_SRT_JITTER_MS`); raw UDP/RTMP
+keep `kJitterBufferMs` (200 ms). The `StreamWorker` picks the window from the URL scheme,
+snapshots it once per pulse, and applies it to both video and audio (one A/V timeline).
+
+**Tests:** `tst_srt_options` (unit — `augmentSrtUrl` option/unit set, `jitterWindowMs` mapping);
+`ctest -L srt` proves the ffmpeg options don't break ingest; the native continuity gate scripts
+(`run_srt_soak.sh`/`run_srt_loss.sh`/`run_srt_jitter.sh`/`run_srt_4cam.sh`, `OLR_NATIVE_SRT=1`)
+prove the 80 ms floor keeps content continuous (no gaps).

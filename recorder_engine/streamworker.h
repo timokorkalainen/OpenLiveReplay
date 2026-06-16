@@ -37,6 +37,11 @@ public:
     // same delay so both land on the same timeline.
     static constexpr int kJitterBufferMs = 200;
 
+    // SRT sources lean on SRT's TSBPD reorder buffer, so the engine only needs a
+    // small residual window instead of the full kJitterBufferMs. Env-overridable
+    // (OLR_SRT_JITTER_MS) for tuning/validation. Non-SRT transports keep 200.
+    static constexpr int kSrtJitterFloorMs = 80;
+
     // Max magnitude of the per-source timeline trim (ms). +delay / -advance.
     static constexpr int kMaxTrimMs = 500;
 
@@ -136,6 +141,9 @@ private:
     // signed ms (+delay / -advance). Relaxed: standalone value, no associated
     // data to synchronize. Only setTrimOffsetMs() (clamped) writes it.
     std::atomic<int> m_trimOffsetMs{0};
+    // Per-source jitter window (ms), chosen by transport in captureLoop and read by
+    // the tick thread. Defaults to kJitterBufferMs until the URL is resolved.
+    std::atomic<int> m_activeJitterWindowMs{kJitterBufferMs};
     int m_connectBackoffMs = 1000;
     // Atomically update m_connected and emit connectionChanged on a real
     // transition (false<->true). Called from the capture thread.
@@ -154,7 +162,7 @@ private:
     int64_t m_audioFifoStartSample = -1;  // timeline sample index of m_audioFifo[0]
     int64_t m_audioWriteCursor = -1;      // next sample to mux (tick thread only)
     void enqueueAudio(int64_t startSample, const uint8_t* data, int numSamples);
-    void writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs);
+    void writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs, int64_t jitterMs);
 
     int m_targetWidth = 1920;
     int m_targetHeight = 1080;
@@ -171,7 +179,8 @@ private:
 
     // FFmpeg helpers
     bool setupEncoder(AVCodecContext** encCtx);
-    void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs);
+    void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
+                            int64_t jitterMs);
 };
 
 #endif // STREAMWORKER_H
