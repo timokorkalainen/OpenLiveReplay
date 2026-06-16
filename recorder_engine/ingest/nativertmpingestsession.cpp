@@ -262,7 +262,12 @@ bool NativeRtmpIngestSession::sendCreateStreamCommand(QString* error) {
         return false;
     }
     m_streamId = int(streamNumber);
-    return m_streamId > 0;
+    if (m_streamId <= 0) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
+        if (error) *error = QStringLiteral("Native RTMP createStream returned invalid stream id.");
+        return false;
+    }
+    return true;
 }
 
 bool NativeRtmpIngestSession::sendPlayCommand(QString* error) {
@@ -652,7 +657,18 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
         }
         return;
     }
-    if (aacPacketType != 1 || m_aacConfig.audioObjectType <= 0 || aacPayload.isEmpty()) {
+    if (aacPacketType != 1) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
+        log(QStringLiteral("Native RTMP audio parse failed: malformed AAC packet type %1.")
+                .arg(aacPacketType));
+        return;
+    }
+    if (m_aacConfig.audioObjectType <= 0) {
+        return;
+    }
+    if (aacPayload.isEmpty()) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
+        log(QStringLiteral("Native RTMP audio parse failed: empty AAC payload."));
         return;
     }
 
