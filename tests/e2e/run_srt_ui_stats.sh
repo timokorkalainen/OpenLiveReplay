@@ -36,7 +36,8 @@ cleanup() {
 trap cleanup EXIT
 
 # Record one source through the relay at $1=loss% $2=tag $3=port_base, with
-# --report-stats. Parses the harness's "stats src=0 ..." line into globals.
+# --report-stats. The harness writes its "stats src=0 ..." line to $tag.err, which
+# the caller reads via hstat() after this returns.
 measure() {
     local loss="$1" tag="$2" pb="$3"
     local S=$pb UDP=$((pb+1)) R=$((pb+2)) pp brp rp hp

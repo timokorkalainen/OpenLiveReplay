@@ -983,17 +983,19 @@ QVariantMap UIManager::recordingTelemetryStateAt(qint64 playheadMs) const {
 
 void UIManager::onSourceConnectionChanged(int sourceIndex, bool connected) {
     if (sourceIndex < 0) return;
+    while (m_sourceConnected.size() <= sourceIndex)
+        m_sourceConnected.append(false);
+    if (m_sourceConnected[sourceIndex] == connected) return; // no UI churn
+    m_sourceConnected[sourceIndex] = connected;
     if (connected) {
-        // Re-baseline SRT stats: counters restart from 0 on the new socket.
+        // Re-baseline SRT stats on a real disconnect->connect transition: the new
+        // socket restarts its cumulative counters from 0. Below the debounce guard
+        // so a redundant connected=true can never wipe a healthy source's baseline.
         if (sourceIndex < int(m_sourceStats.size())) {
             m_sourceStats[sourceIndex].seen = false;
             m_sourceStats[sourceIndex].health = int(SrtHealth::NA);
         }
     }
-    while (m_sourceConnected.size() <= sourceIndex)
-        m_sourceConnected.append(false);
-    if (m_sourceConnected[sourceIndex] == connected) return; // no UI churn
-    m_sourceConnected[sourceIndex] = connected;
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
 }

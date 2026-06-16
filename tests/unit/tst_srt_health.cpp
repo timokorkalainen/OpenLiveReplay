@@ -12,6 +12,7 @@ private slots:
     void lightRetransIsGreen();
     void thresholdIsStrict();
     void counterResetIsGreen();
+    void noRecvNoAmber();
 };
 
 // helper: build a cumulative snapshot
@@ -66,6 +67,14 @@ void TestSrtHealth::counterResetIsGreen() {
     // to Green, never misread a reset as recovery-success-with-loss.
     const SrtStats a = snap(5000, 400, 800, 9);
     const SrtStats b = snap(100, 2, 2, 0);
+    QCOMPARE(srtHealth(a, b, 0.02), SrtHealth::Green);
+}
+
+void TestSrtHealth::noRecvNoAmber() {
+    // No packets received this window but retrans counter moved: the rate is
+    // undefined (div-by-zero guarded by dRecv>0), so it must stay Green, not Amber.
+    const SrtStats a = snap(1000, 10, 10, 0);
+    const SrtStats b = snap(1000, 15, 15, 0); // dRecv==0, dRetrans>0, no drop
     QCOMPARE(srtHealth(a, b, 0.02), SrtHealth::Green);
 }
 
