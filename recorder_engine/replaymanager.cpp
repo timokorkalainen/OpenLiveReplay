@@ -1,4 +1,5 @@
 #include "replaymanager.h"
+#include "heartbeat.h"
 #include <QDebug>
 #include <QDir>
 #include <QDateTime>
@@ -247,8 +248,7 @@ void ReplayManager::startRecording() {
     updateViewMapping(m_viewSlotMap);
 
     // 6. Start the master heartbeat
-    const int intervalMs = qMax(1, static_cast<int>(1000.0 / m_fps));
-    m_heartbeat->start(intervalMs);
+    m_heartbeat->start(kHeartbeatIntervalMs);
     m_isRecording = true;
     qDebug() << "ReplayManager: Recording started."
              << sourceCount << "sources," << m_viewCount << "views.";
@@ -362,24 +362,15 @@ void ReplayManager::updateSourceTrim(int sourceIndex, int ms) {
 void ReplayManager::onTimerTick() {
     if (!m_clock) return;
 
+    // The recording timeline is wall-clock-derived; the (fixed-rate) timer is just a
+    // scheduler. heartbeatFrameSpan() turns the elapsed wall-clock into the frame
+    // range to emit this tick (with catch-up for late ticks + a 1-second backlog
+    // skip). maxBacklogFrames = m_fps == one second of frames.
     const int64_t elapsedMs = m_clock->elapsedMs();
-    const int64_t derivedFrame = (elapsedMs * m_fps) / 1000;
+    const FrameSpan span =
+        heartbeatFrameSpan(elapsedMs, m_fps, m_globalFrameCount, kMaxFramesPerTick, m_fps);
 
-    // Only emit when the frame count actually advances.
-    if (derivedFrame <= m_globalFrameCount) return;
-
-    // Emit one pulse PER FRAME so late timer ticks don't leave
-    // frame-index holes in the video tracks.  Catch-up is capped at one
-    // second of backlog (longer stalls resume from the current frame),
-    // and drained a few frames per tick so the catch-up itself never
-    // freezes the main thread — the remainder follows on later ticks.
-    int64_t from = m_globalFrameCount + 1;
-    if (derivedFrame - from >= m_fps) {
-        from = derivedFrame - m_fps + 1;
-    }
-    const int64_t maxPerTick = qMax(1, m_fps / 4);
-    const int64_t to = qMin(derivedFrame, from + maxPerTick - 1);
-    for (int64_t f = from; f <= to; ++f) {
+    for (int64_t f = span.from; f <= span.to; ++f) {
         m_globalFrameCount = f;
         const int64_t frameMs = (f * 1000) / m_fps;
 

@@ -125,6 +125,14 @@ private:
 
     int m_videoWidth = 1920;
     int m_videoHeight = 1080;
+    // Heartbeat scheduler cadence — fixed and fps-INDEPENDENT. The recording
+    // timeline is wall-clock-derived in onTimerTick (see heartbeatFrameSpan), so the
+    // timer is only a scheduler. ~125 Hz oversamples every supported frame rate
+    // (<=60 fps); surplus wakes are cheap no-ops (the empty-span early-out).
+    // kMaxFramesPerTick caps a post-stall catch-up burst so the GUI thread never
+    // freezes; the remainder drains on later ticks.
+    static constexpr int kHeartbeatIntervalMs = 8;
+    static constexpr int kMaxFramesPerTick = 8;
     int m_fps = 30;
 
     QTimer* m_heartbeat;
