@@ -37,44 +37,60 @@ to_msys() {
     printf '%s' "$p"
 }
 
+# Any path -> native (C:/foo). CMake needs native paths for compiler/prefix.
+to_native() {
+    if [ -d "$1" ]; then ( cd "$1" && pwd -W );
+    elif [ -e "$1" ]; then printf '%s/%s' "$( cd "$(dirname "$1")" && pwd -W )" "$(basename "$1")";
+    else printf '%s' "$1"; fi
+}
+newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
+
 # ------------------------------------------------------------------ toolchain
-if [ -z "${OLR_QT_ROOT:-}" ]; then
-    if [ -d "C:/Qt/6.10.2/mingw_64" ]; then
-        OLR_QT_ROOT="C:/Qt/6.10.2/mingw_64"
-    else
-        # newest C:/Qt/6.*/mingw_64
-        OLR_QT_ROOT="$(ls -d C:/Qt/6.*/mingw_64 2>/dev/null | sort -V | tail -1 || true)"
-    fi
-fi
+# Resolve the Qt MinGW kit. Order: explicit OLR_QT_ROOT, then QT_ROOT_DIR (set by
+# jurplel/install-qt-action in CI), then the default Qt-installer layout. No Qt
+# version or MinGW version is hard-coded — everything is discovered or overridden.
+: "${OLR_QT_ROOT:=${QT_ROOT_DIR:-$(newest C:/Qt/6.*/mingw_64)}}"
 [ -n "${OLR_QT_ROOT:-}" ] && [ -d "$OLR_QT_ROOT" ] || {
-    echo "ERROR: Qt MinGW kit not found; set OLR_QT_ROOT (e.g. C:/Qt/6.10.2/mingw_64)" >&2; exit 1; }
+    echo "ERROR: Qt MinGW kit not found; set OLR_QT_ROOT or QT_ROOT_DIR" >&2; exit 1; }
+OLR_QT_ROOT="$(to_native "$OLR_QT_ROOT")"
 
-OLR_MINGW_ROOT="${OLR_MINGW_ROOT:-C:/Qt/Tools/mingw1310_64}"
-[ -x "$OLR_MINGW_ROOT/bin/gcc.exe" ] || {
-    echo "ERROR: MinGW not found at $OLR_MINGW_ROOT (set OLR_MINGW_ROOT)" >&2; exit 1; }
+# Qt "Tools" dir is a sibling of the version dir: <base>/Tools
+QT_TOOLS_DIR="$(to_native "$OLR_QT_ROOT/../..")/Tools"
 
+# MinGW root: explicit, else newest mingw*_64 under the Qt Tools dir, else default layout.
+: "${OLR_MINGW_ROOT:=$(newest "$QT_TOOLS_DIR"/mingw*_64)}"
+[ -n "${OLR_MINGW_ROOT:-}" ] || OLR_MINGW_ROOT="$(newest C:/Qt/Tools/mingw*_64)"
+[ -n "${OLR_MINGW_ROOT:-}" ] && [ -x "$OLR_MINGW_ROOT/bin/gcc.exe" ] || {
+    echo "ERROR: MinGW not found under $QT_TOOLS_DIR; set OLR_MINGW_ROOT" >&2; exit 1; }
+OLR_MINGW_ROOT="$(to_native "$OLR_MINGW_ROOT")"
+
+# cmake / ninja: PATH first (CI provides them), then the Qt Tools dir.
 if [ -z "${CMAKE_BIN:-}" ]; then
-    if command -v cmake >/dev/null 2>&1; then CMAKE_BIN="$(command -v cmake)";
-    elif [ -x "C:/Qt/Tools/CMake_64/bin/cmake.exe" ]; then CMAKE_BIN="C:/Qt/Tools/CMake_64/bin/cmake.exe";
-    else echo "ERROR: cmake not found; set CMAKE_BIN" >&2; exit 1; fi
+    CMAKE_BIN="$(command -v cmake || true)"
+    [ -n "$CMAKE_BIN" ] || CMAKE_BIN="$(newest "$QT_TOOLS_DIR"/CMake*/bin/cmake.exe)"
 fi
+[ -n "${CMAKE_BIN:-}" ] || { echo "ERROR: cmake not found; set CMAKE_BIN or add to PATH" >&2; exit 1; }
 if [ -z "${NINJA_BIN:-}" ]; then
-    if command -v ninja >/dev/null 2>&1; then NINJA_BIN="$(command -v ninja)";
-    elif [ -x "C:/Qt/Tools/Ninja/ninja.exe" ]; then NINJA_BIN="C:/Qt/Tools/Ninja/ninja.exe";
-    else echo "ERROR: ninja not found; set NINJA_BIN" >&2; exit 1; fi
+    NINJA_BIN="$(command -v ninja || true)"
+    [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
 fi
+[ -n "${NINJA_BIN:-}" ] || { echo "ERROR: ninja not found; set NINJA_BIN or add to PATH" >&2; exit 1; }
+
 export PATH="$(to_msys "$OLR_MINGW_ROOT")/bin:$(to_msys "$(dirname "$NINJA_BIN")"):$(to_msys "$(dirname "$CMAKE_BIN")"):$PATH"
 
 echo "==> Qt    : $OLR_QT_ROOT"
 echo "==> MinGW : $OLR_MINGW_ROOT"
+echo "==> cmake : $CMAKE_BIN"
+echo "==> ninja : $NINJA_BIN"
 
 # ------------------------------------------------------------------ 1. deps
 QT_MINGW_DIR="$OLR_MINGW_ROOT" CMAKE_BIN="$CMAKE_BIN" NINJA_BIN="$NINJA_BIN" \
     "$SCRIPT_DIR/build_ffmpeg_windows_srt.sh"
 
 # ------------------------------------------------------------------ 2/3. cmake (preset)
+# The preset reads these as native paths (CMake rejects MSYS /c/... compiler paths).
 export OLR_QT_ROOT OLR_MINGW_ROOT
-export OLR_NINJA="$NINJA_BIN"
+export OLR_NINJA="$(to_native "$NINJA_BIN")"
 export OLR_FFMPEG_ROOT="$(winpath "$WORK_DIR/dist/ffmpeg")"
 export OLR_SRT_ROOT="$(winpath "$WORK_DIR/dist/srt")"
 
@@ -85,15 +101,27 @@ echo "==> Building"
 "$CMAKE_BIN" --build --preset windows-mingw-release
 
 # ------------------------------------------------------------------ 4. deploy
-echo "==> Deploying Qt + native runtime DLLs into build/"
-"$OLR_QT_ROOT/bin/windeployqt.exe" --qmldir "$(winpath "$ROOT_DIR")" \
-    --compiler-runtime --no-translations "$BUILD_DIR/OpenLiveReplay.exe"
-
-cp "$WORK_DIR/dist/ffmpeg/bin/"*.dll "$BUILD_DIR/"
-cp "$WORK_DIR/dist/srt/bin/libsrt.dll" "$BUILD_DIR/"
+# Assemble a clean, self-contained app dir (kept separate from the raw build
+# tree) and zip it as the distributable artifact.
+echo "==> Assembling self-contained app dir"
+APPDIR="$WORK_DIR/dist/OpenLiveReplay"
+rm -rf "$APPDIR"; mkdir -p "$APPDIR"
+cp "$BUILD_DIR/OpenLiveReplay.exe" "$APPDIR/"
+cp "$WORK_DIR/dist/ffmpeg/bin/"*.dll "$APPDIR/"
+cp "$WORK_DIR/dist/srt/bin/libsrt.dll" "$APPDIR/"
 # rtmidi is fetched + built by CMake (FetchContent).
 RTMIDI_DLL="$(find "$BUILD_DIR/_deps" -iname 'librtmidi*.dll' 2>/dev/null | head -1)"
-[ -n "$RTMIDI_DLL" ] && cp "$RTMIDI_DLL" "$BUILD_DIR/"
+[ -n "$RTMIDI_DLL" ] && cp "$RTMIDI_DLL" "$APPDIR/"
+
+echo "==> windeployqt (Qt DLLs, plugins, QML, compiler runtime)"
+"$OLR_QT_ROOT/bin/windeployqt.exe" --qmldir "$(winpath "$ROOT_DIR")" \
+    --compiler-runtime --no-translations "$APPDIR/OpenLiveReplay.exe"
+
+echo "==> Packaging zip"
+ZIP="$WORK_DIR/dist/OpenLiveReplay-windows.zip"
+rm -f "$ZIP"
+( cd "$WORK_DIR/dist" && "$CMAKE_BIN" -E tar cf "$ZIP" --format=zip OpenLiveReplay )
 
 echo ""
-echo "==> Done: $(winpath "$BUILD_DIR")/OpenLiveReplay.exe"
+echo "==> Done: $APPDIR/OpenLiveReplay.exe"
+echo "==> Artifact: $ZIP"

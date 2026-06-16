@@ -30,8 +30,13 @@ For **Windows** (Qt MinGW kit), the dependencies (FFmpeg + SRT) are built from
 source by a one-command script — see [`docs/windows-build.md`](docs/windows-build.md):
 
 ```bash
-./build-scripts/build_windows_app.sh
+./build-scripts/build_windows_app.sh    # Windows (Git Bash)
+./build-scripts/build_macos_app.sh      # macOS (Homebrew ffmpeg + srt)
 ```
+
+A manually-triggered GitHub Actions workflow
+([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs these on
+clean runners and uploads packaged Windows/macOS bundles as artifacts.
 
 Notes on dependencies
 ---------------------
