@@ -51,6 +51,13 @@ enum class SrtHealth { NA = 0, Green = 1, Amber = 2, Red = 3 };
 // reconnect reset the socket counters) clamp to Green. Pure — no Qt/UI deps.
 SrtHealth srtHealth(const SrtStats& prev, const SrtStats& cur, double amberRetransRate);
 
+// Shared SRT receive latency / connect timeout (milliseconds), used by BOTH ingest
+// paths: the native path passes them straight to srt_setsockopt (SRTO_LATENCY /
+// SRTO_CONNTIMEO, which are milliseconds); the ffmpeg path puts them in the URL query
+// via augmentSrtUrl() (note: ffmpeg's latency options are MICROSECONDS — see there).
+constexpr int kSrtLatencyMs = 500;
+constexpr int kSrtConnectTimeoutMs = 5000;
+
 struct IngestCallbacks {
     std::function<bool()> shouldStop;
     std::function<int64_t()> recordingClockMs;
@@ -74,5 +81,19 @@ public:
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options);
 
 Q_DECLARE_METATYPE(SrtStats)
+
+// Append SRT-private options to an srt:// URL's query so they actually apply.
+// FFmpeg's libsrt reads these via the URL query (av_find_info_tag); set on the
+// avformat_open_input() opts dict they are silently ignored. Non-srt URLs are
+// returned unchanged; an option already present in the query is left as-is (a
+// user override wins). UNITS: ffmpeg's latency/rcvlatency/peerlatency are
+// MICROSECONDS (it divides by 1000 -> SRTO_LATENCY ms), so they carry
+// kSrtLatencyMs*1000; connect_timeout is milliseconds; linger is seconds.
+QUrl augmentSrtUrl(const QUrl& url);
+
+// Per-transport engine jitter window: SRT sources lean on SRT's TSBPD reorder
+// buffer, so they need only a small residual floor; other transports get the
+// default. Returns srtFloorMs for scheme "srt" (case-insensitive), else defaultMs.
+int jitterWindowMs(const QString& scheme, int srtFloorMs, int defaultMs);
 
 #endif // INGESTSESSION_H
