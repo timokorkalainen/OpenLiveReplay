@@ -29,6 +29,8 @@ private slots:
     void chunkParserRejectsUnsafeSetChunkSizeValues();
     void chunkParserAppliesFragmentedSetChunkSizeOnlyAfterCompletion();
     void chunkParserRejectsNewHeaderBeforeIncompleteAssemblyCompletes();
+    void chunkParserRejectsNewFmtOneBeforeIncompleteAssemblyCompletes();
+    void chunkParserRejectsNewFmtTwoBeforeIncompleteAssemblyCompletes();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -292,6 +294,69 @@ void TestRtmpProtocol::chunkParserRejectsNewHeaderBeforeIncompleteAssemblyComple
 
     const QByteArray second = RtmpChunkWriter::message(6, 9, 1, 2000, QByteArray("abcd", 4), 128);
     QVERIFY(!parser.push(second, &messages, &error));
+    QVERIFY(error.contains(QStringLiteral("incomplete"), Qt::CaseInsensitive));
+}
+
+void TestRtmpProtocol::chunkParserRejectsNewFmtOneBeforeIncompleteAssemblyCompletes() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    const QByteArray setChunkSize =
+        RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("00000002"), 128);
+    QVERIFY(parser.push(setChunkSize, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+
+    const QByteArray previous = RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("aa", 2), 2);
+    QVERIFY(parser.push(previous, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+
+    const QByteArray incomplete =
+        RtmpChunkWriter::message(6, 9, 1, 1040, QByteArray("xyzz", 4), 2);
+    const int firstFragmentSize = 1 + 11 + 2;
+    QVERIFY(parser.push(incomplete.left(firstFragmentSize), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    QByteArray fmtOne;
+    fmtOne.append(char((1 << 6) | 6)); // fmt=1, csid=6
+    appendU24(&fmtOne, 40);
+    appendU24(&fmtOne, 2);
+    fmtOne.append(char(9));
+    fmtOne.append("bb", 2);
+
+    QVERIFY(!parser.push(fmtOne, &messages, &error));
+    QVERIFY(error.contains(QStringLiteral("incomplete"), Qt::CaseInsensitive));
+}
+
+void TestRtmpProtocol::chunkParserRejectsNewFmtTwoBeforeIncompleteAssemblyCompletes() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    const QByteArray setChunkSize =
+        RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("00000002"), 128);
+    QVERIFY(parser.push(setChunkSize, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+
+    const QByteArray previous = RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("aa", 2), 2);
+    QVERIFY(parser.push(previous, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+
+    QByteArray fmtOne;
+    fmtOne.append(char((1 << 6) | 6)); // fmt=1, csid=6
+    appendU24(&fmtOne, 40);
+    appendU24(&fmtOne, 4);
+    fmtOne.append(char(9));
+    fmtOne.append("xy", 2);
+    QVERIFY(parser.push(fmtOne, &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    QByteArray fmtTwo;
+    fmtTwo.append(char((2 << 6) | 6)); // fmt=2, csid=6
+    appendU24(&fmtTwo, 40);
+    fmtTwo.append("bb", 2);
+
+    QVERIFY(!parser.push(fmtTwo, &messages, &error));
     QVERIFY(error.contains(QStringLiteral("incomplete"), Qt::CaseInsensitive));
 }
 
