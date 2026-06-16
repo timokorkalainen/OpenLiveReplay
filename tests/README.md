@@ -25,6 +25,23 @@ record/playback E2E matrix. Run the full local gate with:
 ctest --test-dir build --output-on-failure -LE 'sync-report|srt|native-apple-ingest'
 ```
 
+Local transport bring-up gates use distinct labels such as `srt`,
+`native-apple-ingest`, and `native-rtmp`; they are excluded from CI until their
+matching native ingest path is ready.
+
+`native-rtmp` mirrors the applicable SRT transport gates: one-source RTMP/RTMPS
+smoke, 4-source routing, 4-source sync, per-source trim, and live/dead
+connection count.
+
+Native RTMP/RTMPS is opt-in while broadcast-readiness gates are being hardened.
+Set `OLR_NATIVE_RTMP=1` to use it locally. `OLR_FFMPEG_RTMP=1` forces the
+legacy FFmpeg RTMP path when comparing behavior.
+
+The optional real-server interop gate is also under `native-rtmp`. It skips
+unless `OLR_RTMP_INTEROP_PLAY_URL` is set; set `OLR_RTMP_INTEROP_PUBLISH_URL`
+when the publish URL differs, and optionally `OLR_RTMP_INTEROP_SERVER_CMD` to
+start a local server for the duration of the test.
+
 ## What's covered
 
 | Layer | Where | What it checks |

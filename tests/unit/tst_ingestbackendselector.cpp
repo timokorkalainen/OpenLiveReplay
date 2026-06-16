@@ -10,6 +10,10 @@ class TestIngestBackendSelector : public QObject {
 private slots:
     void defaultRoutesEverythingToFfmpeg();
     void nativeSrtFlagRoutesOnlySrtToNative();
+    void nativeRtmpFlagRoutesOnlyRtmpToNative();
+    void environmentKeepsRtmpOnFfmpegByDefaultUntilReady();
+    void environmentOptInRoutesRtmpAndRtmpsToNative();
+    void environmentCanForceRtmpBackToFfmpeg();
     void canConstructFfmpegSession();
     void nativeFailureReasonStartsEmpty();
     void nativeDecodeCapabilityErrorsRequestFallback();
@@ -22,6 +26,24 @@ public:
     bool open(const QUrl&, const IngestCallbacks&) override { return false; }
     void run() override {}
     void requestStop() override {}
+};
+
+class ScopedEnv {
+public:
+    explicit ScopedEnv(const char* name) : m_name(name), m_hadValue(qEnvironmentVariableIsSet(name)),
+                                           m_value(qgetenv(name)) {}
+    ~ScopedEnv() {
+        if (m_hadValue) {
+            qputenv(m_name, m_value);
+        } else {
+            qunsetenv(m_name);
+        }
+    }
+
+private:
+    const char* m_name = nullptr;
+    bool m_hadValue = false;
+    QByteArray m_value;
 };
 
 void TestIngestBackendSelector::defaultRoutesEverythingToFfmpeg() {
@@ -43,6 +65,74 @@ void TestIngestBackendSelector::nativeSrtFlagRoutesOnlySrtToNative() {
              IngestBackendKind::NativeSrt);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
              IngestBackendKind::Ffmpeg);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
+             IngestBackendKind::Ffmpeg);
+}
+
+void TestIngestBackendSelector::nativeRtmpFlagRoutesOnlyRtmpToNative() {
+    IngestBackendOptions opts;
+    opts.preferNativeRtmp = true;
+
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
+             IngestBackendKind::NativeRtmp);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
+             IngestBackendKind::NativeRtmp);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("srt://127.0.0.1:9000")), opts),
+             IngestBackendKind::Ffmpeg);
+}
+
+void TestIngestBackendSelector::environmentKeepsRtmpOnFfmpegByDefaultUntilReady() {
+    ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
+    ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
+    qunsetenv("OLR_NATIVE_RTMP");
+    qunsetenv("OLR_FFMPEG_RTMP");
+
+    IngestBackendOptions opts =
+        ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
+                                            false, true);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
+             IngestBackendKind::Ffmpeg);
+
+    opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
+                                               false, true);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
+             IngestBackendKind::Ffmpeg);
+}
+
+void TestIngestBackendSelector::environmentOptInRoutesRtmpAndRtmpsToNative() {
+    ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
+    ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
+    qputenv("OLR_NATIVE_RTMP", "1");
+    qunsetenv("OLR_FFMPEG_RTMP");
+
+    IngestBackendOptions opts =
+        ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
+                                            false, true);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
+             IngestBackendKind::NativeRtmp);
+
+    opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
+                                               false, true);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
+             IngestBackendKind::NativeRtmp);
+}
+
+void TestIngestBackendSelector::environmentCanForceRtmpBackToFfmpeg() {
+    ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
+    ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
+    qputenv("OLR_FFMPEG_RTMP", "1");
+    qunsetenv("OLR_NATIVE_RTMP");
+
+    IngestBackendOptions opts =
+        ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
+                                            false, true);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
+             IngestBackendKind::Ffmpeg);
+
+    qunsetenv("OLR_FFMPEG_RTMP");
+    qputenv("OLR_NATIVE_RTMP", "0");
+    opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
+                                               false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
              IngestBackendKind::Ffmpeg);
 }

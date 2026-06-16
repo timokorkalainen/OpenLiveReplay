@@ -4,6 +4,9 @@
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
 #include "ingest/nativesrtingestsession.h"
 #endif
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+#include "ingest/nativertmpingestsession.h"
+#endif
 #include <QDebug>
 #include <QDateTime>
 #include <QUrl>
@@ -11,9 +14,10 @@
 
 #include <memory>
 
-StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock *clock,
+StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
                            int targetWidth, int targetHeight, int targetFps, QObject* parent)
-    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer), m_sharedClock(clock) {
+    : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
+      m_sharedClock(clock) {
     qRegisterMetaType<SrtStats>("SrtStats");
     m_restartCapture = 0;
     m_internalFrameCount = 0;
@@ -23,7 +27,10 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
     if (targetFps > 0) m_targetFps = targetFps;
 }
 
-StreamWorker::~StreamWorker() { stop(); wait(); }
+StreamWorker::~StreamWorker() {
+    stop();
+    wait();
+}
 
 void StreamWorker::setConnected(bool c) {
     // exchange first so the emit fires exactly once per real transition,
@@ -34,7 +41,7 @@ void StreamWorker::setConnected(bool c) {
     }
 }
 
-void debugTimestamp(const QString &prefix, int trackIndex) {
+void debugTimestamp(const QString& prefix, int trackIndex) {
     QString timeStr = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
     qDebug() << "[" << timeStr << "] [Track" << trackIndex << "]" << prefix;
 }
@@ -68,7 +75,7 @@ void StreamWorker::run() {
     avcodec_free_context(&m_persistentEncCtx);
     av_frame_free(&m_latestFrame);
 
-    while(!m_frameQueue.isEmpty()){
+    while (!m_frameQueue.isEmpty()) {
         auto qf = m_frameQueue.dequeue();
         av_frame_free(&qf.frame);
     }
@@ -95,8 +102,8 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
 
     // Stall detection: if connected but no frames for too long, signal restart.
     const int64_t lastEnq = m_lastFrameEnqueueAtMs.load(std::memory_order_relaxed);
-    if (m_captureRunning && m_connected && lastEnq >= 0
-        && m_monotonic.elapsed() - lastEnq > m_stallTimeoutMs) {
+    if (m_captureRunning && m_connected && lastEnq >= 0 &&
+        m_monotonic.elapsed() - lastEnq > m_stallTimeoutMs) {
         qDebug() << "Source" << m_sourceIndex << "No frames queued. Forcing restart...";
         m_restartCapture = 1;
     }
@@ -158,7 +165,8 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         memset(m_latestFrame->data[1], 240,
                m_latestFrame->linesize[1] *
                    (m_latestFrame->height / 2)); // Cb: 240 = legal max chroma (255 is out-of-range)
-        memset(m_latestFrame->data[2], 107, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+        memset(m_latestFrame->data[2], 107,
+               m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
     }
     if (pulled) {
         av_frame_unref(m_latestFrame);
@@ -193,7 +201,10 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
         // Write the per-frame source metadata to the paired subtitle track
         QByteArray metaJson;
-        { QMutexLocker locker(&m_metadataMutex); metaJson = m_sourceMetadataJson; }
+        {
+            QMutexLocker locker(&m_metadataMutex);
+            metaJson = m_sourceMetadataJson;
+        }
         if (!metaJson.isEmpty()) {
             m_muxer->writeMetadataPacket(track, streamTimeMs, metaJson);
         }
@@ -215,7 +226,10 @@ void StreamWorker::captureLoop() {
         m_restartCapture = 0;
 
         QString currentUrl;
-        { QMutexLocker locker(&m_urlMutex); currentUrl = m_url; }
+        {
+            QMutexLocker locker(&m_urlMutex);
+            currentUrl = m_url;
+        }
 
         {
             // Right-size the jitter window for this source's transport. SRT (native
@@ -248,8 +262,8 @@ void StreamWorker::captureLoop() {
 
         IngestCallbacks callbacks;
         callbacks.shouldStop = [this]() {
-            return !m_captureRunning.load(std::memory_order_relaxed)
-                   || m_restartCapture.loadRelaxed() != 0;
+            return !m_captureRunning.load(std::memory_order_relaxed) ||
+                   m_restartCapture.loadRelaxed() != 0;
         };
         callbacks.recordingClockMs = [this]() -> int64_t {
             return m_sharedClock ? m_sharedClock->elapsedMs() : -1;
@@ -281,8 +295,8 @@ void StreamWorker::captureLoop() {
             // keeps only the newest frame at-or-before its gate, so the head is
             // garbage as soon as a SECOND frame is inside the gate.
             const int64_t tickGateMs = m_lastTickTargetMs.load(std::memory_order_relaxed);
-            while (tickGateMs >= 0 && m_frameQueue.size() >= 2
-                   && m_frameQueue.at(1).sourcePts <= tickGateMs) {
+            while (tickGateMs >= 0 && m_frameQueue.size() >= 2 &&
+                   m_frameQueue.at(1).sourcePts <= tickGateMs) {
                 auto old = m_frameQueue.dequeue();
                 av_frame_free(&old.frame);
             }
@@ -307,32 +321,43 @@ void StreamWorker::captureLoop() {
             emit statsUpdated(m_sourceIndex, stats);
         };
 
-        IngestBackendOptions backendOptions;
         const QUrl sourceUrl(currentUrl);
+        bool nativeSrtAvailable = false;
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
-        backendOptions.preferNativeSrt = !suppressNativeForCurrentUrl
-                                         && qEnvironmentVariableIsSet("OLR_NATIVE_SRT")
-                                         && NativeSrtIngestSession::supportsUrl(sourceUrl);
+        nativeSrtAvailable = NativeSrtIngestSession::supportsUrl(sourceUrl);
 #endif
+        bool nativeRtmpAvailable = false;
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+        nativeRtmpAvailable = NativeRtmpIngestSession::supportsUrl(sourceUrl);
+#endif
+        const IngestBackendOptions backendOptions =
+            ingestBackendOptionsFromEnvironment(sourceUrl, nativeSrtAvailable, nativeRtmpAvailable);
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
-#if !defined(OLR_NATIVE_SRT_AVAILABLE)
+#if !defined(OLR_NATIVE_SRT_AVAILABLE) && !defined(OLR_NATIVE_RTMP_AVAILABLE)
         Q_UNUSED(backendKind);
 #endif
 
         std::unique_ptr<IngestSession> session;
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
         if (backendKind == IngestBackendKind::NativeSrt) {
-            session = std::make_unique<NativeSrtIngestSession>(
-                m_sourceIndex, m_targetWidth, m_targetHeight, &m_captureRunning);
+            session = std::make_unique<NativeSrtIngestSession>(m_sourceIndex, m_targetWidth,
+                                                               m_targetHeight, &m_captureRunning);
+        } else
+#endif
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+            if (backendKind == IngestBackendKind::NativeRtmp) {
+            session = std::make_unique<NativeRtmpIngestSession>(m_sourceIndex, m_targetWidth,
+                                                                m_targetHeight, &m_captureRunning);
         } else
 #endif
         {
-            session = std::make_unique<FfmpegIngestSession>(
-                m_sourceIndex, m_targetWidth, m_targetHeight, m_targetFps);
+            session = std::make_unique<FfmpegIngestSession>(m_sourceIndex, m_targetWidth,
+                                                            m_targetHeight, m_targetFps);
         }
 
         if (!session->open(sourceUrl, callbacks)) {
-            qDebug() << "Source" << m_sourceIndex << "Connect failed. Retrying in" << (m_connectBackoffMs / 1000.0) << "s...";
+            qDebug() << "Source" << m_sourceIndex << "Connect failed. Retrying in"
+                     << (m_connectBackoffMs / 1000.0) << "s...";
             const int steps = qMax(1, m_connectBackoffMs / 100);
             for (int i = 0; i < steps && m_captureRunning && !m_restartCapture; ++i) {
                 QThread::msleep(100);
@@ -416,11 +441,11 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
         break;
     }
 
-    (*encCtx)->time_base = {1, m_targetFps};      // Internal codec clock
-    (*encCtx)->framerate = {m_targetFps, 1};      // Target framerate
+    (*encCtx)->time_base = {1, m_targetFps}; // Internal codec clock
+    (*encCtx)->framerate = {m_targetFps, 1}; // Target framerate
 
     (*encCtx)->pix_fmt = AV_PIX_FMT_YUV420P;
-    (*encCtx)->gop_size = 1;             // Keep Intra-only for seeking
+    (*encCtx)->gop_size = 1; // Keep Intra-only for seeking
     (*encCtx)->bit_rate = 30000000;
 
     m_latestFrame = av_frame_alloc();
@@ -470,14 +495,13 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
     QMutexLocker locker(&m_audioFifoMutex);
 
     if (m_audioFifoStartSample < 0 || m_audioFifo.isEmpty()) {
-        if (startSample < 0) return;  // continuation data with no stream yet
+        if (startSample < 0) return; // continuation data with no stream yet
         m_audioFifoStartSample = startSample;
         m_audioFifo.append(reinterpret_cast<const char*>(data), numBytes);
     } else {
-        const int64_t expected = m_audioFifoStartSample
-                                 + m_audioFifo.size() / kAudioBytesPerSample;
+        const int64_t expected = m_audioFifoStartSample + m_audioFifo.size() / kAudioBytesPerSample;
         const int64_t delta = (startSample < 0) ? 0 : startSample - expected;
-        const int64_t jitterTol = kAudioSampleRate / 100;  // 10 ms
+        const int64_t jitterTol = kAudioSampleRate / 100; // 10 ms
 
         if (qAbs(delta) <= jitterTol) {
             // Continuous (within PTS rounding jitter): plain append
@@ -533,8 +557,8 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
             const int64_t dropSamples =
                 (targetEnd - jitterSamples - trimSamples) - m_audioFifoStartSample;
             if (dropSamples > 0) {
-                const int dropBytes = int(qMin<int64_t>(dropSamples * kAudioBytesPerSample,
-                                                        m_audioFifo.size()));
+                const int dropBytes =
+                    int(qMin<int64_t>(dropSamples * kAudioBytesPerSample, m_audioFifo.size()));
                 m_audioFifo.remove(0, dropBytes);
                 m_audioFifoStartSample += dropBytes / kAudioBytesPerSample;
             }
@@ -569,8 +593,8 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
             // Trim everything we just consumed (or skipped past)
             const int64_t dropSamples = (srcStart + n) - fifoStart;
             if (dropSamples > 0) {
-                const int dropBytes = int(qMin<int64_t>(dropSamples * kAudioBytesPerSample,
-                                                        m_audioFifo.size()));
+                const int dropBytes =
+                    int(qMin<int64_t>(dropSamples * kAudioBytesPerSample, m_audioFifo.size()));
                 m_audioFifo.remove(0, dropBytes);
                 m_audioFifoStartSample += dropBytes / kAudioBytesPerSample;
             }

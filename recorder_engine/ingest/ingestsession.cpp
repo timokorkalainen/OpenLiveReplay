@@ -1,10 +1,28 @@
 #include "ingestsession.h"
 
 #include <QUrlQuery>
+#include <QtGlobal>
+
+namespace {
+bool nativeRtmpEnabledByEnvironment() {
+    if (qEnvironmentVariableIsSet("OLR_FFMPEG_RTMP")) {
+        return false;
+    }
+
+    const QString value = qEnvironmentVariable("OLR_NATIVE_RTMP").trimmed().toLower();
+    return value == QStringLiteral("1") || value == QStringLiteral("true") ||
+           value == QStringLiteral("on") || value == QStringLiteral("yes");
+}
+} // namespace
 
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options) {
     if (options.preferNativeSrt && url.scheme().toLower() == QStringLiteral("srt")) {
         return IngestBackendKind::NativeSrt;
+    }
+    const QString scheme = url.scheme().toLower();
+    if (options.preferNativeRtmp &&
+        (scheme == QStringLiteral("rtmp") || scheme == QStringLiteral("rtmps"))) {
+        return IngestBackendKind::NativeRtmp;
     }
 
     return IngestBackendKind::Ffmpeg;
@@ -46,4 +64,18 @@ QUrl augmentSrtUrl(const QUrl& url) {
 
 int jitterWindowMs(const QString& scheme, int srtFloorMs, int defaultMs) {
     return scheme.toLower() == QStringLiteral("srt") ? srtFloorMs : defaultMs;
+}
+
+IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
+                                                         bool nativeRtmpAvailable) {
+    IngestBackendOptions options;
+    const QString scheme = url.scheme().toLower();
+    options.preferNativeSrt = nativeSrtAvailable &&
+                              qEnvironmentVariableIsSet("OLR_NATIVE_SRT") &&
+                              scheme == QStringLiteral("srt");
+    options.preferNativeRtmp = nativeRtmpAvailable &&
+                               (scheme == QStringLiteral("rtmp") ||
+                                scheme == QStringLiteral("rtmps")) &&
+                               nativeRtmpEnabledByEnvironment();
+    return options;
 }
