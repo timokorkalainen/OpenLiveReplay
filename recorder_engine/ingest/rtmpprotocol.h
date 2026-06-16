@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QList>
 #include <QString>
+#include <QtGlobal>
 
 struct RtmpMessage {
     int type = 0;
@@ -36,6 +37,9 @@ class RtmpChunkParser {
 public:
     bool push(const QByteArray& bytes, QList<RtmpMessage>* messages, QString* error);
     int inputChunkSize() const { return m_inputChunkSize; }
+    void setMaxMessageSize(int bytes) { m_maxMessageSize = qMax(1, bytes); }
+    void setMaxBufferedBytes(int bytes) { m_maxBufferedBytes = qMax(1, bytes); }
+    void setInputChunkSizeForTest(int bytes) { m_inputChunkSize = qMax(1, bytes); }
     void reset();
 
 private:
@@ -64,6 +68,8 @@ private:
 
     QByteArray m_buffer;
     int m_inputChunkSize = 128;
+    int m_maxMessageSize = 16 * 1024 * 1024;
+    int m_maxBufferedBytes = 4 * 1024 * 1024;
     QHash<int, ChunkHeader> m_previousHeaders;
     QHash<int, ChunkAssembly> m_assemblies;
 };

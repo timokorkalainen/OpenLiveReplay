@@ -285,6 +285,15 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
         offset += 4;
     }
 
+    if (header.messageLength > m_maxMessageSize) {
+        if (error) {
+            *error = QStringLiteral("RTMP message length %1 exceeds limit %2.")
+                         .arg(header.messageLength)
+                         .arg(m_maxMessageSize);
+        }
+        return false;
+    }
+
     ChunkAssembly assembly = m_assemblies.value(csid);
     if (parsed.startsMessage || assembly.payload.isEmpty()) {
         assembly.header = header;
@@ -313,6 +322,10 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         return false;
     }
     messages->clear();
+    if (m_buffer.size() + bytes.size() > m_maxBufferedBytes) {
+        if (error) *error = QStringLiteral("RTMP buffered bytes exceed limit.");
+        return false;
+    }
     m_buffer.append(bytes);
 
     while (!m_buffer.isEmpty()) {
@@ -350,6 +363,10 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         message.streamId = assembly.header.messageStreamId;
         message.timestampMs = assembly.header.timestampMs;
         message.payload = std::move(assembly.payload);
+        if (message.type == 2 && message.payload.size() >= 4) {
+            const int abortCsid = int(readU32Be(message.payload.constData()));
+            m_assemblies.remove(abortCsid);
+        }
         if (message.type == 1) {
             if (message.payload.size() != 4) {
                 if (error) *error = QStringLiteral("RTMP set chunk size payload was malformed.");

@@ -31,6 +31,9 @@ private slots:
     void chunkParserRejectsNewHeaderBeforeIncompleteAssemblyCompletes();
     void chunkParserRejectsNewFmtOneBeforeIncompleteAssemblyCompletes();
     void chunkParserRejectsNewFmtTwoBeforeIncompleteAssemblyCompletes();
+    void chunkParserRejectsMessagesOverConfiguredLimit();
+    void chunkParserRejectsBufferedBytesOverConfiguredLimit();
+    void chunkParserAbortClearsInFlightAssembly();
     void parsesAvcSequenceHeaderAndConvertsNalusToAnnexB();
     void parsesAacSequenceHeaderAndBuildsAdtsFrame();
 };
@@ -358,6 +361,53 @@ void TestRtmpProtocol::chunkParserRejectsNewFmtTwoBeforeIncompleteAssemblyComple
 
     QVERIFY(!parser.push(fmtTwo, &messages, &error));
     QVERIFY(error.contains(QStringLiteral("incomplete"), Qt::CaseInsensitive));
+}
+
+void TestRtmpProtocol::chunkParserRejectsMessagesOverConfiguredLimit() {
+    RtmpChunkParser parser;
+    parser.setMaxMessageSize(4);
+    QList<RtmpMessage> messages;
+    QString error;
+
+    const QByteArray bytes =
+        RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("abcde", 5), 128);
+    QVERIFY(!parser.push(bytes, &messages, &error));
+    QVERIFY(error.contains(QStringLiteral("exceeds")));
+}
+
+void TestRtmpProtocol::chunkParserRejectsBufferedBytesOverConfiguredLimit() {
+    RtmpChunkParser parser;
+    parser.setMaxBufferedBytes(4);
+    QList<RtmpMessage> messages;
+    QString error;
+
+    QVERIFY(!parser.push(QByteArray("abcde", 5), &messages, &error));
+    QVERIFY(error.contains(QStringLiteral("buffered"), Qt::CaseInsensitive));
+    QVERIFY(error.contains(QStringLiteral("limit"), Qt::CaseInsensitive));
+}
+
+void TestRtmpProtocol::chunkParserAbortClearsInFlightAssembly() {
+    RtmpChunkParser parser;
+    QList<RtmpMessage> messages;
+    QString error;
+
+    parser.setInputChunkSizeForTest(2);
+    const QByteArray video = RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("abcdef", 6), 2);
+    QVERIFY(parser.push(video.left(14), &messages, &error));
+    QVERIFY(messages.isEmpty());
+
+    QByteArray abortPayload;
+    abortPayload.append(char(0));
+    abortPayload.append(char(0));
+    abortPayload.append(char(0));
+    abortPayload.append(char(6));
+    const QByteArray abort = RtmpChunkWriter::message(2, 2, 0, 0, abortPayload, 2);
+    QVERIFY(parser.push(abort, &messages, &error));
+    QCOMPARE(messages.size(), 1);
+    QCOMPARE(messages.first().type, 2);
+
+    QVERIFY(parser.push(video.mid(14), &messages, &error));
+    QVERIFY(messages.isEmpty());
 }
 
 void TestRtmpProtocol::parsesAvcSequenceHeaderAndConvertsNalusToAnnexB() {
