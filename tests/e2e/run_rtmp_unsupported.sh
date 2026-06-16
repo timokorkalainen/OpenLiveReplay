@@ -2,8 +2,7 @@
 set -uo pipefail
 # Negative native-RTMP unsupported-profile gate. This script verifies that native
 # RTMP reports unsupported inputs visibly and does not keep retrying native; it
-# does not prove that a second FFmpeg client can reconnect to this one-shot
-# fixture. The per-URL FFmpeg fallback state machine is covered by unit tests.
+# does not use the legacy FFmpeg RTMP path.
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/rtmp_lib.sh"
 
@@ -86,7 +85,7 @@ run_harness_case() {
     local out_mkv=""
     local harness_rc=0
 
-    OLR_NATIVE_RTMP=1 "$HARNESS" --url "$(rtmp_url "$port")" --name "rtmp_${case_name}" \
+    "$HARNESS" --url "$(rtmp_url "$port")" --name "rtmp_${case_name}" \
         --outdir "$WORKDIR" --seconds "$seconds" --width 640 --height 480 --fps 30 \
         >"$harness_out" 2>"$harness_err"
     harness_rc=$?
@@ -134,4 +133,4 @@ if ! grep -q '^READY ' "$IDLE_SERVER_LOG"; then
 fi
 run_harness_case "idle_probe" "$IDLE_PORT" 7 "$IDLE_SERVER_LOG"
 
-echo "PASS: unsupported native RTMP profile fails visibly (FFmpeg reconnect fallback is unit-covered)"
+echo "PASS: unsupported native RTMP profile fails visibly without FFmpeg RTMP fallback"

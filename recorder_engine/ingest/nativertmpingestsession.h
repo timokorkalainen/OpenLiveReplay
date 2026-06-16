@@ -4,8 +4,8 @@
 #include "audiotoolboxaacdecoder.h"
 #include "h26xaccessunit.h"
 #include "ingestsession.h"
+#include "nativevideodecoder.h"
 #include "rtmpprotocol.h"
-#include "videotoolboxdecoder.h"
 
 #include <QByteArray>
 #include <QElapsedTimer>
@@ -45,7 +45,7 @@ private:
     IngestCallbacks m_callbacks;
     QElapsedTimer m_monotonic;
     std::unique_ptr<QTcpSocket> m_socket;
-    std::unique_ptr<VideoToolboxDecoder> m_videoDecoder;
+    std::unique_ptr<NativeVideoDecoder> m_videoDecoder;
     std::unique_ptr<AudioToolboxAacDecoder> m_audioDecoder;
     RtmpAvcConfig m_avcConfig;
     RtmpHevcConfig m_hevcConfig;

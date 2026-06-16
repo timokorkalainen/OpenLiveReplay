@@ -16,16 +16,10 @@ private slots:
     void defaultRoutesEverythingToFfmpeg();
     void nativeSrtFlagRoutesOnlySrtToNative();
     void nativeRtmpFlagRoutesOnlyRtmpToNative();
-    void environmentKeepsRtmpOnFfmpegByDefaultUntilReady();
-    void environmentOptInRoutesRtmpAndRtmpsToNative();
-    void environmentCanForceRtmpBackToFfmpeg();
-    void nativeFailureFallbackPolicy();
-    void nativeFallbackPolicyForcesFfmpegForCurrentUrl();
-    void nativeFallbackPolicyKeepsSameUrlPinnedToFfmpeg();
-    void nativeFallbackPolicyResetsWhenUrlChanges();
-    void nativeFallbackPolicyResetsAfterEmptyUrlThenNewUrl();
-    void nativeFallbackPolicyDisableDoesNotForceFfmpeg();
-    void nativeFallbackPolicyIgnoresTransientNetworkFailures();
+    void environmentDefaultsRtmpAndRtmpsToNative();
+    void legacyRtmpFfmpegOverridesAreIgnored();
+    void nativeRtmpDisableEnvIsIgnored();
+    void nativeFailureStopsNativeRetryWithoutFfmpegFallback();
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
     void malformedLegacyVideoPacketStaysMalformed();
     void nativeRtmpConnectAdvertisesEnhancedCodecCapabilities();
@@ -101,7 +95,7 @@ void TestIngestBackendSelector::nativeRtmpFlagRoutesOnlyRtmpToNative() {
              IngestBackendKind::Ffmpeg);
 }
 
-void TestIngestBackendSelector::environmentKeepsRtmpOnFfmpegByDefaultUntilReady() {
+void TestIngestBackendSelector::environmentDefaultsRtmpAndRtmpsToNative() {
     ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
     ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
     qunsetenv("OLR_NATIVE_RTMP");
@@ -111,19 +105,19 @@ void TestIngestBackendSelector::environmentKeepsRtmpOnFfmpegByDefaultUntilReady(
         ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
                                             false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
+             IngestBackendKind::NativeRtmp);
 
     opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
                                                false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
+             IngestBackendKind::NativeRtmp);
 }
 
-void TestIngestBackendSelector::environmentOptInRoutesRtmpAndRtmpsToNative() {
+void TestIngestBackendSelector::legacyRtmpFfmpegOverridesAreIgnored() {
     ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
     ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
-    qputenv("OLR_NATIVE_RTMP", "1");
-    qunsetenv("OLR_FFMPEG_RTMP");
+    qunsetenv("OLR_NATIVE_RTMP");
+    qputenv("OLR_FFMPEG_RTMP", "1");
 
     IngestBackendOptions opts =
         ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
@@ -137,85 +131,30 @@ void TestIngestBackendSelector::environmentOptInRoutesRtmpAndRtmpsToNative() {
              IngestBackendKind::NativeRtmp);
 }
 
-void TestIngestBackendSelector::environmentCanForceRtmpBackToFfmpeg() {
+void TestIngestBackendSelector::nativeRtmpDisableEnvIsIgnored() {
     ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
     ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
     qputenv("OLR_FFMPEG_RTMP", "1");
-    qunsetenv("OLR_NATIVE_RTMP");
+    qputenv("OLR_NATIVE_RTMP", "0");
 
     IngestBackendOptions opts =
         ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
                                             false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
+             IngestBackendKind::NativeRtmp);
 
-    qunsetenv("OLR_FFMPEG_RTMP");
-    qputenv("OLR_NATIVE_RTMP", "0");
     opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
                                                false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
+             IngestBackendKind::NativeRtmp);
 }
 
-void TestIngestBackendSelector::nativeFailureFallbackPolicy() {
-    QVERIFY(shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::UnsupportedProfile));
-    QVERIFY(shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::DecodeCapability));
-    QVERIFY(shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::MalformedStream));
-    QVERIFY(!shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::TransientNetwork));
-    QVERIFY(!shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind::None));
-}
-
-void TestIngestBackendSelector::nativeFallbackPolicyForcesFfmpegForCurrentUrl() {
-    NativeRtmpFfmpegFallbackPolicy policy;
-    const QString url = QStringLiteral("rtmp://127.0.0.1/live/a");
-
-    QCOMPARE(policy.shouldForceFfmpeg(url), false);
-    QCOMPARE(policy.recordNativeFailure(url, IngestFailureKind::UnsupportedProfile, true), true);
-    QCOMPARE(policy.shouldForceFfmpeg(url), true);
-}
-
-void TestIngestBackendSelector::nativeFallbackPolicyKeepsSameUrlPinnedToFfmpeg() {
-    NativeRtmpFfmpegFallbackPolicy policy;
-    const QString url = QStringLiteral("rtmp://127.0.0.1/live/a");
-
-    QVERIFY(policy.recordNativeFailure(url, IngestFailureKind::DecodeCapability, true));
-    QVERIFY(policy.shouldForceFfmpeg(url));
-    QVERIFY(policy.shouldForceFfmpeg(url));
-}
-
-void TestIngestBackendSelector::nativeFallbackPolicyResetsWhenUrlChanges() {
-    NativeRtmpFfmpegFallbackPolicy policy;
-
-    QVERIFY(policy.recordNativeFailure(QStringLiteral("rtmp://127.0.0.1/live/a"),
-                                       IngestFailureKind::MalformedStream, true));
-    QVERIFY(policy.shouldForceFfmpeg(QStringLiteral("rtmp://127.0.0.1/live/a")));
-    QVERIFY(!policy.shouldForceFfmpeg(QStringLiteral("rtmp://127.0.0.1/live/b")));
-}
-
-void TestIngestBackendSelector::nativeFallbackPolicyResetsAfterEmptyUrlThenNewUrl() {
-    NativeRtmpFfmpegFallbackPolicy policy;
-
-    QVERIFY(policy.recordNativeFailure(QStringLiteral("rtmp://127.0.0.1/live/a"),
-                                       IngestFailureKind::UnsupportedProfile, true));
-    QVERIFY(policy.shouldForceFfmpeg(QStringLiteral("rtmp://127.0.0.1/live/a")));
-    QVERIFY(!policy.shouldForceFfmpeg(QString()));
-    QVERIFY(!policy.shouldForceFfmpeg(QStringLiteral("rtmp://127.0.0.1/live/a")));
-}
-
-void TestIngestBackendSelector::nativeFallbackPolicyDisableDoesNotForceFfmpeg() {
-    NativeRtmpFfmpegFallbackPolicy policy;
-    const QString url = QStringLiteral("rtmp://127.0.0.1/live/a");
-
-    QCOMPARE(policy.recordNativeFailure(url, IngestFailureKind::UnsupportedProfile, false), false);
-    QCOMPARE(policy.shouldForceFfmpeg(url), false);
-}
-
-void TestIngestBackendSelector::nativeFallbackPolicyIgnoresTransientNetworkFailures() {
-    NativeRtmpFfmpegFallbackPolicy policy;
-    const QString url = QStringLiteral("rtmp://127.0.0.1/live/a");
-
-    QCOMPARE(policy.recordNativeFailure(url, IngestFailureKind::TransientNetwork, true), false);
-    QCOMPARE(policy.shouldForceFfmpeg(url), false);
+void TestIngestBackendSelector::nativeFailureStopsNativeRetryWithoutFfmpegFallback() {
+    QVERIFY(shouldStopNativeRtmpAfterFailure(IngestFailureKind::UnsupportedProfile));
+    QVERIFY(shouldStopNativeRtmpAfterFailure(IngestFailureKind::DecodeCapability));
+    QVERIFY(shouldStopNativeRtmpAfterFailure(IngestFailureKind::MalformedStream));
+    QVERIFY(!shouldStopNativeRtmpAfterFailure(IngestFailureKind::TransientNetwork));
+    QVERIFY(!shouldStopNativeRtmpAfterFailure(IngestFailureKind::None));
 }
 
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)

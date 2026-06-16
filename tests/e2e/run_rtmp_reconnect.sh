@@ -67,7 +67,7 @@ if ! grep -q '^READY ' "$SERVER_LOG"; then
 fi
 
 URL="$(rtmp_url "$PORT")"
-OLR_NATIVE_RTMP=1 "$HARNESS" --url "$URL" --name olr_rtmp_reconnect --outdir "$WORKDIR" \
+"$HARNESS" --url "$URL" --name olr_rtmp_reconnect --outdir "$WORKDIR" \
     --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 \
     >"$HARNESS_OUT" 2>"$HARNESS_ERR"
 RC=$?

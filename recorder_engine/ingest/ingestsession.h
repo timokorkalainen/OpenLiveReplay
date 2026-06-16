@@ -34,16 +34,6 @@ struct IngestBackendOptions {
     bool preferNativeRtmp = false;
 };
 
-class NativeRtmpFfmpegFallbackPolicy {
-public:
-    bool shouldForceFfmpeg(const QString& url);
-    bool recordNativeFailure(const QString& url, IngestFailureKind failure, bool fallbackEnabled);
-
-private:
-    QString m_url;
-    bool m_forceFfmpeg = false;
-};
-
 struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
     int64_t sourcePtsMs = 0;
@@ -107,7 +97,7 @@ public:
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options);
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
                                                          bool nativeRtmpAvailable);
-bool shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind failure);
+bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure);
 
 Q_DECLARE_METATYPE(SrtStats)
 

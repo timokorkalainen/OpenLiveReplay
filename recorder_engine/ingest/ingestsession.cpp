@@ -3,18 +3,6 @@
 #include <QUrlQuery>
 #include <QtGlobal>
 
-namespace {
-bool nativeRtmpEnabledByEnvironment() {
-    if (qEnvironmentVariableIsSet("OLR_FFMPEG_RTMP")) {
-        return false;
-    }
-
-    const QString value = qEnvironmentVariable("OLR_NATIVE_RTMP").trimmed().toLower();
-    return value == QStringLiteral("1") || value == QStringLiteral("true") ||
-           value == QStringLiteral("on") || value == QStringLiteral("yes");
-}
-} // namespace
-
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options) {
     if (options.preferNativeSrt && url.scheme().toLower() == QStringLiteral("srt")) {
         return IngestBackendKind::NativeSrt;
@@ -66,30 +54,10 @@ int jitterWindowMs(const QString& scheme, int srtFloorMs, int defaultMs) {
     return scheme.toLower() == QStringLiteral("srt") ? srtFloorMs : defaultMs;
 }
 
-bool shouldFallbackToFfmpegAfterNativeFailure(IngestFailureKind failure) {
+bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure) {
     return failure == IngestFailureKind::UnsupportedProfile ||
            failure == IngestFailureKind::DecodeCapability ||
            failure == IngestFailureKind::MalformedStream;
-}
-
-bool NativeRtmpFfmpegFallbackPolicy::shouldForceFfmpeg(const QString& url) {
-    if (m_url != url) {
-        m_url = url;
-        m_forceFfmpeg = false;
-    }
-    return m_forceFfmpeg;
-}
-
-bool NativeRtmpFfmpegFallbackPolicy::recordNativeFailure(const QString& url,
-                                                         IngestFailureKind failure,
-                                                         bool fallbackEnabled) {
-    shouldForceFfmpeg(url);
-    if (!fallbackEnabled || !shouldFallbackToFfmpegAfterNativeFailure(failure)) {
-        return false;
-    }
-
-    m_forceFfmpeg = true;
-    return true;
 }
 
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
@@ -101,7 +69,6 @@ IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool n
                               scheme == QStringLiteral("srt");
     options.preferNativeRtmp = nativeRtmpAvailable &&
                                (scheme == QStringLiteral("rtmp") ||
-                                scheme == QStringLiteral("rtmps")) &&
-                               nativeRtmpEnabledByEnvironment();
+                                scheme == QStringLiteral("rtmps"));
     return options;
 }

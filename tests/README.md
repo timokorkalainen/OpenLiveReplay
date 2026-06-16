@@ -33,9 +33,8 @@ matching native ingest path is ready.
 smoke, 4-source routing, 4-source sync, per-source trim, and live/dead
 connection count.
 
-Native RTMP/RTMPS is opt-in while broadcast-readiness gates are being hardened.
-Set `OLR_NATIVE_RTMP=1` to use it locally. `OLR_FFMPEG_RTMP=1` forces the
-legacy FFmpeg RTMP path when comparing behavior.
+Native RTMP/RTMPS is the default ingest path. The legacy FFmpeg RTMP path is no
+longer selected for RTMP/RTMPS when the native backend is available.
 
 The optional real-server interop gate is also under `native-rtmp`. It skips
 unless `OLR_RTMP_INTEROP_PLAY_URL` is set; set `OLR_RTMP_INTEROP_PUBLISH_URL`

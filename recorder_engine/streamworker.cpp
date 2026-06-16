@@ -238,7 +238,6 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 void StreamWorker::captureLoop() {
     bool suppressNativeForCurrentUrl = false;
     QString nativeSuppressedUrl;
-    NativeRtmpFfmpegFallbackPolicy nativeRtmpFallbackPolicy;
 
     while (m_captureRunning) {
         // If a restart was requested (e.g. changeSource), acknowledge it
@@ -266,10 +265,6 @@ void StreamWorker::captureLoop() {
             nativeSuppressedUrl = currentUrl;
             suppressNativeForCurrentUrl = false;
         }
-
-        const bool forceFfmpegForCurrentUrl =
-            nativeRtmpFallbackPolicy.shouldForceFfmpeg(currentUrl);
-
         // If URL is empty, don't attempt to connect. Just idle until
         // a new URL is set via changeSource() which sets m_restartCapture.
         if (currentUrl.trimmed().isEmpty()) {
@@ -280,14 +275,8 @@ void StreamWorker::captureLoop() {
             continue;
         }
 
-        if (forceFfmpegForCurrentUrl) {
-            qDebug() << "Source" << m_sourceIndex
-                     << "Attempting FFmpeg fallback connection for current URL.";
-        } else {
-            qDebug() << "Source" << m_sourceIndex
-                     << "Attempting connection to:"
-                     << RtmpUrlParts::redactedForLog(QUrl(currentUrl));
-        }
+        qDebug() << "Source" << m_sourceIndex
+                 << "Attempting connection to:" << RtmpUrlParts::redactedForLog(QUrl(currentUrl));
         setConnected(false);
 
         IngestCallbacks callbacks;
@@ -362,8 +351,8 @@ void StreamWorker::captureLoop() {
 #endif
         IngestBackendOptions backendOptions =
             ingestBackendOptionsFromEnvironment(sourceUrl, nativeSrtAvailable, nativeRtmpAvailable);
-        if (forceFfmpegForCurrentUrl) {
-            backendOptions.preferNativeRtmp = false;
+        if (suppressNativeForCurrentUrl) {
+            backendOptions.preferNativeSrt = false;
         }
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
         const bool nativeRtmpAttempt = backendKind == IngestBackendKind::NativeRtmp;
@@ -391,28 +380,12 @@ void StreamWorker::captureLoop() {
 
         if (!session->open(sourceUrl, callbacks)) {
             const IngestFailureKind failureKind = session->lastFailureKind();
-            if (nativeRtmpAttempt && shouldFallbackToFfmpegAfterNativeFailure(failureKind)) {
-                const bool fallbackEnabled =
-                    !qEnvironmentVariableIsSet("OLR_NATIVE_RTMP_DISABLE_FALLBACK");
-                if (!fallbackEnabled) {
-                    qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
-                             << ingestFailureKindForLog(failureKind)
-                             << "and fallback is disabled; stopping capture for this URL.";
-                    m_captureRunning = false;
-                    break;
-                }
-                nativeRtmpFallbackPolicy.recordNativeFailure(currentUrl, failureKind,
-                                                             fallbackEnabled);
+            if (nativeRtmpAttempt && shouldStopNativeRtmpAfterFailure(failureKind)) {
                 qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
                          << ingestFailureKindForLog(failureKind)
-                         << "; retrying FFmpeg for this URL.";
-                m_connectBackoffMs = 1000;
-                continue;
-            }
-            if (forceFfmpegForCurrentUrl && backendKind == IngestBackendKind::Ffmpeg) {
-                qDebug() << "Source" << m_sourceIndex
-                         << "FFmpeg fallback open failed. Retrying in"
-                         << (m_connectBackoffMs / 1000.0) << "s...";
+                         << "; stopping capture for this URL.";
+                m_captureRunning = false;
+                break;
             } else {
                 qDebug() << "Source" << m_sourceIndex << "Connect failed. Retrying in"
                          << (m_connectBackoffMs / 1000.0) << "s...";
@@ -453,22 +426,12 @@ void StreamWorker::captureLoop() {
 
         setConnected(false);
         const IngestFailureKind failureKind = session->lastFailureKind();
-        if (nativeRtmpAttempt && shouldFallbackToFfmpegAfterNativeFailure(failureKind)) {
-            const bool fallbackEnabled =
-                !qEnvironmentVariableIsSet("OLR_NATIVE_RTMP_DISABLE_FALLBACK");
-            if (!fallbackEnabled) {
-                qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
-                         << ingestFailureKindForLog(failureKind)
-                         << "and fallback is disabled; stopping capture for this URL.";
-                m_captureRunning = false;
-                break;
-            }
-            nativeRtmpFallbackPolicy.recordNativeFailure(currentUrl, failureKind, fallbackEnabled);
+        if (nativeRtmpAttempt && shouldStopNativeRtmpAfterFailure(failureKind)) {
             qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
                      << ingestFailureKindForLog(failureKind)
-                     << "; retrying FFmpeg for this URL.";
-            m_connectBackoffMs = 1000;
-            continue;
+                     << "; stopping capture for this URL.";
+            m_captureRunning = false;
+            break;
         }
     }
 

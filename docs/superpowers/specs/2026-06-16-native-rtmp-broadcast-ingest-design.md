@@ -4,7 +4,7 @@
 
 Make native RTMP/RTMPS ingest dependable enough for live TV broadcast use before it is merged as the default RTMP path. The supported native profile includes legacy RTMP FLV and E-RTMP single-default-track ingest with H.264/AVC or HEVC video, AAC-LC audio, RTMPS transport, signed/authenticated URLs, reconnect behavior, long-running streams, arbitrary TCP fragmentation, and operator-visible failure diagnostics.
 
-The implementation should avoid FFmpeg for RTMP network receive, chunk parsing, FLV/E-RTMP demuxing, H.264/HEVC packetization, or H.264/HEVC decoding within the supported native profile. FFmpeg remains as an explicit fallback and escape hatch until native RTMP has passed real-server interop and soak gates.
+The implementation avoids FFmpeg for RTMP network receive, chunk parsing, FLV/E-RTMP demuxing, H.264/HEVC packetization, and H.264/HEVC decoding within the supported native profile. RTMP/RTMPS does not fall back to the legacy FFmpeg ingest path once the native backend is available.
 
 ## Scope
 
@@ -18,7 +18,7 @@ Supported for merge:
 - RTMPS with normal certificate validation, plus a clearly test-scoped insecure option for self-signed local fixtures.
 - Signed URLs and authentication query strings.
 - Server-driven disconnects, reconnect requests, stalls, source restart, decoder reset, and timestamp discontinuity handling.
-- Explicit failure or fallback when the stream is outside the supported profile.
+- Explicit native failure when the stream is outside the supported profile.
 
 Out of scope for this merge:
 
@@ -104,7 +104,7 @@ HEVC handling:
 - Emit `CompressedAccessUnit` with `NativeVideoCodec::Hevc`.
 - Reset `VideoToolboxDecoder` when VPS/SPS/PPS changes.
 
-Unsupported codecs must not result in a connected black source. Native ingest should fail with a clear unsupported-codec reason and allow the caller to use FFmpeg fallback when configured.
+Unsupported codecs must not result in a connected black source. Native ingest should fail with a clear unsupported-codec reason and must not retry the RTMP/RTMPS URL through FFmpeg.
 
 ## Audio Packet Handling
 
@@ -188,25 +188,15 @@ Server-requested reconnect should honor E-RTMP reconnect request semantics where
 - use replacement `tcUrl` when provided;
 - otherwise reconnect to the current URL.
 
-Unsupported profile or decoder capability failures should not loop forever through the same native path. The source should either:
-
-- fall back to `FfmpegIngestSession` until the URL changes or capture restarts; or
-- fail explicitly if FFmpeg RTMP fallback has been disabled.
+Unsupported profile or decoder capability failures should not loop forever through the same native path. The source should fail explicitly on native RTMP and stop capture for that URL rather than retrying through `FfmpegIngestSession`.
 
 The operator log must include source index, backend, URL scheme, codec/FourCC when known, and failure category.
 
 ## Backend Selection And Rollout
 
-Before the broadcast readiness gates pass:
-
-- native RTMP/RTMPS remains opt-in with `OLR_NATIVE_RTMP=1`;
-- FFmpeg remains the default for RTMP/RTMPS.
-
-After the readiness gates pass:
-
-- native RTMP/RTMPS can become the default on Apple platforms where VideoToolbox and AudioToolbox are available;
-- `OLR_FFMPEG_RTMP=1` remains as an explicit fallback override;
-- unsupported native profiles fall back automatically unless the fallback override is disabled.
+Native RTMP/RTMPS is the default ingest path on Apple platforms where the native backend is available.
+The legacy FFmpeg RTMP/RTMPS path is no longer selected by environment override or by native-profile failure fallback.
+Unsupported or malformed RTMP profiles fail clearly on the native path instead of being retried through FFmpeg.
 
 Native SRT selection remains separate and should not be regressed.
 
@@ -220,7 +210,7 @@ Unit tests:
 - E-RTMP video header parsing for `SequenceStart`, `CodedFrames`, `CodedFramesX`, `SequenceEnd`, metadata, and multitrack packets.
 - HEVCDecoderConfigurationRecord parsing and HEVC NAL conversion.
 - Signed URL app/playpath derivation.
-- Backend selection, fallback override, and unsupported-profile fallback policy.
+- Backend selection, legacy override ignoring, and unsupported-profile stop policy.
 
 Fixture E2E tests:
 
@@ -263,7 +253,7 @@ Native RTMP logs should include concise, structured-ish messages for:
 - reconnect request;
 - stall restart;
 - unsupported codec/profile;
-- fallback to FFmpeg;
+- no fallback to FFmpeg;
 - parse error category.
 
 Tests should assert key log markers so false-positive recordings do not pass.
@@ -286,7 +276,7 @@ Phase 7: Expand fixture E2E coverage for AVC, HEVC, RTMP, RTMPS, reconnect, nega
 
 Phase 8: Add real-server interop and soak gates.
 
-Phase 9: Flip native RTMP default only after all readiness gates pass, keeping `OLR_FFMPEG_RTMP=1`.
+Phase 9: Flip native RTMP default after all readiness gates pass, without an FFmpeg RTMP fallback override.
 
 ## Risks
 
@@ -294,6 +284,6 @@ The largest risk is mistaking fixture success for broadcast reliability. The fix
 
 E-RTMP support can easily sprawl into full multitrack and every modern codec. This design deliberately supports AVC, HEVC, and AAC for the default/single-track ingest profile and fails clearly outside that profile.
 
-HEVC availability is platform-dependent. On Apple platforms, `VideoToolboxDecoder` is the intended native decode boundary. Any VideoToolbox HEVC failure must trigger clear fallback or a clear operator-facing failure.
+HEVC availability is platform-dependent. On Apple platforms, `VideoToolboxDecoder` is the intended native decode boundary. Any VideoToolbox HEVC failure must trigger a clear operator-facing native failure.
 
 Defaulting native RTMP too early could regress existing RTMP users. The default flip is intentionally late and gated by real-server and soak evidence.

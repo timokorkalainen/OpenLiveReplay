@@ -79,7 +79,7 @@ else
 fi
 
 URL="$(rtmp_url "$PORT")"
-OLR_NATIVE_RTMP=1 "$HARNESS" --url "$URL" \
+"$HARNESS" --url "$URL" \
     --name "rtmp_soak_${CODEC}" --outdir "$WORKDIR" --seconds "$SECS" \
     --width 640 --height 480 --fps 30 >"$HARNESS_OUT" 2>"$HARNESS_ERR"
 RC=$?

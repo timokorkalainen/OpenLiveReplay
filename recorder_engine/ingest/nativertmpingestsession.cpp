@@ -8,6 +8,10 @@
 #include <QTcpSocket>
 #include <QThread>
 
+extern "C" {
+#include <libavutil/frame.h>
+}
+
 namespace {
 constexpr int kConnectTimeoutMs = 5000;
 constexpr int kIoTimeoutMs = 5000;
@@ -297,7 +301,7 @@ void NativeRtmpIngestSession::run() {
             break;
         }
         if (!m_unsupportedReason.isEmpty() ||
-            shouldFallbackToFfmpegAfterNativeFailure(m_lastFailureKind)) {
+            shouldStopNativeRtmpAfterFailure(m_lastFailureKind)) {
             break;
         }
         if (supportedVideoProbeExpired()) {
@@ -853,7 +857,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         return;
     }
     if (!m_videoDecoder) {
-        m_videoDecoder = std::make_unique<VideoToolboxDecoder>(m_outputWidth, m_outputHeight);
+        m_videoDecoder = std::make_unique<NativeVideoDecoder>(m_outputWidth, m_outputHeight);
     }
 
     CompressedAccessUnit unit;

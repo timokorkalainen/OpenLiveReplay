@@ -90,7 +90,7 @@ fi
 DISPLAY_PLAY_URL="$(rtmp_redact_value "$PLAY_URL")"
 DISPLAY_PUBLISH_URL="$(rtmp_redact_value "$PUBLISH_URL")"
 echo "[rtmp-interop] codec=$CODEC play=$DISPLAY_PLAY_URL publish=$DISPLAY_PUBLISH_URL seconds=$SECONDS_TO_RECORD"
-OLR_NATIVE_RTMP=1 "$HARNESS" --url "$PLAY_URL" --name olr_rtmp_interop --outdir "$WORKDIR" \
+"$HARNESS" --url "$PLAY_URL" --name olr_rtmp_interop --outdir "$WORKDIR" \
     --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 \
     >"$HARNESS_OUT" 2>"$HARNESS_ERR"
 RC=$?
