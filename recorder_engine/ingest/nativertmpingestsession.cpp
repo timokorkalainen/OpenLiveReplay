@@ -52,7 +52,9 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_videoDecoder.reset();
     m_audioDecoder.reset();
     m_avcConfig = RtmpAvcConfig();
+    m_hevcConfig = RtmpHevcConfig();
     m_aacConfig = RtmpAacConfig();
+    m_videoCodec = NativeVideoCodec::Unknown;
     m_streamId = 1;
     m_firstDtsMs = -1;
     m_prevDtsMs = -1;
@@ -443,42 +445,100 @@ void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
 }
 
 void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByteArray& payload) {
-    if (payload.size() < 5) {
-        return;
-    }
-    const int codecId = uchar(payload[0]) & 0x0f;
-    if (codecId != 7) {
+    const auto markUnsupported = [this](const QString& reason) {
         if (m_unsupportedReason.isEmpty()) {
-            m_unsupportedReason =
-                QStringLiteral("unsupported RTMP video codec id %1").arg(codecId);
+            m_unsupportedReason = reason;
             log(QStringLiteral("Native RTMP unsupported profile: %1").arg(m_unsupportedReason));
         }
-        return;
-    }
-    const int avcPacketType = uchar(payload[1]);
-    const qint32 compositionTimeMs = RtmpFlv::readS24(payload.constData() + 2);
-    const QByteArray avcPayload = payload.mid(5);
-    if (avcPacketType == 0) {
-        QString error;
-        if (!parseAvcSequenceHeader(avcPayload, &error)) {
-            log(error);
-        } else {
-            m_seenSupportedVideo = true;
+    };
+
+    RtmpVideoPacket packet;
+    QString parseError;
+    if (!RtmpFlv::parseVideoPacket(payload, &packet, &parseError)) {
+        if (parseError.isEmpty()) {
+            parseError = QStringLiteral("RTMP video packet is malformed.");
         }
-        return;
-    }
-    if (avcPacketType != 1 || m_avcConfig.parameterSets.h264Sps.isEmpty() ||
-        m_avcConfig.parameterSets.h264Pps.isEmpty()) {
+        log(QStringLiteral("Native RTMP video parse failed: %1").arg(parseError));
+        if (parseError.contains(QStringLiteral("unsupported"), Qt::CaseInsensitive)) {
+            markUnsupported(parseError);
+        }
         return;
     }
 
-    QByteArray annexB = RtmpFlv::avcPayloadToAnnexB(avcPayload, m_avcConfig.nalLengthSize);
+    const auto codecName = [](NativeVideoCodec codec) {
+        if (codec == NativeVideoCodec::H264) return QStringLiteral("avc1");
+        if (codec == NativeVideoCodec::Hevc) return QStringLiteral("hvc1");
+        return QStringLiteral("unknown");
+    };
+
+    if (packet.codec != NativeVideoCodec::H264 && packet.codec != NativeVideoCodec::Hevc) {
+        const QString reason = packet.fourCc.isEmpty()
+                                   ? QStringLiteral("unsupported RTMP video codec")
+                                   : QStringLiteral("unsupported RTMP video codec %1")
+                                         .arg(packet.fourCc);
+        markUnsupported(reason);
+        return;
+    }
+
+    if (packet.enhancedType == RtmpEnhancedVideoPacketType::SequenceStart) {
+        QString error;
+        if (packet.codec == NativeVideoCodec::Hevc) {
+            if (!RtmpFlv::parseHevcSequenceHeader(packet.codecPayload, &m_hevcConfig, &error)) {
+                if (!error.startsWith(QStringLiteral("Native RTMP"))) {
+                    error = QStringLiteral("Native %1").arg(error);
+                }
+                log(error);
+                return;
+            }
+        } else {
+            if (!parseAvcSequenceHeader(packet.codecPayload, &error)) {
+                log(error);
+                return;
+            }
+        }
+
+        m_videoCodec = packet.codec;
+        m_seenSupportedVideo = true;
+        if (m_videoDecoder) {
+            m_videoDecoder->reset();
+        }
+        log(QStringLiteral("Native RTMP video codec %1.").arg(codecName(packet.codec)));
+        return;
+    }
+
+    if (packet.enhancedType != RtmpEnhancedVideoPacketType::CodedFrames &&
+        packet.enhancedType != RtmpEnhancedVideoPacketType::CodedFramesX) {
+        return;
+    }
+
+    int nalLengthSize = 0;
+    H26xParameterSets parameterSets;
+    if (packet.codec == NativeVideoCodec::H264) {
+        if (m_videoCodec != NativeVideoCodec::H264 || m_avcConfig.parameterSets.h264Sps.isEmpty() ||
+            m_avcConfig.parameterSets.h264Pps.isEmpty()) {
+            return;
+        }
+        nalLengthSize = m_avcConfig.nalLengthSize;
+        parameterSets = m_avcConfig.parameterSets;
+    } else {
+        if (m_videoCodec != NativeVideoCodec::Hevc ||
+            m_hevcConfig.parameterSets.hevcVps.isEmpty() ||
+            m_hevcConfig.parameterSets.hevcSps.isEmpty() ||
+            m_hevcConfig.parameterSets.hevcPps.isEmpty()) {
+            return;
+        }
+        nalLengthSize = m_hevcConfig.nalLengthSize;
+        parameterSets = m_hevcConfig.parameterSets;
+    }
+
+    QByteArray annexB =
+        RtmpFlv::lengthPrefixedPayloadToAnnexB(packet.codecPayload, nalLengthSize);
     if (annexB.isEmpty()) {
         return;
     }
 
     const qint64 dtsMs = timestampMs;
-    const qint64 ptsMs = timestampMs + compositionTimeMs;
+    const qint64 ptsMs = timestampMs + packet.compositionTimeMs;
     const int64_t sourcePtsMs = sourcePtsMsForVideo(dtsMs, ptsMs);
     if (sourcePtsMs < 0) {
         return;
@@ -488,11 +548,11 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     }
 
     CompressedAccessUnit unit;
-    unit.codec = NativeVideoCodec::H264;
+    unit.codec = packet.codec;
     unit.pts90k = ptsMs * 90;
     unit.dts90k = dtsMs * 90;
     unit.annexB = std::move(annexB);
-    unit.parameterSets = m_avcConfig.parameterSets;
+    unit.parameterSets = std::move(parameterSets);
 
     QString error;
     const bool decoded = m_videoDecoder->decode(

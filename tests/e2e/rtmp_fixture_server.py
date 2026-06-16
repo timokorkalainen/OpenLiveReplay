@@ -248,9 +248,119 @@ def flv_tags(path: str) -> list[tuple[int, int, bytes]]:
     return tags
 
 
+def split_annexb(data: bytes) -> list[bytes]:
+    starts: list[tuple[int, int]] = []
+    i = 0
+    while i + 3 <= len(data):
+        if data[i : i + 3] == b"\x00\x00\x01":
+            starts.append((i, 3))
+            i += 3
+        elif i + 4 <= len(data) and data[i : i + 4] == b"\x00\x00\x00\x01":
+            starts.append((i, 4))
+            i += 4
+        else:
+            i += 1
+
+    nals: list[bytes] = []
+    for index, (start, prefix_size) in enumerate(starts):
+        nal_start = start + prefix_size
+        nal_end = starts[index + 1][0] if index + 1 < len(starts) else len(data)
+        while nal_end > nal_start and data[nal_end - 1] == 0:
+            nal_end -= 1
+        if nal_end > nal_start:
+            nals.append(data[nal_start:nal_end])
+    return nals
+
+
+def hevc_nal_type(nal: bytes) -> int:
+    if len(nal) < 2:
+        raise ValueError("HEVC NAL unit is too short")
+    return (nal[0] >> 1) & 0x3F
+
+
+def build_hvcc(vps: list[bytes], sps: list[bytes], pps: list[bytes]) -> bytes:
+    if not vps or not sps or not pps:
+        raise ValueError("HEVC Annex B source lacks VPS/SPS/PPS")
+
+    out = bytearray(23)
+    out[0] = 1
+    out[21] = 0xFC | 3  # four-byte NAL lengths
+    out[22] = 3
+    for nal_type, nals in ((32, vps), (33, sps), (34, pps)):
+        out.append(0x80 | nal_type)
+        out.extend(struct.pack(">H", len(nals)))
+        for nal in nals:
+            out.extend(struct.pack(">H", len(nal)))
+            out.extend(nal)
+    return bytes(out)
+
+
+def length_prefixed(nals: list[bytes]) -> bytes:
+    out = bytearray()
+    for nal in nals:
+        out.extend(struct.pack(">I", len(nal)))
+        out.extend(nal)
+    return bytes(out)
+
+
+def enhanced_hevc_tags(path: str) -> list[tuple[int, int, bytes]]:
+    with open(path, "rb") as f:
+        nals = split_annexb(f.read())
+    if not nals:
+        raise ValueError("HEVC Annex B source contains no NAL units")
+
+    vps: list[bytes] = []
+    sps: list[bytes] = []
+    pps: list[bytes] = []
+    frames: list[list[bytes]] = []
+    current: list[bytes] = []
+    prefix: list[bytes] = []
+
+    for nal in nals:
+        nal_type = hevc_nal_type(nal)
+        if nal_type == 32:
+            vps.append(nal)
+            continue
+        if nal_type == 33:
+            sps.append(nal)
+            continue
+        if nal_type == 34:
+            pps.append(nal)
+            continue
+
+        if nal_type in (19, 20, 1):
+            if current:
+                frames.append(current)
+                current = []
+            if prefix:
+                current.extend(prefix)
+                prefix = []
+            current.append(nal)
+        elif current:
+            current.append(nal)
+        else:
+            prefix.append(nal)
+
+    if current:
+        frames.append(current)
+    if not frames:
+        raise ValueError("HEVC Annex B source contains no coded access units")
+
+    tags: list[tuple[int, int, bytes]] = []
+    tags.append((9, 0, bytes((0x80 | 0,)) + b"hvc1" + build_hvcc(vps, sps, pps)))
+    for index, frame in enumerate(frames):
+        payload = bytes((0x80 | 1,)) + b"hvc1" + u24(0) + length_prefixed(frame)
+        tags.append((9, index * 33, payload))
+    return tags
+
+
 def run_server(args: argparse.Namespace) -> None:
     tags: list[tuple[int, int, bytes]] = []
-    if args.flv:
+    if args.enhanced_hevc:
+        if not args.hevc_annexb_source:
+            raise ValueError("--enhanced-hevc requires --hevc-annexb-source")
+        tags = enhanced_hevc_tags(args.hevc_annexb_source)
+    elif args.flv:
         tags = flv_tags(args.flv)
     if not args.idle_after_play and not tags:
         raise ValueError("FLV fixture contains no RTMP media tags")
@@ -357,6 +467,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--flv")
+    parser.add_argument("--enhanced-hevc", action="store_true")
+    parser.add_argument("--hevc-annexb-source")
     parser.add_argument("--accept-timeout", type=float, default=10.0)
     parser.add_argument("--io-timeout", type=float, default=20.0)
     parser.add_argument("--hold-open", type=float, default=2.0)

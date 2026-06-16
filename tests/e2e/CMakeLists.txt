@@ -262,9 +262,16 @@ endif()
 if(APPLE)
     add_test(NAME e2e_native_rtmp_smoke
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+    add_test(NAME e2e_native_rtmp_hevc_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23770)
     add_test(NAME e2e_native_rtmp_unsupported
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_unsupported.sh" "$<TARGET_FILE:record_harness>" 23760)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmp_hevc_smoke PROPERTIES
         LABELS "native-rtmp"
         TIMEOUT 180
         RUN_SERIAL TRUE

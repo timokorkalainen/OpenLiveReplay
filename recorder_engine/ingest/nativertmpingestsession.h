@@ -44,7 +44,9 @@ private:
     std::unique_ptr<VideoToolboxDecoder> m_videoDecoder;
     std::unique_ptr<AudioToolboxAacDecoder> m_audioDecoder;
     RtmpAvcConfig m_avcConfig;
+    RtmpHevcConfig m_hevcConfig;
     RtmpAacConfig m_aacConfig;
+    NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
     int m_outputChunkSize = 128;
     int m_streamId = 1;
     int64_t m_firstDtsMs = -1;
