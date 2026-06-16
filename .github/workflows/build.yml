@@ -9,10 +9,6 @@ on:
         description: "Qt version to build against"
         required: false
         default: "6.10.2"
-  # TEMPORARY (remove before merge): lets the workflow be validated on the PR
-  # branch, since workflow_dispatch only fires from the default branch.
-  push:
-    branches: [feat/windows-mingw-build]
 
 concurrency:
   group: build-apps-${{ github.ref }}
