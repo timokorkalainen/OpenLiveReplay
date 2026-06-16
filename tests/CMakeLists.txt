@@ -103,6 +103,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/telemetry/sseparser.cpp"
     "${CMAKE_SOURCE_DIR}/telemetry/telemetryclient.cpp"
     "${CMAKE_SOURCE_DIR}/websocket/controlprotocol.cpp"
+    "${CMAKE_SOURCE_DIR}/websocket/controlstate.cpp"
     "${CMAKE_SOURCE_DIR}/streamdeck/streamdeckmappingstore.cpp"
 )
 target_include_directories(olr_test_core PUBLIC
