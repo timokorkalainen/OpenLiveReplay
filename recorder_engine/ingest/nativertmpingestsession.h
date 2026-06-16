@@ -79,6 +79,7 @@ private:
     void processMessage(const RtmpMessage& message);
     void processVideoMessage(qint64 timestampMs, const QByteArray& payload);
     void processAudioMessage(qint64 timestampMs, const QByteArray& payload);
+    void resetVideoState();
     bool parseAvcSequenceHeader(const QByteArray& payload, QString* error);
     bool parseAacSequenceHeader(const QByteArray& payload, QString* error);
     int64_t sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs);

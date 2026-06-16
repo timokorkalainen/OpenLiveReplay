@@ -459,8 +459,12 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
             parseError = QStringLiteral("RTMP video packet is malformed.");
         }
         log(QStringLiteral("Native RTMP video parse failed: %1").arg(parseError));
-        if (parseError.contains(QStringLiteral("unsupported"), Qt::CaseInsensitive)) {
-            markUnsupported(parseError);
+        if (!payload.isEmpty() && (uchar(payload[0]) & 0x80) == 0) {
+            const int codecId = uchar(payload[0]) & 0x0f;
+            if (codecId != 7) {
+                markUnsupported(
+                    QStringLiteral("unsupported RTMP video codec id %1").arg(codecId));
+            }
         }
         return;
     }
@@ -470,6 +474,20 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         if (codec == NativeVideoCodec::Hevc) return QStringLiteral("hvc1");
         return QStringLiteral("unknown");
     };
+
+    if (packet.enhancedType == RtmpEnhancedVideoPacketType::Metadata) {
+        return;
+    }
+
+    if (packet.enhancedType == RtmpEnhancedVideoPacketType::Multitrack) {
+        log(QStringLiteral("Native RTMP ignoring unsupported multitrack video packet."));
+        return;
+    }
+
+    if (packet.enhancedType == RtmpEnhancedVideoPacketType::SequenceEnd) {
+        resetVideoState();
+        return;
+    }
 
     if (packet.codec != NativeVideoCodec::H264 && packet.codec != NativeVideoCodec::Hevc) {
         const QString reason = packet.fourCc.isEmpty()
@@ -571,6 +589,15 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         &error);
     if (!decoded && !error.isEmpty()) {
         log(error);
+    }
+}
+
+void NativeRtmpIngestSession::resetVideoState() {
+    m_videoCodec = NativeVideoCodec::Unknown;
+    m_avcConfig = RtmpAvcConfig();
+    m_hevcConfig = RtmpHevcConfig();
+    if (m_videoDecoder) {
+        m_videoDecoder->reset();
     }
 }
 

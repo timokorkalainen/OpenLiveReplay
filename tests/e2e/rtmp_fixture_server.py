@@ -278,6 +278,10 @@ def hevc_nal_type(nal: bytes) -> int:
     return (nal[0] >> 1) & 0x3F
 
 
+def hevc_is_vcl(nal_type: int) -> bool:
+    return 0 <= nal_type <= 31
+
+
 def build_hvcc(vps: list[bytes], sps: list[bytes], pps: list[bytes]) -> bytes:
     if not vps or not sps or not pps:
         raise ValueError("HEVC Annex B source lacks VPS/SPS/PPS")
@@ -328,15 +332,13 @@ def enhanced_hevc_tags(path: str) -> list[tuple[int, int, bytes]]:
             pps.append(nal)
             continue
 
-        if nal_type in (19, 20, 1):
+        if hevc_is_vcl(nal_type):
             if current:
                 frames.append(current)
                 current = []
             if prefix:
                 current.extend(prefix)
                 prefix = []
-            current.append(nal)
-        elif current:
             current.append(nal)
         else:
             prefix.append(nal)

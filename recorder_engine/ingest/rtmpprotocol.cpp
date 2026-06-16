@@ -698,7 +698,9 @@ bool RtmpFlv::parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packe
         offset += 3;
     } else if (parsed.enhancedType == RtmpEnhancedVideoPacketType::SequenceStart ||
                parsed.enhancedType == RtmpEnhancedVideoPacketType::SequenceEnd ||
-               parsed.enhancedType == RtmpEnhancedVideoPacketType::CodedFramesX) {
+               parsed.enhancedType == RtmpEnhancedVideoPacketType::CodedFramesX ||
+               parsed.enhancedType == RtmpEnhancedVideoPacketType::Metadata ||
+               parsed.enhancedType == RtmpEnhancedVideoPacketType::Multitrack) {
         parsed.compositionTimeMs = 0;
     } else {
         if (error) {

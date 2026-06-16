@@ -31,7 +31,7 @@ generate_hevc() {
         -f lavfi -i "testsrc2=size=640x480:rate=30" \
         -t "$SECONDS_TO_RECORD" -an -pix_fmt yuv420p \
         -c:v "$codec" "$@" \
-        -g 1 -bf 0 \
+        -g 30 -bf 0 \
         -f hevc "$HEVC"
 }
 
@@ -44,6 +44,15 @@ if ! generate_hevc hevc_videotoolbox -allow_sw 1 >/dev/null 2>&1 || [ ! -s "$HEV
         echo "SKIP: ffmpeg cannot generate raw Annex B HEVC with hevc_videotoolbox or libx265"
         exit 77
     fi
+fi
+
+is_num() { case "${1:-}" in '' | *[!0-9.-]*) return 1 ;; *) return 0 ;; esac; }
+
+SOURCE_PACKETS="$(ffprobe -v error -count_packets -show_entries stream=nb_read_packets \
+    -of default=noprint_wrappers=1:nokey=1 "$HEVC" | head -n1)"
+if ! is_num "${SOURCE_PACKETS:-}"; then
+    echo "FAIL: could not count generated HEVC source packets"
+    exit 1
 fi
 
 python3 "$HERE/rtmp_fixture_server.py" --port "$RTMP_PORT" \
@@ -81,6 +90,32 @@ fi
 if ! grep -q "hvc1" "$HARNESS_ERR"; then
     echo "FAIL: harness stderr did not identify hvc1"
     fail=1
+fi
+
+if [ "$fail" -eq 0 ]; then
+    V_PACKETS="$(ffprobe -v error -select_streams v:0 -count_packets \
+        -show_entries stream=nb_read_packets -of default=noprint_wrappers=1:nokey=1 \
+        "$OUT_MKV" | head -n1)"
+    echo "[rtmp-hevc-e2e] source_packets=${SOURCE_PACKETS:-?} output_packets=${V_PACKETS:-?}"
+    MIN_FRAMES=$((30 * SECONDS_TO_RECORD / 2))
+    MIN_SOURCE_FRAMES=$((SOURCE_PACKETS / 2))
+    if [ "$MIN_SOURCE_FRAMES" -gt "$MIN_FRAMES" ]; then
+        MIN_FRAMES="$MIN_SOURCE_FRAMES"
+    fi
+    if ! is_num "${V_PACKETS:-}" || [ "${V_PACKETS%.*}" -lt "$MIN_FRAMES" ]; then
+        echo "FAIL: too few/invalid decoded HEVC frames over RTMP (got '${V_PACKETS:-none}', need >= ${MIN_FRAMES})"
+        fail=1
+    fi
+
+    UNIQUE_FRAME_HASHES="$(ffmpeg -hide_banner -loglevel error -i "$OUT_MKV" -map 0:v:0 \
+        -vf "scale=64:64,format=gray" -frames:v 90 -f framemd5 - 2>/dev/null \
+        | awk -F, '/^[0-9]/{gsub(/ /, "", $NF); seen[$NF]=1}
+                   END{print length(seen)}')"
+    echo "[rtmp-hevc-e2e] unique_frame_hashes=${UNIQUE_FRAME_HASHES:-?}"
+    if ! is_num "${UNIQUE_FRAME_HASHES:-}" || [ "${UNIQUE_FRAME_HASHES%.*}" -lt 2 ]; then
+        echo "FAIL: decoded HEVC video appears static or empty (unique_frame_hashes=${UNIQUE_FRAME_HASHES:-none})"
+        fail=1
+    fi
 fi
 
 if [ "$fail" -ne 0 ]; then

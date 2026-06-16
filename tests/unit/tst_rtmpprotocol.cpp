@@ -117,7 +117,7 @@ private slots:
     void rejectsEnhancedCodedFramesWithoutCompositionTime();
     void parsesEnhancedNegativeCompositionTime();
     void parsesEnhancedUnknownFourCcSafely();
-    void rejectsUnsupportedEnhancedMetadataAndMultitrack();
+    void parsesEnhancedMetadataAndMultitrack();
     void parsesEnhancedCodedFramesXWithoutCompositionTime();
     void parsesEnhancedSequenceEndWithoutCompositionTime();
     void parsesLegacyAvcVideoPacket();
@@ -935,7 +935,7 @@ void TestRtmpProtocol::parsesEnhancedUnknownFourCcSafely() {
     QCOMPARE(packet.codecPayload, QByteArray("FRAME", 5));
 }
 
-void TestRtmpProtocol::rejectsUnsupportedEnhancedMetadataAndMultitrack() {
+void TestRtmpProtocol::parsesEnhancedMetadataAndMultitrack() {
     const QList<int> packetTypes = {
         int(RtmpEnhancedVideoPacketType::Metadata),
         int(RtmpEnhancedVideoPacketType::Multitrack),
@@ -949,9 +949,12 @@ void TestRtmpProtocol::rejectsUnsupportedEnhancedMetadataAndMultitrack() {
 
         RtmpVideoPacket packet;
         QString error;
-        QVERIFY(!RtmpFlv::parseVideoPacket(payload, &packet, &error));
-        QVERIFY(errorMentions(error, QStringLiteral("unsupported")));
-        QVERIFY(errorMentions(error, QStringLiteral("packet type")));
+        QVERIFY(RtmpFlv::parseVideoPacket(payload, &packet, &error));
+        QCOMPARE(packet.flavor, RtmpVideoPacketFlavor::Enhanced);
+        QCOMPARE(packet.codec, NativeVideoCodec::H264);
+        QCOMPARE(packet.enhancedType, static_cast<RtmpEnhancedVideoPacketType>(packetType));
+        QCOMPARE(packet.compositionTimeMs, 0);
+        QCOMPARE(packet.codecPayload, QByteArray("DATA", 4));
     }
 }
 
