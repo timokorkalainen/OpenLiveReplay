@@ -15,7 +15,7 @@ if(OLR_QMLLINT)
         -I "${_qt_prefix}/qml"
         "${CMAKE_SOURCE_DIR}/Main.qml"
         "${CMAKE_SOURCE_DIR}/MultiviewWindow.qml")
-    set_tests_properties(qml_smoke PROPERTIES LABELS "smoke" TIMEOUT 60)
+    set_tests_properties(qml_smoke PROPERTIES LABELS "smoke;ci" TIMEOUT 60)
     message(STATUS "OpenLiveReplay tests: qml_smoke using ${OLR_QMLLINT}")
 else()
     message(WARNING "qmllint not found under ${_qt_prefix}/bin; qml_smoke test disabled")
@@ -23,4 +23,4 @@ endif()
 
 add_test(NAME ios_ffmpeg_build_config
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_ffmpeg_build_config.sh")
-set_tests_properties(ios_ffmpeg_build_config PROPERTIES LABELS "smoke" TIMEOUT 10)
+set_tests_properties(ios_ffmpeg_build_config PROPERTIES LABELS "smoke;ci" TIMEOUT 10)

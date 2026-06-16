@@ -14,10 +14,16 @@ cmake -S . -B build -G Ninja \
   -DOLR_BUILD_TESTS=ON
 
 cmake --build build                 # build app + tests
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -L ci --output-on-failure
 ```
 
 Run a subset by label: `ctest --test-dir build -L unit` (or `smoke`, `e2e`).
+The `ci` label is the short PR gate and intentionally excludes the expensive
+record/playback E2E matrix. Run the full local gate with:
+
+```bash
+ctest --test-dir build --output-on-failure -LE 'sync-report|srt|native-apple-ingest'
+```
 
 ## What's covered
 
@@ -28,7 +34,8 @@ Run a subset by label: `ctest --test-dir build -L unit` (or `smoke`, `e2e`).
 | **E2E** (`-L e2e`) | `tests/e2e/` | A headless `record_harness` drives the real `ReplayManager` against a synthetic FFmpeg stream, then `ffprobe` asserts the output: stream layout, ~correct frame count, and **stereo** audio. Includes the **mono-audio regression** (a mono source must record without the SIGBUS crash from commit `3c7d9b4` and be rematrixed up to stereo). |
 
 The E2E tests need `ffmpeg`/`ffprobe` on `PATH` (they `SKIP` cleanly if absent)
-and bind UDP loopback ports 23456/23457 (they run serially).
+and bind UDP loopback ports (they run serially). They are full local/pre-push
+coverage, not PR CI coverage.
 
 ## Sanitizers
 
@@ -40,10 +47,10 @@ cmake --build build-asan
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan --output-on-failure
 ```
 
-`OLR_SANITIZER` instruments the app and tests. CI keeps this to spot checks
-instead of rerunning the full suite in every sanitizer leg: ASan+UBSan covers
-mux/parser/audio primitives plus the mono recording regression, while TSan runs
-the playback storm gate that records a fixture and drives the worker pipeline.
+`OLR_SANITIZER` instruments the app and tests. CI keeps this to fast unit spot
+checks instead of rerunning the full suite in every sanitizer leg:
+ASan+UBSan covers mux/parser/audio primitives, while TSan covers playback buffer
+primitives. The record/playback E2E drivers stay in the local pre-push gate.
 
 ## Linting & formatting
 
@@ -62,8 +69,8 @@ the playback storm gate that records a fixture and drives the worker pipeline.
 - **changes** — classifies the diff first. Docs/workflow-only PRs do not run
   app builds, tests, or sanitizers.
 - **workflow-lint** — `actionlint` for workflow changes.
-- **build-test-macos** — app/test changes only; builds app + tests and runs
-  CTest (primary gate).
+- **build-test-macos** — app/test changes only; builds app + tests and runs the
+  short `ci` CTest label (primary PR gate).
 - **lint** — source/QML changes only; runs changed-line `clang-format` and/or
   `qmllint` only when those file types changed.
 - **sanitizers** — native-code/CMake changes only; focused ASan+UBSan spot
@@ -72,12 +79,13 @@ the playback storm gate that records a fixture and drives the worker pipeline.
 macOS jobs cache Qt via `install-qt-action`, Homebrew downloads via
 `actions/cache`, and C/C++ compiler outputs via `ccache`.
 
-## iOS build (local pre-push hook, not CI)
+## Full local gate + iOS build (pre-push hook, not CI)
 
 iOS is **not** built in GitHub CI: the FFmpeg+SRT from-source build
-(~20 min) OOM-kills hosted runners. It is validated locally by
-[`.githooks/pre-push`](../.githooks/pre-push), which cross-builds the iOS target
-on `git push`. Enable it once per clone:
+(~20 min) OOM-kills hosted runners. The expensive E2E matrix is also kept out
+of PR CI. Both are validated locally by [`.githooks/pre-push`](../.githooks/pre-push),
+which runs the full non-local-only CTest suite and then cross-builds the iOS
+target on `git push`. Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
@@ -85,9 +93,10 @@ git config core.hooksPath .githooks
 
 The FFmpeg xcframeworks are cached in `ios_build/xcframeworks`, so only the
 first push is slow. Override the Qt location with `QT_IOS_PREFIX` /
-`QT_HOST_PREFIX`. Skip a single push with `SKIP_IOS_BUILD=1 git push` (or
-`git push --no-verify`); if no Qt iOS kit is found the hook skips and allows the
-push.
+`QT_HOST_PREFIX`. Skip one part with `SKIP_FULL_TESTS=1 git push` or
+`SKIP_IOS_BUILD=1 git push`; skip the whole hook once with `git push --no-verify`.
+If no Qt iOS kit is found the iOS part skips and allows the push after the full
+CTest gate has passed.
 
 The iOS FFmpeg slice uses SecureTransport for TLS/RTMPS and builds libsrt
 without OpenSSL/mbedTLS encryption support. Encrypted native SRT is intentionally

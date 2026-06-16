@@ -1,36 +1,59 @@
 #!/usr/bin/env bash
-# Pre-push hook: build the iOS target locally before allowing a push.
+# Pre-push hook: run the full local CTest gate, then build the iOS target before
+# allowing a push.
 #
-# iOS is deliberately NOT built in GitHub CI — the FFmpeg+SRT+OpenSSL
-# from-source build (~20 min) OOM-kills hosted runners. We validate it here
-# instead. The FFmpeg xcframeworks are cached in ios_build/xcframeworks, so only
-# the first build is slow; later pushes just rebuild the app.
+# GitHub PR CI deliberately runs only the short "ci" CTest label. The expensive
+# e2e matrix is validated here instead. iOS is also NOT built in GitHub CI: the
+# FFmpeg+SRT+OpenSSL from-source build (~20 min) OOM-kills hosted runners. The
+# FFmpeg xcframeworks are cached in ios_build/xcframeworks, so only the first
+# iOS build is slow; later pushes just rebuild the app.
 #
 # Enable once per clone:   git config core.hooksPath .githooks
-# Skip for a single push:  SKIP_IOS_BUILD=1 git push      (or: git push --no-verify)
+# Skip parts once:        SKIP_FULL_TESTS=1 git push
+#                         SKIP_IOS_BUILD=1 git push
+# Skip the hook once:     git push --no-verify
 set -euo pipefail
-
-if [ "${SKIP_IOS_BUILD:-0}" = "1" ]; then
-    echo "[pre-push] SKIP_IOS_BUILD=1 — skipping iOS build."
-    exit 0
-fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-# Locate the Qt iOS + host (desktop) kits. Override via env if your Qt lives
-# elsewhere, e.g. QT_IOS_PREFIX=~/Qt/6.9.0/ios.
+QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/6.10.1/macos}}"
+
+if [ "${SKIP_FULL_TESTS:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_FULL_TESTS=1 - skipping full local CTest gate."
+else
+    TEST_BUILD_DIR="${OLR_PREPUSH_TEST_BUILD_DIR:-build/prepush-tests}"
+    CTEST_JOBS="${CTEST_PARALLEL_LEVEL:-$(sysctl -n hw.ncpu 2>/dev/null || echo 2)}"
+
+    echo "[pre-push] Running full local CTest gate in ${TEST_BUILD_DIR}..."
+    cmake -S . -B "$TEST_BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
+        -DOLR_BUILD_TESTS=ON >/dev/null
+    cmake --build "$TEST_BUILD_DIR"
+    ctest --test-dir "$TEST_BUILD_DIR" --output-on-failure \
+        --repeat until-pass:2 --parallel "$CTEST_JOBS" \
+        -LE 'sync-report|srt|native-apple-ingest'
+    echo "[pre-push] Full local CTest gate OK."
+fi
+
+if [ "${SKIP_IOS_BUILD:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_IOS_BUILD=1 - skipping iOS build."
+    exit 0
+fi
+
+# Locate the Qt iOS kit. Override via env if your Qt lives elsewhere, e.g.
+# QT_IOS_PREFIX=~/Qt/6.9.0/ios.
 QT_IOS_PREFIX="${QT_IOS_PREFIX:-$HOME/Qt/6.10.1/ios}"
-QT_HOST_PREFIX="${QT_HOST_PREFIX:-$HOME/Qt/6.10.1/macos}"
 QT_CMAKE="$QT_IOS_PREFIX/bin/qt-cmake"
 
 if [ ! -x "$QT_CMAKE" ]; then
-    echo "[pre-push] Qt iOS kit not found at $QT_IOS_PREFIX — skipping iOS build."
+    echo "[pre-push] Qt iOS kit not found at $QT_IOS_PREFIX - skipping iOS build."
     echo "[pre-push] (set QT_IOS_PREFIX/QT_HOST_PREFIX to enable; push allowed.)"
     exit 0
 fi
 
-echo "[pre-push] Building iOS (FFmpeg deps cached in ios_build/xcframeworks; first run ~20 min)…"
+echo "[pre-push] Building iOS (FFmpeg deps cached in ios_build/xcframeworks; first run ~20 min)..."
 BUILD_DIR="build/ios-prepush"
 
 "$QT_CMAKE" -S . -B "$BUILD_DIR" -G Xcode \
@@ -39,8 +62,8 @@ BUILD_DIR="build/ios-prepush"
 
 if cmake --build "$BUILD_DIR" --config Debug -- \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO; then
-    echo "[pre-push] iOS build OK — push proceeding."
+    echo "[pre-push] iOS build OK - push proceeding."
 else
-    echo "[pre-push] iOS build FAILED — push aborted (SKIP_IOS_BUILD=1 to override)." >&2
+    echo "[pre-push] iOS build FAILED - push aborted (SKIP_IOS_BUILD=1 to override)." >&2
     exit 1
 fi

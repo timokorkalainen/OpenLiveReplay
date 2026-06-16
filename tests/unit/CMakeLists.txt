@@ -6,7 +6,7 @@ function(olr_add_unit_test name)
     add_test(NAME ${name} COMMAND ${name})
     # Headless + deterministic; fail fast rather than hang CI.
     set_tests_properties(${name} PROPERTIES
-        LABELS "unit"
+        LABELS "unit;ci"
         TIMEOUT 60
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 endfunction()
