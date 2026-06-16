@@ -13,7 +13,7 @@ struct FrameRate {
     int den = 1;
 
     bool isValid() const { return num > 0 && den > 0; }
-    double toDouble() const { return den != 0 ? double(num) / double(den) : 0.0; }
+    double toDouble() const { return den > 0 ? double(num) / double(den) : 0.0; }
     int roundedFps() const { return den > 0 ? (num + den / 2) / den : 0; }
     // File-timeline milliseconds of frame index f:  f * 1000 * den / num.
     int64_t msForFrame(int64_t f) const { return num > 0 ? (f * 1000 * int64_t(den)) / num : 0; }

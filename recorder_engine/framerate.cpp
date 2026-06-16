@@ -31,6 +31,7 @@ FrameRate parseFrameRate(const QString& s) {
     bool ok = false;
     const double v = t.toDouble(&ok);
     if (!ok || v <= 0) return FrameRate{30, 1};
+    if (std::fabs(v - std::round(v)) < 1e-9) return FrameRate{int(std::lround(v)), 1};
     for (const FrameRatePreset& p : frameRatePresets()) {
         if (std::fabs(p.rate.toDouble() - v) < 0.05) return p.rate; // snap typed decimals
     }

@@ -43,6 +43,10 @@ void TestFrameRate::parse() {
     QVERIFY(parseFrameRate("29.97") == (FrameRate{30000, 1001}));
     QVERIFY(parseFrameRate("30000/1001") == (FrameRate{30000, 1001}));
     QVERIFY(parseFrameRate("garbage") == (FrameRate{30, 1}));
+    QVERIFY(parseFrameRate("60") == (FrameRate{60, 1}));
+    QVERIFY(parseFrameRate("59.94") == (FrameRate{60000, 1001}));
+    QVERIFY(parseFrameRate("30.0") == (FrameRate{30, 1})); // integer-exact, not 29.97
+    QVERIFY(parseFrameRate("30/0") == (FrameRate{30, 1})); // malformed -> default
 }
 
 void TestFrameRate::label() {
