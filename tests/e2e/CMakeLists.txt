@@ -254,3 +254,16 @@ elseif(WIN32)
         RUN_SERIAL TRUE
         ENVIRONMENT "OLR_NATIVE_SRT=1")
 endif()
+
+# --- Local-only native RTMP e2e (NOT in CI) --------------------------------
+# This test uses a deterministic Python RTMP fixture server and requires the
+# native backend marker in the harness log, so a successful FFmpeg fallback is
+# still a failure. Run locally with: ctest -L native-rtmp
+if(APPLE)
+    add_test(NAME e2e_native_rtmp_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+    set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE)
+endif()
