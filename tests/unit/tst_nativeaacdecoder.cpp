@@ -84,8 +84,7 @@ void TestNativeAacDecoder::detectsLatmLoasSync()
 }
 
 #ifdef _WIN32
-void TestNativeAacDecoder::decodesAdtsToneWithNativeBackend()
-{
+void TestNativeAacDecoder::decodesAdtsToneWithNativeBackend() {
     // 0.15 s, 48 kHz stereo AAC-LC ADTS fixture generated from a 1 kHz sine.
     const QByteArray stream = QByteArray::fromBase64(
         "//FMgCTf/N4CAExhdmM2Mi4yOC4xMDEAQlUf////4AJa2UtH6Ig6E4+333VX45+upaSquTcXJuIRH"

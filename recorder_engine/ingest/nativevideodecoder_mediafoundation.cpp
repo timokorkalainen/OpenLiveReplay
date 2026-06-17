@@ -129,13 +129,8 @@ bool mftAvailable(REFGUID subtype) {
 
     IMFActivate** activates = nullptr;
     UINT32 count = 0;
-    const HRESULT hr = MFTEnumEx(
-        MFT_CATEGORY_VIDEO_DECODER,
-        decoderEnumFlags(),
-        &input,
-        nullptr,
-        &activates,
-        &count);
+    const HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, decoderEnumFlags(), &input, nullptr,
+                                 &activates, &count);
     if (SUCCEEDED(hr) && activates) {
         for (UINT32 i = 0; i < count; ++i) {
             if (activates[i]) {
@@ -436,13 +431,8 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
 
         activates = nullptr;
         count = 0;
-        hr = MFTEnumEx(
-            MFT_CATEGORY_VIDEO_DECODER,
-            decoderEnumFlags(),
-            &input,
-            nullptr,
-            &activates,
-            &count);
+        hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, decoderEnumFlags(), &input, nullptr, &activates,
+                       &count);
         if (SUCCEEDED(hr) && count > 0 && activates) {
             selectedInputSubtype = inputSubtypes[i];
             hasSelectedInputSubtype = true;
@@ -508,12 +498,11 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
     }
 
     if (deviceManager) {
-        hr = transform->ProcessMessage(
-            MFT_MESSAGE_SET_D3D_MANAGER,
-            ULONG_PTR(deviceManager.Get()));
+        hr = transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, ULONG_PTR(deviceManager.Get()));
         if (FAILED(hr)) {
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation decoder D3D manager setup failed"), hr);
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation decoder D3D manager setup failed"), hr);
             }
             return false;
         }
@@ -629,10 +618,9 @@ bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, Q
     }
 
     reset();
-    if (!ensureRuntime(error)
-        || (environmentFlagEnabled("OLR_MF_VIDEO_ENABLE_D3D") && !createD3D(error))
-        || !createTransform(unit.codec, error)
-        || !configureTypes(unit.codec, error)) {
+    if (!ensureRuntime(error) ||
+        (environmentFlagEnabled("OLR_MF_VIDEO_ENABLE_D3D") && !createD3D(error)) ||
+        !createTransform(unit.codec, error) || !configureTypes(unit.codec, error)) {
         reset();
         return false;
     }
