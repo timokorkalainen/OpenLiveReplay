@@ -61,6 +61,10 @@ void OutputDispatcher::resetPlayEpoch() {
     m_havePlayEpoch = false;
 }
 
+void OutputDispatcher::setRuntimeStats(const OutputRuntimeDispatchStats& stats) {
+    m_stats.runtime = stats;
+}
+
 OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache,
                                                    const PlaybackStateSnapshot& state) {
     const qint64 outputFrameIndex = m_nextOutputFrameIndex++;

@@ -33,12 +33,26 @@ struct OutputTargetDispatchStats {
     OutputFrameIdentity lastIdentity;
 };
 
+struct OutputRuntimeDispatchStats {
+    bool hasLastDispatchTiming = false;
+    qint64 lastScheduledFrameIndex = -1;
+    qint64 lastDispatchedFrameIndex = -1;
+    qint64 lastScheduledNs = 0;
+    qint64 lastDispatchWallNs = 0;
+    qint64 lastLatenessNs = 0;
+    qint64 maxLatenessNs = 0;
+    qint64 deadlineMisses = 0;
+    qint64 catchUpCapHits = 0;
+    qint64 cappedCatchUpTicks = 0;
+};
+
 struct OutputDispatchStats {
     qint64 ticks = 0;
     qint64 framesSubmitted = 0;
     qint64 sinkFailures = 0;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
+    OutputRuntimeDispatchStats runtime;
     QHash<QString, OutputTargetDispatchStats> targets;
 };
 
@@ -53,6 +67,7 @@ public:
     void resetFrameIndex(qint64 nextOutputFrameIndex = 0);
     void resetPlayEpoch();
     qint64 nextOutputFrameIndex() const { return m_nextOutputFrameIndex; }
+    void setRuntimeStats(const OutputRuntimeDispatchStats& stats);
 
     OutputDispatchStats dispatchTick(const OutputFrameCache& cache,
                                      const PlaybackStateSnapshot& state);

@@ -103,12 +103,15 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
 
     int dispatched = 0;
     while (dispatched < m_maxCatchUpTicks) {
+        qint64 frameIndex = 0;
+        qint64 scheduledNs = 0;
         {
             QMutexLocker locker(&m_mutex);
             if (m_stopRequested) break;
             const FrameRate rate = m_dispatcher.frameRate();
-            if (!rate.isValid() ||
-                frameIndexToNsCeil(rate, m_dispatcher.nextOutputFrameIndex()) > elapsedNs) {
+            frameIndex = m_dispatcher.nextOutputFrameIndex();
+            scheduledNs = frameIndexToNsCeil(rate, frameIndex);
+            if (!rate.isValid() || scheduledNs > elapsedNs) {
                 return m_dispatcher.stats();
             }
         }
@@ -118,12 +121,35 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             QMutexLocker locker(&m_mutex);
             if (m_stopRequested) break;
             m_dispatcher.dispatchTick(current.cache, current.state);
+            recordDispatchTiming(frameIndex, scheduledNs, elapsedNs);
         }
         dispatched++;
     }
 
     QMutexLocker locker(&m_mutex);
+    if (dispatched == m_maxCatchUpTicks) {
+        OutputRuntimeDispatchStats runtime = m_dispatcher.stats().runtime;
+        runtime.catchUpCapHits++;
+        runtime.cappedCatchUpTicks++;
+        m_dispatcher.setRuntimeStats(runtime);
+    }
     return m_dispatcher.stats();
+}
+
+void OutputRuntime::recordDispatchTiming(qint64 outputFrameIndex, qint64 scheduledNs,
+                                         qint64 wallNowNs) {
+    OutputDispatchStats stats = m_dispatcher.stats();
+    OutputRuntimeDispatchStats runtime = stats.runtime;
+    const qint64 latenessNs = wallNowNs - scheduledNs;
+    runtime.hasLastDispatchTiming = true;
+    runtime.lastScheduledFrameIndex = outputFrameIndex;
+    runtime.lastDispatchedFrameIndex = outputFrameIndex;
+    runtime.lastScheduledNs = scheduledNs;
+    runtime.lastDispatchWallNs = wallNowNs;
+    runtime.lastLatenessNs = latenessNs;
+    runtime.maxLatenessNs = qMax(runtime.maxLatenessNs, latenessNs);
+    if (latenessNs > 0) runtime.deadlineMisses++;
+    m_dispatcher.setRuntimeStats(runtime);
 }
 
 qint64 OutputRuntime::frameIndexToNsCeil(FrameRate rate, qint64 frameIndex) {

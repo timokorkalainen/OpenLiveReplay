@@ -61,6 +61,8 @@ private slots:
     void manualTicksRepeatPausedFrameFromCache();
     void nanosecondTicksHonorFractionalFrameBoundary();
     void workerThreadTicksWithoutExternalDispatchCalls();
+    void runtimeStatsReportNoDeadlineMissForOnTimeTicks();
+    void runtimeStatsReportDeadlineMissWhenCatchUpIsCapped();
 };
 
 void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
@@ -171,6 +173,78 @@ void TestOutputRuntime::workerThreadTicksWithoutExternalDispatchCalls() {
     QCOMPARE(frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(frames[2].outputFrameIndex, qint64(2));
     QCOMPARE(uchar(frames[2].video.planeY.at(0)), uchar(55));
+}
+
+void TestOutputRuntime::runtimeStatsReportNoDeadlineMissForOnTimeTicks() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 80));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    runtime.dispatchDueTicksForTest(40);
+    const OutputDispatchStats stats = runtime.dispatchDueTicksForTest(80);
+
+    QCOMPARE(stats.ticks, qint64(3));
+    QCOMPARE(stats.runtime.deadlineMisses, qint64(0));
+    QCOMPARE(stats.runtime.catchUpCapHits, qint64(0));
+    QCOMPARE(stats.runtime.lastDispatchedFrameIndex, qint64(2));
+    QVERIFY(stats.runtime.hasLastDispatchTiming);
+    QVERIFY(stats.runtime.lastLatenessNs <= 0);
+}
+
+void TestOutputRuntime::runtimeStatsReportDeadlineMissWhenCatchUpIsCapped() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 90));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    const OutputDispatchStats stats = runtime.dispatchDueTicksForTest(600);
+
+    QCOMPARE(stats.ticks, qint64(9));
+    QVERIFY(stats.runtime.deadlineMisses > 0);
+    QVERIFY(stats.runtime.catchUpCapHits > 0);
+    QVERIFY(stats.runtime.maxLatenessNs > 0);
+    QCOMPARE(stats.runtime.lastDispatchedFrameIndex, qint64(8));
 }
 
 QTEST_GUILESS_MAIN(TestOutputRuntime)
