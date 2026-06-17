@@ -210,6 +210,7 @@ bool NdiOutputSink::start(const OutputTargetAssignment& assignment, FrameRate ra
         m_status.sendFailures = 0;
         m_status.lastSendDurationNs = 0;
         m_status.hasLastFrameIdentity = false;
+        m_status.lastFrameDelivered = false;
         m_status.lastFrameIdentity = OutputFrameIdentity();
     }
 
@@ -259,15 +260,18 @@ bool NdiOutputSink::submit(const OutputBusFrame& frame) {
         QMutexLocker locker(&m_statusMutex);
         m_status.lastFrameIdentity = outputFrameIdentityFor(frame);
         m_status.hasLastFrameIdentity = true;
+        m_status.lastFrameDelivered = false;
     }
     if (!hasSendableBroadcastAudio(frame.audio)) {
         {
             QMutexLocker locker(&m_statusMutex);
             m_status.sendFailures++;
             m_status.lastSendDurationNs = sendTimer.nsecsElapsed();
+            m_status.lastFrameDelivered = false;
+            m_status.state = NdiOutputState::SendFailed;
+            m_status.message =
+                QStringLiteral("failed to send NDI frame: missing broadcast audio");
         }
-        setStatus(NdiOutputState::SendFailed,
-                  QStringLiteral("failed to send NDI frame: missing broadcast audio"));
         return false;
     }
     if (!m_backend->sendFrame(frame)) {
@@ -275,17 +279,21 @@ bool NdiOutputSink::submit(const OutputBusFrame& frame) {
             QMutexLocker locker(&m_statusMutex);
             m_status.sendFailures++;
             m_status.lastSendDurationNs = sendTimer.nsecsElapsed();
+            m_status.lastFrameDelivered = false;
+            m_status.state = NdiOutputState::SendFailed;
+            m_status.message = QStringLiteral("failed to send NDI frame");
         }
-        setStatus(NdiOutputState::SendFailed, QStringLiteral("failed to send NDI frame"));
         return false;
     }
     {
         QMutexLocker locker(&m_statusMutex);
         m_status.framesSubmitted++;
         m_status.lastSendDurationNs = sendTimer.nsecsElapsed();
+        m_status.lastFrameDelivered = true;
+        m_status.state = NdiOutputState::Active;
+        m_status.message =
+            QStringLiteral("NDI sender '%1' active").arg(senderNameFor(m_assignment));
     }
-    setStatus(NdiOutputState::Active,
-              QStringLiteral("NDI sender '%1' active").arg(senderNameFor(m_assignment)));
     return true;
 }
 
@@ -305,7 +313,8 @@ OutputSinkStatus NdiOutputSink::outputStatus() const {
     if (ndi.hasLastFrameIdentity) {
         out.hasLastQueuedFrameIndex = true;
         out.lastQueuedFrameIndex = ndi.lastFrameIdentity.outputFrameIndex;
-        out.hasLastDeliveredFrameIndex = ndi.state == NdiOutputState::Active;
+        out.hasLastDeliveredFrameIndex =
+            ndi.lastFrameDelivered && ndi.state == NdiOutputState::Active;
         if (out.hasLastDeliveredFrameIndex) {
             out.lastDeliveredFrameIndex = ndi.lastFrameIdentity.outputFrameIndex;
         }

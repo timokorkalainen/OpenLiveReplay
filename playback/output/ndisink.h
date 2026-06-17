@@ -32,6 +32,7 @@ struct NdiOutputStatus {
     qint64 sendFailures = 0;
     qint64 lastSendDurationNs = 0;
     bool hasLastFrameIdentity = false;
+    bool lastFrameDelivered = false;
     OutputFrameIdentity lastFrameIdentity;
 };
 

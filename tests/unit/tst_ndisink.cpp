@@ -3,7 +3,40 @@
 #include "playback/output/ndisink.h"
 #include "playback/output/ndiruntimepaths.h"
 
+#include <QMutex>
 #include <QThread>
+#include <QWaitCondition>
+
+namespace {
+
+OutputTargetAssignment ndiAssignment() {
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-ndi");
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+    assignment.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR Feed 1"));
+    return assignment;
+}
+
+OutputBusFrame validFrame(qint64 outputFrameIndex, qint64 playheadMs, uchar y) {
+    OutputBusFrame frame;
+    frame.bus = OutputBusId::feed(0);
+    frame.outputFrameIndex = outputFrameIndex;
+    frame.sampledPlayheadMs = playheadMs;
+    frame.video = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
+    frame.video.feedIndex = 0;
+    frame.video.ptsMs = playheadMs;
+    frame.video.outputFrameIndex = outputFrameIndex;
+    frame.audio.feedIndex = 0;
+    frame.audio.sampleRate = 48000;
+    frame.audio.channels = 2;
+    frame.audio.format = MediaSampleFormat::S16Interleaved;
+    frame.audio.pcm = QByteArray(8 * int(sizeof(qint16)), '\0');
+    return frame;
+}
+
+} // namespace
 
 static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
     MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
@@ -30,9 +63,29 @@ public:
 
     bool sendFrame(const OutputBusFrame& frame) override {
         if (sendDelayMs > 0) QThread::msleep(uint(sendDelayMs));
+        if (blockSend) {
+            QMutexLocker locker(&sendMutex);
+            sendEntered = true;
+            sendEnteredCondition.wakeAll();
+            while (!releaseSend) {
+                releaseSendCondition.wait(&sendMutex);
+            }
+        }
         if (!active || !sendSucceeds) return false;
         sentFrames.append(frame);
         return true;
+    }
+
+    bool waitForSendEntered(int timeoutMs) {
+        QMutexLocker locker(&sendMutex);
+        if (sendEntered) return true;
+        return sendEnteredCondition.wait(&sendMutex, timeoutMs);
+    }
+
+    void releaseBlockedSend() {
+        QMutexLocker locker(&sendMutex);
+        releaseSend = true;
+        releaseSendCondition.wakeAll();
     }
 
     bool runtimeAvailable = false;
@@ -40,9 +93,17 @@ public:
     bool sendSucceeds = true;
     bool active = false;
     int sendDelayMs = 0;
+    bool blockSend = false;
     QString createdName;
     FrameRate createdRate;
     QVector<OutputBusFrame> sentFrames;
+
+private:
+    QMutex sendMutex;
+    QWaitCondition sendEnteredCondition;
+    QWaitCondition releaseSendCondition;
+    bool sendEntered = false;
+    bool releaseSend = false;
 };
 
 class TestNdiSink : public QObject {
@@ -56,6 +117,8 @@ private slots:
     void reportsCreateFailureAndStoppedStatus();
     void reportsSendFailureStatus();
     void reportsSendDurationInOutputStatus();
+    void failedSendReportsAttemptedButNotDeliveredFrame();
+    void inFlightSendReportsAttemptedButNotDeliveredFrame();
 };
 
 void TestNdiSink::runtimeCandidatesIncludeNdiToolsInstallLocations() {
@@ -254,8 +317,55 @@ void TestNdiSink::reportsSendDurationInOutputStatus() {
     QVERIFY(sink.submit(frame));
     const OutputSinkStatus status = sink.outputStatus();
     QVERIFY(status.lastSubmitDurationNs > 0);
+    QVERIFY(status.hasLastQueuedFrameIndex);
+    QCOMPARE(status.lastQueuedFrameIndex, qint64(42));
     QVERIFY(status.hasLastDeliveredFrameIndex);
     QCOMPARE(status.lastDeliveredFrameIndex, qint64(42));
+}
+
+void TestNdiSink::failedSendReportsAttemptedButNotDeliveredFrame() {
+    FakeNdiBackend backend(true);
+    NdiOutputSink sink(&backend);
+
+    QVERIFY(sink.start(ndiAssignment(), FrameRate::fromFraction(25, 1)));
+    backend.sendSucceeds = false;
+
+    QVERIFY(!sink.submit(validFrame(43, 1720, 104)));
+
+    const OutputSinkStatus status = sink.outputStatus();
+    QVERIFY(status.hasLastQueuedFrameIndex);
+    QCOMPARE(status.lastQueuedFrameIndex, qint64(43));
+    QVERIFY(!status.hasLastDeliveredFrameIndex);
+    QCOMPARE(status.lastDeliveredFrameIndex, qint64(-1));
+}
+
+void TestNdiSink::inFlightSendReportsAttemptedButNotDeliveredFrame() {
+    FakeNdiBackend backend(true);
+    backend.blockSend = true;
+    NdiOutputSink sink(&backend);
+
+    QVERIFY(sink.start(ndiAssignment(), FrameRate::fromFraction(25, 1)));
+
+    bool submitResult = false;
+    QThread* submitThread = QThread::create([&]() {
+        submitResult = sink.submit(validFrame(44, 1760, 112));
+    });
+    submitThread->start();
+
+    const bool sendEntered = backend.waitForSendEntered(1000);
+    const OutputSinkStatus status = sink.outputStatus();
+
+    backend.releaseBlockedSend();
+    const bool submitFinished = submitThread->wait(1000);
+    delete submitThread;
+
+    QVERIFY(sendEntered);
+    QVERIFY(status.hasLastQueuedFrameIndex);
+    QCOMPARE(status.lastQueuedFrameIndex, qint64(44));
+    QVERIFY(!status.hasLastDeliveredFrameIndex);
+    QCOMPARE(status.lastDeliveredFrameIndex, qint64(-1));
+    QVERIFY(submitFinished);
+    QVERIFY(submitResult);
 }
 
 QTEST_GUILESS_MAIN(TestNdiSink)
