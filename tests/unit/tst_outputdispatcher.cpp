@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include "playback/output/broadcastoutputstatus.h"
 #include "playback/output/outputdispatcher.h"
 
 static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
@@ -53,6 +54,8 @@ private slots:
     void rendersFeedMultiviewAndPgmAssignmentsFromSameTick();
     void targetsOnSameBusReceiveMatchingFrameIdentity();
     void targetStatsTrackRepeatedPayloadsAndFailuresIndependently();
+    void statsMergeSinkOutputStatusWithDispatchAttempts();
+    void dispatchStatsConvertToBroadcastStatuses();
     void startFailuresAreVisibleInTargetStats();
     void pgmSwitchUpdatesIdentityOnNextTick();
     void disabledAssignmentsDoNotSubmit();
@@ -314,6 +317,120 @@ void TestOutputDispatcher::targetStatsTrackRepeatedPayloadsAndFailuresIndependen
     QCOMPARE(failingStats.silentAudioFrames, qint64(2));
     QVERIFY(failingStats.hasLastIdentity);
     QCOMPARE(failingStats.lastIdentity.outputFrameIndex, qint64(1));
+}
+
+void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {
+    class StatusReportingSink final : public IOutputSink {
+    public:
+        OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+        bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+            m_active = assignment.enabled && rate.isValid();
+            return m_active;
+        }
+        void stop() override { m_active = false; }
+        bool isActive() const override { return m_active; }
+        bool submit(const OutputBusFrame&) override { return m_active; }
+        OutputSinkStatus outputStatus() const override {
+            OutputSinkStatus status;
+            status.acceptedFrames = 0;
+            status.failedFrames = 1;
+            status.droppedFrames = 2;
+            status.hasLastResult = true;
+            status.lastResultSucceeded = false;
+            status.state = QStringLiteral("send-failed");
+            status.message = QStringLiteral("backend rejected frame");
+            return status;
+        }
+
+    private:
+        bool m_active = false;
+    };
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 44));
+
+    OutputTargetAssignment ndi;
+    ndi.id = QStringLiteral("feed0-ndi");
+    ndi.sourceBus = OutputBusId::feed(0);
+    ndi.kind = OutputTargetKind::Ndi;
+    ndi.enabled = true;
+
+    StatusReportingSink sink;
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{ndi, &sink}});
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    dispatcher.dispatchTick(cache, state);
+
+    const OutputTargetDispatchStats target =
+        dispatcher.stats().targets.value(QStringLiteral("feed0-ndi"));
+    QCOMPARE(target.attemptedFrames, qint64(1));
+    QCOMPARE(target.framesSubmitted, qint64(1));
+    QVERIFY(target.hasLastSubmitResult);
+    QVERIFY(target.lastSubmitSucceeded);
+    QVERIFY(target.hasSinkStatus);
+    QCOMPARE(target.sinkSubmittedFrames, qint64(0));
+    QCOMPARE(target.sinkFailedFrames, qint64(1));
+    QCOMPARE(target.sinkDroppedFrames, qint64(2));
+    QVERIFY(target.hasLastSinkResult);
+    QVERIFY(!target.lastSinkResultSucceeded);
+    QCOMPARE(target.sinkState, QStringLiteral("send-failed"));
+    QCOMPARE(target.sinkMessage, QStringLiteral("backend rejected frame"));
+}
+
+void TestOutputDispatcher::dispatchStatsConvertToBroadcastStatuses() {
+    OutputDispatchStats stats;
+    OutputTargetDispatchStats target;
+    target.attemptedFrames = 7;
+    target.framesSubmitted = 6;
+    target.sinkFailures = 1;
+    target.sinkSubmittedFrames = 5;
+    target.sinkFailedFrames = 2;
+    target.sinkDroppedFrames = 3;
+    target.placeholderFrames = 2;
+    target.silentAudioFrames = 3;
+    target.repeatedPayloadFrames = 4;
+    target.hasSinkStatus = true;
+    target.hasLastSubmitResult = true;
+    target.lastSubmitSucceeded = true;
+    target.hasLastSinkResult = true;
+    target.lastSinkResultSucceeded = false;
+    target.sinkState = QStringLiteral("send-failed");
+    target.sinkMessage = QStringLiteral("backend rejected frame");
+    target.hasLastIdentity = true;
+    target.lastIdentity.outputFrameIndex = 17;
+    target.lastIdentity.sampledPlayheadMs = 2040;
+    target.lastIdentity.sourceFeedIndex = 1;
+    target.lastIdentity.sourcePtsMs = 2000;
+    stats.targets.insert(QStringLiteral("feed1-ndi"), target);
+
+    const QHash<QString, BroadcastOutputTargetStatus> statuses =
+        BroadcastOutputStatus::fromDispatchStats(stats);
+
+    QVERIFY(statuses.contains(QStringLiteral("feed1-ndi")));
+    const BroadcastOutputTargetStatus status = statuses.value(QStringLiteral("feed1-ndi"));
+    QCOMPARE(status.attemptedFrames, qint64(7));
+    QCOMPARE(status.framesSubmitted, qint64(6));
+    QCOMPARE(status.sinkFailures, qint64(1));
+    QCOMPARE(status.sinkSubmittedFrames, qint64(5));
+    QCOMPARE(status.sinkFailedFrames, qint64(2));
+    QCOMPARE(status.sinkDroppedFrames, qint64(3));
+    QCOMPARE(status.placeholderFrames, qint64(2));
+    QCOMPARE(status.silentAudioFrames, qint64(3));
+    QCOMPARE(status.repeatedPayloadFrames, qint64(4));
+    QVERIFY(status.hasSinkStatus);
+    QVERIFY(status.hasLastSubmitResult);
+    QVERIFY(status.lastSubmitSucceeded);
+    QVERIFY(status.hasLastSinkResult);
+    QVERIFY(!status.lastSinkResultSucceeded);
+    QCOMPARE(status.sinkState, QStringLiteral("send-failed"));
+    QCOMPARE(status.sinkMessage, QStringLiteral("backend rejected frame"));
+    QVERIFY(status.hasLastIdentity);
+    QCOMPARE(status.lastIdentity.outputFrameIndex, qint64(17));
+    QCOMPARE(status.lastIdentity.sampledPlayheadMs, qint64(2040));
 }
 
 void TestOutputDispatcher::startFailuresAreVisibleInTargetStats() {

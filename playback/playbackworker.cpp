@@ -48,7 +48,10 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // transport's own (independent) mutex, so there is no lock-order concern.
     m_lastMoveDir.store((clamped >= m_transport->currentPos()) ? 1 : -1, std::memory_order_relaxed);
     m_seekTargetMs = clamped;
-    if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
+    }
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
@@ -82,6 +85,11 @@ void PlaybackWorker::setExternalOutputTargets(const QList<OutputTargetAssignment
     QMutexLocker locker(&m_mutex);
     m_externalOutputAssignments = assignments;
     m_outputTargetsDirty.store(true, std::memory_order_relaxed);
+}
+
+OutputDispatchStats PlaybackWorker::outputStats() const {
+    QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+    return m_outputRuntime ? m_outputRuntime->stats() : OutputDispatchStats{};
 }
 
 void PlaybackWorker::stop() {
@@ -248,18 +256,29 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_outputHeight = qMax(2, height);
     m_outputCache =
         std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth, m_outputHeight);
-    m_outputRuntime = std::make_unique<OutputRuntime>(
-        FrameRate::fromFraction(fps(), 1), m_outputFeedCount, m_outputWidth, m_outputHeight);
-    m_outputRuntime->setSnapshotProvider([this]() { return makeOutputSnapshot(); });
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        m_outputRuntime = std::make_unique<OutputRuntime>(
+            FrameRate::fromFraction(fps(), 1), m_outputFeedCount, m_outputWidth, m_outputHeight);
+        m_outputRuntime->setSnapshotProvider([this]() { return makeOutputSnapshot(); });
+    }
     m_outputTargetsDirty.store(true, std::memory_order_relaxed);
     rebuildOutputEndpoints();
-    m_outputRuntime->startRuntime();
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (m_outputRuntime) m_outputRuntime->startRuntime();
+    }
 }
 
 void PlaybackWorker::shutdownOutputGraph() {
-    if (m_outputRuntime) {
-        m_outputRuntime->stopRuntime();
-        m_outputRuntime.reset();
+    std::unique_ptr<OutputRuntime> runtime;
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        runtime = std::move(m_outputRuntime);
+    }
+    if (runtime) {
+        runtime->stopRuntime();
+        runtime.reset();
     }
     m_outputSinks.clear();
     m_outputCache.reset();
@@ -267,7 +286,10 @@ void PlaybackWorker::shutdownOutputGraph() {
 }
 
 void PlaybackWorker::rebuildOutputEndpoints() {
-    if (!m_outputRuntime) return;
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (!m_outputRuntime) return;
+    }
 
     QList<OutputTargetAssignment> external;
     FrameProvider* multiviewProvider = nullptr;
@@ -279,7 +301,11 @@ void PlaybackWorker::rebuildOutputEndpoints() {
         pgmProvider = m_pgmPreviewProvider;
     }
 
-    m_outputRuntime->setEndpoints({});
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (!m_outputRuntime) return;
+        m_outputRuntime->setEndpoints({});
+    }
     m_outputSinks.clear();
     QList<OutputEndpoint> endpoints;
 
@@ -326,7 +352,10 @@ void PlaybackWorker::rebuildOutputEndpoints() {
         m_outputSinks.push_back(std::move(sink));
     }
 
-    m_outputRuntime->setEndpoints(endpoints);
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (m_outputRuntime) m_outputRuntime->setEndpoints(endpoints);
+    }
     m_outputTargetsDirty.store(false, std::memory_order_relaxed);
 }
 

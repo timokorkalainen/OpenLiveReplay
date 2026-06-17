@@ -3,6 +3,7 @@
 
 #include "playback/output/outputsink.h"
 
+#include <QMutex>
 #include <memory>
 
 class INdiSenderBackend {
@@ -43,7 +44,8 @@ public:
     void stop() override;
     bool isActive() const override { return m_active; }
     bool submit(const OutputBusFrame& frame) override;
-    NdiOutputStatus status() const { return m_status; }
+    NdiOutputStatus status() const;
+    OutputSinkStatus outputStatus() const override;
 
 private:
     static QString senderNameFor(const OutputTargetAssignment& assignment);
@@ -54,6 +56,7 @@ private:
     OutputTargetAssignment m_assignment;
     FrameRate m_rate;
     bool m_active = false;
+    mutable QMutex m_statusMutex;
     NdiOutputStatus m_status;
 };
 

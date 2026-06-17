@@ -5,6 +5,7 @@
 
 #include <QHash>
 #include <QList>
+#include <QString>
 
 struct OutputEndpoint {
     OutputTargetAssignment assignment;
@@ -15,9 +16,19 @@ struct OutputTargetDispatchStats {
     qint64 attemptedFrames = 0;
     qint64 framesSubmitted = 0;
     qint64 sinkFailures = 0;
+    qint64 sinkSubmittedFrames = 0;
+    qint64 sinkFailedFrames = 0;
+    qint64 sinkDroppedFrames = 0;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
     qint64 repeatedPayloadFrames = 0;
+    bool hasSinkStatus = false;
+    bool hasLastSubmitResult = false;
+    bool lastSubmitSucceeded = true;
+    bool hasLastSinkResult = false;
+    bool lastSinkResultSucceeded = true;
+    QString sinkState;
+    QString sinkMessage;
     bool hasLastIdentity = false;
     OutputFrameIdentity lastIdentity;
 };
@@ -45,7 +56,7 @@ public:
 
     OutputDispatchStats dispatchTick(const OutputFrameCache& cache,
                                      const PlaybackStateSnapshot& state);
-    OutputDispatchStats stats() const { return m_stats; }
+    OutputDispatchStats stats() const;
     FrameRate frameRate() const { return m_rate; }
 
 private:
