@@ -5,7 +5,7 @@ native-ingest / broadcast-frame-sync workstream after the merges below._
 
 ---
 
-## 0. Snapshot — what just shipped (all merged to `main` 2026-06-17)
+## 0. Snapshot — what just shipped (merged to `main` / this integration line on 2026-06-17)
 
 | PR | What it landed |
 |----|----------------|
@@ -15,8 +15,13 @@ native-ingest / broadcast-frame-sync workstream after the merges below._
 | #52 | **Native-only ingest** — removed `FfmpegIngestSession` + the native→ffmpeg fallback; selector is native-only (`srt`→NativeSrt, `rtmp/rtmps`→NativeRtmp, else→Unsupported); SRT native by default; **Windows Media Foundation AAC decoder** + **native RTMP enabled on Windows**; udp:// e2e migrated to the native SRT bridge. |
 | #53 | **Soak matrix** — `run_soak_matrix.sh` ({SRT,RTMP}×{H264,H265}) + an `OLR_SRT_SOAK_CODEC` switch. Full 4×30-min run passed (no crash/hang/stall). |
 | #54 | **Broadcast output bus foundation** — preview/PGM/multiview output buses with Qt preview and NDI output dispatch hooks. |
+| #55 | **Output validation / NDI hardening** — output frame identity, NDI runtime smoke/soak options, and NDI status hardening. |
+| #57/#59 | **Windows native ingest smoke hardening** — Windows AAC/RTMP build and smoke coverage were stabilized. |
+| #58/#60 | **Framesync Phases 0-2 + NDI marker fixture** — measurement rig, timing core, native NDI ingest, opt-in NDI smoke, and SDK-backed NDI marker-source matrix coverage. |
+| #61 | **Broadcast output status UI** — output configuration/status surfaced in UI. |
+| #62 | **SRT URL/address hardening** — hostname/DNS/IPv4/IPv6 SRT resolution plus stream ID handling. |
 
-**Net state of the engine now:** ingest is **native-only** — native SRT and native RTMP, decoding **H.264 + H.265 + AAC-LC**, at **rational frame rates**, with a backend-tagged health dot. FFmpeg remains linked **only** for the Matroska muxer + the MPEG-2 record encoder.
+**Net state of the engine now:** ingest is **native-only** — native SRT, native RTMP, and runtime-loaded **NDI ingest**, decoding **H.264 + H.265 + AAC-LC** for SRT/RTMP and decoded NDI video/audio via the NDI SDK, at **rational frame rates**, with a backend-tagged health dot. FFmpeg remains linked **only** for the Matroska muxer + the MPEG-2 record encoder and frame conversion helpers.
 
 **Parallel / adjacent:** #54 is the first move on the **output** side (see §7, P5). It is not part of the ingest stack, but it is part of the same broadcast arc.
 
@@ -49,12 +54,11 @@ Removing `FfmpegIngestSession` (the universal catch-all) intentionally narrowed 
 | Dropped capability | Why it fails now | Restore path |
 |--------------------|------------------|--------------|
 | **Encrypted SRT** (`passphrase`/`pbkeylen`) | `NativeSrtIngestSession::supportsUrl` rejects encrypted URLs | add `SRTO_PASSPHRASE`/`SRTO_PBKEYLEN` to the native SRT socket setup |
-| **Hostname / DNS SRT** (`srt://host.example:port`) | native SRT requires a **numeric IPv4** caller host | add DNS resolution (`getaddrinfo`) + IPv6 in `nativeSrtMakeIpv4Sockaddr` |
 | **Listener / rendezvous SRT** | native SRT is **caller-only** | add listener/rendezvous modes |
 | **`udp://` MPEG-TS ingest** | no native UDP backend | a native UDP+MPEG-TS reader (the `MpegTsParser` already exists; only the UDP socket is missing) — or keep as test-only via the SRT bridge |
 | **`file://` ingest** | no native file reader | a native file/demux reader (low priority; tests use the SRT bridge) |
 
-The unsupported-scheme diagnostic was made **scheme-aware** in #52 (it distinguishes "unknown scheme" from "native backend can't take this srt:// URL — hostname/encryption/mode"), so operators get an accurate message; this section is about actually re-adding the capabilities.
+The unsupported-scheme diagnostic was made **scheme-aware** in #52 (it distinguishes "unknown scheme" from "native backend can't take this srt:// URL — encryption/mode/NDI-runtime/etc."), so operators get an accurate message; this section is about actually re-adding the remaining capabilities. Hostname/DNS SRT and stream IDs were restored in #62.
 
 ---
 
@@ -82,7 +86,7 @@ Decide per real-world source feeds whether any of these need broadening (most li
 ## 6. Test & tooling gaps
 
 - **Wire the soak matrix into CTest (opt-in).** `run_soak_matrix.sh` is a standalone script today. An opt-in `soak`-label ctest registration (guarded like `e2e_native_rtmp_soak`) would make it discoverable; keep it excluded from the default gate (it's long).
-- **Cross-device drift harness.** Every current soak/drift number has slope ≈ 1.0 **by construction** — on one machine the source and recorder share the same wall clock. True clock-drift / phase-lock measurement needs **two machines** (or an injected source-clock offset). This is the only way to validate the P2 work below.
+- **Cross-device drift harness.** Every unskewed one-machine soak/drift number has slope ≈ 1.0 **by construction** — on one machine the source and recorder share the same wall clock. The framesync rig now has a media PTS/PCR skew cell for one-machine stress, but true clock-drift / phase-lock measurement still needs **two machines** for final validation.
 - **Update `drift_2997`.** It still records a 29.97 source at integer 30 (report-only, measuring the mismatch P1 fixes). With rational fps, add a **gated** variant that records at 29.97 and asserts ≈zero drift — a real teeth check for P1, complementing `e2e_record_2997`.
 - **macOS-CI vs local gate.** The full e2e/native suites run only in the local pre-push gate (CI runs the short `ci` label). Fine as designed, but means transport regressions are caught at push, not on PRs.
 
@@ -98,8 +102,8 @@ Phase 1 timing core (`docs/superpowers/plans/2026-06-17-framesync-phase1-timing-
 Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-ingest.md`), backed by
 `docs/superpowers/specs/2026-06-17-broadcast-framesync-program-design.md`.
 
-- **P2 — Source clock recovery + drift servo.** Recover each sender's clock (MPEG-TS PCR / RTP RTCP / a PTS PLL), run a per-source `DriftEstimator`, rate-correct the audio FIFO cursor, and **re-lock to the recovered clock on reconnect** instead of fresh arrival time. **This is what converts "arrival-approx" into "measured phase-lock."** Seeded already: AUD-4 recovers the MPEG-TS PCR on the native SRT path — that 90 kHz reference is the input a `DriftEstimator` needs.
-- **P3 — Timecode.** Extract SMPTE 12M side data (TC-1), align sources by timecode (TC-4), write `tmcd`/tags into the MKV (TC-5).
+- **P2 — Source clock recovery + drift servo.** Live for native SRT/RTMP/NDI: native timestamps route through `SourceClock`, run a per-source `DriftEstimator`, expose `clockppm`/`clockq` telemetry, and use a common drift-aware media-to-session mapping for both video and audio. `StreamWorker` owns per-backend clocks so same-URL reconnects can re-lock to recovered state instead of fresh arrival time. The framesync skew cell now reports A/V-offset drift as well as recovered clock ppm, and the local framesync matrix has SDK-backed NDI marker-source coverage when the NDI runtime is installed.
+- **P3 — Timecode.** Extract SMPTE 12M side data (TC-1), align sources by timecode (TC-4), write `tmcd`/tags into the MKV (TC-5). NDI ingest carries the native NDI timecode value through decoded video/audio callbacks; mux/alignment consumption is still Phase 3.
 - **P4 — Interlace / fields.** Deinterlace policy + field-rate slow-mo (only if interlaced sport is in scope; today fields are silently frame-blended).
 - **P5 — Architectural / true broadcast output.** A PTP (ST 2059) house-clock client (REF-1); genlocked SDI / ST 2110 output via DeckLink/Rivermax (GENLOCK-1, today output is software `QVideoSink` only); interim: PTS-stamp the `QVideoFrame` + vsync-pace presentation (GENLOCK-2/3/5). **#54 (NDI output bus) is the first concrete step here** — a broadcast output path with preview.
 - **Cross-device drift** (two machines) and **encrypted SRT** were also flagged "beyond Phase 2."
@@ -121,10 +125,10 @@ Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-inge
 ## 9. Suggested next sequence
 
 1. **Verify Windows** (§1) — smoke-test live AAC/RTMP on a Windows machine; confirm the Windows CI build is green on `main`. _Unblocks confidence in #52._
-2. **Pick up the capability regressions that real feeds hit** (§3) — most likely **hostname/DNS SRT** and **encrypted SRT** first (common in production SRT).
+2. **Pick up the capability regressions that real feeds hit** (§3) — most likely **encrypted SRT** and **listener/rendezvous SRT** first (common in production SRT).
 3. **Rational playback stepping** (§5) — small, closes the last P1 gap.
-4. **Stand up the Phase 0 measurement rig** (§6/§7) — including the skew injector, so P2 can be measured on one machine before any two-machine drift work.
-5. **P2 source-clock recovery + drift servo** (§7) — the next big leverage step; PCR is already recovered.
+4. **Broaden P2 validation** (§7) — the timing core, reconnect clock ownership, skew A/V metric, SRT cells, and local NDI marker-source matrix cells are live; remaining work is longer-duration/two-machine validation, RTMP marker-source coverage, and tightening report-only cells into gates where the transport can honestly guarantee them.
+5. **Keep the framesync matrix current** (§7) — when new transport fixtures land, make sure they emit the same flash/beep/timecode/skew contract as the SRT and NDI marker sources.
 6. Output side (**P5 / #54**) proceeds in parallel on its own track.
 
 ---
