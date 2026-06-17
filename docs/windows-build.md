@@ -30,6 +30,9 @@ This will, deterministically and idempotently:
 
 1. Build **SRT** (`v1.5.4`) and **FFmpeg** (`8.1.1`, with `libsrt`) from source
    into `windows_build/dist/` — see `build-scripts/build_ffmpeg_windows_srt.sh`.
+   The dependency step also installs `ffmpeg.exe`, `ffprobe.exe`, and
+   `srt-live-transmit.exe` so local native ingest smoke tests can run from the
+   same pinned toolchain.
 2. Configure with the `windows-mingw-release` CMake preset.
 3. Compile and link `build/OpenLiveReplay.exe`.
 4. Run `windeployqt` and assemble a self-contained bundle at
@@ -73,6 +76,15 @@ cmake --preset windows-mingw-release
 cmake --build --preset windows-mingw-release
 ```
 
+To build the test harnesses and run local smoke tests from the same dependency
+tools:
+
+```bash
+cmake --preset windows-mingw-release -DOLR_BUILD_TESTS=ON
+cmake --build --preset windows-mingw-release --target record_harness
+ctest --test-dir build -R "e2e_native_(srt|rtmp)_smoke" --output-on-failure
+```
+
 Qt Creator / VS Code can use the `windows-mingw-release` preset directly once the
 same `OLR_*` environment variables are set.
 
@@ -87,8 +99,10 @@ same `OLR_*` environment variables are set.
   ~1000 objects, and FFmpeg's `compat/windows/makedef` overruns the Windows
   command-line length limit under Git Bash, breaking DLL generation. The curated
   set (see the deps script) stays under the limit and still covers the app's
-  ingest/record/playback codecs. Native decode on Windows uses Media Foundation,
-  so FFmpeg needs no platform codec integration.
+  ingest/record/playback codecs. The local smoke-test FFmpeg uses Windows Media
+  Foundation's H.264 encoder (`h264_mf`) instead of GPL `libx264`; native decode
+  on Windows also uses Media Foundation, so FFmpeg needs no platform decode
+  integration.
 - **SRT without encryption.** SRT is built with `ENABLE_ENCRYPTION=OFF`; the
   native SRT ingest refuses encrypted URLs and falls back to FFmpeg's own
   `libsrt` for those, so no OpenSSL dependency is pulled in.

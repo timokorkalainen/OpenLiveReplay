@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build FFmpeg (with libsrt) + a standalone SRT for the Windows/MinGW app build.
+# Build FFmpeg (with libsrt) + a standalone SRT for the Windows/MinGW app build
+# and local native-ingest smoke tests.
 #
 # Windows analogue of build_ffmpeg_ios_srt.sh: builds SRT from source (CMake) and
 # then FFmpeg from source (--enable-libsrt), mirroring the iOS recipe but for the
@@ -34,7 +35,9 @@
 #
 # OUTPUT (point the app's CMake cache vars here)
 #   windows_build/dist/ffmpeg  ->  -DOLR_FFMPEG_ROOT=.../windows_build/dist/ffmpeg
+#       also contains ffmpeg.exe + ffprobe.exe for local smoke tests
 #   windows_build/dist/srt     ->  -DOLR_SRT_ROOT=.../windows_build/dist/srt
+#       also contains srt-live-transmit.exe for local SRT smoke tests
 set -euo pipefail
 
 # ==============================================================================
@@ -108,8 +111,13 @@ echo "  ninja : $("$NINJA_BIN" --version) ($NINJA_BIN)"
 
 mkdir -p "$SRC_DIR" "$DIST_DIR" "$TMP_DIR" "$SHIM_DIR"
 
-# Idempotent: skip if both artifacts already exist (delete windows_build/ to force).
-if [ -f "$FFMPEG_DIST/bin/avformat-62.dll" ] && [ -f "$SRT_DIST/lib/libsrt.dll.a" ]; then
+# Idempotent: skip if app libraries and smoke-test tools already exist.
+# Delete windows_build/ to force a fully clean rebuild.
+if [ -f "$FFMPEG_DIST/bin/avformat-62.dll" ] \
+    && [ -f "$FFMPEG_DIST/bin/ffmpeg.exe" ] \
+    && [ -f "$FFMPEG_DIST/bin/ffprobe.exe" ] \
+    && [ -f "$SRT_DIST/lib/libsrt.dll.a" ] \
+    && [ -f "$SRT_DIST/bin/srt-live-transmit.exe" ]; then
     echo "[win-srt] already built at $DIST_DIR; skipping (delete windows_build/ to force)."
     echo "          OLR_FFMPEG_ROOT=$(winpath "$FFMPEG_DIST")"
     echo "          OLR_SRT_ROOT=$(winpath "$SRT_DIST")"
@@ -171,8 +179,8 @@ rm -rf "$SRT_BUILD"
     -DCMAKE_C_COMPILER="$GCC_BIN" \
     -DCMAKE_CXX_COMPILER="$GXX_BIN" \
     -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
-    -DENABLE_SHARED=ON -DENABLE_STATIC=OFF \
-    -DENABLE_APPS=OFF -DENABLE_ENCRYPTION=OFF \
+    -DENABLE_SHARED=ON -DENABLE_STATIC=ON \
+    -DENABLE_APPS=ON -DENABLE_ENCRYPTION=OFF \
     -DENABLE_STDCXX_SYNC=ON \
     -DCMAKE_INSTALL_PREFIX="$(winpath "$WORK_DIR")/dist/srt"
 "$CMAKE_BIN" --build "$SRT_BUILD"
@@ -218,12 +226,13 @@ SHIM_WIN="$(winpath "$SHIM_DIR")/pkg-config"
     --cc=gcc --arch=x86_64 --target-os=mingw32 \
     --pkg-config="$SHIM_WIN" --pkg-config-flags=--static \
     --disable-static --enable-shared \
-    --disable-doc --disable-programs \
-    --disable-avdevice --disable-avfilter \
+    --disable-doc --disable-ffplay --enable-ffmpeg --enable-ffprobe \
+    --enable-avdevice --enable-avfilter \
     --disable-x86asm \
     --disable-everything \
-    --enable-network --enable-schannel \
+    --enable-network --enable-schannel --enable-mediafoundation \
     --enable-libsrt \
+    --enable-indev=lavfi \
     --enable-protocol=file --enable-protocol=pipe --enable-protocol=libsrt \
     --enable-protocol=tcp --enable-protocol=udp --enable-protocol=crypto \
     --enable-protocol=rtmp --enable-protocol=rtmpt --enable-protocol=rtmps \
@@ -233,7 +242,7 @@ SHIM_WIN="$(winpath "$SHIM_DIR")/pkg-config"
     --enable-demuxer=hevc --enable-demuxer=aac --enable-demuxer=mp3 \
     --enable-demuxer=wav --enable-demuxer=mpegvideo --enable-demuxer=mpegps \
     --enable-muxer=matroska --enable-muxer=mov --enable-muxer=mp4 \
-    --enable-muxer=mpegts \
+    --enable-muxer=mpegts --enable-muxer=flv --enable-muxer=null \
     --enable-parser=h264 --enable-parser=hevc --enable-parser=aac \
     --enable-parser=aac_latm --enable-parser=av1 --enable-parser=vp9 \
     --enable-parser=mpegvideo --enable-parser=mpegaudio --enable-parser=mpeg4video \
@@ -241,9 +250,15 @@ SHIM_WIN="$(winpath "$SHIM_DIR")/pkg-config"
     --enable-decoder=aac_latm --enable-decoder=av1 --enable-decoder=vp9 \
     --enable-decoder=mpeg2video --enable-decoder=mpeg4 --enable-decoder=mp3 \
     --enable-decoder=ac3 --enable-decoder=pcm_s16le --enable-decoder=pcm_s24le \
-    --enable-decoder=rawvideo \
+    --enable-decoder=rawvideo --enable-decoder=wrapped_avframe \
+    --enable-encoder=h264_mf --enable-encoder=aac \
     --enable-encoder=mpeg2video --enable-encoder=pcm_s16le \
     --enable-encoder=mjpeg --enable-encoder=png --enable-encoder=rawvideo \
+    --enable-filter=testsrc2 --enable-filter=sine --enable-filter=color \
+    --enable-filter=geq --enable-filter=signalstats \
+    --enable-filter=astats --enable-filter=aresample --enable-filter=aformat \
+    --enable-filter=format --enable-filter=scale --enable-filter=null \
+    --enable-filter=anull \
     --enable-bsf=extract_extradata --enable-bsf=h264_mp4toannexb \
     --enable-bsf=hevc_mp4toannexb --enable-bsf=aac_adtstoasc \
     --enable-bsf=null --enable-bsf=vp9_superframe --enable-bsf=dump_extradata
@@ -263,4 +278,4 @@ echo ""
 echo "[win-srt] OK. Configure the app with:"
 echo "    -DOLR_FFMPEG_ROOT=$(winpath "$FFMPEG_DIST")"
 echo "    -DOLR_SRT_ROOT=$(winpath "$SRT_DIST")"
-echo "  Runtime DLLs to deploy next to the app: $FFMPEG_DIST/bin/*.dll and $SRT_DIST/bin/libsrt.dll"
+echo "  Smoke tools: $FFMPEG_DIST/bin/ffmpeg.exe, $FFMPEG_DIST/bin/ffprobe.exe, $SRT_DIST/bin/srt-live-transmit.exe"

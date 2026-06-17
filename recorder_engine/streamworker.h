@@ -122,7 +122,9 @@ private:
     QMutex m_frameMutex;
     QMutex m_urlMutex;
     QMutex m_metadataMutex;
+    QMutex m_sessionMutex;
     QByteArray m_sourceMetadataJson;    // JSON blob for per-frame subtitle track
+    IngestSession* m_activeSession = nullptr; // guarded by m_sessionMutex
 
     // Dedicated capture thread owned by this worker.  captureLoop() loops
     // internally on reconnect/URL-change (m_restartCapture), so it is

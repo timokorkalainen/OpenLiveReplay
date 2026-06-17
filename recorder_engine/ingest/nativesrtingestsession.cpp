@@ -262,20 +262,25 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
     const int yes = 1;
     const int latency = kSrtLatencyMs;
     const int connectTimeout = kSrtConnectTimeoutMs;
+    linger closeLinger{};
+    closeLinger.l_onoff = 1;
+    closeLinger.l_linger = 0;
     const SRT_TRANSTYPE transType = SRTT_LIVE;
 
     if (!setSrtOption(m_socket, SRTO_SNDSYN, &no, sizeof(no), error,
-                      QStringLiteral("SRTO_SNDSYN"))
-        || !setSrtOption(m_socket, SRTO_RCVSYN, &no, sizeof(no), error,
-                         QStringLiteral("SRTO_RCVSYN"))
-        || !setSrtOption(m_socket, SRTO_TRANSTYPE, &transType, sizeof(transType), error,
-                         QStringLiteral("SRTO_TRANSTYPE"))
-        || !setSrtOption(m_socket, SRTO_LATENCY, &latency, sizeof(latency), error,
-                         QStringLiteral("SRTO_LATENCY"))
-        || !setSrtOption(m_socket, SRTO_CONNTIMEO, &connectTimeout, sizeof(connectTimeout), error,
-                         QStringLiteral("SRTO_CONNTIMEO"))
-        || !setSrtOption(m_socket, SRTO_REUSEADDR, &yes, sizeof(yes), error,
-                         QStringLiteral("SRTO_REUSEADDR"))) {
+                      QStringLiteral("SRTO_SNDSYN")) ||
+        !setSrtOption(m_socket, SRTO_RCVSYN, &no, sizeof(no), error,
+                      QStringLiteral("SRTO_RCVSYN")) ||
+        !setSrtOption(m_socket, SRTO_TRANSTYPE, &transType, sizeof(transType), error,
+                      QStringLiteral("SRTO_TRANSTYPE")) ||
+        !setSrtOption(m_socket, SRTO_LATENCY, &latency, sizeof(latency), error,
+                      QStringLiteral("SRTO_LATENCY")) ||
+        !setSrtOption(m_socket, SRTO_CONNTIMEO, &connectTimeout, sizeof(connectTimeout), error,
+                      QStringLiteral("SRTO_CONNTIMEO")) ||
+        !setSrtOption(m_socket, SRTO_REUSEADDR, &yes, sizeof(yes), error,
+                      QStringLiteral("SRTO_REUSEADDR")) ||
+        !setSrtOption(m_socket, SRTO_LINGER, &closeLinger, sizeof(closeLinger), error,
+                      QStringLiteral("SRTO_LINGER"))) {
         closeSocket();
         return false;
     }
