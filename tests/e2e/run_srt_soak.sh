@@ -8,7 +8,11 @@
 # content the whole time. The slope is reported as a diagnostic, not gated.
 #
 # Records over the native SRT ingest (the default, and only, SRT ingest); no
-# SRT-enabled ffmpeg build is needed. Usage: run_srt_soak.sh <harness> [base]
+# SRT-enabled ffmpeg build is needed.
+#   OLR_SRT_SOAK_SECS   soak duration in seconds (default 30)
+#   OLR_SRT_SOAK_CODEC  flash-marker video codec: "avc" (H.264, default) or "hevc"
+#                       (H.265; SKIPs 77 if the local ffmpeg has no HEVC encoder)
+# Usage: run_srt_soak.sh <harness> [base]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=srt_lib.sh
@@ -17,6 +21,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 HARNESS="${1:?sync_harness executable path required}"
 BASE="${2:-23670}"
 SECS="${OLR_SRT_SOAK_SECS:-30}"
+CODEC="${OLR_SRT_SOAK_CODEC:-avc}"
+export OLR_FLASH_CODEC="$CODEC"
 S=$BASE; UDP=$((BASE+1))
 
 srt_require_tools
@@ -32,8 +38,8 @@ flash_marker_to_udps "$UDP"; PIDS+=("$SRT_LAST_PID")
 srt_bridge "$UDP" "$S"; PIDS+=("$SRT_LAST_PID")
 sleep 1.5
 
-echo "[srt-soak] recording one native SRT source for ${SECS}s..."
-"$HARNESS" --url "$(srt_caller_url "$S")" --outdir "$WORKDIR" --name srtsoak \
+echo "[srt-soak] recording one native SRT source (${CODEC}) for ${SECS}s..."
+"$HARNESS" --url "$(srt_caller_url "$S")" --outdir "$WORKDIR" --name "srtsoak_${CODEC}" \
     --seconds "$SECS" --fps 30 >"$WORKDIR/out.txt" 2>"$WORKDIR/err.txt" &
 HP=$!; PIDS+=("$HP")
 wait "$HP"
@@ -61,5 +67,5 @@ awk -v n="${N:-0}" -v s="$SECS" 'BEGIN{exit !(n+0 >= s-3)}' || { echo "FAIL: onl
 awk -v g="${GAP:-9}" 'BEGIN{exit !(g+0 <= 1.5)}' || { echo "FAIL: max gap ${GAP}s > 1.5s — mid-run stall"; fail=1; }
 
 [ $fail -ne 0 ] && exit 1
-echo "PASS: native SRT ingest stable over ${SECS}s soak — ${N} flashes, no stall (slope ${SLOPE})"
+echo "PASS: native SRT ${CODEC} ingest stable over ${SECS}s soak — ${N} flashes, no stall (slope ${SLOPE})"
 exit 0
