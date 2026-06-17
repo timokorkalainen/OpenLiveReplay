@@ -51,7 +51,8 @@ int main(int argc, char** argv) {
     const int seconds = argValue(args, QStringLiteral("--seconds"), QStringLiteral("8")).toInt();
     const int width = argValue(args, QStringLiteral("--width"), QStringLiteral("320")).toInt();
     const int height = argValue(args, QStringLiteral("--height"), QStringLiteral("240")).toInt();
-    const FrameRate frameRate = parseFrameRate(argValue(args, QStringLiteral("--fps"), QStringLiteral("30")));
+    const FrameRate frameRate =
+        parseFrameRate(argValue(args, QStringLiteral("--fps"), QStringLiteral("30")));
     // Where recordings land; the driver points this at a temp dir so the test
     // is hermetic. Empty -> engine default (~/Documents/videos).
     const QString outdir = argValue(args, QStringLiteral("--outdir"), QString());

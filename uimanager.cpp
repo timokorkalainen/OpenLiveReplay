@@ -670,7 +670,7 @@ int UIManager::frameRateIndex() const {
     return -1; // a non-preset rate loaded from config
 }
 
-void UIManager::applyFrameRate(const FrameRate &r) {
+void UIManager::applyFrameRate(const FrameRate& r) {
     m_currentSettings.fpsNum = r.num;
     m_currentSettings.fpsDen = r.den;
     if (m_replayManager) m_replayManager->setFrameRate(r);

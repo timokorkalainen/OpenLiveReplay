@@ -39,7 +39,8 @@ int main(int argc, char** argv) {
     const int seconds = argValue(args, QStringLiteral("--seconds"), QStringLiteral("6")).toInt();
     const int width = argValue(args, QStringLiteral("--width"), QStringLiteral("640")).toInt();
     const int height = argValue(args, QStringLiteral("--height"), QStringLiteral("480")).toInt();
-    const FrameRate frameRate = parseFrameRate(argValue(args, QStringLiteral("--fps"), QStringLiteral("30")));
+    const FrameRate frameRate =
+        parseFrameRate(argValue(args, QStringLiteral("--fps"), QStringLiteral("30")));
     // Where recordings land. The engine honors this (ReplayManager ->
     // Muxer::setOutputDirectory); the driver points it at a temp dir so the
     // test is hermetic. Empty -> engine default (~/Documents/videos).

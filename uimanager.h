@@ -320,7 +320,7 @@ private:
 
     void restartPlaybackWorker();
 
-    void applyFrameRate(const FrameRate &r);
+    void applyFrameRate(const FrameRate& r);
 
     // Shared control-action dispatch used by both MIDI bindings and the
     // Stream Deck. Action ids documented in streamdeck/streamdeckmanager.h.
