@@ -15,6 +15,7 @@ extern "C" {
 namespace {
 constexpr int kConnectTimeoutMs = 5000;
 constexpr int kIoTimeoutMs = 5000;
+constexpr int kSocketPollMs = 100;
 constexpr int kStallTimeoutMs = 8000;
 constexpr int kRtmpVersion = 3;
 constexpr int kMessageSetChunkSize = 1;
@@ -207,6 +208,7 @@ NativeRtmpIngestSession::NativeRtmpIngestSession(int sourceIndex, int outputWidt
 
 NativeRtmpIngestSession::~NativeRtmpIngestSession() {
     requestStop();
+    closeSocket();
 }
 
 bool NativeRtmpIngestSession::supportsUrl(const QUrl& url) {
@@ -217,6 +219,7 @@ bool NativeRtmpIngestSession::supportsUrl(const QUrl& url) {
 
 bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
     requestStop();
+    closeSocket();
     m_url = url;
     m_callbacks = callbacks;
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -251,6 +254,7 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     if (!connectAndPlay(&error)) {
         log(error);
         requestStop();
+        closeSocket();
         return false;
     }
 
@@ -315,10 +319,14 @@ void NativeRtmpIngestSession::run() {
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(false);
     }
+    closeSocket();
 }
 
 void NativeRtmpIngestSession::requestStop() {
     m_stopRequested.store(true, std::memory_order_relaxed);
+}
+
+void NativeRtmpIngestSession::closeSocket() {
     if (m_socket) {
         m_socket->disconnectFromHost();
         m_socket.reset();
@@ -344,10 +352,20 @@ bool NativeRtmpIngestSession::connectAndPlay(QString* error) {
                              [raw](const QList<QSslError>&) { raw->ignoreSslErrors(); });
         }
         raw->connectToHostEncrypted(m_url.host(), quint16(m_url.port(443)));
-        if (!raw->waitForEncrypted(kConnectTimeoutMs)) {
+        QElapsedTimer connectTimer;
+        connectTimer.start();
+        while (!shouldStop() && !raw->isEncrypted() &&
+               raw->state() != QAbstractSocket::UnconnectedState &&
+               connectTimer.elapsed() <= kConnectTimeoutMs) {
+            raw->waitForEncrypted(kSocketPollMs);
+        }
+        if (!raw->isEncrypted()) {
             m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
-                *error = QStringLiteral("Native RTMPS connect failed: %1").arg(raw->errorString());
+                *error =
+                    shouldStop()
+                        ? QStringLiteral("Native RTMPS connect cancelled.")
+                        : QStringLiteral("Native RTMPS connect failed: %1").arg(raw->errorString());
             return false;
         }
         m_socket = std::move(socket);
@@ -356,10 +374,20 @@ bool NativeRtmpIngestSession::connectAndPlay(QString* error) {
         m_socket->connectToHost(m_url.host(), quint16(m_url.port(1935)));
     }
 
-    if (!m_socket->waitForConnected(kConnectTimeoutMs)) {
+    QElapsedTimer connectTimer;
+    connectTimer.start();
+    while (!shouldStop() && m_socket->state() != QAbstractSocket::ConnectedState &&
+           m_socket->state() != QAbstractSocket::UnconnectedState &&
+           connectTimer.elapsed() <= kConnectTimeoutMs) {
+        m_socket->waitForConnected(kSocketPollMs);
+    }
+    if (m_socket->state() != QAbstractSocket::ConnectedState) {
         m_lastFailureKind = IngestFailureKind::TransientNetwork;
         if (error)
-            *error = QStringLiteral("Native RTMP connect failed: %1").arg(m_socket->errorString());
+            *error =
+                shouldStop()
+                    ? QStringLiteral("Native RTMP connect cancelled.")
+                    : QStringLiteral("Native RTMP connect failed: %1").arg(m_socket->errorString());
         return false;
     }
 
@@ -502,7 +530,7 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
     }
 
     while (!shouldStop()) {
-        if (m_socket->bytesAvailable() <= 0 && !m_socket->waitForReadyRead(kIoTimeoutMs)) {
+        if (m_socket->bytesAvailable() <= 0 && !m_socket->waitForReadyRead(kSocketPollMs)) {
             if (m_socket->state() == QAbstractSocket::UnconnectedState) {
                 m_lastFailureKind = IngestFailureKind::TransientNetwork;
                 if (error)
@@ -564,18 +592,24 @@ bool NativeRtmpIngestSession::sendMessage(int chunkStreamId, int messageType, in
 
 bool NativeRtmpIngestSession::readFully(char* data, qsizetype size, QString* error) {
     qsizetype offset = 0;
+    QElapsedTimer idleTimer;
+    idleTimer.start();
     while (offset < size && !shouldStop()) {
         const qint64 read = m_socket->read(data + offset, size - offset);
         if (read > 0) {
             offset += read;
+            idleTimer.restart();
             continue;
         }
-        if (!m_socket->waitForReadyRead(kIoTimeoutMs)) {
+        if (!m_socket->waitForReadyRead(kSocketPollMs) && idleTimer.elapsed() >= kIoTimeoutMs) {
             m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
                 *error = QStringLiteral("Native RTMP read failed: %1").arg(m_socket->errorString());
             return false;
         }
+    }
+    if (shouldStop() && offset < size && error) {
+        *error = QStringLiteral("Native RTMP read cancelled.");
     }
     return offset == size;
 }
@@ -585,6 +619,8 @@ bool NativeRtmpIngestSession::writeFully(const QByteArray& bytes, QString* error
         return false;
     }
     qint64 written = 0;
+    QElapsedTimer idleTimer;
+    idleTimer.start();
     while (written < bytes.size() && !shouldStop()) {
         const qint64 n = m_socket->write(bytes.constData() + written, bytes.size() - written);
         if (n < 0) {
@@ -594,14 +630,35 @@ bool NativeRtmpIngestSession::writeFully(const QByteArray& bytes, QString* error
                     QStringLiteral("Native RTMP write failed: %1").arg(m_socket->errorString());
             return false;
         }
-        written += n;
-        if (!m_socket->waitForBytesWritten(kIoTimeoutMs)) {
-            m_lastFailureKind = IngestFailureKind::TransientNetwork;
-            if (error)
-                *error =
-                    QStringLiteral("Native RTMP write timed out: %1").arg(m_socket->errorString());
-            return false;
+        if (n == 0) {
+            if (!m_socket->waitForBytesWritten(kSocketPollMs) &&
+                idleTimer.elapsed() >= kIoTimeoutMs) {
+                m_lastFailureKind = IngestFailureKind::TransientNetwork;
+                if (error)
+                    *error = QStringLiteral("Native RTMP write timed out: %1")
+                                 .arg(m_socket->errorString());
+                return false;
+            }
+            continue;
         }
+        written += n;
+        idleTimer.restart();
+        while (m_socket->bytesToWrite() > 0 && !shouldStop()) {
+            if (m_socket->waitForBytesWritten(kSocketPollMs)) {
+                idleTimer.restart();
+                continue;
+            }
+            if (idleTimer.elapsed() >= kIoTimeoutMs) {
+                m_lastFailureKind = IngestFailureKind::TransientNetwork;
+                if (error)
+                    *error = QStringLiteral("Native RTMP write timed out: %1")
+                                 .arg(m_socket->errorString());
+                return false;
+            }
+        }
+    }
+    if (shouldStop() && written < bytes.size() && error) {
+        *error = QStringLiteral("Native RTMP write cancelled.");
     }
     return written == bytes.size();
 }
@@ -985,9 +1042,6 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
     if (!m_audioDecoder) {
         m_audioDecoder = std::make_unique<NativeAacDecoder>();
     }
-    // RTMP carries raw AAC frames with a separate AudioSpecificConfig. Wrapping
-    // each frame as ADTS and using a fresh converter avoids stale packet state.
-    m_audioDecoder->reset();
 
     QByteArray pcm;
     QString error;

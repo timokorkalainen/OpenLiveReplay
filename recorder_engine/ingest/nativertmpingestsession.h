@@ -74,6 +74,7 @@ private:
     QList<RtmpMessage> m_pendingMessages;
 
     bool connectAndPlay(QString* error);
+    void closeSocket();
     bool performHandshake(QString* error);
     bool sendConnectCommand(QString* error);
     static RtmpConnectCodecProfile connectCodecProfile();

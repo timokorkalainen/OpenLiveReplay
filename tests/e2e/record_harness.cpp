@@ -27,11 +27,20 @@ QString argValue(const QStringList& args, const QString& flag, const QString& fa
     if (i >= 0 && i + 1 < args.size()) return args.at(i + 1);
     return fallback;
 }
+
+void stderrMessageHandler(QtMsgType, const QMessageLogContext&, const QString& message) {
+    fprintf(stderr, "%s\n", qPrintable(message));
+    fflush(stderr);
+}
 } // namespace
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     const QStringList args = app.arguments();
+
+    if (args.contains(QStringLiteral("--qt-log-stderr"))) {
+        qInstallMessageHandler(stderrMessageHandler);
+    }
 
     const QString url = argValue(args, QStringLiteral("--url"), QString());
     const QString name = argValue(args, QStringLiteral("--name"), QStringLiteral("olr_e2e"));

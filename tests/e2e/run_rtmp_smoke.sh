@@ -52,7 +52,7 @@ case "$DISPLAY_URL" in
     *\?*) DISPLAY_URL="${DISPLAY_URL%%\?*}?<redacted>" ;;
 esac
 "$HARNESS" --url "$URL" --name olr_rtmp_smoke --outdir "$WORKDIR" \
-    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 \
+    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 --qt-log-stderr \
     >"$HARNESS_OUT" 2>"$HARNESS_ERR"
 RC=$?
 
