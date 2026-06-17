@@ -13,6 +13,7 @@ private slots:
     void authorityJumpReanchors();
     void discontinuityReanchors();
     void followerDoesNotReanchorExistingAnchor();
+    void followerDoesNotPollutePpm();
     void measuresPpm();
     void preserves90kAnchorMath();
 };
@@ -51,6 +52,16 @@ void TestSourceClock::followerDoesNotReanchorExistingAnchor() {
     clock.observe(1000, 5000, false);
     clock.observe(9000, 99999, false, ClockObservationRole::Follower);
     QCOMPARE(clock.toSessionMs(9000), int64_t(13000));
+}
+
+void TestSourceClock::followerDoesNotPollutePpm() {
+    AnchoredSourceClock clock(ClockQuality::FlvPll);
+    for (int i = 0; i < 300; ++i) {
+        clock.observe(int64_t(i) * 1000, int64_t(i) * 1000, false);
+        clock.observe(900000 + int64_t(i) * 1000, 1000 + int64_t(i) * 1000, false,
+                      ClockObservationRole::Follower);
+    }
+    QVERIFY(std::abs(clock.ppm()) < 1.0);
 }
 
 void TestSourceClock::measuresPpm() {

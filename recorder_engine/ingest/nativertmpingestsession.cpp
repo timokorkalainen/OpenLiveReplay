@@ -227,9 +227,7 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_aacConfig = RtmpAacConfig();
     m_videoCodec = NativeVideoCodec::Unknown;
     m_streamId = 1;
-    m_anchorMediaMs = -1;
-    m_anchorStreamTimeMs = -1;
-    m_prevDtsMs = -1;
+    m_clock.reset();
     m_prevAudioPtsMs = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastKeyframeAtMs = -1;
@@ -1030,33 +1028,13 @@ bool NativeRtmpIngestSession::parseAacSequenceHeader(const QByteArray& payload, 
 }
 
 int64_t NativeRtmpIngestSession::sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs) {
-    bool needAnchor = m_anchorMediaMs < 0;
-    if (!needAnchor && m_prevDtsMs >= 0) {
-        const int64_t deltaMs = dtsMs - m_prevDtsMs;
-        if (deltaMs > kForwardJumpMs || deltaMs < kBackwardToleranceMs) {
-            log(QStringLiteral("Native RTMP DTS discontinuity (%1 ms jump). Re-anchoring.")
-                    .arg(deltaMs));
-            needAnchor = true;
-        }
-    }
-    if (needAnchor) {
-        m_anchorMediaMs = dtsMs;
-        m_anchorStreamTimeMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
-    }
-    m_prevDtsMs = dtsMs;
-    if (m_anchorStreamTimeMs < 0) {
-        return -1;
-    }
-    return m_anchorStreamTimeMs + (ptsMs - m_anchorMediaMs);
+    const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    m_clock.observe(dtsMs, nowMs, false, ClockObservationRole::Authority);
+    return m_clock.toSessionMs(ptsMs);
 }
 
 int64_t NativeRtmpIngestSession::sourcePtsMsForAudio(qint64 ptsMs) {
-    if (m_anchorMediaMs < 0) {
-        // Audio arrived before any video: establish the shared anchor here. Video
-        // takes over re-anchoring once it arrives.
-        m_anchorMediaMs = ptsMs;
-        m_anchorStreamTimeMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
-    } else if (m_prevAudioPtsMs >= 0) {
+    if (m_clock.locked() && m_prevAudioPtsMs >= 0) {
         const int64_t deltaMs = ptsMs - m_prevAudioPtsMs;
         if (deltaMs > kForwardJumpMs || deltaMs < kBackwardToleranceMs) {
             // Audio discontinuity: flush the decoder but DO NOT move the shared anchor
@@ -1070,8 +1048,7 @@ int64_t NativeRtmpIngestSession::sourcePtsMsForAudio(qint64 ptsMs) {
         }
     }
     m_prevAudioPtsMs = ptsMs;
-    if (m_anchorStreamTimeMs < 0) {
-        return -1;
-    }
-    return m_anchorStreamTimeMs + (ptsMs - m_anchorMediaMs);
+    const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    m_clock.observe(ptsMs, nowMs, false, ClockObservationRole::Follower);
+    return m_clock.toSessionMs(ptsMs);
 }

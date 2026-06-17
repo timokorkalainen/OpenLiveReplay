@@ -6,6 +6,7 @@
 #include "ingestsession.h"
 #include "mpegtsparser.h"
 #include "nativevideodecoder.h"
+#include "recorder_engine/timing/sourceclock.h"
 
 #include <QByteArray>
 #include <QElapsedTimer>
@@ -57,12 +58,9 @@ private:
     int64_t m_statDropTotal = -1;
     int64_t m_statRecvTotal = -1;
     int64_t m_lastStatsAtMs = -1;
-    // Single shared A/V anchor for this source: stream-time anchorTs90k (PCR base,
-    // or the first PES timestamp if no PCR appeared yet) maps to wall-clock
-    // anchorStreamTimeMs. Both video and audio map against it, so the recorded A/V
-    // offset equals the true stream offset (they share the 90 kHz program clock).
-    int64_t m_anchorTs90k = -1;
-    int64_t m_anchorStreamTimeMs = -1;
+    // Single shared A/V anchor for this source. PCR/video own re-anchoring; audio
+    // follows the same recovered 90 kHz sender clock.
+    AnchoredSourceClock m_clock{ClockQuality::Pcr, 90};
     // Per-stream previous timestamps, for discontinuity (jump) detection only.
     int64_t m_prevDts90k = -1;
     int64_t m_prevAudioPts90k = -1;

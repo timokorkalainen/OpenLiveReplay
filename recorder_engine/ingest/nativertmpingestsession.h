@@ -6,6 +6,7 @@
 #include "ingestsession.h"
 #include "nativevideodecoder.h"
 #include "rtmpprotocol.h"
+#include "recorder_engine/timing/sourceclock.h"
 
 #include <QByteArray>
 #include <QElapsedTimer>
@@ -53,9 +54,7 @@ private:
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
     int m_outputChunkSize = 128;
     int m_streamId = 1;
-    int64_t m_anchorMediaMs = -1;      // shared A/V media-timestamp zero (FLV ms)
-    int64_t m_anchorStreamTimeMs = -1; // shared recording-clock zero
-    int64_t m_prevDtsMs = -1;
+    AnchoredSourceClock m_clock{ClockQuality::FlvPll};
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastKeyframeAtMs = -1;
