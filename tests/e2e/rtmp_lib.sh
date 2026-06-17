@@ -5,12 +5,34 @@
 # fixture server startup, RTMP URLs, and flash-onset extraction. The RTMP fixture
 # server paces tags by their FLV timestamps so the harness sees live-ish playback.
 
+# shellcheck source=tool_env.sh
+. "$HERE/tool_env.sh"
+olr_prepend_built_tool_paths
+
 RTMP_LAST_PID=""
+RTMP_PYTHON_CMD=()
+
+rtmp_find_python3() {
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            RTMP_PYTHON_CMD=("$candidate")
+            return 0
+        fi
+    done
+    if command -v py >/dev/null 2>&1 \
+        && py -3 -c 'import sys; raise SystemExit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+        RTMP_PYTHON_CMD=(py -3)
+        return 0
+    fi
+    return 1
+}
 
 rtmp_require_tools() {
     command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 77; }
     command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 77; }
-    command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit 77; }
+    rtmp_find_python3 || { echo "SKIP: usable Python 3 not found"; exit 77; }
 }
 
 rtmp_redact_log() {
@@ -43,16 +65,20 @@ rtmp_fixture_server_cmd() {
     if [ -n "${RTMP_FIXTURE_WRITE_FRAGMENT_DELAY:-}" ]; then
         set -- "$@" --write-fragment-delay "$RTMP_FIXTURE_WRITE_FRAGMENT_DELAY"
     fi
-    python3 "$HERE/rtmp_fixture_server.py" "$@"
+    if [ "${#RTMP_PYTHON_CMD[@]}" -eq 0 ]; then
+        rtmp_find_python3 || { echo "SKIP: usable Python 3 not found"; exit 77; }
+    fi
+    "${RTMP_PYTHON_CMD[@]}" "$HERE/rtmp_fixture_server.py" "$@"
 }
 
 rtmp_generate_tone_flv() { # $1=path $2=freq_hz $3=seconds
     local out="$1" freq="$2" secs="$3"
+    olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 77; }
     ffmpeg -hide_banner -loglevel error \
         -f lavfi -i "testsrc2=size=640x480:rate=30" \
         -f lavfi -i "sine=frequency=${freq}:sample_rate=48000" -ac 2 \
         -t "$secs" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+        "${OLR_H264_VCODEC_ARGS[@]}" \
         -c:a aac -b:a 128k \
         -f flv "$out"
 }
@@ -60,10 +86,11 @@ rtmp_generate_tone_flv() { # $1=path $2=freq_hz $3=seconds
 rtmp_generate_flash_flv() { # $1=path $2=seconds
     local out="$1" secs="$2"
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
+    olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 77; }
     ffmpeg -hide_banner -loglevel error \
         -f lavfi -i "color=c=black:s=320x240:r=30" -vf "$vflt" \
         -t "$secs" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+        "${OLR_H264_VCODEC_ARGS[@]}" \
         -map 0:v \
         -f flv "$out"
 }

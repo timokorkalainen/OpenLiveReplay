@@ -262,6 +262,9 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
     const int yes = 1;
     const int latency = kSrtLatencyMs;
     const int connectTimeout = kSrtConnectTimeoutMs;
+    linger closeLinger {};
+    closeLinger.l_onoff = 1;
+    closeLinger.l_linger = 0;
     const SRT_TRANSTYPE transType = SRTT_LIVE;
 
     if (!setSrtOption(m_socket, SRTO_SNDSYN, &no, sizeof(no), error,
@@ -275,7 +278,9 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         || !setSrtOption(m_socket, SRTO_CONNTIMEO, &connectTimeout, sizeof(connectTimeout), error,
                          QStringLiteral("SRTO_CONNTIMEO"))
         || !setSrtOption(m_socket, SRTO_REUSEADDR, &yes, sizeof(yes), error,
-                         QStringLiteral("SRTO_REUSEADDR"))) {
+                         QStringLiteral("SRTO_REUSEADDR"))
+        || !setSrtOption(m_socket, SRTO_LINGER, &closeLinger, sizeof(closeLinger), error,
+                         QStringLiteral("SRTO_LINGER"))) {
         closeSocket();
         return false;
     }

@@ -215,18 +215,23 @@ bool NativeAacDecoder::Impl::configureTypes(const AacAdtsFrameInfo& info, QStrin
     const quint8 asc0 = quint8(((info.audioObjectType & 0x1f) << 3) | ((srIndex >> 1) & 0x07));
     const quint8 asc1 = quint8(((srIndex & 0x01) << 7) | ((info.channelCount & 0x0f) << 3));
 
-    // MF_MT_USER_DATA for the AAC decoder = the HEAACWAVEINFO tail after WAVEFORMATEX:
-    //   WORD wPayloadType (0 = raw AAC, no ADTS), WORD wAudioProfileLevelIndication (0xFE
-    //   = unknown), WORD wStructType (0), followed by the AudioSpecificConfig bytes.
-    std::array<BYTE, 8> userData{};
+    // MF_MT_USER_DATA for the AAC decoder = the HEAACWAVEINFO tail after WAVEFORMATEX,
+    // followed by AudioSpecificConfig bytes.
+    std::array<BYTE, 14> userData{};
     userData[0] = 0x00; // wPayloadType lo (0 = raw AAC stream; we strip the ADTS header)
     userData[1] = 0x00; // wPayloadType hi
     userData[2] = 0xFE; // wAudioProfileLevelIndication lo (0xFE = unspecified)
     userData[3] = 0x00; // wAudioProfileLevelIndication hi
     userData[4] = 0x00; // wStructType lo
     userData[5] = 0x00; // wStructType hi
-    userData[6] = asc0; // AudioSpecificConfig byte 0
-    userData[7] = asc1; // AudioSpecificConfig byte 1
+    userData[6] = 0x00; // wReserved1 lo
+    userData[7] = 0x00; // wReserved1 hi
+    userData[8] = 0x00; // dwReserved2 byte 0
+    userData[9] = 0x00; // dwReserved2 byte 1
+    userData[10] = 0x00; // dwReserved2 byte 2
+    userData[11] = 0x00; // dwReserved2 byte 3
+    userData[12] = asc0; // AudioSpecificConfig byte 0
+    userData[13] = asc1; // AudioSpecificConfig byte 1
 
     ComPtr<IMFMediaType> inputType;
     HRESULT hr = MFCreateMediaType(&inputType);
@@ -248,6 +253,9 @@ bool NativeAacDecoder::Impl::configureTypes(const AacAdtsFrameInfo& info, QStrin
     if (SUCCEEDED(hr)) {
         // 0 = raw AAC (the MFT input is stripped of the ADTS header). 1 = ADTS.
         hr = inputType->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = inputType->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0xFE);
     }
     if (SUCCEEDED(hr)) {
         hr = inputType->SetBlob(MF_MT_USER_DATA, userData.data(), UINT32(userData.size()));

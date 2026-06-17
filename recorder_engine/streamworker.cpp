@@ -67,6 +67,12 @@ void debugTimestamp(const QString& prefix, int trackIndex) {
 void StreamWorker::stop() {
     m_restartCapture = 1;
     m_captureRunning = false;
+    {
+        QMutexLocker locker(&m_sessionMutex);
+        if (m_activeSession) {
+            m_activeSession->requestStop();
+        }
+    }
     this->quit();
 }
 
@@ -375,7 +381,18 @@ void StreamWorker::captureLoop() {
             break;
         }
 
+        {
+            QMutexLocker locker(&m_sessionMutex);
+            m_activeSession = session.get();
+        }
+
         if (!session->open(sourceUrl, callbacks)) {
+            {
+                QMutexLocker locker(&m_sessionMutex);
+                if (m_activeSession == session.get()) {
+                    m_activeSession = nullptr;
+                }
+            }
             const IngestFailureKind failureKind = session->lastFailureKind();
             if (nativeRtmpAttempt && shouldStopNativeRtmpAfterFailure(failureKind)) {
                 qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
@@ -412,6 +429,12 @@ void StreamWorker::captureLoop() {
         }
 
         session->run();
+        {
+            QMutexLocker locker(&m_sessionMutex);
+            if (m_activeSession == session.get()) {
+                m_activeSession = nullptr;
+            }
+        }
 
         setConnected(false);
         const IngestFailureKind failureKind = session->lastFailureKind();

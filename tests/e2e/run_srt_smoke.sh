@@ -14,10 +14,16 @@ HARNESS="${1:?record_harness executable path required}"
 SRT_PORT="${2:-23501}"
 UDP_PORT=$((SRT_PORT + 1))
 SECONDS_TO_RECORD=6
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# shellcheck source=tool_env.sh
+. "$HERE/tool_env.sh"
+olr_prepend_built_tool_paths
 
 command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
 command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
 command -v srt-live-transmit >/dev/null || { echo "SKIP: srt-live-transmit not found (brew install srt)"; exit 0; }
+olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 0; }
 
 WORKDIR="$(mktemp -d)"
 PIDS=()
@@ -31,7 +37,7 @@ echo "[srt-e2e] srt_port=$SRT_PORT udp_port=$UDP_PORT"
 ffmpeg -hide_banner -loglevel error -re \
     -f lavfi -i "testsrc2=size=640x480:rate=30" \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000" -ac 2 \
-    -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+    "${OLR_H264_VCODEC_ARGS[@]}" \
     -c:a aac -b:a 128k \
     -f mpegts "udp://127.0.0.1:${UDP_PORT}?pkt_size=1316" &
 PIDS+=($!)

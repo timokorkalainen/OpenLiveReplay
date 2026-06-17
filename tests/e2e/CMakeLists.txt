@@ -6,6 +6,23 @@ qt_add_executable(record_harness record_harness.cpp)
 target_link_libraries(record_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
+set(OLR_E2E_BASH bash)
+set(_olr_windows_tool_env)
+if(WIN32)
+    find_program(OLR_GIT_BASH
+        NAMES bash.exe bash
+        HINTS "C:/Program Files/Git/bin" "C:/Program Files/Git/usr/bin")
+    if(OLR_GIT_BASH)
+        set(OLR_E2E_BASH "${OLR_GIT_BASH}")
+    endif()
+    get_filename_component(_olr_mingw_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    list(APPEND _olr_windows_tool_env
+        "OLR_FFMPEG_ROOT=${OLR_FFMPEG_ROOT}"
+        "OLR_SRT_ROOT=${OLR_SRT_ROOT}"
+        "OLR_MINGW_BIN=${_olr_mingw_bin}"
+        "OLR_QT_BIN=$<TARGET_FILE_DIR:Qt6::Core>")
+endif()
+
 # Headless playback harness: drives the real PlaybackWorker against a recorded
 # fixture and prints its telemetry counters. The storm-regression gate.
 qt_add_executable(play_harness play_harness.cpp)
@@ -127,15 +144,15 @@ set_tests_properties(e2e_av_lipsync PROPERTIES
 # CI's e2e selection. Run locally with: ctest -L native-apple-ingest (macOS).
 function(olr_add_native_srt_e2e_tests native_label)
     add_test(NAME e2e_native_srt_smoke
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_smoke.sh" "$<TARGET_FILE:record_harness>" 23601)
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_smoke.sh" "$<TARGET_FILE:record_harness>" 23601)
     add_test(NAME e2e_native_srt_4cam
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_4cam.sh" "$<TARGET_FILE:sync_harness>" 23610)
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_4cam.sh" "$<TARGET_FILE:sync_harness>" 23610)
     add_test(NAME e2e_native_srt_sync
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_sync.sh" "$<TARGET_FILE:sync_harness>" 23620)
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_sync.sh" "$<TARGET_FILE:sync_harness>" 23620)
     add_test(NAME e2e_native_srt_trim
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_trim.sh" "$<TARGET_FILE:sync_harness>" 23630)
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_trim.sh" "$<TARGET_FILE:sync_harness>" 23630)
     add_test(NAME e2e_native_srt_connect
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_connect.sh" "$<TARGET_FILE:sync_harness>" 23640)
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_connect.sh" "$<TARGET_FILE:sync_harness>" 23640)
     set_tests_properties(
         e2e_native_srt_smoke e2e_native_srt_4cam e2e_native_srt_sync
         e2e_native_srt_trim e2e_native_srt_connect
@@ -143,6 +160,12 @@ function(olr_add_native_srt_e2e_tests native_label)
         LABELS "${native_label}"
         TIMEOUT 180
         RUN_SERIAL TRUE)
+    if(WIN32 AND _olr_windows_tool_env)
+        set_tests_properties(
+            e2e_native_srt_smoke e2e_native_srt_4cam e2e_native_srt_sync
+            e2e_native_srt_trim e2e_native_srt_connect
+            PROPERTIES ENVIRONMENT "${_olr_windows_tool_env}")
+    endif()
 endfunction()
 
 if(APPLE)
@@ -222,11 +245,12 @@ if(APPLE)
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")
     add_test(NAME e2e_native_srt_hevc_smoke
-        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
     set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
         LABELS "native-windows-hevc"
         TIMEOUT 180
-        RUN_SERIAL TRUE)
+        RUN_SERIAL TRUE
+        ENVIRONMENT "${_olr_windows_tool_env}")
 endif()
 
 # --- Local-only native RTMP e2e (NOT in CI) --------------------------------
@@ -294,4 +318,13 @@ if(APPLE)
         TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
+elseif(WIN32)
+    add_test(NAME e2e_native_rtmp_smoke
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+    set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "${_olr_windows_tool_env}")
 endif()

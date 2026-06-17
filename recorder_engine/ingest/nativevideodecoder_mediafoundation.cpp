@@ -9,6 +9,7 @@
 
 #include <QByteArray>
 #include <QStringList>
+#include <QtGlobal>
 
 #include <algorithm>
 #include <array>
@@ -50,6 +51,11 @@ bool isSupportedCodec(NativeVideoCodec codec) {
     return codec == NativeVideoCodec::H264 || codec == NativeVideoCodec::Hevc;
 }
 
+bool environmentFlagEnabled(const char* name) {
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return !value.isEmpty() && value != "0" && value != "false" && value != "no";
+}
+
 QString codecName(NativeVideoCodec codec) {
     if (codec == NativeVideoCodec::Hevc) {
         return QStringLiteral("HEVC");
@@ -63,6 +69,14 @@ QString decoderUnavailableMessage(NativeVideoCodec codec) {
             "Windows HEVC decoder is unavailable; install Windows HEVC media support or use FFmpeg fallback");
     }
     return QStringLiteral("Media Foundation H.264 decoder is unavailable");
+}
+
+DWORD decoderEnumFlags() {
+    DWORD flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT;
+    if (environmentFlagEnabled("OLR_MF_VIDEO_ENABLE_HARDWARE")) {
+        flags |= MFT_ENUM_FLAG_HARDWARE;
+    }
+    return flags;
 }
 
 QString hrMessage(const QString& action, HRESULT hr) {
@@ -117,8 +131,7 @@ bool mftAvailable(REFGUID subtype) {
     UINT32 count = 0;
     const HRESULT hr = MFTEnumEx(
         MFT_CATEGORY_VIDEO_DECODER,
-        MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT
-            | MFT_ENUM_FLAG_HARDWARE,
+        decoderEnumFlags(),
         &input,
         nullptr,
         &activates,
@@ -425,8 +438,7 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
         count = 0;
         hr = MFTEnumEx(
             MFT_CATEGORY_VIDEO_DECODER,
-            MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT
-                | MFT_ENUM_FLAG_HARDWARE,
+            decoderEnumFlags(),
             &input,
             nullptr,
             &activates,
@@ -495,14 +507,16 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
         }
     }
 
-    hr = transform->ProcessMessage(
-        MFT_MESSAGE_SET_D3D_MANAGER,
-        ULONG_PTR(deviceManager.Get()));
-    if (FAILED(hr)) {
-        if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation decoder D3D manager setup failed"), hr);
+    if (deviceManager) {
+        hr = transform->ProcessMessage(
+            MFT_MESSAGE_SET_D3D_MANAGER,
+            ULONG_PTR(deviceManager.Get()));
+        if (FAILED(hr)) {
+            if (error) {
+                *error = hrMessage(QStringLiteral("Media Foundation decoder D3D manager setup failed"), hr);
+            }
+            return false;
         }
-        return false;
     }
     return true;
 }
@@ -615,7 +629,9 @@ bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, Q
     }
 
     reset();
-    if (!ensureRuntime(error) || !createD3D(error) || !createTransform(unit.codec, error)
+    if (!ensureRuntime(error)
+        || (environmentFlagEnabled("OLR_MF_VIDEO_ENABLE_D3D") && !createD3D(error))
+        || !createTransform(unit.codec, error)
         || !configureTypes(unit.codec, error)) {
         reset();
         return false;
