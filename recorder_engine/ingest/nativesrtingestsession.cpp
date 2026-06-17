@@ -1,6 +1,8 @@
 #include "nativesrtingestsession.h"
 
 #include "nativesrtaddress.h"
+#include "nativesrtconnectdiagnostics.h"
+#include "nativesrturloptions.h"
 
 #include <QDebug>
 #include <QThread>
@@ -72,6 +74,19 @@ bool isAsyncReceivePending() {
     const int code = srt_getlasterror(&osError);
     Q_UNUSED(osError);
     return code == SRT_EASYNCRCV;
+}
+
+QString srtConnectFailureDetails(SRTSOCKET socket) {
+    int osError = 0;
+    const int code = srt_getlasterror(&osError);
+    Q_UNUSED(osError);
+    const QString lastError = QString::fromUtf8(srt_getlasterror_str());
+    const int rejectReason = srt_getrejectreason(socket);
+    const char* rejectReasonText =
+        rejectReason == SRT_REJ_UNKNOWN ? nullptr : srt_rejectreason_str(rejectReason);
+    return nativeSrtConnectFailureMessage(
+        code, lastError, rejectReason,
+        rejectReasonText ? QString::fromUtf8(rejectReasonText) : QString());
 }
 
 int findAlignedSyncOffset(const QByteArray& bytes) {
@@ -285,6 +300,15 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         return false;
     }
 
+    const NativeSrtUrlOptions urlOptions = nativeSrtUrlOptionsFromUrl(m_url);
+    const QByteArray streamIdUtf8 = urlOptions.streamId.toUtf8();
+    if (!streamIdUtf8.isEmpty() &&
+        !setSrtOption(m_socket, SRTO_STREAMID, streamIdUtf8.constData(), int(streamIdUtf8.size()),
+                      error, QStringLiteral("SRTO_STREAMID"))) {
+        closeSocket();
+        return false;
+    }
+
     NativeSrtSockaddr address;
     if (!nativeSrtMakeIpv4Sockaddr(m_url.host(), quint16(m_url.port(9000)), &address)) {
         if (error) {
@@ -302,7 +326,7 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         if (code != SRT_EASYNCSND) {
             if (error) {
                 *error = QStringLiteral("Native SRT connect failed: %1")
-                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+                             .arg(srtConnectFailureDetails(m_socket));
             }
             closeSocket();
             return false;
@@ -319,7 +343,7 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         if (state == SRTS_BROKEN || state == SRTS_NONEXIST || state == SRTS_CLOSED) {
             if (error) {
                 *error = QStringLiteral("Native SRT connect failed: %1")
-                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+                             .arg(srtConnectFailureDetails(m_socket));
             }
             closeSocket();
             return false;

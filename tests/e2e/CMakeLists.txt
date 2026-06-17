@@ -35,6 +35,22 @@ qt_add_executable(sync_harness sync_harness.cpp)
 target_link_libraries(sync_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
+if(APPLE OR WIN32)
+    # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
+    # before connect by reading the stream ID from a real accepted SRT socket.
+    qt_add_executable(srt_streamid_harness srt_streamid_harness.cpp)
+    target_link_libraries(srt_streamid_harness PRIVATE
+        Qt6::Core olr_test_engine olr_warnings olr_sanitize)
+    if(APPLE)
+        target_include_directories(srt_streamid_harness PRIVATE "${OLR_BREW_PREFIX}/opt/srt/include")
+        target_link_directories(srt_streamid_harness PRIVATE "${OLR_BREW_PREFIX}/opt/srt/lib")
+        target_link_libraries(srt_streamid_harness PRIVATE srt)
+    elseif(WIN32)
+        target_include_directories(srt_streamid_harness PRIVATE "${OLR_SRT_INCLUDE_DIR}")
+        target_link_libraries(srt_streamid_harness PRIVATE ws2_32 "${OLR_SRT_LIBRARY}")
+    endif()
+endif()
+
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
 set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
 
@@ -153,9 +169,11 @@ function(olr_add_native_srt_e2e_tests native_label)
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_trim.sh" "$<TARGET_FILE:sync_harness>" 23630)
     add_test(NAME e2e_native_srt_connect
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_connect.sh" "$<TARGET_FILE:sync_harness>" 23640)
+    add_test(NAME e2e_native_srt_streamid
+        COMMAND "$<TARGET_FILE:srt_streamid_harness>" 23650)
     set_tests_properties(
         e2e_native_srt_smoke e2e_native_srt_4cam e2e_native_srt_sync
-        e2e_native_srt_trim e2e_native_srt_connect
+        e2e_native_srt_trim e2e_native_srt_connect e2e_native_srt_streamid
         PROPERTIES
         LABELS "${native_label}"
         TIMEOUT 180
@@ -163,7 +181,7 @@ function(olr_add_native_srt_e2e_tests native_label)
     if(WIN32 AND _olr_windows_tool_env)
         set_tests_properties(
             e2e_native_srt_smoke e2e_native_srt_4cam e2e_native_srt_sync
-            e2e_native_srt_trim e2e_native_srt_connect
+            e2e_native_srt_trim e2e_native_srt_connect e2e_native_srt_streamid
             PROPERTIES ENVIRONMENT "${_olr_windows_tool_env}")
     endif()
 endfunction()
