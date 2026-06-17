@@ -18,8 +18,8 @@
 #                   recovers loss well past 60%; ~88% reliably exhausts the retransmit
 #                   budget so packets are finally dropped (gap >=2s).
 #
-# Requires sync_harness built with -DOLR_FFMPEG_SRT_PREFIX; native ingest via
-# OLR_NATIVE_SRT=1 (set by the CTest registration). Usage: run_srt_loss.sh <harness> [base]
+# Records over the native SRT ingest (the default, and only, SRT ingest); no
+# SRT-enabled ffmpeg build is needed. Usage: run_srt_loss.sh <harness> [base]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=srt_lib.sh

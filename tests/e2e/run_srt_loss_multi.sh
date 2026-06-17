@@ -9,8 +9,8 @@
 # libsrt socket, and the only SRT mutex guards startup/cleanup (not srt_recv), so
 # isolation is structural.
 #
-# Requires sync_harness built with -DOLR_FFMPEG_SRT_PREFIX; native ingest via
-# OLR_NATIVE_SRT=1 (set by the CTest registration). Usage: run_srt_loss_multi.sh <harness> [base]
+# Records over the native SRT ingest (the default, and only, SRT ingest); no
+# SRT-enabled ffmpeg build is needed. Usage: run_srt_loss_multi.sh <harness> [base]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=srt_lib.sh

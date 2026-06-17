@@ -14,7 +14,8 @@
 # Teeth demo: OLR_SRT_SYNC_DROP_VIEW=<i> skips view i's bridge so that view records
 #   no flash and Gate A FAILS — proving the content gate discriminates.
 #
-# Requires sync_harness built with -DOLR_FFMPEG_SRT_PREFIX (an SRT-enabled avformat).
+# The engine ingests srt:// over its native SRT path — no SRT-enabled ffmpeg build
+# is needed.
 # Usage: run_srt_sync.sh <sync_harness_exe> [base_port]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -60,7 +61,7 @@ RC=$?
 MKV="$(printf '%s\n' "$OUT" | tail -n 1)"
 echo "[srt-sync] harness rc=$RC out=$MKV"
 if [ $RC -ne 0 ] || [ -z "$MKV" ] || [ ! -s "$MKV" ]; then
-    echo "FAIL: no output (rc=$RC) — engine could not record SRT (built with -DOLR_FFMPEG_SRT_PREFIX?)"; exit 1
+    echo "FAIL: no output (rc=$RC) — engine could not record SRT over the native SRT path"; exit 1
 fi
 
 VTRACKS="$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 "$MKV" | wc -l | tr -d ' ')"

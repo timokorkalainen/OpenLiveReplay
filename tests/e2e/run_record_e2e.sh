@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # End-to-end recording test driver.
 #
-# 1. Streams a synthetic live A/V source over UDP MPEG-TS with FFmpeg.
-# 2. Runs the headless record_harness against it for a fixed duration.
+# 1. Streams a synthetic live A/V source over UDP MPEG-TS with FFmpeg, then
+#    bridges it to an SRT listener (srt-live-transmit) so the engine ingests it
+#    over its native srt:// transport (the only ingest path now — udp:// is no
+#    longer accepted).
+# 2. Runs the headless record_harness as an SRT CALLER for a fixed duration.
 # 3. Probes the produced .mkv with ffprobe and asserts structural correctness:
 #       - video + audio streams exist
 #       - output audio is stereo (mono inputs MUST be rematrixed up, not crash)
@@ -17,46 +20,50 @@
 #   stereo  synthetic stereo sine  -> baseline happy path
 #   mono    synthetic mono   sine  -> regression for the mono-audio SIGBUS crash
 #
-# Usage: run_record_e2e.sh <harness_exe> <stereo|mono> [udp_port]
+# Usage: run_record_e2e.sh <harness_exe> <stereo|mono> [srt_port]
 set -uo pipefail
 
 HARNESS="${1:?harness executable path required}"
 MODE="${2:-stereo}"
-PORT="${3:-23456}"
+SRT_PORT="${3:-23456}"
+UDP_PORT=$((SRT_PORT + 1))
 SECONDS_TO_RECORD=6
 
-command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
-command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
+# shellcheck source=tests/e2e/srt_lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
+srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
 
 if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
 
 WORKDIR="$(mktemp -d)"
-FFPID=""
+PIDS=()
 cleanup() {
-    [ -n "$FFPID" ] && kill "$FFPID" 2>/dev/null
-    wait "$FFPID" 2>/dev/null
+    (( ${#PIDS[@]} )) && kill "${PIDS[@]}" 2>/dev/null
+    wait 2>/dev/null
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
-echo "[e2e] mode=$MODE channels=$CH port=$PORT"
+echo "[e2e] mode=$MODE channels=$CH srt_port=$SRT_PORT udp_port=$UDP_PORT"
 
 is_num() { case "${1:-}" in '' | *[!0-9.]*) return 1 ;; *) return 0 ;; esac; }
 
 # --- 1. Producer: synthetic live stream (testsrc2 video + sine audio) --------
-# h264 video + aac audio in MPEG-TS over UDP, paced in real time (-re).
+# h264 video + aac audio in MPEG-TS over UDP, paced in real time (-re), bridged
+# to an SRT listener by srt-live-transmit so the engine ingests over srt://.
 ffmpeg -hide_banner -loglevel error -re \
     -f lavfi -i "testsrc2=size=640x480:rate=30" \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
     -ac "$CH" \
     -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
     -c:a aac -b:a 128k \
-    -f mpegts "udp://127.0.0.1:${PORT}?pkt_size=1316" &
-FFPID=$!
-sleep 0.5 # let the producer come up before the consumer binds
+    -f mpegts "udp://127.0.0.1:${UDP_PORT}?pkt_size=1316" &
+PIDS+=($!)
+srt_bridge "$UDP_PORT" "$SRT_PORT"  # UDP MPEG-TS -> SRT listener
+sleep 1.0 # let the producer + SRT listener come up before the caller connects
 
-# --- 2. Consumer: the real recording engine ----------------------------------
-URL="udp://127.0.0.1:${PORT}?fifo_size=1000000&overrun_nonfatal=1"
+# --- 2. Consumer: the real recording engine (native SRT caller) --------------
+URL="$(srt_caller_url "$SRT_PORT")"
 HARNESS_OUT="$("$HARNESS" --url "$URL" --name "olr_e2e_${MODE}" --outdir "$WORKDIR" \
     --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30)"
 HARNESS_RC=$?
@@ -100,7 +107,7 @@ if [ "${A_CHANNELS:-}" != "2" ]; then
     fail=1
 fi
 
-# Frame count: at least half the nominal fps*seconds (UDP warm-up + CI jitter).
+# Frame count: at least half the nominal fps*seconds (SRT warm-up + CI jitter).
 # A non-numeric value (e.g. ffprobe 'N/A' from a truncated file) is a failure.
 MIN_FRAMES=$((30 * SECONDS_TO_RECORD / 2))
 if ! is_num "${V_PACKETS:-}" || [ "${V_PACKETS%.*}" -lt "$MIN_FRAMES" ]; then

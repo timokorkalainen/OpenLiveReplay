@@ -155,7 +155,7 @@ bool NativeAacDecoder::Impl::decodeAdtsFrame(const QByteArray& frame,
     pcmS16Stereo->clear();
     if (info.audioObjectType != 2) {
         if (error) {
-            *error = QStringLiteral("Native SRT AAC profile %1 is unsupported.")
+            *error = QStringLiteral("Native AAC profile %1 is unsupported.")
                          .arg(info.audioObjectType);
         }
         return false;
@@ -167,7 +167,7 @@ bool NativeAacDecoder::Impl::decodeAdtsFrame(const QByteArray& frame,
     const int payloadSize = info.frameSize - info.headerSize;
     if (payloadSize <= 0 || info.headerSize < 0 || info.headerSize + payloadSize > frame.size()) {
         if (error) {
-            *error = QStringLiteral("Native SRT AAC ADTS frame is malformed.");
+            *error = QStringLiteral("Native AAC ADTS frame is malformed.");
         }
         return false;
     }

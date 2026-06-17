@@ -4,8 +4,8 @@
 # Stands up an SRT LISTENER carrying a flash/beep MPEG-TS via the brew ffmpeg
 # (UDP) + the already-installed srt-live-transmit (UDP->SRT). record_harness
 # connects as an SRT CALLER (the engine's default) and we assert the MKV is
-# valid. Requires the harness to be built with -DOLR_FFMPEG_SRT_PREFIX (i.e. an
-# SRT-enabled avformat); otherwise the engine cannot open srt:// and this FAILS.
+# valid. The engine ingests srt:// over its native SRT path (the default, and
+# only, SRT ingest) — no SRT-enabled ffmpeg build is needed.
 #
 # Usage: run_srt_smoke.sh <record_harness_exe> [srt_port]
 set -uo pipefail
@@ -49,7 +49,7 @@ OUT_MKV="$(printf '%s\n' "$OUT" | tail -n 1)"
 echo "[srt-e2e] harness rc=$RC out=$OUT_MKV"
 
 if [ $RC -ne 0 ] || [ -z "$OUT_MKV" ] || [ ! -s "$OUT_MKV" ]; then
-    echo "FAIL: SRT ingest produced no output (rc=$RC) — engine could not record srt:// (is the harness built with -DOLR_FFMPEG_SRT_PREFIX?)"
+    echo "FAIL: SRT ingest produced no output (rc=$RC) — engine could not record srt:// over the native SRT path"
     exit 1
 fi
 

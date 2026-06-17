@@ -3,8 +3,8 @@
 # correctly — view i carries camera i's content. Each camera emits a distinct
 # audio tone (camera i = (i+1)*1000 Hz); we detect each recorded view's dominant
 # tone and assert it matches that camera. A view from a source that failed to
-# connect is blue-fill SILENCE (no dominant tone) and FAILS. Requires sync_harness
-# built with -DOLR_FFMPEG_SRT_PREFIX (an SRT-enabled avformat).
+# connect is blue-fill SILENCE (no dominant tone) and FAILS. The engine ingests
+# srt:// over its native SRT path — no SRT-enabled ffmpeg build is needed.
 #
 # Teeth-check: set OLR_SRT4_EXPECT_SHIFT=1 to rotate the EXPECTED mapping (view i
 # expects camera i+1); a correctly-routed recording then FAILS, proving the
@@ -54,7 +54,7 @@ RC=$?
 OUT_MKV="$(printf '%s\n' "$OUT" | tail -n 1)"
 echo "[srt-4cam] harness rc=$RC out=$OUT_MKV"
 if [ $RC -ne 0 ] || [ -z "$OUT_MKV" ] || [ ! -s "$OUT_MKV" ]; then
-    echo "FAIL: no output (rc=$RC) — engine could not record the SRT sources (sync_harness built with -DOLR_FFMPEG_SRT_PREFIX?)"
+    echo "FAIL: no output (rc=$RC) — engine could not record the SRT sources over the native SRT path"
     exit 1
 fi
 

@@ -5,7 +5,9 @@
 # 1. Streams a synthetic A/V source over UDP MPEG-TS with FFmpeg (a black frame
 #    flashing white at integer seconds + a 1kHz beep gated to the first 100ms of
 #    each second — a visually/audibly checkable timecode; a plain testsrc+sine
-#    is fine too, the storm metric only needs valid A/V).
+#    is fine too, the storm metric only needs valid A/V), then bridges it over
+#    UDP->SRT (srt-live-transmit) so the engine records it via its native srt://
+#    transport (the only ingest path now — udp:// is no longer accepted).
 # 2. Records a multi-track fixture via the headless record_harness (OLR_VIEWS
 #    controls the track count).
 # 3. Stops the sender, then runs play_harness <fixture> <scenario> <views> and
@@ -18,19 +20,22 @@
 # Hermetic: the fixture is recorded into a per-run temp dir (--outdir) and the
 # whole dir is removed on exit.
 #
-# Usage: run_playback_e2e.sh <play_harness_exe> <record_harness_exe> <scenario> <views> [port]
+# Usage: run_playback_e2e.sh <play_harness_exe> <record_harness_exe> <scenario> <views> [srt_port]
 set -uo pipefail
 
 PLAY="${1:?play_harness executable path required}"
 RECORD="${2:?record_harness executable path required}"
 SCENARIO="${3:-play1x}"
 VIEWS="${4:-2}"
-# Port: explicit 5th arg wins (CTest passes a unique port per case so the
-# RUN_SERIAL tests never share a UDP socket), else OLR_PB_PORT, else default.
-PORT="${5:-${OLR_PB_PORT:-23470}}"
+# Port: explicit 5th arg wins (CTest passes a unique SRT port per case so the
+# RUN_SERIAL tests never share a socket), else OLR_PB_PORT, else default. The UDP
+# producer port is derived as SRT_PORT+1.
+SRT_PORT="${5:-${OLR_PB_PORT:-23470}}"
+UDP_PORT=$((SRT_PORT + 1))
 
-command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
-command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
+# shellcheck source=tests/e2e/srt_lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
+srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
 
 # Record long enough that every scenario's playback window stays inside the
 # fixture (play1x plays ~12s from t=0; liveedge/seekplay reach ~mid/late).
@@ -38,14 +43,16 @@ SECONDS_TO_RECORD=25
 
 WORKDIR="$(mktemp -d)"
 FFPID=""
+BRIDGE_PID=""
 cleanup() {
     [ -n "$FFPID" ] && kill "$FFPID" 2>/dev/null
-    wait "$FFPID" 2>/dev/null
+    [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
+    wait "$FFPID" "$BRIDGE_PID" 2>/dev/null
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
-echo "[pb-e2e] scenario=$SCENARIO views=$VIEWS port=$PORT record=${SECONDS_TO_RECORD}s"
+echo "[pb-e2e] scenario=$SCENARIO views=$VIEWS srt_port=$SRT_PORT udp_port=$UDP_PORT record=${SECONDS_TO_RECORD}s"
 
 # --- 1. Producer: synthetic flash/beep timecode source -----------------------
 # Video: black, flashed white during the first 60ms of each integer second.
@@ -61,7 +68,7 @@ start_producer() {
         -ac 2 \
         -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
         -c:a aac -b:a 128k \
-        -f mpegts "udp://127.0.0.1:${PORT}?pkt_size=1316" &
+        -f mpegts "udp://127.0.0.1:${UDP_PORT}?pkt_size=1316" &
     FFPID=$!
 }
 
@@ -75,16 +82,24 @@ if ! kill -0 "$FFPID" 2>/dev/null; then
     sleep 0.5
 fi
 
+# Bridge the UDP MPEG-TS to an SRT listener so the engine ingests over srt://.
+PIDS=()
+srt_bridge "$UDP_PORT" "$SRT_PORT"
+BRIDGE_PID=$SRT_LAST_PID
+sleep 1.0  # let the SRT listener come up before the caller connects
+
 # --- 2. Record a multi-track fixture -----------------------------------------
-URL="udp://127.0.0.1:${PORT}?fifo_size=1000000&overrun_nonfatal=1"
+URL="$(srt_caller_url "$SRT_PORT")"
 REC_OUT="$(OLR_VIEWS="$VIEWS" "$RECORD" --url "$URL" --name "olr_pb_${SCENARIO}" \
     --outdir "$WORKDIR" --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30)"
 REC_RC=$?
 
-# Stop the sender as soon as the fixture is recorded.
+# Stop the sender + SRT bridge as soon as the fixture is recorded.
 [ -n "$FFPID" ] && kill "$FFPID" 2>/dev/null
-wait "$FFPID" 2>/dev/null
+[ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null
+wait "$FFPID" "$BRIDGE_PID" 2>/dev/null
 FFPID=""
+BRIDGE_PID=""
 
 if [ $REC_RC -ne 0 ]; then
     echo "FAIL: record_harness exited $REC_RC"

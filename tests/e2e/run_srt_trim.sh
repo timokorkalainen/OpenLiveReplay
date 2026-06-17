@@ -12,7 +12,8 @@
 # Measuring the run-to-run DIFFERENCE cancels any systematic per-view connect-order
 # bias, leaving only arrival jitter (which TOL_MS covers).
 #
-# Requires sync_harness built with -DOLR_FFMPEG_SRT_PREFIX.
+# The engine ingests srt:// over its native SRT path — no SRT-enabled ffmpeg build
+# is needed.
 # Usage: run_srt_trim.sh <sync_harness_exe> [base_port]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

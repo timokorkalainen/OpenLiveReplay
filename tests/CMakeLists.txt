@@ -57,19 +57,6 @@ else()
     set(OLR_FFMPEG_SWSCALE_LIBRARY swscale)
     set(OLR_FFMPEG_SWRESAMPLE_LIBRARY swresample)
     message(STATUS "OpenLiveReplay tests: FFmpeg prefix = ${OLR_BREW_PREFIX}")
-
-    # Opt-in: link the test engine + harnesses against a libsrt-enabled ffmpeg built
-    # by build-scripts/build_ffmpeg_macos_srt.sh, so the local SRT e2e can ingest
-    # srt://. Default unset -> brew ffmpeg, so CI and the UDP gates are unaffected.
-    set(OLR_FFMPEG_SRT_PREFIX "" CACHE PATH "Path to a libsrt-enabled ffmpeg install (local SRT e2e)")
-    if(OLR_FFMPEG_SRT_PREFIX)
-        set(OLR_FFMPEG_INCLUDE "${OLR_FFMPEG_SRT_PREFIX}/include")
-        set(OLR_FFMPEG_LIBDIR  "${OLR_FFMPEG_SRT_PREFIX}/lib")
-        # The ffmpeg dylibs use @rpath install names; give every test executable an
-        # rpath to the SRT lib dir so they resolve at runtime (no DYLD_LIBRARY_PATH).
-        list(APPEND CMAKE_BUILD_RPATH "${OLR_FFMPEG_LIBDIR}")
-        message(STATUS "OpenLiveReplay tests: SRT ffmpeg prefix = ${OLR_FFMPEG_SRT_PREFIX}")
-    endif()
 endif()
 
 if(WIN32)

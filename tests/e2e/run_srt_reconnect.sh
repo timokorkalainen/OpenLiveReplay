@@ -9,10 +9,10 @@
 # (c) the control source src0 is FULLY ISOLATED — no mid-record disconnect and no
 # content loss.
 #
-# (c) holds on the NATIVE SRT ingest (OLR_NATIVE_SRT=1), where each source owns its
-# libsrt socket. The legacy ffmpeg ingest instead COUPLES sources: a dead source's
-# avformat reconnect churn monopolizes libsrt's global receive thread and starves
-# the others (~2s content loss each), so this gate runs on the native path.
+# (c) holds on the native SRT ingest, where each source owns its libsrt socket. The
+# now-removed legacy ffmpeg ingest instead COUPLED sources: a dead source's avformat
+# reconnect churn monopolized libsrt's global receive thread and starved the others
+# (~2s content loss each) — that coupling motivated the native ingest this gate uses.
 #
 # The outage MUST exceed the engine's ~8s stall window: disconnect is detected via
 # the stall timeout / 5s rw_timeout, and the SRT recv buffer keeps draining buffered
@@ -22,8 +22,8 @@
 # Teeth: OLR_SRT_RECONN_NO_RESTART=1 skips the restart -> src1 never reconnects ->
 # no second 'up' and no late flashes -> FAIL, proving the gate discriminates.
 #
-# Requires sync_harness built with -DOLR_FFMPEG_SRT_PREFIX; selects the native
-# ingest via OLR_NATIVE_SRT=1 (set by the CTest registration).
+# Records over the native SRT ingest (the default, and only, SRT ingest); no
+# SRT-enabled ffmpeg build is needed.
 # Usage: run_srt_reconnect.sh <sync_harness_exe> [base_port]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -89,7 +89,7 @@ echo "[srt-reconn] out=$MKV"
 echo "[srt-reconn] conn_events:"; grep '^conn_events' "$WORKDIR/err.txt" || echo "  (none)"
 
 if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then
-    echo "FAIL: no output MKV (engine could not record — built with -DOLR_FFMPEG_SRT_PREFIX?)"; exit 1
+    echo "FAIL: no output MKV (engine could not record over the native SRT path)"; exit 1
 fi
 VTRACKS="$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 "$MKV" | wc -l | tr -d ' ')"
 if [ "${VTRACKS:-0}" != "2" ]; then echo "FAIL: expected 2 video tracks, got ${VTRACKS:-0}"; exit 1; fi
