@@ -203,9 +203,12 @@ NdiOutputSink::~NdiOutputSink() {
 
 bool NdiOutputSink::start(const OutputTargetAssignment& assignment, FrameRate rate) {
     stop();
-    m_status.framesSubmitted = 0;
-    m_status.sendFailures = 0;
-    m_status.lastFrameIdentity = OutputFrameIdentity();
+    {
+        QMutexLocker locker(&m_statusMutex);
+        m_status.framesSubmitted = 0;
+        m_status.sendFailures = 0;
+        m_status.lastFrameIdentity = OutputFrameIdentity();
+    }
 
     if (!m_backend || assignment.kind != OutputTargetKind::Ndi || !assignment.enabled ||
         !rate.isValid()) {
@@ -246,25 +249,74 @@ void NdiOutputSink::stop() {
 
 bool NdiOutputSink::submit(const OutputBusFrame& frame) {
     if (!m_active || !m_backend) return false;
-    m_status.lastFrameIdentity = outputFrameIdentityFor(frame);
+    {
+        QMutexLocker locker(&m_statusMutex);
+        m_status.lastFrameIdentity = outputFrameIdentityFor(frame);
+    }
     if (!hasSendableBroadcastAudio(frame.audio)) {
-        m_status.sendFailures++;
+        {
+            QMutexLocker locker(&m_statusMutex);
+            m_status.sendFailures++;
+        }
         setStatus(NdiOutputState::SendFailed,
                   QStringLiteral("failed to send NDI frame: missing broadcast audio"));
         return false;
     }
     if (!m_backend->sendFrame(frame)) {
-        m_status.sendFailures++;
+        {
+            QMutexLocker locker(&m_statusMutex);
+            m_status.sendFailures++;
+        }
         setStatus(NdiOutputState::SendFailed, QStringLiteral("failed to send NDI frame"));
         return false;
     }
-    m_status.framesSubmitted++;
+    {
+        QMutexLocker locker(&m_statusMutex);
+        m_status.framesSubmitted++;
+    }
     setStatus(NdiOutputState::Active,
               QStringLiteral("NDI sender '%1' active").arg(senderNameFor(m_assignment)));
     return true;
 }
 
+NdiOutputStatus NdiOutputSink::status() const {
+    QMutexLocker locker(&m_statusMutex);
+    return m_status;
+}
+
+OutputSinkStatus NdiOutputSink::outputStatus() const {
+    const NdiOutputStatus ndi = status();
+    OutputSinkStatus out;
+    out.acceptedFrames = ndi.framesSubmitted;
+    out.failedFrames = ndi.sendFailures;
+    out.hasLastResult = ndi.framesSubmitted > 0 || ndi.sendFailures > 0;
+    out.lastResultSucceeded = ndi.state != NdiOutputState::SendFailed;
+    switch (ndi.state) {
+    case NdiOutputState::Stopped:
+        out.state = QStringLiteral("stopped");
+        break;
+    case NdiOutputState::RuntimeUnavailable:
+        out.state = QStringLiteral("runtime-unavailable");
+        break;
+    case NdiOutputState::InvalidAssignment:
+        out.state = QStringLiteral("invalid");
+        break;
+    case NdiOutputState::CreateFailed:
+        out.state = QStringLiteral("create-failed");
+        break;
+    case NdiOutputState::Active:
+        out.state = QStringLiteral("active");
+        break;
+    case NdiOutputState::SendFailed:
+        out.state = QStringLiteral("send-failed");
+        break;
+    }
+    out.message = ndi.message;
+    return out;
+}
+
 void NdiOutputSink::setStatus(NdiOutputState state, const QString& message) {
+    QMutexLocker locker(&m_statusMutex);
     m_status.state = state;
     m_status.message = message;
 }

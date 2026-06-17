@@ -19,6 +19,8 @@ static OutputBusFrame frame(qint64 index) {
 
 class SlowCollectingSink final : public IOutputSink {
 public:
+    explicit SlowCollectingSink(bool failSubmits = false) : m_failSubmits(failSubmits) {}
+
     OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
 
     bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
@@ -41,6 +43,8 @@ public:
         QThread::msleep(120);
         QMutexLocker locker(&m_mutex);
         if (!m_active) return false;
+        m_submitAttempts++;
+        if (m_failSubmits) return false;
         m_frames.append(frame);
         return true;
     }
@@ -55,9 +59,16 @@ public:
         return m_frames;
     }
 
+    int submitAttempts() const {
+        QMutexLocker locker(&m_mutex);
+        return m_submitAttempts;
+    }
+
 private:
     mutable QMutex m_mutex;
     bool m_active = false;
+    bool m_failSubmits = false;
+    int m_submitAttempts = 0;
     QVector<OutputBusFrame> m_frames;
 };
 
@@ -65,6 +76,7 @@ class TestQueuedOutputSink : public QObject {
     Q_OBJECT
 private slots:
     void submitReturnsBeforeSlowInnerSinkCompletes();
+    void asyncInnerSubmitFailuresAreVisibleInStatus();
 };
 
 void TestQueuedOutputSink::submitReturnsBeforeSlowInnerSinkCompletes() {
@@ -87,6 +99,27 @@ void TestQueuedOutputSink::submitReturnsBeforeSlowInnerSinkCompletes() {
     QTRY_COMPARE_WITH_TIMEOUT(observed->frameCount(), 1, 500);
     const QVector<OutputBusFrame> frames = observed->frames();
     QCOMPARE(frames[0].outputFrameIndex, qint64(0));
+
+    sink.stop();
+}
+
+void TestQueuedOutputSink::asyncInnerSubmitFailuresAreVisibleInStatus() {
+    auto inner = std::make_unique<SlowCollectingSink>(true);
+    SlowCollectingSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 3);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(4)));
+
+    QTRY_COMPARE_WITH_TIMEOUT(observed->submitAttempts(), 1, 500);
+    QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().failedFrames, qint64(1), 500);
+    QVERIFY(sink.outputStatus().hasLastResult);
+    QVERIFY(!sink.outputStatus().lastResultSucceeded);
 
     sink.stop();
 }

@@ -20,6 +20,7 @@ public:
     void stop() override;
     bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
+    OutputSinkStatus outputStatus() const override;
 
     int droppedFrames() const;
 
@@ -37,6 +38,10 @@ private:
     bool m_active = false;
     bool m_stopRequested = false;
     int m_droppedFrames = 0;
+    qint64 m_asyncAcceptedFrames = 0;
+    qint64 m_asyncFailedFrames = 0;
+    bool m_hasLastAsyncResult = false;
+    bool m_lastAsyncResultSucceeded = true;
 };
 
 #endif // QUEUEDOUTPUTSINK_H
