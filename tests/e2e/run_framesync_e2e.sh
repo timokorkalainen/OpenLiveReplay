@@ -10,6 +10,8 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=srt_lib.sh
 . "$HERE/srt_lib.sh"
+# shellcheck source=ndi_lib.sh
+. "$HERE/ndi_lib.sh"
 
 HARNESS="${1:?sync_harness executable path required}"
 SCENARIO="${2:?scenario required}"
@@ -23,17 +25,33 @@ RELAY="$HERE/lossy_udp_relay.py"
 skip() { echo "SKIP: $*"; exit 77; }
 fail() { echo "FAIL: $*"; exit 1; }
 
-require_tools_77() {
+require_media_tools_77() {
     command -v ffmpeg >/dev/null || skip "ffmpeg not found"
     command -v ffprobe >/dev/null || skip "ffprobe not found"
-    command -v srt-live-transmit >/dev/null || skip "srt-live-transmit not found (brew install srt)"
     command -v python3 >/dev/null || skip "python3 not found"
 }
 
+require_srt_tools_77() {
+    require_media_tools_77
+    command -v srt-live-transmit >/dev/null || skip "srt-live-transmit not found (brew install srt)"
+}
+
 [ -x "$HARNESS" ] || fail "sync_harness not found/executable: $HARNESS"
-[ "$TRANSPORT" = "srt" ] || skip "framesync transport '$TRANSPORT' not wired yet"
-require_tools_77
-[ -f "$RELAY" ] || fail "$RELAY missing"
+case "$TRANSPORT" in
+    srt)
+        require_srt_tools_77
+        [ -f "$RELAY" ] || fail "$RELAY missing"
+        ;;
+    ndi)
+        ndi_require_tools_77
+        ;;
+    rtmp)
+        skip "framesync transport 'rtmp' not wired yet"
+        ;;
+    *)
+        skip "unknown framesync transport '$TRANSPORT'"
+        ;;
+esac
 
 WORKDIR="$(mktemp -d)"
 PIDS=()
@@ -58,10 +76,16 @@ expect_mkv() {
 
 run_lipsync() {
     local udp="$BASE" srt=$((BASE + 1)) mkv stats np mean max
-    flash_beep_tc_marker_to_udp "$udp"
-    srt_bridge "$udp" "$srt"
-    sleep 1.5
-    mkv="$(record_one "$(srt_caller_url "$srt")" framesync_lipsync)"
+    if [ "$TRANSPORT" = "ndi" ]; then
+        local prefix="OLR-FS-${SCENARIO}-$$"
+        ndi_start_marker_sender "$prefix" 1 "$((SECS + 5))" 0
+        mkv="$(record_one "$(ndi_url_for_source "$(ndi_marker_source_name "$prefix" 0)")" framesync_lipsync)"
+    else
+        flash_beep_tc_marker_to_udp "$udp"
+        srt_bridge "$udp" "$srt"
+        sleep 1.5
+        mkv="$(record_one "$(srt_caller_url "$srt")" framesync_lipsync)"
+    fi
     expect_mkv "$mkv"
 
     flash_pts_series "$mkv" 0 > "$WORKDIR/v.txt"
@@ -89,12 +113,21 @@ run_lipsync() {
 
 run_intercam() {
     local udp0="$BASE" udp1=$((BASE + 1)) srt0=$((BASE + 2)) srt1=$((BASE + 3)) mkv stats np mean max
-    flash_marker_to_udps "$udp0" "$udp1"
-    srt_bridge "$udp0" "$srt0"
-    srt_bridge "$udp1" "$srt1"
-    sleep 1.5
-    mkv=$("$HARNESS" --url "$(srt_caller_url "$srt0")" --url "$(srt_caller_url "$srt1")" \
-        --outdir "$WORKDIR" --name framesync_intercam --seconds "$SECS" --fps 30 | tail -n1)
+    if [ "$TRANSPORT" = "ndi" ]; then
+        local prefix="OLR-FS-${SCENARIO}-$$"
+        ndi_start_marker_sender "$prefix" 2 "$((SECS + 5))" 0
+        mkv=$("$HARNESS" \
+            --url "$(ndi_url_for_source "$(ndi_marker_source_name "$prefix" 0)")" \
+            --url "$(ndi_url_for_source "$(ndi_marker_source_name "$prefix" 1)")" \
+            --outdir "$WORKDIR" --name framesync_intercam --seconds "$SECS" --fps 30 | tail -n1)
+    else
+        flash_marker_to_udps "$udp0" "$udp1"
+        srt_bridge "$udp0" "$srt0"
+        srt_bridge "$udp1" "$srt1"
+        sleep 1.5
+        mkv=$("$HARNESS" --url "$(srt_caller_url "$srt0")" --url "$(srt_caller_url "$srt1")" \
+            --outdir "$WORKDIR" --name framesync_intercam --seconds "$SECS" --fps 30 | tail -n1)
+    fi
     expect_mkv "$mkv"
 
     flash_pts_series "$mkv" 0 > "$WORKDIR/v0.txt"
@@ -116,11 +149,19 @@ run_drift() {
     local udp="$BASE" srt=$((BASE + 1))
     local mkv stats nf slope ppm slip_frames av_stats avn av_mean av_max av_delta_ms av_delta_frames av_reg_ms av_reg_frames
     local harness_err="$WORKDIR/harness.err" clock_ppm
-    OLR_MARKER_SKEW_PPM="$SKEW_PPM" flash_beep_tc_marker_to_udp "$udp"
-    srt_bridge "$udp" "$srt"
-    sleep 1.5
-    mkv="$("$HARNESS" --url "$(srt_caller_url "$srt")" --outdir "$WORKDIR" \
-        --name framesync_drift --seconds "$SECS" --fps 30 --report-stats 2>"$harness_err" | tail -n1)"
+    if [ "$TRANSPORT" = "ndi" ]; then
+        local prefix="OLR-FS-${SCENARIO}-$$"
+        ndi_start_marker_sender "$prefix" 1 "$((SECS + 5))" "$SKEW_PPM"
+        mkv="$("$HARNESS" --url "$(ndi_url_for_source "$(ndi_marker_source_name "$prefix" 0)")" \
+            --outdir "$WORKDIR" --name framesync_drift --seconds "$SECS" --fps 30 \
+            --report-stats 2>"$harness_err" | tail -n1)"
+    else
+        OLR_MARKER_SKEW_PPM="$SKEW_PPM" flash_beep_tc_marker_to_udp "$udp"
+        srt_bridge "$udp" "$srt"
+        sleep 1.5
+        mkv="$("$HARNESS" --url "$(srt_caller_url "$srt")" --outdir "$WORKDIR" \
+            --name framesync_drift --seconds "$SECS" --fps 30 --report-stats 2>"$harness_err" | tail -n1)"
+    fi
     expect_mkv "$mkv"
 
     flash_pts_series "$mkv" 0 > "$WORKDIR/v.txt"
@@ -188,10 +229,16 @@ run_drift() {
 
 run_timecode() {
     local udp="$BASE" srt=$((BASE + 1)) mkv tc
-    flash_beep_tc_marker_to_udp "$udp"
-    srt_bridge "$udp" "$srt"
-    sleep 1.5
-    mkv="$(record_one "$(srt_caller_url "$srt")" framesync_timecode)"
+    if [ "$TRANSPORT" = "ndi" ]; then
+        local prefix="OLR-FS-${SCENARIO}-$$"
+        ndi_start_marker_sender "$prefix" 1 "$((SECS + 5))" 0
+        mkv="$(record_one "$(ndi_url_for_source "$(ndi_marker_source_name "$prefix" 0)")" framesync_timecode)"
+    else
+        flash_beep_tc_marker_to_udp "$udp"
+        srt_bridge "$udp" "$srt"
+        sleep 1.5
+        mkv="$(record_one "$(srt_caller_url "$srt")" framesync_timecode)"
+    fi
     expect_mkv "$mkv"
     tc="$(mkv_start_timecode "$mkv")"
     if [ -z "$tc" ]; then

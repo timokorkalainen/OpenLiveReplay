@@ -37,9 +37,16 @@ Run the full transport matrix directly:
 tests/e2e/run_framesync_matrix.sh build/bcast/tests/e2e/sync_harness
 ```
 
-The matrix covers `{lipsync, intercam, drift, timecode} x {srt, rtmp, ndi}`.
-SRT is active now. RTMP and NDI cells currently skip with exit code 77 until
-their fixtures are wired.
+The matrix covers `{lipsync, intercam, drift, drift_skew, timecode} x
+`{srt, rtmp, ndi}`. SRT is active by default. NDI is active when the optional
+local `ndi_marker_sender` target is built from an installed NDI SDK/runtime.
+RTMP cells currently skip with exit code 77 until their marker-source fixture is
+wired.
+
+For NDI cells, `run_framesync_e2e.sh` starts a local `ndi_marker_sender`
+process that publishes one or two deterministic `OLR-FS-*` sources. The sender
+emits the same full-frame flash, 1 kHz beep, fixed timecode, and optional skew
+pattern as the SRT fixture, but directly through the NDI SDK.
 
 ## Timing Core Status
 
@@ -68,6 +75,10 @@ source URL/backend change resets the owned clocks.
   `drift_skew` scenario.
 - `OLR_MARKER_TC=10:00:00:00` sets the injected start timecode.
 - `OLR_FLASH_CODEC=avc|hevc` selects the marker video codec.
+- `OLR_NDI_MARKER_SENDER=/path/to/ndi_marker_sender` overrides the auto-detected
+  sibling of `sync_harness`.
+- `OLR_NDI_DISCOVERY_SECS=2` controls how long the driver waits for the local
+  marker source to appear in NDI discovery before recording.
 
 Local FFmpeg builds may omit `drawtext`. In that case the TC marker still sets
 container timecode and emits a warning, but it does not burn visible timecode
@@ -75,9 +86,11 @@ text into the video.
 
 ## Skew Injector
 
-The drift skew cell uses `OLR_MARKER_SKEW_PPM` internally to stretch/compress
-the FFmpeg marker media timestamps before the UDP->SRT bridge. A single machine
-otherwise shares one wall clock, so real drift is nearly zero by construction.
+The SRT drift skew cell uses `OLR_MARKER_SKEW_PPM` internally to
+stretch/compress the FFmpeg marker media timestamps before the UDP->SRT bridge.
+The NDI drift skew cell asks `ndi_marker_sender` to pace its SDK submissions at
+the requested ppm offset. A single machine otherwise shares one wall clock, so
+real drift is nearly zero by construction.
 
 `tests/e2e/lossy_udp_relay.py` still has a ppm packet-release skew self-test for
 network impairment experiments, but frame-sync acceptance does not treat packet
