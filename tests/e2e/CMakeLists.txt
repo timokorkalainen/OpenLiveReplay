@@ -274,6 +274,12 @@ if(APPLE)
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_interop.sh" "$<TARGET_FILE:record_harness>")
     add_test(NAME e2e_native_rtmp_soak
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_soak.sh" "$<TARGET_FILE:record_harness>" 23790)
+    # The RTMP stats DATA PATH behind the connection-status UI (twin of
+    # e2e_native_srt_ui_stats). native RTMP ingest -> reportStats -> StreamWorker ->
+    # ReplayManager::sourceStatsUpdated; sync_harness --report-stats reads it. Assert a
+    # kind=rtmp line exists, bytes>0, decodefail==0, and the native backend marker. Base 23800.
+    add_test(NAME e2e_native_rtmp_ui_stats
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_ui_stats.sh" "$<TARGET_FILE:sync_harness>" 23800)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
         LABELS "native-rtmp"
         TIMEOUT 180
@@ -307,6 +313,11 @@ if(APPLE)
     set_tests_properties(e2e_native_rtmp_soak PROPERTIES
         LABELS "native-rtmp-soak"
         TIMEOUT 3900
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+    set_tests_properties(e2e_native_rtmp_ui_stats PROPERTIES
+        LABELS "native-rtmp"
+        TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
 endif()

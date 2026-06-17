@@ -209,8 +209,8 @@ public:
     Q_INVOKABLE bool isSourceEnabled(int sourceIndex) const;
     // True only while recording and the source's worker reports a live feed.
     Q_INVOKABLE bool isSourceConnected(int sourceIndex) const;
-    // SRT link health for the connection dot. 0=N/A (no SRT stats), 1=green,
-    // 2=amber (stressed), 3=red (recent unrecovered drops).
+    // Source link health for the connection dot, graded per backend (srtHealth /
+    // rtmpHealth). 0=N/A (no stats yet), 1=green, 2=amber (stressed), 3=red.
     Q_INVOKABLE int sourceLinkHealth(int sourceIndex) const;
     // True once this source has produced at least one stats snapshot
     // (native SRT/RTMP only); false for UDP/ffmpeg-SRT sources.
