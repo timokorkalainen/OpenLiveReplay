@@ -97,6 +97,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeframecopy.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.h"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/rtmpprotocol.cpp"
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectsettingsimporter.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectimportclient.cpp"
@@ -154,8 +155,11 @@ target_link_libraries(olr_test_engine
 if(APPLE)
     target_sources(olr_test_engine PRIVATE
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtingestsession.cpp"
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativertmpingestsession.cpp"
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_videotoolbox.mm")
-    target_compile_definitions(olr_test_engine PUBLIC OLR_NATIVE_SRT_AVAILABLE=1)
+    target_compile_definitions(olr_test_engine PUBLIC
+        OLR_NATIVE_SRT_AVAILABLE=1
+        OLR_NATIVE_RTMP_AVAILABLE=1)
     target_include_directories(olr_test_engine PUBLIC "${OLR_BREW_PREFIX}/opt/srt/include")
     target_link_directories(olr_test_engine PUBLIC "${OLR_BREW_PREFIX}/opt/srt/lib")
     target_link_libraries(olr_test_engine

@@ -90,11 +90,13 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/pespacket.h
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
+        recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/audiotoolboxaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
         recorder_engine/ingest/nativevideodecoder.h
         recorder_engine/ingest/nativesrtaddress.h recorder_engine/ingest/nativesrtaddress.cpp
         recorder_engine/ingest/nativesrtingestsession.h
+        recorder_engine/ingest/nativertmpingestsession.h
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp
@@ -245,8 +247,11 @@ if(APPLE)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
         recorder_engine/ingest/nativesrtingestsession.cpp
+        recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/audiotoolboxaacdecoder.mm)
-    target_compile_definitions(OpenLiveReplay PRIVATE OLR_NATIVE_SRT_AVAILABLE=1)
+    target_compile_definitions(OpenLiveReplay PRIVATE
+        OLR_NATIVE_SRT_AVAILABLE=1
+        OLR_NATIVE_RTMP_AVAILABLE=1)
     target_link_libraries(OpenLiveReplay PRIVATE
         "-framework AudioToolbox"
         "-framework VideoToolbox"

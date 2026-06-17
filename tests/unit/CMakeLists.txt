@@ -30,6 +30,7 @@ olr_add_unit_test(tst_h26xaccessunit   olr_test_core)
 olr_add_unit_test(tst_nativesrtaddress olr_test_core)
 olr_add_unit_test(tst_nativevideodecoder olr_test_core)
 olr_add_unit_test(tst_nativeframecopy olr_test_core)
+olr_add_unit_test(tst_rtmpprotocol     olr_test_core)
 if(APPLE)
     add_library(olr_test_nativevideodecoder STATIC
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_videotoolbox.mm")

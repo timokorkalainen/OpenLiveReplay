@@ -25,6 +25,46 @@ record/playback E2E matrix. Run the full local gate with:
 ctest --test-dir build --output-on-failure -LE 'sync-report|srt|native-apple-ingest'
 ```
 
+Local transport bring-up gates use distinct labels such as `srt`,
+`native-apple-ingest`, and `native-rtmp`; they are excluded from CI until their
+matching native ingest path is ready.
+
+`native-rtmp` mirrors the applicable SRT transport gates: one-source RTMP/RTMPS
+smoke, 4-source routing, 4-source sync, per-source trim, and live/dead
+connection count.
+
+Native RTMP/RTMPS is the default ingest path. The legacy FFmpeg RTMP path is no
+longer selected for RTMP/RTMPS when the native backend is available.
+
+The optional real-server interop gate is also under `native-rtmp`. It skips
+unless `OLR_RTMP_INTEROP_PLAY_URL` is set; set `OLR_RTMP_INTEROP_PUBLISH_URL`
+when the publish URL differs, and optionally `OLR_RTMP_INTEROP_SERVER_CMD` to
+start a local server for the duration of the test.
+
+Real-server native RTMP interop:
+
+```bash
+OLR_RTMP_INTEROP_PLAY_URL=rtmp://127.0.0.1/live/stream \
+OLR_RTMP_INTEROP_PUBLISH_URL=rtmp://127.0.0.1/live/stream \
+ctest --test-dir build/native-rtmp -R e2e_native_rtmp_interop --output-on-failure
+```
+
+For HEVC/E-RTMP:
+
+```bash
+OLR_RTMP_INTEROP_CODEC=hevc \
+OLR_RTMP_INTEROP_PLAY_URL=rtmp://127.0.0.1/live/hevc \
+OLR_RTMP_INTEROP_PUBLISH_URL=rtmp://127.0.0.1/live/hevc \
+ctest --test-dir build/native-rtmp -R e2e_native_rtmp_interop --output-on-failure
+```
+
+The long-run soak gate is separate and opt-in:
+
+```bash
+OLR_RTMP_RUN_SOAK=1 OLR_RTMP_SOAK_SECONDS=1800 OLR_RTMP_SOAK_CODEC=avc \
+ctest --test-dir build/native-rtmp -R e2e_native_rtmp_soak --output-on-failure
+```
+
 ## What's covered
 
 | Layer | Where | What it checks |

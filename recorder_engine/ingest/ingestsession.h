@@ -13,10 +13,25 @@ extern "C" {
 struct AVFrame;
 }
 
-enum class IngestBackendKind { Ffmpeg, NativeSrt };
+enum class IngestBackendKind { Ffmpeg, NativeSrt, NativeRtmp };
+
+enum class IngestFailureKind {
+    None,
+    TransientNetwork,
+    UnsupportedProfile,
+    DecodeCapability,
+    MalformedStream
+};
+
+struct IngestOpenResult {
+    bool ok = false;
+    IngestFailureKind failure = IngestFailureKind::None;
+    QString message;
+};
 
 struct IngestBackendOptions {
     bool preferNativeSrt = false;
+    bool preferNativeRtmp = false;
 };
 
 struct DecodedVideoFrame {
@@ -76,9 +91,13 @@ public:
     virtual void run() = 0;
     virtual void requestStop() = 0;
     virtual QString nativeFallbackReason() const { return QString(); }
+    virtual IngestFailureKind lastFailureKind() const { return IngestFailureKind::None; }
 };
 
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options);
+IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
+                                                         bool nativeRtmpAvailable);
+bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure);
 
 Q_DECLARE_METATYPE(SrtStats)
 
