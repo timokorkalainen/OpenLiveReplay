@@ -243,6 +243,7 @@ void TestOutputRuntime::runtimeStatsReportDeadlineMissWhenCatchUpIsCapped() {
     QCOMPARE(stats.ticks, qint64(9));
     QVERIFY(stats.runtime.deadlineMisses > 0);
     QVERIFY(stats.runtime.catchUpCapHits > 0);
+    QCOMPARE(stats.runtime.cappedCatchUpTicks, qint64(1));
     QVERIFY(stats.runtime.maxLatenessNs > 0);
     QCOMPARE(stats.runtime.lastDispatchedFrameIndex, qint64(8));
 }
