@@ -13,9 +13,11 @@ class TestIngestBackendSelector : public QObject {
 private slots:
     void srtRoutesToNativeSrt();
     void rtmpRoutesToNativeRtmp();
+    void ndiRoutesToNativeNdi();
     void unsupportedSchemesAreRejected();
     void srtIsNativeByDefaultWithoutEnv();
     void rtmpIsNativeByDefault();
+    void ndiIsNativeByDefaultWhenAvailable();
     void nativeFailureStopsNativeRetryWithoutFfmpegFallback();
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
     void malformedLegacyVideoPacketStaysMalformed();
@@ -44,6 +46,12 @@ void TestIngestBackendSelector::rtmpRoutesToNativeRtmp() {
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
              IngestBackendKind::NativeRtmp);
 }
+void TestIngestBackendSelector::ndiRoutesToNativeNdi() {
+    IngestBackendOptions opts;
+    opts.preferNativeNdi = true;
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("ndi://STUDIO%20(CAM1)")), opts),
+             IngestBackendKind::NativeNdi);
+}
 void TestIngestBackendSelector::unsupportedSchemesAreRejected() {
     IngestBackendOptions opts;
     opts.preferNativeSrt = true;
@@ -67,6 +75,14 @@ void TestIngestBackendSelector::rtmpIsNativeByDefault() {
     const IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
         QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), false, true);
     QVERIFY(opts.preferNativeRtmp);
+}
+
+void TestIngestBackendSelector::ndiIsNativeByDefaultWhenAvailable() {
+    const IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
+        QUrl(QStringLiteral("ndi://CAM1")), false, false, true);
+    QVERIFY(opts.preferNativeNdi);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("ndi://CAM1")), opts),
+             IngestBackendKind::NativeNdi);
 }
 
 void TestIngestBackendSelector::nativeFailureStopsNativeRetryWithoutFfmpegFallback() {

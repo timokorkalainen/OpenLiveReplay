@@ -13,7 +13,7 @@ extern "C" {
 struct AVFrame;
 }
 
-enum class IngestBackendKind { NativeSrt, NativeRtmp, Unsupported };
+enum class IngestBackendKind { NativeSrt, NativeRtmp, NativeNdi, Unsupported };
 
 enum class IngestFailureKind {
     None,
@@ -32,6 +32,7 @@ struct IngestOpenResult {
 struct IngestBackendOptions {
     bool preferNativeSrt = false;
     bool preferNativeRtmp = false;
+    bool preferNativeNdi = false;
 };
 
 struct DecodedVideoFrame {
@@ -115,7 +116,8 @@ public:
 
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options);
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
-                                                         bool nativeRtmpAvailable);
+                                                         bool nativeRtmpAvailable,
+                                                         bool nativeNdiAvailable = false);
 bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure);
 
 Q_DECLARE_METATYPE(IngestStats)
