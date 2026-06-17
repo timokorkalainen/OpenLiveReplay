@@ -27,6 +27,7 @@ private slots:
     void nativeRtmpAudioDiscontinuityKeepsSharedAnchor();
 #endif
     void sharedAnchorMapsStreamTime();
+    void srtAnchorMapPureCases();
 };
 
 void TestIngestBackendSelector::srtRoutesToNativeSrt() {
@@ -213,6 +214,14 @@ void TestIngestBackendSelector::sharedAnchorMapsStreamTime() {
     QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(-1, 90000, 1000), -1);
     QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(108000, -1, 1000), -1);
     QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(108000, 90000, -1), -1);
+}
+
+void TestIngestBackendSelector::srtAnchorMapPureCases() {
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(90000, 90000, 5000), 5000);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(180000, 90000, 5000), 6000);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(-1, 90000, 5000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(180000, -1, 5000), -1);
+    QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(180000, 90000, -1), -1);
 }
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)
