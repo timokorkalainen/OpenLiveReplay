@@ -689,6 +689,8 @@ void NativeRtmpIngestSession::maybeReportStats() {
                           : m_openedAtMs >= 0     ? now - m_openedAtMs
                                                   : 0;
     stats.decodeFailures = m_decodeFailures;
+    stats.clockPpm = m_clock.ppm();
+    stats.clockQuality = int(m_clock.quality());
     m_callbacks.reportStats(stats);
 }
 

@@ -194,6 +194,8 @@ void NativeSrtIngestSession::run() {
                         stats.retransTotal = perf.pktRcvRetrans;
                         stats.lossTotal = perf.pktRcvLossTotal;
                         stats.dropTotal = perf.pktRcvDropTotal;
+                        stats.clockPpm = m_clock.ppm();
+                        stats.clockQuality = int(m_clock.quality());
                         m_callbacks.reportStats(stats);
                     }
                 }

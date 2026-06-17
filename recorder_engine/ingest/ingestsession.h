@@ -65,6 +65,9 @@ struct IngestStats {
     qint64 lastPacketAgeMs = 0; // ms since the last media packet, at sample time
     qint64 keyframeAgeMs = 0;   // ms since the last video keyframe, at sample time
     quint64 decodeFailures = 0; // cumulative frames the native decoder rejected
+    // Recovered source-clock telemetry. clockQuality is ClockQuality as an int.
+    double clockPpm = 0.0;
+    int clockQuality = 0;
 };
 
 // Per-source link health -> the connection dot: Green=healthy, Amber=stressed, Red=losing content.
