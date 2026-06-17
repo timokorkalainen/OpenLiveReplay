@@ -1,5 +1,6 @@
 #include "uimanager.h"
 #include "playback/audioplayer.h"
+#include "playback/output/broadcastoutputsettings.h"
 #include "project/projectimportclient.h"
 #include "telemetry/telemetryclient.h"
 #include <QDateTime>
@@ -1263,6 +1264,8 @@ void UIManager::setMultiviewCount(int count) {
         }
         emit multiviewCountChanged();
         emit viewSlotMapChanged();
+        m_broadcastOutputsVersion++;
+        emit broadcastOutputsChanged();
         m_settingsManager->save(m_configPath, m_currentSettings);
     }
 }
@@ -1447,6 +1450,7 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
 
     // Route audio for the selected track (or mute in multiview)
     if (m_playbackWorker) {
+        m_playbackWorker->setSelectedOutputFeed(selectedIndex);
         m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
     }
     if (m_audioPlayer) {
@@ -1518,6 +1522,9 @@ void UIManager::startRecording() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
+    m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
+    m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
 
     // 2. Point it to the file being recorded
     //QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
@@ -1540,6 +1547,9 @@ void UIManager::restartPlaybackWorker() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
+    m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
+    m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
     m_transport->seek(0);
@@ -1878,6 +1888,48 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
     return rows;
 }
 
+QVariantList UIManager::ndiOutputRows() const {
+    return BroadcastOutputSettings::rows(m_currentSettings.broadcastOutputs, activeViewCount(),
+                                         OutputTargetKind::Ndi);
+}
+
+bool UIManager::ndiOutputEnabled(const QString& busKind, int feedIndex) const {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    return BroadcastOutputSettings::isEnabled(m_currentSettings.broadcastOutputs,
+                                              OutputTargetKind::Ndi, bus);
+}
+
+QString UIManager::ndiOutputSenderName(const QString& busKind, int feedIndex) const {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    return BroadcastOutputSettings::senderName(m_currentSettings.broadcastOutputs,
+                                               OutputTargetKind::Ndi, bus);
+}
+
+void UIManager::setNdiOutputEnabled(const QString& busKind, int feedIndex, bool enabled) {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    applyBroadcastOutputs(BroadcastOutputSettings::setEnabled(m_currentSettings.broadcastOutputs,
+                                                              activeViewCount(),
+                                                              OutputTargetKind::Ndi, bus, enabled));
+}
+
+void UIManager::setNdiOutputSenderName(const QString& busKind, int feedIndex,
+                                       const QString& senderName) {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    applyBroadcastOutputs(BroadcastOutputSettings::setSenderName(
+        m_currentSettings.broadcastOutputs, activeViewCount(), OutputTargetKind::Ndi, bus,
+        senderName));
+}
+
+void UIManager::applyBroadcastOutputs(const QList<OutputTargetAssignment>& outputs) {
+    m_currentSettings.broadcastOutputs = outputs;
+    if (m_playbackWorker) {
+        m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
+    }
+    m_broadcastOutputsVersion++;
+    emit broadcastOutputsChanged();
+    m_settingsManager->save(m_configPath, m_currentSettings);
+}
+
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         m_streamDeckStore.loadFrom(m_currentSettings);
@@ -1945,7 +1997,11 @@ void UIManager::loadSettings() {
             qBound(0, m_currentSettings.audioOutputLatencyMs, 500);
         if (m_audioPlayer)
             m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs);
+        if (m_playbackWorker)
+            m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
         emit audioOutputLatencyChanged();
+        m_broadcastOutputsVersion++;
+        emit broadcastOutputsChanged();
     }
 }
 
@@ -2082,12 +2138,18 @@ void UIManager::refreshProviders() {
     // Cleanup old providers
     qDeleteAll(m_providers);
     m_providers.clear();
+    delete m_multiviewPreviewProvider;
+    delete m_pgmPreviewProvider;
+    m_multiviewPreviewProvider = nullptr;
+    m_pgmPreviewProvider = nullptr;
 
     // Create a provider for every stream URL
     int count = activeStreamUrls().size();
     for (int i = 0; i < count; ++i) {
         m_providers.append(new FrameProvider(this));
     }
+    m_multiviewPreviewProvider = new FrameProvider(this);
+    m_pgmPreviewProvider = new FrameProvider(this);
     emit playbackProvidersChanged();
 }
 

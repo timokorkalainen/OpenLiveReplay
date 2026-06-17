@@ -1,6 +1,7 @@
 #ifndef TRACKBUFFER_H
 #define TRACKBUFFER_H
-#include <QVideoFrame>
+#include "playback/output/mediaframe.h"
+
 #include <QVector>
 #include <cstdint>
 
@@ -11,19 +12,20 @@ class TrackBuffer {
 public:
     struct Frame {
         int64_t ptsMs = -1;
-        QVideoFrame frame;
+        MediaVideoFrame frame;
     };
 
     // Insert sorted, unique by PTS (existing PTS is replaced). Enforces the
     // frame cap by evicting the entry farthest (in PTS) from keepNearMs,
     // but never one whose PTS is in [keepNearMs, protectToMs] (the live
     // fill edge). Returns false if the frame was dropped by the cap.
-    bool insert(int64_t ptsMs, const QVideoFrame& f, int capFrames, int64_t keepNearMs,
+    bool insert(int64_t ptsMs, const MediaVideoFrame& f, int capFrames, int64_t keepNearMs,
                 int64_t protectToMs);
 
     // The frame to display at playhead: largest PTS <= playheadMs.
     // Returns false (out untouched) if no such frame.
-    bool frameAt(int64_t playheadMs, QVideoFrame& out, int64_t& outPtsMs) const;
+    bool frameAt(int64_t playheadMs, MediaVideoFrame& out, int64_t& outPtsMs) const;
+    QVector<Frame> framesSnapshot() const { return m_frames; }
 
     // True iff a frame exists within +/- toleranceMs of targetMs.
     bool hasFrameNear(int64_t targetMs, int64_t toleranceMs) const;

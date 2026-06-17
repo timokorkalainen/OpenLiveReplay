@@ -1,0 +1,86 @@
+#include <QtTest>
+
+#include "playback/frameprovider.h"
+#include "playback/output/outputbusengine.h"
+#include "playback/output/outputframecache.h"
+#include "playback/output/qtpreviewsink.h"
+
+class TestQtPreviewSink : public QObject {
+    Q_OBJECT
+private slots:
+    void deliverMediaFrameUpdatesProviderLatestImage();
+    void deliverBusEngineFrameUpdatesProviderLatestImage();
+    void outputSinkEndpointDeliversOnlyWhenStarted();
+};
+
+void TestQtPreviewSink::deliverMediaFrameUpdatesProviderLatestImage() {
+    FrameProvider provider;
+    QtPreviewSink sink(&provider);
+
+    MediaVideoFrame frame = MediaVideoFrame::solidYuv420p(4, 4, 80, 128, 128);
+    frame.ptsMs = 123;
+    frame.outputFrameIndex = 9;
+    QVERIFY(sink.deliver(frame));
+
+    QImage image = provider.latestImage();
+    QVERIFY(!image.isNull());
+    QCOMPARE(image.width(), 4);
+    QCOMPARE(image.height(), 4);
+}
+
+void TestQtPreviewSink::deliverBusEngineFrameUpdatesProviderLatestImage() {
+    OutputFrameCache cache(1, 4, 4);
+    MediaVideoFrame source = MediaVideoFrame::solidYuv420p(4, 4, 90, 128, 128);
+    source.feedIndex = 0;
+    source.ptsMs = 100;
+    cache.insertVideoFrame(source);
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+
+    OutputBusFrame busFrame = engine.renderFeed(0, 25, state, cache);
+
+    FrameProvider provider;
+    QtPreviewSink sink(&provider);
+    QVERIFY(sink.deliver(busFrame.video));
+
+    QImage image = provider.latestImage();
+    QVERIFY(!image.isNull());
+    QCOMPARE(image.width(), 4);
+    QCOMPARE(image.height(), 4);
+}
+
+void TestQtPreviewSink::outputSinkEndpointDeliversOnlyWhenStarted() {
+    OutputFrameCache cache(1, 4, 4);
+    MediaVideoFrame source = MediaVideoFrame::solidYuv420p(4, 4, 70, 128, 128);
+    source.feedIndex = 0;
+    source.ptsMs = 100;
+    cache.insertVideoFrame(source);
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    OutputBusFrame busFrame = engine.renderFeed(0, 3, state, cache);
+
+    FrameProvider provider;
+    QtPreviewOutputSink sink(&provider);
+    QVERIFY(!sink.submit(busFrame));
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(busFrame));
+    QVERIFY(sink.isActive());
+
+    QImage image = provider.latestImage();
+    QVERIFY(!image.isNull());
+    QCOMPARE(image.width(), 4);
+    QCOMPARE(image.height(), 4);
+}
+
+QTEST_MAIN(TestQtPreviewSink)
+#include "tst_qtpreviewsink.moc"

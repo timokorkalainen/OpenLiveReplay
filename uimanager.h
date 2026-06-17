@@ -44,6 +44,10 @@ class UIManager : public QObject {
     Q_PROPERTY(int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
+    Q_PROPERTY(FrameProvider* multiviewPreviewProvider READ multiviewPreviewProvider NOTIFY
+                   playbackProvidersChanged)
+    Q_PROPERTY(
+        FrameProvider* pgmPreviewProvider READ pgmPreviewProvider NOTIFY playbackProvidersChanged)
     Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
     Q_PROPERTY(int64_t scrubPosition READ scrubPosition NOTIFY scrubPositionChanged)
     Q_PROPERTY(QString playbackTimecode READ playbackTimecode NOTIFY playbackTimecodeChanged)
@@ -84,6 +88,8 @@ class UIManager : public QObject {
     Q_PROPERTY(bool importPreviewReady READ importPreviewReady NOTIFY importPreviewChanged)
     Q_PROPERTY(QString telemetrySseUrl READ telemetrySseUrl NOTIFY telemetryConfigChanged)
     Q_PROPERTY(int telemetryVersion READ telemetryVersion NOTIFY telemetryChanged)
+    Q_PROPERTY(
+        int broadcastOutputsVersion READ broadcastOutputsVersion NOTIFY broadcastOutputsChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -103,6 +109,8 @@ public:
     int multiviewCount() const;
     bool isRecording() const;
     QVariantList playbackProviders() const;
+    FrameProvider* multiviewPreviewProvider() const { return m_multiviewPreviewProvider; }
+    FrameProvider* pgmPreviewProvider() const { return m_pgmPreviewProvider; }
     int64_t recordedDurationMs();
     int64_t scrubPosition();
     // The exact timecode the playback UI shows — the single source of truth for
@@ -139,6 +147,7 @@ public:
     bool importPreviewReady() const { return m_hasPendingImport && m_pendingImport.ok; }
     QString telemetrySseUrl() const { return m_currentSettings.telemetrySseUrl; }
     int telemetryVersion() const { return m_telemetryVersion; }
+    int broadcastOutputsVersion() const { return m_broadcastOutputsVersion; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -227,6 +236,12 @@ public:
     Q_INVOKABLE void applyImportPreview();
     Q_INVOKABLE QVariantMap telemetryAtPlayhead();
     Q_INVOKABLE QVariantList telemetryRowsAtPlayhead();
+    Q_INVOKABLE QVariantList ndiOutputRows() const;
+    Q_INVOKABLE bool ndiOutputEnabled(const QString& busKind, int feedIndex) const;
+    Q_INVOKABLE QString ndiOutputSenderName(const QString& busKind, int feedIndex) const;
+    Q_INVOKABLE void setNdiOutputEnabled(const QString& busKind, int feedIndex, bool enabled);
+    Q_INVOKABLE void setNdiOutputSenderName(const QString& busKind, int feedIndex,
+                                            const QString& senderName);
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
@@ -279,6 +294,7 @@ signals:
     void importPreviewChanged();
     void telemetryConfigChanged();
     void telemetryChanged();
+    void broadcastOutputsChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -328,6 +344,8 @@ private:
     QString m_configPath;
     PlaybackWorker* m_playbackWorker = nullptr;
     QList<FrameProvider*> m_providers;
+    FrameProvider* m_multiviewPreviewProvider = nullptr;
+    FrameProvider* m_pgmPreviewProvider = nullptr;
     PlaybackTransport *m_transport;
     AudioPlayer *m_audioPlayer = nullptr;
     bool m_followLive = false;
@@ -386,6 +404,7 @@ private:
     void resetSourceConnection();
     void updateReplayTelemetryFeeds();
     void clearImportPreview();
+    void applyBroadcastOutputs(const QList<OutputTargetAssignment>& outputs);
     bool loadTelemetryTimeline(const QString &filePath, bool notify = true);
     QVariantMap recordingTelemetryStateAt(qint64 playheadMs) const;
 
@@ -409,6 +428,7 @@ private:
     TelemetryTimelineReader m_telemetryTimelineReader;
     bool m_hasTelemetryTimeline = false;
     int m_telemetryVersion = 0;
+    int m_broadcastOutputsVersion = 0;
 
     enum MidiLearnMode {
         LearnControl = 0,

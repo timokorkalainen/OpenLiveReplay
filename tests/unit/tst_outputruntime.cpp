@@ -1,0 +1,177 @@
+#include <QtTest>
+
+#include "playback/output/outputruntime.h"
+
+static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
+    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
+    f.feedIndex = feed;
+    f.ptsMs = pts;
+    return f;
+}
+
+class ThreadSafeCollectingSink final : public IOutputSink {
+public:
+    explicit ThreadSafeCollectingSink(OutputTargetKind kind) : m_kind(kind) {}
+
+    OutputTargetKind kind() const override { return m_kind; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        QMutexLocker locker(&m_mutex);
+        m_active = assignment.enabled && rate.isValid();
+        return m_active;
+    }
+
+    void stop() override {
+        QMutexLocker locker(&m_mutex);
+        m_active = false;
+    }
+
+    bool isActive() const override {
+        QMutexLocker locker(&m_mutex);
+        return m_active;
+    }
+
+    bool submit(const OutputBusFrame& frame) override {
+        QMutexLocker locker(&m_mutex);
+        if (!m_active) return false;
+        m_frames.append(frame);
+        return true;
+    }
+
+    int frameCount() const {
+        QMutexLocker locker(&m_mutex);
+        return m_frames.size();
+    }
+
+    QVector<OutputBusFrame> frames() const {
+        QMutexLocker locker(&m_mutex);
+        return m_frames;
+    }
+
+private:
+    OutputTargetKind m_kind = OutputTargetKind::QtPreview;
+    mutable QMutex m_mutex;
+    bool m_active = false;
+    QVector<OutputBusFrame> m_frames;
+};
+
+class TestOutputRuntime : public QObject {
+    Q_OBJECT
+private slots:
+    void manualTicksRepeatPausedFrameFromCache();
+    void nanosecondTicksHonorFractionalFrameBoundary();
+    void workerThreadTicksWithoutExternalDispatchCalls();
+};
+
+void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 40));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    runtime.dispatchDueTicksForTest(40);
+    runtime.dispatchDueTicksForTest(80);
+
+    const QVector<OutputBusFrame> frames = sink.frames();
+    QCOMPARE(frames.size(), 3);
+    QCOMPARE(frames[0].outputFrameIndex, qint64(0));
+    QCOMPARE(frames[1].outputFrameIndex, qint64(1));
+    QCOMPARE(frames[2].outputFrameIndex, qint64(2));
+    QCOMPARE(frames[0].video.ptsMs, qint64(100));
+    QCOMPARE(frames[2].video.ptsMs, qint64(100));
+    QCOMPARE(uchar(frames[2].video.planeY.at(0)), uchar(40));
+}
+
+void TestOutputRuntime::nanosecondTicksHonorFractionalFrameBoundary() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 0, 70));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(30000, 1001), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTestNs(0);
+    runtime.dispatchDueTicksForTestNs(33366666);
+    QCOMPARE(sink.frameCount(), 1);
+
+    runtime.dispatchDueTicksForTestNs(33366667);
+    QCOMPARE(sink.frameCount(), 2);
+    QCOMPARE(sink.frames()[1].outputFrameIndex, qint64(1));
+}
+
+void TestOutputRuntime::workerThreadTicksWithoutExternalDispatchCalls() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 55));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(50, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.startRuntime();
+    QTRY_VERIFY_WITH_TIMEOUT(sink.frameCount() >= 3, 500);
+    runtime.stopRuntime();
+
+    const QVector<OutputBusFrame> frames = sink.frames();
+    QVERIFY(frames.size() >= 3);
+    QCOMPARE(frames[0].outputFrameIndex, qint64(0));
+    QCOMPARE(frames[1].outputFrameIndex, qint64(1));
+    QCOMPARE(frames[2].outputFrameIndex, qint64(2));
+    QCOMPARE(uchar(frames[2].video.planeY.at(0)), uchar(55));
+}
+
+QTEST_GUILESS_MAIN(TestOutputRuntime)
+#include "tst_outputruntime.moc"

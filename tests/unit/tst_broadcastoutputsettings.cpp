@@ -1,0 +1,119 @@
+#include <QtTest>
+
+#include "playback/output/broadcastoutputsettings.h"
+
+class TestBroadcastOutputSettings : public QObject {
+    Q_OBJECT
+private slots:
+    void ensureTargetsCreatesOneNdiTargetPerBus();
+    void setEnabledPreservesExistingSettingsAndOnlyTouchesSelectedBus();
+    void rowsExposeStableQmlMetadata();
+    void qtPreviewAssignmentsCoverFeedsMultiviewAndPgm();
+};
+
+void TestBroadcastOutputSettings::ensureTargetsCreatesOneNdiTargetPerBus() {
+    const QList<OutputTargetAssignment> outputs =
+        BroadcastOutputSettings::ensureTargets({}, 2, OutputTargetKind::Ndi);
+
+    QCOMPARE(outputs.size(), 4);
+    QCOMPARE(outputs[0].id, QStringLiteral("feed0-ndi"));
+    QCOMPARE(outputs[0].sourceBus, OutputBusId::feed(0));
+    QCOMPARE(outputs[0].kind, OutputTargetKind::Ndi);
+    QVERIFY(!outputs[0].enabled);
+    QCOMPARE(outputs[0].settings.value(QStringLiteral("senderName")).toString(),
+             QStringLiteral("OpenLiveReplay Feed 1"));
+
+    QCOMPARE(outputs[1].id, QStringLiteral("feed1-ndi"));
+    QCOMPARE(outputs[1].sourceBus, OutputBusId::feed(1));
+    QCOMPARE(outputs[1].settings.value(QStringLiteral("senderName")).toString(),
+             QStringLiteral("OpenLiveReplay Feed 2"));
+
+    QCOMPARE(outputs[2].id, QStringLiteral("multiview-ndi"));
+    QCOMPARE(outputs[2].sourceBus, OutputBusId::multiview());
+    QCOMPARE(outputs[2].settings.value(QStringLiteral("senderName")).toString(),
+             QStringLiteral("OpenLiveReplay Multiview"));
+
+    QCOMPARE(outputs[3].id, QStringLiteral("pgm-ndi"));
+    QCOMPARE(outputs[3].sourceBus, OutputBusId::pgm());
+    QCOMPARE(outputs[3].settings.value(QStringLiteral("senderName")).toString(),
+             QStringLiteral("OpenLiveReplay PGM"));
+}
+
+void TestBroadcastOutputSettings::setEnabledPreservesExistingSettingsAndOnlyTouchesSelectedBus() {
+    OutputTargetAssignment existing;
+    existing.id = QStringLiteral("feed1-ndi");
+    existing.sourceBus = OutputBusId::feed(1);
+    existing.kind = OutputTargetKind::Ndi;
+    existing.enabled = false;
+    existing.settings.insert(QStringLiteral("senderName"), QStringLiteral("Director Iso 2"));
+    existing.settings.insert(QStringLiteral("groups"), QStringLiteral("OB1"));
+
+    const QList<OutputTargetAssignment> outputs = BroadcastOutputSettings::setEnabled(
+        {existing}, 3, OutputTargetKind::Ndi, OutputBusId::feed(1), true);
+
+    QCOMPARE(outputs.size(), 5);
+    QVERIFY(
+        !BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi, OutputBusId::feed(0)));
+    QVERIFY(
+        BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi, OutputBusId::feed(1)));
+    QVERIFY(
+        !BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi, OutputBusId::feed(2)));
+    QCOMPARE(
+        BroadcastOutputSettings::senderName(outputs, OutputTargetKind::Ndi, OutputBusId::feed(1)),
+        QStringLiteral("Director Iso 2"));
+
+    const auto feed1 = std::find_if(outputs.cbegin(), outputs.cend(), [](const auto& assignment) {
+        return assignment.kind == OutputTargetKind::Ndi &&
+               assignment.sourceBus == OutputBusId::feed(1);
+    });
+    QVERIFY(feed1 != outputs.cend());
+    QCOMPARE(feed1->settings.value(QStringLiteral("groups")).toString(), QStringLiteral("OB1"));
+}
+
+void TestBroadcastOutputSettings::rowsExposeStableQmlMetadata() {
+    QList<OutputTargetAssignment> outputs =
+        BroadcastOutputSettings::setEnabled({}, 1, OutputTargetKind::Ndi, OutputBusId::pgm(), true);
+    outputs = BroadcastOutputSettings::setSenderName(
+        outputs, 1, OutputTargetKind::Ndi, OutputBusId::pgm(), QStringLiteral(" World Feed "));
+
+    const QVariantList rows = BroadcastOutputSettings::rows(outputs, 1, OutputTargetKind::Ndi);
+
+    QCOMPARE(rows.size(), 3);
+    const QVariantMap feed = rows[0].toMap();
+    QCOMPARE(feed.value(QStringLiteral("id")).toString(), QStringLiteral("feed0-ndi"));
+    QCOMPARE(feed.value(QStringLiteral("busKind")).toString(), QStringLiteral("feed"));
+    QCOMPARE(feed.value(QStringLiteral("feedIndex")).toInt(), 0);
+    QCOMPARE(feed.value(QStringLiteral("label")).toString(), QStringLiteral("Feed 1"));
+    QVERIFY(!feed.value(QStringLiteral("enabled")).toBool());
+
+    const QVariantMap pgm = rows[2].toMap();
+    QCOMPARE(pgm.value(QStringLiteral("id")).toString(), QStringLiteral("pgm-ndi"));
+    QCOMPARE(pgm.value(QStringLiteral("busKind")).toString(), QStringLiteral("pgm"));
+    QCOMPARE(pgm.value(QStringLiteral("feedIndex")).toInt(), -1);
+    QCOMPARE(pgm.value(QStringLiteral("label")).toString(), QStringLiteral("PGM"));
+    QVERIFY(pgm.value(QStringLiteral("enabled")).toBool());
+    QCOMPARE(pgm.value(QStringLiteral("senderName")).toString(), QStringLiteral("World Feed"));
+}
+
+void TestBroadcastOutputSettings::qtPreviewAssignmentsCoverFeedsMultiviewAndPgm() {
+    const QList<OutputTargetAssignment> previews =
+        BroadcastOutputSettings::qtPreviewAssignments(2, true, true);
+
+    QCOMPARE(previews.size(), 4);
+    QCOMPARE(previews[0].id, QStringLiteral("qt-preview-feed-0"));
+    QCOMPARE(previews[0].sourceBus, OutputBusId::feed(0));
+    QCOMPARE(previews[0].kind, OutputTargetKind::QtPreview);
+    QVERIFY(previews[0].enabled);
+
+    QCOMPARE(previews[1].id, QStringLiteral("qt-preview-feed-1"));
+    QCOMPARE(previews[1].sourceBus, OutputBusId::feed(1));
+
+    QCOMPARE(previews[2].id, QStringLiteral("qt-preview-multiview"));
+    QCOMPARE(previews[2].sourceBus, OutputBusId::multiview());
+
+    QCOMPARE(previews[3].id, QStringLiteral("qt-preview-pgm"));
+    QCOMPARE(previews[3].sourceBus, OutputBusId::pgm());
+}
+
+QTEST_GUILESS_MAIN(TestBroadcastOutputSettings)
+#include "tst_broadcastoutputsettings.moc"

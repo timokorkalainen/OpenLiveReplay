@@ -8,29 +8,33 @@
 #include <QThread>
 #include <QVector>
 #include <QMutex>
-#include <QVideoFrame>
 #include <QList>
 #include <atomic>
+#include <memory>
+#include <vector>
 #include "frameprovider.h"
+#include "playback/output/outputruntime.h"
+#include "playback/output/outputtargetassignment.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
 #include "playback/trackbuffer.h"
 #include "playback/audioframequeue.h"
 
 extern "C" {
-    #include <libavformat/avformat.h>
-    #include <libavcodec/avcodec.h>
-    #include <libavutil/imgutils.h>
-    #include <libavutil/error.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/error.h>
 }
 
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
     FrameProvider* provider = nullptr;
     int streamIndex = -1;
+    int feedIndex = -1;
     TrackBuffer buffer;
-    int64_t lastDeliveredPtsMs = -1;   // last frame released to the provider
-    int decimateCounter = 0;           // per-track keep-counter (§6.3 decimation)
+    int64_t lastDeliveredPtsMs = -1; // last frame released to the provider
+    int decimateCounter = 0;         // per-track keep-counter (§6.3 decimation)
 };
 
 struct AudioDecoderTrack {
@@ -38,6 +42,7 @@ struct AudioDecoderTrack {
     int streamIndex = -1;
     int viewIndex = -1;             // which view (0..N-1) this audio belongs to
     int64_t lastEnqueuedPtsMs = -1; // for dedup-before-decode after EOF un-latch
+    int64_t lastCachedPtsMs = -1;   // output-bus audio cache dedup
 };
 
 class PlaybackWorker : public QThread {
@@ -48,16 +53,19 @@ public:
             audioPushes = 0, framesDropped = 0;
     };
 
-    explicit PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport,
-                            AudioPlayer *audioPlayer = nullptr, QObject *parent = nullptr);
+    explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
+                            AudioPlayer* audioPlayer = nullptr, QObject* parent = nullptr);
     ~PlaybackWorker();
 
-    void openFile(const QString &filePath);
+    void openFile(const QString& filePath);
     void seekTo(int64_t timestampMs);
     // Direction-aware delivery (spec §5): forward delivers iff pts moved up,
     // reverse iff pts moved down (dir = +1 / -1).
     void deliverDueFrames(int64_t P, int dir);
     void setActiveAudioView(int viewIndex);
+    void setSelectedOutputFeed(int feedIndex);
+    void setBusPreviewProviders(FrameProvider* multiviewProvider, FrameProvider* pgmProvider);
+    void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
     void stop();
 
     PlaybackCounters counters() const { return m_counters; }
@@ -80,8 +88,8 @@ private:
     static constexpr int kGlobalFrameBudget = 256; // aggregate decoded-frame cap (memory)
     static constexpr double kDecimateAbove = 1.5;  // |speed| above which decimation engages
 
-    // High-performance conversion from FFmpeg AVFrame to QVideoFrame (YUV420P)
-    QVideoFrame convertToQVideoFrame(AVFrame* frame);
+    // High-performance conversion from FFmpeg AVFrame to backend YUV420P media frames.
+    MediaVideoFrame convertToMediaVideoFrame(AVFrame* frame, int feedIndex);
 
     // --- Scheduler helpers (spec §3 symbols / §6). Task 5 wires the loop;
     //     bodies are implemented here except repositionTo (stubbed). ---------
@@ -107,13 +115,20 @@ private:
                                  bool dedupTail);
     // Enqueue a decoded active-view audio frame onto m_audioQueue (format-guarded).
     void enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
+    void cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void resetDedup();      // lastDeliveredPtsMs = -1 on every track
     void clearAllBuffers(); // clear every TrackBuffer (holds m_bufferMutex)
+    void initializeOutputGraph(int feedCount, int width, int height);
+    void shutdownOutputGraph();
+    void rebuildOutputEndpoints();
+    OutputRuntimeSnapshot makeOutputSnapshot() const;
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
 
     QList<FrameProvider*> m_providers;
+    FrameProvider* m_multiviewPreviewProvider = nullptr;
+    FrameProvider* m_pgmPreviewProvider = nullptr;
     QVector<DecoderTrack*> m_decoderBank;
     QVector<AudioDecoderTrack*> m_audioDecoderBank;
     AVFormatContext* m_fmtCtx = nullptr;
@@ -121,9 +136,10 @@ private:
     std::atomic<bool> m_running{false};
     int64_t m_seekTargetMs = -1;
     QString m_currentFilePath;
-    PlaybackTransport *m_transport;
-    AudioPlayer *m_audioPlayer = nullptr;
+    PlaybackTransport* m_transport;
+    AudioPlayer* m_audioPlayer = nullptr;
     std::atomic<int> m_activeAudioView{-1};
+    std::atomic<int> m_selectedOutputFeed{-1};
 
     AudioFrameQueue m_audioQueue;            // worker-thread-only
     std::atomic<bool> m_audioReprime{false}; // set by setActiveAudioView (UI thread)
@@ -138,6 +154,15 @@ private:
 
     QMutex m_mutex;
     mutable QMutex m_bufferMutex;
+
+    QList<OutputTargetAssignment> m_externalOutputAssignments;
+    std::atomic<bool> m_outputTargetsDirty{false};
+    std::unique_ptr<OutputFrameCache> m_outputCache;
+    std::unique_ptr<OutputRuntime> m_outputRuntime;
+    std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
+    int m_outputFeedCount = 0;
+    int m_outputWidth = 1920;
+    int m_outputHeight = 1080;
 
     PlaybackCounters m_counters;
     void emitTelemetry(int64_t P, int64_t newest, double speed);

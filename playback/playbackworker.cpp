@@ -1,4 +1,10 @@
 #include "playback/playbackworker.h"
+#include "playback/output/broadcastoutputsettings.h"
+#include "playback/output/outputbusengine.h"
+#include "playback/output/outputframecache.h"
+#include "playback/output/ndisink.h"
+#include "playback/output/qtpreviewsink.h"
+#include "playback/output/queuedoutputsink.h"
 #include <QDebug>
 #include <QMutexLocker>
 #include <QElapsedTimer>
@@ -6,10 +12,9 @@
 #include <cmath>
 #include <cstdint>
 
-PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackTransport *transport,
-                               AudioPlayer *audioPlayer, QObject *parent)
-    : QThread(parent)
-{
+PlaybackWorker::PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
+                               AudioPlayer* audioPlayer, QObject* parent)
+    : QThread(parent) {
     m_transport = transport;
     m_providers = providers;
     m_audioPlayer = audioPlayer;
@@ -17,6 +22,7 @@ PlaybackWorker::PlaybackWorker(const QList<FrameProvider*> &providers, PlaybackT
 
 PlaybackWorker::~PlaybackWorker() {
     stop();
+    shutdownOutputGraph();
     for (auto* track : m_decoderBank) {
         if (track->codecCtx) avcodec_free_context(&track->codecCtx);
         delete track;
@@ -28,7 +34,7 @@ PlaybackWorker::~PlaybackWorker() {
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
 }
 
-void PlaybackWorker::openFile(const QString &filePath) {
+void PlaybackWorker::openFile(const QString& filePath) {
     QMutexLocker locker(&m_mutex);
     m_currentFilePath = filePath;
 }
@@ -42,11 +48,12 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // transport's own (independent) mutex, so there is no lock-order concern.
     m_lastMoveDir.store((clamped >= m_transport->currentPos()) ? 1 : -1, std::memory_order_relaxed);
     m_seekTargetMs = clamped;
+    if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
     int prev = m_activeAudioView.exchange(viewIndex, std::memory_order_relaxed);
-    if (prev == viewIndex) return;   // no actual change
+    if (prev == viewIndex) return; // no actual change
 
     // Clear the ring buffer so stale samples from the old view don't
     // bleed into the new one.  We do NOT flush the codec contexts here:
@@ -57,6 +64,24 @@ void PlaybackWorker::setActiveAudioView(int viewIndex) {
     // The worker-side AudioFrameQueue is worker-thread-owned; signal the
     // worker to drop it + re-prime (spec §6.7) rather than touch it here.
     m_audioReprime.store(true, std::memory_order_relaxed);
+}
+
+void PlaybackWorker::setSelectedOutputFeed(int feedIndex) {
+    m_selectedOutputFeed.store(feedIndex, std::memory_order_relaxed);
+}
+
+void PlaybackWorker::setBusPreviewProviders(FrameProvider* multiviewProvider,
+                                            FrameProvider* pgmProvider) {
+    QMutexLocker locker(&m_mutex);
+    m_multiviewPreviewProvider = multiviewProvider;
+    m_pgmPreviewProvider = pgmProvider;
+    m_outputTargetsDirty.store(true, std::memory_order_relaxed);
+}
+
+void PlaybackWorker::setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments) {
+    QMutexLocker locker(&m_mutex);
+    m_externalOutputAssignments = assignments;
+    m_outputTargetsDirty.store(true, std::memory_order_relaxed);
 }
 
 void PlaybackWorker::stop() {
@@ -201,6 +226,7 @@ void PlaybackWorker::clearAllBuffers() {
         track->buffer.clear();
         track->decimateCounter = 0;
     }
+    if (m_outputCache) m_outputCache->clear();
 }
 
 bool PlaybackWorker::reuseAt(int64_t target) {
@@ -213,6 +239,112 @@ bool PlaybackWorker::reuseAt(int64_t target) {
         if (!track->buffer.hasFrameNear(target, tol)) return false;
     }
     return true;
+}
+
+void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height) {
+    shutdownOutputGraph();
+    m_outputFeedCount = qMax(0, feedCount);
+    m_outputWidth = qMax(2, width);
+    m_outputHeight = qMax(2, height);
+    m_outputCache =
+        std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth, m_outputHeight);
+    m_outputRuntime = std::make_unique<OutputRuntime>(
+        FrameRate::fromFraction(fps(), 1), m_outputFeedCount, m_outputWidth, m_outputHeight);
+    m_outputRuntime->setSnapshotProvider([this]() { return makeOutputSnapshot(); });
+    m_outputTargetsDirty.store(true, std::memory_order_relaxed);
+    rebuildOutputEndpoints();
+    m_outputRuntime->startRuntime();
+}
+
+void PlaybackWorker::shutdownOutputGraph() {
+    if (m_outputRuntime) {
+        m_outputRuntime->stopRuntime();
+        m_outputRuntime.reset();
+    }
+    m_outputSinks.clear();
+    m_outputCache.reset();
+    m_outputFeedCount = 0;
+}
+
+void PlaybackWorker::rebuildOutputEndpoints() {
+    if (!m_outputRuntime) return;
+
+    QList<OutputTargetAssignment> external;
+    FrameProvider* multiviewProvider = nullptr;
+    FrameProvider* pgmProvider = nullptr;
+    {
+        QMutexLocker locker(&m_mutex);
+        external = m_externalOutputAssignments;
+        multiviewProvider = m_multiviewPreviewProvider;
+        pgmProvider = m_pgmPreviewProvider;
+    }
+
+    m_outputRuntime->setEndpoints({});
+    m_outputSinks.clear();
+    QList<OutputEndpoint> endpoints;
+
+    const QList<OutputTargetAssignment> previews = BroadcastOutputSettings::qtPreviewAssignments(
+        m_outputFeedCount, multiviewProvider != nullptr, pgmProvider != nullptr);
+    for (const OutputTargetAssignment& preview : previews) {
+        FrameProvider* provider = nullptr;
+        switch (preview.sourceBus.kind) {
+        case OutputBusKind::Feed:
+            if (preview.sourceBus.index >= 0 && preview.sourceBus.index < m_providers.size())
+                provider = m_providers[preview.sourceBus.index];
+            break;
+        case OutputBusKind::Multiview:
+            provider = multiviewProvider;
+            break;
+        case OutputBusKind::Pgm:
+            provider = pgmProvider;
+            break;
+        }
+        if (!provider) continue;
+
+        auto sink = std::make_unique<QtPreviewOutputSink>(provider);
+        endpoints.append({preview, sink.get()});
+        m_outputSinks.push_back(std::move(sink));
+    }
+
+    for (const OutputTargetAssignment& assignment : external) {
+        if (!assignment.enabled) continue;
+
+        std::unique_ptr<IOutputSink> sink;
+        switch (assignment.kind) {
+        case OutputTargetKind::Ndi:
+            sink = std::make_unique<QueuedOutputSink>(std::make_unique<NdiOutputSink>());
+            break;
+        case OutputTargetKind::QtPreview:
+        case OutputTargetKind::DeckLinkSdiHdmi:
+        case OutputTargetKind::DeckLinkIpSt2110:
+        case OutputTargetKind::Omt:
+        case OutputTargetKind::Aja:
+            break;
+        }
+        if (!sink) continue;
+        endpoints.append({assignment, sink.get()});
+        m_outputSinks.push_back(std::move(sink));
+    }
+
+    m_outputRuntime->setEndpoints(endpoints);
+    m_outputTargetsDirty.store(false, std::memory_order_relaxed);
+}
+
+OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
+    OutputRuntimeSnapshot snapshot;
+    snapshot.cache = OutputFrameCache(m_outputFeedCount, m_outputWidth, m_outputHeight);
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        if (m_outputCache) snapshot.cache = *m_outputCache;
+    }
+
+    snapshot.state.playheadMs = m_transport ? m_transport->currentPos() : 0;
+    snapshot.state.playing = m_transport && m_transport->isPlaying();
+    snapshot.state.speed = m_transport ? m_transport->speed() : 1.0;
+    snapshot.state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
+    if (snapshot.state.selectedFeedIndex < 0 && m_outputFeedCount > 0)
+        snapshot.state.selectedFeedIndex = 0;
+    return snapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +380,37 @@ void PlaybackWorker::enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audio
         audioFrame->nb_samples * audioFrame->ch_layout.nb_channels * int(sizeof(int16_t));
     m_audioQueue.enqueue(ptsMs, reinterpret_cast<const char*>(audioFrame->data[0]), dataSize);
     aTrack->lastEnqueuedPtsMs = ptsMs;
+}
+
+void PlaybackWorker::cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame,
+                                           bool dedupTail) {
+    if (!m_outputCache) return;
+    if (audioFrame->format != AV_SAMPLE_FMT_S16 || audioFrame->sample_rate != 48000 ||
+        audioFrame->ch_layout.nb_channels != 2) {
+        return;
+    }
+
+    int64_t pts = audioFrame->pts;
+    if (pts == AV_NOPTS_VALUE) pts = audioFrame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) return;
+
+    const AVRational tb = m_fmtCtx->streams[aTrack->streamIndex]->time_base;
+    const int64_t ptsMs = av_rescale_q(pts, tb, {1, 1000});
+    if (dedupTail && aTrack->lastCachedPtsMs >= 0 && ptsMs <= aTrack->lastCachedPtsMs) return;
+
+    const int dataSize =
+        audioFrame->nb_samples * audioFrame->ch_layout.nb_channels * int(sizeof(int16_t));
+    MediaAudioFrame frame;
+    frame.feedIndex = aTrack->viewIndex;
+    frame.startSample = qMax<qint64>(0, ptsMs * qint64(48000) / 1000);
+    frame.sampleRate = 48000;
+    frame.channels = 2;
+    frame.format = MediaSampleFormat::S16Interleaved;
+    frame.pcm = QByteArray(reinterpret_cast<const char*>(audioFrame->data[0]), dataSize);
+
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    if (m_outputCache) m_outputCache->insertAudioFrame(frame);
+    aTrack->lastCachedPtsMs = ptsMs;
 }
 
 // ---------------------------------------------------------------------------
@@ -313,11 +476,13 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     }
                 }
 
-                QVideoFrame qFrame = convertToQVideoFrame(vf);
-                if (qFrame.isValid()) {
+                MediaVideoFrame mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
+                mediaFrame.ptsMs = framePtsMs;
+                if (mediaFrame.isValid()) {
                     QMutexLocker bufferLocker(&m_bufferMutex);
-                    if (!track->buffer.insert(framePtsMs, qFrame, cap, protectLo, protectHi))
+                    if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
                         m_counters.framesDropped++;
+                    if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
                 }
                 lastVideoPtsMs = framePtsMs;
                 av_frame_unref(vf);
@@ -331,6 +496,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
         if (pkt->stream_index != aTrack->streamIndex) continue;
         if (avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
             while (avcodec_receive_frame(aTrack->codecCtx, af) == 0) {
+                cacheOutputAudioFrame(aTrack, af, dedupTail);
                 int activeView = m_activeAudioView.load(std::memory_order_relaxed);
                 if (audioOn && activeView == aTrack->viewIndex) {
                     enqueueAudioFrame(aTrack, af, dedupTail);
@@ -369,8 +535,10 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     clearAllBuffers();
     m_reverseAnchorMs = INT64_MAX; // a seek invalidates the reverse-fetch run
     m_audioQueue.clear();
-    for (auto* aTrack : m_audioDecoderBank)
+    for (auto* aTrack : m_audioDecoderBank) {
         aTrack->lastEnqueuedPtsMs = -1;
+        aTrack->lastCachedPtsMs = -1;
+    }
     if (m_audioPlayer) m_audioPlayer->clear();
 
     const int64_t anchor = qMax<int64_t>(0, target - (dir < 0 ? kLeadMs : kTrailMs));
@@ -415,7 +583,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 }
 
 void PlaybackWorker::run() {
-    qDebug() << "Opening file: "<<m_currentFilePath;
+    qDebug() << "Opening file: " << m_currentFilePath;
 
     if (m_currentFilePath.isEmpty()) return;
 
@@ -425,6 +593,7 @@ void PlaybackWorker::run() {
     m_running = true;
 
     auto clearDecoders = [this]() {
+        shutdownOutputGraph();
         QMutexLocker bufferLocker(&m_bufferMutex);
         for (auto* track : m_decoderBank) {
             if (track->codecCtx) avcodec_free_context(&track->codecCtx);
@@ -453,7 +622,8 @@ void PlaybackWorker::run() {
         newCtx->interrupt_callback.callback = &PlaybackWorker::ffmpegInterruptCallback;
         newCtx->interrupt_callback.opaque = this;
 
-        if (avformat_open_input(&newCtx, m_currentFilePath.toUtf8().constData(), nullptr, nullptr) < 0) {
+        if (avformat_open_input(&newCtx, m_currentFilePath.toUtf8().constData(), nullptr, nullptr) <
+            0) {
             avformat_close_input(&newCtx);
             msleep(200);
             continue;
@@ -493,6 +663,7 @@ void PlaybackWorker::run() {
                 track->streamIndex = i;
                 track->codecCtx = ctx;
                 track->provider = m_providers[providerIndex];
+                track->feedIndex = providerIndex;
 
                 {
                     QMutexLocker bufferLocker(&m_bufferMutex);
@@ -500,7 +671,8 @@ void PlaybackWorker::run() {
                 }
 
                 providerIndex++;
-                qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider" << (providerIndex-1);
+                qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider"
+                         << (providerIndex - 1);
             }
         }
 
@@ -510,10 +682,16 @@ void PlaybackWorker::run() {
             AVCodecParameters* codecParams = m_fmtCtx->streams[i]->codecpar;
             if (codecParams->codec_type == AVMEDIA_TYPE_AUDIO) {
                 const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
-                if (!codec) { audioViewIdx++; continue; }
+                if (!codec) {
+                    audioViewIdx++;
+                    continue;
+                }
 
                 AVCodecContext* ctx = avcodec_alloc_context3(codec);
-                if (!ctx) { audioViewIdx++; continue; }
+                if (!ctx) {
+                    audioViewIdx++;
+                    continue;
+                }
                 avcodec_parameters_to_context(ctx, codecParams);
                 ctx->thread_count = 0;
 
@@ -529,8 +707,8 @@ void PlaybackWorker::run() {
                 aTrack->viewIndex = audioViewIdx;
                 m_audioDecoderBank.append(aTrack);
 
-                qDebug() << "Worker: Initialized Audio Decoder for Stream" << i
-                         << "view" << audioViewIdx;
+                qDebug() << "Worker: Initialized Audio Decoder for Stream" << i << "view"
+                         << audioViewIdx;
                 audioViewIdx++;
             }
         }
@@ -547,11 +725,23 @@ void PlaybackWorker::run() {
         if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
         return;
     }
+
+    int outputWidth = 1920;
+    int outputHeight = 1080;
+    if (!m_decoderBank.isEmpty() && m_decoderBank[0]->codecCtx) {
+        outputWidth = qMax(2, m_decoderBank[0]->codecCtx->width);
+        outputHeight = qMax(2, m_decoderBank[0]->codecCtx->height);
+    }
+    initializeOutputGraph(m_decoderBank.size(), outputWidth, outputHeight);
+
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     AVFrame* audioFrame = av_frame_alloc();
 
-    { QMutexLocker locker(&m_mutex); m_seekTargetMs = -1; }
+    {
+        QMutexLocker locker(&m_mutex);
+        m_seekTargetMs = -1;
+    }
 
     // Telemetry: emit a SEC line once per wall-second.
     int64_t lastTelemetryMs = 0;
@@ -579,6 +769,7 @@ void PlaybackWorker::run() {
             m_audioQueue.clear();
             if (m_audioPlayer) m_audioPlayer->clear();
         }
+        if (m_outputTargetsDirty.load(std::memory_order_relaxed)) rebuildOutputEndpoints();
 
         // --- Telemetry: once per wall-second (spec §11.1) ---
         const int64_t nowMs = wallClock.elapsed();
@@ -603,7 +794,7 @@ void PlaybackWorker::run() {
                 // If a frame at P exists and is already the delivered one, idle.
                 QMutexLocker bufferLocker(&m_bufferMutex);
                 if (!m_decoderBank.isEmpty()) {
-                    QVideoFrame f;
+                    MediaVideoFrame f;
                     int64_t p = -1;
                     DecoderTrack* ref = m_decoderBank[0];
                     if (!ref->buffer.frameAt(P, f, p) || p != ref->lastDeliveredPtsMs)
@@ -633,6 +824,7 @@ void PlaybackWorker::run() {
         if (seekTarget >= 0) {
             // Anchor direction by the recorded move sign (seekTo sets it in T6).
             int seekDir = m_lastMoveDir.load(std::memory_order_relaxed);
+            if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
             repositionTo(seekTarget, seekDir, pkt, frame, audioFrame);
             continue;
         }
@@ -661,6 +853,10 @@ void PlaybackWorker::run() {
                 av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
                 clearAllBuffers();
                 m_audioQueue.clear();
+                for (auto* aTrack : m_audioDecoderBank) {
+                    aTrack->lastEnqueuedPtsMs = -1;
+                    aTrack->lastCachedPtsMs = -1;
+                }
                 if (m_audioPlayer) m_audioPlayer->clear();
                 m_counters.skipForward++;
                 // Fall through into the fill below (decimated) to repopulate.
@@ -793,6 +989,10 @@ void PlaybackWorker::run() {
             QMutexLocker bufferLocker(&m_bufferMutex);
             for (auto* track : m_decoderBank)
                 track->buffer.trim(keepFrom, keepTo);
+            if (m_outputCache) {
+                const qint64 keepAudioFromSample = qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
+                m_outputCache->trimBefore(keepFrom, keepAudioFromSample);
+            }
         }
         m_audioQueue.dropOlderThan(P, kAudioLeadMs);
 
@@ -887,15 +1087,54 @@ void PlaybackWorker::run() {
 void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     struct PendingDeliver {
         FrameProvider* provider = nullptr;
-        QVideoFrame frame;
+        MediaVideoFrame frame;
     };
 
     QVector<PendingDeliver> pending;
+    const bool outputGraphActive = m_outputRuntime != nullptr;
+    const FrameRate rate = FrameRate::fromFraction(fps(), 1);
+    const qint64 outputFrameIndex = rate.msToFrameIndex(P);
     {
         QMutexLocker bufferLocker(&m_bufferMutex);
+        int placeholderWidth = 1920;
+        int placeholderHeight = 1080;
+        QVector<QVector<TrackBuffer::Frame>> snapshots;
+        snapshots.reserve(m_decoderBank.size());
+        for (auto* track : m_decoderBank) {
+            QVector<TrackBuffer::Frame> frames =
+                track ? track->buffer.framesSnapshot() : QVector<TrackBuffer::Frame>();
+            for (const TrackBuffer::Frame& frame : frames) {
+                if (frame.frame.isValid()) {
+                    placeholderWidth = frame.frame.width;
+                    placeholderHeight = frame.frame.height;
+                    break;
+                }
+            }
+            snapshots.append(frames);
+        }
+
+        OutputFrameCache cache(m_decoderBank.size(), placeholderWidth, placeholderHeight);
+        for (int trackIndex = 0; trackIndex < m_decoderBank.size(); ++trackIndex) {
+            DecoderTrack* track = m_decoderBank[trackIndex];
+            if (!track) continue;
+            for (TrackBuffer::Frame frame : snapshots[trackIndex]) {
+                frame.frame.feedIndex = track->feedIndex;
+                cache.insertVideoFrame(frame.frame);
+            }
+        }
+
+        OutputBusEngine engine(rate, m_decoderBank.size(), placeholderWidth, placeholderHeight);
+        PlaybackStateSnapshot state;
+        state.playheadMs = P;
+        state.playing = false;
+        state.speed = 1.0;
+        state.playStartedAtOutputFrame = outputFrameIndex;
+        state.playStartedAtPlayheadMs = P;
+        state.selectedFeedIndex = m_decoderBank.isEmpty() ? -1 : 0;
+
         for (auto* track : m_decoderBank) {
             if (!track || !track->provider) continue;
-            QVideoFrame f;
+            MediaVideoFrame f;
             int64_t p;
             if (track->buffer.frameAt(P, f, p)) {
                 // Direction-aware dedup (spec §5): forbid out-of-order paints.
@@ -912,55 +1151,59 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
                 if (p == last) deliver = false; // already shown
                 if (deliver) {
                     track->lastDeliveredPtsMs = p;
-                    pending.append({track->provider, f});
+                    if (outputGraphActive) continue;
+                    OutputBusFrame busFrame =
+                        engine.renderFeed(track->feedIndex, outputFrameIndex, state, cache);
+                    pending.append({track->provider, busFrame.video});
                 }
             }
         }
     }
 
-    for (const auto &item : pending) {
-        if (item.provider) item.provider->deliverFrame(item.frame);
+    for (const auto& item : pending) {
+        QtPreviewSink sink(item.provider);
+        sink.deliver(item.frame);
     }
 }
 
-QVideoFrame PlaybackWorker::convertToQVideoFrame(AVFrame* frame) {
+MediaVideoFrame PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int feedIndex) {
     // Our recordings are always MPEG-2 all-intra YUV420P. Reject anything else
     // (a foreign MKV, 10-bit or 4:2:2 content) rather than copying it with the
     // wrong plane geometry and rendering garbage. Returns an invalid frame the
     // caller skips.
     if (frame->format != AV_PIX_FMT_YUV420P || frame->width <= 0 || frame->height <= 0)
-        return QVideoFrame();
+        return MediaVideoFrame();
 
-    QVideoFrameFormat format(QSize(frame->width, frame->height), QVideoFrameFormat::Format_YUV420P);
-    // Signal colorimetry explicitly instead of relying on Qt's "height > 576 =>
-    // BT.709 else BT.601" guess: HD is BT.709, SD BT.601; our MPEG-2 is limited
-    // range. Deterministic and at least as correct as the heuristic.
-    format.setColorSpace(frame->height > 576 ? QVideoFrameFormat::ColorSpace_BT709
-                                             : QVideoFrameFormat::ColorSpace_BT601);
-    format.setColorRange(QVideoFrameFormat::ColorRange_Video);
+    MediaVideoFrame out;
+    out.feedIndex = feedIndex;
+    out.width = frame->width;
+    out.height = frame->height;
+    out.format = MediaPixelFormat::Yuv420p;
+    out.strideY = frame->width;
+    out.strideU = (frame->width + 1) / 2;
+    out.strideV = (frame->width + 1) / 2;
+    const int chromaH = (frame->height + 1) / 2;
+    out.planeY = QByteArray(out.strideY * frame->height, '\0');
+    out.planeU = QByteArray(out.strideU * chromaH, '\0');
+    out.planeV = QByteArray(out.strideV * chromaH, '\0');
 
-    QVideoFrame qFrame(format);
-    // On map failure, return invalid — never deliver an unmapped/blank frame.
-    if (!qFrame.map(QVideoFrame::WriteOnly)) return QVideoFrame();
-
-    // Efficient copy of the YUV planes. Chroma planes are ceil(w/2) x ceil(h/2)
-    // for YUV420P; copying the full ceil extent avoids an uninitialized fringe
-    // on the right/bottom edge for odd recording dimensions.
+    QByteArray* dstPlanes[3] = {&out.planeY, &out.planeU, &out.planeV};
+    const int dstStrides[3] = {out.strideY, out.strideU, out.strideV};
     for (int i = 0; i < 3; ++i) {
         uint8_t* src = frame->data[i];
-        uint8_t* dst = qFrame.bits(i);
+        if (!src) return MediaVideoFrame();
+        char* dst = dstPlanes[i]->data();
         int srcStride = frame->linesize[i];
-        int dstStride = qFrame.bytesPerLine(i);
+        int dstStride = dstStrides[i];
         int height = (i == 0) ? frame->height : (frame->height + 1) / 2;
         int width = (i == 0) ? frame->width : (frame->width + 1) / 2;
-        int copyW = qMin(width, qMin(srcStride, dstStride));
+        int copyW = qMin(width, qMin(qAbs(srcStride), dstStride));
         for (int y = 0; y < height; ++y) {
-            memcpy(dst + y * dstStride, src + y * srcStride, copyW);
+            const uint8_t* srcLine =
+                srcStride >= 0 ? (src + y * srcStride) : (src + (height - 1 - y) * -srcStride);
+            memcpy(dst + y * dstStride, srcLine, size_t(copyW));
         }
     }
-    qFrame.unmap();
 
-    // Qt's VideoSink will automatically handle the OpenGL texture upload
-    // when this frame is delivered to the GPU-backed VideoOutput.
-    return qFrame;
+    return out;
 }
