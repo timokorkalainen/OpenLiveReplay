@@ -24,9 +24,10 @@ private slots:
     void malformedLegacyVideoPacketStaysMalformed();
     void nativeRtmpConnectAdvertisesEnhancedCodecCapabilities();
     void nativeRtmpAcknowledgesServerReceiveWindows();
-    void nativeRtmpAudioUsesVideoTimelineAnchor();
-    void nativeRtmpVideoUsesAudioTimelineAnchorWhenAudioArrivesFirst();
-    void nativeRtmpAudioDiscontinuityUsesFreshAudioAnchor();
+    void nativeRtmpAudioFollowsSharedVideoAnchor();
+    void nativeRtmpVideoBindsToSharedAnchorWhenAudioArrivesFirst();
+    void nativeRtmpAudioFollowsVideoReanchorWithoutDrift();
+    void nativeRtmpAudioDiscontinuityKeepsSharedAnchor();
 #endif
     void canConstructFfmpegSession();
     void nativeFailureReasonStartsEmpty();
@@ -198,21 +199,26 @@ void TestIngestBackendSelector::nativeRtmpAcknowledgesServerReceiveWindows() {
     QCOMPARE(sequence, quint32(12));
 }
 
-void TestIngestBackendSelector::nativeRtmpAudioUsesVideoTimelineAnchor() {
+void TestIngestBackendSelector::nativeRtmpAudioFollowsSharedVideoAnchor() {
     NativeRtmpIngestSession session(0, 640, 480, nullptr);
 
-    int64_t clockMs = 100;
+    int64_t clockMs = 10000;
     IngestCallbacks callbacks;
     callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
     session.m_callbacks = callbacks;
 
-    QCOMPARE(session.sourcePtsMsForVideo(0, 0), int64_t(100));
+    // First video establishes the shared anchor: FLV ms 1000 -> recording clock 10000.
+    QCOMPARE(session.sourcePtsMsForVideo(1000, 1000), int64_t(10000));
 
-    clockMs = 5000;
-    QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
+    // Co-timed audio binds to the SAME shared anchor; it must not read a fresh clock.
+    clockMs = 99999;
+    QCOMPARE(session.sourcePtsMsForAudio(1000), int64_t(10000));
+
+    // Later audio advances against the unchanged anchor.
+    QCOMPARE(session.sourcePtsMsForAudio(1100), int64_t(10100));
 }
 
-void TestIngestBackendSelector::nativeRtmpVideoUsesAudioTimelineAnchorWhenAudioArrivesFirst() {
+void TestIngestBackendSelector::nativeRtmpVideoBindsToSharedAnchorWhenAudioArrivesFirst() {
     NativeRtmpIngestSession session(0, 640, 480, nullptr);
 
     int64_t clockMs = 100;
@@ -220,26 +226,61 @@ void TestIngestBackendSelector::nativeRtmpVideoUsesAudioTimelineAnchorWhenAudioA
     callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
     session.m_callbacks = callbacks;
 
+    // Audio with no prior video establishes the shared anchor against the clock.
     QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
 
+    // A later co-timed video maps against THAT shared anchor, not a fresh clock read.
     clockMs = 5000;
     QCOMPARE(session.sourcePtsMsForVideo(0, 0), int64_t(100));
     QCOMPARE(session.sourcePtsMsForAudio(40), int64_t(140));
 }
 
-void TestIngestBackendSelector::nativeRtmpAudioDiscontinuityUsesFreshAudioAnchor() {
+void TestIngestBackendSelector::nativeRtmpAudioFollowsVideoReanchorWithoutDrift() {
     NativeRtmpIngestSession session(0, 640, 480, nullptr);
 
-    int64_t clockMs = 100;
+    int64_t clockMs = 10000;
     IngestCallbacks callbacks;
     callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
     session.m_callbacks = callbacks;
 
-    QCOMPARE(session.sourcePtsMsForVideo(0, 0), int64_t(100));
-    QCOMPARE(session.sourcePtsMsForAudio(0), int64_t(100));
+    // Shared anchor established by first video at FLV ms 1000 -> clock 10000.
+    QCOMPARE(session.sourcePtsMsForVideo(1000, 1000), int64_t(10000));
+    QCOMPARE(session.sourcePtsMsForAudio(1000), int64_t(10000));
 
-    clockMs = 5000;
-    QCOMPARE(session.sourcePtsMsForAudio(10000), int64_t(5000));
+    // Video forward jump (delta 8000 > kForwardJumpMs=3000) re-anchors to clock 20000.
+    clockMs = 20000;
+    QCOMPARE(session.sourcePtsMsForVideo(9000, 9000), int64_t(20000));
+
+    // Audio at the same FLV clock FOLLOWS the new shared anchor: no A/V drift.
+    clockMs = 99999;
+    QCOMPARE(session.sourcePtsMsForAudio(9000), int64_t(20000));
+}
+
+void TestIngestBackendSelector::nativeRtmpAudioDiscontinuityKeepsSharedAnchor() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    int64_t clockMs = 10000;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    // Shared anchor established by first video at FLV ms 1000 -> clock 10000.
+    QCOMPARE(session.sourcePtsMsForVideo(1000, 1000), int64_t(10000));
+
+    // Audio advances normally; m_prevAudioPtsMs becomes 1000.
+    QCOMPARE(session.sourcePtsMsForAudio(1000), int64_t(10000));
+
+    // An AUDIO discontinuity NOT co-timed with any video re-anchor (delta
+    // 5000 - 1000 = 4000 > kForwardJumpMs=3000) flushes the audio decoder but
+    // must NOT move the shared anchor — video owns re-anchoring. The clock is
+    // moved to a sentinel the audio path must ignore: if it wrongly re-anchored
+    // to the fresh clock the result would be 99999, not 14000.
+    clockMs = 99999;
+    QCOMPARE(session.sourcePtsMsForAudio(5000), int64_t(14000));
+
+    // The shared anchor is unchanged (media 1000 / stream 10000), so the next
+    // audio packet still maps against it.
+    QCOMPARE(session.sourcePtsMsForAudio(5040), int64_t(14040));
 }
 #endif
 

@@ -53,13 +53,14 @@ private:
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
     int m_outputChunkSize = 128;
     int m_streamId = 1;
-    int64_t m_firstDtsMs = -1;
+    int64_t m_anchorMediaMs = -1;      // shared A/V media-timestamp zero (FLV ms)
+    int64_t m_anchorStreamTimeMs = -1; // shared recording-clock zero
     int64_t m_prevDtsMs = -1;
-    int64_t m_anchorStreamTimeMs = -1;
-    int64_t m_firstAudioPtsMs = -1;
     int64_t m_prevAudioPtsMs = -1;
-    int64_t m_audioAnchorStreamTimeMs = -1;
     int64_t m_lastPacketAtMs = -1;
+    int64_t m_lastKeyframeAtMs = -1;
+    int64_t m_lastStatsAtMs = -1;
+    quint64 m_decodeFailures = 0;
     quint64 m_receivedChunkBytes = 0;
     quint64 m_nextAcknowledgementAt = 0;
     quint32 m_acknowledgementWindowSize = 0;
@@ -89,6 +90,7 @@ private:
     bool acknowledgeIncomingBytes(qint64 byteCount, QString* error);
     bool shouldStop() const;
     void log(const QString& message) const;
+    void maybeReportStats();
     void processMessage(const RtmpMessage& message);
     void processVideoMessage(qint64 timestampMs, const QByteArray& payload);
     void processAudioMessage(qint64 timestampMs, const QByteArray& payload);

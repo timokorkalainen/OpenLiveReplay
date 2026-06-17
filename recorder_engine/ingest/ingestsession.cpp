@@ -16,17 +16,36 @@ IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOption
     return IngestBackendKind::Ffmpeg;
 }
 
-SrtHealth srtHealth(const SrtStats& prev, const SrtStats& cur, double amberRetransRate) {
+SourceHealth srtHealth(const IngestStats& prev, const IngestStats& cur, double amberRetransRate) {
     const qint64 dDrop = cur.dropTotal - prev.dropTotal;
     const qint64 dRetrans = cur.retransTotal - prev.retransTotal;
     const qint64 dRecv = cur.recvTotal - prev.recvTotal;
     if (dDrop > 0) {
-        return SrtHealth::Red;
+        return SourceHealth::Red;
     }
     if (dRecv > 0 && double(dRetrans) / double(dRecv) > amberRetransRate) {
-        return SrtHealth::Amber;
+        return SourceHealth::Amber;
     }
-    return SrtHealth::Green;
+    return SourceHealth::Green;
+}
+
+SourceHealth rtmpHealth(const IngestStats& prev, const IngestStats& cur) {
+    if (cur.bytesTotal < prev.bytesTotal || cur.decodeFailures < prev.decodeFailures) {
+        return SourceHealth::Green; // counters reset on reconnect
+    }
+    const bool bytesAdvanced = cur.bytesTotal > prev.bytesTotal;
+    const bool decodeFailedThisWindow = cur.decodeFailures > prev.decodeFailures;
+    if (cur.lastPacketAgeMs >= kRtmpRedStallMs) {
+        return SourceHealth::Red;
+    }
+    if (decodeFailedThisWindow && !bytesAdvanced) {
+        return SourceHealth::Red;
+    }
+    if (decodeFailedThisWindow || cur.lastPacketAgeMs >= kRtmpAmberStallMs ||
+        cur.keyframeAgeMs >= kRtmpAmberKeyframeMs) {
+        return SourceHealth::Amber;
+    }
+    return SourceHealth::Green;
 }
 
 QUrl augmentSrtUrl(const QUrl& url) {

@@ -209,12 +209,12 @@ public:
     Q_INVOKABLE bool isSourceEnabled(int sourceIndex) const;
     // True only while recording and the source's worker reports a live feed.
     Q_INVOKABLE bool isSourceConnected(int sourceIndex) const;
-    // SRT link health for the connection dot. 0=N/A (no SRT stats), 1=green,
-    // 2=amber (stressed), 3=red (recent unrecovered drops).
+    // Source link health for the connection dot, graded per backend (srtHealth /
+    // rtmpHealth). 0=N/A (no stats yet), 1=green, 2=amber (stressed), 3=red.
     Q_INVOKABLE int sourceLinkHealth(int sourceIndex) const;
-    // True once this source has produced at least one SRT stats snapshot
-    // (native SRT only); false for RTMP/UDP/ffmpeg-SRT sources.
-    Q_INVOKABLE bool sourceHasSrtStats(int sourceIndex) const;
+    // True once this source has produced at least one stats snapshot
+    // (native SRT/RTMP only); false for UDP/ffmpeg-SRT sources.
+    Q_INVOKABLE bool sourceHasStats(int sourceIndex) const;
     // Preformatted multi-line cumulative figures for the dot's hover tooltip.
     Q_INVOKABLE QString sourceStatsTooltip(int sourceIndex) const;
     // Config-time check: another source carries the same non-empty URL.
@@ -299,7 +299,7 @@ public slots:
     void onSourceConnectionChanged(int sourceIndex, bool connected);
 
     // Receives ReplayManager::sourceStatsUpdated on the main thread.
-    void onSourceStatsUpdated(int sourceIndex, SrtStats stats);
+    void onSourceStatsUpdated(int sourceIndex, IngestStats stats);
 
 private:
     void syncActiveStreams();
@@ -373,13 +373,13 @@ private:
     // Per-source SRT link-health state, keyed by sourceIndex (parallel to
     // m_sourceConnected). last = most recent snapshot (also shown in the tooltip);
     // seen = false until the first snapshot since (re)connect, so the next snapshot
-    // re-baselines after a counter reset; health = cached SrtHealth (0=N/A..3=red).
-    struct SrtStatsEntry {
-        SrtStats last;
+    // re-baselines after a counter reset; health = cached SourceHealth (0=N/A..3=red).
+    struct IngestStatsEntry {
+        IngestStats last;
         bool seen = false;
         int health = 0;
     };
-    std::vector<SrtStatsEntry> m_sourceStats;
+    std::vector<IngestStatsEntry> m_sourceStats;
     int m_sourceStatsVersion = 0;
     double m_srtAmberPct = 0.02; // retransmit-rate threshold for Amber
     void resetSourceStats(int count);

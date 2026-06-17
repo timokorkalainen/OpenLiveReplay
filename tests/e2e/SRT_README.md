@@ -232,10 +232,10 @@ the `srt_stats` loss telemetry on the connection-status UI (framesync roadmap JI
 ## JIT-5: SRT link telemetry on the connection-status UI
 
 The native SRT ingest samples `srt_bstats` ~1/sec and pushes each cumulative
-snapshot (`SrtStats`: recv / retrans / lossDetected / drop) up the same queued-
-signal path as connection status: `reportStats` → `StreamWorker::statsUpdated` →
-`ReplayManager::sourceStatsUpdated` → `UIManager`. The per-source connection dot
-(`Main.qml`) is graded from the most-recent window:
+snapshot (`IngestStats` with `kind=Srt`: recv / retrans / lossDetected / drop) up
+the same queued-signal path as connection status: `reportStats` →
+`StreamWorker::statsUpdated` → `ReplayManager::sourceStatsUpdated` → `UIManager`. The
+per-source connection dot (`Main.qml`) is graded from the most-recent window:
 
 - **green** — healthy (incl. ARQ quietly recovering everything),
 - **amber** — link stressed: windowed retransmit rate > `OLR_SRT_HEALTH_AMBER_PCT`
@@ -303,3 +303,41 @@ case; `e2e_av_lipsync` (`av-sync`, ffmpeg/UDP) and `e2e_native_srt_lipsync` (`na
 PCR path) both assert mean `(audio − video)` within EBU R37 (−40..+60 ms) — the pre-AUD-4 +63 ms
 exceeds the +60 lag bound; the shared anchor collapses it toward 0. Flash/beep are paired by nearest
 timestamp (robust to a spurious `silencedetect` edge).
+
+## Native RTMP parity (PR A)
+
+Brings the native RTMP ingest (`NativeRtmpIngestSession`) to parity with native SRT for everything
+that applies to an RTMP-over-TCP transport (the SRT-protocol-only bits — `srt_bstats` loss/retrans/
+drop counters, TSBPD, `SRTO_LATENCY`, linger — have no TCP analog and are intentionally excluded).
+
+**Generalized health model.** The SRT-only `SrtStats`/`SrtHealth` pipe is now backend-agnostic:
+`IngestStats` carries a `kind` discriminator plus both the SRT loss counters and generic liveness/
+throughput fields (`bytesTotal`, `lastPacketAgeMs`, `keyframeAgeMs`, `decodeFailures`); the dot is
+graded by one of two pure functions — `srtHealth()` (unchanged) and the new `rtmpHealth()` — selected
+in `UIManager` by `kind`. The signal path (`reportStats` → `StreamWorker::statsUpdated` →
+`ReplayManager::sourceStatsUpdated` → `UIManager`) and the `SourceHealth` green/amber/red dot are
+shared. `rtmpHealth` (TCP has no loss): **red** when the stream stalls (`>= kRtmpRedStallMs` since the
+last media) or decode fails with no fresh bytes; **amber** on a decode failure this window, a brief
+stall (`>= kRtmpAmberStallMs`), or a long keyframe gap (`>= kRtmpAmberKeyframeMs`); else **green**; a
+counter reset (reconnect) clamps green.
+
+**RTMP emits stats.** `NativeRtmpIngestSession` samples ~1/sec from its read loop, filling
+`IngestStats{kind=Rtmp}` from `m_receivedChunkBytes`, the last-packet/keyframe arrival times, and a
+decode-failure counter (keyframes detected from the FLV frame-type nibble; the same value works for
+legacy and enhanced/e-RTMP headers).
+
+**Single shared A/V anchor.** RTMP previously kept two independently-re-anchoring anchor pairs that
+could drift apart across a discontinuity; it now uses one shared anchor (the AUD-4 model): video owns
+re-anchoring (reads `recordingClockMs()` on a forward/backward jump); audio follows, flushing its
+decoder on its own discontinuity but **never moving the anchor** — so A/V stays locked.
+
+**Gates:** `tst_rtmp_health` (unit — the new grader) + the RTMP anchor cases in
+`tst_ingestbackendselector` (shared anchor, audio-follows-video, no-drift, and audio-discontinuity-
+keeps-anchor); `e2e_native_rtmp_ui_stats` (`native-rtmp`) drives the Python RTMP fixture through
+`sync_harness --report-stats` and asserts the engine→`sourceStatsUpdated`→UI path delivers a real
+`kind=rtmp` snapshot (bytes > 0, decodeFailures == 0) over the native backend (asserts the "Native
+RTMP connected" marker, so an ffmpeg fallback fails the gate). `tst_srt_health` and the
+`native-apple-ingest` SRT gates stay green — the SRT path is behavior-identical (a rename only).
+
+Removing the pure-ffmpeg ingest path, making native SRT the default, migrating the udp:// tests to a
+native SRT bridge, and adding a Windows Media Foundation AAC decoder are a separate follow-up (PR B).

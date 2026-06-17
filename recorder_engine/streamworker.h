@@ -88,10 +88,10 @@ signals:
     // ReplayManager with a queued connection.
     void connectionChanged(int sourceIndex, bool connected);
 
-    // Emitted ~1/sec from the capture thread with the source's latest cumulative
-    // SRT receiver stats (native SRT ingest only). Cross-thread: relayed to the UI
-    // through ReplayManager with a queued connection, like connectionChanged.
-    void statsUpdated(int sourceIndex, SrtStats stats);
+    // Emitted ~1/sec from the capture thread with the source's latest ingest stats
+    // (native SRT or RTMP; tagged by IngestStats::kind). Cross-thread: relayed to the
+    // UI through ReplayManager with a queued connection, like connectionChanged.
+    void statsUpdated(int sourceIndex, IngestStats stats);
 
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
