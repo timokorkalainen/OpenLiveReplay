@@ -189,6 +189,8 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/output/queuedoutputsink.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/yuv420pcompositor.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/qtpreviewsink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/ndiabi.h"
+    "${CMAKE_SOURCE_DIR}/playback/output/ndiruntimepaths.h"
     "${CMAKE_SOURCE_DIR}/playback/output/ndisink.cpp"
 )
 target_include_directories(olr_test_playback PUBLIC

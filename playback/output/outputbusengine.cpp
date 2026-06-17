@@ -2,13 +2,93 @@
 
 #include "playback/output/yuv420pcompositor.h"
 
+#include <QList>
+
+namespace {
+
+constexpr quint32 kFnvOffset = 2166136261u;
+constexpr quint32 kFnvPrime = 16777619u;
+
+quint32 hashBytes(quint32 hash, const QByteArray& bytes) {
+    for (const char byte : bytes) {
+        hash ^= quint8(byte);
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+quint32 hashInt(quint32 hash, qint64 value) {
+    for (int i = 0; i < 8; ++i) {
+        hash ^= quint8((quint64(value) >> (i * 8)) & 0xff);
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+bool isSilentAudio(const MediaAudioFrame& audio) {
+    for (const char sample : audio.pcm) {
+        if (sample != '\0') return false;
+    }
+    return true;
+}
+
+quint32 videoHashFor(const MediaVideoFrame& video) {
+    quint32 hash = kFnvOffset;
+    hash = hashInt(hash, video.feedIndex);
+    hash = hashInt(hash, video.ptsMs);
+    hash = hashInt(hash, video.width);
+    hash = hashInt(hash, video.height);
+    hash = hashInt(hash, int(video.format));
+    hash = hashBytes(hash, video.planeY);
+    hash = hashBytes(hash, video.planeU);
+    hash = hashBytes(hash, video.planeV);
+    return hash;
+}
+
+quint32 audioHashFor(const MediaAudioFrame& audio) {
+    quint32 hash = kFnvOffset;
+    hash = hashInt(hash, audio.feedIndex);
+    hash = hashInt(hash, audio.startSample);
+    hash = hashInt(hash, audio.sampleRate);
+    hash = hashInt(hash, audio.channels);
+    hash = hashInt(hash, int(audio.format));
+    hash = hashBytes(hash, audio.pcm);
+    return hash;
+}
+
+} // namespace
+
+QDebug operator<<(QDebug debug, const OutputFrameIdentity& identity) {
+    QDebugStateSaver saver(debug);
+    debug.nospace() << "OutputFrameIdentity(bus=" << int(identity.bus.kind) << ':'
+                    << identity.bus.index << ", frame=" << identity.outputFrameIndex
+                    << ", playhead=" << identity.sampledPlayheadMs
+                    << ", sourceFeed=" << identity.sourceFeedIndex
+                    << ", sourcePts=" << identity.sourcePtsMs
+                    << ", placeholder=" << identity.videoPlaceholder
+                    << ", audioSilent=" << identity.audioSilent
+                    << ", videoHash=" << identity.videoHash << ", audioHash=" << identity.audioHash
+                    << ')';
+    return debug;
+}
+
+OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame) {
+    OutputFrameIdentity identity;
+    identity.bus = frame.bus;
+    identity.outputFrameIndex = frame.outputFrameIndex;
+    identity.sampledPlayheadMs = frame.sampledPlayheadMs;
+    identity.sourceFeedIndex = frame.video.feedIndex;
+    identity.sourcePtsMs = frame.video.ptsMs;
+    identity.videoPlaceholder = frame.video.isPlaceholder;
+    identity.audioSilent = isSilentAudio(frame.audio);
+    identity.videoHash = videoHashFor(frame.video);
+    identity.audioHash = audioHashFor(frame.audio);
+    return identity;
+}
+
 OutputBusEngine::OutputBusEngine(FrameRate rate, int feedCount, int width, int height)
     : m_clock(rate), m_feedCount(qMax(0, feedCount)), m_width(qMax(2, width)),
       m_height(qMax(2, height)) {}
-
-void OutputBusEngine::setTargetAssignments(const QList<OutputTargetAssignment>& assignments) {
-    m_assignments = assignments;
-}
 
 int OutputBusEngine::audioSamplesPerFrame() const {
     return audioSamplesForOutputFrame(0);
@@ -44,14 +124,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     out.video.ptsMs = out.sampledPlayheadMs;
     out.video.outputFrameIndex = outputFrameIndex;
 
-    MediaAudioFrame audio;
-    audio.feedIndex = -1;
-    audio.startSample = sourceAudioStartSample(outputFrameIndex, state);
-    audio.sampleRate = 48000;
-    audio.channels = 2;
-    audio.format = MediaSampleFormat::S16Interleaved;
-    audio.pcm = silentS16Stereo(audioSamplesForOutputFrame(outputFrameIndex));
-    out.audio = audio;
+    out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
+    out.identity = outputFrameIdentityFor(out);
     return out;
 }
 
@@ -75,6 +149,15 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     }
     out.video.outputFrameIndex = outputFrameIndex;
 
+    out.audio = renderAudioForFeed(feedIndex, outputFrameIndex, state, cache, allowAudio);
+    out.identity = outputFrameIdentityFor(out);
+    return out;
+}
+
+MediaAudioFrame OutputBusEngine::renderAudioForFeed(int feedIndex, qint64 outputFrameIndex,
+                                                    const PlaybackStateSnapshot& state,
+                                                    const OutputFrameCache& cache,
+                                                    bool allowAudio) const {
     MediaAudioFrame audio;
     audio.feedIndex = feedIndex;
     audio.startSample = sourceAudioStartSample(outputFrameIndex, state);
@@ -86,8 +169,7 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     audio.pcm = (allowAudio && oneXForward && feedIndex >= 0 && feedIndex < m_feedCount)
                     ? cache.audioSpanOrSilence(feedIndex, audio.startSample, samples)
                     : silentS16Stereo(samples);
-    out.audio = audio;
-    return out;
+    return audio;
 }
 
 qint64 OutputBusEngine::audioBoundarySampleForFrame(qint64 outputFrameIndex) const {

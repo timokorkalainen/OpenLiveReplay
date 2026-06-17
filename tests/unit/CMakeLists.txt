@@ -68,6 +68,13 @@ olr_add_unit_test(tst_outputdispatcher olr_test_playback)
 olr_add_unit_test(tst_outputruntime olr_test_playback)
 olr_add_unit_test(tst_queuedoutputsink olr_test_playback)
 olr_add_unit_test(tst_ndisink olr_test_playback)
+qt_add_executable(tst_ndi_runtime_smoke tst_ndi_runtime_smoke.cpp)
+target_link_libraries(tst_ndi_runtime_smoke PRIVATE Qt6::Test olr_test_playback olr_warnings olr_sanitize)
+add_test(NAME tst_ndi_runtime_smoke COMMAND tst_ndi_runtime_smoke)
+set_tests_properties(tst_ndi_runtime_smoke PROPERTIES
+    LABELS "ndi-runtime"
+    TIMEOUT 420
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=420000")
 olr_add_unit_test(tst_streamdeckmappingstore olr_test_core)
 olr_add_unit_test(tst_srt_health olr_test_core)
 olr_add_unit_test(tst_rtmp_health      olr_test_core)

@@ -29,8 +29,7 @@ private slots:
     void feedBusUsesOwnVideoAndAudioAtOneX();
     void pgmFollowsSelectedFeed();
     void pausedAudioIsSilenceButVideoRepeats();
-    void targetAssignmentsDoNotAffectRenderedBusFrames();
-    void multiviewComposesFeedsAndCarriesSilence();
+    void multiviewComposesFeedsAndCarriesSelectedFeedAudio();
     void ntscAudioUsesRationalSampleBoundaries();
 };
 
@@ -93,39 +92,21 @@ void TestOutputBusEngine::pausedAudioIsSilenceButVideoRepeats() {
     QCOMPARE(pcm[0], qint16(0));
 }
 
-void TestOutputBusEngine::targetAssignmentsDoNotAffectRenderedBusFrames() {
-    OutputFrameCache cache(1, 4, 4);
-    cache.insertVideoFrame(video(0, 100, 55));
-
-    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
-    PlaybackStateSnapshot state;
-    state.playheadMs = 100;
-    state.playing = false;
-
-    auto before = engine.renderFeed(0, 1, state, cache);
-    OutputTargetAssignment ndi;
-    ndi.sourceBus = OutputBusId::feed(0);
-    ndi.kind = OutputTargetKind::Ndi;
-    ndi.enabled = true;
-    engine.setTargetAssignments({ndi});
-    auto after = engine.renderFeed(0, 2, state, cache);
-
-    QCOMPARE(uchar(before.video.planeY.at(0)), uchar(after.video.planeY.at(0)));
-    QCOMPARE(before.video.ptsMs, after.video.ptsMs);
-}
-
-void TestOutputBusEngine::multiviewComposesFeedsAndCarriesSilence() {
+void TestOutputBusEngine::multiviewComposesFeedsAndCarriesSelectedFeedAudio() {
     OutputFrameCache cache(4, 4, 4);
     cache.insertVideoFrame(video(0, 100, 10));
     cache.insertVideoFrame(video(1, 100, 20));
     cache.insertVideoFrame(video(2, 100, 30));
     cache.insertVideoFrame(video(3, 100, 40));
+    cache.insertAudioFrame(audio(0, 9600, 100));
+    cache.insertAudioFrame(audio(1, 9600, 200));
 
     OutputBusEngine engine(FrameRate::fromFraction(25, 1), 4, 8, 8);
     PlaybackStateSnapshot state;
     state.playheadMs = 100;
     state.playing = true;
     state.speed = 1.0;
+    state.selectedFeedIndex = 1;
 
     auto multiview = engine.renderMultiview(5, state, cache);
     QCOMPARE(multiview.bus, OutputBusId::multiview());
@@ -134,7 +115,8 @@ void TestOutputBusEngine::multiviewComposesFeedsAndCarriesSilence() {
     QCOMPARE(uchar(multiview.video.planeY.at(4 * 8)), uchar(30));
     QCOMPARE(uchar(multiview.video.planeY.at(4 * 8 + 4)), uchar(40));
     const auto* pcm = reinterpret_cast<const qint16*>(multiview.audio.pcm.constData());
-    QCOMPARE(pcm[0], qint16(0));
+    QCOMPARE(multiview.audio.feedIndex, 1);
+    QCOMPARE(pcm[0], qint16(200));
 }
 
 void TestOutputBusEngine::ntscAudioUsesRationalSampleBoundaries() {

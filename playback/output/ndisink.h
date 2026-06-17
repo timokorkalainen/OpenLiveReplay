@@ -15,6 +15,23 @@ public:
     virtual bool sendFrame(const OutputBusFrame& frame) = 0;
 };
 
+enum class NdiOutputState {
+    Stopped,
+    RuntimeUnavailable,
+    InvalidAssignment,
+    CreateFailed,
+    Active,
+    SendFailed,
+};
+
+struct NdiOutputStatus {
+    NdiOutputState state = NdiOutputState::Stopped;
+    QString message;
+    qint64 framesSubmitted = 0;
+    qint64 sendFailures = 0;
+    OutputFrameIdentity lastFrameIdentity;
+};
+
 class NdiOutputSink final : public IOutputSink {
 public:
     NdiOutputSink();
@@ -26,15 +43,18 @@ public:
     void stop() override;
     bool isActive() const override { return m_active; }
     bool submit(const OutputBusFrame& frame) override;
+    NdiOutputStatus status() const { return m_status; }
 
 private:
     static QString senderNameFor(const OutputTargetAssignment& assignment);
+    void setStatus(NdiOutputState state, const QString& message);
 
     std::unique_ptr<INdiSenderBackend> m_ownedBackend;
     INdiSenderBackend* m_backend = nullptr;
     OutputTargetAssignment m_assignment;
     FrameRate m_rate;
     bool m_active = false;
+    NdiOutputStatus m_status;
 };
 
 #endif // NDISINK_H

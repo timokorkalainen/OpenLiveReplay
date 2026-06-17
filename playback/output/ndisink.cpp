@@ -1,71 +1,17 @@
 #include "playback/output/ndisink.h"
 
 #include <QByteArray>
-#include <QDir>
 #include <QLibrary>
-#include <QStringList>
 #include <QVector>
 
-#include <algorithm>
-#include <cstdint>
+#include "playback/output/ndiabi.h"
+#include "playback/output/ndiruntimepaths.h"
+
 #include <cstring>
-#include <limits>
 
 namespace {
 
-constexpr quint32 ndiFourCc(char a, char b, char c, char d) {
-    return quint32(quint8(a)) | (quint32(quint8(b)) << 8) | (quint32(quint8(c)) << 16) |
-           (quint32(quint8(d)) << 24);
-}
-
-constexpr quint32 kNdiFourCcI420 = ndiFourCc('I', '4', '2', '0');
-constexpr quint32 kNdiFourCcFltp = ndiFourCc('F', 'L', 'T', 'p');
-constexpr int kNdiFrameFormatProgressive = 1;
-constexpr qint64 kNdiTimecodeSynthesize = std::numeric_limits<qint64>::max();
-
-struct NDIlib_send_create_t {
-    const char* p_ndi_name = nullptr;
-    const char* p_groups = nullptr;
-    bool clock_video = false;
-    bool clock_audio = false;
-};
-
-struct NDIlib_video_frame_v2_t {
-    int xres = 0;
-    int yres = 0;
-    quint32 FourCC = kNdiFourCcI420;
-    int frame_rate_N = 0;
-    int frame_rate_D = 1;
-    float picture_aspect_ratio = 0.0f;
-    int frame_format_type = kNdiFrameFormatProgressive;
-    qint64 timecode = kNdiTimecodeSynthesize;
-    quint8* p_data = nullptr;
-    int line_stride_in_bytes = 0;
-    const char* p_metadata = nullptr;
-    qint64 timestamp = 0;
-};
-
-struct NDIlib_audio_frame_v3_t {
-    int sample_rate = 48000;
-    int no_channels = 2;
-    int no_samples = 0;
-    qint64 timecode = kNdiTimecodeSynthesize;
-    quint32 FourCC = kNdiFourCcFltp;
-    quint8* p_data = nullptr;
-    int channel_stride_in_bytes = 0;
-    const char* p_metadata = nullptr;
-    qint64 timestamp = 0;
-};
-
-using NDIlib_send_instance_t = void*;
-using NDIlib_initialize_fn = bool (*)();
-using NDIlib_destroy_fn = void (*)();
-using NDIlib_send_create_fn = NDIlib_send_instance_t (*)(const NDIlib_send_create_t*);
-using NDIlib_send_destroy_fn = void (*)(NDIlib_send_instance_t);
-using NDIlib_send_send_video_v2_fn = void (*)(NDIlib_send_instance_t,
-                                              const NDIlib_video_frame_v2_t*);
-using NDIlib_send_send_audio_v3_fn = void (*)(NDIlib_send_instance_t,
-                                              const NDIlib_audio_frame_v3_t*);
+using namespace olr::ndi;
 
 bool copyPlane(const QByteArray& src, int srcStride, int width, int height, char* dst,
                int dstStride) {
@@ -75,6 +21,20 @@ bool copyPlane(const QByteArray& src, int srcStride, int width, int height, char
         memcpy(dst + y * dstStride, src.constData() + y * srcStride, size_t(width));
     }
     return true;
+}
+
+bool hasSendableBroadcastAudio(const MediaAudioFrame& audio) {
+    if (audio.format != MediaSampleFormat::S16Interleaved || audio.sampleRate <= 0 ||
+        audio.channels <= 0) {
+        return false;
+    }
+
+    const int sampleFrames = audio.sampleFrames();
+    if (sampleFrames <= 0) return false;
+
+    const qsizetype expectedBytes =
+        qsizetype(sampleFrames) * audio.channels * qsizetype(sizeof(qint16));
+    return audio.pcm.size() >= expectedBytes;
 }
 
 class NdiDynamicSenderBackend final : public INdiSenderBackend {
@@ -111,26 +71,27 @@ public:
     }
 
     bool sendFrame(const OutputBusFrame& frame) override {
-        if (!m_sender || !m_sendVideo || !frame.video.isValid()) return false;
+        if (!m_sender || !m_sendVideo || !m_sendAudio || !frame.video.isValid()) return false;
         if (!packI420(frame.video)) return false;
+        NDIlib_audio_frame_v3_t audioFrame;
+        if (!packAudio(frame.audio, &audioFrame)) return false;
 
         NDIlib_video_frame_v2_t videoFrame;
         videoFrame.xres = frame.video.width;
         videoFrame.yres = frame.video.height;
-        videoFrame.FourCC = kNdiFourCcI420;
+        videoFrame.FourCC = kFourCcI420;
         videoFrame.frame_rate_N = m_rate.numerator;
         videoFrame.frame_rate_D = m_rate.denominator;
         videoFrame.picture_aspect_ratio =
             frame.video.height > 0 ? float(frame.video.width) / float(frame.video.height) : 0.0f;
-        videoFrame.frame_format_type = kNdiFrameFormatProgressive;
-        videoFrame.timecode = kNdiTimecodeSynthesize;
+        videoFrame.frame_format_type = kFrameFormatProgressive;
+        videoFrame.timecode = kTimecodeSynthesize;
         videoFrame.p_data = reinterpret_cast<quint8*>(m_videoBuffer.data());
         videoFrame.line_stride_in_bytes = frame.video.width;
         videoFrame.p_metadata = nullptr;
         videoFrame.timestamp = 0;
         m_sendVideo(m_sender, &videoFrame);
-
-        sendAudio(frame.audio);
+        m_sendAudio(m_sender, &audioFrame);
         return true;
     }
 
@@ -138,24 +99,7 @@ private:
     bool ensureLoaded() {
         if (m_loaded) return true;
 
-        QStringList candidates;
-        const QByteArray explicitPath = qgetenv("OLR_NDI_RUNTIME_LIBRARY");
-        if (!explicitPath.isEmpty()) candidates.append(QString::fromLocal8Bit(explicitPath));
-
-#if defined(Q_OS_WIN)
-        const QString runtimeDir = QString::fromLocal8Bit(qgetenv("NDI_RUNTIME_DIR_V6"));
-        if (!runtimeDir.isEmpty())
-            candidates.append(
-                QDir(runtimeDir).filePath(QStringLiteral("Processing.NDI.Lib.x64.dll")));
-        candidates.append(QStringLiteral("Processing.NDI.Lib.x64.dll"));
-#elif defined(Q_OS_MACOS)
-        candidates.append(QStringLiteral("/usr/local/lib/libndi.dylib"));
-        candidates.append(QStringLiteral("libndi.dylib"));
-#else
-        candidates.append(QStringLiteral("libndi.so"));
-#endif
-
-        for (const QString& candidate : candidates) {
+        for (const QString& candidate : runtimeLibraryCandidates()) {
             if (candidate.isEmpty()) continue;
             m_library.setFileName(candidate);
             if (!m_library.load()) continue;
@@ -181,7 +125,7 @@ private:
             m_library.resolve("NDIlib_send_send_video_v2"));
         m_sendAudio = reinterpret_cast<NDIlib_send_send_audio_v3_fn>(
             m_library.resolve("NDIlib_send_send_audio_v3"));
-        return m_sendCreate && m_sendDestroy && m_sendVideo;
+        return m_sendCreate && m_sendDestroy && m_sendVideo && m_sendAudio;
     }
 
     bool packI420(const MediaVideoFrame& frame) {
@@ -200,16 +144,12 @@ private:
                copyPlane(frame.planeV, frame.strideV, chromaW, chromaH, v, chromaW);
     }
 
-    void sendAudio(const MediaAudioFrame& audio) {
-        if (!m_sendAudio || audio.format != MediaSampleFormat::S16Interleaved ||
-            audio.sampleRate <= 0 || audio.channels <= 0) {
-            return;
-        }
-        const int sampleFrames = audio.sampleFrames();
-        if (sampleFrames <= 0) return;
+    bool packAudio(const MediaAudioFrame& audio, NDIlib_audio_frame_v3_t* audioFrame) {
+        if (!audioFrame || !hasSendableBroadcastAudio(audio)) return false;
 
+        const int sampleFrames = audio.sampleFrames();
         const int expectedBytes = sampleFrames * audio.channels * int(sizeof(qint16));
-        if (audio.pcm.size() < expectedBytes) return;
+        if (audio.pcm.size() < expectedBytes) return false;
 
         m_audioFloat.resize(sampleFrames * audio.channels);
         const auto* in = reinterpret_cast<const qint16*>(audio.pcm.constData());
@@ -220,17 +160,16 @@ private:
             }
         }
 
-        NDIlib_audio_frame_v3_t audioFrame;
-        audioFrame.sample_rate = audio.sampleRate;
-        audioFrame.no_channels = audio.channels;
-        audioFrame.no_samples = sampleFrames;
-        audioFrame.timecode = kNdiTimecodeSynthesize;
-        audioFrame.FourCC = kNdiFourCcFltp;
-        audioFrame.p_data = reinterpret_cast<quint8*>(m_audioFloat.data());
-        audioFrame.channel_stride_in_bytes = sampleFrames * int(sizeof(float));
-        audioFrame.p_metadata = nullptr;
-        audioFrame.timestamp = 0;
-        m_sendAudio(m_sender, &audioFrame);
+        audioFrame->sample_rate = audio.sampleRate;
+        audioFrame->no_channels = audio.channels;
+        audioFrame->no_samples = sampleFrames;
+        audioFrame->timecode = kTimecodeSynthesize;
+        audioFrame->FourCC = kFourCcFltp;
+        audioFrame->p_data = reinterpret_cast<quint8*>(m_audioFloat.data());
+        audioFrame->channel_stride_in_bytes = sampleFrames * int(sizeof(float));
+        audioFrame->p_metadata = nullptr;
+        audioFrame->timestamp = 0;
+        return true;
     }
 
     QLibrary m_library;
@@ -264,29 +203,70 @@ NdiOutputSink::~NdiOutputSink() {
 
 bool NdiOutputSink::start(const OutputTargetAssignment& assignment, FrameRate rate) {
     stop();
+    m_status.framesSubmitted = 0;
+    m_status.sendFailures = 0;
+    m_status.lastFrameIdentity = OutputFrameIdentity();
+
     if (!m_backend || assignment.kind != OutputTargetKind::Ndi || !assignment.enabled ||
-        !rate.isValid() || !m_backend->isRuntimeAvailable()) {
+        !rate.isValid()) {
+        setStatus(NdiOutputState::InvalidAssignment,
+                  QStringLiteral("invalid NDI output assignment"));
+        return false;
+    }
+
+    if (!m_backend->isRuntimeAvailable()) {
+        setStatus(NdiOutputState::RuntimeUnavailable,
+                  QStringLiteral("NDI runtime is not available"));
         return false;
     }
 
     const QString senderName = senderNameFor(assignment);
-    if (senderName.isEmpty()) return false;
+    if (senderName.isEmpty()) {
+        setStatus(NdiOutputState::InvalidAssignment, QStringLiteral("NDI sender name is empty"));
+        return false;
+    }
 
-    if (!m_backend->createSender(senderName, rate)) return false;
+    if (!m_backend->createSender(senderName, rate)) {
+        setStatus(NdiOutputState::CreateFailed,
+                  QStringLiteral("failed to create NDI sender '%1'").arg(senderName));
+        return false;
+    }
     m_assignment = assignment;
     m_rate = rate;
     m_active = true;
+    setStatus(NdiOutputState::Active, QStringLiteral("NDI sender '%1' active").arg(senderName));
     return true;
 }
 
 void NdiOutputSink::stop() {
     if (m_active && m_backend) m_backend->destroySender();
     m_active = false;
+    setStatus(NdiOutputState::Stopped, QStringLiteral("NDI sender stopped"));
 }
 
 bool NdiOutputSink::submit(const OutputBusFrame& frame) {
     if (!m_active || !m_backend) return false;
-    return m_backend->sendFrame(frame);
+    m_status.lastFrameIdentity = outputFrameIdentityFor(frame);
+    if (!hasSendableBroadcastAudio(frame.audio)) {
+        m_status.sendFailures++;
+        setStatus(NdiOutputState::SendFailed,
+                  QStringLiteral("failed to send NDI frame: missing broadcast audio"));
+        return false;
+    }
+    if (!m_backend->sendFrame(frame)) {
+        m_status.sendFailures++;
+        setStatus(NdiOutputState::SendFailed, QStringLiteral("failed to send NDI frame"));
+        return false;
+    }
+    m_status.framesSubmitted++;
+    setStatus(NdiOutputState::Active,
+              QStringLiteral("NDI sender '%1' active").arg(senderNameFor(m_assignment)));
+    return true;
+}
+
+void NdiOutputSink::setStatus(NdiOutputState state, const QString& message) {
+    m_status.state = state;
+    m_status.message = message;
 }
 
 QString NdiOutputSink::senderNameFor(const OutputTargetAssignment& assignment) {
