@@ -23,6 +23,8 @@ constexpr int kConnectPollSleepMs = 50;
 constexpr int kStallTimeoutMs = 8000;
 constexpr int64_t kForwardJump90k = 3000 * 90;
 constexpr int64_t kBackwardTolerance90k = -200 * 90;
+constexpr int64_t kMpegTs33Wrap90k = 1LL << 33;
+constexpr int64_t kMpegTs33HalfWrap90k = 1LL << 32;
 constexpr int kTsPacketSize = 188;
 constexpr int kAudioSampleRate = 48000;
 constexpr int kMaxAdtsFrameSize = 8191;
@@ -93,14 +95,34 @@ qint64 samplesTo90k(qint64 samples, int sampleRate) {
     return (samples * 90000 + sampleRate / 2) / sampleRate;
 }
 
+int64_t unwrap33Bit90k(int64_t raw90k, int64_t* previousRaw90k, int64_t* wrapOffset90k) {
+    if (raw90k < 0 || !previousRaw90k || !wrapOffset90k) {
+        return raw90k;
+    }
+    if (*previousRaw90k >= 0) {
+        const int64_t delta = raw90k - *previousRaw90k;
+        if (delta < -kMpegTs33HalfWrap90k) {
+            *wrapOffset90k += kMpegTs33Wrap90k;
+        } else if (delta > kMpegTs33HalfWrap90k) {
+            *wrapOffset90k -= kMpegTs33Wrap90k;
+        }
+    }
+    *previousRaw90k = raw90k;
+    return raw90k + *wrapOffset90k;
+}
+
 } // namespace
 
 NativeSrtIngestSession::NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
                                                std::atomic<bool>* captureRunning)
-    : m_sourceIndex(sourceIndex)
-    , m_outputWidth(outputWidth)
-    , m_outputHeight(outputHeight)
-    , m_captureRunning(captureRunning) {
+    : NativeSrtIngestSession(sourceIndex, outputWidth, outputHeight, captureRunning, nullptr) {}
+
+NativeSrtIngestSession::NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
+                                               std::atomic<bool>* captureRunning,
+                                               AnchoredSourceClock* sourceClock)
+    : m_sourceIndex(sourceIndex), m_outputWidth(outputWidth), m_outputHeight(outputHeight),
+      m_captureRunning(captureRunning), m_clock(sourceClock ? sourceClock : &m_ownedClock),
+      m_externalClock(sourceClock != nullptr) {
     m_monotonic.start();
 }
 
@@ -139,10 +161,18 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_decoder.reset();
     m_audioDecoder.reset();
     m_audioRemainder.clear();
-    m_anchorTs90k = -1;
-    m_anchorStreamTimeMs = -1;
+    if (!m_externalClock) {
+        m_clock->reset();
+    }
     m_prevDts90k = -1;
     m_prevAudioPts90k = -1;
+    m_prevRawPcr90k = -1;
+    m_prevRawVideoDts90k = -1;
+    m_prevRawAudioPts90k = -1;
+    m_pcrWrapOffset90k = 0;
+    m_videoWrapOffset90k = 0;
+    m_audioWrapOffset90k = 0;
+    m_forceNextPcrObserve = true;
     m_audioRemainderPts90k = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastDecodeErrorLogMs = -1;
@@ -195,6 +225,8 @@ void NativeSrtIngestSession::run() {
                         stats.retransTotal = perf.pktRcvRetrans;
                         stats.lossTotal = perf.pktRcvLossTotal;
                         stats.dropTotal = perf.pktRcvDropTotal;
+                        stats.clockPpm = m_clock->ppm();
+                        stats.clockQuality = int(m_clock->quality());
                         m_callbacks.reportStats(stats);
                     }
                 }
@@ -399,14 +431,27 @@ void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
         // Also clear the per-stream jump trackers so the next unit's jump heuristic
         // doesn't immediately discard the PCR re-anchor (keeps "PCR wins").
         if (tsInfo.discontinuity) {
-            m_anchorTs90k = -1;
+            m_clock->reset();
             m_prevDts90k = -1;
             m_prevAudioPts90k = -1;
+            m_prevRawPcr90k = -1;
+            m_prevRawVideoDts90k = -1;
+            m_prevRawAudioPts90k = -1;
+            m_pcrWrapOffset90k = 0;
+            m_videoWrapOffset90k = 0;
+            m_audioWrapOffset90k = 0;
         }
-        if (m_anchorTs90k < 0 && tsInfo.pcr90k >= 0) {
-            m_anchorTs90k = tsInfo.pcr90k;
-            m_anchorStreamTimeMs =
+        if (tsInfo.pcr90k >= 0) {
+            const int64_t pcr90k = unwrapPcr90k(tsInfo.pcr90k);
+            const int64_t nowMs =
                 m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+            if (m_clock->locked() && !tsInfo.discontinuity && !m_forceNextPcrObserve) {
+                m_clock->addRateSample(pcr90k, nowMs);
+            } else {
+                m_clock->observe(pcr90k, nowMs, tsInfo.discontinuity,
+                                 ClockObservationRole::Authority);
+                m_forceNextPcrObserve = false;
+            }
         }
         for (const PesPacket& pes : std::as_const(completedPes)) {
             processPesPacket(pes);
@@ -472,8 +517,7 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
 
                 DecodedVideoFrame decodedFrame;
                 decodedFrame.frame = frame;
-                const int64_t decodedPtsMs =
-                    sourcePtsMsFromAnchor(frame->pts, m_anchorTs90k, m_anchorStreamTimeMs);
+                const int64_t decodedPtsMs = m_clock->toSessionMs(frame->pts);
                 decodedFrame.sourcePtsMs = decodedPtsMs >= 0 ? decodedPtsMs : sourcePtsMs;
                 m_callbacks.onVideoFrame(decodedFrame);
             },
@@ -603,35 +647,31 @@ void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
 }
 
 int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& unit) {
-    const int64_t unitDts90k = unit.dts90k >= 0 ? unit.dts90k : unit.pts90k;
-    const int64_t unitPts90k = unit.pts90k >= 0 ? unit.pts90k : unitDts90k;
-    if (unitDts90k < 0 || unitPts90k < 0) {
+    const int64_t rawDts90k = unit.dts90k >= 0 ? unit.dts90k : unit.pts90k;
+    const int64_t rawPts90k = unit.pts90k >= 0 ? unit.pts90k : rawDts90k;
+    if (rawDts90k < 0 || rawPts90k < 0) {
         return -1;
     }
+    const int64_t unitDts90k = unwrapVideo90k(rawDts90k);
+    const int64_t unitPts90k = rawPts90k + (unitDts90k - rawDts90k);
 
     // Video is the re-anchor authority: a big DTS jump => stream discontinuity =>
     // drop the shared anchor so the next PCR/PES re-establishes it (backstop to the
     // PCR discontinuity_indicator handled in processReceivedBytes).
-    if (m_anchorTs90k >= 0 && m_prevDts90k >= 0) {
+    bool discontinuity = false;
+    if (m_clock->locked() && m_prevDts90k >= 0) {
         const int64_t delta90k = unitDts90k - m_prevDts90k;
         if (delta90k > kForwardJump90k || delta90k < kBackwardTolerance90k) {
             log(QStringLiteral("Native SRT DTS discontinuity (%1 ms jump). Re-anchoring.")
                     .arg(delta90k / 90));
-            m_anchorTs90k = -1;
+            discontinuity = true;
         }
     }
     m_prevDts90k = unitDts90k;
 
-    // First-PES fallback: if no PCR has anchored yet, anchor on this video DTS.
-    if (m_anchorTs90k < 0) {
-        m_anchorTs90k = unitDts90k;
-        m_anchorStreamTimeMs =
-            m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
-    }
-    if (m_anchorStreamTimeMs < 0) {
-        return -1;
-    }
-    return sourcePtsMsFromAnchor(unitPts90k, m_anchorTs90k, m_anchorStreamTimeMs);
+    const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    m_clock->observe(unitDts90k, nowMs, discontinuity, ClockObservationRole::Authority);
+    return m_clock->toSessionMs(unitPts90k);
 }
 
 int64_t NativeSrtIngestSession::sourcePtsMsFromAnchor(qint64 pts90k, int64_t anchorTs90k,
@@ -642,15 +682,28 @@ int64_t NativeSrtIngestSession::sourcePtsMsFromAnchor(qint64 pts90k, int64_t anc
     return anchorStreamMs + ((pts90k - anchorTs90k) / 90);
 }
 
+int64_t NativeSrtIngestSession::unwrapPcr90k(int64_t raw90k) {
+    return unwrap33Bit90k(raw90k, &m_prevRawPcr90k, &m_pcrWrapOffset90k);
+}
+
+int64_t NativeSrtIngestSession::unwrapVideo90k(int64_t raw90k) {
+    return unwrap33Bit90k(raw90k, &m_prevRawVideoDts90k, &m_videoWrapOffset90k);
+}
+
+int64_t NativeSrtIngestSession::unwrapAudio90k(int64_t raw90k) {
+    return unwrap33Bit90k(raw90k, &m_prevRawAudioPts90k, &m_audioWrapOffset90k);
+}
+
 int64_t NativeSrtIngestSession::sourcePtsMsForAudio(qint64 pts90k) {
     if (pts90k < 0) {
         return -1;
     }
+    pts90k = unwrapAudio90k(pts90k);
 
     // Audio does NOT own the anchor (that independent anchor was the lip-sync bug).
     // Detect an audio discontinuity only to flush the decoder; timing uses the
     // shared anchor owned by the PCR/video path.
-    if (m_prevAudioPts90k >= 0) {
+    if (m_clock->locked() && m_prevAudioPts90k >= 0) {
         const int64_t delta90k = pts90k - m_prevAudioPts90k;
         if (delta90k > kForwardJump90k || delta90k < kBackwardTolerance90k) {
             log(QStringLiteral("Native SRT audio PTS discontinuity (%1 ms jump). Flushing.")
@@ -664,13 +717,10 @@ int64_t NativeSrtIngestSession::sourcePtsMsForAudio(qint64 pts90k) {
 
     // First-PES fallback: if audio arrives before any PCR or video, it establishes
     // the shared anchor (first-of-either); otherwise it maps against the existing one.
-    if (m_anchorTs90k < 0) {
-        m_anchorTs90k = pts90k;
-        m_anchorStreamTimeMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
-    }
-    int64_t sourcePtsMs = sourcePtsMsFromAnchor(pts90k, m_anchorTs90k, m_anchorStreamTimeMs);
-    // Safety clamp (no re-anchor): never stamp audio absurdly ahead of the clock.
     const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    m_clock->observe(pts90k, nowMs, false, ClockObservationRole::Follower);
+    int64_t sourcePtsMs = m_clock->toSessionMs(pts90k);
+    // Safety clamp (no re-anchor): never stamp audio absurdly ahead of the clock.
     if (sourcePtsMs >= 0 && nowMs >= 0 && sourcePtsMs > nowMs + 10000) {
         sourcePtsMs = nowMs;
     }
