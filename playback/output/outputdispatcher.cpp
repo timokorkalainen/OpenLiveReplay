@@ -101,8 +101,7 @@ OutputDispatchStats OutputDispatcher::stats() const {
         const OutputSinkStatus sinkStatus = endpoint.sink->outputStatus();
         if (!hasMeaningfulSinkStatus(sinkStatus)) continue;
 
-        OutputTargetDispatchStats& target =
-            snapshot.targets[targetStatsKey(endpoint.assignment)];
+        OutputTargetDispatchStats& target = snapshot.targets[targetStatsKey(endpoint.assignment)];
         target.hasSinkStatus = true;
         target.sinkSubmittedFrames = sinkStatus.acceptedFrames;
         target.sinkFailedFrames = sinkStatus.failedFrames;

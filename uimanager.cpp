@@ -1952,9 +1952,8 @@ QVariantList UIManager::ndiOutputRows() const {
 
 QVariantMap UIManager::ndiOutputStatus(const QString& targetId) const {
     const QHash<QString, BroadcastOutputTargetStatus> statuses =
-        m_playbackWorker
-            ? BroadcastOutputStatus::fromDispatchStats(m_playbackWorker->outputStats())
-            : QHash<QString, BroadcastOutputTargetStatus>{};
+        m_playbackWorker ? BroadcastOutputStatus::fromDispatchStats(m_playbackWorker->outputStats())
+                         : QHash<QString, BroadcastOutputTargetStatus>{};
     const QVariantList rows = BroadcastOutputSettings::rows(
         m_currentSettings.broadcastOutputs, activeViewCount(), OutputTargetKind::Ndi, statuses);
     for (const QVariant& rowValue : rows) {

@@ -139,7 +139,8 @@ void TestBroadcastOutputSettings::rowsIncludeRuntimeStatusDiagnostics() {
     QCOMPARE(feed.value(QStringLiteral("lastSourceFeedIndex")).toInt(), 0);
     QCOMPARE(feed.value(QStringLiteral("lastSourcePtsMs")).toLongLong(), qint64(4160));
     QVERIFY(feed.value(QStringLiteral("diagnostic")).toString().contains(QStringLiteral("fail=1")));
-    QVERIFY(feed.value(QStringLiteral("diagnostic")).toString().contains(QStringLiteral("silent=3")));
+    QVERIFY(
+        feed.value(QStringLiteral("diagnostic")).toString().contains(QStringLiteral("silent=3")));
 
     const QVariantMap pgm = rows[2].toMap();
     QCOMPARE(pgm.value(QStringLiteral("statusState")).toString(), QStringLiteral("Off"));
