@@ -407,8 +407,12 @@ void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
         if (tsInfo.pcr90k >= 0) {
             const int64_t nowMs =
                 m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
-            m_clock.observe(tsInfo.pcr90k, nowMs, tsInfo.discontinuity,
-                            ClockObservationRole::Authority);
+            if (m_clock.locked() && !tsInfo.discontinuity) {
+                m_clock.addRateSample(tsInfo.pcr90k, nowMs);
+            } else {
+                m_clock.observe(tsInfo.pcr90k, nowMs, tsInfo.discontinuity,
+                                ClockObservationRole::Authority);
+            }
         }
         for (const PesPacket& pes : std::as_const(completedPes)) {
             processPesPacket(pes);

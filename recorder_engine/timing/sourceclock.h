@@ -39,6 +39,7 @@ public:
 
     void observe(int64_t senderUnits, int64_t sessionNowMs, bool discontinuity,
                  ClockObservationRole role = ClockObservationRole::Authority) override;
+    void addRateSample(int64_t senderUnits, int64_t sessionNowMs);
     int64_t toSessionMs(int64_t mediaSenderUnits) const override;
     ClockQuality quality() const override { return m_quality; }
     double ppm() const override { return m_drift.ppm(); }

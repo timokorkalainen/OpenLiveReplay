@@ -14,6 +14,7 @@ private slots:
     void discontinuityReanchors();
     void followerDoesNotReanchorExistingAnchor();
     void followerDoesNotPollutePpm();
+    void rateSampleDoesNotReanchor();
     void measuresPpm();
     void preserves90kAnchorMath();
 };
@@ -62,6 +63,13 @@ void TestSourceClock::followerDoesNotPollutePpm() {
                       ClockObservationRole::Follower);
     }
     QVERIFY(std::abs(clock.ppm()) < 1.0);
+}
+
+void TestSourceClock::rateSampleDoesNotReanchor() {
+    AnchoredSourceClock clock(ClockQuality::Pcr, 90);
+    clock.observe(90000, 1000, false);
+    clock.addRateSample(900000, 99999);
+    QCOMPARE(clock.toSessionMs(180000), int64_t(2000));
 }
 
 void TestSourceClock::measuresPpm() {

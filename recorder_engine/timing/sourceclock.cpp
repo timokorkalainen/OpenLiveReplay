@@ -37,7 +37,13 @@ void AnchoredSourceClock::observe(int64_t senderUnits, int64_t sessionNowMs, boo
         m_prevFollowerUnits = senderUnits;
     }
 
-    if (authority && sessionNowMs >= 0) {
+    if (authority) {
+        addRateSample(senderUnits, sessionNowMs);
+    }
+}
+
+void AnchoredSourceClock::addRateSample(int64_t senderUnits, int64_t sessionNowMs) {
+    if (senderUnits >= 0 && sessionNowMs >= 0) {
         m_drift.addSample(senderUnitsToNs(senderUnits), sessionNowMs * 1000000LL);
     }
 }

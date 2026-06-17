@@ -1,6 +1,7 @@
 #include "streamworker.h"
 #include "ingest/ingestsession.h"
 #include "ingest/rtmpprotocol.h"
+#include "timing/audioservo.h"
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
 #include "ingest/nativesrtingestsession.h"
 #endif
@@ -12,9 +13,12 @@
 #include <QUrl>
 #include <QtGlobal>
 
+#include <cmath>
 #include <memory>
 
 namespace {
+constexpr double kMaxAudioServoPpm = 500.0;
+
 QString ingestFailureKindForLog(IngestFailureKind failure) {
     switch (failure) {
     case IngestFailureKind::UnsupportedProfile:
@@ -231,7 +235,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     // Write this tick's worth of audio for the assigned view track
     // (sample-accurate cursor, silence-filled where capture had nothing).
-    writeAudioForTick(currentRecordingTimeMs, track, trimMs, jitterMs);
+    const double sourcePpm =
+        double(m_currentSourcePpmMilli.load(std::memory_order_relaxed)) / 1000.0;
+    writeAudioForTick(currentRecordingTimeMs, track, trimMs, jitterMs, sourcePpm);
 }
 
 void StreamWorker::captureLoop() {
@@ -327,6 +333,9 @@ void StreamWorker::captureLoop() {
         };
         callbacks.setConnected = [this](bool connected) { setConnected(connected); };
         callbacks.reportStats = [this](const IngestStats& stats) {
+            const double ppm = clampPpm(stats.clockPpm, kMaxAudioServoPpm);
+            m_currentSourcePpmMilli.store(int(std::llround(ppm * 1000.0)),
+                                          std::memory_order_relaxed);
             emit statsUpdated(m_sourceIndex, stats);
         };
 
@@ -565,7 +574,7 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
 }
 
 void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs,
-                                     int64_t jitterMs) {
+                                     int64_t jitterMs, double sourcePpm) {
     // Audio shares the video path's jitter delay so both land on the
     // same timeline: a video frame written at file-time T shows source
     // content from T - jitter.  The cursor runs on the FILE timeline;
@@ -580,10 +589,14 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
         // Not mapped to a view: discard consumed FIFO data and keep the
         // cursor pinned to "now" so mapping in resumes at current time.
         m_audioWriteCursor = targetEnd;
+        m_audioSourceCursor = targetEnd - jitterSamples - trimSamples;
+        m_audioServoTrimSamples = trimSamples;
+        m_audioServoJitterSamples = jitterSamples;
+        m_audioServoFraction = 0.0;
         QMutexLocker locker(&m_audioFifoMutex);
         if (m_audioFifoStartSample >= 0) {
             const int64_t dropSamples =
-                (targetEnd - jitterSamples - trimSamples) - m_audioFifoStartSample;
+                m_audioSourceCursor - m_audioFifoStartSample;
             if (dropSamples > 0) {
                 const int dropBytes =
                     int(qMin<int64_t>(dropSamples * kAudioBytesPerSample, m_audioFifo.size()));
@@ -603,7 +616,17 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
     // backlog (stalled event loop) just drains over several ticks.
     const int64_t n = qMin<int64_t>(targetEnd - m_audioWriteCursor, kAudioSampleRate);
     const int64_t start = m_audioWriteCursor;                     // file timeline
-    const int64_t srcStart = start - jitterSamples - trimSamples; // source timeline (+trim)
+    const int64_t nominalSrcStart = start - jitterSamples - trimSamples; // source timeline
+    if (m_audioSourceCursor < 0 || m_audioServoTrimSamples != trimSamples ||
+        m_audioServoJitterSamples != jitterSamples) {
+        m_audioSourceCursor = nominalSrcStart;
+        m_audioServoTrimSamples = trimSamples;
+        m_audioServoJitterSamples = jitterSamples;
+        m_audioServoFraction = 0.0;
+    }
+    const int64_t srcStart = m_audioSourceCursor;
+    const int64_t srcAdvance = correctedSrcSamplesAccumulated(
+        n, clampPpm(sourcePpm, kMaxAudioServoPpm), &m_audioServoFraction);
 
     QByteArray chunk(int(n * kAudioBytesPerSample), '\0');
     {
@@ -619,7 +642,7 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
                        size_t((copyTo - copyFrom) * kAudioBytesPerSample));
             }
             // Trim everything we just consumed (or skipped past)
-            const int64_t dropSamples = (srcStart + n) - fifoStart;
+            const int64_t dropSamples = (srcStart + srcAdvance) - fifoStart;
             if (dropSamples > 0) {
                 const int dropBytes =
                     int(qMin<int64_t>(dropSamples * kAudioBytesPerSample, m_audioFifo.size()));
@@ -628,6 +651,7 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
             }
         }
     }
+    m_audioSourceCursor = srcStart + srcAdvance;
     m_audioWriteCursor = start + n;
 
     const int audioTrackIdx = m_muxer->audioTrackOffset() + track;
