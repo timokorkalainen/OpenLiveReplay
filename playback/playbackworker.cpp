@@ -20,6 +20,7 @@ PlaybackWorker::PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackT
 
 PlaybackWorker::~PlaybackWorker() {
     stop();
+    shutdownOutputGraph();
     for (auto* track : m_decoderBank) {
         if (track->codecCtx) avcodec_free_context(&track->codecCtx);
         delete track;
@@ -45,6 +46,7 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // transport's own (independent) mutex, so there is no lock-order concern.
     m_lastMoveDir.store((clamped >= m_transport->currentPos()) ? 1 : -1, std::memory_order_relaxed);
     m_seekTargetMs = clamped;
+    if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
@@ -236,24 +238,26 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_outputHeight = qMax(2, height);
     m_outputCache =
         std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth, m_outputHeight);
-    m_outputDispatcher = std::make_unique<OutputDispatcher>(
+    m_outputRuntime = std::make_unique<OutputRuntime>(
         FrameRate::fromFraction(fps(), 1), m_outputFeedCount, m_outputWidth, m_outputHeight);
-    m_outputWallStartMs = -1;
+    m_outputRuntime->setSnapshotProvider([this]() { return makeOutputSnapshot(); });
     m_outputTargetsDirty.store(true, std::memory_order_relaxed);
     rebuildOutputEndpoints();
+    m_outputRuntime->startRuntime();
 }
 
 void PlaybackWorker::shutdownOutputGraph() {
-    if (m_outputDispatcher) m_outputDispatcher->setEndpoints({});
-    m_outputDispatcher.reset();
+    if (m_outputRuntime) {
+        m_outputRuntime->stopRuntime();
+        m_outputRuntime.reset();
+    }
     m_outputSinks.clear();
     m_outputCache.reset();
-    m_outputWallStartMs = -1;
     m_outputFeedCount = 0;
 }
 
 void PlaybackWorker::rebuildOutputEndpoints() {
-    if (!m_outputDispatcher) return;
+    if (!m_outputRuntime) return;
 
     QList<OutputTargetAssignment> external;
     {
@@ -261,7 +265,7 @@ void PlaybackWorker::rebuildOutputEndpoints() {
         external = m_externalOutputAssignments;
     }
 
-    m_outputDispatcher->setEndpoints({});
+    m_outputRuntime->setEndpoints({});
     m_outputSinks.clear();
     QList<OutputEndpoint> endpoints;
 
@@ -297,36 +301,25 @@ void PlaybackWorker::rebuildOutputEndpoints() {
         m_outputSinks.push_back(std::move(sink));
     }
 
-    m_outputDispatcher->setEndpoints(endpoints);
+    m_outputRuntime->setEndpoints(endpoints);
     m_outputTargetsDirty.store(false, std::memory_order_relaxed);
 }
 
-void PlaybackWorker::dispatchOutputTicks(qint64 wallNowMs, qint64 playheadMs, bool playing,
-                                         double speed) {
-    if (!m_outputDispatcher || !m_outputCache) return;
-    if (m_outputTargetsDirty.load(std::memory_order_relaxed)) rebuildOutputEndpoints();
-    if (m_outputWallStartMs < 0) m_outputWallStartMs = wallNowMs;
-
-    PlaybackStateSnapshot state;
-    state.playheadMs = playheadMs;
-    state.playing = playing;
-    state.speed = speed;
-    state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
-    if (state.selectedFeedIndex < 0 && m_outputFeedCount > 0) state.selectedFeedIndex = 0;
-
-    const qint64 elapsedMs = qMax<qint64>(0, wallNowMs - m_outputWallStartMs);
-    const FrameRate rate = FrameRate::fromFraction(fps(), 1);
-    int dispatched = 0;
-    while (rate.frameIndexToMs(m_outputDispatcher->nextOutputFrameIndex()) <= elapsedMs &&
-           dispatched < 4) {
-        OutputFrameCache cacheCopy(0, m_outputWidth, m_outputHeight);
-        {
-            QMutexLocker bufferLocker(&m_bufferMutex);
-            cacheCopy = *m_outputCache;
-        }
-        m_outputDispatcher->dispatchTick(cacheCopy, state);
-        dispatched++;
+OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
+    OutputRuntimeSnapshot snapshot;
+    snapshot.cache = OutputFrameCache(m_outputFeedCount, m_outputWidth, m_outputHeight);
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        if (m_outputCache) snapshot.cache = *m_outputCache;
     }
+
+    snapshot.state.playheadMs = m_transport ? m_transport->currentPos() : 0;
+    snapshot.state.playing = m_transport && m_transport->isPlaying();
+    snapshot.state.speed = m_transport ? m_transport->speed() : 1.0;
+    snapshot.state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
+    if (snapshot.state.selectedFeedIndex < 0 && m_outputFeedCount > 0)
+        snapshot.state.selectedFeedIndex = 0;
+    return snapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -751,10 +744,10 @@ void PlaybackWorker::run() {
             m_audioQueue.clear();
             if (m_audioPlayer) m_audioPlayer->clear();
         }
+        if (m_outputTargetsDirty.load(std::memory_order_relaxed)) rebuildOutputEndpoints();
 
         // --- Telemetry: once per wall-second (spec §11.1) ---
         const int64_t nowMs = wallClock.elapsed();
-        dispatchOutputTicks(nowMs, P, playing, speed);
         if (nowMs - lastTelemetryMs >= 1000) {
             lastTelemetryMs = nowMs;
             emitTelemetry(P, newestPtsMax(), speed);
@@ -806,7 +799,7 @@ void PlaybackWorker::run() {
         if (seekTarget >= 0) {
             // Anchor direction by the recorded move sign (seekTo sets it in T6).
             int seekDir = m_lastMoveDir.load(std::memory_order_relaxed);
-            if (m_outputDispatcher) m_outputDispatcher->resetPlayEpoch();
+            if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
             repositionTo(seekTarget, seekDir, pkt, frame, audioFrame);
             continue;
         }
@@ -971,6 +964,10 @@ void PlaybackWorker::run() {
             QMutexLocker bufferLocker(&m_bufferMutex);
             for (auto* track : m_decoderBank)
                 track->buffer.trim(keepFrom, keepTo);
+            if (m_outputCache) {
+                const qint64 keepAudioFromSample = qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
+                m_outputCache->trimBefore(keepFrom, keepAudioFromSample);
+            }
         }
         m_audioQueue.dropOlderThan(P, kAudioLeadMs);
 
@@ -1069,7 +1066,7 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     };
 
     QVector<PendingDeliver> pending;
-    const bool outputGraphActive = m_outputDispatcher != nullptr;
+    const bool outputGraphActive = m_outputRuntime != nullptr;
     const FrameRate rate = FrameRate::fromFraction(fps(), 1);
     const qint64 outputFrameIndex = rate.msToFrameIndex(P);
     {

@@ -33,6 +33,7 @@ public:
     OutputDispatchStats dispatchTick(const OutputFrameCache& cache,
                                      const PlaybackStateSnapshot& state);
     OutputDispatchStats stats() const { return m_stats; }
+    FrameRate frameRate() const { return m_rate; }
 
 private:
     OutputBusFrame renderBus(OutputBusId bus, qint64 outputFrameIndex,

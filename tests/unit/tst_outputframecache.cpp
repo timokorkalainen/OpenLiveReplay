@@ -16,6 +16,8 @@ private slots:
     void videoFallsBackToLastValidFrame();
     void missingVideoReturnsPlaceholder();
     void audioSpanReturnsSamplesAndSilenceForGaps();
+    void trimBeforeBoundsVideoHistoryButKeepsBoundaryFrame();
+    void trimBeforeDropsExpiredAudioFrames();
     void clearDropsVideoAndAudioHistory();
 };
 
@@ -81,6 +83,61 @@ void TestOutputFrameCache::audioSpanReturnsSamplesAndSilenceForGaps() {
     QCOMPARE(out[5], qint16(2));
     QCOMPARE(out[10], qint16(7));
     QCOMPARE(out[11], qint16(8));
+}
+
+void TestOutputFrameCache::trimBeforeBoundsVideoHistoryButKeepsBoundaryFrame() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(makeVideo(0, 0, 10));
+    cache.insertVideoFrame(makeVideo(0, 100, 20));
+    cache.insertVideoFrame(makeVideo(0, 200, 30));
+    cache.insertVideoFrame(makeVideo(0, 300, 40));
+
+    cache.trimBefore(150, 0);
+
+    auto dropped = cache.videoFrameAt(0, 50);
+    QVERIFY(!dropped.has_value());
+
+    auto boundary = cache.videoFrameAt(0, 175);
+    QVERIFY(boundary.has_value());
+    QCOMPARE(boundary->ptsMs, qint64(100));
+    QCOMPARE(uchar(boundary->planeY.at(0)), uchar(20));
+
+    auto current = cache.videoFrameAt(0, 250);
+    QVERIFY(current.has_value());
+    QCOMPARE(current->ptsMs, qint64(200));
+    QCOMPARE(uchar(current->planeY.at(0)), uchar(30));
+}
+
+void TestOutputFrameCache::trimBeforeDropsExpiredAudioFrames() {
+    OutputFrameCache cache(1, 4, 4);
+
+    MediaAudioFrame oldAudio;
+    oldAudio.feedIndex = 0;
+    oldAudio.startSample = 0;
+    oldAudio.sampleRate = 48000;
+    oldAudio.channels = 2;
+    oldAudio.format = MediaSampleFormat::S16Interleaved;
+    oldAudio.pcm.resize(4 * 2 * int(sizeof(qint16)));
+    auto* oldPcm = reinterpret_cast<qint16*>(oldAudio.pcm.data());
+    for (int i = 0; i < 8; ++i)
+        oldPcm[i] = qint16(1);
+    cache.insertAudioFrame(oldAudio);
+
+    MediaAudioFrame currentAudio = oldAudio;
+    currentAudio.startSample = 100;
+    currentAudio.pcm.resize(4 * 2 * int(sizeof(qint16)));
+    auto* currentPcm = reinterpret_cast<qint16*>(currentAudio.pcm.data());
+    for (int i = 0; i < 8; ++i)
+        currentPcm[i] = qint16(2);
+    cache.insertAudioFrame(currentAudio);
+
+    cache.trimBefore(0, 100);
+
+    QCOMPARE(cache.audioSpanOrSilence(0, 0, 4), silentS16Stereo(4));
+    const QByteArray retained = cache.audioSpanOrSilence(0, 100, 4);
+    const auto* out = reinterpret_cast<const qint16*>(retained.constData());
+    QCOMPARE(out[0], qint16(2));
+    QCOMPARE(out[1], qint16(2));
 }
 
 void TestOutputFrameCache::clearDropsVideoAndAudioHistory() {

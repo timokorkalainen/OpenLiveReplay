@@ -1,5 +1,6 @@
 #include "uimanager.h"
 #include "playback/audioplayer.h"
+#include "playback/output/broadcastoutputsettings.h"
 #include "project/projectimportclient.h"
 #include "telemetry/telemetryclient.h"
 #include <QDateTime>
@@ -1256,6 +1257,8 @@ void UIManager::setMultiviewCount(int count) {
         }
         emit multiviewCountChanged();
         emit viewSlotMapChanged();
+        m_broadcastOutputsVersion++;
+        emit broadcastOutputsChanged();
         m_settingsManager->save(m_configPath, m_currentSettings);
     }
 }
@@ -1876,6 +1879,48 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
     return rows;
 }
 
+QVariantList UIManager::ndiOutputRows() const {
+    return BroadcastOutputSettings::rows(m_currentSettings.broadcastOutputs, activeViewCount(),
+                                         OutputTargetKind::Ndi);
+}
+
+bool UIManager::ndiOutputEnabled(const QString& busKind, int feedIndex) const {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    return BroadcastOutputSettings::isEnabled(m_currentSettings.broadcastOutputs,
+                                              OutputTargetKind::Ndi, bus);
+}
+
+QString UIManager::ndiOutputSenderName(const QString& busKind, int feedIndex) const {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    return BroadcastOutputSettings::senderName(m_currentSettings.broadcastOutputs,
+                                               OutputTargetKind::Ndi, bus);
+}
+
+void UIManager::setNdiOutputEnabled(const QString& busKind, int feedIndex, bool enabled) {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    applyBroadcastOutputs(BroadcastOutputSettings::setEnabled(
+        m_currentSettings.broadcastOutputs, activeViewCount(), OutputTargetKind::Ndi, bus,
+        enabled));
+}
+
+void UIManager::setNdiOutputSenderName(const QString& busKind, int feedIndex,
+                                       const QString& senderName) {
+    const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
+    applyBroadcastOutputs(BroadcastOutputSettings::setSenderName(
+        m_currentSettings.broadcastOutputs, activeViewCount(), OutputTargetKind::Ndi, bus,
+        senderName));
+}
+
+void UIManager::applyBroadcastOutputs(const QList<OutputTargetAssignment>& outputs) {
+    m_currentSettings.broadcastOutputs = outputs;
+    if (m_playbackWorker) {
+        m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
+    }
+    m_broadcastOutputsVersion++;
+    emit broadcastOutputsChanged();
+    m_settingsManager->save(m_configPath, m_currentSettings);
+}
+
 void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         m_streamDeckStore.loadFrom(m_currentSettings);
@@ -1946,6 +1991,8 @@ void UIManager::loadSettings() {
         if (m_playbackWorker)
             m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
         emit audioOutputLatencyChanged();
+        m_broadcastOutputsVersion++;
+        emit broadcastOutputsChanged();
     }
 }
 

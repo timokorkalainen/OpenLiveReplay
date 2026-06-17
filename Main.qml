@@ -1232,6 +1232,57 @@ ApplicationWindow {
                 }
 
                 GroupBox {
+                    id: ndiOutputSettings
+                    title: "NDI Outputs"
+                    Layout.fillWidth: true
+                    property var rows: appWindow.uiManagerRef.broadcastOutputsVersion >= 0
+                                       ? appWindow.uiManagerRef.ndiOutputRows()
+                                       : []
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 6
+
+                        Repeater {
+                            model: ndiOutputSettings.rows
+
+                            delegate: RowLayout {
+                                id: ndiOutputRow
+                                required property var modelData
+                                width: parent.width
+                                spacing: 8
+
+                                Label {
+                                    text: ndiOutputRow.modelData.label || ""
+                                    Layout.preferredWidth: 92
+                                    elide: Text.ElideRight
+                                }
+
+                                Switch {
+                                    id: ndiOutputSwitch
+                                    checked: !!ndiOutputRow.modelData.enabled
+                                    onToggled: appWindow.uiManagerRef.setNdiOutputEnabled(
+                                                   ndiOutputRow.modelData.busKind,
+                                                   ndiOutputRow.modelData.feedIndex,
+                                                   checked)
+                                }
+
+                                TextField {
+                                    Layout.fillWidth: true
+                                    enabled: ndiOutputSwitch.checked
+                                    text: ndiOutputRow.modelData.senderName || ""
+                                    selectByMouse: true
+                                    onEditingFinished: appWindow.uiManagerRef.setNdiOutputSenderName(
+                                                           ndiOutputRow.modelData.busKind,
+                                                           ndiOutputRow.modelData.feedIndex,
+                                                           text)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                GroupBox {
                     title: "External Input Settings"
                     Layout.fillWidth: true
 

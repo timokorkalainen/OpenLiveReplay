@@ -75,6 +75,30 @@ QByteArray OutputFrameCache::audioSpanOrSilence(int feedIndex, qint64 startSampl
     return out;
 }
 
+void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample) {
+    for (auto& frames : m_video) {
+        int firstAtOrAfter = 0;
+        while (firstAtOrAfter < frames.size() && frames[firstAtOrAfter].ptsMs < minVideoPtsMs) {
+            ++firstAtOrAfter;
+        }
+
+        // Keep one frame before the cutoff so output can still hold the nearest
+        // previous picture at the retained-window boundary.
+        const int removeCount = qMax(0, firstAtOrAfter - 1);
+        if (removeCount > 0) frames.erase(frames.begin(), frames.begin() + removeCount);
+    }
+
+    for (auto& frames : m_audio) {
+        int removeCount = 0;
+        while (removeCount < frames.size() &&
+               frames[removeCount].startSample + frames[removeCount].sampleFrames() <=
+                   minAudioStartSample) {
+            ++removeCount;
+        }
+        if (removeCount > 0) frames.erase(frames.begin(), frames.begin() + removeCount);
+    }
+}
+
 void OutputFrameCache::clear() {
     for (auto& frames : m_video)
         frames.clear();

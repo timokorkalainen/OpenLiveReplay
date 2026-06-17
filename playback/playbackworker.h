@@ -13,7 +13,7 @@
 #include <memory>
 #include <vector>
 #include "frameprovider.h"
-#include "playback/output/outputdispatcher.h"
+#include "playback/output/outputruntime.h"
 #include "playback/output/outputtargetassignment.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
@@ -120,7 +120,7 @@ private:
     void initializeOutputGraph(int feedCount, int width, int height);
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
-    void dispatchOutputTicks(qint64 wallNowMs, qint64 playheadMs, bool playing, double speed);
+    OutputRuntimeSnapshot makeOutputSnapshot() const;
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
@@ -155,9 +155,8 @@ private:
     QList<OutputTargetAssignment> m_externalOutputAssignments;
     std::atomic<bool> m_outputTargetsDirty{false};
     std::unique_ptr<OutputFrameCache> m_outputCache;
-    std::unique_ptr<OutputDispatcher> m_outputDispatcher;
+    std::unique_ptr<OutputRuntime> m_outputRuntime;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
-    qint64 m_outputWallStartMs = -1;
     int m_outputFeedCount = 0;
     int m_outputWidth = 1920;
     int m_outputHeight = 1080;

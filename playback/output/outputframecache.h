@@ -18,6 +18,7 @@ public:
     QByteArray audioSpanOrSilence(int feedIndex, qint64 startSample, int sampleFrames) const;
 
     int feedCount() const { return m_video.size(); }
+    void trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample);
     void clear();
 
 private:
