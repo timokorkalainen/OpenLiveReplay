@@ -68,6 +68,14 @@ void TestIngestBackendSelector::rtmpRoutesToNativeRtmp() {
         signedUrl, false, NativeRtmpIngestSession::supportsUrl(signedUrl));
     QVERIFY(signedOpts.preferNativeRtmp);
     QCOMPARE(selectIngestBackend(signedUrl, signedOpts), IngestBackendKind::NativeRtmp);
+
+    const QUrl streamIdUrl(
+        QStringLiteral("rtmp://maps.rally.promo:8890/live/stream4?streamid=read:stream4"));
+    QVERIFY(NativeRtmpIngestSession::supportsUrl(streamIdUrl));
+    const IngestBackendOptions streamIdOpts = ingestBackendOptionsFromEnvironment(
+        streamIdUrl, false, NativeRtmpIngestSession::supportsUrl(streamIdUrl));
+    QVERIFY(streamIdOpts.preferNativeRtmp);
+    QCOMPARE(selectIngestBackend(streamIdUrl, streamIdOpts), IngestBackendKind::NativeRtmp);
 #endif
 }
 void TestIngestBackendSelector::unsupportedSchemesAreRejected() {

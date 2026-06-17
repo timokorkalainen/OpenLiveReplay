@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <memory>
 
+struct NativeSrtSockaddr;
+
 class NativeSrtIngestSession final : public IngestSession {
 public:
     NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
@@ -73,6 +75,7 @@ private:
     bool m_loggedLatmUnsupported = false;
 
     bool openSocket(QString* error);
+    bool openSocketToAddress(const NativeSrtSockaddr& address, QString* error);
     void closeSocket();
     bool shouldStop() const;
     void log(const QString& message) const;
