@@ -16,7 +16,7 @@ native-ingest / broadcast-frame-sync workstream after the merges below._
 | #53 | **Soak matrix** — `run_soak_matrix.sh` ({SRT,RTMP}×{H264,H265}) + an `OLR_SRT_SOAK_CODEC` switch. Full 4×30-min run passed (no crash/hang/stall). |
 | #54 | **Broadcast output bus foundation** — preview/PGM/multiview output buses with Qt preview and NDI output dispatch hooks. |
 
-**Net state of the engine now:** ingest is **native-only** — native SRT and native RTMP, decoding **H.264 + H.265 + AAC-LC**, at **rational frame rates**, with a backend-tagged health dot. FFmpeg remains linked **only** for the Matroska muxer + the MPEG-2 record encoder.
+**Net state of the engine now:** ingest is **native-only** — native SRT, native RTMP, and runtime-loaded **NDI ingest**, decoding **H.264 + H.265 + AAC-LC** for SRT/RTMP and decoded NDI video/audio via the NDI SDK, at **rational frame rates**, with a backend-tagged health dot. FFmpeg remains linked **only** for the Matroska muxer + the MPEG-2 record encoder and frame conversion helpers.
 
 **Parallel / adjacent:** #54 is the first move on the **output** side (see §7, P5). It is not part of the ingest stack, but it is part of the same broadcast arc.
 
@@ -98,8 +98,8 @@ Phase 1 timing core (`docs/superpowers/plans/2026-06-17-framesync-phase1-timing-
 Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-ingest.md`), backed by
 `docs/superpowers/specs/2026-06-17-broadcast-framesync-program-design.md`.
 
-- **P2 — Source clock recovery + drift servo.** Partially live: native SRT/RTMP now route timestamps through `SourceClock`, run a per-source `DriftEstimator`, expose `clockppm`/`clockq` telemetry, and rate-correct the audio FIFO cursor with fractional accumulation. Remaining: persist the recovered clock across destroyed/recreated ingest sessions so reconnects re-lock to the prior recovered clock instead of fresh arrival time, and add an A/V-offset-drift metric to the framesync skew cell.
-- **P3 — Timecode.** Extract SMPTE 12M side data (TC-1), align sources by timecode (TC-4), write `tmcd`/tags into the MKV (TC-5).
+- **P2 — Source clock recovery + drift servo.** Partially live: native SRT/RTMP now route timestamps through `SourceClock`, run a per-source `DriftEstimator`, expose `clockppm`/`clockq` telemetry, and rate-correct the audio FIFO cursor with fractional accumulation. NDI ingest maps native 100 ns timestamps through `SourceClock` quality `Ndi`. Remaining: persist the recovered clock across destroyed/recreated ingest sessions so reconnects re-lock to the prior recovered clock instead of fresh arrival time, and add an A/V-offset-drift metric to the framesync skew cell.
+- **P3 — Timecode.** Extract SMPTE 12M side data (TC-1), align sources by timecode (TC-4), write `tmcd`/tags into the MKV (TC-5). NDI ingest already captures the native NDI timecode value per frame internally; mux/alignment consumption is still Phase 3.
 - **P4 — Interlace / fields.** Deinterlace policy + field-rate slow-mo (only if interlaced sport is in scope; today fields are silently frame-blended).
 - **P5 — Architectural / true broadcast output.** A PTP (ST 2059) house-clock client (REF-1); genlocked SDI / ST 2110 output via DeckLink/Rivermax (GENLOCK-1, today output is software `QVideoSink` only); interim: PTS-stamp the `QVideoFrame` + vsync-pace presentation (GENLOCK-2/3/5). **#54 (NDI output bus) is the first concrete step here** — a broadcast output path with preview.
 - **Cross-device drift** (two machines) and **encrypted SRT** were also flagged "beyond Phase 2."

@@ -256,6 +256,16 @@ elseif(WIN32)
         RUN_SERIAL TRUE)
 endif()
 
+# Native NDI ingest is cross-platform and runtime-loaded. This smoke is opt-in:
+# it skips unless OLR_NDI_TEST_SOURCE names a real source visible to the NDI runtime.
+add_test(NAME e2e_native_ndi_smoke
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_smoke.sh" "$<TARGET_FILE:record_harness>")
+set_tests_properties(e2e_native_ndi_smoke PROPERTIES
+    LABELS "native-ndi"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 # --- Local-only native RTMP e2e (NOT in CI) --------------------------------
 # This test uses a deterministic Python RTMP fixture server and requires the
 # native backend marker in the harness log, so a successful FFmpeg fallback is
