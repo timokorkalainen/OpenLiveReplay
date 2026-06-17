@@ -30,6 +30,8 @@ struct NdiOutputStatus {
     QString message;
     qint64 framesSubmitted = 0;
     qint64 sendFailures = 0;
+    qint64 lastSendDurationNs = 0;
+    bool hasLastFrameIdentity = false;
     OutputFrameIdentity lastFrameIdentity;
 };
 

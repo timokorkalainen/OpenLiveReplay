@@ -3,6 +3,8 @@
 #include "playback/output/ndisink.h"
 #include "playback/output/ndiruntimepaths.h"
 
+#include <QThread>
+
 static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
     MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
     f.feedIndex = feed;
@@ -27,6 +29,7 @@ public:
     void destroySender() override { active = false; }
 
     bool sendFrame(const OutputBusFrame& frame) override {
+        if (sendDelayMs > 0) QThread::msleep(uint(sendDelayMs));
         if (!active || !sendSucceeds) return false;
         sentFrames.append(frame);
         return true;
@@ -36,6 +39,7 @@ public:
     bool createSucceeds = true;
     bool sendSucceeds = true;
     bool active = false;
+    int sendDelayMs = 0;
     QString createdName;
     FrameRate createdRate;
     QVector<OutputBusFrame> sentFrames;
@@ -51,6 +55,7 @@ private slots:
     void rejectsDisabledOrNonNdiAssignments();
     void reportsCreateFailureAndStoppedStatus();
     void reportsSendFailureStatus();
+    void reportsSendDurationInOutputStatus();
 };
 
 void TestNdiSink::runtimeCandidatesIncludeNdiToolsInstallLocations() {
@@ -219,6 +224,38 @@ void TestNdiSink::reportsSendFailureStatus() {
     QCOMPARE(sink.status().state, NdiOutputState::SendFailed);
     QCOMPARE(sink.status().sendFailures, qint64(1));
     QCOMPARE(sink.status().lastFrameIdentity.outputFrameIndex, qint64(9));
+}
+
+void TestNdiSink::reportsSendDurationInOutputStatus() {
+    FakeNdiBackend backend(true);
+    backend.sendDelayMs = 5;
+    NdiOutputSink sink(&backend);
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-ndi");
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+    assignment.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR Feed 1"));
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+
+    OutputBusFrame frame;
+    frame.bus = OutputBusId::feed(0);
+    frame.outputFrameIndex = 42;
+    frame.sampledPlayheadMs = 1680;
+    frame.video = video(0, 1680, 96);
+    frame.audio.feedIndex = 0;
+    frame.audio.sampleRate = 48000;
+    frame.audio.channels = 2;
+    frame.audio.format = MediaSampleFormat::S16Interleaved;
+    frame.audio.pcm = QByteArray(8 * int(sizeof(qint16)), '\0');
+
+    QVERIFY(sink.submit(frame));
+    const OutputSinkStatus status = sink.outputStatus();
+    QVERIFY(status.lastSubmitDurationNs > 0);
+    QVERIFY(status.hasLastDeliveredFrameIndex);
+    QCOMPARE(status.lastDeliveredFrameIndex, qint64(42));
 }
 
 QTEST_GUILESS_MAIN(TestNdiSink)
