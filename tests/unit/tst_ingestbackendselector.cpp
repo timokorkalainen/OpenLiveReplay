@@ -1,8 +1,6 @@
 #include <QtTest>
 
-#include "recorder_engine/ingest/ffmpegingestsession.h"
 #include "recorder_engine/ingest/ingestsession.h"
-#include "recorder_engine/ingest/nativefallbackpolicy.h"
 #include "recorder_engine/ingest/nativesrtingestsession.h"
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
 #include "recorder_engine/ingest/nativertmpingestsession.h"
@@ -13,12 +11,11 @@
 class TestIngestBackendSelector : public QObject {
     Q_OBJECT
 private slots:
-    void defaultRoutesEverythingToFfmpeg();
-    void nativeSrtFlagRoutesOnlySrtToNative();
-    void nativeRtmpFlagRoutesOnlyRtmpToNative();
-    void environmentDefaultsRtmpAndRtmpsToNative();
-    void legacyRtmpFfmpegOverridesAreIgnored();
-    void nativeRtmpDisableEnvIsIgnored();
+    void srtRoutesToNativeSrt();
+    void rtmpRoutesToNativeRtmp();
+    void unsupportedSchemesAreRejected();
+    void srtIsNativeByDefaultWithoutEnv();
+    void rtmpIsNativeByDefault();
     void nativeFailureStopsNativeRetryWithoutFfmpegFallback();
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
     void malformedLegacyVideoPacketStaysMalformed();
@@ -29,122 +26,46 @@ private slots:
     void nativeRtmpAudioFollowsVideoReanchorWithoutDrift();
     void nativeRtmpAudioDiscontinuityKeepsSharedAnchor();
 #endif
-    void canConstructFfmpegSession();
-    void nativeFailureReasonStartsEmpty();
-    void nativeDecodeCapabilityErrorsRequestFallback();
-    void nativeDecodeTransientErrorsDoNotRequestFallback();
     void sharedAnchorMapsStreamTime();
 };
 
-class EmptySession final : public IngestSession {
-public:
-    bool open(const QUrl&, const IngestCallbacks&) override { return false; }
-    void run() override {}
-    void requestStop() override {}
-};
-
-class ScopedEnv {
-public:
-    explicit ScopedEnv(const char* name)
-        : m_name(name), m_hadValue(qEnvironmentVariableIsSet(name)), m_value(qgetenv(name)) {}
-    ~ScopedEnv() {
-        if (m_hadValue) {
-            qputenv(m_name, m_value);
-        } else {
-            qunsetenv(m_name);
-        }
-    }
-
-private:
-    const char* m_name = nullptr;
-    bool m_hadValue = false;
-    QByteArray m_value;
-};
-
-void TestIngestBackendSelector::defaultRoutesEverythingToFfmpeg() {
-    const IngestBackendOptions opts;
-
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("srt://127.0.0.1:9000")), opts),
-             IngestBackendKind::Ffmpeg);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
-}
-
-void TestIngestBackendSelector::nativeSrtFlagRoutesOnlySrtToNative() {
+void TestIngestBackendSelector::srtRoutesToNativeSrt() {
     IngestBackendOptions opts;
     opts.preferNativeSrt = true;
-
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("srt://127.0.0.1:9000")), opts),
              IngestBackendKind::NativeSrt);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
-             IngestBackendKind::Ffmpeg);
 }
-
-void TestIngestBackendSelector::nativeRtmpFlagRoutesOnlyRtmpToNative() {
+void TestIngestBackendSelector::rtmpRoutesToNativeRtmp() {
     IngestBackendOptions opts;
     opts.preferNativeRtmp = true;
-
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
              IngestBackendKind::NativeRtmp);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
              IngestBackendKind::NativeRtmp);
+}
+void TestIngestBackendSelector::unsupportedSchemesAreRejected() {
+    IngestBackendOptions opts;
+    opts.preferNativeSrt = true;
+    opts.preferNativeRtmp = true;
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("udp://127.0.0.1:1234")), opts),
+             IngestBackendKind::Unsupported);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("file:///tmp/x.ts")), opts),
+             IngestBackendKind::Unsupported);
+    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("http://example.test/x")), opts),
+             IngestBackendKind::Unsupported);
+}
+void TestIngestBackendSelector::srtIsNativeByDefaultWithoutEnv() {
+    qunsetenv("OLR_NATIVE_SRT");
+    const IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000")), true, false);
+    QVERIFY(opts.preferNativeSrt);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("srt://127.0.0.1:9000")), opts),
-             IngestBackendKind::Ffmpeg);
+             IngestBackendKind::NativeSrt);
 }
-
-void TestIngestBackendSelector::environmentDefaultsRtmpAndRtmpsToNative() {
-    ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
-    ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
-    qunsetenv("OLR_NATIVE_RTMP");
-    qunsetenv("OLR_FFMPEG_RTMP");
-
-    IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
+void TestIngestBackendSelector::rtmpIsNativeByDefault() {
+    const IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
         QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), false, true);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
-             IngestBackendKind::NativeRtmp);
-
-    opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
-                                               false, true);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
-             IngestBackendKind::NativeRtmp);
-}
-
-void TestIngestBackendSelector::legacyRtmpFfmpegOverridesAreIgnored() {
-    ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
-    ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
-    qunsetenv("OLR_NATIVE_RTMP");
-    qputenv("OLR_FFMPEG_RTMP", "1");
-
-    IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
-        QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), false, true);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
-             IngestBackendKind::NativeRtmp);
-
-    opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
-                                               false, true);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
-             IngestBackendKind::NativeRtmp);
-}
-
-void TestIngestBackendSelector::nativeRtmpDisableEnvIsIgnored() {
-    ScopedEnv nativeRtmp("OLR_NATIVE_RTMP");
-    ScopedEnv forceFfmpeg("OLR_FFMPEG_RTMP");
-    qputenv("OLR_FFMPEG_RTMP", "1");
-    qputenv("OLR_NATIVE_RTMP", "0");
-
-    IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
-        QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), false, true);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
-             IngestBackendKind::NativeRtmp);
-
-    opts = ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmps://example.test/live/a")),
-                                               false, true);
-    QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
-             IngestBackendKind::NativeRtmp);
+    QVERIFY(opts.preferNativeRtmp);
 }
 
 void TestIngestBackendSelector::nativeFailureStopsNativeRetryWithoutFfmpegFallback() {
@@ -283,38 +204,6 @@ void TestIngestBackendSelector::nativeRtmpAudioDiscontinuityKeepsSharedAnchor() 
     QCOMPARE(session.sourcePtsMsForAudio(5040), int64_t(14040));
 }
 #endif
-
-void TestIngestBackendSelector::canConstructFfmpegSession() {
-    FfmpegIngestSession session(0);
-    QVERIFY(!session.isOpen());
-}
-
-void TestIngestBackendSelector::nativeFailureReasonStartsEmpty() {
-    EmptySession session;
-    QVERIFY(session.nativeFallbackReason().isEmpty());
-}
-
-void TestIngestBackendSelector::nativeDecodeCapabilityErrorsRequestFallback() {
-    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Native decoder is unavailable.")));
-    QVERIFY(nativeDecodeErrorRequestsFallback(
-        QStringLiteral("Media Foundation decode is not implemented.")));
-    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Unsupported codec profile.")));
-    QVERIFY(nativeDecodeErrorRequestsFallback(
-        QStringLiteral("VideoToolbox decompression session creation failed (-12908).")));
-}
-
-void TestIngestBackendSelector::nativeDecodeTransientErrorsDoNotRequestFallback() {
-    QVERIFY(!nativeDecodeErrorRequestsFallback(
-        QStringLiteral("VideoToolbox format description creation failed (-12712).")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(
-        QStringLiteral("VideoToolbox needs codec parameter sets before decoding.")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(
-        QStringLiteral("H.264 decode requires SPS/PPS before frames.")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(
-        QStringLiteral("H.265 decode requires VPS before frames.")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(
-        QStringLiteral("Native decoder received an empty access unit.")));
-}
 
 void TestIngestBackendSelector::sharedAnchorMapsStreamTime() {
     // The single shared A/V anchor maps a 90kHz stream timestamp onto the recording

@@ -26,7 +26,6 @@ public:
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
     void requestStop() override;
-    QString nativeFallbackReason() const override;
 
     // Map a 90 kHz stream timestamp onto the recording timeline using the shared
     // A/V anchor (anchorTs90k <-> anchorStreamMs). Pure: returns -1 if any input is
@@ -51,7 +50,6 @@ private:
     std::unique_ptr<NativeAacDecoder> m_audioDecoder;
     QByteArray m_tsBuffer;
     QByteArray m_audioRemainder;
-    QString m_nativeFallbackReason;
     int m_socket = -1;
     bool m_srtLibraryStarted = false;
     int64_t m_statRetrans = -1;
@@ -70,13 +68,13 @@ private:
     int64_t m_prevAudioPts90k = -1;
     int64_t m_audioRemainderPts90k = -1;
     int64_t m_lastPacketAtMs = -1;
+    int64_t m_lastDecodeErrorLogMs = -1;
     bool m_loggedLatmUnsupported = false;
 
     bool openSocket(QString* error);
     void closeSocket();
     bool shouldStop() const;
     void log(const QString& message) const;
-    void markNativeFallback(const QString& reason);
     void processReceivedBytes(const char* data, int size);
     void processPesPacket(const PesPacket& pes);
     void processAudioPesPacket(const PesPacket& pes);

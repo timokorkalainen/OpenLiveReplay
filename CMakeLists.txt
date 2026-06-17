@@ -85,8 +85,6 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
         recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
         recorder_engine/ingest/ingestsession.h recorder_engine/ingest/ingestsession.cpp
-        recorder_engine/ingest/ffmpegingestsession.h recorder_engine/ingest/ffmpegingestsession.cpp
-        recorder_engine/ingest/nativefallbackpolicy.h recorder_engine/ingest/nativefallbackpolicy.cpp
         recorder_engine/ingest/pespacket.h
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
@@ -262,8 +260,11 @@ elseif(WIN32)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp
         recorder_engine/ingest/nativesrtingestsession.cpp
+        recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp)
-    target_compile_definitions(OpenLiveReplay PRIVATE OLR_NATIVE_SRT_AVAILABLE=1)
+    target_compile_definitions(OpenLiveReplay PRIVATE
+        OLR_NATIVE_SRT_AVAILABLE=1
+        OLR_NATIVE_RTMP_AVAILABLE=1)
     target_include_directories(OpenLiveReplay PRIVATE
         "${OLR_FFMPEG_INCLUDE}"
         "${OLR_SRT_INCLUDE_DIR}")

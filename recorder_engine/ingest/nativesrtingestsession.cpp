@@ -1,6 +1,5 @@
 #include "nativesrtingestsession.h"
 
-#include "nativefallbackpolicy.h"
 #include "nativesrtaddress.h"
 
 #include <QDebug>
@@ -140,13 +139,13 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_decoder.reset();
     m_audioDecoder.reset();
     m_audioRemainder.clear();
-    m_nativeFallbackReason.clear();
     m_anchorTs90k = -1;
     m_anchorStreamTimeMs = -1;
     m_prevDts90k = -1;
     m_prevAudioPts90k = -1;
     m_audioRemainderPts90k = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
+    m_lastDecodeErrorLogMs = -1;
     m_statRetrans = -1;
     m_statLossTotal = -1;
     m_statDropTotal = -1;
@@ -241,10 +240,6 @@ void NativeSrtIngestSession::run() {
 void NativeSrtIngestSession::requestStop() {
     m_stopRequested.store(true, std::memory_order_relaxed);
     closeSocket();
-}
-
-QString NativeSrtIngestSession::nativeFallbackReason() const {
-    return m_nativeFallbackReason;
 }
 
 bool NativeSrtIngestSession::openSocket(QString* error) {
@@ -369,14 +364,6 @@ void NativeSrtIngestSession::log(const QString& message) const {
     }
 }
 
-void NativeSrtIngestSession::markNativeFallback(const QString& reason) {
-    if (m_nativeFallbackReason.isEmpty()) {
-        m_nativeFallbackReason = reason;
-        m_stopRequested.store(true, std::memory_order_relaxed);
-        log(reason);
-    }
-}
-
 void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
     if (!data || size <= 0) {
         return;
@@ -492,10 +479,10 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
             },
             &error);
         if (!decoded && !error.isEmpty()) {
-            if (nativeDecodeErrorRequestsFallback(error)) {
-                markNativeFallback(error);
-            } else {
+            const int64_t nowMs = m_monotonic.elapsed();
+            if (m_lastDecodeErrorLogMs < 0 || nowMs - m_lastDecodeErrorLogMs >= 5000) {
                 log(error);
+                m_lastDecodeErrorLogMs = nowMs;
             }
         }
     }

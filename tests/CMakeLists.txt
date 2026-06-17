@@ -90,8 +90,6 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/recordingclock.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/heartbeat.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
-    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativefallbackpolicy.h"
-    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativefallbackpolicy.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xaccessunit.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeframecopy.cpp"
@@ -137,7 +135,6 @@ endif()
 
 # --- Engine sources that DO need FFmpeg (muxer / capture / recording) -------
 qt_add_library(olr_test_engine STATIC
-    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ffmpegingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/muxer.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/streamworker.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/replaymanager.cpp"
@@ -172,8 +169,11 @@ if(APPLE)
 elseif(WIN32)
     target_sources(olr_test_engine PRIVATE
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtingestsession.cpp"
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativertmpingestsession.cpp"
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp")
-    target_compile_definitions(olr_test_engine PUBLIC OLR_NATIVE_SRT_AVAILABLE=1)
+    target_compile_definitions(olr_test_engine PUBLIC
+        OLR_NATIVE_SRT_AVAILABLE=1
+        OLR_NATIVE_RTMP_AVAILABLE=1)
     target_include_directories(olr_test_engine PUBLIC "${OLR_SRT_INCLUDE_DIR}")
     target_link_libraries(olr_test_engine
         PRIVATE mfplat mf mfuuid d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")

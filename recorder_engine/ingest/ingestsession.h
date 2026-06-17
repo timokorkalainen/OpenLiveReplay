@@ -13,7 +13,7 @@ extern "C" {
 struct AVFrame;
 }
 
-enum class IngestBackendKind { Ffmpeg, NativeSrt, NativeRtmp };
+enum class IngestBackendKind { NativeSrt, NativeRtmp, Unsupported };
 
 enum class IngestFailureKind {
     None,
@@ -84,10 +84,9 @@ constexpr int kRtmpAmberStallMs = 1000;
 constexpr int kRtmpAmberKeyframeMs = 5000;
 SourceHealth rtmpHealth(const IngestStats& prev, const IngestStats& cur);
 
-// Shared SRT receive latency / connect timeout (milliseconds), used by BOTH ingest
-// paths: the native path passes them straight to srt_setsockopt (SRTO_LATENCY /
-// SRTO_CONNTIMEO, which are milliseconds); the ffmpeg path puts them in the URL query
-// via augmentSrtUrl() (note: ffmpeg's latency options are MICROSECONDS — see there).
+// SRT receive latency / connect timeout (milliseconds): the native ingest path
+// passes them straight to srt_setsockopt (SRTO_LATENCY / SRTO_CONNTIMEO, which are
+// milliseconds).
 constexpr int kSrtLatencyMs = 500;
 constexpr int kSrtConnectTimeoutMs = 5000;
 
@@ -108,7 +107,6 @@ public:
     virtual bool open(const QUrl& url, const IngestCallbacks& callbacks) = 0;
     virtual void run() = 0;
     virtual void requestStop() = 0;
-    virtual QString nativeFallbackReason() const { return QString(); }
     virtual IngestFailureKind lastFailureKind() const { return IngestFailureKind::None; }
 };
 
@@ -118,15 +116,6 @@ IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool n
 bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure);
 
 Q_DECLARE_METATYPE(IngestStats)
-
-// Append SRT-private options to an srt:// URL's query so they actually apply.
-// FFmpeg's libsrt reads these via the URL query (av_find_info_tag); set on the
-// avformat_open_input() opts dict they are silently ignored. Non-srt URLs are
-// returned unchanged; an option already present in the query is left as-is (a
-// user override wins). UNITS: ffmpeg's latency/rcvlatency/peerlatency are
-// MICROSECONDS (it divides by 1000 -> SRTO_LATENCY ms), so they carry
-// kSrtLatencyMs*1000; connect_timeout is milliseconds; linger is seconds.
-QUrl augmentSrtUrl(const QUrl& url);
 
 // Per-transport engine jitter window: SRT sources lean on SRT's TSBPD reorder
 // buffer, so they need only a small residual floor; other transports get the
