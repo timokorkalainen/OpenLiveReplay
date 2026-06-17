@@ -111,6 +111,8 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/mediaframe.h
         playback/output/outputframecache.h playback/output/outputframecache.cpp
         playback/output/outputtargetassignment.h playback/output/outputtargetassignment.cpp
+        playback/output/outputbusengine.h playback/output/outputbusengine.cpp
+        playback/output/yuv420pcompositor.h playback/output/yuv420pcompositor.cpp
         project/projectsettingsimporter.h project/projectsettingsimporter.cpp
         project/projectimportclient.h project/projectimportclient.cpp
         telemetry/telemetryevent.h

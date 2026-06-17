@@ -40,15 +40,9 @@ struct OutputBusId {
     OutputBusKind kind = OutputBusKind::Feed;
     int index = 0;
 
-    static OutputBusId feed(int feedIndex) {
-        return {OutputBusKind::Feed, feedIndex};
-    }
-    static OutputBusId multiview() {
-        return {OutputBusKind::Multiview, 0};
-    }
-    static OutputBusId pgm() {
-        return {OutputBusKind::Pgm, 0};
-    }
+    static OutputBusId feed(int feedIndex) { return {OutputBusKind::Feed, feedIndex}; }
+    static OutputBusId multiview() { return {OutputBusKind::Multiview, 0}; }
+    static OutputBusId pgm() { return {OutputBusKind::Pgm, 0}; }
 
     bool operator==(const OutputBusId& other) const {
         return kind == other.kind && index == other.index;

@@ -22,8 +22,8 @@ struct MediaVideoFrame {
     bool isPlaceholder = false;
 
     bool isValid() const {
-        return width > 0 && height > 0 && format == MediaPixelFormat::Yuv420p
-               && !planeY.isEmpty() && !planeU.isEmpty() && !planeV.isEmpty();
+        return width > 0 && height > 0 && format == MediaPixelFormat::Yuv420p &&
+               !planeY.isEmpty() && !planeU.isEmpty() && !planeV.isEmpty();
     }
 
     static MediaVideoFrame solidYuv420p(int width, int height, uchar y, uchar u, uchar v) {

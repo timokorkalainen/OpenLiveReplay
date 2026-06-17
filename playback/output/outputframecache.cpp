@@ -4,19 +4,15 @@
 #include <cstring>
 
 OutputFrameCache::OutputFrameCache(int feedCount, int placeholderWidth, int placeholderHeight)
-    : m_video(qMax(0, feedCount)),
-      m_audio(qMax(0, feedCount)),
+    : m_video(qMax(0, feedCount)), m_audio(qMax(0, feedCount)),
       m_placeholderWidth(qMax(2, placeholderWidth)),
-      m_placeholderHeight(qMax(2, placeholderHeight)) {
-}
+      m_placeholderHeight(qMax(2, placeholderHeight)) {}
 
 void OutputFrameCache::insertVideoFrame(const MediaVideoFrame& frame) {
     if (frame.feedIndex < 0 || frame.feedIndex >= m_video.size() || !frame.isValid()) return;
     auto& list = m_video[frame.feedIndex];
     auto it = std::lower_bound(list.begin(), list.end(), frame.ptsMs,
-                               [](const MediaVideoFrame& f, qint64 pts) {
-                                   return f.ptsMs < pts;
-                               });
+                               [](const MediaVideoFrame& f, qint64 pts) { return f.ptsMs < pts; });
     if (it != list.end() && it->ptsMs == frame.ptsMs) {
         *it = frame;
     } else {
@@ -24,15 +20,13 @@ void OutputFrameCache::insertVideoFrame(const MediaVideoFrame& frame) {
     }
 }
 
-std::optional<MediaVideoFrame> OutputFrameCache::videoFrameAt(
-    int feedIndex, qint64 playheadMs) const {
+std::optional<MediaVideoFrame> OutputFrameCache::videoFrameAt(int feedIndex,
+                                                              qint64 playheadMs) const {
     if (feedIndex < 0 || feedIndex >= m_video.size()) return std::nullopt;
     const auto& list = m_video[feedIndex];
     if (list.isEmpty()) return std::nullopt;
     auto it = std::upper_bound(list.begin(), list.end(), playheadMs,
-                               [](qint64 pts, const MediaVideoFrame& f) {
-                                   return pts < f.ptsMs;
-                               });
+                               [](qint64 pts, const MediaVideoFrame& f) { return pts < f.ptsMs; });
     if (it == list.begin()) return std::nullopt;
     --it;
     return *it;
@@ -53,15 +47,14 @@ void OutputFrameCache::insertAudioFrame(const MediaAudioFrame& frame) {
     if (frame.feedIndex < 0 || frame.feedIndex >= m_audio.size()) return;
     if (frame.format != MediaSampleFormat::S16Interleaved || frame.channels != 2) return;
     auto& list = m_audio[frame.feedIndex];
-    auto it = std::lower_bound(list.begin(), list.end(), frame.startSample,
-                               [](const MediaAudioFrame& f, qint64 sample) {
-                                   return f.startSample < sample;
-                               });
+    auto it = std::lower_bound(
+        list.begin(), list.end(), frame.startSample,
+        [](const MediaAudioFrame& f, qint64 sample) { return f.startSample < sample; });
     list.insert(it, frame);
 }
 
-QByteArray OutputFrameCache::audioSpanOrSilence(
-    int feedIndex, qint64 startSample, int sampleFrames) const {
+QByteArray OutputFrameCache::audioSpanOrSilence(int feedIndex, qint64 startSample,
+                                                int sampleFrames) const {
     QByteArray out = silentS16Stereo(sampleFrames);
     if (feedIndex < 0 || feedIndex >= m_audio.size() || sampleFrames <= 0) return out;
 
