@@ -347,9 +347,8 @@ void TestNdiSink::inFlightSendReportsAttemptedButNotDeliveredFrame() {
     QVERIFY(sink.start(ndiAssignment(), FrameRate::fromFraction(25, 1)));
 
     bool submitResult = false;
-    QThread* submitThread = QThread::create([&]() {
-        submitResult = sink.submit(validFrame(44, 1760, 112));
-    });
+    QThread* submitThread =
+        QThread::create([&]() { submitResult = sink.submit(validFrame(44, 1760, 112)); });
     submitThread->start();
 
     const bool sendEntered = backend.waitForSendEntered(1000);

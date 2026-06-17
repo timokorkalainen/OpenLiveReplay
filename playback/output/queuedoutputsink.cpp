@@ -136,7 +136,8 @@ void QueuedOutputSink::workerLoop() {
         {
             QMutexLocker locker(&m_mutex);
             if (submitted) {
-                if (m_hasLastDeliveredFrameIndex && frame.outputFrameIndex != m_lastDeliveredFrameIndex + 1) {
+                if (m_hasLastDeliveredFrameIndex &&
+                    frame.outputFrameIndex != m_lastDeliveredFrameIndex + 1) {
                     m_deliveryGaps++;
                 }
                 m_lastDeliveredFrameIndex = frame.outputFrameIndex;

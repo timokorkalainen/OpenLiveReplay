@@ -269,8 +269,7 @@ bool NdiOutputSink::submit(const OutputBusFrame& frame) {
             m_status.lastSendDurationNs = sendTimer.nsecsElapsed();
             m_status.lastFrameDelivered = false;
             m_status.state = NdiOutputState::SendFailed;
-            m_status.message =
-                QStringLiteral("failed to send NDI frame: missing broadcast audio");
+            m_status.message = QStringLiteral("failed to send NDI frame: missing broadcast audio");
         }
         return false;
     }

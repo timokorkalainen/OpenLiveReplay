@@ -104,8 +104,7 @@ QString diagnosticText(const OutputTargetAssignment& assignment,
             .arg(status->maxQueueDepth)
             .arg(status->deliveryGaps)
             .arg(valueOrDash(status->lastQueuedFrameIndex, status->hasLastQueuedFrameIndex))
-            .arg(valueOrDash(status->lastDeliveredFrameIndex,
-                             status->hasLastDeliveredFrameIndex))
+            .arg(valueOrDash(status->lastDeliveredFrameIndex, status->hasLastDeliveredFrameIndex))
             .arg(status->lastSubmitDurationNs)
             .arg(valueOrDash(hasIdentity ? status->lastIdentity.outputFrameIndex : 0, hasIdentity))
             .arg(valueOrDash(hasIdentity ? status->lastIdentity.sampledPlayheadMs : 0, hasIdentity))

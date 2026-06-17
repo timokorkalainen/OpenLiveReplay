@@ -255,7 +255,8 @@ void TestQueuedOutputSink::queueStatusReportsDepthAndDroppedFrames() {
         observed->release();
         sink.stop();
     }
-    QVERIFY2(workerBlocked, "worker must enter the blocking inner sink before queue pressure is asserted");
+    QVERIFY2(workerBlocked,
+             "worker must enter the blocking inner sink before queue pressure is asserted");
 
     const bool submitted11 = sink.submit(frame(11));
     const bool submitted12 = sink.submit(frame(12));
