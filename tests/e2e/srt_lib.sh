@@ -124,7 +124,12 @@ flash_beep_marker_to_udp() {
 flash_beep_tc_marker_to_udp() {
     local port="$1"
     local tc="${OLR_MARKER_TC:-10\\:00\\:00\\:00}"
-    local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128,drawtext=fontfile=:text='':timecode='${tc}':r=30:fontsize=20:fontcolor=white:x=10:y=10"
+    local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
+    if ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' drawtext '; then
+        vflt="${vflt},drawtext=fontfile=:text='':timecode='${tc}':r=30:fontsize=20:fontcolor=white:x=10:y=10"
+    else
+        echo "WARN: ffmpeg drawtext unavailable; TC marker uses container timecode only" >&2
+    fi
     local vargs
     if [ "${OLR_FLASH_CODEC:-avc}" = "hevc" ]; then
         srt_hevc_vcodec_args || { echo "SKIP: no HEVC encoder for TC marker"; exit 77; }
