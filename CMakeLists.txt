@@ -99,6 +99,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/nativesrtaddress.h recorder_engine/ingest/nativesrtaddress.cpp
         recorder_engine/ingest/nativesrtingestsession.h
         recorder_engine/ingest/nativertmpingestsession.h
+        recorder_engine/ingest/nativendiingestsession.h recorder_engine/ingest/nativendiingestsession.cpp
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp
