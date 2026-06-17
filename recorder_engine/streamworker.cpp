@@ -8,6 +8,7 @@
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
 #include "ingest/nativertmpingestsession.h"
 #endif
+#include "ingest/nativendiingestsession.h"
 #include <QDebug>
 #include <QDateTime>
 #include <QUrl>
@@ -348,8 +349,11 @@ void StreamWorker::captureLoop() {
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
         nativeRtmpAvailable = NativeRtmpIngestSession::supportsUrl(sourceUrl);
 #endif
+        const bool nativeNdiAvailable =
+            NativeNdiIngestSession::supportsUrl(sourceUrl) && NativeNdiIngestSession::runtimeAvailable();
         IngestBackendOptions backendOptions =
-            ingestBackendOptionsFromEnvironment(sourceUrl, nativeSrtAvailable, nativeRtmpAvailable);
+            ingestBackendOptionsFromEnvironment(sourceUrl, nativeSrtAvailable, nativeRtmpAvailable,
+                                                nativeNdiAvailable);
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
         const bool nativeRtmpAttempt = backendKind == IngestBackendKind::NativeRtmp;
 
@@ -366,18 +370,21 @@ void StreamWorker::captureLoop() {
                                                                 m_targetHeight, &m_captureRunning);
         }
 #endif
+        if (backendKind == IngestBackendKind::NativeNdi) {
+            session = std::make_unique<NativeNdiIngestSession>(m_sourceIndex, m_targetWidth,
+                                                               m_targetHeight, &m_captureRunning);
+        }
         if (!session) {
             const QString scheme = sourceUrl.scheme().toLower();
             if (scheme == QStringLiteral("srt") || scheme == QStringLiteral("rtmp") ||
-                scheme == QStringLiteral("rtmps")) {
+                scheme == QStringLiteral("rtmps") || scheme == QStringLiteral("ndi")) {
                 qWarning() << "Source" << m_sourceIndex << "native" << scheme
                            << "ingest is unavailable for this URL - the native backend does not"
-                           << "support these URL options (e.g. a hostname instead of a numeric"
-                           << "IPv4 address, encryption, or listener mode), or it is not built on"
-                           << "this platform. Source disabled.";
+                           << "support these URL options, the NDI runtime is missing, or it is not"
+                           << "built on this platform. Source disabled.";
             } else {
                 qWarning() << "Source" << m_sourceIndex << "unsupported ingest scheme" << scheme
-                           << "- OpenLiveReplay ingests only srt://, rtmp://, rtmps://";
+                           << "- OpenLiveReplay ingests only srt://, rtmp://, rtmps://, ndi:";
             }
             setConnected(false);
             m_captureRunning = false;
