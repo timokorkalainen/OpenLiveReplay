@@ -187,6 +187,9 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/frameprovider.cpp"
     "${CMAKE_SOURCE_DIR}/playback/telemetrytimelinereader.cpp"
     "${CMAKE_SOURCE_DIR}/playback/audioplayer.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/outputframeclock.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/outputframecache.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/outputtargetassignment.cpp"
 )
 target_include_directories(olr_test_playback PUBLIC
     "${CMAKE_SOURCE_DIR}"
