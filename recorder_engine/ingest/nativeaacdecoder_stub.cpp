@@ -1,6 +1,6 @@
-#include "audiotoolboxaacdecoder.h"
+#include "nativeaacdecoder.h"
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(_WIN32)
 
 #include <algorithm>
 #include <iterator>
@@ -19,19 +19,19 @@ quint8 byteAt(const QByteArray& bytes, int offset)
 
 } // namespace
 
-class AudioToolboxAacDecoder::Impl {};
+class NativeAacDecoder::Impl {};
 
-AudioToolboxAacDecoder::AudioToolboxAacDecoder()
+NativeAacDecoder::NativeAacDecoder()
     : m_impl(new Impl)
 {
 }
 
-AudioToolboxAacDecoder::~AudioToolboxAacDecoder()
+NativeAacDecoder::~NativeAacDecoder()
 {
     delete m_impl;
 }
 
-bool AudioToolboxAacDecoder::parseAdtsFrame(const QByteArray& bytes, int offset,
+bool NativeAacDecoder::parseAdtsFrame(const QByteArray& bytes, int offset,
                                             AacAdtsFrameInfo* info)
 {
     if (!hasAdtsSync(bytes, offset) || offset + 7 > bytes.size()) {
@@ -66,21 +66,21 @@ bool AudioToolboxAacDecoder::parseAdtsFrame(const QByteArray& bytes, int offset,
     return true;
 }
 
-bool AudioToolboxAacDecoder::hasAdtsSync(const QByteArray& bytes, int offset)
+bool NativeAacDecoder::hasAdtsSync(const QByteArray& bytes, int offset)
 {
     return offset >= 0 && offset + 2 <= bytes.size()
         && byteAt(bytes, offset) == 0xff
         && (byteAt(bytes, offset + 1) & 0xf6) == 0xf0;
 }
 
-bool AudioToolboxAacDecoder::hasLatmLoasSync(const QByteArray& bytes, int offset)
+bool NativeAacDecoder::hasLatmLoasSync(const QByteArray& bytes, int offset)
 {
     return offset >= 0 && offset + 2 <= bytes.size()
         && byteAt(bytes, offset) == 0x56
         && (byteAt(bytes, offset + 1) & 0xe0) == 0xe0;
 }
 
-bool AudioToolboxAacDecoder::decodeAdtsFrame(const QByteArray&, const AacAdtsFrameInfo&,
+bool NativeAacDecoder::decodeAdtsFrame(const QByteArray&, const AacAdtsFrameInfo&,
                                              QByteArray*, QString* error)
 {
     if (error) {
@@ -89,6 +89,6 @@ bool AudioToolboxAacDecoder::decodeAdtsFrame(const QByteArray&, const AacAdtsFra
     return false;
 }
 
-void AudioToolboxAacDecoder::reset() {}
+void NativeAacDecoder::reset() {}
 
-#endif // !__APPLE__
+#endif // !__APPLE__ && !_WIN32

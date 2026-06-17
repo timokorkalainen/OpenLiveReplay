@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Report-only frame-sync measurement driver.
 #
-# Generates synchronized synthetic sources, records them with sync_harness, and
-# measures marker timing in the output MKV. Prints a scoreboard and ALWAYS exits
-# 0 — this is a diagnostic, not a gate. See
+# Generates synchronized synthetic sources, bridges each over UDP->SRT
+# (srt-live-transmit) so the engine ingests them over its native srt:// transport
+# (the only ingest path now — udp:// is no longer accepted), records them with
+# sync_harness, and measures marker timing in the output MKV. Prints a scoreboard
+# and ALWAYS exits 0 — this is a diagnostic, not a gate. See
 # docs/superpowers/specs/2026-06-15-sync-measurement-harness-design.md.
 #
 # Usage: run_sync_e2e.sh <sync_harness> <scenario> <base_port> [--write-baseline]
 #   scenarios: intercam_matched | intercam_skew | drift_2997 | lipsync
+#   base_port is the base UDP producer port; each source's SRT listener is
+#   bridged at UDP+100 (see srt_port()).
 set -uo pipefail
 
 HARNESS="${1:?sync_harness executable path required}"
@@ -15,8 +19,9 @@ SCENARIO="${2:?scenario required}"
 BASE_PORT="${3:?base udp port required}"
 WRITE_BASELINE="${4:-}"
 
-command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
-command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
+# shellcheck source=tests/e2e/srt_lib.sh
+. "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
+srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
 
 WORKDIR="$(mktemp -d)"
 PIDS=()
@@ -27,8 +32,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Full-frame luma flash + (optional) co-timed beep, MPEG-TS over UDP, real-time.
-# $1=port $2=rate(e.g. 30 or 30000/1001) $3=with_audio(0/1)
+# SRT listener port for a UDP producer port (UDP+100; see header). Keeps the SRT
+# ports out of the packed UDP base band and clear of the other e2e gates' ports.
+srt_port() { echo $(( $1 + 100 )); }
+
+# Full-frame luma flash + (optional) co-timed beep, MPEG-TS over UDP, real-time,
+# bridged to an SRT listener (srt-live-transmit) so the engine ingests over srt://.
+# $1=udp_port $2=rate(e.g. 30 or 30000/1001) $3=with_audio(0/1)
 produce() {
     local port="$1" rate="$2" with_audio="$3"
     local vsrc="color=c=black:s=320x240:r=${rate}"
@@ -50,9 +60,11 @@ produce() {
             -f mpegts "udp://127.0.0.1:${port}?pkt_size=1316" &
     fi
     PIDS+=($!)
+    srt_bridge "$port" "$(srt_port "$port")"  # UDP MPEG-TS -> SRT listener
 }
 
-url() { echo "udp://127.0.0.1:${1}?fifo_size=1000000&overrun_nonfatal=1"; }
+# SRT caller URL for the SRT listener bridged from a given UDP producer port.
+url() { srt_caller_url "$(srt_port "$1")"; }
 
 # Rising-edge flash-onset pts_time series for one video track.
 # $1=mkv $2=video-track-index. Emits one pts_time per flash, ascending.
@@ -112,7 +124,9 @@ case "$SCENARIO" in
         -map 0:v \
         -f tee "[f=mpegts]udp://127.0.0.1:${P0}?pkt_size=1316|[f=mpegts]udp://127.0.0.1:${P1}?pkt_size=1316" &
     PIDS+=($!)
-    sleep 0.5
+    srt_bridge "$P0" "$(srt_port "$P0")"  # UDP MPEG-TS -> SRT listener (view 0)
+    srt_bridge "$P1" "$(srt_port "$P1")"  # UDP MPEG-TS -> SRT listener (view 1)
+    sleep 1.0
     MKV=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \
             --outdir "$WORKDIR" --name intercam_matched --seconds 8 --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=intercam_matched ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
@@ -139,7 +153,7 @@ case "$SCENARIO" in
     produce "$P0" 30 0
     sleep "$(awk -v d="$D_MS" 'BEGIN{printf "%.3f", d/1000}')"
     produce "$P1" 30 0
-    sleep 0.5
+    sleep 1.0
     MKV=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \
             --outdir "$WORKDIR" --name intercam_skew --seconds 8 --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=intercam_skew ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
@@ -167,7 +181,8 @@ case "$SCENARIO" in
     vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
 
     # Records the tee'd 2-view setup with a given trim on source 1; echoes the
-    # mean (view0-view1) ms, or "nan". Restarts a fresh producer each sub-run.
+    # mean (view0-view1) ms, or "nan". Restarts a fresh producer + SRT bridges
+    # each sub-run (so the SRT listeners are re-armed for the fresh caller).
     measure_trim() {
         ffmpeg -hide_banner -loglevel error -re \
             -f lavfi -i "color=c=black:s=320x240:r=30" -vf "$vflt" \
@@ -176,11 +191,13 @@ case "$SCENARIO" in
             -f tee "[f=mpegts]udp://127.0.0.1:${P0}?pkt_size=1316|[f=mpegts]udp://127.0.0.1:${P1}?pkt_size=1316" &
         local pid=$!
         PIDS+=("$pid")
-        sleep 0.5
+        srt_bridge "$P0" "$(srt_port "$P0")"; local b0=$SRT_LAST_PID
+        srt_bridge "$P1" "$(srt_port "$P1")"; local b1=$SRT_LAST_PID
+        sleep 1.0
         local mkv
         mkv=$("$HARNESS" --url "$(url "$P0")" --url "$(url "$P1")" \
                 --outdir "$WORKDIR" --name "trim_$1" --seconds 8 --fps 30 --trim "$1" | tail -n1)
-        kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+        kill "$pid" "$b0" "$b1" 2>/dev/null; wait "$pid" "$b0" "$b1" 2>/dev/null
         if [ -z "$mkv" ] || [ ! -s "$mkv" ]; then echo "nan"; return; fi
         flash_pts_series "$mkv" 0 > "$WORKDIR/t0.txt"
         flash_pts_series "$mkv" 1 > "$WORKDIR/t1.txt"
@@ -203,7 +220,7 @@ case "$SCENARIO" in
     P0=$BASE_PORT
     DUR=${DRIFT_SECONDS:-60}
     produce "$P0" "30000/1001" 0
-    sleep 0.5
+    sleep 1.0
     MKV=$("$HARNESS" --url "$(url "$P0")" \
             --outdir "$WORKDIR" --name drift_2997 --seconds "$DUR" --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=drift_2997 ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi
@@ -233,7 +250,7 @@ case "$SCENARIO" in
     # minus video-flash PTS (signed ms). EBU R37 band is +40/-60 ms (context).
     P0=$BASE_PORT
     produce "$P0" 30 1
-    sleep 0.5
+    sleep 1.0
     MKV=$("$HARNESS" --url "$(url "$P0")" \
             --outdir "$WORKDIR" --name lipsync --seconds 8 --fps 30 | tail -n1)
     if [ -z "$MKV" ] || [ ! -s "$MKV" ]; then emit "[sync] scenario=lipsync ERROR=no_output"; echo "PASS: report emitted (diagnostic)"; exit 0; fi

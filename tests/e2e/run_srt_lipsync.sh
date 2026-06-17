@@ -5,7 +5,7 @@
 # EBU R37 (audio lead <=40ms, lag <=60ms). Pre-AUD-4 the independent audio anchor
 # baked in ~+60ms; the shared PCR anchor collapses it toward 0.
 #
-# Requires sync_harness + OLR_NATIVE_SRT=1 (set by the CTest registration).
+# Records over the native SRT ingest (the default, and only, SRT ingest).
 # Usage: run_srt_lipsync.sh <sync_harness_exe> [base_port]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

@@ -1,5 +1,4 @@
 #include "streamworker.h"
-#include "ingest/ffmpegingestsession.h"
 #include "ingest/ingestsession.h"
 #include "ingest/rtmpprotocol.h"
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
@@ -236,9 +235,6 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 }
 
 void StreamWorker::captureLoop() {
-    bool suppressNativeForCurrentUrl = false;
-    QString nativeSuppressedUrl;
-
     while (m_captureRunning) {
         // If a restart was requested (e.g. changeSource), acknowledge it
         // and loop back to re-read the URL instead of exiting.
@@ -251,8 +247,8 @@ void StreamWorker::captureLoop() {
         }
 
         {
-            // Right-size the jitter window for this source's transport. SRT (native
-            // or ffmpeg) pre-buffers via TSBPD, so it needs only a small floor.
+            // Right-size the jitter window for this source's transport. SRT
+            // pre-buffers via TSBPD, so it needs only a small floor.
             int srtFloor = kSrtJitterFloorMs;
             const int envFloor = qEnvironmentVariableIntValue("OLR_SRT_JITTER_MS");
             if (envFloor > 0) srtFloor = envFloor;
@@ -261,10 +257,6 @@ void StreamWorker::captureLoop() {
                 std::memory_order_relaxed);
         }
 
-        if (nativeSuppressedUrl != currentUrl) {
-            nativeSuppressedUrl = currentUrl;
-            suppressNativeForCurrentUrl = false;
-        }
         // If URL is empty, don't attempt to connect. Just idle until
         // a new URL is set via changeSource() which sets m_restartCapture.
         if (currentUrl.trimmed().isEmpty()) {
@@ -349,31 +341,38 @@ void StreamWorker::captureLoop() {
 #endif
         IngestBackendOptions backendOptions =
             ingestBackendOptionsFromEnvironment(sourceUrl, nativeSrtAvailable, nativeRtmpAvailable);
-        if (suppressNativeForCurrentUrl) {
-            backendOptions.preferNativeSrt = false;
-        }
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
         const bool nativeRtmpAttempt = backendKind == IngestBackendKind::NativeRtmp;
-#if !defined(OLR_NATIVE_SRT_AVAILABLE) && !defined(OLR_NATIVE_RTMP_AVAILABLE)
-        Q_UNUSED(backendKind);
-#endif
 
         std::unique_ptr<IngestSession> session;
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
         if (backendKind == IngestBackendKind::NativeSrt) {
             session = std::make_unique<NativeSrtIngestSession>(m_sourceIndex, m_targetWidth,
                                                                m_targetHeight, &m_captureRunning);
-        } else
+        }
 #endif
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
-            if (backendKind == IngestBackendKind::NativeRtmp) {
+        if (backendKind == IngestBackendKind::NativeRtmp) {
             session = std::make_unique<NativeRtmpIngestSession>(m_sourceIndex, m_targetWidth,
                                                                 m_targetHeight, &m_captureRunning);
-        } else
+        }
 #endif
-        {
-            session = std::make_unique<FfmpegIngestSession>(m_sourceIndex, m_targetWidth,
-                                                            m_targetHeight, m_targetFps);
+        if (!session) {
+            const QString scheme = sourceUrl.scheme().toLower();
+            if (scheme == QStringLiteral("srt") || scheme == QStringLiteral("rtmp") ||
+                scheme == QStringLiteral("rtmps")) {
+                qWarning() << "Source" << m_sourceIndex << "native" << scheme
+                           << "ingest is unavailable for this URL - the native backend does not"
+                           << "support these URL options (e.g. a hostname instead of a numeric"
+                           << "IPv4 address, encryption, or listener mode), or it is not built on"
+                           << "this platform. Source disabled.";
+            } else {
+                qWarning() << "Source" << m_sourceIndex << "unsupported ingest scheme" << scheme
+                           << "- OpenLiveReplay ingests only srt://, rtmp://, rtmps://";
+            }
+            setConnected(false);
+            m_captureRunning = false;
+            break;
         }
 
         if (!session->open(sourceUrl, callbacks)) {
@@ -413,14 +412,6 @@ void StreamWorker::captureLoop() {
         }
 
         session->run();
-
-        const QString nativeFallbackReason = session->nativeFallbackReason();
-        if (!nativeFallbackReason.isEmpty()) {
-            qDebug() << "Source" << m_sourceIndex
-                     << "Native ingest fallback requested:" << nativeFallbackReason
-                     << "Retrying with FFmpeg for this URL.";
-            suppressNativeForCurrentUrl = true;
-        }
 
         setConnected(false);
         const IngestFailureKind failureKind = session->lastFailureKind();

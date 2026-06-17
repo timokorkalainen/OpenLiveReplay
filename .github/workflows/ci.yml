@@ -313,8 +313,8 @@ jobs:
           - sanitizer: "address;undefined"
             label: asan-ubsan
             advisory: false
-            build_targets: "tst_muxer tst_mpegtsparser tst_h26xaccessunit tst_audiotoolboxaacdecoder tst_audioframequeue"
-            ctest_regex: "^(tst_muxer|tst_mpegtsparser|tst_h26xaccessunit|tst_audiotoolboxaacdecoder|tst_audioframequeue)$"
+            build_targets: "tst_muxer tst_mpegtsparser tst_h26xaccessunit tst_nativeaacdecoder tst_audioframequeue"
+            ctest_regex: "^(tst_muxer|tst_mpegtsparser|tst_h26xaccessunit|tst_nativeaacdecoder|tst_audioframequeue)$"
           - sanitizer: "thread"
             label: tsan
             advisory: true

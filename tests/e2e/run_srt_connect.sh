@@ -7,7 +7,8 @@
 #   listener) -> the engine cannot connect it -> connected=3. Proves the count
 #   reflects real connection state, not a constant.
 #
-# Requires sync_harness built with -DOLR_FFMPEG_SRT_PREFIX.
+# The engine ingests srt:// over its native SRT path — no SRT-enabled ffmpeg build
+# is needed.
 # Usage: run_srt_connect.sh <sync_harness_exe> [base_port]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

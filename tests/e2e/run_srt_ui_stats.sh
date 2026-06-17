@@ -8,8 +8,8 @@
 # and a clean control run shows recv>0 with ~no retransmits. This proves the exact
 # numbers the UI dot/tooltip will read, without needing QML.
 #
-# Requires sync_harness built with -DOLR_FFMPEG_SRT_PREFIX; native ingest via
-# OLR_NATIVE_SRT=1 (set by the CTest registration).
+# Records over the native SRT ingest (the default, and only, SRT ingest); no
+# SRT-enabled ffmpeg build is needed.
 # Usage: run_srt_ui_stats.sh <sync_harness_exe> [base_port]
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
