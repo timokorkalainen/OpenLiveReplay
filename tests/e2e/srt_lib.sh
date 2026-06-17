@@ -33,9 +33,39 @@ srt_bridge() {
     PIDS+=("$SRT_LAST_PID")
 }
 
+# Populate SRT_HEVC_VCODEC_ARGS with an ffmpeg HEVC encoder + args (clean 30-frame
+# GOP, no scenecut so the per-second flash always lands on a decodable picture).
+# Prefers libx265 (deterministic), then a hardware HEVC encoder. Returns 1 (no args)
+# when the local ffmpeg has no usable HEVC encoder, so callers can SKIP.
+SRT_HEVC_VCODEC_ARGS=()
+srt_hevc_vcodec_args() {
+    local encoders enc
+    encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null)"
+    if printf '%s\n' "$encoders" | grep -q ' libx265 '; then
+        SRT_HEVC_VCODEC_ARGS=(-c:v libx265 -preset ultrafast
+            -x265-params "log-level=error:keyint=30:min-keyint=30:scenecut=0"
+            -pix_fmt yuv420p -b:v 4M)
+        return 0
+    fi
+    for enc in hevc_videotoolbox hevc_nvenc hevc_qsv hevc_amf hevc_mf; do
+        if printf '%s\n' "$encoders" | grep -q " ${enc} "; then
+            if [ "$enc" = "hevc_videotoolbox" ]; then
+                SRT_HEVC_VCODEC_ARGS=(-c:v "$enc" -allow_sw 1 -realtime 1 -g 30
+                    -pix_fmt yuv420p -b:v 4M)
+            else
+                SRT_HEVC_VCODEC_ARGS=(-c:v "$enc" -g 30 -pix_fmt yuv420p -b:v 4M)
+            fi
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Spawn ONE ffmpeg full-frame-flash producer, tee'd to all given UDP ports so every
 # consumer sees byte-identical, simultaneous content. Luma flashes to white (235)
 # for the first ~60ms of every source-second, else black (16).
+# Video codec follows OLR_FLASH_CODEC (default "avc" = H.264; "hevc" = H.265 via
+# srt_hevc_vcodec_args, exits 77/SKIP if no HEVC encoder is available).
 # Usage: flash_marker_to_udps <udp_port> [<udp_port> ...]
 flash_marker_to_udps() {
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
@@ -44,9 +74,16 @@ flash_marker_to_udps() {
         [ -n "$tee" ] && tee="${tee}|"
         tee="${tee}[f=mpegts]udp://127.0.0.1:${p}?pkt_size=1316"
     done
+    local vargs
+    if [ "${OLR_FLASH_CODEC:-avc}" = "hevc" ]; then
+        srt_hevc_vcodec_args || { echo "SKIP: local ffmpeg has no HEVC encoder for the flash marker"; exit 77; }
+        vargs=("${SRT_HEVC_VCODEC_ARGS[@]}")
+    else
+        vargs=(-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M)
+    fi
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "color=c=black:s=320x240:r=30" -vf "$vflt" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+        "${vargs[@]}" \
         -map 0:v \
         -f tee "$tee" &
     SRT_LAST_PID=$!
