@@ -339,6 +339,13 @@ void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {
             status.lastResultSucceeded = false;
             status.state = QStringLiteral("send-failed");
             status.message = QStringLiteral("backend rejected frame");
+            status.currentQueueDepth = 1;
+            status.maxQueueDepth = 3;
+            status.deliveryGaps = 2;
+            status.lastQueuedFrameIndex = 12;
+            status.lastDeliveredFrameIndex = 11;
+            status.hasLastQueuedFrameIndex = true;
+            status.hasLastDeliveredFrameIndex = true;
             return status;
         }
 
@@ -379,10 +386,19 @@ void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {
     QVERIFY(!target.lastSinkResultSucceeded);
     QCOMPARE(target.sinkState, QStringLiteral("send-failed"));
     QCOMPARE(target.sinkMessage, QStringLiteral("backend rejected frame"));
+    QCOMPARE(target.currentQueueDepth, qint64(1));
+    QCOMPARE(target.maxQueueDepth, qint64(3));
+    QCOMPARE(target.deliveryGaps, qint64(2));
+    QCOMPARE(target.lastQueuedFrameIndex, qint64(12));
+    QCOMPARE(target.lastDeliveredFrameIndex, qint64(11));
+    QVERIFY(target.hasLastQueuedFrameIndex);
+    QVERIFY(target.hasLastDeliveredFrameIndex);
 }
 
 void TestOutputDispatcher::dispatchStatsConvertToBroadcastStatuses() {
     OutputDispatchStats stats;
+    stats.runtime.deadlineMisses = 2;
+    stats.runtime.catchUpCapHits = 3;
     OutputTargetDispatchStats target;
     target.attemptedFrames = 7;
     target.framesSubmitted = 6;
@@ -400,6 +416,14 @@ void TestOutputDispatcher::dispatchStatsConvertToBroadcastStatuses() {
     target.lastSinkResultSucceeded = false;
     target.sinkState = QStringLiteral("send-failed");
     target.sinkMessage = QStringLiteral("backend rejected frame");
+    target.currentQueueDepth = 4;
+    target.maxQueueDepth = 8;
+    target.deliveryGaps = 2;
+    target.lastQueuedFrameIndex = 19;
+    target.lastDeliveredFrameIndex = 18;
+    target.lastSubmitDurationNs = 123456;
+    target.hasLastQueuedFrameIndex = true;
+    target.hasLastDeliveredFrameIndex = true;
     target.hasLastIdentity = true;
     target.lastIdentity.outputFrameIndex = 17;
     target.lastIdentity.sampledPlayheadMs = 2040;
@@ -428,6 +452,16 @@ void TestOutputDispatcher::dispatchStatsConvertToBroadcastStatuses() {
     QVERIFY(!status.lastSinkResultSucceeded);
     QCOMPARE(status.sinkState, QStringLiteral("send-failed"));
     QCOMPARE(status.sinkMessage, QStringLiteral("backend rejected frame"));
+    QCOMPARE(status.currentQueueDepth, qint64(4));
+    QCOMPARE(status.maxQueueDepth, qint64(8));
+    QCOMPARE(status.deliveryGaps, qint64(2));
+    QCOMPARE(status.lastQueuedFrameIndex, qint64(19));
+    QCOMPARE(status.lastDeliveredFrameIndex, qint64(18));
+    QCOMPARE(status.lastSubmitDurationNs, qint64(123456));
+    QVERIFY(status.hasLastQueuedFrameIndex);
+    QVERIFY(status.hasLastDeliveredFrameIndex);
+    QCOMPARE(status.runtimeDeadlineMisses, qint64(2));
+    QCOMPARE(status.runtimeCatchUpCapHits, qint64(3));
     QVERIFY(status.hasLastIdentity);
     QCOMPARE(status.lastIdentity.outputFrameIndex, qint64(17));
     QCOMPARE(status.lastIdentity.sampledPlayheadMs, qint64(2040));

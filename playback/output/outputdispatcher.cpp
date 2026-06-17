@@ -22,7 +22,10 @@ bool isSilentAudio(const MediaAudioFrame& audio) {
 
 bool hasMeaningfulSinkStatus(const OutputSinkStatus& status) {
     return status.acceptedFrames > 0 || status.failedFrames > 0 || status.droppedFrames > 0 ||
-           status.hasLastResult || !status.state.isEmpty() || !status.message.isEmpty();
+           status.currentQueueDepth > 0 || status.maxQueueDepth > 0 || status.deliveryGaps > 0 ||
+           status.lastSubmitDurationNs > 0 || status.hasLastResult ||
+           status.hasLastQueuedFrameIndex || status.hasLastDeliveredFrameIndex ||
+           !status.state.isEmpty() || !status.message.isEmpty();
 }
 
 } // namespace
@@ -110,8 +113,16 @@ OutputDispatchStats OutputDispatcher::stats() const {
         target.sinkSubmittedFrames = sinkStatus.acceptedFrames;
         target.sinkFailedFrames = sinkStatus.failedFrames;
         target.sinkDroppedFrames = sinkStatus.droppedFrames;
+        target.currentQueueDepth = sinkStatus.currentQueueDepth;
+        target.maxQueueDepth = sinkStatus.maxQueueDepth;
+        target.deliveryGaps = sinkStatus.deliveryGaps;
+        target.lastQueuedFrameIndex = sinkStatus.lastQueuedFrameIndex;
+        target.lastDeliveredFrameIndex = sinkStatus.lastDeliveredFrameIndex;
+        target.lastSubmitDurationNs = sinkStatus.lastSubmitDurationNs;
         target.hasLastSinkResult = sinkStatus.hasLastResult;
         target.lastSinkResultSucceeded = sinkStatus.lastResultSucceeded;
+        target.hasLastQueuedFrameIndex = sinkStatus.hasLastQueuedFrameIndex;
+        target.hasLastDeliveredFrameIndex = sinkStatus.hasLastDeliveredFrameIndex;
         target.sinkState = sinkStatus.state;
         target.sinkMessage = sinkStatus.message;
     }

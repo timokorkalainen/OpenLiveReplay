@@ -27,16 +27,26 @@ const OutputTargetAssignment* findAssignment(const QList<OutputTargetAssignment>
     return nullptr;
 }
 
+bool hasCurrentError(const BroadcastOutputTargetStatus& status) {
+    return status.runtimeDeadlineMisses > 0 || status.deliveryGaps > 0 ||
+           (status.hasLastSubmitResult && !status.lastSubmitSucceeded) ||
+           (status.hasLastSinkResult && !status.lastSinkResultSucceeded) ||
+           (status.sinkFailures > 0 && status.framesSubmitted == 0);
+}
+
+bool hasDegradedHealth(const BroadcastOutputTargetStatus& status) {
+    return status.maxQueueDepth > 0 || status.sinkDroppedFrames > 0 ||
+           (status.hasLastIdentity && status.lastIdentity.videoPlaceholder);
+}
+
 QString statusState(const OutputTargetAssignment& assignment,
                     const BroadcastOutputTargetStatus* status) {
     if (!assignment.enabled) return QStringLiteral("Off");
     if (!status) return QStringLiteral("Waiting");
-    if ((status->hasLastSubmitResult && !status->lastSubmitSucceeded) ||
-        (status->hasLastSinkResult && !status->lastSinkResultSucceeded) ||
-        (status->sinkFailures > 0 && status->framesSubmitted == 0)) {
+    if (hasCurrentError(*status)) {
         return QStringLiteral("Error");
     }
-    if (status->hasLastIdentity && status->lastIdentity.videoPlaceholder) {
+    if (hasDegradedHealth(*status)) {
         return QStringLiteral("Degraded");
     }
     if (status->framesSubmitted > 0 || status->sinkSubmittedFrames > 0 ||
@@ -51,12 +61,10 @@ QString statusSeverity(const OutputTargetAssignment& assignment,
                        const BroadcastOutputTargetStatus* status) {
     if (!assignment.enabled) return QStringLiteral("off");
     if (!status) return QStringLiteral("warning");
-    if ((status->hasLastSubmitResult && !status->lastSubmitSucceeded) ||
-        (status->hasLastSinkResult && !status->lastSinkResultSucceeded) ||
-        (status->sinkFailures > 0 && status->framesSubmitted == 0)) {
+    if (hasCurrentError(*status)) {
         return QStringLiteral("error");
     }
-    if (status->hasLastIdentity && status->lastIdentity.videoPlaceholder) {
+    if (hasDegradedHealth(*status)) {
         return QStringLiteral("warning");
     }
     if (status->framesSubmitted > 0 || status->sinkSubmittedFrames > 0 ||
@@ -80,7 +88,8 @@ QString diagnosticText(const OutputTargetAssignment& assignment,
     QString text =
         QStringLiteral(
             "queued=%1 sent=%2 fail=%3 sinkFail=%4 drop=%5 placeholder=%6 silent=%7 repeated=%8 "
-            "lastOut=%9 playhead=%10 srcFeed=%11 srcPts=%12")
+            "deadline=%9 cap=%10 q=%11 maxQ=%12 gap=%13 lastQueued=%14 lastDelivered=%15 "
+            "sendNs=%16 lastOut=%17 playhead=%18 srcFeed=%19 srcPts=%20")
             .arg(status->framesSubmitted)
             .arg(status->hasSinkStatus ? status->sinkSubmittedFrames : status->framesSubmitted)
             .arg(status->sinkFailures)
@@ -89,6 +98,15 @@ QString diagnosticText(const OutputTargetAssignment& assignment,
             .arg(status->placeholderFrames)
             .arg(status->silentAudioFrames)
             .arg(status->repeatedPayloadFrames)
+            .arg(status->runtimeDeadlineMisses)
+            .arg(status->runtimeCatchUpCapHits)
+            .arg(status->currentQueueDepth)
+            .arg(status->maxQueueDepth)
+            .arg(status->deliveryGaps)
+            .arg(valueOrDash(status->lastQueuedFrameIndex, status->hasLastQueuedFrameIndex))
+            .arg(valueOrDash(status->lastDeliveredFrameIndex,
+                             status->hasLastDeliveredFrameIndex))
+            .arg(status->lastSubmitDurationNs)
             .arg(valueOrDash(hasIdentity ? status->lastIdentity.outputFrameIndex : 0, hasIdentity))
             .arg(valueOrDash(hasIdentity ? status->lastIdentity.sampledPlayheadMs : 0, hasIdentity))
             .arg(hasIdentity ? QString::number(status->lastIdentity.sourceFeedIndex)
@@ -118,11 +136,21 @@ void addStatusFields(QVariantMap& row, const OutputTargetAssignment& assignment,
     row.insert(QStringLiteral("sinkSubmittedFrames"), values.sinkSubmittedFrames);
     row.insert(QStringLiteral("sinkFailedFrames"), values.sinkFailedFrames);
     row.insert(QStringLiteral("sinkDroppedFrames"), values.sinkDroppedFrames);
+    row.insert(QStringLiteral("currentQueueDepth"), values.currentQueueDepth);
+    row.insert(QStringLiteral("maxQueueDepth"), values.maxQueueDepth);
+    row.insert(QStringLiteral("deliveryGaps"), values.deliveryGaps);
+    row.insert(QStringLiteral("lastQueuedFrameIndex"), values.lastQueuedFrameIndex);
+    row.insert(QStringLiteral("lastDeliveredFrameIndex"), values.lastDeliveredFrameIndex);
+    row.insert(QStringLiteral("lastSubmitDurationNs"), values.lastSubmitDurationNs);
+    row.insert(QStringLiteral("runtimeDeadlineMisses"), values.runtimeDeadlineMisses);
+    row.insert(QStringLiteral("runtimeCatchUpCapHits"), values.runtimeCatchUpCapHits);
     row.insert(QStringLiteral("hasSinkStatus"), values.hasSinkStatus);
     row.insert(QStringLiteral("hasLastSubmitResult"), values.hasLastSubmitResult);
     row.insert(QStringLiteral("lastSubmitSucceeded"), values.lastSubmitSucceeded);
     row.insert(QStringLiteral("hasLastSinkResult"), values.hasLastSinkResult);
     row.insert(QStringLiteral("lastSinkResultSucceeded"), values.lastSinkResultSucceeded);
+    row.insert(QStringLiteral("hasLastQueuedFrameIndex"), values.hasLastQueuedFrameIndex);
+    row.insert(QStringLiteral("hasLastDeliveredFrameIndex"), values.hasLastDeliveredFrameIndex);
     row.insert(QStringLiteral("sinkState"), values.sinkState);
     row.insert(QStringLiteral("sinkMessage"), values.sinkMessage);
     row.insert(QStringLiteral("placeholderFrames"), values.placeholderFrames);
