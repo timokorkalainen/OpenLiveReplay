@@ -88,6 +88,7 @@ endif()
 # --- Lightweight engine sources used by fast unit tests ---------------------
 qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/recordingclock.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/heartbeat.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativefallbackpolicy.h"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativefallbackpolicy.cpp"
