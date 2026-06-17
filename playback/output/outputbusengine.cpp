@@ -2,6 +2,8 @@
 
 #include "playback/output/yuv420pcompositor.h"
 
+#include <QList>
+
 namespace {
 
 constexpr quint32 kFnvOffset = 2166136261u;
@@ -88,10 +90,6 @@ OutputBusEngine::OutputBusEngine(FrameRate rate, int feedCount, int width, int h
     : m_clock(rate), m_feedCount(qMax(0, feedCount)), m_width(qMax(2, width)),
       m_height(qMax(2, height)) {}
 
-void OutputBusEngine::setTargetAssignments(const QList<OutputTargetAssignment>& assignments) {
-    m_assignments = assignments;
-}
-
 int OutputBusEngine::audioSamplesPerFrame() const {
     return audioSamplesForOutputFrame(0);
 }
@@ -126,14 +124,7 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     out.video.ptsMs = out.sampledPlayheadMs;
     out.video.outputFrameIndex = outputFrameIndex;
 
-    MediaAudioFrame audio;
-    audio.feedIndex = -1;
-    audio.startSample = sourceAudioStartSample(outputFrameIndex, state);
-    audio.sampleRate = 48000;
-    audio.channels = 2;
-    audio.format = MediaSampleFormat::S16Interleaved;
-    audio.pcm = silentS16Stereo(audioSamplesForOutputFrame(outputFrameIndex));
-    out.audio = audio;
+    out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
     out.identity = outputFrameIdentityFor(out);
     return out;
 }
@@ -158,6 +149,15 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     }
     out.video.outputFrameIndex = outputFrameIndex;
 
+    out.audio = renderAudioForFeed(feedIndex, outputFrameIndex, state, cache, allowAudio);
+    out.identity = outputFrameIdentityFor(out);
+    return out;
+}
+
+MediaAudioFrame OutputBusEngine::renderAudioForFeed(int feedIndex, qint64 outputFrameIndex,
+                                                    const PlaybackStateSnapshot& state,
+                                                    const OutputFrameCache& cache,
+                                                    bool allowAudio) const {
     MediaAudioFrame audio;
     audio.feedIndex = feedIndex;
     audio.startSample = sourceAudioStartSample(outputFrameIndex, state);
@@ -169,9 +169,7 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     audio.pcm = (allowAudio && oneXForward && feedIndex >= 0 && feedIndex < m_feedCount)
                     ? cache.audioSpanOrSilence(feedIndex, audio.startSample, samples)
                     : silentS16Stereo(samples);
-    out.audio = audio;
-    out.identity = outputFrameIdentityFor(out);
-    return out;
+    return audio;
 }
 
 qint64 OutputBusEngine::audioBoundarySampleForFrame(qint64 outputFrameIndex) const {

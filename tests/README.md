@@ -30,16 +30,17 @@ Local transport bring-up gates use distinct labels such as `srt`,
 matching native ingest path is ready.
 
 The `ndi-runtime` label is an opt-in real NDI sender/receiver smoke test. It
-loads the NDI runtime dynamically, starts the app's `NdiOutputSink`, discovers
-the local sender, and captures one video frame and one audio frame. It skips
-unless `OLR_RUN_NDI_RUNTIME_TESTS=1` is set and the runtime is available; set
-`OLR_NDI_RUNTIME_LIBRARY=/path/to/libndi.dylib` when the runtime is not in the
-platform default location. Set `OLR_NDI_RUNTIME_SOAK_SECONDS=300` to keep the
-sender and receiver running for a five-minute soak.
+loads the NDI runtime dynamically, routes cache-backed app output frames through
+`OutputDispatcher` into the app's `NdiOutputSink`, discovers the local sender,
+and verifies video cadence plus non-silent audio. It skips unless
+`OLR_RUN_NDI_RUNTIME_TESTS=1` is set and the runtime is available; set
+`OLR_NDI_RUNTIME_LIBRARY=/path/to/libndi.dylib` only when the runtime is outside
+the platform default or known NDI Tools locations. Set
+`OLR_NDI_RUNTIME_SOAK_SECONDS=300` to keep the sender and receiver running for a
+five-minute soak.
 
 ```bash
 OLR_RUN_NDI_RUNTIME_TESTS=1 \
-OLR_NDI_RUNTIME_LIBRARY=/usr/local/lib/libndi.dylib \
 OLR_NDI_RUNTIME_SOAK_SECONDS=300 \
 ctest --test-dir build -L ndi-runtime --output-on-failure
 ```

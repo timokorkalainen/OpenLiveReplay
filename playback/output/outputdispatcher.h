@@ -55,6 +55,7 @@ private:
     PlaybackStateSnapshot clockedStateForTick(qint64 outputFrameIndex,
                                               const PlaybackStateSnapshot& state);
     void countFrameHealth(const OutputBusFrame& frame);
+    void countTargetStartFailure(const OutputTargetAssignment& assignment);
     void countTargetAttempt(const OutputTargetAssignment& assignment, const OutputBusFrame& frame,
                             bool submitted);
 

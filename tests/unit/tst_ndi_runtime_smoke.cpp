@@ -1,151 +1,55 @@
 #include "playback/output/ndisink.h"
+#include "playback/output/ndiabi.h"
+#include "playback/output/ndiruntimepaths.h"
+#include "playback/output/outputdispatcher.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDateTime>
-#include <QDir>
 #include <QElapsedTimer>
 #include <QLibrary>
 #include <QThread>
 #include <QtTest>
 
 #include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <limits>
 
 namespace {
 
-constexpr quint32 ndiFourCc(char a, char b, char c, char d) {
-    return quint32(quint8(a)) | (quint32(quint8(b)) << 8) | (quint32(quint8(c)) << 16) |
-           (quint32(quint8(d)) << 24);
-}
-
-constexpr qint64 kNdiTimecodeSynthesize = std::numeric_limits<qint64>::max();
-constexpr quint32 kNdiFourCcI420 = ndiFourCc('I', '4', '2', '0');
-constexpr quint32 kNdiFourCcFltp = ndiFourCc('F', 'L', 'T', 'p');
-
-enum NdiFrameType {
-    NdiFrameTypeNone = 0,
-    NdiFrameTypeVideo = 1,
-    NdiFrameTypeAudio = 2,
-    NdiFrameTypeMetadata = 3,
-    NdiFrameTypeError = 4,
-    NdiFrameTypeStatusChange = 100,
-};
-
-struct NDIlib_source_t {
-    const char* p_ndi_name = nullptr;
-    const char* p_url_address = nullptr;
-};
-
-struct NDIlib_find_create_t {
-    bool show_local_sources = true;
-    const char* p_groups = nullptr;
-    const char* p_extra_ips = nullptr;
-};
-
-struct NDIlib_recv_create_v3_t {
-    NDIlib_source_t source_to_connect_to;
-    int color_format = 3; // NDIlib_recv_color_format_UYVY_RGBA.
-    int bandwidth = 100;  // NDIlib_recv_bandwidth_highest.
-    bool allow_video_fields = false;
-    const char* p_ndi_recv_name = nullptr;
-};
-
-struct NDIlib_video_frame_v2_t {
-    int xres = 0;
-    int yres = 0;
-    quint32 FourCC = kNdiFourCcI420;
-    int frame_rate_N = 0;
-    int frame_rate_D = 1;
-    float picture_aspect_ratio = 0.0f;
-    int frame_format_type = 1;
-    qint64 timecode = kNdiTimecodeSynthesize;
-    quint8* p_data = nullptr;
-    int line_stride_in_bytes = 0;
-    const char* p_metadata = nullptr;
-    qint64 timestamp = 0;
-};
-
-struct NDIlib_audio_frame_v3_t {
-    int sample_rate = 48000;
-    int no_channels = 2;
-    int no_samples = 0;
-    qint64 timecode = kNdiTimecodeSynthesize;
-    quint32 FourCC = kNdiFourCcFltp;
-    quint8* p_data = nullptr;
-    int channel_stride_in_bytes = 0;
-    const char* p_metadata = nullptr;
-    qint64 timestamp = 0;
-};
-
-using NDIlib_find_instance_t = void*;
-using NDIlib_recv_instance_t = void*;
-using NDIlib_initialize_fn = bool (*)();
-using NDIlib_find_create_v2_fn = NDIlib_find_instance_t (*)(const NDIlib_find_create_t*);
-using NDIlib_find_destroy_fn = void (*)(NDIlib_find_instance_t);
-using NDIlib_find_wait_for_sources_fn = bool (*)(NDIlib_find_instance_t, quint32);
-using NDIlib_find_get_current_sources_fn = const NDIlib_source_t* (*) (NDIlib_find_instance_t,
-                                                                       quint32*);
-using NDIlib_recv_create_v3_fn = NDIlib_recv_instance_t (*)(const NDIlib_recv_create_v3_t*);
-using NDIlib_recv_destroy_fn = void (*)(NDIlib_recv_instance_t);
-using NDIlib_recv_capture_v3_fn = int (*)(NDIlib_recv_instance_t, NDIlib_video_frame_v2_t*,
-                                          NDIlib_audio_frame_v3_t*, void*, quint32);
-using NDIlib_recv_free_video_v2_fn = void (*)(NDIlib_recv_instance_t,
-                                              const NDIlib_video_frame_v2_t*);
-using NDIlib_recv_free_audio_v3_fn = void (*)(NDIlib_recv_instance_t,
-                                              const NDIlib_audio_frame_v3_t*);
-using NDIlib_destroy_fn = void (*)();
+using namespace olr::ndi;
 
 struct CaptureStats {
     int videoFrames = 0;
     int audioFrames = 0;
+    bool sawNonSilentAudio = false;
 };
 
-QStringList ndiRuntimeCandidates() {
-    QStringList candidates;
-    const QByteArray explicitPath = qgetenv("OLR_NDI_RUNTIME_LIBRARY");
-    if (!explicitPath.isEmpty()) candidates.append(QString::fromLocal8Bit(explicitPath));
-
-#if defined(Q_OS_WIN)
-    const QString runtimeDir = QString::fromLocal8Bit(qgetenv("NDI_RUNTIME_DIR_V6"));
-    if (!runtimeDir.isEmpty())
-        candidates.append(QDir(runtimeDir).filePath(QStringLiteral("Processing.NDI.Lib.x64.dll")));
-    candidates.append(QStringLiteral("Processing.NDI.Lib.x64.dll"));
-#elif defined(Q_OS_MACOS)
-    candidates.append(QStringLiteral("/usr/local/lib/libndi.dylib"));
-    candidates.append(QStringLiteral("libndi.dylib"));
-#else
-    candidates.append(QStringLiteral("libndi.so"));
-#endif
-    return candidates;
-}
-
-OutputBusFrame makeFrame(qint64 index, uchar y) {
-    OutputBusFrame frame;
-    frame.bus = OutputBusId::feed(0);
-    frame.outputFrameIndex = index;
-    frame.sampledPlayheadMs = index * 40;
-    frame.video = MediaVideoFrame::solidYuv420p(16, 16, y, 96, 160);
-    frame.video.feedIndex = 0;
-    frame.video.ptsMs = frame.sampledPlayheadMs;
-    frame.video.outputFrameIndex = index;
-
-    frame.audio.feedIndex = 0;
-    frame.audio.sampleRate = 48000;
-    frame.audio.channels = 2;
-    frame.audio.format = MediaSampleFormat::S16Interleaved;
-    const int sampleFrames = 1920;
-    frame.audio.pcm.resize(sampleFrames * frame.audio.channels * int(sizeof(qint16)));
-    auto* out = reinterpret_cast<qint16*>(frame.audio.pcm.data());
+MediaAudioFrame makeAudio(qint64 startSample, int sampleFrames) {
+    MediaAudioFrame audio;
+    audio.feedIndex = 0;
+    audio.startSample = startSample;
+    audio.sampleRate = 48000;
+    audio.channels = 2;
+    audio.format = MediaSampleFormat::S16Interleaved;
+    audio.pcm.resize(sampleFrames * audio.channels * int(sizeof(qint16)));
+    auto* out = reinterpret_cast<qint16*>(audio.pcm.data());
     for (int sample = 0; sample < sampleFrames; ++sample) {
         const auto value = qint16(std::lround(std::sin(double(sample) * 0.05) * 12000.0));
         out[sample * 2] = value;
         out[sample * 2 + 1] = qint16(-value);
     }
-    frame.identity = outputFrameIdentityFor(frame);
-    return frame;
+    return audio;
+}
+
+void insertSourceFrame(OutputFrameCache* cache, qint64 index) {
+    constexpr qint64 kFrameDurationMs = 40;
+    constexpr int kAudioSamplesPerFrame = 1920;
+
+    MediaVideoFrame video =
+        MediaVideoFrame::solidYuv420p(16, 16, uchar(70 + (index % 120)), 96, 160);
+    video.feedIndex = 0;
+    video.ptsMs = index * kFrameDurationMs;
+    cache->insertVideoFrame(video);
+    cache->insertAudioFrame(makeAudio(index * kAudioSamplesPerFrame, kAudioSamplesPerFrame));
 }
 
 class NdiRuntimeReceiver final {
@@ -153,7 +57,7 @@ public:
     ~NdiRuntimeReceiver() { close(); }
 
     bool load() {
-        for (const QString& candidate : ndiRuntimeCandidates()) {
+        for (const QString& candidate : runtimeLibraryCandidates()) {
             if (candidate.isEmpty()) continue;
             m_library.setFileName(candidate);
             if (!m_library.load()) continue;
@@ -225,13 +129,14 @@ public:
     }
 
     bool captureVideoAndAudio(int timeoutMs, int expectedWidth, int expectedHeight,
-                              int expectedSampleRate, int expectedChannels, QString* error) {
+                              FrameRate expectedRate, int expectedSampleRate, int expectedChannels,
+                              QString* error) {
         CaptureStats stats;
 
         QElapsedTimer timer;
         timer.start();
         while (timer.elapsed() < timeoutMs && (stats.videoFrames == 0 || stats.audioFrames == 0)) {
-            if (!captureOne(250, expectedWidth, expectedHeight, expectedSampleRate,
+            if (!captureOne(250, expectedWidth, expectedHeight, expectedRate, expectedSampleRate,
                             expectedChannels, &stats, error)) {
                 return false;
             }
@@ -243,39 +148,45 @@ public:
                          .arg(stats.audioFrames > 0);
             return false;
         }
+        if (!stats.sawNonSilentAudio) {
+            *error = QStringLiteral("captured NDI audio frames were silent");
+            return false;
+        }
         return true;
     }
 
-    bool captureOne(int timeoutMs, int expectedWidth, int expectedHeight, int expectedSampleRate,
-                    int expectedChannels, CaptureStats* stats, QString* error) {
+    bool captureOne(int timeoutMs, int expectedWidth, int expectedHeight, FrameRate expectedRate,
+                    int expectedSampleRate, int expectedChannels, CaptureStats* stats,
+                    QString* error) {
         NDIlib_video_frame_v2_t video;
         NDIlib_audio_frame_v3_t audio;
         const int frameType =
             m_recvCapture(m_recv, &video, &audio, nullptr, quint32(qMax(0, timeoutMs)));
 
         switch (frameType) {
-        case NdiFrameTypeVideo:
-            if (!validateVideo(video, expectedWidth, expectedHeight, error)) {
+        case FrameTypeVideo:
+            if (!validateVideo(video, expectedWidth, expectedHeight, expectedRate, error)) {
                 m_recvFreeVideo(m_recv, &video);
                 return false;
             }
             m_recvFreeVideo(m_recv, &video);
             stats->videoFrames++;
             return true;
-        case NdiFrameTypeAudio:
+        case FrameTypeAudio:
             if (!validateAudio(audio, expectedSampleRate, expectedChannels, error)) {
                 m_recvFreeAudio(m_recv, &audio);
                 return false;
             }
+            if (audioHasSignal(audio)) stats->sawNonSilentAudio = true;
             m_recvFreeAudio(m_recv, &audio);
             stats->audioFrames++;
             return true;
-        case NdiFrameTypeError:
+        case FrameTypeError:
             *error = QStringLiteral("NDI receiver returned frame_type_error");
             return false;
-        case NdiFrameTypeNone:
-        case NdiFrameTypeMetadata:
-        case NdiFrameTypeStatusChange:
+        case FrameTypeNone:
+        case FrameTypeMetadata:
+        case FrameTypeStatusChange:
         default:
             return true;
         }
@@ -315,7 +226,7 @@ private:
     }
 
     static bool validateVideo(const NDIlib_video_frame_v2_t& video, int expectedWidth,
-                              int expectedHeight, QString* error) {
+                              int expectedHeight, FrameRate expectedRate, QString* error) {
         if (!video.p_data) {
             *error = QStringLiteral("received NDI video frame without data");
             return false;
@@ -330,6 +241,15 @@ private:
         }
         if (video.line_stride_in_bytes <= 0) {
             *error = QStringLiteral("received NDI video frame without a positive stride");
+            return false;
+        }
+        if (video.frame_rate_N != expectedRate.numerator ||
+            video.frame_rate_D != expectedRate.denominator) {
+            *error = QStringLiteral("received NDI video rate %1/%2, expected %3/%4")
+                         .arg(video.frame_rate_N)
+                         .arg(video.frame_rate_D)
+                         .arg(expectedRate.numerator)
+                         .arg(expectedRate.denominator);
             return false;
         }
         return true;
@@ -354,6 +274,24 @@ private:
             return false;
         }
         return true;
+    }
+
+    static bool audioHasSignal(const NDIlib_audio_frame_v3_t& audio) {
+        if (!audio.p_data || audio.no_samples <= 0 || audio.no_channels <= 0 ||
+            audio.channel_stride_in_bytes < int(sizeof(float))) {
+            return false;
+        }
+
+        const auto* base = reinterpret_cast<const char*>(audio.p_data);
+        const int samplesToScan = qMin(audio.no_samples, 256);
+        for (int channel = 0; channel < audio.no_channels; ++channel) {
+            const auto* samples =
+                reinterpret_cast<const float*>(base + channel * audio.channel_stride_in_bytes);
+            for (int sample = 0; sample < samplesToScan; ++sample) {
+                if (std::abs(samples[sample]) > 0.0001f) return true;
+            }
+        }
+        return false;
     }
 
     void closeReceiver() {
@@ -401,7 +339,8 @@ void TestNdiRuntimeSmoke::realRuntimeDeliversVideoAndAudio() {
 
     NdiRuntimeReceiver receiver;
     if (!receiver.load())
-        QSKIP("NDI runtime is not installed. Set OLR_NDI_RUNTIME_LIBRARY to libndi to run this.");
+        QSKIP("NDI runtime is not installed or discoverable. Set OLR_NDI_RUNTIME_LIBRARY to libndi "
+              "to run this.");
     if (!receiver.hasRequiredSymbols())
         QSKIP("NDI runtime is missing finder/receiver symbols required by this smoke test.");
 
@@ -416,16 +355,30 @@ void TestNdiRuntimeSmoke::realRuntimeDeliversVideoAndAudio() {
     assignment.enabled = true;
     assignment.settings.insert(QStringLiteral("senderName"), senderName);
 
+    const FrameRate outputRate = FrameRate::fromFraction(25, 1);
     NdiOutputSink sink;
-    if (!sink.start(assignment, FrameRate::fromFraction(25, 1))) {
+    OutputDispatcher dispatcher(outputRate, 1, 16, 16);
+    dispatcher.setEndpoints({{assignment, &sink}});
+    if (!sink.isActive()) {
         QFAIL(qPrintable(QStringLiteral("failed to start NDI sender through app sink: %1")
                              .arg(sink.status().message)));
     }
 
     QVERIFY2(receiver.createFinder(), "failed to create NDI finder");
 
+    OutputFrameCache cache(1, 16, 16);
+    PlaybackStateSnapshot state;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
     for (int i = 0; i < 5; ++i) {
-        QVERIFY2(sink.submit(makeFrame(i, uchar(70 + i))), "failed to submit frame to NDI sink");
+        insertSourceFrame(&cache, i);
+        dispatcher.dispatchTick(cache, state);
+        QVERIFY2(
+            sink.status().state == NdiOutputState::Active,
+            qPrintable(
+                QStringLiteral("NDI sink failed during warmup: %1").arg(sink.status().message)));
         QThread::msleep(40);
     }
 
@@ -435,13 +388,17 @@ void TestNdiRuntimeSmoke::realRuntimeDeliversVideoAndAudio() {
     QVERIFY2(receiver.createReceiver(), "failed to create NDI receiver");
 
     for (int i = 5; i < 35; ++i) {
-        QVERIFY2(sink.submit(makeFrame(i, uchar(70 + (i % 30)))),
-                 "failed to submit frame to NDI sink");
+        insertSourceFrame(&cache, i);
+        dispatcher.dispatchTick(cache, state);
+        QVERIFY2(
+            sink.status().state == NdiOutputState::Active,
+            qPrintable(
+                QStringLiteral("NDI sink failed before capture: %1").arg(sink.status().message)));
         QThread::msleep(40);
     }
 
     QString error;
-    QVERIFY2(receiver.captureVideoAndAudio(10000, 16, 16, 48000, 2, &error),
+    QVERIFY2(receiver.captureVideoAndAudio(10000, 16, 16, outputRate, 48000, 2, &error),
              qPrintable(QStringLiteral("NDI receiver did not capture app output: %1").arg(error)));
 
     bool ok = false;
@@ -452,37 +409,47 @@ void TestNdiRuntimeSmoke::realRuntimeDeliversVideoAndAudio() {
         soakTimer.start();
         qint64 frameIndex = 35;
         qint64 nextSendMs = 0;
+        const qint64 submittedBeforeSoak = dispatcher.stats().framesSubmitted;
 
         while (soakTimer.elapsed() < qint64(soakSeconds) * 1000) {
             if (soakTimer.elapsed() >= nextSendMs) {
-                QVERIFY2(sink.submit(makeFrame(frameIndex, uchar(70 + (frameIndex % 30)))),
-                         "failed to submit frame to NDI sink during soak");
+                insertSourceFrame(&cache, frameIndex);
+                dispatcher.dispatchTick(cache, state);
+                QVERIFY2(sink.status().state == NdiOutputState::Active,
+                         qPrintable(QStringLiteral("NDI sink failed during soak: %1")
+                                        .arg(sink.status().message)));
                 ++frameIndex;
                 nextSendMs = soakTimer.elapsed() + 40;
             }
 
-            QVERIFY2(receiver.captureOne(5, 16, 16, 48000, 2, &stats, &error),
+            QVERIFY2(receiver.captureOne(5, 16, 16, outputRate, 48000, 2, &stats, &error),
                      qPrintable(QStringLiteral("NDI receiver failed during soak: %1").arg(error)));
             QCoreApplication::processEvents();
         }
 
         const qint64 drainUntilMs = soakTimer.elapsed() + 1000;
         while (soakTimer.elapsed() < drainUntilMs) {
-            QVERIFY2(receiver.captureOne(5, 16, 16, 48000, 2, &stats, &error),
+            QVERIFY2(receiver.captureOne(5, 16, 16, outputRate, 48000, 2, &stats, &error),
                      qPrintable(
                          QStringLiteral("NDI receiver failed while draining soak: %1").arg(error)));
         }
 
-        qInfo("NDI runtime soak captured %d video frames and %d audio frames over %d seconds",
-              stats.videoFrames, stats.audioFrames, soakSeconds);
-        QVERIFY2(stats.videoFrames >= soakSeconds * 5,
-                 qPrintable(QStringLiteral("NDI soak captured too few video frames: %1 in %2 s")
+        const qint64 submittedDuringSoak = dispatcher.stats().framesSubmitted - submittedBeforeSoak;
+        const qint64 minimumCapturedFrames = submittedDuringSoak * 9 / 10;
+
+        qInfo("NDI runtime soak submitted %lld frames and captured %d video/%d audio frames over "
+              "%d seconds",
+              static_cast<long long>(submittedDuringSoak), stats.videoFrames, stats.audioFrames,
+              soakSeconds);
+        QVERIFY2(stats.videoFrames >= minimumCapturedFrames,
+                 qPrintable(QStringLiteral("NDI soak captured too few video frames: %1 of %2")
                                 .arg(stats.videoFrames)
-                                .arg(soakSeconds)));
-        QVERIFY2(stats.audioFrames >= soakSeconds,
-                 qPrintable(QStringLiteral("NDI soak captured too few audio frames: %1 in %2 s")
+                                .arg(submittedDuringSoak)));
+        QVERIFY2(stats.audioFrames >= minimumCapturedFrames,
+                 qPrintable(QStringLiteral("NDI soak captured too few audio frames: %1 of %2")
                                 .arg(stats.audioFrames)
-                                .arg(soakSeconds)));
+                                .arg(submittedDuringSoak)));
+        QVERIFY2(stats.sawNonSilentAudio, "NDI soak captured only silent audio");
     }
 }
 

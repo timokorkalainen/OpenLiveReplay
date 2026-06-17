@@ -11,15 +11,15 @@ static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
 
 class CollectingSink final : public IOutputSink {
 public:
-    explicit CollectingSink(OutputTargetKind kind, bool failSubmits = false)
-        : m_kind(kind), m_failSubmits(failSubmits) {}
+    explicit CollectingSink(OutputTargetKind kind, bool failSubmits = false, bool failStart = false)
+        : m_kind(kind), m_failSubmits(failSubmits), m_failStart(failStart) {}
 
     OutputTargetKind kind() const override { return m_kind; }
 
     bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
         m_assignment = assignment;
         m_rate = rate;
-        m_active = assignment.enabled && rate.isValid();
+        m_active = assignment.enabled && rate.isValid() && !m_failStart;
         return m_active;
     }
 
@@ -41,6 +41,7 @@ private:
     FrameRate m_rate;
     bool m_active = false;
     bool m_failSubmits = false;
+    bool m_failStart = false;
 };
 
 class TestOutputDispatcher : public QObject {
@@ -52,6 +53,7 @@ private slots:
     void rendersFeedMultiviewAndPgmAssignmentsFromSameTick();
     void targetsOnSameBusReceiveMatchingFrameIdentity();
     void targetStatsTrackRepeatedPayloadsAndFailuresIndependently();
+    void startFailuresAreVisibleInTargetStats();
     void pgmSwitchUpdatesIdentityOnNextTick();
     void disabledAssignmentsDoNotSubmit();
 };
@@ -312,6 +314,38 @@ void TestOutputDispatcher::targetStatsTrackRepeatedPayloadsAndFailuresIndependen
     QCOMPARE(failingStats.silentAudioFrames, qint64(2));
     QVERIFY(failingStats.hasLastIdentity);
     QCOMPARE(failingStats.lastIdentity.outputFrameIndex, qint64(1));
+}
+
+void TestOutputDispatcher::startFailuresAreVisibleInTargetStats() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 44));
+
+    OutputTargetAssignment failing;
+    failing.id = QStringLiteral("feed0-start-failing");
+    failing.sourceBus = OutputBusId::feed(0);
+    failing.kind = OutputTargetKind::Ndi;
+    failing.enabled = true;
+
+    CollectingSink failingSink(OutputTargetKind::Ndi, false, true);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{failing, &failingSink}});
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    dispatcher.dispatchTick(cache, state);
+
+    const OutputDispatchStats stats = dispatcher.stats();
+    QCOMPARE(stats.sinkFailures, qint64(1));
+    QVERIFY(stats.targets.contains(QStringLiteral("feed0-start-failing")));
+    const OutputTargetDispatchStats failingStats =
+        stats.targets.value(QStringLiteral("feed0-start-failing"));
+    QCOMPARE(failingStats.attemptedFrames, qint64(0));
+    QCOMPARE(failingStats.framesSubmitted, qint64(0));
+    QCOMPARE(failingStats.sinkFailures, qint64(1));
+    QVERIFY(!failingStats.hasLastIdentity);
+    QCOMPARE(failingSink.frames.size(), 0);
 }
 
 void TestOutputDispatcher::pgmSwitchUpdatesIdentityOnNextTick() {

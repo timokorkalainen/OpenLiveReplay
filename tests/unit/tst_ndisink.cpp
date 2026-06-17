@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include "playback/output/ndisink.h"
+#include "playback/output/ndiruntimepaths.h"
 
 static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
     MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
@@ -43,12 +44,26 @@ public:
 class TestNdiSink : public QObject {
     Q_OBJECT
 private slots:
+    void runtimeCandidatesIncludeNdiToolsInstallLocations();
     void unavailableRuntimeFailsCleanly();
     void startUsesConfiguredSenderNameAndSubmitsCleanBusFrames();
+    void rejectsFramesWithoutBroadcastAudio();
     void rejectsDisabledOrNonNdiAssignments();
     void reportsCreateFailureAndStoppedStatus();
     void reportsSendFailureStatus();
 };
+
+void TestNdiSink::runtimeCandidatesIncludeNdiToolsInstallLocations() {
+    const QStringList candidates = olr::ndi::runtimeLibraryCandidates();
+#if defined(Q_OS_MACOS)
+    QVERIFY(candidates.contains(
+        QStringLiteral("/Applications/NDI Scan Converter.app/Contents/Frameworks/libndi.dylib")));
+    QVERIFY(
+        candidates.contains(QStringLiteral("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib")));
+#else
+    QVERIFY(!candidates.isEmpty());
+#endif
+}
 
 void TestNdiSink::unavailableRuntimeFailsCleanly() {
     FakeNdiBackend backend(false);
@@ -105,6 +120,32 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
     QCOMPARE(backend.sentFrames[0].bus, OutputBusId::feed(0));
     QCOMPARE(backend.sentFrames[0].outputFrameIndex, qint64(7));
     QCOMPARE(uchar(backend.sentFrames[0].video.planeY.at(0)), uchar(90));
+}
+
+void TestNdiSink::rejectsFramesWithoutBroadcastAudio() {
+    FakeNdiBackend backend(true);
+    NdiOutputSink sink(&backend);
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-ndi");
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+    assignment.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR Feed 1"));
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+
+    OutputBusFrame frame;
+    frame.bus = OutputBusId::feed(0);
+    frame.outputFrameIndex = 8;
+    frame.sampledPlayheadMs = 320;
+    frame.video = video(0, 320, 100);
+
+    QVERIFY(!sink.submit(frame));
+    QCOMPARE(sink.status().state, NdiOutputState::SendFailed);
+    QCOMPARE(sink.status().framesSubmitted, qint64(0));
+    QCOMPARE(sink.status().sendFailures, qint64(1));
+    QCOMPARE(backend.sentFrames.size(), 0);
 }
 
 void TestNdiSink::rejectsDisabledOrNonNdiAssignments() {

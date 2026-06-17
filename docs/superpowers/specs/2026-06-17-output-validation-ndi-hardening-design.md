@@ -19,7 +19,9 @@ Each `OutputBusFrame` gains a deterministic `OutputFrameIdentity`. The identity 
 
 `QueuedOutputSink` continues to protect the output runtime from blocking sinks, but its dropped-frame counter becomes part of target health. The dispatcher owns target-level submission and failure stats; queue overflow remains a sink-level stat exposed for adapters that need it.
 
-`NdiOutputSink` gains a status snapshot. It reports runtime unavailable, create failure, active, stopped, and send failure states through a testable enum plus a short diagnostic string. Real NDI runtime tests stay opt-in because the local machine does not have the NDI runtime installed.
+`NdiOutputSink` gains a status snapshot. It reports runtime unavailable, create failure, active, stopped, and send failure states through a testable enum plus a short diagnostic string. Runtime discovery checks explicit overrides, standard SDK locations, and common NDI Tools app bundles so an installed local NDI runtime can be used without per-run library overrides.
+
+NDI sends require broadcast-valid video and audio. Missing or malformed audio is a send failure instead of a silent success, because every enabled clean output must carry an audio frame even when that frame is silence.
 
 ## Tests
 
@@ -30,6 +32,7 @@ Tests are written first:
 - PGM source switches on the next tick and per-target stats show the new source.
 - A failing sink increments only that target's failures while other targets keep receiving frames.
 - NDI status reports unavailable runtime, create failure, active, stopped, and send failure.
+- NDI runtime smoke routes cache-backed app output through `OutputDispatcher` into `NdiOutputSink`, then verifies receiver video cadence and non-silent audio. Longer soaks compare captured frames against submitted output frames.
 
 ## Non-Goals
 

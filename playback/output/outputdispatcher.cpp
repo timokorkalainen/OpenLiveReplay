@@ -41,7 +41,9 @@ void OutputDispatcher::setEndpoints(const QList<OutputEndpoint>& endpoints) {
     for (const OutputEndpoint& endpoint : m_endpoints) {
         if (!endpoint.sink || !endpoint.assignment.enabled) continue;
         if (endpoint.sink->kind() != endpoint.assignment.kind) continue;
-        endpoint.sink->start(endpoint.assignment, m_rate);
+        if (!endpoint.sink->start(endpoint.assignment, m_rate)) {
+            countTargetStartFailure(endpoint.assignment);
+        }
     }
 }
 
@@ -123,6 +125,12 @@ OutputBusFrame OutputDispatcher::renderBus(OutputBusId bus, qint64 outputFrameIn
 void OutputDispatcher::countFrameHealth(const OutputBusFrame& frame) {
     if (frame.video.isPlaceholder) m_stats.placeholderFrames++;
     if (isSilentAudio(frame.audio)) m_stats.silentAudioFrames++;
+}
+
+void OutputDispatcher::countTargetStartFailure(const OutputTargetAssignment& assignment) {
+    OutputTargetDispatchStats& stats = m_stats.targets[targetStatsKey(assignment)];
+    stats.sinkFailures++;
+    m_stats.sinkFailures++;
 }
 
 void OutputDispatcher::countTargetAttempt(const OutputTargetAssignment& assignment,
