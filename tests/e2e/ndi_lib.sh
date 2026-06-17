@@ -38,19 +38,25 @@ ndi_marker_source_name() {
 
 ndi_start_marker_sender() {
     local prefix="$1" sources="$2" seconds="$3" skew_ppm="$4"
-    local sender
+    local sender sender_seconds
     sender="$(ndi_marker_sender_path)"
+    sender_seconds=$((seconds + 10))
     "$sender" \
         --name-prefix "$prefix" \
         --sources "$sources" \
-        --seconds "$seconds" \
+        --seconds "$sender_seconds" \
         --skew-ppm "$skew_ppm" \
         --timecode "${OLR_MARKER_TC:-10:00:00:00}" \
         >"${WORKDIR}/${prefix}.ndi.out" 2>"${WORKDIR}/${prefix}.ndi.err" &
     PIDS+=("$!")
     sleep "${OLR_NDI_DISCOVERY_SECS:-2}"
     if ! kill -0 "$!" 2>/dev/null; then
+        local rc=0
+        wait "$!" || rc=$?
         sed -n '1,120p' "${WORKDIR}/${prefix}.ndi.err" >&2
-        fail "NDI marker sender exited before discovery"
+        if [ "$rc" -eq 77 ]; then
+            skip "NDI marker sender runtime unavailable"
+        fi
+        fail "NDI marker sender exited before discovery (rc=${rc})"
     fi
 }

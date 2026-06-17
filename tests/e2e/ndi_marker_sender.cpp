@@ -42,7 +42,7 @@ struct NdiSource {
     std::vector<uint8_t> video;
     std::vector<float> audio;
 };
-}
+} // namespace
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, handleSignal);
@@ -54,7 +54,8 @@ int main(int argc, char** argv) {
     config.frameRateNumerator = intArg(argc, argv, "--fps-num", config.frameRateNumerator);
     config.frameRateDenominator = intArg(argc, argv, "--fps-den", config.frameRateDenominator);
     config.skewPpm = doubleArg(argc, argv, "--skew-ppm", 0.0);
-    config.startTimecode = QString::fromStdString(argValue(argc, argv, "--timecode", "10:00:00:00"));
+    config.startTimecode =
+        QString::fromStdString(argValue(argc, argv, "--timecode", "10:00:00:00"));
 
     const int sources = intArg(argc, argv, "--sources", 1);
     const int seconds = intArg(argc, argv, "--seconds", 20);
@@ -100,9 +101,10 @@ int main(int argc, char** argv) {
     const auto start = std::chrono::steady_clock::now();
 
     for (int64_t frameIndex = 0; frameIndex < totalFrames && !g_stop; ++frameIndex) {
-        const auto due = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                     std::chrono::duration<double>(
-                                         double(frameIndex) * frameSeconds * pacingFactor));
+        const auto due =
+            start +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(double(frameIndex) * frameSeconds * pacingFactor));
         std::this_thread::sleep_until(due);
 
         for (NdiSource& source : ndiSources) {
@@ -112,7 +114,7 @@ int main(int argc, char** argv) {
             NDIlib_audio_frame_v3_t audio{};
             audio.sample_rate = config.sampleRate;
             audio.no_channels = config.channels;
-            audio.no_samples = ndiMarkerSamplesPerFrame(config);
+            audio.no_samples = ndiMarkerSamplesForFrame(config, frameIndex);
             audio.timecode = ndiMarkerTimecode100ns(config, frameIndex);
             audio.FourCC = NDIlib_FourCC_audio_type_FLTP;
             audio.p_data = reinterpret_cast<uint8_t*>(source.audio.data());

@@ -19,6 +19,7 @@ struct NdiMarkerConfig {
 };
 
 int ndiMarkerSamplesPerFrame(const NdiMarkerConfig& config);
+int ndiMarkerSamplesForFrame(const NdiMarkerConfig& config, int64_t frameIndex);
 bool ndiMarkerIsActive(const NdiMarkerConfig& config, int64_t frameIndex);
 int64_t ndiMarkerTimestamp100ns(const NdiMarkerConfig& config, int64_t frameIndex);
 int64_t ndiMarkerStartTimecode100ns(const NdiMarkerConfig& config);

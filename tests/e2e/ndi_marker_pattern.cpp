@@ -8,26 +8,46 @@
 namespace {
 constexpr int64_t kHundredNsPerSecond = 10000000;
 
-int framesPerSecond(const NdiMarkerConfig& config) {
-    return std::max(1, config.frameRateNumerator / std::max(1, config.frameRateDenominator));
-}
+int64_t frameTimestamp100ns(const NdiMarkerConfig& config, int64_t frameIndex, double factor) {
+    const double seconds = double(frameIndex) * double(config.frameRateDenominator) /
+                           double(config.frameRateNumerator) * factor;
+    return int64_t(std::llround(seconds * double(kHundredNsPerSecond)));
 }
 
+int64_t samplesBeforeFrame(const NdiMarkerConfig& config, int64_t frameIndex) {
+    const double samples = double(std::max<int64_t>(0, frameIndex)) * double(config.sampleRate) *
+                           double(config.frameRateDenominator) / double(config.frameRateNumerator);
+    return int64_t(std::llround(samples));
+}
+} // namespace
+
 int ndiMarkerSamplesPerFrame(const NdiMarkerConfig& config) {
-    return int(std::llround(double(config.sampleRate) * double(config.frameRateDenominator) /
-                            double(config.frameRateNumerator)));
+    return ndiMarkerSamplesForFrame(config, 0);
+}
+
+int ndiMarkerSamplesForFrame(const NdiMarkerConfig& config, int64_t frameIndex) {
+    const int64_t first = samplesBeforeFrame(config, frameIndex);
+    const int64_t next = samplesBeforeFrame(config, frameIndex + 1);
+    return int(std::max<int64_t>(0, next - first));
 }
 
 bool ndiMarkerIsActive(const NdiMarkerConfig& config, int64_t frameIndex) {
-    const int frameInSecond = int(frameIndex % framesPerSecond(config));
-    return frameInSecond >= 0 && frameInSecond < config.markerFrames;
+    if (frameIndex < 0 || config.markerFrames <= 0) {
+        return false;
+    }
+    const long double sourceSeconds = static_cast<long double>(frameIndex) *
+                                      static_cast<long double>(config.frameRateDenominator) /
+                                      static_cast<long double>(config.frameRateNumerator);
+    const long double frameInSecond = sourceSeconds - std::floor(sourceSeconds);
+    const long double activeWindow = static_cast<long double>(config.markerFrames) *
+                                     static_cast<long double>(config.frameRateDenominator) /
+                                     static_cast<long double>(config.frameRateNumerator);
+    return frameInSecond + 0.000000000001L < activeWindow;
 }
 
 int64_t ndiMarkerTimestamp100ns(const NdiMarkerConfig& config, int64_t frameIndex) {
     const double factor = 1.0 + config.skewPpm / 1000000.0;
-    const double seconds = double(frameIndex) * double(config.frameRateDenominator) /
-                           double(config.frameRateNumerator) * factor;
-    return int64_t(std::llround(seconds * double(kHundredNsPerSecond)));
+    return frameTimestamp100ns(config, frameIndex, factor);
 }
 
 int64_t ndiMarkerStartTimecode100ns(const NdiMarkerConfig& config) {
@@ -79,14 +99,14 @@ void fillNdiMarkerUyvyFrame(const NdiMarkerConfig& config, int64_t frameIndex,
 
 void fillNdiMarkerAudioFrame(const NdiMarkerConfig& config, int64_t frameIndex,
                              std::vector<float>& samples) {
-    const int perChannel = ndiMarkerSamplesPerFrame(config);
+    const int perChannel = ndiMarkerSamplesForFrame(config, frameIndex);
     samples.assign(size_t(config.channels * perChannel), 0.0f);
     if (!ndiMarkerIsActive(config, frameIndex)) {
         return;
     }
 
     const double frequency = 1000.0;
-    const int64_t firstSample = frameIndex * int64_t(perChannel);
+    const int64_t firstSample = samplesBeforeFrame(config, frameIndex);
     for (int channel = 0; channel < config.channels; ++channel) {
         float* channelData = samples.data() + size_t(channel * perChannel);
         for (int i = 0; i < perChannel; ++i) {

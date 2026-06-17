@@ -13,6 +13,8 @@ private slots:
     void audioBeepsOnlyDuringTheFlashWindow();
     void timestampsApplyMediaSkewIn100nsUnits();
     void timecodeParsesStartAndAdvancesWithFrames();
+    void rationalRateFlashesOnSourceSecondBoundary();
+    void rationalRateAudioDistributesSamplesAcrossFrames();
 };
 
 void TestNdiMarkerPattern::videoFlashesForTheFirstTwoFramesOfEachSecond() {
@@ -43,16 +45,14 @@ void TestNdiMarkerPattern::audioBeepsOnlyDuringTheFlashWindow() {
 
     fillNdiMarkerAudioFrame(config, 0, audio);
     QCOMPARE(audio.size(), size_t(config.channels * ndiMarkerSamplesPerFrame(config)));
-    const auto maxActive = std::max_element(audio.begin(), audio.end(), [](float a, float b) {
-        return std::abs(a) < std::abs(b);
-    });
+    const auto maxActive = std::max_element(
+        audio.begin(), audio.end(), [](float a, float b) { return std::abs(a) < std::abs(b); });
     QVERIFY(maxActive != audio.end());
     QVERIFY(std::abs(*maxActive) > 0.1f);
 
     fillNdiMarkerAudioFrame(config, 2, audio);
-    const auto maxSilent = std::max_element(audio.begin(), audio.end(), [](float a, float b) {
-        return std::abs(a) < std::abs(b);
-    });
+    const auto maxSilent = std::max_element(
+        audio.begin(), audio.end(), [](float a, float b) { return std::abs(a) < std::abs(b); });
     QVERIFY(maxSilent != audio.end());
     QCOMPARE(*maxSilent, 0.0f);
 }
@@ -71,6 +71,37 @@ void TestNdiMarkerPattern::timecodeParsesStartAndAdvancesWithFrames() {
 
     QCOMPARE(ndiMarkerStartTimecode100ns(config), int64_t(360000000000));
     QCOMPARE(ndiMarkerTimecode100ns(config, 30), int64_t(360010000000));
+}
+
+void TestNdiMarkerPattern::rationalRateFlashesOnSourceSecondBoundary() {
+    NdiMarkerConfig config;
+    config.frameRateNumerator = 30000;
+    config.frameRateDenominator = 1001;
+
+    QVERIFY(ndiMarkerIsActive(config, 0));
+    QVERIFY(ndiMarkerIsActive(config, 1));
+    QVERIFY(!ndiMarkerIsActive(config, 2));
+    QVERIFY(!ndiMarkerIsActive(config, 29));
+    QVERIFY(ndiMarkerIsActive(config, 30));
+}
+
+void TestNdiMarkerPattern::rationalRateAudioDistributesSamplesAcrossFrames() {
+    NdiMarkerConfig config;
+    config.frameRateNumerator = 30000;
+    config.frameRateDenominator = 1001;
+
+    QCOMPARE(ndiMarkerSamplesForFrame(config, 0), 1602);
+    QCOMPARE(ndiMarkerSamplesForFrame(config, 1), 1601);
+
+    int total = 0;
+    for (int frame = 0; frame < 30; ++frame) {
+        total += ndiMarkerSamplesForFrame(config, frame);
+    }
+    QCOMPARE(total, 48048);
+
+    std::vector<float> audio;
+    fillNdiMarkerAudioFrame(config, 1, audio);
+    QCOMPARE(audio.size(), size_t(config.channels * 1601));
 }
 
 QTEST_GUILESS_MAIN(TestNdiMarkerPattern)
