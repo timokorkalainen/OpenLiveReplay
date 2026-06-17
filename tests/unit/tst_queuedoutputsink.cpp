@@ -72,11 +72,56 @@ private:
     QVector<OutputBusFrame> m_frames;
 };
 
+class GapReportingInnerSink final : public IOutputSink {
+public:
+    explicit GapReportingInnerSink(qint64 rejectedIndex = -1) : m_rejectedIndex(rejectedIndex) {}
+
+    OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        QMutexLocker locker(&m_mutex);
+        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
+        return m_active;
+    }
+
+    void stop() override {
+        QMutexLocker locker(&m_mutex);
+        m_active = false;
+    }
+
+    bool isActive() const override {
+        QMutexLocker locker(&m_mutex);
+        return m_active;
+    }
+
+    bool submit(const OutputBusFrame& frame) override {
+        QMutexLocker locker(&m_mutex);
+        m_attempted.append(frame.outputFrameIndex);
+        if (!m_active || frame.outputFrameIndex == m_rejectedIndex) return false;
+        m_delivered.append(frame.outputFrameIndex);
+        return true;
+    }
+
+    QVector<qint64> delivered() const {
+        QMutexLocker locker(&m_mutex);
+        return m_delivered;
+    }
+
+private:
+    mutable QMutex m_mutex;
+    bool m_active = false;
+    qint64 m_rejectedIndex = -1;
+    QVector<qint64> m_attempted;
+    QVector<qint64> m_delivered;
+};
+
 class TestQueuedOutputSink : public QObject {
     Q_OBJECT
 private slots:
     void submitReturnsBeforeSlowInnerSinkCompletes();
     void asyncInnerSubmitFailuresAreVisibleInStatus();
+    void queueStatusReportsDepthAndDroppedFrames();
+    void deliveryGapsAreVisibleInStatus();
 };
 
 void TestQueuedOutputSink::submitReturnsBeforeSlowInnerSinkCompletes() {
@@ -120,6 +165,49 @@ void TestQueuedOutputSink::asyncInnerSubmitFailuresAreVisibleInStatus() {
     QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().failedFrames, qint64(1), 500);
     QVERIFY(sink.outputStatus().hasLastResult);
     QVERIFY(!sink.outputStatus().lastResultSucceeded);
+
+    sink.stop();
+}
+
+void TestQueuedOutputSink::queueStatusReportsDepthAndDroppedFrames() {
+    auto inner = std::make_unique<SlowCollectingSink>();
+    QueuedOutputSink sink(std::move(inner), 1);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(10)));
+    QVERIFY(sink.submit(frame(11)));
+
+    const OutputSinkStatus status = sink.outputStatus();
+    QVERIFY(status.maxQueueDepth >= 1);
+    QVERIFY(status.droppedFrames >= 1);
+    QCOMPARE(status.lastQueuedFrameIndex, qint64(11));
+
+    sink.stop();
+}
+
+void TestQueuedOutputSink::deliveryGapsAreVisibleInStatus() {
+    auto inner = std::make_unique<GapReportingInnerSink>();
+    GapReportingInnerSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 3);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(20)));
+    QVERIFY(sink.submit(frame(22)));
+
+    QTRY_COMPARE_WITH_TIMEOUT(observed->delivered().size(), 2, 500);
+    const OutputSinkStatus status = sink.outputStatus();
+    QVERIFY(status.deliveryGaps > 0);
+    QCOMPARE(status.lastDeliveredFrameIndex, qint64(22));
 
     sink.stop();
 }

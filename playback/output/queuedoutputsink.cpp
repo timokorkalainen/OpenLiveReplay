@@ -23,8 +23,14 @@ bool QueuedOutputSink::start(const OutputTargetAssignment& assignment, FrameRate
         m_droppedFrames = 0;
         m_asyncAcceptedFrames = 0;
         m_asyncFailedFrames = 0;
+        m_maxQueueDepth = 0;
+        m_deliveryGaps = 0;
+        m_lastQueuedFrameIndex = -1;
+        m_lastDeliveredFrameIndex = -1;
         m_hasLastAsyncResult = false;
         m_lastAsyncResultSucceeded = true;
+        m_hasLastQueuedFrameIndex = false;
+        m_hasLastDeliveredFrameIndex = false;
     }
 
     m_thread.reset(QThread::create([this]() { workerLoop(); }));
@@ -60,6 +66,9 @@ bool QueuedOutputSink::submit(const OutputBusFrame& frame) {
         m_droppedFrames++;
     }
     m_queue.append(frame);
+    m_lastQueuedFrameIndex = frame.outputFrameIndex;
+    m_hasLastQueuedFrameIndex = true;
+    m_maxQueueDepth = qMax<qint64>(m_maxQueueDepth, m_queue.size());
     m_wake.wakeOne();
     return true;
 }
@@ -76,14 +85,33 @@ OutputSinkStatus QueuedOutputSink::outputStatus() const {
         own.acceptedFrames = m_asyncAcceptedFrames;
         own.failedFrames = m_asyncFailedFrames;
         own.droppedFrames = m_droppedFrames;
+        own.currentQueueDepth = m_queue.size();
+        own.maxQueueDepth = m_maxQueueDepth;
+        own.deliveryGaps = m_deliveryGaps;
+        own.lastQueuedFrameIndex = m_lastQueuedFrameIndex;
+        own.lastDeliveredFrameIndex = m_lastDeliveredFrameIndex;
         own.hasLastResult = m_hasLastAsyncResult;
         own.lastResultSucceeded = m_lastAsyncResultSucceeded;
+        own.hasLastQueuedFrameIndex = m_hasLastQueuedFrameIndex;
+        own.hasLastDeliveredFrameIndex = m_hasLastDeliveredFrameIndex;
     }
 
     const OutputSinkStatus inner = m_inner ? m_inner->outputStatus() : OutputSinkStatus{};
     own.acceptedFrames = qMax(own.acceptedFrames, inner.acceptedFrames);
     own.failedFrames = qMax(own.failedFrames, inner.failedFrames);
     own.droppedFrames += inner.droppedFrames;
+    own.currentQueueDepth += inner.currentQueueDepth;
+    own.maxQueueDepth = qMax(own.maxQueueDepth, inner.maxQueueDepth);
+    own.deliveryGaps += inner.deliveryGaps;
+    if (inner.hasLastQueuedFrameIndex) {
+        own.hasLastQueuedFrameIndex = true;
+        own.lastQueuedFrameIndex = inner.lastQueuedFrameIndex;
+    }
+    if (inner.hasLastDeliveredFrameIndex) {
+        own.hasLastDeliveredFrameIndex = true;
+        own.lastDeliveredFrameIndex = inner.lastDeliveredFrameIndex;
+    }
+    own.lastSubmitDurationNs = qMax(own.lastSubmitDurationNs, inner.lastSubmitDurationNs);
     if (inner.hasLastResult) {
         own.hasLastResult = true;
         own.lastResultSucceeded = inner.lastResultSucceeded;
@@ -108,6 +136,11 @@ void QueuedOutputSink::workerLoop() {
         {
             QMutexLocker locker(&m_mutex);
             if (submitted) {
+                if (m_hasLastDeliveredFrameIndex && frame.outputFrameIndex != m_lastDeliveredFrameIndex + 1) {
+                    m_deliveryGaps++;
+                }
+                m_lastDeliveredFrameIndex = frame.outputFrameIndex;
+                m_hasLastDeliveredFrameIndex = true;
                 m_asyncAcceptedFrames++;
             } else {
                 m_asyncFailedFrames++;
