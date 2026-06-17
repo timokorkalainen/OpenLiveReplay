@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Broadcast frame-sync matrix: {lipsync, intercam, drift, drift_skew, timecode} x
-# {srt, rtmp, ndi}. SRT is live now; RTMP/NDI cells are explicit SKIPs until
-# their transport fixtures are wired into run_framesync_e2e.sh.
+# {srt, rtmp, ndi}. SRT is live by default; NDI runs when the optional local
+# ndi_marker_sender target is built from an installed NDI SDK/runtime; RTMP cells
+# are explicit SKIPs until their transport fixture is wired.
 #
 # Usage: run_framesync_matrix.sh <sync_harness> [base_port]
 set -uo pipefail

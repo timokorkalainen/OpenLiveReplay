@@ -18,6 +18,43 @@ qt_add_executable(sync_harness sync_harness.cpp)
 target_link_libraries(sync_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
+set(_olr_ndi_default_sdk "")
+if(APPLE AND EXISTS "/Library/NDI SDK for Apple/include/Processing.NDI.Lib.h")
+    set(_olr_ndi_default_sdk "/Library/NDI SDK for Apple")
+endif()
+set(OLR_NDI_SDK_DIR "${_olr_ndi_default_sdk}" CACHE PATH
+    "Optional NDI SDK root used to build the local framesync NDI marker sender")
+if(OLR_NDI_SDK_DIR)
+    find_path(OLR_NDI_INCLUDE_DIR
+        NAMES Processing.NDI.Lib.h
+        HINTS "${OLR_NDI_SDK_DIR}/include"
+        NO_DEFAULT_PATH)
+    find_library(OLR_NDI_LIBRARY
+        NAMES ndi libndi
+        HINTS
+            "${OLR_NDI_SDK_DIR}/lib/macOS"
+            "${OLR_NDI_SDK_DIR}/lib"
+        NO_DEFAULT_PATH)
+    if(OLR_NDI_INCLUDE_DIR AND OLR_NDI_LIBRARY)
+        add_executable(ndi_marker_sender
+            ndi_marker_sender.cpp
+            ndi_marker_pattern.cpp)
+        target_include_directories(ndi_marker_sender PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${OLR_NDI_INCLUDE_DIR}")
+        target_link_libraries(ndi_marker_sender PRIVATE
+            Qt6::Core
+            "${OLR_NDI_LIBRARY}"
+            olr_warnings
+            olr_sanitize)
+        get_filename_component(_olr_ndi_library_dir "${OLR_NDI_LIBRARY}" DIRECTORY)
+        set_target_properties(ndi_marker_sender PROPERTIES
+            BUILD_RPATH "${_olr_ndi_library_dir}")
+    else()
+        message(STATUS "NDI marker sender disabled: NDI SDK headers/library not found")
+    endif()
+endif()
+
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
 set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
 

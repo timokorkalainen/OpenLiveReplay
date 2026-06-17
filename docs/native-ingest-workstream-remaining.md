@@ -98,7 +98,7 @@ Phase 1 timing core (`docs/superpowers/plans/2026-06-17-framesync-phase1-timing-
 Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-ingest.md`), backed by
 `docs/superpowers/specs/2026-06-17-broadcast-framesync-program-design.md`.
 
-- **P2 — Source clock recovery + drift servo.** Live for native SRT/RTMP/NDI: native timestamps route through `SourceClock`, run a per-source `DriftEstimator`, expose `clockppm`/`clockq` telemetry, and use a common drift-aware media-to-session mapping for both video and audio. `StreamWorker` owns per-backend clocks so same-URL reconnects can re-lock to recovered state instead of fresh arrival time. The framesync skew cell now reports A/V-offset drift as well as recovered clock ppm.
+- **P2 — Source clock recovery + drift servo.** Live for native SRT/RTMP/NDI: native timestamps route through `SourceClock`, run a per-source `DriftEstimator`, expose `clockppm`/`clockq` telemetry, and use a common drift-aware media-to-session mapping for both video and audio. `StreamWorker` owns per-backend clocks so same-URL reconnects can re-lock to recovered state instead of fresh arrival time. The framesync skew cell now reports A/V-offset drift as well as recovered clock ppm, and the local framesync matrix has SDK-backed NDI marker-source coverage when the NDI runtime is installed.
 - **P3 — Timecode.** Extract SMPTE 12M side data (TC-1), align sources by timecode (TC-4), write `tmcd`/tags into the MKV (TC-5). NDI ingest carries the native NDI timecode value through decoded video/audio callbacks; mux/alignment consumption is still Phase 3.
 - **P4 — Interlace / fields.** Deinterlace policy + field-rate slow-mo (only if interlaced sport is in scope; today fields are silently frame-blended).
 - **P5 — Architectural / true broadcast output.** A PTP (ST 2059) house-clock client (REF-1); genlocked SDI / ST 2110 output via DeckLink/Rivermax (GENLOCK-1, today output is software `QVideoSink` only); interim: PTS-stamp the `QVideoFrame` + vsync-pace presentation (GENLOCK-2/3/5). **#54 (NDI output bus) is the first concrete step here** — a broadcast output path with preview.
@@ -123,8 +123,8 @@ Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-inge
 1. **Verify Windows** (§1) — smoke-test live AAC/RTMP on a Windows machine; confirm the Windows CI build is green on `main`. _Unblocks confidence in #52._
 2. **Pick up the capability regressions that real feeds hit** (§3) — most likely **hostname/DNS SRT** and **encrypted SRT** first (common in production SRT).
 3. **Rational playback stepping** (§5) — small, closes the last P1 gap.
-4. **Stand up the Phase 0 measurement rig** (§6/§7) — including the media skew cell, so P2 can be measured on one machine before any two-machine drift work.
-5. **Broaden P2 validation** (§7) — the timing core, reconnect clock ownership, and skew A/V metric are live; remaining work is longer-duration/two-machine validation and tightening report-only cells into gates where the transport can honestly guarantee them.
+4. **Broaden P2 validation** (§7) — the timing core, reconnect clock ownership, skew A/V metric, SRT cells, and local NDI marker-source matrix cells are live; remaining work is longer-duration/two-machine validation, RTMP marker-source coverage, and tightening report-only cells into gates where the transport can honestly guarantee them.
+5. **Keep the framesync matrix current** (§7) — when new transport fixtures land, make sure they emit the same flash/beep/timecode/skew contract as the SRT and NDI marker sources.
 6. Output side (**P5 / #54**) proceeds in parallel on its own track.
 
 ---
