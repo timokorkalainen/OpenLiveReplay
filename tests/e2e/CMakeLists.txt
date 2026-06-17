@@ -123,8 +123,8 @@ set_tests_properties(e2e_av_lipsync PROPERTIES
 # --- Broadcast frame-sync acceptance rig ------------------------------------
 # Opt-in instrument for lip-sync, inter-camera phase, drift and timecode
 # measurements. These use a dedicated port band (>=24000) and report metrics on
-# every run; lipsync is already stable enough to run as a gate while the other
-# Phase-0 cells stay report-only until Phase 1 tightens the timing core.
+# every run; lipsync and the zero-skew drift sanity cell run as gates while the
+# inter-camera/timecode cells stay report-only until common-TC/tmcd work lands.
 set(_framesync_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_framesync_e2e.sh")
 add_test(NAME e2e_framesync_lipsync
     COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 24000)
@@ -143,6 +143,8 @@ set_tests_properties(
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
 set_tests_properties(e2e_framesync_lipsync PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
+set_tests_properties(e2e_framesync_drift PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
 
 # --- Local-only native SRT e2e (NOT in CI) ----------------------------------

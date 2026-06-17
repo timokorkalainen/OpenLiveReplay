@@ -13,8 +13,9 @@ gates.
   With common timecode this becomes a `<= 1 frame` gate; without common TC it is
   a bounded report, because clockless IP cannot prove frame-accurate phase.
 - **Drift:** least-squares slope of `flash index -> recorded PTS`, plus ppm and
-  slip-in-frames over the run. Phase 1 turns this into an A/V-offset drift gate:
-  less than one frame over the run.
+  slip-in-frames over the run. The zero-skew CTest cell is gated at less than
+  one frame of slip. Injected-skew runs remain report-only until the driver adds
+  an A/V-offset-drift metric.
 - **Timecode:** recorded MKV `tmcd` or `timecode` tag versus the injected
   `OLR_MARKER_TC`. Until the engine writes `tmcd` in Phase 3, this reports
   `n/a` rather than failing.
@@ -37,6 +38,21 @@ tests/e2e/run_framesync_matrix.sh build/bcast/tests/e2e/sync_harness
 The matrix covers `{lipsync, intercam, drift, timecode} x {srt, rtmp, ndi}`.
 SRT is active now. RTMP and NDI cells currently skip with exit code 77 until
 their fixtures are wired.
+
+## Timing Core Status
+
+Phase 1 is live for native SRT/RTMP:
+
+- `SourceClock` maps sender timestamps to the recording timeline. SRT uses PCR
+  quality with exact 90 kHz units; RTMP uses FLV millisecond quality.
+- `DriftEstimator` exposes recovered clock ppm, and `sync_harness
+  --report-stats` prints `clockppm` and `clockq`.
+- The record-side audio FIFO cursor rate-corrects from the recovered ppm with a
+  gentle `+/-500 ppm` cap and fractional accumulation, so small ppm corrections
+  are not rounded away.
+
+Reconnect re-lock still needs a follow-up ownership change so the recovered
+clock survives a destroyed/recreated ingest session for the same URL.
 
 ## Environment Knobs
 
