@@ -3,11 +3,23 @@
 
 #include "playback/output/outputsink.h"
 
+#include <QHash>
 #include <QList>
 
 struct OutputEndpoint {
     OutputTargetAssignment assignment;
     IOutputSink* sink = nullptr; // non-owning; UI/target manager owns sinks
+};
+
+struct OutputTargetDispatchStats {
+    qint64 attemptedFrames = 0;
+    qint64 framesSubmitted = 0;
+    qint64 sinkFailures = 0;
+    qint64 placeholderFrames = 0;
+    qint64 silentAudioFrames = 0;
+    qint64 repeatedPayloadFrames = 0;
+    bool hasLastIdentity = false;
+    OutputFrameIdentity lastIdentity;
 };
 
 struct OutputDispatchStats {
@@ -16,6 +28,7 @@ struct OutputDispatchStats {
     qint64 sinkFailures = 0;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
+    QHash<QString, OutputTargetDispatchStats> targets;
 };
 
 class OutputDispatcher {
@@ -42,6 +55,8 @@ private:
     PlaybackStateSnapshot clockedStateForTick(qint64 outputFrameIndex,
                                               const PlaybackStateSnapshot& state);
     void countFrameHealth(const OutputBusFrame& frame);
+    void countTargetAttempt(const OutputTargetAssignment& assignment, const OutputBusFrame& frame,
+                            bool submitted);
 
     FrameRate m_rate;
     int m_feedCount = 0;

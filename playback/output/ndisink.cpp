@@ -264,29 +264,64 @@ NdiOutputSink::~NdiOutputSink() {
 
 bool NdiOutputSink::start(const OutputTargetAssignment& assignment, FrameRate rate) {
     stop();
+    m_status.framesSubmitted = 0;
+    m_status.sendFailures = 0;
+    m_status.lastFrameIdentity = OutputFrameIdentity();
+
     if (!m_backend || assignment.kind != OutputTargetKind::Ndi || !assignment.enabled ||
-        !rate.isValid() || !m_backend->isRuntimeAvailable()) {
+        !rate.isValid()) {
+        setStatus(NdiOutputState::InvalidAssignment,
+                  QStringLiteral("invalid NDI output assignment"));
+        return false;
+    }
+
+    if (!m_backend->isRuntimeAvailable()) {
+        setStatus(NdiOutputState::RuntimeUnavailable,
+                  QStringLiteral("NDI runtime is not available"));
         return false;
     }
 
     const QString senderName = senderNameFor(assignment);
-    if (senderName.isEmpty()) return false;
+    if (senderName.isEmpty()) {
+        setStatus(NdiOutputState::InvalidAssignment, QStringLiteral("NDI sender name is empty"));
+        return false;
+    }
 
-    if (!m_backend->createSender(senderName, rate)) return false;
+    if (!m_backend->createSender(senderName, rate)) {
+        setStatus(NdiOutputState::CreateFailed,
+                  QStringLiteral("failed to create NDI sender '%1'").arg(senderName));
+        return false;
+    }
     m_assignment = assignment;
     m_rate = rate;
     m_active = true;
+    setStatus(NdiOutputState::Active, QStringLiteral("NDI sender '%1' active").arg(senderName));
     return true;
 }
 
 void NdiOutputSink::stop() {
     if (m_active && m_backend) m_backend->destroySender();
     m_active = false;
+    setStatus(NdiOutputState::Stopped, QStringLiteral("NDI sender stopped"));
 }
 
 bool NdiOutputSink::submit(const OutputBusFrame& frame) {
     if (!m_active || !m_backend) return false;
-    return m_backend->sendFrame(frame);
+    m_status.lastFrameIdentity = outputFrameIdentityFor(frame);
+    if (!m_backend->sendFrame(frame)) {
+        m_status.sendFailures++;
+        setStatus(NdiOutputState::SendFailed, QStringLiteral("failed to send NDI frame"));
+        return false;
+    }
+    m_status.framesSubmitted++;
+    setStatus(NdiOutputState::Active,
+              QStringLiteral("NDI sender '%1' active").arg(senderNameFor(m_assignment)));
+    return true;
+}
+
+void NdiOutputSink::setStatus(NdiOutputState state, const QString& message) {
+    m_status.state = state;
+    m_status.message = message;
 }
 
 QString NdiOutputSink::senderNameFor(const OutputTargetAssignment& assignment) {

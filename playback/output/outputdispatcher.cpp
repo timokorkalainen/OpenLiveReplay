@@ -2,6 +2,26 @@
 
 #include <QHash>
 
+namespace {
+
+QString targetStatsKey(const OutputTargetAssignment& assignment) {
+    const QString id = assignment.id.trimmed();
+    if (!id.isEmpty()) return id;
+    return QStringLiteral("%1:%2:%3")
+        .arg(int(assignment.kind))
+        .arg(int(assignment.sourceBus.kind))
+        .arg(assignment.sourceBus.index);
+}
+
+bool isSilentAudio(const MediaAudioFrame& audio) {
+    for (const char sample : audio.pcm) {
+        if (sample != '\0') return false;
+    }
+    return true;
+}
+
+} // namespace
+
 OutputDispatcher::OutputDispatcher(FrameRate rate, int feedCount, int width, int height)
     : m_rate(rate), m_feedCount(qMax(0, feedCount)), m_width(qMax(2, width)),
       m_height(qMax(2, height)) {}
@@ -49,7 +69,10 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
             countFrameHealth(rendered.value(bus));
         }
 
-        if (endpoint.sink->submit(rendered.value(bus))) {
+        const OutputBusFrame frame = rendered.value(bus);
+        const bool submitted = endpoint.sink->submit(frame);
+        countTargetAttempt(endpoint.assignment, frame, submitted);
+        if (submitted) {
             m_stats.framesSubmitted++;
         } else {
             m_stats.sinkFailures++;
@@ -99,12 +122,23 @@ OutputBusFrame OutputDispatcher::renderBus(OutputBusId bus, qint64 outputFrameIn
 
 void OutputDispatcher::countFrameHealth(const OutputBusFrame& frame) {
     if (frame.video.isPlaceholder) m_stats.placeholderFrames++;
-    bool silent = true;
-    for (char sample : frame.audio.pcm) {
-        if (sample != '\0') {
-            silent = false;
-            break;
-        }
+    if (isSilentAudio(frame.audio)) m_stats.silentAudioFrames++;
+}
+
+void OutputDispatcher::countTargetAttempt(const OutputTargetAssignment& assignment,
+                                          const OutputBusFrame& frame, bool submitted) {
+    OutputTargetDispatchStats& stats = m_stats.targets[targetStatsKey(assignment)];
+    stats.attemptedFrames++;
+    if (submitted) {
+        stats.framesSubmitted++;
+    } else {
+        stats.sinkFailures++;
     }
-    if (silent) m_stats.silentAudioFrames++;
+    if (frame.video.isPlaceholder) stats.placeholderFrames++;
+    if (isSilentAudio(frame.audio)) stats.silentAudioFrames++;
+    if (stats.hasLastIdentity && stats.lastIdentity.samePayloadAs(frame.identity)) {
+        stats.repeatedPayloadFrames++;
+    }
+    stats.lastIdentity = frame.identity;
+    stats.hasLastIdentity = true;
 }

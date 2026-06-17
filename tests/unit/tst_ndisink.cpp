@@ -19,19 +19,21 @@ public:
     bool createSender(const QString& senderName, FrameRate rate) override {
         createdName = senderName;
         createdRate = rate;
-        active = runtimeAvailable && !senderName.isEmpty() && rate.isValid();
+        active = runtimeAvailable && createSucceeds && !senderName.isEmpty() && rate.isValid();
         return active;
     }
 
     void destroySender() override { active = false; }
 
     bool sendFrame(const OutputBusFrame& frame) override {
-        if (!active) return false;
+        if (!active || !sendSucceeds) return false;
         sentFrames.append(frame);
         return true;
     }
 
     bool runtimeAvailable = false;
+    bool createSucceeds = true;
+    bool sendSucceeds = true;
     bool active = false;
     QString createdName;
     FrameRate createdRate;
@@ -44,6 +46,8 @@ private slots:
     void unavailableRuntimeFailsCleanly();
     void startUsesConfiguredSenderNameAndSubmitsCleanBusFrames();
     void rejectsDisabledOrNonNdiAssignments();
+    void reportsCreateFailureAndStoppedStatus();
+    void reportsSendFailureStatus();
 };
 
 void TestNdiSink::unavailableRuntimeFailsCleanly() {
@@ -59,6 +63,8 @@ void TestNdiSink::unavailableRuntimeFailsCleanly() {
 
     QVERIFY(!sink.start(assignment, FrameRate::fromFraction(25, 1)));
     QVERIFY(!sink.isActive());
+    QCOMPARE(sink.status().state, NdiOutputState::RuntimeUnavailable);
+    QVERIFY(sink.status().message.contains(QStringLiteral("runtime"), Qt::CaseInsensitive));
     QVERIFY(!sink.submit(OutputBusFrame{}));
     QCOMPARE(backend.sentFrames.size(), 0);
 }
@@ -76,6 +82,7 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
 
     QVERIFY(sink.start(assignment, FrameRate::fromFraction(30000, 1001)));
     QVERIFY(sink.isActive());
+    QCOMPARE(sink.status().state, NdiOutputState::Active);
     QCOMPARE(backend.createdName, QStringLiteral("OLR Feed 1"));
     QCOMPARE(backend.createdRate.numerator, 30000);
     QCOMPARE(backend.createdRate.denominator, 1001);
@@ -92,6 +99,8 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
     frame.audio.pcm = QByteArray(8 * int(sizeof(qint16)), '\0');
 
     QVERIFY(sink.submit(frame));
+    QCOMPARE(sink.status().state, NdiOutputState::Active);
+    QCOMPARE(sink.status().framesSubmitted, qint64(1));
     QCOMPARE(backend.sentFrames.size(), 1);
     QCOMPARE(backend.sentFrames[0].bus, OutputBusId::feed(0));
     QCOMPARE(backend.sentFrames[0].outputFrameIndex, qint64(7));
@@ -113,7 +122,62 @@ void TestNdiSink::rejectsDisabledOrNonNdiAssignments() {
     wrongKind.enabled = true;
     wrongKind.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR Wrong"));
     QVERIFY(!sink.start(wrongKind, FrameRate::fromFraction(25, 1)));
+    QCOMPARE(sink.status().state, NdiOutputState::InvalidAssignment);
     QCOMPARE(backend.sentFrames.size(), 0);
+}
+
+void TestNdiSink::reportsCreateFailureAndStoppedStatus() {
+    FakeNdiBackend backend(true);
+    backend.createSucceeds = false;
+    NdiOutputSink sink(&backend);
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-ndi");
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+    assignment.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR Feed 1"));
+
+    QVERIFY(!sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QCOMPARE(sink.status().state, NdiOutputState::CreateFailed);
+    QVERIFY(sink.status().message.contains(QStringLiteral("create"), Qt::CaseInsensitive));
+
+    backend.createSucceeds = true;
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    sink.stop();
+    QCOMPARE(sink.status().state, NdiOutputState::Stopped);
+    QVERIFY(!sink.isActive());
+}
+
+void TestNdiSink::reportsSendFailureStatus() {
+    FakeNdiBackend backend(true);
+    NdiOutputSink sink(&backend);
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-ndi");
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+    assignment.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR Feed 1"));
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    backend.sendSucceeds = false;
+
+    OutputBusFrame frame;
+    frame.bus = OutputBusId::feed(0);
+    frame.outputFrameIndex = 9;
+    frame.sampledPlayheadMs = 360;
+    frame.video = video(0, 360, 80);
+    frame.audio.feedIndex = 0;
+    frame.audio.sampleRate = 48000;
+    frame.audio.channels = 2;
+    frame.audio.format = MediaSampleFormat::S16Interleaved;
+    frame.audio.pcm = QByteArray(8 * int(sizeof(qint16)), '\0');
+
+    QVERIFY(!sink.submit(frame));
+    QCOMPARE(sink.status().state, NdiOutputState::SendFailed);
+    QCOMPARE(sink.status().sendFailures, qint64(1));
+    QCOMPARE(sink.status().lastFrameIdentity.outputFrameIndex, qint64(9));
 }
 
 QTEST_GUILESS_MAIN(TestNdiSink)

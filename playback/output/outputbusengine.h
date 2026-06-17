@@ -5,7 +5,37 @@
 #include "playback/output/outputframeclock.h"
 #include "playback/output/outputtargetassignment.h"
 
+#include <QDebug>
 #include <QList>
+
+struct OutputFrameIdentity {
+    OutputBusId bus = OutputBusId::pgm();
+    qint64 outputFrameIndex = -1;
+    qint64 sampledPlayheadMs = 0;
+    int sourceFeedIndex = -1;
+    qint64 sourcePtsMs = 0;
+    bool videoPlaceholder = false;
+    bool audioSilent = true;
+    quint32 videoHash = 0;
+    quint32 audioHash = 0;
+
+    bool samePayloadAs(const OutputFrameIdentity& other) const {
+        return bus == other.bus && sourceFeedIndex == other.sourceFeedIndex &&
+               sourcePtsMs == other.sourcePtsMs && videoPlaceholder == other.videoPlaceholder &&
+               audioSilent == other.audioSilent && videoHash == other.videoHash &&
+               audioHash == other.audioHash;
+    }
+
+    bool operator==(const OutputFrameIdentity& other) const {
+        return bus == other.bus && outputFrameIndex == other.outputFrameIndex &&
+               sampledPlayheadMs == other.sampledPlayheadMs &&
+               sourceFeedIndex == other.sourceFeedIndex && sourcePtsMs == other.sourcePtsMs &&
+               videoPlaceholder == other.videoPlaceholder && audioSilent == other.audioSilent &&
+               videoHash == other.videoHash && audioHash == other.audioHash;
+    }
+};
+
+QDebug operator<<(QDebug debug, const OutputFrameIdentity& identity);
 
 struct OutputBusFrame {
     OutputBusId bus;
@@ -13,7 +43,10 @@ struct OutputBusFrame {
     qint64 sampledPlayheadMs = 0;
     MediaVideoFrame video;
     MediaAudioFrame audio;
+    OutputFrameIdentity identity;
 };
+
+OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 
 class OutputBusEngine {
 public:
