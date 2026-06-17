@@ -12,10 +12,12 @@ gates.
 - **Inter-camera phase:** flash-onset spread across two synchronized views.
   With common timecode this becomes a `<= 1 frame` gate; without common TC it is
   a bounded report, because clockless IP cannot prove frame-accurate phase.
-- **Drift:** least-squares slope of `flash index -> recorded PTS`, plus ppm and
-  slip-in-frames over the run. The zero-skew CTest cell is gated at less than
-  one frame of slip. Injected-skew runs remain report-only until the driver adds
-  an A/V-offset-drift metric.
+- **Drift:** least-squares slope of `flash index -> recorded PTS`, recovered
+  source-clock ppm, and A/V offset drift over the run. The zero-skew CTest cell
+  gates A/V offset regression drift at less than one frame; video flash slope is
+  reported as a diagnostic because onset quantization can move by a frame on
+  short local runs. The injected-skew cell is report-only, but it fails if the
+  rig cannot observe a nonzero recovered clock ppm.
 - **Timecode:** recorded MKV `tmcd` or `timecode` tag versus the injected
   `OLR_MARKER_TC`. Until the engine writes `tmcd` in Phase 3, this reports
   `n/a` rather than failing.
@@ -47,12 +49,14 @@ Phase 1 is live for native SRT/RTMP:
   quality with exact 90 kHz units; RTMP uses FLV millisecond quality.
 - `DriftEstimator` exposes recovered clock ppm, and `sync_harness
   --report-stats` prints `clockppm` and `clockq`.
-- The record-side audio FIFO cursor rate-corrects from the recovered ppm with a
-  gentle `+/-500 ppm` cap and fractional accumulation, so small ppm corrections
-  are not rounded away.
+- `SourceClock::toSessionMs()` applies the recovered sender/session slope when
+  mapping media timestamps, so video frames and audio chunks share one corrected
+  timeline. The record-side FIFO consumes that common timeline without an extra
+  audio-only ppm correction.
 
-Reconnect re-lock still needs a follow-up ownership change so the recovered
-clock survives a destroyed/recreated ingest session for the same URL.
+`StreamWorker` owns the per-backend source clocks and passes them into recreated
+native sessions, so same-URL reconnects can retain recovered clock state. A
+source URL/backend change resets the owned clocks.
 
 ## Environment Knobs
 
@@ -60,8 +64,8 @@ clock survives a destroyed/recreated ingest session for the same URL.
   `run_framesync_e2e.sh`.
 - `OLR_FRAMESYNC_SECS=20` sets the recording duration.
 - `OLR_FRAMESYNC_GATE=1` makes a scenario enforce its band.
-- `OLR_FRAMESYNC_SKEW_PPM=200` injects a deterministic rate skew in the drift
-  scenario.
+- `OLR_FRAMESYNC_SKEW_PPM=200` injects deterministic media PTS/PCR skew in the
+  `drift_skew` scenario.
 - `OLR_MARKER_TC=10:00:00:00` sets the injected start timecode.
 - `OLR_FLASH_CODEC=avc|hevc` selects the marker video codec.
 
@@ -71,10 +75,13 @@ text into the video.
 
 ## Skew Injector
 
-`tests/e2e/lossy_udp_relay.py` has a ppm skew mode used by the drift cell. A
-single machine otherwise shares one wall clock, so real drift is nearly zero by
-construction. The injector releases downstream SRT data on a stretched or
-compressed schedule and records `skew_ppm` plus `data_forwarded` in its stats.
+The drift skew cell uses `OLR_MARKER_SKEW_PPM` internally to stretch/compress
+the FFmpeg marker media timestamps before the UDP->SRT bridge. A single machine
+otherwise shares one wall clock, so real drift is nearly zero by construction.
+
+`tests/e2e/lossy_udp_relay.py` still has a ppm packet-release skew self-test for
+network impairment experiments, but frame-sync acceptance does not treat packet
+delay as media-clock skew.
 
 Self-test:
 

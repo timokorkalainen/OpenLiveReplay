@@ -61,6 +61,14 @@ srt_hevc_vcodec_args() {
     return 1
 }
 
+marker_skew_is_enabled() {
+    awk -v ppm="${OLR_MARKER_SKEW_PPM:-0}" 'BEGIN { exit !(ppm != 0) }'
+}
+
+marker_skew_factor() {
+    awk -v ppm="${OLR_MARKER_SKEW_PPM:-0}" 'BEGIN { printf "%.12f", 1.0 + ppm / 1000000.0 }'
+}
+
 # Spawn ONE ffmpeg full-frame-flash producer, tee'd to all given UDP ports so every
 # consumer sees byte-identical, simultaneous content. Luma flashes to white (235)
 # for the first ~60ms of every source-second, else black (16).
@@ -69,6 +77,9 @@ srt_hevc_vcodec_args() {
 # Usage: flash_marker_to_udps <udp_port> [<udp_port> ...]
 flash_marker_to_udps() {
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
+    if marker_skew_is_enabled; then
+        vflt="${vflt},setpts=PTS*$(marker_skew_factor)"
+    fi
     local tee="" p
     for p in "$@"; do
         [ -n "$tee" ] && tee="${tee}|"
@@ -107,10 +118,17 @@ flash_pts_series() {
 flash_beep_marker_to_udp() {
     local port="$1"
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
+    local aflt="volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame"
+    if marker_skew_is_enabled; then
+        local factor
+        factor="$(marker_skew_factor)"
+        vflt="${vflt},setpts=PTS*${factor}"
+        aflt="${aflt},asetpts=PTS*${factor}"
+    fi
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "color=c=black:s=320x240:r=30" \
         -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
-        -filter_complex "[0:v]${vflt}[v];[1:a]volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame[a]" \
+        -filter_complex "[0:v]${vflt}[v];[1:a]${aflt}[a]" \
         -map "[v]" -map "[a]" \
         -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
         -c:a aac -b:a 128k \
@@ -125,10 +143,17 @@ flash_beep_tc_marker_to_udp() {
     local port="$1"
     local tc="${OLR_MARKER_TC:-10\\:00\\:00\\:00}"
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
+    local aflt="volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame"
     if ffmpeg -hide_banner -filters 2>/dev/null | grep -q ' drawtext '; then
         vflt="${vflt},drawtext=fontfile=:text='':timecode='${tc}':r=30:fontsize=20:fontcolor=white:x=10:y=10"
     else
         echo "WARN: ffmpeg drawtext unavailable; TC marker uses container timecode only" >&2
+    fi
+    if marker_skew_is_enabled; then
+        local factor
+        factor="$(marker_skew_factor)"
+        vflt="${vflt},setpts=PTS*${factor}"
+        aflt="${aflt},asetpts=PTS*${factor}"
     fi
     local vargs
     if [ "${OLR_FLASH_CODEC:-avc}" = "hevc" ]; then
@@ -140,7 +165,7 @@ flash_beep_tc_marker_to_udp() {
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "color=c=black:s=320x240:r=30" \
         -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
-        -filter_complex "[0:v]${vflt}[v];[1:a]volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame[a]" \
+        -filter_complex "[0:v]${vflt}[v];[1:a]${aflt}[a]" \
         -map "[v]" -map "[a]" "${vargs[@]}" \
         -c:a aac -b:a 128k -timecode "${OLR_MARKER_TC:-10:00:00:00}" \
         -f mpegts "udp://127.0.0.1:${port}?pkt_size=1316" &

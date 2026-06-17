@@ -17,9 +17,14 @@
 #include <memory>
 
 class NativeSrtIngestSession final : public IngestSession {
+#if defined(QT_TESTLIB_LIB)
+    friend class TestIngestBackendSelector;
+#endif
 public:
     NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
                            std::atomic<bool>* captureRunning);
+    NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
+                           std::atomic<bool>* captureRunning, AnchoredSourceClock* sourceClock);
     ~NativeSrtIngestSession() override;
 
     static bool supportsUrl(const QUrl& url);
@@ -60,10 +65,19 @@ private:
     int64_t m_lastStatsAtMs = -1;
     // Single shared A/V anchor for this source. PCR/video own re-anchoring; audio
     // follows the same recovered 90 kHz sender clock.
-    AnchoredSourceClock m_clock{ClockQuality::Pcr, 90};
+    AnchoredSourceClock m_ownedClock{ClockQuality::Pcr, 90};
+    AnchoredSourceClock* m_clock = &m_ownedClock;
+    bool m_externalClock = false;
     // Per-stream previous timestamps, for discontinuity (jump) detection only.
     int64_t m_prevDts90k = -1;
     int64_t m_prevAudioPts90k = -1;
+    int64_t m_prevRawPcr90k = -1;
+    int64_t m_prevRawVideoDts90k = -1;
+    int64_t m_prevRawAudioPts90k = -1;
+    int64_t m_pcrWrapOffset90k = 0;
+    int64_t m_videoWrapOffset90k = 0;
+    int64_t m_audioWrapOffset90k = 0;
+    bool m_forceNextPcrObserve = false;
     int64_t m_audioRemainderPts90k = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastDecodeErrorLogMs = -1;
@@ -76,6 +90,9 @@ private:
     void processReceivedBytes(const char* data, int size);
     void processPesPacket(const PesPacket& pes);
     void processAudioPesPacket(const PesPacket& pes);
+    int64_t unwrapPcr90k(int64_t raw90k);
+    int64_t unwrapVideo90k(int64_t raw90k);
+    int64_t unwrapAudio90k(int64_t raw90k);
     int64_t sourcePtsMsForUnit(const CompressedAccessUnit& unit);
     int64_t sourcePtsMsForAudio(qint64 pts90k);
 };

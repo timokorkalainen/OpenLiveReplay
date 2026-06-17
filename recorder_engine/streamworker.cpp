@@ -1,7 +1,6 @@
 #include "streamworker.h"
 #include "ingest/ingestsession.h"
 #include "ingest/rtmpprotocol.h"
-#include "timing/audioservo.h"
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
 #include "ingest/nativesrtingestsession.h"
 #endif
@@ -14,12 +13,9 @@
 #include <QUrl>
 #include <QtGlobal>
 
-#include <cmath>
 #include <memory>
 
 namespace {
-constexpr double kMaxAudioServoPpm = 500.0;
-
 QString ingestFailureKindForLog(IngestFailureKind failure) {
     switch (failure) {
     case IngestFailureKind::UnsupportedProfile:
@@ -236,9 +232,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     // Write this tick's worth of audio for the assigned view track
     // (sample-accurate cursor, silence-filled where capture had nothing).
-    const double sourcePpm =
-        double(m_currentSourcePpmMilli.load(std::memory_order_relaxed)) / 1000.0;
-    writeAudioForTick(currentRecordingTimeMs, track, trimMs, jitterMs, sourcePpm);
+    writeAudioForTick(currentRecordingTimeMs, track, trimMs, jitterMs);
 }
 
 void StreamWorker::captureLoop() {
@@ -334,9 +328,6 @@ void StreamWorker::captureLoop() {
         };
         callbacks.setConnected = [this](bool connected) { setConnected(connected); };
         callbacks.reportStats = [this](const IngestStats& stats) {
-            const double ppm = clampPpm(stats.clockPpm, kMaxAudioServoPpm);
-            m_currentSourcePpmMilli.store(int(std::llround(ppm * 1000.0)),
-                                          std::memory_order_relaxed);
             emit statsUpdated(m_sourceIndex, stats);
         };
 
@@ -356,23 +347,33 @@ void StreamWorker::captureLoop() {
                                                 nativeNdiAvailable);
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
         const bool nativeRtmpAttempt = backendKind == IngestBackendKind::NativeRtmp;
+        if (m_clockOwnerUrl != currentUrl || m_clockOwnerBackend != backendKind) {
+            m_srtSourceClock.reset();
+            m_rtmpSourceClock.reset();
+            m_ndiSourceClock.reset();
+            m_clockOwnerUrl = currentUrl;
+            m_clockOwnerBackend = backendKind;
+        }
 
         std::unique_ptr<IngestSession> session;
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
         if (backendKind == IngestBackendKind::NativeSrt) {
             session = std::make_unique<NativeSrtIngestSession>(m_sourceIndex, m_targetWidth,
-                                                               m_targetHeight, &m_captureRunning);
+                                                               m_targetHeight, &m_captureRunning,
+                                                               &m_srtSourceClock);
         }
 #endif
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
         if (backendKind == IngestBackendKind::NativeRtmp) {
             session = std::make_unique<NativeRtmpIngestSession>(m_sourceIndex, m_targetWidth,
-                                                                m_targetHeight, &m_captureRunning);
+                                                                m_targetHeight, &m_captureRunning,
+                                                                &m_rtmpSourceClock);
         }
 #endif
         if (backendKind == IngestBackendKind::NativeNdi) {
             session = std::make_unique<NativeNdiIngestSession>(m_sourceIndex, m_targetWidth,
-                                                               m_targetHeight, &m_captureRunning);
+                                                               m_targetHeight, &m_captureRunning,
+                                                               &m_ndiSourceClock);
         }
         if (!session) {
             const QString scheme = sourceUrl.scheme().toLower();
@@ -581,7 +582,7 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
 }
 
 void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs,
-                                     int64_t jitterMs, double sourcePpm) {
+                                     int64_t jitterMs) {
     // Audio shares the video path's jitter delay so both land on the
     // same timeline: a video frame written at file-time T shows source
     // content from T - jitter.  The cursor runs on the FILE timeline;
@@ -599,7 +600,6 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
         m_audioSourceCursor = targetEnd - jitterSamples - trimSamples;
         m_audioServoTrimSamples = trimSamples;
         m_audioServoJitterSamples = jitterSamples;
-        m_audioServoFraction = 0.0;
         QMutexLocker locker(&m_audioFifoMutex);
         if (m_audioFifoStartSample >= 0) {
             const int64_t dropSamples =
@@ -629,11 +629,9 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
         m_audioSourceCursor = nominalSrcStart;
         m_audioServoTrimSamples = trimSamples;
         m_audioServoJitterSamples = jitterSamples;
-        m_audioServoFraction = 0.0;
     }
     const int64_t srcStart = m_audioSourceCursor;
-    const int64_t srcAdvance = correctedSrcSamplesAccumulated(
-        n, clampPpm(sourcePpm, kMaxAudioServoPpm), &m_audioServoFraction);
+    const int64_t srcAdvance = n;
 
     QByteArray chunk(int(n * kAudioBytesPerSample), '\0');
     {

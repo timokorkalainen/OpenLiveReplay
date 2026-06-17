@@ -29,6 +29,7 @@ void AnchoredSourceClock::observe(int64_t senderUnits, int64_t sessionNowMs, boo
     if (needAnchor) {
         m_anchorSenderUnits = senderUnits;
         m_anchorSessionMs = sessionNowMs;
+        m_drift.reset();
     }
 
     if (authority) {
@@ -49,10 +50,17 @@ void AnchoredSourceClock::addRateSample(int64_t senderUnits, int64_t sessionNowM
 }
 
 int64_t AnchoredSourceClock::toSessionMs(int64_t mediaSenderUnits) const {
-    if (!locked() || mediaSenderUnits < 0) {
+    if (!locked()) {
         return -1;
     }
-    return m_anchorSessionMs + unitsToMs(mediaSenderUnits - m_anchorSenderUnits);
+    const long double senderDeltaMs =
+        static_cast<long double>(mediaSenderUnits - m_anchorSenderUnits) /
+        static_cast<long double>(m_unitsPerMs);
+    const double slope = m_drift.slope();
+    const long double correctedDeltaMs =
+        std::abs(slope) > 0.000001 ? senderDeltaMs / static_cast<long double>(slope)
+                                   : senderDeltaMs;
+    return m_anchorSessionMs + int64_t(std::llround(correctedDeltaMs));
 }
 
 void AnchoredSourceClock::reset() {

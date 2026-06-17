@@ -26,6 +26,14 @@ double DriftEstimator::ppm() const {
     return (m_slope - 1.0) * 1000000.0;
 }
 
+double DriftEstimator::slope() const {
+    if (!locked()) {
+        return 1.0;
+    }
+    recompute();
+    return m_slope;
+}
+
 int64_t DriftEstimator::offsetNs() const {
     if (!locked()) {
         return 0;

@@ -27,9 +27,12 @@ private slots:
     void nativeRtmpVideoBindsToSharedAnchorWhenAudioArrivesFirst();
     void nativeRtmpAudioFollowsVideoReanchorWithoutDrift();
     void nativeRtmpAudioDiscontinuityKeepsSharedAnchor();
+    void nativeRtmpAllowsNegativeCompositionTimeAfterAnchor();
+    void nativeRtmpCanUseExternallyOwnedClockAcrossSessions();
 #endif
     void sharedAnchorMapsStreamTime();
     void srtAnchorMapPureCases();
+    void nativeSrtUnwrapsThirtyThreeBitTimestampWrap();
 };
 
 void TestIngestBackendSelector::srtRoutesToNativeSrt() {
@@ -220,6 +223,37 @@ void TestIngestBackendSelector::nativeRtmpAudioDiscontinuityKeepsSharedAnchor() 
     // audio packet still maps against it.
     QCOMPARE(session.sourcePtsMsForAudio(5040), int64_t(14040));
 }
+
+void TestIngestBackendSelector::nativeRtmpAllowsNegativeCompositionTimeAfterAnchor() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    int64_t clockMs = 1000;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    QCOMPARE(session.sourcePtsMsForVideo(0, -20), int64_t(980));
+    QCOMPARE(session.sourcePtsMsForVideo(40, 20), int64_t(1020));
+}
+
+void TestIngestBackendSelector::nativeRtmpCanUseExternallyOwnedClockAcrossSessions() {
+    AnchoredSourceClock sharedClock(ClockQuality::FlvPll);
+
+    int64_t clockMs = 5000;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+
+    {
+        NativeRtmpIngestSession first(0, 640, 480, nullptr, &sharedClock);
+        first.m_callbacks = callbacks;
+        QCOMPARE(first.sourcePtsMsForVideo(1000, 1000), int64_t(5000));
+    }
+
+    clockMs = 99999;
+    NativeRtmpIngestSession second(0, 640, 480, nullptr, &sharedClock);
+    second.m_callbacks = callbacks;
+    QCOMPARE(second.sourcePtsMsForVideo(1100, 1100), int64_t(5100));
+}
 #endif
 
 void TestIngestBackendSelector::sharedAnchorMapsStreamTime() {
@@ -238,6 +272,20 @@ void TestIngestBackendSelector::srtAnchorMapPureCases() {
     QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(-1, 90000, 5000), -1);
     QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(180000, -1, 5000), -1);
     QCOMPARE(NativeSrtIngestSession::sourcePtsMsFromAnchor(180000, 90000, -1), -1);
+}
+
+void TestIngestBackendSelector::nativeSrtUnwrapsThirtyThreeBitTimestampWrap() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+    constexpr int64_t wrap90k = 1LL << 33;
+
+    int64_t clockMs = 1000;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    QCOMPARE(session.sourcePtsMsForAudio(wrap90k - 90), int64_t(1000));
+    clockMs = 99999;
+    QCOMPARE(session.sourcePtsMsForAudio(90), int64_t(1002));
 }
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)

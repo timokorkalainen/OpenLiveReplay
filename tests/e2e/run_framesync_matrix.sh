@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Broadcast frame-sync matrix: {lipsync, intercam, drift, timecode} x
+# Broadcast frame-sync matrix: {lipsync, intercam, drift, drift_skew, timecode} x
 # {srt, rtmp, ndi}. SRT is live now; RTMP/NDI cells are explicit SKIPs until
 # their transport fixtures are wired into run_framesync_e2e.sh.
 #
@@ -22,31 +22,40 @@ run_cell() {
     local transport="$1" scenario="$2" port="$3" log="$4"
     local label="${transport}/${scenario}"
     printf '\n======== %-18s start %s  (%ss/cell) ========\n' "$label" "$(date '+%H:%M:%S')" "$SECS"
-    local started ended elapsed rc lastline result
+    local started ended elapsed rc statusline reportline result
     started=$(date +%s)
-    env OLR_FRAMESYNC_TRANSPORT="$transport" OLR_FRAMESYNC_SECS="$SECS" \
-        bash "$HERE/run_framesync_e2e.sh" "$HARNESS" "$scenario" "$port" >"$log" 2>&1
+    if [ "$scenario" = "drift_skew" ]; then
+        env OLR_FRAMESYNC_TRANSPORT="$transport" OLR_FRAMESYNC_SECS="$SECS" \
+            OLR_FRAMESYNC_SKEW_PPM="${OLR_FRAMESYNC_SKEW_PPM:-200}" \
+            bash "$HERE/run_framesync_e2e.sh" "$HARNESS" "$scenario" "$port" >"$log" 2>&1
+    else
+        env OLR_FRAMESYNC_TRANSPORT="$transport" OLR_FRAMESYNC_SECS="$SECS" \
+            bash "$HERE/run_framesync_e2e.sh" "$HARNESS" "$scenario" "$port" >"$log" 2>&1
+    fi
     rc=$?
     ended=$(date +%s)
     elapsed=$((ended - started))
-    lastline="$(grep -E '^(PASS|FAIL|SKIP|REPORT)' "$log" | tail -n1)"
-    [ -n "$lastline" ] || lastline="$(tail -n1 "$log" 2>/dev/null)"
+    statusline="$(grep -E '^(PASS|FAIL|SKIP)' "$log" | tail -n1)"
+    reportline="$(grep -E '^REPORT' "$log" | tail -n1)"
+    [ -n "$statusline" ] || statusline="$(tail -n1 "$log" 2>/dev/null)"
+    [ -n "$reportline" ] || reportline="no report"
     case "$rc" in
     0) result="PASS" ;;
     77) result="SKIP" ;;
     *) result="FAIL" ;;
     esac
     printf '======== %-18s %s in %ss (rc=%s) ========\n  %s\n' \
-        "$label" "$result" "$elapsed" "$rc" "$lastline"
-    RESULTS+=("${label}|${result}|${elapsed}|${lastline}")
+        "$label" "$result" "$elapsed" "$rc" "$statusline"
+    RESULTS+=("${label}|${result}|${elapsed}|${reportline}|${statusline}")
 }
 
-echo "Frame-sync matrix: 12 cells x ${SECS}s. base port ${BASE}, start $(date '+%Y-%m-%d %H:%M:%S')."
+SCENARIOS=(lipsync intercam drift drift_skew timecode)
+echo "Frame-sync matrix: $((3 * ${#SCENARIOS[@]})) cells x ${SECS}s. base port ${BASE}, start $(date '+%Y-%m-%d %H:%M:%S')."
 echo "sync_harness=$HARNESS"
 
 idx=0
 for transport in srt rtmp ndi; do
-    for scenario in lipsync intercam drift timecode; do
+    for scenario in "${SCENARIOS[@]}"; do
         port=$((BASE + idx * 10))
         run_cell "$transport" "$scenario" "$port" "$OUTDIR/${transport}_${scenario}.log"
         idx=$((idx + 1))
@@ -57,8 +66,8 @@ echo
 echo "================ FRAMESYNC MATRIX SUMMARY (${SECS}s/cell) ================"
 fails=0
 for r in "${RESULTS[@]}"; do
-    IFS='|' read -r label result elapsed line <<<"$r"
-    printf '  %-18s %-4s  %5ss | %s\n' "$label" "$result" "$elapsed" "$line"
+    IFS='|' read -r label result elapsed reportline statusline <<<"$r"
+    printf '  %-18s %-4s  %5ss | %s | %s\n' "$label" "$result" "$elapsed" "$reportline" "$statusline"
     [ "$result" = "FAIL" ] && fails=$((fails + 1))
 done
 echo "======================================================================="

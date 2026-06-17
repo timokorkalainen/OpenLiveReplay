@@ -26,6 +26,8 @@ class NativeRtmpIngestSession final : public IngestSession {
 public:
     NativeRtmpIngestSession(int sourceIndex, int outputWidth, int outputHeight,
                             std::atomic<bool>* captureRunning);
+    NativeRtmpIngestSession(int sourceIndex, int outputWidth, int outputHeight,
+                            std::atomic<bool>* captureRunning, AnchoredSourceClock* sourceClock);
     ~NativeRtmpIngestSession() override;
 
     static bool supportsUrl(const QUrl& url);
@@ -54,7 +56,9 @@ private:
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
     int m_outputChunkSize = 128;
     int m_streamId = 1;
-    AnchoredSourceClock m_clock{ClockQuality::FlvPll};
+    AnchoredSourceClock m_ownedClock{ClockQuality::FlvPll};
+    AnchoredSourceClock* m_clock = &m_ownedClock;
+    bool m_externalClock = false;
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastKeyframeAtMs = -1;

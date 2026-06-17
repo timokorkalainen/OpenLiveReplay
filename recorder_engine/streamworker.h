@@ -18,6 +18,7 @@
 #include "recordingclock.h"
 #include "muxer.h"
 #include "ingest/ingestsession.h"
+#include "timing/sourceclock.h"
 
 extern "C" {
     #include <libavformat/avformat.h>
@@ -144,8 +145,12 @@ private:
     // Per-source jitter window (ms), chosen by transport in captureLoop and read by
     // the tick thread. Defaults to kJitterBufferMs until the URL is resolved.
     std::atomic<int> m_activeJitterWindowMs{kJitterBufferMs};
-    std::atomic<int> m_currentSourcePpmMilli{0};
     int m_connectBackoffMs = 1000;
+    AnchoredSourceClock m_srtSourceClock{ClockQuality::Pcr, 90};
+    AnchoredSourceClock m_rtmpSourceClock{ClockQuality::FlvPll};
+    AnchoredSourceClock m_ndiSourceClock{ClockQuality::Ndi, 10000};
+    QString m_clockOwnerUrl;
+    IngestBackendKind m_clockOwnerBackend = IngestBackendKind::Unsupported;
     // Atomically update m_connected and emit connectionChanged on a real
     // transition (false<->true). Called from the capture thread.
     void setConnected(bool c);
@@ -165,10 +170,8 @@ private:
     int64_t m_audioSourceCursor = -1;     // next source-timeline sample to consume
     int64_t m_audioServoTrimSamples = 0;
     int64_t m_audioServoJitterSamples = 0;
-    double m_audioServoFraction = 0.0;
     void enqueueAudio(int64_t startSample, const uint8_t* data, int numSamples);
-    void writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs, int64_t jitterMs,
-                           double sourcePpm);
+    void writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs, int64_t jitterMs);
 
     int m_targetWidth = 1920;
     int m_targetHeight = 1080;

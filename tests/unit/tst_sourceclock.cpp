@@ -16,6 +16,9 @@ private slots:
     void followerDoesNotPollutePpm();
     void rateSampleDoesNotReanchor();
     void measuresPpm();
+    void ppmCorrectsSenderToSessionMapping();
+    void reanchorClearsOldDriftSamples();
+    void mappedPtsMayBeNegativeAfterAnchor();
     void preserves90kAnchorMath();
 };
 
@@ -80,6 +83,38 @@ void TestSourceClock::measuresPpm() {
         clock.observe(senderMs, sessionMs, false);
     }
     QVERIFY(std::abs(clock.ppm() - 200.0) < 5.0);
+}
+
+void TestSourceClock::ppmCorrectsSenderToSessionMapping() {
+    AnchoredSourceClock clock(ClockQuality::FlvPll);
+    for (int i = 0; i < 300; ++i) {
+        const int64_t sessionMs = int64_t(i) * 1000;
+        const int64_t senderMs = int64_t(std::llround(double(i) * 1000.0 * 1.0002));
+        clock.observe(senderMs, sessionMs, false);
+    }
+
+    const int64_t senderAtTenMinutes = int64_t(std::llround(600000.0 * 1.0002));
+    QCOMPARE(clock.toSessionMs(senderAtTenMinutes), int64_t(600000));
+}
+
+void TestSourceClock::reanchorClearsOldDriftSamples() {
+    AnchoredSourceClock clock(ClockQuality::FlvPll);
+    for (int i = 0; i < 300; ++i) {
+        const int64_t sessionMs = int64_t(i) * 1000;
+        const int64_t senderMs = int64_t(std::llround(double(i) * 1000.0 * 1.0002));
+        clock.observe(senderMs, sessionMs, false);
+    }
+    QVERIFY(std::abs(clock.ppm() - 200.0) < 5.0);
+
+    clock.observe(9000000, 400000, false);
+    QCOMPARE(clock.toSessionMs(9000000), int64_t(400000));
+    QCOMPARE(clock.ppm(), 0.0);
+}
+
+void TestSourceClock::mappedPtsMayBeNegativeAfterAnchor() {
+    AnchoredSourceClock clock(ClockQuality::FlvPll);
+    clock.observe(0, 1000, false);
+    QCOMPARE(clock.toSessionMs(-20), int64_t(980));
 }
 
 void TestSourceClock::preserves90kAnchorMath() {

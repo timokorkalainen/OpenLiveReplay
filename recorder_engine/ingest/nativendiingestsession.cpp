@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -18,6 +19,7 @@ namespace {
 
 constexpr int kCaptureTimeoutMs = 100;
 constexpr qint64 kNdiTimecodeSynthesize = std::numeric_limits<qint64>::max();
+constexpr int kNdiRecvColorFastest = 100;
 
 struct NDIlib_source_t {
     const char* p_ndi_name = nullptr;
@@ -25,7 +27,7 @@ struct NDIlib_source_t {
 };
 
 struct NDIlib_recv_create_v3_t {
-    const NDIlib_source_t* source_to_connect_to = nullptr;
+    NDIlib_source_t source_to_connect_to;
     int color_format = 0;
     int bandwidth = 0;
     bool allow_video_fields = false;
@@ -93,6 +95,40 @@ using NDIlib_recv_free_video_v2_fn = void (*)(NDIlib_recv_instance_t,
 using NDIlib_recv_free_audio_v3_fn = void (*)(NDIlib_recv_instance_t,
                                               const NDIlib_audio_frame_v3_t*);
 
+QStringList ndiRuntimeLibraryCandidates() {
+    QStringList candidates;
+    const QByteArray explicitPath = qgetenv("OLR_NDI_RUNTIME_LIBRARY");
+    if (!explicitPath.isEmpty()) candidates.append(QString::fromLocal8Bit(explicitPath));
+#if defined(Q_OS_WIN)
+    const QString runtimeDir = QString::fromLocal8Bit(qgetenv("NDI_RUNTIME_DIR_V6"));
+    if (!runtimeDir.isEmpty())
+        candidates.append(QDir(runtimeDir).filePath(QStringLiteral("Processing.NDI.Lib.x64.dll")));
+    candidates.append(QStringLiteral("Processing.NDI.Lib.x64.dll"));
+#elif defined(Q_OS_MACOS)
+    candidates.append(QStringLiteral("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib"));
+    candidates.append(QStringLiteral("/usr/local/lib/libndi.dylib"));
+    candidates.append(QStringLiteral("libndi.dylib"));
+#else
+    candidates.append(QStringLiteral("libndi.so"));
+#endif
+    candidates.removeDuplicates();
+    return candidates;
+}
+
+int selectDiscoveredSourceIndex(const QStringList& discovered, const QString& wanted) {
+    for (int i = 0; i < discovered.size(); ++i) {
+        if (discovered.at(i) == wanted) {
+            return i;
+        }
+    }
+    for (int i = 0; i < discovered.size(); ++i) {
+        if (discovered.at(i).contains(wanted, Qt::CaseInsensitive)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 class NdiDynamicReceiverBackend final : public INdiReceiverBackend {
 public:
     ~NdiDynamicReceiverBackend() override {
@@ -123,23 +159,21 @@ public:
                                             : nullptr;
         QByteArray wanted = sourceName.toUtf8();
         NDIlib_source_t selected;
-        bool found = false;
+        QStringList discovered;
         for (uint32_t i = 0; sources && i < count; ++i) {
-            const QString name = QString::fromUtf8(sources[i].p_ndi_name);
-            if (name == sourceName || name.contains(sourceName, Qt::CaseInsensitive)) {
-                selected = sources[i];
-                found = true;
-                break;
-            }
+            discovered.append(QString::fromUtf8(sources[i].p_ndi_name ? sources[i].p_ndi_name : ""));
         }
-        if (!found) {
+        const int selectedIndex = selectDiscoveredSourceIndex(discovered, sourceName);
+        if (selectedIndex >= 0) {
+            selected = sources[selectedIndex];
+        } else {
             selected.p_ndi_name = wanted.constData();
             selected.p_url_address = nullptr;
         }
 
         NDIlib_recv_create_v3_t create;
-        create.source_to_connect_to = &selected;
-        create.color_format = 1; // fastest, typically UYVY video + FLTp audio
+        create.source_to_connect_to = selected;
+        create.color_format = kNdiRecvColorFastest;
         create.bandwidth = 0;
         create.allow_video_fields = false;
         m_receiver = m_recvCreate(&create);
@@ -206,22 +240,7 @@ private:
     bool ensureLoaded() {
         if (m_loaded) return true;
 
-        QStringList candidates;
-        const QByteArray explicitPath = qgetenv("OLR_NDI_RUNTIME_LIBRARY");
-        if (!explicitPath.isEmpty()) candidates.append(QString::fromLocal8Bit(explicitPath));
-#if defined(Q_OS_WIN)
-        const QString runtimeDir = QString::fromLocal8Bit(qgetenv("NDI_RUNTIME_DIR_V6"));
-        if (!runtimeDir.isEmpty())
-            candidates.append(
-                QDir(runtimeDir).filePath(QStringLiteral("Processing.NDI.Lib.x64.dll")));
-        candidates.append(QStringLiteral("Processing.NDI.Lib.x64.dll"));
-#elif defined(Q_OS_MACOS)
-        candidates.append(QStringLiteral("/usr/local/lib/libndi.dylib"));
-        candidates.append(QStringLiteral("libndi.dylib"));
-#else
-        candidates.append(QStringLiteral("libndi.so"));
-#endif
-        for (const QString& candidate : candidates) {
+        for (const QString& candidate : ndiRuntimeLibraryCandidates()) {
             m_library.setFileName(candidate);
             if (!m_library.load()) continue;
             if (resolveSymbols()) {
@@ -284,7 +303,17 @@ private:
 
 NativeNdiIngestSession::NativeNdiIngestSession(int sourceIndex, int outputWidth, int outputHeight,
                                                std::atomic<bool>* captureRunning)
-    : NativeNdiIngestSession(sourceIndex, outputWidth, outputHeight, captureRunning, nullptr) {
+    : NativeNdiIngestSession(sourceIndex, outputWidth, outputHeight, captureRunning, nullptr,
+                             nullptr) {
+    m_ownedBackend = std::make_unique<NdiDynamicReceiverBackend>();
+    m_backend = m_ownedBackend.get();
+}
+
+NativeNdiIngestSession::NativeNdiIngestSession(int sourceIndex, int outputWidth, int outputHeight,
+                                               std::atomic<bool>* captureRunning,
+                                               AnchoredSourceClock* sourceClock)
+    : NativeNdiIngestSession(sourceIndex, outputWidth, outputHeight, captureRunning, nullptr,
+                             sourceClock) {
     m_ownedBackend = std::make_unique<NdiDynamicReceiverBackend>();
     m_backend = m_ownedBackend.get();
 }
@@ -292,11 +321,21 @@ NativeNdiIngestSession::NativeNdiIngestSession(int sourceIndex, int outputWidth,
 NativeNdiIngestSession::NativeNdiIngestSession(int sourceIndex, int outputWidth, int outputHeight,
                                                std::atomic<bool>* captureRunning,
                                                INdiReceiverBackend* backend)
+    : NativeNdiIngestSession(sourceIndex, outputWidth, outputHeight, captureRunning, backend,
+                             nullptr) {}
+
+NativeNdiIngestSession::NativeNdiIngestSession(int sourceIndex, int outputWidth, int outputHeight,
+                                               std::atomic<bool>* captureRunning,
+                                               INdiReceiverBackend* backend,
+                                               AnchoredSourceClock* sourceClock)
     : m_outputWidth(outputWidth)
     , m_outputHeight(outputHeight)
     , m_captureRunning(captureRunning)
-    , m_backend(backend) {
+    , m_backend(backend)
+    , m_clock(sourceClock ? sourceClock : &m_ownedClock)
+    , m_externalClock(sourceClock != nullptr) {
     Q_UNUSED(sourceIndex);
+    m_monotonic.start();
 }
 
 NativeNdiIngestSession::~NativeNdiIngestSession() {
@@ -331,11 +370,29 @@ QString NativeNdiIngestSession::sourceNameFromUrl(const QUrl& url) {
     return QUrl::fromPercentEncoding(encoded).trimmed();
 }
 
+bool NativeNdiIngestSession::recvCreateSourceIsValueForTest() {
+    return std::is_same<decltype(NDIlib_recv_create_v3_t::source_to_connect_to),
+                        NDIlib_source_t>::value;
+}
+
+QStringList NativeNdiIngestSession::runtimeLibraryCandidatesForTest() {
+    return ndiRuntimeLibraryCandidates();
+}
+
+QString NativeNdiIngestSession::selectDiscoveredSourceForTest(const QStringList& discovered,
+                                                              const QString& wanted) {
+    const int index = selectDiscoveredSourceIndex(discovered, wanted);
+    return index >= 0 ? discovered.at(index) : QString();
+}
+
 bool NativeNdiIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
     m_callbacks = callbacks;
     m_stopRequested.store(false, std::memory_order_relaxed);
     m_lastFailureKind = IngestFailureKind::None;
-    m_clock.reset();
+    m_lastStatsAtMs = -1;
+    if (!m_externalClock) {
+        m_clock->reset();
+    }
     if (!m_backend || !m_backend->isRuntimeAvailable()) {
         m_lastFailureKind = IngestFailureKind::DecodeCapability;
         return false;
@@ -364,10 +421,13 @@ void NativeNdiIngestSession::run() {
             AVFrame* frame = ndiVideoToYuv420p(video, m_outputWidth, m_outputHeight, &m_sws);
             const int64_t sourcePtsMs =
                 mapTimestampMs(video.timestamp100ns, ClockObservationRole::Authority);
+            maybeReportStats();
             if (frame && sourcePtsMs >= 0 && m_callbacks.onVideoFrame) {
                 DecodedVideoFrame decoded;
                 decoded.frame = frame;
                 decoded.sourcePtsMs = sourcePtsMs;
+                decoded.sourceTimecode100ns =
+                    video.timecode100ns == kNdiTimecodeSynthesize ? -1 : video.timecode100ns;
                 m_callbacks.onVideoFrame(decoded);
             } else if (frame) {
                 av_frame_free(&frame);
@@ -377,9 +437,12 @@ void NativeNdiIngestSession::run() {
             const QByteArray pcm = ndiAudioToS16Stereo(audio);
             const int64_t sourcePtsMs =
                 mapTimestampMs(audio.timestamp100ns, ClockObservationRole::Follower);
+            maybeReportStats();
             if (!pcm.isEmpty() && sourcePtsMs >= 0 && m_callbacks.onAudioChunk) {
                 DecodedAudioChunk chunk;
                 chunk.startSample = sourcePtsMs * 48000 / 1000;
+                chunk.sourceTimecode100ns =
+                    audio.timecode100ns == kNdiTimecodeSynthesize ? -1 : audio.timecode100ns;
                 chunk.pcmS16Stereo = pcm;
                 m_callbacks.onAudioChunk(std::move(chunk));
             }
@@ -415,10 +478,29 @@ bool NativeNdiIngestSession::shouldStop() const {
 
 int64_t NativeNdiIngestSession::mapTimestampMs(int64_t timestamp100ns,
                                                ClockObservationRole role) {
-    if (timestamp100ns < 0) {
+    const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
+    if (timestamp100ns < 0 || timestamp100ns == std::numeric_limits<int64_t>::max()) {
+        return nowMs;
+    }
+    if (nowMs < 0) {
         return -1;
     }
-    const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
-    m_clock.observe(timestamp100ns, nowMs, false, role);
-    return m_clock.toSessionMs(timestamp100ns);
+    m_clock->observe(timestamp100ns, nowMs, false, role);
+    return m_clock->toSessionMs(timestamp100ns);
+}
+
+void NativeNdiIngestSession::maybeReportStats() {
+    if (!m_callbacks.reportStats) {
+        return;
+    }
+    const int64_t now = m_monotonic.isValid() ? m_monotonic.elapsed() : 0;
+    if (m_lastStatsAtMs >= 0 && now - m_lastStatsAtMs < 1000) {
+        return;
+    }
+    m_lastStatsAtMs = now;
+    IngestStats stats;
+    stats.kind = IngestStatsKind::Ndi;
+    stats.clockPpm = m_clock->ppm();
+    stats.clockQuality = int(m_clock->quality());
+    m_callbacks.reportStats(stats);
 }

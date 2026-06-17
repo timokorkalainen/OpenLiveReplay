@@ -130,12 +130,14 @@ add_test(NAME e2e_framesync_lipsync
     COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 24000)
 add_test(NAME e2e_framesync_drift
     COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" drift 24010)
+add_test(NAME e2e_framesync_drift_skew
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" drift_skew 24040)
 add_test(NAME e2e_framesync_intercam
     COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" intercam 24020)
 add_test(NAME e2e_framesync_timecode
     COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" timecode 24030)
 set_tests_properties(
-    e2e_framesync_lipsync e2e_framesync_drift
+    e2e_framesync_lipsync e2e_framesync_drift e2e_framesync_drift_skew
     e2e_framesync_intercam e2e_framesync_timecode
     PROPERTIES
     LABELS "framesync"
@@ -146,6 +148,8 @@ set_tests_properties(e2e_framesync_lipsync PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
 set_tests_properties(e2e_framesync_drift PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
+set_tests_properties(e2e_framesync_drift_skew PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_SKEW_PPM=200")
 
 # --- Local-only native SRT e2e (NOT in CI) ----------------------------------
 # Prove the real engine ingests srt:// over the native SRT path (the default,

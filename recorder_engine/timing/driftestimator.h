@@ -11,6 +11,7 @@ public:
     void addSample(int64_t senderNs, int64_t sessionNs);
     bool locked() const { return int(m_samples.size()) >= m_minSamples; }
     double ppm() const;
+    double slope() const;
     int64_t offsetNs() const;
     void reset();
 

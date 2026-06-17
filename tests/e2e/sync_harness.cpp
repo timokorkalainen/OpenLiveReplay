@@ -164,6 +164,9 @@ int main(int argc, char** argv) {
                             src, (unsigned long long) s.bytesTotal, (long long) s.lastPacketAgeMs,
                             (long long) s.keyframeAgeMs, (unsigned long long) s.decodeFailures,
                             s.clockPpm, s.clockQuality);
+                } else if (s.kind == IngestStatsKind::Ndi) {
+                    fprintf(stderr, "stats src=%d kind=ndi clockppm=%.3f clockq=%d\n", src,
+                            s.clockPpm, s.clockQuality);
                 } else {
                     fprintf(stderr,
                             "stats src=%d recv=%lld retrans=%lld loss=%lld drop=%lld "

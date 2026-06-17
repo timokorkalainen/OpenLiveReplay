@@ -4,7 +4,7 @@
 # gates when OLR_FRAMESYNC_GATE=1.
 #
 # Usage: run_framesync_e2e.sh <sync_harness> <scenario> <base_port>
-#   scenarios: lipsync | intercam | drift | timecode
+#   scenarios: lipsync | intercam | drift | drift_skew | timecode
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -106,24 +106,25 @@ run_intercam() {
     echo "REPORT: scenario=intercam flashes_paired=${np} flash_spread_ms_mean=${mean} flash_spread_ms_max=${max} common_tc=no"
     [ "${np:-0}" -ge 3 ] || fail "only ${np:-0} paired flashes"
     if gate_enabled; then
-        echo "PASS: intercam common-TC absent; bounded report only"
+        skip "intercam gate requires common timecode; current fixture is report-only"
     else
         echo "PASS: report emitted (framesync intercam, non-gating)"
     fi
 }
 
 run_drift() {
-    local udp="$BASE" srt=$((BASE + 1)) relay_port=$((BASE + 2)) relay_stats="$WORKDIR/relay.stats"
-    local mkv stats nf slope ppm slip_frames
-    flash_beep_tc_marker_to_udp "$udp"
+    local udp="$BASE" srt=$((BASE + 1))
+    local mkv stats nf slope ppm slip_frames av_stats avn av_mean av_max av_delta_ms av_delta_frames av_reg_ms av_reg_frames
+    local harness_err="$WORKDIR/harness.err" clock_ppm
+    OLR_MARKER_SKEW_PPM="$SKEW_PPM" flash_beep_tc_marker_to_udp "$udp"
     srt_bridge "$udp" "$srt"
-    python3 "$RELAY" "$relay_port" "127.0.0.1:$srt" 0 "$relay_stats" 1234 0 "$SKEW_PPM" &
-    PIDS+=("$!")
     sleep 1.5
-    mkv="$(record_one "srt://127.0.0.1:${relay_port}?transtype=live" framesync_drift)"
+    mkv="$("$HARNESS" --url "$(srt_caller_url "$srt")" --outdir "$WORKDIR" \
+        --name framesync_drift --seconds "$SECS" --fps 30 --report-stats 2>"$harness_err" | tail -n1)"
     expect_mkv "$mkv"
 
     flash_pts_series "$mkv" 0 > "$WORKDIR/v.txt"
+    beep_pts_series "$mkv" 0 > "$WORKDIR/a.txt"
     stats="$(awk -v secs="$SECS" '
         { x=NR-1; y=$1; sx+=x; sy+=y; sxx+=x*x; sxy+=x*y; n++ }
         END {
@@ -135,12 +136,51 @@ run_drift() {
             } else printf "0 nan nan nan"
         }' "$WORKDIR/v.txt")"
     read -r nf slope ppm slip_frames <<<"$stats"
-    echo "REPORT: scenario=drift flashes=${nf} slope=${slope} drift_ppm=${ppm} slip_frames=${slip_frames} injected_ppm=${SKEW_PPM}"
+    av_stats="$(awk '
+        FNR==NR { f[++nf]=$1; next }
+        { b[++nb]=$1 }
+        END {
+            for (i=1;i<=nf;i++) { best=1e9; bj=-1;
+                for (j=1;j<=nb;j++) { dd=b[j]-f[i]; ad=(dd<0?-dd:dd); if(ad<best){best=ad;bj=j} }
+                if (bj>0 && best<=0.25) {
+                    d=(b[bj]-f[i])*1000; x=n; if(n==0) first=d; last=d; s+=d;
+                    sx+=x; sy+=d; sxx+=x*x; sxy+=x*d;
+                    am=(d<0?-d:d); if(am>mx)mx=am; n++;
+                }
+            }
+            if(n>0) {
+                drift=last-first; reg=drift;
+                denom=n*sxx-sx*sx;
+                if(n>=2 && denom != 0) {
+                    slope=(n*sxy-sx*sy)/denom;
+                    reg=slope*(n-1);
+                }
+                printf "%d %.1f %.1f %.1f %.3f %.1f %.3f", n, s/n, mx, drift, drift/33.333333, reg, reg/33.333333;
+            } else printf "0 nan nan nan nan nan nan"
+        }' "$WORKDIR/v.txt" "$WORKDIR/a.txt")"
+    read -r avn av_mean av_max av_delta_ms av_delta_frames av_reg_ms av_reg_frames <<<"$av_stats"
+    clock_ppm="$(awk '
+        /clockppm=/ {
+            for (i=1;i<=NF;i++) if ($i ~ /^clockppm=/) { split($i,a,"="); v=a[2] }
+        }
+        END { if (v == "") print "nan"; else print v }
+        ' "$harness_err")"
+    echo "REPORT: scenario=drift flashes=${nf} slope=${slope} drift_ppm=${ppm} slip_frames=${slip_frames} injected_ppm=${SKEW_PPM} recovered_clock_ppm=${clock_ppm} av_pairs=${avn} av_offset_ms_mean=${av_mean} av_offset_ms_max=${av_max} av_offset_delta_ms=${av_delta_ms} av_offset_delta_frames=${av_delta_frames} av_offset_regression_ms=${av_reg_ms} av_offset_regression_frames=${av_reg_frames}"
     [ "${nf:-0}" -ge 3 ] || fail "only ${nf:-0} flashes"
+    [ "${avn:-0}" -ge 3 ] || fail "only ${avn:-0} A/V pairs"
+    if awk -v injected="$SKEW_PPM" 'BEGIN{if(injected<0)injected=-injected; exit !(injected > 0)}'; then
+        awk -v c="$clock_ppm" -v injected="$SKEW_PPM" '
+            BEGIN {
+                if (c != c) exit 1;
+                if (c < 0) c = -c;
+                if (injected < 0) injected = -injected;
+                exit !(c >= injected * 0.25);
+            }' || fail "nonzero injected skew ${SKEW_PPM}ppm did not produce recovered clockppm=${clock_ppm}"
+    fi
     if gate_enabled; then
-        awk -v s="$slip_frames" 'BEGIN{if(s<0)s=-s; exit !(s < 1.0)}' \
-            || fail "drift slip ${slip_frames} frames exceeds <1 frame gate"
-        echo "PASS: framesync drift slip ${slip_frames} frames within gate"
+        awk -v s="$av_reg_frames" 'BEGIN{if(s<0)s=-s; exit !(s < 1.0)}' \
+            || fail "A/V offset regression drift ${av_reg_frames} frames exceeds <1 frame gate"
+        echo "PASS: framesync A/V regression drift ${av_reg_frames} frames within gate"
     else
         echo "PASS: report emitted (framesync drift, non-gating)"
     fi
@@ -174,6 +214,7 @@ case "$SCENARIO" in
     lipsync) run_lipsync ;;
     intercam) run_intercam ;;
     drift) run_drift ;;
+    drift_skew) SKEW_PPM="${OLR_FRAMESYNC_SKEW_PPM:-200}"; run_drift ;;
     timecode) run_timecode ;;
     *) fail "unknown scenario '$SCENARIO'" ;;
 esac

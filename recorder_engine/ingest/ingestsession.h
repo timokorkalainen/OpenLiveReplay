@@ -38,10 +38,12 @@ struct IngestBackendOptions {
 struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
     int64_t sourcePtsMs = 0;
+    int64_t sourceTimecode100ns = -1;
 };
 
 struct DecodedAudioChunk {
     int64_t startSample = -1;
+    int64_t sourceTimecode100ns = -1;
     QByteArray pcmS16Stereo;
 };
 
@@ -49,7 +51,7 @@ constexpr int kDecodedAudioBytesPerSample = 2 * int(sizeof(int16_t));
 
 // Which backend produced this snapshot — selects the health grader. SRT fills the
 // loss-domain counters; RTMP (TCP, no loss) fills the liveness/throughput fields.
-enum class IngestStatsKind { Unknown = 0, Srt, Rtmp };
+enum class IngestStatsKind { Unknown = 0, Srt, Rtmp, Ndi };
 
 // Per-source ingest stats sampled ~1/sec and pushed to the UI via
 // IngestCallbacks::reportStats. Tagged by kind; each backend fills its own fields
