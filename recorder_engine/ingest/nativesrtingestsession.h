@@ -1,7 +1,7 @@
 #ifndef NATIVESRTINGESTSESSION_H
 #define NATIVESRTINGESTSESSION_H
 
-#include "audiotoolboxaacdecoder.h"
+#include "nativeaacdecoder.h"
 #include "h26xaccessunit.h"
 #include "ingestsession.h"
 #include "mpegtsparser.h"
@@ -48,7 +48,7 @@ private:
     NativeVideoCodec m_activeCodec = NativeVideoCodec::Unknown;
     std::unique_ptr<H26xAccessUnitSplitter> m_splitter;
     std::unique_ptr<NativeVideoDecoder> m_decoder;
-    std::unique_ptr<AudioToolboxAacDecoder> m_audioDecoder;
+    std::unique_ptr<NativeAacDecoder> m_audioDecoder;
     QByteArray m_tsBuffer;
     QByteArray m_audioRemainder;
     QString m_nativeFallbackReason;

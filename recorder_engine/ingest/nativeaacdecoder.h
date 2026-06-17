@@ -1,5 +1,5 @@
-#ifndef AUDIOTOOLBOXAACDECODER_H
-#define AUDIOTOOLBOXAACDECODER_H
+#ifndef NATIVEAACDECODER_H
+#define NATIVEAACDECODER_H
 
 #include <QByteArray>
 #include <QString>
@@ -13,13 +13,14 @@ struct AacAdtsFrameInfo {
     int audioObjectType = 0;
 };
 
-class AudioToolboxAacDecoder {
+// Native AAC (ADTS) decoder: AudioToolbox on Apple, Media Foundation on Windows, stub elsewhere.
+class NativeAacDecoder {
 public:
-    AudioToolboxAacDecoder();
-    ~AudioToolboxAacDecoder();
+    NativeAacDecoder();
+    ~NativeAacDecoder();
 
-    AudioToolboxAacDecoder(const AudioToolboxAacDecoder&) = delete;
-    AudioToolboxAacDecoder& operator=(const AudioToolboxAacDecoder&) = delete;
+    NativeAacDecoder(const NativeAacDecoder&) = delete;
+    NativeAacDecoder& operator=(const NativeAacDecoder&) = delete;
 
     static bool parseAdtsFrame(const QByteArray& bytes, int offset, AacAdtsFrameInfo* info);
     static bool hasAdtsSync(const QByteArray& bytes, int offset);
@@ -34,4 +35,4 @@ private:
     Impl* m_impl = nullptr;
 };
 
-#endif // AUDIOTOOLBOXAACDECODER_H
+#endif // NATIVEAACDECODER_H

@@ -1,4 +1,4 @@
-#include "audiotoolboxaacdecoder.h"
+#include "nativeaacdecoder.h"
 
 #ifdef __APPLE__
 
@@ -102,7 +102,7 @@ AudioStreamBasicDescription outputDescription()
 
 } // namespace
 
-class AudioToolboxAacDecoder::Impl {
+class NativeAacDecoder::Impl {
 public:
     ~Impl() { reset(); }
 
@@ -119,7 +119,7 @@ private:
     bool ensureConverter(const AacAdtsFrameInfo& info, QString* error);
 };
 
-bool AudioToolboxAacDecoder::Impl::ensureConverter(const AacAdtsFrameInfo& info, QString* error)
+bool NativeAacDecoder::Impl::ensureConverter(const AacAdtsFrameInfo& info, QString* error)
 {
     if (converter && sampleRate == info.sampleRate && channelCount == info.channelCount
         && audioObjectType == info.audioObjectType) {
@@ -145,7 +145,7 @@ bool AudioToolboxAacDecoder::Impl::ensureConverter(const AacAdtsFrameInfo& info,
     return true;
 }
 
-bool AudioToolboxAacDecoder::Impl::decodeAdtsFrame(const QByteArray& frame,
+bool NativeAacDecoder::Impl::decodeAdtsFrame(const QByteArray& frame,
                                                    const AacAdtsFrameInfo& info,
                                                    QByteArray* pcmS16Stereo, QString* error)
 {
@@ -207,7 +207,7 @@ bool AudioToolboxAacDecoder::Impl::decodeAdtsFrame(const QByteArray& frame,
     return true;
 }
 
-void AudioToolboxAacDecoder::Impl::reset()
+void NativeAacDecoder::Impl::reset()
 {
     if (converter) {
         AudioConverterDispose(converter);
@@ -218,17 +218,17 @@ void AudioToolboxAacDecoder::Impl::reset()
     audioObjectType = 0;
 }
 
-AudioToolboxAacDecoder::AudioToolboxAacDecoder()
+NativeAacDecoder::NativeAacDecoder()
     : m_impl(new Impl)
 {
 }
 
-AudioToolboxAacDecoder::~AudioToolboxAacDecoder()
+NativeAacDecoder::~NativeAacDecoder()
 {
     delete m_impl;
 }
 
-bool AudioToolboxAacDecoder::parseAdtsFrame(const QByteArray& bytes, int offset,
+bool NativeAacDecoder::parseAdtsFrame(const QByteArray& bytes, int offset,
                                             AacAdtsFrameInfo* info)
 {
     if (!hasAdtsSync(bytes, offset) || offset + 7 > bytes.size()) {
@@ -263,28 +263,28 @@ bool AudioToolboxAacDecoder::parseAdtsFrame(const QByteArray& bytes, int offset,
     return true;
 }
 
-bool AudioToolboxAacDecoder::hasAdtsSync(const QByteArray& bytes, int offset)
+bool NativeAacDecoder::hasAdtsSync(const QByteArray& bytes, int offset)
 {
     return offset >= 0 && offset + 2 <= bytes.size()
         && byteAt(bytes, offset) == 0xff
         && (byteAt(bytes, offset + 1) & 0xf6) == 0xf0;
 }
 
-bool AudioToolboxAacDecoder::hasLatmLoasSync(const QByteArray& bytes, int offset)
+bool NativeAacDecoder::hasLatmLoasSync(const QByteArray& bytes, int offset)
 {
     return offset >= 0 && offset + 2 <= bytes.size()
         && byteAt(bytes, offset) == 0x56
         && (byteAt(bytes, offset + 1) & 0xe0) == 0xe0;
 }
 
-bool AudioToolboxAacDecoder::decodeAdtsFrame(const QByteArray& frame,
+bool NativeAacDecoder::decodeAdtsFrame(const QByteArray& frame,
                                              const AacAdtsFrameInfo& info,
                                              QByteArray* pcmS16Stereo, QString* error)
 {
     return m_impl && m_impl->decodeAdtsFrame(frame, info, pcmS16Stereo, error);
 }
 
-void AudioToolboxAacDecoder::reset()
+void NativeAacDecoder::reset()
 {
     if (m_impl) {
         m_impl->reset();

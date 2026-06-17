@@ -124,11 +124,15 @@ endif()
 
 if(APPLE)
     target_sources(olr_test_core PRIVATE
-        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/audiotoolboxaacdecoder.mm")
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm")
     target_link_libraries(olr_test_core PRIVATE "-framework AudioToolbox")
+elseif(WIN32)
+    target_sources(olr_test_core PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp")
+    target_link_libraries(olr_test_core PRIVATE mfplat mf mfuuid ole32)
 else()
     target_sources(olr_test_core PRIVATE
-        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/audiotoolboxaacdecoder_stub.cpp")
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeaacdecoder_stub.cpp")
 endif()
 
 # --- Engine sources that DO need FFmpeg (muxer / capture / recording) -------

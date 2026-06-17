@@ -1,7 +1,7 @@
 #ifndef NATIVERTMPINGESTSESSION_H
 #define NATIVERTMPINGESTSESSION_H
 
-#include "audiotoolboxaacdecoder.h"
+#include "nativeaacdecoder.h"
 #include "h26xaccessunit.h"
 #include "ingestsession.h"
 #include "nativevideodecoder.h"
@@ -46,7 +46,7 @@ private:
     QElapsedTimer m_monotonic;
     std::unique_ptr<QTcpSocket> m_socket;
     std::unique_ptr<NativeVideoDecoder> m_videoDecoder;
-    std::unique_ptr<AudioToolboxAacDecoder> m_audioDecoder;
+    std::unique_ptr<NativeAacDecoder> m_audioDecoder;
     RtmpAvcConfig m_avcConfig;
     RtmpHevcConfig m_hevcConfig;
     RtmpAacConfig m_aacConfig;

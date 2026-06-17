@@ -91,7 +91,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
-        recorder_engine/ingest/audiotoolboxaacdecoder.h
+        recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
         recorder_engine/ingest/nativevideodecoder.h
         recorder_engine/ingest/nativesrtaddress.h recorder_engine/ingest/nativesrtaddress.cpp
@@ -248,7 +248,7 @@ if(APPLE)
         recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
-        recorder_engine/ingest/audiotoolboxaacdecoder.mm)
+        recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -262,7 +262,7 @@ elseif(WIN32)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp
         recorder_engine/ingest/nativesrtingestsession.cpp
-        recorder_engine/ingest/audiotoolboxaacdecoder_stub.cpp)
+        recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE OLR_NATIVE_SRT_AVAILABLE=1)
     target_include_directories(OpenLiveReplay PRIVATE
         "${OLR_FFMPEG_INCLUDE}"
@@ -275,7 +275,9 @@ elseif(WIN32)
         "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
         mfplat mf mfuuid d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
 elseif(NOT WIN32)
-    target_sources(OpenLiveReplay PRIVATE recorder_engine/ingest/nativevideodecoder_stub.cpp)
+    target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/ingest/nativevideodecoder_stub.cpp
+        recorder_engine/ingest/nativeaacdecoder_stub.cpp)
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)

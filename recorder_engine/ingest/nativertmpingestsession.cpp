@@ -975,7 +975,7 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
     frame.append(aacPayload);
 
     AacAdtsFrameInfo info;
-    if (!AudioToolboxAacDecoder::parseAdtsFrame(frame, 0, &info)) {
+    if (!NativeAacDecoder::parseAdtsFrame(frame, 0, &info)) {
         return;
     }
     const int64_t sourcePtsMs = sourcePtsMsForAudio(timestampMs);
@@ -983,7 +983,7 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
         return;
     }
     if (!m_audioDecoder) {
-        m_audioDecoder = std::make_unique<AudioToolboxAacDecoder>();
+        m_audioDecoder = std::make_unique<NativeAacDecoder>();
     }
     // RTMP carries raw AAC frames with a separate AudioSpecificConfig. Wrapping
     // each frame as ADTS and using a fresh converter avoids stale packet state.
