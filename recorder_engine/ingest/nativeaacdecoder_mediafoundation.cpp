@@ -18,6 +18,9 @@
 #include <mfobjects.h>
 #include <mftransform.h>
 #include <objbase.h>
+// MinGW's mfuuid import library does not export CLSID_CMSAACDecMFT, so instantiate
+// wmcodecdsp.h's DEFINE_GUID declarations in this translation unit.
+#include <initguid.h>
 #include <vector>
 #include <wmcodecdsp.h>
 #include <wrl/client.h>
