@@ -87,7 +87,7 @@ signals:
     void sourceConnectionChanged(int sourceIndex, bool connected);
 
     // Relayed from each StreamWorker ~1/sec with that source's latest SRT stats.
-    void sourceStatsUpdated(int sourceIndex, SrtStats stats);
+    void sourceStatsUpdated(int sourceIndex, IngestStats stats);
 
     // Emitted after a per-feed telemetry packet has been stamped and written.
     void telemetryRecorded(const QString &feedId, const QJsonObject &payload, qint64 effectiveMs);

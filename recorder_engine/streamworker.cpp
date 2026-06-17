@@ -37,7 +37,7 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
                            int targetWidth, int targetHeight, int targetFps, QObject* parent)
     : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
       m_sharedClock(clock) {
-    qRegisterMetaType<SrtStats>("SrtStats");
+    qRegisterMetaType<IngestStats>("IngestStats");
     m_restartCapture = 0;
     m_internalFrameCount = 0;
     m_monotonic.start();
@@ -334,7 +334,7 @@ void StreamWorker::captureLoop() {
                          chunk.pcmS16Stereo.size() / kAudioBytesPerSample);
         };
         callbacks.setConnected = [this](bool connected) { setConnected(connected); };
-        callbacks.reportStats = [this](const SrtStats& stats) {
+        callbacks.reportStats = [this](const IngestStats& stats) {
             emit statsUpdated(m_sourceIndex, stats);
         };
 

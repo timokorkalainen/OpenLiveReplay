@@ -1377,7 +1377,7 @@ ApplicationWindow {
                                           : (!connDot.connected
                                              ? "No signal"
                                              : (appWindow.uiManagerRef.sourceStatsVersion >= 0
-                                                && appWindow.uiManagerRef.sourceHasSrtStats(streamRow.index)
+                                                && appWindow.uiManagerRef.sourceHasStats(streamRow.index)
                                                 ? appWindow.uiManagerRef.sourceStatsTooltip(streamRow.index)
                                                 : "Connected"))
                         }

@@ -190,7 +190,8 @@ void NativeSrtIngestSession::run() {
                     m_statDropTotal = perf.pktRcvDropTotal;
                     m_statRecvTotal = perf.pktRecvTotal;
                     if (m_callbacks.reportStats) {
-                        SrtStats stats;
+                        IngestStats stats;
+                        stats.kind = IngestStatsKind::Srt;
                         stats.recvTotal = perf.pktRecvTotal;
                         stats.retransTotal = perf.pktRcvRetrans;
                         stats.lossTotal = perf.pktRcvLossTotal;

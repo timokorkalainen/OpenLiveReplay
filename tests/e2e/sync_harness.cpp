@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
     //    real up->down->up sequence.
     QSet<int> connectedSources;
     QHash<int, QVector<QPair<qint64, bool>>> connEvents;
-    QHash<int, SrtStats> latestStats;
+    QHash<int, IngestStats> latestStats;
     QElapsedTimer connTimer;
     connTimer.start();
     QObject::connect(&rm, &ReplayManager::sourceConnectionChanged, &app,
@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
                          connEvents[sourceIndex].append(qMakePair(connTimer.elapsed(), connected));
                      });
     QObject::connect(&rm, &ReplayManager::sourceStatsUpdated, &app,
-                     [&latestStats](int sourceIndex, SrtStats stats) {
+                     [&latestStats](int sourceIndex, IngestStats stats) {
                          latestStats.insert(sourceIndex, stats);
                      });
 
@@ -156,10 +156,18 @@ int main(int argc, char** argv) {
             QList<int> srcs = latestStats.keys();
             std::sort(srcs.begin(), srcs.end());
             for (int src : srcs) {
-                const SrtStats& s = latestStats.value(src);
-                fprintf(stderr, "stats src=%d recv=%lld retrans=%lld loss=%lld drop=%lld\n", src,
-                        (long long) s.recvTotal, (long long) s.retransTotal,
-                        (long long) s.lossTotal, (long long) s.dropTotal);
+                const IngestStats& s = latestStats.value(src);
+                if (s.kind == IngestStatsKind::Rtmp) {
+                    fprintf(stderr,
+                            "stats src=%d kind=rtmp bytes=%llu lastpktage=%lld keyframeage=%lld "
+                            "decodefail=%llu\n",
+                            src, (unsigned long long) s.bytesTotal, (long long) s.lastPacketAgeMs,
+                            (long long) s.keyframeAgeMs, (unsigned long long) s.decodeFailures);
+                } else {
+                    fprintf(stderr, "stats src=%d recv=%lld retrans=%lld loss=%lld drop=%lld\n",
+                            src, (long long) s.recvTotal, (long long) s.retransTotal,
+                            (long long) s.lossTotal, (long long) s.dropTotal);
+                }
             }
             fflush(stderr);
         }

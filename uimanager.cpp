@@ -1009,23 +1009,25 @@ void UIManager::onSourceConnectionChanged(int sourceIndex, bool connected) {
         // so a redundant connected=true can never wipe a healthy source's baseline.
         if (sourceIndex < int(m_sourceStats.size())) {
             m_sourceStats[sourceIndex].seen = false;
-            m_sourceStats[sourceIndex].health = int(SrtHealth::NA);
+            m_sourceStats[sourceIndex].health = int(SourceHealth::NA);
         }
     }
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
 }
 
-void UIManager::onSourceStatsUpdated(int sourceIndex, SrtStats stats) {
+void UIManager::onSourceStatsUpdated(int sourceIndex, IngestStats stats) {
     if (sourceIndex < 0) return;
     if (int(m_sourceStats.size()) <= sourceIndex) m_sourceStats.resize(sourceIndex + 1);
-    SrtStatsEntry& e = m_sourceStats[sourceIndex];
+    IngestStatsEntry& e = m_sourceStats[sourceIndex];
     if (!e.seen) {
         // First snapshot since (re)connect: establish the baseline, render Green.
         e.seen = true;
-        e.health = int(SrtHealth::Green);
+        e.health = int(SourceHealth::Green);
     } else {
-        e.health = int(srtHealth(e.last, stats, m_srtAmberPct));
+        e.health =
+            int(stats.kind == IngestStatsKind::Rtmp ? rtmpHealth(e.last, stats)
+                                                    : srtHealth(e.last, stats, m_srtAmberPct));
     }
     e.last = stats;
     m_sourceStatsVersion++;
@@ -1033,11 +1035,11 @@ void UIManager::onSourceStatsUpdated(int sourceIndex, SrtStats stats) {
 }
 
 int UIManager::sourceLinkHealth(int sourceIndex) const {
-    if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size())) return int(SrtHealth::NA);
+    if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size())) return int(SourceHealth::NA);
     return m_sourceStats[sourceIndex].health;
 }
 
-bool UIManager::sourceHasSrtStats(int sourceIndex) const {
+bool UIManager::sourceHasStats(int sourceIndex) const {
     if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size())) return false;
     return m_sourceStats[sourceIndex].seen;
 }
@@ -1047,8 +1049,13 @@ QString UIManager::sourceStatsTooltip(int sourceIndex) const {
         !m_sourceStats[sourceIndex].seen) {
         return QString();
     }
-    const SrtStats& s = m_sourceStats[sourceIndex].last;
+    const IngestStats& s = m_sourceStats[sourceIndex].last;
     const QLocale loc;
+    if (s.kind == IngestStatsKind::Rtmp) {
+        return QStringLiteral("RTMP link\nreceived   %1 bytes\nkeyframe   %2 ms ago\ndecode err %3")
+            .arg(loc.toString(qulonglong(s.bytesTotal)), loc.toString(qlonglong(s.keyframeAgeMs)),
+                 loc.toString(qulonglong(s.decodeFailures)));
+    }
     QString pct = QStringLiteral("0.0");
     if (s.recvTotal > 0)
         pct = QString::number(100.0 * double(s.retransTotal) / double(s.recvTotal), 'f', 1);
@@ -1058,7 +1065,7 @@ QString UIManager::sourceStatsTooltip(int sourceIndex) const {
 }
 
 void UIManager::resetSourceStats(int count) {
-    m_sourceStats.assign(count < 0 ? 0 : count, SrtStatsEntry{});
+    m_sourceStats.assign(count < 0 ? 0 : count, IngestStatsEntry{});
     m_sourceStatsVersion++;
     emit sourceStatsChanged();
 }
