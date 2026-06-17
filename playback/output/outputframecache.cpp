@@ -74,3 +74,10 @@ QByteArray OutputFrameCache::audioSpanOrSilence(int feedIndex, qint64 startSampl
     }
     return out;
 }
+
+void OutputFrameCache::clear() {
+    for (auto& frames : m_video)
+        frames.clear();
+    for (auto& frames : m_audio)
+        frames.clear();
+}

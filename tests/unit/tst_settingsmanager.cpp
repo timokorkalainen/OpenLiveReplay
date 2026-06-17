@@ -56,12 +56,25 @@ AppSettings TestSettingsManager::sampleSettings() {
     s.midiBindingData2Backward.insert(1, 127);
 
     // Stream Deck per-model mapping tables (model id -> index -> action id).
-    s.streamDeckKeyMaps.insert(QStringLiteral("plusXL"),
-                               QList<int>{9, 0, 4, -1, -1});
-    s.streamDeckDialPressMaps.insert(QStringLiteral("plusXL"),
-                                     QList<int>{0, 5, -1, -1, -1, -1});
-    s.streamDeckDialRotateMaps.insert(QStringLiteral("plusXL"),
-                                      QList<int>{8, 10, -1, -1, -1, -1});
+    s.streamDeckKeyMaps.insert(QStringLiteral("plusXL"), QList<int>{9, 0, 4, -1, -1});
+    s.streamDeckDialPressMaps.insert(QStringLiteral("plusXL"), QList<int>{0, 5, -1, -1, -1, -1});
+    s.streamDeckDialRotateMaps.insert(QStringLiteral("plusXL"), QList<int>{8, 10, -1, -1, -1, -1});
+
+    OutputTargetAssignment feedNdi;
+    feedNdi.id = QStringLiteral("feed0-ndi");
+    feedNdi.sourceBus = OutputBusId::feed(0);
+    feedNdi.kind = OutputTargetKind::Ndi;
+    feedNdi.enabled = true;
+    feedNdi.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR Feed 1"));
+
+    OutputTargetAssignment pgmNdi;
+    pgmNdi.id = QStringLiteral("pgm-ndi");
+    pgmNdi.sourceBus = OutputBusId::pgm();
+    pgmNdi.kind = OutputTargetKind::Ndi;
+    pgmNdi.enabled = false;
+    pgmNdi.settings.insert(QStringLiteral("senderName"), QStringLiteral("OLR PGM"));
+
+    s.broadcastOutputs = {feedNdi, pgmNdi};
     return s;
 }
 
@@ -111,6 +124,16 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.streamDeckKeyMaps, in.streamDeckKeyMaps);
     QCOMPARE(out.streamDeckDialPressMaps, in.streamDeckDialPressMaps);
     QCOMPARE(out.streamDeckDialRotateMaps, in.streamDeckDialRotateMaps);
+
+    QCOMPARE(out.broadcastOutputs.size(), 2);
+    QCOMPARE(out.broadcastOutputs[0].id, QStringLiteral("feed0-ndi"));
+    QCOMPARE(out.broadcastOutputs[0].sourceBus, OutputBusId::feed(0));
+    QCOMPARE(out.broadcastOutputs[0].kind, OutputTargetKind::Ndi);
+    QVERIFY(out.broadcastOutputs[0].enabled);
+    QCOMPARE(out.broadcastOutputs[0].settings.value(QStringLiteral("senderName")).toString(),
+             QStringLiteral("OLR Feed 1"));
+    QCOMPARE(out.broadcastOutputs[1].sourceBus, OutputBusId::pgm());
+    QVERIFY(!out.broadcastOutputs[1].enabled);
 }
 
 void TestSettingsManager::loadClampsTelemetryDelayMs() {

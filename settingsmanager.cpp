@@ -4,24 +4,116 @@
 #include <QtGlobal>
 
 namespace {
+QString outputBusKindName(OutputBusKind kind) {
+    switch (kind) {
+    case OutputBusKind::Feed:
+        return QStringLiteral("feed");
+    case OutputBusKind::Multiview:
+        return QStringLiteral("multiview");
+    case OutputBusKind::Pgm:
+        return QStringLiteral("pgm");
+    }
+    return QStringLiteral("pgm");
+}
+
+OutputBusId outputBusFromJson(const QJsonObject& obj) {
+    const QString kind = obj.value(QStringLiteral("kind")).toString();
+    if (kind == QStringLiteral("feed"))
+        return OutputBusId::feed(qMax(0, obj.value(QStringLiteral("index")).toInt(0)));
+    if (kind == QStringLiteral("multiview")) return OutputBusId::multiview();
+    return OutputBusId::pgm();
+}
+
+QJsonObject outputBusToJson(OutputBusId bus) {
+    QJsonObject obj;
+    obj.insert(QStringLiteral("kind"), outputBusKindName(bus.kind));
+    if (bus.kind == OutputBusKind::Feed) obj.insert(QStringLiteral("index"), bus.index);
+    return obj;
+}
+
+bool outputTargetKindFromString(const QString& name, OutputTargetKind* kind) {
+    if (name == QStringLiteral("qt-preview")) {
+        *kind = OutputTargetKind::QtPreview;
+        return true;
+    }
+    if (name == QStringLiteral("decklink-sdi-hdmi")) {
+        *kind = OutputTargetKind::DeckLinkSdiHdmi;
+        return true;
+    }
+    if (name == QStringLiteral("decklink-ip-st2110")) {
+        *kind = OutputTargetKind::DeckLinkIpSt2110;
+        return true;
+    }
+    if (name == QStringLiteral("ndi")) {
+        *kind = OutputTargetKind::Ndi;
+        return true;
+    }
+    if (name == QStringLiteral("omt")) {
+        *kind = OutputTargetKind::Omt;
+        return true;
+    }
+    if (name == QStringLiteral("aja")) {
+        *kind = OutputTargetKind::Aja;
+        return true;
+    }
+    return false;
+}
+
+QJsonArray broadcastOutputsToJson(const QList<OutputTargetAssignment>& outputs) {
+    QJsonArray arr;
+    for (const OutputTargetAssignment& assignment : outputs) {
+        QJsonObject obj;
+        obj.insert(QStringLiteral("id"), assignment.id);
+        obj.insert(QStringLiteral("sourceBus"), outputBusToJson(assignment.sourceBus));
+        obj.insert(QStringLiteral("kind"), outputTargetKindName(assignment.kind));
+        obj.insert(QStringLiteral("enabled"), assignment.enabled);
+        obj.insert(QStringLiteral("settings"), QJsonObject::fromVariantMap(assignment.settings));
+        arr.append(obj);
+    }
+    return arr;
+}
+
+QList<OutputTargetAssignment> broadcastOutputsFromJson(const QJsonValue& value) {
+    QList<OutputTargetAssignment> outputs;
+    if (!value.isArray()) return outputs;
+    for (const QJsonValue& entry : value.toArray()) {
+        if (!entry.isObject()) continue;
+        const QJsonObject obj = entry.toObject();
+        OutputTargetKind kind = OutputTargetKind::QtPreview;
+        if (!outputTargetKindFromString(obj.value(QStringLiteral("kind")).toString(), &kind))
+            continue;
+
+        OutputTargetAssignment assignment;
+        assignment.id = obj.value(QStringLiteral("id")).toString();
+        assignment.sourceBus = outputBusFromJson(obj.value(QStringLiteral("sourceBus")).toObject());
+        assignment.kind = kind;
+        assignment.enabled = obj.value(QStringLiteral("enabled")).toBool(false);
+        assignment.settings = obj.value(QStringLiteral("settings")).toObject().toVariantMap();
+        outputs.append(assignment);
+    }
+    return outputs;
+}
+
 // model id -> [action ids]  <->  JSON object of arrays.
-QJsonObject streamDeckMapsToJson(const QMap<QString, QList<int>> &maps) {
+QJsonObject streamDeckMapsToJson(const QMap<QString, QList<int>>& maps) {
     QJsonObject obj;
     for (auto it = maps.constBegin(); it != maps.constEnd(); ++it) {
         QJsonArray arr;
-        for (int v : it.value()) arr.append(v);
+        for (int v : it.value())
+            arr.append(v);
         obj.insert(it.key(), arr);
     }
     return obj;
 }
 
-QMap<QString, QList<int>> streamDeckMapsFromJson(const QJsonValue &val) {
+QMap<QString, QList<int>> streamDeckMapsFromJson(const QJsonValue& val) {
     QMap<QString, QList<int>> maps;
     if (!val.isObject()) return maps;
     const QJsonObject obj = val.toObject();
     for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
         QList<int> row;
-        for (const QJsonValue &v : it.value().toArray()) row.append(v.toInt(-1));
+        for (const QJsonValue& v : it.value().toArray())
+            row.append(v.toInt(-1));
         maps.insert(it.key(), row);
     }
     return maps;
@@ -30,7 +122,7 @@ QMap<QString, QList<int>> streamDeckMapsFromJson(const QJsonValue &val) {
 
 SettingsManager::SettingsManager() {}
 
-bool SettingsManager::save(const QString &path, const AppSettings &settings) {
+bool SettingsManager::save(const QString& path, const AppSettings& settings) {
     QJsonObject root;
 
     // Save the separate file path strings
@@ -45,7 +137,8 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["midiPortName"] = settings.midiPortName;
 
     QJsonArray midiArray;
-    for (auto it = settings.midiBindings.constBegin(); it != settings.midiBindings.constEnd(); ++it) {
+    for (auto it = settings.midiBindings.constBegin(); it != settings.midiBindings.constEnd();
+         ++it) {
         QJsonObject obj;
         obj["action"] = it.key();
         obj["status"] = it.value().first;
@@ -64,7 +157,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["midiBindings"] = midiArray;
 
     QJsonArray sourcesArray;
-    for (const auto &source : settings.sources) {
+    for (const auto& source : settings.sources) {
         QJsonObject obj;
         obj["id"] = source.id;
         obj["name"] = source.name;
@@ -82,6 +175,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["streamDeckKeyMaps"] = streamDeckMapsToJson(settings.streamDeckKeyMaps);
     root["streamDeckDialPressMaps"] = streamDeckMapsToJson(settings.streamDeckDialPressMaps);
     root["streamDeckDialRotateMaps"] = streamDeckMapsToJson(settings.streamDeckDialRotateMaps);
+    root["broadcastOutputs"] = broadcastOutputsToJson(settings.broadcastOutputs);
 
     QJsonDocument doc(root);
     QFile file(path);
@@ -96,7 +190,7 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     return true;
 }
 
-bool SettingsManager::load(const QString &path, AppSettings &settings) {
+bool SettingsManager::load(const QString& path, AppSettings& settings) {
     QFile file(path);
 
     if (!file.exists()) {
@@ -142,7 +236,7 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.midiBindingData2Forward.clear();
     settings.midiBindingData2Backward.clear();
     QJsonArray midiArray = root["midiBindings"].toArray();
-    for (const QJsonValue &val : midiArray) {
+    for (const QJsonValue& val : midiArray) {
         QJsonObject obj = val.toObject();
         int action = obj["action"].toInt(-1);
         int status = obj["status"].toInt(-1);
@@ -167,7 +261,7 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     // Parse the sources list
     settings.sources.clear();
     QJsonArray sourcesArray = root["sources"].toArray();
-    for (const QJsonValue &val : sourcesArray) {
+    for (const QJsonValue& val : sourcesArray) {
         QJsonObject obj = val.toObject();
         SourceSettings source;
         source.id = obj["id"].toString();
@@ -184,8 +278,11 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.telemetrySseUrl = root["telemetrySseUrl"].toString();
 
     settings.streamDeckKeyMaps = streamDeckMapsFromJson(root.value("streamDeckKeyMaps"));
-    settings.streamDeckDialPressMaps = streamDeckMapsFromJson(root.value("streamDeckDialPressMaps"));
-    settings.streamDeckDialRotateMaps = streamDeckMapsFromJson(root.value("streamDeckDialRotateMaps"));
+    settings.streamDeckDialPressMaps =
+        streamDeckMapsFromJson(root.value("streamDeckDialPressMaps"));
+    settings.streamDeckDialRotateMaps =
+        streamDeckMapsFromJson(root.value("streamDeckDialRotateMaps"));
+    settings.broadcastOutputs = broadcastOutputsFromJson(root.value("broadcastOutputs"));
 
     return true;
 }

@@ -1440,6 +1440,7 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
 
     // Route audio for the selected track (or mute in multiview)
     if (m_playbackWorker) {
+        m_playbackWorker->setSelectedOutputFeed(selectedIndex);
         m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
     }
     if (m_audioPlayer) {
@@ -1511,6 +1512,8 @@ void UIManager::startRecording() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
+    m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
 
     // 2. Point it to the file being recorded
     //QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
@@ -1533,6 +1536,8 @@ void UIManager::restartPlaybackWorker() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
+    m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
     m_transport->seek(0);
@@ -1938,6 +1943,8 @@ void UIManager::loadSettings() {
             qBound(0, m_currentSettings.audioOutputLatencyMs, 500);
         if (m_audioPlayer)
             m_audioPlayer->setOutputLatencyOffsetMs(m_currentSettings.audioOutputLatencyMs);
+        if (m_playbackWorker)
+            m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
         emit audioOutputLatencyChanged();
     }
 }

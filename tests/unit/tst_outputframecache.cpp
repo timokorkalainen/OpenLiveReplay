@@ -16,6 +16,7 @@ private slots:
     void videoFallsBackToLastValidFrame();
     void missingVideoReturnsPlaceholder();
     void audioSpanReturnsSamplesAndSilenceForGaps();
+    void clearDropsVideoAndAudioHistory();
 };
 
 void TestOutputFrameCache::videoAtPicksLargestPtsAtOrBeforePlayhead() {
@@ -80,6 +81,26 @@ void TestOutputFrameCache::audioSpanReturnsSamplesAndSilenceForGaps() {
     QCOMPARE(out[5], qint16(2));
     QCOMPARE(out[10], qint16(7));
     QCOMPARE(out[11], qint16(8));
+}
+
+void TestOutputFrameCache::clearDropsVideoAndAudioHistory() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(makeVideo(0, 100, 50));
+
+    MediaAudioFrame audio;
+    audio.feedIndex = 0;
+    audio.startSample = 100;
+    audio.sampleRate = 48000;
+    audio.channels = 2;
+    audio.format = MediaSampleFormat::S16Interleaved;
+    audio.pcm = QByteArray(4 * 2 * int(sizeof(qint16)), '\1');
+    cache.insertAudioFrame(audio);
+
+    cache.clear();
+
+    MediaVideoFrame frame = cache.videoFrameOrPlaceholder(0, 100);
+    QVERIFY(frame.isPlaceholder);
+    QCOMPARE(cache.audioSpanOrSilence(0, 100, 4), silentS16Stereo(4));
 }
 
 QTEST_GUILESS_MAIN(TestOutputFrameCache)

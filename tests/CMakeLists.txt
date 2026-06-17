@@ -98,6 +98,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.h"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtaddress.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/rtmpprotocol.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/outputtargetassignment.cpp"
     "${CMAKE_SOURCE_DIR}/settingsmanager.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectsettingsimporter.cpp"
     "${CMAKE_SOURCE_DIR}/project/projectimportclient.cpp"
@@ -191,7 +192,10 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/output/outputframecache.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputtargetassignment.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/outputdispatcher.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/yuv420pcompositor.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/qtpreviewsink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/ndisink.cpp"
 )
 target_include_directories(olr_test_playback PUBLIC
     "${CMAKE_SOURCE_DIR}"

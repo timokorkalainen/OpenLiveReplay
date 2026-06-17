@@ -10,13 +10,15 @@
 #include <QList>
 #include <QMap>
 
+#include "playback/output/outputtargetassignment.h"
+
 // Simple data structure to hold our application state
 struct SourceSettings {
     QString id;
     QString name;
     QString url;
     QJsonArray metadata;
-    int trimOffsetMs = 0; // per-source timeline trim (+delay / -advance), ms
+    int trimOffsetMs = 0;     // per-source timeline trim (+delay / -advance), ms
     int telemetryDelayMs = 0; // positive delay so telemetry aligns with video, ms
 };
 
@@ -34,7 +36,7 @@ struct AppSettings {
     bool showTimeOfDay = false;
     int audioOutputLatencyMs = 0; // playback output-device latency comp, ms (0..500)
     QString midiPortName;
-    QMap<int, QPair<int,int>> midiBindings;
+    QMap<int, QPair<int, int>> midiBindings;
     QMap<int, int> midiBindingData2;
     QMap<int, int> midiBindingData2Forward;
     QMap<int, int> midiBindingData2Backward;
@@ -43,16 +45,18 @@ struct AppSettings {
     QMap<QString, QList<int>> streamDeckKeyMaps;
     QMap<QString, QList<int>> streamDeckDialPressMaps;
     QMap<QString, QList<int>> streamDeckDialRotateMaps;
+
+    QList<OutputTargetAssignment> broadcastOutputs;
 };
 
 class SettingsManager {
 public:
     explicit SettingsManager();
     // Saves settings to a JSON file at the specified path
-    bool save(const QString &path, const AppSettings &settings);
+    bool save(const QString& path, const AppSettings& settings);
 
     // Loads settings from a JSON file into the provided struct reference
-    bool load(const QString &path, AppSettings &settings);
+    bool load(const QString& path, AppSettings& settings);
 };
 
 #endif // SETTINGSMANAGER_H
