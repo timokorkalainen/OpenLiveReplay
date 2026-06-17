@@ -64,6 +64,7 @@ public:
     void deliverDueFrames(int64_t P, int dir);
     void setActiveAudioView(int viewIndex);
     void setSelectedOutputFeed(int feedIndex);
+    void setBusPreviewProviders(FrameProvider* multiviewProvider, FrameProvider* pgmProvider);
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
     void stop();
 
@@ -126,6 +127,8 @@ private:
     bool shouldInterrupt() const;
 
     QList<FrameProvider*> m_providers;
+    FrameProvider* m_multiviewPreviewProvider = nullptr;
+    FrameProvider* m_pgmPreviewProvider = nullptr;
     QVector<DecoderTrack*> m_decoderBank;
     QVector<AudioDecoderTrack*> m_audioDecoderBank;
     AVFormatContext* m_fmtCtx = nullptr;

@@ -5,11 +5,17 @@
 #include <cstring>
 
 namespace {
-void copyPlane(const QByteArray& src, int srcStride, int srcW, int srcH, QByteArray& dst,
-               int dstStride, int dstX, int dstY, int copyW, int copyH) {
-    for (int y = 0; y < copyH && y < srcH; ++y) {
-        std::memcpy(dst.data() + (dstY + y) * dstStride + dstX, src.constData() + y * srcStride,
-                    size_t(qMin(copyW, srcW)));
+void scalePlaneNearest(const QByteArray& src, int srcStride, int srcW, int srcH, QByteArray& dst,
+                       int dstStride, int dstX, int dstY, int dstW, int dstH) {
+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
+    for (int y = 0; y < dstH; ++y) {
+        const int srcY = qMin(srcH - 1, (y * srcH) / dstH);
+        char* dstLine = dst.data() + (dstY + y) * dstStride + dstX;
+        const char* srcLine = src.constData() + srcY * srcStride;
+        for (int x = 0; x < dstW; ++x) {
+            const int srcX = qMin(srcW - 1, (x * srcW) / dstW);
+            dstLine[x] = srcLine[srcX];
+        }
     }
 }
 } // namespace
@@ -22,24 +28,34 @@ MediaVideoFrame Yuv420pCompositor::composeGrid(const QList<MediaVideoFrame>& fra
     const int count = qMax(1, frames.size());
     const int columns = qMax(1, int(std::ceil(std::sqrt(double(count)))));
     const int rows = qMax(1, int(std::ceil(double(count) / double(columns))));
-    const int tileW = width / columns;
-    const int tileH = height / rows;
 
     for (int i = 0; i < frames.size(); ++i) {
         const MediaVideoFrame& frame = frames.at(i);
         if (!frame.isValid()) continue;
         const int col = i % columns;
         const int row = i / columns;
-        const int dstX = col * tileW;
-        const int dstY = row * tileH;
+        const int dstX = col * width / columns;
+        const int dstY = row * height / rows;
+        const int dstRight = (col + 1) * width / columns;
+        const int dstBottom = (row + 1) * height / rows;
+        const int dstW = qMax(0, dstRight - dstX);
+        const int dstH = qMax(0, dstBottom - dstY);
 
-        copyPlane(frame.planeY, frame.strideY, frame.width, frame.height, out.planeY, out.strideY,
-                  dstX, dstY, tileW, tileH);
+        scalePlaneNearest(frame.planeY, frame.strideY, frame.width, frame.height, out.planeY,
+                          out.strideY, dstX, dstY, dstW, dstH);
 
-        copyPlane(frame.planeU, frame.strideU, (frame.width + 1) / 2, (frame.height + 1) / 2,
-                  out.planeU, out.strideU, dstX / 2, dstY / 2, (tileW + 1) / 2, (tileH + 1) / 2);
-        copyPlane(frame.planeV, frame.strideV, (frame.width + 1) / 2, (frame.height + 1) / 2,
-                  out.planeV, out.strideV, dstX / 2, dstY / 2, (tileW + 1) / 2, (tileH + 1) / 2);
+        const int srcChromaW = (frame.width + 1) / 2;
+        const int srcChromaH = (frame.height + 1) / 2;
+        const int dstChromaX = dstX / 2;
+        const int dstChromaY = dstY / 2;
+        const int dstChromaRight = (dstRight + 1) / 2;
+        const int dstChromaBottom = (dstBottom + 1) / 2;
+        const int dstChromaW = qMax(0, dstChromaRight - dstChromaX);
+        const int dstChromaH = qMax(0, dstChromaBottom - dstChromaY);
+        scalePlaneNearest(frame.planeU, frame.strideU, srcChromaW, srcChromaH, out.planeU,
+                          out.strideU, dstChromaX, dstChromaY, dstChromaW, dstChromaH);
+        scalePlaneNearest(frame.planeV, frame.strideV, srcChromaW, srcChromaH, out.planeV,
+                          out.strideV, dstChromaX, dstChromaY, dstChromaW, dstChromaH);
     }
     return out;
 }

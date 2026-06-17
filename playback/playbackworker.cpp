@@ -1,8 +1,10 @@
 #include "playback/playbackworker.h"
+#include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/outputbusengine.h"
 #include "playback/output/outputframecache.h"
 #include "playback/output/ndisink.h"
 #include "playback/output/qtpreviewsink.h"
+#include "playback/output/queuedoutputsink.h"
 #include <QDebug>
 #include <QMutexLocker>
 #include <QElapsedTimer>
@@ -66,6 +68,14 @@ void PlaybackWorker::setActiveAudioView(int viewIndex) {
 
 void PlaybackWorker::setSelectedOutputFeed(int feedIndex) {
     m_selectedOutputFeed.store(feedIndex, std::memory_order_relaxed);
+}
+
+void PlaybackWorker::setBusPreviewProviders(FrameProvider* multiviewProvider,
+                                            FrameProvider* pgmProvider) {
+    QMutexLocker locker(&m_mutex);
+    m_multiviewPreviewProvider = multiviewProvider;
+    m_pgmPreviewProvider = pgmProvider;
+    m_outputTargetsDirty.store(true, std::memory_order_relaxed);
 }
 
 void PlaybackWorker::setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments) {
@@ -260,23 +270,38 @@ void PlaybackWorker::rebuildOutputEndpoints() {
     if (!m_outputRuntime) return;
 
     QList<OutputTargetAssignment> external;
+    FrameProvider* multiviewProvider = nullptr;
+    FrameProvider* pgmProvider = nullptr;
     {
         QMutexLocker locker(&m_mutex);
         external = m_externalOutputAssignments;
+        multiviewProvider = m_multiviewPreviewProvider;
+        pgmProvider = m_pgmPreviewProvider;
     }
 
     m_outputRuntime->setEndpoints({});
     m_outputSinks.clear();
     QList<OutputEndpoint> endpoints;
 
-    for (int feed = 0; feed < m_outputFeedCount && feed < m_providers.size(); ++feed) {
-        OutputTargetAssignment preview;
-        preview.id = QStringLiteral("qt-preview-feed-%1").arg(feed);
-        preview.sourceBus = OutputBusId::feed(feed);
-        preview.kind = OutputTargetKind::QtPreview;
-        preview.enabled = true;
+    const QList<OutputTargetAssignment> previews = BroadcastOutputSettings::qtPreviewAssignments(
+        m_outputFeedCount, multiviewProvider != nullptr, pgmProvider != nullptr);
+    for (const OutputTargetAssignment& preview : previews) {
+        FrameProvider* provider = nullptr;
+        switch (preview.sourceBus.kind) {
+        case OutputBusKind::Feed:
+            if (preview.sourceBus.index >= 0 && preview.sourceBus.index < m_providers.size())
+                provider = m_providers[preview.sourceBus.index];
+            break;
+        case OutputBusKind::Multiview:
+            provider = multiviewProvider;
+            break;
+        case OutputBusKind::Pgm:
+            provider = pgmProvider;
+            break;
+        }
+        if (!provider) continue;
 
-        auto sink = std::make_unique<QtPreviewOutputSink>(m_providers[feed]);
+        auto sink = std::make_unique<QtPreviewOutputSink>(provider);
         endpoints.append({preview, sink.get()});
         m_outputSinks.push_back(std::move(sink));
     }
@@ -287,7 +312,7 @@ void PlaybackWorker::rebuildOutputEndpoints() {
         std::unique_ptr<IOutputSink> sink;
         switch (assignment.kind) {
         case OutputTargetKind::Ndi:
-            sink = std::make_unique<NdiOutputSink>();
+            sink = std::make_unique<QueuedOutputSink>(std::make_unique<NdiOutputSink>());
             break;
         case OutputTargetKind::QtPreview:
         case OutputTargetKind::DeckLinkSdiHdmi:

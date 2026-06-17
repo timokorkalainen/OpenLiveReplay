@@ -116,6 +116,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/outputsink.h
         playback/output/outputdispatcher.h playback/output/outputdispatcher.cpp
         playback/output/outputruntime.h playback/output/outputruntime.cpp
+        playback/output/queuedoutputsink.h playback/output/queuedoutputsink.cpp
         playback/output/yuv420pcompositor.h playback/output/yuv420pcompositor.cpp
         playback/output/qtpreviewsink.h playback/output/qtpreviewsink.cpp
         playback/output/ndisink.h playback/output/ndisink.cpp

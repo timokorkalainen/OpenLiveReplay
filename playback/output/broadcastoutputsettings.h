@@ -24,6 +24,8 @@ QString senderName(const QList<OutputTargetAssignment>& outputs, OutputTargetKin
                    OutputBusId bus);
 QVariantList rows(const QList<OutputTargetAssignment>& outputs, int feedCount,
                   OutputTargetKind kind);
+QList<OutputTargetAssignment> qtPreviewAssignments(int feedCount, bool includeMultiview,
+                                                   bool includePgm);
 
 OutputBusId busFromUiKey(const QString& busKind, int feedIndex);
 QString busKindName(OutputBusId bus);

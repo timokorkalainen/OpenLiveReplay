@@ -8,6 +8,7 @@ private slots:
     void ensureTargetsCreatesOneNdiTargetPerBus();
     void setEnabledPreservesExistingSettingsAndOnlyTouchesSelectedBus();
     void rowsExposeStableQmlMetadata();
+    void qtPreviewAssignmentsCoverFeedsMultiviewAndPgm();
 };
 
 void TestBroadcastOutputSettings::ensureTargetsCreatesOneNdiTargetPerBus() {
@@ -51,15 +52,15 @@ void TestBroadcastOutputSettings::setEnabledPreservesExistingSettingsAndOnlyTouc
         {existing}, 3, OutputTargetKind::Ndi, OutputBusId::feed(1), true);
 
     QCOMPARE(outputs.size(), 5);
-    QVERIFY(!BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi,
-                                                OutputBusId::feed(0)));
-    QVERIFY(BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi,
-                                               OutputBusId::feed(1)));
-    QVERIFY(!BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi,
-                                                OutputBusId::feed(2)));
-    QCOMPARE(BroadcastOutputSettings::senderName(outputs, OutputTargetKind::Ndi,
-                                                 OutputBusId::feed(1)),
-             QStringLiteral("Director Iso 2"));
+    QVERIFY(
+        !BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi, OutputBusId::feed(0)));
+    QVERIFY(
+        BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi, OutputBusId::feed(1)));
+    QVERIFY(
+        !BroadcastOutputSettings::isEnabled(outputs, OutputTargetKind::Ndi, OutputBusId::feed(2)));
+    QCOMPARE(
+        BroadcastOutputSettings::senderName(outputs, OutputTargetKind::Ndi, OutputBusId::feed(1)),
+        QStringLiteral("Director Iso 2"));
 
     const auto feed1 = std::find_if(outputs.cbegin(), outputs.cend(), [](const auto& assignment) {
         return assignment.kind == OutputTargetKind::Ndi &&
@@ -70,11 +71,10 @@ void TestBroadcastOutputSettings::setEnabledPreservesExistingSettingsAndOnlyTouc
 }
 
 void TestBroadcastOutputSettings::rowsExposeStableQmlMetadata() {
-    QList<OutputTargetAssignment> outputs = BroadcastOutputSettings::setEnabled(
-        {}, 1, OutputTargetKind::Ndi, OutputBusId::pgm(), true);
-    outputs = BroadcastOutputSettings::setSenderName(outputs, 1, OutputTargetKind::Ndi,
-                                                     OutputBusId::pgm(),
-                                                     QStringLiteral(" World Feed "));
+    QList<OutputTargetAssignment> outputs =
+        BroadcastOutputSettings::setEnabled({}, 1, OutputTargetKind::Ndi, OutputBusId::pgm(), true);
+    outputs = BroadcastOutputSettings::setSenderName(
+        outputs, 1, OutputTargetKind::Ndi, OutputBusId::pgm(), QStringLiteral(" World Feed "));
 
     const QVariantList rows = BroadcastOutputSettings::rows(outputs, 1, OutputTargetKind::Ndi);
 
@@ -93,6 +93,26 @@ void TestBroadcastOutputSettings::rowsExposeStableQmlMetadata() {
     QCOMPARE(pgm.value(QStringLiteral("label")).toString(), QStringLiteral("PGM"));
     QVERIFY(pgm.value(QStringLiteral("enabled")).toBool());
     QCOMPARE(pgm.value(QStringLiteral("senderName")).toString(), QStringLiteral("World Feed"));
+}
+
+void TestBroadcastOutputSettings::qtPreviewAssignmentsCoverFeedsMultiviewAndPgm() {
+    const QList<OutputTargetAssignment> previews =
+        BroadcastOutputSettings::qtPreviewAssignments(2, true, true);
+
+    QCOMPARE(previews.size(), 4);
+    QCOMPARE(previews[0].id, QStringLiteral("qt-preview-feed-0"));
+    QCOMPARE(previews[0].sourceBus, OutputBusId::feed(0));
+    QCOMPARE(previews[0].kind, OutputTargetKind::QtPreview);
+    QVERIFY(previews[0].enabled);
+
+    QCOMPARE(previews[1].id, QStringLiteral("qt-preview-feed-1"));
+    QCOMPARE(previews[1].sourceBus, OutputBusId::feed(1));
+
+    QCOMPARE(previews[2].id, QStringLiteral("qt-preview-multiview"));
+    QCOMPARE(previews[2].sourceBus, OutputBusId::multiview());
+
+    QCOMPARE(previews[3].id, QStringLiteral("qt-preview-pgm"));
+    QCOMPARE(previews[3].sourceBus, OutputBusId::pgm());
 }
 
 QTEST_GUILESS_MAIN(TestBroadcastOutputSettings)

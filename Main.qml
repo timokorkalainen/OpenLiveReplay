@@ -621,9 +621,8 @@ ApplicationWindow {
                 property int selectedIndex: -1
                 property var visibleStreamIndexes: []
                 property int streamCount: visibleStreamIndexes.length
-                property var selectedProvider: (selectedIndex >= 0 && selectedIndex < appWindow.uiManagerRef.playbackProviders.length)
-                                                ? appWindow.uiManagerRef.playbackProviders[selectedIndex]
-                                               : null
+                property var pgmProvider: appWindow.uiManagerRef.pgmPreviewProvider
+                property var multiviewProvider: appWindow.uiManagerRef.multiviewPreviewProvider
                 property string viewMode: "multi"
                 property int gridColumns: Math.max(1, Math.ceil(Math.sqrt(Math.max(1, streamCount))))
                 property int gridRows: Math.ceil(Math.max(1, streamCount) / gridColumns)
@@ -672,16 +671,16 @@ ApplicationWindow {
                     visibleStreamIndexes = indexes
                 }
 
+                function reattachPreviewProviders() {
+                    singleOutput.attachProvider(pgmProvider)
+                    multiviewBusOutput.attachProvider(multiviewProvider)
+                }
+
                 Component.onCompleted: {
                     selectedIndex = -1
                     viewMode = "multi"
                     updateVisibleStreams()
-                }
-
-                onSelectedProviderChanged: {
-                    if (viewMode === "single" && selectedProvider) {
-                        selectedProvider.videoSink = singleOutput.videoSink
-                    }
+                    reattachPreviewProviders()
                 }
 
                 Connections {
@@ -691,6 +690,7 @@ ApplicationWindow {
                         playbackTab.viewMode = "multi"
                         playbackTab.updateVisibleStreams()
                         appWindow.uiManagerRef.setPlaybackViewState(false, -1)
+                        playbackTab.reattachPreviewProviders()
                     }
                     function onStreamUrlsChanged() {
                         playbackTab.selectedIndex = -1
@@ -742,13 +742,27 @@ ApplicationWindow {
                         color: sourceForView < 0 ? "#003080" : "black"
                         border.color: sourceForView < 0 ? "#1565C0" : "#00C853"
                         border.width: 2
-                        visible: playbackTab.viewMode === "single" && playbackTab.selectedIndex >= 0 && appWindow.uiManagerRef.playbackProviders.length > 0
+                        visible: playbackTab.viewMode === "single" && playbackTab.selectedIndex >= 0 && playbackTab.pgmProvider !== null
 
                         VideoOutput {
                             id: singleOutput
                             anchors.fill: parent
                             fillMode: VideoOutput.PreserveAspectFit
-                            visible: singleView.sourceForView >= 0
+                            property var attachedProvider: null
+
+                            function attachProvider(provider) {
+                                if (attachedProvider === provider) return
+                                if (attachedProvider) {
+                                    attachedProvider.removeVideoSink(videoSink)
+                                }
+                                attachedProvider = provider
+                                if (attachedProvider) {
+                                    attachedProvider.addVideoSink(videoSink)
+                                }
+                            }
+
+                            Component.onCompleted: attachProvider(playbackTab.pgmProvider)
+                            Component.onDestruction: attachProvider(null)
                         }
 
                         Rectangle {
@@ -783,11 +797,29 @@ ApplicationWindow {
                             }
                         }
 
-                        onVisibleChanged: {
-                            if (visible && playbackTab.selectedProvider) {
-                                playbackTab.selectedProvider.videoSink = singleOutput.videoSink
+                    }
+
+                    VideoOutput {
+                        id: multiviewBusOutput
+                        anchors.fill: parent
+                        fillMode: VideoOutput.PreserveAspectFit
+                        visible: playbackTab.viewMode === "multi" && playbackTab.multiviewProvider !== null
+                        z: 0
+                        property var attachedProvider: null
+
+                        function attachProvider(provider) {
+                            if (attachedProvider === provider) return
+                            if (attachedProvider) {
+                                attachedProvider.removeVideoSink(videoSink)
+                            }
+                            attachedProvider = provider
+                            if (attachedProvider) {
+                                attachedProvider.addVideoSink(videoSink)
                             }
                         }
+
+                        Component.onCompleted: attachProvider(playbackTab.multiviewProvider)
+                        Component.onDestruction: attachProvider(null)
                     }
 
                     GridView {
@@ -795,6 +827,7 @@ ApplicationWindow {
                         anchors.fill: parent
                         anchors.margins: 0
                         visible: playbackTab.viewMode === "multi"
+                        z: 1
                         clip: true
                         interactive: false
                         cellHeight: parent.height / playbackTab.gridRows
@@ -811,32 +844,11 @@ ApplicationWindow {
                                 return (multiViewDelegate.streamIndex >= 0 && multiViewDelegate.streamIndex < map.length)
                                        ? map[multiViewDelegate.streamIndex] : -1
                             }
-                            color: sourceForView < 0 ? "#003080" : "black"
+                            color: "transparent"
                             border.color: sourceForView < 0 ? "#1565C0" : "red"
                             border.width: 2
                             width: multiViewGrid.cellWidth
                             height: multiViewGrid.cellHeight
-
-                            VideoOutput {
-                                id: vOutput
-                                anchors.fill: parent
-                                fillMode: VideoOutput.PreserveAspectFit
-                                visible: multiViewDelegate.sourceForView >= 0
-                                z: 1
-                                Component.onCompleted: {
-                                    if (multiViewDelegate.streamIndex < appWindow.uiManagerRef.playbackProviders.length) {
-                                        appWindow.uiManagerRef.playbackProviders[multiViewDelegate.streamIndex].videoSink = vOutput.videoSink
-                                    }
-                                }
-                            }
-
-                            onVisibleChanged: {
-                                if (visible) {
-                                    if (multiViewDelegate.streamIndex < appWindow.uiManagerRef.playbackProviders.length) {
-                                        appWindow.uiManagerRef.playbackProviders[multiViewDelegate.streamIndex].videoSink = vOutput.videoSink
-                                    }
-                                }
-                            }
 
                             Rectangle {
                                 anchors.bottom: parent.bottom

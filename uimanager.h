@@ -44,6 +44,10 @@ class UIManager : public QObject {
     Q_PROPERTY(int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
+    Q_PROPERTY(FrameProvider* multiviewPreviewProvider READ multiviewPreviewProvider NOTIFY
+                   playbackProvidersChanged)
+    Q_PROPERTY(
+        FrameProvider* pgmPreviewProvider READ pgmPreviewProvider NOTIFY playbackProvidersChanged)
     Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
     Q_PROPERTY(int64_t scrubPosition READ scrubPosition NOTIFY scrubPositionChanged)
     Q_PROPERTY(QString playbackTimecode READ playbackTimecode NOTIFY playbackTimecodeChanged)
@@ -84,7 +88,8 @@ class UIManager : public QObject {
     Q_PROPERTY(bool importPreviewReady READ importPreviewReady NOTIFY importPreviewChanged)
     Q_PROPERTY(QString telemetrySseUrl READ telemetrySseUrl NOTIFY telemetryConfigChanged)
     Q_PROPERTY(int telemetryVersion READ telemetryVersion NOTIFY telemetryChanged)
-    Q_PROPERTY(int broadcastOutputsVersion READ broadcastOutputsVersion NOTIFY broadcastOutputsChanged)
+    Q_PROPERTY(
+        int broadcastOutputsVersion READ broadcastOutputsVersion NOTIFY broadcastOutputsChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -104,6 +109,8 @@ public:
     int multiviewCount() const;
     bool isRecording() const;
     QVariantList playbackProviders() const;
+    FrameProvider* multiviewPreviewProvider() const { return m_multiviewPreviewProvider; }
+    FrameProvider* pgmPreviewProvider() const { return m_pgmPreviewProvider; }
     int64_t recordedDurationMs();
     int64_t scrubPosition();
     // The exact timecode the playback UI shows — the single source of truth for
@@ -337,6 +344,8 @@ private:
     QString m_configPath;
     PlaybackWorker* m_playbackWorker = nullptr;
     QList<FrameProvider*> m_providers;
+    FrameProvider* m_multiviewPreviewProvider = nullptr;
+    FrameProvider* m_pgmPreviewProvider = nullptr;
     PlaybackTransport *m_transport;
     AudioPlayer *m_audioPlayer = nullptr;
     bool m_followLive = false;

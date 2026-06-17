@@ -1515,6 +1515,7 @@ void UIManager::startRecording() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
+    m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
 
@@ -1539,6 +1540,7 @@ void UIManager::restartPlaybackWorker() {
     }
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
+    m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
@@ -1898,9 +1900,9 @@ QString UIManager::ndiOutputSenderName(const QString& busKind, int feedIndex) co
 
 void UIManager::setNdiOutputEnabled(const QString& busKind, int feedIndex, bool enabled) {
     const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
-    applyBroadcastOutputs(BroadcastOutputSettings::setEnabled(
-        m_currentSettings.broadcastOutputs, activeViewCount(), OutputTargetKind::Ndi, bus,
-        enabled));
+    applyBroadcastOutputs(BroadcastOutputSettings::setEnabled(m_currentSettings.broadcastOutputs,
+                                                              activeViewCount(),
+                                                              OutputTargetKind::Ndi, bus, enabled));
 }
 
 void UIManager::setNdiOutputSenderName(const QString& busKind, int feedIndex,
@@ -2129,12 +2131,18 @@ void UIManager::refreshProviders() {
     // Cleanup old providers
     qDeleteAll(m_providers);
     m_providers.clear();
+    delete m_multiviewPreviewProvider;
+    delete m_pgmPreviewProvider;
+    m_multiviewPreviewProvider = nullptr;
+    m_pgmPreviewProvider = nullptr;
 
     // Create a provider for every stream URL
     int count = activeStreamUrls().size();
     for (int i = 0; i < count; ++i) {
         m_providers.append(new FrameProvider(this));
     }
+    m_multiviewPreviewProvider = new FrameProvider(this);
+    m_pgmPreviewProvider = new FrameProvider(this);
     emit playbackProvidersChanged();
 }
 

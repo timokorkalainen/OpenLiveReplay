@@ -28,10 +28,42 @@ Window {
         anchors.fill: parent
         color: "#111111"
 
+        VideoOutput {
+            id: multiviewBusOutput
+            anchors.fill: parent
+            fillMode: VideoOutput.PreserveAspectFit
+            z: 0
+            property var attachedProvider: null
+
+            function attachProvider(provider) {
+                if (attachedProvider === provider) return
+                if (attachedProvider) {
+                    attachedProvider.removeVideoSink(videoSink)
+                }
+                attachedProvider = provider
+                if (attachedProvider) {
+                    attachedProvider.addVideoSink(videoSink)
+                }
+            }
+
+            Component.onCompleted: {
+                attachProvider(multiviewWindow.uiManager ? multiviewWindow.uiManager.multiviewPreviewProvider : null)
+            }
+            Component.onDestruction: attachProvider(null)
+        }
+
+        Connections {
+            target: multiviewWindow.uiManager
+            function onPlaybackProvidersChanged() {
+                multiviewBusOutput.attachProvider(multiviewWindow.uiManager ? multiviewWindow.uiManager.multiviewPreviewProvider : null)
+            }
+        }
+
         GridView {
             id: multiViewGrid
             anchors.fill: parent
             anchors.margins: 0
+            z: 1
             clip: true
             interactive: false
             cellHeight: parent.height / multiviewWindow.gridRows
@@ -48,29 +80,11 @@ Window {
                     return (streamTile.streamIndex >= 0 && streamTile.streamIndex < map.length)
                            ? map[streamTile.streamIndex] : -1
                 }
-                color: sourceForView < 0 ? "#003080" : "black"
+                color: "transparent"
                 border.color: sourceForView < 0 ? "#1565C0" : "#d32f2f"
                 border.width: 2
                 width: multiViewGrid.cellWidth
                 height: multiViewGrid.cellHeight
-
-                VideoOutput {
-                    id: vOutput
-                    anchors.fill: parent
-                    fillMode: VideoOutput.PreserveAspectFit
-                    visible: streamTile.sourceForView >= 0
-                    z: 1
-                    Component.onCompleted: {
-                        if (streamTile.streamIndex < multiviewWindow.uiManager.playbackProviders.length) {
-                            multiviewWindow.uiManager.playbackProviders[streamTile.streamIndex].addVideoSink(vOutput.videoSink)
-                        }
-                    }
-                    Component.onDestruction: {
-                        if (streamTile.streamIndex < multiviewWindow.uiManager.playbackProviders.length) {
-                            multiviewWindow.uiManager.playbackProviders[streamTile.streamIndex].removeVideoSink(vOutput.videoSink)
-                        }
-                    }
-                }
 
                 Rectangle {
                     anchors.bottom: parent.bottom

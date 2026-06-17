@@ -7,9 +7,7 @@
 #include <QtGlobal>
 #include <cstring>
 
-QtPreviewSink::QtPreviewSink(FrameProvider* provider)
-    : m_provider(provider) {
-}
+QtPreviewSink::QtPreviewSink(FrameProvider* provider) : m_provider(provider) {}
 
 bool QtPreviewSink::deliver(const MediaVideoFrame& frame) {
     if (!m_provider) return false;
@@ -23,7 +21,7 @@ QVideoFrame QtPreviewSink::toQVideoFrame(const MediaVideoFrame& frame) {
     if (!frame.isValid()) return QVideoFrame();
     QVideoFrameFormat format(QSize(frame.width, frame.height), QVideoFrameFormat::Format_YUV420P);
     format.setColorSpace(frame.height > 576 ? QVideoFrameFormat::ColorSpace_BT709
-                                             : QVideoFrameFormat::ColorSpace_BT601);
+                                            : QVideoFrameFormat::ColorSpace_BT601);
     format.setColorRange(QVideoFrameFormat::ColorRange_Video);
 
     QVideoFrame qFrame(format);
@@ -37,8 +35,7 @@ QVideoFrame QtPreviewSink::toQVideoFrame(const MediaVideoFrame& frame) {
         const int copyW = qMin(width, qMin(srcStrides[i], qFrame.bytesPerLine(i)));
         for (int y = 0; y < height; ++y) {
             std::memcpy(qFrame.bits(i) + y * qFrame.bytesPerLine(i),
-                        planes[i].constData() + y * srcStrides[i],
-                        size_t(copyW));
+                        planes[i].constData() + y * srcStrides[i], size_t(copyW));
         }
     }
     qFrame.unmap();

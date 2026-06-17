@@ -195,6 +195,7 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputdispatcher.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputruntime.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/queuedoutputsink.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/yuv420pcompositor.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/qtpreviewsink.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/ndisink.cpp"

@@ -109,14 +109,43 @@ QVariantList rows(const QList<OutputTargetAssignment>& outputs, int feedCount,
         row.insert(QStringLiteral("id"), assignment->id);
         row.insert(QStringLiteral("kind"), outputTargetKindName(kind));
         row.insert(QStringLiteral("busKind"), busKindName(bus));
-        row.insert(QStringLiteral("feedIndex"),
-                   bus.kind == OutputBusKind::Feed ? bus.index : -1);
+        row.insert(QStringLiteral("feedIndex"), bus.kind == OutputBusKind::Feed ? bus.index : -1);
         row.insert(QStringLiteral("label"), label(bus));
         row.insert(QStringLiteral("enabled"), assignment->enabled);
         row.insert(QStringLiteral("senderName"), senderName(normalized, kind, bus));
         list.append(row);
     }
     return list;
+}
+
+QList<OutputTargetAssignment> qtPreviewAssignments(int feedCount, bool includeMultiview,
+                                                   bool includePgm) {
+    QList<OutputTargetAssignment> assignments;
+    for (int feed = 0; feed < qMax(0, feedCount); ++feed) {
+        OutputTargetAssignment assignment;
+        assignment.id = QStringLiteral("qt-preview-feed-%1").arg(feed);
+        assignment.sourceBus = OutputBusId::feed(feed);
+        assignment.kind = OutputTargetKind::QtPreview;
+        assignment.enabled = true;
+        assignments.append(assignment);
+    }
+    if (includeMultiview) {
+        OutputTargetAssignment assignment;
+        assignment.id = QStringLiteral("qt-preview-multiview");
+        assignment.sourceBus = OutputBusId::multiview();
+        assignment.kind = OutputTargetKind::QtPreview;
+        assignment.enabled = true;
+        assignments.append(assignment);
+    }
+    if (includePgm) {
+        OutputTargetAssignment assignment;
+        assignment.id = QStringLiteral("qt-preview-pgm");
+        assignment.sourceBus = OutputBusId::pgm();
+        assignment.kind = OutputTargetKind::QtPreview;
+        assignment.enabled = true;
+        assignments.append(assignment);
+    }
+    return assignments;
 }
 
 OutputBusId busFromUiKey(const QString& busKind, int feedIndex) {
