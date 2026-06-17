@@ -17,5 +17,6 @@ struct NativeSrtSockaddr {
 
 bool nativeSrtIsNumericIpv4Host(const QString& host);
 bool nativeSrtMakeIpv4Sockaddr(const QString& host, quint16 port, NativeSrtSockaddr* address);
+bool nativeSrtResolveSockaddr(const QString& host, quint16 port, NativeSrtSockaddr* address);
 
 #endif // NATIVESRTADDRESS_H

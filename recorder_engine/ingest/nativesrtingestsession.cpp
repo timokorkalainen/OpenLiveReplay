@@ -124,7 +124,15 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
         return false;
     }
 
-    return nativeSrtIsNumericIpv4Host(url.host());
+    return !url.host().isEmpty();
+}
+
+QByteArray NativeSrtIngestSession::streamIdForSocketOption(const QUrl& url) {
+    const QUrlQuery query(url);
+    if (!query.hasQueryItem(QStringLiteral("streamid"))) {
+        return QByteArray();
+    }
+    return query.queryItemValue(QStringLiteral("streamid"), QUrl::FullyDecoded).toUtf8();
 }
 
 bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
@@ -285,10 +293,18 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         return false;
     }
 
+    const QByteArray streamId = streamIdForSocketOption(m_url);
+    if (!streamId.isEmpty() &&
+        !setSrtOption(m_socket, SRTO_STREAMID, streamId.constData(), streamId.size(), error,
+                      QStringLiteral("SRTO_STREAMID"))) {
+        closeSocket();
+        return false;
+    }
+
     NativeSrtSockaddr address;
-    if (!nativeSrtMakeIpv4Sockaddr(m_url.host(), quint16(m_url.port(9000)), &address)) {
+    if (!nativeSrtResolveSockaddr(m_url.host(), quint16(m_url.port(9000)), &address)) {
         if (error) {
-            *error = QStringLiteral("Native SRT currently requires a numeric IPv4 host.");
+            *error = QStringLiteral("Native SRT host lookup failed for %1.").arg(m_url.host());
         }
         closeSocket();
         return false;

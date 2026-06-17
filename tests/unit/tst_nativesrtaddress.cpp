@@ -8,6 +8,7 @@ private slots:
     void acceptsNumericIpv4();
     void rejectsNonIpv4Hosts();
     void fillsIpv4Sockaddr();
+    void resolvesHostnames();
 };
 
 void TestNativeSrtAddress::acceptsNumericIpv4() {
@@ -25,6 +26,14 @@ void TestNativeSrtAddress::rejectsNonIpv4Hosts() {
 void TestNativeSrtAddress::fillsIpv4Sockaddr() {
     NativeSrtSockaddr address;
     QVERIFY(nativeSrtMakeIpv4Sockaddr(QStringLiteral("127.0.0.1"), 9000, &address));
+    QVERIFY(address.size > 0);
+    QVERIFY(address.size <= int(sizeof(address.storage)));
+    QVERIFY(address.sockaddrPtr());
+}
+
+void TestNativeSrtAddress::resolvesHostnames() {
+    NativeSrtSockaddr address;
+    QVERIFY(nativeSrtResolveSockaddr(QStringLiteral("localhost"), 8890, &address));
     QVERIFY(address.size > 0);
     QVERIFY(address.size <= int(sizeof(address.storage)));
     QVERIFY(address.sockaddrPtr());

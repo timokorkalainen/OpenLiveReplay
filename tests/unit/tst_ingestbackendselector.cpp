@@ -12,6 +12,8 @@ class TestIngestBackendSelector : public QObject {
     Q_OBJECT
 private slots:
     void srtRoutesToNativeSrt();
+    void srtHostnameWithStreamIdRoutesToNativeSrt();
+    void srtStreamIdIsDecodedForSocketOption();
     void rtmpRoutesToNativeRtmp();
     void unsupportedSchemesAreRejected();
     void srtIsNativeByDefaultWithoutEnv();
@@ -35,6 +37,23 @@ void TestIngestBackendSelector::srtRoutesToNativeSrt() {
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("srt://127.0.0.1:9000")), opts),
              IngestBackendKind::NativeSrt);
 }
+void TestIngestBackendSelector::srtHostnameWithStreamIdRoutesToNativeSrt() {
+    const QUrl url(QStringLiteral("srt://maps.rally.promo:8890?streamid=read:stream4"));
+    QVERIFY(NativeSrtIngestSession::supportsUrl(url));
+
+    const IngestBackendOptions opts =
+        ingestBackendOptionsFromEnvironment(url, NativeSrtIngestSession::supportsUrl(url), false);
+    QVERIFY(opts.preferNativeSrt);
+    QCOMPARE(selectIngestBackend(url, opts), IngestBackendKind::NativeSrt);
+}
+void TestIngestBackendSelector::srtStreamIdIsDecodedForSocketOption() {
+    QCOMPARE(NativeSrtIngestSession::streamIdForSocketOption(
+                 QUrl(QStringLiteral("srt://maps.rally.promo:8890?streamid=read%3Astream4"))),
+             QByteArray("read:stream4"));
+    QVERIFY(NativeSrtIngestSession::streamIdForSocketOption(
+                QUrl(QStringLiteral("srt://maps.rally.promo:8890")))
+                .isEmpty());
+}
 void TestIngestBackendSelector::rtmpRoutesToNativeRtmp() {
     IngestBackendOptions opts;
     opts.preferNativeRtmp = true;
@@ -42,6 +61,14 @@ void TestIngestBackendSelector::rtmpRoutesToNativeRtmp() {
              IngestBackendKind::NativeRtmp);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmps://example.test/live/a")), opts),
              IngestBackendKind::NativeRtmp);
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+    const QUrl signedUrl(QStringLiteral("rtmp://maps.rally.promo/live/stream4?token=abc"));
+    QVERIFY(NativeRtmpIngestSession::supportsUrl(signedUrl));
+    const IngestBackendOptions signedOpts = ingestBackendOptionsFromEnvironment(
+        signedUrl, false, NativeRtmpIngestSession::supportsUrl(signedUrl));
+    QVERIFY(signedOpts.preferNativeRtmp);
+    QCOMPARE(selectIngestBackend(signedUrl, signedOpts), IngestBackendKind::NativeRtmp);
+#endif
 }
 void TestIngestBackendSelector::unsupportedSchemesAreRejected() {
     IngestBackendOptions opts;

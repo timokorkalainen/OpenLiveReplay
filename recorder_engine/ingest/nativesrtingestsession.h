@@ -22,6 +22,7 @@ public:
     ~NativeSrtIngestSession() override;
 
     static bool supportsUrl(const QUrl& url);
+    static QByteArray streamIdForSocketOption(const QUrl& url);
 
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
