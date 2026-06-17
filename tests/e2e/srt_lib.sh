@@ -119,6 +119,38 @@ flash_beep_marker_to_udp() {
     PIDS+=("$SRT_LAST_PID")
 }
 
+# Spawn ONE ffmpeg producer with co-timed full-frame flash + 1kHz beep plus a
+# burnt-in SMPTE timecode, MPEG-TS to a single UDP port. $1=udp_port
+flash_beep_tc_marker_to_udp() {
+    local port="$1"
+    local tc="${OLR_MARKER_TC:-10\\:00\\:00\\:00}"
+    local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128,drawtext=fontfile=:text='':timecode='${tc}':r=30:fontsize=20:fontcolor=white:x=10:y=10"
+    local vargs
+    if [ "${OLR_FLASH_CODEC:-avc}" = "hevc" ]; then
+        srt_hevc_vcodec_args || { echo "SKIP: no HEVC encoder for TC marker"; exit 77; }
+        vargs=("${SRT_HEVC_VCODEC_ARGS[@]}")
+    else
+        vargs=(-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M)
+    fi
+    ffmpeg -hide_banner -loglevel error -re \
+        -f lavfi -i "color=c=black:s=320x240:r=30" \
+        -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
+        -filter_complex "[0:v]${vflt}[v];[1:a]volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame[a]" \
+        -map "[v]" -map "[a]" "${vargs[@]}" \
+        -c:a aac -b:a 128k -timecode "${OLR_MARKER_TC:-10:00:00:00}" \
+        -f mpegts "udp://127.0.0.1:${port}?pkt_size=1316" &
+    SRT_LAST_PID=$!
+    PIDS+=("$SRT_LAST_PID")
+}
+
+# Echoes the MKV's start timecode (HH:MM:SS:FF) or empty.
+mkv_start_timecode() {
+    {
+        ffprobe -v error -show_entries format_tags=timecode -of default=nk=1:nw=1 "$1" 2>/dev/null
+        ffprobe -v error -show_entries stream_tags=timecode -of default=nk=1:nw=1 "$1" 2>/dev/null
+    } | awk 'NF { print; exit }'
+}
+
 # Beep-onset pts_time series for one audio track (silence->sound rising edges).
 # $1=mkv $2=audio-track-index.
 beep_pts_series() {
