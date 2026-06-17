@@ -25,6 +25,9 @@ struct OutputTargetDispatchStats {
     qint64 lastQueuedFrameIndex = -1;
     qint64 lastDeliveredFrameIndex = -1;
     qint64 lastSubmitDurationNs = 0;
+    bool queuePressure = false;
+    bool lastSubmitDroppedFrame = false;
+    bool lastDeliveryGap = false;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
     qint64 repeatedPayloadFrames = 0;
@@ -52,6 +55,8 @@ struct OutputRuntimeDispatchStats {
     qint64 deadlineMisses = 0;
     qint64 catchUpCapHits = 0;
     qint64 cappedCatchUpTicks = 0;
+    bool lastDispatchDeadlineMiss = false;
+    qint64 lastCappedCatchUpTicks = 0;
 };
 
 struct OutputDispatchStats {

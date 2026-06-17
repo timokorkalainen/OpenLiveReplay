@@ -24,6 +24,7 @@ struct BroadcastOutputTargetStatus {
     qint64 lastSubmitDurationNs = 0;
     qint64 runtimeDeadlineMisses = 0;
     qint64 runtimeCatchUpCapHits = 0;
+    qint64 runtimeLastCappedCatchUpTicks = 0;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
     qint64 repeatedPayloadFrames = 0;
@@ -32,6 +33,10 @@ struct BroadcastOutputTargetStatus {
     bool lastSubmitSucceeded = true;
     bool hasLastSinkResult = false;
     bool lastSinkResultSucceeded = true;
+    bool queuePressure = false;
+    bool lastSubmitDroppedFrame = false;
+    bool lastDeliveryGap = false;
+    bool runtimeLastDeadlineMiss = false;
     bool hasLastQueuedFrameIndex = false;
     bool hasLastDeliveredFrameIndex = false;
     QString sinkState;

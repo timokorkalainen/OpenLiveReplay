@@ -344,6 +344,9 @@ void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {
             status.deliveryGaps = 2;
             status.lastQueuedFrameIndex = 12;
             status.lastDeliveredFrameIndex = 11;
+            status.queuePressure = true;
+            status.lastSubmitDroppedFrame = true;
+            status.lastDeliveryGap = true;
             status.hasLastQueuedFrameIndex = true;
             status.hasLastDeliveredFrameIndex = true;
             return status;
@@ -391,6 +394,9 @@ void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {
     QCOMPARE(target.deliveryGaps, qint64(2));
     QCOMPARE(target.lastQueuedFrameIndex, qint64(12));
     QCOMPARE(target.lastDeliveredFrameIndex, qint64(11));
+    QVERIFY(target.queuePressure);
+    QVERIFY(target.lastSubmitDroppedFrame);
+    QVERIFY(target.lastDeliveryGap);
     QVERIFY(target.hasLastQueuedFrameIndex);
     QVERIFY(target.hasLastDeliveredFrameIndex);
 }
@@ -399,6 +405,8 @@ void TestOutputDispatcher::dispatchStatsConvertToBroadcastStatuses() {
     OutputDispatchStats stats;
     stats.runtime.deadlineMisses = 2;
     stats.runtime.catchUpCapHits = 3;
+    stats.runtime.lastDispatchDeadlineMiss = true;
+    stats.runtime.lastCappedCatchUpTicks = 4;
     OutputTargetDispatchStats target;
     target.attemptedFrames = 7;
     target.framesSubmitted = 6;
@@ -422,6 +430,9 @@ void TestOutputDispatcher::dispatchStatsConvertToBroadcastStatuses() {
     target.lastQueuedFrameIndex = 19;
     target.lastDeliveredFrameIndex = 18;
     target.lastSubmitDurationNs = 123456;
+    target.queuePressure = true;
+    target.lastSubmitDroppedFrame = true;
+    target.lastDeliveryGap = true;
     target.hasLastQueuedFrameIndex = true;
     target.hasLastDeliveredFrameIndex = true;
     target.hasLastIdentity = true;
@@ -458,10 +469,15 @@ void TestOutputDispatcher::dispatchStatsConvertToBroadcastStatuses() {
     QCOMPARE(status.lastQueuedFrameIndex, qint64(19));
     QCOMPARE(status.lastDeliveredFrameIndex, qint64(18));
     QCOMPARE(status.lastSubmitDurationNs, qint64(123456));
+    QVERIFY(status.queuePressure);
+    QVERIFY(status.lastSubmitDroppedFrame);
+    QVERIFY(status.lastDeliveryGap);
     QVERIFY(status.hasLastQueuedFrameIndex);
     QVERIFY(status.hasLastDeliveredFrameIndex);
     QCOMPARE(status.runtimeDeadlineMisses, qint64(2));
     QCOMPARE(status.runtimeCatchUpCapHits, qint64(3));
+    QVERIFY(status.runtimeLastDeadlineMiss);
+    QCOMPARE(status.runtimeLastCappedCatchUpTicks, qint64(4));
     QVERIFY(status.hasLastIdentity);
     QCOMPARE(status.lastIdentity.outputFrameIndex, qint64(17));
     QCOMPARE(status.lastIdentity.sampledPlayheadMs, qint64(2040));

@@ -1,6 +1,7 @@
 #include "playback/output/outputruntime.h"
 
 #include <QElapsedTimer>
+#include <cmath>
 #include <utility>
 
 namespace {
@@ -128,10 +129,18 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
 
     QMutexLocker locker(&m_mutex);
     if (dispatched == m_maxCatchUpTicks) {
-        OutputRuntimeDispatchStats runtime = m_dispatcher.stats().runtime;
-        runtime.catchUpCapHits++;
-        runtime.cappedCatchUpTicks++;
-        m_dispatcher.setRuntimeStats(runtime);
+        const FrameRate rate = m_dispatcher.frameRate();
+        const qint64 cappedTicks =
+            qMax<qint64>(0, dueFrameCount(rate, elapsedNs) - m_dispatcher.nextOutputFrameIndex());
+        if (cappedTicks > 0) {
+            OutputRuntimeDispatchStats runtime = m_dispatcher.stats().runtime;
+            runtime.deadlineMisses++;
+            runtime.catchUpCapHits++;
+            runtime.cappedCatchUpTicks += cappedTicks;
+            runtime.lastDispatchDeadlineMiss = true;
+            runtime.lastCappedCatchUpTicks = cappedTicks;
+            m_dispatcher.setRuntimeStats(runtime);
+        }
     }
     return m_dispatcher.stats();
 }
@@ -148,7 +157,8 @@ void OutputRuntime::recordDispatchTiming(qint64 outputFrameIndex, qint64 schedul
     runtime.lastDispatchWallNs = wallNowNs;
     runtime.lastLatenessNs = latenessNs;
     runtime.maxLatenessNs = qMax(runtime.maxLatenessNs, latenessNs);
-    if (latenessNs > 0) runtime.deadlineMisses++;
+    runtime.lastDispatchDeadlineMiss = false;
+    runtime.lastCappedCatchUpTicks = 0;
     m_dispatcher.setRuntimeStats(runtime);
 }
 
@@ -161,4 +171,13 @@ qint64 OutputRuntime::frameIndexToNsCeil(FrameRate rate, qint64 frameIndex) {
     const qint64 fractionalNs =
         (remainderFrames * kNsPerSecond + rate.numerator - 1) / rate.numerator;
     return wholeSeconds * kNsPerSecond + fractionalNs;
+}
+
+qint64 OutputRuntime::dueFrameCount(FrameRate rate, qint64 elapsedNs) {
+    if (!rate.isValid() || elapsedNs < 0) return 0;
+
+    const long double numerator = static_cast<long double>(elapsedNs) * rate.numerator;
+    const long double denominator =
+        static_cast<long double>(kNsPerSecond) * static_cast<long double>(rate.denominator);
+    return static_cast<qint64>(std::floor(numerator / denominator)) + 1;
 }

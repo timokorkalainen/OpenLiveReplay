@@ -14,6 +14,9 @@ struct OutputSinkStatus {
     qint64 lastQueuedFrameIndex = -1;
     qint64 lastDeliveredFrameIndex = -1;
     qint64 lastSubmitDurationNs = 0;
+    bool queuePressure = false;
+    bool lastSubmitDroppedFrame = false;
+    bool lastDeliveryGap = false;
     bool hasLastResult = false;
     bool lastResultSucceeded = true;
     bool hasLastQueuedFrameIndex = false;

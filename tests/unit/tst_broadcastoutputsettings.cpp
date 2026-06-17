@@ -13,6 +13,8 @@ private slots:
     void rowsUseLastSubmitResultForCurrentHealth();
     void rowsMarkDeadlineMissAndDeliveryGapAsError();
     void rowsMarkQueuePressureAsWarning();
+    void rowsKeepRecoveredRuntimeDiagnosticsActive();
+    void rowsKeepHealthySingleFrameQueueActive();
     void qtPreviewAssignmentsCoverFeedsMultiviewAndPgm();
 };
 
@@ -154,6 +156,11 @@ void TestBroadcastOutputSettings::rowsIncludeRuntimeStatusDiagnostics() {
     QCOMPARE(feed.value(QStringLiteral("lastSubmitDurationNs")).toLongLong(), qint64(456789));
     QCOMPARE(feed.value(QStringLiteral("runtimeDeadlineMisses")).toLongLong(), qint64(0));
     QCOMPARE(feed.value(QStringLiteral("runtimeCatchUpCapHits")).toLongLong(), qint64(2));
+    QCOMPARE(feed.value(QStringLiteral("runtimeLastCappedCatchUpTicks")).toLongLong(), qint64(0));
+    QVERIFY(!feed.value(QStringLiteral("runtimeLastDeadlineMiss")).toBool());
+    QVERIFY(!feed.value(QStringLiteral("queuePressure")).toBool());
+    QVERIFY(!feed.value(QStringLiteral("lastSubmitDroppedFrame")).toBool());
+    QVERIFY(!feed.value(QStringLiteral("lastDeliveryGap")).toBool());
     QVERIFY(feed.value(QStringLiteral("hasLastQueuedFrameIndex")).toBool());
     QVERIFY(feed.value(QStringLiteral("hasLastDeliveredFrameIndex")).toBool());
     QCOMPARE(feed.value(QStringLiteral("lastOutputFrameIndex")).toLongLong(), qint64(99));
@@ -233,8 +240,12 @@ void TestBroadcastOutputSettings::rowsMarkDeadlineMissAndDeliveryGapAsError() {
     status.framesSubmitted = 5;
     status.hasLastSubmitResult = true;
     status.lastSubmitSucceeded = true;
+    status.sinkDroppedFrames = 1;
+    status.maxQueueDepth = 3;
     status.runtimeDeadlineMisses = 1;
     status.deliveryGaps = 1;
+    status.runtimeLastDeadlineMiss = true;
+    status.lastDeliveryGap = true;
     status.hasLastIdentity = true;
     status.lastIdentity.bus = OutputBusId::feed(0);
     status.lastIdentity.outputFrameIndex = 4;
@@ -247,6 +258,8 @@ void TestBroadcastOutputSettings::rowsMarkDeadlineMissAndDeliveryGapAsError() {
     QCOMPARE(feed.value(QStringLiteral("statusState")).toString(), QStringLiteral("Error"));
     QCOMPARE(feed.value(QStringLiteral("statusSeverity")).toString(), QStringLiteral("error"));
     const QString diagnostic = feed.value(QStringLiteral("diagnostic")).toString();
+    QVERIFY(diagnostic.contains(QStringLiteral("drop=1")));
+    QVERIFY(diagnostic.contains(QStringLiteral("maxQ=3")));
     QVERIFY(diagnostic.contains(QStringLiteral("deadline=1")));
     QVERIFY(diagnostic.contains(QStringLiteral("gap=1")));
 }
@@ -260,6 +273,7 @@ void TestBroadcastOutputSettings::rowsMarkQueuePressureAsWarning() {
     status.framesSubmitted = 5;
     status.hasLastSubmitResult = true;
     status.lastSubmitSucceeded = true;
+    status.queuePressure = true;
     status.maxQueueDepth = 2;
     status.hasLastIdentity = true;
     status.lastIdentity.bus = OutputBusId::feed(0);
@@ -273,6 +287,58 @@ void TestBroadcastOutputSettings::rowsMarkQueuePressureAsWarning() {
     QCOMPARE(feed.value(QStringLiteral("statusState")).toString(), QStringLiteral("Degraded"));
     QCOMPARE(feed.value(QStringLiteral("statusSeverity")).toString(), QStringLiteral("warning"));
     QVERIFY(feed.value(QStringLiteral("diagnostic")).toString().contains(QStringLiteral("maxQ=2")));
+}
+
+void TestBroadcastOutputSettings::rowsKeepRecoveredRuntimeDiagnosticsActive() {
+    QList<OutputTargetAssignment> outputs = BroadcastOutputSettings::setEnabled(
+        {}, 1, OutputTargetKind::Ndi, OutputBusId::feed(0), true);
+
+    BroadcastOutputTargetStatus status;
+    status.attemptedFrames = 8;
+    status.framesSubmitted = 8;
+    status.hasLastSubmitResult = true;
+    status.lastSubmitSucceeded = true;
+    status.runtimeDeadlineMisses = 1;
+    status.deliveryGaps = 1;
+    status.hasLastIdentity = true;
+    status.lastIdentity.bus = OutputBusId::feed(0);
+    status.lastIdentity.outputFrameIndex = 7;
+
+    QHash<QString, BroadcastOutputTargetStatus> statuses;
+    statuses.insert(QStringLiteral("feed0-ndi"), status);
+
+    const QVariantMap feed =
+        BroadcastOutputSettings::rows(outputs, 1, OutputTargetKind::Ndi, statuses)[0].toMap();
+    QCOMPARE(feed.value(QStringLiteral("statusState")).toString(), QStringLiteral("Active"));
+    QCOMPARE(feed.value(QStringLiteral("statusSeverity")).toString(), QStringLiteral("ok"));
+    const QString diagnostic = feed.value(QStringLiteral("diagnostic")).toString();
+    QVERIFY(diagnostic.contains(QStringLiteral("deadline=1")));
+    QVERIFY(diagnostic.contains(QStringLiteral("gap=1")));
+}
+
+void TestBroadcastOutputSettings::rowsKeepHealthySingleFrameQueueActive() {
+    QList<OutputTargetAssignment> outputs = BroadcastOutputSettings::setEnabled(
+        {}, 1, OutputTargetKind::Ndi, OutputBusId::feed(0), true);
+
+    BroadcastOutputTargetStatus status;
+    status.attemptedFrames = 3;
+    status.framesSubmitted = 3;
+    status.hasLastSubmitResult = true;
+    status.lastSubmitSucceeded = true;
+    status.currentQueueDepth = 1;
+    status.maxQueueDepth = 1;
+    status.hasLastIdentity = true;
+    status.lastIdentity.bus = OutputBusId::feed(0);
+    status.lastIdentity.outputFrameIndex = 2;
+
+    QHash<QString, BroadcastOutputTargetStatus> statuses;
+    statuses.insert(QStringLiteral("feed0-ndi"), status);
+
+    const QVariantMap feed =
+        BroadcastOutputSettings::rows(outputs, 1, OutputTargetKind::Ndi, statuses)[0].toMap();
+    QCOMPARE(feed.value(QStringLiteral("statusState")).toString(), QStringLiteral("Active"));
+    QCOMPARE(feed.value(QStringLiteral("statusSeverity")).toString(), QStringLiteral("ok"));
+    QVERIFY(feed.value(QStringLiteral("diagnostic")).toString().contains(QStringLiteral("maxQ=1")));
 }
 
 void TestBroadcastOutputSettings::qtPreviewAssignmentsCoverFeedsMultiviewAndPgm() {

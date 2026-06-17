@@ -62,6 +62,7 @@ private slots:
     void nanosecondTicksHonorFractionalFrameBoundary();
     void workerThreadTicksWithoutExternalDispatchCalls();
     void runtimeStatsReportNoDeadlineMissForOnTimeTicks();
+    void exactlyMaxCatchUpTicksDoesNotReportCapHit();
     void runtimeStatsReportDeadlineMissWhenCatchUpIsCapped();
 };
 
@@ -173,6 +174,7 @@ void TestOutputRuntime::workerThreadTicksWithoutExternalDispatchCalls() {
     QCOMPARE(frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(frames[2].outputFrameIndex, qint64(2));
     QCOMPARE(uchar(frames[2].video.planeY.at(0)), uchar(55));
+    QCOMPARE(runtime.stats().runtime.deadlineMisses, qint64(0));
 }
 
 void TestOutputRuntime::runtimeStatsReportNoDeadlineMissForOnTimeTicks() {
@@ -212,6 +214,41 @@ void TestOutputRuntime::runtimeStatsReportNoDeadlineMissForOnTimeTicks() {
     QVERIFY(stats.runtime.lastLatenessNs <= 0);
 }
 
+void TestOutputRuntime::exactlyMaxCatchUpTicksDoesNotReportCapHit() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 85));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    const OutputDispatchStats stats = runtime.dispatchDueTicksForTest(320);
+
+    QCOMPARE(stats.ticks, qint64(9));
+    QCOMPARE(stats.runtime.deadlineMisses, qint64(0));
+    QCOMPARE(stats.runtime.catchUpCapHits, qint64(0));
+    QCOMPARE(stats.runtime.cappedCatchUpTicks, qint64(0));
+    QVERIFY(!stats.runtime.lastDispatchDeadlineMiss);
+}
+
 void TestOutputRuntime::runtimeStatsReportDeadlineMissWhenCatchUpIsCapped() {
     OutputFrameCache cache(1, 4, 4);
     cache.insertVideoFrame(video(0, 100, 90));
@@ -243,7 +280,9 @@ void TestOutputRuntime::runtimeStatsReportDeadlineMissWhenCatchUpIsCapped() {
     QCOMPARE(stats.ticks, qint64(9));
     QVERIFY(stats.runtime.deadlineMisses > 0);
     QVERIFY(stats.runtime.catchUpCapHits > 0);
-    QCOMPARE(stats.runtime.cappedCatchUpTicks, qint64(1));
+    QCOMPARE(stats.runtime.cappedCatchUpTicks, qint64(7));
+    QVERIFY(stats.runtime.lastDispatchDeadlineMiss);
+    QCOMPARE(stats.runtime.lastCappedCatchUpTicks, qint64(7));
     QVERIFY(stats.runtime.maxLatenessNs > 0);
     QCOMPARE(stats.runtime.lastDispatchedFrameIndex, qint64(8));
 }

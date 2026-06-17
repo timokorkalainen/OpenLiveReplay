@@ -28,14 +28,14 @@ const OutputTargetAssignment* findAssignment(const QList<OutputTargetAssignment>
 }
 
 bool hasCurrentError(const BroadcastOutputTargetStatus& status) {
-    return status.runtimeDeadlineMisses > 0 || status.deliveryGaps > 0 ||
+    return status.runtimeLastDeadlineMiss || status.lastDeliveryGap ||
            (status.hasLastSubmitResult && !status.lastSubmitSucceeded) ||
            (status.hasLastSinkResult && !status.lastSinkResultSucceeded) ||
            (status.sinkFailures > 0 && status.framesSubmitted == 0);
 }
 
 bool hasDegradedHealth(const BroadcastOutputTargetStatus& status) {
-    return status.maxQueueDepth > 0 || status.sinkDroppedFrames > 0 ||
+    return status.queuePressure || status.lastSubmitDroppedFrame ||
            (status.hasLastIdentity && status.lastIdentity.videoPlaceholder);
 }
 
@@ -88,8 +88,8 @@ QString diagnosticText(const OutputTargetAssignment& assignment,
     QString text =
         QStringLiteral(
             "queued=%1 sent=%2 fail=%3 sinkFail=%4 drop=%5 placeholder=%6 silent=%7 repeated=%8 "
-            "deadline=%9 cap=%10 q=%11 maxQ=%12 gap=%13 lastQueued=%14 lastDelivered=%15 "
-            "sendNs=%16 lastOut=%17 playhead=%18 srcFeed=%19 srcPts=%20")
+            "deadline=%9 cap=%10 lastCap=%11 q=%12 maxQ=%13 gap=%14 lastQueued=%15 "
+            "lastDelivered=%16 sendNs=%17 lastOut=%18 playhead=%19 srcFeed=%20 srcPts=%21")
             .arg(status->framesSubmitted)
             .arg(status->hasSinkStatus ? status->sinkSubmittedFrames : status->framesSubmitted)
             .arg(status->sinkFailures)
@@ -100,6 +100,7 @@ QString diagnosticText(const OutputTargetAssignment& assignment,
             .arg(status->repeatedPayloadFrames)
             .arg(status->runtimeDeadlineMisses)
             .arg(status->runtimeCatchUpCapHits)
+            .arg(status->runtimeLastCappedCatchUpTicks)
             .arg(status->currentQueueDepth)
             .arg(status->maxQueueDepth)
             .arg(status->deliveryGaps)
@@ -143,11 +144,17 @@ void addStatusFields(QVariantMap& row, const OutputTargetAssignment& assignment,
     row.insert(QStringLiteral("lastSubmitDurationNs"), values.lastSubmitDurationNs);
     row.insert(QStringLiteral("runtimeDeadlineMisses"), values.runtimeDeadlineMisses);
     row.insert(QStringLiteral("runtimeCatchUpCapHits"), values.runtimeCatchUpCapHits);
+    row.insert(QStringLiteral("runtimeLastCappedCatchUpTicks"),
+               values.runtimeLastCappedCatchUpTicks);
     row.insert(QStringLiteral("hasSinkStatus"), values.hasSinkStatus);
     row.insert(QStringLiteral("hasLastSubmitResult"), values.hasLastSubmitResult);
     row.insert(QStringLiteral("lastSubmitSucceeded"), values.lastSubmitSucceeded);
     row.insert(QStringLiteral("hasLastSinkResult"), values.hasLastSinkResult);
     row.insert(QStringLiteral("lastSinkResultSucceeded"), values.lastSinkResultSucceeded);
+    row.insert(QStringLiteral("queuePressure"), values.queuePressure);
+    row.insert(QStringLiteral("lastSubmitDroppedFrame"), values.lastSubmitDroppedFrame);
+    row.insert(QStringLiteral("lastDeliveryGap"), values.lastDeliveryGap);
+    row.insert(QStringLiteral("runtimeLastDeadlineMiss"), values.runtimeLastDeadlineMiss);
     row.insert(QStringLiteral("hasLastQueuedFrameIndex"), values.hasLastQueuedFrameIndex);
     row.insert(QStringLiteral("hasLastDeliveredFrameIndex"), values.hasLastDeliveredFrameIndex);
     row.insert(QStringLiteral("sinkState"), values.sinkState);

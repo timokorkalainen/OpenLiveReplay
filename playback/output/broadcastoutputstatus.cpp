@@ -21,6 +21,7 @@ QHash<QString, BroadcastOutputTargetStatus> fromDispatchStats(const OutputDispat
         status.lastSubmitDurationNs = source.lastSubmitDurationNs;
         status.runtimeDeadlineMisses = stats.runtime.deadlineMisses;
         status.runtimeCatchUpCapHits = stats.runtime.catchUpCapHits;
+        status.runtimeLastCappedCatchUpTicks = stats.runtime.lastCappedCatchUpTicks;
         status.placeholderFrames = source.placeholderFrames;
         status.silentAudioFrames = source.silentAudioFrames;
         status.repeatedPayloadFrames = source.repeatedPayloadFrames;
@@ -29,6 +30,10 @@ QHash<QString, BroadcastOutputTargetStatus> fromDispatchStats(const OutputDispat
         status.lastSubmitSucceeded = source.lastSubmitSucceeded;
         status.hasLastSinkResult = source.hasLastSinkResult;
         status.lastSinkResultSucceeded = source.lastSinkResultSucceeded;
+        status.queuePressure = source.queuePressure;
+        status.lastSubmitDroppedFrame = source.lastSubmitDroppedFrame;
+        status.lastDeliveryGap = source.lastDeliveryGap;
+        status.runtimeLastDeadlineMiss = stats.runtime.lastDispatchDeadlineMiss;
         status.hasLastQueuedFrameIndex = source.hasLastQueuedFrameIndex;
         status.hasLastDeliveredFrameIndex = source.hasLastDeliveredFrameIndex;
         status.sinkState = source.sinkState;

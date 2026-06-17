@@ -80,6 +80,8 @@ quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
     mix(quint64(stats.runtime.lastDispatchedFrameIndex));
     mix(quint64(stats.runtime.lastLatenessNs));
     mix(quint64(stats.runtime.maxLatenessNs));
+    mix(stats.runtime.lastDispatchDeadlineMiss ? 1 : 0);
+    mix(quint64(stats.runtime.lastCappedCatchUpTicks));
 
     QStringList keys = stats.targets.keys();
     keys.sort();
@@ -98,6 +100,9 @@ quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
         mix(quint64(target.lastQueuedFrameIndex));
         mix(quint64(target.lastDeliveredFrameIndex));
         mix(quint64(target.lastSubmitDurationNs));
+        mix(target.queuePressure ? 1 : 0);
+        mix(target.lastSubmitDroppedFrame ? 1 : 0);
+        mix(target.lastDeliveryGap ? 1 : 0);
         mix(quint64(target.placeholderFrames));
         mix(quint64(target.silentAudioFrames));
         mix(quint64(target.repeatedPayloadFrames));

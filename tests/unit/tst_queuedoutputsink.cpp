@@ -269,6 +269,7 @@ void TestQueuedOutputSink::queueStatusReportsDepthAndDroppedFrames() {
     QVERIFY(submitted12);
     QVERIFY(status.maxQueueDepth >= 1);
     QVERIFY(status.droppedFrames >= 1);
+    QVERIFY(status.lastSubmitDroppedFrame);
     QCOMPARE(status.lastQueuedFrameIndex, qint64(12));
 }
 
@@ -289,6 +290,7 @@ void TestQueuedOutputSink::deliveryGapsAreVisibleInStatus() {
     QTRY_COMPARE_WITH_TIMEOUT(observed->delivered().size(), 2, 500);
     const OutputSinkStatus status = sink.outputStatus();
     QVERIFY(status.deliveryGaps > 0);
+    QVERIFY(status.lastDeliveryGap);
     QCOMPARE(status.lastDeliveredFrameIndex, qint64(22));
 
     sink.stop();
@@ -312,6 +314,7 @@ void TestQueuedOutputSink::failedInnerSubmitDoesNotAdvanceDeliveredFrameIndex() 
     QTRY_COMPARE_WITH_TIMEOUT(observed->delivered(), (QVector<qint64>{20, 22}), 500);
     const OutputSinkStatus status = sink.outputStatus();
     QVERIFY(status.deliveryGaps > 0);
+    QVERIFY(status.lastDeliveryGap);
     QCOMPARE(status.lastDeliveredFrameIndex, qint64(22));
 
     sink.stop();
