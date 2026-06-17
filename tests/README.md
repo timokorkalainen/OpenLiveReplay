@@ -29,6 +29,19 @@ Local transport bring-up gates use distinct labels such as `srt`,
 `native-apple-ingest`, and `native-rtmp`; they are excluded from CI until their
 matching native ingest path is ready.
 
+The `ndi-runtime` label is an opt-in real NDI sender/receiver smoke test. It
+loads the NDI runtime dynamically, starts the app's `NdiOutputSink`, discovers
+the local sender, and captures one video frame and one audio frame. It skips
+unless `OLR_RUN_NDI_RUNTIME_TESTS=1` is set and the runtime is available; set
+`OLR_NDI_RUNTIME_LIBRARY=/path/to/libndi.dylib` when the runtime is not in the
+platform default location.
+
+```bash
+OLR_RUN_NDI_RUNTIME_TESTS=1 \
+OLR_NDI_RUNTIME_LIBRARY=/usr/local/lib/libndi.dylib \
+ctest --test-dir build -L ndi-runtime --output-on-failure
+```
+
 `native-rtmp` mirrors the applicable SRT transport gates: one-source RTMP/RTMPS
 smoke, 4-source routing, 4-source sync, per-source trim, and live/dead
 connection count.
