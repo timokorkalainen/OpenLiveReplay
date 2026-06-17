@@ -69,6 +69,7 @@ public:
     void stop();
 
     PlaybackCounters counters() const { return m_counters; }
+    OutputDispatchStats outputStats() const;
 
 protected:
     void run() override;
@@ -154,6 +155,7 @@ private:
 
     QMutex m_mutex;
     mutable QMutex m_bufferMutex;
+    mutable QMutex m_outputRuntimeMutex;
 
     QList<OutputTargetAssignment> m_externalOutputAssignments;
     std::atomic<bool> m_outputTargetsDirty{false};

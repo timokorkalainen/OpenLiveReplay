@@ -90,6 +90,8 @@ class UIManager : public QObject {
     Q_PROPERTY(int telemetryVersion READ telemetryVersion NOTIFY telemetryChanged)
     Q_PROPERTY(
         int broadcastOutputsVersion READ broadcastOutputsVersion NOTIFY broadcastOutputsChanged)
+    Q_PROPERTY(int broadcastOutputStatusVersion READ broadcastOutputStatusVersion NOTIFY
+                   broadcastOutputStatusChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -148,6 +150,7 @@ public:
     QString telemetrySseUrl() const { return m_currentSettings.telemetrySseUrl; }
     int telemetryVersion() const { return m_telemetryVersion; }
     int broadcastOutputsVersion() const { return m_broadcastOutputsVersion; }
+    int broadcastOutputStatusVersion() const { return m_broadcastOutputStatusVersion; }
 
     // Setters
     void setStreamUrls(const QStringList &urls);
@@ -237,6 +240,7 @@ public:
     Q_INVOKABLE QVariantMap telemetryAtPlayhead();
     Q_INVOKABLE QVariantList telemetryRowsAtPlayhead();
     Q_INVOKABLE QVariantList ndiOutputRows() const;
+    Q_INVOKABLE QVariantMap ndiOutputStatus(const QString& targetId) const;
     Q_INVOKABLE bool ndiOutputEnabled(const QString& busKind, int feedIndex) const;
     Q_INVOKABLE QString ndiOutputSenderName(const QString& busKind, int feedIndex) const;
     Q_INVOKABLE void setNdiOutputEnabled(const QString& busKind, int feedIndex, bool enabled);
@@ -295,6 +299,7 @@ signals:
     void telemetryConfigChanged();
     void telemetryChanged();
     void broadcastOutputsChanged();
+    void broadcastOutputStatusChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -429,6 +434,9 @@ private:
     bool m_hasTelemetryTimeline = false;
     int m_telemetryVersion = 0;
     int m_broadcastOutputsVersion = 0;
+    int m_broadcastOutputStatusVersion = 0;
+    QTimer m_broadcastOutputStatusTimer;
+    quint64 m_broadcastOutputStatusFingerprint = 0;
 
     enum MidiLearnMode {
         LearnControl = 0,

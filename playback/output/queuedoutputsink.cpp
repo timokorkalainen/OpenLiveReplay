@@ -21,6 +21,10 @@ bool QueuedOutputSink::start(const OutputTargetAssignment& assignment, FrameRate
         m_stopRequested = false;
         m_active = true;
         m_droppedFrames = 0;
+        m_asyncAcceptedFrames = 0;
+        m_asyncFailedFrames = 0;
+        m_hasLastAsyncResult = false;
+        m_lastAsyncResultSucceeded = true;
     }
 
     m_thread.reset(QThread::create([this]() { workerLoop(); }));
@@ -65,6 +69,30 @@ int QueuedOutputSink::droppedFrames() const {
     return m_droppedFrames;
 }
 
+OutputSinkStatus QueuedOutputSink::outputStatus() const {
+    OutputSinkStatus own;
+    {
+        QMutexLocker locker(&m_mutex);
+        own.acceptedFrames = m_asyncAcceptedFrames;
+        own.failedFrames = m_asyncFailedFrames;
+        own.droppedFrames = m_droppedFrames;
+        own.hasLastResult = m_hasLastAsyncResult;
+        own.lastResultSucceeded = m_lastAsyncResultSucceeded;
+    }
+
+    const OutputSinkStatus inner = m_inner ? m_inner->outputStatus() : OutputSinkStatus{};
+    own.acceptedFrames = qMax(own.acceptedFrames, inner.acceptedFrames);
+    own.failedFrames = qMax(own.failedFrames, inner.failedFrames);
+    own.droppedFrames += inner.droppedFrames;
+    if (inner.hasLastResult) {
+        own.hasLastResult = true;
+        own.lastResultSucceeded = inner.lastResultSucceeded;
+    }
+    if (!inner.state.isEmpty()) own.state = inner.state;
+    if (!inner.message.isEmpty()) own.message = inner.message;
+    return own;
+}
+
 void QueuedOutputSink::workerLoop() {
     while (true) {
         OutputBusFrame frame;
@@ -76,6 +104,16 @@ void QueuedOutputSink::workerLoop() {
             if (m_stopRequested) return;
             frame = m_queue.takeFirst();
         }
-        if (m_inner) m_inner->submit(frame);
+        const bool submitted = m_inner && m_inner->submit(frame);
+        {
+            QMutexLocker locker(&m_mutex);
+            if (submitted) {
+                m_asyncAcceptedFrames++;
+            } else {
+                m_asyncFailedFrames++;
+            }
+            m_hasLastAsyncResult = true;
+            m_lastAsyncResultSucceeded = submitted;
+        }
     }
 }

@@ -112,6 +112,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/outputframecache.h playback/output/outputframecache.cpp
         playback/output/outputtargetassignment.h playback/output/outputtargetassignment.cpp
         playback/output/broadcastoutputsettings.h playback/output/broadcastoutputsettings.cpp
+        playback/output/broadcastoutputstatus.h playback/output/broadcastoutputstatus.cpp
         playback/output/outputbusengine.h playback/output/outputbusengine.cpp
         playback/output/outputsink.h
         playback/output/outputdispatcher.h playback/output/outputdispatcher.cpp

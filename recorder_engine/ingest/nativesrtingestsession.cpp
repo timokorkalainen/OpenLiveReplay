@@ -139,7 +139,11 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
         return false;
     }
 
-    return nativeSrtIsNumericIpv4Host(url.host());
+    return !url.host().isEmpty();
+}
+
+QByteArray NativeSrtIngestSession::streamIdForSocketOption(const QUrl& url) {
+    return nativeSrtUrlOptionsFromUrl(url).streamId.toUtf8();
 }
 
 bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
@@ -258,6 +262,38 @@ void NativeSrtIngestSession::requestStop() {
 }
 
 bool NativeSrtIngestSession::openSocket(QString* error) {
+    const QList<NativeSrtSockaddr> addresses = nativeSrtResolveSockaddrsWithTimeout(
+        m_url.host(), quint16(m_url.port(9000)), kSrtConnectTimeoutMs,
+        [this]() { return shouldStop(); });
+    if (addresses.isEmpty()) {
+        if (error) {
+            *error =
+                shouldStop()
+                    ? QStringLiteral("Native SRT host lookup cancelled.")
+                    : QStringLiteral("Native SRT host lookup failed for %1.").arg(m_url.host());
+        }
+        return false;
+    }
+
+    QString connectError;
+    if (nativeSrtTrySockaddrs(
+            addresses,
+            [this](const NativeSrtSockaddr& address, QString* attemptError) {
+                closeSocket();
+                return openSocketToAddress(address, attemptError);
+            },
+            &connectError, [this]() { return shouldStop(); })) {
+        return true;
+    }
+
+    if (error) {
+        *error = connectError;
+    }
+    closeSocket();
+    return false;
+}
+
+bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& address, QString* error) {
     if (!acquireSrtLibrary(error)) {
         return false;
     }
@@ -300,20 +336,10 @@ bool NativeSrtIngestSession::openSocket(QString* error) {
         return false;
     }
 
-    const NativeSrtUrlOptions urlOptions = nativeSrtUrlOptionsFromUrl(m_url);
-    const QByteArray streamIdUtf8 = urlOptions.streamId.toUtf8();
-    if (!streamIdUtf8.isEmpty() &&
-        !setSrtOption(m_socket, SRTO_STREAMID, streamIdUtf8.constData(), int(streamIdUtf8.size()),
-                      error, QStringLiteral("SRTO_STREAMID"))) {
-        closeSocket();
-        return false;
-    }
-
-    NativeSrtSockaddr address;
-    if (!nativeSrtMakeIpv4Sockaddr(m_url.host(), quint16(m_url.port(9000)), &address)) {
-        if (error) {
-            *error = QStringLiteral("Native SRT currently requires a numeric IPv4 host.");
-        }
+    const QByteArray streamId = streamIdForSocketOption(m_url);
+    if (!streamId.isEmpty() &&
+        !setSrtOption(m_socket, SRTO_STREAMID, streamId.constData(), streamId.size(), error,
+                      QStringLiteral("SRTO_STREAMID"))) {
         closeSocket();
         return false;
     }

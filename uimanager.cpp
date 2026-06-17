@@ -1,6 +1,7 @@
 #include "uimanager.h"
 #include "playback/audioplayer.h"
 #include "playback/output/broadcastoutputsettings.h"
+#include "playback/output/broadcastoutputstatus.h"
 #include "project/projectimportclient.h"
 #include "telemetry/telemetryclient.h"
 #include <QDateTime>
@@ -61,6 +62,51 @@ QString metadataSummary(const QJsonArray &metadata) {
     return parts.join(QStringLiteral("  "));
 }
 
+quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
+    quint64 fp = 1469598103934665603ull;
+    const auto mix = [&fp](quint64 value) {
+        fp ^= value;
+        fp *= 1099511628211ull;
+    };
+
+    mix(quint64(stats.ticks));
+    mix(quint64(stats.framesSubmitted));
+    mix(quint64(stats.sinkFailures));
+    mix(quint64(stats.placeholderFrames));
+    mix(quint64(stats.silentAudioFrames));
+
+    QStringList keys = stats.targets.keys();
+    keys.sort();
+    for (const QString& key : keys) {
+        const OutputTargetDispatchStats target = stats.targets.value(key);
+        mix(quint64(qHash(key)));
+        mix(quint64(target.attemptedFrames));
+        mix(quint64(target.framesSubmitted));
+        mix(quint64(target.sinkFailures));
+        mix(quint64(target.sinkSubmittedFrames));
+        mix(quint64(target.sinkFailedFrames));
+        mix(quint64(target.sinkDroppedFrames));
+        mix(quint64(target.placeholderFrames));
+        mix(quint64(target.silentAudioFrames));
+        mix(quint64(target.repeatedPayloadFrames));
+        mix(target.hasSinkStatus ? 1 : 0);
+        mix(target.hasLastSubmitResult ? 1 : 0);
+        mix(target.lastSubmitSucceeded ? 1 : 0);
+        mix(target.hasLastSinkResult ? 1 : 0);
+        mix(target.lastSinkResultSucceeded ? 1 : 0);
+        mix(quint64(qHash(target.sinkState)));
+        mix(quint64(qHash(target.sinkMessage)));
+        mix(target.hasLastIdentity ? 1 : 0);
+        if (target.hasLastIdentity) {
+            mix(quint64(target.lastIdentity.outputFrameIndex));
+            mix(quint64(target.lastIdentity.sampledPlayheadMs));
+            mix(quint64(target.lastIdentity.sourceFeedIndex));
+            mix(quint64(target.lastIdentity.sourcePtsMs));
+        }
+    }
+    return fp;
+}
+
 } // namespace
 
 UIManager::UIManager(ReplayManager *engine, QObject *parent)
@@ -73,6 +119,17 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
             &UIManager::onSourceConnectionChanged, Qt::QueuedConnection);
     connect(m_replayManager, &ReplayManager::sourceStatsUpdated, this,
             &UIManager::onSourceStatsUpdated, Qt::QueuedConnection);
+    m_broadcastOutputStatusTimer.setInterval(500);
+    connect(&m_broadcastOutputStatusTimer, &QTimer::timeout, this, [this]() {
+        const OutputDispatchStats stats =
+            m_playbackWorker ? m_playbackWorker->outputStats() : OutputDispatchStats{};
+        const quint64 fingerprint = outputStatusFingerprint(stats);
+        if (fingerprint == m_broadcastOutputStatusFingerprint) return;
+        m_broadcastOutputStatusFingerprint = fingerprint;
+        m_broadcastOutputStatusVersion++;
+        emit broadcastOutputStatusChanged();
+    });
+    m_broadcastOutputStatusTimer.start();
     {
         // Amber lights when the windowed retransmit rate exceeds this fraction of
         // received packets. ARQ retransmits routinely on healthy lossy links, so
@@ -1891,6 +1948,19 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
 QVariantList UIManager::ndiOutputRows() const {
     return BroadcastOutputSettings::rows(m_currentSettings.broadcastOutputs, activeViewCount(),
                                          OutputTargetKind::Ndi);
+}
+
+QVariantMap UIManager::ndiOutputStatus(const QString& targetId) const {
+    const QHash<QString, BroadcastOutputTargetStatus> statuses =
+        m_playbackWorker ? BroadcastOutputStatus::fromDispatchStats(m_playbackWorker->outputStats())
+                         : QHash<QString, BroadcastOutputTargetStatus>{};
+    const QVariantList rows = BroadcastOutputSettings::rows(
+        m_currentSettings.broadcastOutputs, activeViewCount(), OutputTargetKind::Ndi, statuses);
+    for (const QVariant& rowValue : rows) {
+        const QVariantMap row = rowValue.toMap();
+        if (row.value(QStringLiteral("id")).toString() == targetId) return row;
+    }
+    return QVariantMap{};
 }
 
 bool UIManager::ndiOutputEnabled(const QString& busKind, int feedIndex) const {

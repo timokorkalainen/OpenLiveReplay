@@ -4,6 +4,9 @@
 #include "recorder_engine/ingest/nativesrtconnectdiagnostics.h"
 #include "recorder_engine/ingest/nativesrturloptions.h"
 
+#include <QElapsedTimer>
+#include <QThread>
+
 class TestNativeSrtAddress : public QObject {
     Q_OBJECT
 private slots:
@@ -13,6 +16,10 @@ private slots:
     void extractsStreamIdOption_data();
     void extractsStreamIdOption();
     void formatsApplicationDefinedRejectReasonWithCode();
+    void resolvesHostnames();
+    void triesLaterResolvedAddressesAfterFirstFailure();
+    void stopsTryingAddressesWhenStopRequested();
+    void resolverTimeoutReturnsBeforeCallbackFinishes();
 };
 
 void TestNativeSrtAddress::acceptsNumericIpv4() {
@@ -72,6 +79,71 @@ void TestNativeSrtAddress::formatsApplicationDefinedRejectReasonWithCode() {
     QVERIFY(message.contains(QStringLiteral("Application-defined rejection reason")));
     QVERIFY(message.contains(QStringLiteral("1404")));
     QVERIFY(!message.contains(QStringLiteral("Success")));
+}
+
+void TestNativeSrtAddress::resolvesHostnames() {
+    NativeSrtSockaddr address;
+    QVERIFY(nativeSrtResolveSockaddr(QStringLiteral("localhost"), 8890, &address));
+    QVERIFY(address.size > 0);
+    QVERIFY(address.size <= int(sizeof(address.storage)));
+    QVERIFY(address.sockaddrPtr());
+}
+
+void TestNativeSrtAddress::triesLaterResolvedAddressesAfterFirstFailure() {
+    NativeSrtSockaddr first;
+    NativeSrtSockaddr second;
+    QVERIFY(nativeSrtMakeIpv4Sockaddr(QStringLiteral("127.0.0.1"), 8890, &first));
+    QVERIFY(nativeSrtMakeIpv4Sockaddr(QStringLiteral("127.0.0.2"), 8890, &second));
+
+    int attempts = 0;
+    QString error;
+    QVERIFY(nativeSrtTrySockaddrs(
+        {first, second},
+        [&attempts](const NativeSrtSockaddr&, QString*) {
+            ++attempts;
+            return attempts == 2;
+        },
+        &error));
+    QCOMPARE(attempts, 2);
+    QVERIFY(error.isEmpty());
+}
+
+void TestNativeSrtAddress::stopsTryingAddressesWhenStopRequested() {
+    NativeSrtSockaddr first;
+    NativeSrtSockaddr second;
+    QVERIFY(nativeSrtMakeIpv4Sockaddr(QStringLiteral("127.0.0.1"), 8890, &first));
+    QVERIFY(nativeSrtMakeIpv4Sockaddr(QStringLiteral("127.0.0.2"), 8890, &second));
+
+    bool stopRequested = false;
+    int attempts = 0;
+    QString error;
+    QVERIFY(!nativeSrtTrySockaddrs(
+        {first, second},
+        [&attempts, &stopRequested](const NativeSrtSockaddr&, QString* attemptError) {
+            ++attempts;
+            stopRequested = true;
+            if (attemptError) {
+                *attemptError = QStringLiteral("cancelled");
+            }
+            return false;
+        },
+        &error, [&stopRequested]() { return stopRequested; }));
+    QCOMPARE(attempts, 1);
+    QCOMPARE(error, QStringLiteral("cancelled"));
+}
+
+void TestNativeSrtAddress::resolverTimeoutReturnsBeforeCallbackFinishes() {
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const QList<NativeSrtSockaddr> addresses = nativeSrtResolveSockaddrsWithTimeout(
+        []() {
+            QThread::msleep(300);
+            return QList<NativeSrtSockaddr>();
+        },
+        20, []() { return false; });
+
+    QVERIFY(addresses.isEmpty());
+    QVERIFY2(elapsed.elapsed() < 250, "resolver timeout blocked on the slow callback");
 }
 
 QTEST_GUILESS_MAIN(TestNativeSrtAddress)

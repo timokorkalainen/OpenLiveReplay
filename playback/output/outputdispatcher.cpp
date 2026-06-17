@@ -20,6 +20,11 @@ bool isSilentAudio(const MediaAudioFrame& audio) {
     return true;
 }
 
+bool hasMeaningfulSinkStatus(const OutputSinkStatus& status) {
+    return status.acceptedFrames > 0 || status.failedFrames > 0 || status.droppedFrames > 0 ||
+           status.hasLastResult || !status.state.isEmpty() || !status.message.isEmpty();
+}
+
 } // namespace
 
 OutputDispatcher::OutputDispatcher(FrameRate rate, int feedCount, int width, int height)
@@ -85,6 +90,30 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
     return m_stats;
 }
 
+OutputDispatchStats OutputDispatcher::stats() const {
+    OutputDispatchStats snapshot = m_stats;
+    for (const OutputEndpoint& endpoint : m_endpoints) {
+        if (!endpoint.assignment.enabled || !endpoint.sink ||
+            endpoint.sink->kind() != endpoint.assignment.kind) {
+            continue;
+        }
+
+        const OutputSinkStatus sinkStatus = endpoint.sink->outputStatus();
+        if (!hasMeaningfulSinkStatus(sinkStatus)) continue;
+
+        OutputTargetDispatchStats& target = snapshot.targets[targetStatsKey(endpoint.assignment)];
+        target.hasSinkStatus = true;
+        target.sinkSubmittedFrames = sinkStatus.acceptedFrames;
+        target.sinkFailedFrames = sinkStatus.failedFrames;
+        target.sinkDroppedFrames = sinkStatus.droppedFrames;
+        target.hasLastSinkResult = sinkStatus.hasLastResult;
+        target.lastSinkResultSucceeded = sinkStatus.lastResultSucceeded;
+        target.sinkState = sinkStatus.state;
+        target.sinkMessage = sinkStatus.message;
+    }
+    return snapshot;
+}
+
 PlaybackStateSnapshot OutputDispatcher::clockedStateForTick(qint64 outputFrameIndex,
                                                             const PlaybackStateSnapshot& state) {
     PlaybackStateSnapshot tickState = state;
@@ -130,6 +159,8 @@ void OutputDispatcher::countFrameHealth(const OutputBusFrame& frame) {
 void OutputDispatcher::countTargetStartFailure(const OutputTargetAssignment& assignment) {
     OutputTargetDispatchStats& stats = m_stats.targets[targetStatsKey(assignment)];
     stats.sinkFailures++;
+    stats.hasLastSubmitResult = true;
+    stats.lastSubmitSucceeded = false;
     m_stats.sinkFailures++;
 }
 
@@ -142,6 +173,8 @@ void OutputDispatcher::countTargetAttempt(const OutputTargetAssignment& assignme
     } else {
         stats.sinkFailures++;
     }
+    stats.hasLastSubmitResult = true;
+    stats.lastSubmitSucceeded = submitted;
     if (frame.video.isPlaceholder) stats.placeholderFrames++;
     if (isSilentAudio(frame.audio)) stats.silentAudioFrames++;
     if (stats.hasLastIdentity && stats.lastIdentity.samePayloadAs(frame.identity)) {

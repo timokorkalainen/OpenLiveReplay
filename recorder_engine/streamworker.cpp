@@ -369,9 +369,8 @@ void StreamWorker::captureLoop() {
                 scheme == QStringLiteral("rtmps")) {
                 qWarning() << "Source" << m_sourceIndex << "native" << scheme
                            << "ingest is unavailable for this URL - the native backend does not"
-                           << "support these URL options (e.g. a hostname instead of a numeric"
-                           << "IPv4 address, encryption, or listener mode), or it is not built on"
-                           << "this platform. Source disabled.";
+                           << "support these URL options (for example SRT encryption or listener"
+                           << "mode), or it is not built on this platform. Source disabled.";
             } else {
                 qWarning() << "Source" << m_sourceIndex << "unsupported ingest scheme" << scheme
                            << "- OpenLiveReplay ingests only srt://, rtmp://, rtmps://";
