@@ -130,6 +130,7 @@ qt_add_library(olr_test_engine STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/muxer.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/streamworker.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/replaymanager.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ndiframeconvert.cpp"
 )
 target_include_directories(olr_test_engine PUBLIC
     "${CMAKE_SOURCE_DIR}"

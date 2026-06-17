@@ -94,6 +94,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
+        recorder_engine/ingest/ndiframeconvert.h recorder_engine/ingest/ndiframeconvert.cpp
         recorder_engine/ingest/nativevideodecoder.h
         recorder_engine/ingest/nativesrtaddress.h recorder_engine/ingest/nativesrtaddress.cpp
         recorder_engine/ingest/nativesrtingestsession.h
