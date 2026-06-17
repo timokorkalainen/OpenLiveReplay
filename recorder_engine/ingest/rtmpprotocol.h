@@ -39,8 +39,8 @@ QByteArray string(const QString& value);
 QByteArray nullValue();
 QByteArray object(const QList<QPair<QString, QByteArray>>& values);
 QByteArray strictArray(const QList<QByteArray>& values);
-QByteArray connectCommandPayload(
-    const QUrl& url, RtmpConnectCodecProfile profile = RtmpConnectCodecProfile::AvcAac);
+QByteArray connectCommandPayload(const QUrl& url,
+                                 RtmpConnectCodecProfile profile = RtmpConnectCodecProfile::AvcAac);
 
 bool readString(const QByteArray& data, int* offset, QString* value);
 bool readNumber(const QByteArray& data, int* offset, double* value);

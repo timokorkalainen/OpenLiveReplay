@@ -204,8 +204,7 @@ QByteArray RtmpAmf0::strictArray(const QList<QByteArray>& values) {
     return out;
 }
 
-QByteArray RtmpAmf0::connectCommandPayload(const QUrl& url,
-                                           RtmpConnectCodecProfile profile) {
+QByteArray RtmpAmf0::connectCommandPayload(const QUrl& url, RtmpConnectCodecProfile profile) {
     const RtmpUrlParts parts = RtmpUrlParts::fromUrl(url);
     const bool includeHevc = profile == RtmpConnectCodecProfile::EnhancedAvcHevcAac;
     QList<QByteArray> fourCcList = {
@@ -233,13 +232,11 @@ QByteArray RtmpAmf0::connectCommandPayload(const QUrl& url,
         {QStringLiteral("audioCodecs"), RtmpAmf0::number(4071)},
         {QStringLiteral("videoCodecs"), RtmpAmf0::number(252)},
         {QStringLiteral("videoFunction"), RtmpAmf0::number(1)},
-        {QStringLiteral("fourCcList"),
-         RtmpAmf0::strictArray(fourCcList)},
+        {QStringLiteral("fourCcList"), RtmpAmf0::strictArray(fourCcList)},
         {QStringLiteral("videoFourCcInfoMap"), RtmpAmf0::object(videoFourCcInfo)},
-        {QStringLiteral("audioFourCcInfoMap"),
-         RtmpAmf0::object({
-             {QStringLiteral("mp4a"), RtmpAmf0::number(1)},
-         })},
+        {QStringLiteral("audioFourCcInfoMap"), RtmpAmf0::object({
+                                                   {QStringLiteral("mp4a"), RtmpAmf0::number(1)},
+                                               })},
     }));
     return payload;
 }
@@ -515,8 +512,8 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         }
 
         if (fragment.discarded) {
-            const int remaining =
-                qMax(0, m_abortedChunkStreams.value(fragment.csid) - fragment.discardedPayloadBytes);
+            const int remaining = qMax(0, m_abortedChunkStreams.value(fragment.csid) -
+                                              fragment.discardedPayloadBytes);
             if (remaining > 0) {
                 m_abortedChunkStreams.insert(fragment.csid, remaining);
             } else {
@@ -601,8 +598,7 @@ qint32 RtmpFlv::readS24(const char* data) {
     return value;
 }
 
-bool RtmpFlv::parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packet,
-                               QString* error) {
+bool RtmpFlv::parseVideoPacket(const QByteArray& payload, RtmpVideoPacket* packet, QString* error) {
     if (!packet || payload.isEmpty()) {
         if (error) *error = QStringLiteral("RTMP video packet is malformed.");
         return false;
@@ -782,8 +778,7 @@ bool RtmpFlv::parseHevcSequenceHeader(const QByteArray& payload, RtmpHevcConfig*
         for (int j = 0; j < nalCount; ++j) {
             if (needMore(payload, offset, 2)) {
                 if (error) {
-                    *error =
-                        QStringLiteral("RTMP HEVC sequence header has truncated NAL length.");
+                    *error = QStringLiteral("RTMP HEVC sequence header has truncated NAL length.");
                 }
                 return false;
             }

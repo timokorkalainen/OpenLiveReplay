@@ -34,7 +34,7 @@ QByteArray hevcConfigWithParameterSets(bool includeUnknownArray = false) {
 
     QByteArray config(23, char(0));
     config[0] = char(1);
-    config[21] = char(0xfc | 3);                  // 4-byte NAL length
+    config[21] = char(0xfc | 3);                    // 4-byte NAL length
     config[22] = char(includeUnknownArray ? 4 : 3); // arrays
     if (includeUnknownArray) appendHevcArray(&config, 39, QByteArray::fromHex("4e01"));
     appendHevcArray(&config, 32, vps);
@@ -58,8 +58,7 @@ bool readConnectObjectString(const QByteArray& payload, const QString& wantedKey
             uchar(payload[offset + 2]) == 0x09) {
             return false;
         }
-        const int keySize =
-            (int(uchar(payload[offset])) << 8) | int(uchar(payload[offset + 1]));
+        const int keySize = (int(uchar(payload[offset])) << 8) | int(uchar(payload[offset + 1]));
         offset += 2;
         if (offset + keySize > payload.size()) return false;
         const QString key = QString::fromUtf8(payload.constData() + offset, keySize);
@@ -174,16 +173,16 @@ void TestRtmpProtocol::amf0WritesStrictArrayForFourCcList() {
 }
 
 void TestRtmpProtocol::rtmpUrlPartsPreserveSignedQueryInPlayPath() {
-    const RtmpUrlParts parts =
-        RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmps://host.example:443/live/cam1?token=abc&expires=123")));
+    const RtmpUrlParts parts = RtmpUrlParts::fromUrl(
+        QUrl(QStringLiteral("rtmps://host.example:443/live/cam1?token=abc&expires=123")));
     QCOMPARE(parts.app, QStringLiteral("live"));
     QCOMPARE(parts.playPath, QStringLiteral("cam1?token=abc&expires=123"));
     QCOMPARE(parts.tcUrl, QStringLiteral("rtmps://host.example:443/live"));
 }
 
 void TestRtmpProtocol::rtmpUrlPartsPreserveEncodedPathAndQuery() {
-    const RtmpUrlParts parts =
-        RtmpUrlParts::fromUrl(QUrl(QStringLiteral("rtmp://host/live/stream%2Fcam?token=a%2Fb&sig=x%3Dy")));
+    const RtmpUrlParts parts = RtmpUrlParts::fromUrl(
+        QUrl(QStringLiteral("rtmp://host/live/stream%2Fcam?token=a%2Fb&sig=x%3Dy")));
     QCOMPARE(parts.app, QStringLiteral("live"));
     QCOMPARE(parts.playPath, QStringLiteral("stream%2Fcam?token=a%2Fb&sig=x%3Dy"));
     QCOMPARE(parts.tcUrl, QStringLiteral("rtmp://host/live"));
@@ -334,7 +333,8 @@ void TestRtmpProtocol::chunkParserReassemblesSplitMessageAndUpdatesChunkSize() {
     QList<RtmpMessage> messages;
     QString error;
 
-    const QByteArray setChunkSize = RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("00000004"), 128);
+    const QByteArray setChunkSize =
+        RtmpChunkWriter::message(2, 1, 0, 0, QByteArray::fromHex("00000004"), 128);
     QVERIFY(parser.push(setChunkSize, &messages, &error));
     QCOMPARE(messages.size(), 1);
     QCOMPARE(messages.takeFirst().type, 1);
@@ -356,14 +356,13 @@ void TestRtmpProtocol::chunkParserDoesNotDoubleApplyTimestampDeltaWhenPayloadArr
     QList<RtmpMessage> messages;
     QString error;
 
-    const QByteArray first =
-        RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("abcd", 4), 128);
+    const QByteArray first = RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("abcd", 4), 128);
     QVERIFY(parser.push(first, &messages, &error));
     QCOMPARE(messages.size(), 1);
     QCOMPARE(messages.first().timestampMs, 1000);
 
     QByteArray second;
-    second.append(char((1 << 6) | 6)); // fmt=1, csid=6
+    second.append(char((1 << 6) | 6));            // fmt=1, csid=6
     second.append(QByteArray::fromHex("000028")); // timestamp delta 40
     second.append(QByteArray::fromHex("000004")); // payload length 4
     second.append(char(9));                       // message type video
@@ -448,8 +447,7 @@ void TestRtmpProtocol::chunkParserAdvancesTimestampForFmtThreeStartingSameHeader
     QList<RtmpMessage> messages;
     QString error;
 
-    const QByteArray first =
-        RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("aa", 2), 128);
+    const QByteArray first = RtmpChunkWriter::message(6, 9, 1, 1000, QByteArray("aa", 2), 128);
     QVERIFY(parser.push(first, &messages, &error));
     QCOMPARE(messages.size(), 1);
     QCOMPARE(messages.first().timestampMs, 1000);
@@ -583,8 +581,7 @@ void TestRtmpProtocol::chunkParserRejectsNewFmtOneBeforeIncompleteAssemblyComple
     QVERIFY(parser.push(previous, &messages, &error));
     QCOMPARE(messages.size(), 1);
 
-    const QByteArray incomplete =
-        RtmpChunkWriter::message(6, 9, 1, 1040, QByteArray("xyzz", 4), 2);
+    const QByteArray incomplete = RtmpChunkWriter::message(6, 9, 1, 1040, QByteArray("xyzz", 4), 2);
     const int firstFragmentSize = 1 + 11 + 2;
     QVERIFY(parser.push(incomplete.left(firstFragmentSize), &messages, &error));
     QVERIFY(messages.isEmpty());
@@ -638,8 +635,7 @@ void TestRtmpProtocol::chunkParserRejectsMessagesOverConfiguredLimit() {
     QList<RtmpMessage> messages;
     QString error;
 
-    const QByteArray bytes =
-        RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("abcde", 5), 128);
+    const QByteArray bytes = RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("abcde", 5), 128);
     QVERIFY(!parser.push(bytes, &messages, &error));
     QVERIFY(error.contains(QStringLiteral("exceeds")));
 }
@@ -741,7 +737,8 @@ void TestRtmpProtocol::chunkParserFmtThreeAfterAbortDoesNotPoisonState() {
     QVERIFY(parser.push(video.left(14), &messages, &error));
     QVERIFY(messages.isEmpty());
 
-    const QByteArray abort = RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("00000006"), 2);
+    const QByteArray abort =
+        RtmpChunkWriter::message(2, 2, 0, 0, QByteArray::fromHex("00000006"), 2);
     QVERIFY(parser.push(abort, &messages, &error));
     QCOMPARE(messages.size(), 1);
 
@@ -779,8 +776,7 @@ void TestRtmpProtocol::chunkParserAbortForInactiveCsidDoesNotCreateTombstone() {
         QList<RtmpMessage> messages;
         QString error;
 
-        const QByteArray first =
-            RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("aa", 2), 128);
+        const QByteArray first = RtmpChunkWriter::message(6, 9, 1, 0, QByteArray("aa", 2), 128);
         QVERIFY(parser.push(first, &messages, &error));
         QCOMPARE(messages.size(), 1);
 
@@ -798,8 +794,7 @@ void TestRtmpProtocol::chunkParserAbortForInactiveCsidDoesNotCreateTombstone() {
         QCOMPARE(messages.first().type, 9);
         QCOMPARE(messages.first().payload, QByteArray("bb", 2));
 
-        const QByteArray fresh =
-            RtmpChunkWriter::message(6, 9, 1, 20, QByteArray("cc", 2), 128);
+        const QByteArray fresh = RtmpChunkWriter::message(6, 9, 1, 20, QByteArray("cc", 2), 128);
         QVERIFY(parser.push(fresh, &messages, &error));
         QCOMPARE(messages.size(), 1);
         QCOMPARE(messages.first().timestampMs, qint64(20));
@@ -1042,7 +1037,8 @@ void TestRtmpProtocol::parsesAvcSequenceHeaderAndConvertsNalusToAnnexB() {
     lengthPrefixed.append(char(nal.size()));
     lengthPrefixed.append(nal);
 
-    QCOMPARE(RtmpFlv::avcPayloadToAnnexB(lengthPrefixed, 4), QByteArray::fromHex("0000000165888421"));
+    QCOMPARE(RtmpFlv::avcPayloadToAnnexB(lengthPrefixed, 4),
+             QByteArray::fromHex("0000000165888421"));
 }
 
 void TestRtmpProtocol::parsesHevcSequenceHeaderAndConvertsNalusToAnnexB() {
@@ -1063,8 +1059,7 @@ void TestRtmpProtocol::parsesHevcSequenceHeaderAndConvertsNalusToAnnexB() {
     QByteArray frame;
     frame.append(QByteArray::fromHex("00000002"));
     frame.append(QByteArray::fromHex("2601"));
-    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(frame, 4),
-             QByteArray::fromHex("000000012601"));
+    QCOMPARE(RtmpFlv::lengthPrefixedPayloadToAnnexB(frame, 4), QByteArray::fromHex("000000012601"));
 }
 
 void TestRtmpProtocol::parsesHevcSequenceHeaderIgnoringUnknownArrays() {

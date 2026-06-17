@@ -133,17 +133,15 @@ Amf0StringScanResult amf0ValueContainsString(const QByteArray& data, int* offset
             }
             Q_UNUSED(className);
         }
-        const Amf0StringScanResult result =
-            scanAmf0ObjectEntries(data, &cursor, needle, depth);
+        const Amf0StringScanResult result = scanAmf0ObjectEntries(data, &cursor, needle, depth);
         *offset = cursor;
         return result;
     }
     if (type == 0x0a) {
         if (needAmf0Bytes(data, cursor, 4)) return Amf0StringScanResult::Malformed;
-        const quint32 count = (quint32(uchar(data[cursor])) << 24) |
-                              (quint32(uchar(data[cursor + 1])) << 16) |
-                              (quint32(uchar(data[cursor + 2])) << 8) |
-                              quint32(uchar(data[cursor + 3]));
+        const quint32 count =
+            (quint32(uchar(data[cursor])) << 24) | (quint32(uchar(data[cursor + 1])) << 16) |
+            (quint32(uchar(data[cursor + 2])) << 8) | quint32(uchar(data[cursor + 3]));
         cursor += 4;
         for (quint32 i = 0; i < count; ++i) {
             const Amf0StringScanResult result =
@@ -300,8 +298,7 @@ void NativeRtmpIngestSession::run() {
         if (m_reconnectRequested) {
             break;
         }
-        if (!m_unsupportedReason.isEmpty() ||
-            shouldStopNativeRtmpAfterFailure(m_lastFailureKind)) {
+        if (!m_unsupportedReason.isEmpty() || shouldStopNativeRtmpAfterFailure(m_lastFailureKind)) {
             break;
         }
         if (supportedVideoProbeExpired()) {
@@ -345,8 +342,7 @@ bool NativeRtmpIngestSession::connectAndPlay(QString* error) {
         if (!raw->waitForEncrypted(kConnectTimeoutMs)) {
             m_lastFailureKind = IngestFailureKind::TransientNetwork;
             if (error)
-                *error =
-                    QStringLiteral("Native RTMPS connect failed: %1").arg(raw->errorString());
+                *error = QStringLiteral("Native RTMPS connect failed: %1").arg(raw->errorString());
             return false;
         }
         m_socket = std::move(socket);
@@ -394,8 +390,7 @@ bool NativeRtmpIngestSession::performHandshake(QString* error) {
 }
 
 bool NativeRtmpIngestSession::sendConnectCommand(QString* error) {
-    const QByteArray payload =
-        RtmpAmf0::connectCommandPayload(m_url, connectCodecProfile());
+    const QByteArray payload = RtmpAmf0::connectCommandPayload(m_url, connectCodecProfile());
     if (!sendMessage(3, kMessageCommandAmf0, 0, 0, payload, error)) {
         return false;
     }
@@ -502,8 +497,7 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
     }
 
     while (!shouldStop()) {
-        if (m_socket->bytesAvailable() <= 0 &&
-            !m_socket->waitForReadyRead(kIoTimeoutMs)) {
+        if (m_socket->bytesAvailable() <= 0 && !m_socket->waitForReadyRead(kIoTimeoutMs)) {
             if (m_socket->state() == QAbstractSocket::UnconnectedState) {
                 m_lastFailureKind = IngestFailureKind::TransientNetwork;
                 if (error)
@@ -517,9 +511,8 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
                 return false;
             }
 
-            const int64_t ageMs = m_lastPacketAtMs >= 0
-                                      ? m_monotonic.elapsed() - m_lastPacketAtMs
-                                      : int64_t(kStallTimeoutMs);
+            const int64_t ageMs = m_lastPacketAtMs >= 0 ? m_monotonic.elapsed() - m_lastPacketAtMs
+                                                        : int64_t(kStallTimeoutMs);
             if (ageMs >= kStallTimeoutMs) {
                 m_lastFailureKind = IngestFailureKind::TransientNetwork;
                 if (error) *error = QStringLiteral("Native RTMP stalled.");
@@ -635,9 +628,8 @@ bool NativeRtmpIngestSession::noteIncomingChunkBytes(qint64 byteCount,
     if (acknowledgementSequence) {
         *acknowledgementSequence = quint32(m_receivedChunkBytes & 0xffffffffu);
     }
-    m_nextAcknowledgementAt =
-        ((m_receivedChunkBytes / m_acknowledgementWindowSize) + 1) *
-        quint64(m_acknowledgementWindowSize);
+    m_nextAcknowledgementAt = ((m_receivedChunkBytes / m_acknowledgementWindowSize) + 1) *
+                              quint64(m_acknowledgementWindowSize);
     return true;
 }
 
@@ -686,11 +678,10 @@ void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
             log(QStringLiteral("Native RTMP window acknowledgement size was malformed."));
             return;
         }
-        const quint32 windowSize =
-            (quint32(uchar(message.payload[0])) << 24) |
-            (quint32(uchar(message.payload[1])) << 16) |
-            (quint32(uchar(message.payload[2])) << 8) |
-            quint32(uchar(message.payload[3]));
+        const quint32 windowSize = (quint32(uchar(message.payload[0])) << 24) |
+                                   (quint32(uchar(message.payload[1])) << 16) |
+                                   (quint32(uchar(message.payload[2])) << 8) |
+                                   quint32(uchar(message.payload[3]));
         configureAcknowledgementWindow(windowSize);
         QString error;
         if (!acknowledgeIncomingBytes(0, &error) && !error.isEmpty()) {
@@ -752,8 +743,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         if (payload.size() >= 5 && (uchar(payload[0]) & 0x80) == 0) {
             const int codecId = uchar(payload[0]) & 0x0f;
             if (codecId != 7) {
-                markUnsupported(
-                    QStringLiteral("unsupported RTMP video codec id %1").arg(codecId));
+                markUnsupported(QStringLiteral("unsupported RTMP video codec id %1").arg(codecId));
             }
         }
         return;
@@ -780,10 +770,10 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     }
 
     if (packet.codec != NativeVideoCodec::H264 && packet.codec != NativeVideoCodec::Hevc) {
-        const QString reason = packet.fourCc.isEmpty()
-                                   ? QStringLiteral("unsupported RTMP video codec")
-                                   : QStringLiteral("unsupported RTMP video codec %1")
-                                         .arg(packet.fourCc);
+        const QString reason =
+            packet.fourCc.isEmpty()
+                ? QStringLiteral("unsupported RTMP video codec")
+                : QStringLiteral("unsupported RTMP video codec %1").arg(packet.fourCc);
         markUnsupported(reason);
         return;
     }
@@ -841,8 +831,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         parameterSets = m_hevcConfig.parameterSets;
     }
 
-    QByteArray annexB =
-        RtmpFlv::lengthPrefixedPayloadToAnnexB(packet.codecPayload, nalLengthSize);
+    QByteArray annexB = RtmpFlv::lengthPrefixedPayloadToAnnexB(packet.codecPayload, nalLengthSize);
     if (annexB.isEmpty()) {
         m_lastFailureKind = IngestFailureKind::MalformedStream;
         log(QStringLiteral(

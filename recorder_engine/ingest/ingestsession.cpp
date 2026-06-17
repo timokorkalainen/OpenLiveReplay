@@ -64,11 +64,9 @@ IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool n
                                                          bool nativeRtmpAvailable) {
     IngestBackendOptions options;
     const QString scheme = url.scheme().toLower();
-    options.preferNativeSrt = nativeSrtAvailable &&
-                              qEnvironmentVariableIsSet("OLR_NATIVE_SRT") &&
+    options.preferNativeSrt = nativeSrtAvailable && qEnvironmentVariableIsSet("OLR_NATIVE_SRT") &&
                               scheme == QStringLiteral("srt");
-    options.preferNativeRtmp = nativeRtmpAvailable &&
-                               (scheme == QStringLiteral("rtmp") ||
-                                scheme == QStringLiteral("rtmps"));
+    options.preferNativeRtmp = nativeRtmpAvailable && (scheme == QStringLiteral("rtmp") ||
+                                                       scheme == QStringLiteral("rtmps"));
     return options;
 }

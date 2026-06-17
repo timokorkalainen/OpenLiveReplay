@@ -44,8 +44,8 @@ public:
 
 class ScopedEnv {
 public:
-    explicit ScopedEnv(const char* name) : m_name(name), m_hadValue(qEnvironmentVariableIsSet(name)),
-                                           m_value(qgetenv(name)) {}
+    explicit ScopedEnv(const char* name)
+        : m_name(name), m_hadValue(qEnvironmentVariableIsSet(name)), m_value(qgetenv(name)) {}
     ~ScopedEnv() {
         if (m_hadValue) {
             qputenv(m_name, m_value);
@@ -101,9 +101,8 @@ void TestIngestBackendSelector::environmentDefaultsRtmpAndRtmpsToNative() {
     qunsetenv("OLR_NATIVE_RTMP");
     qunsetenv("OLR_FFMPEG_RTMP");
 
-    IngestBackendOptions opts =
-        ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
-                                            false, true);
+    IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
+        QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
              IngestBackendKind::NativeRtmp);
 
@@ -119,9 +118,8 @@ void TestIngestBackendSelector::legacyRtmpFfmpegOverridesAreIgnored() {
     qunsetenv("OLR_NATIVE_RTMP");
     qputenv("OLR_FFMPEG_RTMP", "1");
 
-    IngestBackendOptions opts =
-        ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
-                                            false, true);
+    IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
+        QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
              IngestBackendKind::NativeRtmp);
 
@@ -137,9 +135,8 @@ void TestIngestBackendSelector::nativeRtmpDisableEnvIsIgnored() {
     qputenv("OLR_FFMPEG_RTMP", "1");
     qputenv("OLR_NATIVE_RTMP", "0");
 
-    IngestBackendOptions opts =
-        ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")),
-                                            false, true);
+    IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
+        QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), false, true);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("rtmp://127.0.0.1/live/a")), opts),
              IngestBackendKind::NativeRtmp);
 
@@ -258,19 +255,24 @@ void TestIngestBackendSelector::nativeFailureReasonStartsEmpty() {
 
 void TestIngestBackendSelector::nativeDecodeCapabilityErrorsRequestFallback() {
     QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Native decoder is unavailable.")));
-    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Media Foundation decode is not implemented.")));
+    QVERIFY(nativeDecodeErrorRequestsFallback(
+        QStringLiteral("Media Foundation decode is not implemented.")));
     QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral("Unsupported codec profile.")));
-    QVERIFY(nativeDecodeErrorRequestsFallback(QStringLiteral(
-        "VideoToolbox decompression session creation failed (-12908).")));
+    QVERIFY(nativeDecodeErrorRequestsFallback(
+        QStringLiteral("VideoToolbox decompression session creation failed (-12908).")));
 }
 
 void TestIngestBackendSelector::nativeDecodeTransientErrorsDoNotRequestFallback() {
-    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral(
-        "VideoToolbox format description creation failed (-12712).")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("VideoToolbox needs codec parameter sets before decoding.")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("H.264 decode requires SPS/PPS before frames.")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("H.265 decode requires VPS before frames.")));
-    QVERIFY(!nativeDecodeErrorRequestsFallback(QStringLiteral("Native decoder received an empty access unit.")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(
+        QStringLiteral("VideoToolbox format description creation failed (-12712).")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(
+        QStringLiteral("VideoToolbox needs codec parameter sets before decoding.")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(
+        QStringLiteral("H.264 decode requires SPS/PPS before frames.")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(
+        QStringLiteral("H.265 decode requires VPS before frames.")));
+    QVERIFY(!nativeDecodeErrorRequestsFallback(
+        QStringLiteral("Native decoder received an empty access unit.")));
 }
 
 void TestIngestBackendSelector::sharedAnchorMapsStreamTime() {

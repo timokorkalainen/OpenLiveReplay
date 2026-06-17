@@ -333,9 +333,7 @@ void StreamWorker::captureLoop() {
                          reinterpret_cast<const uint8_t*>(chunk.pcmS16Stereo.constData()),
                          chunk.pcmS16Stereo.size() / kAudioBytesPerSample);
         };
-        callbacks.setConnected = [this](bool connected) {
-            setConnected(connected);
-        };
+        callbacks.setConnected = [this](bool connected) { setConnected(connected); };
         callbacks.reportStats = [this](const SrtStats& stats) {
             emit statsUpdated(m_sourceIndex, stats);
         };
@@ -428,8 +426,7 @@ void StreamWorker::captureLoop() {
         const IngestFailureKind failureKind = session->lastFailureKind();
         if (nativeRtmpAttempt && shouldStopNativeRtmpAfterFailure(failureKind)) {
             qDebug() << "Source" << m_sourceIndex << "Native RTMP failed with"
-                     << ingestFailureKindForLog(failureKind)
-                     << "; stopping capture for this URL.";
+                     << ingestFailureKindForLog(failureKind) << "; stopping capture for this URL.";
             m_captureRunning = false;
             break;
         }
