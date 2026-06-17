@@ -207,6 +207,7 @@ NativeRtmpIngestSession::NativeRtmpIngestSession(int sourceIndex, int outputWidt
 
 NativeRtmpIngestSession::~NativeRtmpIngestSession() {
     requestStop();
+    closeSocket();
 }
 
 bool NativeRtmpIngestSession::supportsUrl(const QUrl& url) {
@@ -217,6 +218,7 @@ bool NativeRtmpIngestSession::supportsUrl(const QUrl& url) {
 
 bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
     requestStop();
+    closeSocket();
     m_url = url;
     m_callbacks = callbacks;
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -251,6 +253,7 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     if (!connectAndPlay(&error)) {
         log(error);
         requestStop();
+        closeSocket();
         return false;
     }
 
@@ -315,10 +318,14 @@ void NativeRtmpIngestSession::run() {
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(false);
     }
+    closeSocket();
 }
 
 void NativeRtmpIngestSession::requestStop() {
     m_stopRequested.store(true, std::memory_order_relaxed);
+}
+
+void NativeRtmpIngestSession::closeSocket() {
     if (m_socket) {
         m_socket->disconnectFromHost();
         m_socket.reset();
@@ -985,9 +992,6 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
     if (!m_audioDecoder) {
         m_audioDecoder = std::make_unique<NativeAacDecoder>();
     }
-    // RTMP carries raw AAC frames with a separate AudioSpecificConfig. Wrapping
-    // each frame as ADTS and using a fresh converter avoids stale packet state.
-    m_audioDecoder->reset();
 
     QByteArray pcm;
     QString error;
