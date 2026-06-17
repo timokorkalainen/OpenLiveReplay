@@ -59,9 +59,9 @@ private slots:
 void TestNdiIngest::supportsNdiUrls() {
     QVERIFY(NativeNdiIngestSession::supportsUrl(QUrl(QStringLiteral("ndi:Studio%20%28CAM1%29"))));
     QVERIFY(NativeNdiIngestSession::supportsUrl(QUrl(QStringLiteral("ndi://cam1"))));
-    QCOMPARE(NativeNdiIngestSession::sourceNameFromUrl(
-                 QUrl(QStringLiteral("ndi:Studio%20%28CAM1%29"))),
-             QStringLiteral("Studio (CAM1)"));
+    QCOMPARE(
+        NativeNdiIngestSession::sourceNameFromUrl(QUrl(QStringLiteral("ndi:Studio%20%28CAM1%29"))),
+        QStringLiteral("Studio (CAM1)"));
     QVERIFY(!NativeNdiIngestSession::supportsUrl(QUrl(QStringLiteral("rtmp://x/live/a"))));
 }
 
@@ -118,7 +118,9 @@ void TestNdiIngest::fakeBackendDeliversVideoAndAudio() {
     QList<IngestStats> statsReports;
     IngestCallbacks callbacks;
     callbacks.recordingClockMs = []() { return int64_t(5000); };
-    callbacks.reportStats = [&statsReports](const IngestStats& stats) { statsReports.append(stats); };
+    callbacks.reportStats = [&statsReports](const IngestStats& stats) {
+        statsReports.append(stats);
+    };
     callbacks.onVideoFrame = [&videoPts, &videoTimecodes](DecodedVideoFrame decoded) {
         videoPts.append(decoded.sourcePtsMs);
         videoTimecodes.append(decoded.sourceTimecode100ns);
@@ -157,8 +159,8 @@ void TestNdiIngest::localRecvCreateStructMatchesSdkShape() {
 void TestNdiIngest::macRuntimeCandidatesIncludeOfficialSdkPath() {
     const QStringList candidates = NativeNdiIngestSession::runtimeLibraryCandidatesForTest();
 #if defined(Q_OS_MACOS)
-    QVERIFY(candidates.contains(
-        QStringLiteral("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib")));
+    QVERIFY(
+        candidates.contains(QStringLiteral("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib")));
 #else
     QVERIFY(!candidates.isEmpty());
 #endif
@@ -166,7 +168,8 @@ void TestNdiIngest::macRuntimeCandidatesIncludeOfficialSdkPath() {
 
 void TestNdiIngest::exactSourceMatchWinsBeforeSubstringFallback() {
     const QString selected = NativeNdiIngestSession::selectDiscoveredSourceForTest(
-        QStringList{QStringLiteral("Studio CAM10"), QStringLiteral("CAM1")}, QStringLiteral("CAM1"));
+        QStringList{QStringLiteral("Studio CAM10"), QStringLiteral("CAM1")},
+        QStringLiteral("CAM1"));
     QCOMPARE(selected, QStringLiteral("CAM1"));
 
     const QString fallback = NativeNdiIngestSession::selectDiscoveredSourceForTest(
@@ -197,7 +200,9 @@ void TestNdiIngest::undefinedTimestampFallsBackToArrivalWithoutLockingClock() {
     QList<IngestStats> statsReports;
     IngestCallbacks callbacks;
     callbacks.recordingClockMs = []() { return int64_t(7777); };
-    callbacks.reportStats = [&statsReports](const IngestStats& stats) { statsReports.append(stats); };
+    callbacks.reportStats = [&statsReports](const IngestStats& stats) {
+        statsReports.append(stats);
+    };
     callbacks.onVideoFrame = [&videoPts, &running](DecodedVideoFrame decoded) {
         videoPts.append(decoded.sourcePtsMs);
         av_frame_free(&decoded.frame);

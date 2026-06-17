@@ -206,8 +206,7 @@ NativeRtmpIngestSession::NativeRtmpIngestSession(int sourceIndex, int outputWidt
                                                  std::atomic<bool>* captureRunning,
                                                  AnchoredSourceClock* sourceClock)
     : m_sourceIndex(sourceIndex), m_outputWidth(outputWidth), m_outputHeight(outputHeight),
-      m_captureRunning(captureRunning),
-      m_clock(sourceClock ? sourceClock : &m_ownedClock),
+      m_captureRunning(captureRunning), m_clock(sourceClock ? sourceClock : &m_ownedClock),
       m_externalClock(sourceClock != nullptr) {
     m_monotonic.start();
 }

@@ -16,8 +16,7 @@ private slots:
 };
 
 namespace {
-void feed(DriftEstimator& estimator, double ppm, int count,
-          int64_t stepNs = 33366667) {
+void feed(DriftEstimator& estimator, double ppm, int count, int64_t stepNs = 33366667) {
     for (int i = 0; i < count; ++i) {
         const int64_t sessionNs = int64_t(i) * stepNs;
         const int64_t senderNs =

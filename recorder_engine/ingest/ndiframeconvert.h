@@ -11,8 +11,8 @@ struct SwsContext;
 }
 
 constexpr uint32_t ndiFourCc(char a, char b, char c, char d) {
-    return uint32_t(uint8_t(a)) | (uint32_t(uint8_t(b)) << 8) |
-           (uint32_t(uint8_t(c)) << 16) | (uint32_t(uint8_t(d)) << 24);
+    return uint32_t(uint8_t(a)) | (uint32_t(uint8_t(b)) << 8) | (uint32_t(uint8_t(c)) << 16) |
+           (uint32_t(uint8_t(d)) << 24);
 }
 
 constexpr uint32_t kNdiFourCcUyvy = ndiFourCc('U', 'Y', 'V', 'Y');

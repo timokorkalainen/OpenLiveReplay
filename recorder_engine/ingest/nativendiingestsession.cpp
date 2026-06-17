@@ -82,8 +82,8 @@ using NDIlib_destroy_fn = void (*)();
 using NDIlib_find_create_v2_fn = NDIlib_find_instance_t (*)(const void*);
 using NDIlib_find_destroy_fn = void (*)(NDIlib_find_instance_t);
 using NDIlib_find_wait_for_sources_fn = bool (*)(NDIlib_find_instance_t, uint32_t);
-using NDIlib_find_get_current_sources_fn = const NDIlib_source_t* (*)(NDIlib_find_instance_t,
-                                                                     uint32_t*);
+using NDIlib_find_get_current_sources_fn = const NDIlib_source_t* (*) (NDIlib_find_instance_t,
+                                                                       uint32_t*);
 using NDIlib_recv_create_v3_fn = NDIlib_recv_instance_t (*)(const NDIlib_recv_create_v3_t*);
 using NDIlib_recv_destroy_fn = void (*)(NDIlib_recv_instance_t);
 using NDIlib_recv_capture_v3_fn = NDIlib_frame_type_e (*)(NDIlib_recv_instance_t,
@@ -154,14 +154,14 @@ public:
             m_findWaitForSources(finder, 1000);
         }
         uint32_t count = 0;
-        const NDIlib_source_t* sources = m_findGetCurrentSources
-                                            ? m_findGetCurrentSources(finder, &count)
-                                            : nullptr;
+        const NDIlib_source_t* sources =
+            m_findGetCurrentSources ? m_findGetCurrentSources(finder, &count) : nullptr;
         QByteArray wanted = sourceName.toUtf8();
         NDIlib_source_t selected;
         QStringList discovered;
         for (uint32_t i = 0; sources && i < count; ++i) {
-            discovered.append(QString::fromUtf8(sources[i].p_ndi_name ? sources[i].p_ndi_name : ""));
+            discovered.append(
+                QString::fromUtf8(sources[i].p_ndi_name ? sources[i].p_ndi_name : ""));
         }
         const int selectedIndex = selectDiscoveredSourceIndex(discovered, sourceName);
         if (selectedIndex >= 0) {
@@ -257,16 +257,16 @@ private:
         m_initialize =
             reinterpret_cast<NDIlib_initialize_fn>(m_library.resolve("NDIlib_initialize"));
         m_destroy = reinterpret_cast<NDIlib_destroy_fn>(m_library.resolve("NDIlib_destroy"));
-        m_findCreate = reinterpret_cast<NDIlib_find_create_v2_fn>(
-            m_library.resolve("NDIlib_find_create_v2"));
+        m_findCreate =
+            reinterpret_cast<NDIlib_find_create_v2_fn>(m_library.resolve("NDIlib_find_create_v2"));
         m_findDestroy =
             reinterpret_cast<NDIlib_find_destroy_fn>(m_library.resolve("NDIlib_find_destroy"));
         m_findWaitForSources = reinterpret_cast<NDIlib_find_wait_for_sources_fn>(
             m_library.resolve("NDIlib_find_wait_for_sources"));
         m_findGetCurrentSources = reinterpret_cast<NDIlib_find_get_current_sources_fn>(
             m_library.resolve("NDIlib_find_get_current_sources"));
-        m_recvCreate = reinterpret_cast<NDIlib_recv_create_v3_fn>(
-            m_library.resolve("NDIlib_recv_create_v3"));
+        m_recvCreate =
+            reinterpret_cast<NDIlib_recv_create_v3_fn>(m_library.resolve("NDIlib_recv_create_v3"));
         m_recvDestroy =
             reinterpret_cast<NDIlib_recv_destroy_fn>(m_library.resolve("NDIlib_recv_destroy"));
         m_recvCapture = reinterpret_cast<NDIlib_recv_capture_v3_fn>(
@@ -328,12 +328,9 @@ NativeNdiIngestSession::NativeNdiIngestSession(int sourceIndex, int outputWidth,
                                                std::atomic<bool>* captureRunning,
                                                INdiReceiverBackend* backend,
                                                AnchoredSourceClock* sourceClock)
-    : m_outputWidth(outputWidth)
-    , m_outputHeight(outputHeight)
-    , m_captureRunning(captureRunning)
-    , m_backend(backend)
-    , m_clock(sourceClock ? sourceClock : &m_ownedClock)
-    , m_externalClock(sourceClock != nullptr) {
+    : m_outputWidth(outputWidth), m_outputHeight(outputHeight), m_captureRunning(captureRunning),
+      m_backend(backend), m_clock(sourceClock ? sourceClock : &m_ownedClock),
+      m_externalClock(sourceClock != nullptr) {
     Q_UNUSED(sourceIndex);
     m_monotonic.start();
 }
@@ -476,8 +473,7 @@ bool NativeNdiIngestSession::shouldStop() const {
     return m_callbacks.shouldStop ? m_callbacks.shouldStop() : false;
 }
 
-int64_t NativeNdiIngestSession::mapTimestampMs(int64_t timestamp100ns,
-                                               ClockObservationRole role) {
+int64_t NativeNdiIngestSession::mapTimestampMs(int64_t timestamp100ns, ClockObservationRole role) {
     const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
     if (timestamp100ns < 0 || timestamp100ns == std::numeric_limits<int64_t>::max()) {
         return nowMs;

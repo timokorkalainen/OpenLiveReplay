@@ -81,8 +81,8 @@ void TestIngestBackendSelector::rtmpIsNativeByDefault() {
 }
 
 void TestIngestBackendSelector::ndiIsNativeByDefaultWhenAvailable() {
-    const IngestBackendOptions opts = ingestBackendOptionsFromEnvironment(
-        QUrl(QStringLiteral("ndi://CAM1")), false, false, true);
+    const IngestBackendOptions opts =
+        ingestBackendOptionsFromEnvironment(QUrl(QStringLiteral("ndi://CAM1")), false, false, true);
     QVERIFY(opts.preferNativeNdi);
     QCOMPARE(selectIngestBackend(QUrl(QStringLiteral("ndi://CAM1")), opts),
              IngestBackendKind::NativeNdi);

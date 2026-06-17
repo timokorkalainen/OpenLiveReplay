@@ -120,12 +120,9 @@ NativeSrtIngestSession::NativeSrtIngestSession(int sourceIndex, int outputWidth,
 NativeSrtIngestSession::NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
                                                std::atomic<bool>* captureRunning,
                                                AnchoredSourceClock* sourceClock)
-    : m_sourceIndex(sourceIndex)
-    , m_outputWidth(outputWidth)
-    , m_outputHeight(outputHeight)
-    , m_captureRunning(captureRunning)
-    , m_clock(sourceClock ? sourceClock : &m_ownedClock)
-    , m_externalClock(sourceClock != nullptr) {
+    : m_sourceIndex(sourceIndex), m_outputWidth(outputWidth), m_outputHeight(outputHeight),
+      m_captureRunning(captureRunning), m_clock(sourceClock ? sourceClock : &m_ownedClock),
+      m_externalClock(sourceClock != nullptr) {
     m_monotonic.start();
 }
 
@@ -452,7 +449,7 @@ void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
                 m_clock->addRateSample(pcr90k, nowMs);
             } else {
                 m_clock->observe(pcr90k, nowMs, tsInfo.discontinuity,
-                                ClockObservationRole::Authority);
+                                 ClockObservationRole::Authority);
                 m_forceNextPcrObserve = false;
             }
         }

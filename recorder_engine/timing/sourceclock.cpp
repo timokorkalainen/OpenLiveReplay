@@ -4,12 +4,9 @@
 #include <cmath>
 
 AnchoredSourceClock::AnchoredSourceClock(ClockQuality quality, int64_t unitsPerMs,
-                                         int64_t forwardJumpMs,
-                                         int64_t backwardToleranceMs)
-    : m_quality(quality)
-    , m_unitsPerMs(std::max<int64_t>(1, unitsPerMs))
-    , m_forwardJumpMs(forwardJumpMs)
-    , m_backwardToleranceMs(backwardToleranceMs) {}
+                                         int64_t forwardJumpMs, int64_t backwardToleranceMs)
+    : m_quality(quality), m_unitsPerMs(std::max<int64_t>(1, unitsPerMs)),
+      m_forwardJumpMs(forwardJumpMs), m_backwardToleranceMs(backwardToleranceMs) {}
 
 void AnchoredSourceClock::observe(int64_t senderUnits, int64_t sessionNowMs, bool discontinuity,
                                   ClockObservationRole role) {
@@ -57,9 +54,9 @@ int64_t AnchoredSourceClock::toSessionMs(int64_t mediaSenderUnits) const {
         static_cast<long double>(mediaSenderUnits - m_anchorSenderUnits) /
         static_cast<long double>(m_unitsPerMs);
     const double slope = m_drift.slope();
-    const long double correctedDeltaMs =
-        std::abs(slope) > 0.000001 ? senderDeltaMs / static_cast<long double>(slope)
-                                   : senderDeltaMs;
+    const long double correctedDeltaMs = std::abs(slope) > 0.000001
+                                             ? senderDeltaMs / static_cast<long double>(slope)
+                                             : senderDeltaMs;
     return m_anchorSessionMs + int64_t(std::llround(correctedDeltaMs));
 }
 

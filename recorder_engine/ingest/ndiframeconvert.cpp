@@ -54,8 +54,7 @@ int16_t floatToS16(float sample) {
 float planarSample(const NdiAudioFrame& in, int channel, int sample) {
     const int srcChannel = std::min(channel, std::max(0, in.channels - 1));
     const auto* bytes = reinterpret_cast<const uint8_t*>(in.data);
-    const auto* plane =
-        reinterpret_cast<const float*>(bytes + srcChannel * in.channelStrideBytes);
+    const auto* plane = reinterpret_cast<const float*>(bytes + srcChannel * in.channelStrideBytes);
     return plane[std::max(0, std::min(sample, in.samples - 1))];
 }
 

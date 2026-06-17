@@ -340,11 +340,10 @@ void StreamWorker::captureLoop() {
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
         nativeRtmpAvailable = NativeRtmpIngestSession::supportsUrl(sourceUrl);
 #endif
-        const bool nativeNdiAvailable =
-            NativeNdiIngestSession::supportsUrl(sourceUrl) && NativeNdiIngestSession::runtimeAvailable();
-        IngestBackendOptions backendOptions =
-            ingestBackendOptionsFromEnvironment(sourceUrl, nativeSrtAvailable, nativeRtmpAvailable,
-                                                nativeNdiAvailable);
+        const bool nativeNdiAvailable = NativeNdiIngestSession::supportsUrl(sourceUrl) &&
+                                        NativeNdiIngestSession::runtimeAvailable();
+        IngestBackendOptions backendOptions = ingestBackendOptionsFromEnvironment(
+            sourceUrl, nativeSrtAvailable, nativeRtmpAvailable, nativeNdiAvailable);
         const IngestBackendKind backendKind = selectIngestBackend(sourceUrl, backendOptions);
         const bool nativeRtmpAttempt = backendKind == IngestBackendKind::NativeRtmp;
         if (m_clockOwnerUrl != currentUrl || m_clockOwnerBackend != backendKind) {
@@ -358,9 +357,8 @@ void StreamWorker::captureLoop() {
         std::unique_ptr<IngestSession> session;
 #if defined(OLR_NATIVE_SRT_AVAILABLE)
         if (backendKind == IngestBackendKind::NativeSrt) {
-            session = std::make_unique<NativeSrtIngestSession>(m_sourceIndex, m_targetWidth,
-                                                               m_targetHeight, &m_captureRunning,
-                                                               &m_srtSourceClock);
+            session = std::make_unique<NativeSrtIngestSession>(
+                m_sourceIndex, m_targetWidth, m_targetHeight, &m_captureRunning, &m_srtSourceClock);
         }
 #endif
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
@@ -371,9 +369,8 @@ void StreamWorker::captureLoop() {
         }
 #endif
         if (backendKind == IngestBackendKind::NativeNdi) {
-            session = std::make_unique<NativeNdiIngestSession>(m_sourceIndex, m_targetWidth,
-                                                               m_targetHeight, &m_captureRunning,
-                                                               &m_ndiSourceClock);
+            session = std::make_unique<NativeNdiIngestSession>(
+                m_sourceIndex, m_targetWidth, m_targetHeight, &m_captureRunning, &m_ndiSourceClock);
         }
         if (!session) {
             const QString scheme = sourceUrl.scheme().toLower();
@@ -602,8 +599,7 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
         m_audioServoJitterSamples = jitterSamples;
         QMutexLocker locker(&m_audioFifoMutex);
         if (m_audioFifoStartSample >= 0) {
-            const int64_t dropSamples =
-                m_audioSourceCursor - m_audioFifoStartSample;
+            const int64_t dropSamples = m_audioSourceCursor - m_audioFifoStartSample;
             if (dropSamples > 0) {
                 const int dropBytes =
                     int(qMin<int64_t>(dropSamples * kAudioBytesPerSample, m_audioFifo.size()));

@@ -34,8 +34,7 @@ public:
 class AnchoredSourceClock final : public SourceClock {
 public:
     explicit AnchoredSourceClock(ClockQuality quality, int64_t unitsPerMs = 1,
-                                 int64_t forwardJumpMs = 3000,
-                                 int64_t backwardToleranceMs = -200);
+                                 int64_t forwardJumpMs = 3000, int64_t backwardToleranceMs = -200);
 
     void observe(int64_t senderUnits, int64_t sessionNowMs, bool discontinuity,
                  ClockObservationRole role = ClockObservationRole::Authority) override;

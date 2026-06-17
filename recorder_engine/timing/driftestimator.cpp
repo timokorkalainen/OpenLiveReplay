@@ -4,8 +4,8 @@
 #include <cmath>
 
 DriftEstimator::DriftEstimator(int windowSize, int minSamples)
-    : m_windowSize(std::max(2, windowSize))
-    , m_minSamples(std::max(2, std::min(minSamples, std::max(2, windowSize)))) {}
+    : m_windowSize(std::max(2, windowSize)),
+      m_minSamples(std::max(2, std::min(minSamples, std::max(2, windowSize)))) {}
 
 void DriftEstimator::addSample(int64_t senderNs, int64_t sessionNs) {
     const Sample sample{senderNs, sessionNs};
