@@ -120,6 +120,31 @@ set_tests_properties(e2e_av_lipsync PROPERTIES
     LABELS "av-sync" TIMEOUT 120 RUN_SERIAL TRUE
     ENVIRONMENT "OLR_AV_SYNC_GATE=1")
 
+# --- Broadcast frame-sync acceptance rig ------------------------------------
+# Opt-in instrument for lip-sync, inter-camera phase, drift and timecode
+# measurements. These use a dedicated port band (>=24000) and report metrics on
+# every run; lipsync is already stable enough to run as a gate while the other
+# Phase-0 cells stay report-only until Phase 1 tightens the timing core.
+set(_framesync_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_framesync_e2e.sh")
+add_test(NAME e2e_framesync_lipsync
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 24000)
+add_test(NAME e2e_framesync_drift
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" drift 24010)
+add_test(NAME e2e_framesync_intercam
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" intercam 24020)
+add_test(NAME e2e_framesync_timecode
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" timecode 24030)
+set_tests_properties(
+    e2e_framesync_lipsync e2e_framesync_drift
+    e2e_framesync_intercam e2e_framesync_timecode
+    PROPERTIES
+    LABELS "framesync"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+set_tests_properties(e2e_framesync_lipsync PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
+
 # --- Local-only native SRT e2e (NOT in CI) ----------------------------------
 # Prove the real engine ingests srt:// over the native SRT path (the default,
 # and only, SRT ingest). The producer side uses local ffmpeg + srt-live-transmit;
