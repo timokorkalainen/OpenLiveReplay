@@ -98,6 +98,11 @@ using NDIlib_recv_free_audio_v3_fn = void (*)(NDIlib_recv_instance_t,
                                               const NDIlib_audio_frame_v3_t*);
 using NDIlib_destroy_fn = void (*)();
 
+struct CaptureStats {
+    int videoFrames = 0;
+    int audioFrames = 0;
+};
+
 QStringList ndiRuntimeCandidates() {
     QStringList candidates;
     const QByteArray explicitPath = qgetenv("OLR_NDI_RUNTIME_LIBRARY");
@@ -221,45 +226,59 @@ public:
 
     bool captureVideoAndAudio(int timeoutMs, int expectedWidth, int expectedHeight,
                               int expectedSampleRate, int expectedChannels, QString* error) {
-        bool gotVideo = false;
-        bool gotAudio = false;
+        CaptureStats stats;
 
         QElapsedTimer timer;
         timer.start();
-        while (timer.elapsed() < timeoutMs && !(gotVideo && gotAudio)) {
-            NDIlib_video_frame_v2_t video;
-            NDIlib_audio_frame_v3_t audio;
-            const int frameType = m_recvCapture(m_recv, &video, &audio, nullptr, 250);
-
-            switch (frameType) {
-            case NdiFrameTypeVideo:
-                gotVideo = validateVideo(video, expectedWidth, expectedHeight, error);
-                m_recvFreeVideo(m_recv, &video);
-                if (!gotVideo) return false;
-                break;
-            case NdiFrameTypeAudio:
-                gotAudio = validateAudio(audio, expectedSampleRate, expectedChannels, error);
-                m_recvFreeAudio(m_recv, &audio);
-                if (!gotAudio) return false;
-                break;
-            case NdiFrameTypeError:
-                *error = QStringLiteral("NDI receiver returned frame_type_error");
+        while (timer.elapsed() < timeoutMs && (stats.videoFrames == 0 || stats.audioFrames == 0)) {
+            if (!captureOne(250, expectedWidth, expectedHeight, expectedSampleRate,
+                            expectedChannels, &stats, error)) {
                 return false;
-            case NdiFrameTypeNone:
-            case NdiFrameTypeMetadata:
-            case NdiFrameTypeStatusChange:
-            default:
-                break;
             }
         }
 
-        if (!gotVideo || !gotAudio) {
+        if (stats.videoFrames == 0 || stats.audioFrames == 0) {
             *error = QStringLiteral("timed out waiting for NDI frames: video=%1 audio=%2")
-                         .arg(gotVideo)
-                         .arg(gotAudio);
+                         .arg(stats.videoFrames > 0)
+                         .arg(stats.audioFrames > 0);
             return false;
         }
         return true;
+    }
+
+    bool captureOne(int timeoutMs, int expectedWidth, int expectedHeight, int expectedSampleRate,
+                    int expectedChannels, CaptureStats* stats, QString* error) {
+        NDIlib_video_frame_v2_t video;
+        NDIlib_audio_frame_v3_t audio;
+        const int frameType =
+            m_recvCapture(m_recv, &video, &audio, nullptr, quint32(qMax(0, timeoutMs)));
+
+        switch (frameType) {
+        case NdiFrameTypeVideo:
+            if (!validateVideo(video, expectedWidth, expectedHeight, error)) {
+                m_recvFreeVideo(m_recv, &video);
+                return false;
+            }
+            m_recvFreeVideo(m_recv, &video);
+            stats->videoFrames++;
+            return true;
+        case NdiFrameTypeAudio:
+            if (!validateAudio(audio, expectedSampleRate, expectedChannels, error)) {
+                m_recvFreeAudio(m_recv, &audio);
+                return false;
+            }
+            m_recvFreeAudio(m_recv, &audio);
+            stats->audioFrames++;
+            return true;
+        case NdiFrameTypeError:
+            *error = QStringLiteral("NDI receiver returned frame_type_error");
+            return false;
+        case NdiFrameTypeNone:
+        case NdiFrameTypeMetadata:
+        case NdiFrameTypeStatusChange:
+        default:
+            return true;
+        }
     }
 
     void close() {
@@ -424,6 +443,47 @@ void TestNdiRuntimeSmoke::realRuntimeDeliversVideoAndAudio() {
     QString error;
     QVERIFY2(receiver.captureVideoAndAudio(10000, 16, 16, 48000, 2, &error),
              qPrintable(QStringLiteral("NDI receiver did not capture app output: %1").arg(error)));
+
+    bool ok = false;
+    const int soakSeconds = qEnvironmentVariableIntValue("OLR_NDI_RUNTIME_SOAK_SECONDS", &ok);
+    if (ok && soakSeconds > 0) {
+        CaptureStats stats;
+        QElapsedTimer soakTimer;
+        soakTimer.start();
+        qint64 frameIndex = 35;
+        qint64 nextSendMs = 0;
+
+        while (soakTimer.elapsed() < qint64(soakSeconds) * 1000) {
+            if (soakTimer.elapsed() >= nextSendMs) {
+                QVERIFY2(sink.submit(makeFrame(frameIndex, uchar(70 + (frameIndex % 30)))),
+                         "failed to submit frame to NDI sink during soak");
+                ++frameIndex;
+                nextSendMs = soakTimer.elapsed() + 40;
+            }
+
+            QVERIFY2(receiver.captureOne(5, 16, 16, 48000, 2, &stats, &error),
+                     qPrintable(QStringLiteral("NDI receiver failed during soak: %1").arg(error)));
+            QCoreApplication::processEvents();
+        }
+
+        const qint64 drainUntilMs = soakTimer.elapsed() + 1000;
+        while (soakTimer.elapsed() < drainUntilMs) {
+            QVERIFY2(receiver.captureOne(5, 16, 16, 48000, 2, &stats, &error),
+                     qPrintable(
+                         QStringLiteral("NDI receiver failed while draining soak: %1").arg(error)));
+        }
+
+        qInfo("NDI runtime soak captured %d video frames and %d audio frames over %d seconds",
+              stats.videoFrames, stats.audioFrames, soakSeconds);
+        QVERIFY2(stats.videoFrames >= soakSeconds * 5,
+                 qPrintable(QStringLiteral("NDI soak captured too few video frames: %1 in %2 s")
+                                .arg(stats.videoFrames)
+                                .arg(soakSeconds)));
+        QVERIFY2(stats.audioFrames >= soakSeconds,
+                 qPrintable(QStringLiteral("NDI soak captured too few audio frames: %1 in %2 s")
+                                .arg(stats.audioFrames)
+                                .arg(soakSeconds)));
+    }
 }
 
 QTEST_GUILESS_MAIN(TestNdiRuntimeSmoke)

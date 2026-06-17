@@ -34,11 +34,13 @@ loads the NDI runtime dynamically, starts the app's `NdiOutputSink`, discovers
 the local sender, and captures one video frame and one audio frame. It skips
 unless `OLR_RUN_NDI_RUNTIME_TESTS=1` is set and the runtime is available; set
 `OLR_NDI_RUNTIME_LIBRARY=/path/to/libndi.dylib` when the runtime is not in the
-platform default location.
+platform default location. Set `OLR_NDI_RUNTIME_SOAK_SECONDS=300` to keep the
+sender and receiver running for a five-minute soak.
 
 ```bash
 OLR_RUN_NDI_RUNTIME_TESTS=1 \
 OLR_NDI_RUNTIME_LIBRARY=/usr/local/lib/libndi.dylib \
+OLR_NDI_RUNTIME_SOAK_SECONDS=300 \
 ctest --test-dir build -L ndi-runtime --output-on-failure
 ```
 

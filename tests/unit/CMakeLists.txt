@@ -73,8 +73,8 @@ target_link_libraries(tst_ndi_runtime_smoke PRIVATE Qt6::Test olr_test_playback 
 add_test(NAME tst_ndi_runtime_smoke COMMAND tst_ndi_runtime_smoke)
 set_tests_properties(tst_ndi_runtime_smoke PROPERTIES
     LABELS "ndi-runtime"
-    TIMEOUT 30
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    TIMEOUT 420
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=420000")
 olr_add_unit_test(tst_streamdeckmappingstore olr_test_core)
 olr_add_unit_test(tst_srt_health olr_test_core)
 olr_add_unit_test(tst_rtmp_health      olr_test_core)
