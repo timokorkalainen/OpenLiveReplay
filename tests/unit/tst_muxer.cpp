@@ -42,7 +42,8 @@ void TestMuxer::initBuildsTrackLayout() {
     Muxer m;
     m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A"), QStringLiteral("B")};
-    QVERIFY(m.init(QStringLiteral("olr_unit_layout"), 2, 640, 480, 30, names, 48000, 2));
+    QVERIFY(
+        m.init(QStringLiteral("olr_unit_layout"), 2, 640, 480, FrameRate{30, 1}, names, 48000, 2));
     // 2 video + 2 audio + 2 subtitle, in that order.
     QCOMPARE(m.audioTrackOffset(), 2);
     QCOMPARE(m.subtitleTrackOffset(), 4);
@@ -53,7 +54,8 @@ void TestMuxer::getStreamIsBoundsChecked() {
     Muxer m;
     m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
-    QVERIFY(m.init(QStringLiteral("olr_unit_bounds"), 1, 320, 240, 30, names, 48000, 2));
+    QVERIFY(
+        m.init(QStringLiteral("olr_unit_bounds"), 1, 320, 240, FrameRate{30, 1}, names, 48000, 2));
     // 1 video + 1 audio + 1 subtitle = 3 streams (indices 0..2).
     QVERIFY(m.getStream(0) != nullptr);
     QVERIFY(m.getStream(2) != nullptr);
@@ -66,7 +68,8 @@ void TestMuxer::stereoAudioChannelLayout() {
     Muxer m;
     m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
-    QVERIFY(m.init(QStringLiteral("olr_unit_stereo"), 1, 320, 240, 30, names, 48000, 2));
+    QVERIFY(
+        m.init(QStringLiteral("olr_unit_stereo"), 1, 320, 240, FrameRate{30, 1}, names, 48000, 2));
     AVStream* audio = m.getStream(m.audioTrackOffset());
     QVERIFY(audio != nullptr);
     QCOMPARE(audio->codecpar->ch_layout.nb_channels, 2);
@@ -77,7 +80,8 @@ void TestMuxer::monoAudioChannelLayout() {
     Muxer m;
     m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
-    QVERIFY(m.init(QStringLiteral("olr_unit_mono"), 1, 320, 240, 30, names, 48000, 1));
+    QVERIFY(
+        m.init(QStringLiteral("olr_unit_mono"), 1, 320, 240, FrameRate{30, 1}, names, 48000, 1));
     AVStream* audio = m.getStream(m.audioTrackOffset());
     QVERIFY(audio != nullptr);
     QCOMPARE(audio->codecpar->ch_layout.nb_channels, 1);
@@ -89,7 +93,8 @@ void TestMuxer::initProducesAFile() {
     Muxer m;
     m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
-    QVERIFY(m.init(QStringLiteral("olr_unit_file"), 1, 320, 240, 30, names, 48000, 2));
+    QVERIFY(
+        m.init(QStringLiteral("olr_unit_file"), 1, 320, 240, FrameRate{30, 1}, names, 48000, 2));
     m.close();
     const QFileInfo fi(videoPathFor(QStringLiteral("olr_unit_file")));
     QVERIFY2(fi.exists(), qPrintable("expected output at " + fi.filePath()));
@@ -113,16 +118,8 @@ void TestMuxer::initBuildsTelemetryTrackLayoutAndMetadata() {
         QStringLiteral("Beta Feed"),
     };
 
-    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_layout"),
-                   2,
-                   640,
-                   480,
-                   30,
-                   names,
-                   feedIds,
-                   feedNames,
-                   48000,
-                   2));
+    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_layout"), 2, 640, 480, FrameRate{30, 1},
+                   names, feedIds, feedNames, 48000, 2));
 
     QCOMPARE(m.audioTrackOffset(), 2);
     QCOMPARE(m.subtitleTrackOffset(), 4);
@@ -168,16 +165,8 @@ void TestMuxer::initFailureResetsTelemetryTrackState() {
     const QStringList feedIds{QStringLiteral("feed-alpha")};
     const QStringList feedNames{QStringLiteral("Alpha Feed")};
 
-    QVERIFY(!m.init(QStringLiteral("missing/olr_unit_telemetry_init_fail"),
-                    1,
-                    320,
-                    240,
-                    30,
-                    names,
-                    feedIds,
-                    feedNames,
-                    48000,
-                    2));
+    QVERIFY(!m.init(QStringLiteral("missing/olr_unit_telemetry_init_fail"), 1, 320, 240,
+                    FrameRate{30, 1}, names, feedIds, feedNames, 48000, 2));
 
     QCOMPARE(m.telemetryTrackOffset(), 0);
     QVERIFY(m.getStream(0) == nullptr);
@@ -192,16 +181,8 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
     const QStringList feedNames{QStringLiteral("Alpha Feed")};
     const QByteArray validPayload = QByteArrayLiteral("{\"speed\":42}");
 
-    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_write"),
-                   1,
-                   320,
-                   240,
-                   30,
-                   names,
-                   feedIds,
-                   feedNames,
-                   48000,
-                   2));
+    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_write"), 1, 320, 240, FrameRate{30, 1}, names,
+                   feedIds, feedNames, 48000, 2));
 
     m.writeTelemetryPacket(0, 123, validPayload);
     m.writeTelemetryPacket(1, 124, QByteArrayLiteral("{\"ignored\":true}"));

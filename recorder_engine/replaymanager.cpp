@@ -94,8 +94,8 @@ bool ReplayManager::setupBlueEncoder() {
 
     m_blueEncCtx->width     = m_videoWidth;
     m_blueEncCtx->height    = m_videoHeight;
-    m_blueEncCtx->time_base = {1, m_fps};
-    m_blueEncCtx->framerate = {m_fps, 1};
+    m_blueEncCtx->time_base = {m_frameRate.den, m_frameRate.num};
+    m_blueEncCtx->framerate = {m_frameRate.num, m_frameRate.den};
     m_blueEncCtx->pix_fmt   = AV_PIX_FMT_YUV420P;
     m_blueEncCtx->gop_size  = 1;
     m_blueEncCtx->bit_rate  = 30000000;
@@ -177,10 +177,12 @@ void ReplayManager::startRecording() {
     m_sessionFileName = m_baseFileName + "_" + timestamp;
     // Recordings go to the user-configured location (empty = default)
     m_muxer->setOutputDirectory(m_outputDir);
-    const bool muxerReady = m_telemetryFeedIds.isEmpty()
-        ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames)
-        : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                        m_telemetryFeedIds, m_telemetryFeedNames);
+    const bool muxerReady =
+        m_telemetryFeedIds.isEmpty()
+            ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight,
+                            m_frameRate, m_viewNames)
+            : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight,
+                            m_frameRate, m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames);
     if (!muxerReady) {
         qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
@@ -209,9 +211,8 @@ void ReplayManager::startRecording() {
     const int sourceCount = m_sourceUrls.size();
 
     for (int s = 0; s < sourceCount; ++s) {
-        StreamWorker* worker = new StreamWorker(
-            m_sourceUrls[s], s, m_muxer, m_clock,
-            m_videoWidth, m_videoHeight, m_fps);
+        StreamWorker* worker = new StreamWorker(m_sourceUrls[s], s, m_muxer, m_clock, m_videoWidth,
+                                                m_videoHeight, m_frameRate);
 
         // Set per-source metadata JSON for the subtitle track
         if (s < m_sourceMetadata.size()) {
@@ -365,14 +366,14 @@ void ReplayManager::onTimerTick() {
     // The recording timeline is wall-clock-derived; the (fixed-rate) timer is just a
     // scheduler. heartbeatFrameSpan() turns the elapsed wall-clock into the frame
     // range to emit this tick (with catch-up for late ticks + a 1-second backlog
-    // skip). maxBacklogFrames = m_fps == one second of frames.
+    // skip). maxBacklogFrames = roundedFps == one second of frames.
     const int64_t elapsedMs = m_clock->elapsedMs();
-    const FrameSpan span =
-        heartbeatFrameSpan(elapsedMs, m_fps, m_globalFrameCount, kMaxFramesPerTick, m_fps);
+    const FrameSpan span = heartbeatFrameSpan(elapsedMs, m_frameRate, m_globalFrameCount,
+                                              kMaxFramesPerTick, m_frameRate.roundedFps());
 
     for (int64_t f = span.from; f <= span.to; ++f) {
         m_globalFrameCount = f;
-        const int64_t frameMs = (f * 1000) / m_fps;
+        const int64_t frameMs = m_frameRate.msForFrame(f);
 
         // 1. Emit masterPulse — source workers do jitter pull + encode
         emit masterPulse(f, frameMs);
@@ -406,7 +407,7 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
     // Frame-count-derived recording time on the FILE timeline: same as
     // the source workers' audio cursor, so silence and source audio tile
     // seamlessly when a view's mapping changes.
-    const int64_t recMs = (m_globalFrameCount * 1000) / m_fps;
+    const int64_t recMs = m_frameRate.msForFrame(m_globalFrameCount);
     const int64_t silenceTargetEnd = recMs * StreamWorker::kAudioSampleRate / 1000;
 
     for (int v = 0; v < m_viewCount; ++v) {
@@ -423,7 +424,7 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
 
         // RE-STAMP: the cached packet carries the fixed pts/dts from its
         // one-time encode.  Overwrite both with the CURRENT frame index on
-        // the encoder timeline ({1, m_fps}) — exactly what the old per-pulse
+        // the encoder timeline ({den, num}) — exactly what the old per-pulse
         // path produced via m_blueFrame->pts = m_globalFrameCount — then
         // rescale to the stream timebase.  Without this the muxer's
         // monotonic-DTS bump would fire on every write.
@@ -444,8 +445,8 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         if (silenceTargetEnd > 0 && v < m_blueAudioCursor.size()) {
             int64_t &cursor = m_blueAudioCursor[v];
             if (cursor < 0) {
-                cursor = qMax<int64_t>(0, silenceTargetEnd
-                                          - StreamWorker::kAudioSampleRate / m_fps);
+                cursor = qMax<int64_t>(0, silenceTargetEnd - m_frameRate.samplesPerFrame(
+                                                                 StreamWorker::kAudioSampleRate));
             }
             if (silenceTargetEnd > cursor) {
                 const int64_t n = qMin<int64_t>(silenceTargetEnd - cursor,

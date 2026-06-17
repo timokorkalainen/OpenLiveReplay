@@ -120,16 +120,8 @@ void TestTelemetryTimelineReader::readsLatestFeedTelemetryByPlayhead() {
     const QStringList viewNames{QStringLiteral("View 1")};
     const QStringList feedIds{QStringLiteral("cam-main"), QStringLiteral("cam-reverse")};
     const QStringList feedNames{QStringLiteral("Main"), QStringLiteral("Reverse")};
-    QVERIFY(muxer.init(QStringLiteral("telemetry_reader"),
-                       1,
-                       320,
-                       240,
-                       30,
-                       viewNames,
-                       feedIds,
-                       feedNames,
-                       48000,
-                       2));
+    QVERIFY(muxer.init(QStringLiteral("telemetry_reader"), 1, 320, 240, FrameRate{30, 1}, viewNames,
+                       feedIds, feedNames, 48000, 2));
 
     muxer.writeTelemetryPacket(0, 100, QByteArrayLiteral(
         "{\"feedId\":\"cam-main\",\"values\":{\"batteryPercent\":90}}"));
@@ -203,16 +195,8 @@ void TestTelemetryTimelineReader::keysStateByStreamMetadataWhenPayloadFeedDiffer
     const QStringList viewNames{QStringLiteral("View 1")};
     const QStringList feedIds{QStringLiteral("cam-main")};
     const QStringList feedNames{QStringLiteral("Main")};
-    QVERIFY(muxer.init(QStringLiteral("telemetry_metadata_key"),
-                       1,
-                       320,
-                       240,
-                       30,
-                       viewNames,
-                       feedIds,
-                       feedNames,
-                       48000,
-                       2));
+    QVERIFY(muxer.init(QStringLiteral("telemetry_metadata_key"), 1, 320, 240, FrameRate{30, 1},
+                       viewNames, feedIds, feedNames, 48000, 2));
 
     muxer.writeTelemetryPacket(0, 100, QByteArrayLiteral(
         "{\"feedId\":\"payload-spoof\",\"values\":{\"batteryPercent\":77}}"));

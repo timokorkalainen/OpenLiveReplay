@@ -1197,15 +1197,11 @@ ApplicationWindow {
 
                     Label { text: "FPS"; }
 
-                    SpinBox {
-                        from: 1
-                        to: 120
-                        stepSize: 1
-                        editable: true
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        value: appWindow.uiManagerRef.recordFps
+                    ComboBox {
+                        model: appWindow.uiManagerRef.frameRatePresetLabels
+                        currentIndex: appWindow.uiManagerRef.frameRateIndex
                         enabled: !appWindow.uiManagerRef.isRecording
-                        onValueModified: appWindow.uiManagerRef.recordFps = value
+                        onActivated: appWindow.uiManagerRef.frameRateIndex = currentIndex
                     }
 
                     Item { }

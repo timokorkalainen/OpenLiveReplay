@@ -88,7 +88,7 @@ int main(int argc, char *argv[])
     QObject::connect(&uiManager, &UIManager::fileNameChanged, &controlServer, publishSettings);
     QObject::connect(&uiManager, &UIManager::recordWidthChanged, &controlServer, publishSettings);
     QObject::connect(&uiManager, &UIManager::recordHeightChanged, &controlServer, publishSettings);
-    QObject::connect(&uiManager, &UIManager::recordFpsChanged, &controlServer, publishSettings);
+    QObject::connect(&uiManager, &UIManager::frameRateChanged, &controlServer, publishSettings);
     QObject::connect(&uiManager, &UIManager::audioOutputLatencyChanged, &controlServer,
                      publishSettings);
     QObject::connect(&uiManager, &UIManager::timeOfDayModeChanged, &controlServer, publishSettings);

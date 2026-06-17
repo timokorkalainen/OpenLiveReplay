@@ -14,10 +14,11 @@
 # hermetic — the whole temp dir is removed on exit.
 #
 # Modes:
-#   stereo  synthetic stereo sine  -> baseline happy path
-#   mono    synthetic mono   sine  -> regression for the mono-audio SIGBUS crash
+#   stereo   synthetic stereo sine  -> baseline happy path
+#   mono     synthetic mono   sine  -> regression for the mono-audio SIGBUS crash
+#   fps2997  true 29.97 (30000/1001) -> proves fractional r_frame_rate
 #
-# Usage: run_record_e2e.sh <harness_exe> <stereo|mono> [udp_port]
+# Usage: run_record_e2e.sh <harness_exe> <stereo|mono|fps2997> [udp_port]
 set -uo pipefail
 
 HARNESS="${1:?harness executable path required}"
@@ -29,6 +30,15 @@ command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
 command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
 
 if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
+
+# Recording + source frame rate. fps2997 exercises a true 29.97 (30000/1001).
+SRC_RATE="30"      # ffmpeg testsrc2 rate
+REC_FPS="30"       # --fps passed to the harness
+if [ "$MODE" = "fps2997" ]; then
+    SRC_RATE="30000/1001"
+    REC_FPS="29.97"
+    CH=2
+fi
 
 WORKDIR="$(mktemp -d)"
 FFPID=""
@@ -46,7 +56,7 @@ is_num() { case "${1:-}" in '' | *[!0-9.]*) return 1 ;; *) return 0 ;; esac; }
 # --- 1. Producer: synthetic live stream (testsrc2 video + sine audio) --------
 # h264 video + aac audio in MPEG-TS over UDP, paced in real time (-re).
 ffmpeg -hide_banner -loglevel error -re \
-    -f lavfi -i "testsrc2=size=640x480:rate=30" \
+    -f lavfi -i "testsrc2=size=640x480:rate=${SRC_RATE}" \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
     -ac "$CH" \
     -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
@@ -58,7 +68,7 @@ sleep 0.5 # let the producer come up before the consumer binds
 # --- 2. Consumer: the real recording engine ----------------------------------
 URL="udp://127.0.0.1:${PORT}?fifo_size=1000000&overrun_nonfatal=1"
 HARNESS_OUT="$("$HARNESS" --url "$URL" --name "olr_e2e_${MODE}" --outdir "$WORKDIR" \
-    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30)"
+    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps ${REC_FPS})"
 HARNESS_RC=$?
 
 if [ $HARNESS_RC -ne 0 ]; then
@@ -115,6 +125,21 @@ if ! is_num "${V_LAST:-}" || ! is_num "${A_LAST:-}"; then
 elif ! awk -v v="$V_LAST" -v a="$A_LAST" 'BEGIN{d=v-a; if(d<0)d=-d; exit !(d<0.75)}'; then
     echo "FAIL: audio/video end timestamps diverge >0.75s (v=$V_LAST a=$A_LAST)"
     fail=1
+fi
+
+# fps2997: prove the output is a TRUE fractional rate (~29.97), not integer 30.
+# Matroska carries avg_frame_rate via DefaultDuration; ffprobe reads it back.
+if [ "$MODE" = "fps2997" ]; then
+    AVG_FR="$(scalar -select_streams v:0 -show_entries stream=avg_frame_rate)"
+    RATE_F="$(awk -F/ 'NF==2 && $2+0>0 {printf "%.4f", $1/$2; next} {printf "%.4f", $1}' <<<"$AVG_FR")"
+    echo "[e2e] avg_frame_rate=${AVG_FR:-?} (${RATE_F:-?})"
+    # 29.97 passes (29.9 < r < 30.0); integer 30.0 FAILS. Pre-P1 output is 30/1.
+    if ! is_num "${RATE_F:-}" || ! awk -v r="$RATE_F" 'BEGIN{exit !(r > 29.9 && r < 30.0)}'; then
+        echo "FAIL: avg_frame_rate=${AVG_FR:-none} (${RATE_F:-none}) is not a true 29.97 (integer 30 would read 30.0)"
+        fail=1
+    else
+        echo "[e2e] OK: true fractional rate ${AVG_FR} (~29.97)"
+    fi
 fi
 
 if [ $fail -ne 0 ]; then

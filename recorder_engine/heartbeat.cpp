@@ -2,15 +2,15 @@
 
 #include <algorithm>
 
-FrameSpan heartbeatFrameSpan(int64_t elapsedMs, int fps, int64_t lastFrame, int maxPerTick,
-                             int64_t maxBacklogFrames) {
+FrameSpan heartbeatFrameSpan(int64_t elapsedMs, const FrameRate& rate, int64_t lastFrame,
+                             int maxPerTick, int64_t maxBacklogFrames) {
     FrameSpan span;
     span.from = lastFrame + 1;
     span.to = lastFrame; // empty until we know there is at least one frame to emit
-    if (fps <= 0) {
+    if (!rate.isValid()) {
         return span;
     }
-    const int64_t derivedFrame = (elapsedMs * fps) / 1000;
+    const int64_t derivedFrame = rate.frameForMs(elapsedMs);
     if (derivedFrame <= lastFrame) {
         return span; // frame count has not advanced
     }

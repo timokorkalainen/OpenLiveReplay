@@ -10,6 +10,7 @@
 #include <QStringList>
 #include <QTimer>
 #include "recordingclock.h"
+#include "framerate.h"
 #include "muxer.h"
 #include "streamworker.h"
 #include "ingest/ingestsession.h"
@@ -63,14 +64,18 @@ public:
     void setBaseFileName(const QString &name) { m_baseFileName = name; }
     void setVideoWidth(int width) { m_videoWidth = width; }
     void setVideoHeight(int height) { m_videoHeight = height; }
-    void setFps(int fps) { m_fps = fps; }
+    void setFps(int fps) { m_frameRate = FrameRate{fps > 0 ? fps : 30, 1}; } // int shim
+    void setFrameRate(const FrameRate& r) {
+        if (r.isValid()) m_frameRate = r;
+    }
 
     // Getters
     QString getOutputDirectory() const { return m_outputDir; }
     QString getBaseFileName() const { return m_baseFileName; }
     int getVideoWidth() const { return m_videoWidth; }
     int getVideoHeight() const { return m_videoHeight; }
-    int getFps() const { return m_fps; }
+    FrameRate frameRate() const { return m_frameRate; }
+    int getFps() const { return m_frameRate.roundedFps(); }
 
     int64_t getElapsedMs();
     QString getVideoPath();
@@ -133,7 +138,7 @@ private:
     // freezes; the remainder drains on later ticks.
     static constexpr int kHeartbeatIntervalMs = 8;
     static constexpr int kMaxFramesPerTick = 8;
-    int m_fps = 30;
+    FrameRate m_frameRate{30, 1};
 
     QTimer* m_heartbeat;
     Muxer* m_muxer;

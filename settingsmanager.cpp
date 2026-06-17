@@ -38,7 +38,8 @@ bool SettingsManager::save(const QString &path, const AppSettings &settings) {
     root["fileName"] = settings.fileName;
     root["videoWidth"] = settings.videoWidth;
     root["videoHeight"] = settings.videoHeight;
-    root["fps"] = settings.fps;
+    root["fpsNum"] = settings.fpsNum;
+    root["fpsDen"] = settings.fpsDen;
     root["multiviewCount"] = settings.multiviewCount;
     root["showTimeOfDay"] = settings.showTimeOfDay;
     root["audioOutputLatencyMs"] = settings.audioOutputLatencyMs;
@@ -131,7 +132,15 @@ bool SettingsManager::load(const QString &path, AppSettings &settings) {
     settings.fileName = root["fileName"].toString();
     settings.videoWidth = root["videoWidth"].toInt(settings.videoWidth);
     settings.videoHeight = root["videoHeight"].toInt(settings.videoHeight);
-    settings.fps = root["fps"].toInt(settings.fps);
+    // Legacy "fps":<int> loads as the numerator; den defaults to 1. Use the
+    // const value() accessor and a temporary: nesting two non-const operator[]
+    // subscripts in one expression can reorder the object's storage and swap
+    // the two reads (unspecified eval order over QJsonValueRef).
+    const int legacyFps = root.value("fps").toInt(settings.fpsNum);
+    settings.fpsNum = root.value("fpsNum").toInt(legacyFps);
+    settings.fpsDen = root.value("fpsDen").toInt(settings.fpsDen);
+    if (settings.fpsNum <= 0) settings.fpsNum = 30;
+    if (settings.fpsDen <= 0) settings.fpsDen = 1;
     settings.multiviewCount = root["multiviewCount"].toInt(settings.multiviewCount);
     settings.showTimeOfDay = root["showTimeOfDay"].toBool(settings.showTimeOfDay);
     settings.audioOutputLatencyMs =

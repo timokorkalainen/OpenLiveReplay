@@ -20,3 +20,27 @@ Report-only; these are diagnostics, not pass/fail thresholds.
 # (native-apple-ingest). Also fixed a pre-existing native AAC decoder bug that
 # dropped ~99% of decoded audio (input-proc EOS); the lipsync marker exposed it.
 [sync] scenario=lipsync pairs=7 av_offset_ms: mean=6.3 max=14.7 (EBU_R37_band=+40/-60)  # ffmpeg path, post-AUD-4
+
+## 2026-06-17 (branch feat/rational-fps) — P1 rational frame rate (FRAC-1/2, MUX-2)
+# The frame rate is now an exact rational `FrameRate {num,den}` end-to-end in the
+# recording engine (was integer `fps`). Fractional broadcast rates — 29.97 =
+# 30000/1001, 59.94 = 60000/1001, 23.976 = 24000/1001 — record with correct frame
+# timing and a correct container rate instead of being forced to integer 30/60.
+#   - The frame<->ms math is centralized in `recorder_engine/framerate.h`
+#     (msForFrame / frameForMs / samplesPerFrame); the encoder time_base is
+#     {den,num} and framerate {num,den}; the muxer sets avg/r_frame_rate = {num,den},
+#     which Matroska carries as the track DefaultDuration.
+#   - Settings persist `fpsNum`/`fpsDen` (a legacy `"fps":<int>` loads as {n,1}); the
+#     UI picks a rate from a preset list (23.976/24/25/29.97/30/50/59.94/60); the
+#     e2e harnesses accept a rational `--fps` ("29.97", "30000/1001").
+#   - GATED proof: `e2e_record_2997` (e2e label) records a true 29.97 and asserts the
+#     output avg_frame_rate is in (29.9, 30.0) — 29.97 reads 30000/1001 and PASSES,
+#     integer 30.0 FAILS (teeth-verified bidirectionally). Integer 30/60 recordings
+#     are byte-identical (encoder {1,30}/{30,1}), so all prior gates stay green.
+#   - DEFERRED (separate roadmap items): drop-frame timecode (TC-2) and rational
+#     playback stepping — PlaybackTransport still uses the rounded integer rate, so
+#     step-by-frame on a 29.97 file is ~0.1% off.
+# Note on drift_2997 above: that report-only scenario still records the 29.97 source
+# at session --fps 30 ON PURPOSE — it measures the source-vs-session mismatch
+# (slope 1.000220, 220 ppm). P1 lets a session match the source (record at 29.97);
+# the discriminating proof of that capability is the gated e2e_record_2997.
