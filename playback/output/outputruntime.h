@@ -23,6 +23,9 @@ public:
 
     void setSnapshotProvider(SnapshotProvider provider);
     void setEndpoints(const QList<OutputEndpoint>& endpoints);
+    // Forward identity-skip to the wrapped dispatcher (e.g. tests that assert a
+    // per-tick submit of an unchanged frame must disable it).
+    void setIdentitySkip(bool enabled);
 
     void startRuntime();
     void stopRuntime();
