@@ -70,9 +70,9 @@ int main(int argc, char** argv) {
         OutputBusFrame frame;
         frame.bus = OutputBusId::feed(0);
         frame.outputFrameIndex = frameIndex;
-        frame.sampledPlayheadMs = frame.video.ptsMs;
         frame.video = markerVideo(mk, frameIndex);
         frame.audio = markerAudio(mk, frameIndex);
+        frame.sampledPlayheadMs = frame.video.ptsMs;
         sink.submit(frame);
         ++frameIndex;
         const qint64 targetMs = qint64(frameIndex * periodMs);

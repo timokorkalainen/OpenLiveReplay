@@ -63,7 +63,8 @@ struct Recv {
                 lib.resolve("NDIlib_recv_free_video_v2"));
             freeAudio = reinterpret_cast<NDIlib_recv_free_audio_v3_fn>(
                 lib.resolve("NDIlib_recv_free_audio_v3"));
-            if (findCreate && findSources && recvCreate && recvCapture && freeVideo && freeAudio) {
+            if (findCreate && findSources && recvCreate && recvDestroy && recvCapture &&
+                freeVideo && freeAudio) {
                 if (init) init();
                 return true;
             }
@@ -134,7 +135,7 @@ int main(int argc, char** argv) {
     // NDIlib_recv_color_format_fastest (100): for no-alpha sources NDI delivers UYVY.
     // The marker decoder expects raw luma, so we extract luma from UYVY before decode.
     recvCfg.color_format = 100;
-    recvCfg.bandwidth = 100;  // highest
+    recvCfg.bandwidth = 100; // highest
     recvCfg.p_ndi_recv_name = "olr-ndi-recv-probe";
     NDIlib_recv_instance_t recv = ndi.recvCreate(&recvCfg);
     if (ndi.findDestroy) ndi.findDestroy(finder);
@@ -182,9 +183,9 @@ int main(int argc, char** argv) {
         if (type == FrameTypeVideo) {
             if (v.p_data && v.xres >= mk.width && v.yres >= mk.height) {
                 // NDI delivers UYVY; extract luma before marker decode.
-                const QByteArray luma = extractLumaFromUyvy(
-                    reinterpret_cast<const uchar*>(v.p_data), v.line_stride_in_bytes,
-                    v.xres, v.yres);
+                const QByteArray luma =
+                    extractLumaFromUyvy(reinterpret_cast<const uchar*>(v.p_data),
+                                        v.line_stride_in_bytes, v.xres, v.yres);
                 const auto* lumaPtr = reinterpret_cast<const uchar*>(luma.constData());
                 const qint64 idx = ndiMarkerDecodeIndex(mk, lumaPtr, v.xres);
                 if (idx >= 0) {
