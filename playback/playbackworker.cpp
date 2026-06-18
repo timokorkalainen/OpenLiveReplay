@@ -535,6 +535,17 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     framePtsMs = (lastVideoPtsMs != INT64_MIN) ? lastVideoPtsMs + frameDurMs() : P;
                 }
 
+                // Tier 3: index the primary video stream's PTS->byte-offset so a
+                // later full reposition can avio_seek straight to the exact
+                // packet (ALL-INTRA ⇒ any offset is a valid decode start). Keys
+                // off the SAME stream the reposition seek uses (m_decoderBank[0]).
+                // append() keeps PTS strictly increasing, so re-decoded regions
+                // are harmlessly ignored and the index stays sorted.
+                if (!m_decoderBank.isEmpty() &&
+                    track->streamIndex == m_decoderBank[0]->streamIndex && pkt->pos >= 0) {
+                    m_frameIndex.append(framePtsMs, static_cast<qint64>(pkt->pos));
+                }
+
                 // Dedup-before-decode after EOF un-latch: a re-read tail cluster
                 // already in the buffer is skipped (read cost only, no dup).
                 if (dedupTail) {
@@ -625,9 +636,58 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 
     const int64_t anchor = qMax<int64_t>(0, target - (dir < 0 ? kLeadMs : kTrailMs));
 
-    AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
-    int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
-    av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
+    const int primaryVideoStreamIndex = m_decoderBank[0]->streamIndex;
+    AVStream* vStream = m_fmtCtx->streams[primaryVideoStreamIndex];
+
+    // Tier 3 exact-offset seek: if the primary-stream FrameIndex has an entry
+    // at/just-before the coarse anchor, avio_seek straight to that byte offset
+    // instead of the byte-coarse av_seek_frame BACKWARD. ALL-INTRA ⇒ any indexed
+    // offset is a valid standalone decode start, so the forward fill below covers
+    // the SAME [anchor .. target+lead] window (trail intact — back-step reuse and
+    // trimBefore both depend on it) while decoding fewer pre-anchor frames. We
+    // index off the anchor (not target) so the trail below target is still
+    // populated exactly as the coarse path would.
+    //
+    // VALIDATION: a raw byte avio_seek into the middle of a non-interleaved /
+    // multi-track Matroska is NOT guaranteed to resync to that PTS — the demuxer
+    // can land a long way off, which would shorten the trail and storm the seek
+    // path. So we PROBE the landed primary-video PTS and only keep the exact seek
+    // when it lands in the useful band [anchor - kTrailMs, target]; otherwise we
+    // fall back to the proven coarse av_seek_frame BACKWARD. Fully additive: when
+    // the region is unindexed, pb is not byte-seekable, the seek fails, or the
+    // probe lands out of band, we behave exactly like before — no gate regresses.
+    bool exactSought = false;
+    if (m_fmtCtx->pb) {
+        const std::optional<qint64> offset = m_frameIndex.nearestAtOrBefore(anchor);
+        if (offset.has_value() && avio_seek(m_fmtCtx->pb, offset.value(), SEEK_SET) >= 0) {
+            avformat_flush(m_fmtCtx);
+            // Probe forward for the first primary-video packet and read its PTS
+            // without decoding/inserting. Accept only if it landed in-band.
+            const int64_t bandLo = qMax<int64_t>(0, anchor - kTrailMs);
+            int probed = 0;
+            bool landedInBand = false;
+            while (probed++ < 64 && av_read_frame(m_fmtCtx, pkt) >= 0) {
+                if (pkt->stream_index == primaryVideoStreamIndex) {
+                    int64_t pts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+                    if (pts != AV_NOPTS_VALUE) {
+                        const int64_t ptsMs = av_rescale_q(pts, vStream->time_base, {1, 1000});
+                        landedInBand = (ptsMs >= bandLo && ptsMs <= target);
+                    }
+                    av_packet_unref(pkt);
+                    break;
+                }
+                av_packet_unref(pkt);
+            }
+            if (landedInBand && avio_seek(m_fmtCtx->pb, offset.value(), SEEK_SET) >= 0) {
+                avformat_flush(m_fmtCtx); // rewind to the clean offset for the fill
+                exactSought = true;
+            }
+        }
+    }
+    if (!exactSought) {
+        int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
+        av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
+    }
     // Intra-only: no avcodec_flush_buffers needed (spec §6.2); the seek itself
     // restarts the read cursor and the next sent packet decodes standalone.
 
