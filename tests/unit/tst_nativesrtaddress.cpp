@@ -15,6 +15,8 @@ private slots:
     void fillsIpv4Sockaddr();
     void extractsStreamIdOption_data();
     void extractsStreamIdOption();
+    void extractsPassphraseAndKeyLength();
+    void defaultsPbKeyLenWhenOnlyPassphraseGiven();
     void formatsApplicationDefinedRejectReasonWithCode();
     void resolvesHostnames();
     void triesLaterResolvedAddressesAfterFirstFailure();
@@ -69,6 +71,23 @@ void TestNativeSrtAddress::extractsStreamIdOption() {
     const NativeSrtUrlOptions options = nativeSrtUrlOptionsFromUrl(QUrl(url));
 
     QCOMPARE(options.streamId, expectedStreamId);
+}
+
+void TestNativeSrtAddress::extractsPassphraseAndKeyLength() {
+    const NativeSrtUrlOptions options = nativeSrtUrlOptionsFromUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?passphrase=secretpass123&pbkeylen=32")));
+    QCOMPARE(options.passphrase, QStringLiteral("secretpass123"));
+    QCOMPARE(options.pbKeyLen, 32);
+}
+
+void TestNativeSrtAddress::defaultsPbKeyLenWhenOnlyPassphraseGiven() {
+    // Per SRT semantics, a passphrase with no explicit pbkeylen defaults to AES-128
+    // (16-byte key). The streamid coexists in the same query and stays parsed.
+    const NativeSrtUrlOptions options = nativeSrtUrlOptionsFromUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?streamid=feed&passphrase=anothersecret")));
+    QCOMPARE(options.streamId, QStringLiteral("feed"));
+    QCOMPARE(options.passphrase, QStringLiteral("anothersecret"));
+    QCOMPARE(options.pbKeyLen, 16);
 }
 
 void TestNativeSrtAddress::formatsApplicationDefinedRejectReasonWithCode() {

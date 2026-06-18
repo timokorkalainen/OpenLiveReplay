@@ -53,7 +53,7 @@ Removing `FfmpegIngestSession` (the universal catch-all) intentionally narrowed 
 
 | Dropped capability | Why it fails now | Restore path |
 |--------------------|------------------|--------------|
-| **Encrypted SRT** (`passphrase`/`pbkeylen`) | `NativeSrtIngestSession::supportsUrl` rejects encrypted URLs | add `SRTO_PASSPHRASE`/`SRTO_PBKEYLEN` to the native SRT socket setup |
+| ~~**Encrypted SRT** (`passphrase`/`pbkeylen`)~~ | **RESTORED** — `supportsUrl` accepts a valid `passphrase` (10..79 chars) + optional `pbkeylen` (16/24/32, default 16); the native socket sets `SRTO_PBKEYLEN`/`SRTO_PASSPHRASE` before connect. Bad encryption inputs (mismatched key length, too-short passphrase, `pbkeylen` without a passphrase) still hit the accurate unsupported diagnostic. Loopback e2e: `e2e_native_srt_encrypted`. |
 | **Listener / rendezvous SRT** | native SRT is **caller-only** | add listener/rendezvous modes |
 | **`udp://` MPEG-TS ingest** | no native UDP backend | a native UDP+MPEG-TS reader (the `MpegTsParser` already exists; only the UDP socket is missing) — or keep as test-only via the SRT bridge |
 | **`file://` ingest** | no native file reader | a native file/demux reader (low priority; tests use the SRT bridge) |

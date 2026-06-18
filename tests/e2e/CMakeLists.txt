@@ -335,6 +335,16 @@ if(APPLE)
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_lipsync.sh" "$<TARGET_FILE:sync_harness>" 23710)
     set_tests_properties(e2e_native_srt_lipsync PROPERTIES
         LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE)
+
+    # Encrypted SRT (SRTO_PASSPHRASE/SRTO_PBKEYLEN): a passphrase-protected SRT
+    # listener + an encrypted caller URL must decrypt + record real content. A
+    # mismatch yields no frames, so this positively proves encrypted ingest. The
+    # producer side needs ffmpeg + srt-live-transmit; SKIP-clean (77) otherwise.
+    # Base 23720.
+    add_test(NAME e2e_native_srt_encrypted
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_encrypted_smoke.sh" "$<TARGET_FILE:record_harness>" 23720)
+    set_tests_properties(e2e_native_srt_encrypted PROPERTIES
+        LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")
     add_test(NAME e2e_native_srt_hevc_smoke

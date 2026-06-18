@@ -14,6 +14,8 @@ private slots:
     void srtRoutesToNativeSrt();
     void srtHostnameWithStreamIdRoutesToNativeSrt();
     void srtStreamIdIsDecodedForSocketOption();
+    void srtEncryptedUrlIsSupported();
+    void srtBadEncryptionIsRejected();
     void rtmpRoutesToNativeRtmp();
     void ndiRoutesToNativeNdi();
     void unsupportedSchemesAreRejected();
@@ -60,6 +62,36 @@ void TestIngestBackendSelector::srtStreamIdIsDecodedForSocketOption() {
                 QUrl(QStringLiteral("srt://maps.rally.promo:8890")))
                 .isEmpty());
 }
+void TestIngestBackendSelector::srtEncryptedUrlIsSupported() {
+    // Encrypted SRT (passphrase + optional pbkeylen) is restored natively: the URL
+    // is accepted and routes to NativeSrt, and the parsed options carry the
+    // passphrase + key length so the socket setup can apply SRTO_PASSPHRASE.
+    const QUrl url(QStringLiteral("srt://127.0.0.1:9000?passphrase=secretpass123&pbkeylen=16"));
+    QVERIFY(NativeSrtIngestSession::supportsUrl(url));
+
+    const IngestBackendOptions opts =
+        ingestBackendOptionsFromEnvironment(url, NativeSrtIngestSession::supportsUrl(url), false);
+    QVERIFY(opts.preferNativeSrt);
+    QCOMPARE(selectIngestBackend(url, opts), IngestBackendKind::NativeSrt);
+
+    // A passphrase without an explicit pbkeylen is also valid (defaults to AES-128).
+    QVERIFY(NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?passphrase=secretpass123"))));
+}
+
+void TestIngestBackendSelector::srtBadEncryptionIsRejected() {
+    // pbkeylen must be 16/24/32; anything else is genuinely-bad input and must be
+    // rejected so the scheme-aware unsupported diagnostic stays accurate.
+    QVERIFY(!NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?passphrase=secretpass123&pbkeylen=20"))));
+    // SRT passphrases must be 10..79 characters; a too-short one is invalid.
+    QVERIFY(!NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?passphrase=short"))));
+    // pbkeylen without any passphrase is meaningless (encryption needs a key).
+    QVERIFY(!NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?pbkeylen=16"))));
+}
+
 void TestIngestBackendSelector::rtmpRoutesToNativeRtmp() {
     IngestBackendOptions opts;
     opts.preferNativeRtmp = true;

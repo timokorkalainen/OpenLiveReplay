@@ -156,9 +156,24 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
     if (!mode.isEmpty() && mode != QStringLiteral("caller")) {
         return false;
     }
-    if (query.hasQueryItem(QStringLiteral("passphrase")) ||
-        query.hasQueryItem(QStringLiteral("pbkeylen"))) {
+
+    // Encrypted SRT is supported natively (SRTO_PASSPHRASE/SRTO_PBKEYLEN). Accept a
+    // valid passphrase (+ optional pbkeylen) but reject genuinely-bad encryption
+    // inputs so the scheme-aware unsupported diagnostic stays accurate:
+    //   - pbkeylen present without a passphrase is meaningless;
+    //   - a passphrase outside SRT's 10..79-byte range (libsrt would silently leave
+    //     the link UNENCRYPTED) is rejected rather than silently downgraded;
+    //   - pbkeylen must be 16/24/32.
+    const NativeSrtUrlOptions options = nativeSrtUrlOptionsFromUrl(url);
+    const bool hasPassphrase = !options.passphrase.isEmpty();
+    if (query.hasQueryItem(QStringLiteral("pbkeylen")) && !hasPassphrase) {
         return false;
+    }
+    if (hasPassphrase) {
+        if (!nativeSrtPassphraseIsValid(options.passphrase) ||
+            !nativeSrtPbKeyLenIsValid(options.pbKeyLen)) {
+            return false;
+        }
     }
 
     return !url.host().isEmpty();
@@ -375,6 +390,24 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
                       QStringLiteral("SRTO_STREAMID"))) {
         closeSocket();
         return false;
+    }
+
+    // Encrypted SRT: set the key length first, then the passphrase (which is what
+    // actually enables AES). supportsUrl already validated both, so by here a
+    // non-empty passphrase has a 10..79-byte length and a 16/24/32 pbKeyLen.
+    const NativeSrtUrlOptions urlOptions = nativeSrtUrlOptionsFromUrl(m_url);
+    if (!urlOptions.passphrase.isEmpty()) {
+        if (!setSrtOption(m_socket, SRTO_PBKEYLEN, &urlOptions.pbKeyLen,
+                          sizeof(urlOptions.pbKeyLen), error, QStringLiteral("SRTO_PBKEYLEN"))) {
+            closeSocket();
+            return false;
+        }
+        const QByteArray passphrase = urlOptions.passphrase.toUtf8();
+        if (!setSrtOption(m_socket, SRTO_PASSPHRASE, passphrase.constData(), passphrase.size(),
+                          error, QStringLiteral("SRTO_PASSPHRASE"))) {
+            closeSocket();
+            return false;
+        }
     }
 
     const int connectResult = srt_connect(m_socket, address.sockaddrPtr(), address.size);
