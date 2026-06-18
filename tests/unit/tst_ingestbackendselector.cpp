@@ -14,6 +14,10 @@ private slots:
     void srtRoutesToNativeSrt();
     void srtHostnameWithStreamIdRoutesToNativeSrt();
     void srtStreamIdIsDecodedForSocketOption();
+    void srtEncryptedUrlIsSupported();
+    void srtBadEncryptionIsRejected();
+    void srtListenerAndRendezvousAreSupported();
+    void srtUnknownModeIsRejected();
     void rtmpRoutesToNativeRtmp();
     void ndiRoutesToNativeNdi();
     void unsupportedSchemesAreRejected();
@@ -60,6 +64,67 @@ void TestIngestBackendSelector::srtStreamIdIsDecodedForSocketOption() {
                 QUrl(QStringLiteral("srt://maps.rally.promo:8890")))
                 .isEmpty());
 }
+void TestIngestBackendSelector::srtEncryptedUrlIsSupported() {
+    // Encrypted SRT (passphrase + optional pbkeylen) is restored natively: the URL
+    // is accepted and routes to NativeSrt, and the parsed options carry the
+    // passphrase + key length so the socket setup can apply SRTO_PASSPHRASE.
+    const QUrl url(QStringLiteral("srt://127.0.0.1:9000?passphrase=secretpass123&pbkeylen=16"));
+    QVERIFY(NativeSrtIngestSession::supportsUrl(url));
+
+    const IngestBackendOptions opts =
+        ingestBackendOptionsFromEnvironment(url, NativeSrtIngestSession::supportsUrl(url), false);
+    QVERIFY(opts.preferNativeSrt);
+    QCOMPARE(selectIngestBackend(url, opts), IngestBackendKind::NativeSrt);
+
+    // A passphrase without an explicit pbkeylen is also valid (defaults to AES-128).
+    QVERIFY(NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?passphrase=secretpass123"))));
+}
+
+void TestIngestBackendSelector::srtBadEncryptionIsRejected() {
+    // pbkeylen must be 16/24/32; anything else is genuinely-bad input and must be
+    // rejected so the scheme-aware unsupported diagnostic stays accurate.
+    QVERIFY(!NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?passphrase=secretpass123&pbkeylen=20"))));
+    // SRT passphrases must be 10..79 characters; a too-short one is invalid.
+    QVERIFY(!NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?passphrase=short"))));
+    // pbkeylen without any passphrase is meaningless (encryption needs a key).
+    QVERIFY(!NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?pbkeylen=16"))));
+}
+
+void TestIngestBackendSelector::srtListenerAndRendezvousAreSupported() {
+    // Native SRT was caller-only; listener + rendezvous are restored. Both URLs are
+    // accepted, route to NativeSrt, and the session reports the parsed mode so the
+    // socket setup can bind+listen (listener) or set SRTO_RENDEZVOUS (rendezvous).
+    const QUrl listener(QStringLiteral("srt://127.0.0.1:9000?mode=listener"));
+    QVERIFY(NativeSrtIngestSession::supportsUrl(listener));
+    QCOMPARE(NativeSrtIngestSession::connectionModeForUrl(listener), NativeSrtMode::Listener);
+    const IngestBackendOptions listenerOpts = ingestBackendOptionsFromEnvironment(
+        listener, NativeSrtIngestSession::supportsUrl(listener), false);
+    QCOMPARE(selectIngestBackend(listener, listenerOpts), IngestBackendKind::NativeSrt);
+
+    const QUrl rendezvous(QStringLiteral("srt://127.0.0.1:9000?mode=rendezvous"));
+    QVERIFY(NativeSrtIngestSession::supportsUrl(rendezvous));
+    QCOMPARE(NativeSrtIngestSession::connectionModeForUrl(rendezvous), NativeSrtMode::Rendezvous);
+
+    // Default + explicit caller are unchanged (no behavior change for existing URLs).
+    QCOMPARE(
+        NativeSrtIngestSession::connectionModeForUrl(QUrl(QStringLiteral("srt://127.0.0.1:9000"))),
+        NativeSrtMode::Caller);
+    QCOMPARE(NativeSrtIngestSession::connectionModeForUrl(
+                 QUrl(QStringLiteral("srt://127.0.0.1:9000?mode=caller"))),
+             NativeSrtMode::Caller);
+}
+
+void TestIngestBackendSelector::srtUnknownModeIsRejected() {
+    // An unrecognised mode is genuinely-bad input: rejected so the scheme-aware
+    // unsupported diagnostic stays accurate (it is not silently treated as caller).
+    QVERIFY(!NativeSrtIngestSession::supportsUrl(
+        QUrl(QStringLiteral("srt://127.0.0.1:9000?mode=bogus"))));
+}
+
 void TestIngestBackendSelector::rtmpRoutesToNativeRtmp() {
     IngestBackendOptions opts;
     opts.preferNativeRtmp = true;

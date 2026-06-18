@@ -151,17 +151,42 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
         return false;
     }
 
-    const QUrlQuery query(url);
-    const QString mode = query.queryItemValue(QStringLiteral("mode")).toLower();
-    if (!mode.isEmpty() && mode != QStringLiteral("caller")) {
-        return false;
-    }
-    if (query.hasQueryItem(QStringLiteral("passphrase")) ||
-        query.hasQueryItem(QStringLiteral("pbkeylen"))) {
+    const NativeSrtUrlOptions options = nativeSrtUrlOptionsFromUrl(url);
+
+    // Connection mode: caller (default), listener, or rendezvous are all supported
+    // natively. An unrecognised mode= is genuinely-bad input and is rejected so the
+    // scheme-aware unsupported diagnostic stays accurate.
+    if (options.unknownMode) {
         return false;
     }
 
+    // Encrypted SRT is supported natively (SRTO_PASSPHRASE/SRTO_PBKEYLEN). Accept a
+    // valid passphrase (+ optional pbkeylen) but reject genuinely-bad encryption
+    // inputs so the scheme-aware unsupported diagnostic stays accurate:
+    //   - pbkeylen present without a passphrase is meaningless;
+    //   - a passphrase outside SRT's 10..79-byte range (libsrt would silently leave
+    //     the link UNENCRYPTED) is rejected rather than silently downgraded;
+    //   - pbkeylen must be 16/24/32.
+    const bool hasPassphrase = !options.passphrase.isEmpty();
+    // Use the raw-parsed value (single source of truth — `options` is what the
+    // socket setup applies), not QUrlQuery, so a streamid-embedded '#' can't make
+    // validation and application disagree. pbKeyLen is 0 unless a numeric pbkeylen
+    // was given; non-zero with no passphrase is the meaningless case.
+    if (options.pbKeyLen != 0 && !hasPassphrase) {
+        return false;
+    }
+    if (hasPassphrase) {
+        if (!nativeSrtPassphraseIsValid(options.passphrase) ||
+            !nativeSrtPbKeyLenIsValid(options.pbKeyLen)) {
+            return false;
+        }
+    }
+
     return !url.host().isEmpty();
+}
+
+NativeSrtMode NativeSrtIngestSession::connectionModeForUrl(const QUrl& url) {
+    return nativeSrtUrlOptionsFromUrl(url).mode;
 }
 
 QByteArray NativeSrtIngestSession::streamIdForSocketOption(const QUrl& url) {
@@ -377,6 +402,57 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
         return false;
     }
 
+    // Encrypted SRT: set the key length first, then the passphrase (which is what
+    // actually enables AES). supportsUrl already validated both, so by here a
+    // non-empty passphrase has a 10..79-byte length and a 16/24/32 pbKeyLen.
+    const NativeSrtUrlOptions urlOptions = nativeSrtUrlOptionsFromUrl(m_url);
+    if (!urlOptions.passphrase.isEmpty()) {
+        if (!setSrtOption(m_socket, SRTO_PBKEYLEN, &urlOptions.pbKeyLen,
+                          sizeof(urlOptions.pbKeyLen), error, QStringLiteral("SRTO_PBKEYLEN"))) {
+            closeSocket();
+            return false;
+        }
+        const QByteArray passphrase = urlOptions.passphrase.toUtf8();
+        if (!setSrtOption(m_socket, SRTO_PASSPHRASE, passphrase.constData(), passphrase.size(),
+                          error, QStringLiteral("SRTO_PASSPHRASE"))) {
+            closeSocket();
+            return false;
+        }
+    }
+
+    // Listener mode binds + listens + accepts the inbound caller (the engine is the
+    // server). Caller (default) and rendezvous both connect out; rendezvous also
+    // sets SRTO_RENDEZVOUS so the two peers connect to each other simultaneously.
+    if (urlOptions.mode == NativeSrtMode::Listener) {
+        return acceptListenerConnection(address, error);
+    }
+
+    if (urlOptions.mode == NativeSrtMode::Rendezvous) {
+        const int yesRdv = 1;
+        if (!setSrtOption(m_socket, SRTO_RENDEZVOUS, &yesRdv, sizeof(yesRdv), error,
+                          QStringLiteral("SRTO_RENDEZVOUS"))) {
+            closeSocket();
+            return false;
+        }
+        // Rendezvous requires the socket to be bound to the same local port it
+        // connects to (both peers are symmetric). Bind to the wildcard at that port.
+        NativeSrtSockaddr bindAddress;
+        if (!nativeSrtMakeIpv4Sockaddr(QStringLiteral("0.0.0.0"), quint16(m_url.port(9000)),
+                                       &bindAddress) ||
+            srt_bind(m_socket, bindAddress.sockaddrPtr(), bindAddress.size) == SRT_ERROR) {
+            if (error) {
+                *error = QStringLiteral("Native SRT rendezvous bind failed: %1")
+                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+            }
+            closeSocket();
+            return false;
+        }
+    }
+
+    return connectAndAwait(address, error);
+}
+
+bool NativeSrtIngestSession::connectAndAwait(const NativeSrtSockaddr& address, QString* error) {
     const int connectResult = srt_connect(m_socket, address.sockaddrPtr(), address.size);
     if (connectResult == SRT_ERROR) {
         int osError = 0;
@@ -420,10 +496,87 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
     return false;
 }
 
+bool NativeSrtIngestSession::acceptListenerConnection(const NativeSrtSockaddr& address,
+                                                      QString* error) {
+    // Promote the configured socket to the listening socket (it already carries the
+    // common options + streamid/encryption, which SRT inherits onto the accepted
+    // data socket). m_socket becomes the accepted socket below. Clear m_socket
+    // before publishing m_listenSocket so a concurrent closeSocket() from the
+    // control thread can never see the same SRTSOCKET in both members (no double
+    // srt_close).
+    const SRTSOCKET configured = m_socket;
+    m_socket = SRT_INVALID_SOCK;
+    m_listenSocket = configured;
+
+    if (srt_bind(m_listenSocket, address.sockaddrPtr(), address.size) == SRT_ERROR) {
+        if (error) {
+            *error = QStringLiteral("Native SRT listener bind failed: %1")
+                         .arg(QString::fromUtf8(srt_getlasterror_str()));
+        }
+        closeSocket();
+        return false;
+    }
+    if (srt_listen(m_listenSocket, 1) == SRT_ERROR) {
+        if (error) {
+            *error = QStringLiteral("Native SRT listen failed: %1")
+                         .arg(QString::fromUtf8(srt_getlasterror_str()));
+        }
+        closeSocket();
+        return false;
+    }
+
+    // RCVSYN=0 on the listening socket makes srt_accept non-blocking, so the poll
+    // loop can honor shouldStop()/timeout instead of wedging on a caller that never
+    // arrives.
+    QElapsedTimer acceptTimer;
+    acceptTimer.start();
+    while (!shouldStop()) {
+        const SRTSOCKET accepted = srt_accept(m_listenSocket, nullptr, nullptr);
+        if (accepted != SRT_INVALID_SOCK) {
+            m_socket = accepted;
+            // The data socket should poll receives non-blocking like the caller path.
+            const int no = 0;
+            if (!setSrtOption(m_socket, SRTO_RCVSYN, &no, sizeof(no), error,
+                              QStringLiteral("SRTO_RCVSYN"))) {
+                closeSocket();
+                return false;
+            }
+            return true;
+        }
+        int osError = 0;
+        const int code = srt_getlasterror(&osError);
+        Q_UNUSED(osError);
+        if (code != SRT_EASYNCRCV) {
+            if (error) {
+                *error = QStringLiteral("Native SRT accept failed: %1")
+                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+            }
+            closeSocket();
+            return false;
+        }
+        if (acceptTimer.elapsed() > kSrtConnectTimeoutMs) {
+            if (error) *error = QStringLiteral("Native SRT listener timed out waiting for caller.");
+            closeSocket();
+            return false;
+        }
+        QThread::msleep(kConnectPollSleepMs);
+    }
+
+    if (error) *error = QStringLiteral("Native SRT listener cancelled.");
+    closeSocket();
+    return false;
+}
+
 void NativeSrtIngestSession::closeSocket() {
     if (m_socket != SRT_INVALID_SOCK) {
         srt_close(m_socket);
         m_socket = SRT_INVALID_SOCK;
+    }
+    // Listener mode also holds a listening socket; close it so the bound port is
+    // released for the next attempt (reconnect re-binds), same as the data socket.
+    if (m_listenSocket != SRT_INVALID_SOCK) {
+        srt_close(m_listenSocket);
+        m_listenSocket = SRT_INVALID_SOCK;
     }
     if (m_srtLibraryStarted) {
         m_srtLibraryStarted = false;
