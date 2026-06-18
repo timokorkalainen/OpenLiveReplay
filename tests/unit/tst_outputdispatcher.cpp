@@ -54,6 +54,7 @@ private slots:
     void rendersFeedMultiviewAndPgmAssignmentsFromSameTick();
     void targetsOnSameBusReceiveMatchingFrameIdentity();
     void targetStatsTrackRepeatedPayloadsAndFailuresIndependently();
+    void identicalConsecutiveTicksSkipDuplicateSubmit();
     void statsMergeSinkOutputStatusWithDispatchAttempts();
     void dispatchStatsConvertToBroadcastStatuses();
     void startFailuresAreVisibleInTargetStats();
@@ -87,6 +88,7 @@ void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
     CollectingSink ndiSink(OutputTargetKind::Ndi);
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
     dispatcher.setEndpoints({{qt, &qtSink}, {ndi, &ndiSink}});
+    dispatcher.setIdentitySkip(false); // test exercises repeated-submit behavior directly
 
     dispatcher.dispatchTick(cache, state);
     dispatcher.dispatchTick(cache, state);
@@ -288,6 +290,8 @@ void TestOutputDispatcher::targetStatsTrackRepeatedPayloadsAndFailuresIndependen
     CollectingSink failingSink(OutputTargetKind::Ndi, true);
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
     dispatcher.setEndpoints({{ok, &okSink}, {failing, &failingSink}});
+    dispatcher.setIdentitySkip(
+        false); // force submits so repeatedPayloadFrames counts on submit path
 
     dispatcher.dispatchTick(cache, state);
     dispatcher.dispatchTick(cache, state);
@@ -317,6 +321,33 @@ void TestOutputDispatcher::targetStatsTrackRepeatedPayloadsAndFailuresIndependen
     QCOMPARE(failingStats.silentAudioFrames, qint64(2));
     QVERIFY(failingStats.hasLastIdentity);
     QCOMPARE(failingStats.lastIdentity.outputFrameIndex, qint64(1));
+}
+
+void TestOutputDispatcher::identicalConsecutiveTicksSkipDuplicateSubmit() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 40));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false; // paused: same playhead+frame every tick
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment qt;
+    qt.id = QStringLiteral("feed0-preview");
+    qt.sourceBus = OutputBusId::feed(0);
+    qt.kind = OutputTargetKind::QtPreview;
+    qt.enabled = true;
+
+    CollectingSink qtSink(OutputTargetKind::QtPreview);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{qt, &qtSink}});
+
+    dispatcher.dispatchTick(cache, state);                                    // first: real submit
+    const OutputDispatchStats after2 = dispatcher.dispatchTick(cache, state); // dup: skipped
+
+    QCOMPARE(qtSink.frames.size(), 1); // only one submit reached the sink
+    QCOMPARE(after2.skippedDuplicateFrames, qint64(1));
 }
 
 void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {

@@ -96,6 +96,17 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
         }
 
         const OutputBusFrame frame = rendered.value(bus);
+
+        // Identity-skip: if this endpoint already received a byte-identical
+        // payload, skip the submit (and the sink's map/copy/deliver entirely).
+        OutputTargetDispatchStats& tstats = m_stats.targets[targetStatsKey(endpoint.assignment)];
+        if (m_identitySkip && tstats.hasLastIdentity &&
+            tstats.lastIdentity.samePayloadAs(frame.identity)) {
+            tstats.repeatedPayloadFrames++;
+            m_stats.skippedDuplicateFrames++;
+            continue;
+        }
+
         const bool submitted = endpoint.sink->submit(frame);
         countTargetAttempt(endpoint.assignment, frame, submitted);
         if (submitted) {
