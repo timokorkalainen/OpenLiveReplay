@@ -20,11 +20,12 @@ bool isWellFormedTimecode(const QString& tc) {
 }
 } // namespace
 
-bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-                 int audioSampleRate, int audioChannels,
-                 VideoCodecChoice codec, const QByteArray& videoExtradata, const QString& startTimecode) {
-    return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate, audioChannels,
-                codec, videoExtradata, startTimecode);
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps,
+                 const QStringList& streamNames, int audioSampleRate, int audioChannels,
+                 VideoCodecChoice codec, const QByteArray& videoExtradata,
+                 const QString& startTimecode) {
+    return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate,
+                audioChannels, codec, videoExtradata, startTimecode);
 }
 
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps,
@@ -34,10 +35,11 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
                 audioChannels, VideoCodecChoice::Mpeg2Software, {}, startTimecode);
 }
 
-bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-                 const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
-                 int audioSampleRate, int audioChannels,
-                 VideoCodecChoice codec, const QByteArray& videoExtradata, const QString& startTimecode) {
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps,
+                 const QStringList& streamNames, const QStringList& telemetryFeedIds,
+                 const QStringList& telemetryFeedNames, int audioSampleRate, int audioChannels,
+                 VideoCodecChoice codec, const QByteArray& videoExtradata,
+                 const QString& startTimecode) {
     QMutexLocker locker(&m_mutex);
     Q_UNUSED(streamNames);
 
@@ -63,6 +65,21 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         QMutexLocker headerLock(&m_headerMutex);
         m_headerWritten = false;
         m_startTimecodeCandidate = isWellFormedTimecode(startTimecode) ? startTimecode : QString();
+        // Open the bounded grace window for the first source TC (see muxer.h). An
+        // up-front candidate (e.g. from a unit test) means TC is already known, so
+        // there is nothing to wait for — leave the grace at 0 and commit on the
+        // first packet exactly as before. Tunable via OLR_MUXER_TMCD_GRACE_MS.
+        m_headerGraceMs = 0;
+        if (m_startTimecodeCandidate.isEmpty()) {
+            m_headerGraceMs = 750;
+            bool graceOk = false;
+            const QByteArray graceEnv = qgetenv("OLR_MUXER_TMCD_GRACE_MS");
+            if (!graceEnv.isEmpty()) {
+                const int parsed = graceEnv.toInt(&graceOk);
+                if (graceOk && parsed >= 0) m_headerGraceMs = parsed;
+            }
+        }
+        m_headerGraceTimer.restart();
     }
 
     // 1. Create Format Context for Matroska
@@ -231,6 +248,16 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     return true;
 }
 
+bool Muxer::headerWriteDeferred() {
+    QMutexLocker headerLock(&m_headerMutex);
+    // Defer only while: header still unwritten, no candidate has won yet, and the
+    // grace window is still open. A registered candidate or an expired grace commits.
+    if (m_headerWritten) return false;
+    if (m_headerGraceMs <= 0) return false;
+    if (!m_startTimecodeCandidate.isEmpty()) return false;
+    return m_headerGraceTimer.isValid() && m_headerGraceTimer.elapsed() < m_headerGraceMs;
+}
+
 bool Muxer::ensureHeaderWritten() {
     QMutexLocker headerLock(&m_headerMutex);
     if (m_headerWritten) return true;
@@ -281,13 +308,11 @@ void Muxer::writePacket(AVPacket* pkt) {
     // the writer thread — so a stalled disk no longer blocks the caller.
     if (!m_writerRunning.load(std::memory_order_acquire)) return;
 
-    // Deferred header: write it (once) on this, the FIRST packet, capturing the
-    // winning start-timecode candidate into the file. Done on the enqueueing
-    // thread BEFORE the packet is handed to the writer thread, so the writer never
-    // touches a header-less context. m_headerMutex is taken and released entirely
-    // inside ensureHeaderWritten, BEFORE m_qMutex below — no lock cycle. On failure
-    // the write is dropped (the file is unusable anyway).
-    if (!ensureHeaderWritten()) return;
+    // Deferred header: NOT committed here anymore. The writer thread commits the
+    // header (ensureHeaderWritten) just before it writes the first packet, after
+    // honouring the bounded grace window (headerWriteDeferred) so the first source
+    // TC can win the tmcd tag. Enqueue-only here keeps the producer non-blocking
+    // and lets the writer hold early no-TC packets without dropping or reordering.
 
     AVPacket* localPkt = av_packet_clone(pkt);
     if (!localPkt) return;
@@ -327,11 +352,31 @@ void Muxer::writerLoop() {
                 if (!m_writerRunning.load(std::memory_order_acquire)) return;
                 continue;
             }
+            // Hold the first packet(s) while the header write is deferred for the
+            // first source TC (bounded grace). Leave them queued — no pop, no
+            // reorder, no drop — and re-loop after a short sleep until the grace
+            // resolves (a candidate arrives or the window expires). Only honour the
+            // deferral while still running; on shutdown drain immediately so close()
+            // never wedges. Released the q lock first so setStartTimecodeCandidate /
+            // ensureHeaderWritten (both take m_headerMutex) never block the producer.
+            if (m_writerRunning.load(std::memory_order_acquire) && headerWriteDeferred()) {
+                lk.unlock();
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
             pkt = m_pktQueue.front();
             m_pktQueue.pop();
         }
         // Notify a possibly back-pressured producer that there is now room.
         m_qCv.notify_one();
+
+        // Commit the deferred header (once) just before the first real write, now
+        // that the grace has resolved and any first-frame TC candidate has been
+        // registered. On a fatal header failure drop the packet (file is unusable).
+        if (!ensureHeaderWritten()) {
+            av_packet_free(&pkt);
+            continue;
+        }
 
         // ── No q lock held below; only this thread touches m_outCtx/m_lastDts.
 

@@ -30,10 +30,10 @@ public:
     Muxer();
     ~Muxer();
 
-    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-             int audioSampleRate = 48000, int audioChannels = 2,
-             VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, const QByteArray& videoExtradata = {},
-             const QString& startTimecode = QString());
+    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps,
+              const QStringList& streamNames, int audioSampleRate = 48000, int audioChannels = 2,
+              VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software,
+              const QByteArray& videoExtradata = {}, const QString& startTimecode = QString());
     // Convenience overload carrying ONLY the session start timecode (default
     // codec). startTimecode is REQUIRED here (no default) so this 9-arg form is
     // distinct from the codec-tail overload above (whose 9th positional arg is a
@@ -45,11 +45,11 @@ public:
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps,
               const QStringList& streamNames, int audioSampleRate, int audioChannels,
               const QString& startTimecode);
-    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-             const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
-             int audioSampleRate = 48000, int audioChannels = 2,
-             VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, const QByteArray& videoExtradata = {},
-             const QString& startTimecode = QString());
+    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps,
+              const QStringList& streamNames, const QStringList& telemetryFeedIds,
+              const QStringList& telemetryFeedNames, int audioSampleRate = 48000,
+              int audioChannels = 2, VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software,
+              const QByteArray& videoExtradata = {}, const QString& startTimecode = QString());
     void writePacket(AVPacket* pkt);
     void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     void writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);
@@ -94,6 +94,13 @@ private:
     // never reaches back for m_mutex, so there is no cycle.
     bool ensureHeaderWritten();
 
+    // True while the header write should be HELD for the first source timecode:
+    // unwritten header + no winning candidate yet + grace window still open. The
+    // writer thread polls this and keeps the popped packet (no drop, no reorder)
+    // until it returns false, then commits via ensureHeaderWritten(). Thread-safe
+    // (m_headerMutex). See the m_headerGrace* fields for the rationale.
+    bool headerWriteDeferred();
+
     QString m_outputDir;
     // Path resolved by init() for the current session; getVideoPath()
     // returns it while recording so the reader can never diverge from
@@ -122,6 +129,19 @@ private:
     QMutex m_headerMutex;
     bool m_headerWritten = false;
     QString m_startTimecodeCandidate;
+    // Bounded "wait for the first source TC" grace. A live recording observes no
+    // TC at start and emits BLUE/pre-connect packets (TC=-1) before the first real
+    // source frame carrying a timecode. Committing the header on that first no-TC
+    // packet would lose the tmcd tag forever (first-candidate-wins, header-once).
+    // So ensureHeaderWritten() DEFERS the header write for a small grace window
+    // after init while no candidate has been registered yet; it commits early the
+    // instant a well-formed candidate arrives, or unconditionally once the grace
+    // expires (a no-TC recording then writes the header with no tag, byte-identical
+    // content, only the header flush moves a few hundred ms later). The grace timer
+    // starts in init(); the writer thread (writerLoop) honours the deferral by
+    // keeping the popped packet and retrying, so NO packet is ever dropped/reordered.
+    QElapsedTimer m_headerGraceTimer;
+    int m_headerGraceMs = 0;
     // Matroska muxer options (reserve_index_space/cluster/live), built in init()
     // and consumed by the deferred avformat_write_header in ensureHeaderWritten.
     AVDictionary* m_headerOpts = nullptr;

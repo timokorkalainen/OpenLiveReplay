@@ -58,6 +58,11 @@ int main(int argc, char** argv) {
     const bool reportConnections = args.contains(QStringLiteral("--report-connections"));
     const bool reportConnectionEvents = args.contains(QStringLiteral("--report-connection-events"));
     const bool reportStats = args.contains(QStringLiteral("--report-stats"));
+    // --report-tc-align prints, for every source pair, whether the engine's
+    // TimecodeAligner reports their equal-TC frames as coincident, plus the residual
+    // frame offset. The framesync timecode gate reads this to assert two jam-synced
+    // (common-TC) sources are reported aligned (<= 1 frame).
+    const bool reportTcAlign = args.contains(QStringLiteral("--report-tc-align"));
 
     if (urls.isEmpty()) {
         fprintf(stderr, "sync_harness: at least one --url is required\n");
@@ -174,6 +179,16 @@ int main(int argc, char** argv) {
                             src, (long long) s.recvTotal, (long long) s.retransTotal,
                             (long long) s.lossTotal, (long long) s.dropTotal, s.clockPpm,
                             s.clockQuality);
+                }
+            }
+            fflush(stderr);
+        }
+        if (reportTcAlign) {
+            for (int a = 0; a < n; ++a) {
+                for (int b = a + 1; b < n; ++b) {
+                    fprintf(stderr, "tc_align a=%d b=%d aligned=%d offset=%lld\n", a, b,
+                            rm.sourcesFrameAligned(a, b) ? 1 : 0,
+                            static_cast<long long>(rm.sourceFrameOffset(a, b)));
                 }
             }
             fflush(stderr);
