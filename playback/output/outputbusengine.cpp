@@ -106,24 +106,49 @@ OutputBusFrame OutputBusEngine::renderPgm(qint64 outputFrameIndex,
 
 OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
                                                 const PlaybackStateSnapshot& state,
-                                                const OutputFrameCache& cache) const {
+                                                const OutputFrameCache& cache,
+                                                MultiviewComposite* memo) const {
+    constexpr qint64 kAbsentFeedPts = -1;
     OutputBusFrame out;
     out.bus = OutputBusId::multiview();
     out.outputFrameIndex = outputFrameIndex;
     out.sampledPlayheadMs = m_clock.samplePlayheadMsForOutputTick(outputFrameIndex, state);
 
-    QList<MediaVideoFrame> frames;
+    // Describe the source set selected for this tick. Absent feeds use a stable sentinel
+    // (not the playhead) plus a present flag, so the descriptor is stable across ticks while
+    // the selected source frames are unchanged. The descriptor drives the composite memo
+    // exactly; the folded 32-bit signature drives repeated-payload identity (where a rare
+    // hash collision only miscounts a stat, never produces wrong pixels).
     quint32 sourceSignature = kFnvOffset;
+    QVector<qint64> sourceKeys;
+    sourceKeys.reserve(m_feedCount * 2);
     qint64 sourcePtsMs = 0;
     for (int feed = 0; feed < m_feedCount; ++feed) {
-        const MediaVideoFrame frame = cache.videoFrameOrPlaceholder(feed, out.sampledPlayheadMs);
-        sourceSignature = hashInt(sourceSignature, frame.feedIndex);
-        sourceSignature = hashInt(sourceSignature, frame.ptsMs);
-        sourceSignature = hashInt(sourceSignature, frame.isPlaceholder ? 1 : 0);
-        sourcePtsMs = qMax(sourcePtsMs, frame.ptsMs);
-        frames.append(frame);
+        const std::optional<MediaVideoFrame> src = cache.videoFrameAt(feed, out.sampledPlayheadMs);
+        const qint64 pts = src ? src->ptsMs : kAbsentFeedPts;
+        sourceKeys.append(src ? 1 : 0);
+        sourceKeys.append(pts);
+        sourceSignature = hashInt(sourceSignature, feed);
+        sourceSignature = hashInt(sourceSignature, pts);
+        sourceSignature = hashInt(sourceSignature, src ? 0 : 1);
+        if (src) sourcePtsMs = qMax(sourcePtsMs, src->ptsMs);
     }
-    out.video = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
+
+    if (memo && memo->valid && memo->sourceKeys == sourceKeys) {
+        out.video = memo->video; // reuse composited planes (copy-on-write share)
+    } else {
+        QList<MediaVideoFrame> frames;
+        for (int feed = 0; feed < m_feedCount; ++feed) {
+            frames.append(cache.videoFrameOrPlaceholder(feed, out.sampledPlayheadMs));
+        }
+        out.video = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
+        if (memo) {
+            memo->valid = true;
+            memo->sourceKeys = sourceKeys;
+            memo->video = out.video;
+        }
+    }
+
     // Identity must reflect the composited source content, not the advancing playhead,
     // so repeated-payload detection works when the underlying feeds are frozen.
     out.video.ptsMs = sourcePtsMs;

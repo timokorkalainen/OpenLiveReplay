@@ -33,6 +33,8 @@ private slots:
     void ntscAudioUsesRationalSampleBoundaries();
     void ntscAudioSpansStayContiguousAcrossOddPlayEpoch();
     void multiviewVideoIdentityTracksSourceContentNotPlayhead();
+    void multiviewMemoReusesCompositeForUnchangedSources();
+    void multiviewMemoMatchesUnmemoizedCompositeForDistinctSources();
 };
 
 void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
@@ -205,6 +207,58 @@ void TestOutputBusEngine::multiviewVideoIdentityTracksSourceContentNotPlayhead()
     advanced.playheadMs = 140;
     const auto c = engine.renderMultiview(7, advanced, cache);
     QVERIFY(c.identity.videoHash != b.identity.videoHash);
+}
+
+void TestOutputBusEngine::multiviewMemoReusesCompositeForUnchangedSources() {
+    // When the source signature is unchanged, the memo reuses the composited planes
+    // instead of re-running the full-resolution grid scale. Replacing the content at the
+    // SAME source pts (a test-only operation; in production content is immutable per pts)
+    // must therefore NOT change the composite, proving the scale was skipped.
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 100, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto a = engine.renderMultiview(5, state, cache, &memo);
+    QCOMPARE(uchar(a.video.planeY.at(0)), uchar(10));
+
+    cache.insertVideoFrame(video(0, 100, 99)); // same pts, new content
+    const auto b = engine.renderMultiview(6, state, cache, &memo);
+    QCOMPARE(uchar(b.video.planeY.at(0)), uchar(10)); // reused composite, not 99
+
+    cache.insertVideoFrame(video(0, 140, 77)); // a genuine source advance (new pts)
+    PlaybackStateSnapshot advanced = state;
+    advanced.playheadMs = 140;
+    const auto c = engine.renderMultiview(7, advanced, cache, &memo);
+    QCOMPARE(uchar(c.video.planeY.at(0)), uchar(77)); // memo invalidated, recomposited
+}
+
+void TestOutputBusEngine::multiviewMemoMatchesUnmemoizedCompositeForDistinctSources() {
+    // For genuinely distinct sources, a memoized render must be byte-identical to an
+    // unmemoized one.
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 100, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto memoized = engine.renderMultiview(9, state, cache, &memo);
+    const auto plain = engine.renderMultiview(9, state, cache, nullptr);
+    QCOMPARE(memoized.video.planeY, plain.video.planeY);
+    QCOMPARE(memoized.video.planeU, plain.video.planeU);
+    QCOMPARE(memoized.video.planeV, plain.video.planeV);
+    QCOMPARE(memoized.identity.videoHash, plain.identity.videoHash);
 }
 
 QTEST_GUILESS_MAIN(TestOutputBusEngine)

@@ -46,6 +46,17 @@ struct OutputBusFrame {
 
 OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 
+// Persistent (caller-owned) memo for the multiview compositor. The composited grid depends
+// only on the source frames selected for a tick, so when the exact per-feed source
+// descriptor is unchanged the full-resolution scale can be skipped and the prior planes
+// reused. The descriptor (not a hash) gates reuse so memoized output is byte-identical to a
+// fresh composite — a hash key could collide and emit a stale frame.
+struct MultiviewComposite {
+    bool valid = false;
+    QVector<qint64> sourceKeys; // 2 entries per feed: present flag, then selected pts
+    MediaVideoFrame video;
+};
+
 class OutputBusEngine {
 public:
     OutputBusEngine(FrameRate rate, int feedCount, int width, int height);
@@ -56,7 +67,8 @@ public:
     OutputBusFrame renderPgm(qint64 outputFrameIndex, const PlaybackStateSnapshot& state,
                              const OutputFrameCache& cache) const;
     OutputBusFrame renderMultiview(qint64 outputFrameIndex, const PlaybackStateSnapshot& state,
-                                   const OutputFrameCache& cache) const;
+                                   const OutputFrameCache& cache,
+                                   MultiviewComposite* memo = nullptr) const;
 
     int audioSamplesPerFrame() const;
 
