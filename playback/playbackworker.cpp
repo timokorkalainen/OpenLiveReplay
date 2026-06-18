@@ -479,10 +479,10 @@ void PlaybackWorker::cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* a
     frame.pcm = QByteArray(reinterpret_cast<const char*>(audioFrame->data[0]), dataSize);
 
     QMutexLocker bufferLocker(&m_bufferMutex);
-    if (m_outputCache) {
-        m_outputCache->insertAudioFrame(frame);
-        publishOutputCacheLocked();
-    }
+    // Insert only; the cache is republished once per batch (run-loop trim,
+    // reposition merge) — never per-frame (that leaked the half-built staging
+    // cache during a reposition and was O(N^2) on the decode hot path).
+    if (m_outputCache) m_outputCache->insertAudioFrame(frame);
     aTrack->lastCachedPtsMs = ptsMs;
 }
 
@@ -555,10 +555,9 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     QMutexLocker bufferLocker(&m_bufferMutex);
                     if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
                         m_counters.framesDropped++;
-                    if (m_outputCache) {
-                        m_outputCache->insertVideoFrame(mediaFrame);
-                        publishOutputCacheLocked();
-                    }
+                    // Insert only; republish is batched (run-loop trim /
+                    // reposition merge), never per-frame — see enqueue note.
+                    if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
                 }
                 lastVideoPtsMs = framePtsMs;
                 av_frame_unref(vf);
@@ -1182,6 +1181,13 @@ void PlaybackWorker::run() {
                                              /*decimate*/ false, /*step*/ 1, audioOn,
                                              /*dedupTail*/ true);
                         av_packet_unref(pkt);
+                    }
+                    // Per-insert publish was removed; this path `continue`s past
+                    // the run-loop trim, so publish the re-read tail frames once
+                    // here so live-growth frames become visible promptly.
+                    {
+                        QMutexLocker bufferLocker(&m_bufferMutex);
+                        publishOutputCacheLocked();
                     }
                 }
                 // else: seek failed — don't advance m_sizeAtLastEof handling,
