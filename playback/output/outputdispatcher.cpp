@@ -81,7 +81,17 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
 
         const OutputBusId bus = endpoint.assignment.sourceBus;
         if (!rendered.contains(bus)) {
-            rendered.insert(bus, renderBus(bus, outputFrameIndex, tickState, cache));
+            OutputBusFrame frame = renderBus(bus, outputFrameIndex, tickState, cache);
+            if (m_holdLastFrame && frame.video.isPlaceholder && m_lastGoodFrame.contains(bus)) {
+                // Paint the last real video for this bus instead of the gray
+                // placeholder; keep the freshly-rendered audio + identity +
+                // outputFrameIndex so the clock and audio timeline never stall.
+                frame.video = m_lastGoodFrame.value(bus).video;
+                m_stats.heldFrames++;
+            } else if (!frame.video.isPlaceholder) {
+                m_lastGoodFrame.insert(bus, frame);
+            }
+            rendered.insert(bus, frame);
             countFrameHealth(rendered.value(bus));
         }
 
