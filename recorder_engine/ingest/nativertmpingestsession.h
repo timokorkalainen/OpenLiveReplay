@@ -3,6 +3,7 @@
 
 #include "nativeaacdecoder.h"
 #include "h26xaccessunit.h"
+#include "h26xseitimecode.h"
 #include "ingestsession.h"
 #include "nativevideodecoder.h"
 #include "rtmpprotocol.h"
@@ -37,6 +38,13 @@ public:
     void requestStop() override;
     IngestFailureKind lastFailureKind() const override { return m_lastFailureKind; }
 
+    // Nominal fps used only to convert an extracted/AMF SMPTE 12M timecode into a
+    // 100 ns offset since midnight. RTMP/FLV carries no fps on this path; 30 matches
+    // the engine's default target rate and the SRT session's kTimecodeNominalFps so
+    // SRT and RTMP producers agree (see NativeSrtIngestSession::kTimecodeNominalFps).
+    // This affects only the TC mapping — A/V sync uses the FLV PLL clock, never this.
+    static constexpr int kTimecodeNominalFps = 30;
+
 private:
     int m_sourceIndex = -1;
     int m_outputWidth = 1920;
@@ -59,6 +67,15 @@ private:
     AnchoredSourceClock m_ownedClock{ClockQuality::FlvPll};
     AnchoredSourceClock* m_clock = &m_ownedClock;
     bool m_externalClock = false;
+    // SMPTE 12M timecode (100 ns since midnight) stamped onto the emitted
+    // DecodedVideoFrame. -1 = the current frame carries no timecode (the common
+    // case). Reset per access unit (to the AMF fallback, or -1) so an SEI TC never
+    // bleeds across frames; an SEI TC overrides the AMF fallback for its frame.
+    int64_t m_pendingVideoTimecode100ns = -1;
+    // AMF onMetaData timecode (100 ns since midnight), -1 = none. A sticky fallback
+    // used for frames whose access unit carries no SEI timecode, until the next SEI
+    // TC appears. Set best-effort from a malformed-tolerant string parse.
+    int64_t m_amfTimecode100ns = -1;
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastKeyframeAtMs = -1;
@@ -103,6 +120,14 @@ private:
     bool parseAacSequenceHeader(const QByteArray& payload, QString* error);
     int64_t sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs);
     int64_t sourcePtsMsForAudio(qint64 ptsMs);
+    // Reset m_pendingVideoTimecode100ns to the AMF fallback (m_amfTimecode100ns, or
+    // -1), then (if the access unit carries a SMPTE 12M SEI) overwrite it with that
+    // TC. Called once per access unit so an SEI TC never bleeds across frames and an
+    // SEI TC always wins over the AMF fallback for its own frame.
+    void updatePendingVideoTimecode(const QByteArray& annexB, NativeVideoCodec codec);
+    // Parse an AMF onMetaData timecode string (best-effort, malformed -> ignored)
+    // and remember it as the sticky AMF fallback (m_amfTimecode100ns).
+    void applyAmfTimecodeString(const QString& text);
 };
 
 #endif // NATIVERTMPINGESTSESSION_H

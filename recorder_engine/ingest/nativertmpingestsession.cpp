@@ -5,6 +5,7 @@
 #include <QDebug>
 #include <QSslError>
 #include <QSslSocket>
+#include <QStringList>
 #include <QTcpSocket>
 #include <QThread>
 
@@ -26,6 +27,8 @@ constexpr int kMessageWindowAckSize = 5;
 constexpr int kMessagePeerBandwidth = 6;
 constexpr int kMessageAudio = 8;
 constexpr int kMessageVideo = 9;
+constexpr int kMessageDataAmf3 = 15;
+constexpr int kMessageDataAmf0 = 18;
 constexpr int kMessageCommandAmf0 = 20;
 constexpr int kAudioSampleRate = 48000;
 constexpr int64_t kForwardJumpMs = 3000;
@@ -197,6 +200,88 @@ bool commandPayloadContainsReconnectRequest(const QByteArray& payload) {
     return false;
 }
 
+// Walk the entries of one AMF0 object (0x03) or ECMA-array (0x08) body — *offset
+// points just past the type marker (and, for an ECMA array, past the 4-byte count)
+// — capturing the string value of the first entry whose key is one of `keys`.
+// Returns Found with `out` set on a hit; advances *offset past the object on a
+// clean walk; Malformed on any short/garbled read. Best-effort: any failure leaves
+// the caller's AMF timecode untouched.
+Amf0StringScanResult amf0ScanObjectForStringKey(const QByteArray& data, int* offset,
+                                                const QStringList& keys, int depth, QString* out) {
+    if (!offset || !out || depth > kMaxAmf0ScanDepth) {
+        return Amf0StringScanResult::Malformed;
+    }
+    while (!needAmf0Bytes(data, *offset, 3)) {
+        if (uchar(data[*offset]) == 0 && uchar(data[*offset + 1]) == 0 &&
+            uchar(data[*offset + 2]) == 0x09) {
+            *offset += 3;
+            return Amf0StringScanResult::NotFound;
+        }
+        QString key;
+        if (!readAmf0StringBody(data, offset, 2, &key)) {
+            return Amf0StringScanResult::Malformed;
+        }
+        // A string value (type 0x02) for a matching key is the timecode.
+        if (keys.contains(key) && !needAmf0Bytes(data, *offset, 1) &&
+            uchar(data[*offset]) == 0x02) {
+            int cursor = *offset + 1;
+            QString value;
+            if (!readAmf0StringBody(data, &cursor, 2, &value)) {
+                return Amf0StringScanResult::Malformed;
+            }
+            *offset = cursor;
+            *out = value;
+            return Amf0StringScanResult::Found;
+        }
+        // Otherwise skip this value (recursing into nested objects/arrays via the
+        // existing skipper with an unmatchable needle), then continue scanning.
+        const Amf0StringScanResult skipped =
+            amf0ValueContainsString(data, offset, QString(), depth + 1);
+        if (skipped == Amf0StringScanResult::Malformed) {
+            return Amf0StringScanResult::Malformed;
+        }
+    }
+    return Amf0StringScanResult::Malformed;
+}
+
+// Scan a full AMF0 data-message payload (`@setDataFrame`/`onMetaData ... {props}`)
+// for a "timecode"/"tc" string property. Returns true with `out` set on a hit.
+bool amf0DataMessageTimecode(const QByteArray& payload, QString* out) {
+    if (!out) {
+        return false;
+    }
+    static const QStringList kKeys{QStringLiteral("timecode"), QStringLiteral("tc")};
+    int offset = 0;
+    // Walk top-level values; descend into the first object/ECMA-array we meet.
+    while (!needAmf0Bytes(payload, offset, 1)) {
+        const int type = uchar(payload[offset]);
+        if (type == 0x08 || type == 0x03) {
+            int cursor = offset + 1;
+            if (type == 0x08) { // ECMA array: 4-byte associative count precedes entries.
+                if (needAmf0Bytes(payload, cursor, 4)) {
+                    return false;
+                }
+                cursor += 4;
+            }
+            if (amf0ScanObjectForStringKey(payload, &cursor, kKeys, 0, out) ==
+                Amf0StringScanResult::Found) {
+                return true;
+            }
+            // Not in this object; keep walking after it.
+            offset = cursor;
+            continue;
+        }
+        const int previousOffset = offset;
+        // Skip a non-object top-level value (e.g. the leading strings).
+        if (amf0ValueContainsString(payload, &offset, QString(), 0) ==
+                Amf0StringScanResult::Malformed ||
+            offset <= previousOffset) {
+            return false;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 NativeRtmpIngestSession::NativeRtmpIngestSession(int sourceIndex, int outputWidth, int outputHeight,
@@ -239,6 +324,8 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     if (!m_externalClock) {
         m_clock->reset();
     }
+    m_pendingVideoTimecode100ns = -1;
+    m_amfTimecode100ns = -1;
     m_prevAudioPtsMs = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastKeyframeAtMs = -1;
@@ -805,6 +892,19 @@ void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
         }
         return;
     }
+    if (message.type == kMessageDataAmf0 || message.type == kMessageDataAmf3) {
+        // onMetaData / @setDataFrame: best-effort AMF timecode fallback. An AMF3
+        // data message is a 1-byte AMF3 marker followed by an AMF0 body; skip it.
+        QByteArray amf0 = message.payload;
+        if (message.type == kMessageDataAmf3 && !amf0.isEmpty()) {
+            amf0.remove(0, 1);
+        }
+        QString timecode;
+        if (amf0DataMessageTimecode(amf0, &timecode)) {
+            applyAmfTimecodeString(timecode);
+        }
+        return;
+    }
     if (message.type == kMessageVideo) {
         processVideoMessage(message.timestampMs, message.payload);
     } else if (message.type == kMessageAudio) {
@@ -932,6 +1032,11 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         return;
     }
 
+    // Extract this access unit's SMPTE 12M timecode (SEI), falling back to the AMF
+    // onMetaData timecode. Reset-then-set per unit so a frame with no TC reports
+    // none (or the AMF fallback), never a previous AU's SEI TC.
+    updatePendingVideoTimecode(annexB, packet.codec);
+
     const qint64 dtsMs = timestampMs;
     const qint64 ptsMs = timestampMs + packet.compositionTimeMs;
     const int64_t sourcePtsMs = sourcePtsMsForVideo(dtsMs, ptsMs);
@@ -953,10 +1058,14 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         m_lastKeyframeAtMs = m_monotonic.elapsed();
     }
 
+    // Capture the timecode into a local (not the member) so an async decode binds
+    // THIS access unit's TC even if m_pendingVideoTimecode100ns is overwritten by a
+    // later AU before the callback fires.
+    const int64_t timecode100ns = m_pendingVideoTimecode100ns;
     QString error;
     const bool decoded = m_videoDecoder->decode(
         unit,
-        [this, sourcePtsMs](AVFrame* frame) {
+        [this, sourcePtsMs, timecode100ns](AVFrame* frame) {
             if (!frame) return;
             if (!m_callbacks.onVideoFrame) {
                 av_frame_free(&frame);
@@ -965,6 +1074,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
             DecodedVideoFrame decodedFrame;
             decodedFrame.frame = frame;
             decodedFrame.sourcePtsMs = sourcePtsMs;
+            decodedFrame.sourceTimecode100ns = timecode100ns;
             m_callbacks.onVideoFrame(decodedFrame);
         },
         &error);
@@ -1089,6 +1199,27 @@ bool NativeRtmpIngestSession::parseAacSequenceHeader(const QByteArray& payload, 
         m_audioDecoder->reset();
     }
     return true;
+}
+
+void NativeRtmpIngestSession::updatePendingVideoTimecode(const QByteArray& annexB,
+                                                         NativeVideoCodec codec) {
+    // Start from the AMF onMetaData fallback (-1 when absent): a frame with no SEI
+    // timecode reports the sticky AMF TC (or none), never a previous AU's SEI TC.
+    // Extraction is best-effort and bounds-checked — a garbled/truncated SEI returns
+    // {valid=false}, so a bad timecode never disturbs recording.
+    m_pendingVideoTimecode100ns = m_amfTimecode100ns;
+    const Smpte12mTimecode tc = extractH26xSeiTimecode(annexB, codec);
+    if (tc.valid) {
+        m_pendingVideoTimecode100ns = Smpte12m::to100ns(tc, kTimecodeNominalFps);
+    }
+}
+
+void NativeRtmpIngestSession::applyAmfTimecodeString(const QString& text) {
+    // Strictly best-effort. We are only called when onMetaData actually carried a
+    // timecode/tc string, so clearing on an unparseable value (rather than keeping a
+    // stale one) honours the producer's latest, malformed-but-present, statement.
+    const Smpte12mTimecode tc = Smpte12m::parseTimecodeString(text.toUtf8().constData());
+    m_amfTimecode100ns = tc.valid ? Smpte12m::to100ns(tc, kTimecodeNominalFps) : -1;
 }
 
 int64_t NativeRtmpIngestSession::sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs) {

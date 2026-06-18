@@ -33,5 +33,10 @@ int64_t toFrameCount(const Smpte12mTimecode& tc, int nominalFps);
 int64_t to100ns(const Smpte12mTimecode& tc, int nominalFps);
 // Decode a 100 ns timecode (NDI delivers TC as 100 ns since midnight) -> fields.
 Smpte12mTimecode from100ns(int64_t timecode100ns, int nominalFps);
+// Parse "HH:MM:SS:FF" (or ';' before the frames field for drop-frame) -> fields.
+// Pure and Qt-free (takes a NUL-terminated C string; Qt callers pass
+// QString::toUtf8().constData()). Strictly best-effort: any malformed, null,
+// out-of-range, or wrong-shape input returns {valid=false} (never crashes).
+Smpte12mTimecode parseTimecodeString(const char* text);
 } // namespace Smpte12m
 #endif // SMPTE12M_H

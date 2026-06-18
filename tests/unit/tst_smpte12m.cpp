@@ -12,6 +12,7 @@ private slots:
     void to100nsMatchesFrameCount();
     void from100nsRoundTrips();
     void invalidFormatsEmpty();
+    void parseTimecodeStringRoundTrips();
 };
 
 void TestSmpte12m::packedRoundTrips() {
@@ -74,6 +75,35 @@ void TestSmpte12m::invalidFormatsEmpty() {
     char buf[12];
     Smpte12m::format(Smpte12mTimecode{}, buf); // valid=false
     QCOMPARE(QString::fromLatin1(buf), QString());
+}
+void TestSmpte12m::parseTimecodeStringRoundTrips() {
+    // Non-drop "HH:MM:SS:FF" parses to fields with dropFrame=false.
+    const Smpte12mTimecode nd = Smpte12m::parseTimecodeString("10:11:12:13");
+    QVERIFY(nd.valid);
+    QCOMPARE(nd.hours, 10);
+    QCOMPARE(nd.minutes, 11);
+    QCOMPARE(nd.seconds, 12);
+    QCOMPARE(nd.frames, 13);
+    QVERIFY(!nd.dropFrame);
+
+    // The ';' frame separator flags drop-frame.
+    const Smpte12mTimecode df = Smpte12m::parseTimecodeString("01:00:00;02");
+    QVERIFY(df.valid);
+    QCOMPARE(df.hours, 1);
+    QCOMPARE(df.frames, 2);
+    QVERIFY(df.dropFrame);
+
+    // Malformed / out-of-range / null inputs are rejected (valid=false), never
+    // crash — AMF timecode is strictly best-effort.
+    QVERIFY(!Smpte12m::parseTimecodeString(nullptr).valid);
+    QVERIFY(!Smpte12m::parseTimecodeString("").valid);
+    QVERIFY(!Smpte12m::parseTimecodeString("not a timecode").valid);
+    QVERIFY(!Smpte12m::parseTimecodeString("10:11:12").valid);       // too few fields
+    QVERIFY(!Smpte12m::parseTimecodeString("10-11-12-13").valid);    // wrong separators
+    QVERIFY(!Smpte12m::parseTimecodeString("99:11:12:13").valid);    // hours out of range
+    QVERIFY(!Smpte12m::parseTimecodeString("10:61:12:13").valid);    // minutes out of range
+    QVERIFY(!Smpte12m::parseTimecodeString("1:2:3:4").valid);        // non-two-digit fields
+    QVERIFY(!Smpte12m::parseTimecodeString("10:11:12:13:14").valid); // trailing junk
 }
 QTEST_GUILESS_MAIN(TestSmpte12m)
 #include "tst_smpte12m.moc"

@@ -1,6 +1,7 @@
 #include "smpte12m.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace Smpte12m {
 
@@ -131,6 +132,42 @@ Smpte12mTimecode from100ns(int64_t timecode100ns, int nominalFps) {
     tc.minutes = static_cast<int>((totalSeconds / 60) % 60);
     tc.hours = static_cast<int>((totalSeconds / 3600) % 24);
     tc.valid = true;
+    return tc;
+}
+
+Smpte12mTimecode parseTimecodeString(const char* text) {
+    Smpte12mTimecode tc; // valid=false
+    if (!text) {
+        return tc;
+    }
+    // Exactly "HH:MM:SS<sep>FF": two digits per field, ':' between the first
+    // three, ':' (non-drop) or ';' (drop-frame) before the frames field.
+    if (std::strlen(text) != 11) {
+        return tc;
+    }
+    auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+    static const int kDigitPositions[8] = {0, 1, 3, 4, 6, 7, 9, 10};
+    for (const int i : kDigitPositions) {
+        if (!isDigit(text[i])) {
+            return tc;
+        }
+    }
+    if (text[2] != ':' || text[5] != ':') {
+        return tc;
+    }
+    const char frameSep = text[8];
+    if (frameSep != ':' && frameSep != ';') {
+        return tc;
+    }
+    auto twoDigit = [&](int i) { return (text[i] - '0') * 10 + (text[i + 1] - '0'); };
+    tc.hours = twoDigit(0);
+    tc.minutes = twoDigit(3);
+    tc.seconds = twoDigit(6);
+    tc.frames = twoDigit(9);
+    tc.dropFrame = (frameSep == ';');
+    // Range-sanity (mirrors fromPackedWord): reject impossible fields rather than
+    // emit a plausible-but-wrong TC that would silently mis-align downstream.
+    tc.valid = tc.hours < 24 && tc.minutes < 60 && tc.seconds < 60 && tc.frames < 60;
     return tc;
 }
 

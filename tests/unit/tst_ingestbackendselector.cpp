@@ -37,6 +37,11 @@ private slots:
     void nativeRtmpAudioDiscontinuityKeepsSharedAnchor();
     void nativeRtmpAllowsNegativeCompositionTimeAfterAnchor();
     void nativeRtmpCanUseExternallyOwnedClockAcrossSessions();
+    void nativeRtmpExtractsSeiTimecodeOntoPendingVideoTimecode();
+    void nativeRtmpNoSeiTimecodeLeavesNoStaleTimecodeBleed();
+    void nativeRtmpSeiTimecodeOverridesAmfFallback();
+    void nativeRtmpAmfFallbackTimecodePersistsUntilNextSei();
+    void nativeRtmpOnMetaDataDataMessageSetsAmfTimecode();
 #endif
     void sharedAnchorMapsStreamTime();
     void srtAnchorMapPureCases();
@@ -465,6 +470,105 @@ void TestIngestBackendSelector::nativeSrtNoSeiTimecodeLeavesNoStaleTimecodeBleed
     session.updatePendingVideoTimecode(noTc);
     QCOMPARE(session.m_pendingVideoTimecode100ns, int64_t(-1));
 }
+
+#if defined(OLR_NATIVE_RTMP_AVAILABLE)
+void TestIngestBackendSelector::nativeRtmpExtractsSeiTimecodeOntoPendingVideoTimecode() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    const Smpte12mTimecode tc{10, 11, 12, 13, /*drop*/ false, /*valid*/ true};
+    session.updatePendingVideoTimecode(h264AccessUnitWithSeiTimecode(tc), NativeVideoCodec::H264);
+
+    // The session stamps DecodedVideoFrame::sourceTimecode100ns from this member;
+    // it must equal the encoded SEI TC mapped to 100 ns at the nominal fps.
+    QCOMPARE(session.m_pendingVideoTimecode100ns,
+             Smpte12m::to100ns(tc, NativeRtmpIngestSession::kTimecodeNominalFps));
+    QVERIFY(session.m_pendingVideoTimecode100ns >= 0);
+}
+
+void TestIngestBackendSelector::nativeRtmpNoSeiTimecodeLeavesNoStaleTimecodeBleed() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    // A frame WITH timecode seeds the pending member.
+    session.updatePendingVideoTimecode(
+        h264AccessUnitWithSeiTimecode(Smpte12mTimecode{1, 0, 0, 0, false, true}),
+        NativeVideoCodec::H264);
+    QVERIFY(session.m_pendingVideoTimecode100ns >= 0);
+
+    // A subsequent frame with NO SEI (and no AMF fallback) must report none (-1),
+    // never the previous frame's TC.
+    session.updatePendingVideoTimecode(h264AccessUnitWithoutSei(), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns, int64_t(-1));
+}
+
+void TestIngestBackendSelector::nativeRtmpSeiTimecodeOverridesAmfFallback() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    // AMF onMetaData carried a timecode string (the fallback).
+    session.applyAmfTimecodeString(QStringLiteral("01:00:00:00"));
+    QVERIFY(session.m_amfTimecode100ns >= 0);
+
+    // A frame that ALSO carries an SEI TC: the SEI wins over the AMF fallback.
+    const Smpte12mTimecode sei{02, 03, 04, 05, false, true};
+    session.updatePendingVideoTimecode(h264AccessUnitWithSeiTimecode(sei), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns,
+             Smpte12m::to100ns(sei, NativeRtmpIngestSession::kTimecodeNominalFps));
+}
+
+void TestIngestBackendSelector::nativeRtmpAmfFallbackTimecodePersistsUntilNextSei() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    // No SEI yet: a frame with no SEI reports -1 (no AMF, no SEI).
+    session.updatePendingVideoTimecode(h264AccessUnitWithoutSei(), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns, int64_t(-1));
+
+    // onMetaData delivers an AMF timecode string; a malformed one is ignored.
+    session.applyAmfTimecodeString(QStringLiteral("garbage"));
+    QCOMPARE(session.m_amfTimecode100ns, int64_t(-1));
+    session.applyAmfTimecodeString(QStringLiteral("01:00:00:00"));
+    const Smpte12mTimecode amf{1, 0, 0, 0, false, true};
+    const int64_t amf100ns = Smpte12m::to100ns(amf, NativeRtmpIngestSession::kTimecodeNominalFps);
+    QCOMPARE(session.m_amfTimecode100ns, amf100ns);
+
+    // Frames with NO SEI now carry the AMF fallback TC (it persists across frames).
+    session.updatePendingVideoTimecode(h264AccessUnitWithoutSei(), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns, amf100ns);
+    session.updatePendingVideoTimecode(h264AccessUnitWithoutSei(), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns, amf100ns);
+
+    // A frame WITH an SEI TC overrides the fallback for that frame...
+    const Smpte12mTimecode sei{02, 03, 04, 05, false, true};
+    session.updatePendingVideoTimecode(h264AccessUnitWithSeiTimecode(sei), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns,
+             Smpte12m::to100ns(sei, NativeRtmpIngestSession::kTimecodeNominalFps));
+
+    // ...and the AMF fallback resumes on the next SEI-less frame.
+    session.updatePendingVideoTimecode(h264AccessUnitWithoutSei(), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns, amf100ns);
+}
+
+void TestIngestBackendSelector::nativeRtmpOnMetaDataDataMessageSetsAmfTimecode() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+
+    // Build a real AMF0 onMetaData data message: ["onMetaData", { ... timecode ... }]
+    // and drive it through the production processMessage dispatch (type 18).
+    RtmpMessage meta;
+    meta.type = 18; // RTMP AMF0 data
+    meta.payload = RtmpAmf0::string(QStringLiteral("onMetaData"));
+    meta.payload.append(RtmpAmf0::object(
+        {{QStringLiteral("width"), RtmpAmf0::number(1920)},
+         {QStringLiteral("timecode"), RtmpAmf0::string(QStringLiteral("01:00:00:00"))},
+         {QStringLiteral("framerate"), RtmpAmf0::number(30)}}));
+    session.processMessage(meta);
+
+    const Smpte12mTimecode amf{1, 0, 0, 0, false, true};
+    QCOMPARE(session.m_amfTimecode100ns,
+             Smpte12m::to100ns(amf, NativeRtmpIngestSession::kTimecodeNominalFps));
+
+    // A frame with no SEI now carries that AMF timecode.
+    session.updatePendingVideoTimecode(h264AccessUnitWithoutSei(), NativeVideoCodec::H264);
+    QCOMPARE(session.m_pendingVideoTimecode100ns, session.m_amfTimecode100ns);
+}
+#endif
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)
 #include "tst_ingestbackendselector.moc"
