@@ -20,6 +20,8 @@
 #include "ingest/ingestsession.h"
 #include "timing/sourceclock.h"
 
+#include "recorder_engine/codec/videocodecchoice.h"
+
 extern "C" {
     #include <libavformat/avformat.h>
     #include <libavcodec/avcodec.h>
@@ -53,7 +55,8 @@ public:
     // sourceIndex: fixed identity of this source (for logging)
     // initialViewTrack: which muxer track to encode into (-1 = no view assigned)
     StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
-                 int targetWidth, int targetHeight, int targetFps, QObject* parent = nullptr);
+                 int targetWidth, int targetHeight, int targetFps,
+                 VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, QObject* parent = nullptr);
     ~StreamWorker();
 
     // Change the source URL (real FFmpeg reconnect — only for user editing a URL)
@@ -178,6 +181,7 @@ private:
     int m_targetWidth = 1920;
     int m_targetHeight = 1080;
     int m_targetFps = 30;
+    VideoCodecChoice m_videoCodec = VideoCodecChoice::Mpeg2Software;
 
     // FFmpeg context management
     struct QueuedFrame {

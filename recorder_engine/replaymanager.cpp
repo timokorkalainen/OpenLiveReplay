@@ -86,6 +86,11 @@ bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObjec
 
 // ─── Blue-frame encoder for unmapped view tracks ───────────────────────
 bool ReplayManager::setupBlueEncoder() {
+    if (m_videoCodec == VideoCodecChoice::H264Hardware) {
+        qWarning() << "ReplayManager: H.264 hardware encode not yet implemented; "
+                      "select MPEG-2 (this path is wired in a later plan).";
+        return false;
+    }
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!encoder) return false;
 
@@ -178,9 +183,10 @@ void ReplayManager::startRecording() {
     // Recordings go to the user-configured location (empty = default)
     m_muxer->setOutputDirectory(m_outputDir);
     const bool muxerReady = m_telemetryFeedIds.isEmpty()
-        ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames)
+        ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
+                        48000, 2, m_videoCodec)
         : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                        m_telemetryFeedIds, m_telemetryFeedNames);
+                        m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec);
     if (!muxerReady) {
         qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
         return;
@@ -211,7 +217,7 @@ void ReplayManager::startRecording() {
     for (int s = 0; s < sourceCount; ++s) {
         StreamWorker* worker = new StreamWorker(
             m_sourceUrls[s], s, m_muxer, m_clock,
-            m_videoWidth, m_videoHeight, m_fps);
+            m_videoWidth, m_videoHeight, m_fps, m_videoCodec);
 
         // Set per-source metadata JSON for the subtitle track
         if (s < m_sourceMetadata.size()) {

@@ -13,6 +13,7 @@
 #include "muxer.h"
 #include "streamworker.h"
 #include "ingest/ingestsession.h"
+#include "recorder_engine/codec/videocodecchoice.h"
 
 class ReplayManager : public QObject
 {
@@ -64,6 +65,8 @@ public:
     void setVideoWidth(int width) { m_videoWidth = width; }
     void setVideoHeight(int height) { m_videoHeight = height; }
     void setFps(int fps) { m_fps = fps; }
+    void setVideoCodec(VideoCodecChoice codec) { m_videoCodec = codec; }
+    VideoCodecChoice videoCodec() const { return m_videoCodec; }
 
     // Getters
     QString getOutputDirectory() const { return m_outputDir; }
@@ -134,6 +137,7 @@ private:
     static constexpr int kHeartbeatIntervalMs = 8;
     static constexpr int kMaxFramesPerTick = 8;
     int m_fps = 30;
+    VideoCodecChoice m_videoCodec = VideoCodecChoice::Mpeg2Software;
 
     QTimer* m_heartbeat;
     Muxer* m_muxer;
