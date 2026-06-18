@@ -6,7 +6,7 @@ class TestNdiRecvAnalysis : public QObject {
     Q_OBJECT
 private slots:
     void continuityCountsDropsDupesReorders();
-    void avSyncIsMaxNearestFlashBeepOffset();
+    void avSyncMeasuresJitterAroundMedianOffset();
     void cadenceReportsMaxGapAndMeanRate();
 };
 
@@ -33,10 +33,19 @@ void TestNdiRecvAnalysis::continuityCountsDropsDupesReorders() {
              qint64(2)); // a reorder inherently registers the forward jumps as drops too
 }
 
-void TestNdiRecvAnalysis::avSyncIsMaxNearestFlashBeepOffset() {
-    // flashes at 0,15,30 ; beeps at 0,16,30 -> offsets 0,1,0 -> max 1
+void TestNdiRecvAnalysis::avSyncMeasuresJitterAroundMedianOffset() {
+    // Jitter = max deviation from the MEDIAN signed offset (beep[i]-flash[i]), so the
+    // constant NDI audio-buffer delay is normalized away and only A-V drift counts.
+    // symmetric small offsets {0,1,0} around median 0 -> max deviation 1
     QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {0, 16, 30}), 1);
+    // perfectly locked -> 0
     QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {0, 15, 30}), 0);
+    // a CONSTANT 14-frame buffer delay is NOT desync: offsets {14,14,14}, median 14 -> 0.
+    // (the old nearest-neighbor logic would have returned 14 here.)
+    QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {14, 29, 44}), 0);
+    // genuine drift IS caught: offsets {10,0,-8}, median 0 -> max deviation 10.
+    QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {10, 15, 22}), 10);
+    // empty -> -1
     QCOMPARE(ndiAvSyncMaxFrames({}, {0}), -1);
 }
 
