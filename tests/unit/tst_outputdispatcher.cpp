@@ -619,6 +619,10 @@ void TestOutputDispatcher::reverseAndSpeedChangeReanchorPlayhead() {
 
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
     dispatcher.setEndpoints({{a, &sink}});
+    // tick 2 re-anchors onto the same source frame as tick 1 (byte-identical payload);
+    // identity-skip (default on) would collapse that submit and hide the re-anchor, so
+    // disable it here to assert the per-tick sampled playhead.
+    dispatcher.setIdentitySkip(false);
 
     PlaybackStateSnapshot state;
     state.playing = true;
