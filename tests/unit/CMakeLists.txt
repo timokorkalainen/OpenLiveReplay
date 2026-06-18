@@ -97,3 +97,4 @@ olr_add_unit_test(tst_rtmp_health      olr_test_core)
 olr_add_unit_test(tst_videocodecchoice)
 # Header-only test: no olr_test_core link, so add the project root include manually.
 target_include_directories(tst_videocodecchoice PRIVATE "${CMAKE_SOURCE_DIR}")
+olr_add_unit_test(tst_avcc olr_test_engine)
