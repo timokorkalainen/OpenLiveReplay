@@ -147,6 +147,7 @@ skipForward="$(get skipForward)"
 audioPushes="$(get audioPushes)"
 framesDropped="$(get framesDropped)"
 resyncCount="$(get resyncCount)"
+placeholderFramesDelta="$(get placeholderFramesDelta)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -155,6 +156,7 @@ resyncCount="$(get resyncCount)"
 [ -n "$audioPushes" ] || audioPushes="?"
 [ -n "$framesDropped" ] || framesDropped="?"
 [ -n "$resyncCount" ] || resyncCount="?"
+[ -n "$placeholderFramesDelta" ] || placeholderFramesDelta="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -275,13 +277,32 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    seekflash)
+        # Prove a seek introduces NO NEW gray placeholder. After a warmup play
+        # fills the output cache, a FORWARD test seek must not paint the gray
+        # placeholder: Task 1 keeps the output cache across the reposition so
+        # videoFrameAt returns the largest pts<=target (a stale-but-real frame)
+        # until the new frames decode in. The metric is the POST-SEEK delta
+        # (a cold start legitimately placeholders during warmup, so the
+        # whole-run total is never 0); a non-zero delta is the seek flash.
+        # Task 4 (deliver-target-first) lowers time-to-first-paint; the
+        # placeholderFramesDelta==0 gate is the regression guard.
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: seekflash painted gray after seek (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — seek flash"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 2 ]; then
+            echo "FAIL: seekflash repositioned too much (reposition=$reposition, expected <=2)"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"
