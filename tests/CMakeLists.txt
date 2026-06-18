@@ -78,6 +78,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/heartbeat.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/driftestimator.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/timecode.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/timing/smpte12m.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/sourceclock.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
