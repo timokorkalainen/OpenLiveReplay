@@ -116,6 +116,14 @@ echo "[h264-e2e] video_packets=${V_PACKETS:-?}"
 A_CHANNELS="$(scalar -select_streams a:0 -show_entries stream=channels)"
 echo "[h264-e2e] audio_channels=${A_CHANNELS:-?}"
 
+# 3c1. Subtitle/metadata track layout: assert at least one subtitle stream (metadata track).
+SUBS="$(ffprobe -v error -select_streams s -show_entries stream=codec_type -of csv=p=0 "$OUT_MKV" | wc -l | tr -d ' ')"
+echo "[h264-e2e] subtitle_streams=${SUBS:-?}"
+
+# 3c2. Total stream count: assert at least 3 streams (video + audio + metadata subtitle).
+NSTREAMS="$(ffprobe -v error -show_entries stream=index -of csv=p=0 "$OUT_MKV" | wc -l | tr -d ' ')"
+echo "[h264-e2e] total_streams=${NSTREAMS:-?}"
+
 # 3d. All-intra check: count video packets whose flags do NOT include the keyframe
 #     bit (key_frame=0). For a valid intra-only H.264 stream this count must be 0.
 NON_KF="$(ffprobe -v error -select_streams v:0 \
@@ -155,6 +163,16 @@ fi
 
 if [ "${A_CHANNELS:-}" != "2" ]; then
     echo "FAIL: expected stereo (2ch) audio, got '${A_CHANNELS:-none}'"
+    fail=1
+fi
+
+if ! is_num "${SUBS:-}" || [ "${SUBS}" -lt 1 ]; then
+    echo "FAIL: metadata subtitle track missing (track layout not intact, got ${SUBS:-none} subtitle streams)"
+    fail=1
+fi
+
+if ! is_num "${NSTREAMS:-}" || [ "${NSTREAMS}" -lt 3 ]; then
+    echo "FAIL: insufficient stream count (track layout not intact, got ${NSTREAMS:-none} total streams, need >= 3)"
     fail=1
 fi
 
