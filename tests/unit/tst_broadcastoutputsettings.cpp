@@ -17,6 +17,7 @@ private slots:
     void rowsKeepHealthySingleFrameQueueActive();
     void rowsDoNotMarkIdleTargetErrorOnGlobalDeadlineMiss();
     void qtPreviewAssignmentsCoverFeedsMultiviewAndPgm();
+    void rowsMarkPlaceholderVideoAsDegraded();
 };
 
 void TestBroadcastOutputSettings::ensureTargetsCreatesOneNdiTargetPerBus() {
@@ -394,6 +395,29 @@ void TestBroadcastOutputSettings::qtPreviewAssignmentsCoverFeedsMultiviewAndPgm(
 
     QCOMPARE(previews[3].id, QStringLiteral("qt-preview-pgm"));
     QCOMPARE(previews[3].sourceBus, OutputBusId::pgm());
+}
+
+void TestBroadcastOutputSettings::rowsMarkPlaceholderVideoAsDegraded() {
+    QList<OutputTargetAssignment> outputs = BroadcastOutputSettings::setEnabled(
+        {}, 1, OutputTargetKind::Ndi, OutputBusId::feed(0), true);
+
+    BroadcastOutputTargetStatus status;
+    status.attemptedFrames = 5;
+    status.framesSubmitted = 5;
+    status.hasLastSubmitResult = true;
+    status.lastSubmitSucceeded = true;
+    status.hasLastIdentity = true;
+    status.lastIdentity.bus = OutputBusId::feed(0);
+    status.lastIdentity.outputFrameIndex = 4;
+    status.lastIdentity.videoPlaceholder = true; // placeholder video -> Degraded
+
+    QHash<QString, BroadcastOutputTargetStatus> statuses;
+    statuses.insert(QStringLiteral("feed0-ndi"), status);
+
+    const QVariantMap feed =
+        BroadcastOutputSettings::rows(outputs, 1, OutputTargetKind::Ndi, statuses)[0].toMap();
+    QCOMPARE(feed.value(QStringLiteral("statusState")).toString(), QStringLiteral("Degraded"));
+    QCOMPARE(feed.value(QStringLiteral("statusSeverity")).toString(), QStringLiteral("warning"));
 }
 
 QTEST_GUILESS_MAIN(TestBroadcastOutputSettings)
