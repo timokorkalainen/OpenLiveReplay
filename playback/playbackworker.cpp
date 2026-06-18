@@ -1250,9 +1250,13 @@ MediaVideoFrame PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int fee
     out.strideU = (frame->width + 1) / 2;
     out.strideV = (frame->width + 1) / 2;
     const int chromaH = (frame->height + 1) / 2;
-    out.planeY = QByteArray(out.strideY * frame->height, '\0');
-    out.planeU = QByteArray(out.strideU * chromaH, '\0');
-    out.planeV = QByteArray(out.strideV * chromaH, '\0');
+    // Allocate uninitialized: the per-line memcpy below overwrites every byte
+    // up to copyW for all `height` lines, so a zero-fill is a dead store
+    // (~3 MB memset per 1080p frame). Padding bytes (width..stride) are never
+    // read by the renderer.
+    out.planeY = QByteArray(out.strideY * frame->height, Qt::Uninitialized);
+    out.planeU = QByteArray(out.strideU * chromaH, Qt::Uninitialized);
+    out.planeV = QByteArray(out.strideV * chromaH, Qt::Uninitialized);
 
     QByteArray* dstPlanes[3] = {&out.planeY, &out.planeU, &out.planeV};
     const int dstStrides[3] = {out.strideY, out.strideU, out.strideV};
