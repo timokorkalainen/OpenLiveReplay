@@ -289,7 +289,7 @@ elseif(WIN32)
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp
-        recorder_engine/codec/nativevideoencoder_stub.cpp)
+        recorder_engine/codec/nativevideoencoder_mediafoundation.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -302,7 +302,7 @@ elseif(WIN32)
         "${OLR_FFMPEG_AVUTIL_LIBRARY}"
         "${OLR_FFMPEG_SWSCALE_LIBRARY}"
         "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
-        mfplat mf mfuuid d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
+        mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
 elseif(NOT WIN32)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_stub.cpp

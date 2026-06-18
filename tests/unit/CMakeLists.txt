@@ -111,10 +111,12 @@ if(APPLE)
     target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
 elseif(WIN32)
     add_library(olr_test_nativevideoencoder STATIC
-        "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_stub.cpp")
+        "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_mediafoundation.cpp")
     target_include_directories(olr_test_nativevideoencoder PRIVATE "${CMAKE_SOURCE_DIR}" "${OLR_FFMPEG_INCLUDE}")
+    target_link_directories(olr_test_nativevideoencoder PUBLIC "${OLR_FFMPEG_LIBDIR}")
     target_link_libraries(olr_test_nativevideoencoder
-        PUBLIC Qt6::Core olr_test_engine)
+        PUBLIC Qt6::Core olr_test_engine
+        PRIVATE avutil mfplat mf mfuuid mfreadwrite strmiids ole32)
     target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
 elseif(NOT WIN32)
     add_library(olr_test_nativevideoencoder STATIC
