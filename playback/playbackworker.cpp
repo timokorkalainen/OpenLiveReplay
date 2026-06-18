@@ -48,6 +48,9 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // transport's own (independent) mutex, so there is no lock-order concern.
     m_lastMoveDir.store((clamped >= m_transport->currentPos()) ? 1 : -1, std::memory_order_relaxed);
     m_seekTargetMs = clamped;
+    // A new seek target is outstanding until repositionTo commits it. The gate
+    // holds the last good playhead until m_committedGeneration catches up.
+    m_seekGeneration.fetch_add(1, std::memory_order_release);
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
         if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
@@ -378,7 +381,16 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
             snapshot.cache = OutputFrameCache(m_outputFeedCount, m_outputWidth, m_outputHeight);
     }
 
-    snapshot.state.playheadMs = m_transport ? m_transport->currentPos() : 0;
+    // Gate the visible playhead behind the committed cache generation: when no
+    // seek is outstanding (committedGen == seekGen) this returns the LIVE
+    // transport playhead so 1x playback advances every tick; while a reposition
+    // for the latest seek is in flight it holds the last committed playhead so
+    // the snapshot never reports a new playhead against a not-yet-ready cache.
+    const qint64 transportPlayhead = m_transport ? m_transport->currentPos() : 0;
+    snapshot.state.playheadMs = CommitGate::visiblePlayheadMs(
+        transportPlayhead, m_committedPlayheadMs.load(std::memory_order_acquire),
+        m_committedGeneration.load(std::memory_order_acquire),
+        m_seekGeneration.load(std::memory_order_acquire));
     snapshot.state.playing = m_transport && m_transport->isPlaying();
     snapshot.state.speed = m_transport ? m_transport->speed() : 1.0;
     snapshot.state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
@@ -568,6 +580,13 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
             if (m_audioPlayer) m_audioPlayer->clear();
         }
         m_counters.reuseSeek++;
+        // Tier 2: the cache already covers `target` (reuseAt + deliverDueFrames
+        // above). Record the committed playhead, then advance the committed
+        // generation to the latest seek's value so makeOutputSnapshot exposes
+        // the live transport playhead again (CommitGate).
+        m_committedPlayheadMs.store(target, std::memory_order_relaxed);
+        m_committedGeneration.store(m_seekGeneration.load(std::memory_order_acquire),
+                                    std::memory_order_release);
         return;
     }
 
@@ -631,6 +650,14 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     if (!deliveredEarly) resetDedup();
     deliverDueFrames(target, dir);
     m_counters.reposition++;
+
+    // Tier 2: the cache now covers `target`. Record the committed playhead
+    // first, then advance the committed generation to the latest seek's value
+    // — once these match m_seekGeneration, makeOutputSnapshot exposes the live
+    // transport playhead again (CommitGate).
+    m_committedPlayheadMs.store(target, std::memory_order_relaxed);
+    m_committedGeneration.store(m_seekGeneration.load(std::memory_order_acquire),
+                                std::memory_order_release);
 }
 
 void PlaybackWorker::run() {

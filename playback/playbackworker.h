@@ -13,6 +13,7 @@
 #include <memory>
 #include <vector>
 #include "frameprovider.h"
+#include "playback/commitgate.h"
 #include "playback/output/outputruntime.h"
 #include "playback/output/outputtargetassignment.h"
 #include "playback/playbacktransport.h"
@@ -153,6 +154,15 @@ private:
     // re-decoding an overlapping window every iteration. INT64_MAX = no
     // fetch yet this run; reset on reposition and whenever travelling forward.
     int64_t m_reverseAnchorMs = INT64_MAX;
+
+    // Seek-gate generations (read in makeOutputSnapshot; written in seekTo /
+    // repositionTo). When m_committedGeneration == m_seekGeneration there is no
+    // reposition outstanding and the live playhead is exposed (1x advances);
+    // while they differ a seek is in flight against a not-yet-ready cache and
+    // the gate holds m_committedPlayheadMs (CommitGate).
+    std::atomic<uint64_t> m_seekGeneration{0};
+    std::atomic<uint64_t> m_committedGeneration{0};
+    std::atomic<int64_t> m_committedPlayheadMs{0};
 
     QMutex m_mutex;
     mutable QMutex m_bufferMutex;
