@@ -7,7 +7,7 @@
 # through immediately, so ARQ NAK/ACK timing is preserved.
 #
 # Usage:
-#   lossy_udp_relay.py <listen_port> <bridge_host:bridge_port> <loss_pct> <stats_file> [seed] [reorder_ms]
+#   lossy_udp_relay.py <listen_port> <bridge_host:bridge_port> <loss_pct> <stats_file> [seed] [reorder_ms] [skew_ppm]
 import heapq
 import os
 import random
@@ -18,7 +18,28 @@ import sys
 import time
 
 
+def skew_release_at(first_data_mono, data_index, mean_interval, skew_ppm):
+    return first_data_mono + data_index * mean_interval * (1.0 + skew_ppm / 1e6)
+
+
+def selftest():
+    count = 1000
+    interval = 0.001
+    skew_ppm = 200.0
+    first = 10.0
+    releases = [skew_release_at(first, i, interval, skew_ppm) for i in range(count)]
+    observed = releases[-1] - first
+    expected = (count - 1) * interval * (1.0 + skew_ppm / 1e6)
+    tolerance = expected * 0.01
+    assert abs(observed - expected) <= tolerance, (observed, expected)
+    print("SELFTEST OK")
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
+        selftest()
+        return
+
     listen_port = int(sys.argv[1])
     bridge_host, bridge_port = sys.argv[2].rsplit(":", 1)
     bridge_addr = (bridge_host, int(bridge_port))
@@ -26,6 +47,7 @@ def main():
     stats_file = sys.argv[4]
     seed = int(sys.argv[5]) if len(sys.argv) > 5 else 1234
     reorder_ms = int(sys.argv[6]) if len(sys.argv) > 6 else 0
+    skew_ppm = float(sys.argv[7]) if len(sys.argv) > 7 else 0.0
     rng = random.Random(seed)
 
     engine_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -33,7 +55,13 @@ def main():
     bridge_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     engine_addr = None
-    counters = {"dropped": 0, "forwarded": 0, "control_forwarded": 0, "reordered": 0}
+    counters = {
+        "dropped": 0,
+        "forwarded": 0,
+        "control_forwarded": 0,
+        "reordered": 0,
+        "data_forwarded": 0,
+    }
 
     # Time-ordered release queue for delayed downstream DATA: (release_at, seq, data).
     # arrival_seq tags arrival order; a packet released after a later-arriving one
@@ -41,13 +69,20 @@ def main():
     queue = []
     arrival_seq = 0
     max_released_seq = -1
+    data_index = 0
+    first_data_mono = None
+    ewma_interval = None
+    last_data_mono = None
+    alpha = 0.05
 
     def write_stats_and_exit(*_):
         try:
             with open(stats_file, "w") as f:
-                f.write("dropped=%d forwarded=%d control_forwarded=%d reordered=%d\n"
+                f.write("dropped=%d forwarded=%d control_forwarded=%d reordered=%d "
+                        "skew_ppm=%.3f data_forwarded=%d\n"
                         % (counters["dropped"], counters["forwarded"],
-                           counters["control_forwarded"], counters["reordered"]))
+                           counters["control_forwarded"], counters["reordered"],
+                           skew_ppm, counters["data_forwarded"]))
         except OSError:
             pass
         os._exit(0)
@@ -65,6 +100,7 @@ def main():
                 max_released_seq = seq
             engine_sock.sendto(data, engine_addr)
             counters["forwarded"] += 1
+            counters["data_forwarded"] += 1
 
     while True:
         now = time.monotonic()
@@ -94,13 +130,31 @@ def main():
                 if rng.random() < loss:
                     counters["dropped"] += 1
                     continue
-                if reorder_ms > 0:
+                if skew_ppm != 0.0:
+                    now = time.monotonic()
+                    if last_data_mono is not None:
+                        gap = now - last_data_mono
+                        ewma_interval = gap if ewma_interval is None else (
+                            (1.0 - alpha) * ewma_interval + alpha * gap
+                        )
+                    last_data_mono = now
+                    if first_data_mono is None:
+                        first_data_mono = now
+                        release_at = now
+                    else:
+                        interval = ewma_interval if ewma_interval else 1.0 / 1000.0
+                        release_at = skew_release_at(first_data_mono, data_index, interval, skew_ppm)
+                    data_index += 1
+                    heapq.heappush(queue, (release_at, arrival_seq, data))
+                    arrival_seq += 1
+                elif reorder_ms > 0:
                     delay = rng.random() * (reorder_ms / 1000.0)
                     heapq.heappush(queue, (time.monotonic() + delay, arrival_seq, data))
                     arrival_seq += 1
                 else:
                     engine_sock.sendto(data, engine_addr)
                     counters["forwarded"] += 1
+                    counters["data_forwarded"] += 1
 
 
 if __name__ == "__main__":

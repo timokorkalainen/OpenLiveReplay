@@ -13,7 +13,7 @@ extern "C" {
 struct AVFrame;
 }
 
-enum class IngestBackendKind { NativeSrt, NativeRtmp, Unsupported };
+enum class IngestBackendKind { NativeSrt, NativeRtmp, NativeNdi, Unsupported };
 
 enum class IngestFailureKind {
     None,
@@ -32,15 +32,18 @@ struct IngestOpenResult {
 struct IngestBackendOptions {
     bool preferNativeSrt = false;
     bool preferNativeRtmp = false;
+    bool preferNativeNdi = false;
 };
 
 struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
     int64_t sourcePtsMs = 0;
+    int64_t sourceTimecode100ns = -1;
 };
 
 struct DecodedAudioChunk {
     int64_t startSample = -1;
+    int64_t sourceTimecode100ns = -1;
     QByteArray pcmS16Stereo;
 };
 
@@ -48,7 +51,7 @@ constexpr int kDecodedAudioBytesPerSample = 2 * int(sizeof(int16_t));
 
 // Which backend produced this snapshot — selects the health grader. SRT fills the
 // loss-domain counters; RTMP (TCP, no loss) fills the liveness/throughput fields.
-enum class IngestStatsKind { Unknown = 0, Srt, Rtmp };
+enum class IngestStatsKind { Unknown = 0, Srt, Rtmp, Ndi };
 
 // Per-source ingest stats sampled ~1/sec and pushed to the UI via
 // IngestCallbacks::reportStats. Tagged by kind; each backend fills its own fields
@@ -65,6 +68,9 @@ struct IngestStats {
     qint64 lastPacketAgeMs = 0; // ms since the last media packet, at sample time
     qint64 keyframeAgeMs = 0;   // ms since the last video keyframe, at sample time
     quint64 decodeFailures = 0; // cumulative frames the native decoder rejected
+    // Recovered source-clock telemetry. clockQuality is ClockQuality as an int.
+    double clockPpm = 0.0;
+    int clockQuality = 0;
 };
 
 // Per-source link health -> the connection dot: Green=healthy, Amber=stressed, Red=losing content.
@@ -112,7 +118,8 @@ public:
 
 IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOptions& options);
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
-                                                         bool nativeRtmpAvailable);
+                                                         bool nativeRtmpAvailable,
+                                                         bool nativeNdiAvailable = false);
 bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure);
 
 Q_DECLARE_METATYPE(IngestStats)

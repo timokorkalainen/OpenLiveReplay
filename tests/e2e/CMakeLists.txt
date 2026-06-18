@@ -35,6 +35,43 @@ qt_add_executable(sync_harness sync_harness.cpp)
 target_link_libraries(sync_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
+set(_olr_ndi_default_sdk "")
+if(APPLE AND EXISTS "/Library/NDI SDK for Apple/include/Processing.NDI.Lib.h")
+    set(_olr_ndi_default_sdk "/Library/NDI SDK for Apple")
+endif()
+set(OLR_NDI_SDK_DIR "${_olr_ndi_default_sdk}" CACHE PATH
+    "Optional NDI SDK root used to build the local framesync NDI marker sender")
+if(OLR_NDI_SDK_DIR)
+    find_path(OLR_NDI_INCLUDE_DIR
+        NAMES Processing.NDI.Lib.h
+        HINTS "${OLR_NDI_SDK_DIR}/include"
+        NO_DEFAULT_PATH)
+    find_library(OLR_NDI_LIBRARY
+        NAMES ndi libndi
+        HINTS
+            "${OLR_NDI_SDK_DIR}/lib/macOS"
+            "${OLR_NDI_SDK_DIR}/lib"
+        NO_DEFAULT_PATH)
+    if(OLR_NDI_INCLUDE_DIR AND OLR_NDI_LIBRARY)
+        add_executable(ndi_marker_sender
+            ndi_marker_sender.cpp
+            ndi_marker_pattern.cpp)
+        target_include_directories(ndi_marker_sender PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${OLR_NDI_INCLUDE_DIR}")
+        target_link_libraries(ndi_marker_sender PRIVATE
+            Qt6::Core
+            "${OLR_NDI_LIBRARY}"
+            olr_warnings
+            olr_sanitize)
+        get_filename_component(_olr_ndi_library_dir "${OLR_NDI_LIBRARY}" DIRECTORY)
+        set_target_properties(ndi_marker_sender PROPERTIES
+            BUILD_RPATH "${_olr_ndi_library_dir}")
+    else()
+        message(STATUS "NDI marker sender disabled: NDI SDK headers/library not found")
+    endif()
+endif()
+
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
 set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
 
@@ -136,6 +173,37 @@ add_test(NAME e2e_av_lipsync
 set_tests_properties(e2e_av_lipsync PROPERTIES
     LABELS "av-sync" TIMEOUT 120 RUN_SERIAL TRUE
     ENVIRONMENT "OLR_AV_SYNC_GATE=1")
+
+# --- Broadcast frame-sync acceptance rig ------------------------------------
+# Opt-in instrument for lip-sync, inter-camera phase, drift and timecode
+# measurements. These use a dedicated port band (>=24000) and report metrics on
+# every run; lipsync and the zero-skew drift sanity cell run as gates while the
+# inter-camera/timecode cells stay report-only until common-TC/tmcd work lands.
+set(_framesync_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_framesync_e2e.sh")
+add_test(NAME e2e_framesync_lipsync
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" lipsync 24000)
+add_test(NAME e2e_framesync_drift
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" drift 24010)
+add_test(NAME e2e_framesync_drift_skew
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" drift_skew 24040)
+add_test(NAME e2e_framesync_intercam
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" intercam 24020)
+add_test(NAME e2e_framesync_timecode
+    COMMAND bash "${_framesync_driver}" "$<TARGET_FILE:sync_harness>" timecode 24030)
+set_tests_properties(
+    e2e_framesync_lipsync e2e_framesync_drift e2e_framesync_drift_skew
+    e2e_framesync_intercam e2e_framesync_timecode
+    PROPERTIES
+    LABELS "framesync"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+set_tests_properties(e2e_framesync_lipsync PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
+set_tests_properties(e2e_framesync_drift PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
+set_tests_properties(e2e_framesync_drift_skew PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_SKEW_PPM=200")
 
 # --- Local-only native SRT e2e (NOT in CI) ----------------------------------
 # Prove the real engine ingests srt:// over the native SRT path (the default,
@@ -252,6 +320,16 @@ elseif(WIN32)
         RUN_SERIAL TRUE
         ENVIRONMENT "${_olr_windows_tool_env}")
 endif()
+
+# Native NDI ingest is cross-platform and runtime-loaded. This smoke is opt-in:
+# it skips unless OLR_NDI_TEST_SOURCE names a real source visible to the NDI runtime.
+add_test(NAME e2e_native_ndi_smoke
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_smoke.sh" "$<TARGET_FILE:record_harness>")
+set_tests_properties(e2e_native_ndi_smoke PROPERTIES
+    LABELS "native-ndi"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
 
 # --- Local-only native RTMP e2e (NOT in CI) --------------------------------
 # This test uses a deterministic Python RTMP fixture server and requires the
