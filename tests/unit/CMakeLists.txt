@@ -98,3 +98,26 @@ olr_add_unit_test(tst_videocodecchoice)
 # Header-only test: no olr_test_core link, so add the project root include manually.
 target_include_directories(tst_videocodecchoice PRIVATE "${CMAKE_SOURCE_DIR}")
 olr_add_unit_test(tst_avcc olr_test_engine)
+olr_add_unit_test(tst_nativevideoencoder olr_test_engine)
+if(APPLE)
+    add_library(olr_test_nativevideoencoder STATIC
+        "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_stub.cpp")
+    target_include_directories(olr_test_nativevideoencoder PRIVATE "${CMAKE_SOURCE_DIR}" "${OLR_FFMPEG_INCLUDE}")
+    target_link_directories(olr_test_nativevideoencoder PUBLIC "${OLR_FFMPEG_LIBDIR}")
+    target_link_libraries(olr_test_nativevideoencoder
+        PUBLIC Qt6::Core avutil olr_test_engine)
+    target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
+elseif(WIN32)
+    add_library(olr_test_nativevideoencoder STATIC
+        "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_stub.cpp")
+    target_include_directories(olr_test_nativevideoencoder PRIVATE "${CMAKE_SOURCE_DIR}" "${OLR_FFMPEG_INCLUDE}")
+    target_link_libraries(olr_test_nativevideoencoder
+        PUBLIC Qt6::Core olr_test_engine)
+    target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
+elseif(NOT WIN32)
+    add_library(olr_test_nativevideoencoder STATIC
+        "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_stub.cpp")
+    target_include_directories(olr_test_nativevideoencoder PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(olr_test_nativevideoencoder PUBLIC Qt6::Core olr_test_engine)
+    target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
+endif()

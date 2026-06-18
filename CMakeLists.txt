@@ -272,7 +272,8 @@ if(APPLE)
         recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
-        recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm)
+        recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm
+        recorder_engine/codec/nativevideoencoder_stub.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -287,7 +288,8 @@ elseif(WIN32)
         recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
-        recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp)
+        recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp
+        recorder_engine/codec/nativevideoencoder_stub.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -304,7 +306,8 @@ elseif(WIN32)
 elseif(NOT WIN32)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_stub.cpp
-        recorder_engine/ingest/nativeaacdecoder_stub.cpp)
+        recorder_engine/ingest/nativeaacdecoder_stub.cpp
+        recorder_engine/codec/nativevideoencoder_stub.cpp)
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)
