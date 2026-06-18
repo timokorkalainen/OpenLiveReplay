@@ -171,6 +171,10 @@ private:
     QList<OutputTargetAssignment> m_externalOutputAssignments;
     std::atomic<bool> m_outputTargetsDirty{false};
     std::unique_ptr<OutputFrameCache> m_outputCache;
+    // Worker-thread-only staging buffer: a reposition decodes the target window
+    // here, then merges into the live cache and trims old frames only after
+    // coverage (double-buffer; never published to the output thread).
+    std::unique_ptr<OutputFrameCache> m_stagingCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
     int m_outputFeedCount = 0;

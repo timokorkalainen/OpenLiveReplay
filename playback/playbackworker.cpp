@@ -615,6 +615,26 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     int packets = 0;
     const int packetBudget = (capFrames(trackCount) + 4) * trackCount * 2;
     bool deliveredEarly = false;
+
+    // Tier 2 double-buffer: decode the target window into a fresh staging cache,
+    // then merge it into the live cache and trim old frames only AFTER coverage,
+    // so the live cache is never momentarily empty at target during a far seek.
+    if (m_outputFeedCount > 0) {
+        if (!m_stagingCache)
+            m_stagingCache = std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth,
+                                                                m_outputHeight);
+        else
+            m_stagingCache->clear();
+    }
+    // Swap so decodePacketIntoBank's m_outputCache->insertVideoFrame lands in
+    // staging, not the live cache (which keeps its old frames over the seek).
+    std::unique_ptr<OutputFrameCache> liveSaved;
+    if (m_stagingCache) {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        liveSaved = std::move(m_outputCache);
+        m_outputCache = std::move(m_stagingCache);
+    }
+
     while (!shouldInterrupt()) {
         // A newer explicit seek supersedes this fill.
         {
@@ -645,6 +665,17 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 
         if (++packets > packetBudget) break; // safety bound
         if (newestPtsMin() >= fillTo) break; // covered the target
+    }
+
+    // Merge staging into the live cache, then drop old frames before target.
+    if (liveSaved) {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        m_stagingCache = std::move(m_outputCache); // staging back
+        m_outputCache = std::move(liveSaved);      // live restored (old frames intact)
+        m_outputCache->mergeFrom(*m_stagingCache); // live now covers target AND keeps old
+        const qint64 keepAudioFromSample =
+            qMax<qint64>(0, (target - kLeadMs) * qint64(48000) / 1000);
+        m_outputCache->trimBefore(target - kLeadMs, keepAudioFromSample);
     }
 
     if (!deliveredEarly) resetDedup();
