@@ -606,7 +606,8 @@ void TestOutputDispatcher::reverseAndSpeedChangeReanchorPlayhead() {
     QCOMPARE(sink.frames.size(), 4);
     QCOMPARE(sink.frames[0].sampledPlayheadMs, qint64(200));
     QCOMPARE(sink.frames[1].sampledPlayheadMs, qint64(240));
-    QCOMPARE(sink.frames[2].sampledPlayheadMs, qint64(240)); // re-anchored, not 280
+    QCOMPARE(sink.frames[2].sampledPlayheadMs,
+             qint64(240)); // re-anchored at 240; a stale epoch would give 120
     QCOMPARE(sink.frames[3].sampledPlayheadMs, qint64(200)); // reverse step
 }
 
