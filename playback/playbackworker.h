@@ -242,8 +242,9 @@ private:
     std::atomic<int64_t> m_armedTargetMs{-1};
     std::atomic<bool> m_cutArmed{false};
     std::atomic<bool> m_prerollSeekPending{false};
-    // Worker-thread-only: true once the staging cache covers [target, target+span].
-    bool m_stagingCovers = false;
+    // True once the staging cache covers [target, target+span]. Atomic because
+    // armNextCut clears it from the UI thread while the worker reads/writes it.
+    std::atomic<bool> m_stagingCovers{false};
     // Newest video PTS (ms) currently staged for the reference feed (feed 0),
     // tracked during fillStaging since OutputFrameCache has no newest accessor.
     int64_t m_stagingNewestRefPtsMs = INT64_MIN;

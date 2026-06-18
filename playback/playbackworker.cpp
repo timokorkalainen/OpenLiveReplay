@@ -925,7 +925,7 @@ void PlaybackWorker::armNextCut(int64_t targetMs) {
     if (!m_prerollFmtCtx) return; // pre-roll disabled — feature unavailable
     m_armedTargetMs.store(targetMs < 0 ? 0 : targetMs);
     m_prerollSeekPending.store(true);
-    m_stagingCovers = false;
+    m_stagingCovers.store(false);
     m_scheduledCutFrame.store(-1);
     m_cutArmed.store(true);
 }
@@ -939,7 +939,7 @@ void PlaybackWorker::armNextCut(int64_t targetMs) {
 void PlaybackWorker::fillStaging() {
     if (!m_prerollFmtCtx || m_prerollBank.isEmpty() || !m_prerollStagingCache) return;
     const int64_t target = m_armedTargetMs.load();
-    if (target < 0 || m_stagingCovers) return;
+    if (target < 0 || m_stagingCovers.load()) return;
 
     const int primaryStreamIndex = m_prerollBank[0]->streamIndex;
     AVStream* refStream = m_prerollFmtCtx->streams[primaryStreamIndex];
@@ -968,7 +968,7 @@ void PlaybackWorker::fillStaging() {
         if (ret < 0) {
             // EOF / short clip: take whatever we staged as "covering" so the cut
             // can still fire (it will land on the largest pts<=target available).
-            m_stagingCovers = true;
+            m_stagingCovers.store(true);
             av_packet_unref(pkt);
             break;
         }
@@ -1005,7 +1005,7 @@ void PlaybackWorker::fillStaging() {
         av_packet_unref(pkt);
 
         if (m_stagingNewestRefPtsMs >= coverTo) {
-            m_stagingCovers = true;
+            m_stagingCovers.store(true);
             break;
         }
     }
@@ -1014,7 +1014,7 @@ void PlaybackWorker::fillStaging() {
     av_packet_free(&pkt);
 
     // Schedule the cut the moment staging first covers the target window.
-    if (m_stagingCovers && m_scheduledCutFrame.load() < 0) {
+    if (m_stagingCovers.load() && m_scheduledCutFrame.load() < 0) {
         const qint64 lead = CutSchedule::framesForLeadMs(kCutLeadMs, fps());
         const qint64 nextIdx =
             m_outputRuntime ? m_outputRuntime->dispatcherNextOutputFrameIndex() : 0;
@@ -1061,7 +1061,7 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
         m_transport->seek(
             CutSchedule::playheadAfterCut(target, dispatcherNextIndex, scheduled, fps()));
     }
-    m_stagingCovers = false;
+    m_stagingCovers.store(false);
     m_cutArmed.store(false);
     m_scheduledCutFrame.store(-1);
     fprintf(stderr, "ARMEDCUT fired: nextIdx=%lld scheduled=%lld target=%lldms\n",
@@ -1513,7 +1513,7 @@ void PlaybackWorker::run() {
         // Worker-private; never starves the primary tick (kPrerollPacketsPerTick
         // per pass). Stops once staging covers the armed window (m_stagingCovers),
         // at which point the cut is scheduled and fires on the output thread.
-        if (m_cutArmed.load() && !m_stagingCovers) fillStaging();
+        if (m_cutArmed.load() && !m_stagingCovers.load()) fillStaging();
 
         // --- EOF / live-growth handling (§6.8) ---
         if (hitEof) {
@@ -1604,7 +1604,7 @@ void PlaybackWorker::run() {
     m_prerollStagingCache.reset();
     m_cutArmed.store(false);
     m_scheduledCutFrame.store(-1);
-    m_stagingCovers = false;
+    m_stagingCovers.store(false);
 }
 
 void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
