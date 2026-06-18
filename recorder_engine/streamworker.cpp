@@ -80,7 +80,7 @@ void StreamWorker::stop() {
 }
 
 void StreamWorker::run() {
-    // 1. Setup the persistent encoder context
+    // 1. Setup the persistent encoder context (MPEG-2) or native encoder (H.264).
     if (!setupEncoder(&m_persistentEncCtx)) return;
 
     // 2. Enter the event loop. The thread stays alive, waiting for
@@ -100,6 +100,7 @@ void StreamWorker::run() {
 
     // Cleanup when exec() returns (on stop)
     avcodec_free_context(&m_persistentEncCtx);
+    m_nativeEncoder.reset();
     av_frame_free(&m_latestFrame);
 
     while (!m_frameQueue.isEmpty()) {
@@ -125,7 +126,7 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
         qMax<int64_t>(0, (frameIndex * 1000) / m_targetFps - jitterMs - trimMs),
         std::memory_order_relaxed);
 
-    if (!m_persistentEncCtx) return;
+    if (!m_persistentEncCtx && !m_nativeEncoder) return;
 
     // Stall detection: if connected but no frames for too long, signal restart.
     const int64_t lastEnq = m_lastFrameEnqueueAtMs.load(std::memory_order_relaxed);
@@ -206,25 +207,60 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     track = m_viewTrack.load(std::memory_order_relaxed);
 
     if (track >= 0 && m_latestFrame && m_latestFrame->data[0]) {
-        // Set PTS on the FRAME, not the packet (avcodec_receive_packet
-        // overwrites the packet entirely).
-        m_latestFrame->pts = m_internalFrameCount;
-
-        if (avcodec_send_frame(encCtx, m_latestFrame) == 0) {
-            if (avcodec_receive_packet(encCtx, outPkt) == 0) {
-                outPkt->stream_index = track;
-                outPkt->duration = 1;
-                AVStream* st = m_muxer->getStream(track);
-                if (st) {
-                    av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
+        if (m_videoCodec == VideoCodecChoice::H264Hardware && m_nativeEncoder) {
+            // H.264 native-encode path: encode via NativeVideoEncoder and write
+            // each output packet directly.
+            AVStream* st = m_muxer->getStream(track);
+            QString encErr;
+            m_nativeEncoder->encode(
+                m_latestFrame, m_internalFrameCount,
+                [&](const QByteArray& data, int64_t ptsTicks, bool keyframe) {
+                    AVPacket* pkt = av_packet_alloc();
+                    if (!pkt) return;
+                    if (av_new_packet(pkt, data.size()) < 0) {
+                        av_packet_free(&pkt);
+                        return;
+                    }
+                    memcpy(pkt->data, data.constData(), data.size());
+                    pkt->stream_index = track;
+                    if (st) {
+                        pkt->pts = pkt->dts = av_rescale_q(
+                            ptsTicks, AVRational{1, m_targetFps}, st->time_base);
+                        pkt->duration = av_rescale_q(
+                            1, AVRational{1, m_targetFps}, st->time_base);
+                    }
+                    if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
+                    m_muxer->writePacket(pkt);
+                    av_packet_free(&pkt);
                     havePacket = true;
+                },
+                &encErr);
+        } else if (encCtx) {
+            // MPEG-2 software-encode path (unchanged).
+            // Set PTS on the FRAME, not the packet (avcodec_receive_packet
+            // overwrites the packet entirely).
+            m_latestFrame->pts = m_internalFrameCount;
+
+            if (avcodec_send_frame(encCtx, m_latestFrame) == 0) {
+                if (avcodec_receive_packet(encCtx, outPkt) == 0) {
+                    outPkt->stream_index = track;
+                    outPkt->duration = 1;
+                    AVStream* st = m_muxer->getStream(track);
+                    if (st) {
+                        av_packet_rescale_ts(outPkt, encCtx->time_base, st->time_base);
+                        havePacket = true;
+                    }
                 }
             }
         }
     }
 
     if (havePacket) {
-        m_muxer->writePacket(outPkt);
+        // For MPEG-2, the packet is in outPkt and has not been written yet.
+        // For H.264, packets were written inline in the callback above.
+        if (m_videoCodec != VideoCodecChoice::H264Hardware && encCtx) {
+            m_muxer->writePacket(outPkt);
+        }
 
         // Write the per-frame source metadata to the paired subtitle track
         QByteArray metaJson;
@@ -468,9 +504,26 @@ void StreamWorker::captureLoop() {
 
 bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     if (m_videoCodec == VideoCodecChoice::H264Hardware) {
-        qWarning() << "Source" << m_sourceIndex
-                   << "H.264 hardware encode not yet implemented; select MPEG-2.";
-        return false;
+        QString err;
+        m_nativeEncoder = NativeVideoEncoder::create(
+            {m_targetWidth, m_targetHeight, m_targetFps, 1, 30'000'000}, &err);
+        if (!m_nativeEncoder) {
+            qWarning() << "Source" << m_sourceIndex
+                       << "H.264 hardware encoder unavailable (hardware-only):" << err;
+            return false;
+        }
+        // Allocate the reusable frame buffer (same as MPEG-2 path).
+        m_latestFrame = av_frame_alloc();
+        if (!m_latestFrame) return false;
+        m_latestFrame->format = AV_PIX_FMT_YUV420P;
+        m_latestFrame->width  = m_targetWidth;
+        m_latestFrame->height = m_targetHeight;
+        if (av_frame_get_buffer(m_latestFrame, 0) < 0) return false;
+        memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
+        memset(m_latestFrame->data[1], 128, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
+        memset(m_latestFrame->data[2], 128, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+        // Leave *encCtx null — H.264 path uses m_nativeEncoder.
+        return true;
     }
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!encoder) return false;

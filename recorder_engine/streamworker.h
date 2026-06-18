@@ -21,6 +21,7 @@
 #include "timing/sourceclock.h"
 
 #include "recorder_engine/codec/videocodecchoice.h"
+#include "recorder_engine/codec/nativevideoencoder.h"
 
 extern "C" {
     #include <libavformat/avformat.h>
@@ -191,6 +192,7 @@ private:
 
     QQueue<QueuedFrame> m_frameQueue;
     AVCodecContext* m_persistentEncCtx = nullptr;
+    std::unique_ptr<NativeVideoEncoder> m_nativeEncoder;
 
     // FFmpeg helpers
     bool setupEncoder(AVCodecContext** encCtx);

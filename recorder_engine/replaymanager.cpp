@@ -87,9 +87,66 @@ bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObjec
 // ─── Blue-frame encoder for unmapped view tracks ───────────────────────
 bool ReplayManager::setupBlueEncoder() {
     if (m_videoCodec == VideoCodecChoice::H264Hardware) {
-        qWarning() << "ReplayManager: H.264 hardware encode not yet implemented; "
-                      "select MPEG-2 (this path is wired in a later plan).";
-        return false;
+        // H.264 path: build the native blue encoder and prime-encode the blue
+        // frame once to obtain avcC extradata (needed by Muxer::init).
+        QString err;
+        m_blueNativeEncoder = NativeVideoEncoder::create(
+            {m_videoWidth, m_videoHeight, m_fps, 1, 30'000'000}, &err);
+        if (!m_blueNativeEncoder) {
+            qWarning() << "ReplayManager: H.264 hardware blue encoder unavailable:" << err;
+            return false;
+        }
+
+        // Allocate + paint the blue frame (YUV, same as MPEG-2 path).
+        m_blueFrame = av_frame_alloc();
+        if (!m_blueFrame) { m_blueNativeEncoder.reset(); return false; }
+        m_blueFrame->format = AV_PIX_FMT_YUV420P;
+        m_blueFrame->width  = m_videoWidth;
+        m_blueFrame->height = m_videoHeight;
+        if (av_frame_get_buffer(m_blueFrame, 0) < 0) {
+            av_frame_free(&m_blueFrame);
+            m_blueNativeEncoder.reset();
+            return false;
+        }
+        memset(m_blueFrame->data[0], 128, m_blueFrame->linesize[0] * m_blueFrame->height);
+        memset(m_blueFrame->data[1], 240, m_blueFrame->linesize[1] * (m_blueFrame->height / 2));
+        memset(m_blueFrame->data[2], 107, m_blueFrame->linesize[2] * (m_blueFrame->height / 2));
+
+        // Priming encode: drives avcC extradata to be ready for Muxer::init.
+        // Capture the encoded packet bytes for writeBlueFrames reuse.
+        m_cachedBluePkt = av_packet_alloc();
+        if (!m_cachedBluePkt) {
+            av_frame_free(&m_blueFrame);
+            m_blueNativeEncoder.reset();
+            return false;
+        }
+        bool gotPkt = false;
+        bool encOk = m_blueNativeEncoder->encode(
+            m_blueFrame, 0,
+            [&](const QByteArray& data, int64_t /*pts*/, bool /*key*/) {
+                if (av_new_packet(m_cachedBluePkt, data.size()) == 0) {
+                    memcpy(m_cachedBluePkt->data, data.constData(), data.size());
+                    m_cachedBluePkt->flags |= AV_PKT_FLAG_KEY;
+                    gotPkt = true;
+                }
+            },
+            &err);
+        if (!encOk || !gotPkt) {
+            av_packet_free(&m_cachedBluePkt);
+            av_frame_free(&m_blueFrame);
+            m_blueNativeEncoder.reset();
+            return false;
+        }
+
+        // Stash the avcC so startRecording() can pass it to m_muxer->init().
+        m_videoExtradata = m_blueNativeEncoder->avccExtradata();
+        if (m_videoExtradata.isEmpty()) {
+            av_packet_free(&m_cachedBluePkt);
+            av_frame_free(&m_blueFrame);
+            m_blueNativeEncoder.reset();
+            return false;
+        }
+        return true;
     }
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!encoder) return false;
@@ -168,6 +225,8 @@ void ReplayManager::cleanupBlueEncoder() {
     }
     if (m_blueFrame) { av_frame_free(&m_blueFrame); m_blueFrame = nullptr; }
     if (m_blueEncCtx) { avcodec_free_context(&m_blueEncCtx); m_blueEncCtx = nullptr; }
+    m_blueNativeEncoder.reset();
+    m_videoExtradata.clear();
 }
 
 // ─── Recording lifecycle ───────────────────────────────────────────────
@@ -175,29 +234,48 @@ void ReplayManager::startRecording() {
     QMutexLocker locker(&m_stateMutex);
     if (m_isRecording || m_sourceUrls.isEmpty()) return;
 
-    // 1. Initialize Muxer with M view-tracks (not N source-tracks).
+    // 1. Prepare session name and output directory (used by both paths).
     //    Do this BEFORE starting the clock / stamping the epoch: a failure
     //    here must not leave a phantom advancing clock behind for the idle UI.
     const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
     m_sessionFileName = m_baseFileName + "_" + timestamp;
-    // Recordings go to the user-configured location (empty = default)
     m_muxer->setOutputDirectory(m_outputDir);
-    const bool muxerReady = m_telemetryFeedIds.isEmpty()
-        ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                        48000, 2, m_videoCodec)
-        : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                        m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec);
-    if (!muxerReady) {
-        qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
-        return;
-    }
 
-    // 2. Setup the blue-frame encoder for unmapped views
-    cleanupBlueEncoder();
-    if (!setupBlueEncoder()) {
-        qDebug() << "ReplayManager: Failed to init blue frame encoder.";
-        m_muxer->close();
-        return;
+    if (m_videoCodec == VideoCodecChoice::H264Hardware) {
+        // H.264 path: prime the blue encoder FIRST to obtain avcC extradata,
+        // then pass it to Muxer::init so the container header includes it.
+        cleanupBlueEncoder();
+        if (!setupBlueEncoder()) {
+            qDebug() << "ReplayManager: Failed to init H.264 blue frame encoder.";
+            return;
+        }
+        const bool muxerReady = m_telemetryFeedIds.isEmpty()
+            ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
+                            48000, 2, m_videoCodec, m_videoExtradata)
+            : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
+                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec, m_videoExtradata);
+        if (!muxerReady) {
+            qDebug() << "ReplayManager: Failed to init Muxer (H.264) with base name" << m_sessionFileName;
+            cleanupBlueEncoder();
+            return;
+        }
+    } else {
+        // MPEG-2 path (unchanged): init muxer first, then blue encoder.
+        const bool muxerReady = m_telemetryFeedIds.isEmpty()
+            ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
+                            48000, 2, m_videoCodec)
+            : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
+                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec);
+        if (!muxerReady) {
+            qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
+            return;
+        }
+        cleanupBlueEncoder();
+        if (!setupBlueEncoder()) {
+            qDebug() << "ReplayManager: Failed to init blue frame encoder.";
+            m_muxer->close();
+            return;
+        }
     }
 
     // 3. Setup the session clock — only now that init + encoder have succeeded,
@@ -389,7 +467,9 @@ void ReplayManager::onTimerTick() {
 }
 
 void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
-    if (!m_blueEncCtx || !m_cachedBluePkt || !m_muxer) return;
+    if (!m_cachedBluePkt || !m_muxer) return;
+    // For MPEG-2 m_blueEncCtx must be valid; for H.264 m_blueNativeEncoder is used instead.
+    if (!m_blueEncCtx && !m_blueNativeEncoder) return;
 
     // Skip the encode entirely when every view has a source mapped —
     // but still reset the per-view silence cursors.
@@ -435,10 +515,14 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         // monotonic-DTS bump would fire on every write.
         pkt->pts = m_globalFrameCount;
         pkt->dts = m_globalFrameCount;
+        pkt->flags |= AV_PKT_FLAG_KEY;
         pkt->stream_index = v;
         AVStream* st = m_muxer->getStream(v);
         if (st) {
-            av_packet_rescale_ts(pkt, m_blueEncCtx->time_base, st->time_base);
+            // Use the encoder's time_base for MPEG-2; {1, m_fps} for H.264.
+            const AVRational encTb = m_blueEncCtx ? m_blueEncCtx->time_base
+                                                   : AVRational{1, m_fps};
+            av_packet_rescale_ts(pkt, encTb, st->time_base);
         }
         m_muxer->writePacket(pkt);
         av_packet_free(&pkt);
