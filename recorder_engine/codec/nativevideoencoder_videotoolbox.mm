@@ -156,7 +156,7 @@ NativeVideoEncoder::~NativeVideoEncoder() = default;
 
 std::unique_ptr<NativeVideoEncoder> NativeVideoEncoder::create(const Config& cfg, QString* error) {
     auto enc = std::unique_ptr<VideoToolboxEncoder>(new VideoToolboxEncoder());
-    const void* ek[] = {kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder};
+    const void* ek[] = {kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder};
     const void* ev[] = {kCFBooleanTrue};
     CFDictionaryRef spec = CFDictionaryCreate(kCFAllocatorDefault, ek, ev, 1,
                                               &kCFTypeDictionaryKeyCallBacks,

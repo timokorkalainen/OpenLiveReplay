@@ -22,6 +22,7 @@ private:
 
 AVFrame* TestNativeVideoEncoder::makeGreyFrame(int w, int h) {
     AVFrame* f = av_frame_alloc();
+    if (!f) return nullptr;
     f->format = AV_PIX_FMT_YUV420P;
     f->width = w;
     f->height = h;
