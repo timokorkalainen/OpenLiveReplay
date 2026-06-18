@@ -108,6 +108,17 @@ set_tests_properties(e2e_ndi_playback PROPERTIES
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
 
+add_test(NAME e2e_ndi_pipe
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_e2e_pipe.sh"
+        "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:record_harness>"
+        "$<TARGET_FILE:marker_yuv_probe>" "$<TARGET_FILE:play_harness>"
+        "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_pipe PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 300
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
     # before connect by reading the stream ID from a real accepted SRT socket.
