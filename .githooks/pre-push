@@ -137,7 +137,7 @@ else
     cmake --build "$TEST_BUILD_DIR"
     ctest --test-dir "$TEST_BUILD_DIR" --output-on-failure \
         --repeat until-pass:2 --parallel "$CTEST_JOBS" \
-        -LE 'sync-report|srt|native-apple-ingest|output-soak'
+        -LE 'sync-report|srt|native-apple-ingest|output-soak|ndi-output'
     echo "[pre-push] Full local CTest gate OK."
 fi
 

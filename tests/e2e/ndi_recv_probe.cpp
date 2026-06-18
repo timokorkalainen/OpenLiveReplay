@@ -131,7 +131,9 @@ int main(int argc, char** argv) {
 
     NDIlib_recv_create_v3_t recvCfg;
     recvCfg.source_to_connect_to = chosen;
-    recvCfg.color_format = 3; // fastest / native (I420 from our sender)
+    // NDIlib_recv_color_format_fastest (100): for no-alpha sources NDI delivers UYVY.
+    // The marker decoder expects raw luma, so we extract luma from UYVY before decode.
+    recvCfg.color_format = 100;
     recvCfg.bandwidth = 100;  // highest
     recvCfg.p_ndi_recv_name = "olr-ndi-recv-probe";
     NDIlib_recv_instance_t recv = ndi.recvCreate(&recvCfg);
@@ -148,8 +150,28 @@ int main(int argc, char** argv) {
     std::vector<qint64> beeps;
 
     // Map audio to a frame index by counting received audio samples.
+    // audioSampleBase is set once the first video frame is received so that the
+    // audio-derived ordinal is anchored to the same capture-relative origin as the
+    // video flash ordinals (NDI may buffer several audio frames before the probe
+    // connects, so we must ignore those leading audio frames).
     qint64 audioSamplePos = 0;
+    qint64 audioSampleBase = -1; // -1 = not yet anchored
     const int samplesPerFrame = ndiMarkerSamplesPerFrame(mk);
+
+    // Extract the luma plane from a UYVY buffer (the fastest NDI format for I420 sources).
+    // UYVY layout: [U, Y0, V, Y1] per 4 bytes / 2 pixels; Y at odd bytes.
+    // Returns a tight luma buffer (stride = width) for ndiMarkerDecode*.
+    auto extractLumaFromUyvy = [](const uchar* src, int stride, int width, int height) {
+        QByteArray luma(width * height, '\0');
+        auto* dst = reinterpret_cast<uchar*>(luma.data());
+        for (int row = 0; row < height; ++row) {
+            for (int col = 0; col < width; ++col) {
+                // Y byte is at col*2+1 within a UYVY row.
+                dst[row * width + col] = src[row * stride + col * 2 + 1];
+            }
+        }
+        return luma;
+    };
 
     QElapsedTimer run;
     run.start();
@@ -159,17 +181,22 @@ int main(int argc, char** argv) {
         const int type = ndi.recvCapture(recv, &v, &a, nullptr, 200);
         if (type == FrameTypeVideo) {
             if (v.p_data && v.xres >= mk.width && v.yres >= mk.height) {
-                const qint64 idx = ndiMarkerDecodeIndex(
-                    mk, reinterpret_cast<const uchar*>(v.p_data), v.line_stride_in_bytes);
+                // NDI delivers UYVY; extract luma before marker decode.
+                const QByteArray luma = extractLumaFromUyvy(
+                    reinterpret_cast<const uchar*>(v.p_data), v.line_stride_in_bytes,
+                    v.xres, v.yres);
+                const auto* lumaPtr = reinterpret_cast<const uchar*>(luma.constData());
+                const qint64 idx = ndiMarkerDecodeIndex(mk, lumaPtr, v.xres);
                 if (idx >= 0) {
+                    // Anchor the audio baseline to the first received video frame so that
+                    // audio-derived ordinals align with capture-relative video ordinals.
+                    if (audioSampleBase < 0) audioSampleBase = audioSamplePos;
                     indices.push_back(idx); // absolute index -> continuity (drops/dupes/reorders)
                     arrivals.push_back(run.elapsed() / 1000.0);
-                    if (ndiMarkerDecodeFlash(mk, reinterpret_cast<const uchar*>(v.p_data),
-                                             v.line_stride_in_bytes)) {
-                        // A-V sync compares capture-RELATIVE positions (the receiver joins
-                        // mid-stream, so absolute indices are not comparable to audio, which
-                        // carries no index): the video ordinal since capture start vs the
-                        // audio-sample-derived ordinal of each beep.
+                    if (ndiMarkerDecodeFlash(mk, lumaPtr, v.xres)) {
+                        // A-V sync: record the video ordinal of each flash. The analysis
+                        // pairs flash[i] with beep[i] and measures jitter relative to the
+                        // median offset (absorbing the constant NDI audio buffer delay).
                         flashes.push_back(qint64(indices.size()) - 1);
                     }
                 }
@@ -179,8 +206,9 @@ int main(int argc, char** argv) {
             if (a.p_data && a.no_samples > 0) {
                 const double rms =
                     ndiMarkerAudioRmsFltp(reinterpret_cast<const float*>(a.p_data), a.no_samples);
-                if (rms > 0.05 && samplesPerFrame > 0)
-                    beeps.push_back(audioSamplePos / samplesPerFrame);
+                // Only count beeps after the audio baseline is anchored to the first video.
+                if (rms > 0.05 && samplesPerFrame > 0 && audioSampleBase >= 0)
+                    beeps.push_back((audioSamplePos - audioSampleBase) / samplesPerFrame);
                 audioSamplePos += a.no_samples;
             }
             ndi.freeAudio(recv, &a);

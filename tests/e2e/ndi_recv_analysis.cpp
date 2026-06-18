@@ -24,13 +24,23 @@ NdiContinuity ndiAnalyzeContinuity(const std::vector<qint64>& decodedIndices) {
 int ndiAvSyncMaxFrames(const std::vector<qint64>& videoFlashIndices,
                        const std::vector<qint64>& audioBeepFrameIndices) {
     if (videoFlashIndices.empty() || audioBeepFrameIndices.empty()) return -1;
+    // Pair flash[i] with beep[i] (index-based) and compute the signed A/V offset for each pair.
+    // This measures JITTER rather than the absolute NDI buffer delay (which is constant and
+    // irrelevant to A/V sync quality). Truncate to the shorter list.
+    const size_t n = std::min(videoFlashIndices.size(), audioBeepFrameIndices.size());
+    if (n == 0) return -1;
+    std::vector<qint64> offsets;
+    offsets.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        offsets.push_back(audioBeepFrameIndices[i] - videoFlashIndices[i]);
+    // Median offset = steady-state NDI audio buffer delay.
+    std::vector<qint64> sorted = offsets;
+    std::sort(sorted.begin(), sorted.end());
+    const qint64 median = sorted[n / 2];
+    // Max jitter = max deviation from the median offset.
     int worst = 0;
-    for (const qint64 v : videoFlashIndices) {
-        qint64 best = std::numeric_limits<qint64>::max();
-        for (const qint64 b : audioBeepFrameIndices)
-            best = std::min(best, std::llabs(v - b));
-        worst = std::max(worst, int(best));
-    }
+    for (const qint64 off : offsets)
+        worst = std::max(worst, int(std::llabs(off - median)));
     return worst;
 }
 

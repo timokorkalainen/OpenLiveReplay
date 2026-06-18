@@ -73,6 +73,15 @@ target_include_directories(ndi_output_sender PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(ndi_output_sender PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
 
+add_test(NAME e2e_ndi_output
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
+        "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_output PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
     # before connect by reading the stream ID from a real accepted SRT socket.
