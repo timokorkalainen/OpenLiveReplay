@@ -18,7 +18,7 @@
 //
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
-//              farback
+//              farback | armedcut
 #include <QCoreApplication>
 #include <QTimer>
 #include <QList>
@@ -270,6 +270,29 @@ int main(int argc, char** argv) {
                 worker.seekTo(0);
             });
             QTimer::singleShot(4500, &app, finish);
+
+        } else if (scen == "armedcut") {
+            // Tier3 ARMED CUT: prove a recalled cut snaps to the target frame
+            // with NO gray flash and NO reposition fallback. Play from the head
+            // ~1s so the output cache holds real frames and a real frame has been
+            // delivered, snapshot the placeholder baseline, then arm a cut to the
+            // clip midpoint. The worker pre-rolls [target, target+span] into a
+            // private staging cache on its SECOND AVFormatContext and atomically
+            // promotes it at a scheduled output frame — the playhead re-bases to
+            // the target without ever invoking repositionTo. Continue ~3s through
+            // the cut. The gate: placeholderFramesDelta==0 (no flash) AND
+            // reposition==0 (the cut did NOT fall back to the coarse seek path).
+            transport.setSpeed(1.0);
+            transport.seek(0);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&, basePh]() {
+                *basePh = worker.outputStats().placeholderFrames;
+                const int64_t target = durMs / 2;
+                fprintf(stderr, "### armedcut basePh=%lld; arming cut to %lldms ###\n",
+                        (long long) *basePh, (long long) target);
+                worker.armNextCut(target);
+            });
+            QTimer::singleShot(4000, &app, finish);
 
         } else {
             fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());

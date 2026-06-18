@@ -345,6 +345,26 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    armedcut)
+        # Tier3 ARMED CUT (Tasks 9/10/12): a recalled cut must snap to the target
+        # frame with NO gray flash and NO reposition fallback. The worker pre-rolls
+        # the target window into a private staging cache on its SECOND
+        # AVFormatContext and atomically promotes it at a scheduled output frame —
+        # the playhead re-bases WITHOUT invoking repositionTo. Two hard gates:
+        #   placeholderFramesDelta==0  -> no gray painted across the cut
+        #   reposition==0              -> the cut fired (did NOT fall back to the
+        #                                 coarse repositionTo path)
+        # A non-zero reposition means the cut did not promote in time and the
+        # normal seek path serviced the jump — debug the schedule, do NOT loosen.
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut painted gray across the cut (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — cut flash"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -ne 0 ]; then
+            echo "FAIL: armedcut fell back to repositionTo (reposition=$reposition, expected 0) — cut did not fire in time"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1

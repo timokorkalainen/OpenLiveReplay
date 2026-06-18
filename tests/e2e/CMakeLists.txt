@@ -171,11 +171,20 @@ add_test(NAME e2e_play_seekflash
 add_test(NAME e2e_play_farback
     COMMAND bash "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" farback 2 23496)
+# Tier3 armed-cut gate (Tasks 9/10/12): arm a frame-perfect cut to the clip
+# midpoint mid-playback; the pre-roll bank stages the target window and the cut
+# atomically promotes it — placeholderFramesDelta==0 (no flash) AND reposition==0
+# (the cut fired, not the coarse seek fallback). Port 23498 (UDP 23499) is the
+# next clear port after farback (23496) and disjoint from the record/sync/
+# av-sync/native ranges.
+add_test(NAME e2e_play_armedcut
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut 2 23498)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
-    e2e_play_seekflash e2e_play_farback
+    e2e_play_seekflash e2e_play_farback e2e_play_armedcut
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180
