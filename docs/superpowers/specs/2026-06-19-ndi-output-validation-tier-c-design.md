@@ -93,26 +93,40 @@ ndi_output_sender (marker NDI source, 256x144 @30)            [tier a, reused]
 
 ## Metrics and thresholds (starting values — tune empirically against the real loopback)
 
-These are **starting** thresholds; the implementer runs the real loopback (the NDI runtime is
-present on the dev machine), records the observed numbers, and sets each threshold to pass cleanly
-with margin while still failing on catastrophic loss — exactly as tier (b) tuned its mux. Document
-the observed numbers and any change in the report.
+These were **starting** thresholds; the implementer ran the real loopback (the NDI runtime is
+present on the dev machine), recorded the observed numbers, and set each threshold to pass cleanly
+with margin while still failing on catastrophic loss — exactly as tier (b) tuned its mux. The
+**as-shipped** thresholds below reflect what the real loopback required (the driver comments carry
+the same rationale).
 
 **Stage A — recorded MKV (NDI ingest + record integrity), `MKVMARK` line:**
 - `reorders == 0` (strict — ordering preserved through ingest+record).
 - `maxGapFrames <= 2` (no single large skip).
-- `framesDecoded >= recSecs * 30 * 0.9` (the recorder ticks at 30 fps; a near-empty/failed record
-  fails).
-- **Coverage / catastrophic-loss gate:** `drops <= max(3, ceil(0.05 * framesDecoded))` — a clean
-  loopback rate-matches with only a few drops; a real ingest break (heavy NDI loss → the recorder
-  re-samples stale frames and the sender's counters go missing) drives `drops` far past 5% and
-  fails. `dupes` reported, not gated.
+- `framesDecoded >= (recSecs-1) * 30 * 0.9` (the recorder ticks at 30 fps; a near-empty/failed
+  record fails; the `-1` accounts for the `-ss 1` warmup trim below).
+- **Coverage / catastrophic-loss gate (as shipped):** `coverage = (framesDecoded - dupes) /
+  (lastIndex - firstIndex + 1) >= 0.65`. With `reorders == 0`, `framesDecoded - dupes` is the count
+  of **distinct** marker indices captured and `lastIndex - firstIndex + 1` is the span the source
+  advanced, so coverage is the fraction of source frames the recording actually preserved. A clean
+  rate-matched loopback covers ~0.77–0.94 (the symmetric phase-artifact dupes/drops do **not** lower
+  it); a real uniform ingest loss (e.g. 50%, recorded `0,0,2,2,4,4,…`) covers ~0.5 and fails.
+  (Started as a `drops <= 5%` ceiling, but that vacuously passes a 50% uniform loss —
+  `drops/framesDecoded ≈ 25%`, `maxGapFrames = 2` — so coverage replaced it.) `drops`/`dupes`
+  reported, not gated.
+- **Warmup trim:** the Stage-A decode uses `ffmpeg -ss 1` to drop ~8 NDI-connection-establishment
+  frames (all-bright luma ≈ 130 → decode to the all-ones index 16777215, a false reorder/gap); the
+  liveness floor is lowered in lockstep so the trim cannot hide real loss.
 
 **Stage B — NDI output (record → playback → out), `NDIRECV` + `COUNTERS` lines:**
 - `reorders == 0` (strict).
 - `maxGapFrames <= 3` (looser than Stage A — the floor/round phase artifact widens gaps slightly).
 - `framesReceived >= capSecs * 30 * 0.5` (liveness).
-- `avSyncMaxFrames in [0, 2]` (A-V locked; looser than tier b's `[0,1]` for the extra pipe jitter).
+- `avSyncMaxFrames` **reported, not gated** (only a dead-audio floor: `avSync >= 0`, i.e. beeps were
+  detected). The probe pairs the k-th flash with the k-th beep by **ordinal**, which is structurally
+  unreliable for arrival-anchored NDI-recorded MKVs (audio leads video ~1 flashPeriod, so the metric
+  clusters at multiples of 15 regardless of true sync); a fixed ceiling here would be a vacuous gate.
+  **Tier (b) gates real A-V sync** (`avSyncMaxFrames ∈ [0,1]`) on its PTS-aligned synthesized fixture,
+  where the ordinal pairing is valid — so A-V sync is meaningfully gated in the lane, just not here.
 - Worker `reposition == 0`, `audioPushes > 0`.
 - `drops`/`dupes` **reported, not gated to zero** — the recorder-round-PTS × output-floor-sampling
   phase artifact makes nonzero dupes/drops expected here (documented; tier b proved the transport
@@ -121,12 +135,14 @@ the observed numbers and any change in the report.
 ## Why this is non-vacuous
 
 A real regression still fails a **gated** metric, not just the reported diagnostics:
-- NDI ingest broken / heavy loss → Stage A `drops` ceiling and/or `framesDecoded` floor fail.
+- NDI ingest broken / heavy/uniform loss → Stage A coverage gate (`< 0.65`) and/or `framesDecoded`
+  floor fail. (Coverage, not a raw-drops ratio, because the recorder dupes lost frames — see above.)
 - Frames corrupted/reordered anywhere → `reorders > 0` (either stage) fails.
 - Playback stall / decoder hang / sink crash → Stage B `framesReceived` floor or `maxGapFrames`
-  fails; worker `reposition` storm or dead audio fails.
+  fails; worker `reposition` storm or dead audio (`audioPushes == 0`, or `avSync < 0` = no beeps) fails.
 - A scaled (resolution-corrupted) recording → the 256×144 ffprobe assertion fails before Stage A.
-- A-V drift through the pipe → `avSyncMaxFrames` fails.
+- A-V drift is gated in **tier (b)** (`avSyncMaxFrames ∈ [0,1]`, aligned fixture); tier (c) only
+  reports it (the ordinal flash/beep pairing is unreliable through the arrival-anchored pipe).
 The phase-artifact dupes/drops are the **only** thing not gated to zero, and tiers (a)/(b) already
 proved the transport and decode→output are frame-exact under controlled timing, so nothing real is
 hidden by reporting them here.
