@@ -88,8 +88,10 @@ The probe reports and the driver asserts (configurable via env, defaults shown):
   the steady window. Pass: `drops == 0 && dupes == 0 && reorders == 0`. (Startup/teardown
   frames outside the steady window are excluded.)
 - **A-V sync:** the audio beep aligns with its video flash within `|offset| <= 1` frame.
-- **Cadence:** no inter-arrival gap exceeds `2x` the nominal frame period, and the mean rate
-  is within a tolerance of nominal. Pass: `maxGapFrames <= 2 && meanRate within ±5%`.
+- **Cadence:** no inter-arrival gap exceeds `2x` the nominal frame period. Pass:
+  `maxGapFrames <= 2`. `meanRateHz` is reported for diagnostics but not asserted — a mean rate
+  over a short wall-clock capture window is itself jittery, so `maxGapFrames` carries the
+  cadence gate.
 - **Liveness:** received frame count is at least a floor for the run (a stalled/empty capture
   fails rather than trivially passing).
 
@@ -125,6 +127,34 @@ NDIRECV source=<name> framesReceived=<n> drops=<n> dupes=<n> reorders=<n> \
   for the smoke, env-overridable for a longer soak.
 - The probe's analysis functions (counter decode, continuity, A-V offset, cadence) are pure
   and unit-testable against synthetic captured-frame sequences, independent of the runtime.
+
+## Implementation notes and known limitations
+
+Refinements that emerged from running the real loopback (and were verified correct in review):
+
+- **Receive format is UYVY, not I420.** The probe requests NDI's fastest color format, which
+  for our no-alpha I420 source is delivered as UYVY. The probe extracts the luma byte
+  (`col*2+1`) into a tight plane before decoding the marker. Continuity is therefore a real
+  decode, not a vacuous always-zero.
+- **A-V sync is jitter around the median offset.** A buffered NDI receiver sees a stable
+  audio-vs-video pipeline latency (a constant offset of ~14–16 frames); that is not desync.
+  The metric subtracts the median signed offset and reports the max deviation, so a locked
+  feed scores 0 and only genuine drift counts. Pinned by `tst_ndirecvanalysis`.
+- **Continuity over-reports drops when a reorder occurs.** A single out-of-order frame
+  registers as one reorder plus the forward-jump drops it implies. Harmless for the gate
+  (all of drops/dupes/reorders must be 0 to pass), but the `drops` number overstates true
+  loss for diagnosis when reorders are present.
+
+Known limitation / follow-up:
+
+- **A-V beep↔flash pairing assumes 1:1, in-order chunking.** The probe pairs the kth video
+  flash with the kth audio beep (RMS over each received audio frame). It relies on the
+  receiver getting one audio frame per video frame, which holds for our sink + loopback but
+  is not guaranteed by NDI: under audio re-chunking a beep could be double-counted or diluted
+  below the RMS threshold, desynchronizing the pairing. This can only produce a false FAIL
+  (never a vacuous pass), so the gate stays trustworthy; a follow-up should match beeps to
+  flashes by audio sample position (or detect beep onsets) instead of by ordinal to remove the
+  flakiness risk on a loaded self-hosted runner.
 
 ## File summary
 

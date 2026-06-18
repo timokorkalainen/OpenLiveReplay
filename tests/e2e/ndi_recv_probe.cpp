@@ -208,6 +208,11 @@ int main(int argc, char** argv) {
                 const double rms =
                     ndiMarkerAudioRmsFltp(reinterpret_cast<const float*>(a.p_data), a.no_samples);
                 // Only count beeps after the audio baseline is anchored to the first video.
+                // NOTE: this assumes one audio frame per video frame (true for our sink +
+                // loopback). Under NDI audio re-chunking a beep could be double-counted or
+                // diluted below threshold, desyncing the flash<->beep pairing; that can only
+                // cause a false FAIL, never a vacuous pass. Follow-up: match beeps to flashes
+                // by sample position / onset rather than by ordinal.
                 if (rms > 0.05 && samplesPerFrame > 0 && audioSampleBase >= 0)
                     beeps.push_back((audioSamplePos - audioSampleBase) / samplesPerFrame);
                 audioSamplePos += a.no_samples;
