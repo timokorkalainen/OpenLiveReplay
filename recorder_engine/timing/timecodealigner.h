@@ -31,6 +31,13 @@ public:
     // (B leads -> positive). 0 if either lacks TC.
     int64_t frameOffset(int sourceIndexA, int sourceIndexB) const;
 
+    // The earliest anchored timecode across all sources, as a 100 ns offset since
+    // midnight (the inverse of what observe() stored). Returns true and writes
+    // `out` when at least one source has carried TC; false (and leaves `out`
+    // untouched) when none has. Used to derive the session's start timecode for
+    // the muxer's tmcd/timecode tag.
+    bool firstTimecode100ns(int64_t& out) const;
+
     void reset();
 
 private:

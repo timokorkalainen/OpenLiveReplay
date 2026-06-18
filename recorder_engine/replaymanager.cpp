@@ -241,6 +241,32 @@ void ReplayManager::startRecording() {
     m_sessionFileName = m_baseFileName + "_" + timestamp;
     m_muxer->setOutputDirectory(m_outputDir);
 
+    // Reset the inter-camera aligner for this fresh session (drops any anchors
+    // carried over from a previous recording).
+    m_tcAligner.reset();
+
+    // Derive the session start timecode for the muxer's tmcd/timecode tag from the
+    // first source that has carried TC, formatted via Smpte12m::format.
+    //
+    // TIMING (muxer lifecycle): init() writes the MKV header HERE — and the
+    // matroska muxer materialises the "timecode" tag INTO that header — before any
+    // StreamWorker runs. Matroska header tags cannot be amended once the header is
+    // written, and the muxer is never re-init'd, so the tag can only be set at this
+    // single point. Because no per-frame TC has been observed yet at start (the
+    // aligner was just reset), firstTimecode100ns() returns false on the live cold
+    // start → startTc is empty → no tag (a no-TC recording stays byte-identical).
+    // The tag is written only when a start TC is known up front; the muxer's
+    // tag-writing path itself is covered by tst_muxer's TC tests.
+    QString startTc;
+    int64_t startTc100ns = -1;
+    if (m_tcAligner.firstTimecode100ns(startTc100ns)) {
+        const Smpte12mTimecode tc =
+            Smpte12m::from100ns(startTc100ns, Smpte12m::kTimecodeNominalFps);
+        char buf[12];
+        Smpte12m::format(tc, buf);
+        startTc = QString::fromLatin1(buf);
+    }
+
     if (m_videoCodec == VideoCodecChoice::H264Hardware) {
         // H.264 path: prime the blue encoder FIRST to obtain avcC extradata,
         // then pass it to Muxer::init so the container header includes it.
@@ -251,9 +277,10 @@ void ReplayManager::startRecording() {
         }
         const bool muxerReady = m_telemetryFeedIds.isEmpty()
             ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            48000, 2, m_videoCodec, m_videoExtradata)
+                            48000, 2, m_videoCodec, m_videoExtradata, startTc)
             : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec, m_videoExtradata);
+                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec, m_videoExtradata,
+                            startTc);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer (H.264) with base name" << m_sessionFileName;
             cleanupBlueEncoder();
@@ -263,9 +290,9 @@ void ReplayManager::startRecording() {
         // MPEG-2 path (unchanged): init muxer first, then blue encoder.
         const bool muxerReady = m_telemetryFeedIds.isEmpty()
             ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            48000, 2, m_videoCodec)
+                            48000, 2, m_videoCodec, {}, startTc)
             : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec);
+                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec, {}, startTc);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
             return;

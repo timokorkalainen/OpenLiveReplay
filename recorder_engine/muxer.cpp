@@ -3,22 +3,41 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QDebug>
+#include <QRegularExpression>
 
 Muxer::Muxer() {}
 
 Muxer::~Muxer() { close(); }
 
+namespace {
+// True iff `tc` is a well-formed SMPTE timecode "HH:MM:SS:FF" (or ';' before the
+// frames field for drop-frame). Empty/malformed -> false, so no tag is written
+// and a no-TC recording stays byte-identical. Deliberately a shape check only;
+// the caller has already chosen the value.
+bool isWellFormedTimecode(const QString& tc) {
+    static const QRegularExpression re(QStringLiteral("^\\d{2}:\\d{2}:\\d{2}[:;]\\d{2}$"));
+    return re.match(tc).hasMatch();
+}
+} // namespace
+
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
                  int audioSampleRate, int audioChannels,
-                 VideoCodecChoice codec, const QByteArray& videoExtradata) {
+                 VideoCodecChoice codec, const QByteArray& videoExtradata, const QString& startTimecode) {
     return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate, audioChannels,
-                codec, videoExtradata);
+                codec, videoExtradata, startTimecode);
+}
+
+bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps,
+                 const QStringList& streamNames, int audioSampleRate, int audioChannels,
+                 const QString& startTimecode) {
+    return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate,
+                audioChannels, VideoCodecChoice::Mpeg2Software, {}, startTimecode);
 }
 
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
                  const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
                  int audioSampleRate, int audioChannels,
-                 VideoCodecChoice codec, const QByteArray& videoExtradata) {
+                 VideoCodecChoice codec, const QByteArray& videoExtradata, const QString& startTimecode) {
     QMutexLocker locker(&m_mutex);
     Q_UNUSED(streamNames);
 
@@ -32,6 +51,12 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     if (width <= 0) width = 1920;
     if (height <= 0) height = 1080;
     if (fps <= 0) fps = 30;
+
+    // Session start timecode -> standard FFmpeg "timecode" tag (output + each
+    // video track). Empty or malformed leaves it unset so a no-TC recording is
+    // byte-identical to before (no tag, same tracks).
+    const QByteArray timecodeTag =
+        isWellFormedTimecode(startTimecode) ? startTimecode.toUtf8() : QByteArray();
 
     // 1. Create Format Context for Matroska
     m_activePath = getVideoPath(filename);
@@ -93,6 +118,11 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         // Always name video tracks generically: "Track 1", "Track 2", ...
         const QString trackTitle = QString("Track %1").arg(i + 1);
         av_dict_set(&st->metadata, "title", trackTitle.toUtf8().constData(), 0);
+
+        // Per-track session start timecode (only when a valid TC was supplied).
+        if (!timecodeTag.isEmpty()) {
+            av_dict_set(&st->metadata, "timecode", timecodeTag.constData(), 0);
+        }
     }
 
     // 2a. Add one audio track per video track (PCM S16LE, 48 kHz stereo)
@@ -155,6 +185,13 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     // 3b. Store recording start time metadata (UTC ISO-8601)
     const QString startIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     av_dict_set(&m_outCtx->metadata, "recording_start_time", startIso.toUtf8().constData(), 0);
+
+    // 3c. Session start timecode -> output-level "timecode" tag. libavformat's
+    // matroska muxer materialises this into the MKV. Only when a valid TC was
+    // supplied (empty/malformed -> no tag, no regression).
+    if (!timecodeTag.isEmpty()) {
+        av_dict_set(&m_outCtx->metadata, "timecode", timecodeTag.constData(), 0);
+    }
 
     // 4. Open file and write header
     if (!(m_outCtx->oformat->flags & AVFMT_NOFILE)) {

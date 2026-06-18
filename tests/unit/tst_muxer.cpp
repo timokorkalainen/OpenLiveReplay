@@ -27,6 +27,9 @@ private slots:
     void initFailureResetsTelemetryTrackState();
     void writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed();
     void initFailsForH264WithoutExtradata();
+    void initWritesTimecodeTagWhenStartTimecodeGiven();
+    void initWritesNoTimecodeTagWhenStartTimecodeEmpty();
+    void initIgnoresMalformedStartTimecode();
 
 private:
     QTemporaryDir m_home;
@@ -273,6 +276,110 @@ void TestMuxer::initFailsForH264WithoutExtradata() {
     // H.264 requires avcC extradata; empty must be rejected, not silently accepted.
     QVERIFY(!m.init(QStringLiteral("olr_unit_h264_noextradata"), 1, 320, 240, 30, names,
                     48000, 2, VideoCodecChoice::H264Hardware, QByteArray()));
+}
+
+void TestMuxer::initWritesTimecodeTagWhenStartTimecodeGiven() {
+    QVERIFY(m_home.isValid());
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QStringList names{QStringLiteral("A"), QStringLiteral("B")};
+    const QString startTc = QStringLiteral("01:00:00:05");
+
+    // Two video tracks; pass a valid HH:MM:SS:FF start timecode.
+    QVERIFY(
+        m.init(QStringLiteral("olr_unit_tc_present"), 2, 320, 240, 30, names, 48000, 2, startTc));
+    // Write at least one packet so the MKV is well-formed when reopened (an empty
+    // cluster-less file the demuxer cannot re-parse otherwise — not a TC concern).
+    m.writeMetadataPacket(0, 0, QByteArrayLiteral("{}"));
+    m.close();
+
+    const QFileInfo fi(videoPathFor(QStringLiteral("olr_unit_tc_present")));
+    QVERIFY2(fi.exists(), qPrintable("expected output at " + fi.filePath()));
+    QVERIFY(fi.size() > 0);
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray filePath = fi.filePath().toUtf8();
+    QVERIFY(avformat_open_input(&ctx, filePath.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+
+    // The Matroska muxer materialises the format-level "timecode" tag.
+    AVDictionaryEntry* fmtTc = av_dict_get(ctx->metadata, "timecode", nullptr, 0);
+    QVERIFY2(fmtTc != nullptr, "expected a format-level timecode tag");
+    QCOMPARE(QString::fromUtf8(fmtTc->value), startTc);
+
+    // Each video track also carries the timecode tag.
+    int videoTracksWithTc = 0;
+    for (unsigned int i = 0; i < ctx->nb_streams; ++i) {
+        AVStream* st = ctx->streams[i];
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+        AVDictionaryEntry* tc = av_dict_get(st->metadata, "timecode", nullptr, 0);
+        QVERIFY2(tc != nullptr, "expected a per-video-track timecode tag");
+        QCOMPARE(QString::fromUtf8(tc->value), startTc);
+        ++videoTracksWithTc;
+    }
+    QCOMPARE(videoTracksWithTc, 2);
+}
+
+void TestMuxer::initWritesNoTimecodeTagWhenStartTimecodeEmpty() {
+    QVERIFY(m_home.isValid());
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QStringList names{QStringLiteral("A")};
+
+    // Empty start timecode (the default) must produce NO timecode tag anywhere —
+    // a no-TC recording is otherwise unchanged.
+    QVERIFY(
+        m.init(QStringLiteral("olr_unit_tc_absent"), 1, 320, 240, 30, names, 48000, 2, QString()));
+    m.writeMetadataPacket(0, 0, QByteArrayLiteral("{}"));
+    m.close();
+
+    const QFileInfo fi(videoPathFor(QStringLiteral("olr_unit_tc_absent")));
+    QVERIFY2(fi.exists(), qPrintable("expected output at " + fi.filePath()));
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray filePath = fi.filePath().toUtf8();
+    QVERIFY(avformat_open_input(&ctx, filePath.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+
+    QVERIFY2(av_dict_get(ctx->metadata, "timecode", nullptr, 0) == nullptr,
+             "no format-level timecode tag expected for a no-TC recording");
+    for (unsigned int i = 0; i < ctx->nb_streams; ++i) {
+        AVStream* st = ctx->streams[i];
+        QVERIFY2(av_dict_get(st->metadata, "timecode", nullptr, 0) == nullptr,
+                 "no per-track timecode tag expected for a no-TC recording");
+    }
+}
+
+void TestMuxer::initIgnoresMalformedStartTimecode() {
+    QVERIFY(m_home.isValid());
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QStringList names{QStringLiteral("A")};
+
+    // A malformed start timecode must be treated as "no TC" — no tag, no regression.
+    QVERIFY(m.init(QStringLiteral("olr_unit_tc_malformed"), 1, 320, 240, 30, names, 48000, 2,
+                   QStringLiteral("not-a-timecode")));
+    m.writeMetadataPacket(0, 0, QByteArrayLiteral("{}"));
+    m.close();
+
+    const QFileInfo fi(videoPathFor(QStringLiteral("olr_unit_tc_malformed")));
+    QVERIFY2(fi.exists(), qPrintable("expected output at " + fi.filePath()));
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray filePath = fi.filePath().toUtf8();
+    QVERIFY(avformat_open_input(&ctx, filePath.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+
+    QVERIFY2(av_dict_get(ctx->metadata, "timecode", nullptr, 0) == nullptr,
+             "malformed start timecode must not write a format-level tag");
+    for (unsigned int i = 0; i < ctx->nb_streams; ++i) {
+        AVStream* st = ctx->streams[i];
+        QVERIFY2(av_dict_get(st->metadata, "timecode", nullptr, 0) == nullptr,
+                 "malformed start timecode must not write a per-track tag");
+    }
 }
 
 QTEST_GUILESS_MAIN(TestMuxer)

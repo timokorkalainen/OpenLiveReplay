@@ -32,11 +32,24 @@ public:
 
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
              int audioSampleRate = 48000, int audioChannels = 2,
-             VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, const QByteArray& videoExtradata = {});
+             VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, const QByteArray& videoExtradata = {},
+             const QString& startTimecode = QString());
+    // Convenience overload carrying ONLY the session start timecode (default
+    // codec). startTimecode is REQUIRED here (no default) so this 9-arg form is
+    // distinct from the codec-tail overload above (whose 9th positional arg is a
+    // VideoCodecChoice, not a QString): an 8-arg call still resolves to the
+    // codec-tail overload, a 9-arg call with a QString resolves here. When
+    // startTimecode is a valid "HH:MM:SS[:;]FF" it is written as the standard
+    // FFmpeg "timecode" tag on the output and each video track; empty or
+    // malformed -> no tag (a no-TC recording is byte-identical to before).
+    bool init(const QString& filename, int videoTrackCount, int width, int height, int fps,
+              const QStringList& streamNames, int audioSampleRate, int audioChannels,
+              const QString& startTimecode);
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
              const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
              int audioSampleRate = 48000, int audioChannels = 2,
-             VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, const QByteArray& videoExtradata = {});
+             VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, const QByteArray& videoExtradata = {},
+             const QString& startTimecode = QString());
     void writePacket(AVPacket* pkt);
     void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     void writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);

@@ -79,6 +79,25 @@ bool TimecodeAligner::sourcesAligned(int sourceIndexA, int sourceIndexB,
     return absOff <= toleranceFrames;
 }
 
+bool TimecodeAligner::firstTimecode100ns(int64_t& out) const
+{
+    bool found = false;
+    int64_t earliestFrames = 0;
+    for (int i = 0; i < kMaxSources; ++i) {
+        if (!m_anchors[i].set)
+            continue;
+        if (!found || m_anchors[i].tcFrames < earliestFrames) {
+            earliestFrames = m_anchors[i].tcFrames;
+            found = true;
+        }
+    }
+    if (!found)
+        return false;
+    // Inverse of tcFramesFrom100ns: frames * 1e7 / fps.
+    out = earliestFrames * 10'000'000 / m_nominalFps;
+    return true;
+}
+
 void TimecodeAligner::reset()
 {
     for (int i = 0; i < kMaxSources; ++i)
