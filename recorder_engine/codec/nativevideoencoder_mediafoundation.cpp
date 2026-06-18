@@ -633,6 +633,24 @@ bool MediaFoundationEncoder::buildInputSample(const AVFrame* frame, int64_t ptsT
     // Remember the caller's opaque ptsTicks keyed by the stamp so the output can
     // echo it back per the interface contract.
     m_ptsByMfTime.insert(stampedTime, ptsTicks);
+    // Bound the map: for all-intra monotonic-PTS streams the encoder emits output
+    // in input order, so any entry whose stamp is strictly less than the stamp we
+    // just inserted can never match a future output sample. Cap at 64 in-flight
+    // entries; evict the stalest (smallest-key) entries until within the cap.
+    // This prevents unbounded growth when the encoder occasionally produces an
+    // output whose sample time doesn't match any stamped input (latent leak over
+    // a long recording).
+    constexpr int kMaxInFlight = 64;
+    while (m_ptsByMfTime.size() > kMaxInFlight) {
+        // QHash has no ordered iteration, but stampedTime is strictly increasing
+        // (m_nextSampleTime advances monotonically). Find and evict the entry
+        // with the smallest key (furthest behind the current stamp).
+        auto minIt = m_ptsByMfTime.begin();
+        for (auto it = m_ptsByMfTime.begin(); it != m_ptsByMfTime.end(); ++it) {
+            if (it.key() < minIt.key()) minIt = it;
+        }
+        m_ptsByMfTime.erase(minIt);
+    }
     *sample = createdSample;
     return true;
 }
@@ -642,6 +660,13 @@ int64_t MediaFoundationEncoder::resolvePtsTicks(LONGLONG sampleTime) {
     if (it != m_ptsByMfTime.constEnd()) {
         const int64_t ticks = it.value();
         m_ptsByMfTime.erase(it);
+        // Evict any entries with a stamp strictly less than sampleTime: for an
+        // all-intra, monotonic-PTS stream they can never match a future output.
+        QList<LONGLONG> stale;
+        for (auto jt = m_ptsByMfTime.constBegin(); jt != m_ptsByMfTime.constEnd(); ++jt) {
+            if (jt.key() < sampleTime) stale.append(jt.key());
+        }
+        for (LONGLONG k : stale) m_ptsByMfTime.remove(k);
         return ticks;
     }
     // No mapping (encoder produced an unexpected timestamp): fall back to the MF

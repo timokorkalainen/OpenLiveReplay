@@ -56,6 +56,11 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
                                      ? AV_CODEC_ID_H264
                                      : AV_CODEC_ID_MPEG2VIDEO;
         if (codec == VideoCodecChoice::H264Hardware) {
+            // Invariant: videoExtradata is guaranteed non-empty by the up-front
+            // guard at the top of init() (which returns false for H264Hardware
+            // with empty extradata), so no emptiness re-check is needed here.
+            // H.264 requires avcC (AVCDecoderConfigurationRecord) as CodecPrivate
+            // in Matroska; MPEG-2 does not attach extradata and omits this block.
             st->codecpar->extradata = static_cast<uint8_t*>(
                 av_mallocz(videoExtradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
             if (!st->codecpar->extradata) {

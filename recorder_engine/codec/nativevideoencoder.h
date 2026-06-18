@@ -43,6 +43,12 @@ public:
     virtual bool encode(const AVFrame* frame, int64_t ptsTicks,
                         const PacketCallback& onPacket, QString* error) = 0;
     virtual bool flush(const PacketCallback& onPacket, QString* error) = 0;
+    // Returns the avcC (AVCDecoderConfigurationRecord) blob for the current
+    // encoding session. PRECONDITION: at least one successful encode() call must
+    // have completed before avccExtradata() returns a valid (non-empty) result.
+    // The SPS/PPS are derived from the first encoded frame's output; before that
+    // call the encoder has not yet negotiated its output type and this returns an
+    // empty QByteArray.
     virtual QByteArray avccExtradata() const = 0;
 
 protected:

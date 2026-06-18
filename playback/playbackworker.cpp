@@ -583,6 +583,10 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     av_frame_free(&nativeVf);
                 };
 
+                // All-intra invariant: each access unit decodes to exactly one
+                // keyframe, so handleFrame is called once per unit and the
+                // per-frame decimateCounter/lastVideoPtsMs advancement matches
+                // the FFmpeg path's per-receive_frame loop.
                 track->nativeDecoder->decode(unit, handleFrame, nullptr);
             }
             return lastVideoPtsMs;
@@ -956,7 +960,7 @@ void PlaybackWorker::run() {
                 providerIndex++;
                 qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider"
                          << (providerIndex - 1);
-                } // closes software_decode block
+                }
             }
         }
 
