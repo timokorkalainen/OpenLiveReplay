@@ -14,6 +14,7 @@
 #include "settingsmanager.h"
 #include "project/projectsettingsimporter.h"
 #include "recorder_engine/replaymanager.h"
+#include "recorder_engine/codec/videocodecchoice.h"
 #include "recorder_engine/ingest/ingestsession.h"
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
@@ -39,6 +40,7 @@ class UIManager : public QObject {
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
+    Q_PROPERTY(QString recordCodec READ recordCodec WRITE setRecordCodec NOTIFY recordCodecChanged)
     Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs
                    NOTIFY audioOutputLatencyChanged)
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
@@ -108,6 +110,7 @@ public:
     QString fileName() const;
     int recordWidth() const;
     int recordHeight() const;
+    QString recordCodec() const;
     int recordFps() const;
     int recordFpsNumerator() const;
     int recordFpsDenominator() const;
@@ -165,6 +168,7 @@ public:
     void setFileName(const QString &name);
     void setRecordWidth(int width);
     void setRecordHeight(int height);
+    void setRecordCodec(const QString& codec);
     void setRecordFps(int fps);
     Q_INVOKABLE void setRecordFrameRate(int numerator, int denominator);
     void setMultiviewCount(int count);
@@ -266,6 +270,7 @@ signals:
     void fileNameChanged();
     void recordWidthChanged();
     void recordHeightChanged();
+    void recordCodecChanged();
     void recordFpsChanged();
     void audioOutputLatencyChanged();
     void multiviewCountChanged();

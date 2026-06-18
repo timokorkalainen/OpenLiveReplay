@@ -1333,6 +1333,19 @@ void UIManager::setRecordHeight(int height) {
     }
 }
 
+QString UIManager::recordCodec() const {
+    return videoCodecToString(m_currentSettings.videoCodec);
+}
+
+void UIManager::setRecordCodec(const QString& codec) {
+    const VideoCodecChoice next = videoCodecFromString(codec, m_currentSettings.videoCodec);
+    if (m_currentSettings.videoCodec != next) {
+        m_currentSettings.videoCodec = next;
+        m_replayManager->setVideoCodec(next);
+        emit recordCodecChanged();
+    }
+}
+
 void UIManager::setRecordFps(int fps) {
     setRecordFrameRate(fps, 1);
 }
@@ -2116,6 +2129,7 @@ void UIManager::loadSettings() {
         m_replayManager->setBaseFileName(m_currentSettings.fileName);
         m_replayManager->setVideoWidth(m_currentSettings.videoWidth);
         m_replayManager->setVideoHeight(m_currentSettings.videoHeight);
+        m_replayManager->setVideoCodec(m_currentSettings.videoCodec);
         m_replayManager->setFps(m_currentSettings.fps);
         m_currentSettings.multiviewCount = qBound(1, m_currentSettings.multiviewCount, 16);
         ensureSourceEnabledSize();
