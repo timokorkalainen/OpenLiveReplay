@@ -11,6 +11,12 @@
 // Usage:
 //   record_harness --url <url> --name <base> --seconds <n>
 //                  [--width W] [--height H] [--fps F]
+//                  [--codec mpeg2|h264]
+//
+// Special mode:
+//   record_harness --probe-codec-caps
+//       Prints "h264=1" or "h264=0" and exits immediately (no recording).
+//       Driver scripts use this to SKIP when hardware H.264 is unavailable.
 #include <QCoreApplication>
 #include <QTimer>
 #include <QString>
@@ -20,6 +26,8 @@
 #include <cstdlib>
 
 #include "recorder_engine/replaymanager.h"
+#include "recorder_engine/codec/nativevideoencoder.h"
+#include "recorder_engine/codec/videocodecchoice.h"
 
 namespace {
 QString argValue(const QStringList& args, const QString& flag, const QString& fallback) {
@@ -42,6 +50,17 @@ int main(int argc, char** argv) {
         qInstallMessageHandler(stderrMessageHandler);
     }
 
+    // --probe-codec-caps: print hardware codec availability and exit immediately.
+    // Driver scripts source this to implement SKIP gates.
+    if (args.contains(QStringLiteral("--probe-codec-caps"))) {
+        const NativeVideoEncodeCapabilities caps = queryNativeVideoEncodeCapabilities();
+        printf("h264=%d\n", caps.h264 ? 1 : 0);
+        if (!caps.detail.isEmpty())
+            fprintf(stderr, "record_harness: codec caps detail: %s\n", qPrintable(caps.detail));
+        fflush(stdout);
+        return 0;
+    }
+
     const QString url = argValue(args, QStringLiteral("--url"), QString());
     const QString name = argValue(args, QStringLiteral("--name"), QStringLiteral("olr_e2e"));
     const int seconds = argValue(args, QStringLiteral("--seconds"), QStringLiteral("6")).toInt();
@@ -52,6 +71,16 @@ int main(int argc, char** argv) {
     // Muxer::setOutputDirectory); the driver points it at a temp dir so the
     // test is hermetic. Empty -> engine default (~/Documents/videos).
     const QString outdir = argValue(args, QStringLiteral("--outdir"), QString());
+
+    // Codec selection: --codec h264|mpeg2, or OLR_RECORD_CODEC env var.
+    // Default is mpeg2 (historical behaviour, keeps existing tests unchanged).
+    QString codecStr = argValue(args, QStringLiteral("--codec"), QString());
+    if (codecStr.isEmpty()) {
+        if (const char* env = std::getenv("OLR_RECORD_CODEC"))
+            codecStr = QString::fromLatin1(env);
+    }
+    const VideoCodecChoice codec = videoCodecFromString(
+        codecStr, VideoCodecChoice::Mpeg2Software);
 
     if (url.isEmpty()) {
         fprintf(stderr, "record_harness: --url is required\n");
@@ -93,6 +122,7 @@ int main(int argc, char** argv) {
     rm.setVideoWidth(width);
     rm.setVideoHeight(height);
     rm.setFps(fps);
+    rm.setVideoCodec(codec);
 
     rm.startRecording();
     if (!rm.isRecording()) {

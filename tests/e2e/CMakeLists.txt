@@ -115,6 +115,21 @@ set_tests_properties(e2e_record_stereo e2e_record_mono PROPERTIES
     TIMEOUT 120
     RUN_SERIAL TRUE)  # they bind UDP/SRT ports + drive ffmpeg; don't overlap
 
+# Hardware H.264 recording smoke: records via the H.264Hardware codec path
+# (VideoToolbox / MediaFoundation), then asserts the output MKV has an h264
+# stream, every packet is a keyframe (all-intra), stereo audio, and non-trivial
+# content (RMS > -60 dB). SKIP-return-code 77 so the test skips cleanly on CI
+# runners without a hardware H.264 encoder. Ports 23462 (SRT) / 23463 (UDP) are
+# clear of all other port ranges.
+set(_h264_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_h264_e2e.sh")
+add_test(NAME e2e_h264_record_smoke
+    COMMAND bash "${_h264_driver}" "$<TARGET_FILE:record_harness>" 23462)
+set_tests_properties(e2e_h264_record_smoke PROPERTIES
+    LABELS "e2e;h264"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 # Playback acceptance matrix (spec §11.5) as CTest cases. Each records a fresh
 # multi-track fixture (over the native srt:// ingest, via an ffmpeg->UDP->SRT
 # bridge in run_playback_e2e.sh), drives the real PlaybackWorker through one
