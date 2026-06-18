@@ -217,7 +217,7 @@ if(NOT WIN32)
     target_link_directories(olr_test_playback PUBLIC "${OLR_FFMPEG_LIBDIR}")
 endif()
 target_link_libraries(olr_test_playback
-    PUBLIC olr_test_core Qt6::Core Qt6::Multimedia Qt6::Gui
+    PUBLIC olr_test_engine Qt6::Core Qt6::Multimedia Qt6::Gui
            "${OLR_FFMPEG_AVFORMAT_LIBRARY}" "${OLR_FFMPEG_AVCODEC_LIBRARY}"
            "${OLR_FFMPEG_AVUTIL_LIBRARY}" "${OLR_FFMPEG_SWSCALE_LIBRARY}"
            "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"

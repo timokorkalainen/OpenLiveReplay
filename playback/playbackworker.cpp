@@ -509,6 +509,84 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
     for (auto* track : m_decoderBank) {
         if (pkt->stream_index != track->streamIndex) continue;
 
+        // H.264 tracks use NativeVideoDecoder (hardware); all others use FFmpeg.
+        if (track->nativeDecoder) {
+            // Convert avcC length-prefixed packet → Annex B for the decoder.
+            QByteArray annexB;
+            const uint8_t* p = pkt->data;
+            const uint8_t* end = p + pkt->size;
+            static const char kStartCode[4] = {'\x00', '\x00', '\x00', '\x01'};
+            while (p + 4 <= end) {
+                const uint32_t nalLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16)
+                                      | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+                p += 4;
+                if (nalLen == 0 || p + nalLen > end) break;
+                annexB.append(kStartCode, 4);
+                annexB.append(reinterpret_cast<const char*>(p), int(nalLen));
+                p += nalLen;
+            }
+            if (!annexB.isEmpty()) {
+                AVRational tb = m_fmtCtx->streams[track->streamIndex]->time_base;
+                const int64_t pktPts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+
+                CompressedAccessUnit unit;
+                unit.codec = NativeVideoCodec::H264;
+                unit.parameterSets = track->h264ParamSets;
+                unit.pts90k = (pktPts != AV_NOPTS_VALUE)
+                    ? av_rescale_q(pktPts, tb, {1, 90000}) : -1;
+                unit.dts90k = (pkt->dts != AV_NOPTS_VALUE)
+                    ? av_rescale_q(pkt->dts, tb, {1, 90000}) : -1;
+                unit.annexB = annexB;
+
+                // Count-based decimation applies per decoded frame.
+                auto handleFrame = [&](AVFrame* nativeVf) {
+                    bool keep = true;
+                    if (decimate) {
+                        keep = (track->decimateCounter % decimateStep) == 0;
+                        track->decimateCounter++;
+                    }
+                    if (!keep) {
+                        av_frame_free(&nativeVf);
+                        return;
+                    }
+
+                    // Restore PTS in ms from the packet's time_base.
+                    int64_t framePtsMs;
+                    if (pktPts != AV_NOPTS_VALUE) {
+                        framePtsMs = av_rescale_q(pktPts, tb, {1, 1000});
+                    } else {
+                        framePtsMs = (lastVideoPtsMs != INT64_MIN) ? lastVideoPtsMs + frameDurMs() : P;
+                    }
+
+                    if (dedupTail) {
+                        int64_t nv;
+                        {
+                            QMutexLocker bufferLocker(&m_bufferMutex);
+                            nv = track->buffer.newestPts();
+                        }
+                        if (nv >= 0 && framePtsMs <= nv) {
+                            av_frame_free(&nativeVf);
+                            return;
+                        }
+                    }
+
+                    MediaVideoFrame mediaFrame = convertToMediaVideoFrame(nativeVf, track->feedIndex);
+                    mediaFrame.ptsMs = framePtsMs;
+                    if (mediaFrame.isValid()) {
+                        QMutexLocker bufferLocker(&m_bufferMutex);
+                        if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
+                            m_counters.framesDropped++;
+                        if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
+                    }
+                    lastVideoPtsMs = framePtsMs;
+                    av_frame_free(&nativeVf);
+                };
+
+                track->nativeDecoder->decode(unit, handleFrame, nullptr);
+            }
+            return lastVideoPtsMs;
+        }
+
         // Count-based decimation: keep every decimateStep-th decoded frame.
         // The keep-counter is per-track and advances per decoded *frame*, so a
         // DTS-bumped on-disk PTS lattice is irrelevant (spec §6.3).
@@ -777,6 +855,72 @@ void PlaybackWorker::run() {
                 // Safety: Don't exceed the number of providers we have in the UI
                 if (providerIndex >= m_providers.size()) break;
 
+                // H.264: use hardware NativeVideoDecoder (licensing constraint).
+                // MPEG-2 and all other codecs: FFmpeg software decoder.
+                const bool isH264 = (codecParams->codec_id == AV_CODEC_ID_H264);
+                if (isH264 && queryNativeVideoDecodeCapabilities().h264
+                    && codecParams->extradata_size >= 8) {
+                    // Parse avcC extradata → SPS/PPS NAL payloads (raw, no start codes).
+                    // Layout: [0]=0x01 [1..3]=profile/compat/level [4]=0xFF
+                    //         [5]=0xE0|numSPS  then numSPS*(2B length + payload)
+                    //         then 1B numPPS   then numPPS*(2B length + payload)
+                    H26xParameterSets params;
+                    bool parseOk = true;
+                    const uint8_t* ed = codecParams->extradata;
+                    const int edSize = codecParams->extradata_size;
+                    int off = 5;
+                    const int numSps = off < edSize ? (ed[off] & 0x1f) : 0;
+                    off++;
+                    for (int s = 0; s < numSps && parseOk; ++s) {
+                        if (off + 2 > edSize) { parseOk = false; break; }
+                        const int len = (ed[off] << 8) | ed[off + 1];
+                        off += 2;
+                        if (len <= 0 || off + len > edSize) { parseOk = false; break; }
+                        params.h264Sps.append(
+                            QByteArray(reinterpret_cast<const char*>(ed + off), len));
+                        off += len;
+                    }
+                    if (parseOk && off < edSize) {
+                        const int numPps = ed[off++];
+                        for (int p = 0; p < numPps && parseOk; ++p) {
+                            if (off + 2 > edSize) { parseOk = false; break; }
+                            const int len = (ed[off] << 8) | ed[off + 1];
+                            off += 2;
+                            if (len <= 0 || off + len > edSize) { parseOk = false; break; }
+                            params.h264Pps.append(
+                                QByteArray(reinterpret_cast<const char*>(ed + off), len));
+                            off += len;
+                        }
+                    }
+                    if (!parseOk || params.h264Sps.isEmpty() || params.h264Pps.isEmpty()) {
+                        qWarning() << "PlaybackWorker: H.264 avcC parse failed for stream" << i
+                                   << "— falling back to FFmpeg software decode";
+                        goto software_decode; // NOLINT(cppcoreguidelines-avoid-goto)
+                    }
+
+                    {
+                        DecoderTrack* track = new DecoderTrack();
+                        track->streamIndex = int(i);
+                        track->nativeDecoder = std::make_unique<NativeVideoDecoder>(
+                            codecParams->width, codecParams->height);
+                        track->h264ParamSets = params;
+                        track->codecWidth = codecParams->width;
+                        track->codecHeight = codecParams->height;
+                        track->provider = m_providers[providerIndex];
+                        track->feedIndex = providerIndex;
+                        {
+                            QMutexLocker bufferLocker(&m_bufferMutex);
+                            m_decoderBank.append(track);
+                        }
+                        providerIndex++;
+                        qDebug() << "Worker: Initialized NativeVideoDecoder (H.264) for Stream"
+                                 << i << "mapped to Provider" << (providerIndex - 1);
+                    }
+                    continue;
+                }
+
+                software_decode:
+                {
                 const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
                 if (!codec) continue;
 
@@ -806,6 +950,7 @@ void PlaybackWorker::run() {
                 providerIndex++;
                 qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider"
                          << (providerIndex - 1);
+                } // closes software_decode block
             }
         }
 
@@ -861,9 +1006,15 @@ void PlaybackWorker::run() {
 
     int outputWidth = 1920;
     int outputHeight = 1080;
-    if (!m_decoderBank.isEmpty() && m_decoderBank[0]->codecCtx) {
-        outputWidth = qMax(2, m_decoderBank[0]->codecCtx->width);
-        outputHeight = qMax(2, m_decoderBank[0]->codecCtx->height);
+    if (!m_decoderBank.isEmpty()) {
+        const DecoderTrack* ref = m_decoderBank[0];
+        if (ref->codecCtx) {
+            outputWidth = qMax(2, ref->codecCtx->width);
+            outputHeight = qMax(2, ref->codecCtx->height);
+        } else if (ref->codecWidth > 0 && ref->codecHeight > 0) {
+            outputWidth = qMax(2, ref->codecWidth);
+            outputHeight = qMax(2, ref->codecHeight);
+        }
     }
     initializeOutputGraph(m_decoderBank.size(), outputWidth, outputHeight);
 

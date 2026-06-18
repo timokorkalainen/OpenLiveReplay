@@ -21,6 +21,7 @@
 #include "playback/audioplayer.h"
 #include "playback/trackbuffer.h"
 #include "playback/audioframequeue.h"
+#include "recorder_engine/ingest/nativevideodecoder.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -31,6 +32,13 @@ extern "C" {
 
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
+    // Hardware H.264 decode: when set, this track is decoded via NativeVideoDecoder
+    // instead of the FFmpeg software codecCtx (which stays nullptr for H.264 tracks).
+    std::unique_ptr<NativeVideoDecoder> nativeDecoder;
+    H26xParameterSets h264ParamSets; // SPS/PPS parsed from avcC extradata at open time
+    // Dimensions for the output-graph init when codecCtx is null (H.264 tracks).
+    int codecWidth = 0;
+    int codecHeight = 0;
     FrameProvider* provider = nullptr;
     int streamIndex = -1;
     int feedIndex = -1;

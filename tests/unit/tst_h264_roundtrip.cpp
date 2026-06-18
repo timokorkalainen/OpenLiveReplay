@@ -1,12 +1,14 @@
 // End-to-end avcC + muxing round-trip: native-encode grey frames, attach the
 // encoder's avcC to the muxer, write a real MKV, then demux it and assert the
 // stream is H.264, every frame is a keyframe, and the frame count matches.
+// Task 7: also decode back via NativeVideoDecoder and assert frame dimensions.
 #include <QtTest>
 #include <QTemporaryDir>
 #include <QScopeGuard>
 
 #include "recorder_engine/muxer.h"
 #include "recorder_engine/codec/nativevideoencoder.h"
+#include "recorder_engine/ingest/nativevideodecoder.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -95,6 +97,104 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
     }
     QCOMPARE(frames, keyframes); // all-intra
     QVERIFY(frames >= 6);
+
+    // --- Task 7: decode-back pass via NativeVideoDecoder ---
+    if (!queryNativeVideoDecodeCapabilities().h264)
+        QSKIP("no hardware H.264 decoder on this platform");
+
+    // Parse avcC extradata into SPS/PPS NAL payloads (raw, no start codes).
+    // avcC layout: [0]=0x01 [1..3]=profile/compat/level [4]=0xFF [5]=0xE0|numSPS
+    //   then numSPS * (2-byte big-endian length + that many bytes)
+    //   then 1 byte numPPS
+    //   then numPPS * (2-byte big-endian length + that many bytes)
+    const uint8_t* extradata = ctx->streams[videoIdx]->codecpar->extradata;
+    const int extradataSize = ctx->streams[videoIdx]->codecpar->extradata_size;
+    QVERIFY(extradataSize >= 8); // minimum viable avcC
+
+    H26xParameterSets parameterSets;
+    int offset = 5; // skip configurationVersion, profile, compat, level, lengthSizeMinusOne
+    const int numSps = extradata[offset] & 0x1f;
+    offset++;
+    for (int i = 0; i < numSps && offset + 2 <= extradataSize; ++i) {
+        const int len = (extradata[offset] << 8) | extradata[offset + 1];
+        offset += 2;
+        QVERIFY(offset + len <= extradataSize);
+        parameterSets.h264Sps.append(QByteArray(reinterpret_cast<const char*>(extradata + offset), len));
+        offset += len;
+    }
+    QVERIFY(offset + 1 <= extradataSize);
+    const int numPps = extradata[offset];
+    offset++;
+    for (int i = 0; i < numPps && offset + 2 <= extradataSize; ++i) {
+        const int len = (extradata[offset] << 8) | extradata[offset + 1];
+        offset += 2;
+        QVERIFY(offset + len <= extradataSize);
+        parameterSets.h264Pps.append(QByteArray(reinterpret_cast<const char*>(extradata + offset), len));
+        offset += len;
+    }
+    QVERIFY(!parameterSets.h264Sps.isEmpty());
+    QVERIFY(!parameterSets.h264Pps.isEmpty());
+
+    // Re-open the file and feed the first video packet through NativeVideoDecoder.
+    // MKV stores H.264 as avcC length-prefixed NALUs (4-byte BE length + payload).
+    // Convert to Annex B (\x00\x00\x00\x01 + NAL) for the decoder's annexB field.
+    AVFormatContext* decCtx = nullptr;
+    QVERIFY(avformat_open_input(&decCtx, path.toUtf8().constData(), nullptr, nullptr) >= 0);
+    auto closeDecInput = qScopeGuard([&] { avformat_close_input(&decCtx); });
+    QVERIFY(avformat_find_stream_info(decCtx, nullptr) >= 0);
+
+    NativeVideoDecoder decoder(640, 480);
+    bool gotFrame = false;
+    int frameWidth = 0, frameHeight = 0;
+
+    AVPacket* decPkt = av_packet_alloc();
+    auto freeDecPkt = qScopeGuard([&] { av_packet_free(&decPkt); });
+
+    while (av_read_frame(decCtx, decPkt) >= 0 && !gotFrame) {
+        if (decPkt->stream_index != videoIdx) {
+            av_packet_unref(decPkt);
+            continue;
+        }
+
+        // Convert avcC length-prefixed → Annex B.
+        QByteArray annexB;
+        const uint8_t* p = decPkt->data;
+        const uint8_t* end = p + decPkt->size;
+        static const char kStartCode[4] = {'\x00', '\x00', '\x00', '\x01'};
+        while (p + 4 <= end) {
+            const uint32_t nalLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16)
+                                  | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+            p += 4;
+            if (nalLen == 0 || p + nalLen > end) break;
+            annexB.append(kStartCode, 4);
+            annexB.append(reinterpret_cast<const char*>(p), int(nalLen));
+            p += nalLen;
+        }
+        av_packet_unref(decPkt);
+
+        if (annexB.isEmpty()) continue;
+
+        CompressedAccessUnit unit;
+        unit.codec = NativeVideoCodec::H264;
+        unit.parameterSets = parameterSets;
+        unit.pts90k = 0;
+        unit.dts90k = 0;
+        unit.annexB = annexB;
+
+        QString decErr;
+        bool ok = decoder.decode(unit, [&](AVFrame* f) {
+            gotFrame = true;
+            frameWidth = f->width;
+            frameHeight = f->height;
+            av_frame_free(&f);
+        }, &decErr);
+        if (!ok && !decErr.isEmpty())
+            qWarning() << "NativeVideoDecoder error:" << decErr;
+    }
+
+    QVERIFY2(gotFrame, "NativeVideoDecoder produced no frames from the muxed H.264");
+    QCOMPARE(frameWidth, 640);
+    QCOMPARE(frameHeight, 480);
 }
 
 QTEST_GUILESS_MAIN(TestH264RoundTrip)
