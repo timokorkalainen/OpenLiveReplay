@@ -345,6 +345,15 @@ if(APPLE)
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_encrypted_smoke.sh" "$<TARGET_FILE:record_harness>" 23720)
     set_tests_properties(e2e_native_srt_encrypted PROPERTIES
         LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
+    # SRT LISTENER mode (srt_bind + srt_listen + srt_accept): inverts the usual
+    # roles — the engine binds + listens and srt-live-transmit connects as the
+    # caller. Real decoded content proves the accept path works. Needs ffmpeg +
+    # srt-live-transmit; SKIP-clean (77) otherwise. Base 23730.
+    add_test(NAME e2e_native_srt_listener
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_listener_smoke.sh" "$<TARGET_FILE:record_harness>" 23730)
+    set_tests_properties(e2e_native_srt_listener PROPERTIES
+        LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")
     add_test(NAME e2e_native_srt_hevc_smoke

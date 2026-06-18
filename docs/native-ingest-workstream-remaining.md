@@ -54,7 +54,7 @@ Removing `FfmpegIngestSession` (the universal catch-all) intentionally narrowed 
 | Dropped capability | Why it fails now | Restore path |
 |--------------------|------------------|--------------|
 | ~~**Encrypted SRT** (`passphrase`/`pbkeylen`)~~ | **RESTORED** — `supportsUrl` accepts a valid `passphrase` (10..79 chars) + optional `pbkeylen` (16/24/32, default 16); the native socket sets `SRTO_PBKEYLEN`/`SRTO_PASSPHRASE` before connect. Bad encryption inputs (mismatched key length, too-short passphrase, `pbkeylen` without a passphrase) still hit the accurate unsupported diagnostic. Loopback e2e: `e2e_native_srt_encrypted`. |
-| **Listener / rendezvous SRT** | native SRT is **caller-only** | add listener/rendezvous modes |
+| ~~**Listener / rendezvous SRT**~~ | **RESTORED** — a `mode=listener\|caller\|rendezvous` URL param (default caller, so existing URLs are unchanged) selects the path: listener does `srt_bind`+`srt_listen`+`srt_accept` (non-blocking, honors stop/timeout); rendezvous sets `SRTO_RENDEZVOUS` + binds the local port + `srt_connect`. An unrecognised mode hits the accurate unsupported diagnostic. Loopback e2e: `e2e_native_srt_listener` (inverts the caller/listener roles). |
 | **`udp://` MPEG-TS ingest** | no native UDP backend | a native UDP+MPEG-TS reader (the `MpegTsParser` already exists; only the UDP socket is missing) — or keep as test-only via the SRT bridge |
 | **`file://` ingest** | no native file reader | a native file/demux reader (low priority; tests use the SRT bridge) |
 
@@ -127,7 +127,7 @@ Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-inge
 ## 9. Suggested next sequence
 
 1. **Verify Windows** (§1) — smoke-test live AAC/RTMP on a Windows machine; confirm the Windows CI build is green on `main`. _Unblocks confidence in #52._
-2. **Pick up the capability regressions that real feeds hit** (§3) — most likely **encrypted SRT** and **listener/rendezvous SRT** first (common in production SRT).
+2. **Capability regressions that real feeds hit** (§3) — **encrypted SRT** and **listener/rendezvous SRT** are now restored natively (loopback e2e gated). Remaining §3 items: `udp://` and `file://` ingest (lower priority; tests use the SRT bridge).
 3. **Broaden P2 validation** (§7) — the timing core, reconnect clock ownership, skew A/V metric, SRT cells, and local NDI marker-source matrix cells are live; remaining work is longer-duration/two-machine validation, RTMP marker-source coverage, and tightening report-only cells into gates where the transport can honestly guarantee them.
 4. **Keep the framesync matrix current** (§7) — when new transport fixtures land, make sure they emit the same flash/beep/timecode/skew contract as the SRT and NDI marker sources.
 5. Output side (**P5 / #54**) proceeds in parallel on its own track.

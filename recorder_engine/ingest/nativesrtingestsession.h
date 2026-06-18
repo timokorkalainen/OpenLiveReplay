@@ -5,6 +5,7 @@
 #include "h26xaccessunit.h"
 #include "ingestsession.h"
 #include "mpegtsparser.h"
+#include "nativesrturloptions.h"
 #include "nativevideodecoder.h"
 #include "recorder_engine/timing/sourceclock.h"
 
@@ -31,6 +32,9 @@ public:
 
     static bool supportsUrl(const QUrl& url);
     static QByteArray streamIdForSocketOption(const QUrl& url);
+    // Parsed SRT connection mode for this URL (caller/listener/rendezvous). Static
+    // so the mode selection can be unit-tested without an instance.
+    static NativeSrtMode connectionModeForUrl(const QUrl& url);
 
     bool open(const QUrl& url, const IngestCallbacks& callbacks) override;
     void run() override;
@@ -60,6 +64,9 @@ private:
     QByteArray m_tsBuffer;
     QByteArray m_audioRemainder;
     int m_socket = -1;
+    // Listener mode only: the bound/listening socket that accepts the inbound
+    // caller. m_socket then becomes the accepted data socket used by srt_recv.
+    int m_listenSocket = -1;
     bool m_srtLibraryStarted = false;
     int64_t m_statRetrans = -1;
     int64_t m_statLossTotal = -1;
@@ -88,6 +95,8 @@ private:
 
     bool openSocket(QString* error);
     bool openSocketToAddress(const NativeSrtSockaddr& address, QString* error);
+    bool connectAndAwait(const NativeSrtSockaddr& address, QString* error);
+    bool acceptListenerConnection(const NativeSrtSockaddr& address, QString* error);
     void closeSocket();
     bool shouldStop() const;
     void log(const QString& message) const;

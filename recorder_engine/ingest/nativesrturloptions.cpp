@@ -56,6 +56,17 @@ NativeSrtUrlOptions nativeSrtUrlOptionsFromUrl(const QUrl& url) {
                 if (ok) {
                     options.pbKeyLen = parsed;
                 }
+            } else if (key == QStringLiteral("mode")) {
+                const QString lowered = value.toLower();
+                if (lowered == QStringLiteral("caller")) {
+                    options.mode = NativeSrtMode::Caller;
+                } else if (lowered == QStringLiteral("listener")) {
+                    options.mode = NativeSrtMode::Listener;
+                } else if (lowered == QStringLiteral("rendezvous")) {
+                    options.mode = NativeSrtMode::Rendezvous;
+                } else {
+                    options.unknownMode = true;
+                }
             }
         }
         itemStart = itemEnd + 1;
