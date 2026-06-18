@@ -81,6 +81,9 @@ qt_add_qml_module(OpenLiveReplay
         websocket/uimanagercontroladapter.h websocket/uimanagercontroladapter.cpp
         recorder_engine/replaymanager.cpp recorder_engine/replaymanager.h
         recorder_engine/heartbeat.h recorder_engine/heartbeat.cpp
+        recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp
+        recorder_engine/timing/audioservo.h recorder_engine/timing/audioservo.cpp
+        recorder_engine/timing/sourceclock.h recorder_engine/timing/sourceclock.cpp
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
         recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
@@ -91,12 +94,14 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
+        recorder_engine/ingest/ndiframeconvert.h recorder_engine/ingest/ndiframeconvert.cpp
         recorder_engine/ingest/nativevideodecoder.h
         recorder_engine/ingest/nativesrtconnectdiagnostics.h recorder_engine/ingest/nativesrtconnectdiagnostics.cpp
         recorder_engine/ingest/nativesrtaddress.h recorder_engine/ingest/nativesrtaddress.cpp
         recorder_engine/ingest/nativesrturloptions.h recorder_engine/ingest/nativesrturloptions.cpp
         recorder_engine/ingest/nativesrtingestsession.h
         recorder_engine/ingest/nativertmpingestsession.h
+        recorder_engine/ingest/nativendiingestsession.h recorder_engine/ingest/nativendiingestsession.cpp
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp

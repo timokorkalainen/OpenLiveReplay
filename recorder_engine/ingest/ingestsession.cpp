@@ -11,6 +11,9 @@ IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOption
         (scheme == QStringLiteral("rtmp") || scheme == QStringLiteral("rtmps"))) {
         return IngestBackendKind::NativeRtmp;
     }
+    if (options.preferNativeNdi && scheme == QStringLiteral("ndi")) {
+        return IngestBackendKind::NativeNdi;
+    }
     return IngestBackendKind::Unsupported;
 }
 
@@ -57,11 +60,13 @@ bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure) {
 }
 
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
-                                                         bool nativeRtmpAvailable) {
+                                                         bool nativeRtmpAvailable,
+                                                         bool nativeNdiAvailable) {
     IngestBackendOptions options;
     const QString scheme = url.scheme().toLower();
     options.preferNativeSrt = nativeSrtAvailable && scheme == QStringLiteral("srt");
     options.preferNativeRtmp = nativeRtmpAvailable && (scheme == QStringLiteral("rtmp") ||
                                                        scheme == QStringLiteral("rtmps"));
+    options.preferNativeNdi = nativeNdiAvailable && scheme == QStringLiteral("ndi");
     return options;
 }

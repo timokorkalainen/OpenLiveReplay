@@ -47,7 +47,7 @@ void TestNativeSrtAddress::extractsStreamIdOption_data() {
     QTest::addColumn<QString>("expectedStreamId");
 
     QTest::newRow("plain") << QStringLiteral("srt://127.0.0.1:9000?streamid=feed")
-                            << QStringLiteral("feed");
+                           << QStringLiteral("feed");
     QTest::newRow("escaped-hash-bang")
         << QStringLiteral("srt://127.0.0.1:9000?streamid=%23!::r=feed,m=request")
         << QStringLiteral("#!::r=feed,m=request");
@@ -73,8 +73,7 @@ void TestNativeSrtAddress::extractsStreamIdOption() {
 
 void TestNativeSrtAddress::formatsApplicationDefinedRejectReasonWithCode() {
     const QString message = nativeSrtConnectFailureMessage(
-        0, QStringLiteral("Success"), 1404,
-        QStringLiteral("Application-defined rejection reason"));
+        0, QStringLiteral("Success"), 1404, QStringLiteral("Application-defined rejection reason"));
 
     QVERIFY(message.contains(QStringLiteral("Application-defined rejection reason")));
     QVERIFY(message.contains(QStringLiteral("1404")));

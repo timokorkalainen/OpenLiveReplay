@@ -34,8 +34,8 @@ QString srtLastError() {
     return QString::fromUtf8(srt_getlasterror_str());
 }
 
-bool setSrtOption(SRTSOCKET socket, SRT_SOCKOPT option, const void* value, int size,
-                  QString* error, const QString& name) {
+bool setSrtOption(SRTSOCKET socket, SRT_SOCKOPT option, const void* value, int size, QString* error,
+                  const QString& name) {
     if (srt_setsockopt(socket, 0, option, value, size) == SRT_ERROR) {
         if (error) *error = QStringLiteral("%1 failed: %2").arg(name, srtLastError());
         return false;
@@ -44,7 +44,7 @@ bool setSrtOption(SRTSOCKET socket, SRT_SOCKOPT option, const void* value, int s
 }
 
 sockaddr_in loopbackAddress(quint16 port) {
-    sockaddr_in address {};
+    sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
@@ -52,7 +52,7 @@ sockaddr_in loopbackAddress(quint16 port) {
 }
 
 QString readAcceptedStreamId(SRTSOCKET accepted) {
-    char buffer[512] {};
+    char buffer[512]{};
     int len = int(sizeof(buffer));
     if (srt_getsockopt(accepted, 0, SRTO_STREAMID, buffer, &len) == SRT_ERROR) {
         return QString();
@@ -68,15 +68,15 @@ QString readAcceptedStreamId(SRTSOCKET accepted) {
 void acceptOneStreamId(SRTSOCKET listener, std::atomic<bool>* done, ListenerResult* result) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     while (std::chrono::steady_clock::now() < deadline) {
-        sockaddr_storage peer {};
+        sockaddr_storage peer{};
         int peerLen = int(sizeof(peer));
-        const SRTSOCKET accepted = srt_accept(listener, reinterpret_cast<sockaddr*>(&peer),
-                                             &peerLen);
+        const SRTSOCKET accepted =
+            srt_accept(listener, reinterpret_cast<sockaddr*>(&peer), &peerLen);
         if (accepted != SRT_INVALID_SOCK) {
             result->streamId = readAcceptedStreamId(accepted);
             if (result->streamId.isEmpty()) {
-                result->error = QStringLiteral("accepted socket had no SRTO_STREAMID: %1")
-                                    .arg(srtLastError());
+                result->error =
+                    QStringLiteral("accepted socket had no SRTO_STREAMID: %1").arg(srtLastError());
             }
             done->store(true, std::memory_order_release);
             QThread::msleep(1000);
@@ -106,8 +106,7 @@ int main(int argc, char** argv) {
     const QString expectedStreamId = QStringLiteral("#!::r=olr-streamid,m=request");
 
     if (srt_startup() == SRT_ERROR) {
-        fprintf(stderr, "srt_streamid_harness: srt_startup failed: %s\n",
-                srt_getlasterror_str());
+        fprintf(stderr, "srt_streamid_harness: srt_startup failed: %s\n", srt_getlasterror_str());
         return 2;
     }
 
@@ -161,8 +160,7 @@ int main(int argc, char** argv) {
     callbacks.logInfo = [](const QString& message) {
         fprintf(stderr, "%s\n", qPrintable(message));
     };
-    const QString encodedStreamId =
-        QString::fromLatin1(QUrl::toPercentEncoding(expectedStreamId));
+    const QString encodedStreamId = QString::fromLatin1(QUrl::toPercentEncoding(expectedStreamId));
     const QUrl url(QStringLiteral("srt://127.0.0.1:%1?streamid=%2&transtype=live")
                        .arg(port)
                        .arg(encodedStreamId));
@@ -194,7 +192,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("PASS: native SRT caller streamid reached listener: %s\n",
-           qPrintable(result.streamId));
+    printf("PASS: native SRT caller streamid reached listener: %s\n", qPrintable(result.streamId));
     return 0;
 }
