@@ -24,6 +24,7 @@ PlaybackWorker::~PlaybackWorker() {
     stop();
     shutdownOutputGraph();
     for (auto* track : m_decoderBank) {
+        track->nativeDecoder.reset(); // Tear down VideoToolbox before freeing track
         if (track->codecCtx) avcodec_free_context(&track->codecCtx);
         delete track;
     }
@@ -807,6 +808,7 @@ void PlaybackWorker::run() {
         shutdownOutputGraph();
         QMutexLocker bufferLocker(&m_bufferMutex);
         for (auto* track : m_decoderBank) {
+            track->nativeDecoder.reset(); // Tear down VideoToolbox before freeing track
             if (track->codecCtx) avcodec_free_context(&track->codecCtx);
             delete track;
         }
@@ -894,8 +896,8 @@ void PlaybackWorker::run() {
                     }
                     if (!parseOk || params.h264Sps.isEmpty() || params.h264Pps.isEmpty()) {
                         qWarning() << "PlaybackWorker: H.264 avcC parse failed for stream" << i
-                                   << "— falling back to FFmpeg software decode";
-                        goto software_decode; // NOLINT(cppcoreguidelines-avoid-goto)
+                                   << "— skipping track (hardware-only constraint)";
+                        continue; // do NOT software-decode H.264
                     }
 
                     {
@@ -919,7 +921,11 @@ void PlaybackWorker::run() {
                     continue;
                 }
 
-                software_decode:
+                // Hardware unavailable or H.264 without usable extradata: skip the track.
+                // NEVER software-decode H.264 (hardware-only licensing constraint).
+                if (isH264) continue;
+
+                // Non-H.264 codecs (MPEG-2, etc.) fall through to software decode.
                 {
                 const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
                 if (!codec) continue;
