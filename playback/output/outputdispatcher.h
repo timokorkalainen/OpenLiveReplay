@@ -89,8 +89,7 @@ public:
 
 private:
     OutputBusFrame renderBus(OutputBusId bus, qint64 outputFrameIndex,
-                             const PlaybackStateSnapshot& state,
-                             const OutputFrameCache& cache) const;
+                             const PlaybackStateSnapshot& state, const OutputFrameCache& cache);
     PlaybackStateSnapshot clockedStateForTick(qint64 outputFrameIndex,
                                               const PlaybackStateSnapshot& state);
     void countFrameHealth(const OutputBusFrame& frame);
@@ -107,6 +106,7 @@ private:
     bool m_havePlayEpoch = false;
     PlaybackStateSnapshot m_playEpoch;
     OutputDispatchStats m_stats;
+    MultiviewComposite m_multiviewMemo;
 };
 
 #endif // OUTPUTDISPATCHER_H

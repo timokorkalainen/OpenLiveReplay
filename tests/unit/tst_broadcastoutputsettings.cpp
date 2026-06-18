@@ -15,6 +15,7 @@ private slots:
     void rowsMarkQueuePressureAsWarning();
     void rowsKeepRecoveredRuntimeDiagnosticsActive();
     void rowsKeepHealthySingleFrameQueueActive();
+    void rowsDoNotMarkIdleTargetErrorOnGlobalDeadlineMiss();
     void qtPreviewAssignmentsCoverFeedsMultiviewAndPgm();
 };
 
@@ -339,6 +340,40 @@ void TestBroadcastOutputSettings::rowsKeepHealthySingleFrameQueueActive() {
     QCOMPARE(feed.value(QStringLiteral("statusState")).toString(), QStringLiteral("Active"));
     QCOMPARE(feed.value(QStringLiteral("statusSeverity")).toString(), QStringLiteral("ok"));
     QVERIFY(feed.value(QStringLiteral("diagnostic")).toString().contains(QStringLiteral("maxQ=1")));
+}
+
+void TestBroadcastOutputSettings::rowsDoNotMarkIdleTargetErrorOnGlobalDeadlineMiss() {
+    // The runtime deadline-miss flag is global to the whole dispatch thread and is fanned
+    // onto every per-target status. A target that has never delivered a frame must not be
+    // dragged to Error by an unrelated runtime stall; it is simply still Waiting.
+    QList<OutputTargetAssignment> outputs = BroadcastOutputSettings::setEnabled(
+        {}, 1, OutputTargetKind::Ndi, OutputBusId::feed(0), true);
+
+    BroadcastOutputTargetStatus idle;
+    idle.attemptedFrames = 0;
+    idle.framesSubmitted = 0;
+    idle.runtimeDeadlineMisses = 1;
+    idle.runtimeLastDeadlineMiss = true; // global stall fanned onto this idle target
+
+    QHash<QString, BroadcastOutputTargetStatus> statuses;
+    statuses.insert(QStringLiteral("feed0-ndi"), idle);
+
+    const QVariantMap feed =
+        BroadcastOutputSettings::rows(outputs, 1, OutputTargetKind::Ndi, statuses)[0].toMap();
+    QVERIFY2(feed.value(QStringLiteral("statusState")).toString() != QStringLiteral("Error"),
+             "an idle target must not show Error from a global runtime deadline miss");
+    QCOMPARE(feed.value(QStringLiteral("statusState")).toString(), QStringLiteral("Waiting"));
+
+    // A target that has actually been delivering frames IS affected by a cadence stall.
+    BroadcastOutputTargetStatus active = idle;
+    active.attemptedFrames = 5;
+    active.framesSubmitted = 5;
+    active.hasLastSubmitResult = true;
+    active.lastSubmitSucceeded = true;
+    statuses.insert(QStringLiteral("feed0-ndi"), active);
+    const QVariantMap activeRow =
+        BroadcastOutputSettings::rows(outputs, 1, OutputTargetKind::Ndi, statuses)[0].toMap();
+    QCOMPARE(activeRow.value(QStringLiteral("statusState")).toString(), QStringLiteral("Error"));
 }
 
 void TestBroadcastOutputSettings::qtPreviewAssignmentsCoverFeedsMultiviewAndPgm() {

@@ -47,6 +47,7 @@ void OutputDispatcher::setEndpoints(const QList<OutputEndpoint>& endpoints) {
     }
 
     m_endpoints = endpoints;
+    m_multiviewMemo = MultiviewComposite{};
     for (const OutputEndpoint& endpoint : m_endpoints) {
         if (!endpoint.sink || !endpoint.assignment.enabled) continue;
         if (endpoint.sink->kind() != endpoint.assignment.kind) continue;
@@ -157,13 +158,13 @@ PlaybackStateSnapshot OutputDispatcher::clockedStateForTick(qint64 outputFrameIn
 
 OutputBusFrame OutputDispatcher::renderBus(OutputBusId bus, qint64 outputFrameIndex,
                                            const PlaybackStateSnapshot& state,
-                                           const OutputFrameCache& cache) const {
+                                           const OutputFrameCache& cache) {
     OutputBusEngine engine(m_rate, m_feedCount, m_width, m_height);
     switch (bus.kind) {
     case OutputBusKind::Feed:
         return engine.renderFeed(bus.index, outputFrameIndex, state, cache);
     case OutputBusKind::Multiview:
-        return engine.renderMultiview(outputFrameIndex, state, cache);
+        return engine.renderMultiview(outputFrameIndex, state, cache, &m_multiviewMemo);
     case OutputBusKind::Pgm:
         return engine.renderPgm(outputFrameIndex, state, cache);
     }

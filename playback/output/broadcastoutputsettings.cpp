@@ -28,7 +28,13 @@ const OutputTargetAssignment* findAssignment(const QList<OutputTargetAssignment>
 }
 
 bool hasCurrentError(const BroadcastOutputTargetStatus& status) {
-    return status.runtimeLastDeadlineMiss || status.lastDeliveryGap ||
+    // The runtime deadline miss is a property of the shared dispatch thread, fanned onto
+    // every per-target status. Only let it escalate a target that has actually been
+    // delivering frames (it is genuinely behind cadence); an idle/never-delivered target
+    // must not be dragged to Error by an unrelated global stall.
+    const bool runtimeStallAffectsTarget =
+        status.runtimeLastDeadlineMiss && status.framesSubmitted > 0;
+    return runtimeStallAffectsTarget || status.lastDeliveryGap ||
            (status.hasLastSubmitResult && !status.lastSubmitSucceeded) ||
            (status.hasLastSinkResult && !status.lastSinkResultSucceeded) ||
            (status.sinkFailures > 0 && status.framesSubmitted == 0);

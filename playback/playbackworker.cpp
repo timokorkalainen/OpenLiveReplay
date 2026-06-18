@@ -361,10 +361,16 @@ void PlaybackWorker::rebuildOutputEndpoints() {
 
 OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     OutputRuntimeSnapshot snapshot;
-    snapshot.cache = OutputFrameCache(m_outputFeedCount, m_outputWidth, m_outputHeight);
     {
+        // OutputFrameCache holds Qt copy-on-write containers, so this assignment is a
+        // shallow O(1) share, not a deep copy; the decoder pays a bounded COW detach only
+        // when it inserts while this snapshot is briefly alive. Build the empty fallback
+        // only when there is no cache yet, instead of constructing-then-overwriting it.
         QMutexLocker bufferLocker(&m_bufferMutex);
-        if (m_outputCache) snapshot.cache = *m_outputCache;
+        if (m_outputCache)
+            snapshot.cache = *m_outputCache;
+        else
+            snapshot.cache = OutputFrameCache(m_outputFeedCount, m_outputWidth, m_outputHeight);
     }
 
     snapshot.state.playheadMs = m_transport ? m_transport->currentPos() : 0;

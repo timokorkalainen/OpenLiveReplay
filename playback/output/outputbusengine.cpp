@@ -9,14 +9,6 @@ namespace {
 constexpr quint32 kFnvOffset = 2166136261u;
 constexpr quint32 kFnvPrime = 16777619u;
 
-quint32 hashBytes(quint32 hash, const QByteArray& bytes) {
-    for (const char byte : bytes) {
-        hash ^= quint8(byte);
-        hash *= kFnvPrime;
-    }
-    return hash;
-}
-
 quint32 hashInt(quint32 hash, qint64 value) {
     for (int i = 0; i < 8; ++i) {
         hash ^= quint8((quint64(value) >> (i * 8)) & 0xff);
@@ -32,6 +24,12 @@ bool isSilentAudio(const MediaAudioFrame& audio) {
     return true;
 }
 
+// Identity is derived from frame metadata, not from the pixel/PCM payload. A cached
+// source frame's content is uniquely keyed by (feedIndex, ptsMs), so hashing every plane
+// byte every tick on the cadence thread (~3 MB per 1080p frame) is pure overhead. Keeping
+// the hash metadata-only lets repeated-payload detection stay correct while removing the
+// per-frame O(pixels) cost. Multiview overrides videoHash with its source-content
+// signature (see renderMultiview) because its composed buffer has no single source pts.
 quint32 videoHashFor(const MediaVideoFrame& video) {
     quint32 hash = kFnvOffset;
     hash = hashInt(hash, video.feedIndex);
@@ -39,9 +37,7 @@ quint32 videoHashFor(const MediaVideoFrame& video) {
     hash = hashInt(hash, video.width);
     hash = hashInt(hash, video.height);
     hash = hashInt(hash, int(video.format));
-    hash = hashBytes(hash, video.planeY);
-    hash = hashBytes(hash, video.planeU);
-    hash = hashBytes(hash, video.planeV);
+    hash = hashInt(hash, video.isPlaceholder ? 1 : 0);
     return hash;
 }
 
@@ -52,7 +48,7 @@ quint32 audioHashFor(const MediaAudioFrame& audio) {
     hash = hashInt(hash, audio.sampleRate);
     hash = hashInt(hash, audio.channels);
     hash = hashInt(hash, int(audio.format));
-    hash = hashBytes(hash, audio.pcm);
+    hash = hashInt(hash, audio.sampleFrames());
     return hash;
 }
 
@@ -110,22 +106,57 @@ OutputBusFrame OutputBusEngine::renderPgm(qint64 outputFrameIndex,
 
 OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
                                                 const PlaybackStateSnapshot& state,
-                                                const OutputFrameCache& cache) const {
+                                                const OutputFrameCache& cache,
+                                                MultiviewComposite* memo) const {
+    constexpr qint64 kAbsentFeedPts = -1;
     OutputBusFrame out;
     out.bus = OutputBusId::multiview();
     out.outputFrameIndex = outputFrameIndex;
     out.sampledPlayheadMs = m_clock.samplePlayheadMsForOutputTick(outputFrameIndex, state);
 
-    QList<MediaVideoFrame> frames;
+    // Describe the source set selected for this tick. Absent feeds use a stable sentinel
+    // (not the playhead) plus a present flag, so the descriptor is stable across ticks while
+    // the selected source frames are unchanged. The descriptor drives the composite memo
+    // exactly; the folded 32-bit signature drives repeated-payload identity (where a rare
+    // hash collision only miscounts a stat, never produces wrong pixels).
+    quint32 sourceSignature = kFnvOffset;
+    QVector<qint64> sourceKeys;
+    sourceKeys.reserve(m_feedCount * 2);
+    qint64 sourcePtsMs = 0;
     for (int feed = 0; feed < m_feedCount; ++feed) {
-        frames.append(cache.videoFrameOrPlaceholder(feed, out.sampledPlayheadMs));
+        const std::optional<MediaVideoFrame> src = cache.videoFrameAt(feed, out.sampledPlayheadMs);
+        const qint64 pts = src ? src->ptsMs : kAbsentFeedPts;
+        sourceKeys.append(src ? 1 : 0);
+        sourceKeys.append(pts);
+        sourceSignature = hashInt(sourceSignature, feed);
+        sourceSignature = hashInt(sourceSignature, pts);
+        sourceSignature = hashInt(sourceSignature, src ? 0 : 1);
+        if (src) sourcePtsMs = qMax(sourcePtsMs, src->ptsMs);
     }
-    out.video = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
-    out.video.ptsMs = out.sampledPlayheadMs;
+
+    if (memo && memo->valid && memo->sourceKeys == sourceKeys) {
+        out.video = memo->video; // reuse composited planes (copy-on-write share)
+    } else {
+        QList<MediaVideoFrame> frames;
+        for (int feed = 0; feed < m_feedCount; ++feed) {
+            frames.append(cache.videoFrameOrPlaceholder(feed, out.sampledPlayheadMs));
+        }
+        out.video = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
+        if (memo) {
+            memo->valid = true;
+            memo->sourceKeys = sourceKeys;
+            memo->video = out.video;
+        }
+    }
+
+    // Identity must reflect the composited source content, not the advancing playhead,
+    // so repeated-payload detection works when the underlying feeds are frozen.
+    out.video.ptsMs = sourcePtsMs;
     out.video.outputFrameIndex = outputFrameIndex;
 
     out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
     out.identity = outputFrameIdentityFor(out);
+    out.identity.videoHash = sourceSignature;
     return out;
 }
 
@@ -165,10 +196,17 @@ MediaAudioFrame OutputBusEngine::renderAudioForFeed(int feedIndex, qint64 output
     audio.channels = 2;
     audio.format = MediaSampleFormat::S16Interleaved;
     const bool oneXForward = state.playing && state.speed > 0.99 && state.speed < 1.01;
-    const int samples = audioSamplesForOutputFrame(outputFrameIndex);
-    audio.pcm = (allowAudio && oneXForward && feedIndex >= 0 && feedIndex < m_feedCount)
-                    ? cache.audioSpanOrSilence(feedIndex, audio.startSample, samples)
-                    : silentS16Stereo(samples);
+    if (allowAudio && oneXForward && feedIndex >= 0 && feedIndex < m_feedCount) {
+        // Derive the per-frame sample count from the epoch-relative next start so the
+        // count shares the same fractional-rate phase as the start. Otherwise, for an
+        // odd play epoch at 29.97/59.94 the alternating 1601/1602 size disagrees with
+        // the start step and consecutive spans overlap/gap by one sample forever.
+        const qint64 nextStart = sourceAudioStartSample(outputFrameIndex + 1, state);
+        const int samples = int(qMax<qint64>(0, nextStart - audio.startSample));
+        audio.pcm = cache.audioSpanOrSilence(feedIndex, audio.startSample, samples);
+    } else {
+        audio.pcm = silentS16Stereo(audioSamplesForOutputFrame(outputFrameIndex));
+    }
     return audio;
 }
 

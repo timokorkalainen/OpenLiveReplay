@@ -31,6 +31,10 @@ private slots:
     void pausedAudioIsSilenceButVideoRepeats();
     void multiviewComposesFeedsAndCarriesSelectedFeedAudio();
     void ntscAudioUsesRationalSampleBoundaries();
+    void ntscAudioSpansStayContiguousAcrossOddPlayEpoch();
+    void multiviewVideoIdentityTracksSourceContentNotPlayhead();
+    void multiviewMemoReusesCompositeForUnchangedSources();
+    void multiviewMemoMatchesUnmemoizedCompositeForDistinctSources();
 };
 
 void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
@@ -141,6 +145,120 @@ void TestOutputBusEngine::ntscAudioUsesRationalSampleBoundaries() {
     QCOMPARE(frame2.audio.startSample, qint64(3203));
     QCOMPARE(frame2.audio.pcm.size(), 1601 * 2 * int(sizeof(qint16)));
     QCOMPARE(reinterpret_cast<const qint16*>(frame2.audio.pcm.constData())[0], qint16(222));
+}
+
+void TestOutputBusEngine::ntscAudioSpansStayContiguousAcrossOddPlayEpoch() {
+    // At 29.97 (30000/1001) the per-frame sample count alternates 1601/1602.
+    // The audio start sample is anchored to the play epoch (playStartedAtOutputFrame),
+    // so for an ODD epoch the per-frame count must use the SAME epoch-relative phase as
+    // the start, otherwise consecutive frames overlap/gap by one sample forever.
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 0, 10));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30000, 1001), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playing = true;
+    state.speed = 1.0;
+    state.playStartedAtOutputFrame = 1; // odd epoch: the failing case
+    state.playStartedAtPlayheadMs = 0;
+
+    qint64 prevEnd = -1;
+    for (qint64 frameIndex = 1; frameIndex <= 6; ++frameIndex) {
+        const auto frame = engine.renderFeed(0, frameIndex, state, cache);
+        const qint64 start = frame.audio.startSample;
+        const qint64 count = frame.audio.sampleFrames();
+        if (prevEnd >= 0) {
+            // No gap and no overlap: this frame begins exactly where the last one ended.
+            QCOMPARE(start, prevEnd);
+        }
+        prevEnd = start + count;
+    }
+}
+
+void TestOutputBusEngine::multiviewVideoIdentityTracksSourceContentNotPlayhead() {
+    // During 1x playback the sampled playhead advances every tick. The multiview video
+    // identity must reflect the composited SOURCE content, so that when the underlying
+    // feeds are frozen (same cached pictures) two consecutive ticks compare equal — and
+    // when a source advances, the identity changes.
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 100, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+    state.playStartedAtOutputFrame = 5;
+    state.playStartedAtPlayheadMs = 100;
+
+    const auto a = engine.renderMultiview(5, state, cache);
+    const auto b = engine.renderMultiview(6, state, cache);
+
+    // Frozen sources across two playing ticks: video identity is unchanged.
+    QCOMPARE(a.identity.videoHash, b.identity.videoHash);
+    QCOMPARE(a.identity.sourcePtsMs, b.identity.sourcePtsMs);
+    QVERIFY(!a.identity.videoPlaceholder);
+
+    // A new source picture changes the multiview video identity.
+    cache.insertVideoFrame(video(1, 140, 21));
+    PlaybackStateSnapshot advanced = state;
+    advanced.playheadMs = 140;
+    const auto c = engine.renderMultiview(7, advanced, cache);
+    QVERIFY(c.identity.videoHash != b.identity.videoHash);
+}
+
+void TestOutputBusEngine::multiviewMemoReusesCompositeForUnchangedSources() {
+    // When the source signature is unchanged, the memo reuses the composited planes
+    // instead of re-running the full-resolution grid scale. Replacing the content at the
+    // SAME source pts (a test-only operation; in production content is immutable per pts)
+    // must therefore NOT change the composite, proving the scale was skipped.
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 100, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto a = engine.renderMultiview(5, state, cache, &memo);
+    QCOMPARE(uchar(a.video.planeY.at(0)), uchar(10));
+
+    cache.insertVideoFrame(video(0, 100, 99)); // same pts, new content
+    const auto b = engine.renderMultiview(6, state, cache, &memo);
+    QCOMPARE(uchar(b.video.planeY.at(0)), uchar(10)); // reused composite, not 99
+
+    cache.insertVideoFrame(video(0, 140, 77)); // a genuine source advance (new pts)
+    PlaybackStateSnapshot advanced = state;
+    advanced.playheadMs = 140;
+    const auto c = engine.renderMultiview(7, advanced, cache, &memo);
+    QCOMPARE(uchar(c.video.planeY.at(0)), uchar(77)); // memo invalidated, recomposited
+}
+
+void TestOutputBusEngine::multiviewMemoMatchesUnmemoizedCompositeForDistinctSources() {
+    // For genuinely distinct sources, a memoized render must be byte-identical to an
+    // unmemoized one.
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 100, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto memoized = engine.renderMultiview(9, state, cache, &memo);
+    const auto plain = engine.renderMultiview(9, state, cache, nullptr);
+    QCOMPARE(memoized.video.planeY, plain.video.planeY);
+    QCOMPARE(memoized.video.planeU, plain.video.planeU);
+    QCOMPARE(memoized.video.planeV, plain.video.planeV);
+    QCOMPARE(memoized.identity.videoHash, plain.identity.videoHash);
 }
 
 QTEST_GUILESS_MAIN(TestOutputBusEngine)
