@@ -66,6 +66,13 @@ qt_add_executable(ndi_recv_probe
 target_include_directories(ndi_recv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(ndi_recv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
 
+qt_add_executable(ndi_output_sender
+    ndi_output_sender.cpp
+    ndi_output_marker.cpp)
+target_include_directories(ndi_output_sender PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_output_sender PRIVATE
+    Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
     # before connect by reading the stream ID from a real accepted SRT socket.
