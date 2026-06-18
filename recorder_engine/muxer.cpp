@@ -38,6 +38,14 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska", m_activePath.toUtf8().constData());
     if (!m_outCtx) return false;
 
+    if (codec == VideoCodecChoice::H264Hardware && videoExtradata.isEmpty()) {
+        qWarning() << "Muxer: H.264 selected but no avcC extradata provided; refusing to init.";
+        avformat_free_context(m_outCtx);
+        m_outCtx = nullptr;
+        resetTelemetryTracks();
+        return false;
+    }
+
     // 2. Pre-allocate Video Tracks
     for (int i = 0; i < videoTrackCount; i++) {
         AVStream* st = avformat_new_stream(m_outCtx, nullptr);
@@ -47,13 +55,18 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->codecpar->codec_id = (codec == VideoCodecChoice::H264Hardware)
                                      ? AV_CODEC_ID_H264
                                      : AV_CODEC_ID_MPEG2VIDEO;
-        if (codec == VideoCodecChoice::H264Hardware && !videoExtradata.isEmpty()) {
+        if (codec == VideoCodecChoice::H264Hardware) {
             st->codecpar->extradata = static_cast<uint8_t*>(
                 av_mallocz(videoExtradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
-            if (st->codecpar->extradata) {
-                memcpy(st->codecpar->extradata, videoExtradata.constData(), videoExtradata.size());
-                st->codecpar->extradata_size = videoExtradata.size();
+            if (!st->codecpar->extradata) {
+                qWarning() << "Muxer: failed to allocate H.264 extradata.";
+                avformat_free_context(m_outCtx);
+                m_outCtx = nullptr;
+                resetTelemetryTracks();
+                return false;
             }
+            memcpy(st->codecpar->extradata, videoExtradata.constData(), videoExtradata.size());
+            st->codecpar->extradata_size = videoExtradata.size();
         }
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         st->codecpar->width = width;
