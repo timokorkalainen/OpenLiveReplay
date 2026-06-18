@@ -15,6 +15,7 @@
 #include "frameprovider.h"
 #include "playback/commitgate.h"
 #include "playback/output/outputruntime.h"
+#include "playback/output/sharedcacheslot.h"
 #include "playback/output/outputtargetassignment.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
@@ -125,6 +126,9 @@ private:
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
+    // Snapshot m_outputCache into the published immutable slot. Caller must hold
+    // m_bufferMutex.
+    void publishOutputCacheLocked();
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
@@ -175,6 +179,9 @@ private:
     // here, then merges into the live cache and trims old frames only after
     // coverage (double-buffer; never published to the output thread).
     std::unique_ptr<OutputFrameCache> m_stagingCache;
+    // Immutable snapshot of m_outputCache published to the output thread
+    // (replaces the per-tick deep copy in makeOutputSnapshot).
+    SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
     int m_outputFeedCount = 0;

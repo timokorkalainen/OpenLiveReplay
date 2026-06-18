@@ -262,8 +262,14 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_outputFeedCount = qMax(0, feedCount);
     m_outputWidth = qMax(2, width);
     m_outputHeight = qMax(2, height);
-    m_outputCache =
-        std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth, m_outputHeight);
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        m_outputCache =
+            std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth, m_outputHeight);
+        // Publish the initial (empty) cache so the output thread loads a valid
+        // snapshot from its very first tick instead of the inline fallback.
+        publishOutputCacheLocked();
+    }
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
         m_outputRuntime = std::make_unique<OutputRuntime>(
@@ -289,7 +295,13 @@ void PlaybackWorker::shutdownOutputGraph() {
         runtime.reset();
     }
     m_outputSinks.clear();
-    m_outputCache.reset();
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        m_outputCache.reset();
+        // Drop the published snapshot so a post-teardown tick (if any) falls back
+        // to an empty cache rather than holding stale frames from the old graph.
+        m_publishedCache.publish(nullptr);
+    }
     m_outputFeedCount = 0;
 }
 
@@ -367,16 +379,22 @@ void PlaybackWorker::rebuildOutputEndpoints() {
     m_outputTargetsDirty.store(false, std::memory_order_relaxed);
 }
 
+void PlaybackWorker::publishOutputCacheLocked() {
+    if (m_outputCache)
+        m_publishedCache.publish(std::make_shared<const OutputFrameCache>(*m_outputCache));
+}
+
 OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     OutputRuntimeSnapshot snapshot;
     {
-        // OutputFrameCache holds Qt copy-on-write containers, so this assignment is a
-        // shallow O(1) share, not a deep copy; the decoder pays a bounded COW detach only
-        // when it inserts while this snapshot is briefly alive. Build the empty fallback
-        // only when there is no cache yet, instead of constructing-then-overwriting it.
+        // Tier 2: read the immutable published snapshot instead of deep-copying
+        // the live m_outputCache on every ~1ms tick. The slot's load() takes one
+        // short lock and returns a shared_ptr to a const cache the worker never
+        // mutates again, so the assignment below copies an implicitly-shared
+        // (cheap COW) snapshot, not a re-decode of the decoder track buffers.
         QMutexLocker bufferLocker(&m_bufferMutex);
-        if (m_outputCache)
-            snapshot.cache = *m_outputCache;
+        if (auto published = m_publishedCache.load())
+            snapshot.cache = *published;
         else
             snapshot.cache = OutputFrameCache(m_outputFeedCount, m_outputWidth, m_outputHeight);
     }
@@ -461,7 +479,10 @@ void PlaybackWorker::cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* a
     frame.pcm = QByteArray(reinterpret_cast<const char*>(audioFrame->data[0]), dataSize);
 
     QMutexLocker bufferLocker(&m_bufferMutex);
-    if (m_outputCache) m_outputCache->insertAudioFrame(frame);
+    if (m_outputCache) {
+        m_outputCache->insertAudioFrame(frame);
+        publishOutputCacheLocked();
+    }
     aTrack->lastCachedPtsMs = ptsMs;
 }
 
@@ -534,7 +555,10 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     QMutexLocker bufferLocker(&m_bufferMutex);
                     if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
                         m_counters.framesDropped++;
-                    if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
+                    if (m_outputCache) {
+                        m_outputCache->insertVideoFrame(mediaFrame);
+                        publishOutputCacheLocked();
+                    }
                 }
                 lastVideoPtsMs = framePtsMs;
                 av_frame_unref(vf);
@@ -676,6 +700,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         const qint64 keepAudioFromSample =
             qMax<qint64>(0, (target - kLeadMs) * qint64(48000) / 1000);
         m_outputCache->trimBefore(target - kLeadMs, keepAudioFromSample);
+        publishOutputCacheLocked();
     }
 
     if (!deliveredEarly) resetDedup();
@@ -1101,6 +1126,7 @@ void PlaybackWorker::run() {
             if (m_outputCache) {
                 const qint64 keepAudioFromSample = qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
                 m_outputCache->trimBefore(keepFrom, keepAudioFromSample);
+                publishOutputCacheLocked();
             }
         }
         m_audioQueue.dropOlderThan(P, kAudioLeadMs);
