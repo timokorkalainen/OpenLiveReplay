@@ -3,6 +3,7 @@
 
 #include "nativeaacdecoder.h"
 #include "h26xaccessunit.h"
+#include "h26xseitimecode.h"
 #include "ingestsession.h"
 #include "mpegtsparser.h"
 #include "nativesrturloptions.h"
@@ -45,6 +46,13 @@ public:
     // negative. Static so it can be unit-tested without an instance.
     static int64_t sourcePtsMsFromAnchor(qint64 pts90k, int64_t anchorTs90k,
                                          int64_t anchorStreamMs);
+
+    // Nominal fps used only to convert an extracted SMPTE 12M timecode into a 100 ns
+    // offset since midnight. The SRT session itself carries no fps (the constructor
+    // takes only output width/height); 30 matches the engine's default target rate
+    // (ReplayManager::m_fps / StreamWorker::m_targetFps both default to 30). This
+    // affects only the TC mapping — A/V sync uses the 90 kHz stream clock, never this.
+    static constexpr int kTimecodeNominalFps = 30;
 
 private:
     int m_sourceIndex = -1;
@@ -89,6 +97,11 @@ private:
     int64_t m_audioWrapOffset90k = 0;
     bool m_forceNextPcrObserve = false;
     int64_t m_audioRemainderPts90k = -1;
+    // SMPTE 12M timecode (100 ns since midnight) extracted from the current access
+    // unit's SEI, stamped onto the emitted DecodedVideoFrame. -1 = the current AU
+    // carries no timecode SEI (the common case). Reset to -1 per access unit so a
+    // frame without a TC SEI never inherits a previous frame's timecode.
+    int64_t m_pendingVideoTimecode100ns = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastDecodeErrorLogMs = -1;
     bool m_loggedLatmUnsupported = false;
@@ -108,6 +121,10 @@ private:
     int64_t unwrapAudio90k(int64_t raw90k);
     int64_t sourcePtsMsForUnit(const CompressedAccessUnit& unit);
     int64_t sourcePtsMsForAudio(qint64 pts90k);
+    // Reset m_pendingVideoTimecode100ns to -1, then (if the access unit carries a
+    // SMPTE 12M timecode SEI) set it to that TC as 100 ns since midnight. Called once
+    // per access unit so timecode never bleeds across frames.
+    void updatePendingVideoTimecode(const CompressedAccessUnit& unit);
 };
 
 #endif // NATIVESRTINGESTSESSION_H

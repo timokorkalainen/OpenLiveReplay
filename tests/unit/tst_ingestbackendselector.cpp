@@ -1,7 +1,9 @@
 #include <QtTest>
 
+#include "recorder_engine/ingest/h26xaccessunit.h"
 #include "recorder_engine/ingest/ingestsession.h"
 #include "recorder_engine/ingest/nativesrtingestsession.h"
+#include "recorder_engine/timing/smpte12m.h"
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
 #include "recorder_engine/ingest/nativertmpingestsession.h"
 #endif
@@ -39,6 +41,8 @@ private slots:
     void sharedAnchorMapsStreamTime();
     void srtAnchorMapPureCases();
     void nativeSrtUnwrapsThirtyThreeBitTimestampWrap();
+    void nativeSrtExtractsSeiTimecodeOntoPendingVideoTimecode();
+    void nativeSrtNoSeiTimecodeLeavesNoStaleTimecodeBleed();
 };
 
 void TestIngestBackendSelector::srtRoutesToNativeSrt() {
@@ -386,6 +390,80 @@ void TestIngestBackendSelector::nativeSrtUnwrapsThirtyThreeBitTimestampWrap() {
     QCOMPARE(session.sourcePtsMsForAudio(wrap90k - 90), int64_t(1000));
     clockMs = 99999;
     QCOMPARE(session.sourcePtsMsForAudio(90), int64_t(1002));
+}
+
+namespace {
+
+// Assemble a minimal H.264 Annex-B access unit carrying a pic_timing SEI
+// (payloadType 1) whose payload is the big-endian SMPTE 12M word, followed by a
+// dummy VCL NAL — the same on-wire shape tst_h26xseitimecode builds.
+QByteArray h264AccessUnitWithSeiTimecode(const Smpte12mTimecode& tc) {
+    const char startCode[4] = {0x00, 0x00, 0x00, 0x01};
+    const uint32_t word = Smpte12m::toPackedWord(tc);
+    QByteArray payload(4, char(0));
+    payload[0] = char((word >> 24) & 0xFF);
+    payload[1] = char((word >> 16) & 0xFF);
+    payload[2] = char((word >> 8) & 0xFF);
+    payload[3] = char(word & 0xFF);
+
+    QByteArray rbsp;
+    rbsp.append(char(1));              // payloadType = 1 (pic_timing)
+    rbsp.append(char(payload.size())); // payloadSize = 4
+    rbsp.append(payload);
+
+    QByteArray annexB;
+    annexB.append(startCode, 4);
+    annexB.append(char(0x06)); // SEI NAL header (nal_type 6)
+    annexB.append(rbsp);
+    annexB.append(char(0x80)); // RBSP trailing-bits stop byte
+    annexB.append(startCode, 4);
+    annexB.append(QByteArray::fromHex("658884")); // dummy IDR VCL NAL
+    return annexB;
+}
+
+QByteArray h264AccessUnitWithoutSei() {
+    const char startCode[4] = {0x00, 0x00, 0x00, 0x01};
+    QByteArray annexB;
+    annexB.append(startCode, 4);
+    annexB.append(QByteArray::fromHex("658884")); // VCL NAL only, no SEI
+    return annexB;
+}
+
+} // namespace
+
+void TestIngestBackendSelector::nativeSrtExtractsSeiTimecodeOntoPendingVideoTimecode() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+
+    CompressedAccessUnit unit;
+    unit.codec = NativeVideoCodec::H264;
+    const Smpte12mTimecode tc{10, 11, 12, 13, /*drop*/ false, /*valid*/ true};
+    unit.annexB = h264AccessUnitWithSeiTimecode(tc);
+
+    session.updatePendingVideoTimecode(unit);
+
+    // The session stamps DecodedVideoFrame::sourceTimecode100ns from this member;
+    // it must equal the encoded TC mapped to 100 ns at the nominal fps.
+    QCOMPARE(session.m_pendingVideoTimecode100ns,
+             Smpte12m::to100ns(tc, NativeSrtIngestSession::kTimecodeNominalFps));
+    QVERIFY(session.m_pendingVideoTimecode100ns >= 0);
+}
+
+void TestIngestBackendSelector::nativeSrtNoSeiTimecodeLeavesNoStaleTimecodeBleed() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+
+    // A frame WITH timecode seeds the pending member.
+    CompressedAccessUnit withTc;
+    withTc.codec = NativeVideoCodec::H264;
+    withTc.annexB = h264AccessUnitWithSeiTimecode(Smpte12mTimecode{1, 0, 0, 0, false, true});
+    session.updatePendingVideoTimecode(withTc);
+    QVERIFY(session.m_pendingVideoTimecode100ns >= 0);
+
+    // A subsequent frame with NO SEI must report none (-1), not the previous TC.
+    CompressedAccessUnit noTc;
+    noTc.codec = NativeVideoCodec::H264;
+    noTc.annexB = h264AccessUnitWithoutSei();
+    session.updatePendingVideoTimecode(noTc);
+    QCOMPARE(session.m_pendingVideoTimecode100ns, int64_t(-1));
 }
 
 QTEST_GUILESS_MAIN(TestIngestBackendSelector)
