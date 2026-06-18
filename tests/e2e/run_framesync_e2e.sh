@@ -4,7 +4,7 @@
 # gates when OLR_FRAMESYNC_GATE=1.
 #
 # Usage: run_framesync_e2e.sh <sync_harness> <scenario> <base_port>
-#   scenarios: lipsync | intercam | drift | drift_skew | timecode
+#   scenarios: lipsync | intercam | drift | drift_skew | drift_avsync | timecode
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -227,6 +227,80 @@ run_drift() {
     fi
 }
 
+# Amplified A/V-offset regression under sustained clock skew. Injects a large
+# skew (default 2000 ppm) for a long run (default 60 s), then measures the
+# flash-vs-beep A/V offset in the FIRST third vs the LAST third of the recording.
+# If the restamp (SourceClock::toSessionMs slope correction) holds A/V alignment
+# under skew, the offset stays flat and (last_third - first_third) ~ 0. If A/V
+# offset accumulates, the last third drifts away from the first. Gate: regression
+# (last-first) must stay within 1 frame @30 (33.333 ms).
+run_drift_avsync() {
+    local udp="$BASE" srt=$((BASE + 1))
+    local mkv harness_err="$WORKDIR/harness.err" clock_ppm
+    if [ "$TRANSPORT" = "ndi" ]; then
+        local prefix="OLR-FS-${SCENARIO}-$$"
+        ndi_start_marker_sender "$prefix" 1 "$((SECS + 5))" "$SKEW_PPM"
+        mkv="$("$HARNESS" --url "$(ndi_url_for_source "$(ndi_marker_source_name "$prefix" 0)")" \
+            --outdir "$WORKDIR" --name framesync_drift_avsync --seconds "$SECS" --fps 30 \
+            --report-stats 2>"$harness_err" | tail -n1)"
+    else
+        OLR_MARKER_SKEW_PPM="$SKEW_PPM" flash_beep_tc_marker_to_udp "$udp"
+        srt_bridge "$udp" "$srt"
+        sleep 1.5
+        mkv="$("$HARNESS" --url "$(srt_caller_url "$srt")" --outdir "$WORKDIR" \
+            --name framesync_drift_avsync --seconds "$SECS" --fps 30 --report-stats 2>"$harness_err" | tail -n1)"
+    fi
+    expect_mkv "$mkv"
+
+    flash_pts_series "$mkv" 0 > "$WORKDIR/v.txt"
+    beep_pts_series "$mkv" 0 > "$WORKDIR/a.txt"
+
+    # Pair each flash to nearest beep, bucket pairs into thirds by flash time,
+    # and report the mean A/V offset (ms) of the first vs last third.
+    local av_stats avn first_ms last_ms reg_ms reg_frames span_s
+    av_stats="$(awk '
+        FNR==NR { f[++nf]=$1; next }
+        { b[++nb]=$1 }
+        END {
+            np=0; tmin=1e18; tmax=-1e18;
+            for (i=1;i<=nf;i++) {
+                best=1e9; bj=-1;
+                for (j=1;j<=nb;j++) { dd=b[j]-f[i]; ad=(dd<0?-dd:dd); if(ad<best){best=ad;bj=j} }
+                if (bj>0 && best<=0.25) {
+                    np++; pt[np]=f[i]; pd[np]=(b[bj]-f[i])*1000;
+                    if (f[i]<tmin) tmin=f[i]; if (f[i]>tmax) tmax=f[i];
+                }
+            }
+            if (np<3 || tmax<=tmin) { printf "%d nan nan nan nan nan", np; exit }
+            lo=tmin + (tmax-tmin)/3.0; hi=tmin + 2.0*(tmax-tmin)/3.0;
+            fs=0; fn=0; ls=0; ln=0;
+            for (k=1;k<=np;k++) {
+                if (pt[k] <= lo)      { fs+=pd[k]; fn++ }
+                else if (pt[k] >= hi) { ls+=pd[k]; ln++ }
+            }
+            if (fn==0 || ln==0) { printf "%d nan nan nan nan %.3f", np, tmax-tmin; exit }
+            fm=fs/fn; lm=ls/ln; reg=lm-fm;
+            printf "%d %.1f %.1f %.1f %.3f %.3f", np, fm, lm, reg, reg/33.333333, tmax-tmin;
+        }' "$WORKDIR/v.txt" "$WORKDIR/a.txt")"
+    read -r avn first_ms last_ms reg_ms reg_frames span_s <<<"$av_stats"
+
+    clock_ppm="$(awk '
+        /clockppm=/ {
+            for (i=1;i<=NF;i++) if ($i ~ /^clockppm=/) { split($i,a,"="); v=a[2] }
+        }
+        END { if (v == "") print "nan"; else print v }
+        ' "$harness_err")"
+
+    echo "REPORT: scenario=drift_avsync injected_ppm=${SKEW_PPM} secs=${SECS} recovered_clock_ppm=${clock_ppm} av_pairs=${avn} span_s=${span_s} av_offset_first_third_ms=${first_ms} av_offset_last_third_ms=${last_ms} av_offset_regression_ms=${reg_ms} av_offset_regression_frames=${reg_frames}"
+    [ "${avn:-0}" -ge 3 ] || fail "only ${avn:-0} A/V pairs"
+    awk -v r="$reg_ms" 'BEGIN{ exit !(r==r) }' || fail "could not compute A/V regression (first/last third empty)"
+
+    # Always gate this scenario: the whole point is to assert flat A/V offset.
+    awk -v r="$reg_ms" 'BEGIN{ if(r<0)r=-r; exit !(r <= 33.333334) }' \
+        || fail "A/V offset regression ${reg_ms}ms (${reg_frames} frames) exceeds 33ms (1 frame @30) under ${SKEW_PPM}ppm skew"
+    echo "PASS: framesync A/V offset regression ${reg_ms}ms (${reg_frames} frames) within 33ms under ${SKEW_PPM}ppm/${SECS}s skew"
+}
+
 run_timecode() {
     local udp="$BASE" srt=$((BASE + 1)) mkv tc
     if [ "$TRANSPORT" = "ndi" ]; then
@@ -262,6 +336,11 @@ case "$SCENARIO" in
     intercam) run_intercam ;;
     drift) run_drift ;;
     drift_skew) SKEW_PPM="${OLR_FRAMESYNC_SKEW_PPM:-200}"; run_drift ;;
+    drift_avsync)
+        SKEW_PPM="${OLR_FRAMESYNC_SKEW_PPM:-2000}"
+        SECS="${OLR_FRAMESYNC_SECS:-60}"
+        run_drift_avsync
+        ;;
     timecode) run_timecode ;;
     *) fail "unknown scenario '$SCENARIO'" ;;
 esac

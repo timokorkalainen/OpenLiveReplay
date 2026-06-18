@@ -126,6 +126,25 @@ quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
     return fp;
 }
 
+// Maps IngestStats::clockQuality (a ClockQuality enum stored as int) to the
+// operator-facing label shown in the source health tooltip.
+QString clockQualityLabel(int quality) {
+    switch (quality) {
+    case 0:
+        return QStringLiteral("Arrival");
+    case 1:
+        return QStringLiteral("FLV-PLL");
+    case 2:
+        return QStringLiteral("NDI");
+    case 3:
+        return QStringLiteral("PCR");
+    case 4:
+        return QStringLiteral("Reference");
+    default:
+        return QStringLiteral("?");
+    }
+}
+
 } // namespace
 
 UIManager::UIManager(ReplayManager* engine, QObject* parent)
@@ -1140,17 +1159,26 @@ QString UIManager::sourceStatsTooltip(int sourceIndex) const {
     }
     const IngestStats& s = m_sourceStats[sourceIndex].last;
     const QLocale loc;
+    // Recovered source-clock line, shown for every backend.
+    const QString clockLine =
+        QStringLiteral("\nclock     %1%2 ppm  (%3)")
+            .arg(s.clockPpm >= 0.0 ? QStringLiteral("+") : QString(),
+                 QString::number(s.clockPpm, 'f', 1), clockQualityLabel(s.clockQuality));
     if (s.kind == IngestStatsKind::Rtmp) {
         return QStringLiteral("RTMP link\nreceived   %1 bytes\nkeyframe   %2 ms ago\ndecode err %3")
-            .arg(loc.toString(qulonglong(s.bytesTotal)), loc.toString(qlonglong(s.keyframeAgeMs)),
-                 loc.toString(qulonglong(s.decodeFailures)));
+                   .arg(loc.toString(qulonglong(s.bytesTotal)),
+                        loc.toString(qlonglong(s.keyframeAgeMs)),
+                        loc.toString(qulonglong(s.decodeFailures))) +
+               clockLine;
     }
     QString pct = QStringLiteral("0.0");
     if (s.recvTotal > 0)
         pct = QString::number(100.0 * double(s.retransTotal) / double(s.recvTotal), 'f', 1);
     return QStringLiteral("SRT link\nrecv      %1\nretrans   %2  (%3%)\nloss det  %4\ndropped   %5")
-        .arg(loc.toString(qlonglong(s.recvTotal)), loc.toString(qlonglong(s.retransTotal)), pct,
-             loc.toString(qlonglong(s.lossTotal)), loc.toString(qlonglong(s.dropTotal)));
+               .arg(loc.toString(qlonglong(s.recvTotal)), loc.toString(qlonglong(s.retransTotal)),
+                    pct, loc.toString(qlonglong(s.lossTotal)),
+                    loc.toString(qlonglong(s.dropTotal))) +
+           clockLine;
 }
 
 void UIManager::resetSourceStats(int count) {

@@ -12,7 +12,6 @@ public:
     bool locked() const { return int(m_samples.size()) >= m_minSamples; }
     double ppm() const;
     double slope() const;
-    int64_t offsetNs() const;
     void reset();
 
 private:
@@ -29,7 +28,6 @@ private:
     size_t m_nextIndex = 0;
     mutable bool m_dirty = true;
     mutable double m_slope = 1.0;
-    mutable int64_t m_offsetNs = 0;
 };
 
 #endif // DRIFTESTIMATOR_H

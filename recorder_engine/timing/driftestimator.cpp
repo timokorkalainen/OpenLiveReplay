@@ -34,20 +34,11 @@ double DriftEstimator::slope() const {
     return m_slope;
 }
 
-int64_t DriftEstimator::offsetNs() const {
-    if (!locked()) {
-        return 0;
-    }
-    recompute();
-    return m_offsetNs;
-}
-
 void DriftEstimator::reset() {
     m_samples.clear();
     m_nextIndex = 0;
     m_dirty = true;
     m_slope = 1.0;
-    m_offsetNs = 0;
 }
 
 void DriftEstimator::recompute() const {
@@ -56,7 +47,6 @@ void DriftEstimator::recompute() const {
     }
     m_dirty = false;
     m_slope = 1.0;
-    m_offsetNs = 0;
 
     const int n = int(m_samples.size());
     if (n < m_minSamples) {
@@ -69,8 +59,6 @@ void DriftEstimator::recompute() const {
     double sumY = 0.0;
     double sumXX = 0.0;
     double sumXY = 0.0;
-    double meanSenderAbs = 0.0;
-    double meanSessionAbs = 0.0;
 
     for (const Sample& sample : m_samples) {
         const double x = double(sample.sessionNs) - baseSession;
@@ -79,15 +67,10 @@ void DriftEstimator::recompute() const {
         sumY += y;
         sumXX += x * x;
         sumXY += x * y;
-        meanSenderAbs += double(sample.senderNs);
-        meanSessionAbs += double(sample.sessionNs);
     }
 
     const double denom = double(n) * sumXX - sumX * sumX;
     if (std::abs(denom) > 0.0) {
         m_slope = (double(n) * sumXY - sumX * sumY) / denom;
     }
-    meanSenderAbs /= double(n);
-    meanSessionAbs /= double(n);
-    m_offsetNs = int64_t(std::llround(meanSessionAbs - meanSenderAbs));
 }
