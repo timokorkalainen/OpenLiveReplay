@@ -222,10 +222,19 @@ trap cleanup EXIT
 "$SRC" "$WORK/m" "$((SECONDS_RUN + 4))" || { echo "FAIL: marker source"; exit 1; }
 
 # 2. Mux to a worker-decodable MKV. ffv1 is lossless so the counter cells survive bit-exact.
+#    CRITICAL: the source PTS must be FLOOR-aligned to the output clock, which samples at
+#    playheadMs = floor(N*1000/30) (0,33,66,100,...). Plain `-video_track_timescale 1000`
+#    rounds (0,33,67,100,...) and the floor-sampling clock then double-samples/skips frames,
+#    producing ~60 systematic dupe+drop pairs per 6s. settb+setpts force PTS = trunc(N*1000/30)
+#    so each output tick samples a unique source frame. Do NOT "simplify" this back to
+#    -video_track_timescale — it silently breaks the drops==0/dupes==0 gate. (Real recorded
+#    fixtures from record_harness are already ms-aligned, so this only matters for this
+#    synthetic raw-frame fixture.)
 if ! ffmpeg -loglevel error -y \
         -f rawvideo -pix_fmt yuv420p -s 256x144 -r 30 -i "$WORK/m.yuv" \
         -f s16le -ar 48000 -ac 2 -i "$WORK/m.pcm" \
-        -c:v ffv1 -c:a pcm_s16le -video_track_timescale 1000 "$WORK/marker.mkv"; then
+        -vf "settb=1/1000,setpts=trunc(N*1000/30)" \
+        -c:v ffv1 -enc_time_base 1:1000 -c:a pcm_s16le "$WORK/marker.mkv"; then
     echo "FAIL: ffmpeg mux"; exit 1
 fi
 

@@ -88,6 +88,17 @@ variable entirely (the worker decodes ffv1 via FFmpeg). If the worker rejects ff
 to intra mpeg2 at high quality (`-q:v 2 -intra`). Audio is `pcm_s16le` (lossless), matching
 the worker's expected mezzanine audio.
 
+**PTS floor-alignment (load-bearing).** The free-running output clock samples the frame cache
+at `playheadMs = floor(N*1000/30)` (0, 33, 66, 100, …). The synthetic fixture's source PTS
+must match that lattice exactly, or the floor-sampling clock double-samples/skips frames —
+purely a source-vs-output-clock *phase* artifact (the documented "not genlock-grade"
+limitation), not an NDI-transport fault, but it would swamp the transport signal under test.
+The mux therefore forces `PTS = trunc(N*1000/30)` via `-vf settb=1/1000,setpts=trunc(N*1000/30)
+-enc_time_base 1:1000` rather than a plain `-video_track_timescale 1000` (which rounds and
+yields ~60 dupe+drop pairs per 6s). This isolation is non-vacuous: a genuine transport
+drop/dupe/reorder still fails the `==0` gates. Real recorded fixtures (record_harness, ms
+timebase) are already aligned, so this is specific to the synthetic raw-frame fixture.
+
 ## Gating, error handling, testing
 
 - Opt-in `ndi-output` label; runtime/ffmpeg gating via the existing skip-77 contract; SKIP
