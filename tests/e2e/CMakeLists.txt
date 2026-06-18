@@ -73,6 +73,13 @@ target_include_directories(ndi_output_sender PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(ndi_output_sender PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
 
+# Tier (b): writes the marker as raw YUV420P+S16 for muxing into a playback MKV.
+qt_add_executable(ndi_marker_mkv_source
+    ndi_marker_mkv_source.cpp
+    ndi_output_marker.cpp)
+target_include_directories(ndi_marker_mkv_source PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_marker_mkv_source PRIVATE Qt6::Core olr_warnings olr_sanitize)
+
 add_test(NAME e2e_ndi_output
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
         "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
