@@ -257,7 +257,6 @@ public:
     Q_INVOKABLE void seekPlayback(int64_t ms);
     Q_INVOKABLE void endScrubGesture();
 
-
     QString getSettingsPath(QString fileName);
 signals:
     void streamUrlsChanged();
