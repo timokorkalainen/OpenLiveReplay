@@ -1,4 +1,6 @@
 #include "settingsmanager.h"
+#include "playback/framerate.h"
+
 #include <QDebug>
 #include <QJsonValue>
 #include <QtGlobal>
@@ -131,6 +133,8 @@ bool SettingsManager::save(const QString& path, const AppSettings& settings) {
     root["videoWidth"] = settings.videoWidth;
     root["videoHeight"] = settings.videoHeight;
     root["fps"] = settings.fps;
+    root["fpsNum"] = settings.fpsNum;
+    root["fpsDen"] = settings.fpsDen;
     root["multiviewCount"] = settings.multiviewCount;
     root["showTimeOfDay"] = settings.showTimeOfDay;
     root["audioOutputLatencyMs"] = settings.audioOutputLatencyMs;
@@ -226,6 +230,15 @@ bool SettingsManager::load(const QString& path, AppSettings& settings) {
     settings.videoWidth = root["videoWidth"].toInt(settings.videoWidth);
     settings.videoHeight = root["videoHeight"].toInt(settings.videoHeight);
     settings.fps = root["fps"].toInt(settings.fps);
+    settings.fpsNum = root["fpsNum"].toInt(settings.fps);
+    settings.fpsDen = root["fpsDen"].toInt(1);
+    FrameRate rate = FrameRate::fromFraction(settings.fpsNum, settings.fpsDen);
+    if (!rate.isValid()) {
+        rate = FrameRate::fromFraction(qMax(1, settings.fps), 1);
+        settings.fpsNum = rate.numerator;
+        settings.fpsDen = rate.denominator;
+    }
+    settings.fps = rate.roundedFps(settings.fps);
     settings.multiviewCount = root["multiviewCount"].toInt(settings.multiviewCount);
     settings.showTimeOfDay = root["showTimeOfDay"].toBool(settings.showTimeOfDay);
     settings.audioOutputLatencyMs =

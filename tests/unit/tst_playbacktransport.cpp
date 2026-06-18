@@ -16,6 +16,8 @@ private slots:
     void seekClampsNegativeToZero();
     void seekEmitsPosChanged();
     void stepUsesFrameDuration();
+    void stepTargetsAdjacentFrameBoundaryFromUnalignedPosition();
+    void stepUsesRationalFrameDuration();
     void setPlayingTogglesAndDedupes();
 };
 
@@ -88,6 +90,48 @@ void TestPlaybackTransport::stepUsesFrameDuration() {
     t.seek(0);
     t.step(1); // 1000/60 = 16.66 -> 16ms
     QCOMPARE(t.currentPos(), qint64(16));
+}
+
+void TestPlaybackTransport::stepTargetsAdjacentFrameBoundaryFromUnalignedPosition() {
+    PlaybackTransport t;
+    t.setFps(30);
+
+    t.seek(50);
+    t.step(1);
+    QCOMPARE(t.currentPos(), qint64(66));
+
+    t.seek(50);
+    t.step(-1);
+    QCOMPARE(t.currentPos(), qint64(33));
+
+    t.seek(33);
+    t.step(1);
+    QCOMPARE(t.currentPos(), qint64(66));
+
+    t.seek(33);
+    t.step(-1);
+    QCOMPARE(t.currentPos(), qint64(0));
+}
+
+void TestPlaybackTransport::stepUsesRationalFrameDuration() {
+    PlaybackTransport t;
+    QVERIFY(QMetaObject::invokeMethod(&t, "setFrameRate", Q_ARG(int, 30000), Q_ARG(int, 1001)));
+    QCOMPARE(t.fps(), 30);
+
+    t.seek(0);
+    for (int i = 0; i < 30; ++i)
+        t.step(1);
+    QCOMPARE(t.currentPos(), qint64(1001));
+    t.step(-30);
+    QCOMPARE(t.currentPos(), qint64(0));
+
+    QVERIFY(QMetaObject::invokeMethod(&t, "setFrameRate", Q_ARG(int, 60000), Q_ARG(int, 1001)));
+    QCOMPARE(t.fps(), 60);
+
+    t.seek(0);
+    for (int i = 0; i < 60; ++i)
+        t.step(1);
+    QCOMPARE(t.currentPos(), qint64(1001));
 }
 
 void TestPlaybackTransport::setPlayingTogglesAndDedupes() {

@@ -9,6 +9,7 @@ class TestSettingsManager : public QObject {
     Q_OBJECT
 private slots:
     void roundTripPreservesEverything();
+    void loadBackfillsFrameRateFractionFromLegacyFps();
     void loadClampsTelemetryDelayMs();
     void loadMissingFileReturnsFalse();
     void loadMalformedJsonReturnsFalse();
@@ -24,7 +25,9 @@ AppSettings TestSettingsManager::sampleSettings() {
     s.fileName = QStringLiteral("match_01");
     s.videoWidth = 1280;
     s.videoHeight = 720;
-    s.fps = 50;
+    s.fps = 30;
+    s.fpsNum = 30000;
+    s.fpsDen = 1001;
     s.multiviewCount = 6;
     s.showTimeOfDay = true;
     s.importSettingsUrl = QStringLiteral("https://provider.example/project-settings.json");
@@ -95,6 +98,8 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.videoWidth, in.videoWidth);
     QCOMPARE(out.videoHeight, in.videoHeight);
     QCOMPARE(out.fps, in.fps);
+    QCOMPARE(out.fpsNum, in.fpsNum);
+    QCOMPARE(out.fpsDen, in.fpsDen);
     QCOMPARE(out.audioOutputLatencyMs, in.audioOutputLatencyMs);
     QCOMPARE(out.multiviewCount, in.multiviewCount);
     QCOMPARE(out.showTimeOfDay, in.showTimeOfDay);
@@ -134,6 +139,25 @@ void TestSettingsManager::roundTripPreservesEverything() {
              QStringLiteral("OLR Feed 1"));
     QCOMPARE(out.broadcastOutputs[1].sourceBus, OutputBusId::pgm());
     QVERIFY(!out.broadcastOutputs[1].enabled);
+}
+
+void TestSettingsManager::loadBackfillsFrameRateFractionFromLegacyFps() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("settings.json"));
+
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(QJsonDocument(QJsonObject{{"fps", 50}}).toJson());
+    f.close();
+
+    SettingsManager mgr;
+    AppSettings out;
+    QVERIFY(mgr.load(path, out));
+
+    QCOMPARE(out.fps, 50);
+    QCOMPARE(out.fpsNum, 50);
+    QCOMPARE(out.fpsDen, 1);
 }
 
 void TestSettingsManager::loadClampsTelemetryDelayMs() {

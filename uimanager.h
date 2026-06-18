@@ -41,6 +41,8 @@ class UIManager : public QObject {
     Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs
                    NOTIFY audioOutputLatencyChanged)
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
+    Q_PROPERTY(int recordFpsNumerator READ recordFpsNumerator NOTIFY recordFpsChanged)
+    Q_PROPERTY(int recordFpsDenominator READ recordFpsDenominator NOTIFY recordFpsChanged)
     Q_PROPERTY(int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
     Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
@@ -106,6 +108,8 @@ public:
     int recordWidth() const;
     int recordHeight() const;
     int recordFps() const;
+    int recordFpsNumerator() const;
+    int recordFpsDenominator() const;
     int audioOutputLatencyMs() const;
     void setAudioOutputLatencyMs(int ms);
     int multiviewCount() const;
@@ -161,6 +165,7 @@ public:
     void setRecordWidth(int width);
     void setRecordHeight(int height);
     void setRecordFps(int fps);
+    Q_INVOKABLE void setRecordFrameRate(int numerator, int denominator);
     void setMultiviewCount(int count);
     void setTimeOfDayMode(bool enabled);
     void setImportSettingsUrl(const QString &url);

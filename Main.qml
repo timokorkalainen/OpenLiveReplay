@@ -1209,15 +1209,36 @@ ApplicationWindow {
 
                     Label { text: "FPS"; }
 
-                    SpinBox {
-                        from: 1
-                        to: 120
-                        stepSize: 1
-                        editable: true
-                        inputMethodHints: Qt.ImhDigitsOnly
-                        value: appWindow.uiManagerRef.recordFps
+                    ComboBox {
+                        Layout.fillWidth: true
+                        textRole: "label"
+                        model: ListModel {
+                            ListElement { label: "23.976"; num: 24000; den: 1001 }
+                            ListElement { label: "24"; num: 24; den: 1 }
+                            ListElement { label: "25"; num: 25; den: 1 }
+                            ListElement { label: "29.97"; num: 30000; den: 1001 }
+                            ListElement { label: "30"; num: 30; den: 1 }
+                            ListElement { label: "50"; num: 50; den: 1 }
+                            ListElement { label: "59.94"; num: 60000; den: 1001 }
+                            ListElement { label: "60"; num: 60; den: 1 }
+                            ListElement { label: "120"; num: 120; den: 1 }
+                        }
+                        currentIndex: {
+                            for (var i = 0; i < model.count; ++i) {
+                                var preset = model.get(i)
+                                if (preset.num === appWindow.uiManagerRef.recordFpsNumerator
+                                        && preset.den === appWindow.uiManagerRef.recordFpsDenominator) {
+                                    return i
+                                }
+                            }
+                            return -1
+                        }
+                        displayText: currentIndex >= 0 ? currentText : appWindow.uiManagerRef.recordFps + " fps"
                         enabled: !appWindow.uiManagerRef.isRecording
-                        onValueModified: appWindow.uiManagerRef.recordFps = value
+                        onActivated: {
+                            var preset = model.get(currentIndex)
+                            appWindow.uiManagerRef.setRecordFrameRate(preset.num, preset.den)
+                        }
                     }
 
                     Item { }

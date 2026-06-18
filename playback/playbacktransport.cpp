@@ -1,8 +1,29 @@
 #include "playbacktransport.h"
 
-PlaybackTransport::PlaybackTransport(QObject *parent)
-    : QObject(parent), m_tickTimer(new QTimer(this))
-{
+#include <QtGlobal>
+
+namespace {
+qint64 firstFrameIndexAtOrAfterMs(FrameRate rate, qint64 ms) {
+    if (!rate.isValid() || ms <= 0) return 0;
+
+    qint64 index = rate.msToFrameIndex(ms);
+    while (rate.frameIndexToMs(index) < ms)
+        ++index;
+    while (index > 0 && rate.frameIndexToMs(index - 1) >= ms)
+        --index;
+    return index;
+}
+
+qint64 firstFrameIndexAfterMs(FrameRate rate, qint64 ms) {
+    qint64 index = firstFrameIndexAtOrAfterMs(rate, ms);
+    while (rate.frameIndexToMs(index) <= ms)
+        ++index;
+    return index;
+}
+} // namespace
+
+PlaybackTransport::PlaybackTransport(QObject* parent)
+    : QObject(parent), m_tickTimer(new QTimer(this)) {
     connect(m_tickTimer, &QTimer::timeout, this, &PlaybackTransport::onTick);
     m_tickTimer->setInterval(m_timerIntervalMs);
     m_tickTimer->setTimerType(Qt::PreciseTimer);
@@ -23,7 +44,12 @@ bool PlaybackTransport::isPlaying() const {
 }
 
 int PlaybackTransport::fps() const {
-    return m_fps.load(std::memory_order_relaxed);
+    return frameRate().roundedFps();
+}
+
+FrameRate PlaybackTransport::frameRate() const {
+    QMutexLocker locker(&m_mutex);
+    return m_frameRate;
 }
 
 void PlaybackTransport::setPlaying(bool playing) {
@@ -39,7 +65,10 @@ void PlaybackTransport::setPlaying(bool playing) {
     }
     // QTimer must be driven from its owning (main) thread; setPlaying is
     // only ever called from the UI/main thread.
-    if (playing) m_tickTimer->start(); else m_tickTimer->stop();
+    if (playing)
+        m_tickTimer->start();
+    else
+        m_tickTimer->stop();
     emit playingChanged(playing);
 }
 
@@ -51,8 +80,8 @@ void PlaybackTransport::setSpeed(double speed) {
         if (m_isPlaying.load()) {
             // Bank the position progressed at the OLD speed before the
             // new one takes effect.
-            m_currentPos = m_playStartPos
-                + static_cast<int64_t>(m_playStartTime.elapsed() * m_speed.load());
+            m_currentPos =
+                m_playStartPos + static_cast<int64_t>(m_playStartTime.elapsed() * m_speed.load());
             m_playStartPos = m_currentPos;
             m_playStartTime.restart();
         }
@@ -62,9 +91,27 @@ void PlaybackTransport::setSpeed(double speed) {
 }
 
 void PlaybackTransport::setFps(int fps) {
-    if (fps <= 0) return;
-    if (m_fps.exchange(fps) == fps) return;
-    emit fpsChanged(fps);
+    setFrameRate(fps, 1);
+}
+
+void PlaybackTransport::setFrameRate(int numerator, int denominator) {
+    FrameRate next = FrameRate::fromFraction(numerator, denominator);
+    if (!next.isValid()) return;
+
+    int previousRounded = 30;
+    const int nextRounded = next.roundedFps();
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_frameRate.numerator == next.numerator &&
+            m_frameRate.denominator == next.denominator) {
+            return;
+        }
+        previousRounded = m_frameRate.roundedFps();
+        m_frameRate = next;
+    }
+
+    if (previousRounded != nextRounded) emit fpsChanged(nextRounded);
+    emit frameRateChanged();
 }
 
 void PlaybackTransport::seek(int64_t posMs) {
@@ -82,10 +129,15 @@ void PlaybackTransport::seek(int64_t posMs) {
 }
 
 void PlaybackTransport::step(int frames) {
-    // Step by exact frame duration based on configured FPS
-    int fps = qMax(1, m_fps.load());
-    int64_t stepSize = static_cast<int64_t>(frames * (1000.0 / fps));
-    seek(currentPos() + stepSize);
+    if (frames == 0) return;
+    const FrameRate rate = frameRate();
+    if (!rate.isValid()) return;
+
+    const qint64 pos = currentPos();
+    const qint64 targetFrame =
+        frames > 0 ? firstFrameIndexAfterMs(rate, pos) + qint64(frames - 1)
+                   : qMax<qint64>(0, firstFrameIndexAtOrAfterMs(rate, pos) + qint64(frames));
+    seek(rate.frameIndexToMs(targetFrame));
 }
 
 void PlaybackTransport::onTick() {
