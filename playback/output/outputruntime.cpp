@@ -76,6 +76,11 @@ OutputDispatchStats OutputRuntime::stats() const {
     return m_dispatcher.stats();
 }
 
+qint64 OutputRuntime::dispatcherNextOutputFrameIndex() const {
+    QMutexLocker locker(&m_mutex);
+    return m_dispatcher.nextOutputFrameIndex();
+}
+
 void OutputRuntime::run() {
     QElapsedTimer timer;
     timer.start();
