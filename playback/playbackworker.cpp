@@ -228,13 +228,18 @@ void PlaybackWorker::resetDedup() {
         track->lastDeliveredPtsMs = -1;
 }
 
-void PlaybackWorker::clearAllBuffers() {
+void PlaybackWorker::clearDecoderBuffers() {
     QMutexLocker bufferLocker(&m_bufferMutex);
     for (auto* track : m_decoderBank) {
         track->buffer.clear();
         track->decimateCounter = 0;
     }
-    if (m_outputCache) m_outputCache->clear();
+    // NOTE: deliberately does NOT clear m_outputCache. The OutputRuntime paints
+    // exclusively from m_outputCache; wiping it here makes the next ~1ms tick
+    // snapshot an empty cache and render the gray placeholder (the seek flash).
+    // The cache's stale frames are harmless: the forward fill re-inserts the
+    // new frames before the playhead reaches them, and trimBefore() drops the
+    // old ones. See docs/superpowers/plans (Tier 1 Task 1).
 }
 
 bool PlaybackWorker::reuseAt(int64_t target) {
@@ -567,7 +572,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     }
 
     // --- Full reposition: clear everything, seek behind target, fill forward. ---
-    clearAllBuffers();
+    clearDecoderBuffers();
     m_reverseAnchorMs = INT64_MAX; // a seek invalidates the reverse-fetch run
     m_audioQueue.clear();
     for (auto* aTrack : m_audioDecoderBank) {
@@ -590,6 +595,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     const int64_t fillTo = target + frameDurMs();
     int packets = 0;
     const int packetBudget = (capFrames(trackCount) + 4) * trackCount * 2;
+    bool deliveredEarly = false;
     while (!shouldInterrupt()) {
         // A newer explicit seek supersedes this fill.
         {
@@ -608,11 +614,21 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                              /*audioOn*/ false, /*dedupTail*/ false);
         av_packet_unref(pkt);
 
+        // All-intra deliver-first: the moment every track has a frame at the
+        // target, paint it — do NOT wait for the whole trail/lead to fill. The
+        // loop keeps filling afterwards (same inserts → back-step reuse intact);
+        // the final deliverDueFrames below is a dedup no-op for this pts.
+        if (!deliveredEarly && reuseAt(target)) {
+            resetDedup();
+            deliverDueFrames(target, dir);
+            deliveredEarly = true;
+        }
+
         if (++packets > packetBudget) break; // safety bound
         if (newestPtsMin() >= fillTo) break; // covered the target
     }
 
-    resetDedup();
+    if (!deliveredEarly) resetDedup();
     deliverDueFrames(target, dir);
     m_counters.reposition++;
 }
@@ -886,7 +902,7 @@ void PlaybackWorker::run() {
                 int64_t anchor = qMax<int64_t>(0, P - kTrailMs);
                 int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
                 av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
-                clearAllBuffers();
+                clearDecoderBuffers();
                 m_audioQueue.clear();
                 for (auto* aTrack : m_audioDecoderBank) {
                     aTrack->lastEnqueuedPtsMs = -1;
@@ -1131,41 +1147,57 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     const qint64 outputFrameIndex = rate.msToFrameIndex(P);
     {
         QMutexLocker bufferLocker(&m_bufferMutex);
-        int placeholderWidth = 1920;
-        int placeholderHeight = 1080;
-        QVector<QVector<TrackBuffer::Frame>> snapshots;
-        snapshots.reserve(m_decoderBank.size());
-        for (auto* track : m_decoderBank) {
-            QVector<TrackBuffer::Frame> frames =
-                track ? track->buffer.framesSnapshot() : QVector<TrackBuffer::Frame>();
-            for (const TrackBuffer::Frame& frame : frames) {
-                if (frame.frame.isValid()) {
-                    placeholderWidth = frame.frame.width;
-                    placeholderHeight = frame.frame.height;
-                    break;
+
+        // Only the inactive-output-graph path needs to render frames here; when
+        // the OutputRuntime is active it paints from m_outputCache on its own
+        // tick, so building a local snapshot/cache/engine is pure dead work.
+        OutputBusEngine* engine = nullptr;
+        OutputFrameCache* localCache = nullptr;
+        PlaybackStateSnapshot state;
+        std::unique_ptr<OutputBusEngine> engineHolder;
+        std::unique_ptr<OutputFrameCache> cacheHolder;
+
+        if (!outputGraphActive) {
+            int placeholderWidth = 1920;
+            int placeholderHeight = 1080;
+            QVector<QVector<TrackBuffer::Frame>> snapshots;
+            snapshots.reserve(m_decoderBank.size());
+            for (auto* track : m_decoderBank) {
+                QVector<TrackBuffer::Frame> frames =
+                    track ? track->buffer.framesSnapshot() : QVector<TrackBuffer::Frame>();
+                for (const TrackBuffer::Frame& frame : frames) {
+                    if (frame.frame.isValid()) {
+                        placeholderWidth = frame.frame.width;
+                        placeholderHeight = frame.frame.height;
+                        break;
+                    }
+                }
+                snapshots.append(frames);
+            }
+
+            cacheHolder = std::make_unique<OutputFrameCache>(m_decoderBank.size(), placeholderWidth,
+                                                             placeholderHeight);
+            for (int trackIndex = 0; trackIndex < m_decoderBank.size(); ++trackIndex) {
+                DecoderTrack* track = m_decoderBank[trackIndex];
+                if (!track) continue;
+                for (TrackBuffer::Frame frame : snapshots[trackIndex]) {
+                    frame.frame.feedIndex = track->feedIndex;
+                    cacheHolder->insertVideoFrame(frame.frame);
                 }
             }
-            snapshots.append(frames);
-        }
+            localCache = cacheHolder.get();
 
-        OutputFrameCache cache(m_decoderBank.size(), placeholderWidth, placeholderHeight);
-        for (int trackIndex = 0; trackIndex < m_decoderBank.size(); ++trackIndex) {
-            DecoderTrack* track = m_decoderBank[trackIndex];
-            if (!track) continue;
-            for (TrackBuffer::Frame frame : snapshots[trackIndex]) {
-                frame.frame.feedIndex = track->feedIndex;
-                cache.insertVideoFrame(frame.frame);
-            }
-        }
+            engineHolder = std::make_unique<OutputBusEngine>(rate, m_decoderBank.size(),
+                                                             placeholderWidth, placeholderHeight);
+            engine = engineHolder.get();
 
-        OutputBusEngine engine(rate, m_decoderBank.size(), placeholderWidth, placeholderHeight);
-        PlaybackStateSnapshot state;
-        state.playheadMs = P;
-        state.playing = false;
-        state.speed = 1.0;
-        state.playStartedAtOutputFrame = outputFrameIndex;
-        state.playStartedAtPlayheadMs = P;
-        state.selectedFeedIndex = m_decoderBank.isEmpty() ? -1 : 0;
+            state.playheadMs = P;
+            state.playing = false;
+            state.speed = 1.0;
+            state.playStartedAtOutputFrame = outputFrameIndex;
+            state.playStartedAtPlayheadMs = P;
+            state.selectedFeedIndex = m_decoderBank.isEmpty() ? -1 : 0;
+        }
 
         for (auto* track : m_decoderBank) {
             if (!track || !track->provider) continue;
@@ -1188,7 +1220,7 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
                     track->lastDeliveredPtsMs = p;
                     if (outputGraphActive) continue;
                     OutputBusFrame busFrame =
-                        engine.renderFeed(track->feedIndex, outputFrameIndex, state, cache);
+                        engine->renderFeed(track->feedIndex, outputFrameIndex, state, *localCache);
                     pending.append({track->provider, busFrame.video});
                 }
             }
@@ -1218,9 +1250,13 @@ MediaVideoFrame PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int fee
     out.strideU = (frame->width + 1) / 2;
     out.strideV = (frame->width + 1) / 2;
     const int chromaH = (frame->height + 1) / 2;
-    out.planeY = QByteArray(out.strideY * frame->height, '\0');
-    out.planeU = QByteArray(out.strideU * chromaH, '\0');
-    out.planeV = QByteArray(out.strideV * chromaH, '\0');
+    // Allocate uninitialized: the per-line memcpy below overwrites every byte
+    // up to copyW for all `height` lines, so a zero-fill is a dead store
+    // (~3 MB memset per 1080p frame). Padding bytes (width..stride) are never
+    // read by the renderer.
+    out.planeY = QByteArray(out.strideY * frame->height, Qt::Uninitialized);
+    out.planeU = QByteArray(out.strideU * chromaH, Qt::Uninitialized);
+    out.planeV = QByteArray(out.strideV * chromaH, Qt::Uninitialized);
 
     QByteArray* dstPlanes[3] = {&out.planeY, &out.planeU, &out.planeV};
     const int dstStrides[3] = {out.strideY, out.strideU, out.strideV};

@@ -157,10 +157,17 @@ add_test(NAME e2e_play_4view
 add_test(NAME e2e_play_latency
     COMMAND bash "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" latency 2 23478)
+# Seek-flash gate: a forward seek after a warm cache must paint NO new gray
+# placeholder (post-seek placeholderFramesDelta==0). Port 23494 (UDP 23495) is
+# clear of the record/sync/av-sync/native ranges.
+add_test(NAME e2e_play_seekflash
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" seekflash 2 23494)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
+    e2e_play_seekflash
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180
