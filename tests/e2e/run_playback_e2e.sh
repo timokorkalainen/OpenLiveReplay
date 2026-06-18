@@ -148,6 +148,9 @@ audioPushes="$(get audioPushes)"
 framesDropped="$(get framesDropped)"
 resyncCount="$(get resyncCount)"
 placeholderFramesDelta="$(get placeholderFramesDelta)"
+skippedDuplicateFrames="$(get skippedDuplicateFrames)"
+cacheGeneration="$(get cacheGeneration)"
+heldFramesDelta="$(get heldFramesDelta)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -157,6 +160,9 @@ placeholderFramesDelta="$(get placeholderFramesDelta)"
 [ -n "$framesDropped" ] || framesDropped="?"
 [ -n "$resyncCount" ] || resyncCount="?"
 [ -n "$placeholderFramesDelta" ] || placeholderFramesDelta="?"
+[ -n "$skippedDuplicateFrames" ] || skippedDuplicateFrames="?"
+[ -n "$cacheGeneration" ] || cacheGeneration="?"
+[ -n "$heldFramesDelta" ] || heldFramesDelta="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -296,13 +302,56 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    farback)
+        # Far-backward seek (near EOF -> 0): the worst case for the seek flash.
+        # The committed-playhead gate (Task 1) + worker double-buffer (Task 2)
+        # must keep the flash gate clean — NO new placeholder across the jump
+        # (placeholderFramesDelta==0) — with a bounded reposition count and at
+        # least one committed cache generation (cacheGeneration>=1 proves the
+        # reposition decoded and committed a frame at its target).
+        #
+        # reposition is a SECONDARY bound here. Unlike seekplay's single mid-seek,
+        # farback structurally repositions a handful of times: the warmup seek to
+        # near-EOF, the EOF tail-hold, the far-backward seek to 0, and a settling
+        # reposition as playback resumes from 0 (measured 3-4 across runs). Bound
+        # it at 6 — clear headroom over the observed band yet far below a seek
+        # storm (the old loop produced dozens) — so a genuine regression still
+        # trips without flaking. The flash gate (placeholderFramesDelta) is the
+        # primary assertion.
+        if ! num "$reposition" || [ "$reposition" -gt 6 ]; then
+            echo "FAIL: farback repositioned too much (reposition=$reposition, expected <=6) — seek storm"
+            fail=1
+        fi
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: farback flashed a placeholder (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — seek flash regressed"
+            fail=1
+        fi
+        if ! num "$cacheGeneration" || [ "$cacheGeneration" -lt 1 ]; then
+            echo "FAIL: farback never committed a cache generation (cacheGeneration=$cacheGeneration, expected >=1)"
+            fail=1
+        fi
+        # SECONDARY anti-masking bound (Task 2): the worker double-buffer keeps the
+        # OLD frames published throughout the far-back fill, so the dispatcher
+        # hold-last only fires for a brief transient at the playhead flip (the live
+        # playhead momentarily sits just below the first decoded frame) — measured
+        # ~6 held ticks. A masking regression (publishing the half-built staging
+        # cache for the whole multi-reposition fill) drives this into the dozens.
+        # Bound at 20: clear of the transient + host variance, far below a masking
+        # regression. The primary proof that no gray was shown is placeholderFrames-
+        # Delta==0 above; baseHeld (stderr) being ~0 shows the warmup reposition did
+        # not mask either.
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -gt 20 ]; then
+            echo "FAIL: farback held frames across the jump (heldFramesDelta=$heldFramesDelta, expected <=20) — double-buffer not keeping old frames published (Tier-1 masking)"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

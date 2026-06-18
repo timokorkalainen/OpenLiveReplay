@@ -13,7 +13,9 @@
 #include <memory>
 #include <vector>
 #include "frameprovider.h"
+#include "playback/commitgate.h"
 #include "playback/output/outputruntime.h"
+#include "playback/output/sharedcacheslot.h"
 #include "playback/output/outputtargetassignment.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
@@ -70,6 +72,11 @@ public:
 
     PlaybackCounters counters() const { return m_counters; }
     OutputDispatchStats outputStats() const;
+    // The committed cache generation (set at repositionTo's tail). >=1 after a
+    // real reposition proves a target was decoded and committed to the cache.
+    uint64_t cacheGeneration() const {
+        return m_committedGeneration.load(std::memory_order_acquire);
+    }
 
 protected:
     void run() override;
@@ -124,6 +131,9 @@ private:
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
+    // Snapshot m_outputCache into the published immutable slot. Caller must hold
+    // m_bufferMutex.
+    void publishOutputCacheLocked();
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
@@ -154,6 +164,15 @@ private:
     // fetch yet this run; reset on reposition and whenever travelling forward.
     int64_t m_reverseAnchorMs = INT64_MAX;
 
+    // Seek-gate generations (read in makeOutputSnapshot; written in seekTo /
+    // repositionTo). When m_committedGeneration == m_seekGeneration there is no
+    // reposition outstanding and the live playhead is exposed (1x advances);
+    // while they differ a seek is in flight against a not-yet-ready cache and
+    // the gate holds m_committedPlayheadMs (CommitGate).
+    std::atomic<uint64_t> m_seekGeneration{0};
+    std::atomic<uint64_t> m_committedGeneration{0};
+    std::atomic<int64_t> m_committedPlayheadMs{0};
+
     QMutex m_mutex;
     mutable QMutex m_bufferMutex;
     mutable QMutex m_outputRuntimeMutex;
@@ -161,6 +180,13 @@ private:
     QList<OutputTargetAssignment> m_externalOutputAssignments;
     std::atomic<bool> m_outputTargetsDirty{false};
     std::unique_ptr<OutputFrameCache> m_outputCache;
+    // Worker-thread-only staging buffer: a reposition decodes the target window
+    // here, then merges into the live cache and trims old frames only after
+    // coverage (double-buffer; never published to the output thread).
+    std::unique_ptr<OutputFrameCache> m_stagingCache;
+    // Immutable snapshot of m_outputCache published to the output thread
+    // (replaces the per-tick deep copy in makeOutputSnapshot).
+    SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
     int m_outputFeedCount = 0;

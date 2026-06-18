@@ -18,6 +18,10 @@ public:
     QByteArray audioSpanOrSilence(int feedIndex, qint64 startSample, int sampleFrames) const;
 
     int feedCount() const { return m_video.size(); }
+    // Insert every frame from `other` (video + audio) without removing the
+    // current contents. Feed counts must match. Used to merge a staging window
+    // into the live cache before trimming old frames (double-buffer).
+    void mergeFrom(const OutputFrameCache& other);
     void trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample);
     void clear();
 

@@ -75,6 +75,19 @@ QByteArray OutputFrameCache::audioSpanOrSilence(int feedIndex, qint64 startSampl
     return out;
 }
 
+void OutputFrameCache::mergeFrom(const OutputFrameCache& other) {
+    const qsizetype feeds = qMin(m_video.size(), other.m_video.size());
+    for (qsizetype feed = 0; feed < feeds; ++feed) {
+        for (const MediaVideoFrame& frame : other.m_video.at(feed))
+            insertVideoFrame(frame);
+    }
+    const qsizetype aFeeds = qMin(m_audio.size(), other.m_audio.size());
+    for (qsizetype feed = 0; feed < aFeeds; ++feed) {
+        for (const MediaAudioFrame& frame : other.m_audio.at(feed))
+            insertAudioFrame(frame);
+    }
+}
+
 void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample) {
     for (auto& frames : m_video) {
         int firstAtOrAfter = 0;

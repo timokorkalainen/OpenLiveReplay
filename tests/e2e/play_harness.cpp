@@ -17,7 +17,8 @@
 // OLR_PB_TELEMETRY is set in the environment (passed through transparently).
 //
 // usage: play_harness <file.mkv> <scenario> [viewCount]
-//   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash
+//   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
+//              farback
 #include <QCoreApplication>
 #include <QTimer>
 #include <QList>
@@ -86,9 +87,15 @@ int main(int argc, char** argv) {
     // gate measures the DELTA across the test seek, not the whole-run total.
     // -1 = never snapshotted (every non-seekflash scenario reports delta 0).
     auto* basePh = new qint64(-1);
+    // Same DELTA approach for HELD frames: farback asserts the worker double-buffer
+    // (Task 2), not the dispatcher hold-last, keeps real frames visible — so
+    // heldFrames must NOT spike across the jump. A masking regression (publishing
+    // the half-built staging cache) would show held frames for the whole fill.
+    // -1 = never snapshotted (other scenarios report delta 0).
+    auto* baseHeld = new qint64(-1);
 
     // Print the final counters in a parseable form, then quit.
-    auto finish = [&, basePh]() {
+    auto finish = [&, basePh, baseHeld]() {
         // Read the output stats BEFORE stop(): the worker's run() tears down the
         // OutputRuntime on exit (shutdownOutputGraph nulls m_outputRuntime), so a
         // post-stop outputStats() would return a zeroed struct (delta would go
@@ -97,11 +104,15 @@ int main(int argc, char** argv) {
         worker.stop();
         const PlaybackWorker::PlaybackCounters c = worker.counters();
         const qint64 phDelta = (*basePh < 0) ? 0 : (os.placeholderFrames - *basePh);
+        const qint64 heldDelta = (*baseHeld < 0) ? 0 : (os.heldFrames - *baseHeld);
         printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
-               "placeholderFramesDelta=%lld\n",
+               "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
+               "heldFramesDelta=%lld\n",
                c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-               c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta);
+               c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
+               (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
+               (long long) heldDelta);
         fflush(stdout);
         app.quit();
     };
@@ -232,6 +243,34 @@ int main(int argc, char** argv) {
             });
             QTimer::singleShot(4500, &app, finish);
 
+        } else if (scen == "farback") {
+            // Far-BACKWARD seek: play near EOF, then jump all the way back to 0.
+            // The live cache holds only end-of-file frames at the instant the
+            // playhead snaps to 0, so this is the worst case for the seek flash.
+            // The CommitGate (Task 1) + worker double-buffer (Task 2) must keep
+            // placeholderFramesDelta==0 across the jump, and a committed cache
+            // generation (>=1) must be recorded for the reposition. Mirror the
+            // seekflash baseline-delta pattern: warm up so a real frame is
+            // delivered + cached, snapshot the placeholder baseline BEFORE the
+            // backward seek, then jump to 0 and play on.
+            const int64_t near = qMax<int64_t>(0, durMs - 1000);
+            transport.setSpeed(1.0);
+            transport.seek(near);
+            worker.seekTo(near);
+            transport.setPlaying(true);
+            // After warmup (~1.5s near EOF): snapshot baseline, then far-back seek.
+            QTimer::singleShot(1500, &app, [&, basePh, baseHeld]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
+                fprintf(stderr,
+                        "### farback basePh=%lld baseHeld=%lld; far-backward seek to 0 ###\n",
+                        (long long) *basePh, (long long) *baseHeld);
+                transport.seek(0);
+                worker.seekTo(0);
+            });
+            QTimer::singleShot(4500, &app, finish);
+
         } else {
             fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());
             // Still print counters (all zero) so the driver gets a line, then
@@ -240,11 +279,15 @@ int main(int argc, char** argv) {
             worker.stop();
             const PlaybackWorker::PlaybackCounters c = worker.counters();
             const qint64 phDelta = (*basePh < 0) ? 0 : (os.placeholderFrames - *basePh);
+            const qint64 heldDelta = (*baseHeld < 0) ? 0 : (os.heldFrames - *baseHeld);
             printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                    "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
-                   "placeholderFramesDelta=%lld\n",
+                   "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
+                   "heldFramesDelta=%lld\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-                   c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta);
+                   c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
+                   (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
+                   (long long) heldDelta);
             fflush(stdout);
             ::exit(2);
         }
