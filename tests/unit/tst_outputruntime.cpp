@@ -91,6 +91,9 @@ void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
         return snapshot;
     });
     runtime.setEndpoints({{assignment, &sink}});
+    // This test asserts a per-tick submit of the SAME paused frame; identity-skip
+    // (default on) would collapse the repeats, so disable it here.
+    runtime.setIdentitySkip(false);
 
     runtime.dispatchDueTicksForTest(0);
     runtime.dispatchDueTicksForTest(40);
@@ -164,6 +167,9 @@ void TestOutputRuntime::workerThreadTicksWithoutExternalDispatchCalls() {
         return snapshot;
     });
     runtime.setEndpoints({{assignment, &sink}});
+    // The runtime thread re-ticks the SAME paused frame; identity-skip (default on)
+    // would collapse the repeats to one submit, so disable it for this assertion.
+    runtime.setIdentitySkip(false);
 
     runtime.startRuntime();
     QTRY_VERIFY_WITH_TIMEOUT(sink.frameCount() >= 3, 500);
