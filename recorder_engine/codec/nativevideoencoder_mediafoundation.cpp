@@ -8,6 +8,7 @@
 #endif
 
 #include <QByteArray>
+#include <QHash>
 #include <QList>
 #include <QString>
 
@@ -39,8 +40,11 @@ namespace {
 
 // All-intra, every output sample is a key frame. The MF H.264 encoder emits
 // timestamps in 100 ns units; the encoder echoes the caller-supplied opaque
-// ptsTicks back to the packet callback (it does not interpret them), so we only
-// need a monotonic MF sample time to keep the encoder happy.
+// ptsTicks back to the packet callback (it does not interpret them). We stamp
+// each input sample with a monotonic MF sample time (purely to keep the encoder
+// happy) and use that time as a key to recover the caller's opaque ptsTicks when
+// the matching output sample emerges, so the callback always sees the caller's
+// value rather than the internal MF clock.
 constexpr LONGLONG kMfTimePerSecond = 10000000;
 
 QString hrMessage(const QString& action, HRESULT hr) {
@@ -144,23 +148,50 @@ private:
                           QString* error);
     bool drainOutput(const PacketCallback& onPacket, QString* error);
     bool buildAvccFromSequenceHeader(QString* error);
+    bool emitOutputSample(IMFSample* sample, const PacketCallback& onPacket, QString* error);
+
+    // Async event-pump helpers (used only when the chosen MFT is async).
+    bool processInputSample(IMFSample* sample, QString* error);
+    bool processOutputAsync(const PacketCallback& onPacket, QString* error);
+    bool handleAsyncEvent(IMFMediaEvent* event, IMFSample* inputSample, bool* submittedInput,
+                          const PacketCallback& onPacket, QString* error);
+    bool encodeAsync(IMFSample* inputSample, const PacketCallback& onPacket, QString* error);
+    bool drainReadyAsyncEvents(const PacketCallback& onPacket, QString* error);
+    bool flushAsync(const PacketCallback& onPacket, QString* error);
+
+    // Recover the caller's opaque ptsTicks for an output sample, keyed by the MF
+    // sample time we stamped onto the matching input. Falls back to the MF time
+    // converted to ticks when no mapping exists (e.g. encoder reordered output).
+    int64_t resolvePtsTicks(LONGLONG sampleTime);
 
     Config m_config;
     ComPtr<IMFTransform> m_transform;
+    ComPtr<IMFMediaEventGenerator> m_eventGenerator;
     QByteArray m_avcc;
     bool m_comInitialized = false;
     bool m_mfStarted = false;
     bool m_streaming = false;
+    bool m_asyncTransform = false;
+    int m_asyncNeedInputEvents = 0;
     LONGLONG m_sampleDuration = 0;
     LONGLONG m_nextSampleTime = 0;
+    // Maps the MF input sample time (our monotonic stamp) to the caller's opaque
+    // ptsTicks so the packet callback echoes the caller's value, per the contract.
+    QHash<LONGLONG, int64_t> m_ptsByMfTime;
 };
 
 MediaFoundationEncoder::~MediaFoundationEncoder() {
     if (m_transform && m_streaming) {
+        // On an async MFT, FLUSH discards any queued events/samples so the drain
+        // messages below tear down cleanly without us pumping the event queue.
+        if (m_asyncTransform) {
+            m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+        }
         m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
+    m_eventGenerator.Reset();
     m_transform.Reset();
     shutdownRuntime();
 }
@@ -243,13 +274,39 @@ bool MediaFoundationEncoder::createTransform(QString* error) {
         return false;
     }
 
-    // Async hardware MFTs must be unlocked before use. Sync MFTs ignore this.
+    // Async hardware MFTs (the common case for HW encoders) must be unlocked
+    // before use and driven via the event-generator pump. Sync MFTs ignore the
+    // unlock and are driven with the synchronous ProcessInput/ProcessOutput loop.
     ComPtr<IMFAttributes> attributes;
+    UINT32 isAsync = FALSE;
     if (SUCCEEDED(m_transform->GetAttributes(&attributes)) && attributes) {
-        UINT32 isAsync = FALSE;
         attributes->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
-        if (isAsync) {
-            attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+    }
+    m_asyncTransform = isAsync != FALSE;
+    if (m_asyncTransform) {
+        if (!attributes) {
+            if (error) {
+                *error =
+                    QStringLiteral("Media Foundation async encoder attributes are unavailable");
+            }
+            return false;
+        }
+        hr = m_transform.As(&m_eventGenerator);
+        if (FAILED(hr) || !m_eventGenerator) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async encoder event generator is unavailable"),
+                    hr);
+            }
+            return false;
+        }
+        hr = attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+        if (FAILED(hr)) {
+            if (error) {
+                *error =
+                    hrMessage(QStringLiteral("Media Foundation async encoder unlock failed"), hr);
+            }
+            return false;
         }
     }
     return true;
@@ -473,7 +530,7 @@ bool MediaFoundationEncoder::initialize(const Config& config, QString* error) {
     return true;
 }
 
-bool MediaFoundationEncoder::buildInputSample(const AVFrame* frame, int64_t /*ptsTicks*/,
+bool MediaFoundationEncoder::buildInputSample(const AVFrame* frame, int64_t ptsTicks,
                                               ComPtr<IMFSample>* sample, QString* error) {
     if (!frame || !frame->data[0] || !frame->data[1] || !frame->data[2]) {
         if (error) {
@@ -554,13 +611,14 @@ bool MediaFoundationEncoder::buildInputSample(const AVFrame* frame, int64_t /*pt
         return false;
     }
 
+    const LONGLONG stampedTime = m_nextSampleTime;
     ComPtr<IMFSample> createdSample;
     hr = MFCreateSample(&createdSample);
     if (SUCCEEDED(hr)) {
         hr = createdSample->AddBuffer(buffer.Get());
     }
     if (SUCCEEDED(hr)) {
-        hr = createdSample->SetSampleTime(m_nextSampleTime);
+        hr = createdSample->SetSampleTime(stampedTime);
     }
     if (SUCCEEDED(hr)) {
         hr = createdSample->SetSampleDuration(m_sampleDuration);
@@ -572,8 +630,23 @@ bool MediaFoundationEncoder::buildInputSample(const AVFrame* frame, int64_t /*pt
         return false;
     }
     m_nextSampleTime += m_sampleDuration;
+    // Remember the caller's opaque ptsTicks keyed by the stamp so the output can
+    // echo it back per the interface contract.
+    m_ptsByMfTime.insert(stampedTime, ptsTicks);
     *sample = createdSample;
     return true;
+}
+
+int64_t MediaFoundationEncoder::resolvePtsTicks(LONGLONG sampleTime) {
+    const auto it = m_ptsByMfTime.constFind(sampleTime);
+    if (it != m_ptsByMfTime.constEnd()) {
+        const int64_t ticks = it.value();
+        m_ptsByMfTime.erase(it);
+        return ticks;
+    }
+    // No mapping (encoder produced an unexpected timestamp): fall back to the MF
+    // sample time so we still emit a monotonic, usable value.
+    return int64_t(sampleTime);
 }
 
 bool MediaFoundationEncoder::buildAvccFromSequenceHeader(QString* error) {
@@ -624,6 +697,55 @@ bool MediaFoundationEncoder::buildAvccFromSequenceHeader(QString* error) {
     return true;
 }
 
+bool MediaFoundationEncoder::emitOutputSample(IMFSample* sample, const PacketCallback& onPacket,
+                                              QString* error) {
+    // Lazily build the avcC from the (now negotiated) output type.
+    if (m_avcc.isEmpty()) {
+        QString avccError;
+        buildAvccFromSequenceHeader(&avccError); // best-effort; ignore failure
+    }
+
+    // Determine keyframe via MFSampleExtension_CleanPoint (default: keyframe).
+    UINT32 cleanPoint = 1;
+    sample->GetUINT32(MFSampleExtension_CleanPoint, &cleanPoint);
+    const bool keyframe = cleanPoint != 0;
+
+    // Recover the caller's opaque ptsTicks via the MF sample time we stamped on
+    // the matching input, so the callback echoes the caller's value (contract).
+    LONGLONG sampleTime = 0;
+    sample->GetSampleTime(&sampleTime);
+    const int64_t ptsTicks = resolvePtsTicks(sampleTime);
+
+    ComPtr<IMFMediaBuffer> outBuffer;
+    HRESULT hr = sample->ConvertToContiguousBuffer(&outBuffer);
+    if (FAILED(hr) || !outBuffer) {
+        if (error) {
+            *error =
+                hrMessage(QStringLiteral("Media Foundation H.264 output buffer access failed"), hr);
+        }
+        return false;
+    }
+
+    BYTE* data = nullptr;
+    DWORD currentLength = 0;
+    hr = outBuffer->Lock(&data, nullptr, &currentLength);
+    if (FAILED(hr)) {
+        if (error) {
+            *error =
+                hrMessage(QStringLiteral("Media Foundation H.264 output buffer lock failed"), hr);
+        }
+        return false;
+    }
+    const QByteArray packet =
+        annexBStreamToAvccPacket(reinterpret_cast<const uint8_t*>(data), int(currentLength));
+    outBuffer->Unlock();
+
+    if (!packet.isEmpty() && onPacket) {
+        onPacket(packet, ptsTicks, keyframe);
+    }
+    return true;
+}
+
 bool MediaFoundationEncoder::drainOutput(const PacketCallback& onPacket, QString* error) {
     MFT_OUTPUT_STREAM_INFO streamInfo{};
     HRESULT hr = m_transform->GetOutputStreamInfo(0, &streamInfo);
@@ -641,7 +763,11 @@ bool MediaFoundationEncoder::drainOutput(const PacketCallback& onPacket, QString
     while (true) {
         ComPtr<IMFSample> outputSample;
         if (!encoderProvidesSamples) {
-            const DWORD cb = std::max<DWORD>(streamInfo.cbSize, 1u);
+            // Floor the allocation to a frame-sized buffer: cbSize can be a
+            // conservative (or zero) hint, and an undersized buffer makes
+            // ProcessOutput fail with MF_E_BUFFERTOOSMALL, losing the frame.
+            const DWORD cb = std::max<DWORD>(
+                streamInfo.cbSize, DWORD(m_config.width) * DWORD(m_config.height) * 3u / 2u);
             ComPtr<IMFMediaBuffer> outputBuffer;
             hr = MFCreateMemoryBuffer(cb, &outputBuffer);
             if (SUCCEEDED(hr)) {
@@ -714,51 +840,258 @@ bool MediaFoundationEncoder::drainOutput(const PacketCallback& onPacket, QString
             completed = outputSample;
         }
 
-        // Lazily build the avcC from the (now negotiated) output type.
-        if (m_avcc.isEmpty()) {
-            QString avccError;
-            buildAvccFromSequenceHeader(&avccError); // best-effort; ignore failure
-        }
-
-        // Determine keyframe via MFSampleExtension_CleanPoint (default: keyframe).
-        UINT32 cleanPoint = 1;
-        completed->GetUINT32(MFSampleExtension_CleanPoint, &cleanPoint);
-        const bool keyframe = cleanPoint != 0;
-
-        // The opaque caller pts: the encoder echoes whatever the muxer expects.
-        // We carry the MF sample time back (90 kHz-agnostic — the caller treats
-        // it as opaque ticks per the interface contract).
-        LONGLONG sampleTime = 0;
-        completed->GetSampleTime(&sampleTime);
-
-        ComPtr<IMFMediaBuffer> outBuffer;
-        hr = completed->ConvertToContiguousBuffer(&outBuffer);
-        if (FAILED(hr) || !outBuffer) {
-            if (error) {
-                *error = hrMessage(
-                    QStringLiteral("Media Foundation H.264 output buffer access failed"), hr);
-            }
+        if (!emitOutputSample(completed.Get(), onPacket, error)) {
             return false;
         }
+        // Loop again to pull any further buffered output samples.
+    }
+}
 
-        BYTE* data = nullptr;
-        DWORD currentLength = 0;
-        hr = outBuffer->Lock(&data, nullptr, &currentLength);
+// ---------------------------------------------------------------------------
+// Async event-pump path (hardware encoder MFTs are almost always async).
+//
+// Contract for an async MFT: never call ProcessInput/ProcessOutput speculatively.
+// Wait for METransformNeedInput before ProcessInput, and METransformHaveOutput
+// before ProcessOutput. We drive the pump to completion inside encode()/flush()
+// so the caller still sees a synchronous interface.
+// ---------------------------------------------------------------------------
+
+bool MediaFoundationEncoder::processInputSample(IMFSample* sample, QString* error) {
+    const HRESULT hr = m_transform->ProcessInput(0, sample, 0);
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(QStringLiteral("Media Foundation H.264 ProcessInput failed"), hr);
+        }
+        return false;
+    }
+    return true;
+}
+
+// Pull exactly one output sample in response to a METransformHaveOutput event.
+bool MediaFoundationEncoder::processOutputAsync(const PacketCallback& onPacket, QString* error) {
+    MFT_OUTPUT_STREAM_INFO streamInfo{};
+    HRESULT hr = m_transform->GetOutputStreamInfo(0, &streamInfo);
+    if (FAILED(hr)) {
+        if (error) {
+            *error =
+                hrMessage(QStringLiteral("Media Foundation output stream info query failed"), hr);
+        }
+        return false;
+    }
+    const bool encoderProvidesSamples =
+        (streamInfo.dwFlags &
+         (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+
+    ComPtr<IMFSample> outputSample;
+    if (!encoderProvidesSamples) {
+        // Floor the allocation to a frame-sized buffer (see drainOutput()).
+        const DWORD cb = std::max<DWORD>(streamInfo.cbSize,
+                                         DWORD(m_config.width) * DWORD(m_config.height) * 3u / 2u);
+        ComPtr<IMFMediaBuffer> outputBuffer;
+        hr = MFCreateMemoryBuffer(cb, &outputBuffer);
+        if (SUCCEEDED(hr)) {
+            hr = MFCreateSample(&outputSample);
+        }
+        if (SUCCEEDED(hr)) {
+            hr = outputSample->AddBuffer(outputBuffer.Get());
+        }
         if (FAILED(hr)) {
             if (error) {
                 *error = hrMessage(
-                    QStringLiteral("Media Foundation H.264 output buffer lock failed"), hr);
+                    QStringLiteral("Media Foundation output sample allocation failed"), hr);
             }
             return false;
         }
-        const QByteArray packet =
-            annexBStreamToAvccPacket(reinterpret_cast<const uint8_t*>(data), int(currentLength));
-        outBuffer->Unlock();
+    }
 
-        if (!packet.isEmpty() && onPacket) {
-            onPacket(packet, int64_t(sampleTime), keyframe);
+    MFT_OUTPUT_DATA_BUFFER output{};
+    output.dwStreamID = 0;
+    output.pSample = outputSample.Get();
+    DWORD status = 0;
+    hr = m_transform->ProcessOutput(0, 1, &output, &status);
+
+    if (output.pEvents) {
+        output.pEvents->Release();
+        output.pEvents = nullptr;
+    }
+
+    if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+        // Renegotiate output type and treat this event as drained (the encoder
+        // republishes the sample via a subsequent HaveOutput event).
+        ComPtr<IMFMediaType> renegotiated;
+        if (output.pSample && encoderProvidesSamples) {
+            output.pSample->Release();
+            output.pSample = nullptr;
         }
-        // Loop again to pull any further buffered output samples.
+        if (SUCCEEDED(m_transform->GetOutputAvailableType(0, 0, &renegotiated)) && renegotiated) {
+            m_transform->SetOutputType(0, renegotiated.Get(), 0);
+        }
+        return true;
+    }
+    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+        // Spurious HaveOutput with nothing ready; harmless, treat as drained.
+        return true;
+    }
+    if (FAILED(hr)) {
+        if (output.pSample && encoderProvidesSamples) {
+            output.pSample->Release();
+            output.pSample = nullptr;
+        }
+        if (error) {
+            *error = hrMessage(QStringLiteral("Media Foundation H.264 ProcessOutput failed"), hr);
+        }
+        return false;
+    }
+
+    ComPtr<IMFSample> completed;
+    if (encoderProvidesSamples) {
+        completed.Attach(output.pSample); // MFT allocated it; we own a ref now
+        output.pSample = nullptr;
+    } else {
+        completed = outputSample;
+    }
+    return emitOutputSample(completed.Get(), onPacket, error);
+}
+
+bool MediaFoundationEncoder::handleAsyncEvent(IMFMediaEvent* event, IMFSample* inputSample,
+                                              bool* submittedInput, const PacketCallback& onPacket,
+                                              QString* error) {
+    MediaEventType eventType = MediaEventType(0);
+    HRESULT hr = event->GetType(&eventType);
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(
+                QStringLiteral("Media Foundation async encoder event type query failed"), hr);
+        }
+        return false;
+    }
+
+    HRESULT eventStatus = S_OK;
+    hr = event->GetStatus(&eventStatus);
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(
+                QStringLiteral("Media Foundation async encoder event status query failed"), hr);
+        }
+        return false;
+    }
+    if (FAILED(eventStatus)) {
+        if (error) {
+            *error = hrMessage(QStringLiteral("Media Foundation async encoder event failed"),
+                               eventStatus);
+        }
+        return false;
+    }
+
+    if (eventType == METransformNeedInput) {
+        if (inputSample && submittedInput && !*submittedInput) {
+            if (!processInputSample(inputSample, error)) {
+                return false;
+            }
+            *submittedInput = true;
+        } else {
+            // No sample to give right now; remember the credit for next encode().
+            ++m_asyncNeedInputEvents;
+        }
+        return true;
+    }
+
+    if (eventType == METransformHaveOutput) {
+        return processOutputAsync(onPacket, error);
+    }
+
+    // METransformDrainComplete / METransformMarker and anything else: nothing to do.
+    return true;
+}
+
+// Submit one input sample, blocking on the pump until the MFT accepts it, then
+// drain any output that is already queued.
+bool MediaFoundationEncoder::encodeAsync(IMFSample* inputSample, const PacketCallback& onPacket,
+                                         QString* error) {
+    bool submittedInput = false;
+    if (m_asyncNeedInputEvents > 0) {
+        --m_asyncNeedInputEvents;
+        if (!processInputSample(inputSample, error)) {
+            return false;
+        }
+        submittedInput = true;
+    }
+
+    while (!submittedInput) {
+        ComPtr<IMFMediaEvent> event;
+        const HRESULT hr = m_eventGenerator->GetEvent(0, &event); // block for the next event
+        if (FAILED(hr)) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async encoder event query failed"), hr);
+            }
+            return false;
+        }
+        if (!handleAsyncEvent(event.Get(), inputSample, &submittedInput, onPacket, error)) {
+            return false;
+        }
+    }
+
+    return drainReadyAsyncEvents(onPacket, error);
+}
+
+// Drain every event currently queued without blocking (pull ready output).
+bool MediaFoundationEncoder::drainReadyAsyncEvents(const PacketCallback& onPacket, QString* error) {
+    while (true) {
+        ComPtr<IMFMediaEvent> event;
+        const HRESULT hr = m_eventGenerator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+        if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+            return true;
+        }
+        if (FAILED(hr)) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async encoder event query failed"), hr);
+            }
+            return false;
+        }
+        bool submittedInput = true; // no input to feed during a non-blocking drain
+        if (!handleAsyncEvent(event.Get(), nullptr, &submittedInput, onPacket, error)) {
+            return false;
+        }
+    }
+}
+
+// Signal end-of-stream + drain, then block on the pump until the MFT reports
+// METransformDrainComplete, emitting every remaining output sample.
+bool MediaFoundationEncoder::flushAsync(const PacketCallback& onPacket, QString* error) {
+    HRESULT hr = m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+    if (SUCCEEDED(hr)) {
+        hr = m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
+    }
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(QStringLiteral("Media Foundation H.264 encoder drain failed"), hr);
+        }
+        return false;
+    }
+
+    while (true) {
+        ComPtr<IMFMediaEvent> event;
+        hr = m_eventGenerator->GetEvent(0, &event); // block until drain completes
+        if (FAILED(hr)) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async encoder event query failed"), hr);
+            }
+            return false;
+        }
+        MediaEventType eventType = MediaEventType(0);
+        if (FAILED(event->GetType(&eventType))) {
+            continue;
+        }
+        if (eventType == METransformDrainComplete) {
+            return true;
+        }
+        bool submittedInput = true; // do not feed input while draining
+        if (!handleAsyncEvent(event.Get(), nullptr, &submittedInput, onPacket, error)) {
+            return false;
+        }
     }
 }
 
@@ -774,6 +1107,10 @@ bool MediaFoundationEncoder::encode(const AVFrame* frame, int64_t ptsTicks,
     ComPtr<IMFSample> inputSample;
     if (!buildInputSample(frame, ptsTicks, &inputSample, error)) {
         return false;
+    }
+
+    if (m_asyncTransform) {
+        return encodeAsync(inputSample.Get(), onPacket, error);
     }
 
     HRESULT hr = m_transform->ProcessInput(0, inputSample.Get(), 0);
@@ -798,6 +1135,9 @@ bool MediaFoundationEncoder::encode(const AVFrame* frame, int64_t ptsTicks,
 bool MediaFoundationEncoder::flush(const PacketCallback& onPacket, QString* error) {
     if (!m_transform || !m_streaming) {
         return true;
+    }
+    if (m_asyncTransform) {
+        return flushAsync(onPacket, error);
     }
     HRESULT hr = m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
     if (SUCCEEDED(hr)) {
