@@ -273,7 +273,7 @@ if(APPLE)
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm
-        recorder_engine/codec/nativevideoencoder_stub.cpp)
+        recorder_engine/codec/nativevideoencoder_videotoolbox.mm)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)

@@ -25,7 +25,11 @@ AVFrame* TestNativeVideoEncoder::makeGreyFrame(int w, int h) {
     f->format = AV_PIX_FMT_YUV420P;
     f->width = w;
     f->height = h;
-    av_frame_get_buffer(f, 32);
+    if (av_frame_get_buffer(f, 32) < 0) {
+        qWarning("makeGreyFrame: av_frame_get_buffer failed for %dx%d", w, h);
+        av_frame_free(&f);
+        return nullptr;
+    }
     memset(f->data[0], 128, f->linesize[0] * h);
     memset(f->data[1], 128, f->linesize[1] * (h / 2));
     memset(f->data[2], 128, f->linesize[2] * (h / 2));
@@ -52,6 +56,7 @@ void TestNativeVideoEncoder::encodesIntraFramesWhenAvailable() {
     bool allKeyframes = true;
     for (int i = 0; i < 5; ++i) {
         AVFrame* f = makeGreyFrame(1280, 720);
+        QVERIFY2(f != nullptr, "makeGreyFrame: av_frame_get_buffer failed");
         const bool ok = enc->encode(f, i, [&](const QByteArray& data, int64_t, bool key) {
             ++packets;
             if (!key) allKeyframes = false;
