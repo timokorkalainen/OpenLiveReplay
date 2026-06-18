@@ -19,6 +19,15 @@ struct OutputTargetDispatchStats {
     qint64 sinkSubmittedFrames = 0;
     qint64 sinkFailedFrames = 0;
     qint64 sinkDroppedFrames = 0;
+    qint64 currentQueueDepth = 0;
+    qint64 maxQueueDepth = 0;
+    qint64 deliveryGaps = 0;
+    qint64 lastQueuedFrameIndex = -1;
+    qint64 lastDeliveredFrameIndex = -1;
+    qint64 lastSubmitDurationNs = 0;
+    bool queuePressure = false;
+    bool lastSubmitDroppedFrame = false;
+    bool lastDeliveryGap = false;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
     qint64 repeatedPayloadFrames = 0;
@@ -27,10 +36,27 @@ struct OutputTargetDispatchStats {
     bool lastSubmitSucceeded = true;
     bool hasLastSinkResult = false;
     bool lastSinkResultSucceeded = true;
+    bool hasLastQueuedFrameIndex = false;
+    bool hasLastDeliveredFrameIndex = false;
     QString sinkState;
     QString sinkMessage;
     bool hasLastIdentity = false;
     OutputFrameIdentity lastIdentity;
+};
+
+struct OutputRuntimeDispatchStats {
+    bool hasLastDispatchTiming = false;
+    qint64 lastScheduledFrameIndex = -1;
+    qint64 lastDispatchedFrameIndex = -1;
+    qint64 lastScheduledNs = 0;
+    qint64 lastDispatchWallNs = 0;
+    qint64 lastLatenessNs = 0;
+    qint64 maxLatenessNs = 0;
+    qint64 deadlineMisses = 0;
+    qint64 catchUpCapHits = 0;
+    qint64 cappedCatchUpTicks = 0;
+    bool lastDispatchDeadlineMiss = false;
+    qint64 lastCappedCatchUpTicks = 0;
 };
 
 struct OutputDispatchStats {
@@ -39,6 +65,7 @@ struct OutputDispatchStats {
     qint64 sinkFailures = 0;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
+    OutputRuntimeDispatchStats runtime;
     QHash<QString, OutputTargetDispatchStats> targets;
 };
 
@@ -53,6 +80,7 @@ public:
     void resetFrameIndex(qint64 nextOutputFrameIndex = 0);
     void resetPlayEpoch();
     qint64 nextOutputFrameIndex() const { return m_nextOutputFrameIndex; }
+    void setRuntimeStats(const OutputRuntimeDispatchStats& stats);
 
     OutputDispatchStats dispatchTick(const OutputFrameCache& cache,
                                      const PlaybackStateSnapshot& state);

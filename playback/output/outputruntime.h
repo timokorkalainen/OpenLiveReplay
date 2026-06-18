@@ -39,7 +39,9 @@ protected:
 private:
     OutputRuntimeSnapshot snapshot() const;
     OutputDispatchStats dispatchDueTicksNs(qint64 wallNowNs);
+    void recordDispatchTiming(qint64 outputFrameIndex, qint64 scheduledNs, qint64 wallNowNs);
     static qint64 frameIndexToNsCeil(FrameRate rate, qint64 frameIndex);
+    static qint64 dueFrameCount(FrameRate rate, qint64 elapsedNs);
 
     mutable QMutex m_mutex;
     OutputDispatcher m_dispatcher;

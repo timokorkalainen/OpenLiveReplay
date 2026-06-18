@@ -74,6 +74,14 @@ quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
     mix(quint64(stats.sinkFailures));
     mix(quint64(stats.placeholderFrames));
     mix(quint64(stats.silentAudioFrames));
+    mix(quint64(stats.runtime.deadlineMisses));
+    mix(quint64(stats.runtime.catchUpCapHits));
+    mix(quint64(stats.runtime.cappedCatchUpTicks));
+    mix(quint64(stats.runtime.lastDispatchedFrameIndex));
+    mix(quint64(stats.runtime.lastLatenessNs));
+    mix(quint64(stats.runtime.maxLatenessNs));
+    mix(stats.runtime.lastDispatchDeadlineMiss ? 1 : 0);
+    mix(quint64(stats.runtime.lastCappedCatchUpTicks));
 
     QStringList keys = stats.targets.keys();
     keys.sort();
@@ -86,6 +94,15 @@ quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
         mix(quint64(target.sinkSubmittedFrames));
         mix(quint64(target.sinkFailedFrames));
         mix(quint64(target.sinkDroppedFrames));
+        mix(quint64(target.currentQueueDepth));
+        mix(quint64(target.maxQueueDepth));
+        mix(quint64(target.deliveryGaps));
+        mix(quint64(target.lastQueuedFrameIndex));
+        mix(quint64(target.lastDeliveredFrameIndex));
+        mix(quint64(target.lastSubmitDurationNs));
+        mix(target.queuePressure ? 1 : 0);
+        mix(target.lastSubmitDroppedFrame ? 1 : 0);
+        mix(target.lastDeliveryGap ? 1 : 0);
         mix(quint64(target.placeholderFrames));
         mix(quint64(target.silentAudioFrames));
         mix(quint64(target.repeatedPayloadFrames));
@@ -94,6 +111,8 @@ quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
         mix(target.lastSubmitSucceeded ? 1 : 0);
         mix(target.hasLastSinkResult ? 1 : 0);
         mix(target.lastSinkResultSucceeded ? 1 : 0);
+        mix(target.hasLastQueuedFrameIndex ? 1 : 0);
+        mix(target.hasLastDeliveredFrameIndex ? 1 : 0);
         mix(quint64(qHash(target.sinkState)));
         mix(quint64(qHash(target.sinkMessage)));
         mix(target.hasLastIdentity ? 1 : 0);

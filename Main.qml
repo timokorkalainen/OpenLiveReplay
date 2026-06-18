@@ -1406,7 +1406,9 @@ ApplicationWindow {
                                         text: "F " + (ndiOutputRow.statusData.sinkFailures || 0)
                                               + " SF " + (ndiOutputRow.statusData.sinkFailedFrames || 0)
                                               + " D " + (ndiOutputRow.statusData.sinkDroppedFrames || 0)
-                                              + " P " + (ndiOutputRow.statusData.placeholderFrames || 0)
+                                              + " Q " + (ndiOutputRow.statusData.currentQueueDepth || 0)
+                                              + "/" + (ndiOutputRow.statusData.maxQueueDepth || 0)
+                                              + " G " + (ndiOutputRow.statusData.deliveryGaps || 0)
                                         elide: Text.ElideRight
                                         HoverHandler { id: outputHealthHover }
                                         ToolTip.visible: outputHealthHover.hovered

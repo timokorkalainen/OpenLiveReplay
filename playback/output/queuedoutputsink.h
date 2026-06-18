@@ -40,8 +40,17 @@ private:
     int m_droppedFrames = 0;
     qint64 m_asyncAcceptedFrames = 0;
     qint64 m_asyncFailedFrames = 0;
+    qint64 m_maxQueueDepth = 0;
+    qint64 m_deliveryGaps = 0;
+    qint64 m_lastQueuedFrameIndex = -1;
+    qint64 m_lastDeliveredFrameIndex = -1;
+    bool m_queuePressure = false;
+    bool m_lastSubmitDroppedFrame = false;
+    bool m_lastDeliveryGap = false;
     bool m_hasLastAsyncResult = false;
     bool m_lastAsyncResultSucceeded = true;
+    bool m_hasLastQueuedFrameIndex = false;
+    bool m_hasLastDeliveredFrameIndex = false;
 };
 
 #endif // QUEUEDOUTPUTSINK_H
