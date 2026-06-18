@@ -41,7 +41,11 @@ public:
     void reset();
 
 private:
-    struct Anchor { bool set = false; int64_t tcFrames = 0; int64_t sessionFrame = 0; };
+    struct Anchor {
+        bool set = false;
+        int64_t tcFrames = 0;
+        int64_t sessionFrame = 0;
+    };
     int m_nominalFps;
     static constexpr int kMaxSources = 16;
     Anchor m_anchors[kMaxSources];

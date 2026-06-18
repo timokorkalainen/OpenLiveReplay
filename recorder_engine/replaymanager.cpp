@@ -263,12 +263,13 @@ void ReplayManager::startRecording() {
             qDebug() << "ReplayManager: Failed to init H.264 blue frame encoder.";
             return;
         }
-        const bool muxerReady = m_telemetryFeedIds.isEmpty()
-            ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            48000, 2, m_videoCodec, m_videoExtradata, startTc)
-            : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec, m_videoExtradata,
-                            startTc);
+        const bool muxerReady =
+            m_telemetryFeedIds.isEmpty()
+                ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, 48000, 2, m_videoCodec, m_videoExtradata, startTc)
+                : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2,
+                                m_videoCodec, m_videoExtradata, startTc);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer (H.264) with base name" << m_sessionFileName;
             cleanupBlueEncoder();
@@ -276,11 +277,13 @@ void ReplayManager::startRecording() {
         }
     } else {
         // MPEG-2 path (unchanged): init muxer first, then blue encoder.
-        const bool muxerReady = m_telemetryFeedIds.isEmpty()
-            ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            48000, 2, m_videoCodec, {}, startTc)
-            : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec, {}, startTc);
+        const bool muxerReady =
+            m_telemetryFeedIds.isEmpty()
+                ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, 48000, 2, m_videoCodec, {}, startTc)
+                : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2,
+                                m_videoCodec, {}, startTc);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
             return;
