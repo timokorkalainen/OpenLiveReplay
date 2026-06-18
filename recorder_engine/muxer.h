@@ -53,6 +53,12 @@ public:
     void writePacket(AVPacket* pkt);
     void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     void writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);
+    // Offer a session-start timecode candidate. The header is written on the FIRST
+    // muxed packet (see ensureHeaderWritten); the FIRST well-formed candidate
+    // registered before that wins and becomes the file's "timecode" tag. Empty or
+    // malformed candidates are ignored. Thread-safe: called from every worker tick
+    // thread; guarded by m_headerMutex. A no-op once the header is written.
+    void setStartTimecodeCandidate(const QString& tc);
     AVStream* getStream(int index);
     void close();
 
@@ -74,6 +80,20 @@ private:
     // AVFormatContext.
     void writerLoop();
 
+    // Writes the deferred MKV header exactly once, materialising the winning
+    // start-timecode candidate into the "timecode" tag (format-level + each video
+    // track) at that moment. Idempotent and thread-safe (m_headerMutex). Returns
+    // true once the header is (or already was) written; false if the underlying
+    // avformat_write_header failed. Called at the TOP of every write path before
+    // any queue lock, and from close() so an empty recording still gets a header.
+    //
+    // LOCK ORDERING: m_headerMutex is the FIRST lock taken on any write — it is
+    // never held while acquiring m_qMutex (writePacket releases it implicitly by
+    // returning from ensureHeaderWritten before locking the queue). close() takes
+    // m_mutex, then (via ensureHeaderWritten) m_headerMutex; ensureHeaderWritten
+    // never reaches back for m_mutex, so there is no cycle.
+    bool ensureHeaderWritten();
+
     QString m_outputDir;
     // Path resolved by init() for the current session; getVideoPath()
     // returns it while recording so the reader can never diverge from
@@ -91,6 +111,21 @@ private:
     // path no longer takes this — av_write_frame runs on the writer thread.
     QMutex m_mutex;
     bool m_initialized = false;
+
+    // ─── Deferred header write (timecode-on-first-packet) ─────────────────────
+    // The MKV header is written on the first muxed packet, not in init(), so the
+    // session start timecode (the first muxed frame's TC) can be captured into the
+    // "timecode" tag — live recordings observe no TC at start. m_headerMutex guards
+    // all three fields and serialises the one-time avformat_write_header. It is the
+    // FIRST lock on any write path; ensureHeaderWritten never reaches for another
+    // Muxer lock while holding it (see ensureHeaderWritten doc for ordering).
+    QMutex m_headerMutex;
+    bool m_headerWritten = false;
+    QString m_startTimecodeCandidate;
+    // Matroska muxer options (reserve_index_space/cluster/live), built in init()
+    // and consumed by the deferred avformat_write_header in ensureHeaderWritten.
+    AVDictionary* m_headerOpts = nullptr;
+
     int m_audioTrackOffset = 0;     // Index of first audio track
     int m_subtitleTrackOffset = 0;  // Index of first subtitle track
     int m_telemetryTrackOffset = 0; // Index of first per-feed telemetry track

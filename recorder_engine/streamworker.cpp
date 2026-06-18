@@ -8,6 +8,7 @@
 #include "ingest/nativertmpingestsession.h"
 #endif
 #include "ingest/nativendiingestsession.h"
+#include "timing/smpte12m.h"
 #include <QDebug>
 #include <QDateTime>
 #include <QUrl>
@@ -213,6 +214,24 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     track = m_viewTrack.load(std::memory_order_relaxed);
 
     if (track >= 0 && m_latestFrame && m_latestFrame->data[0]) {
+        // Supply the session-start timecode candidate IN THE SAME THREAD that is
+        // about to write the first muxed packet — so the muxer's deferred header
+        // (written on that first packet) captures a real TC. Registered BEFORE the
+        // encode/write below because the H.264 path writes its packets inline in
+        // the encode callback, which would otherwise materialise the header before
+        // the candidate was offered. The muxer once-guards and first-wins, so doing
+        // this every tick is cheap and race-free: no cross-thread hand-off with the
+        // aligner. Only when this frame carried a valid source TC; recovered with
+        // kTimecodeNominalFps (NOT m_targetFps), because the 100 ns was produced
+        // with that same nominal fps and must round-trip to the original H:M:S:F.
+        // Absent TC -> no candidate -> no tag.
+        if (m_latestFrameTimecode100ns >= 0) {
+            const Smpte12mTimecode startTc =
+                Smpte12m::from100ns(m_latestFrameTimecode100ns, Smpte12m::kTimecodeNominalFps);
+            char buf[12];
+            m_muxer->setStartTimecodeCandidate(QString::fromLatin1(Smpte12m::format(startTc, buf)));
+        }
+
         if (m_videoCodec == VideoCodecChoice::H264Hardware && m_nativeEncoder) {
             // H.264 native-encode path: encode via NativeVideoEncoder and write
             // each output packet directly.

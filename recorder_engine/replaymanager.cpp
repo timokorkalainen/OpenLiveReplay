@@ -245,27 +245,15 @@ void ReplayManager::startRecording() {
     // carried over from a previous recording).
     m_tcAligner.reset();
 
-    // Derive the session start timecode for the muxer's tmcd/timecode tag from the
-    // first source that has carried TC, formatted via Smpte12m::format.
-    //
-    // TIMING (muxer lifecycle): init() writes the MKV header HERE — and the
-    // matroska muxer materialises the "timecode" tag INTO that header — before any
-    // StreamWorker runs. Matroska header tags cannot be amended once the header is
-    // written, and the muxer is never re-init'd, so the tag can only be set at this
-    // single point. Because no per-frame TC has been observed yet at start (the
-    // aligner was just reset), firstTimecode100ns() returns false on the live cold
-    // start → startTc is empty → no tag (a no-TC recording stays byte-identical).
-    // The tag is written only when a start TC is known up front; the muxer's
-    // tag-writing path itself is covered by tst_muxer's TC tests.
-    QString startTc;
-    int64_t startTc100ns = -1;
-    if (m_tcAligner.firstTimecode100ns(startTc100ns)) {
-        const Smpte12mTimecode tc =
-            Smpte12m::from100ns(startTc100ns, Smpte12m::kTimecodeNominalFps);
-        char buf[12];
-        Smpte12m::format(tc, buf);
-        startTc = QString::fromLatin1(buf);
-    }
+    // Session start timecode for the muxer's tmcd/timecode tag is no longer derived
+    // here. The muxer now DEFERS its MKV header write to the first muxed packet and
+    // captures the start TC then (Muxer::setStartTimecodeCandidate, supplied by the
+    // StreamWorker that writes that first packet — see streamworker.cpp). At this
+    // point (cold start, aligner just reset) no per-frame TC has been observed, so
+    // any derivation here would always be empty; we pass an empty up-front candidate
+    // and let the worker supply the real one. Empty -> no tag until the worker wins,
+    // so a no-TC recording still stays byte-identical.
+    const QString startTc;
 
     if (m_videoCodec == VideoCodecChoice::H264Hardware) {
         // H.264 path: prime the blue encoder FIRST to obtain avcC extradata,

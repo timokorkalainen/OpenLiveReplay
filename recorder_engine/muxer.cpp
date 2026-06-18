@@ -52,11 +52,18 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     if (height <= 0) height = 1080;
     if (fps <= 0) fps = 30;
 
-    // Session start timecode -> standard FFmpeg "timecode" tag (output + each
-    // video track). Empty or malformed leaves it unset so a no-TC recording is
-    // byte-identical to before (no tag, same tracks).
-    const QByteArray timecodeTag =
-        isWellFormedTimecode(startTimecode) ? startTimecode.toUtf8() : QByteArray();
+    // Session start timecode candidate. The "timecode" tag is NOT written here:
+    // the header write is deferred to the first muxed packet (ensureHeaderWritten),
+    // where the winning candidate is materialised into the tag — this is what lets
+    // a LIVE recording, which has observed no TC at start, still carry the first
+    // muxed frame's TC. An up-front candidate (passed here, e.g. from a unit test)
+    // is the initial candidate; workers may supply one later via
+    // setStartTimecodeCandidate. Empty or malformed -> no tag (byte-identical).
+    {
+        QMutexLocker headerLock(&m_headerMutex);
+        m_headerWritten = false;
+        m_startTimecodeCandidate = isWellFormedTimecode(startTimecode) ? startTimecode : QString();
+    }
 
     // 1. Create Format Context for Matroska
     m_activePath = getVideoPath(filename);
@@ -119,10 +126,8 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         const QString trackTitle = QString("Track %1").arg(i + 1);
         av_dict_set(&st->metadata, "title", trackTitle.toUtf8().constData(), 0);
 
-        // Per-track session start timecode (only when a valid TC was supplied).
-        if (!timecodeTag.isEmpty()) {
-            av_dict_set(&st->metadata, "timecode", timecodeTag.constData(), 0);
-        }
+        // The per-track "timecode" tag is set later, in ensureHeaderWritten(),
+        // from the winning start-timecode candidate (deferred header write).
     }
 
     // 2a. Add one audio track per video track (PCM S16LE, 48 kHz stereo)
@@ -175,28 +180,32 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         av_dict_set(&st->metadata, "olr_feed_name", feedName.toUtf8().constData(), 0);
     }
 
-    // 3. Set Matroska specific options for Chase Play
-    AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "reserve_index_space", "1024k", 0); // Crucial for seeking while recording
-    av_dict_set(&opts, "cluster_size_limit", "1M", 0);      // Flush data often
-    av_dict_set(&opts, "cluster_time_limit", "100", 0); // Flush data to disk every 100ms
-    av_dict_set(&opts, "live", "1", 0);                 // Signal this is a live-streamed file
+    // 3. Set Matroska specific options for Chase Play. STORED, not consumed:
+    // the deferred avformat_write_header (ensureHeaderWritten) applies these on
+    // the first packet. m_headerOpts is owned by the Muxer until then (freed in
+    // ensureHeaderWritten or, on a never-written header, in close()).
+    av_dict_free(&m_headerOpts); // defensive: clear any stale opts from a prior init
+    m_headerOpts = nullptr;
+    av_dict_set(&m_headerOpts, "reserve_index_space", "1024k",
+                0); // Crucial for seeking while recording
+    av_dict_set(&m_headerOpts, "cluster_size_limit", "1M", 0);  // Flush data often
+    av_dict_set(&m_headerOpts, "cluster_time_limit", "100", 0); // Flush data to disk every 100ms
+    av_dict_set(&m_headerOpts, "live", "1", 0); // Signal this is a live-streamed file
 
     // 3b. Store recording start time metadata (UTC ISO-8601)
     const QString startIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs);
     av_dict_set(&m_outCtx->metadata, "recording_start_time", startIso.toUtf8().constData(), 0);
 
-    // 3c. Session start timecode -> output-level "timecode" tag. libavformat's
-    // matroska muxer materialises this into the MKV. Only when a valid TC was
-    // supplied (empty/malformed -> no tag, no regression).
-    if (!timecodeTag.isEmpty()) {
-        av_dict_set(&m_outCtx->metadata, "timecode", timecodeTag.constData(), 0);
-    }
+    // 3c. The format-level "timecode" tag is NOT set here. It is materialised by
+    // ensureHeaderWritten() on the first packet from the winning start-timecode
+    // candidate (deferred header write), so live recordings carry a real TC.
 
-    // 4. Open file and write header
+    // 4. Open the output file NOW (so a bad path still fails init() exactly as
+    //    before), but DEFER avformat_write_header to the first packet.
     if (!(m_outCtx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&m_outCtx->pb, m_outCtx->url, AVIO_FLAG_WRITE) < 0) {
-            av_dict_free(&opts);
+            av_dict_free(&m_headerOpts);
+            m_headerOpts = nullptr;
             avformat_free_context(m_outCtx);
             m_outCtx = nullptr;
             resetTelemetryTracks();
@@ -204,31 +213,65 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         }
     }
 
-    const int headerRet = avformat_write_header(m_outCtx, &opts);
-    av_dict_free(&opts);
-    if (headerRet < 0) {
-        if (!(m_outCtx->oformat->flags & AVFMT_NOFILE)) {
-            avio_closep(&m_outCtx->pb);
-        }
-        avformat_free_context(m_outCtx);
-        m_outCtx = nullptr;
-        resetTelemetryTracks();
-        return false;
-    }
-    avio_flush(m_outCtx->pb); // Forces the EBML header to be visible to the reader
-
     m_lastDts.clear();
     m_lastFlush.start();
 
     m_initialized = true;
 
-    // Start the dedicated writer thread now that the header is written and
-    // m_outCtx is fully ready. From here until close() joins it, the writer
-    // thread is the ONLY thread that touches m_outCtx (av_write_frame/flush).
+    // Start the dedicated writer thread. The header has NOT been written yet, but
+    // every write path calls ensureHeaderWritten() before enqueuing a packet, so
+    // by the time the writer thread pops anything the header is in place. From here
+    // until close() joins it, the writer thread is the ONLY thread that calls
+    // av_write_frame/avio_flush on m_outCtx; the header write itself happens on the
+    // ENQUEUEING (caller) thread, before the packet is handed off, so it never
+    // races the writer thread.
     m_writerRunning = true;
     m_writerThread = std::thread(&Muxer::writerLoop, this);
 
     return true;
+}
+
+bool Muxer::ensureHeaderWritten() {
+    QMutexLocker headerLock(&m_headerMutex);
+    if (m_headerWritten) return true;
+    if (!m_outCtx) return false;
+
+    // Materialise the winning start-timecode candidate into the "timecode" tag,
+    // format-level + each video track, IMMEDIATELY before the header is written
+    // (the matroska muxer serialises metadata at header time). Empty/malformed
+    // candidate -> no tag (a no-TC recording stays byte-identical to before).
+    if (isWellFormedTimecode(m_startTimecodeCandidate)) {
+        const QByteArray timecodeTag = m_startTimecodeCandidate.toUtf8();
+        av_dict_set(&m_outCtx->metadata, "timecode", timecodeTag.constData(), 0);
+        for (unsigned int i = 0; i < m_outCtx->nb_streams; ++i) {
+            AVStream* st = m_outCtx->streams[i];
+            if (st && st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                av_dict_set(&st->metadata, "timecode", timecodeTag.constData(), 0);
+            }
+        }
+    }
+
+    const int headerRet = avformat_write_header(m_outCtx, &m_headerOpts);
+    av_dict_free(&m_headerOpts);
+    m_headerOpts = nullptr;
+    if (headerRet < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(headerRet, errbuf, sizeof(errbuf));
+        qDebug() << "Muxer: avformat_write_header failed:" << errbuf;
+        return false;
+    }
+    avio_flush(m_outCtx->pb); // Forces the EBML header to be visible to the reader
+    m_headerWritten = true;
+    return true;
+}
+
+void Muxer::setStartTimecodeCandidate(const QString& tc) {
+    QMutexLocker headerLock(&m_headerMutex);
+    // First valid candidate before the header is written wins (so the SAME thread
+    // that writes the first packet supplies the start TC — no cross-thread race).
+    if (!m_headerWritten && m_startTimecodeCandidate.isEmpty() && isWellFormedTimecode(tc)) {
+        m_startTimecodeCandidate = tc;
+    }
 }
 
 void Muxer::writePacket(AVPacket* pkt) {
@@ -237,6 +280,14 @@ void Muxer::writePacket(AVPacket* pkt) {
     // immediately. The DTS-bump, av_write_frame and avio_flush all happen on
     // the writer thread — so a stalled disk no longer blocks the caller.
     if (!m_writerRunning.load(std::memory_order_acquire)) return;
+
+    // Deferred header: write it (once) on this, the FIRST packet, capturing the
+    // winning start-timecode candidate into the file. Done on the enqueueing
+    // thread BEFORE the packet is handed to the writer thread, so the writer never
+    // touches a header-less context. m_headerMutex is taken and released entirely
+    // inside ensureHeaderWritten, BEFORE m_qMutex below — no lock cycle. On failure
+    // the write is dropped (the file is unusable anyway).
+    if (!ensureHeaderWritten()) return;
 
     AVPacket* localPkt = av_packet_clone(pkt);
     if (!localPkt) return;
@@ -414,7 +465,15 @@ void Muxer::close() {
 
     if (m_initialized && m_outCtx) {
         // Writer thread has joined: this thread now solely owns m_outCtx.
-        av_write_trailer(m_outCtx);
+        // Empty-recording edge: if NO packet was ever written, the deferred header
+        // is still unwritten. Write it now (no TC candidate is fine — empty tag),
+        // so the file is a valid (empty) MKV exactly as a no-packet recording was
+        // before the header became deferred. av_write_trailer requires a written
+        // header, so only emit the trailer once the header is confirmed present.
+        const bool headerOk = ensureHeaderWritten();
+        if (headerOk) {
+            av_write_trailer(m_outCtx);
+        }
         if (!(m_outCtx->oformat->flags & AVFMT_NOFILE)) {
             avio_closep(&m_outCtx->pb);
         }
@@ -423,6 +482,10 @@ void Muxer::close() {
         m_outCtx = nullptr;
         m_lastDts.clear();
     }
+    // Any header opts not consumed by a header write (e.g. write_header never
+    // succeeded) are freed here so they never leak across sessions.
+    av_dict_free(&m_headerOpts);
+    m_headerOpts = nullptr;
     m_telemetryTrackOffset = 0;
     m_telemetryTrackCount = 0;
 }
