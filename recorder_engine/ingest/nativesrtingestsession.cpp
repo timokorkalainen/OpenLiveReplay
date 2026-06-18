@@ -151,7 +151,6 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
         return false;
     }
 
-    const QUrlQuery query(url);
     const NativeSrtUrlOptions options = nativeSrtUrlOptionsFromUrl(url);
 
     // Connection mode: caller (default), listener, or rendezvous are all supported
@@ -169,7 +168,11 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
     //     the link UNENCRYPTED) is rejected rather than silently downgraded;
     //   - pbkeylen must be 16/24/32.
     const bool hasPassphrase = !options.passphrase.isEmpty();
-    if (query.hasQueryItem(QStringLiteral("pbkeylen")) && !hasPassphrase) {
+    // Use the raw-parsed value (single source of truth — `options` is what the
+    // socket setup applies), not QUrlQuery, so a streamid-embedded '#' can't make
+    // validation and application disagree. pbKeyLen is 0 unless a numeric pbkeylen
+    // was given; non-zero with no passphrase is the meaningless case.
+    if (options.pbKeyLen != 0 && !hasPassphrase) {
         return false;
     }
     if (hasPassphrase) {
@@ -497,9 +500,13 @@ bool NativeSrtIngestSession::acceptListenerConnection(const NativeSrtSockaddr& a
                                                       QString* error) {
     // Promote the configured socket to the listening socket (it already carries the
     // common options + streamid/encryption, which SRT inherits onto the accepted
-    // data socket). m_socket becomes the accepted socket below.
-    m_listenSocket = m_socket;
+    // data socket). m_socket becomes the accepted socket below. Clear m_socket
+    // before publishing m_listenSocket so a concurrent closeSocket() from the
+    // control thread can never see the same SRTSOCKET in both members (no double
+    // srt_close).
+    const SRTSOCKET configured = m_socket;
     m_socket = SRT_INVALID_SOCK;
+    m_listenSocket = configured;
 
     if (srt_bind(m_listenSocket, address.sockaddrPtr(), address.size) == SRT_ERROR) {
         if (error) {
