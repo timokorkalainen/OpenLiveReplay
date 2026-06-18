@@ -1147,41 +1147,57 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     const qint64 outputFrameIndex = rate.msToFrameIndex(P);
     {
         QMutexLocker bufferLocker(&m_bufferMutex);
-        int placeholderWidth = 1920;
-        int placeholderHeight = 1080;
-        QVector<QVector<TrackBuffer::Frame>> snapshots;
-        snapshots.reserve(m_decoderBank.size());
-        for (auto* track : m_decoderBank) {
-            QVector<TrackBuffer::Frame> frames =
-                track ? track->buffer.framesSnapshot() : QVector<TrackBuffer::Frame>();
-            for (const TrackBuffer::Frame& frame : frames) {
-                if (frame.frame.isValid()) {
-                    placeholderWidth = frame.frame.width;
-                    placeholderHeight = frame.frame.height;
-                    break;
+
+        // Only the inactive-output-graph path needs to render frames here; when
+        // the OutputRuntime is active it paints from m_outputCache on its own
+        // tick, so building a local snapshot/cache/engine is pure dead work.
+        OutputBusEngine* engine = nullptr;
+        OutputFrameCache* localCache = nullptr;
+        PlaybackStateSnapshot state;
+        std::unique_ptr<OutputBusEngine> engineHolder;
+        std::unique_ptr<OutputFrameCache> cacheHolder;
+
+        if (!outputGraphActive) {
+            int placeholderWidth = 1920;
+            int placeholderHeight = 1080;
+            QVector<QVector<TrackBuffer::Frame>> snapshots;
+            snapshots.reserve(m_decoderBank.size());
+            for (auto* track : m_decoderBank) {
+                QVector<TrackBuffer::Frame> frames =
+                    track ? track->buffer.framesSnapshot() : QVector<TrackBuffer::Frame>();
+                for (const TrackBuffer::Frame& frame : frames) {
+                    if (frame.frame.isValid()) {
+                        placeholderWidth = frame.frame.width;
+                        placeholderHeight = frame.frame.height;
+                        break;
+                    }
+                }
+                snapshots.append(frames);
+            }
+
+            cacheHolder = std::make_unique<OutputFrameCache>(m_decoderBank.size(), placeholderWidth,
+                                                             placeholderHeight);
+            for (int trackIndex = 0; trackIndex < m_decoderBank.size(); ++trackIndex) {
+                DecoderTrack* track = m_decoderBank[trackIndex];
+                if (!track) continue;
+                for (TrackBuffer::Frame frame : snapshots[trackIndex]) {
+                    frame.frame.feedIndex = track->feedIndex;
+                    cacheHolder->insertVideoFrame(frame.frame);
                 }
             }
-            snapshots.append(frames);
-        }
+            localCache = cacheHolder.get();
 
-        OutputFrameCache cache(m_decoderBank.size(), placeholderWidth, placeholderHeight);
-        for (int trackIndex = 0; trackIndex < m_decoderBank.size(); ++trackIndex) {
-            DecoderTrack* track = m_decoderBank[trackIndex];
-            if (!track) continue;
-            for (TrackBuffer::Frame frame : snapshots[trackIndex]) {
-                frame.frame.feedIndex = track->feedIndex;
-                cache.insertVideoFrame(frame.frame);
-            }
-        }
+            engineHolder = std::make_unique<OutputBusEngine>(rate, m_decoderBank.size(),
+                                                             placeholderWidth, placeholderHeight);
+            engine = engineHolder.get();
 
-        OutputBusEngine engine(rate, m_decoderBank.size(), placeholderWidth, placeholderHeight);
-        PlaybackStateSnapshot state;
-        state.playheadMs = P;
-        state.playing = false;
-        state.speed = 1.0;
-        state.playStartedAtOutputFrame = outputFrameIndex;
-        state.playStartedAtPlayheadMs = P;
-        state.selectedFeedIndex = m_decoderBank.isEmpty() ? -1 : 0;
+            state.playheadMs = P;
+            state.playing = false;
+            state.speed = 1.0;
+            state.playStartedAtOutputFrame = outputFrameIndex;
+            state.playStartedAtPlayheadMs = P;
+            state.selectedFeedIndex = m_decoderBank.isEmpty() ? -1 : 0;
+        }
 
         for (auto* track : m_decoderBank) {
             if (!track || !track->provider) continue;
@@ -1204,7 +1220,7 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
                     track->lastDeliveredPtsMs = p;
                     if (outputGraphActive) continue;
                     OutputBusFrame busFrame =
-                        engine.renderFeed(track->feedIndex, outputFrameIndex, state, cache);
+                        engine->renderFeed(track->feedIndex, outputFrameIndex, state, *localCache);
                     pending.append({track->provider, busFrame.video});
                 }
             }
