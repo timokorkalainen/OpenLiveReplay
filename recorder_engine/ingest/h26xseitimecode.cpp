@@ -92,7 +92,7 @@ bool isSeiNal(const QByteArray& nal, NativeVideoCodec codec) {
 // True if this payloadType carries a SMPTE 12M timecode word we can decode.
 //   H.264: 1 = pic_timing, 4 = user_data_registered_itu_t_t35 (ATC).
 //   HEVC : 136 = time_code, 4 = user_data_registered (ATC).
-bool isTimecodePayloadType(int payloadType, NativeVideoCodec codec) {
+bool isTimecodePayloadType(int64_t payloadType, NativeVideoCodec codec) {
     if (codec == NativeVideoCodec::H264) {
         return payloadType == 1 || payloadType == 4;
     }
@@ -105,14 +105,19 @@ bool isTimecodePayloadType(int payloadType, NativeVideoCodec codec) {
 // Read a SEI payloadType/payloadSize value: a run of 0xFF bytes plus a final
 // byte < 0xFF. Returns false (and leaves pos unchanged-ish) on any short read so
 // a truncated continuation run never reads past the RBSP end.
-bool readSeiVarValue(const QByteArray& rbsp, int& pos, int& value) {
-    int total = 0;
+bool readSeiVarValue(const QByteArray& rbsp, int& pos, int64_t& value) {
+    int64_t total = 0;
     while (true) {
         if (pos >= rbsp.size()) {
             return false; // ran off the end with no terminating byte
         }
         const int byte = uchar(rbsp[pos]);
         ++pos;
+        // 64-bit accumulation: the run length is bounded by rbsp.size() (pos
+        // advances each iteration), so total <= 255*size can never overflow
+        // int64. payloadType may legitimately exceed the buffer size (e.g. 136 =
+        // HEVC time_code in a tiny RBSP), so do NOT cap on size here; payloadSize
+        // is bounds-checked against the remaining buffer at the call site.
         total += byte;
         if (byte != 0xFF) {
             break;
@@ -147,28 +152,31 @@ Smpte12mTimecode extractFromSeiRbsp(const QByteArray& rbsp, NativeVideoCodec cod
             break;
         }
 
-        int payloadType = 0;
+        int64_t payloadType = 0;
         if (!readSeiVarValue(rbsp, pos, payloadType)) {
             break; // truncated payloadType run -> stop, no timecode
         }
-        int payloadSize = 0;
+        int64_t payloadSize = 0;
         if (!readSeiVarValue(rbsp, pos, payloadSize)) {
             break; // truncated payloadSize run -> stop, no timecode
         }
 
         // The declared payload must fit entirely within the remaining RBSP.
-        if (payloadSize < 0 || pos + payloadSize > rbsp.size()) {
+        // payloadSize is >=0 and <= rbsp.size() (readSeiVarValue caps it), and
+        // pos <= rbsp.size(), so rbsp.size() - pos is a safe non-negative bound.
+        if (payloadSize > rbsp.size() - pos) {
             break; // truncated payload -> never read OOB
         }
 
         if (isTimecodePayloadType(payloadType, codec)) {
-            const Smpte12mTimecode tc = decodePayloadTimecode(rbsp, pos, payloadSize);
+            const Smpte12mTimecode tc =
+                decodePayloadTimecode(rbsp, pos, static_cast<int>(payloadSize));
             if (tc.valid) {
                 return tc;
             }
         }
 
-        pos += payloadSize; // advance past this message to the next
+        pos += static_cast<int>(payloadSize); // advance past this message to the next
     }
     return Smpte12mTimecode{};
 }

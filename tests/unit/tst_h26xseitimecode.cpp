@@ -17,6 +17,7 @@ private slots:
     void emptyBufferReturnsInvalid();
     void seiWithoutTimecodePayloadTypeReturnsInvalid();
     void unknownCodecReturnsInvalid();
+    void hugePayloadSizeVarintDoesNotOverflowOrCrash();
 };
 
 namespace {
@@ -197,6 +198,22 @@ void TestH26xSeiTimecode::unknownCodecReturnsInvalid() {
         seiMessage(1, packedWordBytes(Smpte12mTimecode{1, 0, 0, 0, false, true}));
     const QByteArray annexB = h264SeiNal(rbsp) + h264VclNal();
     const Smpte12mTimecode got = extractH26xSeiTimecode(annexB, NativeVideoCodec::Unknown);
+    QVERIFY(!got.valid);
+}
+
+void TestH26xSeiTimecode::hugePayloadSizeVarintDoesNotOverflowOrCrash() {
+    // Regression: a non-timecode payloadType (0) followed by a multi-megabyte run
+    // of 0xFF size-continuation bytes. A 32-bit accumulator would overflow, the
+    // `pos + payloadSize` bound would wrap, `pos` would go negative and the next
+    // iteration would index out of bounds (SEGV). Must return invalid, no crash,
+    // no OOB (runs clean under ASan/UBSan in the sanitizer CI job).
+    QByteArray rbsp;
+    rbsp.append(char(0));                           // payloadType = 0 (skips the TC decode branch)
+    rbsp.append(QByteArray(8'400'000, char(0xFF))); // enormous size varint run
+    rbsp.append(char(0x10));                        // terminating size byte
+    rbsp.append(QByteArray::fromHex("0a0b0c0d"));   // a little trailing data
+    const QByteArray annexB = h264SeiNal(rbsp) + h264VclNal();
+    const Smpte12mTimecode got = extractH26xSeiTimecode(annexB, NativeVideoCodec::H264);
     QVERIFY(!got.valid);
 }
 

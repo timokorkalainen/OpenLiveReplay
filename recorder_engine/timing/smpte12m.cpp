@@ -39,7 +39,12 @@ Smpte12mTimecode fromPackedWord(uint32_t word) {
         static_cast<int>((word >> 16) & 0x0Fu) + static_cast<int>((word >> 20) & 0x07u) * 10;
     // hours: units [24..27], tens [28..29].
     tc.hours = static_cast<int>((word >> 24) & 0x0Fu) + static_cast<int>((word >> 28) & 0x03u) * 10;
-    tc.valid = true;
+    // Range-sanity the decoded fields. A SMPTE 12M word from a mis-parsed SEI
+    // payload (e.g. real pic_timing/ATC syntax read as a raw word) can yield
+    // impossible fields; reject rather than emit a plausible-but-wrong TC that
+    // would silently mis-align downstream. (frames<=99 since the units+tens BCD
+    // nibbles top out there; callers compare against the real fps separately.)
+    tc.valid = tc.hours < 24 && tc.minutes < 60 && tc.seconds < 60 && tc.frames < 60;
     return tc;
 }
 
