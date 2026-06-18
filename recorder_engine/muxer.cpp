@@ -9,13 +9,16 @@ Muxer::Muxer() {}
 Muxer::~Muxer() { close(); }
 
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
-                 int audioSampleRate, int audioChannels) {
-    return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate, audioChannels);
+                 int audioSampleRate, int audioChannels,
+                 VideoCodecChoice codec, const QByteArray& videoExtradata) {
+    return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate, audioChannels,
+                codec, videoExtradata);
 }
 
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps, const QStringList& streamNames,
                  const QStringList& telemetryFeedIds, const QStringList& telemetryFeedNames,
-                 int audioSampleRate, int audioChannels) {
+                 int audioSampleRate, int audioChannels,
+                 VideoCodecChoice codec, const QByteArray& videoExtradata) {
     QMutexLocker locker(&m_mutex);
     Q_UNUSED(streamNames);
 
@@ -41,7 +44,17 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->id = i;
 
         // 1. Set parameters
-        st->codecpar->codec_id = AV_CODEC_ID_MPEG2VIDEO;
+        st->codecpar->codec_id = (codec == VideoCodecChoice::H264Hardware)
+                                     ? AV_CODEC_ID_H264
+                                     : AV_CODEC_ID_MPEG2VIDEO;
+        if (codec == VideoCodecChoice::H264Hardware && !videoExtradata.isEmpty()) {
+            st->codecpar->extradata = static_cast<uint8_t*>(
+                av_mallocz(videoExtradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (st->codecpar->extradata) {
+                memcpy(st->codecpar->extradata, videoExtradata.constData(), videoExtradata.size());
+                st->codecpar->extradata_size = videoExtradata.size();
+            }
+        }
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         st->codecpar->width = width;
         st->codecpar->height = height;

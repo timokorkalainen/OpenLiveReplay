@@ -34,9 +34,11 @@ QString ingestFailureKindForLog(IngestFailureKind failure) {
 } // namespace
 
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
-                           int targetWidth, int targetHeight, int targetFps, QObject* parent)
+                           int targetWidth, int targetHeight, int targetFps,
+                           VideoCodecChoice codec, QObject* parent)
     : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
       m_sharedClock(clock) {
+    m_videoCodec = codec;
     qRegisterMetaType<IngestStats>("IngestStats");
     m_restartCapture = 0;
     m_internalFrameCount = 0;
@@ -465,6 +467,11 @@ void StreamWorker::captureLoop() {
 }
 
 bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
+    if (m_videoCodec == VideoCodecChoice::H264Hardware) {
+        qWarning() << "Source" << m_sourceIndex
+                   << "H.264 hardware encode not yet implemented; select MPEG-2.";
+        return false;
+    }
     const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!encoder) return false;
 

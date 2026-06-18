@@ -133,6 +133,7 @@ bool SettingsManager::save(const QString& path, const AppSettings& settings) {
     root["videoWidth"] = settings.videoWidth;
     root["videoHeight"] = settings.videoHeight;
     root["fps"] = settings.fps;
+    root["videoCodec"] = videoCodecToString(settings.videoCodec);
     root["fpsNum"] = settings.fpsNum;
     root["fpsDen"] = settings.fpsDen;
     root["multiviewCount"] = settings.multiviewCount;
@@ -230,6 +231,7 @@ bool SettingsManager::load(const QString& path, AppSettings& settings) {
     settings.videoWidth = root["videoWidth"].toInt(settings.videoWidth);
     settings.videoHeight = root["videoHeight"].toInt(settings.videoHeight);
     settings.fps = root["fps"].toInt(settings.fps);
+    settings.videoCodec = videoCodecFromString(root["videoCodec"].toString(), settings.videoCodec);
     settings.fpsNum = root["fpsNum"].toInt(settings.fps);
     settings.fpsDen = root["fpsDen"].toInt(1);
     FrameRate rate = FrameRate::fromFraction(settings.fpsNum, settings.fpsDen);
