@@ -595,6 +595,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     const int64_t fillTo = target + frameDurMs();
     int packets = 0;
     const int packetBudget = (capFrames(trackCount) + 4) * trackCount * 2;
+    bool deliveredEarly = false;
     while (!shouldInterrupt()) {
         // A newer explicit seek supersedes this fill.
         {
@@ -613,11 +614,21 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                              /*audioOn*/ false, /*dedupTail*/ false);
         av_packet_unref(pkt);
 
+        // All-intra deliver-first: the moment every track has a frame at the
+        // target, paint it — do NOT wait for the whole trail/lead to fill. The
+        // loop keeps filling afterwards (same inserts → back-step reuse intact);
+        // the final deliverDueFrames below is a dedup no-op for this pts.
+        if (!deliveredEarly && reuseAt(target)) {
+            resetDedup();
+            deliverDueFrames(target, dir);
+            deliveredEarly = true;
+        }
+
         if (++packets > packetBudget) break; // safety bound
         if (newestPtsMin() >= fillTo) break; // covered the target
     }
 
-    resetDedup();
+    if (!deliveredEarly) resetDedup();
     deliverDueFrames(target, dir);
     m_counters.reposition++;
 }
