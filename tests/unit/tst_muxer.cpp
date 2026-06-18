@@ -46,6 +46,9 @@ void TestMuxer::initBuildsTrackLayout() {
     // 2 video + 2 audio + 2 subtitle, in that order.
     QCOMPARE(m.audioTrackOffset(), 2);
     QCOMPARE(m.subtitleTrackOffset(), 4);
+    // Default codec must remain MPEG-2 (no behavior change).
+    QCOMPARE(m.getStream(0)->codecpar->codec_id, AV_CODEC_ID_MPEG2VIDEO);
+    QCOMPARE(m.getStream(1)->codecpar->codec_id, AV_CODEC_ID_MPEG2VIDEO);
     m.close();
 }
 
