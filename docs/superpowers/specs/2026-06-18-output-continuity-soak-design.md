@@ -117,9 +117,9 @@ RUNTIME deadlineMisses=<n> catchUpCapHits=<n> maxLatenessNs=<n> ticks=<n>
 
 - **`tests/e2e/run_output_soak.sh`** — runs `soak_harness`, greps the report, and exits
   non-zero on any violated invariant (mirrors `run_playback_e2e.sh`).
-- **CTest:** registered as `e2e_output_soak` under an **opt-in label** `soak`, excluded
+- **CTest:** registered as `e2e_output_soak` under an **opt-in label** `output-soak`, excluded
   from the default and pre-push gates (which already use `-LE` exclusions). CI runs it only
-  when explicitly selected (`ctest -L soak`); the default run sets `OLR_SOAK_SECONDS` small
+  when explicitly selected (`ctest -L output-soak`); the default run sets `OLR_SOAK_SECONDS` small
   for a fast smoke when invoked, while local/nightly soaks use the multi-minute default.
 
 ## Deferred review test-gaps (same PR)
@@ -145,7 +145,7 @@ soak binary but closing the review loop:
 ## File summary
 
 - Create: `tests/e2e/soak_harness.cpp`, `tests/e2e/run_output_soak.sh`.
-- Modify: `tests/e2e/CMakeLists.txt` (new target + `e2e_output_soak` test under label `soak`).
+- Modify: `tests/e2e/CMakeLists.txt` (new target + `e2e_output_soak` test under label `output-soak`).
 - Modify: `tests/unit/tst_outputdispatcher.cpp`, `tests/unit/tst_queuedoutputsink.cpp`,
   `tests/unit/tst_broadcastoutputsettings.cpp` (the three test-gaps).
 - No production source changes.

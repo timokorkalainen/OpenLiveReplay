@@ -4,7 +4,7 @@
 
 **Goal:** Add an opt-in, wall-clock soak that proves the broadcast output bus holds frame/audio continuity and cadence over minutes, plus close three deferred unit test-gaps.
 
-**Architecture:** A standalone `soak_harness` binary drives a real `OutputRuntime` against a static synthetic `OutputFrameCache` through alternating play/pause segments, with a `ContinuitySink` computing O(1) running invariants per submitted frame. A bash driver greps the harness report and asserts. The test registers under an opt-in CTest label `soak`, excluded from the pre-push gate. No production source changes.
+**Architecture:** A standalone `soak_harness` binary drives a real `OutputRuntime` against a static synthetic `OutputFrameCache` through alternating play/pause segments, with a `ContinuitySink` computing O(1) running invariants per submitted frame. A bash driver greps the harness report and asserts. The test registers under an opt-in CTest label `output-soak`, excluded from the pre-push gate. No production source changes.
 
 **Tech Stack:** C++17, Qt 6 Core (`QCoreApplication`, `QThread`, `QElapsedTimer`), Qt Test (for the three unit gaps), CMake/CTest, bash.
 
@@ -14,7 +14,7 @@
 - Build with the existing test toolchain: `cmake -S . -B build/claude-debug -G Ninja -DCMAKE_MAKE_PROGRAM=$HOME/Qt/Tools/Ninja/ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON`; build with `~/Qt/Tools/Ninja/ninja -C build/claude-debug <target>`.
 - Format only changed lines before committing: `/opt/homebrew/opt/llvm/bin/git-clang-format --binary /opt/homebrew/opt/llvm/bin/clang-format --commit origin/main --extensions cpp,h,hpp,mm,c`.
 - Output frame rate default for the soak: `30000/1001` (29.97). Audio: 48000 Hz, S16 interleaved, stereo.
-- The soak test label is exactly `soak`; it must NOT carry the `ci` or `e2e` label.
+- The soak test label is exactly `output-soak`; it must NOT carry the `ci` or `e2e` label.
 
 ---
 
@@ -276,19 +276,19 @@ git commit -m "test: add output-bus continuity soak harness"
 
 **Files:**
 - Create: `tests/e2e/run_output_soak.sh`
-- Modify: `tests/e2e/CMakeLists.txt` (add `add_test` + `set_tests_properties` with label `soak`)
-- Modify: `.githooks/pre-push` (exclude the `soak` label from the full local gate)
+- Modify: `tests/e2e/CMakeLists.txt` (add `add_test` + `set_tests_properties` with label `output-soak`)
+- Modify: `.githooks/pre-push` (exclude the `output-soak` label from the full local gate)
 
 **Interfaces:**
 - Consumes: the `soak_harness` executable from Task 1 (its three report lines).
-- Produces: CTest test `e2e_output_soak` under label `soak`.
+- Produces: CTest test `e2e_output_soak` under label `output-soak`.
 
 - [ ] **Step 1: Write `tests/e2e/run_output_soak.sh`**
 
 ```bash
 #!/usr/bin/env bash
 # Output-bus continuity soak driver: runs soak_harness and asserts the produced output
-# stream stayed frame/audio continuous and held cadence. Opt-in (CTest label "soak").
+# stream stayed frame/audio continuous and held cadence. Opt-in (CTest label "output-soak").
 #
 # Usage: run_output_soak.sh <soak_harness_exe>
 # Env: OLR_SOAK_SECONDS (default 5 here for a fast opt-in run; raise for a real soak).
@@ -345,7 +345,7 @@ After the `soak_harness` target block from Task 1, add:
 add_test(NAME e2e_output_soak
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_output_soak.sh" "$<TARGET_FILE:soak_harness>")
 set_tests_properties(e2e_output_soak PROPERTIES
-    LABELS "soak"
+    LABELS "output-soak"
     TIMEOUT 600
     RUN_SERIAL TRUE
     ENVIRONMENT "OLR_SOAK_SECONDS=5")
@@ -353,7 +353,7 @@ set_tests_properties(e2e_output_soak PROPERTIES
 
 Then: `chmod +x tests/e2e/run_output_soak.sh`
 
-- [ ] **Step 3: Exclude `soak` from the pre-push full gate**
+- [ ] **Step 3: Exclude `output-soak` from the pre-push full gate**
 
 In `.githooks/pre-push`, change the CTest exclusion (around line 36) from:
 
@@ -364,10 +364,10 @@ In `.githooks/pre-push`, change the CTest exclusion (around line 36) from:
 to:
 
 ```bash
-        -LE 'sync-report|srt|native-apple-ingest|soak'
+        -LE 'sync-report|srt|native-apple-ingest|output-soak'
 ```
 
-(GitHub CI already runs only `-L ci`, so the `soak`-labelled test never runs there; this keeps it out of the local pre-push gate too. It runs only via explicit `ctest -L soak`.)
+(GitHub CI already runs only `-L ci`, so the `output-soak`-labelled test never runs there; this keeps it out of the local pre-push gate too. It runs only via explicit `ctest -L output-soak`.)
 
 - [ ] **Step 4: Reconfigure CMake so CTest sees the new test**
 
@@ -378,24 +378,24 @@ Expected: configure succeeds.
 
 ```bash
 ~/Qt/Tools/Ninja/ninja -C build/claude-debug soak_harness
-ctest --test-dir build/claude-debug -L soak --output-on-failure
+ctest --test-dir build/claude-debug -L output-soak --output-on-failure
 ```
 Expected: `e2e_output_soak` runs and passes (`PASS: output soak continuity OK`, `100% tests passed`).
 
 ```bash
-ctest --test-dir build/claude-debug -N -LE 'sync-report|srt|native-apple-ingest|soak' | grep -c e2e_output_soak
+ctest --test-dir build/claude-debug -N -LE 'sync-report|srt|native-apple-ingest|output-soak' | grep -c e2e_output_soak
 ```
 Expected: `0` (the soak is excluded from the default/pre-push selection).
 
 - [ ] **Step 6: Negative sanity check (then revert)**
 
-Temporarily break an assertion to prove the gate fails: in `run_output_soak.sh` change `[ "${seams:-1}" = "0" ]` to `[ "${seams:-1}" = "999" ]`, run `ctest --test-dir build/claude-debug -L soak --output-on-failure`, confirm it FAILS, then revert the line.
+Temporarily break an assertion to prove the gate fails: in `run_output_soak.sh` change `[ "${seams:-1}" = "0" ]` to `[ "${seams:-1}" = "999" ]`, run `ctest --test-dir build/claude-debug -L output-soak --output-on-failure`, confirm it FAILS, then revert the line.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add tests/e2e/run_output_soak.sh tests/e2e/CMakeLists.txt .githooks/pre-push
-git commit -m "test: register opt-in output soak gate (label: soak)"
+git commit -m "test: register opt-in output soak gate (label: output-soak)"
 ```
 
 ---
@@ -640,7 +640,7 @@ Expected: `100% tests passed`.
 - [ ] **Step 3: Run the opt-in soak**
 
 ```bash
-ctest --test-dir build/claude-debug -L soak --output-on-failure
+ctest --test-dir build/claude-debug -L output-soak --output-on-failure
 ```
 Expected: `e2e_output_soak` passes.
 
