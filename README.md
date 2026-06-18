@@ -68,8 +68,10 @@ ctest --test-dir build --output-on-failure   # unit + smoke + e2e
   stream, including a regression for the mono-audio recording crash.
 - **Sanitizers**: add `-DOLR_SANITIZER="address;undefined"` (or `thread`).
 - **Formatting/linting**: `.clang-format`, `.editorconfig`, `.clang-tidy`.
-- **CI**: `.github/workflows/ci.yml` (build+test, lint, sanitizers). iOS is built
-  locally via a pre-push hook — enable with `git config core.hooksPath .githooks`.
+- **CI**: `.github/workflows/ci.yml` (build+test, lint, sanitizers). iOS and the
+  full E2E matrix are *recommended* to build/run locally before pushing (not CI,
+  not forced); an optional pre-push hook surfaces the reminder — enable with
+  `git config core.hooksPath .githooks`. See [`tests/README.md`](tests/README.md).
 
 See [`tests/README.md`](tests/README.md) for full details.
 

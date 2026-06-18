@@ -81,11 +81,32 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
 
         const OutputBusId bus = endpoint.assignment.sourceBus;
         if (!rendered.contains(bus)) {
-            rendered.insert(bus, renderBus(bus, outputFrameIndex, tickState, cache));
+            OutputBusFrame frame = renderBus(bus, outputFrameIndex, tickState, cache);
+            if (m_holdLastFrame && frame.video.isPlaceholder && m_lastGoodFrame.contains(bus)) {
+                // Paint the last real video for this bus instead of the gray
+                // placeholder; keep the freshly-rendered audio + identity +
+                // outputFrameIndex so the clock and audio timeline never stall.
+                frame.video = m_lastGoodFrame.value(bus).video;
+                m_stats.heldFrames++;
+            } else if (!frame.video.isPlaceholder) {
+                m_lastGoodFrame.insert(bus, frame);
+            }
+            rendered.insert(bus, frame);
             countFrameHealth(rendered.value(bus));
         }
 
         const OutputBusFrame frame = rendered.value(bus);
+
+        // Identity-skip: if this endpoint already received a byte-identical
+        // payload, skip the submit (and the sink's map/copy/deliver entirely).
+        OutputTargetDispatchStats& tstats = m_stats.targets[targetStatsKey(endpoint.assignment)];
+        if (m_identitySkip && tstats.hasLastIdentity &&
+            tstats.lastIdentity.samePayloadAs(frame.identity)) {
+            tstats.repeatedPayloadFrames++;
+            m_stats.skippedDuplicateFrames++;
+            continue;
+        }
+
         const bool submitted = endpoint.sink->submit(frame);
         countTargetAttempt(endpoint.assignment, frame, submitted);
         if (submitted) {

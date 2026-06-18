@@ -14,11 +14,13 @@
 #include "settingsmanager.h"
 #include "project/projectsettingsimporter.h"
 #include "recorder_engine/replaymanager.h"
+#include "recorder_engine/codec/videocodecchoice.h"
 #include "recorder_engine/ingest/ingestsession.h"
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
+#include "playback/seekcoalescer.h"
 #include "playback/telemetrytimelinereader.h"
 #include "midi/midimanager.h"
 #include "streamdeck/streamdeckmanager.h"
@@ -38,6 +40,7 @@ class UIManager : public QObject {
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
+    Q_PROPERTY(QString recordCodec READ recordCodec WRITE setRecordCodec NOTIFY recordCodecChanged)
     Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs
                    NOTIFY audioOutputLatencyChanged)
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
@@ -107,6 +110,7 @@ public:
     QString fileName() const;
     int recordWidth() const;
     int recordHeight() const;
+    QString recordCodec() const;
     int recordFps() const;
     int recordFpsNumerator() const;
     int recordFpsDenominator() const;
@@ -164,6 +168,7 @@ public:
     void setFileName(const QString &name);
     void setRecordWidth(int width);
     void setRecordHeight(int height);
+    void setRecordCodec(const QString& codec);
     void setRecordFps(int fps);
     Q_INVOKABLE void setRecordFrameRate(int numerator, int denominator);
     void setMultiviewCount(int count);
@@ -254,7 +259,7 @@ public:
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
-
+    Q_INVOKABLE void endScrubGesture();
 
     QString getSettingsPath(QString fileName);
 signals:
@@ -265,6 +270,7 @@ signals:
     void fileNameChanged();
     void recordWidthChanged();
     void recordHeightChanged();
+    void recordCodecChanged();
     void recordFpsChanged();
     void audioOutputLatencyChanged();
     void multiviewCountChanged();
@@ -358,6 +364,13 @@ private:
     FrameProvider* m_pgmPreviewProvider = nullptr;
     PlaybackTransport *m_transport;
     AudioPlayer *m_audioPlayer = nullptr;
+    // Scrub coalescing: seek immediately on the first move of a gesture and on
+    // release, but commit only the latest target on a single-shot timer in
+    // between. SeekCoalescer holds the pure decision logic (unit-tested).
+    void commitPendingScrub();
+    SeekCoalescer m_seekCoalescer;
+    QTimer m_scrubCoalesceTimer;
+    static constexpr int kScrubCoalesceMs = 16; // ~one frame at 60fps
     bool m_followLive = false;
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;

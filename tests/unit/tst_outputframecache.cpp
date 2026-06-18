@@ -19,6 +19,7 @@ private slots:
     void trimBeforeBoundsVideoHistoryButKeepsBoundaryFrame();
     void trimBeforeDropsExpiredAudioFrames();
     void clearDropsVideoAndAudioHistory();
+    void mergeFromInsertsByPtsWithoutClearing();
 };
 
 void TestOutputFrameCache::videoAtPicksLargestPtsAtOrBeforePlayhead() {
@@ -158,6 +159,30 @@ void TestOutputFrameCache::clearDropsVideoAndAudioHistory() {
     MediaVideoFrame frame = cache.videoFrameOrPlaceholder(0, 100);
     QVERIFY(frame.isPlaceholder);
     QCOMPARE(cache.audioSpanOrSilence(0, 100, 4), silentS16Stereo(4));
+}
+
+void TestOutputFrameCache::mergeFromInsertsByPtsWithoutClearing() {
+    OutputFrameCache live(1, 4, 4);
+    MediaVideoFrame oldF = MediaVideoFrame::solidYuv420p(4, 4, 10, 128, 128);
+    oldF.feedIndex = 0;
+    oldF.ptsMs = 5000;
+    live.insertVideoFrame(oldF);
+
+    OutputFrameCache staging(1, 4, 4);
+    MediaVideoFrame newF = MediaVideoFrame::solidYuv420p(4, 4, 20, 128, 128);
+    newF.feedIndex = 0;
+    newF.ptsMs = 200;
+    staging.insertVideoFrame(newF);
+
+    live.mergeFrom(staging);
+
+    // Both old and new frames survive the merge (no clear).
+    auto atNew = live.videoFrameAt(0, 200);
+    auto atOld = live.videoFrameAt(0, 5000);
+    QVERIFY(atNew.has_value());
+    QVERIFY(atOld.has_value());
+    QCOMPARE(int(uchar(atNew->planeY.at(0))), 20);
+    QCOMPARE(int(uchar(atOld->planeY.at(0))), 10);
 }
 
 QTEST_GUILESS_MAIN(TestOutputFrameCache)

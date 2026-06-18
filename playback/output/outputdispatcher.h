@@ -65,6 +65,8 @@ struct OutputDispatchStats {
     qint64 sinkFailures = 0;
     qint64 placeholderFrames = 0;
     qint64 silentAudioFrames = 0;
+    qint64 heldFrames = 0;
+    qint64 skippedDuplicateFrames = 0;
     OutputRuntimeDispatchStats runtime;
     QHash<QString, OutputTargetDispatchStats> targets;
 };
@@ -81,6 +83,8 @@ public:
     void resetPlayEpoch();
     qint64 nextOutputFrameIndex() const { return m_nextOutputFrameIndex; }
     void setRuntimeStats(const OutputRuntimeDispatchStats& stats);
+    void setHoldLastFrame(bool enabled) { m_holdLastFrame = enabled; }
+    void setIdentitySkip(bool enabled) { m_identitySkip = enabled; }
 
     OutputDispatchStats dispatchTick(const OutputFrameCache& cache,
                                      const PlaybackStateSnapshot& state);
@@ -107,6 +111,9 @@ private:
     PlaybackStateSnapshot m_playEpoch;
     OutputDispatchStats m_stats;
     MultiviewComposite m_multiviewMemo;
+    bool m_holdLastFrame = true;
+    QHash<OutputBusId, OutputBusFrame> m_lastGoodFrame; // per-bus last real video
+    bool m_identitySkip = true;
 };
 
 #endif // OUTPUTDISPATCHER_H

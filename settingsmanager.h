@@ -11,6 +11,7 @@
 #include <QMap>
 
 #include "playback/output/outputtargetassignment.h"
+#include "recorder_engine/codec/videocodecchoice.h"
 
 // Simple data structure to hold our application state
 struct SourceSettings {
@@ -32,6 +33,7 @@ struct AppSettings {
     int videoWidth = 1920;
     int videoHeight = 1080;
     int fps = 30;
+    VideoCodecChoice videoCodec = VideoCodecChoice::Mpeg2Software;
     int fpsNum = 30;
     int fpsDen = 1;
     int multiviewCount = 4;

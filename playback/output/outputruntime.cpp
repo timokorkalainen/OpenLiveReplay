@@ -25,6 +25,11 @@ void OutputRuntime::setEndpoints(const QList<OutputEndpoint>& endpoints) {
     m_dispatcher.setEndpoints(endpoints);
 }
 
+void OutputRuntime::setIdentitySkip(bool enabled) {
+    QMutexLocker locker(&m_mutex);
+    m_dispatcher.setIdentitySkip(enabled);
+}
+
 void OutputRuntime::startRuntime() {
     {
         QMutexLocker locker(&m_mutex);
