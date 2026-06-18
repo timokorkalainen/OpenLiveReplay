@@ -48,10 +48,21 @@ for tool in ffmpeg ffprobe srt-live-transmit; do
     command -v "$tool" >/dev/null 2>&1 || note_missing "$tool not found on PATH"
 done
 
-if ! { command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 \
-        || command -v py >/dev/null 2>&1; }; then
-    note_missing "Python 3 not found (needed by the RTMP fixture server)"
-fi
+# Python 3 SPECIFICALLY (mirror rtmp_lib.sh:rtmp_find_python3) -- a Python-2-only
+# `python`/`py` would pass a bare presence check but make the RTMP cells SKIP.
+have_python3() {
+    local c
+    for c in python3 python; do
+        command -v "$c" >/dev/null 2>&1 \
+            && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 \
+            && return 0
+    done
+    command -v py >/dev/null 2>&1 \
+        && py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 \
+        && return 0
+    return 1
+}
+have_python3 || note_missing "Python 3 not found (needed by the RTMP fixture server)"
 
 # Encoder checks need ffmpeg itself; skipped (ffmpeg already flagged above) if absent.
 if command -v ffmpeg >/dev/null 2>&1; then
@@ -60,9 +71,12 @@ if command -v ffmpeg >/dev/null 2>&1; then
     if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx264|h264_mf)[[:space:]]'; then
         note_missing "no usable H.264 encoder (need libx264 or h264_mf) in ffmpeg"
     fi
-    # HEVC: the scripts accept libx265 or any hevc_* encoder.
-    if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx265|hevc_[a-z0-9_]+)[[:space:]]'; then
-        note_missing "no usable HEVC encoder (need libx265 or hevc_*) in ffmpeg"
+    # HEVC: run_rtmp_hevc_smoke.sh only tries hevc_videotoolbox then libx265, so
+    # the gate's binding set is the tighter {hevc_videotoolbox, libx265} (the
+    # SRT-HEVC cell accepts a superset). Require the tighter set so a preflight
+    # pass guarantees BOTH HEVC cells run rather than skip-as-pass.
+    if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx265|hevc_videotoolbox)[[:space:]]'; then
+        note_missing "no usable HEVC encoder (need libx265 or hevc_videotoolbox) in ffmpeg"
     fi
 fi
 
