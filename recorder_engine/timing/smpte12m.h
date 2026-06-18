@@ -17,6 +17,17 @@ struct Smpte12mTimecode {
 // representation carried in H.264/HEVC pic_timing/ATC SEI and ANC; toFrameCount
 // converts a wall-clock TC to an absolute frame number at a given integer fps.
 namespace Smpte12m {
+// SINGLE SOURCE OF TRUTH for the nominal fps used to convert an extracted SMPTE
+// 12M timecode <-> a 100 ns offset since midnight. The producers (SRT/RTMP ingest
+// sessions) encode each frame's TC to 100 ns with THIS fps, and the consumer
+// (TimecodeAligner) decodes that 100 ns back to a TC frame count with the SAME
+// fps — so producers and consumer provably agree. It is deliberately a fixed 30
+// (the engine's default target rate), NOT m_fps: the carried 100 ns is only an
+// intermediate that must round-trip, so as long as both sides use one constant
+// the value cancels. (Threading the real per-source fps end-to-end is a future
+// refinement; see TimecodeAligner construction in replaymanager.cpp.)
+constexpr int kTimecodeNominalFps = 30;
+
 // Decode the 32-bit BCD timecode word (SMPTE 12M / ATC layout) -> fields.
 Smpte12mTimecode fromPackedWord(uint32_t word);
 // Encode fields -> the 32-bit BCD timecode word (inverse of fromPackedWord).

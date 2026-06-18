@@ -160,6 +160,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
     const int64_t currentRecordingTimeMs = (m_internalFrameCount * 1000) / m_targetFps;
 
     AVFrame* pulled = nullptr;
+    int64_t pulledTimecode100ns = -1;
     const bool paintBlue = m_paintBlue.fetchAndStoreRelaxed(0) != 0;
 
     // The mutex only guards m_frameQueue (shared with the capture
@@ -185,6 +186,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
             QueuedFrame top = m_frameQueue.dequeue();
             if (pulled) av_frame_free(&pulled);
             pulled = top.frame;
+            pulledTimecode100ns = top.sourceTimecode100ns;
         }
     }
 
@@ -195,11 +197,15 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                    (m_latestFrame->height / 2)); // Cb: 240 = legal max chroma (255 is out-of-range)
         memset(m_latestFrame->data[2], 107,
                m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+        // A blue-painted frame carries no source timecode.
+        m_latestFrameTimecode100ns = -1;
     }
     if (pulled) {
         av_frame_unref(m_latestFrame);
         av_frame_move_ref(m_latestFrame, pulled);
         av_frame_free(&pulled);
+        // The TC travels with the frame now held in m_latestFrame.
+        m_latestFrameTimecode100ns = pulledTimecode100ns;
     }
 
     // Read the current view-track assignment (atomic, set by UIManager).
@@ -260,6 +266,18 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // For H.264, packets were written inline in the callback above.
         if (m_videoCodec != VideoCodecChoice::H264Hardware && encCtx) {
             m_muxer->writePacket(outPkt);
+        }
+
+        // Forward this frame's source timecode to ReplayManager's TimecodeAligner,
+        // keyed by the session frame index it was muxed on. Purely additive: only
+        // when the frame actually carried a valid TC (>= 0), so sources without TC
+        // never emit and behavior is unchanged when TC is absent.
+        if (m_latestFrameTimecode100ns >= 0) {
+            emit frameTimecode(m_sourceIndex, m_latestFrameTimecode100ns, m_internalFrameCount);
+            // One-shot: a TC belongs to a single fresh frame. Clear it so a held /
+            // repeat CFR tick (which re-muxes m_latestFrame without a new pull) does
+            // not re-emit the same TC paired with a different session frame index.
+            m_latestFrameTimecode100ns = -1;
         }
 
         // Write the per-frame source metadata to the paired subtitle track
@@ -341,6 +359,7 @@ void StreamWorker::captureLoop() {
             QueuedFrame qf;
             qf.frame = decoded.frame;
             qf.sourcePts = decoded.sourcePtsMs;
+            qf.sourceTimecode100ns = decoded.sourceTimecode100ns;
 
             QMutexLocker locker(&m_frameMutex);
             m_frameQueue.enqueue(qf);

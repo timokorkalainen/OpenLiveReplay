@@ -49,10 +49,11 @@ public:
 
     // Nominal fps used only to convert an extracted SMPTE 12M timecode into a 100 ns
     // offset since midnight. The SRT session itself carries no fps (the constructor
-    // takes only output width/height); 30 matches the engine's default target rate
-    // (ReplayManager::m_fps / StreamWorker::m_targetFps both default to 30). This
+    // takes only output width/height). This is an ALIAS of the shared
+    // Smpte12m::kTimecodeNominalFps so producers (SRT/RTMP) and the consumer
+    // (TimecodeAligner) reference ONE source of truth and provably agree. This
     // affects only the TC mapping — A/V sync uses the 90 kHz stream clock, never this.
-    static constexpr int kTimecodeNominalFps = 30;
+    static constexpr int kTimecodeNominalFps = Smpte12m::kTimecodeNominalFps;
 
 private:
     int m_sourceIndex = -1;

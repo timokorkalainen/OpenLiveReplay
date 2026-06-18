@@ -39,11 +39,11 @@ public:
     IngestFailureKind lastFailureKind() const override { return m_lastFailureKind; }
 
     // Nominal fps used only to convert an extracted/AMF SMPTE 12M timecode into a
-    // 100 ns offset since midnight. RTMP/FLV carries no fps on this path; 30 matches
-    // the engine's default target rate and the SRT session's kTimecodeNominalFps so
-    // SRT and RTMP producers agree (see NativeSrtIngestSession::kTimecodeNominalFps).
+    // 100 ns offset since midnight. RTMP/FLV carries no fps on this path. This is an
+    // ALIAS of the shared Smpte12m::kTimecodeNominalFps so SRT and RTMP producers and
+    // the TimecodeAligner consumer reference ONE source of truth and provably agree.
     // This affects only the TC mapping — A/V sync uses the FLV PLL clock, never this.
-    static constexpr int kTimecodeNominalFps = 30;
+    static constexpr int kTimecodeNominalFps = Smpte12m::kTimecodeNominalFps;
 
 private:
     int m_sourceIndex = -1;

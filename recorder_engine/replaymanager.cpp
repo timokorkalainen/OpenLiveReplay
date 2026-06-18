@@ -324,6 +324,12 @@ void ReplayManager::startRecording() {
         connect(worker, &StreamWorker::statsUpdated, this, &ReplayManager::sourceStatsUpdated,
                 Qt::QueuedConnection);
 
+        // Forward each frame's source timecode into the aligner. The worker emits
+        // from its tick thread, so deliver queued onto the thread ReplayManager
+        // lives on (only emitted when the frame actually carried a valid TC).
+        connect(worker, &StreamWorker::frameTimecode, this, &ReplayManager::onFrameTimecode,
+                Qt::QueuedConnection);
+
         m_workers.append(worker);
         worker->start(QThread::HighPriority);
     }
@@ -464,6 +470,12 @@ void ReplayManager::onTimerTick() {
         // 2. Write blue frames for any unmapped view-tracks
         writeBlueFrames(frameMs);
     }
+}
+
+void ReplayManager::onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns,
+                                    int64_t sessionFrameIndex) {
+    // The aligner ignores negative timecodes; the worker only emits valid ones.
+    m_tcAligner.observe(sourceIndex, sourceTimecode100ns, sessionFrameIndex);
 }
 
 void ReplayManager::writeBlueFrames(int64_t elapsedMs) {

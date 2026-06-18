@@ -15,6 +15,7 @@
 #include "ingest/ingestsession.h"
 #include "recorder_engine/codec/videocodecchoice.h"
 #include "recorder_engine/codec/nativevideoencoder.h"
+#include "timing/timecodealigner.h"
 
 class ReplayManager : public QObject
 {
@@ -80,6 +81,13 @@ public:
     QString getVideoPath();
     qint64 getRecordingStartEpochMs() const { return m_recordingStartEpochMs; }
 
+    // Inter-camera timecode alignment (Phase 4 consumes these). True iff both
+    // sources carried a common timecode AND their equal-TC frames coincide
+    // exactly. sourceFrameOffset() is the frame correction to ADD to source B's
+    // mapping so its equal-TC frames coincide with A (0 if either lacks TC).
+    bool sourcesFrameAligned(int a, int b) const { return m_tcAligner.sourcesAligned(a, b, 0); }
+    int64_t sourceFrameOffset(int a, int b) const { return m_tcAligner.frameOffset(a, b); }
+
 signals:
     // Emitted once per advanced frame: (global frame index, elapsed ms
     // since recording start).  The second value is MILLISECONDS — it was
@@ -98,6 +106,11 @@ signals:
 
 private slots:
     void onTimerTick();
+
+    // Queued from each StreamWorker::frameTimecode. Records the source's per-frame
+    // timecode (100 ns since midnight) against the session frame index it landed on
+    // so two sources' equal-TC frames can be compared (sourcesFrameAligned).
+    void onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns, int64_t sessionFrameIndex);
 
 private:
     void writeBlueFrames(int64_t elapsedMs);
@@ -144,6 +157,18 @@ private:
     Muxer* m_muxer;
     RecordingClock* m_clock;
     QList<StreamWorker*> m_workers;  // One per SOURCE (not per view)
+
+    // Inter-camera timecode aligner. Constructed with the SHARED
+    // Smpte12m::kTimecodeNominalFps (30), NOT m_fps. WHY 30 and not m_fps: the
+    // SRT/RTMP producers encode each frame's TC to the carried 100 ns with this
+    // same constant, and the aligner decodes that 100 ns back to a TC frame count
+    // with it — using one shared constant makes producer and consumer provably
+    // agree (the value cancels in the round-trip). Inter-camera alignment is
+    // anchor-relative (a difference of two sources' frame mappings), so it is
+    // correct at ANY source rate; only the ABSOLUTE TC->frame mapping is exact
+    // solely at 30 — a documented limitation. Threading the real per-source fps
+    // end-to-end is a future refinement.
+    TimecodeAligner m_tcAligner{Smpte12m::kTimecodeNominalFps};
     qint64 m_recordingStartEpochMs = 0;
 
     // Final elapsed captured at stopRecording (before m_clock is deleted) so
