@@ -84,6 +84,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp
         recorder_engine/timing/timecode.h recorder_engine/timing/timecode.cpp
         recorder_engine/timing/smpte12m.h recorder_engine/timing/smpte12m.cpp
+        recorder_engine/timing/timecodealigner.h recorder_engine/timing/timecodealigner.cpp
         recorder_engine/timing/sourceclock.h recorder_engine/timing/sourceclock.cpp
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
