@@ -1,6 +1,8 @@
 #include "nativesrtingestsession.h"
 
 #include "nativesrtaddress.h"
+#include "nativesrtconnectdiagnostics.h"
+#include "nativesrturloptions.h"
 
 #include <QDebug>
 #include <QThread>
@@ -57,8 +59,8 @@ void releaseSrtLibrary() {
     }
 }
 
-bool setSrtOption(SRTSOCKET socket, SRT_SOCKOPT option, const void* value, int size,
-                  QString* error, const QString& name) {
+bool setSrtOption(SRTSOCKET socket, SRT_SOCKOPT option, const void* value, int size, QString* error,
+                  const QString& name) {
     if (srt_setsockopt(socket, 0, option, value, size) == SRT_ERROR) {
         if (error) {
             *error = QStringLiteral("Native SRT %1 failed: %2")
@@ -74,6 +76,19 @@ bool isAsyncReceivePending() {
     const int code = srt_getlasterror(&osError);
     Q_UNUSED(osError);
     return code == SRT_EASYNCRCV;
+}
+
+QString srtConnectFailureDetails(SRTSOCKET socket) {
+    int osError = 0;
+    const int code = srt_getlasterror(&osError);
+    Q_UNUSED(osError);
+    const QString lastError = QString::fromUtf8(srt_getlasterror_str());
+    const int rejectReason = srt_getrejectreason(socket);
+    const char* rejectReasonText =
+        rejectReason == SRT_REJ_UNKNOWN ? nullptr : srt_rejectreason_str(rejectReason);
+    return nativeSrtConnectFailureMessage(code, lastError, rejectReason,
+                                          rejectReasonText ? QString::fromUtf8(rejectReasonText)
+                                                           : QString());
 }
 
 int findAlignedSyncOffset(const QByteArray& bytes) {
@@ -141,8 +156,8 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
     if (!mode.isEmpty() && mode != QStringLiteral("caller")) {
         return false;
     }
-    if (query.hasQueryItem(QStringLiteral("passphrase"))
-        || query.hasQueryItem(QStringLiteral("pbkeylen"))) {
+    if (query.hasQueryItem(QStringLiteral("passphrase")) ||
+        query.hasQueryItem(QStringLiteral("pbkeylen"))) {
         return false;
     }
 
@@ -150,11 +165,7 @@ bool NativeSrtIngestSession::supportsUrl(const QUrl& url) {
 }
 
 QByteArray NativeSrtIngestSession::streamIdForSocketOption(const QUrl& url) {
-    const QUrlQuery query(url);
-    if (!query.hasQueryItem(QStringLiteral("streamid"))) {
-        return QByteArray();
-    }
-    return query.queryItemValue(QStringLiteral("streamid"), QUrl::FullyDecoded).toUtf8();
+    return nativeSrtUrlOptionsFromUrl(url).streamId.toUtf8();
 }
 
 bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callbacks) {
@@ -244,7 +255,8 @@ void NativeSrtIngestSession::run() {
         }
 
         if (isAsyncReceivePending()) {
-            if (m_lastPacketAtMs >= 0 && m_monotonic.elapsed() - m_lastPacketAtMs > kStallTimeoutMs) {
+            if (m_lastPacketAtMs >= 0 &&
+                m_monotonic.elapsed() - m_lastPacketAtMs > kStallTimeoutMs) {
                 log(QStringLiteral("Native SRT stalled. Restarting..."));
                 break;
             }
@@ -373,7 +385,7 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
         if (code != SRT_EASYNCSND) {
             if (error) {
                 *error = QStringLiteral("Native SRT connect failed: %1")
-                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+                             .arg(srtConnectFailureDetails(m_socket));
             }
             closeSocket();
             return false;
@@ -390,7 +402,7 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
         if (state == SRTS_BROKEN || state == SRTS_NONEXIST || state == SRTS_CLOSED) {
             if (error) {
                 *error = QStringLiteral("Native SRT connect failed: %1")
-                             .arg(QString::fromUtf8(srt_getlasterror_str()));
+                             .arg(srtConnectFailureDetails(m_socket));
             }
             closeSocket();
             return false;
@@ -450,8 +462,7 @@ void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
         if (m_tsBuffer.at(0) != char(0x47)) {
             const int syncOffset = findAlignedSyncOffset(m_tsBuffer);
             if (syncOffset < 0) {
-                const int bytesToDrop =
-                    std::max(1, int(m_tsBuffer.size()) - (kTsPacketSize - 1));
+                const int bytesToDrop = std::max(1, int(m_tsBuffer.size()) - (kTsPacketSize - 1));
                 m_tsBuffer.remove(0, bytesToDrop);
                 return;
             }
@@ -519,8 +530,8 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
         return;
     }
 
-    if (pes.kind != NativeElementaryStreamKind::Video
-        || pes.videoCodec == NativeVideoCodec::Unknown) {
+    if (pes.kind != NativeElementaryStreamKind::Video ||
+        pes.videoCodec == NativeVideoCodec::Unknown) {
         return;
     }
 
@@ -586,13 +597,12 @@ void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
     }
 
     if (!m_audioRemainder.isEmpty()) {
-        const bool currentPesStartsFrame =
-            NativeAacDecoder::hasAdtsSync(pes.payload, 0)
-            || NativeAacDecoder::hasLatmLoasSync(pes.payload, 0);
+        const bool currentPesStartsFrame = NativeAacDecoder::hasAdtsSync(pes.payload, 0) ||
+                                           NativeAacDecoder::hasLatmLoasSync(pes.payload, 0);
         const qint64 delta90k = pes.pts90k - m_audioRemainderPts90k;
-        if (currentPesStartsFrame || m_audioRemainderPts90k < 0
-            || delta90k > kAudioRemainderPtsTolerance90k
-            || delta90k < -kAudioRemainderPtsTolerance90k) {
+        if (currentPesStartsFrame || m_audioRemainderPts90k < 0 ||
+            delta90k > kAudioRemainderPtsTolerance90k ||
+            delta90k < -kAudioRemainderPtsTolerance90k) {
             m_audioRemainder.clear();
             m_audioRemainderPts90k = -1;
         }
@@ -619,7 +629,8 @@ void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
         if (!NativeAacDecoder::parseAdtsFrame(bytes, offset, &info)) {
             if (NativeAacDecoder::hasLatmLoasSync(bytes, offset)) {
                 if (!m_loggedLatmUnsupported) {
-                    log(QStringLiteral("Native SRT LATM/LOAS AAC is unsupported; continuing video."));
+                    log(QStringLiteral(
+                        "Native SRT LATM/LOAS AAC is unsupported; continuing video."));
                     m_loggedLatmUnsupported = true;
                 }
                 m_audioRemainder.clear();
@@ -628,8 +639,8 @@ void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
 
             int nextOffset = -1;
             for (int i = offset + 1; i < bytes.size(); ++i) {
-                if (NativeAacDecoder::parseAdtsFrame(bytes, i, nullptr)
-                    || NativeAacDecoder::hasLatmLoasSync(bytes, i)) {
+                if (NativeAacDecoder::parseAdtsFrame(bytes, i, nullptr) ||
+                    NativeAacDecoder::hasLatmLoasSync(bytes, i)) {
                     nextOffset = i;
                     break;
                 }
