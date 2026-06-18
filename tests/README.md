@@ -26,24 +26,28 @@ ctest --test-dir build --output-on-failure -LE 'sync-report|srt|native-apple-ing
 ```
 
 Local transport bring-up gates use distinct labels such as `srt`,
-`native-apple-ingest`, and `native-rtmp`; they are excluded from CI until their
-matching native ingest path is ready.
+`native-apple-ingest`, `native-ndi`, and `native-rtmp`; they are excluded from
+CI until their matching native ingest path is ready.
 
-The `ndi-runtime` label is an opt-in real NDI sender/receiver smoke test. It
-loads the NDI runtime dynamically, routes cache-backed app output frames through
+The `ndi-runtime` label is a real NDI sender/receiver smoke test. It loads the
+NDI runtime dynamically, routes cache-backed app output frames through
 `OutputDispatcher` into the app's `NdiOutputSink`, discovers the local sender,
-and verifies video cadence plus non-silent audio. It skips unless
-`OLR_RUN_NDI_RUNTIME_TESTS=1` is set and the runtime is available; set
-`OLR_NDI_RUNTIME_LIBRARY=/path/to/libndi.dylib` only when the runtime is outside
-the platform default or known NDI Tools locations. Set
+and verifies video cadence plus non-silent audio. It skips only when the NDI
+runtime is not installed or discoverable; set
+`OLR_NDI_RUNTIME_LIBRARY=/path/to/libndi.dylib` when the runtime is outside the
+platform default or known NDI Tools locations. Set
 `OLR_NDI_RUNTIME_SOAK_SECONDS=300` to keep the sender and receiver running for a
 five-minute soak.
 
 ```bash
-OLR_RUN_NDI_RUNTIME_TESTS=1 \
 OLR_NDI_RUNTIME_SOAK_SECONDS=300 \
 ctest --test-dir build -L ndi-runtime --output-on-failure
 ```
+
+The `native-ndi` label records a real MKV through the native NDI ingest path.
+By default it starts `ndi_runtime_sender`, a local sender that uses the app's own
+runtime-loaded `NdiOutputSink`; set `OLR_NDI_TEST_SOURCE='Studio (CAM1)'` only
+when you intentionally want to test an external source instead.
 
 `native-rtmp` mirrors the applicable SRT transport gates: one-source RTMP/RTMPS
 smoke, 4-source routing, 4-source sync, per-source trim, and live/dead
