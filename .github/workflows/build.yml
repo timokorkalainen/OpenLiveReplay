@@ -45,6 +45,57 @@ jobs:
           export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
           ./build-scripts/build_windows_app.sh
 
+      # Run the deterministic Media Foundation unit tests on the real Windows
+      # runner. The build step above already built FFmpeg + SRT (into
+      # windows_build/dist/{ffmpeg,srt}) and exposed the Qt MinGW kit via
+      # QT_ROOT_DIR, so a second OLR_BUILD_TESTS=ON configure into build-tests/
+      # reuses that exact toolchain. We build and run only the MF unit tests that
+      # are self-contained on a bare runner:
+      #   * tst_nativeaacdecoder — feeds a canned base64 AAC-LC ADTS fixture
+      #     through the in-box MS AAC Decoder MFT (ships on every Windows SKU);
+      #     no network, no external transmitter, fully deterministic.
+      #   * tst_nativevideodecoder — probes Media Foundation video-decode
+      #     capabilities (no decode, no network, no HEVC OS extension required).
+      # Live native-ingest e2e (SRT/RTMP transmitters), HEVC OS extensions and
+      # the manual AAC/RTMP audio smoke-test are intentionally NOT in this gate;
+      # see docs/windows-aac-rtmp-smoke-runbook.md.
+      - name: Run Media Foundation unit tests (ctest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
+          # Mirror the windows-mingw-release preset's toolchain discovery the same
+          # way build_windows_app.sh does (newest MinGW kit under <Qt>/../../Tools).
+          # shellcheck disable=SC2012  # ls -d on version dirs is intentional (matches build script)
+          newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
+          QT_TOOLS_DIR=""
+          QT_TOOLS_DIR="$(cd "$OLR_QT_ROOT/../.." && pwd)/Tools"
+          : "${OLR_MINGW_ROOT:=$(newest "$QT_TOOLS_DIR"/mingw*_64)}"
+          [ -n "${OLR_MINGW_ROOT:-}" ] || OLR_MINGW_ROOT="$(newest C:/Qt/Tools/mingw*_64)"
+          NINJA_BIN="$(command -v ninja || true)"
+          [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
+          NINJA_DIR=""
+          NINJA_DIR="$(dirname "$NINJA_BIN")"
+          export PATH="$OLR_MINGW_ROOT/bin:$NINJA_DIR:$PATH"
+          # FFmpeg + SRT were built by the previous step. The Windows test CMake
+          # FATAL_ERRORs without these even though only avutil is actually linked.
+          FFMPEG_ROOT=""
+          FFMPEG_ROOT="$(cd windows_build/dist/ffmpeg && pwd)"
+          SRT_ROOT=""
+          SRT_ROOT="$(cd windows_build/dist/srt && pwd)"
+          cmake -S . -B build-tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOLR_BUILD_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$OLR_QT_ROOT" \
+            -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
+            -DCMAKE_CXX_COMPILER="$OLR_MINGW_ROOT/bin/g++.exe" \
+            -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
+            -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
+            -DOLR_SRT_ROOT="$SRT_ROOT"
+          cmake --build build-tests --target tst_nativeaacdecoder tst_nativevideodecoder
+          ctest --test-dir build-tests --output-on-failure \
+            -R '^(tst_nativeaacdecoder|tst_nativevideodecoder)$'
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
