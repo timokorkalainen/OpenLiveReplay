@@ -14,6 +14,7 @@ private slots:
     void loadMissingFileReturnsFalse();
     void loadMalformedJsonReturnsFalse();
     void saveToUnwritablePathReturnsFalse();
+    void loadDefaultsVideoCodecToMpeg2WhenMissing();
 
 private:
     static AppSettings sampleSettings();
@@ -34,6 +35,7 @@ AppSettings TestSettingsManager::sampleSettings() {
     s.telemetrySseUrl = QStringLiteral("https://provider.example/telemetry");
     s.midiPortName = QStringLiteral("X-Touch One");
     s.audioOutputLatencyMs = 180;
+    s.videoCodec = VideoCodecChoice::H264Hardware;
 
     SourceSettings a;
     a.id = QStringLiteral("src-a");
@@ -101,6 +103,7 @@ void TestSettingsManager::roundTripPreservesEverything() {
     QCOMPARE(out.fpsNum, in.fpsNum);
     QCOMPARE(out.fpsDen, in.fpsDen);
     QCOMPARE(out.audioOutputLatencyMs, in.audioOutputLatencyMs);
+    QCOMPARE(out.videoCodec, in.videoCodec);
     QCOMPARE(out.multiviewCount, in.multiviewCount);
     QCOMPARE(out.showTimeOfDay, in.showTimeOfDay);
     QCOMPARE(out.importSettingsUrl, in.importSettingsUrl);
@@ -209,6 +212,22 @@ void TestSettingsManager::saveToUnwritablePathReturnsFalse() {
     SettingsManager mgr;
     // A directory that does not exist -> open for write fails.
     QVERIFY(!mgr.save(QStringLiteral("/nonexistent-dir-xyz/settings.json"), sampleSettings()));
+}
+
+void TestSettingsManager::loadDefaultsVideoCodecToMpeg2WhenMissing() {
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("settings.json"));
+
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(QJsonDocument(QJsonObject{{"fps", 30}}).toJson());  // no videoCodec key
+    f.close();
+
+    SettingsManager mgr;
+    AppSettings out;
+    QVERIFY(mgr.load(path, out));
+    QCOMPARE(out.videoCodec, VideoCodecChoice::Mpeg2Software);
 }
 
 QTEST_GUILESS_MAIN(TestSettingsManager)
