@@ -228,13 +228,18 @@ void PlaybackWorker::resetDedup() {
         track->lastDeliveredPtsMs = -1;
 }
 
-void PlaybackWorker::clearAllBuffers() {
+void PlaybackWorker::clearDecoderBuffers() {
     QMutexLocker bufferLocker(&m_bufferMutex);
     for (auto* track : m_decoderBank) {
         track->buffer.clear();
         track->decimateCounter = 0;
     }
-    if (m_outputCache) m_outputCache->clear();
+    // NOTE: deliberately does NOT clear m_outputCache. The OutputRuntime paints
+    // exclusively from m_outputCache; wiping it here makes the next ~1ms tick
+    // snapshot an empty cache and render the gray placeholder (the seek flash).
+    // The cache's stale frames are harmless: the forward fill re-inserts the
+    // new frames before the playhead reaches them, and trimBefore() drops the
+    // old ones. See docs/superpowers/plans (Tier 1 Task 1).
 }
 
 bool PlaybackWorker::reuseAt(int64_t target) {
@@ -567,7 +572,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     }
 
     // --- Full reposition: clear everything, seek behind target, fill forward. ---
-    clearAllBuffers();
+    clearDecoderBuffers();
     m_reverseAnchorMs = INT64_MAX; // a seek invalidates the reverse-fetch run
     m_audioQueue.clear();
     for (auto* aTrack : m_audioDecoderBank) {
@@ -886,7 +891,7 @@ void PlaybackWorker::run() {
                 int64_t anchor = qMax<int64_t>(0, P - kTrailMs);
                 int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
                 av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
-                clearAllBuffers();
+                clearDecoderBuffers();
                 m_audioQueue.clear();
                 for (auto* aTrack : m_audioDecoderBank) {
                     aTrack->lastEnqueuedPtsMs = -1;
