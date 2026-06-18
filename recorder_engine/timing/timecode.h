@@ -44,11 +44,15 @@ bool isDropFrameRate(const TimecodeRate& rate);
 // result is NDF. Negative `frame` is clamped to 0.
 std::string framesToTimecode(int64_t frame, const TimecodeRate& rate, bool dropFrame);
 
-// Inverse of framesToTimecode: parse "HH:MM:SS:FF" or "HH:MM:SS;FF" back to an
-// absolute frame index. The separator before the frame field is accepted as
-// either ':' or ';' regardless of `dropFrame`; `dropFrame` (gated by
-// isDropFrameRate) selects whether drop-frame renumbering is undone. Returns 0
-// for malformed input.
+// Parse "HH:MM:SS:FF" or "HH:MM:SS;FF" back to an absolute frame index. This is
+// a left-inverse of framesToTimecode (framesToTimecode -> timecodeToFrames is
+// exact for every frame index), NOT a strict bijection: field values are not
+// range-validated, so an out-of-range frame field or an "impossible" dropped DF
+// label is accepted and folded into the index rather than rejected. The
+// separator before the frame field is accepted as either ':' or ';' regardless
+// of `dropFrame`; `dropFrame` (gated by isDropFrameRate) selects whether
+// drop-frame renumbering is undone. Returns 0 for structurally malformed input
+// (wrong field count, non-digit/non-separator characters, or no digits).
 int64_t timecodeToFrames(const std::string& tc, const TimecodeRate& rate, bool dropFrame);
 
 } // namespace Timecode

@@ -46,6 +46,8 @@ private slots:
 
     // --- Parsing edge cases -----------------------------------------------
     void parseAcceptsBothSeparators();
+    void parseRejectsMalformedInput();
+    void parseOversizedFieldDoesNotOverflow();
 };
 
 void TestTimecode::ndf30_basicVectors() {
@@ -166,6 +168,29 @@ void TestTimecode::parseAcceptsBothSeparators() {
     // Parser is lenient about the frame separator; it does not encode mode.
     QCOMPARE(Timecode::timecodeToFrames("00:00:01:00", kRate30, false), int64_t(30));
     QCOMPARE(Timecode::timecodeToFrames("00:00:01;00", kRate30, false), int64_t(30));
+}
+
+void TestTimecode::parseRejectsMalformedInput() {
+    // Structurally malformed input returns 0 (documented contract): wrong field
+    // count, non-digit/non-separator characters, and empty/no-digit strings.
+    QCOMPARE(Timecode::timecodeToFrames("", kRate30, false), int64_t(0));
+    QCOMPARE(Timecode::timecodeToFrames("00:00:01", kRate30, false), int64_t(0));       // 3 fields
+    QCOMPARE(Timecode::timecodeToFrames("00:00:01:00:00", kRate30, false), int64_t(0)); // 5 fields
+    QCOMPARE(Timecode::timecodeToFrames("aa:bb:cc:dd", kRate30, false), int64_t(0));    // non-digit
+    QCOMPARE(Timecode::timecodeToFrames("::::", kRate30, false), int64_t(0));           // no digits
+}
+
+void TestTimecode::parseOversizedFieldDoesNotOverflow() {
+    // A pathologically long numeric field must not trigger signed-integer
+    // overflow (UB) — the accumulator is 64-bit and saturates. The exact folded
+    // value is unspecified, but the call must complete and stay non-negative
+    // (this test runs clean under -fsanitize=undefined in the CI asan-ubsan job).
+    const std::string huge(40, '9');
+    const int64_t r = Timecode::timecodeToFrames(huge + ":00:00:00", kRate30, false);
+    QVERIFY(r >= 0);
+    // A well-formed but out-of-range frame field is accepted (lenient parser),
+    // not UB and not a structural reject.
+    QCOMPARE(Timecode::timecodeToFrames("00:00:00:40", kRate30, false), int64_t(40));
 }
 
 QTEST_GUILESS_MAIN(TestTimecode)

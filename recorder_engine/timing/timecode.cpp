@@ -82,15 +82,23 @@ std::string framesToTimecode(int64_t frame, const TimecodeRate& rate, bool dropF
 
 int64_t timecodeToFrames(const std::string& tc, const TimecodeRate& rate, bool dropFrame) {
     // Parse HH:MM:SS<sep>FF where <sep> is ':' or ';'. Be strict about the field
-    // count but lenient about the separator characters.
-    int parts[4] = {0, 0, 0, 0};
+    // count but lenient about the separator characters. Field values are NOT
+    // range-checked (a frame field >= fps, or an "impossible" dropped DF label,
+    // is accepted and folded into the returned index) — this is a lenient
+    // left-inverse, sufficient for the engine's frames->string->frames round-trip.
+    int64_t parts[4] = {0, 0, 0, 0};
     int idx = 0;
-    int value = 0;
+    // Accumulate in 64-bit and saturate so a pathologically long numeric field
+    // cannot overflow (signed overflow is UB; see tst_timecode oversized-field).
+    int64_t value = 0;
+    constexpr int64_t kValueCap = 1'000'000'000'000LL; // far beyond any real TC field
     bool sawDigit = false;
     for (size_t i = 0; i <= tc.size(); ++i) {
         const char c = (i < tc.size()) ? tc[i] : '\0';
         if (c >= '0' && c <= '9') {
-            value = value * 10 + (c - '0');
+            if (value < kValueCap) {
+                value = value * 10 + (c - '0');
+            }
             sawDigit = true;
         } else if (c == ':' || c == ';' || c == '\0') {
             if (idx < 4) {
@@ -110,21 +118,18 @@ int64_t timecodeToFrames(const std::string& tc, const TimecodeRate& rate, bool d
         return 0;
     }
 
-    const int hh = parts[0];
-    const int mm = parts[1];
-    const int ss = parts[2];
-    const int ff = parts[3];
+    const int64_t hh = parts[0];
+    const int64_t mm = parts[1];
+    const int64_t ss = parts[2];
+    const int64_t ff = parts[3];
 
     const int fpsInt = roundedFps(rate);
     const bool df = dropFrame && isDropFrameRate(rate);
     const int drop = df ? dropPerMinute(rate) : 0;
 
-    int64_t frame = (static_cast<int64_t>(hh) * 3600 + static_cast<int64_t>(mm) * 60 +
-                     static_cast<int64_t>(ss)) *
-                        fpsInt +
-                    ff;
+    int64_t frame = (hh * 3600 + mm * 60 + ss) * fpsInt + ff;
     if (drop > 0) {
-        const int64_t totalMinutes = static_cast<int64_t>(hh) * 60 + mm;
+        const int64_t totalMinutes = hh * 60 + mm;
         frame -= static_cast<int64_t>(drop) * (totalMinutes - totalMinutes / 10);
     }
     return frame;
