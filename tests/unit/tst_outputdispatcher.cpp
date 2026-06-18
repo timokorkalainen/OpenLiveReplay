@@ -60,6 +60,7 @@ private slots:
     void startFailuresAreVisibleInTargetStats();
     void pgmSwitchUpdatesIdentityOnNextTick();
     void disabledAssignmentsDoNotSubmit();
+    void reverseAndSpeedChangeReanchorPlayhead();
 };
 
 void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
@@ -602,6 +603,47 @@ void TestOutputDispatcher::disabledAssignmentsDoNotSubmit() {
     dispatcher.dispatchTick(cache, PlaybackStateSnapshot{});
 
     QCOMPARE(sink.frames.size(), 0);
+}
+
+void TestOutputDispatcher::reverseAndSpeedChangeReanchorPlayhead() {
+    OutputFrameCache cache(1, 4, 4);
+    for (int i = 0; i < 30; ++i)
+        cache.insertVideoFrame(video(0, i * 40, uchar(10 + i)));
+
+    CollectingSink sink(OutputTargetKind::QtPreview);
+    OutputTargetAssignment a;
+    a.id = QStringLiteral("feed0");
+    a.sourceBus = OutputBusId::feed(0);
+    a.kind = OutputTargetKind::QtPreview;
+    a.enabled = true;
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{a, &sink}});
+    // tick 2 re-anchors onto the same source frame as tick 1 (byte-identical payload);
+    // identity-skip (default on) would collapse that submit and hide the re-anchor, so
+    // disable it here to assert the per-tick sampled playhead.
+    dispatcher.setIdentitySkip(false);
+
+    PlaybackStateSnapshot state;
+    state.playing = true;
+    state.speed = 1.0;
+    state.playheadMs = 200;
+    state.selectedFeedIndex = 0;
+
+    dispatcher.dispatchTick(cache, state); // tick 0: epoch anchors at frame 0, playhead 200
+    dispatcher.dispatchTick(cache, state); // tick 1: 200 + 40
+
+    state.speed = -1.0; // speed change forces re-anchor on the next tick
+    state.playheadMs = 240;
+    dispatcher.dispatchTick(cache, state); // tick 2: re-anchor, playhead 240
+    dispatcher.dispatchTick(cache, state); // tick 3: 240 - 40 (reverse)
+
+    QCOMPARE(sink.frames.size(), 4);
+    QCOMPARE(sink.frames[0].sampledPlayheadMs, qint64(200));
+    QCOMPARE(sink.frames[1].sampledPlayheadMs, qint64(240));
+    QCOMPARE(sink.frames[2].sampledPlayheadMs,
+             qint64(240)); // re-anchored at 240; a stale epoch would give 120
+    QCOMPARE(sink.frames[3].sampledPlayheadMs, qint64(200)); // reverse step
 }
 
 QTEST_GUILESS_MAIN(TestOutputDispatcher)

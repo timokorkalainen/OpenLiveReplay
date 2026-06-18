@@ -193,6 +193,8 @@ private slots:
     void failedInnerSubmitDoesNotAdvanceDeliveredFrameIndex();
     void backpressureDropDoesNotReportDeliveryGapAsError();
     void multipleBackpressureDropsInOneGapAreNotError();
+    void restartResetsDeliveryState();
+    void rapidStopAfterBurstDrainsWithoutHang();
 };
 
 void TestQueuedOutputSink::submitReturnsBeforeSlowInnerSinkCompletes() {
@@ -398,6 +400,50 @@ void TestQueuedOutputSink::multipleBackpressureDropsInOneGapAreNotError() {
     QVERIFY(status.deliveryGaps > 0);   // the 30 -> 33 gap is counted
     QVERIFY2(!status.lastDeliveryGap,
              "a gap fully explained by backpressure drops must not raise Error");
+}
+
+void TestQueuedOutputSink::restartResetsDeliveryState() {
+    auto inner = std::make_unique<GapReportingInnerSink>();
+    QueuedOutputSink sink(std::move(inner), 3);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(5)));
+    QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().lastDeliveredFrameIndex, qint64(5), 500);
+    sink.stop();
+
+    // Restart: all delivery state must reset to its initial values.
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    const OutputSinkStatus fresh = sink.outputStatus();
+    QCOMPARE(fresh.droppedFrames, qint64(0));
+    QCOMPARE(fresh.deliveryGaps, qint64(0));
+    QVERIFY(!fresh.hasLastDeliveredFrameIndex);
+    QVERIFY(!fresh.lastDeliveryGap);
+
+    QVERIFY(sink.submit(frame(10)));
+    QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().lastDeliveredFrameIndex, qint64(10), 500);
+    QCOMPARE(sink.outputStatus().deliveryGaps, qint64(0)); // first delivery after restart: no gap
+    sink.stop();
+}
+
+void TestQueuedOutputSink::rapidStopAfterBurstDrainsWithoutHang() {
+    auto inner = std::make_unique<GapReportingInnerSink>();
+    QueuedOutputSink sink(std::move(inner), 2);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    for (int i = 0; i < 50; ++i)
+        sink.submit(frame(i));
+    sink.stop(); // must join the worker and return promptly, no deadlock
+    QVERIFY(!sink.isActive());
 }
 
 QTEST_GUILESS_MAIN(TestQueuedOutputSink)

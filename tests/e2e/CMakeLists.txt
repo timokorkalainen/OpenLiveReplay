@@ -29,6 +29,20 @@ qt_add_executable(play_harness play_harness.cpp)
 target_link_libraries(play_harness PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
 
+# Headless output-bus continuity soak: drives a real OutputRuntime against a static
+# synthetic cache and verifies frame/audio continuity + cadence over wall-clock time.
+qt_add_executable(soak_harness soak_harness.cpp)
+target_link_libraries(soak_harness PRIVATE
+    Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
+add_test(NAME e2e_output_soak
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_output_soak.sh" "$<TARGET_FILE:soak_harness>")
+set_tests_properties(e2e_output_soak PROPERTIES
+    LABELS "output-soak"
+    TIMEOUT 600
+    RUN_SERIAL TRUE
+    ENVIRONMENT "OLR_SOAK_SECONDS=5")
+
 # Headless multi-source sync-measurement harness: records N synthetic sources
 # into an N-view MKV for the report-only frame-sync scoreboard (run_sync_e2e.sh).
 qt_add_executable(sync_harness sync_harness.cpp)
