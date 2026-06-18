@@ -191,6 +191,8 @@ private slots:
     void queueStatusReportsDepthAndDroppedFrames();
     void deliveryGapsAreVisibleInStatus();
     void failedInnerSubmitDoesNotAdvanceDeliveredFrameIndex();
+    void backpressureDropDoesNotReportDeliveryGapAsError();
+    void multipleBackpressureDropsInOneGapAreNotError();
 };
 
 void TestQueuedOutputSink::submitReturnsBeforeSlowInnerSinkCompletes() {
@@ -318,6 +320,84 @@ void TestQueuedOutputSink::failedInnerSubmitDoesNotAdvanceDeliveredFrameIndex() 
     QCOMPARE(status.lastDeliveredFrameIndex, qint64(22));
 
     sink.stop();
+}
+
+void TestQueuedOutputSink::backpressureDropDoesNotReportDeliveryGapAsError() {
+    // A gap in delivered frame indexes caused by the queue dropping an overflow frame is
+    // backpressure (Degraded via lastSubmitDroppedFrame), NOT a delivery failure. It must
+    // not set lastDeliveryGap, which maps to operator Error.
+    auto inner = std::make_unique<BlockingInnerSink>();
+    BlockingInnerSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 1);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(10)));
+    const bool workerBlocked = observed->waitForEnteredSubmits(1, 500);
+    if (!workerBlocked) {
+        observed->release();
+        sink.stop();
+    }
+    QVERIFY2(workerBlocked, "worker must enter the blocking inner sink before queue pressure");
+
+    // Worker is blocked delivering 10. Queue 11, then 12 overflows and drops 11.
+    QVERIFY(sink.submit(frame(11)));
+    QVERIFY(sink.submit(frame(12)));
+
+    observed->release();
+    QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().lastDeliveredFrameIndex, qint64(12), 500);
+
+    const OutputSinkStatus status = sink.outputStatus();
+    sink.stop();
+
+    QVERIFY(status.droppedFrames >= 1);     // 11 was dropped
+    QVERIFY(status.lastSubmitDroppedFrame); // surfaced as Degraded
+    QVERIFY(status.deliveryGaps > 0);       // gap still counted for diagnostics
+    QVERIFY2(!status.lastDeliveryGap,
+             "a backpressure-drop gap must not raise the delivery-gap Error flag");
+}
+
+void TestQueuedOutputSink::multipleBackpressureDropsInOneGapAreNotError() {
+    // Two consecutive overflow drops in the same delivery gap are fully explained by
+    // backpressure: the gap must not raise the Error-mapping lastDeliveryGap, and the
+    // drop attribution must be scoped to the actual missing indexes (not a global pool).
+    auto inner = std::make_unique<BlockingInnerSink>();
+    BlockingInnerSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 1);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(30)));
+    const bool workerBlocked = observed->waitForEnteredSubmits(1, 500);
+    if (!workerBlocked) {
+        observed->release();
+        sink.stop();
+    }
+    QVERIFY2(workerBlocked, "worker must enter the blocking inner sink before queue pressure");
+
+    // Worker is blocked delivering 30. 31 and 32 are queued then dropped by 32 and 33.
+    QVERIFY(sink.submit(frame(31)));
+    QVERIFY(sink.submit(frame(32)));
+    QVERIFY(sink.submit(frame(33)));
+
+    observed->release();
+    QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().lastDeliveredFrameIndex, qint64(33), 500);
+
+    const OutputSinkStatus status = sink.outputStatus();
+    sink.stop();
+
+    QVERIFY(status.droppedFrames >= 2); // 31 and 32 dropped
+    QVERIFY(status.deliveryGaps > 0);   // the 30 -> 33 gap is counted
+    QVERIFY2(!status.lastDeliveryGap,
+             "a gap fully explained by backpressure drops must not raise Error");
 }
 
 QTEST_GUILESS_MAIN(TestQueuedOutputSink)

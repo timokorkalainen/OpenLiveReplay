@@ -64,6 +64,7 @@ private slots:
     void runtimeStatsReportNoDeadlineMissForOnTimeTicks();
     void exactlyMaxCatchUpTicksDoesNotReportCapHit();
     void runtimeStatsReportDeadlineMissWhenCatchUpIsCapped();
+    void runtimeClearsDeadlineMissLatchAfterRecovery();
 };
 
 void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
@@ -285,6 +286,48 @@ void TestOutputRuntime::runtimeStatsReportDeadlineMissWhenCatchUpIsCapped() {
     QCOMPARE(stats.runtime.lastCappedCatchUpTicks, qint64(7));
     QVERIFY(stats.runtime.maxLatenessNs > 0);
     QCOMPARE(stats.runtime.lastDispatchedFrameIndex, qint64(8));
+}
+
+void TestOutputRuntime::runtimeClearsDeadlineMissLatchAfterRecovery() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 95));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    const OutputDispatchStats capped = runtime.dispatchDueTicksForTest(600);
+    QVERIFY(capped.runtime.lastDispatchDeadlineMiss); // missed cadence: catch-up was capped
+
+    // Drain the backlog on subsequent on-time polls; the per-poll latch must clear while
+    // the cumulative miss counters persist for diagnostics.
+    const OutputDispatchStats recovered = runtime.dispatchDueTicksForTest(640);
+    QVERIFY2(!recovered.runtime.lastDispatchDeadlineMiss,
+             "the deadline-miss latch must clear once the runtime catches up");
+    QCOMPARE(recovered.runtime.lastCappedCatchUpTicks, qint64(0));
+    QVERIFY(recovered.runtime.deadlineMisses > 0); // cumulative history is retained
+
+    // A subsequent poll with no frame due must continue to report no current miss.
+    const OutputDispatchStats idle = runtime.dispatchDueTicksForTest(645);
+    QVERIFY(!idle.runtime.lastDispatchDeadlineMiss);
 }
 
 QTEST_GUILESS_MAIN(TestOutputRuntime)

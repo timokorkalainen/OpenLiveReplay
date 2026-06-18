@@ -38,6 +38,7 @@ private:
     bool m_active = false;
     bool m_stopRequested = false;
     int m_droppedFrames = 0;
+    QVector<qint64> m_droppedFrameIndexes;
     qint64 m_asyncAcceptedFrames = 0;
     qint64 m_asyncFailedFrames = 0;
     qint64 m_maxQueueDepth = 0;

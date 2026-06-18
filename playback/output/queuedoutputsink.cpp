@@ -21,6 +21,7 @@ bool QueuedOutputSink::start(const OutputTargetAssignment& assignment, FrameRate
         m_stopRequested = false;
         m_active = true;
         m_droppedFrames = 0;
+        m_droppedFrameIndexes.clear();
         m_asyncAcceptedFrames = 0;
         m_asyncFailedFrames = 0;
         m_maxQueueDepth = 0;
@@ -66,6 +67,14 @@ bool QueuedOutputSink::submit(const OutputBusFrame& frame) {
     if (!m_active || m_stopRequested || !m_thread) return false;
     bool dropped = false;
     if (m_queue.size() >= m_capacity) {
+        m_droppedFrameIndexes.append(m_queue.first().outputFrameIndex);
+        // Bound the tracked-drop history. Indexes are normally drained by the next
+        // successful delivery; only a persistently-failing inner sink (already reported as
+        // Error via the rejection path) lets them accumulate. Forgetting the oldest drop can
+        // only make a future gap look unexplained, which errs toward Error — the correct
+        // outcome in that all-reject state — so it never masks a real failure.
+        constexpr int kMaxTrackedDrops = 4096;
+        if (m_droppedFrameIndexes.size() > kMaxTrackedDrops) m_droppedFrameIndexes.removeFirst();
         m_queue.removeFirst();
         m_droppedFrames++;
         dropped = true;
@@ -150,13 +159,30 @@ void QueuedOutputSink::workerLoop() {
         {
             QMutexLocker locker(&m_mutex);
             if (submitted) {
-                const bool deliveryGap = m_hasLastDeliveredFrameIndex &&
-                                         frame.outputFrameIndex != m_lastDeliveredFrameIndex + 1;
-                if (m_hasLastDeliveredFrameIndex &&
-                    frame.outputFrameIndex != m_lastDeliveredFrameIndex + 1) {
-                    m_deliveryGaps++;
+                // Consume the overflow-dropped indexes that precede this delivered frame.
+                // For a real gap (non-first delivery) these are exactly the missing indexes
+                // between the previous and current delivered frame that were dropped. Drops
+                // below the first-ever delivered index bracket no computed gap and are simply
+                // discarded here, scoped by index so they can never carry forward to suppress
+                // a later, independently-caused gap.
+                int droppedInGap = 0;
+                while (!m_droppedFrameIndexes.isEmpty() &&
+                       m_droppedFrameIndexes.first() < frame.outputFrameIndex) {
+                    m_droppedFrameIndexes.removeFirst();
+                    droppedInGap++;
                 }
-                m_lastDeliveryGap = deliveryGap;
+                if (m_hasLastDeliveredFrameIndex) {
+                    const qint64 gapSize =
+                        qMax<qint64>(0, frame.outputFrameIndex - m_lastDeliveredFrameIndex - 1);
+                    if (gapSize > 0) {
+                        m_deliveryGaps++;
+                    }
+                    // A gap fully explained by queue-overflow drops is backpressure
+                    // (surfaced as Degraded via lastSubmitDroppedFrame), not a delivery
+                    // failure. Only raise the Error-mapping lastDeliveryGap when missing
+                    // indexes remain unexplained by drops (e.g. an inner-sink rejection).
+                    m_lastDeliveryGap = gapSize > 0 && droppedInGap < gapSize;
+                }
                 m_lastDeliveredFrameIndex = frame.outputFrameIndex;
                 m_hasLastDeliveredFrameIndex = true;
                 m_asyncAcceptedFrames++;
