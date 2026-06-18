@@ -150,6 +150,10 @@ QString clockQualityLabel(int quality) {
 UIManager::UIManager(ReplayManager* engine, QObject* parent)
     : QObject(parent), m_replayManager(engine) {
     m_jogTimer.start();
+    m_scrubCoalesceTimer.setSingleShot(true);
+    m_scrubCoalesceTimer.setTimerType(Qt::PreciseTimer);
+    m_scrubCoalesceTimer.setInterval(kScrubCoalesceMs);
+    connect(&m_scrubCoalesceTimer, &QTimer::timeout, this, &UIManager::commitPendingScrub);
     connect(m_replayManager, &ReplayManager::masterPulse, this, &UIManager::onRecorderPulse,
             Qt::QueuedConnection);
     connect(m_replayManager, &ReplayManager::sourceConnectionChanged, this,
@@ -1719,15 +1723,35 @@ void UIManager::stopRecording() {
 }
 
 void UIManager::seekPlayback(int64_t ms) {
-    if (m_transport) {
-        m_transport->seek(ms);
-        // Manual seek disables live-follow; user can re-enable via "Live"
-        setFollowLive(false);
+    // Disable live-follow on a manual scrub; the user re-enables via "Live".
+    setFollowLive(false);
+    // Coalesce a burst of scrub targets: seek immediately on the first move of
+    // a gesture, then commit only the latest target on a single-shot timer.
+    if (m_seekCoalescer.offer(ms)) {
+        if (m_transport) m_transport->seek(ms);
+        if (m_playbackWorker) m_playbackWorker->seekTo(ms);
+    } else {
+        // A seek is already in flight; arm/refresh the coalesce timer. The
+        // worker's own reposition handles audio re-priming (repositionTo clears
+        // + re-primes the AudioPlayer), so no per-move audioPlayer->clear() here.
+        if (!m_scrubCoalesceTimer.isActive()) m_scrubCoalesceTimer.start();
     }
-    // Route the scrub through the scheduler so it classifies the seek
-    // (reuse fast-path vs. full reposition) instead of showing a stale frame.
+}
+
+void UIManager::commitPendingScrub() {
+    bool has = false;
+    const int64_t ms = m_seekCoalescer.takePending(has);
+    if (!has) return;
+    if (m_transport) m_transport->seek(ms);
     if (m_playbackWorker) m_playbackWorker->seekTo(ms);
-    if (m_audioPlayer) m_audioPlayer->clear();
+}
+
+void UIManager::endScrubGesture() {
+    // Called on slider release: commit the final target immediately, then end
+    // the gesture so the next gesture's first move seeks without delay.
+    m_scrubCoalesceTimer.stop();
+    commitPendingScrub();
+    m_seekCoalescer.reset();
 }
 
 void UIManager::updateUrl(int index, const QString& url) {

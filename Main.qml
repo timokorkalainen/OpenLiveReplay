@@ -953,6 +953,13 @@ ApplicationWindow {
                     onMoved: {
                         appWindow.uiManagerRef.seekPlayback(value)
                     }
+                    onPressedChanged: {
+                        // On release (pressed → false) flush the final scrub
+                        // target and end the coalesce gesture.
+                        if (!scrubBar.pressed) {
+                            appWindow.uiManagerRef.endScrubGesture()
+                        }
+                    }
 
                     background: Rectangle {
                         height: 6

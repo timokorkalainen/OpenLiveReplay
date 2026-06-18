@@ -19,6 +19,7 @@
 #include "playback/playbackworker.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
+#include "playback/seekcoalescer.h"
 #include "playback/telemetrytimelinereader.h"
 #include "midi/midimanager.h"
 #include "streamdeck/streamdeckmanager.h"
@@ -254,6 +255,7 @@ public:
 
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
+    Q_INVOKABLE void endScrubGesture();
 
 
     QString getSettingsPath(QString fileName);
@@ -358,6 +360,13 @@ private:
     FrameProvider* m_pgmPreviewProvider = nullptr;
     PlaybackTransport *m_transport;
     AudioPlayer *m_audioPlayer = nullptr;
+    // Scrub coalescing: seek immediately on the first move of a gesture and on
+    // release, but commit only the latest target on a single-shot timer in
+    // between. SeekCoalescer holds the pure decision logic (unit-tested).
+    void commitPendingScrub();
+    SeekCoalescer m_seekCoalescer;
+    QTimer m_scrubCoalesceTimer;
+    static constexpr int kScrubCoalesceMs = 16; // ~one frame at 60fps
     bool m_followLive = false;
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;
