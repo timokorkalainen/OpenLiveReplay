@@ -136,6 +136,7 @@ qt_add_library(olr_test_engine STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/streamworker.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/replaymanager.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/codec/avcc.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xseitimecode.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ndiframeconvert.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativendiingestsession.cpp"
 )
