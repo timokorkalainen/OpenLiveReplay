@@ -59,6 +59,7 @@ private slots:
     void startFailuresAreVisibleInTargetStats();
     void pgmSwitchUpdatesIdentityOnNextTick();
     void disabledAssignmentsDoNotSubmit();
+    void reverseAndSpeedChangeReanchorPlayhead();
 };
 
 void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
@@ -571,6 +572,42 @@ void TestOutputDispatcher::disabledAssignmentsDoNotSubmit() {
     dispatcher.dispatchTick(cache, PlaybackStateSnapshot{});
 
     QCOMPARE(sink.frames.size(), 0);
+}
+
+void TestOutputDispatcher::reverseAndSpeedChangeReanchorPlayhead() {
+    OutputFrameCache cache(1, 4, 4);
+    for (int i = 0; i < 30; ++i)
+        cache.insertVideoFrame(video(0, i * 40, uchar(10 + i)));
+
+    CollectingSink sink(OutputTargetKind::QtPreview);
+    OutputTargetAssignment a;
+    a.id = QStringLiteral("feed0");
+    a.sourceBus = OutputBusId::feed(0);
+    a.kind = OutputTargetKind::QtPreview;
+    a.enabled = true;
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{a, &sink}});
+
+    PlaybackStateSnapshot state;
+    state.playing = true;
+    state.speed = 1.0;
+    state.playheadMs = 200;
+    state.selectedFeedIndex = 0;
+
+    dispatcher.dispatchTick(cache, state); // tick 0: epoch anchors at frame 0, playhead 200
+    dispatcher.dispatchTick(cache, state); // tick 1: 200 + 40
+
+    state.speed = -1.0; // speed change forces re-anchor on the next tick
+    state.playheadMs = 240;
+    dispatcher.dispatchTick(cache, state); // tick 2: re-anchor, playhead 240
+    dispatcher.dispatchTick(cache, state); // tick 3: 240 - 40 (reverse)
+
+    QCOMPARE(sink.frames.size(), 4);
+    QCOMPARE(sink.frames[0].sampledPlayheadMs, qint64(200));
+    QCOMPARE(sink.frames[1].sampledPlayheadMs, qint64(240));
+    QCOMPARE(sink.frames[2].sampledPlayheadMs, qint64(240)); // re-anchored, not 280
+    QCOMPARE(sink.frames[3].sampledPlayheadMs, qint64(200)); // reverse step
 }
 
 QTEST_GUILESS_MAIN(TestOutputDispatcher)
