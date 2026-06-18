@@ -10,7 +10,7 @@ native-ingest / broadcast-frame-sync workstream after the merges below._
 | PR | What it landed |
 |----|----------------|
 | #49 | **P0** — decouple the recording heartbeat from fps (fixed 8 ms scheduler + a pure, unit-tested `heartbeatFrameSpan` seam). |
-| #50 | **P1** — rational recording frame rate (`int fps` → `FrameRate {num,den}` end-to-end; 29.97/59.94 record correctly; settings/UI/harness fractional-rate aware). |
+| #50 | **P1 rational frame-rate workstream** — current `main` preserves exact playback/settings cadence but does **not** yet have rational recorder fps end-to-end; see §5 for what remains. |
 | #51 | **Native RTMP parity** — backend-tagged `IngestStats`/`SourceHealth` (`srtHealth` + new `rtmpHealth`); RTMP emits stats; single shared A/V anchor (audio follows video). |
 | #52 | **Native-only ingest** — removed `FfmpegIngestSession` + the native→ffmpeg fallback; selector is native-only (`srt`→NativeSrt, `rtmp/rtmps`→NativeRtmp, else→Unsupported); SRT native by default; **Windows Media Foundation AAC decoder** + **native RTMP enabled on Windows**; udp:// e2e migrated to the native SRT bridge. |
 | #53 | **Soak matrix** — `run_soak_matrix.sh` ({SRT,RTMP}×{H264,H265}) + an `OLR_SRT_SOAK_CODEC` switch. Full 4×30-min run passed (no crash/hang/stall). |
@@ -21,7 +21,7 @@ native-ingest / broadcast-frame-sync workstream after the merges below._
 | #61 | **Broadcast output status UI** — output configuration/status surfaced in UI. |
 | #62 | **SRT URL/address hardening** — hostname/DNS/IPv4/IPv6 SRT resolution plus stream ID handling. |
 
-**Net state of the engine now:** ingest is **native-only** — native SRT, native RTMP, and runtime-loaded **NDI ingest**, decoding **H.264 + H.265 + AAC-LC** for SRT/RTMP and decoded NDI video/audio via the NDI SDK, at **rational frame rates**, with a backend-tagged health dot. FFmpeg remains linked **only** for the Matroska muxer + the MPEG-2 record encoder and frame conversion helpers.
+**Net state of the engine now:** ingest is **native-only** — native SRT, native RTMP, and runtime-loaded **NDI ingest**, decoding **H.264 + H.265 + AAC-LC** for SRT/RTMP and decoded NDI video/audio via the NDI SDK, with a backend-tagged health dot. Exact playback/settings cadence now preserves rational frame-rate selections, but the recorder path on this line still consumes rounded integer fps until the rational recording-engine migration is restored. FFmpeg remains linked **only** for the Matroska muxer + the MPEG-2 record encoder and frame conversion helpers.
 
 **Parallel / adjacent:** #54 is the first move on the **output** side (see §7, P5). It is not part of the ingest stack, but it is part of the same broadcast arc.
 
@@ -75,11 +75,14 @@ Decide per real-world source feeds whether any of these need broadening (most li
 
 ---
 
-## 5. Deferred from P1 (rational frame rate)
+## 5. Deferred / partial from P1 (rational frame rate)
 
-- **Drop-frame timecode (TC-2).** Rational rates record correctly, but drop-frame TC display/side-data is not implemented.
-- **Rational playback stepping.** `PlaybackTransport` still uses the **rounded integer** rate, so step-by-frame on a 29.97/59.94 recording is ~0.1% off over long durations. Recording is exact; playback stepping is the gap.
-- **Arbitrary (non-preset) rates in the UI.** The engine accepts any `{num,den}`, but the UI offers only the standard preset list (23.976/24/25/29.97/30/50/59.94/60).
+- **Rational recorder fps restoration.** Settings/UI preserve `{num,den}` and `PlaybackTransport` steps on the exact selected cadence, but `ReplayManager` still records at the rounded integer compatibility fps.
+- **Drop-frame timecode (TC-2).** Drop-frame TC display/side-data is not implemented.
+- **Arbitrary (non-preset) rates in the UI.** The transport/settings path accepts any valid `{num,den}`, but the UI offers only the standard preset list (23.976/24/25/29.97/30/50/59.94/60/120).
+
+`PlaybackTransport` now has exact-rate stepping support and UI/settings wiring calls
+`setFrameRate(num, den)` for the playback cadence. The rounded `setFps(int)` path remains the compatibility bridge for recorder/API callers.
 
 ---
 
@@ -87,7 +90,7 @@ Decide per real-world source feeds whether any of these need broadening (most li
 
 - **Wire the soak matrix into CTest (opt-in).** `run_soak_matrix.sh` is a standalone script today. An opt-in `soak`-label ctest registration (guarded like `e2e_native_rtmp_soak`) would make it discoverable; keep it excluded from the default gate (it's long).
 - **Cross-device drift harness.** Every unskewed one-machine soak/drift number has slope ≈ 1.0 **by construction** — on one machine the source and recorder share the same wall clock. The framesync rig now has a media PTS/PCR skew cell for one-machine stress, but true clock-drift / phase-lock measurement still needs **two machines** for final validation.
-- **Update `drift_2997`.** It still records a 29.97 source at integer 30 (report-only, measuring the mismatch P1 fixes). With rational fps, add a **gated** variant that records at 29.97 and asserts ≈zero drift — a real teeth check for P1, complementing `e2e_record_2997`.
+- **Update `drift_2997`.** It still records a 29.97 source at integer 30 (report-only, measuring the mismatch the rational recorder migration should fix). Once recorder fps is rational again, add a **gated** variant that records at 29.97 and asserts ≈zero drift.
 - **macOS-CI vs local gate.** The full e2e/native suites run only in the local pre-push gate (CI runs the short `ci` label). Fine as designed, but means transport regressions are caught at push, not on PRs.
 
 ---
@@ -116,7 +119,6 @@ Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-inge
 
 - **Windows audio is unproven on a real device** until the §1 smoke-test runs. Highest-risk open item.
 - **No decode fallback:** an undecodable stream now fails visibly (source stays connected but unhealthy; decode-error log is throttled to once/5 s). This is by design but is a behavior change for any source outside §4's envelope.
-- **Playback step on fractional rates** is ~0.1% off (§5).
 - **One-machine soak proves stability, not drift** (§6) — don't read the slope≈1.0 as a phase-lock guarantee.
 - **Local backup tags** `bk-A`/`bk-B`/`bk-soak` (the pre-squash commits) exist in the local clone only; safe to delete once the merges are confirmed good.
 
@@ -126,10 +128,9 @@ Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-inge
 
 1. **Verify Windows** (§1) — smoke-test live AAC/RTMP on a Windows machine; confirm the Windows CI build is green on `main`. _Unblocks confidence in #52._
 2. **Pick up the capability regressions that real feeds hit** (§3) — most likely **encrypted SRT** and **listener/rendezvous SRT** first (common in production SRT).
-3. **Rational playback stepping** (§5) — small, closes the last P1 gap.
-4. **Broaden P2 validation** (§7) — the timing core, reconnect clock ownership, skew A/V metric, SRT cells, and local NDI marker-source matrix cells are live; remaining work is longer-duration/two-machine validation, RTMP marker-source coverage, and tightening report-only cells into gates where the transport can honestly guarantee them.
-5. **Keep the framesync matrix current** (§7) — when new transport fixtures land, make sure they emit the same flash/beep/timecode/skew contract as the SRT and NDI marker sources.
-6. Output side (**P5 / #54**) proceeds in parallel on its own track.
+3. **Broaden P2 validation** (§7) — the timing core, reconnect clock ownership, skew A/V metric, SRT cells, and local NDI marker-source matrix cells are live; remaining work is longer-duration/two-machine validation, RTMP marker-source coverage, and tightening report-only cells into gates where the transport can honestly guarantee them.
+4. **Keep the framesync matrix current** (§7) — when new transport fixtures land, make sure they emit the same flash/beep/timecode/skew contract as the SRT and NDI marker sources.
+5. Output side (**P5 / #54**) proceeds in parallel on its own track.
 
 ---
 

@@ -29,7 +29,7 @@
 
 namespace {
 
-QString telemetryValueToString(const QVariant &value) {
+QString telemetryValueToString(const QVariant& value) {
     const QJsonValue json = QJsonValue::fromVariant(value);
     if (json.isObject()) {
         return QString::fromUtf8(QJsonDocument(json.toObject()).toJson(QJsonDocument::Compact));
@@ -49,9 +49,9 @@ QString telemetryValueToString(const QVariant &value) {
     return json.toString();
 }
 
-QString metadataSummary(const QJsonArray &metadata) {
+QString metadataSummary(const QJsonArray& metadata) {
     QStringList parts;
-    for (const QJsonValue &value : metadata) {
+    for (const QJsonValue& value : metadata) {
         const QJsonObject object = value.toObject();
         const QString name = object.value(QStringLiteral("name")).toString().trimmed();
         const QString entryValue = object.value(QStringLiteral("value")).toString();
@@ -128,11 +128,10 @@ quint64 outputStatusFingerprint(const OutputDispatchStats& stats) {
 
 } // namespace
 
-UIManager::UIManager(ReplayManager *engine, QObject *parent)
+UIManager::UIManager(ReplayManager* engine, QObject* parent)
     : QObject(parent), m_replayManager(engine) {
     m_jogTimer.start();
-    connect(m_replayManager, &ReplayManager::masterPulse,
-            this, &UIManager::onRecorderPulse,
+    connect(m_replayManager, &ReplayManager::masterPulse, this, &UIManager::onRecorderPulse,
             Qt::QueuedConnection);
     connect(m_replayManager, &ReplayManager::sourceConnectionChanged, this,
             &UIManager::onSourceConnectionChanged, Qt::QueuedConnection);
@@ -158,84 +157,86 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
         if (ok && pct > 0.0) m_srtAmberPct = pct;
     }
     connect(m_replayManager, &ReplayManager::telemetryRecorded, this,
-            [this](const QString &feedId, const QJsonObject &payload, qint64 effectiveMs) {
-        if (feedId.trimmed().isEmpty()) return;
-        TelemetryTimelineEntry entry;
-        entry.ptsMs = effectiveMs;
-        entry.payload = payload.toVariantMap();
-        entry.payload.insert(QStringLiteral("feedId"), feedId);
-        m_recordingTelemetry[feedId].append(entry);
-        if (m_replayManager && m_replayManager->isRecording()) {
-            loadTelemetryTimeline(m_replayManager->getVideoPath(), false);
-        }
-        m_telemetryVersion++;
-        emit telemetryChanged();
-    });
+            [this](const QString& feedId, const QJsonObject& payload, qint64 effectiveMs) {
+                if (feedId.trimmed().isEmpty()) return;
+                TelemetryTimelineEntry entry;
+                entry.ptsMs = effectiveMs;
+                entry.payload = payload.toVariantMap();
+                entry.payload.insert(QStringLiteral("feedId"), feedId);
+                m_recordingTelemetry[feedId].append(entry);
+                if (m_replayManager && m_replayManager->isRecording()) {
+                    loadTelemetryTimeline(m_replayManager->getVideoPath(), false);
+                }
+                m_telemetryVersion++;
+                emit telemetryChanged();
+            });
     m_settingsManager = new SettingsManager();
     m_importClient = new ProjectImportClient(this);
     connect(m_importClient, &ProjectImportClient::finished, this,
-            [this](const QByteArray &body, const QString &sourceUrl) {
-        if (sourceUrl != m_currentSettings.importSettingsUrl.trimmed()) {
-            return;
-        }
+            [this](const QByteArray& body, const QString& sourceUrl) {
+                if (sourceUrl != m_currentSettings.importSettingsUrl.trimmed()) {
+                    return;
+                }
 
-        QJsonParseError parseError;
-        const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
-        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-            m_pendingImport = ProjectSettingsImportResult{};
-            m_hasPendingImport = false;
-            m_importPreview.clear();
-            m_importPreviewError = parseError.error == QJsonParseError::NoError
-                ? QStringLiteral("Import settings response must be a JSON object")
-                : parseError.errorString();
-            emit importPreviewChanged();
-            return;
-        }
+                QJsonParseError parseError;
+                const QJsonDocument doc = QJsonDocument::fromJson(body, &parseError);
+                if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+                    m_pendingImport = ProjectSettingsImportResult{};
+                    m_hasPendingImport = false;
+                    m_importPreview.clear();
+                    m_importPreviewError =
+                        parseError.error == QJsonParseError::NoError
+                            ? QStringLiteral("Import settings response must be a JSON object")
+                            : parseError.errorString();
+                    emit importPreviewChanged();
+                    return;
+                }
 
-        ProjectSettingsImportResult result = m_settingsImporter.importJson(doc.object(), sourceUrl);
-        if (!result.ok) {
-            m_pendingImport = ProjectSettingsImportResult{};
-            m_hasPendingImport = false;
-            m_importPreview.clear();
-            m_importPreviewError = result.error;
-            emit importPreviewChanged();
-            return;
-        }
+                ProjectSettingsImportResult result =
+                    m_settingsImporter.importJson(doc.object(), sourceUrl);
+                if (!result.ok) {
+                    m_pendingImport = ProjectSettingsImportResult{};
+                    m_hasPendingImport = false;
+                    m_importPreview.clear();
+                    m_importPreviewError = result.error;
+                    emit importPreviewChanged();
+                    return;
+                }
 
-        QVariantList feeds;
-        feeds.reserve(result.sources.size());
-        for (const SourceSettings &source : result.sources) {
-            QVariantMap feed;
-            feed.insert(QStringLiteral("id"), source.id);
-            feed.insert(QStringLiteral("name"), source.name);
-            feed.insert(QStringLiteral("url"), source.url);
-            feed.insert(QStringLiteral("telemetryDelayMs"), source.telemetryDelayMs);
-            feed.insert(QStringLiteral("metadata"), source.metadata.toVariantList());
-            feeds.append(feed);
-        }
+                QVariantList feeds;
+                feeds.reserve(result.sources.size());
+                for (const SourceSettings& source : result.sources) {
+                    QVariantMap feed;
+                    feed.insert(QStringLiteral("id"), source.id);
+                    feed.insert(QStringLiteral("name"), source.name);
+                    feed.insert(QStringLiteral("url"), source.url);
+                    feed.insert(QStringLiteral("telemetryDelayMs"), source.telemetryDelayMs);
+                    feed.insert(QStringLiteral("metadata"), source.metadata.toVariantList());
+                    feeds.append(feed);
+                }
 
-        QVariantList metadataFields;
-        metadataFields.reserve(result.metadataFields.size());
-        for (const QJsonValue &field : result.metadataFields) {
-            metadataFields.append(field.toObject().toVariantMap());
-        }
+                QVariantList metadataFields;
+                metadataFields.reserve(result.metadataFields.size());
+                for (const QJsonValue& field : result.metadataFields) {
+                    metadataFields.append(field.toObject().toVariantMap());
+                }
 
-        QVariantMap preview;
-        preview.insert(QStringLiteral("projectId"), result.projectId);
-        preview.insert(QStringLiteral("projectName"), result.projectName);
-        preview.insert(QStringLiteral("importSettingsUrl"), result.importSettingsUrl);
-        preview.insert(QStringLiteral("telemetrySseUrl"), result.telemetrySseUrl);
-        preview.insert(QStringLiteral("feedCount"), result.sources.size());
-        preview.insert(QStringLiteral("metadataFields"), metadataFields);
-        preview.insert(QStringLiteral("feeds"), feeds);
+                QVariantMap preview;
+                preview.insert(QStringLiteral("projectId"), result.projectId);
+                preview.insert(QStringLiteral("projectName"), result.projectName);
+                preview.insert(QStringLiteral("importSettingsUrl"), result.importSettingsUrl);
+                preview.insert(QStringLiteral("telemetrySseUrl"), result.telemetrySseUrl);
+                preview.insert(QStringLiteral("feedCount"), result.sources.size());
+                preview.insert(QStringLiteral("metadataFields"), metadataFields);
+                preview.insert(QStringLiteral("feeds"), feeds);
 
-        m_pendingImport = result;
-        m_hasPendingImport = true;
-        m_importPreview = preview;
-        m_importPreviewError.clear();
-        emit importPreviewChanged();
-    });
-    connect(m_importClient, &ProjectImportClient::failed, this, [this](const QString &message) {
+                m_pendingImport = result;
+                m_hasPendingImport = true;
+                m_importPreview = preview;
+                m_importPreviewError.clear();
+                emit importPreviewChanged();
+            });
+    connect(m_importClient, &ProjectImportClient::failed, this, [this](const QString& message) {
         m_pendingImport = ProjectSettingsImportResult{};
         m_hasPendingImport = false;
         m_importPreview.clear();
@@ -245,40 +246,36 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
 
     m_telemetryClient = new TelemetryClient(this);
     connect(m_telemetryClient, &TelemetryClient::telemetryEvent, this,
-            [this](const TelemetryEvent &event) {
-        const QString feedId = event.feedId.trimmed();
-        if (feedId.isEmpty()) return;
-        const auto matchesFeedId = [&feedId](const SourceSettings &source) {
-            return source.id == feedId;
-        };
-        if (std::none_of(m_currentSettings.sources.cbegin(),
-                         m_currentSettings.sources.cend(),
-                         matchesFeedId)) {
-            qWarning() << "TelemetryClient: ignoring telemetry for unknown feedId" << feedId;
-            return;
-        }
+            [this](const TelemetryEvent& event) {
+                const QString feedId = event.feedId.trimmed();
+                if (feedId.isEmpty()) return;
+                const auto matchesFeedId = [&feedId](const SourceSettings& source) {
+                    return source.id == feedId;
+                };
+                if (std::none_of(m_currentSettings.sources.cbegin(),
+                                 m_currentSettings.sources.cend(), matchesFeedId)) {
+                    qWarning() << "TelemetryClient: ignoring telemetry for unknown feedId"
+                               << feedId;
+                    return;
+                }
 
-        QJsonObject payload = event.payload;
-        payload.insert(QStringLiteral("feedId"), feedId);
-        m_liveTelemetry.insert(feedId, payload.toVariantMap());
-        m_telemetryVersion++;
-        emit telemetryChanged();
+                QJsonObject payload = event.payload;
+                payload.insert(QStringLiteral("feedId"), feedId);
+                m_liveTelemetry.insert(feedId, payload.toVariantMap());
+                m_telemetryVersion++;
+                emit telemetryChanged();
 
-        if (m_replayManager && m_replayManager->isRecording()) {
-            m_replayManager->recordTelemetryEvent(feedId, payload);
-        }
-    });
+                if (m_replayManager && m_replayManager->isRecording()) {
+                    m_replayManager->recordTelemetryEvent(feedId, payload);
+                }
+            });
     connect(m_telemetryClient, &TelemetryClient::errorOccurred, this,
-            [](const QString &message) {
-        qWarning() << "TelemetryClient:" << message;
-    });
+            [](const QString& message) { qWarning() << "TelemetryClient:" << message; });
     m_configPath = getSettingsPath("config.json");
     m_transport = new PlaybackTransport(this);
     m_transport->seek(0);
-    m_transport->setFps(m_currentSettings.fps);
-    connect(m_transport, &PlaybackTransport::posChanged, this, [this]() {
-        updateXTouchDisplay();
-    });
+    m_transport->setFrameRate(m_currentSettings.fpsNum, m_currentSettings.fpsDen);
+    connect(m_transport, &PlaybackTransport::posChanged, this, [this]() { updateXTouchDisplay(); });
 
     // Audio output for single-view playback
     m_audioPlayer = new AudioPlayer(this);
@@ -300,125 +297,125 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     });
 
     m_midiManager = new MidiManager(this);
-    connect(m_midiManager, &MidiManager::midiMessage, this, [this](int status, int data1, int data2) {
-        if (status < 0 || data1 < 0) return;
+    connect(
+        m_midiManager, &MidiManager::midiMessage, this, [this](int status, int data1, int data2) {
+            if (status < 0 || data1 < 0) return;
 
-        const int statusType = status & 0xF0;
-        const bool isNoteOff = (statusType == 0x80) || (statusType == 0x90 && data2 <= 0);
-        const bool isControlRelease = (statusType == 0xB0 && data2 <= 0);
-        const bool isRelease = isNoteOff || isControlRelease;
+            const int statusType = status & 0xF0;
+            const bool isNoteOff = (statusType == 0x80) || (statusType == 0x90 && data2 <= 0);
+            const bool isControlRelease = (statusType == 0xB0 && data2 <= 0);
+            const bool isRelease = isNoteOff || isControlRelease;
 
-        if (m_midiLearnAction >= 0) {
-            if (m_midiLearnMode == LearnControl) {
-                m_midiBindings[m_midiLearnAction] = {status, data1, data2};
-                m_currentSettings.midiBindings.insert(m_midiLearnAction, qMakePair(status, data1));
-                m_currentSettings.midiBindingData2.insert(m_midiLearnAction, data2);
-            } else if (m_midiLearnMode == LearnJogForward || m_midiLearnMode == LearnJogBackward) {
-                const auto existing = m_midiBindings.value(m_midiLearnAction, MidiBinding{});
-                if (existing.status < 0 || existing.data1 < 0) {
-                    m_midiBindings[m_midiLearnAction] = {status, data1, existing.data2};
-                    m_currentSettings.midiBindings.insert(m_midiLearnAction, qMakePair(status, data1));
+            if (m_midiLearnAction >= 0) {
+                if (m_midiLearnMode == LearnControl) {
+                    m_midiBindings[m_midiLearnAction] = {status, data1, data2};
+                    m_currentSettings.midiBindings.insert(m_midiLearnAction,
+                                                          qMakePair(status, data1));
+                    m_currentSettings.midiBindingData2.insert(m_midiLearnAction, data2);
+                } else if (m_midiLearnMode == LearnJogForward ||
+                           m_midiLearnMode == LearnJogBackward) {
+                    const auto existing = m_midiBindings.value(m_midiLearnAction, MidiBinding{});
+                    if (existing.status < 0 || existing.data1 < 0) {
+                        m_midiBindings[m_midiLearnAction] = {status, data1, existing.data2};
+                        m_currentSettings.midiBindings.insert(m_midiLearnAction,
+                                                              qMakePair(status, data1));
+                    }
+
+                    if (m_midiLearnMode == LearnJogForward) {
+                        m_midiBindingData2Forward[m_midiLearnAction] = data2;
+                        m_currentSettings.midiBindingData2Forward.insert(m_midiLearnAction, data2);
+                    } else {
+                        m_midiBindingData2Backward[m_midiLearnAction] = data2;
+                        m_currentSettings.midiBindingData2Backward.insert(m_midiLearnAction, data2);
+                    }
                 }
 
-                if (m_midiLearnMode == LearnJogForward) {
-                    m_midiBindingData2Forward[m_midiLearnAction] = data2;
-                    m_currentSettings.midiBindingData2Forward.insert(m_midiLearnAction, data2);
-                } else {
-                    m_midiBindingData2Backward[m_midiLearnAction] = data2;
-                    m_currentSettings.midiBindingData2Backward.insert(m_midiLearnAction, data2);
+                m_settingsManager->save(m_configPath, m_currentSettings);
+                m_midiLearnAction = -1;
+                m_midiLearnMode = LearnControl;
+                emit midiLearnActionChanged();
+                m_midiBindingsVersion++;
+                emit midiBindingsChanged();
+                return;
+            }
+
+            QVector<int> candidates;
+            for (auto it = m_midiBindings.constBegin(); it != m_midiBindings.constEnd(); ++it) {
+                if (it.value().status == status && it.value().data1 == data1) {
+                    candidates.append(it.key());
                 }
             }
+            if (candidates.isEmpty()) return;
 
-            m_settingsManager->save(m_configPath, m_currentSettings);
-            m_midiLearnAction = -1;
-            m_midiLearnMode = LearnControl;
-            emit midiLearnActionChanged();
-            m_midiBindingsVersion++;
-            emit midiBindingsChanged();
-            return;
-        }
+            auto matchesJogValue = [&](int action) {
+                if (action != 8) return false;
+                int forwardValue = m_midiBindingData2Forward.value(action, -1);
+                int backwardValue = m_midiBindingData2Backward.value(action, -1);
+                return (forwardValue >= 0 && data2 == forwardValue) ||
+                       (backwardValue >= 0 && data2 == backwardValue);
+            };
 
-        QVector<int> candidates;
-        for (auto it = m_midiBindings.constBegin(); it != m_midiBindings.constEnd(); ++it) {
-            if (it.value().status == status && it.value().data1 == data1) {
-                candidates.append(it.key());
-            }
-        }
-        if (candidates.isEmpty()) return;
+            auto matchesData2 = [&](int action) {
+                const auto binding = m_midiBindings.value(action);
+                return (binding.data2 >= 0 && data2 == binding.data2);
+            };
 
-        auto matchesJogValue = [&](int action) {
-            if (action != 8) return false;
-            int forwardValue = m_midiBindingData2Forward.value(action, -1);
-            int backwardValue = m_midiBindingData2Backward.value(action, -1);
-            return (forwardValue >= 0 && data2 == forwardValue) || (backwardValue >= 0 && data2 == backwardValue);
-        };
-
-        auto matchesData2 = [&](int action) {
-            const auto binding = m_midiBindings.value(action);
-            return (binding.data2 >= 0 && data2 == binding.data2);
-        };
-
-        int matchedAction = -1;
-        for (int action : candidates) {
-            if (matchesJogValue(action)) {
-                matchedAction = action;
-                break;
-            }
-        }
-        if (matchedAction < 0) {
+            int matchedAction = -1;
             for (int action : candidates) {
-                if (matchesData2(action)) {
+                if (matchesJogValue(action)) {
                     matchedAction = action;
                     break;
                 }
             }
-        }
-        if (matchedAction < 0) {
-            matchedAction = *std::min_element(candidates.constBegin(), candidates.constEnd());
-        }
-
-        if (!m_midiLastValues.contains(matchedAction) || m_midiLastValues.value(matchedAction) != data2) {
-            m_midiLastValues[matchedAction] = data2;
-            m_midiLastValuesVersion++;
-            emit midiLastValuesChanged();
-        }
-
-        if (matchedAction == 8) {
-            int forwardValue = m_midiBindingData2Forward.value(matchedAction, -1);
-            int backwardValue = m_midiBindingData2Backward.value(matchedAction, -1);
-
-            int deltaSign = 0;
-            if (forwardValue >= 0 && data2 == forwardValue) {
-                deltaSign = 1;
-            } else if (backwardValue >= 0 && data2 == backwardValue) {
-                deltaSign = -1;
-            } else {
-                return;
+            if (matchedAction < 0) {
+                for (int action : candidates) {
+                    if (matchesData2(action)) {
+                        matchedAction = action;
+                        break;
+                    }
+                }
             }
-            jogStep(deltaSign);
-        } else {
-            dispatchControlAction(matchedAction, isRelease);
-        }
-    });
+            if (matchedAction < 0) {
+                matchedAction = *std::min_element(candidates.constBegin(), candidates.constEnd());
+            }
+
+            if (!m_midiLastValues.contains(matchedAction) ||
+                m_midiLastValues.value(matchedAction) != data2) {
+                m_midiLastValues[matchedAction] = data2;
+                m_midiLastValuesVersion++;
+                emit midiLastValuesChanged();
+            }
+
+            if (matchedAction == 8) {
+                int forwardValue = m_midiBindingData2Forward.value(matchedAction, -1);
+                int backwardValue = m_midiBindingData2Backward.value(matchedAction, -1);
+
+                int deltaSign = 0;
+                if (forwardValue >= 0 && data2 == forwardValue) {
+                    deltaSign = 1;
+                } else if (backwardValue >= 0 && data2 == backwardValue) {
+                    deltaSign = -1;
+                } else {
+                    return;
+                }
+                jogStep(deltaSign);
+            } else {
+                dispatchControlAction(matchedAction, isRelease);
+            }
+        });
     connect(m_midiManager, &MidiManager::portsChanged, this, &UIManager::midiPortsChanged);
-    connect(m_midiManager, &MidiManager::currentPortChanged, this, &UIManager::midiPortIndexChanged);
+    connect(m_midiManager, &MidiManager::currentPortChanged, this,
+            &UIManager::midiPortIndexChanged);
     connect(m_midiManager, &MidiManager::connectedChanged, this, &UIManager::midiConnectedChanged);
     connect(this, &UIManager::midiConnectedChanged, this, [this]() {
         updateXTouchDisplay();
         updateXTouchLcd();
     });
-    connect(this, &UIManager::streamNamesChanged, this, [this]() {
-        updateXTouchLcd();
-    });
-    connect(this, &UIManager::feedSelectRequested, this, [this]() {
-        updateXTouchLcd();
-    });
-    connect(this, &UIManager::timeOfDayModeChanged, this, [this]() {
-        updateXTouchDisplay();
-    });
-    connect(this, &UIManager::recordingStartEpochMsChanged, this, [this]() {
-        updateXTouchDisplay();
-    });
+    connect(this, &UIManager::streamNamesChanged, this, [this]() { updateXTouchLcd(); });
+    connect(this, &UIManager::feedSelectRequested, this, [this]() { updateXTouchLcd(); });
+    connect(this, &UIManager::timeOfDayModeChanged, this, [this]() { updateXTouchDisplay(); });
+    connect(this, &UIManager::recordingStartEpochMsChanged, this,
+            [this]() { updateXTouchDisplay(); });
     connect(m_midiManager, &MidiManager::portsChanged, this, [this]() {
         if (!m_currentSettings.midiPortName.isEmpty()) {
             int idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
@@ -430,47 +427,44 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     m_streamDeckManager = new StreamDeckManager(this);
 
     connect(m_streamDeckManager, &StreamDeckManager::actionTriggered, this,
-            [this](int actionId, bool pressed) {
-        dispatchControlAction(actionId, !pressed);
-    });
+            [this](int actionId, bool pressed) { dispatchControlAction(actionId, !pressed); });
     connect(m_streamDeckManager, &StreamDeckManager::rotateTriggered, this,
             [this](int actionId, int delta) {
-        if (actionId == 10) shuttleStep(delta);
-        else jogStep(delta);
-    });
+                if (actionId == 10)
+                    shuttleStep(delta);
+                else
+                    jogStep(delta);
+            });
 
     connect(m_streamDeckManager, &StreamDeckManager::learnInput, this,
             [this](int elementType, int index) {
-        if (m_streamDeckLearnAction < 0) return;
-        const QString model = m_streamDeckManager->deviceModel();
-        const bool ok = m_streamDeckStore.bind(
-            model, m_streamDeckLearnAction,
-            static_cast<StreamDeckMappingStore::ElementType>(elementType), index,
-            m_streamDeckManager->keyCount(), m_streamDeckManager->dialCount());
-        if (!ok) return;  // invalid pairing — keep listening
-        m_streamDeckStore.writeTo(m_currentSettings);
-        m_settingsManager->save(m_configPath, m_currentSettings);
-        pushStreamDeckMaps();
-        m_streamDeckManager->setLearnMode(false);
-        m_streamDeckLearnAction = -1;
-        emit streamDeckLearnActionChanged();
-        m_streamDeckBindingsVersion++;
-        emit streamDeckBindingsChanged();
-    });
-    connect(m_streamDeckManager, &StreamDeckManager::scrubTriggered, this,
-            [this](double fraction) {
+                if (m_streamDeckLearnAction < 0) return;
+                const QString model = m_streamDeckManager->deviceModel();
+                const bool ok = m_streamDeckStore.bind(
+                    model, m_streamDeckLearnAction,
+                    static_cast<StreamDeckMappingStore::ElementType>(elementType), index,
+                    m_streamDeckManager->keyCount(), m_streamDeckManager->dialCount());
+                if (!ok) return; // invalid pairing — keep listening
+                m_streamDeckStore.writeTo(m_currentSettings);
+                m_settingsManager->save(m_configPath, m_currentSettings);
+                pushStreamDeckMaps();
+                m_streamDeckManager->setLearnMode(false);
+                m_streamDeckLearnAction = -1;
+                emit streamDeckLearnActionChanged();
+                m_streamDeckBindingsVersion++;
+                emit streamDeckBindingsChanged();
+            });
+    connect(m_streamDeckManager, &StreamDeckManager::scrubTriggered, this, [this](double fraction) {
         cancelFollowLive();
         seekPlayback(qint64(fraction * double(recordedDurationMs())));
     });
 
     auto pushRecordingState = [this]() {
-        m_streamDeckManager->setRecording(isRecording(),
-                                          isRecording() ? recordedDurationMs() : 0);
+        m_streamDeckManager->setRecording(isRecording(), isRecording() ? recordedDurationMs() : 0);
     };
     auto pushTransportState = [this]() {
         if (!m_transport) return;
-        m_streamDeckManager->setTransport(m_transport->isPlaying(),
-                                          m_transport->speed(),
+        m_streamDeckManager->setTransport(m_transport->isPlaying(), m_transport->speed(),
                                           m_followLive);
     };
     connect(this, &UIManager::recordingStatusChanged, this, pushRecordingState);
@@ -499,36 +493,32 @@ UIManager::UIManager(ReplayManager *engine, QObject *parent)
     // while playback is paused (no posChanged ticks).
     connect(m_streamDeckManager, &StreamDeckManager::connectedChanged, this,
             [this, pushRecordingState, pushTransportState]() {
-        if (m_streamDeckManager->connected()) {
-            pushRecordingState();
-            pushTransportState();
-            pushDeckTimecode();
-            // Creates the default layout for a new model, or clamps saved rows
-            // to the live geometry for a known one.
-            const QString model = m_streamDeckManager->deviceModel();
-            m_streamDeckStore.clampToGeometry(model,
-                m_streamDeckManager->keyCount(), m_streamDeckManager->dialCount());
-            pushStreamDeckMaps();
-            m_streamDeckBindingsVersion++;
-            emit streamDeckBindingsChanged();
-        } else if (m_streamDeckLearnAction >= 0) {
-            // Deck unplugged mid-learn — cancel listening on BOTH sides
-            // (the Swift learning flag is a persistent singleton).
-            m_streamDeckManager->setLearnMode(false);
-            m_streamDeckLearnAction = -1;
-            emit streamDeckLearnActionChanged();
-        }
-    });
+                if (m_streamDeckManager->connected()) {
+                    pushRecordingState();
+                    pushTransportState();
+                    pushDeckTimecode();
+                    // Creates the default layout for a new model, or clamps saved rows
+                    // to the live geometry for a known one.
+                    const QString model = m_streamDeckManager->deviceModel();
+                    m_streamDeckStore.clampToGeometry(model, m_streamDeckManager->keyCount(),
+                                                      m_streamDeckManager->dialCount());
+                    pushStreamDeckMaps();
+                    m_streamDeckBindingsVersion++;
+                    emit streamDeckBindingsChanged();
+                } else if (m_streamDeckLearnAction >= 0) {
+                    // Deck unplugged mid-learn — cancel listening on BOTH sides
+                    // (the Swift learning flag is a persistent singleton).
+                    m_streamDeckManager->setLearnMode(false);
+                    m_streamDeckLearnAction = -1;
+                    emit streamDeckLearnActionChanged();
+                }
+            });
 
     m_streamDeckManager->start();
 
-    if (auto *app = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
-        connect(app, &QGuiApplication::screenAdded, this, [this](QScreen*) {
-            refreshScreens();
-        });
-        connect(app, &QGuiApplication::screenRemoved, this, [this](QScreen*) {
-            refreshScreens();
-        });
+    if (auto* app = qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
+        connect(app, &QGuiApplication::screenAdded, this, [this](QScreen*) { refreshScreens(); });
+        connect(app, &QGuiApplication::screenRemoved, this, [this](QScreen*) { refreshScreens(); });
     }
     refreshScreens();
     refreshProviders();
@@ -561,8 +551,7 @@ UIManager::~UIManager() {
     }
 }
 
-void UIManager::dispatchControlAction(int action, bool isRelease)
-{
+void UIManager::dispatchControlAction(int action, bool isRelease) {
     // Case 8 (jog) intentionally absent: jog events carry a delta and go
     // through jogStep(), not this press/release dispatch.
     switch (action) {
@@ -579,7 +568,7 @@ void UIManager::dispatchControlAction(int action, bool isRelease)
                 m_holdAction = -1;
             }
         } else {
-            if (m_holdAction != -1) break;  // ignore overlapping hold from any device
+            if (m_holdAction != -1) break; // ignore overlapping hold from any device
             cancelFollowLive();
             m_holdWasPlaying = m_transport ? m_transport->isPlaying() : false;
             m_holdAction = 1;
@@ -599,7 +588,7 @@ void UIManager::dispatchControlAction(int action, bool isRelease)
                 m_holdAction = -1;
             }
         } else {
-            if (m_holdAction != -1) break;  // ignore overlapping hold from any device
+            if (m_holdAction != -1) break; // ignore overlapping hold from any device
             cancelFollowLive();
             m_holdWasPlaying = m_transport ? m_transport->isPlaying() : false;
             m_holdAction = 2;
@@ -629,8 +618,10 @@ void UIManager::dispatchControlAction(int action, bool isRelease)
         break;
     case 9:
         if (!isRelease) {
-            if (isRecording()) stopRecording();
-            else startRecording();
+            if (isRecording())
+                stopRecording();
+            else
+                startRecording();
         }
         break;
     default:
@@ -657,8 +648,7 @@ void UIManager::selectFeedExternal(int index) {
     emit feedSelectRequested(index);
 }
 
-void UIManager::jogStep(int delta)
-{
+void UIManager::jogStep(int delta) {
     if (!m_transport || delta == 0) return;
 
     m_transport->setPlaying(false);
@@ -679,16 +669,15 @@ void UIManager::jogStep(int delta)
     }
 }
 
-void UIManager::setFollowLive(bool on)
-{
+void UIManager::setFollowLive(bool on) {
     if (m_followLive == on) return;
     m_followLive = on;
     emit followLiveChanged();
 }
 
-static int nextSourceIdSeed(const QList<SourceSettings> &sources) {
+static int nextSourceIdSeed(const QList<SourceSettings>& sources) {
     int maxId = 0;
-    for (const auto &source : sources) {
+    for (const auto& source : sources) {
         bool ok = false;
         const int value = source.id.trimmed().toInt(&ok);
         if (ok && value > maxId) {
@@ -701,7 +690,7 @@ static int nextSourceIdSeed(const QList<SourceSettings> &sources) {
 QStringList UIManager::streamUrls() const {
     QStringList urls;
     urls.reserve(m_currentSettings.sources.size());
-    for (const auto &source : m_currentSettings.sources) {
+    for (const auto& source : m_currentSettings.sources) {
         urls.append(source.url);
     }
     return urls;
@@ -710,7 +699,7 @@ QStringList UIManager::streamUrls() const {
 QStringList UIManager::streamNames() const {
     QStringList names;
     names.reserve(m_currentSettings.sources.size());
-    for (const auto &source : m_currentSettings.sources) {
+    for (const auto& source : m_currentSettings.sources) {
         names.append(source.name);
     }
     return names;
@@ -719,18 +708,38 @@ QStringList UIManager::streamNames() const {
 QStringList UIManager::streamIds() const {
     QStringList ids;
     ids.reserve(m_currentSettings.sources.size());
-    for (const auto &source : m_currentSettings.sources) {
+    for (const auto& source : m_currentSettings.sources) {
         ids.append(source.id);
     }
     return ids;
 }
-QString UIManager::saveLocation() const { return m_currentSettings.saveLocation; }
-QString UIManager::fileName() const { return m_currentSettings.fileName; }
-int UIManager::recordWidth() const { return m_currentSettings.videoWidth; }
-int UIManager::recordHeight() const { return m_currentSettings.videoHeight; }
-int UIManager::recordFps() const { return m_currentSettings.fps; }
-int UIManager::multiviewCount() const { return m_currentSettings.multiviewCount; }
-bool UIManager::isRecording() const { return m_replayManager->isRecording(); }
+QString UIManager::saveLocation() const {
+    return m_currentSettings.saveLocation;
+}
+QString UIManager::fileName() const {
+    return m_currentSettings.fileName;
+}
+int UIManager::recordWidth() const {
+    return m_currentSettings.videoWidth;
+}
+int UIManager::recordHeight() const {
+    return m_currentSettings.videoHeight;
+}
+int UIManager::recordFps() const {
+    return m_currentSettings.fps;
+}
+int UIManager::recordFpsNumerator() const {
+    return m_currentSettings.fpsNum;
+}
+int UIManager::recordFpsDenominator() const {
+    return m_currentSettings.fpsDen;
+}
+int UIManager::multiviewCount() const {
+    return m_currentSettings.multiviewCount;
+}
+bool UIManager::isRecording() const {
+    return m_replayManager->isRecording();
+}
 qint64 UIManager::recordingStartEpochMs() const {
     return m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
 }
@@ -856,7 +865,7 @@ void UIManager::syncActiveStreams() {
     names.reserve(m_currentSettings.sources.size());
     metadata.reserve(m_currentSettings.sources.size());
     trims.reserve(m_currentSettings.sources.size());
-    for (const auto &source : m_currentSettings.sources) {
+    for (const auto& source : m_currentSettings.sources) {
         urls.append(source.url);
         names.append(source.name);
         trims.append(source.trimOffsetMs);
@@ -923,7 +932,10 @@ void UIManager::toggleSourceEnabled(int sourceIndex) {
                 if (!m_sourceEnabled[s]) continue;
                 bool inUse = false;
                 for (int vv = 0; vv < m_viewSlotMap.size(); ++vv) {
-                    if (m_viewSlotMap[vv] == s) { inUse = true; break; }
+                    if (m_viewSlotMap[vv] == s) {
+                        inUse = true;
+                        break;
+                    }
                 }
                 if (!inUse) {
                     m_viewSlotMap[v] = s;
@@ -956,7 +968,7 @@ void UIManager::toggleSourceEnabled(int sourceIndex) {
         names.reserve(m_currentSettings.sources.size());
         metadata.reserve(m_currentSettings.sources.size());
         trims.reserve(m_currentSettings.sources.size());
-        for (const auto &source : m_currentSettings.sources) {
+        for (const auto& source : m_currentSettings.sources) {
             urls.append(source.url);
             names.append(source.name);
             trims.append(source.trimOffsetMs);
@@ -1018,7 +1030,7 @@ void UIManager::updateReplayTelemetryFeeds() {
     feedIds.reserve(m_currentSettings.sources.size());
     feedNames.reserve(m_currentSettings.sources.size());
     telemetryDelaysMs.reserve(m_currentSettings.sources.size());
-    for (const SourceSettings &source : m_currentSettings.sources) {
+    for (const SourceSettings& source : m_currentSettings.sources) {
         feedIds.append(source.id);
         feedNames.append(source.name);
         telemetryDelaysMs.append(source.telemetryDelayMs);
@@ -1033,7 +1045,7 @@ void UIManager::clearImportPreview() {
     m_importPreviewError.clear();
 }
 
-bool UIManager::loadTelemetryTimeline(const QString &filePath, bool notify) {
+bool UIManager::loadTelemetryTimeline(const QString& filePath, bool notify) {
     m_hasTelemetryTimeline = false;
     if (filePath.trimmed().isEmpty()) {
         return false;
@@ -1043,8 +1055,8 @@ bool UIManager::loadTelemetryTimeline(const QString &filePath, bool notify) {
         if (!notify) {
             return false;
         }
-        qWarning() << "UIManager: failed to load telemetry timeline"
-                   << filePath << m_telemetryTimelineReader.lastError();
+        qWarning() << "UIManager: failed to load telemetry timeline" << filePath
+                   << m_telemetryTimelineReader.lastError();
         return false;
     }
 
@@ -1059,9 +1071,9 @@ bool UIManager::loadTelemetryTimeline(const QString &filePath, bool notify) {
 QVariantMap UIManager::recordingTelemetryStateAt(qint64 playheadMs) const {
     QVariantMap state;
     for (auto it = m_recordingTelemetry.constBegin(); it != m_recordingTelemetry.constEnd(); ++it) {
-        const QList<TelemetryTimelineEntry> &entries = it.value();
-        const TelemetryTimelineEntry *latest = nullptr;
-        for (const TelemetryTimelineEntry &entry : entries) {
+        const QList<TelemetryTimelineEntry>& entries = it.value();
+        const TelemetryTimelineEntry* latest = nullptr;
+        for (const TelemetryTimelineEntry& entry : entries) {
             if (entry.ptsMs > playheadMs) {
                 break;
             }
@@ -1147,7 +1159,7 @@ void UIManager::resetSourceStats(int count) {
     emit sourceStatsChanged();
 }
 
-void UIManager::setStreamUrls(const QStringList &urls) {
+void UIManager::setStreamUrls(const QStringList& urls) {
     if (streamUrls() != urls) {
         QList<SourceSettings> updated = m_currentSettings.sources;
         const int minSize = qMin(updated.size(), urls.size());
@@ -1177,7 +1189,7 @@ void UIManager::setStreamUrls(const QStringList &urls) {
     }
 }
 
-void UIManager::setStreamNames(const QStringList &names) {
+void UIManager::setStreamNames(const QStringList& names) {
     if (streamNames() != names) {
         QList<SourceSettings> updated = m_currentSettings.sources;
         const int minSize = qMin(updated.size(), names.size());
@@ -1207,7 +1219,7 @@ void UIManager::setStreamNames(const QStringList &names) {
     }
 }
 
-void UIManager::setStreamIds(const QStringList &ids) {
+void UIManager::setStreamIds(const QStringList& ids) {
     if (streamIds() != ids) {
         QList<SourceSettings> updated = m_currentSettings.sources;
         const int minSize = qMin(updated.size(), ids.size());
@@ -1233,14 +1245,14 @@ void UIManager::setStreamIds(const QStringList &ids) {
     }
 }
 
-void UIManager::setSaveLocationFromUrl(const QUrl &folderUrl) {
+void UIManager::setSaveLocationFromUrl(const QUrl& folderUrl) {
     QString localPath = folderUrl.toLocalFile();
     if (!localPath.isEmpty()) {
         setSaveLocation(localPath);
     }
 }
 
-void UIManager::setSaveLocation(const QString &path) {
+void UIManager::setSaveLocation(const QString& path) {
     // Normalize free-text input: expand ~, clean separators, and refuse
     // relative paths (they would resolve against the process cwd).
     QString normalized = path.trimmed();
@@ -1263,7 +1275,7 @@ void UIManager::setSaveLocation(const QString &path) {
     }
 }
 
-void UIManager::setFileName(const QString &name) {
+void UIManager::setFileName(const QString& name) {
     if (m_currentSettings.fileName != name) {
         m_currentSettings.fileName = name;
         m_replayManager->setBaseFileName(name);
@@ -1290,17 +1302,30 @@ void UIManager::setRecordHeight(int height) {
 }
 
 void UIManager::setRecordFps(int fps) {
-    if (fps <= 0) return;
+    setRecordFrameRate(fps, 1);
+}
+
+void UIManager::setRecordFrameRate(int numerator, int denominator) {
+    const FrameRate rate = FrameRate::fromFraction(numerator, denominator);
+    if (!rate.isValid()) return;
+
+    const int roundedFps = rate.roundedFps(m_currentSettings.fps);
+    if (roundedFps <= 0) return;
+
     // Changing fps mid-recording desyncs the workers (frozen at their
     // construction-time fps) from the heartbeat: lowering freezes all output,
-    // raising corrupts the timeline. Refuse while recording; the QML SpinBox
+    // raising corrupts the timeline. Refuse while recording; the QML selector
     // also disables, but guard the engine in case that's bypassed.
     if (m_replayManager && m_replayManager->isRecording()) return;
-    if (m_currentSettings.fps != fps) {
-        m_currentSettings.fps = fps;
-        m_replayManager->setFps(fps);
+
+    if (m_currentSettings.fps != roundedFps || m_currentSettings.fpsNum != rate.numerator ||
+        m_currentSettings.fpsDen != rate.denominator) {
+        m_currentSettings.fps = roundedFps;
+        m_currentSettings.fpsNum = rate.numerator;
+        m_currentSettings.fpsDen = rate.denominator;
+        m_replayManager->setFps(roundedFps);
         if (m_transport) {
-            m_transport->setFps(fps);
+            m_transport->setFrameRate(rate.numerator, rate.denominator);
         }
         emit recordFpsChanged();
     }
@@ -1353,7 +1378,7 @@ void UIManager::setTimeOfDayMode(bool enabled) {
     m_settingsManager->save(m_configPath, m_currentSettings);
 }
 
-void UIManager::setImportSettingsUrl(const QString &url) {
+void UIManager::setImportSettingsUrl(const QString& url) {
     const QString trimmed = url.trimmed();
     if (m_currentSettings.importSettingsUrl == trimmed) return;
 
@@ -1421,16 +1446,23 @@ QString UIManager::midiBindingLabel(int action) const {
     if (!m_midiBindings.contains(action)) return QString("Unassigned");
     const auto binding = m_midiBindings.value(action);
     if (binding.status < 0 || binding.data1 < 0) return QString("Unassigned");
-    QString base = QString("0x%1 0x%2").arg(binding.status, 2, 16, QChar('0')).arg(binding.data1, 2, 16, QChar('0')).toUpper();
+    QString base = QString("0x%1 0x%2")
+                       .arg(binding.status, 2, 16, QChar('0'))
+                       .arg(binding.data1, 2, 16, QChar('0'))
+                       .toUpper();
     if (binding.data2 >= 0) {
         base += QString(" (0x%1)").arg(binding.data2, 2, 16, QChar('0')).toUpper();
     }
     if (m_midiBindingData2Forward.contains(action) || m_midiBindingData2Backward.contains(action)) {
         if (m_midiBindingData2Forward.contains(action)) {
-            base += QString(" F:0x%1").arg(m_midiBindingData2Forward.value(action), 2, 16, QChar('0')).toUpper();
+            base += QString(" F:0x%1")
+                        .arg(m_midiBindingData2Forward.value(action), 2, 16, QChar('0'))
+                        .toUpper();
         }
         if (m_midiBindingData2Backward.contains(action)) {
-            base += QString(" B:0x%1").arg(m_midiBindingData2Backward.value(action), 2, 16, QChar('0')).toUpper();
+            base += QString(" B:0x%1")
+                        .arg(m_midiBindingData2Backward.value(action), 2, 16, QChar('0'))
+                        .toUpper();
         }
     }
     return base;
@@ -1530,7 +1562,8 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
         m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
     }
     if (m_audioPlayer) {
-        bool normalSpeed = m_transport && (m_transport->speed() > 0.99 && m_transport->speed() < 1.01);
+        bool normalSpeed =
+            m_transport && (m_transport->speed() > 0.99 && m_transport->speed() < 1.01);
         m_audioPlayer->setMuted(!singleView || selectedIndex < 0 || !normalSpeed);
     }
 
@@ -1603,7 +1636,8 @@ void UIManager::startRecording() {
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
 
     // 2. Point it to the file being recorded
-    //QString filePath = m_replayManager->getOutputDirectory() + "/" + m_replayManager->getBaseFileName() + ".mkv";
+    // QString filePath = m_replayManager->getOutputDirectory() + "/" +
+    // m_replayManager->getBaseFileName() + ".mkv";
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
 
     m_playbackWorker->start();
@@ -1668,7 +1702,7 @@ void UIManager::seekPlayback(int64_t ms) {
     if (m_audioPlayer) m_audioPlayer->clear();
 }
 
-void UIManager::updateUrl(int index, const QString &url) {
+void UIManager::updateUrl(int index, const QString& url) {
     if (index >= 0 && index < m_currentSettings.sources.size()) {
         m_currentSettings.sources[index].url = url;
         // Update the source worker directly (real FFmpeg reconnect)
@@ -1720,10 +1754,9 @@ void UIManager::updateStreamId(int index, const QString& id) {
 }
 
 QString UIManager::sourceDisplayLabel(int sourceIndex) const {
-    if (sourceIndex < 0 || sourceIndex >= m_currentSettings.sources.size())
-        return QString();
+    if (sourceIndex < 0 || sourceIndex >= m_currentSettings.sources.size()) return QString();
 
-    const SourceSettings &src = m_currentSettings.sources[sourceIndex];
+    const SourceSettings& src = m_currentSettings.sources[sourceIndex];
 
     // Build "ID Name" header
     QString label = src.id;
@@ -1733,15 +1766,16 @@ QString UIManager::sourceDisplayLabel(int sourceIndex) const {
 
     // Build a lookup of stored values for this source
     QHash<QString, QString> valueMap;
-    for (const QJsonValue &val : src.metadata) {
+    for (const QJsonValue& val : src.metadata) {
         const QJsonObject obj = val.toObject();
         valueMap.insert(obj.value("name").toString(), obj.value("value").toString());
     }
 
     // Append metadata fields with display=true
-    for (const QJsonValue &val : m_currentSettings.metadataFields) {
+    for (const QJsonValue& val : m_currentSettings.metadataFields) {
         const QJsonObject fieldDef = val.toObject();
-        const bool display = fieldDef.contains("display") ? fieldDef.value("display").toBool() : true;
+        const bool display =
+            fieldDef.contains("display") ? fieldDef.value("display").toBool() : true;
         if (!display) continue;
         const QString fieldName = fieldDef.value("name").toString();
         const QString fieldValue = valueMap.value(fieldName);
@@ -1755,8 +1789,8 @@ QString UIManager::sourceDisplayLabel(int sourceIndex) const {
 
 QVariantList UIManager::metadataFieldDefinitions() const {
     QVariantList items;
-    const QJsonArray &arr = m_currentSettings.metadataFields;
-    for (const QJsonValue &val : arr) {
+    const QJsonArray& arr = m_currentSettings.metadataFields;
+    for (const QJsonValue& val : arr) {
         const QJsonObject obj = val.toObject();
         QVariantMap row;
         row.insert("name", obj.value("name").toString());
@@ -1766,9 +1800,9 @@ QVariantList UIManager::metadataFieldDefinitions() const {
     return items;
 }
 
-void UIManager::setMetadataFieldDefinitions(const QVariantList &fields) {
+void UIManager::setMetadataFieldDefinitions(const QVariantList& fields) {
     QJsonArray arr;
-    for (const auto &item : fields) {
+    for (const auto& item : fields) {
         const QVariantMap row = item.toMap();
         const QString name = row.value("name").toString().trimmed();
         if (name.isEmpty()) continue;
@@ -1792,15 +1826,15 @@ QVariantList UIManager::sourceMetadataItems(int index) const {
 
     // Build a lookup from the source's stored metadata values
     QHash<QString, QString> valueMap;
-    const QJsonArray &arr = m_currentSettings.sources[index].metadata;
-    for (const QJsonValue &val : arr) {
+    const QJsonArray& arr = m_currentSettings.sources[index].metadata;
+    for (const QJsonValue& val : arr) {
         const QJsonObject obj = val.toObject();
         valueMap.insert(obj.value("name").toString(), obj.value("value").toString());
     }
 
     // Return one row per globally-defined field, merged with any stored value
-    const QJsonArray &fields = m_currentSettings.metadataFields;
-    for (const QJsonValue &val : fields) {
+    const QJsonArray& fields = m_currentSettings.metadataFields;
+    for (const QJsonValue& val : fields) {
         const QJsonObject fieldDef = val.toObject();
         const QString fieldName = fieldDef.value("name").toString();
         QVariantMap row;
@@ -1811,10 +1845,10 @@ QVariantList UIManager::sourceMetadataItems(int index) const {
     return items;
 }
 
-void UIManager::setSourceMetadataItems(int index, const QVariantList &items) {
+void UIManager::setSourceMetadataItems(int index, const QVariantList& items) {
     if (index < 0 || index >= m_currentSettings.sources.size()) return;
     QJsonArray arr;
-    for (const auto &item : items) {
+    for (const auto& item : items) {
         const QVariantMap row = item.toMap();
         const QString name = row.value("name").toString().trimmed();
         if (name.isEmpty()) continue;
@@ -1888,9 +1922,8 @@ void UIManager::applyImportPreview() {
 QVariantMap UIManager::telemetryAtPlayhead() {
     const qint64 playheadMs = scrubPosition();
     if (m_replayManager && m_replayManager->isRecording()) {
-        QVariantMap state = m_hasTelemetryTimeline
-            ? m_telemetryTimelineReader.stateAt(playheadMs)
-            : QVariantMap{};
+        QVariantMap state =
+            m_hasTelemetryTimeline ? m_telemetryTimelineReader.stateAt(playheadMs) : QVariantMap{};
         const QVariantMap pendingState = recordingTelemetryStateAt(playheadMs);
         for (auto it = pendingState.constBegin(); it != pendingState.constEnd(); ++it) {
             state.insert(it.key(), it.value());
@@ -1913,10 +1946,8 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
     QVariantList rows;
     QSet<QString> emitted;
 
-    auto appendRow = [&rows, &emitted, &state](
-                         const QString &feedId,
-                         const QString &feedName,
-                         const QJsonArray &metadata = {}) {
+    auto appendRow = [&rows, &emitted, &state](const QString& feedId, const QString& feedName,
+                                               const QJsonArray& metadata = {}) {
         const QVariant value = state.value(feedId);
         const QVariantMap payload = value.isValid() ? value.toMap() : QVariantMap{};
         QVariantList items;
@@ -1951,7 +1982,7 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
         emitted.insert(feedId);
     };
 
-    for (const SourceSettings &source : m_currentSettings.sources) {
+    for (const SourceSettings& source : m_currentSettings.sources) {
         appendRow(source.id, source.name, source.metadata);
     }
 
@@ -2023,7 +2054,7 @@ void UIManager::loadSettings() {
     if (m_settingsManager->load(m_configPath, m_currentSettings)) {
         m_streamDeckStore.loadFrom(m_currentSettings);
         int nextId = nextSourceIdSeed(m_currentSettings.sources);
-        for (auto &source : m_currentSettings.sources) {
+        for (auto& source : m_currentSettings.sources) {
             if (source.id.trimmed().isEmpty()) {
                 source.id = QString::number(nextId++);
             }
@@ -2038,20 +2069,23 @@ void UIManager::loadSettings() {
         ensureSourceEnabledSize();
         syncActiveStreams();
         if (m_transport) {
-            m_transport->setFps(m_currentSettings.fps);
+            m_transport->setFrameRate(m_currentSettings.fpsNum, m_currentSettings.fpsDen);
         }
 
         m_midiBindings.clear();
         m_midiBindingData2Forward.clear();
         m_midiBindingData2Backward.clear();
-        for (auto it = m_currentSettings.midiBindings.constBegin(); it != m_currentSettings.midiBindings.constEnd(); ++it) {
+        for (auto it = m_currentSettings.midiBindings.constBegin();
+             it != m_currentSettings.midiBindings.constEnd(); ++it) {
             int data2 = m_currentSettings.midiBindingData2.value(it.key(), -1);
             m_midiBindings.insert(it.key(), {it.value().first, it.value().second, data2});
         }
-        for (auto it = m_currentSettings.midiBindingData2Forward.constBegin(); it != m_currentSettings.midiBindingData2Forward.constEnd(); ++it) {
+        for (auto it = m_currentSettings.midiBindingData2Forward.constBegin();
+             it != m_currentSettings.midiBindingData2Forward.constEnd(); ++it) {
             m_midiBindingData2Forward.insert(it.key(), it.value());
         }
-        for (auto it = m_currentSettings.midiBindingData2Backward.constBegin(); it != m_currentSettings.midiBindingData2Backward.constEnd(); ++it) {
+        for (auto it = m_currentSettings.midiBindingData2Backward.constBegin();
+             it != m_currentSettings.midiBindingData2Backward.constEnd(); ++it) {
             m_midiBindingData2Backward.insert(it.key(), it.value());
         }
         m_midiBindingsVersion++;
@@ -2178,7 +2212,7 @@ int UIManager::screenCount() const {
 void UIManager::refreshScreens() {
     QList<QScreen*> screens = QGuiApplication::screens();
     if (screens.isEmpty()) {
-        if (auto *primary = QGuiApplication::primaryScreen()) {
+        if (auto* primary = QGuiApplication::primaryScreen()) {
             screens.append(primary);
         }
     }
@@ -2191,9 +2225,7 @@ void UIManager::refreshScreens() {
         QString name = screen ? screen->name().trimmed() : QString();
         QSize size = screen ? screen->size() : QSize();
 
-        QString label = name.isEmpty()
-                            ? QString("Display %1").arg(i + 1)
-                            : name;
+        QString label = name.isEmpty() ? QString("Display %1").arg(i + 1) : name;
         if (size.isValid()) {
             label = QString("%1 — %2×%3").arg(label).arg(size.width()).arg(size.height());
         }
@@ -2249,8 +2281,8 @@ int64_t UIManager::recordedDurationMs() {
 
 int64_t UIManager::scrubPosition() {
 
-    if(!m_transport) return 0;
-    if(!m_replayManager) return 0;
+    if (!m_transport) return 0;
+    if (!m_replayManager) return 0;
 
     const int64_t pos = qMax<int64_t>(0, m_transport->currentPos());
     return qMin<int64_t>(pos, m_replayManager->getElapsedMs());
@@ -2360,12 +2392,10 @@ void UIManager::updateXTouchLcd() {
     if (!m_midiManager || !m_midiManager->isXTouchConnected()) return;
 
     QString label;
-    if (m_playbackSingleView && m_playbackSelectedIndex >= 0
-        && m_playbackSelectedIndex < m_currentSettings.sources.size()) {
+    if (m_playbackSingleView && m_playbackSelectedIndex >= 0 &&
+        m_playbackSelectedIndex < m_currentSettings.sources.size()) {
         const QString name = m_currentSettings.sources[m_playbackSelectedIndex].name.trimmed();
-        label = name.isEmpty()
-                    ? QString("CAM %1").arg(m_playbackSelectedIndex + 1)
-                    : name;
+        label = name.isEmpty() ? QString("CAM %1").arg(m_playbackSelectedIndex + 1) : name;
     } else if (m_playbackSingleView && m_playbackSelectedIndex >= 0) {
         label = QString("CAM %1").arg(m_playbackSelectedIndex + 1);
     }
@@ -2380,30 +2410,33 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
     const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
 
     const qint64 startEpochMs = m_replayManager ? m_replayManager->getRecordingStartEpochMs() : 0;
-    const qint64 playheadEpochMs = (startEpochMs > 0) ? (startEpochMs + playheadMs) : QDateTime::currentMSecsSinceEpoch();
+    const qint64 playheadEpochMs =
+        (startEpochMs > 0) ? (startEpochMs + playheadMs) : QDateTime::currentMSecsSinceEpoch();
 
     const QString recTimeOfDay = QDateTime::fromMSecsSinceEpoch(playheadEpochMs).toString("HHmmss");
     const QString playheadTime = formatTimecodeForFile(playheadMs, fps);
 
-    QString outputDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/videos";
+    QString outputDir =
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/videos";
     QDir dir(outputDir);
     if (!dir.exists()) dir.mkpath(".");
 
     auto saveImageForIndex = [&](int index) {
         if (index < 0 || index >= m_providers.size()) return;
 
-        const QString feedName = (index < m_currentSettings.sources.size() && !m_currentSettings.sources[index].name.trimmed().isEmpty())
-                     ? sanitizeFileToken(m_currentSettings.sources[index].name)
-                                 : QString("CAM%1").arg(index + 1);
+        const QString feedName = (index < m_currentSettings.sources.size() &&
+                                  !m_currentSettings.sources[index].name.trimmed().isEmpty())
+                                     ? sanitizeFileToken(m_currentSettings.sources[index].name)
+                                     : QString("CAM%1").arg(index + 1);
 
         QImage image = m_providers[index]->latestImage();
         if (image.isNull()) return;
 
         const QString fileName = QString("%1_%2_%3_%4.jpg")
-            .arg(projectName)
-            .arg(feedName)
-            .arg(recTimeOfDay)
-            .arg(playheadTime);
+                                     .arg(projectName)
+                                     .arg(feedName)
+                                     .arg(recTimeOfDay)
+                                     .arg(playheadTime);
 
         const QString fullPath = dir.absoluteFilePath(fileName);
         QImageWriter writer(fullPath, "jpg");
@@ -2455,18 +2488,15 @@ QString UIManager::getSettingsPath(QString fileName) {
     return docPath + "/settings/" + fileName;
 }
 
-void UIManager::pushStreamDeckMaps()
-{
+void UIManager::pushStreamDeckMaps() {
     if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
     const QString model = m_streamDeckManager->deviceModel();
     m_streamDeckManager->pushKeyMap(model, m_streamDeckStore.keyMap(model));
-    m_streamDeckManager->pushDialMaps(model,
-        m_streamDeckStore.dialRotateMap(model),
-        m_streamDeckStore.dialPressMap(model));
+    m_streamDeckManager->pushDialMaps(model, m_streamDeckStore.dialRotateMap(model),
+                                      m_streamDeckStore.dialPressMap(model));
 }
 
-QString UIManager::playbackTimecode()
-{
+QString UIManager::playbackTimecode() {
     // MUST stay identical to the QML playback timecode (Main.qml): the deck and
     // the on-screen label render this one string. Source = scrubPosition.
     const qint64 pos = scrubPosition();
@@ -2486,8 +2516,7 @@ QString UIManager::playbackTimecode()
         .arg(frames, 2, 10, QLatin1Char('0'));
 }
 
-void UIManager::pushDeckTimecode()
-{
+void UIManager::pushDeckTimecode() {
     if (!m_streamDeckManager) return;
     const qint64 dur = recordedDurationMs();
     const qint64 pos = scrubPosition();
@@ -2495,10 +2524,9 @@ void UIManager::pushDeckTimecode()
     m_streamDeckManager->setPosition(playbackTimecode(), frac);
 }
 
-void UIManager::beginStreamDeckLearn(int action)
-{
+void UIManager::beginStreamDeckLearn(int action) {
     if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
-    if (m_streamDeckLearnAction == action) {       // toggle off
+    if (m_streamDeckLearnAction == action) { // toggle off
         m_streamDeckLearnAction = -1;
         m_streamDeckManager->setLearnMode(false);
         emit streamDeckLearnActionChanged();
@@ -2509,8 +2537,7 @@ void UIManager::beginStreamDeckLearn(int action)
     emit streamDeckLearnActionChanged();
 }
 
-void UIManager::clearStreamDeckBinding(int action)
-{
+void UIManager::clearStreamDeckBinding(int action) {
     if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
     const QString model = m_streamDeckManager->deviceModel();
     m_streamDeckStore.clear(model, action);
@@ -2521,12 +2548,11 @@ void UIManager::clearStreamDeckBinding(int action)
     emit streamDeckBindingsChanged();
 }
 
-void UIManager::resetStreamDeckDefaults()
-{
+void UIManager::resetStreamDeckDefaults() {
     if (!m_streamDeckManager || !m_streamDeckManager->connected()) return;
     const QString model = m_streamDeckManager->deviceModel();
-    m_streamDeckStore.resetToDefault(model,
-        m_streamDeckManager->keyCount(), m_streamDeckManager->dialCount());
+    m_streamDeckStore.resetToDefault(model, m_streamDeckManager->keyCount(),
+                                     m_streamDeckManager->dialCount());
     m_streamDeckStore.writeTo(m_currentSettings);
     m_settingsManager->save(m_configPath, m_currentSettings);
     pushStreamDeckMaps();
@@ -2534,14 +2560,12 @@ void UIManager::resetStreamDeckDefaults()
     emit streamDeckBindingsChanged();
 }
 
-QString UIManager::streamDeckBindingLabel(int action) const
-{
+QString UIManager::streamDeckBindingLabel(int action) const {
     if (!m_streamDeckManager) return QStringLiteral("Unassigned");
     return m_streamDeckStore.bindingLabel(m_streamDeckManager->deviceModel(), action);
 }
 
-void UIManager::shuttleStep(int delta)
-{
+void UIManager::shuttleStep(int delta) {
     if (!m_transport) return;
     cancelFollowLive();
     const ShuttleResult r = shuttleLadderStep(m_transport->speed(), delta);
