@@ -1,21 +1,44 @@
 #!/usr/bin/env bash
-# Pre-push hook: run the full local CTest gate, then build the iOS target before
-# allowing a push.
+# Pre-push hook: by default this only PRINTS A RECOMMENDATION and always allows
+# the push. The full local CTest matrix and the iOS cross-build are NOT forced.
 #
-# GitHub PR CI deliberately runs only the short "ci" CTest label. The expensive
-# e2e matrix is validated here instead. iOS is also NOT built in GitHub CI: the
-# FFmpeg+SRT+OpenSSL from-source build (~20 min) OOM-kills hosted runners. The
-# FFmpeg xcframeworks are cached in ios_build/xcframeworks, so only the first
-# iOS build is slow; later pushes just rebuild the app.
+# GitHub PR CI runs only the short "ci" CTest label, and does not build iOS: the
+# FFmpeg+SRT+OpenSSL from-source build (~20 min) OOM-kills hosted runners. So the
+# expensive e2e matrix and the iOS build are worth running locally before you
+# push something risky -- but that's your call, not a gate. The FFmpeg
+# xcframeworks are cached in ios_build/xcframeworks, so only the first iOS build
+# is slow; later builds just rebuild the app.
 #
-# Enable once per clone:   git config core.hooksPath .githooks
-# Skip parts once:        SKIP_FULL_TESTS=1 git push
-#                         SKIP_IOS_BUILD=1 git push
-# Skip the hook once:     git push --no-verify
+# Recommended before pushing risky changes (run manually):
+#   cmake -S . -B build/prepush-tests -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+#       -DCMAKE_PREFIX_PATH="$HOME/Qt/6.10.1/macos" -DOLR_BUILD_TESTS=ON
+#   cmake --build build/prepush-tests
+#   ctest --test-dir build/prepush-tests --output-on-failure \
+#       --repeat until-pass:2 -LE 'sync-report|srt|native-apple-ingest'
+#   # ...then cross-build the iOS target (see tests/README.md).
+#
+# Enable the hook once per clone:  git config core.hooksPath .githooks
+# Opt in to run the full gate + iOS build as a BLOCKING check on this push:
+#                                  OLR_PREPUSH_FULL=1 git push
+# Within OLR_PREPUSH_FULL, skip a part:  SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
+
+if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
+    cat >&2 <<'EOF'
+[pre-push] Recommendation only (not a gate): PR CI runs just the short "ci"
+[pre-push] CTest label and does not build iOS. Before pushing risky changes,
+[pre-push] consider running the full local CTest matrix + iOS cross-build --
+[pre-push] see the commands in this hook's header or tests/README.md, or run a
+[pre-push] one-off blocking check with:  OLR_PREPUSH_FULL=1 git push
+[pre-push] Push proceeding.
+EOF
+    exit 0
+fi
+
+echo "[pre-push] OLR_PREPUSH_FULL=1 - running full local gate + iOS build as a blocking check."
 
 QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/6.10.1/macos}}"
 
