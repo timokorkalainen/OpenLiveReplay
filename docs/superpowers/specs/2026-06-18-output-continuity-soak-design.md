@@ -43,7 +43,7 @@ production code changes** — the harness uses only public `OutputRuntime` / `Ou
 
 - **`tests/e2e/soak_harness.cpp`** — the binary. Builds a static cache, wires an
   `OutputRuntime`, registers sinks, runs the phase schedule over a configurable duration,
-  and prints one parseable report line.
+  and prints three parseable report lines (one per bus, plus a runtime line).
 - **`ContinuitySink`** (defined in the harness) — an `IOutputSink` that computes O(1)
   running invariants per submitted frame and never blocks the cadence thread:
   - tracks `lastOutputFrameIndex`, counting any index gap (`expected != actual`);
@@ -87,7 +87,7 @@ The `OutputRuntime` runs its real cadence thread throughout; the harness samples
 
 ## Invariants and thresholds
 
-Emitted as a single parseable line consumed by the driver script, which asserts:
+Emitted as parseable lines consumed by the driver script, which asserts:
 
 - **Frame continuity:** every bus's `outputFrameIndex` increments by exactly 1 with **zero
   gaps** across the whole run (`indexGaps == 0`).
@@ -97,8 +97,9 @@ Emitted as a single parseable line consumed by the driver script, which asserts:
   `nextStart − start`), so no separate drift metric is needed. The tiling baseline resets
   across a pause (silent audio) and re-establishes on resume; seams are only counted between
   consecutive non-silent (playing) frames.
-- **Cadence:** `runtime.deadlineMisses == 0` and `runtime.maxLatenessNs` below a generous
-  bound (e.g. one frame period) during steady phases.
+- **Cadence:** `runtime.deadlineMisses == 0` (no catch-up-cap overflow). `maxLatenessNs` is
+  reported for diagnostics but not asserted — per-frame lateness is expected under wall-clock
+  jitter; only a sustained stall that overflows the catch-up cap fails the gate.
 - **Paused continuity:** during the paused segment, indexes stay gap-free, repeated-payload
   is detected (`repeatedPayloadFrames > 0`), and **no** placeholder frames appear while the
   source is present (`placeholderFrames == 0`).
