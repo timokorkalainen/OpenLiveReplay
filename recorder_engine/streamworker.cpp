@@ -228,11 +228,11 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                             ptsTicks, AVRational{1, m_targetFps}, st->time_base);
                         pkt->duration = av_rescale_q(
                             1, AVRational{1, m_targetFps}, st->time_base);
+                        if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
+                        m_muxer->writePacket(pkt);
+                        havePacket = true;
                     }
-                    if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
-                    m_muxer->writePacket(pkt);
                     av_packet_free(&pkt);
-                    havePacket = true;
                 },
                 &encErr);
         } else if (encCtx) {
@@ -518,7 +518,7 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
         m_latestFrame->format = AV_PIX_FMT_YUV420P;
         m_latestFrame->width  = m_targetWidth;
         m_latestFrame->height = m_targetHeight;
-        if (av_frame_get_buffer(m_latestFrame, 0) < 0) return false;
+        if (av_frame_get_buffer(m_latestFrame, 0) < 0) { av_frame_free(&m_latestFrame); return false; }
         memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
         memset(m_latestFrame->data[1], 128, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
         memset(m_latestFrame->data[2], 128, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
