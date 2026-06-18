@@ -377,7 +377,10 @@ void AudioPlayer::setMuted(bool muted) {
     bool wasM = m_muted;
     m_muted = muted;
     if (muted && m_ringBuffer) {
-        m_ringBuffer->clear();
+        // De-click: ramp the remaining buffered audio to zero before discarding
+        // it, instead of a hard cut that pops. fadeOutAndClear is the same
+        // de-click path clear() uses.
+        m_ringBuffer->fadeOutAndClear(m_channels);
     }
     // Arm fade-in ramp and re-alignment when transitioning muted → unmuted.
     // m_fadeInRemaining / m_fadeInLen count FRAMES (kFadeInSamples = 10 ms).
