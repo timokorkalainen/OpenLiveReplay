@@ -78,7 +78,13 @@ Decide per real-world source feeds whether any of these need broadening (most li
 ## 5. Deferred / partial from P1 (rational frame rate)
 
 - **Rational recorder fps restoration.** Settings/UI preserve `{num,den}` and `PlaybackTransport` steps on the exact selected cadence, but `ReplayManager` still records at the rounded integer compatibility fps.
-- **Drop-frame timecode (TC-2).** Drop-frame TC display/side-data is not implemented.
+- **Drop-frame timecode (TC-2).** The reusable conversion core now exists:
+  `recorder_engine/timing/timecode.{h,cpp}` (pure, Qt-free) converts an absolute
+  frame index ↔ SMPTE 12M `HH:MM:SS:FF` (NDF) / `HH:MM:SS;FF` (DF) for 29.97 and
+  59.94, fully unit-tested (`tests/unit/tst_timecode.cpp`). Still pending: wiring
+  it into a TC *display*/side-data path — the existing `uimanager.cpp` /
+  control-API timecode is still ms-based, integer-fps, NDF-only. Hooking the new
+  utility into display and `tmcd` side-data is Phase 3's job (TC-1/TC-5).
 - **Arbitrary (non-preset) rates in the UI.** The transport/settings path accepts any valid `{num,den}`, but the UI offers only the standard preset list (23.976/24/25/29.97/30/50/59.94/60/120).
 
 `PlaybackTransport` now has exact-rate stepping support and UI/settings wiring calls
