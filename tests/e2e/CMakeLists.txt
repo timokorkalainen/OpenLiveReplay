@@ -80,6 +80,15 @@ qt_add_executable(ndi_marker_mkv_source
 target_include_directories(ndi_marker_mkv_source PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(ndi_marker_mkv_source PRIVATE Qt6::Core olr_warnings olr_sanitize)
 
+# Tier (c): decodes a recorded MKV's luma (piped from ffmpeg) and reports marker continuity,
+# validating the NDI ingest -> record segment of the full pipe.
+qt_add_executable(marker_yuv_probe
+    marker_yuv_probe.cpp
+    ndi_output_marker.cpp
+    ndi_recv_analysis.cpp)
+target_include_directories(marker_yuv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(marker_yuv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
+
 add_test(NAME e2e_ndi_output
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
         "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
