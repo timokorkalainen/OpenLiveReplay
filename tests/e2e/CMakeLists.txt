@@ -163,11 +163,19 @@ add_test(NAME e2e_play_latency
 add_test(NAME e2e_play_seekflash
     COMMAND bash "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" seekflash 2 23494)
+# Far-backward seek-flash gate (Tier 2): play near EOF, jump all the way back to
+# 0 — the worst case for the flash. The committed-playhead gate + worker
+# double-buffer must keep placeholderFramesDelta==0 with cacheGeneration>=1.
+# Port 23496 (UDP 23497) is the next clear port after seekflash (23494) and the
+# av-sync port (23492), and is disjoint from the record/sync/native ranges.
+add_test(NAME e2e_play_farback
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" farback 2 23496)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
-    e2e_play_seekflash
+    e2e_play_seekflash e2e_play_farback
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180

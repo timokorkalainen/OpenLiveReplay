@@ -72,6 +72,11 @@ public:
 
     PlaybackCounters counters() const { return m_counters; }
     OutputDispatchStats outputStats() const;
+    // The committed cache generation (set at repositionTo's tail). >=1 after a
+    // real reposition proves a target was decoded and committed to the cache.
+    uint64_t cacheGeneration() const {
+        return m_committedGeneration.load(std::memory_order_acquire);
+    }
 
 protected:
     void run() override;
