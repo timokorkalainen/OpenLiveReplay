@@ -56,6 +56,16 @@ qt_add_executable(ndi_runtime_sender ndi_runtime_sender.cpp)
 target_link_libraries(ndi_runtime_sender PRIVATE
     Qt6::Core olr_test_playback olr_warnings olr_sanitize)
 
+# NDI receiver probe + tier-(a) sender for the rung-5 output validation lane. Both
+# runtime-load the NDI library (no SDK at build time) and link the shared marker/analysis
+# modules.
+qt_add_executable(ndi_recv_probe
+    ndi_recv_probe.cpp
+    ndi_output_marker.cpp
+    ndi_recv_analysis.cpp)
+target_include_directories(ndi_recv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_recv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
+
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
     # before connect by reading the stream ID from a real accepted SRT socket.
