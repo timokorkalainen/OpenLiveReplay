@@ -94,3 +94,5 @@ set_tests_properties(tst_ndi_runtime_smoke PROPERTIES
 olr_add_unit_test(tst_streamdeckmappingstore olr_test_core)
 olr_add_unit_test(tst_srt_health olr_test_core)
 olr_add_unit_test(tst_rtmp_health      olr_test_core)
+olr_add_unit_test(tst_videocodecchoice)
+target_include_directories(tst_videocodecchoice PRIVATE "${CMAKE_SOURCE_DIR}")
