@@ -139,24 +139,44 @@ primitives. The record/playback E2E drivers stay in the local pre-push gate.
 macOS jobs cache Qt via `install-qt-action`, Homebrew downloads via
 `actions/cache`, and C/C++ compiler outputs via `ccache`.
 
-## Full local gate + iOS build (pre-push hook, not CI)
+## Full local gate + iOS build (recommended before pushing, not CI)
 
 iOS is **not** built in GitHub CI: the FFmpeg+SRT from-source build
 (~20 min) OOM-kills hosted runners. The expensive E2E matrix is also kept out
-of PR CI. Both are validated locally by [`.githooks/pre-push`](../.githooks/pre-push),
-which runs the full non-local-only CTest suite and then cross-builds the iOS
-target on `git push`. Enable it once per clone:
+of PR CI. Both are **recommended** to run locally before pushing risky changes —
+they are not forced. Run the full non-local-only CTest matrix with:
+
+```bash
+cmake -S . -B build/prepush-tests -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH=~/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON
+cmake --build build/prepush-tests
+ctest --test-dir build/prepush-tests --output-on-failure \
+  --repeat until-pass:2 -LE 'sync-report|srt|native-apple-ingest'
+```
+
+then cross-build the iOS target (the FFmpeg xcframeworks are cached in
+`ios_build/xcframeworks`, so only the first build is slow; override the Qt
+location with `QT_IOS_PREFIX` / `QT_HOST_PREFIX`):
+
+```bash
+~/Qt/6.10.1/ios/bin/qt-cmake -S . -B build/ios-prepush -G Xcode \
+  -DQT_HOST_PATH=~/Qt/6.10.1/macos -DCMAKE_OSX_ARCHITECTURES=arm64
+cmake --build build/ios-prepush --config Debug -- \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+```
+
+The optional [`.githooks/pre-push`](../.githooks/pre-push) hook surfaces this
+reminder at push time without blocking — it just prints the recommendation and
+lets the push through. Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-The FFmpeg xcframeworks are cached in `ios_build/xcframeworks`, so only the
-first push is slow. Override the Qt location with `QT_IOS_PREFIX` /
-`QT_HOST_PREFIX`. Skip one part with `SKIP_FULL_TESTS=1 git push` or
-`SKIP_IOS_BUILD=1 git push`; skip the whole hook once with `git push --no-verify`.
-If no Qt iOS kit is found the iOS part skips and allows the push after the full
-CTest gate has passed.
+If you want the hook to actually run the full gate + iOS build as a one-off
+**blocking** check, opt in with `OLR_PREPUSH_FULL=1 git push` (within that, skip
+a part with `SKIP_FULL_TESTS=1` or `SKIP_IOS_BUILD=1`; if no Qt iOS kit is found
+the iOS part skips and the push proceeds after the CTest gate passes).
 
 The iOS FFmpeg slice uses SecureTransport for TLS/RTMPS and builds libsrt
 without OpenSSL/mbedTLS encryption support. Encrypted native SRT is intentionally
