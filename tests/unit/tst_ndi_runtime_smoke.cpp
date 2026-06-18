@@ -334,9 +334,6 @@ private slots:
 };
 
 void TestNdiRuntimeSmoke::realRuntimeDeliversVideoAndAudio() {
-    if (qEnvironmentVariableIsEmpty("OLR_RUN_NDI_RUNTIME_TESTS"))
-        QSKIP("Set OLR_RUN_NDI_RUNTIME_TESTS=1 to run the real NDI runtime smoke test.");
-
     NdiRuntimeReceiver receiver;
     if (!receiver.load())
         QSKIP("NDI runtime is not installed or discoverable. Set OLR_NDI_RUNTIME_LIBRARY to libndi "

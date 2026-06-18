@@ -35,6 +35,13 @@ qt_add_executable(sync_harness sync_harness.cpp)
 target_link_libraries(sync_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
+# Runtime-loaded local NDI sender used by the native NDI ingest smoke. This
+# deliberately uses the app's own NdiOutputSink instead of the SDK-only marker
+# fixture so a machine with only the NDI runtime can still run the e2e gate.
+qt_add_executable(ndi_runtime_sender ndi_runtime_sender.cpp)
+target_link_libraries(ndi_runtime_sender PRIVATE
+    Qt6::Core olr_test_playback olr_warnings olr_sanitize)
+
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
     # before connect by reading the stream ID from a real accepted SRT socket.
@@ -339,10 +346,12 @@ elseif(WIN32)
         ENVIRONMENT "${_olr_windows_tool_env}")
 endif()
 
-# Native NDI ingest is cross-platform and runtime-loaded. This smoke is opt-in:
-# it skips unless OLR_NDI_TEST_SOURCE names a real source visible to the NDI runtime.
+# Native NDI ingest is cross-platform and runtime-loaded. This smoke starts a
+# local runtime-loaded sender by default, or records
+# OLR_NDI_TEST_SOURCE when a real external source is explicitly requested.
 add_test(NAME e2e_native_ndi_smoke
-    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_smoke.sh" "$<TARGET_FILE:record_harness>")
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_smoke.sh"
+        "$<TARGET_FILE:record_harness>" "$<TARGET_FILE:ndi_runtime_sender>")
 set_tests_properties(e2e_native_ndi_smoke PROPERTIES
     LABELS "native-ndi"
     TIMEOUT 180
