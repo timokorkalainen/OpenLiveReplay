@@ -4,6 +4,7 @@
 #include "recorder_engine/codec/videocodecchoice.h"
 
 #include <QString>
+#include <cstdint>
 
 struct BenchmarkConfig {
     int width = 1920;
@@ -16,7 +17,7 @@ struct BenchmarkConfig {
 struct RampStepResult {
     int concurrency = 0;
     int framesProcessed = 0;
-    int framesRequired = 0;
+    int64_t framesRequired = 0;
     bool budgetMet = true;
     double avgEncodeMs = 0.0;
     double avgDecodeMs = 0.0;
@@ -24,7 +25,9 @@ struct RampStepResult {
 
 struct CodecBenchmarkResult {
     bool h264Available = false;
-    int  h264SafeFeeds = -1;   // -1 = not measured / unavailable
+    // -1 = not measured / codec unavailable; 0 = measured but sustained zero feeds; >0 = safe feed count
+    int  h264SafeFeeds = -1;
+    // -1 = not measured / codec unavailable; 0 = measured but sustained zero feeds; >0 = safe feed count
     int  mpeg2SafeFeeds = -1;
     double h264EncodeMs = 0.0, h264DecodeMs = 0.0;
     double mpeg2EncodeMs = 0.0, mpeg2DecodeMs = 0.0;

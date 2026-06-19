@@ -33,8 +33,9 @@ CodecBenchmarkResult runCodecBenchmark(const BenchmarkConfig& config,
     }
 
     // --- Recommendation ---
-    // Prefer H.264 if available and it handles at least as many feeds as MPEG-2.
-    if (result.h264Available && result.h264SafeFeeds >= result.mpeg2SafeFeeds) {
+    // Prefer H.264 if available, sustained at least one feed, and handles at least
+    // as many feeds as MPEG-2. Never recommend a codec that sustained zero feeds.
+    if (result.h264Available && result.h264SafeFeeds > 0 && result.h264SafeFeeds >= result.mpeg2SafeFeeds) {
         result.recommended = VideoCodecChoice::H264Hardware;
     } else {
         result.recommended = VideoCodecChoice::Mpeg2Software;

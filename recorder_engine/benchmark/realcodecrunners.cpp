@@ -30,7 +30,7 @@ struct ThreadResult {
     double totalDecodeMs = 0.0;
 };
 
-RampStepResult aggregate(int concurrency, int framesRequired,
+RampStepResult aggregate(int concurrency, int64_t framesRequired,
                          const std::vector<ThreadResult>& results)
 {
     RampStepResult r;
@@ -77,8 +77,7 @@ QByteArray avccToAnnexB(const QByteArray& data)
 // ---------------------------------------------------------------------------
 RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig& cfg)
 {
-    const int framesRequired = static_cast<int>(
-        static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000);
+    const int64_t framesRequired = static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000;
     const double budgetMs    = 1000.0 / cfg.fps;
 
     std::vector<ThreadResult> results(concurrency);
@@ -116,6 +115,7 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
 
         AVPacket* pkt    = av_packet_alloc();
         AVFrame*  decFrm = av_frame_alloc();
+        if (!pkt || !decFrm) { av_packet_free(&pkt); av_frame_free(&decFrm); avcodec_free_context(&decCtx); avcodec_free_context(&encCtx); return; }
 
         // Warm-up: encode+decode 2 frames before measurement to prime FFmpeg's
         // internal pipeline (avoids counting codec-init latency against the budget).
@@ -150,7 +150,7 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
         while (wall.elapsed() < cfg.durationMsPerStep) {
             AVFrame* f = makeSyntheticFrame(cfg.width, cfg.height, seq++);
             if (!f) break;
-            f->pts = pts++; // monotonically increasing, starting from 1
+            f->pts = pts++; // monotonically increasing, starting from 100
 
             QElapsedTimer encTimer;
             encTimer.start();
@@ -217,8 +217,7 @@ bool H264CodecRunner::available() const
 
 RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& cfg)
 {
-    const int framesRequired = static_cast<int>(
-        static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000);
+    const int64_t framesRequired = static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000;
     const double budgetMs    = 1000.0 / cfg.fps;
 
     std::vector<ThreadResult> results(concurrency);

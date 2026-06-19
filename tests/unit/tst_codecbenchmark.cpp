@@ -17,7 +17,7 @@ public:
     RampStepResult runStep(int n, const BenchmarkConfig& c) override {
         visited.append(n);
         RampStepResult r; r.concurrency = n;
-        r.framesRequired = n * c.fps * (c.durationMsPerStep / 1000);
+        r.framesRequired = int64_t(n) * c.fps * c.durationMsPerStep / 1000;
         if (n <= maxHeadroom)      r.framesProcessed = r.framesRequired * 2;   // strong
         else if (n <= maxSustain)  r.framesProcessed = r.framesRequired;       // tight
         else                       r.framesProcessed = r.framesRequired / 2;   // fails
