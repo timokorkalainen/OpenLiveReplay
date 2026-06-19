@@ -733,6 +733,17 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         m_committedPlayheadMs.store(target, std::memory_order_relaxed);
         m_committedGeneration.store(m_seekGeneration.load(std::memory_order_acquire),
                                     std::memory_order_release);
+        // Re-anchor the output clock to the now-live playhead AFTER the commit.
+        // seekTo's resetPlayEpoch (issued before this reposition) can be consumed
+        // by an output tick while the CommitGate is still holding the OLD
+        // playhead, anchoring the play epoch to it; without re-anchoring here the
+        // epoch stays at the old position, sampledPlayheadMs diverges by the seek
+        // distance, and the output samples a window the cache never covers -> a
+        // gray placeholder with no last-good frame (the farback flake).
+        {
+            QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+            if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
+        }
         return;
     }
 
@@ -885,6 +896,14 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     m_committedPlayheadMs.store(target, std::memory_order_relaxed);
     m_committedGeneration.store(m_seekGeneration.load(std::memory_order_acquire),
                                 std::memory_order_release);
+    // Re-anchor the output clock to the now-live playhead AFTER the commit (see
+    // the reuse fast-path above): otherwise the play epoch stays anchored to the
+    // CommitGate-held OLD playhead, sampledPlayheadMs diverges by the seek
+    // distance, and the output grays a window the cache never covers.
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
+    }
 }
 
 // ---------------------------------------------------------------------------
