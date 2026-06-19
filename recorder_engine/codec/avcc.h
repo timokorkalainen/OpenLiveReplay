@@ -17,8 +17,6 @@ QByteArray buildAvcCFromParameterSets(const QList<QByteArray>& sps,
 // avcC layout: [0]=configVersion [1..3]=profile/compat/level [4]=0xFF
 // [5]=0xE0|numSPS then numSPS*(2-byte BE len + payload)
 // then 1 byte numPPS then numPPS*(2-byte BE len + payload).
-bool parseAvcc(const QByteArray& avcc,
-               QList<QByteArray>* sps,
-               QList<QByteArray>* pps);
+bool parseAvcc(const QByteArray& avcc, QList<QByteArray>* sps, QList<QByteArray>* pps);
 
 #endif // OLR_AVCC_H

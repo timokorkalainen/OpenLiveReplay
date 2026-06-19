@@ -9,9 +9,7 @@ void appendSizedNal(QByteArray* out, const QByteArray& nal) {
 }
 } // namespace
 
-bool parseAvcc(const QByteArray& avcc,
-               QList<QByteArray>* sps,
-               QList<QByteArray>* pps) {
+bool parseAvcc(const QByteArray& avcc, QList<QByteArray>* sps, QList<QByteArray>* pps) {
     if (!sps || !pps) return false;
     sps->clear();
     pps->clear();

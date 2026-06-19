@@ -12,17 +12,25 @@ private slots:
     void roundTrip();
     void invalidatesOnDeviceOrResolutionChange();
     void deviceLabelIsNonEmpty();
-    void loadMalformedJsonReturnsFalse();        // T-cache-robustness
+    void loadMalformedJsonReturnsFalse();           // T-cache-robustness
     void loadMissingKeysYieldsDocumentedDefaults(); // T-cache-robustness
 };
 
 void TestBenchmarkCache::roundTrip() {
-    QTemporaryDir dir; const QString path = dir.filePath("bench.json");
+    QTemporaryDir dir;
+    const QString path = dir.filePath("bench.json");
     CodecBenchmarkResult in;
-    in.h264Available = true; in.h264SafeFeeds = 12; in.mpeg2SafeFeeds = 5;
-    in.h264EncodeMs = 1.8; in.h264DecodeMs = 2.3; in.mpeg2EncodeMs = 3.5; in.mpeg2DecodeMs = 4.1;
+    in.h264Available = true;
+    in.h264SafeFeeds = 12;
+    in.mpeg2SafeFeeds = 5;
+    in.h264EncodeMs = 1.8;
+    in.h264DecodeMs = 2.3;
+    in.mpeg2EncodeMs = 3.5;
+    in.mpeg2DecodeMs = 4.1;
     in.recommended = VideoCodecChoice::H264Hardware;
-    in.deviceLabel = "TestChip arm64"; in.resolution = "1920x1080@30"; in.timestamp = "2026-06-19T00:00:00Z";
+    in.deviceLabel = "TestChip arm64";
+    in.resolution = "1920x1080@30";
+    in.timestamp = "2026-06-19T00:00:00Z";
     in.ceilingReached = true;
     QVERIFY(saveBenchmarkResult(path, in));
     CodecBenchmarkResult out;
@@ -42,7 +50,9 @@ void TestBenchmarkCache::roundTrip() {
 }
 
 void TestBenchmarkCache::invalidatesOnDeviceOrResolutionChange() {
-    CodecBenchmarkResult c; c.deviceLabel = "ChipA arm64"; c.resolution = "1920x1080@30";
+    CodecBenchmarkResult c;
+    c.deviceLabel = "ChipA arm64";
+    c.resolution = "1920x1080@30";
     QVERIFY(benchmarkResultMatches(c, "ChipA arm64", "1920x1080@30"));
     QVERIFY(!benchmarkResultMatches(c, "ChipB arm64", "1920x1080@30"));
     QVERIFY(!benchmarkResultMatches(c, "ChipA arm64", "1280x720@30"));

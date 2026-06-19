@@ -1,8 +1,9 @@
 #include "recorder_engine/benchmark/codecbenchmark.h"
 
-CodecBenchmark::CodecResult CodecBenchmark::rampCodec(
-    CodecRunner& runner, const BenchmarkConfig& config,
-    const ProgressFn& onStep, const std::atomic<bool>& cancel) {
+CodecBenchmark::CodecResult CodecBenchmark::rampCodec(CodecRunner& runner,
+                                                      const BenchmarkConfig& config,
+                                                      const ProgressFn& onStep,
+                                                      const std::atomic<bool>& cancel) {
     CodecResult out;
     if (!runner.available()) return out;
 
@@ -15,7 +16,7 @@ CodecBenchmark::CodecResult CodecBenchmark::rampCodec(
         out.steps.append(r);
         const bool sustained = rampStepSustained(r);
         if (onStep) onStep(n, sustained);
-        if (!sustained) break;                  // stop at first failing step
+        if (!sustained) break;                        // stop at first failing step
         if (n == lastStep) out.ceilingReached = true; // reached 32 still sustaining
     }
     out.safeFeeds = safeFeedCount(out.steps);
@@ -23,7 +24,8 @@ CodecBenchmark::CodecResult CodecBenchmark::rampCodec(
     // Report avg ms from the largest sustained step (most representative of real load).
     for (const RampStepResult& r : out.steps)
         if (rampStepSustained(r) && r.concurrency == out.ceiling) {
-            out.encodeMs = r.avgEncodeMs; out.decodeMs = r.avgDecodeMs;
+            out.encodeMs = r.avgEncodeMs;
+            out.decodeMs = r.avgDecodeMs;
             break;
         }
     return out;

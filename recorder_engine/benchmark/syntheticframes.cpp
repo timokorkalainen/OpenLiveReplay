@@ -5,12 +5,11 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
-AVFrame* makeSyntheticFrame(int width, int height, int seq)
-{
+AVFrame* makeSyntheticFrame(int width, int height, int seq) {
     AVFrame* f = av_frame_alloc();
     if (!f) return nullptr;
     f->format = AV_PIX_FMT_YUV420P;
-    f->width  = width;
+    f->width = width;
     f->height = height;
     if (av_frame_get_buffer(f, 0) < 0) {
         av_frame_free(&f);
@@ -25,9 +24,9 @@ AVFrame* makeSyntheticFrame(int width, int height, int seq)
     }
 
     // --- Moving 32×32 contrast block (gives inter-frame motion) ---
-    const int bx = width  > 32 ? (seq * 8) % (width  - 32) : 0;
+    const int bx = width > 32 ? (seq * 8) % (width - 32) : 0;
     const int by = height > 32 ? (seq * 4) % (height - 32) : 0;
-    const int bw = (bx + 32 <= width)  ? 32 : width  - bx;
+    const int bw = (bx + 32 <= width) ? 32 : width - bx;
     const int bh = (by + 32 <= height) ? 32 : height - by;
     for (int y = by; y < by + bh; ++y) {
         uint8_t* row = f->data[0] + y * f->linesize[0];
@@ -36,7 +35,7 @@ AVFrame* makeSyntheticFrame(int width, int height, int seq)
     }
 
     // --- U plane: mild horizontal gradient ---
-    const int hw = (width  + 1) / 2;
+    const int hw = (width + 1) / 2;
     const int hh = (height + 1) / 2;
     for (int y = 0; y < hh; ++y) {
         uint8_t* row = f->data[1] + y * f->linesize[1];

@@ -26,16 +26,18 @@ struct RampStepResult {
 
 struct CodecBenchmarkResult {
     bool h264Available = false;
-    // -1 = not measured / codec unavailable; 0 = measured but sustained zero feeds; >0 = safe feed count
-    int  h264SafeFeeds = -1;
-    // -1 = not measured / codec unavailable; 0 = measured but sustained zero feeds; >0 = safe feed count
-    int  mpeg2SafeFeeds = -1;
+    // -1 = not measured / codec unavailable; 0 = measured but sustained zero feeds; >0 = safe feed
+    // count
+    int h264SafeFeeds = -1;
+    // -1 = not measured / codec unavailable; 0 = measured but sustained zero feeds; >0 = safe feed
+    // count
+    int mpeg2SafeFeeds = -1;
     double h264EncodeMs = 0.0, h264DecodeMs = 0.0;
     double mpeg2EncodeMs = 0.0, mpeg2DecodeMs = 0.0;
     VideoCodecChoice recommended = VideoCodecChoice::Mpeg2Software;
     QString deviceLabel;
-    QString resolution;     // e.g. "1920x1080@30"
-    QString timestamp;      // ISO-8601, stamped by the caller
+    QString resolution;          // e.g. "1920x1080@30"
+    QString timestamp;           // ISO-8601, stamped by the caller
     bool ceilingReached = false; // true if a codec ramp hit N=32 without failing
 };
 

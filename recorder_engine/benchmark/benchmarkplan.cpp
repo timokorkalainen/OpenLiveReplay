@@ -28,8 +28,7 @@ int safeFeedCount(const QVector<RampStepResult>& steps) {
     return best;
 }
 
-VideoCodecChoice recommendCodec(bool h264Available, int h264SafeFeeds, int mpeg2SafeFeeds)
-{
+VideoCodecChoice recommendCodec(bool h264Available, int h264SafeFeeds, int mpeg2SafeFeeds) {
     if (h264Available && h264SafeFeeds > 0 && h264SafeFeeds >= mpeg2SafeFeeds)
         return VideoCodecChoice::H264Hardware;
     return VideoCodecChoice::Mpeg2Software;

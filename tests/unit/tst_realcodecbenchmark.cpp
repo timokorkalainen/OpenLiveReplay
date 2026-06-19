@@ -26,13 +26,19 @@ void TestRealCodecBenchmark::syntheticFrameIsDeterministic() {
     QCOMPARE(memcmp(a->data[0], b->data[0], a->linesize[0] * 240), 0); // same seq → identical
     AVFrame* c = makeSyntheticFrame(320, 240, 6);
     QVERIFY(memcmp(a->data[0], c->data[0], a->linesize[0] * 240) != 0); // motion → differs
-    av_frame_free(&a); av_frame_free(&b); av_frame_free(&c);
+    av_frame_free(&a);
+    av_frame_free(&b);
+    av_frame_free(&c);
 }
 
 void TestRealCodecBenchmark::mpeg2RunnerMeasuresOneStep() {
     Mpeg2CodecRunner runner;
     QVERIFY(runner.available());
-    BenchmarkConfig cfg; cfg.width = 320; cfg.height = 240; cfg.fps = 30; cfg.durationMsPerStep = 500;
+    BenchmarkConfig cfg;
+    cfg.width = 320;
+    cfg.height = 240;
+    cfg.fps = 30;
+    cfg.durationMsPerStep = 500;
     std::atomic<bool> cancel{false};
     RampStepResult r = runner.runStep(1, cfg, cancel);
     QCOMPARE(r.concurrency, 1);
@@ -43,9 +49,13 @@ void TestRealCodecBenchmark::mpeg2RunnerMeasuresOneStep() {
 void TestRealCodecBenchmark::h264RunnerRampsWhenAvailable() {
     H264CodecRunner runner;
     if (!runner.available()) QSKIP("no hardware H.264 on this platform");
-    BenchmarkConfig cfg; cfg.width = 640; cfg.height = 480; cfg.fps = 30; cfg.durationMsPerStep = 500;
+    BenchmarkConfig cfg;
+    cfg.width = 640;
+    cfg.height = 480;
+    cfg.fps = 30;
+    cfg.durationMsPerStep = 500;
     std::atomic<bool> cancel{false};
-    auto res = CodecBenchmark::rampCodec(runner, cfg, [](int,bool){}, cancel);
+    auto res = CodecBenchmark::rampCodec(runner, cfg, [](int, bool) {}, cancel);
     QVERIFY(res.ceiling >= 1); // at least 1 feed sustains on any HW-capable device
 }
 
@@ -56,9 +66,9 @@ void TestRealCodecBenchmark::mpeg2RunnerMultiThreaded() {
     Mpeg2CodecRunner runner;
     QVERIFY(runner.available());
     BenchmarkConfig cfg;
-    cfg.width  = 320;
+    cfg.width = 320;
     cfg.height = 240;
-    cfg.fps    = 30;
+    cfg.fps = 30;
     cfg.durationMsPerStep = 400;
     std::atomic<bool> cancel{false};
 
@@ -67,7 +77,8 @@ void TestRealCodecBenchmark::mpeg2RunnerMultiThreaded() {
 
     QCOMPARE(r.concurrency, concurrency);
     // framesRequired = 4 * 30 * 400 / 1000 = 48
-    const int64_t expectedRequired = static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000;
+    const int64_t expectedRequired =
+        static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000;
     QCOMPARE(r.framesRequired, expectedRequired);
     QVERIFY(r.framesProcessed >= 0); // must not crash or hang; value is machine-dependent
     // budgetMet is a valid bool (no UB)

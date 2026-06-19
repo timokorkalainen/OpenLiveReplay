@@ -15,8 +15,7 @@ bool loadBenchmarkResult(const QString& path, CodecBenchmarkResult& out);
 
 // Returns true iff the cached result's deviceLabel and resolution match the given values.
 // Used to invalidate the cache on device change or resolution change.
-bool benchmarkResultMatches(const CodecBenchmarkResult& cached,
-                            const QString& deviceLabel,
+bool benchmarkResultMatches(const CodecBenchmarkResult& cached, const QString& deviceLabel,
                             const QString& resolution);
 
 #endif // OLR_BENCHMARKCACHE_H
