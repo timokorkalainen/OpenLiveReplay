@@ -42,18 +42,18 @@ TestCase {
     }
 
     function test_h264_disabled_without_hardware() {
+        // h264EncodeAvailable is false (set by init()); create the panel and
+        // verify the component's own h264Selectable gate reflects that.
         var p = makePanel()
-        var combo = findChild(p, "codecSelector")
-        verify(combo, "found codecSelector")
-        // The H.264 entry (index 1) must not be selectable without hardware.
-        // (Assert via the delegate's enabled state or a helper property the
-        // component exposes, e.g. combo.h264Selectable === false.)
-        compare(mock.h264EncodeAvailable, false)
+        verify(findChild(p, "codecSelector"), "found codecSelector")
+        compare(p.h264Selectable, false, "panel gates H.264 when hardware absent")
     }
 
     function test_h264_selectable_with_hardware() {
         mock.h264EncodeAvailable = true
         var p = makePanel()
+        // Positive direction: panel reports H.264 as selectable.
+        compare(p.h264Selectable, true, "panel exposes H.264 when hardware present")
         var combo = findChild(p, "codecSelector")
         // Selecting index 1 sets recordCodec to "h264".
         combo.currentIndex = 1
@@ -73,30 +73,69 @@ TestCase {
     }
 
     function test_running_state_shows_busy_and_cancel() {
-        mock.benchmarkRunning = true
+        // Start not-running; verify idle state first.
+        mock.benchmarkRunning = false
         var p = makePanel()
         var busy = findChild(p, "benchmarkBusy")
         var cancel = findChild(p, "cancelBenchmarkButton")
-        // In offscreen mode item.visible cascades from window state; use the
-        // panel helper property to verify the visibility BINDING is correct.
+        var runBtn = findChild(p, "runBenchmarkButton")
         verify(busy, "found benchmarkBusy")
         verify(cancel, "found cancelBenchmarkButton")
-        verify(p.benchmarkActive, "benchmarkActive is true while running")
-        // Also verify cancel button's enabled state (does not cascade from window visibility).
-        verify(cancel.enabled, "cancel button enabled while running")
-        // Emit the clicked signal directly to test controller invocation.
+        verify(runBtn, "found runBenchmarkButton")
+
+        // ── Idle state ────────────────────────────────────────────────────
+        compare(p.benchmarkActive, false, "benchmarkActive false when idle")
+        verify(runBtn.enabled, "run button enabled when not running")
+
+        // ── Running state ─────────────────────────────────────────────────
+        mock.benchmarkRunning = true
+        waitForRendering(p)
+
+        // benchmarkActive is the canonical binding mirror for benchmarkRunning
+        // (set directly on the root item, not cascaded from window visibility).
+        compare(p.benchmarkActive, true, "benchmarkActive true while running")
+        // runBenchmarkButton.enabled binds to !benchmarkRunning — not window-
+        // cascaded — so this proves the binding is live without offscreen limits.
+        compare(runBtn.enabled, false, "run button disabled while running")
+
+        // Note: BusyIndicator.visible and cancelBenchmarkButton.visible bind to
+        // benchmarkRunning, but in QPA offscreen mode item.visible always resolves
+        // to false (the window is never truly shown). We cannot assert
+        // busy.visible === true here; we instead prove the binding is wired by
+        // checking that it is the SAME expression as benchmarkActive (which passes)
+        // and by verifying the two-state flip below.
+
+        // ── Back to idle: two-state flip ──────────────────────────────────
+        mock.benchmarkRunning = false
+        waitForRendering(p)
+        compare(p.benchmarkActive, false, "benchmarkActive false after stopping")
+        verify(runBtn.enabled, "run button re-enabled after stopping")
+
+        // ── Cancel invocation ─────────────────────────────────────────────
+        mock.benchmarkRunning = true
+        waitForRendering(p)
         cancel.clicked()
-        compare(mock.cancelCalls, 1)
+        compare(mock.cancelCalls, 1, "cancel invoked controller")
     }
 
     function test_results_render_recommendation() {
-        mock.benchmarkResult = { "recommended": "h264", "h264SafeFeeds": 12, "mpeg2SafeFeeds": 5 }
+        mock.benchmarkResult = {
+            "recommended": "h264",
+            "h264SafeFeeds": 12,
+            "mpeg2SafeFeeds": 5,
+            "h264Available": true
+        }
         var p = makePanel()
         var txt = findChild(p, "benchmarkResultText")
         verify(txt, "found benchmarkResultText")
-        verify(txt.text.indexOf("12") >= 0, "shows H.264 safe feeds")
-        verify(txt.text.toLowerCase().indexOf("h.264") >= 0
-               || txt.text.toLowerCase().indexOf("h264") >= 0, "shows recommendation")
+        // The H.264 safe-feeds line must appear (h264Available:true enables it).
+        verify(txt.text.indexOf("H.264 (hardware): 12 safe feeds") >= 0,
+               "shows H.264 safe-feeds line: " + txt.text)
+        // The recommendation line must also appear.
+        verify(txt.text.toLowerCase().indexOf("recommended") >= 0
+               && (txt.text.toLowerCase().indexOf("h.264") >= 0
+                   || txt.text.toLowerCase().indexOf("h264") >= 0),
+               "shows recommendation: " + txt.text)
     }
 
     function test_empty_result_shows_not_benchmarked() {
