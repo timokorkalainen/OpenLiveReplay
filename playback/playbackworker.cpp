@@ -1,4 +1,5 @@
 #include "playback/playbackworker.h"
+#include "playback/cutschedule.h"
 #include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/outputbusengine.h"
 #include "playback/output/outputframecache.h"
@@ -33,6 +34,17 @@ PlaybackWorker::~PlaybackWorker() {
         delete aTrack;
     }
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
+    // Tier3 pre-roll: run()'s cleanup clears these on a clean exit; defensively
+    // free here too in case the thread never ran (the QVectors are then empty).
+    for (auto* track : m_prerollBank) {
+        if (track->codecCtx) avcodec_free_context(&track->codecCtx);
+        delete track;
+    }
+    for (auto* aTrack : m_prerollAudioBank) {
+        if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+        delete aTrack;
+    }
+    if (m_prerollFmtCtx) avformat_close_input(&m_prerollFmtCtx);
 }
 
 void PlaybackWorker::openFile(const QString& filePath) {
@@ -386,6 +398,20 @@ void PlaybackWorker::publishOutputCacheLocked() {
 }
 
 OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
+    // Tier3 armed cut: read the dispatcher's next output frame index BEFORE
+    // locking m_bufferMutex (dispatcherNextOutputFrameIndex locks the output
+    // runtime's OWN mutex; taking it here avoids any m_bufferMutex -> runtime
+    // m_mutex ordering). The cut promotion mutates worker-owned state from the
+    // output thread by design (the swap/republish must be atomic w.r.t. this
+    // snapshot), so we const_cast this const provider to drive it under
+    // m_bufferMutex below.
+    qint64 dispatcherNextIndex = 0;
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (m_outputRuntime)
+            dispatcherNextIndex = m_outputRuntime->dispatcherNextOutputFrameIndex();
+    }
+
     OutputRuntimeSnapshot snapshot;
     {
         // Tier 2: read the immutable published snapshot instead of deep-copying
@@ -394,6 +420,9 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
         // mutates again, so the assignment below copies an implicitly-shared
         // (cheap COW) snapshot, not a re-decode of the decoder track buffers.
         QMutexLocker bufferLocker(&m_bufferMutex);
+        // Fire the scheduled cut (if due) while holding m_bufferMutex, BEFORE
+        // reading the published cache so this tick paints the promoted window.
+        const_cast<PlaybackWorker*>(this)->maybeFireScheduledCut(dispatcherNextIndex);
         if (auto published = m_publishedCache.load())
             snapshot.cache = *published;
         else
@@ -858,6 +887,270 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                                 std::memory_order_release);
 }
 
+// ---------------------------------------------------------------------------
+// Tier3 pre-roll / armed-cut implementation.
+//
+// CONCURRENCY MODEL
+//   * m_prerollFmtCtx / m_prerollBank / m_prerollAudioBank / m_prerollStagingCache
+//     / m_stagingCovers / m_stagingNewestRefPtsMs are WORKER-THREAD-ONLY: opened,
+//     filled and read solely inside run()/fillStaging on the worker thread. They
+//     are NOT touched by the output thread, so the fill needs NO lock.
+//   * The ONLY cross-thread handoff is the cut itself (maybeFireScheduledCut),
+//     which runs on the OUTPUT thread inside makeOutputSnapshot under
+//     m_bufferMutex. It swaps m_prerollStagingCache <-> m_outputCache (both
+//     unique_ptr, worker-owned) and republishes — a single pointer swap. Because
+//     the swap happens under m_bufferMutex (the same lock decodePacketIntoBank /
+//     the run-loop trim take for m_outputCache mutation) the two pointers are
+//     never read/written concurrently. After the cut the worker's fillStaging no
+//     longer runs (m_cutArmed cleared), so the swapped-out (old live) cache that
+//     now sits in m_prerollStagingCache is only re-touched on the NEXT arm, which
+//     clears it first. v1 does not handle a manual seek racing an in-flight cut
+//     (out of scope) — armNextCut + the makeOutputSnapshot cut are the only
+//     writers of the schedule atomics.
+// ---------------------------------------------------------------------------
+
+// Mirrors the primary open/init in run() (alloc_context, interrupt_callback,
+// avformat_open_input, find_stream_info, per-video-stream DecoderTrack +
+// per-audio AudioDecoderTrack) but writes the preroll members. No provider
+// wiring (the pre-roll feeds staging, not the live providers). Returns false on
+// failure; the caller leaves pre-roll disabled. Worker thread only.
+bool PlaybackWorker::openPrerollContext() {
+    if (m_prerollFmtCtx) avformat_close_input(&m_prerollFmtCtx);
+
+    AVFormatContext* ctx = avformat_alloc_context();
+    if (!ctx) return false;
+    ctx->interrupt_callback.callback = &PlaybackWorker::ffmpegInterruptCallback;
+    ctx->interrupt_callback.opaque = this;
+    if (avformat_open_input(&ctx, m_currentFilePath.toUtf8().constData(), nullptr, nullptr) < 0) {
+        avformat_close_input(&ctx);
+        return false;
+    }
+    m_prerollFmtCtx = ctx;
+    if (avformat_find_stream_info(m_prerollFmtCtx, nullptr) < 0) {
+        avformat_close_input(&m_prerollFmtCtx);
+        return false;
+    }
+
+    // Build the pre-roll video bank, mapped 1:1 by stream order to feedIndex,
+    // exactly like the primary loop (but capped at the provider count so the
+    // feedIndex matches the live cache feeds).
+    int feedIndex = 0;
+    for (unsigned int i = 0; i < m_prerollFmtCtx->nb_streams; i++) {
+        AVCodecParameters* codecParams = m_prerollFmtCtx->streams[i]->codecpar;
+        if (codecParams->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+        if (feedIndex >= m_providers.size()) break;
+
+        const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+        if (!codec) continue;
+        AVCodecContext* cctx = avcodec_alloc_context3(codec);
+        if (!cctx) continue;
+        avcodec_parameters_to_context(cctx, codecParams);
+        cctx->thread_count = 0;
+        if (avcodec_open2(cctx, codec, nullptr) < 0) {
+            avcodec_free_context(&cctx);
+            continue;
+        }
+        DecoderTrack* track = new DecoderTrack();
+        track->streamIndex = i;
+        track->codecCtx = cctx;
+        track->provider = nullptr; // no live provider wiring for pre-roll
+        track->feedIndex = feedIndex;
+        m_prerollBank.append(track);
+        feedIndex++;
+    }
+
+    // Build the pre-roll audio bank (paired with video by order), like primary.
+    int audioViewIdx = 0;
+    for (unsigned int i = 0; i < m_prerollFmtCtx->nb_streams; i++) {
+        AVCodecParameters* codecParams = m_prerollFmtCtx->streams[i]->codecpar;
+        if (codecParams->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+        const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+        if (!codec) {
+            audioViewIdx++;
+            continue;
+        }
+        AVCodecContext* cctx = avcodec_alloc_context3(codec);
+        if (!cctx) {
+            audioViewIdx++;
+            continue;
+        }
+        avcodec_parameters_to_context(cctx, codecParams);
+        cctx->thread_count = 0;
+        if (avcodec_open2(cctx, codec, nullptr) < 0) {
+            avcodec_free_context(&cctx);
+            audioViewIdx++;
+            continue;
+        }
+        AudioDecoderTrack* aTrack = new AudioDecoderTrack();
+        aTrack->streamIndex = i;
+        aTrack->codecCtx = cctx;
+        aTrack->viewIndex = audioViewIdx;
+        m_prerollAudioBank.append(aTrack);
+        audioViewIdx++;
+    }
+
+    if (m_prerollBank.isEmpty()) {
+        avformat_close_input(&m_prerollFmtCtx);
+        return false;
+    }
+    // Staging cache sized identically to m_outputCache.
+    m_prerollStagingCache =
+        std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth, m_outputHeight);
+    qDebug() << "PlaybackWorker: pre-roll context opened (" << m_prerollBank.size()
+             << "video tracks )";
+    return true;
+}
+
+// UI-thread-safe: atomic stores only, never blocks. Arms a scheduled atomic cut
+// to targetMs. No-op (feature unavailable) if the pre-roll context failed to
+// open. v1 is single-clip (ms-only; same currently-open file).
+void PlaybackWorker::armNextCut(int64_t targetMs) {
+    if (!m_prerollFmtCtx) return; // pre-roll disabled — feature unavailable
+    m_armedTargetMs.store(targetMs < 0 ? 0 : targetMs);
+    m_prerollSeekPending.store(true);
+    m_stagingCovers.store(false);
+    m_scheduledCutFrame.store(-1);
+    m_cutArmed.store(true);
+}
+
+// Worker-thread-only. Bounded incremental pre-roll into m_prerollStagingCache.
+// NOT published until the cut swap, so no lock during the fill. On the first
+// call after arm, av_seek_frame's the pre-roll context BACKWARD to target-kTrailMs
+// (a raw avio_seek into this MKV is unreliable — Part A proved it) then decodes
+// forward until staging covers [target, target+kStagingSpanMs]; schedules the cut
+// the moment coverage is reached.
+void PlaybackWorker::fillStaging() {
+    if (!m_prerollFmtCtx || m_prerollBank.isEmpty() || !m_prerollStagingCache) return;
+    const int64_t target = m_armedTargetMs.load();
+    if (target < 0 || m_stagingCovers.load()) return;
+
+    const int primaryStreamIndex = m_prerollBank[0]->streamIndex;
+    AVStream* refStream = m_prerollFmtCtx->streams[primaryStreamIndex];
+
+    if (m_prerollSeekPending.exchange(false)) {
+        const int64_t anchor = qMax<int64_t>(0, target - kTrailMs);
+        const int64_t seekPts = av_rescale_q(anchor, {1, 1000}, refStream->time_base);
+        av_seek_frame(m_prerollFmtCtx, refStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
+        avformat_flush(m_prerollFmtCtx);
+        m_prerollStagingCache->clear();
+        m_stagingNewestRefPtsMs = INT64_MIN;
+    }
+
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* vf = av_frame_alloc();
+    if (!pkt || !vf) {
+        if (pkt) av_packet_free(&pkt);
+        if (vf) av_frame_free(&vf);
+        return;
+    }
+
+    const int64_t coverTo = target + kStagingSpanMs;
+    int packets = 0;
+    while (packets++ < kPrerollPacketsPerTick) {
+        int ret = av_read_frame(m_prerollFmtCtx, pkt);
+        if (ret < 0) {
+            // EOF / short clip: take whatever we staged as "covering" so the cut
+            // can still fire (it will land on the largest pts<=target available).
+            m_stagingCovers.store(true);
+            av_packet_unref(pkt);
+            break;
+        }
+
+        // Decode video packets into the staging cache (mirror decodePacketIntoBank's
+        // video insert path, but into m_prerollStagingCache; no FrameIndex append,
+        // no per-track buffer, no live cache touch).
+        for (auto* track : m_prerollBank) {
+            if (pkt->stream_index != track->streamIndex) continue;
+            if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
+                while (avcodec_receive_frame(track->codecCtx, vf) == 0) {
+                    int64_t framePts = vf->pts;
+                    if (framePts == AV_NOPTS_VALUE) framePts = vf->best_effort_timestamp;
+                    int64_t framePtsMs;
+                    if (framePts != AV_NOPTS_VALUE) {
+                        framePtsMs = av_rescale_q(
+                            framePts, m_prerollFmtCtx->streams[track->streamIndex]->time_base,
+                            {1, 1000});
+                    } else {
+                        framePtsMs = target;
+                    }
+                    MediaVideoFrame mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
+                    mediaFrame.ptsMs = framePtsMs;
+                    if (mediaFrame.isValid()) {
+                        m_prerollStagingCache->insertVideoFrame(mediaFrame);
+                        if (track->streamIndex == primaryStreamIndex)
+                            m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
+                    }
+                    av_frame_unref(vf);
+                }
+            }
+            break;
+        }
+        av_packet_unref(pkt);
+
+        if (m_stagingNewestRefPtsMs >= coverTo) {
+            m_stagingCovers.store(true);
+            break;
+        }
+    }
+
+    av_frame_free(&vf);
+    av_packet_free(&pkt);
+
+    // Schedule the cut the moment staging first covers the target window.
+    if (m_stagingCovers.load() && m_scheduledCutFrame.load() < 0) {
+        const qint64 lead = CutSchedule::framesForLeadMs(kCutLeadMs, fps());
+        const qint64 nextIdx =
+            m_outputRuntime ? m_outputRuntime->dispatcherNextOutputFrameIndex() : 0;
+        scheduleCutAtFrame(CutSchedule::outputFrameForCut(nextIdx, static_cast<int>(lead)),
+                           m_armedTargetMs.load());
+    }
+}
+
+// Store the atomic schedule (output frame index + target ms). Worker thread.
+void PlaybackWorker::scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs) {
+    m_scheduledCutTargetMs.store(targetMs);
+    m_scheduledCutFrame.store(outputFrameIndex);
+}
+
+// Fire the scheduled cut iff the dispatcher's next index has reached it. Called
+// from makeOutputSnapshot on the OUTPUT thread, which already holds m_bufferMutex
+// (the caller MUST hold it). dispatcherNextIndex was read by the caller BEFORE
+// locking m_bufferMutex (see makeOutputSnapshot) so this never locks the output
+// runtime's m_mutex while holding m_bufferMutex.
+//
+// LOCK ORDER (held: m_bufferMutex):
+//   m_transport->fps()/seek() lock the transport's OWN mutex and release it
+//   before emitting posChanged (transport.cpp); posChanged is a QUEUED cross-
+//   thread signal to UIManager/controlServer (different threads) so no connected
+//   slot runs synchronously here and none re-enters m_bufferMutex. Lock order is
+//   therefore strictly m_bufferMutex -> transport::m_mutex, and no path takes
+//   transport::m_mutex then m_bufferMutex. No inversion.
+void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
+    const qint64 scheduled = m_scheduledCutFrame.load();
+    if (scheduled < 0) return; // nothing scheduled — unarmed path unchanged
+    if (!CutSchedule::shouldFireAt(dispatcherNextIndex, scheduled)) return;
+    if (!m_prerollStagingCache) return;
+
+    const int64_t target = m_scheduledCutTargetMs.load();
+    // Atomic promotion: a single pointer swap of the published double-buffer.
+    std::swap(m_outputCache, m_prerollStagingCache);
+    publishOutputCacheLocked();
+    // Re-base the playhead to the (overshoot-adjusted) target WITHOUT bumping
+    // m_seekGeneration: m_transport->seek does not touch the worker's seek
+    // token, so committedGen stays == seekGen and makeOutputSnapshot exposes the
+    // LIVE transport playhead (now == target) against the freshly-published
+    // target-covering cache — zero placeholder, zero reposition, no repositionTo.
+    if (m_transport) {
+        m_transport->seek(
+            CutSchedule::playheadAfterCut(target, dispatcherNextIndex, scheduled, fps()));
+    }
+    m_stagingCovers.store(false);
+    m_cutArmed.store(false);
+    m_scheduledCutFrame.store(-1);
+    fprintf(stderr, "ARMEDCUT fired: nextIdx=%lld scheduled=%lld target=%lldms\n",
+            (long long) dispatcherNextIndex, (long long) scheduled, (long long) target);
+}
+
 void PlaybackWorker::run() {
     qDebug() << "Opening file: " << m_currentFilePath;
 
@@ -1087,6 +1380,12 @@ void PlaybackWorker::run() {
         }
     }
     initializeOutputGraph(m_decoderBank.size(), outputWidth, outputHeight);
+
+    // Tier3: open the SECOND (pre-roll) AVFormatContext on the same clip now
+    // that the primary bank + output graph are up. On failure the armed-cut
+    // feature is silently disabled (armNextCut becomes a no-op).
+    if (!openPrerollContext())
+        qWarning() << "PlaybackWorker: pre-roll context unavailable — armed cut disabled";
 
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
@@ -1371,6 +1670,12 @@ void PlaybackWorker::run() {
             }
         }
 
+        // --- Tier3 armed cut: bounded pre-roll fill into the staging cache ----
+        // Worker-private; never starves the primary tick (kPrerollPacketsPerTick
+        // per pass). Stops once staging covers the armed window (m_stagingCovers),
+        // at which point the cut is scheduled and fires on the output thread.
+        if (m_cutArmed.load() && !m_stagingCovers.load()) fillStaging();
+
         // --- EOF / live-growth handling (§6.8) ---
         if (hitEof) {
             msleep(kEofSleepMs);
@@ -1444,6 +1749,23 @@ void PlaybackWorker::run() {
     av_frame_free(&audioFrame);
     clearDecoders();
     if (m_fmtCtx) avformat_close_input(&m_fmtCtx);
+
+    // Tier3: free pre-roll resources (worker-thread-owned).
+    for (auto* track : m_prerollBank) {
+        if (track->codecCtx) avcodec_free_context(&track->codecCtx);
+        delete track;
+    }
+    m_prerollBank.clear();
+    for (auto* aTrack : m_prerollAudioBank) {
+        if (aTrack->codecCtx) avcodec_free_context(&aTrack->codecCtx);
+        delete aTrack;
+    }
+    m_prerollAudioBank.clear();
+    if (m_prerollFmtCtx) avformat_close_input(&m_prerollFmtCtx);
+    m_prerollStagingCache.reset();
+    m_cutArmed.store(false);
+    m_scheduledCutFrame.store(-1);
+    m_stagingCovers.store(false);
 }
 
 void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {

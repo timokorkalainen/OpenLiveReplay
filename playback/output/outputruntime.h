@@ -35,6 +35,13 @@ public:
     OutputDispatchStats dispatchDueTicksForTest(qint64 wallNowMs);
     OutputDispatchStats dispatchDueTicksForTestNs(qint64 wallNowNs);
     OutputDispatchStats stats() const;
+    // Tier3 atomic cut: the next output frame index the dispatcher will emit,
+    // read under m_mutex (the same lock that guards m_dispatcher's mutation in
+    // dispatchTick/resetFrameIndex). SAFE to call from makeOutputSnapshot: that
+    // provider is invoked by OutputRuntime::snapshot() OUTSIDE m_mutex (see
+    // dispatchDueTicksNs — snapshot() runs between the two locked scopes), so
+    // this getter does NOT re-enter m_mutex.
+    qint64 dispatcherNextOutputFrameIndex() const;
 
 protected:
     void run() override;

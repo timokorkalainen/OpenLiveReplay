@@ -70,6 +70,14 @@ public:
 
     void openFile(const QString& filePath);
     void seekTo(int64_t timestampMs);
+    // Tier3 frame-perfect ARMED CUT: arm a scheduled atomic cut to targetMs.
+    // UI-thread-safe (atomic stores only, never blocks). The worker pre-rolls
+    // [target, target+kStagingSpanMs] into a private staging cache on a SECOND
+    // AVFormatContext while the primary keeps playing, then promotes staging ->
+    // active at a scheduled output frame (makeOutputSnapshot) with zero gray and
+    // zero reposition. v1 is single-clip (ms-only; same currently-open file). If
+    // the pre-roll context failed to open, this is a no-op (feature unavailable).
+    void armNextCut(int64_t targetMs);
     // Direction-aware delivery (spec §5): forward delivers iff pts moved up,
     // reverse iff pts moved down (dir = +1 / -1).
     void deliverDueFrames(int64_t P, int dir);
@@ -104,6 +112,11 @@ private:
     static constexpr int kBackJumpSlackMs = 150;   // P below buffered span by this ⇒ reposition
     static constexpr int kGlobalFrameBudget = 256; // aggregate decoded-frame cap (memory)
     static constexpr double kDecimateAbove = 1.5;  // |speed| above which decimation engages
+
+    // --- Tier3 pre-roll / armed-cut constants -----------------------------
+    static constexpr int kStagingSpanMs = 800;       // window staged ahead of target
+    static constexpr int kPrerollPacketsPerTick = 8; // bounded per run() iter (no starve)
+    static constexpr int kCutLeadMs = 120;           // lead before the cut fires (output frames)
 
     // High-performance conversion from FFmpeg AVFrame to backend YUV420P media frames.
     MediaVideoFrame convertToMediaVideoFrame(AVFrame* frame, int feedIndex);
@@ -143,6 +156,25 @@ private:
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();
+
+    // --- Tier3 pre-roll / armed-cut (worker-thread internals) -------------
+    // Open a SECOND independent AVFormatContext on the same clip + its own
+    // decoder bank, writing the preroll members. Returns false on failure
+    // (pre-roll silently disabled; armNextCut becomes a no-op). Called once in
+    // run() after the primary bank + output graph are up.
+    bool openPrerollContext();
+    // Bounded incremental pre-roll into m_prerollStagingCache (worker-private;
+    // NOT published until the cut swap, so no lock during fill). On first call
+    // after arm it av_seek_frame's the preroll context BACKWARD to the trail
+    // anchor, then decodes forward until the staging cache covers
+    // [target, target+kStagingSpanMs]; schedules the cut once covered.
+    void fillStaging();
+    // Store the atomic schedule (output frame index + target ms).
+    void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
+    // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
+    // staging -> active, republishes, re-bases the transport playhead. MUST be
+    // called holding m_bufferMutex (invoked from makeOutputSnapshot).
+    void maybeFireScheduledCut(qint64 dispatcherNextIndex);
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
@@ -201,6 +233,33 @@ private:
     // here, then merges into the live cache and trims old frames only after
     // coverage (double-buffer; never published to the output thread).
     std::unique_ptr<OutputFrameCache> m_stagingCache;
+
+    // --- Tier3 pre-roll / armed-cut state (worker-thread-only unless noted) ---
+    // A SECOND independent AVFormatContext + decoder bank on the SAME clip; the
+    // primary keeps playing while this pre-rolls the armed target window into a
+    // private staging cache. Opened once in run() after the primary bank is up;
+    // freed in run() cleanup. If the open fails, the pre-roll is disabled and
+    // armNextCut becomes a no-op (the feature is silently unavailable).
+    AVFormatContext* m_prerollFmtCtx = nullptr;     // mirrors m_fmtCtx
+    QVector<DecoderTrack*> m_prerollBank;           // mirrors m_decoderBank
+    QVector<AudioDecoderTrack*> m_prerollAudioBank; // mirrors m_audioDecoderBank
+    // Pre-roll target window, sized identically to m_outputCache. Worker-private
+    // during the fill (never published) — swapped into m_outputCache at the cut.
+    std::unique_ptr<OutputFrameCache> m_prerollStagingCache;
+    // Armed-cut control. Set by armNextCut (UI thread, atomic stores only).
+    std::atomic<int64_t> m_armedTargetMs{-1};
+    std::atomic<bool> m_cutArmed{false};
+    std::atomic<bool> m_prerollSeekPending{false};
+    // True once the staging cache covers [target, target+span]. Atomic because
+    // armNextCut clears it from the UI thread while the worker reads/writes it.
+    std::atomic<bool> m_stagingCovers{false};
+    // Newest video PTS (ms) currently staged for the reference feed (feed 0),
+    // tracked during fillStaging since OutputFrameCache has no newest accessor.
+    int64_t m_stagingNewestRefPtsMs = INT64_MIN;
+    // Scheduled cut: the output frame index to fire at + the target ms. Read in
+    // maybeFireScheduledCut (under m_bufferMutex); written by scheduleCutAtFrame.
+    std::atomic<qint64> m_scheduledCutFrame{-1};
+    std::atomic<int64_t> m_scheduledCutTargetMs{-1};
     // Immutable snapshot of m_outputCache published to the output thread
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;
