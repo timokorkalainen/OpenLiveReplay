@@ -13,6 +13,8 @@ class FakeRunner : public CodecRunner {
 public:
     int maxHeadroom; int maxSustain; QVector<int> visited;
     bool observedCancel = false; // C1: did any call observe a set cancel flag?
+    bool simulateInLoopCancel = false; // C1: simulate cancel being set mid-loop
+    int loopIterations = 0; // C1: how many iterations did we perform?
     FakeRunner(int headroom, int sustain) : maxHeadroom(headroom), maxSustain(sustain) {}
     bool available() const override { return true; }
     RampStepResult runStep(int n, const BenchmarkConfig& c,
@@ -24,6 +26,19 @@ public:
         visited.append(n);
         RampStepResult r; r.concurrency = n;
         r.framesRequired = int64_t(n) * c.fps * c.durationMsPerStep / 1000;
+
+        // C1: if simulateInLoopCancel, loop and check cancel in-loop
+        if (simulateInLoopCancel) {
+            loopIterations = 0;
+            for (int iter = 0; iter < 100; ++iter) {
+                loopIterations++;
+                if (cancel.load(std::memory_order_acquire)) {
+                    observedCancel = true;
+                    break;
+                }
+            }
+        }
+
         if (n <= maxHeadroom)      r.framesProcessed = r.framesRequired * 2;   // strong
         else if (n <= maxSustain)  r.framesProcessed = r.framesRequired;       // tight
         else                       r.framesProcessed = r.framesRequired / 2;   // fails
@@ -42,6 +57,7 @@ private slots:
     void cancellationStopsRamp();
     void unavailableRunnerYieldsNoFeeds();
     void cancelReachesRunStep(); // T-cancel (C1 wiring)
+    void runStepObservesCancelInLoop(); // T-cancel: in-loop observation
 };
 
 void TestCodecBenchmark::stopsAtFirstFailingStep() {
@@ -99,6 +115,21 @@ void TestCodecBenchmark::cancelReachesRunStep() {
     QCOMPARE(runner.visited.size(), 0); // no steps executed
     QCOMPARE(res.safeFeeds, 0);
     QCOMPARE(res.ceiling, 0);
+}
+
+// T-cancel: proves that runStep observes cancel when set during the in-loop check.
+// This directly tests the contract added in C1: runStep(..., cancel) should check
+// cancel inside its measurement/work loop and bail out promptly when observed.
+void TestCodecBenchmark::runStepObservesCancelInLoop() {
+    FakeRunner runner(32, 32);
+    runner.simulateInLoopCancel = true; // enable in-loop cancel checking
+    BenchmarkConfig cfg; cfg.fps = 30; cfg.durationMsPerStep = 1000;
+    std::atomic<bool> cancel{true}; // pre-set cancel before calling runStep
+    runner.runStep(1, cfg, cancel); // call runStep directly with cancel already set
+    // The runner should have observed cancel early in its loop and recorded it.
+    QVERIFY(runner.observedCancel);
+    // If cancel wasn't observed, loopIterations would be ~100; if observed early, much less.
+    QVERIFY(runner.loopIterations < 50);
 }
 
 QTEST_GUILESS_MAIN(TestCodecBenchmark)

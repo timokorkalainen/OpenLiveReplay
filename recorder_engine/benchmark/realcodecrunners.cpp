@@ -226,9 +226,23 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
 
     std::vector<std::thread> threads;
     threads.reserve(concurrency);
-    for (int i = 0; i < concurrency; ++i)
-        threads.emplace_back(threadFn, i);
-    for (auto& t : threads) t.join();
+    try {
+        for (int i = 0; i < concurrency; ++i)
+            threads.emplace_back(threadFn, i);
+        for (auto& t : threads) t.join();
+    } catch (...) {
+        // I1 Fix 1: if std::thread spawn or join throws (resource exhaustion),
+        // join any successfully-started threads to avoid leaks, then mark step as failed.
+        for (auto& t : threads) {
+            if (t.joinable()) t.join();
+        }
+        RampStepResult r;
+        r.concurrency = concurrency;
+        r.framesRequired = framesRequired;
+        r.startupFailed = true;
+        r.budgetMet = false;
+        return r;
+    }
 
     return aggregate(concurrency, framesRequired, results);
 }
@@ -372,9 +386,23 @@ RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& 
 
     std::vector<std::thread> threads;
     threads.reserve(concurrency);
-    for (int i = 0; i < concurrency; ++i)
-        threads.emplace_back(threadFn, i);
-    for (auto& t : threads) t.join();
+    try {
+        for (int i = 0; i < concurrency; ++i)
+            threads.emplace_back(threadFn, i);
+        for (auto& t : threads) t.join();
+    } catch (...) {
+        // I1 Fix 1: if std::thread spawn or join throws (resource exhaustion),
+        // join any successfully-started threads to avoid leaks, then mark step as failed.
+        for (auto& t : threads) {
+            if (t.joinable()) t.join();
+        }
+        RampStepResult r;
+        r.concurrency = concurrency;
+        r.framesRequired = framesRequired;
+        r.startupFailed = true;
+        r.budgetMet = false;
+        return r;
+    }
 
     return aggregate(concurrency, framesRequired, results);
 }
