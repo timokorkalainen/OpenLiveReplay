@@ -77,7 +77,8 @@ QByteArray avccToAnnexB(const QByteArray& data)
 // ---------------------------------------------------------------------------
 RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig& cfg)
 {
-    const int framesRequired = concurrency * cfg.fps * cfg.durationMsPerStep / 1000;
+    const int framesRequired = static_cast<int>(
+        static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000);
     const double budgetMs    = 1000.0 / cfg.fps;
 
     std::vector<ThreadResult> results(concurrency);
@@ -127,6 +128,8 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
                 if (avcodec_send_frame(encCtx, wf) == 0) {
                     av_frame_free(&wf);
                     if (avcodec_receive_packet(encCtx, pkt) == 0) {
+                        pkt->pts = AV_NOPTS_VALUE;
+                        pkt->dts = AV_NOPTS_VALUE;
                         if (avcodec_send_packet(decCtx, pkt) == 0) {
                             while (avcodec_receive_frame(decCtx, decFrm) == 0)
                                 av_frame_unref(decFrm);
@@ -167,6 +170,8 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
             decTimer.start();
 
             bool decOk = false;
+            pkt->pts = AV_NOPTS_VALUE;
+            pkt->dts = AV_NOPTS_VALUE;
             if (avcodec_send_packet(decCtx, pkt) == 0) {
                 // Drain all output frames — MPEG-2 may buffer one frame.
                 while (avcodec_receive_frame(decCtx, decFrm) == 0) {
@@ -212,7 +217,8 @@ bool H264CodecRunner::available() const
 
 RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& cfg)
 {
-    const int framesRequired = concurrency * cfg.fps * cfg.durationMsPerStep / 1000;
+    const int framesRequired = static_cast<int>(
+        static_cast<int64_t>(concurrency) * cfg.fps * cfg.durationMsPerStep / 1000);
     const double budgetMs    = 1000.0 / cfg.fps;
 
     std::vector<ThreadResult> results(concurrency);
