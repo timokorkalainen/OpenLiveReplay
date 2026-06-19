@@ -317,6 +317,24 @@ endfunction()
 if(APPLE)
     olr_add_native_srt_e2e_tests("native-apple-ingest")
 
+    # --- Delivery push-gate cells (RTMP/SRT x h264/h265) ---------------------
+    # Re-tag the SRT h264 smoke with the delivery-gate label (the function above
+    # set it to "native-apple-ingest"; LABELS is replaced, not appended, so list
+    # both). TIMEOUT/RUN_SERIAL set by the function are untouched.
+    set_tests_properties(e2e_native_srt_smoke PROPERTIES
+        LABELS "native-apple-ingest;delivery-gate")
+
+    # SRT HEVC (h265) cell on macOS. run_srt_hevc_smoke.sh already exists and is
+    # cross-platform (auto-selects libx265 / hevc_videotoolbox); only Windows had
+    # registered it. Port 23740 sits in the gap between the SRT native band
+    # (<=23730) and the RTMP band (>=23760).
+    add_test(NAME e2e_native_srt_hevc_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23740)
+    set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
+        LABELS "native-apple-ingest;delivery-gate"
+        TIMEOUT 180
+        RUN_SERIAL TRUE)
+
     # Phase 2c-a: mid-recording disconnect/reconnect survival on the NATIVE SRT
     # ingest. Kill a victim bridge mid-record, restart it, and prove the victim
     # reconnects + resumes real content WHILE the control source stays fully
@@ -456,12 +474,12 @@ if(APPLE)
     add_test(NAME e2e_native_rtmp_ui_stats
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_ui_stats.sh" "$<TARGET_FILE:sync_harness>" 23800)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
-        LABELS "native-rtmp"
+        LABELS "native-rtmp;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
     set_tests_properties(e2e_native_rtmp_hevc_smoke PROPERTIES
-        LABELS "native-rtmp"
+        LABELS "native-rtmp;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)

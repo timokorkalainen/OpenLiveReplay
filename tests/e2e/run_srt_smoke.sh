@@ -13,7 +13,7 @@ set -uo pipefail
 HARNESS="${1:?record_harness executable path required}"
 SRT_PORT="${2:-23501}"
 UDP_PORT=$((SRT_PORT + 1))
-SECONDS_TO_RECORD=6
+SECONDS_TO_RECORD="${OLR_E2E_CLIP_SECONDS:-6}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # shellcheck source=tool_env.sh

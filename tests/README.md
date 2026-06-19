@@ -29,6 +29,33 @@ Local transport bring-up gates use distinct labels such as `srt`,
 `native-apple-ingest`, `native-ndi`, and `native-rtmp`; they are excluded from
 CI until their matching native ingest path is ready.
 
+### Delivery push gate (always-on)
+
+`git push` runs a blocking pre-push gate (`.githooks/pre-push`): it builds the
+current-platform host and runs the `delivery-gate` CTest label — the four
+transport×codec delivery smokes with 5-second clips:
+
+| | h264 | h265 |
+| --- | --- | --- |
+| **RTMP** | `e2e_native_rtmp_smoke` | `e2e_native_rtmp_hevc_smoke` |
+| **SRT**  | `e2e_native_srt_smoke`  | `e2e_native_srt_hevc_smoke` |
+
+Run the matrix on demand with:
+
+```bash
+OLR_E2E_CLIP_SECONDS=5 ctest --test-dir build -L delivery-gate --output-on-failure
+```
+
+The gate **hard-fails the push** (it does not silently skip) if any required
+tooling is missing: `ffmpeg`, `ffprobe`, `srt-live-transmit`, a Python 3, an
+H.264 encoder (`libx264`/`h264_mf`) and an HEVC encoder (`libx265`/`hevc_*`) in
+ffmpeg, and the Qt host kit at `$QT_HOST_PREFIX`. On macOS: `brew install ffmpeg srt`.
+
+Tunables / bypass:
+- `OLR_E2E_CLIP_SECONDS` — clip length for the matrix (gate default `5`).
+- `OLR_PREPUSH_SKIP=1 git push` — bypass the gate (so does `git push --no-verify`).
+- `OLR_PREPUSH_FULL=1 git push` — also run the full local CTest matrix + iOS build.
+
 The `ndi-runtime` label is a real NDI sender/receiver smoke test. It loads the
 NDI runtime dynamically, routes cache-backed app output frames through
 `OutputDispatcher` into the app's `NdiOutputSink`, discovers the local sender,

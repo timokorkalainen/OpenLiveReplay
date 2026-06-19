@@ -1,46 +1,127 @@
 #!/usr/bin/env bash
-# Pre-push hook: by default this only PRINTS A RECOMMENDATION and always allows
-# the push. The full local CTest matrix and the iOS cross-build are NOT forced.
+# Pre-push hook: an ALWAYS-ON blocking delivery gate. Every push builds the
+# current-platform host (engine + app + test harnesses) and runs the
+# "delivery-gate" CTest matrix -- the transport x codec delivery smokes
+# (RTMP/SRT x h264/h265) with short clips. A build or matrix failure blocks the
+# push.
 #
-# GitHub PR CI runs only the short "ci" CTest label, and does not build iOS: the
-# FFmpeg+SRT+OpenSSL from-source build (~20 min) OOM-kills hosted runners. So the
-# expensive e2e matrix and the iOS build are worth running locally before you
-# push something risky -- but that's your call, not a gate. The FFmpeg
-# xcframeworks are cached in ios_build/xcframeworks, so only the first iOS build
-# is slow; later builds just rebuild the app.
+# The gate HARD-FAILS the push if required local tooling is missing (it does NOT
+# silently skip): ffmpeg, ffprobe, srt-live-transmit, a Python 3, an H.264 and an
+# HEVC encoder in ffmpeg, and the Qt host kit. Install on macOS with:
+#   brew install ffmpeg srt
 #
-# Recommended before pushing risky changes (run manually):
-#   cmake -S . -B build/prepush-tests -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-#       -DCMAKE_PREFIX_PATH="$HOME/Qt/6.10.1/macos" -DOLR_BUILD_TESTS=ON
-#   cmake --build build/prepush-tests
-#   ctest --test-dir build/prepush-tests --output-on-failure \
-#       --repeat until-pass:2 -LE 'sync-report|srt|native-apple-ingest'
-#   # ...then cross-build the iOS target (see tests/README.md).
+# GitHub PR CI runs only the short "ci" CTest label and does not build iOS or run
+# these transport e2e gates (the from-source FFmpeg/SRT build OOM-kills hosted
+# runners), so the delivery matrix is gated locally here instead.
+#
+# Triggers:
+#   git push                 -> build host + delivery matrix (BLOCKING default)
+#   OLR_PREPUSH_SKIP=1 push  -> skip the gate entirely (git push --no-verify too)
+#   OLR_PREPUSH_FULL=1 push  -> ALSO run the full local CTest matrix + iOS build
+#                               (skip parts: SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
+#
+# Tunables:
+#   OLR_E2E_CLIP_SECONDS  (default 5)               delivery-matrix clip length
+#   QT_HOST_PREFIX        (default ~/Qt/6.10.1/macos)
+#   QT_IOS_PREFIX         (default ~/Qt/6.10.1/ios)  used only by OLR_PREPUSH_FULL
 #
 # Enable the hook once per clone:  git config core.hooksPath .githooks
-# Opt in to run the full gate + iOS build as a BLOCKING check on this push:
-#                                  OLR_PREPUSH_FULL=1 git push
-# Within OLR_PREPUSH_FULL, skip a part:  SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
-if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
-    cat >&2 <<'EOF'
-[pre-push] Recommendation only (not a gate): PR CI runs just the short "ci"
-[pre-push] CTest label and does not build iOS. Before pushing risky changes,
-[pre-push] consider running the full local CTest matrix + iOS cross-build --
-[pre-push] see the commands in this hook's header or tests/README.md, or run a
-[pre-push] one-off blocking check with:  OLR_PREPUSH_FULL=1 git push
-[pre-push] Push proceeding.
-EOF
+if [ "${OLR_PREPUSH_SKIP:-0}" = "1" ]; then
+    echo "[pre-push] OLR_PREPUSH_SKIP=1 - skipping the delivery gate. Push proceeding." >&2
     exit 0
 fi
 
-echo "[pre-push] OLR_PREPUSH_FULL=1 - running full local gate + iOS build as a blocking check."
-
 QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/6.10.1/macos}}"
+CLIP_SECONDS="${OLR_E2E_CLIP_SECONDS:-5}"
+DELIVERY_BUILD_DIR="${OLR_PREPUSH_DELIVERY_BUILD_DIR:-build/prepush-delivery}"
+
+# --- 1. Preflight: hard-fail (block the push) if delivery tooling is missing ---
+preflight_fail=0
+note_missing() { echo "[pre-push] MISSING: $1" >&2; preflight_fail=1; }
+
+for tool in ffmpeg ffprobe srt-live-transmit; do
+    command -v "$tool" >/dev/null 2>&1 || note_missing "$tool not found on PATH"
+done
+
+# Python 3 SPECIFICALLY (mirror rtmp_lib.sh:rtmp_find_python3) -- a Python-2-only
+# `python`/`py` would pass a bare presence check but make the RTMP cells SKIP.
+have_python3() {
+    local c
+    for c in python3 python; do
+        command -v "$c" >/dev/null 2>&1 \
+            && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 \
+            && return 0
+    done
+    command -v py >/dev/null 2>&1 \
+        && py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 \
+        && return 0
+    return 1
+}
+have_python3 || note_missing "Python 3 not found (needed by the RTMP fixture server)"
+
+# Encoder checks need ffmpeg itself; skipped (ffmpeg already flagged above) if absent.
+if command -v ffmpeg >/dev/null 2>&1; then
+    ENCODERS="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+    # H.264: the scripts accept only libx264 or h264_mf (see olr_h264_vcodec_args).
+    if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx264|h264_mf)[[:space:]]'; then
+        note_missing "no usable H.264 encoder (need libx264 or h264_mf) in ffmpeg"
+    fi
+    # HEVC: run_rtmp_hevc_smoke.sh only tries hevc_videotoolbox then libx265, so
+    # the gate's binding set is the tighter {hevc_videotoolbox, libx265} (the
+    # SRT-HEVC cell accepts a superset). Require the tighter set so a preflight
+    # pass guarantees BOTH HEVC cells run rather than skip-as-pass.
+    if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx265|hevc_videotoolbox)[[:space:]]'; then
+        note_missing "no usable HEVC encoder (need libx265 or hevc_videotoolbox) in ffmpeg"
+    fi
+fi
+
+[ -d "$QT_HOST_PREFIX" ] || note_missing "Qt host kit not found at $QT_HOST_PREFIX"
+
+if [ "$preflight_fail" -ne 0 ]; then
+    cat >&2 <<EOF
+[pre-push] Delivery gate cannot run -- required tooling is missing (see above).
+[pre-push]   macOS install:  brew install ffmpeg srt
+[pre-push]   Qt host kit:    set QT_HOST_PREFIX (currently $QT_HOST_PREFIX)
+[pre-push] Emergency bypass: OLR_PREPUSH_SKIP=1 git push   (or git push --no-verify)
+EOF
+    exit 1
+fi
+
+# --- 2. Build the current-platform host (engine + app + test harnesses) -------
+echo "[pre-push] Building current-platform host in ${DELIVERY_BUILD_DIR}..."
+cmake -S . -B "$DELIVERY_BUILD_DIR" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
+    -DOLR_BUILD_TESTS=ON >/dev/null
+cmake --build "$DELIVERY_BUILD_DIR"
+
+# --- 3. Sanity: the delivery-gate label must resolve to exactly 4 cells --------
+EXPECTED_CELLS=4
+ACTUAL_CELLS="$(ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate -N \
+    | awk '/Total Tests:/ {print $NF}')"
+if [ "${ACTUAL_CELLS:-0}" -ne "$EXPECTED_CELLS" ]; then
+    echo "[pre-push] Delivery gate misconfigured: expected ${EXPECTED_CELLS} cells, found ${ACTUAL_CELLS:-0}." >&2
+    exit 1
+fi
+
+# --- 4. Run the delivery matrix (RTMP/SRT x h264/h265) as a BLOCKING gate ------
+echo "[pre-push] Running delivery matrix (clip=${CLIP_SECONDS}s) -- RTMP/SRT x h264/h265..."
+OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
+    ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate \
+        --output-on-failure --repeat until-pass:2 --no-tests=error
+echo "[pre-push] Delivery matrix OK."
+
+# --- 5. Optional heavier gate: full local CTest matrix + iOS build -------------
+if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
+    exit 0
+fi
+
+echo "[pre-push] OLR_PREPUSH_FULL=1 - running full local CTest matrix + iOS build."
 
 if [ "${SKIP_FULL_TESTS:-0}" = "1" ]; then
     echo "[pre-push] SKIP_FULL_TESTS=1 - skipping full local CTest gate."
