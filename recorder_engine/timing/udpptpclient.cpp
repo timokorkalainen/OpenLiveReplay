@@ -27,10 +27,23 @@ constexpr int kHeaderLen = 34;
 constexpr int kTimestampLen = 10;
 constexpr int kMinMessageLen = kHeaderLen + kTimestampLen;
 
+// Upper bound on a plausible PTP seconds field. The seconds field is a 48-bit
+// attacker-controlled value (any LAN host can send a crafted Sync/Follow_Up/
+// Delay_Resp), so an all-0xFF timestamp yields seconds ~= 2.8e14 and the naive
+// `seconds * 1e9` overflows int64 (UBSan: signed-integer-overflow). 9e9 s is
+// ~year 2255 — comfortably past any real session — and 9e9 * 1e9 = 9e18 stays
+// below INT64_MAX (~9.22e18), so anything below this bound multiplies safely.
+constexpr int64_t kMaxPlausibleSeconds = 9'000'000'000LL;
+constexpr int64_t kNanosPerSecond = 1'000'000'000LL;
+
 // Parse the 10-byte PTP timestamp at the given offset into absolute nanoseconds
-// (PTP epoch). Returns false if the buffer is too short.
+// (PTP epoch). Returns false if the buffer is too short OR the field is
+// implausible/malformed — seconds beyond a sane PTP range or nanos >= 1e9 — so a
+// wire-crafted timestamp is REJECTED before the multiply (no signed overflow) and
+// never reaches the servo (the caller leaves haveT1/haveDelayResp false, so no
+// exchange completes).
 bool parsePtpTimestampNs(const QByteArray& d, int offset, int64_t* outNs) {
-    if (offset + kTimestampLen > d.size()) {
+    if (offset < 0 || offset + kTimestampLen > d.size()) {
         return false;
     }
     const auto* p = reinterpret_cast<const quint8*>(d.constData()) + offset;
@@ -42,7 +55,13 @@ bool parsePtpTimestampNs(const QByteArray& d, int offset, int64_t* outNs) {
     for (int i = 6; i < 10; ++i) {
         nanos = (nanos << 8) | p[i];
     }
-    *outNs = seconds * 1'000'000'000LL + nanos;
+    // Bounds-check BEFORE the multiply: a valid PTP nanoseconds field is < 1e9, and
+    // a plausible seconds value is < kMaxPlausibleSeconds. Reject otherwise so the
+    // int64 multiply below can never overflow.
+    if (seconds > kMaxPlausibleSeconds || nanos >= kNanosPerSecond) {
+        return false;
+    }
+    *outNs = seconds * kNanosPerSecond + nanos;
     return true;
 }
 
@@ -67,6 +86,11 @@ struct UdpPtpClient::Impl {
     // between threads beyond this const-after-construction value).
     std::chrono::steady_clock::time_point origin = std::chrono::steady_clock::now();
 
+    // Set once the sockets have been created/bound/joined on the discipline thread
+    // (lazily, on the first nextExchange()). The sockets live wholly on that thread:
+    // start() on the caller thread only stores config, never touches a QUdpSocket.
+    bool socketsReady = false;
+
     // In-flight exchange assembly (only touched on the discipline thread inside
     // nextExchange(), never from localMonotonicNs()).
     int64_t pendingT1 = 0;          // master Sync egress (from Sync one-step or Follow_Up)
@@ -90,6 +114,13 @@ bool UdpPtpClient::start(const QString& domainOrIface) {
         return true;
     }
 
+    // THREAD AFFINITY: start() runs on the CALLER thread (ReplayManager), but every
+    // socket op (bind/join/read/write) must run on the DISCIPLINE thread, since Qt
+    // sockets are not thread-safe and carry thread affinity. So start() ONLY records
+    // config + marks started; the sockets are created lazily in nextExchange() on
+    // the discipline thread (ensureSockets()). bind/join failure stays non-fatal
+    // (degrade to local fallback), so start() still reports true as before.
+    //
     // domainOrIface may name a local interface (by address or name) to join the
     // multicast on; a bare domain number (e.g. "0") means "any interface".
     if (!domainOrIface.isEmpty()) {
@@ -104,6 +135,18 @@ bool UdpPtpClient::start(const QString& domainOrIface) {
         }
     }
 
+    m_d->started = true;
+    return m_d->started;
+}
+
+void UdpPtpClient::ensureSockets() {
+    // Runs on the discipline thread (first nextExchange()). Create+bind+join here so
+    // the sockets are created, used, and destroyed all on one thread.
+    if (m_d->socketsReady) {
+        return;
+    }
+    m_d->socketsReady = true; // attempt once; a bind/join failure degrades, never retries
+
     m_d->eventSocket = new QUdpSocket();
     m_d->generalSocket = new QUdpSocket();
 
@@ -114,31 +157,26 @@ bool UdpPtpClient::start(const QString& domainOrIface) {
     const bool generalBound =
         m_d->generalSocket->bind(QHostAddress::AnyIPv4, kGeneralPort, bindOpts);
 
-    bool joinedEvent = false;
-    bool joinedGeneral = false;
     if (eventBound) {
-        joinedEvent = m_d->joinInterface.isValid()
-                          ? m_d->eventSocket->joinMulticastGroup(kPtpMulticast, m_d->joinInterface)
-                          : m_d->eventSocket->joinMulticastGroup(kPtpMulticast);
+        m_d->joinInterface.isValid()
+            ? m_d->eventSocket->joinMulticastGroup(kPtpMulticast, m_d->joinInterface)
+            : m_d->eventSocket->joinMulticastGroup(kPtpMulticast);
     }
     if (generalBound) {
-        joinedGeneral =
-            m_d->joinInterface.isValid()
-                ? m_d->generalSocket->joinMulticastGroup(kPtpMulticast, m_d->joinInterface)
-                : m_d->generalSocket->joinMulticastGroup(kPtpMulticast);
+        m_d->joinInterface.isValid()
+            ? m_d->generalSocket->joinMulticastGroup(kPtpMulticast, m_d->joinInterface)
+            : m_d->generalSocket->joinMulticastGroup(kPtpMulticast);
     }
-
-    // A failure to bind/join is not fatal to the process: the client simply never
-    // completes an exchange, so PtpReference stays in local fallback. We still
-    // report success when we have at least one usable receive socket so the
-    // discipline thread runs and degrades cleanly rather than the caller treating
-    // start() failure as "abort PTP entirely".
-    m_d->started = (eventBound && joinedEvent) || (generalBound && joinedGeneral) || eventBound ||
-                   generalBound;
-    return m_d->started;
+    // A failure to bind/join is not fatal: the client simply never completes an
+    // exchange, so PtpReference stays in local fallback. The sockets are kept (even
+    // unbound) so teardown is uniform; nextExchange() just never sees datagrams.
 }
 
 void UdpPtpClient::stop() {
+    // Idempotent. The sockets are owned by the discipline thread, so the normal
+    // teardown is the discipline thread calling stop() at the end of its loop (see
+    // PtpReference::disciplineLoop). The destructor also calls stop() as a safety
+    // net — a no-op when the sockets were never created (sockets stay null).
     if (m_d->eventSocket) {
         m_d->eventSocket->close();
         delete m_d->eventSocket;
@@ -149,10 +187,15 @@ void UdpPtpClient::stop() {
         delete m_d->generalSocket;
         m_d->generalSocket = nullptr;
     }
+    m_d->socketsReady = false;
     m_d->haveSync = false;
     m_d->haveT1 = false;
     m_d->delayReqSent = false;
     m_d->started = false;
+}
+
+bool UdpPtpClient::parseTimestampNsForTest(const QByteArray& d, int offset, int64_t* outNs) {
+    return parsePtpTimestampNs(d, offset, outNs);
 }
 
 int64_t UdpPtpClient::localMonotonicNs() const {
@@ -233,6 +276,10 @@ PtpExchange UdpPtpClient::nextExchange(int timeoutMs) {
     if (!m_d->started) {
         return PtpExchange{};
     }
+
+    // Create+bind+join on the discipline thread the first time through, so the
+    // sockets' entire lifecycle (create/use/destroy) stays on this thread.
+    ensureSockets();
 
     QDeadlineTimer deadline(timeoutMs);
     while (!deadline.hasExpired()) {

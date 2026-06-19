@@ -29,12 +29,17 @@ bool PtpReference::start() {
 }
 
 void PtpReference::stop() {
+    // The IPtpClient's sockets are created/used/destroyed wholly on the discipline
+    // thread (Qt sockets are not thread-safe / have thread affinity). So we DO NOT
+    // call m_client->stop() here on the caller thread: we only signal the loop to
+    // exit and join it. The loop itself calls m_client->stop() as its last act (see
+    // disciplineLoop), so by the time join() returns the sockets are already torn
+    // down on the thread that owns them. UdpPtpClient::~UdpPtpClient() still calls
+    // stop() as an idempotent safety net (a no-op once the sockets are gone, or if
+    // the loop never ran).
     m_running.store(false, std::memory_order_release);
     if (m_thread.joinable()) {
         m_thread.join();
-    }
-    if (m_client) {
-        m_client->stop();
     }
 }
 
@@ -68,6 +73,15 @@ void PtpReference::disciplineLoop() {
                 }
             }
         }
+    }
+    // Tear the client (and its sockets) down on the THREAD THAT OWNS THEM. The
+    // sockets were created lazily inside nextExchange() on this discipline thread;
+    // closing/deleting them here keeps their whole lifecycle on a single thread.
+    // stop() joins this thread, so teardown is guaranteed complete before stop()
+    // returns. stop() must NOT also call m_client->stop() (that would touch the
+    // sockets from the caller thread).
+    if (m_client) {
+        m_client->stop();
     }
 }
 

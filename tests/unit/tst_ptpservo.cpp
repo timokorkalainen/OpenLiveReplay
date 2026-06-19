@@ -30,6 +30,7 @@ private slots:
     void tracksSteadyOffset();
     void tracksStepInOffset();
     void tracksLargeStepViaReArm();
+    void recoversLargeAbsoluteOffsetWithoutOverflow();
 };
 
 void TestPtpServo::unlockedBeforeMinExchanges() {
@@ -192,6 +193,42 @@ void TestPtpServo::tracksLargeStepViaReArm() {
     }
     QVERIFY(servo.locked());
     QVERIFY(qAbs(servo.offsetNs() - O2) <= 1);
+}
+
+void TestPtpServo::recoversLargeAbsoluteOffsetWithoutOverflow() {
+    // REAL grandmaster: t1/t4 are absolute PTP ns (~1.78e18, year 2026), while
+    // t2/t3 are small local-monotonic ns. The true offset (local - master) is then
+    // ~-1.78e18. Summing minExchanges (8) of these in a naive running mean
+    // overflows int64 (8 * 1.78e18 = 1.4e19 > 9.22e18) -> the baseline-relative
+    // mean must recover the (large) offset with no signed-integer overflow (run
+    // under UBSan). masterNsFromLocal(local) must also recover absolute master time.
+    const int64_t masterBase = 1'780'000'000'000'000'000LL; // ~2026 in PTP ns
+    const int64_t localBase = 5'000'000LL;                  // small local monotonic ns
+    const int64_t D = 60'000;                               // 60 us symmetric one-way delay
+    // local = master + offsetLocalMinusMaster; here local is ~1.78e18 behind master.
+    const int64_t O = (localBase - masterBase); // local - master, a large negative
+
+    PtpServo servo(8);
+    for (int i = 0; i < 16; ++i) {
+        const int64_t t1 = masterBase + 1'000'000LL * i;            // master Sync egress (absolute)
+        const int64_t t3 = localBase + 1'000'000LL * i + 500'000LL; // local Delay_Req egress
+        // t2 = local Sync ingress = t1 + D + O ; t4 = master Delay_Resp ingress = t3 + D - O.
+        PtpExchange ex;
+        ex.t1 = t1;
+        ex.t2 = t1 + D + O; // == localBase + 1e6*i + D  (small local ns)
+        ex.t3 = t3;
+        ex.t4 = t3 + D - O; // == masterBase + 1e6*i + 500000 + D (absolute master ns)
+        ex.valid = true;
+        servo.observe(ex);
+    }
+    QVERIFY(servo.locked());
+    // The smoothed offset recovers the large absolute offset within ns-scale tolerance.
+    QVERIFY(qAbs(servo.offsetNs() - O) <= 1);
+    QVERIFY(qAbs(servo.meanPathDelayNs() - D) <= 1);
+    // masterNsFromLocal recovers absolute master time: master = local - offset.
+    const int64_t someLocal = localBase + 123'456'789LL;
+    QCOMPARE(servo.masterNsFromLocal(someLocal), someLocal - servo.offsetNs());
+    QVERIFY(qAbs((someLocal - servo.offsetNs()) - (masterBase + 123'456'789LL)) <= 1);
 }
 
 QTEST_GUILESS_MAIN(TestPtpServo)

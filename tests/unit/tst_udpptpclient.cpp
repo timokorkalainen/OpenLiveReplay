@@ -26,6 +26,9 @@ private slots:
     void degradesCleanlyWithoutGrandmaster();
     void localMonotonicSafeConcurrentlyWithNextExchange();
     void stopIsIdempotent();
+    void rejectsAllOnesTimestamp();
+    void rejectsImplausibleSecondsAndNanos();
+    void parsesValidTimestamp();
 };
 
 void TestUdpPtpClient::constructsWithoutCrashing() {
@@ -103,6 +106,59 @@ void TestUdpPtpClient::stopIsIdempotent() {
     client.stop();
     client.stop(); // double-stop is a no-op, never a crash
     QVERIFY(true);
+}
+
+void TestUdpPtpClient::rejectsAllOnesTimestamp() {
+    // A wire-crafted all-0xFF 10-byte timestamp: seconds = 2^48-1 ~= 2.8e14. The
+    // naive `seconds * 1e9` would overflow int64 (UBSan: signed-integer-overflow).
+    // The parser MUST reject it BEFORE the multiply so the garbage never reaches
+    // the servo (haveT1/haveDelayResp stay false, no exchange completes).
+    QByteArray ts(10, char(0xFF));
+    int64_t outNs = 12345; // sentinel; must be left untouched on rejection
+    QVERIFY(!UdpPtpClient::parseTimestampNsForTest(ts, 0, &outNs));
+}
+
+void TestUdpPtpClient::rejectsImplausibleSecondsAndNanos() {
+    // Seconds just past the sane PTP bound (> 9e9 s) is rejected even though it
+    // would not itself overflow — it is not a plausible PTP time.
+    {
+        QByteArray ts(10, '\0');
+        const int64_t badSeconds = 9'000'000'001LL; // > 9e9 bound
+        for (int i = 5; i >= 0; --i) {
+            ts[i] = char((badSeconds >> (8 * (5 - i))) & 0xFF);
+        }
+        int64_t outNs = 0;
+        QVERIFY(!UdpPtpClient::parseTimestampNsForTest(ts, 0, &outNs));
+    }
+    // A nanoseconds field >= 1e9 is malformed (valid PTP nanos are < 1e9).
+    {
+        QByteArray ts(10, '\0');
+        const uint32_t badNanos = 1'000'000'000u; // == 1e9, out of range
+        ts[6] = char((badNanos >> 24) & 0xFF);
+        ts[7] = char((badNanos >> 16) & 0xFF);
+        ts[8] = char((badNanos >> 8) & 0xFF);
+        ts[9] = char(badNanos & 0xFF);
+        int64_t outNs = 0;
+        QVERIFY(!UdpPtpClient::parseTimestampNsForTest(ts, 0, &outNs));
+    }
+}
+
+void TestUdpPtpClient::parsesValidTimestamp() {
+    // A realistic grandmaster timestamp (~year 2026) must parse exactly. seconds =
+    // 1'780'000'000 (~2026), nanos = 250'000'000 -> 1.78e18 ns, well within int64.
+    const int64_t seconds = 1'780'000'000LL;
+    const uint32_t nanos = 250'000'000u;
+    QByteArray ts(10, '\0');
+    for (int i = 5; i >= 0; --i) {
+        ts[i] = char((seconds >> (8 * (5 - i))) & 0xFF);
+    }
+    ts[6] = char((nanos >> 24) & 0xFF);
+    ts[7] = char((nanos >> 16) & 0xFF);
+    ts[8] = char((nanos >> 8) & 0xFF);
+    ts[9] = char(nanos & 0xFF);
+    int64_t outNs = 0;
+    QVERIFY(UdpPtpClient::parseTimestampNsForTest(ts, 0, &outNs));
+    QCOMPARE(outNs, seconds * 1'000'000'000LL + int64_t(nanos));
 }
 
 QTEST_GUILESS_MAIN(TestUdpPtpClient)

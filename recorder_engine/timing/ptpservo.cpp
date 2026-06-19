@@ -82,15 +82,27 @@ void PtpServo::recompute() const {
     // Simple low-pass: the running mean over the windowed accepted samples. A step
     // in the true offset ramps in as the window fills with the new level rather
     // than snapping instantly.
-    int64_t sumOffset = 0;
-    int64_t sumDelay = 0;
+    //
+    // Baseline-relative accumulation (the DriftEstimator "relative-to-first-point"
+    // pattern): with a REAL grandmaster the offset is `(t2-t1) - meanPathDelay`
+    // where t1 is ABSOLUTE PTP ns (~1.78e18) and t2 is local-monotonic ns (small),
+    // so offset ~= -1.78e18. Summing minExchanges of those directly would overflow
+    // int64 (8 * 1.78e18 = 1.4e19 > INT64_MAX). Subtracting a per-field baseline
+    // first leaves only ns-scale jitter in the sum, then re-adding the baseline
+    // recovers the true mean. Numerically identical to the naive mean for the
+    // small-offset case (the existing test vectors), with no overflow for large
+    // absolute offsets.
+    const int64_t baseOffset = m_window.front().offsetNs;
+    const int64_t baseDelay = m_window.front().pathDelayNs;
+    int64_t sumOffset = 0; // Σ(s.offsetNs - baseOffset): ns-scale, no overflow
+    int64_t sumDelay = 0;  // Σ(s.pathDelayNs - baseDelay): ns-scale, no overflow
     for (const Sample& s : m_window) {
-        sumOffset += s.offsetNs;
-        sumDelay += s.pathDelayNs;
+        sumOffset += s.offsetNs - baseOffset;
+        sumDelay += s.pathDelayNs - baseDelay;
     }
     const int64_t n = int64_t(m_window.size());
-    m_offsetNs = sumOffset / n;
-    m_pathDelayNs = sumDelay / n;
+    m_offsetNs = baseOffset + sumOffset / n;
+    m_pathDelayNs = baseDelay + sumDelay / n;
 }
 
 bool PtpServo::locked() const {

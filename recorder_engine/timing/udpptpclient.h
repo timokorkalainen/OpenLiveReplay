@@ -3,6 +3,7 @@
 
 #include "iptpclient.h"
 
+#include <QByteArray>
 #include <QHostAddress>
 #include <QString>
 #include <cstdint>
@@ -47,7 +48,19 @@ public:
     // safe to call concurrently with nextExchange() per the IPtpClient contract.
     int64_t localMonotonicNs() const override;
 
+    // Test seam: parse a 10-byte PTP timestamp (48-bit seconds + 32-bit nanos) at
+    // `offset` into absolute ns. Returns false for a short buffer OR an implausible/
+    // malformed field (seconds beyond a sane PTP range, or nanos >= 1e9) so a
+    // wire-crafted timestamp can never overflow the int64 multiply or reach the
+    // servo. Exposed so the parse can be exercised directly (no live grandmaster).
+    static bool parseTimestampNsForTest(const QByteArray& d, int offset, int64_t* outNs);
+
 private:
+    // Lazily create+bind+join the UDP sockets on the FIRST nextExchange() (the
+    // discipline thread), so the sockets are created, used, AND destroyed on a
+    // single thread — Qt sockets have thread affinity and are not thread-safe.
+    // Idempotent: a no-op once the sockets exist.
+    void ensureSockets();
     void processGeneralDatagram(const QByteArray& data);
     void processEventDatagram(const QByteArray& data);
     void sendDelayReq();
