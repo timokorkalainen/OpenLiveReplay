@@ -241,6 +241,20 @@ void ReplayManager::startRecording() {
     m_sessionFileName = m_baseFileName + "_" + timestamp;
     m_muxer->setOutputDirectory(m_outputDir);
 
+    // Reset the inter-camera aligner for this fresh session (drops any anchors
+    // carried over from a previous recording).
+    m_tcAligner.reset();
+
+    // Session start timecode for the muxer's tmcd/timecode tag is no longer derived
+    // here. The muxer now DEFERS its MKV header write to the first muxed packet and
+    // captures the start TC then (Muxer::setStartTimecodeCandidate, supplied by the
+    // StreamWorker that writes that first packet — see streamworker.cpp). At this
+    // point (cold start, aligner just reset) no per-frame TC has been observed, so
+    // any derivation here would always be empty; we pass an empty up-front candidate
+    // and let the worker supply the real one. Empty -> no tag until the worker wins,
+    // so a no-TC recording still stays byte-identical.
+    const QString startTc;
+
     if (m_videoCodec == VideoCodecChoice::H264Hardware) {
         // H.264 path: prime the blue encoder FIRST to obtain avcC extradata,
         // then pass it to Muxer::init so the container header includes it.
@@ -249,11 +263,13 @@ void ReplayManager::startRecording() {
             qDebug() << "ReplayManager: Failed to init H.264 blue frame encoder.";
             return;
         }
-        const bool muxerReady = m_telemetryFeedIds.isEmpty()
-            ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            48000, 2, m_videoCodec, m_videoExtradata)
-            : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec, m_videoExtradata);
+        const bool muxerReady =
+            m_telemetryFeedIds.isEmpty()
+                ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, 48000, 2, m_videoCodec, m_videoExtradata, startTc)
+                : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2,
+                                m_videoCodec, m_videoExtradata, startTc);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer (H.264) with base name" << m_sessionFileName;
             cleanupBlueEncoder();
@@ -261,11 +277,13 @@ void ReplayManager::startRecording() {
         }
     } else {
         // MPEG-2 path (unchanged): init muxer first, then blue encoder.
-        const bool muxerReady = m_telemetryFeedIds.isEmpty()
-            ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            48000, 2, m_videoCodec)
-            : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps, m_viewNames,
-                            m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2, m_videoCodec);
+        const bool muxerReady =
+            m_telemetryFeedIds.isEmpty()
+                ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, 48000, 2, m_videoCodec, {}, startTc)
+                : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
+                                m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2,
+                                m_videoCodec, {}, startTc);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
             return;
@@ -322,6 +340,12 @@ void ReplayManager::startRecording() {
         connect(worker, &StreamWorker::connectionChanged, this,
                 &ReplayManager::sourceConnectionChanged, Qt::QueuedConnection);
         connect(worker, &StreamWorker::statsUpdated, this, &ReplayManager::sourceStatsUpdated,
+                Qt::QueuedConnection);
+
+        // Forward each frame's source timecode into the aligner. The worker emits
+        // from its tick thread, so deliver queued onto the thread ReplayManager
+        // lives on (only emitted when the frame actually carried a valid TC).
+        connect(worker, &StreamWorker::frameTimecode, this, &ReplayManager::onFrameTimecode,
                 Qt::QueuedConnection);
 
         m_workers.append(worker);
@@ -464,6 +488,12 @@ void ReplayManager::onTimerTick() {
         // 2. Write blue frames for any unmapped view-tracks
         writeBlueFrames(frameMs);
     }
+}
+
+void ReplayManager::onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns,
+                                    int64_t sessionFrameIndex) {
+    // The aligner ignores negative timecodes; the worker only emits valid ones.
+    m_tcAligner.observe(sourceIndex, sourceTimecode100ns, sessionFrameIndex);
 }
 
 void ReplayManager::writeBlueFrames(int64_t elapsedMs) {

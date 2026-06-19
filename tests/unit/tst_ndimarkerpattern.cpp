@@ -13,6 +13,7 @@ private slots:
     void audioBeepsOnlyDuringTheFlashWindow();
     void timestampsApplyMediaSkewIn100nsUnits();
     void timecodeParsesStartAndAdvancesWithFrames();
+    void staticTimecodeHoldsStartOnEveryFrame();
     void rationalRateFlashesOnSourceSecondBoundary();
     void rationalRateAudioDistributesSamplesAcrossFrames();
 };
@@ -71,6 +72,19 @@ void TestNdiMarkerPattern::timecodeParsesStartAndAdvancesWithFrames() {
 
     QCOMPARE(ndiMarkerStartTimecode100ns(config), int64_t(360000000000));
     QCOMPARE(ndiMarkerTimecode100ns(config, 30), int64_t(360010000000));
+}
+
+void TestNdiMarkerPattern::staticTimecodeHoldsStartOnEveryFrame() {
+    NdiMarkerConfig config;
+    config.startTimecode = QStringLiteral("10:00:00:00");
+    config.staticTimecode = true;
+
+    // Every frame carries the SAME injected TC (no per-frame advance), so the
+    // engine's first muxed frame — captured at an arbitrary connect time — records
+    // it frame-exact. 10:00:00:00 == 36000 s == 360000000000 (100 ns).
+    QCOMPARE(ndiMarkerTimecode100ns(config, 0), int64_t(360000000000));
+    QCOMPARE(ndiMarkerTimecode100ns(config, 30), int64_t(360000000000));
+    QCOMPARE(ndiMarkerTimecode100ns(config, 599), int64_t(360000000000));
 }
 
 void TestNdiMarkerPattern::rationalRateFlashesOnSourceSecondBoundary() {

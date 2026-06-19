@@ -343,6 +343,15 @@ set_tests_properties(e2e_framesync_drift PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
 set_tests_properties(e2e_framesync_drift_skew PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_SKEW_PPM=200")
+# Timecode GATE: inject a KNOWN SMPTE 12M TC, record, and assert the recorded MKV's
+# tmcd/timecode tag equals it frame-exact + that two jam-synced (common-TC) sources
+# are reported aligned (<= 1 frame). It runs over the NDI transport because that is
+# the only path that injects TC natively in this environment (the SRT-SEI TC path
+# needs ffmpeg drawtext, which local builds usually lack). The cell SKIPs cleanly
+# (exit 77, SKIP_RETURN_CODE above) when no TC-capable source is available — no NDI
+# runtime/marker AND no ffmpeg drawtext — so it never FAILS for an environment gap.
+set_tests_properties(e2e_framesync_timecode PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_GATE=1;OLR_FRAMESYNC_TRANSPORT=ndi")
 
 # --- Local-only native SRT e2e (NOT in CI) ----------------------------------
 # Prove the real engine ingests srt:// over the native SRT path (the default,

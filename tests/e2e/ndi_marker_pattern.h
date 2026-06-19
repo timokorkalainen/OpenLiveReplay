@@ -16,6 +16,12 @@ struct NdiMarkerConfig {
     int markerFrames = 2;
     double skewPpm = 0.0;
     QString startTimecode = QStringLiteral("10:00:00:00");
+    // When true, every frame carries the SAME startTimecode (no per-frame advance).
+    // The timecode acceptance gate needs this so the engine's FIRST muxed frame —
+    // captured whenever discovery/connect completes — carries exactly the injected
+    // TC, making the recorded tmcd frame-exact regardless of connect latency. The
+    // default (false) advances the TC per frame for the drift/intercam scenarios.
+    bool staticTimecode = false;
 };
 
 int ndiMarkerSamplesPerFrame(const NdiMarkerConfig& config);

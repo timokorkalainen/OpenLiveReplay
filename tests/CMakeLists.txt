@@ -78,6 +78,8 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/heartbeat.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/driftestimator.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/timecode.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/timing/smpte12m.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/timing/timecodealigner.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/sourceclock.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
@@ -135,6 +137,7 @@ qt_add_library(olr_test_engine STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/streamworker.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/replaymanager.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/codec/avcc.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xseitimecode.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ndiframeconvert.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativendiingestsession.cpp"
 )

@@ -38,6 +38,10 @@ ndi_marker_source_name() {
 
 ndi_start_marker_sender() {
     local prefix="$1" sources="$2" seconds="$3" skew_ppm="$4"
+    shift 4
+    # Any remaining args pass straight through to the sender (e.g.
+    # --timecode-static for the frame-exact timecode gate).
+    local extra_args=("$@")
     local sender sender_seconds
     sender="$(ndi_marker_sender_path)"
     sender_seconds=$((seconds + 10))
@@ -47,6 +51,7 @@ ndi_start_marker_sender() {
         --seconds "$sender_seconds" \
         --skew-ppm "$skew_ppm" \
         --timecode "${OLR_MARKER_TC:-10:00:00:00}" \
+        "${extra_args[@]}" \
         >"${WORKDIR}/${prefix}.ndi.out" 2>"${WORKDIR}/${prefix}.ndi.err" &
     PIDS+=("$!")
     # The local SDK finder can retain just-destroyed sources briefly when matrix

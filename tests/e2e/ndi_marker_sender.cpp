@@ -56,6 +56,13 @@ int main(int argc, char** argv) {
     config.skewPpm = doubleArg(argc, argv, "--skew-ppm", 0.0);
     config.startTimecode =
         QString::fromStdString(argValue(argc, argv, "--timecode", "10:00:00:00"));
+    // --timecode-static holds the injected TC on every frame (frame-exact tmcd
+    // gate); without it the TC advances per frame for drift/intercam scenarios.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--timecode-static") == 0) {
+            config.staticTimecode = true;
+        }
+    }
 
     const int sources = intArg(argc, argv, "--sources", 1);
     const int seconds = intArg(argc, argv, "--seconds", 20);

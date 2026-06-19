@@ -83,6 +83,8 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/heartbeat.h recorder_engine/heartbeat.cpp
         recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp
         recorder_engine/timing/timecode.h recorder_engine/timing/timecode.cpp
+        recorder_engine/timing/smpte12m.h recorder_engine/timing/smpte12m.cpp
+        recorder_engine/timing/timecodealigner.h recorder_engine/timing/timecodealigner.cpp
         recorder_engine/timing/sourceclock.h recorder_engine/timing/sourceclock.cpp
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
@@ -92,6 +94,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/codec/avcc.h recorder_engine/codec/avcc.cpp
+        recorder_engine/ingest/h26xseitimecode.h recorder_engine/ingest/h26xseitimecode.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
