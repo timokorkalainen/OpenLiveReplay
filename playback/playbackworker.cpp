@@ -61,6 +61,10 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // transport's own (independent) mutex, so there is no lock-order concern.
     m_lastMoveDir.store((clamped >= m_transport->currentPos()) ? 1 : -1, std::memory_order_relaxed);
     m_seekTargetMs = clamped;
+    // A manual seek supersedes any pending armed-cut decoder-follow: the explicit
+    // reposition below resyncs the primary bank to the user's target, so a stale
+    // follow to the old cut target would otherwise jump the decoder back. Cancel it.
+    m_decoderFollowMs.store(-1, std::memory_order_relaxed);
     // A new seek target is outstanding until repositionTo commits it. The gate
     // holds the last good playhead until m_committedGeneration catches up.
     m_seekGeneration.fetch_add(1, std::memory_order_release);
@@ -711,8 +715,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 // ---------------------------------------------------------------------------
 // repositionTo (spec §6.2) — reuse fast-path or full trail-covering reposition.
 // ---------------------------------------------------------------------------
-void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf,
-                                  AVFrame* af) {
+void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af,
+                                  bool cutFollow) {
     const int trackCount = qMax(1, int(m_decoderBank.size()));
 
     // --- Reuse fast-path: every track already has a real frame at target. ---
@@ -811,8 +815,18 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
         av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
     }
-    // Intra-only: no avcodec_flush_buffers needed (spec §6.2); the seek itself
-    // restarts the read cursor and the next sent packet decodes standalone.
+    // Drain the decoders' OUTPUT queues. Intra-only means the next packet decodes
+    // standalone (no reference-frame priming needed), but a seek does NOT discard
+    // frames already DECODED and queued before it: on a BACKWARD seek the first
+    // avcodec_receive_frame would otherwise return a stale frame from the old
+    // (forward) position, whose PTS trips the `newestPtsMin() >= fillTo` break
+    // below so the fill aborts with the bank still parked forward — the reposition
+    // then has to be retried (2-3 reactive backward-jumps) before the stale frames
+    // drain. Flushing here makes a single reposition resync the bank deterministically.
+    for (auto* track : m_decoderBank)
+        if (track->codecCtx) avcodec_flush_buffers(track->codecCtx);
+    for (auto* aTrack : m_audioDecoderBank)
+        if (aTrack->codecCtx) avcodec_flush_buffers(aTrack->codecCtx);
 
     // Decode forward through target + frameDurMs, inserting all tracks. Audio is
     // re-primed by the normal forward release after the reposition, so we do NOT
@@ -887,7 +901,13 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 
     if (!deliveredEarly) resetDedup();
     deliverDueFrames(target, dir);
-    m_counters.reposition++;
+    // An armed-cut decoder-follow resync counts separately: the output cache was
+    // already promoted/correct by the cut, so this is NOT a coarse-seek fallback
+    // (which the reposition counter / armed-cut gate guard against).
+    if (cutFollow)
+        m_counters.cutFollowReposition++;
+    else
+        m_counters.reposition++;
 
     // Tier 2: the cache now covers `target`. Record the committed playhead
     // first, then advance the committed generation to the latest seek's value
@@ -1216,18 +1236,32 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     if (!m_prerollStagingCache) return;
 
     const int64_t target = m_scheduledCutTargetMs.load();
+    const int64_t newPlayhead =
+        CutSchedule::playheadAfterCut(target, dispatcherNextIndex, scheduled, fps());
+    const int64_t prePlayhead = m_transport ? m_transport->currentPos() : newPlayhead;
     // Atomic promotion: a single pointer swap of the published double-buffer.
     std::swap(m_outputCache, m_prerollStagingCache);
     publishOutputCacheLocked();
-    // Re-base the playhead to the (overshoot-adjusted) target WITHOUT bumping
-    // m_seekGeneration: m_transport->seek does not touch the worker's seek
-    // token, so committedGen stays == seekGen and makeOutputSnapshot exposes the
-    // LIVE transport playhead (now == target) against the freshly-published
-    // target-covering cache — zero placeholder, zero reposition, no repositionTo.
-    if (m_transport) {
-        m_transport->seek(
-            CutSchedule::playheadAfterCut(target, dispatcherNextIndex, scheduled, fps()));
-    }
+    // Decoder-follow for a BACKWARD cut: the swap fixed the OUTPUT, but the primary
+    // demuxer+decoder bank is still parked AHEAD of the new playhead, so the worker
+    // would otherwise hit the reactive backward-jump path (run loop §6.1(2)) one or
+    // more passes later. Queue a deterministic resync to the new playhead instead.
+    // Store it BEFORE re-basing the transport playhead: the worker reads the playhead
+    // under the transport's mutex (currentPos), which synchronizes-with this release
+    // store, so any worker pass that observes the re-based playhead is guaranteed to
+    // observe the pending follow too — its follow branch (ordered before the reactive
+    // backward-jump) consumes it, and the reactive path never fires (no double
+    // reposition). A FORWARD cut leaves m_decoderFollowMs unset: the forward-lag
+    // skip-forward path resyncs the bank with no reposition (forward cut stays
+    // reposition==0). The follow is non-clearing (the promoted cache is preserved via
+    // repositionTo's staging double-buffer) and does NOT bump m_seekGeneration, so the
+    // CommitGate never re-engages — no placeholder.
+    if (newPlayhead < prePlayhead) m_decoderFollowMs.store(newPlayhead, std::memory_order_release);
+    // Re-base the playhead WITHOUT bumping m_seekGeneration: m_transport->seek does
+    // not touch the worker's seek token, so committedGen stays == seekGen and
+    // makeOutputSnapshot exposes the LIVE transport playhead (now == target) against
+    // the freshly-published target-covering cache — zero placeholder, no fallback.
+    if (m_transport) m_transport->seek(newPlayhead);
     // Re-anchor the output clock to the new (target) playhead. Without this the
     // dispatcher's play epoch stays anchored to the PRE-CUT play start, so
     // sampledPlayheadMs (which drives the cache lookup) diverges from the target
@@ -1587,6 +1621,21 @@ void PlaybackWorker::run() {
             continue;
         }
 
+        // (1b) Armed-cut decoder-follow: a BACKWARD cut promoted the target window
+        //      into the output cache + re-based the playhead but left the primary
+        //      decode engine parked forward. Resync it deterministically HERE,
+        //      pre-empting the reactive backward-jump below so exactly one resync
+        //      runs. Non-clearing (the promoted cache is preserved); seek
+        //      generations untouched (the CommitGate stays disengaged → no gray);
+        //      counted as cutFollowReposition, not reposition.
+        {
+            const int64_t follow = m_decoderFollowMs.exchange(-1, std::memory_order_acquire);
+            if (follow >= 0) {
+                repositionTo(follow, /*dir*/ -1, pkt, frame, audioFrame, /*cutFollow*/ true);
+                continue;
+            }
+        }
+
         // (2) Backward jump: P fell below everything buffered. → §6.2, reverse.
         const int64_t oMin = oldestPtsMin(); // -1 if empty
         if (oMin >= 0 && P < oMin - kBackJumpSlackMs) {
@@ -1880,6 +1929,7 @@ void PlaybackWorker::run() {
     m_scheduledCutFrame.store(-1);
     m_stagingCovers.store(false);
     m_hasPendingRearm.store(false);
+    m_decoderFollowMs.store(-1);
 }
 
 void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
