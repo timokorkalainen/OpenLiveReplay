@@ -73,6 +73,7 @@ qt_add_qml_module(OpenLiveReplay
     QML_FILES
         Main.qml
         MultiviewWindow.qml
+        CodecSettingsPanel.qml
     SOURCES
         websocket/controlapiadapter.h
         websocket/controlprotocol.h websocket/controlprotocol.cpp

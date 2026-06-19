@@ -128,6 +128,9 @@ ApplicationWindow {
                 importPreviewPopup.open()
             }
         }
+        function onRecordingWarning(msg) {
+            appWindow.recordingError = msg
+        }
     }
 
     Timer {
@@ -1279,6 +1282,11 @@ ApplicationWindow {
                     Item { }
                     Item { }
                     Item { }
+                }
+
+                CodecSettingsPanel {
+                    Layout.fillWidth: true
+                    controller: appWindow.uiManagerRef
                 }
 
                 GroupBox {
