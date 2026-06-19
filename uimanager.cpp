@@ -1767,6 +1767,34 @@ void UIManager::endScrubGesture() {
     m_seekCoalescer.reset();
 }
 
+// --- Tier3 replay cue list -------------------------------------------------
+// markIn/markOut capture the live playhead; recallEntry arms a frame-perfect
+// pre-rolled cut (armNextCut) rather than the churny seekPlayback path.
+void UIManager::markIn() {
+    if (!m_transport) return;
+    // The current clip path is what UIManager already hands to the worker's
+    // openFile (m_replayManager->getVideoPath()); there is no separate accessor.
+    m_playlist.markIn(m_replayManager->getVideoPath(), m_transport->currentPos());
+}
+
+void UIManager::markOut() {
+    if (!m_transport) return;
+    m_playlist.markOut(m_transport->currentPos());
+}
+
+void UIManager::recallEntry(int index) {
+    const auto entry = m_playlist.recall(index);
+    if (!entry.has_value()) return;
+    // Tier3 v1 is single-clip: arm the in-point ms on the currently-open clip.
+    // A recalled entry whose clipPath differs from the open clip is out of scope
+    // for v1 (armNextCut is ms-only); recall still arms the ms.
+    if (m_playbackWorker) m_playbackWorker->armNextCut(entry->inMs);
+}
+
+int UIManager::playlistCount() const {
+    return m_playlist.count();
+}
+
 void UIManager::updateUrl(int index, const QString& url) {
     if (index >= 0 && index < m_currentSettings.sources.size()) {
         m_currentSettings.sources[index].url = url;
