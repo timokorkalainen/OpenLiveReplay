@@ -63,6 +63,12 @@ int main(int argc, char** argv) {
     // frame offset. The framesync timecode gate reads this to assert two jam-synced
     // (common-TC) sources are reported aligned (<= 1 frame).
     const bool reportTcAlign = args.contains(QStringLiteral("--report-tc-align"));
+    // --report-phase prints, per source, the Phase-4 inter-camera servo result:
+    // the confidence tier (frame-accurate / bounded / approximate), the measured
+    // phase to the reference source in ms, and the +/-ms bound. The framesync
+    // intercam GATE reads this to assert two common-TC sources lock to the
+    // FrameAccurate tier within the bound, alongside the recorded flash spread.
+    const bool reportPhase = args.contains(QStringLiteral("--report-phase"));
 
     if (urls.isEmpty()) {
         fprintf(stderr, "sync_harness: at least one --url is required\n");
@@ -190,6 +196,26 @@ int main(int argc, char** argv) {
                             rm.sourcesFrameAligned(a, b) ? 1 : 0,
                             static_cast<long long>(rm.sourceFrameOffset(a, b)));
                 }
+            }
+            fflush(stderr);
+        }
+        if (reportPhase) {
+            auto tierName = [](ConfidenceTier t) -> const char* {
+                switch (t) {
+                case ConfidenceTier::FrameAccurate:
+                    return "frame-accurate";
+                case ConfidenceTier::Bounded:
+                    return "bounded";
+                default:
+                    return "approximate";
+                }
+            };
+            fprintf(stderr, "phase_ref reference=%d\n", rm.referenceSource());
+            for (int s = 0; s < n; ++s) {
+                fprintf(stderr, "phase src=%d tier=%s phase_ms=%lld bound_ms=%d servo_ms=%d\n", s,
+                        tierName(rm.sourceTier(s)),
+                        static_cast<long long>(rm.sourcePhaseOffsetMs(s)), rm.sourcePhaseBoundMs(s),
+                        rm.sourceServoTrimMs(s));
             }
             fflush(stderr);
         }

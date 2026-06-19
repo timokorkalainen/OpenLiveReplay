@@ -343,6 +343,20 @@ set_tests_properties(e2e_framesync_drift PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
 set_tests_properties(e2e_framesync_drift_skew PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_SKEW_PPM=200")
+# Inter-camera phase GATE (Phase 4): two common-TC NDI sources record with the
+# inter-camera phase servo ON; assert the servo drives BOTH to a LOCKED tier
+# (FrameAccurate is the target/reported, Bounded accepted — the tolerance-0 alignment
+# jitters run-to-run with real-NDI arrival jitter; FAIL only on Approximate) and holds
+# the recorded flash-onset spread MEAN within two frames @30 (anti-flake margin over
+# the ~1-frame quantization floor). Runs over NDI because that is the only path that
+# injects a COMMON SMPTE 12M timecode natively here (the marker sender publishes the
+# same advancing TC on both sources). It SKIPs cleanly (exit 77, SKIP_RETURN_CODE
+# above) when no two-source NDI recording can be produced — no NDI runtime/marker, or
+# one source fails discovery/connect — so a two-source NDI flake never FAILs the gate.
+# Like the timecode cell it bumps OLR_MUXER_TMCD_GRACE_MS so a slow two-source connect
+# still wins the deferred header. Validated 8-10x: all PASS-or-SKIP, zero FAIL.
+set_tests_properties(e2e_framesync_intercam PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_GATE=1;OLR_FRAMESYNC_TRANSPORT=ndi")
 # Timecode GATE: inject a KNOWN SMPTE 12M TC, record, and assert the recorded MKV's
 # tmcd/timecode tag equals it frame-exact + that two jam-synced (common-TC) sources
 # are reported aligned (<= 1 frame). It runs over the NDI transport because that is

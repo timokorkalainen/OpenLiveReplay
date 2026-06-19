@@ -9,9 +9,14 @@ gates.
 - **Lip-sync:** nearest beep onset minus flash onset. The current gate is EBU
   R37-compatible at `-40..+60 ms` for `audio - video`; the target band is
   `+/-20 ms`.
-- **Inter-camera phase:** flash-onset spread across two synchronized views.
-  With common timecode this becomes a `<= 1 frame` gate; without common TC it is
-  a bounded report, because clockless IP cannot prove frame-accurate phase.
+- **Inter-camera phase:** flash-onset spread across two synchronized views, plus
+  the Phase-4 servo's measured phase + confidence tier. With common timecode this
+  is a **gate** (`e2e_framesync_intercam`): the servo drives both sources to a
+  locked tier (FrameAccurate is the target; reported per run) and holds the recorded
+  flash-spread **mean within two frames** of anti-flake margin (the honest floor is
+  one frame — see "Inter-Camera Phase Servo, Accuracy & Gate" below). Without common
+  TC it is a bounded report — clockless IP cannot prove frame-accurate phase, so the
+  tier is `Bounded`/`Approximate` with a surfaced `±ms` number.
 - **Drift:** least-squares slope of `flash index -> recorded PTS`, recovered
   source-clock ppm, and A/V offset drift over the run. The zero-skew CTest cell
   gates A/V offset regression drift at less than one frame; video flash slope is
@@ -84,6 +89,82 @@ the tag before the deferred MKV header commits.
   injection makes this frame-exact for the gate).
 - **Drop-frame TC is recovered as non-drop.** A drop-frame source TC is decoded
   with non-drop arithmetic at 30 fps; drop-frame preservation is a follow-up.
+
+## Inter-Camera Phase Servo, Accuracy & Gate (Phase 4)
+
+The `e2e_framesync_intercam` cell is a **gate** (`OLR_FRAMESYNC_GATE=1`,
+`OLR_FRAMESYNC_TRANSPORT=ndi`). It records **two common-timecode sources** with the
+**Phase-4 inter-camera phase servo on** and asserts the servo locks them.
+
+**The servo (what it does).** `ReplayManager` picks a **reference source** (highest
+`ClockQuality`, ties → lowest index) and runs a pure `SourceOffsetEstimator` that, per
+source, measures the phase to the reference and grades a **confidence tier**:
+
+- `FrameAccurate` — common timecode (the `TimecodeAligner` reports the equal-TC frames
+  coincident) or an external reference (PTP, Phase 5). Bound `±0 ms`.
+- `Bounded` — a recovered-clock estimate (PCR/NDI/FLV-PLL) with a numeric `±ms` bound
+  derived from the clock (RTMP/FLV gets a wider base, ms-resolution noise).
+- `Approximate` — arrival-only; no reliable signal to lock to (`±40 ms` order).
+
+It then nudges each non-reference, clock-locked source toward zero phase by summing a
+**servo trim** into the worker's existing trim seam (`StreamWorker::m_servoTrimOffsetMs`,
+separate from and **layered under** the PHASE-6 operator override — operator trim always
+wins). The correction is **capped** (`kMaxInterCamCorrectionMs`) and **ramped**
+(`kServoStepMs = 4 ms`/pulse), so a re-anchor step can never jerk the timeline by the full
+correction in one tick. For **common-TC** sources the servo drives toward the EXACT TC frame
+offset (FrameAccurate); for other locked sources it drives by the recovered clock offset
+(Bounded). `Approximate` sources and a lone source get **servo 0** — byte-identical to
+pre-Phase-4 behavior. The measured phase + tier ride the additive `IngestStats` fields
+(`confidenceTier`/`interCamPhaseMs`/`interCamBoundMs`) into the `sourceStatsTooltip`.
+
+**Achieved accuracy in this environment.** Two jam-synced NDI sources (identical
+**advancing** SMPTE 12M TC on every content frame) usually grade **FrameAccurate** (the
+`TimecodeAligner` reports them aligned) with measured residual phase `0 ms`, and the recorded
+flash-onset spread **mean** holds at/under **one frame @30 (33.33 ms)** with the servo on
+(validated 8–10× — most runs `0.0 ms`; the worst observed mean across runs was ~30 ms, i.e.
+~0.9 frame). The **max** spread is hard-quantized to whole frames and routinely touches
+exactly one frame (33.33 ms).
+
+**What the gate asserts (and why it is reliable, not flaky).** Validated 8–10× in this
+environment: every run **PASSes or SKIPs cleanly, never FAILs**.
+
+1. **Both sources reach a LOCKED tier** — `frame-accurate` OR `bounded` (clock-recovered and
+   servo-driven) — and the gate **FAILs only on `approximate`** (no lock at all). The exact
+   `frame-accurate` grade is the *target* and is **reported** (`frame_accurate=yes/no`,
+   `aligned=`) but is **not hard-gated**, because the `TimecodeAligner` anchors each source on
+   the session frame where it first observes a TC and two real-NDI receivers see jam-synced
+   frames with **arrival jitter**, so the tolerance-0 alignment (and hence the FrameAccurate
+   grade) **jitters ~0–2 frames run-to-run**: the same fixture can grade FrameAccurate one run
+   and Bounded the next. Hard-gating the exact FrameAccurate/`aligned=1` grade flaked (~1 run
+   in ~14); gating "a locked tier" is the stable signal. *(This is the same Phase-3 lesson that
+   made the timecode cell's exact inter-cam alignment report-only.)*
+2. **The recorded flash-onset spread `mean ≤ 2 frames`** — the reliable, physical servo
+   guarantee. The servo aligns the per-source *timeline mapping*, but the recorded flash
+   *onset* is **quantized to the 30 fps frame grid**, so two views whose onsets straddle a
+   frame boundary can differ by a frame. The observed mean stayed at/under ~1 frame across runs
+   but touched ~30 ms (0.9 frame), so the gate uses **2 frames** for comfortable anti-flake
+   margin while still catching a gross servo failure. The **max** is **reported for
+   visibility** but **not gated** (it routinely sits right at the one-frame boundary). **One
+   frame is the rig's honest floor**; sub-frame, genlock-grade lock is the **Phase-5
+   PTP/reference-clock ceiling**, not something arrival-anchored common-TC alignment can pin to
+   zero.
+
+Use an **advancing** common TC, not a static one: a single repeated TC makes "the frame
+where TC X first appears" connect-time-dependent, so two sources that connect at different
+session frames anchor differently and never grade FrameAccurate. Advancing TC carries a
+distinct value per content frame so both sources anchor on the SAME content TC regardless of
+connect skew.
+
+**Gate-vs-skip.** Common-TC injection only works over **NDI** here (the marker sender
+publishes the same advancing TC on both sources via the SDK; the SRT/RTMP SEI path needs
+ffmpeg `drawtext` locally). Under the gate, a non-NDI transport **SKIPs cleanly (exit 77)**.
+Because the cell inherently needs **two** sources, it also **SKIPs cleanly** when the
+two-source NDI recording cannot be produced — no MKV, too few paired flashes, or a source's
+phase report is missing (a source never connected). That is an NDI-runtime discovery/connect
+flake, not a servo defect, so it never **FAILs** the gate. Like the timecode cell it bumps
+`OLR_MUXER_TMCD_GRACE_MS` (default 8000 ms under the cell) so a slow-but-eventual two-source
+connect still wins the deferred MKV header. In report-only mode the cell prints the measured
+spread + tier/phase and never gates.
 
 ## Running It
 
@@ -174,3 +255,9 @@ Clockless SRT/RTMP can maintain A/V sync and bound inter-camera phase, but true
 frame-accurate inter-camera lock requires common timecode or an external
 reference. The rig is intentionally honest about that: it reports the achieved
 accuracy first, then gates only the guarantees the transport can actually make.
+The Phase-4 servo delivers frame-accurate inter-camera lock **only** with common
+TC (graded `FrameAccurate`, recorded spread mean within one frame); other locked
+sources get a `Bounded`-and-measured `±ms` correction, and `Approximate` sources
+get no servo and are surfaced honestly. Sub-frame, genlock-grade phase lock is the
+Phase-5 PTP (ST 2059) / reference-clock ceiling, not something arrival-anchored
+common-TC alignment can reach.
