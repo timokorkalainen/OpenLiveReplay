@@ -1057,11 +1057,14 @@ void PlaybackWorker::fillStaging() {
 
     AVPacket* pkt = av_packet_alloc();
     AVFrame* vf = av_frame_alloc();
-    if (!pkt || !vf) {
+    AVFrame* af = av_frame_alloc(); // Tier3 audio staging (active view)
+    if (!pkt || !vf || !af) {
         if (pkt) av_packet_free(&pkt);
         if (vf) av_frame_free(&vf);
+        if (af) av_frame_free(&af);
         return;
     }
+    const int activeView = m_activeAudioView.load(std::memory_order_relaxed);
 
     const int64_t coverTo = target + kStagingSpanMs;
     int packets = 0;
@@ -1104,6 +1107,44 @@ void PlaybackWorker::fillStaging() {
             }
             break;
         }
+
+        // Stage the ACTIVE-VIEW audio for the armed window into the (worker-
+        // private) staging cache so the output bus has the target's audio the
+        // instant the cut promotes it — mirrors cacheOutputAudioFrame but writes
+        // m_prerollStagingCache (no lock; not published until the cut swap) and
+        // uses the pre-roll context's time base. Bounded to [.., target+span].
+        for (auto* aTrack : m_prerollAudioBank) {
+            if (pkt->stream_index != aTrack->streamIndex) continue;
+            if (aTrack->viewIndex == activeView &&
+                avcodec_send_packet(aTrack->codecCtx, pkt) == 0) {
+                while (avcodec_receive_frame(aTrack->codecCtx, af) == 0) {
+                    if (af->format == AV_SAMPLE_FMT_S16 && af->sample_rate == 48000 &&
+                        af->ch_layout.nb_channels == 2) {
+                        int64_t apts = af->pts;
+                        if (apts == AV_NOPTS_VALUE) apts = af->best_effort_timestamp;
+                        if (apts != AV_NOPTS_VALUE) {
+                            const AVRational atb =
+                                m_prerollFmtCtx->streams[aTrack->streamIndex]->time_base;
+                            const int64_t aPtsMs = av_rescale_q(apts, atb, {1, 1000});
+                            if (aPtsMs <= target + kPrerollAudioSpanMs) {
+                                const int dataSize = af->nb_samples * 2 * int(sizeof(int16_t));
+                                MediaAudioFrame frame;
+                                frame.feedIndex = aTrack->viewIndex;
+                                frame.startSample = qMax<qint64>(0, aPtsMs * qint64(48000) / 1000);
+                                frame.sampleRate = 48000;
+                                frame.channels = 2;
+                                frame.format = MediaSampleFormat::S16Interleaved;
+                                frame.pcm = QByteArray(reinterpret_cast<const char*>(af->data[0]),
+                                                       dataSize);
+                                m_prerollStagingCache->insertAudioFrame(frame);
+                            }
+                        }
+                    }
+                    av_frame_unref(af);
+                }
+            }
+            break;
+        }
         av_packet_unref(pkt);
 
         if (m_stagingNewestRefPtsMs >= coverTo) {
@@ -1113,6 +1154,7 @@ void PlaybackWorker::fillStaging() {
     }
 
     av_frame_free(&vf);
+    av_frame_free(&af);
     av_packet_free(&pkt);
 
     // Schedule the cut the moment staging first covers the target window.
@@ -1173,6 +1215,15 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     // OutputRuntime::snapshot() invokes this provider OUTSIDE that mutex, so there
     // is no re-entrancy or lock-order inversion.
     if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
+    // Click-free audio transition: de-click + drop the stale pre-cut ring so the
+    // monitor re-primes the TARGET audio with a fade-in (AudioPlayer::clear does a
+    // fade-out + arms a fade-in — no hard pop). The worker's run loop then re-fills
+    // m_audioQueue around the new playhead (the stale queued audio is dropped by
+    // its dropOlderThan(P)); the OUTPUT-BUS audio is already correct because the
+    // promoted staging cache carries the staged target audio (fillStaging Step 1).
+    // AudioPlayer::clear is mutex-guarded (safe from this output thread); we do NOT
+    // touch m_audioQueue here (it is worker-thread-only).
+    if (m_audioPlayer) m_audioPlayer->clear();
     m_stagingCovers.store(false);
     m_cutArmed.store(false);
     m_scheduledCutFrame.store(-1);

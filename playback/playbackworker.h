@@ -117,6 +117,7 @@ private:
     static constexpr int kStagingSpanMs = 800;       // window staged ahead of target
     static constexpr int kPrerollPacketsPerTick = 8; // bounded per run() iter (no starve)
     static constexpr int kCutLeadMs = 120;           // lead before the cut fires (output frames)
+    static constexpr int kPrerollAudioSpanMs = 800;  // active-view audio staged ahead of a cut
 
     // High-performance conversion from FFmpeg AVFrame to backend YUV420P media frames.
     MediaVideoFrame convertToMediaVideoFrame(AVFrame* frame, int feedIndex);
