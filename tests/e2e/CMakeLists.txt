@@ -272,11 +272,22 @@ add_test(NAME e2e_play_farback
 add_test(NAME e2e_play_armedcut
     COMMAND bash "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut 2 23498)
+# Tier3 armed-cut gate, BACKWARD target (the dominant EVS replay case), played
+# long past the staging span: a backward cut is frame-accurate + flash-free but
+# resyncs the primary decoder via a benign reactive reposition. Gates
+# placeholderFramesDelta==0 AND heldFramesDelta==0 (no frozen-frame stall — the
+# metric the forward placeholder gate misses) + framesDropped==0 + frame
+# accuracy; reposition is bounded loosely (NOT ==0). Port 23500 (UDP 23501) is
+# the next clear port after armedcut (23498), disjoint from the record/sync/
+# av-sync/native ranges.
+add_test(NAME e2e_play_armedcut_back
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-back 2 23500)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
-    e2e_play_seekflash e2e_play_farback e2e_play_armedcut
+    e2e_play_seekflash e2e_play_farback e2e_play_armedcut e2e_play_armedcut_back
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180
