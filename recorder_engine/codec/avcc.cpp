@@ -9,6 +9,42 @@ void appendSizedNal(QByteArray* out, const QByteArray& nal) {
 }
 } // namespace
 
+bool parseAvcc(const QByteArray& avcc, QList<QByteArray>* sps, QList<QByteArray>* pps) {
+    if (!sps || !pps) return false;
+    sps->clear();
+    pps->clear();
+    // Minimum viable avcC: 6 bytes header + 2 SPS len + 1 PPS count + 2 PPS len
+    const int size = avcc.size();
+    if (size < 8) return false;
+    const auto* d = reinterpret_cast<const uint8_t*>(avcc.constData());
+    // Byte [0]: configurationVersion (skip); [1..3]: profile/compat/level (skip)
+    // Byte [4]: 0xFF — lengthSizeMinusOne in low 2 bits (must be 3)
+    // Byte [5]: 0xE0|numSPS
+    int offset = 5;
+    const int numSps = d[offset] & 0x1f;
+    offset++;
+    for (int i = 0; i < numSps; ++i) {
+        if (offset + 2 > size) return false;
+        const int len = (d[offset] << 8) | d[offset + 1];
+        offset += 2;
+        if (len <= 0 || offset + len > size) return false;
+        sps->append(QByteArray(reinterpret_cast<const char*>(d + offset), len));
+        offset += len;
+    }
+    if (offset + 1 > size) return false;
+    const int numPps = d[offset];
+    offset++;
+    for (int i = 0; i < numPps; ++i) {
+        if (offset + 2 > size) return false;
+        const int len = (d[offset] << 8) | d[offset + 1];
+        offset += 2;
+        if (len <= 0 || offset + len > size) return false;
+        pps->append(QByteArray(reinterpret_cast<const char*>(d + offset), len));
+        offset += len;
+    }
+    return !sps->isEmpty() && !pps->isEmpty();
+}
+
 QByteArray buildAvcCFromParameterSets(const QList<QByteArray>& sps,
                                       const QList<QByteArray>& pps) {
     if (sps.isEmpty() || pps.isEmpty()) return {};

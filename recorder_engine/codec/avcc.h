@@ -12,4 +12,11 @@
 QByteArray buildAvcCFromParameterSets(const QList<QByteArray>& sps,
                                       const QList<QByteArray>& pps);
 
+// Parse an AVCDecoderConfigurationRecord ("avcC") blob into raw SPS and PPS
+// NAL payloads (no start codes, no length prefixes). Returns true on success.
+// avcC layout: [0]=configVersion [1..3]=profile/compat/level [4]=0xFF
+// [5]=0xE0|numSPS then numSPS*(2-byte BE len + payload)
+// then 1 byte numPPS then numPPS*(2-byte BE len + payload).
+bool parseAvcc(const QByteArray& avcc, QList<QByteArray>* sps, QList<QByteArray>* pps);
+
 #endif // OLR_AVCC_H

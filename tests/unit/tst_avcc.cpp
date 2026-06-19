@@ -10,6 +10,7 @@ private slots:
     void emptyInputsYieldEmpty();
     void buildsWellFormedRecord();
     void multipleParameterSets();
+    void parseAvccRoundTrips();
 };
 
 void TestAvcc::emptyInputsYieldEmpty() {
@@ -90,6 +91,26 @@ void TestAvcc::multipleParameterSets() {
     int pps2Len = (quint8(avcc[offset]) << 8) | quint8(avcc[offset + 1]);
     QCOMPARE(pps2Len, pps2.size());
     QCOMPARE(avcc.mid(offset + 2, pps2.size()), pps2);
+}
+
+void TestAvcc::parseAvccRoundTrips() {
+    // Build a well-formed avcC and then parse it back — verify round-trip fidelity.
+    const QByteArray sps = QByteArrayLiteral("\x67\x42\x00\x1f\x8c\x8d\x40");
+    const QByteArray pps = QByteArrayLiteral("\x68\xce\x3c\x80");
+    const QByteArray avcc = buildAvcCFromParameterSets({sps}, {pps});
+    QVERIFY(!avcc.isEmpty());
+
+    QList<QByteArray> parsedSps, parsedPps;
+    QVERIFY(parseAvcc(avcc, &parsedSps, &parsedPps));
+    QCOMPARE(parsedSps.size(), 1);
+    QCOMPARE(parsedPps.size(), 1);
+    QCOMPARE(parsedSps.at(0), sps);
+    QCOMPARE(parsedPps.at(0), pps);
+
+    // Truncated data must return false.
+    QVERIFY(!parseAvcc(avcc.left(4), &parsedSps, &parsedPps));
+    // Empty must return false.
+    QVERIFY(!parseAvcc({}, &parsedSps, &parsedPps));
 }
 
 QTEST_GUILESS_MAIN(TestAvcc)
