@@ -29,8 +29,13 @@ public:
     virtual ~IPtpClient() = default;
     virtual bool start(const QString& domainOrIface) = 0;
     virtual void stop() = 0;
-    // Block up to timeoutMs for the next completed two-way exchange.
+    // Block up to timeoutMs for the next completed two-way exchange. Called only
+    // from PtpReference's discipline thread.
     virtual PtpExchange nextExchange(int timeoutMs) = 0;
+    // THREAD-SAFETY CONTRACT: must be safe to call concurrently with nextExchange().
+    // PtpReference reads the local clock from the caller thread (nowSessionNs) while
+    // its discipline thread is blocked in/around nextExchange() — implementations
+    // (the real UdpPtpClient included) MUST make this read lock-free or synchronized.
     virtual int64_t localMonotonicNs() const = 0;
 };
 #endif // IPTPCLIENT_H
