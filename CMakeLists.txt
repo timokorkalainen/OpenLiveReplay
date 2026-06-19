@@ -91,6 +91,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/pespacket.h
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
+        recorder_engine/codec/avcc.h recorder_engine/codec/avcc.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
@@ -271,7 +272,8 @@ if(APPLE)
         recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
-        recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm)
+        recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm
+        recorder_engine/codec/nativevideoencoder_videotoolbox.mm)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -286,7 +288,8 @@ elseif(WIN32)
         recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
-        recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp)
+        recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp
+        recorder_engine/codec/nativevideoencoder_mediafoundation.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -299,11 +302,12 @@ elseif(WIN32)
         "${OLR_FFMPEG_AVUTIL_LIBRARY}"
         "${OLR_FFMPEG_SWSCALE_LIBRARY}"
         "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
-        mfplat mf mfuuid d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
+        mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
 elseif(NOT WIN32)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_stub.cpp
-        recorder_engine/ingest/nativeaacdecoder_stub.cpp)
+        recorder_engine/ingest/nativeaacdecoder_stub.cpp
+        recorder_engine/codec/nativevideoencoder_stub.cpp)
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)

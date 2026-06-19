@@ -26,6 +26,7 @@ private slots:
     void initBuildsTelemetryTrackLayoutAndMetadata();
     void initFailureResetsTelemetryTrackState();
     void writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed();
+    void initFailsForH264WithoutExtradata();
 
 private:
     QTemporaryDir m_home;
@@ -263,6 +264,15 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
     QCOMPARE(ret, AVERROR_EOF);
     QCOMPARE(totalPackets, 1);
     QCOMPARE(telemetryPackets, 1);
+}
+
+void TestMuxer::initFailsForH264WithoutExtradata() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QStringList names{QStringLiteral("A")};
+    // H.264 requires avcC extradata; empty must be rejected, not silently accepted.
+    QVERIFY(!m.init(QStringLiteral("olr_unit_h264_noextradata"), 1, 320, 240, 30, names,
+                    48000, 2, VideoCodecChoice::H264Hardware, QByteArray()));
 }
 
 QTEST_GUILESS_MAIN(TestMuxer)

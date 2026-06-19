@@ -14,6 +14,7 @@
 #include "streamworker.h"
 #include "ingest/ingestsession.h"
 #include "recorder_engine/codec/videocodecchoice.h"
+#include "recorder_engine/codec/nativevideoencoder.h"
 
 class ReplayManager : public QObject
 {
@@ -160,6 +161,11 @@ private:
     // the GUI thread.  Owned by this session: built in setupBlueEncoder,
     // freed in cleanupBlueEncoder.
     AVPacket* m_cachedBluePkt = nullptr;
+    // H.264 path: native encoder used for priming the blue frame to obtain avcC.
+    std::unique_ptr<NativeVideoEncoder> m_blueNativeEncoder;
+    // avcC extradata obtained from priming encode; passed to Muxer::init for H.264.
+    // Empty for MPEG-2 (not needed).
+    QByteArray m_videoExtradata;
     bool setupBlueEncoder();
     void cleanupBlueEncoder();
 
