@@ -94,6 +94,8 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/codec/avcc.h recorder_engine/codec/avcc.cpp
         recorder_engine/benchmark/benchmarktypes.h
         recorder_engine/benchmark/benchmarkplan.h recorder_engine/benchmark/benchmarkplan.cpp
+        recorder_engine/benchmark/codecrunner.h
+        recorder_engine/benchmark/codecbenchmark.h recorder_engine/benchmark/codecbenchmark.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp

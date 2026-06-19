@@ -99,6 +99,7 @@ olr_add_unit_test(tst_videocodecchoice)
 target_include_directories(tst_videocodecchoice PRIVATE "${CMAKE_SOURCE_DIR}")
 olr_add_unit_test(tst_avcc olr_test_engine)
 olr_add_unit_test(tst_benchmarkplan olr_test_engine)
+olr_add_unit_test(tst_codecbenchmark olr_test_engine)
 olr_add_unit_test(tst_nativevideoencoder olr_test_engine)
 if(APPLE)
     add_library(olr_test_nativevideoencoder STATIC
