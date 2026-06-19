@@ -26,6 +26,14 @@ private slots:
     void referenceSourceHasZeroPhase();
     void disconnectReselectsReferenceAwayFromDeadSource();
 
+    // Phase 4 Task 4: the bounded, gentle phase servo.
+    void servoSignPullsLateSourceEarlier();
+    void servoRampsTowardTargetNotFullJump();
+    void servoNeverExceedsCap();
+    void referenceAndApproximateGetNoServo();
+    void singleSourceServoIsZero();
+    void servoUsesExactTcOffsetWhenCommonTimecode();
+
 private:
     static int64_t tc100ns(int h, int m, int s, int f) {
         // Producers (SRT/RTMP) encode each frame's TC to 100 ns with the shared
@@ -158,6 +166,101 @@ void TestReplayManagerTimecode::disconnectReselectsReferenceAwayFromDeadSource()
     QVERIFY(QMetaObject::invokeMethod(&manager, "onSourcePhaseConnectionChanged",
                                       Qt::DirectConnection, Q_ARG(int, 1), Q_ARG(bool, false)));
     QCOMPARE(manager.referenceSource(), 0);
+}
+
+void TestReplayManagerTimecode::servoSignPullsLateSourceEarlier() {
+    ReplayManager manager;
+    // Reference = source 0 (tie -> lowest index). Source 1 is PCR-locked, NO timecode
+    // -> Bounded, and LATE by +40 ms (clockOffsetNs greater than the reference). The
+    // servo must pull a LATE (positive-phase) source EARLIER, i.e. a NEGATIVE servo trim
+    // (a negative trim makes targetTimeMs larger -> newer frames -> advances the source).
+    // Pulse repeatedly so the gentle ramp converges past the per-step cap.
+    for (int i = 0; i < 40; ++i) {
+        QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+        QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 40000000)));
+    }
+    QCOMPARE(manager.referenceSource(), 0);
+    QCOMPARE(manager.sourceTier(1), ConfidenceTier::Bounded);
+    QCOMPARE(manager.sourcePhaseOffsetMs(1), int64_t(40));
+    // Converged: servo pulls toward -phase = -40 ms (within the cap).
+    QCOMPARE(manager.sourceServoTrimMs(1), -40);
+}
+
+void TestReplayManagerTimecode::servoRampsTowardTargetNotFullJump() {
+    ReplayManager manager;
+    // A single large phase reading must NOT jump the servo straight to the target -
+    // the ramp absorbs a Bounded signal that steps on re-anchor. After ONE pulse the
+    // servo has moved by at most one ramp step, strictly less than the full -phase.
+    QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+    QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 40000000))); // +40 ms phase
+    QCOMPARE(manager.referenceSource(), 0);
+    const int servo1 = manager.sourceServoTrimMs(1);
+    QVERIFY2(servo1 < 0, "ramps in the correcting (negative) direction");
+    QVERIFY2(servo1 > -40, "does NOT jump the full -40 ms in one update");
+    // A second pulse ramps further toward the target (monotone, still not overshooting).
+    QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 40000000)));
+    const int servo2 = manager.sourceServoTrimMs(1);
+    QVERIFY2(servo2 < servo1, "second pulse ramps further toward the target");
+    QVERIFY2(servo2 >= -40, "never overshoots the target");
+}
+
+void TestReplayManagerTimecode::servoNeverExceedsCap() {
+    ReplayManager manager;
+    // A huge measured phase (+5000 ms) must saturate at the cap, never beyond it,
+    // no matter how many pulses ramp it. The cap protects the timeline.
+    for (int i = 0; i < 500; ++i) {
+        QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+        QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 5000000000LL)));
+    }
+    QCOMPARE(manager.referenceSource(), 0);
+    const int servo = manager.sourceServoTrimMs(1);
+    QVERIFY2(servo <= 0, "correcting direction for a late source");
+    QVERIFY2(servo >= -ReplayManager::kMaxInterCamCorrectionMs, "never exceeds the negative cap");
+    QCOMPARE(servo, -ReplayManager::kMaxInterCamCorrectionMs); // saturated AT the cap
+}
+
+void TestReplayManagerTimecode::referenceAndApproximateGetNoServo() {
+    ReplayManager manager;
+    // Source 0 PCR-locked (reference). Source 1 arrival-only/unlocked -> Approximate:
+    // there is nothing reliable to lock to, so it gets ZERO servo even with a phase
+    // reading. The reference itself always gets zero servo.
+    for (int i = 0; i < 40; ++i) {
+        QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+        QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Arrival, false, 40000000)));
+    }
+    QCOMPARE(manager.referenceSource(), 0);
+    QCOMPARE(manager.sourceTier(1), ConfidenceTier::Approximate);
+    QCOMPARE(manager.sourceServoTrimMs(0), 0); // reference: never servoed
+    QCOMPARE(manager.sourceServoTrimMs(1), 0); // Approximate: no reliable lock
+}
+
+void TestReplayManagerTimecode::singleSourceServoIsZero() {
+    ReplayManager manager;
+    // A lone source is its own reference -> zero phase -> zero servo (byte-identical
+    // to today; the additive servo only ever touches Bounded/FrameAccurate followers).
+    for (int i = 0; i < 10; ++i)
+        QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 12345678)));
+    QCOMPARE(manager.referenceSource(), 0);
+    QCOMPARE(manager.sourceServoTrimMs(0), 0);
+}
+
+void TestReplayManagerTimecode::servoUsesExactTcOffsetWhenCommonTimecode() {
+    ReplayManager manager;
+    // Both sources carry COMMON timecode; source 1's equal-TC frame lands 2 session
+    // frames LATE (102 vs reference's 100) -> frameOffset(0,1) = -2 frames = -66 ms @30.
+    // Its CLOCK offset implies only -4 ms. The servo must lock to the EXACT TC offset
+    // (drive toward -66, capped at -80), NOT ride the coarse clock signal (-4). Ramp
+    // many pulses: a clock-driven servo would stall at -4; a TC-driven one keeps going.
+    QVERIFY(feedFrameTimecode(manager, 0, tc100ns(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tc100ns(1, 0, 0, 0), 102));
+    for (int i = 0; i < 40; ++i) {
+        QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+        QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 4000000))); // clock +4ms
+    }
+    QCOMPARE(manager.referenceSource(), 0);
+    // TC-driven target = frameOffset(0,1)*1000/30 = -2*33 = -66 ms; clock-driven would
+    // be only -4. Converged well past the clock signal proves the exact-TC path is used.
+    QCOMPARE(manager.sourceServoTrimMs(1), -66);
 }
 
 QTEST_GUILESS_MAIN(TestReplayManagerTimecode)

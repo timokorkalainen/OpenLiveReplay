@@ -252,6 +252,7 @@ void ReplayManager::startRecording() {
     m_referenceSource = -1;
     m_lastStats = QList<IngestStats>(m_sourceUrls.size());
     m_sourceHasStats = QList<bool>(m_sourceUrls.size(), false);
+    m_servoTrimMs = QList<int>(m_sourceUrls.size(), 0); // fresh session: no servo applied
 
     // Session start timecode for the muxer's tmcd/timecode tag is no longer derived
     // here. The muxer now DEFERS its MKV header write to the first muxed packet and
@@ -583,6 +584,64 @@ void ReplayManager::recomputeInterCamPhase() {
         ev.measuredOffsetMs = (cur.clockOffsetNs - refOffsetNs) / 1000000;
 
         m_offsetEstimator.update(s, ev);
+    }
+
+    // 3. Drive the bounded, gentle phase servo toward the reference (Phase 4). Only
+    //    NON-reference sources that are reliably locked to the reference (Bounded or
+    //    FrameAccurate, with a locked recovered clock) get a correction — an
+    //    Approximate / arrival-only source has nothing trustworthy to lock to, so it
+    //    stays where arrival put it and is surfaced honestly. The reference gets 0.
+    //
+    //    Sign: sourcePhaseOffsetMs is POSITIVE for a LATE source; the correction is
+    //    -phase, so a late source gets a NEGATIVE servo trim. A negative trim makes
+    //    targetTimeMs (= recordingTime - jitter - trim) LARGER, pulling NEWER frames —
+    //    i.e. it advances the late source EARLIER, reducing the measured phase toward 0.
+    //
+    //    The target is CAPPED at ±kMaxInterCamCorrectionMs (saturate, never distort),
+    //    and the servo RAMPS toward it by at most kServoStepMs per pulse, so a Bounded
+    //    signal that STEPS on re-anchor can never jerk the timeline by the full cap in
+    //    one update. A zero target (reference / Approximate / single source) relaxes the
+    //    servo gently back to 0, keeping the no-servo path byte-identical at rest.
+    while (m_servoTrimMs.size() < m_lastStats.size())
+        m_servoTrimMs.append(0);
+    for (int s = 0; s < m_lastStats.size(); ++s) {
+        int target = 0;
+        if (s != m_referenceSource && m_sourceHasStats.value(s)) {
+            const ConfidenceTier tier = m_offsetEstimator.tier(s);
+            const bool servoEligible =
+                m_lastStats[s].clockLocked && tier != ConfidenceTier::Approximate;
+            if (servoEligible) {
+                const int64_t cap = kMaxInterCamCorrectionMs;
+                int64_t rawTargetMs;
+                if (m_tcAligner.hasTimecode(s) && m_tcAligner.hasTimecode(m_referenceSource)) {
+                    // Common timecode: lock to the EXACT TC frame offset (frame-
+                    // accurate), not the coarser clock-offset estimate. frameOffset(ref,
+                    // s) is the frame correction to ADD to s's mapping so its equal-TC
+                    // frames coincide with the reference (negative => s is late => shift
+                    // earlier); a negative servo trim pulls newer frames (earlier), so
+                    // the target is frameOffset*ms-per-frame directly. This drives a
+                    // common-TC pair to exact alignment instead of riding clock noise.
+                    const int64_t frames = m_tcAligner.frameOffset(m_referenceSource, s);
+                    rawTargetMs = frames * 1000 / qMax(1, m_fps);
+                } else {
+                    // No common TC: use the bounded clock-offset estimate.
+                    // sourcePhaseOffsetMs is POSITIVE for a late source, correction -phase.
+                    rawTargetMs = -m_offsetEstimator.offsetMs(s);
+                }
+                target = int(qBound<int64_t>(-cap, rawTargetMs, cap));
+            }
+        }
+        const int current = m_servoTrimMs[s];
+        int next = current;
+        if (target > current) {
+            next = qMin(current + kServoStepMs, target);
+        } else if (target < current) {
+            next = qMax(current - kServoStepMs, target);
+        }
+        if (next != current) {
+            m_servoTrimMs[s] = next;
+            if (s < m_workers.size() && m_workers[s]) m_workers[s]->setServoTrimOffsetMs(next);
+        }
     }
 }
 

@@ -104,6 +104,24 @@ public:
     }
     int sourcePhaseBoundMs(int sourceIndex) const { return m_offsetEstimator.boundMs(sourceIndex); }
 
+    // Phase-4 servo cap: the maximum magnitude (ms) of the inter-camera phase
+    // correction applied per source. DELIBERATELY small (a few frames) — the servo
+    // gently nudges a follower toward the reference, never fights the operator trim,
+    // and a saturating phase reading clamps here rather than distorting the timeline.
+    static constexpr int kMaxInterCamCorrectionMs = StreamWorker::kMaxServoTrimMs;
+    // Max servo movement per stats pulse (ms). The ramp: a sudden/stepping Bounded
+    // phase reading moves the servo by at most this much per update, so a re-anchor
+    // step can never jerk the timeline by the full correction in one tick.
+    static constexpr int kServoStepMs = 4;
+
+    // The current inter-camera servo trim (ms) applied to a source's worker — the
+    // ramped, capped correction toward the reference. 0 for the reference, for
+    // Approximate sources, and for a lone source. Observational accessor for tests/UI.
+    int sourceServoTrimMs(int sourceIndex) const {
+        return (sourceIndex >= 0 && sourceIndex < m_servoTrimMs.size()) ? m_servoTrimMs[sourceIndex]
+                                                                        : 0;
+    }
+
 signals:
     // Emitted once per advanced frame: (global frame index, elapsed ms
     // since recording start).  The second value is MILLISECONDS — it was
@@ -214,6 +232,10 @@ private:
     int m_referenceSource = -1;
     QList<IngestStats> m_lastStats;
     QList<bool> m_sourceHasStats;
+    // Current per-source inter-cam servo trim (ms), the ramped+capped correction last
+    // pushed to each worker. Persists across pulses so the ramp accumulates gently
+    // toward the target; reset to 0 on startRecording. Grows on demand like m_lastStats.
+    QList<int> m_servoTrimMs;
 
     qint64 m_recordingStartEpochMs = 0;
 

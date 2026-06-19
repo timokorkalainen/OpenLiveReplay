@@ -113,9 +113,13 @@ void StreamWorker::run() {
 void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     m_internalFrameCount = frameIndex;
 
-    // Snapshot the trim once per pulse so video and audio of this tick use the
-    // SAME offset even if the UI thread changes it mid-pulse (keeps A/V locked).
-    const int64_t trimMs = m_trimOffsetMs.load(std::memory_order_relaxed);
+    // Snapshot BOTH trims once per pulse so video and audio of this tick use the
+    // SAME combined offset even if the UI thread (operator trim) or ReplayManager's
+    // phase servo (servo trim) changes them mid-pulse (keeps A/V locked). The operator
+    // trim and the bounded inter-cam servo COMPOSE additively into one jitter-pull
+    // offset; the servo defaults to 0, so this is byte-identical when no servo runs.
+    const int64_t trimMs = m_trimOffsetMs.load(std::memory_order_relaxed) +
+                           m_servoTrimOffsetMs.load(std::memory_order_relaxed);
 
     // Snapshot the jitter window once per pulse too, so video + audio of this tick
     // share one value even if a URL change flips it mid-pulse (keeps A/V locked).
