@@ -56,6 +56,32 @@ qt_add_executable(ndi_runtime_sender ndi_runtime_sender.cpp)
 target_link_libraries(ndi_runtime_sender PRIVATE
     Qt6::Core olr_test_playback olr_warnings olr_sanitize)
 
+# NDI receiver probe + tier-(a) sender for the rung-5 output validation lane. Both
+# runtime-load the NDI library (no SDK at build time) and link the shared marker/analysis
+# modules.
+qt_add_executable(ndi_recv_probe
+    ndi_recv_probe.cpp
+    ndi_output_marker.cpp
+    ndi_recv_analysis.cpp)
+target_include_directories(ndi_recv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_recv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
+
+qt_add_executable(ndi_output_sender
+    ndi_output_sender.cpp
+    ndi_output_marker.cpp)
+target_include_directories(ndi_output_sender PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_output_sender PRIVATE
+    Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
+add_test(NAME e2e_ndi_output
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
+        "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_output PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
     # before connect by reading the stream ID from a real accepted SRT socket.

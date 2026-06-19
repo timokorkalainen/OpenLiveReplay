@@ -37,6 +37,12 @@ olr_add_unit_test(tst_ndiingest       olr_test_engine)
 olr_add_unit_test(tst_ndimarkerpattern olr_test_core)
 target_sources(tst_ndimarkerpattern PRIVATE
     "${CMAKE_SOURCE_DIR}/tests/e2e/ndi_marker_pattern.cpp")
+olr_add_unit_test(tst_ndioutputmarker)
+target_sources(tst_ndioutputmarker PRIVATE "${CMAKE_SOURCE_DIR}/tests/e2e/ndi_output_marker.cpp")
+target_include_directories(tst_ndioutputmarker PRIVATE "${CMAKE_SOURCE_DIR}")
+olr_add_unit_test(tst_ndirecvanalysis)
+target_sources(tst_ndirecvanalysis PRIVATE "${CMAKE_SOURCE_DIR}/tests/e2e/ndi_recv_analysis.cpp")
+target_include_directories(tst_ndirecvanalysis PRIVATE "${CMAKE_SOURCE_DIR}")
 olr_add_unit_test(tst_rtmpprotocol     olr_test_core)
 if(APPLE)
     add_library(olr_test_nativevideodecoder STATIC
