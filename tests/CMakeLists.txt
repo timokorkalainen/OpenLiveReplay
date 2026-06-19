@@ -85,6 +85,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/timingreference.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/ptpservo.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/ptpreference.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/timing/udpptpclient.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xaccessunit.cpp"

@@ -179,6 +179,12 @@ private:
         return m_timingRef ? m_timingRef->nowSessionMs() : (m_clock ? m_clock->elapsedMs() : 0);
     }
 
+    // Build the per-recording session timebase: a LocalMonotonicReference over
+    // m_clock by default (byte-identical to today; no thread/socket), or — when
+    // OLR_TIMING_PTP=1 — an external PtpReference over a real UdpPtpClient (with
+    // local fallback if PTP fails to start). The single Phase-5 swap point.
+    std::unique_ptr<TimingReference> buildTimingReference();
+
     mutable QMutex m_stateMutex;
     bool m_isRecording = false;
     int64_t m_globalFrameCount = 0;

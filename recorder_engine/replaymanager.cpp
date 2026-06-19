@@ -1,9 +1,12 @@
 #include "replaymanager.h"
 #include "heartbeat.h"
+#include "timing/ptpreference.h"
+#include "timing/udpptpclient.h"
 #include <QDebug>
 #include <QDir>
 #include <QDateTime>
 #include <QJsonDocument>
+#include <QProcessEnvironment>
 #include <QtGlobal>
 
 ReplayManager::ReplayManager(QObject *parent) : QObject(parent) {
@@ -229,6 +232,33 @@ void ReplayManager::cleanupBlueEncoder() {
     m_videoExtradata.clear();
 }
 
+// Build the session timebase for a fresh recording. DEFAULT (no opt-in):
+// byte-identical to today — a LocalMonotonicReference over m_clock, no thread, no
+// socket. OPT-IN (OLR_TIMING_PTP=1): a PtpReference over a real UdpPtpClient PTP
+// slave (interface from OLR_TIMING_PTP_IFACE, else the PTP domain "0"); if the
+// PTP client fails to start, fall back to the local reference so recording never
+// stalls. The whole pipeline already reads session-now via nowSessionMs(), so this
+// is the single constructor swap — no caller changes.
+std::unique_ptr<TimingReference> ReplayManager::buildTimingReference() {
+    const QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    if (env.value(QStringLiteral("OLR_TIMING_PTP")) == QLatin1String("1")) {
+        QString iface = env.value(QStringLiteral("OLR_TIMING_PTP_IFACE"));
+        if (iface.isEmpty()) {
+            iface = QStringLiteral("0"); // PTP domain 0, any interface
+        }
+        auto ptp = std::make_unique<PtpReference>(std::make_unique<UdpPtpClient>(), iface);
+        if (ptp->start()) {
+            qDebug() << "ReplayManager: PTP timing reference enabled (iface/domain" << iface
+                     << ") — falls back to local until the grandmaster locks.";
+            return ptp;
+        }
+        qWarning() << "ReplayManager: PTP opted in but UdpPtpClient failed to start;"
+                   << "falling back to local monotonic reference.";
+    }
+    // Default: local monotonic — byte-identical to m_clock->elapsedMs().
+    return std::make_unique<LocalMonotonicReference>(m_clock);
+}
+
 // ─── Recording lifecycle ───────────────────────────────────────────────
 void ReplayManager::startRecording() {
     QMutexLocker locker(&m_stateMutex);
@@ -311,10 +341,11 @@ void ReplayManager::startRecording() {
     m_clock = new RecordingClock();
     m_clock->start();
     // Rebuild the session timebase over the FRESH clock (m_clock is re-new'd per
-    // recording). Today a LocalMonotonicReference — byte-identical to m_clock->elapsedMs();
-    // the Phase-5 swap point for an external (PTP) reference. Holds m_clock NON-owningly,
+    // recording). The Phase-5 swap point: by default a LocalMonotonicReference —
+    // byte-identical to m_clock->elapsedMs(); when PTP is OPTED IN (OLR_TIMING_PTP=1)
+    // an external PtpReference over a real UdpPtpClient. Holds m_clock NON-owningly,
     // so it is rebuilt here and reset in stopRecording before m_clock is deleted.
-    m_timingRef = std::make_unique<LocalMonotonicReference>(m_clock);
+    m_timingRef = buildTimingReference();
     m_recordingStartEpochMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
 
     // 4. Launch one StreamWorker PER SOURCE (not per view).
@@ -599,7 +630,12 @@ void ReplayManager::recomputeInterCamPhase() {
         // coincide with the reference (the reference trivially aligns to itself).
         ev.timecodeAlignedToReference =
             (s == m_referenceSource) || m_tcAligner.sourcesAligned(m_referenceSource, s, 0);
-        ev.externalReference = false; // Phase 5 sets this (PTP/genlock); none today.
+        // Phase 5: once an external reference (PTP) is LOCKED, mark every source as
+        // disciplined to facility time so the SourceOffsetEstimator promotes those
+        // phase-locked to the disciplined session estimate to FrameAccurate. With the
+        // default LocalMonotonicReference (no PTP), isExternal() is false → unchanged
+        // from Phase 4.
+        ev.externalReference = m_timingRef && m_timingRef->isExternal();
         // Measured phase: the source's recovered offset minus the reference's. This is
         // a Bounded-tier signal — it has the right sign/units (sub-frame) and steps on
         // re-anchor, so it never grades FrameAccurate on its own (TC does that).

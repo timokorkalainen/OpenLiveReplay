@@ -92,6 +92,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/timing/iptpclient.h
         recorder_engine/timing/ptpservo.h recorder_engine/timing/ptpservo.cpp
         recorder_engine/timing/ptpreference.h recorder_engine/timing/ptpreference.cpp
+        recorder_engine/timing/udpptpclient.h recorder_engine/timing/udpptpclient.cpp
         recorder_engine/muxer.h recorder_engine/muxer.cpp
         recorder_engine/streamworker.h recorder_engine/streamworker.cpp
         recorder_engine/recordingclock.h recorder_engine/recordingclock.cpp
