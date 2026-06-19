@@ -360,6 +360,9 @@ public slots:
 private:
     QString benchmarkCachePath() const;
     static QVariantMap resultToVariantMap(const CodecBenchmarkResult& r);
+    // Recomputes m_benchmarkSafeFeedsForChosen from m_benchmarkResult and the
+    // current m_currentSettings.videoCodec. Returns -1 when no result is loaded.
+    void updateSafeFeedsForChosen();
     void syncActiveStreams();
     int activeViewCount() const;
     QStringList activeStreamUrls() const;

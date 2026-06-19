@@ -24,6 +24,22 @@ ApplicationWindow {
     // Last recording-start failure reason, surfaced near the record button.
     // Cleared on a successful recording start.
     property string recordingError: ""
+    // Soft warning from recordingWarning signal (e.g. feed-count exceeds safe
+    // benchmark limit). Has its OWN surface — recordingStarted/recordingFailed
+    // do NOT clear this; it auto-dismisses after ~8 s or on manual close.
+    property string recordingWarningText: ""
+
+    function showRecordingWarning(msg) {
+        appWindow.recordingWarningText = msg
+        recordingWarningDismissTimer.restart()
+    }
+
+    Timer {
+        id: recordingWarningDismissTimer
+        interval: 8000
+        repeat: false
+        onTriggered: appWindow.recordingWarningText = ""
+    }
 
     Component.onCompleted: {
         appWindow.uiManagerRef.loadSettings()
@@ -129,7 +145,9 @@ ApplicationWindow {
             }
         }
         function onRecordingWarning(msg) {
-            appWindow.recordingError = msg
+            // Soft warning gets its OWN property so that the recordingStarted
+            // handler (which clears recordingError) cannot erase it (C2).
+            appWindow.showRecordingWarning(msg)
         }
     }
 
@@ -253,6 +271,18 @@ ApplicationWindow {
                         color: appWindow.recordingError !== ""
                                ? "#ffb300"
                                : (appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666")
+                    }
+
+                    // Soft recording warning (e.g. feeds exceed the benchmarked safe
+                    // count). Separate from recordingError so onRecordingStarted /
+                    // onRecordingFailed (which clear recordingError) cannot erase it;
+                    // auto-dismissed by recordingWarningDismissTimer. (C2)
+                    Text {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        visible: appWindow.recordingWarningText !== ""
+                        text: "⚠ " + appWindow.recordingWarningText
+                        color: "#ffb300"
                     }
 
                     RowLayout {
