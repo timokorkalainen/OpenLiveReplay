@@ -106,6 +106,7 @@ qt_add_qml_module(OpenLiveReplay
         settingsmanager.h settingsmanager.cpp
         uimanager.h uimanager.cpp
         playback/playbackworker.h playback/playbackworker.cpp
+        playback/frameindex.h playback/frameindex.cpp
         playback/framerate.h
         playback/frameprovider.h playback/frameprovider.cpp
         playback/playbacktransport.h playback/playbacktransport.cpp

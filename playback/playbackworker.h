@@ -14,6 +14,7 @@
 #include <vector>
 #include "frameprovider.h"
 #include "playback/commitgate.h"
+#include "playback/frameindex.h"
 #include "playback/output/outputruntime.h"
 #include "playback/output/sharedcacheslot.h"
 #include "playback/output/outputtargetassignment.h"
@@ -171,6 +172,14 @@ private:
     // re-decoding an overlapping window every iteration. INT64_MAX = no
     // fetch yet this run; reset on reposition and whenever travelling forward.
     int64_t m_reverseAnchorMs = INT64_MAX;
+
+    // PTS(ms) -> byte-offset index of the primary video stream, appended as
+    // packets are read (worker-thread-only; no mutex). All recordings are
+    // ALL-INTRA, so any indexed offset is a valid standalone decode start; the
+    // full-reposition path avio_seeks straight to nearestAtOrBefore(target)
+    // instead of the coarse av_seek_frame anchor, shortening the forward fill.
+    // Survives clearDecoderBuffers (only the per-track frame buffers are wiped).
+    FrameIndex m_frameIndex;
 
     // Seek-gate generations (read in makeOutputSnapshot; written in seekTo /
     // repositionTo). When m_committedGeneration == m_seekGeneration there is no
