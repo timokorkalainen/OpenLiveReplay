@@ -161,6 +161,22 @@ QString confidenceTierLabel(int tier) {
     }
 }
 
+// Maps a ReplayManager ReferenceTier (the Phase-5 session timebase tier, stored as int)
+// + its external/locked flag to the operator-facing label shown on the session timing
+// status surface. Mirrors clockQualityLabel / confidenceTierLabel above. LocalMonotonic
+// is the default (no external reference); Ptp reads "PTP (external)" once locked, or
+// "PTP (acquiring)" while a PtpReference is opted-in but not yet disciplined.
+QString referenceTierLabel(int tier, bool external) {
+    switch (tier) {
+    case 2: // ReferenceTier::Ptp
+        return external ? QStringLiteral("PTP (external)") : QStringLiteral("PTP (acquiring)");
+    case 1: // ReferenceTier::RecoveredConsensus
+        return QStringLiteral("recovered consensus");
+    default: // ReferenceTier::LocalMonotonic
+        return QStringLiteral("local monotonic");
+    }
+}
+
 // The inter-camera phase line for the source health tooltip, built from the Phase-4
 // fields ReplayManager stamps onto the relayed IngestStats. The reference source (and
 // a lone source, which is its own reference) reads "phase     reference"; a follower
@@ -196,6 +212,17 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
             &UIManager::onSourceConnectionChanged, Qt::QueuedConnection);
     connect(m_replayManager, &ReplayManager::sourceStatsUpdated, this,
             &UIManager::onSourceStatsUpdated, Qt::QueuedConnection);
+    // Phase 5: mirror the session timing-reference tier/lock state so the status surface
+    // shows the authoritative timebase (local monotonic by default; PTP once locked).
+    connect(
+        m_replayManager, &ReplayManager::referenceTierChanged, this,
+        [this](int tier, bool external) {
+            if (tier == m_sessionReferenceTier && external == m_sessionReferenceExternal) return;
+            m_sessionReferenceTier = tier;
+            m_sessionReferenceExternal = external;
+            emit sessionReferenceChanged();
+        },
+        Qt::QueuedConnection);
     m_broadcastOutputStatusTimer.setInterval(500);
     connect(&m_broadcastOutputStatusTimer, &QTimer::timeout, this, [this]() {
         const OutputDispatchStats stats =
@@ -1220,6 +1247,18 @@ int UIManager::sourceConfidenceTier(int sourceIndex) const {
     if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size()))
         return int(ConfidenceTier::Approximate);
     return m_sourceStats[sourceIndex].last.confidenceTier;
+}
+
+int UIManager::sessionReferenceTier() const {
+    return m_sessionReferenceTier;
+}
+
+QString UIManager::sessionReferenceStatus() const {
+    // Session-level one-liner for the timing status surface (mirrors the per-source
+    // tooltip's aligned "label    value" layout). Reads the cached tier/external state
+    // the engine relays via referenceTierChanged.
+    return QStringLiteral("timing    %1")
+        .arg(referenceTierLabel(m_sessionReferenceTier, m_sessionReferenceExternal));
 }
 
 QString UIManager::sourceStatsTooltip(int sourceIndex) const {

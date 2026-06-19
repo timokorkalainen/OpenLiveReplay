@@ -104,6 +104,10 @@ class UIManager : public QObject {
         int broadcastOutputsVersion READ broadcastOutputsVersion NOTIFY broadcastOutputsChanged)
     Q_PROPERTY(int broadcastOutputStatusVersion READ broadcastOutputStatusVersion NOTIFY
                    broadcastOutputStatusChanged)
+    // Phase 5: the session timing-reference tier (0=LocalMonotonic, 1=RecoveredConsensus,
+    // 2=Ptp), surfaced so the session status surface can show which timebase is
+    // authoritative. Defaults to LocalMonotonic — byte-identical when PTP is off.
+    Q_PROPERTY(int sessionReferenceTier READ sessionReferenceTier NOTIFY sessionReferenceChanged)
 
 public:
     explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
@@ -255,6 +259,14 @@ public:
     // source: 0=Approximate, 1=Bounded, 2=FrameAccurate. 0 (Approximate) until the
     // source has reported stats. Refreshed on sourceStatsChanged like the other dot bindings.
     Q_INVOKABLE int sourceConfidenceTier(int sourceIndex) const;
+    // Phase 5 session-level timing reference. sessionReferenceTier() relays
+    // ReplayManager::referenceTier() (0=LocalMonotonic, 1=RecoveredConsensus, 2=Ptp);
+    // sessionReferenceStatus() is the one-line operator string for the session status
+    // surface / tooltip — e.g. "timing    PTP (external)" or "timing    local monotonic"
+    // — mapping the tier+external state to a label exactly like clockQualityLabel /
+    // confidenceTierLabel do for the per-source dot. Both default to local monotonic.
+    Q_INVOKABLE int sessionReferenceTier() const;
+    Q_INVOKABLE QString sessionReferenceStatus() const;
     // Config-time check: another source carries the same non-empty URL.
     // Surfaces the duplicate-stream misconfiguration that two workers
     // pulling one URL otherwise hides.
@@ -339,6 +351,10 @@ signals:
     void telemetryChanged();
     void broadcastOutputsChanged();
     void broadcastOutputStatusChanged();
+    // Phase 5: the session timing-reference tier/lock state changed (relayed from
+    // ReplayManager::referenceTierChanged) — drives the sessionReferenceTier property
+    // + the sessionReferenceStatus() line.
+    void sessionReferenceChanged();
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -462,6 +478,11 @@ private:
     std::vector<IngestStatsEntry> m_sourceStats;
     int m_sourceStatsVersion = 0;
     double m_srtAmberPct = 0.02; // retransmit-rate threshold for Amber
+    // Phase 5: cached session timing-reference state, mirrored from
+    // ReplayManager::referenceTierChanged so the QML status surface binds without
+    // calling into the engine on every paint. Defaults to the local monotonic tier.
+    int m_sessionReferenceTier = 0; // 0=LocalMonotonic (ReferenceTier)
+    bool m_sessionReferenceExternal = false;
     void resetSourceStats(int count);
     void resetSourceConnection();
     void updateReplayTelemetryFeeds();

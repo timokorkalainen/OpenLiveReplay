@@ -166,6 +166,54 @@ flake, not a servo defect, so it never **FAILs** the gate. Like the timecode cel
 connect still wins the deferred MKV header. In report-only mode the cell prints the measured
 spread + tier/phase and never gates.
 
+## Timing Reference Tiers & PTP (Phase 5)
+
+The session timebase is read through a single `TimingReference` seam
+(`recorder_engine/timing/timingreference.h`), which advertises a **reference tier** —
+ascending trust — and whether it is **external** (a real reference is locked):
+
+- **`LocalMonotonic` (tier 0, default).** `LocalMonotonicReference` wraps the existing
+  `RecordingClock` (`nowSessionNs() == elapsedMs()*1e6`). Not external. **Byte-identical to
+  every prior phase** — this is what all the gates above run on. The session "now" is the
+  recorder's own monotonic clock.
+- **`RecoveredConsensus` (tier 1, reserved).** A consensus of the recovered sender clocks —
+  the seam reserves it; not built.
+- **`Ptp` (tier 2, opt-in).** `PtpReference` is an ST 2059 / IEEE 1588 **software** PTP
+  slave: a pure `PtpServo` disciplines an offset + mean-path-delay against a grandmaster
+  behind an `IPtpClient` backend (faked in unit tests; the real `UdpPtpClient` runs over UDP
+  319/320). Enabled with `OLR_TIMING_PTP=1` (`OLR_TIMING_PTP_IFACE` picks the domain/iface);
+  it falls back to local if it fails to start, and `nowSessionNs()` falls back to local
+  monotonic **before lock** so the pipeline never stalls waiting for PTP.
+
+**How PTP promotes sources to `FrameAccurate`.** Once the `PtpReference` locks,
+`isExternal()` flips true and the session timebase is **facility time**. `ReplayManager`
+feeds that external-reference state into the Phase-4 `SourceOffsetEstimator` via
+`SourcePhaseEvidence::externalReference`, so any source whose recovered clock phase-locks to
+the PTP-disciplined session estimate grades **`FrameAccurate`** — *without* needing common
+timecode (TC is one route to FrameAccurate; an external reference is the other). With the
+default `LocalMonotonicReference`, `externalReference` stays false and grading is exactly the
+Phase-4 behavior — no change. The active tier + lock state are surfaced to the operator
+(`ReplayManager::referenceTier()`/`referenceIsExternal()` → `UIManager::sessionReferenceTier()`
+/`sessionReferenceStatus()`, e.g. `timing    PTP (external)` vs `timing    local monotonic`).
+
+**The honest PTP ceiling.** This client uses **software timestamps**, so its accuracy is
+*tens of microseconds* on a quiet LAN — much better than clockless IP, but **not** NIC-PHC /
+genlock-grade. The top tier — true sub-frame, genlock-grade lock — needs **hardware
+timestamping or a genlocked SDI/ST 2110 capture path**, a separate program that plugs a
+facility-time `TimingReference` / hardware-`IPtpClient` backend into the *same* seam. The
+seam is built so that is a backend swap, not a rewrite; the achieved tier is always surfaced
+honestly via `tier()`/`isExternal()` rather than overclaimed.
+
+PTP itself is exercised at the unit level (`tst_ptpservo`, `tst_ptpreference`,
+`tst_timingreference`, `tst_udpptpclient`) with a fake `IPtpClient`; a live grandmaster on
+the LAN is a manual/integration check (`OLR_TIMING_PTP=1` → `PtpReference::locked()` flips
+true, the UI shows `PTP (external)`, and PTP-disciplined sources report `FrameAccurate`).
+
+**Frame-sync program status: COMPLETE.** Phases 0–5 (heartbeat decoupling → timing core →
+source-clock recovery → timecode → inter-camera phase servo → reference-clock / PTP seam)
+are all delivered. The remaining work — genlocked SDI/ST 2110 output and hardware
+timestamping — is the *separate* true-broadcast-output / hardware-capture program.
+
 ## Running It
 
 Build `sync_harness`, then run the CTest label:
@@ -258,6 +306,11 @@ accuracy first, then gates only the guarantees the transport can actually make.
 The Phase-4 servo delivers frame-accurate inter-camera lock **only** with common
 TC (graded `FrameAccurate`, recorded spread mean within one frame); other locked
 sources get a `Bounded`-and-measured `±ms` correction, and `Approximate` sources
-get no servo and are surfaced honestly. Sub-frame, genlock-grade phase lock is the
-Phase-5 PTP (ST 2059) / reference-clock ceiling, not something arrival-anchored
-common-TC alignment can reach.
+get no servo and are surfaced honestly. Phase 5 adds the **external-reference**
+route to `FrameAccurate`: an opt-in software PTP (ST 2059) slave
+(`OLR_TIMING_PTP=1`) becomes an external `TimingReference` and promotes
+phase-locked sources to `FrameAccurate` without common TC — see "Timing Reference
+Tiers & PTP" above. Its ceiling is **software-PTP precision (~tens of µs)**, not
+NIC-PHC. Sub-frame, genlock-grade phase lock needs hardware timestamping or a
+genlocked SDI/ST 2110 capture path — the separate true-broadcast-output program,
+which the Phase-5 seam is built to accept as a backend swap.

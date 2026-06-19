@@ -346,6 +346,11 @@ void ReplayManager::startRecording() {
     // an external PtpReference over a real UdpPtpClient. Holds m_clock NON-owningly,
     // so it is rebuilt here and reset in stopRecording before m_clock is deleted.
     m_timingRef = buildTimingReference();
+    // Seed + publish the Phase-5 reference tier for the UI. recomputeInterCamPhase then
+    // re-emits referenceTierChanged only on a later flip (e.g. PTP locking mid-session).
+    m_lastReferenceTier = referenceTier();
+    m_lastReferenceExternal = referenceIsExternal();
+    emit referenceTierChanged(m_lastReferenceTier, m_lastReferenceExternal);
     m_recordingStartEpochMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
 
     // 4. Launch one StreamWorker PER SOURCE (not per view).
@@ -600,6 +605,20 @@ void ReplayManager::onSourcePhaseConnectionChanged(int sourceIndex, bool connect
 }
 
 void ReplayManager::recomputeInterCamPhase() {
+    // 0. Poll the Phase-5 timing reference and emit referenceTierChanged ONLY on a flip
+    //    (e.g. a PtpReference locking to the grandmaster mid-session). This runs on every
+    //    stats pulse (~1/sec) — no new timer. With the default LocalMonotonicReference the
+    //    tier/external never change, so this never emits: byte-identical to Phase 4.
+    {
+        const int curTier = referenceTier();
+        const bool curExternal = referenceIsExternal();
+        if (curTier != m_lastReferenceTier || curExternal != m_lastReferenceExternal) {
+            m_lastReferenceTier = curTier;
+            m_lastReferenceExternal = curExternal;
+            emit referenceTierChanged(curTier, curExternal);
+        }
+    }
+
     // 1. Pick the reference: the source with reported stats whose recovered clock has
     //    the highest ClockQuality; ties break to the lowest index. An externalReference
     //    source (Phase 5) always wins — not present today (LocalMonotonic), so it folds

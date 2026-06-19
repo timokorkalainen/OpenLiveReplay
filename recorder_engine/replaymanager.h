@@ -125,6 +125,18 @@ public:
                                                                         : 0;
     }
 
+    // Phase-5 timing-reference surface (for the UI). referenceTier() is the
+    // ReferenceTier (LocalMonotonic / RecoveredConsensus / Ptp) of the session
+    // timebase, as an int so QML/UIManager can map it to a label; referenceIsExternal()
+    // is true once a real reference (PTP) has LOCKED. With the default
+    // LocalMonotonicReference (no PTP) the tier is LocalMonotonic (0) and not external
+    // — byte-identical to today. Before startRecording (no reference built yet) they
+    // return the same safe default, so the UI never reads a stale/uninitialised tier.
+    int referenceTier() const {
+        return m_timingRef ? int(m_timingRef->tier()) : int(ReferenceTier::LocalMonotonic);
+    }
+    bool referenceIsExternal() const { return m_timingRef && m_timingRef->isExternal(); }
+
 signals:
     // Emitted once per advanced frame: (global frame index, elapsed ms
     // since recording start).  The second value is MILLISECONDS — it was
@@ -140,6 +152,13 @@ signals:
 
     // Emitted after a per-feed telemetry packet has been stamped and written.
     void telemetryRecorded(const QString &feedId, const QJsonObject &payload, qint64 effectiveMs);
+
+    // Phase 5: emitted when the session timing reference's lock state flips — e.g. a
+    // PtpReference disciplines to the grandmaster (LocalMonotonic→Ptp, external=true)
+    // or loses lock. Polled from recomputeInterCamPhase (which already runs ~1/sec on
+    // every stats pulse), so the UIManager can refresh its session reference status.
+    // Never fires with the default LocalMonotonicReference (tier/external never change).
+    void referenceTierChanged(int tier, bool external);
 
 private slots:
     void onTimerTick();
@@ -259,6 +278,11 @@ private:
     int m_referenceSource = -1;
     QList<IngestStats> m_lastStats;
     QList<bool> m_sourceHasStats;
+    // Last-emitted timing-reference state (Phase 5), so recomputeInterCamPhase emits
+    // referenceTierChanged ONLY on a flip (e.g. PTP locking) rather than every pulse.
+    // Seeded to the build-time default (LocalMonotonic, not external) in startRecording.
+    int m_lastReferenceTier = int(ReferenceTier::LocalMonotonic);
+    bool m_lastReferenceExternal = false;
     // Current per-source inter-cam servo trim (ms), the ramped+capped correction last
     // pushed to each worker. Persists across pulses so the ramp accumulates gently
     // toward the target; reset to 0 on startRecording. Grows on demand like m_lastStats.
