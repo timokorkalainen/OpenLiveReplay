@@ -7,6 +7,7 @@ CodecBenchmark::CodecResult CodecBenchmark::rampCodec(
     if (!runner.available()) return out;
 
     const QVector<int> steps = benchmarkRampSteps();
+    const int lastStep = steps.last();
     for (int i = 0; i < steps.size(); ++i) {
         if (cancel.load(std::memory_order_acquire)) break;
         const int n = steps[i];
@@ -15,7 +16,7 @@ CodecBenchmark::CodecResult CodecBenchmark::rampCodec(
         const bool sustained = rampStepSustained(r);
         if (onStep) onStep(n, sustained);
         if (!sustained) break;                  // stop at first failing step
-        if (n == steps.last()) out.ceilingReached = true; // reached 32 still sustaining
+        if (n == lastStep) out.ceilingReached = true; // reached 32 still sustaining
     }
     out.safeFeeds = safeFeedCount(out.steps);
     out.ceiling = ceilingFeedCount(out.steps);
@@ -23,6 +24,7 @@ CodecBenchmark::CodecResult CodecBenchmark::rampCodec(
     for (const RampStepResult& r : out.steps)
         if (rampStepSustained(r) && r.concurrency == out.ceiling) {
             out.encodeMs = r.avgEncodeMs; out.decodeMs = r.avgDecodeMs;
+            break;
         }
     return out;
 }
