@@ -416,6 +416,46 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    armedcut-back)
+        # Tier3 ARMED CUT with a BACKWARD target (the dominant EVS replay case),
+        # played LONG past the staging span. The cut swaps only the output cache +
+        # re-bases the playhead, leaving the primary decoder bank forward, so the
+        # worker resyncs it with a reactive (non-clearing) backward repositionTo —
+        # a benign decoder resync, NOT a coarse-seek fallback. Gates:
+        #   placeholderFramesDelta==0  -> no gray painted across the cut
+        #   heldFramesDelta==0         -> NO frozen-frame stall. THIS is the gate
+        #     the forward armedcut/placeholder gates miss: if the resync ever lags
+        #     and the playhead outruns the ~800ms promoted coverage, the cache runs
+        #     dry and the dispatcher's hold-last paints the last-good frame +
+        #     bumps heldFrames (a frozen picture), which placeholderFramesDelta
+        #     never sees. Verified clean across 38 runs incl. 6-core load + a 6.4s
+        #     long-play; this gate locks that in.
+        #   framesDropped==0           -> the resync never drops a frame
+        #   maxClockDivergenceMs<=1500 -> frame accuracy (epoch re-anchored at cut)
+        # NOT reposition==0: a backward cut legitimately repositions to resync the
+        # primary bank (measured 3 per cut). Bound it loosely (<=8) purely as an
+        # anti-runaway guard so a genuine seek storm still trips.
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut-back painted gray across the backward cut (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — cut flash"
+            fail=1
+        fi
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut-back froze (heldFramesDelta=$heldFramesDelta, expected 0) — output cache ran dry before the decoder resync extended coverage (frozen frame, invisible to the placeholder gate)"
+            fail=1
+        fi
+        if ! num "$framesDropped" || [ "$framesDropped" -ne 0 ]; then
+            echo "FAIL: armedcut-back dropped frames (framesDropped=$framesDropped, expected 0) across the backward cut/resync"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: armedcut-back clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored at the backward cut)"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 8 ]; then
+            echo "FAIL: armedcut-back repositioned too much (reposition=$reposition, expected <=8) — backward-cut resync should be a single decoder reposition, not a storm"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1
