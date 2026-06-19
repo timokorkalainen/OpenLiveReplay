@@ -49,6 +49,12 @@ public:
     // Max magnitude of the per-source timeline trim (ms). +delay / -advance.
     static constexpr int kMaxTrimMs = 500;
 
+    // Max magnitude of the inter-camera phase servo trim (ms). DELIBERATELY small:
+    // it nudges a follower source toward the reference by a few frames, never fights
+    // the operator trim, and never jerks the timeline. Driven by ReplayManager
+    // (Phase 4), summed with the operator trim once per pulse.
+    static constexpr int kMaxServoTrimMs = 80;
+
     // Recorded audio format (48 kHz stereo S16, conformed by swresample)
     static constexpr int kAudioSampleRate = 48000;
     static constexpr int kAudioBytesPerSample = 2 * int(sizeof(int16_t));
@@ -75,6 +81,17 @@ public:
     // unaffected.
     void setTrimOffsetMs(int ms) {
         m_trimOffsetMs.store(qBound(-kMaxTrimMs, ms, kMaxTrimMs), std::memory_order_relaxed);
+    }
+
+    // Inter-camera phase servo trim in ms (+delay / -advance), SEPARATE from the
+    // operator trim above and clamped to ±kMaxServoTrimMs. Driven by ReplayManager's
+    // bounded phase servo (Phase 4). Snapshotted alongside the operator trim once per
+    // pulse (onMasterPulse) and SUMMED into the same jitter-pull target, so operator +
+    // servo compose into one offset and stay A/V-locked. 0 (the default) is
+    // byte-identical to today.
+    void setServoTrimOffsetMs(int ms) {
+        m_servoTrimOffsetMs.store(qBound(-kMaxServoTrimMs, ms, kMaxServoTrimMs),
+                                  std::memory_order_relaxed);
     }
 
     // Per-source metadata JSON blob written to the subtitle track each frame
@@ -159,6 +176,10 @@ private:
     // signed ms (+delay / -advance). Relaxed: standalone value, no associated
     // data to synchronize. Only setTrimOffsetMs() (clamped) writes it.
     std::atomic<int> m_trimOffsetMs{0};
+    // Inter-camera phase servo trim (signed ms, +delay / -advance), SEPARATE from the
+    // operator trim and clamped to ±kMaxServoTrimMs. Only setServoTrimOffsetMs() writes
+    // it; summed with m_trimOffsetMs once per pulse in onMasterPulse. Default 0.
+    std::atomic<int> m_servoTrimOffsetMs{0};
     // Per-source jitter window (ms), chosen by transport in captureLoop and read by
     // the tick thread. Defaults to kJitterBufferMs until the URL is resolved.
     std::atomic<int> m_activeJitterWindowMs{kJitterBufferMs};

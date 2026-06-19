@@ -148,6 +148,39 @@ QString clockQualityLabel(int quality) {
     }
 }
 
+// Maps IngestStats::confidenceTier (a ConfidenceTier enum stored as int) to the
+// operator-facing inter-camera confidence label shown in the source health tooltip.
+QString confidenceTierLabel(int tier) {
+    switch (tier) {
+    case 2:
+        return QStringLiteral("FrameAccurate");
+    case 1:
+        return QStringLiteral("Bounded");
+    default:
+        return QStringLiteral("Approximate");
+    }
+}
+
+// The inter-camera phase line for the source health tooltip, built from the Phase-4
+// fields ReplayManager stamps onto the relayed IngestStats. The reference source (and
+// a lone source, which is its own reference) reads "phase     reference"; a follower
+// reads e.g. "phase     +12 ms  (Bounded ±4)" — signed phase, the tier, and the
+// numeric ±ms bound (FrameAccurate carries no bound, so it shows just the tier).
+QString interCamPhaseLine(const IngestStats& s) {
+    if (s.isReference) {
+        return QStringLiteral("\nphase     reference");
+    }
+    const QString sign = s.interCamPhaseMs >= 0 ? QStringLiteral("+") : QString();
+    const QString tier = confidenceTierLabel(s.confidenceTier);
+    if (s.confidenceTier == 2) { // FrameAccurate: exact, no ±ms bound
+        return QStringLiteral("\nphase     %1%2 ms  (%3)")
+            .arg(sign, QString::number(qlonglong(s.interCamPhaseMs)), tier);
+    }
+    return QStringLiteral("\nphase     %1%2 ms  (%3 ±%4)")
+        .arg(sign, QString::number(qlonglong(s.interCamPhaseMs)), tier,
+             QString::number(s.interCamBoundMs));
+}
+
 } // namespace
 
 UIManager::UIManager(ReplayManager* engine, QObject* parent)
@@ -1183,6 +1216,12 @@ bool UIManager::sourceHasStats(int sourceIndex) const {
     return m_sourceStats[sourceIndex].seen;
 }
 
+int UIManager::sourceConfidenceTier(int sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size()))
+        return int(ConfidenceTier::Approximate);
+    return m_sourceStats[sourceIndex].last.confidenceTier;
+}
+
 QString UIManager::sourceStatsTooltip(int sourceIndex) const {
     if (sourceIndex < 0 || sourceIndex >= int(m_sourceStats.size()) ||
         !m_sourceStats[sourceIndex].seen) {
@@ -1190,17 +1229,26 @@ QString UIManager::sourceStatsTooltip(int sourceIndex) const {
     }
     const IngestStats& s = m_sourceStats[sourceIndex].last;
     const QLocale loc;
-    // Recovered source-clock line, shown for every backend.
+    // Shared timing block, shown for every backend: the recovered source-clock line
+    // plus the Phase-4 inter-camera phase + confidence line.
     const QString clockLine =
         QStringLiteral("\nclock     %1%2 ppm  (%3)")
             .arg(s.clockPpm >= 0.0 ? QStringLiteral("+") : QString(),
                  QString::number(s.clockPpm, 'f', 1), clockQualityLabel(s.clockQuality));
+    const QString timing = clockLine + interCamPhaseLine(s);
     if (s.kind == IngestStatsKind::Rtmp) {
         return QStringLiteral("RTMP link\nreceived   %1 bytes\nkeyframe   %2 ms ago\ndecode err %3")
                    .arg(loc.toString(qulonglong(s.bytesTotal)),
                         loc.toString(qlonglong(s.keyframeAgeMs)),
                         loc.toString(qulonglong(s.decodeFailures))) +
-               clockLine;
+               timing;
+    }
+    if (s.kind == IngestStatsKind::Ndi) {
+        return QStringLiteral("NDI link\nreceived   %1 bytes\nkeyframe   %2 ms ago\ndecode err %3")
+                   .arg(loc.toString(qulonglong(s.bytesTotal)),
+                        loc.toString(qlonglong(s.keyframeAgeMs)),
+                        loc.toString(qulonglong(s.decodeFailures))) +
+               timing;
     }
     QString pct = QStringLiteral("0.0");
     if (s.recvTotal > 0)
@@ -1209,7 +1257,7 @@ QString UIManager::sourceStatsTooltip(int sourceIndex) const {
                .arg(loc.toString(qlonglong(s.recvTotal)), loc.toString(qlonglong(s.retransTotal)),
                     pct, loc.toString(qlonglong(s.lossTotal)),
                     loc.toString(qlonglong(s.dropTotal))) +
-           clockLine;
+           timing;
 }
 
 void UIManager::resetSourceStats(int count) {

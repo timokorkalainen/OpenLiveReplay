@@ -16,6 +16,7 @@
 #include "recorder_engine/codec/videocodecchoice.h"
 #include "recorder_engine/codec/nativevideoencoder.h"
 #include "timing/timecodealigner.h"
+#include "timing/sourceoffsetestimator.h"
 
 class ReplayManager : public QObject
 {
@@ -88,6 +89,39 @@ public:
     bool sourcesFrameAligned(int a, int b) const { return m_tcAligner.sourcesAligned(a, b, 0); }
     int64_t sourceFrameOffset(int a, int b) const { return m_tcAligner.frameOffset(a, b); }
 
+    // Inter-camera phase servo evidence (Phase 4). The reference source is the
+    // session anchor — the connected source with the highest ClockQuality (ties
+    // broken by lowest index); -1 until any source has reported stats. The other
+    // accessors expose the SourceOffsetEstimator result the servo (Task 4) and the
+    // UI (Task 5) consume: each source's confidence tier, its measured phase to the
+    // reference in ms, and the +/-ms bound on that phase. The reference's own phase
+    // is 0 by construction. These are purely observational — additive, no effect on
+    // recording/sync/stats until a later task wires the correction.
+    int referenceSource() const { return m_referenceSource; }
+    ConfidenceTier sourceTier(int sourceIndex) const { return m_offsetEstimator.tier(sourceIndex); }
+    int64_t sourcePhaseOffsetMs(int sourceIndex) const {
+        return m_offsetEstimator.offsetMs(sourceIndex);
+    }
+    int sourcePhaseBoundMs(int sourceIndex) const { return m_offsetEstimator.boundMs(sourceIndex); }
+
+    // Phase-4 servo cap: the maximum magnitude (ms) of the inter-camera phase
+    // correction applied per source. DELIBERATELY small (a few frames) — the servo
+    // gently nudges a follower toward the reference, never fights the operator trim,
+    // and a saturating phase reading clamps here rather than distorting the timeline.
+    static constexpr int kMaxInterCamCorrectionMs = StreamWorker::kMaxServoTrimMs;
+    // Max servo movement per stats pulse (ms). The ramp: a sudden/stepping Bounded
+    // phase reading moves the servo by at most this much per update, so a re-anchor
+    // step can never jerk the timeline by the full correction in one tick.
+    static constexpr int kServoStepMs = 4;
+
+    // The current inter-camera servo trim (ms) applied to a source's worker — the
+    // ramped, capped correction toward the reference. 0 for the reference, for
+    // Approximate sources, and for a lone source. Observational accessor for tests/UI.
+    int sourceServoTrimMs(int sourceIndex) const {
+        return (sourceIndex >= 0 && sourceIndex < m_servoTrimMs.size()) ? m_servoTrimMs[sourceIndex]
+                                                                        : 0;
+    }
+
 signals:
     // Emitted once per advanced frame: (global frame index, elapsed ms
     // since recording start).  The second value is MILLISECONDS — it was
@@ -112,8 +146,26 @@ private slots:
     // so two sources' equal-TC frames can be compared (sourcesFrameAligned).
     void onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns, int64_t sessionFrameIndex);
 
+    // Queued from each StreamWorker::statsUpdated (~1/sec). Caches the source's
+    // latest IngestStats, re-runs the inter-camera phase estimation, then STAMPS the
+    // additive Phase-4 fields (confidenceTier/interCamPhaseMs/interCamBoundMs/
+    // isReference) from the estimator onto the relayed copy and emits it as
+    // sourceStatsUpdated for the UI — every PRE-EXISTING field stays byte-identical;
+    // only the additive estimator fields are augmented (no new signal).
+    void onSourceStatsUpdated(int sourceIndex, IngestStats stats);
+    // Drops a source from inter-cam phase eligibility on disconnect + re-selects
+    // the reference, so the servo never corrects toward a dead reference.
+    void onSourcePhaseConnectionChanged(int sourceIndex, bool connected);
+
 private:
     void writeBlueFrames(int64_t elapsedMs);
+
+    // Re-pick the reference source (highest ClockQuality among sources that have
+    // reported stats, ties -> lowest index) and re-grade every source's inter-camera
+    // phase + confidence tier from the cached IngestStats + the timecode aligner.
+    // Cheap and pure of side effects beyond m_referenceSource/m_offsetEstimator;
+    // called on every stats pulse (no new timer — stats already arrive ~1/sec).
+    void recomputeInterCamPhase();
 
     mutable QMutex m_stateMutex;
     bool m_isRecording = false;
@@ -169,6 +221,23 @@ private:
     // solely at 30 — a documented limitation. Threading the real per-source fps
     // end-to-end is a future refinement.
     TimecodeAligner m_tcAligner{Smpte12m::kTimecodeNominalFps};
+
+    // Inter-camera phase servo (Phase 4). m_offsetEstimator grades each source's
+    // offset-to-reference + confidence tier; m_referenceSource is the chosen anchor
+    // (-1 until the first stats pulse); m_lastStats caches the most recent IngestStats
+    // per source so recomputeInterCamPhase can difference them. All reset on
+    // startRecording (mirrors m_tcAligner.reset()). m_sourceHasStats marks which
+    // sources have reported (i.e. are connected) so reference selection considers
+    // only live sources.
+    SourceOffsetEstimator m_offsetEstimator;
+    int m_referenceSource = -1;
+    QList<IngestStats> m_lastStats;
+    QList<bool> m_sourceHasStats;
+    // Current per-source inter-cam servo trim (ms), the ramped+capped correction last
+    // pushed to each worker. Persists across pulses so the ramp accumulates gently
+    // toward the target; reset to 0 on startRecording. Grows on demand like m_lastStats.
+    QList<int> m_servoTrimMs;
+
     qint64 m_recordingStartEpochMs = 0;
 
     // Final elapsed captured at stopRecording (before m_clock is deleted) so

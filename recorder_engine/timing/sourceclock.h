@@ -43,6 +43,17 @@ public:
     ClockQuality quality() const override { return m_quality; }
     double ppm() const override { return m_drift.ppm(); }
     bool locked() const override { return m_anchorSenderUnits >= 0 && m_anchorSessionMs >= 0; }
+    // The recovered (session - sender) phase at THIS source's anchor instant, in ns.
+    // Differencing two sources' offsets approximates their inter-camera phase to
+    // within drift x (anchor-skew between the two sources) — a BOUNDED estimate, not
+    // a frame-accurate one (frame accuracy comes from TimecodeAligner). Note it steps
+    // discontinuously when one source re-anchors (discontinuity/jump). Consumers
+    // should treat it as the Bounded-tier signal: cap corrections and ignore a single
+    // re-anchor step. 0 until the clock anchors (locked()).
+    int64_t anchorOffsetNs() const {
+        return locked() ? (m_anchorSessionMs * 1000000LL - senderUnitsToNs(m_anchorSenderUnits))
+                        : 0;
+    }
     void reset() override;
 
 private:

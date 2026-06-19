@@ -148,6 +148,10 @@ void TestNdiIngest::fakeBackendDeliversVideoAndAudio() {
     QVERIFY(!statsReports.isEmpty());
     QCOMPARE(statsReports.last().kind, IngestStatsKind::Ndi);
     QCOMPARE(statsReports.last().clockQuality, int(ClockQuality::Ndi));
+    // The NDI clock anchors on the first authority observation (sender 1000 ms vs
+    // session 5000 ms), so it reports locked with a session-minus-sender offset.
+    QVERIFY(statsReports.last().clockLocked);
+    QCOMPARE(statsReports.last().clockOffsetNs, int64_t(4000) * 1000000LL);
     QCOMPARE(backend.freedVideo, 1);
     QCOMPARE(backend.freedAudio, 1);
 }
@@ -216,6 +220,10 @@ void TestNdiIngest::undefinedTimestampFallsBackToArrivalWithoutLockingClock() {
     QCOMPARE(videoPts.first(), int64_t(7777));
     QVERIFY(!statsReports.isEmpty());
     QCOMPARE(statsReports.last().clockPpm, 0.0);
+    // An undefined timestamp never anchors the clock: it stays unlocked with a
+    // zero offset (the additive fields default safely).
+    QVERIFY(!statsReports.last().clockLocked);
+    QCOMPARE(statsReports.last().clockOffsetNs, int64_t(0));
 }
 
 QTEST_GUILESS_MAIN(TestNdiIngest)

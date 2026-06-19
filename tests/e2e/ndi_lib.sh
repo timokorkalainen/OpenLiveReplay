@@ -51,7 +51,7 @@ ndi_start_marker_sender() {
         --seconds "$sender_seconds" \
         --skew-ppm "$skew_ppm" \
         --timecode "${OLR_MARKER_TC:-10:00:00:00}" \
-        "${extra_args[@]}" \
+        ${extra_args[@]+"${extra_args[@]}"} \
         >"${WORKDIR}/${prefix}.ndi.out" 2>"${WORKDIR}/${prefix}.ndi.err" &
     PIDS+=("$!")
     # The local SDK finder can retain just-destroyed sources briefly when matrix
