@@ -1,5 +1,7 @@
 #include "uimanager.h"
 #include "playback/audioplayer.h"
+#include "recorder_engine/benchmark/benchmarkcache.h"
+#include "recorder_engine/benchmark/recordgate.h"
 #include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/broadcastoutputstatus.h"
 #include "project/projectimportclient.h"
@@ -22,6 +24,7 @@
 #include <QStandardPaths>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QtConcurrent>
 #include <QScreen>
 #include <QSet>
 #include <QVariantMap>
@@ -545,6 +548,30 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
     }
     refreshScreens();
     refreshProviders();
+
+    // Probe hardware H.264 encode availability once, off the GUI thread (the
+    // probe opens a throwaway encoder). Publish via a queued signal.
+    // NOTE: we always emit h264EncodeAvailableChanged() regardless of whether
+    // the value changed, so that the QML panel can reconcile a persisted
+    // codec selection (e.g. h264 saved on a device that has no hardware
+    // encoder → probe resolves false → panel auto-falls back). The hard-block
+    // in startRecording() already errs safe; the always-emit keeps codec work
+    // off the GUI thread (no synchronous re-probe at startRecording time),
+    // accepting the sub-second startup window where the cached probe is used.
+    (void) QtConcurrent::run([this]() {
+        const bool available = queryNativeVideoEncodeCapabilities().h264;
+        QMetaObject::invokeMethod(
+            this,
+            [this, available]() {
+                m_h264EncodeAvailable = available;
+                emit h264EncodeAvailableChanged();
+            },
+            Qt::QueuedConnection);
+    });
+
+    // Note: the benchmark cache is loaded in loadSettings() after m_currentSettings
+    // is populated from disk. Loading it here would key on constructor defaults
+    // (1920x1080@30, Mpeg2Software) rather than the persisted resolution/codec.
 }
 
 UIManager::~UIManager() {
@@ -1320,6 +1347,9 @@ void UIManager::setRecordWidth(int width) {
     if (m_currentSettings.videoWidth != width) {
         m_currentSettings.videoWidth = width;
         m_replayManager->setVideoWidth(width);
+        // Cached benchmark result is resolution-specific; invalidate the safe
+        // feed count so no stale warning fires at the new resolution (I2).
+        m_benchmarkSafeFeedsForChosen = -1;
         emit recordWidthChanged();
     }
 }
@@ -1329,6 +1359,9 @@ void UIManager::setRecordHeight(int height) {
     if (m_currentSettings.videoHeight != height) {
         m_currentSettings.videoHeight = height;
         m_replayManager->setVideoHeight(height);
+        // Cached benchmark result is resolution-specific; invalidate the safe
+        // feed count so no stale warning fires at the new resolution (I2).
+        m_benchmarkSafeFeedsForChosen = -1;
         emit recordHeightChanged();
     }
 }
@@ -1342,6 +1375,9 @@ void UIManager::setRecordCodec(const QString& codec) {
     if (m_currentSettings.videoCodec != next) {
         m_currentSettings.videoCodec = next;
         m_replayManager->setVideoCodec(next);
+        // Recompute the safe-feed threshold for the newly selected codec so
+        // the soft-warn gate at startRecording() uses the correct limit (I2).
+        updateSafeFeedsForChosen();
         emit recordCodecChanged();
     }
 }
@@ -1372,6 +1408,9 @@ void UIManager::setRecordFrameRate(int numerator, int denominator) {
         if (m_transport) {
             m_transport->setFrameRate(rate.numerator, rate.denominator);
         }
+        // Cached benchmark result is resolution-specific (WxH@fps); invalidate
+        // the safe feed count so no stale warning fires at the new fps (I2).
+        m_benchmarkSafeFeedsForChosen = -1;
         emit recordFpsChanged();
     }
 }
@@ -1630,6 +1669,23 @@ void UIManager::refreshMidiPorts() {
 }
 
 void UIManager::startRecording() {
+    // Hard block: H.264 selected but no hardware encoder -> refuse, never fall back.
+    if (recordCodecUnavailable(m_currentSettings.videoCodec, m_h264EncodeAvailable)) {
+        const QString reason = recordCodecBlockReason(m_currentSettings.videoCodec);
+        qWarning() << "UIManager:" << reason;
+        emit recordingFailed(reason);
+        return;
+    }
+    // Soft warning: configured feeds exceed the benchmarked safe count for the codec.
+    const int configuredFeeds = m_replayManager->getSourceUrls().size();
+    if (feedCountExceedsSafe(configuredFeeds, m_benchmarkSafeFeedsForChosen)) {
+        emit recordingWarning(
+            QStringLiteral("Recording %1 feeds; this device benchmarked %2 as the safe limit "
+                           "for the selected codec — frames may drop.")
+                .arg(configuredFeeds)
+                .arg(m_benchmarkSafeFeedsForChosen));
+        // proceed — operator's call.
+    }
     // Distinguish the cheap "no sources" cause up front so the surfaced
     // message is actionable; otherwise it's a muxer/encoder init failure.
     const bool hadSources = !m_replayManager->getSourceUrls().isEmpty();
@@ -2159,6 +2215,27 @@ void UIManager::loadSettings() {
         m_replayManager->setVideoHeight(m_currentSettings.videoHeight);
         m_replayManager->setVideoCodec(m_currentSettings.videoCodec);
         m_replayManager->setFps(m_currentSettings.fps);
+
+        // Load the cached benchmark result now that m_currentSettings holds the
+        // real persisted values (C1 — the constructor only has defaults at that
+        // point, so adopting the cache there keyed on the wrong resolution).
+        {
+            CodecBenchmarkResult cached;
+            const QString resolution = QString::number(m_currentSettings.videoWidth) +
+                                       QStringLiteral("x") +
+                                       QString::number(m_currentSettings.videoHeight) +
+                                       QStringLiteral("@") + QString::number(m_currentSettings.fps);
+            if (loadBenchmarkResult(benchmarkCachePath(), cached) &&
+                benchmarkResultMatches(cached, benchmarkDeviceLabel(), resolution)) {
+                m_benchmarkResult = resultToVariantMap(cached);
+                // updateSafeFeedsForChosen() picks h264 vs mpeg2 from the
+                // current codec — use the helper so I2's logic is centralised.
+                updateSafeFeedsForChosen();
+                // emit so QML (now connected) reflects the restored result.
+                emit benchmarkResultChanged();
+            }
+        }
+
         m_currentSettings.multiviewCount = qBound(1, m_currentSettings.multiviewCount, 16);
         ensureSourceEnabledSize();
         syncActiveStreams();
@@ -2668,4 +2745,81 @@ void UIManager::shuttleStep(int delta) {
     if (m_playbackWorker && !r.playing) {
         m_playbackWorker->seekTo(m_transport->currentPos());
     }
+}
+
+// ---------- Codec benchmark ----------
+
+void UIManager::updateSafeFeedsForChosen() {
+    if (m_benchmarkResult.isEmpty()) {
+        m_benchmarkSafeFeedsForChosen = -1;
+        return;
+    }
+    if (m_currentSettings.videoCodec == VideoCodecChoice::H264Hardware) {
+        const QVariant v = m_benchmarkResult.value(QStringLiteral("h264SafeFeeds"));
+        m_benchmarkSafeFeedsForChosen = v.isValid() ? v.toInt() : -1;
+    } else {
+        const QVariant v = m_benchmarkResult.value(QStringLiteral("mpeg2SafeFeeds"));
+        m_benchmarkSafeFeedsForChosen = v.isValid() ? v.toInt() : -1;
+    }
+}
+
+QVariantMap UIManager::resultToVariantMap(const CodecBenchmarkResult& r) {
+    QVariantMap m;
+    m[QStringLiteral("h264Available")] = r.h264Available;
+    m[QStringLiteral("h264SafeFeeds")] = r.h264SafeFeeds;
+    m[QStringLiteral("mpeg2SafeFeeds")] = r.mpeg2SafeFeeds;
+    m[QStringLiteral("recommended")] = videoCodecToString(r.recommended);
+    m[QStringLiteral("deviceLabel")] = r.deviceLabel;
+    m[QStringLiteral("resolution")] = r.resolution;
+    m[QStringLiteral("timestamp")] = r.timestamp;
+    return m;
+}
+
+QString UIManager::benchmarkCachePath() const {
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dir);
+    return dir + QStringLiteral("/codec-benchmark.json");
+}
+
+void UIManager::runBenchmark() {
+    if (m_benchmarkRunning) return;
+    m_benchmarkRunning = true;
+    m_benchmarkCancel.store(false);
+    emit benchmarkRunningChanged();
+
+    BenchmarkConfig cfg;
+    cfg.width = m_currentSettings.videoWidth;
+    cfg.height = m_currentSettings.videoHeight;
+    cfg.fps = m_currentSettings.fps;
+
+    const QString cachePath = benchmarkCachePath();
+
+    (void) QtConcurrent::run([this, cfg, cachePath]() {
+        auto progress = [this](int n, bool sustained) {
+            QMetaObject::invokeMethod(
+                this, [this, n, sustained]() { emit benchmarkProgress(n, sustained); },
+                Qt::QueuedConnection);
+        };
+        CodecBenchmarkResult r = runCodecBenchmark(cfg, progress, m_benchmarkCancel);
+        r.timestamp = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+        saveBenchmarkResult(cachePath, r);
+        QMetaObject::invokeMethod(
+            this,
+            [this, r]() {
+                m_benchmarkResult = resultToVariantMap(r);
+                // updateSafeFeedsForChosen() reads m_benchmarkResult + the
+                // current codec — use the helper so codec changes made between
+                // benchmark start and finish are correctly reflected (I2).
+                updateSafeFeedsForChosen();
+                m_benchmarkRunning = false;
+                emit benchmarkResultChanged();
+                emit benchmarkRunningChanged();
+                emit benchmarkFinished();
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void UIManager::cancelBenchmark() {
+    m_benchmarkCancel.store(true);
 }

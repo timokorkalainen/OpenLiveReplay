@@ -14,7 +14,10 @@
 #include "settingsmanager.h"
 #include "project/projectsettingsimporter.h"
 #include "recorder_engine/replaymanager.h"
+#include "recorder_engine/benchmark/runcodecbenchmark.h"
 #include "recorder_engine/codec/videocodecchoice.h"
+#include "recorder_engine/codec/nativevideoencoder.h"
+#include <atomic>
 #include "recorder_engine/ingest/ingestsession.h"
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
@@ -42,6 +45,9 @@ class UIManager : public QObject {
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
     Q_PROPERTY(QString recordCodec READ recordCodec WRITE setRecordCodec NOTIFY recordCodecChanged)
+    Q_PROPERTY(bool h264EncodeAvailable READ h264EncodeAvailable NOTIFY h264EncodeAvailableChanged)
+    Q_PROPERTY(bool benchmarkRunning READ benchmarkRunning NOTIFY benchmarkRunningChanged)
+    Q_PROPERTY(QVariantMap benchmarkResult READ benchmarkResult NOTIFY benchmarkResultChanged)
     Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs
                    NOTIFY audioOutputLatencyChanged)
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
@@ -112,6 +118,9 @@ public:
     int recordWidth() const;
     int recordHeight() const;
     QString recordCodec() const;
+    bool h264EncodeAvailable() const { return m_h264EncodeAvailable; }
+    bool benchmarkRunning() const { return m_benchmarkRunning; }
+    QVariantMap benchmarkResult() const { return m_benchmarkResult; }
     int recordFps() const;
     int recordFpsNumerator() const;
     int recordFpsDenominator() const;
@@ -173,6 +182,8 @@ public:
     void setRecordFps(int fps);
     Q_INVOKABLE void setRecordFrameRate(int numerator, int denominator);
     void setMultiviewCount(int count);
+    Q_INVOKABLE void runBenchmark();
+    Q_INVOKABLE void cancelBenchmark();
     void setTimeOfDayMode(bool enabled);
     void setImportSettingsUrl(const QString &url);
 
@@ -278,6 +289,11 @@ signals:
     void recordWidthChanged();
     void recordHeightChanged();
     void recordCodecChanged();
+    void h264EncodeAvailableChanged();
+    void benchmarkRunningChanged();
+    void benchmarkResultChanged();
+    void benchmarkProgress(int concurrency, bool sustained);
+    void benchmarkFinished();
     void recordFpsChanged();
     void audioOutputLatencyChanged();
     void multiviewCountChanged();
@@ -286,6 +302,7 @@ signals:
     void recordingStarted();
     void recordingStopped();
     void recordingFailed(const QString& reason);
+    void recordingWarning(const QString& message);
     void recordedDurationMsChanged();
     void scrubPositionChanged();
     void playbackTimecodeChanged();
@@ -341,6 +358,11 @@ public slots:
     void onSourceStatsUpdated(int sourceIndex, IngestStats stats);
 
 private:
+    QString benchmarkCachePath() const;
+    static QVariantMap resultToVariantMap(const CodecBenchmarkResult& r);
+    // Recomputes m_benchmarkSafeFeedsForChosen from m_benchmarkResult and the
+    // current m_currentSettings.videoCodec. Returns -1 when no result is loaded.
+    void updateSafeFeedsForChosen();
     void syncActiveStreams();
     int activeViewCount() const;
     QStringList activeStreamUrls() const;
@@ -380,6 +402,11 @@ private:
     QTimer m_scrubCoalesceTimer;
     static constexpr int kScrubCoalesceMs = 16; // ~one frame at 60fps
     bool m_followLive = false;
+    bool m_h264EncodeAvailable = false;
+    bool m_benchmarkRunning = false;
+    QVariantMap m_benchmarkResult;
+    std::atomic<bool> m_benchmarkCancel{false};
+    int m_benchmarkSafeFeedsForChosen = -1;
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;
     StreamDeckManager* m_streamDeckManager = nullptr;
