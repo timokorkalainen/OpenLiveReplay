@@ -113,12 +113,76 @@ Phase 2 NDI ingest (`docs/superpowers/plans/2026-06-17-framesync-phase2-ndi-inge
 
 - **P2 — Source clock recovery + drift servo.** Live for native SRT/RTMP/NDI: native timestamps route through `SourceClock`, run a per-source `DriftEstimator`, expose `clockppm`/`clockq` telemetry, and use a common drift-aware media-to-session mapping for both video and audio. `StreamWorker` owns per-backend clocks so same-URL reconnects can re-lock to recovered state instead of fresh arrival time. The framesync skew cell now reports A/V-offset drift as well as recovered clock ppm, and the local framesync matrix has SDK-backed NDI marker-source coverage when the NDI runtime is installed.
 - **P3 — Timecode (TC-1 extract / TC-4 align / TC-5 tmcd) — DELIVERED.** SMPTE 12M is extracted from the H.264/HEVC SEI on SRT and RTMP (RTMP also falls back to AMF), routed onto `DecodedVideoFrame::sourceTimecode100ns` (TC-1); a pure `TimecodeAligner` maps each source's TC to the session frame index and reports two-source alignment via `ReplayManager::sourcesFrameAligned`/`sourceFrameOffset` (TC-4); and the muxer writes a `timecode`/`tmcd` tag from the session start TC, deferring the MKV header to the first muxed frame so live recordings carry it (TC-5). NDI already carried the native NDI timecode through the decoded video/audio callbacks (Phase 2); Phase 3 is the extraction/alignment/mux **consumer** of that value. The framesync `e2e_framesync_timecode` cell is now a gate: recorded `tmcd` is frame-exact vs the injected TC and two common-TC sources are reported aligned (NDI transport; SKIP-clean when no TC-capable source). **Phase-3 follow-ups:** full real-SEI `clock_timestamp`/ATC parsing (today reads the raw SMPTE-12M-packed word, not the full `pic_timing`/registered-ATC SEI); real-fps threading so absolute `toSessionFrameIndex`/`tmcd` are exact at rates other than the nominal 30 fps; and drop-frame TC preservation (a drop-frame source TC is currently recovered as non-drop).
-- **Inter-camera phase servo + confidence (framesync Phase 4) — DELIVERED.** A pure, unit-tested `SourceOffsetEstimator` grades each source's inter-camera phase into a **confidence tier** — `FrameAccurate` (common timecode via the Phase-3 `TimecodeAligner`, or an external reference; `±0 ms`), `Bounded` (a recovered-clock PCR/NDI/FLV-PLL estimate with a numeric `±ms` bound, wider on RTMP/FLV), or `Approximate` (arrival-only, `±40 ms` order) — and measures the phase to the session reference. `ReplayManager` selects a **reference source** (highest `ClockQuality`, ties → lowest index) and runs a **bounded, ramped phase servo**: it nudges each non-reference, clock-locked source toward zero phase by summing a servo trim (`StreamWorker::m_servoTrimOffsetMs`) into the worker's existing trim seam — **capped** (`kMaxInterCamCorrectionMs`), **ramped** (`kServoStepMs = 4 ms`/pulse), and **layered under the PHASE-6 operator override** (operator trim always wins). Common-TC sources are driven to the **exact TC frame offset** (FrameAccurate); other locked sources by the recovered **clock offset** (Bounded); `Approximate` and lone sources get **servo 0** (byte-identical to pre-Phase-4). The measured phase + tier ride additive `IngestStats` fields (`confidenceTier`/`interCamPhaseMs`/`interCamBoundMs`) into the `sourceStatsTooltip` plus a `Q_INVOKABLE sourceConfidenceTier()` for the QML health surface. The framesync `e2e_framesync_intercam` cell is now a **gate** (NDI transport, common advancing TC): both sources grade **FrameAccurate** and the recorded flash-onset spread **mean** holds within **one frame @30**; it **SKIPs cleanly** when the two-source NDI recording can't be produced. **Exact frame-lock requires common TC** (else bounded-and-measured, surfaced not hidden). **Phase-4 follow-ups:** reference re-selection robustness when the highest-quality source drops mid-record; the external-reference (PTP) tier and sub-frame lock are the Phase-5 ceiling below.
+- **Inter-camera phase servo + confidence (framesync Phase 4) — DELIVERED.** A pure, unit-tested `SourceOffsetEstimator` grades each source's inter-camera phase into a **confidence tier** — `FrameAccurate` (common timecode via the Phase-3 `TimecodeAligner`, or an external reference; `±0 ms`), `Bounded` (a recovered-clock PCR/NDI/FLV-PLL estimate with a numeric `±ms` bound, wider on RTMP/FLV), or `Approximate` (arrival-only, `±40 ms` order) — and measures the phase to the session reference. `ReplayManager` selects a **reference source** (highest `ClockQuality`, ties → lowest index) and runs a **bounded, ramped phase servo**: it nudges each non-reference, clock-locked source toward zero phase by summing a servo trim (`StreamWorker::m_servoTrimOffsetMs`) into the worker's existing trim seam — **capped** (`kMaxInterCamCorrectionMs`), **ramped** (`kServoStepMs = 4 ms`/pulse), and **layered under the PHASE-6 operator override** (operator trim always wins). Common-TC sources are driven to the **exact TC frame offset** (FrameAccurate); other locked sources by the recovered **clock offset** (Bounded); `Approximate` and lone sources get **servo 0** (byte-identical to pre-Phase-4). The measured phase + tier ride additive `IngestStats` fields (`confidenceTier`/`interCamPhaseMs`/`interCamBoundMs`) into the `sourceStatsTooltip` plus a `Q_INVOKABLE sourceConfidenceTier()` for the QML health surface. The framesync `e2e_framesync_intercam` cell is now a **gate** (NDI transport, common advancing TC): both sources grade **FrameAccurate** and the recorded flash-onset spread **mean** holds within **one frame @30**; it **SKIPs cleanly** when the two-source NDI recording can't be produced. **Exact frame-lock requires common TC** (else bounded-and-measured, surfaced not hidden). **Phase-4 follow-ups:** reference re-selection robustness when the highest-quality source drops mid-record. The external-reference (PTP) tier is now **delivered** in Phase 5 below (an external `TimingReference` promotes phase-locked sources to `FrameAccurate`); sub-frame, NIC-PHC/genlock-grade lock is the hardware-capture program beyond it.
 - **P4 — Interlace / fields.** Deinterlace policy + field-rate slow-mo (only if interlaced sport is in scope; today fields are silently frame-blended).
-- **P5 — Architectural / true broadcast output.** A PTP (ST 2059) house-clock client (REF-1); genlocked SDI / ST 2110 output via DeckLink/Rivermax (GENLOCK-1, today output is software `QVideoSink` only); interim: PTS-stamp the `QVideoFrame` + vsync-pace presentation (GENLOCK-2/3/5). **#54 (NDI output bus) is the first concrete step here** — a broadcast output path with preview.
+- **P5 — Reference-clock / PTP seam (REF-1) — DELIVERED.** The `TimingReference` seam
+  (`recorder_engine/timing/timingreference.h`: `nowSessionNs()` / `tier()` /
+  `isExternal()`, `ReferenceTier{LocalMonotonic,RecoveredConsensus,Ptp}`) is now the top
+  tier of the timing core, and the whole pipeline reads session-now through it
+  (`ReplayManager::nowSessionMs()` → the heartbeat + `getElapsedMs`). The default
+  `LocalMonotonicReference` wraps the existing `RecordingClock` **byte-identically**
+  (`elapsedMs()*1e6`); a `PtpReference` — an ST 2059 / IEEE 1588 **slave** built on a pure,
+  unit-tested `PtpServo` (offset / mean-path-delay discipline) behind an `IPtpClient`
+  backend (faked in tests, real `UdpPtpClient` over UDP 319/320) — swaps in **opt-in**
+  via `OLR_TIMING_PTP=1` (`OLR_TIMING_PTP_IFACE` selects the domain/iface), falling back to
+  local if it fails to start. Once the PtpReference locks, `isExternal()` flips true, the
+  session timebase becomes facility time, and the Phase-4 `SourceOffsetEstimator` promotes
+  any phase-locked source to `FrameAccurate` via `SourcePhaseEvidence::externalReference`.
+  The tier + lock state are surfaced to the operator
+  (`ReplayManager::referenceTier()`/`referenceIsExternal()` + `referenceTierChanged` →
+  `UIManager::sessionReferenceTier()`/`sessionReferenceStatus()` — e.g. `timing    PTP
+  (external)` / `timing    local monotonic`). **Full hardware capture remains out of
+  scope** — see the genlock integration points below.
+- **P5 — true broadcast output (GENLOCK-1/2/3/5).** Genlocked SDI / ST 2110 output via
+  DeckLink/Rivermax (today output is software `QVideoSink` only); interim: PTS-stamp the
+  `QVideoFrame` + vsync-pace presentation. **#54 (NDI output bus) is the first concrete
+  step here** — a broadcast output path with preview. This is a separate program from the
+  REF-1 reference-clock seam above.
 - **Cross-device drift** (two machines) and **encrypted SRT** were also flagged "beyond Phase 2."
 
-**Honest ceiling (unchanged):** non-genlocked SRT/RTMP/UDP ingest can never be true-genlock 100%; the achievable target is *frame-phase-locked-within-measured-bounds* via source-clock recovery (P2) plus the inter-camera phase servo + confidence tiers (framesync Phase 4). That servo delivers **frame-accurate** inter-camera lock **only with common timecode** (graded `FrameAccurate`); other locked sources get a `Bounded`-and-measured `±ms` correction and `Approximate` sources are surfaced honestly with no servo. **Sub-frame, genlock-grade phase lock — and the `FrameAccurate`-via-external-reference path — remain the Phase-5 PTP (ST 2059) / reference-clock ceiling.**
+### Reference-clock seam & genlock integration points (Phase 5)
+
+The whole point of `TimingReference` is that becoming genlock-authoritative is a **backend
+swap behind one seam**, not a pipeline rewrite. The integration points:
+
+- **(a) The single swap point.** Every "session now" the pipeline reads flows through
+  `TimingReference::nowSessionNs()` (via `ReplayManager::nowSessionMs()`). `tier()` and
+  `isExternal()` advertise *how authoritative* that timebase is. Re-timing the session to a
+  new reference is a constructor choice in `ReplayManager::buildTimingReference()` — no
+  caller restructure.
+- **(b) Local vs PTP today.** `LocalMonotonicReference` (default) = the local
+  `RecordingClock`, not external — byte-identical to all prior phases. `PtpReference` (this
+  phase) = an ST 2059 / IEEE 1588 software PTP slave, opt-in, `tier()==Ptp` and external
+  once disciplined.
+- **(c) Genlocked NDI becomes authoritative.** A PTP/genlock-disciplined NDI source already
+  carries SDK-stamped timestamps that the `NdiSourceClock` tracks. Today, with no external
+  reference, that recovery is **arrival-anchored** (clockless IP can only bound phase). With
+  an external `TimingReference` present (PTP locked), such a source phase-locks to facility
+  time *truly* rather than to arrival, so the `SourceOffsetEstimator` can grade it
+  `FrameAccurate` via the `externalReference` evidence — no new ingest code, just the
+  reference being external.
+- **(d) SDI / ST 2110 (a future, separate program).** Hardware capture cards
+  (DeckLink/Rivermax) and an RTP/PTP-stamped ST 2110 path plug a **facility-time
+  `TimingReference` backend** (and a genlocked capture path) into the *same* seam: a new
+  `TimingReference` implementation (or a hardware-PHC-backed `IPtpClient`) plus a card-backed
+  ingest session. The **capture cards are out of scope** — the seam that lets them become
+  the authoritative reference is built and shipped.
+- **(e) The honest ceiling.** This PTP client uses **software timestamps** (no NIC PHC /
+  hardware timestamping), so its accuracy is *tens of microseconds* on a quiet LAN — much
+  better than clockless IP, but **not** NIC-PHC / genlock-grade. True genlock needs hardware
+  timestamping or a genlocked capture path; both slot in behind the same seam as a future
+  backend swap. The current tier is always surfaced honestly via `tier()` / `isExternal()`
+  (and the UI status line) rather than overclaimed.
+
+**Frame-sync program status: COMPLETE (Phases 0–5).** P0 (fps-decoupled heartbeat) → P1
+(timing core: `RecordingClock`/`SourceClock`/`SessionTimeline`) → P2 (source clock recovery
++ drift servo) → P3 (timecode extract/align/tmcd) → P4 (inter-camera phase servo +
+confidence tiers) → **P5 (reference-clock / PTP seam)** are all delivered. What remains is
+the **separate** true-broadcast-output / hardware-capture program (GENLOCK-1/2/3/5, SDI/ST
+2110 cards, NIC-PHC hardware timestamping), which the Phase-5 seam is explicitly built to
+accept as a backend swap.
+
+**Honest ceiling:** non-genlocked SRT/RTMP/UDP ingest can never be true-genlock 100%; the achievable target is *frame-phase-locked-within-measured-bounds* via source-clock recovery (P2) plus the inter-camera phase servo + confidence tiers (framesync Phase 4). That servo delivers **frame-accurate** inter-camera lock **only with common timecode** (graded `FrameAccurate`); other locked sources get a `Bounded`-and-measured `±ms` correction and `Approximate` sources are surfaced honestly with no servo. The **`FrameAccurate`-via-external-reference path is now delivered (Phase 5)**: an opt-in `PtpReference` (ST 2059 / IEEE 1588 software slave) becomes an external `TimingReference` and promotes phase-locked sources to `FrameAccurate`. Its ceiling is **software-PTP precision (~tens of µs on a quiet LAN)** — better than clockless IP but **not** NIC-PHC / genlock-grade. **Sub-frame, genlock-grade phase lock** (hardware timestamping / a genlocked SDI/ST 2110 capture path) is the separate true-broadcast-output program, which the Phase-5 seam is built to accept as a backend swap.
 
 ---
 

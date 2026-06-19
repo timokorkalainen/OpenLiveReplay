@@ -1,9 +1,12 @@
 #include "replaymanager.h"
 #include "heartbeat.h"
+#include "timing/ptpreference.h"
+#include "timing/udpptpclient.h"
 #include <QDebug>
 #include <QDir>
 #include <QDateTime>
 #include <QJsonDocument>
+#include <QProcessEnvironment>
 #include <QtGlobal>
 
 ReplayManager::ReplayManager(QObject *parent) : QObject(parent) {
@@ -229,6 +232,33 @@ void ReplayManager::cleanupBlueEncoder() {
     m_videoExtradata.clear();
 }
 
+// Build the session timebase for a fresh recording. DEFAULT (no opt-in):
+// byte-identical to today — a LocalMonotonicReference over m_clock, no thread, no
+// socket. OPT-IN (OLR_TIMING_PTP=1): a PtpReference over a real UdpPtpClient PTP
+// slave (interface from OLR_TIMING_PTP_IFACE, else the PTP domain "0"); if the
+// PTP client fails to start, fall back to the local reference so recording never
+// stalls. The whole pipeline already reads session-now via nowSessionMs(), so this
+// is the single constructor swap — no caller changes.
+std::unique_ptr<TimingReference> ReplayManager::buildTimingReference() {
+    const QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    if (env.value(QStringLiteral("OLR_TIMING_PTP")) == QLatin1String("1")) {
+        QString iface = env.value(QStringLiteral("OLR_TIMING_PTP_IFACE"));
+        if (iface.isEmpty()) {
+            iface = QStringLiteral("0"); // PTP domain 0, any interface
+        }
+        auto ptp = std::make_unique<PtpReference>(std::make_unique<UdpPtpClient>(), iface);
+        if (ptp->start()) {
+            qDebug() << "ReplayManager: PTP timing reference enabled (iface/domain" << iface
+                     << ") — falls back to local until the grandmaster locks.";
+            return ptp;
+        }
+        qWarning() << "ReplayManager: PTP opted in but UdpPtpClient failed to start;"
+                   << "falling back to local monotonic reference.";
+    }
+    // Default: local monotonic — byte-identical to m_clock->elapsedMs().
+    return std::make_unique<LocalMonotonicReference>(m_clock);
+}
+
 // ─── Recording lifecycle ───────────────────────────────────────────────
 void ReplayManager::startRecording() {
     QMutexLocker locker(&m_stateMutex);
@@ -310,6 +340,17 @@ void ReplayManager::startRecording() {
     if (m_clock) delete m_clock;
     m_clock = new RecordingClock();
     m_clock->start();
+    // Rebuild the session timebase over the FRESH clock (m_clock is re-new'd per
+    // recording). The Phase-5 swap point: by default a LocalMonotonicReference —
+    // byte-identical to m_clock->elapsedMs(); when PTP is OPTED IN (OLR_TIMING_PTP=1)
+    // an external PtpReference over a real UdpPtpClient. Holds m_clock NON-owningly,
+    // so it is rebuilt here and reset in stopRecording before m_clock is deleted.
+    m_timingRef = buildTimingReference();
+    // Seed + publish the Phase-5 reference tier for the UI. recomputeInterCamPhase then
+    // re-emits referenceTierChanged only on a later flip (e.g. PTP locking mid-session).
+    m_lastReferenceTier = referenceTier();
+    m_lastReferenceExternal = referenceIsExternal();
+    emit referenceTierChanged(m_lastReferenceTier, m_lastReferenceExternal);
     m_recordingStartEpochMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
 
     // 4. Launch one StreamWorker PER SOURCE (not per view).
@@ -404,8 +445,14 @@ void ReplayManager::stopRecording() {
 
     if (m_clock) {
         // Capture the final duration before deleting the clock so callers
-        // (recordedDurationMs / scrubPosition) keep getting a valid value.
+        // (recordedDurationMs / scrubPosition) keep getting a valid value. This is a
+        // raw m_clock read (the plan routes only onTimerTick + getElapsedMs through the
+        // reference); m_clock is still valid here.
         m_lastKnownDurationMs = qMax<int64_t>(0, m_clock->elapsedMs());
+        // The reference holds m_clock NON-owningly: drop it BEFORE deleting the clock
+        // so it never points at freed memory (and so a later getElapsedMs falls back to
+        // m_lastKnownDurationMs, exactly as before).
+        m_timingRef.reset();
         delete m_clock;
         m_clock = nullptr;
     }
@@ -492,7 +539,9 @@ void ReplayManager::onTimerTick() {
     // scheduler. heartbeatFrameSpan() turns the elapsed wall-clock into the frame
     // range to emit this tick (with catch-up for late ticks + a 1-second backlog
     // skip). maxBacklogFrames = m_fps == one second of frames.
-    const int64_t elapsedMs = m_clock->elapsedMs();
+    // Read session-now THROUGH the TimingReference seam (byte-identical to
+    // m_clock->elapsedMs() under the local tier; the swap point for a PTP timebase).
+    const int64_t elapsedMs = nowSessionMs();
     const FrameSpan span =
         heartbeatFrameSpan(elapsedMs, m_fps, m_globalFrameCount, kMaxFramesPerTick, m_fps);
 
@@ -556,6 +605,20 @@ void ReplayManager::onSourcePhaseConnectionChanged(int sourceIndex, bool connect
 }
 
 void ReplayManager::recomputeInterCamPhase() {
+    // 0. Poll the Phase-5 timing reference and emit referenceTierChanged ONLY on a flip
+    //    (e.g. a PtpReference locking to the grandmaster mid-session). This runs on every
+    //    stats pulse (~1/sec) — no new timer. With the default LocalMonotonicReference the
+    //    tier/external never change, so this never emits: byte-identical to Phase 4.
+    {
+        const int curTier = referenceTier();
+        const bool curExternal = referenceIsExternal();
+        if (curTier != m_lastReferenceTier || curExternal != m_lastReferenceExternal) {
+            m_lastReferenceTier = curTier;
+            m_lastReferenceExternal = curExternal;
+            emit referenceTierChanged(curTier, curExternal);
+        }
+    }
+
     // 1. Pick the reference: the source with reported stats whose recovered clock has
     //    the highest ClockQuality; ties break to the lowest index. An externalReference
     //    source (Phase 5) always wins — not present today (LocalMonotonic), so it folds
@@ -586,7 +649,12 @@ void ReplayManager::recomputeInterCamPhase() {
         // coincide with the reference (the reference trivially aligns to itself).
         ev.timecodeAlignedToReference =
             (s == m_referenceSource) || m_tcAligner.sourcesAligned(m_referenceSource, s, 0);
-        ev.externalReference = false; // Phase 5 sets this (PTP/genlock); none today.
+        // Phase 5: once an external reference (PTP) is LOCKED, mark every source as
+        // disciplined to facility time so the SourceOffsetEstimator promotes those
+        // phase-locked to the disciplined session estimate to FrameAccurate. With the
+        // default LocalMonotonicReference (no PTP), isExternal() is false → unchanged
+        // from Phase 4.
+        ev.externalReference = m_timingRef && m_timingRef->isExternal();
         // Measured phase: the source's recovered offset minus the reference's. This is
         // a Bounded-tier signal — it has the right sign/units (sub-frame) and steps on
         // re-anchor, so it never grades FrameAccurate on its own (TC does that).
@@ -763,7 +831,10 @@ int64_t ReplayManager::getElapsedMs() {
     // so fall back to the duration captured at stopRecording. Never return -1
     // (that produced garbage snapshot timecodes / QML binding values).
     QMutexLocker locker(&m_stateMutex);
-    if (m_clock) return qMax<int64_t>(0, m_clock->elapsedMs());
+    // Live: read session-now THROUGH the reference (byte-identical to
+    // m_clock->elapsedMs() under the local tier). The m_clock guard is unchanged, so
+    // post-stop this still falls back to the captured duration.
+    if (m_clock) return qMax<int64_t>(0, nowSessionMs());
     return m_lastKnownDurationMs;
 }
 

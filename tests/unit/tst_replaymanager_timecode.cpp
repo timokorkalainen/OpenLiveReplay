@@ -4,6 +4,7 @@
 #include "recorder_engine/ingest/ingestsession.h"
 #include "recorder_engine/timing/smpte12m.h"
 #include "recorder_engine/timing/sourceoffsetestimator.h"
+#include "recorder_engine/timing/timingreference.h"
 
 // Exercises the production seam ReplayManager::onFrameTimecode -> m_tcAligner.observe
 // and the public sourcesFrameAligned()/sourceFrameOffset() queries that Phase 4
@@ -37,6 +38,11 @@ private slots:
     // Phase 4 Task 5: the relayed IngestStats carries the estimator's tier/phase.
     void relayedStatsCarryTierPhaseAndReference();
     void relayedStatsLeavePreExistingFieldsUntouched();
+
+    // Phase 5 Task 6: the reference tier is surfaced for the UI. Default (no PTP,
+    // no startRecording → no TimingReference built yet) reports LocalMonotonic and
+    // not-external, so the accessor the UIManager binds to is byte-identical to today.
+    void referenceTierDefaultsToLocalMonotonic();
 
 private:
     static int64_t tc100ns(int h, int m, int s, int f) {
@@ -335,6 +341,17 @@ void TestReplayManagerTimecode::relayedStatsLeavePreExistingFieldsUntouched() {
     QCOMPARE(out.clockQuality, in.clockQuality);
     QCOMPARE(out.clockLocked, in.clockLocked);
     QCOMPARE(out.clockOffsetNs, in.clockOffsetNs);
+}
+
+void TestReplayManagerTimecode::referenceTierDefaultsToLocalMonotonic() {
+    ReplayManager manager;
+    // No recording started → no TimingReference is constructed yet. The UI-facing
+    // accessors must still report the safe default: the local monotonic tier (0) and
+    // not-external, so the session status surface reads "local monotonic" until a
+    // recording opens (and, with the default LocalMonotonicReference, stays there).
+    QCOMPARE(manager.referenceTier(), int(ReferenceTier::LocalMonotonic));
+    QCOMPARE(manager.referenceTier(), 0);
+    QVERIFY(!manager.referenceIsExternal());
 }
 
 QTEST_GUILESS_MAIN(TestReplayManagerTimecode)
