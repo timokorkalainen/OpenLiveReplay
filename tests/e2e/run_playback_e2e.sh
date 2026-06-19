@@ -151,6 +151,7 @@ placeholderFramesDelta="$(get placeholderFramesDelta)"
 skippedDuplicateFrames="$(get skippedDuplicateFrames)"
 cacheGeneration="$(get cacheGeneration)"
 heldFramesDelta="$(get heldFramesDelta)"
+maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -163,6 +164,7 @@ heldFramesDelta="$(get heldFramesDelta)"
 [ -n "$skippedDuplicateFrames" ] || skippedDuplicateFrames="?"
 [ -n "$cacheGeneration" ] || cacheGeneration="?"
 [ -n "$heldFramesDelta" ] || heldFramesDelta="?"
+[ -n "$maxClockDivergenceMs" ] || maxClockDivergenceMs="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -364,6 +366,17 @@ case "$SCENARIO" in
             echo "FAIL: armedcut fell back to repositionTo (reposition=$reposition, expected 0) — cut did not fire in time"
             fail=1
         fi
+        # FRAME-ACCURACY gate (the one the placeholder/reposition gates miss): the
+        # output clock must re-anchor to the target at the cut. If the play epoch
+        # is not reset, sampledPlayheadMs diverges from the target by the cut
+        # distance and the output renders the WRONG frame with no gray/reposition
+        # reported. maxClockDivergenceMs was ~11000 with the bug; <500 after the
+        # fix. Bound at 1500 (well clear of normal sub-frame jitter + the seek-
+        # settle transient, far below a divergence regression).
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: armedcut clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored at the cut)"
+            fail=1
+        fi
         ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
@@ -371,7 +384,7 @@ case "$SCENARIO" in
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

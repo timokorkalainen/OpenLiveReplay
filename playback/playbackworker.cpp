@@ -1163,11 +1163,19 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
         m_transport->seek(
             CutSchedule::playheadAfterCut(target, dispatcherNextIndex, scheduled, fps()));
     }
+    // Re-anchor the output clock to the new (target) playhead. Without this the
+    // dispatcher's play epoch stays anchored to the PRE-CUT play start, so
+    // sampledPlayheadMs (which drives the cache lookup) diverges from the target
+    // by the cut distance and the output renders the WRONG frame — the cut is not
+    // frame-accurate even though it reports zero placeholder/reposition. (Same
+    // class of bug as the reposition-commit re-anchor.) resetPlayEpoch locks the
+    // output runtime's OWN mutex (independent of the m_bufferMutex held here), and
+    // OutputRuntime::snapshot() invokes this provider OUTSIDE that mutex, so there
+    // is no re-entrancy or lock-order inversion.
+    if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
     m_stagingCovers.store(false);
     m_cutArmed.store(false);
     m_scheduledCutFrame.store(-1);
-    fprintf(stderr, "ARMEDCUT fired: nextIdx=%lld scheduled=%lld target=%lldms\n",
-            (long long) dispatcherNextIndex, (long long) scheduled, (long long) target);
 }
 
 void PlaybackWorker::run() {

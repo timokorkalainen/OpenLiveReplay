@@ -67,6 +67,11 @@ struct OutputDispatchStats {
     qint64 silentAudioFrames = 0;
     qint64 heldFrames = 0;
     qint64 skippedDuplicateFrames = 0;
+    // Max |snapshot playhead - sampled (output-clock) playhead| seen while
+    // playing, in ms. Detects an un-re-anchored play epoch after a seek/cut: a
+    // large value means the output is sampling (and rendering) the WRONG frame
+    // even though no placeholder/reposition is reported (frame-accuracy guard).
+    qint64 maxClockDivergenceMs = 0;
     OutputRuntimeDispatchStats runtime;
     QHash<QString, OutputTargetDispatchStats> targets;
 };

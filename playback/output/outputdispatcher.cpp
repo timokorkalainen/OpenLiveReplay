@@ -93,6 +93,15 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
             }
             rendered.insert(bus, frame);
             countFrameHealth(rendered.value(bus));
+            // Frame-accuracy guard: while playing, the sampled (output-clock)
+            // playhead must track the snapshot playhead. A large divergence means
+            // the play epoch was not re-anchored after a seek/cut and the output
+            // is rendering the wrong frame (no placeholder/reposition reported).
+            if (tickState.playing && !frame.video.isPlaceholder) {
+                const qint64 d = tickState.playheadMs - frame.sampledPlayheadMs;
+                const qint64 ad = d < 0 ? -d : d;
+                if (ad > m_stats.maxClockDivergenceMs) m_stats.maxClockDivergenceMs = ad;
+            }
         }
 
         const OutputBusFrame frame = rendered.value(bus);
