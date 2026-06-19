@@ -147,10 +147,11 @@ private slots:
     void onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns, int64_t sessionFrameIndex);
 
     // Queued from each StreamWorker::statsUpdated (~1/sec). Caches the source's
-    // latest IngestStats, re-runs the inter-camera phase estimation, then relays the
-    // (unmodified) stats onward as sourceStatsUpdated for the UI — so the existing
-    // stats pipe is byte-identical from the UI's perspective; only the additive
-    // estimator state is updated.
+    // latest IngestStats, re-runs the inter-camera phase estimation, then STAMPS the
+    // additive Phase-4 fields (confidenceTier/interCamPhaseMs/interCamBoundMs/
+    // isReference) from the estimator onto the relayed copy and emits it as
+    // sourceStatsUpdated for the UI — every PRE-EXISTING field stays byte-identical;
+    // only the additive estimator fields are augmented (no new signal).
     void onSourceStatsUpdated(int sourceIndex, IngestStats stats);
     // Drops a source from inter-cam phase eligibility on disconnect + re-selects
     // the reference, so the servo never corrects toward a dead reference.

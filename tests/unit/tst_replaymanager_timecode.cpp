@@ -34,6 +34,10 @@ private slots:
     void singleSourceServoIsZero();
     void servoUsesExactTcOffsetWhenCommonTimecode();
 
+    // Phase 4 Task 5: the relayed IngestStats carries the estimator's tier/phase.
+    void relayedStatsCarryTierPhaseAndReference();
+    void relayedStatsLeavePreExistingFieldsUntouched();
+
 private:
     static int64_t tc100ns(int h, int m, int s, int f) {
         // Producers (SRT/RTMP) encode each frame's TC to 100 ns with the shared
@@ -261,6 +265,76 @@ void TestReplayManagerTimecode::servoUsesExactTcOffsetWhenCommonTimecode() {
     // TC-driven target = frameOffset(0,1)*1000/30 = -2*33 = -66 ms; clock-driven would
     // be only -4. Converged well past the clock signal proves the exact-TC path is used.
     QCOMPARE(manager.sourceServoTrimMs(1), -66);
+}
+
+void TestReplayManagerTimecode::relayedStatsCarryTierPhaseAndReference() {
+    ReplayManager manager;
+    // Spy on the UI-facing relay: the estimator state must ride OUT on the same
+    // sourceStatsUpdated signal (no new signal), so the tooltip sees it for free.
+    QSignalSpy spy(&manager, &ReplayManager::sourceStatsUpdated);
+    QVERIFY(spy.isValid());
+
+    // Reference = source 0 (PCR). Source 1 PCR-locked, NO timecode -> Bounded, LATE +7 ms.
+    QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+    QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 7000000)));
+    QCOMPARE(manager.referenceSource(), 0);
+
+    // The LAST emission is source 1 (the second feedStats). Its relayed stats must be
+    // stamped with the estimator's grading: Bounded(=1), phase +7 ms, a >=4 ms bound,
+    // and isReference=false (it is not the reference).
+    QVERIFY(spy.size() >= 2);
+    const QList<QVariant> last = spy.last();
+    QCOMPARE(last.at(0).toInt(), 1);
+    const IngestStats relayed = last.at(1).value<IngestStats>();
+    QCOMPARE(relayed.confidenceTier, int(ConfidenceTier::Bounded));
+    QCOMPARE(relayed.interCamPhaseMs, int64_t(7));
+    QVERIFY(relayed.interCamBoundMs >= 4);
+    QCOMPARE(relayed.isReference, false);
+
+    // The reference's own relayed stats: phase 0, isReference true.
+    QSignalSpy spy2(&manager, &ReplayManager::sourceStatsUpdated);
+    QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+    const IngestStats refRelayed = spy2.last().at(1).value<IngestStats>();
+    QCOMPARE(refRelayed.isReference, true);
+    QCOMPARE(refRelayed.interCamPhaseMs, int64_t(0));
+}
+
+void TestReplayManagerTimecode::relayedStatsLeavePreExistingFieldsUntouched() {
+    ReplayManager manager;
+    QSignalSpy spy(&manager, &ReplayManager::sourceStatsUpdated);
+
+    // A fully-populated snapshot: every pre-existing field must survive the relay
+    // byte-identical; only the additive estimator fields are stamped.
+    IngestStats in;
+    in.kind = IngestStatsKind::Srt;
+    in.recvTotal = 111;
+    in.retransTotal = 22;
+    in.lossTotal = 3;
+    in.dropTotal = 4;
+    in.bytesTotal = 5555;
+    in.lastPacketAgeMs = 66;
+    in.keyframeAgeMs = 77;
+    in.decodeFailures = 8;
+    in.clockPpm = 12.5;
+    in.clockQuality = int(ClockQuality::Pcr);
+    in.clockLocked = true;
+    in.clockOffsetNs = 9000000;
+    QVERIFY(feedStats(manager, 0, in));
+
+    const IngestStats out = spy.last().at(1).value<IngestStats>();
+    QCOMPARE(out.kind, in.kind);
+    QCOMPARE(out.recvTotal, in.recvTotal);
+    QCOMPARE(out.retransTotal, in.retransTotal);
+    QCOMPARE(out.lossTotal, in.lossTotal);
+    QCOMPARE(out.dropTotal, in.dropTotal);
+    QCOMPARE(out.bytesTotal, in.bytesTotal);
+    QCOMPARE(out.lastPacketAgeMs, in.lastPacketAgeMs);
+    QCOMPARE(out.keyframeAgeMs, in.keyframeAgeMs);
+    QCOMPARE(out.decodeFailures, in.decodeFailures);
+    QCOMPARE(out.clockPpm, in.clockPpm);
+    QCOMPARE(out.clockQuality, in.clockQuality);
+    QCOMPARE(out.clockLocked, in.clockLocked);
+    QCOMPARE(out.clockOffsetNs, in.clockOffsetNs);
 }
 
 QTEST_GUILESS_MAIN(TestReplayManagerTimecode)

@@ -240,6 +240,10 @@ public:
     Q_INVOKABLE bool sourceHasStats(int sourceIndex) const;
     // Preformatted multi-line cumulative figures for the dot's hover tooltip.
     Q_INVOKABLE QString sourceStatsTooltip(int sourceIndex) const;
+    // Inter-camera confidence tier (Phase 4) for the QML health surface to badge the
+    // source: 0=Approximate, 1=Bounded, 2=FrameAccurate. 0 (Approximate) until the
+    // source has reported stats. Refreshed on sourceStatsChanged like the other dot bindings.
+    Q_INVOKABLE int sourceConfidenceTier(int sourceIndex) const;
     // Config-time check: another source carries the same non-empty URL.
     // Surfaces the duplicate-stream misconfiguration that two workers
     // pulling one URL otherwise hides.

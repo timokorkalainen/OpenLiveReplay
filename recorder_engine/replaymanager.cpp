@@ -528,10 +528,19 @@ void ReplayManager::onSourceStatsUpdated(int sourceIndex, IngestStats stats) {
         m_lastStats[sourceIndex] = stats;
         m_sourceHasStats[sourceIndex] = true;
         recomputeInterCamPhase();
+
+        // Stamp the estimator's grading onto the relayed copy so the existing
+        // sourceStatsUpdated -> onSourceStatsUpdated pipe carries the inter-camera
+        // phase + confidence tier to the UI (no new signal). ADDITIVE only: every
+        // pre-existing field above is left byte-identical; only these four are set.
+        stats.confidenceTier = int(m_offsetEstimator.tier(sourceIndex));
+        stats.interCamPhaseMs = m_offsetEstimator.offsetMs(sourceIndex);
+        stats.interCamBoundMs = m_offsetEstimator.boundMs(sourceIndex);
+        stats.isReference = (sourceIndex == m_referenceSource);
     }
 
-    // Relay the (unmodified) stats onward for the UI — the existing pipe is
-    // byte-identical; only the additive estimator state changed above.
+    // Relay the stats onward for the UI. Every pre-existing field is byte-identical;
+    // only the additive Phase-4 estimator fields were stamped above.
     emit sourceStatsUpdated(sourceIndex, stats);
 }
 
