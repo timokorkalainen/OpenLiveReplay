@@ -26,18 +26,10 @@ Item {
             }
         }
 
-        function onBenchmarkProgressChanged(n, sustained) {
-            if (n === undefined) return
-            progressLabel.text = "Feed " + n + " — " + (sustained ? "sustained" : "dropped")
-        }
-
         function onBenchmarkProgress(n, sustained) {
             progressLabel.text = "Feed " + n + " — " + (sustained ? "sustained" : "dropped")
         }
 
-        function onBenchmarkResultChanged() {
-            // handled via binding on benchmarkResultText
-        }
     }
 
     implicitWidth: layout.implicitWidth
@@ -67,7 +59,7 @@ Item {
                 model: {
                     var h264Label = root.h264Selectable
                         ? "H.264 (hardware)"
-                        : "H.264 (hardware) — no hardware"
+                        : "H.264 (hardware) (no hardware)"
                     return ["MPEG-2 (software)", h264Label]
                 }
 
