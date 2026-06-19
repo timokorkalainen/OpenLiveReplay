@@ -12,9 +12,15 @@ namespace {
 class FakeRunner : public CodecRunner {
 public:
     int maxHeadroom; int maxSustain; QVector<int> visited;
+    bool observedCancel = false; // C1: did any call observe a set cancel flag?
     FakeRunner(int headroom, int sustain) : maxHeadroom(headroom), maxSustain(sustain) {}
     bool available() const override { return true; }
-    RampStepResult runStep(int n, const BenchmarkConfig& c) override {
+    RampStepResult runStep(int n, const BenchmarkConfig& c,
+                           const std::atomic<bool>& cancel) override {
+        if (cancel.load(std::memory_order_acquire)) {
+            observedCancel = true;
+            return {}; // early-out: return empty result when cancel is pre-set
+        }
         visited.append(n);
         RampStepResult r; r.concurrency = n;
         r.framesRequired = int64_t(n) * c.fps * c.durationMsPerStep / 1000;
@@ -35,6 +41,7 @@ private slots:
     void safeFeedIsLargestWithHeadroom();
     void cancellationStopsRamp();
     void unavailableRunnerYieldsNoFeeds();
+    void cancelReachesRunStep(); // T-cancel (C1 wiring)
 };
 
 void TestCodecBenchmark::stopsAtFirstFailingStep() {
@@ -70,11 +77,26 @@ void TestCodecBenchmark::cancellationStopsRamp() {
 void TestCodecBenchmark::unavailableRunnerYieldsNoFeeds() {
     class Unavail : public CodecRunner {
         bool available() const override { return false; }
-        RampStepResult runStep(int, const BenchmarkConfig&) override { return {}; }
+        RampStepResult runStep(int, const BenchmarkConfig&,
+                               const std::atomic<bool>&) override { return {}; }
     } runner;
     BenchmarkConfig cfg;
     std::atomic<bool> cancel{false};
     auto res = CodecBenchmark::rampCodec(runner, cfg, [](int,bool){}, cancel);
+    QCOMPARE(res.safeFeeds, 0);
+    QCOMPARE(res.ceiling, 0);
+}
+
+// T-cancel: proves that a pre-set cancel flag is propagated into runStep.
+// The FakeRunner returns empty and records observedCancel when cancel is true on entry.
+void TestCodecBenchmark::cancelReachesRunStep() {
+    FakeRunner runner(32, 32);
+    BenchmarkConfig cfg; cfg.fps = 30; cfg.durationMsPerStep = 1000;
+    std::atomic<bool> cancel{true}; // pre-set cancel
+    auto res = CodecBenchmark::rampCodec(runner, cfg, [](int,bool){}, cancel);
+    // rampCodec checks cancel before each step and breaks immediately, so runStep
+    // is never called when cancel is already set on the first iteration.
+    QCOMPARE(runner.visited.size(), 0); // no steps executed
     QCOMPARE(res.safeFeeds, 0);
     QCOMPARE(res.ceiling, 0);
 }

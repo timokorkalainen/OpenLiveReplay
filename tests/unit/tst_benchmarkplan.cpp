@@ -1,8 +1,10 @@
 // Unit tests for the pure benchmark decision core — ramp steps, sustain/headroom
-// predicates, and safe/ceiling feed-count derivation. No threads, no codecs.
+// predicates, safe/ceiling feed-count derivation, and the recommendation rule.
+// No threads, no codecs.
 #include <QtTest>
 
 #include "recorder_engine/benchmark/benchmarkplan.h"
+#include "recorder_engine/codec/videocodecchoice.h"
 
 class TestBenchmarkPlan : public QObject {
     Q_OBJECT
@@ -11,6 +13,7 @@ private slots:
     void sustainPredicate();
     void headroomPredicate();
     void safeAndCeilingFromSteps();
+    void recommendCodecRules(); // T-recommendation
 };
 
 void TestBenchmarkPlan::rampStepsAreExact() {
@@ -45,6 +48,24 @@ void TestBenchmarkPlan::safeAndCeilingFromSteps() {
     };
     QCOMPARE(ceilingFeedCount(steps), 8); // largest sustained
     QCOMPARE(safeFeedCount(steps), 4);    // largest with 1.2x headroom
+}
+
+// T-recommendation: pure recommendCodec() rule coverage.
+void TestBenchmarkPlan::recommendCodecRules() {
+    // H.264 wins when available, safeFeeds > 0, and >= mpeg2
+    QCOMPARE(recommendCodec(true, 8, 4), VideoCodecChoice::H264Hardware);
+
+    // Tie (equal, both > 0) -> H.264
+    QCOMPARE(recommendCodec(true, 4, 4), VideoCodecChoice::H264Hardware);
+
+    // h264SafeFeeds == 0 -> MPEG-2 even if mpeg2 also 0
+    QCOMPARE(recommendCodec(true, 0, 0), VideoCodecChoice::Mpeg2Software);
+
+    // h264Available == false -> MPEG-2 regardless
+    QCOMPARE(recommendCodec(false, 8, 4), VideoCodecChoice::Mpeg2Software);
+
+    // mpeg2 higher -> MPEG-2
+    QCOMPARE(recommendCodec(true, 4, 8), VideoCodecChoice::Mpeg2Software);
 }
 
 QTEST_GUILESS_MAIN(TestBenchmarkPlan)

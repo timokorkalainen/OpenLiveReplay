@@ -11,7 +11,7 @@ CodecBenchmark::CodecResult CodecBenchmark::rampCodec(
     for (int i = 0; i < steps.size(); ++i) {
         if (cancel.load(std::memory_order_acquire)) break;
         const int n = steps[i];
-        RampStepResult r = runner.runStep(n, config);
+        RampStepResult r = runner.runStep(n, config, cancel);
         out.steps.append(r);
         const bool sustained = rampStepSustained(r);
         if (onStep) onStep(n, sustained);

@@ -3,12 +3,15 @@
 
 #include "recorder_engine/benchmark/benchmarktypes.h"
 
+#include <atomic>
+
 // Runs N concurrent encode+decode pipelines for a measurement window and reports
 // the aggregate. Implementations: real (FFmpeg MPEG-2, native H.264) and fake (tests).
 class CodecRunner {
 public:
     virtual ~CodecRunner() = default;
-    virtual RampStepResult runStep(int concurrency, const BenchmarkConfig& config) = 0;
+    virtual RampStepResult runStep(int concurrency, const BenchmarkConfig& config,
+                                   const std::atomic<bool>& cancel) = 0;
     virtual bool available() const = 0;
 };
 

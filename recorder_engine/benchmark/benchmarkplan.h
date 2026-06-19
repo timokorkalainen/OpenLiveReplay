@@ -2,6 +2,7 @@
 #define OLR_BENCHMARKPLAN_H
 
 #include "recorder_engine/benchmark/benchmarktypes.h"
+#include "recorder_engine/codec/videocodecchoice.h"
 
 #include <QVector>
 
@@ -17,5 +18,9 @@ bool rampStepHasHeadroom(const RampStepResult& r);
 int ceilingFeedCount(const QVector<RampStepResult>& steps);
 // Largest N that had headroom (the recommended safe feed count); 0 if none.
 int safeFeedCount(const QVector<RampStepResult>& steps);
+
+// Pure recommendation rule: choose H264Hardware iff h264Available, h264SafeFeeds > 0,
+// and h264SafeFeeds >= mpeg2SafeFeeds; otherwise Mpeg2Software.
+VideoCodecChoice recommendCodec(bool h264Available, int h264SafeFeeds, int mpeg2SafeFeeds);
 
 #endif // OLR_BENCHMARKPLAN_H

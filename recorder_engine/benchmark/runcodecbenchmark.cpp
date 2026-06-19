@@ -1,5 +1,6 @@
 #include "recorder_engine/benchmark/runcodecbenchmark.h"
 #include "recorder_engine/benchmark/benchmarkcache.h"
+#include "recorder_engine/benchmark/benchmarkplan.h"
 #include "recorder_engine/benchmark/realcodecrunners.h"
 #include "recorder_engine/codec/videocodecchoice.h"
 
@@ -33,13 +34,7 @@ CodecBenchmarkResult runCodecBenchmark(const BenchmarkConfig& config,
     }
 
     // --- Recommendation ---
-    // Prefer H.264 if available, sustained at least one feed, and handles at least
-    // as many feeds as MPEG-2. Never recommend a codec that sustained zero feeds.
-    if (result.h264Available && result.h264SafeFeeds > 0 && result.h264SafeFeeds >= result.mpeg2SafeFeeds) {
-        result.recommended = VideoCodecChoice::H264Hardware;
-    } else {
-        result.recommended = VideoCodecChoice::Mpeg2Software;
-    }
+    result.recommended = recommendCodec(result.h264Available, result.h264SafeFeeds, result.mpeg2SafeFeeds);
 
     // --- Metadata (timestamp left for caller) ---
     result.deviceLabel = benchmarkDeviceLabel();

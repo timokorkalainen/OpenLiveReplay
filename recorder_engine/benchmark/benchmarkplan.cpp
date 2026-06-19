@@ -1,5 +1,7 @@
 #include "recorder_engine/benchmark/benchmarkplan.h"
 
+#include "recorder_engine/codec/videocodecchoice.h"
+
 QVector<int> benchmarkRampSteps() {
     return {1, 2, 4, 8, 12, 16, 20, 24, 28, 32};
 }
@@ -24,4 +26,11 @@ int safeFeedCount(const QVector<RampStepResult>& steps) {
     for (const RampStepResult& r : steps)
         if (rampStepHasHeadroom(r) && r.concurrency > best) best = r.concurrency;
     return best;
+}
+
+VideoCodecChoice recommendCodec(bool h264Available, int h264SafeFeeds, int mpeg2SafeFeeds)
+{
+    if (h264Available && h264SafeFeeds > 0 && h264SafeFeeds >= mpeg2SafeFeeds)
+        return VideoCodecChoice::H264Hardware;
+    return VideoCodecChoice::Mpeg2Software;
 }

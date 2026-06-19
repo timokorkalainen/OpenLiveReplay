@@ -19,6 +19,7 @@ struct RampStepResult {
     int framesProcessed = 0;
     int64_t framesRequired = 0;
     bool budgetMet = true;
+    bool startupFailed = false; // true if any thread failed to construct its codec session
     double avgEncodeMs = 0.0;
     double avgDecodeMs = 0.0;
 };
