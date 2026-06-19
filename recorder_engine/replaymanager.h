@@ -17,6 +17,9 @@
 #include "recorder_engine/codec/nativevideoencoder.h"
 #include "timing/timecodealigner.h"
 #include "timing/sourceoffsetestimator.h"
+#include "timing/timingreference.h"
+
+#include <memory>
 
 class ReplayManager : public QObject
 {
@@ -167,6 +170,15 @@ private:
     // called on every stats pulse (no new timer — stats already arrive ~1/sec).
     void recomputeInterCamPhase();
 
+    // Session "now" in ms, read THROUGH the TimingReference seam so the whole
+    // timeline path (heartbeat + getElapsedMs) re-times atomically when the reference
+    // is swapped (local -> PTP). Byte-identical to m_clock->elapsedMs() today: the
+    // LocalMonotonicReference returns elapsedMs()*1e6/1e6. Falls back to the raw clock
+    // if the reference is somehow absent (defensive; they are created/destroyed together).
+    int64_t nowSessionMs() const {
+        return m_timingRef ? m_timingRef->nowSessionMs() : (m_clock ? m_clock->elapsedMs() : 0);
+    }
+
     mutable QMutex m_stateMutex;
     bool m_isRecording = false;
     int64_t m_globalFrameCount = 0;
@@ -208,6 +220,14 @@ private:
     QTimer* m_heartbeat;
     Muxer* m_muxer;
     RecordingClock* m_clock;
+    // The session timebase the whole pipeline reads "now" through. Today a
+    // LocalMonotonicReference wrapping m_clock (byte-identical to m_clock->elapsedMs());
+    // the Phase-5 swap point for a PtpReference with no pipeline changes. Holds a
+    // NON-owning RecordingClock* (m_clock), so it MUST be destroyed before m_clock is
+    // deleted: declared AFTER m_clock here (members destruct in reverse declaration
+    // order) AND reset()/rebuilt in stopRecording/startRecording so it never outlives
+    // the clock it points at.
+    std::unique_ptr<TimingReference> m_timingRef;
     QList<StreamWorker*> m_workers;  // One per SOURCE (not per view)
 
     // Inter-camera timecode aligner. Constructed with the SHARED

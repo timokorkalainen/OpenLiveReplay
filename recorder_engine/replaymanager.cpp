@@ -310,6 +310,11 @@ void ReplayManager::startRecording() {
     if (m_clock) delete m_clock;
     m_clock = new RecordingClock();
     m_clock->start();
+    // Rebuild the session timebase over the FRESH clock (m_clock is re-new'd per
+    // recording). Today a LocalMonotonicReference — byte-identical to m_clock->elapsedMs();
+    // the Phase-5 swap point for an external (PTP) reference. Holds m_clock NON-owningly,
+    // so it is rebuilt here and reset in stopRecording before m_clock is deleted.
+    m_timingRef = std::make_unique<LocalMonotonicReference>(m_clock);
     m_recordingStartEpochMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
 
     // 4. Launch one StreamWorker PER SOURCE (not per view).
@@ -404,8 +409,14 @@ void ReplayManager::stopRecording() {
 
     if (m_clock) {
         // Capture the final duration before deleting the clock so callers
-        // (recordedDurationMs / scrubPosition) keep getting a valid value.
+        // (recordedDurationMs / scrubPosition) keep getting a valid value. This is a
+        // raw m_clock read (the plan routes only onTimerTick + getElapsedMs through the
+        // reference); m_clock is still valid here.
         m_lastKnownDurationMs = qMax<int64_t>(0, m_clock->elapsedMs());
+        // The reference holds m_clock NON-owningly: drop it BEFORE deleting the clock
+        // so it never points at freed memory (and so a later getElapsedMs falls back to
+        // m_lastKnownDurationMs, exactly as before).
+        m_timingRef.reset();
         delete m_clock;
         m_clock = nullptr;
     }
@@ -492,7 +503,9 @@ void ReplayManager::onTimerTick() {
     // scheduler. heartbeatFrameSpan() turns the elapsed wall-clock into the frame
     // range to emit this tick (with catch-up for late ticks + a 1-second backlog
     // skip). maxBacklogFrames = m_fps == one second of frames.
-    const int64_t elapsedMs = m_clock->elapsedMs();
+    // Read session-now THROUGH the TimingReference seam (byte-identical to
+    // m_clock->elapsedMs() under the local tier; the swap point for a PTP timebase).
+    const int64_t elapsedMs = nowSessionMs();
     const FrameSpan span =
         heartbeatFrameSpan(elapsedMs, m_fps, m_globalFrameCount, kMaxFramesPerTick, m_fps);
 
@@ -763,7 +776,10 @@ int64_t ReplayManager::getElapsedMs() {
     // so fall back to the duration captured at stopRecording. Never return -1
     // (that produced garbage snapshot timecodes / QML binding values).
     QMutexLocker locker(&m_stateMutex);
-    if (m_clock) return qMax<int64_t>(0, m_clock->elapsedMs());
+    // Live: read session-now THROUGH the reference (byte-identical to
+    // m_clock->elapsedMs() under the local tier). The m_clock guard is unchanged, so
+    // post-stop this still falls back to the captured duration.
+    if (m_clock) return qMax<int64_t>(0, nowSessionMs());
     return m_lastKnownDurationMs;
 }
 
