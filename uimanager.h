@@ -21,6 +21,7 @@
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
 #include "playback/seekcoalescer.h"
+#include "playback/replayplaylist.h"
 #include "playback/telemetrytimelinereader.h"
 #include "midi/midimanager.h"
 #include "streamdeck/streamdeckmanager.h"
@@ -260,6 +261,12 @@ public:
     //Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
     Q_INVOKABLE void endScrubGesture();
+    // Tier3 replay cue list: capture mark-in/out at the current playhead and
+    // recall an entry as a frame-perfect armed cut (pre-rolled, no flash).
+    Q_INVOKABLE void markIn();
+    Q_INVOKABLE void markOut();
+    Q_INVOKABLE void recallEntry(int index);
+    Q_INVOKABLE int playlistCount() const;
 
     QString getSettingsPath(QString fileName);
 signals:
@@ -359,6 +366,7 @@ private:
     SettingsManager* m_settingsManager;
     QString m_configPath;
     PlaybackWorker* m_playbackWorker = nullptr;
+    ReplayPlaylist m_playlist; // Tier3 cue list (markIn/markOut/recall)
     QList<FrameProvider*> m_providers;
     FrameProvider* m_multiviewPreviewProvider = nullptr;
     FrameProvider* m_pgmPreviewProvider = nullptr;

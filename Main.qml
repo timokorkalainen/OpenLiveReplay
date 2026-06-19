@@ -982,6 +982,16 @@ ApplicationWindow {
                     }
                 }
 
+                // Tier3 replay cue list: mark in/out at the playhead, recall as a
+                // frame-perfect armed cut (pre-rolled, no flash).
+                RowLayout {
+                    Layout.alignment: Qt.AlignHCenter
+                    spacing: 8
+                    Button { text: "Mark In";  onClicked: appWindow.uiManagerRef.markIn() }
+                    Button { text: "Mark Out"; onClicked: appWindow.uiManagerRef.markOut() }
+                    Button { text: "Recall 0"; onClicked: appWindow.uiManagerRef.recallEntry(0) }
+                }
+
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter
                     Layout.fillWidth: true
