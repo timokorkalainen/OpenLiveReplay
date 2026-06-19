@@ -153,6 +153,7 @@ cacheGeneration="$(get cacheGeneration)"
 heldFramesDelta="$(get heldFramesDelta)"
 maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 cutsFired="$(get cutsFired)"
+cutFollowReposition="$(get cutFollowReposition)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -167,6 +168,7 @@ cutsFired="$(get cutsFired)"
 [ -n "$heldFramesDelta" ] || heldFramesDelta="?"
 [ -n "$maxClockDivergenceMs" ] || maxClockDivergenceMs="?"
 [ -n "$cutsFired" ] || cutsFired="?"
+[ -n "$cutFollowReposition" ] || cutFollowReposition="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -415,6 +417,14 @@ case "$SCENARIO" in
             echo "FAIL: armedcut re-arm queue fired $cutsFired cuts (expected 2) — a Recall during an in-flight cut was dropped or duplicated (safe re-arm queue regressed)"
             fail=1
         fi
+        # FORWARD cuts must NOT trigger the armed-cut decoder-follow: the primary
+        # bank is BEHIND the new playhead, so the forward-lag skip-forward path
+        # resyncs it with no reposition. A non-zero cutFollowReposition here means
+        # the follow fired for a forward cut (wrong direction guard).
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 0 ]; then
+            echo "FAIL: armedcut (forward) fired the decoder-follow (cutFollowReposition=$cutFollowReposition, expected 0) — follow should only arm for backward cuts"
+            fail=1
+        fi
         ;;
     armedcut-back)
         # Tier3 ARMED CUT with a BACKWARD target (the dominant EVS replay case),
@@ -439,8 +449,18 @@ case "$SCENARIO" in
             echo "FAIL: armedcut-back painted gray across the backward cut (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — cut flash"
             fail=1
         fi
-        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -ne 0 ]; then
-            echo "FAIL: armedcut-back froze (heldFramesDelta=$heldFramesDelta, expected 0) — output cache ran dry before the decoder resync extended coverage (frozen frame, invisible to the placeholder gate)"
+        # heldFramesDelta is the frozen-frame detector: if the cache runs dry the
+        # dispatcher paints the last-good frame (heldFrames++) instead of gray, so
+        # the placeholder gate misses it. A REAL dry-cache stall (the playhead
+        # outrunning the ~800ms promoted coverage before the resync extends it)
+        # would be HUNDREDS-to-thousands of held ticks (~1ms/tick, seconds of
+        # freeze). The small bound tolerates only the brief cut-flip transient (the
+        # re-based playhead momentarily a tick or two below the first promoted
+        # frame): observed 0-2, bounded at 20 (same as farback) for host-load
+        # variance — orders of magnitude below a real stall, so it never flakes yet
+        # still trips on a genuine freeze.
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -gt 20 ]; then
+            echo "FAIL: armedcut-back froze (heldFramesDelta=$heldFramesDelta, expected <=20) — output cache ran dry before the decoder resync extended coverage (frozen frame, invisible to the placeholder gate)"
             fail=1
         fi
         if ! num "$framesDropped" || [ "$framesDropped" -ne 0 ]; then
@@ -451,8 +471,19 @@ case "$SCENARIO" in
             echo "FAIL: armedcut-back clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored at the backward cut)"
             fail=1
         fi
-        if ! num "$reposition" || [ "$reposition" -gt 8 ]; then
-            echo "FAIL: armedcut-back repositioned too much (reposition=$reposition, expected <=8) — backward-cut resync should be a single decoder reposition, not a storm"
+        # DECODER-FOLLOW gate: a backward cut must resync the primary bank via the
+        # deterministic decoder-follow (cutFollowReposition==1), NOT the reactive
+        # backward-jump path. With the codec flush draining stale post-seek frames,
+        # the resync is a SINGLE reposition, so the only entry on the reposition
+        # counter is the scenario's own warmup seekTo (1). Before this work a
+        # backward cut tripped the reactive path 2-3 times (reposition ~4) AND the
+        # follow did not exist; now reposition==1 (warmup) + cutFollowReposition==1.
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 1 ]; then
+            echo "FAIL: armedcut-back decoder-follow did not fire exactly once (cutFollowReposition=$cutFollowReposition, expected 1) — backward cut should resync the primary bank via the proactive follow"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 2 ]; then
+            echo "FAIL: armedcut-back repositioned too much (reposition=$reposition, expected <=2 = warmup only) — reactive backward-jump storm (codec not flushed) or coarse-seek fallback"
             fail=1
         fi
         ;;
@@ -462,7 +493,7 @@ case "$SCENARIO" in
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

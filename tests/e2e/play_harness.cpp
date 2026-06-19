@@ -118,14 +118,16 @@ int main(int argc, char** argv) {
         const PlaybackWorker::PlaybackCounters c = worker.counters();
         const qint64 phDelta = (*basePh < 0) ? 0 : (os.placeholderFrames - *basePh);
         const qint64 heldDelta = (*baseHeld < 0) ? 0 : (os.heldFrames - *baseHeld);
-        printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
-               "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
-               "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
-               "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d\n",
-               c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-               c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
-               (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-               (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired());
+        printf(
+            "COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
+            "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
+            "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
+            "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d\n",
+            c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
+            c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
+            (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
+            (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
+            c.cutFollowReposition);
         fflush(stdout);
         app.quit();
     };
@@ -373,11 +375,13 @@ int main(int argc, char** argv) {
             printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                    "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                    "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
-                   "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d\n",
+                   "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d "
+                   "cutFollowReposition=%d\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                    c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                    (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-                   (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired());
+                   (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
+                   c.cutFollowReposition);
             fflush(stdout);
             ::exit(2);
         }
