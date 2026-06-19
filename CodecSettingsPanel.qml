@@ -14,6 +14,10 @@ Item {
     // Task 6 asserts H.264 option availability via this helper.
     readonly property bool h264Selectable: root.controller && root.controller.h264EncodeAvailable
 
+    // Task 6 asserts benchmark running state via this helper (effective visible
+    // cascades from window state in offscreen tests; this does not).
+    readonly property bool benchmarkActive: root.controller ? root.controller.benchmarkRunning : false
+
     // Force codec back to mpeg2 when H.264 is selected but hardware is unavailable.
     Connections {
         target: root.controller
