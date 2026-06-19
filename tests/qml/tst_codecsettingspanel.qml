@@ -19,6 +19,7 @@ TestCase {
         property int runCalls: 0
         property int cancelCalls: 0
         signal benchmarkProgress(int concurrency, bool sustained)
+        signal benchmarkFinished()
         function runBenchmark() { runCalls += 1 }
         function cancelBenchmark() { cancelCalls += 1 }
     }
@@ -142,5 +143,17 @@ TestCase {
         var p = makePanel()
         var txt = findChild(p, "benchmarkResultText")
         verify(txt.text.toLowerCase().indexOf("not benchmarked") >= 0, "placeholder shown")
+    }
+
+    // The per-step progress line must clear when the run finishes/cancels, so the
+    // panel doesn't permanently display the last step's text after a benchmark.
+    function test_progress_label_clears_on_finished() {
+        var p = makePanel()
+        var label = findChild(p, "benchmarkProgressLabel")
+        verify(label, "found benchmarkProgressLabel")
+        mock.benchmarkProgress(4, true)
+        verify(label.text !== "", "progress line shown during run: '" + label.text + "'")
+        mock.benchmarkFinished()
+        compare(label.text, "", "progress line cleared after benchmarkFinished")
     }
 }

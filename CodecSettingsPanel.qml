@@ -34,6 +34,12 @@ Item {
             progressLabel.text = "Feed " + n + " — " + (sustained ? "sustained" : "dropped")
         }
 
+        // Clear the per-step progress line when the run ends or is cancelled,
+        // so the panel doesn't permanently display the last step's text.
+        function onBenchmarkFinished() {
+            progressLabel.text = ""
+        }
+
     }
 
     implicitWidth: layout.implicitWidth
@@ -100,7 +106,10 @@ Item {
                 text: "Run Benchmark"
                 enabled: root.controller ? !root.controller.benchmarkRunning : false
                 onClicked: {
-                    if (root.controller) root.controller.runBenchmark()
+                    if (root.controller) {
+                        progressLabel.text = ""
+                        root.controller.runBenchmark()
+                    }
                 }
             }
 
@@ -123,6 +132,7 @@ Item {
 
             Text {
                 id: progressLabel
+                objectName: "benchmarkProgressLabel"
                 text: ""
                 color: "#aaaaaa"
                 visible: text !== ""

@@ -8,6 +8,7 @@
 #include <QElapsedTimer>
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -22,6 +23,23 @@ extern "C" {
 // Shared aggregation helpers
 // ---------------------------------------------------------------------------
 namespace {
+
+// RAII deleters for FFmpeg handles so the benchmark threads release every
+// resource on all exit paths (the C3 early returns and the I1 catch(...))
+// without manual frees — mirrors the RAII the H.264 runner already gets from
+// unique_ptr<NativeVideoEncoder> + a stack NativeVideoDecoder.
+struct AvCodecContextDeleter {
+    void operator()(AVCodecContext* ctx) const { avcodec_free_context(&ctx); }
+};
+struct AvPacketDeleter {
+    void operator()(AVPacket* pkt) const { av_packet_free(&pkt); }
+};
+struct AvFrameDeleter {
+    void operator()(AVFrame* frm) const { av_frame_free(&frm); }
+};
+using AvCodecContextPtr = std::unique_ptr<AVCodecContext, AvCodecContextDeleter>;
+using AvPacketPtr = std::unique_ptr<AVPacket, AvPacketDeleter>;
+using AvFramePtr = std::unique_ptr<AVFrame, AvFrameDeleter>;
 
 struct ThreadResult {
     int pairs = 0;
@@ -98,16 +116,19 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
             ThreadResult& res = results[idx];
 
             // --- Set up FFmpeg MPEG-2 encoder (mirrors StreamWorker::setupEncoder) ---
+            // RAII owners release encCtx/decCtx/pkt/decFrm on every exit path
+            // (the C3 early returns AND the I1 catch(...) below) — no manual frees.
             const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
             if (!encoder) {
                 res.startupFailed = true;
                 return;
             } // C3
-            AVCodecContext* encCtx = avcodec_alloc_context3(encoder);
-            if (!encCtx) {
+            AvCodecContextPtr encCtxOwner(avcodec_alloc_context3(encoder));
+            if (!encCtxOwner) {
                 res.startupFailed = true;
                 return;
             } // C3
+            AVCodecContext* encCtx = encCtxOwner.get();
             encCtx->width = cfg.width;
             encCtx->height = cfg.height;
             encCtx->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -116,7 +137,6 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
             encCtx->gop_size = 1; // intra-only
             encCtx->bit_rate = cfg.bitrate;
             if (avcodec_open2(encCtx, encoder, nullptr) < 0) {
-                avcodec_free_context(&encCtx);
                 res.startupFailed = true;
                 return; // C3
             }
@@ -124,33 +144,28 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
             // --- Set up FFmpeg MPEG-2 decoder ---
             const AVCodec* decoder = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
             if (!decoder) {
-                avcodec_free_context(&encCtx);
                 res.startupFailed = true;
                 return;
             } // C3
-            AVCodecContext* decCtx = avcodec_alloc_context3(decoder);
-            if (!decCtx) {
-                avcodec_free_context(&encCtx);
+            AvCodecContextPtr decCtxOwner(avcodec_alloc_context3(decoder));
+            if (!decCtxOwner) {
                 res.startupFailed = true;
                 return;
             } // C3
+            AVCodecContext* decCtx = decCtxOwner.get();
             if (avcodec_open2(decCtx, decoder, nullptr) < 0) {
-                avcodec_free_context(&decCtx);
-                avcodec_free_context(&encCtx);
                 res.startupFailed = true;
                 return; // C3
             }
 
-            AVPacket* pkt = av_packet_alloc();
-            AVFrame* decFrm = av_frame_alloc();
-            if (!pkt || !decFrm) {
-                av_packet_free(&pkt);
-                av_frame_free(&decFrm);
-                avcodec_free_context(&decCtx);
-                avcodec_free_context(&encCtx);
+            AvPacketPtr pktOwner(av_packet_alloc());
+            AvFramePtr decFrmOwner(av_frame_alloc());
+            if (!pktOwner || !decFrmOwner) {
                 res.startupFailed = true;
                 return; // C3
             }
+            AVPacket* pkt = pktOwner.get();
+            AVFrame* decFrm = decFrmOwner.get();
 
             // Warm-up: encode+decode 2 frames before measurement to prime FFmpeg's
             // internal pipeline (avoids counting codec-init latency against the budget).
@@ -232,10 +247,8 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
                 ++res.pairs;
             }
 
-            av_frame_free(&decFrm);
-            av_packet_free(&pkt);
-            avcodec_free_context(&decCtx);
-            avcodec_free_context(&encCtx);
+            // RAII owners (encCtxOwner/decCtxOwner/pktOwner/decFrmOwner) free
+            // every handle here and on all early-return / exception paths.
         } catch (...) {
             // I1: prevent exception from escaping the thread entry function;
             // treat as a startup failure so the step is definitively non-sustained.
