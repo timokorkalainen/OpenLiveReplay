@@ -36,7 +36,12 @@ bool saveBenchmarkResult(const QString& path, const CodecBenchmarkResult& result
         qDebug() << "benchmarkcache: failed to open for writing:" << path;
         return false;
     }
-    file.write(doc.toJson(QJsonDocument::Indented));
+    const QByteArray bytes = doc.toJson(QJsonDocument::Indented);
+    if (file.write(bytes) < bytes.size()) {
+        qWarning() << "benchmarkcache: failed to write:" << path;
+        file.close();
+        return false;
+    }
     file.close();
     return true;
 }

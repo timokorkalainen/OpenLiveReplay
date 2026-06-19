@@ -16,16 +16,25 @@ void TestBenchmarkCache::roundTrip() {
     QTemporaryDir dir; const QString path = dir.filePath("bench.json");
     CodecBenchmarkResult in;
     in.h264Available = true; in.h264SafeFeeds = 12; in.mpeg2SafeFeeds = 5;
-    in.h264EncodeMs = 1.8; in.recommended = VideoCodecChoice::H264Hardware;
+    in.h264EncodeMs = 1.8; in.h264DecodeMs = 2.3; in.mpeg2EncodeMs = 3.5; in.mpeg2DecodeMs = 4.1;
+    in.recommended = VideoCodecChoice::H264Hardware;
     in.deviceLabel = "TestChip arm64"; in.resolution = "1920x1080@30"; in.timestamp = "2026-06-19T00:00:00Z";
+    in.ceilingReached = true;
     QVERIFY(saveBenchmarkResult(path, in));
     CodecBenchmarkResult out;
     QVERIFY(loadBenchmarkResult(path, out));
+    QCOMPARE(out.h264Available, true);
     QCOMPARE(out.h264SafeFeeds, 12);
     QCOMPARE(out.mpeg2SafeFeeds, 5);
+    QCOMPARE(out.h264EncodeMs, 1.8);
+    QCOMPARE(out.h264DecodeMs, 2.3);
+    QCOMPARE(out.mpeg2EncodeMs, 3.5);
+    QCOMPARE(out.mpeg2DecodeMs, 4.1);
     QCOMPARE(out.recommended, VideoCodecChoice::H264Hardware);
     QCOMPARE(out.deviceLabel, in.deviceLabel);
     QCOMPARE(out.resolution, in.resolution);
+    QCOMPARE(out.timestamp, in.timestamp);
+    QCOMPARE(out.ceilingReached, true);
 }
 
 void TestBenchmarkCache::invalidatesOnDeviceOrResolutionChange() {
