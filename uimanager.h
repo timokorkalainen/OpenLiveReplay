@@ -15,6 +15,7 @@
 #include "project/projectsettingsimporter.h"
 #include "recorder_engine/replaymanager.h"
 #include "recorder_engine/codec/videocodecchoice.h"
+#include "recorder_engine/codec/nativevideoencoder.h"
 #include "recorder_engine/ingest/ingestsession.h"
 #include "playback/frameprovider.h"
 #include "playback/playbackworker.h"
@@ -42,6 +43,7 @@ class UIManager : public QObject {
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
     Q_PROPERTY(QString recordCodec READ recordCodec WRITE setRecordCodec NOTIFY recordCodecChanged)
+    Q_PROPERTY(bool h264EncodeAvailable READ h264EncodeAvailable NOTIFY h264EncodeAvailableChanged)
     Q_PROPERTY(int audioOutputLatencyMs READ audioOutputLatencyMs WRITE setAudioOutputLatencyMs
                    NOTIFY audioOutputLatencyChanged)
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
@@ -112,6 +114,7 @@ public:
     int recordWidth() const;
     int recordHeight() const;
     QString recordCodec() const;
+    bool h264EncodeAvailable() const { return m_h264EncodeAvailable; }
     int recordFps() const;
     int recordFpsNumerator() const;
     int recordFpsDenominator() const;
@@ -278,6 +281,7 @@ signals:
     void recordWidthChanged();
     void recordHeightChanged();
     void recordCodecChanged();
+    void h264EncodeAvailableChanged();
     void recordFpsChanged();
     void audioOutputLatencyChanged();
     void multiviewCountChanged();
@@ -380,6 +384,7 @@ private:
     QTimer m_scrubCoalesceTimer;
     static constexpr int kScrubCoalesceMs = 16; // ~one frame at 60fps
     bool m_followLive = false;
+    bool m_h264EncodeAvailable = false;
     int m_liveBufferMs = 1000;
     MidiManager* m_midiManager = nullptr;
     StreamDeckManager* m_streamDeckManager = nullptr;

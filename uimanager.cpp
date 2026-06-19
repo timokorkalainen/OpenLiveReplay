@@ -22,6 +22,7 @@
 #include <QStandardPaths>
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QtConcurrent>
 #include <QScreen>
 #include <QSet>
 #include <QVariantMap>
@@ -545,6 +546,21 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
     }
     refreshScreens();
     refreshProviders();
+
+    // Probe hardware H.264 encode availability once, off the GUI thread (the
+    // probe opens a throwaway encoder). Publish via a queued signal.
+    (void) QtConcurrent::run([this]() {
+        const bool available = queryNativeVideoEncodeCapabilities().h264;
+        QMetaObject::invokeMethod(
+            this,
+            [this, available]() {
+                if (m_h264EncodeAvailable != available) {
+                    m_h264EncodeAvailable = available;
+                    emit h264EncodeAvailableChanged();
+                }
+            },
+            Qt::QueuedConnection);
+    });
 }
 
 UIManager::~UIManager() {
