@@ -1025,6 +1025,14 @@ bool PlaybackWorker::openPrerollContext() {
 // open. v1 is single-clip (ms-only; same currently-open file).
 void PlaybackWorker::armNextCut(int64_t targetMs) {
     if (!m_prerollFmtCtx) return; // pre-roll disabled — feature unavailable
+    // v1: ignore a re-arm while a cut is already armed/in-flight. The worker
+    // fills m_prerollStagingCache lock-free and only stops once m_stagingCovers
+    // is set; resetting m_stagingCovers here (re-arm) would make the worker resume
+    // clearing/inserting that cache concurrently with the output thread's swap in
+    // maybeFireScheduledCut — a data race reachable by a rapid double "Recall".
+    // The pending cut fires within ~kCutLeadMs; the operator can recall again
+    // after it clears m_cutArmed. (A safe re-arm/queue is a future enhancement.)
+    if (m_cutArmed.load(std::memory_order_acquire)) return;
     m_armedTargetMs.store(targetMs < 0 ? 0 : targetMs);
     m_prerollSeekPending.store(true);
     m_stagingCovers.store(false);

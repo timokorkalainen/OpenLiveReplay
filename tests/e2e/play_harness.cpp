@@ -305,6 +305,13 @@ int main(int argc, char** argv) {
                         (long long) *basePh, (long long) target);
                 worker.armNextCut(target);
             });
+            // Rapid re-arm (simulates a double "Recall"): exercises the re-arm
+            // guard — the second arm must be safely ignored while the first cut is
+            // in flight (no concurrent staging-cache clear during the output swap).
+            QTimer::singleShot(1050, &app, [&]() {
+                worker.armNextCut(durMs / 2);
+                fprintf(stderr, "### armedcut re-arm (double-recall) issued ###\n");
+            });
             QTimer::singleShot(4000, &app, finish);
 
         } else {
