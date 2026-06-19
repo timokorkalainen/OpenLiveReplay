@@ -2736,7 +2736,9 @@ void UIManager::runBenchmark() {
     cfg.height = m_currentSettings.videoHeight;
     cfg.fps = m_currentSettings.fps;
 
-    (void) QtConcurrent::run([this, cfg]() {
+    const QString cachePath = benchmarkCachePath();
+
+    (void) QtConcurrent::run([this, cfg, cachePath]() {
         auto progress = [this](int n, bool sustained) {
             QMetaObject::invokeMethod(
                 this, [this, n, sustained]() { emit benchmarkProgress(n, sustained); },
@@ -2744,7 +2746,7 @@ void UIManager::runBenchmark() {
         };
         CodecBenchmarkResult r = runCodecBenchmark(cfg, progress, m_benchmarkCancel);
         r.timestamp = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
-        saveBenchmarkResult(benchmarkCachePath(), r);
+        saveBenchmarkResult(cachePath, r);
         QMetaObject::invokeMethod(
             this,
             [this, r]() {
