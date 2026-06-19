@@ -1,6 +1,7 @@
 #include "uimanager.h"
 #include "playback/audioplayer.h"
 #include "recorder_engine/benchmark/benchmarkcache.h"
+#include "recorder_engine/benchmark/recordgate.h"
 #include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/broadcastoutputstatus.h"
 #include "project/projectimportclient.h"
@@ -1665,6 +1666,23 @@ void UIManager::refreshMidiPorts() {
 }
 
 void UIManager::startRecording() {
+    // Hard block: H.264 selected but no hardware encoder -> refuse, never fall back.
+    if (recordCodecUnavailable(m_currentSettings.videoCodec, m_h264EncodeAvailable)) {
+        const QString reason = recordCodecBlockReason(m_currentSettings.videoCodec);
+        qWarning() << "UIManager:" << reason;
+        emit recordingFailed(reason);
+        return;
+    }
+    // Soft warning: configured feeds exceed the benchmarked safe count for the codec.
+    const int configuredFeeds = m_replayManager->getSourceUrls().size();
+    if (feedCountExceedsSafe(configuredFeeds, m_benchmarkSafeFeedsForChosen)) {
+        emit recordingWarning(
+            QStringLiteral("Recording %1 feeds; this device benchmarked %2 as the safe limit "
+                           "for the selected codec — frames may drop.")
+                .arg(configuredFeeds)
+                .arg(m_benchmarkSafeFeedsForChosen));
+        // proceed — operator's call.
+    }
     // Distinguish the cheap "no sources" cause up front so the surfaced
     // message is actionable; otherwise it's a muxer/encoder init failure.
     const bool hadSources = !m_replayManager->getSourceUrls().isEmpty();

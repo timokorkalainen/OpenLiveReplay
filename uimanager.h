@@ -302,6 +302,7 @@ signals:
     void recordingStarted();
     void recordingStopped();
     void recordingFailed(const QString& reason);
+    void recordingWarning(const QString& message);
     void recordedDurationMsChanged();
     void scrubPositionChanged();
     void playbackTimecodeChanged();
