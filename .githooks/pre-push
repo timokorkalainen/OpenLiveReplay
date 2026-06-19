@@ -53,13 +53,15 @@ done
 have_python3() {
     local c
     for c in python3 python; do
-        command -v "$c" >/dev/null 2>&1 \
-            && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 \
-            && return 0
+        if command -v "$c" >/dev/null 2>&1 \
+            && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            return 0
+        fi
     done
-    command -v py >/dev/null 2>&1 \
-        && py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1 \
-        && return 0
+    if command -v py >/dev/null 2>&1 \
+        && py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+        return 0
+    fi
     return 1
 }
 have_python3 || note_missing "Python 3 not found (needed by the RTMP fixture server)"
@@ -71,10 +73,10 @@ if command -v ffmpeg >/dev/null 2>&1; then
     if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx264|h264_mf)[[:space:]]'; then
         note_missing "no usable H.264 encoder (need libx264 or h264_mf) in ffmpeg"
     fi
-    # HEVC: run_rtmp_hevc_smoke.sh only tries hevc_videotoolbox then libx265, so
-    # the gate's binding set is the tighter {hevc_videotoolbox, libx265} (the
-    # SRT-HEVC cell accepts a superset). Require the tighter set so a preflight
-    # pass guarantees BOTH HEVC cells run rather than skip-as-pass.
+    # HEVC: run_rtmp_hevc_smoke.sh only tries hevc_videotoolbox then libx265; the
+    # SRT-HEVC cell accepts libx265 or any hevc_*. Require EITHER libx265 or
+    # hevc_videotoolbox (an OR -- either one alone satisfies both cells); this is
+    # the tightest check that still guarantees both HEVC cells run, never skip.
     if ! printf '%s\n' "$ENCODERS" | grep -Eq '(^|[[:space:]])(libx265|hevc_videotoolbox)[[:space:]]'; then
         note_missing "no usable HEVC encoder (need libx265 or hevc_videotoolbox) in ffmpeg"
     fi
