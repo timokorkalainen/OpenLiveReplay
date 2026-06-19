@@ -18,9 +18,72 @@ gates.
   reported as a diagnostic because onset quantization can move by a frame on
   short local runs. The injected-skew cell is report-only, but it fails if the
   rig cannot observe a nonzero recovered clock ppm.
-- **Timecode:** recorded MKV `tmcd` or `timecode` tag versus the injected
-  `OLR_MARKER_TC`. Until the engine writes `tmcd` in Phase 3, this reports
-  `n/a` rather than failing.
+- **Timecode:** recorded MKV `tmcd`/`timecode` tag versus the injected
+  `OLR_MARKER_TC`, asserted **frame-exact**. Phase 3 lands the full pipeline —
+  SMPTE 12M extraction (SRT/RTMP H.264/HEVC SEI + RTMP AMF fallback), the native
+  NDI 100 ns timecode, `TimecodeAligner` (`ReplayManager::sourcesFrameAligned` /
+  `sourceFrameOffset`), and a muxer `timecode`/`tmcd` tag written from the session
+  start TC — so this cell is now a **gate** (`OLR_FRAMESYNC_GATE=1`).
+
+## Timecode Accuracy, Injection & Gate
+
+The `e2e_framesync_timecode` cell **gates** on one thing: the recorded MKV's
+`timecode`/`tmcd` tag is **frame-exact** versus the injected SMPTE 12M timecode.
+Achieved accuracy in this environment: recorded `10:00:00:00` == injected
+`10:00:00:00` (exact). Inter-camera alignment is **measured and reported, not
+gated** (see below).
+
+**How it injects/measures TC.** The cell runs over the **NDI** transport because
+that is the only path that injects SMPTE 12M natively in this environment. The
+`ndi_marker_sender` publishes the injected TC through the SDK
+(`config.startTimecode`) in **static mode** (`--timecode-static`): every frame
+carries the *same* injected TC, so the engine's *first muxed frame* — captured
+whenever discovery/connect completes — records exactly the injected value,
+independent of connect latency. The gate uses a **single** NDI source (one
+discovery+connect, matching the stable lipsync/drift cells); a two-source NDI
+recording occasionally has one source fail to connect and produce no MKV — an
+NDI-runtime/discovery flake, not a tmcd defect. Measurement: `ffprobe
+-show_entries format_tags=timecode / stream_tags=timecode` (`mkv_start_timecode`)
+for the tag.
+
+**Inter-camera alignment is report-only.** When two common-TC sources are
+recorded, `sync_harness --report-tc-align` emits `tc_align a=.. b=.. aligned=..
+offset=..` from `ReplayManager::sourcesFrameAligned`/`sourceFrameOffset`, and the
+cell prints the measured offset — but does **not** fail on it. `TimecodeAligner`
+anchors each source on the session frame where it first observes a TC, and two
+real-NDI receivers see jam-synced frames with arrival jitter, so the measured
+offset jitters ~0–2 frames run to run. That matches this program's honest target
+("aligned within measured bounds"); **exact, stable inter-camera frame-lock is
+the Phase-4 inter-camera servo's job, not Phase 3's**. Two-source flash-onset
+spread is separately exercised by `e2e_framesync_intercam`.
+
+The SRT-SEI TC path would need ffmpeg `drawtext` to burn the timecode into the
+H.264 SEI the engine extracts from; the container-level `-timecode` does **not**
+reach that SEI. Local ffmpeg usually lacks `drawtext`, so the SRT TC-injection
+path is not provable locally.
+
+**Gate-vs-skip.** The cell **gates** when a TC-capable source is available
+(NDI runtime + `ndi_marker_sender`, or ffmpeg `drawtext` for SRT). It **SKIPs
+cleanly (exit 77)** when neither is present — no NDI runtime/marker AND no
+`drawtext` — so an environment gap never fails the gate. The header-write grace
+window (`OLR_MUXER_TMCD_GRACE_MS`, default 750 ms) lets the first source TC win
+the tag before the deferred MKV header commits.
+
+**Known limitations (carried from the Phase-3 reviews).**
+
+- **Raw-packed-word extraction, not full SEI parsing.** The H.264/HEVC extractor
+  reads the SMPTE-12M-packed word; it is not a full `pic_timing` `clock_timestamp`
+  / registered-ATC parser. Real-world SEI variants may not be recovered.
+- **Absolute TC is exact only at the nominal 30 fps.** The engine recovers TC via
+  `Smpte12m::from100ns(_, kTimecodeNominalFps=30)`, and the absolute
+  `TimecodeAligner::toSessionFrameIndex` / `tmcd` are frame-exact only at that
+  nominal. Inject non-drop 30-style TCs (the default `10:00:00:00`); non-30 rates
+  are not asserted (they don't round-trip through the current pipeline).
+- **Start TC = the first muxed frame's TC.** A live recording observes no TC
+  before connect; the tag is the first frame that carried one (static-mode
+  injection makes this frame-exact for the gate).
+- **Drop-frame TC is recovered as non-drop.** A drop-frame source TC is decoded
+  with non-drop arithmetic at 30 fps; drop-frame preservation is a follow-up.
 
 ## Running It
 
@@ -73,7 +136,10 @@ source URL/backend change resets the owned clocks.
 - `OLR_FRAMESYNC_GATE=1` makes a scenario enforce its band.
 - `OLR_FRAMESYNC_SKEW_PPM=200` injects deterministic media PTS/PCR skew in the
   `drift_skew` scenario.
-- `OLR_MARKER_TC=10:00:00:00` sets the injected start timecode.
+- `OLR_MARKER_TC=10:00:00:00` sets the injected start timecode (non-drop 30-style;
+  this round-trips frame-exact through the engine's 30 fps nominal recovery).
+- `OLR_MUXER_TMCD_GRACE_MS=750` bounds how long the muxer holds the deferred MKV
+  header for the first source TC before committing (0 disables the wait).
 - `OLR_FLASH_CODEC=avc|hevc` selects the marker video codec.
 - `OLR_NDI_MARKER_SENDER=/path/to/ndi_marker_sender` overrides the auto-detected
   sibling of `sync_harness`.

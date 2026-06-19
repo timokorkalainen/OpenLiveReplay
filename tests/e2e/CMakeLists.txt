@@ -56,6 +56,69 @@ qt_add_executable(ndi_runtime_sender ndi_runtime_sender.cpp)
 target_link_libraries(ndi_runtime_sender PRIVATE
     Qt6::Core olr_test_playback olr_warnings olr_sanitize)
 
+# NDI receiver probe + tier-(a) sender for the rung-5 output validation lane. Both
+# runtime-load the NDI library (no SDK at build time) and link the shared marker/analysis
+# modules.
+qt_add_executable(ndi_recv_probe
+    ndi_recv_probe.cpp
+    ndi_output_marker.cpp
+    ndi_recv_analysis.cpp)
+target_include_directories(ndi_recv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_recv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
+
+qt_add_executable(ndi_output_sender
+    ndi_output_sender.cpp
+    ndi_output_marker.cpp)
+target_include_directories(ndi_output_sender PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_output_sender PRIVATE
+    Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
+# Tier (b): writes the marker as raw YUV420P+S16 for muxing into a playback MKV.
+qt_add_executable(ndi_marker_mkv_source
+    ndi_marker_mkv_source.cpp
+    ndi_output_marker.cpp)
+target_include_directories(ndi_marker_mkv_source PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ndi_marker_mkv_source PRIVATE Qt6::Core olr_warnings olr_sanitize)
+
+# Tier (c): decodes a recorded MKV's luma (piped from ffmpeg) and reports marker continuity,
+# validating the NDI ingest -> record segment of the full pipe.
+qt_add_executable(marker_yuv_probe
+    marker_yuv_probe.cpp
+    ndi_output_marker.cpp
+    ndi_recv_analysis.cpp)
+target_include_directories(marker_yuv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(marker_yuv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
+
+add_test(NAME e2e_ndi_output
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
+        "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_output PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
+add_test(NAME e2e_ndi_playback
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+        "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_playback PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
+add_test(NAME e2e_ndi_pipe
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_e2e_pipe.sh"
+        "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:record_harness>"
+        "$<TARGET_FILE:marker_yuv_probe>" "$<TARGET_FILE:play_harness>"
+        "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_pipe PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 300
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
     # before connect by reading the stream ID from a real accepted SRT socket.
@@ -280,6 +343,15 @@ set_tests_properties(e2e_framesync_drift PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_GATE=1")
 set_tests_properties(e2e_framesync_drift_skew PROPERTIES
     ENVIRONMENT "OLR_FRAMESYNC_SKEW_PPM=200")
+# Timecode GATE: inject a KNOWN SMPTE 12M TC, record, and assert the recorded MKV's
+# tmcd/timecode tag equals it frame-exact + that two jam-synced (common-TC) sources
+# are reported aligned (<= 1 frame). It runs over the NDI transport because that is
+# the only path that injects TC natively in this environment (the SRT-SEI TC path
+# needs ffmpeg drawtext, which local builds usually lack). The cell SKIPs cleanly
+# (exit 77, SKIP_RETURN_CODE above) when no TC-capable source is available — no NDI
+# runtime/marker AND no ffmpeg drawtext — so it never FAILS for an environment gap.
+set_tests_properties(e2e_framesync_timecode PROPERTIES
+    ENVIRONMENT "OLR_FRAMESYNC_GATE=1;OLR_FRAMESYNC_TRANSPORT=ndi")
 
 # --- Local-only native SRT e2e (NOT in CI) ----------------------------------
 # Prove the real engine ingests srt:// over the native SRT path (the default,
@@ -316,6 +388,24 @@ endfunction()
 
 if(APPLE)
     olr_add_native_srt_e2e_tests("native-apple-ingest")
+
+    # --- Delivery push-gate cells (RTMP/SRT x h264/h265) ---------------------
+    # Re-tag the SRT h264 smoke with the delivery-gate label (the function above
+    # set it to "native-apple-ingest"; LABELS is replaced, not appended, so list
+    # both). TIMEOUT/RUN_SERIAL set by the function are untouched.
+    set_tests_properties(e2e_native_srt_smoke PROPERTIES
+        LABELS "native-apple-ingest;delivery-gate")
+
+    # SRT HEVC (h265) cell on macOS. run_srt_hevc_smoke.sh already exists and is
+    # cross-platform (auto-selects libx265 / hevc_videotoolbox); only Windows had
+    # registered it. Port 23740 sits in the gap between the SRT native band
+    # (<=23730) and the RTMP band (>=23760).
+    add_test(NAME e2e_native_srt_hevc_smoke
+        COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23740)
+    set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
+        LABELS "native-apple-ingest;delivery-gate"
+        TIMEOUT 180
+        RUN_SERIAL TRUE)
 
     # Phase 2c-a: mid-recording disconnect/reconnect survival on the NATIVE SRT
     # ingest. Kill a victim bridge mid-record, restart it, and prove the victim
@@ -456,12 +546,12 @@ if(APPLE)
     add_test(NAME e2e_native_rtmp_ui_stats
         COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_ui_stats.sh" "$<TARGET_FILE:sync_harness>" 23800)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
-        LABELS "native-rtmp"
+        LABELS "native-rtmp;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
     set_tests_properties(e2e_native_rtmp_hevc_smoke PROPERTIES
-        LABELS "native-rtmp"
+        LABELS "native-rtmp;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)

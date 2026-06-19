@@ -13,7 +13,7 @@ set -uo pipefail
 HARNESS="${1:?record_harness executable path required}"
 SRT_PORT="${2:-23501}"
 UDP_PORT=$((SRT_PORT + 1))
-SECONDS_TO_RECORD=6
+SECONDS_TO_RECORD="${OLR_E2E_CLIP_SECONDS:-6}"
 
 command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
 command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }

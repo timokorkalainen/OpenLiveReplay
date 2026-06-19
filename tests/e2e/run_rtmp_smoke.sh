@@ -14,7 +14,7 @@ set -uo pipefail
 
 HARNESS="${1:?record_harness executable path required}"
 RTMP_PORT="${2:-23701}"
-SECONDS_TO_RECORD=7
+SECONDS_TO_RECORD="${OLR_E2E_CLIP_SECONDS:-7}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=rtmp_lib.sh
 . "$HERE/rtmp_lib.sh"

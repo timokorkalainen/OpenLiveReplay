@@ -218,6 +218,7 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_audioWrapOffset90k = 0;
     m_forceNextPcrObserve = true;
     m_audioRemainderPts90k = -1;
+    m_pendingVideoTimecode100ns = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastDecodeErrorLogMs = -1;
     m_statRetrans = -1;
@@ -706,15 +707,20 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
     }
 
     for (const CompressedAccessUnit& unit : units) {
+        // Extract this AU's SMPTE 12M timecode (if any) before decode. Reset-then-set
+        // per unit so a frame with no TC SEI reports none, never a previous AU's TC.
+        updatePendingVideoTimecode(unit);
+
         const int64_t sourcePtsMs = sourcePtsMsForUnit(unit);
         if (sourcePtsMs < 0) {
             continue;
         }
 
+        const int64_t timecode100ns = m_pendingVideoTimecode100ns;
         QString error;
         const bool decoded = m_decoder->decode(
             unit,
-            [this, sourcePtsMs](AVFrame* frame) {
+            [this, sourcePtsMs, timecode100ns](AVFrame* frame) {
                 if (!frame) {
                     return;
                 }
@@ -727,6 +733,7 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
                 decodedFrame.frame = frame;
                 const int64_t decodedPtsMs = m_clock->toSessionMs(frame->pts);
                 decodedFrame.sourcePtsMs = decodedPtsMs >= 0 ? decodedPtsMs : sourcePtsMs;
+                decodedFrame.sourceTimecode100ns = timecode100ns;
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);
@@ -880,6 +887,18 @@ int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& u
     const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
     m_clock->observe(unitDts90k, nowMs, discontinuity, ClockObservationRole::Authority);
     return m_clock->toSessionMs(unitPts90k);
+}
+
+void NativeSrtIngestSession::updatePendingVideoTimecode(const CompressedAccessUnit& unit) {
+    // Reset first: a frame with no timecode SEI must report none (no stale TC bleed
+    // from a previous access unit). Extraction is best-effort and bounds-checked —
+    // a garbled/truncated SEI returns {valid=false} and leaves the reset -1, so a bad
+    // timecode never disturbs recording.
+    m_pendingVideoTimecode100ns = -1;
+    const Smpte12mTimecode tc = extractH26xSeiTimecode(unit.annexB, unit.codec);
+    if (tc.valid) {
+        m_pendingVideoTimecode100ns = Smpte12m::to100ns(tc, kTimecodeNominalFps);
+    }
 }
 
 int64_t NativeSrtIngestSession::sourcePtsMsFromAnchor(qint64 pts90k, int64_t anchorTs90k,

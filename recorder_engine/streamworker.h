@@ -98,6 +98,13 @@ signals:
     // UI through ReplayManager with a queued connection, like connectionChanged.
     void statsUpdated(int sourceIndex, IngestStats stats);
 
+    // Emitted from the tick thread when a frame carrying a valid source timecode is
+    // consumed for this source's assigned view track, with the session frame index
+    // (m_internalFrameCount) it landed on. ONLY emitted when sourceTimecode100ns >= 0
+    // — sources without TC never emit it, so behavior is unchanged when TC is absent.
+    // ReplayManager feeds it into its TimecodeAligner (Qt::QueuedConnection).
+    void frameTimecode(int sourceIndex, int64_t sourceTimecode100ns, int64_t sessionFrameIndex);
+
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
 
@@ -111,6 +118,10 @@ private:
     Muxer* m_muxer;
 
     AVFrame* m_latestFrame = nullptr;
+    // Source timecode (100 ns since midnight) of the frame currently held in
+    // m_latestFrame, or -1 when none/blue. Tick-thread-only. Travels with the
+    // frame through the jitter pull so the muxed frame's TC can be forwarded.
+    int64_t m_latestFrameTimecode100ns = -1;
     int64_t m_internalFrameCount;
     RecordingClock* m_sharedClock;
 
@@ -188,6 +199,10 @@ private:
     struct QueuedFrame {
         AVFrame* frame;
         int64_t sourcePts;
+        // The frame's own source timecode (100 ns since midnight), or -1 when the
+        // transport carried no TC. Purely additive: never affects A/V sync or the
+        // jitter pull; only forwarded via frameTimecode() when the frame is muxed.
+        int64_t sourceTimecode100ns = -1;
     };
 
     QQueue<QueuedFrame> m_frameQueue;

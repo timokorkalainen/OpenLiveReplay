@@ -82,6 +82,11 @@ int64_t ndiMarkerStartTimecode100ns(const NdiMarkerConfig& config) {
 }
 
 int64_t ndiMarkerTimecode100ns(const NdiMarkerConfig& config, int64_t frameIndex) {
+    // Static mode holds the injected start TC on every frame so the engine's first
+    // muxed frame (captured at an arbitrary connect time) carries it frame-exact.
+    if (config.staticTimecode) {
+        return ndiMarkerStartTimecode100ns(config);
+    }
     return ndiMarkerStartTimecode100ns(config) + ndiMarkerTimestamp100ns(config, frameIndex);
 }
 
