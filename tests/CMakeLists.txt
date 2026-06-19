@@ -139,6 +139,8 @@ qt_add_library(olr_test_engine STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/benchmark/codecbenchmark.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/benchmark/syntheticframes.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/benchmark/realcodecrunners.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/benchmark/benchmarkcache.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/benchmark/runcodecbenchmark.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ndiframeconvert.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativendiingestsession.cpp"
 )

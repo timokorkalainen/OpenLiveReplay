@@ -98,6 +98,8 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/benchmark/codecbenchmark.h recorder_engine/benchmark/codecbenchmark.cpp
         recorder_engine/benchmark/syntheticframes.h recorder_engine/benchmark/syntheticframes.cpp
         recorder_engine/benchmark/realcodecrunners.h recorder_engine/benchmark/realcodecrunners.cpp
+        recorder_engine/benchmark/benchmarkcache.h recorder_engine/benchmark/benchmarkcache.cpp
+        recorder_engine/benchmark/runcodecbenchmark.h recorder_engine/benchmark/runcodecbenchmark.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp
