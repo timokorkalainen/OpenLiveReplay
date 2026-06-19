@@ -272,6 +272,8 @@ void NativeSrtIngestSession::run() {
                         stats.dropTotal = perf.pktRcvDropTotal;
                         stats.clockPpm = m_clock->ppm();
                         stats.clockQuality = int(m_clock->quality());
+                        stats.clockLocked = m_clock->locked();
+                        stats.clockOffsetNs = m_clock->anchorOffsetNs();
                         m_callbacks.reportStats(stats);
                     }
                 }

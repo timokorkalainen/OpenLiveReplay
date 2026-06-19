@@ -71,6 +71,8 @@ struct IngestStats {
     // Recovered source-clock telemetry. clockQuality is ClockQuality as an int.
     double clockPpm = 0.0;
     int clockQuality = 0;
+    bool clockLocked = false;  // AnchoredSourceClock::locked() at sample time
+    int64_t clockOffsetNs = 0; // recovered (session - sender) offset at the clock anchor, ns
 };
 
 // Per-source link health -> the connection dot: Green=healthy, Amber=stressed, Red=losing content.
