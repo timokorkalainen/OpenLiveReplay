@@ -94,6 +94,11 @@ public:
     uint64_t cacheGeneration() const {
         return m_committedGeneration.load(std::memory_order_acquire);
     }
+    // Number of armed cuts that have fired (promoted staging -> live). A queued
+    // re-arm (armNextCut while a cut is in flight) that is applied yields a
+    // SECOND fired cut, so this proves the safe re-arm queue actually fired the
+    // latest target rather than dropping it.
+    int cutsFired() const { return m_cutsFired.load(std::memory_order_acquire); }
 
 protected:
     void run() override;
@@ -170,6 +175,11 @@ private:
     // anchor, then decodes forward until the staging cache covers
     // [target, target+kStagingSpanMs]; schedules the cut once covered.
     void fillStaging();
+    // Arm the cut state (target + staging reset). Caller MUST guarantee no cut is
+    // in flight (m_cutArmed false). Called from armNextCut (UI thread, fresh arm)
+    // and from the run loop (worker thread, applying a queued re-arm). Atomics
+    // only — no cache touch — so it is safe from either thread.
+    void armCutInternal(int64_t targetMs);
     // Store the atomic schedule (output frame index + target ms).
     void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
@@ -261,6 +271,16 @@ private:
     // maybeFireScheduledCut (under m_bufferMutex); written by scheduleCutAtFrame.
     std::atomic<qint64> m_scheduledCutFrame{-1};
     std::atomic<int64_t> m_scheduledCutTargetMs{-1};
+    // Safe re-arm queue: a Recall (armNextCut, UI thread) that arrives while a cut
+    // is already in flight stores the LATEST target here instead of dropping it or
+    // (unsafely) resetting the staging state mid-cut. The run loop applies it via
+    // armCutInternal once the in-flight cut clears m_cutArmed — so the re-arm and
+    // its subsequent staging fill happen on the worker thread, never concurrently
+    // with the output thread's swap in maybeFireScheduledCut. Latest target wins.
+    std::atomic<int64_t> m_pendingRearmMs{-1};
+    std::atomic<bool> m_hasPendingRearm{false};
+    // Count of fired cuts (incremented in maybeFireScheduledCut, output thread).
+    std::atomic<int> m_cutsFired{0};
     // Immutable snapshot of m_outputCache published to the output thread
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;

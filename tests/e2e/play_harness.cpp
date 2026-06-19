@@ -121,11 +121,11 @@ int main(int argc, char** argv) {
         printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
-               "heldFramesDelta=%lld maxClockDivergenceMs=%lld\n",
+               "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d\n",
                c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-               (long long) heldDelta, (long long) os.maxClockDivergenceMs);
+               (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired());
         fflush(stdout);
         app.quit();
     };
@@ -305,12 +305,23 @@ int main(int argc, char** argv) {
                         (long long) *basePh, (long long) target);
                 worker.armNextCut(target);
             });
-            // Rapid re-arm (simulates a double "Recall"): exercises the re-arm
-            // guard — the second arm must be safely ignored while the first cut is
-            // in flight (no concurrent staging-cache clear during the output swap).
+            // Rapid re-arm (simulates a double "Recall") to a DIFFERENT target
+            // while the first cut to durMs/2 is still in flight: exercises the safe
+            // re-arm QUEUE. The second arm must not reset the staging state mid-cut
+            // (no concurrent staging-cache clear during the output swap); instead it
+            // is queued and applied by the worker once the first cut clears, firing
+            // a SECOND frame-accurate cut to the latest target. The gate asserts
+            // cutsFired==2, proving the queued target fired rather than being
+            // dropped. The target is FORWARD of the first (durMs*3/4 > durMs/2) so
+            // the cut keeps reposition==0: a backward re-base would (correctly) trip
+            // the run loop's backward-jump path to resync the PRIMARY decoder bank
+            // (which the cut does not move) — a decoder resync, not a cut-fallback,
+            // but indistinguishable at the reposition gate, so the test stays
+            // forward to keep that gate a clean "the cut never fell back" invariant.
             QTimer::singleShot(1050, &app, [&]() {
-                worker.armNextCut(durMs / 2);
-                fprintf(stderr, "### armedcut re-arm (double-recall) issued ###\n");
+                worker.armNextCut(durMs * 3 / 4);
+                fprintf(stderr,
+                        "### armedcut re-arm (queued double-recall to durMs*3/4) issued ###\n");
             });
             QTimer::singleShot(4000, &app, finish);
 
@@ -326,11 +337,11 @@ int main(int argc, char** argv) {
             printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                    "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                    "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
-                   "heldFramesDelta=%lld maxClockDivergenceMs=%lld\n",
+                   "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                    c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                    (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-                   (long long) heldDelta);
+                   (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired());
             fflush(stdout);
             ::exit(2);
         }

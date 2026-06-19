@@ -1025,19 +1025,34 @@ bool PlaybackWorker::openPrerollContext() {
 // open. v1 is single-clip (ms-only; same currently-open file).
 void PlaybackWorker::armNextCut(int64_t targetMs) {
     if (!m_prerollFmtCtx) return; // pre-roll disabled — feature unavailable
-    // v1: ignore a re-arm while a cut is already armed/in-flight. The worker
-    // fills m_prerollStagingCache lock-free and only stops once m_stagingCovers
-    // is set; resetting m_stagingCovers here (re-arm) would make the worker resume
+    // Safe re-arm queue: a re-arm (rapid double "Recall") while a cut is already
+    // armed/in-flight must NOT reset the staging state from this (UI) thread. The
+    // worker fills m_prerollStagingCache lock-free and only stops once
+    // m_stagingCovers is set; clearing it here would make the worker resume
     // clearing/inserting that cache concurrently with the output thread's swap in
-    // maybeFireScheduledCut — a data race reachable by a rapid double "Recall".
-    // The pending cut fires within ~kCutLeadMs; the operator can recall again
-    // after it clears m_cutArmed. (A safe re-arm/queue is a future enhancement.)
-    if (m_cutArmed.load(std::memory_order_acquire)) return;
+    // maybeFireScheduledCut — a data race on a lock-free cache. Instead queue the
+    // LATEST target; the run loop applies it (armCutInternal) the moment the
+    // in-flight cut clears m_cutArmed, so the re-arm and its staging fill run
+    // sequentially on the worker thread. Latest queued target wins.
+    if (m_cutArmed.load(std::memory_order_acquire)) {
+        m_pendingRearmMs.store(targetMs < 0 ? 0 : targetMs);
+        m_hasPendingRearm.store(true, std::memory_order_release);
+        return;
+    }
+    armCutInternal(targetMs);
+}
+
+// Arm the cut state. Caller guarantees no cut is in flight (m_cutArmed false), so
+// the subsequent worker-thread fillStaging never races the output swap. Atomics
+// only (no cache touch) — safe from the UI thread (fresh arm) or the worker
+// thread (queued re-arm applied in the run loop). m_cutArmed is released LAST so
+// a worker observing it true (acquire) sees the target/seek-pending stores.
+void PlaybackWorker::armCutInternal(int64_t targetMs) {
     m_armedTargetMs.store(targetMs < 0 ? 0 : targetMs);
     m_prerollSeekPending.store(true);
     m_stagingCovers.store(false);
     m_scheduledCutFrame.store(-1);
-    m_cutArmed.store(true);
+    m_cutArmed.store(true, std::memory_order_release);
 }
 
 // Worker-thread-only. Bounded incremental pre-roll into m_prerollStagingCache.
@@ -1233,8 +1248,12 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     // touch m_audioQueue here (it is worker-thread-only).
     if (m_audioPlayer) m_audioPlayer->clear();
     m_stagingCovers.store(false);
-    m_cutArmed.store(false);
     m_scheduledCutFrame.store(-1);
+    m_cutsFired.fetch_add(1, std::memory_order_acq_rel);
+    // Clear m_cutArmed LAST: the run loop applies a queued re-arm only once it
+    // observes !m_cutArmed, so releasing it after the swap + counter bump above
+    // guarantees the worker's next staging fill cannot race this swap.
+    m_cutArmed.store(false, std::memory_order_release);
 }
 
 void PlaybackWorker::run() {
@@ -1756,7 +1775,15 @@ void PlaybackWorker::run() {
             }
         }
 
-        // --- Tier3 armed cut: bounded pre-roll fill into the staging cache ----
+        // --- Tier3 armed cut: apply a queued re-arm, then pre-roll fill ----
+        // A Recall that arrived while the previous cut was in flight queued its
+        // target (armNextCut). Now that the cut has fired and cleared m_cutArmed,
+        // arm the latest pending target ON THE WORKER THREAD so the subsequent
+        // staging fill cannot run concurrently with the output thread's swap.
+        if (!m_cutArmed.load(std::memory_order_acquire) &&
+            m_hasPendingRearm.exchange(false, std::memory_order_acq_rel)) {
+            armCutInternal(m_pendingRearmMs.load());
+        }
         // Worker-private; never starves the primary tick (kPrerollPacketsPerTick
         // per pass). Stops once staging covers the armed window (m_stagingCovers),
         // at which point the cut is scheduled and fires on the output thread.
@@ -1852,6 +1879,7 @@ void PlaybackWorker::run() {
     m_cutArmed.store(false);
     m_scheduledCutFrame.store(-1);
     m_stagingCovers.store(false);
+    m_hasPendingRearm.store(false);
 }
 
 void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {

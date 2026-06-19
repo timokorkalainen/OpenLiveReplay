@@ -61,6 +61,7 @@ private slots:
     void pgmSwitchUpdatesIdentityOnNextTick();
     void disabledAssignmentsDoNotSubmit();
     void reverseAndSpeedChangeReanchorPlayhead();
+    void playheadJumpWithoutReanchorIsCaughtByClockDivergence();
 };
 
 void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
@@ -644,6 +645,59 @@ void TestOutputDispatcher::reverseAndSpeedChangeReanchorPlayhead() {
     QCOMPARE(sink.frames[2].sampledPlayheadMs,
              qint64(240)); // re-anchored at 240; a stale epoch would give 120
     QCOMPARE(sink.frames[3].sampledPlayheadMs, qint64(200)); // reverse step
+}
+
+// Frame-accuracy guard (maxClockDivergenceMs). The reposition and armed-cut bugs
+// both re-based the snapshot playhead WITHOUT re-anchoring the output play epoch,
+// so the sampled (output-clock) playhead kept advancing from the OLD anchor: the
+// output rendered a frame seconds stale while reporting ZERO placeholder and ZERO
+// reposition, so every other gate passed. maxClockDivergenceMs is the detector
+// the e2e seekflash/farback/armedcut gates assert; this proves it actually fires
+// on a stale epoch and stays quiet once the epoch is re-anchored (the fix).
+void TestOutputDispatcher::playheadJumpWithoutReanchorIsCaughtByClockDivergence() {
+    OutputFrameCache cache(1, 4, 4);
+    // Real frames spanning [1000, 6000] so the cache lookup never placeholders for
+    // either the stale (~1s) or the re-anchored (5s) sampled playhead — the guard
+    // only measures divergence on non-placeholder frames.
+    for (qint64 pts = 1000; pts <= 6000; pts += 1000)
+        cache.insertVideoFrame(video(0, pts, uchar(pts / 100)));
+
+    OutputTargetAssignment qt;
+    qt.id = QStringLiteral("feed0-preview");
+    qt.sourceBus = OutputBusId::feed(0);
+    qt.kind = OutputTargetKind::QtPreview;
+    qt.enabled = true;
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    // --- Stale epoch: a 4s forward jump with NO resetPlayEpoch ---
+    CollectingSink staleSink(OutputTargetKind::QtPreview);
+    OutputDispatcher stale(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    stale.setEndpoints({{qt, &staleSink}});
+    stale.dispatchTick(cache, state); // anchor epoch at playhead 1000
+    QCOMPARE(stale.stats().maxClockDivergenceMs, qint64(0));
+    state.playheadMs = 5000; // seek re-based the playhead, epoch NOT reset
+    const OutputDispatchStats staleStats = stale.dispatchTick(cache, state);
+    QVERIFY2(staleStats.maxClockDivergenceMs > 1500,
+             qPrintable(QStringLiteral("stale epoch should diverge well past the gate, got %1")
+                            .arg(staleStats.maxClockDivergenceMs)));
+
+    // --- Re-anchored: the same jump, but resetPlayEpoch() before the next tick ---
+    state.playheadMs = 1000;
+    CollectingSink okSink(OutputTargetKind::QtPreview);
+    OutputDispatcher reanchored(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    reanchored.setEndpoints({{qt, &okSink}});
+    reanchored.dispatchTick(cache, state); // anchor epoch at playhead 1000
+    state.playheadMs = 5000;
+    reanchored.resetPlayEpoch(); // the fix: repositionTo / maybeFireScheduledCut
+    const OutputDispatchStats okStats = reanchored.dispatchTick(cache, state);
+    QVERIFY2(okStats.maxClockDivergenceMs <= 1500,
+             qPrintable(QStringLiteral("re-anchored epoch should track the playhead, got %1")
+                            .arg(okStats.maxClockDivergenceMs)));
 }
 
 QTEST_GUILESS_MAIN(TestOutputDispatcher)

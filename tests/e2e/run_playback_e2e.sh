@@ -152,6 +152,7 @@ skippedDuplicateFrames="$(get skippedDuplicateFrames)"
 cacheGeneration="$(get cacheGeneration)"
 heldFramesDelta="$(get heldFramesDelta)"
 maxClockDivergenceMs="$(get maxClockDivergenceMs)"
+cutsFired="$(get cutsFired)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -165,6 +166,7 @@ maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 [ -n "$cacheGeneration" ] || cacheGeneration="?"
 [ -n "$heldFramesDelta" ] || heldFramesDelta="?"
 [ -n "$maxClockDivergenceMs" ] || maxClockDivergenceMs="?"
+[ -n "$cutsFired" ] || cutsFired="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -303,6 +305,19 @@ case "$SCENARIO" in
             echo "FAIL: seekflash repositioned too much (reposition=$reposition, expected <=2)"
             fail=1
         fi
+        # FRAME-ACCURACY gate (the same epoch-divergence guard armedcut asserts):
+        # placeholderFramesDelta==0 proves no gray was painted, but NOT that the
+        # frame shown is the seek target — a reposition that re-bases the playhead
+        # without resetPlayEpoch() leaves sampledPlayheadMs (drives the cache
+        # lookup) diverged by the seek distance and renders a stale-but-real frame
+        # with no gray/reposition flag. That regression measured ~24000ms on the
+        # far-back path before PR #93 reset the epoch at both repositionTo commit
+        # sites; healthy runs sit at ~15ms (one frame). Bound at 1500 (clear of
+        # sub-frame jitter + the seek-settle transient, far below the regression).
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: seekflash clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored after the seek)"
+            fail=1
+        fi
         ;;
     farback)
         # Far-backward seek (near EOF -> 0): the worst case for the seek flash.
@@ -346,6 +361,16 @@ case "$SCENARIO" in
             echo "FAIL: farback held frames across the jump (heldFramesDelta=$heldFramesDelta, expected <=20) — double-buffer not keeping old frames published (Tier-1 masking)"
             fail=1
         fi
+        # FRAME-ACCURACY gate — far-back is the worst case for epoch divergence:
+        # this exact path measured ~24000ms of clock divergence before PR #93
+        # added resetPlayEpoch() after the CommitGate-held reposition, rendering a
+        # frame ~24s stale with placeholderFramesDelta==0 (no gray) and a bounded
+        # reposition count, so every gate above passed despite the wrong frame.
+        # Healthy runs sit at ~14ms. Bound at 1500 (same as armedcut/seekflash).
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: farback clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored after the far-back seek)"
+            fail=1
+        fi
         ;;
     armedcut)
         # Tier3 ARMED CUT (Tasks 9/10/12): a recalled cut must snap to the target
@@ -377,6 +402,19 @@ case "$SCENARIO" in
             echo "FAIL: armedcut clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored at the cut)"
             fail=1
         fi
+        # SAFE RE-ARM QUEUE gate: the scenario fires a first cut (to durMs/2) and,
+        # while it is in flight, issues a SECOND Recall to a different (forward)
+        # target (durMs*3/4). The safe re-arm queue must NOT drop or unsafely apply
+        # that re-arm — it queues the latest target and the worker fires it once the
+        # first cut clears, so exactly TWO cuts fire. cutsFired<2 means the queued
+        # re-arm was dropped (the old drop-while-pending behavior); cutsFired>2
+        # would mean spurious extra cuts. Both fired cuts must also clear the
+        # placeholder/reposition/divergence gates above (the queued second cut is
+        # held to the same frame-accuracy bar as the first).
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 2 ]; then
+            echo "FAIL: armedcut re-arm queue fired $cutsFired cuts (expected 2) — a Recall during an in-flight cut was dropped or duplicated (safe re-arm queue regressed)"
+            fail=1
+        fi
         ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
@@ -384,7 +422,7 @@ case "$SCENARIO" in
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"
