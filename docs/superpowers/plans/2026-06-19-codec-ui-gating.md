@@ -24,8 +24,11 @@
 - **Create** `recorder_engine/benchmark/recordgate.{h,cpp}` — pure hard-block / soft-warn decision functions.
 - **Create** `tests/unit/tst_recordgate.cpp` — unit tests for the gate decisions.
 - **Modify** `uimanager.h` / `uimanager.cpp` — `h264EncodeAvailable` property; `runBenchmark()` / `cancelBenchmark()` invokables; `benchmarkProgress` / `benchmarkFinished` signals; `benchmarkResult` + `benchmarkRunning` properties; cache load/save; record-start gating.
-- **Modify** `Main.qml` — codec selector ComboBox (H.264 gated) + benchmark panel in the recording-settings section.
-- **Modify** `CMakeLists.txt`, `tests/CMakeLists.txt`, `tests/unit/CMakeLists.txt` — wire the new sources/test.
+- **Create** `CodecSettingsPanel.qml` — a standalone, controller-injected component (codec selector + benchmark panel) so it can be instantiated in isolation and QML-unit-tested.
+- **Modify** `Main.qml` — drop in `CodecSettingsPanel { controller: uiManagerRef }` in the recording-settings section.
+- **Create** `tests/qml/` — QtQuickTest harness (`tst_qml_main.cpp`) + `tst_codecsettingspanel.qml` (TestCase against a mock controller).
+- **Create** `tests/qml/CMakeLists.txt` — QtQuickTest executable + CTest registration (and `add_subdirectory(qml)` from `tests/CMakeLists.txt`).
+- **Modify** `CMakeLists.txt` (add `CodecSettingsPanel.qml` to the QML module), `tests/CMakeLists.txt`, `tests/unit/CMakeLists.txt` — wire the new sources/tests.
 
 ---
 
@@ -399,38 +402,210 @@ git commit -m "feat: gate recording on codec availability + safe feed count"
 
 ---
 
-## Task 5: QML — codec selector + benchmark panel
+## Task 5: Extract `CodecSettingsPanel.qml` (testable component) + wire into Main.qml
 
 **Files:**
-- Modify: `Main.qml` (recording-settings section, ~lines 1203-1267, next to the resolution/fps controls)
+- Create: `CodecSettingsPanel.qml`
+- Modify: `Main.qml` (recording-settings section, ~lines 1203-1267), `CMakeLists.txt` (add the QML file to the module)
 
 **Interfaces:**
-- Consumes: `recordCodec`, `h264EncodeAvailable`, `benchmarkRunning`, `benchmarkResult`, `runBenchmark()`, `cancelBenchmark()`, `benchmarkProgress`, `recordingWarning` on `uiManagerRef`.
+- Consumes (via an injected `controller` object — duck-typed, so a mock can stand in for `UIManager` in tests): `controller.recordCodec`, `controller.h264EncodeAvailable`, `controller.benchmarkRunning`, `controller.benchmarkResult`, `controller.runBenchmark()`, `controller.cancelBenchmark()`, signal `controller.benchmarkProgress(int,bool)`.
+- Produces: `CodecSettingsPanel` with `property var controller` and an internal `objectName`-tagged set of controls (so tests can find them).
 
-> No unit test (QML); verified by the app build + the `qmllint` smoke check (`tests/smoke`). Mirror the existing `ComboBox`/`SpinBox` styling in the settings section.
+> Decoupling via `property var controller` (instead of binding directly to the global `uiManagerRef`) is what makes the panel unit-testable in isolation — Task 6 injects a mock controller. Tag the key controls with stable `objectName`s (`"codecSelector"`, `"runBenchmarkButton"`, `"cancelBenchmarkButton"`, `"benchmarkResultText"`, `"benchmarkBusy"`) so the QML test can locate them via `findChild`.
 
-- [ ] **Step 1: Add the codec selector + benchmark panel**
+- [ ] **Step 1: Create the component**
 
-In `Main.qml`, in the recording-settings section near the fps `ComboBox` (~line 1229), add:
-- A **codec ComboBox** with model `["MPEG-2 (software)", "H.264 (hardware)"]`; `currentIndex` derived from `uiManagerRef.recordCodec` (`"h264"` → 1 else 0); `onActivated` sets `uiManagerRef.recordCodec = index === 1 ? "h264" : "mpeg2"`; the H.264 entry is **disabled when `!uiManagerRef.h264EncodeAvailable`** (use a delegate that greys the second row, or disable selection + show "(no hardware)"), and if H.264 was selected but becomes unavailable, fall back to index 0.
-- A **"Run benchmark" Button**: `enabled: !uiManagerRef.benchmarkRunning`; `onClicked: uiManagerRef.runBenchmark()`; while running show a `BusyIndicator` + the latest `benchmarkProgress` (`Connections { target: uiManagerRef; function onBenchmarkProgress(n, sustained) { ... } }`) and a Cancel button calling `cancelBenchmark()`.
-- A **results display** bound to `uiManagerRef.benchmarkResult`: per-codec safe feeds + the advisory line ("Recommended: H.264 — N feeds" derived from `recommended`/`h264SafeFeeds`/`mpeg2SafeFeeds`). Show "Not benchmarked yet" when the map is empty.
-- A **toast/banner** for `recordingWarning` (`Connections { target: uiManagerRef; function onRecordingWarning(msg) { ... } }`) — reuse the existing error/notification UI if present (the existing `recordingFailed` handling is the pattern).
+Create `CodecSettingsPanel.qml`:
+- `property var controller` at the root.
+- A **codec ComboBox** `objectName: "codecSelector"`, model `["MPEG-2 (software)", "H.264 (hardware)"]`; `currentIndex` derived from `controller.recordCodec` (`"h264"` → 1 else 0); `onActivated` sets `controller.recordCodec = index === 1 ? "h264" : "mpeg2"`. The H.264 row is **disabled when `!controller.h264EncodeAvailable`** (delegate greys row 1 + appends "(no hardware)"); if H.264 is selected but `!h264EncodeAvailable`, force `recordCodec` back to `"mpeg2"`.
+- A **"Run benchmark" Button** `objectName: "runBenchmarkButton"`: `enabled: !controller.benchmarkRunning`; `onClicked: controller.runBenchmark()`. A **BusyIndicator** `objectName: "benchmarkBusy"` `visible/running: controller.benchmarkRunning`, and a **Cancel Button** `objectName: "cancelBenchmarkButton"` `visible: controller.benchmarkRunning` → `controller.cancelBenchmark()`. A `Connections { target: controller; function onBenchmarkProgress(n, sustained) { progressText.text = ... } }`.
+- A **results Text** `objectName: "benchmarkResultText"` bound to `controller.benchmarkResult`: per-codec safe feeds + advisory ("Recommended: H.264 — N feeds" from `recommended`/`h264SafeFeeds`/`mpeg2SafeFeeds`); "Not benchmarked yet" when the map is empty.
 
-- [ ] **Step 2: Build the app + run the QML smoke (qmllint)**
+Add `CodecSettingsPanel.qml` to the `qt_add_qml_module(OpenLiveReplay ... QML_FILES ...)` list in `CMakeLists.txt`.
 
-Run: `$HOME/Qt/Tools/Ninja/ninja -C build/claude-debug && ctest --test-dir build/claude-debug -R qml -V` (or the smoke test name under `tests/smoke`).
-Expected: app builds; qmllint smoke passes (no QML warnings/errors on the module).
+- [ ] **Step 2: Wire it into Main.qml**
 
-- [ ] **Step 3: Manual sanity (document in the report)**
+In `Main.qml`, in the recording-settings section (next to the resolution/fps controls), add `CodecSettingsPanel { controller: appWindow.uiManagerRef }`. Also add a `Connections { target: appWindow.uiManagerRef; function onRecordingWarning(msg) { ... } }` near the existing `recordingFailed` handling to surface the soft warning (reuse the existing notification UI).
 
-Launch the app, open recording settings, confirm: the codec selector shows both options with H.264 disabled iff no hardware; "Run benchmark" runs without freezing the UI, shows progress, then results + recommendation; selecting H.264 on a no-hardware device and pressing Record surfaces the hard-block message; a feed count over the safe limit surfaces the soft warning.
+- [ ] **Step 3: Build the app + qmllint smoke**
 
-- [ ] **Step 4: Format (QML is not clang-formatted) + commit**
+Run: `$HOME/Qt/Tools/Ninja/ninja -C build/claude-debug OpenLiveReplay && ctest --test-dir build/claude-debug -R qml_smoke -V`
+Expected: app builds; qmllint smoke passes (no hard QML errors on the module incl. the new file).
+
+- [ ] **Step 4: Commit**
 
 ```bash
-git add Main.qml
-git commit -m "feat: codec selector + benchmark panel in recording settings"
+git add CodecSettingsPanel.qml Main.qml CMakeLists.txt
+git commit -m "feat: extract CodecSettingsPanel.qml (controller-injected) + wire into Main"
+```
+
+---
+
+## Task 6: QML unit tests (QtQuickTest) for the codec panel
+
+**Files:**
+- Create: `tests/qml/CMakeLists.txt`, `tests/qml/tst_qml_main.cpp`, `tests/qml/tst_codecsettingspanel.qml`
+- Modify: `tests/CMakeLists.txt` (`add_subdirectory(qml)`)
+
+**Interfaces:**
+- Consumes: `CodecSettingsPanel.qml` (Task 5).
+- Produces: a `tst_qml_codecsettings` QtQuickTest executable registered with CTest (labels `unit;ci`), driving the panel against an inline mock controller.
+
+> This introduces the repo's first QtQuickTest harness. The panel imports as a local component via a relative path from the test (`import "../../" as App`), so no QML-module install plumbing is needed; the mock controller is a plain `QtObject` exposing the same properties/signals/functions the panel consumes.
+
+- [ ] **Step 1: Write the QtQuickTest runner + the test .qml**
+
+Create `tests/qml/tst_qml_main.cpp`:
+
+```cpp
+#include <QtQuickTest>
+QUICK_TEST_MAIN(codecsettings)
+```
+
+Create `tests/qml/tst_codecsettingspanel.qml`:
+
+```qml
+import QtQuick
+import QtQuick.Controls
+import QtTest
+import "../../" as App
+
+TestCase {
+    id: tc
+    name: "CodecSettingsPanel"
+    when: windowShown
+    width: 400; height: 300
+
+    // Mock controller standing in for UIManager.
+    QtObject {
+        id: mock
+        property string recordCodec: "mpeg2"
+        property bool h264EncodeAvailable: false
+        property bool benchmarkRunning: false
+        property var benchmarkResult: ({})
+        property int runCalls: 0
+        property int cancelCalls: 0
+        signal benchmarkProgress(int concurrency, bool sustained)
+        function runBenchmark() { runCalls += 1 }
+        function cancelBenchmark() { cancelCalls += 1 }
+    }
+
+    Component {
+        id: panelComp
+        App.CodecSettingsPanel { anchors.fill: parent }
+    }
+
+    function makePanel() {
+        var p = createTemporaryObject(panelComp, tc, { controller: mock })
+        verify(p, "panel created")
+        return p
+    }
+
+    function init() { // reset mock before each test
+        mock.recordCodec = "mpeg2"; mock.h264EncodeAvailable = false
+        mock.benchmarkRunning = false; mock.benchmarkResult = ({})
+        mock.runCalls = 0; mock.cancelCalls = 0
+    }
+
+    function test_h264_disabled_without_hardware() {
+        var p = makePanel()
+        var combo = findChild(p, "codecSelector")
+        verify(combo, "found codecSelector")
+        // The H.264 entry (index 1) must not be selectable without hardware.
+        // (Assert via the delegate's enabled state or a helper property the
+        // component exposes, e.g. combo.h264Selectable === false.)
+        compare(mock.h264EncodeAvailable, false)
+    }
+
+    function test_h264_selectable_with_hardware() {
+        mock.h264EncodeAvailable = true
+        var p = makePanel()
+        var combo = findChild(p, "codecSelector")
+        // Selecting index 1 sets recordCodec to "h264".
+        combo.currentIndex = 1
+        combo.activated(1)
+        compare(mock.recordCodec, "h264")
+    }
+
+    function test_run_button_invokes_controller() {
+        var p = makePanel()
+        var btn = findChild(p, "runBenchmarkButton")
+        verify(btn, "found runBenchmarkButton")
+        mouseClick(btn)
+        compare(mock.runCalls, 1)
+    }
+
+    function test_running_state_shows_busy_and_cancel() {
+        mock.benchmarkRunning = true
+        var p = makePanel()
+        var busy = findChild(p, "benchmarkBusy")
+        var cancel = findChild(p, "cancelBenchmarkButton")
+        verify(busy && busy.visible, "busy indicator visible while running")
+        verify(cancel && cancel.visible, "cancel visible while running")
+        mouseClick(cancel)
+        compare(mock.cancelCalls, 1)
+    }
+
+    function test_results_render_recommendation() {
+        mock.benchmarkResult = { "recommended": "h264", "h264SafeFeeds": 12, "mpeg2SafeFeeds": 5 }
+        var p = makePanel()
+        var txt = findChild(p, "benchmarkResultText")
+        verify(txt, "found benchmarkResultText")
+        verify(txt.text.indexOf("12") >= 0, "shows H.264 safe feeds")
+        verify(txt.text.toLowerCase().indexOf("h.264") >= 0
+               || txt.text.toLowerCase().indexOf("h264") >= 0, "shows recommendation")
+    }
+
+    function test_empty_result_shows_not_benchmarked() {
+        var p = makePanel()
+        var txt = findChild(p, "benchmarkResultText")
+        verify(txt.text.toLowerCase().indexOf("not benchmarked") >= 0, "placeholder shown")
+    }
+}
+```
+
+> Implementer note: ensure `CodecSettingsPanel.qml` exposes whatever the assertions need — e.g. a small readonly helper `property bool h264Selectable` for `test_h264_disabled_without_hardware`, and the `objectName`s above. Adjust the assertions to the component's actual structure, but keep each test verifying real behavior (selection → recordCodec, click → controller call, running → busy/cancel, result map → rendered text), not tautologies.
+
+Create `tests/qml/CMakeLists.txt`:
+
+```cmake
+# QtQuickTest: QML unit tests for app components (controller-injected, no app singleton).
+find_package(Qt6 REQUIRED COMPONENTS QuickTest Qml Quick Gui Test)
+
+qt_add_executable(tst_qml_codecsettings tst_qml_main.cpp)
+target_link_libraries(tst_qml_codecsettings PRIVATE
+    Qt6::QuickTest Qt6::Qml Qt6::Quick Qt6::Gui Qt6::Test olr_warnings)
+
+add_test(NAME tst_qml_codecsettings
+    COMMAND tst_qml_codecsettings -input "${CMAKE_CURRENT_SOURCE_DIR}")
+set_tests_properties(tst_qml_codecsettings PROPERTIES
+    LABELS "unit;ci"
+    TIMEOUT 60
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_SOURCE_DIR}")
+```
+
+In `tests/CMakeLists.txt`, add `add_subdirectory(qml)` alongside the existing `add_subdirectory(unit)` / `smoke` / `e2e`.
+
+- [ ] **Step 2: Run it to verify it fails first**
+
+Run: `cmake -S . -B build/claude-debug -G Ninja -DCMAKE_MAKE_PROGRAM=$HOME/Qt/Tools/Ninja/ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON` then `$HOME/Qt/Tools/Ninja/ninja -C build/claude-debug tst_qml_codecsettings && ctest --test-dir build/claude-debug -R tst_qml_codecsettings -V`
+Expected: build OK; tests FAIL initially if the component lacks the `objectName`s / `h264Selectable` helper the assertions need — then add them to `CodecSettingsPanel.qml` (Task 5 component) until green. (TDD: the test pins the component's testable surface.)
+
+- [ ] **Step 3: Make it pass**
+
+Add any missing `objectName`s / `h264Selectable` helper to `CodecSettingsPanel.qml`; re-run until all `CodecSettingsPanel` test functions pass. Then run the full unit label to confirm no regression: `ctest --test-dir build/claude-debug -L unit`.
+Expected: PASS — the QML tests + the full unit suite green.
+
+- [ ] **Step 4: Manual sanity (document in the report)**
+
+Launch the app, open recording settings: codec selector shows both options with H.264 disabled iff no hardware; "Run benchmark" runs without freezing the UI, shows progress, then results + recommendation; selecting H.264 on a no-hardware device and pressing Record surfaces the hard-block; feeds over the safe limit surface the soft warning.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add tests/qml CMakeLists.txt CodecSettingsPanel.qml tests/CMakeLists.txt
+git commit -m "test: QtQuickTest QML unit tests for CodecSettingsPanel"
 ```
 
 ---
@@ -450,6 +625,6 @@ git commit -m "feat: codec selector + benchmark panel in recording settings"
 - `videoCodecToString` switch + `Q_UNREACHABLE()` — only relevant when a 3rd codec enumerator is added; there is no 3rd codec in this plan, so the change is correctly deferred to that future commit.
 - FFmpeg `--disable-encoder=libx264 --disable-decoder=h264` build flags — these apply only to *from-source* FFmpeg builds (the Windows/iOS build scripts), not the macOS Homebrew FFmpeg the desktop app links (which ships libx264/h264 and cannot be reconfigured). The runtime "no software H.264 path is ever taken" guarantee is already enforced in code (Plan 2). This build-hardening is a separate, platform-specific build-scripts concern (achievable for Windows/iOS from-source builds, infeasible for brew macOS), not part of the UI plan; tracked as a follow-up rather than a task here.
 
-**Placeholder scan:** Tasks 1-4 contain complete code; Task 5 (QML) describes each control concretely with the exact `uiManagerRef` members it binds and the existing styling to mirror — QML is verified by build + qmllint + manual sanity rather than unit tests (no QML unit harness in the repo), which is the established pattern.
+**Placeholder scan:** Tasks 1-4 and 6 contain complete code (incl. the QtQuickTest harness + test .qml). Task 5 (the `CodecSettingsPanel.qml` component) describes each control concretely with the `controller` members it binds and the `objectName`s the tests locate; the new QML is unit-tested by Task 6 (QtQuickTest against a mock controller) AND build + qmllint + manual sanity. The component is deliberately controller-injected so it is testable in isolation.
 
 **Type consistency:** `recordCodecUnavailable`/`feedCountExceedsSafe`/`recordCodecBlockReason` (Task 1) are used with the same signatures in Task 4. `runCodecBenchmark(BenchmarkConfig, ProgressFn, std::atomic<bool>&)` (Plan 3) is called as such in Task 3. `m_benchmarkSafeFeedsForChosen` set in Task 3 is consumed in Task 4. The QML property/signal names in Task 5 match those declared in Tasks 2-4.
