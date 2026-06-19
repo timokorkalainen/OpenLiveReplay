@@ -1771,7 +1771,7 @@ void UIManager::endScrubGesture() {
 // markIn/markOut capture the live playhead; recallEntry arms a frame-perfect
 // pre-rolled cut (armNextCut) rather than the churny seekPlayback path.
 void UIManager::markIn() {
-    if (!m_transport) return;
+    if (!m_transport || !m_replayManager) return;
     // The current clip path is what UIManager already hands to the worker's
     // openFile (m_replayManager->getVideoPath()); there is no separate accessor.
     m_playlist.markIn(m_replayManager->getVideoPath(), m_transport->currentPos());
