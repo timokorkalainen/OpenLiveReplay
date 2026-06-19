@@ -31,6 +31,7 @@
 #include "playback/audioplayer.h"
 #include "playback/playbackworker.h"
 #include "playback/output/outputdispatcher.h"
+#include "playback/output/outputtargetassignment.h"
 
 namespace {
 constexpr int kFrameDurMs = 33; // ~30fps step granularity
@@ -77,6 +78,18 @@ int main(int argc, char** argv) {
     PlaybackWorker worker(providers, &transport, &audio);
     worker.openFile(file);
     worker.setActiveAudioView(0); // route audio for view 0
+    // Tier (b): enable a real NDI output on the feed(0) bus when requested, so the worker's
+    // decode->cache->output-bus->NdiOutputSink path is exercised end to end.
+    const QByteArray ndiSender = qgetenv("OLR_NDI_OUTPUT_SENDER");
+    if (!ndiSender.isEmpty()) {
+        OutputTargetAssignment ndi;
+        ndi.id = QStringLiteral("ndi-tier-b");
+        ndi.sourceBus = OutputBusId::feed(0);
+        ndi.kind = OutputTargetKind::Ndi;
+        ndi.enabled = true;
+        ndi.settings.insert(QStringLiteral("senderName"), QString::fromUtf8(ndiSender));
+        worker.setExternalOutputTargets({ndi});
+    }
     worker.start();
 
     const int64_t durMs = probeDurationMs(file);
