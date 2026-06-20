@@ -82,7 +82,11 @@ public:
     // active at a scheduled output frame (makeOutputSnapshot) with zero gray and
     // zero reposition. v1 is single-clip (ms-only; same currently-open file). If
     // the pre-roll context failed to open, this is a no-op (feature unavailable).
-    void armNextCut(int64_t targetMs);
+    // Returns true when the cut was armed (or queued for re-arm), false when the
+    // armed-cut feature is unavailable (e.g. H.264: the pre-roll bank is empty).
+    // Callers that need navigation even when arming fails should seekPlayback on
+    // false — that keeps Recall functional on H.264 recordings.
+    bool armNextCut(int64_t targetMs);
     // Direction-aware delivery (spec §5): forward delivers iff pts moved up,
     // reverse iff pts moved down (dir = +1 / -1).
     void deliverDueFrames(int64_t P, int dir);

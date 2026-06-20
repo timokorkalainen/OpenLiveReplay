@@ -1938,7 +1938,12 @@ void UIManager::recallEntry(int index) {
     // Tier3 v1 is single-clip: arm the in-point ms on the currently-open clip.
     // A recalled entry whose clipPath differs from the open clip is out of scope
     // for v1 (armNextCut is ms-only); recall still arms the ms.
-    if (m_playbackWorker) m_playbackWorker->armNextCut(entry->inMs);
+    // armNextCut returns false when the armed cut is unavailable (e.g. H.264
+    // recordings: the pre-roll bank is hardware-only-guarded and stays empty).
+    // Fall back to a plain seek so Recall still navigates to the cue.
+    if (!m_playbackWorker || !m_playbackWorker->armNextCut(entry->inMs)) {
+        seekPlayback(entry->inMs);
+    }
 }
 
 int UIManager::playlistCount() const {

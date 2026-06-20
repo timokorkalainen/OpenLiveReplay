@@ -1081,10 +1081,12 @@ bool PlaybackWorker::openPrerollContext() {
 }
 
 // UI-thread-safe: atomic stores only, never blocks. Arms a scheduled atomic cut
-// to targetMs. No-op (feature unavailable) if the pre-roll context failed to
-// open. v1 is single-clip (ms-only; same currently-open file).
-void PlaybackWorker::armNextCut(int64_t targetMs) {
-    if (!m_prerollFmtCtx) return; // pre-roll disabled — feature unavailable
+// to targetMs. Returns false (feature unavailable) if the pre-roll context
+// failed to open (e.g. H.264 recordings: the pre-roll bank is hardware-only-
+// guarded and stays empty). Returns true when the cut is armed or queued for
+// re-arm. v1 is single-clip (ms-only; same currently-open file).
+bool PlaybackWorker::armNextCut(int64_t targetMs) {
+    if (!m_prerollFmtCtx) return false; // pre-roll disabled — feature unavailable
     // Safe re-arm queue: a re-arm (rapid double "Recall") while a cut is already
     // armed/in-flight must NOT reset the staging state from this (UI) thread. The
     // worker fills m_prerollStagingCache lock-free and only stops once
@@ -1102,11 +1104,12 @@ void PlaybackWorker::armNextCut(int64_t targetMs) {
         m_pendingRearmSeekGen.store(m_seekGeneration.load(std::memory_order_acquire),
                                     std::memory_order_relaxed);
         m_hasPendingRearm.store(true, std::memory_order_release);
-        return;
+        return true; // queued for re-arm; the cut will still navigate to targetMs
     }
     // Fresh arm: armNextCut and seekTo are both UI-thread, so reading m_seekGeneration
     // here is a coherent baseline (no seek can interleave between this read and the arm).
     armCutInternal(targetMs, m_seekGeneration.load(std::memory_order_acquire));
+    return true;
 }
 
 // Arm the cut state. Caller guarantees no cut is in flight (m_cutArmed false), so
