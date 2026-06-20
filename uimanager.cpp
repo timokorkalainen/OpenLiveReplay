@@ -226,8 +226,8 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
     connect(
         m_replayManager, &ReplayManager::recordingError, this,
         [this](const QString& msg) {
-            emit recordingFailed(QStringLiteral("Recording error — ") + msg +
-                                 QStringLiteral(" (recording continues; check disk space)"));
+            emit recordingWarning(QStringLiteral("Disk write error — ") + msg +
+                                  QStringLiteral(" — recording continues; free disk space now."));
         },
         Qt::QueuedConnection);
     m_broadcastOutputStatusTimer.setInterval(500);
