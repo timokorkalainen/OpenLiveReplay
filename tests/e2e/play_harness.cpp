@@ -18,7 +18,7 @@
 //
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
-//              farback | armedcut
+//              farback | armedcut | armedcut-back
 #include <QCoreApplication>
 #include <QTimer>
 #include <QList>
@@ -118,14 +118,16 @@ int main(int argc, char** argv) {
         const PlaybackWorker::PlaybackCounters c = worker.counters();
         const qint64 phDelta = (*basePh < 0) ? 0 : (os.placeholderFrames - *basePh);
         const qint64 heldDelta = (*baseHeld < 0) ? 0 : (os.heldFrames - *baseHeld);
-        printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
-               "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
-               "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
-               "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d\n",
-               c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-               c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
-               (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-               (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired());
+        printf(
+            "COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
+            "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
+            "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
+            "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d\n",
+            c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
+            c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
+            (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
+            (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
+            c.cutFollowReposition);
         fflush(stdout);
         app.quit();
     };
@@ -325,6 +327,42 @@ int main(int argc, char** argv) {
             });
             QTimer::singleShot(4000, &app, finish);
 
+        } else if (scen == "armedcut-back") {
+            // Tier3 ARMED CUT, BACKWARD target (the dominant EVS replay case). A
+            // backward cut is frame-accurate and flash-free just like a forward
+            // one, but it differs structurally: the cut swaps only the OUTPUT
+            // cache + re-bases the playhead, leaving the PRIMARY decoder bank at
+            // the old (forward) position, so the worker resyncs it via a reactive
+            // backward-jump repositionTo on its next pass. That reposition is
+            // NON-CLEARING (Tier 1/2), so it must not flash — but the risk it
+            // introduces is a DRY CACHE: the promoted staging covers only
+            // [target, target+kStagingSpanMs] (~800ms of wall-clock playout), and
+            // if the resync lags past that the playhead outruns the coverage. That
+            // does NOT show as gray (placeholderFramesDelta) — m_holdLastFrame
+            // paints the last-good frame and bumps heldFrames instead. So this
+            // scenario plays LONG past the staging span and the gate asserts
+            // heldFramesDelta==0 (the metric the placeholder gate misses), not
+            // reposition==0 (the benign resync legitimately repositions).
+            transport.setSpeed(1.0);
+            transport.seek(durMs * 3 / 4); // start AHEAD of the cut target
+            worker.seekTo(durMs * 3 / 4);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&, basePh, baseHeld]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
+                const int64_t target = durMs / 4; // strictly EARLIER than the playhead
+                fprintf(stderr,
+                        "### armedcut-back basePh=%lld baseHeld=%lld; arming BACKWARD cut to "
+                        "%lldms ###\n",
+                        (long long) *basePh, (long long) *baseHeld, (long long) target);
+                worker.armNextCut(target);
+            });
+            // Play ~8s after the cut so the playhead runs several seconds past
+            // target+kStagingSpanMs — the only window where a dry cache (frozen
+            // frame / heldFrames spike) could surface if the resync ever lagged.
+            QTimer::singleShot(9000, &app, finish);
+
         } else {
             fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());
             // Still print counters (all zero) so the driver gets a line, then
@@ -337,11 +375,13 @@ int main(int argc, char** argv) {
             printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
                    "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                    "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
-                   "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d\n",
+                   "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d "
+                   "cutFollowReposition=%d\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                    c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                    (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-                   (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired());
+                   (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
+                   c.cutFollowReposition);
             fflush(stdout);
             ::exit(2);
         }

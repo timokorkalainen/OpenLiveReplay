@@ -62,6 +62,11 @@ public:
     struct PlaybackCounters {
         int reposition = 0, reuseSeek = 0, reverseChunkSeek = 0, eofTailSeek = 0, skipForward = 0,
             audioPushes = 0, framesDropped = 0;
+        // Repositions issued by the armed-cut decoder-follow (a backward cut's
+        // deterministic primary-bank resync). Counted SEPARATELY from reposition
+        // so the armed-cut gate keeps reposition==0 (no coarse-seek fallback)
+        // while still observing the follow fired exactly once.
+        int cutFollowReposition = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
@@ -137,7 +142,11 @@ private:
     int64_t newestPtsMax() const; // cross-track max-newest (ignoring empty); -1 empty
     int64_t refNewestPts() const; // reference (first) track newest; -1 empty
     int64_t refOldestPts() const; // reference (first) track oldest; -1 empty
-    void repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af);
+    // cutFollow=true marks a reposition issued by the armed-cut decoder-follow:
+    // it counts cutFollowReposition instead of reposition (the output cache is
+    // already correct; this only resyncs the primary decode engine).
+    void repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af,
+                      bool cutFollow = false);
     bool reuseAt(int64_t target); // true if every track has a frame within frameDurMs/2
 
     // Decode one read packet into the bank (video → insert with cap; audio →
@@ -281,6 +290,16 @@ private:
     std::atomic<bool> m_hasPendingRearm{false};
     // Count of fired cuts (incremented in maybeFireScheduledCut, output thread).
     std::atomic<int> m_cutsFired{0};
+    // Armed-cut decoder-follow. A BACKWARD cut swaps only the OUTPUT cache + re-bases
+    // the playhead, leaving the PRIMARY demuxer+decoder bank parked AHEAD of the new
+    // playhead. maybeFireScheduledCut (output thread) stores the new playhead here —
+    // BEFORE re-basing the transport playhead, so the worker, on observing the
+    // re-based playhead, is guaranteed to also see this and the reactive backward-jump
+    // path never fires. The run loop consumes it (exchange) on the worker thread and
+    // resyncs the primary bank with a non-clearing repositionTo. -1 = none. Forward
+    // cuts leave it unset (the forward-lag skip-forward path resyncs without a
+    // reposition). Set on the output thread, consumed on the worker thread; atomic.
+    std::atomic<int64_t> m_decoderFollowMs{-1};
     // Immutable snapshot of m_outputCache published to the output thread
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;
