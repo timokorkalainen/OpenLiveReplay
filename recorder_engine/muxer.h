@@ -62,6 +62,12 @@ public:
     AVStream* getStream(int index);
     void close();
 
+    bool hasFatalWriteError() const { return m_fatalWriteError.load(std::memory_order_acquire); }
+    QString fatalWriteMessage() const {
+        std::lock_guard<std::mutex> lk(m_fatalMsgMutex);
+        return QString::fromStdString(m_fatalWriteMsg);
+    }
+
     int audioTrackOffset() const { return m_audioTrackOffset; }
     int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
     int telemetryTrackOffset() const { return m_telemetryTrackOffset; }
@@ -162,6 +168,17 @@ private:
     std::mutex m_qMutex;
     std::condition_variable m_qCv;
     std::atomic<bool> m_writerRunning{false};
+
+    // Set on the FIRST sustained write failure (kFatalWriteThreshold consecutive
+    // av_write_frame errors on any stream). Written once; reset only on init().
+    std::atomic<bool> m_fatalWriteError{false};
+    std::string m_fatalWriteMsg; // guarded by m_fatalMsgMutex
+    mutable std::mutex m_fatalMsgMutex;
+    static constexpr int kFatalWriteThreshold = 3;
+
+#ifdef OLR_UNIT_TEST
+    friend class TestMuxer;
+#endif
 };
 
 #endif // MUXER_H

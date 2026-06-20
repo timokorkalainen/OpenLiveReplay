@@ -160,6 +160,9 @@ signals:
     // Never fires with the default LocalMonotonicReference (tier/external never change).
     void referenceTierChanged(int tier, bool external);
 
+    // Sustained fatal muxer write error (e.g. ENOSPC). Recording is NOT auto-stopped.
+    void recordingError(const QString& message);
+
 private slots:
     void onTimerTick();
 
@@ -287,6 +290,10 @@ private:
     // pushed to each worker. Persists across pulses so the ramp accumulates gently
     // toward the target; reset to 0 on startRecording. Grows on demand like m_lastStats.
     QList<int> m_servoTrimMs;
+
+    // Guards the one-shot recordingError emission per session.
+    // Reset in startRecording(); set when the error is first emitted.
+    bool m_muxerErrorEmitted = false;
 
     qint64 m_recordingStartEpochMs = 0;
 

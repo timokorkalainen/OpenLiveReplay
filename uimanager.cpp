@@ -223,6 +223,13 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
             emit sessionReferenceChanged();
         },
         Qt::QueuedConnection);
+    connect(
+        m_replayManager, &ReplayManager::recordingError, this,
+        [this](const QString& msg) {
+            emit recordingFailed(QStringLiteral("Recording error — ") + msg +
+                                 QStringLiteral(" (recording continues; check disk space)"));
+        },
+        Qt::QueuedConnection);
     m_broadcastOutputStatusTimer.setInterval(500);
     connect(&m_broadcastOutputStatusTimer, &QTimer::timeout, this, [this]() {
         const OutputDispatchStats stats =

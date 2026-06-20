@@ -232,6 +232,11 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
 
     m_lastDts.clear();
     m_lastFlush.start();
+    {
+        std::lock_guard<std::mutex> lk(m_fatalMsgMutex);
+        m_fatalWriteMsg.clear();
+    }
+    m_fatalWriteError.store(false, std::memory_order_relaxed);
 
     m_initialized = true;
 
@@ -337,6 +342,7 @@ void Muxer::writePacket(AVPacket* pkt) {
 }
 
 void Muxer::writerLoop() {
+    int consecutiveWriteErrors = 0;
     for (;;) {
         AVPacket* pkt = nullptr;
         {
@@ -403,6 +409,17 @@ void Muxer::writerLoop() {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
             av_strerror(ret, errbuf, sizeof(errbuf));
             qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
+            ++consecutiveWriteErrors;
+            if (consecutiveWriteErrors >= kFatalWriteThreshold &&
+                !m_fatalWriteError.load(std::memory_order_relaxed)) {
+                {
+                    std::lock_guard<std::mutex> lk(m_fatalMsgMutex);
+                    m_fatalWriteMsg = std::string(errbuf);
+                }
+                m_fatalWriteError.store(true, std::memory_order_release);
+            }
+        } else {
+            consecutiveWriteErrors = 0;
         }
 
         // Flush at most every ~100 ms: keeps the chase-play reader within a

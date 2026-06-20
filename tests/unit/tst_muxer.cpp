@@ -19,6 +19,7 @@
 class TestMuxer : public QObject {
     Q_OBJECT
 private slots:
+    void fatalWriteErrorFlagAndMessage();
     void initBuildsTrackLayout();
     void getStreamIsBoundsChecked();
     void stereoAudioChannelLayout();
@@ -537,6 +538,21 @@ void TestMuxer::emptyRecordingClosesToValidMkv() {
                  static_cast<unsigned char>(head[2]) == 0xDF &&
                  static_cast<unsigned char>(head[3]) == 0xA3,
              "empty recording must still carry the EBML/Matroska header magic");
+}
+
+void TestMuxer::fatalWriteErrorFlagAndMessage() {
+    Muxer m;
+    QVERIFY(!m.hasFatalWriteError());
+    QCOMPARE(m.fatalWriteMessage(), QString());
+
+    {
+        std::lock_guard<std::mutex> lk(m.m_fatalMsgMutex);
+        m.m_fatalWriteMsg = "No space left on device";
+    }
+    m.m_fatalWriteError.store(true, std::memory_order_release);
+
+    QVERIFY(m.hasFatalWriteError());
+    QCOMPARE(m.fatalWriteMessage(), QStringLiteral("No space left on device"));
 }
 
 QTEST_GUILESS_MAIN(TestMuxer)

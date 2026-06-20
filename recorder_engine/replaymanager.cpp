@@ -271,6 +271,9 @@ void ReplayManager::startRecording() {
     m_sessionFileName = m_baseFileName + "_" + timestamp;
     m_muxer->setOutputDirectory(m_outputDir);
 
+    // Reset the per-session muxer error guard so the new session can emit once.
+    m_muxerErrorEmitted = false;
+
     // Reset the inter-camera aligner for this fresh session (drops any anchors
     // carried over from a previous recording).
     m_tcAligner.reset();
@@ -533,6 +536,10 @@ void ReplayManager::updateSourceTrim(int sourceIndex, int ms) {
 
 // ─── Master heartbeat ──────────────────────────────────────────────────
 void ReplayManager::onTimerTick() {
+    if (m_muxer && m_muxer->hasFatalWriteError() && !m_muxerErrorEmitted) {
+        m_muxerErrorEmitted = true;
+        emit recordingError(m_muxer->fatalWriteMessage());
+    }
     if (!m_clock) return;
 
     // The recording timeline is wall-clock-derived; the (fixed-rate) timer is just a
