@@ -47,6 +47,20 @@ void TestNdiRecvAnalysis::avSyncMeasuresJitterAroundMedianOffset() {
     QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {10, 15, 22}), 10);
     // empty -> -1
     QCOMPARE(ndiAvSyncMaxFrames({}, {0}), -1);
+
+    // Re-chunking robustness: a ~60ms marker event registers on a VARIABLE number of frames,
+    // so beeps[]/flashes[] may hold 1-3 near-adjacent ordinals per event. Collapsing each run
+    // to its onset must keep these locked (was the e2e false-FAIL: one extra beep detection
+    // slipped the index pairing by a whole period -> avSyncMaxFrames in multiples of 15).
+    // beep at frame 15 detected on two adjacent audio frames {15,16}: still 0, not 14.
+    QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {0, 15, 16, 30}), 0);
+    // a flash detected on two adjacent video frames {0,1} collapses to onset 0: still 0.
+    QCOMPARE(ndiAvSyncMaxFrames({0, 1, 15, 30}, {0, 15, 30}), 0);
+    // multi-frame detections on BOTH streams every event: still perfectly locked.
+    QCOMPARE(ndiAvSyncMaxFrames({0, 1, 15, 16, 30, 31}, {0, 1, 15, 16, 30, 31}), 0);
+    // onset-collapse must NOT mask real drift: a genuinely late beep event (onset 24 vs
+    // expected ~15) is a distinct event (gap > 2), so offsets {0,9,0}, median 0 -> 9.
+    QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {0, 24, 30}), 9);
 }
 
 void TestNdiRecvAnalysis::cadenceReportsMaxGapAndMeanRate() {
