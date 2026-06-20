@@ -1000,6 +1000,14 @@ bool PlaybackWorker::openPrerollContext() {
         if (codecParams->codec_type != AVMEDIA_TYPE_VIDEO) continue;
         if (feedIndex >= m_providers.size()) break;
 
+        // H.264: hardware-only licensing constraint — NEVER software-decode.
+        // Mirror the primary bank guard exactly: skip the stream without advancing
+        // feedIndex so pre-roll feedIndex N still maps to the same provider as
+        // primary providerIndex N. (Pre-roll has no NativeVideoDecoder wiring, so
+        // H.264 sources simply get no pre-roll staging — the live primary bank keeps
+        // supplying those feeds after the cut swap.)
+        if (codecParams->codec_id == AV_CODEC_ID_H264) continue;
+
         const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
         if (!codec) continue;
         AVCodecContext* cctx = avcodec_alloc_context3(codec);
