@@ -318,8 +318,8 @@ jobs:
           - sanitizer: "thread"
             label: tsan
             advisory: true
-            build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher"
-            ctest_regex: "^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher)$"
+            build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime"
+            ctest_regex: "^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime)$"
     continue-on-error: ${{ matrix.advisory }}
     steps:
       - uses: actions/checkout@v4

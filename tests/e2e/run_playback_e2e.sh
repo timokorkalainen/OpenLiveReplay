@@ -62,9 +62,10 @@ VIDEO_FILTER="color=c=black:s=640x480:r=30,geq=lum='if(lt(mod(T,1),0.06),255,16)
 AUDIO_FILTER="sine=frequency=1000:sample_rate=48000,volume='if(lt(mod(t,1),0.1),1,0)':eval=frame"
 
 start_producer() {
-    # $3: optional video codec (default: libx264). armedcut passes mpeg2video so
-    # the pre-roll bank — which hardware-only-guards H.264 — can decode the
-    # fixture; other scenarios keep libx264 for production-representative testing.
+    # $3: optional video codec (default: libx264). This is the SRT/mpegts WIRE
+    # codec the engine ingests — it does NOT affect the recorded fixture codec.
+    # record_harness always writes an Mpeg2Software mezzanine (its default),
+    # so the pre-roll bank always finds an MPEG-2 fixture regardless of $3.
     local vcodec="${3:-libx264}"
     local extra_opts=""
     if [ "$vcodec" = "libx264" ]; then
@@ -81,10 +82,14 @@ start_producer() {
     FFPID=$!
 }
 
-# armedcut records with mpeg2video: the pre-roll bank skips H.264 (hardware-only
-# licensing constraint added in T1.3); an H.264 fixture would leave the pre-roll
-# bank empty → cutsFired==0. mpeg2video is SW-decodable and exercises the pre-roll
-# staging path the armed-cut gate actually measures.
+# PRODUCER_VCODEC controls the SRT wire format only — it does NOT change the
+# recorded fixture codec. record_harness always records an Mpeg2Software
+# mezzanine by default (no --codec flag passed here), so the pre-roll bank
+# always decodes MPEG-2 and the armed-cut gate always exercises the pre-roll
+# staging path. The armedcut override to mpeg2video keeps the SRT ingest path
+# software-decodable and production-representative; all other scenarios use
+# libx264 for the wire. Neither path exercises the pre-roll H.264 guard
+# (that guard skips H.264 fixtures; none appear here).
 PRODUCER_VCODEC="libx264"
 [ "$SCENARIO" = "armedcut" ] && PRODUCER_VCODEC="mpeg2video"
 

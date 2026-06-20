@@ -1006,6 +1006,17 @@ bool PlaybackWorker::openPrerollContext() {
         // primary providerIndex N. (Pre-roll has no NativeVideoDecoder wiring, so
         // H.264 sources simply get no pre-roll staging — the live primary bank keeps
         // supplying those feeds after the cut swap.)
+        //
+        // Homogeneous-codec invariant: OLR recordings are single-codec by
+        // construction — recorder_engine/muxer.cpp applies one VideoCodecChoice
+        // to all video tracks. The two layouts OLR produces are therefore:
+        //   • all-H.264  → every video stream skipped here → pre-roll bank empty
+        //                  → armed cut disabled (caller checks m_prerollBank.isEmpty())
+        //   • all-MPEG-2 → no H.264 skip → feedIndex advances in lock-step with
+        //                  the primary bank → correct 1:1 provider mapping
+        // A hypothetical externally-authored MIXED-codec file is the only case
+        // where feedIndex could diverge from the primary bank; that is out of
+        // scope and not supported.
         if (codecParams->codec_id == AV_CODEC_ID_H264) continue;
 
         const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
