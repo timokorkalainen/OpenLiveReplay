@@ -7,9 +7,12 @@
 //
 // Env: OLR_SOAK_SECONDS (default 120), OLR_SOAK_FPS_NUM/OLR_SOAK_FPS_DEN (default 30000/1001),
 //      OLR_SOAK_FEEDS (default 2).
-// Output (stdout), one line each:
-//   SOAK bus=feed frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=..
-//   SOAK bus=multiview frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=..
+// Output (stdout), one line each. `repeated` is the dispatcher's identity-skip count for the
+// bus (frozen/duplicate payloads dropped before the sink); `indexGaps` is the sink's raw
+// index-jump count (== skips, diagnostic only). The driver gates on frames + repeated ==
+// ticks (every tick delivered or skipped-as-duplicate) and repeated > 0 (pause exercised):
+//   SOAK bus=feed frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
+//   SOAK bus=multiview frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
 //   RUNTIME deadlineMisses=.. catchUpCapHits=.. maxLatenessNs=.. ticks=..
 #include <QByteArray>
 #include <QCoreApplication>
@@ -184,14 +187,24 @@ int main(int argc, char** argv) {
     runtime.stopRuntime(); // joins the runtime thread; sink accessors are safe afterward
 
     const OutputDispatchStats stats = runtime.stats();
-    auto report = [](const char* bus, const ContinuitySink& s) {
+    // Identity-skip is on by default (OutputDispatcher::m_identitySkip): the dispatcher
+    // drops byte-identical consecutive submits before the sink ever sees them, so the
+    // dedup/pause signal lives in the dispatcher stats, not the sink. A paused freeze
+    // shows up as the target's repeatedPayloadFrames, and each skip makes the sink's next
+    // outputFrameIndex jump (so the sink's raw indexGaps == the number of skips, by
+    // construction — it is a diagnostic here, not a gate). The real continuity invariant
+    // is "every tick is either delivered or skipped-as-duplicate": frames + repeated ==
+    // ticks, with repeated > 0 proving the pause segments were actually exercised.
+    auto report = [&stats](const char* bus, const QString& targetId, const ContinuitySink& s) {
+        const OutputTargetDispatchStats t = stats.targets.value(targetId);
         printf("SOAK bus=%s frames=%lld indexGaps=%lld audioSeams=%lld placeholders=%lld "
-               "repeated=%lld\n",
+               "repeated=%lld ticks=%lld\n",
                bus, (long long) s.frames(), (long long) s.indexGaps(), (long long) s.audioSeams(),
-               (long long) s.placeholders(), (long long) s.repeated());
+               (long long) s.placeholders(), (long long) t.repeatedPayloadFrames,
+               (long long) stats.ticks);
     };
-    report("feed", feedSink);
-    report("multiview", multiviewSink);
+    report("feed", feedAssignment.id, feedSink);
+    report("multiview", multiviewAssignment.id, multiviewSink);
     printf("RUNTIME deadlineMisses=%lld catchUpCapHits=%lld maxLatenessNs=%lld ticks=%lld\n",
            (long long) stats.runtime.deadlineMisses, (long long) stats.runtime.catchUpCapHits,
            (long long) stats.runtime.maxLatenessNs, (long long) stats.ticks);

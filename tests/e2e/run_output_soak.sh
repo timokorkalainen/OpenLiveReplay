@@ -2,6 +2,11 @@
 # Output-bus continuity soak driver: runs soak_harness and asserts the produced output
 # stream stayed frame/audio continuous and held cadence. Opt-in (CTest label "output-soak").
 #
+# Identity-skip aware: the dispatcher drops byte-identical consecutive submits (default-on),
+# so continuity is "every tick is delivered or skipped-as-duplicate" -> frames + repeated ==
+# ticks, with repeated>0 proving the pause segments froze the payload. The sink's raw
+# indexGaps just equals the skip count and is NOT gated.
+#
 # Usage: run_output_soak.sh <soak_harness_exe>
 # Env: OLR_SOAK_SECONDS (default 5 here for a fast opt-in run; raise for a real soak).
 set -uo pipefail
@@ -24,17 +29,23 @@ check_bus() {
     local bus="$1" line
     line="$(grep "SOAK bus=$bus " <<<"$OUT" || true)"
     if [ -z "$line" ]; then echo "FAIL: missing report for bus=$bus"; fail=1; return; fi
-    local frames gaps seams placeholders repeated
+    local frames gaps seams placeholders repeated ticks
     frames=$(field "$line" frames)
     gaps=$(field "$line" indexGaps)
     seams=$(field "$line" audioSeams)
     placeholders=$(field "$line" placeholders)
     repeated=$(field "$line" repeated)
-    [ "${gaps:-1}" = "0" ]         || { echo "FAIL[$bus]: indexGaps=$gaps"; fail=1; }
+    ticks=$(field "$line" ticks)
     [ "${seams:-1}" = "0" ]        || { echo "FAIL[$bus]: audioSeams=$seams"; fail=1; }
     [ "${placeholders:-1}" = "0" ] || { echo "FAIL[$bus]: placeholders=$placeholders"; fail=1; }
     [ "${repeated:-0}" -gt 0 ]     || { echo "FAIL[$bus]: repeated=$repeated (no pause detected)"; fail=1; }
     [ "${frames:-0}" -gt 0 ]       || { echo "FAIL[$bus]: frames=$frames"; fail=1; }
+    [ "${ticks:-0}" -gt 0 ]        || { echo "FAIL[$bus]: ticks=$ticks"; fail=1; }
+    # Identity-skip-aware continuity: every tick is delivered OR skipped-as-duplicate.
+    if [ "${frames:-0}" -gt 0 ] && [ "${ticks:-0}" -gt 0 ]; then
+        [ "$(( frames + repeated ))" = "${ticks}" ] || {
+            echo "FAIL[$bus]: frames($frames)+repeated($repeated) != ticks($ticks) — lost ticks (raw indexGaps=$gaps)"; fail=1; }
+    fi
 }
 
 check_bus feed
