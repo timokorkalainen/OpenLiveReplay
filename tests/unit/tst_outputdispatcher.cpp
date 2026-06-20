@@ -34,6 +34,8 @@ public:
         return true;
     }
 
+    FrameRate receivedRate() const { return m_rate; }
+
     QVector<OutputBusFrame> frames;
 
 private:
@@ -62,6 +64,7 @@ private slots:
     void disabledAssignmentsDoNotSubmit();
     void reverseAndSpeedChangeReanchorPlayhead();
     void playheadJumpWithoutReanchorIsCaughtByClockDivergence();
+    void rationalRateIsCarriedToSinkOnStart();
 };
 
 void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
@@ -698,6 +701,31 @@ void TestOutputDispatcher::playheadJumpWithoutReanchorIsCaughtByClockDivergence(
     QVERIFY2(okStats.maxClockDivergenceMs <= 1500,
              qPrintable(QStringLiteral("re-anchored epoch should track the playhead, got %1")
                             .arg(okStats.maxClockDivergenceMs)));
+}
+
+void TestOutputDispatcher::rationalRateIsCarriedToSinkOnStart() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 0, 128));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment qt;
+    qt.id = QStringLiteral("feed0-preview");
+    qt.sourceBus = OutputBusId::feed(0);
+    qt.kind = OutputTargetKind::QtPreview;
+    qt.enabled = true;
+
+    CollectingSink sink(OutputTargetKind::QtPreview);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(30000, 1001), 1, 4, 4);
+    dispatcher.setEndpoints({{qt, &sink}});
+    dispatcher.dispatchTick(cache, state);
+
+    QVERIFY(sink.isActive());
+    QCOMPARE(sink.receivedRate().numerator, 30000);
+    QCOMPARE(sink.receivedRate().denominator, 1001);
 }
 
 QTEST_GUILESS_MAIN(TestOutputDispatcher)

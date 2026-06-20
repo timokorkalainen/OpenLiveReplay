@@ -297,7 +297,7 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
         m_outputRuntime = std::make_unique<OutputRuntime>(
-            FrameRate::fromFraction(fps(), 1), m_outputFeedCount, m_outputWidth, m_outputHeight);
+            m_transport->frameRate(), m_outputFeedCount, m_outputWidth, m_outputHeight);
         m_outputRuntime->setSnapshotProvider([this]() { return makeOutputSnapshot(); });
     }
     m_outputTargetsDirty.store(true, std::memory_order_relaxed);
@@ -2008,7 +2008,7 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
 
     QVector<PendingDeliver> pending;
     const bool outputGraphActive = m_outputRuntime != nullptr;
-    const FrameRate rate = FrameRate::fromFraction(fps(), 1);
+    const FrameRate rate = m_transport->frameRate();
     const qint64 outputFrameIndex = rate.msToFrameIndex(P);
     {
         QMutexLocker bufferLocker(&m_bufferMutex);
