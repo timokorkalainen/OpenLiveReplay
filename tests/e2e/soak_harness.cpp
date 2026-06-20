@@ -13,6 +13,7 @@
 // ticks (every tick delivered or skipped-as-duplicate) and repeated > 0 (pause exercised):
 //   SOAK bus=feed frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
 //   SOAK bus=multiview frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
+//   SOAK bus=pgm frames=.. indexGaps=.. audioSeams=.. placeholders=.. repeated=.. ticks=..
 //   RUNTIME deadlineMisses=.. catchUpCapHits=.. maxLatenessNs=.. ticks=..
 #include <QByteArray>
 #include <QCoreApplication>
@@ -159,6 +160,7 @@ int main(int argc, char** argv) {
 
     ContinuitySink feedSink(OutputTargetKind::QtPreview);
     ContinuitySink multiviewSink(OutputTargetKind::QtPreview);
+    ContinuitySink pgmSink(OutputTargetKind::QtPreview);
 
     OutputTargetAssignment feedAssignment;
     feedAssignment.id = QStringLiteral("soak-feed");
@@ -172,7 +174,18 @@ int main(int argc, char** argv) {
     multiviewAssignment.kind = OutputTargetKind::QtPreview;
     multiviewAssignment.enabled = true;
 
-    runtime.setEndpoints({{feedAssignment, &feedSink}, {multiviewAssignment, &multiviewSink}});
+    // The program (PGM) bus renders the selected feed full-frame; the snapshot provider pins
+    // selectedFeedIndex=0, so PGM soaks renderPgm -> dispatch -> identity-skip the same way feed
+    // and multiview do, over the same play/pause schedule.
+    OutputTargetAssignment pgmAssignment;
+    pgmAssignment.id = QStringLiteral("soak-pgm");
+    pgmAssignment.sourceBus = OutputBusId::pgm();
+    pgmAssignment.kind = OutputTargetKind::QtPreview;
+    pgmAssignment.enabled = true;
+
+    runtime.setEndpoints({{feedAssignment, &feedSink},
+                          {multiviewAssignment, &multiviewSink},
+                          {pgmAssignment, &pgmSink}});
 
     runtime.startRuntime();
 
@@ -205,6 +218,7 @@ int main(int argc, char** argv) {
     };
     report("feed", feedAssignment.id, feedSink);
     report("multiview", multiviewAssignment.id, multiviewSink);
+    report("pgm", pgmAssignment.id, pgmSink);
     printf("RUNTIME deadlineMisses=%lld catchUpCapHits=%lld maxLatenessNs=%lld ticks=%lld\n",
            (long long) stats.runtime.deadlineMisses, (long long) stats.runtime.catchUpCapHits,
            (long long) stats.runtime.maxLatenessNs, (long long) stats.ticks);
