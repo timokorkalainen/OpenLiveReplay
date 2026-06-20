@@ -487,6 +487,60 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    armedcut-seekrace)
+        # Manual-seek-vs-in-flight-cut policy: a cut is armed, then an operator
+        # seekTo to a different target is issued before the cut fires. The seek must
+        # WIN — the seek bumps m_seekGeneration, so maybeFireScheduledCut aborts the
+        # cut (it never snaps to a target the operator moved away from).
+        #   cutsFired==0   -> the cut was cancelled by the manual seek
+        #   reposition>=1  -> the manual seek serviced the jump via repositionTo
+        #   placeholderFramesDelta==0 -> the seek (Tier1/2) painted no gray
+        # A regression (cut fires despite the seek) shows cutsFired>=1 — the output
+        # would have jumped to the cut target instead of the operator's seek target.
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 0 ]; then
+            echo "FAIL: armedcut-seekrace cut fired despite a manual seek (cutsFired=$cutsFired, expected 0) — manual seek must cancel an in-flight cut"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -lt 1 ]; then
+            echo "FAIL: armedcut-seekrace manual seek did not reposition (reposition=$reposition, expected >=1) — the seek should service the jump"
+            fail=1
+        fi
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut-seekrace painted gray (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — seek flash"
+            fail=1
+        fi
+        # FRAME-ACCURACY: prove the SEEK won — the output clock must re-anchor to the
+        # seek target. cutsFired==0 alone only proves the cut was suppressed, not that
+        # the output landed at the seek target (vs the abandoned cut target). The
+        # divergence gate (same bound the other armed-cut gates use) closes that
+        # false-pass: a cut that silently won, or a seek that mis-positioned, diverges.
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: armedcut-seekrace clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — the seek did not cleanly service the jump (or the cut fired)"
+            fail=1
+        fi
+        ;;
+    armedcut-rearm-seek)
+        # COMBINED recall+seek interleaving (the path the race review flagged as
+        # uncovered): arm a cut, queue a re-arm (double Recall) while it is in flight,
+        # THEN issue a manual seek. The manual seek is the newest explicit action, so
+        # BOTH the in-flight cut and the queued re-arm must be cancelled — no cut fires.
+        #   cutsFired==0   -> in-flight cut aborted (seek-gen mismatch) AND queued
+        #                     re-arm dropped (queue-time gen superseded by the seek)
+        #   placeholderFramesDelta==0 + maxClockDivergenceMs<=1500 -> the seek won,
+        #                     frame-accurately, with no flash
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 0 ]; then
+            echo "FAIL: armedcut-rearm-seek fired a cut (cutsFired=$cutsFired, expected 0) — a queued re-arm or in-flight cut survived a later manual seek"
+            fail=1
+        fi
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut-rearm-seek painted gray (placeholderFramesDelta=$placeholderFramesDelta, expected 0)"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: armedcut-rearm-seek clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — the seek did not cleanly win over the recall+re-arm"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1

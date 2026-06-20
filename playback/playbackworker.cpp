@@ -61,12 +61,19 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // transport's own (independent) mutex, so there is no lock-order concern.
     m_lastMoveDir.store((clamped >= m_transport->currentPos()) ? 1 : -1, std::memory_order_relaxed);
     m_seekTargetMs = clamped;
-    // A manual seek supersedes any pending armed-cut decoder-follow: the explicit
-    // reposition below resyncs the primary bank to the user's target, so a stale
-    // follow to the old cut target would otherwise jump the decoder back. Cancel it.
-    m_decoderFollowMs.store(-1, std::memory_order_relaxed);
+    // A manual seek supersedes any pending armed-cut work: it cancels a pending
+    // decoder-follow (a stale follow to the old cut target would jump the decoder
+    // back) and any queued re-arm (the operator's explicit seek is the latest
+    // intent — a recall that arrived during an in-flight cut must not fire after
+    // it). An ARMED/in-flight cut is cancelled at fire time by maybeFireScheduled
+    // Cut via the seek-generation bump below (m_armSeekGen mismatch).
+    // Release ordering so a lock-free worker that later observes the new
+    // m_seekGeneration (acquire) is guaranteed to also observe these clears.
+    m_decoderFollowMs.store(-1, std::memory_order_release);
+    m_hasPendingRearm.store(false, std::memory_order_release);
     // A new seek target is outstanding until repositionTo commits it. The gate
-    // holds the last good playhead until m_committedGeneration catches up.
+    // holds the last good playhead until m_committedGeneration catches up. The
+    // bump also signals maybeFireScheduledCut to abort an armed cut (manual seek wins).
     m_seekGeneration.fetch_add(1, std::memory_order_release);
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
@@ -729,6 +736,17 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
             m_audioQueue.clear();
             if (m_audioPlayer) m_audioPlayer->clear();
         }
+        // A NEWER explicit seek arrived during this reposition (the full path breaks
+        // on the same condition mid-fill). Do NOT commit a generation against a
+        // target the operator has superseded: that would advance m_committedGeneration
+        // to the new seek's value with a stale m_committedPlayheadMs, disengaging the
+        // CommitGate and briefly exposing a frame the operator seeked away from (also
+        // reachable via a decoder-follow reuse racing a manual seek). Return with the
+        // gate still held; the run loop services the newer seek next, which commits.
+        {
+            QMutexLocker locker(&m_mutex);
+            if (m_seekTargetMs >= 0) return;
+        }
         m_counters.reuseSeek++;
         // Tier 2: the cache already covers `target` (reuseAt + deliverDueFrames
         // above). Record the committed playhead, then advance the committed
@@ -1056,10 +1074,17 @@ void PlaybackWorker::armNextCut(int64_t targetMs) {
     // sequentially on the worker thread. Latest queued target wins.
     if (m_cutArmed.load(std::memory_order_acquire)) {
         m_pendingRearmMs.store(targetMs < 0 ? 0 : targetMs);
+        // Capture the seek generation NOW (queue time): if a manual seek lands
+        // before the worker applies this re-arm, m_seekGeneration moves past it and
+        // the worker drops the re-arm (the seek is the newer explicit action).
+        m_pendingRearmSeekGen.store(m_seekGeneration.load(std::memory_order_acquire),
+                                    std::memory_order_relaxed);
         m_hasPendingRearm.store(true, std::memory_order_release);
         return;
     }
-    armCutInternal(targetMs);
+    // Fresh arm: armNextCut and seekTo are both UI-thread, so reading m_seekGeneration
+    // here is a coherent baseline (no seek can interleave between this read and the arm).
+    armCutInternal(targetMs, m_seekGeneration.load(std::memory_order_acquire));
 }
 
 // Arm the cut state. Caller guarantees no cut is in flight (m_cutArmed false), so
@@ -1067,11 +1092,16 @@ void PlaybackWorker::armNextCut(int64_t targetMs) {
 // only (no cache touch) — safe from the UI thread (fresh arm) or the worker
 // thread (queued re-arm applied in the run loop). m_cutArmed is released LAST so
 // a worker observing it true (acquire) sees the target/seek-pending stores.
-void PlaybackWorker::armCutInternal(int64_t targetMs) {
+void PlaybackWorker::armCutInternal(int64_t targetMs, uint64_t baselineSeekGen) {
     m_armedTargetMs.store(targetMs < 0 ? 0 : targetMs);
     m_prerollSeekPending.store(true);
     m_stagingCovers.store(false);
     m_scheduledCutFrame.store(-1);
+    // Baseline is the seek generation when the recall was ISSUED (not now): a manual
+    // seekTo after that point bumps m_seekGeneration past it, and maybeFireScheduled
+    // Cut aborts the cut on the mismatch (manual seek wins). Capturing it at arm time
+    // instead would re-baseline a queued re-arm against a seek that raced the apply.
+    m_armSeekGen.store(baselineSeekGen, std::memory_order_release);
     m_cutArmed.store(true, std::memory_order_release);
 }
 
@@ -1200,8 +1230,13 @@ void PlaybackWorker::fillStaging() {
     av_frame_free(&af);
     av_packet_free(&pkt);
 
-    // Schedule the cut the moment staging first covers the target window.
-    if (m_stagingCovers.load() && m_scheduledCutFrame.load() < 0) {
+    // Schedule the cut the moment staging first covers the target window — unless
+    // the cut was disarmed meanwhile (e.g. maybeFireScheduledCut aborted it on a
+    // manual-seek generation mismatch, clearing m_cutArmed under m_bufferMutex
+    // while this fill was in flight). Re-checking m_cutArmed here closes the
+    // lost-update window where an aborted cut would be re-scheduled.
+    if (m_cutArmed.load(std::memory_order_acquire) && m_stagingCovers.load() &&
+        m_scheduledCutFrame.load() < 0) {
         const qint64 lead = CutSchedule::framesForLeadMs(kCutLeadMs, fps());
         const qint64 nextIdx =
             m_outputRuntime ? m_outputRuntime->dispatcherNextOutputFrameIndex() : 0;
@@ -1234,6 +1269,24 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     if (scheduled < 0) return; // nothing scheduled — unarmed path unchanged
     if (!CutSchedule::shouldFireAt(dispatcherNextIndex, scheduled)) return;
     if (!m_prerollStagingCache) return;
+    // Manual-seek-vs-in-flight-cut policy: if the operator issued an explicit
+    // seekTo after this cut was armed (m_seekGeneration bumped), the seek wins —
+    // abort the cut WITHOUT swapping/re-basing so it never snaps to a target the
+    // operator has moved away from. The pending seek (m_seekTargetMs) services the
+    // jump via the run loop's explicit-seek classify. Clear the armed state so the
+    // worker stops staging; the queued re-arm (if any) was already dropped by seekTo.
+    if (m_seekGeneration.load(std::memory_order_acquire) !=
+        m_armSeekGen.load(std::memory_order_acquire)) {
+        // Full disarm (mirror the fire path's cleanup) so the post-abort state is
+        // unambiguously "disarmed", not "armed target retained but gated off".
+        m_scheduledCutFrame.store(-1);
+        m_stagingCovers.store(false);
+        m_decoderFollowMs.store(-1);
+        m_armedTargetMs.store(-1);
+        m_prerollSeekPending.store(false);
+        m_cutArmed.store(false, std::memory_order_release);
+        return;
+    }
 
     const int64_t target = m_scheduledCutTargetMs.load();
     const int64_t newPlayhead =
@@ -1831,7 +1884,19 @@ void PlaybackWorker::run() {
         // staging fill cannot run concurrently with the output thread's swap.
         if (!m_cutArmed.load(std::memory_order_acquire) &&
             m_hasPendingRearm.exchange(false, std::memory_order_acq_rel)) {
-            armCutInternal(m_pendingRearmMs.load());
+            const uint64_t qgen = m_pendingRearmSeekGen.load(std::memory_order_acquire);
+            bool seekPending;
+            {
+                QMutexLocker l(&m_mutex);
+                seekPending = (m_seekTargetMs >= 0);
+            }
+            // Apply the queued re-arm ONLY if no manual seek has superseded it since
+            // it was queued: the generation must be unchanged AND no seek target may
+            // be outstanding. Otherwise drop it — the operator's seek is the newer
+            // explicit action. armCutInternal is given the QUEUE-time generation as
+            // the baseline, so even a seek that races this apply aborts the cut later.
+            if (!seekPending && m_seekGeneration.load(std::memory_order_acquire) == qgen)
+                armCutInternal(m_pendingRearmMs.load(), qgen);
         }
         // Worker-private; never starves the primary tick (kPrerollPacketsPerTick
         // per pass). Stops once staging covers the armed window (m_stagingCovers),

@@ -187,8 +187,11 @@ private:
     // Arm the cut state (target + staging reset). Caller MUST guarantee no cut is
     // in flight (m_cutArmed false). Called from armNextCut (UI thread, fresh arm)
     // and from the run loop (worker thread, applying a queued re-arm). Atomics
-    // only — no cache touch — so it is safe from either thread.
-    void armCutInternal(int64_t targetMs);
+    // only — no cache touch — so it is safe from either thread. baselineSeekGen is
+    // the m_seekGeneration captured when the recall was ISSUED (arm time for a
+    // fresh arm, QUEUE time for a re-arm) — stored as m_armSeekGen so any manual
+    // seek after that point aborts the cut at fire time (manual-seek-wins policy).
+    void armCutInternal(int64_t targetMs, uint64_t baselineSeekGen);
     // Store the atomic schedule (output frame index + target ms).
     void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
@@ -288,6 +291,13 @@ private:
     // with the output thread's swap in maybeFireScheduledCut. Latest target wins.
     std::atomic<int64_t> m_pendingRearmMs{-1};
     std::atomic<bool> m_hasPendingRearm{false};
+    // m_seekGeneration captured when a re-arm was QUEUED (armNextCut, UI thread).
+    // The worker uses it as the cut's seek baseline when it applies the queued
+    // re-arm, and drops the re-arm if m_seekGeneration advanced since queuing — so
+    // a manual seek issued after the recall (but while the prior cut was in flight)
+    // still wins. Without this, capturing the baseline at apply time would re-
+    // baseline against the post-seek generation and the recalled cut would fire.
+    std::atomic<uint64_t> m_pendingRearmSeekGen{0};
     // Count of fired cuts (incremented in maybeFireScheduledCut, output thread).
     std::atomic<int> m_cutsFired{0};
     // Armed-cut decoder-follow. A BACKWARD cut swaps only the OUTPUT cache + re-bases
@@ -300,6 +310,13 @@ private:
     // cuts leave it unset (the forward-lag skip-forward path resyncs without a
     // reposition). Set on the output thread, consumed on the worker thread; atomic.
     std::atomic<int64_t> m_decoderFollowMs{-1};
+    // m_seekGeneration captured when a cut is armed (armCutInternal). A manual
+    // seekTo bumps m_seekGeneration; if it differs at fire time the operator
+    // issued an explicit seek after arming, so maybeFireScheduledCut ABORTS the
+    // cut (the manual seek wins — it services the jump via repositionTo). This is
+    // the authoritative manual-seek-vs-in-flight-cut policy: the cut never fires
+    // against a playhead the operator has since seeked away from.
+    std::atomic<uint64_t> m_armSeekGen{0};
     // Immutable snapshot of m_outputCache published to the output thread
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;
