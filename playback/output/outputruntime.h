@@ -42,6 +42,11 @@ public:
     // dispatchDueTicksNs — snapshot() runs between the two locked scopes), so
     // this getter does NOT re-enter m_mutex.
     qint64 dispatcherNextOutputFrameIndex() const;
+    // The output frame index at which the sampled playhead will reach `playheadMs`
+    // (honors the play epoch's speed); -1 if not advancing forward. Same locking as
+    // dispatcherNextOutputFrameIndex. Used to schedule an armed cut at an exact
+    // playhead (a playlist entry's out-point) for frame-perfect playout transitions.
+    qint64 outputFrameForPlayheadMs(qint64 playheadMs) const;
 
 protected:
     void run() override;

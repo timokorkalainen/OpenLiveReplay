@@ -30,6 +30,7 @@
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
 #include "playback/playbackworker.h"
+#include "playback/playlistplayout.h"
 #include "playback/output/outputdispatcher.h"
 #include "playback/output/outputtargetassignment.h"
 
@@ -431,6 +432,65 @@ int main(int argc, char** argv) {
                         (long long) (durMs / 5));
             });
             QTimer::singleShot(5000, &app, finish);
+
+        } else if (scen == "playlist") {
+            // EVS rundown AUTO-PLAYOUT: drive PlaylistPlayout over a few forward
+            // segments (one slow-motion) on the recorded fixture, exactly as the
+            // UIManager controller does — arm each entry's out -> next-in boundary as
+            // a frame-perfect cut (fire-at-out-point), advance on each fire, and apply
+            // the next entry's speed. Proves the worker's fire-at-playhead cut + the
+            // playout state machine end to end against the real decode pipeline,
+            // including a slow-motion segment (the boundary fire-frame honors speed).
+            auto* playout = new PlaylistPlayout();
+            auto* lastCuts = new int(0);
+            auto mk = [](qint64 in, qint64 out, double spd) {
+                ReplayEntry e;
+                e.clipPath = QStringLiteral("clip");
+                e.inMs = in;
+                e.outMs = out;
+                e.speed = spd;
+                return e;
+            };
+            QVector<ReplayEntry> entries;
+            entries << mk(2000, 5000, 1.0) << mk(12000, 14000, 0.5) << mk(18000, 20000, 1.0);
+            const int nEntries = int(entries.size());
+            playout->start(entries, 0); // PlaylistPlayout copies the entries
+            const ReplayEntry first = entries.first();
+            transport.setSpeed(first.speed);
+            transport.seek(first.inMs);
+            worker.seekTo(first.inMs);
+            transport.setPlaying(true);
+            *lastCuts = worker.cutsFired();
+            // Snapshot placeholder/held baseline after warmup, before the first boundary.
+            QTimer::singleShot(1200, &app, [&, basePh, baseHeld, nEntries]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
+                fprintf(stderr, "### playlist basePh=%lld baseHeld=%lld; %d entries ###\n",
+                        (long long) *basePh, (long long) *baseHeld, nEntries);
+            });
+            QTimer* mon = new QTimer(&app);
+            QObject::connect(mon, &QTimer::timeout, &app, [&, playout, lastCuts]() {
+                const int cuts = worker.cutsFired();
+                if (cuts > *lastCuts) {
+                    *lastCuts = cuts;
+                    const auto cur = playout->onBoundaryFired();
+                    if (cur.has_value()) {
+                        transport.setSpeed(cur->speed); // apply the next entry's speed
+                        fprintf(stderr,
+                                "### playlist advanced to entry %d in=%lld speed=%.2f ###\n",
+                                playout->currentIndex(), (long long) cur->inMs, cur->speed);
+                    }
+                }
+                const auto b = playout->evaluate(transport.currentPos(), transport.speed(), 1500);
+                if (b.valid) {
+                    worker.armNextCut(b.targetMs, b.fireAtMs);
+                    fprintf(stderr, "### playlist arm boundary fireAt=%lld -> in=%lld ###\n",
+                            (long long) b.fireAtMs, (long long) b.targetMs);
+                }
+            });
+            mon->start(16);
+            QTimer::singleShot(14000, &app, finish);
 
         } else {
             fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());

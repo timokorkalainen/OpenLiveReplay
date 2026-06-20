@@ -87,6 +87,10 @@ public:
     void resetFrameIndex(qint64 nextOutputFrameIndex = 0);
     void resetPlayEpoch();
     qint64 nextOutputFrameIndex() const { return m_nextOutputFrameIndex; }
+    // The output frame index at which the sampled playhead will reach `playheadMs`,
+    // using the current play epoch (honors speed). -1 if no epoch / not advancing
+    // forward. Used to fire an armed cut at an exact playhead (a playlist out-point).
+    qint64 outputFrameForPlayheadMs(qint64 playheadMs) const;
     void setRuntimeStats(const OutputRuntimeDispatchStats& stats);
     void setHoldLastFrame(bool enabled) { m_holdLastFrame = enabled; }
     void setIdentitySkip(bool enabled) { m_identitySkip = enabled; }

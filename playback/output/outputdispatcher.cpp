@@ -1,5 +1,7 @@
 #include "playback/output/outputdispatcher.h"
 
+#include "playback/output/outputframeclock.h"
+
 #include <QHash>
 
 namespace {
@@ -64,6 +66,11 @@ void OutputDispatcher::resetFrameIndex(qint64 nextOutputFrameIndex) {
 
 void OutputDispatcher::resetPlayEpoch() {
     m_havePlayEpoch = false;
+}
+
+qint64 OutputDispatcher::outputFrameForPlayheadMs(qint64 playheadMs) const {
+    if (!m_havePlayEpoch) return -1;
+    return OutputFrameClock(m_rate).outputFrameForPlayheadMs(playheadMs, m_playEpoch);
 }
 
 void OutputDispatcher::setRuntimeStats(const OutputRuntimeDispatchStats& stats) {

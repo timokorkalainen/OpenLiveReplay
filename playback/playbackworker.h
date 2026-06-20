@@ -86,7 +86,11 @@ public:
     // armed-cut feature is unavailable (e.g. H.264: the pre-roll bank is empty).
     // Callers that need navigation even when arming fails should seekPlayback on
     // false — that keeps Recall functional on H.264 recordings.
-    bool armNextCut(int64_t targetMs);
+    //
+    // fireAtPlayheadMs: when >= 0, the cut fires when the playhead reaches this
+    // position (e.g. a playlist entry's out-point) rather than as-soon-as-staged,
+    // for frame-perfect playout transitions. -1 (default, e.g. a Recall) = fire ASAP.
+    bool armNextCut(int64_t targetMs, int64_t fireAtPlayheadMs = -1);
     // Direction-aware delivery (spec §5): forward delivers iff pts moved up,
     // reverse iff pts moved down (dir = +1 / -1).
     void deliverDueFrames(int64_t P, int dir);
@@ -195,7 +199,7 @@ private:
     // the m_seekGeneration captured when the recall was ISSUED (arm time for a
     // fresh arm, QUEUE time for a re-arm) — stored as m_armSeekGen so any manual
     // seek after that point aborts the cut at fire time (manual-seek-wins policy).
-    void armCutInternal(int64_t targetMs, uint64_t baselineSeekGen);
+    void armCutInternal(int64_t targetMs, uint64_t baselineSeekGen, int64_t fireAtPlayheadMs);
     // Store the atomic schedule (output frame index + target ms).
     void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
@@ -321,6 +325,13 @@ private:
     // the authoritative manual-seek-vs-in-flight-cut policy: the cut never fires
     // against a playhead the operator has since seeked away from.
     std::atomic<uint64_t> m_armSeekGen{0};
+    // Playhead (ms) at which the armed cut should fire, for frame-perfect playlist
+    // playout: the cut fires when the playhead reaches this position (a playlist
+    // entry's out-point) instead of as-soon-as-staged. -1 = fire ASAP (a Recall).
+    // m_armedFireAtMs is the live armed value; m_pendingRearmFireAtMs carries it
+    // through the safe re-arm queue (alongside m_pendingRearmMs).
+    std::atomic<int64_t> m_armedFireAtMs{-1};
+    std::atomic<int64_t> m_pendingRearmFireAtMs{-1};
     // Immutable snapshot of m_outputCache published to the output thread
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;

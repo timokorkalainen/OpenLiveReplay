@@ -210,6 +210,7 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/frameindex.cpp"
     "${CMAKE_SOURCE_DIR}/playback/replayplaylist.cpp"
     "${CMAKE_SOURCE_DIR}/playback/cutschedule.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/playlistplayout.cpp"
     "${CMAKE_SOURCE_DIR}/playback/audioframequeue.cpp"
     "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp"
     "${CMAKE_SOURCE_DIR}/playback/frameprovider.cpp"

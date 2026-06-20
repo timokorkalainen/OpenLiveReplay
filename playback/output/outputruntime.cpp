@@ -81,6 +81,11 @@ qint64 OutputRuntime::dispatcherNextOutputFrameIndex() const {
     return m_dispatcher.nextOutputFrameIndex();
 }
 
+qint64 OutputRuntime::outputFrameForPlayheadMs(qint64 playheadMs) const {
+    QMutexLocker locker(&m_mutex);
+    return m_dispatcher.outputFrameForPlayheadMs(playheadMs);
+}
+
 void OutputRuntime::run() {
     QElapsedTimer timer;
     timer.start();

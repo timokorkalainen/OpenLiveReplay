@@ -21,6 +21,7 @@ public:
     std::optional<ReplayEntry> recall(int index) const;
     void setSpeed(int index, double speed);
     int count() const { return m_entries.size(); }
+    QVector<ReplayEntry> entries() const { return m_entries; } // snapshot for playout
     void clear() { m_entries.clear(); }
 
     QJsonObject toJson() const;
