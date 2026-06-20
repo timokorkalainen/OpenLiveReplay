@@ -237,6 +237,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         m_fatalWriteMsg.clear();
     }
     m_fatalWriteError.store(false, std::memory_order_relaxed);
+    m_consecutiveWriteErrors = 0;
 
     m_initialized = true;
 
@@ -341,8 +342,25 @@ void Muxer::writePacket(AVPacket* pkt) {
     m_qCv.notify_one();
 }
 
-void Muxer::writerLoop() {
-    int consecutiveWriteErrors = 0;
+void Muxer::recordWriteOutcome(bool failed, const char* errLabel)
+{
+    if (failed) {
+        ++m_consecutiveWriteErrors;
+        if (m_consecutiveWriteErrors >= kFatalWriteThreshold &&
+            !m_fatalWriteError.load(std::memory_order_relaxed)) {
+            {
+                std::lock_guard<std::mutex> lk(m_fatalMsgMutex);
+                m_fatalWriteMsg = errLabel ? errLabel : "write error";
+            }
+            m_fatalWriteError.store(true, std::memory_order_release);
+        }
+    } else {
+        m_consecutiveWriteErrors = 0;
+    }
+}
+
+void Muxer::writerLoop()
+{
     for (;;) {
         AVPacket* pkt = nullptr;
         {
@@ -378,9 +396,11 @@ void Muxer::writerLoop() {
 
         // Commit the deferred header (once) just before the first real write, now
         // that the grace has resolved and any first-frame TC candidate has been
-        // registered. On a fatal header failure drop the packet (file is unusable).
+        // registered. On a fatal header failure record the outcome and drop the
+        // packet (file is unusable if the header never landed).
         if (!ensureHeaderWritten()) {
             av_packet_free(&pkt);
+            recordWriteOutcome(true, "avformat_write_header failed");
             continue;
         }
 
@@ -409,23 +429,18 @@ void Muxer::writerLoop() {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
             av_strerror(ret, errbuf, sizeof(errbuf));
             qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
-            ++consecutiveWriteErrors;
-            if (consecutiveWriteErrors >= kFatalWriteThreshold &&
-                !m_fatalWriteError.load(std::memory_order_relaxed)) {
-                {
-                    std::lock_guard<std::mutex> lk(m_fatalMsgMutex);
-                    m_fatalWriteMsg = std::string(errbuf);
-                }
-                m_fatalWriteError.store(true, std::memory_order_release);
-            }
+            recordWriteOutcome(true, errbuf);
         } else {
-            consecutiveWriteErrors = 0;
+            recordWriteOutcome(false, nullptr);
         }
 
         // Flush at most every ~100 ms: keeps the chase-play reader within a
         // cluster of the live edge without a disk flush per packet.
         if (!m_lastFlush.isValid() || m_lastFlush.elapsed() >= 100) {
             avio_flush(m_outCtx->pb);
+            if (m_outCtx->pb && m_outCtx->pb->error != 0) {
+                recordWriteOutcome(true, "avio flush error");
+            }
             m_lastFlush.restart();
         }
     }

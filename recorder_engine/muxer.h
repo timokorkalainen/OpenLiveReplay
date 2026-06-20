@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 
 #ifdef __APPLE__
@@ -85,6 +86,12 @@ private:
     // init() and close(), so the write path needs no lock against the
     // AVFormatContext.
     void writerLoop();
+
+    // Records a single write outcome and drives the consecutive-failure latch.
+    // Called ONLY from the writer thread; no lock needed for the counter.
+    // failed==true: increment counter; on reaching kFatalWriteThreshold, set the
+    // fatal flag (once). failed==false: reset the counter to 0.
+    void recordWriteOutcome(bool failed, const char* errLabel);
 
     // Writes the deferred MKV header exactly once, materialising the winning
     // start-timecode candidate into the "timecode" tag (format-level + each video
@@ -171,6 +178,8 @@ private:
 
     // Set on the FIRST sustained write failure (kFatalWriteThreshold consecutive
     // av_write_frame errors on any stream). Written once; reset only on init().
+    // m_consecutiveWriteErrors is touched ONLY on the writer thread: plain int.
+    int m_consecutiveWriteErrors = 0;
     std::atomic<bool> m_fatalWriteError{false};
     std::string m_fatalWriteMsg; // guarded by m_fatalMsgMutex
     mutable std::mutex m_fatalMsgMutex;

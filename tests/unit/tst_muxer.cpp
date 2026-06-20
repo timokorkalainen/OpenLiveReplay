@@ -20,6 +20,9 @@ class TestMuxer : public QObject {
     Q_OBJECT
 private slots:
     void fatalWriteErrorFlagAndMessage();
+    void recordWriteOutcomeThresholdAndLatch();
+    void recordWriteOutcomeResetOnSuccess();
+    void recordWriteOutcomeInitClears();
     void initBuildsTrackLayout();
     void getStreamIsBoundsChecked();
     void stereoAudioChannelLayout();
@@ -46,6 +49,61 @@ QString TestMuxer::videoPathFor(const QString& name) const {
     // With an explicit output directory set, the muxer writes <dir>/<name>.mkv
     // (the "videos" subfolder is only appended for the default Documents path).
     return m_home.path() + "/" + name + ".mkv";
+}
+
+// ── recordWriteOutcome threshold / latch / reset tests ─────────────────────
+// These tests call the private helper directly via the TestMuxer friend seam.
+// No real recording is started; the muxer is never init()'d.
+
+void TestMuxer::recordWriteOutcomeThresholdAndLatch()
+{
+    Muxer m;
+    // Two failures — below the threshold of 3 — must NOT trip the flag.
+    m.recordWriteOutcome(true, "x");
+    m.recordWriteOutcome(true, "x");
+    QVERIFY(!m.hasFatalWriteError());
+    QCOMPARE(m.fatalWriteMessage(), QString());
+
+    // Third consecutive failure reaches kFatalWriteThreshold: flag is set.
+    m.recordWriteOutcome(true, "x");
+    QVERIFY(m.hasFatalWriteError());
+    QVERIFY(!m.fatalWriteMessage().isEmpty());
+}
+
+void TestMuxer::recordWriteOutcomeResetOnSuccess()
+{
+    Muxer m;
+    // Two failures — not yet fatal.
+    m.recordWriteOutcome(true, "x");
+    m.recordWriteOutcome(true, "x");
+    QVERIFY(!m.hasFatalWriteError());
+
+    // A success resets the consecutive counter.
+    m.recordWriteOutcome(false, nullptr);
+
+    // Two more failures — counter restarted from 0, still below threshold.
+    m.recordWriteOutcome(true, "x");
+    m.recordWriteOutcome(true, "x");
+    QVERIFY(!m.hasFatalWriteError());
+}
+
+void TestMuxer::recordWriteOutcomeInitClears()
+{
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+
+    // Drive the muxer into a fatal state via the helper.
+    m.recordWriteOutcome(true, "x");
+    m.recordWriteOutcome(true, "x");
+    m.recordWriteOutcome(true, "x");
+    QVERIFY(m.hasFatalWriteError());
+
+    // A successful init() must reset the flag and counter.
+    const QStringList names{QStringLiteral("A")};
+    QVERIFY(m.init(QStringLiteral("olr_unit_init_clears"), 1, 320, 240, 30, names, 48000, 2));
+    QVERIFY(!m.hasFatalWriteError());
+    QCOMPARE(m.fatalWriteMessage(), QString());
+    m.close();
 }
 
 void TestMuxer::initBuildsTrackLayout() {
