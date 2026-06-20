@@ -11,7 +11,14 @@ SRC="${1:?ndi_marker_mkv_source required}"
 PLAY="${2:?play_harness required}"
 PROBE="${3:?ndi_recv_probe required}"
 SECONDS_RUN="${OLR_NDI_PLAYBACK_SECONDS:-6}"
-SENDER="OLR NDI Playback Probe $$"
+# Output bus under test: feed (default) | pgm | multiview. play_harness routes the worker's
+# OutputBusEngine render of this bus to the NdiOutputSink. For a single-feed marker at the
+# source's own size, pgm (selected feed) and the 1-cell multiview composite are identity
+# copies, so the full-frame marker stays decodable and the same gate applies to every bus.
+BUS="${OLR_NDI_OUTPUT_BUS:-feed}"
+case "$BUS" in feed|pgm|multiview) ;; *) echo "FAIL: bad OLR_NDI_OUTPUT_BUS='$BUS'"; exit 1 ;; esac
+SENDER="OLR NDI Playback ${BUS} $$"
+echo "[ndi-playback] bus=${BUS} seconds=${SECONDS_RUN}"
 
 command -v ffmpeg >/dev/null || { echo "SKIP: ffmpeg not found"; exit "$SKIP"; }
 
@@ -34,8 +41,9 @@ if ! ffmpeg -loglevel error -y \
     echo "FAIL: ffmpeg mux"; exit 1
 fi
 
-# 3. Play it with NDI output enabled (background); give the source time to register.
-OLR_NDI_OUTPUT_SENDER="$SENDER" "$PLAY" "$WORK/marker.mkv" play1x 1 > "$WORK/play.log" 2>&1 &
+# 3. Play it with NDI output enabled on the selected bus (background); give it time to register.
+OLR_NDI_OUTPUT_SENDER="$SENDER" OLR_NDI_OUTPUT_BUS="$BUS" \
+    "$PLAY" "$WORK/marker.mkv" play1x 1 > "$WORK/play.log" 2>&1 &
 PLAY_PID=$!
 sleep 2
 if ! kill -0 "$PLAY_PID" 2>/dev/null; then

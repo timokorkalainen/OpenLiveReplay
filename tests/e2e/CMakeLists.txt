@@ -98,6 +98,10 @@ set_tests_properties(e2e_ndi_output PROPERTIES
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
 
+# Tier (b) feed bus (default) + the pgm and multiview output buses. Each drives the worker's
+# OutputBusEngine render of that bus (renderSingleSource / renderPgm / renderMultiview) through a
+# real NdiOutputSink to the receiver probe, so every broadcast output bus is validated over real
+# NDI, not just feed(0). play_harness reads OLR_NDI_OUTPUT_BUS.
 add_test(NAME e2e_ndi_playback
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
         "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
@@ -107,6 +111,28 @@ set_tests_properties(e2e_ndi_playback PROPERTIES
     TIMEOUT 180
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+
+add_test(NAME e2e_ndi_playback_pgm
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+        "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_playback_pgm PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "OLR_NDI_OUTPUT_BUS=pgm")
+
+add_test(NAME e2e_ndi_playback_multiview
+    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+        "$<TARGET_FILE:ndi_recv_probe>")
+set_tests_properties(e2e_ndi_playback_multiview PROPERTIES
+    LABELS "ndi-output"
+    TIMEOUT 180
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    ENVIRONMENT "OLR_NDI_OUTPUT_BUS=multiview")
 
 add_test(NAME e2e_ndi_pipe
     COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_e2e_pipe.sh"

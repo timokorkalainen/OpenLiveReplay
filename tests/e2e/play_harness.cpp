@@ -78,17 +78,33 @@ int main(int argc, char** argv) {
     PlaybackWorker worker(providers, &transport, &audio);
     worker.openFile(file);
     worker.setActiveAudioView(0); // route audio for view 0
-    // Tier (b): enable a real NDI output on the feed(0) bus when requested, so the worker's
-    // decode->cache->output-bus->NdiOutputSink path is exercised end to end.
+    // Tier (b): enable a real NDI output when requested, so the worker's
+    // decode->cache->output-bus->NdiOutputSink path is exercised end to end. The output bus is
+    // selectable via OLR_NDI_OUTPUT_BUS (feed|pgm|multiview, default feed) so each broadcast
+    // output bus is validated over real NDI, not just feed(0):
+    //   feed      -> renderSingleSource(feed 0)            (full frame)
+    //   pgm       -> renderPgm(selectedFeedIndex, def 0)   (selected feed, full frame)
+    //   multiview -> renderMultiview()/composeGrid()       (grid; 1:1 for a single feed)
+    // For a single-feed marker playback at the source's own dimensions, pgm and the 1-cell
+    // multiview composite are both identity copies, so the full-frame marker stays decodable
+    // and the receiver probe can apply the same continuity/sync gate to every bus.
     const QByteArray ndiSender = qgetenv("OLR_NDI_OUTPUT_SENDER");
     if (!ndiSender.isEmpty()) {
+        const QByteArray busEnv = qgetenv("OLR_NDI_OUTPUT_BUS").trimmed().toLower();
+        OutputBusId bus = OutputBusId::feed(0);
+        if (busEnv == "pgm")
+            bus = OutputBusId::pgm();
+        else if (busEnv == "multiview")
+            bus = OutputBusId::multiview();
         OutputTargetAssignment ndi;
         ndi.id = QStringLiteral("ndi-tier-b");
-        ndi.sourceBus = OutputBusId::feed(0);
+        ndi.sourceBus = bus;
         ndi.kind = OutputTargetKind::Ndi;
         ndi.enabled = true;
         ndi.settings.insert(QStringLiteral("senderName"), QString::fromUtf8(ndiSender));
         worker.setExternalOutputTargets({ndi});
+        fprintf(stderr, "[play_harness] NDI output bus=%s\n",
+                busEnv.isEmpty() ? "feed" : busEnv.constData());
     }
     worker.start();
 
