@@ -342,8 +342,7 @@ void Muxer::writePacket(AVPacket* pkt) {
     m_qCv.notify_one();
 }
 
-void Muxer::recordWriteOutcome(bool failed, const char* errLabel)
-{
+void Muxer::recordWriteOutcome(bool failed, const char* errLabel) {
     if (failed) {
         ++m_consecutiveWriteErrors;
         if (m_consecutiveWriteErrors >= kFatalWriteThreshold &&
@@ -359,8 +358,7 @@ void Muxer::recordWriteOutcome(bool failed, const char* errLabel)
     }
 }
 
-void Muxer::writerLoop()
-{
+void Muxer::writerLoop() {
     for (;;) {
         AVPacket* pkt = nullptr;
         {

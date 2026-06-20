@@ -55,8 +55,7 @@ QString TestMuxer::videoPathFor(const QString& name) const {
 // These tests call the private helper directly via the TestMuxer friend seam.
 // No real recording is started; the muxer is never init()'d.
 
-void TestMuxer::recordWriteOutcomeThresholdAndLatch()
-{
+void TestMuxer::recordWriteOutcomeThresholdAndLatch() {
     Muxer m;
     // Two failures — below the threshold of 3 — must NOT trip the flag.
     m.recordWriteOutcome(true, "x");
@@ -70,8 +69,7 @@ void TestMuxer::recordWriteOutcomeThresholdAndLatch()
     QVERIFY(!m.fatalWriteMessage().isEmpty());
 }
 
-void TestMuxer::recordWriteOutcomeResetOnSuccess()
-{
+void TestMuxer::recordWriteOutcomeResetOnSuccess() {
     Muxer m;
     // Two failures — not yet fatal.
     m.recordWriteOutcome(true, "x");
@@ -87,8 +85,7 @@ void TestMuxer::recordWriteOutcomeResetOnSuccess()
     QVERIFY(!m.hasFatalWriteError());
 }
 
-void TestMuxer::recordWriteOutcomeInitClears()
-{
+void TestMuxer::recordWriteOutcomeInitClears() {
     Muxer m;
     m.setOutputDirectory(m_home.path());
 
