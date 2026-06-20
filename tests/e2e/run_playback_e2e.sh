@@ -62,23 +62,45 @@ VIDEO_FILTER="color=c=black:s=640x480:r=30,geq=lum='if(lt(mod(T,1),0.06),255,16)
 AUDIO_FILTER="sine=frequency=1000:sample_rate=48000,volume='if(lt(mod(t,1),0.1),1,0)':eval=frame"
 
 start_producer() {
+    # $3: optional video codec (default: libx264). This is the SRT/mpegts WIRE
+    # codec the engine ingests — it does NOT affect the recorded fixture codec.
+    # record_harness always writes an Mpeg2Software mezzanine (its default),
+    # so the pre-roll bank always finds an MPEG-2 fixture regardless of $3.
+    local vcodec="${3:-libx264}"
+    local extra_opts=""
+    if [ "$vcodec" = "libx264" ]; then
+        extra_opts="-preset ultrafast -tune zerolatency"
+    fi
+    # shellcheck disable=SC2086
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "$1" \
         -f lavfi -i "$2" \
         -ac 2 \
-        -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+        -c:v "$vcodec" $extra_opts -pix_fmt yuv420p -g 30 -b:v 4M \
         -c:a aac -b:a 128k \
         -f mpegts "udp://127.0.0.1:${UDP_PORT}?pkt_size=1316" &
     FFPID=$!
 }
 
-start_producer "$VIDEO_FILTER" "$AUDIO_FILTER"
+# PRODUCER_VCODEC controls the SRT wire format only — it does NOT change the
+# recorded fixture codec. record_harness always records an Mpeg2Software
+# mezzanine by default (no --codec flag passed here), so the pre-roll bank
+# always decodes MPEG-2 and the armed-cut gate always exercises the pre-roll
+# staging path. The armedcut override to mpeg2video keeps the SRT ingest path
+# software-decodable and production-representative; all other scenarios use
+# libx264 for the wire. Neither path exercises the pre-roll H.264 guard
+# (that guard skips H.264 fixtures; none appear here).
+PRODUCER_VCODEC="libx264"
+[ "$SCENARIO" = "armedcut" ] && PRODUCER_VCODEC="mpeg2video"
+
+start_producer "$VIDEO_FILTER" "$AUDIO_FILTER" "$PRODUCER_VCODEC"
 sleep 0.5
 # If the fancy filter chain died immediately, fall back to a plain source.
 if ! kill -0 "$FFPID" 2>/dev/null; then
     echo "[pb-e2e] flash/beep filter unsupported; falling back to testsrc2+sine"
     start_producer "testsrc2=size=640x480:rate=30" \
-                   "sine=frequency=1000:sample_rate=48000"
+                   "sine=frequency=1000:sample_rate=48000" \
+                   "$PRODUCER_VCODEC"
     sleep 0.5
 fi
 

@@ -149,6 +149,9 @@ ApplicationWindow {
             // handler (which clears recordingError) cannot erase it (C2).
             appWindow.showRecordingWarning(msg)
         }
+        function onRecordingStopped() {
+            appWindow.recordingWarningText = ""
+        }
     }
 
     Timer {

@@ -297,7 +297,7 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
         m_outputRuntime = std::make_unique<OutputRuntime>(
-            FrameRate::fromFraction(fps(), 1), m_outputFeedCount, m_outputWidth, m_outputHeight);
+            m_transport->frameRate(), m_outputFeedCount, m_outputWidth, m_outputHeight);
         m_outputRuntime->setSnapshotProvider([this]() { return makeOutputSnapshot(); });
     }
     m_outputTargetsDirty.store(true, std::memory_order_relaxed);
@@ -385,10 +385,13 @@ void PlaybackWorker::rebuildOutputEndpoints() {
             sink = std::make_unique<QueuedOutputSink>(std::make_unique<NdiOutputSink>());
             break;
         case OutputTargetKind::QtPreview:
+            break; // handled by the preview loop above; not expected in external list
         case OutputTargetKind::DeckLinkSdiHdmi:
         case OutputTargetKind::DeckLinkIpSt2110:
         case OutputTargetKind::Omt:
         case OutputTargetKind::Aja:
+            qWarning() << "OutputTarget kind" << outputTargetKindName(assignment.kind)
+                       << "is not yet implemented; sink will be skipped";
             break;
         }
         if (!sink) continue;
@@ -997,6 +1000,25 @@ bool PlaybackWorker::openPrerollContext() {
         if (codecParams->codec_type != AVMEDIA_TYPE_VIDEO) continue;
         if (feedIndex >= m_providers.size()) break;
 
+        // H.264: hardware-only licensing constraint — NEVER software-decode.
+        // Mirror the primary bank guard exactly: skip the stream without advancing
+        // feedIndex so pre-roll feedIndex N still maps to the same provider as
+        // primary providerIndex N. (Pre-roll has no NativeVideoDecoder wiring, so
+        // H.264 sources simply get no pre-roll staging — the live primary bank keeps
+        // supplying those feeds after the cut swap.)
+        //
+        // Homogeneous-codec invariant: OLR recordings are single-codec by
+        // construction — recorder_engine/muxer.cpp applies one VideoCodecChoice
+        // to all video tracks. The two layouts OLR produces are therefore:
+        //   • all-H.264  → every video stream skipped here → pre-roll bank empty
+        //                  → armed cut disabled (caller checks m_prerollBank.isEmpty())
+        //   • all-MPEG-2 → no H.264 skip → feedIndex advances in lock-step with
+        //                  the primary bank → correct 1:1 provider mapping
+        // A hypothetical externally-authored MIXED-codec file is the only case
+        // where feedIndex could diverge from the primary bank; that is out of
+        // scope and not supported.
+        if (codecParams->codec_id == AV_CODEC_ID_H264) continue;
+
         const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
         if (!codec) continue;
         AVCodecContext* cctx = avcodec_alloc_context3(codec);
@@ -1059,10 +1081,12 @@ bool PlaybackWorker::openPrerollContext() {
 }
 
 // UI-thread-safe: atomic stores only, never blocks. Arms a scheduled atomic cut
-// to targetMs. No-op (feature unavailable) if the pre-roll context failed to
-// open. v1 is single-clip (ms-only; same currently-open file).
-void PlaybackWorker::armNextCut(int64_t targetMs) {
-    if (!m_prerollFmtCtx) return; // pre-roll disabled — feature unavailable
+// to targetMs. Returns false (feature unavailable) if the pre-roll context
+// failed to open (e.g. H.264 recordings: the pre-roll bank is hardware-only-
+// guarded and stays empty). Returns true when the cut is armed or queued for
+// re-arm. v1 is single-clip (ms-only; same currently-open file).
+bool PlaybackWorker::armNextCut(int64_t targetMs) {
+    if (!m_prerollFmtCtx) return false; // pre-roll disabled — feature unavailable
     // Safe re-arm queue: a re-arm (rapid double "Recall") while a cut is already
     // armed/in-flight must NOT reset the staging state from this (UI) thread. The
     // worker fills m_prerollStagingCache lock-free and only stops once
@@ -1080,11 +1104,12 @@ void PlaybackWorker::armNextCut(int64_t targetMs) {
         m_pendingRearmSeekGen.store(m_seekGeneration.load(std::memory_order_acquire),
                                     std::memory_order_relaxed);
         m_hasPendingRearm.store(true, std::memory_order_release);
-        return;
+        return true; // queued for re-arm; the cut will still navigate to targetMs
     }
     // Fresh arm: armNextCut and seekTo are both UI-thread, so reading m_seekGeneration
     // here is a coherent baseline (no seek can interleave between this read and the arm).
     armCutInternal(targetMs, m_seekGeneration.load(std::memory_order_acquire));
+    return true;
 }
 
 // Arm the cut state. Caller guarantees no cut is in flight (m_cutArmed false), so
@@ -2005,7 +2030,7 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
 
     QVector<PendingDeliver> pending;
     const bool outputGraphActive = m_outputRuntime != nullptr;
-    const FrameRate rate = FrameRate::fromFraction(fps(), 1);
+    const FrameRate rate = m_transport->frameRate();
     const qint64 outputFrameIndex = rate.msToFrameIndex(P);
     {
         QMutexLocker bufferLocker(&m_bufferMutex);

@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
 
 #ifdef __APPLE__
@@ -62,6 +63,12 @@ public:
     AVStream* getStream(int index);
     void close();
 
+    bool hasFatalWriteError() const { return m_fatalWriteError.load(std::memory_order_acquire); }
+    QString fatalWriteMessage() const {
+        std::lock_guard<std::mutex> lk(m_fatalMsgMutex);
+        return QString::fromStdString(m_fatalWriteMsg);
+    }
+
     int audioTrackOffset() const { return m_audioTrackOffset; }
     int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
     int telemetryTrackOffset() const { return m_telemetryTrackOffset; }
@@ -79,6 +86,12 @@ private:
     // init() and close(), so the write path needs no lock against the
     // AVFormatContext.
     void writerLoop();
+
+    // Records a single write outcome and drives the consecutive-failure latch.
+    // Called ONLY from the writer thread; no lock needed for the counter.
+    // failed==true: increment counter; on reaching kFatalWriteThreshold, set the
+    // fatal flag (once). failed==false: reset the counter to 0.
+    void recordWriteOutcome(bool failed, const char* errLabel);
 
     // Writes the deferred MKV header exactly once, materialising the winning
     // start-timecode candidate into the "timecode" tag (format-level + each video
@@ -162,6 +175,19 @@ private:
     std::mutex m_qMutex;
     std::condition_variable m_qCv;
     std::atomic<bool> m_writerRunning{false};
+
+    // Set on the FIRST sustained write failure (kFatalWriteThreshold consecutive
+    // av_write_frame errors on any stream). Written once; reset only on init().
+    // m_consecutiveWriteErrors is touched ONLY on the writer thread: plain int.
+    int m_consecutiveWriteErrors = 0;
+    std::atomic<bool> m_fatalWriteError{false};
+    std::string m_fatalWriteMsg; // guarded by m_fatalMsgMutex
+    mutable std::mutex m_fatalMsgMutex;
+    static constexpr int kFatalWriteThreshold = 3;
+
+#ifdef OLR_UNIT_TEST
+    friend class TestMuxer;
+#endif
 };
 
 #endif // MUXER_H

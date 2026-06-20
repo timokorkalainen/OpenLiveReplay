@@ -166,6 +166,10 @@ target_link_libraries(olr_test_engine
            "${OLR_FFMPEG_AVUTIL_LIBRARY}" "${OLR_FFMPEG_SWSCALE_LIBRARY}"
            "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
     PRIVATE olr_warnings olr_sanitize)
+# Expose the friend-class seam to every TU that sees olr_test_engine (the
+# library TU itself and all linking test executables). Production app targets
+# never link olr_test_engine, so this define never reaches production code.
+target_compile_definitions(olr_test_engine PUBLIC OLR_UNIT_TEST=1)
 
 if(APPLE)
     target_sources(olr_test_engine PRIVATE
