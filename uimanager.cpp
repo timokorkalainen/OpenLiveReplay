@@ -1968,6 +1968,18 @@ bool UIManager::playPlaylist(int fromIndex) {
     if (!m_transport || !m_playbackWorker) return false;
     const QVector<ReplayEntry> entries = m_playlist.entries();
     if (entries.isEmpty() || fromIndex < 0 || fromIndex >= entries.size()) return false;
+    // Fail fast when the frame-perfect armed cut is unavailable (e.g. H.264: no
+    // pre-roll bank). Without it the boundary cut never fires and the rundown would
+    // silently dead-end on the first entry, so refuse rather than mislead.
+    if (!m_playbackWorker->armedCutAvailable()) return false;
+    // Every NON-final entry must have a marked out-point (>= its in) to bound its
+    // boundary; an unmarked mid-list out (the markIn default, or hand-edited/loaded
+    // data) would stall the rundown there. Refuse so the operator marks the out first.
+    for (int i = fromIndex; i + 1 < entries.size(); ++i)
+        if (entries[i].outMs < entries[i].inMs) return false;
+    // A second Play while a rundown is active: clean stop-then-start (also removes
+    // the m_playoutCutBaseline-vs-in-flight-cut race a bare re-start would have).
+    stopPlaylistPlayout();
 
     m_playout.start(entries, fromIndex);
     const ReplayEntry first = entries[fromIndex];
@@ -1995,23 +2007,28 @@ void UIManager::onPlayoutTick() {
         return;
     }
     // A boundary cut fired (the worker re-based the playhead to the next in-point):
-    // advance the rundown and apply the new entry's speed.
+    // advance the rundown and apply the new entry's speed. Reconcile the FULL delta
+    // (not just one) so the index never desyncs from the fired-cut count even if two
+    // cuts were observed in one interval.
     const int cuts = m_playbackWorker->cutsFired();
-    if (cuts > m_playoutCutBaseline) {
-        m_playoutCutBaseline = cuts;
+    while (m_playoutCutBaseline < cuts) {
+        ++m_playoutCutBaseline;
         const auto cur = m_playout.onBoundaryFired();
         if (cur.has_value()) m_transport->setSpeed(cur->speed);
     }
     // On the final entry there is no further boundary — let normal playback continue
-    // forward (the recording keeps growing); nothing more to monitor.
+    // forward (the recording keeps growing). Fully stop playout so the monitor idles
+    // and playlistPlayoutActive() reports false (it is no longer steering anything).
     if (m_playout.onFinalEntry()) {
-        m_playoutMonitor.stop();
+        stopPlaylistPlayout();
         return;
     }
-    // Arm the next boundary as the playhead nears the current entry's out-point.
+    // Arm the next boundary as the playhead nears the current entry's out-point. If
+    // arming ever fails (it should not once armedCutAvailable() gated the start),
+    // stop rather than silently dead-end — evaluate() has consumed its one-shot arm.
     const auto b =
         m_playout.evaluate(m_transport->currentPos(), m_transport->speed(), kPlayoutArmLeadMs);
-    if (b.valid) m_playbackWorker->armNextCut(b.targetMs, b.fireAtMs);
+    if (b.valid && !m_playbackWorker->armNextCut(b.targetMs, b.fireAtMs)) stopPlaylistPlayout();
 }
 
 void UIManager::updateUrl(int index, const QString& url) {

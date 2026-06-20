@@ -91,6 +91,12 @@ public:
     // position (e.g. a playlist entry's out-point) rather than as-soon-as-staged,
     // for frame-perfect playout transitions. -1 (default, e.g. a Recall) = fire ASAP.
     bool armNextCut(int64_t targetMs, int64_t fireAtPlayheadMs = -1);
+    // True if the frame-perfect armed cut is available (the pre-roll context opened).
+    // False on recordings without an all-intra pre-roll bank (e.g. H.264), where
+    // armNextCut returns false. Callers that depend on armed cuts (playlist playout)
+    // gate on this to fail fast rather than silently dead-end. Read from the UI
+    // thread, mirroring armNextCut's own m_prerollFmtCtx check.
+    bool armedCutAvailable() const { return m_prerollFmtCtx != nullptr; }
     // Direction-aware delivery (spec §5): forward delivers iff pts moved up,
     // reverse iff pts moved down (dir = +1 / -1).
     void deliverDueFrames(int64_t P, int dir);

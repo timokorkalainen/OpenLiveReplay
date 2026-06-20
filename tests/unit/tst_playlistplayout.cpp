@@ -19,6 +19,7 @@ private slots:
     void finalEntryArmsNothingAndPlaysForward();
     void leadScalesWithSpeed();
     void inactiveUntilStarted();
+    void entryWithoutOutPointArmsNoBoundary();
 };
 
 void TestPlaylistPlayout::armsBoundaryOnceWhenWithinTheLead() {
@@ -114,6 +115,18 @@ void TestPlaylistPlayout::inactiveUntilStarted() {
     QVERIFY(p.active());
     p.stop();
     QVERIFY(!p.active());
+}
+
+void TestPlaylistPlayout::entryWithoutOutPointArmsNoBoundary() {
+    // An entry with no marked out-point (outMs<0, the markIn default) cannot bound a
+    // boundary, so none is armed and playback flows forward. Correct for the FINAL
+    // entry (open-ended growing recording); for a MIDDLE entry it would dead-end the
+    // rundown, which the UIManager controller refuses at playPlaylist() time — this
+    // pins the pure-class behavior the controller relies on.
+    PlaylistPlayout p;
+    p.start({entry(2000, -1, 1.0), entry(12000, 14000, 1.0)}, 0); // entry 0 has no out
+    QVERIFY(!p.evaluate(3000, 1.0, 1500).valid);
+    QVERIFY(!p.evaluate(50000, 1.0, 1500).valid); // even far past, never arms
 }
 
 QTEST_GUILESS_MAIN(TestPlaylistPlayout)

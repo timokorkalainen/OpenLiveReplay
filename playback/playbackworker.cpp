@@ -1277,6 +1277,16 @@ void PlaybackWorker::fillStaging() {
         // already imminent or past, fall back to firing as-soon-as-staged).
         const int64_t fireAt = m_armedFireAtMs.load();
         if (fireAt >= 0 && m_outputRuntime) {
+            // outputFrameForPlayheadMs / dispatcherNextOutputFrameIndex lock the
+            // output runtime internally; m_outputRuntime itself is worker-thread-owned
+            // (reset only on the worker thread; the dtor joins first), so reading the
+            // raw pointer here is safe without m_outputRuntimeMutex, as elsewhere on
+            // this path. atOut == -1 means the play epoch is not yet established
+            // (transient, e.g. just after a prior cut's resetPlayEpoch); during a
+            // running rundown the epoch is long settled before any boundary is staged,
+            // so we keep the asap-clamp here (fire-at-out-point degrades to as-soon-as-
+            // staged in that unreachable window) — the e2e landing gate would surface
+            // it if it ever occurred.
             const qint64 atOut = m_outputRuntime->outputFrameForPlayheadMs(fireAt);
             if (atOut > asapFrame) fireFrame = atOut;
         }

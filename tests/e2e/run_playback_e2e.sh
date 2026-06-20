@@ -176,6 +176,7 @@ heldFramesDelta="$(get heldFramesDelta)"
 maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 cutsFired="$(get cutsFired)"
 cutFollowReposition="$(get cutFollowReposition)"
+maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -191,6 +192,7 @@ cutFollowReposition="$(get cutFollowReposition)"
 [ -n "$maxClockDivergenceMs" ] || maxClockDivergenceMs="?"
 [ -n "$cutsFired" ] || cutsFired="?"
 [ -n "$cutFollowReposition" ] || cutFollowReposition="?"
+[ -n "$maxBoundaryLandingErrMs" ] || maxBoundaryLandingErrMs="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -605,6 +607,18 @@ case "$SCENARIO" in
             echo "FAIL: playlist repositioned too much (reposition=$reposition, expected <=2 = warmup) — a boundary fell back to a coarse seek"
             fail=1
         fi
+        # FRAME-PERFECT LANDING (the assertion the self-referential divergence gate
+        # misses): each boundary cut must re-base the playhead to the next entry's
+        # in-point. maxBoundaryLandingErrMs is max|landed playhead - expected in-point|
+        # over the boundaries, sampled up to one monitor interval after each fire.
+        # Frame-perfect lands within a few ms (observed ~3-7ms); the bound absorbs the
+        # monitor sampling lag + sub-frame overshoot. A speed-blind fire-frame (the
+        # slow-mo boundary would land ~1s off) or a wrong re-base target fails here
+        # while still passing divergence/placeholder.
+        if ! num "$maxBoundaryLandingErrMs" || [ "$maxBoundaryLandingErrMs" -gt 80 ]; then
+            echo "FAIL: playlist boundary landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80) — a cut did not land at the next entry's in-point (fire-frame/speed bug)"
+            fail=1
+        fi
         ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
@@ -612,7 +626,7 @@ case "$SCENARIO" in
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"
