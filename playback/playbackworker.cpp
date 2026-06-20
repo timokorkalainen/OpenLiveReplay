@@ -385,10 +385,13 @@ void PlaybackWorker::rebuildOutputEndpoints() {
             sink = std::make_unique<QueuedOutputSink>(std::make_unique<NdiOutputSink>());
             break;
         case OutputTargetKind::QtPreview:
+            break; // handled by the preview loop above; not expected in external list
         case OutputTargetKind::DeckLinkSdiHdmi:
         case OutputTargetKind::DeckLinkIpSt2110:
         case OutputTargetKind::Omt:
         case OutputTargetKind::Aja:
+            qWarning() << "OutputTarget kind" << outputTargetKindName(assignment.kind)
+                       << "is not yet implemented; sink will be skipped";
             break;
         }
         if (!sink) continue;
