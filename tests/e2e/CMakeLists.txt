@@ -309,11 +309,24 @@ add_test(NAME e2e_play_armedcut
 add_test(NAME e2e_play_armedcut_back
     COMMAND bash "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-back 2 23500)
+# Manual-seek-vs-in-flight-cut policy: arm a cut, then issue an operator seekTo to
+# a different target before it fires — the seek must WIN (cutsFired==0, the seek
+# services the jump). Port 23502 (UDP 23503) is the next clear port after
+# armedcut-back (23500), disjoint from the record/sync/av-sync/native ranges.
+add_test(NAME e2e_play_armedcut_seekrace
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-seekrace 2 23502)
+# Combined recall+seek: arm a cut, queue a re-arm, then manual seek — the seek must
+# cancel BOTH (cutsFired==0). Covers the queue-time generation gating. Port 23504.
+add_test(NAME e2e_play_armedcut_rearm_seek
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-rearm-seek 2 23504)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
     e2e_play_seekflash e2e_play_farback e2e_play_armedcut e2e_play_armedcut_back
+    e2e_play_armedcut_seekrace e2e_play_armedcut_rearm_seek
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180

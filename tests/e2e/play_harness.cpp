@@ -379,6 +379,59 @@ int main(int argc, char** argv) {
             // frame / heldFrames spike) could surface if the resync ever lagged.
             QTimer::singleShot(9000, &app, finish);
 
+        } else if (scen == "armedcut-seekrace") {
+            // Manual-seek-vs-in-flight-cut policy: arm a cut, then issue an explicit
+            // operator seekTo to a DIFFERENT target before the cut fires. The seek
+            // must WIN — the cut aborts (cutsFired==0), the seek services the jump
+            // via repositionTo (reposition>=1), and no gray is painted. A regression
+            // (cut fires despite the seek) would snap the output back to the cut
+            // target the operator moved away from.
+            transport.setSpeed(1.0);
+            transport.seek(0);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&, basePh]() {
+                *basePh = worker.outputStats().placeholderFrames;
+                fprintf(stderr, "### armedcut-seekrace basePh=%lld; arming cut to %lldms ###\n",
+                        (long long) *basePh, (long long) (durMs / 2));
+                worker.armNextCut(durMs / 2);
+            });
+            // Manual seek ~80ms later — while the cut is still staging (it fires
+            // ~kStagingSpan+kCutLead after arming), so the generation bump aborts it.
+            QTimer::singleShot(1080, &app, [&]() {
+                worker.seekTo(durMs / 5);
+                fprintf(stderr,
+                        "### armedcut-seekrace manual seekTo %lldms (must cancel the cut) ###\n",
+                        (long long) (durMs / 5));
+            });
+            QTimer::singleShot(5000, &app, finish);
+
+        } else if (scen == "armedcut-rearm-seek") {
+            // COMBINED recall+seek: arm a cut, queue a re-arm (second Recall while
+            // the first cut is in flight), THEN manual seek. The seek is the newest
+            // explicit action — both the in-flight cut and the queued re-arm must be
+            // cancelled (cutsFired==0). Exercises the queue-time generation gating
+            // (the worker must drop a re-arm whose queue-time seek gen was superseded).
+            transport.setSpeed(1.0);
+            transport.seek(0);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&, basePh]() {
+                *basePh = worker.outputStats().placeholderFrames;
+                fprintf(stderr, "### armedcut-rearm-seek basePh=%lld; arming cut to %lldms ###\n",
+                        (long long) *basePh, (long long) (durMs / 2));
+                worker.armNextCut(durMs / 2);
+            });
+            QTimer::singleShot(1050, &app, [&]() {
+                worker.armNextCut(durMs / 3); // queued re-arm (cut still in flight)
+                fprintf(stderr, "### armedcut-rearm-seek queued re-arm to %lldms ###\n",
+                        (long long) (durMs / 3));
+            });
+            QTimer::singleShot(1100, &app, [&]() {
+                worker.seekTo(durMs / 5); // manual seek — must cancel cut AND re-arm
+                fprintf(stderr, "### armedcut-rearm-seek manual seekTo %lldms (cancels both) ###\n",
+                        (long long) (durMs / 5));
+            });
+            QTimer::singleShot(5000, &app, finish);
+
         } else {
             fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());
             // Still print counters (all zero) so the driver gets a line, then
