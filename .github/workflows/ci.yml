@@ -313,13 +313,13 @@ jobs:
           - sanitizer: "address;undefined"
             label: asan-ubsan
             advisory: false
-            build_targets: "tst_muxer tst_mpegtsparser tst_h26xaccessunit tst_nativeaacdecoder tst_audioframequeue"
-            ctest_regex: "^(tst_muxer|tst_mpegtsparser|tst_h26xaccessunit|tst_nativeaacdecoder|tst_audioframequeue)$"
+            build_targets: "tst_muxer tst_mpegtsparser tst_h26xaccessunit tst_nativeaacdecoder tst_audioframequeue tst_outputdispatcher tst_outputbusengine tst_outputruntime"
+            ctest_regex: "^(tst_muxer|tst_mpegtsparser|tst_h26xaccessunit|tst_nativeaacdecoder|tst_audioframequeue|tst_outputdispatcher|tst_outputbusengine|tst_outputruntime)$"
           - sanitizer: "thread"
             label: tsan
             advisory: true
-            build_targets: "tst_trackbuffer tst_audioframequeue"
-            ctest_regex: "^(tst_trackbuffer|tst_audioframequeue)$"
+            build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher"
+            ctest_regex: "^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher)$"
     continue-on-error: ${{ matrix.advisory }}
     steps:
       - uses: actions/checkout@v4
