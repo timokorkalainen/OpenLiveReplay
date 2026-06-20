@@ -50,6 +50,7 @@ check_bus() {
 
 check_bus feed
 check_bus multiview
+check_bus pgm
 
 runtime_line="$(grep "^RUNTIME " <<<"$OUT" || true)"
 if [ -z "$runtime_line" ]; then
