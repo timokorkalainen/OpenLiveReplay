@@ -10,7 +10,7 @@ OutputFrameCache::OutputFrameCache(int feedCount, int placeholderWidth, int plac
 
 void OutputFrameCache::insertVideoFrame(const FrameHandle& frame) {
     const FramePayloadKey& key = frame.metadata().key;
-    if (key.feedIndex < 0 || key.feedIndex >= m_video.size() || !frame.isValid()) return;
+    if (key.feedIndex < 0 || key.feedIndex >= m_video.size() || !frame.isPresentable()) return;
     auto& list = m_video[key.feedIndex];
     auto it =
         std::lower_bound(list.begin(), list.end(), key.ptsMs, [](const FrameHandle& f, qint64 pts) {

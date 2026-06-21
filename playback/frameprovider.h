@@ -9,6 +9,8 @@
 #include <QPointer>
 #include <QList>
 
+class FrameHandle;
+
 class FrameProvider : public QObject
 {
     Q_OBJECT
@@ -25,6 +27,7 @@ public:
 
     // This method is called by the PlaybackWorker to push new frames to the UI
     void deliverFrame(const QVideoFrame &frame);
+    void deliverHandle(const FrameHandle& handle);
 
     // Retrieve the latest frame as an image (for screenshots)
     QImage latestImage() const;

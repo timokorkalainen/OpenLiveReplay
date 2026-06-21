@@ -14,6 +14,7 @@ option(OLR_BUILD_TESTS "Build the OpenLiveReplay test suite" OFF)
 option(OLR_WERROR "Treat warnings as errors for first-party targets" ON)
 option(OLR_WCONVERSION "Also enable the -Wconversion/-Wsign-conversion family (large backlog; opt-in)" OFF)
 option(OLR_BUILD_FUZZERS "Build libFuzzer harnesses for the input parsers (needs clang+libFuzzer)" OFF)
+option(OLR_GPU_PIPELINE "Build the GPU-resident pipeline (RHI spine, shaders), default off" OFF)
 option(OLR_BUILD_GPU_PROBES "Build Phase-0 GPU measurement probes (links Qt RHI; not shipped)" OFF)
 set(OLR_SANITIZER "" CACHE STRING
     "Sanitizers to enable, e.g. address, thread, undefined, or 'address;undefined'")
@@ -140,6 +141,12 @@ endif()
 
 # 1. Find Qt
 find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network WebSockets)
+if(OLR_GPU_PIPELINE)
+    # RHI lives in Qt6::GuiPrivate (<rhi/qrhi.h> is a semi-public Gui header);
+    # qsb / qt_add_shaders come from Qt6::ShaderTools. This path is coupled to
+    # the project's Qt 6.10.x toolchain by design.
+    find_package(Qt6 REQUIRED COMPONENTS Gui GuiPrivate ShaderTools)
+endif()
 qt_standard_project_setup(REQUIRES 6.8)
 
 # All QML modules output under one dir so the build-time import path resolves every
@@ -228,6 +235,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/outputtypes.h
         playback/output/outputframeclock.h playback/output/outputframeclock.cpp
         playback/output/framepixelformat.h playback/output/colormetadata.h
+        playback/output/formatcanon.h playback/output/formatcanon.cpp
         playback/output/colormetadatapolicy.h playback/output/colormetadatapolicy.cpp
         playback/output/framehandle.h playback/output/framehandle.cpp
         playback/output/mediaframe.h
@@ -392,7 +400,10 @@ if(APPLE)
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm
-        recorder_engine/codec/nativevideoencoder_videotoolbox.mm)
+        recorder_engine/codec/nativevideoencoder_videotoolbox.mm
+        playback/gpu/gpusurface.h playback/gpu/gpusurface_apple.mm
+        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
+        playback/gpu/appleiosurface.h playback/gpu/applegpusurface_apple.mm)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -401,6 +412,7 @@ if(APPLE)
         "-framework VideoToolbox"
         "-framework CoreMedia"
         "-framework CoreFoundation"
+        "-framework IOSurface"
         "-framework CoreVideo")
 elseif(WIN32)
     target_sources(OpenLiveReplay PRIVATE
@@ -408,7 +420,12 @@ elseif(WIN32)
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp
-        recorder_engine/codec/nativevideoencoder_mediafoundation.cpp)
+        recorder_engine/codec/nativevideoencoder_mediafoundation.cpp
+        playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp
+        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
+        playback/output/win/wingpuimportedge.cpp
+        playback/output/win/d3d11gpusurface.cpp
+        playback/output/win/d3dfence.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -426,7 +443,28 @@ elseif(NOT WIN32)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/ingest/nativevideodecoder_stub.cpp
         recorder_engine/ingest/nativeaacdecoder_stub.cpp
-        recorder_engine/codec/nativevideoencoder_stub.cpp)
+        recorder_engine/codec/nativevideoencoder_stub.cpp
+        playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp
+        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
+        playback/output/win/wingpuimportedge_stub.cpp)
+endif()
+
+if(OLR_GPU_PIPELINE)
+    target_compile_definitions(OpenLiveReplay PRIVATE OLR_GPU_PIPELINE_BUILD=1)
+    target_link_libraries(OpenLiveReplay PRIVATE Qt6::GuiPrivate)
+    if(APPLE)
+        target_sources(OpenLiveReplay PRIVATE
+            playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_apple.mm
+            playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/decodedonefence.h playback/gpu/decodedonefence_apple.mm
+            playback/gpu/vtkeepsurfaceimporter.h playback/gpu/vtkeepsurfaceimporter_apple.mm)
+        target_link_libraries(OpenLiveReplay PRIVATE "-framework Metal" "-framework QuartzCore")
+    else()
+        target_sources(OpenLiveReplay PRIVATE
+            playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp
+            playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/decodedonefence.h playback/gpu/decodedonefence_stub.cpp)
+    endif()
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)

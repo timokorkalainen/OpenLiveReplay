@@ -224,6 +224,7 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/output/outputtargetassignment.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/gpureadbacktelemetry.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/formatcanon.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputdispatcher.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/broadcastoutputstatus.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputruntime.cpp"
@@ -246,6 +247,70 @@ target_link_libraries(olr_test_playback
            "${OLR_FFMPEG_AVUTIL_LIBRARY}" "${OLR_FFMPEG_SWSCALE_LIBRARY}"
            "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
     PRIVATE olr_warnings olr_sanitize)
+if(APPLE)
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_apple.mm"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/applegpusurface_apple.mm")
+    target_link_libraries(olr_test_playback
+        PRIVATE "-framework CoreFoundation" "-framework CoreVideo" "-framework IOSurface")
+else()
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp")
+    if(WIN32)
+        target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/win/d3d11gpusurface.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
+        target_link_libraries(olr_test_playback
+            PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
+    endif()
+endif()
+
+if(OLR_GPU_PIPELINE)
+    target_compile_definitions(olr_test_playback PRIVATE OLR_GPU_PIPELINE_BUILD=1)
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp")
+    if(APPLE)
+        target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm")
+        target_link_libraries(olr_test_playback
+            PRIVATE Qt6::GuiPrivate "-framework Metal" "-framework QuartzCore")
+    else()
+        target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
+    endif()
+
+    qt_add_library(olr_test_gpu STATIC
+        "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
+    target_include_directories(olr_test_gpu PUBLIC "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(olr_test_gpu
+        PUBLIC Qt6::Core Qt6::Gui Qt6::GuiPrivate
+        PRIVATE olr_warnings olr_sanitize)
+    if(APPLE)
+        target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm")
+        target_link_libraries(olr_test_gpu
+            PUBLIC "-framework Metal" "-framework QuartzCore" "-framework CoreVideo"
+                   "-framework CoreFoundation" "-framework IOSurface")
+    endif()
+
+    qt_add_shaders(olr_test_gpu "olr_passthrough_shaders"
+        PREFIX "/olr/shaders"
+        BASE "${CMAKE_SOURCE_DIR}/playback/gpu/shaders"
+        FILES
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.vert"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.frag")
+endif()
 
 add_subdirectory(unit)
 if(APPLE OR WIN32)  # tst_ingestbackendselector is Apple/Windows-only (native ingest)

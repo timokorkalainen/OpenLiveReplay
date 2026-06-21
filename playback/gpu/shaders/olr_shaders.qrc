@@ -1,0 +1,7 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/olr/shaders">
+    <file alias="passthrough.vert.qsb">passthrough.vert.qsb</file>
+    <file alias="passthrough.frag.qsb">passthrough.frag.qsb</file>
+  </qresource>
+</RCC>

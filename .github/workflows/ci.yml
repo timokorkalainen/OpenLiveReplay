@@ -285,7 +285,7 @@ jobs:
           host: mac
           target: desktop
           arch: clang_64
-          modules: qtmultimedia qtwebsockets
+          modules: qtmultimedia qtwebsockets qtshadertools
           cache: true
 
       - name: Cache Homebrew downloads
@@ -320,6 +320,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Debug
           -DOLR_BUILD_TESTS=ON
           -DOLR_WERROR=ON
+          -DOLR_GPU_PIPELINE=ON
           -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
@@ -402,7 +403,7 @@ jobs:
           host: windows
           target: desktop
           arch: win64_mingw
-          modules: qtmultimedia qtwebsockets
+          modules: qtmultimedia qtwebsockets qtshadertools
           tools: tools_mingw1310 tools_ninja
           cache: true
 
@@ -498,7 +499,7 @@ jobs:
           host: linux
           target: desktop
           arch: linux_gcc_64
-          modules: qtmultimedia qtwebsockets
+          modules: qtmultimedia qtwebsockets qtshadertools
           cache: true
 
       - name: Install build deps
@@ -543,6 +544,33 @@ jobs:
       # -Werror diff in one run instead of one-per-push; still exits non-zero.
       - name: Build (app + tests)
         run: cmake --build build -- -k 0
+
+      - name: Shader toolchain compile (qsb / qsb bake)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-gpu -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DOLR_BUILD_TESTS=ON \
+            -DOLR_GPU_PIPELINE=ON \
+            -DCMAKE_C_COMPILER=gcc \
+            -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          cmake --build build-gpu --target olr_test_gpu
+          QSB="$QT_ROOT_DIR/bin/qsb"
+          for stage in vert frag; do
+            qsbfile="$(find build-gpu -name "passthrough.$stage.qsb" | head -1)"
+            test -n "$qsbfile" || { echo "missing passthrough.$stage.qsb"; exit 1; }
+            test -s "$qsbfile" || { echo "empty passthrough.$stage.qsb"; exit 1; }
+            dump="$("$QSB" --dump "$qsbfile")"
+            echo "$dump"
+            echo "$dump" | grep -q "SPIR-V" || { echo "no SPIR-V target in $stage"; exit 1; }
+            echo "$dump" | grep -q "MSL" || { echo "no MSL target in $stage"; exit 1; }
+            echo "$dump" | grep -q "HLSL" || { echo "no HLSL target in $stage"; exit 1; }
+            echo "$dump" | grep -q "GLSL" || { echo "no GLSL target in $stage"; exit 1; }
+          done
+          echo "Shader toolchain OK: pass-through .qsb baked multi-target."
 
       - name: ccache stats
         if: always()

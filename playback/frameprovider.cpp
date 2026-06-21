@@ -1,4 +1,5 @@
 #include "frameprovider.h"
+#include "playback/output/qtpreviewsink.h"
 #include <QtCore/qdebug.h>
 #include <QMetaObject>
 #include <QThread>
@@ -110,6 +111,12 @@ void FrameProvider::deliverFrame(const QVideoFrame &frame)
             }, Qt::QueuedConnection);
         }
     }
+}
+
+void FrameProvider::deliverHandle(const FrameHandle& handle) {
+    const QVideoFrame frame = QtPreviewSink::toQVideoFrame(handle);
+    if (!frame.isValid()) return;
+    deliverFrame(frame);
 }
 
 QImage FrameProvider::latestImage() const
