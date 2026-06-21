@@ -367,7 +367,8 @@ if(APPLE)
         recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm
         recorder_engine/codec/nativevideoencoder_videotoolbox.mm
         playback/gpu/gpusurface.h playback/gpu/gpusurface_apple.mm
-        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp)
+        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
+        playback/gpu/appleiosurface.h playback/gpu/applegpusurface_apple.mm)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -376,6 +377,7 @@ if(APPLE)
         "-framework VideoToolbox"
         "-framework CoreMedia"
         "-framework CoreFoundation"
+        "-framework IOSurface"
         "-framework CoreVideo")
 elseif(WIN32)
     target_sources(OpenLiveReplay PRIVATE

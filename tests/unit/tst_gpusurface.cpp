@@ -6,6 +6,9 @@
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/framepixelformat.h"
+#ifdef __APPLE__
+#include "playback/gpu/appleiosurface.h"
+#endif
 
 namespace {
 class FakeGpuSurface : public GpuSurface {
@@ -31,6 +34,10 @@ private slots:
     void invalidSurfaceHasNullHandle();
     void pipelineFlagDefaultsOff();
     void injectedAllocFailureIsOneShot();
+#ifdef __APPLE__
+    void appleSurfaceIsIoSurfaceBacked();
+    void appleSurfaceRespectsInjectedAllocFailure();
+#endif
 };
 
 void TestGpuSurface::descRoundTrips() {
@@ -68,6 +75,26 @@ void TestGpuSurface::injectedAllocFailureIsOneShot() {
     QVERIFY(gpuConsumeInjectedAllocFailure());
     QVERIFY(!gpuConsumeInjectedAllocFailure());
 }
+
+#ifdef __APPLE__
+void TestGpuSurface::appleSurfaceIsIoSurfaceBacked() {
+    auto s = makeAppleNv12Surface(64, 48);
+    QVERIFY(s != nullptr);
+    QVERIFY(s->isValid());
+    QCOMPARE(s->desc().format, FramePixelFormat::Nv12);
+    QCOMPARE(s->desc().width, 64);
+    QCOMPARE(s->desc().height, 48);
+    QVERIFY(s->nativeHandle() != nullptr);
+}
+
+void TestGpuSurface::appleSurfaceRespectsInjectedAllocFailure() {
+    gpuSetInjectedAllocFailures(1);
+    auto fail = makeAppleNv12Surface(64, 48);
+    QVERIFY(fail == nullptr);
+    auto ok = makeAppleNv12Surface(64, 48);
+    QVERIFY(ok != nullptr);
+}
+#endif
 
 QTEST_GUILESS_MAIN(TestGpuSurface)
 #include "tst_gpusurface.moc"
