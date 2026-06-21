@@ -25,6 +25,10 @@ public:
     NativeVideoCodec videoCodec() const { return m_videoCodec; }
     quint16 audioPid() const { return m_audioPid; }
 
+    // Test seam: lower the per-PID PES reassembly cap so the unbounded-PES
+    // overflow path is exercisable without pushing the full 16 MiB default.
+    void setMaxPesAssemblyBytesForTest(int maxBytes) { m_maxPesAssemblyBytes = maxBytes; }
+
 private:
     struct PesAssembly {
         NativeElementaryStreamKind kind = NativeElementaryStreamKind::Unknown;
@@ -32,6 +36,15 @@ private:
         QByteArray bytes;
         int expectedSize = -1;
     };
+
+    // Upper bound on in-progress PES reassembly per PID. A video PES may legally
+    // declare PES_packet_length = 0 (unbounded; terminated by the next
+    // payload-start), so a hostile/garbled stream that never sends another
+    // payload-start would otherwise grow the buffer without limit — an
+    // unbounded-memory DoS. 16 MiB is far above any real single access unit
+    // (even a 4K keyframe); audio PES always carries a length and stays bounded.
+    static constexpr int kMaxPesAssemblyBytes = 16 * 1024 * 1024;
+    int m_maxPesAssemblyBytes = kMaxPesAssemblyBytes;
 
     quint16 m_pmtPid = 0xffff;
     quint16 m_pcrPid = 0xffff;

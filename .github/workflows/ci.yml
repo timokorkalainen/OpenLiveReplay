@@ -774,6 +774,73 @@ jobs:
           done
           exit "${fail:-0}"
 
+  # ---------------------------------------------------------------------------
+  # Fuzz the untrusted-input parsers (SRT/UDP/RTMP ingest). MANUAL/experimental
+  # (workflow_dispatch only) — continuous fuzzing finds bugs over time, so it is
+  # not a PR gate; run it on demand (or wire a nightly `schedule:` later). A
+  # crash exits non-zero and uploads the reproducer. clang ships libFuzzer; the
+  # harnesses only link Qt6::Core, but the project still configures the app
+  # target, so the Linux app deps are installed too.
+  # ---------------------------------------------------------------------------
+  fuzz:
+    name: Fuzz (parsers, manual)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtmultimedia qtwebsockets
+          cache: true
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build clang pkg-config \
+            libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
+            libsrt-openssl-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev
+
+      - name: Configure (clang + libFuzzer)
+        run: >
+          cmake -S . -B build-fuzz -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOLR_BUILD_FUZZERS=ON
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build fuzzers
+        run: cmake --build build-fuzz --target fuzz_mpegtsparser fuzz_h26xaccessunit fuzz_h26xseitimecode fuzz_rtmpprotocol
+
+      - name: Run fuzzers
+        working-directory: build-fuzz/tests/fuzz
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: |
+          rc=0
+          for f in fuzz_mpegtsparser fuzz_h26xaccessunit fuzz_h26xseitimecode fuzz_rtmpprotocol; do
+            echo "::group::$f"
+            "./$f" -max_total_time=90 -print_final_stats=1 -artifact_prefix="$f-" || rc=1
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
+      - name: Upload crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: build-fuzz/tests/fuzz/fuzz_*-crash-*
+          if-no-files-found: ignore
+
 # iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
 # (~20 min) OOM-kills hosted runners. It is validated locally instead via the
 # .githooks/pre-push hook. See tests/README.md.
