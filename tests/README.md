@@ -29,16 +29,16 @@ Local transport bring-up gates use distinct labels such as `srt`,
 `native-apple-ingest`, `native-ndi`, and `native-rtmp`; they are excluded from
 CI until their matching native ingest path is ready.
 
-### Pre-push gate (heavy, always-on)
+### Pre-push gate (fast pre-flight, always-on)
 
-`git push` runs a blocking pre-push gate (`.githooks/pre-push`). GitHub CI is
-deliberately thin (lint + one cheap Linux build/test), so this hook owns the
-heavy work: on every push it builds the current-platform host with `-Werror`,
-then runs — in order — the `delivery-gate` matrix (below), the unit suite +
-playback/record e2e at native speed, clang-tidy on changed first-party C++, and
-the clang ASan+UBSan (unit + e2e) and TSan sanitizer passes. Any failure blocks
-the push. The `delivery-gate` matrix is the four transport×codec delivery smokes
-with 5-second clips:
+`git push` runs a blocking pre-push gate (`.githooks/pre-push`) — a fast (~5 min)
+local pre-flight so a push rarely fails CI on trivia. On every push it builds the
+current-platform host with `-Werror`, then runs — in order — the `delivery-gate`
+matrix (below), clang-tidy on changed first-party C++, and the fast unit label
+(`-L ci`). Any failure blocks the push. The slower playback e2e + clang
+ASan/UBSan/TSan passes run in GitHub CI now; reproduce them locally with
+`OLR_PREPUSH_FULL=1`. The `delivery-gate` matrix is the four transport×codec
+delivery smokes with 5-second clips:
 
 | | h264 | h265 |
 | --- | --- | --- |
@@ -56,12 +56,14 @@ tooling is missing: `ffmpeg`, `ffprobe`, `srt-live-transmit`, a Python 3, an
 H.264 encoder (`libx264`/`h264_mf`) and an HEVC encoder (`libx265`/`hevc_*`) in
 ffmpeg, and the Qt host kit at `$QT_HOST_PREFIX`. On macOS: `brew install ffmpeg srt`.
 
-Tunables / bypass:
+Tunables / bypass (never use `git push --no-verify` — see CLAUDE.md):
 - `OLR_E2E_CLIP_SECONDS` — clip length for the e2e/delivery matrices (default `5`).
-- `OLR_PREPUSH_SKIP=1 git push` — bypass the whole gate (so does `git push --no-verify`).
-- `OLR_PREPUSH_LIGHT=1 git push` — run the delivery matrix only (skip the heavy build/test gates).
-- `SKIP_UNIT=1` / `SKIP_TIDY=1` / `SKIP_ASAN=1` / `SKIP_TSAN=1` — skip one heavy gate.
-- `OLR_PREPUSH_FULL=1 git push` — also run the full local CTest matrix + iOS build.
+- `OLR_PREPUSH_LIGHT=1 git push` — run the delivery matrix only (skip clang-tidy + unit).
+- `SKIP_UNIT=1` / `SKIP_TIDY=1` — skip one default pre-flight gate.
+- `OLR_PREPUSH_FULL=1 git push` — also run the playback e2e + ASan/UBSan + TSan +
+  full local CTest matrix + iOS build (skip parts: `SKIP_E2E=1` / `SKIP_ASAN=1` /
+  `SKIP_TSAN=1` / `SKIP_FULL_TESTS=1` / `SKIP_IOS_BUILD=1`).
+- `OLR_PREPUSH_SKIP=1 git push` — emergency full bypass only.
 
 The `ndi-runtime` label is a real NDI sender/receiver smoke test. It loads the
 NDI runtime dynamically, routes cache-backed app output frames through
@@ -141,12 +143,13 @@ cmake --build build-asan
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan --output-on-failure
 ```
 
-`OLR_SANITIZER` instruments the app and tests. The clang ASan+UBSan and TSan
-passes run in the local pre-push gate — the only place the VideoToolbox/
-AudioToolbox native-codec tests are sanitized, since they build as stubs on
-Linux. GitHub CI runs the GCC ASan+UBSan+**LSan** pass over the unit suite on
-Linux (LeakSanitizer is unsupported on macOS), which doubles as the
-second-compiler `-Werror` gate.
+`OLR_SANITIZER` instruments the app and tests. GitHub CI runs the full sanitizer
+matrix: clang **ASan+UBSan** (unit + playback e2e) and **TSan** (threading cases)
+on macOS — the only place the VideoToolbox/AudioToolbox native-codec tests are
+sanitized, since they build as stubs on Linux — plus the GCC ASan+UBSan+**LSan**
+pass over the unit suite on Linux (LeakSanitizer is unsupported on macOS), which
+doubles as the second-compiler `-Werror` gate. Reproduce the clang passes locally
+with `OLR_PREPUSH_FULL=1`.
 
 ## Linting & formatting
 
@@ -161,24 +164,28 @@ second-compiler `-Werror` gate.
 
 ## CI
 
-`.github/workflows/ci.yml` is intentionally thin and runs entirely on Linux
-(no macOS) on PRs and pushes to `main`. The heavy build/test/sanitizer/e2e
-gates live in the pre-push hook above; CI is the cheap backstop that fork PRs
-fall back to (they never run that hook; project policy forbids `--no-verify`):
+`.github/workflows/ci.yml` is the comprehensive gate. GHA is free for this
+public repo, so it is bounded by WALL-CLOCK (~6 min), not minutes: jobs fan out
+in parallel across macOS, Linux and Windows, all cached. It runs on PRs and
+pushes to `main`:
 
 - **changes** — classifies the diff first. Docs-only PRs do not run app builds
   or tests.
 - **workflow-lint** — `actionlint` for workflow changes.
-- **lint** — source/QML changes only; runs changed-line `clang-format` and/or
-  `qmllint` only when those file types changed.
-- **build-test-linux** — app/test changes only; the single CI test gate. Builds
-  with GCC `-Werror` and runs the unit suite under ASan+UBSan+LSan (the only leg
-  with LeakSanitizer + a second compiler).
+- **lint** — source/QML changes only; changed-line `clang-format` and `qmllint`.
+- **build-test-macos** — Apple-clang `-Werror` build + the fast unit label + the
+  playback e2e gate + clang-tidy on changed files.
+- **build-test-windows** — MinGW build (FFmpeg/SRT from pinned source, **cached**
+  at `windows_build/dist`) + the deterministic Media Foundation unit tests.
+- **build-test-linux** — GCC `-Werror` + the unit suite under ASan+UBSan+**LSan**
+  (the only leg with LeakSanitizer + a second compiler).
+- **sanitizers** — clang ASan+UBSan (unit + e2e) and TSan, on macOS.
 - **ci-gate** — the one required status check; passes when the gating jobs above
   succeed or are skipped (e.g. a docs-only PR).
-- **coverage** / **mutation-testing** — manual (`workflow_dispatch`) only.
+- **coverage** / **mutation-testing** / **fuzz** — manual (`workflow_dispatch`) only.
 
-CI caches Qt via `install-qt-action` and C/C++ compiler outputs via `ccache`.
+CI caches Qt (`install-qt-action`), Homebrew/apt downloads, C/C++ outputs
+(`ccache`), and the from-source Windows FFmpeg/SRT deps.
 
 ## Full local CTest matrix + iOS build (opt-in)
 

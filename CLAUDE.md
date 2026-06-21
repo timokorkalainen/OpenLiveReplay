@@ -78,17 +78,20 @@ python3 "$GCF" --binary "$CF"        --commit origin/main -- '*.cpp' '*.h'   # a
 - After a PR merges, fetch and confirm the commits are on `main`
   (`git merge-base --is-ancestor <sha> origin/main`). Don't push to a branch whose
   PR has already merged — open a new PR instead.
-- The pre-push hook (`.githooks/pre-push`) is the project's required gate: on
-  every push it builds the host with `-Werror` and runs the delivery matrix, the
-  unit suite + playback e2e, clang-tidy, and the clang ASan/UBSan + TSan passes
-  (`OLR_PREPUSH_FULL=1` adds the full CTest matrix + iOS build). GitHub CI is
-  deliberately thin (lint + one cheap Linux build/test backstop, which is what
-  fork PRs fall back to since they never run the hook).
-- **Never** push with `--no-verify` — it bypasses the gate entirely. A gate that
-  genuinely cannot run on the current platform/toolchain is skipped with its
-  specific flag (`SKIP_IOS_BUILD=1`, `SKIP_ASAN=1`, `SKIP_TSAN=1`, `SKIP_TIDY=1`,
-  `SKIP_UNIT=1`, or `OLR_PREPUSH_LIGHT=1`); that keeps every other gate enforced.
-  Authenticate via gh's git credential helper and let the hook run:
+- GitHub CI is the comprehensive gate: parallel macOS + Linux + Windows builds,
+  the unit suite, the playback e2e, and the clang ASan/UBSan/TSan sanitizer
+  passes, all cached to stay within a ~6 min wall-clock (CI is free for this
+  public repo, so the budget is wall-clock, not minutes).
+- The pre-push hook (`.githooks/pre-push`) is a fast LOCAL pre-flight (~5 min): a
+  single-platform `-Werror` build + the delivery matrix + clang-tidy + the fast
+  unit label, so a push rarely fails CI on trivia. The slower e2e + sanitizer +
+  iOS passes are opt-in (`OLR_PREPUSH_FULL=1`) to reproduce a CI failure locally.
+- **Never** push with `--no-verify` — it bypasses the pre-flight entirely. Skip a
+  gate that genuinely cannot run on the current platform/toolchain with its flag
+  (`SKIP_UNIT=1`, `SKIP_TIDY=1`, or `OLR_PREPUSH_LIGHT=1` for delivery-only; under
+  `OLR_PREPUSH_FULL` also `SKIP_E2E` / `SKIP_ASAN` / `SKIP_TSAN` / `SKIP_IOS_BUILD`);
+  that keeps every other gate enforced. Authenticate via gh's git credential
+  helper and let the hook run:
 
   ```sh
   git -c credential.helper= -c credential.helper='!gh auth git-credential' \

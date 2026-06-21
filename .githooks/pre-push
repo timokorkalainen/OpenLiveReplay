@@ -1,37 +1,37 @@
 #!/usr/bin/env bash
-# Pre-push hook: the project's heavy build + correctness gate. GitHub CI is
-# intentionally thin (lint + one cheap Linux build/test), so the heavy work that
-# used to run on the 10x-billed macOS CI runners runs HERE on every push,
-# against the current platform:
+# Pre-push hook: a FAST local pre-flight (~5 min). GitHub CI is now the
+# comprehensive gate -- macOS + Linux + Windows builds, the unit suite, the
+# playback e2e, and the clang ASan/UBSan/TSan sanitizer passes all run there (see
+# .github/workflows/ci.yml). This hook just catches the COMMON failures before
+# they reach CI, on the current platform:
 #   * build the host (engine + app + test harnesses) with -Werror
-#   * the transport x codec "delivery-gate" matrix (RTMP/SRT x h264/h265)
-#   * the unit suite + playback/record e2e at NATIVE speed
+#   * the transport x codec "delivery-gate" matrix (RTMP/SRT x h264/h265) --
+#     local-only coverage CI does not run
 #   * clang-tidy on changed first-party C++
-#   * clang ASan+UBSan over the unit suite + e2e (the only sanitizer coverage of
-#     the VideoToolbox/AudioToolbox native-codec code -- it compiles as stubs on
-#     the Linux CI leg) and TSan over the threading tests
-# A build / test / sanitizer failure blocks the push.
+#   * the fast unit label (-L ci)
+# A build / unit / clang-tidy failure blocks the push.
 #
-# The gate HARD-FAILS the push if required local tooling is missing (it does NOT
+# The heavier e2e + sanitizer + iOS gates are OPT-IN (OLR_PREPUSH_FULL=1) -- run
+# them to reproduce a CI failure locally, or before a risky native/threading change.
+#
+# The gate HARD-FAILS the push if delivery tooling is missing (it does NOT
 # silently skip): ffmpeg, ffprobe, srt-live-transmit, a Python 3, an H.264 and an
 # HEVC encoder in ffmpeg, and the Qt host kit. Install on macOS with:
 #   brew install ffmpeg srt
 #
-# The from-source FFmpeg/SRT iOS build OOM-kills hosted runners, so iOS is gated
-# locally too (OLR_PREPUSH_FULL). Do NOT bypass this gate with `git push
-# --no-verify` -- it is the project's required gate. To skip a gate that cannot
-# run on the current platform/toolchain, use the per-gate SKIP_* flags below (or
-# OLR_PREPUSH_LIGHT); they keep every OTHER gate enforced. Fork PRs (which never
-# run this hook) fall back to CI's lint + Linux build/test backstop.
+# Do NOT bypass this gate with `git push --no-verify` -- it is the project's
+# required pre-flight. To skip a gate that cannot run on the current
+# platform/toolchain, use the per-gate SKIP_* flags below.
 #
 # Triggers / flags:
-#   git push                  -> full gate above (BLOCKING default)
-#   OLR_PREPUSH_SKIP=1 push   -> emergency bypass ONLY (do NOT use git push --no-verify;
+#   git push                  -> build + delivery + clang-tidy + unit (BLOCKING default)
+#   OLR_PREPUSH_SKIP=1 push   -> emergency bypass ONLY (never use git push --no-verify;
 #                                prefer the per-gate SKIP_* flags for platform skipping)
-#   OLR_PREPUSH_LIGHT=1 push  -> delivery matrix ONLY (skip the heavy build/test gates)
-#   SKIP_UNIT=1 / SKIP_TIDY=1 / SKIP_ASAN=1 / SKIP_TSAN=1  -> skip one heavy gate
-#   OLR_PREPUSH_FULL=1 push   -> ALSO run the full local CTest matrix + iOS build
-#                                (skip parts: SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
+#   OLR_PREPUSH_LIGHT=1 push  -> delivery matrix ONLY (skip clang-tidy + unit)
+#   SKIP_UNIT=1 / SKIP_TIDY=1  -> skip one default gate
+#   OLR_PREPUSH_FULL=1 push   -> ALSO run e2e + ASan/UBSan + TSan + full CTest matrix + iOS
+#                                (skip parts: SKIP_E2E=1 / SKIP_ASAN=1 / SKIP_TSAN=1 /
+#                                 SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
 #
 # Tunables:
 #   OLR_E2E_CLIP_SECONDS  (default 5)               e2e / delivery clip length
@@ -135,37 +135,32 @@ OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
         --output-on-failure --repeat until-pass:2 --no-tests=error
 echo "[pre-push] Delivery matrix OK."
 
-# Past here are the HEAVY gates that moved out of GitHub CI (CI now runs only
-# lint + a cheap Linux build/test). They run by default on every push. Skip one
-# with its SKIP_* flag, or run delivery-only with OLR_PREPUSH_LIGHT=1.
+# Past here are the FAST pre-flight gates kept in the default push (~5 min) so
+# PRs rarely fail CI on trivia: clang-tidy + the fast unit label on the build
+# above. The slower e2e + sanitizer passes and the iOS build run in GitHub CI
+# now -- opt into them locally with OLR_PREPUSH_FULL=1. OLR_PREPUSH_LIGHT=1 runs
+# the delivery matrix only.
 if [ "${OLR_PREPUSH_LIGHT:-0}" = "1" ]; then
-    echo "[pre-push] OLR_PREPUSH_LIGHT=1 - delivery gate only; skipping heavy build/test gates."
+    echo "[pre-push] OLR_PREPUSH_LIGHT=1 - delivery gate only; skipping clang-tidy + unit."
     exit 0
 fi
 
 QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
 export QT_QPA_PLATFORM
 
-# The exact selectors the macOS CI jobs used, kept verbatim so local == old CI.
+# Selectors kept verbatim so local == CI.
 UNIT_SELECTOR_LE='sync-report|srt|native-apple-ingest|native-rtmp'
 E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
 
-# --- 5. Unit suite + playback e2e at native speed (was: Build + Test (macOS)) ---
-# Reuses the delivery build (already compiled with -DOLR_WERROR=ON). The
-# native-speed e2e run is the only leg that exercises the threaded PlaybackWorker
-# at real CPU speed -- the ASan run below perturbs timing, so it cannot replace
-# this scheduling gate.
+# --- 5. Fast unit label (-L ci) on the build above -- catches the unit failures
+# CI would catch, at native speed, in ~1 min.
 if [ "${SKIP_UNIT:-0}" = "1" ]; then
-    echo "[pre-push] SKIP_UNIT=1 - skipping native unit + e2e gate."
+    echo "[pre-push] SKIP_UNIT=1 - skipping the unit gate."
 else
     echo "[pre-push] Running unit suite (native, -L ci)..."
     ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
         -L ci -LE "$UNIT_SELECTOR_LE"
-    echo "[pre-push] Running playback e2e (native speed)..."
-    OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
-        ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
-            --no-tests=error -R "$E2E_REGEX"
-    echo "[pre-push] Native unit + e2e OK."
+    echo "[pre-push] Unit suite OK."
 fi
 
 # --- 6. clang-tidy on changed first-party C++ (was: build-test-macos clang-tidy) -
@@ -224,10 +219,27 @@ else
     fi
 fi
 
-# --- 7. clang ASan+UBSan: unit suite + e2e (was: Sanitizers asan-ubsan/asan-e2e) -
-# A separate -DOLR_SANITIZER build (cannot share the delivery binary). This is the
-# ONLY sanitizer coverage of the VideoToolbox/AudioToolbox native-codec tests --
-# they compile as stubs on the Linux CI leg, so CI can never see them. ASan/UBSan
+# --- 7. OPT-IN heavy gates (OLR_PREPUSH_FULL): the e2e + sanitizer + iOS passes
+# that GitHub CI now runs on every PR. Off by default to keep the push fast; run
+# them to reproduce a CI failure locally or before a risky native/threading change.
+if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
+    exit 0
+fi
+echo "[pre-push] OLR_PREPUSH_FULL=1 - running e2e + sanitizers + full matrix + iOS."
+
+# --- 7a. playback/record e2e at native speed (the native-timing scheduling run) -
+if [ "${SKIP_E2E:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_E2E=1 - skipping native e2e."
+else
+    echo "[pre-push] Running playback e2e (native speed)..."
+    OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
+        ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
+            --no-tests=error -R "$E2E_REGEX"
+    echo "[pre-push] Native e2e OK."
+fi
+
+# --- 7b. clang ASan+UBSan: unit + e2e (local repro of the CI sanitizers job) ----
+# A separate -DOLR_SANITIZER build (cannot share the delivery binary). ASan/UBSan
 # aborts are deterministic (abort_on_error/halt_on_error), so until-pass retries
 # only paper over loopback timing flakes, never a real sanitizer finding.
 if [ "${SKIP_ASAN:-0}" = "1" ]; then
@@ -256,7 +268,7 @@ else
     echo "[pre-push] ASan+UBSan OK."
 fi
 
-# --- 8. TSan: threading-sensitive playback/output cases (was: Sanitizers tsan) --
+# --- 7c. TSan: threading-sensitive playback/output cases -----------------------
 if [ "${SKIP_TSAN:-0}" = "1" ]; then
     echo "[pre-push] SKIP_TSAN=1 - skipping TSan gate."
 else
@@ -278,13 +290,7 @@ else
     echo "[pre-push] TSan OK."
 fi
 
-# --- 9. Optional heavier gate: full local CTest matrix + iOS build -------------
-if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
-    exit 0
-fi
-
-echo "[pre-push] OLR_PREPUSH_FULL=1 - running full local CTest matrix + iOS build."
-
+# --- 7d. Full local CTest matrix (everything except the local-only labels) -----
 if [ "${SKIP_FULL_TESTS:-0}" = "1" ]; then
     echo "[pre-push] SKIP_FULL_TESTS=1 - skipping full local CTest gate."
 else

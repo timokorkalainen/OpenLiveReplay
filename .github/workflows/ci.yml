@@ -1,18 +1,19 @@
 name: CI
 
-# CI is intentionally a THIN, quick gate: static lint plus a single cheap Linux
-# build/test backstop -- it runs entirely on ubuntu-latest (1x billing), no macOS.
+# CI is comprehensive but wall-clock-bounded (~6 min). GHA is free for this
+# public repo, so the budget is WALL-CLOCK, not minutes: jobs fan out in parallel
+# across macOS, Linux and Windows, each leaning on caching (Qt, Homebrew/apt,
+# ccache, and the from-source Windows FFmpeg/SRT deps) to stay within budget.
+#   * lint / workflow-lint  -- fast static checks on Linux
+#   * build-test-macos      -- clang -Werror build + unit (-L ci) + playback e2e + clang-tidy
+#   * build-test-linux      -- GCC -Werror + unit under ASan+UBSan+LeakSanitizer
+#   * build-test-windows    -- MinGW build (cached from-source FFmpeg/SRT) + Media Foundation unit tests
+#   * sanitizers            -- clang ASan/UBSan (unit + e2e) and TSan, on macOS
 #
-# The heavy work runs in the local .githooks/pre-push hook instead: the macOS
-# clang build (-Werror), the full unit suite, clang-tidy, the clang
-# ASan/UBSan + TSan sanitizer passes (the only sanitizer coverage of the
-# VideoToolbox/AudioToolbox native-codec code), and the playback/record e2e
-# matrix. See .githooks/pre-push and tests/README.md.
-#
-# What stays in CI is the cheapest meaningful automated backstop -- and the
-# ONLY home for GCC -Werror + LeakSanitizer, neither of which runs on macOS.
-# It matters because fork PRs never run the local hook (and project policy
-# forbids `git push --no-verify`), so CI is the backstop they fall back to.
+# The local .githooks/pre-push hook is a fast pre-flight (single-platform build +
+# fast unit + lint) so PRs rarely fail on trivia; the exhaustive gating lives
+# here. iOS is the only build NOT in CI (its from-source FFmpeg+SRT+OpenSSL
+# OOM-kills hosted runners) -- it stays in the pre-push hook.
 
 on:
   push:
@@ -42,6 +43,7 @@ jobs:
       app: ${{ steps.classify.outputs.app }}
       format: ${{ steps.classify.outputs.format }}
       qml: ${{ steps.classify.outputs.qml }}
+      native: ${{ steps.classify.outputs.native }}
       workflow: ${{ steps.classify.outputs.workflow }}
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +60,7 @@ jobs:
               echo "app=true"
               echo "format=true"
               echo "qml=true"
+              echo "native=true"
               echo "workflow=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -73,6 +76,7 @@ jobs:
           app=false
           format=false
           qml=false
+          native=false
           workflow=false
           files="$(git diff --name-only "$base" HEAD || true)"
 
@@ -94,20 +98,23 @@ jobs:
                 app=true
                 format=true
                 qml=true
+                native=true
                 ;;
-              # Lint/build rulebooks (including the pre-push hook that now owns the
-              # heavy gates): a change here must re-run the gates that consult them
-              # -- clang-format / qmllint / the clang-tidy floor / the Linux
-              # backstop -- for the same self-referential reason.
+              # Lint/sanitizer/build rulebooks: a change here must re-run the gates
+              # that consult them (clang-format / qmllint / the clang-tidy floor /
+              # the sanitizer suppressions / the cross-platform builds), for the
+              # same self-referential reason.
               .clang-tidy|.clang-format|qmllint.ini|qmllint.ini.in|.pre-commit-config.yaml|.githooks/*|tests/lsan.suppressions.txt)
                 app=true
                 format=true
+                native=true
                 ;;
               *.md|docs/*)
                 ;;
               *.cpp|*.c|*.h|*.hpp|*.mm)
                 app=true
                 format=true
+                native=true
                 ;;
               *.qml)
                 app=true
@@ -115,6 +122,7 @@ jobs:
                 ;;
               CMakeLists.txt|*/CMakeLists.txt|*.cmake|CMakePresets.json)
                 app=true
+                native=true
                 ;;
               recorder_engine/*|playback/*|project/*|telemetry/*|midi/*|streamdeck/*|ios/*|tests/*|build-scripts/*|*.qrc|*.plist|*.entitlements)
                 app=true
@@ -129,6 +137,7 @@ jobs:
             echo "app=$app"
             echo "format=$format"
             echo "qml=$qml"
+            echo "native=$native"
             echo "workflow=$workflow"
           } >> "$GITHUB_OUTPUT"
 
@@ -254,14 +263,213 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # The single CI test backstop: build the app + tests with GCC on Linux and run
-  # the unit suite under ASan+UBSan+LSan. This is the only leg that exercises
-  # GCC's -Werror (warnings clang misses) and LeakSanitizer (unsupported on
-  # macOS), at cheap 1x billing. The macOS build + native-codec + e2e gates run
-  # in the local pre-push hook (see .githooks/pre-push); this job is the backstop
-  # fork PRs fall back to (they never run that hook). On Linux the native ingest
-  # compiles via the cross-platform stubs and NDI is runtime-loaded, so no
-  # Apple/Windows SDKs are required.
+  # Build the macOS app + test suite and run CTest. Apple-clang -Werror build,
+  # the fast unit label, the playback e2e gate, and clang-tidy on changed files.
+  # ---------------------------------------------------------------------------
+  build-test-macos:
+    name: Build + Test (macOS)
+    runs-on: macos-14
+    needs: changes
+    if: ${{ needs.changes.outputs.app == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # clang-tidy diff needs history
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia qtwebsockets
+          cache: true
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-homebrew-build-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-homebrew-build-
+            ${{ runner.os }}-homebrew-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-build-test-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-build-test-
+            ${{ runner.os }}-ccache-
+
+      - name: Install build deps
+        run: brew install ninja ffmpeg srt ccache
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --zero-stats
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOLR_BUILD_TESTS=ON
+          -DOLR_WERROR=ON
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build (app + tests)
+        run: cmake --build build
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
+      - name: Run short PR tests
+        working-directory: build
+        # The fast "ci" CTest label. Full transport/report labels stay in the
+        # local pre-push hook and are excluded defensively; the playback e2e gate
+        # below adds worker-level coverage on top of the unit label.
+        run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+
+      # Representative end-to-end gate: the headless record + PlaybackWorker matrix
+      # (the project's highest-risk threaded code) over the native srt:// loopback,
+      # which the macOS runner supports (brew srt ships srt-live-transmit; python3
+      # is preinstalled). A curated subset keeps wall-clock bounded; until-pass:3
+      # absorbs transient loopback timing flakes so the gate stays trustworthy.
+      - name: Run playback e2e gate
+        working-directory: build
+        run: |
+          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
+            -R '^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
+
+      # clang-tidy is a GATE: WarningsAsErrors in .clang-tidy makes any finding in a
+      # changed first-party file fatal, using the generated compile_commands.json.
+      # The whole first-party tree is tidy-clean, so only regressions in touched
+      # files fail — the same "lint owns the floor" model as clang-format.
+      - name: clang-tidy (changed files)
+        if: ${{ needs.changes.outputs.format == 'true' }}
+        run: |
+          brew install llvm
+          TIDY="$(brew --prefix llvm)/bin/clang-tidy"
+          SDK="$(xcrun --show-sdk-path)"
+          base="${{ github.event.pull_request.base.sha }}"
+          [ -z "$base" ] && base="${{ github.event.before }}"
+          # All-zeros SHA (new branch) or an unreachable base -> diff vs parent.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          files=$(git diff --name-only "$base" HEAD -- \
+                    'recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp' \
+                    'telemetry/*.cpp' 'websocket/*.cpp' \
+                    'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)
+          if [ -z "$files" ]; then echo "No first-party C++ changes."; exit 0; fi
+          printf '%s\n' "$files"
+          # Pass 1 — WHOLE changed file, config-driven WarningsAsErrors.
+          rc=0
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" "$file" || rc=1
+          done <<< "$files"
+          # Pass 2 — DIFF-SCOPED integer-coercion gate (NEW occurrences fatal).
+          CTD="$(brew --prefix llvm)/share/clang/clang-tidy-diff.py"
+          git diff -U0 "$base" HEAD -- \
+              'recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp' \
+              'telemetry/*.cpp' 'websocket/*.cpp' \
+              'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' \
+            | python3 "$CTD" -p1 -path build -clang-tidy-binary "$TIDY" \
+                -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
+                -warnings-as-errors='*' -extra-arg=-isysroot -extra-arg="$SDK" || rc=1
+          exit "$rc"
+
+  # ---------------------------------------------------------------------------
+  # Build the Windows app (MinGW) + run the deterministic Media Foundation unit
+  # tests. FFmpeg + SRT are built from pinned source (build_ffmpeg_windows_srt.sh
+  # is idempotent) and CACHED at windows_build/dist, keyed on that script's hash:
+  # a cache hit skips the ~20-min dep build, so warm runs fit the wall-clock
+  # budget (the cold first run after a cache miss is the one-time exception).
+  # Builds the app target (validates the win32/Media-Foundation code compiles)
+  # plus the two self-contained MF unit tests.
+  # ---------------------------------------------------------------------------
+  build-test-windows:
+    name: Build + Test (Windows, MinGW)
+    runs-on: windows-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.app == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt (MinGW) + tools
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: windows
+          target: desktop
+          arch: win64_mingw
+          modules: qtmultimedia qtwebsockets
+          tools: tools_mingw1310 tools_ninja
+          cache: true
+
+      - name: Cache Windows FFmpeg/SRT (from-source deps)
+        uses: actions/cache@v4
+        with:
+          path: windows_build/dist
+          key: ${{ runner.os }}-winffmpeg-srt-${{ hashFiles('build-scripts/build_ffmpeg_windows_srt.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-winffmpeg-srt-
+
+      - name: Build FFmpeg + SRT (idempotent; cached)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
+          ./build-scripts/build_ffmpeg_windows_srt.sh
+
+      - name: Build app + MF unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OLR_QT_ROOT="${QT_ROOT_DIR//\\//}"
+          # Discover the newest MinGW kit + Ninja the same way the build scripts do.
+          # shellcheck disable=SC2012
+          newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
+          QT_TOOLS_DIR="$(cd "$OLR_QT_ROOT/../.." && pwd)/Tools"
+          : "${OLR_MINGW_ROOT:=$(newest "$QT_TOOLS_DIR"/mingw*_64)}"
+          [ -n "${OLR_MINGW_ROOT:-}" ] || OLR_MINGW_ROOT="$(newest C:/Qt/Tools/mingw*_64)"
+          NINJA_BIN="$(command -v ninja || true)"
+          [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
+          NINJA_DIR="$(dirname "$NINJA_BIN")"
+          export PATH="$OLR_MINGW_ROOT/bin:$NINJA_DIR:$PATH"
+          FFMPEG_ROOT="$(cd windows_build/dist/ffmpeg && pwd)"
+          SRT_ROOT="$(cd windows_build/dist/srt && pwd)"
+          cmake -S . -B build-tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOLR_BUILD_TESTS=ON \
+            -DCMAKE_PREFIX_PATH="$OLR_QT_ROOT" \
+            -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
+            -DCMAKE_CXX_COMPILER="$OLR_MINGW_ROOT/bin/g++.exe" \
+            -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
+            -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
+            -DOLR_SRT_ROOT="$SRT_ROOT"
+          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder
+
+      - name: Run Media Foundation unit tests
+        shell: bash
+        run: |
+          ctest --test-dir build-tests --output-on-failure \
+            -R '^(tst_nativeaacdecoder|tst_nativevideodecoder)$'
+
+  # ---------------------------------------------------------------------------
+  # Second toolchain: build the app + tests with GCC on Linux and run the unit
+  # suite under ASan+UBSan+LSan. The only leg that exercises GCC's -Werror
+  # (warnings clang misses) and LeakSanitizer (unsupported on macOS). On Linux
+  # the native ingest compiles via the cross-platform stubs and NDI is
+  # runtime-loaded, so no Apple/Windows SDKs are required.
   # ---------------------------------------------------------------------------
   build-test-linux:
     name: Build + Test (Linux, GCC)
@@ -336,6 +544,154 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           QT_QPA_PLATFORM: offscreen
         run: ctest --output-on-failure --repeat until-pass:2 -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+
+  # ---------------------------------------------------------------------------
+  # Sanitizer gates (macOS clang). asan-ubsan runs the WHOLE unit label under
+  # ASan+UBSan; tsan runs the threading-sensitive cases under TSan; asan-e2e runs
+  # the deterministic playback e2e + native SRT smoke under ASan+UBSan. These are
+  # the only sanitizer coverage of the VideoToolbox/AudioToolbox native-codec
+  # code (it builds as stubs on the Linux leg). LeakSanitizer is NOT here (macOS
+  # unsupported) — it runs on the Linux leg.
+  # ---------------------------------------------------------------------------
+  sanitizers:
+    name: Sanitizers
+    runs-on: macos-14
+    needs: changes
+    if: ${{ needs.changes.outputs.native == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Empty build_targets => build the whole suite and run the full unit
+          # label; a non-empty list builds only those threading/harness targets.
+          - sanitizer: "address;undefined"
+            label: asan-ubsan
+            advisory: false
+            build_targets: ""
+          - sanitizer: "thread"
+            label: tsan
+            advisory: false
+            build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine tst_ndiingest"
+          # asan-e2e: only the e2e harness binaries need building — the playback
+          # matrix drives play_harness + record_harness; the native SRT smoke
+          # drives record_harness. Both link olr_sanitize, so this build is
+          # genuinely -fsanitize=address,undefined instrumented.
+          - sanitizer: "address;undefined"
+            label: asan-e2e
+            advisory: false
+            build_targets: "play_harness record_harness"
+    continue-on-error: ${{ matrix.advisory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia qtwebsockets
+          cache: true
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-homebrew-sanitizers-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-homebrew-sanitizers-
+            ${{ runner.os }}-homebrew-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-sanitizers-${{ matrix.label }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-sanitizers-${{ matrix.label }}-
+            ${{ runner.os }}-ccache-sanitizers-
+            ${{ runner.os }}-ccache-
+
+      - name: Install build deps
+        run: brew install ninja ffmpeg srt ccache
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=500M
+          ccache --zero-stats
+
+      - name: Configure (${{ matrix.label }})
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DOLR_BUILD_TESTS=ON
+          -DOLR_WERROR=ON
+          -DOLR_SANITIZER="${{ matrix.sanitizer }}"
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+
+      - name: Build tests
+        run: |
+          if [ -n "${{ matrix.build_targets }}" ]; then
+            cmake --build build --target ${{ matrix.build_targets }}
+          else
+            cmake --build build
+          fi
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
+      # asan-e2e GATING part: the deterministic playback e2e subset (the real
+      # threaded PlaybackWorker, record + play, over the native srt:// loopback).
+      # until-pass:3 absorbs a transient loopback timing flake; it does NOT mask
+      # an ASan/UBSan finding (abort_on_error/halt_on_error make those a hard,
+      # deterministic abort that re-fires every relaunch).
+      - name: Run playback e2e under ASan+UBSan (gating)
+        if: ${{ matrix.label == 'asan-e2e' }}
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
+            -R '^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
+
+      # asan-e2e ADVISORY part: the native SRT ingest smoke under the SAME
+      # instrumentation. continue-on-error because its srt-live-transmit
+      # connect/handshake timing can flake on shared runners; a real ASan/UBSan
+      # abort still exits non-zero in the log. until-pass:3 retries only the
+      # connect-timing flake.
+      - name: Run native SRT ingest smoke under ASan+UBSan (advisory)
+        if: ${{ matrix.label == 'asan-e2e' }}
+        continue-on-error: true
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
+            -R '^e2e_native_srt_smoke$'
+
+      - name: Run sanitizer checks
+        if: ${{ matrix.label != 'asan-e2e' }}
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          if [ "${{ matrix.label }}" = "tsan" ]; then
+            ctest --output-on-failure --repeat until-pass:2 \
+              -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
+          else
+            ctest --output-on-failure --repeat until-pass:2 \
+              -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+          fi
 
   # ---------------------------------------------------------------------------
   # Coverage -- REPORT-ONLY, now MANUAL (workflow_dispatch only). It gates
@@ -524,24 +880,26 @@ jobs:
   # Single aggregate status for branch protection. Requiring this one check is
   # robust against matrix-name churn and conditional skips: it passes when every
   # required job either succeeded or was skipped (e.g. a docs-only PR), and fails
-  # if any required job failed or was cancelled. Coverage/mull (manual) and
+  # if any required job failed or was cancelled. Coverage/mull/fuzz (manual) and
   # workflow-lint are intentionally not gated here.
   #
   # NOTE: the branch-protection required check is "CI gate" (this job's name).
-  # Keep that name stable. The heavy macOS build + sanitizer + e2e gates moved to
-  # the local pre-push hook and are deliberately NOT represented here.
+  # Keep that name stable.
   # ---------------------------------------------------------------------------
   ci-gate:
     name: CI gate
     runs-on: ubuntu-latest
-    needs: [lint, build-test-linux]
+    needs: [lint, build-test-macos, build-test-windows, build-test-linux, sanitizers]
     if: ${{ always() }}
     steps:
       - name: Require all gating jobs to pass (skipped is allowed)
         run: |
           for r in \
             "lint=${{ needs.lint.result }}" \
-            "build-test-linux=${{ needs.build-test-linux.result }}"; do
+            "build-test-macos=${{ needs.build-test-macos.result }}" \
+            "build-test-windows=${{ needs.build-test-windows.result }}" \
+            "build-test-linux=${{ needs.build-test-linux.result }}" \
+            "sanitizers=${{ needs.sanitizers.result }}"; do
             name="${r%%=*}"; res="${r#*=}"
             echo "$name: $res"
             if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
@@ -551,8 +909,6 @@ jobs:
           done
           exit "${fail:-0}"
 
-# The macOS build, the clang ASan/UBSan + TSan sanitizer passes, the
-# VideoToolbox/AudioToolbox native-codec tests, the playback/record e2e matrix,
-# and the iOS build are intentionally NOT in CI -- they run in the always-on
-# .githooks/pre-push hook (the FFmpeg+SRT+OpenSSL iOS build also OOM-kills hosted
-# runners). See .githooks/pre-push and tests/README.md.
+# iOS is the only build intentionally NOT in CI: its from-source
+# FFmpeg+SRT+OpenSSL build (~20 min) OOM-kills hosted runners. It is validated
+# locally via the .githooks/pre-push hook (OLR_PREPUSH_FULL). See tests/README.md.
