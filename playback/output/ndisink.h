@@ -1,10 +1,23 @@
 #ifndef NDISINK_H
 #define NDISINK_H
 
+#include "playback/output/ndiabi.h"
 #include "playback/output/outputsink.h"
 
 #include <QMutex>
 #include <memory>
+
+// Resolves the NDI frame `timecode` field (100 ns) from a bus frame's programme timecode:
+// a value >= 0 passes through; -1 (unset) maps to the NDI "synthesize" sentinel so the SDK
+// generates one. Exposed for unit testing the mapping.
+qint64 resolveNdiTimecode(qint64 programmeTimecode100ns);
+
+// Stamps the bus frame's programme timecode onto the paired NDI video + audio frames of one
+// tick (both carry the SAME timecode so the A/V pair stays aligned). The NDI `timestamp` is
+// left to the SDK, which overwrites it on send with its own submission time. Exposed so the
+// sink's bus-frame -> NDI-struct timecode mapping is unit-testable without a live NDI runtime.
+void applyNdiFrameTiming(const OutputBusFrame& frame, olr::ndi::NDIlib_video_frame_v2_t& video,
+                         olr::ndi::NDIlib_audio_frame_v3_t& audio);
 
 class INdiSenderBackend {
 public:

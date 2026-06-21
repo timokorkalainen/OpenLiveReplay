@@ -17,6 +17,12 @@ quint32 hashInt(quint32 hash, qint64 value) {
     return hash;
 }
 
+// Programme timecode in 100 ns units from the playhead (1 ms = 10000 x 100 ns). Clamped at
+// zero so a pre-start/negative playhead still yields a valid (non-sentinel) timecode.
+qint64 programmeTimecode100nsFor(qint64 sampledPlayheadMs) {
+    return qMax<qint64>(0, sampledPlayheadMs) * 10000;
+}
+
 bool isSilentAudio(const MediaAudioFrame& audio) {
     for (const char sample : audio.pcm) {
         if (sample != '\0') return false;
@@ -113,6 +119,7 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     out.bus = OutputBusId::multiview();
     out.outputFrameIndex = outputFrameIndex;
     out.sampledPlayheadMs = m_clock.samplePlayheadMsForOutputTick(outputFrameIndex, state);
+    out.programmeTimecode100ns = programmeTimecode100nsFor(out.sampledPlayheadMs);
 
     // Describe the source set selected for this tick. Absent feeds use a stable sentinel
     // (not the playhead) plus a present flag, so the descriptor is stable across ticks while
@@ -169,6 +176,7 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     out.bus = bus;
     out.outputFrameIndex = outputFrameIndex;
     out.sampledPlayheadMs = m_clock.samplePlayheadMsForOutputTick(outputFrameIndex, state);
+    out.programmeTimecode100ns = programmeTimecode100nsFor(out.sampledPlayheadMs);
 
     if (feedIndex >= 0 && feedIndex < m_feedCount) {
         out.video = cache.videoFrameOrPlaceholder(feedIndex, out.sampledPlayheadMs);
