@@ -3,6 +3,7 @@
 
 #include "playback/output/framehandle.h"
 #include "playback/output/framepixelformat.h"
+#include "playback/output/outputtypes.h"
 
 #include <QList>
 
@@ -37,6 +38,9 @@ struct Rgb8 {
 Rgb8 yuvToRgb8(uchar y, uchar u, uchar v, ColorMatrix matrix, ColorRange range);
 CpuPlanes referenceComposeGridRgba8(const QList<FrameHandle>& frames, int width, int height,
                                     ColorMetadata color);
+CpuPlanes exportRgba8ToYuv420p(const CpuPlanes& rgba, ColorMetadata color);
+CpuPlanes exportRgba8ToNv12(const CpuPlanes& rgba, ColorMetadata color);
+FramePixelFormat sinkExportFormat(OutputTargetKind kind);
 
 } // namespace formatcanon
 

@@ -27,6 +27,30 @@ uchar clampU8(int value) {
     return static_cast<uchar>(value);
 }
 
+void rgbToYuvSample(uchar r, uchar g, uchar b, ColorMatrix matrix, ColorRange range, int* y,
+                    int* cb, int* cr) {
+    int yy = 0;
+    int u = 0;
+    int v = 0;
+    if (matrix == ColorMatrix::Bt601) {
+        yy = 263 * r + 516 * g + 100 * b;
+        u = -152 * r - 298 * g + 450 * b;
+        v = 450 * r - 377 * g - 73 * b;
+    } else {
+        yy = 187 * r + 629 * g + 63 * b;
+        u = -103 * r - 347 * g + 450 * b;
+        v = 450 * r - 409 * g - 41 * b;
+    }
+
+    if (range == ColorRange::Video) {
+        *y = ((yy + 512) >> 10) + 16;
+    } else {
+        *y = (((yy * 1024) / 879 + 512) >> 10);
+    }
+    *cb = ((u + 512) >> 10) + 128;
+    *cr = ((v + 512) >> 10) + 128;
+}
+
 } // namespace
 
 PlaneShape planeShape(FramePixelFormat format, int frameWidth, int frameHeight, int planeIndex) {
@@ -243,6 +267,93 @@ CpuPlanes referenceComposeGridRgba8(const QList<FrameHandle>& frames, int width,
         }
     }
     return out;
+}
+
+CpuPlanes exportRgba8ToYuv420p(const CpuPlanes& rgba, ColorMetadata color) {
+    if (rgba.format != FramePixelFormat::Rgba8 || !rgba.isValid()) return {};
+
+    const int w = rgba.width;
+    const int h = rgba.height;
+    const int cw = chromaWidth(w);
+    const int ch = chromaHeight(h);
+
+    CpuPlanes out;
+    out.format = FramePixelFormat::Yuv420p;
+    out.width = w;
+    out.height = h;
+    out.stride[0] = w;
+    out.stride[1] = cw;
+    out.stride[2] = cw;
+    out.plane[0] = QByteArray(planeBytes(out.stride[0], h), 0);
+    out.plane[1] = QByteArray(planeBytes(out.stride[1], ch), char(128));
+    out.plane[2] = QByteArray(planeBytes(out.stride[2], ch), char(128));
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const qsizetype rgbaOffset =
+                byteOffset(y, rgba.stride[0]) + static_cast<qsizetype>(x) * 4;
+            int yy = 0;
+            int cb = 0;
+            int cr = 0;
+            rgbToYuvSample(
+                uchar(rgba.plane[0].at(rgbaOffset)), uchar(rgba.plane[0].at(rgbaOffset + 1)),
+                uchar(rgba.plane[0].at(rgbaOffset + 2)), color.matrix, color.range, &yy, &cb, &cr);
+            out.plane[0][byteOffset(y, out.stride[0]) + x] = char(clampU8(yy));
+        }
+    }
+
+    for (int cy = 0; cy < ch; ++cy) {
+        for (int cx = 0; cx < cw; ++cx) {
+            int rSum = 0;
+            int gSum = 0;
+            int bSum = 0;
+            int samples = 0;
+            for (int dy = 0; dy < 2; ++dy) {
+                const int y = cy * 2 + dy;
+                if (y >= h) continue;
+                for (int dx = 0; dx < 2; ++dx) {
+                    const int x = cx * 2 + dx;
+                    if (x >= w) continue;
+                    const qsizetype rgbaOffset =
+                        byteOffset(y, rgba.stride[0]) + static_cast<qsizetype>(x) * 4;
+                    rSum += uchar(rgba.plane[0].at(rgbaOffset));
+                    gSum += uchar(rgba.plane[0].at(rgbaOffset + 1));
+                    bSum += uchar(rgba.plane[0].at(rgbaOffset + 2));
+                    ++samples;
+                }
+            }
+            if (samples <= 0) continue;
+            int yy = 0;
+            int cb = 0;
+            int cr = 0;
+            rgbToYuvSample(
+                clampU8((rSum + samples / 2) / samples), clampU8((gSum + samples / 2) / samples),
+                clampU8((bSum + samples / 2) / samples), color.matrix, color.range, &yy, &cb, &cr);
+            const qsizetype chromaOffset = byteOffset(cy, out.stride[1]) + cx;
+            out.plane[1][chromaOffset] = char(clampU8(cb));
+            out.plane[2][chromaOffset] = char(clampU8(cr));
+        }
+    }
+    return out;
+}
+
+CpuPlanes exportRgba8ToNv12(const CpuPlanes& rgba, ColorMetadata color) {
+    const CpuPlanes yuv = exportRgba8ToYuv420p(rgba, color);
+    return yuv.isValid() ? yuv420pToNv12(yuv) : CpuPlanes{};
+}
+
+FramePixelFormat sinkExportFormat(OutputTargetKind kind) {
+    switch (kind) {
+    case OutputTargetKind::QtPreview:
+        return FramePixelFormat::Rgba8;
+    case OutputTargetKind::DeckLinkSdiHdmi:
+    case OutputTargetKind::DeckLinkIpSt2110:
+    case OutputTargetKind::Ndi:
+    case OutputTargetKind::Omt:
+    case OutputTargetKind::Aja:
+        return FramePixelFormat::Yuv420p;
+    }
+    return FramePixelFormat::Yuv420p;
 }
 
 } // namespace formatcanon

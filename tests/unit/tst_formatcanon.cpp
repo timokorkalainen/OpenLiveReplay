@@ -4,6 +4,7 @@
 #include "playback/output/formatcanon.h"
 #include "playback/output/framehandle.h"
 #include "playback/output/framepixelformat.h"
+#include "playback/output/outputtypes.h"
 #include "playback/output/yuv420pcompositor.h"
 
 #include <tuple>
@@ -58,6 +59,9 @@ private slots:
     void referenceGridModelsNv12ChromaDecimation();
     void referenceGridOutputIsRgba8();
     void reconstructorLumaPlacementMatchesCpuOracle();
+    void sinkExportFormatMapsEachTarget();
+    void rgbToYuvRoundTripsWithinTolerance();
+    void exportRgba8ToNv12IsInterleaved();
 };
 
 void TestFormatCanon::planeShapeMatchesYuv420pLayout() {
@@ -308,6 +312,67 @@ void TestFormatCanon::reconstructorLumaPlacementMatchesCpuOracle() {
             QCOMPARE(uchar(rgba.plane[0].at(offset + 2)), grey.b);
         }
     }
+}
+
+void TestFormatCanon::sinkExportFormatMapsEachTarget() {
+    using namespace formatcanon;
+    QCOMPARE(int(sinkExportFormat(OutputTargetKind::Ndi)), int(FramePixelFormat::Yuv420p));
+    QCOMPARE(int(sinkExportFormat(OutputTargetKind::QtPreview)), int(FramePixelFormat::Rgba8));
+    QCOMPARE(int(sinkExportFormat(OutputTargetKind::DeckLinkSdiHdmi)),
+             int(FramePixelFormat::Yuv420p));
+    QCOMPARE(int(sinkExportFormat(OutputTargetKind::DeckLinkIpSt2110)),
+             int(FramePixelFormat::Yuv420p));
+    QCOMPARE(int(sinkExportFormat(OutputTargetKind::Omt)), int(FramePixelFormat::Yuv420p));
+    QCOMPARE(int(sinkExportFormat(OutputTargetKind::Aja)), int(FramePixelFormat::Yuv420p));
+}
+
+void TestFormatCanon::rgbToYuvRoundTripsWithinTolerance() {
+    ColorMetadata color;
+    const formatcanon::Rgb8 src = formatcanon::yuvToRgb8(150, 128, 128, color.matrix, color.range);
+
+    CpuPlanes rgba;
+    rgba.format = FramePixelFormat::Rgba8;
+    rgba.width = 2;
+    rgba.height = 2;
+    rgba.stride[0] = 8;
+    rgba.plane[0] = QByteArray(16, 0);
+    for (int i = 0; i < 4; ++i) {
+        rgba.plane[0][4 * i] = char(src.r);
+        rgba.plane[0][4 * i + 1] = char(src.g);
+        rgba.plane[0][4 * i + 2] = char(src.b);
+        rgba.plane[0][4 * i + 3] = char(255);
+    }
+
+    const CpuPlanes yuv = formatcanon::exportRgba8ToYuv420p(rgba, color);
+    QVERIFY(yuv.isValid());
+    QCOMPARE(int(yuv.format), int(FramePixelFormat::Yuv420p));
+    const int recoveredY = uchar(yuv.plane[0].at(0));
+    QVERIFY2(qAbs(recoveredY - 150) <= 2, qPrintable(QString::number(recoveredY)));
+}
+
+void TestFormatCanon::exportRgba8ToNv12IsInterleaved() {
+    ColorMetadata color;
+    const formatcanon::Rgb8 src = formatcanon::yuvToRgb8(120, 100, 150, color.matrix, color.range);
+
+    CpuPlanes rgba;
+    rgba.format = FramePixelFormat::Rgba8;
+    rgba.width = 2;
+    rgba.height = 2;
+    rgba.stride[0] = 8;
+    rgba.plane[0] = QByteArray(16, 0);
+    for (int i = 0; i < 4; ++i) {
+        rgba.plane[0][4 * i] = char(src.r);
+        rgba.plane[0][4 * i + 1] = char(src.g);
+        rgba.plane[0][4 * i + 2] = char(src.b);
+        rgba.plane[0][4 * i + 3] = char(255);
+    }
+
+    const CpuPlanes nv12 = formatcanon::exportRgba8ToNv12(rgba, color);
+    QVERIFY(nv12.isValid());
+    QCOMPARE(int(nv12.format), int(FramePixelFormat::Nv12));
+    QCOMPARE(nv12.stride[1], 2);
+    QVERIFY(qAbs(int(uchar(nv12.plane[1].at(0))) - 100) <= 2);
+    QVERIFY(qAbs(int(uchar(nv12.plane[1].at(1))) - 150) <= 2);
 }
 
 QTEST_GUILESS_MAIN(TestFormatCanon)
