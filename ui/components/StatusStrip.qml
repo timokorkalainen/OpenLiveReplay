@@ -11,17 +11,26 @@ RowLayout {
     readonly property bool hasUi: root.ui !== undefined && root.ui !== null
     property bool configOpen: false
     property string recordingError: ""
+    readonly property int avail: root.parent ? root.parent.width : root.width
     readonly property int tallyCount: root.hasUi ? Math.max(0, Math.min(16, root.ui.multiviewCount)) : 4
     readonly property int sourceConnectionVersion: root.hasUi ? root.ui.sourceConnectionVersion : 0
     readonly property int sourceStatsVersion: root.hasUi ? root.ui.sourceStatsVersion : 0
+    readonly property bool tight: root.avail <= Theme.bpMD
+    readonly property bool compact: root.avail < Theme.bpMD
+    readonly property bool tiny: root.avail <= Theme.bpSM
+    readonly property bool tallyDots: root.compact
+                                      || root.tallyCount > 8
+                                      || (root.avail < Theme.bpLG && root.tallyCount > 4)
+    readonly property int tallyDotSize: Math.max(6, Theme.dotSize - 4)
 
     signal toggleConfig()
     signal fullscreenMultiviewRequested(real x, real y)
 
     Layout.fillWidth: true
+    Layout.minimumWidth: 0
     implicitHeight: Theme.hControl
     height: Theme.hControl
-    spacing: Theme.s3
+    spacing: root.compact || root.tight ? Theme.s1 : Theme.s3
 
     function formatTimecode(ms) {
         if (root.hasUi) return root.ui.recordTimecode(ms)
@@ -50,8 +59,10 @@ RowLayout {
     Button {
         id: recordButton
         Layout.preferredHeight: Theme.hControl
-        Layout.minimumWidth: 108
-        text: root.hasUi && root.ui.isRecording ? "STOP" : "START"
+        Layout.minimumWidth: root.tiny ? 64 : (root.compact ? 76 : 108)
+        text: root.tiny && !(root.hasUi && root.ui.isRecording)
+              ? "REC"
+              : (root.hasUi && root.ui.isRecording ? "STOP" : "START")
         enabled: root.hasUi
         highlighted: root.hasUi && root.ui.isRecording
         onClicked: root.ui.isRecording ? root.ui.stopRecording() : root.ui.startRecording()
@@ -62,8 +73,8 @@ RowLayout {
 
     Text {
         Layout.alignment: Qt.AlignVCenter
-        Layout.minimumWidth: 118
-        text: "REC " + root.formatTimecode(root.hasUi ? root.ui.recordedDurationMs : 0)
+        Layout.minimumWidth: root.tiny ? 76 : (root.compact ? 104 : 118)
+        text: (root.tiny ? "" : "REC ") + root.formatTimecode(root.hasUi ? root.ui.recordedDurationMs : 0)
         color: root.hasUi && root.ui.isRecording ? Theme.recordOnAir : Theme.textDim
         font.family: Theme.fontMono
         font.pixelSize: Theme.fsTcInline
@@ -73,7 +84,7 @@ RowLayout {
     Text {
         id: masterClock
         Layout.alignment: Qt.AlignVCenter
-        Layout.minimumWidth: 110
+        Layout.minimumWidth: root.tiny ? 70 : (root.compact ? 76 : 110)
         text: root.hasUi ? root.ui.playbackTimecode : "00:00:00"
         color: Theme.textHi
         font.family: Theme.fontMono
@@ -93,32 +104,41 @@ RowLayout {
 
     RowLayout {
         Layout.alignment: Qt.AlignVCenter
-        spacing: Theme.s1
+        spacing: root.tallyDots ? 1 : Theme.s1
 
         Repeater {
             model: root.tallyCount
 
-            delegate: Rectangle {
+            delegate: Item {
                 id: tallyChip
                 required property int index
 
-                Layout.preferredWidth: 22
+                Layout.preferredWidth: root.tallyDots ? root.tallyDotSize : 44
                 Layout.preferredHeight: Theme.hCompact
-                radius: Theme.r1
-                color: root.tallyColor(tallyChip.index)
-                border.color: root.hasUi && root.ui.isRecording ? Theme.lineStrong : Theme.line
-                border.width: Theme.borderW
 
-                Text {
+                Rectangle {
+                    id: tallyFill
+
                     anchors.centerIn: parent
-                    text: tallyChip.index + 1
-                    color: tallyChip.color === Theme.armed
-                           || tallyChip.color === Theme.error
-                           || tallyChip.color === Theme.ready
-                           ? Theme.textOnTally
-                           : Theme.textHi
-                    font.family: Theme.fontMono
-                    font.pixelSize: Theme.fsMicro
+                    width: root.tallyDots ? root.tallyDotSize : parent.width
+                    height: root.tallyDots ? root.tallyDotSize : parent.height
+                    radius: root.tallyDots ? root.tallyDotSize / 2 : Theme.r1
+                    color: root.tallyColor(tallyChip.index)
+                    border.color: root.hasUi && root.ui.isRecording ? Theme.lineStrong : Theme.line
+                    border.width: Theme.borderW
+
+                    Text {
+                        anchors.centerIn: parent
+                        visible: !root.tallyDots
+                        text: "CAM" + (tallyChip.index + 1)
+                        color: tallyFill.color === Theme.armed
+                               || tallyFill.color === Theme.error
+                               || tallyFill.color === Theme.ready
+                               ? Theme.textOnTally
+                               : Theme.textHi
+                        font.family: Theme.fontMono
+                        font.pixelSize: 10
+                    }
                 }
             }
         }
@@ -143,7 +163,11 @@ RowLayout {
     Button {
         id: fullscreenButton
         Layout.preferredHeight: Theme.hControl
-        text: "Fullscreen Multiview"
+        Layout.preferredWidth: root.tiny ? Theme.hControl : implicitWidth
+        Layout.minimumWidth: root.tiny ? Theme.hControl : 64
+        leftPadding: root.tiny ? Theme.s1 : Theme.s3
+        rightPadding: root.tiny ? Theme.s1 : Theme.s3
+        text: root.tiny ? "▾" : "Fullscreen Multiview"
         onClicked: root.fullscreenMultiviewRequested(fullscreenButton.x,
                                                      fullscreenButton.y + fullscreenButton.height + Theme.s1)
 
@@ -152,8 +176,12 @@ RowLayout {
     }
 
     Button {
+        Layout.preferredWidth: root.tiny ? 44 : implicitWidth
+        Layout.minimumWidth: root.tiny ? 44 : 64
         Layout.preferredHeight: Theme.hControl
-        text: "Config"
+        leftPadding: root.tiny ? Theme.s1 : Theme.s3
+        rightPadding: root.tiny ? Theme.s1 : Theme.s3
+        text: root.tiny ? "Cfg" : "Config"
         highlighted: root.configOpen
         onClicked: root.toggleConfig()
 

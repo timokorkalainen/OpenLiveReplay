@@ -12,8 +12,8 @@ ApplicationWindow {
     visible: true
     width: 1200
     height: 760
-    // Floor below which controls would be lost: the OS can't shrink past it, and
-    // every tab scrolls so the floor only needs to cover one transport row.
+    // Floor below which the pinned StatusStrip, minimal PgmStage, and TransportDock
+    // would lose legibility. Only the stage fills surplus vertical space.
     minimumWidth: Theme.windowMinW
     minimumHeight: Theme.windowMinH
     color: Theme.canvas

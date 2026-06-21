@@ -20,7 +20,9 @@ Drawer {
     }
 
     edge: Qt.RightEdge
-    width: Math.min(root.parent ? root.parent.width : Theme.bpSM, Theme.bpSM * 1.4)
+    width: root.parent && root.parent.width < Theme.bpSM
+           ? root.parent.width
+           : Math.min(root.parent ? root.parent.width : Theme.bpSM, Theme.bpSM * 1.4)
     height: root.parent ? root.parent.height : 0
     modal: true
     dim: true

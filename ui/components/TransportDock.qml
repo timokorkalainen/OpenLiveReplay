@@ -11,8 +11,17 @@ ColumnLayout {
     property bool showTimeOfDay: ui ? ui.timeOfDayMode : false
     property int clockTick: 0
     property bool holdWasPlaying: false
+    readonly property int avail: root.parent ? root.parent.width : root.width
+    readonly property bool tight: root.avail <= Theme.bpMD
+    readonly property bool compact: root.avail < Theme.bpMD
+    readonly property int compactTimeWidth: 54
+    readonly property int compactShuttleWidth: 26
+    readonly property int compactCaptureWidth: 40
 
     Layout.fillWidth: true
+    Layout.minimumWidth: 0
+    Layout.preferredHeight: implicitHeight
+    implicitHeight: scrubBar.implicitHeight + cueRow.implicitHeight + transportRow.implicitHeight + root.spacing * 2
     spacing: 8
 
     function formatTimecode(ms) {
@@ -94,27 +103,58 @@ ColumnLayout {
     // a frame-perfect cut, honoring per-entry speed; a manual scrub or
     // recall exits playout.
     RowLayout {
+        id: cueRow
+
         Layout.alignment: Qt.AlignHCenter
-        spacing: 8
-        Button { text: "Mark In"; enabled: root.hasUi; onClicked: root.ui.markIn() }
-        Button { text: "Mark Out"; enabled: root.hasUi; onClicked: root.ui.markOut() }
-        Button { text: "Recall 0"; enabled: root.hasUi; onClicked: root.ui.recallEntry(0) }
+        spacing: root.compact || root.tight ? Theme.s1 : 8
         Button {
-            text: "Play Playlist"
+            Layout.preferredWidth: root.compact ? 44 : implicitWidth
+            leftPadding: root.compact ? Theme.s1 : Theme.s3
+            rightPadding: root.compact ? Theme.s1 : Theme.s3
+            text: root.compact ? "In" : "Mark In"
+            enabled: root.hasUi
+            onClicked: root.ui.markIn()
+        }
+        Button {
+            Layout.preferredWidth: root.compact ? 48 : implicitWidth
+            leftPadding: root.compact ? Theme.s1 : Theme.s3
+            rightPadding: root.compact ? Theme.s1 : Theme.s3
+            text: root.compact ? "Out" : "Mark Out"
+            enabled: root.hasUi
+            onClicked: root.ui.markOut()
+        }
+        Button {
+            Layout.preferredWidth: root.compact ? 42 : implicitWidth
+            leftPadding: root.compact ? Theme.s1 : Theme.s3
+            rightPadding: root.compact ? Theme.s1 : Theme.s3
+            text: root.compact ? "R0" : "Recall 0"
+            enabled: root.hasUi
+            onClicked: root.ui.recallEntry(0)
+        }
+        Button {
+            Layout.preferredWidth: root.compact ? 70 : implicitWidth
+            leftPadding: root.compact ? Theme.s1 : Theme.s3
+            rightPadding: root.compact ? Theme.s1 : Theme.s3
+            text: root.compact ? "Playlist" : "Play Playlist"
             enabled: root.hasUi
             onClicked: root.ui.playPlaylist(0)
         }
         Button {
-            text: "Stop Playout"
+            Layout.preferredWidth: root.compact ? 56 : implicitWidth
+            leftPadding: root.compact ? Theme.s1 : Theme.s3
+            rightPadding: root.compact ? Theme.s1 : Theme.s3
+            text: root.compact ? "Stop" : "Stop Playout"
             enabled: root.hasUi
             onClicked: root.ui.stopPlaylistPlayout()
         }
     }
 
     RowLayout {
+        id: transportRow
+
         Layout.alignment: Qt.AlignHCenter
         Layout.fillWidth: true
-        spacing: 12
+        spacing: root.compact || root.tight ? Theme.s1 : 12
 
         Text {
             // Single source of truth (UIManager): the same string the
@@ -122,8 +162,10 @@ ColumnLayout {
             text: root.hasUi ? root.ui.playbackTimecode : "00:00:00"
             color: Theme.textHi
             font.family: Theme.fontMono
-            font.pixelSize: 14
+            font.pixelSize: root.compact || root.tight ? Theme.fsMicro : 14
             Layout.alignment: Qt.AlignVCenter
+            Layout.preferredWidth: root.compact || root.tight ? root.compactTimeWidth : implicitWidth
+            elide: Text.ElideRight
             MouseArea {
                 anchors.fill: parent
                 enabled: root.hasUi
@@ -131,7 +173,10 @@ ColumnLayout {
             }
         }
 
-        Item { Layout.fillWidth: true }
+        Item {
+            Layout.fillWidth: true
+            visible: !root.compact
+        }
 
         Button {
             text: root.hasUi && root.ui.transport.isPlaying ? "PAUSE" : "PLAY"
@@ -140,110 +185,142 @@ ColumnLayout {
             highlighted: root.hasUi && root.ui.transport.isPlaying
         }
 
-        Button {
-            text: "-5.0x"
-            enabled: root.hasUi
-            onPressed: {
-                root.ui.cancelFollowLive()
-                root.holdWasPlaying = root.ui.transport.isPlaying
-                root.ui.transport.setSpeed(-5.0)
-                root.ui.transport.setPlaying(true)
-            }
-            onReleased: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-            onCanceled: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-        }
+        RowLayout {
+            spacing: root.compact ? 1 : (root.tight ? Theme.s1 : 12)
 
-        Button {
-            text: "<"
-            enabled: root.hasUi
-            onClicked: root.ui.stepFrameBack()
-        }
+            Button {
+                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                leftPadding: root.compact ? Theme.s1 : Theme.s3
+                rightPadding: root.compact ? Theme.s1 : Theme.s3
+                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                text: root.compact ? "-5" : "-5.0x"
+                enabled: root.hasUi
+                onPressed: {
+                    root.ui.cancelFollowLive()
+                    root.holdWasPlaying = root.ui.transport.isPlaying
+                    root.ui.transport.setSpeed(-5.0)
+                    root.ui.transport.setPlaying(true)
+                }
+                onReleased: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
+                onCanceled: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
+            }
 
-        Button {
-            text: ">"
-            enabled: root.hasUi
-            onClicked: root.ui.stepFrame()
-        }
+            Button {
+                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                leftPadding: root.compact ? Theme.s1 : Theme.s3
+                rightPadding: root.compact ? Theme.s1 : Theme.s3
+                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                text: "<"
+                enabled: root.hasUi
+                onClicked: root.ui.stepFrameBack()
+            }
 
-        Button {
-            text: "0.25x"
-            enabled: root.hasUi
-            onPressed: {
-                root.ui.cancelFollowLive()
-                root.holdWasPlaying = root.ui.transport.isPlaying
-                root.ui.transport.setSpeed(0.25)
-                root.ui.transport.setPlaying(true)
+            Button {
+                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                leftPadding: root.compact ? Theme.s1 : Theme.s3
+                rightPadding: root.compact ? Theme.s1 : Theme.s3
+                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                text: ">"
+                enabled: root.hasUi
+                onClicked: root.ui.stepFrame()
             }
-            onReleased: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-            onCanceled: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-        }
 
-        Button {
-            text: "0.5x"
-            enabled: root.hasUi
-            onPressed: {
-                root.ui.cancelFollowLive()
-                root.holdWasPlaying = root.ui.transport.isPlaying
-                root.ui.transport.setSpeed(0.5)
-                root.ui.transport.setPlaying(true)
+            Button {
+                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                leftPadding: root.compact ? Theme.s1 : Theme.s3
+                rightPadding: root.compact ? Theme.s1 : Theme.s3
+                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                text: root.compact ? "¼" : "0.25x"
+                enabled: root.hasUi
+                onPressed: {
+                    root.ui.cancelFollowLive()
+                    root.holdWasPlaying = root.ui.transport.isPlaying
+                    root.ui.transport.setSpeed(0.25)
+                    root.ui.transport.setPlaying(true)
+                }
+                onReleased: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
+                onCanceled: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
             }
-            onReleased: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-            onCanceled: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-        }
 
-        Button {
-            text: "2.0x"
-            enabled: root.hasUi
-            onPressed: {
-                root.ui.cancelFollowLive()
-                root.holdWasPlaying = root.ui.transport.isPlaying
-                root.ui.transport.setSpeed(2.0)
-                root.ui.transport.setPlaying(true)
+            Button {
+                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                leftPadding: root.compact ? Theme.s1 : Theme.s3
+                rightPadding: root.compact ? Theme.s1 : Theme.s3
+                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                text: root.compact ? "½" : "0.5x"
+                enabled: root.hasUi
+                onPressed: {
+                    root.ui.cancelFollowLive()
+                    root.holdWasPlaying = root.ui.transport.isPlaying
+                    root.ui.transport.setSpeed(0.5)
+                    root.ui.transport.setPlaying(true)
+                }
+                onReleased: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
+                onCanceled: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
             }
-            onReleased: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-            onCanceled: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-        }
 
-        Button {
-            text: "5.0x"
-            enabled: root.hasUi
-            onPressed: {
-                root.ui.cancelFollowLive()
-                root.holdWasPlaying = root.ui.transport.isPlaying
-                root.ui.transport.setSpeed(5.0)
-                root.ui.transport.setPlaying(true)
+            Button {
+                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                leftPadding: root.compact ? Theme.s1 : Theme.s3
+                rightPadding: root.compact ? Theme.s1 : Theme.s3
+                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                text: root.compact ? "2" : "2.0x"
+                enabled: root.hasUi
+                onPressed: {
+                    root.ui.cancelFollowLive()
+                    root.holdWasPlaying = root.ui.transport.isPlaying
+                    root.ui.transport.setSpeed(2.0)
+                    root.ui.transport.setPlaying(true)
+                }
+                onReleased: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
+                onCanceled: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
             }
-            onReleased: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
-            }
-            onCanceled: {
-                root.ui.transport.setSpeed(1.0)
-                root.ui.transport.setPlaying(root.holdWasPlaying)
+
+            Button {
+                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                leftPadding: root.compact ? Theme.s1 : Theme.s3
+                rightPadding: root.compact ? Theme.s1 : Theme.s3
+                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                text: root.compact ? "5" : "5.0x"
+                enabled: root.hasUi
+                onPressed: {
+                    root.ui.cancelFollowLive()
+                    root.holdWasPlaying = root.ui.transport.isPlaying
+                    root.ui.transport.setSpeed(5.0)
+                    root.ui.transport.setPlaying(true)
+                }
+                onReleased: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
+                onCanceled: {
+                    root.ui.transport.setSpeed(1.0)
+                    root.ui.transport.setPlaying(root.holdWasPlaying)
+                }
             }
         }
 
@@ -258,12 +335,19 @@ ColumnLayout {
         }
 
         Button {
-            text: "Capture"
+            Layout.preferredWidth: root.compact ? root.compactCaptureWidth : implicitWidth
+            leftPadding: root.compact ? Theme.s1 : Theme.s3
+            rightPadding: root.compact ? Theme.s1 : Theme.s3
+            font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+            text: root.compact ? "Cap" : "Capture"
             enabled: root.hasUi
             onClicked: root.ui.captureCurrent()
         }
 
-        Item { Layout.fillWidth: true }
+        Item {
+            Layout.fillWidth: true
+            visible: !root.compact
+        }
 
         Text {
             text: root.showTimeOfDay
@@ -273,8 +357,10 @@ ColumnLayout {
                 : root.formatTimecode(root.hasUi ? root.ui.recordedDurationMs : 0)
             color: Theme.textHi
             font.family: Theme.fontMono
-            font.pixelSize: 14
+            font.pixelSize: root.compact || root.tight ? Theme.fsMicro : 14
             Layout.alignment: Qt.AlignVCenter
+            Layout.preferredWidth: root.compact || root.tight ? root.compactTimeWidth : implicitWidth
+            elide: Text.ElideRight
             MouseArea {
                 anchors.fill: parent
                 enabled: root.hasUi
