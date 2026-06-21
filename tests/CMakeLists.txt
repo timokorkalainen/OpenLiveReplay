@@ -223,6 +223,7 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/output/outputframecache.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputtargetassignment.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/gpureadbacktelemetry.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputdispatcher.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/broadcastoutputstatus.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputruntime.cpp"

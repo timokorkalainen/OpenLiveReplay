@@ -202,6 +202,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/broadcastoutputstatus.h playback/output/broadcastoutputstatus.cpp
         playback/output/outputbusengine.h playback/output/outputbusengine.cpp
         playback/output/outputsink.h
+        playback/output/gpureadbacktelemetry.h playback/output/gpureadbacktelemetry.cpp
         playback/output/outputdispatcher.h playback/output/outputdispatcher.cpp
         playback/output/outputruntime.h playback/output/outputruntime.cpp
         playback/output/queuedoutputsink.h playback/output/queuedoutputsink.cpp
