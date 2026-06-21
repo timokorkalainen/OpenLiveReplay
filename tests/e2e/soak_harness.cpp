@@ -99,10 +99,10 @@ OutputFrameCache buildStaticCache(int feedCount, int width, int height, FrameRat
     const qint64 frameCount = qint64(seconds + 1) * rate.numerator / rate.denominator + 4;
     for (int feed = 0; feed < feedCount; ++feed) {
         for (qint64 i = 0; i < frameCount; ++i) {
-            MediaVideoFrame v = MediaVideoFrame::solidYuv420p(
-                width, height, uchar(16 + ((i + feed) & 0x3F)), 128, 128);
-            v.feedIndex = feed;
-            v.ptsMs = rate.frameIndexToMs(i);
+            FrameHandle v =
+                solidYuv420pHandle(width, height, uchar(16 + ((i + feed) & 0x3F)), 128, 128);
+            v.metadata().key.feedIndex = feed;
+            v.metadata().key.ptsMs = rate.frameIndexToMs(i);
             cache.insertVideoFrame(v);
         }
     }

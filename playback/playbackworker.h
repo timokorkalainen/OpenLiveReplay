@@ -15,6 +15,7 @@
 #include "frameprovider.h"
 #include "playback/commitgate.h"
 #include "playback/frameindex.h"
+#include "playback/output/colormetadata.h"
 #include "playback/output/outputruntime.h"
 #include "playback/output/sharedcacheslot.h"
 #include "playback/output/outputtargetassignment.h"
@@ -30,6 +31,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/error.h>
 }
+
+ColorMetadata colorMetadataForAvFrame(const AVFrame* frame);
 
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
@@ -159,7 +162,7 @@ private:
     static constexpr int kPrerollAudioSpanMs = 800;  // active-view audio staged ahead of a cut
 
     // High-performance conversion from FFmpeg AVFrame to backend YUV420P media frames.
-    MediaVideoFrame convertToMediaVideoFrame(AVFrame* frame, int feedIndex);
+    FrameHandle convertToMediaVideoFrame(AVFrame* frame, int feedIndex);
 
     // --- Scheduler helpers (spec §3 symbols / §6). Task 5 wires the loop;
     //     bodies are implemented here except repositionTo (stubbed). ---------

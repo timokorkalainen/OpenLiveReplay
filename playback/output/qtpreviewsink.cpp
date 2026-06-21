@@ -9,7 +9,7 @@
 
 QtPreviewSink::QtPreviewSink(FrameProvider* provider) : m_provider(provider) {}
 
-bool QtPreviewSink::deliver(const MediaVideoFrame& frame) {
+bool QtPreviewSink::deliver(const FrameHandle& frame) {
     if (!m_provider) return false;
     QVideoFrame qFrame = toQVideoFrame(frame);
     if (!qFrame.isValid()) return false;
@@ -17,25 +17,44 @@ bool QtPreviewSink::deliver(const MediaVideoFrame& frame) {
     return true;
 }
 
-QVideoFrame QtPreviewSink::toQVideoFrame(const MediaVideoFrame& frame) {
-    if (!frame.isValid()) return QVideoFrame();
-    QVideoFrameFormat format(QSize(frame.width, frame.height), QVideoFrameFormat::Format_YUV420P);
-    format.setColorSpace(frame.height > 576 ? QVideoFrameFormat::ColorSpace_BT709
-                                            : QVideoFrameFormat::ColorSpace_BT601);
-    format.setColorRange(QVideoFrameFormat::ColorRange_Video);
+QVideoFrameFormat::ColorSpace qtColorSpaceFor(ColorMatrix matrix) {
+    switch (matrix) {
+    case ColorMatrix::Bt601:
+        return QVideoFrameFormat::ColorSpace_BT601;
+    case ColorMatrix::Bt2020:
+        return QVideoFrameFormat::ColorSpace_BT2020;
+    case ColorMatrix::Bt709:
+        return QVideoFrameFormat::ColorSpace_BT709;
+    }
+    return QVideoFrameFormat::ColorSpace_BT709;
+}
+
+QVideoFrameFormat::ColorRange qtColorRangeFor(ColorRange range) {
+    return range == ColorRange::Full ? QVideoFrameFormat::ColorRange_Full
+                                     : QVideoFrameFormat::ColorRange_Video;
+}
+
+QVideoFrame QtPreviewSink::toQVideoFrame(const FrameHandle& frame) {
+    const MediaVideoFrameView view(frame);
+    if (!view.isValid()) return QVideoFrame();
+    QVideoFrameFormat format(QSize(view.width, view.height), QVideoFrameFormat::Format_YUV420P);
+    const ColorMetadata& color = frame.metadata().color;
+    format.setColorSpace(qtColorSpaceFor(color.matrix));
+    format.setColorRange(qtColorRangeFor(color.range));
 
     QVideoFrame qFrame(format);
     if (!qFrame.map(QVideoFrame::WriteOnly)) return QVideoFrame();
 
-    const QByteArray planes[3] = {frame.planeY, frame.planeU, frame.planeV};
-    const int srcStrides[3] = {frame.strideY, frame.strideU, frame.strideV};
+    const QByteArray planes[3] = {view.planeY, view.planeU, view.planeV};
+    const int srcStrides[3] = {view.strideY, view.strideU, view.strideV};
     for (int i = 0; i < 3; ++i) {
-        const int height = (i == 0) ? frame.height : (frame.height + 1) / 2;
-        const int width = (i == 0) ? frame.width : (frame.width + 1) / 2;
+        const int height = (i == 0) ? view.height : (view.height + 1) / 2;
+        const int width = (i == 0) ? view.width : (view.width + 1) / 2;
         const int copyW = qMin(width, qMin(srcStrides[i], qFrame.bytesPerLine(i)));
         for (int y = 0; y < height; ++y) {
-            std::memcpy(qFrame.bits(i) + y * qFrame.bytesPerLine(i),
-                        planes[i].constData() + y * srcStrides[i], size_t(copyW));
+            std::memcpy(qFrame.bits(i) + static_cast<qsizetype>(y) * qFrame.bytesPerLine(i),
+                        planes[i].constData() + static_cast<qsizetype>(y) * srcStrides[i],
+                        size_t(copyW));
         }
     }
     qFrame.unmap();

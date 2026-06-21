@@ -49,7 +49,7 @@ struct OutputBusFrame {
     // backward/duplicate values. (The normal output path keeps identity-skip on, so a held
     // paused frame is not re-emitted with a repeating timecode.)
     qint64 programmeTimecode100ns = -1;
-    MediaVideoFrame video;
+    FrameHandle video;
     MediaAudioFrame audio;
     OutputFrameIdentity identity;
 };
@@ -64,7 +64,7 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 struct MultiviewComposite {
     bool valid = false;
     QVector<qint64> sourceKeys; // 2 entries per feed: present flag, then selected pts
-    MediaVideoFrame video;
+    FrameHandle video;
 };
 
 class OutputBusEngine {

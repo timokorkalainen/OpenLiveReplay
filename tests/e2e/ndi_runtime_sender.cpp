@@ -55,11 +55,10 @@ MediaAudioFrame makeAudio(qint64 frameIndex, FrameRate rate) {
 
 void insertFrame(OutputFrameCache* cache, qint64 frameIndex, FrameRate rate, int width,
                  int height) {
-    MediaVideoFrame video =
-        MediaVideoFrame::solidYuv420p(width, height, uchar(64 + (frameIndex % 128)), 96, 160);
-    video.feedIndex = 0;
-    video.ptsMs = rate.frameIndexToMs(frameIndex);
-    video.outputFrameIndex = frameIndex;
+    FrameHandle video = solidYuv420pHandle(width, height, uchar(64 + (frameIndex % 128)), 96, 160);
+    video.metadata().key.feedIndex = 0;
+    video.metadata().key.ptsMs = rate.frameIndexToMs(frameIndex);
+    video.metadata().outputFrameIndex = frameIndex;
     cache->insertVideoFrame(video);
     cache->insertAudioFrame(makeAudio(frameIndex, rate));
 }

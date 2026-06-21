@@ -25,10 +25,10 @@ OutputBusFrame validFrame(qint64 outputFrameIndex, qint64 playheadMs, uchar y) {
     frame.bus = OutputBusId::feed(0);
     frame.outputFrameIndex = outputFrameIndex;
     frame.sampledPlayheadMs = playheadMs;
-    frame.video = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    frame.video.feedIndex = 0;
-    frame.video.ptsMs = playheadMs;
-    frame.video.outputFrameIndex = outputFrameIndex;
+    frame.video = solidYuv420pHandle(4, 4, y, 128, 128);
+    frame.video.metadata().key.feedIndex = 0;
+    frame.video.metadata().key.ptsMs = playheadMs;
+    frame.video.metadata().outputFrameIndex = outputFrameIndex;
     frame.audio.feedIndex = 0;
     frame.audio.sampleRate = 48000;
     frame.audio.channels = 2;
@@ -39,11 +39,11 @@ OutputBusFrame validFrame(qint64 outputFrameIndex, qint64 playheadMs, uchar y) {
 
 } // namespace
 
-static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = feed;
-    f.ptsMs = pts;
-    f.outputFrameIndex = 7;
+static FrameHandle video(int feed, qint64 pts, uchar y) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
+    f.metadata().key.feedIndex = feed;
+    f.metadata().key.ptsMs = pts;
+    f.metadata().outputFrameIndex = 7;
     return f;
 }
 
@@ -192,7 +192,7 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
     QCOMPARE(backend.sentFrames.size(), 1);
     QCOMPARE(backend.sentFrames[0].bus, OutputBusId::feed(0));
     QCOMPARE(backend.sentFrames[0].outputFrameIndex, qint64(7));
-    QCOMPARE(uchar(backend.sentFrames[0].video.planeY.at(0)), uchar(90));
+    QCOMPARE(uchar(MediaVideoFrameView(backend.sentFrames[0].video).planeY.at(0)), uchar(90));
     // The programme timecode survives the submit -> backend path unscaled/unswapped.
     QCOMPARE(backend.sentFrames[0].programmeTimecode100ns, qint64(2000000));
 }

@@ -36,14 +36,14 @@ bool isSilentAudio(const MediaAudioFrame& audio) {
 // the hash metadata-only lets repeated-payload detection stay correct while removing the
 // per-frame O(pixels) cost. Multiview overrides videoHash with its source-content
 // signature (see renderMultiview) because its composed buffer has no single source pts.
-quint32 videoHashFor(const MediaVideoFrame& video) {
+quint32 videoHashFor(const FramePayloadKey& key) {
     quint32 hash = kFnvOffset;
-    hash = hashInt(hash, video.feedIndex);
-    hash = hashInt(hash, video.ptsMs);
-    hash = hashInt(hash, video.width);
-    hash = hashInt(hash, video.height);
-    hash = hashInt(hash, int(video.format));
-    hash = hashInt(hash, video.isPlaceholder ? 1 : 0);
+    hash = hashInt(hash, key.feedIndex);
+    hash = hashInt(hash, key.ptsMs);
+    hash = hashInt(hash, key.width);
+    hash = hashInt(hash, key.height);
+    hash = hashInt(hash, int(key.format));
+    hash = hashInt(hash, key.isPlaceholder ? 1 : 0);
     return hash;
 }
 
@@ -75,15 +75,16 @@ QDebug operator<<(QDebug debug, const OutputFrameIdentity& identity) {
 }
 
 OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame) {
+    const FramePayloadKey& videoKey = frame.video.metadata().key;
     OutputFrameIdentity identity;
     identity.bus = frame.bus;
     identity.outputFrameIndex = frame.outputFrameIndex;
     identity.sampledPlayheadMs = frame.sampledPlayheadMs;
-    identity.sourceFeedIndex = frame.video.feedIndex;
-    identity.sourcePtsMs = frame.video.ptsMs;
-    identity.videoPlaceholder = frame.video.isPlaceholder;
+    identity.sourceFeedIndex = videoKey.feedIndex;
+    identity.sourcePtsMs = videoKey.ptsMs;
+    identity.videoPlaceholder = videoKey.isPlaceholder;
     identity.audioSilent = isSilentAudio(frame.audio);
-    identity.videoHash = videoHashFor(frame.video);
+    identity.videoHash = videoHashFor(videoKey);
     identity.audioHash = audioHashFor(frame.audio);
     return identity;
 }
@@ -131,20 +132,20 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     sourceKeys.reserve(m_feedCount * 2);
     qint64 sourcePtsMs = 0;
     for (int feed = 0; feed < m_feedCount; ++feed) {
-        const std::optional<MediaVideoFrame> src = cache.videoFrameAt(feed, out.sampledPlayheadMs);
-        const qint64 pts = src ? src->ptsMs : kAbsentFeedPts;
+        const std::optional<FrameHandle> src = cache.videoFrameAt(feed, out.sampledPlayheadMs);
+        const qint64 pts = src ? src->metadata().key.ptsMs : kAbsentFeedPts;
         sourceKeys.append(src ? 1 : 0);
         sourceKeys.append(pts);
         sourceSignature = hashInt(sourceSignature, feed);
         sourceSignature = hashInt(sourceSignature, pts);
         sourceSignature = hashInt(sourceSignature, src ? 0 : 1);
-        if (src) sourcePtsMs = qMax(sourcePtsMs, src->ptsMs);
+        if (src) sourcePtsMs = qMax(sourcePtsMs, src->metadata().key.ptsMs);
     }
 
     if (memo && memo->valid && memo->sourceKeys == sourceKeys) {
         out.video = memo->video; // reuse composited planes (copy-on-write share)
     } else {
-        QList<MediaVideoFrame> frames;
+        QList<FrameHandle> frames;
         for (int feed = 0; feed < m_feedCount; ++feed) {
             frames.append(cache.videoFrameOrPlaceholder(feed, out.sampledPlayheadMs));
         }
@@ -158,8 +159,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
 
     // Identity must reflect the composited source content, not the advancing playhead,
     // so repeated-payload detection works when the underlying feeds are frozen.
-    out.video.ptsMs = sourcePtsMs;
-    out.video.outputFrameIndex = outputFrameIndex;
+    out.video.metadata().key.ptsMs = sourcePtsMs;
+    out.video.metadata().outputFrameIndex = outputFrameIndex;
 
     out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
     out.identity = outputFrameIdentityFor(out);
@@ -181,12 +182,12 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     if (feedIndex >= 0 && feedIndex < m_feedCount) {
         out.video = cache.videoFrameOrPlaceholder(feedIndex, out.sampledPlayheadMs);
     } else {
-        out.video = MediaVideoFrame::solidYuv420p(m_width, m_height, 16, 128, 128);
-        out.video.feedIndex = feedIndex;
-        out.video.ptsMs = out.sampledPlayheadMs;
-        out.video.isPlaceholder = true;
+        out.video = solidYuv420pHandle(m_width, m_height, 16, 128, 128);
+        out.video.metadata().key.feedIndex = feedIndex;
+        out.video.metadata().key.ptsMs = out.sampledPlayheadMs;
+        out.video.metadata().key.isPlaceholder = true;
     }
-    out.video.outputFrameIndex = outputFrameIndex;
+    out.video.metadata().outputFrameIndex = outputFrameIndex;
 
     out.audio = renderAudioForFeed(feedIndex, outputFrameIndex, state, cache, allowAudio);
     out.identity = outputFrameIdentityFor(out);

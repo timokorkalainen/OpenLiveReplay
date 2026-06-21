@@ -8,38 +8,41 @@ OutputFrameCache::OutputFrameCache(int feedCount, int placeholderWidth, int plac
       m_placeholderWidth(qMax(2, placeholderWidth)),
       m_placeholderHeight(qMax(2, placeholderHeight)) {}
 
-void OutputFrameCache::insertVideoFrame(const MediaVideoFrame& frame) {
-    if (frame.feedIndex < 0 || frame.feedIndex >= m_video.size() || !frame.isValid()) return;
-    auto& list = m_video[frame.feedIndex];
-    auto it = std::lower_bound(list.begin(), list.end(), frame.ptsMs,
-                               [](const MediaVideoFrame& f, qint64 pts) { return f.ptsMs < pts; });
-    if (it != list.end() && it->ptsMs == frame.ptsMs) {
+void OutputFrameCache::insertVideoFrame(const FrameHandle& frame) {
+    const FramePayloadKey& key = frame.metadata().key;
+    if (key.feedIndex < 0 || key.feedIndex >= m_video.size() || !frame.isValid()) return;
+    auto& list = m_video[key.feedIndex];
+    auto it =
+        std::lower_bound(list.begin(), list.end(), key.ptsMs, [](const FrameHandle& f, qint64 pts) {
+            return f.metadata().key.ptsMs < pts;
+        });
+    if (it != list.end() && it->metadata().key.ptsMs == key.ptsMs) {
         *it = frame;
     } else {
         list.insert(it, frame);
     }
 }
 
-std::optional<MediaVideoFrame> OutputFrameCache::videoFrameAt(int feedIndex,
-                                                              qint64 playheadMs) const {
+std::optional<FrameHandle> OutputFrameCache::videoFrameAt(int feedIndex, qint64 playheadMs) const {
     if (feedIndex < 0 || feedIndex >= m_video.size()) return std::nullopt;
     const auto& list = m_video[feedIndex];
     if (list.isEmpty()) return std::nullopt;
-    auto it = std::upper_bound(list.begin(), list.end(), playheadMs,
-                               [](qint64 pts, const MediaVideoFrame& f) { return pts < f.ptsMs; });
+    auto it = std::upper_bound(
+        list.begin(), list.end(), playheadMs,
+        [](qint64 pts, const FrameHandle& f) { return pts < f.metadata().key.ptsMs; });
     if (it == list.begin()) return std::nullopt;
     --it;
     return *it;
 }
 
-MediaVideoFrame OutputFrameCache::videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const {
+FrameHandle OutputFrameCache::videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const {
     auto frame = videoFrameAt(feedIndex, playheadMs);
     if (frame.has_value()) return *frame;
-    MediaVideoFrame placeholder =
-        MediaVideoFrame::solidYuv420p(m_placeholderWidth, m_placeholderHeight, 16, 128, 128);
-    placeholder.feedIndex = feedIndex;
-    placeholder.ptsMs = playheadMs;
-    placeholder.isPlaceholder = true;
+    FrameHandle placeholder =
+        solidYuv420pHandle(m_placeholderWidth, m_placeholderHeight, 16, 128, 128);
+    placeholder.metadata().key.feedIndex = feedIndex;
+    placeholder.metadata().key.ptsMs = playheadMs;
+    placeholder.metadata().key.isPlaceholder = true;
     return placeholder;
 }
 
@@ -78,7 +81,7 @@ QByteArray OutputFrameCache::audioSpanOrSilence(int feedIndex, qint64 startSampl
 void OutputFrameCache::mergeFrom(const OutputFrameCache& other) {
     const qsizetype feeds = qMin(m_video.size(), other.m_video.size());
     for (qsizetype feed = 0; feed < feeds; ++feed) {
-        for (const MediaVideoFrame& frame : other.m_video.at(feed))
+        for (const FrameHandle& frame : other.m_video.at(feed))
             insertVideoFrame(frame);
     }
     const qsizetype aFeeds = qMin(m_audio.size(), other.m_audio.size());
@@ -91,7 +94,8 @@ void OutputFrameCache::mergeFrom(const OutputFrameCache& other) {
 void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample) {
     for (auto& frames : m_video) {
         int firstAtOrAfter = 0;
-        while (firstAtOrAfter < frames.size() && frames[firstAtOrAfter].ptsMs < minVideoPtsMs) {
+        while (firstAtOrAfter < frames.size() &&
+               frames[firstAtOrAfter].metadata().key.ptsMs < minVideoPtsMs) {
             ++firstAtOrAfter;
         }
 

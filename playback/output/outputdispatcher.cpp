@@ -1,5 +1,6 @@
 #include "playback/output/outputdispatcher.h"
 
+#include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputframeclock.h"
 
 #include <QHash>
@@ -89,13 +90,14 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
         const OutputBusId bus = endpoint.assignment.sourceBus;
         if (!rendered.contains(bus)) {
             OutputBusFrame frame = renderBus(bus, outputFrameIndex, tickState, cache);
-            if (m_holdLastFrame && frame.video.isPlaceholder && m_lastGoodFrame.contains(bus)) {
+            if (m_holdLastFrame && frame.video.metadata().key.isPlaceholder &&
+                m_lastGoodFrame.contains(bus)) {
                 // Paint the last real video for this bus instead of the gray
                 // placeholder; keep the freshly-rendered audio + identity +
                 // outputFrameIndex so the clock and audio timeline never stall.
                 frame.video = m_lastGoodFrame.value(bus).video;
                 m_stats.heldFrames++;
-            } else if (!frame.video.isPlaceholder) {
+            } else if (!frame.video.metadata().key.isPlaceholder) {
                 m_lastGoodFrame.insert(bus, frame);
             }
             rendered.insert(bus, frame);
@@ -104,7 +106,7 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
             // playhead must track the snapshot playhead. A large divergence means
             // the play epoch was not re-anchored after a seek/cut and the output
             // is rendering the wrong frame (no placeholder/reposition reported).
-            if (tickState.playing && !frame.video.isPlaceholder) {
+            if (tickState.playing && !frame.video.metadata().key.isPlaceholder) {
                 const qint64 d = tickState.playheadMs - frame.sampledPlayheadMs;
                 const qint64 ad = d < 0 ? -d : d;
                 if (ad > m_stats.maxClockDivergenceMs) m_stats.maxClockDivergenceMs = ad;
@@ -131,6 +133,10 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
             m_stats.sinkFailures++;
         }
     }
+
+    const GpuReadbackTelemetrySnapshot gpu = GpuReadbackTelemetry::instance().snapshot();
+    m_stats.gpuReadbacks = gpu.gpuReadbacks;
+    m_stats.redundantGpuReadbacks = gpu.redundantReadbacks;
 
     m_stats.ticks++;
     return m_stats;
@@ -209,7 +215,7 @@ OutputBusFrame OutputDispatcher::renderBus(OutputBusId bus, qint64 outputFrameIn
 }
 
 void OutputDispatcher::countFrameHealth(const OutputBusFrame& frame) {
-    if (frame.video.isPlaceholder) m_stats.placeholderFrames++;
+    if (frame.video.metadata().key.isPlaceholder) m_stats.placeholderFrames++;
     if (isSilentAudio(frame.audio)) m_stats.silentAudioFrames++;
 }
 
@@ -232,7 +238,7 @@ void OutputDispatcher::countTargetAttempt(const OutputTargetAssignment& assignme
     }
     stats.hasLastSubmitResult = true;
     stats.lastSubmitSucceeded = submitted;
-    if (frame.video.isPlaceholder) stats.placeholderFrames++;
+    if (frame.video.metadata().key.isPlaceholder) stats.placeholderFrames++;
     if (isSilentAudio(frame.audio)) stats.silentAudioFrames++;
     if (stats.hasLastIdentity && stats.lastIdentity.samePayloadAs(frame.identity)) {
         stats.repeatedPayloadFrames++;

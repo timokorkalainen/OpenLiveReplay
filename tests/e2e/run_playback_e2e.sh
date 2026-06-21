@@ -248,6 +248,13 @@ maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
 armNextCutArmed="$(get armNextCutArmed)"
 decodedVideoFrames="$(get decodedVideoFrames)"
 stagingVideoFramesDecoded="$(get stagingVideoFramesDecoded)"
+gpuReadbacks="$(get gpuReadbacks)"
+redundantGpuReadbacks="$(get redundantGpuReadbacks)"
+readbackQueueDepth="$(get readbackQueueDepth)"
+readbackDrops="$(get readbackDrops)"
+fenceWaitStalls="$(get fenceWaitStalls)"
+gpuOomDegrades="$(get gpuOomDegrades)"
+gpuVramBytes="$(get gpuVramBytes)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -267,6 +274,13 @@ stagingVideoFramesDecoded="$(get stagingVideoFramesDecoded)"
 [ -n "$armNextCutArmed" ] || armNextCutArmed="?"
 [ -n "$decodedVideoFrames" ] || decodedVideoFrames="?"
 [ -n "$stagingVideoFramesDecoded" ] || stagingVideoFramesDecoded="?"
+[ -n "$gpuReadbacks" ] || gpuReadbacks="?"
+[ -n "$redundantGpuReadbacks" ] || redundantGpuReadbacks="?"
+[ -n "$readbackQueueDepth" ] || readbackQueueDepth="?"
+[ -n "$readbackDrops" ] || readbackDrops="?"
+[ -n "$fenceWaitStalls" ] || fenceWaitStalls="?"
+[ -n "$gpuOomDegrades" ] || gpuOomDegrades="?"
+[ -n "$gpuVramBytes" ] || gpuVramBytes="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -841,7 +855,16 @@ case "$SCENARIO" in
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded"
+for gpucnt in gpuReadbacks redundantGpuReadbacks readbackQueueDepth readbackDrops \
+              fenceWaitStalls gpuOomDegrades gpuVramBytes; do
+    eval "gpuval=\$$gpucnt"
+    if ! num "$gpuval" || [ "$gpuval" -ne 0 ]; then
+        echo "FAIL: GPU telemetry counter $gpucnt=$gpuval, expected 0 on the CPU path - Phase-1 counters must read inert/zero"
+        fail=1
+    fi
+done
+
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded gpuReadbacks=$gpuReadbacks redundantGpuReadbacks=$redundantGpuReadbacks readbackQueueDepth=$readbackQueueDepth readbackDrops=$readbackDrops fenceWaitStalls=$fenceWaitStalls gpuOomDegrades=$gpuOomDegrades gpuVramBytes=$gpuVramBytes"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

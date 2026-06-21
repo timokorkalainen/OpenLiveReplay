@@ -1,6 +1,6 @@
 #ifndef TRACKBUFFER_H
 #define TRACKBUFFER_H
-#include "playback/output/mediaframe.h"
+#include "playback/output/framehandle.h"
 
 #include <QVector>
 #include <cstdint>
@@ -12,19 +12,19 @@ class TrackBuffer {
 public:
     struct Frame {
         int64_t ptsMs = -1;
-        MediaVideoFrame frame;
+        FrameHandle frame;
     };
 
     // Insert sorted, unique by PTS (existing PTS is replaced). Enforces the
     // frame cap by evicting the entry farthest (in PTS) from keepNearMs,
     // but never one whose PTS is in [keepNearMs, protectToMs] (the live
     // fill edge). Returns false if the frame was dropped by the cap.
-    bool insert(int64_t ptsMs, const MediaVideoFrame& f, int capFrames, int64_t keepNearMs,
+    bool insert(int64_t ptsMs, const FrameHandle& f, int capFrames, int64_t keepNearMs,
                 int64_t protectToMs);
 
     // The frame to display at playhead: largest PTS <= playheadMs.
     // Returns false (out untouched) if no such frame.
-    bool frameAt(int64_t playheadMs, MediaVideoFrame& out, int64_t& outPtsMs) const;
+    bool frameAt(int64_t playheadMs, FrameHandle& out, int64_t& outPtsMs) const;
     QVector<Frame> framesSnapshot() const { return m_frames; }
 
     // True iff a frame exists within +/- toleranceMs of targetMs.
@@ -33,7 +33,7 @@ public:
     int64_t newestPts() const; // -1 if empty
     int64_t oldestPts() const; // -1 if empty
     bool isEmpty() const { return m_frames.isEmpty(); }
-    int size() const { return m_frames.size(); }
+    int size() const { return static_cast<int>(m_frames.size()); }
 
     // Drop frames with PTS < keepFromMs or PTS > keepToMs.
     void trim(int64_t keepFromMs, int64_t keepToMs);

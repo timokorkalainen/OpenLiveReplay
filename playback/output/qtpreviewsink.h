@@ -1,19 +1,23 @@
 #ifndef QTPREVIEWSINK_H
 #define QTPREVIEWSINK_H
 
-#include "playback/output/mediaframe.h"
+#include "playback/output/framehandle.h"
 #include "playback/output/outputsink.h"
 
 #include <QVideoFrame>
+#include <QVideoFrameFormat>
 
 class FrameProvider;
+
+QVideoFrameFormat::ColorSpace qtColorSpaceFor(ColorMatrix matrix);
+QVideoFrameFormat::ColorRange qtColorRangeFor(ColorRange range);
 
 class QtPreviewSink {
 public:
     explicit QtPreviewSink(FrameProvider* provider);
 
-    bool deliver(const MediaVideoFrame& frame);
-    static QVideoFrame toQVideoFrame(const MediaVideoFrame& frame);
+    bool deliver(const FrameHandle& frame);
+    static QVideoFrame toQVideoFrame(const FrameHandle& frame);
 
 private:
     FrameProvider* m_provider = nullptr;

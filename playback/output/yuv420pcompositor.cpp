@@ -3,6 +3,7 @@
 #include <QtGlobal>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 namespace {
 void scalePlaneNearest(const QByteArray& src, int srcStride, int srcW, int srcH, QByteArray& dst,
@@ -10,8 +11,8 @@ void scalePlaneNearest(const QByteArray& src, int srcStride, int srcW, int srcH,
     if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
     for (int y = 0; y < dstH; ++y) {
         const int srcY = qMin(srcH - 1, (y * srcH) / dstH);
-        char* dstLine = dst.data() + (dstY + y) * dstStride + dstX;
-        const char* srcLine = src.constData() + srcY * srcStride;
+        char* dstLine = dst.data() + static_cast<qsizetype>(dstY + y) * dstStride + dstX;
+        const char* srcLine = src.constData() + static_cast<qsizetype>(srcY) * srcStride;
         for (int x = 0; x < dstW; ++x) {
             const int srcX = qMin(srcW - 1, (x * srcW) / dstW);
             dstLine[x] = srcLine[srcX];
@@ -20,17 +21,18 @@ void scalePlaneNearest(const QByteArray& src, int srcStride, int srcW, int srcH,
 }
 } // namespace
 
-MediaVideoFrame Yuv420pCompositor::composeGrid(const QList<MediaVideoFrame>& frames, int width,
-                                               int height) {
-    MediaVideoFrame out = MediaVideoFrame::solidYuv420p(width, height, 16, 128, 128);
-    out.feedIndex = -1;
+FrameHandle Yuv420pCompositor::composeGrid(const QList<FrameHandle>& frames, int width,
+                                           int height) {
+    FrameHandle outHandle = solidYuv420pHandle(width, height, 16, 128, 128);
+    outHandle.metadata().key.feedIndex = -1;
+    CpuPlanes out = outHandle.readToCpu(FramePixelFormat::Yuv420p);
 
-    const int count = qMax(1, frames.size());
+    const int count = qMax(1, static_cast<int>(frames.size()));
     const int columns = qMax(1, int(std::ceil(std::sqrt(double(count)))));
     const int rows = qMax(1, int(std::ceil(double(count) / double(columns))));
 
     for (int i = 0; i < frames.size(); ++i) {
-        const MediaVideoFrame& frame = frames.at(i);
+        const MediaVideoFrameView frame(frames.at(i));
         if (!frame.isValid()) continue;
         const int col = i % columns;
         const int row = i / columns;
@@ -41,8 +43,8 @@ MediaVideoFrame Yuv420pCompositor::composeGrid(const QList<MediaVideoFrame>& fra
         const int dstW = qMax(0, dstRight - dstX);
         const int dstH = qMax(0, dstBottom - dstY);
 
-        scalePlaneNearest(frame.planeY, frame.strideY, frame.width, frame.height, out.planeY,
-                          out.strideY, dstX, dstY, dstW, dstH);
+        scalePlaneNearest(frame.planeY, frame.strideY, frame.width, frame.height, out.plane[0],
+                          out.stride[0], dstX, dstY, dstW, dstH);
 
         const int srcChromaW = (frame.width + 1) / 2;
         const int srcChromaH = (frame.height + 1) / 2;
@@ -52,10 +54,10 @@ MediaVideoFrame Yuv420pCompositor::composeGrid(const QList<MediaVideoFrame>& fra
         const int dstChromaBottom = (dstBottom + 1) / 2;
         const int dstChromaW = qMax(0, dstChromaRight - dstChromaX);
         const int dstChromaH = qMax(0, dstChromaBottom - dstChromaY);
-        scalePlaneNearest(frame.planeU, frame.strideU, srcChromaW, srcChromaH, out.planeU,
-                          out.strideU, dstChromaX, dstChromaY, dstChromaW, dstChromaH);
-        scalePlaneNearest(frame.planeV, frame.strideV, srcChromaW, srcChromaH, out.planeV,
-                          out.strideV, dstChromaX, dstChromaY, dstChromaW, dstChromaH);
+        scalePlaneNearest(frame.planeU, frame.strideU, srcChromaW, srcChromaH, out.plane[1],
+                          out.stride[1], dstChromaX, dstChromaY, dstChromaW, dstChromaH);
+        scalePlaneNearest(frame.planeV, frame.strideV, srcChromaW, srcChromaH, out.plane[2],
+                          out.stride[2], dstChromaX, dstChromaY, dstChromaW, dstChromaH);
     }
-    return out;
+    return makeCpuFrameHandle(std::move(out), outHandle.metadata());
 }

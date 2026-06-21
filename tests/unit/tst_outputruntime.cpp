@@ -2,11 +2,15 @@
 
 #include "playback/output/outputruntime.h"
 
-static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = feed;
-    f.ptsMs = pts;
+static FrameHandle video(int feed, qint64 pts, uchar y) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
+    f.metadata().key.feedIndex = feed;
+    f.metadata().key.ptsMs = pts;
     return f;
+}
+
+static uchar yAt(const OutputBusFrame& frame, qsizetype offset) {
+    return uchar(MediaVideoFrameView(frame.video).planeY.at(offset));
 }
 
 class ThreadSafeCollectingSink final : public IOutputSink {
@@ -104,9 +108,9 @@ void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
     QCOMPARE(frames[0].outputFrameIndex, qint64(0));
     QCOMPARE(frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(frames[2].outputFrameIndex, qint64(2));
-    QCOMPARE(frames[0].video.ptsMs, qint64(100));
-    QCOMPARE(frames[2].video.ptsMs, qint64(100));
-    QCOMPARE(uchar(frames[2].video.planeY.at(0)), uchar(40));
+    QCOMPARE(frames[0].video.metadata().key.ptsMs, qint64(100));
+    QCOMPARE(frames[2].video.metadata().key.ptsMs, qint64(100));
+    QCOMPARE(yAt(frames[2], 0), uchar(40));
 }
 
 void TestOutputRuntime::nanosecondTicksHonorFractionalFrameBoundary() {
@@ -180,7 +184,7 @@ void TestOutputRuntime::workerThreadTicksWithoutExternalDispatchCalls() {
     QCOMPARE(frames[0].outputFrameIndex, qint64(0));
     QCOMPARE(frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(frames[2].outputFrameIndex, qint64(2));
-    QCOMPARE(uchar(frames[2].video.planeY.at(0)), uchar(55));
+    QCOMPARE(yAt(frames[2], 0), uchar(55));
     QCOMPARE(runtime.stats().runtime.deadlineMisses, qint64(0));
 }
 

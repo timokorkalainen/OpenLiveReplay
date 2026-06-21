@@ -188,6 +188,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/pespacket.h
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
+        recorder_engine/ingest/colorvui.h recorder_engine/ingest/colorvui.cpp
         recorder_engine/codec/avcc.h recorder_engine/codec/avcc.cpp
         recorder_engine/benchmark/benchmarktypes.h
         recorder_engine/benchmark/benchmarkplan.h recorder_engine/benchmark/benchmarkplan.cpp
@@ -226,6 +227,9 @@ qt_add_qml_module(OpenLiveReplay
         playback/audioframequeue.h playback/audioframequeue.cpp
         playback/output/outputtypes.h
         playback/output/outputframeclock.h playback/output/outputframeclock.cpp
+        playback/output/framepixelformat.h playback/output/colormetadata.h
+        playback/output/colormetadatapolicy.h playback/output/colormetadatapolicy.cpp
+        playback/output/framehandle.h playback/output/framehandle.cpp
         playback/output/mediaframe.h
         playback/output/outputframecache.h playback/output/outputframecache.cpp
         playback/output/outputtargetassignment.h playback/output/outputtargetassignment.cpp
@@ -233,6 +237,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/broadcastoutputstatus.h playback/output/broadcastoutputstatus.cpp
         playback/output/outputbusengine.h playback/output/outputbusengine.cpp
         playback/output/outputsink.h
+        playback/output/gpureadbacktelemetry.h playback/output/gpureadbacktelemetry.cpp
         playback/output/outputdispatcher.h playback/output/outputdispatcher.cpp
         playback/output/outputruntime.h playback/output/outputruntime.cpp
         playback/output/queuedoutputsink.h playback/output/queuedoutputsink.cpp
@@ -382,6 +387,7 @@ endif()
 
 if(APPLE)
     target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/ingest/colortags_apple.mm
         recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
