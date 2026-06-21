@@ -447,9 +447,15 @@ jobs:
           export PATH="$OLR_MINGW_ROOT/bin:$NINJA_DIR:$PATH"
           FFMPEG_ROOT="$(cd windows_build/dist/ffmpeg && pwd)"
           SRT_ROOT="$(cd windows_build/dist/srt && pwd)"
+          # OLR_WERROR=OFF: the Windows job validates compile + link + the MF
+          # tests, not warning-cleanliness (the macOS clang and Linux GCC -Werror
+          # legs own that). MinGW GCC at Release -O3 trips -Werror=null-dereference
+          # inside Qt's own qhash.h (the generated qmlcache loader), which is not a
+          # first-party defect.
           cmake -S . -B build-tests -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DOLR_BUILD_TESTS=ON \
+            -DOLR_WERROR=OFF \
             -DCMAKE_PREFIX_PATH="$OLR_QT_ROOT" \
             -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
             -DCMAKE_CXX_COMPILER="$OLR_MINGW_ROOT/bin/g++.exe" \
