@@ -22,3 +22,14 @@ qt_add_executable(uipreview uipreview_main.cpp)
 target_link_libraries(uipreview PRIVATE
     Qt6::Qml Qt6::Quick Qt6::Gui Qt6::QuickControls2
     OlrTheme OlrStyle olr_warnings)
+
+# Linux ld defaults to --as-needed and drops the OlrTheme/OlrStyle backing libraries —
+# they are referenced only through a runtime QML import (no C++ symbol), so their QML
+# modules never self-register and the engine reports "module not installed". Keep them
+# linked, matching macOS/ld64 (which retains them; reproduce the drop there with
+# -dead_strip_dylibs).
+if(UNIX AND NOT APPLE)
+    target_link_options(tst_olrstyle PRIVATE "LINKER:--no-as-needed")
+    target_link_options(uipreview PRIVATE "LINKER:--no-as-needed")
+endif()
+
