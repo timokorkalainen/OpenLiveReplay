@@ -27,7 +27,8 @@ public:
 
     // Test seam: lower the per-PID PES reassembly cap so the unbounded-PES
     // overflow path is exercisable without pushing the full 16 MiB default.
-    void setMaxPesAssemblyBytesForTest(int maxBytes) { m_maxPesAssemblyBytes = maxBytes; }
+    // Clamped to >= 1 (a non-positive cap would drop every PES).
+    void setMaxPesAssemblyBytesForTest(int maxBytes) { m_maxPesAssemblyBytes = qMax(1, maxBytes); }
 
 private:
     struct PesAssembly {
@@ -37,12 +38,14 @@ private:
         int expectedSize = -1;
     };
 
-    // Upper bound on in-progress PES reassembly per PID. A video PES may legally
-    // declare PES_packet_length = 0 (unbounded; terminated by the next
+    // Upper bound on in-progress PES reassembly per PID. A PES may carry
+    // PES_packet_length = 0 (legal/"unbounded" for video, terminated by the next
     // payload-start), so a hostile/garbled stream that never sends another
     // payload-start would otherwise grow the buffer without limit — an
-    // unbounded-memory DoS. 16 MiB is far above any real single access unit
-    // (even a 4K keyframe); audio PES always carries a length and stays bounded.
+    // unbounded-memory DoS. The cap is applied to EVERY reassembling PID
+    // unconditionally (audio included: the parser does not assume a conformant
+    // length, so a length-0 PES on the audio PID is guarded the same way). 16 MiB
+    // is far above any real single access unit, even a 4K keyframe.
     static constexpr int kMaxPesAssemblyBytes = 16 * 1024 * 1024;
     int m_maxPesAssemblyBytes = kMaxPesAssemblyBytes;
 

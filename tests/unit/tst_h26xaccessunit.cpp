@@ -15,6 +15,7 @@ private slots:
     void ignoresUnknownCodecAndNoStartCodePayloads();
     void keepsH264NonFirstSliceInSameAccessUnit();
     void appendsChangedParameterSetValues();
+    void boundsParameterSetAccumulation();
 };
 
 void TestH26xAccessUnit::collectsH264ParameterSets() {
@@ -153,6 +154,40 @@ void TestH26xAccessUnit::appendsChangedParameterSetValues() {
 
     QCOMPARE(splitter.parameterSets().h264Sps, (QList<QByteArray>{sps1, sps2}));
     QCOMPARE(splitter.parameterSets().h264Pps, QList<QByteArray>{pps});
+}
+
+// Regression for the unbounded parameter-set accumulation DoS: m_parameterSets
+// is reset only per connection and copied into every emitted access unit, so a
+// hostile stream that floods slightly-varied SPS/PPS NALs (exact-equality dedup
+// is trivially evaded) must NOT grow it without bound, and an implausibly large
+// parameter-set NAL must be ignored entirely.
+void TestH26xAccessUnit::boundsParameterSetAccumulation() {
+    H26xAccessUnitSplitter splitter(NativeVideoCodec::H264);
+    QByteArray payload;
+    for (int i = 0; i < 1000; ++i) {
+        payload += QByteArray::fromHex("00000001");
+        QByteArray sps; // distinct H.264 SPS (NAL type 7) per iteration
+        sps.append(char(0x67));
+        sps.append(char((i >> 8) & 0xff));
+        sps.append(char(i & 0xff));
+        payload += sps;
+    }
+    payload += QByteArray::fromHex("00000001658884"); // an IDR so an access unit flushes
+    splitter.pushPesPayload(payload, 90000, 81000);
+    // Without the cap this would be 1000; bounded to a small recent window.
+    QVERIFY(!splitter.parameterSets().h264Sps.isEmpty());
+    QVERIFY(splitter.parameterSets().h264Sps.size() <= 16);
+
+    // An implausibly large parameter-set NAL is not tracked at all.
+    H26xAccessUnitSplitter big(NativeVideoCodec::H264);
+    QByteArray huge = QByteArray::fromHex("00000001");
+    QByteArray bigSps;
+    bigSps.append(char(0x67));
+    bigSps.append(QByteArray(9000, char(0x11)));
+    huge += bigSps;
+    huge += QByteArray::fromHex("00000001658884");
+    big.pushPesPayload(huge, 1, 1);
+    QVERIFY(big.parameterSets().h264Sps.isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TestH26xAccessUnit)

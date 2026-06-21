@@ -37,17 +37,26 @@ cmake -S . -B build-fuzz -G Ninja -DOLR_BUILD_FUZZERS=ON \
 cmake --build build-fuzz
 ```
 
+## Seeds & corpus
+
+Committed, structurally-valid seed inputs live under `seeds/<harness>/` (a valid
+PAT/PMT/PES stream incl. a length-0 PES, Annex-B AUs, an SEI NAL, RTMP chunks).
+They matter: without them a cold run mostly bounces off the front-door checks
+(e.g. mpegts needs a valid PAT→PMT before any PES/cap code runs). A grown corpus
+lives under `corpus/<harness>/` (git-ignored).
+
 ## Run
 
 ```sh
-# fuzz for two minutes (LeakSanitizer is off; libFuzzer manages lifetimes)
+# fuzz for two minutes, starting from the seeds, growing a local corpus
 ASAN_OPTIONS=detect_leaks=0 \
-  ./build-fuzz/tests/fuzz/fuzz_mpegtsparser -max_total_time=120 corpus/mpegtsparser
+  ./build-fuzz/tests/fuzz/fuzz_mpegtsparser -max_total_time=120 \
+    corpus/fuzz_mpegtsparser tests/fuzz/seeds/fuzz_mpegtsparser
 
 # reproduce a saved finding
 ./build-fuzz/tests/fuzz/fuzz_mpegtsparser fuzz_mpegtsparser-crash-<hash>
 ```
 
-Keep an evolving corpus under `corpus/<harness>/` (git-ignored; seed it from real
-captures or let libFuzzer grow it). Continuous fuzzing is **not** a PR gate — the
-`Fuzz (parsers)` CI job runs the harnesses on a schedule / on demand.
+Continuous fuzzing is **not** a PR gate. The `Fuzz (parsers, manual)` CI job is
+`workflow_dispatch`-only (run it on demand; a nightly `schedule:` can be added
+later); it seeds from `seeds/<harness>/` and fails the run on any crash.

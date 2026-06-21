@@ -91,7 +91,10 @@ private:
 
     QByteArray m_buffer;
     int m_inputChunkSize = 128;
-    int m_maxMessageSize = 16 * 1024 * 1024;
+    // Kept equal to the assembly/buffered caps: a larger declared-length gate is
+    // unreachable (assembly drops the message at m_maxAssemblyBytes first), so
+    // matching them rejects an oversized declared length at the header instead.
+    int m_maxMessageSize = 4 * 1024 * 1024;
     int m_maxBufferedBytes = 4 * 1024 * 1024;
     int m_maxAssemblyBytes = 4 * 1024 * 1024;
     QHash<int, ChunkHeader> m_previousHeaders;

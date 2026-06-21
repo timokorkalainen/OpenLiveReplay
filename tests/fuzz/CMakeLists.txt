@@ -24,9 +24,11 @@ function(olr_add_fuzzer name)
     target_link_options(${name} PRIVATE ${_olr_fuzz_flags})
 endfunction()
 
+set(_smpte12m "${CMAKE_SOURCE_DIR}/recorder_engine/timing/smpte12m.cpp")
 olr_add_fuzzer(fuzz_mpegtsparser   "${_ingest}/mpegtsparser.cpp")
-olr_add_fuzzer(fuzz_h26xaccessunit "${_ingest}/h26xaccessunit.cpp")
-olr_add_fuzzer(fuzz_h26xseitimecode
+olr_add_fuzzer(fuzz_h26xaccessunit
+    "${_ingest}/h26xaccessunit.cpp"
     "${_ingest}/h26xseitimecode.cpp"
-    "${CMAKE_SOURCE_DIR}/recorder_engine/timing/smpte12m.cpp")
+    "${_smpte12m}") # the harness co-fuzzes the PES->split->SEI chain
+olr_add_fuzzer(fuzz_h26xseitimecode "${_ingest}/h26xseitimecode.cpp" "${_smpte12m}")
 olr_add_fuzzer(fuzz_rtmpprotocol   "${_ingest}/rtmpprotocol.cpp")

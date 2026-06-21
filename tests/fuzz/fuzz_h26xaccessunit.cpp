@@ -1,10 +1,13 @@
 // libFuzzer harness for the H.264/HEVC access-unit splitter. The PES payload it
 // consumes comes straight from an untrusted transport, so NAL start-code
-// scanning and parameter-set inspection must be crash-free on arbitrary bytes.
-// The first input byte selects the codec; the remainder is the PES payload.
+// scanning, parameter-set inspection (and its accumulation cap), and the
+// downstream SEI-timecode scan must be crash-free on arbitrary bytes. The first
+// input byte selects the codec; the remainder is the PES payload.
 #include "recorder_engine/ingest/h26xaccessunit.h"
+#include "recorder_engine/ingest/h26xseitimecode.h"
 
 #include <QByteArray>
+#include <QList>
 
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +18,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     QByteArray payload(reinterpret_cast<const char*>(data + 1), int(size - 1));
 
     H26xAccessUnitSplitter splitter(codec);
-    splitter.pushPesPayload(payload, /*pts90k=*/90000, /*dts90k=*/90000);
+    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 90000, 90000);
     (void) splitter.parameterSets();
+
+    // Co-fuzz the realistic PES -> split -> SEI-timecode chain on each emitted AU.
+    for (const CompressedAccessUnit& unit : units)
+        (void) extractH26xSeiTimecode(unit.annexB, codec);
     return 0;
 }

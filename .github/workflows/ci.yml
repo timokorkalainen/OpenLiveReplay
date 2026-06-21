@@ -505,9 +505,15 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: |
           rc=0
+          seeds="$GITHUB_WORKSPACE/tests/fuzz/seeds"
           for f in fuzz_mpegtsparser fuzz_h26xaccessunit fuzz_h26xseitimecode fuzz_rtmpprotocol; do
             echo "::group::$f"
-            "./$f" -max_total_time=90 -print_final_stats=1 -artifact_prefix="$f-" || rc=1
+            # Start from the committed seeds (the structurally-valid PAT/PMT/PES,
+            # AnnexB, SEI and RTMP chunk inputs) so the run reaches the deep
+            # parser state machines on a cold runner; grow a throwaway corpus.
+            mkdir -p "corpus-$f"
+            "./$f" -max_total_time=90 -print_final_stats=1 -artifact_prefix="$f-" \
+              "corpus-$f" "$seeds/$f" || rc=1
             echo "::endgroup::"
           done
           exit "$rc"
