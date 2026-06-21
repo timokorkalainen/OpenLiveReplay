@@ -11,13 +11,13 @@ QtObject {
     id: theme
 
     // --- Surfaces (back-to-front) ---
-    readonly property color canvas: "#0E0F11"      // app background / video letterbox
-    readonly property color panel: "#16181B"        // status bar, transport, rails
-    readonly property color panelRaised: "#1E2125"  // cards, rows, fields, menus
-    readonly property color panelHover: "#262A30"   // hover surface
+    readonly property color canvas: "#0C0D10"      // app background / video letterbox
+    readonly property color panel: "#16191D"        // status bar, transport, rails
+    readonly property color panelRaised: "#21262C"  // cards, rows, fields, menus
+    readonly property color panelHover: "#2A3037"   // hover surface
     readonly property color panelPressed: "#121417" // pressed/sunken
-    readonly property color line: "#2A2E33"          // 1px dividers / control borders
-    readonly property color lineStrong: "#3A4047"    // emphasized borders / focus ring base
+    readonly property color line: "#323840"          // 1px dividers / control borders
+    readonly property color lineStrong: "#444B54"    // emphasized borders / focus ring base
     readonly property color scrim: "#8C000000"        // 55% black — UMD bars, drawer dim
 
     // --- Text (all >= 4.5:1 on panel/panelRaised) ---
@@ -68,9 +68,9 @@ QtObject {
     readonly property int hPrimary: 48   // PLAY/PAUSE, GO LIVE
     readonly property int hTransport: 44 // step / shuttle
     readonly property int hAction: 40    // TAKE / NEXT
-    readonly property int hControl: 32   // standard buttons / combos / fields
-    readonly property int hCompact: 28   // rundown rows, segmented chips, toggles
-    readonly property int hField: 28     // setup-drawer fields, source rows
+    readonly property int hControl: 30   // standard buttons / combos / fields
+    readonly property int hCompact: 26   // rundown rows, segmented chips, toggles
+    readonly property int hField: 30     // fields aligned to buttons for even rows
     readonly property int dotSize: 12
     readonly property int tallyBorder: 3
     readonly property int borderW: 1

@@ -45,7 +45,7 @@ T.ComboBox {
             ctx.lineTo(width, 0)
             ctx.lineTo(width / 2, height)
             ctx.closePath()
-            ctx.fillStyle = Theme.textDim
+            ctx.fillStyle = Theme.textBody
             ctx.fill()
         }
     }
