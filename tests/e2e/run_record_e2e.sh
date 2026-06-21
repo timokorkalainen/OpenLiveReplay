@@ -25,6 +25,10 @@
 #
 # Usage: run_record_e2e.sh <harness_exe> <stereo|mono|rational|rational-h264> [srt_port]
 set -uo pipefail
+# Pin the numeric locale: awk's printf "%.4f" and ffprobe's pts_time are both
+# dot-decimal under C, so the band math and its parsing never disagree (a
+# comma-decimal locale would otherwise truncate floats and false-fail).
+export LC_ALL=C
 
 HARNESS="${1:?harness executable path required}"
 MODE="${2:-stereo}"
@@ -47,11 +51,17 @@ if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
 FPS_EXTRA=""
 EXPECT_RATE=""
 CODEC_EXTRA=""
+# Advertised rate of the recording, drives the rate-agnostic PTS-timing lock below.
+# Integer modes record at the plain {fps,1}; rational modes override.
+FPS_NUM=30
+FPS_DEN=1
 case "$MODE" in
     rational)
-        FPS_EXTRA="--fps-num 30000 --fps-den 1001"; EXPECT_RATE="30000/1001" ;;
+        FPS_EXTRA="--fps-num 30000 --fps-den 1001"; EXPECT_RATE="30000/1001"
+        FPS_NUM=30000; FPS_DEN=1001 ;;
     rational-h264)
         FPS_EXTRA="--fps-num 30000 --fps-den 1001"; EXPECT_RATE="30000/1001"
+        FPS_NUM=30000; FPS_DEN=1001
         CODEC_EXTRA="--codec h264"
         # The recorder needs a hardware H.264 ENCODER for --codec h264. Probe via
         # the harness; a crashing probe is a FAIL, an unavailable codec is a SKIP.
@@ -152,27 +162,68 @@ elif ! awk -v v="$V_LAST" -v a="$A_LAST" 'BEGIN{d=v-a; if(d<0)d=-d; exit !(d<0.7
     fail=1
 fi
 
-# Rational mode: the container must advertise the true rate, not the legacy {30,1}.
+# --- PTS-timing lock (ALL modes) --------------------------------------------
+# The muxed VIDEO must ride the integer-fps ms grid — the same recording clock the
+# 48 kHz audio is sample-locked to. We assert the MEAN inter-frame interval (the
+# recorder stamps each frame's PTS from its frame INDEX, so the mean is the coded
+# cadence): averaging over ~N frames recovers sub-ms resolution, making a 0.1% rate
+# error — a rational rate leaking into the coded PTS, 33.367 vs 33.333ms at 30fps,
+# 16.683 vs 16.667ms at 60fps — detectable even though each PTS is quantized to the
+# 1ms container grid. The mean is taken over the CONTIGUOUS inter-frame deltas only:
+# any delta above 1.5x the cadence is a discontinuity (a host-stall heartbeat
+# backlog-skip, not a rate property), so it is trimmed out and reported separately —
+# an interior gap can neither inflate the mean (false-fail) nor be misread as a rate
+# leak. Teeth scale with the rate: rational modes get a sub-percent band (halfway to
+# the leak, never under the ms-rounding noise floor at this frame count); integer
+# modes have no rational grid to leak, so they get a coarse +/-3% sanity band that
+# catches only gross whole-fps coded errors — the sub-percent #128 teeth live in the
+# rational/rational-h264 cells, which are the ones actually exercised.
+read -r CAD_LO CAD_HI ICAD_MS <<<"$(awk -v num="$FPS_NUM" -v den="$FPS_DEN" -v n="${V_PACKETS:-0}" 'BEGIN{
+    fps  = (den>0) ? int((num + den/2)/den) : 30; if (fps < 1) fps = 1;
+    icad = 1000.0/fps;                            # integer-fps cadence (lock target)
+    rcad = (num>0) ? 1000.0*den/num : icad;       # rational-grid cadence (the leak)
+    nm1  = (n>1) ? n-1 : 1;
+    quant = 1.1/nm1;                              # ms-grid rounding headroom on the mean
+    gap  = rcad - icad;                           # integer-vs-rational cadence gap
+    head = (gap > 0.001) ? gap*0.5 : icad*0.03;   # rational: halfway to the leak; integer: +/-3% sanity
+    if (head < quant) head = quant;              # never tighter than the rounding-noise floor
+    lo = icad*0.97;                              # generous warm-up cushion below
+    hi = icad + head;
+    printf "%.4f %.4f %.4f", lo, hi, icad }')"
+read -r VMEAN VJUMPS <<<"$(probe -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 \
+    | awk -v icad="${ICAD_MS:-33.3333}" 'BEGIN{ thr = 1.5*icad/1000.0 }
+        $1 ~ /^[0-9.]+$/ {
+            if (have) { d = $1 - p; if (d > 0 && d <= thr) { sum += d; k++ } else if (d > thr) { jumps++ } }
+            p = $1; have = 1 }
+        END{ if (k > 0) printf "%.4f %d", sum*1000.0/k, jumps+0; else print "nan 0" }')"
+echo "[e2e] mean video frame interval=${VMEAN}ms (lock band ${CAD_LO}..${CAD_HI}ms for ${FPS_NUM}/${FPS_DEN}, ${VJUMPS:-0} discontinuities trimmed)"
+if [ "${VJUMPS:-0}" -gt 0 ]; then
+    echo "[e2e] note: ${VJUMPS} cadence discontinuity(ies) >1.5x interval trimmed from the mean (host stall / heartbeat backlog-skip, not a rate property)"
+fi
+if ! awk -v m="${VMEAN:-99}" -v lo="${CAD_LO:-0}" -v hi="${CAD_HI:-0}" 'BEGIN{exit !(m+0 > lo && m+0 < hi)}'; then
+    echo "FAIL: mean video frame interval ${VMEAN}ms is outside the integer-fps lock band ${CAD_LO}..${CAD_HI} — video PTS off the recording-clock grid (rate leak into the coded PTS)"
+    fail=1
+fi
+
+# Audio continuity: the 48 kHz audio must be continuous on its own recording clock
+# (no inter-packet gap beyond a quarter second). This is a single-stream continuity
+# check, not an A/V lock — the only direct audio-vs-video cross-check is the 0.75s
+# end-alignment above. A stream with fewer than two packets cannot be "gapless" and
+# fails (the absent-stream case is also caught by the stereo-channel check earlier).
+AGAP="$(probe -select_streams a:0 -show_entries packet=pts_time -of csv=p=0 \
+    | awk 'NF{ n++; if(p!="" && ($1-p)>mx) mx=$1-p; p=$1 } END{ if(n<2) print "9.999"; else printf "%.3f", mx+0 }')"
+echo "[e2e] max audio inter-packet gap=${AGAP}s"
+if ! awk -v g="${AGAP:-9}" 'BEGIN{exit !(g+0 < 0.25)}'; then
+    echo "FAIL: audio stream has a ${AGAP}s gap (>0.25s) or too few packets — not continuous on its clock"
+    fail=1
+fi
+
+# Rational modes: the container must also advertise the true rate, not the legacy {30,1}.
 if [ -n "$EXPECT_RATE" ]; then
     R_RATE="$(scalar -select_streams v:0 -show_entries stream=r_frame_rate)"
     echo "[e2e] r_frame_rate=${R_RATE:-?} (expect ${EXPECT_RATE})"
     if [ "${R_RATE:-}" != "$EXPECT_RATE" ]; then
         echo "FAIL: video r_frame_rate is '${R_RATE:-none}', expected ${EXPECT_RATE} — rational rate not advertised end to end"
-        fail=1
-    fi
-
-    # TIMING GUARD: the advertised 29.97 rate must change METADATA ONLY — it must
-    # NOT leak into the coded video PTS. The muxed video must stay on the integer-fps
-    # ms cadence (~33.333ms = 1000/30), locked to the integer-fps audio, NOT the
-    # 29.97 grid (~33.367ms = 1001000/30000). A regression that rescales the video
-    # PTS through a rational encoder time_base would push the mean interval past the
-    # 33.35ms bound and desync video from audio. Mean over ~180 frames averages out
-    # ms-rounding noise, so the 33.333-vs-33.367 split is robustly distinguishable.
-    VMEAN="$(probe -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 \
-        | awk 'NF{n++; if(n==1)f=$1; l=$1} END{ if(n>1) printf "%.4f",(l-f)*1000/(n-1); else print "nan" }')"
-    echo "[e2e] mean video frame interval=${VMEAN}ms (integer-30=33.333; 29.97-grid=33.367)"
-    if ! awk -v m="${VMEAN:-99}" 'BEGIN{exit !(m+0 > 33.0 && m+0 < 33.35)}'; then
-        echo "FAIL: video frame interval ${VMEAN}ms is off the integer-fps cadence (~33.333ms) — the rational rate leaked into the coded video PTS (A/V drift regression)"
         fail=1
     fi
 fi
