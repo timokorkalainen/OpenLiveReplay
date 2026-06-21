@@ -1006,23 +1006,85 @@ bool PlaybackWorker::openPrerollContext() {
         if (feedIndex >= m_providers.size()) break;
 
         // H.264: hardware-only licensing constraint — NEVER software-decode.
-        // Mirror the primary bank guard exactly: skip the stream without advancing
-        // feedIndex so pre-roll feedIndex N still maps to the same provider as
-        // primary providerIndex N. (Pre-roll has no NativeVideoDecoder wiring, so
-        // H.264 sources simply get no pre-roll staging — the live primary bank keeps
-        // supplying those feeds after the cut swap.)
+        // Mirror the primary bank guard: when HW is available and extradata is
+        // usable, build a NativeVideoDecoder exactly as the primary bank does
+        // (playbackworker.cpp:1463-1522) so the pre-roll bank can stage H.264
+        // frames. When HW is unavailable or avcC parse fails, skip (continue)
+        // so the bank stays empty and armNextCut returns false (graceful
+        // degradation, feature off for that file).
         //
         // Homogeneous-codec invariant: OLR recordings are single-codec by
-        // construction — recorder_engine/muxer.cpp applies one VideoCodecChoice
-        // to all video tracks. The two layouts OLR produces are therefore:
-        //   • all-H.264  → every video stream skipped here → pre-roll bank empty
-        //                  → armed cut disabled (caller checks m_prerollBank.isEmpty())
-        //   • all-MPEG-2 → no H.264 skip → feedIndex advances in lock-step with
-        //                  the primary bank → correct 1:1 provider mapping
-        // A hypothetical externally-authored MIXED-codec file is the only case
-        // where feedIndex could diverge from the primary bank; that is out of
-        // scope and not supported.
-        if (codecParams->codec_id == AV_CODEC_ID_H264) continue;
+        // construction. Both layouts are now supported:
+        //   • all-H.264  → NativeVideoDecoder built, feedIndex advances 1:1
+        //   • all-MPEG-2 → no H.264 branch taken, existing FFmpeg path below
+        // A hypothetical externally-authored MIXED-codec file is out of scope.
+        if (codecParams->codec_id == AV_CODEC_ID_H264) {
+            if (queryNativeVideoDecodeCapabilities().h264 && codecParams->extradata_size >= 8) {
+                // Parse avcC extradata → SPS/PPS NAL payloads (verbatim from
+                // the primary bank, playbackworker.cpp:1466-1522).
+                H26xParameterSets params;
+                bool parseOk = true;
+                const uint8_t* ed = codecParams->extradata;
+                const int edSize = codecParams->extradata_size;
+                int off = 5;
+                const int numSps = off < edSize ? (ed[off] & 0x1f) : 0;
+                off++;
+                for (int s = 0; s < numSps && parseOk; ++s) {
+                    if (off + 2 > edSize) {
+                        parseOk = false;
+                        break;
+                    }
+                    const int len = (ed[off] << 8) | ed[off + 1];
+                    off += 2;
+                    if (len <= 0 || off + len > edSize) {
+                        parseOk = false;
+                        break;
+                    }
+                    params.h264Sps.append(QByteArray(reinterpret_cast<const char*>(ed + off), len));
+                    off += len;
+                }
+                if (parseOk && off < edSize) {
+                    const int numPps = ed[off++];
+                    for (int p = 0; p < numPps && parseOk; ++p) {
+                        if (off + 2 > edSize) {
+                            parseOk = false;
+                            break;
+                        }
+                        const int len = (ed[off] << 8) | ed[off + 1];
+                        off += 2;
+                        if (len <= 0 || off + len > edSize) {
+                            parseOk = false;
+                            break;
+                        }
+                        params.h264Pps.append(
+                            QByteArray(reinterpret_cast<const char*>(ed + off), len));
+                        off += len;
+                    }
+                }
+                if (!parseOk || params.h264Sps.isEmpty() || params.h264Pps.isEmpty()) {
+                    qWarning() << "PlaybackWorker: pre-roll H.264 avcC parse failed"
+                               << "for stream" << i << "— skipping (HW-only constraint)";
+                    continue;
+                }
+                DecoderTrack* track = new DecoderTrack();
+                track->streamIndex = int(i);
+                track->nativeDecoder =
+                    std::make_unique<NativeVideoDecoder>(codecParams->width, codecParams->height);
+                track->h264ParamSets = params;
+                track->codecWidth = codecParams->width;
+                track->codecHeight = codecParams->height;
+                track->codecCtx = nullptr;
+                track->provider = nullptr; // no live provider wiring for pre-roll
+                track->feedIndex = feedIndex;
+                m_prerollBank.append(track);
+                feedIndex++;
+                qDebug() << "PlaybackWorker: pre-roll NativeVideoDecoder (H.264)"
+                         << "stream" << i << "feedIndex" << (feedIndex - 1);
+                continue;
+            }
+            // No HW or bad extradata: skip — graceful degradation.
+            continue;
+        }
 
         const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
         if (!codec) continue;
@@ -1159,6 +1221,12 @@ void PlaybackWorker::fillStaging() {
         avformat_flush(m_prerollFmtCtx);
         m_prerollStagingCache->clear();
         m_stagingNewestRefPtsMs = INT64_MIN;
+        // Step 3: reset native sessions post-seek so the VT/MF decoder starts
+        // clean — guarantees PTS fidelity (maxClockDivergenceMs gate).
+        // All-intra mezzanine makes this safe and cheap.
+        for (auto* track : m_prerollBank) {
+            if (track->nativeDecoder) track->nativeDecoder->reset();
+        }
     }
 
     AVPacket* pkt = av_packet_alloc();
@@ -1189,26 +1257,85 @@ void PlaybackWorker::fillStaging() {
         // no per-track buffer, no live cache touch).
         for (auto* track : m_prerollBank) {
             if (pkt->stream_index != track->streamIndex) continue;
-            if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
-                while (avcodec_receive_frame(track->codecCtx, vf) == 0) {
-                    int64_t framePts = vf->pts;
-                    if (framePts == AV_NOPTS_VALUE) framePts = vf->best_effort_timestamp;
-                    int64_t framePtsMs;
-                    if (framePts != AV_NOPTS_VALUE) {
-                        framePtsMs = av_rescale_q(
-                            framePts, m_prerollFmtCtx->streams[track->streamIndex]->time_base,
-                            {1, 1000});
-                    } else {
-                        framePtsMs = target;
+            if (track->nativeDecoder) {
+                // H.264 native path: mirrors decodePacketIntoBank native branch
+                // (~:557-634) but writes m_prerollStagingCache (not m_outputCache)
+                // and omits primary-bank-only state (m_bufferMutex, track->buffer).
+                // NativeVideoDecoder::decode() is SYNCHRONOUS — the stage lambda
+                // fires inline on this (worker) thread before decode() returns, so
+                // m_stagingNewestRefPtsMs is updated before the coverage check below.
+                AVRational tb = m_prerollFmtCtx->streams[track->streamIndex]->time_base;
+                const int64_t pktPts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+                // Convert avcC length-prefixed packet → Annex B (verbatim from
+                // decodePacketIntoBank, ~:558-571).
+                QByteArray annexB;
+                {
+                    const uint8_t* p = pkt->data;
+                    const uint8_t* end = p + pkt->size;
+                    static const char kStartCode[4] = {'\x00', '\x00', '\x00', '\x01'};
+                    while (p + 4 <= end) {
+                        const uint32_t nalLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+                                                (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+                        p += 4;
+                        if (nalLen == 0 || p + nalLen > end) break;
+                        annexB.append(kStartCode, 4);
+                        annexB.append(reinterpret_cast<const char*>(p), int(nalLen));
+                        p += nalLen;
                     }
-                    MediaVideoFrame mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
-                    mediaFrame.ptsMs = framePtsMs;
-                    if (mediaFrame.isValid()) {
-                        m_prerollStagingCache->insertVideoFrame(mediaFrame);
-                        if (track->streamIndex == primaryStreamIndex)
-                            m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
+                }
+                if (!annexB.isEmpty()) {
+                    CompressedAccessUnit unit;
+                    unit.codec = NativeVideoCodec::H264;
+                    unit.parameterSets = track->h264ParamSets;
+                    unit.pts90k =
+                        (pktPts != AV_NOPTS_VALUE) ? av_rescale_q(pktPts, tb, {1, 90000}) : -1;
+                    unit.dts90k =
+                        (pkt->dts != AV_NOPTS_VALUE) ? av_rescale_q(pkt->dts, tb, {1, 90000}) : -1;
+                    unit.annexB = annexB;
+
+                    auto stage = [&](AVFrame* nativeVf) {
+                        int64_t framePtsMs;
+                        if (pktPts != AV_NOPTS_VALUE) {
+                            framePtsMs = av_rescale_q(pktPts, tb, {1, 1000});
+                        } else {
+                            framePtsMs = target;
+                        }
+                        MediaVideoFrame mediaFrame =
+                            convertToMediaVideoFrame(nativeVf, track->feedIndex);
+                        mediaFrame.ptsMs = framePtsMs;
+                        if (mediaFrame.isValid()) {
+                            m_prerollStagingCache->insertVideoFrame(mediaFrame);
+                            if (track->streamIndex == primaryStreamIndex) {
+                                m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
+                            }
+                        }
+                        av_frame_free(&nativeVf);
+                    };
+                    track->nativeDecoder->decode(unit, stage, nullptr);
+                }
+            } else {
+                // FFmpeg software path (MPEG-2, etc.) — unchanged.
+                if (avcodec_send_packet(track->codecCtx, pkt) == 0) {
+                    while (avcodec_receive_frame(track->codecCtx, vf) == 0) {
+                        int64_t framePts = vf->pts;
+                        if (framePts == AV_NOPTS_VALUE) framePts = vf->best_effort_timestamp;
+                        int64_t framePtsMs;
+                        if (framePts != AV_NOPTS_VALUE) {
+                            framePtsMs = av_rescale_q(
+                                framePts, m_prerollFmtCtx->streams[track->streamIndex]->time_base,
+                                {1, 1000});
+                        } else {
+                            framePtsMs = target;
+                        }
+                        MediaVideoFrame mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
+                        mediaFrame.ptsMs = framePtsMs;
+                        if (mediaFrame.isValid()) {
+                            m_prerollStagingCache->insertVideoFrame(mediaFrame);
+                            if (track->streamIndex == primaryStreamIndex)
+                                m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
+                        }
+                        av_frame_unref(vf);
                     }
-                    av_frame_unref(vf);
                 }
             }
             break;
@@ -2035,6 +2162,7 @@ void PlaybackWorker::run() {
 
     // Tier3: free pre-roll resources (worker-thread-owned).
     for (auto* track : m_prerollBank) {
+        track->nativeDecoder.reset(); // tear down VT/MF session before freeing track
         if (track->codecCtx) avcodec_free_context(&track->codecCtx);
         delete track;
     }

@@ -701,21 +701,52 @@ case "$SCENARIO" in
         fi
         ;;
     armedcut-h264)
-        # H.264 pre-roll GUARD + UIManager::recallEntry fallback seek:
-        #   armNextCutArmed==0  -> pre-roll guard fired (H.264 streams skipped,
-        #                           bank empty, armNextCut returned false)
-        #   cutsFired==0        -> no cut was issued (guard blocked it)
-        #   reposition>=1       -> the fallback plain seek serviced the jump
-        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 0 ]; then
-            echo "FAIL: armedcut-h264 armNextCut returned true on H.264 fixture (armNextCutArmed=$armNextCutArmed, expected 0) — H.264 pre-roll guard did not fire"
+        # H.264 FRAME-PERFECT ARMED CUT: openPrerollContext() now builds a
+        # NativeVideoDecoder for H.264 streams so armNextCut succeeds and the
+        # worker pre-rolls the target window into staging, firing a frame-accurate
+        # cut with no gray flash and no reposition fallback. Mirrors the MPEG-2
+        # armedcut gate exactly + adds a non-vacuity guard on decodedVideoFrames.
+        #   armNextCutArmed==1    -> HW pre-roll bank accepted the arm
+        #   placeholderFramesDelta==0 -> no gray flash across the cut
+        #   reposition==0         -> cut fired; no coarse-seek fallback
+        #   maxClockDivergenceMs<=1500 -> epoch re-anchored at the cut
+        #   cutsFired==2          -> first cut + queued re-arm both fired
+        #   cutFollowReposition==0 -> forward cut; no backward decoder-follow
+        #   decodedVideoFrames>=30 -> the primary H.264 HW decoder ran (corroborates the
+        #                             fixture is genuinely H.264-decoded). NOTE: this counter
+        #                             tracks the PRIMARY bank, not the pre-roll staging; the
+        #                             staging non-vacuity is proven by the conjunction below.
+        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 1 ]; then
+            echo "FAIL: armedcut-h264 armNextCut did not arm on H.264 fixture (armNextCutArmed=$armNextCutArmed, expected 1) — NativeVideoDecoder pre-roll bank not built (check avcC parse / HW caps)"
             fail=1
         fi
-        if ! num "$cutsFired" || [ "$cutsFired" -ne 0 ]; then
-            echo "FAIL: armedcut-h264 a cut fired on an H.264 fixture (cutsFired=$cutsFired, expected 0) — pre-roll guard should have blocked it"
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 painted gray across the cut (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — cut flash"
             fail=1
         fi
-        if ! num "$reposition" || [ "$reposition" -lt 1 ]; then
-            echo "FAIL: armedcut-h264 fallback seek did not reposition (reposition=$reposition, expected >=1) — the plain-seek fallback should have serviced the jump"
+        if ! num "$reposition" || [ "$reposition" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 fell back to repositionTo (reposition=$reposition, expected 0) — cut did not fire in time"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: armedcut-h264 clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored at the cut)"
+            fail=1
+        fi
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 2 ]; then
+            echo "FAIL: armedcut-h264 re-arm queue fired $cutsFired cuts (expected 2) — queued re-arm dropped or duplicated"
+            fail=1
+        fi
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 (forward) fired the decoder-follow (cutFollowReposition=$cutFollowReposition, expected 0) — follow should only arm for backward cuts"
+            fail=1
+        fi
+        # The primary H.264 HW decoder must have produced real frames (confirms the
+        # fixture is genuinely H.264-decoded, not silently mpeg2). The pre-roll STAGING
+        # non-vacuity (no empty cache "firing" a cut) is carried by the conjunction above:
+        # cutsFired==2 + placeholderFramesDelta==0 + reposition==0 cannot all hold off an
+        # empty/placeholder staging cache. Keep this guard.
+        if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -lt 30 ]; then
+            echo "FAIL: armedcut-h264 too few decoded video frames (decodedVideoFrames=$decodedVideoFrames, expected >=30) — primary H.264 HW decode produced no real frames"
             fail=1
         fi
         ;;

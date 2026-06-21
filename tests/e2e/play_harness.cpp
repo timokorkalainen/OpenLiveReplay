@@ -513,32 +513,37 @@ int main(int argc, char** argv) {
             QTimer::singleShot(14000, &app, finish);
 
         } else if (scen == "armedcut-h264") {
-            // H.264 pre-roll GUARD: on an H.264 fixture openPrerollContext() skips
-            // all H.264 streams (HW-only, not supported in the pre-roll bank), so
-            // the bank is empty and armNextCut returns FALSE. The UIManager fallback
-            // (recallEntry) issues a plain seek instead. Gate:
-            //   armNextCutArmed==0  -> pre-roll guard fired (armNextCut rejected)
-            //   cutsFired==0        -> no cut was issued (guard blocked it)
-            //   reposition>=1       -> the fallback seek serviced the jump
-            //
-            // Scope note: this validates the worker-level guard + seek;
-            // the UIManager::recallEntry->seekPlayback->SeekCoalescer path is not
-            // exercised here.
+            // H.264 FRAME-PERFECT ARMED CUT: now that openPrerollContext() builds a
+            // NativeVideoDecoder for H.264 streams, armNextCut returns TRUE and the
+            // worker pre-rolls [target, target+span] into the staging cache, firing a
+            // frame-accurate cut with NO gray flash and NO reposition fallback.
+            // Mirrors the MPEG-2 "armedcut" scenario exactly (arm + queued re-arm →
+            // cutsFired==2) on the H.264 fixture.
+            // Gates:
+            //   armNextCutArmed==1  -> pre-roll bank accepted the arm (HW decode OK)
+            //   cutsFired==2        -> first cut + queued re-arm both fired
+            //   placeholderFramesDelta==0 -> no gray flash across the cut
+            //   reposition==0       -> cut fired; no coarse-seek fallback
+            //   maxClockDivergenceMs<=1500 -> epoch re-anchored at cut
+            //   decodedVideoFrames>=30 -> HW frames were actually decoded into staging
             transport.setSpeed(1.0);
             transport.seek(0);
             transport.setPlaying(true);
-            QTimer::singleShot(1000, &app, [&]() {
+            QTimer::singleShot(1000, &app, [&, basePh]() {
+                *basePh = worker.outputStats().placeholderFrames;
                 const int64_t target = durMs / 2;
                 armNextCutArmed = worker.armNextCut(target) ? 1 : 0;
                 fprintf(stderr,
-                        "### armedcut-h264 armNextCut(%lldms) returned %d "
+                        "### armedcut-h264 basePh=%lld; armNextCut(%lldms) returned %d "
                         "(0=guard fired, 1=armed) ###\n",
-                        (long long) target, armNextCutArmed);
-                // Simulate UIManager::recallEntry fallback: plain seek.
-                transport.seek(target);
-                worker.seekTo(target);
-                fprintf(stderr, "### armedcut-h264 fallback seek to %lldms issued ###\n",
-                        (long long) target);
+                        (long long) *basePh, (long long) target, armNextCutArmed);
+            });
+            // Rapid re-arm (queued double-recall) while the first cut is in flight,
+            // mirroring the MPEG-2 armedcut scenario (drives cutsFired==2).
+            QTimer::singleShot(1050, &app, [&]() {
+                worker.armNextCut(durMs * 3 / 4);
+                fprintf(stderr,
+                        "### armedcut-h264 re-arm (queued double-recall to durMs*3/4) ###\n");
             });
             QTimer::singleShot(4000, &app, finish);
 
