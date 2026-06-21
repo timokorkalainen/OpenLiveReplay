@@ -36,7 +36,7 @@ void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
     m_telemetryFeedIndexById.clear();
 
     for (int i = 0; i < feedIds.size(); ++i) {
-        const QString feedId = feedIds.at(i);
+        const QString& feedId = feedIds.at(i);
         if (feedId.isEmpty() || m_telemetryFeedIndexById.contains(feedId)) {
             continue;
         }

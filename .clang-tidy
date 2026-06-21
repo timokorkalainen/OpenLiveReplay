@@ -2,9 +2,11 @@
 #
 # Goal: signal on the bug classes that actually bite a threaded real-time media
 # app (null derefs, narrowing/integer coercion, lifetime/use-after-free — cf.
-# the mono-audio SIGBUS), not a style cudgel. Advisory by default
-# (WarningsAsErrors empty); CI runs it on changed files and reports findings
-# without failing the build. Flip WarningsAsErrors once the backlog is clear.
+# the mono-audio SIGBUS), not a style cudgel.
+#
+# This is a GATE: CI runs it on changed first-party files and WarningsAsErrors
+# (below) makes the high-signal classes fatal. The whole first-party tree is
+# clean for those classes, so only regressions in touched files fail.
 #
 # Third-party headers (Qt, FFmpeg, rtmidi) are excluded via HeaderFilterRegex.
 Checks: >
@@ -20,9 +22,26 @@ Checks: >
   readability-non-const-parameter,
   -bugprone-easily-swappable-parameters,
   -bugprone-narrowing-conversions,
-  -clang-analyzer-optin.performance.Padding
+  -clang-analyzer-optin.performance.Padding,
+  -performance-enum-size
 
-WarningsAsErrors: ''
+# Fatal classes: analyzer findings, bug-prone patterns, uninitialised members,
+# and the performance checks the tree is already clean for. The integer-coercion
+# family (narrowing/implicit-widening) and a few low-signal perf checks stay
+# REPORTED-BUT-ADVISORY here — they carry a large, mostly-benign FFmpeg-interop
+# backlog (see -DOLR_WCONVERSION) that must be burned down cast-by-cast in a
+# dedicated pass, not bulk-silenced, which can hide real truncation bugs.
+WarningsAsErrors: >
+  bugprone-*,
+  clang-analyzer-*,
+  cppcoreguidelines-pro-type-member-init,
+  performance-*,
+  misc-*,
+  readability-*,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-throwing-static-initialization,
+  -performance-unnecessary-value-param,
+  -performance-implicit-conversion-in-loop
 
 # Only our first-party sources — never Qt / FFmpeg / rtmidi / generated moc.
 HeaderFilterRegex: '.*/(recorder_engine|playback|midi)/.*|.*/(settingsmanager|uimanager)\.h$'

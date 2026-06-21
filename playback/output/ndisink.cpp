@@ -349,7 +349,7 @@ void NdiOutputSink::setStatus(NdiOutputState state, const QString& message) {
 }
 
 QString NdiOutputSink::senderNameFor(const OutputTargetAssignment& assignment) {
-    const QString configured =
+    QString configured =
         assignment.settings.value(QStringLiteral("senderName")).toString().trimmed();
     if (!configured.isEmpty()) return configured;
     if (!assignment.id.trimmed().isEmpty())

@@ -168,7 +168,10 @@ public:
                 discovered.append(
                     QString::fromUtf8(sources[i].p_ndi_name ? sources[i].p_ndi_name : ""));
             }
-            selectedIndex = selectDiscoveredSourceIndex(discovered, sourceName);
+            // Only select when the source array is valid: if m_findGetCurrentSources
+            // is unresolved, sources is null (and discovered empty), so guard the
+            // index to avoid dereferencing null / leaving `selected` uninitialized.
+            selectedIndex = sources ? selectDiscoveredSourceIndex(discovered, sourceName) : -1;
             if (selectedIndex >= 0) {
                 selected = sources[selectedIndex];
             }

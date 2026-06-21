@@ -614,6 +614,9 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         }
                     }
 
+                    // FP: `track` is an m_decoderBank element (always new'd) and is
+                    // dereferenced unconditionally above, so it is never null here.
+                    // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
                     MediaVideoFrame mediaFrame = convertToMediaVideoFrame(nativeVf, track->feedIndex);
                     mediaFrame.ptsMs = framePtsMs;
                     if (mediaFrame.isValid()) {

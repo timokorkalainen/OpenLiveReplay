@@ -218,8 +218,8 @@ private:
 
     // FFmpeg context management
     struct QueuedFrame {
-        AVFrame* frame;
-        int64_t sourcePts;
+        AVFrame* frame{};
+        int64_t sourcePts{};
         // The frame's own source timecode (100 ns since midnight), or -1 when the
         // transport carried no TC. Purely additive: never affects A/V sync or the
         // jitter pull; only forwarded via frameTimecode() when the frame is muxed.

@@ -1982,7 +1982,7 @@ bool UIManager::playPlaylist(int fromIndex) {
     stopPlaylistPlayout();
 
     m_playout.start(entries, fromIndex);
-    const ReplayEntry first = entries[fromIndex];
+    const ReplayEntry& first = entries[fromIndex];
     // Start the first entry directly (NOT via seekPlayback, which exits playout).
     setFollowLive(false);
     m_transport->setSpeed(first.speed);
@@ -2282,7 +2282,7 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
         QVariantList items;
         QStringList summaryParts;
         for (auto it = payload.constBegin(); it != payload.constEnd(); ++it) {
-            const QString key = it.key();
+            const QString& key = it.key();
             if (key == QStringLiteral("feedId")) continue;
             const QString displayValue = telemetryValueToString(it.value());
 

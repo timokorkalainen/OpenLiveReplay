@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Pre-commit lint gate — mirrors the CI "Lint" job (.github/workflows/ci.yml) so
+# local == CI: clang-format on changed lines + strict qmllint on staged QML.
+#
+# Enable once per clone:   git config core.hooksPath .githooks
+# Bypass:                  git commit --no-verify   (or OLR_PRECOMMIT_SKIP=1)
+#
+# Missing tooling is reported and skipped (not fatal) so a partial toolchain does
+# not block commits; CI remains the authoritative gate.
+set -euo pipefail
+
+[ "${OLR_PRECOMMIT_SKIP:-0}" = "1" ] && exit 0
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+fail=0
+
+# --- clang-format: changed lines only, same tool/style as CI ----------------
+CF="$(command -v clang-format || true)"; [ -x "$CF" ] || CF=/opt/homebrew/opt/llvm/bin/clang-format
+GCF="$(command -v git-clang-format || true)"; [ -x "$GCF" ] || GCF=/opt/homebrew/opt/llvm/bin/git-clang-format
+if [ -x "$CF" ] && [ -x "$GCF" ]; then
+    diff="$("$GCF" --binary "$CF" --diff --staged --extensions cpp,h,hpp,mm,c 2>/dev/null || true)"
+    case "$diff" in
+        "no modified files to format"|"clang-format did not modify any files"|"") ;;
+        *)
+            echo "[pre-commit] clang-format violations in staged changes:" >&2
+            printf '%s\n' "$diff" >&2
+            echo "[pre-commit] fix with: git clang-format --staged" >&2
+            fail=1 ;;
+    esac
+else
+    echo "[pre-commit] clang-format not found (brew install llvm) — skipping C++ format check" >&2
+fi
+
+# --- qmllint: strict, same categories as CI, on staged QML ------------------
+qml_files="$(git diff --cached --name-only --diff-filter=ACM -- '*.qml' || true)"
+if [ -n "$qml_files" ]; then
+    QMLLINT=""
+    for c in "${QT_ROOT_DIR:-}/bin/qmllint" "$HOME/Qt/6.10.1/macos/bin/qmllint"; do
+        [ -n "$c" ] && [ -x "$c" ] && { QMLLINT="$c"; break; }
+    done
+    [ -n "$QMLLINT" ] || QMLLINT="$(command -v qmllint || true)"
+    if [ -n "$QMLLINT" ] && [ -x "$QMLLINT" ]; then
+        qmldir="$(cd "$(dirname "$QMLLINT")/../qml" 2>/dev/null && pwd || true)"
+        # shellcheck disable=SC2086
+        if ! "$QMLLINT" --unqualified error --Quick.layout-positioning error \
+                ${qmldir:+-I "$qmldir"} $qml_files; then
+            echo "[pre-commit] qmllint failed on staged QML" >&2
+            fail=1
+        fi
+    else
+        echo "[pre-commit] qmllint not found — skipping QML lint" >&2
+    fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "[pre-commit] blocked. Bypass with: git commit --no-verify" >&2
+    exit 1
+fi

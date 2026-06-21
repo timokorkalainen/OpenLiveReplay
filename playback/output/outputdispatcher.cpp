@@ -7,7 +7,7 @@
 namespace {
 
 QString targetStatsKey(const OutputTargetAssignment& assignment) {
-    const QString id = assignment.id.trimmed();
+    QString id = assignment.id.trimmed();
     if (!id.isEmpty()) return id;
     return QStringLiteral("%1:%2:%3")
         .arg(int(assignment.kind))
