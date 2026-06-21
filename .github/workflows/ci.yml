@@ -644,6 +644,35 @@ jobs:
             mull-runner-19 --report-name "$t-mutants" "build/tests/unit/$t" || true
           done
 
+  # ---------------------------------------------------------------------------
+  # Single aggregate status for branch protection. Requiring this one check is
+  # robust against matrix-name churn and conditional skips: it passes when every
+  # required job either succeeded or was skipped (e.g. a docs-only PR), and fails
+  # if any required job failed or was cancelled. Coverage (report-only),
+  # workflow-lint, and the manual mull job are intentionally not gated here.
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs: [lint, build-test-macos, build-test-linux, sanitizers]
+    if: ${{ always() }}
+    steps:
+      - name: Require all gating jobs to pass (skipped is allowed)
+        run: |
+          for r in \
+            "lint=${{ needs.lint.result }}" \
+            "build-test-macos=${{ needs.build-test-macos.result }}" \
+            "build-test-linux=${{ needs.build-test-linux.result }}" \
+            "sanitizers=${{ needs.sanitizers.result }}"; do
+            name="${r%%=*}"; res="${r#*=}"
+            echo "$name: $res"
+            if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
+              echo "::error::Required job '$name' did not pass (result: $res)"
+              fail=1
+            fi
+          done
+          exit "${fail:-0}"
+
 # iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
 # (~20 min) OOM-kills hosted runners. It is validated locally instead via the
 # .githooks/pre-push hook. See tests/README.md.
