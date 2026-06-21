@@ -40,9 +40,12 @@ QtObject {
     readonly property color accentPressed: "#1F66E0"
     readonly property color focusRing: "#2E7BFF"
 
-    // --- Type ---
-    readonly property string fontFamily: "Inter, -apple-system, Segoe UI, Roboto, sans-serif"
-    readonly property string fontMono: "Menlo, Consolas, monospace" // tabular figures for timecode
+    // --- Type --- (single families / Qt generics — a comma list is NOT a valid
+    // font.family and silently falls back; use font.families for a preference list.)
+    readonly property var fontStack: ["Inter", "Segoe UI", "Roboto", "Helvetica Neue", "sans-serif"]
+    readonly property var fontMonoStack: ["Menlo", "Consolas", "DejaVu Sans Mono", "monospace"]
+    readonly property string fontFamily: "sans-serif"  // generic fallback for font.family
+    readonly property string fontMono: "monospace"     // generic mono (tabular) for timecode
     readonly property int fsMicro: 11
     readonly property int fsBody: 13
     readonly property int fsHeading: 15

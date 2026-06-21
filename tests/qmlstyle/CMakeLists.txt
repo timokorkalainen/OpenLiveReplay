@@ -15,3 +15,10 @@ set_tests_properties(tst_olrstyle PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# Dev-only headless preview renderer (no add_test): renders a QML file under OlrStyle
+# to a PNG for visual review. Links the style modules so it never dlopens a plugin.
+qt_add_executable(uipreview uipreview_main.cpp)
+target_link_libraries(uipreview PRIVATE
+    Qt6::Qml Qt6::Quick Qt6::Gui Qt6::QuickControls2
+    OlrTheme OlrStyle olr_warnings)

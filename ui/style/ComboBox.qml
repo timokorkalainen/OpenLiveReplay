@@ -79,7 +79,7 @@ T.ComboBox {
             implicitHeight: contentHeight
             model: control.delegateModel
             currentIndex: control.highlightedIndex
-            ScrollIndicator.vertical: ScrollIndicator {}
+            boundsBehavior: Flickable.StopAtBounds
         }
 
         background: Rectangle {

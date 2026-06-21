@@ -6,7 +6,7 @@ T.TextField {
     id: control
 
     implicitWidth: Math.max(implicitBackgroundWidth + leftInset + rightInset, 100)
-    implicitHeight: Math.max(implicitContentHeight + topPadding + bottomPadding,
+    implicitHeight: Math.max(contentHeight + topPadding + bottomPadding,
                              implicitBackgroundHeight, Theme.hField)
 
     leftPadding: Theme.s2

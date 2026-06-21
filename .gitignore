@@ -78,3 +78,6 @@ ios/streamdeck-bridge/StreamDeckBridge.xcodeproj/
 # Python bytecode cache (e.g. from tests/e2e/lossy_udp_relay.py)
 __pycache__/
 *.pyc
+
+# headless UI preview output
+gallery_out.png
