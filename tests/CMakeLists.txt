@@ -264,14 +264,16 @@ if(OLR_GPU_PIPELINE)
     qt_add_library(olr_test_gpu STATIC
         "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
     target_include_directories(olr_test_gpu PUBLIC "${CMAKE_SOURCE_DIR}")
     target_link_libraries(olr_test_gpu
         PUBLIC Qt6::Core Qt6::Gui Qt6::GuiPrivate
         PRIVATE olr_warnings olr_sanitize)
     if(APPLE)
         target_sources(olr_test_gpu PRIVATE
-            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm")
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm")
         target_link_libraries(olr_test_gpu
             PUBLIC "-framework Metal" "-framework QuartzCore" "-framework CoreVideo"
                    "-framework CoreFoundation" "-framework IOSurface")

@@ -415,12 +415,14 @@ if(OLR_GPU_PIPELINE)
     if(APPLE)
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_apple.mm
-            playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp)
+            playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/decodedonefence.h playback/gpu/decodedonefence_apple.mm)
         target_link_libraries(OpenLiveReplay PRIVATE "-framework Metal" "-framework QuartzCore")
     else()
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp
-            playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp)
+            playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/decodedonefence.h playback/gpu/decodedonefence_stub.cpp)
     endif()
 endif()
 
