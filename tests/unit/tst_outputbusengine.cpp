@@ -9,6 +9,15 @@ static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
     return f;
 }
 
+// Distinct Y AND chroma so PGM selection is provable on every plane (a Y-only
+// fixture cannot tell two feeds apart on the U/V planes).
+static MediaVideoFrame videoYuv(int feed, qint64 pts, uchar y, uchar u, uchar v) {
+    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, u, v);
+    f.feedIndex = feed;
+    f.ptsMs = pts;
+    return f;
+}
+
 static MediaAudioFrame audio(int feed, qint64 startSample, qint16 value) {
     MediaAudioFrame a;
     a.feedIndex = feed;
@@ -28,6 +37,7 @@ class TestOutputBusEngine : public QObject {
 private slots:
     void feedBusUsesOwnVideoAndAudioAtOneX();
     void pgmFollowsSelectedFeed();
+    void pgmIsPixelExactCopyOfSelectedFeed();
     void pausedAudioIsSilenceButVideoRepeats();
     void multiviewComposesFeedsAndCarriesSelectedFeedAudio();
     void ntscAudioUsesRationalSampleBoundaries();
@@ -75,6 +85,50 @@ void TestOutputBusEngine::pgmFollowsSelectedFeed() {
     auto pgm = engine.renderPgm(5, state, cache);
     QCOMPARE(pgm.bus, OutputBusId::pgm());
     QCOMPARE(uchar(pgm.video.planeY.at(0)), uchar(30));
+}
+
+// PIXEL-EXACT PGM SELECTION: the PGM bus must emit the SELECTED feed's pixels
+// verbatim (whole Y/U/V planes), and must NOT emit any non-selected feed. The
+// existing pgmFollowsSelectedFeed check above probes a single corner pixel, so a
+// regression that selects the wrong feed but happens to share that pixel — or a
+// chroma-only mis-selection — would slip through. Asserting full-plane equality
+// against the selected source and full-plane inequality against the other feed
+// makes "wrong PGM source" FAIL deterministically.
+void TestOutputBusEngine::pgmIsPixelExactCopyOfSelectedFeed() {
+    const MediaVideoFrame feed0 = videoYuv(0, 100, 10, 60, 200);
+    const MediaVideoFrame feed1 = videoYuv(1, 100, 30, 90, 170);
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(feed0);
+    cache.insertVideoFrame(feed1);
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 1;
+
+    auto pgm = engine.renderPgm(5, state, cache);
+    QCOMPARE(pgm.bus, OutputBusId::pgm());
+    QCOMPARE(pgm.video.feedIndex, 1);
+
+    // Every byte of every plane equals the selected feed (feed 1)...
+    QCOMPARE(pgm.video.planeY, feed1.planeY);
+    QCOMPARE(pgm.video.planeU, feed1.planeU);
+    QCOMPARE(pgm.video.planeV, feed1.planeV);
+
+    // ...and is NOT the non-selected feed (feed 0) on any plane.
+    QVERIFY(pgm.video.planeY != feed0.planeY);
+    QVERIFY(pgm.video.planeU != feed0.planeU);
+    QVERIFY(pgm.video.planeV != feed0.planeV);
+
+    // Selecting feed 0 instead must produce feed 0's planes exactly.
+    state.selectedFeedIndex = 0;
+    auto pgm0 = engine.renderPgm(6, state, cache);
+    QCOMPARE(pgm0.video.feedIndex, 0);
+    QCOMPARE(pgm0.video.planeY, feed0.planeY);
+    QCOMPARE(pgm0.video.planeU, feed0.planeU);
+    QCOMPARE(pgm0.video.planeV, feed0.planeV);
 }
 
 void TestOutputBusEngine::pausedAudioIsSilenceButVideoRepeats() {
