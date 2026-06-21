@@ -92,3 +92,23 @@ default and reference throughout.
   async-readback and DeckLink as GPU-native only where the SDK exposes it. No
   sink blocks the program: forced readback is "needs-readback", not a blocker
   (spec §10).
+
+## P0.6 — Golden-fixture color-tag audit + default-tagging policy (gates color-metadata no-op)
+
+- **Question (§11 Q6):** do existing golden fixtures carry color tags? If not,
+  what default-tagging policy makes color-metadata a provable no-op?
+- **Method:** `tests/probes/audit_fixture_color_tags.sh` regenerates a fixture
+  via the e2e ffmpeg recipe and ffprobes its color metadata.
+- **Result:** `color_space=unknown color_primaries=unknown
+  color_transfer=unknown color_range=tv`; `CLASSIFICATION: UNTAGGED`.
+- **Finding:** fixtures do not carry colorimetry tags (matrix/primaries/transfer
+  are unknown). The e2e recipe sets no `-color_*` flags; the range is `tv`
+  (video). The height>576 heuristic in `qtpreviewsink.cpp:23-25` is the only
+  matrix decision today.
+- **Default-tagging policy (gates color-metadata Phase 1):** an untagged frame
+  gets `ColorMetadata{ matrix = height>576 ? Bt709 : Bt601, range=Video,
+  primaries/transfer matching matrix, chromaFormat=Yuv420, bitDepth=8 }`,
+  byte-identical to today. A tagged fixture honors its tags; re-goldening a
+  tagged fixture is a deliberate future event, not an accidental regression.
+- **Decision:** GO. Color-metadata Phase 1 can land as a proven no-op for current
+  fixtures; the audit confirms no fixture currently forces an appearance change.
