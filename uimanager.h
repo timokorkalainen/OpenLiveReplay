@@ -25,6 +25,7 @@
 #include "playback/audioplayer.h"
 #include "playback/seekcoalescer.h"
 #include "playback/replayplaylist.h"
+#include "playback/playlistplayout.h"
 #include "playback/telemetrytimelinereader.h"
 #include "midi/midimanager.h"
 #include "streamdeck/streamdeckmanager.h"
@@ -294,6 +295,14 @@ public:
     Q_INVOKABLE void markOut();
     Q_INVOKABLE void recallEntry(int index);
     Q_INVOKABLE int playlistCount() const;
+    // EVS rundown auto-playout: play the playlist from `fromIndex`, auto-advancing
+    // across each entry boundary with a frame-perfect armed cut (fire-at-out-point),
+    // honoring each entry's speed. After the final entry, normal playback continues
+    // forward (the recording is a live, growing file). A manual scrub or recall
+    // exits playout (operator override). Returns false if the playlist is empty.
+    Q_INVOKABLE bool playPlaylist(int fromIndex = 0);
+    Q_INVOKABLE void stopPlaylistPlayout();
+    Q_INVOKABLE bool playlistPlayoutActive() const { return m_playout.active(); }
 
     QString getSettingsPath(QString fileName);
 signals:
@@ -409,6 +418,14 @@ private:
     QString m_configPath;
     PlaybackWorker* m_playbackWorker = nullptr;
     ReplayPlaylist m_playlist; // Tier3 cue list (markIn/markOut/recall)
+    // EVS rundown auto-playout state. m_playout decides which boundary to arm and
+    // when; m_playoutMonitor polls the playhead (onPlayoutTick) to arm boundaries
+    // and advance on each cut fire; m_playoutCutBaseline tracks the worker's fired-
+    // cut count so a boundary fire is detected as an advance.
+    PlaylistPlayout m_playout;
+    QTimer m_playoutMonitor;
+    int m_playoutCutBaseline = 0;
+    void onPlayoutTick();
     QList<FrameProvider*> m_providers;
     FrameProvider* m_multiviewPreviewProvider = nullptr;
     FrameProvider* m_pgmPreviewProvider = nullptr;
@@ -421,6 +438,12 @@ private:
     SeekCoalescer m_seekCoalescer;
     QTimer m_scrubCoalesceTimer;
     static constexpr int kScrubCoalesceMs = 16; // ~one frame at 60fps
+    // Wall-clock lead before an entry's out-point at which the playout boundary cut
+    // is armed (PlaylistPlayout scales it by speed into a clip-time distance), and
+    // how often the playout monitor polls the playhead. The cut fires frame-perfectly
+    // on the output thread, so the poll interval does not affect boundary accuracy.
+    static constexpr qint64 kPlayoutArmLeadMs = 1500;
+    static constexpr int kPlayoutMonitorMs = 16;
     bool m_followLive = false;
     bool m_h264EncodeAvailable = false;
     bool m_benchmarkRunning = false;

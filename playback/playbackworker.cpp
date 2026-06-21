@@ -1085,7 +1085,7 @@ bool PlaybackWorker::openPrerollContext() {
 // failed to open (e.g. H.264 recordings: the pre-roll bank is hardware-only-
 // guarded and stays empty). Returns true when the cut is armed or queued for
 // re-arm. v1 is single-clip (ms-only; same currently-open file).
-bool PlaybackWorker::armNextCut(int64_t targetMs) {
+bool PlaybackWorker::armNextCut(int64_t targetMs, int64_t fireAtPlayheadMs) {
     if (!m_prerollFmtCtx) return false; // pre-roll disabled — feature unavailable
     // Safe re-arm queue: a re-arm (rapid double "Recall") while a cut is already
     // armed/in-flight must NOT reset the staging state from this (UI) thread. The
@@ -1098,6 +1098,7 @@ bool PlaybackWorker::armNextCut(int64_t targetMs) {
     // sequentially on the worker thread. Latest queued target wins.
     if (m_cutArmed.load(std::memory_order_acquire)) {
         m_pendingRearmMs.store(targetMs < 0 ? 0 : targetMs);
+        m_pendingRearmFireAtMs.store(fireAtPlayheadMs, std::memory_order_relaxed);
         // Capture the seek generation NOW (queue time): if a manual seek lands
         // before the worker applies this re-arm, m_seekGeneration moves past it and
         // the worker drops the re-arm (the seek is the newer explicit action).
@@ -1108,7 +1109,7 @@ bool PlaybackWorker::armNextCut(int64_t targetMs) {
     }
     // Fresh arm: armNextCut and seekTo are both UI-thread, so reading m_seekGeneration
     // here is a coherent baseline (no seek can interleave between this read and the arm).
-    armCutInternal(targetMs, m_seekGeneration.load(std::memory_order_acquire));
+    armCutInternal(targetMs, m_seekGeneration.load(std::memory_order_acquire), fireAtPlayheadMs);
     return true;
 }
 
@@ -1117,8 +1118,10 @@ bool PlaybackWorker::armNextCut(int64_t targetMs) {
 // only (no cache touch) — safe from the UI thread (fresh arm) or the worker
 // thread (queued re-arm applied in the run loop). m_cutArmed is released LAST so
 // a worker observing it true (acquire) sees the target/seek-pending stores.
-void PlaybackWorker::armCutInternal(int64_t targetMs, uint64_t baselineSeekGen) {
+void PlaybackWorker::armCutInternal(int64_t targetMs, uint64_t baselineSeekGen,
+                                    int64_t fireAtPlayheadMs) {
     m_armedTargetMs.store(targetMs < 0 ? 0 : targetMs);
+    m_armedFireAtMs.store(fireAtPlayheadMs);
     m_prerollSeekPending.store(true);
     m_stagingCovers.store(false);
     m_scheduledCutFrame.store(-1);
@@ -1265,8 +1268,29 @@ void PlaybackWorker::fillStaging() {
         const qint64 lead = CutSchedule::framesForLeadMs(kCutLeadMs, fps());
         const qint64 nextIdx =
             m_outputRuntime ? m_outputRuntime->dispatcherNextOutputFrameIndex() : 0;
-        scheduleCutAtFrame(CutSchedule::outputFrameForCut(nextIdx, static_cast<int>(lead)),
-                           m_armedTargetMs.load());
+        // Earliest safe fire frame: the staging is covered now, so kCutLeadMs ahead.
+        const qint64 asapFrame = CutSchedule::outputFrameForCut(nextIdx, static_cast<int>(lead));
+        qint64 fireFrame = asapFrame;
+        // Frame-perfect playout: when a fire-at-playhead was armed (a playlist
+        // entry's out-point), fire at the output frame where the sampled playhead
+        // reaches it — but never before the earliest safe frame (if the out-point is
+        // already imminent or past, fall back to firing as-soon-as-staged).
+        const int64_t fireAt = m_armedFireAtMs.load();
+        if (fireAt >= 0 && m_outputRuntime) {
+            // outputFrameForPlayheadMs / dispatcherNextOutputFrameIndex lock the
+            // output runtime internally; m_outputRuntime itself is worker-thread-owned
+            // (reset only on the worker thread; the dtor joins first), so reading the
+            // raw pointer here is safe without m_outputRuntimeMutex, as elsewhere on
+            // this path. atOut == -1 means the play epoch is not yet established
+            // (transient, e.g. just after a prior cut's resetPlayEpoch); during a
+            // running rundown the epoch is long settled before any boundary is staged,
+            // so we keep the asap-clamp here (fire-at-out-point degrades to as-soon-as-
+            // staged in that unreachable window) — the e2e landing gate would surface
+            // it if it ever occurred.
+            const qint64 atOut = m_outputRuntime->outputFrameForPlayheadMs(fireAt);
+            if (atOut > asapFrame) fireFrame = atOut;
+        }
+        scheduleCutAtFrame(fireFrame, m_armedTargetMs.load());
     }
 }
 
@@ -1308,6 +1332,7 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
         m_stagingCovers.store(false);
         m_decoderFollowMs.store(-1);
         m_armedTargetMs.store(-1);
+        m_armedFireAtMs.store(-1);
         m_prerollSeekPending.store(false);
         m_cutArmed.store(false, std::memory_order_release);
         return;
@@ -1921,7 +1946,8 @@ void PlaybackWorker::run() {
             // explicit action. armCutInternal is given the QUEUE-time generation as
             // the baseline, so even a seek that races this apply aborts the cut later.
             if (!seekPending && m_seekGeneration.load(std::memory_order_acquire) == qgen)
-                armCutInternal(m_pendingRearmMs.load(), qgen);
+                armCutInternal(m_pendingRearmMs.load(), qgen,
+                               m_pendingRearmFireAtMs.load(std::memory_order_relaxed));
         }
         // Worker-private; never starves the primary tick (kPrerollPacketsPerTick
         // per pass). Stops once staging covers the armed window (m_stagingCovers),

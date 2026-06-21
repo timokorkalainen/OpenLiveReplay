@@ -176,6 +176,7 @@ heldFramesDelta="$(get heldFramesDelta)"
 maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 cutsFired="$(get cutsFired)"
 cutFollowReposition="$(get cutFollowReposition)"
+maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -191,6 +192,7 @@ cutFollowReposition="$(get cutFollowReposition)"
 [ -n "$maxClockDivergenceMs" ] || maxClockDivergenceMs="?"
 [ -n "$cutsFired" ] || cutsFired="?"
 [ -n "$cutFollowReposition" ] || cutFollowReposition="?"
+[ -n "$maxBoundaryLandingErrMs" ] || maxBoundaryLandingErrMs="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -563,13 +565,68 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    playlist)
+        # EVS rundown AUTO-PLAYOUT: a 3-entry playlist (one slow-motion segment)
+        # plays itself, auto-advancing across each entry boundary with a frame-perfect
+        # cut that fires at the entry's out-point. Gates:
+        #   cutsFired==2               -> both boundaries auto-advanced (3 entries ->
+        #                                 2 transitions), proving the rundown ran
+        #   placeholderFramesDelta==0  -> no gray flash across either boundary
+        #   framesDropped==0           -> no dropped frames through the cuts/slow-mo
+        #   maxClockDivergenceMs<=1500 -> frame-accurate boundaries incl. the slow-mo
+        #                                 segment (the fire-frame honors speed)
+        #   cutFollowReposition==0     -> the boundaries are forward cuts (no backward
+        #                                 decoder-follow resync)
+        # heldFramesDelta is bounded (cut-flip transient at each of the 2 boundaries);
+        # reposition is the warmup seek only (forward cuts do not reposition).
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 2 ]; then
+            echo "FAIL: playlist did not auto-advance both boundaries (cutsFired=$cutsFired, expected 2) — rundown stalled or over-fired"
+            fail=1
+        fi
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: playlist painted gray across a boundary (placeholderFramesDelta=$placeholderFramesDelta, expected 0)"
+            fail=1
+        fi
+        if ! num "$framesDropped" || [ "$framesDropped" -ne 0 ]; then
+            echo "FAIL: playlist dropped frames (framesDropped=$framesDropped, expected 0) across the playout"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: playlist clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — a boundary cut did not land frame-accurately (incl. the slow-mo segment)"
+            fail=1
+        fi
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 0 ]; then
+            echo "FAIL: playlist used a backward decoder-follow (cutFollowReposition=$cutFollowReposition, expected 0) — boundaries should be forward cuts"
+            fail=1
+        fi
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -gt 30 ]; then
+            echo "FAIL: playlist held too many frames (heldFramesDelta=$heldFramesDelta, expected <=30) — a boundary stalled the cache"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 2 ]; then
+            echo "FAIL: playlist repositioned too much (reposition=$reposition, expected <=2 = warmup) — a boundary fell back to a coarse seek"
+            fail=1
+        fi
+        # FRAME-PERFECT LANDING (the assertion the self-referential divergence gate
+        # misses): each boundary cut must re-base the playhead to the next entry's
+        # in-point. maxBoundaryLandingErrMs is max|landed playhead - expected in-point|
+        # over the boundaries, sampled up to one monitor interval after each fire.
+        # Frame-perfect lands within a few ms (observed ~3-7ms); the bound absorbs the
+        # monitor sampling lag + sub-frame overshoot. A speed-blind fire-frame (the
+        # slow-mo boundary would land ~1s off) or a wrong re-base target fails here
+        # while still passing divergence/placeholder.
+        if ! num "$maxBoundaryLandingErrMs" || [ "$maxBoundaryLandingErrMs" -gt 80 ]; then
+            echo "FAIL: playlist boundary landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80) — a cut did not land at the next entry's in-point (fire-frame/speed bug)"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

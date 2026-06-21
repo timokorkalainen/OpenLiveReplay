@@ -206,6 +206,10 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
     m_scrubCoalesceTimer.setTimerType(Qt::PreciseTimer);
     m_scrubCoalesceTimer.setInterval(kScrubCoalesceMs);
     connect(&m_scrubCoalesceTimer, &QTimer::timeout, this, &UIManager::commitPendingScrub);
+    // Playlist auto-playout monitor (started only while a rundown is playing).
+    m_playoutMonitor.setTimerType(Qt::PreciseTimer);
+    m_playoutMonitor.setInterval(kPlayoutMonitorMs);
+    connect(&m_playoutMonitor, &QTimer::timeout, this, &UIManager::onPlayoutTick);
     connect(m_replayManager, &ReplayManager::masterPulse, this, &UIManager::onRecorderPulse,
             Qt::QueuedConnection);
     connect(m_replayManager, &ReplayManager::sourceConnectionChanged, this,
@@ -1886,6 +1890,10 @@ void UIManager::stopRecording() {
 }
 
 void UIManager::seekPlayback(int64_t ms) {
+    // A manual scrub is an operator override: exit any running rundown so its monitor
+    // stops arming boundaries (playPlaylist seeks the transport directly, not via
+    // seekPlayback, so this never fires for the rundown's own entry-start seeks).
+    stopPlaylistPlayout();
     // Disable live-follow on a manual scrub; the user re-enables via "Live".
     setFollowLive(false);
     // Coalesce a burst of scrub targets: seek immediately on the first move of
@@ -1935,6 +1943,9 @@ void UIManager::markOut() {
 void UIManager::recallEntry(int index) {
     const auto entry = m_playlist.recall(index);
     if (!entry.has_value()) return;
+    // A manual recall is an operator override: exit any running rundown so its
+    // monitor stops arming boundaries, then arm this single cue.
+    stopPlaylistPlayout();
     // Tier3 v1 is single-clip: arm the in-point ms on the currently-open clip.
     // A recalled entry whose clipPath differs from the open clip is out of scope
     // for v1 (armNextCut is ms-only); recall still arms the ms.
@@ -1948,6 +1959,76 @@ void UIManager::recallEntry(int index) {
 
 int UIManager::playlistCount() const {
     return m_playlist.count();
+}
+
+// EVS rundown auto-playout. Starts the playlist at fromIndex and lets it play
+// itself: the monitor (onPlayoutTick) arms each entry's out -> next-in boundary as a
+// frame-perfect armed cut and advances on each fire, applying each entry's speed.
+bool UIManager::playPlaylist(int fromIndex) {
+    if (!m_transport || !m_playbackWorker) return false;
+    const QVector<ReplayEntry> entries = m_playlist.entries();
+    if (entries.isEmpty() || fromIndex < 0 || fromIndex >= entries.size()) return false;
+    // Fail fast when the frame-perfect armed cut is unavailable (e.g. H.264: no
+    // pre-roll bank). Without it the boundary cut never fires and the rundown would
+    // silently dead-end on the first entry, so refuse rather than mislead.
+    if (!m_playbackWorker->armedCutAvailable()) return false;
+    // Every NON-final entry must have a marked out-point (>= its in) to bound its
+    // boundary; an unmarked mid-list out (the markIn default, or hand-edited/loaded
+    // data) would stall the rundown there. Refuse so the operator marks the out first.
+    for (int i = fromIndex; i + 1 < entries.size(); ++i)
+        if (entries[i].outMs < entries[i].inMs) return false;
+    // A second Play while a rundown is active: clean stop-then-start (also removes
+    // the m_playoutCutBaseline-vs-in-flight-cut race a bare re-start would have).
+    stopPlaylistPlayout();
+
+    m_playout.start(entries, fromIndex);
+    const ReplayEntry first = entries[fromIndex];
+    // Start the first entry directly (NOT via seekPlayback, which exits playout).
+    setFollowLive(false);
+    m_transport->setSpeed(first.speed);
+    m_transport->seek(first.inMs);
+    m_playbackWorker->seekTo(first.inMs);
+    m_transport->setPlaying(true);
+    m_playoutCutBaseline = m_playbackWorker->cutsFired();
+    if (!m_playoutMonitor.isActive()) m_playoutMonitor.start();
+    return true;
+}
+
+void UIManager::stopPlaylistPlayout() {
+    m_playoutMonitor.stop();
+    m_playout.stop();
+}
+
+// Polled on the UI thread (m_playoutMonitor). Advances the rundown on each boundary
+// cut fire and arms the next boundary as the playhead nears the current out-point.
+void UIManager::onPlayoutTick() {
+    if (!m_playout.active() || !m_transport || !m_playbackWorker) {
+        m_playoutMonitor.stop();
+        return;
+    }
+    // A boundary cut fired (the worker re-based the playhead to the next in-point):
+    // advance the rundown and apply the new entry's speed. Reconcile the FULL delta
+    // (not just one) so the index never desyncs from the fired-cut count even if two
+    // cuts were observed in one interval.
+    const int cuts = m_playbackWorker->cutsFired();
+    while (m_playoutCutBaseline < cuts) {
+        ++m_playoutCutBaseline;
+        const auto cur = m_playout.onBoundaryFired();
+        if (cur.has_value()) m_transport->setSpeed(cur->speed);
+    }
+    // On the final entry there is no further boundary — let normal playback continue
+    // forward (the recording keeps growing). Fully stop playout so the monitor idles
+    // and playlistPlayoutActive() reports false (it is no longer steering anything).
+    if (m_playout.onFinalEntry()) {
+        stopPlaylistPlayout();
+        return;
+    }
+    // Arm the next boundary as the playhead nears the current entry's out-point. If
+    // arming ever fails (it should not once armedCutAvailable() gated the start),
+    // stop rather than silently dead-end — evaluate() has consumed its one-shot arm.
+    const auto b =
+        m_playout.evaluate(m_transport->currentPos(), m_transport->speed(), kPlayoutArmLeadMs);
+    if (b.valid && !m_playbackWorker->armNextCut(b.targetMs, b.fireAtMs)) stopPlaylistPlayout();
 }
 
 void UIManager::updateUrl(int index, const QString& url) {

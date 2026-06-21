@@ -1019,13 +1019,24 @@ ApplicationWindow {
                 }
 
                 // Tier3 replay cue list: mark in/out at the playhead, recall as a
-                // frame-perfect armed cut (pre-rolled, no flash).
+                // frame-perfect armed cut (pre-rolled, no flash). "Play Playlist"
+                // runs the rundown — it auto-advances across each entry boundary with
+                // a frame-perfect cut, honoring per-entry speed; a manual scrub or
+                // recall exits playout.
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter
                     spacing: 8
                     Button { text: "Mark In";  onClicked: appWindow.uiManagerRef.markIn() }
                     Button { text: "Mark Out"; onClicked: appWindow.uiManagerRef.markOut() }
                     Button { text: "Recall 0"; onClicked: appWindow.uiManagerRef.recallEntry(0) }
+                    Button {
+                        text: "Play Playlist"
+                        onClicked: appWindow.uiManagerRef.playPlaylist(0)
+                    }
+                    Button {
+                        text: "Stop Playout"
+                        onClicked: appWindow.uiManagerRef.stopPlaylistPlayout()
+                    }
                 }
 
                 RowLayout {

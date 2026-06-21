@@ -321,12 +321,20 @@ add_test(NAME e2e_play_armedcut_seekrace
 add_test(NAME e2e_play_armedcut_rearm_seek
     COMMAND bash "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-rearm-seek 2 23504)
+# EVS rundown auto-playout: a 3-entry playlist (one slow-motion segment) plays
+# itself, auto-advancing across each boundary with a frame-perfect fire-at-out-point
+# cut. Gates cutsFired==2 (both boundaries) + no flash/drops + frame-accuracy incl.
+# the slow-mo segment. Port 23506 (UDP 23507) is the next clear port after
+# armedcut-rearm-seek (23504), disjoint from the record/sync/av-sync/native ranges.
+add_test(NAME e2e_play_playlist
+    COMMAND bash "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist 2 23506)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
     e2e_play_seekflash e2e_play_farback e2e_play_armedcut e2e_play_armedcut_back
-    e2e_play_armedcut_seekrace e2e_play_armedcut_rearm_seek
+    e2e_play_armedcut_seekrace e2e_play_armedcut_rearm_seek e2e_play_playlist
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180
