@@ -102,9 +102,11 @@ peak ≈ aggregate decode window (≤256 surfaces)
 ```
 
 An earlier "~1.8 GiB at 8×1080p" estimate counted only the decode window + normalized per-feed
-output caches; it omits the staging bank, the per-bus compositor outputs, and the readback rings. An
-efficient port whose compositor samples decode textures directly trends toward the ~0.85 GiB floor.
-The GPU budget (§6 `gpu-budget`) sizes against this full formula.
+output caches; it omits the staging bank, the per-bus compositor outputs, and the readback rings.
+**Per D9, there is no separate normalized per-feed output cache term** — `OutputFrameCache` holds
+refs (refcount bumps) aliasing the `TrackBuffer` surfaces, not copies; the only fresh compositor
+surfaces are the per-bus outputs. That collapse is what drops the efficient port toward the ~0.85 GiB
+floor. The GPU budget (§6 `gpu-budget`) sizes against this full formula.
 
 ---
 
@@ -192,7 +194,9 @@ NV12→I420 (or RGB→I420) conversion at the readback edge.
 native surface (`CVPixelBufferRef`/IOSurface on Apple, `ComPtr<ID3D11Texture2D>` on Windows) until
 **all** GPU-render and readback fences referencing it have retired. Lifetime is the handle's
 responsibility; eviction/backpressure (`gpu-sync`, `gpu-budget`) must not free a surface with a fence
-in flight.
+in flight. **Hold-last / placeholder paths stay refcount-only:** the dispatcher's `m_lastGoodFrame`
+re-emit and the placeholder path store and re-paint **handles**, never triggering `readToCpu()` — the
+copy-on-GPU-path detector (`telemetry-contract`) covers those paths too.
 
 **Copy/equality contract (explicit):** a handle copy is a refcount bump of shared pixels; identity
 is by `FrameMetadata`, never pixel content. Concrete unit test: take a memo-aliased handle, override
@@ -221,8 +225,11 @@ product behavior and golden values are unchanged; only test sources edit.
 | D4 | GPU threading | **Fenced multi-thread mirroring the snapshot model** + GPU generation counter | Worker produces surfaces, signals a decode-done fence before publish; output thread waits before reading; eviction waits on render fences. Minimal extension of the proven lock-light producer/consumer; directly closes the TSan-invisible races. Single-GPU-thread would serialize decode+dispatch. **Sync primitive must match the RHI backend (Phase-0 decision):** Apple = `MTLSharedEvent`; Windows = `ID3D12Fence` *iff* the RHI D3D12 backend is chosen, else `ID3D11Fence` (11.4) / keyed-mutex / `ID3D11Query` for D3D11 — do not assume D3D12 fences on a D3D11 device. |
 | D5 | Keep CPU pipeline as runtime fallback | **Yes, permanent**, behind the compositor-select flag, default until GPU proven per-platform | It is the CI oracle, the headless-macOS path, and the safe degradation target. Handle abstraction contains divergence to the compositor + sink-readback layers. |
 | D6 | Mixed-origin frames | **Single self-describing handle**; `readToCpu()` no-op (CPU) / fenced download (GPU) | MPEG-2 SW + NDI ingest are CPU-origin; HW decode GPU-origin. Forcing uniform residency wastes uploads or defeats zero-copy. Compositor uploads a CPU-origin input on demand only when it composites it. |
-| D7 | Readback placement | **Async pipelined** (render N, read N-2), **one readback per unique rendered bus surface / requested CPU format**, shared by all CPU sinks on that bus; **dedicated sub-frame mode for operator PGM preview from day one** | Sync readback stalls the 1 ms cadence at 60 fps. A tick renders per distinct bus (feed/PGM/multiview), so the invariant is per-surface, not per-tick. PGM preview gets a low-latency path up front (user decision); NDI/others accept 2–3 frames. GPU-native sinks bypass via `SinkGpuCapability`. |
+| D7 | Readback placement | **Async pipelined** (render N, read N-2), **one readback per unique rendered bus surface / requested CPU format**, shared by all CPU sinks on that bus; **PGM ring depth-1 (sub-frame) from day one, other CPU sinks depth-3** | Sync readback stalls the 1 ms cadence at 60 fps. A tick renders per distinct bus (feed/PGM/multiview), so the invariant is per-surface, not per-tick. PGM preview gets the low-latency depth-1 path up front (user decision); NDI/multiview accept depth-3 (2–3 frames). The multiview monitor's ~33 ms (@60 fps) A/V lead vs the real-time `AudioPlayer` is **written-accepted** (§9), not mitigated. GPU-native sinks bypass via `SinkGpuCapability`. |
 | D8 | iOS timing | **Symmetric edge interface now, bring-up Phase 5** | No macOS-only architecting, but don't pay iOS main-thread/thermal/VRAM cost before the spine is proven. |
+| D9 | Single decode-window authority | **`TrackBuffer` owns the authoritative GPU surface window; `OutputFrameCache`, staging, and the inactive-graph snapshot hold `FrameHandle` refs (refcount bumps), never second copies** | Code-confirmed double storage: each decoded frame is inserted into both `track->buffer` **and** `m_outputCache` ([playbackworker.cpp:625-627](../../../playback/playbackworker.cpp)), and the inactive-graph path copies every TrackBuffer frame into a fresh cache (:2247-2256). Holding GPU surfaces in both doubles VRAM; refs-only collapses it — this is what makes the ~0.85 GiB floor real. |
+| D10 | Sink cadence contract | **Per-sink capability: `GpuNative` / `AsyncReadbackDedupOk` / `NeedsContinuousCadence`** | The dispatcher identity-skips `submit()` on `samePayloadAs` ([outputdispatcher.cpp:116-122](../../../playback/output/outputdispatcher.cpp)). Async readback must not fight that or NDI's `maxGap≤2`: dedup-ok sinks (preview) skip readback on unchanged payload while advancing delivery indices; continuous-cadence sinks (NDI) get a readback (or a re-sent prior surface) every tick. `async-readback` owns the policy. |
+| D11 | RHI render thread | **One `QRhi`, one dedicated render thread, `beginOffscreenFrame`/`endOffscreenFrame`; explicit handoff from worker/output threads** | RHI is not just fences: a `QRhi` is single-threaded, textures have thread affinity, and cross-thread use is constrained. The fenced producer/consumer (D4) rides on top of a single-render-thread RHI model. The Phase-0 overhead probe must exercise cross-thread import→composite→readback, not a clear pass. |
 
 ---
 
@@ -234,17 +241,17 @@ device-loss, telemetry contract, recorder-encode rescope, iOS).
 
 | id | name | depends on | risk | size |
 |----|------|-----------|------|------|
-| `frame-handle` | Opaque ref-counted FrameHandle + FrameMetadata (per-handle override over shared immutable pixels) + copy/equality contract + compat value-view; CPU-only, zero-regression | — | high | XL |
+| `frame-handle` | Opaque ref-counted FrameHandle + FrameMetadata (per-handle override over shared immutable pixels) + copy/equality contract + compat value-view; CPU-only, zero-regression; `OutputFrameCache`/staging/snapshot hold handle **refs**, not copies (D9) | — | high | XL |
 | `color-metadata` | `ColorMetadata` plumbed decode→sink; replace height>576 heuristic; **proven no-op on goldens first** (Phase-0 default-tagging must reproduce today's height>576 → BT709/601 + video-range output until a fixture is re-goldened; M size is contingent on the audit finding uniform tags) | `frame-handle` | medium | M |
-| `telemetry-contract` | Extend harness counter contract: VRAM occupancy, readback queue depth/drops, fence-wait stalls, GPU-OOM-degrade, **copy-on-GPU-path detector** (count GPU-backed `readToCpu()` calls; assert one per **unique rendered bus surface**, not per output frame) | `frame-handle` | medium | M |
-| `format-canon` | Owns the canonical `format` enum + plane-count model (`Nv12`/`Yuv420p`/`Rgba8`), the on-GPU chroma layout (D2: NV12 kept, shader deinterleave), the **compositor working/output format (`Rgba8`)**, and the **per-sink export conversion**; every shader/golden/encoder agrees | `frame-handle` | medium | M |
+| `telemetry-contract` | Extend harness counter contract: VRAM occupancy, readback queue depth/drops, fence-wait stalls, GPU-OOM-degrade, **copy-on-GPU-path detector** (count GPU-backed `readToCpu()` calls; assert one per **unique rendered bus surface**, not per output frame; covers the hold-last/placeholder paths too) | `frame-handle` | medium | M |
+| `format-canon` | Owns the canonical `format` enum + plane-count model (`Nv12`/`Yuv420p`/`Rgba8`), the on-GPU chroma layout (D2: NV12 kept, shader deinterleave), the **compositor working/output format (`Rgba8`)**, and the **per-sink export conversion**; **delivers the NV12-deinterleave + nearest-neighbor integer reference reconstructor (the golden oracle) BEFORE `gpu-compositor` lands**; every shader/golden/encoder agrees | `frame-handle` | medium | M |
 | `shader-toolchain` | `qt_add_shaders`/`qsb` in CMake, shader source layout, Metal/HLSL/SPIR-V cross-compile, CI shader-compile step | `format-canon` | medium | M |
-| `gpu-abstraction` | **macOS** `GpuSurface` (IOSurface/CVPixelBuffer) + RHI device bring-up + VT keep-surface import + lazy `readToCpu`; the cross-platform `GpuSurface`/import edge interface (platform-symmetric) | `frame-handle`, `format-canon` | high | L |
+| `gpu-abstraction` | **macOS** `GpuSurface` (IOSurface/CVPixelBuffer) + RHI device/render-thread bring-up (D11: one `QRhi`, dedicated render thread) + VT keep-surface import + lazy `readToCpu`; the cross-platform `GpuSurface`/import edge interface stays **platform-neutral** (no `CVPixelBuffer`/`ID3D11Texture2D` types in the shared header) | `frame-handle`, `format-canon` | high | L |
 | `gpu-import-win` | **Windows** MF→`ID3D11Texture2D` import-and-keep edge + RHI D3D interop + minimal import+readback slice; own Phase-0 probe (does MF yield a GPU-resident, RHI-importable texture, and at what reconfig cost — existing D3D11/`IMFDXGIDeviceManager` plumbing is HW-decode-to-CPU only, **not** the import edge) | `frame-handle`, `format-canon`, `gpu-abstraction` | high | L |
 | `gpu-sync` | Backend-matched fences (MTLSharedEvent on Apple; ID3D12Fence/ID3D11Fence per the chosen D3D backend) + GPU generation counter + eviction guard honoring the handle's surface-lifetime contract (§4); **enforced lock rule** (collect victims, release `m_bufferMutex`, *then* fence-wait/free — never fence-wait under the mutex; `makeOutputSnapshot` already enforces `m_outputRuntimeMutex → m_bufferMutex`); armed-cut staging swap fence | `gpu-abstraction` | high | L |
 | `gpu-compositor` | RHI grid + PGM select + YUV→RGB + bilinear/Lanczos; CPU compositor retained as reference; GPU texture memo. (Overlays/interpolation are extension points, not built here.) | `gpu-abstraction`, `color-metadata`, `shader-toolchain` | high | L |
-| `async-readback` | `AsyncGpuReadbackSink` (N-deep ring) + `SinkGpuCapability` routing; **PGM sub-frame mode**; **AV-sync-under-lag as hard gate** (audio travels with the delayed video; OutputBusFrame stays atomic); NDI migration | `gpu-sync`, `telemetry-contract` | high | L |
-| `gpu-budget` | VRAM-bounded GPU window sized against the full peak formula (N-feeds × window + staging-bank + compositor-output-cache) + OOM-safe degrade to CPU handle + seek-prefetch | `gpu-sync` | medium | M |
+| `async-readback` | `AsyncGpuReadbackSink` (**PGM depth-1 ring, other CPU sinks depth-3**) + `SinkGpuCapability` cadence routing (D10: `GpuNative`/`AsyncReadbackDedupOk`/`NeedsContinuousCadence`); **resolves identity-skip × NDI `maxGap≤2`**; **AV-sync-under-lag as hard gate** (audio travels with the delayed video; OutputBusFrame stays atomic); NDI migration | `gpu-sync`, `telemetry-contract` | high | L |
+| `gpu-budget` | VRAM-bounded GPU window — single `TrackBuffer` authority (D9), `OutputFrameCache` refs-only — sized against the peak formula (§2) + OOM-safe degrade to CPU handle + seek-prefetch | `gpu-sync` | medium | M |
 | `device-loss` | RHI device-removed detection, surface invalidation, spine rebuild, degrade-to-CPU policy + fault-injection e2e | `gpu-sync` | medium | M |
 | `gpu-encode` | GPU-native encode **on the recorder `StreamWorker`** (separate jitter-pull pipeline), not a playback sink; color VUI authored from `ColorMetadata` | `gpu-sync`, `color-metadata` | medium | M |
 | `ios-bringup` | iOS Metal bring-up + main-thread-render/thermal handling + smoke tests | `gpu-compositor`, `async-readback` | medium | M |
@@ -263,17 +270,20 @@ Keystone-first, strict gates. Each phase gates the next; everything behind flags
      `kCVPixelBufferIOSurfacePropertiesKey`).
   2. **Windows (symmetric):** confirm MF→`ID3D11Texture2D` yields a GPU-resident, RHI-importable
      texture and at what reconfig cost (existing D3D11 plumbing is HW-decode-to-CPU only).
-  3. Measure RHI per-frame overhead vs the <0.5 ms budget (RHI is not currently linked).
+  3. Measure RHI per-frame overhead vs the <0.5 ms budget on a **realistic cross-thread import →
+     composite → readback** path (not a trivial clear pass) — a `QRhi` is single-threaded with
+     texture thread-affinity (D11), so the threading model is part of the probe. RHI not yet linked.
   4. Probe NDI / DeckLink / AJA / OMT GPU-texture vs CPU-frame capability per platform.
   5. Confirm RHI↔IOSurface / RHI↔D3D-texture interop (`copyTexture` or native detour).
   6. Audit whether existing golden fixtures carry SPS-VUI / CMFormatDescription color tags; if
      untagged, define a default-tagging policy so `color-metadata` is a provable no-op.
 - **Phase 1 — Keystone (CPU-only, byte-green gate):** `frame-handle`, `color-metadata` (no-op
   proven), `telemetry-contract`.
-- **Phase 2 — GPU edge + permanent vertical slice:** `format-canon`, `shader-toolchain`,
-  `gpu-abstraction`, `gpu-import-win` (Windows import+readback slice), and the macOS slice (§8) —
-  **including the early micro-stress probe** (§8) so the two top risks get a signal now, not in
-  Phase 3.
+- **Phase 2 — GPU edge + permanent vertical slice:** `format-canon` (incl. the NV12 reference
+  reconstructor, before any compositor work), `shader-toolchain`, `gpu-abstraction`, `gpu-import-win`
+  (Windows import+readback slice), and the macOS slice (§8) — **including the early micro-stress
+  probe** (§8) and a **minimal `gpu-sync` fence stub** (decode-done fence before publish) so the
+  micro-stress exercises eviction *with* the sync primitive that ships, not without it.
 - **Phase 3 — Sync + compositor:** `gpu-sync`, `gpu-compositor`, **multi-feed cap-pressure stress**.
   (Correction: the single-feed slice **does** exercise CPU-frame eviction today — the window-derived
   cap is ~47–111 frames/feed, not 256. What is *unexercised* until here is **concurrent GPU
@@ -301,7 +311,9 @@ just `QtPreviewSink`.
 **Early micro-stress probe (in this slice, not deferred to Phase 3):** with a forced tiny per-track
 frame budget and injected GPU-alloc failure, exercise **concurrent evict-while-render** and
 **OOM-degrade-to-CPU** on the single feed — giving the program's two highest-rated risks a signal
-before `gpu-sync`/`gpu-compositor` land.
+before `gpu-sync`/`gpu-compositor` land. The slice pulls in a **minimal decode-done fence** (the
+first piece of `gpu-sync`) so eviction-under-render is tested against the real sync primitive, not a
+fenceless approximation.
 
 **Success criteria:**
 - `OLR_GPU_PIPELINE=0`: the existing unit + `e2e_play` suite passes with **identical assertion values
@@ -333,7 +345,17 @@ before `gpu-sync`/`gpu-compositor` land.
   retained permanently as the oracle-test path.
 - **NV12 double-rounding (D2):** the determinism harness must reconstruct goldens from NV12 chroma
   (interleaved UV, shader deinterleave) *plus* nearest-neighbor scaling — two rounding sources, not
-  one. Explicit harness requirement.
+  one. `format-canon` **delivers this integer reference reconstructor before `gpu-compositor`**, so
+  the compositor is debugged against a fixed oracle, not a moving one.
+- **Color is a deliberate two-step golden change, not a regression.** Phase-1 `color-metadata` is a
+  **no-op** (default-tagging reproduces today's `height>576` heuristic → goldens unchanged). When
+  real tags are honored (Phase-3 GPU compositor), appearance **intentionally** changes (correct
+  BT.601/709 + range instead of the height guess) → tagged fixtures are **re-goldened on purpose**.
+  The two events are tracked separately so the Phase-3 shift is never read as a regression.
+- **CI reality (resolves open Q7):** headless hosted runners have no GPU/D3D
+  ([ci.yml:462](../../../.github/workflows/ci.yml)). GPU-compositor correctness coverage is therefore
+  **Windows WARP + an optional local-GPU lane**; **macOS CI stays CPU-oracle-only** (no automated
+  GPU-compositor coverage on macOS — documented and accepted).
 - **GPU race stress as first-class gates** (TSan cannot see GPU command ordering): seek-under-decode,
   armed-cut-while-render-pending, evict-while-render, frame-checksum validators. An early
   single-feed micro-stress runs in the Phase-2 slice (§8); the full multi-feed cap-pressure scenario
@@ -394,8 +416,9 @@ before `gpu-sync`/`gpu-compositor` land.
    platform?
 5. Does RHI↔IOSurface / RHI↔D3D-texture interop work without a CPU detour?
 6. Do existing golden fixtures carry color tags? If not, what is the default-tagging policy?
-7. Is macOS CI headless (no GPU)? If so, the GPU compositor's automated correctness coverage is
-   WARP-on-Windows + local-GPU only — confirm and document.
+7. **Resolved (see §9):** headless hosted runners have no GPU/D3D
+   ([ci.yml:462](../../../.github/workflows/ci.yml)); macOS CI stays CPU-oracle-only, and
+   GPU-compositor coverage is Windows WARP + an optional local-GPU lane.
 
 ---
 
