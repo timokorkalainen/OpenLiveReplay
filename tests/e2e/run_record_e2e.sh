@@ -19,10 +19,11 @@
 # Modes:
 #   stereo    synthetic stereo sine -> baseline happy path
 #   mono      synthetic mono   sine -> regression for the mono-audio SIGBUS crash
-#   rational  stereo, recorded advertising 29.97 (30000/1001) -> asserts the
-#             container carries the true rational rate, not the legacy {30,1}
+#   rational       MPEG-2, recorded advertising 29.97 (30000/1001) -> asserts the
+#                  container carries the true rational rate, not the legacy {30,1}
+#   rational-h264  same, but the hardware H.264 record path (SKIP 77 without HW)
 #
-# Usage: run_record_e2e.sh <harness_exe> <stereo|mono|rational> [srt_port]
+# Usage: run_record_e2e.sh <harness_exe> <stereo|mono|rational|rational-h264> [srt_port]
 set -uo pipefail
 
 HARNESS="${1:?harness executable path required}"
@@ -38,15 +39,28 @@ olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 
 
 if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
 
-# Rational-rate mode: record advertising 29.97 (30000/1001) and assert the output
-# container carries that exact rate (not the legacy {30,1}). FPS_EXTRA is a plain
-# string expanded unquoted (empty for stereo/mono) to stay bash-3.2/set-u safe.
+# Rational-rate modes: record advertising 29.97 (30000/1001) and assert the output
+# container carries that exact rate (not the legacy {30,1}). FPS_EXTRA / CODEC_EXTRA
+# are plain strings expanded unquoted (empty for stereo/mono) to stay bash-3.2/set-u
+# safe. `rational` is the MPEG-2 software path; `rational-h264` is the hardware H.264
+# path (SKIPs 77 when no hardware H.264 encoder is available, e.g. headless runners).
 FPS_EXTRA=""
 EXPECT_RATE=""
-if [ "$MODE" = "rational" ]; then
-    FPS_EXTRA="--fps-num 30000 --fps-den 1001"
-    EXPECT_RATE="30000/1001"
-fi
+CODEC_EXTRA=""
+case "$MODE" in
+    rational)
+        FPS_EXTRA="--fps-num 30000 --fps-den 1001"; EXPECT_RATE="30000/1001" ;;
+    rational-h264)
+        FPS_EXTRA="--fps-num 30000 --fps-den 1001"; EXPECT_RATE="30000/1001"
+        CODEC_EXTRA="--codec h264"
+        # The recorder needs a hardware H.264 ENCODER for --codec h264. Probe via
+        # the harness; a crashing probe is a FAIL, an unavailable codec is a SKIP.
+        CAPS="$("$HARNESS" --probe-codec-caps 2>&1)"; PROBE_RC=$?
+        [ "$PROBE_RC" -eq 0 ] || { echo "FAIL: --probe-codec-caps exited $PROBE_RC"; printf '%s\n' "$CAPS"; exit 1; }
+        H264_AVAIL="$(printf '%s\n' "$CAPS" | awk -F= '/^h264=/{print $2}')"
+        [ "${H264_AVAIL:-0}" = "1" ] || { echo "SKIP: hardware H.264 unavailable"; exit 77; }
+        ;;
+esac
 
 WORKDIR="$(mktemp -d)"
 PIDS=()
@@ -77,9 +91,9 @@ sleep 1.0 # let the producer + SRT listener come up before the caller connects
 
 # --- 2. Consumer: the real recording engine (native SRT caller) --------------
 URL="$(srt_caller_url "$SRT_PORT")"
-# shellcheck disable=SC2086 # FPS_EXTRA is intentionally word-split (may be empty).
+# shellcheck disable=SC2086 # FPS_EXTRA/CODEC_EXTRA are intentionally word-split (may be empty).
 HARNESS_OUT="$("$HARNESS" --url "$URL" --name "olr_e2e_${MODE}" --outdir "$WORKDIR" \
-    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 $FPS_EXTRA)"
+    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 $FPS_EXTRA $CODEC_EXTRA)"
 HARNESS_RC=$?
 
 if [ $HARNESS_RC -ne 0 ]; then

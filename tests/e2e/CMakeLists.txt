@@ -224,6 +224,17 @@ set_tests_properties(e2e_record_stereo e2e_record_mono e2e_record_rational_fps P
     TIMEOUT 120
     RUN_SERIAL TRUE)  # they bind UDP/SRT ports + drive ffmpeg; don't overlap
 
+# Same rational-rate end-to-end assertion on the HARDWARE H.264 record path (the
+# muxer advertises the rational container rate for every codec). SKIP_RETURN_CODE 77
+# when the host has no hardware H.264 encoder (e.g. Linux CI). Port pair {23462,23463}.
+add_test(NAME e2e_record_rational_fps_h264
+    COMMAND "${OLR_E2E_BASH}" "${_driver}" "$<TARGET_FILE:record_harness>" rational-h264 23462)
+set_tests_properties(e2e_record_rational_fps_h264 PROPERTIES
+    LABELS "e2e"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 # Focused AAC-LC confidence matrix: repeated native-SRT recordings across
 # stereo/mono and 48/44.1/32 kHz sources, asserting the engine's 48 kHz stereo
 # PCM contract, non-silent decoded audio, and A/V end alignment.

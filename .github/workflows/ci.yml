@@ -659,7 +659,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
-            -R '^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
+            -R '^(e2e_record_stereo|e2e_record_mono|e2e_record_rational_fps|e2e_record_rational_fps_h264|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
 
       # asan-e2e ADVISORY part: the native SRT ingest smoke under the SAME
       # instrumentation. continue-on-error because its srt-live-transmit
