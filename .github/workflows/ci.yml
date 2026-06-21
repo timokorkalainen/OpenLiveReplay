@@ -446,6 +446,7 @@ jobs:
           cmake -S . -B build-tests -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DOLR_BUILD_TESTS=ON \
+            -DOLR_BUILD_GPU_PROBES=ON \
             -DOLR_WERROR=OFF \
             -DCMAKE_PREFIX_PATH="$OLR_QT_ROOT" \
             -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
@@ -453,7 +454,17 @@ jobs:
             -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder
+          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder rhi_d3d_probe
+
+      - name: Run Windows GPU import probe (diagnostic)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          ./build-tests/tests/probes/rhi_d3d_probe
+          rc=$?
+          echo "rhi_d3d_probe exit code: $rc"
+          exit "$rc"
 
       - name: Run Media Foundation unit tests
         shell: bash

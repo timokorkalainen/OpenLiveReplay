@@ -1055,6 +1055,10 @@ void NativeVideoDecoder::reset() {
     m_impl->reset();
 }
 
+bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {
+    return false;
+}
+
 NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
     NativeVideoDecodeCapabilities caps;
     QStringList detail;

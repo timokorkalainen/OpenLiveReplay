@@ -22,6 +22,10 @@ bool NativeVideoDecoder::decode(const CompressedAccessUnit&, FrameCallback, QStr
 
 void NativeVideoDecoder::reset() {}
 
+bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {
+    return false;
+}
+
 NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
     NativeVideoDecodeCapabilities caps;
     caps.detail = QStringLiteral("Native video decode is unavailable on this platform");
