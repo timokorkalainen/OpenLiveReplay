@@ -602,6 +602,16 @@ set_target_properties(OpenLiveReplay PROPERTIES
     MACOSX_BUNDLE TRUE
 )
 
+# On Linux the qt_add_qml_module(URI OpenLiveReplay) output directory
+# build/OpenLiveReplay/ collides with the plain executable of the same name
+# ("ld: cannot open output file OpenLiveReplay: Is a directory"). macOS builds a
+# .app bundle and Windows an .exe, so only Linux clashes — emit the binary into a
+# subdirectory there.
+if(UNIX AND NOT APPLE)
+    set_target_properties(OpenLiveReplay PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+
 # ---------------------------------------------------------------------------
 # 7. Tests (opt-in: -DOLR_BUILD_TESTS=ON). Desktop/macOS only — the test
 #    targets link homebrew FFmpeg and run headless, so they are skipped for
