@@ -87,6 +87,18 @@ echo "==> ninja : $NINJA_BIN"
 QT_MINGW_DIR="$OLR_MINGW_ROOT" CMAKE_BIN="$CMAKE_BIN" NINJA_BIN="$NINJA_BIN" \
     "$SCRIPT_DIR/build_ffmpeg_windows_srt.sh"
 
+# Older deploy runs may have copied Qt's own QML modules into the CMake build tree.
+# Keep CMake-generated first-party modules there, but force Qt imports to resolve
+# from the active Qt kit so qmlimportscanner does not read stale/incomplete copies.
+if [ -d "$BUILD_DIR/qml" ]; then
+    rm -rf "$BUILD_DIR/qml/Qt" \
+           "$BUILD_DIR/qml/QML" \
+           "$BUILD_DIR/qml/QtQml" \
+           "$BUILD_DIR/qml/QtQuick" \
+           "$BUILD_DIR/qml/QtMultimedia" \
+           "$BUILD_DIR/qml/QtTest"
+fi
+
 # ------------------------------------------------------------------ 2/3. cmake (preset)
 # The preset reads these as native paths (CMake rejects MSYS /c/... compiler paths).
 export OLR_QT_ROOT OLR_MINGW_ROOT
@@ -122,14 +134,24 @@ RTMIDI_DLL="$(find "$BUILD_DIR/_deps" -iname 'librtmidi*.dll' 2>/dev/null | head
 # Qt's own), so copy them next to the exe. macOS is unaffected (macdeployqt walks the
 # dependency graph). Fail loudly if absent so a future rename can't silently reintroduce
 # a non-launchable artifact.
-OLR_MODULE_DLLS="$(find "$BUILD_DIR/ui" -iname 'libOlr*.dll' 2>/dev/null)"
+OLR_MODULE_DLLS="$(find "$BUILD_DIR" -maxdepth 1 \( -iname 'Olr*.dll' -o -iname 'libOlr*.dll' \) 2>/dev/null)"
 [ -n "$OLR_MODULE_DLLS" ] || {
-    echo "ERROR: OlrTheme/OlrStyle DLLs not found under $BUILD_DIR/ui" >&2; exit 1; }
+    echo "ERROR: OlrTheme/OlrStyle DLLs not found under $BUILD_DIR" >&2; exit 1; }
 echo "$OLR_MODULE_DLLS" | while IFS= read -r dll; do cp "$dll" "$APPDIR/"; done
 
 echo "==> windeployqt (Qt DLLs, plugins, QML, compiler runtime)"
 "$OLR_QT_ROOT/bin/windeployqt.exe" --qmldir "$(winpath "$ROOT_DIR")" \
     --compiler-runtime --no-translations "$APPDIR/OpenLiveReplay.exe"
+
+echo "==> Copying first-party QML modules"
+mkdir -p "$APPDIR/qml"
+for module in OlrTheme OlrStyle; do
+    SRC_MODULE="$BUILD_DIR/qml/$module"
+    [ -d "$SRC_MODULE" ] || {
+        echo "ERROR: $module QML module not found under $BUILD_DIR/qml" >&2; exit 1; }
+    rm -rf "$APPDIR/qml/$module"
+    cp -R "$SRC_MODULE" "$APPDIR/qml/"
+done
 
 echo "==> Packaging zip"
 ZIP="$WORK_DIR/dist/OpenLiveReplay-windows.zip"
