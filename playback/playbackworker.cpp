@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <utility>
 
 PlaybackWorker::PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
                                AudioPlayer* audioPlayer, QObject* parent)
@@ -618,8 +620,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     // FP: `track` is an m_decoderBank element (always new'd) and is
                     // dereferenced unconditionally above, so it is never null here.
                     // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
-                    MediaVideoFrame mediaFrame = convertToMediaVideoFrame(nativeVf, track->feedIndex);
-                    mediaFrame.ptsMs = framePtsMs;
+                    FrameHandle mediaFrame = convertToMediaVideoFrame(nativeVf, track->feedIndex);
+                    mediaFrame.metadata().key.ptsMs = framePtsMs;
                     if (mediaFrame.isValid()) {
                         QMutexLocker bufferLocker(&m_bufferMutex);
                         if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
@@ -691,8 +693,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     }
                 }
 
-                MediaVideoFrame mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
-                mediaFrame.ptsMs = framePtsMs;
+                FrameHandle mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
+                mediaFrame.metadata().key.ptsMs = framePtsMs;
                 if (mediaFrame.isValid()) {
                     QMutexLocker bufferLocker(&m_bufferMutex);
                     if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
@@ -1321,9 +1323,9 @@ void PlaybackWorker::fillStaging() {
                         } else {
                             framePtsMs = target;
                         }
-                        MediaVideoFrame mediaFrame =
+                        FrameHandle mediaFrame =
                             convertToMediaVideoFrame(nativeVf, track->feedIndex);
-                        mediaFrame.ptsMs = framePtsMs;
+                        mediaFrame.metadata().key.ptsMs = framePtsMs;
                         if (mediaFrame.isValid()) {
                             m_prerollStagingCache->insertVideoFrame(mediaFrame);
                             m_counters.stagingVideoFramesDecoded++;
@@ -1349,8 +1351,8 @@ void PlaybackWorker::fillStaging() {
                         } else {
                             framePtsMs = target;
                         }
-                        MediaVideoFrame mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
-                        mediaFrame.ptsMs = framePtsMs;
+                        FrameHandle mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
+                        mediaFrame.metadata().key.ptsMs = framePtsMs;
                         if (mediaFrame.isValid()) {
                             m_prerollStagingCache->insertVideoFrame(mediaFrame);
                             m_counters.stagingVideoFramesDecoded++;
@@ -1844,7 +1846,7 @@ void PlaybackWorker::run() {
                 // If a frame at P exists and is already the delivered one, idle.
                 QMutexLocker bufferLocker(&m_bufferMutex);
                 if (!m_decoderBank.isEmpty()) {
-                    MediaVideoFrame f;
+                    FrameHandle f;
                     int64_t p = -1;
                     DecoderTrack* ref = m_decoderBank[0];
                     if (!ref->buffer.frameAt(P, f, p) || p != ref->lastDeliveredPtsMs)
@@ -2207,7 +2209,7 @@ void PlaybackWorker::run() {
 void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     struct PendingDeliver {
         FrameProvider* provider = nullptr;
-        MediaVideoFrame frame;
+        FrameHandle frame;
     };
 
     QVector<PendingDeliver> pending;
@@ -2235,9 +2237,10 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
                 QVector<TrackBuffer::Frame> frames =
                     track ? track->buffer.framesSnapshot() : QVector<TrackBuffer::Frame>();
                 for (const TrackBuffer::Frame& frame : frames) {
-                    if (frame.frame.isValid()) {
-                        placeholderWidth = frame.frame.width;
-                        placeholderHeight = frame.frame.height;
+                    const MediaVideoFrameView view(frame.frame);
+                    if (view.isValid()) {
+                        placeholderWidth = view.width;
+                        placeholderHeight = view.height;
                         break;
                     }
                 }
@@ -2250,7 +2253,7 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
                 DecoderTrack* track = m_decoderBank[trackIndex];
                 if (!track) continue;
                 for (TrackBuffer::Frame frame : snapshots[trackIndex]) {
-                    frame.frame.feedIndex = track->feedIndex;
+                    frame.frame.metadata().key.feedIndex = track->feedIndex;
                     cacheHolder->insertVideoFrame(frame.frame);
                 }
             }
@@ -2270,7 +2273,7 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
 
         for (auto* track : m_decoderBank) {
             if (!track || !track->provider) continue;
-            MediaVideoFrame f;
+            FrameHandle f;
             int64_t p;
             if (track->buffer.frameAt(P, f, p)) {
                 // Direction-aware dedup (spec §5): forbid out-of-order paints.
@@ -2302,48 +2305,55 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     }
 }
 
-MediaVideoFrame PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int feedIndex) {
+FrameHandle PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int feedIndex) {
     // Our recordings are always MPEG-2 all-intra YUV420P. Reject anything else
     // (a foreign MKV, 10-bit or 4:2:2 content) rather than copying it with the
     // wrong plane geometry and rendering garbage. Returns an invalid frame the
     // caller skips.
     if (frame->format != AV_PIX_FMT_YUV420P || frame->width <= 0 || frame->height <= 0)
-        return MediaVideoFrame();
+        return FrameHandle();
 
-    MediaVideoFrame out;
-    out.feedIndex = feedIndex;
+    CpuPlanes out;
+    out.format = FramePixelFormat::Yuv420p;
     out.width = frame->width;
     out.height = frame->height;
-    out.format = MediaPixelFormat::Yuv420p;
-    out.strideY = frame->width;
-    out.strideU = (frame->width + 1) / 2;
-    out.strideV = (frame->width + 1) / 2;
+    out.stride[0] = frame->width;
+    out.stride[1] = (frame->width + 1) / 2;
+    out.stride[2] = (frame->width + 1) / 2;
     const int chromaH = (frame->height + 1) / 2;
     // Allocate uninitialized: the per-line memcpy below overwrites every byte
     // up to copyW for all `height` lines, so a zero-fill is a dead store
     // (~3 MB memset per 1080p frame). Padding bytes (width..stride) are never
     // read by the renderer.
-    out.planeY = QByteArray(out.strideY * frame->height, Qt::Uninitialized);
-    out.planeU = QByteArray(out.strideU * chromaH, Qt::Uninitialized);
-    out.planeV = QByteArray(out.strideV * chromaH, Qt::Uninitialized);
+    out.plane[0] = QByteArray(qsizetype(out.stride[0]) * frame->height, Qt::Uninitialized);
+    out.plane[1] = QByteArray(qsizetype(out.stride[1]) * chromaH, Qt::Uninitialized);
+    out.plane[2] = QByteArray(qsizetype(out.stride[2]) * chromaH, Qt::Uninitialized);
 
-    QByteArray* dstPlanes[3] = {&out.planeY, &out.planeU, &out.planeV};
-    const int dstStrides[3] = {out.strideY, out.strideU, out.strideV};
+    const int dstStrides[3] = {out.stride[0], out.stride[1], out.stride[2]};
     for (int i = 0; i < 3; ++i) {
         uint8_t* src = frame->data[i];
-        if (!src) return MediaVideoFrame();
-        char* dst = dstPlanes[i]->data();
+        if (!src) return FrameHandle();
+        char* dst = out.plane[i].data();
         int srcStride = frame->linesize[i];
         int dstStride = dstStrides[i];
         int height = (i == 0) ? frame->height : (frame->height + 1) / 2;
         int width = (i == 0) ? frame->width : (frame->width + 1) / 2;
         int copyW = qMin(width, qMin(qAbs(srcStride), dstStride));
         for (int y = 0; y < height; ++y) {
-            const uint8_t* srcLine =
-                srcStride >= 0 ? (src + y * srcStride) : (src + (height - 1 - y) * -srcStride);
-            memcpy(dst + y * dstStride, srcLine, size_t(copyW));
+            const uint8_t* srcLine = srcStride >= 0
+                                         ? (src + qsizetype(y) * srcStride)
+                                         : (src + qsizetype(height - 1 - y) * -srcStride);
+            memcpy(dst + qsizetype(y) * dstStride, srcLine, size_t(copyW));
         }
     }
 
-    return out;
+    FrameMetadata meta;
+    meta.key.feedIndex = feedIndex;
+    meta.key.format = FramePixelFormat::Yuv420p;
+    meta.key.width = frame->width;
+    meta.key.height = frame->height;
+    meta.stride[0] = out.stride[0];
+    meta.stride[1] = out.stride[1];
+    meta.stride[2] = out.stride[2];
+    return makeCpuFrameHandle(std::move(out), std::move(meta));
 }

@@ -4,7 +4,7 @@
 // ---------------------------------------------------------------------------
 // insert
 // ---------------------------------------------------------------------------
-bool TrackBuffer::insert(int64_t ptsMs, const MediaVideoFrame& f, int capFrames, int64_t keepNearMs,
+bool TrackBuffer::insert(int64_t ptsMs, const FrameHandle& f, int capFrames, int64_t keepNearMs,
                          int64_t protectToMs) {
     // Binary-search for the insertion position (lower_bound by ptsMs).
     int lo = 0, hi = m_frames.size();
@@ -70,7 +70,7 @@ bool TrackBuffer::insert(int64_t ptsMs, const MediaVideoFrame& f, int capFrames,
 // ---------------------------------------------------------------------------
 // frameAt
 // ---------------------------------------------------------------------------
-bool TrackBuffer::frameAt(int64_t playheadMs, MediaVideoFrame& out, int64_t& outPtsMs) const {
+bool TrackBuffer::frameAt(int64_t playheadMs, FrameHandle& out, int64_t& outPtsMs) const {
     if (m_frames.isEmpty()) return false;
 
     // upper_bound for playheadMs: first index where ptsMs > playheadMs.

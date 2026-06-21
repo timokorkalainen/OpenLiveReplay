@@ -3,11 +3,23 @@
 #include "playback/output/broadcastoutputstatus.h"
 #include "playback/output/outputdispatcher.h"
 
-static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = feed;
-    f.ptsMs = pts;
+static FrameHandle video(int feed, qint64 pts, uchar y) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
+    f.metadata().key.feedIndex = feed;
+    f.metadata().key.ptsMs = pts;
     return f;
+}
+
+static qint64 videoPts(const OutputBusFrame& frame) {
+    return frame.video.metadata().key.ptsMs;
+}
+
+static uchar yAt(const OutputBusFrame& frame, qsizetype offset) {
+    return uchar(MediaVideoFrameView(frame.video).planeY.at(offset));
+}
+
+static QByteArray yPlane(const OutputBusFrame& frame) {
+    return MediaVideoFrameView(frame.video).planeY;
 }
 
 class CollectingSink final : public IOutputSink {
@@ -104,11 +116,12 @@ void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
     QCOMPARE(qtSink.frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(ndiSink.frames[0].outputFrameIndex, qint64(0));
     QCOMPARE(ndiSink.frames[1].outputFrameIndex, qint64(1));
-    QCOMPARE(qtSink.frames[0].video.ptsMs, qint64(100));
-    QCOMPARE(qtSink.frames[1].video.ptsMs, qint64(100));
-    QCOMPARE(uchar(qtSink.frames[1].video.planeY.at(0)), uchar(40));
-    QCOMPARE(ndiSink.frames[0].video.planeY, qtSink.frames[0].video.planeY);
-    QCOMPARE(ndiSink.frames[1].video.outputFrameIndex, qtSink.frames[1].video.outputFrameIndex);
+    QCOMPARE(videoPts(qtSink.frames[0]), qint64(100));
+    QCOMPARE(videoPts(qtSink.frames[1]), qint64(100));
+    QCOMPARE(yAt(qtSink.frames[1], 0), uchar(40));
+    QCOMPARE(yPlane(ndiSink.frames[0]), yPlane(qtSink.frames[0]));
+    QCOMPARE(ndiSink.frames[1].video.metadata().outputFrameIndex,
+             qtSink.frames[1].video.metadata().outputFrameIndex);
     QVERIFY(qtSink.frames[0].identity.samePayloadAs(ndiSink.frames[0].identity));
     QVERIFY(qtSink.frames[1].identity.samePayloadAs(ndiSink.frames[1].identity));
     QVERIFY(qtSink.frames[0].identity.samePayloadAs(qtSink.frames[1].identity));
@@ -143,8 +156,8 @@ void TestOutputDispatcher::playingTicksCreateStableOutputPlayEpoch() {
     QCOMPARE(sink.frames.size(), 2);
     QCOMPARE(sink.frames[0].sampledPlayheadMs, qint64(1000));
     QCOMPARE(sink.frames[1].sampledPlayheadMs, qint64(1040));
-    QCOMPARE(uchar(sink.frames[0].video.planeY.at(0)), uchar(30));
-    QCOMPARE(uchar(sink.frames[1].video.planeY.at(0)), uchar(60));
+    QCOMPARE(yAt(sink.frames[0], 0), uchar(30));
+    QCOMPARE(yAt(sink.frames[1], 0), uchar(60));
 }
 
 void TestOutputDispatcher::resetPlayEpochKeepsOutputFrameIndexContinuous() {
@@ -177,7 +190,7 @@ void TestOutputDispatcher::resetPlayEpochKeepsOutputFrameIndexContinuous() {
     QCOMPARE(sink.frames[0].outputFrameIndex, qint64(0));
     QCOMPARE(sink.frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(sink.frames[1].sampledPlayheadMs, qint64(5000));
-    QCOMPARE(uchar(sink.frames[1].video.planeY.at(0)), uchar(90));
+    QCOMPARE(yAt(sink.frames[1], 0), uchar(90));
 }
 
 void TestOutputDispatcher::rendersFeedMultiviewAndPgmAssignmentsFromSameTick() {
@@ -222,10 +235,10 @@ void TestOutputDispatcher::rendersFeedMultiviewAndPgmAssignmentsFromSameTick() {
     QCOMPARE(feedSink.frames[0].bus, OutputBusId::feed(0));
     QCOMPARE(mvSink.frames[0].bus, OutputBusId::multiview());
     QCOMPARE(pgmSink.frames[0].bus, OutputBusId::pgm());
-    QCOMPARE(uchar(feedSink.frames[0].video.planeY.at(0)), uchar(10));
-    QCOMPARE(uchar(mvSink.frames[0].video.planeY.at(0)), uchar(10));
-    QCOMPARE(uchar(mvSink.frames[0].video.planeY.at(4)), uchar(20));
-    QCOMPARE(uchar(pgmSink.frames[0].video.planeY.at(0)), uchar(20));
+    QCOMPARE(yAt(feedSink.frames[0], 0), uchar(10));
+    QCOMPARE(yAt(mvSink.frames[0], 0), uchar(10));
+    QCOMPARE(yAt(mvSink.frames[0], 4), uchar(20));
+    QCOMPARE(yAt(pgmSink.frames[0], 0), uchar(20));
     QCOMPARE(feedSink.frames[0].outputFrameIndex, pgmSink.frames[0].outputFrameIndex);
 }
 
@@ -582,7 +595,7 @@ void TestOutputDispatcher::pgmSwitchUpdatesIdentityOnNextTick() {
     QCOMPARE(sink.frames[0].identity.sourcePtsMs, qint64(100));
     QCOMPARE(sink.frames[1].identity.sourcePtsMs, qint64(100));
     QVERIFY(!sink.frames[0].identity.samePayloadAs(sink.frames[1].identity));
-    QCOMPARE(uchar(sink.frames[1].video.planeY.at(0)), uchar(99));
+    QCOMPARE(yAt(sink.frames[1], 0), uchar(99));
 
     const OutputTargetDispatchStats target =
         dispatcher.stats().targets.value(QStringLiteral("pgm-preview"));

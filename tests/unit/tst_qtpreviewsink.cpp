@@ -17,9 +17,9 @@ void TestQtPreviewSink::deliverMediaFrameUpdatesProviderLatestImage() {
     FrameProvider provider;
     QtPreviewSink sink(&provider);
 
-    MediaVideoFrame frame = MediaVideoFrame::solidYuv420p(4, 4, 80, 128, 128);
-    frame.ptsMs = 123;
-    frame.outputFrameIndex = 9;
+    FrameHandle frame = solidYuv420pHandle(4, 4, 80, 128, 128);
+    frame.metadata().key.ptsMs = 123;
+    frame.metadata().outputFrameIndex = 9;
     QVERIFY(sink.deliver(frame));
 
     QImage image = provider.latestImage();
@@ -30,9 +30,9 @@ void TestQtPreviewSink::deliverMediaFrameUpdatesProviderLatestImage() {
 
 void TestQtPreviewSink::deliverBusEngineFrameUpdatesProviderLatestImage() {
     OutputFrameCache cache(1, 4, 4);
-    MediaVideoFrame source = MediaVideoFrame::solidYuv420p(4, 4, 90, 128, 128);
-    source.feedIndex = 0;
-    source.ptsMs = 100;
+    FrameHandle source = solidYuv420pHandle(4, 4, 90, 128, 128);
+    source.metadata().key.feedIndex = 0;
+    source.metadata().key.ptsMs = 100;
     cache.insertVideoFrame(source);
 
     OutputBusEngine engine(FrameRate::fromFraction(25, 1), 1, 4, 4);
@@ -54,9 +54,9 @@ void TestQtPreviewSink::deliverBusEngineFrameUpdatesProviderLatestImage() {
 
 void TestQtPreviewSink::outputSinkEndpointDeliversOnlyWhenStarted() {
     OutputFrameCache cache(1, 4, 4);
-    MediaVideoFrame source = MediaVideoFrame::solidYuv420p(4, 4, 70, 128, 128);
-    source.feedIndex = 0;
-    source.ptsMs = 100;
+    FrameHandle source = solidYuv420pHandle(4, 4, 70, 128, 128);
+    source.metadata().key.feedIndex = 0;
+    source.metadata().key.ptsMs = 100;
     cache.insertVideoFrame(source);
 
     OutputBusEngine engine(FrameRate::fromFraction(25, 1), 1, 4, 4);

@@ -2,11 +2,15 @@
 
 #include "playback/output/outputdispatcher.h"
 
-static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = feed;
-    f.ptsMs = pts;
+static FrameHandle video(int feed, qint64 pts, uchar y) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
+    f.metadata().key.feedIndex = feed;
+    f.metadata().key.ptsMs = pts;
     return f;
+}
+
+static QByteArray yPlane(const OutputBusFrame& frame) {
+    return MediaVideoFrameView(frame.video).planeY;
 }
 
 class CollectingSink final : public IOutputSink {
@@ -66,10 +70,10 @@ void TestOutputDispatcherHoldLast::emptyCacheAfterRealFrameHoldsLastGoodVideo() 
 
     QCOMPARE(sink.frames.size(), 2);
     // The held tick must NOT be the gray placeholder...
-    QVERIFY(!sink.frames[1].video.isPlaceholder);
+    QVERIFY(!sink.frames[1].video.metadata().key.isPlaceholder);
     // ...and its video pixels must equal the prior real frame.
-    QCOMPARE(uchar(sink.frames[1].video.planeY.at(0)), uchar(77));
-    QCOMPARE(sink.frames[1].video.planeY, sink.frames[0].video.planeY);
+    QCOMPARE(uchar(yPlane(sink.frames[1]).at(0)), uchar(77));
+    QCOMPARE(yPlane(sink.frames[1]), yPlane(sink.frames[0]));
     // Held frame keeps the fresh tick's outputFrameIndex (clock never stalls).
     QCOMPARE(sink.frames[1].outputFrameIndex, qint64(1));
 
@@ -103,7 +107,7 @@ void TestOutputDispatcherHoldLast::holdDisabledLeavesPlaceholderVisible() {
     dispatcher.dispatchTick(empty, state);
 
     QCOMPARE(sink.frames.size(), 2);
-    QVERIFY(sink.frames[1].video.isPlaceholder);
+    QVERIFY(sink.frames[1].video.metadata().key.isPlaceholder);
     const OutputDispatchStats stats = dispatcher.stats();
     QCOMPARE(stats.heldFrames, qint64(0));
     QCOMPARE(stats.placeholderFrames, qint64(1));

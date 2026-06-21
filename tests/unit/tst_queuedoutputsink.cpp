@@ -6,9 +6,10 @@ static OutputBusFrame frame(qint64 index) {
     OutputBusFrame out;
     out.bus = OutputBusId::feed(0);
     out.outputFrameIndex = index;
-    out.video = MediaVideoFrame::solidYuv420p(4, 4, uchar(40 + index), 128, 128);
-    out.video.feedIndex = 0;
-    out.video.ptsMs = index * 40;
+    out.video = solidYuv420pHandle(4, 4, uchar(40 + index), 128, 128);
+    out.video.metadata().key.feedIndex = 0;
+    out.video.metadata().key.ptsMs = index * 40;
+    out.video.metadata().outputFrameIndex = index;
     out.audio.feedIndex = 0;
     out.audio.sampleRate = 48000;
     out.audio.channels = 2;

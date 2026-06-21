@@ -1,12 +1,13 @@
 #include <QtTest>
 
+#include "playback/output/framehandle.h"
 #include "playback/output/outputframecache.h"
 
-static MediaVideoFrame makeVideo(int feed, qint64 ptsMs, uchar y) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = feed;
-    f.ptsMs = ptsMs;
-    return f;
+static FrameHandle makeVideo(int feed, qint64 ptsMs, uchar y) {
+    FrameHandle frame = solidYuv420pHandle(4, 4, y, 128, 128);
+    frame.metadata().key.feedIndex = feed;
+    frame.metadata().key.ptsMs = ptsMs;
+    return frame;
 }
 
 class TestOutputFrameCache : public QObject {
@@ -30,8 +31,9 @@ void TestOutputFrameCache::videoAtPicksLargestPtsAtOrBeforePlayhead() {
 
     auto frame = cache.videoFrameAt(0, 250);
     QVERIFY(frame.has_value());
-    QCOMPARE(frame->ptsMs, qint64(200));
-    QCOMPARE(uchar(frame->planeY.at(0)), uchar(20));
+    MediaVideoFrameView view(*frame);
+    QCOMPARE(view.ptsMs, qint64(200));
+    QCOMPARE(uchar(view.planeY.at(0)), uchar(20));
 }
 
 void TestOutputFrameCache::videoFallsBackToLastValidFrame() {
@@ -39,17 +41,19 @@ void TestOutputFrameCache::videoFallsBackToLastValidFrame() {
     cache.insertVideoFrame(makeVideo(0, 100, 42));
     auto frame = cache.videoFrameAt(0, 2000);
     QVERIFY(frame.has_value());
-    QCOMPARE(frame->ptsMs, qint64(100));
-    QCOMPARE(uchar(frame->planeY.at(0)), uchar(42));
+    MediaVideoFrameView view(*frame);
+    QCOMPARE(view.ptsMs, qint64(100));
+    QCOMPARE(uchar(view.planeY.at(0)), uchar(42));
 }
 
 void TestOutputFrameCache::missingVideoReturnsPlaceholder() {
     OutputFrameCache cache(1, 4, 4);
     auto frame = cache.videoFrameOrPlaceholder(0, 0);
-    QCOMPARE(frame.feedIndex, 0);
-    QCOMPARE(frame.width, 4);
-    QCOMPARE(frame.height, 4);
-    QVERIFY(frame.isPlaceholder);
+    MediaVideoFrameView view(frame);
+    QCOMPARE(view.feedIndex, 0);
+    QCOMPARE(view.width, 4);
+    QCOMPARE(view.height, 4);
+    QVERIFY(view.isPlaceholder);
 }
 
 void TestOutputFrameCache::audioSpanReturnsSamplesAndSilenceForGaps() {
@@ -100,13 +104,15 @@ void TestOutputFrameCache::trimBeforeBoundsVideoHistoryButKeepsBoundaryFrame() {
 
     auto boundary = cache.videoFrameAt(0, 175);
     QVERIFY(boundary.has_value());
-    QCOMPARE(boundary->ptsMs, qint64(100));
-    QCOMPARE(uchar(boundary->planeY.at(0)), uchar(20));
+    MediaVideoFrameView boundaryView(*boundary);
+    QCOMPARE(boundaryView.ptsMs, qint64(100));
+    QCOMPARE(uchar(boundaryView.planeY.at(0)), uchar(20));
 
     auto current = cache.videoFrameAt(0, 250);
     QVERIFY(current.has_value());
-    QCOMPARE(current->ptsMs, qint64(200));
-    QCOMPARE(uchar(current->planeY.at(0)), uchar(30));
+    MediaVideoFrameView currentView(*current);
+    QCOMPARE(currentView.ptsMs, qint64(200));
+    QCOMPARE(uchar(currentView.planeY.at(0)), uchar(30));
 }
 
 void TestOutputFrameCache::trimBeforeDropsExpiredAudioFrames() {
@@ -156,22 +162,18 @@ void TestOutputFrameCache::clearDropsVideoAndAudioHistory() {
 
     cache.clear();
 
-    MediaVideoFrame frame = cache.videoFrameOrPlaceholder(0, 100);
+    MediaVideoFrameView frame(cache.videoFrameOrPlaceholder(0, 100));
     QVERIFY(frame.isPlaceholder);
     QCOMPARE(cache.audioSpanOrSilence(0, 100, 4), silentS16Stereo(4));
 }
 
 void TestOutputFrameCache::mergeFromInsertsByPtsWithoutClearing() {
     OutputFrameCache live(1, 4, 4);
-    MediaVideoFrame oldF = MediaVideoFrame::solidYuv420p(4, 4, 10, 128, 128);
-    oldF.feedIndex = 0;
-    oldF.ptsMs = 5000;
+    FrameHandle oldF = makeVideo(0, 5000, 10);
     live.insertVideoFrame(oldF);
 
     OutputFrameCache staging(1, 4, 4);
-    MediaVideoFrame newF = MediaVideoFrame::solidYuv420p(4, 4, 20, 128, 128);
-    newF.feedIndex = 0;
-    newF.ptsMs = 200;
+    FrameHandle newF = makeVideo(0, 200, 20);
     staging.insertVideoFrame(newF);
 
     live.mergeFrom(staging);
@@ -181,8 +183,8 @@ void TestOutputFrameCache::mergeFromInsertsByPtsWithoutClearing() {
     auto atOld = live.videoFrameAt(0, 5000);
     QVERIFY(atNew.has_value());
     QVERIFY(atOld.has_value());
-    QCOMPARE(int(uchar(atNew->planeY.at(0))), 20);
-    QCOMPARE(int(uchar(atOld->planeY.at(0))), 10);
+    QCOMPARE(int(uchar(MediaVideoFrameView(*atNew).planeY.at(0))), 20);
+    QCOMPARE(int(uchar(MediaVideoFrameView(*atOld).planeY.at(0))), 10);
 }
 
 QTEST_GUILESS_MAIN(TestOutputFrameCache)

@@ -7,7 +7,9 @@
 #include <QThread>
 
 #include <cstdio>
+#include <utility>
 
+#include "playback/output/framehandle.h"
 #include "playback/output/mediaframe.h"
 #include "playback/output/ndisink.h"
 #include "playback/output/outputbusengine.h"
@@ -17,12 +19,13 @@
 namespace {
 constexpr int kSkip = 77;
 
-MediaVideoFrame markerVideo(const NdiOutputMarkerConfig& mk, qint64 frameIndex) {
-    MediaVideoFrame v = MediaVideoFrame::solidYuv420p(mk.width, mk.height, 128, 128, 128);
-    v.feedIndex = 0;
-    v.ptsMs = frameIndex * 1000 * mk.fpsDen / mk.fpsNum;
-    v.planeY = ndiMarkerLumaPlane(mk, frameIndex); // overwrite luma with the marker
-    return v;
+FrameHandle markerVideo(const NdiOutputMarkerConfig& mk, qint64 frameIndex) {
+    FrameHandle v = solidYuv420pHandle(mk.width, mk.height, 128, 128, 128);
+    v.metadata().key.feedIndex = 0;
+    v.metadata().key.ptsMs = frameIndex * 1000 * mk.fpsDen / mk.fpsNum;
+    CpuPlanes planes = v.readToCpu(FramePixelFormat::Yuv420p);
+    planes.plane[0] = ndiMarkerLumaPlane(mk, frameIndex); // overwrite luma with the marker
+    return makeCpuFrameHandle(std::move(planes), v.metadata());
 }
 
 MediaAudioFrame markerAudio(const NdiOutputMarkerConfig& mk, qint64 frameIndex) {
@@ -72,7 +75,7 @@ int main(int argc, char** argv) {
         frame.outputFrameIndex = frameIndex;
         frame.video = markerVideo(mk, frameIndex);
         frame.audio = markerAudio(mk, frameIndex);
-        frame.sampledPlayheadMs = frame.video.ptsMs;
+        frame.sampledPlayheadMs = frame.video.metadata().key.ptsMs;
         // Stamp the programme timecode the way OutputBusEngine does (playhead x 10000), so the
         // lane drives a real, advancing timecode onto the wire instead of the synthesize default.
         frame.programmeTimecode100ns = qMax<qint64>(0, frame.sampledPlayheadMs) * 10000;

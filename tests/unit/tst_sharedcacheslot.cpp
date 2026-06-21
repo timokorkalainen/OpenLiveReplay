@@ -2,13 +2,14 @@
 #include <atomic>
 #include <memory>
 #include <thread>
+#include "playback/output/framehandle.h"
 #include "playback/output/sharedcacheslot.h"
 
 static std::shared_ptr<const OutputFrameCache> makeCache(uchar y) {
     auto c = std::make_shared<OutputFrameCache>(1, 4, 4);
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = 0;
-    f.ptsMs = 100;
+    FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
+    f.metadata().key.feedIndex = 0;
+    f.metadata().key.ptsMs = 100;
     c->insertVideoFrame(f);
     return std::const_pointer_cast<const OutputFrameCache>(c);
 }
@@ -28,7 +29,7 @@ void TestSharedCacheSlot::loadReturnsLastPublished() {
     QVERIFY(got != nullptr);
     auto frame = got->videoFrameAt(0, 100);
     QVERIFY(frame.has_value());
-    QCOMPARE(int(uchar(frame->planeY.at(0))), 22);
+    QCOMPARE(int(uchar(MediaVideoFrameView(*frame).planeY.at(0))), 22);
 }
 
 void TestSharedCacheSlot::concurrentPublishYieldsConsistentSnapshot() {
@@ -44,7 +45,7 @@ void TestSharedCacheSlot::concurrentPublishYieldsConsistentSnapshot() {
         QVERIFY(snap != nullptr);
         auto frame = snap->videoFrameAt(0, 100);
         QVERIFY(frame.has_value()); // immutable: never torn
-        const int v = int(uchar(frame->planeY.at(0)));
+        const int v = int(uchar(MediaVideoFrameView(*frame).planeY.at(0)));
         QVERIFY(v == 1 || (v >= 50 && v <= 52));
     }
     stop.store(true);

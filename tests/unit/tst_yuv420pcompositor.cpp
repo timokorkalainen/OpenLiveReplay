@@ -1,29 +1,31 @@
 #include <QtTest>
+#include <utility>
 
 #include "playback/output/yuv420pcompositor.h"
 
-static MediaVideoFrame solid(int feed, uchar y) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = feed;
+static FrameHandle solid(int feed, uchar y) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
+    f.metadata().key.feedIndex = feed;
     return f;
 }
 
 // A source with distinct, deterministic Y AND chroma so a swapped/duplicated
 // quadrant or a corrupted chroma plane is detectable (a Y-only fixture cannot
 // tell two feeds apart on the U/V planes).
-static MediaVideoFrame solidYuv(int feed, uchar y, uchar u, uchar v) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, u, v);
-    f.feedIndex = feed;
+static FrameHandle solidYuv(int feed, uchar y, uchar u, uchar v) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, u, v);
+    f.metadata().key.feedIndex = feed;
     return f;
 }
 
-static MediaVideoFrame patterned(int feed) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, 16, 128, 128);
-    f.feedIndex = feed;
-    for (int i = 0; i < f.planeY.size(); ++i) {
-        f.planeY[i] = char(20 + i);
+static FrameHandle patterned(int feed) {
+    FrameHandle f = solidYuv420pHandle(4, 4, 16, 128, 128);
+    f.metadata().key.feedIndex = feed;
+    CpuPlanes planes = f.readToCpu(FramePixelFormat::Yuv420p);
+    for (int i = 0; i < planes.plane[0].size(); ++i) {
+        planes.plane[0][i] = char(20 + i);
     }
-    return f;
+    return makeCpuFrameHandle(std::move(planes), f.metadata());
 }
 
 // Compute the EXPECTED composited planes for a 2x2 grid of equal-size flat
@@ -40,7 +42,7 @@ struct GoldenPlanes {
     QByteArray v;
 };
 
-static GoldenPlanes goldenTwoByTwo(int width, int height, const QList<MediaVideoFrame>& src) {
+static GoldenPlanes goldenTwoByTwo(int width, int height, const QList<FrameHandle>& src) {
     // Background is the compositor's neutral fill (Y=16, U=V=128).
     GoldenPlanes g;
     const int chromaW = (width + 1) / 2;
@@ -52,9 +54,10 @@ static GoldenPlanes goldenTwoByTwo(int width, int height, const QList<MediaVideo
     const int columns = 2;
     const int rows = 2;
     for (int i = 0; i < src.size(); ++i) {
-        const uchar yv = uchar(src.at(i).planeY.at(0));
-        const uchar uv = uchar(src.at(i).planeU.at(0));
-        const uchar vv = uchar(src.at(i).planeV.at(0));
+        const MediaVideoFrameView view(src.at(i));
+        const uchar yv = uchar(view.planeY.at(0));
+        const uchar uv = uchar(view.planeU.at(0));
+        const uchar vv = uchar(view.planeV.at(0));
         const int col = i % columns;
         const int row = i / columns;
         const int dstX = col * width / columns;
@@ -91,8 +94,8 @@ private slots:
 };
 
 void TestYuv420pCompositor::twoByTwoGridCopiesFeedLumaIntoQuadrants() {
-    QList<MediaVideoFrame> frames{solid(0, 40), solid(1, 80), solid(2, 120), solid(3, 160)};
-    MediaVideoFrame out = Yuv420pCompositor::composeGrid(frames, 8, 8);
+    QList<FrameHandle> frames{solid(0, 40), solid(1, 80), solid(2, 120), solid(3, 160)};
+    MediaVideoFrameView out(Yuv420pCompositor::composeGrid(frames, 8, 8));
     QCOMPARE(out.width, 8);
     QCOMPARE(out.height, 8);
     QCOMPARE(uchar(out.planeY.at(0)), uchar(40));
@@ -102,8 +105,8 @@ void TestYuv420pCompositor::twoByTwoGridCopiesFeedLumaIntoQuadrants() {
 }
 
 void TestYuv420pCompositor::downscalesEachFeedAcrossTheWholeSourceFrame() {
-    QList<MediaVideoFrame> frames{patterned(0), solid(1, 80), solid(2, 120), solid(3, 160)};
-    MediaVideoFrame out = Yuv420pCompositor::composeGrid(frames, 4, 4);
+    QList<FrameHandle> frames{patterned(0), solid(1, 80), solid(2, 120), solid(3, 160)};
+    MediaVideoFrameView out(Yuv420pCompositor::composeGrid(frames, 4, 4));
 
     QCOMPARE(out.width, 4);
     QCOMPARE(out.height, 4);
@@ -114,8 +117,8 @@ void TestYuv420pCompositor::downscalesEachFeedAcrossTheWholeSourceFrame() {
 }
 
 void TestYuv420pCompositor::missingFeedLeavesBlackTile() {
-    QList<MediaVideoFrame> frames{solid(0, 40), MediaVideoFrame{}};
-    MediaVideoFrame out = Yuv420pCompositor::composeGrid(frames, 8, 8);
+    QList<FrameHandle> frames{solid(0, 40), FrameHandle{}};
+    MediaVideoFrameView out(Yuv420pCompositor::composeGrid(frames, 8, 8));
     QCOMPARE(uchar(out.planeY.at(0)), uchar(40));
     QCOMPARE(uchar(out.planeY.at(4)), uchar(16));
 }
@@ -128,9 +131,9 @@ void TestYuv420pCompositor::missingFeedLeavesBlackTile() {
 // unlike the single-corner-pixel probes above, which pass even when the rest of
 // a tile is wrong.
 void TestYuv420pCompositor::twoByTwoGridIsPixelExactAgainstGolden() {
-    QList<MediaVideoFrame> frames{solidYuv(0, 40, 60, 200), solidYuv(1, 80, 70, 190),
-                                  solidYuv(2, 120, 80, 180), solidYuv(3, 160, 90, 170)};
-    MediaVideoFrame out = Yuv420pCompositor::composeGrid(frames, 8, 8);
+    QList<FrameHandle> frames{solidYuv(0, 40, 60, 200), solidYuv(1, 80, 70, 190),
+                              solidYuv(2, 120, 80, 180), solidYuv(3, 160, 90, 170)};
+    MediaVideoFrameView out(Yuv420pCompositor::composeGrid(frames, 8, 8));
     QCOMPARE(out.width, 8);
     QCOMPARE(out.height, 8);
     // Strides must match the declared plane geometry (an off-by-one stride here
@@ -150,12 +153,12 @@ void TestYuv420pCompositor::twoByTwoGridIsPixelExactAgainstGolden() {
 // at least one plane. This is the positive proof that the pixel-exact gate above
 // bites (it is the in-test analogue of the manual mutation in the report).
 void TestYuv420pCompositor::quadrantPlacementIsNotSymmetric() {
-    QList<MediaVideoFrame> correct{solidYuv(0, 40, 60, 200), solidYuv(1, 80, 70, 190),
-                                   solidYuv(2, 120, 80, 180), solidYuv(3, 160, 90, 170)};
+    QList<FrameHandle> correct{solidYuv(0, 40, 60, 200), solidYuv(1, 80, 70, 190),
+                               solidYuv(2, 120, 80, 180), solidYuv(3, 160, 90, 170)};
     // Swap the top-right (index 1) and bottom-left (index 2) feeds.
-    QList<MediaVideoFrame> swapped{correct.at(0), correct.at(2), correct.at(1), correct.at(3)};
+    QList<FrameHandle> swapped{correct.at(0), correct.at(2), correct.at(1), correct.at(3)};
 
-    MediaVideoFrame out = Yuv420pCompositor::composeGrid(swapped, 8, 8);
+    MediaVideoFrameView out(Yuv420pCompositor::composeGrid(swapped, 8, 8));
     const GoldenPlanes golden = goldenTwoByTwo(8, 8, correct);
 
     const bool anyPlaneDiffers =
@@ -174,9 +177,9 @@ void TestYuv420pCompositor::quadrantPlacementIsNotSymmetric() {
 // off-by-one chroma stride or a half-pel-misplaced chroma offset FAILS — the Y
 // plane alone cannot catch a chroma-only regression.
 void TestYuv420pCompositor::chromaPlanesAreByteExactPerQuadrant() {
-    QList<MediaVideoFrame> frames{solidYuv(0, 40, 10, 240), solidYuv(1, 80, 20, 230),
-                                  solidYuv(2, 120, 30, 220), solidYuv(3, 160, 40, 210)};
-    MediaVideoFrame out = Yuv420pCompositor::composeGrid(frames, 8, 8);
+    QList<FrameHandle> frames{solidYuv(0, 40, 10, 240), solidYuv(1, 80, 20, 230),
+                              solidYuv(2, 120, 30, 220), solidYuv(3, 160, 40, 210)};
+    MediaVideoFrameView out(Yuv420pCompositor::composeGrid(frames, 8, 8));
 
     // 8x8 -> 4x4 chroma plane, stride 4. The four 2x2 chroma quadrants:
     // (cx,cy) in {0,1}x{0,1} columns/rows; tile index = (cy/... ) — here each tile

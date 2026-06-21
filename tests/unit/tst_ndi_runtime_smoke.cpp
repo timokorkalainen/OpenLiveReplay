@@ -44,10 +44,9 @@ void insertSourceFrame(OutputFrameCache* cache, qint64 index) {
     constexpr qint64 kFrameDurationMs = 40;
     constexpr int kAudioSamplesPerFrame = 1920;
 
-    MediaVideoFrame video =
-        MediaVideoFrame::solidYuv420p(16, 16, uchar(70 + (index % 120)), 96, 160);
-    video.feedIndex = 0;
-    video.ptsMs = index * kFrameDurationMs;
+    FrameHandle video = solidYuv420pHandle(16, 16, uchar(70 + (index % 120)), 96, 160);
+    video.metadata().key.feedIndex = 0;
+    video.metadata().key.ptsMs = index * kFrameDurationMs;
     cache->insertVideoFrame(video);
     cache->insertAudioFrame(makeAudio(index * kAudioSamplesPerFrame, kAudioSamplesPerFrame));
 }

@@ -1,11 +1,11 @@
 #include <QtTest>
 
-#include "playback/output/mediaframe.h"
+#include "playback/output/framehandle.h"
 #include "playback/trackbuffer.h"
 
 // A distinct, mappable frame per pts so identity is checkable.
-static MediaVideoFrame makeFrame(uchar y = 80) {
-    return MediaVideoFrame::solidYuv420p(16, 16, y, 128, 128);
+static FrameHandle makeFrame(uchar y = 80) {
+    return solidYuv420pHandle(16, 16, y, 128, 128);
 }
 
 class TestTrackBuffer : public QObject {
@@ -38,22 +38,22 @@ void TestTrackBuffer::frameAtPicksLargestLeqPlayhead() {
     b.insert(100, makeFrame(10), 100, 0, 100000);
     b.insert(200, makeFrame(20), 100, 0, 100000);
     b.insert(300, makeFrame(30), 100, 0, 100000);
-    MediaVideoFrame out;
+    FrameHandle out;
     int64_t pts = -1;
     QVERIFY(b.frameAt(250, out, pts));
     QCOMPARE(pts, int64_t(200));
-    QCOMPARE(uchar(out.planeY.at(0)), uchar(20));
+    QCOMPARE(uchar(MediaVideoFrameView(out).planeY.at(0)), uchar(20));
     QVERIFY(b.frameAt(300, out, pts));
     QCOMPARE(pts, int64_t(300)); // exact
-    QCOMPARE(uchar(out.planeY.at(0)), uchar(30));
+    QCOMPARE(uchar(MediaVideoFrameView(out).planeY.at(0)), uchar(30));
     QVERIFY(b.frameAt(100, out, pts));
     QCOMPARE(pts, int64_t(100));
-    QCOMPARE(uchar(out.planeY.at(0)), uchar(10));
+    QCOMPARE(uchar(MediaVideoFrameView(out).planeY.at(0)), uchar(10));
 }
 
 void TestTrackBuffer::frameAtEmptyAndBeforeFirst() {
     TrackBuffer b;
-    MediaVideoFrame out;
+    FrameHandle out;
     int64_t pts = -1;
     QVERIFY(!b.frameAt(50, out, pts)); // empty
     b.insert(100, makeFrame(), 100, 0, 100000);

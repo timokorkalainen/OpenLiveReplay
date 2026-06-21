@@ -86,22 +86,23 @@ public:
     }
 
     bool sendFrame(const OutputBusFrame& frame) override {
-        if (!m_sender || !m_sendVideo || !m_sendAudio || !frame.video.isValid()) return false;
-        if (!packI420(frame.video)) return false;
+        const MediaVideoFrameView video(frame.video);
+        if (!m_sender || !m_sendVideo || !m_sendAudio || !video.isValid()) return false;
+        if (!packI420(video)) return false;
         NDIlib_audio_frame_v3_t audioFrame;
         if (!packAudio(frame.audio, &audioFrame)) return false;
 
         NDIlib_video_frame_v2_t videoFrame;
-        videoFrame.xres = frame.video.width;
-        videoFrame.yres = frame.video.height;
+        videoFrame.xres = video.width;
+        videoFrame.yres = video.height;
         videoFrame.FourCC = kFourCcI420;
         videoFrame.frame_rate_N = m_rate.numerator;
         videoFrame.frame_rate_D = m_rate.denominator;
         videoFrame.picture_aspect_ratio =
-            frame.video.height > 0 ? float(frame.video.width) / float(frame.video.height) : 0.0f;
+            video.height > 0 ? float(video.width) / float(video.height) : 0.0f;
         videoFrame.frame_format_type = kFrameFormatProgressive;
         videoFrame.p_data = reinterpret_cast<quint8*>(m_videoBuffer.data());
-        videoFrame.line_stride_in_bytes = frame.video.width;
+        videoFrame.line_stride_in_bytes = video.width;
         videoFrame.p_metadata = nullptr;
 
         // Stamp the programme timecode onto the paired video + audio frames (the SDK fills in
@@ -146,7 +147,7 @@ private:
         return m_sendCreate && m_sendDestroy && m_sendVideo && m_sendAudio;
     }
 
-    bool packI420(const MediaVideoFrame& frame) {
+    bool packI420(const MediaVideoFrameView& frame) {
         if (!frame.isValid() || (frame.width % 2) != 0 || (frame.height % 2) != 0) return false;
         const int chromaW = frame.width / 2;
         const int chromaH = frame.height / 2;

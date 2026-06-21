@@ -1,6 +1,7 @@
 #ifndef OUTPUTFRAMECACHE_H
 #define OUTPUTFRAMECACHE_H
 
+#include "playback/output/framehandle.h"
 #include "playback/output/mediaframe.h"
 
 #include <QVector>
@@ -10,9 +11,9 @@ class OutputFrameCache {
 public:
     OutputFrameCache(int feedCount, int placeholderWidth, int placeholderHeight);
 
-    void insertVideoFrame(const MediaVideoFrame& frame);
-    std::optional<MediaVideoFrame> videoFrameAt(int feedIndex, qint64 playheadMs) const;
-    MediaVideoFrame videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const;
+    void insertVideoFrame(const FrameHandle& frame);
+    std::optional<FrameHandle> videoFrameAt(int feedIndex, qint64 playheadMs) const;
+    FrameHandle videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const;
 
     void insertAudioFrame(const MediaAudioFrame& frame);
     QByteArray audioSpanOrSilence(int feedIndex, qint64 startSample, int sampleFrames) const;
@@ -26,7 +27,7 @@ public:
     void clear();
 
 private:
-    QVector<QVector<MediaVideoFrame>> m_video;
+    QVector<QVector<FrameHandle>> m_video;
     QVector<QVector<MediaAudioFrame>> m_audio;
     int m_placeholderWidth = 1920;
     int m_placeholderHeight = 1080;

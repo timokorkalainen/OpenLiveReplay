@@ -2,19 +2,19 @@
 
 #include "playback/output/outputbusengine.h"
 
-static MediaVideoFrame video(int feed, qint64 pts, uchar y) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, 128, 128);
-    f.feedIndex = feed;
-    f.ptsMs = pts;
+static FrameHandle video(int feed, qint64 pts, uchar y) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
+    f.metadata().key.feedIndex = feed;
+    f.metadata().key.ptsMs = pts;
     return f;
 }
 
 // Distinct Y AND chroma so PGM selection is provable on every plane (a Y-only
 // fixture cannot tell two feeds apart on the U/V planes).
-static MediaVideoFrame videoYuv(int feed, qint64 pts, uchar y, uchar u, uchar v) {
-    MediaVideoFrame f = MediaVideoFrame::solidYuv420p(4, 4, y, u, v);
-    f.feedIndex = feed;
-    f.ptsMs = pts;
+static FrameHandle videoYuv(int feed, qint64 pts, uchar y, uchar u, uchar v) {
+    FrameHandle f = solidYuv420pHandle(4, 4, y, u, v);
+    f.metadata().key.feedIndex = feed;
+    f.metadata().key.ptsMs = pts;
     return f;
 }
 
@@ -65,8 +65,8 @@ void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
     auto feed0 = engine.renderFeed(0, 3, state, cache);
     auto feed1 = engine.renderFeed(1, 3, state, cache);
 
-    QCOMPARE(uchar(feed0.video.planeY.at(0)), uchar(10));
-    QCOMPARE(uchar(feed1.video.planeY.at(0)), uchar(20));
+    QCOMPARE(uchar(MediaVideoFrameView(feed0.video).planeY.at(0)), uchar(10));
+    QCOMPARE(uchar(MediaVideoFrameView(feed1.video).planeY.at(0)), uchar(20));
     QCOMPARE(reinterpret_cast<const qint16*>(feed0.audio.pcm.constData())[0], qint16(100));
     QCOMPARE(reinterpret_cast<const qint16*>(feed1.audio.pcm.constData())[0], qint16(200));
 }
@@ -85,7 +85,7 @@ void TestOutputBusEngine::pgmFollowsSelectedFeed() {
 
     auto pgm = engine.renderPgm(5, state, cache);
     QCOMPARE(pgm.bus, OutputBusId::pgm());
-    QCOMPARE(uchar(pgm.video.planeY.at(0)), uchar(30));
+    QCOMPARE(uchar(MediaVideoFrameView(pgm.video).planeY.at(0)), uchar(30));
 }
 
 // PIXEL-EXACT PGM SELECTION: the PGM bus must emit the SELECTED feed's pixels
@@ -96,8 +96,10 @@ void TestOutputBusEngine::pgmFollowsSelectedFeed() {
 // against the selected source and full-plane inequality against the other feed
 // makes "wrong PGM source" FAIL deterministically.
 void TestOutputBusEngine::pgmIsPixelExactCopyOfSelectedFeed() {
-    const MediaVideoFrame feed0 = videoYuv(0, 100, 10, 60, 200);
-    const MediaVideoFrame feed1 = videoYuv(1, 100, 30, 90, 170);
+    const FrameHandle feed0 = videoYuv(0, 100, 10, 60, 200);
+    const FrameHandle feed1 = videoYuv(1, 100, 30, 90, 170);
+    const MediaVideoFrameView feed0View(feed0);
+    const MediaVideoFrameView feed1View(feed1);
     OutputFrameCache cache(2, 4, 4);
     cache.insertVideoFrame(feed0);
     cache.insertVideoFrame(feed1);
@@ -110,26 +112,28 @@ void TestOutputBusEngine::pgmIsPixelExactCopyOfSelectedFeed() {
     state.selectedFeedIndex = 1;
 
     auto pgm = engine.renderPgm(5, state, cache);
+    const MediaVideoFrameView pgmView(pgm.video);
     QCOMPARE(pgm.bus, OutputBusId::pgm());
-    QCOMPARE(pgm.video.feedIndex, 1);
+    QCOMPARE(pgm.video.metadata().key.feedIndex, 1);
 
     // Every byte of every plane equals the selected feed (feed 1)...
-    QCOMPARE(pgm.video.planeY, feed1.planeY);
-    QCOMPARE(pgm.video.planeU, feed1.planeU);
-    QCOMPARE(pgm.video.planeV, feed1.planeV);
+    QCOMPARE(pgmView.planeY, feed1View.planeY);
+    QCOMPARE(pgmView.planeU, feed1View.planeU);
+    QCOMPARE(pgmView.planeV, feed1View.planeV);
 
     // ...and is NOT the non-selected feed (feed 0) on any plane.
-    QVERIFY(pgm.video.planeY != feed0.planeY);
-    QVERIFY(pgm.video.planeU != feed0.planeU);
-    QVERIFY(pgm.video.planeV != feed0.planeV);
+    QVERIFY(pgmView.planeY != feed0View.planeY);
+    QVERIFY(pgmView.planeU != feed0View.planeU);
+    QVERIFY(pgmView.planeV != feed0View.planeV);
 
     // Selecting feed 0 instead must produce feed 0's planes exactly.
     state.selectedFeedIndex = 0;
     auto pgm0 = engine.renderPgm(6, state, cache);
-    QCOMPARE(pgm0.video.feedIndex, 0);
-    QCOMPARE(pgm0.video.planeY, feed0.planeY);
-    QCOMPARE(pgm0.video.planeU, feed0.planeU);
-    QCOMPARE(pgm0.video.planeV, feed0.planeV);
+    const MediaVideoFrameView pgm0View(pgm0.video);
+    QCOMPARE(pgm0.video.metadata().key.feedIndex, 0);
+    QCOMPARE(pgm0View.planeY, feed0View.planeY);
+    QCOMPARE(pgm0View.planeU, feed0View.planeU);
+    QCOMPARE(pgm0View.planeV, feed0View.planeV);
 }
 
 void TestOutputBusEngine::pausedAudioIsSilenceButVideoRepeats() {
@@ -145,8 +149,8 @@ void TestOutputBusEngine::pausedAudioIsSilenceButVideoRepeats() {
 
     auto a = engine.renderFeed(0, 10, state, cache);
     auto b = engine.renderFeed(0, 11, state, cache);
-    QCOMPARE(a.video.ptsMs, b.video.ptsMs);
-    QCOMPARE(uchar(a.video.planeY.at(0)), uchar(40));
+    QCOMPARE(a.video.metadata().key.ptsMs, b.video.metadata().key.ptsMs);
+    QCOMPARE(uchar(MediaVideoFrameView(a.video).planeY.at(0)), uchar(40));
     const auto* pcm = reinterpret_cast<const qint16*>(a.audio.pcm.constData());
     QCOMPARE(pcm[0], qint16(0));
 }
@@ -169,10 +173,11 @@ void TestOutputBusEngine::multiviewComposesFeedsAndCarriesSelectedFeedAudio() {
 
     auto multiview = engine.renderMultiview(5, state, cache);
     QCOMPARE(multiview.bus, OutputBusId::multiview());
-    QCOMPARE(uchar(multiview.video.planeY.at(0)), uchar(10));
-    QCOMPARE(uchar(multiview.video.planeY.at(4)), uchar(20));
-    QCOMPARE(uchar(multiview.video.planeY.at(4 * 8)), uchar(30));
-    QCOMPARE(uchar(multiview.video.planeY.at(4 * 8 + 4)), uchar(40));
+    const MediaVideoFrameView multiviewVideo(multiview.video);
+    QCOMPARE(uchar(multiviewVideo.planeY.at(0)), uchar(10));
+    QCOMPARE(uchar(multiviewVideo.planeY.at(4)), uchar(20));
+    QCOMPARE(uchar(multiviewVideo.planeY.at(4 * 8)), uchar(30));
+    QCOMPARE(uchar(multiviewVideo.planeY.at(4 * 8 + 4)), uchar(40));
     const auto* pcm = reinterpret_cast<const qint16*>(multiview.audio.pcm.constData());
     QCOMPARE(multiview.audio.feedIndex, 1);
     QCOMPARE(pcm[0], qint16(200));
@@ -281,17 +286,18 @@ void TestOutputBusEngine::multiviewMemoReusesCompositeForUnchangedSources() {
 
     MultiviewComposite memo;
     const auto a = engine.renderMultiview(5, state, cache, &memo);
-    QCOMPARE(uchar(a.video.planeY.at(0)), uchar(10));
+    QCOMPARE(uchar(MediaVideoFrameView(a.video).planeY.at(0)), uchar(10));
 
     cache.insertVideoFrame(video(0, 100, 99)); // same pts, new content
     const auto b = engine.renderMultiview(6, state, cache, &memo);
-    QCOMPARE(uchar(b.video.planeY.at(0)), uchar(10)); // reused composite, not 99
+    QCOMPARE(uchar(MediaVideoFrameView(b.video).planeY.at(0)),
+             uchar(10)); // reused composite, not 99
 
     cache.insertVideoFrame(video(0, 140, 77)); // a genuine source advance (new pts)
     PlaybackStateSnapshot advanced = state;
     advanced.playheadMs = 140;
     const auto c = engine.renderMultiview(7, advanced, cache, &memo);
-    QCOMPARE(uchar(c.video.planeY.at(0)), uchar(77)); // memo invalidated, recomposited
+    QCOMPARE(uchar(MediaVideoFrameView(c.video).planeY.at(0)), uchar(77)); // memo invalidated
 }
 
 void TestOutputBusEngine::multiviewMemoMatchesUnmemoizedCompositeForDistinctSources() {
@@ -310,9 +316,11 @@ void TestOutputBusEngine::multiviewMemoMatchesUnmemoizedCompositeForDistinctSour
     MultiviewComposite memo;
     const auto memoized = engine.renderMultiview(9, state, cache, &memo);
     const auto plain = engine.renderMultiview(9, state, cache, nullptr);
-    QCOMPARE(memoized.video.planeY, plain.video.planeY);
-    QCOMPARE(memoized.video.planeU, plain.video.planeU);
-    QCOMPARE(memoized.video.planeV, plain.video.planeV);
+    const MediaVideoFrameView memoizedVideo(memoized.video);
+    const MediaVideoFrameView plainVideo(plain.video);
+    QCOMPARE(memoizedVideo.planeY, plainVideo.planeY);
+    QCOMPARE(memoizedVideo.planeU, plainVideo.planeU);
+    QCOMPARE(memoizedVideo.planeV, plainVideo.planeV);
     QCOMPARE(memoized.identity.videoHash, plain.identity.videoHash);
 }
 
