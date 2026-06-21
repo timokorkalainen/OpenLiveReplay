@@ -27,6 +27,7 @@ struct DecodeFrameContext {
     qint64 pts90k = -1;
     bool emittedFrame = false;
     bool copyFailed = false;
+    bool ioSurfaceBacked = false;
     OSStatus callbackStatus = noErr;
 };
 
@@ -209,6 +210,9 @@ static void decompressionOutputCallback(void*,
         return;
     }
 
+    context->ioSurfaceBacked =
+        CVPixelBufferGetIOSurface(CVPixelBufferRef(imageBuffer)) != nullptr;
+
     AVFrame* frame = copyPixelBufferToAvFrame(CVPixelBufferRef(imageBuffer));
     if (!frame) {
         context->copyFailed = true;
@@ -232,6 +236,7 @@ public:
 
     bool decode(const CompressedAccessUnit& unit, FrameCallback onFrame, QString* error);
     void reset();
+    bool lastDecodedWasIOSurfaceBacked() const { return lastIOSurfaceBacked; }
 
 private:
     int width = 0;
@@ -240,6 +245,7 @@ private:
     QByteArray activeParameterSetKey;
     CMVideoFormatDescriptionRef format = nullptr;
     VTDecompressionSessionRef session = nullptr;
+    bool lastIOSurfaceBacked = false;
 
     bool ensureSession(const CompressedAccessUnit& unit, QString* error);
     bool createFormatDescription(const CompressedAccessUnit& unit, QString* error);
@@ -328,6 +334,12 @@ bool NativeVideoDecoder::Impl::createSession(QString* error) {
     CFNumberRef pixelFormatNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixelFormat);
     CFDictionarySetValue(attributes, kCVPixelBufferPixelFormatTypeKey, pixelFormatNumber);
     CFRelease(pixelFormatNumber);
+
+    CFDictionaryRef ioSurfaceProps = CFDictionaryCreate(
+        kCFAllocatorDefault, nullptr, nullptr, 0,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey, ioSurfaceProps);
+    CFRelease(ioSurfaceProps);
 
     if (width > 0) {
         CFNumberRef widthNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
@@ -448,6 +460,7 @@ bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
     }
 
     VTDecompressionSessionWaitForAsynchronousFrames(session);
+    lastIOSurfaceBacked = context.ioSurfaceBacked;
     if (context.callbackStatus != noErr) {
         if (error) *error = statusMessage(QStringLiteral("VideoToolbox output callback failed"), context.callbackStatus);
         return false;
@@ -474,6 +487,10 @@ bool NativeVideoDecoder::decode(const CompressedAccessUnit& unit,
 
 void NativeVideoDecoder::reset() {
     m_impl->reset();
+}
+
+bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {
+    return m_impl->lastDecodedWasIOSurfaceBacked();
 }
 
 NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
