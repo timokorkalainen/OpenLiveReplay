@@ -57,6 +57,7 @@ private slots:
     void referenceGridPlacesTilesLikeCpuOracleLuma();
     void referenceGridModelsNv12ChromaDecimation();
     void referenceGridOutputIsRgba8();
+    void reconstructorLumaPlacementMatchesCpuOracle();
 };
 
 void TestFormatCanon::planeShapeMatchesYuv420pLayout() {
@@ -282,6 +283,31 @@ void TestFormatCanon::referenceGridOutputIsRgba8() {
     QCOMPARE(int(rgba.format), int(FramePixelFormat::Rgba8));
     QCOMPARE(rgba.stride[0], 16);
     QCOMPARE(rgba.plane[0].size(), 4 * 4 * 4);
+}
+
+void TestFormatCanon::reconstructorLumaPlacementMatchesCpuOracle() {
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 128, 128), solidYuv420pHandle(4, 4, 80, 128, 128),
+        solidYuv420pHandle(4, 4, 120, 128, 128), solidYuv420pHandle(4, 4, 160, 128, 128)};
+    const FrameHandle cpu = Yuv420pCompositor::composeGrid(frames, 8, 8);
+    const CpuPlanes cpuPlanes = cpu.readToCpu(FramePixelFormat::Yuv420p);
+    QVERIFY(cpuPlanes.isValid());
+
+    ColorMetadata color;
+    const CpuPlanes rgba = formatcanon::referenceComposeGridRgba8(frames, 8, 8, color);
+    QVERIFY(rgba.isValid());
+
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            const uchar yv = uchar(cpuPlanes.plane[0].at(y * cpuPlanes.stride[0] + x));
+            const formatcanon::Rgb8 grey =
+                formatcanon::yuvToRgb8(yv, 128, 128, color.matrix, color.range);
+            const int offset = y * rgba.stride[0] + x * 4;
+            QCOMPARE(uchar(rgba.plane[0].at(offset)), grey.r);
+            QCOMPARE(uchar(rgba.plane[0].at(offset + 1)), grey.g);
+            QCOMPARE(uchar(rgba.plane[0].at(offset + 2)), grey.b);
+        }
+    }
 }
 
 QTEST_GUILESS_MAIN(TestFormatCanon)
