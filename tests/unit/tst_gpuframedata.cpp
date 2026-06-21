@@ -124,12 +124,12 @@ void TestGpuFrameData::readToCpuDownloadsAndCounts() {
 
     const CpuPlanes second = handle.readToCpu(FramePixelFormat::Yuv420p);
     QVERIFY(second.isValid());
-    QCOMPARE(data->readToCpuCount(), 2);
-    QCOMPARE(gpuFrameReadToCpuCount(), qint64(2));
+    QCOMPARE(data->readToCpuCount(), 1);
+    QCOMPARE(gpuFrameReadToCpuCount(), qint64(1));
 
     const GpuReadbackTelemetrySnapshot twice = GpuReadbackTelemetry::instance().snapshot();
-    QCOMPARE(twice.gpuReadbacks, qint64(2));
-    QCOMPARE(twice.redundantReadbacks, qint64(1));
+    QCOMPARE(twice.gpuReadbacks, qint64(1));
+    QCOMPARE(twice.redundantReadbacks, qint64(0));
 }
 
 void TestGpuFrameData::readbackMatchesCpuWithinOneLsb() {

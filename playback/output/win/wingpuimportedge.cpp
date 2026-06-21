@@ -11,11 +11,15 @@
 #endif
 
 #include <QByteArray>
+#include <QHash>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QStringList>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <d3d10.h>
 #include <d3d11.h>
 #include <functional>
 #include <mfapi.h>
@@ -60,7 +64,7 @@ bool createD3D11(ComPtr<ID3D11Device>* device, ComPtr<IMFDXGIDeviceManager>* man
         return false;
     }
 
-    ComPtr<ID3D11Multithread> multithread;
+    ComPtr<ID3D10Multithread> multithread;
     if (SUCCEEDED(device->As(&multithread))) multithread->SetMultithreadProtected(TRUE);
 
     hr = MFCreateDXGIDeviceManager(resetToken, &*manager);
@@ -89,6 +93,8 @@ public:
 
 private:
     std::shared_ptr<D3D11GpuSurface> m_surface;
+    mutable QMutex m_cacheMutex;
+    mutable QHash<int, CpuPlanes> m_cpuCache;
 };
 
 } // namespace
@@ -224,7 +230,10 @@ std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int
     if (FAILED(dxgi->GetResource(IID_PPV_ARGS(&texture))) || !texture) return std::nullopt;
     dxgi->GetSubresourceIndex(&subresource);
 
-    auto surface = D3D11GpuSurface::createKept(m_impl->device, texture, subresource, width, height);
+    ComPtr<ID3D11Device> textureDevice;
+    texture->GetDevice(&textureDevice);
+    auto surface = D3D11GpuSurface::createKept(textureDevice ? textureDevice : m_impl->device,
+                                               texture, subresource, width, height);
     if (!surface) return std::nullopt;
 
     FrameMetadata meta;
@@ -233,7 +242,7 @@ std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = width;
     meta.key.height = height;
-    return makeGpuFrameHandleForTest(std::move(surface), std::move(meta));
+    return makeGpuFrameHandleForTest(std::move(surface), meta);
 }
 
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
@@ -243,7 +252,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
     auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface));
-    return FrameHandle(std::move(data), std::move(meta));
+    return FrameHandle(std::move(data), meta);
 }
 
 void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&)> tap) {
@@ -269,6 +278,11 @@ bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device, ComPtr<ID3D
 CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     CpuPlanes out;
     if (!m_surface) return out;
+
+    QMutexLocker locker(&m_cacheMutex);
+    const auto cached = m_cpuCache.constFind(int(target));
+    if (cached != m_cpuCache.cend()) return cached.value();
+
     ID3D11Device* device = m_surface->device();
     ID3D11Texture2D* src = m_surface->texture();
     if (!device || !src) return out;
@@ -330,6 +344,7 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     }
 
     ctx->Unmap(readable.Get(), 0);
+    if (out.isValid()) m_cpuCache.insert(int(target), out);
     return out;
 }
 

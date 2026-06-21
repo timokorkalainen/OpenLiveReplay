@@ -2,6 +2,8 @@
 
 #include "playback/output/gpureadbacktelemetry.h"
 
+#include <QMutexLocker>
+
 #include <utility>
 
 namespace {
@@ -27,6 +29,10 @@ GpuFrameData::~GpuFrameData() = default;
 CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
     if (!m_surface || !m_rhi) return CpuPlanes{};
 
+    QMutexLocker locker(&m_cacheMutex);
+    const auto cached = m_cpuCache.constFind(int(target));
+    if (cached != m_cpuCache.cend()) return cached.value();
+
     CpuPlanes planes = m_rhi->importAndReadback(m_surface, target);
     if (planes.isValid()) {
         m_readCount.fetch_add(1, std::memory_order_acq_rel);
@@ -37,6 +43,7 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
         key.format = target;
         GpuReadbackTelemetry::instance().recordSurface(key);
         GpuReadbackTelemetry::instance().recordGpuReadback(key);
+        m_cpuCache.insert(int(target), planes);
     }
     return planes;
 }
@@ -48,7 +55,7 @@ FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
     if (meta.key.height <= 0) meta.key.height = desc.height;
     meta.key.format = desc.format;
     auto data = std::make_shared<GpuFrameData>(std::move(surface), std::move(rhi), meta.key.format);
-    return FrameHandle(std::move(data), std::move(meta));
+    return FrameHandle(std::move(data), meta);
 }
 
 qint64 gpuFrameReadToCpuCount() {

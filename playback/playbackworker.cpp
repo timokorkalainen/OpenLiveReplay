@@ -16,6 +16,9 @@
 #ifdef __APPLE__
 #include "playback/gpu/vtkeepsurfaceimporter.h"
 #endif
+#ifdef _WIN32
+#include "playback/output/win/wingpuimportedge.h"
+#endif
 #endif
 #include <QDebug>
 #include <QMutexLocker>
@@ -26,7 +29,7 @@
 #include <cstring>
 #include <utility>
 
-#if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
+#if defined(OLR_GPU_PIPELINE_BUILD) && (defined(__APPLE__) || defined(_WIN32))
 namespace {
 
 ColorMetadata colorMetadataForNativeTrack(const DecoderTrack* track) {
@@ -646,19 +649,24 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     return (lastVideoPtsMs != INT64_MIN) ? lastVideoPtsMs + frameDurMs() : P;
                 };
 
+                auto& counters = m_counters;
+                auto* outputCache = m_outputCache.get();
+                auto* bufferMutex = &m_bufferMutex;
                 auto commitMediaFrame = [&](FrameHandle mediaFrame, int64_t framePtsMs) -> bool {
                     mediaFrame.metadata().key.ptsMs = framePtsMs;
                     if (!mediaFrame.isPresentable()) return false;
-                    QMutexLocker bufferLocker(&m_bufferMutex);
+                    QMutexLocker bufferLocker(bufferMutex);
                     if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
-                        m_counters.framesDropped++;
-                    if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
-                    m_counters.decodedVideoFrames++;
+                        counters.framesDropped++;
+                    if (outputCache) outputCache->insertVideoFrame(mediaFrame);
+                    counters.decodedVideoFrames++;
                     return true;
                 };
 
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
-                if (m_gpuRhi && m_gpuRhi->isValid()) {
+                auto gpuRhi = m_gpuRhi;
+                auto decodeFence = m_decodeFence;
+                if (gpuRhi && gpuRhi->isValid()) {
                     const int savedDecimateCounter = track->decimateCounter;
                     bool gpuCallback = false;
                     bool gpuInserted = false;
@@ -695,12 +703,12 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         meta.key.height = track->codecHeight;
                         meta.color = colorMetadataForNativeTrack(track);
 
-                        FrameHandle mediaFrame = importVtImageBuffer(imageBuffer, meta, m_gpuRhi);
+                        FrameHandle mediaFrame = importVtImageBuffer(imageBuffer, meta, gpuRhi);
                         if (!mediaFrame.isPresentable()) {
                             gpuFallback = true;
                             return;
                         }
-                        if (m_decodeFence) m_decodeFence->signalDecodeDone();
+                        if (decodeFence) decodeFence->signalDecodeDone();
                         gpuInserted = commitMediaFrame(mediaFrame, framePtsMs);
                         if (!gpuInserted) gpuFallback = true;
                         lastVideoPtsMs = framePtsMs;
@@ -715,6 +723,69 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 
                     track->decimateCounter = savedDecimateCounter;
                     lastVideoPtsMs = INT64_MIN;
+                }
+#endif
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
+                if (gpuPipelineEnabled()) {
+                    if (!m_winGpuImportTried) {
+                        QString importError;
+                        m_winGpuImportEdge = WinGpuImportEdge::create(&importError);
+                        m_winGpuImportTried = true;
+                    }
+                    if (m_winGpuImportEdge && m_winGpuImportEdge->isAvailable()) {
+                        const int savedDecimateCounter = track->decimateCounter;
+                        bool gpuCallback = false;
+                        bool gpuInserted = false;
+                        bool gpuFallback = false;
+                        auto handleSurface = [&](void* mfSample, qint64 /*pts90k*/) {
+                            gpuCallback = true;
+                            bool keep = true;
+                            if (decimate) {
+                                keep = (track->decimateCounter % decimateStep) == 0;
+                                track->decimateCounter++;
+                            }
+                            if (!keep) return;
+
+                            const int64_t framePtsMs = packetPtsMs();
+                            if (dedupTail) {
+                                int64_t nv;
+                                {
+                                    QMutexLocker bufferLocker(&m_bufferMutex);
+                                    nv = track->buffer.newestPts();
+                                }
+                                if (nv >= 0 && framePtsMs <= nv) return;
+                            }
+
+                            if (gpuConsumeInjectedAllocFailure()) {
+                                gpuFallback = true;
+                                return;
+                            }
+
+                            auto imported = m_winGpuImportEdge->tryImport(
+                                mfSample, track->feedIndex, framePtsMs, track->codecWidth,
+                                track->codecHeight);
+                            if (!imported || !imported->isPresentable()) {
+                                gpuFallback = true;
+                                return;
+                            }
+
+                            imported->metadata().color = colorMetadataForNativeTrack(track);
+                            if (m_decodeFence) m_decodeFence->signalDecodeDone();
+                            gpuInserted = commitMediaFrame(*imported, framePtsMs);
+                            if (!gpuInserted) gpuFallback = true;
+                            lastVideoPtsMs = framePtsMs;
+                        };
+
+                        QString gpuError;
+                        const bool decodedSurface =
+                            track->nativeDecoder->decodeKeepSurface(unit, handleSurface, &gpuError);
+                        if (gpuInserted || (decodedSurface && gpuCallback && !gpuFallback)) {
+                            return lastVideoPtsMs;
+                        }
+
+                        track->decimateCounter = savedDecimateCounter;
+                        lastVideoPtsMs = INT64_MIN;
+                    }
                 }
 #endif
 

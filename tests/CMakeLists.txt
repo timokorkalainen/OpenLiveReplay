@@ -258,6 +258,14 @@ else()
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp")
+    if(WIN32)
+        target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/win/d3d11gpusurface.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
+        target_link_libraries(olr_test_playback
+            PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
+    endif()
 endif()
 
 if(OLR_GPU_PIPELINE)

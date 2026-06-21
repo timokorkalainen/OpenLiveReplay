@@ -92,15 +92,8 @@ elseif(NOT WIN32)
 endif()
 olr_add_unit_test(tst_wingpuimportedge olr_test_playback)
 if(WIN32)
-    add_library(olr_test_wingpuimport STATIC
-        "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/output/win/d3d11gpusurface.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
-    target_include_directories(olr_test_wingpuimport PRIVATE
-        "${CMAKE_SOURCE_DIR}" "${OLR_FFMPEG_INCLUDE}")
-    target_link_libraries(olr_test_wingpuimport
-        PUBLIC Qt6::Core Qt6::Gui olr_test_playback
-        PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
+    add_library(olr_test_wingpuimport INTERFACE)
+    target_link_libraries(olr_test_wingpuimport INTERFACE olr_test_playback)
     target_link_libraries(tst_wingpuimportedge PRIVATE olr_test_wingpuimport)
 else()
     add_library(olr_test_wingpuimport STATIC

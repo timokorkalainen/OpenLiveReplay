@@ -5,6 +5,9 @@
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/framehandle.h"
 
+#include <QHash>
+#include <QMutex>
+
 #include <atomic>
 #include <memory>
 
@@ -27,6 +30,8 @@ private:
     FramePixelFormat m_nativeFormat = FramePixelFormat::Nv12;
     quint32 m_telemetryKey = 0;
     mutable std::atomic<int> m_readCount{0};
+    mutable QMutex m_cacheMutex;
+    mutable QHash<int, CpuPlanes> m_cpuCache;
 };
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,

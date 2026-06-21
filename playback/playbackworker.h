@@ -36,6 +36,9 @@ ColorMetadata colorMetadataForAvFrame(const AVFrame* frame);
 
 class DecodeDoneFence;
 class GpuRhiContext;
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
+class WinGpuImportEdge;
+#endif
 
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
@@ -370,6 +373,10 @@ private:
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
     std::shared_ptr<GpuRhiContext> m_gpuRhi;
     std::shared_ptr<DecodeDoneFence> m_decodeFence;
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
+    std::unique_ptr<WinGpuImportEdge> m_winGpuImportEdge;
+    bool m_winGpuImportTried = false;
+#endif
     int m_outputFeedCount = 0;
     int m_outputWidth = 1920;
     int m_outputHeight = 1080;

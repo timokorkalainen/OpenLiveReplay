@@ -65,8 +65,8 @@ QString codecName(NativeVideoCodec codec) {
 
 QString decoderUnavailableMessage(NativeVideoCodec codec) {
     if (codec == NativeVideoCodec::Hevc) {
-        return QStringLiteral(
-            "Windows HEVC decoder is unavailable; install Windows HEVC media support or use FFmpeg fallback");
+        return QStringLiteral("Windows HEVC decoder is unavailable; install Windows HEVC media "
+                              "support or use FFmpeg fallback");
     }
     return QStringLiteral("Media Foundation H.264 decoder is unavailable");
 }
@@ -109,21 +109,26 @@ QByteArray parameterSetKey(NativeVideoCodec codec, const H26xParameterSets& para
     QByteArray key;
     key.append(char(codec == NativeVideoCodec::H264 ? 1 : codec == NativeVideoCodec::Hevc ? 2 : 0));
     if (codec == NativeVideoCodec::H264) {
-        for (const QByteArray& sps : parameterSets.h264Sps) appendParameterSet(&key, sps);
+        for (const QByteArray& sps : parameterSets.h264Sps)
+            appendParameterSet(&key, sps);
         key.append(char(0));
-        for (const QByteArray& pps : parameterSets.h264Pps) appendParameterSet(&key, pps);
+        for (const QByteArray& pps : parameterSets.h264Pps)
+            appendParameterSet(&key, pps);
     } else if (codec == NativeVideoCodec::Hevc) {
-        for (const QByteArray& vps : parameterSets.hevcVps) appendParameterSet(&key, vps);
+        for (const QByteArray& vps : parameterSets.hevcVps)
+            appendParameterSet(&key, vps);
         key.append(char(0));
-        for (const QByteArray& sps : parameterSets.hevcSps) appendParameterSet(&key, sps);
+        for (const QByteArray& sps : parameterSets.hevcSps)
+            appendParameterSet(&key, sps);
         key.append(char(0));
-        for (const QByteArray& pps : parameterSets.hevcPps) appendParameterSet(&key, pps);
+        for (const QByteArray& pps : parameterSets.hevcPps)
+            appendParameterSet(&key, pps);
     }
     return key.size() > 1 ? key : QByteArray();
 }
 
 bool mftAvailable(REFGUID subtype) {
-    MFT_REGISTER_TYPE_INFO input {};
+    MFT_REGISTER_TYPE_INFO input{};
     input.guidMajorType = MFMediaType_Video;
     input.guidSubtype = subtype;
 
@@ -145,7 +150,7 @@ bool mftAvailable(REFGUID subtype) {
 bool d3d11Available(QStringList* detail) {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
-    const std::array<D3D_FEATURE_LEVEL, 4> levels {
+    const std::array<D3D_FEATURE_LEVEL, 4> levels{
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
@@ -153,28 +158,13 @@ bool d3d11Available(QStringList* detail) {
     };
     D3D_FEATURE_LEVEL createdLevel = D3D_FEATURE_LEVEL_10_0;
     HRESULT hr = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-        levels.data(),
-        UINT(levels.size()),
-        D3D11_SDK_VERSION,
-        &device,
-        &createdLevel,
-        &context);
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        levels.data(), UINT(levels.size()), D3D11_SDK_VERSION, &device, &createdLevel, &context);
     if (hr == E_INVALIDARG) {
-        hr = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,
-            D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            levels.data() + 1,
-            UINT(levels.size() - 1),
-            D3D11_SDK_VERSION,
-            &device,
-            &createdLevel,
-            &context);
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                               D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels.data() + 1,
+                               UINT(levels.size() - 1), D3D11_SDK_VERSION, &device, &createdLevel,
+                               &context);
     }
     if (FAILED(hr)) {
         if (detail) {
@@ -207,7 +197,8 @@ bool setVideoFrameSize(IMFMediaType* type, int width, int height, QString* error
     const HRESULT hr = MFSetAttributeSize(type, MF_MT_FRAME_SIZE, UINT32(width), UINT32(height));
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation video frame size setup failed"), hr);
+            *error =
+                hrMessage(QStringLiteral("Media Foundation video frame size setup failed"), hr);
         }
         return false;
     }
@@ -229,13 +220,13 @@ void releaseOutputEvents(MFT_OUTPUT_DATA_BUFFER* output) {
 
 class NativeVideoDecoder::Impl {
 public:
-    Impl(int outputWidth, int outputHeight)
-        : width(outputWidth)
-        , height(outputHeight) {}
+    Impl(int outputWidth, int outputHeight) : width(outputWidth), height(outputHeight) {}
 
     ~Impl();
 
     bool decode(const CompressedAccessUnit& unit, FrameCallback onFrame, QString* error);
+    bool decodeKeepSurface(const CompressedAccessUnit& unit, KeepSurfaceCallback onSurface,
+                           QString* error);
     void reset();
 
 private:
@@ -257,29 +248,29 @@ private:
 
     bool ensureRuntime(QString* error);
     void shutdownRuntime();
-    bool ensureSession(const CompressedAccessUnit& unit, QString* error);
+    bool ensureSession(const CompressedAccessUnit& unit, bool requireD3D, QString* error);
     bool createD3D(QString* error);
     bool createTransform(NativeVideoCodec nextCodec, QString* error);
     bool configureTypes(NativeVideoCodec nextCodec, QString* error);
     bool configureOutputType(QString* error);
-    bool createInputSample(const CompressedAccessUnit& unit, ComPtr<IMFSample>* sample, QString* error);
+    bool createInputSample(const CompressedAccessUnit& unit, ComPtr<IMFSample>* sample,
+                           QString* error);
     bool processInputSample(IMFSample* sample, QString* error);
     bool submitSample(const CompressedAccessUnit& unit, QString* error);
     bool drainSync(FrameCallback& onFrame, qint64 pts90k, QString* error);
+    bool drainSyncSurface(KeepSurfaceCallback& onSurface, qint64 pts90k, QString* error);
     bool decodeAsync(const CompressedAccessUnit& unit, FrameCallback onFrame, QString* error);
-    bool drainReadyAsyncEvents(FrameCallback& onFrame, qint64 pts90k, QString* error);
-    bool handleAsyncEvent(IMFMediaEvent* event,
-                          IMFSample* inputSample,
-                          bool* submittedInput,
-                          FrameCallback& onFrame,
-                          qint64 pts90k,
-                          QString* error);
-    bool processOutputFrame(FrameCallback& onFrame,
-                            qint64 pts90k,
-                            bool allowNeedMoreInput,
-                            bool* needMoreInput,
+    bool decodeAsyncSurface(const CompressedAccessUnit& unit, KeepSurfaceCallback onSurface,
                             QString* error);
-    bool copySampleToFrame(IMFSample* sample, qint64 fallbackPts90k, AVFrame** frame, QString* error);
+    bool drainReadyAsyncEvents(FrameCallback* onFrame, KeepSurfaceCallback* onSurface,
+                               qint64 pts90k, QString* error);
+    bool handleAsyncEvent(IMFMediaEvent* event, IMFSample* inputSample, bool* submittedInput,
+                          FrameCallback* onFrame, KeepSurfaceCallback* onSurface, qint64 pts90k,
+                          QString* error);
+    bool processOutput(FrameCallback* onFrame, KeepSurfaceCallback* onSurface, qint64 pts90k,
+                       bool allowNeedMoreInput, bool* needMoreInput, QString* error);
+    bool copySampleToFrame(IMFSample* sample, qint64 fallbackPts90k, AVFrame** frame,
+                           QString* error);
 };
 
 NativeVideoDecoder::Impl::~Impl() {
@@ -345,7 +336,7 @@ void NativeVideoDecoder::Impl::reset() {
 
 bool NativeVideoDecoder::Impl::createD3D(QString* error) {
     ComPtr<ID3D11DeviceContext> context;
-    const std::array<D3D_FEATURE_LEVEL, 4> levels {
+    const std::array<D3D_FEATURE_LEVEL, 4> levels{
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
@@ -353,28 +344,13 @@ bool NativeVideoDecoder::Impl::createD3D(QString* error) {
     };
     D3D_FEATURE_LEVEL createdLevel = D3D_FEATURE_LEVEL_10_0;
     HRESULT hr = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-        levels.data(),
-        UINT(levels.size()),
-        D3D11_SDK_VERSION,
-        &d3dDevice,
-        &createdLevel,
-        &context);
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        levels.data(), UINT(levels.size()), D3D11_SDK_VERSION, &d3dDevice, &createdLevel, &context);
     if (hr == E_INVALIDARG) {
-        hr = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,
-            D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            levels.data() + 1,
-            UINT(levels.size() - 1),
-            D3D11_SDK_VERSION,
-            &d3dDevice,
-            &createdLevel,
-            &context);
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                               D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels.data() + 1,
+                               UINT(levels.size() - 1), D3D11_SDK_VERSION, &d3dDevice,
+                               &createdLevel, &context);
     }
     if (FAILED(hr)) {
         if (error) {
@@ -386,7 +362,8 @@ bool NativeVideoDecoder::Impl::createD3D(QString* error) {
     hr = MFCreateDXGIDeviceManager(&resetToken, &deviceManager);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation DXGI device manager is unavailable"), hr);
+            *error = hrMessage(
+                QStringLiteral("Media Foundation DXGI device manager is unavailable"), hr);
         }
         return false;
     }
@@ -394,7 +371,8 @@ bool NativeVideoDecoder::Impl::createD3D(QString* error) {
     hr = deviceManager->ResetDevice(d3dDevice.Get(), resetToken);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation DXGI device manager reset failed"), hr);
+            *error =
+                hrMessage(QStringLiteral("Media Foundation DXGI device manager reset failed"), hr);
         }
         return false;
     }
@@ -404,12 +382,13 @@ bool NativeVideoDecoder::Impl::createD3D(QString* error) {
 bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QString* error) {
     if (!isSupportedCodec(nextCodec)) {
         if (error) {
-            *error = QStringLiteral("Media Foundation native decode unsupported codec for this task");
+            *error =
+                QStringLiteral("Media Foundation native decode unsupported codec for this task");
         }
         return false;
     }
 
-    std::array<GUID, 2> inputSubtypes {};
+    std::array<GUID, 2> inputSubtypes{};
     int inputSubtypeCount = 0;
     if (nextCodec == NativeVideoCodec::H264) {
         inputSubtypes[inputSubtypeCount++] = MFVideoFormat_H264;
@@ -425,7 +404,7 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
     HRESULT hr = S_OK;
     HRESULT firstFailure = S_OK;
     for (int i = 0; i < inputSubtypeCount; ++i) {
-        MFT_REGISTER_TYPE_INFO input {};
+        MFT_REGISTER_TYPE_INFO input{};
         input.guidMajorType = MFMediaType_Video;
         input.guidSubtype = inputSubtypes[i];
 
@@ -449,7 +428,9 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
             if (nextCodec == NativeVideoCodec::Hevc) {
                 *error = decoderUnavailableMessage(nextCodec);
             } else if (FAILED(firstFailure)) {
-                *error = hrMessage(QStringLiteral("Media Foundation H.264 decoder enumeration failed"), firstFailure);
+                *error =
+                    hrMessage(QStringLiteral("Media Foundation H.264 decoder enumeration failed"),
+                              firstFailure);
             } else {
                 *error = decoderUnavailableMessage(nextCodec);
             }
@@ -461,9 +442,9 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
     releaseActivations(activates, count);
     if (FAILED(hr) || !transform) {
         if (error) {
-            *error = hrMessage(
-                QStringLiteral("Media Foundation %1 decoder activation failed").arg(codecName(nextCodec)),
-                hr);
+            *error = hrMessage(QStringLiteral("Media Foundation %1 decoder activation failed")
+                                   .arg(codecName(nextCodec)),
+                               hr);
         }
         return false;
     }
@@ -477,21 +458,25 @@ bool NativeVideoDecoder::Impl::createTransform(NativeVideoCodec nextCodec, QStri
     if (asyncTransform) {
         if (!attributes) {
             if (error) {
-                *error = QStringLiteral("Media Foundation async decoder attributes are unavailable");
+                *error =
+                    QStringLiteral("Media Foundation async decoder attributes are unavailable");
             }
             return false;
         }
         hr = transform.As(&eventGenerator);
         if (FAILED(hr) || !eventGenerator) {
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation async decoder event generator is unavailable"), hr);
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async decoder event generator is unavailable"),
+                    hr);
             }
             return false;
         }
         hr = attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
         if (FAILED(hr)) {
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation async decoder unlock failed"), hr);
+                *error =
+                    hrMessage(QStringLiteral("Media Foundation async decoder unlock failed"), hr);
             }
             return false;
         }
@@ -540,7 +525,8 @@ bool NativeVideoDecoder::Impl::configureOutputType(QString* error) {
     hr = transform->SetOutputType(0, outputType.Get(), 0);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation NV12 output type setup failed"), hr);
+            *error =
+                hrMessage(QStringLiteral("Media Foundation NV12 output type setup failed"), hr);
         }
         return false;
     }
@@ -557,9 +543,10 @@ bool NativeVideoDecoder::Impl::configureTypes(NativeVideoCodec nextCodec, QStrin
         return false;
     }
 
-    const GUID inputSubtype = hasSelectedInputSubtype
-        ? selectedInputSubtype
-        : (nextCodec == NativeVideoCodec::H264 ? MFVideoFormat_H264 : OLR_MFVideoFormat_HEVC);
+    const GUID inputSubtype =
+        hasSelectedInputSubtype
+            ? selectedInputSubtype
+            : (nextCodec == NativeVideoCodec::H264 ? MFVideoFormat_H264 : OLR_MFVideoFormat_HEVC);
     hr = inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     if (SUCCEEDED(hr)) {
         hr = inputType->SetGUID(MF_MT_SUBTYPE, inputSubtype);
@@ -580,9 +567,9 @@ bool NativeVideoDecoder::Impl::configureTypes(NativeVideoCodec nextCodec, QStrin
     hr = transform->SetInputType(0, inputType.Get(), 0);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(
-                QStringLiteral("Media Foundation %1 input type setup failed").arg(codecName(nextCodec)),
-                hr);
+            *error = hrMessage(QStringLiteral("Media Foundation %1 input type setup failed")
+                                   .arg(codecName(nextCodec)),
+                               hr);
         }
         return false;
     }
@@ -604,22 +591,25 @@ bool NativeVideoDecoder::Impl::configureTypes(NativeVideoCodec nextCodec, QStrin
     return true;
 }
 
-bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, QString* error) {
+bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, bool requireD3D,
+                                             QString* error) {
     if (!isSupportedCodec(unit.codec)) {
         if (error) {
-            *error = QStringLiteral("Media Foundation native decode unsupported codec for this task");
+            *error =
+                QStringLiteral("Media Foundation native decode unsupported codec for this task");
         }
         return false;
     }
 
     const QByteArray nextKey = parameterSetKey(unit.codec, unit.parameterSets);
-    if (transform && unit.codec == codec && (nextKey.isEmpty() || nextKey == activeParameterSetKey)) {
+    if (transform && unit.codec == codec && (!requireD3D || deviceManager) &&
+        (nextKey.isEmpty() || nextKey == activeParameterSetKey)) {
         return true;
     }
 
     reset();
     if (!ensureRuntime(error) ||
-        (environmentFlagEnabled("OLR_MF_VIDEO_ENABLE_D3D") && !createD3D(error)) ||
+        ((requireD3D || environmentFlagEnabled("OLR_MF_VIDEO_ENABLE_D3D")) && !createD3D(error)) ||
         !createTransform(unit.codec, error) || !configureTypes(unit.codec, error)) {
         reset();
         return false;
@@ -631,8 +621,7 @@ bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, Q
 }
 
 bool NativeVideoDecoder::Impl::createInputSample(const CompressedAccessUnit& unit,
-                                                  ComPtr<IMFSample>* sample,
-                                                  QString* error) {
+                                                 ComPtr<IMFSample>* sample, QString* error) {
     if (!sample) {
         if (error) {
             *error = QStringLiteral("Media Foundation input sample setup failed");
@@ -641,7 +630,8 @@ bool NativeVideoDecoder::Impl::createInputSample(const CompressedAccessUnit& uni
     }
     if (unit.annexB.isEmpty()) {
         if (error) {
-            *error = QStringLiteral("Media Foundation native decoder received an empty access unit");
+            *error =
+                QStringLiteral("Media Foundation native decoder received an empty access unit");
         }
         return false;
     }
@@ -668,7 +658,8 @@ bool NativeVideoDecoder::Impl::createInputSample(const CompressedAccessUnit& uni
     hr = buffer->SetCurrentLength(DWORD(unit.annexB.size()));
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation input buffer length setup failed"), hr);
+            *error =
+                hrMessage(QStringLiteral("Media Foundation input buffer length setup failed"), hr);
         }
         return false;
     }
@@ -695,9 +686,9 @@ bool NativeVideoDecoder::Impl::processInputSample(IMFSample* sample, QString* er
     const HRESULT hr = transform->ProcessInput(0, sample, 0);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(
-                QStringLiteral("Media Foundation %1 frame decode input failed").arg(codecName(codec)),
-                hr);
+            *error = hrMessage(QStringLiteral("Media Foundation %1 frame decode input failed")
+                                   .arg(codecName(codec)),
+                               hr);
         }
         return false;
     }
@@ -709,21 +700,19 @@ bool NativeVideoDecoder::Impl::submitSample(const CompressedAccessUnit& unit, QS
     return createInputSample(unit, &sample, error) && processInputSample(sample.Get(), error);
 }
 
-bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample,
-                                                  qint64 fallbackPts90k,
-                                                  AVFrame** frame,
-                                                  QString* error) {
+bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample, qint64 fallbackPts90k,
+                                                 AVFrame** frame, QString* error) {
     if (!sample || !frame) {
         if (error) {
-            *error = QStringLiteral("Media Foundation decoded a frame but output buffer copy failed");
+            *error =
+                QStringLiteral("Media Foundation decoded a frame but output buffer copy failed");
         }
         return false;
     }
 
     LONGLONG sampleTime = 0;
-    const qint64 framePts = SUCCEEDED(sample->GetSampleTime(&sampleTime))
-        ? mfTimeToPts90k(sampleTime)
-        : fallbackPts90k;
+    const qint64 framePts =
+        SUCCEEDED(sample->GetSampleTime(&sampleTime)) ? mfTimeToPts90k(sampleTime) : fallbackPts90k;
 
     ComPtr<IMFMediaBuffer> firstBuffer;
     if (SUCCEEDED(sample->GetBufferByIndex(0, &firstBuffer))) {
@@ -733,26 +722,16 @@ bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample,
             LONG pitch = 0;
             BYTE* bufferStart = nullptr;
             DWORD bufferLength = 0;
-            const HRESULT hr = buffer2d->Lock2DSize(
-                MF2DBuffer_LockFlags_Read,
-                &scanline0,
-                &pitch,
-                &bufferStart,
-                &bufferLength);
+            const HRESULT hr = buffer2d->Lock2DSize(MF2DBuffer_LockFlags_Read, &scanline0, &pitch,
+                                                    &bufferStart, &bufferLength);
             if (SUCCEEDED(hr)) {
                 if (pitch > 0) {
                     const DWORD requiredLength = DWORD(pitch * height + pitch * (height / 2));
-                    if (scanline0 && bufferStart
-                        && scanline0 >= bufferStart
-                        && bufferLength >= requiredLength
-                        && scanline0 + requiredLength <= bufferStart + bufferLength) {
+                    if (scanline0 && bufferStart && scanline0 >= bufferStart &&
+                        bufferLength >= requiredLength &&
+                        scanline0 + requiredLength <= bufferStart + bufferLength) {
                         *frame = nativeCopyNv12ToYuv420p(
-                            scanline0,
-                            pitch,
-                            scanline0 + pitch * height,
-                            pitch,
-                            width,
-                            height);
+                            scanline0, pitch, scanline0 + pitch * height, pitch, width, height);
                     }
                 }
                 buffer2d->Unlock2D();
@@ -772,13 +751,8 @@ bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample,
         hr = contiguous->Lock(&data, nullptr, &currentLength);
         if (SUCCEEDED(hr)) {
             if (currentLength >= DWORD(width * height + width * (height / 2))) {
-                *frame = nativeCopyNv12ToYuv420p(
-                    data,
-                    width,
-                    data + width * height,
-                    width,
-                    width,
-                    height);
+                *frame = nativeCopyNv12ToYuv420p(data, width, data + width * height, width, width,
+                                                 height);
             }
             contiguous->Unlock();
             if (*frame) {
@@ -794,20 +768,25 @@ bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample,
     return false;
 }
 
-bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
-                                                  qint64 pts90k,
-                                                  bool allowNeedMoreInput,
-                                                  bool* needMoreInput,
-                                                  QString* error) {
+bool NativeVideoDecoder::Impl::processOutput(FrameCallback* onFrame, KeepSurfaceCallback* onSurface,
+                                             qint64 pts90k, bool allowNeedMoreInput,
+                                             bool* needMoreInput, QString* error) {
     if (needMoreInput) {
         *needMoreInput = false;
     }
+    if (!onFrame && !onSurface) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation decode requires an output callback");
+        }
+        return false;
+    }
     while (true) {
-        MFT_OUTPUT_STREAM_INFO streamInfo {};
+        MFT_OUTPUT_STREAM_INFO streamInfo{};
         HRESULT hr = transform->GetOutputStreamInfo(0, &streamInfo);
         if (FAILED(hr)) {
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation output stream info query failed"), hr);
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation output stream info query failed"), hr);
             }
             return false;
         }
@@ -815,9 +794,8 @@ bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
         ComPtr<IMFSample> providedSample;
         if (shouldProvideOutputSample(streamInfo)) {
             ComPtr<IMFMediaBuffer> outputBuffer;
-            const DWORD outputSize = std::max<DWORD>(
-                streamInfo.cbSize,
-                DWORD(width * height + width * (height / 2)));
+            const DWORD outputSize =
+                std::max<DWORD>(streamInfo.cbSize, DWORD(width * height + width * (height / 2)));
             hr = MFCreateSample(&providedSample);
             if (SUCCEEDED(hr)) {
                 hr = MFCreateMemoryBuffer(outputSize, &outputBuffer);
@@ -827,13 +805,14 @@ bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
             }
             if (FAILED(hr)) {
                 if (error) {
-                    *error = hrMessage(QStringLiteral("Media Foundation output sample allocation failed"), hr);
+                    *error = hrMessage(
+                        QStringLiteral("Media Foundation output sample allocation failed"), hr);
                 }
                 return false;
             }
         }
 
-        MFT_OUTPUT_DATA_BUFFER output {};
+        MFT_OUTPUT_DATA_BUFFER output{};
         output.dwStreamID = 0;
         output.pSample = providedSample.Get();
         DWORD status = 0;
@@ -848,7 +827,10 @@ bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
                 return true;
             }
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation async decoder unexpectedly requested input from output"), hr);
+                *error = hrMessage(
+                    QStringLiteral(
+                        "Media Foundation async decoder unexpectedly requested input from output"),
+                    hr);
             }
             return false;
         }
@@ -869,9 +851,9 @@ bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
         if (FAILED(hr)) {
             releaseOutputEvents(&output);
             if (error) {
-                *error = hrMessage(
-                    QStringLiteral("Media Foundation %1 frame decode output failed").arg(codecName(codec)),
-                    hr);
+                *error = hrMessage(QStringLiteral("Media Foundation %1 frame decode output failed")
+                                       .arg(codecName(codec)),
+                                   hr);
             }
             return false;
         }
@@ -885,11 +867,20 @@ bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
         }
         releaseOutputEvents(&output);
 
+        if (onSurface) {
+            LONGLONG sampleTime = 0;
+            const qint64 framePts = SUCCEEDED(completedSample->GetSampleTime(&sampleTime))
+                                        ? mfTimeToPts90k(sampleTime)
+                                        : pts90k;
+            (*onSurface)(completedSample.Get(), framePts);
+            return true;
+        }
+
         AVFrame* frame = nullptr;
         if (!copySampleToFrame(completedSample.Get(), pts90k, &frame, error)) {
             return false;
         }
-        onFrame(frame);
+        (*onFrame)(frame);
         return true;
     }
 }
@@ -897,7 +888,7 @@ bool NativeVideoDecoder::Impl::processOutputFrame(FrameCallback& onFrame,
 bool NativeVideoDecoder::Impl::drainSync(FrameCallback& onFrame, qint64 pts90k, QString* error) {
     while (true) {
         bool needMoreInput = false;
-        if (!processOutputFrame(onFrame, pts90k, true, &needMoreInput, error)) {
+        if (!processOutput(&onFrame, nullptr, pts90k, true, &needMoreInput, error)) {
             return false;
         }
         if (needMoreInput) {
@@ -906,17 +897,29 @@ bool NativeVideoDecoder::Impl::drainSync(FrameCallback& onFrame, qint64 pts90k, 
     }
 }
 
-bool NativeVideoDecoder::Impl::handleAsyncEvent(IMFMediaEvent* event,
-                                                 IMFSample* inputSample,
-                                                 bool* submittedInput,
-                                                 FrameCallback& onFrame,
-                                                 qint64 pts90k,
-                                                 QString* error) {
+bool NativeVideoDecoder::Impl::drainSyncSurface(KeepSurfaceCallback& onSurface, qint64 pts90k,
+                                                QString* error) {
+    while (true) {
+        bool needMoreInput = false;
+        if (!processOutput(nullptr, &onSurface, pts90k, true, &needMoreInput, error)) {
+            return false;
+        }
+        if (needMoreInput) {
+            return true;
+        }
+    }
+}
+
+bool NativeVideoDecoder::Impl::handleAsyncEvent(IMFMediaEvent* event, IMFSample* inputSample,
+                                                bool* submittedInput, FrameCallback* onFrame,
+                                                KeepSurfaceCallback* onSurface, qint64 pts90k,
+                                                QString* error) {
     MediaEventType eventType = MediaEventType(0);
     HRESULT hr = event->GetType(&eventType);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation async decoder event type query failed"), hr);
+            *error = hrMessage(
+                QStringLiteral("Media Foundation async decoder event type query failed"), hr);
         }
         return false;
     }
@@ -925,13 +928,15 @@ bool NativeVideoDecoder::Impl::handleAsyncEvent(IMFMediaEvent* event,
     hr = event->GetStatus(&eventStatus);
     if (FAILED(hr)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation async decoder event status query failed"), hr);
+            *error = hrMessage(
+                QStringLiteral("Media Foundation async decoder event status query failed"), hr);
         }
         return false;
     }
     if (FAILED(eventStatus)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation async decoder event failed"), eventStatus);
+            *error = hrMessage(QStringLiteral("Media Foundation async decoder event failed"),
+                               eventStatus);
         }
         return false;
     }
@@ -950,7 +955,7 @@ bool NativeVideoDecoder::Impl::handleAsyncEvent(IMFMediaEvent* event,
 
     if (eventType == METransformHaveOutput) {
         bool needMoreInput = false;
-        return processOutputFrame(onFrame, pts90k, false, &needMoreInput, error);
+        return processOutput(onFrame, onSurface, pts90k, false, &needMoreInput, error);
     }
 
     if (eventType == METransformDrainComplete || eventType == METransformMarker) {
@@ -960,9 +965,9 @@ bool NativeVideoDecoder::Impl::handleAsyncEvent(IMFMediaEvent* event,
     return true;
 }
 
-bool NativeVideoDecoder::Impl::drainReadyAsyncEvents(FrameCallback& onFrame,
-                                                      qint64 pts90k,
-                                                      QString* error) {
+bool NativeVideoDecoder::Impl::drainReadyAsyncEvents(FrameCallback* onFrame,
+                                                     KeepSurfaceCallback* onSurface, qint64 pts90k,
+                                                     QString* error) {
     while (true) {
         ComPtr<IMFMediaEvent> event;
         const HRESULT hr = eventGenerator->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
@@ -971,20 +976,21 @@ bool NativeVideoDecoder::Impl::drainReadyAsyncEvents(FrameCallback& onFrame,
         }
         if (FAILED(hr)) {
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation async decoder event query failed"), hr);
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async decoder event query failed"), hr);
             }
             return false;
         }
 
         bool submittedInput = true;
-        if (!handleAsyncEvent(event.Get(), nullptr, &submittedInput, onFrame, pts90k, error)) {
+        if (!handleAsyncEvent(event.Get(), nullptr, &submittedInput, onFrame, onSurface, pts90k,
+                              error)) {
             return false;
         }
     }
 }
 
-bool NativeVideoDecoder::Impl::decodeAsync(const CompressedAccessUnit& unit,
-                                           FrameCallback onFrame,
+bool NativeVideoDecoder::Impl::decodeAsync(const CompressedAccessUnit& unit, FrameCallback onFrame,
                                            QString* error) {
     ComPtr<IMFSample> sample;
     if (!createInputSample(unit, &sample, error)) {
@@ -1005,28 +1011,64 @@ bool NativeVideoDecoder::Impl::decodeAsync(const CompressedAccessUnit& unit,
         const HRESULT hr = eventGenerator->GetEvent(0, &event);
         if (FAILED(hr)) {
             if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation async decoder event query failed"), hr);
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async decoder event query failed"), hr);
             }
             return false;
         }
-        if (!handleAsyncEvent(event.Get(), sample.Get(), &submittedInput, onFrame, unit.pts90k, error)) {
+        if (!handleAsyncEvent(event.Get(), sample.Get(), &submittedInput, &onFrame, nullptr,
+                              unit.pts90k, error)) {
             return false;
         }
     }
 
-    return drainReadyAsyncEvents(onFrame, unit.pts90k, error);
+    return drainReadyAsyncEvents(&onFrame, nullptr, unit.pts90k, error);
 }
 
-bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
-                                       FrameCallback onFrame,
-                                       QString* error) {
+bool NativeVideoDecoder::Impl::decodeAsyncSurface(const CompressedAccessUnit& unit,
+                                                  KeepSurfaceCallback onSurface, QString* error) {
+    ComPtr<IMFSample> sample;
+    if (!createInputSample(unit, &sample, error)) {
+        return false;
+    }
+
+    bool submittedInput = false;
+    if (asyncNeedInputEvents > 0) {
+        --asyncNeedInputEvents;
+        if (!processInputSample(sample.Get(), error)) {
+            return false;
+        }
+        submittedInput = true;
+    }
+
+    while (!submittedInput) {
+        ComPtr<IMFMediaEvent> event;
+        const HRESULT hr = eventGenerator->GetEvent(0, &event);
+        if (FAILED(hr)) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation async decoder event query failed"), hr);
+            }
+            return false;
+        }
+        if (!handleAsyncEvent(event.Get(), sample.Get(), &submittedInput, nullptr, &onSurface,
+                              unit.pts90k, error)) {
+            return false;
+        }
+    }
+
+    return drainReadyAsyncEvents(nullptr, &onSurface, unit.pts90k, error);
+}
+
+bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit, FrameCallback onFrame,
+                                      QString* error) {
     if (!onFrame) {
         if (error) {
             *error = QStringLiteral("Media Foundation decode requires a frame callback");
         }
         return false;
     }
-    if (!ensureSession(unit, error)) {
+    if (!ensureSession(unit, false, error)) {
         return false;
     }
     if (asyncTransform) {
@@ -1038,6 +1080,26 @@ bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
     return drainSync(onFrame, unit.pts90k, error);
 }
 
+bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& unit,
+                                                 KeepSurfaceCallback onSurface, QString* error) {
+    if (!onSurface) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation keep-surface decode requires a callback");
+        }
+        return false;
+    }
+    if (!ensureSession(unit, true, error)) {
+        return false;
+    }
+    if (asyncTransform) {
+        return decodeAsyncSurface(unit, std::move(onSurface), error);
+    }
+    if (!submitSample(unit, error)) {
+        return false;
+    }
+    return drainSyncSurface(onSurface, unit.pts90k, error);
+}
+
 NativeVideoDecoder::NativeVideoDecoder(int outputWidth, int outputHeight)
     : m_impl(new Impl(outputWidth, outputHeight)) {}
 
@@ -1045,10 +1107,14 @@ NativeVideoDecoder::~NativeVideoDecoder() {
     delete m_impl;
 }
 
-bool NativeVideoDecoder::decode(const CompressedAccessUnit& unit,
-                                 FrameCallback onFrame,
-                                 QString* error) {
+bool NativeVideoDecoder::decode(const CompressedAccessUnit& unit, FrameCallback onFrame,
+                                QString* error) {
     return m_impl->decode(unit, std::move(onFrame), error);
+}
+
+bool NativeVideoDecoder::decodeKeepSurface(const CompressedAccessUnit& unit,
+                                           KeepSurfaceCallback onSurface, QString* error) {
+    return m_impl->decodeKeepSurface(unit, std::move(onSurface), error);
 }
 
 void NativeVideoDecoder::reset() {

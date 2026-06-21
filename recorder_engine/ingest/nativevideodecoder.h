@@ -21,7 +21,7 @@ struct NativeVideoDecodeCapabilities {
 class NativeVideoDecoder {
 public:
     using FrameCallback = std::function<void(AVFrame*)>;
-    using KeepSurfaceCallback = std::function<void(void* cvImageBufferRef, qint64 pts90k)>;
+    using KeepSurfaceCallback = std::function<void(void* nativeDecodedImage, qint64 pts90k)>;
 
     NativeVideoDecoder(int outputWidth, int outputHeight);
     ~NativeVideoDecoder();
@@ -30,7 +30,7 @@ public:
     NativeVideoDecoder& operator=(const NativeVideoDecoder&) = delete;
 
     bool decode(const CompressedAccessUnit& unit, FrameCallback onFrame, QString* error);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
     bool decodeKeepSurface(const CompressedAccessUnit& unit, KeepSurfaceCallback onSurface,
                            QString* error);
 #else
