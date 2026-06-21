@@ -76,9 +76,11 @@ By default it starts `ndi_runtime_sender`, a local sender that uses the app's ow
 runtime-loaded `NdiOutputSink`; set `OLR_NDI_TEST_SOURCE='Studio (CAM1)'` only
 when you intentionally want to test an external source instead.
 
-`native-rtmp` mirrors the applicable SRT transport gates: one-source RTMP/RTMPS
-smoke, 4-source routing, 4-source sync, per-source trim, and live/dead
-connection count.
+`native-rtmp` currently covers one-source RTMP/RTMPS smoke, HEVC/E-RTMP,
+unsupported-profile rejection, reconnect/stall behavior, UI stats, optional
+real-server interop, and opt-in soak. The SRT-style 4-source routing, sync,
+trim, and live/dead connection-count gates do not currently have RTMP
+equivalents.
 
 Native RTMP/RTMPS is the default ingest path. The legacy FFmpeg RTMP path is no
 longer selected for RTMP/RTMPS when the native backend is available.
@@ -192,18 +194,18 @@ cmake --build build/ios-prepush --config Debug -- \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 ```
 
-The optional [`.githooks/pre-push`](../.githooks/pre-push) hook surfaces this
-reminder at push time without blocking — it just prints the recommendation and
-lets the push through. Enable it once per clone:
+The [`.githooks/pre-push`](../.githooks/pre-push) hook is the same always-on
+blocking delivery gate described above. Enable it once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-If you want the hook to actually run the full gate + iOS build as a one-off
-**blocking** check, opt in with `OLR_PREPUSH_FULL=1 git push` (within that, skip
-a part with `SKIP_FULL_TESTS=1` or `SKIP_IOS_BUILD=1`; if no Qt iOS kit is found
-the iOS part skips and the push proceeds after the CTest gate passes).
+The default hook builds the host and runs `ctest -L delivery-gate`. Set
+`OLR_PREPUSH_FULL=1` to additionally run the full local CTest matrix + iOS build
+(within that, skip a part with `SKIP_FULL_TESTS=1` or `SKIP_IOS_BUILD=1`; if no
+Qt iOS kit is found the iOS part skips and the push proceeds after the CTest
+gate passes).
 
 The iOS FFmpeg slice uses SecureTransport for TLS/RTMPS and builds libsrt
 without OpenSSL/mbedTLS encryption support. Encrypted native SRT is intentionally

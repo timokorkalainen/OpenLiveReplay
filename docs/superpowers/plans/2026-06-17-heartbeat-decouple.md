@@ -19,7 +19,7 @@
 - App target source list: `CMakeLists.txt:82` (`recorder_engine/replaymanager.cpp ...`).
 - `olr_test_core` source list: `tests/CMakeLists.txt` (the `qt_add_library(olr_test_core STATIC ...)` block, first entry `recorder_engine/recordingclock.cpp`). `olr_test_engine` links `olr_test_core` PUBLIC, so it inherits the helper transitively.
 - Unit-test registration: `tests/unit/CMakeLists.txt` uses `olr_add_unit_test(name lib)`.
-- The codebase uses **global free functions** (no namespace) for helpers like `selectIngestBackend`, `srtHealth`, `augmentSrtUrl`.
+- The codebase uses **global free functions** (no namespace) for helpers like `selectIngestBackend`, `srtHealth`, `jitterWindowMs`.
 
 ---
 

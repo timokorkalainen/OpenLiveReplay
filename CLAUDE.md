@@ -78,9 +78,11 @@ python3 "$GCF" --binary "$CF"        --commit origin/main -- '*.cpp' '*.h'   # a
 - After a PR merges, fetch and confirm the commits are on `main`
   (`git merge-base --is-ancestor <sha> origin/main`). Don't push to a branch whose
   PR has already merged — open a new PR instead.
-- The pre-push hook runs the full test suite and an iOS build. In a non-interactive
-  context, push with `--no-verify` and rely on CI, using gh's git credential helper
-  for authentication:
+- The pre-push hook runs the blocking delivery gate by default. Set
+  `OLR_PREPUSH_FULL=1` when you intentionally want the full local CTest matrix
+  plus iOS build. In a non-interactive context, push with `--no-verify` only when
+  the local gate cannot run and rely on CI plus the relevant manual verification,
+  using gh's git credential helper for authentication:
 
   ```sh
   git -c credential.helper= -c credential.helper='!gh auth git-credential' \

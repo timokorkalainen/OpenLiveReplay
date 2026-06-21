@@ -17,7 +17,7 @@ Provide a reliable, low-latency platform for recording and replaying multiple ca
 **Key features:**
 - Multi-track synchronized recording (video only)
 - Low-latency ingest and replay pipeline
-- Support for SRT and RMPT streams, local recording and screenshotting
+- Support for SRT and RTMP streams, local recording and screenshotting
 - MIDI controller support, tested with Behringer X-Touch One
 
 Getting started
@@ -69,9 +69,9 @@ ctest --test-dir build --output-on-failure   # unit + smoke + e2e
 - **Sanitizers**: add `-DOLR_SANITIZER="address;undefined"` (or `thread`).
 - **Formatting/linting**: `.clang-format`, `.editorconfig`, `.clang-tidy`.
 - **CI**: `.github/workflows/ci.yml` (build+test, lint, sanitizers). iOS and the
-  full E2E matrix are *recommended* to build/run locally before pushing (not CI,
-  not forced); an optional pre-push hook surfaces the reminder — enable with
-  `git config core.hooksPath .githooks`. See [`tests/README.md`](tests/README.md).
+  full E2E matrix are kept local; enabling `.githooks/pre-push` runs the blocking
+  delivery gate by default, with `OLR_PREPUSH_FULL=1` adding the full local CTest
+  matrix and iOS build. See [`tests/README.md`](tests/README.md).
 
 See [`tests/README.md`](tests/README.md) for full details.
 
