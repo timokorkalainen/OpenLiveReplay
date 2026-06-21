@@ -170,6 +170,7 @@ qt_add_qml_module(OpenLiveReplay
         MultiviewWindow.qml
         CodecSettingsPanel.qml
         ui/components/BindingsPanel.qml
+        ui/components/ConfigDrawer.qml
         ui/components/OutputsPanel.qml
         ui/components/PgmStage.qml
         ui/components/ProjectSettingsPanel.qml

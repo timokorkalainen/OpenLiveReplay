@@ -20,6 +20,7 @@ if(OLR_QMLLINT)
         "${CMAKE_SOURCE_DIR}/MultiviewWindow.qml"
         "${CMAKE_SOURCE_DIR}/CodecSettingsPanel.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/BindingsPanel.qml"
+        "${CMAKE_SOURCE_DIR}/ui/components/ConfigDrawer.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/OutputsPanel.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/PgmStage.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/ProjectSettingsPanel.qml"
