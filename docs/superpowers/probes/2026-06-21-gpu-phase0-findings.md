@@ -35,6 +35,29 @@ default and reference throughout.
   `gpu-abstraction` should pre-warm or keep a fallback session for geometry
   changes.
 
+## P0.2 — Windows MF→ID3D11Texture2D import + RHI D3D backend (gates D4 fence primitive)
+
+- **Question (§11 Q2):** does the Windows import edge have a GPU-resident,
+  RHI-importable D3D texture precondition, and which Qt RHI D3D backend fixes
+  the matching fence primitive?
+- **Method:** `tests/probes/rhi_d3d_probe.cpp` is a Windows-only probe behind
+  `OLR_BUILD_GPU_PROBES=ON`. It reports D3D11/D3D12 QRhi availability, wraps a
+  synthetic `ID3D11Texture2D` owned by the QRhi device through
+  `QRhiTexture::createFrom`, and prints the chosen backend. The real
+  MediaFoundation decoder-to-D3D texture binding remains the `gpu-import-win`
+  Phase-2 slice; this probe proves the QRhi↔D3D11 import precondition and
+  backend selection.
+- **Result (macOS host):** off-Windows guard PASS. `cmake --build build/c
+  --target rhi_d3d_probe` reports `ninja: error: unknown target
+  'rhi_d3d_probe'`, so the probe is not linked into non-Windows builds.
+- **Result (Windows runner):** captured by the Windows CI/manual runner via
+  `cmake --build build/c --target rhi_d3d_probe` and
+  `./build/c/tests/probes/rhi_d3d_probe`.
+- **Decision (D4):** CI-gated until the Windows run records the chosen backend.
+  If D3D11 is chosen, `gpu-sync` uses ID3D11Fence (11.4) /
+  keyed-mutex / ID3D11Query rather than assuming D3D12 fences. If D3D12 is
+  chosen, `gpu-sync` uses ID3D12Fence.
+
 ## P0.3 — RHI per-frame overhead on import→composite→readback (gates D1/D11)
 
 - **Question (§11 Q3):** is RHI per-frame overhead within the <0.5 ms budget on
