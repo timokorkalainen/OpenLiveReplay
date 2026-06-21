@@ -628,6 +628,30 @@ set_tests_properties(e2e_native_ndi_smoke PROPERTIES
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
 
+# Mid-record disconnect/reconnect survival: two local NDI senders (control +
+# victim), kill+restart the victim, assert conn_events up->down->up, control
+# isolation, and pre-kill + post-reconnect content. Drives sync_harness for the
+# per-source connection-event telemetry.
+add_test(NAME e2e_native_ndi_reconnect
+    COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_reconnect.sh"
+        "$<TARGET_FILE:sync_harness>" "$<TARGET_FILE:ndi_runtime_sender>")
+set_tests_properties(e2e_native_ndi_reconnect PROPERTIES
+    LABELS "native-ndi"
+    TIMEOUT 240
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
+# Long-run stability soak: a single native NDI source recorded for ~30s must not
+# crash/hang and must keep delivering content (no mid-run stall / silent freeze).
+add_test(NAME e2e_native_ndi_soak
+    COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_soak.sh"
+        "$<TARGET_FILE:sync_harness>" "$<TARGET_FILE:ndi_runtime_sender>")
+set_tests_properties(e2e_native_ndi_soak PROPERTIES
+    LABELS "native-ndi"
+    TIMEOUT 120
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77)
+
 # --- Local-only native RTMP e2e (NOT in CI) --------------------------------
 # This test uses a deterministic Python RTMP fixture server and requires the
 # native backend marker in the harness log, so a successful FFmpeg fallback is
