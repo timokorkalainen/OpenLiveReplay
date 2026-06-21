@@ -102,6 +102,41 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(rtmidi)
 
+# Qt location: explicit configuration always wins. Only when nothing points at a
+# Qt kit do we auto-detect the standard installer / Homebrew locations, so a
+# fresh `cmake` (or VS Code CMake Tools in presets mode, which bypasses kits and
+# cmake.configureSettings) just works on any machine. CI and build-scripts/*
+# always export QT_ROOT_DIR / OLR_QT_ROOT, so this fallback never fires for them.
+if(NOT CMAKE_PREFIX_PATH AND NOT DEFINED ENV{CMAKE_PREFIX_PATH})
+    if(DEFINED ENV{OLR_QT_ROOT} AND NOT "$ENV{OLR_QT_ROOT}" STREQUAL "")
+        list(APPEND CMAKE_PREFIX_PATH "$ENV{OLR_QT_ROOT}")
+    elseif(DEFINED ENV{QT_ROOT_DIR} AND NOT "$ENV{QT_ROOT_DIR}" STREQUAL "")
+        list(APPEND CMAKE_PREFIX_PATH "$ENV{QT_ROOT_DIR}")
+    else()
+        set(_olr_qt_candidates "")
+        if(APPLE)
+            file(GLOB _olr_qt_candidates "$ENV{HOME}/Qt/6.*/macos")
+            list(APPEND _olr_qt_candidates "/opt/homebrew/opt/qt" "/usr/local/opt/qt")
+        elseif(WIN32)
+            file(GLOB _olr_qt_candidates
+                "$ENV{USERPROFILE}/Qt/6.*/mingw_*"
+                "$ENV{USERPROFILE}/Qt/6.*/msvc*")
+        else()
+            file(GLOB _olr_qt_candidates "$ENV{HOME}/Qt/6.*/gcc_64")
+        endif()
+        # Prefer the newest Qt (natural version order so 6.10 > 6.9).
+        list(SORT _olr_qt_candidates COMPARE NATURAL ORDER DESCENDING)
+        foreach(_olr_qt_dir IN LISTS _olr_qt_candidates)
+            if(IS_DIRECTORY "${_olr_qt_dir}")
+                list(APPEND CMAKE_PREFIX_PATH "${_olr_qt_dir}")
+                message(STATUS "OpenLiveReplay: auto-detected Qt kit at ${_olr_qt_dir}")
+                break()
+            endif()
+        endforeach()
+        unset(_olr_qt_candidates)
+    endif()
+endif()
+
 # 1. Find Qt
 find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network WebSockets)
 qt_standard_project_setup(REQUIRES 6.8)

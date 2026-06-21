@@ -6,7 +6,6 @@ macos_build/
 windows_build/
 *.qmlls.ini
 qmllint.ini
-launch.json
 *.cache/
 
 # C++ objects and libs
@@ -59,6 +58,9 @@ target_wrapper.*
 
 # QtCreator CMake
 CMakeLists.txt.user*
+
+# CMake (per-machine overrides)
+CMakeUserPresets.json
 
 # QtCreator 4.8< compilation database
 compile_commands.json

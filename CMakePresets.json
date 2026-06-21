@@ -32,10 +32,68 @@
         "OLR_FFMPEG_ROOT": "$env{OLR_FFMPEG_ROOT}",
         "OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}"
       }
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux (Release)",
+      "description": "Linux desktop build. FFmpeg from the distro via pkg-config (apt libav*-dev). Qt from the system, QT_ROOT_DIR, OLR_QT_ROOT, or an auto-detected ~/Qt/6.*/gcc_64.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "dev-debug-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "OLR_BUILD_TESTS": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "macos-debug",
+      "displayName": "macOS (Debug, tests)",
+      "description": "macOS desktop Debug build for VS Code / local dev. FFmpeg + SRT from Homebrew (no env needed); Qt auto-detected (override via OLR_QT_ROOT or CMakeUserPresets.json).",
+      "inherits": "dev-debug-base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
+      "name": "linux-debug",
+      "displayName": "Linux (Debug, tests)",
+      "description": "Linux desktop Debug build for VS Code / local dev. FFmpeg via pkg-config; Qt from the system or auto-detected.",
+      "inherits": "dev-debug-base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "windows-mingw-debug",
+      "displayName": "Windows (MinGW, Debug, tests)",
+      "description": "Windows MinGW Debug build. Needs OLR_* env (from-source FFmpeg/SRT + MinGW), same as the release preset; see build-scripts/build_windows_app.sh.",
+      "inherits": "dev-debug-base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "$env{OLR_QT_ROOT}",
+        "CMAKE_C_COMPILER": "$env{OLR_MINGW_ROOT}/bin/gcc.exe",
+        "CMAKE_CXX_COMPILER": "$env{OLR_MINGW_ROOT}/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "$env{OLR_NINJA}",
+        "OLR_FFMPEG_ROOT": "$env{OLR_FFMPEG_ROOT}",
+        "OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}"
+      }
     }
   ],
   "buildPresets": [
     { "name": "windows-mingw-release", "configurePreset": "windows-mingw-release" },
-    { "name": "macos-release", "configurePreset": "macos-release" }
+    { "name": "macos-release", "configurePreset": "macos-release" },
+    { "name": "linux-release", "configurePreset": "linux-release" },
+    { "name": "macos-debug", "configurePreset": "macos-debug" },
+    { "name": "linux-debug", "configurePreset": "linux-debug" },
+    { "name": "windows-mingw-debug", "configurePreset": "windows-mingw-debug" }
+  ],
+  "testPresets": [
+    { "name": "macos-debug", "configurePreset": "macos-debug", "output": { "outputOnFailure": true } },
+    { "name": "linux-debug", "configurePreset": "linux-debug", "output": { "outputOnFailure": true } },
+    { "name": "windows-mingw-debug", "configurePreset": "windows-mingw-debug", "output": { "outputOnFailure": true } }
   ]
 }
