@@ -81,3 +81,6 @@ __pycache__/
 
 # headless UI preview output
 gallery_out.png
+
+# Fuzzer corpora (grown locally / in CI artifacts)
+tests/fuzz/corpus/

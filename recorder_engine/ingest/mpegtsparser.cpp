@@ -233,6 +233,17 @@ void MpegTsParser::pushPesPayload(quint16 pid, bool payloadStart, const QByteArr
     assembly.kind = kindForPid(pid, m_videoPid, m_audioPid, m_audioKind);
     assembly.videoCodec = (pid == m_videoPid) ? m_videoCodec : NativeVideoCodec::Unknown;
     assembly.bytes.append(payload);
+
+    // Bound the reassembly: an unbounded (PES_packet_length=0) video PES whose
+    // terminating payload-start never arrives would otherwise grow this buffer
+    // without limit. On overflow, drop the in-progress PES and resync at the next
+    // payload-start (same recovery as a continuity break) rather than emit a
+    // truncated/garbage access unit.
+    if (assembly.bytes.size() > m_maxPesAssemblyBytes) {
+        m_pes.remove(pid);
+        m_waitingForPayloadStart.insert(pid);
+        return;
+    }
     updateExpectedPesSize(&assembly);
 
     if (assembly.expectedSize >= 0 && assembly.bytes.size() >= assembly.expectedSize) {

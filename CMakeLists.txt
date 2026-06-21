@@ -13,6 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(OLR_BUILD_TESTS "Build the OpenLiveReplay test suite" OFF)
 option(OLR_WERROR "Treat warnings as errors for first-party targets" ON)
 option(OLR_WCONVERSION "Also enable the -Wconversion/-Wsign-conversion family (large backlog; opt-in)" OFF)
+option(OLR_BUILD_FUZZERS "Build libFuzzer harnesses for the input parsers (needs clang+libFuzzer)" OFF)
 set(OLR_SANITIZER "" CACHE STRING
     "Sanitizers to enable, e.g. address, thread, undefined, or 'address;undefined'")
 
@@ -668,4 +669,11 @@ endif()
 if(OLR_BUILD_TESTS AND NOT IOS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# libFuzzer harnesses for the untrusted-input parsers (opt-in; needs clang +
+# libFuzzer). Independent of OLR_BUILD_TESTS and built with their own
+# fuzzer+ASan+UBSan instrumentation — see tests/fuzz/CMakeLists.txt.
+if(OLR_BUILD_FUZZERS AND NOT IOS)
+    add_subdirectory(tests/fuzz)
 endif()

@@ -152,6 +152,7 @@ private slots:
     void rejectsMalformedAdaptationOnlyLength();
     void adaptationOnlyDiscontinuityDropsInProgressPes();
     void ignoresDuplicatePayloadStartPacket();
+    void unboundedPesIsCappedAndResyncs();
 };
 
 void TestMpegTsParser::rejectsBadSyncByte()
@@ -372,6 +373,48 @@ void TestMpegTsParser::ignoresDuplicatePayloadStartPacket()
     QCOMPARE(out.size(), 1);
     QVERIFY(parser.pushTsPacket(packet, &out));
     QCOMPARE(out.size(), 1);
+}
+
+// Regression for the unbounded PES-reassembly DoS: a video PES that declares
+// PES_packet_length=0 (legal "unbounded", terminated by the next payload-start)
+// followed by a flood of continuation packets with no further payload-start must
+// NOT grow the reassembly buffer without limit, and must NOT later emit a giant
+// access unit built from the accumulated bytes — it caps, drops, and resyncs.
+void TestMpegTsParser::unboundedPesIsCappedAndResyncs() {
+    constexpr quint16 videoPid = 0x0101;
+
+    MpegTsParser parser;
+    parser.setMaxPesAssemblyBytesForTest(4096); // small cap -> overflow is cheap to hit
+    QList<PesPacket> out;
+    QVERIFY(parser.pushTsPacket(tsPacket(0x0000, true, patSection(0x1000), 0), &out));
+    QVERIFY(parser.pushTsPacket(tsPacket(0x1000, true, pmtSection({{0x1b, videoPid}}, videoPid), 0),
+                                &out));
+
+    // PES start with PES_packet_length = 0 and a minimal header (no PTS).
+    QByteArray unboundedStart = QByteArray::fromHex("000001"); // start code
+    unboundedStart.append(char(0xe0));                         // video stream id
+    unboundedStart.append(char(0x00)).append(char(0x00));      // PES_packet_length = 0
+    unboundedStart.append(char(0x80)).append(char(0x00)).append(char(0x00)); // flags/flags2/hdrlen
+    QVERIFY(parser.pushTsPacket(tsPacket(videoPid, true, unboundedStart, 0), &out));
+
+    // Flood of continuation packets, no payload-start: ~11.7 KiB, well past the
+    // 4 KiB cap. Without the cap this would all be retained in one assembly.
+    quint8 cc = 1;
+    const QByteArray filler(184, char(0xAA));
+    for (int i = 0; i < 64; ++i) {
+        QVERIFY(parser.pushTsPacket(tsPacket(videoPid, false, filler, cc), &out));
+        cc = quint8((cc + 1) & 0x0f);
+    }
+    QCOMPARE(out.size(), 0); // length-0 PES isn't flushed until a payload-start
+
+    // The next payload-start yields ONLY the new, small PES — never a giant one
+    // assembled from the overflow (which is what an uncapped parser would emit).
+    const QByteArray nextPayload = QByteArray::fromHex("00000001658884");
+    const QByteArray nextPes = pesPacket(0xe0, nextPayload, 180000);
+    QVERIFY(parser.pushTsPacket(tsPacket(videoPid, true, nextPes, cc), &out));
+
+    QCOMPARE(out.size(), 1);
+    QCOMPARE(out.first().payload, nextPayload);
 }
 
 QTEST_GUILESS_MAIN(TestMpegTsParser)
