@@ -8,6 +8,10 @@
 #include "recorder_engine/ingest/h26xaccessunit.h"
 #include "recorder_engine/ingest/nativevideodecoder.h"
 
+#include <QElapsedTimer>
+
+#include <algorithm>
+
 extern "C" {
 #include <libavutil/frame.h>
 }
@@ -16,6 +20,7 @@ class TestVtIOSurface : public QObject {
     Q_OBJECT
 private slots:
     void decodedBufferIsIOSurfaceBacked();
+    void reconfigCostIsBounded();
 
 private:
     static AVFrame* makeGreyFrame(int w, int h);
@@ -115,6 +120,35 @@ void TestVtIOSurface::decodedBufferIsIOSurfaceBacked() {
     QCOMPARE(frames, 1);
     QVERIFY2(decoder.lastDecodedWasIOSurfaceBacked(),
              "VT decode session did not produce an IOSurface-backed CVPixelBuffer");
+}
+
+void TestVtIOSurface::reconfigCostIsBounded() {
+    const NativeVideoDecodeCapabilities caps = queryNativeVideoDecodeCapabilities();
+    if (!caps.h264) QSKIP("no VideoToolbox H.264 decode on this platform");
+
+    CompressedAccessUnit a;
+    CompressedAccessUnit b;
+    if (!buildGreyIdrAccessUnit(&a, 1280, 720) || !buildGreyIdrAccessUnit(&b, 640, 480))
+        QSKIP("could not author two distinct-geometry IDR access units");
+
+    NativeVideoDecoder decoder(0, 0);
+    QString err;
+    auto drain = [](AVFrame* f) { av_frame_free(&f); };
+    QVERIFY2(decoder.decode(a, drain, &err), qPrintable(err));
+
+    QList<qint64> samples;
+    for (int i = 0; i < 8; ++i) {
+        const CompressedAccessUnit& unit = (i % 2 == 0) ? b : a;
+        QElapsedTimer t;
+        t.start();
+        QVERIFY2(decoder.decode(unit, drain, &err), qPrintable(err));
+        samples.append(t.nsecsElapsed());
+    }
+
+    std::sort(samples.begin(), samples.end());
+    const double medianMs = samples.at(samples.size() / 2) / 1.0e6;
+    qInfo("P0.1 reconfig median (decode incl. session recreate): %.3f ms", medianMs);
+    QVERIFY2(medianMs < 100.0, "VT reconfig wildly over budget (>100 ms)");
 }
 
 QTEST_GUILESS_MAIN(TestVtIOSurface)
