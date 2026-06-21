@@ -250,6 +250,7 @@ jobs:
             -I "$LINT_IMPORTS" -I "$QT_ROOT_DIR/qml" \
             Main.qml MultiviewWindow.qml CodecSettingsPanel.qml \
             ui/components/BindingsPanel.qml \
+            ui/components/OutputsPanel.qml \
             ui/components/ProjectSettingsPanel.qml
 
       # qmlformat is ADVISORY (report-only): the existing QML predates it, so it is
