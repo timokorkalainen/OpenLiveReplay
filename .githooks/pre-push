@@ -150,7 +150,7 @@ export QT_QPA_PLATFORM
 
 # Selectors kept verbatim so local == CI.
 UNIT_SELECTOR_LE='sync-report|srt|native-apple-ingest|native-rtmp'
-E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_record_rational_fps|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
+E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_record_rational_fps|e2e_record_rational_fps_h264|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
 
 # --- 5. Fast unit label (-L ci) on the build above -- catches the unit failures
 # CI would catch, at native speed, in ~1 min.
