@@ -11,20 +11,35 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Build options: testing, strict warnings, sanitizers
 # ---------------------------------------------------------------------------
 option(OLR_BUILD_TESTS "Build the OpenLiveReplay test suite" OFF)
-option(OLR_WERROR "Treat warnings as errors for first-party targets" OFF)
+option(OLR_WERROR "Treat warnings as errors for first-party targets" ON)
+option(OLR_WCONVERSION "Also enable the -Wconversion/-Wsign-conversion family (large backlog; opt-in)" OFF)
 set(OLR_SANITIZER "" CACHE STRING
     "Sanitizers to enable, e.g. address, thread, undefined, or 'address;undefined'")
 
 # Warning flags applied to first-party targets only (never third-party deps
-# like rtmidi/ffmpeg). Introduced non-fatally: -Werror is opt-in via OLR_WERROR.
+# like rtmidi/ffmpeg). The first-party tree is -Wall -Wextra -Wshadow
+# -Wnon-virtual-dtor clean, so -Werror defaults ON to keep it that way.
+#
+# -Wconversion/-Wsign-conversion are deliberately NOT in the default set: the
+# FFmpeg-interop code carries ~1k mostly-benign int/size_t coercions, so gating
+# them would be churn, not signal. Audit that backlog separately via
+# -DOLR_WCONVERSION=ON (it is excluded from -Werror so it stays advisory).
 add_library(olr_warnings INTERFACE)
 if(MSVC)
     target_compile_options(olr_warnings INTERFACE /W4)
+    if(OLR_WERROR)
+        target_compile_options(olr_warnings INTERFACE /WX)
+    endif()
 else()
-    target_compile_options(olr_warnings INTERFACE -Wall -Wextra)
-endif()
-if(OLR_WERROR AND NOT MSVC)
-    target_compile_options(olr_warnings INTERFACE -Werror)
+    target_compile_options(olr_warnings INTERFACE -Wall -Wextra -Wshadow -Wnon-virtual-dtor)
+    if(OLR_WERROR)
+        target_compile_options(olr_warnings INTERFACE -Werror)
+    endif()
+    if(OLR_WCONVERSION)
+        # Advisory even under -Werror: surfaced as warnings, never fatal.
+        target_compile_options(olr_warnings INTERFACE
+            -Wconversion -Wsign-conversion -Wno-error=conversion -Wno-error=sign-conversion)
+    endif()
 endif()
 
 # Sanitizer flags (compile + link), applied only when OLR_SANITIZER is set.
@@ -559,6 +574,14 @@ elseif(APPLE) # macOS Desktop
     endif()
     target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
     target_link_libraries(OpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
+elseif(UNIX AND NOT APPLE) # Linux desktop (CI second toolchain; system FFmpeg)
+    # FFmpeg from the distro (apt libav*-dev) via pkg-config. Native SRT/RTMP
+    # ingest is not compiled on Linux (cross-platform stubs), so libsrt is not
+    # linked into the app here.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(OLR_FFMPEG REQUIRED IMPORTED_TARGET
+        libavformat libavcodec libavutil libswscale libswresample)
+    target_link_libraries(OpenLiveReplay PRIVATE PkgConfig::OLR_FFMPEG)
 endif()
 
 # 5. Standard Qt Linking
@@ -586,6 +609,16 @@ set_target_properties(OpenLiveReplay PROPERTIES
     MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
     MACOSX_BUNDLE TRUE
 )
+
+# On Linux the qt_add_qml_module(URI OpenLiveReplay) output directory
+# build/OpenLiveReplay/ collides with the plain executable of the same name
+# ("ld: cannot open output file OpenLiveReplay: Is a directory"). macOS builds a
+# .app bundle and Windows an .exe, so only Linux clashes — emit the binary into a
+# subdirectory there.
+if(UNIX AND NOT APPLE)
+    set_target_properties(OpenLiveReplay PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
 
 # ---------------------------------------------------------------------------
 # 7. Tests (opt-in: -DOLR_BUILD_TESTS=ON). Desktop/macOS only — the test

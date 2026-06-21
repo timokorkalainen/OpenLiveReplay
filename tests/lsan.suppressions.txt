@@ -1,0 +1,22 @@
+# LeakSanitizer suppressions for the Linux unit run (build-test-linux).
+#
+# These match one-time / library allocations outside OpenLiveReplay's control
+# (Qt, FFmpeg, fontconfig, the GL stack, the dynamic loader) that LSan reports at
+# process exit. They are NOT leaks in first-party code; real leaks in our own
+# translation units are not matched here and still fail the gate.
+#
+# Format: `leak:<substring>` matches a frame's module or symbol name.
+leak:libQt6Core
+leak:libQt6Gui
+leak:libQt6Qml
+leak:libQt6Quick
+leak:libfontconfig
+leak:libGLX
+leak:libEGL
+leak:libGLdispatch
+leak:libavutil
+leak:libavcodec
+leak:libavformat
+leak:libswscale
+leak:libswresample
+leak:dlopen

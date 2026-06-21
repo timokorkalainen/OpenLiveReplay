@@ -11,7 +11,7 @@
 // increments the counters we assert on.
 //
 // At the end the worker's counters() are printed as one parseable line:
-//   COUNTERS reposition=.. reuseSeek=.. reverseChunkSeek=.. eofTailSeek=.. \
+//   COUNTERS reposition=.. reuseSeek=.. reverseChunkSeek=.. eofTailSeek=..
 //            skipForward=.. audioPushes=.. framesDropped=..
 // Per-second SEC telemetry is emitted by the instrumented worker to stderr when
 // OLR_PB_TELEMETRY is set in the environment (passed through transparently).

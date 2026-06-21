@@ -188,7 +188,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
         st->time_base = {1, 1000};
 
-        const QString feedId = telemetryFeedIds.at(i);
+        const QString& feedId = telemetryFeedIds.at(i);
         const QString feedName = i < telemetryFeedNames.size() ? telemetryFeedNames.at(i) : QString();
         const QString title = QString("Feed %1 Telemetry").arg(feedId);
         av_dict_set(&st->metadata, "title", title.toUtf8().constData(), 0);

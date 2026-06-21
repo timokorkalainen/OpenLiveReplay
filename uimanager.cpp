@@ -323,7 +323,9 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
                 preview.insert(QStringLiteral("projectName"), result.projectName);
                 preview.insert(QStringLiteral("importSettingsUrl"), result.importSettingsUrl);
                 preview.insert(QStringLiteral("telemetrySseUrl"), result.telemetrySseUrl);
-                preview.insert(QStringLiteral("feedCount"), result.sources.size());
+                // qsizetype is `long` on LP64 Linux -> ambiguous QJsonValue ctor.
+                preview.insert(QStringLiteral("feedCount"),
+                               static_cast<qint64>(result.sources.size()));
                 preview.insert(QStringLiteral("metadataFields"), metadataFields);
                 preview.insert(QStringLiteral("feeds"), feeds);
 
@@ -1982,7 +1984,7 @@ bool UIManager::playPlaylist(int fromIndex) {
     stopPlaylistPlayout();
 
     m_playout.start(entries, fromIndex);
-    const ReplayEntry first = entries[fromIndex];
+    const ReplayEntry& first = entries[fromIndex];
     // Start the first entry directly (NOT via seekPlayback, which exits playout).
     setFollowLive(false);
     m_transport->setSpeed(first.speed);
@@ -2282,7 +2284,7 @@ QVariantList UIManager::telemetryRowsAtPlayhead() {
         QVariantList items;
         QStringList summaryParts;
         for (auto it = payload.constBegin(); it != payload.constEnd(); ++it) {
-            const QString key = it.key();
+            const QString& key = it.key();
             if (key == QStringLiteral("feedId")) continue;
             const QString displayValue = telemetryValueToString(it.value());
 

@@ -59,7 +59,7 @@ void FrameProvider::addVideoSink(QVideoSink *sink)
             sink->setVideoFrame(lastFrameCopy);
         } else {
             QPointer<QVideoSink> sinkPtr = sink;
-            QVideoFrame copy = lastFrameCopy;
+            const QVideoFrame& copy = lastFrameCopy;
             QMetaObject::invokeMethod(sink, [sinkPtr, copy]() mutable {
                 if (sinkPtr) sinkPtr->setVideoFrame(copy);
             }, Qt::QueuedConnection);
@@ -103,7 +103,7 @@ void FrameProvider::deliverFrame(const QVideoFrame &frame)
         if (sink->thread() == QThread::currentThread()) {
             sink->setVideoFrame(frame);
         } else {
-            QVideoFrame copy = frame;
+            const QVideoFrame& copy = frame;
             QPointer<QVideoSink> sinkPtr = sink;
             QMetaObject::invokeMethod(sink, [sinkPtr, copy]() mutable {
                 if (sinkPtr) sinkPtr->setVideoFrame(copy);

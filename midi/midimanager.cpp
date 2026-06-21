@@ -91,6 +91,7 @@ void MidiManager::closePort() {
         try {
             m_midiIn->closePort();
         } catch (...) {
+            qWarning("MidiManager::closePort: ignoring RtMidi exception during teardown");
         }
     }
     closeOutput();
@@ -168,6 +169,7 @@ void MidiManager::closeOutput() {
         try {
             m_midiOut->closePort();
         } catch (...) {
+            qWarning("MidiManager::closeOutput: ignoring RtMidi exception during teardown");
         }
     }
     m_outputPort = -1;

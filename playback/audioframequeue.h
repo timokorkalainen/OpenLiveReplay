@@ -12,7 +12,7 @@
 class AudioFrameQueue {
 public:
     struct Frame {
-        int64_t ptsMs;
+        int64_t ptsMs{};
         QByteArray pcm;
     };
 

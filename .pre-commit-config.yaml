@@ -1,0 +1,27 @@
+# pre-commit framework config — mirrors the CI "Lint" job so local == CI.
+#
+# Two ways to get the same gate locally; pick one:
+#   * raw git hook (no extra deps):  git config core.hooksPath .githooks
+#   * pre-commit framework:          pip install pre-commit && pre-commit install
+#
+# Both run .githooks/pre-commit (clang-format on changed lines + strict qmllint),
+# so they never drift apart.
+minimum_pre_commit_version: "3.0.0"
+repos:
+  - repo: local
+    hooks:
+      - id: olr-lint-staged
+        name: clang-format + qmllint (staged, mirrors CI)
+        entry: .githooks/pre-commit
+        language: script
+        pass_filenames: false
+        always_run: true
+      # Generic hygiene, equivalent to the .editorconfig rules.
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.md$'
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]

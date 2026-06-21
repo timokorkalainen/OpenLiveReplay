@@ -32,7 +32,11 @@ olr_add_unit_test(tst_playbacktransport olr_test_core)
 olr_add_unit_test(tst_sseparser olr_test_core)
 olr_add_unit_test(tst_telemetryclient olr_test_core)
 olr_add_unit_test(tst_muxer            olr_test_engine)
-olr_add_unit_test(tst_ingestbackendselector olr_test_core)
+# Exercises NativeSrtIngestSession, which is compiled only on Apple/Windows
+# (Linux uses the ingest stubs), so this test is platform-gated.
+if(APPLE OR WIN32)
+    olr_add_unit_test(tst_ingestbackendselector olr_test_core)
+endif()
 olr_add_unit_test(tst_mpegtsparser     olr_test_core)
 olr_add_unit_test(tst_mpegtsparser_pcr olr_test_core)
 olr_add_unit_test(tst_h26xaccessunit   olr_test_core)

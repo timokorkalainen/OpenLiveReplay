@@ -168,7 +168,10 @@ public:
                 discovered.append(
                     QString::fromUtf8(sources[i].p_ndi_name ? sources[i].p_ndi_name : ""));
             }
-            selectedIndex = selectDiscoveredSourceIndex(discovered, sourceName);
+            // Only select when the source array is valid: if m_findGetCurrentSources
+            // is unresolved, sources is null (and discovered empty), so guard the
+            // index to avoid dereferencing null / leaving `selected` uninitialized.
+            selectedIndex = sources ? selectDiscoveredSourceIndex(discovered, sourceName) : -1;
             if (selectedIndex >= 0) {
                 selected = sources[selectedIndex];
             }
@@ -199,8 +202,11 @@ public:
         if (!m_receiver || !m_recvCapture) {
             return Capture::Error;
         }
-        std::memset(&m_lastVideo, 0, sizeof(m_lastVideo));
-        std::memset(&m_lastAudio, 0, sizeof(m_lastAudio));
+        // Value-initialize rather than memset: these NDI frame structs are
+        // non-trivial (member initializers), which GCC flags under
+        // -Werror=class-memaccess. The capture call overwrites them anyway.
+        m_lastVideo = {};
+        m_lastAudio = {};
         const NDIlib_frame_type_e type =
             m_recvCapture(m_receiver, &m_lastVideo, &m_lastAudio, nullptr, uint32_t(timeoutMs));
         if (type == NDIlib_frame_type_video && video) {

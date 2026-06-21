@@ -244,7 +244,9 @@ target_link_libraries(olr_test_playback
     PRIVATE olr_warnings olr_sanitize)
 
 add_subdirectory(unit)
-target_link_libraries(tst_ingestbackendselector PRIVATE olr_test_engine)
+if(APPLE OR WIN32)  # tst_ingestbackendselector is Apple/Windows-only (native ingest)
+    target_link_libraries(tst_ingestbackendselector PRIVATE olr_test_engine)
+endif()
 add_subdirectory(smoke)
 add_subdirectory(e2e)
 add_subdirectory(qml)

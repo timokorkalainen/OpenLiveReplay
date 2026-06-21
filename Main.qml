@@ -18,7 +18,12 @@ ApplicationWindow {
     property int multiviewScreenIndex: 0
     property var screenOptions: appWindow.uiManagerRef ? appWindow.uiManagerRef.screenOptions : []
     property bool screensReady: appWindow.uiManagerRef ? appWindow.uiManagerRef.screensReady : false
+    // uiManager is a C++ context property injected at the root context that the
+    // linter cannot resolve. This is the only unqualified access in the file;
+    // every call site uses appWindow.uiManagerRef instead.
+    // qmllint disable unqualified
     property var uiManagerRef: uiManager
+    // qmllint enable unqualified
     property alias playbackTab: playbackTab
     property alias screenProbe: screenProbe
     // Last recording-start failure reason, surfaced near the record button.
@@ -1744,9 +1749,14 @@ ApplicationWindow {
                     modal: true
                     focus: true
                     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                    // A Popup is shown in Overlay.overlay and is not laid out by
+                    // the enclosing Layout, so this geometry/anchors are correct
+                    // (the layout-positioning check is a false positive here).
+                    // qmllint disable Quick.layout-positioning
                     anchors.centerIn: Overlay.overlay
                     width: Math.min(appWindow.width * 0.92, 760)
                     height: Math.min(appWindow.height * 0.84, 580)
+                    // qmllint enable Quick.layout-positioning
 
                     function metadataSummary(metadata) {
                         if (!metadata || metadata.length === 0) return "metadata 0"
@@ -1938,9 +1948,14 @@ ApplicationWindow {
                     modal: true
                     focus: true
                     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                    // A Popup is shown in Overlay.overlay and is not laid out by
+                    // the enclosing Layout, so this geometry/anchors are correct
+                    // (the layout-positioning check is a false positive here).
+                    // qmllint disable Quick.layout-positioning
                     anchors.centerIn: Overlay.overlay
                     width: Math.min(appWindow.width * 0.9, 600)
                     height: Math.min(appWindow.height * 0.8, 480)
+                    // qmllint enable Quick.layout-positioning
 
                     ListModel {
                         id: fieldsModel
@@ -2086,9 +2101,14 @@ ApplicationWindow {
                     modal: true
                     focus: true
                     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                    // A Popup is shown in Overlay.overlay and is not laid out by
+                    // the enclosing Layout, so this geometry/anchors are correct
+                    // (the layout-positioning check is a false positive here).
+                    // qmllint disable Quick.layout-positioning
                     anchors.centerIn: Overlay.overlay
                     width: Math.min(appWindow.width * 0.9, 600)
                     height: Math.min(appWindow.height * 0.8, 480)
+                    // qmllint enable Quick.layout-positioning
 
                     property int sourceIndex: -1
                     property string sourceLabel: ""
