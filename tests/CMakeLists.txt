@@ -247,6 +247,13 @@ target_link_libraries(olr_test_playback
            "${OLR_FFMPEG_AVUTIL_LIBRARY}" "${OLR_FFMPEG_SWSCALE_LIBRARY}"
            "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
     PRIVATE olr_warnings olr_sanitize)
+if(APPLE)
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_apple.mm")
+else()
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp")
+endif()
 
 if(OLR_GPU_PIPELINE)
     qt_add_library(olr_test_gpu STATIC
