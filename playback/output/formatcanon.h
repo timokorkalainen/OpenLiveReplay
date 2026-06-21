@@ -26,6 +26,14 @@ struct FullResChroma {
 
 FullResChroma upsampleChromaNearest(const CpuPlanes& yuv420p);
 
+struct Rgb8 {
+    uchar r = 0;
+    uchar g = 0;
+    uchar b = 0;
+};
+
+Rgb8 yuvToRgb8(uchar y, uchar u, uchar v, ColorMatrix matrix, ColorRange range);
+
 } // namespace formatcanon
 
 #endif // FORMATCANON_H

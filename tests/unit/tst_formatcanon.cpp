@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include "playback/output/colormetadata.h"
 #include "playback/output/formatcanon.h"
 #include "playback/output/framehandle.h"
 #include "playback/output/framepixelformat.h"
@@ -39,6 +40,9 @@ private slots:
     void nv12DeinterleaveProducesPlanarUV();
     void nv12RoundTripsByteExact();
     void chromaUpsampleReplicates2x2Blocks();
+    void yuvToRgbVideoRangeNeutralGrey();
+    void yuvToRgbPrimariesDifferByMatrix();
+    void yuvToRgbClampsAndFullRange();
 };
 
 void TestFormatCanon::planeShapeMatchesYuv420pLayout() {
@@ -158,6 +162,52 @@ void TestFormatCanon::chromaUpsampleReplicates2x2Blocks() {
     QCOMPARE(uAt(2, 2), uchar(40));
     QCOMPARE(uAt(3, 3), uchar(40));
     QCOMPARE(vAt(2, 3), uchar(140));
+}
+
+void TestFormatCanon::yuvToRgbVideoRangeNeutralGrey() {
+    const formatcanon::Rgb8 grey =
+        formatcanon::yuvToRgb8(126, 128, 128, ColorMatrix::Bt709, ColorRange::Video);
+    QCOMPARE(grey.r, grey.g);
+    QCOMPARE(grey.g, grey.b);
+
+    const formatcanon::Rgb8 black =
+        formatcanon::yuvToRgb8(16, 128, 128, ColorMatrix::Bt709, ColorRange::Video);
+    QCOMPARE(black.r, uchar(0));
+    QCOMPARE(black.g, uchar(0));
+    QCOMPARE(black.b, uchar(0));
+
+    const formatcanon::Rgb8 white =
+        formatcanon::yuvToRgb8(235, 128, 128, ColorMatrix::Bt709, ColorRange::Video);
+    QCOMPARE(white.r, uchar(255));
+    QCOMPARE(white.g, uchar(255));
+    QCOMPARE(white.b, uchar(255));
+}
+
+void TestFormatCanon::yuvToRgbPrimariesDifferByMatrix() {
+    const formatcanon::Rgb8 c601 =
+        formatcanon::yuvToRgb8(120, 90, 200, ColorMatrix::Bt601, ColorRange::Video);
+    const formatcanon::Rgb8 c709 =
+        formatcanon::yuvToRgb8(120, 90, 200, ColorMatrix::Bt709, ColorRange::Video);
+    QVERIFY(c601.r != c709.r || c601.g != c709.g || c601.b != c709.b);
+}
+
+void TestFormatCanon::yuvToRgbClampsAndFullRange() {
+    const formatcanon::Rgb8 black =
+        formatcanon::yuvToRgb8(0, 128, 128, ColorMatrix::Bt709, ColorRange::Full);
+    QCOMPARE(black.r, uchar(0));
+    QCOMPARE(black.g, uchar(0));
+    QCOMPARE(black.b, uchar(0));
+
+    const formatcanon::Rgb8 white =
+        formatcanon::yuvToRgb8(255, 128, 128, ColorMatrix::Bt709, ColorRange::Full);
+    QCOMPARE(white.r, uchar(255));
+    QCOMPARE(white.g, uchar(255));
+    QCOMPARE(white.b, uchar(255));
+
+    const formatcanon::Rgb8 hot =
+        formatcanon::yuvToRgb8(235, 16, 240, ColorMatrix::Bt601, ColorRange::Video);
+    QCOMPARE(hot.r, uchar(255));
+    QVERIFY(hot.b < hot.r);
 }
 
 QTEST_GUILESS_MAIN(TestFormatCanon)

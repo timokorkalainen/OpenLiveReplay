@@ -19,6 +19,12 @@ qsizetype byteOffset(int row, int stride) {
     return static_cast<qsizetype>(row) * static_cast<qsizetype>(stride);
 }
 
+uchar clampU8(int value) {
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return static_cast<uchar>(value);
+}
+
 } // namespace
 
 PlaneShape planeShape(FramePixelFormat format, int frameWidth, int frameHeight, int planeIndex) {
@@ -148,6 +154,28 @@ FullResChroma upsampleChromaNearest(const CpuPlanes& yuv420p) {
         }
     }
     return out;
+}
+
+Rgb8 yuvToRgb8(uchar y, uchar u, uchar v, ColorMatrix matrix, ColorRange range) {
+    const int yp = (range == ColorRange::Video) ? (static_cast<int>(y) - 16) * 1192
+                                                : static_cast<int>(y) * 1024;
+    const int cb = static_cast<int>(u) - 128;
+    const int cr = static_cast<int>(v) - 128;
+
+    int r = 0;
+    int g = 0;
+    int b = 0;
+    if (matrix == ColorMatrix::Bt601) {
+        r = yp + 1634 * cr;
+        g = yp - 401 * cb - 832 * cr;
+        b = yp + 2066 * cb;
+    } else {
+        r = yp + 1836 * cr;
+        g = yp - 218 * cb - 546 * cr;
+        b = yp + 2164 * cb;
+    }
+
+    return {clampU8((r + 512) >> 10), clampU8((g + 512) >> 10), clampU8((b + 512) >> 10)};
 }
 
 } // namespace formatcanon
