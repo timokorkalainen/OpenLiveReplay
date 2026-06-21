@@ -621,6 +621,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
                             m_counters.framesDropped++;
                         if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
+                        m_counters.decodedVideoFrames++;
                     }
                     lastVideoPtsMs = framePtsMs;
                     av_frame_free(&nativeVf);
@@ -695,6 +696,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     // Insert only; republish is batched (run-loop trim /
                     // reposition merge), never per-frame — see enqueue note.
                     if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
+                    m_counters.decodedVideoFrames++;
                 }
                 lastVideoPtsMs = framePtsMs;
                 av_frame_unref(vf);

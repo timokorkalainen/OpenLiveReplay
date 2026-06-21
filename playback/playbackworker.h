@@ -67,6 +67,11 @@ public:
         // so the armed-cut gate keeps reposition==0 (no coarse-seek fallback)
         // while still observing the follow fired exactly once.
         int cutFollowReposition = 0;
+        // Video frames committed to the output cache via insertVideoFrame. Counts
+        // every decoded frame regardless of whether an output sink is connected,
+        // so the e2e gate can prove real decode happened without an NDI/display
+        // sink. A stuck or absent decoder leaves this at 0.
+        qint64 decodedVideoFrames = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
