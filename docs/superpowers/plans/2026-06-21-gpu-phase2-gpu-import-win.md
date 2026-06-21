@@ -900,27 +900,149 @@ void TestWinGpuImportEdge::readToCpuDeinterleavesNv12ToI420() {
     QString err;
     auto edge = WinGpuImportEdge::create(&err);
     if (!edge) QSKIP("no GPU import edge on this host");
-    // Build a known NV12 texture (Y=0x40, interleaved UV = 0x80,0xC0), wrap it as
-    // a GPU FrameHandle via the edge's internal path, read it back, and assert the
-    // I420 planes match the byte values an NV12->I420 deinterleave produces.
-    // (The exact construction uses a device-created staging-upload texture; see body.)
-    QVERIFY(true); // replaced in Step 3
+
+    // Build a HW device and a gradient NV12 texture, keep it via the surface
+    // concrete, wrap it in the edge's GPU frame-data, then read it back to I420
+    // and byte-compare against the deinterleave the CPU path would produce.
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> ctx;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
+    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1, D3D11_SDK_VERSION, &device, &fl, &ctx)));
+
+    const int kW = 8;
+    const int kH = 8;
+    // NV12 in row-major: Y plane (kH rows of kW bytes) then interleaved UV
+    // (kH/2 rows of kW bytes = kW/2 U,V pairs). Use a gradient so a bug that
+    // misorders planes or rows shows up as a mismatch.
+    std::vector<uint8_t> nv12(size_t(kW) * kH + size_t(kW) * (kH / 2));
+    uint8_t* y = nv12.data();
+    uint8_t* uv = nv12.data() + size_t(kW) * kH;
+    for (int r = 0; r < kH; ++r)
+        for (int c = 0; c < kW; ++c)
+            y[size_t(r) * kW + c] = uint8_t((r * kW + c) & 0xFF);  // Y gradient
+    for (int r = 0; r < kH / 2; ++r) {
+        for (int c = 0; c < kW / 2; ++c) {
+            uv[size_t(r) * kW + 2 * c] = uint8_t((r * (kW / 2) + c) & 0xFF);       // U
+            uv[size_t(r) * kW + 2 * c + 1] = uint8_t((128 + r * (kW / 2) + c) & 0xFF);  // V
+        }
+    }
+
+    // Upload the gradient into a DEFAULT NV12 texture via UpdateSubresource
+    // (NV12 is a single subresource; the UV plane is laid out below Y at the
+    // same row pitch, so one tightly-packed upload of pitch==kW covers both).
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = kW; desc.Height = kH; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12; desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;  // RHI-importable bind flag
+    ComPtr<ID3D11Texture2D> tex;
+    QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &tex)));
+    ctx->UpdateSubresource(tex.Get(), 0, nullptr, nv12.data(), UINT(kW), 0);
+
+    // Keep the texture and wrap it in the edge's GPU frame-data (test-only
+    // factory; the D3D11IGpuFrameData concrete itself stays TU-private).
+    auto surface = D3D11GpuSurface::createKept(device, tex, 0, kW, kH);
+    QVERIFY(surface != nullptr);
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = kW;
+    meta.key.height = kH;
+    const FrameHandle handle =
+        WinGpuImportEdge::makeGpuFrameHandleForTest(std::move(surface), meta);
+    QVERIFY(!handle.isNull());
+    QVERIFY(handle.isGpuBacked());
+
+    // Read back to I420 through the fenced staging-map path.
+    const CpuPlanes got = handle.readToCpu(FramePixelFormat::Yuv420p);
+    QCOMPARE(int(got.format), int(FramePixelFormat::Yuv420p));
+    QCOMPARE(got.width, kW);
+    QCOMPARE(got.height, kH);
+
+    // Expected I420 = the SAME deinterleave the CPU path applies (the shared
+    // nativeCopyNv12ToYuv420p helper), fed the source gradient at pitch==kW.
+    AVFrame* expected =
+        nativeCopyNv12ToYuv420p(y, kW, uv, kW, kW, kH);
+    QVERIFY(expected != nullptr);
+
+    // Y plane: every row must match byte-for-byte (account for both strides).
+    for (int r = 0; r < kH; ++r) {
+        for (int c = 0; c < kW; ++c) {
+            const uint8_t exp = expected->data[0][size_t(r) * expected->linesize[0] + c];
+            const uint8_t act =
+                uint8_t(got.plane[0].at(size_t(r) * got.stride[0] + c));
+            QCOMPARE(act, exp);
+        }
+    }
+    // U and V planes: kW/2 x kH/2 each.
+    for (int r = 0; r < kH / 2; ++r) {
+        for (int c = 0; c < kW / 2; ++c) {
+            const uint8_t expU = expected->data[1][size_t(r) * expected->linesize[1] + c];
+            const uint8_t expV = expected->data[2][size_t(r) * expected->linesize[2] + c];
+            const uint8_t actU =
+                uint8_t(got.plane[1].at(size_t(r) * got.stride[1] + c));
+            const uint8_t actV =
+                uint8_t(got.plane[2].at(size_t(r) * got.stride[2] + c));
+            QCOMPARE(actU, expU);
+            QCOMPARE(actV, expV);
+        }
+    }
+    av_frame_free(&expected);
 #endif
 }
 ```
 
-Step 3 replaces the placeholder: create a 16x16 NV12 `D3D11_USAGE_DEFAULT` texture, upload known bytes via an intermediate staging texture + `CopyResource`, wrap with `D3D11GpuSurface::createKept`, build a `FrameHandle` over a `D3D11IGpuFrameData`, call `readToCpu(Yuv420p)`, and assert plane Y is all `0x40`, plane U all `0x80`, plane V all `0xC0`, with `format==Yuv420p`, `width==16`, `height==16`.
+This is the genuine RED: it creates a gradient NV12 `ID3D11Texture2D`, keeps it via
+`D3D11GpuSurface::createKept`, wraps it in the edge's GPU frame-data through the
+test-only `WinGpuImportEdge::makeGpuFrameHandleForTest` factory (the
+`D3D11IGpuFrameData` concrete stays TU-private), reads it back with
+`readToCpu(FramePixelFormat::Yuv420p)`, and byte-compares every I420 plane against
+`nativeCopyNv12ToYuv420p` over the same source bytes — the exact deinterleave the CPU
+path uses, so the comparison is byte-exact, not merely ±1. It fails to compile until
+Step 3 provides `readToCpu`'s body and the `makeGpuFrameHandleForTest` factory.
+
+The test needs `<vector>` and the FFmpeg `<libavutil/frame.h>` include inside the
+`#ifdef _WIN32` block at the top of the test (alongside the `<d3d11.h>` /
+`<wrl/client.h>` / `using Microsoft::WRL::ComPtr;` added in Task 3), and
+`#include "recorder_engine/ingest/nativeframecopy.h"` for `nativeCopyNv12ToYuv420p`.
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cmake --build build/c --target tst_wingpuimportedge`
-Expected: on Windows, FAIL at link/assert — `D3D11IGpuFrameData::readToCpu` is a pure-virtual override with no body yet (undefined symbol). On macOS the test QSKIPs.
+Expected: on Windows, FAIL to compile/link — `WinGpuImportEdge::makeGpuFrameHandleForTest` is undeclared and `D3D11IGpuFrameData::readToCpu` is a pure-virtual override with no body yet (undefined symbol). On macOS the test QSKIPs.
 
 - [ ] **Step 3: Write the implementation**
 
-In `playback/output/win/wingpuimportedge.cpp` (inside `#ifdef _WIN32`, after the `D3D11IGpuFrameData` class), add the out-of-line definition:
+The Step-1 test already carries its full assertions; this step only adds the two
+production pieces it calls — the test-only frame-data factory and the `readToCpu`
+body — so the test goes from RED to GREEN with no further edits to the test.
+
+First, declare the test-only factory in `playback/output/win/wingpuimportedge.h`
+(inside the `WinGpuImportEdge` class, alongside `tryImport`). It wraps an already-kept
+`D3D11GpuSurface` in the TU-private `D3D11IGpuFrameData` and returns a GPU-backed
+`FrameHandle`, giving unit tests a construction path that does not require synthesizing
+a real `IMFSample`:
 
 ```cpp
+    // Test-only: wrap an already-kept GPU surface in the edge's GPU frame-data and
+    // return a GPU-backed FrameHandle, so unit tests can exercise readToCpu without
+    // a real IMFSample. The D3D11IGpuFrameData concrete stays TU-private.
+    static FrameHandle makeGpuFrameHandleForTest(
+        std::shared_ptr<class D3D11GpuSurface> surface, FrameMetadata meta);
+```
+
+In `playback/output/win/wingpuimportedge.cpp` (inside `#ifdef _WIN32`, after the
+`D3D11IGpuFrameData` class), define the factory and the `readToCpu` body:
+
+```cpp
+FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(
+    std::shared_ptr<D3D11GpuSurface> surface, FrameMetadata meta) {
+    if (!surface) return FrameHandle();
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface));
+    return FrameHandle(std::move(data), std::move(meta));
+}
+
 CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     CpuPlanes out;
     if (!m_surface) return out;
@@ -993,12 +1115,13 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cmake --build build/c --target tst_wingpuimportedge && ctest --test-dir build/c -R tst_wingpuimportedge --output-on-failure`
-Expected: Windows CI → `readToCpuDeinterleavesNv12ToI420` passes (Y=0x40, U=0x80, V=0xC0, Yuv420p, 16x16). macOS → QSKIPs. The full Windows test-lib now links (Tasks 2-4 complete the unit), so the Windows CI is green end-to-end.
+Expected: Windows CI → `readToCpuDeinterleavesNv12ToI420` passes (every I420 byte of the 8x8 gradient frame equals `nativeCopyNv12ToYuv420p` over the same source bytes; `format==Yuv420p`, `width==8`, `height==8`). macOS → QSKIPs. The full Windows test-lib now links (Tasks 2-4 complete the unit), so the Windows CI is green end-to-end.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add playback/output/win/wingpuimportedge.cpp tests/unit/tst_wingpuimportedge.cpp
+git add playback/output/win/wingpuimportedge.h playback/output/win/wingpuimportedge.cpp \
+        tests/unit/tst_wingpuimportedge.cpp
 git commit -m "feat(gpu-import-win): fenced readToCpu NV12 staging map + I420 deinterleave
 
 Co-Authored-By: Claude <noreply@anthropic.com>"
@@ -1206,13 +1329,23 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `WinGpuImportEdge` (Task 2), `D3DFence` (Task 5), the existing `copySampleToFrame` (`:712`, kept as the fallback path), `environmentFlagEnabled` (`:54`).
-- Produces: a Windows decode path that, when `OLR_GPU_PIPELINE` is set AND `WinGpuImportEdge::create()` succeeds, imports the decoded `IMFSample`'s texture into a GPU-backed `FrameHandle` (signalling the decode-done fence), and otherwise takes today's `copySampleToFrame` CPU path verbatim.
+- Produces:
+  - a Windows decode path that, when `OLR_GPU_PIPELINE` is set AND `WinGpuImportEdge::create()` succeeds, imports the decoded `IMFSample`'s texture into a GPU-backed `FrameHandle` (signalling the decode-done fence), and otherwise takes today's `copySampleToFrame` CPU path verbatim.
+  - test-only hooks on `WinGpuImportEdge` (no-ops / TU-private on the stub) so the slice is exercisable without a real `IMFSample`:
+    - `void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&)> tap);` — arms the `std::function<void(const FrameHandle&)>` the decoder invokes on every imported handle when `OLR_GPU_PIPELINE_TEST_TAP` is set (production `FrameCallback` unchanged).
+    - `bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device, ComPtr<ID3D11Texture2D> nv12, int width, int height);` — keeps a host-built NV12 texture through the surface concrete, wraps it in the edge's `D3D11IGpuFrameData`, signals the decode-done fence, and feeds the resulting `FrameHandle` to the armed tap (the unit-level stand-in for one real decode→import).
 
 > The decoder's public `FrameCallback` today yields a CPU `AVFrame` (`nativevideodecoder.h`). The full handle-emitting path is owned by the playback worker's integration (a later sibling); here the slice proves the edge produces a correct GPU-backed `FrameHandle` and that `readToCpu()` matches the CPU `copySampleToFrame` output within ±1 LSB. The decoder change is gated and isolated: an `OLR_GPU_PIPELINE`-off build is byte-identical to today.
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `tests/unit/tst_wingpuimportedge.cpp` a gated round-trip that drives the existing decoder once with `OLR_GPU_PIPELINE` and compares the imported readback to a CPU decode:
+Add to `tests/unit/tst_wingpuimportedge.cpp` a gated round-trip that drives the
+decoder's import edge once under `OLR_GPU_PIPELINE` and compares the imported
+readback to the CPU `nativeCopyNv12ToYuv420p` deinterleave. The decoder exposes the
+imported `FrameHandle` to the test through the test-only tap hook (a
+`std::function<void(const FrameHandle&)>` armed when `OLR_GPU_PIPELINE_TEST_TAP` is
+set; see Step 3), so the slice is verified without a real `IMFSample` and without
+changing the production `FrameCallback` signature:
 
 ```cpp
     void importedReadbackMatchesCpuDecodeWithinOneLsb();
@@ -1225,27 +1358,192 @@ void TestWinGpuImportEdge::importedReadbackMatchesCpuDecodeWithinOneLsb() {
 #else
     const WinGpuImportCapabilities caps = probeWinGpuImport();
     if (!caps.d3d11KeepTexture) QSKIP("host has no keep-texture path; CPU fallback only");
-    // The slice's e2e driver (run_playback_e2e.sh play1x) provides the real
-    // decode fixture; this unit-level guard asserts the import edge and the CPU
-    // path agree on a single synthesized NV12 frame (the per-frame contract the
-    // e2e relies on). Build one NV12 texture, import->readToCpu(Yuv420p), and
-    // compare to nativeCopyNv12ToYuv420p of the same bytes, |delta| <= 1.
-    // (Construction identical to Task 4's known-bytes texture, with a gradient.)
-    QVERIFY(true); // replaced in Step 3 with the gradient compare
+    QString err;
+    auto edge = WinGpuImportEdge::create(&err);
+    if (!edge) QSKIP("no GPU import edge on this host");
+
+    // The slice's e2e driver (run_playback_e2e.sh play1x) provides the real decode
+    // fixture; this unit-level guard asserts the import edge and the CPU path agree
+    // on a single synthesized NV12 frame (the per-frame contract the e2e relies on).
+    // Build one gradient NV12 texture, route it through the decoder's import edge so
+    // the test-only tap delivers the GPU-backed FrameHandle, readToCpu(Yuv420p), and
+    // compare to nativeCopyNv12ToYuv420p of the same bytes within |delta| <= 1.
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> ctx;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
+    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1, D3D11_SDK_VERSION, &device, &fl, &ctx)));
+
+    const int kW = 8;
+    const int kH = 8;
+    // NV12 in row-major: Y plane (kH rows of kW bytes) then interleaved UV
+    // (kH/2 rows of kW bytes = kW/2 U,V pairs). A gradient makes a plane/row
+    // misorder show up as a mismatch (identical to Task 4's known-bytes texture).
+    std::vector<uint8_t> nv12(size_t(kW) * kH + size_t(kW) * (kH / 2));
+    uint8_t* y = nv12.data();
+    uint8_t* uv = nv12.data() + size_t(kW) * kH;
+    for (int r = 0; r < kH; ++r)
+        for (int c = 0; c < kW; ++c)
+            y[size_t(r) * kW + c] = uint8_t((r * kW + c) & 0xFF);  // Y gradient
+    for (int r = 0; r < kH / 2; ++r) {
+        for (int c = 0; c < kW / 2; ++c) {
+            uv[size_t(r) * kW + 2 * c] = uint8_t((r * (kW / 2) + c) & 0xFF);       // U
+            uv[size_t(r) * kW + 2 * c + 1] = uint8_t((128 + r * (kW / 2) + c) & 0xFF);  // V
+        }
+    }
+
+    // Upload the gradient into a DEFAULT NV12 texture (single subresource; the UV
+    // plane is laid out below Y at the same row pitch, so one tightly-packed upload
+    // of pitch==kW covers both planes).
+    D3D11_TEXTURE2D_DESC desc {};
+    desc.Width = kW; desc.Height = kH; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12; desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;  // RHI-importable bind flag
+    ComPtr<ID3D11Texture2D> tex;
+    QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &tex)));
+    ctx->UpdateSubresource(tex.Get(), 0, nullptr, nv12.data(), UINT(kW), 0);
+
+    // Arm the decoder's test-only tap and drive one decode of the synthesized
+    // gradient frame through the import edge. The tap captures the GPU-backed
+    // FrameHandle the import edge publishes (production FrameCallback unchanged).
+    FrameHandle imported;
+    bool tapped = false;
+    edge->setImportTapForTest([&](const FrameHandle& h) {
+        imported = h;
+        tapped = true;
+    });
+    QVERIFY2(edge->decodeOneForTest(device, tex, kW, kH),
+             "decode-one import drive failed");
+    QVERIFY2(tapped, "import tap was not invoked");
+    QVERIFY(!imported.isNull());
+    QVERIFY(imported.isGpuBacked());
+
+    // Read the imported handle back to I420 through the fenced staging-map path.
+    const CpuPlanes got = imported.readToCpu(FramePixelFormat::Yuv420p);
+    QCOMPARE(int(got.format), int(FramePixelFormat::Yuv420p));
+    QCOMPARE(got.width, kW);
+    QCOMPARE(got.height, kH);
+
+    // Expected I420 = the SAME deinterleave the CPU copySampleToFrame path applies
+    // (the shared nativeCopyNv12ToYuv420p helper), fed the source gradient at
+    // pitch==kW. The program success criterion is |delta| <= 1 LSB.
+    AVFrame* expected = nativeCopyNv12ToYuv420p(y, kW, uv, kW, kW, kH);
+    QVERIFY(expected != nullptr);
+
+    auto within1 = [](uint8_t a, uint8_t b) {
+        return std::abs(int(a) - int(b)) <= 1;
+    };
+    // Y plane: every row within ±1 (account for both strides).
+    for (int r = 0; r < kH; ++r) {
+        for (int c = 0; c < kW; ++c) {
+            const uint8_t exp = expected->data[0][size_t(r) * expected->linesize[0] + c];
+            const uint8_t act = uint8_t(got.plane[0].at(size_t(r) * got.stride[0] + c));
+            QVERIFY2(within1(act, exp), "Y plane exceeds ±1 LSB");
+        }
+    }
+    // U and V planes: kW/2 x kH/2 each.
+    for (int r = 0; r < kH / 2; ++r) {
+        for (int c = 0; c < kW / 2; ++c) {
+            const uint8_t expU = expected->data[1][size_t(r) * expected->linesize[1] + c];
+            const uint8_t expV = expected->data[2][size_t(r) * expected->linesize[2] + c];
+            const uint8_t actU = uint8_t(got.plane[1].at(size_t(r) * got.stride[1] + c));
+            const uint8_t actV = uint8_t(got.plane[2].at(size_t(r) * got.stride[2] + c));
+            QVERIFY2(within1(actU, expU), "U plane exceeds ±1 LSB");
+            QVERIFY2(within1(actV, expV), "V plane exceeds ±1 LSB");
+        }
+    }
+    av_frame_free(&expected);
+    edge->setImportTapForTest(nullptr);
 #endif
 }
 ```
 
-Step 3 fills the gradient compare: upload an NV12 gradient (Y = `x & 0xFF`, UV = `(x*2)&0xFF`), import via the edge path, `readToCpu(Yuv420p)`, and assert each I420 byte is within ±1 of `nativeCopyNv12ToYuv420p` over the same source bytes (they are produced by the same helper, so the tolerance is satisfied exactly; the ±1 wording matches the program success criterion).
+This is the genuine RED: it synthesizes a gradient NV12 `ID3D11Texture2D`, arms the
+decoder's test-only import tap (`setImportTapForTest`, the
+`std::function<void(const FrameHandle&)>` hook backing `OLR_GPU_PIPELINE_TEST_TAP`),
+drives one decode through the import edge (`decodeOneForTest`), captures the
+GPU-backed `FrameHandle` the tap delivers, reads it back with
+`readToCpu(FramePixelFormat::Yuv420p)`, and byte-compares every I420 plane against
+`nativeCopyNv12ToYuv420p` over the same source bytes within ±1 LSB — the exact
+deinterleave the CPU `copySampleToFrame` path uses, so the tolerance holds by
+construction (the ±1 wording matches the program success criterion). It fails to
+compile until Step 3 adds the `setImportTapForTest` / `decodeOneForTest` hooks and
+the decoder's gated import branch that feeds the tap.
+
+The test reuses the `#ifdef _WIN32` includes added in Tasks 3-4 (`<vector>`,
+`<cstdlib>` for `std::abs`, `<d3d11.h>`, `<wrl/client.h>`, `using
+Microsoft::WRL::ComPtr;`, the FFmpeg `<libavutil/frame.h>`, and
+`#include "recorder_engine/ingest/nativeframecopy.h"` for
+`nativeCopyNv12ToYuv420p`).
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cmake --build build/c --target tst_wingpuimportedge`
-Expected: Windows → the gradient-compare body does not yet exist as a callable path off the decoder; it compiles but the assertion placeholder must be replaced (RED is the missing decoder gate). macOS → QSKIPs.
+Expected: Windows → FAIL to compile/link — `WinGpuImportEdge::setImportTapForTest` and `WinGpuImportEdge::decodeOneForTest` are undeclared (the decoder import gate and its test hooks do not exist yet; this is the RED). macOS → QSKIPs.
 
-- [ ] **Step 3: Write the decoder gate + finish the test**
+- [ ] **Step 3: Write the decoder gate + the test-only tap hook**
 
-In `recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp`, add a gated import branch. At the top of the `Impl` class add a member and a lazy initializer:
+The Step-1 test already carries its full assertions; this step only adds the
+production pieces it calls — the decoder's gated import branch, the test-only tap
+the decoder feeds, and the `setImportTapForTest` / `decodeOneForTest` hooks on
+`WinGpuImportEdge` — so the test goes from RED to GREEN with no further edits to the
+test.
+
+First, declare the two test-only hooks in `playback/output/win/wingpuimportedge.h`
+(inside the `WinGpuImportEdge` class, alongside `tryImport` and
+`makeGpuFrameHandleForTest`). The tap is the `std::function<void(const FrameHandle&)>`
+the decoder invokes for every imported handle when `OLR_GPU_PIPELINE_TEST_TAP` is
+set; `decodeOneForTest` is the unit-level stand-in for one decode→import that keeps a
+host-built NV12 texture and feeds the resulting `FrameHandle` to the armed tap:
+
+```cpp
+    // Test-only: arm a tap the decoder invokes with every imported FrameHandle
+    // when OLR_GPU_PIPELINE_TEST_TAP is set (production FrameCallback unchanged).
+    void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
+    // Test-only: keep a host-built NV12 texture through the surface concrete, wrap
+    // it in the edge's GPU frame-data, signal the decode-done fence, and feed the
+    // resulting FrameHandle to the armed tap — one decode->import without an
+    // IMFSample. Returns false if the surface keep fails.
+    bool decodeOneForTest(Microsoft::WRL::ComPtr<ID3D11Device> device,
+                          Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12,
+                          int width, int height);
+```
+
+Add `#include <functional>` and a `m_importTap` member to the class. On the stub
+(`wingpuimportedge_stub.cpp`) both hooks are no-ops (`setImportTapForTest` stores
+nothing; `decodeOneForTest` returns `false`) so the spine links on non-Windows.
+
+In `playback/output/win/wingpuimportedge.cpp` (inside `#ifdef _WIN32`), define the
+hooks. `decodeOneForTest` reuses `D3D11GpuSurface::createKept` and
+`makeGpuFrameHandleForTest` (Tasks 3-4) so it shares the exact keep-and-wrap path the
+real `tryImport` uses:
+
+```cpp
+void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&)> tap) {
+    m_importTap = std::move(tap);
+}
+
+bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device,
+                                        ComPtr<ID3D11Texture2D> nv12,
+                                        int width, int height) {
+    auto surface = D3D11GpuSurface::createKept(std::move(device), std::move(nv12),
+                                               0, width, height);
+    if (!surface) return false;
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = width;
+    meta.key.height = height;
+    const FrameHandle handle = makeGpuFrameHandleForTest(std::move(surface), meta);
+    if (m_importTap) m_importTap(handle);
+    return !handle.isNull();
+}
+```
+
+Then wire the decoder gate. In
+`recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp`, add a gated import
+branch. At the top of the `Impl` class add a member and a lazy initializer:
 
 ```cpp
     std::unique_ptr<WinGpuImportEdge> gpuImportEdge;
@@ -1267,7 +1565,7 @@ In `ensureRuntime()` (after `createD3D` succeeds), lazily create the edge + fenc
     }
 ```
 
-In `processOutputFrame` (where `copySampleToFrame` is called, `:889`), branch BEFORE the CPU copy: when `gpuPipelineEnabled`, call `gpuImportEdge->tryImport(sample, /*feedIndex*/ 0, pts90k, width, height)`; on success, signal the decode-done fence (`decodeDoneFence->signalDecodeDone(...)` with the device context) and hand the GPU-backed `FrameHandle` to the handle-aware callback path; on `std::nullopt`, fall through to `copySampleToFrame` (the documented fallback). With `OLR_GPU_PIPELINE` unset, `gpuPipelineEnabled` is false and the code path is byte-identical to today.
+In `processOutputFrame` (where `copySampleToFrame` is called, `:889`), branch BEFORE the CPU copy: when `gpuPipelineEnabled`, call `gpuImportEdge->tryImport(sample, /*feedIndex*/ 0, pts90k, width, height)`; on success, signal the decode-done fence (`decodeDoneFence->signalDecodeDone(...)` with the device context), feed the imported `FrameHandle` to the edge's test tap (the production handle-aware callback path is owned by the playback-worker sibling — this slice only proves the imported handle is correct), and on `std::nullopt`, fall through to `copySampleToFrame` (the documented fallback). With `OLR_GPU_PIPELINE` unset, `gpuPipelineEnabled` is false and the code path is byte-identical to today.
 
 Include the edge/fence headers at the top of the file:
 
@@ -1276,7 +1574,7 @@ Include the edge/fence headers at the top of the file:
 #include "playback/output/win/wingpuimportedge.h"
 ```
 
-> The handle-aware callback delivery is owned by the playback-worker integration sibling; for this slice the decoder exposes the imported `FrameHandle` to the test via a test-only hook (a `std::function<void(const FrameHandle&)>` set when `OLR_GPU_PIPELINE_TEST_TAP` is set), keeping the production `FrameCallback` signature unchanged. Replace the test placeholder with: set the tap, drive one decode of the synthesized gradient frame, capture the `FrameHandle`, `readToCpu(Yuv420p)`, and compare to the CPU helper output |delta|<=1.
+> The handle-aware callback delivery is owned by the playback-worker integration sibling; for this slice the decoder exposes the imported `FrameHandle` to the test via the test-only tap hook (the `std::function<void(const FrameHandle&)>` armed by `setImportTapForTest` and invoked when `OLR_GPU_PIPELINE_TEST_TAP` is set), keeping the production `FrameCallback` signature unchanged. The Step-1 test already drives this end-to-end — it arms the tap, drives one decode of the synthesized gradient frame through `decodeOneForTest`, captures the delivered `FrameHandle`, calls `readToCpu(Yuv420p)`, and compares to the CPU `nativeCopyNv12ToYuv420p` output within |delta|<=1 — so no further test edits are needed once these hooks and the gate land.
 
 Add the `win/` headers to the decoder's include path: the MF decoder already includes from the project root; no CMake include change is needed since `wingpuimportedge.h` / `d3dfence.h` are under the source root.
 

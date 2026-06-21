@@ -17,7 +17,7 @@
 - **Existing counters keep their exact meaning.** `placeholderFramesDelta`, `heldFramesDelta`, `maxClockDivergenceMs`, `decodedVideoFrames`, `stagingVideoFramesDecoded` are unchanged. New counters are strictly additional.
 - **Public-repo professionalism.** Code, comments, and commit messages are self-contained and describe the present design; no internal notes or references to private history.
 - **Format changed lines only.** Some engine files are hand-written Allman; run `git clang-format --binary /opt/homebrew/opt/llvm/bin/clang-format --commit origin/main -- '*.cpp' '*.h'` and stage only the changed-line reformat. Do not reformat whole files.
-- **Build (from the worktree root** `/Users/timo.korkalainen/Development/timo/OpenLiveReplay/.claude/worktrees/gpu-resident-pipeline-design`**):** configure once with `cmake -S . -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON`; build a target with `cmake --build build/c --target <name>`; run a unit test with `ctest --test-dir build/c -R <name> --output-on-failure`; run the full unit label with `ctest --test-dir build/c -L unit --output-on-failure`. Use a fresh `build/` dir when switching configurations.
+- **Build (from the worktree root** `/Users/timo.korkalainen/Development/timo/OpenLiveReplay/.claude/worktrees/gpu-phase0-2-plans`**):** configure once with `cmake -S . -B build/c -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON`; build a target with `cmake --build build/c --target <name>`; run a unit test with `ctest --test-dir build/c -R <name> --output-on-failure`; run the full unit label with `ctest --test-dir build/c -L unit --output-on-failure`. Use a fresh `build/` dir when switching configurations.
 
 ---
 
@@ -52,7 +52,7 @@
   struct GpuReadbackSurfaceKey {
       quint32 busKey = 0;              // OutputBusId stable key (kind<<16 | index)
       qint64  outputFrameIndex = -1;   // the rendered surface's frame index
-      int     format = 0;              // FramePixelFormat ordinal of the readback target
+      FramePixelFormat format = FramePixelFormat::Yuv420p; // the readback target
       bool operator==(const GpuReadbackSurfaceKey& o) const;
   };
 
@@ -117,7 +117,7 @@ void TestGpuReadbackTelemetry::freshSnapshotIsZero() {
 void TestGpuReadbackTelemetry::oneReadbackPerSurfaceIsNotRedundant() {
     auto& t = GpuReadbackTelemetry::instance();
     // Two CPU sinks on bus 0, frame 7, I420 share exactly one GPU readback.
-    const GpuReadbackSurfaceKey k{0u, 7, 1 /*Yuv420p*/};
+    const GpuReadbackSurfaceKey k{0u, 7, FramePixelFormat::Yuv420p};
     t.recordSurface(k);
     t.recordGpuReadback(k);
     const auto s = t.snapshot();
@@ -128,7 +128,7 @@ void TestGpuReadbackTelemetry::oneReadbackPerSurfaceIsNotRedundant() {
 
 void TestGpuReadbackTelemetry::twoReadbacksForSameSurfaceAreRedundant() {
     auto& t = GpuReadbackTelemetry::instance();
-    const GpuReadbackSurfaceKey k{0u, 7, 1};
+    const GpuReadbackSurfaceKey k{0u, 7, FramePixelFormat::Yuv420p};
     t.recordSurface(k);
     t.recordGpuReadback(k);
     t.recordGpuReadback(k); // a second copy of the SAME surface == the bug
@@ -140,8 +140,8 @@ void TestGpuReadbackTelemetry::twoReadbacksForSameSurfaceAreRedundant() {
 
 void TestGpuReadbackTelemetry::distinctFormatsAreDistinctSurfaces() {
     auto& t = GpuReadbackTelemetry::instance();
-    const GpuReadbackSurfaceKey i420{0u, 7, 1 /*Yuv420p*/};
-    const GpuReadbackSurfaceKey nv12{0u, 7, 0 /*Nv12*/};
+    const GpuReadbackSurfaceKey i420{0u, 7, FramePixelFormat::Yuv420p};
+    const GpuReadbackSurfaceKey nv12{0u, 7, FramePixelFormat::Nv12};
     t.recordSurface(i420);
     t.recordSurface(nv12);
     t.recordGpuReadback(i420);
@@ -179,13 +179,15 @@ Create `playback/output/gpureadbacktelemetry.h`:
 #include <QSet>
 #include <QtGlobal>
 
+#include "playback/output/framepixelformat.h"
+
 // Identity of a rendered bus surface for the copy-on-GPU-path invariant: a
 // GPU-backed readToCpu() is permitted ONCE per (busKey, outputFrameIndex,
 // requested CPU format). Two CPU sinks on the same bus + format share one copy.
 struct GpuReadbackSurfaceKey {
     quint32 busKey = 0;            // OutputBusId stable key (kind<<16 | index)
     qint64 outputFrameIndex = -1; // the rendered surface's frame index
-    int format = 0;               // FramePixelFormat ordinal of the readback target
+    FramePixelFormat format = FramePixelFormat::Yuv420p; // the readback target
     bool operator==(const GpuReadbackSurfaceKey& o) const {
         return busKey == o.busKey && outputFrameIndex == o.outputFrameIndex &&
                format == o.format;
@@ -194,7 +196,7 @@ struct GpuReadbackSurfaceKey {
 
 inline uint qHash(const GpuReadbackSurfaceKey& k, uint seed = 0) noexcept {
     return ::qHash(k.busKey, seed) ^ ::qHash(k.outputFrameIndex, seed) ^
-           ::qHash(k.format, seed);
+           ::qHash(static_cast<int>(k.format), seed);
 }
 
 struct GpuReadbackTelemetrySnapshot {
@@ -325,6 +327,7 @@ Create `tests/unit/tst_outputdispatch_gpustats.cpp`:
 // the VRAM/queue/fence/OOM fields are all 0. This pins the inert-on-CPU contract.
 #include <QtTest>
 
+#include "playback/output/framehandle.h"
 #include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputdispatcher.h"
 
@@ -416,7 +419,7 @@ void TestOutputDispatchGpuStats::redundantReadbackSurfacesThroughStats() {
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
     dispatcher.setEndpoints({{feed0, &sink}});
 
-    const GpuReadbackSurfaceKey k{0u, 3, 1};
+    const GpuReadbackSurfaceKey k{0u, 3, FramePixelFormat::Yuv420p};
     GpuReadbackTelemetry::instance().recordSurface(k);
     GpuReadbackTelemetry::instance().recordGpuReadback(k);
     GpuReadbackTelemetry::instance().recordGpuReadback(k); // redundant copy

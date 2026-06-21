@@ -20,7 +20,7 @@ Copied verbatim from the program spec (§1, §7, §9) — these are project-wide
 - **Format changed lines only.** Several engine files use hand-written Allman style; do not reformat whole files. Run `git clang-format --binary /opt/homebrew/opt/llvm/bin/clang-format --commit origin/main -- '*.cpp' '*.h'` on changed lines before each commit.
 - **The Phase-3 deliberate golden re-bake is OUT of this plan (spec §9).** When the GPU compositor later honors real tags, tagged fixtures are **re-goldened on purpose** (correct BT.601/709 + range instead of the height guess). That intentional appearance change is a *separate, later* event tracked separately and is **not** performed, scheduled, or enabled by any task here. This plan ends at a provable no-op.
 
-### Build & test (run from the worktree root `/Users/timo.korkalainen/Development/timo/OpenLiveReplay/.claude/worktrees/gpu-resident-pipeline-design`)
+### Build & test (run from the worktree root `/Users/timo.korkalainen/Development/timo/OpenLiveReplay/.claude/worktrees/gpu-phase0-2-plans`)
 
 Configure once (fresh dir per configuration):
 

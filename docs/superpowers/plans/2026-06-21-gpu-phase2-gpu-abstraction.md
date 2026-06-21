@@ -781,8 +781,14 @@ public:
     bool isValid() const;
 
     // Import `surface` as an RHI texture, run a no-op offscreen pass, and read it
-    // back to CpuPlanes in `target` on the render thread. Blocks the caller until
-    // the readback retires. Empty CpuPlanes on failure (caller degrades).
+    // back to CpuPlanes on the render thread. Blocks the caller until the readback
+    // retires. Empty CpuPlanes on failure (caller degrades).
+    //
+    // Phase-2 contract: `target` MUST be Yuv420p — GPU readback always produces the
+    // Yuv420p oracle format (the ±1-LSB byte-exact path). Any other target is
+    // unsupported here and returns empty (with a warning); cross-format conversion
+    // from a GPU frame is deferred to Phase 3 (gpu-compositor). This is a
+    // deliberate Phase-2 limitation, not a bug.
     CpuPlanes importAndReadback(const std::shared_ptr<GpuSurface>& surface,
                                 FramePixelFormat target);
 
@@ -806,6 +812,7 @@ Create `playback/gpu/gpurhicontext_apple.mm`. The Impl owns a `GpuRenderThread` 
 
 #include <QtGui/rhi/qrhi.h>
 
+#include <QtGlobal>  // qWarning
 #include <QMutex>
 #include <QThread>
 #include <QWaitCondition>
@@ -945,7 +952,16 @@ bool GpuRhiContext::isValid() const { return m_impl && m_impl->thread.rhi != nul
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& surface,
                                            FramePixelFormat target) {
     CpuPlanes result;
-    if (!surface || !surface->isValid() || target != FramePixelFormat::Yuv420p) return result;
+    // Phase-2 GPU readback always produces the Yuv420p oracle format; cross-format
+    // conversion is deferred to Phase 3 (gpu-compositor). Guard explicitly rather
+    // than returning empty silently — an unexpected target is a caller bug.
+    if (target != FramePixelFormat::Yuv420p) {
+        qWarning("GpuRhiContext::importAndReadback: Phase-2 readback is Yuv420p-only "
+                 "(target=%d); cross-format readback is deferred to Phase 3.",
+                 int(target));
+        return result;
+    }
+    if (!surface || !surface->isValid()) return result;
     // The IOSurface's parent CVPixelBuffer: wrapAppleImageBuffer keeps it; here we
     // recover it from the surface for the readback. (The Apple GpuSurface exposes
     // the IOSurface via nativeHandle; the lock-download recreates a CVPixelBuffer
@@ -975,6 +991,8 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
 ```
 
 > **Note on the readback path:** this phase deliberately uses the lock-download as the byte-exact oracle inside `importAndReadback` (it reproduces the existing `copyPixelBufferToAvFrame` NV12→I420 math so the ±1-LSB gate is exact), while still spinning the QRhi offscreen frame so the render-thread + RHI plumbing is exercised end-to-end on the real device. The QRhi import/readback path is NOT exercised for bytes here — the begin/endOffscreenFrame pass is a no-op and the CVPixelBuffer lock-download is the single readback chokepoint, so `copy-detector==1` still holds (one download per frame, not P0.5 validation). The zero-copy `CVMetalTextureCache`→`QRhiTexture::createFrom` readback is the `gpu-compositor` (Phase 3) optimization; promoting it here is gated on P0.5 and does not change the produced bytes.
+
+> **Note on the readback target (Yuv420p-only):** GPU readback in Phase 2 is **Yuv420p-only** — the lock-download oracle produces exactly the I420 format the ±1-LSB gate compares against. `importAndReadback` therefore guards `target != Yuv420p` explicitly (warns + returns empty) rather than silently producing empty planes, so a stray cross-format request surfaces as a loud caller bug instead of a degraded frame. No Phase-2 caller requests a non-Yuv420p target from a GPU frame; cross-format readback/conversion off a GPU surface is deferred to Phase 3 (`gpu-compositor`), where the compositor shader can emit other formats directly. `GpuFrameData::readToCpu` (Task 5) inherits this contract.
 
 Add a non-Apple stub so the type exists everywhere. Create the body inside `playback/gpu/gpurhicontext_stub.cpp` (`create()` → nullptr, `isValid()` → false, `importAndReadback` → empty) and add it to the WIN32 / NOT WIN32 `target_sources` (and `olr_test_playback` non-Apple sources). Mirror the structure of `gpusurface_stub.cpp`.
 
@@ -1017,6 +1035,11 @@ git commit -m "feat(gpu-abstraction): GpuRhiContext (one QRhi, dedicated render 
                    std::shared_ptr<GpuRhiContext> rhi,
                    FramePixelFormat nativeFormat);
       bool isGpuBacked() const override { return true; }
+      // Lazy GPU->CPU download. Phase-2 contract: produces Yuv420p only (the
+      // ±1-LSB oracle path); `target` must be Yuv420p. Cross-format readback off
+      // a GPU frame is deferred to Phase 3 (gpu-compositor) — this mirrors the
+      // GpuRhiContext::importAndReadback guard, not the keystone CpuFrameData
+      // (which converts to Nv12).
       CpuPlanes readToCpu(FramePixelFormat target) const override;   // lazy download
       GpuSurface* gpuSurface() const override;
       FramePixelFormat nativeFormat() const override;
@@ -1159,6 +1182,11 @@ public:
     ~GpuFrameData() override;
 
     bool isGpuBacked() const override { return true; }
+    // Phase-2 GPU readback is Yuv420p-only (the ±1-LSB oracle path): `target` is
+    // forwarded to GpuRhiContext::importAndReadback, which warns + returns empty
+    // for any non-Yuv420p target. Cross-format readback off a GPU frame is
+    // deferred to Phase 3 (gpu-compositor). Unlike the keystone CpuFrameData,
+    // this does NOT convert to other formats — that is a deliberate Phase-2 limit.
     CpuPlanes readToCpu(FramePixelFormat target) const override;
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     FramePixelFormat nativeFormat() const override { return m_nativeFormat; }
@@ -1194,6 +1222,14 @@ GpuFrameData::~GpuFrameData() = default;
 
 CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
     if (!m_surface || !m_rhi) return CpuPlanes{};
+    // Phase-2 GPU readback is Yuv420p-only (the ±1-LSB oracle path). `target` is
+    // forwarded as-is; importAndReadback warns + returns empty for any non-Yuv420p
+    // target (cross-format readback off a GPU frame is deferred to Phase 3,
+    // gpu-compositor). This keeps GpuFrameData consistent with the
+    // GpuRhiContext::importAndReadback contract rather than the keystone
+    // CpuFrameData, which converts to Nv12. No Phase-2 caller requests a
+    // non-Yuv420p target from a GPU frame, so the empty return is unreachable in
+    // practice; the warning makes a future stray request loud instead of silent.
     CpuPlanes planes = m_rhi->importAndReadback(m_surface, target);
     if (planes.isValid()) m_readCount.fetch_add(1, std::memory_order_acq_rel);
     return planes;

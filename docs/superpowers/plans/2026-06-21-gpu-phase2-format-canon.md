@@ -22,7 +22,7 @@ Copied verbatim from the program spec (§1, §7) — these are project-wide rule
 
 ## Build & test commands (from CLAUDE.md; run from the worktree root)
 
-Worktree root for this work: `/Users/timo.korkalainen/Development/timo/OpenLiveReplay/.claude/worktrees/gpu-resident-pipeline-design`.
+Worktree root for this work: `/Users/timo.korkalainen/Development/timo/OpenLiveReplay/.claude/worktrees/gpu-phase0-2-plans`.
 
 ```sh
 # configure once (fresh build dir)
@@ -1059,14 +1059,14 @@ void TestFormatCanon::reconstructorLumaPlacementMatchesCpuOracle() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the cross-validation test — expected PASS**
 
-If the reconstructor's geometry already agrees, this test would pass on first build — to honor TDD, first introduce it expecting RED only if geometry drifted. Since geometry is shared by construction, run it to confirm and treat a PASS here as the cross-check landing green:
+This step is a *cross-validation gate*, not a RED-first step. The test cross-validates the NV12 reference reconstructor against the CPU `Yuv420pCompositor` oracle, and the reconstructor must MATCH the oracle, so it is expected to PASS. Since the grid geometry is shared by construction, run it to confirm the two stay consistent:
 
 ```sh
 cmake --build build/c --target tst_formatcanon && ctest --test-dir build/c -R tst_formatcanon --output-on-failure
 ```
-Expected: PASS. If it FAILS, the reconstructor's tile-rect math has diverged from `yuv420pcompositor.cpp:36-42` — fix the reconstructor's `dstX/dstY/dstRight/dstBottom` to match exactly, not the test.
+Expected: PASS. If it FAILS, the reconstructor's geometry has diverged from the oracle (its tile-rect math no longer matches `yuv420pcompositor.cpp:36-42`) — fix the reconstructor's `dstX/dstY/dstRight/dstBottom` to match the oracle exactly, not the test. This is a cross-validation gate, not a RED-first step.
 
 > Rationale for a non-RED-first step here: this is a *cross-validation guard*, not a new behavior. Its value is catching future drift between two already-consistent implementations; the spec (§9) mandates the CPU oracle as the anchor, so the test asserts that anchoring holds.
 
