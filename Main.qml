@@ -1617,8 +1617,14 @@ ApplicationWindow {
 
                 ListView {
                     id: streamList
-                    Layout.fillHeight: true
+                    // The enclosing ColumnLayout lives inside a ScrollView, so it is
+                    // height-unconstrained (sized to its content). Layout.fillHeight only
+                    // distributes surplus space, of which there is none here, so it would
+                    // collapse this list to its implicitHeight of 0 — hiding every stream
+                    // row. Size to the rows instead and let the outer ScrollView scroll.
+                    Layout.preferredHeight: contentHeight
                     Layout.fillWidth: true
+                    interactive: false
                     clip: true
                     model: appWindow.uiManagerRef.streamUrls
                     spacing: 8
