@@ -566,6 +566,21 @@ if(APPLE)
         TIMEOUT 120
         RUN_SERIAL TRUE)
 
+    # T3.4: long-run clock-skew STABILITY SOAK. Opt-in (SKIPs 77 unless OLR_DRIFT_RUN_SOAK=1) because
+    # a meaningful run is minutes. Records a skewed source (OLR_MARKER_SKEW_PPM) through the real
+    # engine and gates stream continuity + A/V lip-sync lock over the whole run. Recovered ppm and
+    # absolute slip are reported, NOT gated — a single host shares one wall clock over loopback, so
+    # real cross-machine clock accuracy can't be measured here. Base 23750 (free slot between the SRT
+    # band <=23740 and the RTMP band >=23760); generous TIMEOUT covers the default 300 s run (and
+    # longer manual runs) with headroom.
+    add_test(NAME e2e_drift_soak
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_drift_soak.sh" "$<TARGET_FILE:sync_harness>" 23750)
+    set_tests_properties(e2e_drift_soak PROPERTIES
+        LABELS "drift-soak"
+        TIMEOUT 2400
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+
     # Phase 2d: packet-REORDERING recovery. The lossy_udp_relay.py reorder mode
     # delays downstream SRT DATA packets to reorder the link; assert SRT's TSBPD
     # re-orders them (content in-order, pktRcvDropTotal==0) and the relay actually
