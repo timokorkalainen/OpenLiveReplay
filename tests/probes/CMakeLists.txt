@@ -1,0 +1,9 @@
+# Phase-0 GPU probes. Built only when OLR_BUILD_GPU_PROBES=ON. These link Qt RHI
+# (Qt6::GuiPrivate) for measurement; they are NOT part of the shipping app.
+find_package(Qt6 REQUIRED COMPONENTS Core Gui GuiPrivate ShaderTools)
+
+qt_add_executable(rhi_import_probe rhi_import_probe.cpp)
+target_include_directories(rhi_import_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(rhi_import_probe PRIVATE
+    Qt6::Core Qt6::Gui Qt6::GuiPrivate Qt6::ShaderTools
+    olr_warnings olr_sanitize)
