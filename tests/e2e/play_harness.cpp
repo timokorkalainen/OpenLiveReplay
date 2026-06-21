@@ -19,7 +19,7 @@
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
 //              farback | armedcut | armedcut-back | armedcut-seekrace | armedcut-rearm-seek |
-//              playlist
+//              playlist | armedcut-h264
 #include <QCoreApplication>
 #include <QTimer>
 #include <QList>
@@ -129,6 +129,10 @@ int main(int argc, char** argv) {
     // landed AT the next entry's in-point (the divergence gate only proves the epoch
     // tracks itself). 0 for non-playlist scenarios.
     auto* maxLandErr = new qint64(0);
+    // armNextCut return value for armedcut-h264: 1 = armed (pre-roll bank accepted
+    // the cut), 0 = rejected (H.264 guard fired — pre-roll bank skipped H.264
+    // streams, bank empty). -1 = not applicable / armNextCut not called.
+    int armNextCutArmed = -1;
 
     // Print the final counters in a parseable form, then quit.
     auto finish = [&, basePh, baseHeld, maxLandErr]() {
@@ -145,12 +149,13 @@ int main(int argc, char** argv) {
                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d "
-               "maxBoundaryLandingErrMs=%lld\n",
+               "maxBoundaryLandingErrMs=%lld armNextCutArmed=%d decodedVideoFrames=%lld\n",
                c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
-               c.cutFollowReposition, (long long) *maxLandErr);
+               c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
+               (long long) c.decodedVideoFrames);
         fflush(stdout);
         app.quit();
     };
@@ -507,6 +512,36 @@ int main(int argc, char** argv) {
             mon->start(16);
             QTimer::singleShot(14000, &app, finish);
 
+        } else if (scen == "armedcut-h264") {
+            // H.264 pre-roll GUARD: on an H.264 fixture openPrerollContext() skips
+            // all H.264 streams (HW-only, not supported in the pre-roll bank), so
+            // the bank is empty and armNextCut returns FALSE. The UIManager fallback
+            // (recallEntry) issues a plain seek instead. Gate:
+            //   armNextCutArmed==0  -> pre-roll guard fired (armNextCut rejected)
+            //   cutsFired==0        -> no cut was issued (guard blocked it)
+            //   reposition>=1       -> the fallback seek serviced the jump
+            //
+            // Scope note: this validates the worker-level guard + seek;
+            // the UIManager::recallEntry->seekPlayback->SeekCoalescer path is not
+            // exercised here.
+            transport.setSpeed(1.0);
+            transport.seek(0);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&]() {
+                const int64_t target = durMs / 2;
+                armNextCutArmed = worker.armNextCut(target) ? 1 : 0;
+                fprintf(stderr,
+                        "### armedcut-h264 armNextCut(%lldms) returned %d "
+                        "(0=guard fired, 1=armed) ###\n",
+                        (long long) target, armNextCutArmed);
+                // Simulate UIManager::recallEntry fallback: plain seek.
+                transport.seek(target);
+                worker.seekTo(target);
+                fprintf(stderr, "### armedcut-h264 fallback seek to %lldms issued ###\n",
+                        (long long) target);
+            });
+            QTimer::singleShot(4000, &app, finish);
+
         } else {
             fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());
             // Still print counters (all zero) so the driver gets a line, then
@@ -520,12 +555,14 @@ int main(int argc, char** argv) {
                    "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                    "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                    "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d "
-                   "cutFollowReposition=%d\n",
+                   "cutFollowReposition=%d maxBoundaryLandingErrMs=%lld armNextCutArmed=%d "
+                   "decodedVideoFrames=%lld\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                    c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                    (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                    (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
-                   c.cutFollowReposition);
+                   c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
+                   (long long) c.decodedVideoFrames);
             fflush(stdout);
             ::exit(2);
         }

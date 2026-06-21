@@ -52,6 +52,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# H.264-HW availability probe: required for scenarios that record an H.264
+# fixture. Exit 77 (SKIP_RETURN_CODE) if the hardware encoder is unavailable so
+# CTest marks the test as skipped rather than failed on headless/CI runners.
+# NOTE: the encode-caps probe is a valid proxy for decode caps on
+# VideoToolbox/MediaFoundation — encode and decode are paired capabilities on
+# both platforms. VAC-1's codec assertion below catches any silent codec fallback.
+case "$SCENARIO" in
+    h264_play|armedcut-h264)
+        # Capture both output and exit code. A crashing probe exits non-zero —
+        # treat that as FAIL (not SKIP) so a broken record_harness is visible.
+        CAPS="$("$RECORD" --probe-codec-caps 2>&1)"; PROBE_RC=$?
+        if [ "$PROBE_RC" -ne 0 ]; then
+            echo "FAIL: --probe-codec-caps exited $PROBE_RC"
+            printf '%s\n' "$CAPS"
+            exit 1
+        fi
+        H264_AVAIL="$(printf '%s\n' "$CAPS" | awk -F= '/^h264=/{print $2}')"
+        if [ "${H264_AVAIL:-0}" != "1" ]; then
+            echo "SKIP: hardware H.264 unavailable"
+            exit 77
+        fi
+        ;;
+esac
+
 echo "[pb-e2e] scenario=$SCENARIO views=$VIEWS srt_port=$SRT_PORT udp_port=$UDP_PORT record=${SECONDS_TO_RECORD}s"
 
 # --- 1. Producer: synthetic flash/beep timecode source -----------------------
@@ -111,9 +135,18 @@ BRIDGE_PID=$SRT_LAST_PID
 sleep 1.0  # let the SRT listener come up before the caller connects
 
 # --- 2. Record a multi-track fixture -----------------------------------------
+# REC_CODEC_EXTRA: optional --codec h264 for scenarios that require an H.264 fixture.
+# Written as a plain string (not an array) to stay compatible with bash 3.2 (macOS).
+REC_CODEC_EXTRA=""
+case "$SCENARIO" in
+    h264_play|armedcut-h264) REC_CODEC_EXTRA="--codec h264" ;;
+esac
+
 URL="$(srt_caller_url "$SRT_PORT")"
+# shellcheck disable=SC2086
 REC_OUT="$(OLR_VIEWS="$VIEWS" "$RECORD" --url "$URL" --name "olr_pb_${SCENARIO}" \
-    --outdir "$WORKDIR" --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30)"
+    --outdir "$WORKDIR" --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 \
+    $REC_CODEC_EXTRA)"
 REC_RC=$?
 
 # Stop the sender + SRT bridge as soon as the fixture is recorded.
@@ -139,10 +172,29 @@ fi
 VTRACKS="$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 "$FIXTURE" | grep -c .)"
 echo "[pb-e2e] fixture video tracks: ${VTRACKS:-?} (expected $VIEWS)"
 
+# VAC-1: assert the fixture is actually H.264 for the H.264 scenarios. A silent
+# codec fallback (e.g. record_harness ignoring --codec h264 and writing MPEG-2)
+# would make the H.264 gate exercise the wrong codec — assert early so the test
+# fails loudly rather than passing vacuously.
+case "$SCENARIO" in
+    h264_play|armedcut-h264)
+        VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+            -of default=nk=1:nw=1 "$FIXTURE" | head -n1)"
+        echo "[pb-e2e] fixture video codec: ${VCODEC:-?}"
+        if [ "${VCODEC:-}" != "h264" ]; then
+            echo "FAIL: fixture codec is '${VCODEC:-none}', expected h264 — H.264 gate exercising the wrong codec"
+            exit 1
+        fi ;;
+esac
+
 # --- 3. Drive the real PlaybackWorker ----------------------------------------
 PH_SCENARIO="$SCENARIO"
 if [ "$SCENARIO" = "latency" ]; then
     export OLR_AUDIO_LATENCY_MS="${OLR_AUDIO_LATENCY_MS:-300}"
+    PH_SCENARIO="play1x"
+elif [ "$SCENARIO" = "h264_play" ]; then
+    # The H.264 fixture is what makes this an H.264 test; the play scenario is
+    # the same as the regular 1x playback gate.
     PH_SCENARIO="play1x"
 fi
 PLAY_OUT="$("$PLAY" "$FIXTURE" "$PH_SCENARIO" "$VIEWS")"
@@ -177,6 +229,8 @@ maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 cutsFired="$(get cutsFired)"
 cutFollowReposition="$(get cutFollowReposition)"
 maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
+armNextCutArmed="$(get armNextCutArmed)"
+decodedVideoFrames="$(get decodedVideoFrames)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -193,6 +247,8 @@ maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
 [ -n "$cutsFired" ] || cutsFired="?"
 [ -n "$cutFollowReposition" ] || cutFollowReposition="?"
 [ -n "$maxBoundaryLandingErrMs" ] || maxBoundaryLandingErrMs="?"
+[ -n "$armNextCutArmed" ] || armNextCutArmed="?"
+[ -n "$decodedVideoFrames" ] || decodedVideoFrames="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -620,13 +676,56 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    h264_play)
+        # H.264 HW playback decode through the real worker: steady 1x playback
+        # against an H.264 fixture must not reposition (the storm gate holds for
+        # H.264 just as for MPEG-2), and the audio path must have run.
+        if ! num "$reposition" || [ "$reposition" -ne 0 ]; then
+            echo "FAIL: h264_play repositioned (reposition=$reposition, expected 0) — H.264 HW decode path is stormy"
+            fail=1
+        fi
+        if ! num "$audioPushes" || [ "$audioPushes" -le 0 ]; then
+            echo "FAIL: h264_play audio path did not run (audioPushes=$audioPushes, expected >0)"
+            fail=1
+        fi
+        # Real-frames gate: decodedVideoFrames counts every frame committed to the
+        # output cache via insertVideoFrame, regardless of whether an output sink is
+        # connected. A totally-broken H.264 decode (all-gray placeholder / stuck
+        # decoder) produces 0; healthy 12s@30fps@2views ≈ 720 frames. Floor=30 is
+        # conservative (one second per view), comfortably below any passing run and
+        # clearly above a broken decoder.
+        echo "[pb-e2e] h264_play decodedVideoFrames=$decodedVideoFrames"
+        if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -lt 30 ]; then
+            echo "FAIL: h264_play decoded too few real video frames (decodedVideoFrames=$decodedVideoFrames, expected >=30) — H.264 HW decode did not produce real frames"
+            fail=1
+        fi
+        ;;
+    armedcut-h264)
+        # H.264 pre-roll GUARD + UIManager::recallEntry fallback seek:
+        #   armNextCutArmed==0  -> pre-roll guard fired (H.264 streams skipped,
+        #                           bank empty, armNextCut returned false)
+        #   cutsFired==0        -> no cut was issued (guard blocked it)
+        #   reposition>=1       -> the fallback plain seek serviced the jump
+        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 armNextCut returned true on H.264 fixture (armNextCutArmed=$armNextCutArmed, expected 0) — H.264 pre-roll guard did not fire"
+            fail=1
+        fi
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 a cut fired on an H.264 fixture (cutsFired=$cutsFired, expected 0) — pre-roll guard should have blocked it"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -lt 1 ]; then
+            echo "FAIL: armedcut-h264 fallback seek did not reposition (reposition=$reposition, expected >=1) — the plain-seek fallback should have serviced the jump"
+            fail=1
+        fi
+        ;;
     *)
         echo "FAIL: unknown scenario '$SCENARIO'"
         fail=1
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

@@ -340,6 +340,21 @@ set_tests_properties(
     TIMEOUT 180
     RUN_SERIAL TRUE)
 
+# H.264 HW-gated playback gates (SKIP_RETURN_CODE 77 if HW encoder unavailable).
+# Ports 23506 (SRT) / 23507 (UDP) and 23508 (SRT) / 23509 (UDP) are clear of all
+# other port ranges.
+# h264_play: steady 1x playback against an H.264 fixture — reposition==0 AND
+#            audioPushes>0. Validates the HW decode path through the real worker.
+# armedcut-h264: arm a cut on an H.264 fixture — the pre-roll guard fires
+#            (armNextCut returns false, cutsFired==0) and the UIManager fallback
+#            plain seek services the jump (reposition>=1).
+add_test(NAME e2e_play_h264
+    COMMAND bash "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" h264_play 2 23506)
+add_test(NAME e2e_play_armedcut_h264
+    COMMAND bash "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-h264 2 23508)
+set_tests_properties(e2e_play_h264 e2e_play_armedcut_h264 PROPERTIES
+    LABELS "e2e;h264" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
 # --- Report-only frame-sync scoreboard (NON-GATING) -------------------------
 # These drive sync_harness through synthetic synchronized sources and print
 # measured inter-camera offset / drift / lip-sync numbers. They ALWAYS exit 0
