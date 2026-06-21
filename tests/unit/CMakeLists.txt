@@ -68,8 +68,9 @@ if(APPLE)
 elseif(WIN32)
     add_library(olr_test_nativevideodecoder STATIC
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp")
+    target_include_directories(olr_test_nativevideodecoder PRIVATE "${OLR_FFMPEG_INCLUDE}")
     target_link_libraries(olr_test_nativevideodecoder
-        PUBLIC Qt6::Core
+        PUBLIC Qt6::Core olr_test_core
         PRIVATE mfplat mf mfuuid d3d11 dxgi ole32)
     target_link_libraries(tst_nativevideodecoder PRIVATE olr_test_nativevideodecoder)
 elseif(NOT WIN32)
@@ -128,7 +129,7 @@ if(APPLE)
     target_link_directories(olr_test_nativevideoencoder PUBLIC "${OLR_FFMPEG_LIBDIR}")
     target_link_libraries(olr_test_nativevideoencoder
         PUBLIC Qt6::Core olr_test_engine
-        PRIVATE avutil "-framework VideoToolbox" "-framework CoreMedia"
+        PRIVATE "${OLR_FFMPEG_AVUTIL_LIBRARY}" "-framework VideoToolbox" "-framework CoreMedia"
                 "-framework CoreFoundation" "-framework CoreVideo")
     target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
 elseif(WIN32)
@@ -138,7 +139,7 @@ elseif(WIN32)
     target_link_directories(olr_test_nativevideoencoder PUBLIC "${OLR_FFMPEG_LIBDIR}")
     target_link_libraries(olr_test_nativevideoencoder
         PUBLIC Qt6::Core olr_test_engine
-        PRIVATE avutil mfplat mf mfuuid mfreadwrite strmiids ole32)
+        PRIVATE "${OLR_FFMPEG_AVUTIL_LIBRARY}" mfplat mf mfuuid mfreadwrite strmiids ole32)
     target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
 elseif(NOT WIN32)
     add_library(olr_test_nativevideoencoder STATIC

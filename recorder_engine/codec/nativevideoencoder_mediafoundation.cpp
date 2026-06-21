@@ -27,8 +27,12 @@
 // coverage is incomplete). Mirrors nativeaacdecoder_mediafoundation.cpp.
 #include <initguid.h>
 #include <codecapi.h>
-#include <icodecapi.h>
 #include <wrl/client.h>
+
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ICodecAPI, 0x901db4c7, 0x31ce, 0x41a2, 0x85, 0xdc, 0x8f, 0xa0, 0xbf, 0x41, 0xb8,
+                0xda)
+#endif
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -104,9 +108,33 @@ QByteArray annexBToLengthPrefixed(const QList<QByteArray>& nals) {
     return out;
 }
 
-// Convert an Annex B byte stream straight to AVCC (split + length-prefix).
-QByteArray annexBStreamToAvccPacket(const uint8_t* data, int size) {
-    return annexBToLengthPrefixed(splitAnnexB(data, size));
+QByteArray buildAvccFromNals(const QList<QByteArray>& nals) {
+    QList<QByteArray> sps;
+    QList<QByteArray> pps;
+    for (const QByteArray& nal : nals) {
+        if (nal.isEmpty()) {
+            continue;
+        }
+        const int nalType = quint8(nal.at(0)) & 0x1f;
+        if (nalType == 7) {
+            sps.append(nal);
+        } else if (nalType == 8) {
+            pps.append(nal);
+        }
+    }
+    return buildAvcCFromParameterSets(sps, pps);
+}
+
+bool containsH264Idr(const QList<QByteArray>& nals) {
+    for (const QByteArray& nal : nals) {
+        if (nal.isEmpty()) {
+            continue;
+        }
+        if ((quint8(nal.at(0)) & 0x1f) == 5) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void releaseActivations(IMFActivate** activates, UINT32 count) {
@@ -705,20 +733,7 @@ bool MediaFoundationEncoder::buildAvccFromSequenceHeader(QString* error) {
 
     const QList<QByteArray> nals =
         splitAnnexB(reinterpret_cast<const uint8_t*>(blob.constData()), blob.size());
-    QList<QByteArray> sps;
-    QList<QByteArray> pps;
-    for (const QByteArray& nal : nals) {
-        if (nal.isEmpty()) {
-            continue;
-        }
-        const int nalType = quint8(nal.at(0)) & 0x1f;
-        if (nalType == 7) {
-            sps.append(nal); // SPS
-        } else if (nalType == 8) {
-            pps.append(nal); // PPS
-        }
-    }
-    m_avcc = buildAvcCFromParameterSets(sps, pps);
+    m_avcc = buildAvccFromNals(nals);
     return true;
 }
 
@@ -733,7 +748,6 @@ bool MediaFoundationEncoder::emitOutputSample(IMFSample* sample, const PacketCal
     // Determine keyframe via MFSampleExtension_CleanPoint (default: keyframe).
     UINT32 cleanPoint = 1;
     sample->GetUINT32(MFSampleExtension_CleanPoint, &cleanPoint);
-    const bool keyframe = cleanPoint != 0;
 
     // Recover the caller's opaque ptsTicks via the MF sample time we stamped on
     // the matching input, so the callback echoes the caller's value (contract).
@@ -761,12 +775,22 @@ bool MediaFoundationEncoder::emitOutputSample(IMFSample* sample, const PacketCal
         }
         return false;
     }
-    const QByteArray packet =
-        annexBStreamToAvccPacket(reinterpret_cast<const uint8_t*>(data), int(currentLength));
+    const QList<QByteArray> nals =
+        splitAnnexB(reinterpret_cast<const uint8_t*>(data), int(currentLength));
     outBuffer->Unlock();
 
+    if (m_avcc.isEmpty()) {
+        m_avcc = buildAvccFromNals(nals);
+    }
+
+    const bool nalKeyframe = containsH264Idr(nals);
+    if (nalKeyframe) {
+        cleanPoint = 1;
+    }
+
+    const QByteArray packet = annexBToLengthPrefixed(nals);
     if (!packet.isEmpty() && onPacket) {
-        onPacket(packet, ptsTicks, keyframe);
+        onPacket(packet, ptsTicks, cleanPoint != 0);
     }
     return true;
 }

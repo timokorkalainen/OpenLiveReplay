@@ -81,7 +81,7 @@ fi
 URL="$(rtmp_url "$PORT")"
 "$HARNESS" --url "$URL" \
     --name "rtmp_soak_${CODEC}" --outdir "$WORKDIR" --seconds "$SECS" \
-    --width 640 --height 480 --fps 30 >"$HARNESS_OUT" 2>"$HARNESS_ERR"
+    --width 640 --height 480 --fps 30 --qt-log-stderr >"$HARNESS_OUT" 2>"$HARNESS_ERR"
 RC=$?
 OUT_MKV="$(tail -n 1 "$HARNESS_OUT" 2>/dev/null || true)"
 

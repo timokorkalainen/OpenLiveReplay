@@ -22,6 +22,7 @@ WRITE_BASELINE="${4:-}"
 # shellcheck source=tests/e2e/srt_lib.sh
 . "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
 srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
+olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 0; }
 
 WORKDIR="$(mktemp -d)"
 PIDS=()
@@ -50,13 +51,13 @@ produce() {
             -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
             -filter_complex "[0:v]${vflt}[v];[1:a]volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame[a]" \
             -map "[v]" -map "[a]" \
-            -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+            "${OLR_H264_VCODEC_ARGS[@]}" \
             -c:a aac -b:a 128k \
             -f mpegts "udp://127.0.0.1:${port}?pkt_size=1316" &
     else
         ffmpeg -hide_banner -loglevel error -re \
             -f lavfi -i "$vsrc" -vf "$vflt" \
-            -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+            "${OLR_H264_VCODEC_ARGS[@]}" \
             -f mpegts "udp://127.0.0.1:${port}?pkt_size=1316" &
     fi
     PIDS+=($!)
@@ -114,13 +115,14 @@ echo "=== sync scoreboard: ${SCENARIO} ==="
 
 case "$SCENARIO" in
   intercam_matched)
+    olr_ffmpeg_has_muxer tee || { echo "SKIP: ffmpeg tee muxer not available"; exit 0; }
     # One producer split to two ports via the tee muxer: byte-identical, same
     # PTS, simultaneous. Any measured offset is engine anchoring/mux, not source.
     P0=$BASE_PORT; P1=$((BASE_PORT+1))
     vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "color=c=black:s=320x240:r=30" -vf "$vflt" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+        "${OLR_H264_VCODEC_ARGS[@]}" \
         -map 0:v \
         -f tee "[f=mpegts]udp://127.0.0.1:${P0}?pkt_size=1316|[f=mpegts]udp://127.0.0.1:${P1}?pkt_size=1316" &
     PIDS+=($!)
@@ -172,6 +174,7 @@ case "$SCENARIO" in
     ;;
 
   intercam_trim)
+    olr_ffmpeg_has_muxer tee || { echo "SKIP: ffmpeg tee muxer not available"; exit 0; }
     # Proof that the per-source trim shifts a source by the set amount, in the
     # robust DELAY direction. ONE tee'd source feeds both views (identical content,
     # simultaneous), so the untrimmed inter-view offset is ≈0; a +TRIM on source 1
@@ -186,7 +189,7 @@ case "$SCENARIO" in
     measure_trim() {
         ffmpeg -hide_banner -loglevel error -re \
             -f lavfi -i "color=c=black:s=320x240:r=30" -vf "$vflt" \
-            -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+            "${OLR_H264_VCODEC_ARGS[@]}" \
             -map 0:v \
             -f tee "[f=mpegts]udp://127.0.0.1:${P0}?pkt_size=1316|[f=mpegts]udp://127.0.0.1:${P1}?pkt_size=1316" &
         local pid=$!
@@ -246,6 +249,8 @@ case "$SCENARIO" in
     ;;
 
   lipsync)
+    olr_ffmpeg_has_filter volume || { echo "SKIP: ffmpeg volume filter not available"; exit 0; }
+    olr_ffmpeg_has_filter silencedetect || { echo "SKIP: ffmpeg silencedetect filter not available"; exit 0; }
     # One source with a co-timed flash + beep every second. Measure audio-onset
     # minus video-flash PTS (signed ms). EBU R37 band is +40/-60 ms (context).
     P0=$BASE_PORT

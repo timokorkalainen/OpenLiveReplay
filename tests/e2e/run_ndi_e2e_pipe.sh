@@ -21,10 +21,16 @@ REC_SECS="${OLR_NDI_PIPE_RECORD_SECS:-12}"
 CAP_SECS="${OLR_NDI_PIPE_CAPTURE_SECS:-6}"
 SRC_NAME="OLR NDI Pipe SRC $$"
 OUT_NAME="OLR NDI Pipe OUT $$"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# shellcheck source=tool_env.sh
+. "$HERE/tool_env.sh"
+olr_prepend_built_tool_paths
 
 command -v ffmpeg  >/dev/null || { echo "SKIP: ffmpeg not found";  exit "$SKIP"; }
 command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit "$SKIP"; }
-command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit "$SKIP"; }
+olr_python3_usable || { echo "SKIP: usable python3 not found"; exit "$SKIP"; }
+olr_ffmpeg_has_muxer rawvideo || { echo "SKIP: ffmpeg rawvideo muxer not available"; exit "$SKIP"; }
 
 WORK="$(mktemp -d)"
 SENDER_PID=""; PLAY_PID=""

@@ -30,6 +30,7 @@ MAX_SPREAD_MS="${OLR_SRT_SYNC_MAX_SPREAD_MS:-250}"
 DROP_VIEW="${OLR_SRT_SYNC_DROP_VIEW:-}"
 
 srt_require_tools
+olr_ffmpeg_has_muxer tee || { echo "SKIP: ffmpeg tee muxer not available"; exit 0; }
 WORKDIR="$(mktemp -d)"
 PIDS=()
 cleanup() { (( ${#PIDS[@]} )) && kill "${PIDS[@]}" 2>/dev/null; wait 2>/dev/null; rm -rf "$WORKDIR"; }

@@ -29,6 +29,7 @@ SRT0=$BASE;       UDP0=$((BASE+1))
 SRT1=$((BASE+2)); UDP1=$((BASE+3))
 
 srt_require_tools
+olr_ffmpeg_has_muxer tee || { echo "SKIP: ffmpeg tee muxer not available"; exit 0; }
 WORKDIR="$(mktemp -d)"
 PIDS=()
 cleanup() { (( ${#PIDS[@]} )) && kill "${PIDS[@]}" 2>/dev/null; wait 2>/dev/null; rm -rf "$WORKDIR"; }

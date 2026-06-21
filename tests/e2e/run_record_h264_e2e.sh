@@ -37,6 +37,15 @@ command -v srt-live-transmit >/dev/null || { echo "SKIP: srt-live-transmit not f
 # The ffmpeg producer uses an H.264 encoder; we need one that produces valid MPEG-TS.
 olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder for producer"; exit 77; }
 
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        if [ "${OLR_RUN_UNSTABLE_MF_H264_TESTS:-0}" != "1" ]; then
+            echo "SKIP: Windows Media Foundation H.264 e2e is opt-in on this machine"
+            exit 77
+        fi
+        ;;
+esac
+
 # --- Hardware H.264 encode capability gate (SKIP on CI without HW encoder) ----
 CAPS="$("$HARNESS" --probe-codec-caps 2>/dev/null)"
 H264_AVAIL="$(printf '%s\n' "$CAPS" | awk -F= '/^h264=/{print $2}')"

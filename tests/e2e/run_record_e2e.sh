@@ -32,6 +32,7 @@ SECONDS_TO_RECORD=6
 # shellcheck source=tests/e2e/srt_lib.sh
 . "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
 srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
+olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 0; }
 
 if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
 
@@ -55,7 +56,7 @@ ffmpeg -hide_banner -loglevel error -re \
     -f lavfi -i "testsrc2=size=640x480:rate=30" \
     -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
     -ac "$CH" \
-    -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+    "${OLR_H264_VCODEC_ARGS[@]}" \
     -c:a aac -b:a 128k \
     -f mpegts "udp://127.0.0.1:${UDP_PORT}?pkt_size=1316" &
 PIDS+=($!)

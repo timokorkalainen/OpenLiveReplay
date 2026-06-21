@@ -51,3 +51,29 @@ olr_h264_vcodec_args() {
     fi
     return 1
 }
+
+olr_ffmpeg_has_muxer() {
+    local muxer="${1:?muxer name required}"
+    ffmpeg -hide_banner -muxers 2>/dev/null \
+        | awk '{print $2}' \
+        | grep -Fxq "$muxer"
+}
+
+olr_ffmpeg_has_demuxer() {
+    local demuxer="${1:?demuxer name required}"
+    ffmpeg -hide_banner -demuxers 2>/dev/null \
+        | awk '{print $2}' \
+        | grep -Fxq "$demuxer"
+}
+
+olr_ffmpeg_has_filter() {
+    local filter="${1:?filter name required}"
+    ffmpeg -hide_banner -filters 2>/dev/null \
+        | awk '{print $2}' \
+        | grep -Fxq "$filter"
+}
+
+olr_python3_usable() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 -c 'import sys' >/dev/null 2>&1
+}

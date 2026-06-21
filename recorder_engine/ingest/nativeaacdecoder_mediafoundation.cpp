@@ -140,9 +140,11 @@ void NativeAacDecoder::Impl::shutdownRuntime() {
 // stream format actually changes (new AudioSpecificConfig) and from shutdownRuntime/dtor.
 void NativeAacDecoder::Impl::teardownTransform() {
     if (transform) {
+        // We may tear down while live ingest stops with buffered decoder output.
+        // Flushing is enough before releasing the MFT; sending EOS/end-stream here
+        // asks the decoder to transition a stream we are not going to drain, which
+        // has proven brittle with the Windows AAC MFT during capture-thread exit.
         transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
     transform.Reset();
     sampleRate = 0;
@@ -441,7 +443,10 @@ bool NativeAacDecoder::Impl::processFrame(const QByteArray& rawAac, std::vector<
         const bool provideSample = (streamInfo.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) == 0;
         ComPtr<IMFSample> outputSample;
         if (provideSample) {
-            const DWORD outputSize = std::max<DWORD>(streamInfo.cbSize, 4096);
+            // One stereo AAC-LC frame is 4096 bytes as S16, but some AAC MFTs report
+            // a tiny cbSize and can coalesce buffered output after live jitter. Use
+            // a conservative sample buffer rather than depending on that hint.
+            const DWORD outputSize = std::max<DWORD>(streamInfo.cbSize, 64 * 1024);
             ComPtr<IMFMediaBuffer> outputBuffer;
             hr = MFCreateMemoryBuffer(outputSize, &outputBuffer);
             if (SUCCEEDED(hr)) {

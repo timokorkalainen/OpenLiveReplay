@@ -9,6 +9,7 @@
 #include <QUrlQuery>
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <utility>
 
@@ -34,16 +35,40 @@ constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
 
 std::mutex srtLibraryMutex;
 int srtLibraryRefs = 0;
+bool srtLibraryInitialized = false;
+
+#ifdef _WIN32
+bool srtLibraryCleanupRegistered = false;
+
+void cleanupSrtLibraryAtExit() {
+    std::lock_guard<std::mutex> lock(srtLibraryMutex);
+    if (!srtLibraryInitialized) {
+        return;
+    }
+    srt_clearlasterror();
+    srt_cleanup();
+    srt_clearlasterror();
+    srtLibraryInitialized = false;
+    srtLibraryRefs = 0;
+}
+#endif
 
 bool acquireSrtLibrary(QString* error) {
     std::lock_guard<std::mutex> lock(srtLibraryMutex);
-    if (srtLibraryRefs == 0 && srt_startup() == SRT_ERROR) {
+    if (!srtLibraryInitialized && srt_startup() == SRT_ERROR) {
         if (error) {
             *error = QStringLiteral("Native SRT startup failed: %1")
                          .arg(QString::fromUtf8(srt_getlasterror_str()));
         }
         return false;
     }
+    srtLibraryInitialized = true;
+#ifdef _WIN32
+    if (!srtLibraryCleanupRegistered) {
+        std::atexit(cleanupSrtLibraryAtExit);
+        srtLibraryCleanupRegistered = true;
+    }
+#endif
     ++srtLibraryRefs;
     return true;
 }
@@ -55,7 +80,16 @@ void releaseSrtLibrary() {
     }
     --srtLibraryRefs;
     if (srtLibraryRefs == 0) {
+#ifdef _WIN32
+        // Close sessions on their capture threads, but tear down libsrt's global
+        // worker pool from the process atexit hook. Calling srt_cleanup() here
+        // can race the same short-lived thread's TLS CUDTException destructor;
+        // never calling it leaves libsrt worker threads alive into DLL detach.
+        return;
+#else
         srt_cleanup();
+        srtLibraryInitialized = false;
+#endif
     }
 }
 
@@ -282,6 +316,10 @@ void NativeSrtIngestSession::run() {
             continue;
         }
 
+        if (shouldStop()) {
+            break;
+        }
+
         if (isAsyncReceivePending()) {
             if (m_lastPacketAtMs >= 0 &&
                 m_monotonic.elapsed() - m_lastPacketAtMs > kStallTimeoutMs) {
@@ -315,10 +353,16 @@ void NativeSrtIngestSession::run() {
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(false);
     }
+#ifdef _WIN32
+    srt_clearlasterror();
+#endif
 }
 
 void NativeSrtIngestSession::requestStop() {
     m_stopRequested.store(true, std::memory_order_relaxed);
+    // Force any in-flight receive/accept/connect out promptly. Global libsrt cleanup
+    // is deferred on Windows, and run() checks shouldStop() before asking more socket
+    // state, so this cross-thread close is only used as a wakeup.
     closeSocket();
 }
 
@@ -581,6 +625,15 @@ void NativeSrtIngestSession::closeSocket() {
         srt_close(m_listenSocket);
         m_listenSocket = SRT_INVALID_SOCK;
     }
+#ifdef _WIN32
+    if (m_srtLibraryStarted) {
+        // Clear libsrt's per-thread CUDTException before a short-lived capture
+        // thread exits. The Windows build frees that TLS object in the DLL
+        // callback, and leaving the last async receive error live can trip heap
+        // corruption during thread teardown.
+        srt_clearlasterror();
+    }
+#endif
     if (m_srtLibraryStarted) {
         m_srtLibraryStarted = false;
         releaseSrtLibrary();
