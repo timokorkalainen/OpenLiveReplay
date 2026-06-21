@@ -574,6 +574,14 @@ elseif(APPLE) # macOS Desktop
     endif()
     target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
     target_link_libraries(OpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
+elseif(UNIX AND NOT APPLE) # Linux desktop (CI second toolchain; system FFmpeg)
+    # FFmpeg from the distro (apt libav*-dev) via pkg-config. Native SRT/RTMP
+    # ingest is not compiled on Linux (cross-platform stubs), so libsrt is not
+    # linked into the app here.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(OLR_FFMPEG REQUIRED IMPORTED_TARGET
+        libavformat libavcodec libavutil libswscale libswresample)
+    target_link_libraries(OpenLiveReplay PRIVATE PkgConfig::OLR_FFMPEG)
 endif()
 
 # 5. Standard Qt Linking
