@@ -20,6 +20,10 @@ qt_add_qml_module(OlrStyle
         Frame.qml
         TabButton.qml
         TabBar.qml
+        ToolTip.qml
+        Popup.qml
+        Menu.qml
+        MenuItem.qml
 )
 
 # The delegates import OlrTheme for tokens; link the backing module so it is on the

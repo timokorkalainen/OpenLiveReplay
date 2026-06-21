@@ -40,12 +40,11 @@ QtObject {
     readonly property color accentPressed: "#1F66E0"
     readonly property color focusRing: "#2E7BFF"
 
-    // --- Type --- (single families / Qt generics — a comma list is NOT a valid
-    // font.family and silently falls back; use font.families for a preference list.)
-    readonly property var fontStack: ["Inter", "Segoe UI", "Roboto", "Helvetica Neue", "sans-serif"]
-    readonly property var fontMonoStack: ["Menlo", "Consolas", "DejaVu Sans Mono", "monospace"]
-    readonly property string fontFamily: "sans-serif"  // generic fallback for font.family
-    readonly property string fontMono: "monospace"     // generic mono (tabular) for timecode
+    // --- Type --- QML's font.family takes a SINGLE family; a comma list (and font.families,
+    // which is not a QML font property) silently fail. So use Qt generic families, which
+    // resolve to the platform UI sans and a real monospace on every OS.
+    readonly property string fontFamily: "sans-serif" // generic UI sans
+    readonly property string fontMono: "monospace"    // generic monospace (tabular) for timecode
     readonly property int fsMicro: 11
     readonly property int fsBody: 13
     readonly property int fsHeading: 15

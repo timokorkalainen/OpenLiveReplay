@@ -11,6 +11,7 @@ T.CheckBox {
                              implicitIndicatorHeight + topPadding + bottomPadding, Theme.hControl)
     padding: Theme.s1
     spacing: Theme.s2
+    opacity: control.enabled ? 1.0 : 0.5
 
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fsBody
@@ -22,9 +23,11 @@ T.CheckBox {
                         : control.leftPadding + (control.availableWidth - width) / 2
         y: control.topPadding + (control.availableHeight - height) / 2
         radius: Theme.r1
-        color: control.checked ? Theme.accent : Theme.panelPressed
+        // accent fill for both checked AND partially-checked, so the (dark) tick/dash
+        // reads against it; unchecked stays sunken-dark.
+        color: control.checkState !== Qt.Unchecked ? Theme.accent : Theme.panelPressed
         border.width: Theme.borderW
-        border.color: control.checked ? Theme.accent
+        border.color: control.checkState !== Qt.Unchecked ? Theme.accent
                      : (control.visualFocus ? Theme.focusRing : Theme.lineStrong)
 
         Text {

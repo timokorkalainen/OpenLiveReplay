@@ -11,6 +11,7 @@ T.Switch {
                              implicitIndicatorHeight + topPadding + bottomPadding, Theme.hControl)
     padding: Theme.s1
     spacing: Theme.s2
+    opacity: control.enabled ? 1.0 : 0.5
 
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fsBody

@@ -15,6 +15,7 @@ T.ComboBox {
     rightPadding: 28
     topPadding: Theme.s1
     bottomPadding: Theme.s1
+    opacity: control.enabled ? 1.0 : 0.5
 
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fsBody
@@ -50,13 +51,23 @@ T.ComboBox {
         }
     }
 
-    contentItem: Text {
+    // A TextField (not a plain Text) so an editable ComboBox routes keyboard input,
+    // caret and selection; for a non-editable combo it is disabled and just shows the
+    // current text. Mirrors the QtQuick Controls Basic/Fusion ComboBox pattern.
+    contentItem: T.TextField {
         leftPadding: 0
-        text: control.displayText
+        rightPadding: 0
+        text: control.editable ? control.editText : control.displayText
+        enabled: control.editable
+        autoScroll: control.editable
+        readOnly: control.down
+        inputMethodHints: control.inputMethodHints
+        validator: control.validator
         font: control.font
         color: Theme.textHi
+        selectionColor: Theme.accent
+        selectedTextColor: Theme.textOnTally
         verticalAlignment: Text.AlignVCenter
-        elide: Text.ElideRight
     }
 
     background: Rectangle {

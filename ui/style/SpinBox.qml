@@ -11,6 +11,7 @@ T.SpinBox {
 
     leftPadding: Theme.s2
     rightPadding: Theme.s2 + (up.indicator ? up.indicator.width : 0)
+    opacity: control.enabled ? 1.0 : 0.5
 
     font.family: Theme.fontFamily
     font.pixelSize: Theme.fsBody

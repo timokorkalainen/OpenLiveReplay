@@ -825,7 +825,7 @@ ApplicationWindow {
                                     return appWindow.uiManagerRef.sourceDisplayLabel(src)
                                 }
                                 color: "white"
-                                font.family: "monospace"
+                                font.family: Theme.fontMono
                                 font.pixelSize: 14
                             }
                         }
@@ -910,7 +910,7 @@ ApplicationWindow {
                                         return appWindow.uiManagerRef.sourceDisplayLabel(src)
                                     }
                                     color: "white"
-                                    font.family: "monospace"
+                                    font.family: Theme.fontMono
                                     font.pixelSize: 12
                                 }
                             }
@@ -1055,7 +1055,7 @@ ApplicationWindow {
                         // Stream Deck shows. Do not reformat here.
                         text: appWindow.uiManagerRef.playbackTimecode
                         color: "#eeeeee"
-                        font.family: "Menlo"
+                        font.family: Theme.fontMono
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
                         MouseArea {
@@ -1195,7 +1195,7 @@ ApplicationWindow {
                                : playbackTab.formatTimeOfDay(Date.now()))
                             : playbackTab.formatTimecode(appWindow.uiManagerRef.recordedDurationMs)
                         color: "#eeeeee"
-                        font.family: "Menlo"
+                        font.family: Theme.fontMono
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
                         MouseArea {
@@ -1207,14 +1207,15 @@ ApplicationWindow {
                 }
             }
 
-            // --- Project Tab --- (scrollable: its stacked settings exceed any normal
-            // window height; the horizontal scrollbar reaches wide source/NDI rows.)
+            // --- Project Tab --- (vertically scrollable: its stacked settings exceed any
+            // normal window height. Content is pinned to the viewport width, so wide blocks
+            // — the NDI Outputs table, source rows — scroll within their own inner views.)
             ScrollView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 contentWidth: availableWidth
                 clip: true
-                ScrollBar.horizontal.policy: ScrollBar.AsNeeded
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
                 ColumnLayout {
                     id: projectTab

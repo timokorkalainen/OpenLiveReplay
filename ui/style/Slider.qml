@@ -8,6 +8,7 @@ T.Slider {
     implicitWidth: control.horizontal ? 120 : implicitHandleWidth + leftPadding + rightPadding
     implicitHeight: control.horizontal ? implicitHandleHeight + topPadding + bottomPadding : 120
     padding: control.horizontal ? 0 : Theme.s1
+    opacity: control.enabled ? 1.0 : 0.5
 
     background: Rectangle {
         x: control.leftPadding + (control.horizontal ? 0 : (control.availableWidth - width) / 2)

@@ -316,9 +316,19 @@ jobs:
         # promote the high-signal categories to errors to make them a real gate;
         # known false positives are suppressed inline with `// qmllint disable`.
         run: |
+          # The bespoke OlrTheme module is emitted by the CMake build, which this
+          # lightweight job does not run (Qt only, not the full native toolchain). It is
+          # pure QML, so synthesize a throwaway import dir with a qmldir so qmllint can
+          # resolve `import OlrTheme` and Main.qml's Theme.* references without a build.
+          # (Required now that --unqualified is an error: an unresolved import would turn
+          # every Theme.* reference into a hard failure.)
+          LINT_IMPORTS="$(mktemp -d)"
+          mkdir -p "$LINT_IMPORTS/OlrTheme"
+          ln -s "$PWD/ui/theme/Theme.qml" "$LINT_IMPORTS/OlrTheme/Theme.qml"
+          printf 'module OlrTheme\nsingleton Theme 1.0 Theme.qml\n' > "$LINT_IMPORTS/OlrTheme/qmldir"
           "$QT_ROOT_DIR/bin/qmllint" \
             --unqualified error --Quick.layout-positioning error \
-            -I "$QT_ROOT_DIR/qml" \
+            -I "$LINT_IMPORTS" -I "$QT_ROOT_DIR/qml" \
             Main.qml MultiviewWindow.qml CodecSettingsPanel.qml
 
       # qmlformat is ADVISORY (report-only): the existing QML predates it, so it is
