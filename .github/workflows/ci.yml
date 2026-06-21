@@ -254,6 +254,7 @@ jobs:
             ui/components/PgmStage.qml \
             ui/components/ProjectSettingsPanel.qml \
             ui/components/SourceListPanel.qml \
+            ui/components/StatusStrip.qml \
             ui/components/TransportDock.qml
 
       # qmlformat is ADVISORY (report-only): the existing QML predates it, so it is
