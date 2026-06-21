@@ -14,6 +14,7 @@ option(OLR_BUILD_TESTS "Build the OpenLiveReplay test suite" OFF)
 option(OLR_WERROR "Treat warnings as errors for first-party targets" ON)
 option(OLR_WCONVERSION "Also enable the -Wconversion/-Wsign-conversion family (large backlog; opt-in)" OFF)
 option(OLR_BUILD_FUZZERS "Build libFuzzer harnesses for the input parsers (needs clang+libFuzzer)" OFF)
+option(OLR_GPU_PIPELINE "Build the GPU-resident pipeline (RHI spine, shaders), default off" OFF)
 option(OLR_BUILD_GPU_PROBES "Build Phase-0 GPU measurement probes (links Qt RHI; not shipped)" OFF)
 set(OLR_SANITIZER "" CACHE STRING
     "Sanitizers to enable, e.g. address, thread, undefined, or 'address;undefined'")
@@ -105,6 +106,12 @@ FetchContent_MakeAvailable(rtmidi)
 
 # 1. Find Qt
 find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network WebSockets)
+if(OLR_GPU_PIPELINE)
+    # RHI lives in Qt6::GuiPrivate (<rhi/qrhi.h> is a semi-public Gui header);
+    # qsb / qt_add_shaders come from Qt6::ShaderTools. This path is coupled to
+    # the project's Qt 6.10.x toolchain by design.
+    find_package(Qt6 REQUIRED COMPONENTS Gui GuiPrivate ShaderTools)
+endif()
 qt_standard_project_setup(REQUIRES 6.8)
 
 # All QML modules output under one dir so the build-time import path resolves every

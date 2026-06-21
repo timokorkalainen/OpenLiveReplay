@@ -175,3 +175,7 @@ olr_add_unit_test(tst_realcodecbenchmark olr_test_engine)
 target_link_libraries(tst_realcodecbenchmark PRIVATE olr_test_nativevideoencoder olr_test_nativevideodecoder)
 olr_add_unit_test(tst_benchmarkcache olr_test_engine)
 olr_add_unit_test(tst_recordgate olr_test_engine)
+
+if(OLR_GPU_PIPELINE)
+    olr_add_unit_test(tst_shadertoolchain olr_test_gpu)
+endif()
