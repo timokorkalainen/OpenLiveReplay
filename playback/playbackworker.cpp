@@ -37,6 +37,7 @@ PlaybackWorker::~PlaybackWorker() {
     // Tier3 pre-roll: run()'s cleanup clears these on a clean exit; defensively
     // free here too in case the thread never ran (the QVectors are then empty).
     for (auto* track : m_prerollBank) {
+        track->nativeDecoder.reset(); // tear down VT/MF session before freeing track
         if (track->codecCtx) avcodec_free_context(&track->codecCtx);
         delete track;
     }
@@ -849,6 +850,16 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     // below so the fill aborts with the bank still parked forward — the reposition
     // then has to be retried (2-3 reactive backward-jumps) before the stale frames
     // drain. Flushing here makes a single reposition resync the bank deterministically.
+    //
+    // H.264 primary tracks have codecCtx == nullptr (they decode via nativeDecoder),
+    // so they are intentionally NOT flushed here: NativeVideoDecoder::decode() drains
+    // every frame for the submitted access unit before it returns (VideoToolbox
+    // WaitForAsynchronousFrames / MediaFoundation drainSync) and re-supplies parameter
+    // sets per call, so it holds NO inter-call output FIFO — there is no stale
+    // post-seek frame to drain. This invariant is what makes a BACKWARD H.264 armed
+    // cut (decoder-follow → cutFollow repositionTo) resync in a single pass, the same
+    // as the flushed MPEG-2 path; e2e_play_armedcut_h264_back locks it in (a future
+    // buffering/reordering native decoder would trip its reposition/held gates).
     for (auto* track : m_decoderBank)
         if (track->codecCtx) avcodec_flush_buffers(track->codecCtx);
     for (auto* aTrack : m_audioDecoderBank)
@@ -1264,6 +1275,15 @@ void PlaybackWorker::fillStaging() {
                 // NativeVideoDecoder::decode() is SYNCHRONOUS — the stage lambda
                 // fires inline on this (worker) thread before decode() returns, so
                 // m_stagingNewestRefPtsMs is updated before the coverage check below.
+                // This holds on VideoToolbox (WaitForAsynchronousFrames blocks until
+                // the output callback runs) and is the only configuration validated
+                // here. An ASYNC MediaFoundation MFT (Windows) could defer delivery
+                // past this call; that deeper coverage/PTS correctness is a known
+                // limitation shared with the primary decode bank and is tracked as a
+                // follow-up (the staging fill would then need a blocking per-AU drain).
+                // The stage lambda captures the per-packet locals BY VALUE so a
+                // (hypothetical) deferred callback can never read a stale/dangling
+                // reference — behavior-identical to the inline VT path.
                 AVRational tb = m_prerollFmtCtx->streams[track->streamIndex]->time_base;
                 const int64_t pktPts = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
                 // Convert avcC length-prefixed packet → Annex B (verbatim from
@@ -1293,7 +1313,8 @@ void PlaybackWorker::fillStaging() {
                         (pkt->dts != AV_NOPTS_VALUE) ? av_rescale_q(pkt->dts, tb, {1, 90000}) : -1;
                     unit.annexB = annexB;
 
-                    auto stage = [&](AVFrame* nativeVf) {
+                    auto stage = [this, pktPts, tb, target, track,
+                                  primaryStreamIndex](AVFrame* nativeVf) {
                         int64_t framePtsMs;
                         if (pktPts != AV_NOPTS_VALUE) {
                             framePtsMs = av_rescale_q(pktPts, tb, {1, 1000});
@@ -1305,6 +1326,7 @@ void PlaybackWorker::fillStaging() {
                         mediaFrame.ptsMs = framePtsMs;
                         if (mediaFrame.isValid()) {
                             m_prerollStagingCache->insertVideoFrame(mediaFrame);
+                            m_counters.stagingVideoFramesDecoded++;
                             if (track->streamIndex == primaryStreamIndex) {
                                 m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
                             }
@@ -1331,6 +1353,7 @@ void PlaybackWorker::fillStaging() {
                         mediaFrame.ptsMs = framePtsMs;
                         if (mediaFrame.isValid()) {
                             m_prerollStagingCache->insertVideoFrame(mediaFrame);
+                            m_counters.stagingVideoFramesDecoded++;
                             if (track->streamIndex == primaryStreamIndex)
                                 m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
                         }

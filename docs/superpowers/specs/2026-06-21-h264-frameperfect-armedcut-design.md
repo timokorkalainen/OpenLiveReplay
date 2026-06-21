@@ -78,11 +78,13 @@ assertions to mirror the MPEG-2 `armedcut` gate:
 - `cutsFired == 2` (queued re-arm fired),
 - `cutFollowReposition == 0` (forward cut, no backward decoder-follow),
 - `maxClockDivergenceMs <= 1500` (frame-accurate, epoch re-anchored),
-- **`decodedVideoFrames >= 30`** (non-vacuity: proves real HW frames were decoded into staging, not an
-  empty/placeholder cache "firing" a cut). `armNextCutArmed` flips to `1` (armed) — assert that too.
+- **`decodedVideoFrames >= 30`** (corroborates the primary H.264 HW decoder ran). `armNextCutArmed`
+  flips to `1` (armed) — assert that too.
 
-This makes the gate prove the feature works (the same standard as MPEG-2), and the `decodedVideoFrames`
-floor is the load-bearing non-vacuity guard.
+This makes the gate prove the feature works (the same standard as MPEG-2). **Correction (adversarial
+review):** `decodedVideoFrames` counts the PRIMARY bank only, so it does NOT prove the *staging* decode —
+the load-bearing non-vacuity guard is the dedicated `stagingVideoFramesDecoded >= 15` counter plus
+`heldFramesDelta <= 20`, both added in the fix wave. See the "Adversarial review" section below.
 
 ## Risks
 
@@ -97,7 +99,8 @@ floor is the load-bearing non-vacuity guard.
 
 - No change to the primary live decode bank (already HW-decodes H.264).
 - No B-frame / non-intra handling (the mezzanine is all-intra by construction).
-- No header/`DecoderTrack` change (fields already exist).
+- No `DecoderTrack` change (its `nativeDecoder`/`h264ParamSets`/`codecWidth/Height` fields already exist).
+  (The fix wave did add one `PlaybackCounters` field, `stagingVideoFramesDecoded` — see below.)
 - HEVC pre-roll (out of scope; this is the H.264 feature).
 
 ## File summary
@@ -105,4 +108,46 @@ floor is the load-bearing non-vacuity guard.
 - Modify: `playback/playbackworker.cpp` (`openPrerollContext`, `fillStaging`, pre-roll teardown).
 - Modify: `tests/e2e/play_harness.cpp` (`armedcut-h264` scenario), `tests/e2e/run_playback_e2e.sh`
   (`armedcut-h264` assertion case).
-- No production header change; no `DecoderTrack` change.
+- The initial feature needed no header change; the fix wave adds one `PlaybackCounters` field
+  (`stagingVideoFramesDecoded`) to `playback/playbackworker.h`. No `DecoderTrack` change.
+
+## Adversarial review — fixes applied & follow-ups (post-implementation)
+
+A multi-lens adversarial review of the implementation confirmed nine findings (zero
+false positives). Fixes landed in this branch:
+
+- **Gate vacuity (important).** The flipped `armedcut-h264` gate's "non-vacuity" rested on
+  `cutsFired==2 + placeholderFramesDelta==0 + reposition==0`, but an EMPTY promoted staging
+  cache passes all three: the dispatcher's hold-last paints the last live *primary* frame
+  (bumping `heldFrames`, not `placeholderFrames`). Fixed with (a) a new production counter
+  `PlaybackCounters::stagingVideoFramesDecoded` (incremented in `fillStaging` on every staged
+  insert — native + FFmpeg), asserted `>=15` as the DIRECT proof the pre-roll HW-decoded the
+  window, and (b) capturing `*baseHeld` at arm time + asserting `heldFramesDelta<=20` (the
+  empty-cache symptom detector). `decodedVideoFrames` is primary-bank only — comments corrected.
+- **Backward H.264 untested (important).** The forward `armedcut-h264` never exercised the
+  backward decoder-follow (`#104`) on the native bank, nor `fillStaging`'s post-seek
+  `nativeDecoder->reset()` after a real backward `av_seek_frame`. Added `armedcut-h264-back`
+  (mirrors `armedcut-back` on an H.264 fixture; gates `cutFollowReposition==1`, `reposition<=2`,
+  `heldFramesDelta<=20`, …). The `repositionTo` flush deliberately does NOT reset native
+  decoders — `decode()` drains per access unit (no inter-call FIFO), so there is no stale frame
+  to drain and an unconditional reset would add a VT-session teardown to every backward scrub.
+  The invariant is documented inline and locked in by the new test.
+- **Lifecycle/robustness (minor/nit).** Async-MediaFoundation MFTs could defer delivery past
+  the synchronous-VT assumption `fillStaging` relies on — the staging lambda now captures
+  per-packet locals BY VALUE (removes a dangling-reference hazard on a hypothetical async path;
+  behavior-identical on VT). Destructor pre-roll teardown now `reset()`s the native decoder for
+  consistency with the other two teardown sites. Stale `CMakeLists` comment corrected.
+
+### Known limitations / deferred (documented, not fixed here)
+
+- **MediaFoundation (Windows) is unvalidated.** The inline-delivery / coverage-correctness
+  guarantee is verified on VideoToolbox only. An async MFT's deferred delivery would need a
+  blocking per-AU drain in `fillStaging` (and an EOF drain) — a `NativeVideoDecoder`-level
+  change shared with the primary decode bank. Tracked as a follow-up; documented inline.
+- **No-HW / bad-extradata fallback coverage gap (minor).** Flipping the gate to
+  `armNextCutArmed==1` removed the only automated coverage of `armNextCut` returning false
+  (graceful degradation → UIManager plain-seek). Exercising it needs a test seam to force HW
+  caps off; deferred rather than adding a production seam for a minor path.
+- **Second concurrent VT session per H.264 view (minor).** The pre-roll bank adds a second VT
+  session per view while a cut is armed (2N total). Benign for realistic 2–4 view layouts; no
+  change made.

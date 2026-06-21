@@ -341,18 +341,27 @@ set_tests_properties(
     RUN_SERIAL TRUE)
 
 # H.264 HW-gated playback gates (SKIP_RETURN_CODE 77 if HW encoder unavailable).
-# Ports 23506 (SRT) / 23507 (UDP) and 23508 (SRT) / 23509 (UDP) are clear of all
+# Ports 23506/23508/23510 (SRT) and their +1 UDP siblings are clear of all
 # other port ranges.
 # h264_play: steady 1x playback against an H.264 fixture — reposition==0 AND
 #            audioPushes>0. Validates the HW decode path through the real worker.
-# armedcut-h264: arm a cut on an H.264 fixture — the pre-roll guard fires
-#            (armNextCut returns false, cutsFired==0) and the UIManager fallback
-#            plain seek services the jump (reposition>=1).
+# armedcut-h264: arm a FORWARD cut on an H.264 fixture — frame-perfect armed cut
+#            fires (armNextCut returns true, cutsFired==2), no gray flash
+#            (placeholderFramesDelta==0), no frozen-frame stall (heldFramesDelta<=20),
+#            no coarse-seek fallback (reposition==0), epoch re-anchored
+#            (maxClockDivergenceMs<=1500), and the pre-roll bank HW-decoded the
+#            window (stagingVideoFramesDecoded>=15).
+# armedcut-h264-back: arm a BACKWARD cut on an H.264 fixture (the dominant EVS
+#            replay direction) — exercises the backward decoder-follow on the native
+#            primary bank (cutFollowReposition==1) and the post-seek native reset,
+#            played long past the staging span (heldFramesDelta<=20, reposition<=2).
 add_test(NAME e2e_play_h264
     COMMAND bash "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" h264_play 2 23506)
 add_test(NAME e2e_play_armedcut_h264
     COMMAND bash "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-h264 2 23508)
-set_tests_properties(e2e_play_h264 e2e_play_armedcut_h264 PROPERTIES
+add_test(NAME e2e_play_armedcut_h264_back
+    COMMAND bash "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" armedcut-h264-back 2 23510)
+set_tests_properties(e2e_play_h264 e2e_play_armedcut_h264 e2e_play_armedcut_h264_back PROPERTIES
     LABELS "e2e;h264" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 
 # --- Report-only frame-sync scoreboard (NON-GATING) -------------------------

@@ -70,8 +70,18 @@ public:
         // Video frames committed to the output cache via insertVideoFrame. Counts
         // every decoded frame regardless of whether an output sink is connected,
         // so the e2e gate can prove real decode happened without an NDI/display
-        // sink. A stuck or absent decoder leaves this at 0.
+        // sink. A stuck or absent decoder leaves this at 0. NOTE: incremented only
+        // on the PRIMARY decode bank (decodePacketIntoBank); the pre-roll staging
+        // fill is counted separately by stagingVideoFramesDecoded below.
         qint64 decodedVideoFrames = 0;
+        // Video frames the armed-cut pre-roll committed into m_prerollStagingCache
+        // (fillStaging). This is the DIRECT, unfakeable non-vacuity proof that the
+        // staging bank actually decoded the target window before a cut promoted it
+        // — distinct from decodedVideoFrames (primary bank). A cut that "fires" off
+        // an empty/dry staging cache (riding the dispatcher's hold-last) leaves this
+        // at 0, so the H.264 armed-cut gate asserts a floor on it. Counts both the
+        // native (H.264) and the FFmpeg (MPEG-2) staging paths.
+        qint64 stagingVideoFramesDecoded = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
