@@ -39,6 +39,8 @@ field() { sed -n "s/.*$1=\\([0-9.-]*\\).*/\\1/p" <<<"$line"; }
 
 frames=$(field framesReceived); drops=$(field drops); dupes=$(field dupes)
 reorders=$(field reorders); avsync=$(field avSyncMaxFrames); maxgap=$(field maxGapFrames)
+vtcchecked=$(field vTcChecked); vtcmatches=$(field vTcMatches); vtcsynth=$(field vTcSynth)
+atcseen=$(field aTcSeen); atcsynth=$(field aTcSynth)
 
 fail=0
 [ "${frames:-0}" -ge "$((SECONDS_RUN * 10))" ] || { echo "FAIL: too few frames ($frames)"; fail=1; }
@@ -47,6 +49,15 @@ fail=0
 [ "${reorders:-1}" = "0" ] || { echo "FAIL: reorders=$reorders"; fail=1; }
 [ "${avsync:-9}" -ge 0 ] && [ "${avsync:-9}" -le 1 ] || { echo "FAIL: avSyncMaxFrames=$avsync"; fail=1; }
 [ "${maxgap:-9}" -le 2 ]   || { echo "FAIL: maxGapFrames=$maxgap"; fail=1; }
+
+# Programme timecode (T2.1) must reach the wire: a real (non-synthesize) timecode on a healthy
+# count of frames, every checked frame's timecode matching the value recomputed from its decoded
+# marker index, and no video/audio frame carrying the SDK synthesize sentinel.
+[ "${vtcchecked:-0}" -ge "$((SECONDS_RUN * 10))" ] || { echo "FAIL: too few timecoded video frames ($vtcchecked)"; fail=1; }
+[ "${vtcmatches:-0}" = "${vtcchecked:-1}" ] || { echo "FAIL: video timecode mismatch (matches=$vtcmatches of $vtcchecked)"; fail=1; }
+[ "${vtcsynth:-1}" = "0" ] || { echo "FAIL: $vtcsynth video frames had synthesize timecode (programme TC not on the wire)"; fail=1; }
+[ "${atcseen:-0}" -ge 1 ]  || { echo "FAIL: no audio frames captured for timecode check"; fail=1; }
+[ "${atcsynth:-1}" = "0" ] || { echo "FAIL: $atcsynth audio frames had synthesize timecode"; fail=1; }
 
 if [ "$fail" = "0" ]; then echo "PASS: NDI output continuity/sync/cadence OK"; exit 0; fi
 echo "NDI OUTPUT VALIDATION FAILED"; exit 1

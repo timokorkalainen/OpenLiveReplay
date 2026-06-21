@@ -45,6 +45,7 @@ private slots:
     void multiviewVideoIdentityTracksSourceContentNotPlayhead();
     void multiviewMemoReusesCompositeForUnchangedSources();
     void multiviewMemoMatchesUnmemoizedCompositeForDistinctSources();
+    void programmeTimecodeTracksPlayheadOnEveryBus();
 };
 
 void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
@@ -313,6 +314,41 @@ void TestOutputBusEngine::multiviewMemoMatchesUnmemoizedCompositeForDistinctSour
     QCOMPARE(memoized.video.planeU, plain.video.planeU);
     QCOMPARE(memoized.video.planeV, plain.video.planeV);
     QCOMPARE(memoized.identity.videoHash, plain.identity.videoHash);
+}
+
+// Every output bus stamps a programme timecode = playhead position in 100 ns units, so a
+// timecode-carrying sink (NDI) can pass it downstream. Asserted on feed / pgm / multiview.
+void TestOutputBusEngine::programmeTimecodeTracksPlayheadOnEveryBus() {
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 200, 10));
+    cache.insertVideoFrame(video(1, 200, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 200; // paused → sampled playhead == playhead, deterministic
+    state.playing = false;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 1;
+
+    const auto feed = engine.renderFeed(0, 7, state, cache);
+    const auto pgm = engine.renderPgm(7, state, cache);
+    const auto mv = engine.renderMultiview(7, state, cache, nullptr);
+
+    // The invariant: programme TC is exactly 10000 × the frame's own sampled playhead.
+    QCOMPARE(feed.programmeTimecode100ns, feed.sampledPlayheadMs * 10000);
+    QCOMPARE(pgm.programmeTimecode100ns, pgm.sampledPlayheadMs * 10000);
+    QCOMPARE(mv.programmeTimecode100ns, mv.sampledPlayheadMs * 10000);
+
+    // …and the concrete value at a 200 ms playhead is 2,000,000 × 100 ns.
+    QCOMPARE(feed.programmeTimecode100ns, qint64(200) * 10000);
+    QCOMPARE(pgm.programmeTimecode100ns, qint64(200) * 10000);
+    QCOMPARE(mv.programmeTimecode100ns, qint64(200) * 10000);
+
+    // It advances with the playhead (a later playhead → a strictly larger timecode).
+    state.playheadMs = 500;
+    const auto later = engine.renderPgm(8, state, cache);
+    QCOMPARE(later.programmeTimecode100ns, qint64(500) * 10000);
+    QVERIFY(later.programmeTimecode100ns > pgm.programmeTimecode100ns);
 }
 
 QTEST_GUILESS_MAIN(TestOutputBusEngine)

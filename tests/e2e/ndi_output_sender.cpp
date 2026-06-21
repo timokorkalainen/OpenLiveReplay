@@ -73,6 +73,9 @@ int main(int argc, char** argv) {
         frame.video = markerVideo(mk, frameIndex);
         frame.audio = markerAudio(mk, frameIndex);
         frame.sampledPlayheadMs = frame.video.ptsMs;
+        // Stamp the programme timecode the way OutputBusEngine does (playhead x 10000), so the
+        // lane drives a real, advancing timecode onto the wire instead of the synthesize default.
+        frame.programmeTimecode100ns = qMax<qint64>(0, frame.sampledPlayheadMs) * 10000;
         sink.submit(frame);
         ++frameIndex;
         const qint64 targetMs = qint64(frameIndex * periodMs);

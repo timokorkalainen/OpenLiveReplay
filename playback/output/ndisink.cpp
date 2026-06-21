@@ -10,6 +10,20 @@
 
 #include <cstring>
 
+qint64 resolveNdiTimecode(qint64 programmeTimecode100ns) {
+    return programmeTimecode100ns >= 0 ? programmeTimecode100ns : olr::ndi::kTimecodeSynthesize;
+}
+
+void applyNdiFrameTiming(const OutputBusFrame& frame, olr::ndi::NDIlib_video_frame_v2_t& video,
+                         olr::ndi::NDIlib_audio_frame_v3_t& audio) {
+    // Video and audio of a tick share the programme timecode so the pair stays A/V-aligned.
+    // The NDI `timestamp` field is intentionally left at its default: the SDK overwrites it on
+    // send with its own submission time (100 ns since the Unix epoch, UTC), which is what
+    // receivers jitter-buffer on — a value written here would be discarded.
+    video.timecode = resolveNdiTimecode(frame.programmeTimecode100ns);
+    audio.timecode = video.timecode;
+}
+
 namespace {
 
 using namespace olr::ndi;
@@ -86,11 +100,14 @@ public:
         videoFrame.picture_aspect_ratio =
             frame.video.height > 0 ? float(frame.video.width) / float(frame.video.height) : 0.0f;
         videoFrame.frame_format_type = kFrameFormatProgressive;
-        videoFrame.timecode = kTimecodeSynthesize;
         videoFrame.p_data = reinterpret_cast<quint8*>(m_videoBuffer.data());
         videoFrame.line_stride_in_bytes = frame.video.width;
         videoFrame.p_metadata = nullptr;
-        videoFrame.timestamp = 0;
+
+        // Stamp the programme timecode onto the paired video + audio frames (the SDK fills in
+        // the transport timestamp on send).
+        applyNdiFrameTiming(frame, videoFrame, audioFrame);
+
         m_sendVideo(m_sender, &videoFrame);
         m_sendAudio(m_sender, &audioFrame);
         return true;
@@ -164,12 +181,11 @@ private:
         audioFrame->sample_rate = audio.sampleRate;
         audioFrame->no_channels = audio.channels;
         audioFrame->no_samples = sampleFrames;
-        audioFrame->timecode = kTimecodeSynthesize;
+        // timecode/timestamp are set by sendFrame (shared with the paired video frame).
         audioFrame->FourCC = kFourCcFltp;
         audioFrame->p_data = reinterpret_cast<quint8*>(m_audioFloat.data());
         audioFrame->channel_stride_in_bytes = sampleFrames * int(sizeof(float));
         audioFrame->p_metadata = nullptr;
-        audioFrame->timestamp = 0;
         return true;
     }
 

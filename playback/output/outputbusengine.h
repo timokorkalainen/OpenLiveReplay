@@ -39,6 +39,16 @@ struct OutputBusFrame {
     OutputBusId bus;
     qint64 outputFrameIndex = 0;
     qint64 sampledPlayheadMs = 0;
+    // Programme timecode for this frame in 100 ns units (the playhead position on the
+    // recording timeline), for sinks that carry timecode downstream (e.g. NDI). -1 = unset,
+    // which an NDI sink maps to synthesize. It is a passthrough field only and deliberately
+    // not part of OutputFrameIdentity (it is a function of sampledPlayheadMs, so it adds no
+    // dedup discrimination). Being a replay-position timecode it is intentionally NON-monotonic:
+    // it jumps backward on a seek/scrub, decreases in reverse play, and repeats while paused, so
+    // a downstream NDI recorder/TC-track consumer that assumes monotonic timecode may see
+    // backward/duplicate values. (The normal output path keeps identity-skip on, so a held
+    // paused frame is not re-emitted with a repeating timecode.)
+    qint64 programmeTimecode100ns = -1;
     MediaVideoFrame video;
     MediaAudioFrame audio;
     OutputFrameIdentity identity;

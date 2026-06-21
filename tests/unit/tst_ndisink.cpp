@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include "playback/output/ndiabi.h"
 #include "playback/output/ndisink.h"
 #include "playback/output/ndiruntimepaths.h"
 
@@ -119,6 +120,7 @@ private slots:
     void reportsSendDurationInOutputStatus();
     void failedSendReportsAttemptedButNotDeliveredFrame();
     void inFlightSendReportsAttemptedButNotDeliveredFrame();
+    void ndiFrameTimingStampsSharedProgrammeTimecode();
 };
 
 void TestNdiSink::runtimeCandidatesIncludeNdiToolsInstallLocations() {
@@ -174,6 +176,9 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
     frame.bus = OutputBusId::feed(0);
     frame.outputFrameIndex = 7;
     frame.sampledPlayheadMs = 280;
+    // Distinct from sampledPlayheadMs*10000 (=2,800,000) so a regression that fed the wrong
+    // source field into the sink would be caught.
+    frame.programmeTimecode100ns = 2000000;
     frame.video = video(0, 280, 90);
     frame.audio.feedIndex = 0;
     frame.audio.sampleRate = 48000;
@@ -188,6 +193,8 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
     QCOMPARE(backend.sentFrames[0].bus, OutputBusId::feed(0));
     QCOMPARE(backend.sentFrames[0].outputFrameIndex, qint64(7));
     QCOMPARE(uchar(backend.sentFrames[0].video.planeY.at(0)), uchar(90));
+    // The programme timecode survives the submit -> backend path unscaled/unswapped.
+    QCOMPARE(backend.sentFrames[0].programmeTimecode100ns, qint64(2000000));
 }
 
 void TestNdiSink::rejectsFramesWithoutBroadcastAudio() {
@@ -365,6 +372,38 @@ void TestNdiSink::inFlightSendReportsAttemptedButNotDeliveredFrame() {
     QCOMPARE(status.lastDeliveredFrameIndex, qint64(-1));
     QVERIFY(submitFinished);
     QVERIFY(submitResult);
+}
+
+// The NDI sink maps the bus frame's programme timecode onto BOTH the video and audio frames
+// (shared, so the A/V pair stays aligned) and falls back to the SDK "synthesize" sentinel when
+// the bus left it unset (-1). This drives applyNdiFrameTiming with a real OutputBusFrame — the
+// exact bus-frame -> NDI-struct mapping the sink performs per frame — without a live NDI
+// runtime. The NDI `timestamp` is the SDK's to fill on send, so it is not asserted here.
+void TestNdiSink::ndiFrameTimingStampsSharedProgrammeTimecode() {
+    // resolveNdiTimecode: passthrough for a real programme TC, synthesize for the unset -1.
+    QCOMPARE(resolveNdiTimecode(0), qint64(0));
+    QCOMPARE(resolveNdiTimecode(2000000), qint64(2000000)); // 200 ms playhead → 100 ns units
+    QCOMPARE(resolveNdiTimecode(-1), olr::ndi::kTimecodeSynthesize);
+
+    // A real programme TC on the bus frame reaches both NDI structs, shared.
+    OutputBusFrame frame = validFrame(7, /*playheadMs=*/200, 60);
+    frame.programmeTimecode100ns = 2000000;
+    olr::ndi::NDIlib_video_frame_v2_t video;
+    olr::ndi::NDIlib_audio_frame_v3_t audio;
+    applyNdiFrameTiming(frame, video, audio);
+    QCOMPARE(video.timecode, qint64(2000000)); // the frame's programme TC reaches the struct
+    QCOMPARE(audio.timecode, video.timecode);  // A/V share the tick's timecode
+
+    // Unset programme TC (-1) → synthesize on both. Poison the fields first so the WRITE is
+    // proven (the struct default is already kTimecodeSynthesize, which would pass vacuously).
+    OutputBusFrame unset = validFrame(8, /*playheadMs=*/0, 60);
+    unset.programmeTimecode100ns = -1;
+    olr::ndi::NDIlib_video_frame_v2_t video2;
+    olr::ndi::NDIlib_audio_frame_v3_t audio2;
+    video2.timecode = audio2.timecode = qint64(42);
+    applyNdiFrameTiming(unset, video2, audio2);
+    QCOMPARE(video2.timecode, olr::ndi::kTimecodeSynthesize);
+    QCOMPARE(audio2.timecode, olr::ndi::kTimecodeSynthesize);
 }
 
 QTEST_GUILESS_MAIN(TestNdiSink)

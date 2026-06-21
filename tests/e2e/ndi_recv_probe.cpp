@@ -157,6 +157,14 @@ int main(int argc, char** argv) {
     // connects, so we must ignore those leading audio frames).
     qint64 audioSamplePos = 0;
     qint64 audioSampleBase = -1; // -1 = not yet anchored
+
+    // Timecode round-trip: the sender stamps each frame's programme timecode = ptsMs * 10000
+    // (ptsMs = idx*1000*fpsDen/fpsNum), so a received frame's timecode must equal the value
+    // recomputed from its decoded marker index. vTcSynth/aTcSynth count frames that arrived with
+    // the SDK synthesize sentinel (i.e. our programme timecode did NOT reach the wire).
+    qint64 firstVideoTimecode = -1;
+    qint64 vTcChecked = 0, vTcMatches = 0, vTcSynth = 0;
+    qint64 aTcSeen = 0, aTcSynth = 0;
     const int samplesPerFrame = ndiMarkerSamplesPerFrame(mk);
 
     // Extract the luma plane from a UYVY buffer (the fastest NDI format for I420 sources).
@@ -192,6 +200,18 @@ int main(int argc, char** argv) {
                     // Anchor the audio baseline to the first received video frame so that
                     // audio-derived ordinals align with capture-relative video ordinals.
                     if (audioSampleBase < 0) audioSampleBase = audioSamplePos;
+                    // Verify the programme timecode round-tripped: it must equal the value the
+                    // sender derived from this same decoded index (reorder-immune: each frame's
+                    // timecode is checked against its own index).
+                    const qint64 tc = v.timecode;
+                    if (tc == kTimecodeSynthesize) {
+                        ++vTcSynth;
+                    } else {
+                        if (firstVideoTimecode < 0) firstVideoTimecode = tc;
+                        const qint64 expectedTc = (idx * 1000 * mk.fpsDen / mk.fpsNum) * 10000;
+                        ++vTcChecked;
+                        if (tc == expectedTc) ++vTcMatches;
+                    }
                     indices.push_back(idx); // absolute index -> continuity (drops/dupes/reorders)
                     arrivals.push_back(run.elapsed() / 1000.0);
                     if (ndiMarkerDecodeFlash(mk, lumaPtr, v.xres)) {
@@ -205,6 +225,10 @@ int main(int argc, char** argv) {
             ndi.freeVideo(recv, &v);
         } else if (type == FrameTypeAudio) {
             if (a.p_data && a.no_samples > 0) {
+                // Audio shares the video tick's programme timecode (applyNdiFrameTiming), so a
+                // received audio frame must not carry the synthesize sentinel.
+                ++aTcSeen;
+                if (a.timecode == kTimecodeSynthesize) ++aTcSynth;
                 const double rms =
                     ndiMarkerAudioRmsFltp(reinterpret_cast<const float*>(a.p_data), a.no_samples);
                 // Only count beeps after the audio baseline is anchored to the first video.
@@ -227,11 +251,14 @@ int main(int argc, char** argv) {
     const int avSync = ndiAvSyncMaxFrames(flashes, beeps);
     const NdiCadence cad = ndiAnalyzeCadence(arrivals, mk.fpsNum, mk.fpsDen);
 
-    printf("NDIRECV source=%s framesReceived=%lld drops=%lld dupes=%lld reorders=%lld "
-           "avSyncMaxFrames=%d maxGapFrames=%d meanRateHz=%.3f\n",
-           want.toUtf8().constData(), (long long) cont.framesReceived, (long long) cont.drops,
-           (long long) cont.dupes, (long long) cont.reorders, avSync, cad.maxGapFrames,
-           cad.meanRateHz);
+    printf(
+        "NDIRECV source=%s framesReceived=%lld drops=%lld dupes=%lld reorders=%lld "
+        "avSyncMaxFrames=%d maxGapFrames=%d meanRateHz=%.3f "
+        "vTcFirst=%lld vTcChecked=%lld vTcMatches=%lld vTcSynth=%lld aTcSeen=%lld aTcSynth=%lld\n",
+        want.toUtf8().constData(), (long long) cont.framesReceived, (long long) cont.drops,
+        (long long) cont.dupes, (long long) cont.reorders, avSync, cad.maxGapFrames, cad.meanRateHz,
+        (long long) firstVideoTimecode, (long long) vTcChecked, (long long) vTcMatches,
+        (long long) vTcSynth, (long long) aTcSeen, (long long) aTcSynth);
     fflush(stdout);
     return 0;
 }
