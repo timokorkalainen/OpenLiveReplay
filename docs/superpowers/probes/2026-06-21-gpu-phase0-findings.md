@@ -59,6 +59,20 @@ default and reference throughout.
 - **D11 note:** the probe creates and runs the QRhi loop off the GUI thread; the
   dedicated render-thread model held for the measured path.
 
+## P0.5 — RHI↔IOSurface interop without a CPU detour (gates the macOS zero-copy edge)
+
+- **Question (§11 Q5):** does RHI↔IOSurface interop work without a CPU detour?
+- **Method:** create an IOSurface-backed `CVPixelBuffer` →
+  `CVMetalTextureCache` → `id<MTLTexture>` → `QRhiTexture::createFrom` using
+  the `MTLDevice` owned by the QRhi (`rhi_import_probe --interop`).
+- **Result:** `RHI<->IOSurface interop: OK (zero-copy wrap of an
+  IOSurface-backed Metal texture)` on macOS 26.5.1 (25F80), Apple M4 Pro, arm64.
+- **Decision:** GO. `gpu-abstraction` can import VT IOSurfaces into RHI
+  zero-copy via `CVMetalTextureCache` + `QRhiTexture::createFrom`. If this
+  regresses, fall back to a Metal blit into an RHI-owned texture (still
+  GPU-resident, one extra GPU copy, no CPU detour) and record that import-edge
+  cost.
+
 ## P0.4 — Sink GPU-texture vs CPU-frame capability (gates D10 routing + new-io-targets)
 
 - **Question (§11 Q4):** which sinks accept GPU textures vs require CPU frames?

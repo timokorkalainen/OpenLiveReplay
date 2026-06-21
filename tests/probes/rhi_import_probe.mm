@@ -8,9 +8,13 @@
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
 
+#import <Metal/Metal.h>
+#include <CoreVideo/CoreVideo.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -132,10 +136,86 @@ ProbeResult runProbe(double budgetMs) {
     return result;
 }
 
+static bool runIOSurfaceInteropProbe(Probe& probe);
+
+static bool runIOSurfaceInteropProbe(Probe& probe) {
+    CVPixelBufferRef pb = nullptr;
+    NSDictionary* attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+    };
+    const CVReturn created = CVPixelBufferCreate(kCFAllocatorDefault, kWidth, kHeight,
+                                                 kCVPixelFormatType_32BGRA,
+                                                 (__bridge CFDictionaryRef)attrs, &pb);
+    if (created != kCVReturnSuccess || !pb) {
+        std::fprintf(stderr, "interop: CVPixelBufferCreate failed (%d)\n", int(created));
+        return false;
+    }
+    if (!CVPixelBufferGetIOSurface(pb)) {
+        std::fprintf(stderr, "interop: buffer is not IOSurface-backed\n");
+        CVPixelBufferRelease(pb);
+        return false;
+    }
+
+    const auto* nativeHandles =
+        static_cast<const QRhiMetalNativeHandles*>(probe.rhi->nativeHandles());
+    if (!nativeHandles || !nativeHandles->dev) {
+        std::fprintf(stderr, "interop: QRhi Metal native device unavailable\n");
+        CVPixelBufferRelease(pb);
+        return false;
+    }
+    id<MTLDevice> device = (__bridge id<MTLDevice>)nativeHandles->dev;
+
+    CVMetalTextureCacheRef cache = nullptr;
+    CVReturn rc = CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr, device, nullptr, &cache);
+    if (rc != kCVReturnSuccess || !cache) {
+        std::fprintf(stderr, "interop: CVMetalTextureCacheCreate failed (%d)\n", int(rc));
+        CVPixelBufferRelease(pb);
+        return false;
+    }
+
+    CVMetalTextureRef cvtex = nullptr;
+    rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, nullptr,
+                                                   MTLPixelFormatBGRA8Unorm, kWidth, kHeight, 0,
+                                                   &cvtex);
+    if (rc != kCVReturnSuccess || !cvtex) {
+        std::fprintf(stderr, "interop: CVMetalTextureCacheCreateTextureFromImage failed (%d)\n",
+                     int(rc));
+        CFRelease(cache);
+        CVPixelBufferRelease(pb);
+        return false;
+    }
+
+    id<MTLTexture> metalTexture = CVMetalTextureGetTexture(cvtex);
+    std::unique_ptr<QRhiTexture> imported(
+        probe.rhi->newTexture(QRhiTexture::BGRA8, QSize(kWidth, kHeight)));
+    QRhiTexture::NativeTexture native{
+        quint64(reinterpret_cast<uintptr_t>((__bridge void*)metalTexture)), 0};
+    const bool wrapped = imported->createFrom(native);
+
+    CFRelease(cvtex);
+    CFRelease(cache);
+    CVPixelBufferRelease(pb);
+
+    std::printf("RHI<->IOSurface interop: %s (zero-copy wrap of an IOSurface-backed Metal texture)\n",
+                wrapped ? "OK" : "FAILED");
+    return wrapped;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     QGuiApplication app(argc, argv);
+
+    if (argc > 1 && std::strcmp(argv[1], "--interop") == 0) {
+        Probe probe;
+        if (!probe.init()) {
+            std::fprintf(stderr, "RHI Metal unavailable on this host; interop probe inconclusive\n");
+            return 2;
+        }
+        return runIOSurfaceInteropProbe(probe) ? 0 : 4;
+    }
+
     const double budgetMs = argc > 1 ? std::atof(argv[1]) : 0.5;
 
     ProbeResult result;
