@@ -1,5 +1,19 @@
 name: CI
 
+# CI is intentionally a THIN, quick gate: static lint plus a single cheap Linux
+# build/test backstop -- it runs entirely on ubuntu-latest (1x billing), no macOS.
+#
+# The heavy work runs in the local .githooks/pre-push hook instead: the macOS
+# clang build (-Werror), the full unit suite, clang-tidy, the clang
+# ASan/UBSan + TSan sanitizer passes (the only sanitizer coverage of the
+# VideoToolbox/AudioToolbox native-codec code), and the playback/record e2e
+# matrix. See .githooks/pre-push and tests/README.md.
+#
+# What stays in CI is the cheapest meaningful automated backstop -- and the
+# ONLY home for GCC -Werror + LeakSanitizer, neither of which runs on macOS.
+# It matters because fork PRs never run the local hook (and project policy
+# forbids `git push --no-verify`), so CI is the backstop they fall back to.
+
 on:
   push:
     branches: [main]
@@ -19,7 +33,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Classify changed files once so workflow/docs-only PRs do not pay for app CI.
+  # Classify changed files once so docs-only PRs do not pay for build/lint CI.
   # ---------------------------------------------------------------------------
   changes:
     name: Detect changes
@@ -28,7 +42,6 @@ jobs:
       app: ${{ steps.classify.outputs.app }}
       format: ${{ steps.classify.outputs.format }}
       qml: ${{ steps.classify.outputs.qml }}
-      native: ${{ steps.classify.outputs.native }}
       workflow: ${{ steps.classify.outputs.workflow }}
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +58,6 @@ jobs:
               echo "app=true"
               echo "format=true"
               echo "qml=true"
-              echo "native=true"
               echo "workflow=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
@@ -61,7 +73,6 @@ jobs:
           app=false
           format=false
           qml=false
-          native=false
           workflow=false
           files="$(git diff --name-only "$base" HEAD || true)"
 
@@ -76,29 +87,27 @@ jobs:
 
             case "$file" in
               # The workflow file defines every gate, so a change to it must
-              # re-run them ALL — otherwise the gate's own rulebook could be
+              # re-run them ALL -- otherwise the gate's own rulebook could be
               # edited with the gates it controls skipped, and "CI gate" counts a
               # skipped required job as a pass (vacuously green).
               .github/workflows/*)
                 app=true
                 format=true
                 qml=true
-                native=true
                 ;;
-              # Lint/sanitizer/build rulebooks: a change here must re-run the
-              # gates that consult them (clang-tidy/clang-format/qmllint/sanitizer
-              # suppressions/pre-commit), for the same self-referential reason.
+              # Lint/build rulebooks (including the pre-push hook that now owns the
+              # heavy gates): a change here must re-run the gates that consult them
+              # -- clang-format / qmllint / the clang-tidy floor / the Linux
+              # backstop -- for the same self-referential reason.
               .clang-tidy|.clang-format|qmllint.ini|qmllint.ini.in|.pre-commit-config.yaml|.githooks/*|tests/lsan.suppressions.txt)
                 app=true
                 format=true
-                native=true
                 ;;
               *.md|docs/*)
                 ;;
               *.cpp|*.c|*.h|*.hpp|*.mm)
                 app=true
                 format=true
-                native=true
                 ;;
               *.qml)
                 app=true
@@ -106,7 +115,6 @@ jobs:
                 ;;
               CMakeLists.txt|*/CMakeLists.txt|*.cmake|CMakePresets.json)
                 app=true
-                native=true
                 ;;
               recorder_engine/*|playback/*|project/*|telemetry/*|midi/*|streamdeck/*|ios/*|tests/*|build-scripts/*|*.qrc|*.plist|*.entitlements)
                 app=true
@@ -121,170 +129,36 @@ jobs:
             echo "app=$app"
             echo "format=$format"
             echo "qml=$qml"
-            echo "native=$native"
             echo "workflow=$workflow"
           } >> "$GITHUB_OUTPUT"
 
+  # ---------------------------------------------------------------------------
+  # Lint the workflow files themselves (only when they change). Linux + go-installed
+  # actionlint (shellcheck is preinstalled on ubuntu-latest).
+  # ---------------------------------------------------------------------------
   workflow-lint:
     name: Workflow lint
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     needs: changes
     if: ${{ needs.changes.outputs.workflow == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: ${{ runner.os }}-homebrew-workflow-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-homebrew-workflow-
-            ${{ runner.os }}-homebrew-
-
       - name: Install actionlint
-        run: brew install actionlint shellcheck
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
 
       - name: actionlint
-        run: actionlint .github/workflows/ci.yml
+        run: |
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/ci.yml .github/workflows/build.yml
 
   # ---------------------------------------------------------------------------
-  # Build the macOS app + test suite and run CTest. This is the primary gate.
-  # ---------------------------------------------------------------------------
-  build-test-macos:
-    name: Build + Test (macOS)
-    runs-on: macos-14
-    needs: changes
-    if: ${{ needs.changes.outputs.app == 'true' }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # clang-tidy diff needs history
-
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: desktop
-          arch: clang_64
-          modules: qtmultimedia qtwebsockets
-          cache: true
-
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: ${{ runner.os }}-homebrew-build-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-homebrew-build-
-            ${{ runner.os }}-homebrew-
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ${{ runner.os }}-ccache-build-test-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-build-test-
-            ${{ runner.os }}-ccache-
-
-      - name: Install build deps
-        run: brew install ninja ffmpeg srt ccache
-
-      - name: Configure ccache
-        run: |
-          ccache --set-config=max_size=500M
-          ccache --zero-stats
-
-      - name: Configure
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Debug
-          -DOLR_BUILD_TESTS=ON
-          -DOLR_WERROR=ON
-          -DCMAKE_C_COMPILER_LAUNCHER=ccache
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
-
-      - name: Build (app + tests)
-        run: cmake --build build
-
-      - name: ccache stats
-        if: always()
-        run: ccache --show-stats
-
-      - name: Run short PR tests
-        working-directory: build
-        # PR CI runs the fast "ci" CTest label. Full transport/report labels stay
-        # in the local pre-push hook and are excluded defensively; the playback
-        # e2e gate below adds worker-level coverage on top of the unit label.
-        run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
-
-      # Representative end-to-end gate: the headless record + PlaybackWorker matrix
-      # (the project's highest-risk threaded code) over the native srt:// loopback,
-      # which the macOS runner supports (brew srt ships srt-live-transmit; python3
-      # is preinstalled). A curated subset keeps wall-clock bounded; until-pass:3
-      # absorbs transient loopback timing flakes so the gate stays trustworthy.
-      - name: Run playback e2e gate
-        working-directory: build
-        run: |
-          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
-            -R '^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
-
-      # clang-tidy is a GATE: WarningsAsErrors in .clang-tidy makes any finding in a
-      # changed first-party file fatal, using the generated compile_commands.json.
-      # The whole first-party tree is tidy-clean, so only regressions in touched
-      # files fail — the same "lint owns the floor" model as clang-format.
-      - name: clang-tidy (changed files)
-        if: ${{ needs.changes.outputs.format == 'true' }}
-        run: |
-          brew install llvm
-          TIDY="$(brew --prefix llvm)/bin/clang-tidy"
-          SDK="$(xcrun --show-sdk-path)"
-          base="${{ github.event.pull_request.base.sha }}"
-          [ -z "$base" ] && base="${{ github.event.before }}"
-          # All-zeros SHA (new branch) or an unreachable base -> diff vs parent.
-          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
-          fi
-          files=$(git diff --name-only "$base" HEAD -- \
-                    'recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp' \
-                    'telemetry/*.cpp' 'websocket/*.cpp' \
-                    'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)
-          if [ -z "$files" ]; then echo "No first-party C++ changes."; exit 0; fi
-          printf '%s\n' "$files"
-          # Pass 1 — WHOLE changed file, config-driven WarningsAsErrors: the
-          # high-signal bug classes (analyzer, bugprone, member-init, ...) are
-          # tree-clean, so any finding anywhere in a touched file is fatal.
-          rc=0
-          while IFS= read -r file; do
-            [ -n "$file" ] || continue
-            "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" "$file" || rc=1
-          done <<< "$files"
-          # Pass 2 — DIFF-SCOPED integer-coercion gate. narrowing/implicit-widening
-          # carry a large grandfathered backlog, so they stay advisory tree-wide
-          # (Pass 1 does not fail on them); but any NEW occurrence on the lines this
-          # PR changes is fatal here. "Lint owns the floor going forward", matching
-          # the clang-format changed-lines model.
-          CTD="$(brew --prefix llvm)/share/clang/clang-tidy-diff.py"
-          git diff -U0 "$base" HEAD -- \
-              'recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp' \
-              'telemetry/*.cpp' 'websocket/*.cpp' \
-              'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' \
-            | python3 "$CTD" -p1 -path build -clang-tidy-binary "$TIDY" \
-                -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
-                -warnings-as-errors='*' -extra-arg=-isysroot -extra-arg="$SDK" || rc=1
-          exit "$rc"
-
-  # ---------------------------------------------------------------------------
-  # Lightweight static checks. Each setup step is gated by the file types that
-  # need it, so C++ formatting and QML linting do not force each other's deps.
+  # Static source lint -- OS-agnostic, so it runs on Linux (1x). clang-format on
+  # changed lines + strict qmllint + advisory qmlformat. Each setup step is gated
+  # by the file types that need it.
   # ---------------------------------------------------------------------------
   lint:
     name: Lint
-    runs-on: macos-14
+    runs-on: ubuntu-latest
     needs: changes
     if: ${{ needs.changes.outputs.format == 'true' || needs.changes.outputs.qml == 'true' }}
     steps:
@@ -292,28 +166,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Cache Homebrew downloads
-        if: ${{ needs.changes.outputs.format == 'true' }}
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: ${{ runner.os }}-homebrew-lint-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-homebrew-lint-
-            ${{ runner.os }}-homebrew-
-
       - name: clang-format (changed lines)
         if: ${{ needs.changes.outputs.format == 'true' }}
         run: |
-          # Homebrew LLVM clang-format (Xcode does not reliably ship clang-format);
-          # committed sources are formatted with the same tool. Only the lines
-          # changed in this PR are checked (git-clang-format), so pre-existing
-          # formatting in a touched file is not retroactively enforced.
-          brew install llvm
-          PREFIX="$(brew --prefix llvm)"
-          CF="$PREFIX/bin/clang-format"
-          GCF="$PREFIX/bin/git-clang-format"
+          # Pinned LLVM clang-format from apt.llvm.org so the changed-lines gate
+          # tracks the Homebrew-LLVM clang-format used by the local hooks (same
+          # major version). Only the lines changed in this PR are checked
+          # (git-clang-format), so pre-existing formatting is not re-enforced.
+          LLVM_VER=20
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${LLVM_VER} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y "clang-format-${LLVM_VER}"
+          CF="$(command -v "clang-format-${LLVM_VER}")"
           "$CF" --version
+          # git-clang-format is a standalone python script; fetch the matching one.
+          GCF=/tmp/git-clang-format
+          curl -fsSL "https://raw.githubusercontent.com/llvm/llvm-project/release/${LLVM_VER}.x/clang/tools/clang-format/git-clang-format" -o "$GCF"
+          chmod +x "$GCF"
           base="${{ github.event.pull_request.base.sha }}"
           [ -z "$base" ] && base="${{ github.event.before }}"
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
@@ -335,11 +207,18 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
-          host: mac
+          host: linux
           target: desktop
-          arch: clang_64
+          arch: linux_gcc_64
           modules: qtmultimedia qtwebsockets   # Main.qml imports QtMultimedia (VideoOutput)
           cache: true
+
+      - name: Install qmllint runtime libs
+        if: ${{ needs.changes.outputs.qml == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0
 
       - name: qmllint
         if: ${{ needs.changes.outputs.qml == 'true' }}
@@ -375,182 +254,14 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # Sanitizer gates. All gating legs have continue-on-error: false.
-  #   * asan-ubsan runs the WHOLE unit label under instrumentation.
-  #   * tsan runs the threading-sensitive playback/output cases.
-  #   * asan-e2e runs the deterministic playback e2e (the real threaded
-  #     PlaybackWorker end-to-end) AND the native SRT ingest smoke under
-  #     ASan+UBSan — the two highest-risk surfaces (untrusted bytes meeting the
-  #     worker's atomics across threads) that the unit/e2e gates otherwise leave
-  #     UNinstrumented (the unit run excludes the native-ingest labels; the
-  #     build-test-macos e2e gate runs with no sanitizer). The playback-e2e part
-  #     is GATING; the native-SRT-smoke part is step-level advisory (it depends on
-  #     loopback srt-live-transmit timing that can flake on shared runners — see
-  #     its step comment).
-  # LeakSanitizer is intentionally NOT enabled here: it is unsupported on macOS
-  # (Apple platforms) — leak detection runs on the Linux/GCC leg instead.
-  # ---------------------------------------------------------------------------
-  sanitizers:
-    name: Sanitizers
-    runs-on: macos-14
-    needs: changes
-    if: ${{ needs.changes.outputs.native == 'true' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Empty build_targets => build the whole suite and run the full unit
-          # label; a non-empty list builds only those threading/harness targets.
-          # The ctest selector itself is chosen by label in the run step.
-          - sanitizer: "address;undefined"
-            label: asan-ubsan
-            advisory: false
-            build_targets: ""
-          - sanitizer: "thread"
-            label: tsan
-            advisory: false
-            build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine tst_ndiingest"
-          # asan-e2e: only the e2e harness binaries need building — the playback
-          # matrix drives play_harness + record_harness; the native SRT smoke
-          # drives record_harness. Both are linked with olr_sanitize, so this
-          # build is genuinely -fsanitize=address,undefined instrumented.
-          - sanitizer: "address;undefined"
-            label: asan-e2e
-            advisory: false
-            build_targets: "play_harness record_harness"
-    continue-on-error: ${{ matrix.advisory }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: mac
-          target: desktop
-          arch: clang_64
-          modules: qtmultimedia qtwebsockets
-          cache: true
-
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: ${{ runner.os }}-homebrew-sanitizers-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-homebrew-sanitizers-
-            ${{ runner.os }}-homebrew-
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ${{ runner.os }}-ccache-sanitizers-${{ matrix.label }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-sanitizers-${{ matrix.label }}-
-            ${{ runner.os }}-ccache-sanitizers-
-            ${{ runner.os }}-ccache-
-
-      - name: Install build deps
-        run: brew install ninja ffmpeg srt ccache
-
-      - name: Configure ccache
-        run: |
-          ccache --set-config=max_size=500M
-          ccache --zero-stats
-
-      - name: Configure (${{ matrix.label }})
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Debug
-          -DOLR_BUILD_TESTS=ON
-          -DOLR_WERROR=ON
-          -DOLR_SANITIZER="${{ matrix.sanitizer }}"
-          -DCMAKE_C_COMPILER_LAUNCHER=ccache
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
-
-      - name: Build tests
-        # Empty build_targets builds the whole suite (asan-ubsan); a non-empty
-        # list builds only the named threading targets (tsan).
-        run: |
-          if [ -n "${{ matrix.build_targets }}" ]; then
-            cmake --build build --target ${{ matrix.build_targets }}
-          else
-            cmake --build build
-          fi
-
-      - name: ccache stats
-        if: always()
-        run: ccache --show-stats
-
-      # asan-e2e: the GATING part — the deterministic playback e2e subset (the
-      # real threaded PlaybackWorker, record + play, over the native srt://
-      # loopback). These are timing/loopback-sensitive, so until-pass:3 absorbs a
-      # transient loopback flake. IMPORTANT: until-pass does NOT mask a real
-      # ASan/UBSan finding — abort_on_error/halt_on_error make those a hard,
-      # deterministic abort that re-fires on every relaunch, so until-pass cannot
-      # paper over it (it only retries non-deterministic timing flakes).
-      # --no-tests=error fails closed if the regex matches nothing (a relabel
-      # that silently dropped the cases would be caught here).
-      - name: Run playback e2e under ASan+UBSan (gating)
-        if: ${{ matrix.label == 'asan-e2e' }}
-        working-directory: build
-        env:
-          # detect_leaks=0: LeakSanitizer is unsupported on macOS (see Linux leg).
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
-            -R '^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
-
-      # asan-e2e: the ADVISORY part — the native SRT ingest smoke under the SAME
-      # ASan+UBSan instrumentation, so the live-ingest path (untrusted SRT bytes
-      # in the native NativeSrtIngestSession) runs sanitized. continue-on-error
-      # because it stands up srt-live-transmit over UDP->SRT loopback whose
-      # connect/handshake timing can flake on shared CI runners; we do NOT want a
-      # loopback connect flake to red the whole sanitizers job. A real ASan/UBSan
-      # abort here still surfaces in the log (and exits non-zero) for follow-up —
-      # advisory means non-blocking, not invisible. until-pass:3 retries only the
-      # connect-timing flake; an ASan abort is deterministic and re-fires.
-      - name: Run native SRT ingest smoke under ASan+UBSan (advisory)
-        if: ${{ matrix.label == 'asan-e2e' }}
-        continue-on-error: true
-        working-directory: build
-        env:
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
-            -R '^e2e_native_srt_smoke$'
-
-      - name: Run sanitizer checks
-        if: ${{ matrix.label != 'asan-e2e' }}
-        working-directory: build
-        env:
-          # detect_leaks=0: LeakSanitizer is unsupported on macOS (see Linux leg).
-          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
-          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-          TSAN_OPTIONS: halt_on_error=1
-        # Branch by label so the regex/exclude selectors stay correctly quoted
-        # (shell metacharacters like ( | $ must not be word-split by the runner).
-        run: |
-          if [ "${{ matrix.label }}" = "tsan" ]; then
-            ctest --output-on-failure --repeat until-pass:2 \
-              -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
-          else
-            ctest --output-on-failure --repeat until-pass:2 \
-              -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
-          fi
-
-  # ---------------------------------------------------------------------------
-  # Second toolchain: build the app + tests with GCC on Linux and run the unit
-  # suite under ASan+UBSan+LSan. This is the only leg that exercises GCC's
-  # -Werror (catches warnings clang misses) and LeakSanitizer (unsupported on
-  # macOS). On Linux the native ingest compiles via the cross-platform stubs and
-  # NDI is runtime-loaded, so no Apple/Windows SDKs are required.
+  # The single CI test backstop: build the app + tests with GCC on Linux and run
+  # the unit suite under ASan+UBSan+LSan. This is the only leg that exercises
+  # GCC's -Werror (warnings clang misses) and LeakSanitizer (unsupported on
+  # macOS), at cheap 1x billing. The macOS build + native-codec + e2e gates run
+  # in the local pre-push hook (see .githooks/pre-push); this job is the backstop
+  # fork PRs fall back to (they never run that hook). On Linux the native ingest
+  # compiles via the cross-platform stubs and NDI is runtime-loaded, so no
+  # Apple/Windows SDKs are required.
   # ---------------------------------------------------------------------------
   build-test-linux:
     name: Build + Test (Linux, GCC)
@@ -627,16 +338,15 @@ jobs:
         run: ctest --output-on-failure --repeat until-pass:2 -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
 
   # ---------------------------------------------------------------------------
-  # Coverage — REPORT-ONLY (continue-on-error), no failing threshold yet. Builds
-  # the unit suite with gcov instrumentation and publishes a gcovr report so the
-  # first-party line/branch coverage is visible. Promote to a gate by adding
-  # `--fail-under-line <N>` once a non-regressing baseline is agreed.
+  # Coverage -- REPORT-ONLY, now MANUAL (workflow_dispatch only). It gates
+  # nothing (continue-on-error, no threshold) and re-ran the unit suite a 4th
+  # time on every PR, so it is off the per-PR path. Trigger on demand to refresh
+  # the gcovr report; promote to a gate by adding `--fail-under-line <N>`.
   # ---------------------------------------------------------------------------
   coverage:
-    name: Coverage (report-only)
+    name: Coverage (report-only, manual)
     runs-on: ubuntu-latest
-    needs: changes
-    if: ${{ needs.changes.outputs.app == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -697,7 +407,7 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
-  # Mutation testing (mull) — MANUAL/experimental (workflow_dispatch only). A
+  # Mutation testing (mull) -- MANUAL/experimental (workflow_dispatch only). A
   # strong test-quality signal: it mutates the pure-logic engine and checks the
   # unit tests catch the mutants. Not a PR gate (slow, and tuning the survivor
   # baseline is ongoing); never blocks. See .mull.yml for the filtered scope.
@@ -746,41 +456,10 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # Single aggregate status for branch protection. Requiring this one check is
-  # robust against matrix-name churn and conditional skips: it passes when every
-  # required job either succeeded or was skipped (e.g. a docs-only PR), and fails
-  # if any required job failed or was cancelled. Coverage (report-only),
-  # workflow-lint, and the manual mull job are intentionally not gated here.
-  # ---------------------------------------------------------------------------
-  ci-gate:
-    name: CI gate
-    runs-on: ubuntu-latest
-    needs: [lint, build-test-macos, build-test-linux, sanitizers]
-    if: ${{ always() }}
-    steps:
-      - name: Require all gating jobs to pass (skipped is allowed)
-        run: |
-          for r in \
-            "lint=${{ needs.lint.result }}" \
-            "build-test-macos=${{ needs.build-test-macos.result }}" \
-            "build-test-linux=${{ needs.build-test-linux.result }}" \
-            "sanitizers=${{ needs.sanitizers.result }}"; do
-            name="${r%%=*}"; res="${r#*=}"
-            echo "$name: $res"
-            if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
-              echo "::error::Required job '$name' did not pass (result: $res)"
-              fail=1
-            fi
-          done
-          exit "${fail:-0}"
-
-  # ---------------------------------------------------------------------------
   # Fuzz the untrusted-input parsers (SRT/UDP/RTMP ingest). MANUAL/experimental
-  # (workflow_dispatch only) — continuous fuzzing finds bugs over time, so it is
-  # not a PR gate; run it on demand (or wire a nightly `schedule:` later). A
-  # crash exits non-zero and uploads the reproducer. clang ships libFuzzer; the
-  # harnesses only link Qt6::Core, but the project still configures the app
-  # target, so the Linux app deps are installed too.
+  # (workflow_dispatch only) — continuous fuzzing finds bugs over time; never a
+  # PR gate. clang ships libFuzzer; a crash exits non-zero and uploads the
+  # reproducer.
   # ---------------------------------------------------------------------------
   fuzz:
     name: Fuzz (parsers, manual)
@@ -841,6 +520,39 @@ jobs:
           path: build-fuzz/tests/fuzz/fuzz_*-crash-*
           if-no-files-found: ignore
 
-# iOS is intentionally NOT built in CI: the FFmpeg+SRT+OpenSSL from-source build
-# (~20 min) OOM-kills hosted runners. It is validated locally instead via the
-# .githooks/pre-push hook. See tests/README.md.
+  # ---------------------------------------------------------------------------
+  # Single aggregate status for branch protection. Requiring this one check is
+  # robust against matrix-name churn and conditional skips: it passes when every
+  # required job either succeeded or was skipped (e.g. a docs-only PR), and fails
+  # if any required job failed or was cancelled. Coverage/mull (manual) and
+  # workflow-lint are intentionally not gated here.
+  #
+  # NOTE: the branch-protection required check is "CI gate" (this job's name).
+  # Keep that name stable. The heavy macOS build + sanitizer + e2e gates moved to
+  # the local pre-push hook and are deliberately NOT represented here.
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: CI gate
+    runs-on: ubuntu-latest
+    needs: [lint, build-test-linux]
+    if: ${{ always() }}
+    steps:
+      - name: Require all gating jobs to pass (skipped is allowed)
+        run: |
+          for r in \
+            "lint=${{ needs.lint.result }}" \
+            "build-test-linux=${{ needs.build-test-linux.result }}"; do
+            name="${r%%=*}"; res="${r#*=}"
+            echo "$name: $res"
+            if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
+              echo "::error::Required job '$name' did not pass (result: $res)"
+              fail=1
+            fi
+          done
+          exit "${fail:-0}"
+
+# The macOS build, the clang ASan/UBSan + TSan sanitizer passes, the
+# VideoToolbox/AudioToolbox native-codec tests, the playback/record e2e matrix,
+# and the iOS build are intentionally NOT in CI -- they run in the always-on
+# .githooks/pre-push hook (the FFmpeg+SRT+OpenSSL iOS build also OOM-kills hosted
+# runners). See .githooks/pre-push and tests/README.md.

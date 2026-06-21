@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
-# Pre-push hook: an ALWAYS-ON blocking delivery gate. Every push builds the
-# current-platform host (engine + app + test harnesses) and runs the
-# "delivery-gate" CTest matrix -- the transport x codec delivery smokes
-# (RTMP/SRT x h264/h265) with short clips. A build or matrix failure blocks the
-# push.
+# Pre-push hook: the project's heavy build + correctness gate. GitHub CI is
+# intentionally thin (lint + one cheap Linux build/test), so the heavy work that
+# used to run on the 10x-billed macOS CI runners runs HERE on every push,
+# against the current platform:
+#   * build the host (engine + app + test harnesses) with -Werror
+#   * the transport x codec "delivery-gate" matrix (RTMP/SRT x h264/h265)
+#   * the unit suite + playback/record e2e at NATIVE speed
+#   * clang-tidy on changed first-party C++
+#   * clang ASan+UBSan over the unit suite + e2e (the only sanitizer coverage of
+#     the VideoToolbox/AudioToolbox native-codec code -- it compiles as stubs on
+#     the Linux CI leg) and TSan over the threading tests
+# A build / test / sanitizer failure blocks the push.
 #
 # The gate HARD-FAILS the push if required local tooling is missing (it does NOT
 # silently skip): ffmpeg, ffprobe, srt-live-transmit, a Python 3, an H.264 and an
 # HEVC encoder in ffmpeg, and the Qt host kit. Install on macOS with:
 #   brew install ffmpeg srt
 #
-# GitHub PR CI runs only the short "ci" CTest label and does not build iOS or run
-# these transport e2e gates (the from-source FFmpeg/SRT build OOM-kills hosted
-# runners), so the delivery matrix is gated locally here instead.
+# The from-source FFmpeg/SRT iOS build OOM-kills hosted runners, so iOS is gated
+# locally too (OLR_PREPUSH_FULL). Do NOT bypass this gate with `git push
+# --no-verify` -- it is the project's required gate. To skip a gate that cannot
+# run on the current platform/toolchain, use the per-gate SKIP_* flags below (or
+# OLR_PREPUSH_LIGHT); they keep every OTHER gate enforced. Fork PRs (which never
+# run this hook) fall back to CI's lint + Linux build/test backstop.
 #
-# Triggers:
-#   git push                 -> build host + delivery matrix (BLOCKING default)
-#   OLR_PREPUSH_SKIP=1 push  -> skip the gate entirely (git push --no-verify too)
-#   OLR_PREPUSH_FULL=1 push  -> ALSO run the full local CTest matrix + iOS build
-#                               (skip parts: SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
+# Triggers / flags:
+#   git push                  -> full gate above (BLOCKING default)
+#   OLR_PREPUSH_SKIP=1 push   -> emergency bypass ONLY (do NOT use git push --no-verify;
+#                                prefer the per-gate SKIP_* flags for platform skipping)
+#   OLR_PREPUSH_LIGHT=1 push  -> delivery matrix ONLY (skip the heavy build/test gates)
+#   SKIP_UNIT=1 / SKIP_TIDY=1 / SKIP_ASAN=1 / SKIP_TSAN=1  -> skip one heavy gate
+#   OLR_PREPUSH_FULL=1 push   -> ALSO run the full local CTest matrix + iOS build
+#                                (skip parts: SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
 #
 # Tunables:
-#   OLR_E2E_CLIP_SECONDS  (default 5)               delivery-matrix clip length
+#   OLR_E2E_CLIP_SECONDS  (default 5)               e2e / delivery clip length
 #   QT_HOST_PREFIX        (default ~/Qt/6.10.1/macos)
 #   QT_IOS_PREFIX         (default ~/Qt/6.10.1/ios)  used only by OLR_PREPUSH_FULL
 #
@@ -95,10 +108,14 @@ EOF
 fi
 
 # --- 2. Build the current-platform host (engine + app + test harnesses) -------
+# -DOLR_WERROR=ON makes this the clang -Werror compile gate (mirrors what the
+# macOS build-test CI job used to enforce); the same build dir is reused by the
+# native unit/e2e and clang-tidy gates below.
 echo "[pre-push] Building current-platform host in ${DELIVERY_BUILD_DIR}..."
 cmake -S . -B "$DELIVERY_BUILD_DIR" -G Ninja \
     -DCMAKE_BUILD_TYPE=Debug \
     -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
+    -DOLR_WERROR=ON \
     -DOLR_BUILD_TESTS=ON >/dev/null
 cmake --build "$DELIVERY_BUILD_DIR"
 
@@ -118,7 +135,150 @@ OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
         --output-on-failure --repeat until-pass:2 --no-tests=error
 echo "[pre-push] Delivery matrix OK."
 
-# --- 5. Optional heavier gate: full local CTest matrix + iOS build -------------
+# Past here are the HEAVY gates that moved out of GitHub CI (CI now runs only
+# lint + a cheap Linux build/test). They run by default on every push. Skip one
+# with its SKIP_* flag, or run delivery-only with OLR_PREPUSH_LIGHT=1.
+if [ "${OLR_PREPUSH_LIGHT:-0}" = "1" ]; then
+    echo "[pre-push] OLR_PREPUSH_LIGHT=1 - delivery gate only; skipping heavy build/test gates."
+    exit 0
+fi
+
+QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"
+export QT_QPA_PLATFORM
+
+# The exact selectors the macOS CI jobs used, kept verbatim so local == old CI.
+UNIT_SELECTOR_LE='sync-report|srt|native-apple-ingest|native-rtmp'
+E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
+
+# --- 5. Unit suite + playback e2e at native speed (was: Build + Test (macOS)) ---
+# Reuses the delivery build (already compiled with -DOLR_WERROR=ON). The
+# native-speed e2e run is the only leg that exercises the threaded PlaybackWorker
+# at real CPU speed -- the ASan run below perturbs timing, so it cannot replace
+# this scheduling gate.
+if [ "${SKIP_UNIT:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_UNIT=1 - skipping native unit + e2e gate."
+else
+    echo "[pre-push] Running unit suite (native, -L ci)..."
+    ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+        -L ci -LE "$UNIT_SELECTOR_LE"
+    echo "[pre-push] Running playback e2e (native speed)..."
+    OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
+        ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
+            --no-tests=error -R "$E2E_REGEX"
+    echo "[pre-push] Native unit + e2e OK."
+fi
+
+# --- 6. clang-tidy on changed first-party C++ (was: build-test-macos clang-tidy) -
+# Uses the delivery build's compile_commands.json. Pass 1 = whole changed file
+# (config-driven WarningsAsErrors); Pass 2 = diff-scoped narrowing/widening gate.
+# Skipped with a warning (not fatal) if LLVM clang-tidy is unavailable, matching
+# the pre-commit hook's "partial toolchain does not block" policy.
+if [ "${SKIP_TIDY:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_TIDY=1 - skipping clang-tidy gate."
+else
+    TIDY="$(command -v clang-tidy || true)"
+    [ -x "$TIDY" ] || TIDY=/opt/homebrew/opt/llvm/bin/clang-tidy
+    CTD="$(dirname "$TIDY")/../share/clang/clang-tidy-diff.py"
+    if [ -x "$TIDY" ] && [ -f "$DELIVERY_BUILD_DIR/compile_commands.json" ]; then
+        base="$(git merge-base HEAD origin/main 2>/dev/null \
+                || git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+        SDK="$(xcrun --show-sdk-path 2>/dev/null || true)"
+        tidy_paths=('recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp'
+                    'telemetry/*.cpp' 'websocket/*.cpp'
+                    'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp')
+        files="$(git diff --name-only "$base" HEAD -- "${tidy_paths[@]}" || true)"
+        if [ -z "$files" ]; then
+            echo "[pre-push] clang-tidy: no first-party C++ changes."
+        else
+            echo "[pre-push] Running clang-tidy on changed first-party C++..."
+            printf '%s\n' "$files"
+            rc=0
+            # Pass 1 -- whole changed file (the high-signal bug classes are fatal).
+            while IFS= read -r file; do
+                [ -n "$file" ] || continue
+                if [ -n "$SDK" ]; then
+                    "$TIDY" -p "$DELIVERY_BUILD_DIR" --extra-arg=-isysroot --extra-arg="$SDK" "$file" || rc=1
+                else
+                    "$TIDY" -p "$DELIVERY_BUILD_DIR" "$file" || rc=1
+                fi
+            done <<< "$files"
+            # Pass 2 -- diff-scoped integer-coercion gate (NEW occurrences fatal).
+            if [ -f "$CTD" ]; then
+                if [ -n "$SDK" ]; then
+                    git diff -U0 "$base" HEAD -- "${tidy_paths[@]}" \
+                        | python3 "$CTD" -p1 -path "$DELIVERY_BUILD_DIR" -clang-tidy-binary "$TIDY" \
+                            -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
+                            -warnings-as-errors='*' -extra-arg=-isysroot -extra-arg="$SDK" || rc=1
+                else
+                    git diff -U0 "$base" HEAD -- "${tidy_paths[@]}" \
+                        | python3 "$CTD" -p1 -path "$DELIVERY_BUILD_DIR" -clang-tidy-binary "$TIDY" \
+                            -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
+                            -warnings-as-errors='*' || rc=1
+                fi
+            fi
+            [ "$rc" -eq 0 ] || { echo "[pre-push] clang-tidy gate FAILED." >&2; exit 1; }
+            echo "[pre-push] clang-tidy OK."
+        fi
+    else
+        echo "[pre-push] clang-tidy skipped (no LLVM clang-tidy or compile_commands.json)." >&2
+    fi
+fi
+
+# --- 7. clang ASan+UBSan: unit suite + e2e (was: Sanitizers asan-ubsan/asan-e2e) -
+# A separate -DOLR_SANITIZER build (cannot share the delivery binary). This is the
+# ONLY sanitizer coverage of the VideoToolbox/AudioToolbox native-codec tests --
+# they compile as stubs on the Linux CI leg, so CI can never see them. ASan/UBSan
+# aborts are deterministic (abort_on_error/halt_on_error), so until-pass retries
+# only paper over loopback timing flakes, never a real sanitizer finding.
+if [ "${SKIP_ASAN:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_ASAN=1 - skipping ASan/UBSan gate."
+else
+    ASAN_BUILD_DIR="${OLR_PREPUSH_ASAN_BUILD_DIR:-build/prepush-asan}"
+    echo "[pre-push] Building ASan+UBSan suite in ${ASAN_BUILD_DIR}..."
+    cmake -S . -B "$ASAN_BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DOLR_BUILD_TESTS=ON \
+        -DOLR_WERROR=ON \
+        -DOLR_SANITIZER="address;undefined" \
+        -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" >/dev/null
+    cmake --build "$ASAN_BUILD_DIR"
+    echo "[pre-push] Running unit suite under ASan+UBSan..."
+    ASAN_OPTIONS="detect_leaks=0:abort_on_error=1" \
+    UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
+        ctest --test-dir "$ASAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+            -L unit -LE "$UNIT_SELECTOR_LE"
+    echo "[pre-push] Running playback e2e under ASan+UBSan..."
+    ASAN_OPTIONS="detect_leaks=0:abort_on_error=1" \
+    UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
+    OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
+        ctest --test-dir "$ASAN_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
+            --no-tests=error -R "$E2E_REGEX"
+    echo "[pre-push] ASan+UBSan OK."
+fi
+
+# --- 8. TSan: threading-sensitive playback/output cases (was: Sanitizers tsan) --
+if [ "${SKIP_TSAN:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_TSAN=1 - skipping TSan gate."
+else
+    TSAN_BUILD_DIR="${OLR_PREPUSH_TSAN_BUILD_DIR:-build/prepush-tsan}"
+    TSAN_TARGETS=(tst_trackbuffer tst_audioframequeue tst_outputdispatcher
+                  tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine
+                  tst_ndiingest)
+    echo "[pre-push] Building TSan threading targets in ${TSAN_BUILD_DIR}..."
+    cmake -S . -B "$TSAN_BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DOLR_BUILD_TESTS=ON \
+        -DOLR_SANITIZER="thread" \
+        -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" >/dev/null
+    cmake --build "$TSAN_BUILD_DIR" --target "${TSAN_TARGETS[@]}"
+    echo "[pre-push] Running threading tests under TSan..."
+    TSAN_OPTIONS="halt_on_error=1" \
+        ctest --test-dir "$TSAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+            -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
+    echo "[pre-push] TSan OK."
+fi
+
+# --- 9. Optional heavier gate: full local CTest matrix + iOS build -------------
 if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
     exit 0
 fi

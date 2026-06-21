@@ -29,11 +29,16 @@ Local transport bring-up gates use distinct labels such as `srt`,
 `native-apple-ingest`, `native-ndi`, and `native-rtmp`; they are excluded from
 CI until their matching native ingest path is ready.
 
-### Delivery push gate (always-on)
+### Pre-push gate (heavy, always-on)
 
-`git push` runs a blocking pre-push gate (`.githooks/pre-push`): it builds the
-current-platform host and runs the `delivery-gate` CTest label — the four
-transport×codec delivery smokes with 5-second clips:
+`git push` runs a blocking pre-push gate (`.githooks/pre-push`). GitHub CI is
+deliberately thin (lint + one cheap Linux build/test), so this hook owns the
+heavy work: on every push it builds the current-platform host with `-Werror`,
+then runs — in order — the `delivery-gate` matrix (below), the unit suite +
+playback/record e2e at native speed, clang-tidy on changed first-party C++, and
+the clang ASan+UBSan (unit + e2e) and TSan sanitizer passes. Any failure blocks
+the push. The `delivery-gate` matrix is the four transport×codec delivery smokes
+with 5-second clips:
 
 | | h264 | h265 |
 | --- | --- | --- |
@@ -52,8 +57,10 @@ H.264 encoder (`libx264`/`h264_mf`) and an HEVC encoder (`libx265`/`hevc_*`) in
 ffmpeg, and the Qt host kit at `$QT_HOST_PREFIX`. On macOS: `brew install ffmpeg srt`.
 
 Tunables / bypass:
-- `OLR_E2E_CLIP_SECONDS` — clip length for the matrix (gate default `5`).
-- `OLR_PREPUSH_SKIP=1 git push` — bypass the gate (so does `git push --no-verify`).
+- `OLR_E2E_CLIP_SECONDS` — clip length for the e2e/delivery matrices (default `5`).
+- `OLR_PREPUSH_SKIP=1 git push` — bypass the whole gate (so does `git push --no-verify`).
+- `OLR_PREPUSH_LIGHT=1 git push` — run the delivery matrix only (skip the heavy build/test gates).
+- `SKIP_UNIT=1` / `SKIP_TIDY=1` / `SKIP_ASAN=1` / `SKIP_TSAN=1` — skip one heavy gate.
 - `OLR_PREPUSH_FULL=1 git push` — also run the full local CTest matrix + iOS build.
 
 The `ndi-runtime` label is a real NDI sender/receiver smoke test. It loads the
@@ -134,44 +141,52 @@ cmake --build build-asan
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan --output-on-failure
 ```
 
-`OLR_SANITIZER` instruments the app and tests. CI keeps this to fast unit spot
-checks instead of rerunning the full suite in every sanitizer leg:
-ASan+UBSan covers mux/parser/audio primitives, while TSan covers playback buffer
-primitives. The record/playback E2E drivers stay in the local pre-push gate.
+`OLR_SANITIZER` instruments the app and tests. The clang ASan+UBSan and TSan
+passes run in the local pre-push gate — the only place the VideoToolbox/
+AudioToolbox native-codec tests are sanitized, since they build as stubs on
+Linux. GitHub CI runs the GCC ASan+UBSan+**LSan** pass over the unit suite on
+Linux (LeakSanitizer is unsupported on macOS), which doubles as the
+second-compiler `-Werror` gate.
 
 ## Linting & formatting
 
 - **Format:** `.clang-format` (C++) and `.editorconfig`. Format changed files with
   `xcrun clang-format -i <files>`. The tree was *not* mass-reformatted; CI checks
   formatting on changed files only.
-- **C++ static analysis:** `.clang-tidy` (bug-focused, advisory). Run with
-  `clang-tidy -p build --extra-arg=-isysroot --extra-arg=$(xcrun --show-sdk-path) <file>`
+- **C++ static analysis:** `.clang-tidy` (bug-focused). The high-signal checks
+  gate changed first-party files in the pre-push hook and pre-commit; run by hand
+  with `clang-tidy -p build --extra-arg=-isysroot --extra-arg=$(xcrun --show-sdk-path) <file>`
   (the `-isysroot` arg is required for Homebrew LLVM to find the macOS SDK headers).
 - **QML:** `qmllint -I "$QT/qml" Main.qml MultiviewWindow.qml`.
 
 ## CI
 
-`.github/workflows/ci.yml` runs on PRs and pushes to `main`:
+`.github/workflows/ci.yml` is intentionally thin and runs entirely on Linux
+(no macOS) on PRs and pushes to `main`. The heavy build/test/sanitizer/e2e
+gates live in the pre-push hook above; CI is the cheap backstop that fork PRs
+fall back to (they never run that hook; project policy forbids `--no-verify`):
 
-- **changes** — classifies the diff first. Docs/workflow-only PRs do not run
-  app builds, tests, or sanitizers.
+- **changes** — classifies the diff first. Docs-only PRs do not run app builds
+  or tests.
 - **workflow-lint** — `actionlint` for workflow changes.
-- **build-test-macos** — app/test changes only; builds app + tests and runs the
-  short `ci` CTest label (primary PR gate).
 - **lint** — source/QML changes only; runs changed-line `clang-format` and/or
   `qmllint` only when those file types changed.
-- **sanitizers** — native-code/CMake changes only; focused ASan+UBSan spot
-  checks (gating) and a focused ThreadSanitizer spot check (advisory).
+- **build-test-linux** — app/test changes only; the single CI test gate. Builds
+  with GCC `-Werror` and runs the unit suite under ASan+UBSan+LSan (the only leg
+  with LeakSanitizer + a second compiler).
+- **ci-gate** — the one required status check; passes when the gating jobs above
+  succeed or are skipped (e.g. a docs-only PR).
+- **coverage** / **mutation-testing** — manual (`workflow_dispatch`) only.
 
-macOS jobs cache Qt via `install-qt-action`, Homebrew downloads via
-`actions/cache`, and C/C++ compiler outputs via `ccache`.
+CI caches Qt via `install-qt-action` and C/C++ compiler outputs via `ccache`.
 
-## Full local gate + iOS build (recommended before pushing, not CI)
+## Full local CTest matrix + iOS build (opt-in)
 
 iOS is **not** built in GitHub CI: the FFmpeg+SRT from-source build
-(~20 min) OOM-kills hosted runners. The expensive E2E matrix is also kept out
-of PR CI. Both are **recommended** to run locally before pushing risky changes —
-they are not forced. Run the full non-local-only CTest matrix with:
+(~20 min) OOM-kills hosted runners. The pre-push gate above already runs the
+unit/e2e/sanitizer gates by default; `OLR_PREPUSH_FULL=1 git push` *additionally*
+runs the full non-local-only CTest matrix and the iOS build. To run that matrix
+by hand:
 
 ```bash
 cmake -S . -B build/prepush-tests -G Ninja -DCMAKE_BUILD_TYPE=Debug \
@@ -192,18 +207,16 @@ cmake --build build/ios-prepush --config Debug -- \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 ```
 
-The optional [`.githooks/pre-push`](../.githooks/pre-push) hook surfaces this
-reminder at push time without blocking — it just prints the recommendation and
-lets the push through. Enable it once per clone:
+Enable the [`.githooks/pre-push`](../.githooks/pre-push) hook once per clone:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
-If you want the hook to actually run the full gate + iOS build as a one-off
-**blocking** check, opt in with `OLR_PREPUSH_FULL=1 git push` (within that, skip
-a part with `SKIP_FULL_TESTS=1` or `SKIP_IOS_BUILD=1`; if no Qt iOS kit is found
-the iOS part skips and the push proceeds after the CTest gate passes).
+The full CTest matrix + iOS build are opt-in on top of the default gate:
+`OLR_PREPUSH_FULL=1 git push` (within that, skip a part with `SKIP_FULL_TESTS=1`
+or `SKIP_IOS_BUILD=1`; if no Qt iOS kit is found the iOS part skips and the push
+proceeds after the rest of the gate passes).
 
 The iOS FFmpeg slice uses SecureTransport for TLS/RTMPS and builds libsrt
 without OpenSSL/mbedTLS encryption support. Encrypted native SRT is intentionally
@@ -214,7 +227,3 @@ ingest uses the native VideoToolbox path instead.
 
 - A runtime offscreen QML load test (beyond `qmllint`) needs the app factored
   into a library + thin `main`; today the smoke test is static-only.
-- `clang-tidy` is advisory; flip it to gating once the warning backlog is
-  triaged.
-- Introducing `-Werror` for the app (currently first-party warnings are
-  surfaced but non-fatal) after the existing warning backlog is cleared.
