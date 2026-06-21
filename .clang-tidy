@@ -28,9 +28,13 @@ Checks: >
 # Fatal classes: analyzer findings, bug-prone patterns, uninitialised members,
 # and the performance checks the tree is already clean for. The integer-coercion
 # family (narrowing/implicit-widening) and a few low-signal perf checks stay
-# REPORTED-BUT-ADVISORY here — they carry a large, mostly-benign FFmpeg-interop
-# backlog (see -DOLR_WCONVERSION) that must be burned down cast-by-cast in a
-# dedicated pass, not bulk-silenced, which can hide real truncation bugs.
+# REPORTED-BUT-ADVISORY *in this file* — they carry a large, mostly-benign
+# FFmpeg-interop backlog (see -DOLR_WCONVERSION) that must be burned down
+# cast-by-cast, not bulk-silenced (which can hide real truncation bugs).
+# NOTE: that backlog is grandfathered, NOT a free pass. CI runs a second,
+# DIFF-SCOPED clang-tidy pass (clang-tidy-diff.py over the PR's changed lines,
+# mirrored in .githooks/pre-commit) that makes narrowing-conversions and
+# implicit-widening-of-multiplication FATAL on any NEWLY changed line.
 WarningsAsErrors: >
   bugprone-*,
   clang-analyzer-*,
