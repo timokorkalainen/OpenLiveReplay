@@ -350,6 +350,13 @@ NativeNdiIngestSession::NativeNdiIngestSession(int sourceIndex, int outputWidth,
 
 NativeNdiIngestSession::~NativeNdiIngestSession() {
     requestStop();
+    // Backstop for the path where run() never executed (e.g. open() succeeded but
+    // the loop was never entered): run() closes the receiver on the normal path,
+    // and closeReceiver() is idempotent. The destructor runs on the capture thread
+    // after run() has returned, so this never races capture().
+    if (m_backend) {
+        m_backend->closeReceiver();
+    }
     if (m_sws) {
         sws_freeContext(m_sws);
         m_sws = nullptr;
@@ -412,6 +419,9 @@ bool NativeNdiIngestSession::open(const QUrl& url, const IngestCallbacks& callba
         m_lastFailureKind = IngestFailureKind::TransientNetwork;
         return false;
     }
+    // Baseline the stall clock at connect: run() breaks if no frame arrives
+    // within m_stallTimeoutMs of this (or of the last received frame).
+    m_lastFrameAtMs = m_monotonic.elapsed();
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(true);
     }
@@ -428,6 +438,7 @@ void NativeNdiIngestSession::run() {
         const INdiReceiverBackend::Capture result =
             m_backend->capture(&video, &audio, kCaptureTimeoutMs);
         if (result == INdiReceiverBackend::Capture::Video) {
+            m_lastFrameAtMs = m_monotonic.elapsed();
             AVFrame* frame = ndiVideoToYuv420p(video, m_outputWidth, m_outputHeight, &m_sws);
             const int64_t sourcePtsMs =
                 mapTimestampMs(video.timestamp100ns, ClockObservationRole::Authority);
@@ -444,6 +455,7 @@ void NativeNdiIngestSession::run() {
             }
             m_backend->freeVideo(&video);
         } else if (result == INdiReceiverBackend::Capture::Audio) {
+            m_lastFrameAtMs = m_monotonic.elapsed();
             const QByteArray pcm = ndiAudioToS16Stereo(audio);
             const int64_t sourcePtsMs =
                 mapTimestampMs(audio.timestamp100ns, ClockObservationRole::Follower);
@@ -461,8 +473,27 @@ void NativeNdiIngestSession::run() {
             m_lastFailureKind = IngestFailureKind::TransientNetwork;
             break;
         } else {
+            // Capture::None: source connected but no frame this poll. Break if the
+            // silence has exceeded the stall window so captureLoop reconnects —
+            // symmetry with SRT/RTMP and a clear TransientNetwork classification
+            // (the StreamWorker watchdog also covers this case; this is faster +
+            // session-local). Belt-and-suspenders, not the sole defense.
+            if (m_lastFrameAtMs >= 0 &&
+                m_monotonic.elapsed() - m_lastFrameAtMs > m_stallTimeoutMs) {
+                m_lastFailureKind = IngestFailureKind::TransientNetwork;
+                if (m_callbacks.logInfo) {
+                    m_callbacks.logInfo(QStringLiteral("Native NDI stalled. Restarting..."));
+                }
+                break;
+            }
             QThread::msleep(1);
         }
+    }
+    // Destroy the receiver on the CAPTURE thread (the only thread that calls
+    // capture()/free*()), never from the stopping thread — this is what makes
+    // requestStop() safe to be flag-only. closeReceiver() is idempotent.
+    if (m_backend) {
+        m_backend->closeReceiver();
     }
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(false);
@@ -470,10 +501,11 @@ void NativeNdiIngestSession::run() {
 }
 
 void NativeNdiIngestSession::requestStop() {
+    // Flag-only: NDI capture() self-unblocks within kCaptureTimeoutMs, so the
+    // capture thread sees this flag and tears down its own receiver in run().
+    // Destroying the receiver here (from the worker/UI thread) while the capture
+    // thread is inside capture()/free*() would be a use-after-free + data race.
     m_stopRequested.store(true, std::memory_order_relaxed);
-    if (m_backend) {
-        m_backend->closeReceiver();
-    }
 }
 
 bool NativeNdiIngestSession::shouldStop() const {

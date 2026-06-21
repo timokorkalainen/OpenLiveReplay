@@ -409,7 +409,7 @@ jobs:
           - sanitizer: "thread"
             label: tsan
             advisory: false
-            build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine"
+            build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine tst_ndiingest"
           # asan-e2e: only the e2e harness binaries need building — the playback
           # matrix drives play_harness + record_harness; the native SRT smoke
           # drives record_harness. Both are linked with olr_sanitize, so this
@@ -539,7 +539,7 @@ jobs:
         run: |
           if [ "${{ matrix.label }}" = "tsan" ]; then
             ctest --output-on-failure --repeat until-pass:2 \
-              -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine)$'
+              -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
           else
             ctest --output-on-failure --repeat until-pass:2 \
               -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
