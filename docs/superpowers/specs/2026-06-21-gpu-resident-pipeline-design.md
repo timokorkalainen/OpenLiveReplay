@@ -199,7 +199,8 @@ re-emit and the placeholder path store and re-paint **handles**, never triggerin
 copy-on-GPU-path detector (`telemetry-contract`) covers those paths too.
 
 **Copy/equality contract (explicit):** a handle copy is a refcount bump of shared pixels; identity
-is by `FrameMetadata`, never pixel content. Concrete unit test: take a memo-aliased handle, override
+is by the `FramePayloadKey` (payload identity), never the presentation fields (`outputFrameIndex` /
+`sampledPlayheadMs`) or pixel content. Concrete unit test: take a memo-aliased handle, override
 `ptsMs`/`outputFrameIndex` on the copy, and assert (a) the pixel payload is byte-identical and
 refcount-shared with the original and (b) the original's metadata is unchanged.
 
@@ -225,7 +226,7 @@ product behavior and golden values are unchanged; only test sources edit.
 | D4 | GPU threading | **Fenced multi-thread mirroring the snapshot model** + GPU generation counter | Worker produces surfaces, signals a decode-done fence before publish; output thread waits before reading; eviction waits on render fences. Minimal extension of the proven lock-light producer/consumer; directly closes the TSan-invisible races. Single-GPU-thread would serialize decode+dispatch. **Sync primitive must match the RHI backend (Phase-0 decision):** Apple = `MTLSharedEvent`; Windows = `ID3D12Fence` *iff* the RHI D3D12 backend is chosen, else `ID3D11Fence` (11.4) / keyed-mutex / `ID3D11Query` for D3D11 — do not assume D3D12 fences on a D3D11 device. |
 | D5 | Keep CPU pipeline as runtime fallback | **Yes, permanent**, behind the compositor-select flag, default until GPU proven per-platform | It is the CI oracle, the headless-macOS path, and the safe degradation target. Handle abstraction contains divergence to the compositor + sink-readback layers. |
 | D6 | Mixed-origin frames | **Single self-describing handle**; `readToCpu()` no-op (CPU) / fenced download (GPU) | MPEG-2 SW + NDI ingest are CPU-origin; HW decode GPU-origin. Forcing uniform residency wastes uploads or defeats zero-copy. Compositor uploads a CPU-origin input on demand only when it composites it. |
-| D7 | Readback placement | **Async pipelined** (render N, read N-2), **one readback per unique rendered bus surface / requested CPU format**, shared by all CPU sinks on that bus; **PGM ring depth-1 (sub-frame) from day one, other CPU sinks depth-3** | Sync readback stalls the 1 ms cadence at 60 fps. A tick renders per distinct bus (feed/PGM/multiview), so the invariant is per-surface, not per-tick. PGM preview gets the low-latency depth-1 path up front (user decision); NDI/multiview accept depth-3 (2–3 frames). The multiview monitor's ~33 ms (@60 fps) A/V lead vs the real-time `AudioPlayer` is **written-accepted** (§9), not mitigated. GPU-native sinks bypass via `SinkGpuCapability`. |
+| D7 | Readback placement | **Async pipelined** (render N, read N-2), **one readback per unique rendered bus surface / requested CPU format**, shared by all CPU sinks on that bus; **PGM ring depth-1 (sub-frame) from day one, other CPU sinks depth-3** | Sync readback stalls the 1 ms cadence at 60 fps. A tick renders per distinct bus (feed/PGM/multiview), so the invariant is per-surface, not per-tick. PGM preview gets the low-latency depth-1 path up front (user decision); NDI/multiview accept depth-3 (2–3 frames). The multiview monitor's ~33 ms (@60 fps) A/V lead vs the real-time `AudioPlayer` is an open AudioPlayer-delay-or-accept decision deferred to `async-readback` (§9), not silently mitigated. GPU-native sinks bypass via `SinkGpuCapability`. |
 | D8 | iOS timing | **Symmetric edge interface now, bring-up Phase 5** | No macOS-only architecting, but don't pay iOS main-thread/thermal/VRAM cost before the spine is proven. |
 | D9 | Single decode-window authority | **`TrackBuffer` owns the authoritative GPU surface window; `OutputFrameCache`, staging, and the inactive-graph snapshot hold `FrameHandle` refs (refcount bumps), never second copies** | Code-confirmed double storage: each decoded frame is inserted into both `track->buffer` **and** `m_outputCache` ([playbackworker.cpp:625-627](../../../playback/playbackworker.cpp)), and the inactive-graph path copies every TrackBuffer frame into a fresh cache (:2247-2256). Holding GPU surfaces in both doubles VRAM; refs-only collapses it — this is what makes the ~0.85 GiB floor real. |
 | D10 | Sink cadence contract | **Per-sink capability: `GpuNative` / `AsyncReadbackDedupOk` / `NeedsContinuousCadence`** | The dispatcher identity-skips `submit()` on `samePayloadAs` ([outputdispatcher.cpp:116-122](../../../playback/output/outputdispatcher.cpp)). Async readback must not fight that or NDI's `maxGap≤2`: dedup-ok sinks (preview) skip readback on unchanged payload while advancing delivery indices; continuous-cadence sinks (NDI) get a readback (or a re-sent prior surface) every tick. `async-readback` owns the policy. |
@@ -285,10 +286,9 @@ Keystone-first, strict gates. Each phase gates the next; everything behind flags
   probe** (§8) and a **minimal `gpu-sync` fence stub** (decode-done fence before publish) so the
   micro-stress exercises eviction *with* the sync primitive that ships, not without it.
 - **Phase 3 — Sync + compositor:** `gpu-sync`, `gpu-compositor`, **multi-feed cap-pressure stress**.
-  (Correction: the single-feed slice **does** exercise CPU-frame eviction today — the window-derived
-  cap is ~47–111 frames/feed, not 256. What is *unexercised* until here is **concurrent GPU
-  evict-while-render under pressure** and **OOM-degrade** — see §8's micro-stress for the early
-  signal.)
+  The single-feed slice already exercises CPU-frame eviction (the window-derived cap is ~47–111
+  frames/feed, not 256); what is *unexercised* until here is **concurrent GPU evict-while-render
+  under pressure** and **OOM-degrade** (see §8's micro-stress for the earlier signal).
 - **Phase 4 — Output at scale:** `async-readback` (AV-sync-under-lag hard gate + PGM sub-frame
   mode), `gpu-budget`, `device-loss`.
 - **Phase 5 — Capabilities:** `gpu-encode`, `ios-bringup`, `new-io-targets`.
@@ -394,7 +394,7 @@ fenceless approximation.
 | **Quality scaler not oracle-validatable** | GPU nearest-neighbor compat shader covers the bit/LSB oracle; the bilinear/Lanczos scaler gets its own PSNR/SSIM goldens + tolerance, validated separately |
 | **Identity-skip regression** | Handle identity is `FramePayloadKey` (excludes `outputFrameIndex`/`sampledPlayheadMs`), matching `samePayloadAs`; unit test pins that presentation-only changes do not break dedup |
 | Readback stall on 1 ms cadence | Async pipelined, one copy per unique rendered bus surface shared by that bus's CPU sinks; identity-skip dedup; PGM sub-frame mode profiled |
-| **VRAM blowup under multiview** | GPU budget sized to the peak formula (N-feeds × window + staging-bank + compositor-output-cache), not a flat 32–64; OOM-safe degrade to CPU; never let GPU alloc failure crash decode |
+| **VRAM blowup under multiview** | GPU budget sized to the §2 peak formula (aggregate ≤256 decode window + armed-cut staging bank + Σ per-bus compositor outputs + Σ async-readback rings), not a flat 32–64 and not `256 × N-feeds`; OOM-safe degrade to CPU; never let GPU alloc failure crash decode |
 | **Two top risks retire late** | Early micro-stress (tiny per-track budget + GPU-alloc-failure injection) in the Phase-2 single-feed slice surfaces evict-while-render + OOM-degrade before Phase 3 |
 | **Hidden second native edge (Windows)** | `gpu-import-win` split out with its own Phase-0 probe, slice, and risk/size — symmetric to the macOS VT edge |
 | GPU device loss (hard-down for live) | `device-loss` subproject: detect, invalidate, rebuild spine, degrade to CPU; fault-injection e2e |
