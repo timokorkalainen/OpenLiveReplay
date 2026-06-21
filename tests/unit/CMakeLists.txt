@@ -41,6 +41,16 @@ olr_add_unit_test(tst_mpegtsparser     olr_test_core)
 olr_add_unit_test(tst_mpegtsparser_pcr olr_test_core)
 olr_add_unit_test(tst_h26xaccessunit   olr_test_core)
 olr_add_unit_test(tst_colorvui olr_test_core)
+if(APPLE)
+    olr_add_unit_test(tst_colortags_apple olr_test_core)
+    add_library(olr_test_colortags_apple STATIC
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/colortags_apple.mm")
+    target_include_directories(olr_test_colortags_apple PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(olr_test_colortags_apple
+        PUBLIC Qt6::Core olr_test_core "-framework CoreMedia" "-framework CoreFoundation"
+               "-framework CoreVideo")
+    target_link_libraries(tst_colortags_apple PRIVATE olr_test_colortags_apple)
+endif()
 olr_add_unit_test(tst_h26xseitimecode  olr_test_engine)
 olr_add_unit_test(tst_nativesrtaddress olr_test_core)
 olr_add_unit_test(tst_nativevideodecoder olr_test_core)

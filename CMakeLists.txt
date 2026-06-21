@@ -351,6 +351,7 @@ endif()
 
 if(APPLE)
     target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/ingest/colortags_apple.mm
         recorder_engine/ingest/nativevideodecoder_videotoolbox.mm
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
