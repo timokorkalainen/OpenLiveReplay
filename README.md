@@ -75,6 +75,14 @@ ctest --test-dir build --output-on-failure   # unit + smoke + e2e
 
 See [`tests/README.md`](tests/README.md) for full details.
 
+Debugging (runtime introspection)
+---------------------------------
+Inspect the running desktop app live — QML scene, QObject tree, thread affinity,
+signal/slot connections, timers, and `uiManager` properties — with
+[GammaRay](https://github.com/KDAB/GammaRay). One-time setup (build it against the
+project's Qt) is in [`docs/gammaray.md`](docs/gammaray.md); the day-to-day usage
+playbook is the [`gammaray` skill](.claude/skills/gammaray/SKILL.md).
+
 Contributing
 ------------
 Contributions, issues and feature requests are welcome. Please open issues describing the problem or enhancement and follow the repository's contribution guidelines when submitting pull requests. Before opening a PR, run the test suite and format any changed C++ with `xcrun clang-format -i`.
