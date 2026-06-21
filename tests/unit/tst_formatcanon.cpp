@@ -4,6 +4,9 @@
 #include "playback/output/formatcanon.h"
 #include "playback/output/framehandle.h"
 #include "playback/output/framepixelformat.h"
+#include "playback/output/yuv420pcompositor.h"
+
+#include <tuple>
 
 namespace {
 
@@ -27,6 +30,14 @@ CpuPlanes makeNv12_4x4() {
     return planes;
 }
 
+formatcanon::Rgb8 expectedSolidRgb(uchar y, uchar u, uchar v, ColorMetadata color) {
+    return formatcanon::yuvToRgb8(y, u, v, color.matrix, color.range);
+}
+
+bool sameRgb(formatcanon::Rgb8 lhs, formatcanon::Rgb8 rhs) {
+    return lhs.r == rhs.r && lhs.g == rhs.g && lhs.b == rhs.b;
+}
+
 } // namespace
 
 class TestFormatCanon : public QObject {
@@ -43,6 +54,9 @@ private slots:
     void yuvToRgbVideoRangeNeutralGrey();
     void yuvToRgbPrimariesDifferByMatrix();
     void yuvToRgbClampsAndFullRange();
+    void referenceGridPlacesTilesLikeCpuOracleLuma();
+    void referenceGridModelsNv12ChromaDecimation();
+    void referenceGridOutputIsRgba8();
 };
 
 void TestFormatCanon::planeShapeMatchesYuv420pLayout() {
@@ -208,6 +222,66 @@ void TestFormatCanon::yuvToRgbClampsAndFullRange() {
         formatcanon::yuvToRgb8(235, 16, 240, ColorMatrix::Bt601, ColorRange::Video);
     QCOMPARE(hot.r, uchar(255));
     QVERIFY(hot.b < hot.r);
+}
+
+void TestFormatCanon::referenceGridPlacesTilesLikeCpuOracleLuma() {
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 60, 200), solidYuv420pHandle(4, 4, 80, 70, 190),
+        solidYuv420pHandle(4, 4, 120, 80, 180), solidYuv420pHandle(4, 4, 160, 90, 170)};
+    ColorMetadata color;
+    const CpuPlanes rgba = formatcanon::referenceComposeGridRgba8(frames, 8, 8, color);
+    QVERIFY(rgba.isValid());
+    QCOMPARE(int(rgba.format), int(FramePixelFormat::Rgba8));
+    QCOMPARE(rgba.width, 8);
+    QCOMPARE(rgba.height, 8);
+
+    auto pixelRgb = [&](int x, int y) {
+        const int offset = y * rgba.stride[0] + x * 4;
+        return formatcanon::Rgb8{uchar(rgba.plane[0].at(offset)),
+                                 uchar(rgba.plane[0].at(offset + 1)),
+                                 uchar(rgba.plane[0].at(offset + 2))};
+    };
+
+    QVERIFY(sameRgb(pixelRgb(0, 0), expectedSolidRgb(40, 60, 200, color)));
+    QVERIFY(sameRgb(pixelRgb(4, 0), expectedSolidRgb(80, 70, 190, color)));
+    QVERIFY(sameRgb(pixelRgb(0, 4), expectedSolidRgb(120, 80, 180, color)));
+    QVERIFY(sameRgb(pixelRgb(4, 4), expectedSolidRgb(160, 90, 170, color)));
+    QCOMPARE(uchar(rgba.plane[0].at(3)), uchar(255));
+}
+
+void TestFormatCanon::referenceGridModelsNv12ChromaDecimation() {
+    CpuPlanes planes;
+    planes.format = FramePixelFormat::Yuv420p;
+    planes.width = 2;
+    planes.height = 2;
+    planes.stride[0] = 2;
+    planes.stride[1] = 1;
+    planes.stride[2] = 1;
+    planes.plane[0] = QByteArray(4, char(128));
+    planes.plane[1] = QByteArray(1, char(64));
+    planes.plane[2] = QByteArray(1, char(192));
+    FrameHandle handle = makeCpuFrameHandle(planes, FrameMetadata{});
+
+    ColorMetadata color;
+    const CpuPlanes rgba = formatcanon::referenceComposeGridRgba8({handle}, 2, 2, color);
+    QVERIFY(rgba.isValid());
+    auto px = [&](int x, int y) {
+        const int offset = y * rgba.stride[0] + x * 4;
+        return std::make_tuple(uchar(rgba.plane[0].at(offset)), uchar(rgba.plane[0].at(offset + 1)),
+                               uchar(rgba.plane[0].at(offset + 2)));
+    };
+    QCOMPARE(px(0, 0), px(1, 1));
+    QCOMPARE(px(1, 0), px(0, 1));
+    QCOMPARE(px(0, 0), px(1, 0));
+}
+
+void TestFormatCanon::referenceGridOutputIsRgba8() {
+    QList<FrameHandle> frames{solidYuv420pHandle(4, 4, 100, 128, 128)};
+    const CpuPlanes rgba = formatcanon::referenceComposeGridRgba8(frames, 4, 4, ColorMetadata{});
+    QVERIFY(rgba.isValid());
+    QCOMPARE(int(rgba.format), int(FramePixelFormat::Rgba8));
+    QCOMPARE(rgba.stride[0], 16);
+    QCOMPARE(rgba.plane[0].size(), 4 * 4 * 4);
 }
 
 QTEST_GUILESS_MAIN(TestFormatCanon)

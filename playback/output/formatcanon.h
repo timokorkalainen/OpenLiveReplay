@@ -4,6 +4,8 @@
 #include "playback/output/framehandle.h"
 #include "playback/output/framepixelformat.h"
 
+#include <QList>
+
 namespace formatcanon {
 
 struct PlaneShape {
@@ -33,6 +35,8 @@ struct Rgb8 {
 };
 
 Rgb8 yuvToRgb8(uchar y, uchar u, uchar v, ColorMatrix matrix, ColorRange range);
+CpuPlanes referenceComposeGridRgba8(const QList<FrameHandle>& frames, int width, int height,
+                                    ColorMetadata color);
 
 } // namespace formatcanon
 

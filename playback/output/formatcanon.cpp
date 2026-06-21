@@ -1,5 +1,7 @@
 #include "playback/output/formatcanon.h"
 
+#include <cmath>
+
 namespace formatcanon {
 namespace {
 
@@ -176,6 +178,71 @@ Rgb8 yuvToRgb8(uchar y, uchar u, uchar v, ColorMatrix matrix, ColorRange range) 
     }
 
     return {clampU8((r + 512) >> 10), clampU8((g + 512) >> 10), clampU8((b + 512) >> 10)};
+}
+
+CpuPlanes referenceComposeGridRgba8(const QList<FrameHandle>& frames, int width, int height,
+                                    ColorMetadata color) {
+    CpuPlanes out;
+    out.format = FramePixelFormat::Rgba8;
+    out.width = width;
+    out.height = height;
+    out.stride[0] = width * 4;
+    out.plane[0] = QByteArray(planeBytes(out.stride[0], height), 0);
+
+    const Rgb8 bg = yuvToRgb8(16, 128, 128, color.matrix, color.range);
+    for (int y = 0; y < height; ++y) {
+        char* row = out.plane[0].data() + byteOffset(y, out.stride[0]);
+        for (int x = 0; x < width; ++x) {
+            const qsizetype offset = static_cast<qsizetype>(x) * 4;
+            row[offset] = char(bg.r);
+            row[offset + 1] = char(bg.g);
+            row[offset + 2] = char(bg.b);
+            row[offset + 3] = char(255);
+        }
+    }
+
+    const int count = qMax(1, static_cast<int>(frames.size()));
+    const int columns = qMax(1, int(std::ceil(std::sqrt(double(count)))));
+    const int rows = qMax(1, int(std::ceil(double(count) / double(columns))));
+
+    for (int i = 0; i < static_cast<int>(frames.size()); ++i) {
+        const CpuPlanes planar = frames.at(i).readToCpu(FramePixelFormat::Yuv420p);
+        if (!planar.isValid()) continue;
+        const CpuPlanes viaNv12 = nv12ToYuv420p(yuv420pToNv12(planar));
+        if (!viaNv12.isValid()) continue;
+        const FullResChroma chroma = upsampleChromaNearest(viaNv12);
+        const int srcW = viaNv12.width;
+        const int srcH = viaNv12.height;
+        if (srcW <= 0 || srcH <= 0) continue;
+
+        const int col = i % columns;
+        const int row = i / columns;
+        const int dstX = col * width / columns;
+        const int dstY = row * height / rows;
+        const int dstRight = (col + 1) * width / columns;
+        const int dstBottom = (row + 1) * height / rows;
+        const int dstW = qMax(0, dstRight - dstX);
+        const int dstH = qMax(0, dstBottom - dstY);
+
+        for (int y = 0; y < dstH; ++y) {
+            const int sy = qMin(srcH - 1, (y * srcH) / dstH);
+            for (int x = 0; x < dstW; ++x) {
+                const int sx = qMin(srcW - 1, (x * srcW) / dstW);
+                const qsizetype srcOffset = byteOffset(sy, viaNv12.stride[0]) + sx;
+                const qsizetype chromaOffset = byteOffset(sy, srcW) + sx;
+                const Rgb8 rgb = yuvToRgb8(
+                    uchar(viaNv12.plane[0].at(srcOffset)), uchar(chroma.u.at(chromaOffset)),
+                    uchar(chroma.v.at(chromaOffset)), color.matrix, color.range);
+                const qsizetype dstOffset =
+                    byteOffset(dstY + y, out.stride[0]) + static_cast<qsizetype>(dstX + x) * 4;
+                out.plane[0][dstOffset] = char(rgb.r);
+                out.plane[0][dstOffset + 1] = char(rgb.g);
+                out.plane[0][dstOffset + 2] = char(rgb.b);
+                out.plane[0][dstOffset + 3] = char(255);
+            }
+        }
+    }
+    return out;
 }
 
 } // namespace formatcanon
