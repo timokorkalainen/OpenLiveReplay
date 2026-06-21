@@ -249,10 +249,12 @@ target_link_libraries(olr_test_playback
     PRIVATE olr_warnings olr_sanitize)
 if(APPLE)
     target_sources(olr_test_playback PRIVATE
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_apple.mm")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_apple.mm"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp")
 else()
     target_sources(olr_test_playback PRIVATE
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp")
 endif()
 
 if(OLR_GPU_PIPELINE)

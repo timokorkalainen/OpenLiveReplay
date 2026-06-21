@@ -366,7 +366,8 @@ if(APPLE)
         recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm
         recorder_engine/codec/nativevideoencoder_videotoolbox.mm
-        playback/gpu/gpusurface.h playback/gpu/gpusurface_apple.mm)
+        playback/gpu/gpusurface.h playback/gpu/gpusurface_apple.mm
+        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -383,7 +384,8 @@ elseif(WIN32)
         recorder_engine/ingest/nativertmpingestsession.cpp
         recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp
         recorder_engine/codec/nativevideoencoder_mediafoundation.cpp
-        playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp)
+        playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp
+        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp)
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -402,7 +404,8 @@ elseif(NOT WIN32)
         recorder_engine/ingest/nativevideodecoder_stub.cpp
         recorder_engine/ingest/nativeaacdecoder_stub.cpp
         recorder_engine/codec/nativevideoencoder_stub.cpp
-        playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp)
+        playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp
+        playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp)
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)

@@ -3,6 +3,7 @@
 // Apple, Metal, or D3D headers and exercises the desc/validity contract.
 #include <QtTest>
 
+#include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/framepixelformat.h"
 
@@ -28,6 +29,8 @@ class TestGpuSurface : public QObject {
 private slots:
     void descRoundTrips();
     void invalidSurfaceHasNullHandle();
+    void pipelineFlagDefaultsOff();
+    void injectedAllocFailureIsOneShot();
 };
 
 void TestGpuSurface::descRoundTrips() {
@@ -43,6 +46,27 @@ void TestGpuSurface::invalidSurfaceHasNullHandle() {
     FakeGpuSurface s({FramePixelFormat::Nv12, 0, 0}, false);
     QVERIFY(!s.isValid());
     QVERIFY(s.nativeHandle() == nullptr);
+}
+
+void TestGpuSurface::pipelineFlagDefaultsOff() {
+    qunsetenv("OLR_GPU_PIPELINE");
+    QVERIFY(!gpuPipelineEnabled());
+    qputenv("OLR_GPU_PIPELINE", "1");
+    QVERIFY(gpuPipelineEnabled());
+    qputenv("OLR_GPU_PIPELINE", "true");
+    QVERIFY(gpuPipelineEnabled());
+    qputenv("OLR_GPU_PIPELINE", "on");
+    QVERIFY(gpuPipelineEnabled());
+    qputenv("OLR_GPU_PIPELINE", "0");
+    QVERIFY(!gpuPipelineEnabled());
+    qunsetenv("OLR_GPU_PIPELINE");
+}
+
+void TestGpuSurface::injectedAllocFailureIsOneShot() {
+    gpuSetInjectedAllocFailures(2);
+    QVERIFY(gpuConsumeInjectedAllocFailure());
+    QVERIFY(gpuConsumeInjectedAllocFailure());
+    QVERIFY(!gpuConsumeInjectedAllocFailure());
 }
 
 QTEST_GUILESS_MAIN(TestGpuSurface)
