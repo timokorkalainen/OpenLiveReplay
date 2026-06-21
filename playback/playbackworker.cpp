@@ -1,11 +1,13 @@
 #include "playback/playbackworker.h"
 #include "playback/cutschedule.h"
 #include "playback/output/broadcastoutputsettings.h"
+#include "playback/output/colormetadatapolicy.h"
 #include "playback/output/outputbusengine.h"
 #include "playback/output/outputframecache.h"
 #include "playback/output/ndisink.h"
 #include "playback/output/qtpreviewsink.h"
 #include "playback/output/queuedoutputsink.h"
+#include "recorder_engine/ingest/colorvui.h"
 #include <QDebug>
 #include <QMutexLocker>
 #include <QElapsedTimer>
@@ -2305,6 +2307,13 @@ void PlaybackWorker::deliverDueFrames(int64_t P, int dir) {
     }
 }
 
+ColorMetadata colorMetadataForAvFrame(const AVFrame* frame) {
+    if (!frame) return defaultColorMetadataForHeight(0);
+    return resolveColorMetadata(VuiColorInfo{}, frame->height, int(frame->colorspace),
+                                int(frame->color_range), int(frame->color_primaries),
+                                int(frame->color_trc));
+}
+
 FrameHandle PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int feedIndex) {
     // Our recordings are always MPEG-2 all-intra YUV420P. Reject anything else
     // (a foreign MKV, 10-bit or 4:2:2 content) rather than copying it with the
@@ -2355,5 +2364,6 @@ FrameHandle PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int feedInd
     meta.stride[0] = out.stride[0];
     meta.stride[1] = out.stride[1];
     meta.stride[2] = out.stride[2];
+    meta.color = colorMetadataForAvFrame(frame);
     return makeCpuFrameHandle(std::move(out), std::move(meta));
 }

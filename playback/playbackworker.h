@@ -15,6 +15,7 @@
 #include "frameprovider.h"
 #include "playback/commitgate.h"
 #include "playback/frameindex.h"
+#include "playback/output/colormetadata.h"
 #include "playback/output/outputruntime.h"
 #include "playback/output/sharedcacheslot.h"
 #include "playback/output/outputtargetassignment.h"
@@ -30,6 +31,8 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/error.h>
 }
+
+ColorMetadata colorMetadataForAvFrame(const AVFrame* frame);
 
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
