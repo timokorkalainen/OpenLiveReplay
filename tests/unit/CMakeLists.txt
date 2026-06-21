@@ -179,4 +179,5 @@ olr_add_unit_test(tst_recordgate olr_test_engine)
 
 if(OLR_GPU_PIPELINE)
     olr_add_unit_test(tst_shadertoolchain olr_test_gpu)
+    olr_add_unit_test(tst_gpurhicontext olr_test_playback olr_test_gpu)
 endif()

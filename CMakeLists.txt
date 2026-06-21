@@ -410,6 +410,18 @@ elseif(NOT WIN32)
         playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp)
 endif()
 
+if(OLR_GPU_PIPELINE)
+    target_link_libraries(OpenLiveReplay PRIVATE Qt6::GuiPrivate)
+    if(APPLE)
+        target_sources(OpenLiveReplay PRIVATE
+            playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_apple.mm)
+        target_link_libraries(OpenLiveReplay PRIVATE "-framework Metal" "-framework QuartzCore")
+    else()
+        target_sources(OpenLiveReplay PRIVATE
+            playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp)
+    endif()
+endif()
+
 # 4. Handle Platform Specifics (FFmpeg)
 if(IOS)
     target_sources(OpenLiveReplay PRIVATE
