@@ -72,6 +72,13 @@ struct OutputDispatchStats {
     // large value means the output is sampling (and rendering) the WRONG frame
     // even though no placeholder/reposition is reported (frame-accuracy guard).
     qint64 maxClockDivergenceMs = 0;
+    qint64 gpuVramBytes = 0;
+    qint64 readbackQueueDepth = 0;
+    qint64 readbackDrops = 0;
+    qint64 fenceWaitStalls = 0;
+    qint64 gpuOomDegrades = 0;
+    qint64 gpuReadbacks = 0;
+    qint64 redundantGpuReadbacks = 0;
     OutputRuntimeDispatchStats runtime;
     QHash<QString, OutputTargetDispatchStats> targets;
 };

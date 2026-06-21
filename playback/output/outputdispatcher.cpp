@@ -1,5 +1,6 @@
 #include "playback/output/outputdispatcher.h"
 
+#include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputframeclock.h"
 
 #include <QHash>
@@ -132,6 +133,10 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
             m_stats.sinkFailures++;
         }
     }
+
+    const GpuReadbackTelemetrySnapshot gpu = GpuReadbackTelemetry::instance().snapshot();
+    m_stats.gpuReadbacks = gpu.gpuReadbacks;
+    m_stats.redundantGpuReadbacks = gpu.redundantReadbacks;
 
     m_stats.ticks++;
     return m_stats;
