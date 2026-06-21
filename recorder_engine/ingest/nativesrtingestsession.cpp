@@ -356,14 +356,24 @@ void NativeSrtIngestSession::run() {
 #ifdef _WIN32
     srt_clearlasterror();
 #endif
+
+    // Close the socket on the capture thread — the same thread that ran srt_recv /
+    // srt_bstats / srt_getsockstate above. requestStop() (worker/control thread) is
+    // flag-only, so the close never races the receive loop. closeSocket() is
+    // idempotent, so the destructor's backstop close (open()-without-run() path)
+    // stays safe.
+    closeSocket();
 }
 
 void NativeSrtIngestSession::requestStop() {
+    // Flag-only. The socket is non-blocking (RCVSYN=0) and every connect/accept/recv
+    // loop polls shouldStop() within one poll interval, so the capture thread tears
+    // its OWN socket down in run() on observing this flag. Closing the socket here —
+    // from the worker/control thread, while the capture thread may be inside
+    // srt_recv/srt_bstats/srt_getsockstate on the same non-atomic handle — is a
+    // cross-thread use-after-free + data race. (The RTMP sibling is already
+    // flag-only; the NDI sibling was fixed the same way in commit a50e0af.)
     m_stopRequested.store(true, std::memory_order_relaxed);
-    // Force any in-flight receive/accept/connect out promptly. Global libsrt cleanup
-    // is deferred on Windows, and run() checks shouldStop() before asking more socket
-    // state, so this cross-thread close is only used as a wakeup.
-    closeSocket();
 }
 
 bool NativeSrtIngestSession::openSocket(QString* error) {
