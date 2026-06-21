@@ -21,6 +21,7 @@ struct NativeVideoDecodeCapabilities {
 class NativeVideoDecoder {
 public:
     using FrameCallback = std::function<void(AVFrame*)>;
+    using KeepSurfaceCallback = std::function<void(void* cvImageBufferRef, qint64 pts90k)>;
 
     NativeVideoDecoder(int outputWidth, int outputHeight);
     ~NativeVideoDecoder();
@@ -29,6 +30,17 @@ public:
     NativeVideoDecoder& operator=(const NativeVideoDecoder&) = delete;
 
     bool decode(const CompressedAccessUnit& unit, FrameCallback onFrame, QString* error);
+#ifdef __APPLE__
+    bool decodeKeepSurface(const CompressedAccessUnit& unit, KeepSurfaceCallback onSurface,
+                           QString* error);
+#else
+    bool decodeKeepSurface(const CompressedAccessUnit&, KeepSurfaceCallback, QString* error) {
+        if (error) {
+            *error = QStringLiteral("Native keep-surface decode is unavailable on this platform");
+        }
+        return false;
+    }
+#endif
     void reset();
     // Phase-0 probe (P0.1): true iff the most recently decoded CVPixelBuffer was
     // IOSurface-backed. Always false on non-VideoToolbox builds.

@@ -7,6 +7,7 @@
 #include "playback/output/framehandle.h"
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
+#include "playback/gpu/vtkeepsurfaceimporter.h"
 #endif
 
 class TestGpuFrameData : public QObject {
@@ -16,6 +17,7 @@ private slots:
 #ifdef __APPLE__
     void readToCpuDownloadsAndCounts();
     void readbackMatchesCpuWithinOneLsb();
+    void importVtBufferProducesGpuHandle();
 #endif
 };
 
@@ -83,6 +85,25 @@ void TestGpuFrameData::readbackMatchesCpuWithinOneLsb() {
         QVERIFY(qAbs(static_cast<int>(static_cast<uchar>(b))) <= 1);
     for (char b : got.plane[2])
         QVERIFY(qAbs(static_cast<int>(static_cast<uchar>(b))) <= 1);
+}
+
+void TestGpuFrameData::importVtBufferProducesGpuHandle() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no RHI backend");
+
+    auto surface = makeAppleNv12Surface(64, 48);
+    QVERIFY(surface != nullptr);
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 48;
+    meta.key.ptsMs = 40;
+
+    FrameHandle handle = importVtSurface(surface, meta, rhi);
+    QVERIFY(handle.isGpuBacked());
+    QCOMPARE(handle.metadata().key.format, FramePixelFormat::Nv12);
+    QCOMPARE(handle.metadata().key.width, 64);
+    QCOMPARE(handle.metadata().key.height, 48);
 }
 #endif
 

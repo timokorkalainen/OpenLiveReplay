@@ -24,7 +24,9 @@ struct AnnexBNal {
 
 struct DecodeFrameContext {
     NativeVideoDecoder::FrameCallback* callback = nullptr;
+    NativeVideoDecoder::KeepSurfaceCallback* surfaceCallback = nullptr;
     qint64 pts90k = -1;
+    bool keepSurface = false;
     bool emittedFrame = false;
     bool copyFailed = false;
     bool ioSurfaceBacked = false;
@@ -206,12 +208,25 @@ static void decompressionOutputCallback(void*,
         context->callbackStatus = status;
         return;
     }
-    if (!imageBuffer || !context->callback) {
+    if (!imageBuffer) {
         return;
     }
 
     context->ioSurfaceBacked =
         CVPixelBufferGetIOSurface(CVPixelBufferRef(imageBuffer)) != nullptr;
+
+    if (context->keepSurface) {
+        if (!context->surfaceCallback) {
+            return;
+        }
+        context->emittedFrame = true;
+        (*context->surfaceCallback)(imageBuffer, context->pts90k);
+        return;
+    }
+
+    if (!context->callback) {
+        return;
+    }
 
     AVFrame* frame = copyPixelBufferToAvFrame(CVPixelBufferRef(imageBuffer));
     if (!frame) {
@@ -235,6 +250,9 @@ public:
     ~Impl() { reset(); }
 
     bool decode(const CompressedAccessUnit& unit, FrameCallback onFrame, QString* error);
+    bool decodeKeepSurface(const CompressedAccessUnit& unit,
+                           KeepSurfaceCallback onSurface,
+                           QString* error);
     void reset();
     bool lastDecodedWasIOSurfaceBacked() const { return lastIOSurfaceBacked; }
 
@@ -472,6 +490,85 @@ bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
     return true;
 }
 
+bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& unit,
+                                                  KeepSurfaceCallback onSurface,
+                                                  QString* error) {
+    if (!onSurface) {
+        if (error) *error = QStringLiteral("VideoToolbox keep-surface decode requires a callback");
+        return false;
+    }
+    if (!ensureSession(unit, error)) {
+        return false;
+    }
+
+    QByteArray sampleData = annexBToLengthPrefixed(unit.annexB);
+    if (sampleData.isEmpty()) {
+        if (error) *error = QStringLiteral("VideoToolbox decode received an empty access unit");
+        return false;
+    }
+
+    CMBlockBufferRef blockBuffer = nullptr;
+    OSStatus status = CMBlockBufferCreateWithMemoryBlock(
+        kCFAllocatorDefault,
+        sampleData.data(),
+        sampleData.size(),
+        kCFAllocatorNull,
+        nullptr,
+        0,
+        sampleData.size(),
+        0,
+        &blockBuffer);
+    if (status != noErr || !blockBuffer) {
+        if (error) *error = statusMessage(QStringLiteral("VideoToolbox block buffer creation failed"), status);
+        return false;
+    }
+
+    const size_t sampleSize = size_t(sampleData.size());
+    const CMTime pts = unit.pts90k >= 0 ? CMTimeMake(unit.pts90k, 90000) : kCMTimeInvalid;
+    const CMTime dts = unit.dts90k >= 0 ? CMTimeMake(unit.dts90k, 90000) : kCMTimeInvalid;
+    CMSampleTimingInfo timing;
+    timing.duration = kCMTimeInvalid;
+    timing.presentationTimeStamp = pts;
+    timing.decodeTimeStamp = dts;
+
+    CMSampleBufferRef sampleBuffer = nullptr;
+    status = CMSampleBufferCreateReady(
+        kCFAllocatorDefault,
+        blockBuffer,
+        format,
+        1,
+        1,
+        &timing,
+        1,
+        &sampleSize,
+        &sampleBuffer);
+    CFRelease(blockBuffer);
+    if (status != noErr || !sampleBuffer) {
+        if (error) *error = statusMessage(QStringLiteral("VideoToolbox sample buffer creation failed"), status);
+        return false;
+    }
+
+    DecodeFrameContext context;
+    context.keepSurface = true;
+    context.surfaceCallback = &onSurface;
+    context.pts90k = unit.pts90k;
+    VTDecodeInfoFlags infoFlags = 0;
+    status = VTDecompressionSessionDecodeFrame(session, sampleBuffer, 0, &context, &infoFlags);
+    CFRelease(sampleBuffer);
+    if (status != noErr) {
+        if (error) *error = statusMessage(QStringLiteral("VideoToolbox frame decode failed"), status);
+        return false;
+    }
+
+    VTDecompressionSessionWaitForAsynchronousFrames(session);
+    lastIOSurfaceBacked = context.ioSurfaceBacked;
+    if (context.callbackStatus != noErr) {
+        if (error) *error = statusMessage(QStringLiteral("VideoToolbox output callback failed"), context.callbackStatus);
+        return false;
+    }
+    return true;
+}
+
 NativeVideoDecoder::NativeVideoDecoder(int outputWidth, int outputHeight)
     : m_impl(new Impl(outputWidth, outputHeight)) {}
 
@@ -483,6 +580,12 @@ bool NativeVideoDecoder::decode(const CompressedAccessUnit& unit,
                                  FrameCallback onFrame,
                                  QString* error) {
     return m_impl->decode(unit, std::move(onFrame), error);
+}
+
+bool NativeVideoDecoder::decodeKeepSurface(const CompressedAccessUnit& unit,
+                                           KeepSurfaceCallback onSurface,
+                                           QString* error) {
+    return m_impl->decodeKeepSurface(unit, std::move(onSurface), error);
 }
 
 void NativeVideoDecoder::reset() {

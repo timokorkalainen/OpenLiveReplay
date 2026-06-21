@@ -273,7 +273,8 @@ if(OLR_GPU_PIPELINE)
     if(APPLE)
         target_sources(olr_test_gpu PRIVATE
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
-            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm")
+            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm")
         target_link_libraries(olr_test_gpu
             PUBLIC "-framework Metal" "-framework QuartzCore" "-framework CoreVideo"
                    "-framework CoreFoundation" "-framework IOSurface")
