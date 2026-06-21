@@ -12,9 +12,14 @@
 //
 // At the end the worker's counters() are printed as one parseable line:
 //   COUNTERS reposition=.. reuseSeek=.. reverseChunkSeek=.. eofTailSeek=..
-//            skipForward=.. audioPushes=.. framesDropped=..
-//            gpuReadbacks=.. redundantGpuReadbacks=.. readbackQueueDepth=..
-//            readbackDrops=.. fenceWaitStalls=.. gpuOomDegrades=.. gpuVramBytes=..
+//            skipForward=.. audioPushes=.. framesDropped=.. (... existing tokens ...)
+// The GPU-pipeline telemetry contract appends:
+//   gpuReadbacks=.. redundantGpuReadbacks=.. readbackQueueDepth=.. readbackDrops=..
+//   fenceWaitStalls=.. gpuOomDegrades=.. gpuVramBytes=..
+// On the Phase-1 CPU path all seven read 0 (no GPU-backed readToCpu, no GPU
+// resources); run_playback_e2e.sh gates them at 0. redundantGpuReadbacks is the
+// copy-on-GPU-path detector: > 0 means a rendered bus surface was read back to CPU
+// more than once. Phase-2 GPU subprojects populate the rest via the same path.
 // Per-second SEC telemetry is emitted by the instrumented worker to stderr when
 // OLR_PB_TELEMETRY is set in the environment (passed through transparently).
 //
