@@ -179,11 +179,25 @@ bool isHevcParameterSet(int type) {
     return type == 32 || type == 33 || type == 34;
 }
 
+// A real SPS/PPS/VPS is tiny (tens to a few hundred bytes). Cap both the per-NAL
+// size and the count of tracked parameter sets: m_parameterSets is copied into
+// every emitted access unit and is reset only per connection, so a hostile
+// stream that floods slightly-varied parameter-set NALs (dedup by exact equality
+// is trivially evaded) would otherwise grow it without bound — a memory + O(n)-
+// copy DoS. Evict the oldest on overflow so legitimate mid-stream parameter-set
+// updates still take effect, and ignore implausibly large parameter-set NALs.
+constexpr int kMaxParameterSetsPerList = 16;
+constexpr int kMaxParameterSetBytes = 8 * 1024;
+
 template <typename T>
 void appendUnique(QList<T>* values, const T& value) {
-    if (values && !values->contains(value)) {
-        values->append(value);
+    if (!values || value.size() > kMaxParameterSetBytes || values->contains(value)) {
+        return;
     }
+    if (values->size() >= kMaxParameterSetsPerList) {
+        values->removeFirst(); // bounded recent window; oldest evicted
+    }
+    values->append(value);
 }
 
 } // namespace
