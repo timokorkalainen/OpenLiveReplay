@@ -51,7 +51,16 @@ public:
     void requestStop() override;
     IngestFailureKind lastFailureKind() const override { return m_lastFailureKind; }
 
+    // Test seam: shorten the stall window so a unit test can exercise the
+    // session-internal stall break without waiting the full production timeout.
+    void setStallTimeoutMsForTest(int ms) { m_stallTimeoutMs = ms; }
+
 private:
+    // Session-internal stall window: if no video/audio frame arrives for this
+    // long, run() breaks so captureLoop reconnects — mirrors the SRT/RTMP
+    // sessions (their own file-local kStallTimeoutMs and StreamWorker's
+    // m_stallTimeoutMs are the same 8000 value; these could converge later).
+    static constexpr int kStallTimeoutMs = 8000;
     int m_outputWidth = 1920;
     int m_outputHeight = 1080;
     std::atomic<bool>* m_captureRunning = nullptr;
@@ -63,6 +72,11 @@ private:
     AnchoredSourceClock* m_clock = &m_ownedClock;
     bool m_externalClock = false;
     QElapsedTimer m_monotonic;
+    // Set-before-run (production default, or setStallTimeoutMsForTest before open());
+    // read only on the capture thread in run(). Not synchronized — do not mutate
+    // once run() has started.
+    int m_stallTimeoutMs = kStallTimeoutMs;
+    int64_t m_lastFrameAtMs = -1; // m_monotonic.elapsed() at the last received frame
     int64_t m_lastStatsAtMs = -1;
     struct SwsContext* m_sws = nullptr;
     IngestFailureKind m_lastFailureKind = IngestFailureKind::None;

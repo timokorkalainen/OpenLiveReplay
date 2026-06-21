@@ -2,7 +2,10 @@
 
 #include "recorder_engine/ingest/nativendiingestsession.h"
 
+#include <atomic>
+#include <chrono>
 #include <limits>
+#include <thread>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -22,8 +25,24 @@ public:
         opened = available && !sourceName.isEmpty();
         return opened;
     }
-    void closeReceiver() override { opened = false; }
+    void closeReceiver() override {
+        // Detect the original UAF: a close that overlaps an in-flight capture().
+        if (inCapture.load(std::memory_order_relaxed)) {
+            closedDuringCapture.store(true, std::memory_order_relaxed);
+        }
+        opened = false;
+        closeThread = std::this_thread::get_id();
+        closeCount.fetch_add(1, std::memory_order_relaxed);
+    }
     Capture capture(NdiVideoFrame* video, NdiAudioFrame* audio, int) override {
+        captureThread = std::this_thread::get_id();
+        if (blockingCapture) {
+            // Hold an "in capture" window so a concurrent close (the old UAF) is
+            // observable and TSan can witness the race on the receiver handle.
+            inCapture.store(true, std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            inCapture.store(false, std::memory_order_relaxed);
+        }
         if (items.isEmpty()) {
             return Capture::None;
         }
@@ -41,6 +60,12 @@ public:
     QList<Item> items;
     int freedVideo = 0;
     int freedAudio = 0;
+    bool blockingCapture = false; // set-before-run: make capture() hold a window
+    std::atomic<int> closeCount{0};
+    std::atomic<bool> inCapture{false};
+    std::atomic<bool> closedDuringCapture{false};
+    std::thread::id closeThread;   // written by closeReceiver(); read after join()
+    std::thread::id captureThread; // written by capture(); read after join()
 };
 
 class TestNdiIngest : public QObject {
@@ -54,6 +79,8 @@ private slots:
     void macRuntimeCandidatesIncludeOfficialSdkPath();
     void exactSourceMatchWinsBeforeSubstringFallback();
     void undefinedTimestampFallsBackToArrivalWithoutLockingClock();
+    void stallTimerBreaksOnSilence();
+    void requestStopIsFlagOnlyAndClosesOnRunThread();
 };
 
 void TestNdiIngest::supportsNdiUrls() {
@@ -224,6 +251,72 @@ void TestNdiIngest::undefinedTimestampFallsBackToArrivalWithoutLockingClock() {
     // zero offset (the additive fields default safely).
     QVERIFY(!statsReports.last().clockLocked);
     QCOMPARE(statsReports.last().clockOffsetNs, int64_t(0));
+}
+
+void TestNdiIngest::stallTimerBreaksOnSilence() {
+    // A source that connects but never delivers a frame (capture()==None forever)
+    // must trip the session-internal stall timer: run() returns and classifies the
+    // failure as TransientNetwork so captureLoop reconnects. A short test-only
+    // timeout keeps this from waiting the production 8s window.
+    FakeNdiReceiverBackend backend; // no items -> Capture::None forever
+    std::atomic<bool> running{true};
+    NativeNdiIngestSession session(0, 4, 4, &running, &backend);
+    session.setStallTimeoutMsForTest(20);
+
+    QStringList logs;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = []() { return int64_t(0); };
+    callbacks.logInfo = [&logs](const QString& msg) { logs.append(msg); };
+
+    QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+    QElapsedTimer t;
+    t.start();
+    session.run(); // must return on its own (stall), not hang
+    QVERIFY(t.elapsed() < 5000);
+    QCOMPARE(session.lastFailureKind(), IngestFailureKind::TransientNetwork);
+    QVERIFY(logs.contains(QStringLiteral("Native NDI stalled. Restarting...")));
+}
+
+void TestNdiIngest::requestStopIsFlagOnlyAndClosesOnRunThread() {
+    // The shutdown UAF fix: requestStop() must NOT destroy the receiver (it runs on
+    // the stopping thread while the capture thread is inside capture()). The receiver
+    // is destroyed only by run() on the capture thread, after it observes the flag.
+    FakeNdiReceiverBackend backend; // Capture::None forever -> run() loops until stop
+    backend.blockingCapture = true; // each capture() holds a ~5ms window
+    std::atomic<bool> running{true};
+    NativeNdiIngestSession session(0, 4, 4, &running, &backend);
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = []() { return int64_t(0); };
+    QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+
+    std::thread::id runThread;
+    std::thread runner([&]() {
+        runThread = std::this_thread::get_id();
+        session.run();
+    });
+
+    // Let run() loop on the capture thread for a while (default 8s stall window
+    // keeps it running). It must not have closed the receiver while looping.
+    QTest::qWait(40);
+    QCOMPARE(backend.closeCount.load(std::memory_order_relaxed), 0);
+
+    // Hammer requestStop() from THIS (main) thread repeatedly across capture
+    // windows. On the OLD code each call destroyed the receiver from the main
+    // thread, mid-capture() — setting closedDuringCapture, closing from the wrong
+    // thread, and racing the handle (TSan-visible). On the fixed code requestStop()
+    // only flips a flag; run() closes exactly once, on its own thread, after the
+    // loop. (We do NOT assert closeCount here: run() closes asynchronously the
+    // moment it observes the flag, which can race this loop — that's correct.)
+    for (int i = 0; i < 20; ++i) {
+        session.requestStop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    runner.join(); // run() has observed the flag, exited, and closed on its thread
+
+    QCOMPARE(backend.closeCount.load(std::memory_order_relaxed), 1); // exactly once
+    QVERIFY(backend.closeThread == runThread);                       // closed on the capture thread
+    QVERIFY(backend.closeThread != std::this_thread::get_id());      // NOT the stopping thread
+    QVERIFY(!backend.closedDuringCapture.load(std::memory_order_relaxed)); // never raced capture()
 }
 
 QTEST_GUILESS_MAIN(TestNdiIngest)
