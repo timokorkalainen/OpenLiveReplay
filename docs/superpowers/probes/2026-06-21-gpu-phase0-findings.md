@@ -58,3 +58,23 @@ default and reference throughout.
   becomes a production cadence path.
 - **D11 note:** the probe creates and runs the QRhi loop off the GUI thread; the
   dedicated render-thread model held for the measured path.
+
+## P0.4 — Sink GPU-texture vs CPU-frame capability (gates D10 routing + new-io-targets)
+
+- **Question (§11 Q4):** which sinks accept GPU textures vs require CPU frames?
+- **Method:** inspect implemented sinks (NDI/Qt preview) in-tree; classify
+  enumerated DeckLink/AJA/OMT targets from SDK interchange types.
+
+| sink | interchange today | classification (D10) | source |
+|------|-------------------|----------------------|--------|
+| Qt preview | `QVideoFrame` mapped and filled with CPU plane copies | `AsyncReadbackDedupOk` | `playback/output/qtpreviewsink.cpp:20-41` |
+| NDI | `NDIlib_video_frame_v2_t` with CPU `p_data` (`I420`) | `NeedsContinuousCadence` (`maxGap<=2`) | `playback/output/ndisink.cpp:88-112` |
+| DeckLink | `IDeckLinkVideoFrame` CPU bytes; GPUDirect on some SDK/SKU paths | `GpuNative` where SDK allows, else `NeedsContinuousCadence` | SDK survey |
+| AJA NTV2 | AutoCirculate host buffers | async readback (CPU-frame) | SDK survey |
+| OMT | software SDK CPU frame | async readback (CPU-frame) | SDK survey |
+
+- **Decision:** GO. `async-readback` routes NDI/preview through the CPU
+  readback edge (D7); `new-io-targets` treats AJA/OMT as CPU-frame
+  async-readback and DeckLink as GPU-native only where the SDK exposes it. No
+  sink blocks the program: forced readback is "needs-readback", not a blocker
+  (spec §10).
