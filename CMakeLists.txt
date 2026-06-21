@@ -32,6 +32,33 @@ if(MSVC)
     endif()
 else()
     target_compile_options(olr_warnings INTERFACE -Wall -Wextra -Wshadow -Wnon-virtual-dtor)
+
+    # Cross-compiler high-value diagnostics (GCC and Clang both honour these):
+    #   -Wformat=2             stricter printf/scanf format checking (incl.
+    #                          -Wformat-security/-Wformat-nonliteral).
+    #   -Wimplicit-fallthrough catches missing break/[[fallthrough]] in switches.
+    target_compile_options(olr_warnings INTERFACE -Wformat=2 -Wimplicit-fallthrough)
+
+    # GCC-only high-value diagnostics. These flags either do not exist on
+    # Clang/AppleClang or behave very differently, so gate them to the GNU
+    # frontend via a per-language generator expression — the macOS (Clang) and
+    # iOS (AppleClang) legs never see them.
+    #   -Wdangling-reference   (GCC 13+) reference bound to a destroyed temporary.
+    #   -Wmaybe-uninitialized  possibly-uninitialized read.
+    #   -Wnull-dereference     path-sensitive NULL dereference.
+    #   -Wduplicated-cond      duplicated condition in an if/else-if chain.
+    #   -Wduplicated-branches  identical bodies on both arms of a branch.
+    #   -Wlogical-op           suspicious use of && / || (e.g. always-true).
+    # -Wdangling-reference is silently ignored by GCC < 13, so passing it
+    # unconditionally to the GNU frontend is safe.
+    target_compile_options(olr_warnings INTERFACE
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wdangling-reference>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wmaybe-uninitialized>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wnull-dereference>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wduplicated-cond>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wduplicated-branches>
+        $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wlogical-op>)
+
     if(OLR_WERROR)
         target_compile_options(olr_warnings INTERFACE -Werror)
     endif()
