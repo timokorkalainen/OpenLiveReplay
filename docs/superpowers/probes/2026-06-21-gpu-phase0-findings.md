@@ -50,9 +50,11 @@ default and reference throughout.
 - **Result (macOS host):** off-Windows guard PASS. `cmake --build build/c
   --target rhi_d3d_probe` reports `ninja: error: unknown target
   'rhi_d3d_probe'`, so the probe is not linked into non-Windows builds.
-- **Result (Windows runner):** captured by the Windows CI/manual runner via
-  `cmake --build build/c --target rhi_d3d_probe` and
-  `./build/c/tests/probes/rhi_d3d_probe`.
+- **Result (Windows runner):** `build-test-windows` now configures with
+  `OLR_BUILD_GPU_PROBES=ON`, compiles `rhi_d3d_probe`, and runs it as a
+  non-blocking diagnostic because hosted Windows runners may not expose a
+  usable D3D device. The diagnostic log captures the four backend/wrap lines on
+  any runner with D3D available.
 - **Decision (D4):** CI-gated until the Windows run records the chosen backend.
   If D3D11 is chosen, `gpu-sync` uses ID3D11Fence (11.4) /
   keyed-mutex / ID3D11Query rather than assuming D3D12 fences. If D3D12 is
@@ -135,3 +137,24 @@ default and reference throughout.
   tagged fixture is a deliberate future event, not an accidental regression.
 - **Decision:** GO. Color-metadata Phase 1 can land as a proven no-op for current
   fixtures; the audit confirms no fixture currently forces an appearance change.
+
+## Phase-0 sign-off matrix
+
+| probe | measured result | gates | decision |
+|------|-----------------|-------|----------|
+| P0.1 | VT decode yields IOSurface-backed `CVPixelBuffer` | macOS import edge | GO |
+| P0.1b | VT reconfig median 5.871 ms (<16.7 ms frame) | feed-flip stall budget | GO |
+| P0.2 | Windows `rhi_d3d_probe` compiles in CI and runs as a diagnostic; off-Windows target absent | D4 fence primitive | CI-GATED |
+| P0.3 | import→composite→synchronous-readback median 1.7763 ms (>0.5 ms) | D1/D11 | CONDITIONAL / NO-GO for synchronous hot-path readback |
+| P0.4 | sinks classified as GPU-native vs CPU-readback cadence paths | D10 routing | GO |
+| P0.5 | IOSurface→Metal→QRhiTexture wraps without CPU detour | macOS zero-copy edge | GO |
+| P0.6 | fixtures are untagged except video range; default policy matches current heuristic | color-metadata no-op | GO |
+
+## Default-lane verification
+
+- `cmake -S . -B build/unit -G Ninja -DCMAKE_BUILD_TYPE=Debug
+  -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON`: PASS
+  (`OLR_BUILD_GPU_PROBES` left at default `OFF`).
+- `cmake --build build/unit`: PASS (`651/651` targets).
+- `ctest --test-dir build/unit -L unit --output-on-failure`: PASS (`76/76`
+  tests, `100% tests passed`, real time 32.75 sec).

@@ -10,14 +10,19 @@
 #include <cstdio>
 #include <cstdint>
 #include <memory>
-#include <wrl/client.h>
-
-using Microsoft::WRL::ComPtr;
 
 namespace {
 
 constexpr int kWidth = 1920;
 constexpr int kHeight = 1080;
+
+struct ComReleaser {
+    void operator()(ID3D11Texture2D* texture) const {
+        if (texture) texture->Release();
+    }
+};
+
+using D3D11TexturePtr = std::unique_ptr<ID3D11Texture2D, ComReleaser>;
 
 std::unique_ptr<QRhi> createD3D11Rhi() {
     QRhiD3D11InitParams params;
@@ -59,18 +64,19 @@ bool wrapD3D11Texture() {
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-    ComPtr<ID3D11Texture2D> texture;
-    const HRESULT created = device->CreateTexture2D(&desc, nullptr, &texture);
+    ID3D11Texture2D* rawTexture = nullptr;
+    const HRESULT created = device->CreateTexture2D(&desc, nullptr, &rawTexture);
     if (FAILED(created)) {
         std::fprintf(stderr, "CreateTexture2D failed: 0x%08lx\n",
                      static_cast<unsigned long>(created));
         return false;
     }
+    D3D11TexturePtr texture(rawTexture);
 
     std::unique_ptr<QRhiTexture> imported(
         rhi->newTexture(QRhiTexture::RGBA8, QSize(kWidth, kHeight)));
     QRhiTexture::NativeTexture native{
-        quint64(reinterpret_cast<uintptr_t>(texture.Get())),
+        quint64(reinterpret_cast<uintptr_t>(texture.get())),
         0,
     };
     const bool wrapped = imported->createFrom(native);
