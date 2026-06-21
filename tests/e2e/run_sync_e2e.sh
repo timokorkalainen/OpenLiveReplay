@@ -279,16 +279,34 @@ case "$SCENARIO" in
     read -r NP MEAN MAX <<<"$STATS"
     emit "[sync] scenario=lipsync pairs=${NP} av_offset_ms: mean=${MEAN} max=${MAX} (EBU_R37_band=+40/-60)"
     if [ "${OLR_AV_SYNC_GATE:-0}" = "1" ]; then
-        # Gate: EBU R37 — audio may lead the picture by <=40ms and lag by <=60ms.
-        # offset = mean(audio_pts - video_pts); positive => audio lags.
+        # Two gates over the same matched flash/beep pairs:
+        #   1) MEAN gate (EBU R37): mean(audio_pts - video_pts) within -40..+60 ms.
+        #      A positive offset means audio lags the picture. This catches a
+        #      steady-state anchoring regression.
+        #   2) MAX (worst-case) gate: the largest single-pair |audio - video|
+        #      must stay <= OLR_AV_SYNC_MAX_MS (default 100). The mean can pass
+        #      while one frame is badly out of sync (a dropped/duplicated audio
+        #      span, a single mis-anchored picture); the mean averages that
+        #      excursion away, so a per-pair worst-case bound is required to make
+        #      a single out-of-bounds frame FAIL. 100 ms is ~3 frames @30 — wider
+        #      than the mean band (so it is not redundant) yet tight enough to bite
+        #      a genuine excursion, with headroom over the ~1-frame onset-detection
+        #      quantization on each of the audio and video edges (~66 ms combined
+        #      worst-case measurement noise).
+        MAX_BOUND="${OLR_AV_SYNC_MAX_MS:-100}"
         if [ "${NP:-0}" -lt 3 ]; then
             echo "FAIL: only ${NP:-0} flash/beep pairs — measurement unreliable"; exit 1
         fi
-        if awk -v m="$MEAN" 'BEGIN{exit !(m >= -40 && m <= 60)}'; then
-            echo "PASS: A/V offset ${MEAN}ms within EBU R37 (-40..+60)"; exit 0
+        if ! awk -v m="$MEAN" 'BEGIN{exit !(m >= -40 && m <= 60)}'; then
+            echo "FAIL: A/V mean offset ${MEAN}ms outside EBU R37 (-40..+60) — shared anchor regressed"
+            exit 1
         fi
-        echo "FAIL: A/V offset ${MEAN}ms outside EBU R37 (-40..+60) — shared anchor regressed"
-        exit 1
+        if ! awk -v x="$MAX" -v b="$MAX_BOUND" 'BEGIN{exit !(x <= b)}'; then
+            echo "FAIL: A/V worst-case offset ${MAX}ms exceeds MAX bound ${MAX_BOUND}ms — single-frame A/V excursion"
+            exit 1
+        fi
+        echo "PASS: A/V mean ${MEAN}ms within EBU R37 (-40..+60) and max ${MAX}ms within ${MAX_BOUND}ms"
+        exit 0
     fi
     echo "PASS: report emitted (diagnostic, non-gating)"
     exit 0
