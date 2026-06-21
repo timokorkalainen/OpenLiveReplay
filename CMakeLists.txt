@@ -193,6 +193,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/outputtypes.h
         playback/output/outputframeclock.h playback/output/outputframeclock.cpp
         playback/output/framepixelformat.h playback/output/colormetadata.h
+        playback/output/colormetadatapolicy.h playback/output/colormetadatapolicy.cpp
         playback/output/framehandle.h playback/output/framehandle.cpp
         playback/output/mediaframe.h
         playback/output/outputframecache.h playback/output/outputframecache.cpp
