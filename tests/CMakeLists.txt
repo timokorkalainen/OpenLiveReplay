@@ -263,7 +263,8 @@ endif()
 if(OLR_GPU_PIPELINE)
     qt_add_library(olr_test_gpu STATIC
         "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp")
     target_include_directories(olr_test_gpu PUBLIC "${CMAKE_SOURCE_DIR}")
     target_link_libraries(olr_test_gpu
         PUBLIC Qt6::Core Qt6::Gui Qt6::GuiPrivate
