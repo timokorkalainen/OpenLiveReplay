@@ -5,6 +5,7 @@
 #include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/broadcastoutputstatus.h"
 #include "project/projectimportclient.h"
+#include "recorder_engine/timing/timecode.h"
 #include "telemetry/telemetryclient.h"
 #include <QDateTime>
 #include <QJsonArray>
@@ -2676,20 +2677,6 @@ static QString formatTimecodeForFile(int64_t ms, int fps) {
         .arg(frames, 2, 10, QChar('0'));
 }
 
-static QString formatTimecodeForDisplay(int64_t ms, int fps) {
-    if (ms < 0) ms = 0;
-    const int totalSeconds = static_cast<int>(ms / 1000);
-    const int hours = totalSeconds / 3600;
-    const int minutes = (totalSeconds % 3600) / 60;
-    const int seconds = totalSeconds % 60;
-    const int frames = static_cast<int>((ms % 1000) / (1000.0 / qMax(1, fps)));
-    return QString("%1:%2:%3:%4")
-        .arg(hours, 2, 10, QChar('0'))
-        .arg(minutes, 2, 10, QChar('0'))
-        .arg(seconds, 2, 10, QChar('0'))
-        .arg(frames, 2, 10, QChar('0'));
-}
-
 void UIManager::updateXTouchDisplay() {
     if (!m_midiManager || !m_midiManager->isXTouchConnected()) return;
 
@@ -2711,15 +2698,20 @@ void UIManager::updateXTouchDisplay() {
         minutes = dt.time().minute();
         seconds = dt.time().second();
         displayText = dt.toString("HH:mm:ss");
+        // Frame field: the playhead's sub-second frame (integer-fps, as before).
+        frames = static_cast<int>(static_cast<double>(playheadMs % 1000) / (1000.0 / qMax(1, fps)));
     } else {
-        const int totalSeconds = static_cast<int>(playheadMs / 1000);
-        hours = totalSeconds / 3600;
-        minutes = (totalSeconds % 3600) / 60;
-        seconds = totalSeconds % 60;
-        displayText = formatTimecodeForDisplay(playheadMs, fps);
+        // SMPTE timecode (drop-frame for 29.97/59.94). Parse the fixed-width
+        // "HH:MM:SS<sep>FF" fields for the 7-segment digits so the segments match
+        // the displayed string, including drop-frame frame/second renumbering.
+        displayText = recordTimecode(playheadMs);
+        if (displayText.size() >= 11) {
+            hours = displayText.mid(0, 2).toInt();
+            minutes = displayText.mid(3, 2).toInt();
+            seconds = displayText.mid(6, 2).toInt();
+            frames = displayText.mid(9, 2).toInt();
+        }
     }
-
-    frames = static_cast<int>((playheadMs % 1000) / (1000.0 / qMax(1, fps)));
 
     if (!m_xTouchLastSend.isValid()) {
         m_xTouchLastSend.start();
@@ -2851,24 +2843,23 @@ void UIManager::pushStreamDeckMaps() {
                                       m_streamDeckStore.dialPressMap(model));
 }
 
+QString UIManager::recordTimecode(qint64 ms) const {
+    const int num =
+        m_currentSettings.fpsNum > 0 ? m_currentSettings.fpsNum : qMax(1, m_currentSettings.fps);
+    const int den = m_currentSettings.fpsDen > 0 ? m_currentSettings.fpsDen : 1;
+    return QString::fromStdString(olr::Timecode::timecodeFromMs(ms, olr::TimecodeRate{num, den}));
+}
+
 QString UIManager::playbackTimecode() {
-    // MUST stay identical to the QML playback timecode (Main.qml): the deck and
-    // the on-screen label render this one string. Source = scrubPosition.
+    // Single source of truth for the on-screen label AND the deck: both render
+    // this one string (QML binds to it / calls recordTimecode). Source = scrubPosition.
     const qint64 pos = scrubPosition();
     if (m_currentSettings.showTimeOfDay && recordingStartEpochMs() > 0) {
         // Wall-clock time at the playhead (not a live clock — moves with pos).
         return QDateTime::fromMSecsSinceEpoch(recordingStartEpochMs() + pos)
             .toString(QStringLiteral("HH:mm:ss"));
     }
-    const qint64 ms = pos < 0 ? 0 : pos;
-    const int fps = m_currentSettings.fps > 0 ? m_currentSettings.fps : 30;
-    const qint64 totalSeconds = ms / 1000;
-    const int frames = int(double(ms % 1000) / (1000.0 / double(fps)));
-    return QStringLiteral("%1:%2:%3.%4")
-        .arg(totalSeconds / 3600, 2, 10, QLatin1Char('0'))
-        .arg((totalSeconds / 60) % 60, 2, 10, QLatin1Char('0'))
-        .arg(totalSeconds % 60, 2, 10, QLatin1Char('0'))
-        .arg(frames, 2, 10, QLatin1Char('0'));
+    return recordTimecode(pos); // SMPTE; ;FF drop-frame for 29.97/59.94, :FF otherwise
 }
 
 void UIManager::pushDeckTimecode() {

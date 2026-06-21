@@ -1,6 +1,7 @@
 #include "timecode.h"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 
@@ -78,6 +79,18 @@ std::string framesToTimecode(int64_t frame, const TimecodeRate& rate, bool dropF
     std::array<char, 16> buf{};
     std::snprintf(buf.data(), buf.size(), "%02d:%02d:%02d%c%02d", hh, mm, ss, frameSep, ff);
     return std::string(buf.data());
+}
+
+std::string timecodeFromMs(int64_t ms, const TimecodeRate& rate) {
+    if (ms < 0) {
+        ms = 0;
+    }
+    const int num = rate.num > 0 ? rate.num : 30;
+    const int den = rate.den > 0 ? rate.den : 1;
+    // Absolute frame index = round(ms * num / (1000 * den)).
+    const int64_t frame =
+        static_cast<int64_t>(std::llround(static_cast<double>(ms) * num / (1000.0 * den)));
+    return framesToTimecode(frame, rate, isDropFrameRate(rate));
 }
 
 int64_t timecodeToFrames(const std::string& tc, const TimecodeRate& rate, bool dropFrame) {

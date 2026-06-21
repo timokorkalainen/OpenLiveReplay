@@ -672,19 +672,11 @@ ApplicationWindow {
                 property int clockTick: 0
                 property bool holdWasPlaying: false
 
+                // Delegate to the C++ single source of truth so the duration
+                // timecode matches the playhead label exactly, including SMPTE
+                // drop-frame for 29.97/59.94 (UIManager::recordTimecode).
                 function formatTimecode(ms) {
-                    var totalSeconds = Math.floor(ms / 1000)
-                    var hours = Math.floor(totalSeconds / 3600)
-                    var minutes = Math.floor((totalSeconds % 3600) / 60)
-                    var seconds = totalSeconds % 60
-                    var fps = Math.max(1, appWindow.uiManagerRef.recordFps)
-                    var frames = Math.floor((ms % 1000) / (1000 / fps))
-
-                    var hh = hours < 10 ? "0" + hours : "" + hours
-                    var mm = minutes < 10 ? "0" + minutes : "" + minutes
-                    var ss = seconds < 10 ? "0" + seconds : "" + seconds
-                    var ff = frames < 10 ? "0" + frames : "" + frames
-                    return hh + ":" + mm + ":" + ss + "." + ff
+                    return appWindow.uiManagerRef.recordTimecode(ms)
                 }
 
                 function formatTimeOfDay(epochMs) {

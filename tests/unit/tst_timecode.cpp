@@ -48,6 +48,11 @@ private slots:
     void parseAcceptsBothSeparators();
     void parseRejectsMalformedInput();
     void parseOversizedFieldDoesNotOverflow();
+
+    // --- ms -> timecode convenience (UI layer reuse) ----------------------
+    void timecodeFromMs_ndfRatesUseColonAndSequentialFrames();
+    void timecodeFromMs_dropFrameRatesAutoSelectSemicolon();
+    void timecodeFromMs_clampsNegativeAndDefaultsRate();
 };
 
 void TestTimecode::ndf30_basicVectors() {
@@ -191,6 +196,31 @@ void TestTimecode::parseOversizedFieldDoesNotOverflow() {
     // A well-formed but out-of-range frame field is accepted (lenient parser),
     // not UB and not a structural reject.
     QCOMPARE(Timecode::timecodeToFrames("00:00:00:40", kRate30, false), int64_t(40));
+}
+
+void TestTimecode::timecodeFromMs_ndfRatesUseColonAndSequentialFrames() {
+    // 30fps: 1500ms = frame 45 = 1s + 15 frames, NDF colon separator.
+    QCOMPARE(Timecode::timecodeFromMs(0, kRate30), std::string("00:00:00:00"));
+    QCOMPARE(Timecode::timecodeFromMs(1500, kRate30), std::string("00:00:01:15"));
+    QCOMPARE(Timecode::timecodeFromMs(3600000, kRate30), std::string("01:00:00:00"));
+    // 25fps: 1000ms = 25 frames = exactly 1s.
+    QCOMPARE(Timecode::timecodeFromMs(1000, kRate25), std::string("00:00:01:00"));
+}
+
+void TestTimecode::timecodeFromMs_dropFrameRatesAutoSelectSemicolon() {
+    // 29.97 auto-selects drop-frame (semicolon) without an explicit flag.
+    QCOMPARE(Timecode::timecodeFromMs(0, kRate2997), std::string("00:00:00;00"));
+    // 1 hour: round(3600000 * 30000 / 1001000) = 107892 frames = 01:00:00;00 (the
+    // canonical DF one-hour vector — drop-frame keeps wall-clock-accurate hours).
+    QCOMPARE(Timecode::timecodeFromMs(3600000, kRate2997), std::string("01:00:00;00"));
+    // 59.94 likewise auto-DF.
+    QCOMPARE(Timecode::timecodeFromMs(0, kRate5994), std::string("00:00:00;00"));
+}
+
+void TestTimecode::timecodeFromMs_clampsNegativeAndDefaultsRate() {
+    QCOMPARE(Timecode::timecodeFromMs(-5000, kRate30), std::string("00:00:00:00"));
+    // A degenerate rate falls back to 30/1 NDF rather than dividing by zero.
+    QCOMPARE(Timecode::timecodeFromMs(1000, TimecodeRate{0, 0}), std::string("00:00:01:00"));
 }
 
 QTEST_GUILESS_MAIN(TestTimecode)
