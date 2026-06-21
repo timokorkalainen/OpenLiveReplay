@@ -75,7 +75,25 @@ jobs:
             esac
 
             case "$file" in
-              .github/workflows/*|*.md|docs/*)
+              # The workflow file defines every gate, so a change to it must
+              # re-run them ALL — otherwise the gate's own rulebook could be
+              # edited with the gates it controls skipped, and "CI gate" counts a
+              # skipped required job as a pass (vacuously green).
+              .github/workflows/*)
+                app=true
+                format=true
+                qml=true
+                native=true
+                ;;
+              # Lint/sanitizer/build rulebooks: a change here must re-run the
+              # gates that consult them (clang-tidy/clang-format/qmllint/sanitizer
+              # suppressions/pre-commit), for the same self-referential reason.
+              .clang-tidy|.clang-format|qmllint.ini|qmllint.ini.in|.pre-commit-config.yaml|.githooks/*|tests/lsan.suppressions.txt)
+                app=true
+                format=true
+                native=true
+                ;;
+              *.md|docs/*)
                 ;;
               *.cpp|*.c|*.h|*.hpp|*.mm)
                 app=true
@@ -357,9 +375,18 @@ jobs:
           done
 
   # ---------------------------------------------------------------------------
-  # Sanitizer gates. Both legs are GATING (continue-on-error is false).
-  #   * ASan+UBSan runs the WHOLE unit label under instrumentation.
-  #   * TSan runs the threading-sensitive playback/output cases.
+  # Sanitizer gates. All gating legs have continue-on-error: false.
+  #   * asan-ubsan runs the WHOLE unit label under instrumentation.
+  #   * tsan runs the threading-sensitive playback/output cases.
+  #   * asan-e2e runs the deterministic playback e2e (the real threaded
+  #     PlaybackWorker end-to-end) AND the native SRT ingest smoke under
+  #     ASan+UBSan — the two highest-risk surfaces (untrusted bytes meeting the
+  #     worker's atomics across threads) that the unit/e2e gates otherwise leave
+  #     UNinstrumented (the unit run excludes the native-ingest labels; the
+  #     build-test-macos e2e gate runs with no sanitizer). The playback-e2e part
+  #     is GATING; the native-SRT-smoke part is step-level advisory (it depends on
+  #     loopback srt-live-transmit timing that can flake on shared runners — see
+  #     its step comment).
   # LeakSanitizer is intentionally NOT enabled here: it is unsupported on macOS
   # (Apple platforms) — leak detection runs on the Linux/GCC leg instead.
   # ---------------------------------------------------------------------------
@@ -373,8 +400,8 @@ jobs:
       matrix:
         include:
           # Empty build_targets => build the whole suite and run the full unit
-          # label; a non-empty list builds only those threading targets. The
-          # ctest selector itself is chosen by label in the run step.
+          # label; a non-empty list builds only those threading/harness targets.
+          # The ctest selector itself is chosen by label in the run step.
           - sanitizer: "address;undefined"
             label: asan-ubsan
             advisory: false
@@ -383,6 +410,14 @@ jobs:
             label: tsan
             advisory: false
             build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine"
+          # asan-e2e: only the e2e harness binaries need building — the playback
+          # matrix drives play_harness + record_harness; the native SRT smoke
+          # drives record_harness. Both are linked with olr_sanitize, so this
+          # build is genuinely -fsanitize=address,undefined instrumented.
+          - sanitizer: "address;undefined"
+            label: asan-e2e
+            advisory: false
+            build_targets: "play_harness record_harness"
     continue-on-error: ${{ matrix.advisory }}
     steps:
       - uses: actions/checkout@v4
@@ -449,7 +484,50 @@ jobs:
         if: always()
         run: ccache --show-stats
 
+      # asan-e2e: the GATING part — the deterministic playback e2e subset (the
+      # real threaded PlaybackWorker, record + play, over the native srt://
+      # loopback). These are timing/loopback-sensitive, so until-pass:3 absorbs a
+      # transient loopback flake. IMPORTANT: until-pass does NOT mask a real
+      # ASan/UBSan finding — abort_on_error/halt_on_error make those a hard,
+      # deterministic abort that re-fires on every relaunch, so until-pass cannot
+      # paper over it (it only retries non-deterministic timing flakes).
+      # --no-tests=error fails closed if the regex matches nothing (a relabel
+      # that silently dropped the cases would be caught here).
+      - name: Run playback e2e under ASan+UBSan (gating)
+        if: ${{ matrix.label == 'asan-e2e' }}
+        working-directory: build
+        env:
+          # detect_leaks=0: LeakSanitizer is unsupported on macOS (see Linux leg).
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
+            -R '^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
+
+      # asan-e2e: the ADVISORY part — the native SRT ingest smoke under the SAME
+      # ASan+UBSan instrumentation, so the live-ingest path (untrusted SRT bytes
+      # in the native NativeSrtIngestSession) runs sanitized. continue-on-error
+      # because it stands up srt-live-transmit over UDP->SRT loopback whose
+      # connect/handshake timing can flake on shared CI runners; we do NOT want a
+      # loopback connect flake to red the whole sanitizers job. A real ASan/UBSan
+      # abort here still surfaces in the log (and exits non-zero) for follow-up —
+      # advisory means non-blocking, not invisible. until-pass:3 retries only the
+      # connect-timing flake; an ASan abort is deterministic and re-fires.
+      - name: Run native SRT ingest smoke under ASan+UBSan (advisory)
+        if: ${{ matrix.label == 'asan-e2e' }}
+        continue-on-error: true
+        working-directory: build
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ctest --output-on-failure --repeat until-pass:3 --no-tests=error \
+            -R '^e2e_native_srt_smoke$'
+
       - name: Run sanitizer checks
+        if: ${{ matrix.label != 'asan-e2e' }}
         working-directory: build
         env:
           # detect_leaks=0: LeakSanitizer is unsupported on macOS (see Linux leg).
