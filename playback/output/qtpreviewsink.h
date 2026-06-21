@@ -5,8 +5,12 @@
 #include "playback/output/outputsink.h"
 
 #include <QVideoFrame>
+#include <QVideoFrameFormat>
 
 class FrameProvider;
+
+QVideoFrameFormat::ColorSpace qtColorSpaceFor(ColorMatrix matrix);
+QVideoFrameFormat::ColorRange qtColorRangeFor(ColorRange range);
 
 class QtPreviewSink {
 public:
