@@ -17,6 +17,15 @@ int packedStride(FramePixelFormat format, int frameWidth, int frameHeight, int p
 CpuPlanes nv12ToYuv420p(const CpuPlanes& src);
 CpuPlanes yuv420pToNv12(const CpuPlanes& src);
 
+struct FullResChroma {
+    int width = 0;
+    int height = 0;
+    QByteArray u;
+    QByteArray v;
+};
+
+FullResChroma upsampleChromaNearest(const CpuPlanes& yuv420p);
+
 } // namespace formatcanon
 
 #endif // FORMATCANON_H

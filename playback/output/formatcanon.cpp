@@ -121,4 +121,33 @@ CpuPlanes yuv420pToNv12(const CpuPlanes& src) {
     return out;
 }
 
+FullResChroma upsampleChromaNearest(const CpuPlanes& yuv420p) {
+    if (yuv420p.format != FramePixelFormat::Yuv420p || !yuv420p.isValid()) return {};
+
+    const int w = yuv420p.width;
+    const int h = yuv420p.height;
+    const int cw = chromaWidth(w);
+    const int ch = chromaHeight(h);
+
+    FullResChroma out;
+    out.width = w;
+    out.height = h;
+    out.u = QByteArray(planeBytes(w, h), 0);
+    out.v = QByteArray(planeBytes(w, h), 0);
+
+    for (int y = 0; y < h; ++y) {
+        const int cy = (y >> 1) < ch ? (y >> 1) : (ch - 1);
+        const char* uRow = yuv420p.plane[1].constData() + byteOffset(cy, yuv420p.stride[1]);
+        const char* vRow = yuv420p.plane[2].constData() + byteOffset(cy, yuv420p.stride[2]);
+        char* uDst = out.u.data() + byteOffset(y, w);
+        char* vDst = out.v.data() + byteOffset(y, w);
+        for (int x = 0; x < w; ++x) {
+            const int cx = (x >> 1) < cw ? (x >> 1) : (cw - 1);
+            uDst[x] = uRow[cx];
+            vDst[x] = vRow[cx];
+        }
+    }
+    return out;
+}
+
 } // namespace formatcanon

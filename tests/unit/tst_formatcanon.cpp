@@ -38,6 +38,7 @@ private slots:
     void packedStrideIsWidthTimesBytesPerSample();
     void nv12DeinterleaveProducesPlanarUV();
     void nv12RoundTripsByteExact();
+    void chromaUpsampleReplicates2x2Blocks();
 };
 
 void TestFormatCanon::planeShapeMatchesYuv420pLayout() {
@@ -121,6 +122,42 @@ void TestFormatCanon::nv12RoundTripsByteExact() {
     QCOMPARE(back.plane[1], nv12.plane[1]);
     QVERIFY(!formatcanon::nv12ToYuv420p(planar).isValid());
     QVERIFY(!formatcanon::yuv420pToNv12(nv12).isValid());
+}
+
+void TestFormatCanon::chromaUpsampleReplicates2x2Blocks() {
+    CpuPlanes planes;
+    planes.format = FramePixelFormat::Yuv420p;
+    planes.width = 4;
+    planes.height = 4;
+    planes.stride[0] = 4;
+    planes.stride[1] = 2;
+    planes.stride[2] = 2;
+    planes.plane[0] = QByteArray(16, char(0));
+    planes.plane[1] = QByteArrayLiteral("\x0a\x14\x1e\x28");
+    planes.plane[2] = QByteArray(4, 0);
+    planes.plane[2][0] = char(110);
+    planes.plane[2][1] = char(120);
+    planes.plane[2][2] = char(130);
+    planes.plane[2][3] = char(140);
+
+    const formatcanon::FullResChroma chroma = formatcanon::upsampleChromaNearest(planes);
+    QCOMPARE(chroma.width, 4);
+    QCOMPARE(chroma.height, 4);
+    auto uAt = [&](int x, int y) { return uchar(chroma.u.at(y * 4 + x)); };
+    auto vAt = [&](int x, int y) { return uchar(chroma.v.at(y * 4 + x)); };
+
+    QCOMPARE(uAt(0, 0), uchar(10));
+    QCOMPARE(uAt(1, 1), uchar(10));
+    QCOMPARE(vAt(0, 0), uchar(110));
+    QCOMPARE(vAt(1, 1), uchar(110));
+    QCOMPARE(uAt(2, 0), uchar(20));
+    QCOMPARE(uAt(3, 1), uchar(20));
+    QCOMPARE(vAt(3, 0), uchar(120));
+    QCOMPARE(uAt(0, 2), uchar(30));
+    QCOMPARE(uAt(1, 3), uchar(30));
+    QCOMPARE(uAt(2, 2), uchar(40));
+    QCOMPARE(uAt(3, 3), uchar(40));
+    QCOMPARE(vAt(2, 3), uchar(140));
 }
 
 QTEST_GUILESS_MAIN(TestFormatCanon)
