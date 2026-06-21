@@ -80,7 +80,7 @@ class FrameHandle {
 public:
     FrameHandle() = default;
     FrameHandle(std::shared_ptr<const IFrameData> data, FrameMetadata meta)
-        : m_data(std::move(data)), m_meta(std::move(meta)) {}
+        : m_data(std::move(data)), m_meta(meta) {}
 
     bool isNull() const { return m_data == nullptr; }
     const FrameMetadata& metadata() const { return m_meta; }

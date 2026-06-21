@@ -2365,5 +2365,5 @@ FrameHandle PlaybackWorker::convertToMediaVideoFrame(AVFrame* frame, int feedInd
     meta.stride[1] = out.stride[1];
     meta.stride[2] = out.stride[2];
     meta.color = colorMetadataForAvFrame(frame);
-    return makeCpuFrameHandle(std::move(out), std::move(meta));
+    return makeCpuFrameHandle(std::move(out), meta);
 }

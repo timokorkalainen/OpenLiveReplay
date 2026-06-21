@@ -31,9 +31,10 @@ using namespace olr::ndi;
 bool copyPlane(const QByteArray& src, int srcStride, int width, int height, char* dst,
                int dstStride) {
     if (srcStride <= 0 || width <= 0 || height <= 0 || dstStride < width) return false;
-    if (src.size() < srcStride * height) return false;
+    if (src.size() < static_cast<qsizetype>(srcStride) * height) return false;
     for (int y = 0; y < height; ++y) {
-        memcpy(dst + y * dstStride, src.constData() + y * srcStride, size_t(width));
+        memcpy(dst + static_cast<qsizetype>(y) * dstStride,
+               src.constData() + static_cast<qsizetype>(y) * srcStride, size_t(width));
     }
     return true;
 }

@@ -52,8 +52,9 @@ QVideoFrame QtPreviewSink::toQVideoFrame(const FrameHandle& frame) {
         const int width = (i == 0) ? view.width : (view.width + 1) / 2;
         const int copyW = qMin(width, qMin(srcStrides[i], qFrame.bytesPerLine(i)));
         for (int y = 0; y < height; ++y) {
-            std::memcpy(qFrame.bits(i) + y * qFrame.bytesPerLine(i),
-                        planes[i].constData() + y * srcStrides[i], size_t(copyW));
+            std::memcpy(qFrame.bits(i) + static_cast<qsizetype>(y) * qFrame.bytesPerLine(i),
+                        planes[i].constData() + static_cast<qsizetype>(y) * srcStrides[i],
+                        size_t(copyW));
         }
     }
     qFrame.unmap();

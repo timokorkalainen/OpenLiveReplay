@@ -33,7 +33,7 @@ public:
     int64_t newestPts() const; // -1 if empty
     int64_t oldestPts() const; // -1 if empty
     bool isEmpty() const { return m_frames.isEmpty(); }
-    int size() const { return m_frames.size(); }
+    int size() const { return static_cast<int>(m_frames.size()); }
 
     // Drop frames with PTS < keepFromMs or PTS > keepToMs.
     void trim(int64_t keepFromMs, int64_t keepToMs);

@@ -7,7 +7,7 @@
 bool TrackBuffer::insert(int64_t ptsMs, const FrameHandle& f, int capFrames, int64_t keepNearMs,
                          int64_t protectToMs) {
     // Binary-search for the insertion position (lower_bound by ptsMs).
-    int lo = 0, hi = m_frames.size();
+    int lo = 0, hi = static_cast<int>(m_frames.size());
     while (lo < hi) {
         int mid = lo + (hi - lo) / 2;
         if (m_frames[mid].ptsMs < ptsMs)
@@ -74,7 +74,7 @@ bool TrackBuffer::frameAt(int64_t playheadMs, FrameHandle& out, int64_t& outPtsM
     if (m_frames.isEmpty()) return false;
 
     // upper_bound for playheadMs: first index where ptsMs > playheadMs.
-    int lo = 0, hi = m_frames.size();
+    int lo = 0, hi = static_cast<int>(m_frames.size());
     while (lo < hi) {
         int mid = lo + (hi - lo) / 2;
         if (m_frames[mid].ptsMs <= playheadMs)

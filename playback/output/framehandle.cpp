@@ -120,7 +120,7 @@ FrameHandle makeCpuFrameHandle(CpuPlanes planes, FrameMetadata meta) {
     for (int i = 0; i < 3; ++i) {
         if (meta.stride[i] == 0) meta.stride[i] = planes.stride[i];
     }
-    return FrameHandle(std::make_shared<CpuFrameData>(std::move(planes)), std::move(meta));
+    return FrameHandle(std::make_shared<CpuFrameData>(std::move(planes)), meta);
 }
 
 FrameHandle solidYuv420pHandle(int width, int height, uchar y, uchar u, uchar v) {
@@ -145,5 +145,5 @@ FrameHandle solidYuv420pHandle(int width, int height, uchar y, uchar u, uchar v)
     meta.stride[0] = planes.stride[0];
     meta.stride[1] = planes.stride[1];
     meta.stride[2] = planes.stride[2];
-    return makeCpuFrameHandle(std::move(planes), std::move(meta));
+    return makeCpuFrameHandle(std::move(planes), meta);
 }

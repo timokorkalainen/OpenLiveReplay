@@ -11,8 +11,8 @@ void scalePlaneNearest(const QByteArray& src, int srcStride, int srcW, int srcH,
     if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
     for (int y = 0; y < dstH; ++y) {
         const int srcY = qMin(srcH - 1, (y * srcH) / dstH);
-        char* dstLine = dst.data() + (dstY + y) * dstStride + dstX;
-        const char* srcLine = src.constData() + srcY * srcStride;
+        char* dstLine = dst.data() + static_cast<qsizetype>(dstY + y) * dstStride + dstX;
+        const char* srcLine = src.constData() + static_cast<qsizetype>(srcY) * srcStride;
         for (int x = 0; x < dstW; ++x) {
             const int srcX = qMin(srcW - 1, (x * srcW) / dstW);
             dstLine[x] = srcLine[srcX];
@@ -27,7 +27,7 @@ FrameHandle Yuv420pCompositor::composeGrid(const QList<FrameHandle>& frames, int
     outHandle.metadata().key.feedIndex = -1;
     CpuPlanes out = outHandle.readToCpu(FramePixelFormat::Yuv420p);
 
-    const int count = qMax(1, frames.size());
+    const int count = qMax(1, static_cast<int>(frames.size()));
     const int columns = qMax(1, int(std::ceil(std::sqrt(double(count)))));
     const int rows = qMax(1, int(std::ceil(double(count) / double(columns))));
 
