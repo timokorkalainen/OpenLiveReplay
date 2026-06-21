@@ -237,14 +237,27 @@ jobs:
                     'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)
           if [ -z "$files" ]; then echo "No first-party C++ changes."; exit 0; fi
           printf '%s\n' "$files"
-          # No --warnings-as-errors override: the curated WarningsAsErrors in
-          # .clang-tidy decides what is fatal (the advisory conversion family
-          # stays non-fatal). clang-tidy exits non-zero when a fatal class fires.
+          # Pass 1 — WHOLE changed file, config-driven WarningsAsErrors: the
+          # high-signal bug classes (analyzer, bugprone, member-init, ...) are
+          # tree-clean, so any finding anywhere in a touched file is fatal.
           rc=0
           while IFS= read -r file; do
             [ -n "$file" ] || continue
             "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" "$file" || rc=1
           done <<< "$files"
+          # Pass 2 — DIFF-SCOPED integer-coercion gate. narrowing/implicit-widening
+          # carry a large grandfathered backlog, so they stay advisory tree-wide
+          # (Pass 1 does not fail on them); but any NEW occurrence on the lines this
+          # PR changes is fatal here. "Lint owns the floor going forward", matching
+          # the clang-format changed-lines model.
+          CTD="$(brew --prefix llvm)/share/clang/clang-tidy-diff.py"
+          git diff -U0 "$base" HEAD -- \
+              'recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp' \
+              'telemetry/*.cpp' 'websocket/*.cpp' \
+              'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' \
+            | python3 "$CTD" -p1 -path build -clang-tidy-binary "$TIDY" \
+                -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
+                -warnings-as-errors='*' -extra-arg=-isysroot -extra-arg="$SDK" || rc=1
           exit "$rc"
 
   # ---------------------------------------------------------------------------

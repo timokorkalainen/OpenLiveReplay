@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Pre-commit lint gate — mirrors the CI "Lint" job (.github/workflows/ci.yml) so
-# local == CI: clang-format on changed lines + strict qmllint on staged QML.
+# Pre-commit lint gate — mirrors the CI "Lint"/clang-tidy jobs so local == CI:
+# clang-format on changed lines + strict qmllint on staged QML + a diff-scoped
+# clang-tidy pass that blocks NEW narrowing/implicit-widening conversions.
 #
 # Enable once per clone:   git config core.hooksPath .githooks
 # Bypass:                  git commit --no-verify   (or OLR_PRECOMMIT_SKIP=1)
@@ -50,6 +51,37 @@ if [ -n "$qml_files" ]; then
         fi
     else
         echo "[pre-commit] qmllint not found — skipping QML lint" >&2
+    fi
+fi
+
+# --- clang-tidy (diff-scoped): block NEW narrowing/implicit-widening only -----
+# Grandfathers the existing integer-coercion backlog (it stays advisory) but
+# fails on any newly-changed line, matching the CI "clang-tidy" Pass 2. Needs a
+# configured build dir (compile_commands.json); skipped cleanly if absent.
+cpp_staged="$(git diff --cached --name-only --diff-filter=ACM -- \
+    'recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp' 'telemetry/*.cpp' \
+    'websocket/*.cpp' 'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' || true)"
+if [ -n "$cpp_staged" ] && [ -x "$CF" ]; then
+    TIDY="$(dirname "$CF")/clang-tidy"
+    CTD="$(dirname "$CF")/../share/clang/clang-tidy-diff.py"
+    BUILD_DIR=""
+    for d in build build/c build/prepush-delivery; do
+        [ -f "$d/compile_commands.json" ] && { BUILD_DIR="$d"; break; }
+    done
+    if [ -x "$TIDY" ] && [ -f "$CTD" ] && [ -n "$BUILD_DIR" ]; then
+        SDK="$(xcrun --show-sdk-path 2>/dev/null || true)"
+        if ! git diff --cached -U0 -- \
+                'recorder_engine/*.cpp' 'playback/*.cpp' 'project/*.cpp' 'telemetry/*.cpp' \
+                'websocket/*.cpp' 'settingsmanager.cpp' 'uimanager.cpp' 'midi/*.cpp' \
+            | python3 "$CTD" -p1 -path "$BUILD_DIR" -clang-tidy-binary "$TIDY" \
+                -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
+                -warnings-as-errors='*' ${SDK:+-extra-arg=-isysroot -extra-arg="$SDK"}; then
+            echo "[pre-commit] NEW narrowing/implicit-widening conversion in staged changes" >&2
+            echo "[pre-commit] make the conversion explicit with static_cast<...>" >&2
+            fail=1
+        fi
+    else
+        echo "[pre-commit] clang-tidy diff-scope skipped (no build/compile_commands.json or tooling)" >&2
     fi
 fi
 
