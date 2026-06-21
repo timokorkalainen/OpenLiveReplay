@@ -255,6 +255,13 @@ if(OLR_GPU_PIPELINE)
     target_link_libraries(olr_test_gpu
         PUBLIC Qt6::Core Qt6::Gui Qt6::GuiPrivate
         PRIVATE olr_warnings olr_sanitize)
+
+    qt_add_shaders(olr_test_gpu "olr_passthrough_shaders"
+        PREFIX "/olr/shaders"
+        BASE "${CMAKE_SOURCE_DIR}/playback/gpu/shaders"
+        FILES
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.vert"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.frag")
 endif()
 
 add_subdirectory(unit)
