@@ -44,6 +44,13 @@ bool isDropFrameRate(const TimecodeRate& rate);
 // result is NDF. Negative `frame` is clamped to 0.
 std::string framesToTimecode(int64_t frame, const TimecodeRate& rate, bool dropFrame);
 
+// Convenience: convert a millisecond timeline position to a SMPTE 12M timecode
+// string, AUTO-selecting drop-frame when the rate is a 29.97/59.94 family
+// (isDropFrameRate). The frame index is round(ms * num / (1000 * den)). Pure
+// int/float math (no Qt), so the UI layer reuses this instead of duplicating the
+// ms->frame->label conversion. Negative `ms` is clamped to 0.
+std::string timecodeFromMs(int64_t ms, const TimecodeRate& rate);
+
 // Parse "HH:MM:SS:FF" or "HH:MM:SS;FF" back to an absolute frame index. This is
 // a left-inverse of framesToTimecode (framesToTimecode -> timecodeToFrames is
 // exact for every frame index), NOT a strict bijection: field values are not

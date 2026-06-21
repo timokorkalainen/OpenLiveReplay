@@ -142,6 +142,11 @@ public:
     // both the on-screen label and the Stream Deck (time-of-day aware; HH:MM:SS.FF
     // from scrubPosition otherwise). The deck must never compute its own.
     QString playbackTimecode();
+    // Format a millisecond timeline position as a SMPTE timecode for the configured
+    // record rate, auto-selecting drop-frame for 29.97/59.94 (";FF") vs non-drop
+    // (":FF"). The single source of truth for every on-screen/deck timecode so the
+    // C++ and QML never drift. QML calls this instead of computing its own.
+    Q_INVOKABLE QString recordTimecode(qint64 ms) const;
     qint64 recordingStartEpochMs() const;
     bool timeOfDayMode() const;
     int liveBufferMs() const;
