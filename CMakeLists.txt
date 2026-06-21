@@ -172,6 +172,7 @@ qt_add_qml_module(OpenLiveReplay
         ui/components/BindingsPanel.qml
         ui/components/OutputsPanel.qml
         ui/components/ProjectSettingsPanel.qml
+        ui/components/SourceListPanel.qml
     SOURCES
         websocket/controlapiadapter.h
         websocket/controlprotocol.h websocket/controlprotocol.cpp

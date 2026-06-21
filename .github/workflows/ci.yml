@@ -251,7 +251,8 @@ jobs:
             Main.qml MultiviewWindow.qml CodecSettingsPanel.qml \
             ui/components/BindingsPanel.qml \
             ui/components/OutputsPanel.qml \
-            ui/components/ProjectSettingsPanel.qml
+            ui/components/ProjectSettingsPanel.qml \
+            ui/components/SourceListPanel.qml
 
       # qmlformat is ADVISORY (report-only): the existing QML predates it, so it is
       # introduced without reformatting the tree (same policy as clang-format).
