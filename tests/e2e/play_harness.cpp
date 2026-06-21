@@ -13,6 +13,8 @@
 // At the end the worker's counters() are printed as one parseable line:
 //   COUNTERS reposition=.. reuseSeek=.. reverseChunkSeek=.. eofTailSeek=..
 //            skipForward=.. audioPushes=.. framesDropped=..
+//            gpuReadbacks=.. redundantGpuReadbacks=.. readbackQueueDepth=..
+//            readbackDrops=.. fenceWaitStalls=.. gpuOomDegrades=.. gpuVramBytes=..
 // Per-second SEC telemetry is emitted by the instrumented worker to stderr when
 // OLR_PB_TELEMETRY is set in the environment (passed through transparently).
 //
@@ -150,13 +152,19 @@ int main(int argc, char** argv) {
                "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d "
                "maxBoundaryLandingErrMs=%lld armNextCutArmed=%d decodedVideoFrames=%lld "
-               "stagingVideoFramesDecoded=%lld\n",
+               "stagingVideoFramesDecoded=%lld gpuReadbacks=%lld redundantGpuReadbacks=%lld "
+               "readbackQueueDepth=%lld readbackDrops=%lld fenceWaitStalls=%lld "
+               "gpuOomDegrades=%lld gpuVramBytes=%lld\n",
                c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
                c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
-               (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded);
+               (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
+               (long long) os.gpuReadbacks, (long long) os.redundantGpuReadbacks,
+               (long long) os.readbackQueueDepth, (long long) os.readbackDrops,
+               (long long) os.fenceWaitStalls, (long long) os.gpuOomDegrades,
+               (long long) os.gpuVramBytes);
         fflush(stdout);
         app.quit();
     };
@@ -608,13 +616,19 @@ int main(int argc, char** argv) {
                    "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                    "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d "
                    "cutFollowReposition=%d maxBoundaryLandingErrMs=%lld armNextCutArmed=%d "
-                   "decodedVideoFrames=%lld stagingVideoFramesDecoded=%lld\n",
+                   "decodedVideoFrames=%lld stagingVideoFramesDecoded=%lld gpuReadbacks=%lld "
+                   "redundantGpuReadbacks=%lld readbackQueueDepth=%lld readbackDrops=%lld "
+                   "fenceWaitStalls=%lld gpuOomDegrades=%lld gpuVramBytes=%lld\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                    c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                    (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                    (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
                    c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
-                   (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded);
+                   (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
+                   (long long) os.gpuReadbacks, (long long) os.redundantGpuReadbacks,
+                   (long long) os.readbackQueueDepth, (long long) os.readbackDrops,
+                   (long long) os.fenceWaitStalls, (long long) os.gpuOomDegrades,
+                   (long long) os.gpuVramBytes);
             fflush(stdout);
             ::exit(2);
         }
