@@ -173,10 +173,13 @@ pushes to `main`:
   or tests.
 - **workflow-lint** — `actionlint` for workflow changes.
 - **lint** — source/QML changes only; changed-line `clang-format` and `qmllint`.
-- **build-test-macos** — Apple-clang `-Werror` build + the fast unit label + the
-  playback e2e gate + clang-tidy on changed files.
-- **build-test-windows** — MinGW build (FFmpeg/SRT from pinned source, **cached**
-  at `windows_build/dist`) + the deterministic Media Foundation unit tests.
+- **build-test-macos** — Apple-clang `-Werror` build + the fast unit label +
+  clang-tidy on changed files. (The playback e2e runs once, under ASan, in the
+  `sanitizers` leg — not duplicated here, to stay within the wall-clock budget.)
+- **build-test-windows** — MinGW build of the app + the deterministic AAC Media
+  Foundation unit test (FFmpeg/SRT from pinned source, **cached** at
+  `windows_build/dist`). The MF video-decode capability probe is compiled but not
+  run — it hangs on the headless hosted runner.
 - **build-test-linux** — GCC `-Werror` + the unit suite under ASan+UBSan+**LSan**
   (the only leg with LeakSanitizer + a second compiler).
 - **sanitizers** — clang ASan+UBSan (unit + e2e) and TSan, on macOS.
