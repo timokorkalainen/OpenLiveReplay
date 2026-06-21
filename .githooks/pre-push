@@ -11,6 +11,12 @@
 #   * the fast unit label (-L ci)
 # A build / unit / clang-tidy failure blocks the push.
 #
+# A docs-only push -- one whose every changed file (vs merge-base with
+# origin/main) is markdown, lives under docs/, or is root legal text
+# (LICENSE/NOTICE/AUTHORS/COPYING) -- cannot affect the build, the delivery
+# matrix, or any test, so the whole gate is auto-skipped (no Qt/ffmpeg needed).
+# The check is fail-closed: ANY file outside that set runs the full gate.
+#
 # The heavier e2e + sanitizer + iOS gates are OPT-IN (OLR_PREPUSH_FULL=1) -- run
 # them to reproduce a CI failure locally, or before a risky native/threading change.
 #
@@ -24,7 +30,9 @@
 # platform/toolchain, use the per-gate SKIP_* flags below.
 #
 # Triggers / flags:
-#   git push                  -> build + delivery + clang-tidy + unit (BLOCKING default)
+#   git push                  -> build + delivery + clang-tidy + unit (BLOCKING default;
+#                                auto-skipped for a docs-only push, see above)
+#   OLR_PREPUSH_DOCS_FULL=1   -> force the full gate even for a docs-only push
 #   OLR_PREPUSH_SKIP=1 push   -> emergency bypass ONLY (never use git push --no-verify;
 #                                prefer the per-gate SKIP_* flags for platform skipping)
 #   OLR_PREPUSH_LIGHT=1 push  -> delivery matrix ONLY (skip clang-tidy + unit)
@@ -47,6 +55,53 @@ cd "$REPO_ROOT"
 if [ "${OLR_PREPUSH_SKIP:-0}" = "1" ]; then
     echo "[pre-push] OLR_PREPUSH_SKIP=1 - skipping the delivery gate. Push proceeding." >&2
     exit 0
+fi
+
+# --- 0. Docs-only fast path ---------------------------------------------------
+# A push that touches ONLY documentation/legal text cannot affect the build, the
+# delivery matrix, or any test, so the heavy gates below would validate nothing.
+# Detect that case (fail-closed: ANY non-inert file -> full gate) and skip
+# straight past the cold build -- before the tooling preflight, so a docs push
+# needs no Qt/ffmpeg/srt. The cheap, file-scoped lints that apply to such a push
+# still run here; for pure docs there are none today (clang-format/qmllint live
+# in the pre-commit hook), so a new doc linter would slot in at the marker below.
+# Force the full gate with OLR_PREPUSH_DOCS_FULL=1.
+if [ "${OLR_PREPUSH_DOCS_FULL:-0}" != "1" ]; then
+    # Mirror the clang-tidy gate's base resolution so "what's being pushed" is
+    # measured the same way throughout the hook.
+    docs_base="$(git merge-base HEAD origin/main 2>/dev/null \
+                 || git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD 2>/dev/null || true)"
+    docs_changed=""
+    [ -n "$docs_base" ] && docs_changed="$(git diff --name-only "$docs_base" HEAD 2>/dev/null || true)"
+
+    # Inert = markdown anywhere, the whole docs/ subtree, or root legal text.
+    # NOTE: *.txt is deliberately NOT inert -- it would match CMakeLists.txt.
+    is_inert_path() {
+        case "$1" in
+            *.md|docs/*|LICENSE*|NOTICE*|AUTHORS*|COPYING*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+
+    docs_only=0
+    if [ -n "$docs_changed" ]; then
+        docs_only=1
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            is_inert_path "$f" || { docs_only=0; break; }
+        done <<< "$docs_changed"
+    fi
+
+    if [ "$docs_only" = "1" ]; then
+        echo "[pre-push] Docs-only change (vs ${docs_base}) -- skipping build + delivery + unit + clang-tidy."
+        echo "[pre-push] Changed files:"
+        while IFS= read -r f; do
+            [ -n "$f" ] && echo "[pre-push]   $f"
+        done <<< "$docs_changed"
+        # --- cheap doc-applicable lints would run here; none today ---
+        echo "[pre-push] (OLR_PREPUSH_DOCS_FULL=1 forces the full gate.)"
+        exit 0
+    fi
 fi
 
 QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/6.10.1/macos}}"
