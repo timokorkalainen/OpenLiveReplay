@@ -1,6 +1,7 @@
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
+#include <QQuickStyle>
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
 #include "playback/frameprovider.h"
@@ -17,6 +18,12 @@ using namespace Qt::StringLiterals;
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
+
+    // Bespoke broadcast-console look: select the OlrStyle custom QQC2 style and fall
+    // back to Basic for any control it doesn't provide. Must be set before the engine
+    // loads QML. (Overrides the Style= entry in qtquickcontrols2.conf.)
+    QQuickStyle::setStyle(u"OlrStyle"_s);
+    QQuickStyle::setFallbackStyle(u"Basic"_s);
 
     ReplayManager replayManager;
     UIManager uiManager(&replayManager);

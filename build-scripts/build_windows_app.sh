@@ -117,6 +117,16 @@ cp "$WORK_DIR/dist/srt/bin/libsrt.dll" "$APPDIR/"
 RTMIDI_DLL="$(find "$BUILD_DIR/_deps" -iname 'librtmidi*.dll' 2>/dev/null | head -1)"
 [ -n "$RTMIDI_DLL" ] && cp "$RTMIDI_DLL" "$APPDIR/"
 
+# The bespoke OlrTheme/OlrStyle QML-module backing libraries are first-party shared
+# libs the exe hard-depends on. windeployqt does not deploy arbitrary app DLLs (only
+# Qt's own), so copy them next to the exe. macOS is unaffected (macdeployqt walks the
+# dependency graph). Fail loudly if absent so a future rename can't silently reintroduce
+# a non-launchable artifact.
+OLR_MODULE_DLLS="$(find "$BUILD_DIR/ui" -iname 'libOlr*.dll' 2>/dev/null)"
+[ -n "$OLR_MODULE_DLLS" ] || {
+    echo "ERROR: OlrTheme/OlrStyle DLLs not found under $BUILD_DIR/ui" >&2; exit 1; }
+echo "$OLR_MODULE_DLLS" | while IFS= read -r dll; do cp "$dll" "$APPDIR/"; done
+
 echo "==> windeployqt (Qt DLLs, plugins, QML, compiler runtime)"
 "$OLR_QT_ROOT/bin/windeployqt.exe" --qmldir "$(winpath "$ROOT_DIR")" \
     --compiler-runtime --no-translations "$APPDIR/OpenLiveReplay.exe"

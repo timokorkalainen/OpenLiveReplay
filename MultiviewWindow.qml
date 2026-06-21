@@ -2,11 +2,14 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Window
 import QtMultimedia
+import OlrTheme
 
 Window {
     id: multiviewWindow
     width: 900
     height: 600
+    minimumWidth: 320
+    minimumHeight: 240
     visible: true
     title: "Multiview"
 
@@ -26,7 +29,7 @@ Window {
 
     Rectangle {
         anchors.fill: parent
-        color: "#111111"
+        color: Theme.canvas
 
         VideoOutput {
             id: multiviewBusOutput
@@ -81,7 +84,7 @@ Window {
                            ? map[streamTile.streamIndex] : -1
                 }
                 color: "transparent"
-                border.color: sourceForView < 0 ? "#1565C0" : "#d32f2f"
+                border.color: sourceForView < 0 ? Theme.line : Theme.ready
                 border.width: 2
                 width: multiViewGrid.cellWidth
                 height: multiViewGrid.cellHeight

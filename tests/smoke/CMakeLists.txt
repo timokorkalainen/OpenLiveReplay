@@ -11,6 +11,10 @@ find_program(OLR_QMLLINT NAMES qmllint HINTS "${_qt_prefix}/bin")
 if(OLR_QMLLINT)
     add_test(NAME qml_smoke COMMAND "${OLR_QMLLINT}"
         --unqualified error --Quick.layout-positioning error
+        # The app's own QML modules (OpenLiveReplay, OlrTheme, OlrStyle) are emitted
+        # here by the build; without this, `import OlrTheme` cannot resolve and every
+        # Theme.* reference in Main.qml/MultiviewWindow.qml becomes an unqualified error.
+        -I "${CMAKE_BINARY_DIR}/qml"
         -I "${_qt_prefix}/qml"
         "${CMAKE_SOURCE_DIR}/Main.qml"
         "${CMAKE_SOURCE_DIR}/MultiviewWindow.qml"

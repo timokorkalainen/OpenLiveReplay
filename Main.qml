@@ -4,14 +4,19 @@ import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
 import Qt.labs.platform 1.1
-import QtQuick.Controls.Universal 2.15 // Necessary for attached properties
 import QtMultimedia
+import OlrTheme
 
 ApplicationWindow {
     id: appWindow
     visible: true
-    width: 800
-    height: 600
+    width: 1200
+    height: 760
+    // Floor below which controls would be lost: the OS can't shrink past it, and
+    // every tab scrolls so the floor only needs to cover one transport row.
+    minimumWidth: Theme.windowMinW
+    minimumHeight: Theme.windowMinH
+    color: Theme.canvas
     title: "OpenLiveReplay"
 
     property var multiviewWindow: null
@@ -168,10 +173,6 @@ ApplicationWindow {
             if (appWindow.screensReady) stop()
         }
     }
-
-    // FORCE THE THEME HERE
-    Universal.theme: Universal.Dark
-    Universal.accent: Universal.Red
 
     FolderDialog {
         id: folderDialog
@@ -781,7 +782,7 @@ ApplicationWindow {
                                    ? map[playbackTab.selectedIndex] : -1
                         }
                         color: sourceForView < 0 ? "#003080" : "black"
-                        border.color: sourceForView < 0 ? "#1565C0" : "#00C853"
+                        border.color: sourceForView < 0 ? Theme.line : Theme.ready
                         border.width: 2
                         visible: playbackTab.viewMode === "single" && playbackTab.selectedIndex >= 0 && playbackTab.pgmProvider !== null
 
@@ -824,7 +825,7 @@ ApplicationWindow {
                                     return appWindow.uiManagerRef.sourceDisplayLabel(src)
                                 }
                                 color: "white"
-                                font.family: "monospace"
+                                font.family: Theme.fontMono
                                 font.pixelSize: 14
                             }
                         }
@@ -886,7 +887,7 @@ ApplicationWindow {
                                        ? map[multiViewDelegate.streamIndex] : -1
                             }
                             color: "transparent"
-                            border.color: sourceForView < 0 ? "#1565C0" : "red"
+                            border.color: sourceForView < 0 ? Theme.line : Theme.ready
                             border.width: 2
                             width: multiViewGrid.cellWidth
                             height: multiViewGrid.cellHeight
@@ -909,7 +910,7 @@ ApplicationWindow {
                                         return appWindow.uiManagerRef.sourceDisplayLabel(src)
                                     }
                                     color: "white"
-                                    font.family: "monospace"
+                                    font.family: Theme.fontMono
                                     font.pixelSize: 12
                                 }
                             }
@@ -1009,7 +1010,7 @@ ApplicationWindow {
                         Rectangle {
                             width: scrubBar.visualPosition * parent.width
                             height: parent.height
-                            color: "#007AFF"
+                            color: Theme.accent
                             radius: 3
                         }
                     }
@@ -1054,7 +1055,7 @@ ApplicationWindow {
                         // Stream Deck shows. Do not reformat here.
                         text: appWindow.uiManagerRef.playbackTimecode
                         color: "#eeeeee"
-                        font.family: "Menlo"
+                        font.family: Theme.fontMono
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
                         MouseArea {
@@ -1194,7 +1195,7 @@ ApplicationWindow {
                                : playbackTab.formatTimeOfDay(Date.now()))
                             : playbackTab.formatTimecode(appWindow.uiManagerRef.recordedDurationMs)
                         color: "#eeeeee"
-                        font.family: "Menlo"
+                        font.family: Theme.fontMono
                         font.pixelSize: 14
                         Layout.alignment: Qt.AlignVCenter
                         MouseArea {
@@ -1206,13 +1207,22 @@ ApplicationWindow {
                 }
             }
 
-            // --- Project Tab ---
-            ColumnLayout {
-                spacing: 12
+            // --- Project Tab --- (vertically scrollable: its stacked settings exceed any
+            // normal window height. Content is pinned to the viewport width, so wide blocks
+            // — the NDI Outputs table, source rows — scroll within their own inner views.)
+            ScrollView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
+                contentWidth: availableWidth
+                clip: true
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
-                Text {
+                ColumnLayout {
+                    id: projectTab
+                    spacing: 12
+                    width: parent.width
+
+                    Text {
                     text: "Project Settings"
                     font.bold: true
                     color: "#eeeeee"
@@ -2260,6 +2270,7 @@ ApplicationWindow {
                     Item { Layout.fillWidth: true }
                 }
             }
+            } // ScrollView (Project tab)
         }
     }
 }

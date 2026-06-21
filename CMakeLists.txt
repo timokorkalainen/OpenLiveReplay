@@ -78,6 +78,15 @@ FetchContent_MakeAvailable(rtmidi)
 find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickControls2 Network WebSockets)
 qt_standard_project_setup(REQUIRES 6.8)
 
+# All QML modules output under one dir so the build-time import path resolves every
+# module (OpenLiveReplay, OlrTheme, OlrStyle) consistently for qmllint/qmlcachegen.
+set(QT_QML_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/qml")
+
+# UI design system: token singleton + bespoke QQC2 custom style (defined before the
+# app so they are on the QML import path when Main.qml is processed).
+add_subdirectory(ui/theme)
+add_subdirectory(ui/style)
+
 # 2. Create the Executable Target FIRST
 qt_add_executable(OpenLiveReplay main.cpp)
 
@@ -213,17 +222,19 @@ if(NOT WIN32)
     add_custom_target(qmllint_imports ALL
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/build"
         COMMAND ${CMAKE_COMMAND} -E remove -f "${QMLLINT_IMPORT_LINK}"
-        COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_BINARY_DIR}/OpenLiveReplay" "${QMLLINT_IMPORT_LINK}"
+        # Point at the unified QML output dir so qmllint resolves every module
+        # (OpenLiveReplay, OlrTheme, OlrStyle) under one import root.
+        COMMAND ${CMAKE_COMMAND} -E create_symlink "${CMAKE_BINARY_DIR}/qml" "${QMLLINT_IMPORT_LINK}"
         COMMENT "Updating qmllint import path symlink"
     )
 endif()
 
 # Ensure qmllint can find the generated qmltypes file in the module output directory.
 add_custom_command(TARGET OpenLiveReplay POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/OpenLiveReplay"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/qml/OpenLiveReplay"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_BINARY_DIR}/.qt/qmltypes/OpenLiveReplay.qmltypes"
-        "${CMAKE_BINARY_DIR}/OpenLiveReplay/OpenLiveReplay.qmltypes"
+        "${CMAKE_BINARY_DIR}/qml/OpenLiveReplay/OpenLiveReplay.qmltypes"
     COMMENT "Copying OpenLiveReplay.qmltypes for qmllint"
 )
 
@@ -595,6 +606,8 @@ target_link_libraries(OpenLiveReplay PRIVATE
     Qt6::WebSockets
     rtmidi
     OpenLiveReplayMidi
+    OlrTheme
+    OlrStyle
     olr_warnings
     olr_sanitize
 )
