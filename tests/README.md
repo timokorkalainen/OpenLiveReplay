@@ -121,6 +121,27 @@ OLR_RTMP_RUN_SOAK=1 OLR_RTMP_SOAK_SECONDS=1800 OLR_RTMP_SOAK_CODEC=avc \
 ctest --test-dir build/native-rtmp -R e2e_native_rtmp_soak --output-on-failure
 ```
 
+### Clock-skew stability soak (opt-in)
+
+`e2e_drift_soak` (label `drift-soak`) runs a long recording from a source whose
+media clock is skewed by a fixed ppm (simulating an independent source clock — a
+single host shares one wall clock, so a real two-machine rig is out of scope) and
+gates two things observable over a long run: **continuity** (no stalls) and **A/V
+lip-sync lock** (the flash-vs-beep offset's first vs last third doesn't drift
+apart — catches a path-split of audio/video onto separate clocks under sustained
+skew). Recovered ppm and absolute slip are reported, not gated: over loopback the
+ingest timestamps on arrival, so neither is a clean measure of the injected skew
+or of absolute cross-machine clock accuracy. Opt-in; SKIPs (77) unless enabled:
+
+```bash
+OLR_DRIFT_RUN_SOAK=1 OLR_DRIFT_SOAK_SECS=300 OLR_DRIFT_SOAK_PPM=300 \
+ctest --test-dir build/c -R e2e_drift_soak --output-on-failure
+```
+
+Best run on a quiesced host: the A/V-regression and inter-flash-gap gates are
+timing-sensitive and can false-fail under concurrent CPU load (override
+`OLR_DRIFT_AV_FRAMES` / `OLR_DRIFT_MAX_GAP` if needed).
+
 ## What's covered
 
 | Layer | Where | What it checks |

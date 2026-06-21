@@ -1,7 +1,8 @@
-// End-to-end avcC + muxing round-trip: native-encode grey frames, attach the
+// End-to-end avcC + muxing round-trip: native-encode a textured pattern, attach the
 // encoder's avcC to the muxer, write a real MKV, then demux it and assert the
 // stream is H.264, every frame is a keyframe, and the frame count matches.
-// Task 7: also decode back via NativeVideoDecoder and assert frame dimensions.
+// Then decode back via NativeVideoDecoder and assert frame dimensions AND that the
+// decoded luma matches the source within a PSNR floor (objective quality gate, T3.4).
 #include <QtTest>
 #include <QTemporaryDir>
 #include <QScopeGuard>
@@ -9,6 +10,7 @@
 #include "recorder_engine/muxer.h"
 #include "recorder_engine/codec/nativevideoencoder.h"
 #include "recorder_engine/ingest/nativevideodecoder.h"
+#include "tests/unit/framepsnr.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -34,21 +36,50 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
     auto enc = NativeVideoEncoder::create({640, 480, 30, 1, 4'000'000}, &err);
     if (!enc) QSKIP("no hardware H.264 encoder on this platform");
 
-    // Prime to obtain avcC.
-    auto grey = []() {
+    // A deterministic, textured source: a diagonal luma gradient + a 32 px checkerboard (low/mid
+    // frequency) PLUS a per-pixel high-frequency dither so the encoder actually has to spend bits
+    // (a flat or trivially-compressible field makes PSNR degenerate — any encoder scores ~infinite
+    // and quality regressions sail through). Chroma carries two DISTINCT gradients (U varies in x,
+    // V in y) so a U<->V swap or dropped chroma is detectable. The same frame is reused for the
+    // prime and all coded frames (all-intra), so the decoded keyframe pairs trivially with this
+    // reference.
+    auto makePattern = []() {
         AVFrame* f = av_frame_alloc();
-        f->format = AV_PIX_FMT_YUV420P; f->width = 640; f->height = 480;
+        f->format = AV_PIX_FMT_YUV420P;
+        f->width = 640;
+        f->height = 480;
         av_frame_get_buffer(f, 32);
-        memset(f->data[0], 128, f->linesize[0] * 480);
-        memset(f->data[1], 128, f->linesize[1] * 240);
-        memset(f->data[2], 128, f->linesize[2] * 240);
+        for (int y = 0; y < 480; ++y) {
+            uint8_t* row = f->data[0] + y * f->linesize[0];
+            for (int x = 0; x < 640; ++x) {
+                const int base = (x * 256 / 640 + y * 256 / 480) / 2; // diagonal gradient 0..255
+                const int block = (((x >> 5) + (y >> 5)) & 1) ? 24 : -24; // 32 px checkerboard
+                // Deterministic per-pixel high-frequency dither (+/-16) so the 4 Mbps budget binds
+                // and the PSNR floor tracks real quality, not just gross corruption.
+                const unsigned h = unsigned(x) * 2654435761u + unsigned(y) * 40503u;
+                const int hf = int((h >> 24) & 0x1f) - 16;
+                const int v = base + block + hf;
+                row[x] = uint8_t(v < 0 ? 0 : (v > 255 ? 255 : v));
+            }
+        }
+        for (int y = 0; y < 240; ++y) {
+            uint8_t* u = f->data[1] + y * f->linesize[1];
+            uint8_t* vrow = f->data[2] + y * f->linesize[2];
+            for (int x = 0; x < 320; ++x) {
+                u[x] = uint8_t(96 + x * 64 / 320);    // 96..160 horizontal gradient
+                vrow[x] = uint8_t(96 + y * 64 / 240); // 96..160 vertical gradient
+            }
+        }
         return f;
     };
-    AVFrame* prime = grey();
+    AVFrame* source = makePattern();
+    auto freeSource = qScopeGuard([&] { av_frame_free(&source); });
+
+    // Prime to obtain avcC.
     bool gotPrimePacket = false;
     bool primeKeyframe = true;
     const bool primeOk = enc->encode(
-        prime, 0,
+        source, 0,
         [&](const QByteArray& data, int64_t, bool key) {
             if (!data.isEmpty()) {
                 gotPrimePacket = true;
@@ -56,7 +87,6 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
             }
         },
         &err);
-    av_frame_free(&prime);
     if (!primeOk || !gotPrimePacket) {
         QSKIP("hardware H.264 encoder opened but produced no priming packet");
     }
@@ -78,20 +108,21 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
     QVERIFY(st);
     int written = 0;
     for (int i = 1; i <= 6; ++i) {
-        AVFrame* f = grey();
-        enc->encode(f, i, [&](const QByteArray& data, int64_t pts, bool key) {
-            AVPacket* pkt = av_packet_alloc();
-            av_new_packet(pkt, data.size());
-            memcpy(pkt->data, data.constData(), data.size());
-            pkt->stream_index = 0;
-            pkt->pts = pkt->dts = av_rescale_q(pts, AVRational{1, 30}, st->time_base);
-            pkt->duration = av_rescale_q(1, AVRational{1, 30}, st->time_base);
-            if (key) pkt->flags |= AV_PKT_FLAG_KEY;
-            m.writePacket(pkt);
-            av_packet_free(&pkt);
-            ++written;
-        }, &err);
-        av_frame_free(&f);
+        enc->encode(
+            source, i,
+            [&](const QByteArray& data, int64_t pts, bool key) {
+                AVPacket* pkt = av_packet_alloc();
+                av_new_packet(pkt, data.size());
+                memcpy(pkt->data, data.constData(), data.size());
+                pkt->stream_index = 0;
+                pkt->pts = pkt->dts = av_rescale_q(pts, AVRational{1, 30}, st->time_base);
+                pkt->duration = av_rescale_q(1, AVRational{1, 30}, st->time_base);
+                if (key) pkt->flags |= AV_PKT_FLAG_KEY;
+                m.writePacket(pkt);
+                av_packet_free(&pkt);
+                ++written;
+            },
+            &err);
     }
     m.close();
     QVERIFY(written >= 6);
@@ -170,6 +201,9 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
     NativeVideoDecoder decoder(640, 480);
     bool gotFrame = false;
     int frameWidth = 0, frameHeight = 0;
+    double lumaPsnr = 0.0;
+    double chromaUPsnr = 0.0;
+    double chromaVPsnr = 0.0;
 
     AVPacket* decPkt = av_packet_alloc();
     auto freeDecPkt = qScopeGuard([&] { av_packet_free(&decPkt); });
@@ -210,6 +244,19 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
             gotFrame = true;
             frameWidth = f->width;
             frameHeight = f->height;
+            // Objective quality: PSNR of the decoded keyframe vs the source pattern, per plane.
+            // Both are YUV420P with (possibly padded) per-row linesize, so compare by stride.
+            // Chroma planes are half-resolution; the two distinct chroma gradients make a U<->V
+            // swap or dropped chroma show up as a low chroma PSNR even though luma is untouched.
+            if (f->format == AV_PIX_FMT_YUV420P && f->width == source->width &&
+                f->height == source->height) {
+                lumaPsnr = psnrY8(source->data[0], source->linesize[0], f->data[0], f->linesize[0],
+                                  f->width, f->height);
+                chromaUPsnr = psnrY8(source->data[1], source->linesize[1], f->data[1],
+                                     f->linesize[1], f->width / 2, f->height / 2);
+                chromaVPsnr = psnrY8(source->data[2], source->linesize[2], f->data[2],
+                                     f->linesize[2], f->width / 2, f->height / 2);
+            }
             av_frame_free(&f);
         }, &decErr);
         if (!ok && !decErr.isEmpty())
@@ -219,6 +266,29 @@ void TestH264RoundTrip::encodeMuxDemuxYieldsIntraH264() {
     QVERIFY2(gotFrame, "NativeVideoDecoder produced no frames from the muxed H.264");
     QCOMPARE(frameWidth, 640);
     QCOMPARE(frameHeight, 480);
+
+    // Objective fidelity gate (T3.4): the decoded frame must match the source within per-plane PSNR
+    // floors. The high-frequency dither makes the 4 Mbps all-intra budget actually bind (it pulls
+    // the achievable luma PSNR down from ~50 dB on the flat content to ~48 dB), so the luma floor
+    // is a real quality threshold — a gross bitrate/quality regression or any corruption drops
+    // below it, not only a fully garbled decode; the chroma floors catch a U<->V swap or dropped
+    // chroma that luma-only would miss. Floors are calibrated on VideoToolbox (measured luma ~47.8
+    // dB, chroma ~52 dB, deterministic) and sit a wide margin below that to tolerate Media
+    // Foundation / other HW-encoder variance while still failing a
+    // garbled/wrong-pixels/wrong-chroma decode.
+    constexpr double kMinLumaPsnrDb = 40.0;
+    constexpr double kMinChromaPsnrDb = 42.0;
+    qInfo("decoded PSNR: luma=%.2f dB (floor %.1f), U=%.2f dB, V=%.2f dB (floor %.1f)", lumaPsnr,
+          kMinLumaPsnrDb, chromaUPsnr, chromaVPsnr, kMinChromaPsnrDb);
+    QVERIFY2(lumaPsnr >= kMinLumaPsnrDb,
+             qPrintable(QStringLiteral("decoded luma PSNR %1 dB below floor %2 dB")
+                            .arg(lumaPsnr, 0, 'f', 2)
+                            .arg(kMinLumaPsnrDb, 0, 'f', 1)));
+    QVERIFY2(chromaUPsnr >= kMinChromaPsnrDb && chromaVPsnr >= kMinChromaPsnrDb,
+             qPrintable(QStringLiteral("decoded chroma PSNR U=%1 V=%2 dB below floor %3 dB")
+                            .arg(chromaUPsnr, 0, 'f', 2)
+                            .arg(chromaVPsnr, 0, 'f', 2)
+                            .arg(kMinChromaPsnrDb, 0, 'f', 1)));
 }
 
 QTEST_GUILESS_MAIN(TestH264RoundTrip)
