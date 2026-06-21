@@ -19,7 +19,7 @@
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
 //              farback | armedcut | armedcut-back | armedcut-seekrace | armedcut-rearm-seek |
-//              playlist | armedcut-h264
+//              playlist | armedcut-h264 | armedcut-h264-back
 #include <QCoreApplication>
 #include <QTimer>
 #include <QList>
@@ -149,13 +149,14 @@ int main(int argc, char** argv) {
                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d "
-               "maxBoundaryLandingErrMs=%lld armNextCutArmed=%d decodedVideoFrames=%lld\n",
+               "maxBoundaryLandingErrMs=%lld armNextCutArmed=%d decodedVideoFrames=%lld "
+               "stagingVideoFramesDecoded=%lld\n",
                c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
                c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
-               (long long) c.decodedVideoFrames);
+               (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded);
         fflush(stdout);
         app.quit();
     };
@@ -513,34 +514,85 @@ int main(int argc, char** argv) {
             QTimer::singleShot(14000, &app, finish);
 
         } else if (scen == "armedcut-h264") {
-            // H.264 pre-roll GUARD: on an H.264 fixture openPrerollContext() skips
-            // all H.264 streams (HW-only, not supported in the pre-roll bank), so
-            // the bank is empty and armNextCut returns FALSE. The UIManager fallback
-            // (recallEntry) issues a plain seek instead. Gate:
-            //   armNextCutArmed==0  -> pre-roll guard fired (armNextCut rejected)
-            //   cutsFired==0        -> no cut was issued (guard blocked it)
-            //   reposition>=1       -> the fallback seek serviced the jump
-            //
-            // Scope note: this validates the worker-level guard + seek;
-            // the UIManager::recallEntry->seekPlayback->SeekCoalescer path is not
-            // exercised here.
+            // H.264 FRAME-PERFECT ARMED CUT: now that openPrerollContext() builds a
+            // NativeVideoDecoder for H.264 streams, armNextCut returns TRUE and the
+            // worker pre-rolls [target, target+span] into the staging cache, firing a
+            // frame-accurate cut with NO gray flash and NO reposition fallback.
+            // Mirrors the MPEG-2 "armedcut" scenario exactly (arm + queued re-arm →
+            // cutsFired==2) on the H.264 fixture.
+            // Gates:
+            //   armNextCutArmed==1  -> pre-roll bank accepted the arm (HW decode OK)
+            //   cutsFired==2        -> first cut + queued re-arm both fired
+            //   placeholderFramesDelta==0 -> no gray flash across the cut
+            //   heldFramesDelta<=20 -> the promoted staging cache was NOT empty/dry
+            //                          (an empty cache would hold-last → held spike)
+            //   reposition==0       -> cut fired; no coarse-seek fallback
+            //   maxClockDivergenceMs<=1500 -> epoch re-anchored at cut
+            //   stagingVideoFramesDecoded>=15 -> the pre-roll bank actually HW-decoded
+            //                          the target window into staging (direct proof)
+            //   decodedVideoFrames>=30 -> the PRIMARY H.264 HW decoder ran (corroborates
+            //                          the fixture is genuinely H.264; primary bank only,
+            //                          NOT the staging bank — staging is stagingVideoFramesDecoded)
             transport.setSpeed(1.0);
             transport.seek(0);
             transport.setPlaying(true);
-            QTimer::singleShot(1000, &app, [&]() {
+            QTimer::singleShot(1000, &app, [&, basePh, baseHeld]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
                 const int64_t target = durMs / 2;
                 armNextCutArmed = worker.armNextCut(target) ? 1 : 0;
+                fprintf(
+                    stderr,
+                    "### armedcut-h264 basePh=%lld baseHeld=%lld; armNextCut(%lldms) returned %d "
+                    "(0=guard fired, 1=armed) ###\n",
+                    (long long) *basePh, (long long) *baseHeld, (long long) target,
+                    armNextCutArmed);
+            });
+            // Rapid re-arm (queued double-recall) while the first cut is in flight,
+            // mirroring the MPEG-2 armedcut scenario (drives cutsFired==2).
+            QTimer::singleShot(1050, &app, [&]() {
+                worker.armNextCut(durMs * 3 / 4);
                 fprintf(stderr,
-                        "### armedcut-h264 armNextCut(%lldms) returned %d "
-                        "(0=guard fired, 1=armed) ###\n",
-                        (long long) target, armNextCutArmed);
-                // Simulate UIManager::recallEntry fallback: plain seek.
-                transport.seek(target);
-                worker.seekTo(target);
-                fprintf(stderr, "### armedcut-h264 fallback seek to %lldms issued ###\n",
-                        (long long) target);
+                        "### armedcut-h264 re-arm (queued double-recall to durMs*3/4) ###\n");
             });
             QTimer::singleShot(4000, &app, finish);
+
+        } else if (scen == "armedcut-h264-back") {
+            // H.264 ARMED CUT, BACKWARD target — the H.264 analogue of armedcut-back
+            // and the dominant EVS replay direction. This is the path the PR's new
+            // native pre-roll uniquely exercises: the backward cut sets
+            // m_decoderFollowMs, so the worker resyncs the PRIMARY H.264 bank via the
+            // deterministic decoder-follow (cutFollowReposition==1) through
+            // repositionTo — whose post-seek drain intentionally does NOT flush the
+            // native decoder (per-AU statelessness; see playbackworker.cpp). It also
+            // exercises fillStaging's post-seek nativeDecoder->reset() on a real
+            // backward av_seek_frame. Mirrors armedcut-back exactly (seek ahead, arm
+            // a strictly-earlier cut, play long past the staging span) but on the
+            // H.264 fixture. The gate asserts heldFramesDelta<=20 (no frozen-frame
+            // stall if the resync lags), placeholderFramesDelta==0, framesDropped==0,
+            // maxClockDivergenceMs<=1500, cutFollowReposition==1, reposition<=2, plus
+            // the staging non-vacuity floor stagingVideoFramesDecoded>=15.
+            transport.setSpeed(1.0);
+            transport.seek(durMs * 3 / 4); // start AHEAD of the cut target
+            worker.seekTo(durMs * 3 / 4);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&, basePh, baseHeld]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
+                const int64_t target = durMs / 4; // strictly EARLIER than the playhead
+                armNextCutArmed = worker.armNextCut(target) ? 1 : 0;
+                fprintf(stderr,
+                        "### armedcut-h264-back basePh=%lld baseHeld=%lld; arming BACKWARD cut to "
+                        "%lldms returned %d (0=guard fired, 1=armed) ###\n",
+                        (long long) *basePh, (long long) *baseHeld, (long long) target,
+                        armNextCutArmed);
+            });
+            // Play ~8s after the cut so the playhead runs several seconds past
+            // target+kStagingSpanMs — the window where a dry cache (frozen frame /
+            // heldFrames spike) would surface if the native resync ever lagged.
+            QTimer::singleShot(9000, &app, finish);
 
         } else {
             fprintf(stderr, "play_harness: unknown scenario '%s'\n", scen.toUtf8().constData());
@@ -556,13 +608,13 @@ int main(int argc, char** argv) {
                    "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                    "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d "
                    "cutFollowReposition=%d maxBoundaryLandingErrMs=%lld armNextCutArmed=%d "
-                   "decodedVideoFrames=%lld\n",
+                   "decodedVideoFrames=%lld stagingVideoFramesDecoded=%lld\n",
                    c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                    c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                    (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                    (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
                    c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
-                   (long long) c.decodedVideoFrames);
+                   (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded);
             fflush(stdout);
             ::exit(2);
         }

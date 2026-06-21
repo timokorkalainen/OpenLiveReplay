@@ -59,7 +59,7 @@ trap cleanup EXIT
 # VideoToolbox/MediaFoundation — encode and decode are paired capabilities on
 # both platforms. VAC-1's codec assertion below catches any silent codec fallback.
 case "$SCENARIO" in
-    h264_play|armedcut-h264)
+    h264_play|armedcut-h264|armedcut-h264-back)
         # Capture both output and exit code. A crashing probe exits non-zero —
         # treat that as FAIL (not SKIP) so a broken record_harness is visible.
         CAPS="$("$RECORD" --probe-codec-caps 2>&1)"; PROBE_RC=$?
@@ -139,7 +139,7 @@ sleep 1.0  # let the SRT listener come up before the caller connects
 # Written as a plain string (not an array) to stay compatible with bash 3.2 (macOS).
 REC_CODEC_EXTRA=""
 case "$SCENARIO" in
-    h264_play|armedcut-h264) REC_CODEC_EXTRA="--codec h264" ;;
+    h264_play|armedcut-h264|armedcut-h264-back) REC_CODEC_EXTRA="--codec h264" ;;
 esac
 
 URL="$(srt_caller_url "$SRT_PORT")"
@@ -177,7 +177,7 @@ echo "[pb-e2e] fixture video tracks: ${VTRACKS:-?} (expected $VIEWS)"
 # would make the H.264 gate exercise the wrong codec — assert early so the test
 # fails loudly rather than passing vacuously.
 case "$SCENARIO" in
-    h264_play|armedcut-h264)
+    h264_play|armedcut-h264|armedcut-h264-back)
         VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
             -of default=nk=1:nw=1 "$FIXTURE" | head -n1)"
         echo "[pb-e2e] fixture video codec: ${VCODEC:-?}"
@@ -231,6 +231,7 @@ cutFollowReposition="$(get cutFollowReposition)"
 maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
 armNextCutArmed="$(get armNextCutArmed)"
 decodedVideoFrames="$(get decodedVideoFrames)"
+stagingVideoFramesDecoded="$(get stagingVideoFramesDecoded)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
@@ -249,6 +250,7 @@ decodedVideoFrames="$(get decodedVideoFrames)"
 [ -n "$maxBoundaryLandingErrMs" ] || maxBoundaryLandingErrMs="?"
 [ -n "$armNextCutArmed" ] || armNextCutArmed="?"
 [ -n "$decodedVideoFrames" ] || decodedVideoFrames="?"
+[ -n "$stagingVideoFramesDecoded" ] || stagingVideoFramesDecoded="?"
 
 if [ $PLAY_RC -ne 0 ]; then
     echo "FAIL: play_harness exited $PLAY_RC"
@@ -701,21 +703,119 @@ case "$SCENARIO" in
         fi
         ;;
     armedcut-h264)
-        # H.264 pre-roll GUARD + UIManager::recallEntry fallback seek:
-        #   armNextCutArmed==0  -> pre-roll guard fired (H.264 streams skipped,
-        #                           bank empty, armNextCut returned false)
-        #   cutsFired==0        -> no cut was issued (guard blocked it)
-        #   reposition>=1       -> the fallback plain seek serviced the jump
-        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 0 ]; then
-            echo "FAIL: armedcut-h264 armNextCut returned true on H.264 fixture (armNextCutArmed=$armNextCutArmed, expected 0) — H.264 pre-roll guard did not fire"
+        # H.264 FRAME-PERFECT ARMED CUT: openPrerollContext() now builds a
+        # NativeVideoDecoder for H.264 streams so armNextCut succeeds and the
+        # worker pre-rolls the target window into staging, firing a frame-accurate
+        # cut with no gray flash and no reposition fallback. Mirrors the MPEG-2
+        # armedcut gate + a DIRECT staging non-vacuity guard.
+        #   armNextCutArmed==1    -> HW pre-roll bank accepted the arm
+        #   placeholderFramesDelta==0 -> no gray flash across the cut
+        #   heldFramesDelta<=20   -> the promoted staging cache was NOT empty/dry
+        #   reposition==0         -> cut fired; no coarse-seek fallback
+        #   maxClockDivergenceMs<=1500 -> epoch re-anchored at the cut
+        #   cutsFired==2          -> first cut + queued re-arm both fired
+        #   cutFollowReposition==0 -> forward cut; no backward decoder-follow
+        #   stagingVideoFramesDecoded>=15 -> the pre-roll bank HW-decoded the window
+        #   decodedVideoFrames>=30 -> the primary H.264 HW decoder ran
+        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 1 ]; then
+            echo "FAIL: armedcut-h264 armNextCut did not arm on H.264 fixture (armNextCutArmed=$armNextCutArmed, expected 1) — NativeVideoDecoder pre-roll bank not built (check avcC parse / HW caps)"
             fail=1
         fi
-        if ! num "$cutsFired" || [ "$cutsFired" -ne 0 ]; then
-            echo "FAIL: armedcut-h264 a cut fired on an H.264 fixture (cutsFired=$cutsFired, expected 0) — pre-roll guard should have blocked it"
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 painted gray across the cut (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — cut flash"
             fail=1
         fi
-        if ! num "$reposition" || [ "$reposition" -lt 1 ]; then
-            echo "FAIL: armedcut-h264 fallback seek did not reposition (reposition=$reposition, expected >=1) — the plain-seek fallback should have serviced the jump"
+        # Frozen-frame detector (the gate the placeholder check misses): if the
+        # promoted staging cache were EMPTY/dry, the dispatcher's hold-last would
+        # paint the last live PRIMARY frame and bump heldFrames (NOT placeholders),
+        # so placeholderFramesDelta==0 + cutsFired==2 + reposition==0 would ALL still
+        # pass on a vacuous cut. A dry cache shows hundreds-to-thousands of held
+        # ticks; the <=20 bound (same as armedcut-back/farback) tolerates only the
+        # one-or-two-tick cut-flip transient — orders of magnitude below a real stall.
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -gt 20 ]; then
+            echo "FAIL: armedcut-h264 froze (heldFramesDelta=$heldFramesDelta, expected <=20) — promoted staging cache was empty/dry; hold-last froze a stale primary frame (vacuous cut)"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 fell back to repositionTo (reposition=$reposition, expected 0) — cut did not fire in time"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: armedcut-h264 clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored at the cut)"
+            fail=1
+        fi
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 2 ]; then
+            echo "FAIL: armedcut-h264 re-arm queue fired $cutsFired cuts (expected 2) — queued re-arm dropped or duplicated"
+            fail=1
+        fi
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 0 ]; then
+            echo "FAIL: armedcut-h264 (forward) fired the decoder-follow (cutFollowReposition=$cutFollowReposition, expected 0) — follow should only arm for backward cuts"
+            fail=1
+        fi
+        # DIRECT staging non-vacuity: the pre-roll bank must have HW-decoded real
+        # frames into m_prerollStagingCache before the cut promoted it. This is the
+        # unfakeable proof the cut rode a genuinely-decoded window (heldFramesDelta
+        # above catches the empty-cache symptom; this catches its cause). The staging
+        # span is ~800ms ≈ 24 frames at 30fps; 15 is a safe floor.
+        if ! num "$stagingVideoFramesDecoded" || [ "$stagingVideoFramesDecoded" -lt 15 ]; then
+            echo "FAIL: armedcut-h264 pre-roll decoded too few staging frames (stagingVideoFramesDecoded=$stagingVideoFramesDecoded, expected >=15) — staging bank empty/wrong; the cut did not ride a HW-decoded window"
+            fail=1
+        fi
+        # The PRIMARY H.264 HW decoder must also have produced real frames (confirms
+        # the fixture is genuinely H.264-decoded, not silently mpeg2). NOTE: this
+        # counter tracks the PRIMARY bank only — the staging proof is the assertion
+        # immediately above (stagingVideoFramesDecoded), NOT this one.
+        if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -lt 30 ]; then
+            echo "FAIL: armedcut-h264 too few decoded video frames (decodedVideoFrames=$decodedVideoFrames, expected >=30) — primary H.264 HW decode produced no real frames"
+            fail=1
+        fi
+        ;;
+    armedcut-h264-back)
+        # H.264 ARMED CUT, BACKWARD target — the H.264 analogue of armedcut-back and
+        # the dominant EVS replay direction. Exercises the PR's two new native paths
+        # that the forward armedcut-h264 never reaches: (1) the backward decoder-follow
+        # resyncing the PRIMARY H.264 bank through repositionTo (cutFollowReposition==1),
+        # whose post-seek drain intentionally does NOT flush the native decoder
+        # (per-AU statelessness — this gate is what locks that invariant in), and
+        # (2) fillStaging's post-seek nativeDecoder->reset() after a real backward seek.
+        #   armNextCutArmed==1    -> HW pre-roll bank accepted the backward arm
+        #   placeholderFramesDelta==0 -> no gray across the backward cut
+        #   heldFramesDelta<=20   -> no frozen-frame stall if the resync lags
+        #   framesDropped==0      -> the resync never drops a frame
+        #   maxClockDivergenceMs<=1500 -> frame accuracy (epoch re-anchored)
+        #   cutFollowReposition==1 -> the backward decoder-follow fired exactly once
+        #   reposition<=2         -> warmup only; no reactive backward-jump storm
+        #   stagingVideoFramesDecoded>=15 -> the pre-roll bank HW-decoded the window
+        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 1 ]; then
+            echo "FAIL: armedcut-h264-back armNextCut did not arm on H.264 fixture (armNextCutArmed=$armNextCutArmed, expected 1) — NativeVideoDecoder pre-roll bank not built"
+            fail=1
+        fi
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: armedcut-h264-back painted gray across the backward cut (placeholderFramesDelta=$placeholderFramesDelta, expected 0) — cut flash"
+            fail=1
+        fi
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -gt 20 ]; then
+            echo "FAIL: armedcut-h264-back froze (heldFramesDelta=$heldFramesDelta, expected <=20) — output cache ran dry before the native resync extended coverage (frozen frame, invisible to the placeholder gate)"
+            fail=1
+        fi
+        if ! num "$framesDropped" || [ "$framesDropped" -ne 0 ]; then
+            echo "FAIL: armedcut-h264-back dropped frames (framesDropped=$framesDropped, expected 0) across the backward cut/resync"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: armedcut-h264-back clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500) — output rendered the wrong frame (play epoch not re-anchored at the backward cut)"
+            fail=1
+        fi
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 1 ]; then
+            echo "FAIL: armedcut-h264-back decoder-follow did not fire exactly once (cutFollowReposition=$cutFollowReposition, expected 1) — backward cut should resync the primary H.264 bank via the proactive follow"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 2 ]; then
+            echo "FAIL: armedcut-h264-back repositioned too much (reposition=$reposition, expected <=2 = warmup only) — reactive backward-jump storm (native decoder carried stale frames) or coarse-seek fallback"
+            fail=1
+        fi
+        if ! num "$stagingVideoFramesDecoded" || [ "$stagingVideoFramesDecoded" -lt 15 ]; then
+            echo "FAIL: armedcut-h264-back pre-roll decoded too few staging frames (stagingVideoFramesDecoded=$stagingVideoFramesDecoded, expected >=15) — staging bank empty/wrong; the cut did not ride a HW-decoded window"
             fail=1
         fi
         ;;
@@ -725,7 +825,7 @@ case "$SCENARIO" in
         ;;
 esac
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"
