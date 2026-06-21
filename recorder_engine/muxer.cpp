@@ -23,23 +23,23 @@ bool isWellFormedTimecode(const QString& tc) {
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps,
                  const QStringList& streamNames, int audioSampleRate, int audioChannels,
                  VideoCodecChoice codec, const QByteArray& videoExtradata,
-                 const QString& startTimecode) {
+                 const QString& startTimecode, int fpsNum, int fpsDen) {
     return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate,
-                audioChannels, codec, videoExtradata, startTimecode);
+                audioChannels, codec, videoExtradata, startTimecode, fpsNum, fpsDen);
 }
 
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps,
                  const QStringList& streamNames, int audioSampleRate, int audioChannels,
-                 const QString& startTimecode) {
+                 const QString& startTimecode, int fpsNum, int fpsDen) {
     return init(filename, videoTrackCount, width, height, fps, streamNames, {}, {}, audioSampleRate,
-                audioChannels, VideoCodecChoice::Mpeg2Software, {}, startTimecode);
+                audioChannels, VideoCodecChoice::Mpeg2Software, {}, startTimecode, fpsNum, fpsDen);
 }
 
 bool Muxer::init(const QString& filename, int videoTrackCount, int width, int height, int fps,
                  const QStringList& streamNames, const QStringList& telemetryFeedIds,
                  const QStringList& telemetryFeedNames, int audioSampleRate, int audioChannels,
                  VideoCodecChoice codec, const QByteArray& videoExtradata,
-                 const QString& startTimecode) {
+                 const QString& startTimecode, int fpsNum, int fpsDen) {
     QMutexLocker locker(&m_mutex);
     Q_UNUSED(streamNames);
 
@@ -53,6 +53,10 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     if (width <= 0) width = 1920;
     if (height <= 0) height = 1080;
     if (fps <= 0) fps = 30;
+    // Advertised rational frame rate: prefer the explicit fpsNum/fpsDen (e.g.
+    // 30000/1001 for 29.97); fall back to the integer {fps, 1} when unset (0/0).
+    const AVRational advertisedRate =
+        (fpsNum > 0 && fpsDen > 0) ? AVRational{fpsNum, fpsDen} : AVRational{fps, 1};
 
     // Session start timecode candidate. The "timecode" tag is NOT written here:
     // the header write is deferred to the first muxed packet (ensureHeaderWritten),
@@ -132,9 +136,9 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         // This keeps timeline duration consistent across players.
         st->time_base = {1, 1000};
 
-        // 3. Set the metadata hints
-        st->avg_frame_rate = {fps, 1};
-        st->r_frame_rate = {fps, 1};
+        // 3. Set the metadata hints (advertised rate; ms time_base is unchanged)
+        st->avg_frame_rate = advertisedRate;
+        st->r_frame_rate = advertisedRate;
 
         // For MPEG-2, you can also set the 'closed gop' and 'fixed fps' flags in codecpar
         st->codecpar->video_delay = 0;

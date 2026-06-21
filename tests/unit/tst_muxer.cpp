@@ -39,6 +39,7 @@ private slots:
     void setStartTimecodeCandidateFirstWins();
     void noTimecodeTagWhenCandidateAbsentButPacketWritten();
     void emptyRecordingClosesToValidMkv();
+    void advertisesRationalFrameRate();
 
 private:
     QTemporaryDir m_home;
@@ -115,6 +116,33 @@ void TestMuxer::initBuildsTrackLayout() {
     QCOMPARE(m.getStream(0)->codecpar->codec_id, AV_CODEC_ID_MPEG2VIDEO);
     QCOMPARE(m.getStream(1)->codecpar->codec_id, AV_CODEC_ID_MPEG2VIDEO);
     m.close();
+}
+
+void TestMuxer::advertisesRationalFrameRate() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QStringList names{QStringLiteral("A")};
+    // 29.97 (rounded fps 30, rational 30000/1001): the stream must advertise the
+    // rational rate, not the legacy {30, 1}.
+    QVERIFY(m.init(QStringLiteral("olr_unit_rate_2997"), 1, 320, 240, 30, names, 48000, 2,
+                   VideoCodecChoice::Mpeg2Software, QByteArray(), QString(), 30000, 1001));
+    AVStream* v = m.getStream(0);
+    QVERIFY(v != nullptr);
+    QCOMPARE(v->avg_frame_rate.num, 30000);
+    QCOMPARE(v->avg_frame_rate.den, 1001);
+    QCOMPARE(v->r_frame_rate.num, 30000);
+    QCOMPARE(v->r_frame_rate.den, 1001);
+    m.close();
+
+    // Default (no rational supplied) keeps the legacy integer {fps, 1}.
+    Muxer m2;
+    m2.setOutputDirectory(m_home.path());
+    QVERIFY(m2.init(QStringLiteral("olr_unit_rate_int"), 1, 320, 240, 30, names, 48000, 2));
+    AVStream* v2 = m2.getStream(0);
+    QVERIFY(v2 != nullptr);
+    QCOMPARE(v2->avg_frame_rate.num, 30);
+    QCOMPARE(v2->avg_frame_rate.den, 1);
+    m2.close();
 }
 
 void TestMuxer::getStreamIsBoundsChecked() {

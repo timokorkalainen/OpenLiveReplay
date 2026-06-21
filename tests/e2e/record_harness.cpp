@@ -67,6 +67,10 @@ int main(int argc, char** argv) {
     const int width = argValue(args, QStringLiteral("--width"), QStringLiteral("640")).toInt();
     const int height = argValue(args, QStringLiteral("--height"), QStringLiteral("480")).toInt();
     const int fps = argValue(args, QStringLiteral("--fps"), QStringLiteral("30")).toInt();
+    // Optional rational advertised rate (e.g. --fps-num 30000 --fps-den 1001 for
+    // 29.97). 0/0 keeps the integer {fps, 1}.
+    const int fpsNum = argValue(args, QStringLiteral("--fps-num"), QStringLiteral("0")).toInt();
+    const int fpsDen = argValue(args, QStringLiteral("--fps-den"), QStringLiteral("0")).toInt();
     // Where recordings land. The engine honors this (ReplayManager ->
     // Muxer::setOutputDirectory); the driver points it at a temp dir so the
     // test is hermetic. Empty -> engine default (~/Documents/videos).
@@ -122,6 +126,7 @@ int main(int argc, char** argv) {
     rm.setVideoWidth(width);
     rm.setVideoHeight(height);
     rm.setFps(fps);
+    rm.setFpsRational(fpsNum, fpsDen); // no-op when 0/0
     rm.setVideoCodec(codec);
 
     rm.startRecording();

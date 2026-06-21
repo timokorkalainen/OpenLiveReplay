@@ -71,6 +71,14 @@ public:
     void setVideoWidth(int width) { m_videoWidth = width; }
     void setVideoHeight(int height) { m_videoHeight = height; }
     void setFps(int fps) { m_fps = fps; }
+    // Advertised rational rate (e.g. 30000/1001). Defaults to {fps, 1}; set this
+    // so the encoder + muxer advertise the true rate for 29.97/59.94 sources.
+    void setFpsRational(int num, int den) {
+        if (num > 0 && den > 0) {
+            m_fpsNum = num;
+            m_fpsDen = den;
+        }
+    }
     void setVideoCodec(VideoCodecChoice codec) { m_videoCodec = codec; }
     VideoCodecChoice videoCodec() const { return m_videoCodec; }
 
@@ -243,6 +251,8 @@ private:
     static constexpr int kHeartbeatIntervalMs = 8;
     static constexpr int kMaxFramesPerTick = 8;
     int m_fps = 30;
+    int m_fpsNum = 30; // advertised rational rate numerator (e.g. 30000)
+    int m_fpsDen = 1;  // advertised rational rate denominator (e.g. 1001)
     VideoCodecChoice m_videoCodec = VideoCodecChoice::Mpeg2Software;
 
     QTimer* m_heartbeat;

@@ -213,7 +213,13 @@ add_test(NAME e2e_record_stereo
 add_test(NAME e2e_record_mono
     COMMAND "${OLR_E2E_BASH}" "${_driver}" "$<TARGET_FILE:record_harness>" mono 23458)
 
-set_tests_properties(e2e_record_stereo e2e_record_mono PROPERTIES
+# Rational frame rate end to end: record advertising 29.97 (30000/1001) and assert
+# the container's r_frame_rate is exactly 30000/1001, not the legacy {30,1}.
+# Port pair {23460,23461}, disjoint from stereo/mono.
+add_test(NAME e2e_record_rational_fps
+    COMMAND "${OLR_E2E_BASH}" "${_driver}" "$<TARGET_FILE:record_harness>" rational 23460)
+
+set_tests_properties(e2e_record_stereo e2e_record_mono e2e_record_rational_fps PROPERTIES
     LABELS "e2e"
     TIMEOUT 120
     RUN_SERIAL TRUE)  # they bind UDP/SRT ports + drive ffmpeg; don't overlap

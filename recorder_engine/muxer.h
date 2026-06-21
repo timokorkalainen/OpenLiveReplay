@@ -31,10 +31,15 @@ public:
     Muxer();
     ~Muxer();
 
+    // fpsNum/fpsDen: the rational frame rate advertised on each video stream's
+    // avg_frame_rate / r_frame_rate. 0/0 (the default) keeps the legacy {fps, 1};
+    // pass e.g. 30000/1001 so a 29.97 recording advertises its true rate. The
+    // integer `fps` still drives defaults and the ms time_base (PTS is unchanged).
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps,
               const QStringList& streamNames, int audioSampleRate = 48000, int audioChannels = 2,
               VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software,
-              const QByteArray& videoExtradata = {}, const QString& startTimecode = QString());
+              const QByteArray& videoExtradata = {}, const QString& startTimecode = QString(),
+              int fpsNum = 0, int fpsDen = 0);
     // Convenience overload carrying ONLY the session start timecode (default
     // codec). startTimecode is REQUIRED here (no default) so this 9-arg form is
     // distinct from the codec-tail overload above (whose 9th positional arg is a
@@ -45,12 +50,13 @@ public:
     // malformed -> no tag (a no-TC recording is byte-identical to before).
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps,
               const QStringList& streamNames, int audioSampleRate, int audioChannels,
-              const QString& startTimecode);
+              const QString& startTimecode, int fpsNum = 0, int fpsDen = 0);
     bool init(const QString& filename, int videoTrackCount, int width, int height, int fps,
               const QStringList& streamNames, const QStringList& telemetryFeedIds,
               const QStringList& telemetryFeedNames, int audioSampleRate = 48000,
               int audioChannels = 2, VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software,
-              const QByteArray& videoExtradata = {}, const QString& startTimecode = QString());
+              const QByteArray& videoExtradata = {}, const QString& startTimecode = QString(),
+              int fpsNum = 0, int fpsDen = 0);
     void writePacket(AVPacket* pkt);
     void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     void writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);

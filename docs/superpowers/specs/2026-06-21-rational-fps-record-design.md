@@ -46,13 +46,18 @@ build its output `FrameRate` from `m_transport->frameRate()` (rational).
 - Add `m_targetFpsNum`/`m_targetFpsDen` to `StreamWorker` alongside the existing `m_targetFps` (keep
   `m_targetFps` = rounded integer for the unchanged internal ms-cadence math — see Scope boundary).
   Plumb them through the `StreamWorker` ctor (new params, defaulted) from `ReplayManager`.
-- **MPEG-2 (`setupEncoder`):** `encCtx->time_base = {fpsDen, fpsNum}`, `encCtx->framerate = {fpsNum,
-  fpsDen}` (`streamworker.cpp:612-613`). MPEG-2's sequence header can signal the 1000/1001 variants, so
-  29.97/59.94 now write the correct ES rate. Update the "exactly representable" warning switch to accept
-  the rational 30000/1001 & 60000/1001 (warn only on genuinely non-representable rates).
-- **Native H.264 (config at `streamworker.cpp:551`):** pass `{w, h, fpsNum, fpsDen, bitrate}` instead of
-  `{w, h, fps, 1, bitrate}` (the config struct already has `fpsNum`/`fpsDen`,
-  `nativevideoencoder.h:25`).
+- **MPEG-2 (`setupEncoder`):** keep `encCtx->time_base = {1, m_targetFps}` (the integer-fps coding clock)
+  and set only `encCtx->framerate = {fpsNum, fpsDen}` — `framerate` is the field `mpeg2video` writes into
+  the sequence-header `frame_rate_code` (the 1000/1001 variants), while `time_base` governs the coded PTS.
+  **This separation is load-bearing:** the MPEG-2 path stamps `frame->pts = frame_index` and rescales the
+  *output packet* from `encCtx->time_base` to the muxer, so a rational `time_base` would push the muxed
+  video PTS onto the 29.97 grid (~33.367ms/frame) while audio/metadata stay on the integer-fps grid
+  (~33.333ms) — a slow A/V drift. (See the adversarial-review correction at the end.) Update the "exactly
+  representable" warning to accept the rational 30000/1001 & 60000/1001.
+- **Native H.264 (config at `streamworker.cpp:551`):** pass `{w, h, fpsNum, fpsDen, bitrate}` (the config
+  struct already has `fpsNum`/`fpsDen`, `nativevideoencoder.h:25`). NOTE: only MediaFoundation (Windows)
+  honors `fpsNum/fpsDen` for the ES; VideoToolbox (macOS) ignores them, so on macOS the H.264 **container**
+  rate (the muxer fields below) is authoritative and the ES VUI is unchanged.
 
 ### Part 2 — Rational rate through the container (Muxer)
 
@@ -61,7 +66,14 @@ build its output `FrameRate` from `m_transport->frameRate()` (rational).
   defaults). Set `st->avg_frame_rate = {fpsNum, fpsDen}` and `st->r_frame_rate = {fpsNum, fpsDen}`
   (`muxer.cpp:136-137`). No change to `time_base` (stays ms) or packet PTS.
 
-### Part 3 — Drop-frame timecode display (UIManager)
+### Part 3 — Drop-frame timecode display (UIManager) — SPLIT TO A FOLLOW-UP PR
+
+> **Scope update (during implementation):** the on-screen timecode is computed in **two** places
+> that must stay byte-identical — `UIManager::playbackTimecode()` (C++, drives the StreamDeck) and the
+> QML label in `Main.qml` — and uses a `HH:MM:SS.FF` (period) separator rather than SMPTE `:`/`;`.
+> Making it drop-frame is therefore a coupled C++/QML UI change (separator + DF renumbering kept in sync
+> across both), a distinct logical unit from the engine-side rate fix. Parts 1 & 2 (the actual
+> file-correctness bug) ship first; Part 3 follows as its own PR. The design below stands for that PR.
 
 - Replace the hand-rolled frame math in `formatTimecodeForDisplay` and `updateXTouchDisplay` (and
   `formatTimecodeForFile`) with `olr::Timecode`: convert the playhead ms to an absolute frame index
@@ -110,3 +122,34 @@ build its output `FrameRate` from `m_transport->frameRate()` (rational).
 - `ctest -L unit` (full suite — recorder/muxer change can ripple).
 - The record e2e gates (`e2e_record_*`) + a new rational-rate ffprobe assertion.
 - clang-format / clang-tidy clean; independent review of the StreamWorker/Muxer plumbing.
+
+## Adversarial-review correction (post-implementation)
+
+A ruthless multi-lens adversarial review caught a real regression in the first implementation and the
+fixes below were applied:
+
+- **MPEG-2 video PTS drift (important — fixed).** The first cut set the MPEG-2 encoder
+  `time_base = {fpsDen, fpsNum}`. Because the MPEG-2 path stamps `frame->pts = frame_index` and rescales
+  the *output packet* from `encCtx->time_base` to the muxer, that pushed the muxed video PTS onto the 29.97
+  grid (~33.367ms/frame) while audio/metadata stayed on the integer-fps grid (~33.333ms) — a slow A/V
+  drift (~6ms/6s, ~3.6s/hour) on exactly the 29.97/59.94 rates this work targets, contradicting the
+  "timing-identical" scope claim. **Fix:** keep `time_base = {1, m_targetFps}` (integer-fps coding clock)
+  and carry the rational rate only via `framerate` (ES) + the container `avg/r_frame_rate`. Same fix on the
+  blue-fill MPEG-2 encoder. The H.264 path was never affected (it already rescales PTS via `{1,fps}`), and
+  integer 30/1 was byte-identical throughout.
+- **Test had no timing teeth (fixed).** The e2e/unit gates checked only the advertised-rate *metadata*, so
+  they could not catch the PTS drift. The `rational` e2e now also asserts the mean muxed-video frame
+  interval stays on the integer-fps cadence (~33.333ms, bounded `< 33.35ms`), which fails if a rational
+  rate ever leaks back into the coded PTS.
+- **ES claim narrowed (honesty).** "Both the elementary stream and the container" is only fully true for
+  MPEG-2 (whose `framerate` drives the sequence-header rate) and for MediaFoundation H.264. **VideoToolbox
+  (macOS) H.264 ignores `fpsNum/fpsDen`**, so on macOS the H.264 ES VUI is unchanged and the **container**
+  rate is the authoritative advertised rate (which is what MKV playback uses anyway).
+
+### Deferred (documented, not in this PR)
+
+- H.264 / 59.94 rational e2e cells and an ES-level (not just container) rate assertion (TVC-2/F4).
+- A UIManager unit test for the two `setFpsRational` call sites (needs a `ReplayManager::fpsNum/fpsDen`
+  getter seam) (TVC-3).
+- VideoToolbox `kVTCompressionPropertyKey_ExpectedFrameRate` / SPS-VUI injection for a true macOS H.264 ES
+  rate (only if ES-level signalling is later required; container is authoritative today).

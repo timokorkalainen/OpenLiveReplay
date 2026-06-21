@@ -96,7 +96,7 @@ bool ReplayManager::setupBlueEncoder() {
         // frame once to obtain avcC extradata (needed by Muxer::init).
         QString err;
         m_blueNativeEncoder = NativeVideoEncoder::create(
-            {m_videoWidth, m_videoHeight, m_fps, 1, 30'000'000}, &err);
+            {m_videoWidth, m_videoHeight, m_fpsNum, m_fpsDen, 30'000'000}, &err);
         if (!m_blueNativeEncoder) {
             qWarning() << "ReplayManager: H.264 hardware blue encoder unavailable:" << err;
             return false;
@@ -161,8 +161,11 @@ bool ReplayManager::setupBlueEncoder() {
 
     m_blueEncCtx->width     = m_videoWidth;
     m_blueEncCtx->height    = m_videoHeight;
+    // Integer-fps coding clock so blue video PTS tracks the integer-fps cadence
+    // (it is rescaled from this time_base in writeBlueFrames); the true rational
+    // rate is carried only by framerate (ES) + the container avg/r_frame_rate.
     m_blueEncCtx->time_base = {1, m_fps};
-    m_blueEncCtx->framerate = {m_fps, 1};
+    m_blueEncCtx->framerate = {m_fpsNum, m_fpsDen};
     m_blueEncCtx->pix_fmt   = AV_PIX_FMT_YUV420P;
     m_blueEncCtx->gop_size  = 1;
     m_blueEncCtx->bit_rate  = 30000000;
@@ -310,10 +313,11 @@ void ReplayManager::startRecording() {
         const bool muxerReady =
             m_telemetryFeedIds.isEmpty()
                 ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
-                                m_viewNames, 48000, 2, m_videoCodec, m_videoExtradata, startTc)
+                                m_viewNames, 48000, 2, m_videoCodec, m_videoExtradata, startTc,
+                                m_fpsNum, m_fpsDen)
                 : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
                                 m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2,
-                                m_videoCodec, m_videoExtradata, startTc);
+                                m_videoCodec, m_videoExtradata, startTc, m_fpsNum, m_fpsDen);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer (H.264) with base name" << m_sessionFileName;
             cleanupBlueEncoder();
@@ -324,10 +328,11 @@ void ReplayManager::startRecording() {
         const bool muxerReady =
             m_telemetryFeedIds.isEmpty()
                 ? m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
-                                m_viewNames, 48000, 2, m_videoCodec, {}, startTc)
+                                m_viewNames, 48000, 2, m_videoCodec, {}, startTc, m_fpsNum,
+                                m_fpsDen)
                 : m_muxer->init(m_sessionFileName, m_viewCount, m_videoWidth, m_videoHeight, m_fps,
                                 m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2,
-                                m_videoCodec, {}, startTc);
+                                m_videoCodec, {}, startTc, m_fpsNum, m_fpsDen);
         if (!muxerReady) {
             qDebug() << "ReplayManager: Failed to init Muxer with base name" << m_sessionFileName;
             return;
@@ -366,9 +371,9 @@ void ReplayManager::startRecording() {
     const int sourceCount = m_sourceUrls.size();
 
     for (int s = 0; s < sourceCount; ++s) {
-        StreamWorker* worker = new StreamWorker(
-            m_sourceUrls[s], s, m_muxer, m_clock,
-            m_videoWidth, m_videoHeight, m_fps, m_videoCodec);
+        StreamWorker* worker =
+            new StreamWorker(m_sourceUrls[s], s, m_muxer, m_clock, m_videoWidth, m_videoHeight,
+                             m_fps, m_fpsNum, m_fpsDen, m_videoCodec);
 
         // Set per-source metadata JSON for the subtitle track
         if (s < m_sourceMetadata.size()) {
