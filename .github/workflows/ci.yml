@@ -75,7 +75,25 @@ jobs:
             esac
 
             case "$file" in
-              .github/workflows/*|*.md|docs/*)
+              # The workflow file defines every gate, so a change to it must
+              # re-run them ALL — otherwise the gate's own rulebook could be
+              # edited with the gates it controls skipped, and "CI gate" counts a
+              # skipped required job as a pass (vacuously green).
+              .github/workflows/*)
+                app=true
+                format=true
+                qml=true
+                native=true
+                ;;
+              # Lint/sanitizer/build rulebooks: a change here must re-run the
+              # gates that consult them (clang-tidy/clang-format/qmllint/sanitizer
+              # suppressions/pre-commit), for the same self-referential reason.
+              .clang-tidy|.clang-format|qmllint.ini|qmllint.ini.in|.pre-commit-config.yaml|.githooks/*|tests/lsan.suppressions.txt)
+                app=true
+                format=true
+                native=true
+                ;;
+              *.md|docs/*)
                 ;;
               *.cpp|*.c|*.h|*.hpp|*.mm)
                 app=true
