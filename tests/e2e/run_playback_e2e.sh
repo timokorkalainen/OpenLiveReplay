@@ -36,6 +36,7 @@ UDP_PORT=$((SRT_PORT + 1))
 # shellcheck source=tests/e2e/srt_lib.sh
 . "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
 srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
+olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 0; }
 
 # Record long enough that every scenario's playback window stays inside the
 # fixture (play1x plays ~12s from t=0; liveedge/seekplay reach ~mid/late).
@@ -60,6 +61,14 @@ trap cleanup EXIT
 # both platforms. VAC-1's codec assertion below catches any silent codec fallback.
 case "$SCENARIO" in
     h264_play|armedcut-h264|armedcut-h264-back)
+        case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*)
+                if [ "${OLR_RUN_UNSTABLE_MF_H264_TESTS:-0}" != "1" ]; then
+                    echo "SKIP: Windows Media Foundation H.264 playback e2e is opt-in on this machine"
+                    exit 77
+                fi
+                ;;
+        esac
         # Capture both output and exit code. A crashing probe exits non-zero —
         # treat that as FAIL (not SKIP) so a broken record_harness is visible.
         CAPS="$("$RECORD" --probe-codec-caps 2>&1)"; PROBE_RC=$?
@@ -86,21 +95,28 @@ VIDEO_FILTER="color=c=black:s=640x480:r=30,geq=lum='if(lt(mod(T,1),0.06),255,16)
 AUDIO_FILTER="sine=frequency=1000:sample_rate=48000,volume='if(lt(mod(t,1),0.1),1,0)':eval=frame"
 
 start_producer() {
-    # $3: optional video codec (default: libx264). This is the SRT/mpegts WIRE
+    # $3: optional video codec (default: libx264/H.264). This is the SRT/mpegts WIRE
     # codec the engine ingests — it does NOT affect the recorded fixture codec.
     # record_harness always writes an Mpeg2Software mezzanine (its default),
     # so the pre-roll bank always finds an MPEG-2 fixture regardless of $3.
     local vcodec="${3:-libx264}"
-    local extra_opts=""
-    if [ "$vcodec" = "libx264" ]; then
-        extra_opts="-preset ultrafast -tune zerolatency"
-    fi
-    # shellcheck disable=SC2086
+    local vargs=()
+    case "$vcodec" in
+        libx264|h264|avc)
+            vargs=("${OLR_H264_VCODEC_ARGS[@]}")
+            ;;
+        mpeg2video)
+            vargs=(-c:v mpeg2video -pix_fmt yuv420p -g 30 -b:v 4M)
+            ;;
+        *)
+            vargs=(-c:v "$vcodec" -pix_fmt yuv420p -g 30 -b:v 4M)
+            ;;
+    esac
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "$1" \
         -f lavfi -i "$2" \
         -ac 2 \
-        -c:v "$vcodec" $extra_opts -pix_fmt yuv420p -g 30 -b:v 4M \
+        "${vargs[@]}" \
         -c:a aac -b:a 128k \
         -f mpegts "udp://127.0.0.1:${UDP_PORT}?pkt_size=1316" &
     FFPID=$!

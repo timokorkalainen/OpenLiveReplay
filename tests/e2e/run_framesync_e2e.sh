@@ -41,6 +41,18 @@ case "$TRANSPORT" in
     srt)
         require_srt_tools_77
         [ -f "$RELAY" ] || fail "$RELAY missing"
+        case "$SCENARIO" in
+            lipsync|drift|drift_skew)
+                olr_ffmpeg_has_filter volume || skip "ffmpeg volume filter not available"
+                olr_ffmpeg_has_filter silencedetect || skip "ffmpeg silencedetect filter not available"
+                ;;
+            timecode)
+                olr_ffmpeg_has_filter volume || skip "ffmpeg volume filter not available"
+                ;;
+            intercam)
+                olr_ffmpeg_has_muxer tee || skip "ffmpeg tee muxer not available"
+                ;;
+        esac
         ;;
     ndi)
         ndi_require_tools_77

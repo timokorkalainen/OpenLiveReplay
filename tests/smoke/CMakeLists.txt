@@ -25,6 +25,16 @@ else()
     message(WARNING "qmllint not found under ${_qt_prefix}/bin; qml_smoke test disabled")
 endif()
 
+set(OLR_SMOKE_BASH bash)
+if(WIN32)
+    find_program(OLR_GIT_BASH
+        NAMES bash.exe bash
+        HINTS "C:/Program Files/Git/bin" "C:/Program Files/Git/usr/bin")
+    if(OLR_GIT_BASH)
+        set(OLR_SMOKE_BASH "${OLR_GIT_BASH}")
+    endif()
+endif()
+
 add_test(NAME ios_ffmpeg_build_config
-    COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_ffmpeg_build_config.sh")
+    COMMAND "${OLR_SMOKE_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_ffmpeg_build_config.sh")
 set_tests_properties(ios_ffmpeg_build_config PROPERTIES LABELS "smoke;ci" TIMEOUT 10)

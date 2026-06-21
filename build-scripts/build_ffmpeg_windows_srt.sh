@@ -167,12 +167,15 @@ if [ ! -f "ffmpeg-$FFMPEG_VERSION/configure" ]; then
 fi
 
 # ==============================================================================
-# 2. BUILD SRT (CMake + MinGW, shared, no encryption, C++11 std threads)
+# 2. BUILD SRT (CMake + MinGW, shared, no encryption, pthread TLS)
 # ==============================================================================
 echo "[win-srt] building SRT..."
 SRT_SRC="$SRC_DIR/srt-$SRT_VERSION"
 SRT_BUILD="$SRT_SRC/build-win"
 rm -rf "$SRT_BUILD"
+# MinGW's C++11 thread_local teardown in libsrt 1.5.4 is brittle on Windows
+# under short-lived native ingest threads. Use SRT's pthread-key sync/TLS path
+# so per-thread error state is destroyed by libwinpthread instead.
 "$CMAKE_BIN" -S "$SRT_SRC" -B "$SRT_BUILD" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -181,7 +184,7 @@ rm -rf "$SRT_BUILD"
     -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
     -DENABLE_SHARED=ON -DENABLE_STATIC=ON \
     -DENABLE_APPS=ON -DENABLE_ENCRYPTION=OFF \
-    -DENABLE_STDCXX_SYNC=ON \
+    -DENABLE_STDCXX_SYNC=OFF \
     -DCMAKE_INSTALL_PREFIX="$(winpath "$WORK_DIR")/dist/srt"
 "$CMAKE_BIN" --build "$SRT_BUILD"
 "$CMAKE_BIN" --install "$SRT_BUILD"

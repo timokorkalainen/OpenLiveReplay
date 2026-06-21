@@ -11,6 +11,7 @@ SRC="${1:?ndi_marker_mkv_source required}"
 PLAY="${2:?play_harness required}"
 PROBE="${3:?ndi_recv_probe required}"
 SECONDS_RUN="${OLR_NDI_PLAYBACK_SECONDS:-6}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 # Output bus under test: feed (default) | pgm | multiview. play_harness routes the worker's
 # OutputBusEngine render of this bus to the NdiOutputSink. For a single-feed marker at the
 # source's own size, pgm (selected feed) and the 1-cell multiview composite are identity
@@ -20,7 +21,13 @@ case "$BUS" in feed|pgm|multiview) ;; *) echo "FAIL: bad OLR_NDI_OUTPUT_BUS='$BU
 SENDER="OLR NDI Playback ${BUS} $$"
 echo "[ndi-playback] bus=${BUS} seconds=${SECONDS_RUN}"
 
+# shellcheck source=tool_env.sh
+. "$HERE/tool_env.sh"
+olr_prepend_built_tool_paths
+
 command -v ffmpeg >/dev/null || { echo "SKIP: ffmpeg not found"; exit "$SKIP"; }
+olr_ffmpeg_has_demuxer rawvideo || { echo "SKIP: ffmpeg rawvideo demuxer not available"; exit "$SKIP"; }
+olr_ffmpeg_has_demuxer s16le || { echo "SKIP: ffmpeg s16le demuxer not available"; exit "$SKIP"; }
 
 WORK="$(mktemp -d)"
 PLAY_PID=""

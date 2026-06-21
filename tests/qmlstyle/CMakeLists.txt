@@ -14,7 +14,7 @@ add_test(NAME tst_olrstyle
 set_tests_properties(tst_olrstyle PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
 
 # Dev-only headless preview renderer (no add_test): renders a QML file under OlrStyle
 # to a PNG for visual review. Links the style modules so it never dlopens a plugin.

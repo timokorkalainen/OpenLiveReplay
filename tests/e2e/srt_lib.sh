@@ -12,6 +12,11 @@
 # PID (read it immediately, before the next spawn). Call srt_require_tools first.
 # Targets localhost only.
 
+SRT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tool_env.sh
+. "$SRT_LIB_DIR/tool_env.sh"
+olr_prepend_built_tool_paths
+
 SRT_LAST_PID=""
 
 # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit are all present.
@@ -76,6 +81,7 @@ marker_skew_factor() {
 # srt_hevc_vcodec_args, exits 77/SKIP if no HEVC encoder is available).
 # Usage: flash_marker_to_udps <udp_port> [<udp_port> ...]
 flash_marker_to_udps() {
+    olr_ffmpeg_has_muxer tee || { echo "SKIP: ffmpeg tee muxer not available"; exit 0; }
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
     if marker_skew_is_enabled; then
         vflt="${vflt},setpts=PTS*$(marker_skew_factor)"
@@ -90,7 +96,8 @@ flash_marker_to_udps() {
         srt_hevc_vcodec_args || { echo "SKIP: local ffmpeg has no HEVC encoder for the flash marker"; exit 77; }
         vargs=("${SRT_HEVC_VCODEC_ARGS[@]}")
     else
-        vargs=(-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M)
+        olr_h264_vcodec_args || { echo "SKIP: local ffmpeg has no H.264 encoder for the flash marker"; exit 0; }
+        vargs=("${OLR_H264_VCODEC_ARGS[@]}")
     fi
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "color=c=black:s=320x240:r=30" -vf "$vflt" \
@@ -116,6 +123,7 @@ flash_pts_series() {
 # Spawn ONE ffmpeg producer with a co-timed full-frame flash + 1kHz beep (first
 # ~60ms of every source-second), MPEG-TS to a single UDP port. $1=udp_port
 flash_beep_marker_to_udp() {
+    olr_ffmpeg_has_filter volume || { echo "SKIP: ffmpeg volume filter not available"; exit 0; }
     local port="$1"
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
     local aflt="volume=volume='if(lt(mod(t,1),0.06),1,0)':eval=frame"
@@ -125,12 +133,13 @@ flash_beep_marker_to_udp() {
         vflt="${vflt},setpts=PTS*${factor}"
         aflt="${aflt},asetpts=PTS*${factor}"
     fi
+    olr_h264_vcodec_args || { echo "SKIP: local ffmpeg has no H.264 encoder for flash/beep marker"; exit 0; }
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "color=c=black:s=320x240:r=30" \
         -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
         -filter_complex "[0:v]${vflt}[v];[1:a]${aflt}[a]" \
         -map "[v]" -map "[a]" \
-        -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M \
+        "${OLR_H264_VCODEC_ARGS[@]}" \
         -c:a aac -b:a 128k \
         -f mpegts "udp://127.0.0.1:${port}?pkt_size=1316" &
     SRT_LAST_PID=$!
@@ -140,6 +149,7 @@ flash_beep_marker_to_udp() {
 # Spawn ONE ffmpeg producer with co-timed full-frame flash + 1kHz beep plus a
 # burnt-in SMPTE timecode, MPEG-TS to a single UDP port. $1=udp_port
 flash_beep_tc_marker_to_udp() {
+    olr_ffmpeg_has_filter volume || { echo "SKIP: ffmpeg volume filter not available"; exit 0; }
     local port="$1"
     local tc="${OLR_MARKER_TC:-10\\:00\\:00\\:00}"
     local vflt="geq=lum='if(lt(mod(T,1),0.06),235,16)':cb=128:cr=128"
@@ -160,7 +170,8 @@ flash_beep_tc_marker_to_udp() {
         srt_hevc_vcodec_args || { echo "SKIP: no HEVC encoder for TC marker"; exit 77; }
         vargs=("${SRT_HEVC_VCODEC_ARGS[@]}")
     else
-        vargs=(-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g 30 -b:v 4M)
+        olr_h264_vcodec_args || { echo "SKIP: local ffmpeg has no H.264 encoder for TC marker"; exit 0; }
+        vargs=("${OLR_H264_VCODEC_ARGS[@]}")
     fi
     ffmpeg -hide_banner -loglevel error -re \
         -f lavfi -i "color=c=black:s=320x240:r=30" \
