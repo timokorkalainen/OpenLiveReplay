@@ -507,8 +507,10 @@ jobs:
           -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
+      # -k 0 (ninja keep-going) so a first GCC bring-up surfaces every
+      # -Werror diff in one run instead of one-per-push; still exits non-zero.
       - name: Build (app + tests)
-        run: cmake --build build
+        run: cmake --build build -- -k 0
 
       - name: ccache stats
         if: always()
