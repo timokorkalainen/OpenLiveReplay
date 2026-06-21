@@ -90,6 +90,25 @@ elseif(NOT WIN32)
     target_link_libraries(olr_test_nativevideodecoder PUBLIC Qt6::Core)
     target_link_libraries(tst_nativevideodecoder PRIVATE olr_test_nativevideodecoder)
 endif()
+olr_add_unit_test(tst_wingpuimportedge olr_test_playback)
+if(WIN32)
+    add_library(olr_test_wingpuimport STATIC
+        "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/win/d3d11gpusurface.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
+    target_include_directories(olr_test_wingpuimport PRIVATE
+        "${CMAKE_SOURCE_DIR}" "${OLR_FFMPEG_INCLUDE}")
+    target_link_libraries(olr_test_wingpuimport
+        PUBLIC Qt6::Core Qt6::Gui olr_test_playback
+        PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
+    target_link_libraries(tst_wingpuimportedge PRIVATE olr_test_wingpuimport)
+else()
+    add_library(olr_test_wingpuimport STATIC
+        "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge_stub.cpp")
+    target_include_directories(olr_test_wingpuimport PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(olr_test_wingpuimport PUBLIC Qt6::Core)
+    target_link_libraries(tst_wingpuimportedge PRIVATE olr_test_wingpuimport)
+endif()
 olr_add_unit_test(tst_nativeaacdecoder olr_test_core)
 olr_add_unit_test(tst_telemetrytimelinereader olr_test_engine olr_test_playback)
 olr_add_unit_test(tst_replaymanager_telemetry olr_test_engine olr_test_playback)
