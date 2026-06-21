@@ -17,10 +17,12 @@
 # hermetic — the whole temp dir is removed on exit.
 #
 # Modes:
-#   stereo  synthetic stereo sine  -> baseline happy path
-#   mono    synthetic mono   sine  -> regression for the mono-audio SIGBUS crash
+#   stereo    synthetic stereo sine -> baseline happy path
+#   mono      synthetic mono   sine -> regression for the mono-audio SIGBUS crash
+#   rational  stereo, recorded advertising 29.97 (30000/1001) -> asserts the
+#             container carries the true rational rate, not the legacy {30,1}
 #
-# Usage: run_record_e2e.sh <harness_exe> <stereo|mono> [srt_port]
+# Usage: run_record_e2e.sh <harness_exe> <stereo|mono|rational> [srt_port]
 set -uo pipefail
 
 HARNESS="${1:?harness executable path required}"
@@ -35,6 +37,16 @@ srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit prese
 olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 0; }
 
 if [ "$MODE" = "mono" ]; then CH=1; else CH=2; fi
+
+# Rational-rate mode: record advertising 29.97 (30000/1001) and assert the output
+# container carries that exact rate (not the legacy {30,1}). FPS_EXTRA is a plain
+# string expanded unquoted (empty for stereo/mono) to stay bash-3.2/set-u safe.
+FPS_EXTRA=""
+EXPECT_RATE=""
+if [ "$MODE" = "rational" ]; then
+    FPS_EXTRA="--fps-num 30000 --fps-den 1001"
+    EXPECT_RATE="30000/1001"
+fi
 
 WORKDIR="$(mktemp -d)"
 PIDS=()
@@ -65,8 +77,9 @@ sleep 1.0 # let the producer + SRT listener come up before the caller connects
 
 # --- 2. Consumer: the real recording engine (native SRT caller) --------------
 URL="$(srt_caller_url "$SRT_PORT")"
+# shellcheck disable=SC2086 # FPS_EXTRA is intentionally word-split (may be empty).
 HARNESS_OUT="$("$HARNESS" --url "$URL" --name "olr_e2e_${MODE}" --outdir "$WORKDIR" \
-    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30)"
+    --seconds "$SECONDS_TO_RECORD" --width 640 --height 480 --fps 30 $FPS_EXTRA)"
 HARNESS_RC=$?
 
 if [ $HARNESS_RC -ne 0 ]; then
@@ -125,9 +138,34 @@ elif ! awk -v v="$V_LAST" -v a="$A_LAST" 'BEGIN{d=v-a; if(d<0)d=-d; exit !(d<0.7
     fail=1
 fi
 
+# Rational mode: the container must advertise the true rate, not the legacy {30,1}.
+if [ -n "$EXPECT_RATE" ]; then
+    R_RATE="$(scalar -select_streams v:0 -show_entries stream=r_frame_rate)"
+    echo "[e2e] r_frame_rate=${R_RATE:-?} (expect ${EXPECT_RATE})"
+    if [ "${R_RATE:-}" != "$EXPECT_RATE" ]; then
+        echo "FAIL: video r_frame_rate is '${R_RATE:-none}', expected ${EXPECT_RATE} — rational rate not advertised end to end"
+        fail=1
+    fi
+
+    # TIMING GUARD: the advertised 29.97 rate must change METADATA ONLY — it must
+    # NOT leak into the coded video PTS. The muxed video must stay on the integer-fps
+    # ms cadence (~33.333ms = 1000/30), locked to the integer-fps audio, NOT the
+    # 29.97 grid (~33.367ms = 1001000/30000). A regression that rescales the video
+    # PTS through a rational encoder time_base would push the mean interval past the
+    # 33.35ms bound and desync video from audio. Mean over ~180 frames averages out
+    # ms-rounding noise, so the 33.333-vs-33.367 split is robustly distinguishable.
+    VMEAN="$(probe -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 \
+        | awk 'NF{n++; if(n==1)f=$1; l=$1} END{ if(n>1) printf "%.4f",(l-f)*1000/(n-1); else print "nan" }')"
+    echo "[e2e] mean video frame interval=${VMEAN}ms (integer-30=33.333; 29.97-grid=33.367)"
+    if ! awk -v m="${VMEAN:-99}" 'BEGIN{exit !(m+0 > 33.0 && m+0 < 33.35)}'; then
+        echo "FAIL: video frame interval ${VMEAN}ms is off the integer-fps cadence (~33.333ms) — the rational rate leaked into the coded video PTS (A/V drift regression)"
+        fail=1
+    fi
+fi
+
 if [ $fail -ne 0 ]; then
     exit 1
 fi
 
-echo "PASS: e2e recording ($MODE) — stereo A/V, ${V_PACKETS} frames, A/V end-aligned"
+echo "PASS: e2e recording ($MODE) — stereo A/V, ${V_PACKETS} frames, A/V end-aligned${EXPECT_RATE:+, r_frame_rate=$EXPECT_RATE}"
 exit 0

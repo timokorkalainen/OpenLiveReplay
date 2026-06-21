@@ -148,7 +148,7 @@ export QT_QPA_PLATFORM
 
 # The exact selectors the macOS CI jobs used, kept verbatim so local == old CI.
 UNIT_SELECTOR_LE='sync-report|srt|native-apple-ingest|native-rtmp'
-E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
+E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_record_rational_fps|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
 
 # --- 5. Unit suite + playback e2e at native speed (was: Build + Test (macOS)) ---
 # Reuses the delivery build (already compiled with -DOLR_WERROR=ON). The

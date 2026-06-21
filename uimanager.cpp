@@ -1505,6 +1505,7 @@ void UIManager::setRecordFrameRate(int numerator, int denominator) {
         m_currentSettings.fpsNum = rate.numerator;
         m_currentSettings.fpsDen = rate.denominator;
         m_replayManager->setFps(roundedFps);
+        m_replayManager->setFpsRational(rate.numerator, rate.denominator);
         if (m_transport) {
             m_transport->setFrameRate(rate.numerator, rate.denominator);
         }
@@ -2397,6 +2398,7 @@ void UIManager::loadSettings() {
         m_replayManager->setVideoHeight(m_currentSettings.videoHeight);
         m_replayManager->setVideoCodec(m_currentSettings.videoCodec);
         m_replayManager->setFps(m_currentSettings.fps);
+        m_replayManager->setFpsRational(m_currentSettings.fpsNum, m_currentSettings.fpsDen);
 
         // Load the cached benchmark result now that m_currentSettings holds the
         // real persisted values (C1 — the constructor only has defaults at that

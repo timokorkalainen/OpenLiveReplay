@@ -35,8 +35,8 @@ QString ingestFailureKindForLog(IngestFailureKind failure) {
 } // namespace
 
 StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
-                           int targetWidth, int targetHeight, int targetFps,
-                           VideoCodecChoice codec, QObject* parent)
+                           int targetWidth, int targetHeight, int targetFps, int targetFpsNum,
+                           int targetFpsDen, VideoCodecChoice codec, QObject* parent)
     : QThread(parent), m_url(url), m_sourceIndex(sourceIndex), m_viewTrack(-1), m_muxer(muxer),
       m_sharedClock(clock) {
     m_videoCodec = codec;
@@ -47,6 +47,14 @@ StreamWorker::StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, Re
     if (targetWidth > 0) m_targetWidth = targetWidth;
     if (targetHeight > 0) m_targetHeight = targetHeight;
     if (targetFps > 0) m_targetFps = targetFps;
+    // Advertised rational rate: explicit num/den, else the integer {targetFps, 1}.
+    if (targetFpsNum > 0 && targetFpsDen > 0) {
+        m_targetFpsNum = targetFpsNum;
+        m_targetFpsDen = targetFpsDen;
+    } else {
+        m_targetFpsNum = m_targetFps;
+        m_targetFpsDen = 1;
+    }
 }
 
 StreamWorker::~StreamWorker() {
@@ -548,7 +556,7 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     if (m_videoCodec == VideoCodecChoice::H264Hardware) {
         QString err;
         m_nativeEncoder = NativeVideoEncoder::create(
-            {m_targetWidth, m_targetHeight, m_targetFps, 1, 30'000'000}, &err);
+            {m_targetWidth, m_targetHeight, m_targetFpsNum, m_targetFpsDen, 30'000'000}, &err);
         if (!m_nativeEncoder) {
             qWarning() << "Source" << m_sourceIndex
                        << "H.264 hardware encoder unavailable (hardware-only):" << err;
@@ -588,29 +596,34 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
     (*encCtx)->width = m_targetWidth;
     (*encCtx)->height = m_targetHeight;
 
-    // MPEG-2 can only signal a small set of frame rates in its sequence header
-    // (24/25/30/50/60 and the 1000/1001 variants, times a tiny n/d extension).
-    // For any other integer fps the encoder silently writes the NEAREST
-    // representable rate into the elementary stream while our container stamps
-    // {fps,1}, so the file carries contradictory rates and ES-rate-trusting
-    // tools mis-time the video.  Warn so the operator can pick a standard rate.
-    switch (m_targetFps) {
-    case 24:
-    case 25:
-    case 30:
-    case 50:
-    case 60:
-        break; // exactly representable
-    default:
-        qWarning() << "Source" << m_sourceIndex << "fps" << m_targetFps
+    // MPEG-2 can only signal a small set of frame rates in its sequence header:
+    // the integer 24/25/30/50/60 and the 1000/1001 variants (24000/1001,
+    // 30000/1001, 60000/1001). For any other rate the encoder silently writes the
+    // NEAREST representable rate into the elementary stream, so the file would
+    // carry contradictory rates and ES-rate-trusting tools mis-time the video.
+    // Warn so the operator can pick a standard rate.
+    const bool representable =
+        (m_targetFpsDen == 1 &&
+         (m_targetFpsNum == 24 || m_targetFpsNum == 25 || m_targetFpsNum == 30 ||
+          m_targetFpsNum == 50 || m_targetFpsNum == 60)) ||
+        (m_targetFpsDen == 1001 &&
+         (m_targetFpsNum == 24000 || m_targetFpsNum == 30000 || m_targetFpsNum == 60000));
+    if (!representable) {
+        qWarning() << "Source" << m_sourceIndex << "rate" << m_targetFpsNum << "/" << m_targetFpsDen
                    << "is not an exact MPEG-2 rate; the elementary stream will"
-                   << "carry the nearest representable rate (use 24/25/30/50/60"
-                   << "to avoid a container/ES rate mismatch).";
-        break;
+                   << "carry the nearest representable rate (use 24/25/30/50/60 or"
+                   << "their 1000/1001 variants to avoid a container/ES rate mismatch).";
     }
 
-    (*encCtx)->time_base = {1, m_targetFps}; // Internal codec clock
-    (*encCtx)->framerate = {m_targetFps, 1}; // Target framerate
+    // The coding time_base stays on the integer-fps ms grid: the output packet PTS
+    // is rescaled from this time_base to the muxer (av_packet_rescale_ts below), and
+    // it MUST track the integer-fps audio/metadata cadence (m_targetFps), so the
+    // muxed video does not drift against audio for 29.97/59.94. The TRUE rational
+    // rate is signalled only via framerate (the field mpeg2video writes into the
+    // sequence-header frame_rate_code) and via the container avg/r_frame_rate; it
+    // must NOT leak into the coded PTS.
+    (*encCtx)->time_base = {1, m_targetFps}; // Integer-fps coding clock (ms-anchored)
+    (*encCtx)->framerate = {m_targetFpsNum, m_targetFpsDen}; // True rational ES rate
 
     (*encCtx)->pix_fmt = AV_PIX_FMT_YUV420P;
     (*encCtx)->gop_size = 1; // Keep Intra-only for seeking

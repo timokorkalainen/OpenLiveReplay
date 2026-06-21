@@ -61,9 +61,13 @@ public:
 
     // sourceIndex: fixed identity of this source (for logging)
     // initialViewTrack: which muxer track to encode into (-1 = no view assigned)
+    // targetFps is the rounded integer rate (drives the internal ms cadence);
+    // targetFpsNum/targetFpsDen are the rational rate the encoder advertises
+    // (e.g. 30000/1001). 0/0 falls back to {targetFps, 1}.
     StreamWorker(const QString& url, int sourceIndex, Muxer* muxer, RecordingClock* clock,
-                 int targetWidth, int targetHeight, int targetFps,
-                 VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software, QObject* parent = nullptr);
+                 int targetWidth, int targetHeight, int targetFps, int targetFpsNum,
+                 int targetFpsDen, VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software,
+                 QObject* parent = nullptr);
     ~StreamWorker();
 
     // Change the source URL (real FFmpeg reconnect — only for user editing a URL)
@@ -213,7 +217,9 @@ private:
 
     int m_targetWidth = 1920;
     int m_targetHeight = 1080;
-    int m_targetFps = 30;
+    int m_targetFps = 30;    // rounded integer rate (internal ms cadence)
+    int m_targetFpsNum = 30; // advertised rational rate numerator (e.g. 30000)
+    int m_targetFpsDen = 1;  // advertised rational rate denominator (e.g. 1001)
     VideoCodecChoice m_videoCodec = VideoCodecChoice::Mpeg2Software;
 
     // FFmpeg context management
