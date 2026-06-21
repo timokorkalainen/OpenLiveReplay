@@ -73,8 +73,10 @@ bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObjec
 
         recorded = payload;
         recorded.insert(QStringLiteral("feedId"), feedId);
-        recorded.insert(QStringLiteral("olrReceiveMs"), receiveMs);
-        recorded.insert(QStringLiteral("olrEffectiveMs"), effectiveMs);
+        // Cast to qint64: int64_t is `long` on LP64 Linux, which makes the
+        // QJsonValue conversion ambiguous; qint64 (long long) is the exact match.
+        recorded.insert(QStringLiteral("olrReceiveMs"), static_cast<qint64>(receiveMs));
+        recorded.insert(QStringLiteral("olrEffectiveMs"), static_cast<qint64>(effectiveMs));
         recorded.insert(QStringLiteral("olrTelemetryDelayMs"), delayMs);
 
         m_muxer->writeTelemetryPacket(

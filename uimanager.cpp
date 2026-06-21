@@ -323,7 +323,9 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
                 preview.insert(QStringLiteral("projectName"), result.projectName);
                 preview.insert(QStringLiteral("importSettingsUrl"), result.importSettingsUrl);
                 preview.insert(QStringLiteral("telemetrySseUrl"), result.telemetrySseUrl);
-                preview.insert(QStringLiteral("feedCount"), result.sources.size());
+                // qsizetype is `long` on LP64 Linux -> ambiguous QJsonValue ctor.
+                preview.insert(QStringLiteral("feedCount"),
+                               static_cast<qint64>(result.sources.size()));
                 preview.insert(QStringLiteral("metadataFields"), metadataFields);
                 preview.insert(QStringLiteral("feeds"), feeds);
 
