@@ -191,6 +191,8 @@ qt_add_qml_module(OpenLiveReplay
         playback/audioframequeue.h playback/audioframequeue.cpp
         playback/output/outputtypes.h
         playback/output/outputframeclock.h playback/output/outputframeclock.cpp
+        playback/output/framepixelformat.h playback/output/colormetadata.h
+        playback/output/framehandle.h playback/output/framehandle.cpp
         playback/output/mediaframe.h
         playback/output/outputframecache.h playback/output/outputframecache.cpp
         playback/output/outputtargetassignment.h playback/output/outputtargetassignment.cpp
