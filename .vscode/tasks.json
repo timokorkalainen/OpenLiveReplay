@@ -1,0 +1,33 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "cmake",
+      "label": "CMake: build app",
+      "command": "build",
+      "targets": ["OpenLiveReplay"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$gcc"],
+      "detail": "Build the app target with the active CMake preset"
+    },
+    {
+      "type": "cmake",
+      "label": "CMake: build all (incl. tests)",
+      "command": "build",
+      "targets": ["all"],
+      "group": "build",
+      "problemMatcher": ["$gcc"],
+      "detail": "Build everything, including the test suite (OLR_BUILD_TESTS)"
+    },
+    {
+      "type": "shell",
+      "label": "CMake: run tests (ctest)",
+      "command": "ctest",
+      "args": ["--output-on-failure"],
+      "options": { "cwd": "${command:cmake.buildDirectory}" },
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": [],
+      "detail": "Run the CTest suite in the active preset's build directory"
+    }
+  ]
+}

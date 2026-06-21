@@ -38,6 +38,38 @@ A manually-triggered GitHub Actions workflow
 ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs these on
 clean runners and uploads packaged Windows/macOS bundles as artifacts.
 
+### Building in VS Code
+
+The repo ships ready-to-use VS Code configuration for the CMake Tools and the
+official Qt extensions (`.vscode/`). On a fresh checkout:
+
+1. Open the project folder; install the recommended extensions when prompted.
+2. From the CMake Tools status bar, pick the Debug configure preset for your
+   platform (e.g. **macOS (Debug, tests)**).
+3. Use **Build**, **Run**, and **Debug** from the status bar (or
+   `Ctrl`/`Cmd`+`Shift`+`B`); **Run Tests** runs the CTest suite.
+
+Qt is auto-detected from the standard installer locations (`~/Qt/6.*/<kit>`) and
+Homebrew, so macOS/Linux need no setup. If your Qt lives elsewhere, either export
+`OLR_QT_ROOT`, or add a gitignored `CMakeUserPresets.json` that inherits the
+preset and sets the path:
+
+```json
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "macos-debug-local",
+      "inherits": "macos-debug",
+      "cacheVariables": { "CMAKE_PREFIX_PATH": "/path/to/Qt/6.10.1/macos" }
+    }
+  ]
+}
+```
+
+On **Windows**, first build the from-source FFmpeg/SRT dependencies and export the
+`OLR_*` variables (see [`docs/windows-build.md`](docs/windows-build.md)).
+
 Notes on dependencies
 ---------------------
 - The build config downloads or configures native dependencies during CMake configure step, including FFmpeg and RtMidi for macOS and iOS targets.
