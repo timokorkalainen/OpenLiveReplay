@@ -248,7 +248,8 @@ jobs:
           "$QT_ROOT_DIR/bin/qmllint" \
             --unqualified error --Quick.layout-positioning error \
             -I "$LINT_IMPORTS" -I "$QT_ROOT_DIR/qml" \
-            Main.qml MultiviewWindow.qml CodecSettingsPanel.qml
+            Main.qml MultiviewWindow.qml CodecSettingsPanel.qml \
+            ui/components/BindingsPanel.qml
 
       # qmlformat is ADVISORY (report-only): the existing QML predates it, so it is
       # introduced without reformatting the tree (same policy as clang-format).

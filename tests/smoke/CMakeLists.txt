@@ -18,7 +18,8 @@ if(OLR_QMLLINT)
         -I "${_qt_prefix}/qml"
         "${CMAKE_SOURCE_DIR}/Main.qml"
         "${CMAKE_SOURCE_DIR}/MultiviewWindow.qml"
-        "${CMAKE_SOURCE_DIR}/CodecSettingsPanel.qml")
+        "${CMAKE_SOURCE_DIR}/CodecSettingsPanel.qml"
+        "${CMAKE_SOURCE_DIR}/ui/components/BindingsPanel.qml")
     set_tests_properties(qml_smoke PROPERTIES LABELS "smoke;ci" TIMEOUT 60)
     message(STATUS "OpenLiveReplay tests: qml_smoke using ${OLR_QMLLINT}")
 else()
