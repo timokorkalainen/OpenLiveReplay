@@ -1,7 +1,8 @@
 # GPU-Resident Video Pipeline — Design Spec
 
 - **Date:** 2026-06-21
-- **Status:** Draft for review (design approved in brainstorming; spec under review)
+- **Status:** Draft, revised after an independent fresh-agent review (verdict: proceed-with-fixes;
+  all code claims independently verified). Spec under user review.
 - **Scope:** Program-level design. Each subproject below gets its own spec + implementation plan.
 - **Approach:** Keystone-first, strict zero-regression gates. Everything ships behind capability
   flags; the CPU path stays default and becomes the permanent correctness reference + fallback.
@@ -12,17 +13,27 @@
 ## 1. Motivation & goals
 
 Re-architect the playback/output pipeline so decoded frames stay resident as GPU textures from
-decode → composite → output, with CPU readback only at the edges that genuinely require it. The
-user confirmed **all** of the following as drivers (none is secondary):
+decode → composite → output, with CPU readback only at the edges that genuinely require it.
+
+**Load-bearing drivers (committed scope of this program):**
 
 - **CPU headroom / more feeds** — eliminate per-frame GPU→CPU readback, the NV12→I420 deinterleave,
   the nearest-neighbor CPU composite, and the preview upload.
 - **Image quality** — replace nearest-neighbor multiview scaling with GPU bilinear/Lanczos; do
   correct in-shader BT.709/601 color + range instead of today's height-inferred guess.
-- **New GPU-only capabilities** — motion-interpolated slow-mo, GPU overlays/DVE/wipes, real-time
-  effects, eventually 4K/UHD multiview.
-- **Future I/O** — the enumerated-but-unbuilt DeckLink SDI/HDMI and ST2110 IP outputs.
 - **Raw performance** — lower latency and steadier cadence on the ~1 ms output tick.
+- **Future I/O** — the enumerated-but-unbuilt DeckLink SDI/HDMI and ST2110 IP outputs.
+
+**Enabled future capabilities (NOT committed scope; the architecture makes them possible, each
+gets its own spec + correctness strategy later — Phase 5+):**
+
+- **Motion-interpolated slow-mo.** Today's slow-mo is pure frame-repeat
+  (`OutputFrameClock`: `mediaFrameDelta = frameDelta * speed`). True temporal interpolation cannot
+  be validated by the CPU-compositor oracle (§9), so it needs a dedicated subproject with its own
+  reference/perceptual correctness approach — out of scope here, not load-bearing.
+- **GPU overlays / DVE / wipes / real-time effects.** No graphics source or data model exists in
+  the tree today. These are bounded **extension points** the GPU compositor enables, not deliverables
+  of this program.
 
 ### Platforms
 macOS, iOS (both Metal) and Windows (D3D) are **all first-class**. Consequence: a portable shader
@@ -32,8 +43,13 @@ bring-up is deferred to Phase 5 but the edge interface stays platform-symmetric 
 ### Non-goals (YAGNI)
 - No deep decoded replay buffer in VRAM. The existing sliding-window-over-compressed-history model
   is retained (see §2). Deep history stays compressed (MKV).
+- **No 10-bit / HDR in this program.** The pipeline is structurally 8-bit today
+  (`MediaPixelFormat ∈ {Invalid, Yuv420p}`; both codecs 8-bit; the VT decoder pins 8-bit NV12; D2
+  keeps NV12). A 10-bit/HDR path (P010, PQ/HLG, Main10) is a future program; `ColorMetadata.bitDepth`
+  is carried **fixed at 8** for forward-compatibility only.
+- No motion interpolation or overlay/DVE compositing in committed scope (see "Enabled future
+  capabilities" above).
 - No Linux/VAAPI backend (not a current target).
-- No speculative GPU effects beyond what a driver subproject scopes.
 
 ---
 
@@ -43,7 +59,7 @@ The pipeline is fully **CPU-resident** for pixels. The universal frame type is `
 ([playback/output/mediaframe.h](../../../playback/output/mediaframe.h)) — three `QByteArray`
 YUV420P planes in RAM, value/COW semantics.
 
-Per-frame copies across GPU boundaries today:
+Per-frame copies across CPU↔GPU boundaries today (a cross-cutting inventory, not a single pipeline):
 
 1. **Decode (HW) → CPU.** VideoToolbox decodes to an IOSurface-capable `CVPixelBuffer` (NV12),
    then `copyPixelBufferToAvFrame`
@@ -56,22 +72,34 @@ Per-frame copies across GPU boundaries today:
    `SharedCacheSlot` (`shared_ptr<const OutputFrameCache>`,
    [sharedcacheslot.h](../../../playback/output/sharedcacheslot.h)).
 3. **Composite.** `Yuv420pCompositor::composeGrid`
-   ([yuv420pcompositor.cpp:8-61](../../../playback/output/yuv420pcompositor.cpp)) — CPU
-   **nearest-neighbor** grid blit (`scalePlaneNearest`).
-4. **Sinks.** NDI (`packI420`, [ndisink.cpp](../../../playback/output/ndisink.cpp)), Qt preview
-   (`toQVideoFrame` memcpy, [qtpreviewsink.cpp](../../../playback/output/qtpreviewsink.cpp)), and
-   H.264 encode all consume CPU frames. The encoder **re-uploads** a CPU frame to a `CVPixelBuffer`
-   (`makeI420PixelBuffer`,
+   ([yuv420pcompositor.cpp:23-61](../../../playback/output/yuv420pcompositor.cpp), via the
+   file-local `scalePlaneNearest` helper at :8-20) — CPU **nearest-neighbor** grid blit.
+4. **Sinks (playback `OutputDispatcher`).** NDI (`packI420`,
+   [ndisink.cpp](../../../playback/output/ndisink.cpp)) and Qt preview (`toQVideoFrame` memcpy,
+   [qtpreviewsink.cpp](../../../playback/output/qtpreviewsink.cpp)) consume CPU frames.
+   **Separately**, H.264 **encode-on-record** lives in the recorder's `StreamWorker`
+   ([recorder_engine/streamworker.cpp](../../../recorder_engine/streamworker.cpp)) — a distinct
+   jitter-pull pipeline, cleanly disjoint from the playback `OutputDispatcher` — where it
+   **re-uploads** a CPU frame to a `CVPixelBuffer` (`makeI420PixelBuffer`,
    [nativevideoencoder_videotoolbox.mm:27-52](../../../recorder_engine/codec/nativevideoencoder_videotoolbox.mm)).
+   `gpu-encode` (§6) targets that recorder path, not a playback sink.
 
 ### VRAM budget (for a GPU-resident port)
 The decode window is design-bounded at 256 frames (~0.76 GiB at 1080p NV12), **fixed regardless of
-feed count** (8 feeds → 32 frames each). A faithful port that keeps normalized per-feed output
-caches lands ~1.8 GiB at 8×1080p; an efficient port whose compositor samples decode textures
-directly trends toward the ~0.85 GiB floor. On Apple Silicon (unified memory) the "VRAM constraint"
-is mild; it is real on discrete-GPU Windows. **Caveat (from review):** under multiview the peak is
-`N-feeds × window + staging-bank + compositor-output-cache`, not a single flat budget — the GPU
-budget must account for the per-feed multiplier (§6 `gpu-budget`).
+feed count** (8 feeds → 32 frames each; `capFrames` clamps to `max(12, 256/trackCount)`). On Apple
+Silicon (unified memory) the "VRAM constraint" is mild; it is real on discrete-GPU Windows.
+
+The multiview peak is **not** a flat number. The mandated accounting is:
+
+```
+peak ≈ N-feeds × decode-window  +  armed-cut staging bank  +  compositor-output-cache
+```
+
+An earlier "~1.8 GiB at 8×1080p" estimate counted only the first and last terms (decode window +
+normalized per-feed output caches) and must be reconciled against this formula — the staging bank
+(armed-cut second decoder) is an additional resident term. An efficient port whose compositor
+samples decode textures directly trends toward the ~0.85 GiB floor. The GPU budget (§6 `gpu-budget`)
+sizes against the full peak formula, not the flat 256.
 
 ---
 
@@ -90,8 +118,9 @@ budget must account for the per-feed multiplier (§6 `gpu-budget`).
    TrackBuffer / OutputFrameCache  (store handles; metadata-keyed dedup/memo)
           ▼
    ┌────────────────────── RHI spine (portable shaders) ──────────────────────┐
-   │  GPU compositor: YUV→RGB (BT.601/709), bilinear/Lanczos scale, grid,      │
-   │  PGM select, overlays, interpolation                                      │
+   │  GPU compositor: YUV→RGB (BT.601/709), bilinear/Lanczos scale,            │
+   │  grid, PGM select                                                          │
+   │  ── extension points (Phase 5+, not built here): overlays/DVE, interpolation
    └──────────────────────────────┬────────────────────────────────────────────┘
                                    ▼ GpuSurface output
         ┌──────────────── dispatch (fenced) ─────────────────┐
@@ -119,24 +148,35 @@ separating metadata (CPU-cheap) from pixel residency (CPU or GPU).
 
 - **`FrameMetadata`** — `width, height, stride[3], format, feedIndex, ptsMs, outputFrameIndex,
   isPlaceholder` + **`ColorMetadata`** (`matrix` 601/709/2020, `range` video/full, `primaries`,
-  `transfer`, `chromaFormat`, `bitDepth`). This struct — not pixel content — is the key for the
-  dispatcher's identity-skip dedup and the multiview memo descriptor.
-- **`FrameHandle`** — value wrapper over `shared_ptr<const IFrameData>`. **Copy = refcount bump**
-  (cheap, aliasing). Contents immutable, so a handle shared into the memo or a published snapshot is
-  never mutated by a later composite.
+  `transfer`, `chromaFormat`, `bitDepth` — `bitDepth` fixed at 8, see §1 non-goals). This struct —
+  not pixel content — is the key for the dispatcher's identity-skip dedup and the multiview memo
+  descriptor (both are **already** metadata/descriptor-keyed today: `videoHashFor` hashes only
+  metadata, never pixels — so they survive refcounted handles as refcount bumps with no readback).
+- **`FrameHandle`** — value wrapper over `shared_ptr<const IFrameData>` (pixels) **plus a per-handle
+  `FrameMetadata`**. **Copy = refcount bump** of the immutable pixel data; metadata is a cheap
+  per-handle value. This split is load-bearing: today `OutputBusEngine` **mutates** `ptsMs` /
+  `outputFrameIndex` on a COW-shared `MediaVideoFrame` after sharing it
+  ([outputbusengine.cpp](../../../playback/output/outputbusengine.cpp)). An immutable handle cannot
+  allow that, so metadata must be a cheap per-handle override **over shared immutable pixels** — set
+  scalars without touching (or copying) the pixel payload.
 - **`IFrameData`** — `isGpuBacked()`/`isCpuBacked()`; `readToCpu() → CpuPlanes` (no-op for
   CPU-origin, fenced GPU→CPU download for GPU-origin — the single chokepoint every CPU sink funnels
   through); `gpuSurface() → GpuSurface*` (null on CPU frames).
 
-**Copy/equality contract (explicit, from review):** a handle copy is a refcount bump; identity is
-by `FrameMetadata`, never pixel content. A unit test pins that a memoized GPU handle is not mutated
-by a later composite (the multiview memo's byte-identical-reuse and identity-skip must survive
-aliasing).
+**Copy/equality contract (explicit):** a handle copy is a refcount bump of shared pixels; identity
+is by `FrameMetadata`, never pixel content. Concrete unit test: take a memo-aliased handle, override
+`ptsMs`/`outputFrameIndex` on the copy, and assert (a) the pixel payload is byte-identical and
+refcount-shared with the original and (b) the original's metadata is unchanged.
 
-**Zero-regression gate:** Phase 1 ships **CPU-backed only**. `readToCpu()` returns the existing
-`QByteArray` planes; all ~30+ access sites — including `OutputBusFrame`-by-value and
-`MultiviewComposite.video` — funnel through the handle API. The gate is **the entire existing unit
-+ e2e suite byte-for-byte green** before any GPU code exists.
+**Zero-regression gate (precise meaning):** Phase 1 ships **CPU-backed only**. `readToCpu()` returns
+the existing `QByteArray` planes; all ~30+ access sites — including `OutputBusFrame`-by-value,
+`MultiviewComposite.video`, and `TrackBuffer::Frame.frame` — funnel through the handle API.
+**Byte-for-byte green applies to assertion *values* and golden *outputs*, not test *source*.** ~9–10
+unit-test files directly index `.planeY/.planeU/.planeV` (e.g.
+[tst_outputbusengine.cpp](../../../tests/unit/tst_outputbusengine.cpp)) and **will be mechanically
+rewritten** through `readToCpu()`. To bound that churn, provide a thin `MediaVideoFrame`-compatible
+value view backed by `readToCpu()` so plane-indexing test code migrates with minimal edits. The
+product behavior and golden values are unchanged; only test sources edit.
 
 ---
 
@@ -145,7 +185,7 @@ aliasing).
 | # | Decision | Choice | Rationale |
 |---|----------|--------|-----------|
 | D1 | Portable shader spine | **Qt RHI**, native only at import/export edges | All 3 platforms first-class; 3× native multiplies the test matrix; RHI gives WARP determinism on Windows CI. IOSurface/D3D-texture interop is native regardless — isolate at edges. Budget <0.5 ms/frame RHI overhead, **measured in Phase 0** before committing. |
-| D2 | On-GPU canonical layout | **Keep NV12, deinterleave chroma in shader** | Zero import conversion, matches decoder output, lowest VRAM. Cost: golden reconstruction must model NV12 chroma rounding *on top of* nearest-neighbor (see §9). |
+| D2 | On-GPU canonical layout | **Keep NV12, deinterleave chroma in shader** (8-bit only) | Zero import conversion, matches decoder output, lowest VRAM. Cost: golden reconstruction must model NV12 chroma rounding *on top of* nearest-neighbor (see §9). NV12 blocks a 10-bit/P010 path until a future HDR program adds one. |
 | D3 | Golden strategy | **CPU compositor = permanent reference + fallback**; GPU exact on WARP, ±1 LSB on local-GPU lane | macOS has no deterministic headless Metal, so a CPU reference is needed regardless; it doubles as runtime fallback (RHI-unavailable / GPU-OOM). Integer-reconstruct shader math for WARP-exact; reserve ε for vendor-rounding on the local GPU lane. |
 | D4 | GPU threading | **Fenced multi-thread mirroring the snapshot model** + GPU generation counter | Worker produces surfaces, signals a decode-done fence before publish; output thread waits before reading; eviction waits on render fences. Minimal extension of the proven lock-light producer/consumer; directly closes the TSan-invisible races. Single-GPU-thread would serialize decode+dispatch. |
 | D5 | Keep CPU pipeline as runtime fallback | **Yes, permanent**, behind the compositor-select flag, default until GPU proven per-platform | It is the CI oracle, the headless-macOS path, and the safe degradation target. Handle abstraction contains divergence to the compositor + sink-readback layers. |
@@ -157,26 +197,27 @@ aliasing).
 
 ## 6. Subproject decomposition
 
-IDs, dependencies, and sizes. The decomposition incorporates the adversarial review's additions
-(format canonicalization, shader toolchain, AV-sync-under-readback, device-loss, telemetry
-contract, recorder-encode rescope, iOS).
+15 subprojects with IDs, dependencies, and sizes. Incorporates the review's additions (format
+canonicalization, shader toolchain, the **split-out Windows import edge**, AV-sync-under-readback,
+device-loss, telemetry contract, recorder-encode rescope, iOS).
 
 | id | name | depends on | risk | size |
 |----|------|-----------|------|------|
-| `frame-handle` | Opaque ref-counted FrameHandle + FrameMetadata + copy/equality contract; CPU-only, zero-regression | — | high | XL |
-| `color-metadata` | `ColorMetadata` plumbed decode→sink; replace height>576 heuristic; **proven no-op on goldens first** | `frame-handle` | medium | M |
-| `telemetry-contract` | Extend harness counter contract: VRAM occupancy, readback queue depth/drops, fence-wait stalls, GPU-OOM-degrade, **copy-on-GPU-path detector** (makes slice criteria measurable) | `frame-handle` | medium | M |
+| `frame-handle` | Opaque ref-counted FrameHandle + FrameMetadata (per-handle override over shared immutable pixels) + copy/equality contract + compat value-view; CPU-only, zero-regression | — | high | XL |
+| `color-metadata` | `ColorMetadata` plumbed decode→sink; replace height>576 heuristic; **proven no-op on goldens first** (Phase-0 default-tagging must reproduce today's height>576 → BT709/601 + video-range output until a fixture is re-goldened; M size is contingent on the audit finding uniform tags) | `frame-handle` | medium | M |
+| `telemetry-contract` | Extend harness counter contract: VRAM occupancy, readback queue depth/drops, fence-wait stalls, GPU-OOM-degrade, **copy-on-GPU-path detector** (count GPU-backed `readToCpu()` calls, assert ==1 per output frame) | `frame-handle` | medium | M |
 | `format-canon` | Decide + enforce on-GPU chroma layout (D2: NV12 kept, shader deinterleave); every shader/golden/encoder agrees | `frame-handle` | medium | S |
 | `shader-toolchain` | `qt_add_shaders`/`qsb` in CMake, shader source layout, Metal/HLSL/SPIR-V cross-compile, CI shader-compile step | `format-canon` | medium | M |
-| `gpu-abstraction` | `GpuSurface` (IOSurface/CVPixelBuffer, ID3D11Texture2D), RHI device bring-up, VT keep-surface import + lazy `readToCpu`; Windows MF-D3D11 import as parallel deliverable | `frame-handle`, `format-canon` | high | XL |
-| `gpu-sync` | Fences (MTLSharedEvent/D3D12) + GPU generation counter + eviction guard; **explicit lock-hierarchy care** (`m_outputRuntimeMutex → m_bufferMutex`); armed-cut staging swap fence | `gpu-abstraction` | high | L |
-| `gpu-compositor` | RHI grid + PGM select + YUV→RGB + bilinear/Lanczos; CPU compositor retained as reference; GPU texture memo | `gpu-abstraction`, `color-metadata`, `shader-toolchain` | high | L |
-| `async-readback` | `AsyncGpuReadbackSink` (N-deep ring) + `SinkGpuCapability` routing; **PGM sub-frame mode**; **AV-sync-under-lag as hard gate**; NDI migration | `gpu-sync`, `telemetry-contract` | high | L |
-| `gpu-budget` | VRAM-bounded GPU window (per-feed × staging multiplier) + OOM-safe degrade to CPU handle + seek-prefetch | `gpu-sync` | medium | M |
+| `gpu-abstraction` | **macOS** `GpuSurface` (IOSurface/CVPixelBuffer) + RHI device bring-up + VT keep-surface import + lazy `readToCpu`; the cross-platform `GpuSurface`/import edge interface (platform-symmetric) | `frame-handle`, `format-canon` | high | L |
+| `gpu-import-win` | **Windows** MF→`ID3D11Texture2D` import-and-keep edge + RHI D3D interop + minimal import+readback slice; own Phase-0 probe (does MF yield a GPU-resident, RHI-importable texture, and at what reconfig cost — existing D3D11/`IMFDXGIDeviceManager` plumbing is HW-decode-to-CPU only, **not** the import edge) | `frame-handle`, `format-canon`, `gpu-abstraction` | high | L |
+| `gpu-sync` | Fences (MTLSharedEvent/D3D12) + GPU generation counter + eviction guard; **enforced lock rule** (collect victims, release `m_bufferMutex`, *then* fence-wait/free — never fence-wait under the mutex; `makeOutputSnapshot` already enforces `m_outputRuntimeMutex → m_bufferMutex`); armed-cut staging swap fence | `gpu-abstraction` | high | L |
+| `gpu-compositor` | RHI grid + PGM select + YUV→RGB + bilinear/Lanczos; CPU compositor retained as reference; GPU texture memo. (Overlays/interpolation are extension points, not built here.) | `gpu-abstraction`, `color-metadata`, `shader-toolchain` | high | L |
+| `async-readback` | `AsyncGpuReadbackSink` (N-deep ring) + `SinkGpuCapability` routing; **PGM sub-frame mode**; **AV-sync-under-lag as hard gate** (audio travels with the delayed video; OutputBusFrame stays atomic); NDI migration | `gpu-sync`, `telemetry-contract` | high | L |
+| `gpu-budget` | VRAM-bounded GPU window sized against the full peak formula (N-feeds × window + staging-bank + compositor-output-cache) + OOM-safe degrade to CPU handle + seek-prefetch | `gpu-sync` | medium | M |
 | `device-loss` | RHI device-removed detection, surface invalidation, spine rebuild, degrade-to-CPU policy + fault-injection e2e | `gpu-sync` | medium | M |
-| `gpu-encode` | GPU-native encode **rescoped to recorder `StreamWorker`** (separate jitter-pull pipeline), not a playback sink; color VUI authored from `ColorMetadata` | `gpu-sync`, `color-metadata` | medium | M |
+| `gpu-encode` | GPU-native encode **on the recorder `StreamWorker`** (separate jitter-pull pipeline), not a playback sink; color VUI authored from `ColorMetadata` | `gpu-sync`, `color-metadata` | medium | M |
 | `ios-bringup` | iOS Metal bring-up + main-thread-render/thermal handling + smoke tests | `gpu-compositor`, `async-readback` | medium | M |
-| `new-io-targets` | DeckLink SDI/HDMI, ST2110, AJA, OMT sinks — GPU-texture where SDK allows, async readback otherwise | `async-readback`, `gpu-budget` | high | L |
+| `new-io-targets` | DeckLink SDI/HDMI + ST2110 as **GPU-texture-capable hardware** sinks (where the SDK allows); **OMT + AJA as NDI-style async-readback** (CPU-frame software SDKs) | `async-readback`, `gpu-budget` | high | L |
 
 ---
 
@@ -186,19 +227,27 @@ Keystone-first, strict gates. Each phase gates the next; everything behind flags
 
 - **Phase 0 — Gating probes** (mostly measurement; the one code change — requesting IOSurface
   backing on the VT decode session — is the first piece of the real import edge, not a throwaway):
-  1. Confirm VideoToolbox can produce an **IOSurface-backed, RHI-importable** surface and at what
-     reconfig cost (today the decode session does **not** request `kCVPixelBufferIOSurfacePropertiesKey`).
-  2. Measure RHI per-frame overhead vs the <0.5 ms budget (RHI is not currently linked).
-  3. Probe NDI / DeckLink / AJA GPU-texture capability per platform.
-  4. Confirm RHI↔IOSurface / RHI↔D3D-texture interop (`copyTexture` or native detour).
-  5. Audit whether existing golden fixtures carry SPS-VUI / CMFormatDescription color tags; if
+  1. **macOS:** confirm VideoToolbox can produce an **IOSurface-backed, RHI-importable** surface and
+     at what reconfig cost (today the decode session does **not** request
+     `kCVPixelBufferIOSurfacePropertiesKey`).
+  2. **Windows (symmetric):** confirm MF→`ID3D11Texture2D` yields a GPU-resident, RHI-importable
+     texture and at what reconfig cost (existing D3D11 plumbing is HW-decode-to-CPU only).
+  3. Measure RHI per-frame overhead vs the <0.5 ms budget (RHI is not currently linked).
+  4. Probe NDI / DeckLink / AJA / OMT GPU-texture vs CPU-frame capability per platform.
+  5. Confirm RHI↔IOSurface / RHI↔D3D-texture interop (`copyTexture` or native detour).
+  6. Audit whether existing golden fixtures carry SPS-VUI / CMFormatDescription color tags; if
      untagged, define a default-tagging policy so `color-metadata` is a provable no-op.
 - **Phase 1 — Keystone (CPU-only, byte-green gate):** `frame-handle`, `color-metadata` (no-op
   proven), `telemetry-contract`.
 - **Phase 2 — GPU edge + permanent vertical slice:** `format-canon`, `shader-toolchain`,
-  `gpu-abstraction`, and the slice (§8).
-- **Phase 3 — Sync + compositor:** `gpu-sync`, `gpu-compositor`, **multi-feed cap-pressure stress**
-  (the single-feed slice never exercises evict-while-render or VRAM pressure).
+  `gpu-abstraction`, `gpu-import-win` (Windows import+readback slice), and the macOS slice (§8) —
+  **including the early micro-stress probe** (§8) so the two top risks get a signal now, not in
+  Phase 3.
+- **Phase 3 — Sync + compositor:** `gpu-sync`, `gpu-compositor`, **multi-feed cap-pressure stress**.
+  (Correction: the single-feed slice **does** exercise CPU-frame eviction today — the window-derived
+  cap is ~47–111 frames/feed, not 256. What is *unexercised* until here is **concurrent GPU
+  evict-while-render under pressure** and **OOM-degrade** — see §8's micro-stress for the early
+  signal.)
 - **Phase 4 — Output at scale:** `async-readback` (AV-sync-under-lag hard gate + PGM sub-frame
   mode), `gpu-budget`, `device-loss`.
 - **Phase 5 — Capabilities:** `gpu-encode`, `ios-bringup`, `new-io-targets`.
@@ -207,25 +256,36 @@ Keystone-first, strict gates. Each phase gates the next; everything behind flags
 
 ## 8. The permanent vertical slice (Phase 2)
 
-macOS only, one feed, behind `OLR_GPU_PIPELINE` (default off): VideoToolbox decodes H.264 keeping
-the IOSurface-backed `CVPixelBuffer`, wraps it in a GPU-backed `FrameHandle`, flows through the
-existing single-source render path, and reaches Qt preview via one lazy readback. No compositor
-changes, no multiview, no NDI. **Ships and stays** (CPU path remains default + reference).
+macOS, one feed, behind `OLR_GPU_PIPELINE` (default off): VideoToolbox decodes H.264 keeping the
+IOSurface-backed `CVPixelBuffer`, wraps it in a GPU-backed `FrameHandle`, flows through the existing
+single-source render path, and reaches Qt preview via one lazy readback. No compositor changes, no
+multiview, no NDI. **Ships and stays** (CPU path remains default + reference). A **Windows sibling
+slice** (`gpu-import-win`) proves MF→D3D11 import+readback symmetrically.
 
-**Note (from review):** the real preview consumer is `FrameProvider` (holds `m_lastFrame`, serves
+**Note:** the real preview consumer is `FrameProvider` (holds `m_lastFrame`, serves
 `latestImage()→toImage()` for screenshots, broadcasts `QVideoFrame` cross-thread to `QVideoSink` on
-the GUI thread). The slice must address screenshot CPU-QImage path and GUI-thread affinity, not just
-`QtPreviewSink`.
+the GUI thread). The slice must address the screenshot CPU-`QImage` path and GUI-thread affinity, not
+just `QtPreviewSink`.
+
+**Early micro-stress probe (in this slice, not deferred to Phase 3):** with a forced tiny per-track
+frame budget and injected GPU-alloc failure, exercise **concurrent evict-while-render** and
+**OOM-degrade-to-CPU** on the single feed — giving the program's two highest-rated risks a signal
+before `gpu-sync`/`gpu-compositor` land.
 
 **Success criteria:**
-- `OLR_GPU_PIPELINE=0`: entire existing unit + `e2e_play` suite byte-for-byte green (handle
-  migration is a true no-op).
+- `OLR_GPU_PIPELINE=0`: the existing unit + `e2e_play` suite passes with **identical assertion values
+  and golden outputs** (handle migration is behavior-preserving). Test *sources* that index
+  `.planeY/.U/.V` are mechanically migrated via the compat value-view; this is expected churn, not a
+  regression. Playback counters are emitted by `play_harness` and the thresholds asserted by
+  `tests/e2e/run_playback_e2e.sh`.
 - `OLR_GPU_PIPELINE=1` on a GPU-capable macOS host: single-feed `play1x` shows correct picture,
   `placeholderFramesDelta==0`, `heldFramesDelta==0` (no gray flash / stalls from readback).
-- No full-frame GPU→CPU download except the single preview readback (verified by the
-  `copy-on-GPU-path detector` counter from `telemetry-contract`).
+- No full-frame GPU→CPU download except the single preview readback — asserted by the
+  copy-on-GPU-path detector (GPU-backed `readToCpu()` count == 1 per output frame).
 - GPU-surface readback matches CPU-path decode of the same frame within **±1 LSB/channel**.
-- No new ASan/UBSan findings; seek-under-decode stress does not crash or read a freed surface.
+- Micro-stress: concurrent evict-while-render does not read a freed surface; injected GPU-OOM
+  degrades to the CPU handle without crashing the decode loop.
+- No new ASan/UBSan findings; seek-under-decode stress does not crash.
 
 ---
 
@@ -235,17 +295,29 @@ the GUI thread). The slice must address screenshot CPU-QImage path and GUI-threa
   Windows WARP** (integer-reconstructed shader math), **±1 LSB on a local-GPU lane**.
 - **NV12 double-rounding (D2):** the determinism harness must reconstruct goldens from NV12 chroma
   (interleaved UV, shader deinterleave) *plus* nearest-neighbor scaling — two rounding sources, not
-  one. This is an explicit harness requirement, not an afterthought.
+  one. Explicit harness requirement.
 - **GPU race stress as first-class gates** (TSan cannot see GPU command ordering): seek-under-decode,
-  armed-cut-while-render-pending, evict-while-render, frame-checksum validators. Multi-feed +
-  cap-pressure scenario added in Phase 3 (the slice excludes it).
-- **AV-sync under readback lag** (hard gate inside `async-readback`, before NDI migrates): define how
-  audio stays sample-aligned when video is delayed N frames; the **AV-sync MAX gate (100 ms)** and
-  **NDI marker-continuity (`maxGap≤2`)** must pass through the readback path. `OutputBusFrame` carries
-  video+audio together — this is the single most likely regression.
+  armed-cut-while-render-pending, evict-while-render, frame-checksum validators. An early
+  single-feed micro-stress runs in the Phase-2 slice (§8); the full multi-feed cap-pressure scenario
+  lands in Phase 3.
+- **AV-sync under readback lag** (hard gate inside `async-readback`, before NDI migrates).
+  **Direction:** audio travels with the delayed video so `OutputBusFrame` stays atomic — the
+  video+audio pair is read back / dispatched together, preserving sample alignment under N-frame
+  lag. The **AV-sync MAX gate (≤100 ms)** and **NDI marker-continuity (`maxGap≤2`)** must pass
+  through the readback path; these gates live in `tests/e2e/run_sync_e2e.sh` and the NDI
+  recv-probe/analysis + NDI e2e shell drivers (not `play_harness`). `OutputBusFrame` carrying
+  video+audio together is what makes the atomic-pair approach possible — and is the single most
+  likely regression if violated.
+- **Local-monitor lip-sync lead:** the worker-side `AudioPlayer` (real-time `QAudioSink` on the
+  device clock) keeps playing in real time while preview video rides D7's render-N/read-N-2 path,
+  creating a monitor-side audio **lead of ~2 frames (~33 ms @ 60 fps)** that the OutputBusFrame/NDI
+  AV-sync gate structurally cannot observe. PGM gets D7's sub-frame mitigation; **multiview previews
+  do not.** Resolution: either delay `AudioPlayer` to match preview readback, or document and accept
+  the bounded monitor lead — decided in `async-readback`.
 - **Telemetry counter contract** (`telemetry-contract`): existing gate counters
   (`placeholderFramesDelta`, `heldFramesDelta`, `maxClockDivergenceMs`, `decodedVideoFrames`,
-  `stagingVideoFramesDecoded`) keep their meaning; new counters added and asserted in `play_harness`.
+  `stagingVideoFramesDecoded`) keep their meaning; new counters are emitted by the harnesses and the
+  thresholds asserted by the e2e shell drivers.
 - **Concurrency review** (per CLAUDE.md): the playback worker's threading + every `gpu-sync` change
   gets an independent review before merge.
 
@@ -255,35 +327,45 @@ the GUI thread). The slice must address screenshot CPU-QImage path and GUI-threa
 
 | Risk | Mitigation |
 |------|------------|
-| Keystone churn corrupts pipeline (30+ sites + by-value `OutputBusFrame`/`MultiviewComposite`) | Land CPU-only first; whole suite byte-green as gate; explicit copy/equality contract + aliasing unit test |
-| TSan-invisible GPU races | Fences + GPU generation counter + checksum stress gates as first-class |
-| **Lock × fence deadlock** | `TrackBuffer::insert` evicts under `m_bufferMutex` in the decode hot loop; a render-fence wait held across that mutex can cycle with the `m_outputRuntimeMutex → m_bufferMutex` order. Design eviction to drop the mutex before fence-wait; review the lock+fence hierarchy explicitly |
+| Keystone churn corrupts pipeline (30+ sites + by-value `OutputBusFrame`/`MultiviewComposite`/`TrackBuffer::Frame`) | Land CPU-only first; behavior-preserving gate (values + goldens); compat value-view bounds test churn; explicit copy/equality + aliasing unit test |
+| TSan-invisible GPU races | Fences + GPU generation counter + checksum stress gates; early single-feed micro-stress in the Phase-2 slice |
+| **Lock × fence deadlock** | Enforced `gpu-sync` rule: eviction collects victims, **releases `m_bufferMutex`, then** waits on render fences / frees — never fence-wait under the mutex (today eviction is a plain `m_frames.remove()` with no fence; `makeOutputSnapshot` already enforces `m_outputRuntimeMutex → m_bufferMutex`). Add TSan + lock-order annotation checks |
 | Pixel-exact golden loss / NV12 double rounding | CPU reference oracle; integer-reconstruct for WARP-exact; ε only on local-GPU lane; harness models NV12 chroma rounding |
 | Readback stall on 1 ms cadence | Async pipelined, one copy per output frame fanned out; identity-skip dedup; PGM sub-frame mode profiled |
-| **VRAM blowup under multiview** | GPU budget accounts for `N-feeds × window + staging-bank + compositor-output-cache`, not a flat 32–64; OOM-safe degrade to CPU; never let GPU alloc failure crash decode |
+| **VRAM blowup under multiview** | GPU budget sized to the peak formula (N-feeds × window + staging-bank + compositor-output-cache), not a flat 32–64; OOM-safe degrade to CPU; never let GPU alloc failure crash decode |
+| **Two top risks retire late** | Early micro-stress (tiny per-track budget + GPU-alloc-failure injection) in the Phase-2 single-feed slice surfaces evict-while-render + OOM-degrade before Phase 3 |
+| **Hidden second native edge (Windows)** | `gpu-import-win` split out with its own Phase-0 probe, slice, and risk/size — symmetric to the macOS VT edge |
 | GPU device loss (hard-down for live) | `device-loss` subproject: detect, invalidate, rebuild spine, degrade to CPU; fault-injection e2e |
-| Audio drift under readback lag | AV-sync-under-lag hard gate before NDI migration |
-| SDK GPU-capability unknowns | Phase 0 probes; treat forced-readback as `needs-readback`, not blocker |
-| Color regression (zero metadata today) | `color-metadata` early; extract from CMFormatDescription/IMFMediaType/SPS-VUI; round-trip unit test; fixture color-tag audit |
-| Platform-sequencing debt | Keep `GpuSurface` edge interface platform-symmetric; Windows MF-D3D11 import parallel inside `gpu-abstraction` |
+| Audio drift under readback lag / monitor lead | Atomic video+audio pair under lag; explicit AudioPlayer-delay-or-accept decision for the monitor lead |
+| SDK GPU-capability unknowns | Phase 0 probes; OMT/AJA treated as CPU-frame async-readback sinks, not GPU-texture; forced-readback is `needs-readback`, not blocker |
+| Color regression (zero metadata today) | `color-metadata` early; extract from CMFormatDescription/IMFMediaType/SPS-VUI; round-trip unit test; fixture color-tag audit + default-tagging policy |
 
 ---
 
 ## 11. Open questions (resolved in Phase 0)
 
 1. Does the VT decode session yield an IOSurface-backed, RHI-importable buffer, and at what reconfig
-   cost?
-2. Is RHI per-frame overhead within the <0.5 ms budget on representative hardware?
-3. Which sinks (NDI/DeckLink/AJA/Qt preview) actually accept GPU textures per platform?
-4. Does RHI↔IOSurface / RHI↔D3D-texture interop work without a CPU detour?
-5. Do existing golden fixtures carry color tags? If not, what is the default-tagging policy?
-6. Is macOS CI headless (no GPU)? If so, the GPU compositor's automated correctness coverage is
+   cost? (macOS edge)
+2. Does MF→`ID3D11Texture2D` yield a GPU-resident, RHI-importable texture, and at what reconfig
+   cost? (Windows edge, symmetric)
+3. Is RHI per-frame overhead within the <0.5 ms budget on representative hardware?
+4. Which sinks (NDI/DeckLink/AJA/OMT/Qt preview) accept GPU textures vs require CPU frames, per
+   platform?
+5. Does RHI↔IOSurface / RHI↔D3D-texture interop work without a CPU detour?
+6. Do existing golden fixtures carry color tags? If not, what is the default-tagging policy?
+7. Is macOS CI headless (no GPU)? If so, the GPU compositor's automated correctness coverage is
    WARP-on-Windows + local-GPU only — confirm and document.
 
 ---
 
-## 12. Subproject lifecycle
+## 12. Subproject lifecycle & out-of-scope futures
 
 Each subproject (§6) becomes its own `docs/superpowers/specs/` spec + implementation plan when its
 phase is reached, following the existing per-feature spec convention in this directory. This
 document is the program-level umbrella they hang from.
+
+**Explicitly out of this program (future, architecture-enabled):** motion-interpolated slow-mo (needs
+its own correctness strategy — the CPU oracle cannot validate interpolated frames), GPU
+overlays/DVE/wipes (needs a graphics source + data model that does not exist today), and 10-bit/HDR
+(P010/PQ/HLG — blocked by the D2 NV12 choice until a future path adds it). Each is a separate program
+with its own spec; the GPU compositor and `FrameHandle` make them possible but do not deliver them.
