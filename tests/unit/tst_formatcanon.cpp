@@ -1,7 +1,32 @@
 #include <QtTest>
 
 #include "playback/output/formatcanon.h"
+#include "playback/output/framehandle.h"
 #include "playback/output/framepixelformat.h"
+
+namespace {
+
+CpuPlanes makeNv12_4x4() {
+    CpuPlanes planes;
+    planes.format = FramePixelFormat::Nv12;
+    planes.width = 4;
+    planes.height = 4;
+    planes.stride[0] = 4;
+    planes.stride[1] = 4;
+    planes.plane[0] = QByteArray(16, char(100));
+
+    QByteArray uv(8, 0);
+    const uchar us[4] = {10, 11, 12, 13};
+    const uchar vs[4] = {200, 201, 202, 203};
+    for (int i = 0; i < 4; ++i) {
+        uv[2 * i] = char(us[i]);
+        uv[2 * i + 1] = char(vs[i]);
+    }
+    planes.plane[1] = uv;
+    return planes;
+}
+
+} // namespace
 
 class TestFormatCanon : public QObject {
     Q_OBJECT
@@ -11,6 +36,8 @@ private slots:
     void planeShapeMatchesRgba8Layout();
     void absentPlanesAreZero();
     void packedStrideIsWidthTimesBytesPerSample();
+    void nv12DeinterleaveProducesPlanarUV();
+    void nv12RoundTripsByteExact();
 };
 
 void TestFormatCanon::planeShapeMatchesYuv420pLayout() {
@@ -64,6 +91,36 @@ void TestFormatCanon::packedStrideIsWidthTimesBytesPerSample() {
     QCOMPARE(packedStride(FramePixelFormat::Yuv420p, 8, 6, 0), 8);
     QCOMPARE(packedStride(FramePixelFormat::Yuv420p, 8, 6, 1), 4);
     QCOMPARE(packedStride(FramePixelFormat::Nv12, 8, 6, 1), 8);
+}
+
+void TestFormatCanon::nv12DeinterleaveProducesPlanarUV() {
+    const CpuPlanes out = formatcanon::nv12ToYuv420p(makeNv12_4x4());
+    QVERIFY(out.isValid());
+    QCOMPARE(int(out.format), int(FramePixelFormat::Yuv420p));
+    QCOMPARE(out.width, 4);
+    QCOMPARE(out.height, 4);
+    QCOMPARE(out.stride[1], 2);
+    QCOMPARE(out.stride[2], 2);
+    QCOMPARE(out.plane[0], QByteArray(16, char(100)));
+
+    const uchar usExp[4] = {10, 11, 12, 13};
+    const uchar vsExp[4] = {200, 201, 202, 203};
+    for (int i = 0; i < 4; ++i) {
+        QCOMPARE(uchar(out.plane[1].at(i)), usExp[i]);
+        QCOMPARE(uchar(out.plane[2].at(i)), vsExp[i]);
+    }
+}
+
+void TestFormatCanon::nv12RoundTripsByteExact() {
+    const CpuPlanes nv12 = makeNv12_4x4();
+    const CpuPlanes planar = formatcanon::nv12ToYuv420p(nv12);
+    const CpuPlanes back = formatcanon::yuv420pToNv12(planar);
+    QVERIFY(back.isValid());
+    QCOMPARE(int(back.format), int(FramePixelFormat::Nv12));
+    QCOMPARE(back.plane[0], nv12.plane[0]);
+    QCOMPARE(back.plane[1], nv12.plane[1]);
+    QVERIFY(!formatcanon::nv12ToYuv420p(planar).isValid());
+    QVERIFY(!formatcanon::yuv420pToNv12(nv12).isValid());
 }
 
 QTEST_GUILESS_MAIN(TestFormatCanon)
