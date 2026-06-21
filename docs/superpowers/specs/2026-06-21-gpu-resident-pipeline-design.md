@@ -424,9 +424,27 @@ fenceless approximation.
 
 ## 12. Subproject lifecycle & out-of-scope futures
 
-Each subproject (§6) becomes its own `docs/superpowers/specs/` spec + implementation plan when its
-phase is reached, following the existing per-feature spec convention in this directory. This
+Each subproject (§6) becomes its own implementation plan under `docs/superpowers/plans/` when its
+phase is reached, following the existing per-feature plan convention in that directory. This
 document is the program-level umbrella they hang from.
+
+### Phase 0–2 implementation plans (authored)
+
+Detailed TDD plans for the first three phases. The `frame-handle` keystone pins the canonical
+interface contract (`FrameHandle`, `FrameMetadata`, `FramePayloadKey`, `ColorMetadata`,
+`FramePixelFormat`, `IFrameData`) that every downstream plan consumes. Phase-2 GPU plans carry
+explicit Phase-0 probe preconditions and documented fallback branches rather than assuming the
+unknowns are settled.
+
+- **Phase 0:** [gpu-phase0-probes](../plans/2026-06-21-gpu-phase0-probes.md) — 8 gating probes
+  (VT IOSurface, MF→D3D11, RHI overhead, sink capability, interop, color-tag audit).
+- **Phase 1:** [gpu-phase1-frame-handle](../plans/2026-06-21-gpu-phase1-frame-handle.md) (keystone,
+  12 tasks) · [gpu-phase1-color-metadata](../plans/2026-06-21-gpu-phase1-color-metadata.md) ·
+  [gpu-phase1-telemetry-contract](../plans/2026-06-21-gpu-phase1-telemetry-contract.md).
+- **Phase 2:** [gpu-phase2-format-canon](../plans/2026-06-21-gpu-phase2-format-canon.md) ·
+  [gpu-phase2-shader-toolchain](../plans/2026-06-21-gpu-phase2-shader-toolchain.md) ·
+  [gpu-phase2-gpu-abstraction](../plans/2026-06-21-gpu-phase2-gpu-abstraction.md) (incl. the macOS
+  vertical slice) · [gpu-phase2-gpu-import-win](../plans/2026-06-21-gpu-phase2-gpu-import-win.md).
 
 **Explicitly out of this program (future, architecture-enabled):** motion-interpolated slow-mo (needs
 its own correctness strategy — the CPU oracle cannot validate interpolated frames), GPU
