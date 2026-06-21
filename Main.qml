@@ -145,7 +145,7 @@ ApplicationWindow {
             appWindow.recordingError = ""
         }
         function onImportPreviewChanged() {
-            if (sourceListPanel) sourceListPanel.maybeAutoOpenImport()
+            configDrawer.maybeAutoOpenImport()
         }
         function onRecordingWarning(msg) {
             // Soft warning gets its OWN property so that the recordingStarted
@@ -178,331 +178,132 @@ ApplicationWindow {
 
     ColumnLayout {
         anchors.fill: parent
-        anchors.margins: 16
-        spacing: 12
+        spacing: 0
 
-        TabBar {
-            id: mainTabs
+        StatusStrip {
+            id: statusStrip
+
             Layout.fillWidth: true
 
-            TabButton { text: "Control" }
-            TabButton { text: "Playback" }
-            TabButton { text: "Project" }
+            ui: appWindow.uiManagerRef
+            configOpen: configDrawer.opened
+            recordingError: appWindow.recordingError
+            onToggleConfig: configDrawer.opened ? configDrawer.close() : configDrawer.open()
+            onFullscreenMultiviewRequested: (x, y) => {
+                appWindow.refreshScreenOptions()
+                screenMenu.x = x
+                screenMenu.y = y
+                screenMenu.open()
+            }
         }
 
-        StackLayout {
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: warningText.implicitHeight + Theme.s2 * 2
+            visible: appWindow.recordingWarningText !== ""
+            color: "#2b2615"
+            border.color: "#5b4818"
+            border.width: 1
+
+            Text {
+                id: warningText
+
+                anchors.fill: parent
+                anchors.margins: Theme.s2
+                text: "Warning: " + appWindow.recordingWarningText
+                color: "#ffb300"
+                wrapMode: Text.WordWrap
+                verticalAlignment: Text.AlignVCenter
+            }
+        }
+
+        PgmStage {
+            id: pgmStage
+
             Layout.fillWidth: true
             Layout.fillHeight: true
-            currentIndex: mainTabs.currentIndex
+            ui: appWindow.uiManagerRef
+        }
 
-            // --- Control Tab ---
+        GroupBox {
+            id: playbackTelemetryPanel
+
+            title: "Telemetry"
+            Layout.fillWidth: true
+            Layout.preferredHeight: 110
+            visible: telemetryRows.length > 0
+            property var telemetryRows: appWindow.uiManagerRef.telemetryVersion >= 0
+                                        ? appWindow.uiManagerRef.telemetryRowsAtPlayhead()
+                                        : []
+
             ScrollView {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                contentWidth: availableWidth
-                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
-                ColumnLayout {
-                    width: parent.width
-                    spacing: 16
-                    Layout.fillWidth: true
-
-                    Text {
-                        text: "Runtime Control"
-                        font.bold: true
-                        color: "#eeeeee"
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 12
-
-                        Button {
-                            id: recordButton
-                            text: appWindow.uiManagerRef.isRecording ? "STOP RECORDING" : "START RECORDING"
-                            padding: 18
-
-                            background: Rectangle {
-                                color: appWindow.uiManagerRef.isRecording ? "#d32f2f" : "#2e7d32"
-                                radius: 6
-                            }
-
-                            contentItem: Text {
-                                text: recordButton.text
-                                horizontalAlignment: Text.AlignHCenter
-                                verticalAlignment: Text.AlignVCenter
-                            }
-
-                            onClicked: appWindow.uiManagerRef.isRecording ? appWindow.uiManagerRef.stopRecording() : appWindow.uiManagerRef.startRecording()
-                        }
-
-                        Item { Layout.fillWidth: true }
-
-                        Button {
-                            id: multiviewMenuButton
-                            text: "Fullscreen Multiview ▾"
-                            padding: 12
-                            onClicked: {
-                                appWindow.refreshScreenOptions()
-                                screenMenu.x = 0
-                                screenMenu.y = multiviewMenuButton.height + 4
-                                screenMenu.open()
-                            }
-
-                            Menu {
-                                id: screenMenu
-                                Repeater {
-                                    model: appWindow.screenOptions
-                                    delegate: MenuItem {
-                                        id: screenMenuItem
-                                        required property var modelData
-                                        text: modelData.label
-                                        onTriggered: appWindow.makeScreenHandler(modelData.index)()
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    Text {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        text: appWindow.recordingError !== ""
-                              ? ("⚠ " + appWindow.recordingError)
-                              : (appWindow.uiManagerRef.isRecording ? "● RECORDING LIVE" : "IDLE")
-                        color: appWindow.recordingError !== ""
-                               ? "#ffb300"
-                               : (appWindow.uiManagerRef.isRecording ? "#ff5252" : "#666")
-                    }
-
-                    // Soft recording warning (e.g. feeds exceed the benchmarked safe
-                    // count). Separate from recordingError so onRecordingStarted /
-                    // onRecordingFailed (which clear recordingError) cannot erase it;
-                    // auto-dismissed by recordingWarningDismissTimer. (C2)
-                    Text {
-                        Layout.fillWidth: true
-                        wrapMode: Text.WordWrap
-                        visible: appWindow.recordingWarningText !== ""
-                        text: "⚠ " + appWindow.recordingWarningText
-                        color: "#ffb300"
-                    }
-
-                    RowLayout {
-                        Layout.fillWidth: true
-                        spacing: 12
-
-                        Text {
-                            text: "Multiview Views"
-                            color: "#eeeeee"
-                            Layout.alignment: Qt.AlignVCenter
-                        }
-
-                        SpinBox {
-                            from: 1
-                            to: 16
-                            stepSize: 1
-                            editable: true
-                            inputMethodHints: Qt.ImhDigitsOnly
-                            value: appWindow.uiManagerRef.multiviewCount
-                            enabled: !appWindow.uiManagerRef.isRecording
-                            onValueModified: appWindow.uiManagerRef.multiviewCount = value
-                        }
-
-                        Item { Layout.fillWidth: true }
-                    }
-
-                    BindingsPanel {
-                        Layout.fillWidth: true
-                        ui: appWindow.uiManagerRef
-                    }
-                }
-            }
-
-            // --- Playback Tab ---
-            ColumnLayout {
-                id: playbackTab
-                spacing: 12
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-
-                PgmStage {
-                    id: pgmStage
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    ui: appWindow.uiManagerRef
-                }
-
-                GroupBox {
-                    id: playbackTelemetryPanel
-                    title: "Telemetry"
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 110
-                    visible: telemetryRows.length > 0
-                    property var telemetryRows: appWindow.uiManagerRef.telemetryVersion >= 0
-                                                ? appWindow.uiManagerRef.telemetryRowsAtPlayhead()
-                                                : []
-
-                    ScrollView {
-                        anchors.fill: parent
-                        clip: true
-                        contentWidth: availableWidth
-                        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-
-                        ColumnLayout {
-                            width: parent.width
-                            spacing: 6
-
-                            Repeater {
-                                model: playbackTelemetryPanel.telemetryRows
-
-                                delegate: RowLayout {
-                                    id: telemetryRow
-                                    required property var modelData
-                                    width: parent.width
-                                    spacing: 10
-
-                                    Text {
-                                        text: {
-                                            var name = telemetryRow.modelData.feedName || ""
-                                            var idText = telemetryRow.modelData.feedId || ""
-                                            return name.length > 0 ? (idText + " " + name) : idText
-                                        }
-                                        color: "#eeeeee"
-                                        font.bold: true
-                                        elide: Text.ElideRight
-                                        Layout.preferredWidth: 180
-                                    }
-
-                                    Text {
-                                        text: telemetryRow.modelData.summary || ""
-                                        color: "#b0b0b0"
-                                        elide: Text.ElideRight
-                                        Layout.fillWidth: true
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                TransportDock {
-                    Layout.fillWidth: true
-                    ui: appWindow.uiManagerRef
-                }
-            }
-
-            // --- Project Tab --- (vertically scrollable: its stacked settings exceed any
-            // normal window height. Content is pinned to the viewport width, so wide blocks
-            // — the NDI Outputs table, source rows — scroll within their own inner views.)
-            ScrollView {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                contentWidth: availableWidth
+                anchors.fill: parent
                 clip: true
+                contentWidth: availableWidth
                 ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
                 ColumnLayout {
-                    id: projectTab
-                    spacing: 12
                     width: parent.width
+                    spacing: 6
 
-                    ProjectSettingsPanel {
-                        Layout.fillWidth: true
-                        ui: appWindow.uiManagerRef
-                        onBrowseFolderRequested: folderDialog.open()
-                    }
+                    Repeater {
+                        model: playbackTelemetryPanel.telemetryRows
 
-                    OutputsPanel {
-                        Layout.fillWidth: true
-                        ui: appWindow.uiManagerRef
-                    }
+                        delegate: RowLayout {
+                            id: telemetryRow
+                            required property var modelData
+                            width: parent.width
+                            spacing: 10
 
-                GroupBox {
-                    title: "External Input Settings"
-                    Layout.fillWidth: true
-
-                    ColumnLayout {
-                        anchors.fill: parent
-                        spacing: 8
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 8
-
-                            TextField {
-                                id: importSettingsUrlField
-                                Layout.fillWidth: true
-                                text: appWindow.uiManagerRef.importSettingsUrl
-                                placeholderText: "https://provider.example/project-settings.json"
-                                enabled: !appWindow.uiManagerRef.isRecording
-                                onEditingFinished: appWindow.uiManagerRef.importSettingsUrl = text
-                            }
-
-                            Button {
-                                text: "Read Settings"
-                                enabled: !appWindow.uiManagerRef.isRecording
-                                onClicked: {
-                                    appWindow.uiManagerRef.importSettingsUrl = importSettingsUrlField.text
-                                    appWindow.uiManagerRef.readImportSettings()
+                            Text {
+                                text: {
+                                    var name = telemetryRow.modelData.feedName || ""
+                                    var idText = telemetryRow.modelData.feedId || ""
+                                    return name.length > 0 ? (idText + " " + name) : idText
                                 }
-                            }
-                        }
-
-                        Text {
-                            visible: appWindow.uiManagerRef.importPreviewError !== ""
-                            text: appWindow.uiManagerRef.importPreviewError
-                            color: "#ff9800"
-                            wrapMode: Text.WordWrap
-                            Layout.fillWidth: true
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 8
-
-                            Button {
-                                visible: appWindow.uiManagerRef.importPreviewReady
-                                text: "Preview Imported Sources"
-                                enabled: appWindow.uiManagerRef.importPreviewReady
-                                onClicked: sourceListPanel.openImportPreview()
+                                color: "#eeeeee"
+                                font.bold: true
+                                elide: Text.ElideRight
+                                Layout.preferredWidth: 180
                             }
 
                             Text {
-                                visible: appWindow.uiManagerRef.importPreviewReady
-                                text: {
-                                    var p = appWindow.uiManagerRef.importPreview
-                                    var count = p.feedCount !== undefined ? p.feedCount : ((p.feeds || []).length)
-                                    return count + " imported feed" + (count === 1 ? "" : "s") + " ready"
-                                }
-                                color: "#8bc34a"
-                                Layout.alignment: Qt.AlignVCenter
+                                text: telemetryRow.modelData.summary || ""
+                                color: "#b0b0b0"
+                                elide: Text.ElideRight
+                                Layout.fillWidth: true
                             }
-
-                            Item { Layout.fillWidth: true }
                         }
                     }
                 }
-
-                SourceListPanel {
-                    id: sourceListPanel
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    ui: appWindow.uiManagerRef
-                }
-
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 10
-
-                    Button {
-                        text: "Save Config"
-                        onClicked: appWindow.uiManagerRef.saveSettings()
-                    }
-
-                    Item { Layout.fillWidth: true }
-                }
             }
-            } // ScrollView (Project tab)
         }
+
+        TransportDock {
+            Layout.fillWidth: true
+            ui: appWindow.uiManagerRef
+        }
+    }
+
+    Menu {
+        id: screenMenu
+
+        Repeater {
+            model: appWindow.screenOptions
+            delegate: MenuItem {
+                id: screenMenuItem
+                required property var modelData
+                text: modelData.label
+                onTriggered: appWindow.makeScreenHandler(modelData.index)()
+            }
+        }
+    }
+
+    ConfigDrawer {
+        id: configDrawer
+
+        ui: appWindow.uiManagerRef
+        parent: Overlay.overlay
+        onBrowseFolderRequested: folderDialog.open()
     }
 }
