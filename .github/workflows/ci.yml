@@ -349,17 +349,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Empty build_targets => build the whole suite and run the full unit label.
+          # Empty build_targets => build the whole suite and run the full unit
+          # label; a non-empty list builds only those threading targets. The
+          # ctest selector itself is chosen by label in the run step.
           - sanitizer: "address;undefined"
             label: asan-ubsan
             advisory: false
             build_targets: ""
-            ctest_selector: "-L unit -LE sync-report|srt|native-apple-ingest|native-rtmp"
           - sanitizer: "thread"
             label: tsan
             advisory: false
             build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine"
-            ctest_selector: "-R ^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine)$"
     continue-on-error: ${{ matrix.advisory }}
     steps:
       - uses: actions/checkout@v4
@@ -433,8 +433,16 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1
-        # asan-ubsan runs the whole unit label; tsan runs the threading cases.
-        run: ctest --output-on-failure --repeat until-pass:2 ${{ matrix.ctest_selector }}
+        # Branch by label so the regex/exclude selectors stay correctly quoted
+        # (shell metacharacters like ( | $ must not be word-split by the runner).
+        run: |
+          if [ "${{ matrix.label }}" = "tsan" ]; then
+            ctest --output-on-failure --repeat until-pass:2 \
+              -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine)$'
+          else
+            ctest --output-on-failure --repeat until-pass:2 \
+              -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+          fi
 
   # ---------------------------------------------------------------------------
   # Second toolchain: build the app + tests with GCC on Linux and run the unit

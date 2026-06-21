@@ -202,8 +202,11 @@ public:
         if (!m_receiver || !m_recvCapture) {
             return Capture::Error;
         }
-        std::memset(&m_lastVideo, 0, sizeof(m_lastVideo));
-        std::memset(&m_lastAudio, 0, sizeof(m_lastAudio));
+        // Value-initialize rather than memset: these NDI frame structs are
+        // non-trivial (member initializers), which GCC flags under
+        // -Werror=class-memaccess. The capture call overwrites them anyway.
+        m_lastVideo = {};
+        m_lastAudio = {};
         const NDIlib_frame_type_e type =
             m_recvCapture(m_receiver, &m_lastVideo, &m_lastAudio, nullptr, uint32_t(timeoutMs));
         if (type == NDIlib_frame_type_video && video) {
