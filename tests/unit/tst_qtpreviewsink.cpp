@@ -10,6 +10,7 @@ class TestQtPreviewSink : public QObject {
     Q_OBJECT
 private slots:
     void deliverMediaFrameUpdatesProviderLatestImage();
+    void frameProviderDeliverHandleUpdatesLatestImage();
     void deliverBusEngineFrameUpdatesProviderLatestImage();
     void outputSinkEndpointDeliversOnlyWhenStarted();
     void colorMetadataRoundTripsDecodeToSink();
@@ -25,6 +26,19 @@ void TestQtPreviewSink::deliverMediaFrameUpdatesProviderLatestImage() {
     frame.metadata().key.ptsMs = 123;
     frame.metadata().outputFrameIndex = 9;
     QVERIFY(sink.deliver(frame));
+
+    QImage image = provider.latestImage();
+    QVERIFY(!image.isNull());
+    QCOMPARE(image.width(), 4);
+    QCOMPARE(image.height(), 4);
+}
+
+void TestQtPreviewSink::frameProviderDeliverHandleUpdatesLatestImage() {
+    FrameProvider provider;
+
+    FrameHandle frame = solidYuv420pHandle(4, 4, 80, 128, 128);
+    frame.metadata().key.ptsMs = 123;
+    provider.deliverHandle(frame);
 
     QImage image = provider.latestImage();
     QVERIFY(!image.isNull());

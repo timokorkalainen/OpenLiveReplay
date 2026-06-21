@@ -34,6 +34,9 @@ extern "C" {
 
 ColorMetadata colorMetadataForAvFrame(const AVFrame* frame);
 
+class DecodeDoneFence;
+class GpuRhiContext;
+
 struct DecoderTrack {
     AVCodecContext* codecCtx = nullptr;
     // Hardware H.264 decode: when set, this track is decoded via NativeVideoDecoder
@@ -85,6 +88,10 @@ public:
         // at 0, so the H.264 armed-cut gate asserts a floor on it. Counts both the
         // native (H.264) and the FFmpeg (MPEG-2) staging paths.
         qint64 stagingVideoFramesDecoded = 0;
+        // GPU-backed frames materialized to CPU planes. Stays 0 on the CPU path;
+        // Phase-2 macOS GPU playback increments it only when a sink/preview asks
+        // a GpuFrameData to read back.
+        qint64 gpuReadToCpuCount = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
@@ -124,7 +131,7 @@ public:
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
     void stop();
 
-    PlaybackCounters counters() const { return m_counters; }
+    PlaybackCounters counters() const;
     OutputDispatchStats outputStats() const;
     // The committed cache generation (set at repositionTo's tail). >=1 after a
     // real reposition proves a target was decoded and committed to the cache.
@@ -361,6 +368,8 @@ private:
     SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
+    std::shared_ptr<GpuRhiContext> m_gpuRhi;
+    std::shared_ptr<DecodeDoneFence> m_decodeFence;
     int m_outputFeedCount = 0;
     int m_outputWidth = 1920;
     int m_outputHeight = 1080;

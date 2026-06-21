@@ -8,6 +8,15 @@
 #include "playback/output/qtpreviewsink.h"
 #include "playback/output/queuedoutputsink.h"
 #include "recorder_engine/ingest/colorvui.h"
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/decodedonefence.h"
+#include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpurhicontext.h"
+#ifdef __APPLE__
+#include "playback/gpu/vtkeepsurfaceimporter.h"
+#endif
+#endif
 #include <QDebug>
 #include <QMutexLocker>
 #include <QElapsedTimer>
@@ -16,6 +25,20 @@
 #include <cstdint>
 #include <cstring>
 #include <utility>
+
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
+namespace {
+
+ColorMetadata colorMetadataForNativeTrack(const DecoderTrack* track) {
+    VuiColorInfo vui;
+    if (track && !track->h264ParamSets.h264Sps.isEmpty()) {
+        vui = parseSpsColorVui(NativeVideoCodec::H264, track->h264ParamSets.h264Sps.first());
+    }
+    return resolveColorMetadata(vui, track ? track->codecHeight : 0, 2, 2, 2, 2);
+}
+
+} // namespace
+#endif
 
 PlaybackWorker::PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
                                AudioPlayer* audioPlayer, QObject* parent)
@@ -122,6 +145,14 @@ void PlaybackWorker::setExternalOutputTargets(const QList<OutputTargetAssignment
 OutputDispatchStats PlaybackWorker::outputStats() const {
     QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
     return m_outputRuntime ? m_outputRuntime->stats() : OutputDispatchStats{};
+}
+
+PlaybackWorker::PlaybackCounters PlaybackWorker::counters() const {
+    PlaybackCounters counters = m_counters;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    counters.gpuReadToCpuCount = gpuFrameReadToCpuCount();
+#endif
+    return counters;
 }
 
 void PlaybackWorker::stop() {
@@ -291,6 +322,19 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_outputFeedCount = qMax(0, feedCount);
     m_outputWidth = qMax(2, width);
     m_outputHeight = qMax(2, height);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    gpuResetFrameReadToCpuCount();
+    m_gpuRhi.reset();
+    m_decodeFence.reset();
+    if (gpuPipelineEnabled()) {
+        m_gpuRhi = GpuRhiContext::create();
+        if (!m_gpuRhi || !m_gpuRhi->isValid()) {
+            m_gpuRhi.reset();
+        } else {
+            m_decodeFence = DecodeDoneFence::create();
+        }
+    }
+#endif
     {
         QMutexLocker bufferLocker(&m_bufferMutex);
         m_outputCache =
@@ -332,6 +376,10 @@ void PlaybackWorker::shutdownOutputGraph() {
         m_publishedCache.publish(nullptr);
     }
     m_outputFeedCount = 0;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    m_decodeFence.reset();
+    m_gpuRhi.reset();
+#endif
 }
 
 void PlaybackWorker::rebuildOutputEndpoints() {
@@ -548,7 +596,13 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                                              int dir, int trackCount, bool decimate,
                                              int decimateStep, bool audioOn, bool dedupTail) {
     int64_t lastVideoPtsMs = INT64_MIN;
-    const int cap = capFrames(trackCount);
+    int cap = capFrames(trackCount);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (gpuPipelineEnabled()) {
+        const int forcedBudget = gpuForcedPerTrackBudget();
+        if (forcedBudget > 0) cap = forcedBudget;
+    }
+#endif
     // Protect the active fill range in the travel direction (spec §6.6) so the
     // cap can never evict a frame the window still needs:
     //   forward: [P, P + kLeadMs]   reverse: [P - kLeadMs, P]
@@ -566,8 +620,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
             const uint8_t* end = p + pkt->size;
             static const char kStartCode[4] = {'\x00', '\x00', '\x00', '\x01'};
             while (p + 4 <= end) {
-                const uint32_t nalLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16)
-                                      | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+                const uint32_t nalLen = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
+                                        (uint32_t(p[2]) << 8) | uint32_t(p[3]);
                 p += 4;
                 if (nalLen == 0 || p + nalLen > end) break;
                 annexB.append(kStartCode, 4);
@@ -581,11 +635,88 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                 CompressedAccessUnit unit;
                 unit.codec = NativeVideoCodec::H264;
                 unit.parameterSets = track->h264ParamSets;
-                unit.pts90k = (pktPts != AV_NOPTS_VALUE)
-                    ? av_rescale_q(pktPts, tb, {1, 90000}) : -1;
-                unit.dts90k = (pkt->dts != AV_NOPTS_VALUE)
-                    ? av_rescale_q(pkt->dts, tb, {1, 90000}) : -1;
+                unit.pts90k =
+                    (pktPts != AV_NOPTS_VALUE) ? av_rescale_q(pktPts, tb, {1, 90000}) : -1;
+                unit.dts90k =
+                    (pkt->dts != AV_NOPTS_VALUE) ? av_rescale_q(pkt->dts, tb, {1, 90000}) : -1;
                 unit.annexB = annexB;
+
+                auto packetPtsMs = [&]() -> int64_t {
+                    if (pktPts != AV_NOPTS_VALUE) return av_rescale_q(pktPts, tb, {1, 1000});
+                    return (lastVideoPtsMs != INT64_MIN) ? lastVideoPtsMs + frameDurMs() : P;
+                };
+
+                auto commitMediaFrame = [&](FrameHandle mediaFrame, int64_t framePtsMs) -> bool {
+                    mediaFrame.metadata().key.ptsMs = framePtsMs;
+                    if (!mediaFrame.isPresentable()) return false;
+                    QMutexLocker bufferLocker(&m_bufferMutex);
+                    if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
+                        m_counters.framesDropped++;
+                    if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
+                    m_counters.decodedVideoFrames++;
+                    return true;
+                };
+
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
+                if (m_gpuRhi && m_gpuRhi->isValid()) {
+                    const int savedDecimateCounter = track->decimateCounter;
+                    bool gpuCallback = false;
+                    bool gpuInserted = false;
+                    bool gpuFallback = false;
+                    auto handleSurface = [&](void* imageBuffer, qint64 /*pts90k*/) {
+                        gpuCallback = true;
+                        bool keep = true;
+                        if (decimate) {
+                            keep = (track->decimateCounter % decimateStep) == 0;
+                            track->decimateCounter++;
+                        }
+                        if (!keep) return;
+
+                        const int64_t framePtsMs = packetPtsMs();
+                        if (dedupTail) {
+                            int64_t nv;
+                            {
+                                QMutexLocker bufferLocker(&m_bufferMutex);
+                                nv = track->buffer.newestPts();
+                            }
+                            if (nv >= 0 && framePtsMs <= nv) return;
+                        }
+
+                        if (gpuConsumeInjectedAllocFailure()) {
+                            gpuFallback = true;
+                            return;
+                        }
+
+                        FrameMetadata meta;
+                        meta.key.feedIndex = track->feedIndex;
+                        meta.key.ptsMs = framePtsMs;
+                        meta.key.format = FramePixelFormat::Nv12;
+                        meta.key.width = track->codecWidth;
+                        meta.key.height = track->codecHeight;
+                        meta.color = colorMetadataForNativeTrack(track);
+
+                        FrameHandle mediaFrame = importVtImageBuffer(imageBuffer, meta, m_gpuRhi);
+                        if (!mediaFrame.isPresentable()) {
+                            gpuFallback = true;
+                            return;
+                        }
+                        if (m_decodeFence) m_decodeFence->signalDecodeDone();
+                        gpuInserted = commitMediaFrame(mediaFrame, framePtsMs);
+                        if (!gpuInserted) gpuFallback = true;
+                        lastVideoPtsMs = framePtsMs;
+                    };
+
+                    QString gpuError;
+                    const bool decodedSurface =
+                        track->nativeDecoder->decodeKeepSurface(unit, handleSurface, &gpuError);
+                    if (gpuInserted || (decodedSurface && gpuCallback && !gpuFallback)) {
+                        return lastVideoPtsMs;
+                    }
+
+                    track->decimateCounter = savedDecimateCounter;
+                    lastVideoPtsMs = INT64_MIN;
+                }
+#endif
 
                 // Count-based decimation applies per decoded frame.
                 auto handleFrame = [&](AVFrame* nativeVf) {
@@ -600,12 +731,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     }
 
                     // Restore PTS in ms from the packet's time_base.
-                    int64_t framePtsMs;
-                    if (pktPts != AV_NOPTS_VALUE) {
-                        framePtsMs = av_rescale_q(pktPts, tb, {1, 1000});
-                    } else {
-                        framePtsMs = (lastVideoPtsMs != INT64_MIN) ? lastVideoPtsMs + frameDurMs() : P;
-                    }
+                    const int64_t framePtsMs = packetPtsMs();
 
                     if (dedupTail) {
                         int64_t nv;
@@ -623,14 +749,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     // dereferenced unconditionally above, so it is never null here.
                     // NOLINTNEXTLINE(clang-analyzer-core.CallAndMessage)
                     FrameHandle mediaFrame = convertToMediaVideoFrame(nativeVf, track->feedIndex);
-                    mediaFrame.metadata().key.ptsMs = framePtsMs;
-                    if (mediaFrame.isValid()) {
-                        QMutexLocker bufferLocker(&m_bufferMutex);
-                        if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
-                            m_counters.framesDropped++;
-                        if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
-                        m_counters.decodedVideoFrames++;
-                    }
+                    commitMediaFrame(mediaFrame, framePtsMs);
                     lastVideoPtsMs = framePtsMs;
                     av_frame_free(&nativeVf);
                 };

@@ -91,7 +91,7 @@ public:
     CpuPlanes readToCpu(FramePixelFormat target = FramePixelFormat::Yuv420p) const;
     bool isGpuBacked() const { return m_data && m_data->isGpuBacked(); }
     bool isValid() const;
-    bool isPresentable() const { return isValid(); }
+    bool isPresentable() const;
 
 private:
     std::shared_ptr<const IFrameData> m_data;

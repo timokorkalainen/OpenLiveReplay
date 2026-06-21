@@ -411,6 +411,7 @@ elseif(NOT WIN32)
 endif()
 
 if(OLR_GPU_PIPELINE)
+    target_compile_definitions(OpenLiveReplay PRIVATE OLR_GPU_PIPELINE_BUILD=1)
     target_link_libraries(OpenLiveReplay PRIVATE Qt6::GuiPrivate)
     if(APPLE)
         target_sources(OpenLiveReplay PRIVATE

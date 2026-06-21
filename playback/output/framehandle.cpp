@@ -94,6 +94,13 @@ bool FrameHandle::isValid() const {
            readToCpu(FramePixelFormat::Yuv420p).isValid();
 }
 
+bool FrameHandle::isPresentable() const {
+    if (!m_data || m_meta.key.width <= 0 || m_meta.key.height <= 0) return false;
+    if (m_data->isGpuBacked())
+        return m_data->gpuSurface() != nullptr && planeCount(m_meta.key.format) > 0;
+    return isValid();
+}
+
 MediaVideoFrameView::MediaVideoFrameView(const FrameHandle& handle) {
     const FrameMetadata& meta = handle.metadata();
     feedIndex = meta.key.feedIndex;

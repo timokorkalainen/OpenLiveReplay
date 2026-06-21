@@ -25,10 +25,13 @@ private:
     std::shared_ptr<GpuSurface> m_surface;
     std::shared_ptr<GpuRhiContext> m_rhi;
     FramePixelFormat m_nativeFormat = FramePixelFormat::Nv12;
+    quint32 m_telemetryKey = 0;
     mutable std::atomic<int> m_readCount{0};
 };
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta);
+qint64 gpuFrameReadToCpuCount();
+void gpuResetFrameReadToCpuCount();
 
 #endif // OLR_GPUFRAMEDATA_H

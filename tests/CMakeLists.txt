@@ -261,6 +261,22 @@ else()
 endif()
 
 if(OLR_GPU_PIPELINE)
+    target_compile_definitions(olr_test_playback PRIVATE OLR_GPU_PIPELINE_BUILD=1)
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp")
+    if(APPLE)
+        target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm")
+        target_link_libraries(olr_test_playback
+            PRIVATE Qt6::GuiPrivate "-framework Metal" "-framework QuartzCore")
+    else()
+        target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
+    endif()
+
     qt_add_library(olr_test_gpu STATIC
         "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
