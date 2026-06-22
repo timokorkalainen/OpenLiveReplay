@@ -1,6 +1,7 @@
 #include "playback/gpu/gpucompositor.h"
 
 #include "playback/gpu/gpugeneration.h"
+#include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/output/formatcanon.h"
 #include "playback/output/outputbusengine.h"
@@ -323,6 +324,7 @@ bool GpuCompositor::isValid() const {
 
 FrameHandle GpuCompositor::composeGrid(const QList<FrameHandle>& frames, int width, int height,
                                        ColorMetadata color, ScaleQuality quality) const {
+    if (gpuConsumeInjectedAllocFailure()) return FrameHandle{};
     const uint64_t generation = GpuGenerationCounter::instance().current();
     CpuPlanes rgba = composeGridToCpu(frames, width, height, color, quality);
     if (!rgba.isValid()) return FrameHandle{};
