@@ -8,6 +8,10 @@ private slots:
     void holdsCommittedPlayheadWhileSeekPending(); // seek in flight: hold last good
     void snapsToLiveOnceCommitGenerationCatchesUp();
     void bookmarkIgnoresUncoveredTransportJump();
+    void visiblePlayheadHoldsBookmarkForUncoveredLiveJump();
+    void repositionCommitRequiresSameSeekGeneration();
+    void repositionCommitBodyRunsOnlyForOriginalSeek();
+    void gpuGenerationInvalidatesOnlyWhenSeekGateIsHeld();
 };
 
 // committedGen == seekGen -> no reposition outstanding -> expose the LIVE
@@ -51,6 +55,56 @@ void TestCommitGate::bookmarkIgnoresUncoveredTransportJump() {
                  /*cacheCoveredPlayheadMs*/ 5040, /*cacheCovered*/ true,
                  /*committedGen*/ 3, /*seekGen*/ 3),
              int64_t(5040));
+}
+
+void TestCommitGate::visiblePlayheadHoldsBookmarkForUncoveredLiveJump() {
+    QCOMPARE(CommitGate::cacheGuardedVisiblePlayheadMs(
+                 /*visiblePlayheadMs*/ 9000, /*bookmarkedPlayheadMs*/ 5000,
+                 /*cacheCovered*/ false, /*committedGen*/ 3, /*seekGen*/ 3),
+             int64_t(5000));
+    QCOMPARE(CommitGate::cacheGuardedVisiblePlayheadMs(
+                 /*visiblePlayheadMs*/ 5040, /*bookmarkedPlayheadMs*/ 5000,
+                 /*cacheCovered*/ true, /*committedGen*/ 3, /*seekGen*/ 3),
+             int64_t(5040));
+    QCOMPARE(CommitGate::cacheGuardedVisiblePlayheadMs(
+                 /*visiblePlayheadMs*/ 5000, /*bookmarkedPlayheadMs*/ 4800,
+                 /*cacheCovered*/ false, /*committedGen*/ 3, /*seekGen*/ 4),
+             int64_t(5000));
+}
+
+void TestCommitGate::repositionCommitRequiresSameSeekGeneration() {
+    QVERIFY(CommitGate::canCommitReposition(/*startedSeekGen*/ 4, /*currentSeekGen*/ 4,
+                                            /*supersededSeekPending*/ false));
+    QVERIFY(!CommitGate::canCommitReposition(/*startedSeekGen*/ 4, /*currentSeekGen*/ 5,
+                                             /*supersededSeekPending*/ false));
+    QVERIFY(!CommitGate::canCommitReposition(/*startedSeekGen*/ 4, /*currentSeekGen*/ 4,
+                                             /*supersededSeekPending*/ true));
+}
+
+void TestCommitGate::repositionCommitBodyRunsOnlyForOriginalSeek() {
+    bool committed = false;
+    QVERIFY(CommitGate::commitRepositionIfCurrent(
+        /*startedSeekGen*/ 4, /*currentSeekGen*/ 4, /*supersededSeekPending*/ false,
+        [&] { committed = true; }));
+    QVERIFY(committed);
+
+    committed = false;
+    QVERIFY(!CommitGate::commitRepositionIfCurrent(
+        /*startedSeekGen*/ 4, /*currentSeekGen*/ 5, /*supersededSeekPending*/ false,
+        [&] { committed = true; }));
+    QVERIFY(!committed);
+
+    QVERIFY(!CommitGate::commitRepositionIfCurrent(
+        /*startedSeekGen*/ 4, /*currentSeekGen*/ 4, /*supersededSeekPending*/ true,
+        [&] { committed = true; }));
+    QVERIFY(!committed);
+}
+
+void TestCommitGate::gpuGenerationInvalidatesOnlyWhenSeekGateIsHeld() {
+    QVERIFY(CommitGate::shouldInvalidateGpuGenerationForReposition(
+        /*startedSeekGen*/ 7, /*committedGen*/ 6));
+    QVERIFY(!CommitGate::shouldInvalidateGpuGenerationForReposition(
+        /*startedSeekGen*/ 7, /*committedGen*/ 7));
 }
 
 QTEST_MAIN(TestCommitGate)

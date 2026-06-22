@@ -2,6 +2,8 @@
 
 #ifdef __APPLE__
 
+#include "playback/gpu/gpufence.h"
+
 #include <QList>
 #include <QMutex>
 #include <QMutexLocker>
@@ -214,6 +216,20 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
     CVPixelBufferRelease(pb);
     if (!invoked) return CpuPlanes{};
     return result;
+}
+
+std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
+    if (!m_impl || !m_impl->valid) return nullptr;
+
+    std::shared_ptr<GpuFence> fence;
+    const bool invoked = m_impl->thread.invoke([&] {
+        QRhi* rhi = m_impl->thread.rhi;
+        if (!rhi) return;
+        const auto* nativeHandles =
+            static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles());
+        fence = nativeHandles ? makeMetalGpuFence(nativeHandles->cmdQueue) : nullptr;
+    });
+    return invoked ? fence : nullptr;
 }
 
 #endif // __APPLE__

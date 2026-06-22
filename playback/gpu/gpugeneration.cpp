@@ -14,5 +14,5 @@ uint64_t GpuGenerationCounter::bump() {
 }
 
 void GpuGenerationCounter::reset() {
-    m_generation.store(0, std::memory_order_release);
+    m_generation.store(1, std::memory_order_release);
 }

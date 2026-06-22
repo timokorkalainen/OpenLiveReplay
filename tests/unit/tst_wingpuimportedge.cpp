@@ -2,12 +2,16 @@
 
 #include "playback/output/win/wingpuimportedge.h"
 #ifdef _WIN32
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpureadbackretainer.h"
 #include "playback/output/win/d3d11gpusurface.h"
 #include "playback/output/win/d3dfence.h"
 #include "recorder_engine/ingest/nativeframecopy.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <d3d11.h>
+#include <thread>
 #include <vector>
 #include <wrl/client.h>
 
@@ -16,6 +20,22 @@ extern "C" {
 }
 
 using Microsoft::WRL::ComPtr;
+
+namespace {
+
+class DeferredFence final : public GpuFence {
+public:
+    uint64_t signal() override { return m_next.fetch_add(1, std::memory_order_acq_rel) + 1; }
+    bool wait(uint64_t value, int) override { return completedValue() >= value; }
+    uint64_t completedValue() const override { return m_completed.load(std::memory_order_acquire); }
+    void complete(uint64_t value) { m_completed.store(value, std::memory_order_release); }
+
+private:
+    std::atomic<uint64_t> m_next{0};
+    std::atomic<uint64_t> m_completed{0};
+};
+
+} // namespace
 #endif
 
 class TestWinGpuImportEdge : public QObject {
@@ -28,6 +48,7 @@ private slots:
     void surfaceKeepsTextureAndTracksFence();
     void readToCpuDeinterleavesNv12ToI420();
     void fenceSignalsAndWaits();
+    void fenceWaitForeverWaitsUntilSignal();
     void importedReadbackMatchesCpuDecodeWithinOneLsb();
     void allocFailureDegradesToCpuFallback();
     void surfaceSurvivesInFlightReadback();
@@ -64,12 +85,20 @@ void TestWinGpuImportEdge::createConsistentWithProbe() {
 }
 
 void TestWinGpuImportEdge::nullSampleYieldsFallbackNullopt() {
+#ifndef _WIN32
+    QSKIP("WinGpuImportEdge null sample import is Windows-only");
+#else
     QString error;
     auto edge = WinGpuImportEdge::create(&error);
     if (!edge) QSKIP("no GPU import edge on this host (CPU fallback path)");
 
-    const std::optional<FrameHandle> handle = edge->tryImport(nullptr, 0, 1000, 1280, 720);
+    auto renderFence = makeD3D11GpuFence(edge->d3d11Device());
+    if (!renderFence) QSKIP("no D3D11 fence on this host");
+
+    const std::optional<FrameHandle> handle =
+        edge->tryImport(nullptr, 0, 1000, 1280, 720, renderFence);
     QVERIFY2(!handle.has_value(), "null sample must return nullopt (CPU fallback)");
+#endif
 }
 
 void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
@@ -206,6 +235,30 @@ void TestWinGpuImportEdge::fenceSignalsAndWaits() {
 #endif
 }
 
+void TestWinGpuImportEdge::fenceWaitForeverWaitsUntilSignal() {
+#ifndef _WIN32
+    QSKIP("D3D fence is Windows-only");
+#else
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> ctx;
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
+    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
+                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    QString error;
+    auto fence = D3DFence::create(device.Get(), &error);
+    if (!fence) QSKIP(qPrintable(error));
+
+    bool waitResult = false;
+    std::thread waiter([&] { waitResult = fence->wait(1, -1); });
+    QTest::qWait(20);
+    QCOMPARE(fence->signal(ctx.Get()), uint64_t(1));
+    waiter.join();
+    QVERIFY(waitResult);
+#endif
+}
+
 void TestWinGpuImportEdge::importedReadbackMatchesCpuDecodeWithinOneLsb() {
 #ifndef _WIN32
     QSKIP("Windows import slice");
@@ -334,9 +387,16 @@ void TestWinGpuImportEdge::surfaceSurvivesInFlightReadback() {
     QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                         D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
                                         D3D11_SDK_VERSION, &device, &level, &ctx)));
+    constexpr int kW = 8;
+    constexpr int kH = 8;
+    std::vector<uint8_t> nv12(size_t(kW) * kH + size_t(kW) * (kH / 2), 0x80);
+    for (int r = 0; r < kH; ++r)
+        for (int c = 0; c < kW; ++c)
+            nv12[size_t(r) * kW + c] = uint8_t((r * kW + c) & 0xff);
+
     D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = 64;
-    desc.Height = 64;
+    desc.Width = kW;
+    desc.Height = kH;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
     desc.Format = DXGI_FORMAT_NV12;
@@ -345,18 +405,26 @@ void TestWinGpuImportEdge::surfaceSurvivesInFlightReadback() {
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Texture2D> texture;
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
+    ctx->UpdateSubresource(texture.Get(), 0, nullptr, nv12.data(), UINT(kW), 0);
 
-    auto surface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64);
+    auto surface = D3D11GpuSurface::createKept(device, texture, 0, kW, kH);
     QVERIFY(surface != nullptr);
     std::weak_ptr<D3D11GpuSurface> weak = surface;
+    auto renderFence = std::make_shared<DeferredFence>();
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
-    meta.key.width = 64;
-    meta.key.height = 64;
-    FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta);
+    meta.key.width = kW;
+    meta.key.height = kH;
+    FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence);
     surface.reset();
     QVERIFY(!weak.expired());
+    QVERIFY(handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
     handle = FrameHandle();
+    QVERIFY(!weak.expired());
+    QVERIFY(gpuPendingReadbackRetainCount() >= 1);
+
+    renderFence->complete(1);
+    gpuDrainCompletedReadbackRetains();
     QVERIFY(weak.expired());
 #endif
 }

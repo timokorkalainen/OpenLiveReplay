@@ -2,6 +2,8 @@
 
 #ifndef __APPLE__
 
+#include "playback/gpu/gpufence.h"
+
 #include <utility>
 
 class GpuRhiContext::Impl {};
@@ -19,6 +21,10 @@ bool GpuRhiContext::isValid() const {
 
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, FramePixelFormat) {
     return CpuPlanes{};
+}
+
+std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
+    return GpuFence::create();
 }
 
 #endif // !__APPLE__

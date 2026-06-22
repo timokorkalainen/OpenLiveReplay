@@ -37,6 +37,32 @@ std::optional<FrameHandle> OutputFrameCache::videoFrameAt(int feedIndex, qint64 
     return *it;
 }
 
+std::optional<FrameHandle>
+OutputFrameCache::videoFrameAtFreshForGeneration(int feedIndex, qint64 playheadMs,
+                                                 uint64_t gpuGeneration) const {
+    if (feedIndex < 0 || feedIndex >= m_video.size()) return std::nullopt;
+    const auto& list = m_video[feedIndex];
+    if (list.isEmpty()) return std::nullopt;
+    auto it = std::upper_bound(
+        list.begin(), list.end(), playheadMs,
+        [](qint64 pts, const FrameHandle& f) { return pts < f.metadata().key.ptsMs; });
+    while (it != list.begin()) {
+        --it;
+        if (!it->isStaleForGeneration(gpuGeneration)) return *it;
+    }
+    return std::nullopt;
+}
+
+bool OutputFrameCache::hasFreshVideoFrameAtOrBeforeNear(int feedIndex, qint64 targetMs,
+                                                        qint64 toleranceMs,
+                                                        uint64_t gpuGeneration) const {
+    const std::optional<FrameHandle> frame =
+        videoFrameAtFreshForGeneration(feedIndex, targetMs, gpuGeneration);
+    if (!frame.has_value() || frame->metadata().key.isPlaceholder) return false;
+    const qint64 delta = targetMs - frame->metadata().key.ptsMs;
+    return delta >= 0 && delta <= qMax<qint64>(0, toleranceMs);
+}
+
 FrameHandle OutputFrameCache::videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const {
     auto frame = videoFrameAt(feedIndex, playheadMs);
     if (frame.has_value()) return *frame;

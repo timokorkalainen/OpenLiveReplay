@@ -29,8 +29,7 @@ std::optional<FrameHandle> WinGpuImportEdge::tryImport(void*, int, qint64, int, 
 }
 
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface>,
-                                                        FrameMetadata,
-                                                        std::shared_ptr<GpuFence>) {
+                                                        FrameMetadata, std::shared_ptr<GpuFence>) {
     return FrameHandle();
 }
 

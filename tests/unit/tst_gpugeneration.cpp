@@ -8,18 +8,25 @@
 class TestGpuGeneration : public QObject {
     Q_OBJECT
 private slots:
+    void resetStartsAtLiveGpuGeneration();
     void bumpAdvancesMonotonically();
     void cpuHandleIsNeverStale();
     void gpuHandleStaleAfterBump();
 };
 
+void TestGpuGeneration::resetStartsAtLiveGpuGeneration() {
+    auto& generation = GpuGenerationCounter::instance();
+    generation.reset();
+    QVERIFY(generation.current() >= uint64_t(1));
+}
+
 void TestGpuGeneration::bumpAdvancesMonotonically() {
     auto& generation = GpuGenerationCounter::instance();
     generation.reset();
-    QCOMPARE(generation.current(), uint64_t(0));
-    QCOMPARE(generation.bump(), uint64_t(1));
+    QCOMPARE(generation.current(), uint64_t(1));
     QCOMPARE(generation.bump(), uint64_t(2));
-    QCOMPARE(generation.current(), uint64_t(2));
+    QCOMPARE(generation.bump(), uint64_t(3));
+    QCOMPARE(generation.current(), uint64_t(3));
 }
 
 void TestGpuGeneration::cpuHandleIsNeverStale() {

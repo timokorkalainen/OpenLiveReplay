@@ -41,6 +41,14 @@
 #include "playback/playlistplayout.h"
 #include "playback/output/outputdispatcher.h"
 #include "playback/output/outputtargetassignment.h"
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpurhicontext.h"
+#if defined(_WIN32)
+#include "playback/output/win/wingpuimportedge.h"
+#endif
+#endif
 
 namespace {
 constexpr int kFrameDurMs = 33; // ~30fps step granularity
@@ -55,12 +63,63 @@ int64_t probeDurationMs(const QString& file) {
     Q_UNUSED(file);
     return 25000;
 }
+
+int probeGpuBackend() {
+#ifndef OLR_GPU_PIPELINE_BUILD
+    fprintf(stderr, "SKIP: GPU pipeline was not compiled into this harness\n");
+    return 77;
+#else
+    if (!gpuPipelineEnabled()) {
+        fprintf(stderr, "SKIP: OLR_GPU_PIPELINE is not enabled\n");
+        return 77;
+    }
+#if defined(__APPLE__)
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isValid()) {
+        fprintf(stderr, "SKIP: no usable Metal QRhi backend\n");
+        return 77;
+    }
+    auto renderFence = rhi->createFence();
+    auto stagingFence = rhi->createFence();
+    if (!renderFence || !stagingFence) {
+        fprintf(stderr, "SKIP: no usable Metal GPU fences\n");
+        return 77;
+    }
+    return 0;
+#elif defined(_WIN32)
+    const WinGpuImportCapabilities caps = probeWinGpuImport();
+    if (!caps.d3d11KeepTexture) {
+        fprintf(stderr, "SKIP: Windows GPU import unavailable: %s\n", qPrintable(caps.detail));
+        return 77;
+    }
+    QString error;
+    auto edge = WinGpuImportEdge::create(&error);
+    if (!edge || !edge->isAvailable()) {
+        fprintf(stderr, "SKIP: Windows GPU import edge unavailable: %s\n", qPrintable(error));
+        return 77;
+    }
+    auto renderFence = makeD3D11GpuFence(edge->d3d11Device());
+    auto stagingFence = makeD3D11GpuFence(edge->d3d11Device());
+    if (!renderFence || !stagingFence) {
+        fprintf(stderr, "SKIP: Windows D3D11 fences unavailable\n");
+        return 77;
+    }
+    return 0;
+#else
+    fprintf(stderr, "SKIP: no real GPU backend on this platform\n");
+    return 77;
+#endif
+#endif
+}
 } // namespace
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
+    if (argc >= 2 && QString::fromUtf8(argv[1]) == QStringLiteral("--probe-gpu-backend"))
+        return probeGpuBackend();
     if (argc < 3) {
-        fprintf(stderr, "usage: play_harness <file.mkv> <scenario> [viewCount]\n");
+        fprintf(stderr, "usage: play_harness <file.mkv> <scenario> [viewCount]\n"
+                        "       play_harness --probe-gpu-backend\n");
         return 2;
     }
     const QString file = QString::fromUtf8(argv[1]);
@@ -136,13 +195,16 @@ int main(int argc, char** argv) {
     // landed AT the next entry's in-point (the divergence gate only proves the epoch
     // tracks itself). 0 for non-playlist scenarios.
     auto* maxLandErr = new qint64(0);
+    // Number of real boundary/cut landing observations that contributed to
+    // maxLandErr. A zero error with zero samples is vacuous and must not pass.
+    auto* cutLandingSamples = new int(0);
     // armNextCut return value for armedcut-h264: 1 = armed (pre-roll bank accepted
     // the cut), 0 = rejected (H.264 guard fired — pre-roll bank skipped H.264
     // streams, bank empty). -1 = not applicable / armNextCut not called.
     int armNextCutArmed = -1;
 
     // Print the final counters in a parseable form, then quit.
-    auto finish = [&, basePh, baseHeld, maxLandErr]() {
+    auto finish = [&, basePh, baseHeld, maxLandErr, cutLandingSamples]() {
         // Read the output stats BEFORE stop(): the worker's run() tears down the
         // OutputRuntime on exit (shutdownOutputGraph nulls m_outputRuntime), so a
         // post-stop outputStats() would return a zeroed struct (delta would go
@@ -156,7 +218,8 @@ int main(int argc, char** argv) {
                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d "
-               "maxBoundaryLandingErrMs=%lld armNextCutArmed=%d decodedVideoFrames=%lld "
+               "maxBoundaryLandingErrMs=%lld cutLandingSamples=%d armNextCutArmed=%d "
+               "decodedVideoFrames=%lld "
                "stagingVideoFramesDecoded=%lld gpuReadToCpuCount=%lld gpuReadbacks=%lld "
                "redundantGpuReadbacks=%lld readbackQueueDepth=%lld readbackDrops=%lld "
                "fenceWaitStalls=%lld "
@@ -165,7 +228,7 @@ int main(int argc, char** argv) {
                c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
-               c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
+               c.cutFollowReposition, (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
                (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
                (long long) c.gpuReadToCpuCount, (long long) os.gpuReadbacks,
                (long long) os.redundantGpuReadbacks, (long long) os.readbackQueueDepth,
@@ -496,34 +559,39 @@ int main(int argc, char** argv) {
                         (long long) *basePh, (long long) *baseHeld, nEntries);
             });
             QTimer* mon = new QTimer(&app);
-            QObject::connect(mon, &QTimer::timeout, &app, [&, playout, lastCuts, maxLandErr]() {
-                const int cuts = worker.cutsFired();
-                if (cuts > *lastCuts) {
-                    *lastCuts = cuts;
-                    const auto cur = playout->onBoundaryFired();
-                    if (cur.has_value()) {
-                        transport.setSpeed(cur->speed); // apply the next entry's speed
-                        // Frame-accuracy: the cut just re-based the playhead to this
-                        // entry's in-point. The landed playhead (sampled up to one
-                        // monitor interval after the fire) must be at/just past the
-                        // in-point — a direct check the boundary landed where intended.
-                        const qint64 landed = transport.currentPos();
-                        const qint64 err = qAbs(landed - cur->inMs);
-                        if (err > *maxLandErr) *maxLandErr = err;
-                        fprintf(stderr,
+            QObject::connect(
+                mon, &QTimer::timeout, &app,
+                [&, playout, lastCuts, maxLandErr, cutLandingSamples]() {
+                    const int cuts = worker.cutsFired();
+                    if (cuts > *lastCuts) {
+                        *lastCuts = cuts;
+                        const auto cur = playout->onBoundaryFired();
+                        if (cur.has_value()) {
+                            transport.setSpeed(cur->speed); // apply the next entry's speed
+                            // Frame-accuracy: the cut just re-based the playhead to this
+                            // entry's in-point. The landed playhead (sampled up to one
+                            // monitor interval after the fire) must be at/just past the
+                            // in-point — a direct check the boundary landed where intended.
+                            const qint64 landed = transport.currentPos();
+                            const qint64 err = qAbs(landed - cur->inMs);
+                            (*cutLandingSamples)++;
+                            if (err > *maxLandErr) *maxLandErr = err;
+                            fprintf(
+                                stderr,
                                 "### playlist advanced to entry %d in=%lld landed=%lld err=%lld "
                                 "speed=%.2f ###\n",
                                 playout->currentIndex(), (long long) cur->inMs, (long long) landed,
                                 (long long) err, cur->speed);
+                        }
                     }
-                }
-                const auto b = playout->evaluate(transport.currentPos(), transport.speed(), 1500);
-                if (b.valid) {
-                    worker.armNextCut(b.targetMs, b.fireAtMs);
-                    fprintf(stderr, "### playlist arm boundary fireAt=%lld -> in=%lld ###\n",
-                            (long long) b.fireAtMs, (long long) b.targetMs);
-                }
-            });
+                    const auto b =
+                        playout->evaluate(transport.currentPos(), transport.speed(), 1500);
+                    if (b.valid) {
+                        worker.armNextCut(b.targetMs, b.fireAtMs);
+                        fprintf(stderr, "### playlist arm boundary fireAt=%lld -> in=%lld ###\n",
+                                (long long) b.fireAtMs, (long long) b.targetMs);
+                    }
+                });
             mon->start(16);
             QTimer::singleShot(14000, &app, finish);
 
@@ -558,20 +626,22 @@ int main(int argc, char** argv) {
                         (long long) cutTarget, armNextCutArmed);
             });
             QTimer* mon = new QTimer(&app);
-            QObject::connect(
-                mon, &QTimer::timeout, &app, [&, lastCuts, capCutTarget, maxLandErr]() {
-                    const int cuts = worker.cutsFired();
-                    if (cuts <= *lastCuts) return;
-                    *lastCuts = cuts;
-                    if (*capCutTarget < 0) return;
-                    const qint64 landed = transport.currentPos();
-                    const qint64 err = qAbs(landed - *capCutTarget);
-                    if (err > *maxLandErr) *maxLandErr = err;
-                    fprintf(stderr,
-                            "### gpucapstress cut landed=%lld target=%lld err=%lld "
-                            "###\n",
-                            (long long) landed, (long long) *capCutTarget, (long long) err);
-                });
+            QObject::connect(mon, &QTimer::timeout, &app,
+                             [&, lastCuts, capCutTarget, maxLandErr, cutLandingSamples]() {
+                                 const int cuts = worker.cutsFired();
+                                 if (cuts <= *lastCuts) return;
+                                 *lastCuts = cuts;
+                                 if (*capCutTarget < 0) return;
+                                 const qint64 landed = transport.currentPos();
+                                 const qint64 err = qAbs(landed - *capCutTarget);
+                                 (*cutLandingSamples)++;
+                                 if (err > *maxLandErr) *maxLandErr = err;
+                                 fprintf(stderr,
+                                         "### gpucapstress cut landed=%lld target=%lld err=%lld "
+                                         "###\n",
+                                         (long long) landed, (long long) *capCutTarget,
+                                         (long long) err);
+                             });
             mon->start(16);
             QTimer::singleShot(10000, &app, finish);
 
@@ -670,7 +740,8 @@ int main(int argc, char** argv) {
                 "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
                 "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                 "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d "
-                "cutFollowReposition=%d maxBoundaryLandingErrMs=%lld armNextCutArmed=%d "
+                "cutFollowReposition=%d maxBoundaryLandingErrMs=%lld cutLandingSamples=%d "
+                "armNextCutArmed=%d "
                 "decodedVideoFrames=%lld stagingVideoFramesDecoded=%lld gpuReadToCpuCount=%lld "
                 "gpuReadbacks=%lld redundantGpuReadbacks=%lld readbackQueueDepth=%lld "
                 "readbackDrops=%lld fenceWaitStalls=%lld gpuOomDegrades=%lld gpuVramBytes=%lld\n",
@@ -678,7 +749,7 @@ int main(int argc, char** argv) {
                 c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
                 (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
                 (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
-                c.cutFollowReposition, (long long) *maxLandErr, armNextCutArmed,
+                c.cutFollowReposition, (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
                 (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
                 (long long) c.gpuReadToCpuCount, (long long) os.gpuReadbacks,
                 (long long) os.redundantGpuReadbacks, (long long) os.readbackQueueDepth,

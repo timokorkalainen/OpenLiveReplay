@@ -25,6 +25,7 @@ private slots:
     void trimBeforeReportsVideoEvictions();
     void clearReportsVideoEvictions();
     void mergeFromReportsReplacedVideoFrames();
+    void freshCoverageRequiresFrameAtOrBeforeTargetWithinTolerance();
 };
 
 void TestOutputFrameCache::videoAtPicksLargestPtsAtOrBeforePlayhead() {
@@ -256,6 +257,28 @@ void TestOutputFrameCache::mergeFromReportsReplacedVideoFrames() {
     auto current = live.videoFrameAt(0, 100);
     QVERIFY(current.has_value());
     QCOMPARE(uchar(MediaVideoFrameView(*current).planeY.at(0)), uchar(80));
+}
+
+void TestOutputFrameCache::freshCoverageRequiresFrameAtOrBeforeTargetWithinTolerance() {
+    OutputFrameCache cache(1, 4, 4);
+    FrameHandle old = makeVideo(0, 90, 10);
+    old.metadata().gpuGeneration = 1;
+    FrameHandle exact = makeVideo(0, 100, 20);
+    exact.metadata().gpuGeneration = 1;
+    FrameHandle stale = makeVideo(0, 140, 30);
+    stale.metadata().gpuGeneration = 1;
+    FrameHandle future = makeVideo(0, 220, 40);
+    future.metadata().gpuGeneration = 2;
+    cache.insertVideoFrame(old);
+    cache.insertVideoFrame(exact);
+    cache.insertVideoFrame(stale);
+    cache.insertVideoFrame(future);
+
+    QVERIFY(cache.hasFreshVideoFrameAtOrBeforeNear(0, 100, 15, 1));
+    QVERIFY(cache.hasFreshVideoFrameAtOrBeforeNear(0, 105, 15, 1));
+    QVERIFY(!cache.hasFreshVideoFrameAtOrBeforeNear(0, 140, 15, 2));
+    QVERIFY(!cache.hasFreshVideoFrameAtOrBeforeNear(0, 210, 15, 2));
+    QVERIFY(!cache.hasFreshVideoFrameAtOrBeforeNear(0, 80, 15, 1));
 }
 
 QTEST_GUILESS_MAIN(TestOutputFrameCache)

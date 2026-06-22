@@ -6,6 +6,8 @@
 
 #include <QDebug>
 
+#include <cstdint>
+
 struct OutputFrameIdentity {
     OutputBusId bus = OutputBusId::pgm();
     qint64 outputFrameIndex = -1;
@@ -16,12 +18,13 @@ struct OutputFrameIdentity {
     bool audioSilent = true;
     quint32 videoHash = 0;
     quint32 audioHash = 0;
+    uint64_t videoGpuGeneration = 0;
 
     bool samePayloadAs(const OutputFrameIdentity& other) const {
         return bus == other.bus && sourceFeedIndex == other.sourceFeedIndex &&
                sourcePtsMs == other.sourcePtsMs && videoPlaceholder == other.videoPlaceholder &&
                audioSilent == other.audioSilent && videoHash == other.videoHash &&
-               audioHash == other.audioHash;
+               audioHash == other.audioHash && videoGpuGeneration == other.videoGpuGeneration;
     }
 
     bool operator==(const OutputFrameIdentity& other) const {
@@ -29,7 +32,8 @@ struct OutputFrameIdentity {
                sampledPlayheadMs == other.sampledPlayheadMs &&
                sourceFeedIndex == other.sourceFeedIndex && sourcePtsMs == other.sourcePtsMs &&
                videoPlaceholder == other.videoPlaceholder && audioSilent == other.audioSilent &&
-               videoHash == other.videoHash && audioHash == other.audioHash;
+               videoHash == other.videoHash && audioHash == other.audioHash &&
+               videoGpuGeneration == other.videoGpuGeneration;
     }
 };
 
@@ -63,7 +67,7 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 // fresh composite — a hash key could collide and emit a stale frame.
 struct MultiviewComposite {
     bool valid = false;
-    QVector<qint64> sourceKeys; // 2 entries per feed: present flag, then selected pts
+    QVector<qint64> sourceKeys; // 3 entries per feed: present flag, selected pts, GPU generation
     FrameHandle video;
 };
 

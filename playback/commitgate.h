@@ -22,6 +22,31 @@ inline int64_t bookmarkedVisiblePlayheadMs(int64_t currentBookmarkMs, int64_t vi
     if (cacheCoveredPlayheadMs > visiblePlayheadMs) return currentBookmarkMs;
     return cacheCoveredPlayheadMs;
 }
+
+inline int64_t cacheGuardedVisiblePlayheadMs(int64_t visiblePlayheadMs,
+                                             int64_t bookmarkedPlayheadMs, bool cacheCovered,
+                                             uint64_t committedGen, uint64_t seekGen) {
+    if (committedGen == seekGen && !cacheCovered) return bookmarkedPlayheadMs;
+    return visiblePlayheadMs;
+}
+
+inline bool canCommitReposition(uint64_t startedSeekGen, uint64_t currentSeekGen,
+                                bool supersededSeekPending) {
+    return !supersededSeekPending && startedSeekGen == currentSeekGen;
+}
+
+inline bool shouldInvalidateGpuGenerationForReposition(uint64_t startedSeekGen,
+                                                       uint64_t committedGen) {
+    return startedSeekGen != committedGen;
+}
+
+template <typename CommitFn>
+inline bool commitRepositionIfCurrent(uint64_t startedSeekGen, uint64_t currentSeekGen,
+                                      bool supersededSeekPending, CommitFn commit) {
+    if (!canCommitReposition(startedSeekGen, currentSeekGen, supersededSeekPending)) return false;
+    commit();
+    return true;
+}
 } // namespace CommitGate
 
 #endif // COMMITGATE_H

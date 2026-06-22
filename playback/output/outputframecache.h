@@ -15,6 +15,10 @@ public:
 
     void insertVideoFrame(const FrameHandle& frame, EvictedVideoFrames* evictedFrames = nullptr);
     std::optional<FrameHandle> videoFrameAt(int feedIndex, qint64 playheadMs) const;
+    std::optional<FrameHandle> videoFrameAtFreshForGeneration(int feedIndex, qint64 playheadMs,
+                                                              uint64_t gpuGeneration) const;
+    bool hasFreshVideoFrameAtOrBeforeNear(int feedIndex, qint64 targetMs, qint64 toleranceMs,
+                                          uint64_t gpuGeneration) const;
     FrameHandle videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const;
     EvictedVideoFrames videoFramesSnapshot() const;
 

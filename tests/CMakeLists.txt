@@ -263,6 +263,10 @@ else()
             "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3d11gpusurface.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
+        if(NOT OLR_GPU_PIPELINE)
+            target_sources(olr_test_playback PRIVATE
+                "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp")
+        endif()
         target_link_libraries(olr_test_playback
             PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
     endif()
@@ -273,6 +277,7 @@ if(OLR_GPU_PIPELINE)
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
     if(APPLE)
         target_sources(olr_test_playback PRIVATE
@@ -299,6 +304,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
     target_include_directories(olr_test_gpu PUBLIC "${CMAKE_SOURCE_DIR}")
@@ -316,7 +322,10 @@ if(OLR_GPU_PIPELINE)
                    "-framework CoreFoundation" "-framework IOSurface")
     elseif(WIN32)
         target_sources(olr_test_gpu PRIVATE
-            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_win.cpp")
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_win.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
+        target_link_libraries(olr_test_gpu
+            PRIVATE d3d11 dxgi ole32)
     endif()
 
     qt_add_shaders(olr_test_gpu "olr_passthrough_shaders"

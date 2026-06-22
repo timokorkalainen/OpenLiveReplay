@@ -15,7 +15,7 @@ public:
 private:
     GpuGenerationCounter() = default;
 
-    std::atomic<uint64_t> m_generation{0};
+    std::atomic<uint64_t> m_generation{1};
 };
 
 #endif // OLR_GPUGENERATION_H

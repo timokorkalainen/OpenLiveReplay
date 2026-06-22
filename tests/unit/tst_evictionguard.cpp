@@ -69,6 +69,7 @@ private slots:
     void ignoresCpuAndUnfencedGpuFrames();
     void timeoutRetainsFrameAndCountsStall();
     void completedFenceReleasesFrame();
+    void drainBudgetLimitsFenceWaitsPerPass();
 };
 
 void TestEvictionGuard::ignoresCpuAndUnfencedGpuFrames() {
@@ -127,6 +128,20 @@ void TestEvictionGuard::completedFenceReleasesFrame() {
     QCOMPARE(stalls, 0);
     QCOMPARE(queue.size(), 0);
     QVERIFY(weakData.expired());
+}
+
+void TestEvictionGuard::drainBudgetLimitsFenceWaitsPerPass() {
+    GpuFrameRetireQueue queue;
+    auto fence = std::make_shared<FakeFence>();
+    queue.collect(makeGpuFrame(4), fence);
+    queue.collect(makeGpuFrame(5), fence);
+
+    int stalls = 0;
+    QCOMPARE(queue.drain(1, &stalls, 1), 0);
+
+    QCOMPARE(fence->waitCalls, 1);
+    QCOMPARE(stalls, 2);
+    QCOMPARE(queue.size(), 2);
 }
 
 QTEST_GUILESS_MAIN(TestEvictionGuard)

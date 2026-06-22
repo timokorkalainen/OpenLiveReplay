@@ -24,16 +24,20 @@ void GpuFrameRetireQueue::collect(const QVector<FrameHandle>& frames,
         collect(frame, fence);
 }
 
-int GpuFrameRetireQueue::drain(int timeoutMs, int* stalls) {
+int GpuFrameRetireQueue::drain(int timeoutMs, int* stalls, int maxWaits) {
     if (m_entries.isEmpty()) return 0;
 
     QVector<Entry> pending;
     int released = 0;
+    int waits = 0;
     for (Entry& entry : m_entries) {
         bool retired = false;
         if (entry.fence) {
             retired = entry.fence->completedValue() >= entry.fenceValue;
-            if (!retired) retired = entry.fence->wait(entry.fenceValue, timeoutMs);
+            if (!retired && (maxWaits < 0 || waits < maxWaits)) {
+                waits++;
+                retired = entry.fence->wait(entry.fenceValue, timeoutMs);
+            }
         }
 
         if (retired) {

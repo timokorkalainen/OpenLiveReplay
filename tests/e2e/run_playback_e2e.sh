@@ -49,6 +49,17 @@ case "$SCENARIO" in
                 exit 77
                 ;;
         esac
+        GPU_PROBE_OUT="$("$PLAY" --probe-gpu-backend 2>&1)"
+        GPU_PROBE_RC=$?
+        if [ "$GPU_PROBE_RC" -eq 77 ]; then
+            printf '%s\n' "$GPU_PROBE_OUT"
+            exit 77
+        fi
+        if [ "$GPU_PROBE_RC" -ne 0 ]; then
+            echo "FAIL: GPU backend probe exited $GPU_PROBE_RC"
+            printf '%s\n' "$GPU_PROBE_OUT"
+            exit 1
+        fi
         export OLR_GPU_FORCE_BUDGET="${OLR_GPU_FORCE_BUDGET:-12}"
         ;;
 esac
@@ -205,6 +216,10 @@ fi
 # Sanity: the fixture should carry <views> video tracks.
 VTRACKS="$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 "$FIXTURE" | grep -c .)"
 echo "[pb-e2e] fixture video tracks: ${VTRACKS:-?} (expected $VIEWS)"
+if [ "${VTRACKS:-0}" != "$VIEWS" ]; then
+    echo "FAIL: fixture has ${VTRACKS:-0} video tracks, expected $VIEWS"
+    exit 1
+fi
 
 # VAC-1: assert the fixture is actually H.264 for the H.264 scenarios. A silent
 # codec fallback (e.g. record_harness ignoring --codec h264 and writing MPEG-2)
@@ -263,6 +278,7 @@ maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 cutsFired="$(get cutsFired)"
 cutFollowReposition="$(get cutFollowReposition)"
 maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
+cutLandingSamples="$(get cutLandingSamples)"
 armNextCutArmed="$(get armNextCutArmed)"
 decodedVideoFrames="$(get decodedVideoFrames)"
 stagingVideoFramesDecoded="$(get stagingVideoFramesDecoded)"
@@ -290,6 +306,7 @@ gpuVramBytes="$(get gpuVramBytes)"
 [ -n "$cutsFired" ] || cutsFired="?"
 [ -n "$cutFollowReposition" ] || cutFollowReposition="?"
 [ -n "$maxBoundaryLandingErrMs" ] || maxBoundaryLandingErrMs="?"
+[ -n "$cutLandingSamples" ] || cutLandingSamples="?"
 [ -n "$armNextCutArmed" ] || armNextCutArmed="?"
 [ -n "$decodedVideoFrames" ] || decodedVideoFrames="?"
 [ -n "$stagingVideoFramesDecoded" ] || stagingVideoFramesDecoded="?"
@@ -727,6 +744,10 @@ case "$SCENARIO" in
             echo "FAIL: playlist boundary landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80) — a cut did not land at the next entry's in-point (fire-frame/speed bug)"
             fail=1
         fi
+        if ! num "$cutLandingSamples" || [ "$cutLandingSamples" -ne 2 ]; then
+            echo "FAIL: playlist observed $cutLandingSamples boundary landing samples (expected 2 for 3 entries) — landing-error gate is vacuous"
+            fail=1
+        fi
         ;;
     gpucapstress)
         if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
@@ -763,6 +784,10 @@ case "$SCENARIO" in
         fi
         if ! num "$maxBoundaryLandingErrMs" || [ "$maxBoundaryLandingErrMs" -gt 80 ]; then
             echo "FAIL: gpucapstress cut landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80)"
+            fail=1
+        fi
+        if ! num "$cutLandingSamples" || [ "$cutLandingSamples" -lt 1 ]; then
+            echo "FAIL: gpucapstress did not observe a cut landing sample (cutLandingSamples=$cutLandingSamples, expected >=1)"
             fail=1
         fi
         if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -lt 60 ]; then
@@ -978,7 +1003,7 @@ else
     done
 fi
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded gpuReadToCpuCount=$gpuReadToCpuCount gpuReadbacks=$gpuReadbacks redundantGpuReadbacks=$redundantGpuReadbacks readbackQueueDepth=$readbackQueueDepth readbackDrops=$readbackDrops fenceWaitStalls=$fenceWaitStalls gpuOomDegrades=$gpuOomDegrades gpuVramBytes=$gpuVramBytes"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs cutLandingSamples=$cutLandingSamples armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded gpuReadToCpuCount=$gpuReadToCpuCount gpuReadbacks=$gpuReadbacks redundantGpuReadbacks=$redundantGpuReadbacks readbackQueueDepth=$readbackQueueDepth readbackDrops=$readbackDrops fenceWaitStalls=$fenceWaitStalls gpuOomDegrades=$gpuOomDegrades gpuVramBytes=$gpuVramBytes"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

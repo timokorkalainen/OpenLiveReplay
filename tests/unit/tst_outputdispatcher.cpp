@@ -76,6 +76,7 @@ private slots:
     void disabledAssignmentsDoNotSubmit();
     void reverseAndSpeedChangeReanchorPlayhead();
     void playheadJumpWithoutReanchorIsCaughtByClockDivergence();
+    void cacheGuardedSnapshotReanchorsPlayEpoch();
     void rationalRateIsCarriedToSinkOnStart();
 };
 
@@ -714,6 +715,39 @@ void TestOutputDispatcher::playheadJumpWithoutReanchorIsCaughtByClockDivergence(
     QVERIFY2(okStats.maxClockDivergenceMs <= 1500,
              qPrintable(QStringLiteral("re-anchored epoch should track the playhead, got %1")
                             .arg(okStats.maxClockDivergenceMs)));
+}
+
+void TestOutputDispatcher::cacheGuardedSnapshotReanchorsPlayEpoch() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 30));
+    cache.insertVideoFrame(video(0, 1040, 60));
+
+    OutputTargetAssignment qt;
+    qt.id = QStringLiteral("feed0-preview");
+    qt.sourceBus = OutputBusId::feed(0);
+    qt.kind = OutputTargetKind::QtPreview;
+    qt.enabled = true;
+
+    CollectingSink sink(OutputTargetKind::QtPreview);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{qt, &sink}});
+    dispatcher.setIdentitySkip(false);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    dispatcher.dispatchTick(cache, state);
+    state.forcePlayEpochReset = true;
+    dispatcher.dispatchTick(cache, state);
+
+    QCOMPARE(sink.frames.size(), 2);
+    QCOMPARE(sink.frames[0].sampledPlayheadMs, qint64(1000));
+    QCOMPARE(sink.frames[1].sampledPlayheadMs, qint64(1000));
+    QCOMPARE(videoPts(sink.frames[1]), qint64(1000));
+    QCOMPARE(yAt(sink.frames[1], 0), uchar(30));
 }
 
 void TestOutputDispatcher::rationalRateIsCarriedToSinkOnStart() {
