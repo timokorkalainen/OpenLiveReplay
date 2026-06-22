@@ -456,6 +456,7 @@ if(OLR_GPU_PIPELINE)
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_apple.mm
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/gpufence.h playback/gpu/gpufence_apple.mm
             playback/gpu/decodedonefence.h playback/gpu/decodedonefence_apple.mm
             playback/gpu/vtkeepsurfaceimporter.h playback/gpu/vtkeepsurfaceimporter_apple.mm)
         target_link_libraries(OpenLiveReplay PRIVATE "-framework Metal" "-framework QuartzCore")
@@ -463,7 +464,11 @@ if(OLR_GPU_PIPELINE)
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/gpufence.h playback/gpu/gpufence_stub.cpp
             playback/gpu/decodedonefence.h playback/gpu/decodedonefence_stub.cpp)
+        if(WIN32)
+            target_sources(OpenLiveReplay PRIVATE playback/gpu/gpufence_win.cpp)
+        endif()
     endif()
 endif()
 
