@@ -10,6 +10,7 @@ import OlrTheme
 ApplicationWindow {
     id: appWindow
     visible: true
+    visibility: Qt.platform.os === "ios" ? Window.FullScreen : Window.Windowed
     width: 1200
     height: 760
     // Floor below which the pinned StatusStrip, minimal PgmStage, and TransportDock

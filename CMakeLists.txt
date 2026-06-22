@@ -738,6 +738,9 @@ target_link_libraries(OpenLiveReplay PRIVATE
     olr_warnings
     olr_sanitize
 )
+if(IOS)
+    target_link_libraries(OpenLiveReplay PRIVATE OlrStyleplugin)
+endif()
 if(WIN32)
     target_link_libraries(OpenLiveReplay PRIVATE ws2_32)
     add_custom_command(TARGET OpenLiveReplay POST_BUILD

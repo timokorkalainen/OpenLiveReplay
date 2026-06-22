@@ -2,6 +2,10 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#ifdef Q_OS_IOS
+#include <QtPlugin>
+Q_IMPORT_PLUGIN(OlrStylePlugin)
+#endif
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
 #include "playback/frameprovider.h"
