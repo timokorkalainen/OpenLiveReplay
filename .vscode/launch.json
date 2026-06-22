@@ -1,133 +1,100 @@
 {
-    // Run/Debug configurations for the CMake Tools + official Qt extensions.
-    // `${command:cmake.launchTargetPath}` resolves to the active preset's
-    // built executable, so these work on any machine without hardcoded paths.
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Debug Qt Application with lldb",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${command:cmake.launchTargetPath}",
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "visualizerFile": "${command:qt-cpp.natvis}",
-            "showDisplayString": true,
-            "osx": {
-                "MIMode": "lldb",
-                "sourceFileMap": {
-                    "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                }
-            },
-            "linux": {
-                "MIMode": "lldb",
-                "miDebuggerPath": "/usr/bin/lldb",
-                "sourceFileMap": {
-                    "/home/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                }
-            },
-            "windows": {
-                "sourceFileMap": {
-                    "Q:/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
-                    "C:/work/build/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
-                    "c:/users/qt/work/qt": "${command:qt-cpp.sourceDirectory}",
-                    "c:/Users/qt/work/install": "${command:qt-cpp.sourceDirectory}",
-                    "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                },
-                "environment": [
-                    { "name": "PATH", "value": "${env:PATH};${command:qt-cpp.qtDir}" },
-                    { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
-                    { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
-                ],
-                "MIMode": "lldb"
-            }
-        },
-        {
-            "name": "Debug Qt Application with cppdbg",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${command:cmake.launchTargetPath}",
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "visualizerFile": "${command:qt-cpp.natvis}",
-            "showDisplayString": true,
-            "osx": {
-                "MIMode": "lldb",
-                "sourceFileMap": {
-                    "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                }
-            },
-            "linux": {
-                "MIMode": "gdb",
-                "miDebuggerPath": "/usr/bin/gdb",
-                "sourceFileMap": {
-                    "/home/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                }
-            },
-            "windows": {
-                "sourceFileMap": {
-                    "Q:/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
-                    "C:/work/build/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
-                    "c:/users/qt/work/qt": "${command:qt-cpp.sourceDirectory}",
-                    "c:/Users/qt/work/install": "${command:qt-cpp.sourceDirectory}",
-                    "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                },
-                "environment": [
-                    { "name": "PATH", "value": "${env:PATH};${command:qt-cpp.qtDir}" },
-                    { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
-                    { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
-                ],
-                "MIMode": "gdb",
-                "miDebuggerPath": "${command:qt-cpp.minGWgdb}"
-            }
-        },
-        {
-            "name": "Qt: Debug with cppdbg and QML debugger",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${command:cmake.launchTargetPath}",
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "visualizerFile": "${command:qt-cpp.natvis}",
-            "showDisplayString": true,
-            "args": [
-                "-qmljsdebugger=host:localhost,port:${command:qt-qml.debugPort},block,services:DebugMessages,QmlDebugger,V8Debugger"
-            ],
-            "osx": {
-                "MIMode": "lldb",
-                "sourceFileMap": {
-                    "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                }
-            },
-            "linux": {
-                "MIMode": "gdb",
-                "miDebuggerPath": "/usr/bin/gdb",
-                "sourceFileMap": {
-                    "/home/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                }
-            },
-            "windows": {
-                "sourceFileMap": {
-                    "Q:/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
-                    "C:/work/build/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
-                    "c:/users/qt/work/qt": "${command:qt-cpp.sourceDirectory}",
-                    "c:/Users/qt/work/install": "${command:qt-cpp.sourceDirectory}",
-                    "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
-                },
-                "environment": [
-                    { "name": "PATH", "value": "${env:PATH};${command:qt-cpp.qtDir}" },
-                    { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
-                    { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
-                ],
-                "MIMode": "gdb",
-                "miDebuggerPath": "${command:qt-cpp.minGWgdb}"
-            }
-        },
-        {
-            "name": "Qt: QML: Launch",
-            "type": "qml",
-            "request": "launch",
-            "program": "${command:cmake.launchTargetPath}"
+  // App-specific debug configurations for VS Code CMake Tools.
+  // Pick a Debug CMake preset first; `${command:cmake.launchTargetPath}` then
+  // resolves to the active preset's OpenLiveReplay executable/app bundle.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "OpenLiveReplay: Debug",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${command:cmake.launchTargetPath}",
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "preLaunchTask": "CMake: build app",
+      "visualizerFile": "${command:qt-cpp.natvis}",
+      "showDisplayString": true,
+      "externalConsole": false,
+      "osx": {
+        "MIMode": "lldb",
+        "sourceFileMap": {
+          "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
         }
-    ]
+      },
+      "linux": {
+        "MIMode": "gdb",
+        "miDebuggerPath": "/usr/bin/gdb",
+        "sourceFileMap": {
+          "/home/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
+        }
+      },
+      "windows": {
+        "MIMode": "gdb",
+        "miDebuggerPath": "${command:qt-cpp.minGWgdb}",
+        "environment": [
+          { "name": "PATH", "value": "${env:PATH};${command:qt-cpp.qtDir}" },
+          { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
+          { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
+        ],
+        "sourceFileMap": {
+          "Q:/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
+          "C:/work/build/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
+          "c:/users/qt/work/qt": "${command:qt-cpp.sourceDirectory}",
+          "c:/Users/qt/work/install": "${command:qt-cpp.sourceDirectory}",
+          "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
+        }
+      }
+    },
+    {
+      "name": "OpenLiveReplay: Debug C++ and QML",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${command:cmake.launchTargetPath}",
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "preLaunchTask": "CMake: build app",
+      "visualizerFile": "${command:qt-cpp.natvis}",
+      "showDisplayString": true,
+      "externalConsole": false,
+      "args": [
+        "-qmljsdebugger=host:localhost,port:${command:qt-qml.debugPort},block,services:DebugMessages,QmlDebugger,V8Debugger"
+      ],
+      "osx": {
+        "MIMode": "lldb",
+        "sourceFileMap": {
+          "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
+        }
+      },
+      "linux": {
+        "MIMode": "gdb",
+        "miDebuggerPath": "/usr/bin/gdb",
+        "sourceFileMap": {
+          "/home/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
+        }
+      },
+      "windows": {
+        "MIMode": "gdb",
+        "miDebuggerPath": "${command:qt-cpp.minGWgdb}",
+        "environment": [
+          { "name": "PATH", "value": "${env:PATH};${command:qt-cpp.qtDir}" },
+          { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
+          { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
+        ],
+        "sourceFileMap": {
+          "Q:/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
+          "C:/work/build/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
+          "c:/users/qt/work/qt": "${command:qt-cpp.sourceDirectory}",
+          "c:/Users/qt/work/install": "${command:qt-cpp.sourceDirectory}",
+          "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
+        }
+      }
+    },
+    {
+      "name": "OpenLiveReplay: QML Debugger",
+      "type": "qml",
+      "request": "launch",
+      "program": "${command:cmake.launchTargetPath}",
+      "preLaunchTask": "CMake: build app"
+    }
+  ]
 }
