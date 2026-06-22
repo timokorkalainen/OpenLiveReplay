@@ -251,7 +251,7 @@ ColumnLayout {
                         Text {
                             visible: root.hasStreamDeck && !root.streamDeck.driverAppInstalled
                             text: "Install “Elgato Stream Deck Connect” from the App Store and enable the Stream Deck Device Driver in the iPadOS Settings app, then connect the deck via USB-C."
-                            color: Theme.armed
+                            color: Theme.warning
                             wrapMode: Text.WordWrap
                             Layout.fillWidth: true
                         }

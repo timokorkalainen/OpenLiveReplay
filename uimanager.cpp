@@ -1032,6 +1032,14 @@ QVariantList UIManager::viewSlotMap() const {
     return list;
 }
 
+int UIManager::sourceIndexForViewSlot(int viewIndex) const {
+    if (viewIndex < 0 || viewIndex >= m_viewSlotMap.size()) {
+        return -1;
+    }
+    const int sourceIndex = m_viewSlotMap.at(viewIndex);
+    return sourceIndex >= 0 && sourceIndex < m_currentSettings.sources.size() ? sourceIndex : -1;
+}
+
 void UIManager::toggleSourceEnabled(int sourceIndex) {
     ensureSourceEnabledSize();
     if (sourceIndex < 0 || sourceIndex >= m_sourceEnabled.size()) return;
@@ -2029,11 +2037,11 @@ bool UIManager::insertPlaylistEntry(int index, qint64 inMs, qint64 outMs, double
     const QString clipPath =
         m_replayManager ? m_replayManager->getVideoPath() : QStringLiteral("playlist-entry");
     ReplayEntry entry{clipPath, inMs, outMs, speed};
-    stopPlaylistPlayoutForEdit();
     const int inserted = m_playlist.insertEntry(index, entry);
     if (inserted < 0) {
         return failPlaylistOperation(QStringLiteral("Invalid rundown entry range"));
     }
+    stopPlaylistPlayoutForEdit();
     markPlaylistChanged(true);
     return true;
 }
@@ -2043,19 +2051,19 @@ bool UIManager::insertPlaylistEntryAt(int index) {
 }
 
 bool UIManager::removePlaylistEntry(int index) {
-    stopPlaylistPlayoutForEdit();
     if (!m_playlist.removeEntry(index)) {
         return failPlaylistOperation(QStringLiteral("Rundown row is out of range"));
     }
+    stopPlaylistPlayoutForEdit();
     markPlaylistChanged(true);
     return true;
 }
 
 bool UIManager::movePlaylistEntry(int fromIndex, int toIndex) {
-    stopPlaylistPlayoutForEdit();
     if (!m_playlist.moveEntry(fromIndex, toIndex)) {
         return failPlaylistOperation(QStringLiteral("Rundown move is out of range"));
     }
+    stopPlaylistPlayoutForEdit();
     markPlaylistChanged(true);
     return true;
 }
@@ -2078,10 +2086,10 @@ bool UIManager::setPlaylistEntrySpeed(int index, double speed) {
 }
 
 bool UIManager::setPlaylistEntryInOut(int index, qint64 inMs, qint64 outMs) {
-    stopPlaylistPlayoutForEdit();
     if (!m_playlist.setEntryRange(index, inMs, outMs)) {
         return failPlaylistOperation(QStringLiteral("Invalid rundown entry range"));
     }
+    stopPlaylistPlayoutForEdit();
     markPlaylistChanged(true);
     return true;
 }
@@ -2173,18 +2181,25 @@ bool UIManager::loadPlaylistFromUrl(const QUrl& url) {
 // itself: the monitor (onPlayoutTick) arms each entry's out -> next-in boundary as a
 // frame-perfect armed cut and advances on each fire, applying each entry's speed.
 bool UIManager::playPlaylist(int fromIndex) {
-    if (!m_transport || !m_playbackWorker) return false;
+    if (!m_transport || !m_playbackWorker)
+        return failPlaylistOperation(QStringLiteral("Playback is not ready"));
     const QVector<ReplayEntry> entries = m_playlist.entries();
-    if (entries.isEmpty() || fromIndex < 0 || fromIndex >= entries.size()) return false;
+    if (entries.isEmpty() || fromIndex < 0 || fromIndex >= entries.size())
+        return failPlaylistOperation(QStringLiteral("Rundown row is out of range"));
     // Fail fast when the frame-perfect armed cut is unavailable (e.g. H.264: no
     // pre-roll bank). Without it the boundary cut never fires and the rundown would
     // silently dead-end on the first entry, so refuse rather than mislead.
-    if (!m_playbackWorker->armedCutAvailable()) return false;
+    const bool needsArmedCuts = fromIndex + 1 < entries.size();
+    if (needsArmedCuts && !m_playbackWorker->armedCutAvailable())
+        return failPlaylistOperation(
+            QStringLiteral("Frame-perfect rundown playout is unavailable for this recording"));
     // Every NON-final entry must have a marked out-point (>= its in) to bound its
     // boundary; an unmarked mid-list out (the markIn default, or hand-edited/loaded
     // data) would stall the rundown there. Refuse so the operator marks the out first.
     for (int i = fromIndex; i + 1 < entries.size(); ++i)
-        if (entries[i].outMs < entries[i].inMs) return false;
+        if (entries[i].outMs < entries[i].inMs)
+            return failPlaylistOperation(
+                QStringLiteral("Mark an out-point before playing this rundown"));
     // A second Play while a rundown is active: clean stop-then-start (also removes
     // the m_playoutCutBaseline-vs-in-flight-cut race a bare re-start would have).
     stopPlaylistPlayout();
@@ -2199,6 +2214,10 @@ bool UIManager::playPlaylist(int fromIndex) {
     m_transport->setPlaying(true);
     m_playoutCutBaseline = m_playbackWorker->cutsFired();
     if (!m_playoutMonitor.isActive()) m_playoutMonitor.start();
+    if (!m_playlistOperationError.isEmpty()) {
+        m_playlistOperationError.clear();
+        emit playlistOperationErrorChanged();
+    }
     emit playlistEntryChanged();
     return true;
 }
@@ -2949,12 +2968,13 @@ void UIManager::updateXTouchLcd() {
     if (!m_midiManager || !m_midiManager->isXTouchConnected()) return;
 
     QString label;
-    if (m_playbackSingleView && m_playbackSelectedIndex >= 0 &&
-        m_playbackSelectedIndex < m_currentSettings.sources.size()) {
-        const QString name = m_currentSettings.sources[m_playbackSelectedIndex].name.trimmed();
-        label = name.isEmpty() ? QString("CAM %1").arg(m_playbackSelectedIndex + 1) : name;
+    const int sourceIndex =
+        m_playbackSingleView ? sourceIndexForViewSlot(m_playbackSelectedIndex) : -1;
+    if (sourceIndex >= 0) {
+        const QString name = m_currentSettings.sources[sourceIndex].name.trimmed();
+        label = name.isEmpty() ? QString("CAM %1").arg(sourceIndex + 1) : name;
     } else if (m_playbackSingleView && m_playbackSelectedIndex >= 0) {
-        label = QString("CAM %1").arg(m_playbackSelectedIndex + 1);
+        label = QString("VIEW %1").arg(m_playbackSelectedIndex + 1);
     }
 
     m_midiManager->sendXTouchLcdText(label);
@@ -2978,15 +2998,16 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
     QDir dir(outputDir);
     if (!dir.exists()) dir.mkpath(".");
 
-    auto saveImageForIndex = [&](int index) {
-        if (index < 0 || index >= m_providers.size()) return;
+    auto saveImageForView = [&](int viewIndex) {
+        if (viewIndex < 0 || viewIndex >= m_providers.size()) return;
 
-        const QString feedName = (index < m_currentSettings.sources.size() &&
-                                  !m_currentSettings.sources[index].name.trimmed().isEmpty())
-                                     ? sanitizeFileToken(m_currentSettings.sources[index].name)
-                                     : QString("CAM%1").arg(index + 1);
+        const int sourceIndex = sourceIndexForViewSlot(viewIndex);
+        const QString feedName =
+            (sourceIndex >= 0 && !m_currentSettings.sources[sourceIndex].name.trimmed().isEmpty())
+                ? sanitizeFileToken(m_currentSettings.sources[sourceIndex].name)
+                : QString("VIEW%1").arg(viewIndex + 1);
 
-        QImage image = m_providers[index]->latestImage();
+        QImage image = m_providers[viewIndex]->latestImage();
         if (image.isNull()) return;
 
         const QString fileName = QString("%1_%2_%3_%4.jpg")
@@ -3002,10 +3023,10 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
     };
 
     if (singleView) {
-        saveImageForIndex(selectedIndex);
+        saveImageForView(selectedIndex);
     } else {
         for (int i = 0; i < m_providers.size(); ++i) {
-            saveImageForIndex(i);
+            saveImageForView(i);
         }
     }
 }

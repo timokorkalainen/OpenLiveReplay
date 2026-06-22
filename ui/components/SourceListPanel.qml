@@ -77,8 +77,8 @@ ColumnLayout {
                                                        && root.ui.isSourceEnabled(streamRow.index)
 
                     text: sourceEnabled ? "ON" : "OFF"
+                    highlighted: sourceEnabled
                     Layout.preferredWidth: 50
-                    palette.button: sourceEnabled ? Theme.ready : Theme.lineStrong
                     onClicked: if (root.hasUi) root.ui.toggleSourceEnabled(streamRow.index)
                 }
 
@@ -159,7 +159,7 @@ ColumnLayout {
                 // Misconfiguration warning: another source points at this same URL.
                 Label {
                     text: "⚠"
-                    color: Theme.armed
+                    color: Theme.warning
                     font.bold: true
                     Layout.preferredWidth: 16
                     visible: root.hasUi
@@ -280,7 +280,7 @@ ColumnLayout {
 
                 Text {
                     text: "Applying will replace the current input sources."
-                    color: Theme.armed
+                    color: Theme.warning
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
                 }

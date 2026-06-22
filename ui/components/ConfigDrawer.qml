@@ -104,7 +104,7 @@ Drawer {
                             Text {
                                 visible: root.hasUi && root.ui.importPreviewError !== ""
                                 text: root.hasUi ? root.ui.importPreviewError : ""
-                                color: Theme.armed
+                                color: Theme.warning
                                 wrapMode: Text.WordWrap
                                 Layout.fillWidth: true
                             }

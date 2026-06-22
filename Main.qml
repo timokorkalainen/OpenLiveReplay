@@ -45,7 +45,7 @@ ApplicationWindow {
     }
 
     onWidthChanged: {
-        if (appWindow.width < Theme.bpSM) appWindow.rundownExpanded = false
+        if (appWindow.width <= Theme.bpSM) appWindow.rundownExpanded = false
     }
 
     Timer {
@@ -238,7 +238,7 @@ ApplicationWindow {
                 anchors.fill: parent
                 anchors.margins: Theme.s2
                 text: "Warning: " + appWindow.recordingWarningText
-                color: Theme.armed
+                color: Theme.warning
                 wrapMode: Text.WordWrap
                 verticalAlignment: Text.AlignVCenter
             }

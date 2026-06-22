@@ -32,6 +32,7 @@ QtObject {
     // --- Semantic tally (one token per MEANING) ---
     readonly property color recordOnAir: "#E53935" // record active AND the single PGM/on-air tally
     readonly property color armed: "#FFB300"        // cued / preview / armed cut
+    readonly property color warning: "#FFD166"      // generic warnings / destructive previews
     readonly property color ready: "#43A047"        // healthy / ready / connected
     readonly property color idle: "#6E6E6E"         // no source / inactive
     readonly property color error: "#FF7043"        // no-signal / link-error / NDI drop (render as hatch/blink, never on-air)

@@ -10,7 +10,7 @@ target_link_libraries(tst_olrstyle PRIVATE
     OlrTheme OlrStyle olr_warnings)
 
 add_test(NAME tst_olrstyle
-    COMMAND tst_olrstyle -input "${CMAKE_CURRENT_SOURCE_DIR}")
+    COMMAND tst_olrstyle -input "${CMAKE_CURRENT_SOURCE_DIR}/tst_olrstyle.qml")
 set_tests_properties(tst_olrstyle PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
@@ -24,6 +24,18 @@ target_link_libraries(tst_statusstrip_onair PRIVATE
 add_test(NAME tst_statusstrip_onair
     COMMAND tst_statusstrip_onair -input "${CMAKE_CURRENT_SOURCE_DIR}/tst_statusstrip_onair.qml")
 set_tests_properties(tst_statusstrip_onair PROPERTIES
+    LABELS "unit;ci"
+    TIMEOUT 60
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+
+qt_add_executable(tst_pgmstage_mapping tst_pgmstage_mapping_main.cpp)
+target_link_libraries(tst_pgmstage_mapping PRIVATE
+    Qt6::QuickTest Qt6::Qml Qt6::Quick Qt6::Gui Qt6::Test Qt6::QuickControls2
+    OlrTheme OlrStyle olr_warnings)
+
+add_test(NAME tst_pgmstage_mapping
+    COMMAND tst_pgmstage_mapping -input "${CMAKE_CURRENT_SOURCE_DIR}/tst_pgmstage_mapping.qml")
+set_tests_properties(tst_pgmstage_mapping PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
@@ -79,6 +91,7 @@ target_link_libraries(uipreview PRIVATE
 if(UNIX AND NOT APPLE)
     target_link_options(tst_olrstyle PRIVATE "LINKER:--no-as-needed")
     target_link_options(tst_statusstrip_onair PRIVATE "LINKER:--no-as-needed")
+    target_link_options(tst_pgmstage_mapping PRIVATE "LINKER:--no-as-needed")
     target_link_options(tst_rundownrail_drag PRIVATE "LINKER:--no-as-needed")
     target_link_options(tst_scrubtimeline PRIVATE "LINKER:--no-as-needed")
     target_link_options(tst_transportdock_layout PRIVATE "LINKER:--no-as-needed")

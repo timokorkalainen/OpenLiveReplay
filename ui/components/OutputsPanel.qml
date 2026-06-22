@@ -22,7 +22,7 @@ GroupBox {
         if (severity === "ok")
             return Theme.ready
         if (severity === "warning")
-            return Theme.armed
+            return Theme.warning
         if (severity === "error")
             return Theme.error
         return Theme.textDim
@@ -32,7 +32,7 @@ GroupBox {
         id: ndiOutputScroll
         anchors.fill: parent
         clip: true
-        contentWidth: Math.max(availableWidth, root.tableMinimumWidth)
+        contentWidth: Math.max(width, root.tableMinimumWidth)
         ScrollBar.horizontal.policy: ScrollBar.AsNeeded
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
 

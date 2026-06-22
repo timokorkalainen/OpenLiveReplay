@@ -43,10 +43,12 @@ Item {
 
     function selectSource(sourceIndex) {
         if (!root.hasUi || sourceIndex < 0) return
+        var viewIndex = root.viewForSource(sourceIndex)
+        if (viewIndex < 0) return
         root.selectedSourceIndex = sourceIndex
-        root.selectedIndex = root.viewForSource(sourceIndex)
+        root.selectedIndex = viewIndex
         root.viewMode = "single"
-        root.ui.setPlaybackViewState(true, sourceIndex)
+        root.ui.setPlaybackViewState(true, viewIndex)
     }
 
     function selectViewSlot(viewIndex) {
@@ -64,6 +66,17 @@ Item {
         if (root.hasUi) {
             root.ui.setPlaybackViewState(false, -1)
         }
+    }
+
+    function rebindSelectedSource() {
+        if (!root.hasUi || root.viewMode !== "single" || root.selectedSourceIndex < 0) return
+        var viewIndex = root.viewForSource(root.selectedSourceIndex)
+        if (viewIndex < 0) {
+            root.resetToMulti()
+            return
+        }
+        root.selectedIndex = viewIndex
+        root.ui.setPlaybackViewState(true, viewIndex)
     }
 
     function updateVisibleStreams() {
@@ -103,6 +116,12 @@ Item {
         }
         function onMultiviewCountChanged() {
             root.resetToMulti()
+        }
+        function onViewSlotMapChanged() {
+            if (root.viewMode === "single")
+                root.rebindSelectedSource()
+            else
+                root.updateVisibleStreams()
         }
         function onFeedSelectRequested(index) {
             root.selectSource(index)

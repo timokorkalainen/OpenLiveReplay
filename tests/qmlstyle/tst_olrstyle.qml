@@ -30,6 +30,11 @@ TestCase {
         id: combo
         model: ["A", "B"]
     }
+    Switch {
+        id: switchControl
+        text: "Live"
+        checked: true
+    }
 
     function channelToLinear(channel) {
         return channel <= 0.03928
@@ -75,6 +80,7 @@ TestCase {
         verify(Theme.minWUrl > Theme.minWField)
         verify(Theme.warnSurface !== Theme.panel)
         verify(Theme.warnBorder !== Theme.line)
+        verify(Theme.warning !== Theme.armed)
     }
 
     function test_contrastTokensMeetThresholds() {
@@ -85,7 +91,7 @@ TestCase {
             verifyContrast("textDim surface " + i, Theme.textDim, surfaces[i], 4.5)
         }
 
-        verifyContrast("warning text", Theme.armed, Theme.warnSurface, 4.5)
+        verifyContrast("warning text", Theme.warning, Theme.warnSurface, 4.5)
         verifyContrast("textOnTally record", Theme.textOnTally, Theme.recordOnAir, 4.5)
         verifyContrast("textOnTally armed", Theme.textOnTally, Theme.armed, 4.5)
         verifyContrast("textOnTally ready", Theme.textOnTally, Theme.ready, 4.5)
@@ -106,6 +112,12 @@ TestCase {
         combo.forceActiveFocus(Qt.TabFocusReason)
         tryCompare(combo.background.border, "color", Theme.focusRing)
         verify(combo.implicitHeight >= Theme.hControl)
+
+        primary.forceActiveFocus(Qt.TabFocusReason)
+        tryCompare(primary.background.border, "color", Theme.textHi)
+
+        switchControl.forceActiveFocus(Qt.TabFocusReason)
+        tryCompare(switchControl.indicator.border, "color", Theme.focusRing)
         verify(Theme.hCompact >= 24)
     }
 }

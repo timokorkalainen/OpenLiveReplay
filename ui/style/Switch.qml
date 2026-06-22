@@ -25,7 +25,8 @@ T.Switch {
         radius: height / 2
         color: control.checked ? Theme.ready : Theme.panelPressed
         border.width: Theme.borderW
-        border.color: control.checked ? Theme.ready : Theme.lineStrong
+        border.color: control.visualFocus ? Theme.focusRing
+                                          : (control.checked ? Theme.ready : Theme.lineStrong)
 
         Rectangle {
             x: control.checked ? parent.width - width - 2 : 2

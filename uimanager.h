@@ -444,6 +444,7 @@ private:
     int activeViewCount() const;
     QStringList activeStreamUrls() const;
     QStringList activeStreamNames() const;
+    int sourceIndexForViewSlot(int viewIndex) const;
     void rebuildSlotMap();
     void ensureSourceEnabledSize();
     void updateXTouchLcd();

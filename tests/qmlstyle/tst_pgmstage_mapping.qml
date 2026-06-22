@@ -17,7 +17,10 @@ TestCase {
         property int lastPlaybackSingle: -1
         property int lastPlaybackIndex: -99
 
+        signal playbackProvidersChanged()
+        signal streamUrlsChanged()
         signal feedSelectRequested(int index)
+        signal multiviewRequested()
 
         function setPlaybackViewState(singleView, selectedIndex) {
             lastPlaybackSingle = singleView ? 1 : 0
@@ -43,14 +46,14 @@ TestCase {
         mockUi.lastPlaybackIndex = -99
     }
 
-    function test_viewSlotSelectionPassesMappedSourceIndex() {
+    function test_viewSlotSelectionPassesViewSlotToPlayback() {
         stage.selectViewSlot(0)
 
         compare(stage.viewMode, "single")
         compare(stage.selectedIndex, 0)
         compare(stage.selectedSourceIndex, 1)
         compare(mockUi.lastPlaybackSingle, 1)
-        compare(mockUi.lastPlaybackIndex, 1)
+        compare(mockUi.lastPlaybackIndex, 0)
     }
 
     function test_unmappedViewSlotDoesNotSetOnAir() {
@@ -63,12 +66,50 @@ TestCase {
         compare(mockUi.lastPlaybackIndex, -99)
     }
 
-    function test_externalFeedSelectionPassesSourceIndex() {
+    function test_externalFeedSelectionPassesMappedViewSlotToPlayback() {
         mockUi.feedSelectRequested(1)
 
         compare(stage.viewMode, "single")
         compare(stage.selectedIndex, 0)
         compare(stage.selectedSourceIndex, 1)
+        compare(mockUi.lastPlaybackIndex, 0)
+    }
+
+    function test_externalFeedSelectionForHiddenSourceDoesNotSelectPgm() {
+        mockUi.viewSlotMap = [1, 0, 2, 3]
+
+        mockUi.feedSelectRequested(7)
+
+        compare(stage.viewMode, "multi")
+        compare(stage.selectedIndex, -1)
+        compare(stage.selectedSourceIndex, -1)
+        compare(mockUi.lastPlaybackIndex, -99)
+    }
+
+    function test_viewSlotMapChangeRebindsSelectedSourceToNewViewSlot() {
+        stage.selectSource(1)
+        compare(stage.viewMode, "single")
+        compare(stage.selectedIndex, 0)
+        compare(mockUi.lastPlaybackIndex, 0)
+
+        mockUi.viewSlotMap = [0, 1, 2, 3]
+        mockUi.viewSlotMapChanged()
+
+        compare(stage.viewMode, "single")
+        compare(stage.selectedIndex, 1)
+        compare(stage.selectedSourceIndex, 1)
         compare(mockUi.lastPlaybackIndex, 1)
+    }
+
+    function test_viewSlotMapChangeResetsHiddenSelectedSource() {
+        stage.selectSource(1)
+        compare(stage.viewMode, "single")
+
+        mockUi.viewSlotMap = [0, 2, 3, -1]
+        mockUi.viewSlotMapChanged()
+
+        compare(stage.viewMode, "multi")
+        compare(stage.selectedIndex, -1)
+        compare(stage.selectedSourceIndex, -1)
     }
 }

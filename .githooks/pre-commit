@@ -43,9 +43,21 @@ if [ -n "$qml_files" ]; then
     [ -n "$QMLLINT" ] || QMLLINT="$(command -v qmllint || true)"
     if [ -n "$QMLLINT" ] && [ -x "$QMLLINT" ]; then
         qmldir="$(cd "$(dirname "$QMLLINT")/../qml" 2>/dev/null && pwd || true)"
+        qml_import_args=()
+        project_qml_import_found=0
+        for d in build/qmllint-imports build/c/qml build/prepush-delivery/qml build/qml; do
+            if [ -d "$d" ]; then
+                qml_import_args+=(-I "$d")
+                project_qml_import_found=1
+            fi
+        done
+        if [ "$project_qml_import_found" -eq 0 ]; then
+            echo "[pre-commit] project QML import dir not found (run a CMake build) — skipping QML lint" >&2
+            qml_files=""
+        fi
         # shellcheck disable=SC2086
-        if ! "$QMLLINT" --unqualified error --Quick.layout-positioning error \
-                ${qmldir:+-I "$qmldir"} $qml_files; then
+        if [ -n "$qml_files" ] && ! "$QMLLINT" --unqualified error --Quick.layout-positioning error \
+                "${qml_import_args[@]}" ${qmldir:+-I "$qmldir"} $qml_files; then
             echo "[pre-commit] qmllint failed on staged QML" >&2
             fail=1
         fi

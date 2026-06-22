@@ -7,7 +7,11 @@
 
 namespace {
 
-constexpr double kMaxSafeJsonInteger = 9007199254740991.0; // 2^53 - 1
+constexpr qint64 kMaxSafeJsonInteger = 9007199254740991LL; // 2^53 - 1
+
+bool isSafeJsonInteger(qint64 value) {
+    return value >= -kMaxSafeJsonInteger && value <= kMaxSafeJsonInteger;
+}
 
 bool readRequiredString(const QJsonObject& obj, const char* key, QString& out) {
     const QJsonValue value = obj.value(QLatin1StringView(key));
@@ -24,8 +28,9 @@ bool readRequiredInt64(const QJsonObject& obj, const char* key, qint64& out) {
         return false;
     }
     const double number = value.toDouble();
-    if (!std::isfinite(number) || std::floor(number) != number || number < -kMaxSafeJsonInteger ||
-        number > kMaxSafeJsonInteger) {
+    if (!std::isfinite(number) || std::floor(number) != number ||
+        number < -static_cast<double>(kMaxSafeJsonInteger) ||
+        number > static_cast<double>(kMaxSafeJsonInteger)) {
         return false;
     }
     out = static_cast<qint64>(number);
@@ -44,10 +49,14 @@ bool readRequiredDouble(const QJsonObject& obj, const char* key, double& out) {
 } // namespace
 
 bool ReplayPlaylist::validRange(qint64 inMs, qint64 outMs) {
-    return inMs >= 0 && (outMs < 0 || outMs >= inMs);
+    return inMs >= 0 && isSafeJsonInteger(inMs) &&
+           (outMs == -1 || (outMs >= inMs && isSafeJsonInteger(outMs)));
 }
 
 int ReplayPlaylist::markIn(const QString& clipPath, qint64 inMs) {
+    if (!validRange(inMs, -1)) {
+        return -1;
+    }
     ReplayEntry e;
     e.clipPath = clipPath;
     e.inMs = inMs;
@@ -62,7 +71,7 @@ bool ReplayPlaylist::markOut(qint64 outMs) {
         return false;
     }
     ReplayEntry& last = m_entries.last();
-    if (last.outMs != -1 || outMs < last.inMs) {
+    if (last.outMs != -1 || outMs < 0 || !validRange(last.inMs, outMs)) {
         return false;
     }
     last.outMs = outMs;
@@ -80,7 +89,7 @@ void ReplayPlaylist::setSpeed(int index, double speed) {
     if (index < 0 || index >= m_entries.size()) {
         return;
     }
-    m_entries[index].speed = (speed < kMinSpeed) ? kMinSpeed : speed;
+    m_entries[index].speed = (!std::isfinite(speed) || speed < kMinSpeed) ? kMinSpeed : speed;
 }
 
 bool ReplayPlaylist::removeEntry(int index) {
@@ -96,7 +105,7 @@ int ReplayPlaylist::insertEntry(int index, const ReplayEntry& entry) {
         return -1;
     }
     ReplayEntry normalized = entry;
-    if (normalized.speed < kMinSpeed) {
+    if (!std::isfinite(normalized.speed) || normalized.speed < kMinSpeed) {
         normalized.speed = kMinSpeed;
     }
     const int target = std::clamp(index, 0, static_cast<int>(m_entries.size()));

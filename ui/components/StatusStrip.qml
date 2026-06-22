@@ -13,7 +13,12 @@ RowLayout {
     property bool rundownOpen: false
     property string recordingError: ""
     readonly property int avail: root.parent ? root.parent.width : root.width
-    readonly property int tallyCount: root.hasUi ? Math.max(0, Math.min(16, root.ui.multiviewCount)) : 4
+    readonly property int sourceCount: root.hasUi && root.ui.streamUrls !== undefined
+                                       ? Math.max(0, Math.min(16, root.ui.streamUrls.length))
+                                       : (root.hasUi
+                                          ? Math.max(0, Math.min(16, root.ui.multiviewCount))
+                                          : 4)
+    readonly property int tallyCount: root.sourceCount
     readonly property int sourceConnectionVersion: root.hasUi ? root.ui.sourceConnectionVersion : 0
     readonly property int sourceStatsVersion: root.hasUi ? root.ui.sourceStatsVersion : 0
     readonly property bool tight: root.avail <= Theme.bpMD
@@ -46,7 +51,14 @@ RowLayout {
             + ":" + (ss < 10 ? "0" + ss : "" + ss)
     }
 
-    function tallyColor(index) {
+    function selectedPgmSourceIndex() {
+        if (!root.hasUi || !root.ui.playbackSingleView) return -1
+        var viewIndex = root.ui.playbackSelectedIndex
+        var map = root.ui.viewSlotMap || []
+        return (viewIndex >= 0 && viewIndex < map.length) ? map[viewIndex] : viewIndex
+    }
+
+    function tallyColor(sourceIndex) {
         if (!root.hasUi || !root.ui.isRecording) return Theme.idle
 
         var versionTouch = root.ui.playbackViewStateVersion
@@ -54,14 +66,14 @@ RowLayout {
             + root.ui.sourceStatsVersion
         if (versionTouch < 0) return Theme.idle
 
-        if (root.ui.playbackSingleView && root.ui.playbackSelectedIndex === index) {
+        if (root.selectedPgmSourceIndex() === sourceIndex) {
             return Theme.recordOnAir
         }
 
-        var connected = root.ui.isSourceConnected(index)
+        var connected = root.ui.isSourceConnected(sourceIndex)
         if (!connected) return Theme.error
 
-        var linkHealth = root.ui.sourceLinkHealth(index)
+        var linkHealth = root.ui.sourceLinkHealth(sourceIndex)
         if (linkHealth === 3) return Theme.error
         if (linkHealth === 2) return Theme.armed
         return Theme.ready
