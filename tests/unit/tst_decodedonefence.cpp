@@ -12,6 +12,8 @@ class TestDecodeDoneFence : public QObject {
 private slots:
     void signalThenWaitSucceeds();
     void waitBlocksUntilSignaledFromAnotherThread();
+    void signaledValueAdvances();
+    void waitForValueReachesGpuTimeline();
 };
 
 void TestDecodeDoneFence::signalThenWaitSucceeds() {
@@ -33,6 +35,26 @@ void TestDecodeDoneFence::waitBlocksUntilSignaledFromAnotherThread() {
     });
     QVERIFY(fence->waitDecodeDone(2000));
     producer.join();
+}
+
+void TestDecodeDoneFence::signaledValueAdvances() {
+    auto fence = DecodeDoneFence::create();
+    if (!fence) QSKIP("no fence backend on this platform");
+    QCOMPARE(fence->signaledValue(), uint64_t(0));
+    fence->signalDecodeDone();
+    QVERIFY(fence->signaledValue() >= 1);
+    const uint64_t v1 = fence->signaledValue();
+    fence->signalDecodeDone();
+    QVERIFY(fence->signaledValue() > v1);
+}
+
+void TestDecodeDoneFence::waitForValueReachesGpuTimeline() {
+    auto fence = DecodeDoneFence::create();
+    if (!fence) QSKIP("no fence backend on this platform");
+    QVERIFY(!fence->waitForValue(1, 50));
+    fence->signalDecodeDone();
+    const uint64_t v = fence->signaledValue();
+    QVERIFY(fence->waitForValue(v, 1000));
 }
 
 QTEST_GUILESS_MAIN(TestDecodeDoneFence)
