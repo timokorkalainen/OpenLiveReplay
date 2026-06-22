@@ -161,11 +161,14 @@ Item {
                 var mpeg2Feeds = (typeof r.mpeg2SafeFeeds === "number") ? r.mpeg2SafeFeeds : "?"
                 var rec        = r.recommended || ""
                 var h264Avail  = (r.h264Available === true)
+                var h264Measured = (typeof r.h264SafeFeeds === "number" && r.h264SafeFeeds >= 0)
 
                 var lines = []
                 lines.push("MPEG-2 (software): " + mpeg2Feeds + " safe feeds")
-                if (h264Avail) {
+                if (h264Avail && h264Measured) {
                     lines.push("H.264 (hardware): " + h264Feeds + " safe feeds")
+                } else if (h264Avail) {
+                    lines.push("H.264 (hardware): not benchmarked")
                 } else {
                     lines.push("H.264 (hardware): not available")
                 }

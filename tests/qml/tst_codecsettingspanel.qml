@@ -139,6 +139,22 @@ TestCase {
                "shows recommendation: " + txt.text)
     }
 
+    function test_h264_available_but_unmeasured() {
+        mock.benchmarkResult = {
+            "recommended": "mpeg2",
+            "h264SafeFeeds": -1,
+            "mpeg2SafeFeeds": 4,
+            "h264Available": true
+        }
+        var p = makePanel()
+        var txt = findChild(p, "benchmarkResultText")
+        verify(txt, "found benchmarkResultText")
+        verify(txt.text.indexOf("H.264 (hardware): not benchmarked") >= 0,
+               "shows H.264 not-benchmarked line: " + txt.text)
+        verify(txt.text.indexOf("-1 safe feeds") < 0,
+               "does not show sentinel safe-feed count: " + txt.text)
+    }
+
     function test_empty_result_shows_not_benchmarked() {
         var p = makePanel()
         var txt = findChild(p, "benchmarkResultText")
