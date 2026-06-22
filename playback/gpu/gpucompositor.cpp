@@ -167,6 +167,8 @@ CpuPlanes makeRgbaPlanes(int width, int height, QByteArray bytes) {
     return out;
 }
 
+// QRhiResourceUpdateBatch::uploadTexture mutates the batch, despite clang-tidy's heuristic.
+// NOLINTNEXTLINE(readability-non-const-parameter)
 bool uploadNv12Planes(QRhiResourceUpdateBatch* updates, QRhiTexture* yTex, QRhiTexture* uvTex,
                       const CpuPlanes& nv12) {
     if (!updates || !yTex || !uvTex || !nv12.isValid() || nv12.format != FramePixelFormat::Nv12)
@@ -471,8 +473,7 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         }
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);
         meta.color = color;
-        return makeGpuFrameHandle(std::move(surface), m_impl->rhi, std::move(meta),
-                                  std::move(renderFence));
+        return makeGpuFrameHandle(std::move(surface), m_impl->rhi, meta, std::move(renderFence));
     }
 
     CpuPlanes rgba =

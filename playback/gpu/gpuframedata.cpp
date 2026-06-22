@@ -22,8 +22,7 @@ quint32 nextTelemetryKey() {
 
 } // namespace
 
-GpuFrameData::GpuFrameData(std::shared_ptr<GpuSurface> surface,
-                           std::shared_ptr<GpuRhiContext> rhi,
+GpuFrameData::GpuFrameData(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuRhiContext> rhi,
                            FramePixelFormat nativeFormat, ColorMetadata color,
                            std::shared_ptr<GpuFence> renderFence)
     : m_surface(std::move(surface)), m_rhi(std::move(rhi)), m_renderFence(std::move(renderFence)),
