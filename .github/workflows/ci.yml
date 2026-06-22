@@ -463,11 +463,10 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          probe="./build-tests/tests/probes/rhi_d3d_probe"
-          [ -x "$probe" ] || probe="${probe}.exe"
+          probe="$(find build-tests -type f \( -name rhi_d3d_probe -o -name rhi_d3d_probe.exe \) -print -quit)"
           if [ ! -x "$probe" ]; then
             echo "::warning::rhi_d3d_probe executable not found"
-            find build-tests/tests/probes -maxdepth 2 -type f -print || true
+            find build-tests -maxdepth 2 -type f -name '*rhi*d3d*' -print || true
             exit 0
           fi
           "$probe"
@@ -490,8 +489,12 @@ jobs:
           export QT_QPA_PLATFORM=offscreen
           ctest --test-dir build-tests --output-on-failure \
             -R '^(tst_nativeaacdecoder|tst_gpufence)$'
-          gpu_test="./build-tests/tests/unit/tst_gpucompositor"
-          [ -x "$gpu_test" ] || gpu_test="${gpu_test}.exe"
+          gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
+          if [ ! -x "$gpu_test" ]; then
+            echo "::error::tst_gpucompositor executable not found"
+            find build-tests -maxdepth 2 -type f -name '*gpucompositor*' -print || true
+            exit 127
+          fi
           "$gpu_test" -v2
 
   # ---------------------------------------------------------------------------
