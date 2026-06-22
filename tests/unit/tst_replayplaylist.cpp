@@ -26,6 +26,8 @@ private slots:
     void jsonRoundTripPreservesEntries();
     void fromJsonRejectsMalformed();
     void fromJsonRejectsInvalidEntryRanges();
+    void fromJsonRejectsMissingEntryFields();
+    void fromJsonRejectsWrongTypedEntryFields();
 };
 
 void TestReplayPlaylist::emptyHasNoEntries() {
@@ -228,6 +230,29 @@ void TestReplayPlaylist::fromJsonRejectsInvalidEntryRanges() {
     QJsonArray entries;
     entries.append(
         QJsonObject{{"clipPath", "/clips/a.mkv"}, {"inMs", 500}, {"outMs", 100}, {"speed", 1.0}});
+
+    QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
+    QCOMPARE(b.count(), 0);
+}
+
+void TestReplayPlaylist::fromJsonRejectsMissingEntryFields() {
+    ReplayPlaylist b;
+    QJsonArray entries;
+    entries.append(QJsonObject{});
+
+    QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
+    QCOMPARE(b.count(), 0);
+}
+
+void TestReplayPlaylist::fromJsonRejectsWrongTypedEntryFields() {
+    ReplayPlaylist b;
+    QJsonArray entries;
+    entries.append(QJsonObject{
+        {"clipPath", 42},
+        {"inMs", QStringLiteral("zero")},
+        {"outMs", QJsonValue::Null},
+        {"speed", QStringLiteral("fast")},
+    });
 
     QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
     QCOMPARE(b.count(), 0);

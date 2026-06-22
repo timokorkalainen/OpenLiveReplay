@@ -14,6 +14,7 @@ Frame {
     readonly property bool hasUi: root.ui !== undefined && root.ui !== null
     readonly property int rowHeight: 104
     property int dragIndex: -1
+    property int dragTargetIndex: -1
 
     signal toggleRequested()
     signal saveRequested()
@@ -57,6 +58,38 @@ Frame {
 
     function insertAt(index) {
         if (root.hasUi) root.ui.insertPlaylistEntryAt(index)
+    }
+
+    function rowIndexAt(handle, x, y) {
+        var point = handle.mapToItem(rundownList.contentItem, x, y)
+        var target = rundownList.indexAt(Math.max(1, Math.min(rundownList.width - 2, point.x)),
+                                         point.y)
+        if (target >= 0) return target
+        if (point.y < 0) return 0
+        if (point.y > rundownList.contentHeight) return Math.max(0, rundownList.count - 1)
+        return -1
+    }
+
+    function beginDrag(index) {
+        root.dragIndex = index
+        root.dragTargetIndex = index
+    }
+
+    function updateDragTarget(handle, x, y) {
+        root.dragTargetIndex = root.rowIndexAt(handle, x, y)
+    }
+
+    function finishDrag(target) {
+        if (target >= 0) {
+            root.moveEntry(root.dragIndex, target)
+        }
+        root.dragIndex = -1
+        root.dragTargetIndex = -1
+    }
+
+    function cancelDrag() {
+        root.dragIndex = -1
+        root.dragTargetIndex = -1
     }
 
     function requestToggle() {
@@ -251,22 +284,10 @@ Frame {
                         border.width: Theme.borderW
                         border.color: row.index === root.ui.currentPlaylistEntryIndex
                                       ? Theme.recordOnAir
-                                      : (row.index === root.ui.nextPlaylistEntryIndex ? Theme.armed : Theme.line)
+                                      : (root.dragIndex >= 0 && row.index === root.dragTargetIndex
+                                         ? Theme.accent
+                                         : (row.index === root.ui.nextPlaylistEntryIndex ? Theme.armed : Theme.line))
                         radius: Theme.r1
-
-                        Drag.active: dragHandler.active
-                        Drag.hotSpot.x: width / 2
-                        Drag.hotSpot.y: height / 2
-
-                        DropArea {
-                            anchors.fill: parent
-                            onEntered: (drag) => {
-                                if (drag !== null && root.dragIndex >= 0 && root.dragIndex !== row.index) {
-                                    root.moveEntry(root.dragIndex, row.index)
-                                    root.dragIndex = row.index
-                                }
-                            }
-                        }
 
                         MouseArea {
                             anchors.fill: parent
@@ -279,10 +300,12 @@ Frame {
                             spacing: Theme.s2
 
                             Rectangle {
+                                objectName: "rundownDragHandle" + row.index
+                                z: 2
                                 Layout.preferredWidth: Theme.hCompact
                                 Layout.fillHeight: true
                                 radius: Theme.r1
-                                color: dragHandler.active ? Theme.accent : Theme.panelPressed
+                                color: dragMouse.pressed ? Theme.accent : Theme.panelPressed
                                 border.color: Theme.line
                                 border.width: Theme.borderW
 
@@ -293,12 +316,27 @@ Frame {
                                     font.family: Theme.fontMono
                                 }
 
-                                DragHandler {
-                                    id: dragHandler
-                                    target: null
-                                    onActiveChanged: {
-                                        root.dragIndex = active ? row.index : -1
+                                MouseArea {
+                                    id: dragMouse
+                                    objectName: "rundownDragMouse" + row.index
+
+                                    anchors.fill: parent
+                                    z: 2
+                                    acceptedButtons: Qt.LeftButton
+                                    preventStealing: true
+                                    onPressed: (mouse) => {
+                                        root.beginDrag(row.index)
+                                        mouse.accepted = true
                                     }
+                                    onPositionChanged: (mouse) => {
+                                        if (pressed) {
+                                            root.updateDragTarget(parent, mouse.x, mouse.y)
+                                        }
+                                    }
+                                    onReleased: (mouse) => {
+                                        root.finishDrag(root.rowIndexAt(parent, mouse.x, mouse.y))
+                                    }
+                                    onCanceled: root.cancelDrag()
                                 }
                             }
 

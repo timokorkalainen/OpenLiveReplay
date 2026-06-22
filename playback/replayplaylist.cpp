@@ -3,6 +3,45 @@
 #include <QJsonArray>
 #include <QJsonValue>
 #include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace {
+
+bool readRequiredString(const QJsonObject& obj, const char* key, QString& out) {
+    const QJsonValue value = obj.value(QLatin1StringView(key));
+    if (!value.isString()) {
+        return false;
+    }
+    out = value.toString();
+    return !out.isEmpty();
+}
+
+bool readRequiredInt64(const QJsonObject& obj, const char* key, qint64& out) {
+    const QJsonValue value = obj.value(QLatin1StringView(key));
+    if (!value.isDouble()) {
+        return false;
+    }
+    const double number = value.toDouble();
+    if (!std::isfinite(number) || std::floor(number) != number ||
+        number < static_cast<double>(std::numeric_limits<qint64>::min()) ||
+        number > static_cast<double>(std::numeric_limits<qint64>::max())) {
+        return false;
+    }
+    out = static_cast<qint64>(number);
+    return true;
+}
+
+bool readRequiredDouble(const QJsonObject& obj, const char* key, double& out) {
+    const QJsonValue value = obj.value(QLatin1StringView(key));
+    if (!value.isDouble()) {
+        return false;
+    }
+    out = value.toDouble();
+    return std::isfinite(out);
+}
+
+} // namespace
 
 bool ReplayPlaylist::validRange(qint64 inMs, qint64 outMs) {
     return inMs >= 0 && (outMs < 0 || outMs >= inMs);
@@ -118,10 +157,12 @@ bool ReplayPlaylist::fromJson(const QJsonObject& obj) {
         }
         const QJsonObject o = v.toObject();
         ReplayEntry e;
-        e.clipPath = o.value("clipPath").toString();
-        e.inMs = static_cast<qint64>(o.value("inMs").toDouble(0.0));
-        e.outMs = static_cast<qint64>(o.value("outMs").toDouble(-1.0));
-        e.speed = o.value("speed").toDouble(1.0);
+        if (!readRequiredString(o, "clipPath", e.clipPath) ||
+            !readRequiredInt64(o, "inMs", e.inMs) ||
+            !readRequiredInt64(o, "outMs", e.outMs) ||
+            !readRequiredDouble(o, "speed", e.speed)) {
+            return false;
+        }
         if (!validRange(e.inMs, e.outMs)) {
             return false;
         }
