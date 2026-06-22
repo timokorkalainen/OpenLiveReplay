@@ -24,12 +24,12 @@ QString hrMessage(const QString& action, HRESULT hr) {
 } // namespace
 
 bool ensureMediaFoundationRuntime(QString* error) {
-    std::call_once(g_mfStartupOnce, [] {
-        g_mfStartupResult = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-    });
+    std::call_once(g_mfStartupOnce,
+                   [] { g_mfStartupResult = MFStartup(MF_VERSION, MFSTARTUP_LITE); });
     if (FAILED(g_mfStartupResult)) {
         if (error) {
-            *error = hrMessage(QStringLiteral("Media Foundation startup failed"), g_mfStartupResult);
+            *error =
+                hrMessage(QStringLiteral("Media Foundation startup failed"), g_mfStartupResult);
         }
         return false;
     }

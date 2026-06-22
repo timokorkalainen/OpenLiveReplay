@@ -333,12 +333,12 @@ RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& 
                     res.startupFailed = true;
                     return;
                 } // C3
-                const bool primeOk =
-                    enc->encode(prime, p,
-                                [&](const QByteArray& data, int64_t, bool) {
-                                    gotPrimePacket = gotPrimePacket || !data.isEmpty();
-                                },
-                                &err);
+                const bool primeOk = enc->encode(
+                    prime, p,
+                    [&](const QByteArray& data, int64_t, bool) {
+                        gotPrimePacket = gotPrimePacket || !data.isEmpty();
+                    },
+                    &err);
                 av_frame_free(&prime);
                 if (!primeOk) {
                     res.startupFailed = true;
