@@ -12,6 +12,7 @@ GroupBox {
     readonly property var rows: root.hasUi && root.ui.broadcastOutputsVersion >= 0
                                 ? root.ui.ndiOutputRows()
                                 : []
+    readonly property int tableMinimumWidth: 760
 
     title: "NDI Outputs"
     Layout.fillWidth: true
@@ -31,18 +32,18 @@ GroupBox {
         id: ndiOutputScroll
         anchors.fill: parent
         clip: true
-        contentWidth: Math.max(availableWidth, ndiOutputTable.implicitWidth)
+        contentWidth: Math.max(availableWidth, root.tableMinimumWidth)
         ScrollBar.horizontal.policy: ScrollBar.AsNeeded
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
 
         ColumnLayout {
             id: ndiOutputTable
-            width: Math.max(ndiOutputScroll.availableWidth, implicitWidth)
+            width: ndiOutputScroll.contentWidth
             spacing: 8
 
             RowLayout {
                 Layout.fillWidth: true
-                Layout.minimumWidth: 744
+                Layout.minimumWidth: root.tableMinimumWidth
                 spacing: 8
 
                 Label {
@@ -103,7 +104,7 @@ GroupBox {
                                                              ? (statusData.sinkSubmittedFrames || 0)
                                                              : (statusData.framesSubmitted || 0)
                     width: ndiOutputTable.width
-                    Layout.minimumWidth: 744
+                    Layout.minimumWidth: root.tableMinimumWidth
                     spacing: 8
 
                     Label {
