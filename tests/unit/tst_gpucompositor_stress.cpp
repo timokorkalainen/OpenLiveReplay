@@ -47,7 +47,7 @@ void TestGpuCompositorStress::staleGenerationInputIsDroppedAsAbsent() {
     auto comp = GpuCompositor::create(rhi);
     if (!comp) QSKIP("compositor unavailable");
 
-    GpuGenerationCounter::instance().reset();
+    GpuGenerationCounter::instance().resetForTest();
     const uint64_t generation = GpuGenerationCounter::instance().bump();
     FrameHandle stale = solidYuv420pHandle(4, 4, 200, 128, 128);
     stale.metadata().gpuGeneration = generation;
@@ -86,7 +86,7 @@ void TestGpuCompositorStress::concurrentComposeAndChecksumValidate() {
     auto comp = GpuCompositor::create(rhi);
     if (!comp) QSKIP("compositor unavailable");
 
-    GpuGenerationCounter::instance().reset();
+    GpuGenerationCounter::instance().resetForTest();
     QList<FrameHandle> frames{solidYuv420pHandle(4, 4, 40, 60, 200),
                               solidYuv420pHandle(4, 4, 160, 90, 170)};
     ColorMetadata color;

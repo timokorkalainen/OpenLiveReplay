@@ -207,8 +207,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
         if (m_gpuCompositor && m_gpuCompositor->isValid() && gpuPipelineEnabled()) {
             ColorMetadata color;
             composed = m_gpuCompositor->composeGridMemoizedForGeneration(
-                frames, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear,
-                sourceKeys, memo, state.gpuGeneration);
+                frames, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear, sourceKeys,
+                memo, state.gpuGeneration);
         }
 #endif
         if (composed.isNull()) {
@@ -220,8 +220,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
             }
         }
         out.video = composed;
-        out.video.metadata().key.isPlaceholder = !anySourcePresent;
     }
+    out.video.metadata().key.isPlaceholder = !anySourcePresent;
 
     // Identity must reflect the composited source content, not the advancing playhead,
     // so repeated-payload detection works when the underlying feeds are frozen.

@@ -438,6 +438,9 @@ void PlaybackWorker::shutdownOutputGraph() {
         QMutexLocker bufferLocker(&m_bufferMutex);
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (m_outputCache) collectEvictedGpuFramesLocked(m_outputCache->videoFramesSnapshot());
+        if (m_stagingCache) collectEvictedGpuFramesLocked(m_stagingCache->videoFramesSnapshot());
+        if (m_prerollStagingCache)
+            collectEvictedGpuFramesLocked(m_prerollStagingCache->videoFramesSnapshot());
 #endif
         // Drop the published snapshot so a post-teardown tick (if any) falls back
         // to an empty cache rather than holding stale frames from the old graph.
@@ -448,10 +451,12 @@ void PlaybackWorker::shutdownOutputGraph() {
         m_publishedCache.publish(nullptr);
 #endif
         m_outputCache.reset();
+        m_stagingCache.reset();
+        m_prerollStagingCache.reset();
     }
     m_outputFeedCount = 0;
 #ifdef OLR_GPU_PIPELINE_BUILD
-    drainEvictedGpuFrames();
+    forceDrainEvictedGpuFrames();
     m_renderFence.reset();
     m_stagingFence.reset();
     m_stagedFenceValue.store(0, std::memory_order_release);
@@ -541,8 +546,7 @@ void PlaybackWorker::publishOutputCacheLocked() {
     if (!m_outputCache) return;
     auto next = std::make_shared<const OutputFrameCache>(*m_outputCache);
 #ifdef OLR_GPU_PIPELINE_BUILD
-    auto previous = m_publishedCache.publish(std::move(next));
-    if (previous) collectEvictedGpuFramesLocked(previous->videoFramesSnapshot());
+    m_publishedCache.publish(std::move(next));
 #else
     m_publishedCache.publish(std::move(next));
 #endif
@@ -587,6 +591,41 @@ void PlaybackWorker::drainEvictedGpuFrames() {
         QMutexLocker bufferLocker(&m_bufferMutex);
         m_gpuFrameRetireQueue.append(std::move(local));
     }
+    gpuDrainCompletedReadbackRetains();
+}
+
+void PlaybackWorker::forceDrainEvictedGpuFrames() {
+    gpuDrainCompletedReadbackRetains();
+
+    constexpr int kForceRetireFenceWaitTimeoutMs = 10;
+    constexpr int kMaxForceRetireFenceWaitsPerPass = 1;
+    constexpr int kMaxForceRetireFenceWaitPasses = 100;
+    int passes = 0;
+
+    while (passes++ < kMaxForceRetireFenceWaitPasses) {
+        GpuFrameRetireQueue local;
+        {
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            if (m_gpuFrameRetireQueue.isEmpty()) break;
+            m_gpuFrameRetireQueue.swap(local);
+        }
+
+        int stalls = 0;
+        local.drain(kForceRetireFenceWaitTimeoutMs, &stalls, kMaxForceRetireFenceWaitsPerPass);
+        for (int i = 0; i < stalls; ++i)
+            recordFenceWaitStall();
+
+        if (!local.isEmpty()) {
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            m_gpuFrameRetireQueue.append(std::move(local));
+            if (passes >= kMaxForceRetireFenceWaitPasses) {
+                // Process teardown must not hang forever on a broken backend fence.
+                m_gpuFrameRetireQueue = GpuFrameRetireQueue();
+                break;
+            }
+        }
+    }
+
     gpuDrainCompletedReadbackRetains();
 }
 
@@ -959,6 +998,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                             gpuFallback = true;
                             return;
                         }
+                        Q_ASSERT(mediaFrame.isPresentable());
                         if (decodeFence) decodeFence->signalDecodeDone();
                         gpuInserted = commitMediaFrame(mediaFrame, framePtsMs);
                         if (!gpuInserted) gpuFallback = true;
@@ -1027,6 +1067,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                                     gpuFallback = true;
                                     return;
                                 }
+                                Q_ASSERT(imported->isPresentable());
 
                                 imported->metadata().color = colorMetadataForNativeTrack(track);
                                 imported->metadata().gpuGeneration =
@@ -2190,8 +2231,8 @@ void PlaybackWorker::run() {
                 // H.264: use hardware NativeVideoDecoder (licensing constraint).
                 // MPEG-2 and all other codecs: FFmpeg software decoder.
                 const bool isH264 = (codecParams->codec_id == AV_CODEC_ID_H264);
-                if (isH264 && queryNativeVideoDecodeCapabilities().h264
-                    && codecParams->extradata_size >= 8) {
+                if (isH264 && queryNativeVideoDecodeCapabilities().h264 &&
+                    codecParams->extradata_size >= 8) {
                     // Parse avcC extradata → SPS/PPS NAL payloads (raw, no start codes).
                     // Layout: [0]=0x01 [1..3]=profile/compat/level [4]=0xFF
                     //         [5]=0xE0|numSPS  then numSPS*(2B length + payload)
@@ -2204,10 +2245,16 @@ void PlaybackWorker::run() {
                     const int numSps = off < edSize ? (ed[off] & 0x1f) : 0;
                     off++;
                     for (int s = 0; s < numSps && parseOk; ++s) {
-                        if (off + 2 > edSize) { parseOk = false; break; }
+                        if (off + 2 > edSize) {
+                            parseOk = false;
+                            break;
+                        }
                         const int len = (ed[off] << 8) | ed[off + 1];
                         off += 2;
-                        if (len <= 0 || off + len > edSize) { parseOk = false; break; }
+                        if (len <= 0 || off + len > edSize) {
+                            parseOk = false;
+                            break;
+                        }
                         params.h264Sps.append(
                             QByteArray(reinterpret_cast<const char*>(ed + off), len));
                         off += len;
@@ -2215,10 +2262,16 @@ void PlaybackWorker::run() {
                     if (parseOk && off < edSize) {
                         const int numPps = ed[off++];
                         for (int p = 0; p < numPps && parseOk; ++p) {
-                            if (off + 2 > edSize) { parseOk = false; break; }
+                            if (off + 2 > edSize) {
+                                parseOk = false;
+                                break;
+                            }
                             const int len = (ed[off] << 8) | ed[off + 1];
                             off += 2;
-                            if (len <= 0 || off + len > edSize) { parseOk = false; break; }
+                            if (len <= 0 || off + len > edSize) {
+                                parseOk = false;
+                                break;
+                            }
                             params.h264Pps.append(
                                 QByteArray(reinterpret_cast<const char*>(ed + off), len));
                             off += len;
@@ -2245,8 +2298,8 @@ void PlaybackWorker::run() {
                             m_decoderBank.append(track);
                         }
                         providerIndex++;
-                        qDebug() << "Worker: Initialized NativeVideoDecoder (H.264) for Stream"
-                                 << i << "mapped to Provider" << (providerIndex - 1);
+                        qDebug() << "Worker: Initialized NativeVideoDecoder (H.264) for Stream" << i
+                                 << "mapped to Provider" << (providerIndex - 1);
                     }
                     continue;
                 }
@@ -2257,35 +2310,35 @@ void PlaybackWorker::run() {
 
                 // Non-H.264 codecs (MPEG-2, etc.) fall through to software decode.
                 {
-                const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
-                if (!codec) continue;
+                    const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+                    if (!codec) continue;
 
-                AVCodecContext* ctx = avcodec_alloc_context3(codec);
-                if (!ctx) continue;
-                avcodec_parameters_to_context(ctx, codecParams);
+                    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+                    if (!ctx) continue;
+                    avcodec_parameters_to_context(ctx, codecParams);
 
-                // Enable Multi-threading for the decoder itself
-                ctx->thread_count = 0;
+                    // Enable Multi-threading for the decoder itself
+                    ctx->thread_count = 0;
 
-                if (avcodec_open2(ctx, codec, nullptr) < 0) {
-                    avcodec_free_context(&ctx);
-                    continue;
-                }
+                    if (avcodec_open2(ctx, codec, nullptr) < 0) {
+                        avcodec_free_context(&ctx);
+                        continue;
+                    }
 
-                DecoderTrack* track = new DecoderTrack();
-                track->streamIndex = i;
-                track->codecCtx = ctx;
-                track->provider = m_providers[providerIndex];
-                track->feedIndex = providerIndex;
+                    DecoderTrack* track = new DecoderTrack();
+                    track->streamIndex = static_cast<int>(i);
+                    track->codecCtx = ctx;
+                    track->provider = m_providers[providerIndex];
+                    track->feedIndex = providerIndex;
 
-                {
-                    QMutexLocker bufferLocker(&m_bufferMutex);
-                    m_decoderBank.append(track);
-                }
+                    {
+                        QMutexLocker bufferLocker(&m_bufferMutex);
+                        m_decoderBank.append(track);
+                    }
 
-                providerIndex++;
-                qDebug() << "Worker: Initialized Decoder for Stream" << i << "mapped to Provider"
-                         << (providerIndex - 1);
+                    providerIndex++;
+                    qDebug() << "Worker: Initialized Decoder for Stream" << i
+                             << "mapped to Provider" << (providerIndex - 1);
                 }
             }
         }

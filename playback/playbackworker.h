@@ -213,7 +213,7 @@ private:
     // Enqueue a decoded active-view audio frame onto m_audioQueue (format-guarded).
     void enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
-    void resetDedup();          // lastDeliveredPtsMs = -1 on every track
+    void resetDedup(); // lastDeliveredPtsMs = -1 on every track
     void clearDecoderBuffers(bool invalidateGpuGeneration = true);
     // clear every TrackBuffer (holds m_bufferMutex); leaves m_outputCache intact
     void initializeOutputGraph(int feedCount, int width, int height);
@@ -228,6 +228,7 @@ private:
     void collectEvictedGpuFramesLocked(const OutputFrameCache::EvictedVideoFrames& evictedFrames);
     void collectEvictedGpuFrameLocked(const FrameHandle& frame);
     void drainEvictedGpuFrames();
+    void forceDrainEvictedGpuFrames();
     void recordFenceWaitStall();
     bool ensureWindowsGpuImportFencesReadyForDecode(void* d3d11Device);
 #endif

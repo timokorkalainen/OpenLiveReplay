@@ -10,7 +10,9 @@ public:
 
     uint64_t current() const;
     uint64_t bump();
-    void reset();
+#ifdef OLR_UNIT_TEST
+    void resetForTest();
+#endif
 
 private:
     GpuGenerationCounter() = default;

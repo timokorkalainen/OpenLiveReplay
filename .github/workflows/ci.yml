@@ -104,7 +104,7 @@ jobs:
               # that consult them (clang-format / qmllint / the clang-tidy floor /
               # the sanitizer suppressions / the cross-platform builds), for the
               # same self-referential reason.
-              .clang-tidy|.clang-format|qmllint.ini|qmllint.ini.in|.pre-commit-config.yaml|.githooks/*|tests/lsan.suppressions.txt)
+              .clang-tidy|.clang-format|qmllint.ini|qmllint.ini.in|.pre-commit-config.yaml|.githooks/*|tests/lsan.suppressions.txt|tests/tsan.suppressions.txt)
                 app=true
                 format=true
                 native=true
@@ -448,6 +448,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DOLR_BUILD_TESTS=ON \
             -DOLR_BUILD_GPU_PROBES=ON \
+            -DOLR_GPU_PIPELINE=ON \
             -DOLR_WERROR=OFF \
             -DCMAKE_PREFIX_PATH="$OLR_QT_ROOT" \
             -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
@@ -455,7 +456,7 @@ jobs:
             -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder rhi_d3d_probe
+          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor rhi_d3d_probe
 
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
@@ -467,15 +468,19 @@ jobs:
           echo "rhi_d3d_probe exit code: $rc"
           exit "$rc"
 
-      - name: Run Media Foundation unit tests
+      - name: Run Media Foundation + WARP GPU unit tests
         shell: bash
         # tst_nativevideodecoder is BUILT above (Windows compile coverage) but not
         # RUN here: its Media Foundation video-decode capability probe hangs on the
         # headless hosted runner (no GPU/D3D) and times out. tst_nativeaacdecoder
         # (a canned ADTS fixture through the in-box AAC MFT) is deterministic.
+        # tst_gpucompositor exercises the QRhi D3D11 WARP byte-exact compat lane;
+        # tst_gpufence exercises the D3D11 fence event wait path through WARP.
         run: |
+          export OLR_REQUIRE_GPU_FENCE=1
+          export OLR_REQUIRE_WARP=1
           ctest --test-dir build-tests --output-on-failure \
-            -R '^tst_nativeaacdecoder$'
+            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_gpucompositor)$'
 
   # ---------------------------------------------------------------------------
   # Second toolchain: build the app + tests with GCC on Linux and run the unit
@@ -612,6 +617,10 @@ jobs:
             label: tsan
             advisory: false
             build_targets: "tst_trackbuffer tst_audioframequeue tst_outputdispatcher tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine tst_ndiingest"
+          - sanitizer: "thread"
+            label: tsan-gpu
+            advisory: false
+            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpucompositor_stress"
           # asan-e2e: only the e2e harness binaries need building — the playback
           # matrix drives play_harness + record_harness; the native SRT smoke
           # drives record_harness. Both link olr_sanitize, so this build is
@@ -631,7 +640,7 @@ jobs:
           host: mac
           target: desktop
           arch: clang_64
-          modules: qtmultimedia qtwebsockets
+          modules: qtmultimedia qtwebsockets qtshadertools
           cache: true
 
       - name: Cache Homebrew downloads
@@ -662,15 +671,20 @@ jobs:
           ccache --zero-stats
 
       - name: Configure (${{ matrix.label }})
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Debug
-          -DOLR_BUILD_TESTS=ON
-          -DOLR_WERROR=ON
-          -DOLR_SANITIZER="${{ matrix.sanitizer }}"
-          -DCMAKE_C_COMPILER_LAUNCHER=ccache
-          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+        run: |
+          gpu_args=()
+          if [ "${{ matrix.label }}" = "tsan-gpu" ]; then
+            gpu_args+=(-DOLR_GPU_PIPELINE=ON)
+          fi
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DOLR_BUILD_TESTS=ON \
+            -DOLR_WERROR=ON \
+            -DOLR_SANITIZER="${{ matrix.sanitizer }}" \
+            "${gpu_args[@]}" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build tests
         run: |
@@ -723,11 +737,14 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-          TSAN_OPTIONS: halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:suppressions=${{ github.workspace }}/tests/tsan.suppressions.txt
         run: |
           if [ "${{ matrix.label }}" = "tsan" ]; then
             ctest --output-on-failure --repeat until-pass:2 \
               -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
+          elif [ "${{ matrix.label }}" = "tsan-gpu" ]; then
+            ctest --output-on-failure --repeat until-pass:2 \
+              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpucompositor_stress)$'
           else
             ctest --output-on-failure --repeat until-pass:2 \
               -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'

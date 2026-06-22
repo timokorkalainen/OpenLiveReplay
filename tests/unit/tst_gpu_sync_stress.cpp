@@ -139,7 +139,7 @@ void TestGpuSyncStress::concurrentEvictWhileRenderNeverFreesInUse() {
 }
 
 void TestGpuSyncStress::seekUnderDecodeInvalidatesStaleSurfaces() {
-    GpuGenerationCounter::instance().reset();
+    GpuGenerationCounter::instance().resetForTest();
     const uint64_t initialGeneration = GpuGenerationCounter::instance().bump();
     FrameHandle handle = solidYuv420pHandle(16, 16, 16, 128, 128);
     handle.metadata().gpuGeneration = initialGeneration;

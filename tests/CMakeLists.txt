@@ -314,6 +314,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
     target_include_directories(olr_test_gpu PUBLIC "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(olr_test_gpu PUBLIC OLR_UNIT_TEST=1)
     target_link_libraries(olr_test_gpu
         PUBLIC Qt6::Core Qt6::Gui Qt6::GuiPrivate
         PRIVATE olr_warnings olr_sanitize)

@@ -30,9 +30,11 @@ struct GridUniformBlock {
     qint32 range = 0;
     qint32 columns = 1;
     qint32 rows = 1;
+    qint32 outputSize[4] = {};
     qint32 sourceSize[kMaxGridSources][4] = {};
+    qint32 tileRect[kMaxGridSources][4] = {};
 };
-static_assert(sizeof(GridUniformBlock) == 272);
+static_assert(sizeof(GridUniformBlock) == 544);
 
 struct PreparedSource {
     std::shared_ptr<GpuSurface> surface;
@@ -120,14 +122,28 @@ int gridRowsForCount(int count, int columns) {
     return qMax(1, int(std::ceil(double(qMax(1, count)) / double(columns))));
 }
 
-GridUniformBlock makeUniforms(const QList<PreparedSource>& sources, int frameCount,
-                              ColorMetadata color) {
+GridUniformBlock makeUniforms(const QList<PreparedSource>& sources, int frameCount, int width,
+                              int height, ColorMetadata color) {
     GridUniformBlock ub;
     ub.matrix = color.matrix == ColorMatrix::Bt601 ? 0 : 1;
     ub.range = color.range == ColorRange::Video ? 1 : 0;
     ub.columns = gridColumnsForCount(frameCount);
     ub.rows = gridRowsForCount(frameCount, ub.columns);
+    ub.outputSize[0] = width;
+    ub.outputSize[1] = height;
     for (int i = 0; i < qMin(kMaxGridSources, sources.size()); ++i) {
+        if (i < frameCount) {
+            const int col = i % ub.columns;
+            const int row = i / ub.columns;
+            const int dstX = col * width / ub.columns;
+            const int dstY = row * height / ub.rows;
+            const int dstRight = (col + 1) * width / ub.columns;
+            const int dstBottom = (row + 1) * height / ub.rows;
+            ub.tileRect[i][0] = dstX;
+            ub.tileRect[i][1] = dstY;
+            ub.tileRect[i][2] = qMax(0, dstRight - dstX);
+            ub.tileRect[i][3] = qMax(0, dstBottom - dstY);
+        }
         const PreparedSource& source = sources.at(i);
         if (!source.present) continue;
         ub.sourceSize[i][0] = source.desc.width;
@@ -172,8 +188,7 @@ bool uploadNv12Planes(QRhiResourceUpdateBatch* updates, QRhiTexture* yTex, QRhiT
 }
 
 RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sources, int frameCount,
-                                   int width,
-                                   int height, ColorMetadata color,
+                                   int width, int height, ColorMetadata color,
                                    GpuCompositor::ScaleQuality quality,
                                    const std::shared_ptr<GpuSurface>& outputSurface) {
     RenderGridResult result;
@@ -196,20 +211,20 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
     const QShader frag = loadShader(fragPath);
     if (!vert.isValid() || !frag.isValid()) return {};
 
-    const GridUniformBlock uniforms = makeUniforms(sources, frameCount, color);
+    const GridUniformBlock uniforms = makeUniforms(sources, frameCount, width, height, color);
 
     std::unique_ptr<gpucompositor::ImportedRgbaRenderTarget> importedOutput;
     std::unique_ptr<QRhiTexture> output;
     if (outputSurface) {
         importedOutput = gpucompositor::importRgbaRenderTarget(rhi, outputSurface);
         if (!importedOutput) return {};
-        output.reset(rhi->newTexture(outputFormat, QSize(width, height), 1,
-                                     QRhiTexture::RenderTarget));
+        output.reset(
+            rhi->newTexture(outputFormat, QSize(width, height), 1, QRhiTexture::RenderTarget));
         if (!output || !output->createFrom(importedOutput->nativeTexture())) return {};
     } else {
-        output.reset(rhi->newTexture(outputFormat, QSize(width, height), 1,
-                                     QRhiTexture::RenderTarget |
-                                         QRhiTexture::UsedAsTransferSource));
+        output.reset(
+            rhi->newTexture(outputFormat, QSize(width, height), 1,
+                            QRhiTexture::RenderTarget | QRhiTexture::UsedAsTransferSource));
         if (!output || !output->create()) return {};
     }
 
@@ -380,13 +395,12 @@ std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int, int) {
     return nullptr;
 }
 
-std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi*,
-                                                     const std::shared_ptr<GpuSurface>&) {
+std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi*, const std::shared_ptr<GpuSurface>&) {
     return nullptr;
 }
 
-std::unique_ptr<ImportedRgbaRenderTarget> importRgbaRenderTarget(QRhi*,
-                                                                 const std::shared_ptr<GpuSurface>&) {
+std::unique_ptr<ImportedRgbaRenderTarget>
+importRgbaRenderTarget(QRhi*, const std::shared_ptr<GpuSurface>&) {
     return nullptr;
 }
 
@@ -461,8 +475,8 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
                                   std::move(renderFence));
     }
 
-    CpuPlanes rgba = composeGridToCpuForGeneration(frames, width, height, color, quality,
-                                                   generation);
+    CpuPlanes rgba =
+        composeGridToCpuForGeneration(filtered, width, height, color, quality, generation);
     if (!rgba.isValid()) return FrameHandle{};
     return makeCpuFrameHandle(std::move(rgba), makeCompositeMetadata(width, height, generation));
 }
@@ -476,21 +490,18 @@ FrameHandle GpuCompositor::composeGridMemoized(const QList<FrameHandle>& frames,
                                             GpuGenerationCounter::instance().current());
 }
 
-FrameHandle GpuCompositor::composeGridMemoizedForGeneration(const QList<FrameHandle>& frames,
-                                                            int width, int height,
-                                                            ColorMetadata color,
-                                                            ScaleQuality quality,
-                                                            const QVector<qint64>& sourceKeys,
-                                                            MultiviewComposite* memo,
-                                                            uint64_t generation) const {
+FrameHandle GpuCompositor::composeGridMemoizedForGeneration(
+    const QList<FrameHandle>& frames, int width, int height, ColorMetadata color,
+    ScaleQuality quality, const QVector<qint64>& sourceKeys, MultiviewComposite* memo,
+    uint64_t generation) const {
     if (memo && memo->valid && memo->sourceKeys == sourceKeys && !memo->video.isNull()) {
         // FENCE: a memo hit returns the same handle so its render/readback fence metadata
         // travels with the payload; consumers still observe the original ordering contract.
         return memo->video;
     }
 
-    FrameHandle rendered = composeGridForGeneration(frames, width, height, color, quality,
-                                                    generation);
+    FrameHandle rendered =
+        composeGridForGeneration(frames, width, height, color, quality, generation);
     if (!rendered.isNull() && memo) {
         memo->valid = true;
         memo->sourceKeys = sourceKeys;
@@ -541,9 +552,8 @@ FrameHandle GpuCompositor::composePgm(const FrameHandle& source, int width, int 
                                    GpuGenerationCounter::instance().current());
 }
 
-FrameHandle GpuCompositor::composePgmForGeneration(const FrameHandle& source, int width,
-                                                   int height, ColorMetadata color,
-                                                   ScaleQuality quality,
+FrameHandle GpuCompositor::composePgmForGeneration(const FrameHandle& source, int width, int height,
+                                                   ColorMetadata color, ScaleQuality quality,
                                                    uint64_t generation) const {
     return composeGridForGeneration(QList<FrameHandle>{source}, width, height, color, quality,
                                     generation);

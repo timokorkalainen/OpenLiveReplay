@@ -75,6 +75,7 @@ private slots:
     void ntscAudioSpansStayContiguousAcrossOddPlayEpoch();
     void multiviewVideoIdentityTracksSourceContentNotPlayhead();
     void multiviewMemoReusesCompositeForUnchangedSources();
+    void multiviewMemoHitKeepsAllAbsentSourcesPlaceholder();
     void multiviewMemoMatchesUnmemoizedCompositeForDistinctSources();
     void multiviewUsesCpuCompositorWithoutInjectedGpuCompositor();
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -337,6 +338,25 @@ void TestOutputBusEngine::multiviewMemoReusesCompositeForUnchangedSources() {
     advanced.playheadMs = 140;
     const auto c = engine.renderMultiview(7, advanced, cache, &memo);
     QCOMPARE(uchar(MediaVideoFrameView(c.video).planeY.at(0)), uchar(77)); // memo invalidated
+}
+
+void TestOutputBusEngine::multiviewMemoHitKeepsAllAbsentSourcesPlaceholder() {
+    OutputFrameCache cache(2, 4, 4);
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto miss = engine.renderMultiview(5, state, cache, &memo);
+    QVERIFY(miss.video.metadata().key.isPlaceholder);
+    QVERIFY(miss.identity.videoPlaceholder);
+    QVERIFY(memo.valid);
+
+    const auto hit = engine.renderMultiview(6, state, cache, &memo);
+    QVERIFY(hit.video.metadata().key.isPlaceholder);
+    QVERIFY(hit.identity.videoPlaceholder);
 }
 
 void TestOutputBusEngine::multiviewMemoMatchesUnmemoizedCompositeForDistinctSources() {

@@ -13,9 +13,7 @@
 #endif
 #endif
 
-#include <chrono>
 #include <mutex>
-#include <thread>
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
@@ -82,12 +80,20 @@ bool D3DFence::wait(uint64_t value, int timeoutMs) {
     return false;
 #else
     if (!m_impl || !m_impl->fence) return false;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    while (m_impl->fence->GetCompletedValue() < value) {
-        if (timeoutMs >= 0 && std::chrono::steady_clock::now() >= deadline) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (m_impl->fence->GetCompletedValue() >= value) return true;
+
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    const HRESULT hr = m_impl->fence->SetEventOnCompletion(value, event);
+    if (FAILED(hr)) {
+        CloseHandle(event);
+        return false;
     }
-    return true;
+
+    const DWORD waitMs = timeoutMs < 0 ? INFINITE : static_cast<DWORD>(timeoutMs);
+    const DWORD result = WaitForSingleObject(event, waitMs);
+    CloseHandle(event);
+    return result == WAIT_OBJECT_0 && m_impl->fence->GetCompletedValue() >= value;
 #endif
 }
 

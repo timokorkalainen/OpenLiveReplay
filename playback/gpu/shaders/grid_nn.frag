@@ -14,7 +14,9 @@ layout(std140, binding = 0) uniform GridUniforms
     int uRange;
     int uColumns;
     int uRows;
+    ivec4 uOutputSize;              // width, height, unused, unused
     ivec4 uSourceSize[kMaxGridSources]; // width, height, present, unused
+    ivec4 uTileRect[kMaxGridSources];   // dstX, dstY, dstW, dstH
 }
 ub;
 
@@ -158,14 +160,18 @@ vec4 yuvToRgba8(int y, int u, int v)
 
 void main()
 {
-    if (ub.uColumns <= 0 || ub.uRows <= 0) {
+    int outW = ub.uOutputSize.x;
+    int outH = ub.uOutputSize.y;
+    if (ub.uColumns <= 0 || ub.uRows <= 0 || outW <= 0 || outH <= 0) {
         fragColor = yuvToRgba8(16, 128, 128);
         return;
     }
 
     vec2 uv = clamp(vUv, vec2(0.0), vec2(0.999999));
-    int col = min(ub.uColumns - 1, int(floor(uv.x * float(ub.uColumns))));
-    int row = min(ub.uRows - 1, int(floor(uv.y * float(ub.uRows))));
+    int px = clamp(int(floor(uv.x * float(outW))), 0, outW - 1);
+    int py = clamp(int(floor(uv.y * float(outH))), 0, outH - 1);
+    int col = min(ub.uColumns - 1, (((px + 1) * ub.uColumns) - 1) / outW);
+    int row = min(ub.uRows - 1, (((py + 1) * ub.uRows) - 1) / outH);
     int source = row * ub.uColumns + col;
     if (source < 0 || source >= kMaxGridSources || ub.uSourceSize[source].z == 0) {
         fragColor = yuvToRgba8(16, 128, 128);
@@ -179,10 +185,18 @@ void main()
         return;
     }
 
-    vec2 tileUv = vec2(uv.x * float(ub.uColumns) - float(col),
-                       uv.y * float(ub.uRows) - float(row));
-    int lx = min(srcW - 1, max(0, int(tileUv.x * float(srcW))));
-    int ly = min(srcH - 1, max(0, int(tileUv.y * float(srcH))));
+    ivec4 tile = ub.uTileRect[source];
+    int dstW = tile.z;
+    int dstH = tile.w;
+    if (dstW <= 0 || dstH <= 0) {
+        fragColor = yuvToRgba8(16, 128, 128);
+        return;
+    }
+
+    int ix = clamp(px - tile.x, 0, dstW - 1);
+    int iy = clamp(py - tile.y, 0, dstH - 1);
+    int lx = min(srcW - 1, (ix * srcW) / dstW);
+    int ly = min(srcH - 1, (iy * srcH) / dstH);
     int cx = lx / 2;
     int cy = ly / 2;
 
