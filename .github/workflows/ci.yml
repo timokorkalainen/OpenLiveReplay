@@ -487,6 +487,20 @@ jobs:
           export OLR_REQUIRE_GPU_FENCE=1
           export OLR_REQUIRE_WARP=1
           export QT_QPA_PLATFORM=offscreen
+          to_msys() {
+            local p="${1//\\//}"
+            case "$p" in
+              [A-Za-z]:/*) p="/$(printf '%s' "${p%%:*}" | tr '[:upper:]' '[:lower:]')${p#*:}" ;;
+            esac
+            printf '%s' "$p"
+          }
+          newest() { find "$@" -maxdepth 0 -type d 2>/dev/null | sort -V | tail -1 || true; }
+          qt_root="$(to_msys "$QT_ROOT_DIR")"
+          qt_tools_dir="$(cd "$qt_root/../.." && pwd)/Tools"
+          mingw_root="$(to_msys "$(newest "$qt_tools_dir"/mingw*_64)")"
+          ffmpeg_root="$(cd windows_build/dist/ffmpeg && pwd)"
+          srt_root="$(cd windows_build/dist/srt && pwd)"
+          export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
           ctest --test-dir build-tests --output-on-failure \
             -R '^(tst_nativeaacdecoder|tst_gpufence)$'
           gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
@@ -495,6 +509,7 @@ jobs:
             find build-tests -maxdepth 2 -type f -name '*gpucompositor*' -print || true
             exit 127
           fi
+          echo "Running $gpu_test with Qt=$qt_root MinGW=$mingw_root FFmpeg=$ffmpeg_root SRT=$srt_root"
           "$gpu_test" -v2
 
   # ---------------------------------------------------------------------------
