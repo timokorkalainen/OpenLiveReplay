@@ -4,9 +4,10 @@
 #include <QJsonValue>
 #include <algorithm>
 #include <cmath>
-#include <limits>
 
 namespace {
+
+constexpr double kMaxSafeJsonInteger = 9007199254740991.0; // 2^53 - 1
 
 bool readRequiredString(const QJsonObject& obj, const char* key, QString& out) {
     const QJsonValue value = obj.value(QLatin1StringView(key));
@@ -23,13 +24,12 @@ bool readRequiredInt64(const QJsonObject& obj, const char* key, qint64& out) {
         return false;
     }
     const double number = value.toDouble();
-    if (!std::isfinite(number) || std::floor(number) != number ||
-        number < static_cast<double>(std::numeric_limits<qint64>::min()) ||
-        number > static_cast<double>(std::numeric_limits<qint64>::max())) {
+    if (!std::isfinite(number) || std::floor(number) != number || number < -kMaxSafeJsonInteger ||
+        number > kMaxSafeJsonInteger) {
         return false;
     }
     out = static_cast<qint64>(number);
-    return true;
+    return static_cast<double>(out) == number;
 }
 
 bool readRequiredDouble(const QJsonObject& obj, const char* key, double& out) {

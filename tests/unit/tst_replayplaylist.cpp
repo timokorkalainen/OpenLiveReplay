@@ -2,6 +2,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include "playback/replayplaylist.h"
+#include <cmath>
 
 class TestReplayPlaylist : public QObject {
     Q_OBJECT
@@ -28,6 +29,7 @@ private slots:
     void fromJsonRejectsInvalidEntryRanges();
     void fromJsonRejectsMissingEntryFields();
     void fromJsonRejectsWrongTypedEntryFields();
+    void fromJsonRejectsOutOfRangeIntegerFields();
 };
 
 void TestReplayPlaylist::emptyHasNoEntries() {
@@ -252,6 +254,20 @@ void TestReplayPlaylist::fromJsonRejectsWrongTypedEntryFields() {
         {"inMs", QStringLiteral("zero")},
         {"outMs", QJsonValue::Null},
         {"speed", QStringLiteral("fast")},
+    });
+
+    QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
+    QCOMPARE(b.count(), 0);
+}
+
+void TestReplayPlaylist::fromJsonRejectsOutOfRangeIntegerFields() {
+    ReplayPlaylist b;
+    QJsonArray entries;
+    entries.append(QJsonObject{
+        {"clipPath", "/clips/a.mkv"},
+        {"inMs", std::ldexp(1.0, 63)},
+        {"outMs", -1},
+        {"speed", 1.0},
     });
 
     QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
