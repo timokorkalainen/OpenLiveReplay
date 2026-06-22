@@ -265,6 +265,8 @@ ApplicationWindow {
                 Layout.minimumWidth: appWindow.rundownExpanded ? 260 : Theme.hControl + Theme.s2 * 2
                 ui: appWindow.uiManagerRef
                 expanded: appWindow.rundownExpanded
+                controlledExpansion: true
+                onToggleRequested: appWindow.rundownExpanded = !appWindow.rundownExpanded
                 onSaveRequested: rundownSaveDialog.open()
                 onLoadRequested: rundownLoadDialog.open()
             }

@@ -9,11 +9,13 @@ Frame {
 
     property var ui
     property bool expanded: true
+    property bool controlledExpansion: false
     property int selectedIndex: -1
     readonly property bool hasUi: root.ui !== undefined && root.ui !== null
     readonly property int rowHeight: 104
     property int dragIndex: -1
 
+    signal toggleRequested()
     signal saveRequested()
     signal loadRequested()
 
@@ -57,6 +59,14 @@ Frame {
         if (root.hasUi) root.ui.insertPlaylistEntryAt(index)
     }
 
+    function requestToggle() {
+        if (root.controlledExpansion) {
+            root.toggleRequested()
+        } else {
+            root.expanded = !root.expanded
+        }
+    }
+
     background: Rectangle {
         color: Theme.panel
         border.width: Theme.borderW
@@ -75,7 +85,7 @@ Frame {
             ToolButton {
                 text: root.expanded ? "<" : ">"
                 checked: root.expanded
-                onClicked: root.expanded = !root.expanded
+                onClicked: root.requestToggle()
                 ToolTip.visible: hovered
                 ToolTip.text: root.expanded ? "Collapse rundown" : "Expand rundown"
             }
