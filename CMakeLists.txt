@@ -215,6 +215,12 @@ qt_add_qml_module(OpenLiveReplay
         resources.qrc
 )
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_BINARY_DIR}/.rcc/qmlcache/OpenLiveReplay_qmlcache_loader.cpp"
+        PROPERTIES COMPILE_OPTIONS "-Wno-null-dereference")
+endif()
+
 # Generate qmllint.ini with stable import paths and QML dirs for all installed kits.
 set(QMLLINT_IMPORT_PATHS "build/qmllint-imports")
 if (Qt6_DIR)
@@ -643,6 +649,11 @@ target_link_libraries(OpenLiveReplay PRIVATE
 )
 if(WIN32)
     target_link_libraries(OpenLiveReplay PRIVATE ws2_32)
+    add_custom_command(TARGET OpenLiveReplay POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:rtmidi>"
+            "$<TARGET_FILE_DIR:OpenLiveReplay>"
+        COMMENT "[rtmidi] Copying runtime DLL next to OpenLiveReplay.exe")
 endif()
 
 # 6. Bundle Properties
