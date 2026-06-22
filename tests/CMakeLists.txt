@@ -310,9 +310,14 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/formatcanon.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/framehandle.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/gpureadbacktelemetry.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/yuv420pcompositor.cpp")
     target_include_directories(olr_test_gpu PUBLIC "${CMAKE_SOURCE_DIR}")
     target_compile_definitions(olr_test_gpu PUBLIC OLR_UNIT_TEST=1)
     target_link_libraries(olr_test_gpu
@@ -320,6 +325,8 @@ if(OLR_GPU_PIPELINE)
         PRIVATE olr_warnings olr_sanitize)
     if(APPLE)
         target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/applegpusurface_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
@@ -330,6 +337,7 @@ if(OLR_GPU_PIPELINE)
                    "-framework CoreFoundation" "-framework IOSurface")
     elseif(WIN32)
         target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_win.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_win.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
@@ -337,6 +345,7 @@ if(OLR_GPU_PIPELINE)
             PRIVATE d3d11 dxgi ole32)
     else()
         target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp")
     endif()
 
