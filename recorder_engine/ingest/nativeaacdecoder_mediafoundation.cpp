@@ -1,4 +1,5 @@
 #include "nativeaacdecoder.h"
+#include "recorder_engine/mediafoundationruntime.h"
 
 #ifdef _WIN32
 
@@ -83,7 +84,6 @@ private:
     int m_outputRate = 0;
     int m_outputChannels = 0;
     bool comInitialized = false;
-    bool mfStarted = false;
 
     bool ensureRuntime(QString* error);
     void shutdownRuntime();
@@ -111,25 +111,14 @@ bool NativeAacDecoder::Impl::ensureRuntime(QString* error) {
         }
     }
 
-    if (!mfStarted) {
-        const HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-        if (FAILED(hr)) {
-            if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation startup failed"), hr);
-            }
-            return false;
-        }
-        mfStarted = true;
+    if (!ensureMediaFoundationRuntime(error)) {
+        return false;
     }
     return true;
 }
 
 void NativeAacDecoder::Impl::shutdownRuntime() {
     teardownTransform();
-    if (mfStarted) {
-        MFShutdown();
-        mfStarted = false;
-    }
     if (comInitialized) {
         CoUninitialize();
         comInitialized = false;
