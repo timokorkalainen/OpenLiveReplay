@@ -8,6 +8,7 @@ Item {
     id: root
     property var ui
     property int selectedIndex: -1
+    property int selectedSourceIndex: -1
     property var visibleStreamIndexes: []
     readonly property int streamCount: visibleStreamIndexes.length
     property var pgmProvider: ui ? ui.pgmPreviewProvider : null
@@ -31,8 +32,33 @@ Item {
         return root.ui.sourceDisplayLabel(sourceIndex)
     }
 
+    function viewForSource(sourceIndex) {
+        if (!root.hasUi) return -1
+        var map = root.ui.viewSlotMap || []
+        for (var i = 0; i < map.length; ++i) {
+            if (map[i] === sourceIndex) return i
+        }
+        return -1
+    }
+
+    function selectSource(sourceIndex) {
+        if (!root.hasUi || sourceIndex < 0) return
+        root.selectedSourceIndex = sourceIndex
+        root.selectedIndex = root.viewForSource(sourceIndex)
+        root.viewMode = "single"
+        root.ui.setPlaybackViewState(true, sourceIndex)
+    }
+
+    function selectViewSlot(viewIndex) {
+        var sourceIndex = root.sourceForView(viewIndex)
+        if (sourceIndex < 0) return
+        root.selectedIndex = viewIndex
+        root.selectSource(sourceIndex)
+    }
+
     function resetToMulti() {
         root.selectedIndex = -1
+        root.selectedSourceIndex = -1
         root.viewMode = "multi"
         root.updateVisibleStreams()
         if (root.hasUi) {
@@ -66,6 +92,7 @@ Item {
         ignoreUnknownSignals: !root.hasUi
         function onPlaybackProvidersChanged() {
             root.selectedIndex = -1
+            root.selectedSourceIndex = -1
             root.viewMode = "multi"
             root.updateVisibleStreams()
             root.ui.setPlaybackViewState(false, -1)
@@ -78,9 +105,7 @@ Item {
             root.resetToMulti()
         }
         function onFeedSelectRequested(index) {
-            root.selectedIndex = index
-            root.viewMode = "single"
-            root.ui.setPlaybackViewState(true, index)
+            root.selectSource(index)
         }
         function onMultiviewRequested() {
             root.resetToMulti()
@@ -96,11 +121,11 @@ Item {
     Rectangle {
         id: singleView
         anchors.fill: parent
-        property int sourceForView: root.sourceForView(root.selectedIndex)
+        property int sourceForView: root.selectedSourceIndex
         color: sourceForView < 0 ? Theme.panelPressed : "black"
         border.color: sourceForView < 0 ? Theme.line : Theme.recordOnAir
         border.width: 2
-        visible: root.viewMode === "single" && root.selectedIndex >= 0 && root.pgmProvider !== null
+        visible: root.viewMode === "single" && root.selectedSourceIndex >= 0 && root.pgmProvider !== null
 
         VideoOutput {
             id: singleOutput
@@ -136,7 +161,7 @@ Item {
                 anchors.centerIn: parent
                 text: {
                     var src = singleView.sourceForView
-                    if (root.selectedIndex < 0) return ""
+                    if (src < 0) return ""
                     return root.sourceLabel(src, root.selectedIndex)
                 }
                 color: Theme.textHi
@@ -221,11 +246,7 @@ Item {
                 anchors.fill: parent
                 z: 2
                 onClicked: {
-                    root.selectedIndex = multiViewDelegate.streamIndex
-                    root.viewMode = "single"
-                    if (root.hasUi) {
-                        root.ui.setPlaybackViewState(true, multiViewDelegate.streamIndex)
-                    }
+                    root.selectViewSlot(multiViewDelegate.streamIndex)
                 }
             }
         }
