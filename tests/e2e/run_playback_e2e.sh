@@ -53,6 +53,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+case "$SCENARIO" in
+    gpucapstress)
+        case "${OLR_GPU_PIPELINE:-}" in
+            1|true|TRUE|on|ON) ;;
+            *)
+                echo "SKIP: gpucapstress requires OLR_GPU_PIPELINE=1"
+                exit 77
+                ;;
+        esac
+        export OLR_GPU_FORCE_BUDGET="${OLR_GPU_FORCE_BUDGET:-12}"
+        ;;
+esac
+
 # H.264-HW availability probe: required for scenarios that record an H.264
 # fixture. Exit 77 (SKIP_RETURN_CODE) if the hardware encoder is unavailable so
 # CTest marks the test as skipped rather than failed on headless/CI runners.
@@ -60,7 +73,7 @@ trap cleanup EXIT
 # VideoToolbox/MediaFoundation — encode and decode are paired capabilities on
 # both platforms. VAC-1's codec assertion below catches any silent codec fallback.
 case "$SCENARIO" in
-    h264_play|armedcut-h264|armedcut-h264-back)
+    h264_play|armedcut-h264|armedcut-h264-back|gpucapstress)
         case "$(uname -s)" in
             MINGW*|MSYS*|CYGWIN*)
                 if [ "${OLR_RUN_UNSTABLE_MF_H264_TESTS:-0}" != "1" ]; then
@@ -155,7 +168,7 @@ sleep 1.0  # let the SRT listener come up before the caller connects
 # Written as a plain string (not an array) to stay compatible with bash 3.2 (macOS).
 REC_CODEC_EXTRA=""
 case "$SCENARIO" in
-    h264_play|armedcut-h264|armedcut-h264-back) REC_CODEC_EXTRA="--codec h264" ;;
+    h264_play|armedcut-h264|armedcut-h264-back|gpucapstress) REC_CODEC_EXTRA="--codec h264" ;;
 esac
 
 URL="$(srt_caller_url "$SRT_PORT")"
@@ -193,7 +206,7 @@ echo "[pb-e2e] fixture video tracks: ${VTRACKS:-?} (expected $VIEWS)"
 # would make the H.264 gate exercise the wrong codec — assert early so the test
 # fails loudly rather than passing vacuously.
 case "$SCENARIO" in
-    h264_play|armedcut-h264|armedcut-h264-back)
+    h264_play|armedcut-h264|armedcut-h264-back|gpucapstress)
         VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
             -of default=nk=1:nw=1 "$FIXTURE" | head -n1)"
         echo "[pb-e2e] fixture video codec: ${VCODEC:-?}"
@@ -710,6 +723,40 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    gpucapstress)
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: gpucapstress painted gray (placeholderFramesDelta=$placeholderFramesDelta, expected 0) under GPU cap pressure"
+            fail=1
+        fi
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -ne 0 ]; then
+            echo "FAIL: gpucapstress held frames (heldFramesDelta=$heldFramesDelta, expected 0) under GPU cap pressure"
+            fail=1
+        fi
+        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 1 ]; then
+            echo "FAIL: gpucapstress armNextCut did not arm (armNextCutArmed=$armNextCutArmed, expected 1)"
+            fail=1
+        fi
+        if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -lt 60 ]; then
+            echo "FAIL: gpucapstress decoded too few real video frames (decodedVideoFrames=$decodedVideoFrames, expected >=60)"
+            fail=1
+        fi
+        if ! num "$gpuReadToCpuCount" || [ "$gpuReadToCpuCount" -le 0 ]; then
+            echo "FAIL: gpucapstress produced no GPU CPU-materialization (gpuReadToCpuCount=$gpuReadToCpuCount, expected >0)"
+            fail=1
+        fi
+        if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
+            echo "FAIL: gpucapstress produced no GPU readback telemetry (gpuReadbacks=$gpuReadbacks, expected >0)"
+            fail=1
+        fi
+        if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
+            echo "FAIL: gpucapstress redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
+            fail=1
+        fi
+        if ! num "$fenceWaitStalls" || ! num "$decodedVideoFrames" || [ "$fenceWaitStalls" -gt "$decodedVideoFrames" ]; then
+            echo "FAIL: gpucapstress fence waits unbounded (fenceWaitStalls=$fenceWaitStalls, decodedVideoFrames=$decodedVideoFrames)"
+            fail=1
+        fi
+        ;;
     h264_play)
         # H.264 HW playback decode through the real worker: steady 1x playback
         # against an H.264 fixture must not reposition (the storm gate holds for
@@ -875,6 +922,8 @@ if [ "$GPU_RUNTIME_ENABLED" -eq 1 ] && [ "$SCENARIO" = "h264_play" ]; then
         echo "FAIL: redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
         fail=1
     fi
+elif [ "$GPU_RUNTIME_ENABLED" -eq 1 ] && [ "$SCENARIO" = "gpucapstress" ]; then
+    :
 else
     for gpucnt in gpuReadToCpuCount gpuReadbacks redundantGpuReadbacks readbackQueueDepth readbackDrops \
                   fenceWaitStalls gpuOomDegrades gpuVramBytes; do

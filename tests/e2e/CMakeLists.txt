@@ -393,6 +393,17 @@ add_test(NAME e2e_play_armedcut_h264_back
 set_tests_properties(e2e_play_h264 e2e_play_armedcut_h264 e2e_play_armedcut_h264_back PROPERTIES
     LABELS "e2e;h264" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 
+if(OLR_GPU_PIPELINE)
+    add_test(NAME e2e_play_gpu_capstress
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" gpucapstress 4 23512)
+    set_tests_properties(e2e_play_gpu_capstress PROPERTIES
+        LABELS "e2e;gpu"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_GPU_FORCE_BUDGET=12")
+endif()
+
 # --- Report-only frame-sync scoreboard (NON-GATING) -------------------------
 # These drive sync_harness through synthetic synchronized sources and print
 # measured inter-camera offset / drift / lip-sync numbers. They ALWAYS exit 0

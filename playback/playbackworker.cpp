@@ -105,8 +105,13 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     m_decoderFollowMs.store(-1, std::memory_order_release);
     m_hasPendingRearm.store(false, std::memory_order_release);
     // A new seek target is outstanding until repositionTo commits it. The gate
-    // holds the last good playhead until m_committedGeneration catches up. The
-    // bump also signals maybeFireScheduledCut to abort an armed cut (manual seek wins).
+    // holds the last output-visible playhead until m_committedGeneration catches
+    // up. During long steady playback the last reposition target may already be
+    // outside the tiny cap window, so refresh the held playhead from the output
+    // bookmark before bumping the generation.
+    m_committedPlayheadMs.store(m_lastVisiblePlayheadMs.load(std::memory_order_acquire),
+                                std::memory_order_release);
+    // The bump also signals maybeFireScheduledCut to abort an armed cut (manual seek wins).
     m_seekGeneration.fetch_add(1, std::memory_order_release);
 #ifdef OLR_GPU_PIPELINE_BUILD
     if (gpuPipelineEnabled()) GpuGenerationCounter::instance().bump();
@@ -601,10 +606,13 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     // for the latest seek is in flight it holds the last committed playhead so
     // the snapshot never reports a new playhead against a not-yet-ready cache.
     const qint64 transportPlayhead = m_transport ? m_transport->currentPos() : 0;
-    snapshot.state.playheadMs = CommitGate::visiblePlayheadMs(
-        transportPlayhead, m_committedPlayheadMs.load(std::memory_order_acquire),
-        m_committedGeneration.load(std::memory_order_acquire),
-        m_seekGeneration.load(std::memory_order_acquire));
+    const qint64 committedPlayhead = m_committedPlayheadMs.load(std::memory_order_acquire);
+    const uint64_t committedGen = m_committedGeneration.load(std::memory_order_acquire);
+    const uint64_t seekGen = m_seekGeneration.load(std::memory_order_acquire);
+    snapshot.state.playheadMs =
+        CommitGate::visiblePlayheadMs(transportPlayhead, committedPlayhead, committedGen, seekGen);
+    if (committedGen == seekGen)
+        m_lastVisiblePlayheadMs.store(snapshot.state.playheadMs, std::memory_order_release);
     snapshot.state.playing = m_transport && m_transport->isPlaying();
     snapshot.state.speed = m_transport ? m_transport->speed() : 1.0;
     snapshot.state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
@@ -1092,6 +1100,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         // generation to the latest seek's value so makeOutputSnapshot exposes
         // the live transport playhead again (CommitGate).
         m_committedPlayheadMs.store(target, std::memory_order_relaxed);
+        m_lastVisiblePlayheadMs.store(target, std::memory_order_release);
         m_committedGeneration.store(m_seekGeneration.load(std::memory_order_acquire),
                                     std::memory_order_release);
         // Re-anchor the output clock to the now-live playhead AFTER the commit.
@@ -1295,6 +1304,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     // — once these match m_seekGeneration, makeOutputSnapshot exposes the live
     // transport playhead again (CommitGate).
     m_committedPlayheadMs.store(target, std::memory_order_relaxed);
+    m_lastVisiblePlayheadMs.store(target, std::memory_order_release);
     m_committedGeneration.store(m_seekGeneration.load(std::memory_order_acquire),
                                 std::memory_order_release);
     // Re-anchor the output clock to the now-live playhead AFTER the commit (see

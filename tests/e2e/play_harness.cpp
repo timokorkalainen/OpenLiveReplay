@@ -26,7 +26,7 @@
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
 //              farback | armedcut | armedcut-back | armedcut-seekrace | armedcut-rearm-seek |
-//              playlist | armedcut-h264 | armedcut-h264-back
+//              playlist | gpucapstress | armedcut-h264 | armedcut-h264-back
 #include <QCoreApplication>
 #include <QTimer>
 #include <QList>
@@ -526,6 +526,35 @@ int main(int argc, char** argv) {
             });
             mon->start(16);
             QTimer::singleShot(14000, &app, finish);
+
+        } else if (scen == "gpucapstress") {
+            // GPU cap-pressure stress: a 4-view H.264 fixture runs with a forced
+            // tiny per-track GPU budget. Warm up real output frames, snapshot the
+            // placeholder/hold baseline, seek while decode is active, then arm a
+            // forward cut. The driver gates no placeholder flash, no held-frame
+            // stall, GPU materialization, and bounded fence stalls.
+            transport.setSpeed(1.0);
+            transport.seek(0);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&, basePh, baseHeld]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
+                const int64_t seekTarget = durMs / 3;
+                fprintf(stderr,
+                        "### gpucapstress basePh=%lld baseHeld=%lld; seek under decode to "
+                        "%lldms ###\n",
+                        (long long) *basePh, (long long) *baseHeld, (long long) seekTarget);
+                transport.seek(seekTarget);
+                worker.seekTo(seekTarget);
+            });
+            QTimer::singleShot(1600, &app, [&]() {
+                const int64_t cutTarget = durMs / 2;
+                armNextCutArmed = worker.armNextCut(cutTarget) ? 1 : 0;
+                fprintf(stderr, "### gpucapstress armNextCut(%lldms) returned %d ###\n",
+                        (long long) cutTarget, armNextCutArmed);
+            });
+            QTimer::singleShot(10000, &app, finish);
 
         } else if (scen == "armedcut-h264") {
             // H.264 FRAME-PERFECT ARMED CUT: now that openPrerollContext() builds a

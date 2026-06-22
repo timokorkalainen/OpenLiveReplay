@@ -269,7 +269,7 @@ else()
 endif()
 
 if(OLR_GPU_PIPELINE)
-    target_compile_definitions(olr_test_playback PRIVATE OLR_GPU_PIPELINE_BUILD=1)
+    target_compile_definitions(olr_test_playback PUBLIC OLR_GPU_PIPELINE_BUILD=1)
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"

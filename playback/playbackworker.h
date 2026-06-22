@@ -300,6 +300,10 @@ private:
     std::atomic<uint64_t> m_seekGeneration{0};
     std::atomic<uint64_t> m_committedGeneration{0};
     std::atomic<int64_t> m_committedPlayheadMs{0};
+    // Last playhead actually exposed to the output clock while no seek was
+    // pending. A later seek holds this recent, cache-covered position instead
+    // of a stale reposition target that steady playback may have trimmed away.
+    mutable std::atomic<int64_t> m_lastVisiblePlayheadMs{0};
 
     QMutex m_mutex;
     mutable QMutex m_bufferMutex;
