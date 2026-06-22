@@ -836,6 +836,53 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                 auto& counters = m_counters;
                 auto* outputCache = m_outputCache.get();
                 auto* bufferMutex = &m_bufferMutex;
+#ifdef OLR_GPU_PIPELINE_BUILD
+                auto renderFenceForCommit = m_renderFence;
+                auto* retireQueueForCommit = &m_gpuFrameRetireQueue;
+                auto* outputRuntimeMutexForCommit = &m_outputRuntimeMutex;
+                auto* outputRuntimeForCommit = &m_outputRuntime;
+                auto collectEvictedGpuFrameForCommit = [&](const FrameHandle& frame) {
+                    if (!retireQueueForCommit || !renderFenceForCommit) return;
+                    retireQueueForCommit->collect(frame, renderFenceForCommit);
+                };
+                auto collectEvictedTrackFramesForCommit =
+                    [&](const TrackBuffer::EvictedFrames& evictedFrames) {
+                        for (const TrackBuffer::Frame& evicted : evictedFrames)
+                            collectEvictedGpuFrameForCommit(evicted.frame);
+                    };
+                auto collectEvictedCacheFramesForCommit =
+                    [&](const OutputFrameCache::EvictedVideoFrames& evictedFrames) {
+                        for (const FrameHandle& evicted : evictedFrames)
+                            collectEvictedGpuFrameForCommit(evicted);
+                    };
+                auto drainEvictedGpuFramesForCommit = [&]() {
+                    gpuDrainCompletedReadbackRetains();
+                    if (!retireQueueForCommit) return;
+
+                    GpuFrameRetireQueue local;
+                    {
+                        QMutexLocker bufferLocker(bufferMutex);
+                        if (retireQueueForCommit->isEmpty()) return;
+                        retireQueueForCommit->swap(local);
+                    }
+
+                    constexpr int kRetireFenceWaitTimeoutMs = 1;
+                    constexpr int kMaxRetireFenceWaitsPerDrain = 1;
+                    int stalls = 0;
+                    local.drain(kRetireFenceWaitTimeoutMs, &stalls, kMaxRetireFenceWaitsPerDrain);
+                    for (int i = 0; i < stalls; ++i) {
+                        QMutexLocker runtimeLocker(outputRuntimeMutexForCommit);
+                        if (outputRuntimeForCommit && *outputRuntimeForCommit)
+                            (*outputRuntimeForCommit)->incrementFenceWaitStalls();
+                    }
+
+                    if (!local.isEmpty()) {
+                        QMutexLocker bufferLocker(bufferMutex);
+                        retireQueueForCommit->append(std::move(local));
+                    }
+                    gpuDrainCompletedReadbackRetains();
+                };
+#endif
                 auto commitMediaFrame = [&](FrameHandle mediaFrame, int64_t framePtsMs) -> bool {
                     mediaFrame.metadata().key.ptsMs = framePtsMs;
                     if (!mediaFrame.isPresentable()) return false;
@@ -847,18 +894,18 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                             counters.framesDropped++;
                         }
 #ifdef OLR_GPU_PIPELINE_BUILD
-                        collectEvictedGpuFramesLocked(evictedTrackFrames);
+                        collectEvictedTrackFramesForCommit(evictedTrackFrames);
 #endif
                         if (outputCache) {
                             OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
                             outputCache->insertVideoFrame(mediaFrame, &evictedCacheFrames);
 #ifdef OLR_GPU_PIPELINE_BUILD
-                            collectEvictedGpuFramesLocked(evictedCacheFrames);
+                            collectEvictedCacheFramesForCommit(evictedCacheFrames);
 #endif
                         }
                     }
 #ifdef OLR_GPU_PIPELINE_BUILD
-                    drainEvictedGpuFrames();
+                    drainEvictedGpuFramesForCommit();
 #endif
                     counters.decodedVideoFrames++;
                     return true;
@@ -867,7 +914,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
                 auto gpuRhi = m_gpuRhi;
                 auto decodeFence = m_decodeFence;
-                auto renderFence = m_renderFence;
+                auto renderFence = renderFenceForCommit;
                 if (gpuRhi && gpuRhi->isValid() && renderFence) {
                     const int savedDecimateCounter = track->decimateCounter;
                     bool gpuCallback = false;
@@ -943,7 +990,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                             m_winGpuImportEdge.reset();
                         } else {
                             auto decodeFence = m_decodeFence;
-                            auto renderFence = m_renderFence;
+                            renderFenceForCommit = m_renderFence;
+                            auto renderFence = renderFenceForCommit;
                             const int savedDecimateCounter = track->decimateCounter;
                             bool gpuCallback = false;
                             bool gpuInserted = false;
