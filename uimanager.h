@@ -25,6 +25,7 @@
 #include "playback/audioplayer.h"
 #include "playback/seekcoalescer.h"
 #include "playback/replayplaylist.h"
+#include "playback/playlistentriesmodel.h"
 #include "playback/playlistplayout.h"
 #include "playback/telemetrytimelinereader.h"
 #include "midi/midimanager.h"
@@ -78,6 +79,16 @@ class UIManager : public QObject {
     Q_PROPERTY(int midiBindingsVersion READ midiBindingsVersion NOTIFY midiBindingsChanged)
     Q_PROPERTY(int midiLastValuesVersion READ midiLastValuesVersion NOTIFY midiLastValuesChanged)
     Q_PROPERTY(PlaybackTransport* transport READ transport CONSTANT)
+    Q_PROPERTY(PlaylistEntriesModel* playlistModel READ playlistModel CONSTANT)
+    Q_PROPERTY(int playlistCount READ playlistCount NOTIFY playlistChanged)
+    Q_PROPERTY(
+        int currentPlaylistEntryIndex READ currentPlaylistEntryIndex NOTIFY playlistEntryChanged)
+    Q_PROPERTY(int nextPlaylistEntryIndex READ nextPlaylistEntryIndex NOTIFY playlistEntryChanged)
+    Q_PROPERTY(bool playlistPlayoutActive READ playlistPlayoutActive NOTIFY playlistEntryChanged)
+    Q_PROPERTY(QString playlistFilePath READ playlistFilePath NOTIFY playlistPersistenceChanged)
+    Q_PROPERTY(bool playlistDirty READ playlistDirty NOTIFY playlistPersistenceChanged)
+    Q_PROPERTY(QString playlistOperationError READ playlistOperationError NOTIFY
+                   playlistOperationErrorChanged)
     Q_PROPERTY(StreamDeckManager* streamDeck READ streamDeck CONSTANT)
     Q_PROPERTY(int streamDeckLearnAction READ streamDeckLearnAction NOTIFY streamDeckLearnActionChanged)
     Q_PROPERTY(int streamDeckBindingsVersion READ streamDeckBindingsVersion NOTIFY streamDeckBindingsChanged)
@@ -165,6 +176,12 @@ public:
     int midiBindingsVersion() const;
     int midiLastValuesVersion() const;
     PlaybackTransport* transport() const { return m_transport; }
+    PlaylistEntriesModel* playlistModel() const { return m_playlistModel; }
+    int currentPlaylistEntryIndex() const;
+    int nextPlaylistEntryIndex() const;
+    QString playlistFilePath() const { return m_playlistFilePath; }
+    bool playlistDirty() const { return m_playlistDirty; }
+    QString playlistOperationError() const { return m_playlistOperationError; }
     StreamDeckManager* streamDeck() const { return m_streamDeckManager; }
     int streamDeckLearnAction() const { return m_streamDeckLearnAction; }
     int streamDeckBindingsVersion() const { return m_streamDeckBindingsVersion; }
@@ -307,6 +324,19 @@ public:
     Q_INVOKABLE void markOut();
     Q_INVOKABLE void recallEntry(int index);
     Q_INVOKABLE int playlistCount() const;
+    Q_INVOKABLE bool insertPlaylistEntry(int index, qint64 inMs, qint64 outMs, double speed = 1.0);
+    Q_INVOKABLE bool insertPlaylistEntryAt(int index);
+    Q_INVOKABLE bool removePlaylistEntry(int index);
+    Q_INVOKABLE bool movePlaylistEntry(int fromIndex, int toIndex);
+    Q_INVOKABLE bool clearPlaylist();
+    Q_INVOKABLE bool setPlaylistEntrySpeed(int index, double speed);
+    Q_INVOKABLE bool setPlaylistEntryInOut(int index, qint64 inMs, qint64 outMs);
+    Q_INVOKABLE bool setPlaylistEntryInFromPlayhead(int index);
+    Q_INVOKABLE bool setPlaylistEntryOutFromPlayhead(int index);
+    Q_INVOKABLE bool savePlaylist(const QString& filePath);
+    Q_INVOKABLE bool loadPlaylist(const QString& filePath);
+    Q_INVOKABLE bool savePlaylistToUrl(const QUrl& url);
+    Q_INVOKABLE bool loadPlaylistFromUrl(const QUrl& url);
     // EVS rundown auto-playout: play the playlist from `fromIndex`, auto-advancing
     // across each entry boundary with a frame-perfect armed cut (fire-at-out-point),
     // honoring each entry's speed. After the final entry, normal playback continues
@@ -368,6 +398,11 @@ signals:
     void metadataFieldsChanged();
     void sourceMetadataChanged();
     void importSettingsUrlChanged();
+    void playlistChanged();
+    void playlistEntryChanged();
+    void playlistPersistenceChanged();
+    void playlistOperationErrorChanged();
+    void playlistOperationFailed(const QString& reason);
     void importPreviewChanged();
     void telemetryConfigChanged();
     void telemetryChanged();
@@ -431,6 +466,10 @@ private:
     QString m_configPath;
     PlaybackWorker* m_playbackWorker = nullptr;
     ReplayPlaylist m_playlist; // Tier3 cue list (markIn/markOut/recall)
+    PlaylistEntriesModel* m_playlistModel = nullptr;
+    QString m_playlistFilePath;
+    bool m_playlistDirty = false;
+    QString m_playlistOperationError;
     // EVS rundown auto-playout state. m_playout decides which boundary to arm and
     // when; m_playoutMonitor polls the playhead (onPlayoutTick) to arm boundaries
     // and advance on each cut fire; m_playoutCutBaseline tracks the worker's fired-
@@ -438,6 +477,11 @@ private:
     PlaylistPlayout m_playout;
     QTimer m_playoutMonitor;
     int m_playoutCutBaseline = 0;
+    void refreshPlaylistModel();
+    void markPlaylistChanged(bool dirty);
+    bool failPlaylistOperation(const QString& reason);
+    void stopPlaylistPlayoutForEdit();
+    qint64 currentPlayheadMs() const;
     void onPlayoutTick();
     QList<FrameProvider*> m_providers;
     FrameProvider* m_multiviewPreviewProvider = nullptr;

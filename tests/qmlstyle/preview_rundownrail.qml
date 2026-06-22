@@ -6,12 +6,9 @@ import "../../ui/components"
 import OlrTheme
 
 Rectangle {
-    id: shell
-
-    width: 1120
+    width: 380
     height: 680
     color: Theme.canvas
-    property bool rundownExpanded: true
 
     ListModel {
         id: rundownModel
@@ -56,6 +53,7 @@ Rectangle {
         property int nextPlaylistEntryIndex: 1
         property bool playlistPlayoutActive: true
         property bool playlistDirty: true
+        property string playlistFilePath: "/clips/final-rundown.json"
         property string playlistOperationError: ""
 
         function recordTimecode(ms) {
@@ -81,44 +79,10 @@ Rectangle {
         function setPlaylistEntryOutFromPlayhead(index) {}
     }
 
-    ColumnLayout {
+    RundownRail {
         anchors.fill: parent
-        spacing: 0
-
-        StatusStrip {
-            Layout.fillWidth: true
-            rundownOpen: shell.rundownExpanded
-            onToggleRundown: shell.rundownExpanded = !shell.rundownExpanded
-        }
-
-        RowLayout {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
-            spacing: Theme.s2
-
-            PgmStage {
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-            }
-
-            RundownRail {
-                Layout.fillHeight: true
-                Layout.preferredWidth: shell.rundownExpanded ? 340 : Theme.hControl + Theme.s2 * 2
-                Layout.minimumWidth: shell.rundownExpanded ? 260 : Theme.hControl + Theme.s2 * 2
-                ui: mockUi
-                expanded: shell.rundownExpanded
-                controlledExpansion: true
-                onToggleRequested: shell.rundownExpanded = !shell.rundownExpanded
-            }
-        }
-
-        TransportDock {
-            Layout.fillWidth: true
-        }
-    }
-
-    ConfigDrawer {
-        id: drawer
-        parent: parent
+        anchors.margins: Theme.s2
+        ui: mockUi
+        expanded: true
     }
 }

@@ -15,6 +15,7 @@
 #include <QLocale>
 #include <algorithm>
 #include <QDir>
+#include <QFile>
 #include <QGuiApplication>
 #include <QDebug>
 #if defined(Q_OS_IOS)
@@ -22,6 +23,7 @@
 #endif
 #include <QImageWriter>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QElapsedTimer>
 #include <QTimer>
@@ -202,6 +204,8 @@ QString interCamPhaseLine(const IngestStats& s) {
 
 UIManager::UIManager(ReplayManager* engine, QObject* parent)
     : QObject(parent), m_replayManager(engine) {
+    m_playlistModel = new PlaylistEntriesModel(this);
+    refreshPlaylistModel();
     m_jogTimer.start();
     m_scrubCoalesceTimer.setSingleShot(true);
     m_scrubCoalesceTimer.setTimerType(Qt::PreciseTimer);
@@ -1938,12 +1942,17 @@ void UIManager::markIn() {
     if (!m_transport || !m_replayManager) return;
     // The current clip path is what UIManager already hands to the worker's
     // openFile (m_replayManager->getVideoPath()); there is no separate accessor.
+    stopPlaylistPlayoutForEdit();
     m_playlist.markIn(m_replayManager->getVideoPath(), m_transport->currentPos());
+    markPlaylistChanged(true);
 }
 
 void UIManager::markOut() {
     if (!m_transport) return;
-    m_playlist.markOut(m_transport->currentPos());
+    if (m_playlist.markOut(m_transport->currentPos())) {
+        stopPlaylistPlayoutForEdit();
+        markPlaylistChanged(true);
+    }
 }
 
 void UIManager::recallEntry(int index) {
@@ -1965,6 +1974,199 @@ void UIManager::recallEntry(int index) {
 
 int UIManager::playlistCount() const {
     return m_playlist.count();
+}
+
+int UIManager::currentPlaylistEntryIndex() const {
+    return m_playout.active() ? m_playout.currentIndex() : -1;
+}
+
+int UIManager::nextPlaylistEntryIndex() const {
+    if (!m_playout.active()) {
+        return -1;
+    }
+    const int next = m_playout.currentIndex() + 1;
+    return next < m_playout.count() ? next : -1;
+}
+
+void UIManager::refreshPlaylistModel() {
+    if (m_playlistModel) {
+        m_playlistModel->setEntries(m_playlist.entries());
+    }
+}
+
+void UIManager::markPlaylistChanged(bool dirty) {
+    refreshPlaylistModel();
+    if (!m_playlistOperationError.isEmpty()) {
+        m_playlistOperationError.clear();
+        emit playlistOperationErrorChanged();
+    }
+    if (dirty && !m_playlistDirty) {
+        m_playlistDirty = true;
+        emit playlistPersistenceChanged();
+    }
+    emit playlistChanged();
+    emit playlistEntryChanged();
+}
+
+bool UIManager::failPlaylistOperation(const QString& reason) {
+    m_playlistOperationError = reason;
+    emit playlistOperationErrorChanged();
+    emit playlistOperationFailed(reason);
+    return false;
+}
+
+void UIManager::stopPlaylistPlayoutForEdit() {
+    if (m_playout.active()) {
+        stopPlaylistPlayout();
+    }
+}
+
+qint64 UIManager::currentPlayheadMs() const {
+    return m_transport ? qMax<qint64>(0, m_transport->currentPos()) : qint64(0);
+}
+
+bool UIManager::insertPlaylistEntry(int index, qint64 inMs, qint64 outMs, double speed) {
+    const QString clipPath =
+        m_replayManager ? m_replayManager->getVideoPath() : QStringLiteral("playlist-entry");
+    ReplayEntry entry{clipPath, inMs, outMs, speed};
+    stopPlaylistPlayoutForEdit();
+    const int inserted = m_playlist.insertEntry(index, entry);
+    if (inserted < 0) {
+        return failPlaylistOperation(QStringLiteral("Invalid rundown entry range"));
+    }
+    markPlaylistChanged(true);
+    return true;
+}
+
+bool UIManager::insertPlaylistEntryAt(int index) {
+    return insertPlaylistEntry(index, currentPlayheadMs(), -1, 1.0);
+}
+
+bool UIManager::removePlaylistEntry(int index) {
+    stopPlaylistPlayoutForEdit();
+    if (!m_playlist.removeEntry(index)) {
+        return failPlaylistOperation(QStringLiteral("Rundown row is out of range"));
+    }
+    markPlaylistChanged(true);
+    return true;
+}
+
+bool UIManager::movePlaylistEntry(int fromIndex, int toIndex) {
+    stopPlaylistPlayoutForEdit();
+    if (!m_playlist.moveEntry(fromIndex, toIndex)) {
+        return failPlaylistOperation(QStringLiteral("Rundown move is out of range"));
+    }
+    markPlaylistChanged(true);
+    return true;
+}
+
+bool UIManager::clearPlaylist() {
+    stopPlaylistPlayoutForEdit();
+    m_playlist.clear();
+    markPlaylistChanged(true);
+    return true;
+}
+
+bool UIManager::setPlaylistEntrySpeed(int index, double speed) {
+    if (!m_playlist.recall(index).has_value()) {
+        return failPlaylistOperation(QStringLiteral("Rundown row is out of range"));
+    }
+    stopPlaylistPlayoutForEdit();
+    m_playlist.setSpeed(index, speed);
+    markPlaylistChanged(true);
+    return true;
+}
+
+bool UIManager::setPlaylistEntryInOut(int index, qint64 inMs, qint64 outMs) {
+    stopPlaylistPlayoutForEdit();
+    if (!m_playlist.setEntryRange(index, inMs, outMs)) {
+        return failPlaylistOperation(QStringLiteral("Invalid rundown entry range"));
+    }
+    markPlaylistChanged(true);
+    return true;
+}
+
+bool UIManager::setPlaylistEntryInFromPlayhead(int index) {
+    const auto entry = m_playlist.recall(index);
+    if (!entry.has_value()) {
+        return failPlaylistOperation(QStringLiteral("Rundown row is out of range"));
+    }
+    return setPlaylistEntryInOut(index, currentPlayheadMs(), entry->outMs);
+}
+
+bool UIManager::setPlaylistEntryOutFromPlayhead(int index) {
+    const auto entry = m_playlist.recall(index);
+    if (!entry.has_value()) {
+        return failPlaylistOperation(QStringLiteral("Rundown row is out of range"));
+    }
+    return setPlaylistEntryInOut(index, entry->inMs, currentPlayheadMs());
+}
+
+bool UIManager::savePlaylist(const QString& filePath) {
+    const QString path = filePath.trimmed();
+    if (path.isEmpty()) {
+        return failPlaylistOperation(QStringLiteral("Choose a rundown file to save"));
+    }
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return failPlaylistOperation(QStringLiteral("Could not open rundown for writing"));
+    }
+    const QJsonDocument doc(m_playlist.toJson());
+    file.write(doc.toJson(QJsonDocument::Indented));
+    if (!file.commit()) {
+        return failPlaylistOperation(QStringLiteral("Could not save rundown"));
+    }
+    m_playlistFilePath = path;
+    m_playlistDirty = false;
+    if (!m_playlistOperationError.isEmpty()) {
+        m_playlistOperationError.clear();
+        emit playlistOperationErrorChanged();
+    }
+    emit playlistPersistenceChanged();
+    return true;
+}
+
+bool UIManager::loadPlaylist(const QString& filePath) {
+    const QString path = filePath.trimmed();
+    if (path.isEmpty()) {
+        return failPlaylistOperation(QStringLiteral("Choose a rundown file to load"));
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return failPlaylistOperation(QStringLiteral("Could not open rundown"));
+    }
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return failPlaylistOperation(QStringLiteral("Rundown file is not valid JSON"));
+    }
+
+    ReplayPlaylist loaded;
+    if (!loaded.fromJson(doc.object())) {
+        return failPlaylistOperation(QStringLiteral("Rundown file has invalid entries"));
+    }
+
+    stopPlaylistPlayoutForEdit();
+    m_playlist = loaded;
+    m_playlistFilePath = path;
+    m_playlistDirty = false;
+    if (!m_playlistOperationError.isEmpty()) {
+        m_playlistOperationError.clear();
+        emit playlistOperationErrorChanged();
+    }
+    refreshPlaylistModel();
+    emit playlistChanged();
+    emit playlistEntryChanged();
+    emit playlistPersistenceChanged();
+    return true;
+}
+
+bool UIManager::savePlaylistToUrl(const QUrl& url) {
+    return savePlaylist(url.isLocalFile() ? url.toLocalFile() : url.toString());
+}
+
+bool UIManager::loadPlaylistFromUrl(const QUrl& url) {
+    return loadPlaylist(url.isLocalFile() ? url.toLocalFile() : url.toString());
 }
 
 // EVS rundown auto-playout. Starts the playlist at fromIndex and lets it play
@@ -1997,12 +2199,17 @@ bool UIManager::playPlaylist(int fromIndex) {
     m_transport->setPlaying(true);
     m_playoutCutBaseline = m_playbackWorker->cutsFired();
     if (!m_playoutMonitor.isActive()) m_playoutMonitor.start();
+    emit playlistEntryChanged();
     return true;
 }
 
 void UIManager::stopPlaylistPlayout() {
+    const bool wasActive = m_playout.active();
     m_playoutMonitor.stop();
     m_playout.stop();
+    if (wasActive) {
+        emit playlistEntryChanged();
+    }
 }
 
 // Polled on the UI thread (m_playoutMonitor). Advances the rundown on each boundary
@@ -2021,6 +2228,7 @@ void UIManager::onPlayoutTick() {
         ++m_playoutCutBaseline;
         const auto cur = m_playout.onBoundaryFired();
         if (cur.has_value()) m_transport->setSpeed(cur->speed);
+        emit playlistEntryChanged();
     }
     // On the final entry there is no further boundary — let normal playback continue
     // forward (the recording keeps growing). Fully stop playout so the monitor idles

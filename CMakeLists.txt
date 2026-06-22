@@ -174,6 +174,7 @@ qt_add_qml_module(OpenLiveReplay
         ui/components/OutputsPanel.qml
         ui/components/PgmStage.qml
         ui/components/ProjectSettingsPanel.qml
+        ui/components/RundownRail.qml
         ui/components/SourceListPanel.qml
         ui/components/StatusStrip.qml
         ui/components/TransportDock.qml
@@ -232,6 +233,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/frameindex.h playback/frameindex.cpp
         playback/cutschedule.h playback/cutschedule.cpp
         playback/replayplaylist.h playback/replayplaylist.cpp
+        playback/playlistentriesmodel.h playback/playlistentriesmodel.cpp
         playback/playlistplayout.h playback/playlistplayout.cpp
         playback/framerate.h
         playback/frameprovider.h playback/frameprovider.cpp

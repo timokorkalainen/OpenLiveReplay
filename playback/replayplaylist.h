@@ -20,9 +20,13 @@ public:
     bool markOut(qint64 outMs);
     std::optional<ReplayEntry> recall(int index) const;
     void setSpeed(int index, double speed);
+    bool removeEntry(int index);
+    int insertEntry(int index, const ReplayEntry& entry);
+    bool moveEntry(int fromIndex, int toIndex);
+    bool setEntryRange(int index, qint64 inMs, qint64 outMs);
     int count() const { return m_entries.size(); }
     QVector<ReplayEntry> entries() const { return m_entries; } // snapshot for playout
-    void clear() { m_entries.clear(); }
+    void clear();
 
     QJsonObject toJson() const;
     bool fromJson(const QJsonObject& obj);
@@ -30,6 +34,7 @@ public:
 private:
     QVector<ReplayEntry> m_entries;
     static constexpr double kMinSpeed = 0.01;
+    static bool validRange(qint64 inMs, qint64 outMs);
 };
 
 #endif // REPLAYPLAYLIST_H

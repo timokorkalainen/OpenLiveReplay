@@ -2,6 +2,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include "playback/replayplaylist.h"
+#include <cmath>
 
 class TestReplayPlaylist : public QObject {
     Q_OBJECT
@@ -14,8 +15,21 @@ private slots:
     void recallOutOfRangeReturnsNullopt();
     void multipleOrderedEntries();
     void setSpeedClampsToPositive();
+    void removeEntryDropsByIndex();
+    void removeOutOfRangeIsNoOp();
+    void clearEmpties();
+    void insertEntryAtIndex();
+    void insertEntryClampsPastEnd();
+    void moveEntryReordersToFinalIndex();
+    void moveEntryOutOfRangeIsNoOp();
+    void setEntryRangeUpdatesInAndOut();
+    void setEntryRangeRejectsOutBeforeIn();
     void jsonRoundTripPreservesEntries();
     void fromJsonRejectsMalformed();
+    void fromJsonRejectsInvalidEntryRanges();
+    void fromJsonRejectsMissingEntryFields();
+    void fromJsonRejectsWrongTypedEntryFields();
+    void fromJsonRejectsOutOfRangeIntegerFields();
 };
 
 void TestReplayPlaylist::emptyHasNoEntries() {
@@ -86,6 +100,107 @@ void TestReplayPlaylist::setSpeedClampsToPositive() {
     QVERIFY(p.recall(0).value().speed > 0.0);
 }
 
+void TestReplayPlaylist::removeEntryDropsByIndex() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 0);
+    p.markOut(100);
+    p.markIn("/clips/b.mkv", 200);
+    p.markOut(300);
+
+    QVERIFY(p.removeEntry(0));
+    QCOMPARE(p.count(), 1);
+    QCOMPARE(p.entries()[0].clipPath, QString("/clips/b.mkv"));
+}
+
+void TestReplayPlaylist::removeOutOfRangeIsNoOp() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 0);
+
+    QVERIFY(!p.removeEntry(5));
+    QVERIFY(!p.removeEntry(-1));
+    QCOMPARE(p.count(), 1);
+}
+
+void TestReplayPlaylist::clearEmpties() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 0);
+    p.markIn("/clips/b.mkv", 1);
+
+    p.clear();
+    QCOMPARE(p.count(), 0);
+}
+
+void TestReplayPlaylist::insertEntryAtIndex() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 0);
+    p.markOut(100);
+    p.markIn("/clips/c.mkv", 400);
+    p.markOut(500);
+    ReplayEntry b{QStringLiteral("/clips/b.mkv"), 200, 300, 0.5};
+
+    QCOMPARE(p.insertEntry(1, b), 1);
+    QCOMPARE(p.count(), 3);
+    QCOMPARE(p.entries()[1].clipPath, QString("/clips/b.mkv"));
+    QCOMPARE(p.entries()[1].speed, 0.5);
+}
+
+void TestReplayPlaylist::insertEntryClampsPastEnd() {
+    ReplayPlaylist p;
+    ReplayEntry a{QStringLiteral("/clips/a.mkv"), 0, 100, 1.0};
+
+    QCOMPARE(p.insertEntry(42, a), 0);
+    QCOMPARE(p.count(), 1);
+    QCOMPARE(p.entries()[0].clipPath, QString("/clips/a.mkv"));
+}
+
+void TestReplayPlaylist::moveEntryReordersToFinalIndex() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 0);
+    p.markOut(100);
+    p.markIn("/clips/b.mkv", 200);
+    p.markOut(300);
+    p.markIn("/clips/c.mkv", 400);
+    p.markOut(500);
+
+    QVERIFY(p.moveEntry(0, 2));
+    QCOMPARE(p.entries()[0].clipPath, QString("/clips/b.mkv"));
+    QCOMPARE(p.entries()[1].clipPath, QString("/clips/c.mkv"));
+    QCOMPARE(p.entries()[2].clipPath, QString("/clips/a.mkv"));
+
+    QVERIFY(p.moveEntry(2, 0));
+    QCOMPARE(p.entries()[0].clipPath, QString("/clips/a.mkv"));
+}
+
+void TestReplayPlaylist::moveEntryOutOfRangeIsNoOp() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 0);
+
+    QVERIFY(!p.moveEntry(-1, 0));
+    QVERIFY(!p.moveEntry(0, 4));
+    QCOMPARE(p.count(), 1);
+    QCOMPARE(p.entries()[0].clipPath, QString("/clips/a.mkv"));
+}
+
+void TestReplayPlaylist::setEntryRangeUpdatesInAndOut() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 100);
+    p.markOut(300);
+
+    QVERIFY(p.setEntryRange(0, 120, 360));
+    QCOMPARE(p.entries()[0].inMs, qint64(120));
+    QCOMPARE(p.entries()[0].outMs, qint64(360));
+}
+
+void TestReplayPlaylist::setEntryRangeRejectsOutBeforeIn() {
+    ReplayPlaylist p;
+    p.markIn("/clips/a.mkv", 100);
+    p.markOut(300);
+
+    QVERIFY(!p.setEntryRange(0, 400, 200));
+    QCOMPARE(p.entries()[0].inMs, qint64(100));
+    QCOMPARE(p.entries()[0].outMs, qint64(300));
+}
+
 void TestReplayPlaylist::jsonRoundTripPreservesEntries() {
     ReplayPlaylist a;
     a.markIn("/clips/a.mkv", 1000);
@@ -109,6 +224,53 @@ void TestReplayPlaylist::fromJsonRejectsMalformed() {
     ReplayPlaylist b;
     QJsonObject bad; // no "entries" array
     QVERIFY(!b.fromJson(bad));
+    QCOMPARE(b.count(), 0);
+}
+
+void TestReplayPlaylist::fromJsonRejectsInvalidEntryRanges() {
+    ReplayPlaylist b;
+    QJsonArray entries;
+    entries.append(
+        QJsonObject{{"clipPath", "/clips/a.mkv"}, {"inMs", 500}, {"outMs", 100}, {"speed", 1.0}});
+
+    QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
+    QCOMPARE(b.count(), 0);
+}
+
+void TestReplayPlaylist::fromJsonRejectsMissingEntryFields() {
+    ReplayPlaylist b;
+    QJsonArray entries;
+    entries.append(QJsonObject{});
+
+    QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
+    QCOMPARE(b.count(), 0);
+}
+
+void TestReplayPlaylist::fromJsonRejectsWrongTypedEntryFields() {
+    ReplayPlaylist b;
+    QJsonArray entries;
+    entries.append(QJsonObject{
+        {"clipPath", 42},
+        {"inMs", QStringLiteral("zero")},
+        {"outMs", QJsonValue::Null},
+        {"speed", QStringLiteral("fast")},
+    });
+
+    QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
+    QCOMPARE(b.count(), 0);
+}
+
+void TestReplayPlaylist::fromJsonRejectsOutOfRangeIntegerFields() {
+    ReplayPlaylist b;
+    QJsonArray entries;
+    entries.append(QJsonObject{
+        {"clipPath", "/clips/a.mkv"},
+        {"inMs", std::ldexp(1.0, 63)},
+        {"outMs", -1},
+        {"speed", 1.0},
+    });
+
+    QVERIFY(!b.fromJson(QJsonObject{{"entries", entries}}));
     QCOMPARE(b.count(), 0);
 }
 
