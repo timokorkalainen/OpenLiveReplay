@@ -867,7 +867,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
                 auto gpuRhi = m_gpuRhi;
                 auto decodeFence = m_decodeFence;
-                if (gpuRhi && gpuRhi->isValid()) {
+                auto renderFence = m_renderFence;
+                if (gpuRhi && gpuRhi->isValid() && renderFence) {
                     const int savedDecimateCounter = track->decimateCounter;
                     bool gpuCallback = false;
                     bool gpuInserted = false;
@@ -906,7 +907,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         meta.gpuGeneration = GpuGenerationCounter::instance().current();
 
                         FrameHandle mediaFrame =
-                            importVtImageBuffer(imageBuffer, meta, gpuRhi, m_renderFence);
+                            importVtImageBuffer(imageBuffer, meta, gpuRhi, renderFence);
                         if (!mediaFrame.isPresentable()) {
                             gpuFallback = true;
                             return;
@@ -941,6 +942,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         if (!fencesReady) {
                             m_winGpuImportEdge.reset();
                         } else {
+                            auto decodeFence = m_decodeFence;
+                            auto renderFence = m_renderFence;
                             const int savedDecimateCounter = track->decimateCounter;
                             bool gpuCallback = false;
                             bool gpuInserted = false;
@@ -971,7 +974,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 
                                 auto imported = m_winGpuImportEdge->tryImport(
                                     mfSample, track->feedIndex, framePtsMs, track->codecWidth,
-                                    track->codecHeight, m_renderFence);
+                                    track->codecHeight, renderFence);
                                 if (!imported || !imported->isPresentable()) {
                                     gpuFallback = true;
                                     return;
@@ -980,7 +983,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                                 imported->metadata().color = colorMetadataForNativeTrack(track);
                                 imported->metadata().gpuGeneration =
                                     GpuGenerationCounter::instance().current();
-                                if (m_decodeFence) m_decodeFence->signalDecodeDone();
+                                if (decodeFence) decodeFence->signalDecodeDone();
                                 gpuInserted = commitMediaFrame(*imported, framePtsMs);
                                 if (!gpuInserted) gpuFallback = true;
                                 lastVideoPtsMs = framePtsMs;
