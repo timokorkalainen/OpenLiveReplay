@@ -59,123 +59,150 @@ ColumnLayout {
             model: root.hasUi ? root.ui.streamUrls : []
             spacing: 8
 
-            delegate: RowLayout {
+            delegate: ColumnLayout {
                 id: streamRow
                 required property string modelData
                 required property int index
                 width: streamList.width
-                spacing: 10
+                height: implicitHeight
+                spacing: Theme.s1
+                readonly property bool compactControls: streamRow.width < 620
 
-                Label {
-                    text: (streamRow.index + 1) + ":"
-                    Layout.preferredWidth: 20
-                }
-
-                Button {
-                    readonly property bool sourceEnabled: root.hasUi
-                                                       && root.ui.sourceEnabledVersion >= 0
-                                                       && root.ui.isSourceEnabled(streamRow.index)
-
-                    text: sourceEnabled ? "ON" : "OFF"
-                    highlighted: sourceEnabled
-                    Layout.preferredWidth: 50
-                    onClicked: if (root.hasUi) root.ui.toggleSourceEnabled(streamRow.index)
-                }
-
-                // Live connection indicator: grey when idle, green once the source's feed is up,
-                // red while recording but the feed has not connected (or has dropped).
-                Rectangle {
-                    id: connDot
-                    Layout.preferredWidth: 12
-                    Layout.preferredHeight: 12
-                    radius: width / 2
-                    property bool connected: root.hasUi
-                                             && root.ui.sourceConnectionVersion >= 0
-                                             && root.ui.isSourceConnected(streamRow.index)
-                    // 0=N/A,1=green,2=amber,3=red (native SRT only; else 0)
-                    property int linkHealth: root.hasUi && root.ui.sourceStatsVersion >= 0
-                                             ? root.ui.sourceLinkHealth(streamRow.index)
-                                             : 0
-                    color: !root.hasUi || !root.ui.isRecording
-                           ? Theme.idle
-                           : (!connDot.connected
-                              ? Theme.error
-                              : (connDot.linkHealth === 3 ? Theme.error
-                                 : connDot.linkHealth === 2 ? Theme.armed
-                                 : Theme.ready))
-                    HoverHandler { id: connHover }
-                    ToolTip.visible: connHover.hovered
-                    ToolTip.text: !root.hasUi || !root.ui.isRecording
-                                  ? "Not recording"
-                                  : (!connDot.connected
-                                     ? "No signal"
-                                     : (root.ui.sourceStatsVersion >= 0
-                                        && root.ui.sourceHasStats(streamRow.index)
-                                        ? root.ui.sourceStatsTooltip(streamRow.index)
-                                        : "Connected"))
-                }
-
-                SpinBox {
-                    id: trimSpin
-                    from: -500
-                    to: 500
-                    stepSize: 33
-                    editable: true
-                    Layout.preferredWidth: 96
-                    value: root.hasUi && root.ui.sourceTrimVersion >= 0
-                           ? root.ui.sourceTrimOffset(streamRow.index) : 0
-                    onValueModified: if (root.hasUi) root.ui.setSourceTrimOffset(streamRow.index, value)
-                    ToolTip.visible: hovered
-                    ToolTip.text: "Timeline trim (ms): + delays this camera, − advances it"
-                }
-
-                TextField {
-                    Layout.preferredWidth: 160
-                    text: root.hasUi && root.ui.streamIds.length > streamRow.index ? root.ui.streamIds[streamRow.index] : ""
-                    placeholderText: "ID"
-                    onEditingFinished: if (root.hasUi) root.ui.updateStreamId(streamRow.index, text)
-                }
-
-                TextField {
-                    Layout.preferredWidth: 140
-                    text: root.hasUi && root.ui.streamNames.length > streamRow.index ? root.ui.streamNames[streamRow.index] : ""
-                    placeholderText: "Name"
-                    onEditingFinished: if (root.hasUi) root.ui.updateStreamName(streamRow.index, text)
-                }
-
-                Button {
-                    text: "Metadata"
-                    Layout.preferredWidth: 90
-                    onClicked: metadataEditor.openFor(streamRow.index)
-                }
-
-                TextField {
+                RowLayout {
                     Layout.fillWidth: true
-                    text: streamRow.modelData
-                    placeholderText: "rtmp://..."
-                    onEditingFinished: if (root.hasUi) root.ui.updateUrl(streamRow.index, text)
+                    spacing: Theme.s2
+
+                    Label {
+                        text: (streamRow.index + 1) + ":"
+                        Layout.preferredWidth: 20
+                    }
+
+                    Button {
+                        readonly property bool sourceEnabled: root.hasUi
+                                                           && root.ui.sourceEnabledVersion >= 0
+                                                           && root.ui.isSourceEnabled(streamRow.index)
+
+                        text: sourceEnabled ? "ON" : "OFF"
+                        highlighted: sourceEnabled
+                        Layout.preferredWidth: 50
+                        leftPadding: Theme.s1
+                        rightPadding: Theme.s1
+                        onClicked: if (root.hasUi) root.ui.toggleSourceEnabled(streamRow.index)
+                    }
+
+                    // Live connection indicator: grey when idle, green once the source's feed is up,
+                    // red while recording but the feed has not connected (or has dropped).
+                    Rectangle {
+                        id: connDot
+                        Layout.preferredWidth: 12
+                        Layout.preferredHeight: 12
+                        radius: width / 2
+                        property bool connected: root.hasUi
+                                                 && root.ui.sourceConnectionVersion >= 0
+                                                 && root.ui.isSourceConnected(streamRow.index)
+                        // 0=N/A,1=green,2=amber,3=red (native SRT only; else 0)
+                        property int linkHealth: root.hasUi && root.ui.sourceStatsVersion >= 0
+                                                 ? root.ui.sourceLinkHealth(streamRow.index)
+                                                 : 0
+                        color: !root.hasUi || !root.ui.isRecording
+                               ? Theme.idle
+                               : (!connDot.connected
+                                  ? Theme.error
+                                  : (connDot.linkHealth === 3 ? Theme.error
+                                     : connDot.linkHealth === 2 ? Theme.armed
+                                     : Theme.ready))
+                        HoverHandler { id: connHover }
+                        ToolTip.visible: connHover.hovered
+                        ToolTip.text: !root.hasUi || !root.ui.isRecording
+                                      ? "Not recording"
+                                      : (!connDot.connected
+                                         ? "No signal"
+                                         : (root.ui.sourceStatsVersion >= 0
+                                            && root.ui.sourceHasStats(streamRow.index)
+                                            ? root.ui.sourceStatsTooltip(streamRow.index)
+                                            : "Connected"))
+                    }
+
+                    TextField {
+                        objectName: "sourceUrlField"
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: Math.min(Theme.minWUrl, Math.max(140, streamRow.width - 180))
+                        Layout.preferredWidth: Math.max(Theme.minWUrl, streamRow.width * 0.66)
+                        text: streamRow.modelData
+                        placeholderText: "rtmp://..."
+                        onEditingFinished: if (root.hasUi) root.ui.updateUrl(streamRow.index, text)
+                    }
+
+                    // Misconfiguration warning: another source points at this same URL.
+                    Label {
+                        text: "⚠"
+                        color: Theme.warning
+                        font.bold: true
+                        Layout.preferredWidth: 16
+                        visible: root.hasUi
+                                 && root.ui.streamUrls.length >= 0
+                                 && root.ui.hasDuplicateUrl(streamRow.index)
+                        HoverHandler { id: dupHover }
+                        ToolTip.visible: dupHover.hovered
+                        ToolTip.text: "Duplicate URL — another source uses this same stream"
+                    }
+
+                    Button {
+                        text: "X"
+                        Layout.preferredWidth: 34
+                        leftPadding: 0
+                        rightPadding: 0
+                        flat: true
+                        onClicked: if (root.hasUi) root.ui.removeStream(streamRow.index)
+                        visible: root.hasUi && !root.ui.isRecording
+                    }
                 }
 
-                // Misconfiguration warning: another source points at this same URL.
-                Label {
-                    text: "⚠"
-                    color: Theme.warning
-                    font.bold: true
-                    Layout.preferredWidth: 16
-                    visible: root.hasUi
-                             && root.ui.streamUrls.length >= 0
-                             && root.ui.hasDuplicateUrl(streamRow.index)
-                    HoverHandler { id: dupHover }
-                    ToolTip.visible: dupHover.hovered
-                    ToolTip.text: "Duplicate URL — another source uses this same stream"
-                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: Theme.s2
 
-                Button {
-                    text: "×"
-                    Layout.preferredWidth: 30
-                    flat: true
-                    onClicked: if (root.hasUi) root.ui.removeStream(streamRow.index)
-                    visible: root.hasUi && !root.ui.isRecording
+                    Item {
+                        visible: !streamRow.compactControls
+                        Layout.preferredWidth: 20 + 50 + 12 + Theme.s2 * 2
+                    }
+
+                    SpinBox {
+                        id: trimSpin
+                        from: -500
+                        to: 500
+                        stepSize: 33
+                        editable: true
+                        Layout.preferredWidth: streamRow.compactControls ? 82 : 96
+                        value: root.hasUi && root.ui.sourceTrimVersion >= 0
+                               ? root.ui.sourceTrimOffset(streamRow.index) : 0
+                        onValueModified: if (root.hasUi) root.ui.setSourceTrimOffset(streamRow.index, value)
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Timeline trim (ms): + delays this camera, − advances it"
+                    }
+
+                    TextField {
+                        Layout.preferredWidth: streamRow.compactControls ? 96 : 160
+                        Layout.minimumWidth: 72
+                        text: root.hasUi && root.ui.streamIds.length > streamRow.index ? root.ui.streamIds[streamRow.index] : ""
+                        placeholderText: "ID"
+                        onEditingFinished: if (root.hasUi) root.ui.updateStreamId(streamRow.index, text)
+                    }
+
+                    TextField {
+                        Layout.fillWidth: true
+                        Layout.minimumWidth: streamRow.compactControls ? 96 : 120
+                        Layout.preferredWidth: streamRow.compactControls ? 120 : 160
+                        text: root.hasUi && root.ui.streamNames.length > streamRow.index ? root.ui.streamNames[streamRow.index] : ""
+                        placeholderText: "Name"
+                        onEditingFinished: if (root.hasUi) root.ui.updateStreamName(streamRow.index, text)
+                    }
+
+                    Button {
+                        text: "Metadata"
+                        Layout.preferredWidth: 90
+                        onClicked: metadataEditor.openFor(streamRow.index)
+                    }
                 }
             }
         }
