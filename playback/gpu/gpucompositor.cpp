@@ -143,7 +143,7 @@ CpuPlanes makeRgbaPlanes(int width, int height, QByteArray bytes) {
 }
 
 CpuPlanes renderGridWithRhi(QRhi* rhi, const QList<FrameHandle>& frames, int width, int height,
-                            ColorMetadata color) {
+                            ColorMetadata color, GpuCompositor::ScaleQuality quality) {
     if (!rhi || width <= 0 || height <= 0) return {};
     if (!rhi->isTextureFormatSupported(QRhiTexture::RGBA8, QRhiTexture::RenderTarget) ||
         !rhi->isTextureFormatSupported(QRhiTexture::R8) ||
@@ -152,7 +152,10 @@ CpuPlanes renderGridWithRhi(QRhi* rhi, const QList<FrameHandle>& frames, int wid
     }
 
     const QShader vert = loadShader(QStringLiteral(":/olr/shaders/grid.vert.qsb"));
-    const QShader frag = loadShader(QStringLiteral(":/olr/shaders/grid_nn.frag.qsb"));
+    const QString fragPath = quality == GpuCompositor::ScaleQuality::NearestCompat
+                                 ? QStringLiteral(":/olr/shaders/grid_nn.frag.qsb")
+                                 : QStringLiteral(":/olr/shaders/grid_quality.frag.qsb");
+    const QShader frag = loadShader(fragPath);
     if (!vert.isValid() || !frag.isValid()) return {};
 
     const QList<PreparedSource> sources = prepareSources(frames);
@@ -171,9 +174,11 @@ CpuPlanes renderGridWithRhi(QRhi* rhi, const QList<FrameHandle>& frames, int wid
     renderTarget->setRenderPassDescriptor(rpDesc.get());
     if (!rpDesc || !renderTarget->create()) return {};
 
-    std::unique_ptr<QRhiSampler> sampler(
-        rhi->newSampler(QRhiSampler::Nearest, QRhiSampler::Nearest, QRhiSampler::None,
-                        QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge));
+    const QRhiSampler::Filter filter = quality == GpuCompositor::ScaleQuality::NearestCompat
+                                           ? QRhiSampler::Nearest
+                                           : QRhiSampler::Linear;
+    std::unique_ptr<QRhiSampler> sampler(rhi->newSampler(
+        filter, filter, QRhiSampler::None, QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge));
     if (!sampler || !sampler->create()) return {};
 
     std::unique_ptr<QRhiBuffer> ubuf(
@@ -326,7 +331,6 @@ FrameHandle GpuCompositor::composeGrid(const QList<FrameHandle>& frames, int wid
 CpuPlanes GpuCompositor::composeGridToCpu(const QList<FrameHandle>& frames, int width, int height,
                                           ColorMetadata color, ScaleQuality quality) const {
     if (!isValid() || width <= 0 || height <= 0) return CpuPlanes{};
-    if (quality != ScaleQuality::NearestCompat) return CpuPlanes{};
 
     const uint64_t generation = GpuGenerationCounter::instance().current();
     const QList<FrameHandle> filtered = dropStaleInputs(frames, generation);
@@ -336,11 +340,12 @@ CpuPlanes GpuCompositor::composeGridToCpu(const QList<FrameHandle>& frames, int 
             // LOCK RULE: all QRhi resources are created, used, and destroyed on the
             // GpuRhiContext render thread. The cadence/output thread only observes
             // the completed readback bytes returned from this synchronous test path.
-            gpu = renderGridWithRhi(rhi, filtered, width, height, color);
+            gpu = renderGridWithRhi(rhi, filtered, width, height, color, quality);
         });
         return invoked ? gpu : CpuPlanes{};
     }
 
+    if (quality != ScaleQuality::NearestCompat) return CpuPlanes{};
     CpuPlanes rgba = formatcanon::referenceComposeGridRgba8(filtered, width, height, color);
     if (rgba.isValid()) {
         rgba.format = FramePixelFormat::Rgba8;

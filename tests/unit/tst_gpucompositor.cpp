@@ -6,6 +6,8 @@
 #include <QFile>
 #include <rhi/qshader.h>
 
+#include "framepsnr.h"
+
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpucompositor.h"
 #include "playback/gpu/gpurhicontext.h"
@@ -24,6 +26,8 @@ private slots:
     void compatGridWithinOneLsbOnLocalGpu();
     void swappedQuadrantsDifferFromOracle();
     void pgmSelectFillsOutputFromSingleSource();
+    void bilinearScalerMeetsPsnrAgainstBilinearReference();
+    void bilinearDiffersFromNearestOracle();
 #ifdef __APPLE__
     void cpuHandleUploadsToNv12Surface();
     void gpuNv12HandleAliasesExistingSurface();
@@ -72,6 +76,40 @@ FrameHandle patternedYuv420pHandle(int width, int height) {
     return makeCpuFrameHandle(std::move(planes), meta);
 }
 
+FrameHandle gradientYuv420pHandle(int width, int height) {
+    const int chromaW = (width + 1) / 2;
+    const int chromaH = (height + 1) / 2;
+
+    CpuPlanes planes;
+    planes.format = FramePixelFormat::Yuv420p;
+    planes.width = width;
+    planes.height = height;
+    planes.stride[0] = width;
+    planes.stride[1] = chromaW;
+    planes.stride[2] = chromaW;
+    planes.plane[0] = QByteArray(planeOffset(height, planes.stride[0]), 0);
+    planes.plane[1] = QByteArray(planeOffset(chromaH, planes.stride[1]), 0);
+    planes.plane[2] = QByteArray(planeOffset(chromaH, planes.stride[2]), 0);
+
+    for (int y = 0; y < height; ++y) {
+        char* row = planes.plane[0].data() + planeOffset(y, planes.stride[0]);
+        for (int x = 0; x < width; ++x) {
+            row[x] = char(32 + ((x * 149 + y * 53) / qMax(1, width + height - 2)));
+        }
+    }
+    for (int y = 0; y < chromaH; ++y) {
+        char* u = planes.plane[1].data() + planeOffset(y, planes.stride[1]);
+        char* v = planes.plane[2].data() + planeOffset(y, planes.stride[2]);
+        for (int x = 0; x < chromaW; ++x) {
+            u[x] = char(92 + ((x * 31 + y * 17) / qMax(1, chromaW + chromaH - 2)));
+            v[x] = char(156 - ((x * 23 + y * 11) / qMax(1, chromaW + chromaH - 2)));
+        }
+    }
+
+    FrameMetadata meta;
+    return makeCpuFrameHandle(std::move(planes), meta);
+}
+
 void compareRows(const CpuPlanes& expected, const CpuPlanes& actual, int plane, int rows,
                  int bytesPerRow) {
     for (int row = 0; row < rows; ++row) {
@@ -82,6 +120,78 @@ void compareRows(const CpuPlanes& expected, const CpuPlanes& actual, int plane, 
             actual.plane[plane].constData() + planeOffset(row, actual.stride[plane]), bytesPerRow);
         QCOMPARE(got, exp);
     }
+}
+
+double sampleLinear(const QByteArray& plane, int stride, int width, int height, int bytesPerPixel,
+                    int channel, double u, double v) {
+    const double fx = u * double(width) - 0.5;
+    const double fy = v * double(height) - 0.5;
+    const int x0 = qBound(0, int(std::floor(fx)), width - 1);
+    const int y0 = qBound(0, int(std::floor(fy)), height - 1);
+    const int x1 = qBound(0, x0 + 1, width - 1);
+    const int y1 = qBound(0, y0 + 1, height - 1);
+    const double tx = qBound(0.0, fx - std::floor(fx), 1.0);
+    const double ty = qBound(0.0, fy - std::floor(fy), 1.0);
+
+    auto at = [&](int x, int y) {
+        const qsizetype offset =
+            planeOffset(y, stride) + static_cast<qsizetype>(x) * bytesPerPixel + channel;
+        return double(uchar(plane.at(offset)));
+    };
+
+    const double a = at(x0, y0) * (1.0 - tx) + at(x1, y0) * tx;
+    const double b = at(x0, y1) * (1.0 - tx) + at(x1, y1) * tx;
+    return a * (1.0 - ty) + b * ty;
+}
+
+CpuPlanes bilinearUpscaleReferenceRgba8(const FrameHandle& source, int width, int height,
+                                        ColorMetadata color) {
+    const CpuPlanes nv12 = source.readToCpu(FramePixelFormat::Nv12);
+    if (!nv12.isValid() || nv12.format != FramePixelFormat::Nv12) return {};
+
+    const int chromaW = (nv12.width + 1) / 2;
+    const int chromaH = (nv12.height + 1) / 2;
+    CpuPlanes out;
+    out.format = FramePixelFormat::Rgba8;
+    out.width = width;
+    out.height = height;
+    out.stride[0] = width * 4;
+    out.plane[0] = QByteArray(planeOffset(height, out.stride[0]), 0);
+
+    for (int y = 0; y < height; ++y) {
+        char* dst = out.plane[0].data() + planeOffset(y, out.stride[0]);
+        const double v = (double(y) + 0.5) / double(height);
+        for (int x = 0; x < width; ++x) {
+            const double u = (double(x) + 0.5) / double(width);
+            const int yy = qRound(
+                sampleLinear(nv12.plane[0], nv12.stride[0], nv12.width, nv12.height, 1, 0, u, v));
+            const int cb =
+                qRound(sampleLinear(nv12.plane[1], nv12.stride[1], chromaW, chromaH, 2, 0, u, v));
+            const int cr =
+                qRound(sampleLinear(nv12.plane[1], nv12.stride[1], chromaW, chromaH, 2, 1, u, v));
+            const formatcanon::Rgb8 rgb =
+                formatcanon::yuvToRgb8(uchar(qBound(0, yy, 255)), uchar(qBound(0, cb, 255)),
+                                       uchar(qBound(0, cr, 255)), color.matrix, color.range);
+            const qsizetype offset = static_cast<qsizetype>(x) * 4;
+            dst[offset] = char(rgb.r);
+            dst[offset + 1] = char(rgb.g);
+            dst[offset + 2] = char(rgb.b);
+            dst[offset + 3] = char(255);
+        }
+    }
+    return out;
+}
+
+QByteArray packChannel(const CpuPlanes& rgba, int channel) {
+    QByteArray out(planeOffset(rgba.height, rgba.width), 0);
+    for (int y = 0; y < rgba.height; ++y) {
+        const char* src = rgba.plane[0].constData() + planeOffset(y, rgba.stride[0]);
+        char* dst = out.data() + planeOffset(y, rgba.width);
+        for (int x = 0; x < rgba.width; ++x) {
+            dst[x] = src[static_cast<qsizetype>(x) * 4 + channel];
+        }
+    }
+    return out;
 }
 
 void compareRgbaWithinOneLsb(const CpuPlanes& actual, const CpuPlanes& expected) {
@@ -120,11 +230,14 @@ void TestGpuCompositor::gridShadersLoadAndBuildPipeline() {
 
     const QShader vert = load(QStringLiteral(":/olr/shaders/grid.vert.qsb"));
     const QShader frag = load(QStringLiteral(":/olr/shaders/grid_nn.frag.qsb"));
+    const QShader quality = load(QStringLiteral(":/olr/shaders/grid_quality.frag.qsb"));
 
     QVERIFY2(vert.isValid(), "grid.vert.qsb missing or not deserializable");
     QVERIFY2(frag.isValid(), "grid_nn.frag.qsb missing or not deserializable");
+    QVERIFY2(quality.isValid(), "grid_quality.frag.qsb missing or not deserializable");
     QCOMPARE(vert.stage(), QShader::VertexStage);
     QCOMPARE(frag.stage(), QShader::FragmentStage);
+    QCOMPARE(quality.stage(), QShader::FragmentStage);
 }
 
 void TestGpuCompositor::compatGridMatchesCpuOracleExactOnNull() {
@@ -218,6 +331,45 @@ void TestGpuCompositor::pgmSelectFillsOutputFromSingleSource() {
     const CpuPlanes got = pgm.readToCpu(FramePixelFormat::Rgba8);
     QVERIFY(got.isValid());
     QCOMPARE(got.plane[0], oracle.plane[0]);
+}
+
+void TestGpuCompositor::bilinearScalerMeetsPsnrAgainstBilinearReference() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    const FrameHandle src = gradientYuv420pHandle(8, 8);
+    ColorMetadata color;
+    const CpuPlanes ref = bilinearUpscaleReferenceRgba8(src, 32, 32, color);
+    QVERIFY(ref.isValid());
+    const CpuPlanes gpu =
+        comp->composeGridToCpu({src}, 32, 32, color, GpuCompositor::ScaleQuality::Bilinear);
+    QVERIFY(gpu.isValid());
+
+    const QByteArray refG = packChannel(ref, 1);
+    const QByteArray gpuG = packChannel(gpu, 1);
+    const double psnr = psnrY8(reinterpret_cast<const uint8_t*>(refG.constData()), 32,
+                               reinterpret_cast<const uint8_t*>(gpuG.constData()), 32, 32, 32);
+    QVERIFY2(psnr >= 39.0, qPrintable(QStringLiteral("bilinear PSNR %1 dB < 39").arg(psnr)));
+}
+
+void TestGpuCompositor::bilinearDiffersFromNearestOracle() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    const FrameHandle src = gradientYuv420pHandle(8, 8);
+    ColorMetadata color;
+    const CpuPlanes nearest = formatcanon::referenceComposeGridRgba8({src}, 32, 32, color);
+    const CpuPlanes bilinear =
+        comp->composeGridToCpu({src}, 32, 32, color, GpuCompositor::ScaleQuality::Bilinear);
+    QVERIFY(bilinear.isValid());
+    QVERIFY2(bilinear.plane[0] != nearest.plane[0],
+             "bilinear scaler must differ from the nearest-neighbor oracle");
 }
 
 #ifdef __APPLE__

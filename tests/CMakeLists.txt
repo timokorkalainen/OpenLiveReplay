@@ -345,7 +345,8 @@ if(OLR_GPU_PIPELINE)
         GLSL "330,440"
         FILES
             "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid.vert"
-            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_nn.frag")
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_nn.frag"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_quality.frag")
 endif()
 
 add_subdirectory(unit)
