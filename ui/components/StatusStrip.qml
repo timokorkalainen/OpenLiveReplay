@@ -47,10 +47,19 @@ RowLayout {
     function tallyColor(index) {
         if (!root.hasUi || !root.ui.isRecording) return Theme.idle
 
-        var connected = root.sourceConnectionVersion >= 0 && root.ui.isSourceConnected(index)
+        var versionTouch = root.ui.playbackViewStateVersion
+            + root.ui.sourceConnectionVersion
+            + root.ui.sourceStatsVersion
+        if (versionTouch < 0) return Theme.idle
+
+        if (root.ui.playbackSingleView && root.ui.playbackSelectedIndex === index) {
+            return Theme.recordOnAir
+        }
+
+        var connected = root.ui.isSourceConnected(index)
         if (!connected) return Theme.error
 
-        var linkHealth = root.sourceStatsVersion >= 0 ? root.ui.sourceLinkHealth(index) : 0
+        var linkHealth = root.ui.sourceLinkHealth(index)
         if (linkHealth === 3) return Theme.error
         if (linkHealth === 2) return Theme.armed
         return Theme.ready
@@ -124,7 +133,9 @@ RowLayout {
                     height: root.tallyDots ? root.tallyDotSize : parent.height
                     radius: root.tallyDots ? root.tallyDotSize / 2 : Theme.r1
                     color: root.tallyColor(tallyChip.index)
-                    border.color: root.hasUi && root.ui.isRecording ? Theme.lineStrong : Theme.line
+                    border.color: root.hasUi && root.ui.isRecording
+                                  ? root.tallyColor(tallyChip.index)
+                                  : Theme.line
                     border.width: Theme.borderW
 
                     Text {
@@ -134,6 +145,7 @@ RowLayout {
                         color: tallyFill.color === Theme.armed
                                || tallyFill.color === Theme.error
                                || tallyFill.color === Theme.ready
+                               || tallyFill.color === Theme.recordOnAir
                                ? Theme.textOnTally
                                : Theme.textHi
                         font.family: Theme.fontMono
