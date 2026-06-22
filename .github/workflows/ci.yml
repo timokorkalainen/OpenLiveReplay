@@ -463,7 +463,14 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          ./build-tests/tests/probes/rhi_d3d_probe
+          probe="./build-tests/tests/probes/rhi_d3d_probe"
+          [ -x "$probe" ] || probe="${probe}.exe"
+          if [ ! -x "$probe" ]; then
+            echo "::warning::rhi_d3d_probe executable not found"
+            find build-tests/tests/probes -maxdepth 2 -type f -print || true
+            exit 0
+          fi
+          "$probe"
           rc=$?
           echo "rhi_d3d_probe exit code: $rc"
           exit "$rc"
@@ -477,10 +484,15 @@ jobs:
         # tst_gpucompositor exercises the QRhi D3D11 WARP byte-exact compat lane;
         # tst_gpufence exercises the D3D11 fence event wait path through WARP.
         run: |
+          set -euo pipefail
           export OLR_REQUIRE_GPU_FENCE=1
           export OLR_REQUIRE_WARP=1
+          export QT_QPA_PLATFORM=offscreen
           ctest --test-dir build-tests --output-on-failure \
-            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_gpucompositor)$'
+            -R '^(tst_nativeaacdecoder|tst_gpufence)$'
+          gpu_test="./build-tests/tests/unit/tst_gpucompositor"
+          [ -x "$gpu_test" ] || gpu_test="${gpu_test}.exe"
+          "$gpu_test" -v2
 
   # ---------------------------------------------------------------------------
   # Second toolchain: build the app + tests with GCC on Linux and run the unit

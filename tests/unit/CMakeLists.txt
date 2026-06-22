@@ -3,7 +3,7 @@
 function(olr_add_unit_test name)
     qt_add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE Qt6::Test ${ARGN} olr_warnings olr_sanitize)
-    add_test(NAME ${name} COMMAND ${name})
+    add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
     # Headless + deterministic; fail fast rather than hang CI.
     set_tests_properties(${name} PROPERTIES
         LABELS "unit;ci"

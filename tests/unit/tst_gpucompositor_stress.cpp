@@ -125,5 +125,5 @@ void TestGpuCompositorStress::concurrentComposeAndChecksumValidate() {
              qPrintable(QStringLiteral("max channel delta %1 > 1 LSB").arg(worstDelta)));
 }
 
-QTEST_GUILESS_MAIN(TestGpuCompositorStress)
+QTEST_MAIN(TestGpuCompositorStress)
 #include "tst_gpucompositor_stress.moc"
