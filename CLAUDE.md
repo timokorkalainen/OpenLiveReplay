@@ -24,6 +24,11 @@ git worktree add .claude/worktrees/<name> -b <branch> origin/main
 
 ## Build & test
 
+Full build/run playbook: [`docs/build-and-run.md`](docs/build-and-run.md). It
+covers terminal builds, the committed VS Code build/debug setup
+([`.vscode/launch.json`](.vscode/launch.json), [`.vscode/tasks.json`](.vscode/tasks.json)),
+tests, and iOS device install/launch.
+
 macOS (Homebrew) defaults — adjust paths for your environment:
 
 ```sh
