@@ -64,74 +64,118 @@ int texelU8(vec4 texel, int channel)
     return int(round(texel[channel] * 255.0));
 }
 
-vec4 lumaSample(int source, vec2 uv)
+vec4 lumaTexel(int source, ivec2 coord)
 {
     if (source == 0)
-        return texture(sampler2D(texLuma0, texSampler), uv);
+        return texelFetch(sampler2D(texLuma0, texSampler), coord, 0);
     if (source == 1)
-        return texture(sampler2D(texLuma1, texSampler), uv);
+        return texelFetch(sampler2D(texLuma1, texSampler), coord, 0);
     if (source == 2)
-        return texture(sampler2D(texLuma2, texSampler), uv);
+        return texelFetch(sampler2D(texLuma2, texSampler), coord, 0);
     if (source == 3)
-        return texture(sampler2D(texLuma3, texSampler), uv);
+        return texelFetch(sampler2D(texLuma3, texSampler), coord, 0);
     if (source == 4)
-        return texture(sampler2D(texLuma4, texSampler), uv);
+        return texelFetch(sampler2D(texLuma4, texSampler), coord, 0);
     if (source == 5)
-        return texture(sampler2D(texLuma5, texSampler), uv);
+        return texelFetch(sampler2D(texLuma5, texSampler), coord, 0);
     if (source == 6)
-        return texture(sampler2D(texLuma6, texSampler), uv);
+        return texelFetch(sampler2D(texLuma6, texSampler), coord, 0);
     if (source == 7)
-        return texture(sampler2D(texLuma7, texSampler), uv);
+        return texelFetch(sampler2D(texLuma7, texSampler), coord, 0);
     if (source == 8)
-        return texture(sampler2D(texLuma8, texSampler), uv);
+        return texelFetch(sampler2D(texLuma8, texSampler), coord, 0);
     if (source == 9)
-        return texture(sampler2D(texLuma9, texSampler), uv);
+        return texelFetch(sampler2D(texLuma9, texSampler), coord, 0);
     if (source == 10)
-        return texture(sampler2D(texLuma10, texSampler), uv);
+        return texelFetch(sampler2D(texLuma10, texSampler), coord, 0);
     if (source == 11)
-        return texture(sampler2D(texLuma11, texSampler), uv);
+        return texelFetch(sampler2D(texLuma11, texSampler), coord, 0);
     if (source == 12)
-        return texture(sampler2D(texLuma12, texSampler), uv);
+        return texelFetch(sampler2D(texLuma12, texSampler), coord, 0);
     if (source == 13)
-        return texture(sampler2D(texLuma13, texSampler), uv);
+        return texelFetch(sampler2D(texLuma13, texSampler), coord, 0);
     if (source == 14)
-        return texture(sampler2D(texLuma14, texSampler), uv);
-    return texture(sampler2D(texLuma15, texSampler), uv);
+        return texelFetch(sampler2D(texLuma14, texSampler), coord, 0);
+    return texelFetch(sampler2D(texLuma15, texSampler), coord, 0);
 }
 
-vec4 chromaSample(int source, vec2 uv)
+vec4 chromaTexel(int source, ivec2 coord)
 {
     if (source == 0)
-        return texture(sampler2D(texChroma0, texSampler), uv);
+        return texelFetch(sampler2D(texChroma0, texSampler), coord, 0);
     if (source == 1)
-        return texture(sampler2D(texChroma1, texSampler), uv);
+        return texelFetch(sampler2D(texChroma1, texSampler), coord, 0);
     if (source == 2)
-        return texture(sampler2D(texChroma2, texSampler), uv);
+        return texelFetch(sampler2D(texChroma2, texSampler), coord, 0);
     if (source == 3)
-        return texture(sampler2D(texChroma3, texSampler), uv);
+        return texelFetch(sampler2D(texChroma3, texSampler), coord, 0);
     if (source == 4)
-        return texture(sampler2D(texChroma4, texSampler), uv);
+        return texelFetch(sampler2D(texChroma4, texSampler), coord, 0);
     if (source == 5)
-        return texture(sampler2D(texChroma5, texSampler), uv);
+        return texelFetch(sampler2D(texChroma5, texSampler), coord, 0);
     if (source == 6)
-        return texture(sampler2D(texChroma6, texSampler), uv);
+        return texelFetch(sampler2D(texChroma6, texSampler), coord, 0);
     if (source == 7)
-        return texture(sampler2D(texChroma7, texSampler), uv);
+        return texelFetch(sampler2D(texChroma7, texSampler), coord, 0);
     if (source == 8)
-        return texture(sampler2D(texChroma8, texSampler), uv);
+        return texelFetch(sampler2D(texChroma8, texSampler), coord, 0);
     if (source == 9)
-        return texture(sampler2D(texChroma9, texSampler), uv);
+        return texelFetch(sampler2D(texChroma9, texSampler), coord, 0);
     if (source == 10)
-        return texture(sampler2D(texChroma10, texSampler), uv);
+        return texelFetch(sampler2D(texChroma10, texSampler), coord, 0);
     if (source == 11)
-        return texture(sampler2D(texChroma11, texSampler), uv);
+        return texelFetch(sampler2D(texChroma11, texSampler), coord, 0);
     if (source == 12)
-        return texture(sampler2D(texChroma12, texSampler), uv);
+        return texelFetch(sampler2D(texChroma12, texSampler), coord, 0);
     if (source == 13)
-        return texture(sampler2D(texChroma13, texSampler), uv);
+        return texelFetch(sampler2D(texChroma13, texSampler), coord, 0);
     if (source == 14)
-        return texture(sampler2D(texChroma14, texSampler), uv);
-    return texture(sampler2D(texChroma15, texSampler), uv);
+        return texelFetch(sampler2D(texChroma14, texSampler), coord, 0);
+    return texelFetch(sampler2D(texChroma15, texSampler), coord, 0);
+}
+
+int lumaU8(int source, ivec2 coord)
+{
+    return texelU8(lumaTexel(source, coord), 0);
+}
+
+int chromaU8(int source, ivec2 coord, int channel)
+{
+    return texelU8(chromaTexel(source, coord), channel);
+}
+
+int sampleLumaLinear(int source, int width, int height, vec2 uv)
+{
+    float fx = uv.x * float(width) - 0.5;
+    float fy = uv.y * float(height) - 0.5;
+    float tx = clamp(fx - floor(fx), 0.0, 1.0);
+    float ty = clamp(fy - floor(fy), 0.0, 1.0);
+    int x0 = clamp(int(floor(fx)), 0, width - 1);
+    int y0 = clamp(int(floor(fy)), 0, height - 1);
+    int x1 = clamp(x0 + 1, 0, width - 1);
+    int y1 = clamp(y0 + 1, 0, height - 1);
+
+    float a = mix(float(lumaU8(source, ivec2(x0, y0))), float(lumaU8(source, ivec2(x1, y0))), tx);
+    float b = mix(float(lumaU8(source, ivec2(x0, y1))), float(lumaU8(source, ivec2(x1, y1))), tx);
+    return clampU8(int(floor(mix(a, b, ty) + 0.5)));
+}
+
+int sampleChromaLinear(int source, int width, int height, int channel, vec2 uv)
+{
+    float fx = uv.x * float(width) - 0.5;
+    float fy = uv.y * float(height) - 0.5;
+    float tx = clamp(fx - floor(fx), 0.0, 1.0);
+    float ty = clamp(fy - floor(fy), 0.0, 1.0);
+    int x0 = clamp(int(floor(fx)), 0, width - 1);
+    int y0 = clamp(int(floor(fy)), 0, height - 1);
+    int x1 = clamp(x0 + 1, 0, width - 1);
+    int y1 = clamp(y0 + 1, 0, height - 1);
+
+    float a = mix(float(chromaU8(source, ivec2(x0, y0), channel)),
+                  float(chromaU8(source, ivec2(x1, y0), channel)), tx);
+    float b = mix(float(chromaU8(source, ivec2(x0, y1), channel)),
+                  float(chromaU8(source, ivec2(x1, y1), channel)), tx);
+    return clampU8(int(floor(mix(a, b, ty) + 0.5)));
 }
 
 vec4 yuvToRgba8(int y, int u, int v)
@@ -196,7 +240,9 @@ void main()
     int ix = clamp(px - tile.x, 0, dstW - 1);
     int iy = clamp(py - tile.y, 0, dstH - 1);
     vec2 tileUv = vec2((float(ix) + 0.5) / float(dstW), (float(iy) + 0.5) / float(dstH));
-    vec4 yTexel = lumaSample(source, tileUv);
-    vec4 uvTexel = chromaSample(source, tileUv);
-    fragColor = yuvToRgba8(texelU8(yTexel, 0), texelU8(uvTexel, 0), texelU8(uvTexel, 1));
+    int chromaW = (srcW + 1) / 2;
+    int chromaH = (srcH + 1) / 2;
+    fragColor = yuvToRgba8(sampleLumaLinear(source, srcW, srcH, tileUv),
+                           sampleChromaLinear(source, chromaW, chromaH, 0, tileUv),
+                           sampleChromaLinear(source, chromaW, chromaH, 1, tileUv));
 }

@@ -16,7 +16,6 @@
 #include "playback/output/framehandle.h"
 #include "playback/output/outputbusengine.h"
 
-#include <cstdio>
 #include <utility>
 
 class TestGpuCompositor : public QObject {
@@ -643,14 +642,5 @@ void TestGpuCompositor::gpuNv12HandleAliasesExistingSurface() {
 }
 #endif
 
-int main(int argc, char** argv) {
-    std::fprintf(stderr, "tst_gpucompositor: main entered\n");
-    QCoreApplication app(argc, argv);
-    std::fprintf(stderr, "tst_gpucompositor: QCoreApplication ready\n");
-    TestGpuCompositor tc;
-    const int rc = QTest::qExec(&tc, argc, argv);
-    std::fprintf(stderr, "tst_gpucompositor: qExec returned %d\n", rc);
-    return rc;
-}
-
+QTEST_GUILESS_MAIN(TestGpuCompositor)
 #include "tst_gpucompositor.moc"
