@@ -229,17 +229,18 @@ CpuPlanes renderGridWithRhi(QRhi* rhi, const QList<FrameHandle>& frames, int wid
     }
 
     QVector<QRhiShaderResourceBinding> bindings;
-    bindings.reserve(1 + kMaxGridSources * 2);
+    bindings.reserve(2 + kMaxGridSources * 2);
     bindings.append(QRhiShaderResourceBinding::uniformBuffer(
         0, QRhiShaderResourceBinding::FragmentStage, ubuf.get()));
     for (int i = 0; i < kMaxGridSources; ++i) {
-        bindings.append(QRhiShaderResourceBinding::sampledTexture(
-            1 + i * 2, QRhiShaderResourceBinding::FragmentStage, lumaTextures.at(size_t(i)).get(),
-            sampler.get()));
-        bindings.append(QRhiShaderResourceBinding::sampledTexture(
-            2 + i * 2, QRhiShaderResourceBinding::FragmentStage, chromaTextures.at(size_t(i)).get(),
-            sampler.get()));
+        bindings.append(QRhiShaderResourceBinding::texture(
+            1 + i * 2, QRhiShaderResourceBinding::FragmentStage, lumaTextures.at(size_t(i)).get()));
+        bindings.append(QRhiShaderResourceBinding::texture(2 + i * 2,
+                                                           QRhiShaderResourceBinding::FragmentStage,
+                                                           chromaTextures.at(size_t(i)).get()));
     }
+    bindings.append(QRhiShaderResourceBinding::sampler(33, QRhiShaderResourceBinding::FragmentStage,
+                                                       sampler.get()));
 
     std::unique_ptr<QRhiShaderResourceBindings> srb(rhi->newShaderResourceBindings());
     srb->setBindings(bindings.cbegin(), bindings.cend());
@@ -347,7 +348,7 @@ CpuPlanes GpuCompositor::composeGridToCpu(const QList<FrameHandle>& frames, int 
     return rgba;
 }
 
-FrameHandle GpuCompositor::composePgm(const FrameHandle&, int, int, ColorMetadata,
-                                      ScaleQuality) const {
-    return FrameHandle{};
+FrameHandle GpuCompositor::composePgm(const FrameHandle& source, int width, int height,
+                                      ColorMetadata color, ScaleQuality quality) const {
+    return composeGrid(QList<FrameHandle>{source}, width, height, color, quality);
 }

@@ -21,6 +21,9 @@ private slots:
     void createIsNullOrValidNeverPartial();
     void gridShadersLoadAndBuildPipeline();
     void compatGridMatchesCpuOracleExactOnNull();
+    void compatGridWithinOneLsbOnLocalGpu();
+    void swappedQuadrantsDifferFromOracle();
+    void pgmSelectFillsOutputFromSingleSource();
 #ifdef __APPLE__
     void cpuHandleUploadsToNv12Surface();
     void gpuNv12HandleAliasesExistingSurface();
@@ -81,6 +84,22 @@ void compareRows(const CpuPlanes& expected, const CpuPlanes& actual, int plane, 
     }
 }
 
+void compareRgbaWithinOneLsb(const CpuPlanes& actual, const CpuPlanes& expected) {
+    QCOMPARE(actual.format, FramePixelFormat::Rgba8);
+    QCOMPARE(actual.width, expected.width);
+    QCOMPARE(actual.height, expected.height);
+    QCOMPARE(actual.stride[0], expected.stride[0]);
+    QCOMPARE(actual.plane[0].size(), expected.plane[0].size());
+
+    for (qsizetype i = 0; i < expected.plane[0].size(); ++i) {
+        const int got = uchar(actual.plane[0].at(i));
+        const int exp = uchar(expected.plane[0].at(i));
+        QVERIFY2(
+            qAbs(got - exp) <= 1,
+            qPrintable(QStringLiteral("RGBA byte %1 got %2 expected %3").arg(i).arg(got).arg(exp)));
+    }
+}
+
 } // namespace
 
 void TestGpuCompositor::createIsNullOrValidNeverPartial() {
@@ -132,6 +151,73 @@ void TestGpuCompositor::compatGridMatchesCpuOracleExactOnNull() {
     QCOMPARE(gpu.width, 8);
     QCOMPARE(gpu.height, 8);
     QCOMPARE(gpu.plane[0], oracle.plane[0]);
+}
+
+void TestGpuCompositor::compatGridWithinOneLsbOnLocalGpu() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 60, 200),
+        solidYuv420pHandle(4, 4, 80, 70, 190),
+        solidYuv420pHandle(4, 4, 120, 80, 180),
+        solidYuv420pHandle(4, 4, 160, 90, 170),
+    };
+    ColorMetadata color;
+
+    const CpuPlanes oracle = formatcanon::referenceComposeGridRgba8(frames, 8, 8, color);
+    QVERIFY(oracle.isValid());
+    const CpuPlanes gpu =
+        comp->composeGridToCpu(frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    if (!gpu.isValid()) QSKIP("local GPU grid render/readback unavailable on this host");
+    compareRgbaWithinOneLsb(gpu, oracle);
+}
+
+void TestGpuCompositor::swappedQuadrantsDifferFromOracle() {
+    auto rhi = GpuRhiContext::createNullForTest();
+    if (!rhi) QSKIP("QRhi Null backend unavailable on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> correct{
+        solidYuv420pHandle(4, 4, 40, 60, 200),
+        solidYuv420pHandle(4, 4, 80, 70, 190),
+        solidYuv420pHandle(4, 4, 120, 80, 180),
+        solidYuv420pHandle(4, 4, 160, 90, 170),
+    };
+    QList<FrameHandle> swapped{correct.at(1), correct.at(0), correct.at(2), correct.at(3)};
+    ColorMetadata color;
+
+    const CpuPlanes oracle = formatcanon::referenceComposeGridRgba8(correct, 8, 8, color);
+    const CpuPlanes gpu =
+        comp->composeGridToCpu(swapped, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(oracle.isValid());
+    QVERIFY(gpu.isValid());
+    QVERIFY(gpu.plane[0] != oracle.plane[0]);
+}
+
+void TestGpuCompositor::pgmSelectFillsOutputFromSingleSource() {
+    auto rhi = GpuRhiContext::createNullForTest();
+    if (!rhi) QSKIP("QRhi Null backend unavailable on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    const FrameHandle source = solidYuv420pHandle(4, 4, 92, 108, 154);
+    ColorMetadata color;
+    const CpuPlanes oracle = formatcanon::referenceComposeGridRgba8({source}, 8, 8, color);
+    QVERIFY(oracle.isValid());
+
+    const FrameHandle pgm =
+        comp->composePgm(source, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(!pgm.isNull());
+    const CpuPlanes got = pgm.readToCpu(FramePixelFormat::Rgba8);
+    QVERIFY(got.isValid());
+    QCOMPARE(got.plane[0], oracle.plane[0]);
 }
 
 #ifdef __APPLE__

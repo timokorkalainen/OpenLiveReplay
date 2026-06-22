@@ -18,38 +18,39 @@ layout(std140, binding = 0) uniform GridUniforms
 }
 ub;
 
-layout(binding = 1) uniform sampler2D texLuma0;
-layout(binding = 2) uniform sampler2D texChroma0;
-layout(binding = 3) uniform sampler2D texLuma1;
-layout(binding = 4) uniform sampler2D texChroma1;
-layout(binding = 5) uniform sampler2D texLuma2;
-layout(binding = 6) uniform sampler2D texChroma2;
-layout(binding = 7) uniform sampler2D texLuma3;
-layout(binding = 8) uniform sampler2D texChroma3;
-layout(binding = 9) uniform sampler2D texLuma4;
-layout(binding = 10) uniform sampler2D texChroma4;
-layout(binding = 11) uniform sampler2D texLuma5;
-layout(binding = 12) uniform sampler2D texChroma5;
-layout(binding = 13) uniform sampler2D texLuma6;
-layout(binding = 14) uniform sampler2D texChroma6;
-layout(binding = 15) uniform sampler2D texLuma7;
-layout(binding = 16) uniform sampler2D texChroma7;
-layout(binding = 17) uniform sampler2D texLuma8;
-layout(binding = 18) uniform sampler2D texChroma8;
-layout(binding = 19) uniform sampler2D texLuma9;
-layout(binding = 20) uniform sampler2D texChroma9;
-layout(binding = 21) uniform sampler2D texLuma10;
-layout(binding = 22) uniform sampler2D texChroma10;
-layout(binding = 23) uniform sampler2D texLuma11;
-layout(binding = 24) uniform sampler2D texChroma11;
-layout(binding = 25) uniform sampler2D texLuma12;
-layout(binding = 26) uniform sampler2D texChroma12;
-layout(binding = 27) uniform sampler2D texLuma13;
-layout(binding = 28) uniform sampler2D texChroma13;
-layout(binding = 29) uniform sampler2D texLuma14;
-layout(binding = 30) uniform sampler2D texChroma14;
-layout(binding = 31) uniform sampler2D texLuma15;
-layout(binding = 32) uniform sampler2D texChroma15;
+layout(binding = 1) uniform texture2D texLuma0;
+layout(binding = 2) uniform texture2D texChroma0;
+layout(binding = 3) uniform texture2D texLuma1;
+layout(binding = 4) uniform texture2D texChroma1;
+layout(binding = 5) uniform texture2D texLuma2;
+layout(binding = 6) uniform texture2D texChroma2;
+layout(binding = 7) uniform texture2D texLuma3;
+layout(binding = 8) uniform texture2D texChroma3;
+layout(binding = 9) uniform texture2D texLuma4;
+layout(binding = 10) uniform texture2D texChroma4;
+layout(binding = 11) uniform texture2D texLuma5;
+layout(binding = 12) uniform texture2D texChroma5;
+layout(binding = 13) uniform texture2D texLuma6;
+layout(binding = 14) uniform texture2D texChroma6;
+layout(binding = 15) uniform texture2D texLuma7;
+layout(binding = 16) uniform texture2D texChroma7;
+layout(binding = 17) uniform texture2D texLuma8;
+layout(binding = 18) uniform texture2D texChroma8;
+layout(binding = 19) uniform texture2D texLuma9;
+layout(binding = 20) uniform texture2D texChroma9;
+layout(binding = 21) uniform texture2D texLuma10;
+layout(binding = 22) uniform texture2D texChroma10;
+layout(binding = 23) uniform texture2D texLuma11;
+layout(binding = 24) uniform texture2D texChroma11;
+layout(binding = 25) uniform texture2D texLuma12;
+layout(binding = 26) uniform texture2D texChroma12;
+layout(binding = 27) uniform texture2D texLuma13;
+layout(binding = 28) uniform texture2D texChroma13;
+layout(binding = 29) uniform texture2D texLuma14;
+layout(binding = 30) uniform texture2D texChroma14;
+layout(binding = 31) uniform texture2D texLuma15;
+layout(binding = 32) uniform texture2D texChroma15;
+layout(binding = 33) uniform sampler texSampler;
 
 int clampU8(int v)
 {
@@ -64,71 +65,71 @@ int texelU8(vec4 texel, int channel)
 vec4 lumaTexel(int source, ivec2 coord)
 {
     if (source == 0)
-        return texelFetch(texLuma0, coord, 0);
+        return texelFetch(sampler2D(texLuma0, texSampler), coord, 0);
     if (source == 1)
-        return texelFetch(texLuma1, coord, 0);
+        return texelFetch(sampler2D(texLuma1, texSampler), coord, 0);
     if (source == 2)
-        return texelFetch(texLuma2, coord, 0);
+        return texelFetch(sampler2D(texLuma2, texSampler), coord, 0);
     if (source == 3)
-        return texelFetch(texLuma3, coord, 0);
+        return texelFetch(sampler2D(texLuma3, texSampler), coord, 0);
     if (source == 4)
-        return texelFetch(texLuma4, coord, 0);
+        return texelFetch(sampler2D(texLuma4, texSampler), coord, 0);
     if (source == 5)
-        return texelFetch(texLuma5, coord, 0);
+        return texelFetch(sampler2D(texLuma5, texSampler), coord, 0);
     if (source == 6)
-        return texelFetch(texLuma6, coord, 0);
+        return texelFetch(sampler2D(texLuma6, texSampler), coord, 0);
     if (source == 7)
-        return texelFetch(texLuma7, coord, 0);
+        return texelFetch(sampler2D(texLuma7, texSampler), coord, 0);
     if (source == 8)
-        return texelFetch(texLuma8, coord, 0);
+        return texelFetch(sampler2D(texLuma8, texSampler), coord, 0);
     if (source == 9)
-        return texelFetch(texLuma9, coord, 0);
+        return texelFetch(sampler2D(texLuma9, texSampler), coord, 0);
     if (source == 10)
-        return texelFetch(texLuma10, coord, 0);
+        return texelFetch(sampler2D(texLuma10, texSampler), coord, 0);
     if (source == 11)
-        return texelFetch(texLuma11, coord, 0);
+        return texelFetch(sampler2D(texLuma11, texSampler), coord, 0);
     if (source == 12)
-        return texelFetch(texLuma12, coord, 0);
+        return texelFetch(sampler2D(texLuma12, texSampler), coord, 0);
     if (source == 13)
-        return texelFetch(texLuma13, coord, 0);
+        return texelFetch(sampler2D(texLuma13, texSampler), coord, 0);
     if (source == 14)
-        return texelFetch(texLuma14, coord, 0);
-    return texelFetch(texLuma15, coord, 0);
+        return texelFetch(sampler2D(texLuma14, texSampler), coord, 0);
+    return texelFetch(sampler2D(texLuma15, texSampler), coord, 0);
 }
 
 vec4 chromaTexel(int source, ivec2 coord)
 {
     if (source == 0)
-        return texelFetch(texChroma0, coord, 0);
+        return texelFetch(sampler2D(texChroma0, texSampler), coord, 0);
     if (source == 1)
-        return texelFetch(texChroma1, coord, 0);
+        return texelFetch(sampler2D(texChroma1, texSampler), coord, 0);
     if (source == 2)
-        return texelFetch(texChroma2, coord, 0);
+        return texelFetch(sampler2D(texChroma2, texSampler), coord, 0);
     if (source == 3)
-        return texelFetch(texChroma3, coord, 0);
+        return texelFetch(sampler2D(texChroma3, texSampler), coord, 0);
     if (source == 4)
-        return texelFetch(texChroma4, coord, 0);
+        return texelFetch(sampler2D(texChroma4, texSampler), coord, 0);
     if (source == 5)
-        return texelFetch(texChroma5, coord, 0);
+        return texelFetch(sampler2D(texChroma5, texSampler), coord, 0);
     if (source == 6)
-        return texelFetch(texChroma6, coord, 0);
+        return texelFetch(sampler2D(texChroma6, texSampler), coord, 0);
     if (source == 7)
-        return texelFetch(texChroma7, coord, 0);
+        return texelFetch(sampler2D(texChroma7, texSampler), coord, 0);
     if (source == 8)
-        return texelFetch(texChroma8, coord, 0);
+        return texelFetch(sampler2D(texChroma8, texSampler), coord, 0);
     if (source == 9)
-        return texelFetch(texChroma9, coord, 0);
+        return texelFetch(sampler2D(texChroma9, texSampler), coord, 0);
     if (source == 10)
-        return texelFetch(texChroma10, coord, 0);
+        return texelFetch(sampler2D(texChroma10, texSampler), coord, 0);
     if (source == 11)
-        return texelFetch(texChroma11, coord, 0);
+        return texelFetch(sampler2D(texChroma11, texSampler), coord, 0);
     if (source == 12)
-        return texelFetch(texChroma12, coord, 0);
+        return texelFetch(sampler2D(texChroma12, texSampler), coord, 0);
     if (source == 13)
-        return texelFetch(texChroma13, coord, 0);
+        return texelFetch(sampler2D(texChroma13, texSampler), coord, 0);
     if (source == 14)
-        return texelFetch(texChroma14, coord, 0);
-    return texelFetch(texChroma15, coord, 0);
+        return texelFetch(sampler2D(texChroma14, texSampler), coord, 0);
+    return texelFetch(sampler2D(texChroma15, texSampler), coord, 0);
 }
 
 vec4 yuvToRgba8(int y, int u, int v)
