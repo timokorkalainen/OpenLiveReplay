@@ -20,12 +20,12 @@ GroupBox {
 
     function statusColor(severity) {
         if (severity === "ok")
-            return "#2e7d32"
+            return Theme.ready
         if (severity === "warning")
-            return "#f9a825"
+            return Theme.armed
         if (severity === "error")
-            return "#d32f2f"
-        return "#666"
+            return Theme.error
+        return Theme.textDim
     }
 
     ScrollView {

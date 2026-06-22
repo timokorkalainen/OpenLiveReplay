@@ -104,7 +104,7 @@ Drawer {
                             Text {
                                 visible: root.hasUi && root.ui.importPreviewError !== ""
                                 text: root.hasUi ? root.ui.importPreviewError : ""
-                                color: "#ff9800"
+                                color: Theme.armed
                                 wrapMode: Text.WordWrap
                                 Layout.fillWidth: true
                             }
@@ -128,7 +128,7 @@ Drawer {
                                         var count = p.feedCount !== undefined ? p.feedCount : ((p.feeds || []).length)
                                         return count + " imported feed" + (count === 1 ? "" : "s") + " ready"
                                     }
-                                    color: "#8bc34a"
+                                    color: Theme.ready
                                     Layout.fillWidth: true
                                     elide: Text.ElideRight
                                 }

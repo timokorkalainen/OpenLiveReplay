@@ -28,12 +28,12 @@ ColumnLayout {
     RowLayout {
         Layout.fillWidth: true
 
-        Text {
-            text: "Input Sources"
-            Layout.fillWidth: true
-            color: "#eeeeee"
-            font.bold: true
-        }
+            Text {
+                text: "Input Sources"
+                Layout.fillWidth: true
+                color: Theme.textHi
+                font.bold: true
+            }
 
         Button {
             text: "Metadata Fields"
@@ -50,7 +50,7 @@ ColumnLayout {
     Rectangle {
         Layout.fillHeight: true
         Layout.fillWidth: true
-        color: "#181818"
+        color: Theme.panel
 
         ListView {
             id: streamList
@@ -78,7 +78,7 @@ ColumnLayout {
 
                     text: sourceEnabled ? "ON" : "OFF"
                     Layout.preferredWidth: 50
-                    palette.button: sourceEnabled ? "#2e7d32" : "#555"
+                    palette.button: sourceEnabled ? Theme.ready : Theme.lineStrong
                     onClicked: if (root.hasUi) root.ui.toggleSourceEnabled(streamRow.index)
                 }
 
@@ -97,12 +97,12 @@ ColumnLayout {
                                              ? root.ui.sourceLinkHealth(streamRow.index)
                                              : 0
                     color: !root.hasUi || !root.ui.isRecording
-                           ? "#555"
+                           ? Theme.idle
                            : (!connDot.connected
-                              ? "#d32f2f"
-                              : (connDot.linkHealth === 3 ? "#d32f2f"
-                                 : connDot.linkHealth === 2 ? "#f9a825"
-                                 : "#2e7d32"))
+                              ? Theme.error
+                              : (connDot.linkHealth === 3 ? Theme.error
+                                 : connDot.linkHealth === 2 ? Theme.armed
+                                 : Theme.ready))
                     HoverHandler { id: connHover }
                     ToolTip.visible: connHover.hovered
                     ToolTip.text: !root.hasUi || !root.ui.isRecording
@@ -159,7 +159,7 @@ ColumnLayout {
                 // Misconfiguration warning: another source points at this same URL.
                 Label {
                     text: "⚠"
-                    color: "#ff9800"
+                    color: Theme.armed
                     font.bold: true
                     Layout.preferredWidth: 16
                     visible: root.hasUi
@@ -210,9 +210,9 @@ ColumnLayout {
         }
 
         contentItem: Rectangle {
-            color: "#1f1f1f"
+            color: Theme.panelRaised
             radius: 0
-            border.color: "#333"
+            border.color: Theme.line
             border.width: 1
 
             ColumnLayout {
@@ -222,7 +222,7 @@ ColumnLayout {
 
                 Text {
                     text: "Imported Input Settings"
-                    color: "#eeeeee"
+                    color: Theme.textHi
                     font.pixelSize: 18
                     font.bold: true
                     Layout.fillWidth: true
@@ -236,7 +236,7 @@ ColumnLayout {
 
                     Label {
                         text: "Project"
-                        color: "#999999"
+                        color: Theme.textDim
                     }
 
                     Text {
@@ -247,13 +247,13 @@ ColumnLayout {
                             var idText = p.projectId ? " (" + p.projectId + ")" : ""
                             return name + idText
                         }
-                        color: "#eeeeee"
+                        color: Theme.textHi
                         elide: Text.ElideRight
                     }
 
                     Label {
                         text: "Feeds"
-                        color: "#999999"
+                        color: Theme.textDim
                     }
 
                     Text {
@@ -262,25 +262,25 @@ ColumnLayout {
                             var p = root.hasUi ? root.ui.importPreview : ({})
                             return p.feedCount !== undefined ? p.feedCount : ((p.feeds || []).length)
                         }
-                        color: "#eeeeee"
+                        color: Theme.textHi
                     }
 
                     Label {
                         text: "Telemetry SSE"
-                        color: "#999999"
+                        color: Theme.textDim
                     }
 
                     Text {
                         Layout.fillWidth: true
                         text: root.hasUi ? (root.ui.importPreview.telemetrySseUrl || "") : ""
-                        color: "#b0b0b0"
+                        color: Theme.textBody
                         elide: Text.ElideMiddle
                     }
                 }
 
                 Text {
                     text: "Applying will replace the current input sources."
-                    color: "#ffcc80"
+                    color: Theme.armed
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
                 }
@@ -304,8 +304,8 @@ ColumnLayout {
                             required property var modelData
                             width: importFeedsList.width
                             height: feedLayout.implicitHeight + 16
-                            color: "#181818"
-                            border.color: "#333"
+                            color: Theme.panel
+                            border.color: Theme.line
                             border.width: 1
                             radius: 4
 
@@ -322,7 +322,7 @@ ColumnLayout {
                                         var idText = importFeedRow.modelData.id || ""
                                         return idText.length > 0 ? (name + " · " + idText) : name
                                     }
-                                    color: "#eeeeee"
+                                    color: Theme.textHi
                                     font.bold: true
                                     elide: Text.ElideRight
                                 }
@@ -330,21 +330,21 @@ ColumnLayout {
                                 Text {
                                     Layout.fillWidth: true
                                     text: importFeedRow.modelData.url || ""
-                                    color: "#aaaaaa"
+                                    color: Theme.textBody
                                     elide: Text.ElideMiddle
                                 }
 
                                 Text {
                                     Layout.fillWidth: true
                                     text: "telemetryDelayMs " + (importFeedRow.modelData.telemetryDelayMs || 0)
-                                    color: "#888888"
+                                    color: Theme.textDim
                                     elide: Text.ElideRight
                                 }
 
                                 Text {
                                     Layout.fillWidth: true
                                     text: importPreviewPopup.metadataSummary(importFeedRow.modelData.metadata)
-                                    color: "#777777"
+                                    color: Theme.textDim
                                     elide: Text.ElideRight
                                 }
                             }
@@ -426,9 +426,9 @@ ColumnLayout {
         }
 
         contentItem: Rectangle {
-            color: "#1f1f1f"
+            color: Theme.panelRaised
             radius: 0
-            border.color: "#333"
+            border.color: Theme.line
             border.width: 1
 
             ColumnLayout {
@@ -441,7 +441,7 @@ ColumnLayout {
 
                     Text {
                         text: "Metadata Field Definitions"
-                        color: "#eeeeee"
+                        color: Theme.textHi
                         font.pixelSize: 18
                         font.bold: true
                         Layout.fillWidth: true
@@ -455,7 +455,7 @@ ColumnLayout {
 
                 Text {
                     text: "Define the metadata fields available for all sources. Each source can then fill in its own values."
-                    color: "#b0b0b0"
+                    color: Theme.textBody
                     font.pixelSize: 12
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
@@ -585,9 +585,9 @@ ColumnLayout {
         }
 
         contentItem: Rectangle {
-            color: "#1f1f1f"
+            color: Theme.panelRaised
             radius: 0
-            border.color: "#333"
+            border.color: Theme.line
             border.width: 1
 
             ColumnLayout {
@@ -597,7 +597,7 @@ ColumnLayout {
 
                 Text {
                     text: "Metadata — " + metadataEditor.sourceLabel
-                    color: "#eeeeee"
+                    color: Theme.textHi
                     font.pixelSize: 18
                     font.bold: true
                     Layout.fillWidth: true
@@ -605,9 +605,9 @@ ColumnLayout {
 
                 Text {
                     text: metadataModel.count > 0
-                          ? "Fill in values for this source. Fields are defined in Metadata Fields."
-                          : "No metadata fields defined. Use the Metadata Fields button to add fields first."
-                    color: "#b0b0b0"
+                      ? "Fill in values for this source. Fields are defined in Metadata Fields."
+                      : "No metadata fields defined. Use the Metadata Fields button to add fields first."
+                    color: Theme.textBody
                     font.pixelSize: 12
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
@@ -635,7 +635,7 @@ ColumnLayout {
                             Label {
                                 text: metaRow.name
                                 Layout.preferredWidth: 180
-                                color: "#cccccc"
+                                color: Theme.textHi
                                 font.bold: true
                                 elide: Text.ElideRight
                             }

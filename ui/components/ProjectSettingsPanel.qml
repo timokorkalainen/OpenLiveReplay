@@ -36,7 +36,7 @@ ColumnLayout {
     Text {
         text: "Project Settings"
         font.bold: true
-        color: "#eeeeee"
+        color: Theme.textHi
     }
 
     GridLayout {
