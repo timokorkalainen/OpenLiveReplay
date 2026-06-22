@@ -136,6 +136,7 @@ public:
 
     PlaybackCounters counters() const;
     OutputDispatchStats outputStats() const;
+    uint64_t gpuGeneration() const;
     // The committed cache generation (set at repositionTo's tail). >=1 after a
     // real reposition proves a target was decoded and committed to the cache.
     uint64_t cacheGeneration() const {

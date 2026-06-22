@@ -11,6 +11,7 @@
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/decodedonefence.h"
 #include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpurhicontext.h"
 #ifdef __APPLE__
@@ -106,6 +107,9 @@ void PlaybackWorker::seekTo(int64_t timestampMs) {
     // holds the last good playhead until m_committedGeneration catches up. The
     // bump also signals maybeFireScheduledCut to abort an armed cut (manual seek wins).
     m_seekGeneration.fetch_add(1, std::memory_order_release);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (gpuPipelineEnabled()) GpuGenerationCounter::instance().bump();
+#endif
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
         if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
@@ -156,6 +160,14 @@ PlaybackWorker::PlaybackCounters PlaybackWorker::counters() const {
     counters.gpuReadToCpuCount = gpuFrameReadToCpuCount();
 #endif
     return counters;
+}
+
+uint64_t PlaybackWorker::gpuGeneration() const {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    return GpuGenerationCounter::instance().current();
+#else
+    return 0;
+#endif
 }
 
 void PlaybackWorker::stop() {
@@ -295,6 +307,9 @@ void PlaybackWorker::resetDedup() {
 }
 
 void PlaybackWorker::clearDecoderBuffers() {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (gpuPipelineEnabled()) GpuGenerationCounter::instance().bump();
+#endif
     QMutexLocker bufferLocker(&m_bufferMutex);
     for (auto* track : m_decoderBank) {
         track->buffer.clear();
@@ -702,6 +717,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         meta.key.width = track->codecWidth;
                         meta.key.height = track->codecHeight;
                         meta.color = colorMetadataForNativeTrack(track);
+                        meta.gpuGeneration = GpuGenerationCounter::instance().current();
 
                         FrameHandle mediaFrame = importVtImageBuffer(imageBuffer, meta, gpuRhi);
                         if (!mediaFrame.isPresentable()) {
@@ -770,6 +786,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                             }
 
                             imported->metadata().color = colorMetadataForNativeTrack(track);
+                            imported->metadata().gpuGeneration =
+                                GpuGenerationCounter::instance().current();
                             if (m_decodeFence) m_decodeFence->signalDecodeDone();
                             gpuInserted = commitMediaFrame(*imported, framePtsMs);
                             if (!gpuInserted) gpuFallback = true;
