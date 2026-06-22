@@ -1,6 +1,8 @@
 <!DOCTYPE RCC>
 <RCC version="1.0">
   <qresource prefix="/olr/shaders">
+    <file alias="grid.vert.qsb">grid.vert.qsb</file>
+    <file alias="grid_nn.frag.qsb">grid_nn.frag.qsb</file>
     <file alias="passthrough.vert.qsb">passthrough.vert.qsb</file>
     <file alias="passthrough.frag.qsb">passthrough.frag.qsb</file>
   </qresource>

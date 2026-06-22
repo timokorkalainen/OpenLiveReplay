@@ -336,6 +336,13 @@ if(OLR_GPU_PIPELINE)
         FILES
             "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.vert"
             "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.frag")
+    qt_add_shaders(olr_test_gpu "olr_grid_shaders"
+        PREFIX "/olr/shaders"
+        BASE "${CMAKE_SOURCE_DIR}/playback/gpu/shaders"
+        GLSL "330,440"
+        FILES
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid.vert"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_nn.frag")
 endif()
 
 add_subdirectory(unit)
