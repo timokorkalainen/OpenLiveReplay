@@ -158,8 +158,7 @@ bool ReplayPlaylist::fromJson(const QJsonObject& obj) {
         const QJsonObject o = v.toObject();
         ReplayEntry e;
         if (!readRequiredString(o, "clipPath", e.clipPath) ||
-            !readRequiredInt64(o, "inMs", e.inMs) ||
-            !readRequiredInt64(o, "outMs", e.outMs) ||
+            !readRequiredInt64(o, "inMs", e.inMs) || !readRequiredInt64(o, "outMs", e.outMs) ||
             !readRequiredDouble(o, "speed", e.speed)) {
             return false;
         }
