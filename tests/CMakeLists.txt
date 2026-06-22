@@ -277,13 +277,16 @@ endif()
 
 if(OLR_GPU_PIPELINE)
     target_compile_definitions(olr_test_playback PUBLIC OLR_GPU_PIPELINE_BUILD=1)
+    target_link_libraries(olr_test_playback PRIVATE Qt6::GuiPrivate)
     target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
     if(APPLE)
         target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
@@ -292,30 +295,42 @@ if(OLR_GPU_PIPELINE)
             PRIVATE Qt6::GuiPrivate "-framework Metal" "-framework QuartzCore")
     else()
         target_sources(olr_test_playback PRIVATE
-            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
         if(WIN32)
             target_sources(olr_test_playback PRIVATE
+                "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_win.cpp"
                 "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_win.cpp")
+        else()
+            target_sources(olr_test_playback PRIVATE
+                "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp")
         endif()
     endif()
 
     qt_add_library(olr_test_gpu STATIC
         "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/formatcanon.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/framehandle.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/gpureadbacktelemetry.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/output/yuv420pcompositor.cpp")
     target_include_directories(olr_test_gpu PUBLIC "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(olr_test_gpu PUBLIC OLR_UNIT_TEST=1)
     target_link_libraries(olr_test_gpu
         PUBLIC Qt6::Core Qt6::Gui Qt6::GuiPrivate
         PRIVATE olr_warnings olr_sanitize)
     if(APPLE)
         target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/applegpusurface_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
@@ -325,10 +340,16 @@ if(OLR_GPU_PIPELINE)
                    "-framework CoreFoundation" "-framework IOSurface")
     elseif(WIN32)
         target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_win.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_win.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
         target_link_libraries(olr_test_gpu
             PRIVATE d3d11 dxgi ole32)
+    else()
+        target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp")
     endif()
 
     qt_add_shaders(olr_test_gpu "olr_passthrough_shaders"
@@ -337,6 +358,14 @@ if(OLR_GPU_PIPELINE)
         FILES
             "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.vert"
             "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/passthrough.frag")
+    qt_add_shaders(olr_test_gpu "olr_grid_shaders"
+        PREFIX "/olr/shaders"
+        BASE "${CMAKE_SOURCE_DIR}/playback/gpu/shaders"
+        GLSL "330,440"
+        FILES
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid.vert"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_nn.frag"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_quality.frag")
 endif()
 
 add_subdirectory(unit)

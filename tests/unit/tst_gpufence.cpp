@@ -10,6 +10,36 @@
 #include <thread>
 #include <vector>
 
+#ifdef _WIN32
+#include <d3d11.h>
+#include <wrl/client.h>
+using Microsoft::WRL::ComPtr;
+#endif
+
+namespace {
+
+bool gpuFenceRequiredForTest() {
+    return qEnvironmentVariableIntValue("OLR_REQUIRE_GPU_FENCE") != 0;
+}
+
+std::shared_ptr<GpuFence> createTestFence() {
+#ifdef _WIN32
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &want, 1,
+                                 D3D11_SDK_VERSION, &device, &level, &context))) {
+        return nullptr;
+    }
+    return makeD3D11GpuFence(device.Get());
+#else
+    return GpuFence::create();
+#endif
+}
+
+} // namespace
+
 class TestGpuFence : public QObject {
     Q_OBJECT
 private slots:
@@ -21,14 +51,20 @@ private slots:
 };
 
 void TestGpuFence::createIsNullOrValidNeverPartial() {
-    auto fence = GpuFence::create();
-    if (!fence) QSKIP("no GPU fence backend on this host");
+    auto fence = createTestFence();
+    if (!fence) {
+        if (gpuFenceRequiredForTest()) QFAIL("required GPU fence backend unavailable");
+        QSKIP("no GPU fence backend on this host");
+    }
     QCOMPARE(fence->completedValue(), uint64_t(0));
 }
 
 void TestGpuFence::signalWaitRoundTrips() {
-    auto fence = GpuFence::create();
-    if (!fence) QSKIP("no GPU fence backend on this host");
+    auto fence = createTestFence();
+    if (!fence) {
+        if (gpuFenceRequiredForTest()) QFAIL("required GPU fence backend unavailable");
+        QSKIP("no GPU fence backend on this host");
+    }
     const uint64_t value = fence->signal();
     QVERIFY(value >= 1);
     QVERIFY(fence->wait(value, 1000));
@@ -36,14 +72,20 @@ void TestGpuFence::signalWaitRoundTrips() {
 }
 
 void TestGpuFence::waitTimesOutBeforeSignal() {
-    auto fence = GpuFence::create();
-    if (!fence) QSKIP("no GPU fence backend on this host");
+    auto fence = createTestFence();
+    if (!fence) {
+        if (gpuFenceRequiredForTest()) QFAIL("required GPU fence backend unavailable");
+        QSKIP("no GPU fence backend on this host");
+    }
     QVERIFY(!fence->wait(fence->completedValue() + 100, 50));
 }
 
 void TestGpuFence::waitForeverReturnsAfterSignal() {
-    auto fence = GpuFence::create();
-    if (!fence) QSKIP("no GPU fence backend on this host");
+    auto fence = createTestFence();
+    if (!fence) {
+        if (gpuFenceRequiredForTest()) QFAIL("required GPU fence backend unavailable");
+        QSKIP("no GPU fence backend on this host");
+    }
 
     std::atomic<bool> waitReturned{false};
     std::atomic<bool> waitResult{false};
@@ -61,8 +103,11 @@ void TestGpuFence::waitForeverReturnsAfterSignal() {
 }
 
 void TestGpuFence::concurrentSignalsProduceUniqueMonotonicValues() {
-    auto fence = GpuFence::create();
-    if (!fence) QSKIP("no GPU fence backend on this host");
+    auto fence = createTestFence();
+    if (!fence) {
+        if (gpuFenceRequiredForTest()) QFAIL("required GPU fence backend unavailable");
+        QSKIP("no GPU fence backend on this host");
+    }
 
     constexpr int kThreads = 8;
     constexpr int kSignalsPerThread = 16;

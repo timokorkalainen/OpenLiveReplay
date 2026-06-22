@@ -7,6 +7,11 @@
 #include <QList>
 #include <QString>
 
+#include <memory>
+
+class GpuCompositor;
+class GpuRhiContext;
+
 struct OutputEndpoint {
     OutputTargetAssignment assignment;
     IOutputSink* sink = nullptr; // non-owning; UI/target manager owns sinks
@@ -128,6 +133,8 @@ private:
     PlaybackStateSnapshot m_playEpoch;
     OutputDispatchStats m_stats;
     MultiviewComposite m_multiviewMemo;
+    std::shared_ptr<GpuRhiContext> m_gpuRhi;
+    std::shared_ptr<GpuCompositor> m_gpuCompositor;
     bool m_holdLastFrame = true;
     QHash<OutputBusId, OutputBusFrame> m_lastGoodFrame; // per-bus last real video
     bool m_identitySkip = true;

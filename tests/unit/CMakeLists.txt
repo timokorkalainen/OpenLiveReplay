@@ -3,7 +3,15 @@
 function(olr_add_unit_test name)
     qt_add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE Qt6::Test ${ARGN} olr_warnings olr_sanitize)
-    add_test(NAME ${name} COMMAND ${name})
+    if(WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+        add_custom_command(TARGET ${name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:${name}>
+                $<TARGET_FILE_DIR:${name}>
+            COMMAND_EXPAND_LISTS
+            COMMENT "Copying ${name} runtime DLLs")
+    endif()
+    add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
     # Headless + deterministic; fail fast rather than hang CI.
     set_tests_properties(${name} PROPERTIES
         LABELS "unit;ci"
@@ -210,4 +218,7 @@ if(OLR_GPU_PIPELINE)
     olr_add_unit_test(tst_stagingfence olr_test_playback olr_test_gpu)
     olr_add_unit_test(tst_gpu_sync_stress olr_test_playback olr_test_gpu)
     olr_add_unit_test(tst_gpu_microstress olr_test_playback)
+    olr_add_unit_test(tst_gpucompositor olr_test_gpu)
+    olr_add_unit_test(tst_gpucompositor_stress olr_test_gpu)
+    target_link_libraries(tst_outputbusengine PRIVATE olr_test_gpu)
 endif()

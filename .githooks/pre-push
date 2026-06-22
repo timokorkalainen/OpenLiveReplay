@@ -331,18 +331,21 @@ else
     TSAN_BUILD_DIR="${OLR_PREPUSH_TSAN_BUILD_DIR:-build/prepush-tsan}"
     TSAN_TARGETS=(tst_trackbuffer tst_audioframequeue tst_outputdispatcher
                   tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine
-                  tst_ndiingest)
+                  tst_ndiingest
+                  tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence
+                  tst_gpu_sync_stress tst_gpuframedata tst_gpucompositor_stress)
     echo "[pre-push] Building TSan threading targets in ${TSAN_BUILD_DIR}..."
     cmake -S . -B "$TSAN_BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Debug \
         -DOLR_BUILD_TESTS=ON \
+        -DOLR_GPU_PIPELINE=ON \
         -DOLR_SANITIZER="thread" \
         -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" >/dev/null
     cmake --build "$TSAN_BUILD_DIR" --target "${TSAN_TARGETS[@]}"
     echo "[pre-push] Running threading tests under TSan..."
-    TSAN_OPTIONS="halt_on_error=1" \
+    TSAN_OPTIONS="halt_on_error=1:suppressions=$PWD/tests/tsan.suppressions.txt" \
         ctest --test-dir "$TSAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
-            -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
+            -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest|tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpucompositor_stress)$'
     echo "[pre-push] TSan OK."
 fi
 

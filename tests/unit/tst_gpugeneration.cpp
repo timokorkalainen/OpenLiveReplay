@@ -16,13 +16,13 @@ private slots:
 
 void TestGpuGeneration::resetStartsAtLiveGpuGeneration() {
     auto& generation = GpuGenerationCounter::instance();
-    generation.reset();
+    generation.resetForTest();
     QVERIFY(generation.current() >= uint64_t(1));
 }
 
 void TestGpuGeneration::bumpAdvancesMonotonically() {
     auto& generation = GpuGenerationCounter::instance();
-    generation.reset();
+    generation.resetForTest();
     QCOMPARE(generation.current(), uint64_t(1));
     QCOMPARE(generation.bump(), uint64_t(2));
     QCOMPARE(generation.bump(), uint64_t(3));
@@ -31,7 +31,7 @@ void TestGpuGeneration::bumpAdvancesMonotonically() {
 
 void TestGpuGeneration::cpuHandleIsNeverStale() {
     auto& generation = GpuGenerationCounter::instance();
-    generation.reset();
+    generation.resetForTest();
     FrameHandle handle = solidYuv420pHandle(16, 16, 16, 128, 128);
     generation.bump();
     QVERIFY(!handle.isStaleForGeneration(generation.current()));
@@ -39,7 +39,7 @@ void TestGpuGeneration::cpuHandleIsNeverStale() {
 
 void TestGpuGeneration::gpuHandleStaleAfterBump() {
     auto& generation = GpuGenerationCounter::instance();
-    generation.reset();
+    generation.resetForTest();
     const uint64_t mintedAt = generation.bump();
     FrameHandle handle = solidYuv420pHandle(16, 16, 16, 128, 128);
     handle.metadata().gpuGeneration = mintedAt;

@@ -21,6 +21,7 @@ class TestGpuFrameData : public QObject {
 private slots:
     void gpuBackedReportsSurface();
     void completedReadbackRetainReleasesImmediately();
+    void waitForPendingFenceUsesProducerFence();
 #ifdef __APPLE__
     void gpuPresentabilityDoesNotReadBack();
     void outputCacheInsertionDoesNotReadBack();
@@ -100,6 +101,17 @@ void TestGpuFrameData::completedReadbackRetainReleasesImmediately() {
              "already-completed readback fences must not leave a surface retained until a later "
              "opportunistic drain");
     QCOMPARE(gpuPendingReadbackRetainCount(), qsizetype(0));
+}
+
+void TestGpuFrameData::waitForPendingFenceUsesProducerFence() {
+    auto fence = std::make_shared<DeferredFence>();
+    auto surface = std::make_shared<TestSurface>();
+    surface->retainUntilFenceRetired(1);
+
+    GpuFrameData data(surface, nullptr, FramePixelFormat::Nv12, {}, fence);
+    QVERIFY(!data.waitForPendingFence(0));
+    fence->complete(1);
+    QVERIFY(data.waitForPendingFence(0));
 }
 
 #ifdef __APPLE__

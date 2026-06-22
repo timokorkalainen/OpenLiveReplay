@@ -7,6 +7,9 @@
 #include <QDebug>
 
 #include <cstdint>
+#include <memory>
+
+class GpuCompositor;
 
 struct OutputFrameIdentity {
     OutputBusId bus = OutputBusId::pgm();
@@ -83,6 +86,7 @@ public:
     OutputBusFrame renderMultiview(qint64 outputFrameIndex, const PlaybackStateSnapshot& state,
                                    const OutputFrameCache& cache,
                                    MultiviewComposite* memo = nullptr) const;
+    void setGpuCompositor(std::shared_ptr<GpuCompositor> compositor);
 
     int audioSamplesPerFrame() const;
 
@@ -99,6 +103,7 @@ private:
     int audioSamplesForOutputFrame(qint64 outputFrameIndex) const;
 
     OutputFrameClock m_clock;
+    std::shared_ptr<GpuCompositor> m_gpuCompositor;
     int m_feedCount = 0;
     int m_width = 1920;
     int m_height = 1080;

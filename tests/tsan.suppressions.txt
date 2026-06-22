@@ -1,0 +1,8 @@
+# Metal shared-event listener callbacks cross Apple's uninstrumented notifyListener.
+race:*MetalGpuFence::signal*
+race:*MetalGpuFence::wait*
+race:*MTLSharedEventListener*
+
+# Qt's QWaitCondition/TSan shim can report a synthetic double-lock in the render thread.
+mutex:*QWaitConditionPrivate::wait*
+race:*qtsan_impl*QWaitCondition*

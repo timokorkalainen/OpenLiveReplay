@@ -1,5 +1,10 @@
 #include "playback/output/outputdispatcher.h"
 
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpucompositor.h"
+#include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpurhicontext.h"
+#endif
 #include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputframeclock.h"
 
@@ -36,7 +41,16 @@ bool hasMeaningfulSinkStatus(const OutputSinkStatus& status) {
 
 OutputDispatcher::OutputDispatcher(FrameRate rate, int feedCount, int width, int height)
     : m_rate(rate), m_feedCount(qMax(0, feedCount)), m_width(qMax(2, width)),
-      m_height(qMax(2, height)) {}
+      m_height(qMax(2, height)) {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (gpuPipelineEnabled()) {
+        m_gpuRhi = GpuRhiContext::create();
+        if (m_gpuRhi) {
+            m_gpuCompositor = GpuCompositor::create(m_gpuRhi);
+        }
+    }
+#endif
+}
 
 OutputDispatcher::~OutputDispatcher() {
     for (const OutputEndpoint& endpoint : m_endpoints) {
@@ -219,6 +233,9 @@ OutputBusFrame OutputDispatcher::renderBus(OutputBusId bus, qint64 outputFrameIn
                                            const PlaybackStateSnapshot& state,
                                            const OutputFrameCache& cache) {
     OutputBusEngine engine(m_rate, m_feedCount, m_width, m_height);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    engine.setGpuCompositor(m_gpuCompositor);
+#endif
     switch (bus.kind) {
     case OutputBusKind::Feed:
         return engine.renderFeed(bus.index, outputFrameIndex, state, cache);

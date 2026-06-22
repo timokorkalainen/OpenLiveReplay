@@ -3,12 +3,10 @@
 #ifdef __APPLE__
 
 #include "playback/gpu/gpufence.h"
+#include "playback/output/formatcanon.h"
 
 #include <QList>
-#include <QMutex>
-#include <QMutexLocker>
 #include <QThread>
-#include <QWaitCondition>
 #include <QtGlobal>
 
 #include <CoreVideo/CoreVideo.h>
@@ -17,8 +15,10 @@
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
 
+#include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <utility>
 
 namespace {
@@ -82,26 +82,85 @@ CpuPlanes lockDownloadNv12ToYuv420p(CVPixelBufferRef pb) {
     return out;
 }
 
+CpuPlanes lockDownloadRgba8(CVPixelBufferRef pb) {
+    CpuPlanes out;
+    if (!pb) return out;
+    const OSType pixelFormat = CVPixelBufferGetPixelFormatType(pb);
+    if (pixelFormat != kCVPixelFormatType_32RGBA && pixelFormat != kCVPixelFormatType_32BGRA) {
+        return out;
+    }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return out;
+    }
+
+    const int w = static_cast<int>(CVPixelBufferGetWidth(pb));
+    const int h = static_cast<int>(CVPixelBufferGetHeight(pb));
+    const auto* src = static_cast<const uchar*>(CVPixelBufferGetBaseAddress(pb));
+    const size_t srcStride = CVPixelBufferGetBytesPerRow(pb);
+    if (!src || srcStride < static_cast<size_t>(w) * 4) {
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        return CpuPlanes{};
+    }
+
+    out.format = FramePixelFormat::Rgba8;
+    out.width = w;
+    out.height = h;
+    out.stride[0] = w * 4;
+    out.plane[0] = QByteArray(planeBytes(out.stride[0], h), '\0');
+    for (int row = 0; row < h; ++row) {
+        const uchar* srcRow = src + static_cast<size_t>(row) * srcStride;
+        char* dstRow = out.plane[0].data() + byteOffset(row, out.stride[0]);
+        if (pixelFormat == kCVPixelFormatType_32RGBA) {
+            std::memcpy(dstRow, srcRow, static_cast<size_t>(w) * 4);
+        } else {
+            for (int x = 0; x < w; ++x) {
+                const qsizetype dst = static_cast<qsizetype>(x) * 4;
+                const qsizetype srcOffset = static_cast<qsizetype>(x) * 4;
+                dstRow[dst] = char(srcRow[srcOffset + 2]);
+                dstRow[dst + 1] = char(srcRow[srcOffset + 1]);
+                dstRow[dst + 2] = char(srcRow[srcOffset]);
+                dstRow[dst + 3] = char(srcRow[srcOffset + 3]);
+            }
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return out;
+}
+
 class GpuRenderThread final : public QThread {
 public:
+    explicit GpuRenderThread(QRhi::Implementation backend) : m_backend(backend) {}
+
     QRhi* rhi = nullptr;
 
     void run() override {
-        QRhiMetalInitParams params;
-        rhi = QRhi::create(QRhi::Metal, &params);
-        {
-            QMutexLocker lock(&m_mutex);
-            m_ready = true;
-            m_cond.wakeAll();
+        QRhiMetalInitParams metalParams;
+        QRhiNullInitParams nullParams;
+        QRhiInitParams* params = nullptr;
+        switch (m_backend) {
+        case QRhi::Metal:
+            params = &metalParams;
+            break;
+        case QRhi::Null:
+            params = &nullParams;
+            break;
+        default:
+            break;
         }
+        QRhi* createdRhi = params ? QRhi::create(m_backend, params) : nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            rhi = createdRhi;
+            m_ready = true;
+        }
+        m_cond.notify_all();
 
         while (true) {
             std::function<void()> job;
             {
-                QMutexLocker lock(&m_mutex);
-                while (m_jobs.isEmpty() && !m_stop) {
-                    m_cond.wait(&m_mutex);
-                }
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_cond.wait(lock, [&] { return !m_jobs.isEmpty() || m_stop; });
                 if (m_stop && m_jobs.isEmpty()) break;
                 job = m_jobs.takeFirst();
             }
@@ -113,40 +172,41 @@ public:
     }
 
     bool waitReady() {
-        QMutexLocker lock(&m_mutex);
-        while (!m_ready) {
-            m_cond.wait(&m_mutex);
-        }
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cond.wait(lock, [&] { return m_ready; });
         return rhi != nullptr;
     }
 
     bool invoke(std::function<void()> job) {
-        QMutexLocker lock(&m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex);
         if (m_stop) return false;
 
         bool done = false;
         m_jobs.append([&] {
             job();
-            QMutexLocker doneLock(&m_mutex);
-            done = true;
-            m_cond.wakeAll();
+            {
+                std::lock_guard<std::mutex> doneLock(m_mutex);
+                done = true;
+            }
+            m_cond.notify_all();
         });
-        m_cond.wakeAll();
-        while (!done) {
-            m_cond.wait(&m_mutex);
-        }
+        m_cond.notify_all();
+        m_cond.wait(lock, [&] { return done; });
         return true;
     }
 
     void requestStop() {
-        QMutexLocker lock(&m_mutex);
-        m_stop = true;
-        m_cond.wakeAll();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_cond.notify_all();
     }
 
 private:
-    QMutex m_mutex;
-    QWaitCondition m_cond;
+    QRhi::Implementation m_backend = QRhi::Null;
+    std::mutex m_mutex;
+    std::condition_variable m_cond;
     QList<std::function<void()>> m_jobs;
     bool m_ready = false;
     bool m_stop = false;
@@ -156,7 +216,10 @@ private:
 
 class GpuRhiContext::Impl {
 public:
+    explicit Impl(QRhi::Implementation backend) : thread(backend), backend(backend) {}
+
     GpuRenderThread thread;
+    QRhi::Implementation backend = QRhi::Null;
     bool valid = false;
 };
 
@@ -169,7 +232,7 @@ GpuRhiContext::~GpuRhiContext() {
 }
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
-    auto impl = std::make_unique<Impl>();
+    auto impl = std::make_unique<Impl>(QRhi::Metal);
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -180,18 +243,40 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
     return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::move(impl)));
 }
 
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createNullForTest() {
+    auto impl = std::make_unique<Impl>(QRhi::Null);
+    impl->thread.start();
+    impl->valid = impl->thread.waitReady();
+    if (!impl->valid) {
+        impl->thread.requestStop();
+        impl->thread.wait();
+        return nullptr;
+    }
+    return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::move(impl)));
+}
+
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
+    return nullptr;
+}
+
 bool GpuRhiContext::isValid() const {
     return m_impl && m_impl->valid;
+}
+
+bool GpuRhiContext::isNullBackend() const {
+    return m_impl && m_impl->backend == QRhi::Null;
+}
+
+bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) const {
+    if (!m_impl || !m_impl->valid || !job) return false;
+    return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& surface,
                                            FramePixelFormat target) {
     CpuPlanes result;
-    if (target != FramePixelFormat::Yuv420p) {
-        qWarning("GpuRhiContext::importAndReadback: Phase-2 readback is Yuv420p-only");
-        return result;
-    }
     if (!m_impl || !m_impl->valid || !surface || !surface->isValid()) return result;
+    const GpuSurfaceDesc desc = surface->desc();
 
     auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
     if (!ioSurface) return result;
@@ -211,7 +296,15 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                 rhi->endOffscreenFrame();
             }
         }
-        result = lockDownloadNv12ToYuv420p(pb);
+        if (desc.format == FramePixelFormat::Nv12) {
+            if (target == FramePixelFormat::Yuv420p) {
+                result = lockDownloadNv12ToYuv420p(pb);
+            } else if (target == FramePixelFormat::Nv12) {
+                result = formatcanon::yuv420pToNv12(lockDownloadNv12ToYuv420p(pb));
+            }
+        } else if (desc.format == FramePixelFormat::Rgba8 && target == FramePixelFormat::Rgba8) {
+            result = lockDownloadRgba8(pb);
+        }
     });
     CVPixelBufferRelease(pb);
     if (!invoked) return CpuPlanes{};
@@ -220,6 +313,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
 
 std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
     if (!m_impl || !m_impl->valid) return nullptr;
+    if (m_impl->backend == QRhi::Null) return GpuFence::create();
 
     std::shared_ptr<GpuFence> fence;
     const bool invoked = m_impl->thread.invoke([&] {
