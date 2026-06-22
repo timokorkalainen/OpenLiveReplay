@@ -91,6 +91,7 @@ private slots:
     void amf0RejectsMalformedObjectKeyWithoutAdvancingOffset();
     void amf0RejectsMalformedEcmaArrayKeyWithoutAdvancingOffset();
     void amf0RejectsExcessiveNestingWithoutAdvancingOffset();
+    void chunkWriterRejectsPayloadsTooLargeForMessageLength();
     void chunkParserReassemblesSplitMessageAndUpdatesChunkSize();
     void chunkParserDoesNotDoubleApplyTimestampDeltaWhenPayloadArrivesLater();
     void chunkParserConsumesExtendedTimestampOnContinuationChunks();
@@ -335,6 +336,11 @@ void TestRtmpProtocol::amf0RejectsExcessiveNestingWithoutAdvancingOffset() {
     int offset = 0;
     QVERIFY(!RtmpAmf0::skipValue(value, &offset));
     QCOMPARE(offset, 0);
+}
+
+void TestRtmpProtocol::chunkWriterRejectsPayloadsTooLargeForMessageLength() {
+    const QByteArray payload(0x1000000, char('x'));
+    QVERIFY(RtmpChunkWriter::message(3, 20, 1, 0, payload, 128).isEmpty());
 }
 
 void TestRtmpProtocol::chunkParserReassemblesSplitMessageAndUpdatesChunkSize() {

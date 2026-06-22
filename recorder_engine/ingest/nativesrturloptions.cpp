@@ -20,7 +20,7 @@ bool nativeSrtPbKeyLenIsValid(int pbKeyLen) {
 NativeSrtUrlOptions nativeSrtUrlOptionsFromUrl(const QUrl& url) {
     NativeSrtUrlOptions options;
     const QString encodedUrl = url.toString(QUrl::FullyEncoded);
-    const int queryStart = encodedUrl.indexOf(QLatin1Char('?'));
+    const qsizetype queryStart = encodedUrl.indexOf(QLatin1Char('?'));
     if (queryStart < 0) {
         return options;
     }

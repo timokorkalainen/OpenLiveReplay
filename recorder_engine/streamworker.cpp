@@ -254,7 +254,7 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                 [&](const QByteArray& data, int64_t ptsTicks, bool keyframe) {
                     AVPacket* pkt = av_packet_alloc();
                     if (!pkt) return;
-                    if (av_new_packet(pkt, data.size()) < 0) {
+                    if (av_new_packet(pkt, static_cast<int>(data.size())) < 0) {
                         av_packet_free(&pkt);
                         return;
                     }
@@ -418,7 +418,7 @@ void StreamWorker::captureLoop() {
         callbacks.onAudioChunk = [this](DecodedAudioChunk chunk) {
             enqueueAudio(chunk.startSample,
                          reinterpret_cast<const uint8_t*>(chunk.pcmS16Stereo.constData()),
-                         chunk.pcmS16Stereo.size() / kAudioBytesPerSample);
+                         static_cast<int>(chunk.pcmS16Stereo.size() / kAudioBytesPerSample));
         };
         callbacks.setConnected = [this](bool connected) { setConnected(connected); };
         callbacks.reportStats = [this](const IngestStats& stats) {
@@ -711,7 +711,7 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
     // Cap the FIFO at ~10 s
     const int maxBytes = kAudioSampleRate * 10 * kAudioBytesPerSample;
     if (m_audioFifo.size() > maxBytes) {
-        const int excess = m_audioFifo.size() - maxBytes;
+        const int excess = static_cast<int>(m_audioFifo.size() - maxBytes);
         m_audioFifo.remove(0, excess);
         m_audioFifoStartSample += excess / kAudioBytesPerSample;
     }
@@ -800,7 +800,7 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
 
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) return;
-    if (av_new_packet(pkt, chunk.size()) == 0) {
+    if (av_new_packet(pkt, static_cast<int>(chunk.size())) == 0) {
         memcpy(pkt->data, chunk.constData(), size_t(chunk.size()));
         pkt->stream_index = audioTrackIdx;
         pkt->pts = av_rescale_q(start, {1, kAudioSampleRate}, st->time_base);

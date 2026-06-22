@@ -34,7 +34,7 @@ public:
 
     bool active() const { return m_active; }
     int currentIndex() const { return m_index; }
-    int count() const { return m_entries.size(); }
+    int count() const { return static_cast<int>(m_entries.size()); }
     bool onFinalEntry() const { return m_active && !hasNext(); }
     std::optional<ReplayEntry> entryAt(int index) const;
     std::optional<ReplayEntry> currentEntry() const { return entryAt(m_index); }

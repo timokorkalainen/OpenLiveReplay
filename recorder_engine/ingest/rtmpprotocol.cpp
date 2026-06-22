@@ -9,6 +9,7 @@ const int kAacSampleRates[] = {
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
 };
 constexpr int kMaxAmf0SkipDepth = 64;
+constexpr qsizetype kMaxRtmpChunkMessageLength = 0xffffff;
 
 void appendU24(QByteArray* bytes, int value) {
     bytes->append(char((value >> 16) & 0xff));
@@ -280,18 +281,20 @@ bool RtmpAmf0::skipValue(const QByteArray& data, int* offset) {
 
 QByteArray RtmpChunkWriter::message(int chunkStreamId, int messageType, int messageStreamId,
                                     qint64 timestampMs, const QByteArray& payload, int chunkSize) {
+    if (payload.size() > kMaxRtmpChunkMessageLength) return {};
+
     QByteArray out;
     out.append(char(chunkStreamId & 0x3f));
-    appendU24(&out, int(qMin<qint64>(timestampMs, 0xffffff)));
-    appendU24(&out, payload.size());
+    appendU24(&out, static_cast<int>(qMin<qint64>(timestampMs, 0xffffff)));
+    appendU24(&out, static_cast<int>(payload.size()));
     out.append(char(messageType));
-    const quint32 streamId = quint32(messageStreamId);
+    const quint32 streamId = static_cast<quint32>(messageStreamId);
     out.append(char(streamId & 0xff));
     out.append(char((streamId >> 8) & 0xff));
     out.append(char((streamId >> 16) & 0xff));
     out.append(char((streamId >> 24) & 0xff));
     if (timestampMs >= 0xffffff) {
-        const quint32 ts = quint32(timestampMs);
+        const quint32 ts = static_cast<quint32>(timestampMs);
         out.append(char((ts >> 24) & 0xff));
         out.append(char((ts >> 16) & 0xff));
         out.append(char((ts >> 8) & 0xff));
@@ -302,11 +305,12 @@ QByteArray RtmpChunkWriter::message(int chunkStreamId, int messageType, int mess
     int offset = 0;
     bool first = true;
     while (offset < payload.size() || (first && payload.isEmpty())) {
-        const int size = qMin(boundedChunkSize, payload.size() - offset);
+        const int size =
+            static_cast<int>(qMin<qsizetype>(boundedChunkSize, payload.size() - offset));
         if (!first) {
             out.append(char((3 << 6) | (chunkStreamId & 0x3f)));
             if (timestampMs >= 0xffffff) {
-                const quint32 ts = quint32(timestampMs);
+                const quint32 ts = static_cast<quint32>(timestampMs);
                 out.append(char((ts >> 24) & 0xff));
                 out.append(char((ts >> 16) & 0xff));
                 out.append(char((ts >> 8) & 0xff));
@@ -331,7 +335,7 @@ void RtmpChunkParser::reset() {
 int RtmpChunkParser::assemblyPayloadBytes() const {
     int total = 0;
     for (auto it = m_assemblies.cbegin(); it != m_assemblies.cend(); ++it) {
-        total += it.value().payload.size();
+        total += static_cast<int>(it.value().payload.size());
     }
     return total;
 }
@@ -467,12 +471,13 @@ bool RtmpChunkParser::tryParseFragment(ParsedChunkFragment* fragment, QString* e
     if (parsed.startsMessage || assembly.payload.isEmpty()) {
         assembly.header = header;
     }
-    const int remaining = assembly.header.messageLength - assembly.payload.size();
+    const qsizetype remaining =
+        static_cast<qsizetype>(assembly.header.messageLength) - assembly.payload.size();
     if (remaining < 0) {
         if (error) *error = QStringLiteral("RTMP chunk overflow.");
         return false;
     }
-    const int toRead = qMin(m_inputChunkSize, remaining);
+    const int toRead = static_cast<int>(qMin<qsizetype>(m_inputChunkSize, remaining));
     if (needMore(m_buffer, offset, toRead)) return false;
     if (toRead > 0) {
         parsed.fragment = m_buffer.mid(offset, toRead);
@@ -527,8 +532,8 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         if (fragment.startsMessage || assembly.payload.isEmpty()) {
             assembly.header = fragment.header;
         }
-        const int existingAssemblyBytes = m_assemblies.value(fragment.csid).payload.size();
-        const int projectedPayloadSize = assembly.payload.size() + fragment.fragment.size();
+        const qsizetype existingAssemblyBytes = m_assemblies.value(fragment.csid).payload.size();
+        const qsizetype projectedPayloadSize = assembly.payload.size() + fragment.fragment.size();
         if (projectedPayloadSize < assembly.header.messageLength &&
             assemblyPayloadBytes() - existingAssemblyBytes + projectedPayloadSize >
                 m_maxAssemblyBytes) {
@@ -564,10 +569,11 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
             const int abortCsid = int(readU32Be(message.payload.constData()));
             if (m_assemblies.contains(abortCsid)) {
                 const ChunkAssembly abortedAssembly = m_assemblies.take(abortCsid);
-                const int remaining =
-                    qMax(0, abortedAssembly.header.messageLength - abortedAssembly.payload.size());
+                const qsizetype remaining = qMax<qsizetype>(
+                    0, static_cast<qsizetype>(abortedAssembly.header.messageLength) -
+                           abortedAssembly.payload.size());
                 if (remaining > 0) {
-                    m_abortedChunkStreams.insert(abortCsid, remaining);
+                    m_abortedChunkStreams.insert(abortCsid, static_cast<int>(remaining));
                 } else {
                     m_abortedChunkStreams.remove(abortCsid);
                 }
@@ -836,7 +842,7 @@ QByteArray RtmpFlv::lengthPrefixedPayloadToAnnexB(const QByteArray& payload, int
             nalSize = (nalSize << 8) | quint32(uchar(payload[offset + i]));
         }
         offset += nalLengthSize;
-        const int remaining = payload.size() - offset;
+        const qsizetype remaining = payload.size() - offset;
         if (nalSize == 0 || quint64(nalSize) > quint64(remaining)) {
             return QByteArray();
         }

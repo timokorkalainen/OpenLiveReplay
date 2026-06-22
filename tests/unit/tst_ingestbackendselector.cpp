@@ -31,6 +31,7 @@ private slots:
     void malformedLegacyVideoPacketStaysMalformed();
     void nativeRtmpConnectAdvertisesEnhancedCodecCapabilities();
     void nativeRtmpAcknowledgesServerReceiveWindows();
+    void nativeRtmpRejectsUnrepresentableOutgoingMessage();
     void nativeRtmpAudioFollowsSharedVideoAnchor();
     void nativeRtmpVideoBindsToSharedAnchorWhenAudioArrivesFirst();
     void nativeRtmpAudioFollowsVideoReanchorWithoutDrift();
@@ -247,6 +248,14 @@ void TestIngestBackendSelector::nativeRtmpAcknowledgesServerReceiveWindows() {
     alreadyReadSession.configureAcknowledgementWindow(10);
     QVERIFY(alreadyReadSession.noteIncomingChunkBytes(0, &sequence));
     QCOMPARE(sequence, quint32(12));
+}
+
+void TestIngestBackendSelector::nativeRtmpRejectsUnrepresentableOutgoingMessage() {
+    NativeRtmpIngestSession session(0, 640, 480, nullptr);
+    QString error;
+
+    QVERIFY(!session.sendMessage(3, 20, 1, 0, QByteArray(0x1000000, char('x')), &error));
+    QVERIFY(error.contains(QStringLiteral("too large"), Qt::CaseInsensitive));
 }
 
 void TestIngestBackendSelector::nativeRtmpAudioFollowsSharedVideoAnchor() {

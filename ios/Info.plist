@@ -30,6 +30,8 @@
     <array>
         <string>elgato-device-driver</string>
     </array>
+    <key>UILaunchScreen</key>
+    <dict/>
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationLandscapeLeft</string>

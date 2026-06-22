@@ -109,11 +109,11 @@ void StreamDeckMappingStore::clear(const QString &model, int action) {
 }
 
 QString StreamDeckMappingStore::bindingLabel(const QString &model, int action) const {
-    const int k = m_keyMaps.value(model).indexOf(action);
+    const qsizetype k = m_keyMaps.value(model).indexOf(action);
     if (k >= 0) return QStringLiteral("Key %1").arg(k);
-    const int p = m_dialPressMaps.value(model).indexOf(action);
+    const qsizetype p = m_dialPressMaps.value(model).indexOf(action);
     if (p >= 0) return QStringLiteral("Dial %1 press").arg(p);
-    const int r = m_dialRotateMaps.value(model).indexOf(action);
+    const qsizetype r = m_dialRotateMaps.value(model).indexOf(action);
     if (r >= 0) return QStringLiteral("Dial %1 turn").arg(r);
     return QStringLiteral("Unassigned");
 }

@@ -307,8 +307,8 @@ void MidiManager::sendXTouchLcdText(const QString &text) {
 
     QByteArray ascii = trimmed.toLatin1();
     QByteArray display(56, ' ');
-    const int copyLen = qMin(display.size(), ascii.size());
-    for (int i = 0; i < copyLen; ++i) {
+    const qsizetype copyLen = qMin(display.size(), ascii.size());
+    for (qsizetype i = 0; i < copyLen; ++i) {
         unsigned char ch = static_cast<unsigned char>(ascii.at(i));
         display[i] = (ch < 0x20 || ch > 0x7F) ? ' ' : static_cast<char>(ch & 0x7F);
     }

@@ -66,7 +66,8 @@ QList<AnnexBNal> splitAnnexBNals(const QByteArray& bytes) {
     for (int i = 0; i < starts.size(); ++i) {
         const int prefixSize = startCodeSizeAt(bytes, starts[i]);
         const int payloadOffset = starts[i] + prefixSize;
-        const int endOffset = (i + 1 < starts.size()) ? starts[i + 1] : bytes.size();
+        const int endOffset =
+            (i + 1 < starts.size()) ? starts[i + 1] : static_cast<int>(bytes.size());
         if (prefixSize > 0 && endOffset > payloadOffset) {
             nals.append({payloadOffset, endOffset});
         }
