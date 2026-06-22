@@ -31,6 +31,11 @@ constexpr int64_t kMpegTs33HalfWrap90k = 1LL << 32;
 constexpr int kTsPacketSize = 188;
 constexpr int kAudioSampleRate = 48000;
 constexpr int kMaxAdtsFrameSize = 8191;
+// The decoded-audio FIFO advances by decoded sample count and only re-anchors to the
+// clock when it diverges by more than this — a real gap/seek, not the drift-corrected
+// clock's per-frame millisecond jitter (which would otherwise fragment the
+// sample-contiguous track into clicks). 200 ms @ 48 kHz.
+constexpr int64_t kAudioResyncSamples = 200LL * 48;
 constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
 
 std::mutex srtLibraryMutex;
@@ -252,6 +257,7 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_audioWrapOffset90k = 0;
     m_forceNextPcrObserve = true;
     m_audioRemainderPts90k = -1;
+    m_audioFifoSamplePos = -1;
     m_pendingVideoTimecode100ns = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastDecodeErrorLogMs = -1;
@@ -911,8 +917,15 @@ void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
             QString error;
             if (m_audioDecoder->decodeAdtsFrame(frame, info, &pcm, &error)) {
                 if (!pcm.isEmpty()) {
+                    const int decodedSamples = int(pcm.size() / kDecodedAudioBytesPerSample);
+                    const int64_t clockStartSample = sourcePtsMs * kAudioSampleRate / 1000;
                     DecodedAudioChunk chunk;
-                    chunk.startSample = sourcePtsMs * kAudioSampleRate / 1000;
+                    // Place by decoded sample count (anchored to the clock, re-synced
+                    // only on a real discontinuity) so the drift-corrected clock's
+                    // per-frame jitter cannot fragment the contiguous audio track.
+                    chunk.startSample =
+                        advanceAudioFifoSample(&m_audioFifoSamplePos, clockStartSample,
+                                               decodedSamples, kAudioResyncSamples);
                     chunk.pcmS16Stereo = std::move(pcm);
                     m_callbacks.onAudioChunk(std::move(chunk));
                 }
@@ -972,6 +985,30 @@ int64_t NativeSrtIngestSession::sourcePtsMsFromAnchor(qint64 pts90k, int64_t anc
         return -1;
     }
     return anchorStreamMs + ((pts90k - anchorTs90k) / 90);
+}
+
+int64_t NativeSrtIngestSession::advanceAudioFifoSample(int64_t* fifoSamplePos,
+                                                       int64_t clockStartSample, int decodedSamples,
+                                                       int64_t resyncSamples) {
+    if (!fifoSamplePos) {
+        return clockStartSample;
+    }
+    // (Re)anchor to the clock-mapped start on the first frame, or when the running
+    // contiguous position has drifted from the clock beyond the resync window — a
+    // real discontinuity (gap / seek / reconnect), not the millisecond jitter of the
+    // drift-corrected mapping. Otherwise keep the position the audio samples
+    // themselves define, so consecutive frames stay byte-exactly contiguous.
+    const bool needAnchor =
+        *fifoSamplePos < 0 ||
+        (clockStartSample >= 0 && std::llabs(clockStartSample - *fifoSamplePos) > resyncSamples);
+    if (needAnchor) {
+        *fifoSamplePos = clockStartSample;
+    }
+    const int64_t startSample = *fifoSamplePos;
+    if (decodedSamples > 0 && *fifoSamplePos >= 0) {
+        *fifoSamplePos += decodedSamples;
+    }
+    return startSample;
 }
 
 int64_t NativeSrtIngestSession::unwrapPcr90k(int64_t raw90k) {

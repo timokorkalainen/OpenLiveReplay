@@ -48,6 +48,19 @@ public:
     static int64_t sourcePtsMsFromAnchor(qint64 pts90k, int64_t anchorTs90k,
                                          int64_t anchorStreamMs);
 
+    // Sample-contiguous placement for the decoded-audio FIFO. The source audio PTS is
+    // regular, but the shared drift-corrected clock's toSessionMs() jitters by
+    // milliseconds (it re-projects the whole sender-delta-since-anchor through a
+    // noisy rate estimate). Driving a sample-contiguous buffer straight from that
+    // per-frame jitter fragments it into gap-fills/overlaps — audible clicks and
+    // dropouts. Instead, trust the decoded sample count: anchor *fifoSamplePos to the
+    // clock-mapped start once, advance it by decodedSamples each frame, and re-anchor
+    // ONLY when the contiguous position diverges from the clock beyond resyncSamples
+    // (a real gap/seek, not millisecond jitter). Returns the start sample to enqueue
+    // and advances *fifoSamplePos. Static + pure for unit testing.
+    static int64_t advanceAudioFifoSample(int64_t* fifoSamplePos, int64_t clockStartSample,
+                                          int decodedSamples, int64_t resyncSamples);
+
     // Nominal fps used only to convert an extracted SMPTE 12M timecode into a 100 ns
     // offset since midnight. The SRT session itself carries no fps (the constructor
     // takes only output width/height). This is an ALIAS of the shared
@@ -99,6 +112,10 @@ private:
     int64_t m_audioWrapOffset90k = 0;
     bool m_forceNextPcrObserve = false;
     int64_t m_audioRemainderPts90k = -1;
+    // Running sample-contiguous write position for the decoded-audio FIFO (48 kHz
+    // output samples). -1 until the first audio frame anchors it to the clock; see
+    // advanceAudioFifoSample().
+    int64_t m_audioFifoSamplePos = -1;
     // SMPTE 12M timecode (100 ns since midnight) extracted from the current access
     // unit's SEI, stamped onto the emitted DecodedVideoFrame. -1 = the current AU
     // carries no timecode SEI (the common case). Reset to -1 per access unit so a
