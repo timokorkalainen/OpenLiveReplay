@@ -84,11 +84,25 @@ CpuPlanes lockDownloadNv12ToYuv420p(CVPixelBufferRef pb) {
 
 class GpuRenderThread final : public QThread {
 public:
+    explicit GpuRenderThread(QRhi::Implementation backend) : m_backend(backend) {}
+
     QRhi* rhi = nullptr;
 
     void run() override {
-        QRhiMetalInitParams params;
-        rhi = QRhi::create(QRhi::Metal, &params);
+        QRhiMetalInitParams metalParams;
+        QRhiNullInitParams nullParams;
+        QRhiInitParams* params = nullptr;
+        switch (m_backend) {
+        case QRhi::Metal:
+            params = &metalParams;
+            break;
+        case QRhi::Null:
+            params = &nullParams;
+            break;
+        default:
+            break;
+        }
+        rhi = params ? QRhi::create(m_backend, params) : nullptr;
         {
             QMutexLocker lock(&m_mutex);
             m_ready = true;
@@ -145,6 +159,7 @@ public:
     }
 
 private:
+    QRhi::Implementation m_backend = QRhi::Null;
     QMutex m_mutex;
     QWaitCondition m_cond;
     QList<std::function<void()>> m_jobs;
@@ -156,7 +171,10 @@ private:
 
 class GpuRhiContext::Impl {
 public:
+    explicit Impl(QRhi::Implementation backend) : thread(backend), backend(backend) {}
+
     GpuRenderThread thread;
+    QRhi::Implementation backend = QRhi::Null;
     bool valid = false;
 };
 
@@ -169,7 +187,19 @@ GpuRhiContext::~GpuRhiContext() {
 }
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
-    auto impl = std::make_unique<Impl>();
+    auto impl = std::make_unique<Impl>(QRhi::Metal);
+    impl->thread.start();
+    impl->valid = impl->thread.waitReady();
+    if (!impl->valid) {
+        impl->thread.requestStop();
+        impl->thread.wait();
+        return nullptr;
+    }
+    return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::move(impl)));
+}
+
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createNullForTest() {
+    auto impl = std::make_unique<Impl>(QRhi::Null);
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -182,6 +212,15 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
 
 bool GpuRhiContext::isValid() const {
     return m_impl && m_impl->valid;
+}
+
+bool GpuRhiContext::isNullBackend() const {
+    return m_impl && m_impl->backend == QRhi::Null;
+}
+
+bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) const {
+    if (!m_impl || !m_impl->valid || !job) return false;
+    return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& surface,
@@ -220,6 +259,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
 
 std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
     if (!m_impl || !m_impl->valid) return nullptr;
+    if (m_impl->backend == QRhi::Null) return GpuFence::create();
 
     std::shared_ptr<GpuFence> fence;
     const bool invoked = m_impl->thread.invoke([&] {

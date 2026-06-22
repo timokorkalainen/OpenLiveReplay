@@ -10,6 +10,7 @@
 #include "playback/gpu/gpucompositor.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/output/formatcanon.h"
 #include "playback/output/framehandle.h"
 
 #include <utility>
@@ -19,6 +20,7 @@ class TestGpuCompositor : public QObject {
 private slots:
     void createIsNullOrValidNeverPartial();
     void gridShadersLoadAndBuildPipeline();
+    void compatGridMatchesCpuOracleExactOnNull();
 #ifdef __APPLE__
     void cpuHandleUploadsToNv12Surface();
     void gpuNv12HandleAliasesExistingSurface();
@@ -104,6 +106,32 @@ void TestGpuCompositor::gridShadersLoadAndBuildPipeline() {
     QVERIFY2(frag.isValid(), "grid_nn.frag.qsb missing or not deserializable");
     QCOMPARE(vert.stage(), QShader::VertexStage);
     QCOMPARE(frag.stage(), QShader::FragmentStage);
+}
+
+void TestGpuCompositor::compatGridMatchesCpuOracleExactOnNull() {
+    auto rhi = GpuRhiContext::createNullForTest();
+    if (!rhi) QSKIP("QRhi Null backend unavailable on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 60, 200),
+        solidYuv420pHandle(4, 4, 80, 70, 190),
+        solidYuv420pHandle(4, 4, 120, 80, 180),
+        solidYuv420pHandle(4, 4, 160, 90, 170),
+    };
+    ColorMetadata color;
+
+    const CpuPlanes oracle = formatcanon::referenceComposeGridRgba8(frames, 8, 8, color);
+    QVERIFY(oracle.isValid());
+    const CpuPlanes gpu =
+        comp->composeGridToCpu(frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(gpu.isValid());
+    QCOMPARE(gpu.format, FramePixelFormat::Rgba8);
+    QCOMPARE(gpu.width, 8);
+    QCOMPARE(gpu.height, 8);
+    QCOMPARE(gpu.plane[0], oracle.plane[0]);
 }
 
 #ifdef __APPLE__

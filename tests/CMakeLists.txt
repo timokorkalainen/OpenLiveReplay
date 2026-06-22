@@ -274,6 +274,7 @@ endif()
 
 if(OLR_GPU_PIPELINE)
     target_compile_definitions(olr_test_playback PUBLIC OLR_GPU_PIPELINE_BUILD=1)
+    target_link_libraries(olr_test_playback PRIVATE Qt6::GuiPrivate)
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"

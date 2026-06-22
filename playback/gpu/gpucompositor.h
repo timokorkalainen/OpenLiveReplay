@@ -31,6 +31,8 @@ public:
 
     FrameHandle composeGrid(const QList<FrameHandle>& frames, int width, int height,
                             ColorMetadata color, ScaleQuality quality) const;
+    CpuPlanes composeGridToCpu(const QList<FrameHandle>& frames, int width, int height,
+                               ColorMetadata color, ScaleQuality quality) const;
     FrameHandle composePgm(const FrameHandle& source, int width, int height, ColorMetadata color,
                            ScaleQuality quality) const;
 
