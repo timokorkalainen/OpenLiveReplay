@@ -275,6 +275,7 @@ endif()
 if(OLR_GPU_PIPELINE)
     target_compile_definitions(olr_test_playback PUBLIC OLR_GPU_PIPELINE_BUILD=1)
     target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
@@ -301,6 +302,7 @@ if(OLR_GPU_PIPELINE)
     qt_add_library(olr_test_gpu STATIC
         "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
