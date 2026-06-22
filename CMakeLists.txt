@@ -362,6 +362,8 @@ if(APPLE)
         "-framework CoreVideo")
 elseif(WIN32)
     target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/mediafoundationruntime.cpp
+        recorder_engine/mediafoundationruntime.h
         recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
