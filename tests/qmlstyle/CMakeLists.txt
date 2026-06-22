@@ -40,6 +40,18 @@ set_tests_properties(tst_rundownrail_drag PROPERTIES
     TIMEOUT 60
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
 
+qt_add_executable(tst_scrubtimeline tst_scrubtimeline_main.cpp)
+target_link_libraries(tst_scrubtimeline PRIVATE
+    Qt6::QuickTest Qt6::Qml Qt6::Quick Qt6::Gui Qt6::Test Qt6::QuickControls2
+    OlrTheme OlrStyle olr_warnings)
+
+add_test(NAME tst_scrubtimeline
+    COMMAND tst_scrubtimeline -input "${CMAKE_CURRENT_SOURCE_DIR}/tst_scrubtimeline.qml")
+set_tests_properties(tst_scrubtimeline PROPERTIES
+    LABELS "unit;ci"
+    TIMEOUT 60
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+
 # Dev-only headless preview renderer (no add_test): renders a QML file under OlrStyle
 # to a PNG for visual review. Links the style modules so it never dlopens a plugin.
 qt_add_executable(uipreview uipreview_main.cpp)
@@ -56,5 +68,6 @@ if(UNIX AND NOT APPLE)
     target_link_options(tst_olrstyle PRIVATE "LINKER:--no-as-needed")
     target_link_options(tst_statusstrip_onair PRIVATE "LINKER:--no-as-needed")
     target_link_options(tst_rundownrail_drag PRIVATE "LINKER:--no-as-needed")
+    target_link_options(tst_scrubtimeline PRIVATE "LINKER:--no-as-needed")
     target_link_options(uipreview PRIVATE "LINKER:--no-as-needed")
 endif()

@@ -53,48 +53,11 @@ ColumnLayout {
         onTriggered: root.clockTick = root.clockTick + 1
     }
 
-    Slider {
+    ScrubTimeline {
         id: scrubBar
+
         Layout.fillWidth: true
-        from: 0
-        to: root.hasUi ? Math.max(0, root.ui.recordedDurationMs - root.ui.liveBufferMs) : 100
-        // While the user is dragging, hold the handle at their drag position;
-        // otherwise follow the playhead. Without the pressed guard,
-        // scrubPositionChanged (~30/s while recording) yanks the handle back mid-drag.
-        value: scrubBar.pressed ? scrubBar.value : (root.hasUi ? root.ui.scrubPosition : 0)
-
-        onMoved: {
-            if (root.hasUi) {
-                root.ui.seekPlayback(value)
-            }
-        }
-        onPressedChanged: {
-            // On release (pressed -> false) flush the final scrub target and end
-            // the coalesce gesture.
-            if (!scrubBar.pressed && root.hasUi) {
-                root.ui.endScrubGesture()
-            }
-        }
-
-        background: Rectangle {
-            height: 6
-            radius: 3
-            color: Theme.line
-            Rectangle {
-                width: scrubBar.visualPosition * parent.width
-                height: parent.height
-                color: Theme.accent
-                radius: 3
-            }
-        }
-
-        handle: Rectangle {
-            implicitWidth: 0
-            implicitHeight: 0
-            width: 0
-            height: 0
-            visible: false
-        }
+        ui: root.ui
     }
 
     RowLayout {
