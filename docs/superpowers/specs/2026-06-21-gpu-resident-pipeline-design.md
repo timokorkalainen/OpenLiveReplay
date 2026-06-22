@@ -446,6 +446,23 @@ unknowns are settled.
   [gpu-phase2-gpu-abstraction](../plans/2026-06-21-gpu-phase2-gpu-abstraction.md) (incl. the macOS
   vertical slice) · [gpu-phase2-gpu-import-win](../plans/2026-06-21-gpu-phase2-gpu-import-win.md).
 
+### Phase 3–5 implementation plans (authored)
+
+Phases 0–2 are built and merged; these plans build on that real code. `gpu-sync` is the Phase 3–5
+keystone — it pins the GPU fence / generation-counter / eviction-guard contract the rest consume.
+
+- **Phase 3:** [gpu-phase3-gpu-sync](../plans/2026-06-21-gpu-phase3-gpu-sync.md) (keystone — real
+  GPU fences, generation counter, eviction guard, multi-feed cap-pressure stress) ·
+  [gpu-phase3-gpu-compositor](../plans/2026-06-21-gpu-phase3-gpu-compositor.md) (RHI grid/PGM,
+  nearest-neighbor compat oracle + PSNR-validated quality scaler).
+- **Phase 4:** [gpu-phase4-async-readback](../plans/2026-06-21-gpu-phase4-async-readback.md)
+  (pipelined readback — resolves the P0.3 over-budget finding) ·
+  [gpu-phase4-gpu-budget](../plans/2026-06-21-gpu-phase4-gpu-budget.md) ·
+  [gpu-phase4-device-loss](../plans/2026-06-21-gpu-phase4-device-loss.md).
+- **Phase 5:** [gpu-phase5-gpu-encode](../plans/2026-06-21-gpu-phase5-gpu-encode.md) (recorder
+  StreamWorker) · [gpu-phase5-ios-bringup](../plans/2026-06-21-gpu-phase5-ios-bringup.md) ·
+  [gpu-phase5-new-io-targets](../plans/2026-06-21-gpu-phase5-new-io-targets.md).
+
 **Explicitly out of this program (future, architecture-enabled):** motion-interpolated slow-mo (needs
 its own correctness strategy — the CPU oracle cannot validate interpolated frames), GPU
 overlays/DVE/wipes (needs a graphics source + data model that does not exist today), and 10-bit/HDR
