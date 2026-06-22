@@ -64,6 +64,8 @@ class UIManager : public QObject {
     Q_PROPERTY(int64_t recordedDurationMs READ recordedDurationMs NOTIFY recordedDurationMsChanged)
     Q_PROPERTY(int64_t scrubPosition READ scrubPosition NOTIFY scrubPositionChanged)
     Q_PROPERTY(QString playbackTimecode READ playbackTimecode NOTIFY playbackTimecodeChanged)
+    Q_PROPERTY(bool playbackSingleView READ playbackSingleView NOTIFY playbackViewStateChanged)
+    Q_PROPERTY(int playbackSelectedIndex READ playbackSelectedIndex NOTIFY playbackViewStateChanged)
     Q_PROPERTY(qint64 recordingStartEpochMs READ recordingStartEpochMs NOTIFY recordingStartEpochMsChanged)
     Q_PROPERTY(bool timeOfDayMode READ timeOfDayMode WRITE setTimeOfDayMode NOTIFY timeOfDayModeChanged)
     Q_PROPERTY(int liveBufferMs READ liveBufferMs CONSTANT)
@@ -92,6 +94,10 @@ class UIManager : public QObject {
     // Bumped on every per-source SRT stats update so QML re-evaluates the dot
     // color (sourceLinkHealth) and tooltip (sourceStatsTooltip) bindings.
     Q_PROPERTY(int sourceStatsVersion READ sourceStatsVersion NOTIFY sourceStatsChanged)
+    // Bumped when the PGM view switches between multiview/single-view or changes
+    // the selected source, so QML re-evaluates on-air tally bindings.
+    Q_PROPERTY(int playbackViewStateVersion READ playbackViewStateVersion NOTIFY
+                   playbackViewStateVersionChanged)
     // Bumped when any source's trim changes (config load / programmatic set) so
     // QML re-reads sourceTrimOffset() bindings.
     Q_PROPERTY(int sourceTrimVersion READ sourceTrimVersion NOTIFY sourceTrimChanged)
@@ -170,6 +176,7 @@ public:
     bool followLive() const { return m_followLive; }
     int sourceConnectionVersion() const { return m_sourceConnectionVersion; }
     int sourceStatsVersion() const { return m_sourceStatsVersion; }
+    int playbackViewStateVersion() const { return m_playbackViewStateVersion; }
     int sourceTrimVersion() const { return m_sourceTrimVersion; }
     QString importSettingsUrl() const;
     QString importPreviewError() const { return m_importPreviewError; }
@@ -337,6 +344,7 @@ signals:
     void scrubPositionChanged();
     void playbackTimecodeChanged();
     void playbackViewStateChanged();
+    void playbackViewStateVersionChanged();
     void recordingStartEpochMsChanged();
     void timeOfDayModeChanged();
     void midiPortsChanged();
@@ -493,6 +501,7 @@ private:
     // start/stop so a stale "connected" never lingers across sessions.
     QList<bool> m_sourceConnected;
     int m_sourceConnectionVersion = 0;
+    int m_playbackViewStateVersion = 0;
     int m_sourceTrimVersion = 0;
     // Per-source SRT link-health state, keyed by sourceIndex (parallel to
     // m_sourceConnected). last = most recent snapshot (also shown in the tooltip);

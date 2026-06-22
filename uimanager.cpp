@@ -1755,6 +1755,8 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
 
     updateXTouchLcd();
     if (changed) {
+        ++m_playbackViewStateVersion;
+        emit playbackViewStateVersionChanged();
         emit playbackViewStateChanged();
     }
 }
