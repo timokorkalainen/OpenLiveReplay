@@ -19,8 +19,8 @@ CodecBenchmarkResult runCodecBenchmark(const BenchmarkConfig& config,
 
     // --- H.264 (hardware, only if available) ---
     H264CodecRunner h264Runner;
-    result.h264Available = h264Runner.available();
-    if (result.h264Available && !cancel.load()) {
+    result.h264Available = H264CodecRunner::hardwareAvailable();
+    if (result.h264Available && h264Runner.available() && !cancel.load()) {
         const CodecBenchmark::CodecResult h264 =
             CodecBenchmark::rampCodec(h264Runner, config, onStep, cancel);
         result.h264SafeFeeds = h264.safeFeeds;

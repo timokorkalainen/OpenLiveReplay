@@ -275,6 +275,12 @@ qt_add_qml_module(OpenLiveReplay
         resources.qrc
 )
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(
+        "${CMAKE_CURRENT_BINARY_DIR}/.rcc/qmlcache/OpenLiveReplay_qmlcache_loader.cpp"
+        PROPERTIES COMPILE_OPTIONS "-Wno-null-dereference")
+endif()
+
 # Generate qmllint.ini with stable import paths and QML dirs for all installed kits.
 set(QMLLINT_IMPORT_PATHS "build/qmllint-imports")
 if (Qt6_DIR)
@@ -427,6 +433,8 @@ if(APPLE)
         "-framework CoreVideo")
 elseif(WIN32)
     target_sources(OpenLiveReplay PRIVATE
+        recorder_engine/mediafoundationruntime.cpp
+        recorder_engine/mediafoundationruntime.h
         recorder_engine/ingest/nativevideodecoder_mediafoundation.cpp
         recorder_engine/ingest/nativesrtingestsession.cpp
         recorder_engine/ingest/nativertmpingestsession.cpp
@@ -732,6 +740,11 @@ target_link_libraries(OpenLiveReplay PRIVATE
 )
 if(WIN32)
     target_link_libraries(OpenLiveReplay PRIVATE ws2_32)
+    add_custom_command(TARGET OpenLiveReplay POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:rtmidi>"
+            "$<TARGET_FILE_DIR:OpenLiveReplay>"
+        COMMENT "[rtmidi] Copying runtime DLL next to OpenLiveReplay.exe")
 endif()
 
 # 6. Bundle Properties

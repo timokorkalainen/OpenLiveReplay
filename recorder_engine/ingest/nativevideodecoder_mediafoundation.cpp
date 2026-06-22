@@ -1,5 +1,6 @@
 #include "nativevideodecoder.h"
 #include "nativeframecopy.h"
+#include "recorder_engine/mediafoundationruntime.h"
 
 #ifdef _WIN32
 
@@ -244,7 +245,6 @@ private:
     bool asyncTransform = false;
     int asyncNeedInputEvents = 0;
     bool comInitialized = false;
-    bool mfStarted = false;
 
     bool ensureRuntime(QString* error);
     void shutdownRuntime();
@@ -291,24 +291,13 @@ bool NativeVideoDecoder::Impl::ensureRuntime(QString* error) {
         }
     }
 
-    if (!mfStarted) {
-        const HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-        if (FAILED(hr)) {
-            if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation startup failed"), hr);
-            }
-            return false;
-        }
-        mfStarted = true;
+    if (!ensureMediaFoundationRuntime(error)) {
+        return false;
     }
     return true;
 }
 
 void NativeVideoDecoder::Impl::shutdownRuntime() {
-    if (mfStarted) {
-        MFShutdown();
-        mfStarted = false;
-    }
     if (comInitialized) {
         CoUninitialize();
         comInitialized = false;
@@ -1138,9 +1127,7 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
         return caps;
     }
 
-    const HRESULT startup = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-    if (FAILED(startup)) {
-        caps.detail = hrMessage(QStringLiteral("Media Foundation startup failed"), startup);
+    if (!ensureMediaFoundationRuntime(&caps.detail)) {
         if (comInitialized) {
             CoUninitialize();
         }
@@ -1165,7 +1152,6 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
     }
     caps.detail = detail.join(QStringLiteral("; "));
 
-    MFShutdown();
     if (comInitialized) {
         CoUninitialize();
     }

@@ -153,6 +153,7 @@ int main(int argc, char *argv[])
         "Exposed via uiManager.streamDeck");
 
     QQmlApplicationEngine qmlEngine;
+    qmlEngine.addImportPath(QCoreApplication::applicationDirPath() + u"/qml"_s);
 
     // This makes the 'uiManager' object globally available in QML
     qmlEngine.rootContext()->setContextProperty("uiManager", &uiManager);

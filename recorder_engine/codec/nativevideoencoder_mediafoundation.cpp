@@ -1,5 +1,6 @@
 #include "recorder_engine/codec/nativevideoencoder.h"
 #include "recorder_engine/codec/avcc.h"
+#include "recorder_engine/mediafoundationruntime.h"
 
 #ifdef _WIN32
 
@@ -197,7 +198,6 @@ private:
     ComPtr<IMFMediaEventGenerator> m_eventGenerator;
     QByteArray m_avcc;
     bool m_comInitialized = false;
-    bool m_mfStarted = false;
     bool m_streaming = false;
     bool m_asyncTransform = false;
     int m_asyncNeedInputEvents = 0;
@@ -236,24 +236,13 @@ bool MediaFoundationEncoder::ensureRuntime(QString* error) {
             return false;
         }
     }
-    if (!m_mfStarted) {
-        const HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-        if (FAILED(hr)) {
-            if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation startup failed"), hr);
-            }
-            return false;
-        }
-        m_mfStarted = true;
+    if (!ensureMediaFoundationRuntime(error)) {
+        return false;
     }
     return true;
 }
 
 void MediaFoundationEncoder::shutdownRuntime() {
-    if (m_mfStarted) {
-        MFShutdown();
-        m_mfStarted = false;
-    }
     if (m_comInitialized) {
         CoUninitialize();
         m_comInitialized = false;

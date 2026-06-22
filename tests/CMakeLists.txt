@@ -130,6 +130,8 @@ if(APPLE)
     target_link_libraries(olr_test_core PRIVATE "-framework AudioToolbox")
 elseif(WIN32)
     target_sources(olr_test_core PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/mediafoundationruntime.cpp"
+        "${CMAKE_SOURCE_DIR}/recorder_engine/mediafoundationruntime.h"
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp")
     target_link_libraries(olr_test_core PRIVATE mfplat mf mfuuid ole32)
 else()

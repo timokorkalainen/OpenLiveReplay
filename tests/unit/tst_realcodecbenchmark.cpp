@@ -5,6 +5,7 @@
 
 #include "recorder_engine/benchmark/realcodecrunners.h"
 #include "recorder_engine/benchmark/codecbenchmark.h"
+#include "recorder_engine/benchmark/runcodecbenchmark.h"
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -15,6 +16,8 @@ class TestRealCodecBenchmark : public QObject {
 private slots:
     void syntheticFrameIsDeterministic();
     void mpeg2RunnerMeasuresOneStep();
+    void h264AvailabilityMatchesHardwareProbe();
+    void runCodecBenchmarkMeasuresH264WhenAvailable();
     void h264RunnerRampsWhenAvailable();
     void mpeg2RunnerMultiThreaded(); // T-concurrency: exercises N=4 multi-thread path
 };
@@ -46,15 +49,34 @@ void TestRealCodecBenchmark::mpeg2RunnerMeasuresOneStep() {
     QVERIFY(r.framesRequired > 0);
 }
 
-void TestRealCodecBenchmark::h264RunnerRampsWhenAvailable() {
-#ifdef _WIN32
-    if (!qEnvironmentVariableIsSet("OLR_RUN_UNSTABLE_MF_H264_TESTS")) {
-        QSKIP("Windows Media Foundation H.264 benchmark is opt-in on this machine");
-    }
-#endif
-
+void TestRealCodecBenchmark::h264AvailabilityMatchesHardwareProbe() {
     H264CodecRunner runner;
-    if (!runner.available()) QSKIP("no hardware H.264 on this platform");
+    QCOMPARE(runner.available(), H264CodecRunner::hardwareAvailable());
+}
+
+void TestRealCodecBenchmark::runCodecBenchmarkMeasuresH264WhenAvailable() {
+    BenchmarkConfig cfg;
+    cfg.width = 640;
+    cfg.height = 480;
+    cfg.fps = 30;
+    cfg.durationMsPerStep = 100;
+    std::atomic<bool> cancel{false};
+
+    const CodecBenchmarkResult res = runCodecBenchmark(cfg, [](int, bool) {}, cancel);
+    QVERIFY(res.mpeg2SafeFeeds >= 0);
+    QCOMPARE(res.h264Available, H264CodecRunner::hardwareAvailable());
+    if (res.h264Available) {
+        QVERIFY2(res.h264SafeFeeds >= 1,
+                 qPrintable(QStringLiteral("expected hardware H.264 benchmark to complete; got %1")
+                                .arg(res.h264SafeFeeds)));
+    } else {
+        QCOMPARE(res.h264SafeFeeds, -1);
+    }
+}
+
+void TestRealCodecBenchmark::h264RunnerRampsWhenAvailable() {
+    H264CodecRunner runner;
+    if (!runner.available()) QSKIP("hardware H.264 benchmark unavailable on this platform");
     BenchmarkConfig cfg;
     cfg.width = 640;
     cfg.height = 480;
