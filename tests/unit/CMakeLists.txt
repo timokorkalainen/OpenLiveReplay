@@ -40,6 +40,9 @@ if(APPLE OR WIN32)
     # and requestStop() concurrently; the threading regression it guards is caught
     # under TSan (registered as a TSan target in .githooks/pre-push and CI).
     olr_add_unit_test(tst_srtingest_teardown olr_test_engine)
+    # Guards the audio-FIFO crackle fix: clock jitter must not fragment the
+    # sample-contiguous decoded-audio buffer.
+    olr_add_unit_test(tst_srtaudiofifo olr_test_engine)
 endif()
 olr_add_unit_test(tst_mpegtsparser     olr_test_core)
 olr_add_unit_test(tst_mpegtsparser_pcr olr_test_core)
