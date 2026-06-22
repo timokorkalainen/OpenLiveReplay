@@ -9,10 +9,14 @@
 
 #include <memory>
 
+class GpuFence;
+
 FrameHandle importVtImageBuffer(void* cvImageBufferRef, FrameMetadata meta,
-                                std::shared_ptr<GpuRhiContext> rhi);
+                                std::shared_ptr<GpuRhiContext> rhi,
+                                std::shared_ptr<GpuFence> renderFence = nullptr);
 FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface, FrameMetadata meta,
-                            std::shared_ptr<GpuRhiContext> rhi);
+                            std::shared_ptr<GpuRhiContext> rhi,
+                            std::shared_ptr<GpuFence> renderFence = nullptr);
 
 #endif // __APPLE__
 

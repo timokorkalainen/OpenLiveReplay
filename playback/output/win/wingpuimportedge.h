@@ -26,6 +26,7 @@ struct WinGpuImportCapabilities {
 
 WinGpuImportCapabilities probeWinGpuImport();
 
+class GpuFence;
 class D3D11GpuSurface;
 
 class WinGpuImportEdge {
@@ -37,11 +38,13 @@ public:
     WinGpuImportEdge& operator=(const WinGpuImportEdge&) = delete;
 
     std::optional<FrameHandle> tryImport(void* mfSampleOpaque, int feedIndex, qint64 ptsMs,
-                                         int width, int height);
+                                         int width, int height,
+                                         std::shared_ptr<GpuFence> renderFence = nullptr);
     bool isAvailable() const;
 
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                 FrameMetadata meta);
+                                                 FrameMetadata meta,
+                                                 std::shared_ptr<GpuFence> renderFence = nullptr);
 #ifdef _WIN32
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
     void* d3d11Device() const;

@@ -2,6 +2,7 @@
 // exposes its surface, and downloads lazily through GpuRhiContext.
 #include <QtTest>
 
+#include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/output/framehandle.h"
@@ -22,6 +23,7 @@ private slots:
     void readToCpuDownloadsAndCounts();
     void readbackMatchesCpuWithinOneLsb();
     void importVtBufferProducesGpuHandle();
+    void readbackStampsSurfacePendingFence();
 #endif
 };
 
@@ -171,6 +173,25 @@ void TestGpuFrameData::importVtBufferProducesGpuHandle() {
     QCOMPARE(handle.metadata().key.format, FramePixelFormat::Nv12);
     QCOMPARE(handle.metadata().key.width, 64);
     QCOMPARE(handle.metadata().key.height, 48);
+}
+
+void TestGpuFrameData::readbackStampsSurfacePendingFence() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no RHI backend");
+    auto renderFence = GpuFence::create();
+    QVERIFY(renderFence != nullptr);
+
+    auto surface = makeAppleNv12Surface(64, 48);
+    QVERIFY(surface != nullptr);
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 48;
+
+    FrameHandle handle = makeGpuFrameHandle(surface, rhi, meta, renderFence);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(0));
+    QVERIFY(handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
+    QVERIFY(surface->pendingFenceValue() >= uint64_t(1));
 }
 #endif
 

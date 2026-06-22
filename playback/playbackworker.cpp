@@ -836,7 +836,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         meta.color = colorMetadataForNativeTrack(track);
                         meta.gpuGeneration = GpuGenerationCounter::instance().current();
 
-                        FrameHandle mediaFrame = importVtImageBuffer(imageBuffer, meta, gpuRhi);
+                        FrameHandle mediaFrame =
+                            importVtImageBuffer(imageBuffer, meta, gpuRhi, m_renderFence);
                         if (!mediaFrame.isPresentable()) {
                             gpuFallback = true;
                             return;
@@ -900,7 +901,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 
                             auto imported = m_winGpuImportEdge->tryImport(
                                 mfSample, track->feedIndex, framePtsMs, track->codecWidth,
-                                track->codecHeight);
+                                track->codecHeight, m_renderFence);
                             if (!imported || !imported->isPresentable()) {
                                 gpuFallback = true;
                                 return;
