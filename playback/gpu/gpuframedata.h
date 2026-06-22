@@ -23,6 +23,7 @@ public:
     CpuPlanes readToCpu(FramePixelFormat target) const override;
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     FramePixelFormat nativeFormat() const override { return m_nativeFormat; }
+    std::shared_ptr<GpuSurface> surfacePtr() const { return m_surface; }
 
     int readToCpuCount() const { return m_readCount.load(std::memory_order_acquire); }
 

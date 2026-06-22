@@ -8,6 +8,7 @@
 #include <memory>
 
 class GpuRhiContext;
+class GpuSurface;
 
 // RHI grid + PGM-select compositor. The CPU Yuv420pCompositor remains the
 // correctness oracle and fallback; a null FrameHandle from this type means the
@@ -17,6 +18,9 @@ public:
     enum class ScaleQuality { NearestCompat, Bilinear, Lanczos };
 
     static std::shared_ptr<GpuCompositor> create(std::shared_ptr<GpuRhiContext> rhi);
+    static std::shared_ptr<GpuSurface>
+    uploadFrameToNv12SurfaceForTest(const FrameHandle& frame,
+                                    const std::shared_ptr<GpuRhiContext>& rhi);
 
     ~GpuCompositor();
 

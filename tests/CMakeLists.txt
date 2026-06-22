@@ -282,6 +282,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
     if(APPLE)
         target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
@@ -315,6 +316,7 @@ if(OLR_GPU_PIPELINE)
         PRIVATE olr_warnings olr_sanitize)
     if(APPLE)
         target_sources(olr_test_gpu PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"

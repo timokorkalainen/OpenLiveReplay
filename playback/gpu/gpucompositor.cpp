@@ -20,6 +20,14 @@ std::shared_ptr<GpuCompositor> GpuCompositor::create(std::shared_ptr<GpuRhiConte
     return std::shared_ptr<GpuCompositor>(new GpuCompositor(std::move(impl)));
 }
 
+#ifndef __APPLE__
+std::shared_ptr<GpuSurface>
+GpuCompositor::uploadFrameToNv12SurfaceForTest(const FrameHandle&,
+                                               const std::shared_ptr<GpuRhiContext>&) {
+    return nullptr;
+}
+#endif
+
 bool GpuCompositor::isValid() const {
     return m_impl && m_impl->rhi && m_impl->rhi->isValid();
 }
