@@ -19,6 +19,8 @@ QtObject {
     readonly property color line: "#323840"          // 1px dividers / control borders
     readonly property color lineStrong: "#444B54"    // emphasized borders / focus ring base
     readonly property color scrim: "#8C000000"        // 55% black — UMD bars, drawer dim
+    readonly property color warnSurface: "#2B2615"   // soft-warning banner, distinct from error
+    readonly property color warnBorder: "#5B4818"
 
     // --- Text (all >= 4.5:1 on panel/panelRaised) ---
     readonly property color textHi: "#ECEEF0"   // primary

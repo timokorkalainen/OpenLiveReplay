@@ -39,5 +39,7 @@ TestCase {
         verify(Theme.fsTc > Theme.fsBody)
         verify(Theme.windowMinW >= 480 && Theme.windowMinH >= 480)
         verify(Theme.minWUrl > Theme.minWField)
+        verify(Theme.warnSurface !== Theme.panel)
+        verify(Theme.warnBorder !== Theme.line)
     }
 }
