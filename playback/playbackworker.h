@@ -249,6 +249,7 @@ private:
     void armCutInternal(int64_t targetMs, uint64_t baselineSeekGen, int64_t fireAtPlayheadMs);
     // Store the atomic schedule (output frame index + target ms).
     void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
+    bool stagingGpuSurfacesIdle() const;
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
     // staging -> active, republishes, re-bases the transport playhead. MUST be
     // called holding m_bufferMutex (invoked from makeOutputSnapshot).
@@ -331,6 +332,10 @@ private:
     // True once the staging cache covers [target, target+span]. Atomic because
     // armNextCut clears it from the UI thread while the worker reads/writes it.
     std::atomic<bool> m_stagingCovers{false};
+#ifdef OLR_GPU_PIPELINE_BUILD
+    std::shared_ptr<GpuFence> m_stagingFence;
+    std::atomic<uint64_t> m_stagedFenceValue{0};
+#endif
     // Newest video PTS (ms) currently staged for the reference feed (feed 0),
     // tracked during fillStaging since OutputFrameCache has no newest accessor.
     int64_t m_stagingNewestRefPtsMs = INT64_MIN;

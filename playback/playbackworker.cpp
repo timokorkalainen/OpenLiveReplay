@@ -355,6 +355,8 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_gpuRhi.reset();
     m_decodeFence.reset();
     m_renderFence.reset();
+    m_stagingFence.reset();
+    m_stagedFenceValue.store(0, std::memory_order_release);
     if (gpuPipelineEnabled()) {
         m_gpuRhi = GpuRhiContext::create();
         if (!m_gpuRhi || !m_gpuRhi->isValid()) {
@@ -362,6 +364,7 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
         } else {
             m_decodeFence = DecodeDoneFence::create();
             m_renderFence = GpuFence::create();
+            m_stagingFence = GpuFence::create();
         }
     }
 #endif
@@ -417,6 +420,8 @@ void PlaybackWorker::shutdownOutputGraph() {
 #ifdef OLR_GPU_PIPELINE_BUILD
     drainEvictedGpuFrames();
     m_renderFence.reset();
+    m_stagingFence.reset();
+    m_stagedFenceValue.store(0, std::memory_order_release);
     m_decodeFence.reset();
     m_gpuRhi.reset();
 #endif
@@ -844,6 +849,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     if (m_winGpuImportEdge && m_winGpuImportEdge->isAvailable()) {
                         if (!m_renderFence)
                             m_renderFence = makeD3D11GpuFence(m_winGpuImportEdge->d3d11Device());
+                        if (!m_stagingFence)
+                            m_stagingFence = makeD3D11GpuFence(m_winGpuImportEdge->d3d11Device());
                         const int savedDecimateCounter = track->decimateCounter;
                         bool gpuCallback = false;
                         bool gpuInserted = false;
@@ -1540,6 +1547,9 @@ void PlaybackWorker::armCutInternal(int64_t targetMs, uint64_t baselineSeekGen,
     m_prerollSeekPending.store(true);
     m_stagingCovers.store(false);
     m_scheduledCutFrame.store(-1);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    m_stagedFenceValue.store(0, std::memory_order_release);
+#endif
     // Baseline is the seek generation when the recall was ISSUED (not now): a manual
     // seekTo after that point bumps m_seekGeneration past it, and maybeFireScheduled
     // Cut aborts the cut on the mismatch (manual seek wins). Capturing it at arm time
@@ -1765,6 +1775,10 @@ void PlaybackWorker::fillStaging() {
 
         if (m_stagingNewestRefPtsMs >= coverTo) {
             m_stagingCovers.store(true);
+#ifdef OLR_GPU_PIPELINE_BUILD
+            if (m_stagingFence && gpuPipelineEnabled())
+                m_stagedFenceValue.store(m_stagingFence->signal(), std::memory_order_release);
+#endif
             break;
         }
     }
@@ -1819,6 +1833,17 @@ void PlaybackWorker::scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetM
     m_scheduledCutFrame.store(outputFrameIndex);
 }
 
+bool PlaybackWorker::stagingGpuSurfacesIdle() const {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (!m_stagingFence || !gpuPipelineEnabled()) return true;
+    const uint64_t target = m_stagedFenceValue.load(std::memory_order_acquire);
+    if (target == 0) return true;
+    return m_stagingFence->completedValue() >= target;
+#else
+    return true;
+#endif
+}
+
 // Fire the scheduled cut iff the dispatcher's next index has reached it. Called
 // from makeOutputSnapshot on the OUTPUT thread, which already holds m_bufferMutex
 // (the caller MUST hold it). dispatcherNextIndex was read by the caller BEFORE
@@ -1837,6 +1862,11 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     if (scheduled < 0) return; // nothing scheduled — unarmed path unchanged
     if (!CutSchedule::shouldFireAt(dispatcherNextIndex, scheduled)) return;
     if (!m_prerollStagingCache) return;
+    // GPU staging-swap fence: do not promote staging -> live until the staging
+    // decoder has finished writing its GPU surfaces. This is a NON-BLOCKING poll
+    // because makeOutputSnapshot holds m_bufferMutex while calling this method;
+    // a not-yet-idle staging cache simply defers the cut to the next tick.
+    if (!stagingGpuSurfacesIdle()) return;
     // Manual-seek-vs-in-flight-cut policy: if the operator issued an explicit
     // seekTo after this cut was armed (m_seekGeneration bumped), the seek wins —
     // abort the cut WITHOUT swapping/re-basing so it never snaps to a target the
@@ -1853,6 +1883,9 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
         m_armedTargetMs.store(-1);
         m_armedFireAtMs.store(-1);
         m_prerollSeekPending.store(false);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        m_stagedFenceValue.store(0, std::memory_order_release);
+#endif
         m_cutArmed.store(false, std::memory_order_release);
         return;
     }
@@ -1905,6 +1938,9 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     if (m_audioPlayer) m_audioPlayer->clear();
     m_stagingCovers.store(false);
     m_scheduledCutFrame.store(-1);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    m_stagedFenceValue.store(0, std::memory_order_release);
+#endif
     m_cutsFired.fetch_add(1, std::memory_order_acq_rel);
     // Clear m_cutArmed LAST: the run loop applies a queued re-arm only once it
     // observes !m_cutArmed, so releasing it after the swap + counter bump above
@@ -2576,6 +2612,9 @@ void PlaybackWorker::run() {
     m_cutArmed.store(false);
     m_scheduledCutFrame.store(-1);
     m_stagingCovers.store(false);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    m_stagedFenceValue.store(0, std::memory_order_release);
+#endif
     m_hasPendingRearm.store(false);
     m_decoderFollowMs.store(-1);
 }
