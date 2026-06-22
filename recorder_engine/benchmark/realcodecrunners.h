@@ -18,6 +18,7 @@ public:
 class H264CodecRunner : public CodecRunner {
 public:
     H264CodecRunner() = default;
+    static bool hardwareAvailable();
     bool available() const override;
     RampStepResult runStep(int concurrency, const BenchmarkConfig& config,
                            const std::atomic<bool>& cancel) override;

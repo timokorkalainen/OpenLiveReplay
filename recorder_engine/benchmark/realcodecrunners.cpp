@@ -283,8 +283,12 @@ RampStepResult Mpeg2CodecRunner::runStep(int concurrency, const BenchmarkConfig&
 // ---------------------------------------------------------------------------
 // H.264 runner
 // ---------------------------------------------------------------------------
-bool H264CodecRunner::available() const {
+bool H264CodecRunner::hardwareAvailable() {
     return queryNativeVideoEncodeCapabilities().h264 && queryNativeVideoDecodeCapabilities().h264;
+}
+
+bool H264CodecRunner::available() const {
+    return hardwareAvailable();
 }
 
 RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& cfg,
@@ -317,15 +321,32 @@ RampStepResult H264CodecRunner::runStep(int concurrency, const BenchmarkConfig& 
             } // C3: HW pool exhausted
 
             // --- Prime encoder to obtain avcC ---
-            AVFrame* prime = makeSyntheticFrame(cfg.width, cfg.height, 0);
-            if (!prime) {
-                res.startupFailed = true;
-                return;
-            } // C3
-            enc->encode(prime, 0, [](const QByteArray&, int64_t, bool) {}, &err);
-            av_frame_free(&prime);
-            const QByteArray avcc = enc->avccExtradata();
-            if (avcc.isEmpty()) {
+            // Some Windows hardware MFTs accept the first few samples before
+            // publishing output/sequence headers. Treat those as warm-up rather
+            // than startup failure; the benchmark window starts only after avcC
+            // is available.
+            QByteArray avcc;
+            bool gotPrimePacket = false;
+            for (int p = 0; p < 8 && avcc.isEmpty(); ++p) {
+                AVFrame* prime = makeSyntheticFrame(cfg.width, cfg.height, p);
+                if (!prime) {
+                    res.startupFailed = true;
+                    return;
+                } // C3
+                const bool primeOk =
+                    enc->encode(prime, p,
+                                [&](const QByteArray& data, int64_t, bool) {
+                                    gotPrimePacket = gotPrimePacket || !data.isEmpty();
+                                },
+                                &err);
+                av_frame_free(&prime);
+                if (!primeOk) {
+                    res.startupFailed = true;
+                    return;
+                } // C3
+                avcc = enc->avccExtradata();
+            }
+            if (!gotPrimePacket || avcc.isEmpty()) {
                 res.startupFailed = true;
                 return;
             } // C3
