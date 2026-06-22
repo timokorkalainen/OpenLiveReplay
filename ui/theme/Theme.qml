@@ -39,7 +39,7 @@ QtObject {
     // --- Accent (focus / selection / scrub progress) ---
     readonly property color accent: "#2E7BFF"
     readonly property color accentHover: "#4A8DFF"
-    readonly property color accentPressed: "#1F66E0"
+    readonly property color accentPressed: "#2C76F4"
     readonly property color focusRing: "#2E7BFF"
 
     // --- Type --- QML's font.family takes a SINGLE family; a comma list (and font.families,

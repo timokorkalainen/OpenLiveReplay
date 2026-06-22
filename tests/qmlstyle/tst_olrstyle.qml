@@ -90,6 +90,8 @@ TestCase {
         verifyContrast("textOnTally armed", Theme.textOnTally, Theme.armed, 4.5)
         verifyContrast("textOnTally ready", Theme.textOnTally, Theme.ready, 4.5)
         verifyContrast("textOnTally accent", Theme.textOnTally, Theme.accent, 4.5)
+        verifyContrast("textOnTally accentHover", Theme.textOnTally, Theme.accentHover, 4.5)
+        verifyContrast("textOnTally accentPressed", Theme.textOnTally, Theme.accentPressed, 4.5)
     }
 
     function test_focusAndHitTargetsUseTokens() {
