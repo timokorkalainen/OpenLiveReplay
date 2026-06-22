@@ -35,6 +35,7 @@ namespace {
 
 constexpr LONGLONG kMfTimePerSecond = 10000000;
 constexpr LONGLONG kPtsClock = 90000;
+constexpr DWORD kMaxOutputBufferSize = 256u * 1024u * 1024u;
 
 #ifndef MFVideoFormat_HEVC
 const GUID kMfVideoFormatHevc = {
@@ -92,6 +93,33 @@ LONGLONG pts90kToMfTime(qint64 pts90k) {
 
 qint64 mfTimeToPts90k(LONGLONG time) {
     return time * kPtsClock / kMfTimePerSecond;
+}
+
+DWORD clampBufferSize(quint64 size) {
+    return DWORD(std::min<quint64>(size, kMaxOutputBufferSize));
+}
+
+DWORD compactNv12Size(int width, int height) {
+    UINT32 calculated = 0;
+    if (width > 0 && height > 0 &&
+        SUCCEEDED(
+            MFCalculateImageSize(MFVideoFormat_NV12, UINT32(width), UINT32(height), &calculated))) {
+        return calculated;
+    }
+    return clampBufferSize(quint64(width) * quint64(height) * 3 / 2);
+}
+
+DWORD alignedNv12Size(int width, int height) {
+    const quint64 alignedWidth = (quint64(width) + 255u) & ~quint64(255u);
+    const quint64 alignedHeight = (quint64(height) + 31u) & ~quint64(31u);
+    return clampBufferSize(alignedWidth * alignedHeight * 3 / 2);
+}
+
+DWORD growOutputBufferSize(DWORD size) {
+    if (size >= kMaxOutputBufferSize) {
+        return kMaxOutputBufferSize;
+    }
+    return std::min<DWORD>(kMaxOutputBufferSize, std::max<DWORD>(size + 1, size * 2));
 }
 
 void appendParameterSet(QByteArray* key, const QByteArray& nal) {
@@ -271,6 +299,8 @@ private:
                        bool allowNeedMoreInput, bool* needMoreInput, QString* error);
     bool copySampleToFrame(IMFSample* sample, qint64 fallbackPts90k, AVFrame** frame,
                            QString* error);
+    DWORD outputBufferSize(const MFT_OUTPUT_STREAM_INFO& streamInfo) const;
+    LONG currentOutputStride() const;
 };
 
 NativeVideoDecoder::Impl::~Impl() {
@@ -689,6 +719,38 @@ bool NativeVideoDecoder::Impl::submitSample(const CompressedAccessUnit& unit, QS
     return createInputSample(unit, &sample, error) && processInputSample(sample.Get(), error);
 }
 
+LONG NativeVideoDecoder::Impl::currentOutputStride() const {
+    if (!transform) {
+        return 0;
+    }
+    ComPtr<IMFMediaType> currentType;
+    if (FAILED(transform->GetOutputCurrentType(0, &currentType)) || !currentType) {
+        return 0;
+    }
+    UINT32 storedStride = 0;
+    if (SUCCEEDED(currentType->GetUINT32(MF_MT_DEFAULT_STRIDE, &storedStride)) &&
+        storedStride != 0) {
+        return LONG(storedStride);
+    }
+    LONG bitmapStride = 0;
+    if (SUCCEEDED(MFGetStrideForBitmapInfoHeader(MFVideoFormat_NV12.Data1, DWORD(width),
+                                                 &bitmapStride))) {
+        return bitmapStride;
+    }
+    return 0;
+}
+
+DWORD NativeVideoDecoder::Impl::outputBufferSize(const MFT_OUTPUT_STREAM_INFO& streamInfo) const {
+    DWORD outputSize = std::max(streamInfo.cbSize, compactNv12Size(width, height));
+    outputSize = std::max(outputSize, alignedNv12Size(width, height));
+    const LONG stride = currentOutputStride();
+    if (stride > 0) {
+        outputSize = std::max(outputSize, clampBufferSize(quint64(stride) * quint64(height) +
+                                                          quint64(stride) * quint64(height / 2)));
+    }
+    return outputSize;
+}
+
 bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample, qint64 fallbackPts90k,
                                                  AVFrame** frame, QString* error) {
     if (!sample || !frame) {
@@ -739,9 +801,14 @@ bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample, qint64 fallb
         DWORD currentLength = 0;
         hr = contiguous->Lock(&data, nullptr, &currentLength);
         if (SUCCEEDED(hr)) {
-            if (currentLength >= DWORD(width * height + width * (height / 2))) {
-                *frame = nativeCopyNv12ToYuv420p(data, width, data + width * height, width, width,
-                                                 height);
+            const LONG stride = currentOutputStride();
+            const int sourceStride = stride > 0 ? int(stride) : width;
+            const DWORD requiredLength =
+                clampBufferSize(quint64(sourceStride) * quint64(height) +
+                                quint64(sourceStride) * quint64(height / 2));
+            if (sourceStride > 0 && currentLength >= requiredLength) {
+                *frame = nativeCopyNv12ToYuv420p(data, sourceStride, data + sourceStride * height,
+                                                 sourceStride, width, height);
             }
             contiguous->Unlock();
             if (*frame) {
@@ -780,97 +847,107 @@ bool NativeVideoDecoder::Impl::processOutput(FrameCallback* onFrame, KeepSurface
             return false;
         }
 
-        ComPtr<IMFSample> providedSample;
-        if (shouldProvideOutputSample(streamInfo)) {
-            ComPtr<IMFMediaBuffer> outputBuffer;
-            const DWORD outputSize =
-                std::max<DWORD>(streamInfo.cbSize, DWORD(width * height + width * (height / 2)));
-            hr = MFCreateSample(&providedSample);
-            if (SUCCEEDED(hr)) {
-                hr = MFCreateMemoryBuffer(outputSize, &outputBuffer);
+        const bool provideOutputSample = shouldProvideOutputSample(streamInfo);
+        DWORD outputSize = outputBufferSize(streamInfo);
+        constexpr int kMaxOutputAttempts = 4;
+        for (int outputAttempt = 0; outputAttempt < kMaxOutputAttempts; ++outputAttempt) {
+            ComPtr<IMFSample> providedSample;
+            if (provideOutputSample) {
+                ComPtr<IMFMediaBuffer> outputBuffer;
+                hr = MFCreateSample(&providedSample);
+                if (SUCCEEDED(hr)) {
+                    hr = MFCreateMemoryBuffer(outputSize, &outputBuffer);
+                }
+                if (SUCCEEDED(hr)) {
+                    hr = providedSample->AddBuffer(outputBuffer.Get());
+                }
+                if (FAILED(hr)) {
+                    if (error) {
+                        *error = hrMessage(
+                            QStringLiteral("Media Foundation output sample allocation failed"), hr);
+                    }
+                    return false;
+                }
             }
-            if (SUCCEEDED(hr)) {
-                hr = providedSample->AddBuffer(outputBuffer.Get());
+
+            MFT_OUTPUT_DATA_BUFFER output{};
+            output.dwStreamID = 0;
+            output.pSample = providedSample.Get();
+            DWORD status = 0;
+            hr = transform->ProcessOutput(0, 1, &output, &status);
+            if (hr == MF_E_BUFFERTOOSMALL && provideOutputSample &&
+                outputAttempt + 1 < kMaxOutputAttempts) {
+                releaseOutputEvents(&output);
+                outputSize = growOutputBufferSize(outputSize);
+                continue;
             }
-            if (FAILED(hr)) {
+
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+                releaseOutputEvents(&output);
+                if (allowNeedMoreInput) {
+                    if (needMoreInput) {
+                        *needMoreInput = true;
+                    }
+                    return true;
+                }
                 if (error) {
                     *error = hrMessage(
-                        QStringLiteral("Media Foundation output sample allocation failed"), hr);
+                        QStringLiteral("Media Foundation async decoder unexpectedly requested "
+                                       "input from output"),
+                        hr);
                 }
                 return false;
             }
-        }
-
-        MFT_OUTPUT_DATA_BUFFER output{};
-        output.dwStreamID = 0;
-        output.pSample = providedSample.Get();
-        DWORD status = 0;
-        hr = transform->ProcessOutput(0, 1, &output, &status);
-
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-            releaseOutputEvents(&output);
-            if (allowNeedMoreInput) {
-                if (needMoreInput) {
-                    *needMoreInput = true;
+            if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                releaseOutputEvents(&output);
+                if (output.pSample && !providedSample) {
+                    output.pSample->Release();
+                    output.pSample = nullptr;
                 }
-                return true;
+                if (!configureOutputType(error)) {
+                    return false;
+                }
+                if (!allowNeedMoreInput) {
+                    return true;
+                }
+                break;
             }
-            if (error) {
-                *error = hrMessage(
-                    QStringLiteral(
-                        "Media Foundation async decoder unexpectedly requested input from output"),
-                    hr);
+            if (FAILED(hr)) {
+                releaseOutputEvents(&output);
+                if (error) {
+                    *error =
+                        hrMessage(QStringLiteral("Media Foundation %1 frame decode output failed")
+                                      .arg(codecName(codec)),
+                                  hr);
+                }
+                return false;
             }
-            return false;
-        }
-        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-            releaseOutputEvents(&output);
-            if (output.pSample && !providedSample) {
-                output.pSample->Release();
+
+            ComPtr<IMFSample> completedSample;
+            if (providedSample) {
+                completedSample = providedSample;
+            } else {
+                completedSample.Attach(output.pSample);
                 output.pSample = nullptr;
             }
-            if (!configureOutputType(error)) {
-                return false;
-            }
-            if (!allowNeedMoreInput) {
+            releaseOutputEvents(&output);
+
+            if (onSurface) {
+                LONGLONG sampleTime = 0;
+                const qint64 framePts = SUCCEEDED(completedSample->GetSampleTime(&sampleTime))
+                                            ? mfTimeToPts90k(sampleTime)
+                                            : pts90k;
+                (*onSurface)(completedSample.Get(), framePts);
                 return true;
             }
-            continue;
-        }
-        if (FAILED(hr)) {
-            releaseOutputEvents(&output);
-            if (error) {
-                *error = hrMessage(QStringLiteral("Media Foundation %1 frame decode output failed")
-                                       .arg(codecName(codec)),
-                                   hr);
+
+            AVFrame* frame = nullptr;
+            if (!copySampleToFrame(completedSample.Get(), pts90k, &frame, error)) {
+                return false;
             }
-            return false;
-        }
-
-        ComPtr<IMFSample> completedSample;
-        if (providedSample) {
-            completedSample = providedSample;
-        } else {
-            completedSample.Attach(output.pSample);
-            output.pSample = nullptr;
-        }
-        releaseOutputEvents(&output);
-
-        if (onSurface) {
-            LONGLONG sampleTime = 0;
-            const qint64 framePts = SUCCEEDED(completedSample->GetSampleTime(&sampleTime))
-                                        ? mfTimeToPts90k(sampleTime)
-                                        : pts90k;
-            (*onSurface)(completedSample.Get(), framePts);
+            (*onFrame)(frame);
             return true;
         }
-
-        AVFrame* frame = nullptr;
-        if (!copySampleToFrame(completedSample.Get(), pts90k, &frame, error)) {
-            return false;
-        }
-        (*onFrame)(frame);
-        return true;
     }
 }
 
