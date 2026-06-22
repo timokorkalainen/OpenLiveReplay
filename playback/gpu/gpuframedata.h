@@ -11,10 +11,12 @@
 #include <atomic>
 #include <memory>
 
+class GpuFence;
+
 class GpuFrameData final : public IFrameData {
 public:
     GpuFrameData(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuRhiContext> rhi,
-                 FramePixelFormat nativeFormat);
+                 FramePixelFormat nativeFormat, std::shared_ptr<GpuFence> renderFence = nullptr);
     ~GpuFrameData() override;
 
     bool isGpuBacked() const override { return true; }
@@ -27,6 +29,7 @@ public:
 private:
     std::shared_ptr<GpuSurface> m_surface;
     std::shared_ptr<GpuRhiContext> m_rhi;
+    std::shared_ptr<GpuFence> m_renderFence;
     FramePixelFormat m_nativeFormat = FramePixelFormat::Nv12;
     quint32 m_telemetryKey = 0;
     mutable std::atomic<int> m_readCount{0};
@@ -36,6 +39,9 @@ private:
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta);
+FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
+                               std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
+                               std::shared_ptr<GpuFence> renderFence);
 qint64 gpuFrameReadToCpuCount();
 void gpuResetFrameReadToCpuCount();
 

@@ -8,7 +8,8 @@ OutputFrameCache::OutputFrameCache(int feedCount, int placeholderWidth, int plac
       m_placeholderWidth(qMax(2, placeholderWidth)),
       m_placeholderHeight(qMax(2, placeholderHeight)) {}
 
-void OutputFrameCache::insertVideoFrame(const FrameHandle& frame) {
+void OutputFrameCache::insertVideoFrame(const FrameHandle& frame,
+                                        EvictedVideoFrames* evictedFrames) {
     const FramePayloadKey& key = frame.metadata().key;
     if (key.feedIndex < 0 || key.feedIndex >= m_video.size() || !frame.isPresentable()) return;
     auto& list = m_video[key.feedIndex];
@@ -17,6 +18,7 @@ void OutputFrameCache::insertVideoFrame(const FrameHandle& frame) {
             return f.metadata().key.ptsMs < pts;
         });
     if (it != list.end() && it->metadata().key.ptsMs == key.ptsMs) {
+        if (evictedFrames) evictedFrames->append(*it);
         *it = frame;
     } else {
         list.insert(it, frame);
@@ -35,6 +37,32 @@ std::optional<FrameHandle> OutputFrameCache::videoFrameAt(int feedIndex, qint64 
     return *it;
 }
 
+std::optional<FrameHandle>
+OutputFrameCache::videoFrameAtFreshForGeneration(int feedIndex, qint64 playheadMs,
+                                                 uint64_t gpuGeneration) const {
+    if (feedIndex < 0 || feedIndex >= m_video.size()) return std::nullopt;
+    const auto& list = m_video[feedIndex];
+    if (list.isEmpty()) return std::nullopt;
+    auto it = std::upper_bound(
+        list.begin(), list.end(), playheadMs,
+        [](qint64 pts, const FrameHandle& f) { return pts < f.metadata().key.ptsMs; });
+    while (it != list.begin()) {
+        --it;
+        if (!it->isStaleForGeneration(gpuGeneration)) return *it;
+    }
+    return std::nullopt;
+}
+
+bool OutputFrameCache::hasFreshVideoFrameAtOrBeforeNear(int feedIndex, qint64 targetMs,
+                                                        qint64 toleranceMs,
+                                                        uint64_t gpuGeneration) const {
+    const std::optional<FrameHandle> frame =
+        videoFrameAtFreshForGeneration(feedIndex, targetMs, gpuGeneration);
+    if (!frame.has_value() || frame->metadata().key.isPlaceholder) return false;
+    const qint64 delta = targetMs - frame->metadata().key.ptsMs;
+    return delta >= 0 && delta <= qMax<qint64>(0, toleranceMs);
+}
+
 FrameHandle OutputFrameCache::videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const {
     auto frame = videoFrameAt(feedIndex, playheadMs);
     if (frame.has_value()) return *frame;
@@ -44,6 +72,13 @@ FrameHandle OutputFrameCache::videoFrameOrPlaceholder(int feedIndex, qint64 play
     placeholder.metadata().key.ptsMs = playheadMs;
     placeholder.metadata().key.isPlaceholder = true;
     return placeholder;
+}
+
+OutputFrameCache::EvictedVideoFrames OutputFrameCache::videoFramesSnapshot() const {
+    EvictedVideoFrames frames;
+    for (const auto& feedFrames : m_video)
+        frames += feedFrames;
+    return frames;
 }
 
 void OutputFrameCache::insertAudioFrame(const MediaAudioFrame& frame) {
@@ -78,11 +113,11 @@ QByteArray OutputFrameCache::audioSpanOrSilence(int feedIndex, qint64 startSampl
     return out;
 }
 
-void OutputFrameCache::mergeFrom(const OutputFrameCache& other) {
+void OutputFrameCache::mergeFrom(const OutputFrameCache& other, EvictedVideoFrames* evictedFrames) {
     const qsizetype feeds = qMin(m_video.size(), other.m_video.size());
     for (qsizetype feed = 0; feed < feeds; ++feed) {
         for (const FrameHandle& frame : other.m_video.at(feed))
-            insertVideoFrame(frame);
+            insertVideoFrame(frame, evictedFrames);
     }
     const qsizetype aFeeds = qMin(m_audio.size(), other.m_audio.size());
     for (qsizetype feed = 0; feed < aFeeds; ++feed) {
@@ -91,7 +126,8 @@ void OutputFrameCache::mergeFrom(const OutputFrameCache& other) {
     }
 }
 
-void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample) {
+void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample,
+                                  EvictedVideoFrames* evictedFrames) {
     for (auto& frames : m_video) {
         int firstAtOrAfter = 0;
         while (firstAtOrAfter < frames.size() &&
@@ -102,7 +138,13 @@ void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSamp
         // Keep one frame before the cutoff so output can still hold the nearest
         // previous picture at the retained-window boundary.
         const int removeCount = qMax(0, firstAtOrAfter - 1);
-        if (removeCount > 0) frames.erase(frames.begin(), frames.begin() + removeCount);
+        if (removeCount > 0) {
+            if (evictedFrames) {
+                for (int i = 0; i < removeCount; ++i)
+                    evictedFrames->append(frames[i]);
+            }
+            frames.erase(frames.begin(), frames.begin() + removeCount);
+        }
     }
 
     for (auto& frames : m_audio) {
@@ -116,9 +158,11 @@ void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSamp
     }
 }
 
-void OutputFrameCache::clear() {
-    for (auto& frames : m_video)
+void OutputFrameCache::clear(EvictedVideoFrames* evictedFrames) {
+    for (auto& frames : m_video) {
+        if (evictedFrames) *evictedFrames += frames;
         frames.clear();
+    }
     for (auto& frames : m_audio)
         frames.clear();
 }

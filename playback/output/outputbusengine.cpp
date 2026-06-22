@@ -23,6 +23,29 @@ qint64 programmeTimecode100nsFor(qint64 sampledPlayheadMs) {
     return qMax<qint64>(0, sampledPlayheadMs) * 10000;
 }
 
+FrameHandle placeholderVideoFrame(int feedIndex, qint64 playheadMs, int width, int height) {
+    FrameHandle placeholder = solidYuv420pHandle(width, height, 16, 128, 128);
+    placeholder.metadata().key.feedIndex = feedIndex;
+    placeholder.metadata().key.ptsMs = playheadMs;
+    placeholder.metadata().key.isPlaceholder = true;
+    return placeholder;
+}
+
+std::optional<FrameHandle> freshVideoFrameAt(const OutputFrameCache& cache, int feedIndex,
+                                             qint64 playheadMs, uint64_t gpuGeneration) {
+    return cache.videoFrameAtFreshForGeneration(feedIndex, playheadMs, gpuGeneration);
+}
+
+FrameHandle freshVideoFrameOrPlaceholder(const OutputFrameCache& cache, int feedIndex,
+                                         qint64 playheadMs, int width, int height,
+                                         uint64_t gpuGeneration) {
+    if (std::optional<FrameHandle> frame =
+            freshVideoFrameAt(cache, feedIndex, playheadMs, gpuGeneration)) {
+        return *frame;
+    }
+    return placeholderVideoFrame(feedIndex, playheadMs, width, height);
+}
+
 bool isSilentAudio(const MediaAudioFrame& audio) {
     for (const char sample : audio.pcm) {
         if (sample != '\0') return false;
@@ -70,7 +93,7 @@ QDebug operator<<(QDebug debug, const OutputFrameIdentity& identity) {
                     << ", placeholder=" << identity.videoPlaceholder
                     << ", audioSilent=" << identity.audioSilent
                     << ", videoHash=" << identity.videoHash << ", audioHash=" << identity.audioHash
-                    << ')';
+                    << ", gpuGeneration=" << identity.videoGpuGeneration << ')';
     return debug;
 }
 
@@ -86,6 +109,7 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame) {
     identity.audioSilent = isSilentAudio(frame.audio);
     identity.videoHash = videoHashFor(videoKey);
     identity.audioHash = audioHashFor(frame.audio);
+    identity.videoGpuGeneration = frame.video.metadata().gpuGeneration;
     return identity;
 }
 
@@ -129,17 +153,30 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     // hash collision only miscounts a stat, never produces wrong pixels).
     quint32 sourceSignature = kFnvOffset;
     QVector<qint64> sourceKeys;
-    sourceKeys.reserve(m_feedCount * 2);
+    sourceKeys.reserve(static_cast<qsizetype>(m_feedCount) * 3);
+    QVector<std::optional<FrameHandle>> sources;
+    sources.reserve(m_feedCount);
     qint64 sourcePtsMs = 0;
+    uint64_t sourceGpuGeneration = 0;
+    bool anySourcePresent = false;
     for (int feed = 0; feed < m_feedCount; ++feed) {
-        const std::optional<FrameHandle> src = cache.videoFrameAt(feed, out.sampledPlayheadMs);
+        const std::optional<FrameHandle> src =
+            freshVideoFrameAt(cache, feed, out.sampledPlayheadMs, state.gpuGeneration);
+        sources.append(src);
         const qint64 pts = src ? src->metadata().key.ptsMs : kAbsentFeedPts;
+        const uint64_t generation = src ? src->metadata().gpuGeneration : uint64_t(0);
         sourceKeys.append(src ? 1 : 0);
         sourceKeys.append(pts);
+        sourceKeys.append(qint64(generation));
         sourceSignature = hashInt(sourceSignature, feed);
         sourceSignature = hashInt(sourceSignature, pts);
+        sourceSignature = hashInt(sourceSignature, qint64(generation));
         sourceSignature = hashInt(sourceSignature, src ? 0 : 1);
-        if (src) sourcePtsMs = qMax(sourcePtsMs, src->metadata().key.ptsMs);
+        if (src) {
+            anySourcePresent = true;
+            sourcePtsMs = qMax(sourcePtsMs, src->metadata().key.ptsMs);
+            sourceGpuGeneration = qMax(sourceGpuGeneration, generation);
+        }
     }
 
     if (memo && memo->valid && memo->sourceKeys == sourceKeys) {
@@ -147,9 +184,16 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     } else {
         QList<FrameHandle> frames;
         for (int feed = 0; feed < m_feedCount; ++feed) {
-            frames.append(cache.videoFrameOrPlaceholder(feed, out.sampledPlayheadMs));
+            const std::optional<FrameHandle>& source = sources.at(feed);
+            if (source.has_value()) {
+                frames.append(source.value());
+            } else {
+                frames.append(
+                    placeholderVideoFrame(feed, out.sampledPlayheadMs, m_width, m_height));
+            }
         }
         out.video = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
+        out.video.metadata().key.isPlaceholder = !anySourcePresent;
         if (memo) {
             memo->valid = true;
             memo->sourceKeys = sourceKeys;
@@ -160,6 +204,7 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     // Identity must reflect the composited source content, not the advancing playhead,
     // so repeated-payload detection works when the underlying feeds are frozen.
     out.video.metadata().key.ptsMs = sourcePtsMs;
+    out.video.metadata().gpuGeneration = sourceGpuGeneration;
     out.video.metadata().outputFrameIndex = outputFrameIndex;
 
     out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
@@ -180,12 +225,10 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     out.programmeTimecode100ns = programmeTimecode100nsFor(out.sampledPlayheadMs);
 
     if (feedIndex >= 0 && feedIndex < m_feedCount) {
-        out.video = cache.videoFrameOrPlaceholder(feedIndex, out.sampledPlayheadMs);
+        out.video = freshVideoFrameOrPlaceholder(cache, feedIndex, out.sampledPlayheadMs, m_width,
+                                                 m_height, state.gpuGeneration);
     } else {
-        out.video = solidYuv420pHandle(m_width, m_height, 16, 128, 128);
-        out.video.metadata().key.feedIndex = feedIndex;
-        out.video.metadata().key.ptsMs = out.sampledPlayheadMs;
-        out.video.metadata().key.isPlaceholder = true;
+        out.video = placeholderVideoFrame(feedIndex, out.sampledPlayheadMs, m_width, m_height);
     }
     out.video.metadata().outputFrameIndex = outputFrameIndex;
 

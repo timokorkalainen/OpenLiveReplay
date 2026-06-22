@@ -6,6 +6,8 @@
 
 #include <memory>
 
+class GpuFence;
+
 // Owns the platform QRhi on a dedicated render thread. QRhi and imported GPU
 // textures are thread-affine, so all RHI work funnels through this context.
 class GpuRhiContext {
@@ -20,6 +22,7 @@ public:
 
     CpuPlanes importAndReadback(const std::shared_ptr<GpuSurface>& surface,
                                 FramePixelFormat target);
+    std::shared_ptr<GpuFence> createFence() const;
 
 private:
     class Impl;

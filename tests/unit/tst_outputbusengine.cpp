@@ -9,6 +9,12 @@ static FrameHandle video(int feed, qint64 pts, uchar y) {
     return f;
 }
 
+static FrameHandle gpuVideo(int feed, qint64 pts, uchar y, uint64_t generation) {
+    FrameHandle f = video(feed, pts, y);
+    f.metadata().gpuGeneration = generation;
+    return f;
+}
+
 // Distinct Y AND chroma so PGM selection is provable on every plane (a Y-only
 // fixture cannot tell two feeds apart on the U/V planes).
 static FrameHandle videoYuv(int feed, qint64 pts, uchar y, uchar u, uchar v) {
@@ -46,6 +52,10 @@ private slots:
     void multiviewMemoReusesCompositeForUnchangedSources();
     void multiviewMemoMatchesUnmemoizedCompositeForDistinctSources();
     void programmeTimecodeTracksPlayheadOnEveryBus();
+    void staleGpuFeedAndPgmFramesArePlaceholders();
+    void staleGpuMultiviewSourcesAreComposedAsAbsent();
+    void staleNearestGpuFeedFallsBackToOlderFreshFrame();
+    void multiviewMemoInvalidatesWhenSourceGenerationChangesAtSamePts();
 };
 
 void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
@@ -357,6 +367,92 @@ void TestOutputBusEngine::programmeTimecodeTracksPlayheadOnEveryBus() {
     const auto later = engine.renderPgm(8, state, cache);
     QCOMPARE(later.programmeTimecode100ns, qint64(500) * 10000);
     QVERIFY(later.programmeTimecode100ns > pgm.programmeTimecode100ns);
+}
+
+void TestOutputBusEngine::staleGpuFeedAndPgmFramesArePlaceholders() {
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(gpuVideo(0, 100, 44, 1));
+    cache.insertVideoFrame(gpuVideo(1, 100, 88, 1));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 1;
+    state.gpuGeneration = 2;
+
+    const auto feed0 = engine.renderFeed(0, 3, state, cache);
+    const auto pgm = engine.renderPgm(3, state, cache);
+
+    QVERIFY(feed0.video.metadata().key.isPlaceholder);
+    QCOMPARE(feed0.video.metadata().key.feedIndex, 0);
+    QCOMPARE(feed0.video.metadata().key.ptsMs, qint64(100));
+    QCOMPARE(uchar(MediaVideoFrameView(feed0.video).planeY.at(0)), uchar(16));
+
+    QVERIFY(pgm.video.metadata().key.isPlaceholder);
+    QCOMPARE(pgm.video.metadata().key.feedIndex, 1);
+    QCOMPARE(pgm.video.metadata().key.ptsMs, qint64(100));
+    QCOMPARE(uchar(MediaVideoFrameView(pgm.video).planeY.at(0)), uchar(16));
+}
+
+void TestOutputBusEngine::staleGpuMultiviewSourcesAreComposedAsAbsent() {
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(gpuVideo(0, 100, 99, 1));
+    cache.insertVideoFrame(gpuVideo(1, 100, 33, 1));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = 2;
+
+    const auto multiview = engine.renderMultiview(4, state, cache);
+    const MediaVideoFrameView view(multiview.video);
+    QCOMPARE(uchar(view.planeY.at(0)), uchar(16));
+    QCOMPARE(uchar(view.planeY.at(4)), uchar(16));
+    QCOMPARE(multiview.identity.sourcePtsMs, qint64(0));
+    QVERIFY(multiview.identity.videoPlaceholder);
+}
+
+void TestOutputBusEngine::staleNearestGpuFeedFallsBackToOlderFreshFrame() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(gpuVideo(0, 80, 55, 2));
+    cache.insertVideoFrame(gpuVideo(0, 100, 99, 1));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = 2;
+
+    const auto feed0 = engine.renderFeed(0, 5, state, cache);
+    QVERIFY(!feed0.video.metadata().key.isPlaceholder);
+    QCOMPARE(feed0.video.metadata().key.ptsMs, qint64(80));
+    QCOMPARE(uchar(MediaVideoFrameView(feed0.video).planeY.at(0)), uchar(55));
+}
+
+void TestOutputBusEngine::multiviewMemoInvalidatesWhenSourceGenerationChangesAtSamePts() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(gpuVideo(0, 100, 99, 1));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = 1;
+
+    MultiviewComposite memo;
+    const auto first = engine.renderMultiview(4, state, cache, &memo);
+    QCOMPARE(uchar(MediaVideoFrameView(first.video).planeY.at(0)), uchar(99));
+
+    cache.insertVideoFrame(gpuVideo(0, 100, 22, 2));
+    state.gpuGeneration = 2;
+    const auto second = engine.renderMultiview(5, state, cache, &memo);
+    QCOMPARE(uchar(MediaVideoFrameView(second.video).planeY.at(0)), uchar(22));
+    QVERIFY(second.identity.videoHash != first.identity.videoHash);
 }
 
 QTEST_GUILESS_MAIN(TestOutputBusEngine)

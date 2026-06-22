@@ -99,6 +99,7 @@ public:
     // forward. Used to fire an armed cut at an exact playhead (a playlist out-point).
     qint64 outputFrameForPlayheadMs(qint64 playheadMs) const;
     void setRuntimeStats(const OutputRuntimeDispatchStats& stats);
+    void incrementFenceWaitStalls();
     void setHoldLastFrame(bool enabled) { m_holdLastFrame = enabled; }
     void setIdentitySkip(bool enabled) { m_identitySkip = enabled; }
 

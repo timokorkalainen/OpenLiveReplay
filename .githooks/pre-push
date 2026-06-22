@@ -104,7 +104,8 @@ if [ "${OLR_PREPUSH_DOCS_FULL:-0}" != "1" ]; then
     fi
 fi
 
-QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/6.10.1/macos}}"
+QT_VERSION="${QT_VERSION:-6.10.1}"
+QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/$QT_VERSION/macos}}"
 CLIP_SECONDS="${OLR_E2E_CLIP_SECONDS:-5}"
 DELIVERY_BUILD_DIR="${OLR_PREPUSH_DELIVERY_BUILD_DIR:-build/prepush-delivery}"
 
@@ -243,28 +244,28 @@ else
             echo "[pre-push] Running clang-tidy on changed first-party C++..."
             printf '%s\n' "$files"
             rc=0
+            tidy_extra_args=()
+            diff_tidy_extra_args=()
+            if [ -n "$SDK" ]; then
+                tidy_extra_args+=(--extra-arg=-isysroot --extra-arg="$SDK")
+                diff_tidy_extra_args+=(-extra-arg=-isysroot -extra-arg="$SDK")
+            fi
+            qt_gui_private_include="$QT_HOST_PREFIX/lib/QtGui.framework/Versions/A/Headers/$QT_VERSION/QtGui"
+            if [ -d "$qt_gui_private_include" ]; then
+                tidy_extra_args+=(--extra-arg="-I$qt_gui_private_include")
+                diff_tidy_extra_args+=(-extra-arg="-I$qt_gui_private_include")
+            fi
             # Pass 1 -- whole changed file (the high-signal bug classes are fatal).
             while IFS= read -r file; do
                 [ -n "$file" ] || continue
-                if [ -n "$SDK" ]; then
-                    "$TIDY" -p "$DELIVERY_BUILD_DIR" --extra-arg=-isysroot --extra-arg="$SDK" "$file" || rc=1
-                else
-                    "$TIDY" -p "$DELIVERY_BUILD_DIR" "$file" || rc=1
-                fi
+                "$TIDY" -p "$DELIVERY_BUILD_DIR" "${tidy_extra_args[@]}" "$file" || rc=1
             done <<< "$files"
             # Pass 2 -- diff-scoped integer-coercion gate (NEW occurrences fatal).
             if [ -f "$CTD" ]; then
-                if [ -n "$SDK" ]; then
-                    git diff -U0 "$base" HEAD -- "${tidy_paths[@]}" \
-                        | python3 "$CTD" -p1 -path "$DELIVERY_BUILD_DIR" -clang-tidy-binary "$TIDY" \
-                            -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
-                            -warnings-as-errors='*' -extra-arg=-isysroot -extra-arg="$SDK" || rc=1
-                else
-                    git diff -U0 "$base" HEAD -- "${tidy_paths[@]}" \
-                        | python3 "$CTD" -p1 -path "$DELIVERY_BUILD_DIR" -clang-tidy-binary "$TIDY" \
-                            -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
-                            -warnings-as-errors='*' || rc=1
-                fi
+                git diff -U0 "$base" HEAD -- "${tidy_paths[@]}" \
+                    | python3 "$CTD" -p1 -path "$DELIVERY_BUILD_DIR" -clang-tidy-binary "$TIDY" \
+                        -checks='-*,cppcoreguidelines-narrowing-conversions,bugprone-implicit-widening-of-multiplication-result' \
+                        -warnings-as-errors='*' "${diff_tidy_extra_args[@]}" || rc=1
             fi
             [ "$rc" -eq 0 ] || { echo "[pre-push] clang-tidy gate FAILED." >&2; exit 1; }
             echo "[pre-push] clang-tidy OK."

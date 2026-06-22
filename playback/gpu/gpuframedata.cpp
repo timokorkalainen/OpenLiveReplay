@@ -1,5 +1,7 @@
 #include "playback/gpu/gpuframedata.h"
 
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpureadbackretainer.h"
 #include "playback/output/gpureadbacktelemetry.h"
 
 #include <QMutexLocker>
@@ -20,9 +22,9 @@ quint32 nextTelemetryKey() {
 } // namespace
 
 GpuFrameData::GpuFrameData(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuRhiContext> rhi,
-                           FramePixelFormat nativeFormat)
-    : m_surface(std::move(surface)), m_rhi(std::move(rhi)), m_nativeFormat(nativeFormat),
-      m_telemetryKey(nextTelemetryKey()) {}
+                           FramePixelFormat nativeFormat, std::shared_ptr<GpuFence> renderFence)
+    : m_surface(std::move(surface)), m_rhi(std::move(rhi)), m_renderFence(std::move(renderFence)),
+      m_nativeFormat(nativeFormat), m_telemetryKey(nextTelemetryKey()) {}
 
 GpuFrameData::~GpuFrameData() = default;
 
@@ -43,6 +45,10 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
         key.format = target;
         GpuReadbackTelemetry::instance().recordSurface(key);
         GpuReadbackTelemetry::instance().recordGpuReadback(key);
+        if (m_renderFence && m_surface) {
+            const uint64_t fenceValue = m_renderFence->signal();
+            gpuRetainSurfaceUntilFenceRetired(m_surface, m_renderFence, fenceValue);
+        }
         m_cpuCache.insert(int(target), planes);
     }
     return planes;
@@ -50,11 +56,18 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta) {
+    return makeGpuFrameHandle(std::move(surface), std::move(rhi), meta, nullptr);
+}
+
+FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
+                               std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
+                               std::shared_ptr<GpuFence> renderFence) {
     const GpuSurfaceDesc desc = surface ? surface->desc() : GpuSurfaceDesc{};
     if (meta.key.width <= 0) meta.key.width = desc.width;
     if (meta.key.height <= 0) meta.key.height = desc.height;
     meta.key.format = desc.format;
-    auto data = std::make_shared<GpuFrameData>(std::move(surface), std::move(rhi), meta.key.format);
+    auto data = std::make_shared<GpuFrameData>(std::move(surface), std::move(rhi), meta.key.format,
+                                               std::move(renderFence));
     return FrameHandle(std::move(data), meta);
 }
 

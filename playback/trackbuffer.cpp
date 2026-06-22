@@ -1,11 +1,12 @@
 #include "playback/trackbuffer.h"
 #include <algorithm>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // insert
 // ---------------------------------------------------------------------------
 bool TrackBuffer::insert(int64_t ptsMs, const FrameHandle& f, int capFrames, int64_t keepNearMs,
-                         int64_t protectToMs) {
+                         int64_t protectToMs, EvictedFrames* evictedFrames) {
     // Binary-search for the insertion position (lower_bound by ptsMs).
     int lo = 0, hi = static_cast<int>(m_frames.size());
     while (lo < hi) {
@@ -19,6 +20,7 @@ bool TrackBuffer::insert(int64_t ptsMs, const FrameHandle& f, int capFrames, int
 
     if (lo < m_frames.size() && m_frames[lo].ptsMs == ptsMs) {
         // Duplicate PTS: replace frame, size unchanged.
+        if (evictedFrames) evictedFrames->append(m_frames[lo]);
         m_frames[lo].frame = f;
         return true;
     }
@@ -60,7 +62,9 @@ bool TrackBuffer::insert(int64_t ptsMs, const FrameHandle& f, int capFrames, int
         // The inserted entry currently sits at lo; if we evict something before
         // lo, the inserted entry will shift down by one.
         bool inserted_was_evicted = (evictIdx == lo);
+        Frame evicted = m_frames[evictIdx];
         m_frames.remove(evictIdx);
+        if (evictedFrames) evictedFrames->append(std::move(evicted));
         return !inserted_was_evicted;
     }
 
@@ -117,12 +121,21 @@ int64_t TrackBuffer::oldestPts() const {
 // ---------------------------------------------------------------------------
 // trim
 // ---------------------------------------------------------------------------
-void TrackBuffer::trim(int64_t keepFromMs, int64_t keepToMs) {
+void TrackBuffer::trim(int64_t keepFromMs, int64_t keepToMs, EvictedFrames* evictedFrames) {
     // Remove from the front while ptsMs < keepFromMs.
-    while (!m_frames.isEmpty() && m_frames.first().ptsMs < keepFromMs)
+    while (!m_frames.isEmpty() && m_frames.first().ptsMs < keepFromMs) {
+        if (evictedFrames) evictedFrames->append(m_frames.first());
         m_frames.removeFirst();
+    }
 
     // Remove from the back while ptsMs > keepToMs.
-    while (!m_frames.isEmpty() && m_frames.last().ptsMs > keepToMs)
+    while (!m_frames.isEmpty() && m_frames.last().ptsMs > keepToMs) {
+        if (evictedFrames) evictedFrames->append(m_frames.last());
         m_frames.removeLast();
+    }
+}
+
+void TrackBuffer::clear(EvictedFrames* evictedFrames) {
+    if (evictedFrames) *evictedFrames += m_frames;
+    m_frames.clear();
 }

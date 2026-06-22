@@ -57,6 +57,8 @@ struct PlaybackStateSnapshot {
     qint64 playStartedAtOutputFrame = 0;
     qint64 playStartedAtPlayheadMs = 0;
     int selectedFeedIndex = -1;
+    uint64_t gpuGeneration = 0;
+    bool forcePlayEpochReset = false;
 };
 
 #endif // OUTPUTTYPES_H

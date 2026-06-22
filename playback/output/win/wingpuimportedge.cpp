@@ -2,6 +2,8 @@
 
 #ifdef _WIN32
 
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpureadbackretainer.h"
 #include "playback/output/win/d3d11gpusurface.h"
 
 #include "recorder_engine/ingest/nativeframecopy.h"
@@ -83,8 +85,9 @@ bool createD3D11(ComPtr<ID3D11Device>* device, ComPtr<IMFDXGIDeviceManager>* man
 
 class D3D11IGpuFrameData final : public IFrameData {
 public:
-    explicit D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface)
-        : m_surface(std::move(surface)) {}
+    D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface,
+                       std::shared_ptr<GpuFence> renderFence)
+        : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)) {}
 
     bool isGpuBacked() const override { return true; }
     CpuPlanes readToCpu(FramePixelFormat target) const override;
@@ -93,6 +96,7 @@ public:
 
 private:
     std::shared_ptr<D3D11GpuSurface> m_surface;
+    std::shared_ptr<GpuFence> m_renderFence;
     mutable QMutex m_cacheMutex;
     mutable QHash<int, CpuPlanes> m_cpuCache;
 };
@@ -215,7 +219,9 @@ bool WinGpuImportEdge::isAvailable() const {
 }
 
 std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int feedIndex,
-                                                       qint64 ptsMs, int width, int height) {
+                                                       qint64 ptsMs, int width, int height,
+                                                       std::shared_ptr<GpuFence> renderFence) {
+    if (!renderFence) return std::nullopt;
     if (!isAvailable() || !mfSampleOpaque || width <= 0 || height <= 0) return std::nullopt;
 
     auto* sample = static_cast<IMFSample*>(mfSampleOpaque);
@@ -242,22 +248,27 @@ std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = width;
     meta.key.height = height;
-    return makeGpuFrameHandleForTest(std::move(surface), meta);
+    return makeGpuFrameHandleForTest(std::move(surface), meta, std::move(renderFence));
 }
 
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
-                                                        FrameMetadata meta) {
+                                                        FrameMetadata meta,
+                                                        std::shared_ptr<GpuFence> renderFence) {
     if (!surface) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
-    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface));
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence));
     return FrameHandle(std::move(data), meta);
 }
 
 void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&)> tap) {
     if (!m_impl) return;
     m_impl->importTap = std::move(tap);
+}
+
+void* WinGpuImportEdge::d3d11Device() const {
+    return (m_impl && m_impl->device) ? m_impl->device.Get() : nullptr;
 }
 
 bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device, ComPtr<ID3D11Texture2D> nv12,
@@ -344,7 +355,13 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     }
 
     ctx->Unmap(readable.Get(), 0);
-    if (out.isValid()) m_cpuCache.insert(int(target), out);
+    if (out.isValid()) {
+        if (m_renderFence && m_surface) {
+            const uint64_t fenceValue = m_renderFence->signal();
+            gpuRetainSurfaceUntilFenceRetired(m_surface, m_renderFence, fenceValue);
+        }
+        m_cpuCache.insert(int(target), out);
+    }
     return out;
 }
 

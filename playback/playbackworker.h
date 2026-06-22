@@ -15,7 +15,11 @@
 #include "frameprovider.h"
 #include "playback/commitgate.h"
 #include "playback/frameindex.h"
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpuframeretirequeue.h"
+#endif
 #include "playback/output/colormetadata.h"
+#include "playback/output/outputframecache.h"
 #include "playback/output/outputruntime.h"
 #include "playback/output/sharedcacheslot.h"
 #include "playback/output/outputtargetassignment.h"
@@ -35,6 +39,7 @@ extern "C" {
 ColorMetadata colorMetadataForAvFrame(const AVFrame* frame);
 
 class DecodeDoneFence;
+class GpuFence;
 class GpuRhiContext;
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
 class WinGpuImportEdge;
@@ -67,6 +72,9 @@ struct AudioDecoderTrack {
 
 class PlaybackWorker : public QThread {
     Q_OBJECT
+#ifdef OLR_UNIT_TEST
+    friend class TestStagingFence;
+#endif
 public:
     struct PlaybackCounters {
         int reposition = 0, reuseSeek = 0, reverseChunkSeek = 0, eofTailSeek = 0, skipForward = 0,
@@ -136,6 +144,7 @@ public:
 
     PlaybackCounters counters() const;
     OutputDispatchStats outputStats() const;
+    uint64_t gpuGeneration() const;
     // The committed cache generation (set at repositionTo's tail). >=1 after a
     // real reposition proves a target was decoded and committed to the cache.
     uint64_t cacheGeneration() const {
@@ -189,7 +198,8 @@ private:
     // already correct; this only resyncs the primary decode engine).
     void repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af,
                       bool cutFollow = false);
-    bool reuseAt(int64_t target); // true if every track has a frame within frameDurMs/2
+    // True when decoder buffers and the output cache both cover target within frameDurMs/2.
+    bool reuseAt(int64_t target);
 
     // Decode one read packet into the bank (video → insert with cap; audio →
     // enqueue active view). Used by forward fill, reposition, and reverse fill.
@@ -204,8 +214,8 @@ private:
     void enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void resetDedup();          // lastDeliveredPtsMs = -1 on every track
-    void clearDecoderBuffers(); // clear every TrackBuffer (holds m_bufferMutex); leaves
-                                // m_outputCache intact
+    void clearDecoderBuffers(bool invalidateGpuGeneration = true);
+    // clear every TrackBuffer (holds m_bufferMutex); leaves m_outputCache intact
     void initializeOutputGraph(int feedCount, int width, int height);
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
@@ -213,6 +223,14 @@ private:
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void collectEvictedGpuFramesLocked(const TrackBuffer::EvictedFrames& evictedFrames);
+    void collectEvictedGpuFramesLocked(const OutputFrameCache::EvictedVideoFrames& evictedFrames);
+    void collectEvictedGpuFrameLocked(const FrameHandle& frame);
+    void drainEvictedGpuFrames();
+    void recordFenceWaitStall();
+    bool ensureWindowsGpuImportFencesReadyForDecode(void* d3d11Device);
+#endif
 
     // --- Tier3 pre-roll / armed-cut (worker-thread internals) -------------
     // Open a SECOND independent AVFormatContext on the same clip + its own
@@ -236,6 +254,7 @@ private:
     void armCutInternal(int64_t targetMs, uint64_t baselineSeekGen, int64_t fireAtPlayheadMs);
     // Store the atomic schedule (output frame index + target ms).
     void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
+    bool stagingGpuSurfacesIdle() const;
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
     // staging -> active, republishes, re-bases the transport playhead. MUST be
     // called holding m_bufferMutex (invoked from makeOutputSnapshot).
@@ -286,6 +305,17 @@ private:
     std::atomic<uint64_t> m_seekGeneration{0};
     std::atomic<uint64_t> m_committedGeneration{0};
     std::atomic<int64_t> m_committedPlayheadMs{0};
+#ifdef OLR_GPU_PIPELINE_BUILD
+    // GPU generation visible to the output graph once the cache generation is
+    // committed. While CommitGate is holding the old cache/playhead during a
+    // reposition, output must keep accepting the old generation too.
+    std::atomic<uint64_t> m_committedGpuGeneration{1};
+#endif
+    // Last playhead actually exposed to the output clock while no seek was
+    // pending. A later seek holds this recent, cache-covered position instead
+    // of a stale reposition target that steady playback may have trimmed away.
+    mutable std::atomic<int64_t> m_lastVisiblePlayheadMs{0};
+    mutable std::atomic<bool> m_outputPlayheadCacheGuarded{false};
 
     QMutex m_mutex;
     mutable QMutex m_bufferMutex;
@@ -318,6 +348,10 @@ private:
     // True once the staging cache covers [target, target+span]. Atomic because
     // armNextCut clears it from the UI thread while the worker reads/writes it.
     std::atomic<bool> m_stagingCovers{false};
+#ifdef OLR_GPU_PIPELINE_BUILD
+    std::shared_ptr<GpuFence> m_stagingFence;
+    std::atomic<uint64_t> m_stagedFenceValue{0};
+#endif
     // Newest video PTS (ms) currently staged for the reference feed (feed 0),
     // tracked during fillStaging since OutputFrameCache has no newest accessor.
     int64_t m_stagingNewestRefPtsMs = INT64_MIN;
@@ -371,8 +405,14 @@ private:
     SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    GpuFrameRetireQueue m_gpuFrameRetireQueue; // guarded by m_bufferMutex
+#endif
     std::shared_ptr<GpuRhiContext> m_gpuRhi;
     std::shared_ptr<DecodeDoneFence> m_decodeFence;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    std::shared_ptr<GpuFence> m_renderFence;
+#endif
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
     std::unique_ptr<WinGpuImportEdge> m_winGpuImportEdge;
     bool m_winGpuImportTried = false;

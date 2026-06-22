@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QtGlobal>
 
+#include <cstdint>
 #include <memory>
 #include <utility>
 
@@ -32,6 +33,7 @@ struct FrameMetadata {
     qint64 sampledPlayheadMs = 0;
     int stride[3] = {0, 0, 0};
     ColorMetadata color;
+    uint64_t gpuGeneration = 0;
 };
 
 struct CpuPlanes {
@@ -92,6 +94,7 @@ public:
     bool isGpuBacked() const { return m_data && m_data->isGpuBacked(); }
     bool isValid() const;
     bool isPresentable() const;
+    bool isStaleForGeneration(uint64_t currentGeneration) const;
 
 private:
     std::shared_ptr<const IFrameData> m_data;

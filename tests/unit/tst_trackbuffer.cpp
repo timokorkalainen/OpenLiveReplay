@@ -17,6 +17,10 @@ private slots:
     void hasFrameNearTolerance();
     void trimDropsOutsideRange();
     void capProtectsFillEdge();
+    void insertReportsCapEviction();
+    void duplicateInsertReportsReplacedFrame();
+    void trimReportsRemovedFrames();
+    void clearReportsRemovedFrames();
 };
 
 void TestTrackBuffer::insertKeepsSortedUniqueAndCap() {
@@ -88,6 +92,69 @@ void TestTrackBuffer::capProtectsFillEdge() {
     QCOMPARE(b.size(), 3);
     QCOMPARE(b.oldestPts(), int64_t(1000)); // 900 evicted (farthest, unprotected)
     QVERIFY(b.hasFrameNear(1300, 1));       // protected edge kept
+}
+
+void TestTrackBuffer::insertReportsCapEviction() {
+    TrackBuffer b;
+    TrackBuffer::EvictedFrames evicted;
+
+    QVERIFY(b.insert(100, makeFrame(), 2, 200, 200, &evicted));
+    QVERIFY(b.insert(200, makeFrame(), 2, 200, 200, &evicted));
+    QVERIFY(b.insert(300, makeFrame(), 2, 200, 200, &evicted));
+
+    QCOMPARE(evicted.size(), 1);
+    QCOMPARE(evicted.first().ptsMs, int64_t(100));
+    QCOMPARE(b.size(), 2);
+    QCOMPARE(b.oldestPts(), int64_t(200));
+}
+
+void TestTrackBuffer::duplicateInsertReportsReplacedFrame() {
+    TrackBuffer b;
+    TrackBuffer::EvictedFrames evicted;
+
+    QVERIFY(b.insert(100, makeFrame(10), 10, 0, 1000));
+    QVERIFY(b.insert(100, makeFrame(90), 10, 0, 1000, &evicted));
+
+    QCOMPARE(b.size(), 1);
+    QCOMPARE(evicted.size(), 1);
+    QCOMPARE(evicted.first().ptsMs, int64_t(100));
+    QCOMPARE(uchar(MediaVideoFrameView(evicted.first().frame).planeY.at(0)), uchar(10));
+
+    FrameHandle current;
+    int64_t currentPts = -1;
+    QVERIFY(b.frameAt(100, current, currentPts));
+    QCOMPARE(uchar(MediaVideoFrameView(current).planeY.at(0)), uchar(90));
+}
+
+void TestTrackBuffer::trimReportsRemovedFrames() {
+    TrackBuffer b;
+    for (int64_t p = 0; p <= 500; p += 100)
+        b.insert(p, makeFrame(), 100, 0, 100000);
+
+    TrackBuffer::EvictedFrames evicted;
+    b.trim(200, 300, &evicted);
+
+    QCOMPARE(b.oldestPts(), int64_t(200));
+    QCOMPARE(b.newestPts(), int64_t(300));
+    QCOMPARE(evicted.size(), 4);
+    QCOMPARE(evicted[0].ptsMs, int64_t(0));
+    QCOMPARE(evicted[1].ptsMs, int64_t(100));
+    QCOMPARE(evicted[2].ptsMs, int64_t(500));
+    QCOMPARE(evicted[3].ptsMs, int64_t(400));
+}
+
+void TestTrackBuffer::clearReportsRemovedFrames() {
+    TrackBuffer b;
+    b.insert(100, makeFrame(), 100, 0, 100000);
+    b.insert(200, makeFrame(), 100, 0, 100000);
+
+    TrackBuffer::EvictedFrames evicted;
+    b.clear(&evicted);
+
+    QVERIFY(b.isEmpty());
+    QCOMPARE(evicted.size(), 2);
+    QCOMPARE(evicted[0].ptsMs, int64_t(100));
+    QCOMPARE(evicted[1].ptsMs, int64_t(200));
 }
 QTEST_APPLESS_MAIN(TestTrackBuffer)
 #include "tst_trackbuffer.moc"

@@ -32,8 +32,10 @@ public:
     UINT subresource() const { return m_subresource; }
     ID3D11Device* device() const { return m_device.Get(); }
 
-    void retainUntilFenceRetired(uint64_t fenceValue);
-    uint64_t pendingFenceValue() const { return m_pendingFence.load(std::memory_order_acquire); }
+    void retainUntilFenceRetired(uint64_t fenceValue) override;
+    uint64_t pendingFenceValue() const override {
+        return m_pendingFence.load(std::memory_order_acquire);
+    }
 
     static void setForceAllocFailureForTest(bool force);
 

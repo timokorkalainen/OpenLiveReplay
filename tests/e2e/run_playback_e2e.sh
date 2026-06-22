@@ -35,8 +35,37 @@ UDP_PORT=$((SRT_PORT + 1))
 
 # shellcheck source=tests/e2e/srt_lib.sh
 . "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
-srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
-olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 0; }
+
+PB_SKIP_RC=0
+
+case "$SCENARIO" in
+    gpucapstress)
+        PB_SKIP_RC=77
+        export SRT_SKIP_CODE=77
+        case "${OLR_GPU_PIPELINE:-}" in
+            1|true|TRUE|on|ON) ;;
+            *)
+                echo "SKIP: gpucapstress requires OLR_GPU_PIPELINE=1"
+                exit 77
+                ;;
+        esac
+        GPU_PROBE_OUT="$("$PLAY" --probe-gpu-backend 2>&1)"
+        GPU_PROBE_RC=$?
+        if [ "$GPU_PROBE_RC" -eq 77 ]; then
+            printf '%s\n' "$GPU_PROBE_OUT"
+            exit 77
+        fi
+        if [ "$GPU_PROBE_RC" -ne 0 ]; then
+            echo "FAIL: GPU backend probe exited $GPU_PROBE_RC"
+            printf '%s\n' "$GPU_PROBE_OUT"
+            exit 1
+        fi
+        export OLR_GPU_FORCE_BUDGET="${OLR_GPU_FORCE_BUDGET:-12}"
+        ;;
+esac
+
+srt_require_tools  # SKIP unless ffmpeg/ffprobe/srt-live-transmit present.
+olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit "$PB_SKIP_RC"; }
 
 # Record long enough that every scenario's playback window stays inside the
 # fixture (play1x plays ~12s from t=0; liveedge/seekplay reach ~mid/late).
@@ -60,7 +89,7 @@ trap cleanup EXIT
 # VideoToolbox/MediaFoundation — encode and decode are paired capabilities on
 # both platforms. VAC-1's codec assertion below catches any silent codec fallback.
 case "$SCENARIO" in
-    h264_play|armedcut-h264|armedcut-h264-back)
+    h264_play|armedcut-h264|armedcut-h264-back|gpucapstress)
         case "$(uname -s)" in
             MINGW*|MSYS*|CYGWIN*)
                 if [ "${OLR_RUN_UNSTABLE_MF_H264_TESTS:-0}" != "1" ]; then
@@ -155,7 +184,7 @@ sleep 1.0  # let the SRT listener come up before the caller connects
 # Written as a plain string (not an array) to stay compatible with bash 3.2 (macOS).
 REC_CODEC_EXTRA=""
 case "$SCENARIO" in
-    h264_play|armedcut-h264|armedcut-h264-back) REC_CODEC_EXTRA="--codec h264" ;;
+    h264_play|armedcut-h264|armedcut-h264-back|gpucapstress) REC_CODEC_EXTRA="--codec h264" ;;
 esac
 
 URL="$(srt_caller_url "$SRT_PORT")"
@@ -187,13 +216,17 @@ fi
 # Sanity: the fixture should carry <views> video tracks.
 VTRACKS="$(ffprobe -v error -select_streams v -show_entries stream=index -of csv=p=0 "$FIXTURE" | grep -c .)"
 echo "[pb-e2e] fixture video tracks: ${VTRACKS:-?} (expected $VIEWS)"
+if [ "${VTRACKS:-0}" != "$VIEWS" ]; then
+    echo "FAIL: fixture has ${VTRACKS:-0} video tracks, expected $VIEWS"
+    exit 1
+fi
 
 # VAC-1: assert the fixture is actually H.264 for the H.264 scenarios. A silent
 # codec fallback (e.g. record_harness ignoring --codec h264 and writing MPEG-2)
 # would make the H.264 gate exercise the wrong codec — assert early so the test
 # fails loudly rather than passing vacuously.
 case "$SCENARIO" in
-    h264_play|armedcut-h264|armedcut-h264-back)
+    h264_play|armedcut-h264|armedcut-h264-back|gpucapstress)
         VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
             -of default=nk=1:nw=1 "$FIXTURE" | head -n1)"
         echo "[pb-e2e] fixture video codec: ${VCODEC:-?}"
@@ -245,6 +278,7 @@ maxClockDivergenceMs="$(get maxClockDivergenceMs)"
 cutsFired="$(get cutsFired)"
 cutFollowReposition="$(get cutFollowReposition)"
 maxBoundaryLandingErrMs="$(get maxBoundaryLandingErrMs)"
+cutLandingSamples="$(get cutLandingSamples)"
 armNextCutArmed="$(get armNextCutArmed)"
 decodedVideoFrames="$(get decodedVideoFrames)"
 stagingVideoFramesDecoded="$(get stagingVideoFramesDecoded)"
@@ -272,6 +306,7 @@ gpuVramBytes="$(get gpuVramBytes)"
 [ -n "$cutsFired" ] || cutsFired="?"
 [ -n "$cutFollowReposition" ] || cutFollowReposition="?"
 [ -n "$maxBoundaryLandingErrMs" ] || maxBoundaryLandingErrMs="?"
+[ -n "$cutLandingSamples" ] || cutLandingSamples="?"
 [ -n "$armNextCutArmed" ] || armNextCutArmed="?"
 [ -n "$decodedVideoFrames" ] || decodedVideoFrames="?"
 [ -n "$stagingVideoFramesDecoded" ] || stagingVideoFramesDecoded="?"
@@ -709,6 +744,72 @@ case "$SCENARIO" in
             echo "FAIL: playlist boundary landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80) — a cut did not land at the next entry's in-point (fire-frame/speed bug)"
             fail=1
         fi
+        if ! num "$cutLandingSamples" || [ "$cutLandingSamples" -ne 2 ]; then
+            echo "FAIL: playlist observed $cutLandingSamples boundary landing samples (expected 2 for 3 entries) — landing-error gate is vacuous"
+            fail=1
+        fi
+        ;;
+    gpucapstress)
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: gpucapstress painted gray (placeholderFramesDelta=$placeholderFramesDelta, expected 0) under GPU cap pressure"
+            fail=1
+        fi
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -ne 0 ]; then
+            echo "FAIL: gpucapstress held frames (heldFramesDelta=$heldFramesDelta, expected 0) under GPU cap pressure"
+            fail=1
+        fi
+        if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 1 ]; then
+            echo "FAIL: gpucapstress armNextCut did not arm (armNextCutArmed=$armNextCutArmed, expected 1)"
+            fail=1
+        fi
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 1 ]; then
+            echo "FAIL: gpucapstress armed cut did not fire exactly once (cutsFired=$cutsFired, expected 1)"
+            fail=1
+        fi
+        if ! num "$stagingVideoFramesDecoded" || [ "$stagingVideoFramesDecoded" -lt 15 ]; then
+            echo "FAIL: gpucapstress staged too few cut frames (stagingVideoFramesDecoded=$stagingVideoFramesDecoded, expected >=15)"
+            fail=1
+        fi
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 0 ]; then
+            echo "FAIL: gpucapstress cut used decoder-follow reposition (cutFollowReposition=$cutFollowReposition, expected 0)"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 2 ]; then
+            echo "FAIL: gpucapstress repositioned too much (reposition=$reposition, expected <=2 for explicit seek/warmup only)"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: gpucapstress clock diverged after seek/cut (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500)"
+            fail=1
+        fi
+        if ! num "$maxBoundaryLandingErrMs" || [ "$maxBoundaryLandingErrMs" -gt 80 ]; then
+            echo "FAIL: gpucapstress cut landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80)"
+            fail=1
+        fi
+        if ! num "$cutLandingSamples" || [ "$cutLandingSamples" -lt 1 ]; then
+            echo "FAIL: gpucapstress did not observe a cut landing sample (cutLandingSamples=$cutLandingSamples, expected >=1)"
+            fail=1
+        fi
+        if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -lt 60 ]; then
+            echo "FAIL: gpucapstress decoded too few real video frames (decodedVideoFrames=$decodedVideoFrames, expected >=60)"
+            fail=1
+        fi
+        if ! num "$gpuReadToCpuCount" || [ "$gpuReadToCpuCount" -le 0 ]; then
+            echo "FAIL: gpucapstress produced no GPU CPU-materialization (gpuReadToCpuCount=$gpuReadToCpuCount, expected >0)"
+            fail=1
+        fi
+        if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
+            echo "FAIL: gpucapstress produced no GPU readback telemetry (gpuReadbacks=$gpuReadbacks, expected >0)"
+            fail=1
+        fi
+        if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
+            echo "FAIL: gpucapstress redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
+            fail=1
+        fi
+        if ! num "$fenceWaitStalls" || ! num "$decodedVideoFrames" || [ "$fenceWaitStalls" -gt "$decodedVideoFrames" ]; then
+            echo "FAIL: gpucapstress fence waits unbounded (fenceWaitStalls=$fenceWaitStalls, decodedVideoFrames=$decodedVideoFrames)"
+            fail=1
+        fi
         ;;
     h264_play)
         # H.264 HW playback decode through the real worker: steady 1x playback
@@ -862,19 +963,35 @@ case "${OLR_GPU_PIPELINE:-}" in
     1|true|TRUE|on|ON) GPU_RUNTIME_ENABLED=1 ;;
 esac
 
-if [ "$GPU_RUNTIME_ENABLED" -eq 1 ] && [ "$SCENARIO" = "h264_play" ]; then
-    if ! num "$gpuReadToCpuCount" || [ "$gpuReadToCpuCount" -le 0 ]; then
-        echo "FAIL: GPU path produced no CPU materialization (gpuReadToCpuCount=$gpuReadToCpuCount, expected >0)"
-        fail=1
-    fi
-    if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
-        echo "FAIL: GPU readback telemetry stayed zero (gpuReadbacks=$gpuReadbacks, expected >0)"
-        fail=1
-    fi
-    if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
-        echo "FAIL: redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
-        fail=1
-    fi
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    case "$SCENARIO" in
+        h264_play|armedcut-h264|armedcut-h264-back)
+            if ! num "$gpuReadToCpuCount" || [ "$gpuReadToCpuCount" -le 0 ]; then
+                echo "FAIL: GPU path produced no CPU materialization (gpuReadToCpuCount=$gpuReadToCpuCount, expected >0)"
+                fail=1
+            fi
+            if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
+                echo "FAIL: GPU readback telemetry stayed zero (gpuReadbacks=$gpuReadbacks, expected >0)"
+                fail=1
+            fi
+            if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
+                echo "FAIL: redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
+                fail=1
+            fi
+            ;;
+        gpucapstress)
+            ;;
+        *)
+            for gpucnt in gpuReadToCpuCount gpuReadbacks redundantGpuReadbacks readbackQueueDepth readbackDrops \
+                          fenceWaitStalls gpuOomDegrades gpuVramBytes; do
+                eval "gpuval=\$$gpucnt"
+                if ! num "$gpuval" || [ "$gpuval" -ne 0 ]; then
+                    echo "FAIL: GPU telemetry counter $gpucnt=$gpuval, expected 0 on the CPU path - Phase-1 counters must read inert/zero"
+                    fail=1
+                fi
+            done
+            ;;
+    esac
 else
     for gpucnt in gpuReadToCpuCount gpuReadbacks redundantGpuReadbacks readbackQueueDepth readbackDrops \
                   fenceWaitStalls gpuOomDegrades gpuVramBytes; do
@@ -886,7 +1003,7 @@ else
     done
 fi
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded gpuReadToCpuCount=$gpuReadToCpuCount gpuReadbacks=$gpuReadbacks redundantGpuReadbacks=$redundantGpuReadbacks readbackQueueDepth=$readbackQueueDepth readbackDrops=$readbackDrops fenceWaitStalls=$fenceWaitStalls gpuOomDegrades=$gpuOomDegrades gpuVramBytes=$gpuVramBytes"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs cutLandingSamples=$cutLandingSamples armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded gpuReadToCpuCount=$gpuReadToCpuCount gpuReadbacks=$gpuReadbacks redundantGpuReadbacks=$redundantGpuReadbacks readbackQueueDepth=$readbackQueueDepth readbackDrops=$readbackDrops fenceWaitStalls=$fenceWaitStalls gpuOomDegrades=$gpuOomDegrades gpuVramBytes=$gpuVramBytes"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

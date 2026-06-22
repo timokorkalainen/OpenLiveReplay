@@ -78,6 +78,10 @@ void OutputDispatcher::setRuntimeStats(const OutputRuntimeDispatchStats& stats) 
     m_stats.runtime = stats;
 }
 
+void OutputDispatcher::incrementFenceWaitStalls() {
+    m_stats.fenceWaitStalls++;
+}
+
 OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache,
                                                    const PlaybackStateSnapshot& state) {
     const qint64 outputFrameIndex = m_nextOutputFrameIndex++;
@@ -92,13 +96,24 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
             OutputBusFrame frame = renderBus(bus, outputFrameIndex, tickState, cache);
             if (m_holdLastFrame && frame.video.metadata().key.isPlaceholder &&
                 m_lastGoodFrame.contains(bus)) {
-                // Paint the last real video for this bus instead of the gray
-                // placeholder; keep the freshly-rendered audio + identity +
-                // outputFrameIndex so the clock and audio timeline never stall.
-                frame.video = m_lastGoodFrame.value(bus).video;
-                m_stats.heldFrames++;
+                const OutputBusFrame held = m_lastGoodFrame.value(bus);
+                if (held.video.isStaleForGeneration(tickState.gpuGeneration)) {
+                    m_lastGoodFrame.remove(bus);
+                } else {
+                    // Paint the last real video for this bus instead of the gray
+                    // placeholder; keep the freshly-rendered audio + identity +
+                    // outputFrameIndex so the clock and audio timeline never stall.
+                    // Stamp the identity with the held GPU generation so a later
+                    // generation bump cannot identity-skip the first real placeholder.
+                    frame.video = held.video;
+                    frame.identity.videoGpuGeneration = held.video.metadata().gpuGeneration;
+                    m_stats.heldFrames++;
+                }
             } else if (!frame.video.metadata().key.isPlaceholder) {
-                m_lastGoodFrame.insert(bus, frame);
+                if (frame.video.isStaleForGeneration(tickState.gpuGeneration))
+                    m_lastGoodFrame.remove(bus);
+                else
+                    m_lastGoodFrame.insert(bus, frame);
             }
             rendered.insert(bus, frame);
             countFrameHealth(rendered.value(bus));
@@ -187,6 +202,7 @@ PlaybackStateSnapshot OutputDispatcher::clockedStateForTick(qint64 outputFrameIn
 
     const bool speedChanged =
         m_havePlayEpoch && !qFuzzyCompare(m_playEpoch.speed + 1.0, state.speed + 1.0);
+    if (state.forcePlayEpochReset) m_havePlayEpoch = false;
     if (!m_havePlayEpoch || speedChanged) {
         m_playEpoch = state;
         m_playEpoch.playStartedAtOutputFrame = outputFrameIndex;

@@ -14,6 +14,7 @@
 #endif
 
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <wrl/client.h>
 
@@ -23,6 +24,7 @@ struct D3DFence::Impl {
 #ifdef OLR_HAS_D3D11_FENCE
     ComPtr<ID3D11Fence> fence;
 #endif
+    std::mutex signalMutex;
     uint64_t nextValue = 0;
 };
 
@@ -64,6 +66,7 @@ uint64_t D3DFence::signal(ID3D11DeviceContext* context) {
     return 0;
 #else
     if (!context || !m_impl || !m_impl->fence) return 0;
+    std::lock_guard<std::mutex> lock(m_impl->signalMutex);
     ComPtr<ID3D11DeviceContext4> context4;
     if (FAILED(context->QueryInterface(IID_PPV_ARGS(&context4))) || !context4) return 0;
     const uint64_t value = ++m_impl->nextValue;
@@ -81,7 +84,7 @@ bool D3DFence::wait(uint64_t value, int timeoutMs) {
     if (!m_impl || !m_impl->fence) return false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     while (m_impl->fence->GetCompletedValue() < value) {
-        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (timeoutMs >= 0 && std::chrono::steady_clock::now() >= deadline) return false;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return true;

@@ -101,6 +101,10 @@ bool FrameHandle::isPresentable() const {
     return isValid();
 }
 
+bool FrameHandle::isStaleForGeneration(uint64_t currentGeneration) const {
+    return m_meta.gpuGeneration != 0 && m_meta.gpuGeneration != currentGeneration;
+}
+
 MediaVideoFrameView::MediaVideoFrameView(const FrameHandle& handle) {
     const FrameMetadata& meta = handle.metadata();
     feedIndex = meta.key.feedIndex;

@@ -23,12 +23,13 @@ bool WinGpuImportEdge::isAvailable() const {
     return false;
 }
 
-std::optional<FrameHandle> WinGpuImportEdge::tryImport(void*, int, qint64, int, int) {
+std::optional<FrameHandle> WinGpuImportEdge::tryImport(void*, int, qint64, int, int,
+                                                       std::shared_ptr<GpuFence>) {
     return std::nullopt;
 }
 
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface>,
-                                                        FrameMetadata) {
+                                                        FrameMetadata, std::shared_ptr<GpuFence>) {
     return FrameHandle();
 }
 

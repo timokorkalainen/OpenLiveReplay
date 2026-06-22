@@ -3,6 +3,8 @@
 
 #include "playback/output/framepixelformat.h"
 
+#include <cstdint>
+
 struct GpuSurfaceDesc {
     FramePixelFormat format = FramePixelFormat::Nv12;
     int width = 0;
@@ -21,6 +23,8 @@ public:
 
     // IOSurfaceRef on Apple, ID3D11Texture2D* on Windows.
     virtual void* nativeHandle() const = 0;
+    virtual void retainUntilFenceRetired(uint64_t fenceValue) { (void) fenceValue; }
+    virtual uint64_t pendingFenceValue() const { return 0; }
 };
 
 #endif // OLR_GPUSURFACE_H

@@ -445,6 +445,10 @@ elseif(WIN32)
         playback/output/win/wingpuimportedge.cpp
         playback/output/win/d3d11gpusurface.cpp
         playback/output/win/d3dfence.cpp)
+    if(NOT OLR_GPU_PIPELINE)
+        target_sources(OpenLiveReplay PRIVATE
+            playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp)
+    endif()
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1
         OLR_NATIVE_RTMP_AVAILABLE=1)
@@ -475,6 +479,10 @@ if(OLR_GPU_PIPELINE)
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_apple.mm
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/gpuframeretirequeue.h playback/gpu/gpuframeretirequeue.cpp
+            playback/gpu/gpufence.h playback/gpu/gpufence_apple.mm
+            playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp
+            playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp
             playback/gpu/decodedonefence.h playback/gpu/decodedonefence_apple.mm
             playback/gpu/vtkeepsurfaceimporter.h playback/gpu/vtkeepsurfaceimporter_apple.mm)
         target_link_libraries(OpenLiveReplay PRIVATE "-framework Metal" "-framework QuartzCore")
@@ -482,7 +490,14 @@ if(OLR_GPU_PIPELINE)
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
+            playback/gpu/gpuframeretirequeue.h playback/gpu/gpuframeretirequeue.cpp
+            playback/gpu/gpufence.h playback/gpu/gpufence_stub.cpp
+            playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp
+            playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp
             playback/gpu/decodedonefence.h playback/gpu/decodedonefence_stub.cpp)
+        if(WIN32)
+            target_sources(OpenLiveReplay PRIVATE playback/gpu/gpufence_win.cpp)
+        endif()
     endif()
 endif()
 
