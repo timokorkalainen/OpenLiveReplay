@@ -509,6 +509,28 @@ jobs:
             find build-tests -maxdepth 2 -type f -name '*gpucompositor*' -print || true
             exit 127
           fi
+          echo "Direct DLL imports for $gpu_test:"
+          imports=""
+          if command -v objdump >/dev/null 2>&1; then
+            objdump -p "$gpu_test" | awk '/DLL Name:/ {print $3}' | sort -u | tee /tmp/tst_gpucompositor.imports
+            imports="$(cat /tmp/tst_gpucompositor.imports)"
+          else
+            echo "::warning::objdump not found; cannot list PE imports"
+          fi
+          echo "Runtime DLLs copied beside $gpu_test:"
+          find "$(dirname "$gpu_test")" -maxdepth 1 -type f -iname '*.dll' -print | sort || true
+          if [ -n "$imports" ]; then
+            echo "PATH resolution for direct DLL imports:"
+            while IFS= read -r dll; do
+              [ -n "$dll" ] || continue
+              printf '%s -> ' "$dll"
+              where.exe "$dll" 2>/dev/null | tr -d '\r' | head -1 || echo "MISSING"
+            done <<< "$imports"
+          fi
+          if command -v ldd >/dev/null 2>&1; then
+            echo "ldd view for $gpu_test:"
+            ldd "$gpu_test" || true
+          fi
           echo "Running $gpu_test with Qt=$qt_root MinGW=$mingw_root FFmpeg=$ffmpeg_root SRT=$srt_root"
           "$gpu_test" -v2
 
