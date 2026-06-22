@@ -20,19 +20,19 @@ GroupBox {
 
     function statusColor(severity) {
         if (severity === "ok")
-            return "#2e7d32"
+            return Theme.ready
         if (severity === "warning")
-            return "#f9a825"
+            return Theme.warning
         if (severity === "error")
-            return "#d32f2f"
-        return "#666"
+            return Theme.error
+        return Theme.textDim
     }
 
     ScrollView {
         id: ndiOutputScroll
         anchors.fill: parent
         clip: true
-        contentWidth: Math.max(availableWidth, root.tableMinimumWidth)
+        contentWidth: Math.max(width, root.tableMinimumWidth)
         ScrollBar.horizontal.policy: ScrollBar.AsNeeded
         ScrollBar.vertical.policy: ScrollBar.AsNeeded
 

@@ -10,7 +10,8 @@ Item {
     property var ui
     readonly property bool hasUi: root.ui !== null && root.ui !== undefined
     readonly property real durMax: root.hasUi
-                                   ? Math.max(0, Number(root.ui.recordedDurationMs) - Number(root.ui.liveBufferMs))
+                                   ? Math.max(0, root.finiteMs(root.ui.recordedDurationMs)
+                                              - root.finiteMs(root.ui.liveBufferMs))
                                    : 0
     property bool dragging: false
     property real dragMs: 0
@@ -21,8 +22,15 @@ Item {
     implicitHeight: Theme.hControl
     Layout.minimumWidth: 0
 
+    function finiteMs(value) {
+        var number = Number(value)
+        return Number.isFinite(number) ? number : 0
+    }
+
     function clampMs(ms) {
-        return Math.max(0, Math.min(root.durMax, Number(ms)))
+        var number = Number(ms)
+        if (!Number.isFinite(number)) return 0
+        return Math.max(0, Math.min(root.durMax, number))
     }
 
     function msToX(ms) {
@@ -32,8 +40,10 @@ Item {
     }
 
     function xToMs(x) {
+        var number = Number(x)
+        if (!Number.isFinite(number)) return 0
         return root.durMax > 0 && track.width > 0
-            ? root.clampMs((Math.max(0, Math.min(track.width, Number(x))) / track.width) * root.durMax)
+            ? root.clampMs((Math.max(0, Math.min(track.width, number)) / track.width) * root.durMax)
             : 0
     }
 
@@ -42,6 +52,7 @@ Item {
     }
 
     function beginScrubAtX(x) {
+        if (!root.hasUi || root.durMax <= 0) return
         root.dragging = true
         root.dragMs = root.xToMs(x)
         root.seekTo(root.dragMs)
@@ -55,6 +66,7 @@ Item {
     }
 
     function endScrubAtX(x) {
+        if (!root.dragging) return
         root.dragMs = root.xToMs(x)
         root.seekTo(root.dragMs)
         root.finishScrub()
@@ -90,27 +102,41 @@ Item {
                 required property var outMs
 
                 objectName: region.openEnded ? "openRegion" : "closedRegion"
-                readonly property bool openEnded: Number(region.outMs) < 0
+                readonly property real inValue: Number(region.inMs)
+                readonly property real outValue: Number(region.outMs)
+                readonly property bool openEnded: Number.isFinite(region.outValue) && region.outValue < 0
                 readonly property bool durationAvailable: root.durMax > 0
-                readonly property real startX: root.msToX(Number(region.inMs))
-                readonly property real endX: region.openEnded ? region.startX + 2
-                                                               : root.msToX(Number(region.outMs))
                 readonly property real markerWidth: 2
+                readonly property bool startValid: Number.isFinite(region.inValue) && region.inValue >= 0
+                readonly property bool rangeValid: region.openEnded
+                                                   ? region.startValid
+                                                   : (region.startValid
+                                                      && Number.isFinite(region.outValue)
+                                                      && region.outValue >= region.inValue)
+                readonly property real startX: region.startValid ? root.msToX(region.inValue) : 0
+                readonly property real endX: region.openEnded ? region.startX + region.markerWidth
+                                                              : root.msToX(region.outValue)
+                readonly property real regionWidth: !region.durationAvailable || !region.rangeValid ? 0
+                                                    : region.openEnded
+                                                    ? region.markerWidth
+                                                    : Math.min(track.width,
+                                                               Math.max(region.markerWidth,
+                                                                        region.endX - region.startX))
 
-                visible: region.durationAvailable
                 x: region.openEnded
                    ? Math.max(0, Math.min(track.width - region.markerWidth, region.startX - region.markerWidth / 2))
-                   : region.startX
+                   : Math.max(0, Math.min(track.width - region.regionWidth, region.startX))
                 y: 0
-                width: region.openEnded ? region.markerWidth : Math.max(2, region.endX - region.startX)
-                height: track.height
+                width: region.regionWidth
+                height: region.durationAvailable && region.rangeValid ? track.height : 0
                 color: region.openEnded ? Theme.armed : Theme.accent
-                opacity: region.openEnded ? 1.0 : 0.25
+                opacity: !region.durationAvailable || !region.rangeValid ? 0.0 : (region.openEnded ? 1.0 : 0.25)
                 radius: Theme.r1
             }
         }
 
         Rectangle {
+            visible: root.durMax > 0
             width: root.msToX(root.shownMs)
             height: parent.height
             color: Theme.accent
@@ -131,6 +157,7 @@ Item {
         }
 
         Rectangle {
+            visible: root.durMax > 0
             x: Math.max(0, Math.min(parent.width - width, root.msToX(root.shownMs) - width / 2))
             width: 3
             height: parent.height
@@ -144,7 +171,7 @@ Item {
         objectName: "scrubMouse"
         anchors.fill: parent
         hoverEnabled: true
-        enabled: root.hasUi
+        enabled: root.hasUi && root.durMax > 0
         onPressed: (mouse) => {
             root.beginScrubAtX(mouse.x)
             mouse.accepted = true

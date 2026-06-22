@@ -19,6 +19,8 @@ QtObject {
     readonly property color line: "#323840"          // 1px dividers / control borders
     readonly property color lineStrong: "#444B54"    // emphasized borders / focus ring base
     readonly property color scrim: "#8C000000"        // 55% black — UMD bars, drawer dim
+    readonly property color warnSurface: "#2B2615"   // soft-warning banner, distinct from error
+    readonly property color warnBorder: "#5B4818"
 
     // --- Text (all >= 4.5:1 on panel/panelRaised) ---
     readonly property color textHi: "#ECEEF0"   // primary
@@ -30,6 +32,7 @@ QtObject {
     // --- Semantic tally (one token per MEANING) ---
     readonly property color recordOnAir: "#E53935" // record active AND the single PGM/on-air tally
     readonly property color armed: "#FFB300"        // cued / preview / armed cut
+    readonly property color warning: "#FFD166"      // generic warnings / destructive previews
     readonly property color ready: "#43A047"        // healthy / ready / connected
     readonly property color idle: "#6E6E6E"         // no source / inactive
     readonly property color error: "#FF7043"        // no-signal / link-error / NDI drop (render as hatch/blink, never on-air)
@@ -37,7 +40,7 @@ QtObject {
     // --- Accent (focus / selection / scrub progress) ---
     readonly property color accent: "#2E7BFF"
     readonly property color accentHover: "#4A8DFF"
-    readonly property color accentPressed: "#1F66E0"
+    readonly property color accentPressed: "#2C76F4"
     readonly property color focusRing: "#2E7BFF"
 
     // --- Type --- QML's font.family takes a SINGLE family; a comma list (and font.families,

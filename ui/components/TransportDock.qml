@@ -17,11 +17,21 @@ ColumnLayout {
     readonly property int compactTimeWidth: 54
     readonly property int compactShuttleWidth: 26
     readonly property int compactCaptureWidth: 40
+    readonly property int primaryKeyHeight: root.compact ? Theme.hControl : Theme.hPrimary
+    readonly property int liveKeyHeight: root.compact ? Theme.hControl : Theme.hTransport
+    readonly property int actionKeyHeight: root.compact ? Theme.hControl : Theme.hAction
+    readonly property int shuttleKeyHeight: Theme.hControl
+    readonly property int shuttleFramePadding: root.compact ? 0 : Theme.s1
+    readonly property int shuttleFrameHeight: root.shuttleKeyHeight + root.shuttleFramePadding * 2
+    readonly property int deckRowHeight: Math.max(root.primaryKeyHeight,
+                                                  root.liveKeyHeight,
+                                                  root.actionKeyHeight,
+                                                  root.shuttleFrameHeight)
 
     Layout.fillWidth: true
     Layout.minimumWidth: 0
     Layout.preferredHeight: implicitHeight
-    implicitHeight: scrubBar.implicitHeight + transportRow.implicitHeight + root.spacing
+    implicitHeight: scrubBar.implicitHeight + root.deckRowHeight + root.spacing
     spacing: 8
 
     function formatTimecode(ms) {
@@ -65,6 +75,7 @@ ColumnLayout {
 
         Layout.alignment: Qt.AlignHCenter
         Layout.fillWidth: true
+        Layout.preferredHeight: root.deckRowHeight
         spacing: root.compact || root.tight ? Theme.s1 : 12
 
         Text {
@@ -90,153 +101,198 @@ ColumnLayout {
         }
 
         Button {
+            objectName: "transportPlayButton"
             text: root.hasUi && root.ui.transport.isPlaying ? "PAUSE" : "PLAY"
+            implicitHeight: root.primaryKeyHeight
+            Layout.preferredHeight: root.primaryKeyHeight
+            font.pixelSize: root.compact ? Theme.fsBody : Theme.fsHeading
             enabled: root.hasUi
             onClicked: root.ui.playPause()
             highlighted: root.hasUi && root.ui.transport.isPlaying
         }
 
-        RowLayout {
-            spacing: root.compact ? 1 : (root.tight ? Theme.s1 : 12)
+        Frame {
+            id: shuttleFrame
 
-            Button {
-                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
-                leftPadding: root.compact ? Theme.s1 : Theme.s3
-                rightPadding: root.compact ? Theme.s1 : Theme.s3
-                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
-                text: root.compact ? "-5" : "-5.0x"
-                enabled: root.hasUi
-                onPressed: {
-                    root.ui.cancelFollowLive()
-                    root.holdWasPlaying = root.ui.transport.isPlaying
-                    root.ui.transport.setSpeed(-5.0)
-                    root.ui.transport.setPlaying(true)
-                }
-                onReleased: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
-                onCanceled: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
+            objectName: "transportShuttleFrame"
+            implicitHeight: root.shuttleFrameHeight
+            padding: root.shuttleFramePadding
+            Layout.alignment: Qt.AlignVCenter
+            Layout.preferredHeight: root.shuttleFrameHeight
+
+            background: Rectangle {
+                color: Theme.panel
+                border.color: Theme.line
+                border.width: Theme.borderW
+                radius: Theme.r1
             }
 
-            Button {
-                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
-                leftPadding: root.compact ? Theme.s1 : Theme.s3
-                rightPadding: root.compact ? Theme.s1 : Theme.s3
-                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
-                text: "<"
-                enabled: root.hasUi
-                onClicked: root.ui.stepFrameBack()
-            }
+            contentItem: RowLayout {
+                spacing: root.compact ? 1 : (root.tight ? Theme.s1 : 12)
 
-            Button {
-                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
-                leftPadding: root.compact ? Theme.s1 : Theme.s3
-                rightPadding: root.compact ? Theme.s1 : Theme.s3
-                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
-                text: ">"
-                enabled: root.hasUi
-                onClicked: root.ui.stepFrame()
-            }
+                Button {
+                    objectName: "transportRewindButton"
+                    implicitHeight: root.shuttleKeyHeight
+                    Layout.preferredHeight: root.shuttleKeyHeight
+                    Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                    leftPadding: root.compact ? Theme.s1 : Theme.s3
+                    rightPadding: root.compact ? Theme.s1 : Theme.s3
+                    font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                    text: root.compact ? "-5" : "-5.0x"
+                    enabled: root.hasUi
+                    onPressed: {
+                        root.ui.cancelFollowLive()
+                        root.holdWasPlaying = root.ui.transport.isPlaying
+                        root.ui.transport.setSpeed(-5.0)
+                        root.ui.transport.setPlaying(true)
+                    }
+                    onReleased: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
+                    onCanceled: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
+                }
 
-            Button {
-                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
-                leftPadding: root.compact ? Theme.s1 : Theme.s3
-                rightPadding: root.compact ? Theme.s1 : Theme.s3
-                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
-                text: root.compact ? "¼" : "0.25x"
-                enabled: root.hasUi
-                onPressed: {
-                    root.ui.cancelFollowLive()
-                    root.holdWasPlaying = root.ui.transport.isPlaying
-                    root.ui.transport.setSpeed(0.25)
-                    root.ui.transport.setPlaying(true)
+                Button {
+                    objectName: "transportStepBackButton"
+                    implicitHeight: root.shuttleKeyHeight
+                    Layout.preferredHeight: root.shuttleKeyHeight
+                    Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                    leftPadding: root.compact ? Theme.s1 : Theme.s3
+                    rightPadding: root.compact ? Theme.s1 : Theme.s3
+                    font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                    text: "<"
+                    enabled: root.hasUi
+                    onClicked: root.ui.stepFrameBack()
                 }
-                onReleased: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
-                onCanceled: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
-            }
 
-            Button {
-                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
-                leftPadding: root.compact ? Theme.s1 : Theme.s3
-                rightPadding: root.compact ? Theme.s1 : Theme.s3
-                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
-                text: root.compact ? "½" : "0.5x"
-                enabled: root.hasUi
-                onPressed: {
-                    root.ui.cancelFollowLive()
-                    root.holdWasPlaying = root.ui.transport.isPlaying
-                    root.ui.transport.setSpeed(0.5)
-                    root.ui.transport.setPlaying(true)
+                Button {
+                    objectName: "transportStepForwardButton"
+                    implicitHeight: root.shuttleKeyHeight
+                    Layout.preferredHeight: root.shuttleKeyHeight
+                    Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                    leftPadding: root.compact ? Theme.s1 : Theme.s3
+                    rightPadding: root.compact ? Theme.s1 : Theme.s3
+                    font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                    text: ">"
+                    enabled: root.hasUi
+                    onClicked: root.ui.stepFrame()
                 }
-                onReleased: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
-                onCanceled: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
-            }
 
-            Button {
-                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
-                leftPadding: root.compact ? Theme.s1 : Theme.s3
-                rightPadding: root.compact ? Theme.s1 : Theme.s3
-                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
-                text: root.compact ? "2" : "2.0x"
-                enabled: root.hasUi
-                onPressed: {
-                    root.ui.cancelFollowLive()
-                    root.holdWasPlaying = root.ui.transport.isPlaying
-                    root.ui.transport.setSpeed(2.0)
-                    root.ui.transport.setPlaying(true)
+                Button {
+                    objectName: "transportQuarterButton"
+                    implicitHeight: root.shuttleKeyHeight
+                    Layout.preferredHeight: root.shuttleKeyHeight
+                    Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                    leftPadding: root.compact ? Theme.s1 : Theme.s3
+                    rightPadding: root.compact ? Theme.s1 : Theme.s3
+                    font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                    text: root.compact ? "¼" : "0.25x"
+                    enabled: root.hasUi
+                    onPressed: {
+                        root.ui.cancelFollowLive()
+                        root.holdWasPlaying = root.ui.transport.isPlaying
+                        root.ui.transport.setSpeed(0.25)
+                        root.ui.transport.setPlaying(true)
+                    }
+                    onReleased: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
+                    onCanceled: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
                 }
-                onReleased: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
-                onCanceled: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
-                }
-            }
 
-            Button {
-                Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
-                leftPadding: root.compact ? Theme.s1 : Theme.s3
-                rightPadding: root.compact ? Theme.s1 : Theme.s3
-                font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
-                text: root.compact ? "5" : "5.0x"
-                enabled: root.hasUi
-                onPressed: {
-                    root.ui.cancelFollowLive()
-                    root.holdWasPlaying = root.ui.transport.isPlaying
-                    root.ui.transport.setSpeed(5.0)
-                    root.ui.transport.setPlaying(true)
+                Button {
+                    objectName: "transportHalfButton"
+                    implicitHeight: root.shuttleKeyHeight
+                    Layout.preferredHeight: root.shuttleKeyHeight
+                    Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                    leftPadding: root.compact ? Theme.s1 : Theme.s3
+                    rightPadding: root.compact ? Theme.s1 : Theme.s3
+                    font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                    text: root.compact ? "½" : "0.5x"
+                    enabled: root.hasUi
+                    onPressed: {
+                        root.ui.cancelFollowLive()
+                        root.holdWasPlaying = root.ui.transport.isPlaying
+                        root.ui.transport.setSpeed(0.5)
+                        root.ui.transport.setPlaying(true)
+                    }
+                    onReleased: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
+                    onCanceled: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
                 }
-                onReleased: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
+
+                Button {
+                    objectName: "transportDoubleButton"
+                    implicitHeight: root.shuttleKeyHeight
+                    Layout.preferredHeight: root.shuttleKeyHeight
+                    Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                    leftPadding: root.compact ? Theme.s1 : Theme.s3
+                    rightPadding: root.compact ? Theme.s1 : Theme.s3
+                    font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                    text: root.compact ? "2" : "2.0x"
+                    enabled: root.hasUi
+                    onPressed: {
+                        root.ui.cancelFollowLive()
+                        root.holdWasPlaying = root.ui.transport.isPlaying
+                        root.ui.transport.setSpeed(2.0)
+                        root.ui.transport.setPlaying(true)
+                    }
+                    onReleased: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
+                    onCanceled: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
                 }
-                onCanceled: {
-                    root.ui.transport.setSpeed(1.0)
-                    root.ui.transport.setPlaying(root.holdWasPlaying)
+
+                Button {
+                    objectName: "transportForwardButton"
+                    implicitHeight: root.shuttleKeyHeight
+                    Layout.preferredHeight: root.shuttleKeyHeight
+                    Layout.preferredWidth: root.compact ? root.compactShuttleWidth : implicitWidth
+                    leftPadding: root.compact ? Theme.s1 : Theme.s3
+                    rightPadding: root.compact ? Theme.s1 : Theme.s3
+                    font.pixelSize: root.compact ? Theme.fsMicro : Theme.fsBody
+                    text: root.compact ? "5" : "5.0x"
+                    enabled: root.hasUi
+                    onPressed: {
+                        root.ui.cancelFollowLive()
+                        root.holdWasPlaying = root.ui.transport.isPlaying
+                        root.ui.transport.setSpeed(5.0)
+                        root.ui.transport.setPlaying(true)
+                    }
+                    onReleased: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
+                    onCanceled: {
+                        root.ui.transport.setSpeed(1.0)
+                        root.ui.transport.setPlaying(root.holdWasPlaying)
+                    }
                 }
             }
         }
 
         Button {
-            text: "Live"
+            objectName: "transportLiveButton"
+            text: root.compact ? "Live" : "GO LIVE"
+            implicitHeight: root.liveKeyHeight
+            Layout.preferredHeight: root.liveKeyHeight
             enabled: root.hasUi
             onClicked: {
                 root.ui.goLive()
@@ -246,6 +302,9 @@ ColumnLayout {
         }
 
         Button {
+            objectName: "transportCaptureButton"
+            implicitHeight: root.actionKeyHeight
+            Layout.preferredHeight: root.actionKeyHeight
             Layout.preferredWidth: root.compact ? root.compactCaptureWidth : implicitWidth
             leftPadding: root.compact ? Theme.s1 : Theme.s3
             rightPadding: root.compact ? Theme.s1 : Theme.s3

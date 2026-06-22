@@ -44,7 +44,8 @@ T.Button {
             return Theme.panelRaised
         }
         border.width: Theme.borderW
-        border.color: control.highlighted ? "transparent"
-                                          : (control.visualFocus ? Theme.focusRing : Theme.line)
+        border.color: control.visualFocus
+                      ? (control.highlighted ? Theme.textHi : Theme.focusRing)
+                      : (control.highlighted ? "transparent" : Theme.line)
     }
 }

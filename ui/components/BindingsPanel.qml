@@ -22,9 +22,9 @@ ColumnLayout {
         property bool expanded: false
 
         background: Rectangle {
-            color: "#1b1b1b"
+            color: Theme.panelRaised
             radius: 6
-            border.color: "#333"
+            border.color: Theme.line
             border.width: 1
         }
 
@@ -38,7 +38,7 @@ ColumnLayout {
 
                 Text {
                     text: "MIDI Controller"
-                    color: "#eeeeee"
+                    color: Theme.textHi
                     font.bold: true
                     Layout.alignment: Qt.AlignVCenter
                 }
@@ -78,7 +78,7 @@ ColumnLayout {
 
                         Text {
                             text: root.hasUi && root.ui.midiConnected ? "Connected" : "Disconnected"
-                            color: root.hasUi && root.ui.midiConnected ? "#4CAF50" : "#777"
+                            color: root.hasUi && root.ui.midiConnected ? Theme.ready : Theme.textDim
                             verticalAlignment: Text.AlignVCenter
                         }
                     }
@@ -122,14 +122,14 @@ ColumnLayout {
                                 Text {
                                     text: midiRow.modelData.name
                                     Layout.preferredWidth: 130
-                                    color: "#eeeeee"
+                                    color: Theme.textHi
                                 }
 
                                 Text {
                                     text: root.hasUi && root.ui.midiBindingsVersion >= 0
                                           ? root.ui.midiBindingLabel(midiRow.modelData.action)
                                           : (root.hasUi ? root.ui.midiBindingLabel(midiRow.modelData.action) : "")
-                                    color: root.hasUi && root.ui.midiLearnAction === midiRow.modelData.action ? "#ff9800" : "#aaa"
+                                    color: root.hasUi && root.ui.midiLearnAction === midiRow.modelData.action ? Theme.armed : Theme.textBody
                                     Layout.fillWidth: true
                                 }
 
@@ -137,7 +137,7 @@ ColumnLayout {
                                     text: "Last: " + (root.hasUi && root.ui.midiLastValuesVersion >= 0
                                                       ? root.ui.midiLastValue(midiRow.modelData.action)
                                                       : (root.hasUi ? root.ui.midiLastValue(midiRow.modelData.action) : ""))
-                                    color: "#666666"
+                                    color: Theme.textDim
                                     Layout.preferredWidth: 80
                                 }
 
@@ -190,9 +190,9 @@ ColumnLayout {
         visible: !root.hasUi || (root.hasStreamDeck && root.streamDeck.supported)
 
         background: Rectangle {
-            color: "#1b1b1b"
+            color: Theme.panelRaised
             radius: 6
-            border.color: "#333"
+            border.color: Theme.line
             border.width: 1
         }
 
@@ -206,7 +206,7 @@ ColumnLayout {
 
                 Text {
                     text: "Stream Deck"
-                    color: "#eeeeee"
+                    color: Theme.textHi
                     font.bold: true
                     Layout.alignment: Qt.AlignVCenter
                 }
@@ -217,7 +217,7 @@ ColumnLayout {
                     text: root.hasStreamDeck && root.streamDeck.connected
                           ? root.streamDeck.deviceName
                           : "Disconnected"
-                    color: root.hasStreamDeck && root.streamDeck.connected ? "#4CAF50" : "#777"
+                    color: root.hasStreamDeck && root.streamDeck.connected ? Theme.ready : Theme.textDim
                     verticalAlignment: Text.AlignVCenter
                 }
 
@@ -245,13 +245,13 @@ ColumnLayout {
                                   ? "Connected: " + root.streamDeck.deviceName
                                     + " (" + root.streamDeck.deviceModel + ")"
                                   : "No Stream Deck connected"
-                            color: root.hasStreamDeck && root.streamDeck.connected ? "#4CAF50" : "#aaa"
+                            color: root.hasStreamDeck && root.streamDeck.connected ? Theme.ready : Theme.textBody
                         }
 
                         Text {
                             visible: root.hasStreamDeck && !root.streamDeck.driverAppInstalled
                             text: "Install “Elgato Stream Deck Connect” from the App Store and enable the Stream Deck Device Driver in the iPadOS Settings app, then connect the deck via USB-C."
-                            color: "#ff9800"
+                            color: Theme.warning
                             wrapMode: Text.WordWrap
                             Layout.fillWidth: true
                         }
@@ -273,12 +273,12 @@ ColumnLayout {
                         Layout.fillWidth: true
                         spacing: 8
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Text {
-                                text: "Click Learn, then press a key or turn/press a dial."
-                                color: "#aaaaaa"
+                            RowLayout {
                                 Layout.fillWidth: true
+                                Text {
+                                    text: "Click Learn, then press a key or turn/press a dial."
+                                    color: Theme.textBody
+                                    Layout.fillWidth: true
                                 wrapMode: Text.WordWrap
                             }
                             Button {
@@ -320,7 +320,7 @@ ColumnLayout {
 
                                 Text {
                                     text: sdRow.modelData.name
-                                    color: "#eeeeee"
+                                    color: Theme.textHi
                                     Layout.preferredWidth: 110
                                 }
                                 Text {
@@ -328,7 +328,7 @@ ColumnLayout {
                                           ? root.ui.streamDeckBindingLabel(sdRow.modelData.action)
                                           : ""
                                     color: root.hasUi && root.ui.streamDeckLearnAction === sdRow.modelData.action
-                                           ? "#ff9800" : "#aaa"
+                                           ? Theme.armed : Theme.textBody
                                     Layout.fillWidth: true
                                 }
                                 Button {

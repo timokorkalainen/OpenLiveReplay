@@ -45,7 +45,7 @@ ApplicationWindow {
     }
 
     onWidthChanged: {
-        if (appWindow.width < Theme.bpSM) appWindow.rundownExpanded = false
+        if (appWindow.width <= Theme.bpSM) appWindow.rundownExpanded = false
     }
 
     Timer {
@@ -228,8 +228,8 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.preferredHeight: warningText.implicitHeight + Theme.s2 * 2
             visible: appWindow.recordingWarningText !== ""
-            color: "#2b2615"
-            border.color: "#5b4818"
+            color: Theme.warnSurface
+            border.color: Theme.warnBorder
             border.width: 1
 
             Text {
@@ -238,7 +238,7 @@ ApplicationWindow {
                 anchors.fill: parent
                 anchors.margins: Theme.s2
                 text: "Warning: " + appWindow.recordingWarningText
-                color: "#ffb300"
+                color: Theme.warning
                 wrapMode: Text.WordWrap
                 verticalAlignment: Text.AlignVCenter
             }
@@ -308,7 +308,7 @@ ApplicationWindow {
                                     var idText = telemetryRow.modelData.feedId || ""
                                     return name.length > 0 ? (idText + " " + name) : idText
                                 }
-                                color: "#eeeeee"
+                                color: Theme.textHi
                                 font.bold: true
                                 elide: Text.ElideRight
                                 Layout.preferredWidth: 180
@@ -316,7 +316,7 @@ ApplicationWindow {
 
                             Text {
                                 text: telemetryRow.modelData.summary || ""
-                                color: "#b0b0b0"
+                                color: Theme.textBody
                                 elide: Text.ElideRight
                                 Layout.fillWidth: true
                             }
