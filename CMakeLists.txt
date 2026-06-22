@@ -174,6 +174,7 @@ qt_add_qml_module(OpenLiveReplay
         ui/components/OutputsPanel.qml
         ui/components/PgmStage.qml
         ui/components/ProjectSettingsPanel.qml
+        ui/components/RundownRail.qml
         ui/components/SourceListPanel.qml
         ui/components/StatusStrip.qml
         ui/components/TransportDock.qml

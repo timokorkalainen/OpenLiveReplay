@@ -21,7 +21,7 @@ ColumnLayout {
     Layout.fillWidth: true
     Layout.minimumWidth: 0
     Layout.preferredHeight: implicitHeight
-    implicitHeight: scrubBar.implicitHeight + cueRow.implicitHeight + transportRow.implicitHeight + root.spacing * 2
+    implicitHeight: scrubBar.implicitHeight + transportRow.implicitHeight + root.spacing
     spacing: 8
 
     function formatTimecode(ms) {
@@ -94,58 +94,6 @@ ColumnLayout {
             width: 0
             height: 0
             visible: false
-        }
-    }
-
-    // Tier3 replay cue list: mark in/out at the playhead, recall as a
-    // frame-perfect armed cut (pre-rolled, no flash). "Play Playlist"
-    // runs the rundown -- it auto-advances across each entry boundary with
-    // a frame-perfect cut, honoring per-entry speed; a manual scrub or
-    // recall exits playout.
-    RowLayout {
-        id: cueRow
-
-        Layout.alignment: Qt.AlignHCenter
-        spacing: root.compact || root.tight ? Theme.s1 : 8
-        Button {
-            Layout.preferredWidth: root.compact ? 44 : implicitWidth
-            leftPadding: root.compact ? Theme.s1 : Theme.s3
-            rightPadding: root.compact ? Theme.s1 : Theme.s3
-            text: root.compact ? "In" : "Mark In"
-            enabled: root.hasUi
-            onClicked: root.ui.markIn()
-        }
-        Button {
-            Layout.preferredWidth: root.compact ? 48 : implicitWidth
-            leftPadding: root.compact ? Theme.s1 : Theme.s3
-            rightPadding: root.compact ? Theme.s1 : Theme.s3
-            text: root.compact ? "Out" : "Mark Out"
-            enabled: root.hasUi
-            onClicked: root.ui.markOut()
-        }
-        Button {
-            Layout.preferredWidth: root.compact ? 42 : implicitWidth
-            leftPadding: root.compact ? Theme.s1 : Theme.s3
-            rightPadding: root.compact ? Theme.s1 : Theme.s3
-            text: root.compact ? "R0" : "Recall 0"
-            enabled: root.hasUi
-            onClicked: root.ui.recallEntry(0)
-        }
-        Button {
-            Layout.preferredWidth: root.compact ? 70 : implicitWidth
-            leftPadding: root.compact ? Theme.s1 : Theme.s3
-            rightPadding: root.compact ? Theme.s1 : Theme.s3
-            text: root.compact ? "Playlist" : "Play Playlist"
-            enabled: root.hasUi
-            onClicked: root.ui.playPlaylist(0)
-        }
-        Button {
-            Layout.preferredWidth: root.compact ? 56 : implicitWidth
-            leftPadding: root.compact ? Theme.s1 : Theme.s3
-            rightPadding: root.compact ? Theme.s1 : Theme.s3
-            text: root.compact ? "Stop" : "Stop Playout"
-            enabled: root.hasUi
-            onClicked: root.ui.stopPlaylistPlayout()
         }
     }
 

@@ -30,6 +30,7 @@ ApplicationWindow {
     property var uiManagerRef: uiManager
     // qmllint enable unqualified
     property alias screenProbe: screenProbe
+    property bool rundownExpanded: width >= Theme.bpMD
     // Last recording-start failure reason, surfaced near the record button.
     // Cleared on a successful recording start.
     property string recordingError: ""
@@ -41,6 +42,10 @@ ApplicationWindow {
     function showRecordingWarning(msg) {
         appWindow.recordingWarningText = msg
         recordingWarningDismissTimer.restart()
+    }
+
+    onWidthChanged: {
+        if (appWindow.width < Theme.bpSM) appWindow.rundownExpanded = false
     }
 
     Timer {
@@ -176,6 +181,26 @@ ApplicationWindow {
         }
     }
 
+    FileDialog {
+        id: rundownSaveDialog
+        title: "Save Rundown"
+        fileMode: FileDialog.SaveFile
+        nameFilters: ["Rundown JSON (*.json)", "All files (*)"]
+        onAccepted: {
+            appWindow.uiManagerRef.savePlaylistToUrl(rundownSaveDialog.file)
+        }
+    }
+
+    FileDialog {
+        id: rundownLoadDialog
+        title: "Load Rundown"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Rundown JSON (*.json)", "All files (*)"]
+        onAccepted: {
+            appWindow.uiManagerRef.loadPlaylistFromUrl(rundownLoadDialog.file)
+        }
+    }
+
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
@@ -187,8 +212,10 @@ ApplicationWindow {
 
             ui: appWindow.uiManagerRef
             configOpen: configDrawer.opened
+            rundownOpen: appWindow.rundownExpanded
             recordingError: appWindow.recordingError
             onToggleConfig: configDrawer.opened ? configDrawer.close() : configDrawer.open()
+            onToggleRundown: appWindow.rundownExpanded = !appWindow.rundownExpanded
             onFullscreenMultiviewRequested: (x, y) => {
                 appWindow.refreshScreenOptions()
                 screenMenu.x = x
@@ -217,12 +244,30 @@ ApplicationWindow {
             }
         }
 
-        PgmStage {
-            id: pgmStage
-
+        RowLayout {
             Layout.fillWidth: true
             Layout.fillHeight: true
-            ui: appWindow.uiManagerRef
+            spacing: Theme.s2
+
+            PgmStage {
+                id: pgmStage
+
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                ui: appWindow.uiManagerRef
+            }
+
+            RundownRail {
+                id: rundownRail
+
+                Layout.fillHeight: true
+                Layout.preferredWidth: appWindow.rundownExpanded ? 340 : Theme.hControl + Theme.s2 * 2
+                Layout.minimumWidth: appWindow.rundownExpanded ? 260 : Theme.hControl + Theme.s2 * 2
+                ui: appWindow.uiManagerRef
+                expanded: appWindow.rundownExpanded
+                onSaveRequested: rundownSaveDialog.open()
+                onLoadRequested: rundownLoadDialog.open()
+            }
         }
 
         GroupBox {

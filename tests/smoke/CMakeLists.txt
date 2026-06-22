@@ -24,6 +24,7 @@ if(OLR_QMLLINT)
         "${CMAKE_SOURCE_DIR}/ui/components/OutputsPanel.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/PgmStage.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/ProjectSettingsPanel.qml"
+        "${CMAKE_SOURCE_DIR}/ui/components/RundownRail.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/SourceListPanel.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/StatusStrip.qml"
         "${CMAKE_SOURCE_DIR}/ui/components/TransportDock.qml")

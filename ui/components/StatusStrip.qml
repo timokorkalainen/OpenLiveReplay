@@ -10,6 +10,7 @@ RowLayout {
     property var ui
     readonly property bool hasUi: root.ui !== undefined && root.ui !== null
     property bool configOpen: false
+    property bool rundownOpen: false
     property string recordingError: ""
     readonly property int avail: root.parent ? root.parent.width : root.width
     readonly property int tallyCount: root.hasUi ? Math.max(0, Math.min(16, root.ui.multiviewCount)) : 4
@@ -24,6 +25,7 @@ RowLayout {
     readonly property int tallyDotSize: Math.max(6, Theme.dotSize - 4)
 
     signal toggleConfig()
+    signal toggleRundown()
     signal fullscreenMultiviewRequested(real x, real y)
 
     Layout.fillWidth: true
@@ -185,6 +187,20 @@ RowLayout {
 
         ToolTip.visible: hovered
         ToolTip.text: "Open fullscreen multiview"
+    }
+
+    Button {
+        Layout.preferredWidth: root.tiny ? 44 : implicitWidth
+        Layout.minimumWidth: root.tiny ? 44 : 64
+        Layout.preferredHeight: Theme.hControl
+        leftPadding: root.tiny ? Theme.s1 : Theme.s3
+        rightPadding: root.tiny ? Theme.s1 : Theme.s3
+        text: root.tiny ? "Run" : "Rundown"
+        highlighted: root.rundownOpen
+        onClicked: root.toggleRundown()
+
+        ToolTip.visible: hovered
+        ToolTip.text: root.rundownOpen ? "Hide rundown" : "Show rundown"
     }
 
     Button {
