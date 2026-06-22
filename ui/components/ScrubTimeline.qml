@@ -68,6 +68,7 @@ Item {
     Rectangle {
         id: track
 
+        objectName: "track"
         anchors.fill: parent
         anchors.topMargin: Theme.s2
         anchors.bottomMargin: Theme.s2
@@ -88,17 +89,23 @@ Item {
                 required property var inMs
                 required property var outMs
 
+                objectName: region.openEnded ? "openRegion" : "closedRegion"
+                readonly property bool openEnded: Number(region.outMs) < 0
+                readonly property bool durationAvailable: root.durMax > 0
                 readonly property real startX: root.msToX(Number(region.inMs))
-                readonly property real endX: Number(region.outMs) < 0
-                                             ? region.startX + 2
-                                             : root.msToX(Number(region.outMs))
+                readonly property real endX: region.openEnded ? region.startX + 2
+                                                               : root.msToX(Number(region.outMs))
+                readonly property real markerWidth: 2
 
-                x: region.startX
+                visible: region.durationAvailable
+                x: region.openEnded
+                   ? Math.max(0, Math.min(track.width - region.markerWidth, region.startX - region.markerWidth / 2))
+                   : region.startX
                 y: 0
-                width: Math.max(2, region.endX - region.startX)
+                width: region.openEnded ? region.markerWidth : Math.max(2, region.endX - region.startX)
                 height: track.height
-                color: Number(region.outMs) < 0 ? Theme.armed : Theme.accent
-                opacity: Number(region.outMs) < 0 ? 1.0 : 0.25
+                color: region.openEnded ? Theme.armed : Theme.accent
+                opacity: region.openEnded ? 1.0 : 0.25
                 radius: Theme.r1
             }
         }
@@ -112,6 +119,10 @@ Item {
         }
 
         Rectangle {
+            objectName: "liveEdge"
+            readonly property bool durationAvailable: root.durMax > 0
+
+            visible: durationAvailable
             x: Math.max(0, parent.width - width)
             width: 2
             height: parent.height
@@ -125,27 +136,28 @@ Item {
             height: parent.height
             color: Theme.textHi
         }
+    }
 
-        MouseArea {
-            id: scrubMouse
+    MouseArea {
+        id: scrubMouse
 
-            anchors.fill: parent
-            hoverEnabled: true
-            enabled: root.hasUi
-            onPressed: (mouse) => {
-                root.beginScrubAtX(mouse.x)
-                mouse.accepted = true
-            }
-            onPositionChanged: (mouse) => {
-                root.updateScrubAtX(mouse.x)
-            }
-            onReleased: (mouse) => {
-                root.endScrubAtX(mouse.x)
-            }
-            onCanceled: root.finishScrub()
-
-            ToolTip.visible: scrubMouse.containsMouse && root.hasUi
-            ToolTip.text: root.hasUi ? root.ui.recordTimecode(root.xToMs(scrubMouse.mouseX)) : ""
+        objectName: "scrubMouse"
+        anchors.fill: parent
+        hoverEnabled: true
+        enabled: root.hasUi
+        onPressed: (mouse) => {
+            root.beginScrubAtX(mouse.x)
+            mouse.accepted = true
         }
+        onPositionChanged: (mouse) => {
+            root.updateScrubAtX(mouse.x)
+        }
+        onReleased: (mouse) => {
+            root.endScrubAtX(mouse.x)
+        }
+        onCanceled: root.finishScrub()
+
+        ToolTip.visible: scrubMouse.containsMouse && root.hasUi
+        ToolTip.text: root.hasUi ? root.ui.recordTimecode(root.xToMs(scrubMouse.mouseX)) : ""
     }
 }

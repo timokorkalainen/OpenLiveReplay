@@ -34,6 +34,18 @@ TestCase {
         function recordTimecode(ms) { return String(ms) }
     }
 
+    QtObject {
+        id: uiWithoutPlaylistModel
+
+        property int recordedDurationMs: 61000
+        property int liveBufferMs: 1000
+        property int scrubPosition: 15000
+
+        function seekPlayback(ms) {}
+        function endScrubGesture() {}
+        function recordTimecode(ms) { return String(ms) }
+    }
+
     ScrubTimeline {
         id: timeline
         width: tc.width
@@ -43,8 +55,14 @@ TestCase {
     }
 
     function init() {
+        scrubPlaylistModel.clear()
+        scrubPlaylistModel.append({ "inMs": 10000, "outMs": 20000 })
+        mockUi.recordedDurationMs = 61000
+        mockUi.liveBufferMs = 1000
+        mockUi.scrubPosition = 15000
         mockUi.lastSeekMs = -1
         mockUi.endCount = 0
+        timeline.ui = mockUi
         timeline.dragging = false
         timeline.dragMs = 0
     }
@@ -66,5 +84,58 @@ TestCase {
         compare(mockUi.lastSeekMs, 30000)
         compare(mockUi.endCount, 1)
         verify(!timeline.dragging)
+    }
+
+    function test_mouseAreaCoversTheFullControlHeight() {
+        var mouseLayer = findChild(timeline, "scrubMouse")
+        verify(mouseLayer !== null)
+        compare(mouseLayer.width, timeline.width)
+        compare(mouseLayer.height, timeline.height)
+        tryCompare(mouseLayer, "enabled", true)
+    }
+
+    function test_openRegionAtRightEdgeStaysVisibleInsideTrack() {
+        scrubPlaylistModel.clear()
+        scrubPlaylistModel.append({ "inMs": 60000, "outMs": -1 })
+        wait(0)
+
+        var track = findChild(timeline, "track")
+        var region = findChild(timeline, "openRegion")
+        verify(track !== null)
+        verify(region !== null)
+        verify(region.durationAvailable)
+        compare(region.width, 2)
+        verify(region.x >= 0)
+        verify(region.x + region.width <= track.width)
+    }
+
+    function test_zeroDurationHidesLiveEdgeAndRegions() {
+        mockUi.recordedDurationMs = 1000
+        mockUi.liveBufferMs = 1000
+        scrubPlaylistModel.clear()
+        scrubPlaylistModel.append({ "inMs": 0, "outMs": -1 })
+        wait(0)
+
+        var liveEdge = findChild(timeline, "liveEdge")
+        var region = findChild(timeline, "openRegion")
+        verify(liveEdge !== null)
+        verify(region !== null)
+        compare(timeline.durMax, 0)
+        verify(!liveEdge.durationAvailable)
+        verify(!region.durationAvailable)
+        compare(timeline.xToMs(timeline.width), 0)
+    }
+
+    function test_nullUiAndMissingPlaylistModelAreSafe() {
+        timeline.ui = null
+        timeline.beginScrubAtX(timeline.width)
+        verify(timeline.dragging)
+        timeline.finishScrub()
+        compare(mockUi.endCount, 0)
+
+        timeline.ui = uiWithoutPlaylistModel
+        wait(0)
+        compare(Math.round(timeline.xToMs(timeline.width)), 60000)
+        compare(findChild(timeline, "closedRegion"), null)
     }
 }
