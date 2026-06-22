@@ -184,11 +184,13 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     } else {
         QList<FrameHandle> frames;
         for (int feed = 0; feed < m_feedCount; ++feed) {
-            if (sources.at(feed))
-                frames.append(*sources.at(feed));
-            else
+            const std::optional<FrameHandle>& source = sources.at(feed);
+            if (source.has_value()) {
+                frames.append(source.value());
+            } else {
                 frames.append(
                     placeholderVideoFrame(feed, out.sampledPlayheadMs, m_width, m_height));
+            }
         }
         out.video = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
         out.video.metadata().key.isPlaceholder = !anySourcePresent;

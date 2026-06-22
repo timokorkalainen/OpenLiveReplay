@@ -15,7 +15,7 @@ public:
     void collect(const QVector<FrameHandle>& frames, std::shared_ptr<GpuFence> fence);
     int drain(int timeoutMs, int* stalls = nullptr, int maxWaits = -1);
     void append(GpuFrameRetireQueue&& other);
-    void swap(GpuFrameRetireQueue& other);
+    void swap(GpuFrameRetireQueue& other) noexcept;
 
     int size() const { return static_cast<int>(m_entries.size()); }
     bool isEmpty() const { return m_entries.isEmpty(); }

@@ -58,6 +58,6 @@ void GpuFrameRetireQueue::append(GpuFrameRetireQueue&& other) {
     other.m_entries.clear();
 }
 
-void GpuFrameRetireQueue::swap(GpuFrameRetireQueue& other) {
+void GpuFrameRetireQueue::swap(GpuFrameRetireQueue& other) noexcept {
     m_entries.swap(other.m_entries);
 }

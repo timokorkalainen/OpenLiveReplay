@@ -56,7 +56,7 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta) {
-    return makeGpuFrameHandle(std::move(surface), std::move(rhi), std::move(meta), nullptr);
+    return makeGpuFrameHandle(std::move(surface), std::move(rhi), meta, nullptr);
 }
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,

@@ -67,7 +67,7 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 // fresh composite — a hash key could collide and emit a stale frame.
 struct MultiviewComposite {
     bool valid = false;
-    QVector<qint64> sourceKeys; // 3 entries per feed: present flag, selected pts, GPU generation
+    QVector<qint64> sourceKeys{}; // 3 entries per feed: present flag, selected pts, GPU generation
     FrameHandle video;
 };
 

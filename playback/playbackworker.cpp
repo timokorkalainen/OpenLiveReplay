@@ -1547,7 +1547,7 @@ bool PlaybackWorker::openPrerollContext() {
                     continue;
                 }
                 DecoderTrack* track = new DecoderTrack();
-                track->streamIndex = int(i);
+                track->streamIndex = static_cast<int>(i);
                 track->nativeDecoder =
                     std::make_unique<NativeVideoDecoder>(codecParams->width, codecParams->height);
                 track->h264ParamSets = params;
@@ -1577,7 +1577,7 @@ bool PlaybackWorker::openPrerollContext() {
             continue;
         }
         DecoderTrack* track = new DecoderTrack();
-        track->streamIndex = i;
+        track->streamIndex = static_cast<int>(i);
         track->codecCtx = cctx;
         track->provider = nullptr; // no live provider wiring for pre-roll
         track->feedIndex = feedIndex;
@@ -1608,7 +1608,7 @@ bool PlaybackWorker::openPrerollContext() {
             continue;
         }
         AudioDecoderTrack* aTrack = new AudioDecoderTrack();
-        aTrack->streamIndex = i;
+        aTrack->streamIndex = static_cast<int>(i);
         aTrack->codecCtx = cctx;
         aTrack->viewIndex = audioViewIdx;
         m_prerollAudioBank.append(aTrack);
@@ -2265,7 +2265,7 @@ void PlaybackWorker::run() {
                 }
 
                 AudioDecoderTrack* aTrack = new AudioDecoderTrack();
-                aTrack->streamIndex = i;
+                aTrack->streamIndex = static_cast<int>(i);
                 aTrack->codecCtx = ctx;
                 aTrack->viewIndex = audioViewIdx;
                 m_audioDecoderBank.append(aTrack);
@@ -2301,7 +2301,7 @@ void PlaybackWorker::run() {
             outputHeight = qMax(2, ref->codecHeight);
         }
     }
-    initializeOutputGraph(m_decoderBank.size(), outputWidth, outputHeight);
+    initializeOutputGraph(static_cast<int>(m_decoderBank.size()), outputWidth, outputHeight);
 
     // Tier3: open the SECOND (pre-roll) AVFormatContext on the same clip now
     // that the primary bank + output graph are up. On failure the armed-cut
@@ -2528,8 +2528,8 @@ void PlaybackWorker::run() {
                 m_counters.reverseChunkSeek++;
 
                 const int kReverseChunkBudget =
-                    int(std::ceil(double(kChunkMs) / qMax<int64_t>(1, frameDurMs()))) * trackCount *
-                    2;
+                    int(std::ceil(double(kChunkMs) / double(qMax<int64_t>(1, frameDurMs())))) *
+                    trackCount * 2;
                 int packets = 0;
                 while (!shouldInterrupt() && packets < kReverseChunkBudget) {
                     {
@@ -2609,7 +2609,7 @@ void PlaybackWorker::run() {
                 AudioFrameQueue::Frame af;
                 while (m_audioQueue.releaseDue(P, kAudioLeadMs, af)) {
                     m_audioPlayer->pushSamples(reinterpret_cast<const uint8_t*>(af.pcm.constData()),
-                                               af.pcm.size(), af.ptsMs, P);
+                                               static_cast<int>(af.pcm.size()), af.ptsMs, P);
                     m_counters.audioPushes++;
                 }
             } else {
