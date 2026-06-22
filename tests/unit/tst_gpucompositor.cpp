@@ -642,5 +642,5 @@ void TestGpuCompositor::gpuNv12HandleAliasesExistingSurface() {
 }
 #endif
 
-QTEST_MAIN(TestGpuCompositor)
+QTEST_GUILESS_MAIN(TestGpuCompositor)
 #include "tst_gpucompositor.moc"
