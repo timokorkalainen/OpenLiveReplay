@@ -5,18 +5,17 @@
 #include "playback/gpu/gpufence.h"
 
 #include <QList>
-#include <QMutex>
-#include <QMutexLocker>
 #include <QThread>
-#include <QWaitCondition>
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
 
 #include <d3d10_1.h>
 #include <d3d11.h>
 #include <array>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <wrl/client.h>
 
@@ -66,21 +65,23 @@ public:
         if (createD3D11Device(m_kind, &m_device, &m_context)) {
             handles.dev = m_device.Get();
             handles.context = m_context.Get();
-            rhi = QRhi::create(QRhi::D3D11, &params, {}, &handles);
+            QRhi* createdRhi = QRhi::create(QRhi::D3D11, &params, {}, &handles);
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                rhi = createdRhi;
+            }
         }
         {
-            QMutexLocker lock(&m_mutex);
+            std::lock_guard<std::mutex> lock(m_mutex);
             m_ready = true;
-            m_cond.wakeAll();
         }
+        m_cond.notify_all();
 
         while (true) {
             std::function<void()> job;
             {
-                QMutexLocker lock(&m_mutex);
-                while (m_jobs.isEmpty() && !m_stop) {
-                    m_cond.wait(&m_mutex);
-                }
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_cond.wait(lock, [&] { return !m_jobs.isEmpty() || m_stop; });
                 if (m_stop && m_jobs.isEmpty()) break;
                 job = m_jobs.takeFirst();
             }
@@ -94,43 +95,43 @@ public:
     }
 
     bool waitReady() {
-        QMutexLocker lock(&m_mutex);
-        while (!m_ready) {
-            m_cond.wait(&m_mutex);
-        }
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cond.wait(lock, [&] { return m_ready; });
         return rhi != nullptr;
     }
 
     bool invoke(std::function<void()> job) {
-        QMutexLocker lock(&m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex);
         if (m_stop) return false;
 
         bool done = false;
         m_jobs.append([&] {
             job();
-            QMutexLocker doneLock(&m_mutex);
-            done = true;
-            m_cond.wakeAll();
+            {
+                std::lock_guard<std::mutex> doneLock(m_mutex);
+                done = true;
+            }
+            m_cond.notify_all();
         });
-        m_cond.wakeAll();
-        while (!done) {
-            m_cond.wait(&m_mutex);
-        }
+        m_cond.notify_all();
+        m_cond.wait(lock, [&] { return done; });
         return true;
     }
 
     void requestStop() {
-        QMutexLocker lock(&m_mutex);
-        m_stop = true;
-        m_cond.wakeAll();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_cond.notify_all();
     }
 
 private:
     D3DDeviceKind m_kind = D3DDeviceKind::Hardware;
     ComPtr<ID3D11Device> m_device;
     ComPtr<ID3D11DeviceContext> m_context;
-    QMutex m_mutex;
-    QWaitCondition m_cond;
+    std::mutex m_mutex;
+    std::condition_variable m_cond;
     QList<std::function<void()>> m_jobs;
     bool m_ready = false;
     bool m_stop = false;

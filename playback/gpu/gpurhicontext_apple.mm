@@ -6,10 +6,7 @@
 #include "playback/output/formatcanon.h"
 
 #include <QList>
-#include <QMutex>
-#include <QMutexLocker>
 #include <QThread>
-#include <QWaitCondition>
 #include <QtGlobal>
 
 #include <CoreVideo/CoreVideo.h>
@@ -18,8 +15,10 @@
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
 
+#include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <utility>
 
 namespace {
@@ -149,20 +148,19 @@ public:
         default:
             break;
         }
-        rhi = params ? QRhi::create(m_backend, params) : nullptr;
+        QRhi* createdRhi = params ? QRhi::create(m_backend, params) : nullptr;
         {
-            QMutexLocker lock(&m_mutex);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            rhi = createdRhi;
             m_ready = true;
-            m_cond.wakeAll();
         }
+        m_cond.notify_all();
 
         while (true) {
             std::function<void()> job;
             {
-                QMutexLocker lock(&m_mutex);
-                while (m_jobs.isEmpty() && !m_stop) {
-                    m_cond.wait(&m_mutex);
-                }
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_cond.wait(lock, [&] { return !m_jobs.isEmpty() || m_stop; });
                 if (m_stop && m_jobs.isEmpty()) break;
                 job = m_jobs.takeFirst();
             }
@@ -174,41 +172,41 @@ public:
     }
 
     bool waitReady() {
-        QMutexLocker lock(&m_mutex);
-        while (!m_ready) {
-            m_cond.wait(&m_mutex);
-        }
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cond.wait(lock, [&] { return m_ready; });
         return rhi != nullptr;
     }
 
     bool invoke(std::function<void()> job) {
-        QMutexLocker lock(&m_mutex);
+        std::unique_lock<std::mutex> lock(m_mutex);
         if (m_stop) return false;
 
         bool done = false;
         m_jobs.append([&] {
             job();
-            QMutexLocker doneLock(&m_mutex);
-            done = true;
-            m_cond.wakeAll();
+            {
+                std::lock_guard<std::mutex> doneLock(m_mutex);
+                done = true;
+            }
+            m_cond.notify_all();
         });
-        m_cond.wakeAll();
-        while (!done) {
-            m_cond.wait(&m_mutex);
-        }
+        m_cond.notify_all();
+        m_cond.wait(lock, [&] { return done; });
         return true;
     }
 
     void requestStop() {
-        QMutexLocker lock(&m_mutex);
-        m_stop = true;
-        m_cond.wakeAll();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stop = true;
+        }
+        m_cond.notify_all();
     }
 
 private:
     QRhi::Implementation m_backend = QRhi::Null;
-    QMutex m_mutex;
-    QWaitCondition m_cond;
+    std::mutex m_mutex;
+    std::condition_variable m_cond;
     QList<std::function<void()>> m_jobs;
     bool m_ready = false;
     bool m_stop = false;
