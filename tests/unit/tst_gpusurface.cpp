@@ -37,6 +37,7 @@ private slots:
 #ifdef __APPLE__
     void appleSurfaceIsIoSurfaceBacked();
     void appleSurfaceRespectsInjectedAllocFailure();
+    void appleSurfaceTracksPendingFence();
 #endif
 };
 
@@ -93,6 +94,18 @@ void TestGpuSurface::appleSurfaceRespectsInjectedAllocFailure() {
     QVERIFY(fail == nullptr);
     auto ok = makeAppleNv12Surface(64, 48);
     QVERIFY(ok != nullptr);
+}
+
+void TestGpuSurface::appleSurfaceTracksPendingFence() {
+    auto surface = makeAppleNv12Surface(64, 48);
+    QVERIFY(surface != nullptr);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(0));
+    surface->retainUntilFenceRetired(7);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(7));
+    surface->retainUntilFenceRetired(3);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(7));
+    surface->retainUntilFenceRetired(9);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(9));
 }
 #endif
 

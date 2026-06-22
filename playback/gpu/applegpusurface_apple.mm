@@ -7,6 +7,7 @@
 #include <CoreVideo/CoreVideo.h>
 #include <IOSurface/IOSurface.h>
 
+#include <atomic>
 #include <cstring>
 #include <memory>
 
@@ -55,8 +56,21 @@ public:
         return m_pixelBuffer ? CVPixelBufferGetIOSurface(m_pixelBuffer) : nullptr;
     }
 
+    void retainUntilFenceRetired(uint64_t fenceValue) override {
+        uint64_t previous = m_pendingFence.load(std::memory_order_acquire);
+        while (fenceValue > previous &&
+               !m_pendingFence.compare_exchange_weak(previous, fenceValue,
+                                                      std::memory_order_acq_rel)) {
+        }
+    }
+
+    uint64_t pendingFenceValue() const override {
+        return m_pendingFence.load(std::memory_order_acquire);
+    }
+
 private:
     CVPixelBufferRef m_pixelBuffer = nullptr;
+    std::atomic<uint64_t> m_pendingFence{0};
 };
 
 CFDictionaryRef makeIoSurfacePixelBufferAttributes() {
