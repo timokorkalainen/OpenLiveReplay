@@ -2,6 +2,31 @@
 
 #include "playback/output/outputbusengine.h"
 
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpucompositor.h"
+#include "playback/gpu/gpurhicontext.h"
+#endif
+
+class ScopedEnv {
+public:
+    ScopedEnv(const char* name, const QByteArray& value)
+        : m_name(name), m_hadValue(qEnvironmentVariableIsSet(name)), m_previous(qgetenv(name)) {
+        qputenv(m_name, value);
+    }
+
+    ~ScopedEnv() {
+        if (m_hadValue)
+            qputenv(m_name, m_previous);
+        else
+            qunsetenv(m_name);
+    }
+
+private:
+    const char* m_name = nullptr;
+    bool m_hadValue = false;
+    QByteArray m_previous;
+};
+
 static FrameHandle video(int feed, qint64 pts, uchar y) {
     FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
     f.metadata().key.feedIndex = feed;
@@ -51,6 +76,10 @@ private slots:
     void multiviewVideoIdentityTracksSourceContentNotPlayhead();
     void multiviewMemoReusesCompositeForUnchangedSources();
     void multiviewMemoMatchesUnmemoizedCompositeForDistinctSources();
+    void multiviewUsesCpuCompositorWithoutInjectedGpuCompositor();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void multiviewUsesInjectedGpuCompositorWhenEnabled();
+#endif
     void programmeTimecodeTracksPlayheadOnEveryBus();
     void staleGpuFeedAndPgmFramesArePlaceholders();
     void staleGpuMultiviewSourcesAreComposedAsAbsent();
@@ -333,6 +362,64 @@ void TestOutputBusEngine::multiviewMemoMatchesUnmemoizedCompositeForDistinctSour
     QCOMPARE(memoizedVideo.planeV, plainVideo.planeV);
     QCOMPARE(memoized.identity.videoHash, plain.identity.videoHash);
 }
+
+void TestOutputBusEngine::multiviewUsesCpuCompositorWithoutInjectedGpuCompositor() {
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 100, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    const auto multiview = engine.renderMultiview(5, state, cache, nullptr);
+    QCOMPARE(multiview.video.metadata().key.format, FramePixelFormat::Yuv420p);
+
+    const MediaVideoFrameView view(multiview.video);
+    QVERIFY(view.isValid());
+    QCOMPARE(uchar(view.planeY.at(0)), uchar(10));
+    QCOMPARE(uchar(view.planeY.at(4)), uchar(20));
+}
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+void TestOutputBusEngine::multiviewUsesInjectedGpuCompositorWhenEnabled() {
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 100, 20));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto multiview = engine.renderMultiview(5, state, cache, &memo);
+    QVERIFY(!multiview.video.isNull());
+    QCOMPARE(multiview.video.metadata().key.format, FramePixelFormat::Rgba8);
+    QCOMPARE(multiview.video.metadata().key.width, 8);
+    QCOMPARE(multiview.video.metadata().key.height, 8);
+    QVERIFY(memo.valid);
+
+    const CpuPlanes rgba = multiview.video.readToCpu(FramePixelFormat::Rgba8);
+    QVERIFY(rgba.isValid());
+    QCOMPARE(rgba.format, FramePixelFormat::Rgba8);
+    QCOMPARE(rgba.width, 8);
+    QCOMPARE(rgba.height, 8);
+}
+#endif
 
 // Every output bus stamps a programme timecode = playhead position in 100 ns units, so a
 // timecode-carrying sink (NDI) can pass it downstream. Asserted on feed / pgm / multiview.

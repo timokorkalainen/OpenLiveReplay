@@ -456,8 +456,11 @@ endif()
 if(OLR_GPU_PIPELINE)
     target_compile_definitions(OpenLiveReplay PRIVATE OLR_GPU_PIPELINE_BUILD=1)
     target_link_libraries(OpenLiveReplay PRIVATE Qt6::GuiPrivate)
+    target_sources(OpenLiveReplay PRIVATE
+        playback/gpu/gpucompositor.h playback/gpu/gpucompositor.cpp)
     if(APPLE)
         target_sources(OpenLiveReplay PRIVATE
+            playback/gpu/gpucompositor_apple.mm
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_apple.mm
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
             playback/gpu/gpuframeretirequeue.h playback/gpu/gpuframeretirequeue.cpp
@@ -480,6 +483,14 @@ if(OLR_GPU_PIPELINE)
             target_sources(OpenLiveReplay PRIVATE playback/gpu/gpufence_win.cpp)
         endif()
     endif()
+    qt_add_shaders(OpenLiveReplay "olr_grid_shaders"
+        PREFIX "/olr/shaders"
+        BASE "${CMAKE_SOURCE_DIR}/playback/gpu/shaders"
+        GLSL "330,440"
+        FILES
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid.vert"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_nn.frag"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_quality.frag")
 endif()
 
 # 4. Handle Platform Specifics (FFmpeg)

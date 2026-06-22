@@ -1,8 +1,14 @@
 #include "playback/output/outputbusengine.h"
 
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpucompositor.h"
+#include "playback/gpu/gpupipelineconfig.h"
+#endif
 #include "playback/output/yuv420pcompositor.h"
 
 #include <QList>
+
+#include <utility>
 
 namespace {
 
@@ -121,6 +127,10 @@ int OutputBusEngine::audioSamplesPerFrame() const {
     return audioSamplesForOutputFrame(0);
 }
 
+void OutputBusEngine::setGpuCompositor(std::shared_ptr<GpuCompositor> compositor) {
+    m_gpuCompositor = std::move(compositor);
+}
+
 OutputBusFrame OutputBusEngine::renderFeed(int feedIndex, qint64 outputFrameIndex,
                                            const PlaybackStateSnapshot& state,
                                            const OutputFrameCache& cache) const {
@@ -192,13 +202,25 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
                     placeholderVideoFrame(feed, out.sampledPlayheadMs, m_width, m_height));
             }
         }
-        out.video = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
-        out.video.metadata().key.isPlaceholder = !anySourcePresent;
-        if (memo) {
-            memo->valid = true;
-            memo->sourceKeys = sourceKeys;
-            memo->video = out.video;
+        FrameHandle composed;
+#ifdef OLR_GPU_PIPELINE_BUILD
+        if (m_gpuCompositor && m_gpuCompositor->isValid() && gpuPipelineEnabled()) {
+            ColorMetadata color;
+            composed = m_gpuCompositor->composeGridMemoized(frames, m_width, m_height, color,
+                                                            GpuCompositor::ScaleQuality::Bilinear,
+                                                            sourceKeys, memo);
         }
+#endif
+        if (composed.isNull()) {
+            composed = Yuv420pCompositor::composeGrid(frames, m_width, m_height);
+            if (memo) {
+                memo->valid = true;
+                memo->sourceKeys = sourceKeys;
+                memo->video = composed;
+            }
+        }
+        out.video = composed;
+        out.video.metadata().key.isPlaceholder = !anySourcePresent;
     }
 
     // Identity must reflect the composited source content, not the advancing playhead,
@@ -227,6 +249,20 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     if (feedIndex >= 0 && feedIndex < m_feedCount) {
         out.video = freshVideoFrameOrPlaceholder(cache, feedIndex, out.sampledPlayheadMs, m_width,
                                                  m_height, state.gpuGeneration);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        if (bus == OutputBusId::pgm() && m_gpuCompositor && m_gpuCompositor->isValid() &&
+            gpuPipelineEnabled()) {
+            ColorMetadata color;
+            FrameHandle gpu = m_gpuCompositor->composePgm(out.video, m_width, m_height, color,
+                                                          GpuCompositor::ScaleQuality::Bilinear);
+            if (!gpu.isNull()) {
+                gpu.metadata().key.feedIndex = out.video.metadata().key.feedIndex;
+                gpu.metadata().key.ptsMs = out.video.metadata().key.ptsMs;
+                gpu.metadata().key.isPlaceholder = out.video.metadata().key.isPlaceholder;
+                out.video = gpu;
+            }
+        }
+#endif
     } else {
         out.video = placeholderVideoFrame(feedIndex, out.sampledPlayheadMs, m_width, m_height);
     }
