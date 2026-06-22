@@ -35,8 +35,26 @@ UDP_PORT=$((SRT_PORT + 1))
 
 # shellcheck source=tests/e2e/srt_lib.sh
 . "$(cd "$(dirname "$0")" && pwd)/srt_lib.sh"
-srt_require_tools  # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit present
-olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit 0; }
+
+PB_SKIP_RC=0
+
+case "$SCENARIO" in
+    gpucapstress)
+        PB_SKIP_RC=77
+        export SRT_SKIP_CODE=77
+        case "${OLR_GPU_PIPELINE:-}" in
+            1|true|TRUE|on|ON) ;;
+            *)
+                echo "SKIP: gpucapstress requires OLR_GPU_PIPELINE=1"
+                exit 77
+                ;;
+        esac
+        export OLR_GPU_FORCE_BUDGET="${OLR_GPU_FORCE_BUDGET:-12}"
+        ;;
+esac
+
+srt_require_tools  # SKIP unless ffmpeg/ffprobe/srt-live-transmit present.
+olr_h264_vcodec_args || { echo "SKIP: ffmpeg has no usable H.264 encoder"; exit "$PB_SKIP_RC"; }
 
 # Record long enough that every scenario's playback window stays inside the
 # fixture (play1x plays ~12s from t=0; liveedge/seekplay reach ~mid/late).
@@ -52,19 +70,6 @@ cleanup() {
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
-
-case "$SCENARIO" in
-    gpucapstress)
-        case "${OLR_GPU_PIPELINE:-}" in
-            1|true|TRUE|on|ON) ;;
-            *)
-                echo "SKIP: gpucapstress requires OLR_GPU_PIPELINE=1"
-                exit 77
-                ;;
-        esac
-        export OLR_GPU_FORCE_BUDGET="${OLR_GPU_FORCE_BUDGET:-12}"
-        ;;
-esac
 
 # H.264-HW availability probe: required for scenarios that record an H.264
 # fixture. Exit 77 (SKIP_RETURN_CODE) if the hardware encoder is unavailable so
@@ -734,6 +739,30 @@ case "$SCENARIO" in
         fi
         if ! num "$armNextCutArmed" || [ "$armNextCutArmed" -ne 1 ]; then
             echo "FAIL: gpucapstress armNextCut did not arm (armNextCutArmed=$armNextCutArmed, expected 1)"
+            fail=1
+        fi
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 1 ]; then
+            echo "FAIL: gpucapstress armed cut did not fire exactly once (cutsFired=$cutsFired, expected 1)"
+            fail=1
+        fi
+        if ! num "$stagingVideoFramesDecoded" || [ "$stagingVideoFramesDecoded" -lt 15 ]; then
+            echo "FAIL: gpucapstress staged too few cut frames (stagingVideoFramesDecoded=$stagingVideoFramesDecoded, expected >=15)"
+            fail=1
+        fi
+        if ! num "$cutFollowReposition" || [ "$cutFollowReposition" -ne 0 ]; then
+            echo "FAIL: gpucapstress cut used decoder-follow reposition (cutFollowReposition=$cutFollowReposition, expected 0)"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 2 ]; then
+            echo "FAIL: gpucapstress repositioned too much (reposition=$reposition, expected <=2 for explicit seek/warmup only)"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: gpucapstress clock diverged after seek/cut (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500)"
+            fail=1
+        fi
+        if ! num "$maxBoundaryLandingErrMs" || [ "$maxBoundaryLandingErrMs" -gt 80 ]; then
+            echo "FAIL: gpucapstress cut landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80)"
             fail=1
         fi
         if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -lt 60 ]; then

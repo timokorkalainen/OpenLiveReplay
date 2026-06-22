@@ -14,6 +14,14 @@ inline int64_t visiblePlayheadMs(int64_t transportPlayheadMs, int64_t committedP
     if (committedGen != seekGen) return committedPlayheadMs;
     return transportPlayheadMs;
 }
+
+inline int64_t bookmarkedVisiblePlayheadMs(int64_t currentBookmarkMs, int64_t visiblePlayheadMs,
+                                           int64_t cacheCoveredPlayheadMs, bool cacheCovered,
+                                           uint64_t committedGen, uint64_t seekGen) {
+    if (committedGen != seekGen || !cacheCovered) return currentBookmarkMs;
+    if (cacheCoveredPlayheadMs > visiblePlayheadMs) return currentBookmarkMs;
+    return cacheCoveredPlayheadMs;
+}
 } // namespace CommitGate
 
 #endif // COMMITGATE_H

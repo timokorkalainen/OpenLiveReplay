@@ -2,8 +2,11 @@
 
 #include "playback/gpu/decodedonefence.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpuframeretirequeue.h"
 #include "playback/gpu/gpugeneration.h"
+#include "playback/gpu/gpusurface.h"
 #include "playback/output/framehandle.h"
+#include "playback/trackbuffer.h"
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
 #include "playback/gpu/gpuframedata.h"
@@ -21,8 +24,71 @@ private slots:
     void concurrentEvictWhileRenderNeverFreesInUse();
     void seekUnderDecodeInvalidatesStaleSurfaces();
 #endif
+    void capEvictionRetireQueueHoldsGpuFramesUntilFenceCompletes();
     void stubFenceStressIsRaceFree();
 };
+
+namespace {
+
+class StressGpuSurface final : public GpuSurface {
+public:
+    explicit StressGpuSurface(uint64_t pendingFence) : m_pendingFence(pendingFence) {}
+
+    GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 4, 4}; }
+    bool isValid() const override { return true; }
+    void* nativeHandle() const override { return nullptr; }
+    uint64_t pendingFenceValue() const override { return m_pendingFence; }
+
+private:
+    uint64_t m_pendingFence = 0;
+};
+
+class StressGpuFrameData final : public IFrameData {
+public:
+    explicit StressGpuFrameData(std::shared_ptr<StressGpuSurface> surface)
+        : m_surface(std::move(surface)) {}
+
+    bool isGpuBacked() const override { return true; }
+    CpuPlanes readToCpu(FramePixelFormat) const override { return {}; }
+    GpuSurface* gpuSurface() const override { return m_surface.get(); }
+    FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
+
+private:
+    std::shared_ptr<StressGpuSurface> m_surface;
+};
+
+class StressFence final : public GpuFence {
+public:
+    uint64_t signal() override { return ++m_completedValue; }
+    bool wait(uint64_t value, int) override {
+        waitCalls++;
+        return m_completedValue >= value;
+    }
+    uint64_t completedValue() const override { return m_completedValue; }
+
+    void complete(uint64_t value) { m_completedValue = value; }
+
+    int waitCalls = 0;
+
+private:
+    uint64_t m_completedValue = 0;
+};
+
+FrameHandle makeStressGpuFrame(int feed, qint64 ptsMs, uint64_t pendingFence,
+                               std::weak_ptr<const IFrameData>* weakData = nullptr) {
+    auto data = std::static_pointer_cast<const IFrameData>(
+        std::make_shared<StressGpuFrameData>(std::make_shared<StressGpuSurface>(pendingFence)));
+    if (weakData) *weakData = data;
+    FrameMetadata meta;
+    meta.key.feedIndex = feed;
+    meta.key.ptsMs = ptsMs;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 4;
+    meta.key.height = 4;
+    return FrameHandle(std::move(data), meta);
+}
+
+} // namespace
 
 #ifdef __APPLE__
 void TestGpuSyncStress::concurrentEvictWhileRenderNeverFreesInUse() {
@@ -97,6 +163,47 @@ void TestGpuSyncStress::seekUnderDecodeInvalidatesStaleSurfaces() {
     QVERIFY(!stalePresented.load(std::memory_order_acquire));
 }
 #endif
+
+void TestGpuSyncStress::capEvictionRetireQueueHoldsGpuFramesUntilFenceCompletes() {
+    constexpr int kFeeds = 4;
+    constexpr uint64_t kFenceValue = 7;
+    auto fence = std::make_shared<StressFence>();
+    GpuFrameRetireQueue retireQueue;
+    QVector<std::weak_ptr<const IFrameData>> evictedData;
+
+    for (int feed = 0; feed < kFeeds; ++feed) {
+        TrackBuffer buffer;
+        std::weak_ptr<const IFrameData> weak;
+        QVERIFY(buffer.insert(0, makeStressGpuFrame(feed, 0, kFenceValue, &weak), /*capFrames*/ 2,
+                              /*keepNearMs*/ 0, /*protectToMs*/ 40));
+        QVERIFY(buffer.insert(40, makeStressGpuFrame(feed, 40, kFenceValue), /*capFrames*/ 2,
+                              /*keepNearMs*/ 0, /*protectToMs*/ 40));
+
+        TrackBuffer::EvictedFrames evicted;
+        QVERIFY(buffer.insert(80, makeStressGpuFrame(feed, 80, kFenceValue), /*capFrames*/ 2,
+                              /*keepNearMs*/ 80, /*protectToMs*/ 120, &evicted));
+        QCOMPARE(evicted.size(), 1);
+        evictedData.append(weak);
+        for (const TrackBuffer::Frame& frame : evicted)
+            retireQueue.collect(frame.frame, fence);
+    }
+
+    int stalls = 0;
+    QCOMPARE(retireQueue.drain(0, &stalls), 0);
+    QCOMPARE(stalls, kFeeds);
+    QCOMPARE(retireQueue.size(), kFeeds);
+    QVERIFY(fence->waitCalls >= kFeeds);
+    for (const auto& weak : evictedData)
+        QVERIFY(!weak.expired());
+
+    fence->complete(kFenceValue);
+    stalls = 0;
+    QCOMPARE(retireQueue.drain(0, &stalls), kFeeds);
+    QCOMPARE(stalls, 0);
+    QCOMPARE(retireQueue.size(), 0);
+    for (const auto& weak : evictedData)
+        QVERIFY(weak.expired());
+}
 
 void TestGpuSyncStress::stubFenceStressIsRaceFree() {
     auto fence = GpuFence::create();

@@ -605,19 +605,30 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     // transport playhead so 1x playback advances every tick; while a reposition
     // for the latest seek is in flight it holds the last committed playhead so
     // the snapshot never reports a new playhead against a not-yet-ready cache.
+    snapshot.state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
+    if (snapshot.state.selectedFeedIndex < 0 && m_outputFeedCount > 0)
+        snapshot.state.selectedFeedIndex = 0;
+
     const qint64 transportPlayhead = m_transport ? m_transport->currentPos() : 0;
     const qint64 committedPlayhead = m_committedPlayheadMs.load(std::memory_order_acquire);
     const uint64_t committedGen = m_committedGeneration.load(std::memory_order_acquire);
     const uint64_t seekGen = m_seekGeneration.load(std::memory_order_acquire);
     snapshot.state.playheadMs =
         CommitGate::visiblePlayheadMs(transportPlayhead, committedPlayhead, committedGen, seekGen);
-    if (committedGen == seekGen)
-        m_lastVisiblePlayheadMs.store(snapshot.state.playheadMs, std::memory_order_release);
+    if (committedGen == seekGen) {
+        const std::optional<FrameHandle> cachedFrame = snapshot.cache.videoFrameAt(
+            snapshot.state.selectedFeedIndex, snapshot.state.playheadMs);
+        const bool cacheCovered =
+            cachedFrame.has_value() && !cachedFrame->metadata().key.isPlaceholder;
+        const qint64 coveredPlayhead =
+            cacheCovered ? cachedFrame->metadata().key.ptsMs : snapshot.state.playheadMs;
+        const qint64 bookmark = CommitGate::bookmarkedVisiblePlayheadMs(
+            m_lastVisiblePlayheadMs.load(std::memory_order_acquire), snapshot.state.playheadMs,
+            coveredPlayhead, cacheCovered, committedGen, seekGen);
+        m_lastVisiblePlayheadMs.store(bookmark, std::memory_order_release);
+    }
     snapshot.state.playing = m_transport && m_transport->isPlaying();
     snapshot.state.speed = m_transport ? m_transport->speed() : 1.0;
-    snapshot.state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
-    if (snapshot.state.selectedFeedIndex < 0 && m_outputFeedCount > 0)
-        snapshot.state.selectedFeedIndex = 0;
     return snapshot;
 }
 

@@ -21,9 +21,10 @@ SRT_LAST_PID=""
 
 # SKIP (exit 0) unless ffmpeg/ffprobe/srt-live-transmit are all present.
 srt_require_tools() {
-    command -v ffmpeg            >/dev/null || { echo "SKIP: ffmpeg not found";  exit 0; }
-    command -v ffprobe           >/dev/null || { echo "SKIP: ffprobe not found"; exit 0; }
-    command -v srt-live-transmit >/dev/null || { echo "SKIP: srt-live-transmit not found (brew install srt)"; exit 0; }
+    local skip_code="${SRT_SKIP_CODE:-0}"
+    command -v ffmpeg            >/dev/null || { echo "SKIP: ffmpeg not found";  exit "$skip_code"; }
+    command -v ffprobe           >/dev/null || { echo "SKIP: ffprobe not found"; exit "$skip_code"; }
+    command -v srt-live-transmit >/dev/null || { echo "SKIP: srt-live-transmit not found (brew install srt)"; exit "$skip_code"; }
 }
 
 # SRT caller URL for a local listener port. $1=srt_port
