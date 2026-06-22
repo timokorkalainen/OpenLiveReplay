@@ -84,6 +84,6 @@ QtObject {
     readonly property int minWCombo: 110
 
     // --- Window floors ---
-    readonly property int windowMinW: 720
-    readonly property int windowMinH: 520
+    readonly property int windowMinW: 480
+    readonly property int windowMinH: 480
 }

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import "../../ui/components"
 import OlrTheme
 
 // Throwaway preview harness: renders the bespoke OlrStyle controls + mock broadcast
@@ -128,6 +129,41 @@ Rectangle {
                             Label { text: modelData.sp; color: Theme.armed; font.pixelSize: Theme.fsMicro; font.family: Theme.fontMono }
                             Label { text: modelData.d; color: Theme.textBody; font.family: Theme.fontMono }
                             Label { text: modelData.st; color: modelData.c === "transparent" ? Theme.textDim : modelData.c; font.pixelSize: Theme.fsMicro; font.family: Theme.fontMono }
+                        }
+                    }
+                }
+            }
+
+            Label { text: "COCKPIT SHELL"; color: Theme.textDim; font.pixelSize: Theme.fsMicro; font.weight: Font.DemiBold }
+            Item {
+                id: cockpitThumbnail
+
+                Layout.fillWidth: true
+                Layout.preferredHeight: 150
+                clip: true
+                property real previewScale: Math.min(width / cockpitPreview.width, height / cockpitPreview.height)
+
+                Item {
+                    id: cockpitPreview
+
+                    width: 840
+                    height: 420
+                    scale: cockpitThumbnail.previewScale
+                    transformOrigin: Item.TopLeft
+
+                    Rectangle {
+                        anchors.fill: parent
+                        color: Theme.canvas
+                        border.color: Theme.line
+                        border.width: 1
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            spacing: 0
+
+                            StatusStrip { Layout.fillWidth: true }
+                            PgmStage { Layout.fillWidth: true; Layout.fillHeight: true }
+                            TransportDock { Layout.fillWidth: true }
                         }
                     }
                 }
