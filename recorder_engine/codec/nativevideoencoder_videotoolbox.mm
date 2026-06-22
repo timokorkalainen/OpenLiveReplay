@@ -156,11 +156,14 @@ NativeVideoEncoder::~NativeVideoEncoder() = default;
 
 std::unique_ptr<NativeVideoEncoder> NativeVideoEncoder::create(const Config& cfg, QString* error) {
     auto enc = std::unique_ptr<VideoToolboxEncoder>(new VideoToolboxEncoder());
-    const void* ek[] = {kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder};
-    const void* ev[] = {kCFBooleanTrue};
-    CFDictionaryRef spec = CFDictionaryCreate(kCFAllocatorDefault, ek, ev, 1,
-                                              &kCFTypeDictionaryKeyCallBacks,
-                                              &kCFTypeDictionaryValueCallBacks);
+    CFDictionaryRef spec = nullptr;
+    if (@available(iOS 17.4, tvOS 17.4, visionOS 1.1, *)) {
+        const void* ek[] = {kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder};
+        const void* ev[] = {kCFBooleanTrue};
+        spec = CFDictionaryCreate(kCFAllocatorDefault, ek, ev, 1,
+                                  &kCFTypeDictionaryKeyCallBacks,
+                                  &kCFTypeDictionaryValueCallBacks);
+    }
     OSStatus st = VTCompressionSessionCreate(kCFAllocatorDefault, cfg.width, cfg.height,
                                              kCMVideoCodecType_H264, spec, nullptr, nullptr,
                                              compressionOutputCallback, enc.get(), &enc->session);

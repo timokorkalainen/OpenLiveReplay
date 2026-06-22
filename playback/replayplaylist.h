@@ -24,7 +24,7 @@ public:
     int insertEntry(int index, const ReplayEntry& entry);
     bool moveEntry(int fromIndex, int toIndex);
     bool setEntryRange(int index, qint64 inMs, qint64 outMs);
-    int count() const { return m_entries.size(); }
+    int count() const { return static_cast<int>(m_entries.size()); }
     QVector<ReplayEntry> entries() const { return m_entries; } // snapshot for playout
     void clear();
 

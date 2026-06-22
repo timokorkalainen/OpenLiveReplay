@@ -10,6 +10,8 @@ private slots:
     void emptyInputsYieldEmpty();
     void buildsWellFormedRecord();
     void multipleParameterSets();
+    void rejectsNalPayloadsTooLargeForAvccLengthField();
+    void rejectsParameterSetCountsTooLargeForAvccFields();
     void parseAvccRoundTrips();
 };
 
@@ -91,6 +93,27 @@ void TestAvcc::multipleParameterSets() {
     int pps2Len = (quint8(avcc[offset]) << 8) | quint8(avcc[offset + 1]);
     QCOMPARE(pps2Len, pps2.size());
     QCOMPARE(avcc.mid(offset + 2, pps2.size()), pps2);
+}
+
+void TestAvcc::rejectsNalPayloadsTooLargeForAvccLengthField() {
+    QByteArray oversizedSps(0x10000, char(0x67));
+    oversizedSps[1] = char(0x42);
+    oversizedSps[2] = char(0x00);
+    oversizedSps[3] = char(0x1f);
+    const QByteArray sps = QByteArrayLiteral("\x67\x42\x00\x1f\x8c\x8d\x40");
+    const QByteArray pps = QByteArrayLiteral("\x68\xce\x3c\x80");
+    const QByteArray oversizedPps(0x10000, char(0x68));
+
+    QVERIFY(buildAvcCFromParameterSets({oversizedSps}, {pps}).isEmpty());
+    QVERIFY(buildAvcCFromParameterSets({sps}, {oversizedPps}).isEmpty());
+}
+
+void TestAvcc::rejectsParameterSetCountsTooLargeForAvccFields() {
+    const QByteArray sps = QByteArrayLiteral("\x67\x42\x00\x1f\x8c\x8d\x40");
+    const QByteArray pps = QByteArrayLiteral("\x68\xce\x3c\x80");
+
+    QVERIFY(buildAvcCFromParameterSets(QList<QByteArray>(32, sps), {pps}).isEmpty());
+    QVERIFY(buildAvcCFromParameterSets({sps}, QList<QByteArray>(256, pps)).isEmpty());
 }
 
 void TestAvcc::parseAvccRoundTrips() {

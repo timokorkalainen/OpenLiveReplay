@@ -678,9 +678,14 @@ bool NativeRtmpIngestSession::readMessage(RtmpMessage* message, QString* error) 
 bool NativeRtmpIngestSession::sendMessage(int chunkStreamId, int messageType, int messageStreamId,
                                           qint64 timestampMs, const QByteArray& payload,
                                           QString* error) {
-    return writeFully(RtmpChunkWriter::message(chunkStreamId, messageType, messageStreamId,
-                                               timestampMs, payload, m_outputChunkSize),
-                      error);
+    const QByteArray bytes = RtmpChunkWriter::message(chunkStreamId, messageType, messageStreamId,
+                                                      timestampMs, payload, m_outputChunkSize);
+    if (bytes.isEmpty()) {
+        if (error) *error = QStringLiteral("Native RTMP outgoing message is too large.");
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
+        return false;
+    }
+    return writeFully(bytes, error);
 }
 
 bool NativeRtmpIngestSession::readFully(char* data, qsizetype size, QString* error) {
@@ -1144,7 +1149,7 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
         return;
     }
 
-    const QByteArray header = RtmpFlv::adtsHeader(m_aacConfig, aacPayload.size());
+    const QByteArray header = RtmpFlv::adtsHeader(m_aacConfig, static_cast<int>(aacPayload.size()));
     if (header.isEmpty()) {
         return;
     }

@@ -73,7 +73,7 @@ void FrameProvider::removeVideoSink(QVideoSink *sink)
     if (!sink) return;
 
     QMutexLocker locker(&m_sinkMutex);
-    for (int i = m_sinks.size() - 1; i >= 0; --i) {
+    for (qsizetype i = m_sinks.size() - 1; i >= 0; --i) {
         if (!m_sinks[i] || m_sinks[i] == sink) {
             m_sinks.removeAt(i);
         }

@@ -30,9 +30,9 @@ QList<TelemetryEvent> SseParser::push(const QByteArray &chunk) {
 QList<TelemetryEvent> SseParser::parseBufferedEvents() {
     QList<TelemetryEvent> events;
     for (;;) {
-        int sep = m_buffer.indexOf("\n\n");
-        int sepLen = 2;
-        const int crlfSep = m_buffer.indexOf("\r\n\r\n");
+        qsizetype sep = m_buffer.indexOf("\n\n");
+        qsizetype sepLen = 2;
+        const qsizetype crlfSep = m_buffer.indexOf("\r\n\r\n");
         if (crlfSep >= 0 && (sep < 0 || crlfSep < sep)) {
             sep = crlfSep;
             sepLen = 4;
@@ -64,7 +64,7 @@ void SseParser::parseEventBlock(const QByteArray &block, QList<TelemetryEvent> *
         if (line.endsWith('\r')) line.chop(1);
         if (line.isEmpty() || line.startsWith(':')) continue;
 
-        const int colon = line.indexOf(':');
+        const qsizetype colon = line.indexOf(':');
         const QByteArray field = colon >= 0 ? line.left(colon) : line;
         QByteArray value = colon >= 0 ? line.mid(colon + 1) : QByteArray();
         if (value.startsWith(' ')) value.remove(0, 1);

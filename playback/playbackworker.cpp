@@ -1970,7 +1970,7 @@ void PlaybackWorker::run() {
             outputHeight = qMax(2, ref->codecHeight);
         }
     }
-    initializeOutputGraph(m_decoderBank.size(), outputWidth, outputHeight);
+    initializeOutputGraph(static_cast<int>(m_decoderBank.size()), outputWidth, outputHeight);
 
     // Tier3: open the SECOND (pre-roll) AVFormatContext on the same clip now
     // that the primary bank + output graph are up. On failure the armed-cut
@@ -2266,7 +2266,7 @@ void PlaybackWorker::run() {
                 AudioFrameQueue::Frame af;
                 while (m_audioQueue.releaseDue(P, kAudioLeadMs, af)) {
                     m_audioPlayer->pushSamples(reinterpret_cast<const uint8_t*>(af.pcm.constData()),
-                                               af.pcm.size(), af.ptsMs, P);
+                                               static_cast<int>(af.pcm.size()), af.ptsMs, P);
                     m_counters.audioPushes++;
                 }
             } else {

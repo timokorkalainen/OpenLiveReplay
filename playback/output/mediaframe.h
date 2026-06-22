@@ -52,7 +52,7 @@ struct MediaAudioFrame {
 
     int sampleFrames() const {
         const int bytesPerFrame = channels * int(sizeof(qint16));
-        return bytesPerFrame > 0 ? pcm.size() / bytesPerFrame : 0;
+        return bytesPerFrame > 0 ? static_cast<int>(pcm.size() / bytesPerFrame) : 0;
     }
 };
 

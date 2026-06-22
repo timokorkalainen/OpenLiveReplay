@@ -41,7 +41,7 @@ void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
             continue;
         }
 
-        const int feedIndex = m_telemetryFeedIds.size();
+        const int feedIndex = static_cast<int>(m_telemetryFeedIds.size());
         m_telemetryFeedIndexById.insert(feedId, feedIndex);
         m_telemetryFeedIds.append(feedId);
         m_telemetryFeedNames.append(i < feedNames.size() ? feedNames.at(i) : QString());
@@ -129,7 +129,7 @@ bool ReplayManager::setupBlueEncoder() {
         bool encOk = m_blueNativeEncoder->encode(
             m_blueFrame, 0,
             [&](const QByteArray& data, int64_t /*pts*/, bool /*key*/) {
-                if (av_new_packet(m_cachedBluePkt, data.size()) == 0) {
+                if (av_new_packet(m_cachedBluePkt, static_cast<int>(data.size())) == 0) {
                     memcpy(m_cachedBluePkt->data, data.constData(), data.size());
                     m_cachedBluePkt->flags |= AV_PKT_FLAG_KEY;
                     gotPkt = true;
@@ -368,7 +368,7 @@ void ReplayManager::startRecording() {
     //    they are currently mapped to (or skip encoding when m_viewTrack == -1).
     m_globalFrameCount = 0;
     m_blueAudioCursor = QVector<int64_t>(m_viewCount, -1);
-    const int sourceCount = m_sourceUrls.size();
+    const int sourceCount = static_cast<int>(m_sourceUrls.size());
 
     for (int s = 0; s < sourceCount; ++s) {
         StreamWorker* worker =
@@ -504,7 +504,7 @@ void ReplayManager::updateViewMapping(const QList<int>& viewSlotMap) {
 
     // Build a reverse map: for each source, which view-track is it in?
     // Default is -1 (not assigned to any view).
-    const int sourceCount = m_workers.size();
+    const int sourceCount = static_cast<int>(m_workers.size());
     QVector<int> sourceToTrack(sourceCount, -1);
 
     for (int v = 0; v < viewSlotMap.size(); ++v) {

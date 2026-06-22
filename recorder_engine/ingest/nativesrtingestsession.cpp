@@ -459,8 +459,8 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
 
     const QByteArray streamId = streamIdForSocketOption(m_url);
     if (!streamId.isEmpty() &&
-        !setSrtOption(m_socket, SRTO_STREAMID, streamId.constData(), streamId.size(), error,
-                      QStringLiteral("SRTO_STREAMID"))) {
+        !setSrtOption(m_socket, SRTO_STREAMID, streamId.constData(),
+                      static_cast<int>(streamId.size()), error, QStringLiteral("SRTO_STREAMID"))) {
         closeSocket();
         return false;
     }
@@ -476,8 +476,9 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
             return false;
         }
         const QByteArray passphrase = urlOptions.passphrase.toUtf8();
-        if (!setSrtOption(m_socket, SRTO_PASSPHRASE, passphrase.constData(), passphrase.size(),
-                          error, QStringLiteral("SRTO_PASSPHRASE"))) {
+        if (!setSrtOption(m_socket, SRTO_PASSPHRASE, passphrase.constData(),
+                          static_cast<int>(passphrase.size()), error,
+                          QStringLiteral("SRTO_PASSPHRASE"))) {
             closeSocket();
             return false;
         }
@@ -839,7 +840,7 @@ void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
         }
     }
 
-    const int remainderSize = m_audioRemainder.size();
+    const int remainderSize = static_cast<int>(m_audioRemainder.size());
     qint64 basePts90k = pes.pts90k;
     if (remainderSize > 0 && m_audioRemainderPts90k >= 0) {
         basePts90k = m_audioRemainderPts90k;

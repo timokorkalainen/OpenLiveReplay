@@ -522,8 +522,8 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
             [this]() { updateXTouchDisplay(); });
     connect(m_midiManager, &MidiManager::portsChanged, this, [this]() {
         if (!m_currentSettings.midiPortName.isEmpty()) {
-            int idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
-            if (idx >= 0) m_midiManager->openPort(idx);
+            const qsizetype idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
+            if (idx >= 0) m_midiManager->openPort(static_cast<int>(idx));
         }
     });
 
@@ -923,7 +923,7 @@ void UIManager::ensureSourceEnabledSize() {
 
 void UIManager::rebuildSlotMap() {
     const int viewCount = activeViewCount();
-    const int sourceCount = m_currentSettings.sources.size();
+    const int sourceCount = static_cast<int>(m_currentSettings.sources.size());
     ensureSourceEnabledSize();
 
     // Preserve existing assignments: a source already in a slot stays there
@@ -1334,13 +1334,13 @@ void UIManager::resetSourceStats(int count) {
 void UIManager::setStreamUrls(const QStringList& urls) {
     if (streamUrls() != urls) {
         QList<SourceSettings> updated = m_currentSettings.sources;
-        const int minSize = qMin(updated.size(), urls.size());
-        for (int i = 0; i < minSize; ++i) {
+        const qsizetype minSize = qMin(updated.size(), urls.size());
+        for (qsizetype i = 0; i < minSize; ++i) {
             updated[i].url = urls[i];
         }
         if (urls.size() > updated.size()) {
             int nextId = nextSourceIdSeed(updated);
-            for (int i = updated.size(); i < urls.size(); ++i) {
+            for (qsizetype i = updated.size(); i < urls.size(); ++i) {
                 SourceSettings source;
                 source.id = QString::number(nextId++);
                 source.name = "";
@@ -1364,13 +1364,13 @@ void UIManager::setStreamUrls(const QStringList& urls) {
 void UIManager::setStreamNames(const QStringList& names) {
     if (streamNames() != names) {
         QList<SourceSettings> updated = m_currentSettings.sources;
-        const int minSize = qMin(updated.size(), names.size());
-        for (int i = 0; i < minSize; ++i) {
+        const qsizetype minSize = qMin(updated.size(), names.size());
+        for (qsizetype i = 0; i < minSize; ++i) {
             updated[i].name = names[i];
         }
         if (names.size() > updated.size()) {
             int nextId = nextSourceIdSeed(updated);
-            for (int i = updated.size(); i < names.size(); ++i) {
+            for (qsizetype i = updated.size(); i < names.size(); ++i) {
                 SourceSettings source;
                 source.id = QString::number(nextId++);
                 source.name = names[i];
@@ -1394,12 +1394,12 @@ void UIManager::setStreamNames(const QStringList& names) {
 void UIManager::setStreamIds(const QStringList& ids) {
     if (streamIds() != ids) {
         QList<SourceSettings> updated = m_currentSettings.sources;
-        const int minSize = qMin(updated.size(), ids.size());
-        for (int i = 0; i < minSize; ++i) {
+        const qsizetype minSize = qMin(updated.size(), ids.size());
+        for (qsizetype i = 0; i < minSize; ++i) {
             updated[i].id = ids[i];
         }
         if (ids.size() > updated.size()) {
-            for (int i = updated.size(); i < ids.size(); ++i) {
+            for (qsizetype i = updated.size(); i < ids.size(); ++i) {
                 SourceSettings source;
                 source.id = ids[i];
                 source.name = "";
@@ -1793,7 +1793,7 @@ void UIManager::startRecording() {
         return;
     }
     // Soft warning: configured feeds exceed the benchmarked safe count for the codec.
-    const int configuredFeeds = m_replayManager->getSourceUrls().size();
+    const int configuredFeeds = static_cast<int>(m_replayManager->getSourceUrls().size());
     if (feedCountExceedsSafe(configuredFeeds, m_benchmarkSafeFeedsForChosen)) {
         emit recordingWarning(
             QStringLiteral("Recording %1 feeds; this device benchmarked %2 as the safe limit "
@@ -1839,7 +1839,7 @@ void UIManager::startRecording() {
     m_sourceConnected = QList<bool>(m_replayManager->getSourceUrls().size(), false);
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
-    resetSourceStats(m_replayManager->getSourceUrls().size());
+    resetSourceStats(static_cast<int>(m_replayManager->getSourceUrls().size()));
 
     // 1. Initialize the Playback Worker with our providers
     if (m_playbackWorker) {
@@ -2455,7 +2455,7 @@ void UIManager::applyImportPreview() {
     m_sourceEnabledVersion++;
     m_sourceConnected = QList<bool>(m_currentSettings.sources.size(), false);
     m_sourceConnectionVersion++;
-    resetSourceStats(m_currentSettings.sources.size());
+    resetSourceStats(static_cast<int>(m_currentSettings.sources.size()));
     m_sourceTrimVersion++;
     m_liveTelemetry.clear();
     m_recordingTelemetry.clear();
@@ -2677,8 +2677,8 @@ void UIManager::loadSettings() {
         emit midiBindingsChanged();
 
         if (m_midiManager && !m_currentSettings.midiPortName.isEmpty()) {
-            int idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
-            if (idx >= 0) m_midiManager->openPort(idx);
+            const qsizetype idx = m_midiManager->ports().indexOf(m_currentSettings.midiPortName);
+            if (idx >= 0) m_midiManager->openPort(static_cast<int>(idx));
         }
 
         refreshProviders();
@@ -2791,7 +2791,7 @@ bool UIManager::screensReady() const {
 }
 
 int UIManager::screenCount() const {
-    return m_screens.size();
+    return static_cast<int>(m_screens.size());
 }
 
 void UIManager::refreshScreens() {
@@ -2850,7 +2850,7 @@ void UIManager::refreshProviders() {
     m_pgmPreviewProvider = nullptr;
 
     // Create a provider for every stream URL
-    int count = activeStreamUrls().size();
+    const int count = static_cast<int>(activeStreamUrls().size());
     for (int i = 0; i < count; ++i) {
         m_providers.append(new FrameProvider(this));
     }

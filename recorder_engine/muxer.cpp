@@ -124,7 +124,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
                 return false;
             }
             memcpy(st->codecpar->extradata, videoExtradata.constData(), videoExtradata.size());
-            st->codecpar->extradata_size = videoExtradata.size();
+            st->codecpar->extradata_size = static_cast<int>(videoExtradata.size());
         }
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         st->codecpar->width = width;
@@ -184,7 +184,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
 
     // 2c. Add one subtitle track per configured feed for feed telemetry
     m_telemetryTrackOffset = m_subtitleTrackOffset + videoTrackCount;
-    m_telemetryTrackCount = telemetryFeedIds.size();
+    m_telemetryTrackCount = static_cast<int>(telemetryFeedIds.size());
     for (int i = 0; i < telemetryFeedIds.size(); ++i) {
         AVStream* st = avformat_new_stream(m_outCtx, nullptr);
         st->id = m_telemetryTrackOffset + i;
@@ -460,7 +460,7 @@ void Muxer::writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& 
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) return;
 
-    if (av_new_packet(pkt, jsonData.size()) < 0) {
+    if (av_new_packet(pkt, static_cast<int>(jsonData.size())) < 0) {
         av_packet_free(&pkt);
         return;
     }
@@ -488,7 +488,7 @@ void Muxer::writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray&
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) return;
 
-    if (av_new_packet(pkt, jsonData.size()) < 0) {
+    if (av_new_packet(pkt, static_cast<int>(jsonData.size())) < 0) {
         av_packet_free(&pkt);
         return;
     }

@@ -55,7 +55,7 @@ void AudioRingBuffer::fadeOutAndClear(int channels) {
         m_buf = m_buf.left(kFadeBytes);  // trim to just what's next to play
 
     int16_t* samples = reinterpret_cast<int16_t*>(m_buf.data());
-    int nSamples = m_buf.size() / int(sizeof(int16_t));
+    int nSamples = static_cast<int>(m_buf.size() / static_cast<int>(sizeof(int16_t)));
     // Ramp per channel-FRAME so both channels of a stereo frame get the same
     // gain (otherwise L and R diverge by 1/nFrames across the tail).
     const int ch = qMax(1, channels);
