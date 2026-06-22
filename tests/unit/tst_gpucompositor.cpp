@@ -14,6 +14,7 @@
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/formatcanon.h"
 #include "playback/output/framehandle.h"
+#include "playback/output/outputbusengine.h"
 
 #include <utility>
 
@@ -28,6 +29,8 @@ private slots:
     void pgmSelectFillsOutputFromSingleSource();
     void bilinearScalerMeetsPsnrAgainstBilinearReference();
     void bilinearDiffersFromNearestOracle();
+    void memoHitReusesSameGpuSurface();
+    void memoMissRendersFresh();
 #ifdef __APPLE__
     void cpuHandleUploadsToNv12Surface();
     void gpuNv12HandleAliasesExistingSurface();
@@ -370,6 +373,52 @@ void TestGpuCompositor::bilinearDiffersFromNearestOracle() {
     QVERIFY(bilinear.isValid());
     QVERIFY2(bilinear.plane[0] != nearest.plane[0],
              "bilinear scaler must differ from the nearest-neighbor oracle");
+}
+
+void TestGpuCompositor::memoHitReusesSameGpuSurface() {
+    auto rhi = GpuRhiContext::createNullForTest();
+    if (!rhi) QSKIP("QRhi Null backend unavailable on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 60, 200),
+        solidYuv420pHandle(4, 4, 80, 70, 190),
+    };
+    QVector<qint64> keys{1, 100, 1, 200};
+    MultiviewComposite memo;
+    ColorMetadata color;
+
+    const FrameHandle a = comp->composeGridMemoized(
+        frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat, keys, &memo);
+    QVERIFY(!a.isNull());
+    QVERIFY(memo.valid);
+
+    const FrameHandle b = comp->composeGridMemoized(
+        frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat, keys, &memo);
+    QVERIFY(!b.isNull());
+    QVERIFY(a.dataPtr() == b.dataPtr());
+}
+
+void TestGpuCompositor::memoMissRendersFresh() {
+    auto rhi = GpuRhiContext::createNullForTest();
+    if (!rhi) QSKIP("QRhi Null backend unavailable on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{solidYuv420pHandle(4, 4, 40, 60, 200)};
+    MultiviewComposite memo;
+    ColorMetadata color;
+
+    const FrameHandle a = comp->composeGridMemoized(
+        frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat, {1, 100}, &memo);
+    const FrameHandle b = comp->composeGridMemoized(
+        frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat, {1, 999}, &memo);
+    QVERIFY(!a.isNull());
+    QVERIFY(!b.isNull());
+    QVERIFY(a.dataPtr() != b.dataPtr());
 }
 
 #ifdef __APPLE__

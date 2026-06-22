@@ -3,6 +3,7 @@
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/output/formatcanon.h"
+#include "playback/output/outputbusengine.h"
 
 #include <QColor>
 #include <QFile>
@@ -326,6 +327,26 @@ FrameHandle GpuCompositor::composeGrid(const QList<FrameHandle>& frames, int wid
     CpuPlanes rgba = composeGridToCpu(frames, width, height, color, quality);
     if (!rgba.isValid()) return FrameHandle{};
     return makeCpuFrameHandle(std::move(rgba), makeCompositeMetadata(width, height, generation));
+}
+
+FrameHandle GpuCompositor::composeGridMemoized(const QList<FrameHandle>& frames, int width,
+                                               int height, ColorMetadata color,
+                                               ScaleQuality quality,
+                                               const QVector<qint64>& sourceKeys,
+                                               MultiviewComposite* memo) const {
+    if (memo && memo->valid && memo->sourceKeys == sourceKeys && !memo->video.isNull()) {
+        // FENCE: a memo hit returns the same handle so its render/readback fence metadata
+        // travels with the payload; consumers still observe the original ordering contract.
+        return memo->video;
+    }
+
+    FrameHandle rendered = composeGrid(frames, width, height, color, quality);
+    if (!rendered.isNull() && memo) {
+        memo->valid = true;
+        memo->sourceKeys = sourceKeys;
+        memo->video = rendered;
+    }
+    return rendered;
 }
 
 CpuPlanes GpuCompositor::composeGridToCpu(const QList<FrameHandle>& frames, int width, int height,

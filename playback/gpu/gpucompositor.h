@@ -4,11 +4,13 @@
 #include "playback/output/framehandle.h"
 
 #include <QList>
+#include <QVector>
 
 #include <memory>
 
 class GpuRhiContext;
 class GpuSurface;
+struct MultiviewComposite;
 
 // RHI grid + PGM-select compositor. The CPU Yuv420pCompositor remains the
 // correctness oracle and fallback; a null FrameHandle from this type means the
@@ -31,6 +33,10 @@ public:
 
     FrameHandle composeGrid(const QList<FrameHandle>& frames, int width, int height,
                             ColorMetadata color, ScaleQuality quality) const;
+    FrameHandle composeGridMemoized(const QList<FrameHandle>& frames, int width, int height,
+                                    ColorMetadata color, ScaleQuality quality,
+                                    const QVector<qint64>& sourceKeys,
+                                    MultiviewComposite* memo) const;
     CpuPlanes composeGridToCpu(const QList<FrameHandle>& frames, int width, int height,
                                ColorMetadata color, ScaleQuality quality) const;
     FrameHandle composePgm(const FrameHandle& source, int width, int height, ColorMetadata color,
