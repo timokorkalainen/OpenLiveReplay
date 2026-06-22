@@ -33,9 +33,13 @@ olr_add_unit_test(tst_sseparser olr_test_core)
 olr_add_unit_test(tst_telemetryclient olr_test_core)
 olr_add_unit_test(tst_muxer            olr_test_engine)
 # Exercises NativeSrtIngestSession, which is compiled only on Apple/Windows
-# (Linux uses the ingest stubs), so this test is platform-gated.
+# (Linux uses the ingest stubs), so these tests are platform-gated.
 if(APPLE OR WIN32)
     olr_add_unit_test(tst_ingestbackendselector olr_test_core)
+    # Drives a real loopback SRT connection through NativeSrtIngestSession::run()
+    # and requestStop() concurrently; the threading regression it guards is caught
+    # under TSan (registered as a TSan target in .githooks/pre-push and CI).
+    olr_add_unit_test(tst_srtingest_teardown olr_test_engine)
 endif()
 olr_add_unit_test(tst_mpegtsparser     olr_test_core)
 olr_add_unit_test(tst_mpegtsparser_pcr olr_test_core)

@@ -23,6 +23,7 @@ struct NativeSrtSockaddr;
 class NativeSrtIngestSession final : public IngestSession {
 #if defined(QT_TESTLIB_LIB)
     friend class TestIngestBackendSelector;
+    friend class TestSrtIngestTeardown;
 #endif
 public:
     NativeSrtIngestSession(int sourceIndex, int outputWidth, int outputHeight,
