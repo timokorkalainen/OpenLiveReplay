@@ -6,6 +6,7 @@
 #include <QList>
 #include <QVector>
 
+#include <cstdint>
 #include <memory>
 
 class GpuRhiContext;
@@ -33,14 +34,29 @@ public:
 
     FrameHandle composeGrid(const QList<FrameHandle>& frames, int width, int height,
                             ColorMetadata color, ScaleQuality quality) const;
+    FrameHandle composeGridForGeneration(const QList<FrameHandle>& frames, int width, int height,
+                                         ColorMetadata color, ScaleQuality quality,
+                                         uint64_t generation) const;
     FrameHandle composeGridMemoized(const QList<FrameHandle>& frames, int width, int height,
                                     ColorMetadata color, ScaleQuality quality,
                                     const QVector<qint64>& sourceKeys,
                                     MultiviewComposite* memo) const;
+    FrameHandle composeGridMemoizedForGeneration(const QList<FrameHandle>& frames, int width,
+                                                 int height, ColorMetadata color,
+                                                 ScaleQuality quality,
+                                                 const QVector<qint64>& sourceKeys,
+                                                 MultiviewComposite* memo,
+                                                 uint64_t generation) const;
     CpuPlanes composeGridToCpu(const QList<FrameHandle>& frames, int width, int height,
                                ColorMetadata color, ScaleQuality quality) const;
+    CpuPlanes composeGridToCpuForGeneration(const QList<FrameHandle>& frames, int width,
+                                            int height, ColorMetadata color,
+                                            ScaleQuality quality, uint64_t generation) const;
     FrameHandle composePgm(const FrameHandle& source, int width, int height, ColorMetadata color,
                            ScaleQuality quality) const;
+    FrameHandle composePgmForGeneration(const FrameHandle& source, int width, int height,
+                                        ColorMetadata color, ScaleQuality quality,
+                                        uint64_t generation) const;
 
 private:
     class Impl;

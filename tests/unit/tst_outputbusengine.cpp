@@ -386,6 +386,9 @@ void TestOutputBusEngine::multiviewUsesCpuCompositorWithoutInjectedGpuCompositor
 
 #ifdef OLR_GPU_PIPELINE_BUILD
 void TestOutputBusEngine::multiviewUsesInjectedGpuCompositorWhenEnabled() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
     ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no local GPU RHI backend on this host");
@@ -408,6 +411,7 @@ void TestOutputBusEngine::multiviewUsesInjectedGpuCompositorWhenEnabled() {
     MultiviewComposite memo;
     const auto multiview = engine.renderMultiview(5, state, cache, &memo);
     QVERIFY(!multiview.video.isNull());
+    QVERIFY(multiview.video.isGpuBacked());
     QCOMPARE(multiview.video.metadata().key.format, FramePixelFormat::Rgba8);
     QCOMPARE(multiview.video.metadata().key.width, 8);
     QCOMPARE(multiview.video.metadata().key.height, 8);
@@ -418,6 +422,7 @@ void TestOutputBusEngine::multiviewUsesInjectedGpuCompositorWhenEnabled() {
     QCOMPARE(rgba.format, FramePixelFormat::Rgba8);
     QCOMPARE(rgba.width, 8);
     QCOMPARE(rgba.height, 8);
+#endif
 }
 #endif
 

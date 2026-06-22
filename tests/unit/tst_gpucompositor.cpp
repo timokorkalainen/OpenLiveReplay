@@ -23,8 +23,10 @@ class TestGpuCompositor : public QObject {
 private slots:
     void createIsNullOrValidNeverPartial();
     void gridShadersLoadAndBuildPipeline();
-    void compatGridMatchesCpuOracleExactOnNull();
+    void compatGridFallsBackToCpuOracleOnNull();
+    void compatGridMatchesCpuOracleExactOnWarp();
     void compatGridWithinOneLsbOnLocalGpu();
+    void composeGridReturnsGpuBackedRgbaOnLocalGpu();
     void swappedQuadrantsDifferFromOracle();
     void pgmSelectFillsOutputFromSingleSource();
     void bilinearScalerMeetsPsnrAgainstBilinearReference();
@@ -243,7 +245,7 @@ void TestGpuCompositor::gridShadersLoadAndBuildPipeline() {
     QCOMPARE(quality.stage(), QShader::FragmentStage);
 }
 
-void TestGpuCompositor::compatGridMatchesCpuOracleExactOnNull() {
+void TestGpuCompositor::compatGridFallsBackToCpuOracleOnNull() {
     auto rhi = GpuRhiContext::createNullForTest();
     if (!rhi) QSKIP("QRhi Null backend unavailable on this host");
 
@@ -269,6 +271,34 @@ void TestGpuCompositor::compatGridMatchesCpuOracleExactOnNull() {
     QCOMPARE(gpu.plane[0], oracle.plane[0]);
 }
 
+void TestGpuCompositor::compatGridMatchesCpuOracleExactOnWarp() {
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi) QSKIP("QRhi WARP/D3D11 backend unavailable on this host");
+    QVERIFY(rhi->isGpuBacked());
+    QVERIFY(!rhi->isNullBackend());
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        patternedYuv420pHandle(5, 3),
+        solidYuv420pHandle(4, 4, 80, 70, 190),
+        gradientYuv420pHandle(6, 5),
+        solidYuv420pHandle(3, 7, 160, 90, 170),
+    };
+    ColorMetadata color;
+
+    const CpuPlanes oracle = formatcanon::referenceComposeGridRgba8(frames, 10, 8, color);
+    QVERIFY(oracle.isValid());
+    const CpuPlanes gpu =
+        comp->composeGridToCpu(frames, 10, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(gpu.isValid());
+    QCOMPARE(gpu.format, FramePixelFormat::Rgba8);
+    QCOMPARE(gpu.width, 10);
+    QCOMPARE(gpu.height, 8);
+    QCOMPARE(gpu.plane[0], oracle.plane[0]);
+}
+
 void TestGpuCompositor::compatGridWithinOneLsbOnLocalGpu() {
     auto rhi = GpuRhiContext::create();
     if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
@@ -290,6 +320,45 @@ void TestGpuCompositor::compatGridWithinOneLsbOnLocalGpu() {
         comp->composeGridToCpu(frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
     if (!gpu.isValid()) QSKIP("local GPU grid render/readback unavailable on this host");
     compareRgbaWithinOneLsb(gpu, oracle);
+}
+
+void TestGpuCompositor::composeGridReturnsGpuBackedRgbaOnLocalGpu() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 60, 200),
+        solidYuv420pHandle(4, 4, 160, 90, 170),
+    };
+    ColorMetadata color;
+    const CpuPlanes oracle = formatcanon::referenceComposeGridRgba8(frames, 8, 8, color);
+    QVERIFY(oracle.isValid());
+
+    const FrameHandle gpu =
+        comp->composeGrid(frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(!gpu.isNull());
+    QVERIFY(gpu.isGpuBacked());
+    QCOMPARE(gpu.metadata().key.format, FramePixelFormat::Rgba8);
+    QCOMPARE(gpu.data()->nativeFormat(), FramePixelFormat::Rgba8);
+    QVERIFY(gpu.data()->gpuSurface() != nullptr);
+    QCOMPARE(gpu.data()->gpuSurface()->desc().format, FramePixelFormat::Rgba8);
+
+    const CpuPlanes rgba = gpu.readToCpu(FramePixelFormat::Rgba8);
+    QVERIFY(rgba.isValid());
+    compareRgbaWithinOneLsb(rgba, oracle);
+
+    const CpuPlanes yuv = gpu.readToCpu(FramePixelFormat::Yuv420p);
+    QVERIFY(yuv.isValid());
+    QCOMPARE(yuv.format, FramePixelFormat::Yuv420p);
+    QCOMPARE(yuv.width, 8);
+    QCOMPARE(yuv.height, 8);
+#endif
 }
 
 void TestGpuCompositor::swappedQuadrantsDifferFromOracle() {

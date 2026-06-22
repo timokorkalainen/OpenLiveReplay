@@ -118,6 +118,10 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createNullForTest() {
     return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::move(impl)));
 }
 
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
+    return nullptr;
+}
+
 bool GpuRhiContext::isValid() const {
     return m_impl && m_impl->valid;
 }

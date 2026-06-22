@@ -206,9 +206,9 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (m_gpuCompositor && m_gpuCompositor->isValid() && gpuPipelineEnabled()) {
             ColorMetadata color;
-            composed = m_gpuCompositor->composeGridMemoized(frames, m_width, m_height, color,
-                                                            GpuCompositor::ScaleQuality::Bilinear,
-                                                            sourceKeys, memo);
+            composed = m_gpuCompositor->composeGridMemoizedForGeneration(
+                frames, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear,
+                sourceKeys, memo, state.gpuGeneration);
         }
 #endif
         if (composed.isNull()) {
@@ -226,7 +226,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     // Identity must reflect the composited source content, not the advancing playhead,
     // so repeated-payload detection works when the underlying feeds are frozen.
     out.video.metadata().key.ptsMs = sourcePtsMs;
-    out.video.metadata().gpuGeneration = sourceGpuGeneration;
+    out.video.metadata().gpuGeneration =
+        out.video.isGpuBacked() ? state.gpuGeneration : sourceGpuGeneration;
     out.video.metadata().outputFrameIndex = outputFrameIndex;
 
     out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
@@ -253,12 +254,15 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
         if (bus == OutputBusId::pgm() && m_gpuCompositor && m_gpuCompositor->isValid() &&
             gpuPipelineEnabled()) {
             ColorMetadata color;
-            FrameHandle gpu = m_gpuCompositor->composePgm(out.video, m_width, m_height, color,
-                                                          GpuCompositor::ScaleQuality::Bilinear);
+            const FrameMetadata sourceMeta = out.video.metadata();
+            FrameHandle gpu = m_gpuCompositor->composePgmForGeneration(
+                out.video, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear,
+                state.gpuGeneration);
             if (!gpu.isNull()) {
-                gpu.metadata().key.feedIndex = out.video.metadata().key.feedIndex;
-                gpu.metadata().key.ptsMs = out.video.metadata().key.ptsMs;
-                gpu.metadata().key.isPlaceholder = out.video.metadata().key.isPlaceholder;
+                gpu.metadata().key.feedIndex = sourceMeta.key.feedIndex;
+                gpu.metadata().key.ptsMs = sourceMeta.key.ptsMs;
+                gpu.metadata().key.isPlaceholder = sourceMeta.key.isPlaceholder;
+                gpu.metadata().gpuGeneration = state.gpuGeneration;
                 out.video = gpu;
             }
         }

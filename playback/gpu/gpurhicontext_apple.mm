@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 
 #include "playback/gpu/gpufence.h"
+#include "playback/output/formatcanon.h"
 
 #include <QList>
 #include <QMutex>
@@ -75,6 +76,52 @@ CpuPlanes lockDownloadNv12ToYuv420p(CVPixelBufferRef pb) {
             const qsizetype srcIndex = static_cast<qsizetype>(2) * x;
             u[dst] = static_cast<char>(src[srcIndex]);
             v[dst] = static_cast<char>(src[srcIndex + 1]);
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return out;
+}
+
+CpuPlanes lockDownloadRgba8(CVPixelBufferRef pb) {
+    CpuPlanes out;
+    if (!pb) return out;
+    const OSType pixelFormat = CVPixelBufferGetPixelFormatType(pb);
+    if (pixelFormat != kCVPixelFormatType_32RGBA && pixelFormat != kCVPixelFormatType_32BGRA) {
+        return out;
+    }
+    if (CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+        return out;
+    }
+
+    const int w = static_cast<int>(CVPixelBufferGetWidth(pb));
+    const int h = static_cast<int>(CVPixelBufferGetHeight(pb));
+    const auto* src = static_cast<const uchar*>(CVPixelBufferGetBaseAddress(pb));
+    const size_t srcStride = CVPixelBufferGetBytesPerRow(pb);
+    if (!src || srcStride < static_cast<size_t>(w) * 4) {
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        return CpuPlanes{};
+    }
+
+    out.format = FramePixelFormat::Rgba8;
+    out.width = w;
+    out.height = h;
+    out.stride[0] = w * 4;
+    out.plane[0] = QByteArray(planeBytes(out.stride[0], h), '\0');
+    for (int row = 0; row < h; ++row) {
+        const uchar* srcRow = src + static_cast<size_t>(row) * srcStride;
+        char* dstRow = out.plane[0].data() + byteOffset(row, out.stride[0]);
+        if (pixelFormat == kCVPixelFormatType_32RGBA) {
+            std::memcpy(dstRow, srcRow, static_cast<size_t>(w) * 4);
+        } else {
+            for (int x = 0; x < w; ++x) {
+                const qsizetype dst = static_cast<qsizetype>(x) * 4;
+                const qsizetype srcOffset = static_cast<qsizetype>(x) * 4;
+                dstRow[dst] = char(srcRow[srcOffset + 2]);
+                dstRow[dst + 1] = char(srcRow[srcOffset + 1]);
+                dstRow[dst + 2] = char(srcRow[srcOffset]);
+                dstRow[dst + 3] = char(srcRow[srcOffset + 3]);
+            }
         }
     }
 
@@ -210,6 +257,10 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createNullForTest() {
     return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::move(impl)));
 }
 
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
+    return nullptr;
+}
+
 bool GpuRhiContext::isValid() const {
     return m_impl && m_impl->valid;
 }
@@ -226,11 +277,8 @@ bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) 
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& surface,
                                            FramePixelFormat target) {
     CpuPlanes result;
-    if (target != FramePixelFormat::Yuv420p) {
-        qWarning("GpuRhiContext::importAndReadback: Phase-2 readback is Yuv420p-only");
-        return result;
-    }
     if (!m_impl || !m_impl->valid || !surface || !surface->isValid()) return result;
+    const GpuSurfaceDesc desc = surface->desc();
 
     auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
     if (!ioSurface) return result;
@@ -250,7 +298,15 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                 rhi->endOffscreenFrame();
             }
         }
-        result = lockDownloadNv12ToYuv420p(pb);
+        if (desc.format == FramePixelFormat::Nv12) {
+            if (target == FramePixelFormat::Yuv420p) {
+                result = lockDownloadNv12ToYuv420p(pb);
+            } else if (target == FramePixelFormat::Nv12) {
+                result = formatcanon::yuv420pToNv12(lockDownloadNv12ToYuv420p(pb));
+            }
+        } else if (desc.format == FramePixelFormat::Rgba8 && target == FramePixelFormat::Rgba8) {
+            result = lockDownloadRgba8(pb);
+        }
     });
     CVPixelBufferRelease(pb);
     if (!invoked) return CpuPlanes{};

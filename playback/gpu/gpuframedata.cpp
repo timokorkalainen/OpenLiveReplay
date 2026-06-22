@@ -2,6 +2,7 @@
 
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpureadbackretainer.h"
+#include "playback/output/formatcanon.h"
 #include "playback/output/gpureadbacktelemetry.h"
 
 #include <QMutexLocker>
@@ -21,12 +22,22 @@ quint32 nextTelemetryKey() {
 
 } // namespace
 
-GpuFrameData::GpuFrameData(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuRhiContext> rhi,
-                           FramePixelFormat nativeFormat, std::shared_ptr<GpuFence> renderFence)
+GpuFrameData::GpuFrameData(std::shared_ptr<GpuSurface> surface,
+                           std::shared_ptr<GpuRhiContext> rhi,
+                           FramePixelFormat nativeFormat, ColorMetadata color,
+                           std::shared_ptr<GpuFence> renderFence)
     : m_surface(std::move(surface)), m_rhi(std::move(rhi)), m_renderFence(std::move(renderFence)),
-      m_nativeFormat(nativeFormat), m_telemetryKey(nextTelemetryKey()) {}
+      m_nativeFormat(nativeFormat), m_color(color), m_telemetryKey(nextTelemetryKey()) {}
 
 GpuFrameData::~GpuFrameData() = default;
+
+bool GpuFrameData::waitForPendingFence(int timeoutMs) const {
+    if (!m_surface) return false;
+    const uint64_t pendingFence = m_surface->pendingFenceValue();
+    if (pendingFence == 0) return true;
+    if (!m_renderFence) return true;
+    return m_renderFence->wait(pendingFence, timeoutMs);
+}
 
 CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
     if (!m_surface || !m_rhi) return CpuPlanes{};
@@ -35,7 +46,21 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
     const auto cached = m_cpuCache.constFind(int(target));
     if (cached != m_cpuCache.cend()) return cached.value();
 
-    CpuPlanes planes = m_rhi->importAndReadback(m_surface, target);
+    if (!waitForPendingFence(-1)) return CpuPlanes{};
+
+    const FramePixelFormat readbackTarget =
+        m_nativeFormat == FramePixelFormat::Rgba8 &&
+                (target == FramePixelFormat::Yuv420p || target == FramePixelFormat::Nv12)
+            ? FramePixelFormat::Rgba8
+            : target;
+    CpuPlanes planes = m_rhi->importAndReadback(m_surface, readbackTarget);
+    if (planes.isValid() && planes.format == FramePixelFormat::Rgba8 &&
+        target == FramePixelFormat::Yuv420p) {
+        planes = formatcanon::exportRgba8ToYuv420p(planes, m_color);
+    } else if (planes.isValid() && planes.format == FramePixelFormat::Rgba8 &&
+               target == FramePixelFormat::Nv12) {
+        planes = formatcanon::exportRgba8ToNv12(planes, m_color);
+    }
     if (planes.isValid()) {
         m_readCount.fetch_add(1, std::memory_order_acq_rel);
         s_frameReadToCpuCount.fetch_add(1, std::memory_order_acq_rel);
@@ -67,7 +92,7 @@ FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
     if (meta.key.height <= 0) meta.key.height = desc.height;
     meta.key.format = desc.format;
     auto data = std::make_shared<GpuFrameData>(std::move(surface), std::move(rhi), meta.key.format,
-                                               std::move(renderFence));
+                                               meta.color, std::move(renderFence));
     return FrameHandle(std::move(data), meta);
 }
 

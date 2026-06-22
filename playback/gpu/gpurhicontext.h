@@ -16,6 +16,7 @@ class GpuRhiContext {
 public:
     static std::shared_ptr<GpuRhiContext> create();
     static std::shared_ptr<GpuRhiContext> createNullForTest();
+    static std::shared_ptr<GpuRhiContext> createWarpForTest();
     ~GpuRhiContext();
 
     GpuRhiContext(const GpuRhiContext&) = delete;

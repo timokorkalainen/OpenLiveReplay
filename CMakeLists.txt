@@ -472,7 +472,6 @@ if(OLR_GPU_PIPELINE)
         target_link_libraries(OpenLiveReplay PRIVATE "-framework Metal" "-framework QuartzCore")
     else()
         target_sources(OpenLiveReplay PRIVATE
-            playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
             playback/gpu/gpuframeretirequeue.h playback/gpu/gpuframeretirequeue.cpp
             playback/gpu/gpufence.h playback/gpu/gpufence_stub.cpp
@@ -480,7 +479,12 @@ if(OLR_GPU_PIPELINE)
             playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp
             playback/gpu/decodedonefence.h playback/gpu/decodedonefence_stub.cpp)
         if(WIN32)
-            target_sources(OpenLiveReplay PRIVATE playback/gpu/gpufence_win.cpp)
+            target_sources(OpenLiveReplay PRIVATE
+                playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_win.cpp
+                playback/gpu/gpufence_win.cpp)
+        else()
+            target_sources(OpenLiveReplay PRIVATE
+                playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp)
         endif()
     endif()
     qt_add_shaders(OpenLiveReplay "olr_grid_shaders"
