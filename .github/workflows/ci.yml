@@ -532,7 +532,18 @@ jobs:
             ldd "$gpu_test" || true
           fi
           echo "Running $gpu_test with Qt=$qt_root MinGW=$mingw_root FFmpeg=$ffmpeg_root SRT=$srt_root"
-          "$gpu_test" -v2
+          gpu_log="$(pwd)/tst_gpucompositor.txt"
+          set +e
+          "$gpu_test" -v1 -o "$gpu_log,txt"
+          gpu_rc=$?
+          set -e
+          echo "tst_gpucompositor exit code: $gpu_rc"
+          if [ -f "$gpu_log" ]; then
+            cat "$gpu_log"
+          else
+            echo "::warning::tst_gpucompositor produced no QtTest log at $gpu_log"
+          fi
+          exit "$gpu_rc"
 
   # ---------------------------------------------------------------------------
   # Second toolchain: build the app + tests with GCC on Linux and run the unit
