@@ -44,6 +44,7 @@ public:
                                                  FrameMetadata meta);
 #ifdef _WIN32
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
+    void* d3d11Device() const;
     bool decodeOneForTest(Microsoft::WRL::ComPtr<ID3D11Device> device,
                           Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12, int width, int height);
 #endif

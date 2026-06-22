@@ -31,6 +31,7 @@ public:
     void stopRuntime();
     void resetFrameIndex(qint64 nextOutputFrameIndex = 0);
     void resetPlayEpoch();
+    void incrementFenceWaitStalls();
 
     OutputDispatchStats dispatchDueTicksForTest(qint64 wallNowMs);
     OutputDispatchStats dispatchDueTicksForTestNs(qint64 wallNowNs);

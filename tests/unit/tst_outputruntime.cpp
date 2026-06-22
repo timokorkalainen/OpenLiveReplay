@@ -69,6 +69,7 @@ private slots:
     void exactlyMaxCatchUpTicksDoesNotReportCapHit();
     void runtimeStatsReportDeadlineMissWhenCatchUpIsCapped();
     void runtimeClearsDeadlineMissLatchAfterRecovery();
+    void fenceWaitStallsCanBeIncremented();
 };
 
 void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
@@ -338,6 +339,16 @@ void TestOutputRuntime::runtimeClearsDeadlineMissLatchAfterRecovery() {
     // A subsequent poll with no frame due must continue to report no current miss.
     const OutputDispatchStats idle = runtime.dispatchDueTicksForTest(645);
     QVERIFY(!idle.runtime.lastDispatchDeadlineMiss);
+}
+
+void TestOutputRuntime::fenceWaitStallsCanBeIncremented() {
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+
+    QCOMPARE(runtime.stats().fenceWaitStalls, qint64(0));
+    runtime.incrementFenceWaitStalls();
+    runtime.incrementFenceWaitStalls();
+
+    QCOMPARE(runtime.stats().fenceWaitStalls, qint64(2));
 }
 
 QTEST_GUILESS_MAIN(TestOutputRuntime)

@@ -21,6 +21,10 @@ private slots:
     void trimBeforeDropsExpiredAudioFrames();
     void clearDropsVideoAndAudioHistory();
     void mergeFromInsertsByPtsWithoutClearing();
+    void insertVideoFrameReportsReplacement();
+    void trimBeforeReportsVideoEvictions();
+    void clearReportsVideoEvictions();
+    void mergeFromReportsReplacedVideoFrames();
 };
 
 void TestOutputFrameCache::videoAtPicksLargestPtsAtOrBeforePlayhead() {
@@ -185,6 +189,73 @@ void TestOutputFrameCache::mergeFromInsertsByPtsWithoutClearing() {
     QVERIFY(atOld.has_value());
     QCOMPARE(int(uchar(MediaVideoFrameView(*atNew).planeY.at(0))), 20);
     QCOMPARE(int(uchar(MediaVideoFrameView(*atOld).planeY.at(0))), 10);
+}
+
+void TestOutputFrameCache::insertVideoFrameReportsReplacement() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(makeVideo(0, 100, 10));
+
+    OutputFrameCache::EvictedVideoFrames evicted;
+    cache.insertVideoFrame(makeVideo(0, 100, 90), &evicted);
+
+    QCOMPARE(evicted.size(), 1);
+    QCOMPARE(evicted.first().metadata().key.ptsMs, qint64(100));
+    QCOMPARE(uchar(MediaVideoFrameView(evicted.first()).planeY.at(0)), uchar(10));
+
+    auto current = cache.videoFrameAt(0, 100);
+    QVERIFY(current.has_value());
+    QCOMPARE(uchar(MediaVideoFrameView(*current).planeY.at(0)), uchar(90));
+}
+
+void TestOutputFrameCache::trimBeforeReportsVideoEvictions() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(makeVideo(0, 0, 10));
+    cache.insertVideoFrame(makeVideo(0, 100, 20));
+    cache.insertVideoFrame(makeVideo(0, 200, 30));
+    cache.insertVideoFrame(makeVideo(0, 300, 40));
+
+    OutputFrameCache::EvictedVideoFrames evicted;
+    cache.trimBefore(250, 0, &evicted);
+
+    QCOMPARE(evicted.size(), 2);
+    QCOMPARE(evicted[0].metadata().key.ptsMs, qint64(0));
+    QCOMPARE(evicted[1].metadata().key.ptsMs, qint64(100));
+
+    auto boundary = cache.videoFrameAt(0, 250);
+    QVERIFY(boundary.has_value());
+    QCOMPARE(boundary->metadata().key.ptsMs, qint64(200));
+}
+
+void TestOutputFrameCache::clearReportsVideoEvictions() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(makeVideo(0, 100, 10));
+    cache.insertVideoFrame(makeVideo(0, 200, 20));
+
+    OutputFrameCache::EvictedVideoFrames evicted;
+    cache.clear(&evicted);
+
+    QCOMPARE(evicted.size(), 2);
+    QCOMPARE(evicted[0].metadata().key.ptsMs, qint64(100));
+    QCOMPARE(evicted[1].metadata().key.ptsMs, qint64(200));
+    QVERIFY(cache.videoFrameOrPlaceholder(0, 100).metadata().key.isPlaceholder);
+}
+
+void TestOutputFrameCache::mergeFromReportsReplacedVideoFrames() {
+    OutputFrameCache live(1, 4, 4);
+    live.insertVideoFrame(makeVideo(0, 100, 10));
+
+    OutputFrameCache staging(1, 4, 4);
+    staging.insertVideoFrame(makeVideo(0, 100, 80));
+
+    OutputFrameCache::EvictedVideoFrames evicted;
+    live.mergeFrom(staging, &evicted);
+
+    QCOMPARE(evicted.size(), 1);
+    QCOMPARE(uchar(MediaVideoFrameView(evicted.first()).planeY.at(0)), uchar(10));
+
+    auto current = live.videoFrameAt(0, 100);
+    QVERIFY(current.has_value());
+    QCOMPARE(uchar(MediaVideoFrameView(*current).planeY.at(0)), uchar(80));
 }
 
 QTEST_GUILESS_MAIN(TestOutputFrameCache)

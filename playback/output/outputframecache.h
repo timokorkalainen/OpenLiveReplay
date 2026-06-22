@@ -9,11 +9,14 @@
 
 class OutputFrameCache {
 public:
+    using EvictedVideoFrames = QVector<FrameHandle>;
+
     OutputFrameCache(int feedCount, int placeholderWidth, int placeholderHeight);
 
-    void insertVideoFrame(const FrameHandle& frame);
+    void insertVideoFrame(const FrameHandle& frame, EvictedVideoFrames* evictedFrames = nullptr);
     std::optional<FrameHandle> videoFrameAt(int feedIndex, qint64 playheadMs) const;
     FrameHandle videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const;
+    EvictedVideoFrames videoFramesSnapshot() const;
 
     void insertAudioFrame(const MediaAudioFrame& frame);
     QByteArray audioSpanOrSilence(int feedIndex, qint64 startSample, int sampleFrames) const;
@@ -22,9 +25,10 @@ public:
     // Insert every frame from `other` (video + audio) without removing the
     // current contents. Feed counts must match. Used to merge a staging window
     // into the live cache before trimming old frames (double-buffer).
-    void mergeFrom(const OutputFrameCache& other);
-    void trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample);
-    void clear();
+    void mergeFrom(const OutputFrameCache& other, EvictedVideoFrames* evictedFrames = nullptr);
+    void trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample,
+                    EvictedVideoFrames* evictedFrames = nullptr);
+    void clear(EvictedVideoFrames* evictedFrames = nullptr);
 
 private:
     QVector<QVector<FrameHandle>> m_video;

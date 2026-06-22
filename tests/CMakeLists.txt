@@ -272,6 +272,7 @@ if(OLR_GPU_PIPELINE)
     target_compile_definitions(olr_test_playback PRIVATE OLR_GPU_PIPELINE_BUILD=1)
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
     if(APPLE)
         target_sources(olr_test_playback PRIVATE
@@ -296,6 +297,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")

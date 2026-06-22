@@ -78,6 +78,10 @@ void OutputDispatcher::setRuntimeStats(const OutputRuntimeDispatchStats& stats) 
     m_stats.runtime = stats;
 }
 
+void OutputDispatcher::incrementFenceWaitStalls() {
+    m_stats.fenceWaitStalls++;
+}
+
 OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache,
                                                    const PlaybackStateSnapshot& state) {
     const qint64 outputFrameIndex = m_nextOutputFrameIndex++;

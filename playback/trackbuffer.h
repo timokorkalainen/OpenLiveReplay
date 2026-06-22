@@ -14,13 +14,14 @@ public:
         int64_t ptsMs = -1;
         FrameHandle frame;
     };
+    using EvictedFrames = QVector<Frame>;
 
     // Insert sorted, unique by PTS (existing PTS is replaced). Enforces the
     // frame cap by evicting the entry farthest (in PTS) from keepNearMs,
     // but never one whose PTS is in [keepNearMs, protectToMs] (the live
     // fill edge). Returns false if the frame was dropped by the cap.
     bool insert(int64_t ptsMs, const FrameHandle& f, int capFrames, int64_t keepNearMs,
-                int64_t protectToMs);
+                int64_t protectToMs, EvictedFrames* evictedFrames = nullptr);
 
     // The frame to display at playhead: largest PTS <= playheadMs.
     // Returns false (out untouched) if no such frame.
@@ -36,8 +37,8 @@ public:
     int size() const { return static_cast<int>(m_frames.size()); }
 
     // Drop frames with PTS < keepFromMs or PTS > keepToMs.
-    void trim(int64_t keepFromMs, int64_t keepToMs);
-    void clear() { m_frames.clear(); }
+    void trim(int64_t keepFromMs, int64_t keepToMs, EvictedFrames* evictedFrames = nullptr);
+    void clear(EvictedFrames* evictedFrames = nullptr);
 
 private:
     QVector<Frame> m_frames; // sorted ascending by ptsMs, unique

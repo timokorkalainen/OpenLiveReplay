@@ -11,6 +11,7 @@
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/decodedonefence.h"
 #include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpurhicontext.h"
@@ -310,11 +311,20 @@ void PlaybackWorker::clearDecoderBuffers() {
 #ifdef OLR_GPU_PIPELINE_BUILD
     if (gpuPipelineEnabled()) GpuGenerationCounter::instance().bump();
 #endif
-    QMutexLocker bufferLocker(&m_bufferMutex);
-    for (auto* track : m_decoderBank) {
-        track->buffer.clear();
-        track->decimateCounter = 0;
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        for (auto* track : m_decoderBank) {
+            TrackBuffer::EvictedFrames evicted;
+            track->buffer.clear(&evicted);
+#ifdef OLR_GPU_PIPELINE_BUILD
+            collectEvictedGpuFramesLocked(evicted);
+#endif
+            track->decimateCounter = 0;
+        }
     }
+#ifdef OLR_GPU_PIPELINE_BUILD
+    drainEvictedGpuFrames();
+#endif
     // NOTE: deliberately does NOT clear m_outputCache. The OutputRuntime paints
     // exclusively from m_outputCache; wiping it here makes the next ~1ms tick
     // snapshot an empty cache and render the gray placeholder (the seek flash).
@@ -344,12 +354,14 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     gpuResetFrameReadToCpuCount();
     m_gpuRhi.reset();
     m_decodeFence.reset();
+    m_renderFence.reset();
     if (gpuPipelineEnabled()) {
         m_gpuRhi = GpuRhiContext::create();
         if (!m_gpuRhi || !m_gpuRhi->isValid()) {
             m_gpuRhi.reset();
         } else {
             m_decodeFence = DecodeDoneFence::create();
+            m_renderFence = GpuFence::create();
         }
     }
 #endif
@@ -388,13 +400,23 @@ void PlaybackWorker::shutdownOutputGraph() {
     m_outputSinks.clear();
     {
         QMutexLocker bufferLocker(&m_bufferMutex);
-        m_outputCache.reset();
+#ifdef OLR_GPU_PIPELINE_BUILD
+        if (m_outputCache) collectEvictedGpuFramesLocked(m_outputCache->videoFramesSnapshot());
+#endif
         // Drop the published snapshot so a post-teardown tick (if any) falls back
         // to an empty cache rather than holding stale frames from the old graph.
+#ifdef OLR_GPU_PIPELINE_BUILD
+        auto previous = m_publishedCache.publish(nullptr);
+        if (previous) collectEvictedGpuFramesLocked(previous->videoFramesSnapshot());
+#else
         m_publishedCache.publish(nullptr);
+#endif
+        m_outputCache.reset();
     }
     m_outputFeedCount = 0;
 #ifdef OLR_GPU_PIPELINE_BUILD
+    drainEvictedGpuFrames();
+    m_renderFence.reset();
     m_decodeFence.reset();
     m_gpuRhi.reset();
 #endif
@@ -478,9 +500,59 @@ void PlaybackWorker::rebuildOutputEndpoints() {
 }
 
 void PlaybackWorker::publishOutputCacheLocked() {
-    if (m_outputCache)
-        m_publishedCache.publish(std::make_shared<const OutputFrameCache>(*m_outputCache));
+    if (!m_outputCache) return;
+    auto next = std::make_shared<const OutputFrameCache>(*m_outputCache);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    auto previous = m_publishedCache.publish(std::move(next));
+    if (previous) collectEvictedGpuFramesLocked(previous->videoFramesSnapshot());
+#else
+    m_publishedCache.publish(std::move(next));
+#endif
 }
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+void PlaybackWorker::collectEvictedGpuFramesLocked(
+    const TrackBuffer::EvictedFrames& evictedFrames) {
+    for (const TrackBuffer::Frame& evicted : evictedFrames)
+        collectEvictedGpuFrameLocked(evicted.frame);
+}
+
+void PlaybackWorker::collectEvictedGpuFramesLocked(
+    const OutputFrameCache::EvictedVideoFrames& evictedFrames) {
+    for (const FrameHandle& frame : evictedFrames)
+        collectEvictedGpuFrameLocked(frame);
+}
+
+void PlaybackWorker::collectEvictedGpuFrameLocked(const FrameHandle& frame) {
+    if (!m_renderFence) return;
+    m_gpuFrameRetireQueue.collect(frame, m_renderFence);
+}
+
+void PlaybackWorker::drainEvictedGpuFrames() {
+    GpuFrameRetireQueue local;
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        if (m_gpuFrameRetireQueue.isEmpty()) return;
+        m_gpuFrameRetireQueue.swap(local);
+    }
+
+    constexpr int kRetireFenceWaitTimeoutMs = 1;
+    int stalls = 0;
+    local.drain(kRetireFenceWaitTimeoutMs, &stalls);
+    for (int i = 0; i < stalls; ++i)
+        recordFenceWaitStall();
+
+    if (!local.isEmpty()) {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        m_gpuFrameRetireQueue.append(std::move(local));
+    }
+}
+
+void PlaybackWorker::recordFenceWaitStall() {
+    QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+    if (m_outputRuntime) m_outputRuntime->incrementFenceWaitStalls();
+}
+#endif
 
 OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     // Tier3 armed cut: read the dispatcher's next output frame index BEFORE
@@ -513,6 +585,10 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
         else
             snapshot.cache = OutputFrameCache(m_outputFeedCount, m_outputWidth, m_outputHeight);
     }
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+    const_cast<PlaybackWorker*>(this)->drainEvictedGpuFrames();
+#endif
 
     // Gate the visible playhead behind the committed cache generation: when no
     // seek is outstanding (committedGen == seekGen) this returns the LIVE
@@ -670,10 +746,27 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                 auto commitMediaFrame = [&](FrameHandle mediaFrame, int64_t framePtsMs) -> bool {
                     mediaFrame.metadata().key.ptsMs = framePtsMs;
                     if (!mediaFrame.isPresentable()) return false;
-                    QMutexLocker bufferLocker(bufferMutex);
-                    if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
-                        counters.framesDropped++;
-                    if (outputCache) outputCache->insertVideoFrame(mediaFrame);
+                    {
+                        QMutexLocker bufferLocker(bufferMutex);
+                        TrackBuffer::EvictedFrames evictedTrackFrames;
+                        if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi,
+                                                  &evictedTrackFrames)) {
+                            counters.framesDropped++;
+                        }
+#ifdef OLR_GPU_PIPELINE_BUILD
+                        collectEvictedGpuFramesLocked(evictedTrackFrames);
+#endif
+                        if (outputCache) {
+                            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+                            outputCache->insertVideoFrame(mediaFrame, &evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+                            collectEvictedGpuFramesLocked(evictedCacheFrames);
+#endif
+                        }
+                    }
+#ifdef OLR_GPU_PIPELINE_BUILD
+                    drainEvictedGpuFrames();
+#endif
                     counters.decodedVideoFrames++;
                     return true;
                 };
@@ -749,6 +842,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         m_winGpuImportTried = true;
                     }
                     if (m_winGpuImportEdge && m_winGpuImportEdge->isAvailable()) {
+                        if (!m_renderFence)
+                            m_renderFence = makeD3D11GpuFence(m_winGpuImportEdge->d3d11Device());
                         const int savedDecimateCounter = track->decimateCounter;
                         bool gpuCallback = false;
                         bool gpuInserted = false;
@@ -906,12 +1001,28 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                 FrameHandle mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
                 mediaFrame.metadata().key.ptsMs = framePtsMs;
                 if (mediaFrame.isValid()) {
-                    QMutexLocker bufferLocker(&m_bufferMutex);
-                    if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi))
-                        m_counters.framesDropped++;
-                    // Insert only; republish is batched (run-loop trim /
-                    // reposition merge), never per-frame — see enqueue note.
-                    if (m_outputCache) m_outputCache->insertVideoFrame(mediaFrame);
+                    {
+                        QMutexLocker bufferLocker(&m_bufferMutex);
+                        TrackBuffer::EvictedFrames evictedTrackFrames;
+                        if (!track->buffer.insert(framePtsMs, mediaFrame, cap, protectLo, protectHi,
+                                                  &evictedTrackFrames))
+                            m_counters.framesDropped++;
+#ifdef OLR_GPU_PIPELINE_BUILD
+                        collectEvictedGpuFramesLocked(evictedTrackFrames);
+#endif
+                        // Insert only; republish is batched (run-loop trim /
+                        // reposition merge), never per-frame — see enqueue note.
+                        if (m_outputCache) {
+                            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+                            m_outputCache->insertVideoFrame(mediaFrame, &evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+                            collectEvictedGpuFramesLocked(evictedCacheFrames);
+#endif
+                        }
+                    }
+#ifdef OLR_GPU_PIPELINE_BUILD
+                    drainEvictedGpuFrames();
+#endif
                     m_counters.decodedVideoFrames++;
                 }
                 lastVideoPtsMs = framePtsMs;
@@ -1092,8 +1203,14 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         if (!m_stagingCache)
             m_stagingCache = std::make_unique<OutputFrameCache>(m_outputFeedCount, m_outputWidth,
                                                                 m_outputHeight);
-        else
-            m_stagingCache->clear();
+        else {
+            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+            m_stagingCache->clear(&evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            collectEvictedGpuFramesLocked(evictedCacheFrames);
+#endif
+        }
     }
     // Swap so decodePacketIntoBank's m_outputCache->insertVideoFrame lands in
     // staging, not the live cache (which keeps its old frames over the seek).
@@ -1141,12 +1258,20 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         QMutexLocker bufferLocker(&m_bufferMutex);
         m_stagingCache = std::move(m_outputCache); // staging back
         m_outputCache = std::move(liveSaved);      // live restored (old frames intact)
-        m_outputCache->mergeFrom(*m_stagingCache); // live now covers target AND keeps old
+        OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+        m_outputCache->mergeFrom(*m_stagingCache,
+                                 &evictedCacheFrames); // live now covers target AND keeps old
         const qint64 keepAudioFromSample =
             qMax<qint64>(0, (target - kLeadMs) * qint64(48000) / 1000);
-        m_outputCache->trimBefore(target - kLeadMs, keepAudioFromSample);
+        m_outputCache->trimBefore(target - kLeadMs, keepAudioFromSample, &evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        collectEvictedGpuFramesLocked(evictedCacheFrames);
+#endif
         publishOutputCacheLocked();
     }
+#ifdef OLR_GPU_PIPELINE_BUILD
+    drainEvictedGpuFrames();
+#endif
 
     if (!deliveredEarly) resetDedup();
     deliverDueFrames(target, dir);
@@ -1442,7 +1567,14 @@ void PlaybackWorker::fillStaging() {
         const int64_t seekPts = av_rescale_q(anchor, {1, 1000}, refStream->time_base);
         av_seek_frame(m_prerollFmtCtx, refStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
         avformat_flush(m_prerollFmtCtx);
-        m_prerollStagingCache->clear();
+        OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+        m_prerollStagingCache->clear(&evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        {
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            collectEvictedGpuFramesLocked(evictedCacheFrames);
+        }
+#endif
         m_stagingNewestRefPtsMs = INT64_MIN;
         // Step 3: reset native sessions post-seek so the VT/MF decoder starts
         // clean — guarantees PTS fidelity (maxClockDivergenceMs gate).
@@ -1537,7 +1669,15 @@ void PlaybackWorker::fillStaging() {
                             convertToMediaVideoFrame(nativeVf, track->feedIndex);
                         mediaFrame.metadata().key.ptsMs = framePtsMs;
                         if (mediaFrame.isValid()) {
-                            m_prerollStagingCache->insertVideoFrame(mediaFrame);
+                            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+                            m_prerollStagingCache->insertVideoFrame(mediaFrame,
+                                                                    &evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+                            if (!evictedCacheFrames.isEmpty()) {
+                                QMutexLocker bufferLocker(&m_bufferMutex);
+                                collectEvictedGpuFramesLocked(evictedCacheFrames);
+                            }
+#endif
                             m_counters.stagingVideoFramesDecoded++;
                             if (track->streamIndex == primaryStreamIndex) {
                                 m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
@@ -1564,7 +1704,15 @@ void PlaybackWorker::fillStaging() {
                         FrameHandle mediaFrame = convertToMediaVideoFrame(vf, track->feedIndex);
                         mediaFrame.metadata().key.ptsMs = framePtsMs;
                         if (mediaFrame.isValid()) {
-                            m_prerollStagingCache->insertVideoFrame(mediaFrame);
+                            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+                            m_prerollStagingCache->insertVideoFrame(mediaFrame,
+                                                                    &evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+                            if (!evictedCacheFrames.isEmpty()) {
+                                QMutexLocker bufferLocker(&m_bufferMutex);
+                                collectEvictedGpuFramesLocked(evictedCacheFrames);
+                            }
+#endif
                             m_counters.stagingVideoFramesDecoded++;
                             if (track->streamIndex == primaryStreamIndex)
                                 m_stagingNewestRefPtsMs = qMax(m_stagingNewestRefPtsMs, framePtsMs);
@@ -1624,6 +1772,10 @@ void PlaybackWorker::fillStaging() {
     av_frame_free(&vf);
     av_frame_free(&af);
     av_packet_free(&pkt);
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+    drainEvictedGpuFrames();
+#endif
 
     // Schedule the cut the moment staging first covers the target window — unless
     // the cut was disarmed meanwhile (e.g. maybeFireScheduledCut aborted it on a
@@ -2264,14 +2416,26 @@ void PlaybackWorker::run() {
                 keepTo = P + (kTrailMs + kSlackMs);
             }
             QMutexLocker bufferLocker(&m_bufferMutex);
-            for (auto* track : m_decoderBank)
-                track->buffer.trim(keepFrom, keepTo);
+            for (auto* track : m_decoderBank) {
+                TrackBuffer::EvictedFrames evictedTrackFrames;
+                track->buffer.trim(keepFrom, keepTo, &evictedTrackFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+                collectEvictedGpuFramesLocked(evictedTrackFrames);
+#endif
+            }
             if (m_outputCache) {
                 const qint64 keepAudioFromSample = qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
-                m_outputCache->trimBefore(keepFrom, keepAudioFromSample);
+                OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+                m_outputCache->trimBefore(keepFrom, keepAudioFromSample, &evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+                collectEvictedGpuFramesLocked(evictedCacheFrames);
+#endif
                 publishOutputCacheLocked();
             }
         }
+#ifdef OLR_GPU_PIPELINE_BUILD
+        drainEvictedGpuFrames();
+#endif
         m_audioQueue.dropOlderThan(P, kAudioLeadMs);
 
         // --- AUDIO release (§6.7): only at 1× forward, playing, single active

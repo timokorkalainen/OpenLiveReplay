@@ -15,7 +15,11 @@
 #include "frameprovider.h"
 #include "playback/commitgate.h"
 #include "playback/frameindex.h"
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpuframeretirequeue.h"
+#endif
 #include "playback/output/colormetadata.h"
+#include "playback/output/outputframecache.h"
 #include "playback/output/outputruntime.h"
 #include "playback/output/sharedcacheslot.h"
 #include "playback/output/outputtargetassignment.h"
@@ -35,6 +39,7 @@ extern "C" {
 ColorMetadata colorMetadataForAvFrame(const AVFrame* frame);
 
 class DecodeDoneFence;
+class GpuFence;
 class GpuRhiContext;
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
 class WinGpuImportEdge;
@@ -214,6 +219,13 @@ private:
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void collectEvictedGpuFramesLocked(const TrackBuffer::EvictedFrames& evictedFrames);
+    void collectEvictedGpuFramesLocked(const OutputFrameCache::EvictedVideoFrames& evictedFrames);
+    void collectEvictedGpuFrameLocked(const FrameHandle& frame);
+    void drainEvictedGpuFrames();
+    void recordFenceWaitStall();
+#endif
 
     // --- Tier3 pre-roll / armed-cut (worker-thread internals) -------------
     // Open a SECOND independent AVFormatContext on the same clip + its own
@@ -372,8 +384,14 @@ private:
     SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    GpuFrameRetireQueue m_gpuFrameRetireQueue; // guarded by m_bufferMutex
+#endif
     std::shared_ptr<GpuRhiContext> m_gpuRhi;
     std::shared_ptr<DecodeDoneFence> m_decodeFence;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    std::shared_ptr<GpuFence> m_renderFence;
+#endif
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
     std::unique_ptr<WinGpuImportEdge> m_winGpuImportEdge;
     bool m_winGpuImportTried = false;

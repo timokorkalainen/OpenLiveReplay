@@ -63,6 +63,11 @@ void OutputRuntime::resetPlayEpoch() {
     m_dispatcher.resetPlayEpoch();
 }
 
+void OutputRuntime::incrementFenceWaitStalls() {
+    QMutexLocker locker(&m_mutex);
+    m_dispatcher.incrementFenceWaitStalls();
+}
+
 OutputDispatchStats OutputRuntime::dispatchDueTicksForTest(qint64 wallNowMs) {
     return dispatchDueTicksNs(wallNowMs * kNsPerSecond / 1000);
 }

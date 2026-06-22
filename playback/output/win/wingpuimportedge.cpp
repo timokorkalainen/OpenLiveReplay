@@ -260,6 +260,10 @@ void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&
     m_impl->importTap = std::move(tap);
 }
 
+void* WinGpuImportEdge::d3d11Device() const {
+    return (m_impl && m_impl->device) ? m_impl->device.Get() : nullptr;
+}
+
 bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device, ComPtr<ID3D11Texture2D> nv12,
                                         int width, int height) {
     auto surface =
