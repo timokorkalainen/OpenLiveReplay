@@ -44,10 +44,12 @@ QtObject {
     readonly property color focusRing: "#2E7BFF"
 
     // --- Type --- QML's font.family takes a SINGLE family; a comma list (and font.families,
-    // which is not a QML font property) silently fail. So use Qt generic families, which
-    // resolve to the platform UI sans and a real monospace on every OS.
-    readonly property string fontFamily: "sans-serif" // generic UI sans
-    readonly property string fontMono: "monospace"    // generic monospace (tabular) for timecode
+    // which is not a QML font property) silently fail. Use concrete platform families for
+    // timer-critical text so Qt does not fall back to a proportional face.
+    readonly property string fontFamily: Qt.platform.os === "osx" ? "Helvetica Neue"
+                                        : (Qt.platform.os === "windows" ? "Segoe UI" : "DejaVu Sans")
+    readonly property string fontMono: Qt.platform.os === "osx" ? "Menlo"
+                                      : (Qt.platform.os === "windows" ? "Consolas" : "DejaVu Sans Mono")
     readonly property int fsMicro: 11
     readonly property int fsBody: 13
     readonly property int fsHeading: 15

@@ -14,7 +14,8 @@ ColumnLayout {
     readonly property int avail: root.parent ? root.parent.width : root.width
     readonly property bool tight: root.avail <= Theme.bpMD
     readonly property bool compact: root.avail < Theme.bpMD
-    readonly property int compactTimeWidth: 54
+    readonly property int compactTimeWidth: 72
+    readonly property int timeReadoutWidth: root.compact || root.tight ? root.compactTimeWidth : 112
     readonly property int compactShuttleWidth: 26
     readonly property int compactCaptureWidth: 40
     readonly property int primaryKeyHeight: root.compact ? Theme.hControl : Theme.hPrimary
@@ -79,14 +80,18 @@ ColumnLayout {
         spacing: root.compact || root.tight ? Theme.s1 : 12
 
         Text {
+            objectName: "transportPlayheadTimecode"
             // Single source of truth (UIManager): the same string the
             // Stream Deck shows. Do not reformat here.
             text: root.hasUi ? root.ui.playbackTimecode : "00:00:00"
             color: Theme.textHi
             font.family: Theme.fontMono
+            font.kerning: false
             font.pixelSize: root.compact || root.tight ? Theme.fsMicro : 14
             Layout.alignment: Qt.AlignVCenter
-            Layout.preferredWidth: root.compact || root.tight ? root.compactTimeWidth : implicitWidth
+            Layout.minimumWidth: root.timeReadoutWidth
+            Layout.preferredWidth: root.timeReadoutWidth
+            horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideRight
             MouseArea {
                 anchors.fill: parent
@@ -320,6 +325,7 @@ ColumnLayout {
         }
 
         Text {
+            objectName: "transportDurationTimecode"
             text: root.showTimeOfDay
                 ? (root.clockTick >= 0
                    ? root.formatTimeOfDay(Date.now())
@@ -327,9 +333,12 @@ ColumnLayout {
                 : root.formatTimecode(root.hasUi ? root.ui.recordedDurationMs : 0)
             color: Theme.textHi
             font.family: Theme.fontMono
+            font.kerning: false
             font.pixelSize: root.compact || root.tight ? Theme.fsMicro : 14
             Layout.alignment: Qt.AlignVCenter
-            Layout.preferredWidth: root.compact || root.tight ? root.compactTimeWidth : implicitWidth
+            Layout.minimumWidth: root.timeReadoutWidth
+            Layout.preferredWidth: root.timeReadoutWidth
+            horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideRight
             MouseArea {
                 anchors.fill: parent

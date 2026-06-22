@@ -90,7 +90,12 @@ ApplicationWindow {
 
     function openMultiviewOnExternalDisplay() {
         if (!appWindow.uiManagerRef || appWindow.uiManagerRef.screenCount === 0) {
-            console.warn("No screens detected")
+            appWindow.openMultiviewWindow()
+            if (!appWindow.multiviewWindow) return
+            appWindow.multiviewWindow.visibility = Window.FullScreen
+            appWindow.multiviewWindow.visible = true
+            appWindow.multiviewWindow.raise()
+            appWindow.multiviewWindow.requestActivate()
             return
         }
 
@@ -216,11 +221,9 @@ ApplicationWindow {
             recordingError: appWindow.recordingError
             onToggleConfig: configDrawer.opened ? configDrawer.close() : configDrawer.open()
             onToggleRundown: appWindow.rundownExpanded = !appWindow.rundownExpanded
-            onFullscreenMultiviewRequested: (x, y) => {
+            onFullscreenMultiviewRequested: {
                 appWindow.refreshScreenOptions()
-                screenMenu.x = x
-                screenMenu.y = y
-                screenMenu.open()
+                appWindow.openMultiviewOnExternalDisplay()
             }
         }
 
