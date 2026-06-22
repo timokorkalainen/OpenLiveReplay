@@ -533,6 +533,8 @@ int main(int argc, char** argv) {
             // placeholder/hold baseline, seek while decode is active, then arm a
             // forward cut. The driver gates no placeholder flash, no held-frame
             // stall, GPU materialization, and bounded fence stalls.
+            auto* lastCuts = new int(worker.cutsFired());
+            auto* capCutTarget = new qint64(-1);
             transport.setSpeed(1.0);
             transport.seek(0);
             transport.setPlaying(true);
@@ -550,10 +552,27 @@ int main(int argc, char** argv) {
             });
             QTimer::singleShot(1600, &app, [&]() {
                 const int64_t cutTarget = durMs / 2;
+                *capCutTarget = cutTarget;
                 armNextCutArmed = worker.armNextCut(cutTarget) ? 1 : 0;
                 fprintf(stderr, "### gpucapstress armNextCut(%lldms) returned %d ###\n",
                         (long long) cutTarget, armNextCutArmed);
             });
+            QTimer* mon = new QTimer(&app);
+            QObject::connect(
+                mon, &QTimer::timeout, &app, [&, lastCuts, capCutTarget, maxLandErr]() {
+                    const int cuts = worker.cutsFired();
+                    if (cuts <= *lastCuts) return;
+                    *lastCuts = cuts;
+                    if (*capCutTarget < 0) return;
+                    const qint64 landed = transport.currentPos();
+                    const qint64 err = qAbs(landed - *capCutTarget);
+                    if (err > *maxLandErr) *maxLandErr = err;
+                    fprintf(stderr,
+                            "### gpucapstress cut landed=%lld target=%lld err=%lld "
+                            "###\n",
+                            (long long) landed, (long long) *capCutTarget, (long long) err);
+                });
+            mon->start(16);
             QTimer::singleShot(10000, &app, finish);
 
         } else if (scen == "armedcut-h264") {

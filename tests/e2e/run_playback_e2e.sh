@@ -938,21 +938,35 @@ case "${OLR_GPU_PIPELINE:-}" in
     1|true|TRUE|on|ON) GPU_RUNTIME_ENABLED=1 ;;
 esac
 
-if [ "$GPU_RUNTIME_ENABLED" -eq 1 ] && [ "$SCENARIO" = "h264_play" ]; then
-    if ! num "$gpuReadToCpuCount" || [ "$gpuReadToCpuCount" -le 0 ]; then
-        echo "FAIL: GPU path produced no CPU materialization (gpuReadToCpuCount=$gpuReadToCpuCount, expected >0)"
-        fail=1
-    fi
-    if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
-        echo "FAIL: GPU readback telemetry stayed zero (gpuReadbacks=$gpuReadbacks, expected >0)"
-        fail=1
-    fi
-    if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
-        echo "FAIL: redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
-        fail=1
-    fi
-elif [ "$GPU_RUNTIME_ENABLED" -eq 1 ] && [ "$SCENARIO" = "gpucapstress" ]; then
-    :
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    case "$SCENARIO" in
+        h264_play|armedcut-h264|armedcut-h264-back)
+            if ! num "$gpuReadToCpuCount" || [ "$gpuReadToCpuCount" -le 0 ]; then
+                echo "FAIL: GPU path produced no CPU materialization (gpuReadToCpuCount=$gpuReadToCpuCount, expected >0)"
+                fail=1
+            fi
+            if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
+                echo "FAIL: GPU readback telemetry stayed zero (gpuReadbacks=$gpuReadbacks, expected >0)"
+                fail=1
+            fi
+            if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
+                echo "FAIL: redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
+                fail=1
+            fi
+            ;;
+        gpucapstress)
+            ;;
+        *)
+            for gpucnt in gpuReadToCpuCount gpuReadbacks redundantGpuReadbacks readbackQueueDepth readbackDrops \
+                          fenceWaitStalls gpuOomDegrades gpuVramBytes; do
+                eval "gpuval=\$$gpucnt"
+                if ! num "$gpuval" || [ "$gpuval" -ne 0 ]; then
+                    echo "FAIL: GPU telemetry counter $gpucnt=$gpuval, expected 0 on the CPU path - Phase-1 counters must read inert/zero"
+                    fail=1
+                fi
+            done
+            ;;
+    esac
 else
     for gpucnt in gpuReadToCpuCount gpuReadbacks redundantGpuReadbacks readbackQueueDepth readbackDrops \
                   fenceWaitStalls gpuOomDegrades gpuVramBytes; do
