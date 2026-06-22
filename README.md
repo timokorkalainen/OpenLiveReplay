@@ -26,6 +26,9 @@ Getting started
 1. Clone the repository
 2. Open the project in Qt Creator (open the project root or `CMakeLists.txt`), configure for your target (macOS or iOS), then build.
 
+For the full VS Code, terminal, test, and iOS device workflows, see
+[`docs/build-and-run.md`](docs/build-and-run.md).
+
 For **Windows** (Qt MinGW kit), the dependencies (FFmpeg + SRT) are built from
 source by a one-command script — see [`docs/windows-build.md`](docs/windows-build.md):
 
@@ -41,7 +44,8 @@ clean runners and uploads packaged Windows/macOS bundles as artifacts.
 ### Building in VS Code
 
 The repo ships ready-to-use VS Code configuration for the CMake Tools and the
-official Qt extensions (`.vscode/`). On a fresh checkout:
+official Qt extensions (`.vscode/`). The detailed playbook is
+[`docs/build-and-run.md`](docs/build-and-run.md). On a fresh checkout:
 
 1. Open the project folder; install the recommended extensions when prompted.
 2. From the CMake Tools status bar, pick the Debug configure preset for your
