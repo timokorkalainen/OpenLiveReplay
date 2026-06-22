@@ -1,6 +1,5 @@
 pragma ComponentBehavior: Bound
 import QtQuick
-import QtQuick.Controls
 import QtQuick.Layouts
 import QtMultimedia
 import OlrTheme
@@ -99,7 +98,7 @@ Item {
         anchors.fill: parent
         property int sourceForView: root.sourceForView(root.selectedIndex)
         color: sourceForView < 0 ? Theme.panelPressed : "black"
-        border.color: sourceForView < 0 ? Theme.line : Theme.ready
+        border.color: sourceForView < 0 ? Theme.line : Theme.recordOnAir
         border.width: 2
         visible: root.viewMode === "single" && root.selectedIndex >= 0 && root.pgmProvider !== null
 
