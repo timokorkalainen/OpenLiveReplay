@@ -5,7 +5,11 @@
 #include "playback/gpu/gpupipelineconfig.h"
 
 #include <CoreVideo/CoreVideo.h>
+#if __has_include(<IOSurface/IOSurfaceRef.h>)
+#include <IOSurface/IOSurfaceRef.h>
+#elif __has_include(<IOSurface/IOSurface.h>)
 #include <IOSurface/IOSurface.h>
+#endif
 
 #include <cstring>
 #include <memory>
