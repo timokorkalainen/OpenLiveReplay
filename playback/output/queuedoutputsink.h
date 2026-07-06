@@ -21,6 +21,9 @@ public:
     bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
     OutputSinkStatus outputStatus() const override;
+    bool needsContinuousCadence() const override {
+        return m_inner && m_inner->needsContinuousCadence();
+    }
 
     int droppedFrames() const;
 
