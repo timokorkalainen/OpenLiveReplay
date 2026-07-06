@@ -3,6 +3,10 @@
 
 #include "playback/output/framehandle.h"
 
+#ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpubudget.h"
+#endif
+
 #include <QString>
 
 #include <functional>
@@ -26,6 +30,10 @@ struct WinGpuImportCapabilities {
 
 WinGpuImportCapabilities probeWinGpuImport();
 
+#ifdef OLR_UNIT_TEST
+bool winGpuImportProbeForcesHardwareDecoderForTest();
+#endif
+
 class GpuFence;
 class D3D11GpuSurface;
 
@@ -40,11 +48,20 @@ public:
     std::optional<FrameHandle> tryImport(void* mfSampleOpaque, int feedIndex, qint64 ptsMs,
                                          int width, int height,
                                          std::shared_ptr<GpuFence> renderFence = nullptr);
+    std::shared_ptr<D3D11GpuSurface> tryImportSurface(void* mfSampleOpaque, int width, int height);
     bool isAvailable() const;
+    bool deviceLost() const;
 
+#ifdef OLR_GPU_PIPELINE_BUILD
+    static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
+                                                 FrameMetadata meta,
+                                                 std::shared_ptr<GpuFence> renderFence = nullptr,
+                                                 GpuBudgetCharge charge = {});
+#else
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                  FrameMetadata meta,
                                                  std::shared_ptr<GpuFence> renderFence = nullptr);
+#endif
 #ifdef _WIN32
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
     void* d3d11Device() const;

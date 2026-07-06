@@ -151,6 +151,7 @@ private slots:
     void dropsPesAfterContinuityGapUntilNextPayloadStart();
     void rejectsMalformedAdaptationOnlyLength();
     void adaptationOnlyDiscontinuityDropsInProgressPes();
+    void pcrDiscontinuityDropsAllInProgressPes();
     void ignoresDuplicatePayloadStartPacket();
     void unboundedPesIsCappedAndResyncs();
 };
@@ -353,6 +354,39 @@ void TestMpegTsParser::adaptationOnlyDiscontinuityDropsInProgressPes()
     QCOMPARE(out.size(), 1);
     QCOMPARE(out.first().pts90k, qint64(180000));
     QCOMPARE(out.first().payload, nextPayload);
+}
+
+void TestMpegTsParser::pcrDiscontinuityDropsAllInProgressPes() {
+    constexpr quint16 videoPid = 0x0101;
+    constexpr quint16 audioPid = 0x0103;
+
+    MpegTsParser parser;
+    QList<PesPacket> out;
+    QVERIFY(parser.pushTsPacket(tsPacket(0x0000, true, patSection(0x1000), 0), &out));
+    QVERIFY(parser.pushTsPacket(
+        tsPacket(0x1000, true, pmtSection({{0x1b, videoPid}, {0x0f, audioPid}}, videoPid), 0),
+        &out));
+
+    QByteArray oldAudioPayload;
+    for (int i = 0; i < 220; ++i) {
+        oldAudioPayload.append(char(0x80 | (i & 0x3f)));
+    }
+    const QByteArray oldAudioPes = pesPacket(0xc0, oldAudioPayload, 90000);
+    QVERIFY(parser.pushTsPacket(tsPacket(audioPid, true, oldAudioPes.left(184), 0), &out));
+    QCOMPARE(out.size(), 0);
+
+    MpegTsParser::TsPacketInfo info;
+    QVERIFY(parser.pushTsPacket(adaptationOnlyPacket(videoPid, 0, 0x80), &out, &info));
+    QVERIFY(info.discontinuity);
+
+    const QByteArray nextAudioPayload = QByteArray::fromHex("112233445566");
+    const QByteArray nextAudioPes = pesPacket(0xc0, nextAudioPayload, 180000);
+    QVERIFY(parser.pushTsPacket(tsPacket(audioPid, true, nextAudioPes, 1), &out));
+
+    QCOMPARE(out.size(), 1);
+    QCOMPARE(out.first().pid, audioPid);
+    QCOMPARE(out.first().pts90k, qint64(180000));
+    QCOMPARE(out.first().payload, nextAudioPayload);
 }
 
 void TestMpegTsParser::ignoresDuplicatePayloadStartPacket()

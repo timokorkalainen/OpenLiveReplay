@@ -349,6 +349,14 @@ jobs:
         # below adds worker-level coverage on top of the unit label.
         run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
 
+      - name: Run GPU async-readback, budget, seek-prefetch, and device-loss e2e gates
+        working-directory: build
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ctest --output-on-failure --repeat until-pass:2 --no-tests=error \
+            -L 'async-readback|av-sync|device-loss|gpu-budget|seek-prefetch'
+
       # clang-tidy is a GATE: WarningsAsErrors in .clang-tidy makes any finding in a
       # changed first-party file fatal, using the generated compile_commands.json.
       # The whole first-party tree is tidy-clean, so only regressions in touched
@@ -466,7 +474,7 @@ jobs:
             -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor rhi_d3d_probe
+          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge rhi_d3d_probe
 
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
@@ -512,7 +520,7 @@ jobs:
           srt_root="$(cd windows_build/dist/srt && pwd)"
           export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
           ctest --test-dir build-tests --output-on-failure \
-            -R '^(tst_nativeaacdecoder|tst_gpufence)$'
+            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge)$'
           gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
           if [ ! -x "$gpu_test" ]; then
             echo "::error::tst_gpucompositor executable not found"
@@ -671,7 +679,7 @@ jobs:
           - sanitizer: "thread"
             label: tsan-gpu
             advisory: false
-            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpucompositor_stress"
+            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring tst_gpucompositor_stress tst_asyncgpureadbacksink tst_iotargetsinkfactory tst_gpuencodepump tst_streamworker_gpuencode"
           # asan-e2e: only the e2e harness binaries need building — the playback
           # matrix drives play_harness + record_harness; the native SRT smoke
           # drives record_harness. Both link olr_sanitize, so this build is
@@ -795,7 +803,7 @@ jobs:
               -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
           elif [ "${{ matrix.label }}" = "tsan-gpu" ]; then
             ctest --output-on-failure --repeat until-pass:2 \
-              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpucompositor_stress)$'
+              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode)$'
           else
             ctest --output-on-failure --repeat until-pass:2 \
               -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'

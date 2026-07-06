@@ -62,6 +62,7 @@ private:
     RtmpHevcConfig m_hevcConfig;
     RtmpAacConfig m_aacConfig;
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
+    bool m_keepSurfaceDecodeActive = false;
     int m_outputChunkSize = 128;
     int m_streamId = 1;
     AnchoredSourceClock m_ownedClock{ClockQuality::FlvPll};

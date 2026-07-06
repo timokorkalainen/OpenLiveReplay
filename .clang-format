@@ -26,3 +26,21 @@ SpaceAfterCStyleCast: true
 Standard: c++17
 IncludeBlocks: Preserve
 ...
+---
+Language: ObjC
+BasedOnStyle: LLVM
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+PointerAlignment: Left
+ReferenceAlignment: Left
+AccessModifierOffset: -4
+AlwaysBreakTemplateDeclarations: Yes
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+BreakBeforeBraces: Attach
+NamespaceIndentation: None
+SortIncludes: false
+IncludeBlocks: Preserve
+...

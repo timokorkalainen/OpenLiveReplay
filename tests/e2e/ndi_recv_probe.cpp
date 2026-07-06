@@ -149,6 +149,8 @@ int main(int argc, char** argv) {
     std::vector<double> arrivals;
     std::vector<qint64> flashes;
     std::vector<qint64> beeps;
+    std::vector<qint64> videoTimecodes;
+    std::vector<qint64> audioTimecodes;
 
     // Map audio to a frame index by counting received audio samples.
     // audioSampleBase is set once the first video frame is received so that the
@@ -208,6 +210,7 @@ int main(int argc, char** argv) {
                         ++vTcSynth;
                     } else {
                         if (firstVideoTimecode < 0) firstVideoTimecode = tc;
+                        videoTimecodes.push_back(tc);
                         const qint64 expectedTc = (idx * 1000 * mk.fpsDen / mk.fpsNum) * 10000;
                         ++vTcChecked;
                         if (tc == expectedTc) ++vTcMatches;
@@ -228,7 +231,10 @@ int main(int argc, char** argv) {
                 // Audio shares the video tick's programme timecode (applyNdiFrameTiming), so a
                 // received audio frame must not carry the synthesize sentinel.
                 ++aTcSeen;
-                if (a.timecode == kTimecodeSynthesize) ++aTcSynth;
+                if (a.timecode == kTimecodeSynthesize)
+                    ++aTcSynth;
+                else
+                    audioTimecodes.push_back(a.timecode);
                 const double rms =
                     ndiMarkerAudioRmsFltp(reinterpret_cast<const float*>(a.p_data), a.no_samples);
                 // Only count beeps after the audio baseline is anchored to the first video.
@@ -249,16 +255,18 @@ int main(int argc, char** argv) {
 
     const NdiContinuity cont = ndiAnalyzeContinuity(indices);
     const int avSync = ndiAvSyncMaxFrames(flashes, beeps);
+    const int tcAvSync =
+        ndiTimecodeAvSyncMaxFrames(videoTimecodes, audioTimecodes, mk.fpsNum, mk.fpsDen);
     const NdiCadence cad = ndiAnalyzeCadence(arrivals, mk.fpsNum, mk.fpsDen);
 
     printf(
         "NDIRECV source=%s framesReceived=%lld drops=%lld dupes=%lld reorders=%lld "
-        "avSyncMaxFrames=%d maxGapFrames=%d meanRateHz=%.3f "
+        "avSyncMaxFrames=%d tcAvMaxFrames=%d maxGapFrames=%d meanRateHz=%.3f "
         "vTcFirst=%lld vTcChecked=%lld vTcMatches=%lld vTcSynth=%lld aTcSeen=%lld aTcSynth=%lld\n",
         want.toUtf8().constData(), (long long) cont.framesReceived, (long long) cont.drops,
-        (long long) cont.dupes, (long long) cont.reorders, avSync, cad.maxGapFrames, cad.meanRateHz,
-        (long long) firstVideoTimecode, (long long) vTcChecked, (long long) vTcMatches,
-        (long long) vTcSynth, (long long) aTcSeen, (long long) aTcSynth);
+        (long long) cont.dupes, (long long) cont.reorders, avSync, tcAvSync, cad.maxGapFrames,
+        cad.meanRateHz, (long long) firstVideoTimecode, (long long) vTcChecked,
+        (long long) vTcMatches, (long long) vTcSynth, (long long) aTcSeen, (long long) aTcSynth);
     fflush(stdout);
     return 0;
 }

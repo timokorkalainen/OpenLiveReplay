@@ -8,6 +8,7 @@
 #include "playback/output/win/d3dfence.h"
 #include "recorder_engine/ingest/nativeframecopy.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <d3d11.h>
@@ -26,14 +27,38 @@ namespace {
 class DeferredFence final : public GpuFence {
 public:
     uint64_t signal() override { return m_next.fetch_add(1, std::memory_order_acq_rel) + 1; }
-    bool wait(uint64_t value, int) override { return completedValue() >= value; }
+    bool wait(uint64_t value, int) override {
+        waits.fetch_add(1, std::memory_order_acq_rel);
+        lastValue.store(value, std::memory_order_release);
+        return completedValue() >= value;
+    }
     uint64_t completedValue() const override { return m_completed.load(std::memory_order_acquire); }
     void complete(uint64_t value) { m_completed.store(value, std::memory_order_release); }
+
+    std::atomic<int> waits{0};
+    std::atomic<uint64_t> lastValue{0};
 
 private:
     std::atomic<uint64_t> m_next{0};
     std::atomic<uint64_t> m_completed{0};
 };
+
+bool createTestD3D11Device(ComPtr<ID3D11Device>* device, ComPtr<ID3D11DeviceContext>* ctx) {
+    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
+    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                   D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1, D3D11_SDK_VERSION,
+                                   device, &level, ctx);
+    if (SUCCEEDED(hr)) return true;
+
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &want, 1,
+                           D3D11_SDK_VERSION, device, &level, ctx);
+    if (SUCCEEDED(hr)) return true;
+
+    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &want, 1, D3D11_SDK_VERSION,
+                           device, &level, ctx);
+    return SUCCEEDED(hr);
+}
 
 } // namespace
 #endif
@@ -42,11 +67,14 @@ class TestWinGpuImportEdge : public QObject {
     Q_OBJECT
 private slots:
     void probeIsConsistentAndNeverThrows();
+    void probeForcesHardwareDecoderEnumeration();
     void backendConstantIsValid();
     void createConsistentWithProbe();
     void nullSampleYieldsFallbackNullopt();
     void surfaceKeepsTextureAndTracksFence();
+    void importedFrameExposesRenderFence();
     void readToCpuDeinterleavesNv12ToI420();
+    void readToCpuWaitsForPendingFenceBeforeCopy();
     void fenceSignalsAndWaits();
     void fenceWaitForeverWaitsUntilSignal();
     void importedReadbackMatchesCpuDecodeWithinOneLsb();
@@ -60,9 +88,23 @@ void TestWinGpuImportEdge::probeIsConsistentAndNeverThrows() {
         QVERIFY2(caps.d3d11KeepTexture, "rhiImportable but keep-texture failed");
     }
     QVERIFY(!caps.detail.isEmpty());
+#ifdef _WIN32
+    if (caps.d3d11KeepTexture) {
+        QVERIFY2(caps.detail.contains(QStringLiteral("decoded MF H.264 sample")),
+                 "positive Windows GPU import probe must be based on a decoded sample import");
+    }
+#endif
 #ifndef _WIN32
     QVERIFY2(!caps.d3d11KeepTexture, "non-Windows must report no keep-texture");
     QVERIFY2(!caps.rhiImportable, "non-Windows must report no RHI import");
+#endif
+}
+
+void TestWinGpuImportEdge::probeForcesHardwareDecoderEnumeration() {
+#ifndef _WIN32
+    QSKIP("Windows-only hardware decoder probe flag");
+#else
+    QVERIFY(winGpuImportProbeForcesHardwareDecoderForTest());
 #endif
 }
 
@@ -107,11 +149,7 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
 #else
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
-    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
-                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = 1280;
@@ -140,17 +178,53 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
 #endif
 }
 
+void TestWinGpuImportEdge::importedFrameExposesRenderFence() {
+#ifndef _WIN32
+    QSKIP("D3D11GpuSurface is Windows-only");
+#else
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> ctx;
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
+
+    auto surface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64);
+    QVERIFY(surface != nullptr);
+    auto renderFence = std::make_shared<DeferredFence>();
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 64;
+
+    const FrameHandle handle =
+        WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence);
+
+    QVERIFY(handle.isGpuBacked());
+    QVERIFY(handle.data() != nullptr);
+    QVERIFY(handle.data()->gpuFence() == renderFence);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
+    renderFence->complete(1);
+    gpuDrainCompletedReadbackRetains();
+#endif
+}
+
 void TestWinGpuImportEdge::readToCpuDeinterleavesNv12ToI420() {
 #ifndef _WIN32
     QSKIP("D3D11 readback is Windows-only");
 #else
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
-    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
-                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
 
     constexpr int kW = 8;
     constexpr int kH = 8;
@@ -214,17 +288,63 @@ void TestWinGpuImportEdge::readToCpuDeinterleavesNv12ToI420() {
 #endif
 }
 
+void TestWinGpuImportEdge::readToCpuWaitsForPendingFenceBeforeCopy() {
+#ifndef _WIN32
+    QSKIP("D3D11 readback is Windows-only");
+#else
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> ctx;
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
+
+    constexpr int kW = 8;
+    constexpr int kH = 8;
+    std::vector<uint8_t> nv12(size_t(kW) * kH + size_t(kW) * (kH / 2), uint8_t(128));
+    std::fill(nv12.begin(), nv12.begin() + size_t(kW) * kH, uint8_t(32));
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = kW;
+    desc.Height = kH;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
+    ctx->UpdateSubresource(texture.Get(), 0, nullptr, nv12.data(), UINT(kW), 0);
+
+    auto surface = D3D11GpuSurface::createKept(device, texture, 0, kW, kH);
+    QVERIFY(surface != nullptr);
+    auto fence = std::make_shared<DeferredFence>();
+
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = kW;
+    meta.key.height = kH;
+    const FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, fence);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
+
+    QVERIFY(!handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
+    QCOMPARE(fence->waits.load(std::memory_order_acquire), 1);
+    QCOMPARE(fence->lastValue.load(std::memory_order_acquire), uint64_t(1));
+
+    fence->complete(1);
+    const CpuPlanes got = handle.readToCpu(FramePixelFormat::Yuv420p);
+    QVERIFY(got.isValid());
+    QCOMPARE(fence->waits.load(std::memory_order_acquire), 2);
+    fence->complete(2);
+    gpuDrainCompletedReadbackRetains();
+#endif
+}
+
 void TestWinGpuImportEdge::fenceSignalsAndWaits() {
 #ifndef _WIN32
     QSKIP("D3D fence is Windows-only");
 #else
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
-    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
-                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
     QString error;
     auto fence = D3DFence::create(device.Get(), &error);
     if (!fence) QSKIP(qPrintable(error));
@@ -241,11 +361,7 @@ void TestWinGpuImportEdge::fenceWaitForeverWaitsUntilSignal() {
 #else
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
-    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
-                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
     QString error;
     auto fence = D3DFence::create(device.Get(), &error);
     if (!fence) QSKIP(qPrintable(error));
@@ -271,11 +387,7 @@ void TestWinGpuImportEdge::importedReadbackMatchesCpuDecodeWithinOneLsb() {
 
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
-    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
-                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
 
     constexpr int kW = 8;
     constexpr int kH = 8;
@@ -348,11 +460,7 @@ void TestWinGpuImportEdge::allocFailureDegradesToCpuFallback() {
 #else
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
-    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
-                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = 64;
     desc.Height = 64;
@@ -382,11 +490,7 @@ void TestWinGpuImportEdge::surfaceSurvivesInFlightReadback() {
 #else
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
-    QVERIFY(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                        D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1,
-                                        D3D11_SDK_VERSION, &device, &level, &ctx)));
+    if (!createTestD3D11Device(&device, &ctx)) QSKIP("no D3D11 test device available");
     constexpr int kW = 8;
     constexpr int kH = 8;
     std::vector<uint8_t> nv12(size_t(kW) * kH + size_t(kW) * (kH / 2), 0x80);
@@ -416,14 +520,16 @@ void TestWinGpuImportEdge::surfaceSurvivesInFlightReadback() {
     meta.key.width = kW;
     meta.key.height = kH;
     FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence);
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
     surface.reset();
     QVERIFY(!weak.expired());
+    renderFence->complete(1);
     QVERIFY(handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
     handle = FrameHandle();
     QVERIFY(!weak.expired());
     QVERIFY(gpuPendingReadbackRetainCount() >= 1);
 
-    renderFence->complete(1);
+    renderFence->complete(2);
     gpuDrainCompletedReadbackRetains();
     QVERIFY(weak.expired());
 #endif

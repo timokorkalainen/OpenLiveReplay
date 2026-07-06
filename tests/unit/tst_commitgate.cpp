@@ -1,4 +1,6 @@
 #include <QtTest>
+#include <QFile>
+
 #include "playback/commitgate.h"
 
 class TestCommitGate : public QObject {
@@ -12,6 +14,7 @@ private slots:
     void repositionCommitRequiresSameSeekGeneration();
     void repositionCommitBodyRunsOnlyForOriginalSeek();
     void gpuGenerationInvalidatesOnlyWhenSeekGateIsHeld();
+    void legacyMediaVideoFrameTypeIsRetired();
 };
 
 // committedGen == seekGen -> no reposition outstanding -> expose the LIVE
@@ -105,6 +108,15 @@ void TestCommitGate::gpuGenerationInvalidatesOnlyWhenSeekGateIsHeld() {
         /*startedSeekGen*/ 7, /*committedGen*/ 6));
     QVERIFY(!CommitGate::shouldInvalidateGpuGenerationForReposition(
         /*startedSeekGen*/ 7, /*committedGen*/ 7));
+}
+
+void TestCommitGate::legacyMediaVideoFrameTypeIsRetired() {
+    QFile mediaFrame(QStringLiteral(OLR_SOURCE_DIR "/playback/output/mediaframe.h"));
+    QVERIFY2(mediaFrame.open(QIODevice::ReadOnly), qPrintable(mediaFrame.errorString()));
+
+    const QByteArray source = mediaFrame.readAll();
+    QVERIFY2(!source.contains("struct MediaVideoFrame"),
+             "MediaVideoFrame must stay retired; use FrameHandle plus MediaVideoFrameView");
 }
 
 QTEST_MAIN(TestCommitGate)

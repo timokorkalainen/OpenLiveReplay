@@ -1,6 +1,13 @@
 #include <QtTest>
 
+#include "playback/gpu/gpurhicontext.h"
 #include "playback/output/outputruntime.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 static FrameHandle video(int feed, qint64 pts, uchar y) {
     FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
@@ -59,6 +66,69 @@ private:
     QVector<OutputBusFrame> m_frames;
 };
 
+class RuntimeSetterDuringSubmitSink final : public IOutputSink {
+public:
+    ~RuntimeSetterDuringSubmitSink() override { joinSetter(); }
+
+    void setRuntime(OutputRuntime* runtime) { m_runtime = runtime; }
+
+    OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        m_active = assignment.enabled && rate.isValid();
+        return m_active;
+    }
+
+    void stop() override { m_active = false; }
+
+    bool isActive() const override { return m_active; }
+
+    bool submit(const OutputBusFrame&) override {
+        if (!m_active || !m_runtime) return false;
+
+        joinSetter();
+        m_setterStarted.store(false, std::memory_order_release);
+        m_setterReturned.store(false, std::memory_order_release);
+        m_setterReturnedDuringSubmit.store(false, std::memory_order_release);
+        m_setterThread = std::thread([this]() {
+            m_setterStarted.store(true, std::memory_order_release);
+            m_runtime->setSnapshotProvider([]() { return OutputRuntimeSnapshot(); });
+            m_setterReturned.store(true, std::memory_order_release);
+            m_setterReturnedCv.notify_all();
+        });
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (!m_setterStarted.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::unique_lock<std::mutex> lock(m_setterReturnedMutex);
+        const bool returned = m_setterReturnedCv.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return m_setterReturned.load(std::memory_order_acquire);
+        });
+        m_setterReturnedDuringSubmit.store(returned, std::memory_order_release);
+        return true;
+    }
+
+    bool setterReturnedDuringSubmit() const {
+        return m_setterReturnedDuringSubmit.load(std::memory_order_acquire);
+    }
+
+    void joinSetter() {
+        if (m_setterThread.joinable()) m_setterThread.join();
+    }
+
+private:
+    OutputRuntime* m_runtime = nullptr;
+    bool m_active = false;
+    std::atomic<bool> m_setterStarted = false;
+    std::atomic<bool> m_setterReturned = false;
+    std::atomic<bool> m_setterReturnedDuringSubmit = false;
+    std::mutex m_setterReturnedMutex;
+    std::condition_variable m_setterReturnedCv;
+    std::thread m_setterThread;
+};
+
 class TestOutputRuntime : public QObject {
     Q_OBJECT
 private slots:
@@ -70,6 +140,10 @@ private slots:
     void runtimeStatsReportDeadlineMissWhenCatchUpIsCapped();
     void runtimeClearsDeadlineMissLatchAfterRecovery();
     void fenceWaitStallsCanBeIncremented();
+    void recordGpuBudgetSurfacesInStats();
+    void injectedGpuRhiContextIsReusedAndReplaceable();
+    void dispatchSubmitsWithoutHoldingRuntimeMutex();
+    void endpointReconfigurationDiscardsPreReconfigSnapshot();
 };
 
 void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
@@ -349,6 +423,124 @@ void TestOutputRuntime::fenceWaitStallsCanBeIncremented() {
     runtime.incrementFenceWaitStalls();
 
     QCOMPARE(runtime.stats().fenceWaitStalls, qint64(2));
+}
+
+void TestOutputRuntime::recordGpuBudgetSurfacesInStats() {
+    OutputRuntime runtime(FrameRate::fromFraction(60, 1), 1, 64, 48);
+
+    QCOMPARE(runtime.stats().gpuVramBytes, qint64(0));
+    QCOMPARE(runtime.stats().gpuOomDegrades, qint64(0));
+    QCOMPARE(runtime.stats().gpuDeviceLossEvents, qint64(0));
+
+    runtime.recordGpuBudget(3110400, 2);
+    runtime.recordGpuDeviceLossEvents(1);
+    QCOMPARE(runtime.stats().gpuVramBytes, qint64(3110400));
+    QCOMPARE(runtime.stats().gpuOomDegrades, qint64(2));
+    QCOMPARE(runtime.stats().gpuDeviceLossEvents, qint64(1));
+
+    runtime.recordGpuBudget(6220800, 3);
+    runtime.recordGpuDeviceLossEvents(2);
+    QCOMPARE(runtime.stats().gpuVramBytes, qint64(6220800));
+    QCOMPARE(runtime.stats().gpuOomDegrades, qint64(3));
+    QCOMPARE(runtime.stats().gpuDeviceLossEvents, qint64(2));
+
+    runtime.recordGpuDeviceLossEvents(-1);
+    QCOMPARE(runtime.stats().gpuDeviceLossEvents, qint64(0));
+}
+
+void TestOutputRuntime::injectedGpuRhiContextIsReusedAndReplaceable() {
+#ifndef OLR_GPU_PIPELINE_BUILD
+    QSKIP("GPU pipeline disabled");
+#else
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto initial = GpuRhiContext::createInvalidForTest();
+    auto replacement = GpuRhiContext::createInvalidForTest();
+    QVERIFY(initial != nullptr);
+    QVERIFY(replacement != nullptr);
+    QVERIFY(initial != replacement);
+
+    OutputRuntime runtime(FrameRate::fromFraction(60, 1), 1, 64, 48, initial);
+    QCOMPARE(runtime.gpuRhiContextForTest(), initial);
+
+    runtime.setGpuRhiContext(replacement);
+
+    QCOMPARE(runtime.gpuRhiContextForTest(), replacement);
+    qunsetenv("OLR_GPU_PIPELINE");
+#endif
+}
+
+void TestOutputRuntime::dispatchSubmitsWithoutHoldingRuntimeMutex() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 105));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    RuntimeSetterDuringSubmitSink sink;
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    sink.setRuntime(&runtime);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    sink.joinSetter();
+
+    QVERIFY2(sink.setterReturnedDuringSubmit(),
+             "sink submission must not run while OutputRuntime::m_mutex is held; GPU readback "
+             "sinks can block on fences while submitting");
+}
+
+void TestOutputRuntime::endpointReconfigurationDiscardsPreReconfigSnapshot() {
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+
+    OutputFrameCache full(1, 4, 4);
+    full.insertVideoFrame(video(0, 100, 91));
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    int snapshots = 0;
+    runtime.setSnapshotProvider([&]() {
+        ++snapshots;
+        OutputRuntimeSnapshot snapshot;
+        snapshot.state = state;
+        if (snapshots == 1) {
+            runtime.setEndpoints({{assignment, &sink}});
+            return snapshot;
+        }
+        snapshot.cache = full;
+        return snapshot;
+    });
+
+    runtime.dispatchDueTicksForTest(0);
+
+    QCOMPARE(snapshots, 2);
+    const QVector<OutputBusFrame> frames = sink.frames();
+    QCOMPARE(frames.size(), 1);
+    QVERIFY(!frames.first().video.metadata().key.isPlaceholder);
+    QCOMPARE(frames.first().video.metadata().key.ptsMs, qint64(100));
+    QCOMPARE(yAt(frames.first(), 0), uchar(91));
 }
 
 QTEST_GUILESS_MAIN(TestOutputRuntime)

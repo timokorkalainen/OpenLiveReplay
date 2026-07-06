@@ -937,7 +937,13 @@ bool NativeVideoDecoder::Impl::processOutput(FrameCallback* onFrame, KeepSurface
                 const qint64 framePts = SUCCEEDED(completedSample->GetSampleTime(&sampleTime))
                                             ? mfTimeToPts90k(sampleTime)
                                             : pts90k;
-                (*onSurface)(completedSample.Get(), framePts);
+                if (!(*onSurface)(completedSample.Get(), framePts)) {
+                    if (error) {
+                        *error = QStringLiteral(
+                            "Media Foundation keep-surface callback rejected decoded surface");
+                    }
+                    return false;
+                }
                 return true;
             }
 

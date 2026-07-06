@@ -171,6 +171,10 @@ signals:
     // Sustained fatal muxer write error (e.g. ENOSPC). Recording is NOT auto-stopped.
     void recordingError(const QString& message);
 
+#ifdef OLR_UNIT_TEST
+    friend class TestReplayManagerTelemetry;
+#endif
+
 private slots:
     void onTimerTick();
 

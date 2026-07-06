@@ -5,11 +5,17 @@
 #include <QDebug>
 #include <QRegularExpression>
 
+#include <limits>
+
 Muxer::Muxer() {}
 
-Muxer::~Muxer() { close(); }
+Muxer::~Muxer() {
+    close();
+}
 
 namespace {
+thread_local const Muxer* t_writerMuxer = nullptr;
+
 // True iff `tc` is a well-formed SMPTE timecode "HH:MM:SS:FF" (or ';' before the
 // frames field for drop-frame). Empty/malformed -> false, so no tag is written
 // and a no-TC recording stays byte-identical. Deliberately a shape check only;
@@ -88,11 +94,26 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
 
     // 1. Create Format Context for Matroska
     m_activePath = getVideoPath(filename);
-    avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska", m_activePath.toUtf8().constData());
+    avformat_alloc_output_context2(&m_outCtx, nullptr, "matroska",
+                                   m_activePath.toUtf8().constData());
     if (!m_outCtx) return false;
 
     if (codec == VideoCodecChoice::H264Hardware && videoExtradata.isEmpty()) {
         qWarning() << "Muxer: H.264 selected but no avcC extradata provided; refusing to init.";
+        avformat_free_context(m_outCtx);
+        m_outCtx = nullptr;
+        resetTelemetryTracks();
+        return false;
+    }
+    if (videoExtradata.size() > std::numeric_limits<int>::max()) {
+        qWarning() << "Muxer: H.264 extradata is too large.";
+        avformat_free_context(m_outCtx);
+        m_outCtx = nullptr;
+        resetTelemetryTracks();
+        return false;
+    }
+    if (telemetryFeedIds.size() > std::numeric_limits<int>::max()) {
+        qWarning() << "Muxer: too many telemetry tracks.";
         avformat_free_context(m_outCtx);
         m_outCtx = nullptr;
         resetTelemetryTracks();
@@ -105,17 +126,17 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->id = i;
 
         // 1. Set parameters
-        st->codecpar->codec_id = (codec == VideoCodecChoice::H264Hardware)
-                                     ? AV_CODEC_ID_H264
-                                     : AV_CODEC_ID_MPEG2VIDEO;
+        st->codecpar->codec_id =
+            (codec == VideoCodecChoice::H264Hardware) ? AV_CODEC_ID_H264 : AV_CODEC_ID_MPEG2VIDEO;
         if (codec == VideoCodecChoice::H264Hardware) {
+            const int extradataSize = static_cast<int>(videoExtradata.size());
             // Invariant: videoExtradata is guaranteed non-empty by the up-front
             // guard at the top of init() (which returns false for H264Hardware
             // with empty extradata), so no emptiness re-check is needed here.
             // H.264 requires avcC (AVCDecoderConfigurationRecord) as CodecPrivate
             // in Matroska; MPEG-2 does not attach extradata and omits this block.
             st->codecpar->extradata = static_cast<uint8_t*>(
-                av_mallocz(videoExtradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                av_mallocz(static_cast<size_t>(extradataSize) + AV_INPUT_BUFFER_PADDING_SIZE));
             if (!st->codecpar->extradata) {
                 qWarning() << "Muxer: failed to allocate H.264 extradata.";
                 avformat_free_context(m_outCtx);
@@ -123,8 +144,9 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
                 resetTelemetryTracks();
                 return false;
             }
-            memcpy(st->codecpar->extradata, videoExtradata.constData(), videoExtradata.size());
-            st->codecpar->extradata_size = static_cast<int>(videoExtradata.size());
+            memcpy(st->codecpar->extradata, videoExtradata.constData(),
+                   static_cast<size_t>(extradataSize));
+            st->codecpar->extradata_size = extradataSize;
         }
         st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
         st->codecpar->width = width;
@@ -156,12 +178,12 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     for (int i = 0; i < videoTrackCount; i++) {
         AVStream* st = avformat_new_stream(m_outCtx, nullptr);
         st->id = videoTrackCount + i;
-        st->codecpar->codec_id    = AV_CODEC_ID_PCM_S16LE;
-        st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
+        st->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE;
+        st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
         st->codecpar->sample_rate = audioSampleRate;
-        st->codecpar->format      = AV_SAMPLE_FMT_S16;
-        st->codecpar->bit_rate    = audioSampleRate * audioChannels * 16;
-        st->codecpar->frame_size  = 0; // PCM has no fixed frame size
+        st->codecpar->format = AV_SAMPLE_FMT_S16;
+        st->codecpar->bit_rate = static_cast<int64_t>(audioSampleRate) * audioChannels * 16;
+        st->codecpar->frame_size = 0; // PCM has no fixed frame size
         av_channel_layout_default(&st->codecpar->ch_layout, audioChannels);
         st->time_base = {1, 1000};
 
@@ -174,8 +196,8 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     for (int i = 0; i < videoTrackCount; i++) {
         AVStream* st = avformat_new_stream(m_outCtx, nullptr);
         st->id = m_subtitleTrackOffset + i;
-        st->codecpar->codec_id    = AV_CODEC_ID_TEXT;
-        st->codecpar->codec_type  = AVMEDIA_TYPE_SUBTITLE;
+        st->codecpar->codec_id = AV_CODEC_ID_TEXT;
+        st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
         st->time_base = {1, 1000};
 
         const QString subTitle = QString("Track %1 Metadata").arg(i + 1);
@@ -185,7 +207,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     // 2c. Add one subtitle track per configured feed for feed telemetry
     m_telemetryTrackOffset = m_subtitleTrackOffset + videoTrackCount;
     m_telemetryTrackCount = static_cast<int>(telemetryFeedIds.size());
-    for (int i = 0; i < telemetryFeedIds.size(); ++i) {
+    for (int i = 0; i < m_telemetryTrackCount; ++i) {
         AVStream* st = avformat_new_stream(m_outCtx, nullptr);
         st->id = m_telemetryTrackOffset + i;
         st->codecpar->codec_id = AV_CODEC_ID_TEXT;
@@ -193,7 +215,8 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         st->time_base = {1, 1000};
 
         const QString& feedId = telemetryFeedIds.at(i);
-        const QString feedName = i < telemetryFeedNames.size() ? telemetryFeedNames.at(i) : QString();
+        const QString feedName =
+            i < telemetryFeedNames.size() ? telemetryFeedNames.at(i) : QString();
         const QString title = QString("Feed %1 Telemetry").arg(feedId);
         av_dict_set(&st->metadata, "title", title.toUtf8().constData(), 0);
         av_dict_set(&st->metadata, "olr_track_type", "feed_telemetry", 0);
@@ -252,6 +275,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     // av_write_frame/avio_flush on m_outCtx; the header write itself happens on the
     // ENQUEUEING (caller) thread, before the packet is handed off, so it never
     // races the writer thread.
+    m_blockingWritesAllowed.store(true, std::memory_order_release);
     m_writerRunning = true;
     m_writerThread = std::thread(&Muxer::writerLoop, this);
 
@@ -311,12 +335,16 @@ void Muxer::setStartTimecodeCandidate(const QString& tc) {
     }
 }
 
-void Muxer::writePacket(AVPacket* pkt) {
+bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten) {
     // ENQUEUE-ONLY. Clone the caller's packet (the caller still owns theirs,
     // exactly as before) and hand the clone to the writer thread, then return
     // immediately. The DTS-bump, av_write_frame and avio_flush all happen on
     // the writer thread — so a stalled disk no longer blocks the caller.
-    if (!m_writerRunning.load(std::memory_order_acquire)) return;
+    const bool writerThreadDrain = (t_writerMuxer == this);
+    if (!m_writerRunning.load(std::memory_order_acquire) && !writerThreadDrain) {
+        if (onWritten) onWritten(false);
+        return false;
+    }
 
     // Deferred header: NOT committed here anymore. The writer thread commits the
     // header (ensureHeaderWritten) just before it writes the first packet, after
@@ -324,26 +352,66 @@ void Muxer::writePacket(AVPacket* pkt) {
     // TC can win the tmcd tag. Enqueue-only here keeps the producer non-blocking
     // and lets the writer hold early no-TC packets without dropping or reordering.
 
+    if (!pkt) {
+        if (onWritten) onWritten(false);
+        return false;
+    }
+
     AVPacket* localPkt = av_packet_clone(pkt);
-    if (!localPkt) return;
+    if (!localPkt) {
+        if (onWritten) onWritten(false);
+        return false;
+    }
 
     std::unique_lock<std::mutex> lk(m_qMutex);
     // Backpressure: never drop (dropping corrupts the file) and never grow
     // unbounded. A transient stall is absorbed by the queue; a SUSTAINED
     // disk-too-slow eventually blocks the caller here — unavoidable, the disk
     // literally cannot keep up — but it is still strictly better than blocking
-    // on every single packet. Re-check m_writerRunning so close() can wake us.
-    m_qCv.wait(lk, [this] {
-        return m_pktQueue.size() < kMaxQueued || !m_writerRunning.load(std::memory_order_acquire);
+    // on every single packet. During shutdown drain, blocked producers wake and
+    // reject if still full; in-flight packets may still enqueue when space exists.
+    m_qCv.wait(lk, [this, writerThreadDrain] {
+        return writerThreadDrain || m_pktQueue.size() < kMaxQueued ||
+               !m_writerRunning.load(std::memory_order_acquire) ||
+               !m_blockingWritesAllowed.load(std::memory_order_acquire);
     });
-    if (!m_writerRunning.load(std::memory_order_acquire)) {
+    if (!m_writerRunning.load(std::memory_order_acquire) && !writerThreadDrain) {
         // Shutting down; do not enqueue (close() is draining/finishing).
+        lk.unlock();
         av_packet_free(&localPkt);
-        return;
+        if (onWritten) onWritten(false);
+        return false;
     }
-    m_pktQueue.push(localPkt);
+    if (!writerThreadDrain && m_pktQueue.size() >= kMaxQueued) {
+        lk.unlock();
+        av_packet_free(&localPkt);
+        if (onWritten) onWritten(false);
+        return false;
+    }
+    m_pktQueue.push(QueuedPacket{localPkt, std::move(onWritten)});
     lk.unlock();
     m_qCv.notify_one();
+    return true;
+}
+
+void Muxer::beginShutdownDrain() {
+    m_blockingWritesAllowed.store(false, std::memory_order_release);
+    m_qCv.notify_all();
+}
+
+void Muxer::normalizePacketDts(AVPacket* pkt) {
+    if (!pkt) return;
+    const int idx = pkt->stream_index;
+    auto it = m_lastDts.constFind(idx);
+    if (it != m_lastDts.constEnd() && pkt->dts <= it.value()) {
+        pkt->dts = it.value() + 1;
+        if (pkt->pts < pkt->dts) pkt->pts = pkt->dts;
+    }
+}
+
+void Muxer::rememberWrittenPacketDts(const AVPacket* pkt) {
+    if (!pkt) return;
+    m_lastDts[pkt->stream_index] = pkt->dts;
 }
 
 void Muxer::recordWriteOutcome(bool failed, const char* errLabel) {
@@ -363,8 +431,13 @@ void Muxer::recordWriteOutcome(bool failed, const char* errLabel) {
 }
 
 void Muxer::writerLoop() {
+    t_writerMuxer = this;
+    struct WriterMarkerReset {
+        ~WriterMarkerReset() { t_writerMuxer = nullptr; }
+    } markerReset;
+
     for (;;) {
-        AVPacket* pkt = nullptr;
+        QueuedPacket queued;
         {
             std::unique_lock<std::mutex> lk(m_qMutex);
             // Wait for work, or for shutdown. Keep draining while the queue is
@@ -390,7 +463,7 @@ void Muxer::writerLoop() {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
-            pkt = m_pktQueue.front();
+            queued = std::move(m_pktQueue.front());
             m_pktQueue.pop();
         }
         // Notify a possibly back-pressured producer that there is now room.
@@ -401,7 +474,8 @@ void Muxer::writerLoop() {
         // registered. On a fatal header failure record the outcome and drop the
         // packet (file is unusable if the header never landed).
         if (!ensureHeaderWritten()) {
-            av_packet_free(&pkt);
+            if (queued.onWritten) queued.onWritten(false);
+            av_packet_free(&queued.pkt);
             recordWriteOutcome(true, "avformat_write_header failed");
             continue;
         }
@@ -412,29 +486,28 @@ void Muxer::writerLoop() {
         // Dropping was too aggressive: when a source was re-mapped to a view
         // track that had blue-frame DTS ahead of the source encoder's counter,
         // every packet was silently lost.  Bumping preserves the data.
+        AVPacket* pkt = queued.pkt;
         const int idx = pkt->stream_index;
-        auto it = m_lastDts.constFind(idx);
-        if (it != m_lastDts.constEnd() && pkt->dts <= it.value()) {
-            pkt->dts = it.value() + 1;
-            if (pkt->pts < pkt->dts) pkt->pts = pkt->dts;
-        }
-        m_lastDts[idx] = pkt->dts;
+        normalizePacketDts(pkt);
 
         // Use av_write_frame (non-interleaved) so that each stream writes
         // independently. av_interleaved_write_frame buffers packets across
         // ALL streams and won't flush stream A until stream B catches up,
         // causing one disrupted source to freeze every other source.
         const int ret = av_write_frame(m_outCtx, pkt);
-        av_packet_free(&pkt); // av_write_frame does NOT take ownership
 
         if (ret < 0) {
             char errbuf[AV_ERROR_MAX_STRING_SIZE] = {0};
             av_strerror(ret, errbuf, sizeof(errbuf));
             qDebug() << "Muxer: write error for stream" << idx << ":" << errbuf;
             recordWriteOutcome(true, errbuf);
+            if (queued.onWritten) queued.onWritten(false);
         } else {
+            rememberWrittenPacketDts(pkt);
             recordWriteOutcome(false, nullptr);
+            if (queued.onWritten) queued.onWritten(true);
         }
+        av_packet_free(&pkt); // av_write_frame does NOT take ownership
 
         // Flush at most every ~100 ms: keeps the chase-play reader within a
         // cluster of the live edge without a disk flush per packet.
@@ -448,65 +521,71 @@ void Muxer::writerLoop() {
     }
 }
 
-void Muxer::writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData) {
-    if (!m_initialized || !m_outCtx || jsonData.isEmpty()) return;
+bool Muxer::writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData) {
+    if (!m_initialized || !m_outCtx || jsonData.isEmpty()) return false;
+    if (jsonData.size() > std::numeric_limits<int>::max()) return false;
 
     const int subTrackIndex = m_subtitleTrackOffset + viewTrack;
-    if (subTrackIndex < 0 || subTrackIndex >= (int)m_outCtx->nb_streams) return;
+    if (subTrackIndex < 0 || subTrackIndex >= (int) m_outCtx->nb_streams) return false;
 
     AVStream* st = m_outCtx->streams[subTrackIndex];
-    if (!st) return;
+    if (!st) return false;
 
     AVPacket* pkt = av_packet_alloc();
-    if (!pkt) return;
+    if (!pkt) return false;
 
-    if (av_new_packet(pkt, static_cast<int>(jsonData.size())) < 0) {
+    const int packetSize = static_cast<int>(jsonData.size());
+    if (av_new_packet(pkt, packetSize) < 0) {
         av_packet_free(&pkt);
-        return;
+        return false;
     }
-    memcpy(pkt->data, jsonData.constData(), jsonData.size());
+    memcpy(pkt->data, jsonData.constData(), static_cast<size_t>(packetSize));
 
     pkt->stream_index = subTrackIndex;
-    pkt->pts      = av_rescale_q(ptsMs, {1, 1000}, st->time_base);
-    pkt->dts      = pkt->pts;
+    pkt->pts = av_rescale_q(ptsMs, {1, 1000}, st->time_base);
+    pkt->dts = pkt->pts;
     pkt->duration = av_rescale_q(1, {1, 1000}, st->time_base);
 
-    writePacket(pkt);
+    const bool accepted = writePacket(pkt);
     av_packet_free(&pkt);
+    return accepted;
 }
 
-void Muxer::writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData) {
-    if (!m_initialized || !m_outCtx || jsonData.isEmpty()) return;
-    if (feedIndex < 0 || feedIndex >= m_telemetryTrackCount) return;
+bool Muxer::writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData) {
+    if (!m_initialized || !m_outCtx || jsonData.isEmpty()) return false;
+    if (jsonData.size() > std::numeric_limits<int>::max()) return false;
+    if (feedIndex < 0 || feedIndex >= m_telemetryTrackCount) return false;
 
     const int trackIndex = m_telemetryTrackOffset + feedIndex;
-    if (trackIndex < 0 || trackIndex >= (int)m_outCtx->nb_streams) return;
+    if (trackIndex < 0 || trackIndex >= (int) m_outCtx->nb_streams) return false;
 
     AVStream* st = m_outCtx->streams[trackIndex];
-    if (!st) return;
+    if (!st) return false;
 
     AVPacket* pkt = av_packet_alloc();
-    if (!pkt) return;
+    if (!pkt) return false;
 
-    if (av_new_packet(pkt, static_cast<int>(jsonData.size())) < 0) {
+    const int packetSize = static_cast<int>(jsonData.size());
+    if (av_new_packet(pkt, packetSize) < 0) {
         av_packet_free(&pkt);
-        return;
+        return false;
     }
-    memcpy(pkt->data, jsonData.constData(), jsonData.size());
+    memcpy(pkt->data, jsonData.constData(), static_cast<size_t>(packetSize));
 
     pkt->stream_index = trackIndex;
-    pkt->pts      = av_rescale_q(ptsMs, {1, 1000}, st->time_base);
-    pkt->dts      = pkt->pts;
+    pkt->pts = av_rescale_q(ptsMs, {1, 1000}, st->time_base);
+    pkt->dts = pkt->pts;
     pkt->duration = av_rescale_q(1, {1, 1000}, st->time_base);
 
-    writePacket(pkt);
+    const bool accepted = writePacket(pkt);
     av_packet_free(&pkt);
+    return accepted;
 }
 
 AVStream* Muxer::getStream(int index) {
     // REMOVED LOCKER HERE: Reading nb_streams and streams is safe
     // after init() is finished and before close() starts.
-    if (!m_outCtx || index < 0 || index >= (int)m_outCtx->nb_streams) {
+    if (!m_outCtx || index < 0 || index >= (int) m_outCtx->nb_streams) {
         return nullptr;
     }
     return m_outCtx->streams[index];
@@ -521,14 +600,10 @@ void Muxer::close() {
     // BEFORE we proceed to the trailer. Caller contract (ReplayManager):
     // workers are stopped+joined and the heartbeat is stopped before close(),
     // so no thread enqueues concurrently here.
-    if (m_writerRunning.exchange(false)) {
-        m_qCv.notify_all();
-        if (m_writerThread.joinable()) m_writerThread.join();
-    } else if (m_writerThread.joinable()) {
-        // init() started a thread but writerRunning was already cleared
-        // (e.g. a second close()): still join to avoid a dangling thread.
-        m_writerThread.join();
-    }
+    beginShutdownDrain();
+    m_writerRunning.store(false, std::memory_order_release);
+    m_qCv.notify_all();
+    if (m_writerThread.joinable()) m_writerThread.join();
 
     // Defensive: on a clean close the writer drains fully, so the queue is
     // empty here. Free anything left only to guarantee no leak on an abnormal
@@ -536,7 +611,7 @@ void Muxer::close() {
     {
         std::lock_guard<std::mutex> lk(m_qMutex);
         while (!m_pktQueue.empty()) {
-            AVPacket* p = m_pktQueue.front();
+            AVPacket* p = m_pktQueue.front().pkt;
             m_pktQueue.pop();
             av_packet_free(&p);
         }
@@ -595,8 +670,8 @@ QString Muxer::getVideoPath(QString fileName) {
     if (!dir.exists()) dir.mkpath(".");
     const QFileInfo baseInfo(base);
     if (!baseInfo.isDir() || !baseInfo.isWritable()) {
-        qWarning() << "Muxer: save location unusable, falling back to"
-                   << fallback << "(configured:" << base << ")";
+        qWarning() << "Muxer: save location unusable, falling back to" << fallback
+                   << "(configured:" << base << ")";
         // Configured location unusable: fall back to the default
         base = fallback;
         QDir fb(base);

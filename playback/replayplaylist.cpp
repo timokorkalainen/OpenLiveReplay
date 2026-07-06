@@ -63,7 +63,8 @@ int ReplayPlaylist::markIn(const QString& clipPath, qint64 inMs) {
     e.outMs = -1;
     e.speed = 1.0;
     m_entries.append(e);
-    return static_cast<int>(m_entries.size()) - 1;
+    const qsizetype index = m_entries.size() - 1;
+    return static_cast<int>(qMin<qsizetype>(index, std::numeric_limits<int>::max()));
 }
 
 bool ReplayPlaylist::markOut(qint64 outMs) {

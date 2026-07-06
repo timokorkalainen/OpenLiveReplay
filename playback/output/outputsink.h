@@ -35,6 +35,12 @@ public:
     virtual bool isActive() const = 0;
     virtual bool submit(const OutputBusFrame& frame) = 0;
     virtual OutputSinkStatus outputStatus() const { return OutputSinkStatus{}; }
+    virtual bool needsContinuousCadence() const { return false; }
+    virtual bool readbackStats(qint64& depth, qint64& drops) const {
+        (void) depth;
+        (void) drops;
+        return false;
+    }
 };
 
 #endif // OUTPUTSINK_H

@@ -12,11 +12,20 @@
 //
 // At the end the worker's counters() are printed as one parseable line:
 //   COUNTERS reposition=.. reuseSeek=.. reverseChunkSeek=.. eofTailSeek=..
-//            skipForward=.. audioPushes=.. framesDropped=.. (... existing tokens ...)
+//            skipForward=.. audioPushes=.. framesDropped=.. framesSubmittedDelta=..
+//            (... existing tokens ...)
 // The GPU-pipeline telemetry contract appends:
-//   gpuReadToCpuCount=.. gpuReadbacks=.. redundantGpuReadbacks=.. readbackQueueDepth=..
-//   readbackDrops=.. fenceWaitStalls=.. gpuOomDegrades=.. gpuVramBytes=..
-// On the Phase-1 CPU path all seven read 0 (no GPU-backed readToCpu, no GPU
+//   gpuReadToCpuCount=.. gpuSeekPrefetchConsults=.. gpuSeekPrefetchPlannedSurfaces=..
+//   gpuSeekPrefetchGpuAttempts=.. gpuReadbacks=.. uniqueGpuReadbackSurfaces=..
+//   redundantGpuReadbacks=.. readbackQueueDepth=.. readbackDrops=.. fenceWaitStalls=..
+//   gpuOomDegrades=.. gpuDeviceLossEvents=.. gpuVramBytes=..
+// Device-loss scenarios append:
+//   deviceLossObserved=.. deviceLossObserveDelayMs=.. postLossFramesSubmitted=..
+//   postLossDecodedVideoFrames=.. postLossPlaceholderFrames=.. postLossHeldFrames=..
+//   postLossFirstFrameDelayMs=.. postLossObservedOutputTargets=..
+//   postLossFreshOutputTargets=.. postLossAllTargetsFresh=..
+//   postLossFirstFreshOutputDelayMs=.. postLossOutputPtsAdvanced=.. gpuGenerationAdvanced=..
+// On the Phase-1 CPU path all GPU counters read 0 (no GPU-backed readToCpu, no GPU
 // resources); run_playback_e2e.sh gates them at 0. redundantGpuReadbacks is the
 // copy-on-GPU-path detector: > 0 means a rendered bus surface was read back to CPU
 // more than once. Phase-2 GPU subprojects populate the rest via the same path.
@@ -26,8 +35,11 @@
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
 //              farback | armedcut | armedcut-back | armedcut-seekrace | armedcut-rearm-seek |
-//              playlist | gpucapstress | armedcut-h264 | armedcut-h264-back
+//              playlist | gpucapstress | gpubudget | devicelost | armedcut-h264 |
+//              armedcut-h264-back
 #include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QHash>
 #include <QTimer>
 #include <QList>
 #include <functional>
@@ -39,8 +51,10 @@
 #include "playback/audioplayer.h"
 #include "playback/playbackworker.h"
 #include "playback/playlistplayout.h"
+#include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputdispatcher.h"
 #include "playback/output/outputtargetassignment.h"
+#include "recorder_engine/ingest/nativevideodecoder.h"
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpupipelineconfig.h"
@@ -52,6 +66,38 @@
 
 namespace {
 constexpr int kFrameDurMs = 33; // ~30fps step granularity
+
+struct DeviceLossProbe {
+    qint64 injectionMs = -1;
+    qint64 observed = 0;
+    qint64 observeDelayMs = -1;
+    qint64 lossEventsAtBaseline = 0;
+    qint64 framesSubmittedAtObserve = -1;
+    qint64 decodedFramesAtObserve = -1;
+    qint64 placeholderFramesAtObserve = -1;
+    qint64 heldFramesAtObserve = -1;
+    qint64 firstPostLossFrameDelayMs = -1;
+    QHash<QString, qint64> outputPtsAtObserve;
+    QHash<QString, qint64> freshOutputDelayMsByTarget;
+    qint64 firstFreshOutputDelayMs = -1;
+    qint64 observedOutputTargets = 0;
+    qint64 freshOutputTargets = 0;
+    bool outputPtsAdvanced = false;
+    qint64 observedAtMs = -1;
+    uint64_t generationBefore = 0;
+    bool generationAdvanced = false;
+};
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+QHash<QString, OutputFrameIdentity> activeVideoOutputIdentities(const OutputDispatchStats& stats) {
+    QHash<QString, OutputFrameIdentity> identities;
+    for (auto it = stats.targets.cbegin(); it != stats.targets.cend(); ++it) {
+        if (!it->hasLastIdentity || it->lastIdentity.videoPlaceholder) continue;
+        identities.insert(it.key(), it->lastIdentity);
+    }
+    return identities;
+}
+#endif
 
 // Probe the fixture's duration so scenarios that seek "near the end" target a
 // real position. Falls back to a conservative default if ffprobe is missing.
@@ -111,15 +157,27 @@ int probeGpuBackend() {
 #endif
 #endif
 }
+
+int probeNativeDecodeCaps() {
+    const NativeVideoDecodeCapabilities caps = queryNativeVideoDecodeCapabilities();
+    printf("h264=%d\n", caps.h264 ? 1 : 0);
+    if (!caps.detail.isEmpty())
+        fprintf(stderr, "play_harness: native decode caps detail: %s\n", qPrintable(caps.detail));
+    fflush(stdout);
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     if (argc >= 2 && QString::fromUtf8(argv[1]) == QStringLiteral("--probe-gpu-backend"))
         return probeGpuBackend();
+    if (argc >= 2 && QString::fromUtf8(argv[1]) == QStringLiteral("--probe-native-decode-caps"))
+        return probeNativeDecodeCaps();
     if (argc < 3) {
         fprintf(stderr, "usage: play_harness <file.mkv> <scenario> [viewCount]\n"
-                        "       play_harness --probe-gpu-backend\n");
+                        "       play_harness --probe-gpu-backend\n"
+                        "       play_harness --probe-native-decode-caps\n");
         return 2;
     }
     const QString file = QString::fromUtf8(argv[1]);
@@ -174,6 +232,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[play_harness] NDI output bus=%s\n",
                 busEnv.isEmpty() ? "feed" : busEnv.constData());
     }
+    GpuReadbackTelemetry::instance().reset();
     worker.start();
 
     const int64_t durMs = probeDurationMs(file);
@@ -198,13 +257,18 @@ int main(int argc, char** argv) {
     // Number of real boundary/cut landing observations that contributed to
     // maxLandErr. A zero error with zero samples is vacuous and must not pass.
     auto* cutLandingSamples = new int(0);
+    auto* baseSubmitted = new qint64(-1);
+    auto* deviceLoss = new DeviceLossProbe();
+    QElapsedTimer scenarioClock;
+    scenarioClock.start();
     // armNextCut return value for armedcut-h264: 1 = armed (pre-roll bank accepted
     // the cut), 0 = rejected (H.264 guard fired — pre-roll bank skipped H.264
     // streams, bank empty). -1 = not applicable / armNextCut not called.
     int armNextCutArmed = -1;
 
     // Print the final counters in a parseable form, then quit.
-    auto finish = [&, basePh, baseHeld, maxLandErr, cutLandingSamples]() {
+    auto finish = [&, basePh, baseHeld, maxLandErr, cutLandingSamples, baseSubmitted,
+                   deviceLoss]() {
         // Read the output stats BEFORE stop(): the worker's run() tears down the
         // OutputRuntime on exit (shutdownOutputGraph nulls m_outputRuntime), so a
         // post-stop outputStats() would return a zeroed struct (delta would go
@@ -214,26 +278,65 @@ int main(int argc, char** argv) {
         const PlaybackWorker::PlaybackCounters c = worker.counters();
         const qint64 phDelta = (*basePh < 0) ? 0 : (os.placeholderFrames - *basePh);
         const qint64 heldDelta = (*baseHeld < 0) ? 0 : (os.heldFrames - *baseHeld);
+        const qint64 submittedDelta =
+            (*baseSubmitted < 0) ? 0 : (os.framesSubmitted - *baseSubmitted);
+        const qint64 postLossFramesSubmitted =
+            (deviceLoss->framesSubmittedAtObserve < 0)
+                ? 0
+                : (os.framesSubmitted - deviceLoss->framesSubmittedAtObserve);
+        const qint64 postLossDecodedVideoFrames =
+            (deviceLoss->decodedFramesAtObserve < 0)
+                ? 0
+                : (c.decodedVideoFrames - deviceLoss->decodedFramesAtObserve);
+        const qint64 postLossPlaceholderFrames =
+            (deviceLoss->placeholderFramesAtObserve < 0)
+                ? 0
+                : (os.placeholderFrames - deviceLoss->placeholderFramesAtObserve);
+        const qint64 postLossHeldFrames = (deviceLoss->heldFramesAtObserve < 0)
+                                              ? 0
+                                              : (os.heldFrames - deviceLoss->heldFramesAtObserve);
         printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
-               "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
+               "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d "
+               "framesSubmittedDelta=%lld resyncCount=%d "
                "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d "
                "maxBoundaryLandingErrMs=%lld cutLandingSamples=%d armNextCutArmed=%d "
                "decodedVideoFrames=%lld "
-               "stagingVideoFramesDecoded=%lld gpuReadToCpuCount=%lld gpuReadbacks=%lld "
-               "redundantGpuReadbacks=%lld readbackQueueDepth=%lld readbackDrops=%lld "
-               "fenceWaitStalls=%lld "
-               "gpuOomDegrades=%lld gpuVramBytes=%lld\n",
+               "stagingVideoFramesDecoded=%lld gpuReadToCpuCount=%lld "
+               "gpuSeekPrefetchConsults=%lld gpuSeekPrefetchPlannedSurfaces=%lld "
+               "gpuSeekPrefetchGpuAttempts=%lld gpuReadbacks=%lld uniqueGpuReadbackSurfaces=%lld "
+               "redundantGpuReadbacks=%lld "
+               "readbackQueueDepth=%lld readbackDrops=%lld fenceWaitStalls=%lld "
+               "gpuOomDegrades=%lld gpuDeviceLossEvents=%lld gpuVramBytes=%lld "
+               "deviceLossObserved=%lld deviceLossObserveDelayMs=%lld "
+               "postLossFramesSubmitted=%lld postLossDecodedVideoFrames=%lld "
+               "postLossPlaceholderFrames=%lld postLossHeldFrames=%lld "
+               "postLossFirstFrameDelayMs=%lld postLossObservedOutputTargets=%lld "
+               "postLossFreshOutputTargets=%lld postLossAllTargetsFresh=%d "
+               "postLossFirstFreshOutputDelayMs=%lld postLossOutputPtsAdvanced=%d "
+               "gpuGenerationAdvanced=%d\n",
                c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-               c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
-               (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-               (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
-               c.cutFollowReposition, (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
+               c.audioPushes, c.framesDropped, (long long) submittedDelta, audio.resyncCount(),
+               (long long) phDelta, (long long) os.skippedDuplicateFrames,
+               (long long) worker.cacheGeneration(), (long long) heldDelta,
+               (long long) os.maxClockDivergenceMs, worker.cutsFired(), c.cutFollowReposition,
+               (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
                (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
-               (long long) c.gpuReadToCpuCount, (long long) os.gpuReadbacks,
-               (long long) os.redundantGpuReadbacks, (long long) os.readbackQueueDepth,
-               (long long) os.readbackDrops, (long long) os.fenceWaitStalls,
-               (long long) os.gpuOomDegrades, (long long) os.gpuVramBytes);
+               (long long) c.gpuReadToCpuCount, (long long) c.gpuSeekPrefetchConsults,
+               (long long) c.gpuSeekPrefetchPlannedSurfaces,
+               (long long) c.gpuSeekPrefetchGpuAttempts, (long long) os.gpuReadbacks,
+               (long long) os.uniqueGpuReadbackSurfaces, (long long) os.redundantGpuReadbacks,
+               (long long) os.readbackQueueDepth, (long long) os.readbackDrops,
+               (long long) os.fenceWaitStalls, (long long) os.gpuOomDegrades,
+               (long long) os.gpuDeviceLossEvents, (long long) os.gpuVramBytes,
+               (long long) deviceLoss->observed, (long long) deviceLoss->observeDelayMs,
+               (long long) postLossFramesSubmitted, (long long) postLossDecodedVideoFrames,
+               (long long) postLossPlaceholderFrames, (long long) postLossHeldFrames,
+               (long long) deviceLoss->firstPostLossFrameDelayMs,
+               (long long) deviceLoss->observedOutputTargets,
+               (long long) deviceLoss->freshOutputTargets, deviceLoss->outputPtsAdvanced ? 1 : 0,
+               (long long) deviceLoss->firstFreshOutputDelayMs,
+               deviceLoss->outputPtsAdvanced ? 1 : 0, deviceLoss->generationAdvanced ? 1 : 0);
         fflush(stdout);
         app.quit();
     };
@@ -243,6 +346,7 @@ int main(int argc, char** argv) {
     QTimer::singleShot(1500, &app, [&]() {
         fprintf(stderr, "### SCENARIO %s views=%d dur=%lldms ###\n", scen.toUtf8().constData(),
                 views, (long long) durMs);
+        GpuReadbackTelemetry::instance().reset();
 
         if (scen == "play1x") {
             // Steady 1x playback from the start. The headline storm metric:
@@ -252,7 +356,7 @@ int main(int argc, char** argv) {
             transport.setPlaying(true);
             QTimer::singleShot(12000, &app, finish);
 
-        } else if (scen == "seekplay") {
+        } else if (scen == "seekplay" || scen == "gpu-seekprefetch") {
             // Seek to the middle, then play 1x. Tests post-seek storm.
             transport.setSpeed(1.0);
             transport.seek(8000);
@@ -595,55 +699,161 @@ int main(int argc, char** argv) {
             mon->start(16);
             QTimer::singleShot(14000, &app, finish);
 
-        } else if (scen == "gpucapstress") {
+        } else if (scen == "gpucapstress" || scen == "gpubudget") {
             // GPU cap-pressure stress: a 4-view H.264 fixture runs with a forced
             // tiny per-track GPU budget. Warm up real output frames, snapshot the
             // placeholder/hold baseline, seek while decode is active, then arm a
             // forward cut. The driver gates no placeholder flash, no held-frame
             // stall, GPU materialization, and bounded fence stalls.
+            const QByteArray scenarioName = scen.toUtf8();
             auto* lastCuts = new int(worker.cutsFired());
             auto* capCutTarget = new qint64(-1);
             transport.setSpeed(1.0);
             transport.seek(0);
             transport.setPlaying(true);
-            QTimer::singleShot(1000, &app, [&, basePh, baseHeld]() {
+            QTimer::singleShot(1000, &app, [&, basePh, baseHeld, scenarioName]() {
                 const OutputDispatchStats b = worker.outputStats();
                 *basePh = b.placeholderFrames;
                 *baseHeld = b.heldFrames;
                 const int64_t seekTarget = durMs / 3;
                 fprintf(stderr,
-                        "### gpucapstress basePh=%lld baseHeld=%lld; seek under decode to "
+                        "### %s basePh=%lld baseHeld=%lld; seek under decode to "
                         "%lldms ###\n",
-                        (long long) *basePh, (long long) *baseHeld, (long long) seekTarget);
+                        scenarioName.constData(), (long long) *basePh, (long long) *baseHeld,
+                        (long long) seekTarget);
                 transport.seek(seekTarget);
                 worker.seekTo(seekTarget);
             });
-            QTimer::singleShot(1600, &app, [&]() {
+            QTimer::singleShot(1600, &app, [&, capCutTarget, scenarioName]() {
                 const int64_t cutTarget = durMs / 2;
                 *capCutTarget = cutTarget;
                 armNextCutArmed = worker.armNextCut(cutTarget) ? 1 : 0;
-                fprintf(stderr, "### gpucapstress armNextCut(%lldms) returned %d ###\n",
-                        (long long) cutTarget, armNextCutArmed);
+                fprintf(stderr, "### %s armNextCut(%lldms) returned %d ###\n",
+                        scenarioName.constData(), (long long) cutTarget, armNextCutArmed);
             });
             QTimer* mon = new QTimer(&app);
-            QObject::connect(mon, &QTimer::timeout, &app,
-                             [&, lastCuts, capCutTarget, maxLandErr, cutLandingSamples]() {
-                                 const int cuts = worker.cutsFired();
-                                 if (cuts <= *lastCuts) return;
-                                 *lastCuts = cuts;
-                                 if (*capCutTarget < 0) return;
-                                 const qint64 landed = transport.currentPos();
-                                 const qint64 err = qAbs(landed - *capCutTarget);
-                                 (*cutLandingSamples)++;
-                                 if (err > *maxLandErr) *maxLandErr = err;
-                                 fprintf(stderr,
-                                         "### gpucapstress cut landed=%lld target=%lld err=%lld "
-                                         "###\n",
-                                         (long long) landed, (long long) *capCutTarget,
-                                         (long long) err);
-                             });
+            QObject::connect(
+                mon, &QTimer::timeout, &app,
+                [&, lastCuts, capCutTarget, maxLandErr, cutLandingSamples, scenarioName]() {
+                    const int cuts = worker.cutsFired();
+                    if (cuts <= *lastCuts) return;
+                    *lastCuts = cuts;
+                    if (*capCutTarget < 0) return;
+                    const qint64 landed = transport.currentPos();
+                    const qint64 err = qAbs(landed - *capCutTarget);
+                    (*cutLandingSamples)++;
+                    if (err > *maxLandErr) *maxLandErr = err;
+                    fprintf(stderr,
+                            "### %s cut landed=%lld target=%lld err=%lld "
+                            "###\n",
+                            scenarioName.constData(), (long long) landed, (long long) *capCutTarget,
+                            (long long) err);
+                });
             mon->start(16);
             QTimer::singleShot(10000, &app, finish);
+
+        } else if (scen == "devicelost") {
+#ifndef OLR_GPU_PIPELINE_BUILD
+            fprintf(stderr, "SKIP: devicelost requires GPU pipeline build\n");
+            QTimer::singleShot(0, &app, []() { ::exit(77); });
+#else
+            // GPU device-loss survival: warm up real output, snapshot flash/freeze
+            // baselines, inject a device loss through the worker test seam, and keep
+            // playing long enough for the worker to detect, rebuild or degrade, and
+            // continue delivering frames.
+            transport.setSpeed(1.0);
+            transport.seek(0);
+            transport.setPlaying(true);
+            QTimer::singleShot(1000, &app, [&, basePh, baseHeld, baseSubmitted, deviceLoss]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
+                *baseSubmitted = b.framesSubmitted;
+                deviceLoss->injectionMs = scenarioClock.elapsed();
+                deviceLoss->lossEventsAtBaseline = b.gpuDeviceLossEvents;
+                deviceLoss->generationBefore = worker.gpuGeneration();
+                fprintf(stderr,
+                        "### devicelost basePh=%lld baseHeld=%lld baseSubmitted=%lld; injecting "
+                        "GPU device loss ###\n",
+                        (long long) *basePh, (long long) *baseHeld, (long long) *baseSubmitted);
+                worker.injectGpuDeviceLossForTest();
+            });
+            QTimer* mon = new QTimer(&app);
+            QObject::connect(mon, &QTimer::timeout, &app, [&, deviceLoss]() {
+                const OutputDispatchStats os = worker.outputStats();
+                const PlaybackWorker::PlaybackCounters c = worker.counters();
+                if (!deviceLoss->observed &&
+                    os.gpuDeviceLossEvents > deviceLoss->lossEventsAtBaseline) {
+                    deviceLoss->observed = 1;
+                    deviceLoss->observedAtMs = scenarioClock.elapsed();
+                    deviceLoss->observeDelayMs =
+                        (deviceLoss->injectionMs < 0)
+                            ? -1
+                            : (deviceLoss->observedAtMs - deviceLoss->injectionMs);
+                    deviceLoss->framesSubmittedAtObserve = os.framesSubmitted;
+                    deviceLoss->decodedFramesAtObserve = c.decodedVideoFrames;
+                    deviceLoss->placeholderFramesAtObserve = os.placeholderFrames;
+                    deviceLoss->heldFramesAtObserve = os.heldFrames;
+                    const QHash<QString, OutputFrameIdentity> identities =
+                        activeVideoOutputIdentities(os);
+                    for (auto it = identities.cbegin(); it != identities.cend(); ++it)
+                        deviceLoss->outputPtsAtObserve.insert(it.key(), it->sourcePtsMs);
+                    deviceLoss->observedOutputTargets = deviceLoss->outputPtsAtObserve.size();
+                    deviceLoss->generationAdvanced =
+                        worker.gpuGeneration() > deviceLoss->generationBefore;
+                    fprintf(stderr,
+                            "### devicelost observed loss event delay=%lldms submitted=%lld "
+                            "decoded=%lld outputTargets=%lld generationAdvanced=%d ###\n",
+                            (long long) deviceLoss->observeDelayMs,
+                            (long long) deviceLoss->framesSubmittedAtObserve,
+                            (long long) deviceLoss->decodedFramesAtObserve,
+                            (long long) deviceLoss->observedOutputTargets,
+                            deviceLoss->generationAdvanced ? 1 : 0);
+                }
+                if (deviceLoss->observed && deviceLoss->firstPostLossFrameDelayMs < 0 &&
+                    os.framesSubmitted > deviceLoss->framesSubmittedAtObserve) {
+                    deviceLoss->firstPostLossFrameDelayMs =
+                        scenarioClock.elapsed() - deviceLoss->observedAtMs;
+                    fprintf(stderr,
+                            "### devicelost first post-loss submitted frame delay=%lldms ###\n",
+                            (long long) deviceLoss->firstPostLossFrameDelayMs);
+                }
+                if (deviceLoss->observed) {
+                    const QHash<QString, OutputFrameIdentity> identities =
+                        activeVideoOutputIdentities(os);
+                    for (auto it = deviceLoss->outputPtsAtObserve.cbegin();
+                         it != deviceLoss->outputPtsAtObserve.cend(); ++it) {
+                        if (deviceLoss->freshOutputDelayMsByTarget.contains(it.key())) continue;
+                        const auto current = identities.constFind(it.key());
+                        if (current == identities.cend()) continue;
+                        if (current->sourcePtsMs <= it.value()) continue;
+                        if (current->sourceDecodedSequence <= deviceLoss->decodedFramesAtObserve) {
+                            continue;
+                        }
+                        const qint64 delay = scenarioClock.elapsed() - deviceLoss->observedAtMs;
+                        deviceLoss->freshOutputDelayMsByTarget.insert(it.key(), delay);
+                        deviceLoss->freshOutputTargets =
+                            deviceLoss->freshOutputDelayMsByTarget.size();
+                        fprintf(stderr,
+                                "### devicelost fresh post-loss target=%s pts=%lld "
+                                "decodedSequence=%lld delay=%lldms ###\n",
+                                qPrintable(it.key()), (long long) current->sourcePtsMs,
+                                (long long) current->sourceDecodedSequence, (long long) delay);
+                    }
+                    if (!deviceLoss->outputPtsAdvanced && deviceLoss->observedOutputTargets > 0 &&
+                        deviceLoss->freshOutputTargets >= deviceLoss->observedOutputTargets) {
+                        deviceLoss->outputPtsAdvanced = true;
+                        deviceLoss->firstFreshOutputDelayMs =
+                            scenarioClock.elapsed() - deviceLoss->observedAtMs;
+                        fprintf(stderr,
+                                "### devicelost all observed outputs fresh delay=%lldms ###\n",
+                                (long long) deviceLoss->firstFreshOutputDelayMs);
+                    }
+                }
+            });
+            mon->start(16);
+            QTimer::singleShot(7000, &app, finish);
+#endif
 
         } else if (scen == "armedcut-h264") {
             // H.264 FRAME-PERFECT ARMED CUT: now that openPrerollContext() builds a
@@ -735,26 +945,36 @@ int main(int argc, char** argv) {
             const PlaybackWorker::PlaybackCounters c = worker.counters();
             const qint64 phDelta = (*basePh < 0) ? 0 : (os.placeholderFrames - *basePh);
             const qint64 heldDelta = (*baseHeld < 0) ? 0 : (os.heldFrames - *baseHeld);
+            const qint64 submittedDelta =
+                (*baseSubmitted < 0) ? 0 : (os.framesSubmitted - *baseSubmitted);
             printf(
                 "COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
-                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d resyncCount=%d "
+                "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d "
+                "framesSubmittedDelta=%lld resyncCount=%d "
                 "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
                 "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d "
                 "cutFollowReposition=%d maxBoundaryLandingErrMs=%lld cutLandingSamples=%d "
                 "armNextCutArmed=%d "
                 "decodedVideoFrames=%lld stagingVideoFramesDecoded=%lld gpuReadToCpuCount=%lld "
-                "gpuReadbacks=%lld redundantGpuReadbacks=%lld readbackQueueDepth=%lld "
-                "readbackDrops=%lld fenceWaitStalls=%lld gpuOomDegrades=%lld gpuVramBytes=%lld\n",
+                "gpuSeekPrefetchConsults=%lld gpuSeekPrefetchPlannedSurfaces=%lld "
+                "gpuSeekPrefetchGpuAttempts=%lld gpuReadbacks=%lld uniqueGpuReadbackSurfaces=%lld "
+                "redundantGpuReadbacks=%lld "
+                "readbackQueueDepth=%lld readbackDrops=%lld fenceWaitStalls=%lld "
+                "gpuOomDegrades=%lld gpuDeviceLossEvents=%lld gpuVramBytes=%lld\n",
                 c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-                c.audioPushes, c.framesDropped, audio.resyncCount(), (long long) phDelta,
-                (long long) os.skippedDuplicateFrames, (long long) worker.cacheGeneration(),
-                (long long) heldDelta, (long long) os.maxClockDivergenceMs, worker.cutsFired(),
-                c.cutFollowReposition, (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
+                c.audioPushes, c.framesDropped, (long long) submittedDelta, audio.resyncCount(),
+                (long long) phDelta, (long long) os.skippedDuplicateFrames,
+                (long long) worker.cacheGeneration(), (long long) heldDelta,
+                (long long) os.maxClockDivergenceMs, worker.cutsFired(), c.cutFollowReposition,
+                (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
                 (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
-                (long long) c.gpuReadToCpuCount, (long long) os.gpuReadbacks,
-                (long long) os.redundantGpuReadbacks, (long long) os.readbackQueueDepth,
-                (long long) os.readbackDrops, (long long) os.fenceWaitStalls,
-                (long long) os.gpuOomDegrades, (long long) os.gpuVramBytes);
+                (long long) c.gpuReadToCpuCount, (long long) c.gpuSeekPrefetchConsults,
+                (long long) c.gpuSeekPrefetchPlannedSurfaces,
+                (long long) c.gpuSeekPrefetchGpuAttempts, (long long) os.gpuReadbacks,
+                (long long) os.uniqueGpuReadbackSurfaces, (long long) os.redundantGpuReadbacks,
+                (long long) os.readbackQueueDepth, (long long) os.readbackDrops,
+                (long long) os.fenceWaitStalls, (long long) os.gpuOomDegrades,
+                (long long) os.gpuDeviceLossEvents, (long long) os.gpuVramBytes);
             fflush(stdout);
             ::exit(2);
         }

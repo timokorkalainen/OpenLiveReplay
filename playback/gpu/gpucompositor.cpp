@@ -2,6 +2,7 @@
 
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpucompositor_platform.h"
 #include "playback/gpu/gpupipelineconfig.h"
@@ -397,6 +398,10 @@ std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int, int) {
     return nullptr;
 }
 
+bool supportsNativeOutputSurfaces() {
+    return false;
+}
+
 std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi*, const std::shared_ptr<GpuSurface>&) {
     return nullptr;
 }
@@ -452,10 +457,16 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
     if (gpuConsumeInjectedAllocFailure()) return FrameHandle{};
 
     const QList<FrameHandle> filtered = dropStaleInputs(frames, generation);
-    if (m_impl && m_impl->rhi && m_impl->rhi->isGpuBacked()) {
+    if (m_impl && m_impl->rhi && m_impl->rhi->isGpuBacked() &&
+        gpucompositor::supportsNativeOutputSurfaces()) {
         const QList<PreparedSource> sources = prepareSources(filtered);
         std::shared_ptr<GpuSurface> surface = gpucompositor::makeOutputRgba8Surface(width, height);
         if (!surface || !surface->isValid()) return FrameHandle{};
+        auto budgetCharge = GpuBudget::instance().tryCharge(gpuSurfaceBytes(*surface));
+        if (!budgetCharge) {
+            GpuBudget::instance().noteOomDegrade();
+            return FrameHandle{};
+        }
 
         bool rendered = false;
         const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
@@ -473,7 +484,8 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         }
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);
         meta.color = color;
-        return makeGpuFrameHandle(std::move(surface), m_impl->rhi, meta, std::move(renderFence));
+        return makeGpuFrameHandle(std::move(surface), m_impl->rhi, meta, std::move(renderFence),
+                                  std::move(*budgetCharge));
     }
 
     CpuPlanes rgba =

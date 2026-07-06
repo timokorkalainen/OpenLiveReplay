@@ -1,7 +1,5 @@
 # new-io-targets Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax.
-
 **Goal:** Land the four enumerated-but-stubbed broadcast output kinds — `DeckLinkSdiHdmi`, `DeckLinkIpSt2110`, `Aja`, `Omt` — as real `IOutputSink` implementations behind per-SDK build/capability flags, with a runtime capability probe per SDK that selects each sink's GPU path. Per P0.4: DeckLink SDI/HDMI + ST2110 are **GPU-texture-capable hardware** sinks (`SinkGpuCapability::GpuNative`, bypass readback) where the SDK exposes GPUDirect/texture input, else they fall to `NeedsContinuousCadence` CPU readback; AJA (NTV2 AutoCirculate host buffers) and OMT (software SDK) are **NDI-style CPU-frame async-readback siblings** that route through `AsyncGpuReadbackSink`. The DeckLink/AJA/OMT SDKs are **not vendored** — each sink lands behind a build flag (`OLR_WITH_DECKLINK` / `OLR_WITH_AJA` / `OLR_WITH_OMT`) with a clean integration seam: a thin `IOutputSink` impl over an injectable backend interface, plus an SDK-availability stub that compiles and tests **off-SDK**. Tests run against the stub path (no SDK) asserting routing, cadence classification, capability-probe selection, and ST2110 bitstream framing; real-SDK paths are documented manual gates. e2e cadence/continuity gates per target mirror the NDI marker-continuity gate (`maxGap<=2`).
 
 **Architecture:** A new `playback/output/iotargets/` family adds one sink per kind, each split into (a) a neutral `IOutputSink` shell (`DeckLinkOutputSink`, `AjaOutputSink`, `OmtOutputSink`) holding an injectable backend interface (`IDeckLinkSenderBackend`, `IAjaSenderBackend`, `IOmtSenderBackend`) — mirroring the existing `NdiOutputSink`/`INdiSenderBackend` seam — and (b) a real-SDK backend compiled only under the matching `OLR_WITH_*` flag, with a `Stub*SenderBackend` that compiles unconditionally and reports the SDK as unavailable. A per-sink `SinkCapabilityProbe` runs the runtime capability decision (DeckLink: `GpuNative` if the SDK build exposes GPUDirect/texture input and the device confirms it at runtime, else `NeedsContinuousCadence`; AJA/OMT: always `NeedsContinuousCadence` — NDI-style software SDKs that need a frame every tick, `maxGap<=2`) and returns the `SinkGpuCapability` consumed by Phase-4 `async-readback` routing. CPU-frame sinks (AJA/OMT, and the DeckLink readback fallback) are wrapped in the Phase-4 `AsyncGpuReadbackSink` exactly as NDI is; `GpuNative` DeckLink keeps the GPU texture and submits it through the SDK's texture-input path, bypassing readback. ST2110 is authored from the encode bitstream where applicable (the `gpu-encode` recorder path supplies the H.264/SMPTE-2110-30 essence framing); the DeckLink ST2110 sink carries an `St2110FrameFramer` that packs the encoded essence + RTP-style framing fields the SDK's IP output expects. A `decklink-st2110-bitstream` framing unit covers the packetization without the SDK present. Sink construction is wired through the existing target-manager/dispatcher seam (`OutputEndpoint`/`IOutputSink`); the dispatcher and `OutputBusFrame` are unchanged.
@@ -1465,11 +1463,11 @@ target_include_directories(iotarget_marker_sender PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(iotarget_marker_sender PRIVATE
     Qt6::Core olr_test_playback olr_warnings olr_sanitize)
 
-foreach(kind aja omt decklink-readback)
+foreach(kind aja omt decklink-readback decklink-gpu decklink-st2110-readback decklink-st2110-gpu)
     add_test(NAME e2e_iotarget_${kind}
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_iotarget_cadence_e2e.sh"
             "$<TARGET_FILE:iotarget_marker_sender>" "${kind}")
-    set_tests_properties(e2e_iotarget_${kind} PROPERTIES LABELS "iotargets" TIMEOUT 120)
+    set_tests_properties(e2e_iotarget_${kind} PROPERTIES LABELS "ci;iotargets" TIMEOUT 120)
 endforeach()
 ```
 
@@ -1509,7 +1507,7 @@ git commit -m "test(new-io-targets): stub-backed cadence/continuity e2e gate (ma
 **Files:**
 - Modify: this plan (mark the manual-gate matrix), and the spec's `new-io-targets` lifecycle note (§12) if it tracks per-subproject sign-off.
 
-- [ ] **Step 1: Record the manual-SDK gate matrix**
+- [x] **Step 1: Record the manual-SDK gate matrix**
 
 Add to this plan a closing table the integrator runs on real hardware (NOT on CI):
 
@@ -1520,7 +1518,7 @@ Add to this plan a closing table the integrator runs on real hardware (NOT on CI
 | AJA NTV2 | `OLR_WITH_AJA` | `AJA_NTV2_DIR` | configure ON; AutoCirculate output to a real NTV2 device; continuity gate |
 | OMT | `OLR_WITH_OMT` | `OMT_SDK_DIR` | configure ON; OMT receiver confirms continuity |
 
-- [ ] **Step 2: Confirm the full off-SDK gate is green and capstone-complete**
+- [x] **Step 2: Confirm the full off-SDK gate is green and capstone-complete**
 
 ```sh
 # Fresh build dir, all SDK flags off (the CI configuration):
@@ -1532,7 +1530,7 @@ ctest --test-dir build/verify -L iotargets --output-on-failure
 ```
 Expected: unit + iotargets gates PASS; all four kinds build, route, and classify cadence off-SDK; the real backends are documented manual gates.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```sh
 git add docs/superpowers/plans/2026-06-21-gpu-phase5-new-io-targets.md \
@@ -1542,12 +1540,37 @@ git commit -m "docs(new-io-targets): manual-SDK gate matrix + capstone sign-off"
 
 ---
 
+## Capstone sign-off and manual SDK gates
+
+The CI/off-SDK capstone is the fresh `build/verify` configuration with all vendor SDK flags left
+off, followed by the `unit` and `iotargets` CTest labels. That gate proves all six I/O target modes
+build, route through the production sink seams, classify cadence, and preserve marker continuity
+without requiring proprietary SDKs or hardware.
+
+Capstone result (2026-06-24): `build/verify` configured and built with all SDK flags off; the
+`unit` label passed 95/95; the original `iotargets` label passed 4/4. Follow-up hardening added
+DeckLink ST2110 readback/GPU-native cadence variants and promoted the iotarget matrix to the `ci`
+label; the expanded `iotargets` label passes 6/6.
+
+The public tree lands the SDK build seams and off-SDK contract; vendor-specific backend bodies remain
+integrator-supplied because the DeckLink/AJA/OMT SDKs are not vendored. Real SDK and device output
+validation remains a manual hardware gate for integrators:
+
+| target | flag | SDK var | manual gate |
+|--------|------|---------|-------------|
+| DeckLink SDI/HDMI | `OLR_WITH_DECKLINK` | `DECKLINK_SDK_DIR` | configure ON; `ctest -L iotargets`; capture device output, assert continuity on a real card |
+| DeckLink ST2110 | `OLR_WITH_DECKLINK` | `DECKLINK_SDK_DIR` | as above + ST2110 receiver confirms RTP timestamp/marker per `St2110FrameFramer` |
+| AJA NTV2 | `OLR_WITH_AJA` | `AJA_NTV2_DIR` | configure ON; AutoCirculate output to a real NTV2 device; continuity gate |
+| OMT | `OLR_WITH_OMT` | `OMT_SDK_DIR` | configure ON; OMT receiver confirms continuity |
+
+---
+
 ## Canonical contract this plan produces (for downstream / integrators)
 
 - `SinkCapabilityProbe::classify(OutputTargetKind, const QVariantMap&, bool sdkBuilt, bool deviceGpuTextureInput) -> SinkGpuCapability` (`playback/output/iotargets/sinkcapabilityprobe.h`)
-- `DeckLinkOutputSink` + `IDeckLinkSenderBackend`/`StubDeckLinkSenderBackend` + `makeDeckLinkSenderBackend()` (`playback/output/iotargets/decklinksink.h`); real backend under `OLR_WITH_DECKLINK`.
+- `DeckLinkOutputSink` + `IDeckLinkSenderBackend`/`StubDeckLinkSenderBackend` + `makeDeckLinkSenderBackend()` (`playback/output/iotargets/decklinksink.h`); SDK backend seam under `OLR_WITH_DECKLINK`.
 - `St2110FrameFramer` + `St2110VideoFrame` (`playback/output/iotargets/st2110framer.h`)
-- `AjaOutputSink` + `IAjaSenderBackend`/`StubAjaSenderBackend` + `makeAjaSenderBackend()` (`playback/output/iotargets/ajasink.h`); real backend under `OLR_WITH_AJA`.
-- `OmtOutputSink` + `IOmtSenderBackend`/`StubOmtSenderBackend` + `makeOmtSenderBackend()` (`playback/output/iotargets/omtsink.h`); real backend under `OLR_WITH_OMT`.
+- `AjaOutputSink` + `IAjaSenderBackend`/`StubAjaSenderBackend` + `makeAjaSenderBackend()` (`playback/output/iotargets/ajasink.h`); SDK backend seam under `OLR_WITH_AJA`.
+- `OmtOutputSink` + `IOmtSenderBackend`/`StubOmtSenderBackend` + `makeOmtSenderBackend()` (`playback/output/iotargets/omtsink.h`); SDK backend seam under `OLR_WITH_OMT`.
 - `makeIoTargetSink(const OutputTargetAssignment&, FrameRate) -> std::unique_ptr<IOutputSink>` (`playback/output/iotargets/iotargetsinkfactory.h`) — applies the `AsyncGpuReadbackSink` capability routing.
 - e2e label `iotargets` (`tests/e2e/run_iotarget_cadence_e2e.sh`, `maxGap<=2`); manual-SDK gates per the Task 10 matrix.

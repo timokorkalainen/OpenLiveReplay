@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 extern "C" {
@@ -30,6 +31,7 @@ struct DecodeFrameContext {
     bool emittedFrame = false;
     bool copyFailed = false;
     bool ioSurfaceBacked = false;
+    bool surfaceRejected = false;
     OSStatus callbackStatus = noErr;
 };
 
@@ -51,8 +53,12 @@ int startCodeSizeAt(const QByteArray& bytes, int offset) {
 }
 
 QList<AnnexBNal> splitAnnexBNals(const QByteArray& bytes) {
+    if (bytes.size() > std::numeric_limits<int>::max()) {
+        return {};
+    }
+    const int byteCount = static_cast<int>(bytes.size());
     QList<int> starts;
-    for (int i = 0; i + 3 <= bytes.size();) {
+    for (int i = 0; i + 3 <= byteCount;) {
         const int prefixSize = startCodeSizeAt(bytes, i);
         if (prefixSize > 0) {
             starts.append(i);
@@ -66,8 +72,7 @@ QList<AnnexBNal> splitAnnexBNals(const QByteArray& bytes) {
     for (int i = 0; i < starts.size(); ++i) {
         const int prefixSize = startCodeSizeAt(bytes, starts[i]);
         const int payloadOffset = starts[i] + prefixSize;
-        const int endOffset =
-            (i + 1 < starts.size()) ? starts[i + 1] : static_cast<int>(bytes.size());
+        const int endOffset = (i + 1 < starts.size()) ? starts[i + 1] : byteCount;
         if (prefixSize > 0 && endOffset > payloadOffset) {
             nals.append({payloadOffset, endOffset});
         }
@@ -210,6 +215,9 @@ static void decompressionOutputCallback(void*,
         return;
     }
     if (!imageBuffer) {
+        if (context->keepSurface) {
+            context->surfaceRejected = true;
+        }
         return;
     }
 
@@ -220,8 +228,12 @@ static void decompressionOutputCallback(void*,
         if (!context->surfaceCallback) {
             return;
         }
+        const bool accepted = (*context->surfaceCallback)(imageBuffer, context->pts90k);
+        if (!accepted) {
+            context->surfaceRejected = true;
+            return;
+        }
         context->emittedFrame = true;
-        (*context->surfaceCallback)(imageBuffer, context->pts90k);
         return;
     }
 
@@ -241,6 +253,18 @@ static void decompressionOutputCallback(void*,
 }
 
 } // namespace
+
+#ifdef OLR_UNIT_TEST
+bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest() {
+    NativeVideoDecoder::KeepSurfaceCallback callback = [](void*, qint64) { return true; };
+    DecodeFrameContext context;
+    context.keepSurface = true;
+    context.surfaceCallback = &callback;
+    decompressionOutputCallback(nullptr, &context, noErr, 0, nullptr, kCMTimeInvalid,
+                                kCMTimeInvalid);
+    return context.surfaceRejected;
+}
+#endif
 
 class NativeVideoDecoder::Impl {
 public:
@@ -565,6 +589,11 @@ bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& uni
     lastIOSurfaceBacked = context.ioSurfaceBacked;
     if (context.callbackStatus != noErr) {
         if (error) *error = statusMessage(QStringLiteral("VideoToolbox output callback failed"), context.callbackStatus);
+        return false;
+    }
+    if (context.surfaceRejected) {
+        if (error)
+            *error = QStringLiteral("VideoToolbox keep-surface callback rejected decoded surface");
         return false;
     }
     return true;

@@ -7,6 +7,7 @@ class TestNdiRecvAnalysis : public QObject {
 private slots:
     void continuityCountsDropsDupesReorders();
     void avSyncMeasuresJitterAroundMedianOffset();
+    void timecodeAvSyncMeasuresPairedAudioVideoFrames();
     void cadenceReportsMaxGapAndMeanRate();
 };
 
@@ -61,6 +62,19 @@ void TestNdiRecvAnalysis::avSyncMeasuresJitterAroundMedianOffset() {
     // onset-collapse must NOT mask real drift: a genuinely late beep event (onset 24 vs
     // expected ~15) is a distinct event (gap > 2), so offsets {0,9,0}, median 0 -> 9.
     QCOMPARE(ndiAvSyncMaxFrames({0, 15, 30}, {0, 24, 30}), 9);
+}
+
+void TestNdiRecvAnalysis::timecodeAvSyncMeasuresPairedAudioVideoFrames() {
+    // Programme timecodes are in 100 ns units. At 30 fps, the output path stamps
+    // integer-ms playhead timecodes, so frame 100/101/102 are 3330/3363/3396 ms.
+    const std::vector<qint64> video = {33300000, 33630000, 33960000};
+    QCOMPARE(ndiTimecodeAvSyncMaxFrames(video, video, 30, 1), 0);
+
+    const std::vector<qint64> audioOneFrameLate = {33630000, 33960000, 34290000};
+    QCOMPARE(ndiTimecodeAvSyncMaxFrames(video, audioOneFrameLate, 30, 1), 1);
+
+    QCOMPARE(ndiTimecodeAvSyncMaxFrames({}, video, 30, 1), -1);
+    QCOMPARE(ndiTimecodeAvSyncMaxFrames(video, video, 0, 1), -1);
 }
 
 void TestNdiRecvAnalysis::cadenceReportsMaxGapAndMeanRate() {

@@ -55,10 +55,12 @@ default and reference throughout.
   non-blocking diagnostic because hosted Windows runners may not expose a
   usable D3D device. The diagnostic log captures the four backend/wrap lines on
   any runner with D3D available.
-- **Decision (D4):** CI-gated until the Windows run records the chosen backend.
-  If D3D11 is chosen, `gpu-sync` uses ID3D11Fence (11.4) /
-  keyed-mutex / ID3D11Query rather than assuming D3D12 fences. If D3D12 is
-  chosen, `gpu-sync` uses ID3D12Fence.
+- **Decision (D4):** GO with CI coverage. The Windows lane builds
+  `tst_wingpuimportedge` and runs it in the Media Foundation + WARP GPU unit
+  group; `rhi_d3d_probe` remains a non-blocking diagnostic because hosted
+  runners may not expose a hardware D3D device. If D3D11 is chosen, `gpu-sync`
+  uses ID3D11Fence (11.4) / keyed-mutex / ID3D11Query rather than assuming D3D12
+  fences. If D3D12 is chosen, `gpu-sync` uses ID3D12Fence.
 
 ## P0.3 — RHI per-frame overhead on import→composite→readback (gates D1/D11)
 
@@ -144,7 +146,7 @@ default and reference throughout.
 |------|-----------------|-------|----------|
 | P0.1 | VT decode yields IOSurface-backed `CVPixelBuffer` | macOS import edge | GO |
 | P0.1b | VT reconfig median 5.871 ms (<16.7 ms frame) | feed-flip stall budget | GO |
-| P0.2 | Windows `rhi_d3d_probe` compiles in CI and runs as a diagnostic; off-Windows target absent | D4 fence primitive | CI-GATED |
+| P0.2 | Windows `tst_wingpuimportedge` builds/runs in CI; `rhi_d3d_probe` compiles and runs as a diagnostic; off-Windows target absent | D4 fence primitive | GO |
 | P0.3 | import→composite→synchronous-readback median 1.7763 ms (>0.5 ms) | D1/D11 | CONDITIONAL / NO-GO for synchronous hot-path readback |
 | P0.4 | sinks classified as GPU-native vs CPU-readback cadence paths | D10 routing | GO |
 | P0.5 | IOSurface→Metal→QRhiTexture wraps without CPU detour | macOS zero-copy edge | GO |

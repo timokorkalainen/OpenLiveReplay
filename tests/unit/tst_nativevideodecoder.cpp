@@ -7,6 +7,7 @@ class TestNativeVideoDecoder : public QObject {
 private slots:
     void defaultCapabilitiesAreFalse();
     void queryCapabilitiesReportsPlatformBackend();
+    void keepSurfaceNullImageBufferIsRejected();
 };
 
 void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
@@ -33,6 +34,14 @@ void TestNativeVideoDecoder::queryCapabilitiesReportsPlatformBackend() {
     QVERIFY(!caps.d3d11);
     QVERIFY(!caps.detail.isEmpty());
 #endif
+#endif
+}
+
+void TestNativeVideoDecoder::keepSurfaceNullImageBufferIsRejected() {
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS) || defined(Q_OS_TVOS) || defined(Q_OS_WATCHOS)
+    QVERIFY(nativeVideoDecoderKeepSurfaceNullImageRejectedForTest());
+#else
+    QSKIP("VideoToolbox null-image callback seam is Apple-only");
 #endif
 }
 

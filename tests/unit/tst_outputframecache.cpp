@@ -26,6 +26,8 @@ private slots:
     void clearReportsVideoEvictions();
     void mergeFromReportsReplacedVideoFrames();
     void freshCoverageRequiresFrameAtOrBeforeTargetWithinTolerance();
+    void firstFreshAtOrAfterSkipsStaleFrames();
+    void removeVideoFramesIfReportsEvictions();
 };
 
 void TestOutputFrameCache::videoAtPicksLargestPtsAtOrBeforePlayhead() {
@@ -279,6 +281,37 @@ void TestOutputFrameCache::freshCoverageRequiresFrameAtOrBeforeTargetWithinToler
     QVERIFY(!cache.hasFreshVideoFrameAtOrBeforeNear(0, 140, 15, 2));
     QVERIFY(!cache.hasFreshVideoFrameAtOrBeforeNear(0, 210, 15, 2));
     QVERIFY(!cache.hasFreshVideoFrameAtOrBeforeNear(0, 80, 15, 1));
+}
+
+void TestOutputFrameCache::firstFreshAtOrAfterSkipsStaleFrames() {
+    OutputFrameCache cache(1, 4, 4);
+    FrameHandle stale = makeVideo(0, 100, 10);
+    stale.metadata().gpuGeneration = 1;
+    FrameHandle fresh = makeVideo(0, 133, 20);
+    fresh.metadata().gpuGeneration = 2;
+    cache.insertVideoFrame(stale);
+    cache.insertVideoFrame(fresh);
+
+    const std::optional<FrameHandle> frame = cache.firstFreshVideoFrameAtOrAfter(0, 90, 2);
+    QVERIFY(frame.has_value());
+    QCOMPARE(frame->metadata().key.ptsMs, qint64(133));
+    QVERIFY(!cache.firstFreshVideoFrameAtOrAfter(0, 134, 2).has_value());
+}
+
+void TestOutputFrameCache::removeVideoFramesIfReportsEvictions() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(makeVideo(0, 100, 10));
+    cache.insertVideoFrame(makeVideo(0, 200, 20));
+
+    OutputFrameCache::EvictedVideoFrames evicted;
+    const int removed = cache.removeVideoFramesIf(
+        [](const FrameHandle& frame) { return frame.metadata().key.ptsMs == 100; }, &evicted);
+
+    QCOMPARE(removed, 1);
+    QCOMPARE(evicted.size(), 1);
+    QCOMPARE(evicted.first().metadata().key.ptsMs, qint64(100));
+    QVERIFY(!cache.videoFrameAt(0, 100).has_value());
+    QVERIFY(cache.videoFrameAt(0, 200).has_value());
 }
 
 QTEST_GUILESS_MAIN(TestOutputFrameCache)

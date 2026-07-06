@@ -59,6 +59,15 @@ bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure) {
            failure == IngestFailureKind::MalformedStream;
 }
 
+bool keepSurfaceDecodeNeedsResetBeforeCpuFallback(bool decodedGpu, bool gpuSurfaceRejected) {
+    return !decodedGpu || gpuSurfaceRejected;
+}
+
+bool ingestPrefersGpuVideoFrames(const IngestCallbacks& callbacks) {
+    if (callbacks.shouldPreferGpuVideoFrames) return callbacks.shouldPreferGpuVideoFrames();
+    return callbacks.preferGpuVideoFrames;
+}
+
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,
                                                          bool nativeRtmpAvailable,
                                                          bool nativeNdiAvailable) {

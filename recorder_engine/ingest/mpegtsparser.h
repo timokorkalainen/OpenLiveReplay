@@ -65,6 +65,7 @@ private:
                         QList<PesPacket>* completedPes);
     bool flushPes(quint16 pid, QList<PesPacket>* completedPes);
     void updateExpectedPesSize(PesAssembly* assembly);
+    void resetProgramPesForDiscontinuity();
     bool acceptContinuity(quint16 pid, quint8 continuityCounter, bool hasPayload,
                           bool payloadStart, bool discontinuity);
 };

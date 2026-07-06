@@ -115,6 +115,9 @@ bool MpegTsParser::pushTsPacket(const QByteArray& packet, QList<PesPacket>* comp
         offset += 1 + adaptationLength;
     }
 
+    if (discontinuity && pid == m_pcrPid) {
+        resetProgramPesForDiscontinuity();
+    }
     if (!acceptContinuity(pid, continuityCounter, hasPayload, payloadStart, discontinuity)) {
         return true;
     }
@@ -309,6 +312,18 @@ void MpegTsParser::updateExpectedPesSize(PesAssembly* assembly)
     const int pesPacketLength = read16(p + 4);
     if (pesPacketLength > 0) {
         assembly->expectedSize = 6 + pesPacketLength;
+    }
+}
+
+void MpegTsParser::resetProgramPesForDiscontinuity() {
+    m_pes.clear();
+    m_lastContinuityCounter.clear();
+    m_waitingForPayloadStart.clear();
+    if (m_videoPid != 0xffff) {
+        m_waitingForPayloadStart.insert(m_videoPid);
+    }
+    if (m_audioPid != 0xffff) {
+        m_waitingForPayloadStart.insert(m_audioPid);
     }
 }
 

@@ -5,6 +5,7 @@
 #include "playback/output/mediaframe.h"
 
 #include <QVector>
+#include <functional>
 #include <optional>
 
 class OutputFrameCache {
@@ -17,10 +18,16 @@ public:
     std::optional<FrameHandle> videoFrameAt(int feedIndex, qint64 playheadMs) const;
     std::optional<FrameHandle> videoFrameAtFreshForGeneration(int feedIndex, qint64 playheadMs,
                                                               uint64_t gpuGeneration) const;
+    std::optional<FrameHandle> firstFreshVideoFrameAtOrAfter(int feedIndex, qint64 playheadMs,
+                                                             uint64_t gpuGeneration) const;
     bool hasFreshVideoFrameAtOrBeforeNear(int feedIndex, qint64 targetMs, qint64 toleranceMs,
                                           uint64_t gpuGeneration) const;
     FrameHandle videoFrameOrPlaceholder(int feedIndex, qint64 playheadMs) const;
     EvictedVideoFrames videoFramesSnapshot() const;
+    int replaceVideoFrames(const std::function<std::optional<FrameHandle>(const FrameHandle&)>& fn,
+                           EvictedVideoFrames* evictedFrames = nullptr);
+    int removeVideoFramesIf(const std::function<bool(const FrameHandle&)>& predicate,
+                            EvictedVideoFrames* evictedFrames = nullptr);
 
     void insertAudioFrame(const MediaAudioFrame& frame);
     QByteArray audioSpanOrSilence(int feedIndex, qint64 startSample, int sampleFrames) const;

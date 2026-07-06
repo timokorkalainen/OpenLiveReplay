@@ -21,7 +21,7 @@ struct NativeVideoDecodeCapabilities {
 class NativeVideoDecoder {
 public:
     using FrameCallback = std::function<void(AVFrame*)>;
-    using KeepSurfaceCallback = std::function<void(void* nativeDecodedImage, qint64 pts90k)>;
+    using KeepSurfaceCallback = std::function<bool(void* nativeDecodedImage, qint64 pts90k)>;
 
     NativeVideoDecoder(int outputWidth, int outputHeight);
     ~NativeVideoDecoder();
@@ -52,5 +52,9 @@ private:
 };
 
 NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities();
+
+#ifdef OLR_UNIT_TEST
+bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest();
+#endif
 
 #endif // NATIVEVIDEODECODER_H

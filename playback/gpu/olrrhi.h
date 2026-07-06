@@ -3,6 +3,7 @@
 
 #include <QString>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 
@@ -27,10 +28,16 @@ public:
 
     bool runOffscreenFrame(const std::function<void(QRhiCommandBuffer*)>& record, QString* error);
 
+    // Once a backend reports a removed/reset device, the instance stays lost.
+    // Recovery is a fresh OlrRhi::create(), never a clear-in-place.
+    bool deviceLost() const;
+    void injectDeviceLostForTest();
+
 protected:
     OlrRhi() = default;
 
     std::unique_ptr<QRhi> m_rhi;
+    std::atomic<bool> m_deviceLost{false};
 };
 
 #endif // OLR_OLRRHI_H

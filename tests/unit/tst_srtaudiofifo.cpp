@@ -14,6 +14,8 @@
 
 #include <QtTest>
 
+#include <iterator>
+
 #include "recorder_engine/ingest/nativesrtingestsession.h"
 
 class TestSrtAudioFifo : public QObject {
@@ -21,6 +23,8 @@ class TestSrtAudioFifo : public QObject {
 private slots:
     void clockJitterStaysSampleContiguous();
     void realDiscontinuityReanchors();
+    void clockJitterStaysFrameContiguous();
+    void realVideoDiscontinuityReanchors();
 };
 
 // A regular audio stream (1024-sample frames) whose clock-mapped start carries
@@ -65,6 +69,51 @@ void TestSrtAudioFifo::realDiscontinuityReanchors() {
     const int64_t jumped = contiguousNext + kDecoded + 20000;
     QCOMPARE(NativeSrtIngestSession::advanceAudioFifoSample(&pos, jumped, kDecoded, kResync),
              jumped);
+}
+
+void TestSrtAudioFifo::clockJitterStaysFrameContiguous() {
+    constexpr int64_t kResyncMs = 200;
+    constexpr qint64 kFrame90k = 3000; // 30 fps on the MPEG-TS 90 kHz clock
+    const int64_t jitterMs[] = {0, 12, -18, 31, -24, 43, -37, 16, -11, 28};
+
+    int64_t anchorTs90k = -1;
+    int64_t anchorStreamMs = -1;
+    const qint64 firstPts90k = 90000;
+    const int64_t firstCleanMs = 1000;
+
+    for (int i = 0; i < int(std::size(jitterMs)); ++i) {
+        const qint64 pts90k = firstPts90k + i * kFrame90k;
+        const int64_t cleanMs =
+            NativeSrtIngestSession::sourcePtsMsFromAnchor(pts90k, firstPts90k, firstCleanMs);
+        const int64_t mappedMs = NativeSrtIngestSession::advanceVideoFramePtsMs(
+            &anchorTs90k, &anchorStreamMs, pts90k, cleanMs + jitterMs[i], kResyncMs);
+        QCOMPARE(mappedMs, cleanMs);
+    }
+}
+
+void TestSrtAudioFifo::realVideoDiscontinuityReanchors() {
+    constexpr int64_t kResyncMs = 200;
+    constexpr qint64 kFrame90k = 3000;
+
+    int64_t anchorTs90k = -1;
+    int64_t anchorStreamMs = -1;
+    QCOMPARE(NativeSrtIngestSession::advanceVideoFramePtsMs(&anchorTs90k, &anchorStreamMs, 90000,
+                                                            1000, kResyncMs),
+             1000);
+
+    const qint64 nextPts90k = 90000 + kFrame90k;
+    const int64_t nextCleanMs =
+        NativeSrtIngestSession::sourcePtsMsFromAnchor(nextPts90k, 90000, 1000);
+    QCOMPARE(NativeSrtIngestSession::advanceVideoFramePtsMs(
+                 &anchorTs90k, &anchorStreamMs, nextPts90k, nextCleanMs + 40, kResyncMs),
+             nextCleanMs);
+
+    const qint64 jumpedPts90k = nextPts90k + kFrame90k;
+    const int64_t jumpedClockMs =
+        NativeSrtIngestSession::sourcePtsMsFromAnchor(jumpedPts90k, 90000, 1000) + 300;
+    QCOMPARE(NativeSrtIngestSession::advanceVideoFramePtsMs(&anchorTs90k, &anchorStreamMs,
+                                                            jumpedPts90k, jumpedClockMs, kResyncMs),
+             jumpedClockMs);
 }
 
 QTEST_GUILESS_MAIN(TestSrtAudioFifo)

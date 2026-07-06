@@ -179,9 +179,9 @@ nativeSrtResolveSockaddrsWithTimeout(const NativeSrtAddressResolver& resolver, i
             return {};
         }
 
-        const int waitMs = timeoutMs < 0 ? 50
-                                         : static_cast<int>(qMax<qint64>(
-                                               1, qMin<qint64>(50, timeoutMs - elapsed.elapsed())));
+        const qint64 boundedWaitMs =
+            timeoutMs < 0 ? 50 : qMax<qint64>(1, qMin<qint64>(50, timeoutMs - elapsed.elapsed()));
+        const int waitMs = static_cast<int>(boundedWaitMs);
         state->finishedCondition.wait(&state->mutex, waitMs);
     }
 

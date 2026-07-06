@@ -3,12 +3,15 @@
 
 #include "playback/output/framepixelformat.h"
 
+#include <QtGlobal>
+
 #include <cstdint>
 
 struct GpuSurfaceDesc {
     FramePixelFormat format = FramePixelFormat::Nv12;
     int width = 0;
     int height = 0;
+    qint64 allocationBytes = 0;
 };
 
 // GPU-resident pixel surface behind the opaque GpuSurface forward declaration

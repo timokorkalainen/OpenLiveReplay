@@ -34,6 +34,7 @@ struct FrameMetadata {
     int stride[3] = {0, 0, 0};
     ColorMetadata color;
     uint64_t gpuGeneration = 0;
+    qint64 decodedSequence = 0;
 };
 
 struct CpuPlanes {
@@ -53,6 +54,7 @@ struct CpuPlanes {
 };
 
 class GpuSurface;
+class GpuFence;
 
 class IFrameData {
 public:
@@ -61,7 +63,9 @@ public:
     virtual bool isGpuBacked() const = 0;
     bool isCpuBacked() const { return !isGpuBacked(); }
     virtual CpuPlanes readToCpu(FramePixelFormat target) const = 0;
+    virtual CpuPlanes cachedCpuPlanes(FramePixelFormat target) const;
     virtual GpuSurface* gpuSurface() const = 0;
+    virtual std::shared_ptr<GpuFence> gpuFence() const;
     virtual FramePixelFormat nativeFormat() const = 0;
 };
 
@@ -71,6 +75,7 @@ public:
 
     bool isGpuBacked() const override { return false; }
     CpuPlanes readToCpu(FramePixelFormat target) const override;
+    CpuPlanes cachedCpuPlanes(FramePixelFormat target) const override;
     GpuSurface* gpuSurface() const override { return nullptr; }
     FramePixelFormat nativeFormat() const override { return m_planes.format; }
 

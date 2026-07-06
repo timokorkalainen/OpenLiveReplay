@@ -73,6 +73,13 @@ target_include_directories(ndi_output_sender PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(ndi_output_sender PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
 
+qt_add_executable(iotarget_marker_sender
+    iotarget_marker_sender.cpp
+    ndi_output_marker.cpp)
+target_include_directories(iotarget_marker_sender PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(iotarget_marker_sender PRIVATE
+    Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
 # Tier (b): writes the marker as raw YUV420P+S16 for muxing into a playback MKV.
 qt_add_executable(ndi_marker_mkv_source
     ndi_marker_mkv_source.cpp
@@ -97,6 +104,16 @@ set_tests_properties(e2e_ndi_output PROPERTIES
     TIMEOUT 120
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+
+foreach(kind aja omt decklink-readback decklink-gpu decklink-st2110-readback decklink-st2110-gpu)
+    add_test(NAME e2e_iotarget_${kind}
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_iotarget_cadence_e2e.sh"
+            "$<TARGET_FILE:iotarget_marker_sender>" "${kind}")
+    set_tests_properties(e2e_iotarget_${kind} PROPERTIES
+        LABELS "ci;iotargets"
+        TIMEOUT 120
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+endforeach()
 
 # Tier (b) feed bus (default) + the pgm and multiview output buses. Each drives the worker's
 # OutputBusEngine render of that bus (renderSingleSource / renderPgm / renderMultiview) through a
@@ -144,6 +161,63 @@ set_tests_properties(e2e_ndi_pipe PROPERTIES
     TIMEOUT 300
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+
+if(OLR_GPU_PIPELINE)
+    add_test(NAME e2e_ndi_output_gpu
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
+            "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_output_gpu PROPERTIES
+        LABELS "ndi-output;gpu-smoke"
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_ndi_playback_gpu
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_playback_gpu PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_ndi_playback_gpu_pgm
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_playback_gpu_pgm PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_NDI_OUTPUT_BUS=pgm")
+
+    add_test(NAME e2e_ndi_playback_gpu_multiview
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_playback_gpu_multiview PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_NDI_OUTPUT_BUS=multiview")
+
+    add_test(NAME e2e_ndi_pipe_gpu
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_e2e_pipe.sh"
+            "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:record_harness>"
+            "$<TARGET_FILE:marker_yuv_probe>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_pipe_gpu PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 300
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+endif()
 
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
@@ -394,6 +468,33 @@ set_tests_properties(e2e_play_h264 e2e_play_armedcut_h264 e2e_play_armedcut_h264
     LABELS "e2e;h264" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 
 if(OLR_GPU_PIPELINE)
+    add_test(NAME e2e_play_gpu_play1x
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" play1x 2 23522)
+    set_tests_properties(e2e_play_gpu_play1x PROPERTIES
+        LABELS "e2e;gpu;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_readback
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" h264_play 2 23514)
+    set_tests_properties(e2e_play_gpu_readback PROPERTIES
+        LABELS "e2e;gpu;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_seekprefetch
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" gpu-seekprefetch 2 23516)
+    set_tests_properties(e2e_play_gpu_seekprefetch PROPERTIES
+        LABELS "e2e;gpu;seek-prefetch"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
     add_test(NAME e2e_play_gpu_capstress
         COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" gpucapstress 4 23512)
     set_tests_properties(e2e_play_gpu_capstress PROPERTIES
@@ -402,6 +503,24 @@ if(OLR_GPU_PIPELINE)
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_GPU_FORCE_BUDGET=12")
+
+    add_test(NAME e2e_play_gpubudget
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" gpubudget 4 23518)
+    set_tests_properties(e2e_play_gpubudget PROPERTIES
+        LABELS "e2e;gpu;gpu-budget"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_GPU_FORCE_BUDGET=12")
+
+    add_test(NAME e2e_play_devicelost
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" devicelost 2 23520)
+    set_tests_properties(e2e_play_devicelost PROPERTIES
+        LABELS "e2e;gpu;device-loss"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
 endif()
 
 # --- Report-only frame-sync scoreboard (NON-GATING) -------------------------

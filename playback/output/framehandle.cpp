@@ -5,6 +5,14 @@
 
 IFrameData::~IFrameData() = default;
 
+CpuPlanes IFrameData::cachedCpuPlanes(FramePixelFormat) const {
+    return CpuPlanes{};
+}
+
+std::shared_ptr<GpuFence> IFrameData::gpuFence() const {
+    return nullptr;
+}
+
 namespace {
 
 qsizetype planeBytes(int stride, int rows) {
@@ -83,6 +91,10 @@ CpuPlanes CpuFrameData::readToCpu(FramePixelFormat target) const {
     if (m_planes.format == FramePixelFormat::Nv12 && target == FramePixelFormat::Yuv420p)
         return convertNv12ToYuv420p(m_planes);
     return m_planes;
+}
+
+CpuPlanes CpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {
+    return readToCpu(target);
 }
 
 CpuPlanes FrameHandle::readToCpu(FramePixelFormat target) const {

@@ -1,12 +1,10 @@
 # async-readback Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (- [ ]) syntax.
-
-**Goal:** Stop CPU sinks (NDI, Qt preview, screenshot) from stalling the ~1 ms output dispatch tick. P0.3 proved a synchronous import→composite→readback costs ~1.78 ms (readback alone ~1.18 ms), well over budget — so a GPU-backed `OutputBusFrame` cannot be read back inline on the tick. This subproject introduces an `AsyncGpuReadbackSink` that wraps any CPU `IOutputSink` with an **N-deep readback ring** (render frame N, deliver the frame read back ~N-2 ticks ago), driven by the `gpu-sync` `GpuFence` so a readback frame is only consumed once its GPU work has retired. Exactly **one readback per unique rendered bus surface / requested CPU format** is performed (the dispatcher renders one `OutputBusFrame` per distinct bus; all CPU sinks on that bus share that single readback). Cadence is routed per the D10 `SinkGpuCapability`: `GpuNative` (bypass — texture path), `AsyncReadbackDedupOk` (preview — skip readback on an unchanged payload via `samePayloadAs`, but still advance delivery indices), `NeedsContinuousCadence` (NDI `maxGap<=2` — a readback or a re-sent prior surface every tick). The PGM bus gets a **depth-1 (sub-frame, low-latency)** ring; all other CPU sinks get **depth-3**. The **AV-sync-under-lag hard gate** (§9) is the merge precondition: audio travels with the delayed video so the `OutputBusFrame` stays atomic, and both the AV-sync MAX gate (`<=100 ms` via `run_sync_e2e.sh`) and NDI marker-continuity (`maxGap<=2`) must pass through the readback path **before** NDI migrates behind the wrapper. The copy-on-GPU-path detector is extended to cover the ring (one GPU `readToCpu` per unique bus surface, including hold-last/placeholder re-emits). NDI and Qt preview are migrated behind the wrapper.
+**Goal:** Stop CPU sinks (NDI, Qt preview, screenshot) from stalling the ~1 ms output dispatch tick. P0.3 proved a synchronous import→composite→readback costs ~1.78 ms (readback alone ~1.18 ms), well over budget — so a GPU-backed `OutputBusFrame` cannot be read back inline on the tick. This subproject introduces an `AsyncGpuReadbackSink` that wraps any CPU `IOutputSink` with an **N-deep readback ring** (render frame N, deliver the frame read back ~N-2 ticks ago), driven by the `gpu-sync` `GpuFence` so a readback frame is only consumed once its GPU work has retired. Exactly **one readback per unique rendered bus surface / requested CPU format** is performed (the dispatcher renders one `OutputBusFrame` per distinct bus; all CPU sinks on that bus share that single readback). Cadence is routed per the D10 `SinkGpuCapability`: `GpuNative` (bypass — texture path), `AsyncReadbackDedupOk` (preview — skip readback on an unchanged payload via `samePayloadAs`, but still advance delivery indices), `NeedsContinuousCadence` (NDI `maxGap<=2` — a readback or a re-sent prior surface every tick). The PGM bus gets a **depth-1 (sub-frame, low-latency)** ring; all other CPU sinks get **depth-3**. The **AV-sync-under-lag hard gate** (§9) is the merge precondition: audio travels with the delayed video so the `OutputBusFrame` stays atomic, and GPU-enabled NDI playback/pipe gates must prove receiver A/V (`e2e_ndi_playback_gpu*` content `avSyncMaxFrames<=1`; `e2e_ndi_pipe_gpu` programme-timecode `tcAvMaxFrames<=1`), marker-continuity (`maxGap<=2`), and one-readback-per-surface counters through the readback path **before** NDI migrates behind the wrapper. The ingest-oriented `run_sync_e2e.sh lipsync` gate remains a separate source A/V oracle because it does not construct output sinks. The direct `e2e_ndi_output_gpu` lane remains an NDI runtime smoke, not readback-path proof. The copy-on-GPU-path detector is extended to cover the ring (one GPU `readToCpu` per unique bus surface, including hold-last/placeholder re-emits). NDI and Qt preview are migrated behind the wrapper.
 
 **Architecture:** A new `playback/output/asyncgpureadbacksink.{h,cpp}` mirrors the existing `QueuedOutputSink` wrapper idiom (`playback/output/queuedoutputsink.h`: own an inner `IOutputSink`, present an `IOutputSink` face, do the heavy work off the dispatch path) but replaces the blind queue with a **fenced readback ring**. A standalone `playback/output/gpureadbackring.{h,cpp}` owns the ring mechanics (push a GPU-backed `OutputBusFrame` + its `GpuFence` value at tick T; pop the CPU-resident frame from tick T-(depth-1) once its fence has `completedValue() >= value`), independent of `IOutputSink` so it is unit-testable headless with a stub fence. A `SinkGpuCapability` enum + a `gpuCapabilityFor(OutputTargetKind)` mapping (from the P0.4 table) drives the per-tick cadence decision. A per-bus **readback memo** (`SharedReadback`, keyed by `GpuReadbackSurfaceKey`) lets all CPU sinks on one bus share a single `readToCpu`; the dispatcher renders one `OutputBusFrame` per bus, so the memo is per-bus-per-tick. The `OutputDispatcher::dispatchTick` loop is extended to perform at most one shared readback per rendered bus surface and to route each endpoint through its capability. The CPU path stays default + the permanent oracle: with `OLR_GPU_PIPELINE` off (or the frame CPU-backed), the wrapper is a transparent pass-through to the inner sink — zero behavior change, byte-green goldens. `PlaybackWorker::rebuildOutputEndpoints` wraps the NDI and preview sinks in `AsyncGpuReadbackSink` only when the GPU pipeline is enabled.
 
-**Tech Stack:** C++17, Qt 6 (Core/Gui/Test), CMake + Ninja. Consumes the merged Phase-0/1/2 contracts and the `gpu-sync` keystone (Phase 3). No new third-party deps. GPU behavioral tests run headless under `QT_QPA_PLATFORM=offscreen` and `QSKIP`/degrade where no GPU/RHI backend exists. The AV-sync + NDI continuity gates run through the existing e2e shell drivers (`tests/e2e/run_sync_e2e.sh`, `run_ndi_output_e2e.sh`, `run_ndi_playback_e2e.sh`, `run_ndi_e2e_pipe.sh`).
+**Tech Stack:** C++17, Qt 6 (Core/Gui/Test), CMake + Ninja. Consumes the merged Phase-0/1/2 contracts and the `gpu-sync` keystone (Phase 3). No new third-party deps. GPU behavioral tests run headless under `QT_QPA_PLATFORM=offscreen` and `QSKIP`/degrade where no GPU/RHI backend exists. The readback-path AV-sync + NDI continuity gates run through the existing NDI e2e shell drivers (`tests/e2e/run_ndi_playback_e2e.sh`, `run_ndi_e2e_pipe.sh`); the direct output smoke (`run_ndi_output_e2e.sh`) and source lip-sync harness (`run_sync_e2e.sh`) remain separate non-readback oracles.
 
 ## Global Constraints
 
@@ -19,8 +17,8 @@
 - **CPU path stays default + reference.** The GPU pipeline is two-gated: the `OLR_GPU_PIPELINE` CMake option → `OLR_GPU_PIPELINE_BUILD` compile def, and the runtime `gpuPipelineEnabled()` env flag (off by default; `playback/gpu/gpupipelineconfig.h`). With `OLR_GPU_PIPELINE_BUILD` undefined **or** `gpuPipelineEnabled()` false, every byte of this plan's behavior must be inert: `AsyncGpuReadbackSink::submit` is a direct pass-through to the inner sink, the dispatcher does no readback routing, and `rebuildOutputEndpoints` wraps nothing. The CPU path is byte-for-byte the Phase-1/2/3 path and remains the permanent correctness oracle + fallback.
 - **A CPU-backed `OutputBusFrame` is never read back.** The ring engages only when `frame.video.isGpuBacked()`. A CPU-origin frame (SW decode / NDI ingest / the CPU compositor) is submitted to the inner sink unchanged — `readToCpu` on it is already a no-op, but the wrapper must not even ring-buffer it, so the CPU lane keeps its exact today-cadence and zero added latency.
 - **One readback per unique rendered bus surface / requested CPU format.** A tick may render the feed, PGM, and multiview buses — three distinct surfaces, three readbacks. All CPU sinks consuming the *same* bus at the *same* tick share one readback (the shared `SharedReadback` memo). The copy-detector asserts `gpuReadbacks == uniqueSurfaces` (no redundant readback of a surface already read), covering hold-last and placeholder re-emit paths. This is the `telemetry-contract` invariant carried forward.
-- **AV-sync is atomic and a hard merge gate.** Audio travels WITH the delayed video: the ring stores the whole `OutputBusFrame` (video handle + `MediaAudioFrame` + identity), so when the readback for tick T retires, the *same tick's* audio is delivered alongside the readback video — the A/V pair is never split across the lag. The AV-sync MAX gate (`<=100 ms`, `run_sync_e2e.sh lipsync` with `OLR_AV_SYNC_GATE=1`) and NDI marker-continuity (`maxGap<=2`, `run_ndi_output_e2e.sh` / `run_ndi_playback_e2e.sh`) MUST pass through the readback path **before** the NDI migration task lands. Splitting the A/V pair is the single most likely regression — Task 7 is the gate that catches it.
-- **Concurrency-critical — independent review required before merge (CLAUDE.md "Verification").** The ring is touched by the dispatch (worker) thread that pushes and by the inner sink path that pops; the `gpu-sync` lock rule applies (never block on a `GpuFence` while holding a buffer/runtime mutex). Each task that touches the ring/fence threading carries a `**Review gate:**` note; the branch gets a fresh-agent concurrency review before the PR merges.
+- **AV-sync is atomic and a hard merge gate.** Audio travels WITH the delayed video: the ring stores the whole `OutputBusFrame` (video handle + `MediaAudioFrame` + identity), so when the readback for tick T retires, the *same tick's* audio is delivered alongside the readback video — the A/V pair is never split across the lag. The GPU-enabled NDI playback gates check marker content A/V (`avSyncMaxFrames<=1`) on feed, PGM, and multiview buses. The full NDI pipe gate checks programme-timecode A/V pairing (`tcAvMaxFrames<=1`) because the ingest-recorded pipe fixture rebases playback timecode and the marker beep pairing can be unreliable after record/playback; it also requires dense, non-synthesized video/audio timecodes so the timecode gate is not vacuous. Both readback-path gates enforce `maxGap<=2`, `gpuReadbacks==uniqueGpuReadbackSurfaces`, and `readbackDrops==0` before the NDI migration task lands. Splitting the A/V pair is the single most likely regression — Task 7 is the gate that catches it. The ingest-oriented `run_sync_e2e.sh lipsync` gate stays outside this proof because it does not instantiate output sinks.
+- **Concurrency-critical — independent review required before merge (CLAUDE.md "Verification").** The ring is touched by the dispatch (worker) thread that pushes and by the inner sink path that pops; the `gpu-sync` lock rule applies (never block on a `GpuFence` while holding a buffer/runtime mutex). Each task that touches the ring/fence threading carries a `**Review gate:**` note; the branch gets an independent concurrency review before the PR merges.
 - **Zero-regression gate after every task.** With the flag off:
   ```sh
   cmake --build build/c && ctest --test-dir build/c -L unit --output-on-failure
@@ -61,10 +59,19 @@
 
 ## Open decision carried by this subproject (document, then decide in Task 7)
 
-**Multiview-monitor ~33 ms A/V lead (spec §9 "Local-monitor lip-sync lead").** The worker-side `AudioPlayer` (real-time `QAudioSink` on the device clock) keeps playing in real time while a preview's video rides the render-N/read-N-2 path, creating a monitor-side audio **lead of ~2 frames (~33 ms @ 60 fps)**. PGM gets the depth-1 (sub-frame) ring as its mitigation; **multiview previews do not** (depth-3). The `OutputBusFrame`/NDI AV-sync gate structurally cannot observe this monitor-only lead (it measures the *output* A/V pair, which stays atomic). Resolution options, decided in Task 7 with measurement in hand:
+**Multiview-monitor two-frame A/V lead (spec §9 "Local-monitor lip-sync lead").** The worker-side `AudioPlayer` (real-time `QAudioSink` on the device clock) keeps playing in real time while a preview's video rides the render-N/read-N-2 path, creating a monitor-side audio **lead of roughly two output frames** (~33 ms @60 Hz, ~67 ms @30 fps). PGM gets the depth-1 (sub-frame) ring as its mitigation; **multiview previews do not** (depth-3). The `OutputBusFrame`/NDI AV-sync gate structurally cannot observe this monitor-only lead (it measures the *output* A/V pair, which stays atomic). Resolution options, decided in Task 7 with measurement in hand:
 - **(a) Delay `AudioPlayer`** by the preview ring depth so the monitor audio rides the same lag as the preview video, or
-- **(b) Document-and-accept** the bounded ~33 ms monitor lead (within EBU R37's +40/-60 ms band for a non-PGM monitor).
-This plan implements the depth split + the atomic-pair guarantee; Task 7 records the measured monitor lead and the chosen option in the plan + a code comment. It does **not** silently mitigate.
+- **(b) Document-and-accept** the bounded, rate-dependent two-output-frame monitor lead for non-PGM local monitoring.
+This plan implements the depth split + the atomic-pair guarantee; Task 7 records the expected bounded monitor lead and the chosen option in the plan + a code comment. It does **not** silently mitigate.
+
+**Task 7 decision:** choose **(b) document-and-accept**. PGM stays depth-1. Non-PGM CPU
+sinks stay depth-3, so the expected local multiview monitor lead remains bounded to roughly
+two output-frame periods (~33 ms at 60 Hz, ~67 ms at 30 fps). No `AudioPlayer` delay is added in
+Phase 4; output-bound audio/video sync is enforced by the atomic `OutputBusFrame` readback path and
+the GPU-enabled NDI playback receiver gates (`e2e_ndi_playback_gpu*`: `avSyncMaxFrames<=1`,
+`maxGapFrames<=2`, `gpuReadbacks == uniqueGpuReadbackSurfaces`, `readbackDrops==0`). The ingest-oriented
+`run_sync_e2e.sh lipsync` gate does not exercise `AsyncGpuReadbackSink`, so it remains separate from
+the readback-path proof.
 
 ---
 
@@ -242,7 +249,7 @@ git commit -m "feat(async-readback): SinkGpuCapability routing table (D10 / P0.4
                                 std::shared_ptr<GpuFence> fence, FramePixelFormat format);
 
       // Drain the oldest still-pending entry, blocking on its fence up to timeoutMs.
-      // Used at stop()/flush. Returns {ready=false} when empty. timeoutMs<0 = forever.
+      // Explicit flush helper. Returns {ready=false} when empty. timeoutMs<0 = forever.
       RingReadyFrame flushOne(int timeoutMs);
   };
   ```
@@ -398,7 +405,7 @@ git commit -m "feat(async-readback): fenced GpuReadbackRing (render-N/read-N-(de
 
       OutputTargetKind kind() const override;
       bool start(const OutputTargetAssignment& assignment, FrameRate rate) override;
-      void stop() override;                       // flushes the ring through the inner sink
+      void stop() override;                       // stops inner sink, then drops pending ring frames
       bool isActive() const override;
       bool submit(const OutputBusFrame& frame) override;
       OutputSinkStatus outputStatus() const override;  // augments inner status with ring depth/drops
@@ -538,7 +545,7 @@ Create `playback/output/asyncgpureadbacksink.{h,cpp}`. Members: `std::unique_ptr
     }
     return true;  // dedup/native: a gap here is acceptable; indices already advanced
 ```
-`m_sharedRenderFence` is the process `GpuFence` shared with the worker's `m_renderFence`; pass it into the ctor (add a `std::shared_ptr<GpuFence>` ctor param defaulting to `GpuFence::create()` so unit tests can inject the stub). `stop()` drains the ring: `while (true) { auto r = m_ring.flushOne(2); if (!r.ready) break; m_inner->submit(r.frame); }` then `m_inner->stop();`. `outputStatus()` returns `m_inner->outputStatus()` with `currentQueueDepth = m_ring.occupancy()` and `droppedFrames += m_ring.drops()` folded in. Include `playback/gpu/gpusurface.h` and `playback/gpu/gpufence.h`.
+`m_sharedRenderFence` is the process `GpuFence` shared with the worker's `m_renderFence`; pass it into the ctor (add a `std::shared_ptr<GpuFence>` ctor param defaulting to `GpuFence::create()` so unit tests can inject the stub). `stop()` does **not** wait on fences; it stops the inner sink, then drops pending ring frames and resets the ring so endpoint rebuild/teardown cannot move a `GpuFence::wait` under `m_outputRuntimeMutex`. `outputStatus()` returns `m_inner->outputStatus()` with `currentQueueDepth = m_ring.occupancy()` and `droppedFrames += m_ring.drops()` folded in. Include `playback/gpu/gpusurface.h` and `playback/gpu/gpufence.h`.
 
 Wire `asyncgpureadbacksink.{h,cpp}` into the `OpenLiveReplay` `if(OLR_GPU_PIPELINE)` block, `olr_test_playback`'s GPU block, and `olr_test_gpu`.
 
@@ -548,7 +555,7 @@ cmake --build build/c --target tst_asyncgpureadbacksink && ctest --test-dir buil
 ```
 Expected: PASS (2 tests; GPU-frame round-trip behavior is exercised in Task 4 with real `GpuFrameData`).
 
-**Review gate:** confirm the CPU-lane pass-through is truly zero-overhead and the `stop()` drain cannot deadlock on a fence (bounded 2 ms `flushOne` timeout). Flag for independent review.
+**Review gate:** confirm the CPU-lane pass-through is truly zero-overhead and `stop()` cannot deadlock on a fence because it never calls `GpuFence::wait`. Flag for independent review.
 
 - [ ] **Step 5: Zero-regression + commit**
 ```sh
@@ -809,68 +816,66 @@ git commit -m "feat(async-readback): migrate NDI + preview behind the readback r
 
 ## Task 7: AV-sync-under-lag HARD GATE + NDI marker-continuity through the readback path
 
-**Precondition:** Tasks 1-6. **This is the merge precondition for the whole subproject (spec §9): the readback path must NOT break the AV-sync MAX gate (`<=100 ms`) or NDI marker-continuity (`maxGap<=2`).**
+**Precondition:** Tasks 1-6. **This is the merge precondition for the whole subproject (spec §9): the readback path must NOT break output-bound receiver A/V (`avSyncMaxFrames<=1` on the clean playback marker, `tcAvMaxFrames<=1` on the full pipe), NDI marker-continuity (`maxGap<=2`), or the one-readback-per-surface telemetry invariant.**
 
 **Files:**
-- Modify: `tests/e2e/run_playback_e2e.sh` (gate `readbackQueueDepth`/`readbackDrops` thresholds + assert `gpuReadbacks == uniqueSurfaces` under `OLR_GPU_PIPELINE=1`), the plan's open-decision section (record the measured multiview monitor lead + the chosen option)
-- Test: the existing e2e drivers `tests/e2e/run_sync_e2e.sh` (lipsync, `OLR_AV_SYNC_GATE=1`), `tests/e2e/run_ndi_output_e2e.sh` + `run_ndi_playback_e2e.sh` + `run_ndi_e2e_pipe.sh` (`maxGapFrames<=2`), run with `OLR_GPU_PIPELINE=1`
+- Modify: `tests/e2e/run_playback_e2e.sh` (gate `readbackQueueDepth`/`readbackDrops` thresholds + assert `gpuReadbacks == uniqueSurfaces` under `OLR_GPU_PIPELINE=1`), `tests/e2e/run_ndi_playback_e2e.sh`, `tests/e2e/run_ndi_e2e_pipe.sh`, `tests/e2e/CMakeLists.txt`, and the plan's open-decision section (record the expected bounded multiview monitor lead + the chosen option)
+- Test: the existing NDI e2e drivers `run_ndi_playback_e2e.sh` + `run_ndi_e2e_pipe.sh` (`maxGapFrames<=2`, GPU playback `avSyncMaxFrames<=1` for feed/PGM/multiview, GPU pipe `tcAvMaxFrames<=1`), run with `OLR_GPU_PIPELINE=1`; `run_ndi_output_e2e.sh` and `run_sync_e2e.sh lipsync` remain separate smoke/source oracles, not readback-path evidence.
 
 **Interfaces:**
-- Consumes: `run_sync_e2e.sh lipsync` MEAN+MAX gates (run_sync_e2e.sh:281-310: `OLR_AV_SYNC_GATE=1`, EBU R37 `-40..+60` mean, `OLR_AV_SYNC_MAX_MS=100` max), the NDI `maxGapFrames<=2` gates (run_ndi_output_e2e.sh:51, run_ndi_playback_e2e.sh:90, run_ndi_e2e_pipe.sh:94/140), the GPU counters emitted by `play_harness.cpp` / parsed by `run_playback_e2e.sh`.
-- Produces: the AV-sync + continuity gates proven to pass through the readback path; `readbackQueueDepth`/`readbackDrops` thresholds enforced; the multiview-monitor-lead decision recorded.
+- Consumes: the NDI `maxGapFrames<=2`, clean marker `avSyncMaxFrames<=1`, full-pipe `tcAvMaxFrames<=1`, and non-vacuous timecode receiver gates (`run_ndi_playback_e2e.sh`, `run_ndi_e2e_pipe.sh`), plus the GPU counters emitted by `play_harness.cpp` / parsed by `run_playback_e2e.sh`.
+- Produces: the output-bound AV-sync + continuity gates proven to pass through the readback path; `readbackQueueDepth`/`readbackDrops` thresholds enforced; the multiview-monitor-lead decision recorded.
 
 - [ ] **Step 1: Write the failing gate (assert through the GPU path)**
 
-Extend `tests/e2e/run_playback_e2e.sh` to add, under an `OLR_GPU_PIPELINE=1` lane (mirroring the Phase-2 GPU lane), assertions on the new counters: `readbackDrops` must be 0 on the steady `play1x` scenario (a drop means a readback frame was overwritten before delivery — a stall), and `gpuReadbacks == uniqueSurfaces` (no redundant readback). Add the NDI + lipsync gates to the e2e lane as GPU-path invocations:
+Extend `tests/e2e/run_playback_e2e.sh` to add, under an `OLR_GPU_PIPELINE=1` lane (mirroring the Phase-2 GPU lane), assertions on the new counters: `readbackDrops` must be 0 on the steady `play1x` scenario (a drop means a readback frame was overwritten before delivery — a stall), and `gpuReadbacks == uniqueSurfaces` (no redundant readback). Add the NDI output-bound gates to the e2e lane as GPU-path invocations:
 ```sh
-# NDI continuity through the readback path (maxGap<=2 must survive the ring):
-OLR_GPU_PIPELINE=1 tests/e2e/run_ndi_output_e2e.sh ...     # asserts maxGapFrames<=2
-OLR_GPU_PIPELINE=1 tests/e2e/run_ndi_playback_e2e.sh ...   # asserts maxGapFrames<=2 + avSync
-# AV-sync MAX gate through the readback path (audio travels with delayed video):
-OLR_AV_SYNC_GATE=1 OLR_AV_SYNC_MAX_MS=100 OLR_GPU_PIPELINE=1 \
-  tests/e2e/run_sync_e2e.sh <sync_harness> lipsync <port>  # asserts mean EBU R37 + max<=100ms
+# NDI continuity + output-bound A/V through the readback path:
+OLR_GPU_PIPELINE=1 tests/e2e/run_ndi_playback_e2e.sh ...   # feed/PGM/multiview: maxGap<=2 + avSync<=1 + counters
+OLR_GPU_PIPELINE=1 tests/e2e/run_ndi_e2e_pipe.sh ...       # maxGap<=2 + tcAv<=1 + counters
 ```
-> These drivers SKIP (exit 0) without ffmpeg/srt/NDI runtime present, so on a bare CI host they are inert; the gate bites on a host with the toolchain. Add them to the e2e CTest lane the same way the existing NDI/sync e2e tests are registered in `tests/e2e/CMakeLists.txt`, with a `gpu` label so they can be selected.
+> These drivers SKIP (exit 77) without ffmpeg/srt/NDI/runtime codec support present, so CTest reports a skip rather than a false green; the gate bites on a host with the toolchain. Add them to the e2e CTest lane the same way the existing NDI e2e tests are registered in `tests/e2e/CMakeLists.txt`, with a `gpu` label so they can be selected.
 
 - [ ] **Step 2: Run the gates, expect FAIL if the path splits A/V or stalls**
 ```sh
-OLR_GPU_PIPELINE=1 ctest --test-dir build/c -R "e2e_play" --output-on-failure
-OLR_AV_SYNC_GATE=1 OLR_AV_SYNC_MAX_MS=100 OLR_GPU_PIPELINE=1 \
-  tests/e2e/run_sync_e2e.sh <sync_harness> lipsync 9200
+OLR_GPU_PIPELINE=1 ctest --test-dir build/c -R "e2e_play_gpu_readback|e2e_ndi_playback_gpu|e2e_ndi_playback_gpu_pgm|e2e_ndi_playback_gpu_multiview|e2e_ndi_pipe_gpu" --output-on-failure
 ```
-Expected (before the fix is verified): if the ring split the A/V pair or stalled the tick, the MAX gate FAILs (`A/V worst-case offset ...ms exceeds MAX bound 100ms`) or NDI FAILs (`maxGapFrames>2`). If Tasks 2-6 are correct, they should already PASS — this task's job is to PROVE it and lock it in as a gate.
+Expected (before the fix is verified): if the ring split the A/V pair or stalled the tick, GPU NDI playback/pipe FAILs (`avSyncMaxFrames>1` on playback, `tcAvMaxFrames>1` on pipe, `maxGapFrames>2`, non-zero `readbackDrops`, or duplicate readbacks). If Tasks 2-6 are correct, they should already PASS — this task's job is to PROVE it and lock it in as a gate.
 
 - [ ] **Step 3: Close any gap the gate exposes; record the monitor-lead decision**
 
-If the AV-sync MAX gate fails, the regression is almost certainly an A/V split in the ring (video lagged but audio not, or vice versa). Fix: confirm `GpuReadbackRing` stores and delivers the WHOLE `OutputBusFrame` (Task 2/4) — the audio rides with its own tick's video. If NDI `maxGap>2`, confirm the `NeedsContinuousCadence` re-send path (Task 3) fires when a readback is not ready. Then MEASURE the multiview monitor A/V lead: run `run_sync_e2e.sh lipsync` with a multiview-preview-driven monitor and record the observed audio lead vs the preview video (expected ~33 ms @ 60 fps / ~2 frames). Record the decision in the "Open decision" section of this plan AND as a code comment at the `AsyncGpuReadbackSink` preview-wrap site: either (a) `AudioPlayer` is delayed by the preview ring depth (implement the delay) or (b) the bounded ~33 ms monitor lead is documented-and-accepted (no code change; comment only). The default, absent a contrary measurement, is (b) accept — it is within EBU R37 for a non-PGM monitor and PGM already has the depth-1 mitigation.
+If the GPU NDI receiver A/V gate fails, the regression is almost certainly an A/V split in the ring (video lagged but audio not, or vice versa). Fix: confirm `GpuReadbackRing` stores and delivers the WHOLE `OutputBusFrame` (Task 2/4) — the audio rides with its own tick's video. If NDI `maxGap>2`, confirm the `NeedsContinuousCadence` re-send path (Task 3) fires when a readback is not ready. Then record the multiview monitor A/V lead decision: the expected lead is roughly two output-frame periods because non-PGM previews keep depth-3 while the real-time `AudioPlayer` is not delayed (~33 ms @60 Hz, ~67 ms @30 fps). Record the decision in the "Open decision" section of this plan AND as a code comment at the `AsyncGpuReadbackSink` preview-wrap site: either (a) `AudioPlayer` is delayed by the preview ring depth (implement the delay) or (b) the bounded rate-dependent monitor lead is documented-and-accepted (no code change; comment only). The default, absent a contrary measurement, is (b) accept for non-PGM local monitoring; PGM already has the depth-1 mitigation.
 
 - [ ] **Step 4: Run the gates, expect PASS**
 ```sh
-OLR_GPU_PIPELINE=1 ctest --test-dir build/c -R "e2e_play|e2e_ndi|e2e_sync" --output-on-failure
+OLR_GPU_PIPELINE=1 ctest --test-dir build/c -R "e2e_play_gpu_readback|e2e_ndi_playback_gpu|e2e_ndi_playback_gpu_pgm|e2e_ndi_playback_gpu_multiview|e2e_ndi_pipe_gpu" --output-on-failure
 ```
-Expected: AV-sync MEAN (EBU R37) + MAX (`<=100 ms`) PASS, NDI `maxGapFrames<=2` PASS, `readbackDrops==0`, `gpuReadbacks==uniqueSurfaces`, all through `OLR_GPU_PIPELINE=1`.
+Expected: GPU NDI receiver A/V (`avSyncMaxFrames<=1` playback, `tcAvMaxFrames<=1` pipe) + NDI `maxGapFrames<=2` PASS, `readbackDrops==0`, `gpuReadbacks==uniqueSurfaces`, all through `OLR_GPU_PIPELINE=1`.
 
 - [ ] **Step 5: Full pre-flight + final review**
 ```sh
 cmake --build build/c && ctest --test-dir build/c -L unit --output-on-failure
-OLR_GPU_PIPELINE=1 ctest --test-dir build/c -R "e2e_play" --output-on-failure
+OLR_GPU_PIPELINE=1 ctest --test-dir build/c -R "e2e_play_gpu_readback|e2e_ndi_playback_gpu|e2e_ndi_playback_gpu_pgm|e2e_ndi_playback_gpu_multiview|e2e_ndi_pipe_gpu" --output-on-failure
 # Off-path byte-green check (fresh build dir):
 cmake -S . -B build/off -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON -DOLR_GPU_PIPELINE=OFF
 cmake --build build/off && ctest --test-dir build/off -L unit --output-on-failure
 ```
-Expected: GPU-on and GPU-off suites both PASS; e2e thresholds unchanged on the CPU lane; AV-sync + NDI continuity gates green through the readback path.
+Expected: GPU-on and GPU-off suites both PASS; e2e thresholds unchanged on the CPU lane; output-bound A/V + NDI continuity gates green through the readback path.
 
-**Review gate (final, whole-subproject):** per CLAUDE.md, the playback worker's threading + every readback/fence change gets an independent fresh-agent concurrency review before merge. The reviewer verifies: (a) no `GpuFence::wait`/`completedValue` under any worker mutex (grep every ring/wrapper call site, confirm dispatch-thread-only); (b) the A/V pair is never split — the ring delivers the whole `OutputBusFrame`; (c) the `NeedsContinuousCadence` re-send keeps `maxGap<=2` and never re-sends a stale-generation surface (check `isStaleForGeneration` before re-send); (d) the one-readback-per-surface memo is reset exactly once per tick. Open the PR with the per-branch push:
-```sh
-git -c credential.helper= -c credential.helper='!gh auth git-credential' push -u origin gpu-phase4-async-readback
-```
+**Review gate (final, whole-subproject):** per CLAUDE.md, the playback worker's threading + every readback/fence change gets an independent concurrency review before merge. The reviewer verifies: (a) no `GpuFence::wait`/`completedValue` under any worker mutex (grep every ring/wrapper call site, confirm dispatch-thread-only); (b) the A/V pair is never split — the ring delivers the whole `OutputBusFrame`; (c) the `NeedsContinuousCadence` re-send keeps `maxGap<=2` and never re-sends a stale-generation surface (check `isStaleForGeneration` before re-send); (d) the one-readback-per-surface memo is reset exactly once per tick.
 
 - [ ] **Step 6: Commit**
 ```sh
 python3 "$GCF" --binary "$CF" --commit origin/main -- '*.cpp' '*.h'
-git add tests/e2e/run_playback_e2e.sh tests/e2e/CMakeLists.txt \
-        docs/superpowers/plans/2026-06-21-gpu-phase4-async-readback.md
-git commit -m "test(async-readback): AV-sync MAX + NDI maxGap<=2 hard gates through the readback path"
+git add docs/superpowers/plans/2026-06-21-gpu-phase4-async-readback.md \
+        docs/superpowers/specs/2026-06-21-gpu-resident-pipeline-design.md \
+        playback/output/asyncgpureadbacksink.* playback/output/gpureadbackring.* \
+        playback/output/outputdispatcher.* playback/playbackworker.cpp \
+        tests/e2e/CMakeLists.txt tests/e2e/play_harness.cpp \
+        tests/e2e/run_ndi_e2e_pipe.sh tests/e2e/run_ndi_playback_e2e.sh \
+        tests/e2e/run_playback_e2e.sh tests/unit/tst_asyncgpureadbacksink.cpp \
+        tests/unit/tst_outputdispatch_gpustats.cpp
+git commit -m "feat(async-readback): gate GPU readback e2e"
 ```
 
 ---
@@ -908,6 +913,6 @@ class AsyncGpuReadbackSink final : public IOutputSink {
 };
 ```
 
-**Telemetry** (placeholders added by Phase-2 `telemetry-contract`; this subproject is the FIRST to write non-zero values): `readbackQueueDepth` / `readbackDrops` on `OutputDispatchStats` (`playback/output/outputdispatcher.h:76-78`), folded from the live `AsyncGpuReadbackSink` wrappers in `dispatchTick`, emitted by `play_harness.cpp` and parsed by `run_playback_e2e.sh`. The one-readback-per-surface invariant remains `GpuReadbackTelemetry::snapshot().gpuReadbacks == uniqueSurfaces` with `redundantReadbacks == 0` (covering hold-last / placeholder re-emit). The `fenceWaitStalls` counter (first written by `gpu-sync`) is bumped on a bounded `flushOne` timeout at `stop()`/drain.
+**Telemetry** (placeholders added by Phase-2 `telemetry-contract`; this subproject is the FIRST to write non-zero values): `readbackQueueDepth` / `readbackDrops` on `OutputDispatchStats` (`playback/output/outputdispatcher.h:76-78`), folded from the live `AsyncGpuReadbackSink` wrappers in `dispatchTick`, emitted by `play_harness.cpp` and parsed by `run_playback_e2e.sh`. The one-readback-per-surface invariant remains `GpuReadbackTelemetry::snapshot().gpuReadbacks == uniqueSurfaces` with `redundantReadbacks == 0` (covering hold-last / placeholder re-emit). Endpoint stop discards pending ring frames instead of waiting on fences, so `fenceWaitStalls` is reserved for future explicit bounded-wait call sites.
 
 **Per-sink depth rule** (consumed by `gpu-budget` for the ring term of the §2 VRAM peak formula): PGM bus = depth-1; every other CPU sink = depth-3. The async-readback ring term of the peak is `Σ (ring-depth × bus × requested CPU format)`.

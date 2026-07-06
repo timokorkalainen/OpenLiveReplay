@@ -36,6 +36,13 @@ static std::vector<qint64> ndiCollapseOnsets(const std::vector<qint64>& v) {
     return out;
 }
 
+static qint64 timecodeToFrameIndex(qint64 timecode100ns, int fpsNum, int fpsDen) {
+    const long double ms = static_cast<long double>(timecode100ns) / 10000.0L;
+    const long double frames =
+        (ms * static_cast<long double>(fpsNum)) / (1000.0L * static_cast<long double>(fpsDen));
+    return static_cast<qint64>(std::llround(frames));
+}
+
 int ndiAvSyncMaxFrames(const std::vector<qint64>& videoFlashIndicesRaw,
                        const std::vector<qint64>& audioBeepFrameIndicesRaw) {
     if (videoFlashIndicesRaw.empty() || audioBeepFrameIndicesRaw.empty()) return -1;
@@ -58,6 +65,22 @@ int ndiAvSyncMaxFrames(const std::vector<qint64>& videoFlashIndicesRaw,
     int worst = 0;
     for (const qint64 off : offsets)
         worst = std::max(worst, int(std::llabs(off - median)));
+    return worst;
+}
+
+int ndiTimecodeAvSyncMaxFrames(const std::vector<qint64>& videoTimecodes100ns,
+                               const std::vector<qint64>& audioTimecodes100ns, int fpsNum,
+                               int fpsDen) {
+    if (videoTimecodes100ns.empty() || audioTimecodes100ns.empty() || fpsNum <= 0 || fpsDen <= 0)
+        return -1;
+
+    const size_t n = std::min(videoTimecodes100ns.size(), audioTimecodes100ns.size());
+    int worst = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const qint64 videoFrame = timecodeToFrameIndex(videoTimecodes100ns[i], fpsNum, fpsDen);
+        const qint64 audioFrame = timecodeToFrameIndex(audioTimecodes100ns[i], fpsNum, fpsDen);
+        worst = std::max(worst, int(std::llabs(audioFrame - videoFrame)));
+    }
     return worst;
 }
 

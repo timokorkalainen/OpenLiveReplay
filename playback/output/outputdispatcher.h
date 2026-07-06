@@ -11,6 +11,7 @@
 
 class GpuCompositor;
 class GpuRhiContext;
+class SharedGpuReadbackCache;
 
 struct OutputEndpoint {
     OutputTargetAssignment assignment;
@@ -82,7 +83,9 @@ struct OutputDispatchStats {
     qint64 readbackDrops = 0;
     qint64 fenceWaitStalls = 0;
     qint64 gpuOomDegrades = 0;
+    qint64 gpuDeviceLossEvents = 0;
     qint64 gpuReadbacks = 0;
+    qint64 uniqueGpuReadbackSurfaces = 0;
     qint64 redundantGpuReadbacks = 0;
     OutputRuntimeDispatchStats runtime;
     QHash<QString, OutputTargetDispatchStats> targets;
@@ -90,7 +93,8 @@ struct OutputDispatchStats {
 
 class OutputDispatcher {
 public:
-    OutputDispatcher(FrameRate rate, int feedCount, int width, int height);
+    OutputDispatcher(FrameRate rate, int feedCount, int width, int height,
+                     std::shared_ptr<GpuRhiContext> gpuRhi = nullptr);
     ~OutputDispatcher();
 
     void setEndpoints(const QList<OutputEndpoint>& endpoints);
@@ -104,14 +108,21 @@ public:
     // forward. Used to fire an armed cut at an exact playhead (a playlist out-point).
     qint64 outputFrameForPlayheadMs(qint64 playheadMs) const;
     void setRuntimeStats(const OutputRuntimeDispatchStats& stats);
+    void setGpuRhiContext(std::shared_ptr<GpuRhiContext> gpuRhi);
     void incrementFenceWaitStalls();
     void setHoldLastFrame(bool enabled) { m_holdLastFrame = enabled; }
     void setIdentitySkip(bool enabled) { m_identitySkip = enabled; }
+    std::shared_ptr<SharedGpuReadbackCache> sharedGpuReadbacks() const { return m_sharedReadbacks; }
 
     OutputDispatchStats dispatchTick(const OutputFrameCache& cache,
                                      const PlaybackStateSnapshot& state);
     OutputDispatchStats stats() const;
     FrameRate frameRate() const { return m_rate; }
+    // Test support: by-reference view of live endpoint sink chains.
+    const QList<OutputEndpoint>& outputEndpointsForTest() const { return m_endpoints; }
+#ifdef OLR_UNIT_TEST
+    std::shared_ptr<GpuRhiContext> gpuRhiContextForTest() const { return m_gpuRhi; }
+#endif
 
 private:
     OutputBusFrame renderBus(OutputBusId bus, qint64 outputFrameIndex,
@@ -122,6 +133,7 @@ private:
     void countTargetStartFailure(const OutputTargetAssignment& assignment);
     void countTargetAttempt(const OutputTargetAssignment& assignment, const OutputBusFrame& frame,
                             bool submitted);
+    void collectReadbackStats(OutputDispatchStats& stats) const;
 
     FrameRate m_rate;
     int m_feedCount = 0;
@@ -133,6 +145,7 @@ private:
     PlaybackStateSnapshot m_playEpoch;
     OutputDispatchStats m_stats;
     MultiviewComposite m_multiviewMemo;
+    std::shared_ptr<SharedGpuReadbackCache> m_sharedReadbacks;
     std::shared_ptr<GpuRhiContext> m_gpuRhi;
     std::shared_ptr<GpuCompositor> m_gpuCompositor;
     bool m_holdLastFrame = true;

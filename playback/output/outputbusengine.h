@@ -22,12 +22,14 @@ struct OutputFrameIdentity {
     quint32 videoHash = 0;
     quint32 audioHash = 0;
     uint64_t videoGpuGeneration = 0;
+    qint64 sourceDecodedSequence = 0;
 
     bool samePayloadAs(const OutputFrameIdentity& other) const {
         return bus == other.bus && sourceFeedIndex == other.sourceFeedIndex &&
                sourcePtsMs == other.sourcePtsMs && videoPlaceholder == other.videoPlaceholder &&
                audioSilent == other.audioSilent && videoHash == other.videoHash &&
-               audioHash == other.audioHash && videoGpuGeneration == other.videoGpuGeneration;
+               audioHash == other.audioHash && videoGpuGeneration == other.videoGpuGeneration &&
+               sourceDecodedSequence == other.sourceDecodedSequence;
     }
 
     bool operator==(const OutputFrameIdentity& other) const {
@@ -36,7 +38,8 @@ struct OutputFrameIdentity {
                sourceFeedIndex == other.sourceFeedIndex && sourcePtsMs == other.sourcePtsMs &&
                videoPlaceholder == other.videoPlaceholder && audioSilent == other.audioSilent &&
                videoHash == other.videoHash && audioHash == other.audioHash &&
-               videoGpuGeneration == other.videoGpuGeneration;
+               videoGpuGeneration == other.videoGpuGeneration &&
+               sourceDecodedSequence == other.sourceDecodedSequence;
     }
 };
 
@@ -70,7 +73,8 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 // fresh composite — a hash key could collide and emit a stale frame.
 struct MultiviewComposite {
     bool valid = false;
-    QVector<qint64> sourceKeys{}; // 3 entries per feed: present flag, selected pts, GPU generation
+    // 8 entries per feed: presence/timing/generation plus color/range dimensions.
+    QVector<qint64> sourceKeys{};
     FrameHandle video;
 };
 

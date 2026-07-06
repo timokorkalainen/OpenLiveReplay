@@ -16,6 +16,12 @@ option(OLR_WCONVERSION "Also enable the -Wconversion/-Wsign-conversion family (l
 option(OLR_BUILD_FUZZERS "Build libFuzzer harnesses for the input parsers (needs clang+libFuzzer)" OFF)
 option(OLR_GPU_PIPELINE "Build the GPU-resident pipeline (RHI spine, shaders), default off" OFF)
 option(OLR_BUILD_GPU_PROBES "Build Phase-0 GPU measurement probes (links Qt RHI; not shipped)" OFF)
+option(OLR_WITH_DECKLINK "Build the Blackmagic DeckLink output backend (requires DECKLINK_SDK_DIR)" OFF)
+set(DECKLINK_SDK_DIR "" CACHE PATH "Path to the Blackmagic DeckLink SDK headers")
+option(OLR_WITH_AJA "Build the AJA NTV2 output backend (requires AJA_NTV2_DIR)" OFF)
+set(AJA_NTV2_DIR "" CACHE PATH "Path to the AJA NTV2 SDK headers")
+option(OLR_WITH_OMT "Build the OMT output backend (requires OMT_SDK_DIR)" OFF)
+set(OMT_SDK_DIR "" CACHE PATH "Path to the OMT SDK headers")
 set(OLR_SANITIZER "" CACHE STRING
     "Sanitizers to enable, e.g. address, thread, undefined, or 'address;undefined'")
 
@@ -206,7 +212,9 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/ingest/mpegtsparser.h recorder_engine/ingest/mpegtsparser.cpp
         recorder_engine/ingest/h26xaccessunit.h recorder_engine/ingest/h26xaccessunit.cpp
         recorder_engine/ingest/colorvui.h recorder_engine/ingest/colorvui.cpp
+        recorder_engine/ingest/gpudecodedframe.h recorder_engine/ingest/gpudecodedframe.cpp
         recorder_engine/codec/avcc.h recorder_engine/codec/avcc.cpp
+        recorder_engine/codec/colorvui.h recorder_engine/codec/colorvui.cpp
         recorder_engine/benchmark/benchmarktypes.h
         recorder_engine/benchmark/benchmarkplan.h recorder_engine/benchmark/benchmarkplan.cpp
         recorder_engine/benchmark/codecrunner.h
@@ -256,15 +264,31 @@ qt_add_qml_module(OpenLiveReplay
         playback/output/broadcastoutputstatus.h playback/output/broadcastoutputstatus.cpp
         playback/output/outputbusengine.h playback/output/outputbusengine.cpp
         playback/output/outputsink.h
+        playback/gpu/gpuframereadbacktelemetry.h playback/gpu/gpuframereadbacktelemetry.cpp
         playback/output/gpureadbacktelemetry.h playback/output/gpureadbacktelemetry.cpp
         playback/output/outputdispatcher.h playback/output/outputdispatcher.cpp
         playback/output/outputruntime.h playback/output/outputruntime.cpp
         playback/output/queuedoutputsink.h playback/output/queuedoutputsink.cpp
+        playback/output/asyncgpureadbacksink.h playback/output/asyncgpureadbacksink.cpp
+        playback/output/gpureadbackring.h playback/output/gpureadbackring.cpp
+        playback/output/sinkgpucapability.h playback/output/sinkgpucapability.cpp
         playback/output/yuv420pcompositor.h playback/output/yuv420pcompositor.cpp
         playback/output/qtpreviewsink.h playback/output/qtpreviewsink.cpp
         playback/output/ndiabi.h
         playback/output/ndiruntimepaths.h
         playback/output/ndisink.h playback/output/ndisink.cpp
+        playback/output/iotargets/sinkcapabilityprobe.h
+        playback/output/iotargets/sinkcapabilityprobe.cpp
+        playback/output/iotargets/decklinksink.h
+        playback/output/iotargets/decklinksink.cpp
+        playback/output/iotargets/st2110framer.h
+        playback/output/iotargets/st2110framer.cpp
+        playback/output/iotargets/ajasink.h
+        playback/output/iotargets/ajasink.cpp
+        playback/output/iotargets/omtsink.h
+        playback/output/iotargets/omtsink.cpp
+        playback/output/iotargets/iotargetsinkfactory.h
+        playback/output/iotargets/iotargetsinkfactory.cpp
         project/projectsettingsimporter.h project/projectsettingsimporter.cpp
         project/projectimportclient.h project/projectimportclient.cpp
         telemetry/telemetryevent.h
@@ -279,6 +303,31 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(
         "${CMAKE_CURRENT_BINARY_DIR}/.rcc/qmlcache/OpenLiveReplay_qmlcache_loader.cpp"
         PROPERTIES COMPILE_OPTIONS "-Wno-null-dereference")
+endif()
+
+if(OLR_WITH_DECKLINK)
+    if(NOT DECKLINK_SDK_DIR)
+        message(FATAL_ERROR "OLR_WITH_DECKLINK=ON requires -DDECKLINK_SDK_DIR=<path>")
+    endif()
+    target_sources(OpenLiveReplay PRIVATE playback/output/iotargets/decklinkbackend_sdk.cpp)
+    target_compile_definitions(OpenLiveReplay PRIVATE OLR_WITH_DECKLINK_BUILD)
+    target_include_directories(OpenLiveReplay PRIVATE "${DECKLINK_SDK_DIR}")
+endif()
+if(OLR_WITH_AJA)
+    if(NOT AJA_NTV2_DIR)
+        message(FATAL_ERROR "OLR_WITH_AJA=ON requires -DAJA_NTV2_DIR=<path>")
+    endif()
+    target_sources(OpenLiveReplay PRIVATE playback/output/iotargets/ajabackend_sdk.cpp)
+    target_compile_definitions(OpenLiveReplay PRIVATE OLR_WITH_AJA_BUILD)
+    target_include_directories(OpenLiveReplay PRIVATE "${AJA_NTV2_DIR}")
+endif()
+if(OLR_WITH_OMT)
+    if(NOT OMT_SDK_DIR)
+        message(FATAL_ERROR "OLR_WITH_OMT=ON requires -DOMT_SDK_DIR=<path>")
+    endif()
+    target_sources(OpenLiveReplay PRIVATE playback/output/iotargets/omtbackend_sdk.cpp)
+    target_compile_definitions(OpenLiveReplay PRIVATE OLR_WITH_OMT_BUILD)
+    target_include_directories(OpenLiveReplay PRIVATE "${OMT_SDK_DIR}")
 endif()
 
 # Generate qmllint.ini with stable import paths and QML dirs for all installed kits.
@@ -419,6 +468,7 @@ if(APPLE)
         recorder_engine/ingest/nativeaacdecoder_audiotoolbox.mm
         recorder_engine/codec/nativevideoencoder_videotoolbox.mm
         playback/gpu/gpusurface.h playback/gpu/gpusurface_apple.mm
+        playback/gpu/gpufence.h playback/gpu/gpufence_apple.mm
         playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
         playback/gpu/appleiosurface.h playback/gpu/applegpusurface_apple.mm)
     target_compile_definitions(OpenLiveReplay PRIVATE
@@ -429,6 +479,7 @@ if(APPLE)
         "-framework VideoToolbox"
         "-framework CoreMedia"
         "-framework CoreFoundation"
+        "-framework Metal"
         "-framework IOSurface"
         "-framework CoreVideo")
 elseif(WIN32)
@@ -441,6 +492,7 @@ elseif(WIN32)
         recorder_engine/ingest/nativeaacdecoder_mediafoundation.cpp
         recorder_engine/codec/nativevideoencoder_mediafoundation.cpp
         playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp
+        playback/gpu/gpufence.h playback/gpu/gpufence_win.cpp
         playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
         playback/output/win/wingpuimportedge.cpp
         playback/output/win/d3d11gpusurface.cpp
@@ -468,6 +520,7 @@ elseif(NOT WIN32)
         recorder_engine/ingest/nativeaacdecoder_stub.cpp
         recorder_engine/codec/nativevideoencoder_stub.cpp
         playback/gpu/gpusurface.h playback/gpu/gpusurface_stub.cpp
+        playback/gpu/gpufence.h playback/gpu/gpufence_stub.cpp
         playback/gpu/gpupipelineconfig.h playback/gpu/gpupipelineconfig.cpp
         playback/output/win/wingpuimportedge_stub.cpp)
 endif()
@@ -476,31 +529,40 @@ if(OLR_GPU_PIPELINE)
     target_compile_definitions(OpenLiveReplay PRIVATE OLR_GPU_PIPELINE_BUILD=1)
     target_link_libraries(OpenLiveReplay PRIVATE Qt6::GuiPrivate)
     target_sources(OpenLiveReplay PRIVATE
-        playback/gpu/gpucompositor.h playback/gpu/gpucompositor.cpp)
+        recorder_engine/codec/gpuencodepump.h recorder_engine/codec/gpuencodepump.cpp
+        playback/gpu/gpucompositor.h playback/gpu/gpucompositor.cpp
+        playback/gpu/gpubudget.h playback/gpu/gpubudget.cpp
+        playback/gpu/gpudevicelossmonitor.h playback/gpu/gpudevicelossmonitor.cpp
+        playback/gpu/gpuseekprefetch.h playback/gpu/gpuseekprefetch.cpp
+        playback/gpu/gpusurfaceallocator.h playback/gpu/gpusurfaceallocator.cpp
+        playback/gpu/iosgpupolicy.h playback/gpu/iosgpupolicy.cpp
+        playback/gpu/iosgpulifecyclesink.h playback/gpu/iosgpulifecyclesink.cpp)
     if(APPLE)
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpucompositor_apple.mm
             playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_apple.mm
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
             playback/gpu/gpuframeretirequeue.h playback/gpu/gpuframeretirequeue.cpp
-            playback/gpu/gpufence.h playback/gpu/gpufence_apple.mm
             playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp
             playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp
             playback/gpu/decodedonefence.h playback/gpu/decodedonefence_apple.mm
             playback/gpu/vtkeepsurfaceimporter.h playback/gpu/vtkeepsurfaceimporter_apple.mm)
         target_link_libraries(OpenLiveReplay PRIVATE "-framework Metal" "-framework QuartzCore")
+        if(IOS)
+            target_sources(OpenLiveReplay PRIVATE
+                ios/iosgpulifecycle.h ios/iosgpulifecycle.mm)
+            target_link_libraries(OpenLiveReplay PRIVATE "-framework UIKit")
+        endif()
     else()
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpuframedata.h playback/gpu/gpuframedata.cpp
             playback/gpu/gpuframeretirequeue.h playback/gpu/gpuframeretirequeue.cpp
-            playback/gpu/gpufence.h playback/gpu/gpufence_stub.cpp
             playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp
             playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp
             playback/gpu/decodedonefence.h playback/gpu/decodedonefence_stub.cpp)
         if(WIN32)
             target_sources(OpenLiveReplay PRIVATE
-                playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_win.cpp
-                playback/gpu/gpufence_win.cpp)
+                playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_win.cpp)
         else()
             target_sources(OpenLiveReplay PRIVATE
                 playback/gpu/gpurhicontext.h playback/gpu/gpurhicontext_stub.cpp)

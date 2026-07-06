@@ -1,7 +1,7 @@
 # GPU-Resident Video Pipeline — Design Spec
 
 - **Date:** 2026-06-21
-- **Status:** Draft, revised after an independent fresh-agent review (verdict: proceed-with-fixes;
+- **Status:** Draft, revised after an independent review (verdict: proceed-with-fixes;
   all code claims independently verified). Spec under user review.
 - **Scope:** Program-level design. Each subproject below gets its own spec + implementation plan.
 - **Approach:** Keystone-first, strict zero-regression gates. Everything ships behind capability
@@ -226,7 +226,7 @@ product behavior and golden values are unchanged; only test sources edit.
 | D4 | GPU threading | **Fenced multi-thread mirroring the snapshot model** + GPU generation counter | Worker produces surfaces, signals a decode-done fence before publish; output thread waits before reading; eviction waits on render fences. Minimal extension of the proven lock-light producer/consumer; directly closes the TSan-invisible races. Single-GPU-thread would serialize decode+dispatch. **Sync primitive must match the RHI backend (Phase-0 decision):** Apple = `MTLSharedEvent`; Windows = `ID3D12Fence` *iff* the RHI D3D12 backend is chosen, else `ID3D11Fence` (11.4) / keyed-mutex / `ID3D11Query` for D3D11 — do not assume D3D12 fences on a D3D11 device. |
 | D5 | Keep CPU pipeline as runtime fallback | **Yes, permanent**, behind the compositor-select flag, default until GPU proven per-platform | It is the CI oracle, the headless-macOS path, and the safe degradation target. Handle abstraction contains divergence to the compositor + sink-readback layers. |
 | D6 | Mixed-origin frames | **Single self-describing handle**; `readToCpu()` no-op (CPU) / fenced download (GPU) | MPEG-2 SW + NDI ingest are CPU-origin; HW decode GPU-origin. Forcing uniform residency wastes uploads or defeats zero-copy. Compositor uploads a CPU-origin input on demand only when it composites it. |
-| D7 | Readback placement | **Async pipelined** (render N, read N-2), **one readback per unique rendered bus surface / requested CPU format**, shared by all CPU sinks on that bus; **PGM ring depth-1 (sub-frame) from day one, other CPU sinks depth-3** | Sync readback stalls the 1 ms cadence at 60 fps. A tick renders per distinct bus (feed/PGM/multiview), so the invariant is per-surface, not per-tick. PGM preview gets the low-latency depth-1 path up front (user decision); NDI/multiview accept depth-3 (2–3 frames). The multiview monitor's ~33 ms (@60 fps) A/V lead vs the real-time `AudioPlayer` is an open AudioPlayer-delay-or-accept decision deferred to `async-readback` (§9), not silently mitigated. GPU-native sinks bypass via `SinkGpuCapability`. |
+| D7 | Readback placement | **Async pipelined** (render N, read N-2), **one readback per unique rendered bus surface / requested CPU format**, shared by all CPU sinks on that bus; **PGM ring depth-1 (sub-frame) from day one, other CPU sinks depth-3** | Sync readback stalls the 1 ms cadence at 60 fps. A tick renders per distinct bus (feed/PGM/multiview), so the invariant is per-surface, not per-tick. PGM preview gets the low-latency depth-1 path up front (user decision); NDI/multiview accept depth-3 (roughly two output-frame periods of monitor lead, e.g. ~33 ms @60 Hz or ~67 ms @30 fps). The multiview monitor A/V lead vs the real-time `AudioPlayer` is an open AudioPlayer-delay-or-accept decision deferred to `async-readback` (§9), not silently mitigated. GPU-native sinks bypass via `SinkGpuCapability`. |
 | D8 | iOS timing | **Symmetric edge interface now, bring-up Phase 5** | No macOS-only architecting, but don't pay iOS main-thread/thermal/VRAM cost before the spine is proven. |
 | D9 | Single decode-window authority | **`TrackBuffer` owns the authoritative GPU surface window; `OutputFrameCache`, staging, and the inactive-graph snapshot hold `FrameHandle` refs (refcount bumps), never second copies** | Code-confirmed double storage: each decoded frame is inserted into both `track->buffer` **and** `m_outputCache` ([playbackworker.cpp:625-627](../../../playback/playbackworker.cpp)), and the inactive-graph path copies every TrackBuffer frame into a fresh cache (:2247-2256). Holding GPU surfaces in both doubles VRAM; refs-only collapses it — this is what makes the ~0.85 GiB floor real. |
 | D10 | Sink cadence contract | **Per-sink capability: `GpuNative` / `AsyncReadbackDedupOk` / `NeedsContinuousCadence`** | The dispatcher identity-skips `submit()` on `samePayloadAs` ([outputdispatcher.cpp:116-122](../../../playback/output/outputdispatcher.cpp)). Async readback must not fight that or NDI's `maxGap≤2`: dedup-ok sinks (preview) skip readback on unchanged payload while advancing delivery indices; continuous-cadence sinks (NDI) get a readback (or a re-sent prior surface) every tick. `async-readback` owns the policy. |
@@ -363,17 +363,25 @@ fenceless approximation.
 - **AV-sync under readback lag** (hard gate inside `async-readback`, before NDI migrates).
   **Direction:** audio travels with the delayed video so `OutputBusFrame` stays atomic — the
   video+audio pair is read back / dispatched together, preserving sample alignment under N-frame
-  lag. The **AV-sync MAX gate (≤100 ms)** and **NDI marker-continuity (`maxGap≤2`)** must pass
-  through the readback path; these gates live in `tests/e2e/run_sync_e2e.sh` and the NDI
-  recv-probe/analysis + NDI e2e shell drivers (not `play_harness`). `OutputBusFrame` carrying
-  video+audio together is what makes the atomic-pair approach possible — and is the single most
-  likely regression if violated.
+  lag. GPU-enabled NDI playback gates content A/V (`avSyncMaxFrames<=1`) on feed, PGM, and
+  multiview buses and requires non-synthesized receiver timecodes. GPU NDI pipe gates
+  programme-timecode A/V pairing (`tcAvMaxFrames<=1`) and requires dense, non-synthesized
+  video/audio timecodes, with both paths enforcing `maxGap<=2`.
+  The source lip-sync harness remains a separate oracle because it does not construct
+  output sinks. `OutputBusFrame` carrying video+audio together is what makes the atomic-pair
+  approach possible — and is the single most likely regression if violated.
 - **Local-monitor lip-sync lead:** the worker-side `AudioPlayer` (real-time `QAudioSink` on the
   device clock) keeps playing in real time while preview video rides D7's render-N/read-N-2 path,
-  creating a monitor-side audio **lead of ~2 frames (~33 ms @ 60 fps)** that the OutputBusFrame/NDI
-  AV-sync gate structurally cannot observe. PGM gets D7's sub-frame mitigation; **multiview previews
-  do not.** Resolution: either delay `AudioPlayer` to match preview readback, or document and accept
-  the bounded monitor lead — decided in `async-readback`.
+  creating a monitor-side audio **lead of roughly two output frames** (~33 ms @60 Hz, ~67 ms @30 fps)
+  that the OutputBusFrame/NDI AV-sync gate structurally cannot observe. PGM gets D7's sub-frame
+  mitigation; **multiview previews do not.** Resolution: either delay `AudioPlayer` to match preview
+  readback, or document and accept the bounded monitor lead — decided in `async-readback`.
+  **`async-readback` Task 7 decision:** document-and-accept. PGM remains depth-1, so program monitor
+  latency is sub-frame; non-PGM CPU sinks remain depth-3 to avoid render-thread stalls. The bounded
+  local multiview monitor audio lead (about two output-frame periods, so rate-dependent) is therefore
+  accepted rather than adding an `AudioPlayer` delay in Phase 4. Output-bound AV sync remains gated by
+  the atomic `OutputBusFrame` path through the GPU-enabled NDI playback receiver lane; the ingest
+  lip-sync harness is not used as readback-path evidence because it does not construct output sinks.
 - **Telemetry counter contract** (`telemetry-contract`): existing gate counters
   (`placeholderFramesDelta`, `heldFramesDelta`, `maxClockDivergenceMs`, `decodedVideoFrames`,
   `stagingVideoFramesDecoded`) keep their meaning; new counters are emitted by the harnesses and the
@@ -461,7 +469,9 @@ keystone — it pins the GPU fence / generation-counter / eviction-guard contrac
   [gpu-phase4-device-loss](../plans/2026-06-21-gpu-phase4-device-loss.md).
 - **Phase 5:** [gpu-phase5-gpu-encode](../plans/2026-06-21-gpu-phase5-gpu-encode.md) (recorder
   StreamWorker) · [gpu-phase5-ios-bringup](../plans/2026-06-21-gpu-phase5-ios-bringup.md) ·
-  [gpu-phase5-new-io-targets](../plans/2026-06-21-gpu-phase5-new-io-targets.md).
+  [gpu-phase5-new-io-targets](../plans/2026-06-21-gpu-phase5-new-io-targets.md) (off-SDK
+  `unit` + `iotargets` capstone; DeckLink/AJA/OMT SDK backend bodies remain integrator-supplied
+  manual hardware gates).
 
 **Explicitly out of this program (future, architecture-enabled):** motion-interpolated slow-mo (needs
 its own correctness strategy — the CPU oracle cannot validate interpolated frames), GPU

@@ -4,6 +4,7 @@
 #include "playback/gpu/gpucompositor.h"
 #include "playback/gpu/gpupipelineconfig.h"
 #endif
+#include "playback/output/colormetadatapolicy.h"
 #include "playback/output/yuv420pcompositor.h"
 
 #include <QList>
@@ -34,6 +35,7 @@ FrameHandle placeholderVideoFrame(int feedIndex, qint64 playheadMs, int width, i
     placeholder.metadata().key.feedIndex = feedIndex;
     placeholder.metadata().key.ptsMs = playheadMs;
     placeholder.metadata().key.isPlaceholder = true;
+    placeholder.metadata().color = defaultColorMetadataForHeight(height);
     return placeholder;
 }
 
@@ -99,7 +101,8 @@ QDebug operator<<(QDebug debug, const OutputFrameIdentity& identity) {
                     << ", placeholder=" << identity.videoPlaceholder
                     << ", audioSilent=" << identity.audioSilent
                     << ", videoHash=" << identity.videoHash << ", audioHash=" << identity.audioHash
-                    << ", gpuGeneration=" << identity.videoGpuGeneration << ')';
+                    << ", gpuGeneration=" << identity.videoGpuGeneration
+                    << ", decodedSequence=" << identity.sourceDecodedSequence << ')';
     return debug;
 }
 
@@ -116,6 +119,7 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame) {
     identity.videoHash = videoHashFor(videoKey);
     identity.audioHash = audioHashFor(frame.audio);
     identity.videoGpuGeneration = frame.video.metadata().gpuGeneration;
+    identity.sourceDecodedSequence = frame.video.metadata().decodedSequence;
     return identity;
 }
 
@@ -163,11 +167,12 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     // hash collision only miscounts a stat, never produces wrong pixels).
     quint32 sourceSignature = kFnvOffset;
     QVector<qint64> sourceKeys;
-    sourceKeys.reserve(static_cast<qsizetype>(m_feedCount) * 3);
+    sourceKeys.reserve(static_cast<qsizetype>(m_feedCount) * 8);
     QVector<std::optional<FrameHandle>> sources;
     sources.reserve(m_feedCount);
     qint64 sourcePtsMs = 0;
     uint64_t sourceGpuGeneration = 0;
+    qint64 sourceDecodedSequence = 0;
     bool anySourcePresent = false;
     for (int feed = 0; feed < m_feedCount; ++feed) {
         const std::optional<FrameHandle> src =
@@ -175,17 +180,43 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
         sources.append(src);
         const qint64 pts = src ? src->metadata().key.ptsMs : kAbsentFeedPts;
         const uint64_t generation = src ? src->metadata().gpuGeneration : uint64_t(0);
+        const ColorMetadata color =
+            src ? src->metadata().color : defaultColorMetadataForHeight(m_height);
         sourceKeys.append(src ? 1 : 0);
         sourceKeys.append(pts);
         sourceKeys.append(qint64(generation));
+        sourceKeys.append(src ? src->metadata().decodedSequence : qint64(0));
+        sourceKeys.append(int(color.matrix));
+        sourceKeys.append(int(color.primaries));
+        sourceKeys.append(int(color.transfer));
+        sourceKeys.append(int(color.range));
         sourceSignature = hashInt(sourceSignature, feed);
         sourceSignature = hashInt(sourceSignature, pts);
         sourceSignature = hashInt(sourceSignature, qint64(generation));
+        sourceSignature =
+            hashInt(sourceSignature, src ? src->metadata().decodedSequence : qint64(0));
         sourceSignature = hashInt(sourceSignature, src ? 0 : 1);
+        sourceSignature = hashInt(sourceSignature, int(color.matrix));
+        sourceSignature = hashInt(sourceSignature, int(color.primaries));
+        sourceSignature = hashInt(sourceSignature, int(color.transfer));
+        sourceSignature = hashInt(sourceSignature, int(color.range));
         if (src) {
             anySourcePresent = true;
             sourcePtsMs = qMax(sourcePtsMs, src->metadata().key.ptsMs);
             sourceGpuGeneration = qMax(sourceGpuGeneration, generation);
+            sourceDecodedSequence = qMax(sourceDecodedSequence, src->metadata().decodedSequence);
+        }
+    }
+    ColorMetadata compositeColor = defaultColorMetadataForHeight(m_height);
+    if (state.selectedFeedIndex >= 0 && state.selectedFeedIndex < sources.size() &&
+        sources.at(state.selectedFeedIndex).has_value()) {
+        compositeColor = sources.at(state.selectedFeedIndex)->metadata().color;
+    } else {
+        for (const std::optional<FrameHandle>& src : sources) {
+            if (src.has_value()) {
+                compositeColor = src->metadata().color;
+                break;
+            }
         }
     }
 
@@ -205,10 +236,9 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
         FrameHandle composed;
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (m_gpuCompositor && m_gpuCompositor->isValid() && gpuPipelineEnabled()) {
-            ColorMetadata color;
             composed = m_gpuCompositor->composeGridMemoizedForGeneration(
-                frames, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear, sourceKeys,
-                memo, state.gpuGeneration);
+                frames, m_width, m_height, compositeColor, GpuCompositor::ScaleQuality::Bilinear,
+                sourceKeys, memo, state.gpuGeneration);
         }
 #endif
         if (composed.isNull()) {
@@ -222,12 +252,14 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
         out.video = composed;
     }
     out.video.metadata().key.isPlaceholder = !anySourcePresent;
+    out.video.metadata().color = compositeColor;
 
     // Identity must reflect the composited source content, not the advancing playhead,
     // so repeated-payload detection works when the underlying feeds are frozen.
     out.video.metadata().key.ptsMs = sourcePtsMs;
     out.video.metadata().gpuGeneration =
         out.video.isGpuBacked() ? state.gpuGeneration : sourceGpuGeneration;
+    out.video.metadata().decodedSequence = sourceDecodedSequence;
     out.video.metadata().outputFrameIndex = outputFrameIndex;
 
     out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
@@ -253,16 +285,16 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (bus == OutputBusId::pgm() && m_gpuCompositor && m_gpuCompositor->isValid() &&
             gpuPipelineEnabled()) {
-            ColorMetadata color;
             const FrameMetadata sourceMeta = out.video.metadata();
             FrameHandle gpu = m_gpuCompositor->composePgmForGeneration(
-                out.video, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear,
-                state.gpuGeneration);
+                out.video, m_width, m_height, sourceMeta.color,
+                GpuCompositor::ScaleQuality::Bilinear, state.gpuGeneration);
             if (!gpu.isNull()) {
                 gpu.metadata().key.feedIndex = sourceMeta.key.feedIndex;
                 gpu.metadata().key.ptsMs = sourceMeta.key.ptsMs;
                 gpu.metadata().key.isPlaceholder = sourceMeta.key.isPlaceholder;
                 gpu.metadata().gpuGeneration = state.gpuGeneration;
+                gpu.metadata().decodedSequence = sourceMeta.decodedSequence;
                 out.video = gpu;
             }
         }

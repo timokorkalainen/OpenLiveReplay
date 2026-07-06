@@ -36,13 +36,13 @@ ColorPrimaries primariesFromAv(int code) {
 ColorTransfer transferFromAv(int code) {
     switch (code) {
     case 1:
-    case 14:
-    case 15:
         return ColorTransfer::Bt709;
     case 5:
     case 6:
     case 8:
         return ColorTransfer::Bt601;
+    case 14:
+    case 15:
     case 16:
         return ColorTransfer::Bt2020;
     default:

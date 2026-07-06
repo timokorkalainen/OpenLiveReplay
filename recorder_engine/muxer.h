@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -19,15 +20,17 @@
 #endif
 
 extern "C" {
-    #include <libavformat/avformat.h>
-    #include <libavcodec/avcodec.h>
-    #include <libavutil/opt.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
 }
 
 #include "recorder_engine/codec/videocodecchoice.h"
 
 class Muxer {
 public:
+    using PacketWriteCallback = std::function<void(bool written)>;
+
     Muxer();
     ~Muxer();
 
@@ -57,9 +60,12 @@ public:
               int audioChannels = 2, VideoCodecChoice codec = VideoCodecChoice::Mpeg2Software,
               const QByteArray& videoExtradata = {}, const QString& startTimecode = QString(),
               int fpsNum = 0, int fpsDen = 0);
-    void writePacket(AVPacket* pkt);
-    void writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
-    void writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);
+    // Returns true when the packet was accepted into the writer queue. The optional
+    // callback still reports the later disk-write result.
+    bool writePacket(AVPacket* pkt, PacketWriteCallback onWritten = PacketWriteCallback{});
+    bool writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
+    bool writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);
+    void beginShutdownDrain();
     // Offer a session-start timecode candidate. The header is written on the FIRST
     // muxed packet (see ensureHeaderWritten); the FIRST well-formed candidate
     // registered before that wins and becomes the file's "timecode" tag. Empty or
@@ -86,6 +92,7 @@ public:
     // Deliberately unlocked: init() calls getVideoPath() while holding
     // m_mutex, and the value never changes during a recording session.
     void setOutputDirectory(const QString& dir) { m_outputDir = dir; }
+
 private:
     // Drains m_pktQueue and performs the actual av_write_frame/avio_flush.
     // Runs on m_writerThread; the ONLY thread that touches m_outCtx between
@@ -98,13 +105,15 @@ private:
     // failed==true: increment counter; on reaching kFatalWriteThreshold, set the
     // fatal flag (once). failed==false: reset the counter to 0.
     void recordWriteOutcome(bool failed, const char* errLabel);
+    void normalizePacketDts(AVPacket* pkt);
+    void rememberWrittenPacketDts(const AVPacket* pkt);
 
     // Writes the deferred MKV header exactly once, materialising the winning
     // start-timecode candidate into the "timecode" tag (format-level + each video
     // track) at that moment. Idempotent and thread-safe (m_headerMutex). Returns
     // true once the header is (or already was) written; false if the underlying
-    // avformat_write_header failed. Called at the TOP of every write path before
-    // any queue lock, and from close() so an empty recording still gets a header.
+    // avformat_write_header failed. Called by the writer thread before draining the
+    // first queued packet, and from close() so an empty recording still gets a header.
     //
     // LOCK ORDERING: m_headerMutex is the FIRST lock taken on any write — it is
     // never held while acquiring m_qMutex (writePacket releases it implicitly by
@@ -176,11 +185,17 @@ private:
     // so worker tick threads and the GUI thread never block on a stalled disk
     // (except, by design, when a sustained stall fills the bounded queue).
     static constexpr size_t kMaxQueued = 4096; // ~ a few seconds of packets
+    struct QueuedPacket {
+        AVPacket* pkt = nullptr;
+        PacketWriteCallback onWritten;
+    };
+
     std::thread m_writerThread;
-    std::queue<AVPacket*> m_pktQueue; // owns the cloned packets it holds
+    std::queue<QueuedPacket> m_pktQueue; // owns the cloned packets it holds
     std::mutex m_qMutex;
     std::condition_variable m_qCv;
     std::atomic<bool> m_writerRunning{false};
+    std::atomic<bool> m_blockingWritesAllowed{true};
 
     // Set on the FIRST sustained write failure (kFatalWriteThreshold consecutive
     // av_write_frame errors on any stream). Written once; reset only on init().

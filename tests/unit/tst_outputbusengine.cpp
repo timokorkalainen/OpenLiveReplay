@@ -34,6 +34,18 @@ static FrameHandle video(int feed, qint64 pts, uchar y) {
     return f;
 }
 
+static FrameHandle videoWithSequence(int feed, qint64 pts, uchar y, qint64 decodedSequence) {
+    FrameHandle f = video(feed, pts, y);
+    f.metadata().decodedSequence = decodedSequence;
+    return f;
+}
+
+static FrameHandle videoWithColor(int feed, qint64 pts, uchar y, ColorMetadata color) {
+    FrameHandle f = video(feed, pts, y);
+    f.metadata().color = color;
+    return f;
+}
+
 static FrameHandle gpuVideo(int feed, qint64 pts, uchar y, uint64_t generation) {
     FrameHandle f = video(feed, pts, y);
     f.metadata().gpuGeneration = generation;
@@ -67,10 +79,15 @@ class TestOutputBusEngine : public QObject {
     Q_OBJECT
 private slots:
     void feedBusUsesOwnVideoAndAudioAtOneX();
+    void feedIdentityCarriesSourceDecodedSequence();
     void pgmFollowsSelectedFeed();
+    void pgmIdentityCarriesSourceDecodedSequence();
     void pgmIsPixelExactCopyOfSelectedFeed();
+    void placeholderUsesHeightDefaultColorMetadata();
+    void pgmPreservesSelectedSourceColorMetadata();
     void pausedAudioIsSilenceButVideoRepeats();
     void multiviewComposesFeedsAndCarriesSelectedFeedAudio();
+    void multiviewChoosesSelectedSourceColorMetadata();
     void ntscAudioUsesRationalSampleBoundaries();
     void ntscAudioSpansStayContiguousAcrossOddPlayEpoch();
     void multiviewVideoIdentityTracksSourceContentNotPlayhead();
@@ -86,6 +103,7 @@ private slots:
     void staleGpuMultiviewSourcesAreComposedAsAbsent();
     void staleNearestGpuFeedFallsBackToOlderFreshFrame();
     void multiviewMemoInvalidatesWhenSourceGenerationChangesAtSamePts();
+    void multiviewMemoInvalidatesWhenSourceDecodedSequenceChangesAtSamePts();
 };
 
 void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
@@ -111,6 +129,21 @@ void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
     QCOMPARE(reinterpret_cast<const qint16*>(feed1.audio.pcm.constData())[0], qint16(200));
 }
 
+void TestOutputBusEngine::feedIdentityCarriesSourceDecodedSequence() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoWithSequence(0, 100, 10, 42));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    const auto feed = engine.renderFeed(0, 3, state, cache);
+    QCOMPARE(feed.identity.sourceDecodedSequence, qint64(42));
+}
+
 void TestOutputBusEngine::pgmFollowsSelectedFeed() {
     OutputFrameCache cache(2, 4, 4);
     cache.insertVideoFrame(video(0, 100, 10));
@@ -126,6 +159,22 @@ void TestOutputBusEngine::pgmFollowsSelectedFeed() {
     auto pgm = engine.renderPgm(5, state, cache);
     QCOMPARE(pgm.bus, OutputBusId::pgm());
     QCOMPARE(uchar(MediaVideoFrameView(pgm.video).planeY.at(0)), uchar(30));
+}
+
+void TestOutputBusEngine::pgmIdentityCarriesSourceDecodedSequence() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoWithSequence(0, 100, 10, 42));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    const auto pgm = engine.renderPgm(3, state, cache);
+    QCOMPARE(pgm.identity.sourceDecodedSequence, qint64(42));
+    QCOMPARE(pgm.video.metadata().decodedSequence, qint64(42));
 }
 
 // PIXEL-EXACT PGM SELECTION: the PGM bus must emit the SELECTED feed's pixels
@@ -176,6 +225,43 @@ void TestOutputBusEngine::pgmIsPixelExactCopyOfSelectedFeed() {
     QCOMPARE(pgm0View.planeV, feed0View.planeV);
 }
 
+void TestOutputBusEngine::placeholderUsesHeightDefaultColorMetadata() {
+    OutputFrameCache cache(1, 4, 4);
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 640, 480);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    const auto feed = engine.renderFeed(0, 5, state, cache);
+
+    QVERIFY(feed.video.metadata().key.isPlaceholder);
+    QCOMPARE(int(feed.video.metadata().color.matrix), int(ColorMatrix::Bt601));
+    QCOMPARE(int(feed.video.metadata().color.primaries), int(ColorPrimaries::Bt601));
+    QCOMPARE(int(feed.video.metadata().color.transfer), int(ColorTransfer::Bt601));
+}
+
+void TestOutputBusEngine::pgmPreservesSelectedSourceColorMetadata() {
+    ColorMetadata bt601;
+    bt601.matrix = ColorMatrix::Bt601;
+    bt601.primaries = ColorPrimaries::Bt601;
+    bt601.transfer = ColorTransfer::Bt601;
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(videoWithColor(1, 100, 30, bt601));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 1;
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QCOMPARE(pgm.video.metadata().color, bt601);
+}
+
 void TestOutputBusEngine::pausedAudioIsSilenceButVideoRepeats() {
     OutputFrameCache cache(1, 4, 4);
     cache.insertVideoFrame(video(0, 100, 40));
@@ -221,6 +307,27 @@ void TestOutputBusEngine::multiviewComposesFeedsAndCarriesSelectedFeedAudio() {
     const auto* pcm = reinterpret_cast<const qint16*>(multiview.audio.pcm.constData());
     QCOMPARE(multiview.audio.feedIndex, 1);
     QCOMPARE(pcm[0], qint16(200));
+}
+
+void TestOutputBusEngine::multiviewChoosesSelectedSourceColorMetadata() {
+    ColorMetadata selectedColor;
+    selectedColor.matrix = ColorMatrix::Bt601;
+    selectedColor.primaries = ColorPrimaries::Bt601;
+    selectedColor.transfer = ColorTransfer::Bt601;
+    OutputFrameCache cache(3, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(videoWithColor(1, 100, 20, selectedColor));
+    cache.insertVideoFrame(video(2, 100, 30));
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 3, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 1;
+
+    const auto multiview = engine.renderMultiview(5, state, cache);
+
+    QCOMPARE(multiview.video.metadata().color, selectedColor);
 }
 
 void TestOutputBusEngine::ntscAudioUsesRationalSampleBoundaries() {
@@ -563,6 +670,28 @@ void TestOutputBusEngine::multiviewMemoInvalidatesWhenSourceGenerationChangesAtS
     cache.insertVideoFrame(gpuVideo(0, 100, 22, 2));
     state.gpuGeneration = 2;
     const auto second = engine.renderMultiview(5, state, cache, &memo);
+    QCOMPARE(uchar(MediaVideoFrameView(second.video).planeY.at(0)), uchar(22));
+    QVERIFY(second.identity.videoHash != first.identity.videoHash);
+}
+
+void TestOutputBusEngine::multiviewMemoInvalidatesWhenSourceDecodedSequenceChangesAtSamePts() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoWithSequence(0, 100, 99, 1));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto first = engine.renderMultiview(4, state, cache, &memo);
+    QCOMPARE(first.identity.sourceDecodedSequence, qint64(1));
+    QCOMPARE(uchar(MediaVideoFrameView(first.video).planeY.at(0)), uchar(99));
+
+    cache.insertVideoFrame(videoWithSequence(0, 100, 22, 2));
+    const auto second = engine.renderMultiview(5, state, cache, &memo);
+    QCOMPARE(second.identity.sourceDecodedSequence, qint64(2));
     QCOMPARE(uchar(MediaVideoFrameView(second.video).planeY.at(0)), uchar(22));
     QVERIFY(second.identity.videoHash != first.identity.videoHash);
 }

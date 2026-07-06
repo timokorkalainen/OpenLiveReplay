@@ -4,6 +4,8 @@
 
 #include "playback/gpu/appleiosurface.h"
 #include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpureadbackretainer.h"
 
 #include <utility>
 
@@ -25,6 +27,13 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
     meta.key.format = FramePixelFormat::Nv12;
     if (meta.key.width <= 0) meta.key.width = desc.width;
     if (meta.key.height <= 0) meta.key.height = desc.height;
+    if (renderFence) {
+        const uint64_t fenceValue = renderFence->signal();
+        if (fenceValue != 0) {
+            surface->retainUntilFenceRetired(fenceValue);
+            gpuRetainSurfaceUntilFenceRetired(surface, renderFence, fenceValue);
+        }
+    }
     return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence));
 }
 

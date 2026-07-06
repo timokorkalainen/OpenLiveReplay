@@ -1,6 +1,7 @@
 #include "h26xseitimecode.h"
 
 #include <QList>
+#include <limits>
 
 namespace {
 
@@ -20,8 +21,12 @@ int startCodeSizeAt(const QByteArray& bytes, int offset) {
 }
 
 QList<int> findStartCodes(const QByteArray& bytes) {
+    if (bytes.size() > std::numeric_limits<int>::max()) {
+        return {};
+    }
+    const int byteCount = static_cast<int>(bytes.size());
     QList<int> offsets;
-    for (int i = 0; i + 3 <= bytes.size();) {
+    for (int i = 0; i + 3 <= byteCount;) {
         const int size = startCodeSizeAt(bytes, i);
         if (size > 0) {
             offsets.append(i);
@@ -35,13 +40,17 @@ QList<int> findStartCodes(const QByteArray& bytes) {
 
 // Each NAL payload spans from just after its start code to the next start code.
 QList<QByteArray> splitAnnexBNals(const QByteArray& bytes) {
+    if (bytes.size() > std::numeric_limits<int>::max()) {
+        return {};
+    }
+    const int byteCount = static_cast<int>(bytes.size());
     QList<QByteArray> nals;
     const QList<int> starts = findStartCodes(bytes);
     for (int i = 0; i < starts.size(); ++i) {
         const int start = starts[i];
         const int prefixSize = startCodeSizeAt(bytes, start);
         const int payloadOffset = start + prefixSize;
-        const int end = (i + 1 < starts.size()) ? starts[i + 1] : static_cast<int>(bytes.size());
+        const int end = (i + 1 < starts.size()) ? starts[i + 1] : byteCount;
         if (prefixSize == 0 || end <= payloadOffset) {
             continue;
         }

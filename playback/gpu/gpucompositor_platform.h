@@ -25,6 +25,7 @@ public:
 
 std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle& frame);
 std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int width, int height);
+bool supportsNativeOutputSurfaces();
 std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi* rhi,
                                                      const std::shared_ptr<GpuSurface>& surface);
 std::unique_ptr<ImportedRgbaRenderTarget>

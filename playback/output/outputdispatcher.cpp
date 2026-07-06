@@ -4,11 +4,14 @@
 #include "playback/gpu/gpucompositor.h"
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpurhicontext.h"
+#include "playback/output/gpureadbackring.h"
 #endif
 #include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputframeclock.h"
 
 #include <QHash>
+
+#include <memory>
 
 namespace {
 
@@ -37,18 +40,26 @@ bool hasMeaningfulSinkStatus(const OutputSinkStatus& status) {
            !status.state.isEmpty() || !status.message.isEmpty();
 }
 
+std::shared_ptr<SharedGpuReadbackCache> createSharedReadbackCache() {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    return std::make_shared<SharedGpuReadbackCache>();
+#else
+    return nullptr;
+#endif
+}
+
 } // namespace
 
-OutputDispatcher::OutputDispatcher(FrameRate rate, int feedCount, int width, int height)
+OutputDispatcher::OutputDispatcher(FrameRate rate, int feedCount, int width, int height,
+                                   std::shared_ptr<GpuRhiContext> gpuRhi)
     : m_rate(rate), m_feedCount(qMax(0, feedCount)), m_width(qMax(2, width)),
-      m_height(qMax(2, height)) {
+      m_height(qMax(2, height)), m_sharedReadbacks(createSharedReadbackCache()) {
 #ifdef OLR_GPU_PIPELINE_BUILD
     if (gpuPipelineEnabled()) {
-        m_gpuRhi = GpuRhiContext::create();
-        if (m_gpuRhi) {
-            m_gpuCompositor = GpuCompositor::create(m_gpuRhi);
-        }
+        setGpuRhiContext(gpuRhi ? std::move(gpuRhi) : GpuRhiContext::create());
     }
+#else
+    Q_UNUSED(gpuRhi);
 #endif
 }
 
@@ -96,11 +107,25 @@ void OutputDispatcher::incrementFenceWaitStalls() {
     m_stats.fenceWaitStalls++;
 }
 
+void OutputDispatcher::setGpuRhiContext(std::shared_ptr<GpuRhiContext> gpuRhi) {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    m_gpuRhi = std::move(gpuRhi);
+    m_gpuCompositor = m_gpuRhi && m_gpuRhi->isValid() && !m_gpuRhi->deviceLost()
+                          ? GpuCompositor::create(m_gpuRhi)
+                          : nullptr;
+#else
+    Q_UNUSED(gpuRhi);
+#endif
+}
+
 OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache,
                                                    const PlaybackStateSnapshot& state) {
     const qint64 outputFrameIndex = m_nextOutputFrameIndex++;
     const PlaybackStateSnapshot tickState = clockedStateForTick(outputFrameIndex, state);
     QHash<OutputBusId, OutputBusFrame> rendered;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (m_sharedReadbacks) m_sharedReadbacks->clear();
+#endif
 
     for (const OutputEndpoint& endpoint : m_endpoints) {
         if (!endpoint.assignment.enabled || !endpoint.sink || !endpoint.sink->isActive()) continue;
@@ -147,7 +172,7 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
         // Identity-skip: if this endpoint already received a byte-identical
         // payload, skip the submit (and the sink's map/copy/deliver entirely).
         OutputTargetDispatchStats& tstats = m_stats.targets[targetStatsKey(endpoint.assignment)];
-        if (m_identitySkip && tstats.hasLastIdentity &&
+        if (m_identitySkip && !endpoint.sink->needsContinuousCadence() && tstats.hasLastIdentity &&
             tstats.lastIdentity.samePayloadAs(frame.identity)) {
             tstats.repeatedPayloadFrames++;
             m_stats.skippedDuplicateFrames++;
@@ -163,8 +188,11 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
         }
     }
 
+    collectReadbackStats(m_stats);
+
     const GpuReadbackTelemetrySnapshot gpu = GpuReadbackTelemetry::instance().snapshot();
     m_stats.gpuReadbacks = gpu.gpuReadbacks;
+    m_stats.uniqueGpuReadbackSurfaces = gpu.uniqueSurfaces;
     m_stats.redundantGpuReadbacks = gpu.redundantReadbacks;
 
     m_stats.ticks++;
@@ -203,6 +231,11 @@ OutputDispatchStats OutputDispatcher::stats() const {
         target.sinkState = sinkStatus.state;
         target.sinkMessage = sinkStatus.message;
     }
+    collectReadbackStats(snapshot);
+    const GpuReadbackTelemetrySnapshot gpu = GpuReadbackTelemetry::instance().snapshot();
+    snapshot.gpuReadbacks = gpu.gpuReadbacks;
+    snapshot.uniqueGpuReadbackSurfaces = gpu.uniqueSurfaces;
+    snapshot.redundantGpuReadbacks = gpu.redundantReadbacks;
     return snapshot;
 }
 
@@ -278,4 +311,21 @@ void OutputDispatcher::countTargetAttempt(const OutputTargetAssignment& assignme
     }
     stats.lastIdentity = frame.identity;
     stats.hasLastIdentity = true;
+}
+
+void OutputDispatcher::collectReadbackStats(OutputDispatchStats& stats) const {
+    stats.readbackQueueDepth = 0;
+    stats.readbackDrops = 0;
+    for (const OutputEndpoint& endpoint : m_endpoints) {
+        if (!endpoint.assignment.enabled || !endpoint.sink ||
+            endpoint.sink->kind() != endpoint.assignment.kind) {
+            continue;
+        }
+
+        qint64 depth = 0;
+        qint64 drops = 0;
+        if (!endpoint.sink->readbackStats(depth, drops)) continue;
+        stats.readbackQueueDepth = qMax(stats.readbackQueueDepth, depth);
+        stats.readbackDrops += drops;
+    }
 }
