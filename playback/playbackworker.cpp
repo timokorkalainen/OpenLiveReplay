@@ -71,7 +71,7 @@ std::optional<FrameHandle> cachedCpuSnapshotForDeviceLoss(const FrameHandle& fra
 
     FrameMetadata meta = frame.metadata();
     meta.gpuGeneration = 0;
-    return makeCpuFrameHandle(std::move(planes), std::move(meta));
+    return makeCpuFrameHandle(std::move(planes), meta);
 }
 
 void decodeSurfaceGeometryForGpuBudget(const QList<DecoderTrack*>& decoderBank, int fallbackWidth,

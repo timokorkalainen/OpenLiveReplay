@@ -283,22 +283,31 @@ NativeVideoEncoder::PacketCallback
 StreamWorker::makeMuxerWriteCallback(int track, AVStream* st, bool* havePacket,
                                      std::function<void()> beforePacketWrite,
                                      std::function<void(bool)> afterPacketWritten) {
-    return [this, track, st, havePacket, beforePacketWrite = std::move(beforePacketWrite),
-            afterPacketWritten = std::move(afterPacketWritten)](
-               const QByteArray& data, int64_t ptsTicks, bool keyframe) mutable {
+    // Own the caller hooks behind one ref-counted handle. The returned callback
+    // then captures a single shared_ptr rather than move-capturing two type-erased
+    // std::functions: the static analyzer models shared_ptr lifetime precisely, so
+    // this avoids a false "leaked std::function storage" report on the capture.
+    struct MuxerWriteHooks {
+        std::function<void()> before;
+        std::function<void(bool)> after;
+    };
+    auto hooks = std::make_shared<MuxerWriteHooks>(
+        MuxerWriteHooks{std::move(beforePacketWrite), std::move(afterPacketWritten)});
+    return [this, track, st, havePacket, hooks](const QByteArray& data, int64_t ptsTicks,
+                                                bool keyframe) mutable {
         AVPacket* pkt = av_packet_alloc();
         if (!pkt) {
-            if (afterPacketWritten) afterPacketWritten(false);
+            if (hooks->after) hooks->after(false);
             return;
         }
         if (data.size() > std::numeric_limits<int>::max()) {
             av_packet_free(&pkt);
-            if (afterPacketWritten) afterPacketWritten(false);
+            if (hooks->after) hooks->after(false);
             return;
         }
         if (av_new_packet(pkt, static_cast<int>(data.size())) < 0) {
             av_packet_free(&pkt);
-            if (afterPacketWritten) afterPacketWritten(false);
+            if (hooks->after) hooks->after(false);
             return;
         }
         memcpy(pkt->data, data.constData(), data.size());
@@ -307,8 +316,8 @@ StreamWorker::makeMuxerWriteCallback(int track, AVStream* st, bool* havePacket,
             pkt->pts = pkt->dts = av_rescale_q(ptsTicks, AVRational{1, m_targetFps}, st->time_base);
             pkt->duration = av_rescale_q(1, AVRational{1, m_targetFps}, st->time_base);
             if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
-            if (beforePacketWrite) beforePacketWrite();
-            const bool accepted = m_muxer->writePacket(pkt, std::move(afterPacketWritten));
+            if (hooks->before) hooks->before();
+            const bool accepted = m_muxer->writePacket(pkt, std::move(hooks->after));
             if (accepted && havePacket) *havePacket = true;
         }
         av_packet_free(&pkt);

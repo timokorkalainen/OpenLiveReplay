@@ -208,9 +208,12 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
         }
     }
     ColorMetadata compositeColor = defaultColorMetadataForHeight(m_height);
-    if (state.selectedFeedIndex >= 0 && state.selectedFeedIndex < sources.size() &&
-        sources.at(state.selectedFeedIndex).has_value()) {
-        compositeColor = sources.at(state.selectedFeedIndex)->metadata().color;
+    const std::optional<FrameHandle>* selectedSource =
+        (state.selectedFeedIndex >= 0 && state.selectedFeedIndex < sources.size())
+            ? &sources.at(state.selectedFeedIndex)
+            : nullptr;
+    if (selectedSource && selectedSource->has_value()) {
+        compositeColor = (*selectedSource)->metadata().color;
     } else {
         for (const std::optional<FrameHandle>& src : sources) {
             if (src.has_value()) {
