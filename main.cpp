@@ -14,6 +14,9 @@ Q_IMPORT_PLUGIN(OlrStylePlugin)
 #include "websocket/controlstate.h"
 #include "websocket/controlwebsocketserver.h"
 #include "websocket/uimanagercontroladapter.h"
+#if defined(Q_OS_IOS)
+#include "ios/ios_scene.h"
+#endif
 #include <QHostAddress>
 #include <QDebug>
 
@@ -23,6 +26,9 @@ using namespace Qt::StringLiterals;
 int main(int argc, char *argv[])
 {
     QGuiApplication app(argc, argv);
+#if defined(Q_OS_IOS)
+    installIosGpuLifecycleIfEnabled();
+#endif
 
     // Bespoke broadcast-console look: select the OlrStyle custom QQC2 style and fall
     // back to Basic for any control it doesn't provide. Must be set before the engine

@@ -32,8 +32,14 @@
 #include <QSet>
 #include <QVariantMap>
 #include <cstdio>
+#include <limits>
 
 namespace {
+
+int boundedIntCount(qsizetype value) {
+    return static_cast<int>(
+        qMin<qsizetype>(qMax<qsizetype>(value, 0), std::numeric_limits<int>::max()));
+}
 
 QString telemetryValueToString(const QVariant& value) {
     const QJsonValue json = QJsonValue::fromVariant(value);
@@ -923,7 +929,7 @@ void UIManager::ensureSourceEnabledSize() {
 
 void UIManager::rebuildSlotMap() {
     const int viewCount = activeViewCount();
-    const int sourceCount = static_cast<int>(m_currentSettings.sources.size());
+    const int sourceCount = boundedIntCount(m_currentSettings.sources.size());
     ensureSourceEnabledSize();
 
     // Preserve existing assignments: a source already in a slot stays there
@@ -1793,7 +1799,7 @@ void UIManager::startRecording() {
         return;
     }
     // Soft warning: configured feeds exceed the benchmarked safe count for the codec.
-    const int configuredFeeds = static_cast<int>(m_replayManager->getSourceUrls().size());
+    const int configuredFeeds = boundedIntCount(m_replayManager->getSourceUrls().size());
     if (feedCountExceedsSafe(configuredFeeds, m_benchmarkSafeFeedsForChosen)) {
         emit recordingWarning(
             QStringLiteral("Recording %1 feeds; this device benchmarked %2 as the safe limit "
@@ -1839,7 +1845,7 @@ void UIManager::startRecording() {
     m_sourceConnected = QList<bool>(m_replayManager->getSourceUrls().size(), false);
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
-    resetSourceStats(static_cast<int>(m_replayManager->getSourceUrls().size()));
+    resetSourceStats(boundedIntCount(m_replayManager->getSourceUrls().size()));
 
     // 1. Initialize the Playback Worker with our providers
     if (m_playbackWorker) {
@@ -2455,7 +2461,7 @@ void UIManager::applyImportPreview() {
     m_sourceEnabledVersion++;
     m_sourceConnected = QList<bool>(m_currentSettings.sources.size(), false);
     m_sourceConnectionVersion++;
-    resetSourceStats(static_cast<int>(m_currentSettings.sources.size()));
+    resetSourceStats(boundedIntCount(m_currentSettings.sources.size()));
     m_sourceTrimVersion++;
     m_liveTelemetry.clear();
     m_recordingTelemetry.clear();
@@ -2791,7 +2797,7 @@ bool UIManager::screensReady() const {
 }
 
 int UIManager::screenCount() const {
-    return static_cast<int>(m_screens.size());
+    return boundedIntCount(m_screens.size());
 }
 
 void UIManager::refreshScreens() {
@@ -2850,8 +2856,8 @@ void UIManager::refreshProviders() {
     m_pgmPreviewProvider = nullptr;
 
     // Create a provider for every stream URL
-    const int count = static_cast<int>(activeStreamUrls().size());
-    for (int i = 0; i < count; ++i) {
+    const qsizetype count = activeStreamUrls().size();
+    for (qsizetype i = 0; i < count; ++i) {
         m_providers.append(new FrameProvider(this));
     }
     m_multiviewPreviewProvider = new FrameProvider(this);
