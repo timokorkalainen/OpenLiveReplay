@@ -1,6 +1,6 @@
 # iOS frame-residency design: unified decoded-frame ledger + playhead-centered windows
 
-**Status:** approved design, pre-implementation
+**Status:** v2 — revised after adversarial review; pre-implementation
 **Depends on:** the GPU-resident pipeline phases 4–5 branch (`gpu/resident-pipeline-phases-4-5`)
 **Platforms:** enforcement changes are iOS-scoped; accounting unification applies everywhere
 
@@ -9,178 +9,265 @@
 With the GPU pipeline active on iOS (4× 1080p SRT feeds, record + play), the app's
 physical footprint grows to ~3.3 GB within seconds of playback and iOS jetsam-kills it
 (SIGKILL). Evidence from the on-device JetsamEvent report: OpenLiveReplay is
-`largestProcess`, frontmost, `rpages = 202615` (16 KB pages ≈ 3.32 GB), lifetime max the
-same — a monotonic climb, not a spike. The CPU-only path idles at a few MB and plays
-within the existing 256-frame aggregate cap (~800 MB at 1080p) without incident.
+`largestProcess`, frontmost, `rpages = 202615` (16 KB pages ≈ 3.32 GB) — a monotonic
+climb, not a spike. The CPU-only path plays the same workload within the existing
+256-frame aggregate cap without incident.
 
-The iOS GPU budget (`kIosAggregateGpuFrameCeiling = 48` frames ≈ 500 MB with staging and
-readback terms) was exceeded ~6–7×. Root cause is structural, in four parts:
+### What is known vs. hypothesized
 
-1. **Charge lifetime ≠ allocation lifetime.** The RAII `GpuBudgetCharge` lives inside
-   `GpuFrameData`. The GPU surface itself is a `std::shared_ptr<GpuSurface>` co-owned by
-   other components — the async readback ring's pending list, the frame retire queue,
-   and the VideoToolbox keep-alive. When the `GpuFrameData` wrapper is evicted, the
-   budget is credited and a new mint is allowed, while the real IOSurface stays resident
-   under another owner. The ledger drains; the memory does not.
-2. **Uncharged CPU copies.** `GpuFrameData::m_cpuCache` retains a full CPU plane copy of
-   every surface that has been read back (one per requested format). On iOS unified
-   memory this is a second ~3.1 MB per displayed 1080p frame, invisible to the budget.
-3. **Constant-based budget.** The 48-frame ceiling is a compile-time guess. iOS exposes
-   the actual remaining allowance (`os_proc_available_memory()`), which varies by device
-   and moment.
-4. **No memory-pressure response.** Nothing subscribes to UIKit memory warnings; the
-   first signal the app receives is the kill itself.
+The *charged* GPU budget cannot be the whole story: `GpuBudget::tryCharge` hard-rejects
+above the configured budget, whose iOS value computes to ~530 MB, and the major frame
+holders (track buffers, staging/output caches, readback ring, retire queue) all hold
+`FrameHandle → GpuFrameData`, which owns the charge — while they retain a frame, the
+ledger does **not** drain. So ~2.8 GB of the observed footprint lives outside the
+ledger. Candidate balloons, in rough order of suspicion:
 
-A key sizing fact drives the design: **on iOS unified memory, a decoded CPU frame and a
-GPU IOSurface frame cost the same physical bytes** (1080p NV12 ≈ 3.1 MB either way, both
-counted against the jetsam limit). Demoting GPU→CPU saves nothing; only *fewer resident
-frames* and *eviction that truly frees* reduce footprint.
+1. **Uncharged producer-side GPU wraps.** The recorder's encode path
+   (`StreamWorker::importGpuVideoFrameForEncode`) and the ingest decode path
+   (`makeGpuDecodedFrameHandle`) mint GPU frame handles via the 3-arg
+   `makeGpuFrameHandle` with an empty `GpuBudgetCharge` — never accounted, never gated.
+2. **CPU readback copies.** `GpuFrameData::m_cpuCache` (one full plane set per
+   read-back format per frame) and `SharedGpuReadbackCache` are invisible to the
+   budget.
+3. **VideoToolbox pool growth.** Eight VT sessions run concurrently (4 playback + 4
+   ingest decoders). Each session's `CVPixelBufferPool` retains buffers warm at its
+   high-watermark; releasing our reference returns the buffer to the pool, not the
+   pages to the OS.
+4. **Charge-free transient retainers.** `gpuReadbackRetains()` parks raw
+   `shared_ptr<GpuSurface>` (no charge) until fence retirement — normally
+   milliseconds, but unbounded if fences stall on iOS.
+5. FFmpeg/SRT ingest buffering and encoder queues.
+
+**The design is therefore evidence-gated:** Phase 0 (below) instruments all of the
+above and produces per-class numbers on device *before* the enforcement and window
+work proceeds. If the dominant class is not what a task assumes, the plan stops and
+re-scopes at the recorded decision point.
+
+A sizing fact that still stands: on iOS unified memory, a decoded CPU frame and a GPU
+IOSurface frame cost roughly the same physical bytes (1080p NV12 ≈ 3.1 MB either way,
+both against the jetsam limit). Only *fewer resident frames* and *pages actually
+returned to the OS* reduce footprint — the latter requires managing VT pools, not just
+dropping references.
 
 ## Requirements (agreed)
 
 - **All four feeds scrub/frame-step in lockstep** (EVS-style multiview scrubbing), with
-  "some frames back and forth from the playhead" instantly steppable.
-- CPU-path functionality is fully preserved: scrub anywhere on the recorded timeline;
-  outside the resident window frames re-decode on demand (existing FrameIndex exact
-  seek).
-- Device target: **M-series iPad Pro**; budget adapts at runtime rather than assuming a
-  fixed allowance.
-- Design point: **4× 1080p feeds**; all math derived from actual decoded frame geometry
-  (which `GpuBudgetConfig` already receives), so other formats degrade proportionally.
-- Jetsam must become structurally unreachable: accounting equals reality by
-  construction, and pressure signals shed memory before the OS sheds the process.
+  a window of frames back and forth from the playhead instantly steppable.
+- CPU-path functionality fully preserved: scrub anywhere; outside the resident window
+  frames re-decode on demand (existing FrameIndex exact seek).
+- Device target: **M-series iPad Pro**; budget adapts at runtime.
+- Design point: **4× 1080p feeds**; all math derived from actual decoded frame geometry.
+- Jetsam must become structurally unreachable: accounting equals reality (with the
+  bounded, named exceptions below), and pressure is detected by an active watchdog —
+  not only by UIKit warnings, which are known to arrive late or never for fast ramps.
+
+## Phase 0 (gating): instrumented evidence run
+
+Extend the ledger with **report-only mode** (`OLR_LEDGER_REPORT_ONLY=1`, delivered via
+the same startup-env seam as the GPU-pipeline flag): all accounting and telemetry
+active, no gating, no window changes, no ladder — a clean attribution run.
+
+Instrumentation added for this run (and kept permanently as telemetry):
+
+- **Per-allocation-class charges** (owner tags): `DecodeWindow`, `Staging`,
+  `ReadbackRing`, `CpuReadbackCache`, `RetireQueue`, `RecorderWrap`, `IngestWrap`,
+  `Other`. Producer-side wraps get charged (charge-only, never gated) so they become
+  visible.
+- **Per-holder occupancy** (tags alone attribute allocation class, not retention):
+  readback-ring pending count/bytes, retire-queue size, readback-retainer count
+  (`gpuPendingReadbackRetainCount`), sink `m_lastDelivered`, per-cache entry bytes.
+- **Per-VT-session pool watermarks**: outstanding output buffers per decoder session,
+  sampled periodically.
+- Periodic on-device log line + the existing `recordGpuBudget` stats hook extended with
+  tags; `os_proc_available_memory()` sampled alongside so ledger totals can be
+  correlated with real headroom.
+
+**Decision point (recorded in the plan):** the run names the dominant class(es). Work
+that targets a class the evidence exonerates is dropped or re-scoped. The window and
+ladder tasks proceed regardless (they are requirement-driven), but their sizing uses
+the measured numbers.
 
 ## Design
 
 ### 1. Unified residency ledger
 
-`GpuBudget` evolves into a single ledger for **all decoded video memory** — GPU surfaces
+`GpuBudget` evolves into a single ledger for all decoded video memory — GPU surfaces
 and CPU planes. Final name `FrameResidencyLedger` (`GpuBudgetCharge` →
-`ResidencyCharge`); the rename is a mechanical final commit, the API keeps its
-`tryCharge`/`charge`/`credit`/`liveBytes` shape and leaf-mutex design.
+`ResidencyCharge`); mechanical rename as the final commit. API keeps its
+`tryCharge`/`charge`/`credit`/`liveBytes` shape and **strict leaf-mutex** discipline
+(credits may fire while worker locks are held — e.g. evicted-frame vectors destroyed
+inside `m_bufferMutex` scope — so the ledger must never take a non-leaf lock).
 
-Additions:
+### 2. Charge tied to the surface's lifetime
 
-- **Owner tags.** Every charge carries a tag: `DecodeWindow`, `Staging`, `ReadbackRing`,
-  `CpuReadbackCache`, `RetireQueue`, `Other`. `liveBytes()` remains the total;
-  `liveBytes(tag)` and per-tag peaks feed telemetry (extending the existing
-  `recordGpuBudget` output-stats hook) and a periodic on-device log line.
-- **Report-only mode** (`OLR_LEDGER_REPORT_ONLY=1`): accounting and telemetry active,
-  mint gating disabled. The first on-device run uses this to capture per-owner numbers
-  and name the dominant retainer — completing the root-cause evidence as part of the
-  work.
+The charge is attached to the **`GpuSurface` object itself** and credited in its
+destructor — equivalent to last-reference semantics without the fixed-at-construction
+problem of a `shared_ptr` deleter (surfaces are wrapped before the budget decision).
 
-### 2. Charge follows the allocation (the structural fix)
+- **Gate stays at mint** (`mintGpuOrDegrade`): `tryCharge` failure follows the existing
+  OOM-degrade contract — the transiently *uncharged* surface remains legal just long
+  enough for the CPU-fallback readback to produce real pixels (the current degrade
+  behavior), then dies. This is the one bounded, documented exception to
+  "accounting == reality".
+- **Producer paths are charge-only, never gated:** recorder encode wraps
+  (`RecorderWrap`) and ingest decode wraps (`IngestWrap`) attach charges for
+  visibility, but a saturated playback ledger must never fail an ingest/encode wrap —
+  a failed wrap would trip `latchGpuEncodeCpuFallback()`, which latches CPU encode for
+  the whole session. Playback pressure may not degrade recording.
+- CPU frames: the CPU frame-data object charges plane bytes on construction, credits on
+  destruction. `m_cpuCache` entries are charged under `CpuReadbackCache`; that tag gets
+  an explicit allowance and an eviction rule — entries for frames no longer inside any
+  residency window are dropped on the trim tick (readbacks cannot "degrade"; they are
+  bounded by eviction instead).
 
-The GPU surface allocator mints every surface as a `shared_ptr<GpuSurface>` whose
-**custom deleter owns the ledger charge**. The credit fires exactly when the last
-co-owner — track buffer, staging cache, readback ring, retire queue, VT keep-alive —
-drops its reference. Retained surfaces are charged surfaces: over-retention becomes
-visible back-pressure on the mint gate (the existing OOM-degrade-to-CPU path) instead of
-invisible growth.
+### 3. Budget derived from the OS, with honest arithmetic
 
-CPU frames get the same treatment: the CPU frame-data object charges plane bytes on
-construction and credits on destruction (`QByteArray` implicit sharing makes copies
-share storage; the per-object charge over-counts shared copies slightly, which errs in
-the safe direction). `GpuFrameData::m_cpuCache` entries are charged under
-`CpuReadbackCache` — the double-count becomes visible and budgeted rather than removed,
-because sinks legitimately share one readback per surface.
-
-**Deleter discipline:** the last reference can drop on any thread (readback thread, VT
-callback, dispatch tick). The deleter does nothing but credit the ledger (leaf lock) and
-free the surface — no worker locks, no Qt calls.
-
-### 3. Budget derived from the OS
-
-On iOS, at playback-session start:
+On iOS, at playback-session start and on every ladder event:
 
 ```
-budget = clamp(os_proc_available_memory() × 0.5, 512 MB, 4 GB)
+budget = min( 0.5 × (os_proc_available_memory() + ledger.liveBytes()),  available_now )
+budget = clamp(budget, min(512 MB, available_now), 4 GB)
 ```
 
-Re-sampled on every memory warning and on Level-1 pressure (below).
+Adding back `ledger.liveBytes()` prevents the double-count that would otherwise shrink
+the budget merely because the ledger is healthily full; the outer `min` and the
+`min(512 MB, available)` floor prevent overcommit when memory is genuinely scarce. A
+0-or-garbage sample (backgrounded, early startup) leaves the previous budget unchanged.
 `kIosAggregateGpuFrameCeiling` is deleted. On macOS/Windows the existing peak-formula
-configuration remains the enforcement input; the unified accounting and tags apply on
-all platforms, so desktop behavior is unchanged.
+configuration remains the enforcement input; unified accounting and tags apply
+everywhere.
 
-### 4. Playhead-centered residency windows, lockstep by construction
+On the target iPad (per-process limit ≈ 3.3 GB observed), session-start availability is
+~3.0 GB → budget ≈ 1.5 GB.
 
-Per-feed window depth is derived, not tuned:
+### 4. Playhead-centered residency windows — owning the scheduler changes
+
+Per-feed window **half-width** (frames each direction from the playhead):
 
 ```
-windowDepth = clamp((budget − nonWindowReserves) / (feedCount × frameBytes × 2), minDepth, maxDepth)
+halfWidth = clamp((budget − nonWindowReserves) / (feedCount × frameBytes × 2), 8, 120)
 ```
 
-where `nonWindowReserves` reuses `GpuBudgetConfig`'s existing per-term byte estimators
-(staging windows, output bus surfaces, readback rings) plus a `CpuReadbackCache`
-allowance. Every feed gets the same depth, so 4-feed lockstep scrubbing is structural.
-At 1080p with a ~2 GB budget this yields roughly ±60–80 instantly-steppable frames per
-feed. Clamps: `minDepth = 8` (keeps a usable window on constrained samples) and
-`maxDepth = 120` (beyond ~±120 frames further hoarding buys nothing).
+`×2` = both directions (the CPU-readback double-cost of displayed frames is covered by
+the `CpuReadbackCache` allowance inside `nonWindowReserves`, which is sized as
+`2 × feedCount × frameBytes` — the steady-state display set, not the whole window).
+`nonWindowReserves` otherwise reuses `GpuBudgetConfig`'s per-term estimators (staging,
+output bus, readback rings). With the measured ~1.5 GB budget and 1080p × 4 feeds this
+yields roughly **±35–40 frames per feed** — stated honestly; deeper windows require
+either fewer feeds or more headroom. Every feed gets the same half-width, so lockstep
+scrubbing is structural.
 
-The mechanisms already exist and are reused, not replaced:
+This is a **scheduler-behavior change**, not just a cap change. Delivering the trail
+requires parameterizing the time-based mechanisms that currently destroy it:
 
-- `TrackBuffer::insert(capFrames, keepNearMs, protectToMs)` — farthest-from-playhead
-  eviction with live-edge protection — receives the derived depth as its cap.
-- `allowNativeGpuDecodeForCurrentPacket` / `gpuPerTrackWindowCap` gate GPU minting to
-  the window.
-- Outside the window frames are **dropped** (truly freed via §2), and scrubbing beyond
-  it re-decodes on demand through the existing exact-seek path. No disk tier, no new
-  prefetcher; the existing seek-prefetch machinery is untouched.
+- The per-iteration trim (`kTrailMs`/`kSlackMs` spans) and `OutputFrameCache::trimBefore`
+  horizons derive from the window half-width (in ms at the session frame rate) instead
+  of fixed 500/700 ms constants.
+- The backward-step fast path (`reuseAt` output-cache coverage) must be able to serve
+  the retained trail; the output cache trim horizon follows the same derived span.
+- `TrackBuffer::insert` caps and the protect-range asymmetry (`protectLo/protectHi`)
+  take the derived values; behind-playhead frames inside the window are no longer
+  first-eviction candidates.
+- **Post-seek semantics (explicit):** after a reposition, the trail is *cold* — it
+  warms as material plays through. No backward prefetch in this design; stepping
+  backward past decoded material re-decodes via exact seek (existing behavior, same as
+  the CPU path today).
 
-### 5. iOS memory-pressure ladder
+Outside the window frames are dropped; whether dropping returns pages to the OS
+depends on the VT pool (next section).
 
-Events arrive through the existing `IosGpuLifecycleSink` seam, extended with
-`onMemoryWarning()` — the same main-thread→worker marshaling as suspend/resume.
+### 5. VideoToolbox pool management
 
-- **Level 0** — normal; budget as derived.
-- **Level 1** — on a UIKit memory warning, or an available-memory sample below ~20% of
-  the session-start sample: re-derive the budget from a fresh sample, shrink windows,
-  and immediately trim distal frames with the existing eviction machinery. Bytes
-  measurably fall; a telemetry counter records the event.
-- **Level 2** — a second warning shortly after Level 1, or availability below ~10% of
-  the session-start sample after trimming: latch CPU-only mode for the session via the **parameterized** sanitize
-  path — the same machinery as device loss with a distinct `MemoryPressure` reason that
-  does **not** consume the device-loss rebuild budget. Unlatch on session restart. CPU
-  mode under the existing 256-frame aggregate cap is known-survivable.
+Dropping our last reference returns buffers to the session's pool, which keeps pages
+warm at its high-watermark. Therefore:
 
-### 6. Adjacent cleanup (in scope)
+- Phase 0 records per-session pool watermarks; the window-depth formula is validated
+  on device against VT actually sustaining `halfWidth × 2` outstanding buffers per
+  session (unverified today; the current cap is 8/track).
+- **Ladder Levels 1–2 flush decoder pools**: the decoder `reset()` path (session
+  invalidation) exists and is exercised after backward seeks; Level 1 uses the
+  cheapest available mechanism (pool flush if the session supports it, else reset) so
+  that trims translate into pages actually returned.
+- The on-device sign-off measures `os_proc_available_memory()` recovery after Level-1
+  trim + flush — not just ledger deltas — because ledger bytes falling without
+  footprint falling is exactly the failure mode of a pool-blind design.
 
-The ad-hoc `-DOLR_GPU_PIPELINE_FORCE_ON` compile hack in `main.cpp` becomes a proper
-CMake option (`OLR_GPU_PIPELINE_FORCE_ON`, default OFF) defining the same symbol — it is
-how iOS GPU builds are produced and belongs in the build system, not in a flag string.
+### 6. iOS memory-pressure ladder
+
+**Sampling (the primary trigger):** the worker loop polls `os_proc_available_memory()`
+once per decode iteration (cheap syscall), debounced to ~250 ms. UIKit memory warnings
+(via the `IosGpuLifecycleSink` seam extended with `onMemoryWarning()`, marshaled like
+suspend/resume) are a *supplementary* trigger — warnings are known to be late or absent
+for fast ramps, and the observed balloon reaches the limit in seconds.
+
+Thresholds are **absolute headroom**, not %-of-session-start (which the ledger's own
+healthy holdings would depress):
+
+- **Level 0** — normal. Re-arm: after ≥30 s with headroom above 2× the Level-1
+  threshold, the budget may re-derive upward (once per minute at most).
+- **Level 1** — headroom < `max(256 MB, 4 × feedCount × frameBytes)` or a UIKit
+  warning: re-derive budget (per §3), shrink windows, trim distal frames, flush VT
+  pools, drop out-of-window `CpuReadbackCache` entries. Telemetry counter + log.
+- **Level 2** — headroom below half the Level-1 threshold after a Level-1 trim, or a
+  second warning within 10 s: latch CPU-only mode for the session.
+
+**Level-2 state machine (explicit):** latch = `GpuPipelineState::CpuFallback` plus a
+dedicated `m_memoryPressureLatched` flag — **not** `GpuDeviceLossMonitor::recordLoss()`
+(a monitor "lost" state would make surviving GPU frames unreadable in `readToCpu` and
+block their CPU snapshots). The latch path runs `handleGpuDeviceLoss(reason)`
+parameterized with `MemoryPressure`: one generation bump for sink staleness, sanitize
+of caches/buffers, **no** `consumeGpuDeviceLossRebuildBudget()`, **no**
+`rebuildGpuSpine()`. Warnings arriving while suspended are ignored (the suspend path
+already defers GPU work). Unlatch: only on playback-session stop/start. Expected
+visual artifact at latch: frames without a CPU snapshot are dropped — a brief gap on
+never-displayed material — documented, not hidden. Post-latch decode caps: the CPU
+branch of `capFrames()` must apply (256 aggregate), not the GPU per-track cap — the
+latch flag, not `gpuPipelineEnabled()`, selects the branch.
+
+### 7. Adjacent cleanup (in scope)
+
+The GPU-force-on mechanism used to produce iOS GPU builds currently exists only as an
+uncommitted local edit to `main.cpp` (in the phases 4–5 worktree). It lands here
+properly: CMake option `OLR_GPU_PIPELINE_FORCE_ON` (default OFF) → compile definition →
+the guarded `qputenv("OLR_GPU_PIPELINE", "1")` at startup, committed with this work.
 
 ## Testing
 
-The failing test comes first and reproduces the bug class without a device: mint frames
-through a simulated pipeline in which a co-owner (fake readback ring) retains surfaces
-past track-buffer eviction; assert (a) ledger total never exceeds the configured budget
-and (b) live allocation count equals ledger count. Current code fails (b).
+**Failing tests first — targeting the real mechanisms:**
 
-Then:
+1. **Charge-free retainer test:** a fake co-owner holds raw `shared_ptr<GpuSurface>`
+   (modeled on the fence-parked readback retainer) past track-buffer eviction; assert
+   live allocation count equals ledger count. Fails today (the retained surface is
+   uncharged once its `GpuFrameData` dies).
+2. **Uncharged producer test:** mint frames through the recorder/ingest wrap paths;
+   assert the ledger sees them. Fails today (empty `GpuBudgetCharge`).
+3. **Trail retention test:** with a derived window of ±N, play forward then step
+   backward N−1 frames; assert zero re-decodes (fails today at ~16 frames when the
+   500 ms trim bites).
 
-- **Ledger units:** charge-follows-last-reference across N co-owners and threads;
-  per-tag accounting; CPU-plane charges; report-only mode gates nothing but counts
-  everything.
-- **Window math units:** depth derivation across feed counts / frame sizes / budgets;
-  clamps; lockstep equality across feeds.
-- **Pressure units:** injectable available-memory function and warning events. Level 1
-  provably frees bytes; Level 2 latches with reason `MemoryPressure` and leaves the
-  device-loss rebuild budget untouched.
-- **Existing gates stay green:** `tst_gpubudget`, `tst_gpu_budget_stress`, the
-  multi-feed budget pressure gate, the device-loss suite, and the `gpu-budget` /
-  `seek-prefetch` e2e labels. New tests join the TSan CI lists.
-- **On-device manual sign-off** (added to the iOS manual checklist as a required gate
-  with a concrete script): 4× SRT feeds, ≥10 minutes of playback plus scrubbing; the
-  app's own telemetry shows the ledger plateauing ≤ budget and available memory stable;
-  4-feed lockstep frame-step check. First run in report-only mode to record per-owner
-  peaks.
+Then: ledger units (charge-follows-surface-lifetime across threads and co-owners;
+per-tag accounting; CPU-plane and `CpuReadbackCache` charges + eviction rule);
+window-math units (half-width derivation, clamps, lockstep equality, trim-span
+derivation); ladder units with injectable memory/warning sources (watchdog fires
+without any UIKit warning; Level 1 provably lowers headroom-relevant usage; budget
+re-derivation with the `liveBytes` add-back; floor never exceeds availability; Level 2
+latches with `MemoryPressure` reason, leaves the device-loss rebuild budget untouched,
+and selects the CPU cap branch; re-arm path). Existing gates stay green
+(`tst_gpubudget`, `tst_gpu_budget_stress`, multi-feed pressure gate, device-loss suite,
+`gpu-budget`/`seek-prefetch` e2e). New tests join the TSan CI lists.
+
+**On-device gates (added to the iOS manual checklist as required sign-off):**
+
+- Phase 0 attribution run (report-only): per-class/per-holder/per-pool numbers
+  recorded; dominant class named; decision point exercised.
+- Enforcement run: 4× SRT feeds, ≥10 min play + scrub; ledger plateau ≤ budget AND
+  `os_proc_available_memory()` stable (both, per §5); 4-feed lockstep step-check across
+  the full ±window; Level-1 drill (induce pressure, verify trim + pool flush recovers
+  real headroom); VT sustains window-depth outstanding buffers.
 
 ## Out of scope
 
-- Disk/cold tier and predictive prefetch (existing seek-prefetch suffices).
-- Output sink changes (NDI/DeckLink/AJA/OMT) beyond their retention becoming charged.
-- Audio memory (small and already bounded).
-- The iOS native-SRT DNS resolution failure (`Native SRT host lookup failed`) — a
-  separate ingest bug, tracked separately.
-- Desktop behavior changes beyond unified accounting and telemetry tags.
+- Disk/cold tier, predictive/backward prefetch (existing seek-prefetch untouched).
+- Output sink changes (NDI/DeckLink/AJA/OMT) beyond retention visibility.
+- Audio memory. Desktop behavior beyond unified accounting/tags.
+- The iOS native-SRT DNS resolution failure — separate bug, tracked separately.
