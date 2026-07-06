@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
 
 #include <QList>
@@ -9,6 +10,7 @@
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
 
+#include <atomic>
 #include <d3d10_1.h>
 #include <d3d11.h>
 #include <array>
@@ -145,6 +147,7 @@ public:
 
     D3DRenderThread thread;
     bool valid = false;
+    std::atomic<bool> deviceLost{false};
 };
 
 GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
@@ -183,6 +186,17 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
     return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::move(impl)));
 }
 
+#ifdef OLR_UNIT_TEST
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createInvalidForTest() {
+    return std::shared_ptr<GpuRhiContext>(
+        new GpuRhiContext(std::make_unique<Impl>(D3DDeviceKind::Warp)));
+}
+
+int GpuRhiContext::rhiReadbackCountForTest() const {
+    return 0;
+}
+#endif
+
 bool GpuRhiContext::isValid() const {
     return m_impl && m_impl->valid;
 }
@@ -196,7 +210,38 @@ bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) 
     return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
+bool GpuRhiContext::deviceLost() const {
+    return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
+}
+
+void GpuRhiContext::injectDeviceLostForTest() {
+    if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
+}
+
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, FramePixelFormat) {
+    if (!m_impl || !m_impl->valid) {
+        return CpuPlanes{};
+    }
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) {
+        GpuDeviceLossMonitor::instance().recordLoss();
+        return CpuPlanes{};
+    }
+
+    {
+        const bool invoked = m_impl->thread.invoke([&] {
+            QRhi* rhi = m_impl->thread.rhi;
+            if (!rhi) return;
+            const auto* nativeHandles =
+                static_cast<const QRhiD3D11NativeHandles*>(rhi->nativeHandles());
+            ID3D11Device* device = nativeHandles ? nativeHandles->dev : nullptr;
+            if (device && FAILED(device->GetDeviceRemovedReason())) {
+                // LOCK RULE: D3D11 removed-device polling touches no m_bufferMutex.
+                m_impl->deviceLost.store(true, std::memory_order_release);
+                GpuDeviceLossMonitor::instance().recordLoss();
+            }
+        });
+        (void) invoked;
+    }
     return CpuPlanes{};
 }
 

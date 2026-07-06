@@ -2,6 +2,7 @@
 
 #ifdef __APPLE__
 
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
 #include "playback/output/formatcanon.h"
 
@@ -10,14 +11,19 @@
 #include <QtGlobal>
 
 #include <CoreVideo/CoreVideo.h>
-#include <IOSurface/IOSurface.h>
+#import <Foundation/Foundation.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <Metal/Metal.h>
+#include <TargetConditionals.h>
+#include <dispatch/dispatch.h>
 #include <rhi/qrhi.h>
 #include <rhi/qrhi_platform.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -128,6 +134,297 @@ CpuPlanes lockDownloadRgba8(CVPixelBufferRef pb) {
     return out;
 }
 
+CVMetalTextureCacheRef makeTextureCache(QRhi* rhi) {
+    if (!rhi) return nullptr;
+    const auto* nativeHandles = static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles());
+    if (!nativeHandles || !nativeHandles->dev) return nullptr;
+    id<MTLDevice> device = (__bridge id<MTLDevice>)nativeHandles->dev;
+
+    CVMetalTextureCacheRef cache = nullptr;
+    const CVReturn rc =
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr, device, nullptr, &cache);
+    return rc == kCVReturnSuccess ? cache : nullptr;
+}
+
+CFDictionaryRef makeMetalTextureAttributes(MTLTextureUsage usage) {
+    uint64_t usageValue = static_cast<uint64_t>(usage);
+    CFNumberRef usageNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &usageValue);
+    if (!usageNumber) return nullptr;
+
+    const void* keys[] = {kCVMetalTextureUsage};
+    const void* values[] = {usageNumber};
+    CFDictionaryRef attrs =
+        CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
+                           &kCFTypeDictionaryValueCallBacks);
+    CFRelease(usageNumber);
+    return attrs;
+}
+
+CpuPlanes rgba8FromReadback(const QRhiReadbackResult& readback, const GpuSurfaceDesc& desc) {
+    CpuPlanes out;
+    if (desc.width <= 0 || desc.height <= 0) return out;
+    if (readback.data.size() < desc.width * desc.height * 4) return out;
+    if (readback.format != QRhiTexture::RGBA8 && readback.format != QRhiTexture::BGRA8) {
+        return out;
+    }
+
+    out.format = FramePixelFormat::Rgba8;
+    out.width = desc.width;
+    out.height = desc.height;
+    out.stride[0] = desc.width * 4;
+    out.plane[0] = QByteArray(planeBytes(out.stride[0], desc.height), '\0');
+
+    const auto* src = reinterpret_cast<const uchar*>(readback.data.constData());
+    auto* dst = reinterpret_cast<uchar*>(out.plane[0].data());
+    const qsizetype bytes = static_cast<qsizetype>(desc.width) * desc.height * 4;
+    if (readback.format == QRhiTexture::RGBA8) {
+        std::memcpy(dst, src, static_cast<size_t>(bytes));
+    } else {
+        for (qsizetype i = 0; i < bytes; i += 4) {
+            dst[i] = src[i + 2];
+            dst[i + 1] = src[i + 1];
+            dst[i + 2] = src[i];
+            dst[i + 3] = src[i + 3];
+        }
+    }
+    return out;
+}
+
+int readbackRowStride(const QRhiReadbackResult& readback, int minBytesPerRow, int rows) {
+    if (minBytesPerRow <= 0 || rows <= 0) return 0;
+    const qsizetype minimumBytes =
+        static_cast<qsizetype>(minBytesPerRow) * static_cast<qsizetype>(rows);
+    if (readback.data.size() < minimumBytes) return 0;
+    if (readback.data.size() % rows == 0) {
+        const qsizetype inferred = readback.data.size() / rows;
+        if (inferred >= minBytesPerRow && inferred <= std::numeric_limits<int>::max()) {
+            return static_cast<int>(inferred);
+        }
+    }
+    return minBytesPerRow;
+}
+
+CpuPlanes yuv420pFromNv12Readbacks(const QRhiReadbackResult& yReadback,
+                                   const QRhiReadbackResult& uvReadback,
+                                   const GpuSurfaceDesc& desc) {
+    CpuPlanes out;
+    if (desc.width <= 0 || desc.height <= 0 || desc.format != FramePixelFormat::Nv12) {
+        return out;
+    }
+    const int chromaW = (desc.width + 1) / 2;
+    const int chromaH = (desc.height + 1) / 2;
+    if (yReadback.format != QRhiTexture::R8 || uvReadback.format != QRhiTexture::RG8 ||
+        yReadback.pixelSize != QSize(desc.width, desc.height) ||
+        uvReadback.pixelSize != QSize(chromaW, chromaH)) {
+        return out;
+    }
+
+    const int yReadStride = readbackRowStride(yReadback, desc.width, desc.height);
+    const int uvReadStride = readbackRowStride(uvReadback, chromaW * 2, chromaH);
+    if (yReadStride <= 0 || uvReadStride <= 0) return out;
+
+    out.format = FramePixelFormat::Yuv420p;
+    out.width = desc.width;
+    out.height = desc.height;
+    out.stride[0] = desc.width;
+    out.stride[1] = chromaW;
+    out.stride[2] = chromaW;
+    out.plane[0] = QByteArray(planeBytes(out.stride[0], desc.height), '\0');
+    out.plane[1] = QByteArray(planeBytes(out.stride[1], chromaH), '\0');
+    out.plane[2] = QByteArray(planeBytes(out.stride[2], chromaH), '\0');
+
+    const auto* ySrc = reinterpret_cast<const uchar*>(yReadback.data.constData());
+    const auto* uvSrc = reinterpret_cast<const uchar*>(uvReadback.data.constData());
+    for (int row = 0; row < desc.height; ++row) {
+        std::memcpy(out.plane[0].data() + byteOffset(row, out.stride[0]),
+                    ySrc + byteOffset(row, yReadStride), static_cast<size_t>(desc.width));
+    }
+    for (int row = 0; row < chromaH; ++row) {
+        const uchar* src = uvSrc + byteOffset(row, uvReadStride);
+        char* u = out.plane[1].data() + byteOffset(row, out.stride[1]);
+        char* v = out.plane[2].data() + byteOffset(row, out.stride[2]);
+        for (int x = 0; x < chromaW; ++x) {
+            const int srcOffset = x * 2;
+            u[x] = static_cast<char>(src[srcOffset]);
+            v[x] = static_cast<char>(src[srcOffset + 1]);
+        }
+    }
+    return out;
+}
+
+CpuPlanes readbackRgba8WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDesc& desc) {
+    CpuPlanes out;
+    if (!rhi || !pb || desc.format != FramePixelFormat::Rgba8 || desc.width <= 0 ||
+        desc.height <= 0) {
+        return out;
+    }
+
+    CVMetalTextureCacheRef cache = makeTextureCache(rhi);
+    if (!cache) return out;
+
+    CFDictionaryRef readAttrs = makeMetalTextureAttributes(MTLTextureUsageShaderRead);
+    if (!readAttrs) {
+        CFRelease(cache);
+        return out;
+    }
+
+    CVMetalTextureRef cvTexture = nullptr;
+    const CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(
+        kCFAllocatorDefault, cache, pb, readAttrs, MTLPixelFormatBGRA8Unorm, desc.width,
+        desc.height, 0, &cvTexture);
+    CFRelease(readAttrs);
+    if (rc != kCVReturnSuccess || !cvTexture) {
+        CFRelease(cache);
+        return out;
+    }
+
+    id<MTLTexture> metalTexture = CVMetalTextureGetTexture(cvTexture);
+    if (!metalTexture) {
+        CFRelease(cvTexture);
+        CFRelease(cache);
+        return out;
+    }
+
+    std::unique_ptr<QRhiTexture> texture(rhi->newTexture(
+        QRhiTexture::BGRA8, QSize(desc.width, desc.height), 1, QRhiTexture::UsedAsTransferSource));
+    if (!texture) {
+        CFRelease(cvTexture);
+        CFRelease(cache);
+        return out;
+    }
+
+    const QRhiTexture::NativeTexture nativeTexture{
+        quint64(reinterpret_cast<uintptr_t>((__bridge void*)metalTexture)), 0};
+    if (!texture->createFrom(nativeTexture)) {
+        CFRelease(cvTexture);
+        CFRelease(cache);
+        return out;
+    }
+
+    QRhiCommandBuffer* cb = nullptr;
+    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess || !cb) {
+        CFRelease(cvTexture);
+        CFRelease(cache);
+        return out;
+    }
+
+    QRhiReadbackResult readback;
+    QRhiResourceUpdateBatch* batch = rhi->nextResourceUpdateBatch();
+    if (batch) {
+        batch->readBackTexture(QRhiReadbackDescription(texture.get()), &readback);
+        cb->resourceUpdate(batch);
+    }
+    const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
+    if (end == QRhi::FrameOpSuccess && rhi->finish() == QRhi::FrameOpSuccess) {
+        out = rgba8FromReadback(readback, desc);
+    }
+
+    CFRelease(cvTexture);
+    CFRelease(cache);
+    return out;
+}
+
+CpuPlanes readbackNv12WithRhi(QRhi* rhi, CVPixelBufferRef pb, const GpuSurfaceDesc& desc) {
+    CpuPlanes out;
+    if (!rhi || !pb || desc.format != FramePixelFormat::Nv12 || desc.width <= 0 ||
+        desc.height <= 0) {
+        return out;
+    }
+
+    CVMetalTextureCacheRef cache = makeTextureCache(rhi);
+    if (!cache) return out;
+
+    CFDictionaryRef readAttrs = makeMetalTextureAttributes(MTLTextureUsageShaderRead);
+    if (!readAttrs) {
+        CFRelease(cache);
+        return out;
+    }
+
+    CVMetalTextureRef luma = nullptr;
+    CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb,
+                                                            readAttrs, MTLPixelFormatR8Unorm,
+                                                            desc.width, desc.height, 0, &luma);
+    if (rc != kCVReturnSuccess || !luma) {
+        CFRelease(readAttrs);
+        CFRelease(cache);
+        return out;
+    }
+
+    const int chromaW = (desc.width + 1) / 2;
+    const int chromaH = (desc.height + 1) / 2;
+    CVMetalTextureRef chroma = nullptr;
+    rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb, readAttrs,
+                                                   MTLPixelFormatRG8Unorm, chromaW, chromaH, 1,
+                                                   &chroma);
+    CFRelease(readAttrs);
+    if (rc != kCVReturnSuccess || !chroma) {
+        CFRelease(luma);
+        CFRelease(cache);
+        return out;
+    }
+
+    id<MTLTexture> lumaTexture = CVMetalTextureGetTexture(luma);
+    id<MTLTexture> chromaTexture = CVMetalTextureGetTexture(chroma);
+    if (!lumaTexture || !chromaTexture) {
+        CFRelease(chroma);
+        CFRelease(luma);
+        CFRelease(cache);
+        return out;
+    }
+
+    std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(
+        QRhiTexture::R8, QSize(desc.width, desc.height), 1, QRhiTexture::UsedAsTransferSource));
+    std::unique_ptr<QRhiTexture> uvTex(rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH), 1,
+                                                       QRhiTexture::UsedAsTransferSource));
+    if (!yTex || !uvTex) {
+        CFRelease(chroma);
+        CFRelease(luma);
+        CFRelease(cache);
+        return out;
+    }
+
+    const QRhiTexture::NativeTexture yNative{
+        quint64(reinterpret_cast<uintptr_t>((__bridge void*)lumaTexture)), 0};
+    const QRhiTexture::NativeTexture uvNative{
+        quint64(reinterpret_cast<uintptr_t>((__bridge void*)chromaTexture)), 0};
+    if (!yTex->createFrom(yNative) || !uvTex->createFrom(uvNative)) {
+        CFRelease(chroma);
+        CFRelease(luma);
+        CFRelease(cache);
+        return out;
+    }
+
+    QRhiCommandBuffer* cb = nullptr;
+    if (rhi->beginOffscreenFrame(&cb) != QRhi::FrameOpSuccess || !cb) {
+        CFRelease(chroma);
+        CFRelease(luma);
+        CFRelease(cache);
+        return out;
+    }
+
+    QRhiReadbackResult yReadback;
+    QRhiReadbackResult uvReadback;
+    QRhiResourceUpdateBatch* batch = rhi->nextResourceUpdateBatch();
+    if (batch) {
+        batch->readBackTexture(QRhiReadbackDescription(yTex.get()), &yReadback);
+        batch->readBackTexture(QRhiReadbackDescription(uvTex.get()), &uvReadback);
+        cb->resourceUpdate(batch);
+    }
+
+    const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
+    if (end == QRhi::FrameOpSuccess && rhi->finish() == QRhi::FrameOpSuccess) {
+        out = yuv420pFromNv12Readbacks(yReadback, uvReadback, desc);
+    }
+
+    CFRelease(chroma);
+    CFRelease(luma);
+    CFRelease(cache);
+    return out;
+}
+
+// RENDER-THREAD INVARIANT (iOS main-thread rule): this thread runs only QRhi/Metal
+// command encoding. It must not call UIKit or touch a CAMetalLayer; use
+// GpuRhiContext::presentOnMainThread for any present/UIKit interaction.
 class GpuRenderThread final : public QThread {
 public:
     explicit GpuRenderThread(QRhi::Implementation backend) : m_backend(backend) {}
@@ -221,6 +518,10 @@ public:
     GpuRenderThread thread;
     QRhi::Implementation backend = QRhi::Null;
     bool valid = false;
+    std::atomic<bool> deviceLost{false};
+#ifdef OLR_UNIT_TEST
+    std::atomic<int> rhiReadbacks{0};
+#endif
 };
 
 GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
@@ -259,6 +560,16 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
     return nullptr;
 }
 
+#ifdef OLR_UNIT_TEST
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createInvalidForTest() {
+    return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::make_unique<Impl>(QRhi::Null)));
+}
+
+int GpuRhiContext::rhiReadbackCountForTest() const {
+    return m_impl ? m_impl->rhiReadbacks.load(std::memory_order_acquire) : 0;
+}
+#endif
+
 bool GpuRhiContext::isValid() const {
     return m_impl && m_impl->valid;
 }
@@ -272,10 +583,43 @@ bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) 
     return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
+void GpuRhiContext::presentOnMainThread(const std::function<void()>& block) {
+    if (!block) return;
+#if TARGET_OS_IOS
+    // MAIN-THREAD: iOS requires UIKit/CAMetalLayer present work on the main thread.
+    if ([NSThread isMainThread]) {
+        block();
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+          block();
+        });
+    }
+#else
+    block();
+#endif
+}
+
+bool GpuRhiContext::deviceLost() const {
+    return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
+}
+
+void GpuRhiContext::injectDeviceLostForTest() {
+    if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
+}
+
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& surface,
                                            FramePixelFormat target) {
     CpuPlanes result;
-    if (!m_impl || !m_impl->valid || !surface || !surface->isValid()) return result;
+    if (!m_impl || !m_impl->valid) {
+        return result;
+    }
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) {
+        GpuDeviceLossMonitor::instance().recordLoss();
+        return result;
+    }
+    if (!surface || !surface->isValid()) {
+        return result;
+    }
     const GpuSurfaceDesc desc = surface->desc();
 
     auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
@@ -292,15 +636,64 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
         QRhi* rhi = m_impl->thread.rhi;
         if (rhi) {
             QRhiCommandBuffer* cb = nullptr;
-            if (rhi->beginOffscreenFrame(&cb) == QRhi::FrameOpSuccess) {
-                rhi->endOffscreenFrame();
+            const QRhi::FrameOpResult begin = rhi->beginOffscreenFrame(&cb);
+            if (begin == QRhi::FrameOpSuccess) {
+                const QRhi::FrameOpResult end = rhi->endOffscreenFrame();
+                if (end == QRhi::FrameOpDeviceLost || rhi->isDeviceLost()) {
+                    // LOCK RULE: this render-thread poll touches no m_bufferMutex;
+                    // callers observe deviceLost() and degrade/rebuild outside it.
+                    m_impl->deviceLost.store(true, std::memory_order_release);
+                    GpuDeviceLossMonitor::instance().recordLoss();
+                    result = CpuPlanes{};
+                    return;
+                }
+            } else {
+                if (begin == QRhi::FrameOpDeviceLost || rhi->isDeviceLost()) {
+                    // LOCK RULE: this render-thread poll touches no m_bufferMutex.
+                    m_impl->deviceLost.store(true, std::memory_order_release);
+                    GpuDeviceLossMonitor::instance().recordLoss();
+                }
+                result = CpuPlanes{};
+                return;
+            }
+        }
+        if (desc.format == FramePixelFormat::Rgba8 && target == FramePixelFormat::Rgba8) {
+            result = readbackRgba8WithRhi(rhi, pb, desc);
+            if (result.isValid()) {
+#ifdef OLR_UNIT_TEST
+                m_impl->rhiReadbacks.fetch_add(1, std::memory_order_acq_rel);
+#endif
+                return;
+            }
+            if (rhi && rhi->isDeviceLost()) {
+                m_impl->deviceLost.store(true, std::memory_order_release);
+                GpuDeviceLossMonitor::instance().recordLoss();
+                result = CpuPlanes{};
+                return;
             }
         }
         if (desc.format == FramePixelFormat::Nv12) {
-            if (target == FramePixelFormat::Yuv420p) {
-                result = lockDownloadNv12ToYuv420p(pb);
-            } else if (target == FramePixelFormat::Nv12) {
-                result = formatcanon::yuv420pToNv12(lockDownloadNv12ToYuv420p(pb));
+            if (target == FramePixelFormat::Yuv420p || target == FramePixelFormat::Nv12) {
+                CpuPlanes yuv = readbackNv12WithRhi(rhi, pb, desc);
+                if (yuv.isValid()) {
+#ifdef OLR_UNIT_TEST
+                    m_impl->rhiReadbacks.fetch_add(1, std::memory_order_acq_rel);
+#endif
+                    result =
+                        target == FramePixelFormat::Yuv420p ? yuv : formatcanon::yuv420pToNv12(yuv);
+                    if (result.isValid()) return;
+                }
+                if (rhi && rhi->isDeviceLost()) {
+                    m_impl->deviceLost.store(true, std::memory_order_release);
+                    GpuDeviceLossMonitor::instance().recordLoss();
+                    result = CpuPlanes{};
+                    return;
+                }
+                if (target == FramePixelFormat::Yuv420p) {
+                    result = lockDownloadNv12ToYuv420p(pb);
+                } else {
+                    result = formatcanon::yuv420pToNv12(lockDownloadNv12ToYuv420p(pb));
+                }
             }
         } else if (desc.format == FramePixelFormat::Rgba8 && target == FramePixelFormat::Rgba8) {
             result = lockDownloadRgba8(pb);

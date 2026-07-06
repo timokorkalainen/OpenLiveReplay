@@ -11,11 +11,13 @@
 #include <QList>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "frameprovider.h"
 #include "playback/commitgate.h"
 #include "playback/frameindex.h"
 #ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpuseekprefetch.h"
 #include "playback/gpu/gpuframeretirequeue.h"
 #endif
 #include "playback/output/colormetadata.h"
@@ -74,6 +76,8 @@ class PlaybackWorker : public QThread {
     Q_OBJECT
 #ifdef OLR_UNIT_TEST
     friend class TestStagingFence;
+    friend class TestPlaybackWorker;
+    friend class TestGpuDeviceLostWorker;
 #endif
 public:
     struct PlaybackCounters {
@@ -103,6 +107,9 @@ public:
         // Phase-2 macOS GPU playback increments it only when a sink/preview asks
         // a GpuFrameData to read back.
         qint64 gpuReadToCpuCount = 0;
+        qint64 gpuSeekPrefetchConsults = 0;
+        qint64 gpuSeekPrefetchPlannedSurfaces = 0;
+        qint64 gpuSeekPrefetchGpuAttempts = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
@@ -145,6 +152,9 @@ public:
     PlaybackCounters counters() const;
     OutputDispatchStats outputStats() const;
     uint64_t gpuGeneration() const;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void injectGpuDeviceLossForTest();
+#endif
     // The committed cache generation (set at repositionTo's tail). >=1 after a
     // real reposition proves a target was decoded and committed to the cache.
     uint64_t cacheGeneration() const {
@@ -224,6 +234,9 @@ private:
     // m_bufferMutex.
     void publishOutputCacheLocked();
 #ifdef OLR_GPU_PIPELINE_BUILD
+    enum class GpuPipelineState { Gpu, RebuildPending, CpuFallback };
+    static constexpr int kDeviceLossRebuildBudget = 3;
+
     void collectEvictedGpuFramesLocked(const TrackBuffer::EvictedFrames& evictedFrames);
     void collectEvictedGpuFramesLocked(const OutputFrameCache::EvictedVideoFrames& evictedFrames);
     void collectEvictedGpuFrameLocked(const FrameHandle& frame);
@@ -231,6 +244,27 @@ private:
     void forceDrainEvictedGpuFrames();
     void recordFenceWaitStall();
     bool ensureWindowsGpuImportFencesReadyForDecode(void* d3d11Device);
+    void configureGpuBudget();
+    GpuPipelineState gpuPipelineState() const;
+    bool gpuPathActive() const;
+    bool gpuLifecycleSuspended() const;
+    bool gpuDeviceLossPending() const;
+    bool consumeGpuDeviceLossRebuildBudget();
+    void drainGpuDeviceLossEvents() const;
+    void handleGpuDeviceLoss();
+    void resumeDeferredGpuRebuild();
+    void detachOutputEndpointsForDeviceLoss();
+    void sanitizeCacheForDeviceLossLocked(OutputFrameCache* cache, int* recoveredFrames = nullptr,
+                                          int* removedGpuFrames = nullptr);
+    void sanitizeTrackBufferForDeviceLossLocked(TrackBuffer* buffer, int* recoveredFrames = nullptr,
+                                                int* removedGpuFrames = nullptr);
+    std::optional<qint64> recoveredCachePlayheadLocked(qint64 playheadMs,
+                                                       uint64_t gpuGeneration) const;
+    bool rebuildGpuSpine();
+    GpuPrefetchPlan planGpuSeekPrefetchForReposition(int64_t target, int dir);
+    GpuPrefetchPlan beginGpuSeekPrefetchForReposition(int64_t target, int dir);
+    void endGpuSeekPrefetchForReposition();
+    bool allowNativeGpuDecodeForCurrentPacket(int64_t packetPtsMs);
 #endif
 
     // --- Tier3 pre-roll / armed-cut (worker-thread internals) -------------
@@ -255,6 +289,7 @@ private:
     void armCutInternal(int64_t targetMs, uint64_t baselineSeekGen, int64_t fireAtPlayheadMs);
     // Store the atomic schedule (output frame index + target ms).
     void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
+    void markStagingCovered();
     bool stagingGpuSurfacesIdle() const;
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
     // staging -> active, republishes, re-bases the transport playhead. MUST be
@@ -280,6 +315,7 @@ private:
     std::atomic<int> m_selectedOutputFeed{-1};
 
     AudioFrameQueue m_audioQueue;            // worker-thread-only
+    qint64 m_decodedVideoSequence = 0;       // worker-thread-only decoded frame identity
     std::atomic<bool> m_audioReprime{false}; // set by setActiveAudioView (UI thread)
     std::atomic<int> m_lastMoveDir{1};
     int64_t m_sizeAtLastEof = -1;
@@ -311,6 +347,7 @@ private:
     // committed. While CommitGate is holding the old cache/playhead during a
     // reposition, output must keep accepting the old generation too.
     std::atomic<uint64_t> m_committedGpuGeneration{1};
+    std::atomic<int> m_gpuPipelineState{static_cast<int>(GpuPipelineState::CpuFallback)};
 #endif
     // Last playhead actually exposed to the output clock while no seek was
     // pending. A later seek holds this recent, cache-covered position instead
@@ -413,6 +450,15 @@ private:
     std::shared_ptr<DecodeDoneFence> m_decodeFence;
 #ifdef OLR_GPU_PIPELINE_BUILD
     std::shared_ptr<GpuFence> m_renderFence;
+    mutable std::atomic<qint64> m_gpuDeviceLossEvents{0};
+    std::atomic<bool> m_injectGpuDeviceLossForTest{false};
+    std::atomic<bool> m_forceLiveOutputSnapshotsOnNextAttach{false};
+    mutable std::atomic<int> m_forceLiveOutputSnapshots{0};
+    std::atomic<int> m_gpuDeviceLossRebuildsRemaining{kDeviceLossRebuildBudget};
+    std::atomic<bool> m_gpuRebuildDeferredForSuspend{false};
+    bool m_gpuSeekPrefetchActive = false; // worker-thread-only reposition scope
+    int m_gpuSeekPrefetchRemaining = 0;
+    GpuPrefetchPlan m_gpuSeekPrefetchPlan;
 #endif
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
     std::unique_ptr<WinGpuImportEdge> m_winGpuImportEdge;

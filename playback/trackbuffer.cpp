@@ -107,6 +107,37 @@ bool TrackBuffer::hasFrameNear(int64_t targetMs, int64_t toleranceMs) const {
     return false;
 }
 
+int TrackBuffer::replaceFrames(
+    const std::function<std::optional<FrameHandle>(const FrameHandle&)>& fn,
+    EvictedFrames* evictedFrames) {
+    int replaced = 0;
+    for (Frame& entry : m_frames) {
+        std::optional<FrameHandle> replacement = fn(entry.frame);
+        if (!replacement.has_value() || !replacement->isPresentable()) continue;
+        replacement->metadata().key.ptsMs = entry.ptsMs;
+        if (evictedFrames) evictedFrames->append(entry);
+        entry.frame = std::move(*replacement);
+        ++replaced;
+    }
+    return replaced;
+}
+
+int TrackBuffer::removeFramesIf(const std::function<bool(const FrameHandle&)>& predicate,
+                                EvictedFrames* evictedFrames) {
+    int removed = 0;
+    auto it = m_frames.begin();
+    while (it != m_frames.end()) {
+        if (!predicate(it->frame)) {
+            ++it;
+            continue;
+        }
+        if (evictedFrames) evictedFrames->append(*it);
+        it = m_frames.erase(it);
+        ++removed;
+    }
+    return removed;
+}
+
 // ---------------------------------------------------------------------------
 // newestPts / oldestPts
 // ---------------------------------------------------------------------------
