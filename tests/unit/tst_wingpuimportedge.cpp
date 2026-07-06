@@ -48,15 +48,15 @@ bool createTestD3D11Device(ComPtr<ID3D11Device>* device, ComPtr<ID3D11DeviceCont
     const D3D_FEATURE_LEVEL want = D3D_FEATURE_LEVEL_11_0;
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, &want, 1, D3D11_SDK_VERSION,
-                                   device, &level, ctx);
+                                   device->GetAddressOf(), &level, ctx->GetAddressOf());
     if (SUCCEEDED(hr)) return true;
 
     hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &want, 1,
-                           D3D11_SDK_VERSION, device, &level, ctx);
+                           D3D11_SDK_VERSION, device->GetAddressOf(), &level, ctx->GetAddressOf());
     if (SUCCEEDED(hr)) return true;
 
     hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &want, 1, D3D11_SDK_VERSION,
-                           device, &level, ctx);
+                           device->GetAddressOf(), &level, ctx->GetAddressOf());
     return SUCCEEDED(hr);
 }
 
