@@ -112,6 +112,7 @@ foreach(kind aja omt decklink-readback decklink-gpu decklink-st2110-readback dec
     set_tests_properties(e2e_iotarget_${kind} PROPERTIES
         LABELS "ci;iotargets"
         TIMEOUT 120
+        SKIP_RETURN_CODE 77
         ENVIRONMENT "OLR_GPU_PIPELINE=1")
 endforeach()
 

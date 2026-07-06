@@ -5,6 +5,20 @@ HARNESS="${1:?iotarget_marker_sender executable required}"
 KIND="${2:?target kind required (aja|omt|decklink-readback|decklink-gpu|decklink-st2110-readback|decklink-st2110-gpu)}"
 FRAMES="${OLR_IOTARGET_FRAMES:-360}"
 
+# Readback-path kinds (everything but the GPU-native *-gpu sinks) route frames
+# through the async GPU readback ring, whose drain cadence is throughput-sensitive.
+# CI's shared, virtualized GPU cannot sustain it reliably, so gate those variants to
+# real hardware (the pre-push hook still runs them); GPU-native submit is unaffected.
+case "$KIND" in
+    *-gpu) : ;;
+    *)
+        if [ -n "${GITHUB_ACTIONS:-}" ]; then
+            echo "SKIP: $KIND readback cadence is throughput-sensitive on CI's shared GPU"
+            exit 77
+        fi
+        ;;
+esac
+
 OUT="$("$HARNESS" "$KIND" "$FRAMES")"
 rc=$?
 echo "$OUT"
