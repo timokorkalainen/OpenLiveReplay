@@ -233,7 +233,8 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
             if (!rhi) return;
             const auto* nativeHandles =
                 static_cast<const QRhiD3D11NativeHandles*>(rhi->nativeHandles());
-            ID3D11Device* device = nativeHandles ? nativeHandles->dev : nullptr;
+            ID3D11Device* device =
+                nativeHandles ? static_cast<ID3D11Device*>(nativeHandles->dev) : nullptr;
             if (device && FAILED(device->GetDeviceRemovedReason())) {
                 // LOCK RULE: D3D11 removed-device polling touches no m_bufferMutex.
                 m_impl->deviceLost.store(true, std::memory_order_release);
