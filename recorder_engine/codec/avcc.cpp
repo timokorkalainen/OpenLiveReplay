@@ -1,12 +1,16 @@
 #include "recorder_engine/codec/avcc.h"
 
+#include <limits>
+
 namespace {
 constexpr qsizetype kMaxAvccSpsCount = 0x1f;
 constexpr qsizetype kMaxAvccPpsCount = 0xff;
 constexpr qsizetype kMaxAvccNalLength = 0xffff;
 
 bool appendSizedNal(QByteArray* out, const QByteArray& nal) {
-    if (!out || nal.size() > kMaxAvccNalLength) return false;
+    if (!out || nal.size() <= 0 || nal.size() > kMaxAvccNalLength) {
+        return false;
+    }
     const int size = static_cast<int>(nal.size());
     out->append(char((size >> 8) & 0xff));
     out->append(char(size & 0xff));

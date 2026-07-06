@@ -1,0 +1,343 @@
+#include <QtTest>
+
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
+#include "playback/gpu/appleiosurface.h"
+#endif
+#include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpugeneration.h"
+#include "playback/gpu/gpusurface.h"
+#include "recorder_engine/codec/gpuencodepump.h"
+#include "recorder_engine/ingest/gpudecodedframe.h"
+#include "recorder_engine/streamworker.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
+#include <CoreVideo/CoreVideo.h>
+#if __has_include(<IOSurface/IOSurfaceRef.h>)
+#include <IOSurface/IOSurfaceRef.h>
+#elif __has_include(<IOSurface/IOSurface.h>)
+#include <IOSurface/IOSurface.h>
+#endif
+#endif
+
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+}
+
+namespace {
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+AVFrame* makeYuvFrame(int width, int height, int64_t pts) {
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) return nullptr;
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->width = width;
+    frame->height = height;
+    frame->pts = pts;
+    if (av_frame_get_buffer(frame, 32) < 0) {
+        av_frame_free(&frame);
+        return nullptr;
+    }
+    return frame;
+}
+#endif
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+class FakeSurface final : public GpuSurface {
+public:
+    GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 16}; }
+    bool isValid() const override { return true; }
+    void* nativeHandle() const override { return const_cast<FakeSurface*>(this); }
+};
+
+FrameHandle makeGpuHandle() {
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 16;
+    meta.key.height = 16;
+    return makeGpuFrameHandle(std::make_shared<FakeSurface>(), nullptr, meta);
+}
+
+class BlockingSurfaceEncoder final : public NativeVideoEncoder {
+public:
+    bool encode(const AVFrame*, int64_t, const PacketCallback&, QString*) override { return false; }
+
+    bool encodeSurface(GpuSurface*, int64_t ptsTicks, const ColorMetadata&,
+                       const PacketCallback& onPacket, QString*) override {
+        surfaceCalls.fetch_add(1, std::memory_order_acq_rel);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_entered = true;
+        }
+        m_cv.notify_all();
+
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [&] { return m_released; });
+        lock.unlock();
+        onPacket(QByteArrayLiteral("pkt"), ptsTicks, true);
+        return true;
+    }
+
+    bool flush(const PacketCallback&, QString*) override { return true; }
+    QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
+
+    bool waitForFirstCall(int timeoutMs) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return m_entered; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_released = true;
+        }
+        m_cv.notify_all();
+    }
+
+    std::atomic<int> surfaceCalls{0};
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    bool m_entered = false;
+    bool m_released = false;
+};
+#endif
+
+} // namespace
+
+class TestStreamWorkerGpuEncode : public QObject {
+    Q_OBJECT
+private slots:
+    void pumpIsNullWhenPipelineFlagOff();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void jitterPullCarriesGpuFrameAndClearsOnCpuFrame();
+    void paintBlueClearsGpuOnlyLatestFrame();
+    void gpuDecodedFrameHelperWrapsAppleSurface();
+    void gpuEncodePumpStartsWhenGpuPipelineEnabled();
+    void queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFlight();
+    void gpuEncodeFallbackDisablesGpuFrameIngestPreference();
+    void gpuOnlyQueuedFrameBeforeEncodeFallbackDoesNotClearCpuLatest();
+    void gpuOnlyQueuedFrameAfterEncodeFallbackDoesNotClearCpuLatest();
+#endif
+};
+
+void TestStreamWorkerGpuEncode::pumpIsNullWhenPipelineFlagOff() {
+    qunsetenv("OLR_GPU_PIPELINE");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 320, 240, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    QVERIFY(worker.gpuEncodePumpForTest() == nullptr);
+}
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+void TestStreamWorkerGpuEncode::jitterPullCarriesGpuFrameAndClearsOnCpuFrame() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.m_latestFrame = av_frame_alloc();
+    QVERIFY(worker.m_latestFrame != nullptr);
+
+    StreamWorker::QueuedFrame gpuQueued;
+    gpuQueued.frame = makeYuvFrame(16, 16, 0);
+    QVERIFY(gpuQueued.frame != nullptr);
+    gpuQueued.sourcePts = 0;
+    gpuQueued.gpuFrame = makeGpuHandle();
+    gpuQueued.gpuFenceValue = 42;
+
+    {
+        QMutexLocker locker(&worker.m_frameMutex);
+        worker.m_frameQueue.enqueue(gpuQueued);
+    }
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(nullptr, 0, 0, 0);
+
+    QVERIFY(worker.m_latestGpuFrame.isGpuBacked());
+    QCOMPARE(worker.m_latestGpuFenceValue, uint64_t(42));
+
+    StreamWorker::QueuedFrame cpuQueued;
+    cpuQueued.frame = makeYuvFrame(16, 16, 40);
+    QVERIFY(cpuQueued.frame != nullptr);
+    cpuQueued.sourcePts = 40;
+
+    {
+        QMutexLocker locker(&worker.m_frameMutex);
+        worker.m_frameQueue.enqueue(cpuQueued);
+    }
+
+    worker.m_internalFrameCount = 3;
+    worker.processEncoderTick(nullptr, 0, 0, 0);
+
+    QVERIFY(worker.m_latestGpuFrame.isNull());
+    QCOMPARE(worker.m_latestGpuFenceValue, uint64_t(0));
+
+    av_frame_free(&worker.m_latestFrame);
+}
+
+void TestStreamWorkerGpuEncode::paintBlueClearsGpuOnlyLatestFrame() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    StreamWorker worker(QStringLiteral("old-source"), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.m_latestGpuFrame = makeGpuHandle();
+    worker.m_latestGpuFenceValue = 7;
+    worker.m_latestGpuFrameTimecode100ns = 5678;
+    worker.m_latestFrameTimecode100ns = 1234;
+    worker.m_paintBlue = 1;
+
+    worker.processEncoderTick(nullptr, 0, 0, 0);
+
+    QVERIFY(worker.m_latestGpuFrame.isNull());
+    QCOMPARE(worker.m_latestGpuFenceValue, uint64_t(0));
+    QCOMPARE(worker.m_latestGpuFrameTimecode100ns.load(std::memory_order_acquire), int64_t(-1));
+    QCOMPARE(worker.m_latestFrameTimecode100ns.load(std::memory_order_acquire), int64_t(-1));
+}
+
+void TestStreamWorkerGpuEncode::gpuDecodedFrameHelperWrapsAppleSurface() {
+#ifndef __APPLE__
+    QSKIP("GPU decoded-frame helper currently wraps Apple CVImageBuffer surfaces");
+#else
+    auto surface = makeAppleNv12Surface(16, 16);
+    if (!surface) QSKIP("could not allocate an IOSurface-backed NV12 surface");
+
+    auto* ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    CVPixelBufferRef pixelBuffer = nullptr;
+    const CVReturn rc =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+    if (rc != kCVReturnSuccess || !pixelBuffer) {
+        QSKIP("could not create a CVPixelBuffer wrapper for IOSurface");
+    }
+
+    CompressedAccessUnit unit;
+    unit.codec = NativeVideoCodec::H264;
+    const FrameHandle handle = makeGpuDecodedFrameHandle(pixelBuffer, unit, 16, 16, 123);
+    CVPixelBufferRelease(pixelBuffer);
+
+    QVERIFY(handle.isGpuBacked());
+    QCOMPARE(handle.metadata().key.format, FramePixelFormat::Nv12);
+    QCOMPARE(handle.metadata().key.width, 16);
+    QCOMPARE(handle.metadata().key.height, 16);
+    QCOMPARE(handle.metadata().key.ptsMs, qint64(123));
+    QCOMPARE(handle.metadata().gpuGeneration, GpuGenerationCounter::instance().current());
+#endif
+}
+
+void TestStreamWorkerGpuEncode::gpuEncodePumpStartsWhenGpuPipelineEnabled() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.m_nativeEncoder = std::make_unique<BlockingSurfaceEncoder>();
+
+    QVERIFY(worker.ensureGpuEncodePumpStartedForTest());
+    QVERIFY(worker.gpuEncodePumpForTest() != nullptr);
+}
+
+void TestStreamWorkerGpuEncode::queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFlight() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    Muxer muxer;
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.setViewTrack(0);
+
+    auto encoder = std::make_unique<BlockingSurfaceEncoder>();
+    auto* encoderPtr = encoder.get();
+    worker.m_nativeEncoder = std::move(encoder);
+    worker.m_gpuEncodePump =
+        std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), nullptr, 4);
+    worker.m_gpuEncodePump->start();
+    worker.m_latestGpuFrame = makeGpuHandle();
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(nullptr, 33, 0, 0);
+    QVERIFY2(encoderPtr->waitForFirstCall(1000), "first GPU encode did not start");
+
+    worker.m_internalFrameCount = 2;
+    worker.processEncoderTick(nullptr, 66, 0, 0);
+
+    encoderPtr->release();
+    QTRY_COMPARE_WITH_TIMEOUT(encoderPtr->surfaceCalls.load(std::memory_order_acquire), 2, 2000);
+    worker.m_gpuEncodePump->stop();
+}
+
+void TestStreamWorkerGpuEncode::gpuEncodeFallbackDisablesGpuFrameIngestPreference() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    QVERIFY(worker.preferGpuVideoFramesForIngestForTest());
+
+    worker.latchGpuEncodeCpuFallback();
+
+    QVERIFY(!worker.preferGpuVideoFramesForIngestForTest());
+}
+
+void TestStreamWorkerGpuEncode::gpuOnlyQueuedFrameBeforeEncodeFallbackDoesNotClearCpuLatest() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.m_latestFrame = makeYuvFrame(16, 16, 0);
+    QVERIFY(worker.m_latestFrame != nullptr);
+    worker.m_latestFrameTimecode100ns = 1000;
+
+    StreamWorker::QueuedFrame gpuOnly;
+    gpuOnly.sourcePts = 0;
+    gpuOnly.sourceTimecode100ns = 2000;
+    gpuOnly.gpuFrame = makeGpuHandle();
+    {
+        QMutexLocker locker(&worker.m_frameMutex);
+        worker.m_frameQueue.enqueue(gpuOnly);
+    }
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(nullptr, 0, 0, 0);
+
+    QVERIFY(worker.m_latestFrame != nullptr);
+    QVERIFY(worker.m_latestFrame->data[0] != nullptr);
+    QCOMPARE(worker.m_latestFrameTimecode100ns.load(std::memory_order_acquire), int64_t(1000));
+    QVERIFY(worker.m_latestGpuFrame.isGpuBacked());
+    QCOMPARE(worker.m_latestGpuFrameTimecode100ns.load(std::memory_order_acquire), int64_t(2000));
+
+    av_frame_free(&worker.m_latestFrame);
+}
+
+void TestStreamWorkerGpuEncode::gpuOnlyQueuedFrameAfterEncodeFallbackDoesNotClearCpuLatest() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.m_latestFrame = makeYuvFrame(16, 16, 0);
+    QVERIFY(worker.m_latestFrame != nullptr);
+    worker.m_gpuEncodeCpuFallback.store(true, std::memory_order_release);
+
+    StreamWorker::QueuedFrame gpuOnly;
+    gpuOnly.sourcePts = 0;
+    gpuOnly.gpuFrame = makeGpuHandle();
+    {
+        QMutexLocker locker(&worker.m_frameMutex);
+        worker.m_frameQueue.enqueue(gpuOnly);
+    }
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(nullptr, 0, 0, 0);
+
+    QVERIFY(worker.m_latestFrame != nullptr);
+    QVERIFY(worker.m_latestFrame->data[0] != nullptr);
+    QCOMPARE(worker.m_frameQueue.size(), 0);
+
+    av_frame_free(&worker.m_latestFrame);
+}
+#endif
+
+QTEST_GUILESS_MAIN(TestStreamWorkerGpuEncode)
+#include "tst_streamworker_gpuencode.moc"

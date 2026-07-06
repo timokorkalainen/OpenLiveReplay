@@ -13,6 +13,8 @@
 #include <QByteArray>
 #include <QUrl>
 #include <atomic>
+#include <functional>
+#include <mutex>
 #include <thread>
 
 #include "recordingclock.h"
@@ -22,15 +24,24 @@
 
 #include "recorder_engine/codec/videocodecchoice.h"
 #include "recorder_engine/codec/nativevideoencoder.h"
+#if defined(OLR_GPU_PIPELINE_BUILD)
+#include "playback/output/framehandle.h"
+#endif
+
+class GpuEncodePump;
+class GpuFence;
+#if defined(_WIN32)
+class WinGpuImportEdge;
+#endif
 
 extern "C" {
-    #include <libavformat/avformat.h>
-    #include <libavcodec/avcodec.h>
-    #include <libavutil/avutil.h>
-    #include <libavutil/time.h>
-    #include <libavutil/error.h>
-    #include <libswscale/swscale.h>
-    #include <libswresample/swresample.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/time.h>
+#include <libavutil/error.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
 }
 
 class StreamWorker : public QThread {
@@ -108,6 +119,13 @@ public:
 
     int sourceIndex() const { return m_sourceIndex; }
 
+#ifdef OLR_UNIT_TEST
+    friend class TestStreamWorkerGpuEncode;
+    const GpuEncodePump* gpuEncodePumpForTest() const;
+    bool preferGpuVideoFramesForIngestForTest() const;
+    bool ensureGpuEncodePumpStartedForTest();
+#endif
+
 signals:
     // Emitted from the capture thread ONLY when the connection state flips
     // (debounced via setConnected). Cross-thread: relayed to the UI through
@@ -134,20 +152,20 @@ protected:
 
 private:
     QString m_url;
-    int m_sourceIndex;              // Fixed: identity of this source
-    std::atomic<int> m_viewTrack;   // Dynamic: muxer track to write to (-1 = none)
+    int m_sourceIndex;            // Fixed: identity of this source
+    std::atomic<int> m_viewTrack; // Dynamic: muxer track to write to (-1 = none)
     Muxer* m_muxer;
 
     AVFrame* m_latestFrame = nullptr;
     // Source timecode (100 ns since midnight) of the frame currently held in
     // m_latestFrame, or -1 when none/blue. Tick-thread-only. Travels with the
     // frame through the jitter pull so the muxed frame's TC can be forwarded.
-    int64_t m_latestFrameTimecode100ns = -1;
+    std::atomic<int64_t> m_latestFrameTimecode100ns{-1};
     int64_t m_internalFrameCount;
     RecordingClock* m_sharedClock;
 
-    QAtomicInt m_restartCapture;    // Thread-safe flag to signal a source swap
-    QAtomicInt m_paintBlue{0};      // Deferred blue-paint flag
+    QAtomicInt m_restartCapture; // Thread-safe flag to signal a source swap
+    QAtomicInt m_paintBlue{0};   // Deferred blue-paint flag
 
     // Set when the source is changed to an empty URL (blue-paint state),
     // cleared when a non-empty URL actually connects.  While set, the
@@ -155,12 +173,12 @@ private:
     // from the old/cleared source cannot overwrite the painted blue frame.
     std::atomic<bool> m_suppressEnqueue{false};
 
-    //Mutexes & Threads
+    // Mutexes & Threads
     QMutex m_frameMutex;
     QMutex m_urlMutex;
     QMutex m_metadataMutex;
     QMutex m_sessionMutex;
-    QByteArray m_sourceMetadataJson;    // JSON blob for per-frame subtitle track
+    QByteArray m_sourceMetadataJson;          // JSON blob for per-frame subtitle track
     IngestSession* m_activeSession = nullptr; // guarded by m_sessionMutex
 
     // Dedicated capture thread owned by this worker.  captureLoop() loops
@@ -207,9 +225,9 @@ private:
     // consumes it on a sample-accurate cursor (gap-filled with silence).
     QMutex m_audioFifoMutex;
     QByteArray m_audioFifo;
-    int64_t m_audioFifoStartSample = -1;  // timeline sample index of m_audioFifo[0]
-    int64_t m_audioWriteCursor = -1;      // next sample to mux (tick thread only)
-    int64_t m_audioSourceCursor = -1;     // next source-timeline sample to consume
+    int64_t m_audioFifoStartSample = -1; // timeline sample index of m_audioFifo[0]
+    int64_t m_audioWriteCursor = -1;     // next sample to mux (tick thread only)
+    int64_t m_audioSourceCursor = -1;    // next source-timeline sample to consume
     int64_t m_audioServoTrimSamples = 0;
     int64_t m_audioServoJitterSamples = 0;
     void enqueueAudio(int64_t startSample, const uint8_t* data, int numSamples);
@@ -230,14 +248,42 @@ private:
         // transport carried no TC. Purely additive: never affects A/V sync or the
         // jitter pull; only forwarded via frameTimecode() when the frame is muxed.
         int64_t sourceTimecode100ns = -1;
+#ifdef OLR_GPU_PIPELINE_BUILD
+        FrameHandle gpuFrame;
+        uint64_t gpuFenceValue = 0;
+#endif
     };
 
     QQueue<QueuedFrame> m_frameQueue;
     AVCodecContext* m_persistentEncCtx = nullptr;
     std::unique_ptr<NativeVideoEncoder> m_nativeEncoder;
+    std::mutex m_nativeEncodeMutex;
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+    std::unique_ptr<GpuEncodePump> m_gpuEncodePump;
+    std::shared_ptr<GpuFence> m_gpuEncodeFence;
+    std::atomic<bool> m_gpuEncodeCpuFallback{false};
+#if defined(_WIN32)
+    std::unique_ptr<WinGpuImportEdge> m_gpuEncodeImportEdge;
+#endif
+    FrameHandle m_latestGpuFrame;
+    uint64_t m_latestGpuFenceValue = 0;
+    std::atomic<int64_t> m_latestGpuFrameTimecode100ns{-1};
+#endif
 
     // FFmpeg helpers
     bool setupEncoder(AVCodecContext** encCtx);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    ImportedGpuVideoFrame importGpuVideoFrameForEncode(void* nativeDecodedImage,
+                                                       const FrameMetadata& metadata);
+    bool ensureGpuEncodePumpStarted();
+    bool preferGpuVideoFramesForIngest() const;
+    void latchGpuEncodeCpuFallback();
+#endif
+    NativeVideoEncoder::PacketCallback makeMuxerWriteCallback(
+        int track, AVStream* st, bool* havePacket,
+        std::function<void()> beforePacketWrite = std::function<void()>{},
+        std::function<void(bool)> afterPacketWritten = std::function<void(bool)>{});
     void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
                             int64_t jitterMs);
 };

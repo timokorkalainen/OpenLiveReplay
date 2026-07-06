@@ -9,12 +9,28 @@
 #endif
 #include "ingest/nativendiingestsession.h"
 #include "timing/smpte12m.h"
+#if defined(OLR_GPU_PIPELINE_BUILD)
+#include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpupipelineconfig.h"
+#include "recorder_engine/codec/gpuencodepump.h"
+#if defined(__APPLE__)
+#include "playback/gpu/appleiosurface.h"
+#endif
+#if defined(_WIN32)
+#include "playback/output/win/d3d11gpusurface.h"
+#include "playback/output/win/wingpuimportedge.h"
+#endif
+#endif
 #include <QDebug>
 #include <QDateTime>
 #include <QUrl>
 #include <QtGlobal>
 
+#include <atomic>
+#include <limits>
 #include <memory>
+#include <utility>
 
 namespace {
 QString ingestFailureKindForLog(IngestFailureKind failure) {
@@ -71,6 +87,101 @@ void StreamWorker::setConnected(bool c) {
     }
 }
 
+#ifdef OLR_UNIT_TEST
+const GpuEncodePump* StreamWorker::gpuEncodePumpForTest() const {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    return m_gpuEncodePump.get();
+#else
+    return nullptr;
+#endif
+}
+
+bool StreamWorker::preferGpuVideoFramesForIngestForTest() const {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    return preferGpuVideoFramesForIngest();
+#else
+    return false;
+#endif
+}
+
+bool StreamWorker::ensureGpuEncodePumpStartedForTest() {
+#ifdef OLR_GPU_PIPELINE_BUILD
+    return ensureGpuEncodePumpStarted();
+#else
+    return false;
+#endif
+}
+#endif
+
+#if defined(OLR_GPU_PIPELINE_BUILD)
+bool StreamWorker::ensureGpuEncodePumpStarted() {
+    if (!gpuPipelineEnabled() || !m_nativeEncoder) return false;
+    if (m_gpuEncodePump) return true;
+
+    m_gpuEncodeFence = GpuFence::create();
+    m_gpuEncodePump = std::make_unique<GpuEncodePump>(m_nativeEncoder.get(), m_gpuEncodeFence, 4,
+                                                      &m_nativeEncodeMutex);
+    m_gpuEncodePump->start();
+    return true;
+}
+
+bool StreamWorker::preferGpuVideoFramesForIngest() const {
+    return gpuPipelineEnabled() && m_videoCodec == VideoCodecChoice::H264Hardware &&
+           !m_gpuEncodeCpuFallback.load(std::memory_order_acquire);
+}
+
+void StreamWorker::latchGpuEncodeCpuFallback() {
+    if (m_gpuEncodeCpuFallback.exchange(true, std::memory_order_acq_rel)) return;
+    if (m_gpuEncodePump) m_gpuEncodePump->cancelPending();
+}
+
+ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDecodedImage,
+                                                                 const FrameMetadata& metadata) {
+    ImportedGpuVideoFrame imported;
+#if defined(__APPLE__)
+    auto surface = wrapAppleImageBuffer(nativeDecodedImage);
+    if (!surface) return imported;
+
+    imported.frame = makeGpuFrameHandle(std::move(surface), nullptr, metadata);
+    imported.fenceValue = 0;
+#elif defined(_WIN32)
+    if (!m_gpuEncodeImportEdge || m_gpuEncodeImportEdge->deviceLost()) {
+        QString error;
+        m_gpuEncodeImportEdge = WinGpuImportEdge::create(&error);
+        if (!m_gpuEncodeImportEdge) {
+            if (!error.isEmpty()) {
+                qWarning() << "Source" << m_sourceIndex
+                           << "Windows GPU video import unavailable:" << error;
+            }
+            latchGpuEncodeCpuFallback();
+            return imported;
+        }
+    }
+
+    auto surface = m_gpuEncodeImportEdge->tryImportSurface(nativeDecodedImage, metadata.key.width,
+                                                           metadata.key.height);
+    if (!surface) {
+        latchGpuEncodeCpuFallback();
+        return imported;
+    }
+
+    std::shared_ptr<GpuFence> fence = makeD3D11GpuFence(surface->device());
+    if (!fence) {
+        latchGpuEncodeCpuFallback();
+        return imported;
+    }
+    const uint64_t fenceValue = fence ? fence->signal() : 0;
+    imported.frame =
+        WinGpuImportEdge::makeGpuFrameHandleForTest(std::move(surface), metadata, fence);
+    imported.fenceValue = fenceValue;
+#else
+    Q_UNUSED(nativeDecodedImage);
+    Q_UNUSED(metadata);
+#endif
+    return imported;
+}
+#endif
+
 void debugTimestamp(const QString& prefix, int trackIndex) {
     QString timeStr = QDateTime::currentDateTime().toString("HH:mm:ss.zzz");
     qDebug() << "[" << timeStr << "] [Track" << trackIndex << "]" << prefix;
@@ -108,6 +219,9 @@ void StreamWorker::run() {
     if (m_captureThread.joinable()) m_captureThread.join();
 
     // Cleanup when exec() returns (on stop)
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    if (m_gpuEncodePump) m_gpuEncodePump->stop();
+#endif
     avcodec_free_context(&m_persistentEncCtx);
     m_nativeEncoder.reset();
     av_frame_free(&m_latestFrame);
@@ -165,6 +279,42 @@ void StreamWorker::onMasterPulse(int64_t frameIndex, int64_t streamTimeMs) {
     processEncoderTick(m_persistentEncCtx, streamTimeMs, trimMs, jitterMs);
 }
 
+NativeVideoEncoder::PacketCallback
+StreamWorker::makeMuxerWriteCallback(int track, AVStream* st, bool* havePacket,
+                                     std::function<void()> beforePacketWrite,
+                                     std::function<void(bool)> afterPacketWritten) {
+    return [this, track, st, havePacket, beforePacketWrite = std::move(beforePacketWrite),
+            afterPacketWritten = std::move(afterPacketWritten)](
+               const QByteArray& data, int64_t ptsTicks, bool keyframe) mutable {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt) {
+            if (afterPacketWritten) afterPacketWritten(false);
+            return;
+        }
+        if (data.size() > std::numeric_limits<int>::max()) {
+            av_packet_free(&pkt);
+            if (afterPacketWritten) afterPacketWritten(false);
+            return;
+        }
+        if (av_new_packet(pkt, static_cast<int>(data.size())) < 0) {
+            av_packet_free(&pkt);
+            if (afterPacketWritten) afterPacketWritten(false);
+            return;
+        }
+        memcpy(pkt->data, data.constData(), data.size());
+        pkt->stream_index = track;
+        if (st && m_muxer) {
+            pkt->pts = pkt->dts = av_rescale_q(ptsTicks, AVRational{1, m_targetFps}, st->time_base);
+            pkt->duration = av_rescale_q(1, AVRational{1, m_targetFps}, st->time_base);
+            if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
+            if (beforePacketWrite) beforePacketWrite();
+            const bool accepted = m_muxer->writePacket(pkt, std::move(afterPacketWritten));
+            if (accepted && havePacket) *havePacket = true;
+        }
+        av_packet_free(&pkt);
+    };
+}
+
 void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
                                       int64_t jitterMs) {
     AVPacket* outPkt = av_packet_alloc();
@@ -174,6 +324,11 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
     AVFrame* pulled = nullptr;
     int64_t pulledTimecode100ns = -1;
+    bool pulledAnyFrame = false;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    FrameHandle pulledGpuFrame;
+    uint64_t pulledGpuFenceValue = 0;
+#endif
     const bool paintBlue = m_paintBlue.fetchAndStoreRelaxed(0) != 0;
 
     // The mutex only guards m_frameQueue (shared with the capture
@@ -197,35 +352,71 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
 
         while (!m_frameQueue.isEmpty() && m_frameQueue.head().sourcePts <= targetTimeMs) {
             QueuedFrame top = m_frameQueue.dequeue();
+#ifdef OLR_GPU_PIPELINE_BUILD
+            if (!top.frame && !top.gpuFrame.isNull() &&
+                m_gpuEncodeCpuFallback.load(std::memory_order_acquire)) {
+                continue;
+            }
+#endif
             if (pulled) av_frame_free(&pulled);
             pulled = top.frame;
             pulledTimecode100ns = top.sourceTimecode100ns;
+            pulledAnyFrame = true;
+#ifdef OLR_GPU_PIPELINE_BUILD
+            pulledGpuFrame = top.gpuFrame;
+            pulledGpuFenceValue = top.gpuFenceValue;
+#endif
         }
     }
 
-    if (paintBlue && m_latestFrame && m_latestFrame->data[0]) {
-        memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
-        memset(m_latestFrame->data[1], 240,
-               m_latestFrame->linesize[1] *
-                   (m_latestFrame->height / 2)); // Cb: 240 = legal max chroma (255 is out-of-range)
-        memset(m_latestFrame->data[2], 107,
-               m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+    if (paintBlue) {
+        if (m_latestFrame && m_latestFrame->data[0]) {
+            const size_t yBytes =
+                static_cast<size_t>(m_latestFrame->linesize[0]) * m_latestFrame->height;
+            const size_t uvBytes =
+                static_cast<size_t>(m_latestFrame->linesize[1]) * (m_latestFrame->height / 2);
+            memset(m_latestFrame->data[0], 128, yBytes);
+            memset(m_latestFrame->data[1], 240,
+                   uvBytes); // Cb: 240 = legal max chroma (255 is out-of-range)
+            memset(m_latestFrame->data[2], 107,
+                   static_cast<size_t>(m_latestFrame->linesize[2]) * (m_latestFrame->height / 2));
+        }
         // A blue-painted frame carries no source timecode.
-        m_latestFrameTimecode100ns = -1;
+        m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        m_latestGpuFrame = FrameHandle{};
+        m_latestGpuFenceValue = 0;
+        m_latestGpuFrameTimecode100ns.store(-1, std::memory_order_release);
+#endif
     }
-    if (pulled) {
-        av_frame_unref(m_latestFrame);
-        av_frame_move_ref(m_latestFrame, pulled);
-        av_frame_free(&pulled);
-        // The TC travels with the frame now held in m_latestFrame.
-        m_latestFrameTimecode100ns = pulledTimecode100ns;
+    if (pulledAnyFrame) {
+        if (pulled && m_latestFrame) {
+            av_frame_unref(m_latestFrame);
+            av_frame_move_ref(m_latestFrame, pulled);
+            // The TC travels with the frame now held in m_latestFrame.
+            m_latestFrameTimecode100ns.store(pulledTimecode100ns, std::memory_order_release);
+        }
+        if (pulled) av_frame_free(&pulled);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        m_latestGpuFrame = std::move(pulledGpuFrame);
+        m_latestGpuFenceValue = pulledGpuFenceValue;
+        m_latestGpuFrameTimecode100ns.store(m_latestGpuFrame.isNull() ? -1 : pulledTimecode100ns,
+                                            std::memory_order_release);
+#endif
     }
 
     // Read the current view-track assignment (atomic, set by UIManager).
     // -1 = this source is not assigned to any view, skip encoding.
     track = m_viewTrack.load(std::memory_order_relaxed);
 
-    if (track >= 0 && m_latestFrame && m_latestFrame->data[0]) {
+    const bool hasCpuLatest = m_latestFrame && m_latestFrame->data[0];
+#ifdef OLR_GPU_PIPELINE_BUILD
+    const bool hasGpuLatest = !m_latestGpuFrame.isNull() && m_latestGpuFrame.isGpuBacked();
+#else
+    const bool hasGpuLatest = false;
+#endif
+
+    if (track >= 0 && (hasCpuLatest || hasGpuLatest)) {
         // Supply the session-start timecode candidate IN THE SAME THREAD that is
         // about to write the first muxed packet — so the muxer's deferred header
         // (written on that first packet) captures a real TC. Registered BEFORE the
@@ -237,42 +428,86 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // kTimecodeNominalFps (NOT m_targetFps), because the 100 ns was produced
         // with that same nominal fps and must round-trip to the original H:M:S:F.
         // Absent TC -> no candidate -> no tag.
-        if (m_latestFrameTimecode100ns >= 0) {
+        const bool asyncGpuEncodePath =
+#if defined(OLR_GPU_PIPELINE_BUILD)
+            m_videoCodec == VideoCodecChoice::H264Hardware && m_gpuEncodePump && hasGpuLatest &&
+            m_muxer && !m_gpuEncodeCpuFallback.load(std::memory_order_acquire);
+#else
+            false;
+#endif
+        const int64_t latestFrameTimecode100ns =
+            m_latestFrameTimecode100ns.load(std::memory_order_acquire);
+        if (!asyncGpuEncodePath && m_muxer && latestFrameTimecode100ns >= 0) {
             const Smpte12mTimecode startTc =
-                Smpte12m::from100ns(m_latestFrameTimecode100ns, Smpte12m::kTimecodeNominalFps);
+                Smpte12m::from100ns(latestFrameTimecode100ns, Smpte12m::kTimecodeNominalFps);
             char buf[12];
             m_muxer->setStartTimecodeCandidate(QString::fromLatin1(Smpte12m::format(startTc, buf)));
         }
 
-        if (m_videoCodec == VideoCodecChoice::H264Hardware && m_nativeEncoder) {
+        bool submittedGpuEncode = false;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+        if (m_videoCodec == VideoCodecChoice::H264Hardware && m_gpuEncodePump && hasGpuLatest &&
+            m_muxer) {
+            AVStream* st = m_muxer->getStream(track);
+            const int64_t sourceTimecode100ns =
+                m_latestGpuFrameTimecode100ns.load(std::memory_order_acquire);
+            const int64_t sessionFrameIndex = m_internalFrameCount;
+            const QString startTimecodeCandidate = [sourceTimecode100ns] {
+                if (sourceTimecode100ns < 0) return QString();
+                const Smpte12mTimecode startTc =
+                    Smpte12m::from100ns(sourceTimecode100ns, Smpte12m::kTimecodeNominalFps);
+                char buf[12];
+                return QString::fromLatin1(Smpte12m::format(startTc, buf));
+            }();
+            QByteArray metaJson;
+            {
+                QMutexLocker locker(&m_metadataMutex);
+                metaJson = m_sourceMetadataJson;
+            }
+            auto emittedSidecars = std::make_shared<std::atomic_bool>(false);
+            if (!m_gpuEncodeCpuFallback.load(std::memory_order_acquire)) {
+                submittedGpuEncode = m_gpuEncodePump->submit(
+                    m_latestGpuFrame, m_latestGpuFenceValue, m_internalFrameCount,
+                    m_latestGpuFrame.metadata().color,
+                    makeMuxerWriteCallback(
+                        track, st, nullptr,
+                        [this, startTimecodeCandidate] {
+                            if (!startTimecodeCandidate.isEmpty())
+                                m_muxer->setStartTimecodeCandidate(startTimecodeCandidate);
+                        },
+                        [this, track, streamTimeMs, sourceTimecode100ns, sessionFrameIndex,
+                         metaJson, emittedSidecars](bool written) {
+                            if (!written) {
+                                latchGpuEncodeCpuFallback();
+                                return;
+                            }
+                            if (emittedSidecars->exchange(true, std::memory_order_acq_rel)) return;
+                            if (sourceTimecode100ns >= 0) {
+                                emit frameTimecode(m_sourceIndex, sourceTimecode100ns,
+                                                   sessionFrameIndex);
+                                int64_t expected = sourceTimecode100ns;
+                                m_latestGpuFrameTimecode100ns.compare_exchange_strong(
+                                    expected, -1, std::memory_order_acq_rel);
+                            }
+                            if (!metaJson.isEmpty())
+                                m_muxer->writeMetadataPacket(track, streamTimeMs, metaJson);
+                        }),
+                    [this] { latchGpuEncodeCpuFallback(); });
+                if (!submittedGpuEncode) latchGpuEncodeCpuFallback();
+            }
+        }
+#endif
+
+        if (!submittedGpuEncode && hasCpuLatest && m_videoCodec == VideoCodecChoice::H264Hardware &&
+            m_nativeEncoder) {
             // H.264 native-encode path: encode via NativeVideoEncoder and write
             // each output packet directly.
             AVStream* st = m_muxer->getStream(track);
             QString encErr;
-            m_nativeEncoder->encode(
-                m_latestFrame, m_internalFrameCount,
-                [&](const QByteArray& data, int64_t ptsTicks, bool keyframe) {
-                    AVPacket* pkt = av_packet_alloc();
-                    if (!pkt) return;
-                    if (av_new_packet(pkt, static_cast<int>(data.size())) < 0) {
-                        av_packet_free(&pkt);
-                        return;
-                    }
-                    memcpy(pkt->data, data.constData(), data.size());
-                    pkt->stream_index = track;
-                    if (st) {
-                        pkt->pts = pkt->dts = av_rescale_q(
-                            ptsTicks, AVRational{1, m_targetFps}, st->time_base);
-                        pkt->duration = av_rescale_q(
-                            1, AVRational{1, m_targetFps}, st->time_base);
-                        if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
-                        m_muxer->writePacket(pkt);
-                        havePacket = true;
-                    }
-                    av_packet_free(&pkt);
-                },
-                &encErr);
-        } else if (encCtx) {
+            std::lock_guard<std::mutex> encoderLock(m_nativeEncodeMutex);
+            m_nativeEncoder->encode(m_latestFrame, m_internalFrameCount,
+                                    makeMuxerWriteCallback(track, st, &havePacket), &encErr);
+        } else if (!submittedGpuEncode && hasCpuLatest && encCtx) {
             // MPEG-2 software-encode path (unchanged).
             // Set PTS on the FRAME, not the packet (avcodec_receive_packet
             // overwrites the packet entirely).
@@ -303,12 +538,14 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         // keyed by the session frame index it was muxed on. Purely additive: only
         // when the frame actually carried a valid TC (>= 0), so sources without TC
         // never emit and behavior is unchanged when TC is absent.
-        if (m_latestFrameTimecode100ns >= 0) {
-            emit frameTimecode(m_sourceIndex, m_latestFrameTimecode100ns, m_internalFrameCount);
+        const int64_t emittedTimecode100ns =
+            m_latestFrameTimecode100ns.load(std::memory_order_acquire);
+        if (emittedTimecode100ns >= 0) {
+            emit frameTimecode(m_sourceIndex, emittedTimecode100ns, m_internalFrameCount);
             // One-shot: a TC belongs to a single fresh frame. Clear it so a held /
             // repeat CFR tick (which re-muxes m_latestFrame without a new pull) does
             // not re-emit the same TC paired with a different session frame index.
-            m_latestFrameTimecode100ns = -1;
+            m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
         }
 
         // Write the per-frame source metadata to the paired subtitle track
@@ -376,14 +613,26 @@ void StreamWorker::captureLoop() {
         callbacks.logInfo = [this](const QString& message) {
             qDebug() << "Source" << m_sourceIndex << message;
         };
+#if defined(OLR_GPU_PIPELINE_BUILD)
+        callbacks.preferGpuVideoFrames = preferGpuVideoFramesForIngest();
+        callbacks.shouldPreferGpuVideoFrames = [this]() { return preferGpuVideoFramesForIngest(); };
+        callbacks.importGpuVideoFrame = [this](void* nativeDecodedImage,
+                                               const FrameMetadata& metadata) {
+            return importGpuVideoFrameForEncode(nativeDecodedImage, metadata);
+        };
+#endif
         callbacks.onVideoFrame = [this](DecodedVideoFrame decoded) {
+#if defined(OLR_GPU_PIPELINE_BUILD)
+            if (!decoded.frame && decoded.gpuFrame.isNull()) return;
+#else
             if (!decoded.frame) return;
+#endif
 
             // Bug 4: a restart/blue-paint is pending (source was cleared to an
             // empty URL). Drop frames from the old source so a late straggler
             // can't overwrite the painted blue frame.
             if (m_suppressEnqueue.load(std::memory_order_relaxed)) {
-                av_frame_free(&decoded.frame);
+                if (decoded.frame) av_frame_free(&decoded.frame);
                 return;
             }
 
@@ -391,6 +640,10 @@ void StreamWorker::captureLoop() {
             qf.frame = decoded.frame;
             qf.sourcePts = decoded.sourcePtsMs;
             qf.sourceTimecode100ns = decoded.sourceTimecode100ns;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+            qf.gpuFrame = decoded.gpuFrame;
+            qf.gpuFenceValue = decoded.gpuFenceValue;
+#endif
 
             QMutexLocker locker(&m_frameMutex);
             m_frameQueue.enqueue(qf);
@@ -416,9 +669,13 @@ void StreamWorker::captureLoop() {
             }
         };
         callbacks.onAudioChunk = [this](DecodedAudioChunk chunk) {
+            const qsizetype sampleCount = chunk.pcmS16Stereo.size() / kAudioBytesPerSample;
+            if (sampleCount > std::numeric_limits<int>::max()) {
+                return;
+            }
             enqueueAudio(chunk.startSample,
                          reinterpret_cast<const uint8_t*>(chunk.pcmS16Stereo.constData()),
-                         static_cast<int>(chunk.pcmS16Stereo.size() / kAudioBytesPerSample));
+                         static_cast<int>(sampleCount));
         };
         callbacks.setConnected = [this](bool connected) { setConnected(connected); };
         callbacks.reportStats = [this](const IngestStats& stats) {
@@ -562,16 +819,27 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
                        << "H.264 hardware encoder unavailable (hardware-only):" << err;
             return false;
         }
+#if defined(OLR_GPU_PIPELINE_BUILD)
+        if (gpuPipelineEnabled()) {
+            ensureGpuEncodePumpStarted();
+        }
+#endif
         // Allocate the reusable frame buffer (same as MPEG-2 path).
         m_latestFrame = av_frame_alloc();
         if (!m_latestFrame) return false;
         m_latestFrame->format = AV_PIX_FMT_YUV420P;
-        m_latestFrame->width  = m_targetWidth;
+        m_latestFrame->width = m_targetWidth;
         m_latestFrame->height = m_targetHeight;
-        if (av_frame_get_buffer(m_latestFrame, 0) < 0) { av_frame_free(&m_latestFrame); return false; }
-        memset(m_latestFrame->data[0], 128, m_latestFrame->linesize[0] * m_latestFrame->height);
-        memset(m_latestFrame->data[1], 128, m_latestFrame->linesize[1] * (m_latestFrame->height / 2));
-        memset(m_latestFrame->data[2], 128, m_latestFrame->linesize[2] * (m_latestFrame->height / 2));
+        if (av_frame_get_buffer(m_latestFrame, 0) < 0) {
+            av_frame_free(&m_latestFrame);
+            return false;
+        }
+        memset(m_latestFrame->data[0], 128,
+               static_cast<size_t>(m_latestFrame->linesize[0]) * m_latestFrame->height);
+        memset(m_latestFrame->data[1], 128,
+               static_cast<size_t>(m_latestFrame->linesize[1]) * (m_latestFrame->height / 2));
+        memset(m_latestFrame->data[2], 128,
+               static_cast<size_t>(m_latestFrame->linesize[2]) * (m_latestFrame->height / 2));
         // Leave *encCtx null — H.264 path uses m_nativeEncoder.
         return true;
     }
@@ -711,7 +979,7 @@ void StreamWorker::enqueueAudio(int64_t startSample, const uint8_t* data, int nu
     // Cap the FIFO at ~10 s
     const int maxBytes = kAudioSampleRate * 10 * kAudioBytesPerSample;
     if (m_audioFifo.size() > maxBytes) {
-        const int excess = static_cast<int>(m_audioFifo.size() - maxBytes);
+        const qsizetype excess = m_audioFifo.size() - maxBytes;
         m_audioFifo.remove(0, excess);
         m_audioFifoStartSample += excess / kAudioBytesPerSample;
     }
@@ -757,7 +1025,7 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
     // Catch up at most 1 s per tick: the track stays contiguous, a large
     // backlog (stalled event loop) just drains over several ticks.
     const int64_t n = qMin<int64_t>(targetEnd - m_audioWriteCursor, kAudioSampleRate);
-    const int64_t start = m_audioWriteCursor;                     // file timeline
+    const int64_t start = m_audioWriteCursor;                            // file timeline
     const int64_t nominalSrcStart = start - jitterSamples - trimSamples; // source timeline
     if (m_audioSourceCursor < 0 || m_audioServoTrimSamples != trimSamples ||
         m_audioServoJitterSamples != jitterSamples) {
@@ -800,8 +1068,9 @@ void StreamWorker::writeAudioForTick(int64_t recordingTimeMs, int track, int64_t
 
     AVPacket* pkt = av_packet_alloc();
     if (!pkt) return;
-    if (av_new_packet(pkt, static_cast<int>(chunk.size())) == 0) {
-        memcpy(pkt->data, chunk.constData(), size_t(chunk.size()));
+    if (chunk.size() <= std::numeric_limits<int>::max() &&
+        av_new_packet(pkt, static_cast<int>(chunk.size())) == 0) {
+        memcpy(pkt->data, chunk.constData(), static_cast<size_t>(chunk.size()));
         pkt->stream_index = audioTrackIdx;
         pkt->pts = av_rescale_q(start, {1, kAudioSampleRate}, st->time_base);
         pkt->dts = pkt->pts;

@@ -1,6 +1,8 @@
 #ifndef NATIVEVIDEOENCODER_H
 #define NATIVEVIDEOENCODER_H
 
+#include "playback/output/colormetadata.h"
+
 #include <QByteArray>
 #include <QString>
 
@@ -12,6 +14,8 @@ extern "C" {
 struct AVFrame;
 }
 
+class GpuSurface;
+
 struct NativeVideoEncodeCapabilities {
     bool h264 = false;
     QString detail;
@@ -20,11 +24,18 @@ struct NativeVideoEncodeCapabilities {
 class NativeVideoEncoder {
 public:
     struct Config {
+        Config() = default;
+        Config(int width_, int height_, int fpsNum_ = 30, int fpsDen_ = 1,
+               int bitrate_ = 30'000'000, ColorMetadata color_ = {})
+            : width(width_), height(height_), fpsNum(fpsNum_), fpsDen(fpsDen_), bitrate(bitrate_),
+              color(color_) {}
+
         int width = 0;
         int height = 0;
         int fpsNum = 30;
         int fpsDen = 1;
         int bitrate = 30'000'000;
+        ColorMetadata color;
     };
     using PacketCallback =
         std::function<void(const QByteArray& data, int64_t ptsTicks, bool keyframe)>;
@@ -40,8 +51,13 @@ public:
 
     // Encode one CPU YUV420P frame (all-intra → one keyframe packet),
     // synchronously draining output to onPacket. ptsTicks is opaque (echoed).
-    virtual bool encode(const AVFrame* frame, int64_t ptsTicks,
-                        const PacketCallback& onPacket, QString* error) = 0;
+    virtual bool encode(const AVFrame* frame, int64_t ptsTicks, const PacketCallback& onPacket,
+                        QString* error) = 0;
+    // Encode one GPU-resident NV12 surface without a CPU re-upload. The caller
+    // must fence the surface before calling; this synchronous API completes VT/MF
+    // frame submission before returning.
+    virtual bool encodeSurface(GpuSurface* surface, int64_t ptsTicks, const ColorMetadata& color,
+                               const PacketCallback& onPacket, QString* error) = 0;
     virtual bool flush(const PacketCallback& onPacket, QString* error) = 0;
     // Returns the avcC (AVCDecoderConfigurationRecord) blob for the current
     // encoding session. PRECONDITION: at least one successful encode() call must
