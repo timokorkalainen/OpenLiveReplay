@@ -2070,8 +2070,13 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                         m_stagingCache = std::move(m_outputCache); // staging back
                         m_outputCache = std::move(liveSaved); // live restored (old frames intact)
 #ifdef OLR_GPU_PIPELINE_BUILD
-                        sanitizeCacheForDeviceLossLocked(m_outputCache.get());
-                        sanitizeCacheForDeviceLossLocked(m_stagingCache.get());
+                        // Only strip GPU-backed frames when the device is actually lost:
+                        // otherwise the freshly decoded seek-prefetch window (pure GPU, not
+                        // yet read back to CPU) would be deleted here on every healthy seek.
+                        if (gpuDeviceLossPending()) {
+                            sanitizeCacheForDeviceLossLocked(m_outputCache.get());
+                            sanitizeCacheForDeviceLossLocked(m_stagingCache.get());
+                        }
 #endif
                         OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
                         m_outputCache->mergeFrom(
