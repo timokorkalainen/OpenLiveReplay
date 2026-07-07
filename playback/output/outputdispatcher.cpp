@@ -306,11 +306,13 @@ void OutputDispatcher::countTargetAttempt(const OutputTargetAssignment& assignme
     stats.lastSubmitSucceeded = submitted;
     if (frame.video.metadata().key.isPlaceholder) stats.placeholderFrames++;
     if (isSilentAudio(frame.audio)) stats.silentAudioFrames++;
-    if (stats.hasLastIdentity && stats.lastIdentity.samePayloadAs(frame.identity)) {
-        stats.repeatedPayloadFrames++;
+    if (submitted) {
+        if (stats.hasLastIdentity && stats.lastIdentity.samePayloadAs(frame.identity)) {
+            stats.repeatedPayloadFrames++;
+        }
+        stats.lastIdentity = frame.identity;
+        stats.hasLastIdentity = true;
     }
-    stats.lastIdentity = frame.identity;
-    stats.hasLastIdentity = true;
 }
 
 void OutputDispatcher::collectReadbackStats(OutputDispatchStats& stats) const {

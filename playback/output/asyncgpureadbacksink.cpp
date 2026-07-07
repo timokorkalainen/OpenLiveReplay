@@ -51,6 +51,7 @@ bool AsyncGpuReadbackSink::start(const OutputTargetAssignment& assignment, Frame
         m_stopRequested.store(false, std::memory_order_release);
         m_active.store(true, std::memory_order_release);
         m_readbackEnabled.store(readbackEnabled, std::memory_order_release);
+        m_needsReadbackCadence.store(false, std::memory_order_release);
         m_cancelReadbacks.store(false, std::memory_order_release);
         ++m_epoch;
     }
@@ -69,6 +70,7 @@ void AsyncGpuReadbackSink::stop() {
         m_active.store(false, std::memory_order_release);
         m_stopRequested.store(true, std::memory_order_release);
         m_readbackEnabled.store(false, std::memory_order_release);
+        m_needsReadbackCadence.store(false, std::memory_order_release);
         m_cancelReadbacks.store(true, std::memory_order_release);
         clearPendingReadbacksLocked();
         m_wake.notify_all();
@@ -87,6 +89,13 @@ bool AsyncGpuReadbackSink::isActive() const {
     std::lock_guard<std::mutex> innerLocker(m_innerMutex);
     return m_active.load(std::memory_order_acquire) &&
            !m_stopRequested.load(std::memory_order_acquire) && m_inner && m_inner->isActive();
+}
+
+bool AsyncGpuReadbackSink::needsContinuousCadence() const {
+    if (m_capability == SinkGpuCapability::NeedsContinuousCadence) return true;
+    if (m_inner && m_inner->needsContinuousCadence()) return true;
+    return m_readbackEnabled.load(std::memory_order_acquire) &&
+           m_needsReadbackCadence.load(std::memory_order_acquire);
 }
 
 bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
@@ -109,6 +118,7 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
                 m_hasLastIdentity = false;
                 m_hasGpuGeneration = false;
                 m_lastGpuGeneration = 0;
+                m_needsReadbackCadence.store(false, std::memory_order_release);
             }
         }
         bool ok = false;
@@ -141,6 +151,8 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
             return false;
 
         const uint64_t gpuGeneration = frame.video.metadata().gpuGeneration;
+        if (!m_hasLastIdentity || !m_lastIdentity.samePayloadAs(frame.identity))
+            m_needsReadbackCadence.store(true, std::memory_order_release);
         if (gpuGeneration != 0) {
             if (m_hasGpuGeneration && m_lastGpuGeneration != gpuGeneration) {
                 m_generationDrops += m_ring.drops() + m_ring.occupancy() + m_jobs.size() +
@@ -148,6 +160,7 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
                 clearPendingReadbacksLocked();
                 m_hasLastDelivered = false;
                 m_hasLastIdentity = false;
+                m_needsReadbackCadence.store(true, std::memory_order_release);
             }
             m_lastGpuGeneration = gpuGeneration;
             m_hasGpuGeneration = true;
@@ -321,6 +334,7 @@ void AsyncGpuReadbackSink::rememberDeliveredLocked(const OutputBusFrame& frame) 
     m_hasLastDelivered = true;
     m_lastIdentity = frame.identity;
     m_hasLastIdentity = true;
+    m_needsReadbackCadence.store(false, std::memory_order_release);
 }
 
 void AsyncGpuReadbackSink::clearPendingReadbacksLocked() {

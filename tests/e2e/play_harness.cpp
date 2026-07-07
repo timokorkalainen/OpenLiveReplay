@@ -33,15 +33,18 @@
 // OLR_PB_TELEMETRY is set in the environment (passed through transparently).
 //
 // usage: play_harness <file.mkv> <scenario> [viewCount]
-//   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | liveedge | seekflash |
-//              farback | armedcut | armedcut-back | armedcut-seekrace | armedcut-rearm-seek |
-//              playlist | gpucapstress | gpubudget | devicelost | armedcut-h264 |
-//              armedcut-h264-back
+//   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | frameoracle |
+//              liveedge | seekflash | farback | armedcut | armedcut-back |
+//              armedcut-seekrace | armedcut-rearm-seek | playlist | gpucapstress |
+//              gpubudget | devicelost | armedcut-h264 | armedcut-h264-back
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QHash>
+#include <QImage>
 #include <QTimer>
 #include <QList>
+#include <QStringList>
+#include <QVector>
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
@@ -66,6 +69,8 @@
 
 namespace {
 constexpr int kFrameDurMs = 33; // ~30fps step granularity
+constexpr int kMarkerCellPx = 8;
+constexpr int kMarkerCounterBits = 24;
 
 struct DeviceLossProbe {
     qint64 injectionMs = -1;
@@ -87,6 +92,97 @@ struct DeviceLossProbe {
     uint64_t generationBefore = 0;
     bool generationAdvanced = false;
 };
+
+struct FrameOracleOp {
+    QString label;
+    qint64 absoluteFrame = -1;
+    int deltaFrames = 0;
+};
+
+struct FrameOracleExpectation {
+    qint64 frameIndex = 0;
+    qint64 ptsMs = 0;
+};
+
+qint64 decodeVisualMarkerIndex(const QImage& image) {
+    if (image.isNull()) return -1;
+    if (image.width() < kMarkerCounterBits * kMarkerCellPx || image.height() < kMarkerCellPx)
+        return -1;
+
+    quint32 index = 0;
+    for (int bit = 0; bit < kMarkerCounterBits; ++bit) {
+        const int x = qMin(image.width() - 1, bit * kMarkerCellPx + kMarkerCellPx / 2);
+        const int y = qMin(image.height() - 1, kMarkerCellPx / 2);
+        index = (index << 1) | (qGray(image.pixel(x, y)) > 128 ? 1u : 0u);
+    }
+    return qint64(index);
+}
+
+QVector<FrameOracleOp> buildFrameOracleOps() {
+    QVector<FrameOracleOp> ops;
+    ops.append({QStringLiteral("prime"), 360, 0});
+
+    for (int i = 0; i < 24; ++i)
+        ops.append({QStringLiteral("jog-back-1"), -1, -1});
+    for (int i = 0; i < 24; ++i)
+        ops.append({QStringLiteral("jog-forward-1"), -1, 1});
+
+    const int pattern[] = {-1, 1, -2, 3, -4, 4, -1, -1, 2, -3, 5, -5, 1, 1, -2, 2};
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        for (int delta : pattern) {
+            ops.append({QStringLiteral("jog-pattern"), -1, delta});
+        }
+    }
+
+    const qint64 jumps[] = {90, 540, 120, 475, 121, 474, 300, 299, 301, 60, 510, 240};
+    for (qint64 frame : jumps)
+        ops.append({QStringLiteral("absolute-scrub"), frame, 0});
+
+    return ops;
+}
+
+bool frameOracleMatches(const QList<FrameProvider*>& providers, const OutputDispatchStats& stats,
+                        const FrameOracleExpectation& expected, bool checkVisual, QString* detail) {
+    QStringList parts;
+    bool ok = true;
+    for (int feed = 0; feed < providers.size(); ++feed) {
+        const QString targetId = QStringLiteral("qt-preview-feed-%1").arg(feed);
+        const auto it = stats.targets.constFind(targetId);
+        if (it == stats.targets.cend()) {
+            parts << QStringLiteral("feed%1:missingTarget").arg(feed);
+            ok = false;
+            continue;
+        }
+        if (!it->hasLastIdentity) {
+            parts << QStringLiteral("feed%1:missingIdentity").arg(feed);
+            ok = false;
+            continue;
+        }
+
+        const OutputFrameIdentity identity = it->lastIdentity;
+        const bool metaOk = identity.bus.kind == OutputBusKind::Feed &&
+                            identity.bus.index == feed && identity.sourceFeedIndex == feed &&
+                            !identity.videoPlaceholder && identity.sourcePtsMs == expected.ptsMs;
+
+        qint64 visualIndex = -1;
+        bool visualOk = true;
+        if (checkVisual) {
+            visualIndex = decodeVisualMarkerIndex(providers.at(feed)->latestImage());
+            visualOk = visualIndex == expected.frameIndex;
+        }
+
+        parts << QStringLiteral("feed%1{pts=%2 visual=%3 out=%4 decoded=%5 placeholder=%6}")
+                     .arg(feed)
+                     .arg(identity.sourcePtsMs)
+                     .arg(visualIndex)
+                     .arg(identity.outputFrameIndex)
+                     .arg(identity.sourceDecodedSequence)
+                     .arg(identity.videoPlaceholder ? 1 : 0);
+        if (!metaOk || !visualOk) ok = false;
+    }
+    if (detail) *detail = parts.join(QLatin1Char(' '));
+    return ok;
+}
 
 #ifdef OLR_GPU_PIPELINE_BUILD
 QHash<QString, OutputFrameIdentity> activeVideoOutputIdentities(const OutputDispatchStats& stats) {
@@ -204,6 +300,10 @@ int main(int argc, char** argv) {
     PlaybackWorker worker(providers, &transport, &audio);
     worker.openFile(file);
     worker.setActiveAudioView(0); // route audio for view 0
+    if (scen == "frameoracle") {
+        worker.setSelectedOutputFeed(0);
+        worker.setRequireAllOutputFeedsForPlayhead(true);
+    }
     // Tier (b): enable a real NDI output when requested, so the worker's
     // decode->cache->output-bus->NdiOutputSink path is exercised end to end. The output bus is
     // selectable via OLR_NDI_OUTPUT_BUS (feed|pgm|multiview, default feed) so each broadcast
@@ -259,6 +359,7 @@ int main(int argc, char** argv) {
     auto* cutLandingSamples = new int(0);
     auto* baseSubmitted = new qint64(-1);
     auto* deviceLoss = new DeviceLossProbe();
+    auto* exitCode = new int(0);
     QElapsedTimer scenarioClock;
     scenarioClock.start();
     // armNextCut return value for armedcut-h264: 1 = armed (pre-roll bank accepted
@@ -267,8 +368,8 @@ int main(int argc, char** argv) {
     int armNextCutArmed = -1;
 
     // Print the final counters in a parseable form, then quit.
-    auto finish = [&, basePh, baseHeld, maxLandErr, cutLandingSamples, baseSubmitted,
-                   deviceLoss]() {
+    auto finish = [&, basePh, baseHeld, maxLandErr, cutLandingSamples, baseSubmitted, deviceLoss,
+                   exitCode]() {
         // Read the output stats BEFORE stop(): the worker's run() tears down the
         // OutputRuntime on exit (shutdownOutputGraph nulls m_outputRuntime), so a
         // post-stop outputStats() would return a zeroed struct (delta would go
@@ -338,7 +439,7 @@ int main(int argc, char** argv) {
                (long long) deviceLoss->firstFreshOutputDelayMs,
                deviceLoss->outputPtsAdvanced ? 1 : 0, deviceLoss->generationAdvanced ? 1 : 0);
         fflush(stdout);
-        app.quit();
+        app.exit(*exitCode);
     };
 
     // Scenario kickoff at t=1500ms: the worker's run() has an open/retry loop
@@ -396,6 +497,127 @@ int main(int argc, char** argv) {
                 (*n)++;
             });
             t->start(150);
+
+        } else if (scen == "frameoracle") {
+            // Frame-perfect paused scrub/jog oracle. The input fixture is the marker MKV
+            // generated by run_frame_oracle_e2e.sh: each video frame carries a visible
+            // block-coded frame number and exact floor(N*1000/30) PTS. For each operator
+            // action, require EVERY feed preview target to report matching source metadata
+            // and matching delivered pixels before advancing to the next action.
+            transport.setPlaying(false);
+            transport.setSpeed(1.0);
+            worker.setRequireAllOutputFeedsForPlayhead(true);
+
+            const QByteArray visualEnv = qgetenv("OLR_FRAME_ORACLE_VISUAL").trimmed().toLower();
+            const bool checkVisual =
+                visualEnv.isEmpty() || !(visualEnv == "0" || visualEnv == "false" ||
+                                         visualEnv == "off" || visualEnv == "no");
+            const QVector<FrameOracleOp> ops = buildFrameOracleOps();
+            auto* opIndex = new int(0);
+            auto* currentFrame = new qint64(0);
+            auto* waiting = new bool(false);
+            auto* stablePolls = new int(0);
+            auto* issuedAtMs = new qint64(0);
+            auto* expected = new FrameOracleExpectation();
+            auto* timer = new QTimer(&app);
+            timer->setInterval(10);
+            timer->setTimerType(Qt::PreciseTimer);
+
+            QObject::connect(
+                timer, &QTimer::timeout, &app,
+                [&, opIndex, currentFrame, waiting, stablePolls, issuedAtMs, expected, timer, ops,
+                 checkVisual, exitCode]() {
+                    const qint64 now = scenarioClock.elapsed();
+                    if (*opIndex >= ops.size()) {
+                        timer->stop();
+                        printf("FRAME_ORACLE_PASS steps=%d views=%d visual=%d\n", int(ops.size()),
+                               views, checkVisual ? 1 : 0);
+                        fflush(stdout);
+                        finish();
+                        return;
+                    }
+
+                    const FrameRate rate = transport.frameRate();
+                    if (!rate.isValid()) {
+                        *exitCode = 1;
+                        fprintf(stderr, "FRAME_ORACLE_FAIL invalid frame rate\n");
+                        timer->stop();
+                        finish();
+                        return;
+                    }
+
+                    if (!*waiting) {
+                        const FrameOracleOp op = ops.at(*opIndex);
+                        const qint64 beforeFrame = *currentFrame;
+                        const qint64 beforeMs = transport.currentPos();
+                        int direction = 0;
+                        if (op.absoluteFrame >= 0) {
+                            *currentFrame = op.absoluteFrame;
+                            expected->ptsMs = rate.frameIndexToMs(*currentFrame);
+                            direction = expected->ptsMs > beforeMs
+                                            ? 1
+                                            : (expected->ptsMs < beforeMs ? -1 : 0);
+                            transport.seek(expected->ptsMs);
+                        } else {
+                            *currentFrame = qMax<qint64>(0, *currentFrame + op.deltaFrames);
+                            direction = op.deltaFrames;
+                            transport.step(op.deltaFrames);
+                            expected->ptsMs = rate.frameIndexToMs(*currentFrame);
+                        }
+                        expected->frameIndex = *currentFrame;
+                        const qint64 actualTransportMs = transport.currentPos();
+                        worker.seekTo(actualTransportMs, direction);
+                        *issuedAtMs = now;
+                        *stablePolls = 0;
+                        *waiting = true;
+                        fprintf(stderr,
+                                "FRAME_ORACLE_ISSUE step=%d action=%s beforeFrame=%lld "
+                                "targetFrame=%lld expectedPts=%lld transportMs=%lld "
+                                "direction=%d\n",
+                                *opIndex, qPrintable(op.label), (long long) beforeFrame,
+                                (long long) expected->frameIndex, (long long) expected->ptsMs,
+                                (long long) actualTransportMs, direction);
+                        if (actualTransportMs != expected->ptsMs) {
+                            fprintf(stderr,
+                                    "FRAME_ORACLE_TRANSPORT_MISMATCH step=%d "
+                                    "expectedPts=%lld transportMs=%lld\n",
+                                    *opIndex, (long long) expected->ptsMs,
+                                    (long long) actualTransportMs);
+                        }
+                        return;
+                    }
+
+                    const OutputDispatchStats stats = worker.outputStats();
+                    QString detail;
+                    if (frameOracleMatches(providers, stats, *expected, checkVisual, &detail)) {
+                        ++(*stablePolls);
+                        if (*stablePolls >= 2) {
+                            fprintf(stderr,
+                                    "FRAME_ORACLE_OK step=%d targetFrame=%lld "
+                                    "expectedPts=%lld settledMs=%lld %s\n",
+                                    *opIndex, (long long) expected->frameIndex,
+                                    (long long) expected->ptsMs, (long long) (now - *issuedAtMs),
+                                    qPrintable(detail));
+                            *waiting = false;
+                            ++(*opIndex);
+                        }
+                        return;
+                    }
+
+                    *stablePolls = 0;
+                    if (now - *issuedAtMs > 5000) {
+                        *exitCode = 1;
+                        fprintf(stderr,
+                                "FRAME_ORACLE_FAIL step=%d targetFrame=%lld "
+                                "expectedPts=%lld elapsedMs=%lld %s\n",
+                                *opIndex, (long long) expected->frameIndex,
+                                (long long) expected->ptsMs, (long long) (now - *issuedAtMs),
+                                qPrintable(detail));
+                        timer->stop();
+                        finish();
+                    }
+                });
+            timer->start();
 
         } else if (scen == "sliderscrub") {
             // The slider path post-§7: the UI calls BOTH transport.seek() and

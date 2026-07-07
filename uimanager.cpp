@@ -799,7 +799,7 @@ void UIManager::jogStep(int delta) {
     }
 
     if (m_playbackWorker) {
-        m_playbackWorker->seekTo(m_transport->currentPos());
+        m_playbackWorker->seekTo(m_transport->currentPos(), delta);
     }
 }
 
@@ -1717,7 +1717,7 @@ void UIManager::stepFrame() {
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->seekTo(targetMs);
+        m_playbackWorker->seekTo(targetMs, 1);
     }
 }
 
@@ -1729,7 +1729,7 @@ void UIManager::stepFrameBack() {
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->seekTo(targetMs);
+        m_playbackWorker->seekTo(targetMs, -1);
     }
 }
 
@@ -1763,6 +1763,7 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
     // Route audio for the selected track (or mute in multiview)
     if (m_playbackWorker) {
         m_playbackWorker->setSelectedOutputFeed(selectedIndex);
+        m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!singleView);
         m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
     }
     if (m_audioPlayer) {
@@ -1856,6 +1857,7 @@ void UIManager::startRecording() {
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
 
     // 2. Point it to the file being recorded
@@ -1882,6 +1884,7 @@ void UIManager::restartPlaybackWorker() {
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
@@ -1923,8 +1926,9 @@ void UIManager::seekPlayback(int64_t ms) {
     // Coalesce a burst of scrub targets: seek immediately on the first move of
     // a gesture, then commit only the latest target on a single-shot timer.
     if (m_seekCoalescer.offer(ms)) {
+        const int directionHint = m_transport && ms < m_transport->currentPos() ? -1 : 1;
         if (m_transport) m_transport->seek(ms);
-        if (m_playbackWorker) m_playbackWorker->seekTo(ms);
+        if (m_playbackWorker) m_playbackWorker->seekTo(ms, directionHint);
     } else {
         // A seek is already in flight; arm/refresh the coalesce timer. The
         // worker's own reposition handles audio re-priming (repositionTo clears
@@ -1937,8 +1941,9 @@ void UIManager::commitPendingScrub() {
     bool has = false;
     const int64_t ms = m_seekCoalescer.takePending(has);
     if (!has) return;
+    const int directionHint = m_transport && ms < m_transport->currentPos() ? -1 : 1;
     if (m_transport) m_transport->seek(ms);
-    if (m_playbackWorker) m_playbackWorker->seekTo(ms);
+    if (m_playbackWorker) m_playbackWorker->seekTo(ms, directionHint);
 }
 
 void UIManager::endScrubGesture() {

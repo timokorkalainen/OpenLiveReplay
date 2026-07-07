@@ -32,10 +32,7 @@ public:
     bool submit(const OutputBusFrame& frame) override;
     OutputSinkStatus outputStatus() const override;
     bool readbackStats(qint64& depth, qint64& drops) const override;
-    bool needsContinuousCadence() const override {
-        return m_capability == SinkGpuCapability::NeedsContinuousCadence ||
-               (m_inner && m_inner->needsContinuousCadence());
-    }
+    bool needsContinuousCadence() const override;
 
     int ringDepth() const { return m_ringDepth; }
     qint64 readbackDrops() const;
@@ -80,6 +77,7 @@ private:
     std::atomic_bool m_active{false};
     std::atomic_bool m_stopRequested{false};
     std::atomic_bool m_readbackEnabled{false};
+    std::atomic_bool m_needsReadbackCadence{false};
     bool m_readbackInFlight = false;
     std::atomic_bool m_cancelReadbacks{false};
 };

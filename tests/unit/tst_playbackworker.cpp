@@ -25,6 +25,9 @@ private slots:
     void buildsSinkForNewIoTargetKinds();
     void newIoTargetsShareGpuReadbackCache();
     void selectedFeedCoverageAdvancesPlayheadWhenOtherFeedMissing();
+    void pausedStepRequiresNearFrameCoverage();
+    void multiviewCoverageHoldsPlayheadWhenAnyFeedMissing();
+    void seekDirectionHintSurvivesUpdatedTransport();
 #ifdef OLR_GPU_PIPELINE_BUILD
     void gpuBudgetConfiguredFromOutputGraphGeometry();
     void gpuBudgetUsesCodecGeometryForDecodeSurfaces();
@@ -294,6 +297,84 @@ void TestPlaybackWorker::selectedFeedCoverageAdvancesPlayheadWhenOtherFeedMissin
     QCOMPARE(snapshot.state.selectedFeedIndex, 0);
     QCOMPARE(snapshot.state.playheadMs, qint64(1000));
     QVERIFY(!snapshot.state.forcePlayEpochReset);
+}
+
+void TestPlaybackWorker::pausedStepRequiresNearFrameCoverage() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    transport.seek(1000);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(500, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 900, 80));
+        worker.publishOutputCacheLocked();
+    }
+
+    const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
+    QCOMPARE(snapshot.state.playheadMs, qint64(500));
+    QVERIFY(snapshot.state.forcePlayEpochReset);
+}
+
+void TestPlaybackWorker::multiviewCoverageHoldsPlayheadWhenAnyFeedMissing() {
+    FrameProvider feed0;
+    FrameProvider feed1;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    transport.seek(1000);
+
+    PlaybackWorker worker({&feed0, &feed1}, &transport);
+    worker.m_outputFeedCount = 2;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_requireAllOutputFeedsForPlayhead.store(true, std::memory_order_release);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(500, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(2, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 80));
+        worker.publishOutputCacheLocked();
+    }
+
+    OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
+    QCOMPARE(snapshot.state.playheadMs, qint64(500));
+    QVERIFY(snapshot.state.forcePlayEpochReset);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(1, 1000, 120));
+        worker.publishOutputCacheLocked();
+    }
+
+    snapshot = worker.makeOutputSnapshot();
+    QCOMPARE(snapshot.state.playheadMs, qint64(1000));
+}
+
+void TestPlaybackWorker::seekDirectionHintSurvivesUpdatedTransport() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.seek(960);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.seekTo(960, -1);
+
+    QCOMPARE(worker.m_lastMoveDir.load(std::memory_order_relaxed), -1);
 }
 
 #ifdef OLR_GPU_PIPELINE_BUILD

@@ -129,7 +129,7 @@ public:
     ~PlaybackWorker();
 
     void openFile(const QString& filePath);
-    void seekTo(int64_t timestampMs);
+    void seekTo(int64_t timestampMs, int directionHint = 0);
     // Tier3 frame-perfect ARMED CUT: arm a scheduled atomic cut to targetMs.
     // UI-thread-safe (atomic stores only, never blocks). The worker pre-rolls
     // [target, target+kStagingSpanMs] into a private staging cache on a SECOND
@@ -157,6 +157,7 @@ public:
     void deliverDueFrames(int64_t P, int dir);
     void setActiveAudioView(int viewIndex);
     void setSelectedOutputFeed(int feedIndex);
+    void setRequireAllOutputFeedsForPlayhead(bool required);
     void setBusPreviewProviders(FrameProvider* multiviewProvider, FrameProvider* pgmProvider);
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
 #ifdef OLR_UNIT_TEST
@@ -344,8 +345,9 @@ private:
     AudioPlayer* m_audioPlayer = nullptr;
     std::atomic<int> m_activeAudioView{-1};
     std::atomic<int> m_selectedOutputFeed{-1};
+    std::atomic<bool> m_requireAllOutputFeedsForPlayhead{false};
 
-    AudioFrameQueue m_audioQueue;            // worker-thread-only
+    AudioFrameQueue m_audioQueue; // worker-thread-only
     ResidencyWindowParams m_residencyWindowParams;
     qint64 m_decodedVideoSequence = 0;       // worker-thread-only decoded frame identity
     std::atomic<bool> m_audioReprime{false}; // set by setActiveAudioView (UI thread)

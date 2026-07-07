@@ -275,6 +275,7 @@ endif()
 
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
 set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
+set(_frame_oracle_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_frame_oracle_e2e.sh")
 
 # Baseline happy path: stereo input. The driver bridges the ffmpeg producer over
 # UDP->SRT (srt-live-transmit) and records via the native srt:// ingest; the 3rd
@@ -434,15 +435,24 @@ add_test(NAME e2e_play_playlist
     COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist 2 23506)
 
+# Deterministic frame-perfect scrub/jog oracle: generates a marker MKV whose pixels
+# encode frame number N and whose PTS are exact floor(N*1000/30), then verifies paused
+# seek/step output for every feed by both metadata identity and delivered pixels.
+add_test(NAME e2e_play_frameoracle
+    COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2)
+
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
     e2e_play_seekflash e2e_play_farback e2e_play_armedcut e2e_play_armedcut_back
     e2e_play_armedcut_seekrace e2e_play_armedcut_rearm_seek e2e_play_playlist
+    e2e_play_frameoracle
     PROPERTIES
     LABELS "e2e"
     TIMEOUT 180
     RUN_SERIAL TRUE)
+set_tests_properties(e2e_play_frameoracle PROPERTIES SKIP_RETURN_CODE 77)
 
 # H.264 HW-gated playback gates (SKIP_RETURN_CODE 77 if HW encoder unavailable).
 # Ports 23506/23508/23510 (SRT) and their +1 UDP siblings are clear of all
@@ -492,6 +502,16 @@ if(OLR_GPU_PIPELINE)
     set_tests_properties(e2e_play_gpu_seekprefetch PROPERTIES
         LABELS "e2e;gpu;seek-prefetch"
         TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_frameoracle
+        COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2)
+    set_tests_properties(e2e_play_gpu_frameoracle PROPERTIES
+        LABELS "e2e;gpu;frame-oracle;async-readback"
+        TIMEOUT 240
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         ENVIRONMENT "OLR_GPU_PIPELINE=1")

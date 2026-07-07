@@ -149,6 +149,7 @@ private slots:
     void sameBusSinksShareOneReadback();
     void readbackTelemetryReachesDispatchStats();
     void continuousCadenceReadbackBypassesIdentitySkip();
+    void asyncReadbackBypassesIdentitySkipOnlyUntilDelivered();
 #endif
 };
 
@@ -415,10 +416,11 @@ void TestOutputDispatcher::targetStatsTrackRepeatedPayloadsAndFailuresIndependen
     QCOMPARE(failingStats.attemptedFrames, qint64(2));
     QCOMPARE(failingStats.framesSubmitted, qint64(0));
     QCOMPARE(failingStats.sinkFailures, qint64(2));
-    QCOMPARE(failingStats.repeatedPayloadFrames, qint64(1));
+    // Failed attempts are not delivered payloads. Do not update lastIdentity here:
+    // async readback sinks need future paused ticks to retry until pixels are delivered.
+    QCOMPARE(failingStats.repeatedPayloadFrames, qint64(0));
     QCOMPARE(failingStats.silentAudioFrames, qint64(2));
-    QVERIFY(failingStats.hasLastIdentity);
-    QCOMPARE(failingStats.lastIdentity.outputFrameIndex, qint64(1));
+    QVERIFY(!failingStats.hasLastIdentity);
 }
 
 void TestOutputDispatcher::identicalConsecutiveTicksSkipDuplicateSubmit() {
@@ -980,6 +982,51 @@ void TestOutputDispatcher::continuousCadenceReadbackBypassesIdentitySkip() {
     QCOMPARE(frames[0].outputFrameIndex, qint64(0));
     QCOMPARE(frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(stats.skippedDuplicateFrames, qint64(0));
+}
+
+void TestOutputDispatcher::asyncReadbackBypassesIdentitySkipOnlyUntilDelivered() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    auto gpuData = std::make_shared<TelemetryGpuFrameData>(92);
+    cache.insertVideoFrame(gpuVideo(0, 0, gpuData));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment ndi;
+    ndi.id = QStringLiteral("feed0-ndi");
+    ndi.sourceBus = OutputBusId::feed(0);
+    ndi.kind = OutputTargetKind::Ndi;
+    ndi.enabled = true;
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    auto inner = std::make_unique<CollectingSink>(OutputTargetKind::Ndi);
+    CollectingSink* observed = inner.get();
+    AsyncGpuReadbackSink ndiSink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                                 SinkGpuCapability::AsyncReadbackDedupOk, GpuFence::create(),
+                                 dispatcher.sharedGpuReadbacks());
+
+    dispatcher.setEndpoints({{ndi, &ndiSink}});
+    dispatcher.dispatchTick(cache, state);
+    dispatcher.dispatchTick(cache, state);
+    QCOMPARE(observed->framesSnapshot().size(), 0);
+    QCOMPARE(ndiSink.readbackQueueDepth(), qint64(2));
+
+    dispatcher.dispatchTick(cache, state);
+    QTRY_COMPARE_WITH_TIMEOUT(observed->framesSnapshot().size(), 1, 1000);
+    QTRY_COMPARE_WITH_TIMEOUT(ndiSink.readbackQueueDepth(), qint64(2), 1000);
+
+    const OutputDispatchStats stats = dispatcher.dispatchTick(cache, state);
+    dispatcher.setEndpoints({});
+
+    const QVector<OutputBusFrame> frames = observed->framesSnapshot();
+    QCOMPARE(frames.size(), 1);
+    QVERIFY(!frames.front().video.isGpuBacked());
+    QCOMPARE(gpuData->readCount(), 1);
+    QCOMPARE(stats.skippedDuplicateFrames, qint64(1));
 }
 #endif
 
