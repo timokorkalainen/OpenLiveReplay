@@ -34,7 +34,7 @@
 //
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | frameoracle |
-//              liveedge | seekflash | farback | armedcut | armedcut-back |
+//              liveedge | livegrow | seekflash | farback | armedcut | armedcut-back |
 //              armedcut-seekrace | armedcut-rearm-seek | playlist | gpucapstress |
 //              gpubudget | devicelost | armedcut-h264 | armedcut-h264-back
 #include <QCoreApplication>
@@ -179,6 +179,34 @@ bool frameOracleMatches(const QList<FrameProvider*>& providers, const OutputDisp
                      .arg(identity.sourceDecodedSequence)
                      .arg(identity.videoPlaceholder ? 1 : 0);
         if (!metaOk || !visualOk) ok = false;
+    }
+    if (detail) *detail = parts.join(QLatin1Char(' '));
+    return ok;
+}
+
+bool feedOutputsCoverPts(const QList<FrameProvider*>& providers, const OutputDispatchStats& stats,
+                         qint64 minPtsMs, QString* detail) {
+    QStringList parts;
+    bool ok = true;
+    for (int feed = 0; feed < providers.size(); ++feed) {
+        const QString targetId = QStringLiteral("qt-preview-feed-%1").arg(feed);
+        const auto it = stats.targets.constFind(targetId);
+        if (it == stats.targets.cend() || !it->hasLastIdentity) {
+            parts << QStringLiteral("feed%1:missingIdentity").arg(feed);
+            ok = false;
+            continue;
+        }
+        const OutputFrameIdentity identity = it->lastIdentity;
+        parts << QStringLiteral("feed%1{pts=%2 placeholder=%3 decoded=%4}")
+                     .arg(feed)
+                     .arg(identity.sourcePtsMs)
+                     .arg(identity.videoPlaceholder ? 1 : 0)
+                     .arg(identity.sourceDecodedSequence);
+        if (identity.bus.kind != OutputBusKind::Feed || identity.bus.index != feed ||
+            identity.sourceFeedIndex != feed || identity.videoPlaceholder ||
+            identity.sourcePtsMs < minPtsMs) {
+            ok = false;
+        }
     }
     if (detail) *detail = parts.join(QLatin1Char(' '));
     return ok;
@@ -664,6 +692,53 @@ int main(int argc, char** argv) {
             worker.seekTo(near);
             transport.setPlaying(true);
             QTimer::singleShot(6000, &app, finish);
+
+        } else if (scen == "livegrow") {
+            // Start on a deliberately-truncated, live-growing MKV. The driver appends
+            // the rest only after playback has hit EOF. Passing requires every preview
+            // feed to advance beyond the old tail after growth; holding blue/black
+            // filler at the live edge is a failure even if no gray placeholder is counted.
+            const qint64 minPts =
+                qMax<qint64>(0, qEnvironmentVariableIntValue("OLR_LIVEGROW_MIN_PTS_MS"));
+            transport.setSpeed(1.0);
+            transport.seek(0);
+            transport.setPlaying(true);
+
+            auto* stablePolls = new int(0);
+            const int configuredTimeoutMs = qEnvironmentVariableIntValue("OLR_LIVEGROW_TIMEOUT_MS");
+            const qint64 timeoutMs = configuredTimeoutMs > 0 ? configuredTimeoutMs : 12500;
+            auto* timer = new QTimer(&app);
+            timer->setInterval(50);
+            timer->setTimerType(Qt::PreciseTimer);
+            QObject::connect(
+                timer, &QTimer::timeout, &app, [&, stablePolls, timer, minPts, exitCode]() {
+                    const OutputDispatchStats stats = worker.outputStats();
+                    QString detail;
+                    if (scenarioClock.elapsed() > timeoutMs) {
+                        feedOutputsCoverPts(providers, stats, minPts, &detail);
+                        *exitCode = 1;
+                        fprintf(stderr, "LIVEGROW_FAIL minPts=%lld elapsedMs=%lld %s\n",
+                                (long long) minPts, (long long) scenarioClock.elapsed(),
+                                qPrintable(detail));
+                        timer->stop();
+                        finish();
+                        return;
+                    }
+                    if (feedOutputsCoverPts(providers, stats, minPts, &detail)) {
+                        ++(*stablePolls);
+                        if (*stablePolls >= 3) {
+                            fprintf(stderr, "LIVEGROW_PASS minPts=%lld elapsedMs=%lld %s\n",
+                                    (long long) minPts, (long long) scenarioClock.elapsed(),
+                                    qPrintable(detail));
+                            timer->stop();
+                            finish();
+                        }
+                        return;
+                    }
+
+                    *stablePolls = 0;
+                });
+            timer->start();
 
         } else if (scen == "seekflash") {
             // Prove a seek introduces NO NEW gray placeholder. A cold start emits
@@ -1205,6 +1280,7 @@ int main(int argc, char** argv) {
     // Hard safety net: never hang a CI job even if a scenario timer is dropped.
     QTimer::singleShot(40000, &app, [&]() {
         fprintf(stderr, "play_harness: safety timeout — forcing finish\n");
+        *exitCode = 1;
         finish();
     });
 

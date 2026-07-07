@@ -44,11 +44,30 @@ std::optional<FrameHandle> freshVideoFrameAt(const OutputFrameCache& cache, int 
     return cache.videoFrameAtFreshForGeneration(feedIndex, playheadMs, gpuGeneration);
 }
 
-FrameHandle freshVideoFrameOrPlaceholder(const OutputFrameCache& cache, int feedIndex,
-                                         qint64 playheadMs, int width, int height,
-                                         uint64_t gpuGeneration) {
+std::optional<FrameHandle> freshVideoFrameAtOrJustAhead(const OutputFrameCache& cache,
+                                                        int feedIndex, qint64 playheadMs,
+                                                        qint64 aheadToleranceMs,
+                                                        uint64_t gpuGeneration) {
     if (std::optional<FrameHandle> frame =
             freshVideoFrameAt(cache, feedIndex, playheadMs, gpuGeneration)) {
+        return frame;
+    }
+
+    std::optional<FrameHandle> next =
+        cache.firstFreshVideoFrameAtOrAfter(feedIndex, playheadMs, gpuGeneration);
+    if (!next.has_value() || next->metadata().key.isPlaceholder) return std::nullopt;
+
+    const qint64 delta = next->metadata().key.ptsMs - playheadMs;
+    if (delta < 0 || delta > qMax<qint64>(0, aheadToleranceMs)) return std::nullopt;
+    return next;
+}
+
+FrameHandle freshVideoFrameAtOrJustAheadOrPlaceholder(const OutputFrameCache& cache, int feedIndex,
+                                                      qint64 playheadMs, qint64 aheadToleranceMs,
+                                                      int width, int height,
+                                                      uint64_t gpuGeneration) {
+    if (std::optional<FrameHandle> frame = freshVideoFrameAtOrJustAhead(
+            cache, feedIndex, playheadMs, aheadToleranceMs, gpuGeneration)) {
         return *frame;
     }
     return placeholderVideoFrame(feedIndex, playheadMs, width, height);
@@ -170,13 +189,15 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     sourceKeys.reserve(static_cast<qsizetype>(m_feedCount) * 8);
     QVector<std::optional<FrameHandle>> sources;
     sources.reserve(m_feedCount);
+    const qint64 nearFutureToleranceMs =
+        qMax<qint64>(1, m_clock.frameRate().isValid() ? m_clock.frameRate().frameIndexToMs(1) : 40);
     qint64 sourcePtsMs = 0;
     uint64_t sourceGpuGeneration = 0;
     qint64 sourceDecodedSequence = 0;
     bool anySourcePresent = false;
     for (int feed = 0; feed < m_feedCount; ++feed) {
-        const std::optional<FrameHandle> src =
-            freshVideoFrameAt(cache, feed, out.sampledPlayheadMs, state.gpuGeneration);
+        const std::optional<FrameHandle> src = freshVideoFrameAtOrJustAhead(
+            cache, feed, out.sampledPlayheadMs, nearFutureToleranceMs, state.gpuGeneration);
         sources.append(src);
         const qint64 pts = src ? src->metadata().key.ptsMs : kAbsentFeedPts;
         const uint64_t generation = src ? src->metadata().gpuGeneration : uint64_t(0);
@@ -283,8 +304,11 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     out.programmeTimecode100ns = programmeTimecode100nsFor(out.sampledPlayheadMs);
 
     if (feedIndex >= 0 && feedIndex < m_feedCount) {
-        out.video = freshVideoFrameOrPlaceholder(cache, feedIndex, out.sampledPlayheadMs, m_width,
-                                                 m_height, state.gpuGeneration);
+        const qint64 nearFutureToleranceMs = qMax<qint64>(
+            1, m_clock.frameRate().isValid() ? m_clock.frameRate().frameIndexToMs(1) : 40);
+        out.video = freshVideoFrameAtOrJustAheadOrPlaceholder(
+            cache, feedIndex, out.sampledPlayheadMs, nearFutureToleranceMs, m_width, m_height,
+            state.gpuGeneration);
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (bus == OutputBusId::pgm() && m_gpuCompositor && m_gpuCompositor->isValid() &&
             gpuPipelineEnabled()) {

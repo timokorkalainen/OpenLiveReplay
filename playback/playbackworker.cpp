@@ -35,10 +35,10 @@
 #endif
 #endif
 #include <QDebug>
-#include <QMutexLocker>
 #include <QElapsedTimer>
-#include <cstdio>
+#include <QMutexLocker>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -286,6 +286,108 @@ void PlaybackWorker::emitTelemetry(int64_t P, int64_t newest, double speed) {
             m_counters.reposition, m_counters.reuseSeek, m_counters.reverseChunkSeek,
             m_counters.eofTailSeek, m_counters.skipForward, m_counters.audioPushes,
             m_counters.framesDropped, (long long) P, (long long) newest, speed);
+
+    if (!qEnvironmentVariableIsSet("OLR_PB_TELEMETRY_DETAIL")) return;
+
+    auto describeFrame = [](const FrameHandle& handle) {
+        if (handle.isNull()) return QStringLiteral("null");
+        const FrameMetadata meta = handle.metadata();
+        QString sample = QStringLiteral("noCpu");
+        const MediaVideoFrameView view(handle);
+        if (view.isValid()) {
+            const int y = uchar(view.planeY.at(0));
+            const int u = uchar(view.planeU.at(0));
+            const int v = uchar(view.planeV.at(0));
+            sample = QStringLiteral("yuv=%1,%2,%3").arg(y).arg(u).arg(v);
+        }
+        return QStringLiteral("feed=%1 pts=%2 ph=%3 gpu=%4 gen=%5 seq=%6 fmt=%7 %8")
+            .arg(meta.key.feedIndex)
+            .arg(meta.key.ptsMs)
+            .arg(meta.key.isPlaceholder ? 1 : 0)
+            .arg(handle.isGpuBacked() ? 1 : 0)
+            .arg(qulonglong(meta.gpuGeneration))
+            .arg(meta.decodedSequence)
+            .arg(int(meta.key.format))
+            .arg(sample);
+    };
+
+    struct FeedLine {
+        int feed = -1;
+        qint64 oldest = -1;
+        qint64 newest = -1;
+        qint64 delivered = -1;
+        int count = 0;
+        QString latest;
+        QString cacheAt;
+        QString cacheNext;
+    };
+
+    QVector<FeedLine> feeds;
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        const uint64_t gpuGeneration = GpuGenerationCounter::instance().current();
+#else
+        const uint64_t gpuGeneration = 0;
+#endif
+        feeds.reserve(m_decoderBank.size());
+        for (const DecoderTrack* track : m_decoderBank) {
+            if (!track) continue;
+            FeedLine line;
+            line.feed = track->feedIndex;
+            line.oldest = track->buffer.oldestPts();
+            line.newest = track->buffer.newestPts();
+            line.delivered = track->lastDeliveredPtsMs;
+            line.count = track->buffer.size();
+            const QVector<TrackBuffer::Frame> frames = track->buffer.framesSnapshot();
+            line.latest = frames.isEmpty() ? QStringLiteral("empty")
+                                           : describeFrame(frames.constLast().frame);
+            if (m_outputCache) {
+                const std::optional<FrameHandle> at =
+                    m_outputCache->videoFrameAtFreshForGeneration(line.feed, P, gpuGeneration);
+                const std::optional<FrameHandle> next =
+                    m_outputCache->firstFreshVideoFrameAtOrAfter(line.feed, P, gpuGeneration);
+                line.cacheAt = at.has_value() ? describeFrame(*at) : QStringLiteral("none");
+                line.cacheNext = next.has_value() ? describeFrame(*next) : QStringLiteral("none");
+            } else {
+                line.cacheAt = QStringLiteral("noOutputCache");
+                line.cacheNext = QStringLiteral("noOutputCache");
+            }
+            feeds.append(line);
+        }
+    }
+
+    for (const FeedLine& line : feeds) {
+        fprintf(stderr,
+                "FEED feed=%d P=%lld bufOld=%lld bufNew=%lld bufN=%d delivered=%lld "
+                "latest{%s} cacheAt{%s} cacheNext{%s}\n",
+                line.feed, (long long) P, (long long) line.oldest, (long long) line.newest,
+                line.count, (long long) line.delivered, qPrintable(line.latest),
+                qPrintable(line.cacheAt), qPrintable(line.cacheNext));
+    }
+
+    const OutputDispatchStats stats = outputStats();
+    for (auto it = stats.targets.constBegin(); it != stats.targets.constEnd(); ++it) {
+        const OutputTargetDispatchStats& target = it.value();
+        if (!target.hasLastIdentity) {
+            fprintf(stderr, "OUT target=%s frames=%lld placeholders=%lld held=%lld noIdentity\n",
+                    qPrintable(it.key()), (long long) target.framesSubmitted,
+                    (long long) target.placeholderFrames, (long long) stats.heldFrames);
+            continue;
+        }
+        const OutputFrameIdentity& id = target.lastIdentity;
+        fprintf(stderr,
+                "OUT target=%s frames=%lld placeholders=%lld repeated=%lld held=%lld bus=%d:%d "
+                "out=%lld sampled=%lld srcFeed=%d srcPts=%lld ph=%d gpuGen=%llu seq=%lld "
+                "vhash=%u\n",
+                qPrintable(it.key()), (long long) target.framesSubmitted,
+                (long long) target.placeholderFrames, (long long) target.repeatedPayloadFrames,
+                (long long) stats.heldFrames, int(id.bus.kind), id.bus.index,
+                (long long) id.outputFrameIndex, (long long) id.sampledPlayheadMs,
+                id.sourceFeedIndex, (long long) id.sourcePtsMs, id.videoPlaceholder ? 1 : 0,
+                (unsigned long long) id.videoGpuGeneration, (long long) id.sourceDecodedSequence,
+                id.videoHash);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +571,7 @@ void PlaybackWorker::clearDecoderBuffers(bool invalidateGpuGeneration) {
 bool PlaybackWorker::reuseAt(int64_t target) {
     // True iff the bank is non-empty AND every track has a decoded frame
     // within frameDurMs/2 of target, and the output cache covers the same target.
-    const int64_t tol = frameDurMs() / 2;
+    const int64_t tol = frameDurMs();
     QMutexLocker bufferLocker(&m_bufferMutex);
     if (m_decoderBank.isEmpty()) return false;
     for (auto* track : m_decoderBank) {
@@ -483,8 +585,15 @@ bool PlaybackWorker::reuseAt(int64_t target) {
         for (auto* track : m_decoderBank) {
             if (!track || track->feedIndex < 0 || track->feedIndex >= m_outputFeedCount)
                 return false;
-            if (!m_outputCache->hasFreshVideoFrameAtOrBeforeNear(track->feedIndex, target, tol,
-                                                                 gpuGeneration))
+            const std::optional<FrameHandle> prior = m_outputCache->videoFrameAtFreshForGeneration(
+                track->feedIndex, target, gpuGeneration);
+            if (prior.has_value() && !prior->metadata().key.isPlaceholder &&
+                target - prior->metadata().key.ptsMs <= tol)
+                continue;
+            const std::optional<FrameHandle> future = m_outputCache->firstFreshVideoFrameAtOrAfter(
+                track->feedIndex, target, gpuGeneration);
+            if (!future.has_value() || future->metadata().key.isPlaceholder ||
+                future->metadata().key.ptsMs - target > tol)
                 return false;
         }
     }
@@ -1531,7 +1640,7 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
         CommitGate::visiblePlayheadMs(transportPlayhead, committedPlayhead, committedGen, seekGen);
     if (committedGen == seekGen) {
         const qint64 bookmarkedPlayhead = m_lastVisiblePlayheadMs.load(std::memory_order_acquire);
-        const qint64 toleranceMs = qMax<qint64>(0, frameDurMs() / 2);
+        const qint64 toleranceMs = qMax<qint64>(1, frameDurMs());
         const bool preciseCoverage = !transportPlaying;
         const bool requireAllFeeds =
             m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire);
@@ -1542,12 +1651,19 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
             const std::optional<FrameHandle> cachedFrame =
                 snapshot.cache.videoFrameAtFreshForGeneration(feedIndex, snapshot.state.playheadMs,
                                                               snapshot.state.gpuGeneration);
-            if (!cachedFrame.has_value() || cachedFrame->metadata().key.isPlaceholder)
+            if (cachedFrame.has_value() && !cachedFrame->metadata().key.isPlaceholder) {
+                const qint64 ptsMs = cachedFrame->metadata().key.ptsMs;
+                if (!preciseCoverage || snapshot.state.playheadMs - ptsMs <= toleranceMs)
+                    return ptsMs;
+            }
+            const std::optional<FrameHandle> futureFrame =
+                snapshot.cache.firstFreshVideoFrameAtOrAfter(feedIndex, snapshot.state.playheadMs,
+                                                             snapshot.state.gpuGeneration);
+            if (!futureFrame.has_value() || futureFrame->metadata().key.isPlaceholder)
                 return std::nullopt;
-            const qint64 ptsMs = cachedFrame->metadata().key.ptsMs;
-            if (preciseCoverage && snapshot.state.playheadMs - ptsMs > toleranceMs)
-                return std::nullopt;
-            return ptsMs;
+            const qint64 futurePtsMs = futureFrame->metadata().key.ptsMs;
+            if (futurePtsMs - snapshot.state.playheadMs > toleranceMs) return std::nullopt;
+            return futurePtsMs;
         };
         if (requireAllFeeds) {
             for (int feed = 0; feed < m_outputFeedCount; ++feed) {
@@ -2376,10 +2492,17 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (gpuPipelineEnabled()) gpuGeneration = GpuGenerationCounter::instance().current();
 #endif
-        const qint64 toleranceMs = qMax<qint64>(1, frameDurMs() / 2);
+        const qint64 toleranceMs = qMax<qint64>(1, frameDurMs());
         for (int feed = 0; feed < m_outputFeedCount; ++feed) {
-            if (!m_outputCache->hasFreshVideoFrameAtOrBeforeNear(feed, target, toleranceMs,
-                                                                 gpuGeneration)) {
+            const std::optional<FrameHandle> prior =
+                m_outputCache->videoFrameAtFreshForGeneration(feed, target, gpuGeneration);
+            if (prior.has_value() && !prior->metadata().key.isPlaceholder &&
+                target - prior->metadata().key.ptsMs <= toleranceMs)
+                continue;
+            const std::optional<FrameHandle> future =
+                m_outputCache->firstFreshVideoFrameAtOrAfter(feed, target, gpuGeneration);
+            if (!future.has_value() || future->metadata().key.isPlaceholder ||
+                future->metadata().key.ptsMs - target > toleranceMs) {
                 targetCovered = false;
                 break;
             }
@@ -3766,10 +3889,21 @@ void PlaybackWorker::run() {
                     m_fmtCtx->pb->eof_reached = 0;
                     m_fmtCtx->pb->error = 0;
                 }
-                avformat_flush(m_fmtCtx);
-                int64_t rNewest = refNewestPts();
+                const int64_t rNewest = refNewestPts();
                 AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
-                int64_t anchorMs = qMax<int64_t>(0, rNewest);
+                // If playback has outrun the old live tail, the previously-buffered
+                // newest frame is no longer a useful recovery anchor: it may already
+                // be trimmed, or it may force the demuxer to re-read seconds of stale
+                // filler before reaching the newly-grown region. Re-anchor inside the
+                // current visible window so live preview catches up immediately after
+                // the recorder appends more packets.
+                const int64_t staleTailBeforeMs = P - windowLeadMs();
+                if (rNewest >= staleTailBeforeMs) {
+                    m_sizeAtLastEof = sz;
+                    continue;
+                }
+                avformat_flush(m_fmtCtx);
+                const int64_t anchorMs = qMax<int64_t>(0, P - windowTrailMs());
                 int64_t seekPts = av_rescale_q(anchorMs, {1, 1000}, vStream->time_base);
                 int sret = av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
                 m_sizeAtLastEof = sz;
@@ -3778,8 +3912,16 @@ void PlaybackWorker::run() {
                     // Dedup-before-decode: re-read tail clusters cost reads only.
                     // Drain a bounded number of packets, skipping already-buffered.
                     bool audioOn = playing && (speed > 0.99 && speed < 1.01);
-                    const int kEofDrain = 4 * trackCount;
+                    const int64_t recoverySpanMs =
+                        windowTrailMs() + windowLeadMs() + windowChunkMs() + 2000;
+                    const int recoveryFrames =
+                        int((recoverySpanMs + qMax<int64_t>(1, frameDurMs()) - 1) /
+                            qMax<int64_t>(1, frameDurMs()));
+                    const int kEofDrain = qMax(4 * trackCount, recoveryFrames * trackCount * 2);
+                    const int64_t recoveryTargetMs = P + windowLeadMs();
                     for (int i = 0; i < kEofDrain && !shouldInterrupt(); ++i) {
+                        const int64_t nm = newestPtsMin();
+                        if (nm >= 0 && nm >= recoveryTargetMs) break;
                         int ret = av_read_frame(m_fmtCtx, pkt);
                         if (ret < 0) break;
                         decodePacketIntoBank(pkt, frame, audioFrame, P, /*dir*/ 1, trackCount,

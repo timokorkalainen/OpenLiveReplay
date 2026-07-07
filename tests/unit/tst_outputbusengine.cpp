@@ -87,6 +87,8 @@ private slots:
     void pgmPreservesSelectedSourceColorMetadata();
     void pausedAudioIsSilenceButVideoRepeats();
     void multiviewComposesFeedsAndCarriesSelectedFeedAudio();
+    void feedUsesNearFutureFrameBeforePlaceholder();
+    void multiviewUsesNearFutureFeedBeforePlaceholder();
     void multiviewChoosesSelectedSourceColorMetadata();
     void ntscAudioUsesRationalSampleBoundaries();
     void ntscAudioSpansStayContiguousAcrossOddPlayEpoch();
@@ -307,6 +309,42 @@ void TestOutputBusEngine::multiviewComposesFeedsAndCarriesSelectedFeedAudio() {
     const auto* pcm = reinterpret_cast<const qint16*>(multiview.audio.pcm.constData());
     QCOMPARE(multiview.audio.feedIndex, 1);
     QCOMPARE(pcm[0], qint16(200));
+}
+
+void TestOutputBusEngine::feedUsesNearFutureFrameBeforePlaceholder() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 20, 44));
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+
+    const auto feed = engine.renderFeed(0, 0, state, cache);
+    const MediaVideoFrameView rendered(feed.video);
+
+    QCOMPARE(uchar(rendered.planeY.at(0)), uchar(44));
+    QVERIFY(!feed.identity.videoPlaceholder);
+    QCOMPARE(feed.identity.sourcePtsMs, qint64(20));
+}
+
+void TestOutputBusEngine::multiviewUsesNearFutureFeedBeforePlaceholder() {
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 120, 44));
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 2, 8, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    const auto multiview = engine.renderMultiview(5, state, cache);
+    const MediaVideoFrameView multiviewVideo(multiview.video);
+
+    QCOMPARE(uchar(multiviewVideo.planeY.at(0)), uchar(10));
+    QCOMPARE(uchar(multiviewVideo.planeY.at(4)), uchar(44));
+    QVERIFY(!multiview.identity.videoPlaceholder);
 }
 
 void TestOutputBusEngine::multiviewChoosesSelectedSourceColorMetadata() {

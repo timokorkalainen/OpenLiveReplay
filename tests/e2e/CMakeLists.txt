@@ -372,6 +372,9 @@ add_test(NAME e2e_play_sliderscrub
 add_test(NAME e2e_play_liveedge
     COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" liveedge 2 23474)
+add_test(NAME e2e_play_livegrow
+    COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" livegrow 2 23524)
 # 4-view multi-track decode path: the "stable" case even under the old code —
 # the new scheduler must also hold it at 0 repositions.
 add_test(NAME e2e_play_4view

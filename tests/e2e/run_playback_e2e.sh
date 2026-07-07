@@ -270,6 +270,7 @@ esac
 
 # --- 3. Drive the real PlaybackWorker ----------------------------------------
 PH_SCENARIO="$SCENARIO"
+PLAY_FILE="$FIXTURE"
 if [ "$SCENARIO" = "latency" ]; then
     export OLR_AUDIO_LATENCY_MS="${OLR_AUDIO_LATENCY_MS:-300}"
     PH_SCENARIO="play1x"
@@ -277,9 +278,33 @@ elif [ "$SCENARIO" = "h264_play" ]; then
     # The H.264 fixture is what makes this an H.264 test; the play scenario is
     # the same as the regular 1x playback gate.
     PH_SCENARIO="play1x"
+elif [ "$SCENARIO" = "livegrow" ]; then
+    PH_SCENARIO="livegrow"
+    CUT_MS="${OLR_LIVEGROW_CUT_MS:-5000}"
+    APPEND_DELAY="${OLR_LIVEGROW_APPEND_DELAY:-10}"
+    MIN_PTS="${OLR_LIVEGROW_MIN_PTS_MS:-12000}"
+    TIMEOUT_MS="${OLR_LIVEGROW_TIMEOUT_MS:-12500}"
+    CUT_POS="$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time,pos \
+        -of csv=p=0 "$FIXTURE" | awk -F, -v ms="$CUT_MS" '($1 * 1000) >= ms {print $2; exit}')"
+    if [ -z "${CUT_POS:-}" ] || [ "$CUT_POS" -le 0 ]; then
+        echo "FAIL: livegrow could not find a cut position at ${CUT_MS}ms"
+        exit 1
+    fi
+    PLAY_FILE="$WORKDIR/livegrow_partial.mkv"
+    cp "$FIXTURE" "$PLAY_FILE"
+    truncate -s "$CUT_POS" "$PLAY_FILE"
+    export OLR_LIVEGROW_MIN_PTS_MS="$MIN_PTS"
+    export OLR_LIVEGROW_TIMEOUT_MS="$TIMEOUT_MS"
+    echo "[pb-e2e] livegrow partial cut_pos=$CUT_POS cut_ms=$CUT_MS append_delay=${APPEND_DELAY}s min_pts=$MIN_PTS timeout_ms=$TIMEOUT_MS"
+    (
+        sleep "$APPEND_DELAY"
+        tail -c +"$((CUT_POS + 1))" "$FIXTURE" >> "$PLAY_FILE"
+    ) &
+    LIVEGROW_APPEND_PID=$!
 fi
-PLAY_OUT="$("$PLAY" "$FIXTURE" "$PH_SCENARIO" "$VIEWS")"
+PLAY_OUT="$("$PLAY" "$PLAY_FILE" "$PH_SCENARIO" "$VIEWS")"
 PLAY_RC=$?
+[ -n "${LIVEGROW_APPEND_PID:-}" ] && wait "$LIVEGROW_APPEND_PID" 2>/dev/null
 echo "[pb-e2e] play_harness rc=$PLAY_RC"
 
 COUNTERS="$(printf '%s\n' "$PLAY_OUT" | grep '^COUNTERS ' | tail -n 1)"
@@ -558,6 +583,24 @@ case "$SCENARIO" in
         fi
         if ! num "$reposition" || [ "$reposition" -gt 3 ]; then
             echo "FAIL: liveedge repositioned too much (reposition=$reposition, expected <=3)"
+            fail=1
+        fi
+        ;;
+    livegrow)
+        # Start playback from a deliberately truncated MKV, hit EOF, append the rest,
+        # then require the harness to observe every feed output past the old tail.
+        # play_harness owns the per-feed identity oracle and exits non-zero if it
+        # cannot reach OLR_LIVEGROW_MIN_PTS_MS.
+        if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -le 0 ]; then
+            echo "FAIL: livegrow decoded no video frames (decodedVideoFrames=$decodedVideoFrames, expected >0)"
+            fail=1
+        fi
+        if ! num "$audioPushes" || [ "$audioPushes" -le 0 ]; then
+            echo "FAIL: livegrow audio path did not run (audioPushes=$audioPushes, expected >0)"
+            fail=1
+        fi
+        if ! num "$eofTailSeek" || [ "$eofTailSeek" -gt 10 ]; then
+            echo "FAIL: livegrow EOF recovery spun too much (eofTailSeek=$eofTailSeek, expected <=10)"
             fail=1
         fi
         ;;
