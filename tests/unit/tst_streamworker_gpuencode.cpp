@@ -126,6 +126,7 @@ private slots:
     void gpuEncodePumpStartsWhenGpuPipelineEnabled();
     void queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFlight();
     void gpuEncodeFallbackDisablesGpuFrameIngestPreference();
+    void iosLiveIngestKeepsCpuDecodedFramesWhenGpuPipelineEnabled();
     void gpuOnlyQueuedFrameBeforeEncodeFallbackDoesNotClearCpuLatest();
     void gpuOnlyQueuedFrameAfterEncodeFallbackDoesNotClearCpuLatest();
 #endif
@@ -351,6 +352,19 @@ void TestStreamWorkerGpuEncode::gpuEncodeFallbackDisablesGpuFrameIngestPreferenc
     worker.latchGpuEncodeCpuFallback();
 
     QVERIFY(!worker.preferGpuVideoFramesForIngestForTest());
+}
+
+void TestStreamWorkerGpuEncode::iosLiveIngestKeepsCpuDecodedFramesWhenGpuPipelineEnabled() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+
+#if defined(Q_OS_IOS)
+    QVERIFY(!worker.preferGpuVideoFramesForIngestForTest());
+#else
+    QVERIFY(worker.preferGpuVideoFramesForIngestForTest());
+#endif
 }
 
 void TestStreamWorkerGpuEncode::gpuOnlyQueuedFrameBeforeEncodeFallbackDoesNotClearCpuLatest() {

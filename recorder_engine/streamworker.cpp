@@ -127,8 +127,12 @@ bool StreamWorker::ensureGpuEncodePumpStarted() {
 }
 
 bool StreamWorker::preferGpuVideoFramesForIngest() const {
+#if defined(Q_OS_IOS)
+    return false;
+#else
     return gpuPipelineEnabled() && m_videoCodec == VideoCodecChoice::H264Hardware &&
            !m_gpuEncodeCpuFallback.load(std::memory_order_acquire);
+#endif
 }
 
 void StreamWorker::latchGpuEncodeCpuFallback() {
