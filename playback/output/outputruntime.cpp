@@ -102,6 +102,9 @@ void OutputRuntime::resetFrameIndex(qint64 nextOutputFrameIndex) {
 
 void OutputRuntime::resetPlayEpoch() {
     QMutexLocker locker(&m_mutex);
+#ifdef OLR_UNIT_TEST
+    ++m_playEpochResetCountForTest;
+#endif
     if (dispatchActiveOnCurrentThreadLocked()) {
         m_pendingPlayEpochReset = true;
         return;
@@ -149,6 +152,47 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksForTestNs(qint64 wallNowNs) {
     return dispatchDueTicksNs(wallNowNs);
 }
 
+OutputDispatchStats OutputRuntime::dispatchImmediate() {
+    qint64 frameIndex = 0;
+    quint64 configGeneration = 0;
+    {
+        QMutexLocker locker(&m_mutex);
+        waitForDispatchIdleLocked();
+        while (m_reconfiguring && !m_stopRequested)
+            m_dispatchIdle.wait(&m_mutex);
+        if (m_stopRequested) return statsLocked();
+        applyPendingDispatchMutationsLocked();
+        frameIndex = m_dispatcher.nextOutputFrameIndex();
+        configGeneration = m_configGeneration;
+    }
+
+    OutputRuntimeSnapshot current = snapshot();
+    bool shouldDispatch = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        waitForDispatchIdleLocked();
+        while (m_reconfiguring && !m_stopRequested)
+            m_dispatchIdle.wait(&m_mutex);
+        if (!m_stopRequested && m_configGeneration == configGeneration &&
+            m_dispatcher.nextOutputFrameIndex() == frameIndex) {
+            m_dispatchActive = true;
+            m_dispatchThreadId = QThread::currentThreadId();
+            shouldDispatch = true;
+        }
+    }
+
+    if (shouldDispatch) m_dispatcher.dispatchTick(current.cache, current.state);
+
+    {
+        QMutexLocker locker(&m_mutex);
+        applyPendingDispatchMutationsLocked();
+        m_dispatchActive = false;
+        m_dispatchThreadId = nullptr;
+        m_dispatchIdle.wakeAll();
+        return statsLocked();
+    }
+}
+
 OutputDispatchStats OutputRuntime::stats() const {
     QMutexLocker locker(&m_mutex);
     if (!dispatchActiveOnCurrentThreadLocked()) waitForDispatchIdleLocked();
@@ -172,6 +216,11 @@ std::shared_ptr<GpuRhiContext> OutputRuntime::gpuRhiContextForTest() const {
     QMutexLocker locker(&m_mutex);
     if (!dispatchActiveOnCurrentThreadLocked()) waitForDispatchIdleLocked();
     return m_dispatcher.gpuRhiContextForTest();
+}
+
+int OutputRuntime::playEpochResetCountForTest() const {
+    QMutexLocker locker(&m_mutex);
+    return m_playEpochResetCountForTest;
 }
 #endif
 

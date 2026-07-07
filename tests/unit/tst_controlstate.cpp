@@ -55,6 +55,15 @@ public:
         return {2, QVariantList{QVariantMap{{QStringLiteral("feedId"), QStringLiteral("cam-a")}}},
                 QVariantMap{{QStringLiteral("cam-a"), QVariantMap{{QStringLiteral("speed"), 88}}}}};
     }
+    QVariantMap outputState() const override {
+        return {{QStringLiteral("previewTargets"),
+                 QVariantList{
+                     QVariantMap{{QStringLiteral("id"), QStringLiteral("qt-preview-multiview")},
+                                 {QStringLiteral("framesSubmitted"), 12},
+                                 {QStringLiteral("placeholderFrames"), 1},
+                                 {QStringLiteral("lastVideoPlaceholder"), false},
+                                 {QStringLiteral("readbackDrops"), 0}}}}};
+    }
     CommandResult executeCommand(const QString&, const QJsonObject&) override {
         return CommandResult::success();
     }
@@ -102,6 +111,17 @@ void TestControlState::buildsSnapshotWithExpectedTopLevelObjects() {
                  .value(QStringLiteral("version"))
                  .toInt(),
              2);
+    const QJsonArray previewTargets = state.value(QStringLiteral("output"))
+                                          .toObject()
+                                          .value(QStringLiteral("previewTargets"))
+                                          .toArray();
+    QCOMPARE(previewTargets.first().toObject().value(QStringLiteral("id")).toString(),
+             QStringLiteral("qt-preview-multiview"));
+    QCOMPARE(previewTargets.first().toObject().value(QStringLiteral("framesSubmitted")).toInt(),
+             12);
+    QCOMPARE(
+        previewTargets.first().toObject().value(QStringLiteral("lastVideoPlaceholder")).toBool(),
+        false);
 }
 
 void TestControlState::buildsPathPatch() {

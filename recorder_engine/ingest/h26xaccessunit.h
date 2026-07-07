@@ -25,12 +25,18 @@ class H26xAccessUnitSplitter {
 public:
     explicit H26xAccessUnitSplitter(NativeVideoCodec codec);
 
-    QList<CompressedAccessUnit> pushPesPayload(const QByteArray& payload, qint64 pts90k, qint64 dts90k);
+    QList<CompressedAccessUnit> pushPesPayload(const QByteArray& payload, qint64 pts90k,
+                                               qint64 dts90k);
+    QList<CompressedAccessUnit> flush();
     H26xParameterSets parameterSets() const { return m_parameterSets; }
 
 private:
     NativeVideoCodec m_codec = NativeVideoCodec::Unknown;
     H26xParameterSets m_parameterSets;
+    QByteArray m_pendingAnnexB;
+    bool m_pendingHasVcl = false;
+    qint64 m_pendingPts90k = -1;
+    qint64 m_pendingDts90k = -1;
 
     void inspectNal(const QByteArray& nal);
 };

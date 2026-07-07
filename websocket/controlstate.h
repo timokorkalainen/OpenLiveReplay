@@ -16,6 +16,7 @@ public:
     static QJsonObject transportObject(const ControlApiAdapter& adapter);
     static QJsonObject settingsObject(const ControlApiAdapter& adapter);
     static QJsonObject telemetryObject(const ControlApiAdapter& adapter);
+    static QJsonObject outputObject(const ControlApiAdapter& adapter);
 };
 
 #endif

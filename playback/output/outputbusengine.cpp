@@ -48,18 +48,20 @@ std::optional<FrameHandle> freshVideoFrameAtOrJustAhead(const OutputFrameCache& 
                                                         int feedIndex, qint64 playheadMs,
                                                         qint64 aheadToleranceMs,
                                                         uint64_t gpuGeneration) {
-    if (std::optional<FrameHandle> frame =
-            freshVideoFrameAt(cache, feedIndex, playheadMs, gpuGeneration)) {
-        return frame;
-    }
+    std::optional<FrameHandle> prior =
+        freshVideoFrameAt(cache, feedIndex, playheadMs, gpuGeneration);
 
     std::optional<FrameHandle> next =
         cache.firstFreshVideoFrameAtOrAfter(feedIndex, playheadMs, gpuGeneration);
-    if (!next.has_value() || next->metadata().key.isPlaceholder) return std::nullopt;
+    if (!next.has_value() || next->metadata().key.isPlaceholder) return prior;
 
     const qint64 delta = next->metadata().key.ptsMs - playheadMs;
-    if (delta < 0 || delta > qMax<qint64>(0, aheadToleranceMs)) return std::nullopt;
-    return next;
+    if (delta >= 0 && delta <= qMax<qint64>(0, aheadToleranceMs)) {
+        if (!prior.has_value()) return next;
+        if (OutputFrameSelection::isTimestampRoundingFuture(delta)) return next;
+    }
+
+    return prior;
 }
 
 FrameHandle freshVideoFrameAtOrJustAheadOrPlaceholder(const OutputFrameCache& cache, int feedIndex,
@@ -186,7 +188,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     // hash collision only miscounts a stat, never produces wrong pixels).
     quint32 sourceSignature = kFnvOffset;
     QVector<qint64> sourceKeys;
-    sourceKeys.reserve(static_cast<qsizetype>(m_feedCount) * 8);
+    sourceKeys.reserve(1 + static_cast<qsizetype>(m_feedCount) * 8);
+    sourceKeys.append(qint64(state.gpuGeneration));
     QVector<std::optional<FrameHandle>> sources;
     sources.reserve(m_feedCount);
     const qint64 nearFutureToleranceMs =

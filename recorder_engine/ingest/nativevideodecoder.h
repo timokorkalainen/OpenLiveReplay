@@ -56,6 +56,7 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities();
 
 #ifdef OLR_UNIT_TEST
 bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest();
+bool nativeVideoDecoderNoFrameRejectedForTest(QString* error = nullptr);
 #endif
 
 #endif // NATIVEVIDEODECODER_H

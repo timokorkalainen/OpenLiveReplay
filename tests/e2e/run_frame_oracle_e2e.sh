@@ -5,14 +5,19 @@
 #   3. Drive play_harness frameoracle, which scrubs/jogs while paused and checks that
 #      every output feed delivers the exact requested frame in both metadata and pixels.
 #
-# Usage: run_frame_oracle_e2e.sh <ndi_marker_mkv_source> <play_harness> [views]
+# Usage: run_frame_oracle_e2e.sh <ndi_marker_mkv_source> <play_harness> [views] [scenario]
 set -uo pipefail
 
 SKIP=77
 SRC="${1:?ndi_marker_mkv_source required}"
 PLAY="${2:?play_harness required}"
 VIEWS="${3:-2}"
-SECONDS_FIXTURE="${OLR_FRAME_ORACLE_SECONDS:-22}"
+SCENARIO="${4:-frameoracle}"
+DEFAULT_SECONDS=22
+case "$SCENARIO" in
+    jogstressoracle|coldseeklatency) DEFAULT_SECONDS=45 ;;
+esac
+SECONDS_FIXTURE="${OLR_FRAME_ORACLE_SECONDS:-$DEFAULT_SECONDS}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # shellcheck source=tool_env.sh
@@ -37,39 +42,57 @@ case "${OLR_GPU_PIPELINE:-}" in
     1|true|TRUE|on|ON) GPU_RUNTIME_ENABLED=1 ;;
 esac
 
-# Use an all-intra H.264 marker fixture so every oracle seek has a real random
-# access target. The GPU lane consumes the same codec through native decode.
-if ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])libx264[[:space:]]'; then
-    VIDEO_ARGS=(-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p
-        -g 1 -keyint_min 1 -sc_threshold 0 -b:v 4M)
-elif ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])h264_mf[[:space:]]'; then
-    VIDEO_ARGS=(-c:v h264_mf -pix_fmt yuv420p -g 1 -b:v 4M)
-else
-    echo "SKIP: ffmpeg has no usable H.264 encoder for frame oracle"
-    exit "$SKIP"
-fi
+# Use an all-intra software-decodable marker fixture by default so the frame
+# oracle gates seek/render behavior rather than platform H.264 decoder quirks.
+# Set OLR_FRAME_ORACLE_CODEC=h264 when the decoder path itself is under test.
+FRAME_ORACLE_CODEC="${OLR_FRAME_ORACLE_CODEC:-ffv1}"
+case "$FRAME_ORACLE_CODEC" in
+    ffv1)
+        VIDEO_ARGS=(-c:v ffv1 -level 3 -g 1 -pix_fmt yuv420p)
+        ;;
+    mpeg2video|mpeg2)
+        VIDEO_ARGS=(-c:v mpeg2video -pix_fmt yuv420p -g 1 -bf 0 -b:v 20M)
+        ;;
+    h264)
+        if ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])libx264[[:space:]]'; then
+            VIDEO_ARGS=(-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p
+                -g 1 -keyint_min 1 -sc_threshold 0 -b:v 4M)
+        elif ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])h264_mf[[:space:]]'; then
+            VIDEO_ARGS=(-c:v h264_mf -pix_fmt yuv420p -g 1 -b:v 4M)
+        else
+            echo "SKIP: ffmpeg has no usable H.264 encoder for frame oracle"
+            exit "$SKIP"
+        fi
+        ;;
+    *)
+        echo "FAIL: unsupported OLR_FRAME_ORACLE_CODEC=$FRAME_ORACLE_CODEC"
+        exit 1
+        ;;
+esac
 if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
     "$PLAY" --probe-gpu-backend >/dev/null 2>&1
     rc=$?
     if [ "$rc" = "$SKIP" ]; then echo "SKIP: GPU backend unavailable"; exit "$SKIP"; fi
     [ "$rc" = "0" ] || { echo "FAIL: GPU backend probe failed ($rc)"; exit 1; }
 
-    DECODE_CAPS="$("$PLAY" --probe-native-decode-caps 2>&1)"
-    rc=$?
-    if [ "$rc" != "0" ]; then
-        echo "FAIL: native decode caps probe failed ($rc)"
-        printf '%s\n' "$DECODE_CAPS"
-        exit 1
+    if [ "$FRAME_ORACLE_CODEC" = "h264" ]; then
+        DECODE_CAPS="$("$PLAY" --probe-native-decode-caps 2>&1)"
+        rc=$?
+        if [ "$rc" != "0" ]; then
+            echo "FAIL: native decode caps probe failed ($rc)"
+            printf '%s\n' "$DECODE_CAPS"
+            exit 1
+        fi
+        H264_DECODE_AVAIL="$(printf '%s\n' "$DECODE_CAPS" | awk -F= '/^h264=/{print $2}')"
+        [ "$H264_DECODE_AVAIL" = "1" ] || { echo "SKIP: native H.264 decode unavailable"; exit "$SKIP"; }
     fi
-    H264_DECODE_AVAIL="$(printf '%s\n' "$DECODE_CAPS" | awk -F= '/^h264=/{print $2}')"
-    [ "$H264_DECODE_AVAIL" = "1" ] || { echo "SKIP: native H.264 decode unavailable"; exit "$SKIP"; }
 fi
 
 WORK="$(mktemp -d)"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
-echo "[frame-oracle] views=$VIEWS seconds=$SECONDS_FIXTURE gpu=$GPU_RUNTIME_ENABLED"
+echo "[frame-oracle] scenario=$SCENARIO views=$VIEWS seconds=$SECONDS_FIXTURE gpu=$GPU_RUNTIME_ENABLED codec=$FRAME_ORACLE_CODEC"
 "$SRC" "$WORK/marker" "$SECONDS_FIXTURE" || { echo "FAIL: marker source"; exit 1; }
 
 split_labels=""
@@ -102,7 +125,7 @@ if [ "${VTRACKS:-0}" != "$VIEWS" ]; then
 fi
 
 PLAY_OUT="$(OLR_FRAME_ORACLE_VISUAL="${OLR_FRAME_ORACLE_VISUAL:-1}" \
-    "$PLAY" "$WORK/frame_oracle.mkv" frameoracle "$VIEWS" 2>&1)"
+    "$PLAY" "$WORK/frame_oracle.mkv" "$SCENARIO" "$VIEWS" 2>&1)"
 PLAY_RC=$?
 printf '%s\n' "$PLAY_OUT"
 
@@ -114,9 +137,19 @@ if [ "$PLAY_RC" != "0" ]; then
     echo "FAIL: frame oracle play_harness exited $PLAY_RC"
     exit 1
 fi
-if ! printf '%s\n' "$PLAY_OUT" | grep -q '^FRAME_ORACLE_PASS '; then
-    echo "FAIL: frame oracle did not report FRAME_ORACLE_PASS"
-    exit 1
-fi
+case "$SCENARIO" in
+    coldseeklatency)
+        if ! printf '%s\n' "$PLAY_OUT" | grep -q '^COLD_SEEK_LATENCY_PASS '; then
+            echo "FAIL: cold seek latency oracle did not report COLD_SEEK_LATENCY_PASS"
+            exit 1
+        fi
+        ;;
+    *)
+        if ! printf '%s\n' "$PLAY_OUT" | grep -q '^FRAME_ORACLE_PASS '; then
+            echo "FAIL: frame oracle did not report FRAME_ORACLE_PASS"
+            exit 1
+        fi
+        ;;
+esac
 
 echo "PASS: frame-perfect scrub/jog oracle OK"

@@ -34,6 +34,11 @@ public:
     virtual void stop() = 0;
     virtual bool isActive() const = 0;
     virtual bool submit(const OutputBusFrame& frame) = 0;
+    virtual bool flush(int timeoutMs) {
+        (void) timeoutMs;
+        return true;
+    }
+    virtual void discardPending() {}
     virtual OutputSinkStatus outputStatus() const { return OutputSinkStatus{}; }
     virtual bool needsContinuousCadence() const { return false; }
     virtual bool readbackStats(qint64& depth, qint64& drops) const {

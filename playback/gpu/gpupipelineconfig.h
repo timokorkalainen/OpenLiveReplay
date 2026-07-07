@@ -4,6 +4,7 @@
 // The single runtime capability gate for the GPU-resident pipeline. It is off
 // by default; callers must also verify that the platform RHI context exists.
 bool gpuPipelineEnabled();
+bool gpuRecordSurfaceEncodeEnabled();
 
 // Test/micro-stress knobs used only by GPU paths.
 int gpuForcedPerTrackBudget();

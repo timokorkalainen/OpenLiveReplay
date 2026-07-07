@@ -43,19 +43,34 @@ void GpuEncodePump::cancelPending() {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_drops.fetch_add(m_queue.size(), std::memory_order_acq_rel);
     m_queue.clear();
+    m_cv.notify_all();
 }
 
 bool GpuEncodePump::submit(FrameHandle frame, uint64_t fenceValue, int64_t ptsTicks,
                            ColorMetadata color, PacketSink onPacket, FailureSink onFailure) {
+    Job job{std::move(frame),    fenceValue,          ptsTicks, color,
+            std::move(onPacket), std::move(onFailure)};
+    FailureSink rejectedFailure;
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (int(m_queue.size()) >= m_maxQueue) {
-            m_queue.pop_front();
-            m_drops.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock<std::mutex> lock(m_mutex);
+        const bool runningAtEntry = m_running.load(std::memory_order_acquire);
+        if (runningAtEntry) {
+            m_cv.wait(lock, [this] {
+                return !m_running.load(std::memory_order_acquire) ||
+                       int(m_queue.size()) < m_maxQueue;
+            });
         }
-
-        m_queue.push_back(Job{std::move(frame), fenceValue, ptsTicks, color, std::move(onPacket),
-                              std::move(onFailure)});
+        if ((runningAtEntry && !m_running.load(std::memory_order_acquire)) ||
+            int(m_queue.size()) >= m_maxQueue) {
+            m_drops.fetch_add(1, std::memory_order_acq_rel);
+            rejectedFailure = std::move(job.onFailure);
+        } else {
+            m_queue.push_back(std::move(job));
+        }
+    }
+    if (rejectedFailure) {
+        rejectedFailure();
+        return false;
     }
     m_cv.notify_one();
     return true;
@@ -72,6 +87,7 @@ void GpuEncodePump::run() {
             if (!m_running.load(std::memory_order_acquire) && m_queue.empty()) return;
             job = std::move(m_queue.front());
             m_queue.pop_front();
+            m_cv.notify_all();
         }
 
         const IFrameData* frameData = job.frame.data();

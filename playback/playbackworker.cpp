@@ -149,38 +149,51 @@ void PlaybackWorker::openFile(const QString& filePath) {
 
 void PlaybackWorker::seekTo(int64_t timestampMs, int directionHint) {
     const int64_t clamped = qMax<int64_t>(0, timestampMs);
-    QMutexLocker locker(&m_mutex);
-    // Record travel direction from the current playhead (spec §4/§5/§6.7):
-    // drives reverse reposition anchoring, the backward-scrub audio re-prime,
-    // and paused dedup direction. m_transport->currentPos() locks the
-    // transport's own (independent) mutex, so there is no lock-order concern.
-    const int moveDir = directionHint == 0 ? ((clamped >= m_transport->currentPos()) ? 1 : -1)
-                                           : (directionHint > 0 ? 1 : -1);
-    m_lastMoveDir.store(moveDir, std::memory_order_relaxed);
-    m_seekTargetMs = clamped;
-    // A manual seek supersedes any pending armed-cut work: it cancels a pending
-    // decoder-follow (a stale follow to the old cut target would jump the decoder
-    // back) and any queued re-arm (the operator's explicit seek is the latest
-    // intent — a recall that arrived during an in-flight cut must not fire after
-    // it). An ARMED/in-flight cut is cancelled at fire time by maybeFireScheduled
-    // Cut via the seek-generation bump below (m_armSeekGen mismatch).
-    // Release ordering so a lock-free worker that later observes the new
-    // m_seekGeneration (acquire) is guaranteed to also observe these clears.
-    m_decoderFollowMs.store(-1, std::memory_order_release);
-    m_hasPendingRearm.store(false, std::memory_order_release);
-    // A new seek target is outstanding until repositionTo commits it. The gate
-    // holds the last output-visible playhead until m_committedGeneration catches
-    // up. During long steady playback the last reposition target may already be
-    // outside the tiny cap window, so refresh the held playhead from the output
-    // bookmark before bumping the generation.
-    m_committedPlayheadMs.store(m_lastVisiblePlayheadMs.load(std::memory_order_acquire),
-                                std::memory_order_release);
-    // The bump also signals maybeFireScheduledCut to abort an armed cut (manual seek wins).
-    m_seekGeneration.fetch_add(1, std::memory_order_release);
+    uint64_t seekGeneration = 0;
     {
-        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
-        if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
+        QMutexLocker locker(&m_mutex);
+        // Record travel direction from the current playhead (spec §4/§5/§6.7):
+        // drives reverse reposition anchoring, the backward-scrub audio re-prime,
+        // and paused dedup direction. m_transport->currentPos() locks the
+        // transport's own (independent) mutex, so there is no lock-order concern.
+        const int moveDir = directionHint == 0 ? ((clamped >= m_transport->currentPos()) ? 1 : -1)
+                                               : (directionHint > 0 ? 1 : -1);
+        m_lastMoveDir.store(moveDir, std::memory_order_relaxed);
+        m_seekTargetMs = clamped;
+        // A manual seek supersedes any pending armed-cut work: it cancels a pending
+        // decoder-follow (a stale follow to the old cut target would jump the decoder
+        // back) and any queued re-arm (the operator's explicit seek is the latest
+        // intent — a recall that arrived during an in-flight cut must not fire after
+        // it). An ARMED/in-flight cut is cancelled at fire time by maybeFireScheduled
+        // Cut via the seek-generation bump below (m_armSeekGen mismatch).
+        // Release ordering so a lock-free worker that later observes the new
+        // m_seekGeneration (acquire) is guaranteed to also observe these clears.
+        m_decoderFollowMs.store(-1, std::memory_order_release);
+        m_hasPendingRearm.store(false, std::memory_order_release);
+        // A new seek target is outstanding until repositionTo commits it. The gate
+        // holds the last output-visible playhead until m_committedGeneration catches
+        // up. During long steady playback the last reposition target may already be
+        // outside the tiny cap window, so refresh the held playhead from the output
+        // bookmark before bumping the generation.
+        m_committedPlayheadMs.store(m_lastVisiblePlayheadMs.load(std::memory_order_acquire),
+                                    std::memory_order_release);
+        // The bump also signals maybeFireScheduledCut to abort an armed cut (manual seek wins).
+        seekGeneration = m_seekGeneration.fetch_add(1, std::memory_order_release) + 1;
     }
+    bool committedFromPublishedCache = false;
+    if (publishOutputCacheIfCoversPlayhead(clamped)) {
+        m_committedPlayheadMs.store(clamped, std::memory_order_relaxed);
+        m_lastVisiblePlayheadMs.store(clamped, std::memory_order_release);
+#ifdef OLR_GPU_PIPELINE_BUILD
+        if (gpuPipelineEnabled())
+            m_committedGpuGeneration.store(GpuGenerationCounter::instance().current(),
+                                           std::memory_order_release);
+#endif
+        m_committedGeneration.store(seekGeneration, std::memory_order_release);
+        committedFromPublishedCache = true;
+    }
+    const bool playing = m_transport && m_transport->isPlaying();
+    if (committedFromPublishedCache || playing) refreshOutputAfterSeekCommit(playing);
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
@@ -234,6 +247,25 @@ OutputDispatchStats PlaybackWorker::outputStats() const {
     }
 #endif
     return m_outputRuntime->stats();
+}
+
+void PlaybackWorker::refreshOutputAfterSeekCommit(bool resetPlayEpoch) {
+    OutputRuntime* runtime = nullptr;
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (!m_outputRuntime) return;
+        runtime = m_outputRuntime.get();
+        ++m_outputRuntimeImmediateDispatches;
+    }
+
+    if (resetPlayEpoch) runtime->resetPlayEpoch();
+    runtime->dispatchImmediate();
+
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        --m_outputRuntimeImmediateDispatches;
+        m_outputRuntimeImmediateDispatchesIdle.wakeAll();
+    }
 }
 
 PlaybackWorker::PlaybackCounters PlaybackWorker::counters() const {
@@ -406,6 +438,138 @@ int64_t PlaybackWorker::frameDurMs() const {
     return 1000 / fps(); // fps() >= 1 so no divide-by-zero
 }
 
+int64_t PlaybackWorker::maxPriorCoverageMs() const {
+    return qMax<int64_t>(frameDurMs(), windowLeadMs() + windowChunkMs() + windowSlackMs());
+}
+
+std::optional<qint64> PlaybackWorker::outputFeedCoverageInCache(const OutputFrameCache& cache,
+                                                                int feedIndex, int64_t playheadMs,
+                                                                uint64_t gpuGeneration,
+                                                                OutputCoverageMode mode) const {
+    if (feedIndex < 0 || feedIndex >= cache.feedCount()) return std::nullopt;
+
+    const std::optional<FrameHandle> rawAt = cache.videoFrameAt(feedIndex, playheadMs);
+    if (rawAt.has_value() && rawAt->metadata().key.ptsMs == playheadMs) {
+        if (rawAt->metadata().key.isPlaceholder || rawAt->isStaleForGeneration(gpuGeneration))
+            return std::nullopt;
+        return playheadMs;
+    }
+
+    const std::optional<FrameHandle> prior =
+        cache.videoFrameAtFreshForGeneration(feedIndex, playheadMs, gpuGeneration);
+    if (prior.has_value() && !prior->metadata().key.isPlaceholder) {
+        const qint64 ageMs = playheadMs - prior->metadata().key.ptsMs;
+        if (ageMs == 0 || (ageMs > 0 && ageMs < frameDurMs())) return playheadMs;
+    }
+
+    const std::optional<FrameHandle> future =
+        cache.firstFreshVideoFrameAtOrAfter(feedIndex, playheadMs, gpuGeneration);
+    if (!future.has_value() || future->metadata().key.isPlaceholder) return std::nullopt;
+
+    const qint64 futureDeltaMs = future->metadata().key.ptsMs - playheadMs;
+    if (futureDeltaMs < 0) return std::nullopt;
+    if (prior.has_value()) {
+        if (OutputFrameSelection::isTimestampRoundingFuture(futureDeltaMs))
+            return std::optional<qint64>(playheadMs);
+        // A near future frame within one output tick means the same-cadence target frame is
+        // missing; bracketed lower-cadence sources have a wider gap and intentionally hold prior.
+        if (mode == OutputCoverageMode::StrictSeek && futureDeltaMs <= frameDurMs())
+            return std::nullopt;
+        return futureDeltaMs <= maxPriorCoverageMs() ? std::optional<qint64>(playheadMs)
+                                                     : std::nullopt;
+    }
+    return futureDeltaMs <= qMax<qint64>(1, frameDurMs())
+               ? std::optional<qint64>(future->metadata().key.ptsMs)
+               : std::nullopt;
+}
+
+bool PlaybackWorker::outputFeedCoversPlayheadLocked(int feedIndex, int64_t playheadMs,
+                                                    uint64_t gpuGeneration,
+                                                    OutputCoverageMode mode) const {
+    if (!m_outputCache) return false;
+    return outputFeedCoverageInCache(*m_outputCache, feedIndex, playheadMs, gpuGeneration, mode)
+        .has_value();
+}
+
+bool PlaybackWorker::outputCacheCoversPlayhead(int64_t playheadMs) const {
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    if (!m_outputCache || m_outputFeedCount <= 0) return false;
+
+    uint64_t gpuGeneration = 0;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (gpuPipelineEnabled()) gpuGeneration = GpuGenerationCounter::instance().current();
+#endif
+    const bool requireAllFeeds = m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire);
+
+    if (requireAllFeeds) {
+        for (int feed = 0; feed < m_outputFeedCount; ++feed) {
+            if (!outputFeedCoversPlayheadLocked(feed, playheadMs, gpuGeneration)) return false;
+        }
+        return true;
+    }
+    int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
+    if (selected < 0 && m_outputFeedCount > 0) selected = 0;
+    return outputFeedCoversPlayheadLocked(selected, playheadMs, gpuGeneration);
+}
+
+bool PlaybackWorker::publishOutputCacheIfCoversPlayhead(int64_t playheadMs) {
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    if (!m_outputCache || m_outputFeedCount <= 0) return false;
+
+    uint64_t gpuGeneration = 0;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (gpuPipelineEnabled()) gpuGeneration = GpuGenerationCounter::instance().current();
+#endif
+    const bool requireAllFeeds = m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire);
+    if (requireAllFeeds) {
+        for (int feed = 0; feed < m_outputFeedCount; ++feed) {
+            if (!outputFeedCoversPlayheadLocked(feed, playheadMs, gpuGeneration)) return false;
+        }
+    } else {
+        int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
+        if (selected < 0 && m_outputFeedCount > 0) selected = 0;
+        if (!outputFeedCoversPlayheadLocked(selected, playheadMs, gpuGeneration)) return false;
+    }
+    publishOutputCacheLocked();
+    return true;
+}
+
+bool PlaybackWorker::pausedPlayheadNeedsWork(int64_t playheadMs) {
+    {
+        QMutexLocker locker(&m_mutex);
+        if (m_seekTargetMs >= 0) return true;
+    }
+
+    QMutexLocker bufferLocker(&m_bufferMutex);
+    if (m_decoderBank.isEmpty()) return true;
+
+    FrameHandle frame;
+    int64_t ptsMs = -1;
+    DecoderTrack* ref = m_decoderBank[0];
+    if (!ref || !ref->buffer.frameAt(playheadMs, frame, ptsMs) || ptsMs != ref->lastDeliveredPtsMs)
+        return true;
+
+    if (!m_outputCache || m_outputFeedCount <= 0) return false;
+
+    uint64_t gpuGeneration = 0;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (gpuPipelineEnabled()) gpuGeneration = GpuGenerationCounter::instance().current();
+#endif
+    const bool requireAllFeeds = m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire);
+    if (requireAllFeeds) {
+        for (int feed = 0; feed < m_outputFeedCount; ++feed) {
+            if (!outputFeedCoversPlayheadLocked(feed, playheadMs, gpuGeneration)) return true;
+        }
+        return false;
+    }
+
+    int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
+    if (selected < 0 && m_outputFeedCount > 0) selected = 0;
+    if (!outputFeedCoversPlayheadLocked(selected, playheadMs, gpuGeneration)) return true;
+
+    return false;
+}
+
 int64_t PlaybackWorker::windowLeadMs() const {
     return qMax(1, m_residencyWindowParams.leadMs);
 }
@@ -569,32 +733,67 @@ void PlaybackWorker::clearDecoderBuffers(bool invalidateGpuGeneration) {
 }
 
 bool PlaybackWorker::reuseAt(int64_t target) {
-    // True iff the bank is non-empty AND every track has a decoded frame
-    // within frameDurMs/2 of target, and the output cache covers the same target.
-    const int64_t tol = frameDurMs();
+    // True iff the bank is non-empty AND every track has a displayable decoded frame
+    // for target, and the output cache covers the same target. Displayability follows
+    // the output renderer: use the latest source frame at-or-before the playhead so
+    // lower-cadence feeds still cover every replay frame between source frames.
     QMutexLocker bufferLocker(&m_bufferMutex);
     if (m_decoderBank.isEmpty()) return false;
-    for (auto* track : m_decoderBank) {
-        if (!track->buffer.hasFrameNear(target, tol)) return false;
+
+    auto trackCoversTarget = [&](DecoderTrack* track) {
+        FrameHandle frame;
+        int64_t pts = -1;
+        if (!track || !track->buffer.frameAt(target, frame, pts) ||
+            frame.metadata().key.isPlaceholder)
+            return false;
+        const qint64 ageMs = target - pts;
+        if (ageMs != 0 && ageMs >= frameDurMs()) {
+            bool bracketed = false;
+            for (const TrackBuffer::Frame& candidate : track->buffer.framesSnapshot()) {
+                if (candidate.ptsMs >= target && !candidate.frame.metadata().key.isPlaceholder &&
+                    candidate.ptsMs - target <= maxPriorCoverageMs()) {
+                    bracketed = true;
+                    break;
+                }
+            }
+            if (!bracketed) return false;
+        }
+        return true;
+    };
+
+    if (m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire)) {
+        for (auto* track : m_decoderBank) {
+            if (!trackCoversTarget(track)) return false;
+        }
+    } else {
+        int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
+        if (selected < 0) selected = 0;
+        DecoderTrack* selectedTrack = nullptr;
+        for (auto* track : m_decoderBank) {
+            if (track && track->feedIndex == selected) {
+                selectedTrack = track;
+                break;
+            }
+        }
+        if (!trackCoversTarget(selectedTrack)) return false;
     }
+
     if (m_outputCache && m_outputFeedCount > 0) {
         uint64_t gpuGeneration = 0;
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (gpuPipelineEnabled()) gpuGeneration = GpuGenerationCounter::instance().current();
 #endif
-        for (auto* track : m_decoderBank) {
-            if (!track || track->feedIndex < 0 || track->feedIndex >= m_outputFeedCount)
-                return false;
-            const std::optional<FrameHandle> prior = m_outputCache->videoFrameAtFreshForGeneration(
-                track->feedIndex, target, gpuGeneration);
-            if (prior.has_value() && !prior->metadata().key.isPlaceholder &&
-                target - prior->metadata().key.ptsMs <= tol)
-                continue;
-            const std::optional<FrameHandle> future = m_outputCache->firstFreshVideoFrameAtOrAfter(
-                track->feedIndex, target, gpuGeneration);
-            if (!future.has_value() || future->metadata().key.isPlaceholder ||
-                future->metadata().key.ptsMs - target > tol)
-                return false;
+        if (m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire)) {
+            for (auto* track : m_decoderBank) {
+                if (!track || track->feedIndex < 0 || track->feedIndex >= m_outputFeedCount)
+                    return false;
+                if (!outputFeedCoversPlayheadLocked(track->feedIndex, target, gpuGeneration))
+                    return false;
+            }
+        } else {
+            int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
+            if (selected < 0) selected = 0;
+            if (!outputFeedCoversPlayheadLocked(selected, target, gpuGeneration)) return false;
         }
     }
     return true;
@@ -1268,6 +1467,8 @@ void PlaybackWorker::shutdownOutputGraph() {
     std::unique_ptr<OutputRuntime> runtime;
     {
         QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        while (m_outputRuntimeImmediateDispatches > 0)
+            m_outputRuntimeImmediateDispatchesIdle.wait(&m_outputRuntimeMutex);
         runtime = std::move(m_outputRuntime);
     }
     if (runtime) {
@@ -1646,25 +1847,10 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
         bool cacheCovered = m_outputFeedCount > 0;
         qint64 coveredPlayhead = std::numeric_limits<qint64>::min();
         auto feedCoverage = [&](int feedIndex) -> std::optional<qint64> {
-            if (feedIndex < 0 || feedIndex >= m_outputFeedCount) return std::nullopt;
-            const std::optional<FrameHandle> cachedFrame =
-                snapshot.cache.videoFrameAtFreshForGeneration(feedIndex, snapshot.state.playheadMs,
-                                                              snapshot.state.gpuGeneration);
-            if (cachedFrame.has_value() && !cachedFrame->metadata().key.isPlaceholder) {
-                // The renderer uses the latest source frame at-or-before the playhead.
-                // Treat that as covered even when the input cadence is lower than the
-                // output cadence; otherwise a single sparse feed freezes the whole
-                // paused multiview while stepping frame-by-frame.
-                return snapshot.state.playheadMs;
-            }
-            const std::optional<FrameHandle> futureFrame =
-                snapshot.cache.firstFreshVideoFrameAtOrAfter(feedIndex, snapshot.state.playheadMs,
-                                                             snapshot.state.gpuGeneration);
-            if (!futureFrame.has_value() || futureFrame->metadata().key.isPlaceholder)
-                return std::nullopt;
-            const qint64 futurePtsMs = futureFrame->metadata().key.ptsMs;
-            if (futurePtsMs - snapshot.state.playheadMs > toleranceMs) return std::nullopt;
-            return futurePtsMs;
+            Q_UNUSED(toleranceMs);
+            return outputFeedCoverageInCache(snapshot.cache, feedIndex, snapshot.state.playheadMs,
+                                             snapshot.state.gpuGeneration,
+                                             OutputCoverageMode::Displayable);
         };
         if (requireAllFeeds) {
             for (int feed = 0; feed < m_outputFeedCount; ++feed) {
@@ -2158,7 +2344,14 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                 // keyframe, so handleFrame is called once per unit and the
                 // per-frame decimateCounter/lastVideoPtsMs advancement matches
                 // the FFmpeg path's per-receive_frame loop.
-                track->nativeDecoder->decode(unit, handleFrame, nullptr);
+                QString decodeError;
+                const bool decodedNative =
+                    track->nativeDecoder->decode(unit, handleFrame, &decodeError);
+                if (!decodedNative && track->nativeDecodeFailureWarnings < 3) {
+                    ++track->nativeDecodeFailureWarnings;
+                    qWarning() << "PlaybackWorker: NativeVideoDecoder failed for stream"
+                               << track->streamIndex << "ptsMs" << packetPtsMs() << decodeError;
+                }
             }
             return lastVideoPtsMs;
         }
@@ -2313,18 +2506,12 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                                                        std::memory_order_release);
 #endif
                     m_committedGeneration.store(startedSeekGeneration, std::memory_order_release);
-                    // Re-anchor the output clock to the now-live playhead AFTER the commit.
-                    // seekTo's resetPlayEpoch (issued before this reposition) can be consumed
-                    // by an output tick while the CommitGate is still holding the OLD
-                    // playhead, anchoring the play epoch to it; without re-anchoring here the
-                    // epoch stays at the old position, sampledPlayheadMs diverges by the seek
-                    // distance, and the output samples a window the cache never covers -> a
-                    // gray placeholder with no last-good frame (the farback flake).
-                    QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
-                    if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
                 });
         }
         if (!committed) return;
+        // Re-anchor and publish after leaving m_mutex: dispatchImmediate snapshots the
+        // output cache and must not run under the seek-state lock.
+        refreshOutputAfterSeekCommit();
         return;
     }
 
@@ -2344,6 +2531,15 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 
     const int primaryVideoStreamIndex = m_decoderBank[0]->streamIndex;
     AVStream* vStream = m_fmtCtx->streams[primaryVideoStreamIndex];
+
+    if (m_fmtCtx->pb) {
+        // The worker opens recordings while they are still growing. Matroska can
+        // latch EOF after reading the temporary tail; a seek-driven reposition
+        // must clear that latch before retrying or it can spin on the old EOF
+        // without ever seeing newly appended clusters.
+        m_fmtCtx->pb->eof_reached = 0;
+        m_fmtCtx->pb->error = 0;
+    }
 
     // Tier 3 exact-offset seek: if the primary-stream FrameIndex has an entry
     // at/just-before the coarse anchor, avio_seek straight to that byte offset
@@ -2486,29 +2682,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     endGpuSeekPrefetchForReposition();
 #endif
 
-    bool targetCovered = m_outputFeedCount <= 0;
-    if (m_outputFeedCount > 0 && m_outputCache) {
-        targetCovered = true;
-        uint64_t gpuGeneration = 0;
-#ifdef OLR_GPU_PIPELINE_BUILD
-        if (gpuPipelineEnabled()) gpuGeneration = GpuGenerationCounter::instance().current();
-#endif
-        const qint64 toleranceMs = qMax<qint64>(1, frameDurMs());
-        for (int feed = 0; feed < m_outputFeedCount; ++feed) {
-            const std::optional<FrameHandle> prior =
-                m_outputCache->videoFrameAtFreshForGeneration(feed, target, gpuGeneration);
-            if (prior.has_value() && !prior->metadata().key.isPlaceholder &&
-                target - prior->metadata().key.ptsMs <= toleranceMs)
-                continue;
-            const std::optional<FrameHandle> future =
-                m_outputCache->firstFreshVideoFrameAtOrAfter(feed, target, gpuGeneration);
-            if (!future.has_value() || future->metadata().key.isPlaceholder ||
-                future->metadata().key.ptsMs - target > toleranceMs) {
-                targetCovered = false;
-                break;
-            }
-        }
-    }
+    const bool targetCovered = m_outputFeedCount <= 0 || outputCacheCoversPlayhead(target);
     if (!targetCovered) {
         {
             QMutexLocker bufferLocker(&m_bufferMutex);
@@ -2586,15 +2760,6 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                 m_counters.cutFollowReposition++;
             else
                 m_counters.reposition++;
-
-            // Tier 2: the cache now covers `target`; the committed playhead/generation were
-            // published atomically with the cache above.
-            // Re-anchor the output clock to the now-live playhead AFTER the commit (see
-            // the reuse fast-path above): otherwise the play epoch stays anchored to the
-            // CommitGate-held OLD playhead, sampledPlayheadMs diverges by the seek
-            // distance, and the output grays a window the cache never covers.
-            QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
-            if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
         }
     }
     if (!committed) {
@@ -2613,6 +2778,12 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 #endif
         return;
     }
+
+    // Tier 2: the cache now covers `target`; the committed playhead/generation were
+    // published atomically with the cache above. Re-anchor and publish the target frame
+    // immediately after leaving m_mutex so paused seek/step/scrub does not wait for the
+    // next scheduled output tick.
+    refreshOutputAfterSeekCommit();
 
 #ifdef OLR_GPU_PIPELINE_BUILD
     drainEvictedGpuFrames();
@@ -3588,26 +3759,7 @@ void PlaybackWorker::run() {
         if (!playing) {
             // Recompute dir for the paused case from the last explicit move.
             dir = m_lastMoveDir.load(std::memory_order_relaxed);
-            // Has the playhead left the delivered frame's interval? If the
-            // reference track has no frame at P, we must (re)deliver/reposition.
-            bool needWork = false;
-            {
-                QMutexLocker locker(&m_mutex);
-                if (m_seekTargetMs >= 0) needWork = true;
-            }
-            if (!needWork) {
-                // If a frame at P exists and is already the delivered one, idle.
-                QMutexLocker bufferLocker(&m_bufferMutex);
-                if (!m_decoderBank.isEmpty()) {
-                    FrameHandle f;
-                    int64_t p = -1;
-                    DecoderTrack* ref = m_decoderBank[0];
-                    if (!ref->buffer.frameAt(P, f, p) || p != ref->lastDeliveredPtsMs)
-                        needWork = true;
-                } else {
-                    needWork = true;
-                }
-            }
+            const bool needWork = pausedPlayheadNeedsWork(P);
             if (!needWork) {
                 msleep(10);
                 continue;

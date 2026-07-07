@@ -128,7 +128,13 @@ bool StreamWorker::ensureGpuEncodePumpStarted() {
 
 bool StreamWorker::preferGpuVideoFramesForIngest() const {
 #if defined(Q_OS_IOS)
+    // iOS GPU playback is default-on, but recorder surface encode is still held off: a stalled
+    // VideoToolbox surface encode can block live ingest. Keep recording on CPU frames for now.
     return false;
+#elif defined(__APPLE__)
+    return gpuPipelineEnabled() && gpuRecordSurfaceEncodeEnabled() &&
+           m_videoCodec == VideoCodecChoice::H264Hardware &&
+           !m_gpuEncodeCpuFallback.load(std::memory_order_acquire);
 #else
     return gpuPipelineEnabled() && m_videoCodec == VideoCodecChoice::H264Hardware &&
            !m_gpuEncodeCpuFallback.load(std::memory_order_acquire);
@@ -837,7 +843,7 @@ bool StreamWorker::setupEncoder(AVCodecContext** encCtx) {
             return false;
         }
 #if defined(OLR_GPU_PIPELINE_BUILD)
-        if (gpuPipelineEnabled()) {
+        if (preferGpuVideoFramesForIngest()) {
             ensureGpuEncodePumpStarted();
         }
 #endif

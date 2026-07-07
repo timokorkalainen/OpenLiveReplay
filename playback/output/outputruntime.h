@@ -43,12 +43,14 @@ public:
 
     OutputDispatchStats dispatchDueTicksForTest(qint64 wallNowMs);
     OutputDispatchStats dispatchDueTicksForTestNs(qint64 wallNowNs);
+    OutputDispatchStats dispatchImmediate();
     OutputDispatchStats stats() const;
     std::shared_ptr<SharedGpuReadbackCache> sharedGpuReadbacks() const;
     // Test support: snapshot of live endpoint sink chains.
     QList<OutputEndpoint> outputEndpointsForTest() const;
 #ifdef OLR_UNIT_TEST
     std::shared_ptr<GpuRhiContext> gpuRhiContextForTest() const;
+    int playEpochResetCountForTest() const;
 #endif
     // Tier3 atomic cut: the next output frame index the dispatcher will emit,
     // read under m_mutex after any active dispatch tick has finished. SAFE to call
@@ -94,6 +96,9 @@ private:
     qint64 m_pendingFrameIndexReset = 0;
     bool m_pendingPlayEpochReset = false;
     int m_pendingFenceWaitStalls = 0;
+#ifdef OLR_UNIT_TEST
+    int m_playEpochResetCountForTest = 0;
+#endif
     qint64 m_gpuVramBytes = 0;
     qint64 m_gpuBudgetBytes = 0;
     qint64 m_gpuGatedLiveBytes = 0;

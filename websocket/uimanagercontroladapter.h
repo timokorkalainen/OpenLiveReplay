@@ -22,6 +22,7 @@ public:
     ScreensState screensState() const override;
     ImportState importState() const override;
     TelemetryState telemetryState() const override;
+    QVariantMap outputState() const override;
     CommandResult executeCommand(const QString& name, const QJsonObject& args) override;
 
 private:

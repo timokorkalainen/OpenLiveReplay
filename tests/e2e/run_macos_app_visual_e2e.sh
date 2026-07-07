@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# macOS real-app visual reliability gate.
+#
+# Launches the actual OpenLiveReplay.app visibly, drives it over WebSocket,
+# records a deterministic numbered-frame marker stream over local SRT, then
+# verifies paused seek/jog preview pixels via provider captures. Also saves an
+# OS screenshot for human inspection.
+set -uo pipefail
+
+APP="${1:?OpenLiveReplay executable required}"
+MARKER_SRC="${2:?ndi_marker_mkv_source required}"
+MARKER_PROBE="${3:?marker_yuv_probe required}"
+
+SKIP=77
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# shellcheck source=srt_lib.sh
+. "$HERE/srt_lib.sh"
+export SRT_SKIP_CODE="$SKIP"
+
+[ "$(uname -s)" = "Darwin" ] || { echo "SKIP: macOS app visual e2e requires Darwin"; exit "$SKIP"; }
+[ -x "$APP" ] || { echo "FAIL: app executable not found at $APP"; exit 1; }
+command -v python3 >/dev/null || { echo "SKIP: python3 not found"; exit "$SKIP"; }
+command -v ffmpeg >/dev/null || { echo "SKIP: ffmpeg not found"; exit "$SKIP"; }
+command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit "$SKIP"; }
+command -v srt-live-transmit >/dev/null || { echo "SKIP: srt-live-transmit not found"; exit "$SKIP"; }
+pgrep -x WindowServer >/dev/null || { echo "SKIP: no macOS WindowServer"; exit "$SKIP"; }
+
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])libx264[[:space:]]'; then
+    VIDEO_ARGS=(-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p
+        -g 1 -keyint_min 1 -sc_threshold 0 -b:v 4M)
+elif ffmpeg -hide_banner -encoders 2>/dev/null | grep -Eq '(^|[[:space:]])h264_videotoolbox[[:space:]]'; then
+    VIDEO_ARGS=(-c:v h264_videotoolbox -allow_sw 1 -realtime 1 -pix_fmt yuv420p
+        -g 1 -b:v 4M)
+else
+    echo "SKIP: ffmpeg has no usable H.264 encoder"
+    exit "$SKIP"
+fi
+
+BASE_PORT="${OLR_APP_E2E_BASE_PORT:-31870}"
+CONTROL_PORT="${OLR_APP_E2E_CONTROL_PORT:-$((BASE_PORT + RANDOM % 1000))}"
+SRT_PORT="${OLR_APP_E2E_SRT_PORT:-$((CONTROL_PORT + 1))}"
+UDP_PORT=$((SRT_PORT + 1))
+
+WORKDIR="$(mktemp -d)"
+FFPID=""
+PIDS=()
+cleanup() {
+    [ -n "$FFPID" ] && kill "$FFPID" 2>/dev/null
+    if [ "${#PIDS[@]}" -gt 0 ]; then
+        kill "${PIDS[@]}" 2>/dev/null
+    fi
+    wait "$FFPID" "${PIDS[@]}" 2>/dev/null
+    if [ "${OLR_APP_E2E_KEEP_WORKDIR:-0}" != "1" ]; then
+        rm -rf "$WORKDIR"
+    else
+        echo "[app-e2e] kept workdir: $WORKDIR"
+    fi
+}
+trap cleanup EXIT
+
+echo "[app-e2e] workdir=$WORKDIR control_port=$CONTROL_PORT srt_port=$SRT_PORT udp_port=$UDP_PORT"
+
+"$MARKER_SRC" "$WORKDIR/marker" 45 || { echo "FAIL: marker source failed"; exit 1; }
+
+if ! ffmpeg -hide_banner -loglevel error -y \
+        -f rawvideo -pix_fmt yuv420p -s 256x144 -r 30 -i "$WORKDIR/marker.yuv" \
+        -f s16le -ar 48000 -ac 2 -i "$WORKDIR/marker.pcm" \
+        -filter_complex "[0:v]settb=1/1000,setpts=trunc(N*1000/30)[v]" \
+        -map "[v]" -map 1:a \
+        "${VIDEO_ARGS[@]}" -enc_time_base 1:1000 -c:a pcm_s16le "$WORKDIR/marker.mkv"; then
+    echo "FAIL: marker MKV mux failed"
+    exit 1
+fi
+
+srt_bridge "$UDP_PORT" "$SRT_PORT"
+sleep 0.5
+
+ffmpeg -hide_banner -loglevel error -re -stream_loop -1 -i "$WORKDIR/marker.mkv" \
+    -map 0:v:0 -map 0:a:0 -c:v copy -c:a aac -b:a 96k \
+    -f mpegts "udp://127.0.0.1:${UDP_PORT}?pkt_size=1316" &
+FFPID=$!
+sleep 0.8
+if ! kill -0 "$FFPID" 2>/dev/null; then
+    echo "FAIL: marker stream exited early"
+    exit 1
+fi
+
+python3 "$HERE/macos_app_driver.py" \
+    --app "$APP" \
+    --port "$CONTROL_PORT" \
+    --documents-root "$WORKDIR/Documents" \
+    --srt-url "$(srt_caller_url "$SRT_PORT")" \
+    --marker-probe "$MARKER_PROBE" \
+    --workdir "$WORKDIR"

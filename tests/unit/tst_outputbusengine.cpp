@@ -4,6 +4,7 @@
 
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpucompositor.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpurhicontext.h"
 #endif
 
@@ -89,6 +90,7 @@ private slots:
     void multiviewComposesFeedsAndCarriesSelectedFeedAudio();
     void feedUsesNearFutureFrameBeforePlaceholder();
     void multiviewUsesNearFutureFeedBeforePlaceholder();
+    void feedPrefersTimestampRoundingFutureOverFrameOldPrior();
     void multiviewChoosesSelectedSourceColorMetadata();
     void ntscAudioUsesRationalSampleBoundaries();
     void ntscAudioSpansStayContiguousAcrossOddPlayEpoch();
@@ -99,6 +101,7 @@ private slots:
     void multiviewUsesCpuCompositorWithoutInjectedGpuCompositor();
 #ifdef OLR_GPU_PIPELINE_BUILD
     void multiviewUsesInjectedGpuCompositorWhenEnabled();
+    void multiviewMemoInvalidatesWhenOutputGpuGenerationChangesWithAbsentSources();
 #endif
     void programmeTimecodeTracksPlayheadOnEveryBus();
     void staleGpuFeedAndPgmFramesArePlaceholders();
@@ -347,6 +350,44 @@ void TestOutputBusEngine::multiviewUsesNearFutureFeedBeforePlaceholder() {
     QVERIFY(!multiview.identity.videoPlaceholder);
 }
 
+void TestOutputBusEngine::feedPrefersTimestampRoundingFutureOverFrameOldPrior() {
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+
+    {
+        OutputFrameCache cache(1, 4, 4);
+        cache.insertVideoFrame(video(0, 29933, 10));
+        cache.insertVideoFrame(video(0, 29967, 20));
+
+        PlaybackStateSnapshot state;
+        state.playheadMs = 29966;
+        state.playing = false;
+        state.selectedFeedIndex = 0;
+
+        const auto feed = engine.renderFeed(0, 0, state, cache);
+
+        QCOMPARE(feed.video.metadata().key.ptsMs, qint64(29967));
+        QCOMPARE(feed.identity.sourcePtsMs, qint64(29967));
+        QCOMPARE(uchar(MediaVideoFrameView(feed.video).planeY.at(0)), uchar(20));
+    }
+
+    {
+        OutputFrameCache cache(1, 4, 4);
+        cache.insertVideoFrame(video(0, 29932, 10));
+        cache.insertVideoFrame(video(0, 29967, 20));
+
+        PlaybackStateSnapshot state;
+        state.playheadMs = 29965;
+        state.playing = false;
+        state.selectedFeedIndex = 0;
+
+        const auto feed = engine.renderFeed(0, 0, state, cache);
+
+        QCOMPARE(feed.video.metadata().key.ptsMs, qint64(29967));
+        QCOMPARE(feed.identity.sourcePtsMs, qint64(29967));
+        QCOMPARE(uchar(MediaVideoFrameView(feed.video).planeY.at(0)), uchar(20));
+    }
+}
+
 void TestOutputBusEngine::multiviewChoosesSelectedSourceColorMetadata() {
     ColorMetadata selectedColor;
     selectedColor.matrix = ColorMatrix::Bt601;
@@ -587,6 +628,46 @@ void TestOutputBusEngine::multiviewUsesInjectedGpuCompositorWhenEnabled() {
     QCOMPARE(rgba.format, FramePixelFormat::Rgba8);
     QCOMPARE(rgba.width, 8);
     QCOMPARE(rgba.height, 8);
+#endif
+}
+
+void TestOutputBusEngine::
+    multiviewMemoInvalidatesWhenOutputGpuGenerationChangesWithAbsentSources() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    OutputFrameCache cache(2, 4, 4);
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = GpuGenerationCounter::instance().current();
+
+    MultiviewComposite memo;
+    const auto first = engine.renderMultiview(5, state, cache, &memo);
+    QVERIFY(first.video.isGpuBacked());
+    QVERIFY(first.video.metadata().key.isPlaceholder);
+
+    state.gpuGeneration = GpuGenerationCounter::instance().bump();
+    const auto second = engine.renderMultiview(6, state, cache, &memo);
+    QVERIFY(second.video.isGpuBacked());
+    QVERIFY(second.video.metadata().key.isPlaceholder);
+    QCOMPARE(second.video.metadata().gpuGeneration, state.gpuGeneration);
+
+    const CpuPlanes rgba = second.video.readToCpu(FramePixelFormat::Rgba8);
+    QVERIFY2(rgba.isValid(),
+             "memo hit after a GPU-generation bump must not reuse an old-generation surface");
 #endif
 }
 #endif

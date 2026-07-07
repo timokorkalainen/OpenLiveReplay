@@ -66,6 +66,16 @@ struct OutputBusFrame {
 
 OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 
+namespace OutputFrameSelection {
+// Container and transport integer-ms rounding can put the intended stepped frame just ahead of
+// the playhead. Keep this window tight so lower-cadence sources still hold the prior frame.
+constexpr qint64 kTimestampRoundingToleranceMs = 2;
+
+inline bool isTimestampRoundingFuture(qint64 deltaMs) {
+    return deltaMs >= 0 && deltaMs <= kTimestampRoundingToleranceMs;
+}
+} // namespace OutputFrameSelection
+
 // Persistent (caller-owned) memo for the multiview compositor. The composited grid depends
 // only on the source frames selected for a tick, so when the exact per-feed source
 // descriptor is unchanged the full-resolution scale can be skipped and the prior planes
@@ -73,7 +83,8 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 // fresh composite — a hash key could collide and emit a stale frame.
 struct MultiviewComposite {
     bool valid = false;
-    // 8 entries per feed: presence/timing/generation plus color/range dimensions.
+    // Output GPU generation plus 8 entries per feed: presence/timing/source generation plus
+    // color/range dimensions.
     QVector<qint64> sourceKeys{};
     FrameHandle video;
 };

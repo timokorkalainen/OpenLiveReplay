@@ -14,6 +14,11 @@ bool gpuPipelineEnabled() {
     return v == "1" || v == "true" || v == "on";
 }
 
+bool gpuRecordSurfaceEncodeEnabled() {
+    const QByteArray v = qgetenv("OLR_GPU_RECORD_SURFACE_ENCODE").toLower();
+    return v == "1" || v == "true" || v == "on";
+}
+
 int gpuForcedPerTrackBudget() {
     const QByteArray v = qgetenv("OLR_GPU_FORCE_BUDGET");
     if (v.isEmpty()) return -1;

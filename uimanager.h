@@ -40,9 +40,11 @@ class UIManager : public QObject {
     Q_OBJECT
     // These allow QML to bind to your settings automatically
     Q_PROPERTY(QStringList streamUrls READ streamUrls WRITE setStreamUrls NOTIFY streamUrlsChanged)
-    Q_PROPERTY(QStringList streamNames READ streamNames WRITE setStreamNames NOTIFY streamNamesChanged)
+    Q_PROPERTY(
+        QStringList streamNames READ streamNames WRITE setStreamNames NOTIFY streamNamesChanged)
     Q_PROPERTY(QStringList streamIds READ streamIds WRITE setStreamIds NOTIFY streamIdsChanged)
-    Q_PROPERTY(QString saveLocation READ saveLocation WRITE setSaveLocation NOTIFY saveLocationChanged)
+    Q_PROPERTY(
+        QString saveLocation READ saveLocation WRITE setSaveLocation NOTIFY saveLocationChanged)
     Q_PROPERTY(QString fileName READ fileName WRITE setFileName NOTIFY fileNameChanged)
     Q_PROPERTY(int recordWidth READ recordWidth WRITE setRecordWidth NOTIFY recordWidthChanged)
     Q_PROPERTY(int recordHeight READ recordHeight WRITE setRecordHeight NOTIFY recordHeightChanged)
@@ -55,9 +57,11 @@ class UIManager : public QObject {
     Q_PROPERTY(int recordFps READ recordFps WRITE setRecordFps NOTIFY recordFpsChanged)
     Q_PROPERTY(int recordFpsNumerator READ recordFpsNumerator NOTIFY recordFpsChanged)
     Q_PROPERTY(int recordFpsDenominator READ recordFpsDenominator NOTIFY recordFpsChanged)
-    Q_PROPERTY(int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
+    Q_PROPERTY(
+        int multiviewCount READ multiviewCount WRITE setMultiviewCount NOTIFY multiviewCountChanged)
     Q_PROPERTY(bool isRecording READ isRecording NOTIFY recordingStatusChanged)
-    Q_PROPERTY(QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
+    Q_PROPERTY(
+        QVariantList playbackProviders READ playbackProviders NOTIFY playbackProvidersChanged)
     Q_PROPERTY(FrameProvider* multiviewPreviewProvider READ multiviewPreviewProvider NOTIFY
                    playbackProvidersChanged)
     Q_PROPERTY(
@@ -67,11 +71,14 @@ class UIManager : public QObject {
     Q_PROPERTY(QString playbackTimecode READ playbackTimecode NOTIFY playbackTimecodeChanged)
     Q_PROPERTY(bool playbackSingleView READ playbackSingleView NOTIFY playbackViewStateChanged)
     Q_PROPERTY(int playbackSelectedIndex READ playbackSelectedIndex NOTIFY playbackViewStateChanged)
-    Q_PROPERTY(qint64 recordingStartEpochMs READ recordingStartEpochMs NOTIFY recordingStartEpochMsChanged)
-    Q_PROPERTY(bool timeOfDayMode READ timeOfDayMode WRITE setTimeOfDayMode NOTIFY timeOfDayModeChanged)
+    Q_PROPERTY(
+        qint64 recordingStartEpochMs READ recordingStartEpochMs NOTIFY recordingStartEpochMsChanged)
+    Q_PROPERTY(
+        bool timeOfDayMode READ timeOfDayMode WRITE setTimeOfDayMode NOTIFY timeOfDayModeChanged)
     Q_PROPERTY(int liveBufferMs READ liveBufferMs CONSTANT)
     Q_PROPERTY(QStringList midiPorts READ midiPorts NOTIFY midiPortsChanged)
-    Q_PROPERTY(int midiPortIndex READ midiPortIndex WRITE setMidiPortIndex NOTIFY midiPortIndexChanged)
+    Q_PROPERTY(
+        int midiPortIndex READ midiPortIndex WRITE setMidiPortIndex NOTIFY midiPortIndexChanged)
     Q_PROPERTY(bool midiConnected READ midiConnected NOTIFY midiConnectedChanged)
     Q_PROPERTY(int midiLearnAction READ midiLearnAction NOTIFY midiLearnActionChanged)
     Q_PROPERTY(int midiLearnMode READ midiLearnMode NOTIFY midiLearnActionChanged)
@@ -90,8 +97,10 @@ class UIManager : public QObject {
     Q_PROPERTY(QString playlistOperationError READ playlistOperationError NOTIFY
                    playlistOperationErrorChanged)
     Q_PROPERTY(StreamDeckManager* streamDeck READ streamDeck CONSTANT)
-    Q_PROPERTY(int streamDeckLearnAction READ streamDeckLearnAction NOTIFY streamDeckLearnActionChanged)
-    Q_PROPERTY(int streamDeckBindingsVersion READ streamDeckBindingsVersion NOTIFY streamDeckBindingsChanged)
+    Q_PROPERTY(
+        int streamDeckLearnAction READ streamDeckLearnAction NOTIFY streamDeckLearnActionChanged)
+    Q_PROPERTY(int streamDeckBindingsVersion READ streamDeckBindingsVersion NOTIFY
+                   streamDeckBindingsChanged)
     Q_PROPERTY(QVariantList screenOptions READ screenOptions NOTIFY screensChanged)
     Q_PROPERTY(bool screensReady READ screensReady NOTIFY screensChanged)
     Q_PROPERTY(int screenCount READ screenCount NOTIFY screensChanged)
@@ -112,7 +121,8 @@ class UIManager : public QObject {
     // Bumped when any source's trim changes (config load / programmatic set) so
     // QML re-reads sourceTrimOffset() bindings.
     Q_PROPERTY(int sourceTrimVersion READ sourceTrimVersion NOTIFY sourceTrimChanged)
-    Q_PROPERTY(QString importSettingsUrl READ importSettingsUrl WRITE setImportSettingsUrl NOTIFY importSettingsUrlChanged)
+    Q_PROPERTY(QString importSettingsUrl READ importSettingsUrl WRITE setImportSettingsUrl NOTIFY
+                   importSettingsUrlChanged)
     Q_PROPERTY(QString importPreviewError READ importPreviewError NOTIFY importPreviewChanged)
     Q_PROPERTY(QVariantMap importPreview READ importPreview NOTIFY importPreviewChanged)
     Q_PROPERTY(bool importPreviewReady READ importPreviewReady NOTIFY importPreviewChanged)
@@ -128,7 +138,7 @@ class UIManager : public QObject {
     Q_PROPERTY(int sessionReferenceTier READ sessionReferenceTier NOTIFY sessionReferenceChanged)
 
 public:
-    explicit UIManager(ReplayManager *engine, QObject *parent = nullptr);
+    explicit UIManager(ReplayManager* engine, QObject* parent = nullptr);
     ~UIManager() override;
 
     // Getters for QML
@@ -205,11 +215,11 @@ public:
     int broadcastOutputStatusVersion() const { return m_broadcastOutputStatusVersion; }
 
     // Setters
-    void setStreamUrls(const QStringList &urls);
-    void setStreamNames(const QStringList &names);
-    void setStreamIds(const QStringList &ids);
-    void setSaveLocation(const QString &path);
-    void setFileName(const QString &name);
+    void setStreamUrls(const QStringList& urls);
+    void setStreamNames(const QStringList& names);
+    void setStreamIds(const QStringList& ids);
+    void setSaveLocation(const QString& path);
+    void setFileName(const QString& name);
     void setRecordWidth(int width);
     void setRecordHeight(int height);
     void setRecordCodec(const QString& codec);
@@ -219,7 +229,7 @@ public:
     Q_INVOKABLE void runBenchmark();
     Q_INVOKABLE void cancelBenchmark();
     void setTimeOfDayMode(bool enabled);
-    void setImportSettingsUrl(const QString &url);
+    void setImportSettingsUrl(const QString& url);
 
     void refreshProviders();
 
@@ -227,19 +237,19 @@ public:
     Q_INVOKABLE void openStreams();
     Q_INVOKABLE void startRecording();
     Q_INVOKABLE void stopRecording();
-    Q_INVOKABLE void updateUrl(int index, const QString &url);
-    Q_INVOKABLE void updateStreamName(int index, const QString &name);
-    Q_INVOKABLE void updateStreamId(int index, const QString &id);
+    Q_INVOKABLE void updateUrl(int index, const QString& url);
+    Q_INVOKABLE void updateStreamName(int index, const QString& name);
+    Q_INVOKABLE void updateStreamId(int index, const QString& id);
     Q_INVOKABLE QString sourceDisplayLabel(int sourceIndex) const;
     Q_INVOKABLE QVariantList metadataFieldDefinitions() const;
-    Q_INVOKABLE void setMetadataFieldDefinitions(const QVariantList &fields);
+    Q_INVOKABLE void setMetadataFieldDefinitions(const QVariantList& fields);
     Q_INVOKABLE QVariantList sourceMetadataItems(int index) const;
-    Q_INVOKABLE void setSourceMetadataItems(int index, const QVariantList &items);
+    Q_INVOKABLE void setSourceMetadataItems(int index, const QVariantList& items);
     Q_INVOKABLE void loadSettings();
     Q_INVOKABLE void addStream();             // Increases stream count
     Q_INVOKABLE void removeStream(int index); // (Optional) for better UX
     Q_INVOKABLE void saveSettings();          // Manual save trigger
-    Q_INVOKABLE void setSaveLocationFromUrl(const QUrl &folderUrl);
+    Q_INVOKABLE void setSaveLocationFromUrl(const QUrl& folderUrl);
     Q_INVOKABLE void scrubToLive();
     Q_INVOKABLE void captureSnapshot(bool singleView, int selectedIndex, int64_t playheadMs);
     Q_INVOKABLE void refreshMidiPorts();
@@ -309,13 +319,14 @@ public:
     Q_INVOKABLE QVariantList telemetryRowsAtPlayhead();
     Q_INVOKABLE QVariantList ndiOutputRows() const;
     Q_INVOKABLE QVariantMap ndiOutputStatus(const QString& targetId) const;
+    QVariantMap previewOutputState() const;
     Q_INVOKABLE bool ndiOutputEnabled(const QString& busKind, int feedIndex) const;
     Q_INVOKABLE QString ndiOutputSenderName(const QString& busKind, int feedIndex) const;
     Q_INVOKABLE void setNdiOutputEnabled(const QString& busKind, int feedIndex, bool enabled);
     Q_INVOKABLE void setNdiOutputSenderName(const QString& busKind, int feedIndex,
                                             const QString& senderName);
 
-    //Playback
+    // Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
     Q_INVOKABLE void endScrubGesture();
     // Tier3 replay cue list: capture mark-in/out at the current playhead and
@@ -487,11 +498,10 @@ private:
     QList<FrameProvider*> m_providers;
     FrameProvider* m_multiviewPreviewProvider = nullptr;
     FrameProvider* m_pgmPreviewProvider = nullptr;
-    PlaybackTransport *m_transport;
-    AudioPlayer *m_audioPlayer = nullptr;
-    // Scrub coalescing: seek immediately on the first move of a gesture and on
-    // release, but commit only the latest target on a single-shot timer in
-    // between. SeekCoalescer holds the pure decision logic (unit-tested).
+    PlaybackTransport* m_transport;
+    AudioPlayer* m_audioPlayer = nullptr;
+    // Scrub release cleanup for older coalesced gestures. Live scrub movement is
+    // intentionally immediate: every drag sample calls seekPlayback().
     void commitPendingScrub();
     SeekCoalescer m_seekCoalescer;
     QTimer m_scrubCoalesceTimer;
@@ -538,7 +548,7 @@ private:
     QHash<int, int> m_midiBindingData2Backward;
 
     QList<bool> m_sourceEnabled;
-    QList<int> m_viewSlotMap;       // viewSlotMap[viewIndex] = sourceIndex or -1
+    QList<int> m_viewSlotMap; // viewSlotMap[viewIndex] = sourceIndex or -1
     int m_sourceEnabledVersion = 0;
 
     // Live connection state per source index, mirrored from the workers via
@@ -570,7 +580,7 @@ private:
     void updateReplayTelemetryFeeds();
     void clearImportPreview();
     void applyBroadcastOutputs(const QList<OutputTargetAssignment>& outputs);
-    bool loadTelemetryTimeline(const QString &filePath, bool notify = true);
+    bool loadTelemetryTimeline(const QString& filePath, bool notify = true);
     QVariantMap recordingTelemetryStateAt(qint64 playheadMs) const;
 
     struct TelemetryTimelineEntry {
@@ -581,8 +591,8 @@ private:
     QList<QScreen*> m_screens;
     QVariantList m_screenOptions;
 
-    ProjectImportClient *m_importClient = nullptr;
-    TelemetryClient *m_telemetryClient = nullptr;
+    ProjectImportClient* m_importClient = nullptr;
+    TelemetryClient* m_telemetryClient = nullptr;
     ProjectSettingsImporter m_settingsImporter;
     ProjectSettingsImportResult m_pendingImport;
     bool m_hasPendingImport = false;
@@ -598,11 +608,7 @@ private:
     QTimer m_broadcastOutputStatusTimer;
     quint64 m_broadcastOutputStatusFingerprint = 0;
 
-    enum MidiLearnMode {
-        LearnControl = 0,
-        LearnJogForward = 1,
-        LearnJogBackward = 2
-    };
+    enum MidiLearnMode { LearnControl = 0, LearnJogForward = 1, LearnJogBackward = 2 };
     int m_midiLearnMode = LearnControl;
 };
 

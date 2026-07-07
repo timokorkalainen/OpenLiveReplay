@@ -241,10 +241,12 @@ private slots:
     void sharedReadbackCacheSeparatesBusSurfaces();
     void sharedReadbackCacheSeparatesGpuGenerations();
     void generationChangeClearsPendingReadbacks();
+    void generationChangeDoesNotCountInFlightReadbackAsQueueDrop();
     void cpuGenerationChangeClearsPendingReadbacks();
     void generationChangePreservesExistingDropCount();
     void stopDropsPendingReadbacksWithoutWaitingOnFence();
     void producerFenceControlsGpuReadbackReadiness();
+    void flushDeliversPendingGpuReadbackWithoutFutureSubmit();
     void gpuReadbackDoesNotBlockSubmitTick();
     void continuousCadenceResendsLastFrameWhileFencePending();
     void readyReadbackDoesNotDoubleSubmitCadence();
@@ -521,6 +523,26 @@ void TestAsyncGpuReadbackSink::generationChangeClearsPendingReadbacks() {
     QCOMPARE(observed->deliveredAt(1).video.metadata().gpuGeneration, uint64_t(2));
 }
 
+void TestAsyncGpuReadbackSink::generationChangeDoesNotCountInFlightReadbackAsQueueDrop() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<RecordingSink>();
+    AsyncGpuReadbackSink sink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    auto blocking = std::make_shared<BlockingGpuFrameData>();
+    QVERIFY(sink.submit(gpuFrame(0, blocking, 1)));
+    QVERIFY(sink.submit(gpuFrame(1, std::make_shared<CountingGpuFrameData>(41), 1)));
+    QVERIFY(sink.submit(gpuFrame(2, std::make_shared<CountingGpuFrameData>(42), 1)));
+    QVERIFY(sink.submit(gpuFrame(3, std::make_shared<CountingGpuFrameData>(43), 1)));
+    QVERIFY2(blocking->waitForReadStart(1000), "readback did not start");
+    QVERIFY(sink.submit(gpuFrame(4, std::make_shared<CountingGpuFrameData>(80), 2)));
+
+    const qint64 readbackDrops = sink.readbackDrops();
+    blocking->releaseReadback();
+    QCOMPARE(readbackDrops, qint64(3));
+}
+
 void TestAsyncGpuReadbackSink::cpuGenerationChangeClearsPendingReadbacks() {
     qputenv("OLR_GPU_PIPELINE", "1");
     auto inner = std::make_unique<RecordingSink>();
@@ -624,6 +646,30 @@ void TestAsyncGpuReadbackSink::producerFenceControlsGpuReadbackReadiness() {
     QCOMPARE(observed->deliveredAt(0).outputFrameIndex, qint64(0));
     QTRY_COMPARE_WITH_TIMEOUT(data->readCount(), 1, 1000);
     QCOMPARE(wrapperFence->waitCalls(), 0);
+}
+
+void TestAsyncGpuReadbackSink::flushDeliversPendingGpuReadbackWithoutFutureSubmit() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<RecordingSink>();
+    RecordingSink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    auto producerFence = std::make_shared<ManualFence>();
+    auto data = std::make_shared<CountingGpuFrameData>(53, 7, producerFence);
+
+    QVERIFY(sink.submit(gpuFrame(1, data, 1)));
+    QCOMPARE(observed->deliveredCount(), qsizetype(0));
+    QCOMPARE(sink.readbackQueueDepth(), qint64(1));
+
+    producerFence->complete(7);
+    QVERIFY(sink.flush(1000));
+    QCOMPARE(observed->deliveredCount(), qsizetype(1));
+    QCOMPARE(observed->deliveredAt(0).outputFrameIndex, qint64(1));
+    QVERIFY(!observed->gpuBackedAt(0));
+    QCOMPARE(data->readCount(), 1);
+    QCOMPARE(sink.readbackQueueDepth(), qint64(0));
 }
 
 void TestAsyncGpuReadbackSink::gpuReadbackDoesNotBlockSubmitTick() {

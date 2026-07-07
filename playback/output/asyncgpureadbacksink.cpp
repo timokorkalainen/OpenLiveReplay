@@ -5,6 +5,7 @@
 #include "playback/gpu/gpusurface.h"
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <utility>
 
@@ -111,8 +112,7 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
                 m_stopRequested.load(std::memory_order_acquire))
                 return false;
             if (gpuRuntimeEnabled && !frame.video.isGpuBacked() && m_hasGpuGeneration) {
-                m_generationDrops += m_ring.drops() + m_ring.occupancy() + m_jobs.size() +
-                                     (m_readbackInFlight ? 1 : 0);
+                m_generationDrops += m_ring.drops() + m_ring.occupancy() + m_jobs.size();
                 clearPendingReadbacksLocked();
                 m_hasLastDelivered = false;
                 m_hasLastIdentity = false;
@@ -155,8 +155,7 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
             m_needsReadbackCadence.store(true, std::memory_order_release);
         if (gpuGeneration != 0) {
             if (m_hasGpuGeneration && m_lastGpuGeneration != gpuGeneration) {
-                m_generationDrops += m_ring.drops() + m_ring.occupancy() + m_jobs.size() +
-                                     (m_readbackInFlight ? 1 : 0);
+                m_generationDrops += m_ring.drops() + m_ring.occupancy() + m_jobs.size();
                 clearPendingReadbacksLocked();
                 m_hasLastDelivered = false;
                 m_hasLastIdentity = false;
@@ -203,6 +202,87 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
     }
 
     return cadenceOk;
+}
+
+bool AsyncGpuReadbackSink::flush(int timeoutMs) {
+    if (!m_readbackEnabled.load(std::memory_order_acquire)) return true;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(qMax(0, timeoutMs));
+
+    while (true) {
+        RingReadbackJob job;
+        {
+            std::unique_lock<std::mutex> locker(m_mutex);
+            if (!m_active.load(std::memory_order_acquire) ||
+                m_stopRequested.load(std::memory_order_acquire))
+                return false;
+
+            while ((!m_jobs.isEmpty() || m_readbackInFlight) &&
+                   !m_stopRequested.load(std::memory_order_acquire)) {
+                if (std::chrono::steady_clock::now() >= deadline) return false;
+                m_wake.wait_until(locker, deadline);
+            }
+            if (m_stopRequested.load(std::memory_order_acquire)) return false;
+            if (m_jobs.isEmpty() && !m_readbackInFlight && m_ring.occupancy() == 0) return true;
+
+            const auto now = std::chrono::steady_clock::now();
+            const int remainingMs =
+                now >= deadline
+                    ? 0
+                    : int(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                              .count());
+            job = m_ring.takeReadyAfterWait(remainingMs);
+            if (!job.ready) return false;
+        }
+
+        RingReadyFrame ready = GpuReadbackRing::readBack(job, m_sharedReadbacks, [this]() {
+            return m_cancelReadbacks.load(std::memory_order_acquire);
+        });
+
+        OutputBusFrame frameToDeliver;
+        bool deliver = false;
+        {
+            std::lock_guard<std::mutex> locker(m_mutex);
+            if (m_stopRequested.load(std::memory_order_acquire)) return false;
+            if (ready.readbackFailed || !ready.ready) {
+                ++m_asyncReadbackDrops;
+                if (m_capability == SinkGpuCapability::NeedsContinuousCadence &&
+                    m_hasLastDelivered) {
+                    frameToDeliver = m_lastDelivered;
+                    deliver = true;
+                }
+            } else {
+                frameToDeliver = ready.frame;
+                deliver = true;
+            }
+        }
+        if (!deliver) return false;
+
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> innerLocker(m_innerMutex);
+            ok = m_inner && m_active.load(std::memory_order_acquire) &&
+                 !m_stopRequested.load(std::memory_order_acquire) &&
+                 m_inner->submit(frameToDeliver);
+        }
+        if (ok) rememberDelivered(frameToDeliver);
+        return ok;
+    }
+}
+
+void AsyncGpuReadbackSink::discardPending() {
+    if (!m_readbackEnabled.load(std::memory_order_acquire)) return;
+
+    std::lock_guard<std::mutex> locker(m_mutex);
+    if (!m_active.load(std::memory_order_acquire) ||
+        m_stopRequested.load(std::memory_order_acquire))
+        return;
+    clearPendingReadbacksLocked();
+    m_hasLastDelivered = false;
+    m_hasLastIdentity = false;
+    m_needsReadbackCadence.store(false, std::memory_order_release);
+    m_wake.notify_all();
+    if (m_sharedReadbacks) m_sharedReadbacks->wakeAll();
 }
 
 OutputSinkStatus AsyncGpuReadbackSink::outputStatus() const {

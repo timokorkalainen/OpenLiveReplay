@@ -6,6 +6,7 @@
 #include <QtPlugin>
 Q_IMPORT_PLUGIN(OlrStylePlugin)
 #endif
+#include "appenv.h"
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
 #include "playback/frameprovider.h"
@@ -23,8 +24,7 @@ Q_IMPORT_PLUGIN(OlrStylePlugin)
 #include <QString>
 using namespace Qt::StringLiterals;
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char* argv[]) {
 #if defined(OLR_GPU_PIPELINE_FORCE_ON)
     qputenv("OLR_GPU_PIPELINE", "1");
 #endif
@@ -51,8 +51,9 @@ int main(int argc, char *argv[])
 
     UIManagerControlAdapter controlAdapter(&uiManager);
     ControlWebSocketServer controlServer(&controlAdapter);
-    if (!controlServer.listen(QHostAddress::Any, 8115)) {
-        qWarning() << "WebSocket control API failed to listen on port 8115:"
+    const quint16 controlPort = appenv::controlPort();
+    if (!controlServer.listen(QHostAddress::Any, controlPort)) {
+        qWarning() << "WebSocket control API failed to listen on port" << controlPort << ":"
                    << controlServer.lastError();
     }
 
@@ -68,6 +69,9 @@ int main(int argc, char *argv[])
     };
     auto publishTelemetry = [&controlServer]() {
         controlServer.publishPatch(QStringLiteral("telemetry"));
+    };
+    auto publishOutput = [&controlServer]() {
+        controlServer.publishPatch(QStringLiteral("output"));
     };
 
     auto publishFullSnapshot = [&controlServer, &controlAdapter]() {
@@ -145,6 +149,8 @@ int main(int argc, char *argv[])
     QObject::connect(&uiManager, &UIManager::streamDeckBindingsChanged, &controlServer,
                      publishStreamDeck);
     QObject::connect(&uiManager, &UIManager::screensChanged, &controlServer, publishScreens);
+    QObject::connect(&uiManager, &UIManager::broadcastOutputStatusChanged, &controlServer,
+                     publishOutput);
 
     if (const auto transport = uiManager.transport()) {
         QObject::connect(transport, &PlaybackTransport::posChanged, &controlServer,
@@ -161,9 +167,8 @@ int main(int argc, char *argv[])
     qmlRegisterType<PlaybackTransport>("Recorder.Types", 1, 0, "PlaybackTransport");
     qmlRegisterUncreatableType<PlaylistEntriesModel>("Recorder.Types", 1, 0, "PlaylistEntriesModel",
                                                      "Owned by UIManager");
-    qmlRegisterUncreatableType<StreamDeckManager>(
-        "Recorder.Types", 1, 0, "StreamDeckManager",
-        "Exposed via uiManager.streamDeck");
+    qmlRegisterUncreatableType<StreamDeckManager>("Recorder.Types", 1, 0, "StreamDeckManager",
+                                                  "Exposed via uiManager.streamDeck");
 
     QQmlApplicationEngine qmlEngine;
     qmlEngine.addImportPath(QCoreApplication::applicationDirPath() + u"/qml"_s);
@@ -172,14 +177,11 @@ int main(int argc, char *argv[])
     qmlEngine.rootContext()->setContextProperty("uiManager", &uiManager);
 
     QObject::connect(
-        &qmlEngine,
-        &QQmlApplicationEngine::objectCreationFailed,
-        &app,
-        []() { QCoreApplication::exit(-1); },
-        Qt::QueuedConnection);
+        &qmlEngine, &QQmlApplicationEngine::objectCreationFailed, &app,
+        []() { QCoreApplication::exit(-1); }, Qt::QueuedConnection);
 
-    //qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
-    //qmlEngine.load(QUrl(u":/qt/qml/OpenLiveReplay/Main.qml"_s));
+    // qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
+    // qmlEngine.load(QUrl(u":/qt/qml/OpenLiveReplay/Main.qml"_s));
     qmlEngine.load(QUrl(u"qrc:/qt/qml/OpenLiveReplay/Main.qml"_s));
 
     return app.exec();

@@ -144,6 +144,8 @@ private:
     void log(const QString& message) const;
     void processReceivedBytes(const char* data, int size);
     void processPesPacket(const PesPacket& pes);
+    int drainPendingVideoAccessUnits();
+    void processVideoAccessUnits(const QList<CompressedAccessUnit>& units);
     void processAudioPesPacket(const PesPacket& pes);
     int64_t unwrapPcr90k(int64_t raw90k);
     int64_t unwrapVideo90k(int64_t raw90k);

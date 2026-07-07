@@ -50,6 +50,7 @@ private slots:
     void nativeSrtUnwrapsThirtyThreeBitTimestampWrap();
     void nativeSrtDiscontinuityClearsVideoProjectionAnchor();
     void nativeSrtDiscontinuityClearsAllProjectionState();
+    void nativeSrtDrainsPendingAccessUnitOnSessionBoundary();
     void nativeSrtExtractsSeiTimecodeOntoPendingVideoTimecode();
     void nativeSrtNoSeiTimecodeLeavesNoStaleTimecodeBleed();
 };
@@ -443,6 +444,18 @@ void TestIngestBackendSelector::nativeSrtDiscontinuityClearsAllProjectionState()
     QCOMPARE(session.m_audioRemainderPts90k, int64_t(-1));
     QCOMPARE(session.m_videoPtsAnchor90k, int64_t(-1));
     QCOMPARE(session.m_videoPtsAnchorStreamMs, int64_t(-1));
+}
+
+void TestIngestBackendSelector::nativeSrtDrainsPendingAccessUnitOnSessionBoundary() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+    session.m_activeCodec = NativeVideoCodec::H264;
+    session.m_splitter = std::make_unique<H26xAccessUnitSplitter>(NativeVideoCodec::H264);
+
+    const QByteArray payload = QByteArray::fromHex("0000000167420000000001658884");
+    QVERIFY(session.m_splitter->pushPesPayload(payload, 90000, 81000).isEmpty());
+
+    QCOMPARE(session.drainPendingVideoAccessUnits(), 1);
+    QVERIFY(session.m_splitter->flush().isEmpty());
 }
 
 namespace {

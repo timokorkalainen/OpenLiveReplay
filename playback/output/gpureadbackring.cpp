@@ -156,12 +156,18 @@ RingReadbackJob GpuReadbackRing::pushAndTakeReady(const OutputBusFrame& frame, u
 }
 
 RingReadyFrame GpuReadbackRing::flushOne(int timeoutMs) {
+    RingReadyFrame ready = readBack(takeReadyAfterWait(timeoutMs), m_sharedReadbacks);
+    if (ready.readbackFailed) ++m_drops;
+    return ready;
+}
+
+RingReadbackJob GpuReadbackRing::takeReadyAfterWait(int timeoutMs) {
     if (m_pending.isEmpty()) return {};
 
     const PendingFrame& oldest = m_pending.front();
     if (oldest.fence && !oldest.fence->wait(oldest.fenceValue, timeoutMs)) return {};
 
-    return readBackAndPopOldest();
+    return takeOldest();
 }
 
 RingReadyFrame GpuReadbackRing::readBackAndPopOldest() {

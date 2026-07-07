@@ -12,24 +12,13 @@ struct AnnexBNal {
     QByteArray nal;
 };
 
-struct PendingAccessUnit {
-    int startOffset = -1;
-    int endOffset = -1;
-    bool hasVcl = false;
-};
-
 int startCodeSizeAt(const QByteArray& bytes, int offset) {
-    if (offset + 3 <= bytes.size()
-        && bytes[offset] == char(0)
-        && bytes[offset + 1] == char(0)
-        && bytes[offset + 2] == char(1)) {
+    if (offset + 3 <= bytes.size() && bytes[offset] == char(0) && bytes[offset + 1] == char(0) &&
+        bytes[offset + 2] == char(1)) {
         return 3;
     }
-    if (offset + 4 <= bytes.size()
-        && bytes[offset] == char(0)
-        && bytes[offset + 1] == char(0)
-        && bytes[offset + 2] == char(0)
-        && bytes[offset + 3] == char(1)) {
+    if (offset + 4 <= bytes.size() && bytes[offset] == char(0) && bytes[offset + 1] == char(0) &&
+        bytes[offset + 2] == char(0) && bytes[offset + 3] == char(1)) {
         return 4;
     }
     return 0;
@@ -101,8 +90,7 @@ QByteArray rbspFromPayload(const QByteArray& bytes) {
 
 class BitReader {
 public:
-    explicit BitReader(const QByteArray& bytes)
-        : m_bytes(bytes) {}
+    explicit BitReader(const QByteArray& bytes) : m_bytes(bytes) {}
 
     bool readBit(bool* bit) {
         if (!bit || m_bitOffset >= m_bytes.size() * 8) {
@@ -211,12 +199,37 @@ void appendUnique(QList<T>* values, const T& value) {
 
 } // namespace
 
-H26xAccessUnitSplitter::H26xAccessUnitSplitter(NativeVideoCodec codec)
-    : m_codec(codec) {}
+H26xAccessUnitSplitter::H26xAccessUnitSplitter(NativeVideoCodec codec) : m_codec(codec) {}
+
+QList<CompressedAccessUnit> H26xAccessUnitSplitter::flush() {
+    QList<CompressedAccessUnit> units;
+    if (m_pendingAnnexB.isEmpty() || m_codec == NativeVideoCodec::Unknown) {
+        return units;
+    }
+    if (!m_pendingHasVcl) {
+        m_pendingAnnexB.clear();
+        m_pendingPts90k = -1;
+        m_pendingDts90k = -1;
+        return units;
+    }
+
+    CompressedAccessUnit unit;
+    unit.codec = m_codec;
+    unit.pts90k = m_pendingPts90k;
+    unit.dts90k = m_pendingDts90k;
+    unit.annexB = m_pendingAnnexB;
+    unit.parameterSets = m_parameterSets;
+    units.append(unit);
+
+    m_pendingAnnexB.clear();
+    m_pendingHasVcl = false;
+    m_pendingPts90k = -1;
+    m_pendingDts90k = -1;
+    return units;
+}
 
 QList<CompressedAccessUnit> H26xAccessUnitSplitter::pushPesPayload(const QByteArray& payload,
-                                                                   qint64 pts90k,
-                                                                   qint64 dts90k) {
+                                                                   qint64 pts90k, qint64 dts90k) {
     QList<CompressedAccessUnit> units;
     if (payload.isEmpty() || m_codec == NativeVideoCodec::Unknown) {
         return units;
@@ -227,56 +240,36 @@ QList<CompressedAccessUnit> H26xAccessUnitSplitter::pushPesPayload(const QByteAr
         return units;
     }
 
-    PendingAccessUnit pending;
-
-    const auto flushPending = [&]() {
-        if (pending.startOffset < 0 || pending.endOffset <= pending.startOffset) {
-            return;
-        }
-
-        CompressedAccessUnit unit;
-        unit.codec = m_codec;
-        unit.pts90k = pts90k;
-        unit.dts90k = dts90k;
-        unit.annexB = payload.mid(pending.startOffset, pending.endOffset - pending.startOffset);
-        unit.parameterSets = m_parameterSets;
-        units.append(unit);
-
-        pending = PendingAccessUnit();
-    };
-
     for (const AnnexBNal& nal : nals) {
         if (nal.nal.isEmpty()) {
             continue;
         }
 
-        const int type = (m_codec == NativeVideoCodec::H264)
-            ? (uchar(nal.nal[0]) & 0x1f)
-            : ((uchar(nal.nal[0]) >> 1) & 0x3f);
-        const bool isParameterSet = (m_codec == NativeVideoCodec::H264)
-            ? isH264ParameterSet(type)
-            : isHevcParameterSet(type);
+        const int type = (m_codec == NativeVideoCodec::H264) ? (uchar(nal.nal[0]) & 0x1f)
+                                                             : ((uchar(nal.nal[0]) >> 1) & 0x3f);
+        const bool isParameterSet = (m_codec == NativeVideoCodec::H264) ? isH264ParameterSet(type)
+                                                                        : isHevcParameterSet(type);
         const bool isAud = (m_codec == NativeVideoCodec::H264) ? (type == 9) : (type == 35);
         const bool isVcl = (m_codec == NativeVideoCodec::H264) ? h264IsVcl(type) : hevcIsVcl(type);
-        const bool startsNewPicture = isVcl && ((m_codec == NativeVideoCodec::H264)
-            ? h264StartsNewPicture(nal.nal)
-            : hevcStartsNewPicture(nal.nal));
+        const bool startsNewPicture =
+            isVcl && ((m_codec == NativeVideoCodec::H264) ? h264StartsNewPicture(nal.nal)
+                                                          : hevcStartsNewPicture(nal.nal));
 
-        if (pending.startOffset >= 0
-            && (isAud || (pending.hasVcl && (isParameterSet || startsNewPicture)))) {
-            flushPending();
+        if (!m_pendingAnnexB.isEmpty() &&
+            (isAud || (m_pendingHasVcl && (isParameterSet || startsNewPicture)))) {
+            units += flush();
         }
 
-        if (pending.startOffset < 0) {
-            pending.startOffset = nal.startOffset;
+        if (m_pendingAnnexB.isEmpty()) {
+            m_pendingPts90k = pts90k;
+            m_pendingDts90k = dts90k;
         }
-        pending.endOffset = nal.endOffset;
-        pending.hasVcl = pending.hasVcl || isVcl;
+        m_pendingAnnexB += payload.mid(nal.startOffset, nal.endOffset - nal.startOffset);
+        m_pendingHasVcl = m_pendingHasVcl || isVcl;
 
         inspectNal(nal.nal);
     }
 
-    flushPending();
     return units;
 }
 

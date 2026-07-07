@@ -82,6 +82,7 @@ public:
     RingReadbackJob pushAndTakeReady(const OutputBusFrame& frame, uint64_t fenceValue,
                                      std::shared_ptr<GpuFence> fence, FramePixelFormat format);
     RingReadyFrame flushOne(int timeoutMs);
+    RingReadbackJob takeReadyAfterWait(int timeoutMs);
     static RingReadyFrame readBack(const RingReadbackJob& job,
                                    const std::shared_ptr<SharedGpuReadbackCache>& sharedReadbacks,
                                    const std::function<bool()>& shouldCancel = {});

@@ -23,6 +23,11 @@ public:
     std::atomic<bool> cpuEncodeSucceeds{false};
     std::mutex* expectedEncoderMutex = nullptr;
     std::atomic<bool> sawEncoderMutexHeld{false};
+    std::atomic<bool> blockSurfaceEncode{false};
+    std::atomic<int> blockedSurfaceEncodeEntries{0};
+    std::mutex blockMutex;
+    std::condition_variable blockCv;
+    bool releaseBlockedSurfaceEncode = false;
 
     bool encode(const AVFrame*, int64_t ptsTicks, const PacketCallback& onPacket,
                 QString*) override {
@@ -47,6 +52,11 @@ public:
             sawEncoderMutexHeld.store(!probeLocked.load(std::memory_order_acquire),
                                       std::memory_order_release);
         }
+        if (blockSurfaceEncode.load(std::memory_order_acquire)) {
+            blockedSurfaceEncodeEntries.fetch_add(1, std::memory_order_acq_rel);
+            std::unique_lock<std::mutex> lock(blockMutex);
+            blockCv.wait(lock, [&] { return releaseBlockedSurfaceEncode; });
+        }
         if (failSurfaceEncode.load(std::memory_order_acquire)) return false;
         onPacket(QByteArray("pkt"), ptsTicks, true);
         return true;
@@ -54,6 +64,14 @@ public:
 
     bool flush(const PacketCallback&, QString*) override { return true; }
     QByteArray avccExtradata() const override { return QByteArray("avcc"); }
+
+    void releaseBlockedEncodes() {
+        {
+            std::lock_guard<std::mutex> lock(blockMutex);
+            releaseBlockedSurfaceEncode = true;
+        }
+        blockCv.notify_all();
+    }
 };
 
 class FakeSurface final : public GpuSurface {
@@ -149,7 +167,7 @@ private slots:
     void encodeSurfaceFailureDropsJobWithoutCpuFallback();
     void unreadableGpuHandleDropsWithoutCpuReadback();
     void packetCallbackRunsAfterEncoderMutexReleased();
-    void submitDropsOldestOnOverflowNeverBlocks();
+    void submitBackpressuresOnOverflowUntilQueueSpace();
     void cancelPendingDropsQueuedJobsWithoutInvokingCallbacks();
 };
 
@@ -291,19 +309,52 @@ void TestGpuEncodePump::packetCallbackRunsAfterEncoderMutexReleased() {
     pump.stop();
 }
 
-void TestGpuEncodePump::submitDropsOldestOnOverflowNeverBlocks() {
+void TestGpuEncodePump::submitBackpressuresOnOverflowUntilQueueSpace() {
     FakeEncoder enc;
+    enc.blockSurfaceEncode.store(true, std::memory_order_release);
     auto fence = std::make_shared<FakeFence>();
+    fence->signal();
 
-    GpuEncodePump pump(&enc, fence, 2);
-    auto noop = [](const QByteArray&, int64_t, bool) {};
+    GpuEncodePump pump(&enc, fence, 1);
+    pump.start();
+
+    std::atomic<int> packets{0};
     std::atomic<int> failures{0};
+    auto onPacket = [&](const QByteArray&, int64_t, bool) {
+        packets.fetch_add(1, std::memory_order_acq_rel);
+    };
     auto onFailure = [&] { failures.fetch_add(1, std::memory_order_acq_rel); };
 
-    QVERIFY(pump.submit(makeGpuHandle(), 9, 1, ColorMetadata{}, noop, onFailure));
-    QVERIFY(pump.submit(makeGpuHandle(), 9, 2, ColorMetadata{}, noop, onFailure));
-    QVERIFY(pump.submit(makeGpuHandle(), 9, 3, ColorMetadata{}, noop, onFailure));
-    QCOMPARE(pump.queueDrops(), uint64_t(1));
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 1, ColorMetadata{}, onPacket, onFailure));
+    QTRY_COMPARE_WITH_TIMEOUT(enc.blockedSurfaceEncodeEntries.load(std::memory_order_acquire), 1,
+                              2000);
+    QVERIFY(pump.submit(makeGpuHandle(), 1, 2, ColorMetadata{}, onPacket, onFailure));
+
+    std::atomic<bool> returned{false};
+    bool thirdSubmit = false;
+    std::thread submitter([&] {
+        thirdSubmit = pump.submit(makeGpuHandle(), 1, 3, ColorMetadata{}, onPacket, onFailure);
+        returned.store(true, std::memory_order_release);
+    });
+
+    QTest::qWait(100);
+    const bool returnedEarly = returned.load(std::memory_order_acquire);
+    enc.releaseBlockedEncodes();
+    for (int i = 0; i < 200 && !returned.load(std::memory_order_acquire); ++i)
+        QTest::qWait(10);
+
+    const bool returnedAfterRelease = returned.load(std::memory_order_acquire);
+    if (!returnedAfterRelease) pump.stop();
+    if (submitter.joinable()) submitter.join();
+    pump.stop();
+
+    QVERIFY2(!returnedEarly, "submit must backpressure instead of dropping queued recorder frames");
+    QVERIFY2(returnedAfterRelease, "submit must resume once the encode worker opens queue space");
+    QVERIFY(thirdSubmit);
+    QTRY_COMPARE_WITH_TIMEOUT(enc.calls.load(std::memory_order_acquire), 3, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(packets.load(std::memory_order_acquire), 3, 2000);
+
+    QCOMPARE(pump.queueDrops(), uint64_t(0));
     QCOMPARE(failures.load(std::memory_order_acquire), 0);
 }
 

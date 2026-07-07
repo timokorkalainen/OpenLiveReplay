@@ -56,6 +56,8 @@ public:
         return true;
     }
 
+    void discardPending() override { ++discardPendingCalls; }
+
     FrameRate receivedRate() const { return m_rate; }
     QVector<OutputBusFrame> framesSnapshot() const {
         std::lock_guard<std::mutex> lock(m_framesMutex);
@@ -63,6 +65,7 @@ public:
     }
 
     QVector<OutputBusFrame> frames;
+    int discardPendingCalls = 0;
 
 private:
     mutable std::mutex m_framesMutex;
@@ -132,10 +135,12 @@ private slots:
     void pausedTicksRepeatFramesContinuouslyForEverySink();
     void playingTicksCreateStableOutputPlayEpoch();
     void resetPlayEpochKeepsOutputFrameIndexContinuous();
+    void resetPlayEpochDiscardsSinkPendingFrames();
     void rendersFeedMultiviewAndPgmAssignmentsFromSameTick();
     void targetsOnSameBusReceiveMatchingFrameIdentity();
     void targetStatsTrackRepeatedPayloadsAndFailuresIndependently();
     void identicalConsecutiveTicksSkipDuplicateSubmit();
+    void replacingEndpointReceivesCurrentPayloadEvenWhenIdentityMatches();
     void statsMergeSinkOutputStatusWithDispatchAttempts();
     void dispatchStatsConvertToBroadcastStatuses();
     void startFailuresAreVisibleInTargetStats();
@@ -147,6 +152,7 @@ private slots:
     void rationalRateIsCarriedToSinkOnStart();
 #ifdef OLR_GPU_PIPELINE_BUILD
     void sameBusSinksShareOneReadback();
+    void pausedQtPreviewFlushesGpuReadbackBeforeReturning();
     void readbackTelemetryReachesDispatchStats();
     void continuousCadenceReadbackBypassesIdentitySkip();
     void asyncReadbackBypassesIdentitySkipOnlyUntilDelivered();
@@ -156,6 +162,7 @@ private slots:
 void TestOutputDispatcher::cleanup() {
 #ifdef OLR_GPU_PIPELINE_BUILD
     qunsetenv("OLR_GPU_PIPELINE");
+    qunsetenv("OLR_QT_PREVIEW_SYNC_FLUSH");
     GpuReadbackTelemetry::instance().reset();
 #endif
 }
@@ -272,6 +279,22 @@ void TestOutputDispatcher::resetPlayEpochKeepsOutputFrameIndexContinuous() {
     QCOMPARE(sink.frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(sink.frames[1].sampledPlayheadMs, qint64(5000));
     QCOMPARE(yAt(sink.frames[1], 0), uchar(90));
+}
+
+void TestOutputDispatcher::resetPlayEpochDiscardsSinkPendingFrames() {
+    OutputTargetAssignment qt;
+    qt.id = QStringLiteral("feed0-preview");
+    qt.sourceBus = OutputBusId::feed(0);
+    qt.kind = OutputTargetKind::QtPreview;
+    qt.enabled = true;
+
+    CollectingSink sink(OutputTargetKind::QtPreview);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{qt, &sink}});
+
+    dispatcher.resetPlayEpoch();
+
+    QCOMPARE(sink.discardPendingCalls, 1);
 }
 
 void TestOutputDispatcher::rendersFeedMultiviewAndPgmAssignmentsFromSameTick() {
@@ -448,6 +471,38 @@ void TestOutputDispatcher::identicalConsecutiveTicksSkipDuplicateSubmit() {
 
     QCOMPARE(qtSink.frames.size(), 1); // only one submit reached the sink
     QCOMPARE(after2.skippedDuplicateFrames, qint64(1));
+}
+
+void TestOutputDispatcher::replacingEndpointReceivesCurrentPayloadEvenWhenIdentityMatches() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 40));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment qt;
+    qt.id = QStringLiteral("feed0-preview");
+    qt.sourceBus = OutputBusId::feed(0);
+    qt.kind = OutputTargetKind::QtPreview;
+    qt.enabled = true;
+
+    CollectingSink firstSink(OutputTargetKind::QtPreview);
+    CollectingSink replacementSink(OutputTargetKind::QtPreview);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{qt, &firstSink}});
+
+    dispatcher.dispatchTick(cache, state);
+    dispatcher.dispatchTick(cache, state); // populate duplicate identity skip state
+
+    dispatcher.setEndpoints({{qt, &replacementSink}});
+    dispatcher.dispatchTick(cache, state);
+
+    QCOMPARE(firstSink.frames.size(), 1);
+    QCOMPARE(replacementSink.frames.size(), 1);
+    QCOMPARE(videoPts(replacementSink.frames.first()), qint64(100));
 }
 
 void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {
@@ -914,6 +969,46 @@ void TestOutputDispatcher::sameBusSinksShareOneReadback() {
     QCOMPARE(telemetry.redundantReadbacks, qint64(0));
 }
 
+void TestOutputDispatcher::pausedQtPreviewFlushesGpuReadbackBeforeReturning() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    auto gpuData = std::make_shared<TelemetryGpuFrameData>(84);
+    cache.insertVideoFrame(gpuVideo(0, 0, gpuData));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("feed0-preview");
+    preview.sourceBus = OutputBusId::feed(0);
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    auto inner = std::make_unique<CollectingSink>(OutputTargetKind::QtPreview);
+    CollectingSink* observed = inner.get();
+    AsyncGpuReadbackSink previewSink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                                     SinkGpuCapability::NeedsContinuousCadence, GpuFence::create(),
+                                     dispatcher.sharedGpuReadbacks());
+
+    dispatcher.setEndpoints({{preview, &previewSink}});
+    const OutputDispatchStats stats = dispatcher.dispatchTick(cache, state);
+    dispatcher.setEndpoints({});
+
+    const QVector<OutputBusFrame> frames = observed->framesSnapshot();
+    QCOMPARE(frames.size(), 1);
+    QVERIFY(!frames.front().video.isGpuBacked());
+    QCOMPARE(frames.front().outputFrameIndex, qint64(0));
+    QCOMPARE(gpuData->readCount(), 1);
+    QCOMPARE(previewSink.readbackQueueDepth(), qint64(0));
+    QCOMPARE(stats.readbackQueueDepth, qint64(0));
+    QCOMPARE(stats.readbackDrops, qint64(0));
+}
+
 void TestOutputDispatcher::readbackTelemetryReachesDispatchStats() {
     qputenv("OLR_GPU_PIPELINE", "1");
 
@@ -922,7 +1017,7 @@ void TestOutputDispatcher::readbackTelemetryReachesDispatchStats() {
 
     PlaybackStateSnapshot state;
     state.playheadMs = 0;
-    state.playing = false;
+    state.playing = true;
     state.selectedFeedIndex = 0;
 
     OutputTargetAssignment preview;

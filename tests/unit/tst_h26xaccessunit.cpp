@@ -12,10 +12,12 @@ private slots:
     void ignoresDuplicateParameterSets();
     void propagatesTimestamps();
     void splitsMultipleAccessUnits();
+    void keepsAccessUnitOpenAcrossPesUntilNextPicture();
     void ignoresUnknownCodecAndNoStartCodePayloads();
     void keepsH264NonFirstSliceInSameAccessUnit();
     void appendsChangedParameterSetValues();
     void boundsParameterSetAccumulation();
+    void flushIgnoresParameterSetOnlyPendingUnit();
 };
 
 void TestH26xAccessUnit::collectsH264ParameterSets() {
@@ -23,11 +25,12 @@ void TestH26xAccessUnit::collectsH264ParameterSets() {
     const QByteArray sps = QByteArray::fromHex("6764001facd940780227e5c05a808080a0");
     const QByteArray pps = QByteArray::fromHex("68ebe3cb22c0");
     const QByteArray idr = QByteArray::fromHex("658884");
-    const QByteArray payload = QByteArray::fromHex("00000001") + sps
-        + QByteArray::fromHex("00000001") + pps
-        + QByteArray::fromHex("00000001") + idr;
+    const QByteArray payload = QByteArray::fromHex("00000001") + sps +
+                               QByteArray::fromHex("00000001") + pps +
+                               QByteArray::fromHex("00000001") + idr;
 
-    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 90000, 81000);
+    QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 90000, 81000);
+    units += splitter.flush();
 
     QCOMPARE(units.size(), 1);
     QCOMPARE(units.first().codec, NativeVideoCodec::H264);
@@ -42,12 +45,12 @@ void TestH26xAccessUnit::collectsHevcParameterSets() {
     const QByteArray sps = QByteArray::fromHex("4201010160");
     const QByteArray pps = QByteArray::fromHex("4401c172b46240");
     const QByteArray trail = QByteArray::fromHex("2601af09");
-    const QByteArray payload = QByteArray::fromHex("00000001") + vps
-        + QByteArray::fromHex("00000001") + sps
-        + QByteArray::fromHex("00000001") + pps
-        + QByteArray::fromHex("00000001") + trail;
+    const QByteArray payload =
+        QByteArray::fromHex("00000001") + vps + QByteArray::fromHex("00000001") + sps +
+        QByteArray::fromHex("00000001") + pps + QByteArray::fromHex("00000001") + trail;
 
-    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 90000, 81000);
+    QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 90000, 81000);
+    units += splitter.flush();
 
     QCOMPARE(units.size(), 1);
     QCOMPARE(units.first().codec, NativeVideoCodec::Hevc);
@@ -62,11 +65,11 @@ void TestH26xAccessUnit::supportsThreeByteStartCodes() {
     const QByteArray sps = QByteArray::fromHex("6742c01e");
     const QByteArray pps = QByteArray::fromHex("68ce3c80");
     const QByteArray idr = QByteArray::fromHex("658899");
-    const QByteArray payload = QByteArray::fromHex("000001") + sps
-        + QByteArray::fromHex("000001") + pps
-        + QByteArray::fromHex("000001") + idr;
+    const QByteArray payload = QByteArray::fromHex("000001") + sps + QByteArray::fromHex("000001") +
+                               pps + QByteArray::fromHex("000001") + idr;
 
-    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 123, 100);
+    QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 123, 100);
+    units += splitter.flush();
 
     QCOMPARE(units.size(), 1);
     QCOMPARE(units.first().parameterSets.h264Sps, QList<QByteArray>{sps});
@@ -78,13 +81,11 @@ void TestH26xAccessUnit::ignoresDuplicateParameterSets() {
     const QByteArray vps = QByteArray::fromHex("40010c01");
     const QByteArray sps = QByteArray::fromHex("4201010160");
     const QByteArray pps = QByteArray::fromHex("4401c172b46240");
-    const QByteArray payload = QByteArray::fromHex("00000001") + vps
-        + QByteArray::fromHex("00000001") + sps
-        + QByteArray::fromHex("00000001") + pps
-        + QByteArray::fromHex("00000001") + vps
-        + QByteArray::fromHex("00000001") + sps
-        + QByteArray::fromHex("00000001") + pps
-        + QByteArray::fromHex("00000001") + QByteArray::fromHex("2601af09");
+    const QByteArray payload =
+        QByteArray::fromHex("00000001") + vps + QByteArray::fromHex("00000001") + sps +
+        QByteArray::fromHex("00000001") + pps + QByteArray::fromHex("00000001") + vps +
+        QByteArray::fromHex("00000001") + sps + QByteArray::fromHex("00000001") + pps +
+        QByteArray::fromHex("00000001") + QByteArray::fromHex("2601af09");
 
     splitter.pushPesPayload(payload, 90, 80);
     splitter.pushPesPayload(payload, 180, 170);
@@ -98,7 +99,8 @@ void TestH26xAccessUnit::propagatesTimestamps() {
     H26xAccessUnitSplitter splitter(NativeVideoCodec::H264);
     const QByteArray payload = QByteArray::fromHex("00000001678800000001650102");
 
-    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 123456, 123000);
+    QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 123456, 123000);
+    units += splitter.flush();
 
     QCOMPARE(units.size(), 1);
     QCOMPARE(units.first().pts90k, 123456);
@@ -107,17 +109,37 @@ void TestH26xAccessUnit::propagatesTimestamps() {
 
 void TestH26xAccessUnit::splitsMultipleAccessUnits() {
     H26xAccessUnitSplitter splitter(NativeVideoCodec::H264);
-    const QByteArray firstAccessUnit = QByteArray::fromHex("000000016742c01e0000000168ce3c8000000001658884");
+    const QByteArray firstAccessUnit =
+        QByteArray::fromHex("000000016742c01e0000000168ce3c8000000001658884");
     const QByteArray secondAccessUnit = QByteArray::fromHex("00000001091000000001418884");
     const QByteArray payload = firstAccessUnit + secondAccessUnit;
 
-    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 45000, 45000);
+    QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 45000, 45000);
+    units += splitter.flush();
 
     QCOMPARE(units.size(), 2);
     QCOMPARE(units.at(0).annexB, firstAccessUnit);
     QCOMPARE(units.at(1).annexB, secondAccessUnit);
     QCOMPARE(units.at(1).parameterSets.h264Sps, QList<QByteArray>{QByteArray::fromHex("6742c01e")});
     QCOMPARE(units.at(1).parameterSets.h264Pps, QList<QByteArray>{QByteArray::fromHex("68ce3c80")});
+}
+
+void TestH26xAccessUnit::keepsAccessUnitOpenAcrossPesUntilNextPicture() {
+    H26xAccessUnitSplitter splitter(NativeVideoCodec::H264);
+    const QByteArray firstHalf =
+        QByteArray::fromHex("000000016742c01e0000000168ce3c8000000001658884");
+    const QByteArray secondHalf = QByteArray::fromHex("00000001410102");
+    const QByteArray nextPicture = QByteArray::fromHex("00000001658899");
+
+    const QList<CompressedAccessUnit> firstUnits = splitter.pushPesPayload(firstHalf, 90000, 81000);
+    const QList<CompressedAccessUnit> completed =
+        splitter.pushPesPayload(secondHalf + nextPicture, 93000, 84000);
+
+    QVERIFY(firstUnits.isEmpty());
+    QCOMPARE(completed.size(), 1);
+    QCOMPARE(completed.first().annexB, firstHalf + secondHalf);
+    QCOMPARE(completed.first().pts90k, qint64(90000));
+    QCOMPARE(completed.first().dts90k, qint64(81000));
 }
 
 void TestH26xAccessUnit::ignoresUnknownCodecAndNoStartCodePayloads() {
@@ -134,7 +156,8 @@ void TestH26xAccessUnit::keepsH264NonFirstSliceInSameAccessUnit() {
     const QByteArray secondSlice = QByteArray::fromHex("00000001414084");
     const QByteArray payload = firstSlice + secondSlice;
 
-    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 10, 9);
+    QList<CompressedAccessUnit> units = splitter.pushPesPayload(payload, 10, 9);
+    units += splitter.flush();
 
     QCOMPARE(units.size(), 1);
     QCOMPARE(units.first().annexB, payload);
@@ -145,10 +168,10 @@ void TestH26xAccessUnit::appendsChangedParameterSetValues() {
     const QByteArray sps1 = QByteArray::fromHex("6742c01e");
     const QByteArray sps2 = QByteArray::fromHex("6742c01f");
     const QByteArray pps = QByteArray::fromHex("68ce3c80");
-    const QByteArray payload = QByteArray::fromHex("00000001") + sps1
-        + QByteArray::fromHex("00000001") + pps
-        + QByteArray::fromHex("00000001") + sps2
-        + QByteArray::fromHex("00000001") + QByteArray::fromHex("658899");
+    const QByteArray payload = QByteArray::fromHex("00000001") + sps1 +
+                               QByteArray::fromHex("00000001") + pps +
+                               QByteArray::fromHex("00000001") + sps2 +
+                               QByteArray::fromHex("00000001") + QByteArray::fromHex("658899");
 
     splitter.pushPesPayload(payload, 10, 9);
 
@@ -188,6 +211,21 @@ void TestH26xAccessUnit::boundsParameterSetAccumulation() {
     huge += QByteArray::fromHex("00000001658884");
     big.pushPesPayload(huge, 1, 1);
     QVERIFY(big.parameterSets().h264Sps.isEmpty());
+}
+
+void TestH26xAccessUnit::flushIgnoresParameterSetOnlyPendingUnit() {
+    H26xAccessUnitSplitter splitter(NativeVideoCodec::H264);
+    const QByteArray sps = QByteArray::fromHex("6742c01e");
+    const QByteArray pps = QByteArray::fromHex("68ce3c80");
+    const QByteArray payload =
+        QByteArray::fromHex("00000001") + sps + QByteArray::fromHex("00000001") + pps;
+
+    QVERIFY(splitter.pushPesPayload(payload, 90000, 81000).isEmpty());
+    QCOMPARE(splitter.parameterSets().h264Sps, QList<QByteArray>{sps});
+    QCOMPARE(splitter.parameterSets().h264Pps, QList<QByteArray>{pps});
+    QVERIFY(splitter.flush().isEmpty());
+    QCOMPARE(splitter.parameterSets().h264Sps, QList<QByteArray>{sps});
+    QCOMPARE(splitter.parameterSets().h264Pps, QList<QByteArray>{pps});
 }
 
 QTEST_GUILESS_MAIN(TestH26xAccessUnit)

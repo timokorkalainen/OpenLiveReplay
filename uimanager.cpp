@@ -1,4 +1,5 @@
 #include "uimanager.h"
+#include "appenv.h"
 #include "playback/audioplayer.h"
 #include "recorder_engine/benchmark/benchmarkcache.h"
 #include "recorder_engine/benchmark/recordgate.h"
@@ -1703,9 +1704,9 @@ void UIManager::forward5x() {
 
 void UIManager::stepFrame() {
     if (!m_transport) return;
-    m_transport->step(1);
     m_transport->setPlaying(false);
     cancelFollowLive();
+    m_transport->step(1);
 
     // Clamp the upper bound to the live edge: the transport only clamps >= 0,
     // so stepping forward past the last recorded frame would walk the hidden
@@ -1723,9 +1724,9 @@ void UIManager::stepFrame() {
 
 void UIManager::stepFrameBack() {
     if (!m_transport) return;
-    m_transport->step(-1);
     m_transport->setPlaying(false);
     cancelFollowLive();
+    m_transport->step(-1);
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
@@ -1923,18 +1924,13 @@ void UIManager::seekPlayback(int64_t ms) {
     stopPlaylistPlayout();
     // Disable live-follow on a manual scrub; the user re-enables via "Live".
     setFollowLive(false);
-    // Coalesce a burst of scrub targets: seek immediately on the first move of
-    // a gesture, then commit only the latest target on a single-shot timer.
-    if (m_seekCoalescer.offer(ms)) {
-        const int directionHint = m_transport && ms < m_transport->currentPos() ? -1 : 1;
-        if (m_transport) m_transport->seek(ms);
-        if (m_playbackWorker) m_playbackWorker->seekTo(ms, directionHint);
-    } else {
-        // A seek is already in flight; arm/refresh the coalesce timer. The
-        // worker's own reposition handles audio re-priming (repositionTo clears
-        // + re-primes the AudioPlayer), so no per-move audioPlayer->clear() here.
-        if (!m_scrubCoalesceTimer.isActive()) m_scrubCoalesceTimer.start();
-    }
+    // Broadcast scrubbing is a direct manipulation surface: every drag sample
+    // must move the playhead and request the matching frame immediately.
+    m_scrubCoalesceTimer.stop();
+    m_seekCoalescer.reset();
+    const int directionHint = m_transport && ms < m_transport->currentPos() ? -1 : 1;
+    if (m_transport) m_transport->seek(ms);
+    if (m_playbackWorker) m_playbackWorker->seekTo(ms, directionHint);
 }
 
 void UIManager::commitPendingScrub() {
@@ -2586,6 +2582,26 @@ QVariantMap UIManager::ndiOutputStatus(const QString& targetId) const {
     return QVariantMap{};
 }
 
+QVariantMap UIManager::previewOutputState() const {
+    const OutputDispatchStats stats =
+        m_playbackWorker ? m_playbackWorker->outputStats() : OutputDispatchStats{};
+    const QHash<QString, BroadcastOutputTargetStatus> statuses =
+        BroadcastOutputStatus::fromDispatchStats(stats);
+    const int providerCount = static_cast<int>(m_providers.size());
+    const QList<OutputTargetAssignment> previews = BroadcastOutputSettings::qtPreviewAssignments(
+        providerCount, m_multiviewPreviewProvider != nullptr, m_pgmPreviewProvider != nullptr);
+
+    QVariantMap state;
+    state.insert(QStringLiteral("previewTargets"),
+                 BroadcastOutputSettings::rows(previews, providerCount, OutputTargetKind::QtPreview,
+                                               statuses));
+    state.insert(QStringLiteral("readbackQueueDepth"), stats.readbackQueueDepth);
+    state.insert(QStringLiteral("readbackDrops"), stats.readbackDrops);
+    state.insert(QStringLiteral("fenceWaitStalls"), stats.fenceWaitStalls);
+    state.insert(QStringLiteral("gpuOomDegrades"), stats.gpuOomDegrades);
+    return state;
+}
+
 bool UIManager::ndiOutputEnabled(const QString& busKind, int feedIndex) const {
     const OutputBusId bus = BroadcastOutputSettings::busFromUiKey(busKind, feedIndex);
     return BroadcastOutputSettings::isEnabled(m_currentSettings.broadcastOutputs,
@@ -3004,10 +3020,27 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
     const QString recTimeOfDay = QDateTime::fromMSecsSinceEpoch(playheadEpochMs).toString("HHmmss");
     const QString playheadTime = formatTimecodeForFile(playheadMs, fps);
 
-    QString outputDir =
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/videos";
+    QString outputDir = appenv::documentsPath(QStringLiteral("videos"));
     QDir dir(outputDir);
     if (!dir.exists()) dir.mkpath(".");
+
+    auto saveImage = [&](FrameProvider* provider, const QString& token) {
+        if (!provider) return;
+
+        QImage image = provider->latestImage();
+        if (image.isNull()) return;
+
+        const QString fileName = QString("%1_%2_%3_%4.jpg")
+                                     .arg(projectName)
+                                     .arg(token)
+                                     .arg(recTimeOfDay)
+                                     .arg(playheadTime);
+
+        const QString fullPath = dir.absoluteFilePath(fileName);
+        QImageWriter writer(fullPath, "jpg");
+        writer.setQuality(95);
+        writer.write(image);
+    };
 
     auto saveImageForView = [&](int viewIndex) {
         if (viewIndex < 0 || viewIndex >= m_providers.size()) return;
@@ -3018,27 +3051,17 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
                 ? sanitizeFileToken(m_currentSettings.sources[sourceIndex].name)
                 : QString("VIEW%1").arg(viewIndex + 1);
 
-        QImage image = m_providers[viewIndex]->latestImage();
-        if (image.isNull()) return;
-
-        const QString fileName = QString("%1_%2_%3_%4.jpg")
-                                     .arg(projectName)
-                                     .arg(feedName)
-                                     .arg(recTimeOfDay)
-                                     .arg(playheadTime);
-
-        const QString fullPath = dir.absoluteFilePath(fileName);
-        QImageWriter writer(fullPath, "jpg");
-        writer.setQuality(95);
-        writer.write(image);
+        saveImage(m_providers[viewIndex], feedName);
     };
 
     if (singleView) {
         saveImageForView(selectedIndex);
+        saveImage(m_pgmPreviewProvider, QStringLiteral("PGM"));
     } else {
         for (int i = 0; i < m_providers.size(); ++i) {
             saveImageForView(i);
         }
+        saveImage(m_multiviewPreviewProvider, QStringLiteral("MULTIVIEW"));
     }
 }
 
@@ -3053,6 +3076,7 @@ void UIManager::onRecorderPulse(int64_t frameIndex, int64_t elapsedMs) {
     if (m_followLive && m_transport && m_transport->isPlaying()) {
         const int64_t liveEdge = recordedDurationMs();
         const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
+        if (target == 0 && liveEdge < m_liveBufferMs) return;
         const int64_t current = m_transport->currentPos();
         if (qAbs(current - target) > 50) {
             m_transport->seek(target);
@@ -3064,17 +3088,9 @@ void UIManager::onRecorderPulse(int64_t frameIndex, int64_t elapsedMs) {
 }
 
 QString UIManager::getSettingsPath(QString fileName) {
-    // 1. Get the Documents directory for your app
-    QString docPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-
-    // 2. Create a subfolder if you want to be organized
-    QDir dir(docPath);
-    if (!dir.exists("settings")) {
-        dir.mkdir("settings");
-    }
-
-    // 3. Construct the full filename
-    return docPath + "/settings/" + fileName;
+    const QString settingsPath = appenv::documentsPath(QStringLiteral("settings"));
+    QDir().mkpath(settingsPath);
+    return QDir(settingsPath).filePath(fileName);
 }
 
 void UIManager::pushStreamDeckMaps() {

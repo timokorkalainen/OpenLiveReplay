@@ -125,6 +125,7 @@ public:
     virtual ScreensState screensState() const = 0;
     virtual ImportState importState() const = 0;
     virtual TelemetryState telemetryState() const = 0;
+    virtual QVariantMap outputState() const = 0;
 
     virtual CommandResult executeCommand(const QString& name, const QJsonObject& args) = 0;
 };

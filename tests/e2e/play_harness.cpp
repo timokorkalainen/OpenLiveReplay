@@ -34,8 +34,10 @@
 //
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | frameoracle |
+//              jogstressoracle | coldseeklatency |
 //              liveedge | livegrow | seekflash | farback | armedcut | armedcut-back |
-//              armedcut-seekrace | armedcut-rearm-seek | playlist | gpucapstress |
+//              armedcut-seekrace | armedcut-rearm-seek | playlist | playlist-jumpstress |
+//              gpucapstress |
 //              gpubudget | devicelost | armedcut-h264 | armedcut-h264-back
 #include <QCoreApplication>
 #include <QElapsedTimer>
@@ -97,6 +99,7 @@ struct FrameOracleOp {
     QString label;
     qint64 absoluteFrame = -1;
     int deltaFrames = 0;
+    qint64 postDelayMs = 0;
 };
 
 struct FrameOracleExpectation {
@@ -120,29 +123,55 @@ qint64 decodeVisualMarkerIndex(const QImage& image) {
 
 QVector<FrameOracleOp> buildFrameOracleOps() {
     QVector<FrameOracleOp> ops;
-    ops.append({QStringLiteral("prime"), 360, 0});
+    ops.append({QStringLiteral("prime"), 360, 0, 0});
 
     for (int i = 0; i < 24; ++i)
-        ops.append({QStringLiteral("jog-back-1"), -1, -1});
+        ops.append({QStringLiteral("jog-back-1"), -1, -1, 0});
     for (int i = 0; i < 24; ++i)
-        ops.append({QStringLiteral("jog-forward-1"), -1, 1});
+        ops.append({QStringLiteral("jog-forward-1"), -1, 1, 0});
 
     const int pattern[] = {-1, 1, -2, 3, -4, 4, -1, -1, 2, -3, 5, -5, 1, 1, -2, 2};
     for (int repeat = 0; repeat < 3; ++repeat) {
         for (int delta : pattern) {
-            ops.append({QStringLiteral("jog-pattern"), -1, delta});
+            ops.append({QStringLiteral("jog-pattern"), -1, delta, 0});
         }
     }
 
     const qint64 jumps[] = {90, 540, 120, 475, 121, 474, 300, 299, 301, 60, 510, 240};
     for (qint64 frame : jumps)
-        ops.append({QStringLiteral("absolute-scrub"), frame, 0});
+        ops.append({QStringLiteral("absolute-scrub"), frame, 0, 0});
 
     return ops;
 }
 
-bool frameOracleMatches(const QList<FrameProvider*>& providers, const OutputDispatchStats& stats,
-                        const FrameOracleExpectation& expected, bool checkVisual, QString* detail) {
+QVector<FrameOracleOp> buildJogStressOracleOps() {
+    QVector<FrameOracleOp> ops;
+    ops.append({QStringLiteral("prime-30s"), 900, 0, 0});
+    for (int i = 0; i < 60; ++i)
+        ops.append({QStringLiteral("jog-back-60-500ms"), -1, -1, 500});
+    for (int i = 0; i < 15; ++i)
+        ops.append({QStringLiteral("jog-forward-15"), -1, 1, 500});
+    for (int i = 0; i < 30; ++i)
+        ops.append({QStringLiteral("jog-back-30"), -1, -1, 500});
+    return ops;
+}
+
+QVector<FrameOracleOp> buildColdSeekLatencyOps() {
+    QVector<FrameOracleOp> ops;
+    const qint64 targets[] = {60, 540, 90, 570, 120, 510, 30, 480};
+    for (qint64 frame : targets)
+        ops.append({QStringLiteral("cold-seek"), frame, 0, 0});
+    return ops;
+}
+
+bool isFrameOracleScenario(const QString& scen) {
+    return scen == QStringLiteral("frameoracle") || scen == QStringLiteral("jogstressoracle") ||
+           scen == QStringLiteral("coldseeklatency");
+}
+
+bool frameOracleMatches(const QList<FrameProvider*>& providers, FrameProvider* pgmProvider,
+                        const OutputDispatchStats& stats, const FrameOracleExpectation& expected,
+                        bool checkVisual, QString* detail) {
     QStringList parts;
     bool ok = true;
     for (int feed = 0; feed < providers.size(); ++feed) {
@@ -179,6 +208,37 @@ bool frameOracleMatches(const QList<FrameProvider*>& providers, const OutputDisp
                      .arg(identity.sourceDecodedSequence)
                      .arg(identity.videoPlaceholder ? 1 : 0);
         if (!metaOk || !visualOk) ok = false;
+    }
+    if (pgmProvider) {
+        const QString targetId = QStringLiteral("qt-preview-pgm");
+        const auto it = stats.targets.constFind(targetId);
+        if (it == stats.targets.cend()) {
+            parts << QStringLiteral("pgm:missingTarget");
+            ok = false;
+        } else if (!it->hasLastIdentity) {
+            parts << QStringLiteral("pgm:missingIdentity");
+            ok = false;
+        } else {
+            const OutputFrameIdentity identity = it->lastIdentity;
+            const bool metaOk = identity.bus.kind == OutputBusKind::Pgm &&
+                                identity.sourceFeedIndex == 0 && !identity.videoPlaceholder &&
+                                identity.sourcePtsMs == expected.ptsMs;
+
+            qint64 visualIndex = -1;
+            bool visualOk = true;
+            if (checkVisual) {
+                visualIndex = decodeVisualMarkerIndex(pgmProvider->latestImage());
+                visualOk = visualIndex == expected.frameIndex;
+            }
+
+            parts << QStringLiteral("pgm{pts=%1 visual=%2 out=%3 decoded=%4 placeholder=%5}")
+                         .arg(identity.sourcePtsMs)
+                         .arg(visualIndex)
+                         .arg(identity.outputFrameIndex)
+                         .arg(identity.sourceDecodedSequence)
+                         .arg(identity.videoPlaceholder ? 1 : 0);
+            if (!metaOk || !visualOk) ok = false;
+        }
     }
     if (detail) *detail = parts.join(QLatin1Char(' '));
     return ok;
@@ -311,6 +371,7 @@ int main(int argc, char** argv) {
     QList<FrameProvider*> providers;
     for (int i = 0; i < views; ++i)
         providers.append(new FrameProvider());
+    FrameProvider pgmProvider;
 
     PlaybackTransport transport;
     transport.setFps(30);
@@ -328,9 +389,10 @@ int main(int argc, char** argv) {
     PlaybackWorker worker(providers, &transport, &audio);
     worker.openFile(file);
     worker.setActiveAudioView(0); // route audio for view 0
-    if (scen == "frameoracle") {
+    if (isFrameOracleScenario(scen)) {
         worker.setSelectedOutputFeed(0);
         worker.setRequireAllOutputFeedsForPlayhead(true);
+        worker.setBusPreviewProviders(nullptr, &pgmProvider);
     }
     // Tier (b): enable a real NDI output when requested, so the worker's
     // decode->cache->output-bus->NdiOutputSink path is exercised end to end. The output bus is
@@ -526,26 +588,29 @@ int main(int argc, char** argv) {
             });
             t->start(150);
 
-        } else if (scen == "frameoracle") {
+        } else if (scen == "frameoracle" || scen == "jogstressoracle") {
             // Frame-perfect paused scrub/jog oracle. The input fixture is the marker MKV
             // generated by run_frame_oracle_e2e.sh: each video frame carries a visible
             // block-coded frame number and exact floor(N*1000/30) PTS. For each operator
             // action, require EVERY feed preview target to report matching source metadata
             // and matching delivered pixels before advancing to the next action.
-            transport.setPlaying(false);
             transport.setSpeed(1.0);
+            transport.setPlaying(scen == "jogstressoracle");
             worker.setRequireAllOutputFeedsForPlayhead(true);
 
             const QByteArray visualEnv = qgetenv("OLR_FRAME_ORACLE_VISUAL").trimmed().toLower();
             const bool checkVisual =
                 visualEnv.isEmpty() || !(visualEnv == "0" || visualEnv == "false" ||
                                          visualEnv == "off" || visualEnv == "no");
-            const QVector<FrameOracleOp> ops = buildFrameOracleOps();
+            const QVector<FrameOracleOp> ops =
+                (scen == "jogstressoracle") ? buildJogStressOracleOps() : buildFrameOracleOps();
+            const qint64 startDelayMs = (scen == "jogstressoracle") ? 30000 : 0;
             auto* opIndex = new int(0);
             auto* currentFrame = new qint64(0);
             auto* waiting = new bool(false);
             auto* stablePolls = new int(0);
             auto* issuedAtMs = new qint64(0);
+            auto* nextIssueAtMs = new qint64(startDelayMs);
             auto* expected = new FrameOracleExpectation();
             auto* timer = new QTimer(&app);
             timer->setInterval(10);
@@ -553,8 +618,8 @@ int main(int argc, char** argv) {
 
             QObject::connect(
                 timer, &QTimer::timeout, &app,
-                [&, opIndex, currentFrame, waiting, stablePolls, issuedAtMs, expected, timer, ops,
-                 checkVisual, exitCode]() {
+                [&, opIndex, currentFrame, waiting, stablePolls, issuedAtMs, nextIssueAtMs,
+                 expected, timer, ops, checkVisual, exitCode]() {
                     const qint64 now = scenarioClock.elapsed();
                     if (*opIndex >= ops.size()) {
                         timer->stop();
@@ -575,6 +640,9 @@ int main(int argc, char** argv) {
                     }
 
                     if (!*waiting) {
+                        if (now < *nextIssueAtMs) return;
+                        if (scen == "jogstressoracle" && transport.isPlaying())
+                            transport.setPlaying(false);
                         const FrameOracleOp op = ops.at(*opIndex);
                         const qint64 beforeFrame = *currentFrame;
                         const qint64 beforeMs = transport.currentPos();
@@ -617,17 +685,20 @@ int main(int argc, char** argv) {
 
                     const OutputDispatchStats stats = worker.outputStats();
                     QString detail;
-                    if (frameOracleMatches(providers, stats, *expected, checkVisual, &detail)) {
+                    if (frameOracleMatches(providers, &pgmProvider, stats, *expected, checkVisual,
+                                           &detail)) {
                         ++(*stablePolls);
                         if (*stablePolls >= 2) {
+                            const FrameOracleOp op = ops.at(*opIndex);
                             fprintf(stderr,
                                     "FRAME_ORACLE_OK step=%d targetFrame=%lld "
-                                    "expectedPts=%lld settledMs=%lld %s\n",
+                                    "expectedPts=%lld settledMs=%lld nextDelayMs=%lld %s\n",
                                     *opIndex, (long long) expected->frameIndex,
                                     (long long) expected->ptsMs, (long long) (now - *issuedAtMs),
-                                    qPrintable(detail));
+                                    (long long) op.postDelayMs, qPrintable(detail));
                             *waiting = false;
                             ++(*opIndex);
+                            *nextIssueAtMs = now + qMax<qint64>(0, op.postDelayMs);
                         }
                         return;
                     }
@@ -644,6 +715,160 @@ int main(int argc, char** argv) {
                         timer->stop();
                         finish();
                     }
+                });
+            timer->start();
+
+        } else if (scen == "coldseeklatency") {
+            // Cold-location seek latency oracle. Each seek is >5s away from the
+            // previous playhead and must be visible on every preview output within
+            // 25ms. This catches frame-rate-paced output that waits for the next
+            // scheduled 30fps tick instead of publishing the requested seek frame
+            // immediately.
+            transport.setSpeed(1.0);
+            transport.setPlaying(false);
+            worker.setRequireAllOutputFeedsForPlayhead(true);
+
+            const QByteArray visualEnv = qgetenv("OLR_FRAME_ORACLE_VISUAL").trimmed().toLower();
+            const bool checkVisual =
+                visualEnv.isEmpty() || !(visualEnv == "0" || visualEnv == "false" ||
+                                         visualEnv == "off" || visualEnv == "no");
+            const QVector<FrameOracleOp> ops = buildColdSeekLatencyOps();
+            constexpr qint64 kPrimeFrame = 360;
+            constexpr qint64 kLatencyDeadlineMs = 25;
+            constexpr qint64 kColdDistanceMs = 5000;
+            auto* opIndex = new int(-1);
+            auto* currentFrame = new qint64(kPrimeFrame);
+            auto* waiting = new bool(false);
+            auto* issuedAtMs = new qint64(0);
+            auto* maxLatencyMs = new qint64(0);
+            auto* expected = new FrameOracleExpectation();
+            auto* timer = new QTimer(&app);
+            timer->setInterval(1);
+            timer->setTimerType(Qt::PreciseTimer);
+
+            const FrameRate oracleRate = transport.frameRate();
+            if (!oracleRate.isValid()) {
+                *exitCode = 1;
+                fprintf(stderr, "COLD_SEEK_LATENCY_FAIL invalid frame rate\n");
+                finish();
+                return;
+            }
+            expected->frameIndex = kPrimeFrame;
+            expected->ptsMs = oracleRate.frameIndexToMs(kPrimeFrame);
+            transport.seek(expected->ptsMs);
+            worker.seekTo(expected->ptsMs, 1);
+            *issuedAtMs = scenarioClock.elapsed();
+            *waiting = true;
+
+            QObject::connect(
+                timer, &QTimer::timeout, &app,
+                [&, opIndex, currentFrame, waiting, issuedAtMs, maxLatencyMs, expected, timer, ops,
+                 checkVisual, exitCode, oracleRate]() {
+                    const qint64 now = scenarioClock.elapsed();
+                    const OutputDispatchStats stats = worker.outputStats();
+                    QString detail;
+                    const bool matched = frameOracleMatches(providers, &pgmProvider, stats,
+                                                            *expected, checkVisual, &detail);
+                    if (*waiting && matched) {
+                        const qint64 latencyMs = now - *issuedAtMs;
+                        if (*opIndex >= 0) {
+                            *maxLatencyMs = qMax(*maxLatencyMs, latencyMs);
+                            if (latencyMs > kLatencyDeadlineMs) {
+                                *exitCode = 1;
+                                fprintf(stderr,
+                                        "COLD_SEEK_LATENCY_FAIL step=%d targetFrame=%lld "
+                                        "expectedPts=%lld latencyMs=%lld deadlineMs=%lld %s\n",
+                                        *opIndex, (long long) expected->frameIndex,
+                                        (long long) expected->ptsMs, (long long) latencyMs,
+                                        (long long) kLatencyDeadlineMs, qPrintable(detail));
+                                timer->stop();
+                                finish();
+                                return;
+                            }
+                            fprintf(stderr,
+                                    "COLD_SEEK_LATENCY_OK step=%d targetFrame=%lld "
+                                    "expectedPts=%lld latencyMs=%lld %s\n",
+                                    *opIndex, (long long) expected->frameIndex,
+                                    (long long) expected->ptsMs, (long long) latencyMs,
+                                    qPrintable(detail));
+                        } else {
+                            fprintf(stderr,
+                                    "COLD_SEEK_LATENCY_PRIME targetFrame=%lld expectedPts=%lld "
+                                    "settledMs=%lld %s\n",
+                                    (long long) expected->frameIndex, (long long) expected->ptsMs,
+                                    (long long) latencyMs, qPrintable(detail));
+                        }
+                        *waiting = false;
+                    }
+                    if (*waiting) {
+                        const qint64 elapsedMs = now - *issuedAtMs;
+                        if (*opIndex >= 0 && elapsedMs > kLatencyDeadlineMs) {
+                            *exitCode = 1;
+                            fprintf(stderr,
+                                    "COLD_SEEK_LATENCY_FAIL step=%d targetFrame=%lld "
+                                    "expectedPts=%lld elapsedMs=%lld deadlineMs=%lld %s\n",
+                                    *opIndex, (long long) expected->frameIndex,
+                                    (long long) expected->ptsMs, (long long) elapsedMs,
+                                    (long long) kLatencyDeadlineMs, qPrintable(detail));
+                            timer->stop();
+                            finish();
+                            return;
+                        }
+                        if (elapsedMs > 5000) {
+                            *exitCode = 1;
+                            fprintf(stderr,
+                                    "COLD_SEEK_LATENCY_FAIL step=%d targetFrame=%lld "
+                                    "expectedPts=%lld elapsedMs=%lld timeout=5000 %s\n",
+                                    *opIndex, (long long) expected->frameIndex,
+                                    (long long) expected->ptsMs, (long long) elapsedMs,
+                                    qPrintable(detail));
+                            timer->stop();
+                            finish();
+                            return;
+                        }
+                        return;
+                    }
+
+                    ++(*opIndex);
+                    if (*opIndex >= ops.size()) {
+                        timer->stop();
+                        printf("COLD_SEEK_LATENCY_PASS steps=%d views=%d visual=%d "
+                               "maxLatencyMs=%lld deadlineMs=%lld\n",
+                               int(ops.size()), views, checkVisual ? 1 : 0,
+                               (long long) *maxLatencyMs, (long long) kLatencyDeadlineMs);
+                        fflush(stdout);
+                        finish();
+                        return;
+                    }
+
+                    const FrameOracleOp op = ops.at(*opIndex);
+                    const qint64 targetPts = oracleRate.frameIndexToMs(op.absoluteFrame);
+                    const qint64 previousPts = oracleRate.frameIndexToMs(*currentFrame);
+                    if (qAbs(targetPts - previousPts) < kColdDistanceMs) {
+                        *exitCode = 1;
+                        fprintf(stderr,
+                                "COLD_SEEK_LATENCY_FAIL step=%d targetFrame=%lld "
+                                "previousFrame=%lld distanceMs=%lld requiredMs=%lld\n",
+                                *opIndex, (long long) op.absoluteFrame, (long long) *currentFrame,
+                                (long long) qAbs(targetPts - previousPts),
+                                (long long) kColdDistanceMs);
+                        timer->stop();
+                        finish();
+                        return;
+                    }
+                    const int direction = targetPts > previousPts ? 1 : -1;
+                    *currentFrame = op.absoluteFrame;
+                    expected->frameIndex = *currentFrame;
+                    expected->ptsMs = targetPts;
+                    transport.seek(targetPts);
+                    worker.seekTo(targetPts, direction);
+                    *issuedAtMs = scenarioClock.elapsed();
+                    *waiting = true;
+                    fprintf(stderr,
+                            "COLD_SEEK_LATENCY_ISSUE step=%d targetFrame=%lld expectedPts=%lld "
+                            "previousPts=%lld direction=%d deadlineMs=%lld\n",
+                            *opIndex, (long long) expected->frameIndex, (long long) expected->ptsMs,
+                            (long long) previousPts, direction, (long long) kLatencyDeadlineMs);
                 });
             timer->start();
 
@@ -996,6 +1221,77 @@ int main(int argc, char** argv) {
             mon->start(16);
             QTimer::singleShot(14000, &app, finish);
 
+        } else if (scen == "playlist-jumpstress") {
+            // Rundown discontinuity stress: alternate playlist entries between
+            // opposite ends of the fixture. This models operator/rundown clip jumps
+            // that must keep a continuous non-placeholder output feed even when the
+            // next clip is many seconds away from the current playhead.
+            auto* playout = new PlaylistPlayout();
+            auto* lastCuts = new int(0);
+            auto mk = [](qint64 in, qint64 out, double spd) {
+                ReplayEntry e;
+                e.clipPath = QStringLiteral("clip");
+                e.inMs = in;
+                e.outMs = out;
+                e.speed = spd;
+                return e;
+            };
+            QVector<ReplayEntry> entries;
+            entries << mk(20000, 22000, 1.0) << mk(2000, 4000, 1.0) << mk(21000, 23000, 1.0)
+                    << mk(1000, 3000, 1.0);
+            const int expectedCuts = qMax(0, int(entries.size()) - 1);
+            playout->start(entries, 0);
+            const ReplayEntry first = entries.first();
+            transport.setSpeed(first.speed);
+            transport.seek(first.inMs);
+            worker.seekTo(first.inMs);
+            transport.setPlaying(true);
+            *lastCuts = worker.cutsFired();
+            QTimer::singleShot(800, &app, [&, basePh, baseHeld, expectedCuts]() {
+                const OutputDispatchStats b = worker.outputStats();
+                *basePh = b.placeholderFrames;
+                *baseHeld = b.heldFrames;
+                fprintf(stderr,
+                        "### playlist-jumpstress basePh=%lld baseHeld=%lld; expectedCuts=%d ###\n",
+                        (long long) *basePh, (long long) *baseHeld, expectedCuts);
+            });
+            QTimer* mon = new QTimer(&app);
+            QObject::connect(
+                mon, &QTimer::timeout, &app,
+                [&, playout, lastCuts, maxLandErr, cutLandingSamples, expectedCuts, mon]() {
+                    const int cuts = worker.cutsFired();
+                    if (cuts > *lastCuts) {
+                        *lastCuts = cuts;
+                        const auto cur = playout->onBoundaryFired();
+                        if (cur.has_value()) {
+                            transport.setSpeed(cur->speed);
+                            const qint64 landed = transport.currentPos();
+                            const qint64 err = qAbs(landed - cur->inMs);
+                            (*cutLandingSamples)++;
+                            if (err > *maxLandErr) *maxLandErr = err;
+                            fprintf(stderr,
+                                    "### playlist-jumpstress advanced to entry %d in=%lld "
+                                    "landed=%lld err=%lld speed=%.2f ###\n",
+                                    playout->currentIndex(), (long long) cur->inMs,
+                                    (long long) landed, (long long) err, cur->speed);
+                        }
+                    }
+                    const auto b =
+                        playout->evaluate(transport.currentPos(), transport.speed(), 1500);
+                    if (b.valid) {
+                        worker.armNextCut(b.targetMs, b.fireAtMs);
+                        fprintf(stderr,
+                                "### playlist-jumpstress arm boundary fireAt=%lld -> in=%lld ###\n",
+                                (long long) b.fireAtMs, (long long) b.targetMs);
+                    }
+                    if (*cutLandingSamples >= expectedCuts) {
+                        mon->stop();
+                        QTimer::singleShot(1000, &app, finish);
+                    }
+                });
+            mon->start(8);
+            QTimer::singleShot(12000, &app, finish);
+
         } else if (scen == "gpucapstress" || scen == "gpubudget") {
             // GPU cap-pressure stress: a 4-view H.264 fixture runs with a forced
             // tiny per-track GPU budget. Warm up real output frames, snapshot the
@@ -1069,10 +1365,16 @@ int main(int argc, char** argv) {
                 deviceLoss->injectionMs = scenarioClock.elapsed();
                 deviceLoss->lossEventsAtBaseline = b.gpuDeviceLossEvents;
                 deviceLoss->generationBefore = worker.gpuGeneration();
+                const QHash<QString, OutputFrameIdentity> identities =
+                    activeVideoOutputIdentities(b);
+                for (auto it = identities.cbegin(); it != identities.cend(); ++it)
+                    deviceLoss->outputPtsAtObserve.insert(it.key(), it->sourcePtsMs);
+                deviceLoss->observedOutputTargets = deviceLoss->outputPtsAtObserve.size();
                 fprintf(stderr,
-                        "### devicelost basePh=%lld baseHeld=%lld baseSubmitted=%lld; injecting "
-                        "GPU device loss ###\n",
-                        (long long) *basePh, (long long) *baseHeld, (long long) *baseSubmitted);
+                        "### devicelost basePh=%lld baseHeld=%lld baseSubmitted=%lld "
+                        "outputTargets=%lld; injecting GPU device loss ###\n",
+                        (long long) *basePh, (long long) *baseHeld, (long long) *baseSubmitted,
+                        (long long) deviceLoss->observedOutputTargets);
                 worker.injectGpuDeviceLossForTest();
             });
             QTimer* mon = new QTimer(&app);
@@ -1091,11 +1393,13 @@ int main(int argc, char** argv) {
                     deviceLoss->decodedFramesAtObserve = c.decodedVideoFrames;
                     deviceLoss->placeholderFramesAtObserve = os.placeholderFrames;
                     deviceLoss->heldFramesAtObserve = os.heldFrames;
-                    const QHash<QString, OutputFrameIdentity> identities =
-                        activeVideoOutputIdentities(os);
-                    for (auto it = identities.cbegin(); it != identities.cend(); ++it)
-                        deviceLoss->outputPtsAtObserve.insert(it.key(), it->sourcePtsMs);
-                    deviceLoss->observedOutputTargets = deviceLoss->outputPtsAtObserve.size();
+                    if (deviceLoss->outputPtsAtObserve.isEmpty()) {
+                        const QHash<QString, OutputFrameIdentity> identities =
+                            activeVideoOutputIdentities(os);
+                        for (auto it = identities.cbegin(); it != identities.cend(); ++it)
+                            deviceLoss->outputPtsAtObserve.insert(it.key(), it->sourcePtsMs);
+                        deviceLoss->observedOutputTargets = deviceLoss->outputPtsAtObserve.size();
+                    }
                     deviceLoss->generationAdvanced =
                         worker.gpuGeneration() > deviceLoss->generationBefore;
                     fprintf(stderr,
@@ -1278,7 +1582,8 @@ int main(int argc, char** argv) {
     });
 
     // Hard safety net: never hang a CI job even if a scenario timer is dropped.
-    QTimer::singleShot(40000, &app, [&]() {
+    const int hardTimeoutMs = (scen == "jogstressoracle") ? 180000 : 40000;
+    QTimer::singleShot(hardTimeoutMs, &app, [&]() {
         fprintf(stderr, "play_harness: safety timeout — forcing finish\n");
         *exitCode = 1;
         finish();

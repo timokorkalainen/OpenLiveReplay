@@ -26,7 +26,19 @@ private slots:
     void newIoTargetsShareGpuReadbackCache();
     void selectedFeedCoverageAdvancesPlayheadWhenOtherFeedMissing();
     void pausedStepUsesPriorFrameCoverage();
+    void coveredSeekCommitsPlayheadBeforeWorkerRuns();
+    void coveredSeekPublishesLiveCacheForInstantSnapshot();
+    void pausedCoveredSeekDoesNotResetOutputRuntimeSynchronously();
+    void reuseAtAcceptsSelectedFeedWhenOtherFeedMissing();
+    void reuseAtAcceptsPriorFrameCoverageForLowerCadenceInputs();
+    void priorFrameAtFrameDurationBoundaryDoesNotCoverSeek();
+    void stalePriorFrameDoesNotCoverFarSeek();
+    void unbracketedPriorFrameDoesNotCoverNextSourceFrame();
+    void sameCadenceFutureBeyondRoundingWindowDoesNotCoverMissingFrame();
+    void staleExactGpuFrameCannotBeCoveredByFreshNeighbors();
+    void pausedWorkerKeepsWorkingUntilOutputCacheCoversPlayhead();
     void multiviewPausedCoverageAllowsBracketedLowerCadenceFrames();
+    void liveDisplayableCoverageAllowsLowerCadenceHoldNearFuture();
     void multiviewCoverageHoldsPlayheadWhenAnyFeedMissing();
     void seekDirectionHintSurvivesUpdatedTransport();
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -320,12 +332,376 @@ void TestPlaybackWorker::pausedStepUsesPriorFrameCoverage() {
         QMutexLocker bufferLocker(&worker.m_bufferMutex);
         worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
         worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 900, 80));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1100, 90));
         worker.publishOutputCacheLocked();
     }
 
     const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
     QCOMPARE(snapshot.state.playheadMs, qint64(1000));
     QVERIFY(!snapshot.state.forcePlayEpochReset);
+}
+
+void TestPlaybackWorker::coveredSeekCommitsPlayheadBeforeWorkerRuns() {
+    FrameProvider feed0;
+    FrameProvider feed1;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+    transport.seek(1000);
+
+    PlaybackWorker worker({&feed0, &feed1}, &transport);
+    worker.m_outputFeedCount = 2;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_requireAllOutputFeedsForPlayhead.store(true, std::memory_order_release);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(500, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(2, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 960, 80));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1040, 90));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(1, 900, 120));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(1, 1100, 130));
+        worker.publishOutputCacheLocked();
+    }
+
+    worker.seekTo(1000, -1);
+
+    QCOMPARE(worker.m_seekGeneration.load(std::memory_order_acquire), uint64_t(8));
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(8));
+    const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
+    QCOMPARE(snapshot.state.playheadMs, qint64(1000));
+}
+
+void TestPlaybackWorker::coveredSeekPublishesLiveCacheForInstantSnapshot() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+    transport.seek(1000);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(500, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.publishOutputCacheLocked();
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 80));
+    }
+
+    worker.seekTo(1000, -1);
+
+    const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
+    QCOMPARE(snapshot.state.playheadMs, qint64(1000));
+    const std::optional<FrameHandle> frame =
+        snapshot.cache.videoFrameAtFreshForGeneration(0, 1000, snapshot.state.gpuGeneration);
+    QVERIFY(frame.has_value());
+    QVERIFY(!frame->metadata().key.isPlaceholder);
+    QCOMPARE(frame->metadata().key.ptsMs, qint64(1000));
+}
+
+void TestPlaybackWorker::pausedCoveredSeekDoesNotResetOutputRuntimeSynchronously() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+    transport.seek(1000);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(500, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 80));
+        worker.publishOutputCacheLocked();
+    }
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(50, 1), 1, 4, 4);
+    }
+
+    int resetCount = -1;
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        resetCount = worker.m_outputRuntime->playEpochResetCountForTest();
+    }
+    QCOMPARE(resetCount, 0);
+
+    worker.seekTo(1000, -1);
+
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        resetCount = worker.m_outputRuntime->playEpochResetCountForTest();
+    }
+    QCOMPARE(resetCount, 0);
+}
+
+void TestPlaybackWorker::reuseAtAcceptsSelectedFeedWhenOtherFeedMissing() {
+    FrameProvider feed0;
+    FrameProvider feed1;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+
+    PlaybackWorker worker({&feed0, &feed1}, &transport);
+    worker.m_outputFeedCount = 2;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_requireAllOutputFeedsForPlayhead.store(false, std::memory_order_release);
+
+    auto* selected = new DecoderTrack;
+    selected->feedIndex = 0;
+    selected->buffer.insert(1000, testVideoFrame(0, 1000, 80), 8, 1000, 1000);
+    worker.m_decoderBank.append(selected);
+
+    auto* missing = new DecoderTrack;
+    missing->feedIndex = 1;
+    worker.m_decoderBank.append(missing);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(2, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 80));
+        worker.publishOutputCacheLocked();
+    }
+
+    QVERIFY(worker.reuseAt(1000));
+
+    worker.m_decoderBank.clear();
+    delete selected;
+    delete missing;
+}
+
+void TestPlaybackWorker::reuseAtAcceptsPriorFrameCoverageForLowerCadenceInputs() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+
+    auto* track = new DecoderTrack;
+    track->feedIndex = 0;
+    track->buffer.insert(900, testVideoFrame(0, 900, 80), 8, 1000, 1000);
+    track->buffer.insert(1100, testVideoFrame(0, 1100, 90), 8, 1000, 1100);
+    worker.m_decoderBank.append(track);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 900, 80));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1100, 90));
+        worker.publishOutputCacheLocked();
+    }
+
+    QVERIFY(worker.reuseAt(1000));
+
+    worker.m_decoderBank.clear();
+    delete track;
+}
+
+void TestPlaybackWorker::priorFrameAtFrameDurationBoundaryDoesNotCoverSeek() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(30, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(3, std::memory_order_release);
+    worker.m_committedGeneration.store(3, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(3000, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(3000, std::memory_order_release);
+
+    auto* track = new DecoderTrack;
+    track->feedIndex = 0;
+    track->buffer.insert(3000, testVideoFrame(0, 3000, 80), 8, 3000, 3000);
+    worker.m_decoderBank.append(track);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 3000, 80));
+        worker.publishOutputCacheLocked();
+    }
+
+    QVERIFY(!worker.outputFeedCoverageInCache(*worker.m_outputCache, 0, 3033, 0).has_value());
+
+    worker.seekTo(3033, 1);
+    QCOMPARE(worker.m_seekGeneration.load(std::memory_order_acquire), uint64_t(4));
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(3));
+
+    worker.m_decoderBank.clear();
+    delete track;
+}
+
+void TestPlaybackWorker::stalePriorFrameDoesNotCoverFarSeek() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(900, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(900, std::memory_order_release);
+
+    auto* track = new DecoderTrack;
+    track->feedIndex = 0;
+    track->buffer.insert(900, testVideoFrame(0, 900, 80), 8, 900, 900);
+    worker.m_decoderBank.append(track);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 900, 80));
+        worker.publishOutputCacheLocked();
+    }
+
+    QVERIFY(!worker.reuseAt(5000));
+
+    worker.seekTo(5000, 1);
+    QCOMPARE(worker.m_seekGeneration.load(std::memory_order_acquire), uint64_t(8));
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(7));
+
+    worker.m_decoderBank.clear();
+    delete track;
+}
+
+void TestPlaybackWorker::unbracketedPriorFrameDoesNotCoverNextSourceFrame() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(12033, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(12033, std::memory_order_release);
+
+    auto* track = new DecoderTrack;
+    track->feedIndex = 0;
+    track->buffer.insert(12033, testVideoFrame(0, 12033, 80), 8, 12033, 12033);
+    worker.m_decoderBank.append(track);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 12033, 80));
+        worker.publishOutputCacheLocked();
+    }
+
+    QVERIFY(!worker.reuseAt(12100));
+
+    worker.seekTo(12100, 1);
+    QCOMPARE(worker.m_seekGeneration.load(std::memory_order_acquire), uint64_t(8));
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(7));
+
+    worker.m_decoderBank.clear();
+    delete track;
+}
+
+void TestPlaybackWorker::sameCadenceFutureBeyondRoundingWindowDoesNotCoverMissingFrame() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(30, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(testVideoFrame(0, 11966, 80));
+    cache.insertVideoFrame(testVideoFrame(0, 12033, 90));
+
+    QVERIFY(!worker.outputFeedCoverageInCache(cache, 0, 12000, 0).has_value());
+}
+
+void TestPlaybackWorker::staleExactGpuFrameCannotBeCoveredByFreshNeighbors() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(testVideoFrame(0, 11966, 80));
+    FrameHandle staleExact = testVideoFrame(0, 12000, 90);
+    staleExact.metadata().gpuGeneration = 1;
+    cache.insertVideoFrame(staleExact);
+    cache.insertVideoFrame(testVideoFrame(0, 12033, 100));
+
+    QVERIFY(!worker.outputFeedCoverageInCache(cache, 0, 12000, 2).has_value());
+}
+
+void TestPlaybackWorker::pausedWorkerKeepsWorkingUntilOutputCacheCoversPlayhead() {
+    FrameProvider feed0;
+    FrameProvider feed1;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+    transport.seek(1000);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0, &feed1}, &transport);
+    worker.m_outputFeedCount = 2;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_requireAllOutputFeedsForPlayhead.store(true, std::memory_order_release);
+
+    auto* track = new DecoderTrack;
+    track->feedIndex = 0;
+    track->lastDeliveredPtsMs = 1000;
+    track->buffer.insert(1000, testVideoFrame(0, 1000, 80), 8, 1000, 1000);
+    worker.m_decoderBank.append(track);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(2, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 80));
+        worker.publishOutputCacheLocked();
+    }
+
+    QVERIFY(worker.pausedPlayheadNeedsWork(1000));
+
+    worker.m_decoderBank.clear();
+    delete track;
 }
 
 void TestPlaybackWorker::multiviewPausedCoverageAllowsBracketedLowerCadenceFrames() {
@@ -358,6 +734,35 @@ void TestPlaybackWorker::multiviewPausedCoverageAllowsBracketedLowerCadenceFrame
 
     const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
     QCOMPARE(snapshot.state.playheadMs, qint64(1000));
+    QVERIFY(!snapshot.state.forcePlayEpochReset);
+}
+
+void TestPlaybackWorker::liveDisplayableCoverageAllowsLowerCadenceHoldNearFuture() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(60, 1);
+    transport.seek(17);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(0, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(0, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 0, 80));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 33, 90));
+        worker.publishOutputCacheLocked();
+    }
+
+    const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
+    QCOMPARE(snapshot.state.playheadMs, qint64(17));
     QVERIFY(!snapshot.state.forcePlayEpochReset);
 }
 

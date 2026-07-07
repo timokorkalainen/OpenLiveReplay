@@ -71,6 +71,8 @@ void ControlWebSocketServer::publishPatch(const QString& path, const QJsonObject
         messageValue = ControlState::settingsObject(*m_adapter);
     } else if (path == QStringLiteral("telemetry")) {
         messageValue = ControlState::telemetryObject(*m_adapter);
+    } else if (path == QStringLiteral("output")) {
+        messageValue = ControlState::outputObject(*m_adapter);
     } else {
         return;
     }

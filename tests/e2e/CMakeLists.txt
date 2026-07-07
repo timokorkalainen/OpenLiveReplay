@@ -96,6 +96,19 @@ qt_add_executable(marker_yuv_probe
 target_include_directories(marker_yuv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(marker_yuv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
 
+if(APPLE AND NOT IOS)
+    add_test(NAME e2e_macos_app_visual
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_macos_app_visual_e2e.sh"
+            "$<TARGET_FILE:OpenLiveReplay>"
+            "$<TARGET_FILE:ndi_marker_mkv_source>"
+            "$<TARGET_FILE:marker_yuv_probe>")
+    set_tests_properties(e2e_macos_app_visual PROPERTIES
+        LABELS "app-e2e;macos"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+endif()
+
 add_test(NAME e2e_ndi_output
     COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
         "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
@@ -437,6 +450,9 @@ add_test(NAME e2e_play_armedcut_rearm_seek
 add_test(NAME e2e_play_playlist
     COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist 2 23506)
+add_test(NAME e2e_play_playlist_jumpstress
+    COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist-jumpstress 2 23518)
 
 # Deterministic frame-perfect scrub/jog oracle: generates a marker MKV whose pixels
 # encode frame number N and whose PTS are exact floor(N*1000/30), then verifies paused
@@ -444,18 +460,26 @@ add_test(NAME e2e_play_playlist
 add_test(NAME e2e_play_frameoracle
     COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
         "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2)
+add_test(NAME e2e_play_jogstress_oracle
+    COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 jogstressoracle)
+add_test(NAME e2e_play_coldseek_latency
+    COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 coldseeklatency)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
     e2e_play_seekflash e2e_play_farback e2e_play_armedcut e2e_play_armedcut_back
     e2e_play_armedcut_seekrace e2e_play_armedcut_rearm_seek e2e_play_playlist
-    e2e_play_frameoracle
+    e2e_play_playlist_jumpstress e2e_play_frameoracle e2e_play_jogstress_oracle
+    e2e_play_coldseek_latency
     PROPERTIES
     LABELS "e2e"
-    TIMEOUT 180
+    TIMEOUT 240
     RUN_SERIAL TRUE)
-set_tests_properties(e2e_play_frameoracle PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(e2e_play_frameoracle e2e_play_jogstress_oracle e2e_play_coldseek_latency
+    PROPERTIES SKIP_RETURN_CODE 77)
 
 # H.264 HW-gated playback gates (SKIP_RETURN_CODE 77 if HW encoder unavailable).
 # Ports 23506/23508/23510 (SRT) and their +1 UDP siblings are clear of all
@@ -514,6 +538,35 @@ if(OLR_GPU_PIPELINE)
             "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2)
     set_tests_properties(e2e_play_gpu_frameoracle PROPERTIES
         LABELS "e2e;gpu;frame-oracle;async-readback"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_jogstress_oracle
+        COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 jogstressoracle)
+    set_tests_properties(e2e_play_gpu_jogstress_oracle PROPERTIES
+        LABELS "e2e;gpu;frame-oracle;async-readback"
+        TIMEOUT 300
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_coldseek_latency
+        COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 coldseeklatency)
+    set_tests_properties(e2e_play_gpu_coldseek_latency PROPERTIES
+        LABELS "e2e;gpu;frame-oracle;async-readback"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_playlist_jumpstress
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist-jumpstress 2 23520)
+    set_tests_properties(e2e_play_gpu_playlist_jumpstress PROPERTIES
+        LABELS "e2e;gpu;async-readback"
         TIMEOUT 240
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77

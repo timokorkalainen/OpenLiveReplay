@@ -36,6 +36,15 @@ public:
 
     TelemetryState telemetryState() const override { return {}; }
 
+    QVariantMap outputState() const override {
+        return {{QStringLiteral("previewTargets"),
+                 QVariantList{QVariantMap{
+                     {QStringLiteral("id"), QStringLiteral("qt-preview-multiview")},
+                     {QStringLiteral("framesSubmitted"), 7},
+                     {QStringLiteral("lastVideoPlaceholder"), false},
+                 }}}};
+    }
+
     CommandResult executeCommand(const QString& name, const QJsonObject& args) override {
         lastCommand = name;
         lastArgs = args;
@@ -51,6 +60,7 @@ private slots:
     void addsClientIdToCommandsAndReleasesHoldOnDisconnect();
     void sendsErrorForBadJson();
     void publishEventBroadcastsToAllSockets();
+    void publishOutputPatchBroadcastsPreviewCounters();
     void rejectsBinaryMessageAsUnsupported();
 };
 
@@ -185,6 +195,37 @@ void TestControlWebSocketServer::publishEventBroadcastsToAllSockets() {
     QCOMPARE(eventB.value(QStringLiteral("name")).toString(), QStringLiteral("recording.started"));
     QCOMPARE(eventB.value(QStringLiteral("data")).toObject().value(QStringLiteral("value")).toInt(),
              1);
+}
+
+void TestControlWebSocketServer::publishOutputPatchBroadcastsPreviewCounters() {
+    ServerFakeAdapter adapter;
+    ControlWebSocketServer server(&adapter);
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QWebSocket socket;
+    QSignalSpy messages(&socket, &QWebSocket::textMessageReceived);
+    socket.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/api/ws").arg(server.serverPort())));
+
+    QTRY_COMPARE_WITH_TIMEOUT(messages.count(), 2, 2000);
+
+    server.publishPatch(QStringLiteral("output"));
+
+    QTRY_COMPARE_WITH_TIMEOUT(messages.count(), 3, 2000);
+    const QJsonObject patch =
+        QJsonDocument::fromJson(messages.at(2).at(0).toString().toUtf8()).object();
+    QCOMPARE(patch.value(QStringLiteral("type")).toString(), QStringLiteral("state.patch"));
+    QCOMPARE(patch.value(QStringLiteral("path")).toString(), QStringLiteral("output"));
+
+    const QJsonObject preview = patch.value(QStringLiteral("value"))
+                                    .toObject()
+                                    .value(QStringLiteral("previewTargets"))
+                                    .toArray()
+                                    .first()
+                                    .toObject();
+    QCOMPARE(preview.value(QStringLiteral("id")).toString(),
+             QStringLiteral("qt-preview-multiview"));
+    QCOMPARE(preview.value(QStringLiteral("framesSubmitted")).toInt(), 7);
+    QCOMPARE(preview.value(QStringLiteral("lastVideoPlaceholder")).toBool(), false);
 }
 
 void TestControlWebSocketServer::rejectsBinaryMessageAsUnsupported() {

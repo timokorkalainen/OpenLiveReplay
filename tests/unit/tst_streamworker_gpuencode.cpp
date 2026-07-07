@@ -116,6 +116,7 @@ private:
 class TestStreamWorkerGpuEncode : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup();
     void pumpIsNullWhenPipelineFlagOff();
 #ifdef OLR_GPU_PIPELINE_BUILD
     void jitterPullCarriesGpuFrameAndClearsOnCpuFrame();
@@ -126,11 +127,17 @@ private slots:
     void gpuEncodePumpStartsWhenGpuPipelineEnabled();
     void queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFlight();
     void gpuEncodeFallbackDisablesGpuFrameIngestPreference();
-    void iosLiveIngestKeepsCpuDecodedFramesWhenGpuPipelineEnabled();
+    void appleDefaultsToCpuIngestWhenGpuPipelineEnabled();
+    void gpuRecordSurfaceEncodeOptInPrefersGpuFramesWhereSupported();
     void gpuOnlyQueuedFrameBeforeEncodeFallbackDoesNotClearCpuLatest();
     void gpuOnlyQueuedFrameAfterEncodeFallbackDoesNotClearCpuLatest();
 #endif
 };
+
+void TestStreamWorkerGpuEncode::cleanup() {
+    qunsetenv("OLR_GPU_PIPELINE");
+    qunsetenv("OLR_GPU_RECORD_SURFACE_ENCODE");
+}
 
 void TestStreamWorkerGpuEncode::pumpIsNullWhenPipelineFlagOff() {
     qunsetenv("OLR_GPU_PIPELINE");
@@ -305,6 +312,7 @@ void TestStreamWorkerGpuEncode::gpuEncodeImportChargesRecorderWrap() {
 
 void TestStreamWorkerGpuEncode::gpuEncodePumpStartsWhenGpuPipelineEnabled() {
     qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
 
     StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
                         VideoCodecChoice::H264Hardware);
@@ -316,6 +324,7 @@ void TestStreamWorkerGpuEncode::gpuEncodePumpStartsWhenGpuPipelineEnabled() {
 
 void TestStreamWorkerGpuEncode::queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFlight() {
     qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
 
     Muxer muxer;
     StreamWorker worker(QString(), 0, &muxer, nullptr, 16, 16, 30, 30, 1,
@@ -344,6 +353,7 @@ void TestStreamWorkerGpuEncode::queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFli
 
 void TestStreamWorkerGpuEncode::gpuEncodeFallbackDisablesGpuFrameIngestPreference() {
     qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
 
     StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
                         VideoCodecChoice::H264Hardware);
@@ -354,13 +364,29 @@ void TestStreamWorkerGpuEncode::gpuEncodeFallbackDisablesGpuFrameIngestPreferenc
     QVERIFY(!worker.preferGpuVideoFramesForIngestForTest());
 }
 
-void TestStreamWorkerGpuEncode::iosLiveIngestKeepsCpuDecodedFramesWhenGpuPipelineEnabled() {
+void TestStreamWorkerGpuEncode::appleDefaultsToCpuIngestWhenGpuPipelineEnabled() {
     qputenv("OLR_GPU_PIPELINE", "1");
 
     StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
                         VideoCodecChoice::H264Hardware);
 
+#if defined(__APPLE__)
+    QVERIFY(!worker.preferGpuVideoFramesForIngestForTest());
+#else
+    QVERIFY(worker.preferGpuVideoFramesForIngestForTest());
+#endif
+}
+
+void TestStreamWorkerGpuEncode::gpuRecordSurfaceEncodeOptInPrefersGpuFramesWhereSupported() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_GPU_RECORD_SURFACE_ENCODE", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+
 #if defined(Q_OS_IOS)
+    // iOS GPU playback is enabled by default, but recorder surface encode remains disabled until
+    // the live ingest path has a proven non-stalling VideoToolbox surface-encode strategy.
     QVERIFY(!worker.preferGpuVideoFramesForIngestForTest());
 #else
     QVERIFY(worker.preferGpuVideoFramesForIngestForTest());

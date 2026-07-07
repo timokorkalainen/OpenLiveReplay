@@ -364,6 +364,8 @@ void NativeSrtIngestSession::run() {
             .arg(m_statDropTotal)
             .arg(m_statRecvTotal));
 
+    drainPendingVideoAccessUnits();
+
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(false);
     }
@@ -769,6 +771,7 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
     }
 
     if (!m_splitter || m_activeCodec != pes.videoCodec) {
+        drainPendingVideoAccessUnits();
         m_activeCodec = pes.videoCodec;
         m_splitter = std::make_unique<H26xAccessUnitSplitter>(pes.videoCodec);
         m_decoder.reset();
@@ -780,10 +783,22 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
 
     const QList<CompressedAccessUnit> units =
         m_splitter->pushPesPayload(pes.payload, pes.pts90k, pes.dts90k);
+    processVideoAccessUnits(units);
+}
+
+int NativeSrtIngestSession::drainPendingVideoAccessUnits() {
+    if (!m_splitter) {
+        return 0;
+    }
+    const QList<CompressedAccessUnit> units = m_splitter->flush();
+    processVideoAccessUnits(units);
+    return int(units.size());
+}
+
+void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAccessUnit>& units) {
     if (units.isEmpty()) {
         return;
     }
-
     if (!m_decoder) {
         m_decoder = std::make_unique<NativeVideoDecoder>(m_outputWidth, m_outputHeight);
     }

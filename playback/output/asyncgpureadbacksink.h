@@ -30,6 +30,8 @@ public:
     void stop() override;
     bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
+    bool flush(int timeoutMs) override;
+    void discardPending() override;
     OutputSinkStatus outputStatus() const override;
     bool readbackStats(qint64& depth, qint64& drops) const override;
     bool needsContinuousCadence() const override;

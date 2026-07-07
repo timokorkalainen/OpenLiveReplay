@@ -9,6 +9,7 @@
 #include <QVector>
 #include <QMutex>
 #include <QList>
+#include <QWaitCondition>
 #include <atomic>
 #include <memory>
 #include <optional>
@@ -62,6 +63,7 @@ struct DecoderTrack {
     TrackBuffer buffer;
     int64_t lastDeliveredPtsMs = -1; // last frame released to the provider
     int decimateCounter = 0;         // per-track keep-counter (§6.3 decimation)
+    int nativeDecodeFailureWarnings = 0;
 };
 
 struct AudioDecoderTrack {
@@ -190,6 +192,11 @@ protected:
     void run() override;
 
 private:
+    enum class OutputCoverageMode {
+        StrictSeek,
+        Displayable,
+    };
+
     // --- Scheduler constants (spec §3) ------------------------------------
     static constexpr int kLeadMs = 500;            // default video window ahead of P
     static constexpr int kTrailMs = 300;           // default video window behind P
@@ -217,6 +224,17 @@ private:
     //     bodies are implemented here except repositionTo (stubbed). ---------
     int fps() const;            // m_transport->fps(), clamped >=1
     int64_t frameDurMs() const; // 1000 / fps()
+    int64_t maxPriorCoverageMs() const;
+    std::optional<qint64>
+    outputFeedCoverageInCache(const OutputFrameCache& cache, int feedIndex, int64_t playheadMs,
+                              uint64_t gpuGeneration,
+                              OutputCoverageMode mode = OutputCoverageMode::StrictSeek) const;
+    bool
+    outputFeedCoversPlayheadLocked(int feedIndex, int64_t playheadMs, uint64_t gpuGeneration,
+                                   OutputCoverageMode mode = OutputCoverageMode::StrictSeek) const;
+    bool outputCacheCoversPlayhead(int64_t playheadMs) const;
+    bool publishOutputCacheIfCoversPlayhead(int64_t playheadMs);
+    bool pausedPlayheadNeedsWork(int64_t playheadMs);
     int64_t windowLeadMs() const;
     int64_t windowTrailMs() const;
     int64_t windowChunkMs() const;
@@ -233,7 +251,7 @@ private:
     // already correct; this only resyncs the primary decode engine).
     void repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af,
                       bool cutFollow = false);
-    // True when decoder buffers and the output cache both cover target within frameDurMs/2.
+    // True when decoder buffers and the output cache both cover target for display.
     bool reuseAt(int64_t target);
 
     // Decode one read packet into the bank (video → insert with cap; audio →
@@ -255,6 +273,7 @@ private:
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
+    void refreshOutputAfterSeekCommit(bool resetPlayEpoch = true);
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();
@@ -476,6 +495,8 @@ private:
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
+    int m_outputRuntimeImmediateDispatches = 0;
+    QWaitCondition m_outputRuntimeImmediateDispatchesIdle;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
 #ifdef OLR_GPU_PIPELINE_BUILD
     GpuFrameRetireQueue m_gpuFrameRetireQueue; // guarded by m_bufferMutex

@@ -62,9 +62,13 @@ case "${OLR_GPU_PIPELINE:-}" in
         fi
         ;;
 esac
-GPU_PLAY1X_H264=0
-if [ "$GPU_RUNTIME_ENABLED" -eq 1 ] && [ "$SCENARIO" = "play1x" ]; then
-    GPU_PLAY1X_H264=1
+GPU_H264_FIXTURE=0
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    case "$SCENARIO" in
+        play1x|playlist-jumpstress)
+            GPU_H264_FIXTURE=1
+            ;;
+    esac
 fi
 
 case "$SCENARIO" in
@@ -109,8 +113,8 @@ trap cleanup EXIT
 # then require the worker's native decoder path to consume it. Exit 77
 # (SKIP_RETURN_CODE) if either side is unavailable so CTest marks the test
 # skipped rather than failed on headless/CI runners.
-case "$SCENARIO:$GPU_PLAY1X_H264" in
-    play1x:1|h264_play:*|armedcut-h264:*|armedcut-h264-back:*|gpucapstress:*|gpubudget:*|gpu-seekprefetch:*|devicelost:*)
+case "$SCENARIO:$GPU_H264_FIXTURE" in
+    play1x:1|playlist-jumpstress:1|h264_play:*|armedcut-h264:*|armedcut-h264-back:*|gpucapstress:*|gpubudget:*|gpu-seekprefetch:*|devicelost:*)
         case "$(uname -s)" in
             MINGW*|MSYS*|CYGWIN*)
                 if [ "${OLR_RUN_UNSTABLE_MF_H264_TESTS:-0}" != "1" ]; then
@@ -215,8 +219,8 @@ sleep 1.0  # let the SRT listener come up before the caller connects
 # REC_CODEC_EXTRA: optional --codec h264 for scenarios that require an H.264 fixture.
 # Written as a plain string (not an array) to stay compatible with bash 3.2 (macOS).
 REC_CODEC_EXTRA=""
-case "$SCENARIO:$GPU_PLAY1X_H264" in
-    play1x:1|h264_play:*|armedcut-h264:*|armedcut-h264-back:*|gpucapstress:*|gpubudget:*|gpu-seekprefetch:*|devicelost:*) REC_CODEC_EXTRA="--codec h264" ;;
+case "$SCENARIO:$GPU_H264_FIXTURE" in
+    play1x:1|playlist-jumpstress:1|h264_play:*|armedcut-h264:*|armedcut-h264-back:*|gpucapstress:*|gpubudget:*|gpu-seekprefetch:*|devicelost:*) REC_CODEC_EXTRA="--codec h264" ;;
 esac
 
 URL="$(srt_caller_url "$SRT_PORT")"
@@ -257,8 +261,8 @@ fi
 # codec fallback (e.g. record_harness ignoring --codec h264 and writing MPEG-2)
 # would make the H.264 gate exercise the wrong codec — assert early so the test
 # fails loudly rather than passing vacuously.
-case "$SCENARIO:$GPU_PLAY1X_H264" in
-    play1x:1|h264_play:*|armedcut-h264:*|armedcut-h264-back:*|gpucapstress:*|gpubudget:*|gpu-seekprefetch:*|devicelost:*)
+case "$SCENARIO:$GPU_H264_FIXTURE" in
+    play1x:1|playlist-jumpstress:1|h264_play:*|armedcut-h264:*|armedcut-h264-back:*|gpucapstress:*|gpubudget:*|gpu-seekprefetch:*|devicelost:*)
         VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
             -of default=nk=1:nw=1 "$FIXTURE" | head -n1)"
         echo "[pb-e2e] fixture video codec: ${VCODEC:-?}"
@@ -929,6 +933,44 @@ case "$SCENARIO" in
             fail=1
         fi
         ;;
+    playlist-jumpstress)
+        # Rundown discontinuity stress: 4 playlist entries alternate between the
+        # tail and head of the file. The test accepts backward decoder-follow cuts,
+        # but still requires uninterrupted non-placeholder output and frame-accurate
+        # target landing for every boundary.
+        if ! num "$cutsFired" || [ "$cutsFired" -ne 3 ]; then
+            echo "FAIL: playlist-jumpstress did not fire all discontinuity boundaries (cutsFired=$cutsFired, expected 3)"
+            fail=1
+        fi
+        if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
+            echo "FAIL: playlist-jumpstress painted gray across a discontinuity (placeholderFramesDelta=$placeholderFramesDelta, expected 0)"
+            fail=1
+        fi
+        if ! num "$framesDropped" || [ "$framesDropped" -ne 0 ]; then
+            echo "FAIL: playlist-jumpstress dropped frames (framesDropped=$framesDropped, expected 0)"
+            fail=1
+        fi
+        if ! num "$maxClockDivergenceMs" || [ "$maxClockDivergenceMs" -gt 1500 ]; then
+            echo "FAIL: playlist-jumpstress clock diverged (maxClockDivergenceMs=$maxClockDivergenceMs, expected <=1500)"
+            fail=1
+        fi
+        if ! num "$heldFramesDelta" || [ "$heldFramesDelta" -gt 30 ]; then
+            echo "FAIL: playlist-jumpstress froze too many frames (heldFramesDelta=$heldFramesDelta, expected <=30)"
+            fail=1
+        fi
+        if ! num "$reposition" || [ "$reposition" -gt 4 ]; then
+            echo "FAIL: playlist-jumpstress repositioned too much (reposition=$reposition, expected <=4)"
+            fail=1
+        fi
+        if ! num "$maxBoundaryLandingErrMs" || [ "$maxBoundaryLandingErrMs" -gt 80 ]; then
+            echo "FAIL: playlist-jumpstress boundary landed off target (maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs, expected <=80)"
+            fail=1
+        fi
+        if ! num "$cutLandingSamples" || [ "$cutLandingSamples" -ne 3 ]; then
+            echo "FAIL: playlist-jumpstress observed $cutLandingSamples boundary landing samples (expected 3 for 4 entries)"
+            fail=1
+        fi
+        ;;
     gpubudget)
         if ! num "$placeholderFramesDelta" || [ "$placeholderFramesDelta" -ne 0 ]; then
             echo "FAIL: gpubudget painted gray (placeholderFramesDelta=$placeholderFramesDelta, expected 0) under GPU budget pressure"
@@ -1292,8 +1334,13 @@ if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
             ;;
         gpu-seekprefetch)
             # A seek-prefetch transition can intentionally clear pending readbacks from
-            # the old GPU generation. Keep the bound to one full ring per active view.
-            assert_gpu_readback_invariants "$SCENARIO" $((VIEWS * 3))
+            # the old GPU generation. Keep the bound to one full ring plus the
+            # generation-change submit that can overflow that old ring before it is
+            # cleared, per active view.
+            assert_gpu_readback_invariants "$SCENARIO" $((VIEWS * 4))
+            ;;
+        playlist-jumpstress)
+            assert_gpu_readback_invariants "$SCENARIO" $((VIEWS * 8))
             ;;
         gpucapstress|gpubudget)
             ;;

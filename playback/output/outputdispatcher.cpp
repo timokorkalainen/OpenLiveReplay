@@ -9,11 +9,32 @@
 #include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputframeclock.h"
 
+#include <QCoreApplication>
+#include <QGuiApplication>
 #include <QHash>
 
 #include <memory>
 
 namespace {
+
+constexpr int kPausedPreviewFlushTimeoutMs = 16;
+
+bool envFlagValue(const char* name, bool* value) {
+    const QByteArray raw = qgetenv(name).trimmed().toLower();
+    if (raw.isEmpty()) return false;
+    if (raw == "0" || raw == "false" || raw == "off" || raw == "no") {
+        if (value) *value = false;
+        return true;
+    }
+    if (value) *value = true;
+    return true;
+}
+
+bool pausedQtPreviewFlushEnabled() {
+    bool enabled = false;
+    if (envFlagValue("OLR_QT_PREVIEW_SYNC_FLUSH", &enabled)) return enabled;
+    return qobject_cast<QGuiApplication*>(QCoreApplication::instance()) != nullptr;
+}
 
 QString targetStatsKey(const OutputTargetAssignment& assignment) {
     QString id = assignment.id.trimmed();
@@ -76,6 +97,10 @@ void OutputDispatcher::setEndpoints(const QList<OutputEndpoint>& endpoints) {
 
     m_endpoints = endpoints;
     m_multiviewMemo = MultiviewComposite{};
+    for (auto it = m_stats.targets.begin(); it != m_stats.targets.end(); ++it) {
+        it->hasLastIdentity = false;
+        it->lastIdentity = OutputFrameIdentity{};
+    }
     for (const OutputEndpoint& endpoint : m_endpoints) {
         if (!endpoint.sink || !endpoint.assignment.enabled) continue;
         if (endpoint.sink->kind() != endpoint.assignment.kind) continue;
@@ -92,6 +117,10 @@ void OutputDispatcher::resetFrameIndex(qint64 nextOutputFrameIndex) {
 
 void OutputDispatcher::resetPlayEpoch() {
     m_havePlayEpoch = false;
+    for (const OutputEndpoint& endpoint : m_endpoints) {
+        if (!endpoint.sink || !endpoint.assignment.enabled) continue;
+        endpoint.sink->discardPending();
+    }
 }
 
 qint64 OutputDispatcher::outputFrameForPlayheadMs(qint64 playheadMs) const {
@@ -180,6 +209,11 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
         }
 
         const bool submitted = endpoint.sink->submit(frame);
+        if (submitted && !tickState.playing &&
+            endpoint.assignment.kind == OutputTargetKind::QtPreview &&
+            pausedQtPreviewFlushEnabled()) {
+            endpoint.sink->flush(kPausedPreviewFlushTimeoutMs);
+        }
         countTargetAttempt(endpoint.assignment, frame, submitted);
         if (submitted) {
             m_stats.framesSubmitted++;

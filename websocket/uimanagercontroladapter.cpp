@@ -129,6 +129,11 @@ TelemetryState UIManagerControlAdapter::telemetryState() const {
             m_uiManager->telemetryAtPlayhead()};
 }
 
+QVariantMap UIManagerControlAdapter::outputState() const {
+    if (!m_uiManager) return {};
+    return m_uiManager->previewOutputState();
+}
+
 CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
                                                       const QJsonObject& args) {
     if (!m_uiManager) {
