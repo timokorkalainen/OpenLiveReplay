@@ -1641,7 +1641,6 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     if (committedGen == seekGen) {
         const qint64 bookmarkedPlayhead = m_lastVisiblePlayheadMs.load(std::memory_order_acquire);
         const qint64 toleranceMs = qMax<qint64>(1, frameDurMs());
-        const bool preciseCoverage = !transportPlaying;
         const bool requireAllFeeds =
             m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire);
         bool cacheCovered = m_outputFeedCount > 0;
@@ -1652,9 +1651,11 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
                 snapshot.cache.videoFrameAtFreshForGeneration(feedIndex, snapshot.state.playheadMs,
                                                               snapshot.state.gpuGeneration);
             if (cachedFrame.has_value() && !cachedFrame->metadata().key.isPlaceholder) {
-                const qint64 ptsMs = cachedFrame->metadata().key.ptsMs;
-                if (!preciseCoverage || snapshot.state.playheadMs - ptsMs <= toleranceMs)
-                    return ptsMs;
+                // The renderer uses the latest source frame at-or-before the playhead.
+                // Treat that as covered even when the input cadence is lower than the
+                // output cadence; otherwise a single sparse feed freezes the whole
+                // paused multiview while stepping frame-by-frame.
+                return snapshot.state.playheadMs;
             }
             const std::optional<FrameHandle> futureFrame =
                 snapshot.cache.firstFreshVideoFrameAtOrAfter(feedIndex, snapshot.state.playheadMs,

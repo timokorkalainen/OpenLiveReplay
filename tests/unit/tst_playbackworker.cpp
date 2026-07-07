@@ -25,7 +25,8 @@ private slots:
     void buildsSinkForNewIoTargetKinds();
     void newIoTargetsShareGpuReadbackCache();
     void selectedFeedCoverageAdvancesPlayheadWhenOtherFeedMissing();
-    void pausedStepRequiresNearFrameCoverage();
+    void pausedStepUsesPriorFrameCoverage();
+    void multiviewPausedCoverageAllowsBracketedLowerCadenceFrames();
     void multiviewCoverageHoldsPlayheadWhenAnyFeedMissing();
     void seekDirectionHintSurvivesUpdatedTransport();
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -299,7 +300,7 @@ void TestPlaybackWorker::selectedFeedCoverageAdvancesPlayheadWhenOtherFeedMissin
     QVERIFY(!snapshot.state.forcePlayEpochReset);
 }
 
-void TestPlaybackWorker::pausedStepRequiresNearFrameCoverage() {
+void TestPlaybackWorker::pausedStepUsesPriorFrameCoverage() {
     FrameProvider feed0;
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
@@ -323,8 +324,41 @@ void TestPlaybackWorker::pausedStepRequiresNearFrameCoverage() {
     }
 
     const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
-    QCOMPARE(snapshot.state.playheadMs, qint64(500));
-    QVERIFY(snapshot.state.forcePlayEpochReset);
+    QCOMPARE(snapshot.state.playheadMs, qint64(1000));
+    QVERIFY(!snapshot.state.forcePlayEpochReset);
+}
+
+void TestPlaybackWorker::multiviewPausedCoverageAllowsBracketedLowerCadenceFrames() {
+    FrameProvider feed0;
+    FrameProvider feed1;
+    PlaybackTransport transport;
+    transport.setFrameRate(50, 1);
+    transport.seek(1000);
+
+    PlaybackWorker worker({&feed0, &feed1}, &transport);
+    worker.m_outputFeedCount = 2;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_requireAllOutputFeedsForPlayhead.store(true, std::memory_order_release);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(500, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(2, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 960, 80));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1040, 90));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(1, 900, 120));
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(1, 1100, 130));
+        worker.publishOutputCacheLocked();
+    }
+
+    const OutputRuntimeSnapshot snapshot = worker.makeOutputSnapshot();
+    QCOMPARE(snapshot.state.playheadMs, qint64(1000));
+    QVERIFY(!snapshot.state.forcePlayEpochReset);
 }
 
 void TestPlaybackWorker::multiviewCoverageHoldsPlayheadWhenAnyFeedMissing() {
