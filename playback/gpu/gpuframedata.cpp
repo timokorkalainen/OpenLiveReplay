@@ -15,7 +15,23 @@
 
 namespace {
 constexpr int kReadbackFenceTimeoutMs = 2000;
+
+qint64 cpuPlanesBytes(const CpuPlanes& planes) {
+    qint64 bytes = 0;
+    for (const QByteArray& plane : planes.plane) {
+        bytes += qint64(plane.size());
+    }
+    return bytes;
 }
+} // namespace
+
+struct GpuFrameData::CpuCacheEntry {
+    CpuCacheEntry(CpuPlanes cachedPlanes, GpuBudgetCharge cacheCharge)
+        : planes(std::move(cachedPlanes)), charge(std::move(cacheCharge)) {}
+
+    CpuPlanes planes;
+    GpuBudgetCharge charge;
+};
 
 GpuFrameData::GpuFrameData(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuRhiContext> rhi,
                            FramePixelFormat nativeFormat, ColorMetadata color,
@@ -38,7 +54,7 @@ bool GpuFrameData::waitForPendingFence(int timeoutMs) const {
 CpuPlanes GpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {
     QMutexLocker locker(&m_cacheMutex);
     const auto cached = m_cpuCache.constFind(int(target));
-    return cached == m_cpuCache.cend() ? CpuPlanes{} : cached.value();
+    return cached == m_cpuCache.cend() ? CpuPlanes{} : cached.value()->planes;
 }
 
 CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
@@ -49,7 +65,7 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
     {
         QMutexLocker locker(&m_cacheMutex);
         const auto cached = m_cpuCache.constFind(int(target));
-        if (cached != m_cpuCache.cend()) return cached.value();
+        if (cached != m_cpuCache.cend()) return cached.value()->planes;
     }
 
     if (m_gpuGeneration != 0 && m_gpuGeneration != GpuGenerationCounter::instance().current()) {
@@ -62,7 +78,7 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
     {
         QMutexLocker locker(&m_cacheMutex);
         const auto cached = m_cpuCache.constFind(int(target));
-        if (cached != m_cpuCache.cend()) return cached.value();
+        if (cached != m_cpuCache.cend()) return cached.value()->planes;
     }
 
     const FramePixelFormat readbackTarget =
@@ -96,8 +112,11 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
         }
         QMutexLocker locker(&m_cacheMutex);
         const auto cached = m_cpuCache.constFind(int(target));
-        if (cached != m_cpuCache.cend()) return cached.value();
-        m_cpuCache.insert(int(target), planes);
+        if (cached != m_cpuCache.cend()) return cached.value()->planes;
+        m_cpuCache.insert(
+            int(target),
+            std::make_shared<CpuCacheEntry>(
+                planes, GpuBudgetCharge(cpuPlanesBytes(planes), GpuBudgetTag::CpuReadbackCache)));
     }
     return planes;
 }

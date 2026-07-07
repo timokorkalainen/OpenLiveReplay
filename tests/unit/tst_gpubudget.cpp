@@ -37,6 +37,9 @@ private slots:
     void chargeTokenCreditsOnDestruction();
     void chargeTokenMoveTransfersOwnership();
     void tryChargeDeniesWhenBudgetFull();
+    void chargeOnlyTagsDoNotConsumeGate();
+    void perTagSnapshotTracksClasses();
+    void reportOnlyDoesNotDisableGatedCharges();
 };
 
 void TestGpuBudget::surfaceBytesIsNv12() {
@@ -195,6 +198,91 @@ void TestGpuBudget::tryChargeDeniesWhenBudgetFull() {
     auto second = b.tryCharge(sb);
     QVERIFY(!second.has_value());
     QCOMPARE(b.liveBytes(), sb);
+}
+
+void TestGpuBudget::chargeOnlyTagsDoNotConsumeGate() {
+    GpuBudgetConfig c;
+    c.aggregateDecodeWindow = 1;
+    c.feedCount = 1;
+    c.stagingWindowPerFeed = 0;
+    c.activeBusCount = 0;
+    c.readbackRingDepth = 0;
+    c.width = 64;
+    c.height = 48;
+
+    auto& b = GpuBudget::instance();
+    b.reset();
+    b.configure(c);
+    const qint64 sb = c.surfaceBytes();
+
+    GpuBudgetCharge producer(sb * 4, GpuBudgetTag::RecorderWrap);
+    QCOMPARE(b.liveBytes(), sb * 4);
+    QCOMPARE(b.liveBytes(GpuBudgetTag::RecorderWrap), sb * 4);
+    QCOMPARE(b.gatedLiveBytes(), qint64(0));
+
+    auto decode = b.tryCharge(sb, GpuBudgetTag::DecodeWindow);
+    QVERIFY(decode.has_value());
+    QCOMPARE(b.liveBytes(), sb * 5);
+    QCOMPARE(b.gatedLiveBytes(), sb);
+    QVERIFY(!b.canAllocate(sb));
+}
+
+void TestGpuBudget::perTagSnapshotTracksClasses() {
+    GpuBudgetConfig c;
+    c.aggregateDecodeWindow = 4;
+    c.feedCount = 1;
+    c.stagingWindowPerFeed = 0;
+    c.activeBusCount = 0;
+    c.readbackRingDepth = 0;
+    c.width = 64;
+    c.height = 48;
+
+    auto& b = GpuBudget::instance();
+    b.reset();
+    b.configure(c);
+    const qint64 sb = c.surfaceBytes();
+
+    GpuBudgetCharge ingest(sb, GpuBudgetTag::IngestWrap);
+    auto readback = b.tryCharge(sb * 2, GpuBudgetTag::ReadbackRing);
+    QVERIFY(readback.has_value());
+
+    const GpuBudgetSnapshot snapshot = b.snapshot();
+    QCOMPARE(snapshot.liveBytes, sb * 3);
+    QCOMPARE(snapshot.gatedLiveBytes, sb * 2);
+    QCOMPARE(snapshot.liveBytesByTag[static_cast<int>(GpuBudgetTag::IngestWrap)], sb);
+    QCOMPARE(snapshot.liveBytesByTag[static_cast<int>(GpuBudgetTag::ReadbackRing)], sb * 2);
+    QCOMPARE(QString::fromLatin1(gpuBudgetTagName(GpuBudgetTag::IngestWrap)),
+             QStringLiteral("IngestWrap"));
+}
+
+void TestGpuBudget::reportOnlyDoesNotDisableGatedCharges() {
+    qputenv("OLR_LEDGER_REPORT_ONLY", "1");
+
+    GpuBudgetConfig c;
+    c.aggregateDecodeWindow = 1;
+    c.feedCount = 1;
+    c.stagingWindowPerFeed = 0;
+    c.activeBusCount = 0;
+    c.readbackRingDepth = 0;
+    c.width = 64;
+    c.height = 48;
+
+    auto& b = GpuBudget::instance();
+    b.reset();
+    b.configure(c);
+    const qint64 sb = c.surfaceBytes();
+
+    auto staging = b.tryCharge(sb * 2, GpuBudgetTag::Staging);
+    QVERIFY(!staging.has_value());
+    QCOMPARE(b.liveBytes(GpuBudgetTag::Staging), qint64(0));
+    QCOMPARE(b.gatedLiveBytes(), qint64(0));
+    QVERIFY(b.snapshot().reportOnly);
+
+    GpuBudgetCharge cache(sb * 4, GpuBudgetTag::CpuReadbackCache);
+    QCOMPARE(b.liveBytes(GpuBudgetTag::CpuReadbackCache), sb * 4);
+    QCOMPARE(b.gatedLiveBytes(), qint64(0));
+
+    qunsetenv("OLR_LEDGER_REPORT_ONLY");
 }
 
 QTEST_GUILESS_MAIN(TestGpuBudget)

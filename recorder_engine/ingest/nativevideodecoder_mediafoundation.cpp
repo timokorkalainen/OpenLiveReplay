@@ -257,6 +257,7 @@ public:
     bool decodeKeepSurface(const CompressedAccessUnit& unit, KeepSurfaceCallback onSurface,
                            QString* error);
     void reset();
+    void flushExcessPixelBufferPool() {}
 
 private:
     int width = 0;
@@ -1191,6 +1192,10 @@ bool NativeVideoDecoder::decodeKeepSurface(const CompressedAccessUnit& unit,
 
 void NativeVideoDecoder::reset() {
     m_impl->reset();
+}
+
+void NativeVideoDecoder::flushExcessPixelBufferPool() {
+    m_impl->flushExcessPixelBufferPool();
 }
 
 bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {

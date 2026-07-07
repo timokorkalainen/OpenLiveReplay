@@ -3,6 +3,7 @@
 #ifdef __APPLE__
 
 #include "playback/gpu/appleiosurface.h"
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpureadbackretainer.h"
@@ -24,6 +25,11 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
     if (!surface || !surface->isValid() || !rhi) return FrameHandle();
 
     const GpuSurfaceDesc desc = surface->desc();
+    auto charge = GpuBudget::instance().tryCharge(gpuSurfaceBytes(*surface));
+    if (!charge) {
+        GpuBudget::instance().noteOomDegrade();
+        return FrameHandle();
+    }
     meta.key.format = FramePixelFormat::Nv12;
     if (meta.key.width <= 0) meta.key.width = desc.width;
     if (meta.key.height <= 0) meta.key.height = desc.height;
@@ -34,7 +40,8 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
             gpuRetainSurfaceUntilFenceRetired(surface, renderFence, fenceValue);
         }
     }
-    return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence));
+    return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence),
+                              std::move(*charge));
 }
 
 #endif // __APPLE__

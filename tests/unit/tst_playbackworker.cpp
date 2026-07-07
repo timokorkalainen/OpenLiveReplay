@@ -5,6 +5,7 @@
 #include "playback/output/queuedoutputsink.h"
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/decodedonefence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpurhicontext.h"
 #endif
@@ -28,11 +29,17 @@ private slots:
     void gpuBudgetConfiguredFromOutputGraphGeometry();
     void gpuBudgetUsesCodecGeometryForDecodeSurfaces();
     void gpuForceBudgetConstrainsConfiguredBudget();
+    void residencyWindowParamsPreserveDefaultCap();
+    void residencyWindowParamsCanExpandTrailCap();
     void outputStatsSurfaceGpuBudgetCounters();
     void gpuSeekPrefetchPlanUsesBudgetHeadroom();
     void gpuSeekPrefetchPlanUsesCodecGeometryForSurfaceBytes();
     void gpuSeekPrefetchAllowanceBoundsNativeGpuDecode();
     void gpuSeekPrefetchAllowanceUsesPlannedWindow();
+    void gpuPressureDerivesRuntimeBudgetFromHeadroom();
+    void gpuPressureWarningShrinksWindowWithoutLatch();
+    void gpuPressureLevel2LatchesCpuWithoutDeviceLoss();
+    void initializeOutputGraphClearsMemoryPressureLatch();
 
 private:
     bool installTestGpuSpine(PlaybackWorker& worker) const;
@@ -84,6 +91,7 @@ FrameHandle testVideoFrame(int feed, qint64 ptsMs, uchar y) {
 void TestPlaybackWorker::cleanup() {
     qunsetenv("OLR_GPU_PIPELINE");
     qunsetenv("OLR_GPU_FORCE_BUDGET");
+    qunsetenv("OLR_LEDGER_REPORT_ONLY");
 #ifdef OLR_GPU_PIPELINE_BUILD
     GpuBudget::instance().reset();
 #endif
@@ -403,15 +411,45 @@ void TestPlaybackWorker::gpuForceBudgetConstrainsConfiguredBudget() {
     QCOMPARE(GpuBudget::instance().budgetBytes(), expected.peakBudgetBytes());
 }
 
+void TestPlaybackWorker::residencyWindowParamsPreserveDefaultCap() {
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+
+    QCOMPARE(worker.capFrames(4), 47);
+}
+
+void TestPlaybackWorker::residencyWindowParamsCanExpandTrailCap() {
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(30, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+
+    PlaybackWorker::ResidencyWindowParams params;
+    params.leadMs = 500;
+    params.trailMs = 2000;
+    params.chunkMs = 500;
+    params.slackMs = 200;
+    params.globalFrameBudget = 512;
+    params.perTrackCapOverride = 128;
+    worker.setResidencyWindowParamsForTest(params);
+
+    QVERIFY(worker.capFrames(4) > 50);
+    QCOMPARE(worker.capFrames(4), 108);
+}
+
 void TestPlaybackWorker::outputStatsSurfaceGpuBudgetCounters() {
     qputenv("OLR_GPU_PIPELINE", "1");
+    qputenv("OLR_LEDGER_REPORT_ONLY", "1");
 
     FrameProvider feedProvider;
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
 
     GpuBudget::instance().reset();
-    GpuBudgetCharge liveCharge(3110400);
+    GpuBudgetCharge gatedCharge(2000000, GpuBudgetTag::DecodeWindow);
+    GpuBudgetCharge chargeOnlyCharge(1110400, GpuBudgetTag::IngestWrap);
     GpuBudget::instance().noteOomDegrade();
     GpuBudget::instance().noteOomDegrade();
 
@@ -420,12 +458,23 @@ void TestPlaybackWorker::outputStatsSurfaceGpuBudgetCounters() {
 
     const OutputDispatchStats stats = worker.outputStats();
     QCOMPARE(stats.gpuVramBytes, qint64(3110400));
+    QCOMPARE(stats.gpuBudgetBytes, GpuBudget::instance().budgetBytes());
+    QCOMPARE(stats.gpuGatedLiveBytes, qint64(2000000));
+    QVERIFY(stats.gpuBudgetReportOnly);
+    QCOMPARE(stats.gpuLiveBytesByTag[static_cast<int>(GpuBudgetTag::DecodeWindow)],
+             qint64(2000000));
+    QCOMPARE(stats.gpuLiveBytesByTag[static_cast<int>(GpuBudgetTag::IngestWrap)], qint64(1110400));
     QCOMPARE(stats.gpuOomDegrades, qint64(2));
     QCOMPARE(stats.gpuDeviceLossEvents, qint64(0));
 
     qunsetenv("OLR_GPU_PIPELINE");
     const OutputDispatchStats disabledStats = worker.outputStats();
     QCOMPARE(disabledStats.gpuVramBytes, qint64(0));
+    QCOMPARE(disabledStats.gpuBudgetBytes, qint64(0));
+    QCOMPARE(disabledStats.gpuGatedLiveBytes, qint64(0));
+    QVERIFY(!disabledStats.gpuBudgetReportOnly);
+    for (qint64 taggedBytes : disabledStats.gpuLiveBytesByTag)
+        QCOMPARE(taggedBytes, qint64(0));
     QCOMPARE(disabledStats.gpuOomDegrades, qint64(0));
     QCOMPARE(disabledStats.gpuDeviceLossEvents, qint64(0));
 }
@@ -574,6 +623,89 @@ void TestPlaybackWorker::gpuSeekPrefetchAllowanceUsesPlannedWindow() {
 
     const PlaybackWorker::PlaybackCounters counters = worker.counters();
     QCOMPARE(counters.gpuSeekPrefetchGpuAttempts, qint64(3));
+}
+
+void TestPlaybackWorker::gpuPressureDerivesRuntimeBudgetFromHeadroom() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+
+    GpuBudget::instance().reset();
+    const qint64 twoGiB = qint64(2) * 1024 * 1024 * 1024;
+    worker.evaluateGpuMemoryPressureForTest(uint64_t(twoGiB), false, 1000);
+
+    QCOMPARE(GpuBudget::instance().budgetBytes(), twoGiB / 2);
+    QCOMPARE(worker.counters().gpuMemoryPressureLevel1, qint64(0));
+}
+
+void TestPlaybackWorker::gpuPressureWarningShrinksWindowWithoutLatch() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+
+    PlaybackWorker::ResidencyWindowParams params;
+    params.trailMs = 2000;
+    params.globalFrameBudget = 512;
+    params.perTrackCapOverride = 128;
+    worker.setResidencyWindowParamsForTest(params);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+
+    worker.evaluateGpuMemoryPressureForTest(0, true, 1000);
+
+    QCOMPARE(worker.m_residencyWindowParams.trailMs, 1000);
+    QCOMPARE(worker.counters().gpuMemoryPressureLevel1, qint64(1));
+    QCOMPARE(worker.counters().gpuMemoryPressureLevel2, qint64(0));
+    QVERIFY(!worker.m_memoryPressureLatched.load(std::memory_order_acquire));
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::Gpu);
+}
+
+void TestPlaybackWorker::gpuPressureLevel2LatchesCpuWithoutDeviceLoss() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+    worker.m_gpuDeviceLossRebuildsRemaining.store(3, std::memory_order_release);
+    GpuDeviceLossMonitor::instance().reset();
+
+    worker.evaluateGpuMemoryPressureForTest(64 * 1024 * 1024, false, 1000);
+
+    QVERIFY(worker.m_memoryPressureLatched.load(std::memory_order_acquire));
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
+    QCOMPARE(worker.m_gpuDeviceLossRebuildsRemaining.load(std::memory_order_acquire), 3);
+    QVERIFY(!GpuDeviceLossMonitor::instance().isLost());
+    QCOMPARE(worker.counters().gpuMemoryPressureLevel1, qint64(1));
+    QCOMPARE(worker.counters().gpuMemoryPressureLevel2, qint64(1));
+}
+
+void TestPlaybackWorker::initializeOutputGraphClearsMemoryPressureLatch() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+    worker.m_memoryPressureLatched.store(true, std::memory_order_release);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::CpuFallback),
+                                    std::memory_order_release);
+
+    worker.initializeOutputGraph(1, 64, 48);
+
+    QVERIFY(!worker.m_memoryPressureLatched.load(std::memory_order_acquire));
 }
 #endif
 

@@ -14,12 +14,21 @@ void DefaultIosGpuLifecycleSink::onEnterForeground() {
     m_suspended.store(false, std::memory_order_release);
 }
 
+void DefaultIosGpuLifecycleSink::onMemoryWarning() {
+    if (isSuspended()) return;
+    m_memoryWarnings.fetch_add(1, std::memory_order_acq_rel);
+}
+
 bool DefaultIosGpuLifecycleSink::isSuspended() const {
     return m_suspended.load(std::memory_order_acquire);
 }
 
 uint64_t DefaultIosGpuLifecycleSink::generationAtLastBackground() const {
     return m_bgGeneration.load(std::memory_order_acquire);
+}
+
+uint64_t DefaultIosGpuLifecycleSink::memoryWarningCount() const {
+    return m_memoryWarnings.load(std::memory_order_acquire);
 }
 
 namespace {

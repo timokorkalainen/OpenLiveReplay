@@ -42,6 +42,7 @@ public:
     }
 #endif
     void reset();
+    void flushExcessPixelBufferPool();
     // Phase-0 probe (P0.1): true iff the most recently decoded CVPixelBuffer was
     // IOSurface-backed. Always false on non-VideoToolbox builds.
     bool lastDecodedWasIOSurfaceBacked() const;

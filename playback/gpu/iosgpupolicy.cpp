@@ -23,12 +23,8 @@ bool gpuIsIosBuild() {
 #endif
 }
 
-int gpuPerTrackWindowCap(int trackCount) {
+int gpuPerTrackWindowCap(int trackCount, int derivedPerTrackCap) {
     const int base = macosPerTrackCap(trackCount);
-    if (gpuIsIosBuild()) return std::min(base, kIosMaxPerTrackGpuFrames);
+    if (gpuIsIosBuild() && derivedPerTrackCap > 0) return derivedPerTrackCap;
     return base;
-}
-
-int gpuIosAggregateWindowCeiling() {
-    return kIosAggregateGpuFrameCeiling;
 }

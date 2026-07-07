@@ -19,6 +19,7 @@
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/iosgpulifecyclesink.h"
+#include "playback/gpu/iosmemoryheadroom.h"
 #include "playback/gpu/iosgpupolicy.h"
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpureadbackretainer.h"
@@ -60,6 +61,13 @@ ColorMetadata colorMetadataForNativeTrack(const DecoderTrack* track) {
 
 #ifdef OLR_GPU_PIPELINE_BUILD
 namespace {
+
+constexpr qint64 kMiB = qint64(1024) * 1024;
+constexpr qint64 kGiB = 1024 * kMiB;
+constexpr qint64 kPressurePollMs = 250;
+constexpr qint64 kMintedBytesPressureSample = 64 * kMiB;
+constexpr qint64 kSecondWarningLatchMs = 10000;
+constexpr qint64 kMaxSaneAvailableMemoryBytes = 256 * kGiB;
 
 std::optional<FrameHandle> cachedCpuSnapshotForDeviceLoss(const FrameHandle& frame) {
     if (!frame.isGpuBacked()) return std::nullopt;
@@ -214,10 +222,9 @@ OutputDispatchStats PlaybackWorker::outputStats() const {
     m_outputRuntime->recordGpuDeviceLossEvents(
         m_gpuDeviceLossEvents.load(std::memory_order_acquire));
     if (gpuPipelineEnabled()) {
-        m_outputRuntime->recordGpuBudget(GpuBudget::instance().liveBytes(),
-                                         GpuBudget::instance().oomDegradeCount());
+        m_outputRuntime->recordGpuBudget(GpuBudget::instance().snapshot());
     } else {
-        m_outputRuntime->recordGpuBudget(0, 0);
+        m_outputRuntime->recordGpuBudget(GpuBudgetSnapshot{});
     }
 #endif
     return m_outputRuntime->stats();
@@ -291,22 +298,58 @@ int64_t PlaybackWorker::frameDurMs() const {
     return 1000 / fps(); // fps() >= 1 so no divide-by-zero
 }
 
+int64_t PlaybackWorker::windowLeadMs() const {
+    return qMax(1, m_residencyWindowParams.leadMs);
+}
+
+int64_t PlaybackWorker::windowTrailMs() const {
+    return qMax(0, m_residencyWindowParams.trailMs);
+}
+
+int64_t PlaybackWorker::windowChunkMs() const {
+    return qMax(1, m_residencyWindowParams.chunkMs);
+}
+
+int64_t PlaybackWorker::windowSlackMs() const {
+    return qMax(0, m_residencyWindowParams.slackMs);
+}
+
+int64_t PlaybackWorker::windowAudioTrailMs() const {
+    return qMax(0, m_residencyWindowParams.audioTrailMs);
+}
+
+#ifdef OLR_UNIT_TEST
+void PlaybackWorker::setResidencyWindowParamsForTest(const ResidencyWindowParams& params) {
+    m_residencyWindowParams = params;
+}
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+void PlaybackWorker::evaluateGpuMemoryPressureForTest(uint64_t availableBytes, bool memoryWarning,
+                                                      qint64 nowMs) {
+    evaluateGpuMemoryPressure(availableBytes, memoryWarning, nowMs);
+}
+#endif
+#endif
+
 int PlaybackWorker::capFrames(int trackCount) const {
     // capFrames = clamp( ceil(windowMs / frameDurMs) + 4, 12,
     //                    max(12, kGlobalFrameBudget / max(1,trackCount)) )
-    const int64_t windowMs = int64_t(kLeadMs) + kChunkMs + kTrailMs + 2 * int64_t(kSlackMs);
+    const int64_t windowMs =
+        windowLeadMs() + windowChunkMs() + windowTrailMs() + 2 * windowSlackMs();
     const int64_t dur = qMax<int64_t>(1, frameDurMs());    // never divide by zero
     const int64_t ceilFrames = (windowMs + dur - 1) / dur; // integer ceil
     int64_t want = ceilFrames + 4;
 
     const int tc = qMax(1, trackCount);
-    int64_t hi = qMax<int64_t>(12, int64_t(kGlobalFrameBudget) / tc);
+    int64_t hi = qMax<int64_t>(12, qMax(1, m_residencyWindowParams.globalFrameBudget) / tc);
 #ifdef OLR_GPU_PIPELINE_BUILD
-    if (gpuPipelineEnabled()) {
-        // iOS clamps the GPU decode window below the macOS floor for thermal and VRAM headroom.
-        hi = gpuPerTrackWindowCap(tc);
+    if (gpuPipelineEnabled() && gpuPipelineState() == GpuPipelineState::Gpu &&
+        !m_memoryPressureLatched.load(std::memory_order_acquire)) {
+        hi = gpuPerTrackWindowCap(tc, int(hi));
     }
 #endif
+    if (m_residencyWindowParams.perTrackCapOverride > 0)
+        hi = m_residencyWindowParams.perTrackCapOverride;
     const int64_t lo = qMin<int64_t>(12, hi);
 
     if (want < lo) want = lo;
@@ -330,7 +373,7 @@ int64_t PlaybackWorker::newestPtsMin() const {
     for (auto* track : m_decoderBank) {
         const int64_t n = track->buffer.newestPts();
         if (n < 0) continue;                   // empty track
-        if (n < maxNewest - kLeadMs) continue; // stalled track — exclude
+        if (n < maxNewest - windowLeadMs()) continue; // stalled track — exclude
         if (minNewest < 0 || n < minNewest) minNewest = n;
     }
     return minNewest;
@@ -351,7 +394,7 @@ int64_t PlaybackWorker::oldestPtsMin() const {
     for (auto* track : m_decoderBank) {
         const int64_t n = track->buffer.newestPts();
         if (n < 0) continue;                   // empty track
-        if (n < maxNewest - kLeadMs) continue; // stalled track — exclude
+        if (n < maxNewest - windowLeadMs()) continue; // stalled track — exclude
         const int64_t o = track->buffer.oldestPts();
         if (minOldest < 0 || o < minOldest) minOldest = o;
     }
@@ -450,7 +493,7 @@ PlaybackWorker::GpuPipelineState PlaybackWorker::gpuPipelineState() const {
 bool PlaybackWorker::gpuPathActive() const {
     return gpuPipelineState() == GpuPipelineState::Gpu && m_gpuRhi && m_gpuRhi->isValid() &&
            !m_gpuRhi->deviceLost() && !GpuDeviceLossMonitor::instance().isLost() &&
-           !gpuLifecycleSuspended();
+           !gpuLifecycleSuspended() && !m_memoryPressureLatched.load(std::memory_order_acquire);
 }
 
 bool PlaybackWorker::gpuLifecycleSuspended() const {
@@ -608,6 +651,242 @@ void PlaybackWorker::handleGpuDeviceLoss() {
     }
 }
 
+void PlaybackWorker::sampleGpuMemoryPressure(qint64 nowMs) {
+    if (!gpuPipelineEnabled()) return;
+    if (gpuPipelineState() != GpuPipelineState::Gpu) return;
+    if (gpuLifecycleSuspended()) return;
+    if (m_memoryPressureLatched.load(std::memory_order_acquire)) return;
+
+    const IosGpuLifecycleSink* sink = iosGpuLifecycleSink();
+    const uint64_t warningCount = sink ? sink->memoryWarningCount() : 0;
+    const bool memoryWarning = warningCount != m_lastIosMemoryWarningCount;
+    if (memoryWarning) m_lastIosMemoryWarningCount = warningCount;
+
+    const bool timeToPoll = nowMs - m_lastPressureSampleMs >= kPressurePollMs;
+    const bool mintedBurst =
+        GpuBudget::instance().mintedBytesSinceLastSample() >= kMintedBytesPressureSample;
+    if (!memoryWarning && !timeToPoll && !mintedBurst) return;
+
+    m_lastPressureSampleMs = nowMs;
+    GpuBudget::instance().resetMintedBytesSinceLastSample();
+    evaluateGpuMemoryPressure(iosAvailableMemoryBytes(), memoryWarning, nowMs);
+}
+
+qint64 PlaybackWorker::gpuMemoryPressureLevel1ThresholdBytes() {
+    int width = 0;
+    int height = 0;
+    int surfaceWidth = 0;
+    int surfaceHeight = 0;
+    int feedCount = 0;
+    {
+        QMutexLocker locker(&m_mutex);
+        width = m_outputWidth;
+        height = m_outputHeight;
+        feedCount = m_outputFeedCount;
+    }
+    decodeSurfaceGeometryForGpuBudget(m_decoderBank, width, height, &surfaceWidth, &surfaceHeight);
+
+    GpuBudgetConfig config;
+    config.width = width;
+    config.height = height;
+    config.surfaceWidth = surfaceWidth;
+    config.surfaceHeight = surfaceHeight;
+    config.surfaceFormat = FramePixelFormat::Nv12;
+    const qint64 frameBytes = qMax<qint64>(1, config.surfaceBytes());
+    return qMax<qint64>(256 * kMiB, qint64(4) * qMax(1, feedCount) * frameBytes);
+}
+
+bool PlaybackWorker::deriveGpuBudgetFromAvailableMemory(uint64_t availableBytes) {
+    if (gpuForcedPerTrackBudget() > 0) return false;
+    if (availableBytes == 0 || availableBytes > uint64_t(kMaxSaneAvailableMemoryBytes))
+        return false;
+
+    const qint64 available = qint64(availableBytes);
+    const qint64 gated = GpuBudget::instance().gatedLiveBytes();
+    const qint64 derived = qMin<qint64>((available + gated) / 2, available);
+    const qint64 floorBytes = qMin<qint64>(512 * kMiB, available);
+    const qint64 clamped = qMin<qint64>(4 * kGiB, qMax(floorBytes, derived));
+    GpuBudget::instance().setBudgetBytesForRuntime(clamped);
+    return true;
+}
+
+void PlaybackWorker::evaluateGpuMemoryPressure(uint64_t availableBytes, bool memoryWarning,
+                                               qint64 nowMs) {
+    if (!gpuPipelineEnabled()) return;
+    if (m_memoryPressureLatched.load(std::memory_order_acquire)) return;
+
+    const bool sampleValid =
+        availableBytes > 0 && availableBytes <= uint64_t(kMaxSaneAvailableMemoryBytes);
+    if (sampleValid) deriveGpuBudgetFromAvailableMemory(availableBytes);
+
+    const qint64 level1Threshold = gpuMemoryPressureLevel1ThresholdBytes();
+    const qint64 available =
+        sampleValid ? qint64(availableBytes) : std::numeric_limits<qint64>::max();
+    const bool belowLevel1 = sampleValid && available < level1Threshold;
+    if (!memoryWarning && !belowLevel1) return;
+
+    const bool secondWarning = memoryWarning && m_lastPressureWarningMs >= 0 &&
+                               nowMs - m_lastPressureWarningMs <= kSecondWarningLatchMs;
+    if (memoryWarning) m_lastPressureWarningMs = nowMs;
+
+    handleGpuMemoryPressureLevel1(nowMs);
+
+    const bool belowLevel2 = sampleValid && available < level1Threshold / 2;
+    if (belowLevel2 || secondWarning) handleGpuMemoryPressureLevel2(nowMs);
+}
+
+void PlaybackWorker::handleGpuMemoryPressureLevel1(qint64 nowMs) {
+    if (m_lastPressureLevel1Ms >= 0 && nowMs - m_lastPressureLevel1Ms < kPressurePollMs) return;
+    m_lastPressureLevel1Ms = nowMs;
+    ++m_counters.gpuMemoryPressureLevel1;
+
+    const int64_t dur = qMax<int64_t>(1, frameDurMs());
+    const int minTrailFrames = 8;
+    const int64_t minTrailMs = minTrailFrames * dur;
+    ResidencyWindowParams params = m_residencyWindowParams;
+    params.trailMs = int(qMax<int64_t>(minTrailMs, qMax<int64_t>(params.trailMs / 2, minTrailMs)));
+    params.chunkMs = qMax(1, qMin(params.chunkMs, params.leadMs));
+
+    int width = 0;
+    int height = 0;
+    int surfaceWidth = 0;
+    int surfaceHeight = 0;
+    int feedCount = 0;
+    {
+        QMutexLocker locker(&m_mutex);
+        width = m_outputWidth;
+        height = m_outputHeight;
+        feedCount = m_outputFeedCount;
+    }
+    decodeSurfaceGeometryForGpuBudget(m_decoderBank, width, height, &surfaceWidth, &surfaceHeight);
+    GpuBudgetConfig config;
+    config.width = width;
+    config.height = height;
+    config.surfaceWidth = surfaceWidth;
+    config.surfaceHeight = surfaceHeight;
+    config.surfaceFormat = FramePixelFormat::Nv12;
+    const qint64 perFeedSurfaces =
+        qMax<qint64>(12, GpuBudget::instance().budgetBytes() /
+                             qMax<qint64>(1, config.surfaceBytes()) / qMax(1, feedCount));
+    params.globalFrameBudget = qMax(12, int(qMin<qint64>(qMax(1, feedCount) * perFeedSurfaces,
+                                                         std::numeric_limits<int>::max())));
+    params.perTrackCapOverride =
+        qMax(12, int(qMin<qint64>(perFeedSurfaces, std::numeric_limits<int>::max())));
+    m_residencyWindowParams = params;
+
+    const qint64 playhead = m_transport ? m_transport->currentPos()
+                                        : m_lastVisiblePlayheadMs.load(std::memory_order_acquire);
+    const qint64 keepFrom = playhead - (windowTrailMs() + windowSlackMs());
+    const qint64 keepTo = playhead + (windowLeadMs() + windowSlackMs());
+    const qint64 audioKeepFrom = playhead - windowAudioTrailMs();
+    const qint64 keepAudioFromSample = qMax<qint64>(0, audioKeepFrom * qint64(48000) / 1000);
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        for (DecoderTrack* track : m_decoderBank) {
+            if (!track) continue;
+            TrackBuffer::EvictedFrames evictedTrackFrames;
+            track->buffer.trim(keepFrom, keepTo, &evictedTrackFrames);
+            collectEvictedGpuFramesLocked(evictedTrackFrames);
+        }
+        if (m_outputCache) {
+            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+            m_outputCache->trimBefore(keepFrom, keepAudioFromSample, &evictedCacheFrames);
+            collectEvictedGpuFramesLocked(evictedCacheFrames);
+            publishOutputCacheLocked();
+        }
+        if (m_stagingCache) {
+            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+            m_stagingCache->trimBefore(keepFrom, keepAudioFromSample, &evictedCacheFrames);
+            collectEvictedGpuFramesLocked(evictedCacheFrames);
+        }
+        if (m_prerollStagingCache) {
+            OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+            m_prerollStagingCache->trimBefore(keepFrom, keepAudioFromSample, &evictedCacheFrames);
+            collectEvictedGpuFramesLocked(evictedCacheFrames);
+        }
+    }
+    flushNativeDecoderPools();
+    drainEvictedGpuFrames();
+}
+
+void PlaybackWorker::flushNativeDecoderPools() {
+    auto flushBank = [](QVector<DecoderTrack*>& bank) {
+        for (DecoderTrack* track : bank) {
+            if (track && track->nativeDecoder) track->nativeDecoder->flushExcessPixelBufferPool();
+        }
+    };
+    flushBank(m_decoderBank);
+    flushBank(m_prerollBank);
+}
+
+void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
+    Q_UNUSED(nowMs);
+    bool expected = false;
+    if (!m_memoryPressureLatched.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+        return;
+    }
+    ++m_counters.gpuMemoryPressureLevel2;
+
+    detachOutputEndpointsForDeviceLoss();
+    m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
+                             std::memory_order_release);
+    const uint64_t pressureGeneration = GpuGenerationCounter::instance().bump();
+    m_committedGpuGeneration.store(pressureGeneration, std::memory_order_release);
+
+    for (DecoderTrack* track : m_decoderBank)
+        if (track && track->nativeDecoder) track->nativeDecoder->reset();
+    for (DecoderTrack* track : m_prerollBank)
+        if (track && track->nativeDecoder) track->nativeDecoder->reset();
+
+    int recoveredFrames = 0;
+    int removedGpuFrames = 0;
+    std::optional<qint64> recoveredPlayhead;
+    {
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        for (DecoderTrack* track : m_decoderBank)
+            if (track)
+                sanitizeTrackBufferForDeviceLossLocked(&track->buffer, &recoveredFrames,
+                                                       &removedGpuFrames);
+        for (DecoderTrack* track : m_prerollBank)
+            if (track)
+                sanitizeTrackBufferForDeviceLossLocked(&track->buffer, &recoveredFrames,
+                                                       &removedGpuFrames);
+        sanitizeCacheForDeviceLossLocked(m_outputCache.get(), &recoveredFrames, &removedGpuFrames);
+        sanitizeCacheForDeviceLossLocked(m_stagingCache.get(), &recoveredFrames, &removedGpuFrames);
+        sanitizeCacheForDeviceLossLocked(m_prerollStagingCache.get(), &recoveredFrames,
+                                         &removedGpuFrames);
+        m_gpuFrameRetireQueue = GpuFrameRetireQueue();
+
+        const qint64 playhead = m_transport
+                                    ? m_transport->currentPos()
+                                    : m_lastVisiblePlayheadMs.load(std::memory_order_acquire);
+        recoveredPlayhead = recoveredCachePlayheadLocked(playhead, pressureGeneration);
+        if (recoveredFrames > 0 || removedGpuFrames > 0 || recoveredPlayhead.has_value())
+            publishOutputCacheLocked();
+    }
+
+    m_decodeFence.reset();
+    m_renderFence.reset();
+    m_stagingFence.reset();
+    m_stagedFenceValue.store(0, std::memory_order_release);
+    m_gpuRhi.reset();
+#ifdef _WIN32
+    m_winGpuImportEdge.reset();
+    m_winGpuImportTried = false;
+#endif
+    {
+        QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
+        if (m_outputRuntime) m_outputRuntime->setGpuRhiContext(nullptr);
+    }
+    rebuildOutputEndpoints();
+    if (recoveredPlayhead.has_value()) {
+        m_lastVisiblePlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
+        m_outputPlayheadCacheGuarded.store(true, std::memory_order_release);
+        m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
+    }
+}
+
 void PlaybackWorker::resumeDeferredGpuRebuild() {
     if (!m_gpuRebuildDeferredForSuspend.load(std::memory_order_acquire)) return;
     if (gpuLifecycleSuspended()) return;
@@ -732,8 +1011,7 @@ void PlaybackWorker::configureGpuBudget() {
         cfg.activeBusCount = 0;
         cfg.readbackRingDepth = 0;
     } else {
-        cfg.aggregateDecodeWindow =
-            gpuIsIosBuild() ? gpuIosAggregateWindowCeiling() : kGlobalFrameBudget;
+        cfg.aggregateDecodeWindow = qMax(1, m_residencyWindowParams.globalFrameBudget);
         cfg.stagingWindowPerFeed = int((int64_t(kStagingSpanMs) + dur - 1) / dur);
         cfg.activeBusCount = activeBusCount;
         cfg.readbackRingDepth = 3;
@@ -773,8 +1051,8 @@ GpuPrefetchPlan PlaybackWorker::planGpuSeekPrefetchForReposition(int64_t target,
 
     GpuBudget& budget = GpuBudget::instance();
     const GpuPrefetchPlan plan = GpuSeekPrefetch::planPrefetch(
-        target, dir, qMax<int64_t>(1, frameDurMs()), kLeadMs, surfaceConfig.surfaceBytes(),
-        budget.budgetBytes(), budget.liveBytes());
+        target, dir, qMax<int64_t>(1, frameDurMs()), windowLeadMs(), surfaceConfig.surfaceBytes(),
+        budget.budgetBytes(), budget.gatedLiveBytes());
     m_counters.gpuSeekPrefetchConsults++;
     m_counters.gpuSeekPrefetchPlannedSurfaces += plan.surfaceCount;
     return plan;
@@ -829,6 +1107,11 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_forceLiveOutputSnapshots.store(0, std::memory_order_release);
     m_gpuDeviceLossRebuildsRemaining.store(kDeviceLossRebuildBudget, std::memory_order_release);
     m_gpuRebuildDeferredForSuspend.store(false, std::memory_order_release);
+    m_memoryPressureLatched.store(false, std::memory_order_release);
+    m_lastIosMemoryWarningCount = 0;
+    m_lastPressureSampleMs = 0;
+    m_lastPressureWarningMs = -1;
+    m_lastPressureLevel1Ms = -1;
     GpuDeviceLossMonitor::instance().reset();
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
                              std::memory_order_release);
@@ -924,6 +1207,7 @@ void PlaybackWorker::shutdownOutputGraph() {
     m_forceLiveOutputSnapshots.store(0, std::memory_order_release);
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
                              std::memory_order_release);
+    m_memoryPressureLatched.store(false, std::memory_order_release);
     GpuDeviceLossMonitor::instance().reset();
 #endif
 }
@@ -1365,9 +1649,10 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
 #endif
     // Protect the active fill range in the travel direction (spec §6.6) so the
     // cap can never evict a frame the window still needs:
-    //   forward: [P, P + kLeadMs]   reverse: [P - kLeadMs, P]
-    const int64_t protectLo = (dir >= 0) ? P : (P - kLeadMs);
-    const int64_t protectHi = (dir >= 0) ? (P + kLeadMs) : P;
+    //   forward: [P, P + lead]   reverse: [P - lead, P]
+    const int64_t leadMs = windowLeadMs();
+    const int64_t protectLo = (dir >= 0) ? P : (P - leadMs);
+    const int64_t protectHi = (dir >= 0) ? (P + leadMs) : P;
 
     for (auto* track : m_decoderBank) {
         if (pkt->stream_index != track->streamIndex) continue;
@@ -1907,7 +2192,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     }
     if (m_audioPlayer) m_audioPlayer->clear();
 
-    const int64_t anchor = qMax<int64_t>(0, target - (dir < 0 ? kLeadMs : kTrailMs));
+    const int64_t anchor = qMax<int64_t>(0, target - (dir < 0 ? windowLeadMs() : windowTrailMs()));
 
     const int primaryVideoStreamIndex = m_decoderBank[0]->streamIndex;
     AVStream* vStream = m_fmtCtx->streams[primaryVideoStreamIndex];
@@ -1925,7 +2210,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     // multi-track Matroska is NOT guaranteed to resync to that PTS — the demuxer
     // can land a long way off, which would shorten the trail and storm the seek
     // path. So we PROBE the landed primary-video PTS and only keep the exact seek
-    // when it lands in the useful band [anchor - kTrailMs, target]; otherwise we
+    // when it lands in the useful band [anchor - trail, target]; otherwise we
     // fall back to the proven coarse av_seek_frame BACKWARD. Fully additive: when
     // the region is unindexed, pb is not byte-seekable, the seek fails, or the
     // probe lands out of band, we behave exactly like before — no gate regresses.
@@ -1936,7 +2221,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
             avformat_flush(m_fmtCtx);
             // Probe forward for the first primary-video packet and read its PTS
             // without decoding/inserting. Accept only if it landed in-band.
-            const int64_t bandLo = qMax<int64_t>(0, anchor - kTrailMs);
+            const int64_t bandLo = qMax<int64_t>(0, anchor - windowTrailMs());
             int probed = 0;
             bool landedInBand = false;
             while (probed++ < 64 && av_read_frame(m_fmtCtx, pkt) >= 0) {
@@ -2082,9 +2367,10 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                         m_outputCache->mergeFrom(
                             *m_stagingCache,
                             &evictedCacheFrames); // live now covers target AND keeps old
+                        const qint64 keepFrom = target - windowLeadMs();
                         const qint64 keepAudioFromSample =
-                            qMax<qint64>(0, (target - kLeadMs) * qint64(48000) / 1000);
-                        m_outputCache->trimBefore(target - kLeadMs, keepAudioFromSample,
+                            qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
+                        m_outputCache->trimBefore(keepFrom, keepAudioFromSample,
                                                   &evictedCacheFrames);
 #ifdef OLR_GPU_PIPELINE_BUILD
                         collectEvictedGpuFramesLocked(evictedCacheFrames);
@@ -2402,7 +2688,7 @@ void PlaybackWorker::fillStaging() {
     AVStream* refStream = m_prerollFmtCtx->streams[primaryStreamIndex];
 
     if (m_prerollSeekPending.exchange(false)) {
-        const int64_t anchor = qMax<int64_t>(0, target - kTrailMs);
+        const int64_t anchor = qMax<int64_t>(0, target - windowTrailMs());
         const int64_t seekPts = av_rescale_q(anchor, {1, 1000}, refStream->time_base);
         av_seek_frame(m_prerollFmtCtx, refStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
         avformat_flush(m_prerollFmtCtx);
@@ -3075,6 +3361,7 @@ void PlaybackWorker::run() {
         if (deviceLossPending && gpuPipelineState() == GpuPipelineState::Gpu) {
             handleGpuDeviceLoss();
         }
+        sampleGpuMemoryPressure(wallClock.elapsed());
 #endif
 
         // --- Sample state (spec §6.1) ---
@@ -3175,7 +3462,7 @@ void PlaybackWorker::run() {
         // (3) Forward lag / overrun (playing, dir=+1): decode/playhead is ahead
         //     of what's buffered. NEVER a reposition — skip-forward or tail-hold.
         const int64_t nMin = newestPtsMin(); // -1 if empty
-        if (playing && dir == 1 && nMin >= 0 && nMin < P - kLeadMs) {
+        if (playing && dir == 1 && nMin >= 0 && nMin < P - windowLeadMs()) {
             const int64_t nMax = newestPtsMax();
             if (P > nMax) {
                 // §6.8 tail-hold: P is past the written tail. Hold last frame,
@@ -3184,7 +3471,7 @@ void PlaybackWorker::run() {
             } else {
                 // §6.5 skip-forward: seek back a trail, resume decimated fill.
                 AVStream* vStream = m_fmtCtx->streams[m_decoderBank[0]->streamIndex];
-                int64_t anchor = qMax<int64_t>(0, P - kTrailMs);
+                int64_t anchor = qMax<int64_t>(0, P - windowTrailMs());
                 int64_t seekPts = av_rescale_q(anchor, {1, 1000}, vStream->time_base);
                 av_seek_frame(m_fmtCtx, vStream->index, seekPts, AVSEEK_FLAG_BACKWARD);
                 clearDecoderBuffers(/*invalidateGpuGeneration*/ false);
@@ -3220,7 +3507,7 @@ void PlaybackWorker::run() {
             while (!shouldInterrupt() && batch < kFillBatch) {
                 // Stop once the buffered min-newest reaches the lead edge.
                 int64_t nm = newestPtsMin();
-                if (nm >= 0 && nm >= P + kLeadMs) break;
+                if (nm >= 0 && nm >= P + windowLeadMs()) break;
                 // Abort fill if a seek arrived.
                 {
                     QMutexLocker locker(&m_mutex);
@@ -3248,19 +3535,19 @@ void PlaybackWorker::run() {
                 av_packet_unref(pkt);
 
                 // Terminate when the just-read video packet crosses the slack edge.
-                if (lastV != INT64_MIN && lastV > P + kLeadMs + kSlackMs) break;
+                if (lastV != INT64_MIN && lastV > P + windowLeadMs() + windowSlackMs()) break;
             }
         } else {
             // --- Reverse fill (§6.4): fill-then-deliver one chunk atomically. ---
             const int64_t rOldest = refOldestPts();
-            const int64_t newAnchor = qMax<int64_t>(0, P - kLeadMs - kChunkMs);
+            const int64_t newAnchor = qMax<int64_t>(0, P - windowLeadMs() - windowChunkMs());
             // Re-fetch only when the window needs filling AND the anchor has
             // descended a full chunk since the last fetch — otherwise
             // consecutive iterations (P drops < kChunkMs apart) re-decode an
             // overlapping window (~2-5x wasted decode under load).
-            const bool needFill = (rOldest < 0 || (rOldest > P - kLeadMs && P > 0));
-            const bool anchorMoved =
-                (m_reverseAnchorMs == INT64_MAX) || (m_reverseAnchorMs - newAnchor >= kChunkMs);
+            const bool needFill = (rOldest < 0 || (rOldest > P - windowLeadMs() && P > 0));
+            const bool anchorMoved = (m_reverseAnchorMs == INT64_MAX) ||
+                                     (m_reverseAnchorMs - newAnchor >= windowChunkMs());
             if (needFill && anchorMoved) {
                 m_reverseAnchorMs = newAnchor;
                 // Record the avio position of the current oldest (file-position
@@ -3274,7 +3561,8 @@ void PlaybackWorker::run() {
                 m_counters.reverseChunkSeek++;
 
                 const int kReverseChunkBudget =
-                    int(std::ceil(double(kChunkMs) / double(qMax<int64_t>(1, frameDurMs())))) *
+                    int(std::ceil(double(windowChunkMs()) /
+                                  double(qMax<int64_t>(1, frameDurMs())))) *
                     trackCount * 2;
                 int packets = 0;
                 while (!shouldInterrupt() && packets < kReverseChunkBudget) {
@@ -3316,11 +3604,11 @@ void PlaybackWorker::run() {
         {
             int64_t keepFrom, keepTo;
             if (dir >= 0) {
-                keepFrom = P - (kTrailMs + kSlackMs);
-                keepTo = P + (kLeadMs + kSlackMs);
+                keepFrom = P - (windowTrailMs() + windowSlackMs());
+                keepTo = P + (windowLeadMs() + windowSlackMs());
             } else {
-                keepFrom = P - (kLeadMs + kChunkMs + kSlackMs);
-                keepTo = P + (kTrailMs + kSlackMs);
+                keepFrom = P - (windowLeadMs() + windowChunkMs() + windowSlackMs());
+                keepTo = P + (windowTrailMs() + windowSlackMs());
             }
             QMutexLocker bufferLocker(&m_bufferMutex);
             for (auto* track : m_decoderBank) {
@@ -3331,7 +3619,9 @@ void PlaybackWorker::run() {
 #endif
             }
             if (m_outputCache) {
-                const qint64 keepAudioFromSample = qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
+                const qint64 audioKeepFrom = P - windowAudioTrailMs();
+                const qint64 keepAudioFromSample =
+                    qMax<qint64>(0, audioKeepFrom * qint64(48000) / 1000);
                 OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
                 m_outputCache->trimBefore(keepFrom, keepAudioFromSample, &evictedCacheFrames);
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -3450,8 +3740,9 @@ void PlaybackWorker::run() {
         // tail) and the bottom-of-file reverse case, preventing a hot spin.
         if (playing) {
             int64_t nm = newestPtsMin();
-            bool windowFull = (dir >= 0) ? (nm >= 0 && nm >= P + kLeadMs)
-                                         : (refOldestPts() >= 0 && refOldestPts() <= P - kLeadMs);
+            bool windowFull = (dir >= 0)
+                                  ? (nm >= 0 && nm >= P + windowLeadMs())
+                                  : (refOldestPts() >= 0 && refOldestPts() <= P - windowLeadMs());
             if (windowFull || packetsThisIter == 0) msleep(kIdleSleepMs);
         } else {
             // Paused and we did work this pass: brief sleep before re-checking.

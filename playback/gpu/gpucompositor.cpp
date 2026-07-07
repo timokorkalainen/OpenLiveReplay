@@ -462,7 +462,8 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         const QList<PreparedSource> sources = prepareSources(filtered);
         std::shared_ptr<GpuSurface> surface = gpucompositor::makeOutputRgba8Surface(width, height);
         if (!surface || !surface->isValid()) return FrameHandle{};
-        auto budgetCharge = GpuBudget::instance().tryCharge(gpuSurfaceBytes(*surface));
+        auto budgetCharge =
+            GpuBudget::instance().tryCharge(gpuSurfaceBytes(*surface), GpuBudgetTag::OutputBus);
         if (!budgetCharge) {
             GpuBudget::instance().noteOomDegrade();
             return FrameHandle{};

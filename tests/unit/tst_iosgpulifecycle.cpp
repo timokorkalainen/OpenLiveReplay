@@ -9,6 +9,7 @@
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/iosgpulifecyclesink.h"
+#include "playback/gpu/iosmemoryheadroom.h"
 
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
@@ -20,6 +21,8 @@ private slots:
     void init();
     void backgroundBumpsGenerationAndSuspends();
     void foregroundClearsSuspend();
+    void memoryWarningCountsOnlyWhileForeground();
+    void memoryHeadroomStubContract();
     void sinkRegistryRoundTrips();
     void presentBlockRunsOnceOnHost();
 #ifdef __APPLE__
@@ -49,6 +52,31 @@ void TestIosGpuLifecycle::foregroundClearsSuspend() {
     QVERIFY(sink.isSuspended());
     sink.onEnterForeground();
     QVERIFY(!sink.isSuspended());
+}
+
+void TestIosGpuLifecycle::memoryWarningCountsOnlyWhileForeground() {
+    DefaultIosGpuLifecycleSink sink;
+    QCOMPARE(sink.memoryWarningCount(), uint64_t(0));
+
+    sink.onMemoryWarning();
+    QCOMPARE(sink.memoryWarningCount(), uint64_t(1));
+
+    sink.onEnterBackground();
+    sink.onMemoryWarning();
+    QCOMPARE(sink.memoryWarningCount(), uint64_t(1));
+
+    sink.onEnterForeground();
+    sink.onMemoryWarning();
+    QCOMPARE(sink.memoryWarningCount(), uint64_t(2));
+}
+
+void TestIosGpuLifecycle::memoryHeadroomStubContract() {
+    const uint64_t bytes = iosAvailableMemoryBytes();
+#if defined(Q_OS_IOS)
+    Q_UNUSED(bytes);
+#else
+    QCOMPARE(bytes, uint64_t(0));
+#endif
 }
 
 void TestIosGpuLifecycle::sinkRegistryRoundTrips() {

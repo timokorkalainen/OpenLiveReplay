@@ -59,7 +59,7 @@ GpuMintResult degradedResult(FrameMetadata meta, const std::function<CpuPlanes()
 
 GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface, FrameMetadata meta,
                                const GpuFrameHandleFactory& gpuFactory,
-                               const std::function<CpuPlanes()>& cpuFallback) {
+                               const std::function<CpuPlanes()>& cpuFallback, GpuBudgetTag tag) {
     GpuMintResult result;
 
     if (gpuConsumeInjectedAllocFailure()) {
@@ -74,7 +74,7 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface, FrameMetadat
     if (bytes <= 0) {
         return degradedResult(meta, cpuFallback);
     }
-    auto charge = GpuBudget::instance().tryCharge(bytes);
+    auto charge = GpuBudget::instance().tryCharge(bytes, tag);
     if (!charge.has_value()) {
         return degradedResult(meta, cpuFallback);
     }
@@ -91,7 +91,7 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface, FrameMetadat
 GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
                                std::shared_ptr<GpuFence> renderFence,
-                               const std::function<CpuPlanes()>& cpuFallback) {
+                               const std::function<CpuPlanes()>& cpuFallback, GpuBudgetTag tag) {
     if (!rhi || !rhi->isValid()) return degradedResult(meta, cpuFallback);
     return mintGpuOrDegrade(
         std::move(surface), meta,
@@ -107,5 +107,5 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
             return makeGpuFrameHandle(std::move(s), std::move(rhi), m, std::move(renderFence),
                                       std::move(charge));
         },
-        cpuFallback);
+        cpuFallback, tag);
 }

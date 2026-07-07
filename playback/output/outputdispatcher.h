@@ -7,11 +7,14 @@
 #include <QList>
 #include <QString>
 
+#include <array>
 #include <memory>
 
 class GpuCompositor;
 class GpuRhiContext;
 class SharedGpuReadbackCache;
+
+constexpr int kOutputGpuBudgetTagCount = 9;
 
 struct OutputEndpoint {
     OutputTargetAssignment assignment;
@@ -79,6 +82,10 @@ struct OutputDispatchStats {
     // even though no placeholder/reposition is reported (frame-accuracy guard).
     qint64 maxClockDivergenceMs = 0;
     qint64 gpuVramBytes = 0;
+    qint64 gpuBudgetBytes = 0;
+    qint64 gpuGatedLiveBytes = 0;
+    bool gpuBudgetReportOnly = false;
+    std::array<qint64, kOutputGpuBudgetTagCount> gpuLiveBytesByTag{};
     qint64 readbackQueueDepth = 0;
     qint64 readbackDrops = 0;
     qint64 fenceWaitStalls = 0;

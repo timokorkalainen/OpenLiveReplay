@@ -17,6 +17,7 @@ namespace {
 std::atomic<bool> g_installed{false};
 id g_bgObserver = nil;
 id g_fgObserver = nil;
+id g_memoryWarningObserver = nil;
 
 } // namespace
 
@@ -40,6 +41,14 @@ extern "C" void installIosGpuLifecycle(void) {
                                  // MAIN-THREAD: forward to the platform-neutral sink.
                                  if (auto* sink = iosGpuLifecycleSink()) sink->onEnterForeground();
                                }];
+    g_memoryWarningObserver =
+        [nc addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification*) {
+                      // MAIN-THREAD: forward to the platform-neutral sink.
+                      if (auto* sink = iosGpuLifecycleSink()) sink->onMemoryWarning();
+                    }];
 }
 
 #else

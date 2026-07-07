@@ -9,6 +9,8 @@
 #include <atomic>
 #include <functional>
 
+struct GpuBudgetSnapshot;
+
 struct OutputRuntimeSnapshot {
     OutputFrameCache cache;
     PlaybackStateSnapshot state;
@@ -36,7 +38,7 @@ public:
     void resetPlayEpoch();
     void incrementFenceWaitStalls();
     void setGpuRhiContext(std::shared_ptr<GpuRhiContext> gpuRhi);
-    void recordGpuBudget(qint64 vramBytes, qint64 oomDegrades);
+    void recordGpuBudget(const GpuBudgetSnapshot& snapshot);
     void recordGpuDeviceLossEvents(qint64 events);
 
     OutputDispatchStats dispatchDueTicksForTest(qint64 wallNowMs);
@@ -92,8 +94,12 @@ private:
     qint64 m_pendingFrameIndexReset = 0;
     bool m_pendingPlayEpochReset = false;
     int m_pendingFenceWaitStalls = 0;
-    std::atomic<qint64> m_gpuVramBytes{0};
-    std::atomic<qint64> m_gpuOomDegrades{0};
+    qint64 m_gpuVramBytes = 0;
+    qint64 m_gpuBudgetBytes = 0;
+    qint64 m_gpuGatedLiveBytes = 0;
+    qint64 m_gpuOomDegrades = 0;
+    bool m_gpuBudgetReportOnly = false;
+    std::array<qint64, kOutputGpuBudgetTagCount> m_gpuLiveBytesByTag{};
     std::atomic<qint64> m_gpuDeviceLossEvents{0};
     int m_maxCatchUpTicks = 8;
 };

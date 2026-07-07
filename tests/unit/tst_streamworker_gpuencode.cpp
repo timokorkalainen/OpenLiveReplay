@@ -5,6 +5,7 @@
 #endif
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpugeneration.h"
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpusurface.h"
 #include "recorder_engine/codec/gpuencodepump.h"
 #include "recorder_engine/ingest/gpudecodedframe.h"
@@ -120,6 +121,8 @@ private slots:
     void jitterPullCarriesGpuFrameAndClearsOnCpuFrame();
     void paintBlueClearsGpuOnlyLatestFrame();
     void gpuDecodedFrameHelperWrapsAppleSurface();
+    void gpuDecodedFrameHelperChargesIngestWrap();
+    void gpuEncodeImportChargesRecorderWrap();
     void gpuEncodePumpStartsWhenGpuPipelineEnabled();
     void queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFlight();
     void gpuEncodeFallbackDisablesGpuFrameIngestPreference();
@@ -227,6 +230,75 @@ void TestStreamWorkerGpuEncode::gpuDecodedFrameHelperWrapsAppleSurface() {
     QCOMPARE(handle.metadata().key.height, 16);
     QCOMPARE(handle.metadata().key.ptsMs, qint64(123));
     QCOMPARE(handle.metadata().gpuGeneration, GpuGenerationCounter::instance().current());
+#endif
+}
+
+void TestStreamWorkerGpuEncode::gpuDecodedFrameHelperChargesIngestWrap() {
+#ifndef __APPLE__
+    QSKIP("GPU decoded-frame helper currently wraps Apple CVImageBuffer surfaces");
+#else
+    GpuBudget::instance().reset();
+
+    auto surface = makeAppleNv12Surface(16, 16);
+    if (!surface) QSKIP("could not allocate an IOSurface-backed NV12 surface");
+    const qint64 bytes = gpuSurfaceBytes(*surface);
+
+    auto* ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    CVPixelBufferRef pixelBuffer = nullptr;
+    const CVReturn rc =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+    if (rc != kCVReturnSuccess || !pixelBuffer) {
+        QSKIP("could not create a CVPixelBuffer wrapper for IOSurface");
+    }
+
+    CompressedAccessUnit unit;
+    unit.codec = NativeVideoCodec::H264;
+    {
+        const FrameHandle handle = makeGpuDecodedFrameHandle(pixelBuffer, unit, 16, 16, 123);
+        QVERIFY(handle.isGpuBacked());
+        QCOMPARE(GpuBudget::instance().liveBytes(GpuBudgetTag::IngestWrap), bytes);
+        QCOMPARE(GpuBudget::instance().gatedLiveBytes(), qint64(0));
+    }
+    CVPixelBufferRelease(pixelBuffer);
+    QCOMPARE(GpuBudget::instance().liveBytes(GpuBudgetTag::IngestWrap), qint64(0));
+#endif
+}
+
+void TestStreamWorkerGpuEncode::gpuEncodeImportChargesRecorderWrap() {
+#ifndef __APPLE__
+    QSKIP("GPU encode import currently wraps Apple CVImageBuffer surfaces in this test");
+#else
+    qputenv("OLR_GPU_PIPELINE", "1");
+    GpuBudget::instance().reset();
+
+    auto surface = makeAppleNv12Surface(16, 16);
+    if (!surface) QSKIP("could not allocate an IOSurface-backed NV12 surface");
+    const qint64 bytes = gpuSurfaceBytes(*surface);
+
+    auto* ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    CVPixelBufferRef pixelBuffer = nullptr;
+    const CVReturn rc =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+    if (rc != kCVReturnSuccess || !pixelBuffer) {
+        QSKIP("could not create a CVPixelBuffer wrapper for IOSurface");
+    }
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 16;
+    meta.key.height = 16;
+
+    {
+        const ImportedGpuVideoFrame imported =
+            worker.importGpuVideoFrameForEncode(pixelBuffer, meta);
+        QVERIFY(imported.frame.isGpuBacked());
+        QCOMPARE(GpuBudget::instance().liveBytes(GpuBudgetTag::RecorderWrap), bytes);
+        QCOMPARE(GpuBudget::instance().gatedLiveBytes(), qint64(0));
+    }
+    CVPixelBufferRelease(pixelBuffer);
+    QCOMPARE(GpuBudget::instance().liveBytes(GpuBudgetTag::RecorderWrap), qint64(0));
 #endif
 }
 

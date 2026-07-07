@@ -2,13 +2,10 @@
 #define OLR_IOSGPUPOLICY_H
 
 // iOS GPU-pipeline policy. Platform-neutral: no UIKit/Metal/CoreVideo types.
-// iOS uses a tighter GPU decode-window budget than macOS to bound thermal and
-// VRAM pressure under multiview playback.
-constexpr int kIosMaxPerTrackGpuFrames = 8;
-constexpr int kIosAggregateGpuFrameCeiling = 48;
+// The iOS per-track cap is derived by PlaybackWorker from the active residency
+// window instead of pinned to a fixed small constant.
 
 bool gpuIsIosBuild();
-int gpuPerTrackWindowCap(int trackCount);
-int gpuIosAggregateWindowCeiling();
+int gpuPerTrackWindowCap(int trackCount, int derivedPerTrackCap = 0);
 
 #endif // OLR_IOSGPUPOLICY_H

@@ -279,6 +279,7 @@ public:
                            KeepSurfaceCallback onSurface,
                            QString* error);
     void reset();
+    void flushExcessPixelBufferPool();
     bool lastDecodedWasIOSurfaceBacked() const { return lastIOSurfaceBacked; }
 
 private:
@@ -307,6 +308,21 @@ void NativeVideoDecoder::Impl::reset() {
     }
     codec = NativeVideoCodec::Unknown;
     activeParameterSetKey.clear();
+}
+
+void NativeVideoDecoder::Impl::flushExcessPixelBufferPool() {
+    if (!session) return;
+
+    CFTypeRef poolValue = nullptr;
+    const OSStatus status = VTSessionCopyProperty(
+        session, kVTDecompressionPropertyKey_PixelBufferPool, kCFAllocatorDefault, &poolValue);
+    if (status != noErr || !poolValue) return;
+
+    if (CFGetTypeID(poolValue) == CVPixelBufferPoolGetTypeID()) {
+        CVPixelBufferPoolFlush((CVPixelBufferPoolRef)poolValue,
+                               kCVPixelBufferPoolFlushExcessBuffers);
+    }
+    CFRelease(poolValue);
 }
 
 bool NativeVideoDecoder::Impl::createFormatDescription(const CompressedAccessUnit& unit,
@@ -620,6 +636,10 @@ bool NativeVideoDecoder::decodeKeepSurface(const CompressedAccessUnit& unit,
 
 void NativeVideoDecoder::reset() {
     m_impl->reset();
+}
+
+void NativeVideoDecoder::flushExcessPixelBufferPool() {
+    m_impl->flushExcessPixelBufferPool();
 }
 
 bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {

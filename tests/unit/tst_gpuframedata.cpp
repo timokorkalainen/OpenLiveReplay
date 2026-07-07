@@ -28,6 +28,8 @@ private slots:
     void gpuPresentabilityDoesNotReadBack();
     void outputCacheInsertionDoesNotReadBack();
     void readToCpuDownloadsAndCounts();
+    void cpuReadbackCacheChargesRepeatedReadsOnce();
+    void cpuReadbackCacheCreditsWhenHandleIsDestroyed();
     void appleSurfaceWithoutRhiReadsToCpu();
     void readbackMatchesCpuWithinOneLsb();
     void importVtBufferProducesGpuHandle();
@@ -65,6 +67,16 @@ public:
 private:
     std::atomic<uint64_t> m_pending{0};
 };
+
+#ifdef __APPLE__
+qint64 cpuPlanePayloadBytes(const CpuPlanes& planes) {
+    qint64 bytes = 0;
+    for (const QByteArray& plane : planes.plane) {
+        bytes += qint64(plane.size());
+    }
+    return bytes;
+}
+#endif
 
 } // namespace
 
@@ -223,6 +235,67 @@ void TestGpuFrameData::readToCpuDownloadsAndCounts() {
     QCOMPARE(twice.gpuReadbacks, qint64(0));
     QCOMPARE(twice.uniqueSurfaces, qint64(0));
     QCOMPARE(twice.redundantReadbacks, qint64(0));
+}
+
+void TestGpuFrameData::cpuReadbackCacheChargesRepeatedReadsOnce() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no RHI backend");
+    auto& budget = GpuBudget::instance();
+    budget.reset();
+
+    auto surface = makeAppleNv12Surface(64, 48);
+    QVERIFY(surface != nullptr);
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 48;
+
+    FrameHandle handle = makeGpuFrameHandle(surface, rhi, meta);
+    const auto* data = dynamic_cast<const GpuFrameData*>(handle.data());
+    QVERIFY(data != nullptr);
+
+    const CpuPlanes planes = handle.readToCpu(FramePixelFormat::Yuv420p);
+    QVERIFY(planes.isValid());
+    const qint64 cachedBytes = cpuPlanePayloadBytes(planes);
+    QVERIFY(cachedBytes > 0);
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), cachedBytes);
+    QCOMPARE(budget.gatedLiveBytes(), qint64(0));
+    QCOMPARE(data->readToCpuCount(), 1);
+
+    const CpuPlanes second = handle.readToCpu(FramePixelFormat::Yuv420p);
+    QVERIFY(second.isValid());
+    QCOMPARE(data->readToCpuCount(), 1);
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), cachedBytes);
+    QCOMPARE(budget.gatedLiveBytes(), qint64(0));
+
+    handle = FrameHandle();
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), qint64(0));
+}
+
+void TestGpuFrameData::cpuReadbackCacheCreditsWhenHandleIsDestroyed() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no RHI backend");
+    auto& budget = GpuBudget::instance();
+    budget.reset();
+
+    qint64 cachedBytes = 0;
+    {
+        auto surface = makeAppleNv12Surface(64, 48);
+        QVERIFY(surface != nullptr);
+        FrameMetadata meta;
+        meta.key.format = FramePixelFormat::Nv12;
+        meta.key.width = 64;
+        meta.key.height = 48;
+
+        FrameHandle handle = makeGpuFrameHandle(surface, rhi, meta);
+        const CpuPlanes planes = handle.readToCpu(FramePixelFormat::Yuv420p);
+        QVERIFY(planes.isValid());
+        cachedBytes = cpuPlanePayloadBytes(planes);
+        QVERIFY(cachedBytes > 0);
+        QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), cachedBytes);
+    }
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), qint64(0));
+    QCOMPARE(budget.liveBytes(), qint64(0));
 }
 
 void TestGpuFrameData::appleSurfaceWithoutRhiReadsToCpu() {

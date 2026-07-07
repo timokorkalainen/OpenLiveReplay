@@ -5,9 +5,37 @@
 
 #include <QtGlobal>
 
+#include <array>
 #include <optional>
 
 class GpuSurface;
+
+enum class GpuBudgetTag {
+    DecodeWindow = 0,
+    Staging,
+    ReadbackRing,
+    CpuReadbackCache,
+    RetireQueue,
+    RecorderWrap,
+    IngestWrap,
+    OutputBus,
+    Other,
+    Count
+};
+
+constexpr int kGpuBudgetTagCount = static_cast<int>(GpuBudgetTag::Count);
+
+const char* gpuBudgetTagName(GpuBudgetTag tag);
+bool gpuBudgetTagIsGated(GpuBudgetTag tag);
+
+struct GpuBudgetSnapshot {
+    qint64 budgetBytes = 0;
+    qint64 liveBytes = 0;
+    qint64 gatedLiveBytes = 0;
+    qint64 oomDegrades = 0;
+    bool reportOnly = false;
+    std::array<qint64, kGpuBudgetTagCount> liveBytesByTag{};
+};
 
 struct GpuBudgetConfig {
     int feedCount = 1;
@@ -37,6 +65,7 @@ class GpuBudgetCharge {
 public:
     GpuBudgetCharge() = default;
     explicit GpuBudgetCharge(qint64 bytes);
+    GpuBudgetCharge(qint64 bytes, GpuBudgetTag tag);
     ~GpuBudgetCharge();
 
     GpuBudgetCharge(GpuBudgetCharge&& other) noexcept;
@@ -46,12 +75,14 @@ public:
     GpuBudgetCharge& operator=(const GpuBudgetCharge&) = delete;
 
     qint64 bytes() const { return m_bytes; }
+    GpuBudgetTag tag() const { return m_tag; }
 
 private:
     struct Adopted {};
-    GpuBudgetCharge(qint64 bytes, Adopted);
+    GpuBudgetCharge(qint64 bytes, GpuBudgetTag tag, Adopted);
 
     qint64 m_bytes = 0;
+    GpuBudgetTag m_tag = GpuBudgetTag::DecodeWindow;
 
     friend class GpuBudget;
 };
@@ -61,14 +92,21 @@ public:
     static GpuBudget& instance();
 
     void configure(const GpuBudgetConfig& config);
+    void setBudgetBytesForRuntime(qint64 bytes);
     qint64 budgetBytes() const;
     qint64 liveBytes() const;
+    qint64 liveBytes(GpuBudgetTag tag) const;
+    qint64 gatedLiveBytes() const;
+    qint64 mintedBytesSinceLastSample() const;
+    void resetMintedBytesSinceLastSample();
     bool canAllocate(qint64 bytes) const;
-    std::optional<GpuBudgetCharge> tryCharge(qint64 bytes);
-    void charge(qint64 bytes);
-    void credit(qint64 bytes);
+    std::optional<GpuBudgetCharge> tryCharge(qint64 bytes,
+                                             GpuBudgetTag tag = GpuBudgetTag::DecodeWindow);
+    void charge(qint64 bytes, GpuBudgetTag tag = GpuBudgetTag::DecodeWindow);
+    void credit(qint64 bytes, GpuBudgetTag tag = GpuBudgetTag::DecodeWindow);
     qint64 oomDegradeCount() const;
     void noteOomDegrade();
+    GpuBudgetSnapshot snapshot() const;
     void reset();
 
 private:

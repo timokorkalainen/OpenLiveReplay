@@ -35,6 +35,8 @@ public:
     int readToCpuCount() const { return m_readCount.load(std::memory_order_acquire); }
 
 private:
+    struct CpuCacheEntry;
+
     std::shared_ptr<GpuSurface> m_surface;
     std::shared_ptr<GpuRhiContext> m_rhi;
     std::shared_ptr<GpuFence> m_renderFence;
@@ -44,7 +46,7 @@ private:
     uint64_t m_gpuGeneration = 0;
     mutable std::atomic<int> m_readCount{0};
     mutable QMutex m_cacheMutex;
-    mutable QHash<int, CpuPlanes> m_cpuCache;
+    mutable QHash<int, std::shared_ptr<const CpuCacheEntry>> m_cpuCache;
 };
 
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,

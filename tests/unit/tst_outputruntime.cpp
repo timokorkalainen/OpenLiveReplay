@@ -1,5 +1,6 @@
 #include <QtTest>
 
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/output/outputruntime.h"
 
@@ -429,18 +430,55 @@ void TestOutputRuntime::recordGpuBudgetSurfacesInStats() {
     OutputRuntime runtime(FrameRate::fromFraction(60, 1), 1, 64, 48);
 
     QCOMPARE(runtime.stats().gpuVramBytes, qint64(0));
+    QCOMPARE(runtime.stats().gpuBudgetBytes, qint64(0));
+    QCOMPARE(runtime.stats().gpuGatedLiveBytes, qint64(0));
+    QVERIFY(!runtime.stats().gpuBudgetReportOnly);
+    for (qint64 taggedBytes : runtime.stats().gpuLiveBytesByTag)
+        QCOMPARE(taggedBytes, qint64(0));
     QCOMPARE(runtime.stats().gpuOomDegrades, qint64(0));
     QCOMPARE(runtime.stats().gpuDeviceLossEvents, qint64(0));
 
-    runtime.recordGpuBudget(3110400, 2);
+    GpuBudgetSnapshot snapshot;
+    snapshot.budgetBytes = 9000000;
+    snapshot.liveBytes = 3110400;
+    snapshot.gatedLiveBytes = 2000000;
+    snapshot.oomDegrades = 2;
+    snapshot.reportOnly = true;
+    snapshot.liveBytesByTag[static_cast<int>(GpuBudgetTag::DecodeWindow)] = 2000000;
+    snapshot.liveBytesByTag[static_cast<int>(GpuBudgetTag::IngestWrap)] = 1110400;
+
+    runtime.recordGpuBudget(snapshot);
     runtime.recordGpuDeviceLossEvents(1);
     QCOMPARE(runtime.stats().gpuVramBytes, qint64(3110400));
+    QCOMPARE(runtime.stats().gpuBudgetBytes, qint64(9000000));
+    QCOMPARE(runtime.stats().gpuGatedLiveBytes, qint64(2000000));
+    QVERIFY(runtime.stats().gpuBudgetReportOnly);
+    QCOMPARE(runtime.stats().gpuLiveBytesByTag[static_cast<int>(GpuBudgetTag::DecodeWindow)],
+             qint64(2000000));
+    QCOMPARE(runtime.stats().gpuLiveBytesByTag[static_cast<int>(GpuBudgetTag::IngestWrap)],
+             qint64(1110400));
     QCOMPARE(runtime.stats().gpuOomDegrades, qint64(2));
     QCOMPARE(runtime.stats().gpuDeviceLossEvents, qint64(1));
 
-    runtime.recordGpuBudget(6220800, 3);
+    snapshot = {};
+    snapshot.budgetBytes = 12000000;
+    snapshot.liveBytes = 6220800;
+    snapshot.gatedLiveBytes = 3000000;
+    snapshot.oomDegrades = 3;
+    snapshot.liveBytesByTag[static_cast<int>(GpuBudgetTag::OutputBus)] = 3000000;
+    snapshot.liveBytesByTag[static_cast<int>(GpuBudgetTag::RecorderWrap)] = 3220800;
+    runtime.recordGpuBudget(snapshot);
     runtime.recordGpuDeviceLossEvents(2);
     QCOMPARE(runtime.stats().gpuVramBytes, qint64(6220800));
+    QCOMPARE(runtime.stats().gpuBudgetBytes, qint64(12000000));
+    QCOMPARE(runtime.stats().gpuGatedLiveBytes, qint64(3000000));
+    QVERIFY(!runtime.stats().gpuBudgetReportOnly);
+    QCOMPARE(runtime.stats().gpuLiveBytesByTag[static_cast<int>(GpuBudgetTag::DecodeWindow)],
+             qint64(0));
+    QCOMPARE(runtime.stats().gpuLiveBytesByTag[static_cast<int>(GpuBudgetTag::OutputBus)],
+             qint64(3000000));
+    QCOMPARE(runtime.stats().gpuLiveBytesByTag[static_cast<int>(GpuBudgetTag::RecorderWrap)],
+             qint64(3220800));
     QCOMPARE(runtime.stats().gpuOomDegrades, qint64(3));
     QCOMPARE(runtime.stats().gpuDeviceLossEvents, qint64(2));
 

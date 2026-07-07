@@ -8,6 +8,7 @@ private slots:
     void defaultCapabilitiesAreFalse();
     void queryCapabilitiesReportsPlatformBackend();
     void keepSurfaceNullImageBufferIsRejected();
+    void flushExcessPixelBufferPoolNoOpsWithoutSession();
 };
 
 void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
@@ -43,6 +44,11 @@ void TestNativeVideoDecoder::keepSurfaceNullImageBufferIsRejected() {
 #else
     QSKIP("VideoToolbox null-image callback seam is Apple-only");
 #endif
+}
+
+void TestNativeVideoDecoder::flushExcessPixelBufferPoolNoOpsWithoutSession() {
+    NativeVideoDecoder decoder(0, 0);
+    decoder.flushExcessPixelBufferPool();
 }
 
 QTEST_GUILESS_MAIN(TestNativeVideoDecoder)

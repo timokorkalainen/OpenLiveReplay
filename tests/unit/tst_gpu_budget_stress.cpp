@@ -1,5 +1,5 @@
 // Multi-feed budget-pressure stress (spec Section 10 VRAM-blowup row): under a
-// tiny GPU budget, concurrent mints must never push liveBytes past budgetBytes,
+// tiny GPU budget, concurrent gated mints must never push gatedLiveBytes past budgetBytes,
 // over-budget mints must degrade to CPU handles, and charges must drain to zero
 // once all handles drop.
 #include <QtTest>
@@ -98,7 +98,7 @@ void TestGpuBudgetStress::concurrentMintsNeverExceedBudgetAndNeverNull() {
                 if (r.degradedToCpu) cpuDegrades.fetch_add(1, std::memory_order_acq_rel);
                 if (!r.handle.isNull())
                     perFeedHandles[feedIndex].fetch_add(1, std::memory_order_acq_rel);
-                if (b.liveBytes() > b.budgetBytes())
+                if (b.gatedLiveBytes() > b.budgetBytes())
                     sawBlowup.store(true, std::memory_order_release);
                 held.push_back(std::move(r.handle));
             }

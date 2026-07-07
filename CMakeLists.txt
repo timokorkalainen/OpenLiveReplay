@@ -15,6 +15,7 @@ option(OLR_WERROR "Treat warnings as errors for first-party targets" ON)
 option(OLR_WCONVERSION "Also enable the -Wconversion/-Wsign-conversion family (large backlog; opt-in)" OFF)
 option(OLR_BUILD_FUZZERS "Build libFuzzer harnesses for the input parsers (needs clang+libFuzzer)" OFF)
 option(OLR_GPU_PIPELINE "Build the GPU-resident pipeline (RHI spine, shaders), default off" OFF)
+option(OLR_GPU_PIPELINE_FORCE_ON "Force-enable the GPU-resident pipeline at app startup" OFF)
 option(OLR_BUILD_GPU_PROBES "Build Phase-0 GPU measurement probes (links Qt RHI; not shipped)" OFF)
 option(OLR_WITH_DECKLINK "Build the Blackmagic DeckLink output backend (requires DECKLINK_SDK_DIR)" OFF)
 set(DECKLINK_SDK_DIR "" CACHE PATH "Path to the Blackmagic DeckLink SDK headers")
@@ -527,6 +528,9 @@ endif()
 
 if(OLR_GPU_PIPELINE)
     target_compile_definitions(OpenLiveReplay PRIVATE OLR_GPU_PIPELINE_BUILD=1)
+    if(OLR_GPU_PIPELINE_FORCE_ON)
+        target_compile_definitions(OpenLiveReplay PRIVATE OLR_GPU_PIPELINE_FORCE_ON=1)
+    endif()
     target_link_libraries(OpenLiveReplay PRIVATE Qt6::GuiPrivate)
     target_sources(OpenLiveReplay PRIVATE
         recorder_engine/codec/gpuencodepump.h recorder_engine/codec/gpuencodepump.cpp
@@ -536,6 +540,7 @@ if(OLR_GPU_PIPELINE)
         playback/gpu/gpuseekprefetch.h playback/gpu/gpuseekprefetch.cpp
         playback/gpu/gpusurfaceallocator.h playback/gpu/gpusurfaceallocator.cpp
         playback/gpu/iosgpupolicy.h playback/gpu/iosgpupolicy.cpp
+        playback/gpu/iosmemoryheadroom.h playback/gpu/iosmemoryheadroom.cpp
         playback/gpu/iosgpulifecyclesink.h playback/gpu/iosgpulifecyclesink.cpp)
     if(APPLE)
         target_sources(OpenLiveReplay PRIVATE

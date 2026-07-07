@@ -314,6 +314,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpulifecyclesink.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosmemoryheadroom.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpupolicy.cpp")
     if(APPLE)
         target_sources(olr_test_playback PRIVATE
@@ -347,6 +348,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpulifecyclesink.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosmemoryheadroom.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpupolicy.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"

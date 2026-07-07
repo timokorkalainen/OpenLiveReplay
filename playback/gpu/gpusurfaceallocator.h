@@ -21,10 +21,12 @@ using GpuFrameHandleFactory =
 
 GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface, FrameMetadata meta,
                                const GpuFrameHandleFactory& gpuFactory,
-                               const std::function<CpuPlanes()>& cpuFallback);
+                               const std::function<CpuPlanes()>& cpuFallback,
+                               GpuBudgetTag tag = GpuBudgetTag::DecodeWindow);
 GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
                                std::shared_ptr<GpuFence> renderFence,
-                               const std::function<CpuPlanes()>& cpuFallback);
+                               const std::function<CpuPlanes()>& cpuFallback,
+                               GpuBudgetTag tag = GpuBudgetTag::DecodeWindow);
 
 #endif // OLR_GPUSURFACEALLOCATOR_H

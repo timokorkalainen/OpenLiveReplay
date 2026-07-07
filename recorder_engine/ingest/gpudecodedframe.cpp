@@ -12,6 +12,7 @@
 
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(__APPLE__)
 #include "playback/gpu/appleiosurface.h"
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpuframedata.h"
 #endif
 
@@ -54,7 +55,9 @@ FrameHandle makeGpuDecodedFrameHandle(void* nativeDecodedImage, const Compressed
     if (!surface) return {};
 
     FrameMetadata meta = gpuDecodedFrameMetadata(unit, width, height, ptsMs);
-    return makeGpuFrameHandle(std::move(surface), nullptr, meta);
+    const qint64 bytes = gpuSurfaceBytes(*surface);
+    return makeGpuFrameHandle(std::move(surface), nullptr, meta, nullptr,
+                              GpuBudgetCharge(bytes, GpuBudgetTag::IngestWrap));
 #else
     Q_UNUSED(nativeDecodedImage);
     Q_UNUSED(unit);

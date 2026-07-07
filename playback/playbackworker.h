@@ -80,6 +80,16 @@ class PlaybackWorker : public QThread {
     friend class TestGpuDeviceLostWorker;
 #endif
 public:
+    struct ResidencyWindowParams {
+        int leadMs = 500;
+        int trailMs = 300;
+        int chunkMs = 500;
+        int slackMs = 200;
+        int audioTrailMs = 500;
+        int globalFrameBudget = 256;
+        int perTrackCapOverride = 0;
+    };
+
     struct PlaybackCounters {
         int reposition = 0, reuseSeek = 0, reverseChunkSeek = 0, eofTailSeek = 0, skipForward = 0,
             audioPushes = 0, framesDropped = 0;
@@ -110,6 +120,8 @@ public:
         qint64 gpuSeekPrefetchConsults = 0;
         qint64 gpuSeekPrefetchPlannedSurfaces = 0;
         qint64 gpuSeekPrefetchGpuAttempts = 0;
+        qint64 gpuMemoryPressureLevel1 = 0;
+        qint64 gpuMemoryPressureLevel2 = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
@@ -147,6 +159,13 @@ public:
     void setSelectedOutputFeed(int feedIndex);
     void setBusPreviewProviders(FrameProvider* multiviewProvider, FrameProvider* pgmProvider);
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
+#ifdef OLR_UNIT_TEST
+    void setResidencyWindowParamsForTest(const ResidencyWindowParams& params);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void evaluateGpuMemoryPressureForTest(uint64_t availableBytes, bool memoryWarning,
+                                          qint64 nowMs = 0);
+#endif
+#endif
     void stop();
 
     PlaybackCounters counters() const;
@@ -171,9 +190,9 @@ protected:
 
 private:
     // --- Scheduler constants (spec §3) ------------------------------------
-    static constexpr int kLeadMs = 500;            // video window ahead of P (travel dir)
-    static constexpr int kTrailMs = 300;           // video window behind P
-    static constexpr int kChunkMs = 500;           // reverse backward-fetch chunk size
+    static constexpr int kLeadMs = 500;            // default video window ahead of P
+    static constexpr int kTrailMs = 300;           // default video window behind P
+    static constexpr int kChunkMs = 500;           // default reverse backward-fetch chunk size
     static constexpr int kAudioLeadMs = 200;       // max lead of pushed audio over P
     static constexpr int kAudioQueueMs = 900;      // worker audio-queue span bound
     static constexpr int kSlackMs = 200;           // trim hysteresis beyond the window
@@ -197,6 +216,11 @@ private:
     //     bodies are implemented here except repositionTo (stubbed). ---------
     int fps() const;            // m_transport->fps(), clamped >=1
     int64_t frameDurMs() const; // 1000 / fps()
+    int64_t windowLeadMs() const;
+    int64_t windowTrailMs() const;
+    int64_t windowChunkMs() const;
+    int64_t windowSlackMs() const;
+    int64_t windowAudioTrailMs() const;
     int capFrames(int trackCount) const;
     int64_t newestPtsMin() const; // min-newest, staleness-excluded; -1 empty
     int64_t oldestPtsMin() const; // min-oldest, staleness-excluded; -1 empty
@@ -252,6 +276,13 @@ private:
     bool consumeGpuDeviceLossRebuildBudget();
     void drainGpuDeviceLossEvents() const;
     void handleGpuDeviceLoss();
+    void sampleGpuMemoryPressure(qint64 nowMs);
+    void evaluateGpuMemoryPressure(uint64_t availableBytes, bool memoryWarning, qint64 nowMs);
+    qint64 gpuMemoryPressureLevel1ThresholdBytes();
+    bool deriveGpuBudgetFromAvailableMemory(uint64_t availableBytes);
+    void handleGpuMemoryPressureLevel1(qint64 nowMs);
+    void handleGpuMemoryPressureLevel2(qint64 nowMs);
+    void flushNativeDecoderPools();
     void resumeDeferredGpuRebuild();
     void detachOutputEndpointsForDeviceLoss();
     void sanitizeCacheForDeviceLossLocked(OutputFrameCache* cache, int* recoveredFrames = nullptr,
@@ -315,6 +346,7 @@ private:
     std::atomic<int> m_selectedOutputFeed{-1};
 
     AudioFrameQueue m_audioQueue;            // worker-thread-only
+    ResidencyWindowParams m_residencyWindowParams;
     qint64 m_decodedVideoSequence = 0;       // worker-thread-only decoded frame identity
     std::atomic<bool> m_audioReprime{false}; // set by setActiveAudioView (UI thread)
     std::atomic<int> m_lastMoveDir{1};
@@ -456,7 +488,12 @@ private:
     mutable std::atomic<int> m_forceLiveOutputSnapshots{0};
     std::atomic<int> m_gpuDeviceLossRebuildsRemaining{kDeviceLossRebuildBudget};
     std::atomic<bool> m_gpuRebuildDeferredForSuspend{false};
-    bool m_gpuSeekPrefetchActive = false; // worker-thread-only reposition scope
+    std::atomic<bool> m_memoryPressureLatched{false};
+    uint64_t m_lastIosMemoryWarningCount = 0; // worker-thread-only
+    qint64 m_lastPressureSampleMs = 0;        // worker-thread-only
+    qint64 m_lastPressureWarningMs = -1;      // worker-thread-only
+    qint64 m_lastPressureLevel1Ms = -1;       // worker-thread-only
+    bool m_gpuSeekPrefetchActive = false;     // worker-thread-only reposition scope
     int m_gpuSeekPrefetchRemaining = 0;
     GpuPrefetchPlan m_gpuSeekPrefetchPlan;
 #endif

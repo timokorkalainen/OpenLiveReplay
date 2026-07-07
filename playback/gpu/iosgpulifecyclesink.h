@@ -13,20 +13,25 @@ public:
     virtual ~IosGpuLifecycleSink();
     virtual void onEnterBackground() = 0;
     virtual void onEnterForeground() = 0;
+    virtual void onMemoryWarning() = 0;
     virtual bool isSuspended() const = 0;
+    virtual uint64_t memoryWarningCount() const { return 0; }
 };
 
 class DefaultIosGpuLifecycleSink : public IosGpuLifecycleSink {
 public:
     void onEnterBackground() override;
     void onEnterForeground() override;
+    void onMemoryWarning() override;
 
     bool isSuspended() const override;
     uint64_t generationAtLastBackground() const;
+    uint64_t memoryWarningCount() const override;
 
 private:
     std::atomic<bool> m_suspended{false};
     std::atomic<uint64_t> m_bgGeneration{0};
+    std::atomic<uint64_t> m_memoryWarnings{0};
 };
 
 void setIosGpuLifecycleSink(IosGpuLifecycleSink* sink);

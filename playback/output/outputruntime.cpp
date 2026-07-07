@@ -1,11 +1,15 @@
 #include "playback/output/outputruntime.h"
 
+#include "playback/gpu/gpubudget.h"
+
 #include <QElapsedTimer>
 #include <cmath>
 #include <utility>
 
 namespace {
 constexpr qint64 kNsPerSecond = 1000000000;
+static_assert(kOutputGpuBudgetTagCount == kGpuBudgetTagCount,
+              "OutputDispatchStats GPU tag storage must match GpuBudgetSnapshot tags");
 } // namespace
 
 OutputRuntime::OutputRuntime(FrameRate rate, int feedCount, int width, int height,
@@ -122,9 +126,15 @@ void OutputRuntime::setGpuRhiContext(std::shared_ptr<GpuRhiContext> gpuRhi) {
     m_dispatcher.setGpuRhiContext(std::move(gpuRhi));
 }
 
-void OutputRuntime::recordGpuBudget(qint64 vramBytes, qint64 oomDegrades) {
-    m_gpuVramBytes.store(qMax<qint64>(0, vramBytes), std::memory_order_release);
-    m_gpuOomDegrades.store(qMax<qint64>(0, oomDegrades), std::memory_order_release);
+void OutputRuntime::recordGpuBudget(const GpuBudgetSnapshot& snapshot) {
+    QMutexLocker locker(&m_mutex);
+    m_gpuVramBytes = qMax<qint64>(0, snapshot.liveBytes);
+    m_gpuBudgetBytes = qMax<qint64>(0, snapshot.budgetBytes);
+    m_gpuGatedLiveBytes = qMax<qint64>(0, snapshot.gatedLiveBytes);
+    m_gpuOomDegrades = qMax<qint64>(0, snapshot.oomDegrades);
+    m_gpuBudgetReportOnly = snapshot.reportOnly;
+    for (int i = 0; i < kOutputGpuBudgetTagCount; ++i)
+        m_gpuLiveBytesByTag[i] = qMax<qint64>(0, snapshot.liveBytesByTag[i]);
 }
 
 void OutputRuntime::recordGpuDeviceLossEvents(qint64 events) {
@@ -275,8 +285,12 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
 
 OutputDispatchStats OutputRuntime::statsLocked() const {
     OutputDispatchStats stats = m_dispatcher.stats();
-    stats.gpuVramBytes = m_gpuVramBytes.load(std::memory_order_acquire);
-    stats.gpuOomDegrades = m_gpuOomDegrades.load(std::memory_order_acquire);
+    stats.gpuVramBytes = m_gpuVramBytes;
+    stats.gpuBudgetBytes = m_gpuBudgetBytes;
+    stats.gpuGatedLiveBytes = m_gpuGatedLiveBytes;
+    stats.gpuBudgetReportOnly = m_gpuBudgetReportOnly;
+    stats.gpuLiveBytesByTag = m_gpuLiveBytesByTag;
+    stats.gpuOomDegrades = m_gpuOomDegrades;
     stats.gpuDeviceLossEvents = m_gpuDeviceLossEvents.load(std::memory_order_acquire);
     return stats;
 }

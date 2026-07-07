@@ -10,6 +10,7 @@
 #include "ingest/nativendiingestsession.h"
 #include "timing/smpte12m.h"
 #if defined(OLR_GPU_PIPELINE_BUILD)
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpupipelineconfig.h"
@@ -142,7 +143,9 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDec
     auto surface = wrapAppleImageBuffer(nativeDecodedImage);
     if (!surface) return imported;
 
-    imported.frame = makeGpuFrameHandle(std::move(surface), nullptr, metadata);
+    const qint64 bytes = gpuSurfaceBytes(*surface);
+    imported.frame = makeGpuFrameHandle(std::move(surface), nullptr, metadata, nullptr,
+                                        GpuBudgetCharge(bytes, GpuBudgetTag::RecorderWrap));
     imported.fenceValue = 0;
 #elif defined(_WIN32)
     if (!m_gpuEncodeImportEdge || m_gpuEncodeImportEdge->deviceLost()) {
@@ -171,8 +174,9 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDec
         return imported;
     }
     const uint64_t fenceValue = fence ? fence->signal() : 0;
-    imported.frame =
-        WinGpuImportEdge::makeGpuFrameHandleForTest(std::move(surface), metadata, fence);
+    const qint64 bytes = gpuSurfaceBytes(*surface);
+    imported.frame = WinGpuImportEdge::makeGpuFrameHandleForTest(
+        std::move(surface), metadata, fence, GpuBudgetCharge(bytes, GpuBudgetTag::RecorderWrap));
     imported.fenceValue = fenceValue;
 #else
     Q_UNUSED(nativeDecodedImage);

@@ -51,6 +51,11 @@ void TestOutputDispatchGpuStats::newFieldsDefaultZero() {
     QCOMPARE(stats.gpuReadbacks, qint64(0));
     QCOMPARE(stats.uniqueGpuReadbackSurfaces, qint64(0));
     QCOMPARE(stats.redundantGpuReadbacks, qint64(0));
+    QCOMPARE(stats.gpuBudgetBytes, qint64(0));
+    QCOMPARE(stats.gpuGatedLiveBytes, qint64(0));
+    QVERIFY(!stats.gpuBudgetReportOnly);
+    for (qint64 taggedBytes : stats.gpuLiveBytesByTag)
+        QCOMPARE(taggedBytes, qint64(0));
 }
 
 void TestOutputDispatchGpuStats::cpuPathLeavesGpuCountersZero() {
@@ -84,6 +89,11 @@ void TestOutputDispatchGpuStats::cpuPathLeavesGpuCountersZero() {
     QCOMPARE(stats.fenceWaitStalls, qint64(0));
     QCOMPARE(stats.gpuOomDegrades, qint64(0));
     QCOMPARE(stats.gpuDeviceLossEvents, qint64(0));
+    QCOMPARE(stats.gpuBudgetBytes, qint64(0));
+    QCOMPARE(stats.gpuGatedLiveBytes, qint64(0));
+    QVERIFY(!stats.gpuBudgetReportOnly);
+    for (qint64 taggedBytes : stats.gpuLiveBytesByTag)
+        QCOMPARE(taggedBytes, qint64(0));
 }
 
 void TestOutputDispatchGpuStats::redundantReadbackSurfacesThroughStats() {

@@ -24,6 +24,7 @@ private slots:
     void zeroByteSurfaceDegradesToCpu();
     void headroomMintsChargedGpuHandle();
     void customFactoryReceivesBudgetCharge();
+    void customTagPropagatesToBudgetCharge();
 };
 
 namespace {
@@ -372,6 +373,45 @@ void TestGpuSurfaceAllocator::customFactoryReceivesBudgetCharge() {
     QVERIFY(r.handle.isGpuBacked());
     QVERIFY(!r.degradedToCpu);
     QVERIFY(b.liveBytes() > 0);
+}
+
+void TestGpuSurfaceAllocator::customTagPropagatesToBudgetCharge() {
+    auto rhi = testRhi();
+    if (!rhi) QSKIP("no test RHI backend on this host");
+
+    GpuBudgetConfig c;
+    c.aggregateDecodeWindow = 8;
+    c.feedCount = 1;
+    c.stagingWindowPerFeed = 0;
+    c.activeBusCount = 0;
+    c.readbackRingDepth = 0;
+    c.width = 64;
+    c.height = 48;
+    auto& b = GpuBudget::instance();
+    b.reset();
+    b.configure(c);
+
+    auto surface = std::make_shared<TestSurface>();
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 48;
+    GpuBudgetTag observedTag = GpuBudgetTag::Other;
+    GpuMintResult r = mintGpuOrDegrade(
+        surface, meta,
+        [rhi, &observedTag](std::shared_ptr<GpuSurface> s, FrameMetadata m,
+                            GpuBudgetCharge charge) mutable {
+            observedTag = charge.tag();
+            return makeGpuFrameHandle(std::move(s), std::move(rhi), std::move(m), nullptr,
+                                      std::move(charge));
+        },
+        [] { return solidPlanes(64, 48); }, GpuBudgetTag::ReadbackRing);
+
+    QVERIFY(!r.handle.isNull());
+    QVERIFY(r.handle.isGpuBacked());
+    QCOMPARE(observedTag, GpuBudgetTag::ReadbackRing);
+    QCOMPARE(b.liveBytes(GpuBudgetTag::ReadbackRing), gpuSurfaceBytes(*surface));
+    QCOMPARE(b.gatedLiveBytes(), gpuSurfaceBytes(*surface));
 }
 
 QTEST_GUILESS_MAIN(TestGpuSurfaceAllocator)
