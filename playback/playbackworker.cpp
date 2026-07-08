@@ -2976,7 +2976,8 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     // when it lands in the useful band [anchor - trail, target]; otherwise we
     // fall back to the proven coarse av_seek_frame BACKWARD. Fully additive: when
     // the region is unindexed, pb is not byte-seekable, the seek fails, or the
-    // probe lands out of band, we behave exactly like before — no gate regresses.
+    // probe lands out of band, or the packet cannot be retained for the fill loop,
+    // we behave exactly like before — no gate regresses.
     bool exactSought = false;
     bool havePrimedSeekPacket = false;
     AVPacket* primedSeekPacket = av_packet_alloc();
@@ -3010,9 +3011,6 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                 av_packet_unref(pkt);
             }
             if (landedInBand && havePrimedSeekPacket) {
-                exactSought = true;
-            } else if (landedInBand && avio_seek(m_fmtCtx->pb, offset.value(), SEEK_SET) >= 0) {
-                avformat_flush(m_fmtCtx);
                 exactSought = true;
             }
         }
