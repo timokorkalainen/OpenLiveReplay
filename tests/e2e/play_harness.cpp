@@ -736,7 +736,7 @@ int main(int argc, char** argv) {
             const qint64 latencyDeadlineMs = []() -> qint64 {
                 bool ok = false;
                 const int value = qgetenv("OLR_COLD_SEEK_DEADLINE_MS").toInt(&ok);
-                return ok && value > 0 ? qint64(value) : qint64(50);
+                return ok && value > 0 ? qint64(value) : qint64(75);
             }();
             auto* opIndex = new int(-1);
             auto* currentFrame = new qint64(kPrimeFrame);
