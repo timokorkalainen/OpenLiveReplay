@@ -191,10 +191,25 @@ jobs:
           sudo apt-get install -y "clang-format-${LLVM_VER}"
           CF="$(command -v "clang-format-${LLVM_VER}")"
           "$CF" --version
-          # git-clang-format is a standalone python script; fetch the matching one.
-          GCF=/tmp/git-clang-format
-          curl -fsSL "https://raw.githubusercontent.com/llvm/llvm-project/release/${LLVM_VER}.x/clang/tools/clang-format/git-clang-format" -o "$GCF"
-          chmod +x "$GCF"
+          GCF="$(command -v "git-clang-format-${LLVM_VER}" || true)"
+          if [ -z "$GCF" ]; then
+            for candidate in \
+              "/usr/lib/llvm-${LLVM_VER}/share/clang/git-clang-format" \
+              "/usr/lib/llvm-${LLVM_VER}/bin/git-clang-format"; do
+              if [ -x "$candidate" ]; then
+                GCF="$candidate"
+                break
+              fi
+            done
+          fi
+          if [ -z "$GCF" ]; then
+            GCF=/tmp/git-clang-format
+            curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL \
+              "https://raw.githubusercontent.com/llvm/llvm-project/release/${LLVM_VER}.x/clang/tools/clang-format/git-clang-format" \
+              -o "$GCF"
+            chmod +x "$GCF"
+          fi
+          echo "git-clang-format: $GCF"
           base="${{ github.event.pull_request.base.sha }}"
           [ -z "$base" ] && base="${{ github.event.before }}"
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
