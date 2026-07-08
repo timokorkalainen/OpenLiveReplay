@@ -20,6 +20,9 @@ public:
     void stop() override;
     bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
+    bool submitAndFlush(const OutputBusFrame& frame, int timeoutMs) override;
+    bool flush(int timeoutMs) override;
+    void discardPending() override;
     OutputSinkStatus outputStatus() const override;
     bool needsContinuousCadence() const override {
         return m_inner && m_inner->needsContinuousCadence();
@@ -28,7 +31,13 @@ public:
     int droppedFrames() const;
 
 private:
+    struct QueuedFrame {
+        OutputBusFrame frame;
+        quint64 epoch = 0;
+    };
+
     void workerLoop();
+    void recordDeliveryResultLocked(const OutputBusFrame& frame, quint64 epoch, bool submitted);
 
     std::unique_ptr<IOutputSink> m_inner;
     OutputTargetKind m_kind = OutputTargetKind::QtPreview;
@@ -36,10 +45,13 @@ private:
 
     mutable QMutex m_mutex;
     QWaitCondition m_wake;
-    QVector<OutputBusFrame> m_queue;
+    QWaitCondition m_drained;
+    QVector<QueuedFrame> m_queue;
     std::unique_ptr<QThread> m_thread;
+    quint64 m_epoch = 0;
     bool m_active = false;
     bool m_stopRequested = false;
+    bool m_delivering = false;
     int m_droppedFrames = 0;
     QVector<qint64> m_droppedFrameIndexes;
     qint64 m_asyncAcceptedFrames = 0;

@@ -4,6 +4,7 @@
 #include "controlprotocol.h"
 #include "controlstate.h"
 
+#include <QAbstractSocket>
 #include <QJsonObject>
 #include <QWebSocket>
 #include <QWebSocketServer>
@@ -14,6 +15,13 @@ ControlWebSocketServer::ControlWebSocketServer(ControlApiAdapter* adapter, QObje
                                     QWebSocketServer::NonSecureMode, this)) {
     connect(m_server, &QWebSocketServer::newConnection, this,
             &ControlWebSocketServer::handleNewConnection);
+    connect(m_server, &QWebSocketServer::acceptError, this,
+            [this](QAbstractSocket::SocketError error) {
+                qWarning() << "WebSocket control API accept error" << int(error)
+                           << m_server->errorString();
+            });
+    connect(m_server, &QWebSocketServer::closed, this,
+            []() { qInfo() << "WebSocket control API closed"; });
 
     m_timecodeTimer.setSingleShot(true);
     connect(&m_timecodeTimer, &QTimer::timeout, this, &ControlWebSocketServer::publishTimecodeNow);
@@ -109,9 +117,12 @@ void ControlWebSocketServer::scheduleTimecode() {
 void ControlWebSocketServer::handleNewConnection() {
     QWebSocket* socket = m_server->nextPendingConnection();
     if (!socket) {
+        qWarning() << "WebSocket control API newConnection without pending socket";
         return;
     }
 
+    qInfo() << "WebSocket control API accepted client" << socket->peerAddress().toString()
+            << socket->peerPort() << socket->requestUrl().toString();
     socket->setProperty("controlClientId", QString::number(reinterpret_cast<quintptr>(socket)));
     m_sockets.insert(socket);
 
@@ -153,7 +164,7 @@ void ControlWebSocketServer::handleTextMessage(const QString& message) {
     commandArgs.insert(QStringLiteral("_clientId"), socket->property("controlClientId").toString());
 
     const auto result = m_adapter->executeCommand(parsed.message.name, commandArgs);
-    sendJson(result.ok ? ControlProtocol::ack(parsed.message.id)
+    sendJson(result.ok ? ControlProtocol::ack(parsed.message.id, result.details)
                        : ControlProtocol::ackError(parsed.message.id, result.code, result.message),
              socket);
 }

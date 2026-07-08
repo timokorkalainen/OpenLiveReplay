@@ -44,6 +44,7 @@ public:
     OutputDispatchStats dispatchDueTicksForTest(qint64 wallNowMs);
     OutputDispatchStats dispatchDueTicksForTestNs(qint64 wallNowNs);
     OutputDispatchStats dispatchImmediate();
+    OutputDispatchReport dispatchImmediateWithReport(const OutputDispatchRequest& request);
     OutputDispatchStats stats() const;
     std::shared_ptr<SharedGpuReadbackCache> sharedGpuReadbacks() const;
     // Test support: snapshot of live endpoint sink chains.
@@ -87,6 +88,7 @@ private:
     bool m_dispatchActive = false;
     Qt::HANDLE m_dispatchThreadId = nullptr;
     bool m_reconfiguring = false;
+    int m_immediateDispatchRequests = 0;
     quint64 m_configGeneration = 0;
     bool m_hasPendingEndpoints = false;
     QList<OutputEndpoint> m_pendingEndpoints;

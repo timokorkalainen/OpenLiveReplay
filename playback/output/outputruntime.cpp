@@ -2,6 +2,7 @@
 
 #include "playback/gpu/gpubudget.h"
 
+#include <QDebug>
 #include <QElapsedTimer>
 #include <cmath>
 #include <utility>
@@ -10,6 +11,11 @@ namespace {
 constexpr qint64 kNsPerSecond = 1000000000;
 static_assert(kOutputGpuBudgetTagCount == kGpuBudgetTagCount,
               "OutputDispatchStats GPU tag storage must match GpuBudgetSnapshot tags");
+
+bool latencyTraceEnabled() {
+    const QByteArray raw = qgetenv("OLR_E2E_LATENCY_TRACE").trimmed().toLower();
+    return !(raw.isEmpty() || raw == "0" || raw == "false" || raw == "off" || raw == "no");
+}
 } // namespace
 
 OutputRuntime::OutputRuntime(FrameRate rate, int feedCount, int width, int height,
@@ -153,20 +159,51 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksForTestNs(qint64 wallNowNs) {
 }
 
 OutputDispatchStats OutputRuntime::dispatchImmediate() {
+    return dispatchImmediateWithReport(OutputDispatchRequest{}).stats;
+}
+
+OutputDispatchReport
+OutputRuntime::dispatchImmediateWithReport(const OutputDispatchRequest& request) {
+    const bool traceLatency = latencyTraceEnabled();
+    OutputDispatchReport report;
+    QElapsedTimer traceTimer;
+    if (traceLatency) traceTimer.start();
     qint64 frameIndex = 0;
     quint64 configGeneration = 0;
+    qint64 waitReadyNs = 0;
+    qint64 snapshotNs = 0;
+    qint64 dispatchNs = 0;
+    bool immediateRegistered = false;
+    auto clearImmediateRequestLocked = [&]() {
+        if (!immediateRegistered) return;
+        if (m_immediateDispatchRequests > 0) --m_immediateDispatchRequests;
+        immediateRegistered = false;
+        m_dispatchIdle.wakeAll();
+    };
+
     {
         QMutexLocker locker(&m_mutex);
+        ++m_immediateDispatchRequests;
+        immediateRegistered = true;
+        m_dispatchIdle.wakeAll();
         waitForDispatchIdleLocked();
         while (m_reconfiguring && !m_stopRequested)
             m_dispatchIdle.wait(&m_mutex);
-        if (m_stopRequested) return statsLocked();
+        if (m_stopRequested) {
+            clearImmediateRequestLocked();
+            report.stats = statsLocked();
+            return report;
+        }
         applyPendingDispatchMutationsLocked();
         frameIndex = m_dispatcher.nextOutputFrameIndex();
         configGeneration = m_configGeneration;
     }
+    if (traceLatency) waitReadyNs = traceTimer.nsecsElapsed();
 
+    QElapsedTimer snapshotTimer;
+    if (traceLatency) snapshotTimer.start();
     OutputRuntimeSnapshot current = snapshot();
+    if (traceLatency) snapshotNs = snapshotTimer.nsecsElapsed();
     bool shouldDispatch = false;
     {
         QMutexLocker locker(&m_mutex);
@@ -181,15 +218,38 @@ OutputDispatchStats OutputRuntime::dispatchImmediate() {
         }
     }
 
-    if (shouldDispatch) m_dispatcher.dispatchTick(current.cache, current.state);
+    if (shouldDispatch) {
+        QElapsedTimer dispatchTimer;
+        if (traceLatency) dispatchTimer.start();
+        report = m_dispatcher.dispatchTickWithReport(
+            current.cache, current.state, OutputDispatchFlushMode::PausedImmediate, request);
+        if (traceLatency) dispatchNs = dispatchTimer.nsecsElapsed();
+    }
 
     {
         QMutexLocker locker(&m_mutex);
         applyPendingDispatchMutationsLocked();
         m_dispatchActive = false;
         m_dispatchThreadId = nullptr;
+        clearImmediateRequestLocked();
         m_dispatchIdle.wakeAll();
-        return statsLocked();
+        if (traceLatency) {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "OLR_LATENCY output.dispatchImmediate frameIndex=%1 shouldDispatch=%2 "
+                       "playing=%3 playheadMs=%4 waitReadyNs=%5 snapshotNs=%6 dispatchNs=%7 "
+                       "totalNs=%8")
+                       .arg(frameIndex)
+                       .arg(shouldDispatch ? 1 : 0)
+                       .arg(current.state.playing ? 1 : 0)
+                       .arg(current.state.playheadMs)
+                       .arg(waitReadyNs)
+                       .arg(snapshotNs)
+                       .arg(dispatchNs)
+                       .arg(traceTimer.nsecsElapsed());
+        }
+        report.stats = statsLocked();
+        return report;
     }
 }
 
@@ -278,6 +338,7 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
+            if (m_immediateDispatchRequests > 0) return statsLocked();
             const FrameRate rate = m_dispatcher.frameRate();
             frameIndex = m_dispatcher.nextOutputFrameIndex();
             scheduledNs = frameIndexToNsCeil(rate, frameIndex);
@@ -294,6 +355,7 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
+            if (m_immediateDispatchRequests > 0) return statsLocked();
             if (m_configGeneration != configGeneration) continue;
             if (m_dispatcher.nextOutputFrameIndex() != frameIndex) continue;
             m_dispatchActive = true;

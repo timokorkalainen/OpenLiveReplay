@@ -68,6 +68,25 @@ struct OutputRuntimeDispatchStats {
     qint64 lastCappedCatchUpTicks = 0;
 };
 
+enum class OutputDispatchFlushMode {
+    Default,
+    PausedImmediate,
+};
+
+enum class OutputDispatchLane {
+    All,
+    PgmCritical,
+    PreviewFollower,
+};
+
+struct OutputDispatchRequest {
+    OutputDispatchLane lane = OutputDispatchLane::All;
+    OutputBusId requiredBus = OutputBusId::pgm();
+    OutputTargetKind requiredKind = OutputTargetKind::Ndi;
+    qint64 requiredPlayheadMs = -1;
+    bool requireNonPlaceholder = false;
+};
+
 struct OutputDispatchStats {
     qint64 ticks = 0;
     qint64 framesSubmitted = 0;
@@ -98,6 +117,20 @@ struct OutputDispatchStats {
     QHash<QString, OutputTargetDispatchStats> targets;
 };
 
+struct OutputSubmittedFrame {
+    OutputTargetAssignment assignment;
+    OutputFrameIdentity identity;
+    bool submitted = false;
+    qint64 submitNs = 0;
+};
+
+struct OutputDispatchReport {
+    OutputDispatchStats stats;
+    QList<OutputSubmittedFrame> submittedFrames;
+    bool requiredSubmitted = false;
+    OutputFrameIdentity requiredIdentity;
+};
+
 class OutputDispatcher {
 public:
     OutputDispatcher(FrameRate rate, int feedCount, int width, int height,
@@ -121,8 +154,13 @@ public:
     void setIdentitySkip(bool enabled) { m_identitySkip = enabled; }
     std::shared_ptr<SharedGpuReadbackCache> sharedGpuReadbacks() const { return m_sharedReadbacks; }
 
-    OutputDispatchStats dispatchTick(const OutputFrameCache& cache,
-                                     const PlaybackStateSnapshot& state);
+    OutputDispatchStats
+    dispatchTick(const OutputFrameCache& cache, const PlaybackStateSnapshot& state,
+                 OutputDispatchFlushMode flushMode = OutputDispatchFlushMode::Default);
+    OutputDispatchReport
+    dispatchTickWithReport(const OutputFrameCache& cache, const PlaybackStateSnapshot& state,
+                           OutputDispatchFlushMode flushMode = OutputDispatchFlushMode::Default,
+                           const OutputDispatchRequest& request = OutputDispatchRequest{});
     OutputDispatchStats stats() const;
     FrameRate frameRate() const { return m_rate; }
     // Test support: by-reference view of live endpoint sink chains.

@@ -7,6 +7,75 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QDebug>
+
+namespace {
+
+constexpr int kControlPgmWaitTimeoutMs = 250;
+
+bool controlLatencyTraceEnabled() {
+    const QByteArray raw = qgetenv("OLR_E2E_LATENCY_TRACE").trimmed().toLower();
+    return raw == "1" || raw == "true" || raw == "on" || raw == "yes";
+}
+
+QJsonObject pgmTransactionDetails(const PlaybackWorker::OperatorSeekResult& result) {
+    QJsonObject identity;
+    identity.insert(QStringLiteral("busKind"), static_cast<int>(result.pgmIdentity.bus.kind));
+    identity.insert(QStringLiteral("busIndex"), result.pgmIdentity.bus.index);
+    identity.insert(QStringLiteral("sampledPlayheadMs"),
+                    static_cast<double>(result.pgmIdentity.sampledPlayheadMs));
+    identity.insert(QStringLiteral("sourcePtsMs"),
+                    static_cast<double>(result.pgmIdentity.sourcePtsMs));
+    identity.insert(QStringLiteral("sourceFeedIndex"), result.pgmIdentity.sourceFeedIndex);
+    identity.insert(QStringLiteral("videoPlaceholder"), result.pgmIdentity.videoPlaceholder);
+
+    QJsonObject transaction;
+    transaction.insert(QStringLiteral("completed"), result.completed);
+    transaction.insert(QStringLiteral("submittedPgm"), result.submittedPgm);
+    transaction.insert(QStringLiteral("timedOut"), result.timedOut);
+    transaction.insert(QStringLiteral("targetMs"), static_cast<double>(result.targetMs));
+    transaction.insert(QStringLiteral("generation"),
+                       QString::number(static_cast<qulonglong>(result.generation)));
+    transaction.insert(QStringLiteral("elapsedNs"), static_cast<double>(result.elapsedNs));
+    transaction.insert(QStringLiteral("message"), result.message);
+    transaction.insert(QStringLiteral("identity"), identity);
+
+    return QJsonObject{{QStringLiteral("pgmTransaction"), transaction}};
+}
+
+CommandResult resultForOperatorSeek(const QString& commandName,
+                                    const PlaybackWorker::OperatorSeekResult& result) {
+    if (controlLatencyTraceEnabled()) {
+        qInfo().noquote() << QStringLiteral(
+                                 "OLR_LATENCY control.command name=%1 targetMs=%2 generation=%3 "
+                                 "completed=%4 submittedPgm=%5 timedOut=%6 elapsedNs=%7 "
+                                 "sampledMs=%8 sourcePtsMs=%9 placeholder=%10 message=\"%11\"")
+                                 .arg(commandName)
+                                 .arg(result.targetMs)
+                                 .arg(static_cast<qulonglong>(result.generation))
+                                 .arg(result.completed ? 1 : 0)
+                                 .arg(result.submittedPgm ? 1 : 0)
+                                 .arg(result.timedOut ? 1 : 0)
+                                 .arg(result.elapsedNs)
+                                 .arg(result.pgmIdentity.sampledPlayheadMs)
+                                 .arg(result.pgmIdentity.sourcePtsMs)
+                                 .arg(result.pgmIdentity.videoPlaceholder ? 1 : 0)
+                                 .arg(result.message);
+    }
+    if (result.completed && result.submittedPgm) {
+        return CommandResult::success(pgmTransactionDetails(result));
+    }
+    const QString code =
+        result.timedOut ? QStringLiteral("timeout") : QStringLiteral("pgm_not_submitted");
+    const QString detail =
+        result.message.isEmpty() ? QStringLiteral("PGM output was not submitted") : result.message;
+    return CommandResult::failure(code, QStringLiteral("%1 (targetMs=%2 generation=%3)")
+                                            .arg(detail)
+                                            .arg(result.targetMs)
+                                            .arg(static_cast<qulonglong>(result.generation)));
+}
+
+} // namespace
 
 UIManagerControlAdapter::UIManagerControlAdapter(UIManager* uiManager, QObject* parent)
     : QObject(parent), m_uiManager(uiManager) {}
@@ -185,10 +254,14 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
             }
         }
     } else if (name == QStringLiteral("transport.stepFrame")) {
-        m_uiManager->jogExternal(args.value(QStringLiteral("frames")).toInt());
+        return resultForOperatorSeek(
+            name, m_uiManager->jogExternalAndWaitForPgm(
+                      args.value(QStringLiteral("frames")).toInt(), kControlPgmWaitTimeoutMs));
     } else if (name == QStringLiteral("transport.seek")) {
-        m_uiManager->seekPlayback(
-            args.value(QStringLiteral("positionMs")).toVariant().toLongLong());
+        return resultForOperatorSeek(
+            name, m_uiManager->seekPlaybackAndWaitForPgm(
+                      args.value(QStringLiteral("positionMs")).toVariant().toLongLong(),
+                      kControlPgmWaitTimeoutMs));
     } else if (name == QStringLiteral("transport.goLive")) {
         m_uiManager->goLive();
     } else if (name == QStringLiteral("transport.cancelFollowLive")) {
@@ -266,6 +339,14 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
     } else if (name == QStringLiteral("settings.setMetadataFields")) {
         m_uiManager->setMetadataFieldDefinitions(
             args.value(QStringLiteral("fields")).toArray().toVariantList());
+    } else if (name == QStringLiteral("outputs.ndi.setEnabled")) {
+        m_uiManager->setNdiOutputEnabled(args.value(QStringLiteral("busKind")).toString(),
+                                         args.value(QStringLiteral("feedIndex")).toInt(),
+                                         args.value(QStringLiteral("enabled")).toBool());
+    } else if (name == QStringLiteral("outputs.ndi.setSenderName")) {
+        m_uiManager->setNdiOutputSenderName(args.value(QStringLiteral("busKind")).toString(),
+                                            args.value(QStringLiteral("feedIndex")).toInt(),
+                                            args.value(QStringLiteral("senderName")).toString());
     } else if (name == QStringLiteral("settings.save")) {
         m_uiManager->saveSettings();
     } else if (name == QStringLiteral("import.setUrl")) {
@@ -296,7 +377,9 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
         m_uiManager->dispatchExternalAction(args.value(QStringLiteral("actionId")).toInt(),
                                             args.value(QStringLiteral("pressed")).toBool());
     } else if (name == QStringLiteral("action.jog")) {
-        m_uiManager->jogExternal(args.value(QStringLiteral("delta")).toInt());
+        return resultForOperatorSeek(
+            name, m_uiManager->jogExternalAndWaitForPgm(args.value(QStringLiteral("delta")).toInt(),
+                                                        kControlPgmWaitTimeoutMs));
     } else if (name == QStringLiteral("action.shuttle")) {
         m_uiManager->shuttleExternal(args.value(QStringLiteral("delta")).toInt());
     } else {

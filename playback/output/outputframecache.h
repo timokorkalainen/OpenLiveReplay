@@ -39,6 +39,8 @@ public:
     void mergeFrom(const OutputFrameCache& other, EvictedVideoFrames* evictedFrames = nullptr);
     void trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample,
                     EvictedVideoFrames* evictedFrames = nullptr);
+    void trimWindow(qint64 minVideoPtsMs, qint64 maxVideoPtsMs, qint64 minAudioStartSample,
+                    EvictedVideoFrames* evictedFrames = nullptr);
     void clear(EvictedVideoFrames* evictedFrames = nullptr);
 
 private:

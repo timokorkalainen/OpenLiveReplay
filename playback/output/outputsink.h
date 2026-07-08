@@ -38,6 +38,9 @@ public:
         (void) timeoutMs;
         return true;
     }
+    virtual bool submitAndFlush(const OutputBusFrame& frame, int timeoutMs) {
+        return submit(frame) && flush(timeoutMs);
+    }
     virtual void discardPending() {}
     virtual OutputSinkStatus outputStatus() const { return OutputSinkStatus{}; }
     virtual bool needsContinuousCadence() const { return false; }

@@ -34,6 +34,13 @@ bool hasString(const QJsonObject& args, const QString& key) {
     return args.value(key).isString();
 }
 
+bool hasOutputBusKind(const QJsonObject& args, const QString& key) {
+    if (!hasString(args, key)) return false;
+    const QString busKind = args.value(key).toString();
+    return busKind == QStringLiteral("feed") || busKind == QStringLiteral("pgm") ||
+           busKind == QStringLiteral("multiview");
+}
+
 ControlProtocol::CommandValidation valid(QJsonObject args = {}) {
     ControlProtocol::CommandValidation validation;
     validation.ok = true;
@@ -92,11 +99,14 @@ ControlProtocol::ParseResult ControlProtocol::parseTextMessage(const QByteArray&
     return result;
 }
 
-QJsonObject ControlProtocol::ack(const QString& id) {
+QJsonObject ControlProtocol::ack(const QString& id, const QJsonObject& details) {
     QJsonObject obj;
     obj.insert(QStringLiteral("type"), QStringLiteral("ack"));
     if (!id.isEmpty()) obj.insert(QStringLiteral("id"), id);
     obj.insert(QStringLiteral("ok"), true);
+    for (auto it = details.constBegin(); it != details.constEnd(); ++it) {
+        obj.insert(it.key(), it.value());
+    }
     return obj;
 }
 
@@ -291,6 +301,35 @@ ControlProtocol::validateCommand(const ControlCommandMessage& command) {
                    ? valid(args)
                    : invalid(
                          QStringLiteral("settings.setMetadataFields requires array args.fields"));
+    }
+    if (name == QStringLiteral("outputs.ndi.setEnabled")) {
+        if (!hasOutputBusKind(args, QStringLiteral("busKind"))) {
+            return invalid(QStringLiteral(
+                "outputs.ndi.setEnabled requires args.busKind feed, pgm, or multiview"));
+        }
+        if (!hasInteger(args, QStringLiteral("feedIndex"))) {
+            return invalid(
+                QStringLiteral("outputs.ndi.setEnabled requires integer args.feedIndex"));
+        }
+        if (!hasBool(args, QStringLiteral("enabled"))) {
+            return invalid(QStringLiteral("outputs.ndi.setEnabled requires boolean args.enabled"));
+        }
+        return valid(args);
+    }
+    if (name == QStringLiteral("outputs.ndi.setSenderName")) {
+        if (!hasOutputBusKind(args, QStringLiteral("busKind"))) {
+            return invalid(QStringLiteral(
+                "outputs.ndi.setSenderName requires args.busKind feed, pgm, or multiview"));
+        }
+        if (!hasInteger(args, QStringLiteral("feedIndex"))) {
+            return invalid(
+                QStringLiteral("outputs.ndi.setSenderName requires integer args.feedIndex"));
+        }
+        if (!hasString(args, QStringLiteral("senderName"))) {
+            return invalid(
+                QStringLiteral("outputs.ndi.setSenderName requires string args.senderName"));
+        }
+        return valid(args);
     }
     if (name == QStringLiteral("import.setUrl")) {
         return hasString(args, QStringLiteral("url"))

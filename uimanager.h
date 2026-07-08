@@ -328,6 +328,8 @@ public:
 
     // Playback
     Q_INVOKABLE void seekPlayback(int64_t ms);
+    PlaybackWorker::OperatorSeekResult seekPlaybackAndWaitForPgm(int64_t ms, int timeoutMs);
+    PlaybackWorker::OperatorSeekResult jogExternalAndWaitForPgm(int delta, int timeoutMs);
     Q_INVOKABLE void endScrubGesture();
     // Tier3 replay cue list: capture mark-in/out at the current playhead and
     // recall an entry as a frame-perfect armed cut (pre-rolled, no flash).
@@ -466,7 +468,7 @@ private:
     // Shared control-action dispatch used by both MIDI bindings and the
     // Stream Deck. Action ids documented in streamdeck/streamdeckmanager.h.
     void dispatchControlAction(int action, bool isRelease);
-    void jogStep(int delta);
+    PlaybackWorker::OperatorSeekResult jogStep(int delta, int timeoutMs = 250);
     void setFollowLive(bool on);
     void pushStreamDeckMaps();
     void pushDeckTimecode();

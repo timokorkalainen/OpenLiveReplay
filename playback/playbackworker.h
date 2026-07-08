@@ -124,14 +124,37 @@ public:
         qint64 gpuSeekPrefetchGpuAttempts = 0;
         qint64 gpuMemoryPressureLevel1 = 0;
         qint64 gpuMemoryPressureLevel2 = 0;
+        qint64 transportPlayheadMs = 0;
+        qint64 committedPlayheadMs = 0;
+        qint64 lastVisiblePlayheadMs = 0;
+        uint64_t seekGeneration = 0;
+        uint64_t committedGeneration = 0;
+        uint64_t committedGpuGeneration = 0;
+        uint64_t currentGpuGeneration = 0;
+        bool outputPlayheadCacheGuarded = false;
+        int forceLiveOutputSnapshots = 0;
+        bool memoryPressureLatched = false;
+        int gpuPipelineState = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
                             AudioPlayer* audioPlayer = nullptr, QObject* parent = nullptr);
     ~PlaybackWorker();
 
+    struct OperatorSeekResult {
+        bool completed = false;
+        bool submittedPgm = false;
+        bool timedOut = false;
+        qint64 targetMs = 0;
+        uint64_t generation = 0;
+        OutputFrameIdentity pgmIdentity;
+        qint64 elapsedNs = 0;
+        QString message;
+    };
+
     void openFile(const QString& filePath);
     void seekTo(int64_t timestampMs, int directionHint = 0);
+    OperatorSeekResult seekToAndWaitForPgm(qint64 timestampMs, int directionHint, int timeoutMs);
     // Tier3 frame-perfect ARMED CUT: arm a scheduled atomic cut to targetMs.
     // UI-thread-safe (atomic stores only, never blocks). The worker pre-rolls
     // [target, target+kStagingSpanMs] into a private staging cache on a SECOND
@@ -162,11 +185,17 @@ public:
     void setRequireAllOutputFeedsForPlayhead(bool required);
     void setBusPreviewProviders(FrameProvider* multiviewProvider, FrameProvider* pgmProvider);
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
+    void resetOutputPlayEpoch();
 #ifdef OLR_UNIT_TEST
     void setResidencyWindowParamsForTest(const ResidencyWindowParams& params);
+    static int64_t liveGrowthFileSizeForTest(int64_t avioSize, const QString& filePath);
+    static bool liveReadDeadlineInterruptsForTest(bool baseInterrupt, int64_t deadlineMs,
+                                                  int64_t nowMs);
 #ifdef OLR_GPU_PIPELINE_BUILD
     void evaluateGpuMemoryPressureForTest(uint64_t availableBytes, bool memoryWarning,
                                           qint64 nowMs = 0);
+    static int64_t manualSeekCommitFillToForTest(int64_t target, int64_t frameDurationMs,
+                                                 const GpuPrefetchPlan& prefetchPlan);
 #endif
 #endif
     void stop();
@@ -193,8 +222,27 @@ protected:
 
 private:
     enum class OutputCoverageMode {
+        OperatorSeek,
         StrictSeek,
         Displayable,
+    };
+
+    struct SeekRequestResult {
+        qint64 clampedTargetMs = 0;
+        int moveDir = 1;
+        uint64_t generation = 0;
+        bool committedFromPublishedCache = false;
+        qint64 publishNs = 0;
+    };
+
+    struct OperatorSeekCompletionState {
+        uint64_t generation = 0;
+        qint64 targetMs = -1;
+        bool waiting = false;
+        bool completed = false;
+        bool submittedPgm = false;
+        OutputFrameIdentity pgmIdentity;
+        QString message;
     };
 
     // --- Scheduler constants (spec §3) ------------------------------------
@@ -207,6 +255,7 @@ private:
     static constexpr int kIdleSleepMs = 3;         // sleep when window full and playing
     static constexpr int kEofSleepMs = 10;         // sleep between EOF re-checks
     static constexpr int kReadErrSleepMs = 20;     // sleep after a non-EOF read error
+    static constexpr int kLiveReadTimeoutMs = 100; // bound av_read_frame on growing local files
     static constexpr int kBackJumpSlackMs = 150;   // P below buffered span by this ⇒ reposition
     static constexpr int kGlobalFrameBudget = 256; // aggregate decoded-frame cap (memory)
     static constexpr double kDecimateAbove = 1.5;  // |speed| above which decimation engages
@@ -232,14 +281,28 @@ private:
     bool
     outputFeedCoversPlayheadLocked(int feedIndex, int64_t playheadMs, uint64_t gpuGeneration,
                                    OutputCoverageMode mode = OutputCoverageMode::StrictSeek) const;
+    bool outputCacheCoversPlayheadLocked(
+        int64_t playheadMs, uint64_t gpuGeneration,
+        OutputCoverageMode mode = OutputCoverageMode::OperatorSeek) const;
+    std::optional<qint64> outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
+                                                               uint64_t gpuGeneration) const;
     bool outputCacheCoversPlayhead(int64_t playheadMs) const;
     bool publishOutputCacheIfCoversPlayhead(int64_t playheadMs);
     bool pausedPlayheadNeedsWork(int64_t playheadMs);
+    SeekRequestResult requestSeekTo(qint64 timestampMs, int directionHint,
+                                    bool registerOperatorTransaction);
+    OutputDispatchReport dispatchPgmAfterSeekCommit(qint64 targetMs);
+    void completeOperatorSeekTransaction(uint64_t generation, qint64 targetMs,
+                                         const OutputDispatchReport& report);
+    bool hasOperatorSeekTransaction(uint64_t generation);
+    bool tryCompleteOperatorSeekFromCurrentOutputCache(qint64 targetMs, uint64_t generation);
+    bool allowDisplayableFallbackForReposition(uint64_t generation);
     int64_t windowLeadMs() const;
     int64_t windowTrailMs() const;
     int64_t windowChunkMs() const;
     int64_t windowSlackMs() const;
     int64_t windowAudioTrailMs() const;
+    int64_t liveGrowthFileSize() const;
     int capFrames(int trackCount) const;
     int64_t newestPtsMin() const; // min-newest, staleness-excluded; -1 empty
     int64_t oldestPtsMin() const; // min-oldest, staleness-excluded; -1 empty
@@ -263,6 +326,8 @@ private:
     int64_t decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame* af, int64_t P, int dir,
                                  int trackCount, bool decimate, int decimateStep, bool audioOn,
                                  bool dedupTail);
+    void indexPrimaryVideoPacketForSeek(const DecoderTrack* track, const AVPacket* pkt,
+                                        qint64 framePtsMs);
     // Enqueue a decoded active-view audio frame onto m_audioQueue (format-guarded).
     void enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
@@ -274,6 +339,7 @@ private:
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
     void refreshOutputAfterSeekCommit(bool resetPlayEpoch = true);
+    void refreshPreviewAfterSeekCommit(bool resetPlayEpoch = false);
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();
@@ -312,6 +378,8 @@ private:
     std::optional<qint64> recoveredCachePlayheadLocked(qint64 playheadMs,
                                                        uint64_t gpuGeneration) const;
     bool rebuildGpuSpine();
+    static int64_t manualSeekCommitFillTo(int64_t target, int64_t frameDurationMs,
+                                          const GpuPrefetchPlan& prefetchPlan);
     GpuPrefetchPlan planGpuSeekPrefetchForReposition(int64_t target, int dir);
     GpuPrefetchPlan beginGpuSeekPrefetchForReposition(int64_t target, int dir);
     void endGpuSeekPrefetchForReposition();
@@ -349,6 +417,9 @@ private:
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
+    bool shouldInterruptFfmpeg() const;
+    bool liveReadDeadlineExpired(int64_t nowMs) const;
+    int readPrimaryFrame(AVPacket* pkt);
 
     QList<FrameProvider*> m_providers;
     FrameProvider* m_multiviewPreviewProvider = nullptr;
@@ -358,7 +429,9 @@ private:
     AVFormatContext* m_fmtCtx = nullptr;
 
     std::atomic<bool> m_running{false};
+    std::atomic<int64_t> m_liveReadDeadlineSteadyMs{-1};
     int64_t m_seekTargetMs = -1;
+    OperatorSeekCompletionState m_operatorSeekCompletion;
     QString m_currentFilePath;
     PlaybackTransport* m_transport;
     AudioPlayer* m_audioPlayer = nullptr;
@@ -409,6 +482,8 @@ private:
     mutable std::atomic<bool> m_outputPlayheadCacheGuarded{false};
 
     QMutex m_mutex;
+    QWaitCondition m_workerWake;
+    QWaitCondition m_operatorSeekCondition;
     mutable QMutex m_bufferMutex;
     mutable QMutex m_outputRuntimeMutex;
 

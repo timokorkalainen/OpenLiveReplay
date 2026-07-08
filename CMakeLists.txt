@@ -256,6 +256,7 @@ qt_add_qml_module(OpenLiveReplay
         playback/playlistplayout.h playback/playlistplayout.cpp
         playback/framerate.h
         playback/frameprovider.h playback/frameprovider.cpp
+        playback/framepreviewitem.h playback/framepreviewitem.cpp
         playback/playbacktransport.h playback/playbacktransport.cpp
         playback/telemetrytimelinereader.h playback/telemetrytimelinereader.cpp
         playback/audioplayer.h playback/audioplayer.cpp

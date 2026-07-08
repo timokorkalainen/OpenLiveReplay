@@ -30,6 +30,7 @@ public:
     void stop() override;
     bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
+    bool submitAndFlush(const OutputBusFrame& frame, int timeoutMs) override;
     bool flush(int timeoutMs) override;
     void discardPending() override;
     OutputSinkStatus outputStatus() const override;
@@ -48,6 +49,8 @@ private:
     };
 
     void workerLoop();
+    bool submitGpuFrameAndFlush(const OutputBusFrame& frame, int timeoutMs, bool traceLatency);
+    bool flushReadbacks(int timeoutMs);
     void rememberDelivered(const OutputBusFrame& frame);
     void rememberDeliveredLocked(const OutputBusFrame& frame);
     void clearPendingReadbacksLocked();

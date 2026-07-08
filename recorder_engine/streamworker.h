@@ -254,6 +254,10 @@ private:
 #endif
     };
 
+    static qint64 queuedFrameBytes(const QueuedFrame& frame);
+    qint64 frameQueueBackstopBytes() const;
+    void trimFrameQueueBackstopLocked(qint64 tickGateMs);
+
     QQueue<QueuedFrame> m_frameQueue;
     AVCodecContext* m_persistentEncCtx = nullptr;
     std::unique_ptr<NativeVideoEncoder> m_nativeEncoder;

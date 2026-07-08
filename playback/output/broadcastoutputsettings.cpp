@@ -286,25 +286,25 @@ QList<OutputTargetAssignment> qtPreviewAssignments(int feedCount, bool includeMu
     QList<OutputTargetAssignment> assignments;
     for (int feed = 0; feed < qMax(0, feedCount); ++feed) {
         OutputTargetAssignment assignment;
-        assignment.id = QStringLiteral("qt-preview-feed-%1").arg(feed);
         assignment.sourceBus = OutputBusId::feed(feed);
         assignment.kind = OutputTargetKind::QtPreview;
+        assignment.id = targetId(assignment.sourceBus, assignment.kind);
         assignment.enabled = true;
         assignments.append(assignment);
     }
     if (includeMultiview) {
         OutputTargetAssignment assignment;
-        assignment.id = QStringLiteral("qt-preview-multiview");
         assignment.sourceBus = OutputBusId::multiview();
         assignment.kind = OutputTargetKind::QtPreview;
+        assignment.id = targetId(assignment.sourceBus, assignment.kind);
         assignment.enabled = true;
         assignments.append(assignment);
     }
     if (includePgm) {
         OutputTargetAssignment assignment;
-        assignment.id = QStringLiteral("qt-preview-pgm");
         assignment.sourceBus = OutputBusId::pgm();
         assignment.kind = OutputTargetKind::QtPreview;
+        assignment.id = targetId(assignment.sourceBus, assignment.kind);
         assignment.enabled = true;
         assignments.append(assignment);
     }

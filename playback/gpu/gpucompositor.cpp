@@ -75,6 +75,21 @@ QShader loadShader(const QString& path) {
     return f.open(QIODevice::ReadOnly) ? QShader::fromSerialized(f.readAll()) : QShader();
 }
 
+const QShader& gridVertexShader() {
+    static const QShader shader = loadShader(QStringLiteral(":/olr/shaders/grid.vert.qsb"));
+    return shader;
+}
+
+const QShader& gridNearestShader() {
+    static const QShader shader = loadShader(QStringLiteral(":/olr/shaders/grid_nn.frag.qsb"));
+    return shader;
+}
+
+const QShader& gridQualityShader() {
+    static const QShader shader = loadShader(QStringLiteral(":/olr/shaders/grid_quality.frag.qsb"));
+    return shader;
+}
+
 int cappedFrameCount(const QList<FrameHandle>& frames) {
     return static_cast<int>(qMin<qsizetype>(kMaxGridSources, frames.size()));
 }
@@ -207,11 +222,10 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
         return {};
     }
 
-    const QShader vert = loadShader(QStringLiteral(":/olr/shaders/grid.vert.qsb"));
-    const QString fragPath = quality == GpuCompositor::ScaleQuality::NearestCompat
-                                 ? QStringLiteral(":/olr/shaders/grid_nn.frag.qsb")
-                                 : QStringLiteral(":/olr/shaders/grid_quality.frag.qsb");
-    const QShader frag = loadShader(fragPath);
+    const QShader& vert = gridVertexShader();
+    const QShader& frag = quality == GpuCompositor::ScaleQuality::NearestCompat
+                              ? gridNearestShader()
+                              : gridQualityShader();
     if (!vert.isValid() || !frag.isValid()) return {};
 
     const GridUniformBlock uniforms = makeUniforms(sources, frameCount, width, height, color);
@@ -250,9 +264,13 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
         rhi->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, sizeof(GridUniformBlock)));
     if (!ubuf || !ubuf->create()) return {};
 
-    std::vector<std::unique_ptr<QRhiTexture>> lumaTextures;
-    std::vector<std::unique_ptr<QRhiTexture>> chromaTextures;
+    std::vector<std::unique_ptr<QRhiTexture>> ownedLumaTextures;
+    std::vector<std::unique_ptr<QRhiTexture>> ownedChromaTextures;
+    std::vector<QRhiTexture*> lumaTextures;
+    std::vector<QRhiTexture*> chromaTextures;
     std::vector<std::unique_ptr<gpucompositor::ImportedNv12Source>> importedSources;
+    ownedLumaTextures.reserve(kMaxGridSources);
+    ownedChromaTextures.reserve(kMaxGridSources);
     lumaTextures.reserve(kMaxGridSources);
     chromaTextures.reserve(kMaxGridSources);
     importedSources.reserve(kMaxGridSources);
@@ -261,21 +279,49 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
     if (!updates) return {};
     updates->updateDynamicBuffer(ubuf.get(), 0, sizeof(GridUniformBlock), &uniforms);
 
-    for (int i = 0; i < kMaxGridSources; ++i) {
-        const PreparedSource& source = sources.at(i);
-        const int srcW = source.present ? source.desc.width : 1;
-        const int srcH = source.present ? source.desc.height : 1;
-        const int chromaW = source.present ? (srcW + 1) / 2 : 1;
-        const int chromaH = source.present ? (srcH + 1) / 2 : 1;
-        std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(QRhiTexture::R8, QSize(srcW, srcH)));
-        std::unique_ptr<QRhiTexture> uvTex(
-            rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH)));
-        if (!yTex || !uvTex) {
-            updates->release();
-            return {};
+    std::unique_ptr<QRhiTexture> dummyLumaTexture;
+    std::unique_ptr<QRhiTexture> dummyChromaTexture;
+    auto ensureDummyTextures = [&]() -> bool {
+        if (dummyLumaTexture && dummyChromaTexture) return true;
+
+        dummyLumaTexture.reset(rhi->newTexture(QRhiTexture::R8, QSize(1, 1)));
+        dummyChromaTexture.reset(rhi->newTexture(QRhiTexture::RG8, QSize(1, 1)));
+        if (!dummyLumaTexture || !dummyChromaTexture || !dummyLumaTexture->create() ||
+            !dummyChromaTexture->create()) {
+            return false;
         }
 
+        QByteArray yBytes(1, char(16));
+        QByteArray uvBytes(2, char(128));
+
+        QRhiTextureSubresourceUploadDescription yUpload(yBytes);
+        yUpload.setDataStride(static_cast<quint32>(1));
+        yUpload.setSourceSize(QSize(1, 1));
+        updates->uploadTexture(dummyLumaTexture.get(),
+                               QRhiTextureUploadDescription({{0, 0, yUpload}}));
+
+        QRhiTextureSubresourceUploadDescription uvUpload(uvBytes);
+        uvUpload.setDataStride(static_cast<quint32>(2));
+        uvUpload.setSourceSize(QSize(1, 1));
+        updates->uploadTexture(dummyChromaTexture.get(),
+                               QRhiTextureUploadDescription({{0, 0, uvUpload}}));
+        return true;
+    };
+
+    for (int i = 0; i < kMaxGridSources; ++i) {
+        const PreparedSource& source = sources.at(i);
         if (source.present && source.surface) {
+            const int srcW = source.desc.width;
+            const int srcH = source.desc.height;
+            const int chromaW = (srcW + 1) / 2;
+            const int chromaH = (srcH + 1) / 2;
+            std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(QRhiTexture::R8, QSize(srcW, srcH)));
+            std::unique_ptr<QRhiTexture> uvTex(
+                rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH)));
+            if (!yTex || !uvTex) {
+                updates->release();
+                return {};
+            }
             auto imported = gpucompositor::importNv12Source(rhi, source.surface);
             if (!imported || !yTex->createFrom(imported->lumaNativeTexture()) ||
                 !uvTex->createFrom(imported->chromaNativeTexture())) {
@@ -283,33 +329,39 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
                 return {};
             }
             importedSources.push_back(std::move(imported));
+            lumaTextures.push_back(yTex.get());
+            chromaTextures.push_back(uvTex.get());
+            ownedLumaTextures.push_back(std::move(yTex));
+            ownedChromaTextures.push_back(std::move(uvTex));
         } else if (source.present && source.uploadFromCpu) {
+            const int srcW = source.desc.width;
+            const int srcH = source.desc.height;
+            const int chromaW = (srcW + 1) / 2;
+            const int chromaH = (srcH + 1) / 2;
+            std::unique_ptr<QRhiTexture> yTex(rhi->newTexture(QRhiTexture::R8, QSize(srcW, srcH)));
+            std::unique_ptr<QRhiTexture> uvTex(
+                rhi->newTexture(QRhiTexture::RG8, QSize(chromaW, chromaH)));
+            if (!yTex || !uvTex) {
+                updates->release();
+                return {};
+            }
             if (!yTex->create() || !uvTex->create() ||
                 !uploadNv12Planes(updates, yTex.get(), uvTex.get(), source.nv12)) {
                 updates->release();
                 return {};
             }
+            lumaTextures.push_back(yTex.get());
+            chromaTextures.push_back(uvTex.get());
+            ownedLumaTextures.push_back(std::move(yTex));
+            ownedChromaTextures.push_back(std::move(uvTex));
         } else {
-            if (!yTex->create() || !uvTex->create()) {
+            if (!ensureDummyTextures()) {
                 updates->release();
                 return {};
             }
-            QByteArray yBytes(1, char(16));
-            QByteArray uvBytes(2, char(128));
-
-            QRhiTextureSubresourceUploadDescription yUpload(yBytes);
-            yUpload.setDataStride(static_cast<quint32>(1));
-            yUpload.setSourceSize(QSize(1, 1));
-            updates->uploadTexture(yTex.get(), QRhiTextureUploadDescription({{0, 0, yUpload}}));
-
-            QRhiTextureSubresourceUploadDescription uvUpload(uvBytes);
-            uvUpload.setDataStride(static_cast<quint32>(2));
-            uvUpload.setSourceSize(QSize(1, 1));
-            updates->uploadTexture(uvTex.get(), QRhiTextureUploadDescription({{0, 0, uvUpload}}));
+            lumaTextures.push_back(dummyLumaTexture.get());
+            chromaTextures.push_back(dummyChromaTexture.get());
         }
-
-        lumaTextures.push_back(std::move(yTex));
-        chromaTextures.push_back(std::move(uvTex));
     }
 
     QVector<QRhiShaderResourceBinding> bindings;
@@ -318,10 +370,9 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
         0, QRhiShaderResourceBinding::FragmentStage, ubuf.get()));
     for (int i = 0; i < kMaxGridSources; ++i) {
         bindings.append(QRhiShaderResourceBinding::texture(
-            1 + i * 2, QRhiShaderResourceBinding::FragmentStage, lumaTextures.at(size_t(i)).get()));
-        bindings.append(QRhiShaderResourceBinding::texture(2 + i * 2,
-                                                           QRhiShaderResourceBinding::FragmentStage,
-                                                           chromaTextures.at(size_t(i)).get()));
+            1 + i * 2, QRhiShaderResourceBinding::FragmentStage, lumaTextures.at(size_t(i))));
+        bindings.append(QRhiShaderResourceBinding::texture(
+            2 + i * 2, QRhiShaderResourceBinding::FragmentStage, chromaTextures.at(size_t(i))));
     }
     bindings.append(QRhiShaderResourceBinding::sampler(33, QRhiShaderResourceBinding::FragmentStage,
                                                        sampler.get()));

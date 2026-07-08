@@ -7,13 +7,18 @@
 #include <QtGlobal>
 #include <cstring>
 
+namespace {
+constexpr qint64 kPreviewFrameDurationUs = 1000;
+}
+
 QtPreviewSink::QtPreviewSink(FrameProvider* provider) : m_provider(provider) {}
 
-bool QtPreviewSink::deliver(const FrameHandle& frame) {
+bool QtPreviewSink::deliver(const FrameHandle& frame, quint64* deliveredSerial) {
     if (!m_provider) return false;
     QVideoFrame qFrame = toQVideoFrame(frame);
     if (!qFrame.isValid()) return false;
-    m_provider->deliverFrame(qFrame);
+    const quint64 serial = m_provider->deliverFrame(qFrame);
+    if (deliveredSerial) *deliveredSerial = serial;
     return true;
 }
 
@@ -43,6 +48,9 @@ QVideoFrame QtPreviewSink::toQVideoFrame(const FrameHandle& frame) {
     format.setColorRange(qtColorRangeFor(color.range));
 
     QVideoFrame qFrame(format);
+    const qint64 startUs = qMax<qint64>(0, frame.metadata().key.ptsMs) * 1000;
+    qFrame.setStartTime(startUs);
+    qFrame.setEndTime(startUs + kPreviewFrameDurationUs);
     if (!qFrame.map(QVideoFrame::WriteOnly)) return QVideoFrame();
 
     const QByteArray planes[3] = {view.planeY, view.planeU, view.planeV};
@@ -76,10 +84,19 @@ bool QtPreviewOutputSink::start(const OutputTargetAssignment& assignment, FrameR
 
 void QtPreviewOutputSink::stop() {
     m_active = false;
+    m_lastSubmittedSerial = 0;
 }
 
 bool QtPreviewOutputSink::submit(const OutputBusFrame& frame) {
     if (!m_active) return false;
     QtPreviewSink sink(m_provider);
-    return sink.deliver(frame.video);
+    quint64 serial = 0;
+    const bool delivered = sink.deliver(frame.video, &serial);
+    if (delivered) m_lastSubmittedSerial = serial;
+    return delivered;
+}
+
+bool QtPreviewOutputSink::flush(int timeoutMs) {
+    if (!m_active || !m_provider) return true;
+    return m_provider->flushVideoSinks(timeoutMs, m_lastSubmittedSerial);
 }

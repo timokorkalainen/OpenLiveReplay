@@ -9,6 +9,8 @@
 #include <QVector>
 #include <QtGlobal>
 
+#include <utility>
+
 struct RecordingState {
     bool active = false;
     qint64 durationMs = 0;
@@ -100,8 +102,14 @@ struct CommandResult {
     bool ok = true;
     QString code;
     QString message;
+    QJsonObject details;
 
     static CommandResult success() { return {}; }
+    static CommandResult success(QJsonObject resultDetails) {
+        CommandResult result;
+        result.details = std::move(resultDetails);
+        return result;
+    }
     static CommandResult failure(const QString& failureCode, const QString& failureMessage) {
         CommandResult result;
         result.ok = false;

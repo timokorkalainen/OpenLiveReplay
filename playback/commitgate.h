@@ -25,8 +25,9 @@ inline int64_t bookmarkedVisiblePlayheadMs(int64_t currentBookmarkMs, int64_t vi
 
 inline int64_t cacheGuardedVisiblePlayheadMs(int64_t visiblePlayheadMs,
                                              int64_t bookmarkedPlayheadMs, bool cacheCovered,
-                                             uint64_t committedGen, uint64_t seekGen) {
-    if (committedGen == seekGen && !cacheCovered) return bookmarkedPlayheadMs;
+                                             bool bookmarkUsable, uint64_t committedGen,
+                                             uint64_t seekGen) {
+    if (committedGen == seekGen && !cacheCovered && bookmarkUsable) return bookmarkedPlayheadMs;
     return visiblePlayheadMs;
 }
 

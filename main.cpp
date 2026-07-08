@@ -12,6 +12,7 @@ Q_IMPORT_PLUGIN(OlrStylePlugin)
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
 #include "playback/frameprovider.h"
+#include "playback/framepreviewitem.h"
 #include "playback/playlistentriesmodel.h"
 #include "streamdeck/streamdeckmanager.h"
 #include "websocket/controlstate.h"
@@ -61,9 +62,18 @@ int main(int argc, char* argv[]) {
     UIManagerControlAdapter controlAdapter(&uiManager);
     ControlWebSocketServer controlServer(&controlAdapter);
     const quint16 controlPort = appenv::controlPort();
-    if (!controlServer.listen(QHostAddress::Any, controlPort)) {
+    const QByteArray controlBindEnv = qgetenv("OLR_CONTROL_BIND").trimmed().toLower();
+    const QHostAddress controlBindAddress = controlBindEnv == "localhost" ||
+                                                    controlBindEnv == "loopback" ||
+                                                    controlBindEnv == "127.0.0.1"
+                                                ? QHostAddress::LocalHost
+                                                : QHostAddress::Any;
+    if (!controlServer.listen(controlBindAddress, controlPort)) {
         qWarning() << "WebSocket control API failed to listen on port" << controlPort << ":"
                    << controlServer.lastError();
+    } else {
+        qInfo() << "WebSocket control API listening on" << controlBindAddress.toString() << "port"
+                << controlServer.serverPort();
     }
 
     auto publishRecording = [&controlServer]() {
@@ -81,6 +91,13 @@ int main(int argc, char* argv[]) {
     };
     auto publishOutput = [&controlServer]() {
         controlServer.publishPatch(QStringLiteral("output"));
+    };
+    QTimer transportPatchTimer;
+    transportPatchTimer.setSingleShot(true);
+    transportPatchTimer.setInterval(100);
+    QObject::connect(&transportPatchTimer, &QTimer::timeout, &controlServer, publishTransport);
+    auto scheduleTransport = [&transportPatchTimer]() {
+        if (!transportPatchTimer.isActive()) transportPatchTimer.start();
     };
 
     auto publishFullSnapshot = [&controlServer, &controlAdapter]() {
@@ -163,7 +180,7 @@ int main(int argc, char* argv[]) {
 
     if (const auto transport = uiManager.transport()) {
         QObject::connect(transport, &PlaybackTransport::posChanged, &controlServer,
-                         [&controlServer]() { controlServer.scheduleTimecode(); });
+                         scheduleTransport);
         QObject::connect(transport, &PlaybackTransport::playingChanged, &controlServer,
                          publishTransport);
         QObject::connect(transport, &PlaybackTransport::speedChanged, &controlServer,
@@ -173,6 +190,7 @@ int main(int argc, char* argv[]) {
     }
 
     qmlRegisterType<FrameProvider>("Recorder.Types", 1, 0, "FrameProvider");
+    qmlRegisterType<FramePreviewItem>("Recorder.Types", 1, 0, "FramePreviewItem");
     qmlRegisterType<PlaybackTransport>("Recorder.Types", 1, 0, "PlaybackTransport");
     qmlRegisterUncreatableType<PlaylistEntriesModel>("Recorder.Types", 1, 0, "PlaylistEntriesModel",
                                                      "Owned by UIManager");

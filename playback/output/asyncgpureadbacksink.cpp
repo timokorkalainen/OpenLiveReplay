@@ -4,10 +4,22 @@
 #include "playback/gpu/gpupipelineconfig.h"
 #include "playback/gpu/gpusurface.h"
 
+#include <QDebug>
+#include <QElapsedTimer>
+
 #include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <utility>
+
+namespace {
+
+bool latencyTraceEnabled() {
+    const QByteArray raw = qgetenv("OLR_E2E_LATENCY_TRACE").trimmed().toLower();
+    return !(raw.isEmpty() || raw == "0" || raw == "false" || raw == "off" || raw == "no");
+}
+
+} // namespace
 
 AsyncGpuReadbackSink::AsyncGpuReadbackSink(std::unique_ptr<IOutputSink> inner, int ringDepth,
                                            FramePixelFormat cpuFormat, SinkGpuCapability capability,
@@ -204,7 +216,241 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
     return cadenceOk;
 }
 
+bool AsyncGpuReadbackSink::submitAndFlush(const OutputBusFrame& frame, int timeoutMs) {
+    const bool traceLatency = latencyTraceEnabled();
+    const bool syncGpuReadback = m_readbackEnabled.load(std::memory_order_acquire) &&
+                                 gpuPipelineEnabled() && frame.video.isGpuBacked();
+    if (syncGpuReadback) return submitGpuFrameAndFlush(frame, timeoutMs, traceLatency);
+
+    QElapsedTimer timer;
+    timer.start();
+
+    const bool submitted = submit(frame);
+    const qint64 submitNs = timer.nsecsElapsed();
+    if (!submitted) {
+        if (traceLatency) {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "OLR_LATENCY readback.submitAndFlush kind=%1 frameIndex=%2 playheadMs=%3 "
+                       "sampledMs=%4 gpuBacked=%5 submitNs=%6 flushNs=0 innerFlushNs=0 totalNs=%7 "
+                       "ok=0")
+                       .arg(int(m_kind))
+                       .arg(frame.outputFrameIndex)
+                       .arg(frame.identity.sampledPlayheadMs)
+                       .arg(frame.sampledPlayheadMs)
+                       .arg(frame.video.isGpuBacked() ? 1 : 0)
+                       .arg(submitNs)
+                       .arg(timer.nsecsElapsed());
+        }
+        return false;
+    }
+    QElapsedTimer flushTimer;
+    if (traceLatency) flushTimer.start();
+    if (!flushReadbacks(timeoutMs)) {
+        if (traceLatency) {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "OLR_LATENCY readback.submitAndFlush kind=%1 frameIndex=%2 playheadMs=%3 "
+                       "sampledMs=%4 gpuBacked=%5 submitNs=%6 flushNs=%7 innerFlushNs=0 totalNs=%8 "
+                       "ok=0")
+                       .arg(int(m_kind))
+                       .arg(frame.outputFrameIndex)
+                       .arg(frame.identity.sampledPlayheadMs)
+                       .arg(frame.sampledPlayheadMs)
+                       .arg(frame.video.isGpuBacked() ? 1 : 0)
+                       .arg(submitNs)
+                       .arg(flushTimer.nsecsElapsed())
+                       .arg(timer.nsecsElapsed());
+        }
+        return false;
+    }
+    const qint64 flushNs = traceLatency ? flushTimer.nsecsElapsed() : 0;
+
+    const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
+    std::lock_guard<std::mutex> innerLocker(m_innerMutex);
+    QElapsedTimer innerFlushTimer;
+    if (traceLatency) innerFlushTimer.start();
+    const bool ok = m_inner && m_active.load(std::memory_order_acquire) &&
+                    !m_stopRequested.load(std::memory_order_acquire) &&
+                    m_inner->flush(int(qMax<qint64>(0, remainingMs)));
+    if (traceLatency) {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "OLR_LATENCY readback.submitAndFlush kind=%1 frameIndex=%2 playheadMs=%3 "
+                   "sampledMs=%4 gpuBacked=%5 submitNs=%6 flushNs=%7 innerFlushNs=%8 totalNs=%9 "
+                   "ok=%10")
+                   .arg(int(m_kind))
+                   .arg(frame.outputFrameIndex)
+                   .arg(frame.identity.sampledPlayheadMs)
+                   .arg(frame.sampledPlayheadMs)
+                   .arg(frame.video.isGpuBacked() ? 1 : 0)
+                   .arg(submitNs)
+                   .arg(flushNs)
+                   .arg(innerFlushTimer.nsecsElapsed())
+                   .arg(timer.nsecsElapsed())
+                   .arg(ok ? 1 : 0);
+    }
+    return ok;
+}
+
+bool AsyncGpuReadbackSink::submitGpuFrameAndFlush(const OutputBusFrame& frame, int timeoutMs,
+                                                  bool traceLatency) {
+    QElapsedTimer timer;
+    timer.start();
+    const int boundedTimeoutMs = qMax(0, timeoutMs);
+
+    uint64_t fenceValue = 0;
+    std::shared_ptr<GpuFence> producerFence = m_renderFence;
+    bool hasExplicitProducerFence = false;
+    if (const IFrameData* data = frame.video.data()) {
+        if (GpuSurface* surface = data->gpuSurface()) fenceValue = surface->pendingFenceValue();
+        if (std::shared_ptr<GpuFence> frameFence = data->gpuFence()) {
+            producerFence = std::move(frameFence);
+            hasExplicitProducerFence = true;
+        }
+    }
+    if (fenceValue == 0 && producerFence) fenceValue = producerFence->completedValue();
+
+    OutputBusFrame frameToDeliver;
+    bool deliverCadenceFrame = false;
+    {
+        std::lock_guard<std::mutex> locker(m_mutex);
+        if (!m_active.load(std::memory_order_acquire) ||
+            m_stopRequested.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        m_generationDrops += m_ring.drops() + m_ring.occupancy() + m_jobs.size();
+        clearPendingReadbacksLocked();
+        m_wake.notify_all();
+
+        const uint64_t gpuGeneration = frame.video.metadata().gpuGeneration;
+        if (gpuGeneration != 0) {
+            if (m_hasGpuGeneration && m_lastGpuGeneration != gpuGeneration) {
+                m_hasLastDelivered = false;
+                m_hasLastIdentity = false;
+                m_needsReadbackCadence.store(true, std::memory_order_release);
+            }
+            m_lastGpuGeneration = gpuGeneration;
+            m_hasGpuGeneration = true;
+        }
+
+        if (fenceValue == 0 && !hasExplicitProducerFence) {
+            ++m_asyncReadbackDrops;
+            if (m_capability == SinkGpuCapability::NeedsContinuousCadence && m_hasLastDelivered) {
+                frameToDeliver = m_lastDelivered;
+                deliverCadenceFrame = true;
+            } else {
+                if (traceLatency) {
+                    qInfo().noquote()
+                        << QStringLiteral(
+                               "OLR_LATENCY readback.submitAndFlush kind=%1 frameIndex=%2 "
+                               "playheadMs=%3 sampledMs=%4 gpuBacked=1 submitNs=0 flushNs=0 "
+                               "innerFlushNs=0 totalNs=%5 ok=0")
+                               .arg(int(m_kind))
+                               .arg(frame.outputFrameIndex)
+                               .arg(frame.identity.sampledPlayheadMs)
+                               .arg(frame.sampledPlayheadMs)
+                               .arg(timer.nsecsElapsed());
+                }
+                return false;
+            }
+        }
+    }
+
+    qint64 readbackNs = 0;
+    if (!deliverCadenceFrame) {
+        QElapsedTimer readbackTimer;
+        if (traceLatency) readbackTimer.start();
+        const int fenceTimeoutMs = int(qMax<qint64>(0, qint64(boundedTimeoutMs) - timer.elapsed()));
+        if (producerFence && !producerFence->wait(fenceValue, fenceTimeoutMs)) {
+            if (traceLatency) {
+                qInfo().noquote()
+                    << QStringLiteral(
+                           "OLR_LATENCY readback.submitAndFlush kind=%1 frameIndex=%2 "
+                           "playheadMs=%3 sampledMs=%4 gpuBacked=1 submitNs=0 flushNs=%5 "
+                           "innerFlushNs=0 totalNs=%6 ok=0")
+                           .arg(int(m_kind))
+                           .arg(frame.outputFrameIndex)
+                           .arg(frame.identity.sampledPlayheadMs)
+                           .arg(frame.sampledPlayheadMs)
+                           .arg(readbackTimer.nsecsElapsed())
+                           .arg(timer.nsecsElapsed());
+            }
+            return false;
+        }
+
+        RingReadbackJob job;
+        job.ready = true;
+        job.frame = frame;
+        job.format = m_cpuFormat;
+        RingReadyFrame ready = GpuReadbackRing::readBack(job, m_sharedReadbacks, [this]() {
+            return m_cancelReadbacks.load(std::memory_order_acquire);
+        });
+        readbackNs = traceLatency ? readbackTimer.nsecsElapsed() : 0;
+
+        if (ready.readbackFailed || !ready.ready) {
+            {
+                std::lock_guard<std::mutex> locker(m_mutex);
+                ++m_asyncReadbackDrops;
+                if (m_capability == SinkGpuCapability::NeedsContinuousCadence &&
+                    m_hasLastDelivered) {
+                    frameToDeliver = m_lastDelivered;
+                    deliverCadenceFrame = true;
+                }
+            }
+            if (!deliverCadenceFrame) {
+                if (traceLatency) {
+                    qInfo().noquote()
+                        << QStringLiteral(
+                               "OLR_LATENCY readback.submitAndFlush kind=%1 frameIndex=%2 "
+                               "playheadMs=%3 sampledMs=%4 gpuBacked=1 submitNs=0 flushNs=%5 "
+                               "innerFlushNs=0 totalNs=%6 ok=0")
+                               .arg(int(m_kind))
+                               .arg(frame.outputFrameIndex)
+                               .arg(frame.identity.sampledPlayheadMs)
+                               .arg(frame.sampledPlayheadMs)
+                               .arg(readbackNs)
+                               .arg(timer.nsecsElapsed());
+                }
+                return false;
+            }
+        } else {
+            frameToDeliver = ready.frame;
+        }
+    }
+
+    const qint64 remainingMs = qint64(boundedTimeoutMs) - timer.elapsed();
+    std::lock_guard<std::mutex> innerLocker(m_innerMutex);
+    QElapsedTimer innerFlushTimer;
+    if (traceLatency) innerFlushTimer.start();
+    const bool ok = m_inner && m_active.load(std::memory_order_acquire) &&
+                    !m_stopRequested.load(std::memory_order_acquire) &&
+                    m_inner->submitAndFlush(frameToDeliver, int(qMax<qint64>(0, remainingMs)));
+    if (ok) rememberDelivered(frameToDeliver);
+    if (traceLatency) {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "OLR_LATENCY readback.submitAndFlush kind=%1 frameIndex=%2 playheadMs=%3 "
+                   "sampledMs=%4 gpuBacked=1 submitNs=0 flushNs=%5 innerFlushNs=%6 totalNs=%7 "
+                   "ok=%8")
+                   .arg(int(m_kind))
+                   .arg(frame.outputFrameIndex)
+                   .arg(frame.identity.sampledPlayheadMs)
+                   .arg(frame.sampledPlayheadMs)
+                   .arg(readbackNs)
+                   .arg(innerFlushTimer.nsecsElapsed())
+                   .arg(timer.nsecsElapsed())
+                   .arg(ok ? 1 : 0);
+    }
+    return ok;
+}
+
 bool AsyncGpuReadbackSink::flush(int timeoutMs) {
+    return flushReadbacks(timeoutMs);
+}
+
+bool AsyncGpuReadbackSink::flushReadbacks(int timeoutMs) {
     if (!m_readbackEnabled.load(std::memory_order_acquire)) return true;
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(qMax(0, timeoutMs));
@@ -260,10 +506,16 @@ bool AsyncGpuReadbackSink::flush(int timeoutMs) {
 
         bool ok = false;
         {
+            const auto now = std::chrono::steady_clock::now();
+            const int remainingMs =
+                now >= deadline
+                    ? 0
+                    : int(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                              .count());
             std::lock_guard<std::mutex> innerLocker(m_innerMutex);
             ok = m_inner && m_active.load(std::memory_order_acquire) &&
                  !m_stopRequested.load(std::memory_order_acquire) &&
-                 m_inner->submit(frameToDeliver);
+                 m_inner->submitAndFlush(frameToDeliver, remainingMs);
         }
         if (ok) rememberDelivered(frameToDeliver);
         return ok;
@@ -271,18 +523,30 @@ bool AsyncGpuReadbackSink::flush(int timeoutMs) {
 }
 
 void AsyncGpuReadbackSink::discardPending() {
-    if (!m_readbackEnabled.load(std::memory_order_acquire)) return;
+    bool shouldForward = false;
+    if (m_readbackEnabled.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> locker(m_mutex);
+        if (!m_active.load(std::memory_order_acquire) ||
+            m_stopRequested.load(std::memory_order_acquire))
+            return;
+        clearPendingReadbacksLocked();
+        m_hasLastDelivered = false;
+        m_hasLastIdentity = false;
+        m_needsReadbackCadence.store(false, std::memory_order_release);
+        m_wake.notify_all();
+        if (m_sharedReadbacks) m_sharedReadbacks->wakeAll();
+        shouldForward = true;
+    } else {
+        shouldForward = m_active.load(std::memory_order_acquire) &&
+                        !m_stopRequested.load(std::memory_order_acquire);
+    }
 
-    std::lock_guard<std::mutex> locker(m_mutex);
-    if (!m_active.load(std::memory_order_acquire) ||
-        m_stopRequested.load(std::memory_order_acquire))
-        return;
-    clearPendingReadbacksLocked();
-    m_hasLastDelivered = false;
-    m_hasLastIdentity = false;
-    m_needsReadbackCadence.store(false, std::memory_order_release);
-    m_wake.notify_all();
-    if (m_sharedReadbacks) m_sharedReadbacks->wakeAll();
+    if (!shouldForward) return;
+    std::lock_guard<std::mutex> innerLocker(m_innerMutex);
+    if (m_inner && m_active.load(std::memory_order_acquire) &&
+        !m_stopRequested.load(std::memory_order_acquire)) {
+        m_inner->discardPending();
+    }
 }
 
 OutputSinkStatus AsyncGpuReadbackSink::outputStatus() const {

@@ -133,6 +133,7 @@ private:
     int64_t m_pendingVideoTimecode100ns = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastDecodeErrorLogMs = -1;
+    quint64 m_decodeFailures = 0;
     bool m_loggedLatmUnsupported = false;
 
     bool openSocket(QString* error);

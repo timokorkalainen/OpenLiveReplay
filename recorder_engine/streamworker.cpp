@@ -33,6 +33,10 @@
 #include <memory>
 #include <utility>
 
+extern "C" {
+#include <libavutil/imgutils.h>
+}
+
 namespace {
 QString ingestFailureKindForLog(IngestFailureKind failure) {
     switch (failure) {
@@ -85,6 +89,73 @@ void StreamWorker::setConnected(bool c) {
     const bool prev = m_connected.exchange(c, std::memory_order_relaxed);
     if (prev != c) {
         emit connectionChanged(m_sourceIndex, c);
+    }
+}
+
+qint64 StreamWorker::queuedFrameBytes(const QueuedFrame& frame) {
+    qint64 bytes = 0;
+    if (frame.frame && frame.frame->width > 0 && frame.frame->height > 0 &&
+        frame.frame->format >= 0) {
+        const int frameBytes =
+            av_image_get_buffer_size(static_cast<AVPixelFormat>(frame.frame->format),
+                                     frame.frame->width, frame.frame->height, 1);
+        if (frameBytes > 0) bytes += frameBytes;
+    }
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (!frame.gpuFrame.isNull()) {
+        const FramePayloadKey& key = frame.gpuFrame.metadata().key;
+        const qint64 pixels = qint64(qMax(0, key.width)) * qMax(0, key.height);
+        switch (key.format) {
+        case FramePixelFormat::Rgba8:
+            bytes += pixels * 4;
+            break;
+        case FramePixelFormat::Nv12:
+        case FramePixelFormat::Yuv420p:
+        default:
+            bytes += pixels * 3 / 2;
+            break;
+        }
+    }
+#endif
+    return bytes;
+}
+
+qint64 StreamWorker::frameQueueBackstopBytes() const {
+    bool ok = false;
+    const int configuredMb = qEnvironmentVariableIntValue("OLR_FRAME_QUEUE_BACKSTOP_MB", &ok);
+    if (ok && configuredMb > 0) return qint64(configuredMb) * 1024 * 1024;
+#if defined(Q_OS_IOS)
+    return 64LL * 1024 * 1024;
+#else
+    return 512LL * 1024 * 1024;
+#endif
+}
+
+void StreamWorker::trimFrameQueueBackstopLocked(qint64 tickGateMs) {
+    while (tickGateMs >= 0 && m_frameQueue.size() >= 2 &&
+           m_frameQueue.at(1).sourcePts <= tickGateMs) {
+        auto old = m_frameQueue.dequeue();
+        av_frame_free(&old.frame);
+    }
+
+    const int backstopFrames = 10 * m_targetFps;
+    while (m_frameQueue.size() > backstopFrames) {
+        auto old = m_frameQueue.dequeue();
+        av_frame_free(&old.frame);
+    }
+
+    const qint64 backstopBytes = frameQueueBackstopBytes();
+    if (backstopBytes <= 0) return;
+
+    qint64 queuedBytes = 0;
+    for (const QueuedFrame& queued : m_frameQueue)
+        queuedBytes += queuedFrameBytes(queued);
+
+    while (m_frameQueue.size() > 1 && queuedBytes > backstopBytes) {
+        const qint64 oldBytes = queuedFrameBytes(m_frameQueue.head());
+        auto old = m_frameQueue.dequeue();
+        av_frame_free(&old.frame);
+        queuedBytes = qMax<qint64>(0, queuedBytes - oldBytes);
     }
 }
 
@@ -673,23 +744,8 @@ void StreamWorker::captureLoop() {
 
             m_lastFrameEnqueueAtMs.store(m_monotonic.elapsed(), std::memory_order_relaxed);
 
-            // Pre-drain frames the next tick would discard anyway: the tick
-            // keeps only the newest frame at-or-before its gate, so the head is
-            // garbage as soon as a SECOND frame is inside the gate.
             const int64_t tickGateMs = m_lastTickTargetMs.load(std::memory_order_relaxed);
-            while (tickGateMs >= 0 && m_frameQueue.size() >= 2 &&
-                   m_frameQueue.at(1).sourcePts <= tickGateMs) {
-                auto old = m_frameQueue.dequeue();
-                av_frame_free(&old.frame);
-            }
-
-            // Count backstop (~10 s of frames) against future-stamped bursts
-            // after a re-anchor.
-            const int backstopFrames = 10 * m_targetFps;
-            while (m_frameQueue.size() > backstopFrames) {
-                auto old = m_frameQueue.dequeue();
-                av_frame_free(&old.frame);
-            }
+            trimFrameQueueBackstopLocked(tickGateMs);
         };
         callbacks.onAudioChunk = [this](DecodedAudioChunk chunk) {
             const qsizetype sampleCount = chunk.pcmS16Stereo.size() / kAudioBytesPerSample;

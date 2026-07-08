@@ -269,6 +269,7 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_pendingVideoTimecode100ns = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastDecodeErrorLogMs = -1;
+    m_decodeFailures = 0;
     m_statRetrans = -1;
     m_statLossTotal = -1;
     m_statDropTotal = -1;
@@ -322,6 +323,7 @@ void NativeSrtIngestSession::run() {
                         stats.clockQuality = int(m_clock->quality());
                         stats.clockLocked = m_clock->locked();
                         stats.clockOffsetNs = m_clock->anchorOffsetNs();
+                        stats.decodeFailures = m_decodeFailures;
                         m_callbacks.reportStats(stats);
                     }
                 }
@@ -881,6 +883,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
             },
             &error);
         if (!decoded && !error.isEmpty()) {
+            ++m_decodeFailures;
             const int64_t nowMs = m_monotonic.elapsed();
             if (m_lastDecodeErrorLogMs < 0 || nowMs - m_lastDecodeErrorLogMs >= 5000) {
                 log(error);

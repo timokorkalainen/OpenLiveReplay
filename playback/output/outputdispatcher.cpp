@@ -10,6 +10,8 @@
 #include "playback/output/outputframeclock.h"
 
 #include <QCoreApplication>
+#include <QDebug>
+#include <QElapsedTimer>
 #include <QGuiApplication>
 #include <QHash>
 
@@ -17,7 +19,8 @@
 
 namespace {
 
-constexpr int kPausedPreviewFlushTimeoutMs = 16;
+constexpr int kPausedExternalFlushTimeoutMs = 16;
+constexpr int kPausedPreviewFlushTimeoutMs = 64;
 
 bool envFlagValue(const char* name, bool* value) {
     const QByteArray raw = qgetenv(name).trimmed().toLower();
@@ -34,6 +37,11 @@ bool pausedQtPreviewFlushEnabled() {
     bool enabled = false;
     if (envFlagValue("OLR_QT_PREVIEW_SYNC_FLUSH", &enabled)) return enabled;
     return qobject_cast<QGuiApplication*>(QCoreApplication::instance()) != nullptr;
+}
+
+bool latencyTraceEnabled() {
+    bool enabled = false;
+    return envFlagValue("OLR_E2E_LATENCY_TRACE", &enabled) && enabled;
 }
 
 QString targetStatsKey(const OutputTargetAssignment& assignment) {
@@ -67,6 +75,32 @@ std::shared_ptr<SharedGpuReadbackCache> createSharedReadbackCache() {
 #else
     return nullptr;
 #endif
+}
+
+bool endpointMatchesRequest(const OutputEndpoint& endpoint, const OutputDispatchRequest& request) {
+    if (request.lane == OutputDispatchLane::All) return true;
+    if (request.lane == OutputDispatchLane::PgmCritical) {
+        return endpoint.assignment.sourceBus == OutputBusId::pgm() &&
+               (endpoint.assignment.kind == request.requiredKind ||
+                endpoint.assignment.kind == OutputTargetKind::QtPreview);
+    }
+    if (request.lane == OutputDispatchLane::PreviewFollower) {
+        return endpoint.assignment.kind == OutputTargetKind::QtPreview;
+    }
+    return true;
+}
+
+bool submittedFrameMatchesRequest(const OutputTargetAssignment& assignment,
+                                  const OutputBusFrame& frame,
+                                  const OutputDispatchRequest& request) {
+    if (request.lane != OutputDispatchLane::PgmCritical) return false;
+    if (!(assignment.sourceBus == request.requiredBus)) return false;
+    if (assignment.kind != request.requiredKind) return false;
+    if (request.requiredPlayheadMs >= 0 && frame.sampledPlayheadMs != request.requiredPlayheadMs) {
+        return false;
+    }
+    if (request.requireNonPlaceholder && frame.video.metadata().key.isPlaceholder) return false;
+    return true;
 }
 
 } // namespace
@@ -148,20 +182,68 @@ void OutputDispatcher::setGpuRhiContext(std::shared_ptr<GpuRhiContext> gpuRhi) {
 }
 
 OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache,
-                                                   const PlaybackStateSnapshot& state) {
+                                                   const PlaybackStateSnapshot& state,
+                                                   OutputDispatchFlushMode flushMode) {
+    return dispatchTickWithReport(cache, state, flushMode).stats;
+}
+
+OutputDispatchReport OutputDispatcher::dispatchTickWithReport(
+    const OutputFrameCache& cache, const PlaybackStateSnapshot& state,
+    OutputDispatchFlushMode flushMode, const OutputDispatchRequest& request) {
+    const bool traceLatency = latencyTraceEnabled();
+    OutputDispatchReport report;
     const qint64 outputFrameIndex = m_nextOutputFrameIndex++;
     const PlaybackStateSnapshot tickState = clockedStateForTick(outputFrameIndex, state);
     QHash<OutputBusId, OutputBusFrame> rendered;
+    QHash<OutputBusId, qint64> renderDurationsNs;
 #ifdef OLR_GPU_PIPELINE_BUILD
     if (m_sharedReadbacks) m_sharedReadbacks->clear();
 #endif
 
-    for (const OutputEndpoint& endpoint : m_endpoints) {
+    QList<const OutputEndpoint*> endpointOrder;
+    endpointOrder.reserve(m_endpoints.size());
+    if (flushMode == OutputDispatchFlushMode::PausedImmediate) {
+        for (const OutputEndpoint& endpoint : m_endpoints) {
+            if (endpoint.assignment.kind != OutputTargetKind::QtPreview &&
+                endpointMatchesRequest(endpoint, request))
+                endpointOrder.append(&endpoint);
+        }
+        for (const OutputEndpoint& endpoint : m_endpoints) {
+            if (endpoint.assignment.kind == OutputTargetKind::QtPreview &&
+                endpointMatchesRequest(endpoint, request))
+                endpointOrder.append(&endpoint);
+        }
+    } else {
+        for (const OutputEndpoint& endpoint : m_endpoints) {
+            if (endpointMatchesRequest(endpoint, request)) endpointOrder.append(&endpoint);
+        }
+    }
+
+    for (const OutputEndpoint* endpointPtr : endpointOrder) {
+        const OutputEndpoint& endpoint = *endpointPtr;
         if (!endpoint.assignment.enabled || !endpoint.sink || !endpoint.sink->isActive()) continue;
+        const bool isQtPreview = endpoint.assignment.kind == OutputTargetKind::QtPreview;
+        const bool pausedDefaultTick =
+            !tickState.playing && flushMode != OutputDispatchFlushMode::PausedImmediate;
+        if (pausedDefaultTick && !isQtPreview) {
+            if (traceLatency) {
+                qInfo().noquote()
+                    << QStringLiteral("OLR_LATENCY output.dispatcher.skip endpoint=%1 kind=%2 "
+                                      "frameIndex=%3 playheadMs=%4 reason=paused-default-external")
+                           .arg(endpoint.assignment.id)
+                           .arg(int(endpoint.assignment.kind))
+                           .arg(outputFrameIndex)
+                           .arg(tickState.playheadMs);
+            }
+            continue;
+        }
 
         const OutputBusId bus = endpoint.assignment.sourceBus;
         if (!rendered.contains(bus)) {
+            QElapsedTimer renderTimer;
+            if (traceLatency) renderTimer.start();
             OutputBusFrame frame = renderBus(bus, outputFrameIndex, tickState, cache);
+            if (traceLatency) renderDurationsNs.insert(bus, renderTimer.nsecsElapsed());
             if (m_holdLastFrame && frame.video.metadata().key.isPlaceholder &&
                 m_lastGoodFrame.contains(bus)) {
                 const OutputBusFrame held = m_lastGoodFrame.value(bus);
@@ -171,10 +253,8 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
                     // Paint the last real video for this bus instead of the gray
                     // placeholder; keep the freshly-rendered audio + identity +
                     // outputFrameIndex so the clock and audio timeline never stall.
-                    // Stamp the identity with the held GPU generation so a later
-                    // generation bump cannot identity-skip the first real placeholder.
                     frame.video = held.video;
-                    frame.identity.videoGpuGeneration = held.video.metadata().gpuGeneration;
+                    frame.identity = outputFrameIdentityFor(frame);
                     m_stats.heldFrames++;
                 }
             } else if (!frame.video.metadata().key.isPlaceholder) {
@@ -201,20 +281,75 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
         // Identity-skip: if this endpoint already received a byte-identical
         // payload, skip the submit (and the sink's map/copy/deliver entirely).
         OutputTargetDispatchStats& tstats = m_stats.targets[targetStatsKey(endpoint.assignment)];
-        if (m_identitySkip && !endpoint.sink->needsContinuousCadence() && tstats.hasLastIdentity &&
+        const bool sinkNeedsContinuousCadence = endpoint.sink->needsContinuousCadence();
+        qint64 readbackDepth = 0;
+        qint64 readbackDrops = 0;
+        const bool hasReadbackQueue = endpoint.sink->readbackStats(readbackDepth, readbackDrops);
+        Q_UNUSED(readbackDrops);
+        const bool pausedNdiDuplicateMaySkip =
+            !tickState.playing && endpoint.assignment.kind == OutputTargetKind::Ndi &&
+            sinkNeedsContinuousCadence && (!hasReadbackQueue || readbackDepth == 0);
+        const bool pausedImmediateExternal =
+            !tickState.playing && flushMode == OutputDispatchFlushMode::PausedImmediate &&
+            !isQtPreview;
+        const bool pausedImmediatePreview = !tickState.playing &&
+                                            flushMode == OutputDispatchFlushMode::PausedImmediate &&
+                                            isQtPreview;
+        const bool duplicateMaySkip = !pausedImmediateExternal && !pausedImmediatePreview &&
+                                      (!sinkNeedsContinuousCadence || pausedNdiDuplicateMaySkip);
+        if (m_identitySkip && duplicateMaySkip && tstats.hasLastIdentity &&
             tstats.lastIdentity.samePayloadAs(frame.identity)) {
             tstats.repeatedPayloadFrames++;
             m_stats.skippedDuplicateFrames++;
             continue;
         }
 
-        const bool submitted = endpoint.sink->submit(frame);
-        if (submitted && !tickState.playing &&
-            endpoint.assignment.kind == OutputTargetKind::QtPreview &&
-            pausedQtPreviewFlushEnabled()) {
-            endpoint.sink->flush(kPausedPreviewFlushTimeoutMs);
+        const bool shouldFlushPausedPreview =
+            isQtPreview && flushMode == OutputDispatchFlushMode::PausedImmediate &&
+            pausedQtPreviewFlushEnabled();
+        const bool shouldFlushPausedImmediate =
+            flushMode == OutputDispatchFlushMode::PausedImmediate && !isQtPreview;
+        const bool shouldFlush =
+            !tickState.playing && (shouldFlushPausedPreview || shouldFlushPausedImmediate);
+        const int timeoutMs = endpoint.assignment.kind == OutputTargetKind::QtPreview
+                                  ? kPausedPreviewFlushTimeoutMs
+                                  : kPausedExternalFlushTimeoutMs;
+        QElapsedTimer submitTimer;
+        if (traceLatency) submitTimer.start();
+        const bool submitted = shouldFlush ? endpoint.sink->submitAndFlush(frame, timeoutMs)
+                                           : endpoint.sink->submit(frame);
+        const qint64 submitNs = traceLatency ? submitTimer.nsecsElapsed() : 0;
+        report.submittedFrames.append(
+            OutputSubmittedFrame{endpoint.assignment, frame.identity, submitted, submitNs});
+        if (submitted && submittedFrameMatchesRequest(endpoint.assignment, frame, request)) {
+            report.requiredSubmitted = true;
+            report.requiredIdentity = frame.identity;
         }
         countTargetAttempt(endpoint.assignment, frame, submitted);
+        if (traceLatency && flushMode == OutputDispatchFlushMode::PausedImmediate) {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "OLR_LATENCY output.dispatcher endpoint=%1 kind=%2 busKind=%3 busIndex=%4 "
+                       "frameIndex=%5 playheadMs=%6 sampledMs=%7 sourcePtsMs=%8 sourceFeed=%9 "
+                       "placeholder=%10 gpuBacked=%11 shouldFlush=%12 timeoutMs=%13 renderNs=%14 "
+                       "submitNs=%15 submitted=%16")
+                       .arg(endpoint.assignment.id)
+                       .arg(int(endpoint.assignment.kind))
+                       .arg(int(bus.kind))
+                       .arg(bus.index)
+                       .arg(outputFrameIndex)
+                       .arg(tickState.playheadMs)
+                       .arg(frame.sampledPlayheadMs)
+                       .arg(frame.identity.sourcePtsMs)
+                       .arg(frame.identity.sourceFeedIndex)
+                       .arg(frame.video.metadata().key.isPlaceholder ? 1 : 0)
+                       .arg(frame.video.isGpuBacked() ? 1 : 0)
+                       .arg(shouldFlush ? 1 : 0)
+                       .arg(timeoutMs)
+                       .arg(renderDurationsNs.value(bus, 0))
+                       .arg(submitNs)
+                       .arg(submitted ? 1 : 0);
+        }
         if (submitted) {
             m_stats.framesSubmitted++;
         } else {
@@ -230,7 +365,8 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
     m_stats.redundantGpuReadbacks = gpu.redundantReadbacks;
 
     m_stats.ticks++;
-    return m_stats;
+    report.stats = m_stats;
+    return report;
 }
 
 OutputDispatchStats OutputDispatcher::stats() const {
