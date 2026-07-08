@@ -104,6 +104,11 @@ For a focused unit-only run:
 ctest --test-dir build/debug -L unit --output-on-failure
 ```
 
+For frame-accurate playback, jog, and scrub-preview validation, including the
+macOS visual oracle, >5 second cold-seek checks, PGM NDI output-latency samples,
+and iOS local SRT marker oracle, see
+[Frame-Accurate Scrub Testing](frame-accurate-scrub-testing.md).
+
 ## iOS Device Build
 
 iOS remains Xcode-driven. Use a separate build directory because it uses the
@@ -113,8 +118,30 @@ Xcode generator and the iOS Qt kit.
 $HOME/Qt/6.10.1/ios/bin/qt-cmake -S . -B build/ios-debug -G Xcode \
   -DQT_HOST_PATH=$HOME/Qt/6.10.1/macos \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
-  -DOLR_ENABLE_STREAMDECK=ON
+  -DOLR_ENABLE_STREAMDECK=ON \
+  -DOLR_GPU_PIPELINE=ON \
+  -DOLR_GPU_PIPELINE_FORCE_ON=ON
 ```
+
+For device validation that uses PGM NDI as the external output oracle, install
+the NDI SDK for Apple and make NDI mandatory at configure time:
+
+```sh
+$HOME/Qt/6.10.1/ios/bin/qt-cmake -S . -B build/ios-debug -G Xcode \
+  -DQT_HOST_PATH=$HOME/Qt/6.10.1/macos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DOLR_ENABLE_STREAMDECK=ON \
+  -DOLR_GPU_PIPELINE=ON \
+  -DOLR_GPU_PIPELINE_FORCE_ON=ON \
+  -DOLR_NDI_IOS_REQUIRED=ON \
+  -DOLR_NDI_IOS_SDK_DIR="/Library/NDI SDK for Apple"
+```
+
+The iOS build links `lib/iOS/libndi_ios.a` statically and adds the required
+Apple frameworks. Do not add `-ldns_sd` on iPhoneOS; Bonjour/DNSService symbols
+resolve from the platform libraries there. The app plist must include local
+network usage text and `_ndi._tcp.` in `NSBonjourServices` so iOS allows the PGM
+NDI sender to advertise on the LAN.
 
 Find the paired device identifier:
 
@@ -145,3 +172,5 @@ xcrun devicectl device process launch \
 ```
 
 Use `-DOLR_ENABLE_STREAMDECK=ON` when validating StreamDeck integration.
+Use the GPU flags above for replay/scrub validation so the app exercises the
+same PGM-first GPU path that the device oracle tests.
