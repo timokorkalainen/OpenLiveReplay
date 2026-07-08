@@ -102,10 +102,11 @@ if(APPLE AND NOT IOS)
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_macos_app_visual_e2e.sh"
             "$<TARGET_FILE:OpenLiveReplay>"
             "$<TARGET_FILE:ndi_marker_mkv_source>"
-            "$<TARGET_FILE:marker_yuv_probe>")
+            "$<TARGET_FILE:marker_yuv_probe>"
+            "$<TARGET_FILE:ndi_recv_probe>")
     set_tests_properties(e2e_macos_app_visual PROPERTIES
         LABELS "app-e2e;macos"
-        TIMEOUT 240
+        TIMEOUT 300
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
 endif()
@@ -116,6 +117,22 @@ if(OLR_PYTHON3_EXECUTABLE)
             "${CMAKE_CURRENT_SOURCE_DIR}/test_macos_app_driver_static.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/macos_app_driver.py")
     set_tests_properties(tst_macos_app_driver_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_playbackworker_seek_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_playbackworker_seek_static.py"
+            "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
+    set_tests_properties(tst_playbackworker_seek_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_gpucompositor_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_gpucompositor_static.py"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp")
+    set_tests_properties(tst_gpucompositor_static PROPERTIES
         LABELS "unit;ci"
         TIMEOUT 30)
 endif()

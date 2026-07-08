@@ -13,6 +13,7 @@ class ServerFakeAdapter final : public QObject, public ControlApiAdapter {
 public:
     QString lastCommand;
     QJsonObject lastArgs;
+    QJsonObject resultDetails;
 
     RecordingState recordingState() const override { return {}; }
 
@@ -48,7 +49,9 @@ public:
     CommandResult executeCommand(const QString& name, const QJsonObject& args) override {
         lastCommand = name;
         lastArgs = args;
-        return CommandResult::success();
+        CommandResult result = CommandResult::success();
+        result.details = resultDetails;
+        return result;
     }
 };
 
@@ -88,6 +91,9 @@ void TestControlWebSocketServer::sendsSnapshotAndTimecodeOnConnect() {
 
 void TestControlWebSocketServer::dispatchesCommandAndSendsAck() {
     ServerFakeAdapter adapter;
+    adapter.resultDetails.insert(
+        QStringLiteral("pgmTransaction"),
+        QJsonObject{{QStringLiteral("completed"), true}, {QStringLiteral("targetMs"), 321}});
     ControlWebSocketServer server(&adapter);
     QVERIFY(server.listen(QHostAddress::LocalHost, 0));
 
@@ -106,6 +112,9 @@ void TestControlWebSocketServer::dispatchesCommandAndSendsAck() {
     QCOMPARE(ack.value(QStringLiteral("type")).toString(), QStringLiteral("ack"));
     QCOMPARE(ack.value(QStringLiteral("id")).toString(), QStringLiteral("seek-1"));
     QCOMPARE(ack.value(QStringLiteral("ok")).toBool(), true);
+    const QJsonObject transaction = ack.value(QStringLiteral("pgmTransaction")).toObject();
+    QCOMPARE(transaction.value(QStringLiteral("completed")).toBool(), true);
+    QCOMPARE(transaction.value(QStringLiteral("targetMs")).toInt(), 321);
 
     QCOMPARE(adapter.lastCommand, QStringLiteral("transport.seek"));
     QCOMPARE(adapter.lastArgs.value(QStringLiteral("positionMs")).toInt(), 321);

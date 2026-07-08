@@ -70,7 +70,7 @@ void TestOutputDispatcherHoldLast::emptyCacheAfterRealFrameHoldsLastGoodVideo() 
 
     // Tick 2: the cache went empty (mid-seek) → renderBus yields a placeholder.
     OutputFrameCache empty(1, 4, 4);
-    dispatcher.dispatchTick(empty, state);
+    dispatcher.dispatchTick(empty, state, OutputDispatchFlushMode::PausedImmediate);
 
     QCOMPARE(sink.frames.size(), 2);
     // The held tick must NOT be the gray placeholder...
@@ -108,7 +108,7 @@ void TestOutputDispatcherHoldLast::holdDisabledLeavesPlaceholderVisible() {
     dispatcher.dispatchTick(full, state);
 
     OutputFrameCache empty(1, 4, 4);
-    dispatcher.dispatchTick(empty, state);
+    dispatcher.dispatchTick(empty, state, OutputDispatchFlushMode::PausedImmediate);
 
     QCOMPARE(sink.frames.size(), 2);
     QVERIFY(sink.frames[1].video.metadata().key.isPlaceholder);
@@ -180,11 +180,11 @@ void TestOutputDispatcherHoldLast::placeholderAfterHeldGpuFrameIsSubmittedWhenGe
     dispatcher.dispatchTick(full, state);
 
     OutputFrameCache empty(1, 4, 4);
-    dispatcher.dispatchTick(empty, state);
+    dispatcher.dispatchTick(empty, state, OutputDispatchFlushMode::PausedImmediate);
 
     PlaybackStateSnapshot afterBump = state;
     afterBump.gpuGeneration = 2;
-    dispatcher.dispatchTick(empty, afterBump);
+    dispatcher.dispatchTick(empty, afterBump, OutputDispatchFlushMode::PausedImmediate);
 
     QCOMPARE(sink.frames.size(), 3);
     QVERIFY(!sink.frames[1].video.metadata().key.isPlaceholder);

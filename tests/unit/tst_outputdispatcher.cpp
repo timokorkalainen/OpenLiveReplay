@@ -33,8 +33,10 @@ static QByteArray yPlane(const OutputBusFrame& frame) {
 
 class CollectingSink final : public IOutputSink {
 public:
-    explicit CollectingSink(OutputTargetKind kind, bool failSubmits = false, bool failStart = false)
-        : m_kind(kind), m_failSubmits(failSubmits), m_failStart(failStart) {}
+    explicit CollectingSink(OutputTargetKind kind, bool failSubmits = false, bool failStart = false,
+                            bool continuousCadence = false)
+        : m_kind(kind), m_failSubmits(failSubmits), m_failStart(failStart),
+          m_continuousCadence(continuousCadence) {}
 
     OutputTargetKind kind() const override { return m_kind; }
 
@@ -57,6 +59,7 @@ public:
     }
 
     void discardPending() override { ++discardPendingCalls; }
+    bool needsContinuousCadence() const override { return m_continuousCadence; }
 
     FrameRate receivedRate() const { return m_rate; }
     QVector<OutputBusFrame> framesSnapshot() const {
@@ -75,6 +78,75 @@ private:
     bool m_active = false;
     bool m_failSubmits = false;
     bool m_failStart = false;
+    bool m_continuousCadence = false;
+};
+
+class OrderingSink final : public IOutputSink {
+public:
+    OrderingSink(OutputTargetKind kind, QString name, QVector<QString>* events)
+        : m_kind(kind), m_name(std::move(name)), m_events(events) {}
+
+    OutputTargetKind kind() const override { return m_kind; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        m_active = assignment.enabled && rate.isValid();
+        return m_active;
+    }
+
+    void stop() override { m_active = false; }
+    bool isActive() const override { return m_active; }
+
+    bool submit(const OutputBusFrame&) override {
+        if (!m_active || !m_events) return false;
+        m_events->append(QStringLiteral("submit:%1").arg(m_name));
+        return true;
+    }
+
+    bool flush(int timeoutMs) override {
+        if (!m_active || !m_events) return false;
+        m_events->append(QStringLiteral("flush:%1").arg(m_name));
+        flushTimeouts.append(timeoutMs);
+        return true;
+    }
+
+    QVector<int> flushTimeouts;
+
+private:
+    OutputTargetKind m_kind = OutputTargetKind::QtPreview;
+    QString m_name;
+    QVector<QString>* m_events = nullptr;
+    bool m_active = false;
+};
+
+class FlushFailingSink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
+        return m_active;
+    }
+
+    void stop() override { m_active = false; }
+    bool isActive() const override { return m_active; }
+
+    bool submit(const OutputBusFrame&) override {
+        if (!m_active) return false;
+        submitCalls++;
+        return true;
+    }
+
+    bool flush(int) override {
+        if (!m_active) return false;
+        flushCalls++;
+        return false;
+    }
+
+    int submitCalls = 0;
+    int flushCalls = 0;
+
+private:
+    bool m_active = false;
 };
 
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -132,7 +204,7 @@ class TestOutputDispatcher : public QObject {
     Q_OBJECT
 private slots:
     void cleanup();
-    void pausedTicksRepeatFramesContinuouslyForEverySink();
+    void pausedDefaultTicksKeepPreviewAliveButLeaveExternalOutputsCommandOwned();
     void playingTicksCreateStableOutputPlayEpoch();
     void resetPlayEpochKeepsOutputFrameIndexContinuous();
     void resetPlayEpochDiscardsSinkPendingFrames();
@@ -140,6 +212,13 @@ private slots:
     void targetsOnSameBusReceiveMatchingFrameIdentity();
     void targetStatsTrackRepeatedPayloadsAndFailuresIndependently();
     void identicalConsecutiveTicksSkipDuplicateSubmit();
+    void pausedImmediateNdiDuplicateSubmitsEvenForContinuousCadence();
+    void playingNdiDuplicatesKeepContinuousCadence();
+    void pgmCriticalLaneSubmitsPgmAndPreviewButReportsPgmIdentity();
+    void pgmCriticalLaneFlushesPreviewEvenAfterDefaultPreviewTick();
+    void heldPgmFrameSatisfiesCriticalRequestWithCurrentPlayhead();
+    void previewFollowerLaneSubmitsOnlyQtPreviewEndpoints();
+    void previewFollowerLaneSubmitsAdjacentPausedSeekFrame();
     void replacingEndpointReceivesCurrentPayloadEvenWhenIdentityMatches();
     void statsMergeSinkOutputStatusWithDispatchAttempts();
     void dispatchStatsConvertToBroadcastStatuses();
@@ -150,13 +229,18 @@ private slots:
     void playheadJumpWithoutReanchorIsCaughtByClockDivergence();
     void cacheGuardedSnapshotReanchorsPlayEpoch();
     void rationalRateIsCarriedToSinkOnStart();
+    void pausedDefaultTickDoesNotSynchronouslyFlushPreview();
+    void pausedImmediateSubmitsExternalOutputsBeforePreviewFlush();
+    void pausedImmediateSkipsPreviewFlushWhenExplicitlyDisabled();
 #ifdef OLR_GPU_PIPELINE_BUILD
     void sameBusSinksShareOneReadback();
-    void pausedQtPreviewFlushesGpuReadbackBeforeReturning();
+    void pausedImmediateQtPreviewFlushesGpuReadbackBeforeReturning();
+    void pausedImmediateNdiFlushesGpuReadbackBeforeReturning();
     void readbackTelemetryReachesDispatchStats();
     void continuousCadenceReadbackBypassesIdentitySkip();
     void asyncReadbackBypassesIdentitySkipOnlyUntilDelivered();
 #endif
+    void pausedImmediateFlushFailureIsReported();
 };
 
 void TestOutputDispatcher::cleanup() {
@@ -167,7 +251,7 @@ void TestOutputDispatcher::cleanup() {
 #endif
 }
 
-void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
+void TestOutputDispatcher::pausedDefaultTicksKeepPreviewAliveButLeaveExternalOutputsCommandOwned() {
     OutputFrameCache cache(1, 4, 4);
     cache.insertVideoFrame(video(0, 100, 40));
 
@@ -199,22 +283,23 @@ void TestOutputDispatcher::pausedTicksRepeatFramesContinuouslyForEverySink() {
     dispatcher.dispatchTick(cache, state);
 
     QCOMPARE(qtSink.frames.size(), 2);
-    QCOMPARE(ndiSink.frames.size(), 2);
+    QCOMPARE(ndiSink.frames.size(), 0);
     QCOMPARE(qtSink.frames[0].outputFrameIndex, qint64(0));
     QCOMPARE(qtSink.frames[1].outputFrameIndex, qint64(1));
-    QCOMPARE(ndiSink.frames[0].outputFrameIndex, qint64(0));
-    QCOMPARE(ndiSink.frames[1].outputFrameIndex, qint64(1));
     QCOMPARE(videoPts(qtSink.frames[0]), qint64(100));
     QCOMPARE(videoPts(qtSink.frames[1]), qint64(100));
     QCOMPARE(yAt(qtSink.frames[1], 0), uchar(40));
-    QCOMPARE(yPlane(ndiSink.frames[0]), yPlane(qtSink.frames[0]));
-    QCOMPARE(ndiSink.frames[1].video.metadata().outputFrameIndex,
-             qtSink.frames[1].video.metadata().outputFrameIndex);
-    QVERIFY(qtSink.frames[0].identity.samePayloadAs(ndiSink.frames[0].identity));
-    QVERIFY(qtSink.frames[1].identity.samePayloadAs(ndiSink.frames[1].identity));
     QVERIFY(qtSink.frames[0].identity.samePayloadAs(qtSink.frames[1].identity));
     QVERIFY(qtSink.frames[0].identity.outputFrameIndex !=
             qtSink.frames[1].identity.outputFrameIndex);
+
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+
+    QCOMPARE(ndiSink.frames.size(), 1);
+    QCOMPARE(ndiSink.frames[0].outputFrameIndex, qint64(2));
+    QCOMPARE(videoPts(ndiSink.frames[0]), qint64(100));
+    QCOMPARE(yPlane(ndiSink.frames[0]), yPlane(qtSink.frames[0]));
+    QVERIFY(qtSink.frames[0].identity.samePayloadAs(ndiSink.frames[0].identity));
 }
 
 void TestOutputDispatcher::playingTicksCreateStableOutputPlayEpoch() {
@@ -331,7 +416,7 @@ void TestOutputDispatcher::rendersFeedMultiviewAndPgmAssignmentsFromSameTick() {
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 2, 8, 4);
     dispatcher.setEndpoints({{feed0, &feedSink}, {mv, &mvSink}, {pgm, &pgmSink}});
 
-    dispatcher.dispatchTick(cache, state);
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
 
     QCOMPARE(feedSink.frames.size(), 1);
     QCOMPARE(mvSink.frames.size(), 1);
@@ -372,7 +457,7 @@ void TestOutputDispatcher::targetsOnSameBusReceiveMatchingFrameIdentity() {
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
     dispatcher.setEndpoints({{preview, &previewSink}, {ndi, &ndiSink}});
 
-    dispatcher.dispatchTick(cache, state);
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
 
     QCOMPARE(previewSink.frames.size(), 1);
     QCOMPARE(ndiSink.frames.size(), 1);
@@ -415,8 +500,8 @@ void TestOutputDispatcher::targetStatsTrackRepeatedPayloadsAndFailuresIndependen
     dispatcher.setIdentitySkip(
         false); // force submits so repeatedPayloadFrames counts on submit path
 
-    dispatcher.dispatchTick(cache, state);
-    dispatcher.dispatchTick(cache, state);
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
 
     const OutputDispatchStats stats = dispatcher.stats();
     QCOMPARE(stats.ticks, qint64(2));
@@ -471,6 +556,296 @@ void TestOutputDispatcher::identicalConsecutiveTicksSkipDuplicateSubmit() {
 
     QCOMPARE(qtSink.frames.size(), 1); // only one submit reached the sink
     QCOMPARE(after2.skippedDuplicateFrames, qint64(1));
+}
+
+void TestOutputDispatcher::pausedImmediateNdiDuplicateSubmitsEvenForContinuousCadence() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 40));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment ndi;
+    ndi.id = QStringLiteral("feed0-ndi");
+    ndi.sourceBus = OutputBusId::feed(0);
+    ndi.kind = OutputTargetKind::Ndi;
+    ndi.enabled = true;
+
+    CollectingSink ndiSink(OutputTargetKind::Ndi, false, false, true);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{ndi, &ndiSink}});
+
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+    const OutputDispatchStats afterDuplicate =
+        dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+
+    QCOMPARE(ndiSink.frames.size(), 2);
+    QCOMPARE(videoPts(ndiSink.frames[0]), qint64(100));
+    QCOMPARE(videoPts(ndiSink.frames[1]), qint64(100));
+    QCOMPARE(afterDuplicate.skippedDuplicateFrames, qint64(0));
+}
+
+void TestOutputDispatcher::playingNdiDuplicatesKeepContinuousCadence() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 40));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.playStartedAtOutputFrame = 0;
+    state.playStartedAtPlayheadMs = 100;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment ndi;
+    ndi.id = QStringLiteral("feed0-ndi");
+    ndi.sourceBus = OutputBusId::feed(0);
+    ndi.kind = OutputTargetKind::Ndi;
+    ndi.enabled = true;
+
+    CollectingSink ndiSink(OutputTargetKind::Ndi, false, false, true);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{ndi, &ndiSink}});
+
+    const OutputDispatchStats afterFirst = dispatcher.dispatchTick(cache, state);
+    const OutputDispatchStats afterSecond = dispatcher.dispatchTick(cache, state);
+
+    QCOMPARE(ndiSink.frames.size(), 2);
+    QCOMPARE(videoPts(ndiSink.frames[0]), qint64(100));
+    QCOMPARE(videoPts(ndiSink.frames[1]), qint64(100));
+    QCOMPARE(afterFirst.skippedDuplicateFrames, qint64(0));
+    QCOMPARE(afterSecond.skippedDuplicateFrames, qint64(0));
+}
+
+void TestOutputDispatcher::pgmCriticalLaneSubmitsPgmAndPreviewButReportsPgmIdentity() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 92));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("pgm-preview");
+    preview.sourceBus = OutputBusId::pgm();
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    CollectingSink pgmSink(OutputTargetKind::Ndi);
+    CollectingSink previewSink(OutputTargetKind::QtPreview);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(60, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{preview, &previewSink}, {pgm, &pgmSink}});
+
+    OutputDispatchRequest request;
+    request.lane = OutputDispatchLane::PgmCritical;
+    request.requiredBus = OutputBusId::pgm();
+    request.requiredKind = OutputTargetKind::Ndi;
+    request.requiredPlayheadMs = 1000;
+    request.requireNonPlaceholder = true;
+
+    const OutputDispatchReport report = dispatcher.dispatchTickWithReport(
+        cache, state, OutputDispatchFlushMode::PausedImmediate, request);
+
+    QVERIFY(report.requiredSubmitted);
+    QCOMPARE(report.requiredIdentity.bus, OutputBusId::pgm());
+    QCOMPARE(report.requiredIdentity.sampledPlayheadMs, qint64(1000));
+    QCOMPARE(report.requiredIdentity.sourcePtsMs, qint64(1000));
+    QVERIFY(!report.requiredIdentity.videoPlaceholder);
+    QCOMPARE(report.submittedFrames.size(), 2);
+    QCOMPARE(report.submittedFrames.at(0).assignment.id, QStringLiteral("pgm-ndi"));
+    QCOMPARE(report.submittedFrames.at(1).assignment.id, QStringLiteral("pgm-preview"));
+    QCOMPARE(pgmSink.frames.size(), 1);
+    QCOMPARE(previewSink.frames.size(), 1);
+    QCOMPARE(previewSink.frames.first().identity, pgmSink.frames.first().identity);
+}
+
+void TestOutputDispatcher::pgmCriticalLaneFlushesPreviewEvenAfterDefaultPreviewTick() {
+    qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 92));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("pgm-preview");
+    preview.sourceBus = OutputBusId::pgm();
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    QVector<QString> previewEvents;
+    CollectingSink pgmSink(OutputTargetKind::Ndi);
+    OrderingSink previewSink(OutputTargetKind::QtPreview, QStringLiteral("preview"),
+                             &previewEvents);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(60, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{preview, &previewSink}, {pgm, &pgmSink}});
+
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::Default);
+
+    OutputDispatchRequest request;
+    request.lane = OutputDispatchLane::PgmCritical;
+    request.requiredBus = OutputBusId::pgm();
+    request.requiredKind = OutputTargetKind::Ndi;
+    request.requiredPlayheadMs = 1000;
+    request.requireNonPlaceholder = true;
+
+    const OutputDispatchReport report = dispatcher.dispatchTickWithReport(
+        cache, state, OutputDispatchFlushMode::PausedImmediate, request);
+
+    QVERIFY(report.requiredSubmitted);
+    QCOMPARE(pgmSink.frames.size(), 1);
+    QCOMPARE(report.submittedFrames.size(), 2);
+    QCOMPARE(report.submittedFrames.at(0).assignment.id, QStringLiteral("pgm-ndi"));
+    QCOMPARE(report.submittedFrames.at(1).assignment.id, QStringLiteral("pgm-preview"));
+    QCOMPARE(previewSink.flushTimeouts.size(), 1);
+    QVERIFY(previewSink.flushTimeouts.first() >= 50);
+    QCOMPARE(previewEvents.count(QStringLiteral("submit:preview")), 2);
+}
+
+void TestOutputDispatcher::heldPgmFrameSatisfiesCriticalRequestWithCurrentPlayhead() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 92));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    CollectingSink pgmSink(OutputTargetKind::Ndi);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{pgm, &pgmSink}});
+
+    OutputDispatchRequest seedRequest;
+    seedRequest.lane = OutputDispatchLane::PgmCritical;
+    seedRequest.requiredBus = OutputBusId::pgm();
+    seedRequest.requiredKind = OutputTargetKind::Ndi;
+    seedRequest.requiredPlayheadMs = 1000;
+    seedRequest.requireNonPlaceholder = true;
+
+    const OutputDispatchReport seedReport = dispatcher.dispatchTickWithReport(
+        cache, state, OutputDispatchFlushMode::PausedImmediate, seedRequest);
+    QVERIFY(seedReport.requiredSubmitted);
+
+    state.playheadMs = 1040;
+    OutputDispatchRequest heldRequest = seedRequest;
+    heldRequest.requiredPlayheadMs = 1040;
+
+    const OutputDispatchReport heldReport = dispatcher.dispatchTickWithReport(
+        cache, state, OutputDispatchFlushMode::PausedImmediate, heldRequest);
+
+    QVERIFY(heldReport.requiredSubmitted);
+    QCOMPARE(heldReport.requiredIdentity.bus, OutputBusId::pgm());
+    QCOMPARE(heldReport.requiredIdentity.sampledPlayheadMs, qint64(1040));
+    QCOMPARE(heldReport.requiredIdentity.sourcePtsMs, qint64(1000));
+    QVERIFY(!heldReport.requiredIdentity.videoPlaceholder);
+    QCOMPARE(pgmSink.frames.size(), 2);
+    QCOMPARE(pgmSink.frames.last().sampledPlayheadMs, qint64(1040));
+    QCOMPARE(videoPts(pgmSink.frames.last()), qint64(1000));
+    QVERIFY(!pgmSink.frames.last().identity.videoPlaceholder);
+}
+
+void TestOutputDispatcher::previewFollowerLaneSubmitsOnlyQtPreviewEndpoints() {
+    qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 80));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("pgm-preview");
+    preview.sourceBus = OutputBusId::pgm();
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    CollectingSink pgmSink(OutputTargetKind::Ndi);
+    CollectingSink previewSink(OutputTargetKind::QtPreview);
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{pgm, &pgmSink}, {preview, &previewSink}});
+
+    OutputDispatchRequest request;
+    request.lane = OutputDispatchLane::PreviewFollower;
+    const OutputDispatchReport report = dispatcher.dispatchTickWithReport(
+        cache, state, OutputDispatchFlushMode::PausedImmediate, request);
+
+    QCOMPARE(previewSink.frames.size(), 1);
+    QCOMPARE(pgmSink.frames.size(), 0);
+    QCOMPARE(report.submittedFrames.size(), 1);
+    QCOMPARE(report.submittedFrames.first().assignment.kind, OutputTargetKind::QtPreview);
+    QVERIFY(!report.requiredSubmitted);
+}
+
+void TestOutputDispatcher::previewFollowerLaneSubmitsAdjacentPausedSeekFrame() {
+    qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 28933, 80));
+    cache.insertVideoFrame(video(0, 28966, 96));
+
+    PlaybackStateSnapshot state;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("pgm-preview");
+    preview.sourceBus = OutputBusId::pgm();
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    CollectingSink previewSink(OutputTargetKind::QtPreview);
+    OutputDispatcher dispatcher(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{preview, &previewSink}});
+
+    OutputDispatchRequest request;
+    request.lane = OutputDispatchLane::PreviewFollower;
+
+    state.playheadMs = 28966;
+    dispatcher.dispatchTickWithReport(cache, state, OutputDispatchFlushMode::PausedImmediate,
+                                      request);
+
+    state.playheadMs = 28933;
+    const OutputDispatchReport report = dispatcher.dispatchTickWithReport(
+        cache, state, OutputDispatchFlushMode::PausedImmediate, request);
+
+    QCOMPARE(previewSink.frames.size(), 2);
+    QCOMPARE(report.submittedFrames.size(), 1);
+    QCOMPARE(previewSink.frames.last().sampledPlayheadMs, qint64(28933));
+    QCOMPARE(videoPts(previewSink.frames.last()), qint64(28933));
 }
 
 void TestOutputDispatcher::replacingEndpointReceivesCurrentPayloadEvenWhenIdentityMatches() {
@@ -559,7 +934,7 @@ void TestOutputDispatcher::statsMergeSinkOutputStatusWithDispatchAttempts() {
     state.playheadMs = 100;
     state.playing = false;
     state.selectedFeedIndex = 0;
-    dispatcher.dispatchTick(cache, state);
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
 
     const OutputTargetDispatchStats target =
         dispatcher.stats().targets.value(QStringLiteral("feed0-ndi"));
@@ -911,6 +1286,146 @@ void TestOutputDispatcher::rationalRateIsCarriedToSinkOnStart() {
     QCOMPARE(sink.receivedRate().denominator, 1001);
 }
 
+void TestOutputDispatcher::pausedDefaultTickDoesNotSynchronouslyFlushPreview() {
+    qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 80));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("feed0-preview");
+    preview.sourceBus = OutputBusId::feed(0);
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    QVector<QString> events;
+    OrderingSink previewSink(OutputTargetKind::QtPreview, QStringLiteral("preview"), &events);
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{preview, &previewSink}});
+    dispatcher.dispatchTick(cache, state);
+    dispatcher.setEndpoints({});
+
+    QCOMPARE(events, QVector<QString>({QStringLiteral("submit:preview")}));
+    QVERIFY(previewSink.flushTimeouts.isEmpty());
+}
+
+void TestOutputDispatcher::pausedImmediateSubmitsExternalOutputsBeforePreviewFlush() {
+    qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 80));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("feed0-preview");
+    preview.sourceBus = OutputBusId::feed(0);
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    OutputTargetAssignment ndi;
+    ndi.id = QStringLiteral("feed0-ndi");
+    ndi.sourceBus = OutputBusId::feed(0);
+    ndi.kind = OutputTargetKind::Ndi;
+    ndi.enabled = true;
+
+    QVector<QString> events;
+    OrderingSink previewSink(OutputTargetKind::QtPreview, QStringLiteral("preview"), &events);
+    OrderingSink ndiSink(OutputTargetKind::Ndi, QStringLiteral("ndi"), &events);
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{preview, &previewSink}, {ndi, &ndiSink}});
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+    dispatcher.setEndpoints({});
+
+    const int previewFlush = events.indexOf(QStringLiteral("flush:preview"));
+    const int ndiSubmit = events.indexOf(QStringLiteral("submit:ndi"));
+    const int ndiFlush = events.indexOf(QStringLiteral("flush:ndi"));
+
+    QVERIFY(previewFlush >= 0);
+    QVERIFY(ndiSubmit >= 0);
+    QVERIFY(ndiFlush >= 0);
+    QVERIFY2(ndiSubmit < previewFlush, qPrintable(events.join(QStringLiteral(","))));
+    QVERIFY2(ndiFlush < previewFlush, qPrintable(events.join(QStringLiteral(","))));
+    QCOMPARE(ndiSink.flushTimeouts, QVector<int>({16}));
+    QVERIFY(!previewSink.flushTimeouts.isEmpty());
+    QVERIFY2(previewSink.flushTimeouts.front() >= 50,
+             qPrintable(QString::number(previewSink.flushTimeouts.front())));
+}
+
+void TestOutputDispatcher::pausedImmediateSkipsPreviewFlushWhenExplicitlyDisabled() {
+    qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "0");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 80));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("feed0-preview");
+    preview.sourceBus = OutputBusId::feed(0);
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    QVector<QString> events;
+    OrderingSink previewSink(OutputTargetKind::QtPreview, QStringLiteral("preview"), &events);
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{preview, &previewSink}});
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+    dispatcher.setEndpoints({});
+
+    QCOMPARE(events, QVector<QString>({QStringLiteral("submit:preview")}));
+    QVERIFY(previewSink.flushTimeouts.isEmpty());
+}
+
+void TestOutputDispatcher::pausedImmediateFlushFailureIsReported() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 0, 64));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment ndi;
+    ndi.id = QStringLiteral("feed0-ndi");
+    ndi.sourceBus = OutputBusId::feed(0);
+    ndi.kind = OutputTargetKind::Ndi;
+    ndi.enabled = true;
+
+    FlushFailingSink sink;
+    OutputDispatcher dispatcher(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    dispatcher.setEndpoints({{ndi, &sink}});
+
+    const OutputDispatchStats stats =
+        dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+    dispatcher.setEndpoints({});
+
+    QCOMPARE(sink.submitCalls, 1);
+    QCOMPARE(sink.flushCalls, 1);
+    QCOMPARE(stats.framesSubmitted, qint64(0));
+    QCOMPARE(stats.sinkFailures, qint64(1));
+
+    const OutputTargetDispatchStats target = stats.targets.value(QStringLiteral("feed0-ndi"));
+    QCOMPARE(target.framesSubmitted, qint64(0));
+    QCOMPARE(target.sinkFailures, qint64(1));
+    QVERIFY(target.hasLastSubmitResult);
+    QVERIFY(!target.lastSubmitSucceeded);
+}
+
 #ifdef OLR_GPU_PIPELINE_BUILD
 void TestOutputDispatcher::sameBusSinksShareOneReadback() {
     qputenv("OLR_GPU_PIPELINE", "1");
@@ -952,7 +1467,7 @@ void TestOutputDispatcher::sameBusSinksShareOneReadback() {
                                  sharedReadbacks);
 
     dispatcher.setEndpoints({{preview, &previewSink}, {ndi, &ndiSink}});
-    dispatcher.dispatchTick(cache, state);
+    dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
     QTRY_COMPARE_WITH_TIMEOUT(previewSink.readbackQueueDepth(), qint64(0), 1000);
     QTRY_COMPARE_WITH_TIMEOUT(ndiSink.readbackQueueDepth(), qint64(0), 1000);
     dispatcher.setEndpoints({});
@@ -969,7 +1484,7 @@ void TestOutputDispatcher::sameBusSinksShareOneReadback() {
     QCOMPARE(telemetry.redundantReadbacks, qint64(0));
 }
 
-void TestOutputDispatcher::pausedQtPreviewFlushesGpuReadbackBeforeReturning() {
+void TestOutputDispatcher::pausedImmediateQtPreviewFlushesGpuReadbackBeforeReturning() {
     qputenv("OLR_GPU_PIPELINE", "1");
     qputenv("OLR_QT_PREVIEW_SYNC_FLUSH", "1");
 
@@ -996,7 +1511,8 @@ void TestOutputDispatcher::pausedQtPreviewFlushesGpuReadbackBeforeReturning() {
                                      dispatcher.sharedGpuReadbacks());
 
     dispatcher.setEndpoints({{preview, &previewSink}});
-    const OutputDispatchStats stats = dispatcher.dispatchTick(cache, state);
+    const OutputDispatchStats stats =
+        dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
     dispatcher.setEndpoints({});
 
     const QVector<OutputBusFrame> frames = observed->framesSnapshot();
@@ -1005,6 +1521,46 @@ void TestOutputDispatcher::pausedQtPreviewFlushesGpuReadbackBeforeReturning() {
     QCOMPARE(frames.front().outputFrameIndex, qint64(0));
     QCOMPARE(gpuData->readCount(), 1);
     QCOMPARE(previewSink.readbackQueueDepth(), qint64(0));
+    QCOMPARE(stats.readbackQueueDepth, qint64(0));
+    QCOMPARE(stats.readbackDrops, qint64(0));
+}
+
+void TestOutputDispatcher::pausedImmediateNdiFlushesGpuReadbackBeforeReturning() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+
+    OutputFrameCache cache(1, 4, 4);
+    auto gpuData = std::make_shared<TelemetryGpuFrameData>(86);
+    cache.insertVideoFrame(gpuVideo(0, 0, gpuData));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment ndi;
+    ndi.id = QStringLiteral("feed0-ndi");
+    ndi.sourceBus = OutputBusId::feed(0);
+    ndi.kind = OutputTargetKind::Ndi;
+    ndi.enabled = true;
+
+    OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    auto inner = std::make_unique<CollectingSink>(OutputTargetKind::Ndi);
+    CollectingSink* observed = inner.get();
+    AsyncGpuReadbackSink ndiSink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                                 SinkGpuCapability::NeedsContinuousCadence, GpuFence::create(),
+                                 dispatcher.sharedGpuReadbacks());
+
+    dispatcher.setEndpoints({{ndi, &ndiSink}});
+    const OutputDispatchStats stats =
+        dispatcher.dispatchTick(cache, state, OutputDispatchFlushMode::PausedImmediate);
+    dispatcher.setEndpoints({});
+
+    const QVector<OutputBusFrame> frames = observed->framesSnapshot();
+    QCOMPARE(frames.size(), 1);
+    QVERIFY(!frames.front().video.isGpuBacked());
+    QCOMPARE(frames.front().outputFrameIndex, qint64(0));
+    QCOMPARE(gpuData->readCount(), 1);
+    QCOMPARE(ndiSink.readbackQueueDepth(), qint64(0));
     QCOMPARE(stats.readbackQueueDepth, qint64(0));
     QCOMPARE(stats.readbackDrops, qint64(0));
 }
@@ -1049,7 +1605,10 @@ void TestOutputDispatcher::continuousCadenceReadbackBypassesIdentitySkip() {
 
     PlaybackStateSnapshot state;
     state.playheadMs = 0;
-    state.playing = false;
+    state.playing = true;
+    state.speed = 1.0;
+    state.playStartedAtOutputFrame = 0;
+    state.playStartedAtPlayheadMs = 0;
     state.selectedFeedIndex = 0;
 
     OutputTargetAssignment ndi;
@@ -1091,28 +1650,28 @@ void TestOutputDispatcher::asyncReadbackBypassesIdentitySkipOnlyUntilDelivered()
     state.playing = false;
     state.selectedFeedIndex = 0;
 
-    OutputTargetAssignment ndi;
-    ndi.id = QStringLiteral("feed0-ndi");
-    ndi.sourceBus = OutputBusId::feed(0);
-    ndi.kind = OutputTargetKind::Ndi;
-    ndi.enabled = true;
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("feed0-preview");
+    preview.sourceBus = OutputBusId::feed(0);
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
 
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
-    auto inner = std::make_unique<CollectingSink>(OutputTargetKind::Ndi);
+    auto inner = std::make_unique<CollectingSink>(OutputTargetKind::QtPreview);
     CollectingSink* observed = inner.get();
-    AsyncGpuReadbackSink ndiSink(std::move(inner), 3, FramePixelFormat::Yuv420p,
-                                 SinkGpuCapability::AsyncReadbackDedupOk, GpuFence::create(),
-                                 dispatcher.sharedGpuReadbacks());
+    AsyncGpuReadbackSink previewSink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                                     SinkGpuCapability::AsyncReadbackDedupOk, GpuFence::create(),
+                                     dispatcher.sharedGpuReadbacks());
 
-    dispatcher.setEndpoints({{ndi, &ndiSink}});
+    dispatcher.setEndpoints({{preview, &previewSink}});
     dispatcher.dispatchTick(cache, state);
     dispatcher.dispatchTick(cache, state);
     QCOMPARE(observed->framesSnapshot().size(), 0);
-    QCOMPARE(ndiSink.readbackQueueDepth(), qint64(2));
+    QCOMPARE(previewSink.readbackQueueDepth(), qint64(2));
 
     dispatcher.dispatchTick(cache, state);
     QTRY_COMPARE_WITH_TIMEOUT(observed->framesSnapshot().size(), 1, 1000);
-    QTRY_COMPARE_WITH_TIMEOUT(ndiSink.readbackQueueDepth(), qint64(2), 1000);
+    QTRY_COMPARE_WITH_TIMEOUT(previewSink.readbackQueueDepth(), qint64(2), 1000);
 
     const OutputDispatchStats stats = dispatcher.dispatchTick(cache, state);
     dispatcher.setEndpoints({});

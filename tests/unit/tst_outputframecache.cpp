@@ -18,6 +18,7 @@ private slots:
     void missingVideoReturnsPlaceholder();
     void audioSpanReturnsSamplesAndSilenceForGaps();
     void trimBeforeBoundsVideoHistoryButKeepsBoundaryFrame();
+    void trimWindowBoundsVideoHistoryOnBothSides();
     void trimBeforeDropsExpiredAudioFrames();
     void clearDropsVideoAndAudioHistory();
     void mergeFromInsertsByPtsWithoutClearing();
@@ -120,6 +121,28 @@ void TestOutputFrameCache::trimBeforeBoundsVideoHistoryButKeepsBoundaryFrame() {
     MediaVideoFrameView currentView(*current);
     QCOMPARE(currentView.ptsMs, qint64(200));
     QCOMPARE(uchar(currentView.planeY.at(0)), uchar(30));
+}
+
+void TestOutputFrameCache::trimWindowBoundsVideoHistoryOnBothSides() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(makeVideo(0, 0, 10));
+    cache.insertVideoFrame(makeVideo(0, 100, 20));
+    cache.insertVideoFrame(makeVideo(0, 200, 30));
+    cache.insertVideoFrame(makeVideo(0, 300, 40));
+    cache.insertVideoFrame(makeVideo(0, 400, 50));
+
+    OutputFrameCache::EvictedVideoFrames evicted;
+    cache.trimWindow(150, 300, 0, &evicted);
+
+    QVERIFY(!cache.videoFrameAt(0, 50).has_value());
+    QVERIFY(cache.videoFrameAt(0, 175).has_value());
+    QCOMPARE(cache.videoFrameAt(0, 175)->metadata().key.ptsMs, qint64(100));
+    QVERIFY(cache.videoFrameAt(0, 300).has_value());
+    QCOMPARE(cache.videoFrameAt(0, 300)->metadata().key.ptsMs, qint64(300));
+    QCOMPARE(cache.videoFrameAt(0, 400)->metadata().key.ptsMs, qint64(300));
+    QCOMPARE(evicted.size(), 2);
+    QCOMPARE(evicted[0].metadata().key.ptsMs, qint64(0));
+    QCOMPARE(evicted[1].metadata().key.ptsMs, qint64(400));
 }
 
 void TestOutputFrameCache::trimBeforeDropsExpiredAudioFrames() {

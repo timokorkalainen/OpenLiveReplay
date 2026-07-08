@@ -84,6 +84,10 @@ private slots:
     void pgmFollowsSelectedFeed();
     void pgmIdentityCarriesSourceDecodedSequence();
     void pgmIsPixelExactCopyOfSelectedFeed();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void pgmUsesGpuCompositorEvenWhenAlreadyOutputSized();
+    void pgmUsesGpuCompositorWhenScalingIsRequired();
+#endif
     void placeholderUsesHeightDefaultColorMetadata();
     void pgmPreservesSelectedSourceColorMetadata();
     void pausedAudioIsSilenceButVideoRepeats();
@@ -229,6 +233,86 @@ void TestOutputBusEngine::pgmIsPixelExactCopyOfSelectedFeed() {
     QCOMPARE(pgm0View.planeU, feed0View.planeU);
     QCOMPARE(pgm0View.planeV, feed0View.planeV);
 }
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+void TestOutputBusEngine::pgmUsesGpuCompositorEvenWhenAlreadyOutputSized() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    const FrameHandle selected = videoYuv(0, 100, 30, 90, 170);
+    const MediaVideoFrameView selectedView(selected);
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(selected);
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = GpuGenerationCounter::instance().current();
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QVERIFY2(pgm.video.isGpuBacked(),
+             "PGM must stay GPU-backed in GPU mode so future PGM GPU processing remains on-GPU");
+    QCOMPARE(pgm.video.data() == selected.data(), false);
+    QCOMPARE(pgm.video.metadata().key.format, FramePixelFormat::Rgba8);
+    QCOMPARE(pgm.video.metadata().key.width, 4);
+    QCOMPARE(pgm.video.metadata().key.height, 4);
+    QCOMPARE(pgm.video.metadata().gpuGeneration, state.gpuGeneration);
+    QCOMPARE(pgm.video.metadata().key.feedIndex, selected.metadata().key.feedIndex);
+    QCOMPARE(pgm.video.metadata().key.ptsMs, selected.metadata().key.ptsMs);
+    QCOMPARE(pgm.video.metadata().decodedSequence, selected.metadata().decodedSequence);
+
+    const MediaVideoFrameView pgmView(pgm.video);
+    QVERIFY(pgmView.isValid());
+    QCOMPARE(pgmView.width, selectedView.width);
+    QCOMPARE(pgmView.height, selectedView.height);
+#endif
+}
+
+void TestOutputBusEngine::pgmUsesGpuCompositorWhenScalingIsRequired() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoYuv(0, 100, 30, 90, 170));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 8, 8);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = 12;
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QVERIFY(pgm.video.isGpuBacked());
+    QCOMPARE(pgm.video.metadata().key.format, FramePixelFormat::Rgba8);
+    QCOMPARE(pgm.video.metadata().key.width, 8);
+    QCOMPARE(pgm.video.metadata().key.height, 8);
+#endif
+}
+#endif
 
 void TestOutputBusEngine::placeholderUsesHeightDefaultColorMetadata() {
     OutputFrameCache cache(1, 4, 4);

@@ -19,7 +19,11 @@ private slots:
     void validatesActionDispatchDefaultsPressed();
     void rejectsActionDispatchForShuttleId();
     void validatesActionShuttleDelta();
+    void validatesNdiOutputEnabledCommand();
+    void rejectsNdiOutputEnabledWithoutBusKind();
+    void validatesNdiOutputSenderNameCommand();
     void buildsSuccessAck();
+    void buildsSuccessAckWithDetails();
     void buildsFailureAck();
     void buildsErrorWithoutId();
 };
@@ -158,12 +162,73 @@ void TestControlProtocol::validatesActionShuttleDelta() {
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("delta")).toInt(), -1);
 }
 
+void TestControlProtocol::validatesNdiOutputEnabledCommand() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("ndi-enable"),
+        QStringLiteral("outputs.ndi.setEnabled"),
+        QJsonObject{{QStringLiteral("busKind"), QStringLiteral("pgm")},
+                    {QStringLiteral("feedIndex"), -1},
+                    {QStringLiteral("enabled"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("busKind")).toString(),
+             QStringLiteral("pgm"));
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("feedIndex")).toInt(), -1);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("enabled")).toBool(), true);
+}
+
+void TestControlProtocol::rejectsNdiOutputEnabledWithoutBusKind() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("ndi-enable"),
+        QStringLiteral("outputs.ndi.setEnabled"),
+        QJsonObject{{QStringLiteral("feedIndex"), -1}, {QStringLiteral("enabled"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("busKind")));
+}
+
+void TestControlProtocol::validatesNdiOutputSenderNameCommand() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("ndi-name"),
+        QStringLiteral("outputs.ndi.setSenderName"),
+        QJsonObject{{QStringLiteral("busKind"), QStringLiteral("pgm")},
+                    {QStringLiteral("feedIndex"), -1},
+                    {QStringLiteral("senderName"), QStringLiteral("OLR PGM Latency")}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("senderName")).toString(),
+             QStringLiteral("OLR PGM Latency"));
+}
+
 void TestControlProtocol::buildsSuccessAck() {
     const QJsonObject ack = ControlProtocol::ack(QStringLiteral("abc-1"));
 
     QCOMPARE(ack.value(QStringLiteral("type")).toString(), QStringLiteral("ack"));
     QCOMPARE(ack.value(QStringLiteral("id")).toString(), QStringLiteral("abc-1"));
     QCOMPARE(ack.value(QStringLiteral("ok")).toBool(), true);
+}
+
+void TestControlProtocol::buildsSuccessAckWithDetails() {
+    QJsonObject details;
+    details.insert(
+        QStringLiteral("pgmTransaction"),
+        QJsonObject{{QStringLiteral("completed"), true}, {QStringLiteral("targetMs"), 1000}});
+
+    const QJsonObject ack = ControlProtocol::ack(QStringLiteral("abc-1"), details);
+
+    QCOMPARE(ack.value(QStringLiteral("type")).toString(), QStringLiteral("ack"));
+    QCOMPARE(ack.value(QStringLiteral("id")).toString(), QStringLiteral("abc-1"));
+    QCOMPARE(ack.value(QStringLiteral("ok")).toBool(), true);
+    const QJsonObject transaction = ack.value(QStringLiteral("pgmTransaction")).toObject();
+    QCOMPARE(transaction.value(QStringLiteral("completed")).toBool(), true);
+    QCOMPARE(transaction.value(QStringLiteral("targetMs")).toInt(), 1000);
 }
 
 void TestControlProtocol::buildsFailureAck() {

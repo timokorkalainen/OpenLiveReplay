@@ -382,18 +382,18 @@ void TestBroadcastOutputSettings::qtPreviewAssignmentsCoverFeedsMultiviewAndPgm(
         BroadcastOutputSettings::qtPreviewAssignments(2, true, true);
 
     QCOMPARE(previews.size(), 4);
-    QCOMPARE(previews[0].id, QStringLiteral("qt-preview-feed-0"));
+    QCOMPARE(previews[0].id, QStringLiteral("feed0-qt-preview"));
     QCOMPARE(previews[0].sourceBus, OutputBusId::feed(0));
     QCOMPARE(previews[0].kind, OutputTargetKind::QtPreview);
     QVERIFY(previews[0].enabled);
 
-    QCOMPARE(previews[1].id, QStringLiteral("qt-preview-feed-1"));
+    QCOMPARE(previews[1].id, QStringLiteral("feed1-qt-preview"));
     QCOMPARE(previews[1].sourceBus, OutputBusId::feed(1));
 
-    QCOMPARE(previews[2].id, QStringLiteral("qt-preview-multiview"));
+    QCOMPARE(previews[2].id, QStringLiteral("multiview-qt-preview"));
     QCOMPARE(previews[2].sourceBus, OutputBusId::multiview());
 
-    QCOMPARE(previews[3].id, QStringLiteral("qt-preview-pgm"));
+    QCOMPARE(previews[3].id, QStringLiteral("pgm-qt-preview"));
     QCOMPARE(previews[3].sourceBus, OutputBusId::pgm());
 }
 

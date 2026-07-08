@@ -51,6 +51,7 @@ private slots:
     void nativeSrtDiscontinuityClearsVideoProjectionAnchor();
     void nativeSrtDiscontinuityClearsAllProjectionState();
     void nativeSrtDrainsPendingAccessUnitOnSessionBoundary();
+    void nativeSrtCountsDecodeFailures();
     void nativeSrtExtractsSeiTimecodeOntoPendingVideoTimecode();
     void nativeSrtNoSeiTimecodeLeavesNoStaleTimecodeBleed();
 };
@@ -456,6 +457,24 @@ void TestIngestBackendSelector::nativeSrtDrainsPendingAccessUnitOnSessionBoundar
 
     QCOMPARE(session.drainPendingVideoAccessUnits(), 1);
     QVERIFY(session.m_splitter->flush().isEmpty());
+}
+
+void TestIngestBackendSelector::nativeSrtCountsDecodeFailures() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+    int64_t clockMs = 1000;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    CompressedAccessUnit invalidUnit;
+    invalidUnit.codec = NativeVideoCodec::H264;
+    invalidUnit.pts90k = 90000;
+    invalidUnit.dts90k = 90000;
+    invalidUnit.annexB = QByteArray::fromHex("00000001658884");
+
+    session.processVideoAccessUnits({invalidUnit});
+
+    QCOMPARE(session.m_decodeFailures, quint64(1));
 }
 
 namespace {

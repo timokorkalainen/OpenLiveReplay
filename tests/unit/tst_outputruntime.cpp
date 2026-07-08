@@ -130,6 +130,66 @@ private:
     std::thread m_setterThread;
 };
 
+class SlowSubmitSink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        QMutexLocker locker(&m_mutex);
+        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
+        m_frames.clear();
+        m_submitCount = 0;
+        return m_active;
+    }
+
+    void stop() override {
+        QMutexLocker locker(&m_mutex);
+        m_active = false;
+        m_submitStarted.wakeAll();
+    }
+
+    bool isActive() const override {
+        QMutexLocker locker(&m_mutex);
+        return m_active;
+    }
+
+    bool submit(const OutputBusFrame& frame) override {
+        {
+            QMutexLocker locker(&m_mutex);
+            if (!m_active) return false;
+            m_frames.append(frame);
+            ++m_submitCount;
+            m_submitStarted.wakeAll();
+        }
+        QThread::msleep(80);
+        return true;
+    }
+
+    bool waitForSubmits(int count, int timeoutMs) const {
+        QElapsedTimer timer;
+        timer.start();
+        QMutexLocker locker(&m_mutex);
+        while (m_submitCount < count) {
+            const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
+            if (remainingMs <= 0) return false;
+            m_submitStarted.wait(&m_mutex, static_cast<unsigned long>(remainingMs));
+        }
+        return true;
+    }
+
+    QVector<OutputBusFrame> frames() const {
+        QMutexLocker locker(&m_mutex);
+        return m_frames;
+    }
+
+private:
+    mutable QMutex m_mutex;
+    mutable QWaitCondition m_submitStarted;
+    bool m_active = false;
+    int m_submitCount = 0;
+    QVector<OutputBusFrame> m_frames;
+};
+
 class TestOutputRuntime : public QObject {
     Q_OBJECT
 private slots:
@@ -144,6 +204,8 @@ private slots:
     void recordGpuBudgetSurfacesInStats();
     void injectedGpuRhiContextIsReusedAndReplaceable();
     void dispatchSubmitsWithoutHoldingRuntimeMutex();
+    void immediateDispatchPreemptsCatchUpBurstAfterCurrentTick();
+    void pgmCriticalImmediateDispatchSubmitsPreviewAndReportsPgmIdentity();
     void endpointReconfigurationDiscardsPreReconfigSnapshot();
 };
 
@@ -539,6 +601,110 @@ void TestOutputRuntime::dispatchSubmitsWithoutHoldingRuntimeMutex() {
     QVERIFY2(sink.setterReturnedDuringSubmit(),
              "sink submission must not run while OutputRuntime::m_mutex is held; GPU readback "
              "sinks can block on fences while submitting");
+}
+
+void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 40));
+    cache.insertVideoFrame(video(0, 200, 90));
+
+    std::atomic<qint64> playheadMs{100};
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    SlowSubmitSink sink;
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([&]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state.playheadMs = playheadMs.load(std::memory_order_acquire);
+        snapshot.state.playing = false;
+        snapshot.state.selectedFeedIndex = 0;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+    runtime.setIdentitySkip(false);
+
+    runtime.dispatchDueTicksForTest(0);
+
+    std::thread catchUpThread([&]() { runtime.dispatchDueTicksForTest(1000); });
+
+    QVERIFY2(sink.waitForSubmits(2, 1000), "scheduled catch-up must enter its first tick");
+    playheadMs.store(200, std::memory_order_release);
+
+    QElapsedTimer timer;
+    timer.start();
+    runtime.dispatchImmediate();
+    const qint64 immediateElapsedMs = timer.elapsed();
+
+    catchUpThread.join();
+
+    const QVector<OutputBusFrame> frames = sink.frames();
+    QVERIFY2(immediateElapsedMs < 250,
+             qPrintable(QStringLiteral("immediate dispatch waited %1 ms behind catch-up")
+                            .arg(immediateElapsedMs)));
+    QVERIFY2(frames.size() <= 4,
+             qPrintable(QStringLiteral("immediate dispatch allowed %1 stale catch-up frames")
+                            .arg(frames.size())));
+    QCOMPARE(frames.last().sampledPlayheadMs, qint64(200));
+}
+
+void TestOutputRuntime::pgmCriticalImmediateDispatchSubmitsPreviewAndReportsPgmIdentity() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 88));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    SlowSubmitSink previewSink;
+    ThreadSafeCollectingSink pgmSink(OutputTargetKind::Ndi);
+    OutputRuntime runtime(FrameRate::fromFraction(60, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("pgm-preview");
+    preview.sourceBus = OutputBusId::pgm();
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    runtime.setEndpoints({{preview, &previewSink}, {pgm, &pgmSink}});
+
+    OutputDispatchRequest request;
+    request.lane = OutputDispatchLane::PgmCritical;
+    request.requiredBus = OutputBusId::pgm();
+    request.requiredKind = OutputTargetKind::Ndi;
+    request.requiredPlayheadMs = 1000;
+    request.requireNonPlaceholder = true;
+
+    const OutputDispatchReport report = runtime.dispatchImmediateWithReport(request);
+
+    QVERIFY(report.requiredSubmitted);
+    QCOMPARE(report.requiredIdentity.bus, OutputBusId::pgm());
+    QCOMPARE(report.requiredIdentity.sampledPlayheadMs, qint64(1000));
+    QCOMPARE(report.requiredIdentity.sourcePtsMs, qint64(1000));
+    QVERIFY(!report.requiredIdentity.videoPlaceholder);
+    QCOMPARE(pgmSink.frameCount(), 1);
+    QVERIFY(previewSink.waitForSubmits(1, 10));
+    QCOMPARE(report.submittedFrames.size(), 2);
+    QCOMPARE(report.submittedFrames.at(0).assignment.id, QStringLiteral("pgm-ndi"));
+    QCOMPARE(report.submittedFrames.at(1).assignment.id, QStringLiteral("pgm-preview"));
 }
 
 void TestOutputRuntime::endpointReconfigurationDiscardsPreReconfigSnapshot() {

@@ -184,6 +184,53 @@ private:
     QVector<qint64> m_delivered;
 };
 
+class ThreadRecordingSink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        QMutexLocker locker(&m_mutex);
+        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
+        m_frames.clear();
+        m_submitThread = nullptr;
+        return m_active;
+    }
+
+    void stop() override {
+        QMutexLocker locker(&m_mutex);
+        m_active = false;
+    }
+
+    bool isActive() const override {
+        QMutexLocker locker(&m_mutex);
+        return m_active;
+    }
+
+    bool submit(const OutputBusFrame& frame) override {
+        QMutexLocker locker(&m_mutex);
+        if (!m_active) return false;
+        m_frames.append(frame);
+        m_submitThread = QThread::currentThread();
+        return true;
+    }
+
+    QVector<OutputBusFrame> frames() const {
+        QMutexLocker locker(&m_mutex);
+        return m_frames;
+    }
+
+    QThread* submitThread() const {
+        QMutexLocker locker(&m_mutex);
+        return m_submitThread;
+    }
+
+private:
+    mutable QMutex m_mutex;
+    bool m_active = false;
+    QVector<OutputBusFrame> m_frames;
+    QThread* m_submitThread = nullptr;
+};
+
 class TestQueuedOutputSink : public QObject {
     Q_OBJECT
 private slots:
@@ -192,10 +239,13 @@ private slots:
     void queueStatusReportsDepthAndDroppedFrames();
     void deliveryGapsAreVisibleInStatus();
     void failedInnerSubmitDoesNotAdvanceDeliveredFrameIndex();
+    void flushWaitsForQueuedFrameDelivery();
     void backpressureDropDoesNotReportDeliveryGapAsError();
     void multipleBackpressureDropsInOneGapAreNotError();
+    void discardPendingDropsQueuedFramesBehindInFlightDelivery();
     void restartResetsDeliveryState();
     void rapidStopAfterBurstDrainsWithoutHang();
+    void submitAndFlushDeliversIdleFrameOnCallerThread();
 };
 
 void TestQueuedOutputSink::submitReturnsBeforeSlowInnerSinkCompletes() {
@@ -325,6 +375,31 @@ void TestQueuedOutputSink::failedInnerSubmitDoesNotAdvanceDeliveredFrameIndex() 
     sink.stop();
 }
 
+void TestQueuedOutputSink::flushWaitsForQueuedFrameDelivery() {
+    auto inner = std::make_unique<SlowCollectingSink>();
+    SlowCollectingSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 3);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(40)));
+
+    QElapsedTimer timer;
+    timer.start();
+    QVERIFY(sink.flush(1000));
+
+    QVERIFY2(timer.elapsed() >= 90, "flush must wait for the queued inner submit to finish");
+    QCOMPARE(observed->frameCount(), 1);
+    QCOMPARE(observed->frames().front().outputFrameIndex, qint64(40));
+    QCOMPARE(sink.outputStatus().lastDeliveredFrameIndex, qint64(40));
+
+    sink.stop();
+}
+
 void TestQueuedOutputSink::backpressureDropDoesNotReportDeliveryGapAsError() {
     // A gap in delivered frame indexes caused by the queue dropping an overflow frame is
     // backpressure (Degraded via lastSubmitDroppedFrame), NOT a delivery failure. It must
@@ -403,6 +478,46 @@ void TestQueuedOutputSink::multipleBackpressureDropsInOneGapAreNotError() {
              "a gap fully explained by backpressure drops must not raise Error");
 }
 
+void TestQueuedOutputSink::discardPendingDropsQueuedFramesBehindInFlightDelivery() {
+    auto inner = std::make_unique<BlockingInnerSink>();
+    BlockingInnerSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 3);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(40)));
+    const bool workerBlocked = observed->waitForEnteredSubmits(1, 500);
+    if (!workerBlocked) {
+        observed->release();
+        sink.stop();
+    }
+    QVERIFY2(workerBlocked, "worker must be blocked in the first delivery before discard");
+
+    QVERIFY(sink.submit(frame(41)));
+    QVERIFY(sink.submit(frame(42)));
+    QCOMPARE(sink.outputStatus().currentQueueDepth, qint64(2));
+
+    sink.discardPending();
+    const OutputSinkStatus afterDiscard = sink.outputStatus();
+
+    observed->release();
+    QTest::qWait(50);
+    QVERIFY(sink.submit(frame(43)));
+    QTRY_COMPARE_WITH_TIMEOUT(sink.outputStatus().lastDeliveredFrameIndex, qint64(43), 500);
+
+    const OutputSinkStatus status = sink.outputStatus();
+    sink.stop();
+
+    QCOMPARE(afterDiscard.currentQueueDepth, qint64(0));
+    QCOMPARE(status.lastDeliveredFrameIndex, qint64(43));
+    QCOMPARE(status.currentQueueDepth, qint64(0));
+    QCOMPARE(status.deliveryGaps, qint64(0));
+}
+
 void TestQueuedOutputSink::restartResetsDeliveryState() {
     auto inner = std::make_unique<GapReportingInnerSink>();
     QueuedOutputSink sink(std::move(inner), 3);
@@ -445,6 +560,30 @@ void TestQueuedOutputSink::rapidStopAfterBurstDrainsWithoutHang() {
         sink.submit(frame(i));
     sink.stop(); // must join the worker and return promptly, no deadlock
     QVERIFY(!sink.isActive());
+}
+
+void TestQueuedOutputSink::submitAndFlushDeliversIdleFrameOnCallerThread() {
+    auto inner = std::make_unique<ThreadRecordingSink>();
+    ThreadRecordingSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 3);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QThread* callerThread = QThread::currentThread();
+
+    QVERIFY(sink.submitAndFlush(frame(70), 1000));
+
+    const QVector<OutputBusFrame> delivered = observed->frames();
+    QCOMPARE(delivered.size(), 1);
+    QCOMPARE(delivered.front().outputFrameIndex, qint64(70));
+    QCOMPARE(observed->submitThread(), callerThread);
+    QCOMPARE(sink.outputStatus().lastDeliveredFrameIndex, qint64(70));
+
+    sink.stop();
 }
 
 QTEST_GUILESS_MAIN(TestQueuedOutputSink)

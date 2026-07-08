@@ -32,6 +32,8 @@ public:
         return true;
     }
 
+    void discardPending() override { discardCalls.fetch_add(1, std::memory_order_acq_rel); }
+
     qsizetype deliveredCount() const {
         std::lock_guard<std::mutex> lock(m_mutex);
         return delivered.size();
@@ -47,11 +49,102 @@ public:
         return gpuBackedAtSink.at(index);
     }
 
+    int discardCount() const { return discardCalls.load(std::memory_order_acquire); }
+
 private:
     mutable std::mutex m_mutex;
     QVector<OutputBusFrame> delivered;
     QVector<bool> gpuBackedAtSink;
     std::atomic_bool active{false};
+    std::atomic<int> discardCalls{0};
+};
+
+class FlushRecordingSink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+
+    bool start(const OutputTargetAssignment&, FrameRate) override {
+        active.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void stop() override { active.store(false, std::memory_order_release); }
+    bool isActive() const override { return active.load(std::memory_order_acquire); }
+
+    bool submit(const OutputBusFrame& frame) override {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        delivered.append(frame);
+        return true;
+    }
+
+    bool flush(int timeoutMs) override {
+        Q_UNUSED(timeoutMs);
+        flushCalls.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+
+    int deliveredCount() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return delivered.size();
+    }
+
+    OutputBusFrame deliveredAt(qsizetype index) const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return delivered.at(index);
+    }
+
+    int flushCount() const { return flushCalls.load(std::memory_order_acquire); }
+
+private:
+    mutable std::mutex m_mutex;
+    QVector<OutputBusFrame> delivered;
+    std::atomic_bool active{false};
+    std::atomic<int> flushCalls{0};
+};
+
+class SubmitFlushOnlySink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
+
+    bool start(const OutputTargetAssignment&, FrameRate) override {
+        active.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void stop() override { active.store(false, std::memory_order_release); }
+    bool isActive() const override { return active.load(std::memory_order_acquire); }
+
+    bool submit(const OutputBusFrame&) override { return false; }
+
+    bool submitAndFlush(const OutputBusFrame& frame, int timeoutMs) override {
+        Q_UNUSED(timeoutMs);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        delivered.append(frame);
+        submitAndFlushCalls.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+
+    bool flush(int timeoutMs) override {
+        Q_UNUSED(timeoutMs);
+        flushCalls.fetch_add(1, std::memory_order_acq_rel);
+        return false;
+    }
+
+    int deliveredCount() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return delivered.size();
+    }
+
+    int submitAndFlushCount() const { return submitAndFlushCalls.load(std::memory_order_acquire); }
+
+    int flushCount() const { return flushCalls.load(std::memory_order_acquire); }
+
+private:
+    mutable std::mutex m_mutex;
+    QVector<OutputBusFrame> delivered;
+    std::atomic_bool active{false};
+    std::atomic<int> submitAndFlushCalls{0};
+    std::atomic<int> flushCalls{0};
 };
 
 OutputBusFrame cpuFrame(qint64 index, uint64_t gpuGeneration = 0) {
@@ -245,8 +338,12 @@ private slots:
     void cpuGenerationChangeClearsPendingReadbacks();
     void generationChangePreservesExistingDropCount();
     void stopDropsPendingReadbacksWithoutWaitingOnFence();
+    void discardPendingForwardsToInnerSink();
     void producerFenceControlsGpuReadbackReadiness();
     void flushDeliversPendingGpuReadbackWithoutFutureSubmit();
+    void flushForwardsToInnerSinkAfterReadbackDelivery();
+    void submitAndFlushDoesNotDoubleFlushInnerAfterGpuReadback();
+    void cpuSubmitAndFlushStillFlushesAfterDrainingPendingGpuReadback();
     void gpuReadbackDoesNotBlockSubmitTick();
     void continuousCadenceResendsLastFrameWhileFencePending();
     void readyReadbackDoesNotDoubleSubmitCadence();
@@ -627,6 +724,23 @@ void TestAsyncGpuReadbackSink::stopDropsPendingReadbacksWithoutWaitingOnFence() 
     QCOMPARE(sink.readbackQueueDepth(), qint64(0));
 }
 
+void TestAsyncGpuReadbackSink::discardPendingForwardsToInnerSink() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<RecordingSink>();
+    RecordingSink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    QVERIFY(sink.submit(gpuFrame(0, std::make_shared<CountingGpuFrameData>(74), 1)));
+    QCOMPARE(sink.readbackQueueDepth(), qint64(1));
+
+    sink.discardPending();
+
+    QCOMPARE(sink.readbackQueueDepth(), qint64(0));
+    QCOMPARE(observed->discardCount(), 1);
+}
+
 void TestAsyncGpuReadbackSink::producerFenceControlsGpuReadbackReadiness() {
     qputenv("OLR_GPU_PIPELINE", "1");
     auto wrapperFence = std::make_shared<CountingFence>();
@@ -669,6 +783,71 @@ void TestAsyncGpuReadbackSink::flushDeliversPendingGpuReadbackWithoutFutureSubmi
     QCOMPARE(observed->deliveredAt(0).outputFrameIndex, qint64(1));
     QVERIFY(!observed->gpuBackedAt(0));
     QCOMPARE(data->readCount(), 1);
+    QCOMPARE(sink.readbackQueueDepth(), qint64(0));
+}
+
+void TestAsyncGpuReadbackSink::flushForwardsToInnerSinkAfterReadbackDelivery() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<FlushRecordingSink>();
+    FlushRecordingSink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    auto producerFence = std::make_shared<ManualFence>();
+    auto data = std::make_shared<CountingGpuFrameData>(54, 9, producerFence);
+
+    QVERIFY(sink.submit(gpuFrame(2, data, 1)));
+    producerFence->complete(9);
+    QVERIFY(sink.flush(1000));
+
+    QCOMPARE(observed->deliveredCount(), 1);
+    QCOMPARE(observed->deliveredAt(0).outputFrameIndex, qint64(2));
+    QCOMPARE(observed->flushCount(), 1);
+    QCOMPARE(sink.readbackQueueDepth(), qint64(0));
+}
+
+void TestAsyncGpuReadbackSink::submitAndFlushDoesNotDoubleFlushInnerAfterGpuReadback() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<SubmitFlushOnlySink>();
+    SubmitFlushOnlySink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 1, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    auto producerFence = std::make_shared<ManualFence>();
+    auto data = std::make_shared<CountingGpuFrameData>(55, 11, producerFence);
+    producerFence->complete(11);
+
+    QVERIFY(sink.submitAndFlush(gpuFrame(3, data, 1), 1000));
+
+    QCOMPARE(observed->deliveredCount(), 1);
+    QCOMPARE(observed->submitAndFlushCount(), 1);
+    QCOMPARE(observed->flushCount(), 0);
+    QCOMPARE(data->readCount(), 1);
+    QCOMPARE(sink.readbackQueueDepth(), qint64(0));
+}
+
+void TestAsyncGpuReadbackSink::cpuSubmitAndFlushStillFlushesAfterDrainingPendingGpuReadback() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<FlushRecordingSink>();
+    FlushRecordingSink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    auto producerFence = std::make_shared<ManualFence>();
+    auto data = std::make_shared<CountingGpuFrameData>(56, 12, producerFence);
+    QVERIFY(sink.submit(gpuFrame(4, data, 0)));
+    QCOMPARE(sink.readbackQueueDepth(), qint64(1));
+
+    producerFence->complete(12);
+    QVERIFY(sink.submitAndFlush(cpuFrame(5), 1000));
+
+    QCOMPARE(observed->deliveredCount(), 2);
+    QCOMPARE(observed->deliveredAt(0).outputFrameIndex, qint64(5));
+    QCOMPARE(observed->deliveredAt(1).outputFrameIndex, qint64(4));
+    QCOMPARE(observed->flushCount(), 2);
     QCOMPARE(sink.readbackQueueDepth(), qint64(0));
 }
 

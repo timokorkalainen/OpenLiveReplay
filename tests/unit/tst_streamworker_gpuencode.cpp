@@ -131,12 +131,14 @@ private slots:
     void gpuRecordSurfaceEncodeOptInPrefersGpuFramesWhereSupported();
     void gpuOnlyQueuedFrameBeforeEncodeFallbackDoesNotClearCpuLatest();
     void gpuOnlyQueuedFrameAfterEncodeFallbackDoesNotClearCpuLatest();
+    void frameQueueBackstopHonorsByteCap();
 #endif
 };
 
 void TestStreamWorkerGpuEncode::cleanup() {
     qunsetenv("OLR_GPU_PIPELINE");
     qunsetenv("OLR_GPU_RECORD_SURFACE_ENCODE");
+    qunsetenv("OLR_FRAME_QUEUE_BACKSTOP_MB");
 }
 
 void TestStreamWorkerGpuEncode::pumpIsNullWhenPipelineFlagOff() {
@@ -448,6 +450,32 @@ void TestStreamWorkerGpuEncode::gpuOnlyQueuedFrameAfterEncodeFallbackDoesNotClea
     QCOMPARE(worker.m_frameQueue.size(), 0);
 
     av_frame_free(&worker.m_latestFrame);
+}
+
+void TestStreamWorkerGpuEncode::frameQueueBackstopHonorsByteCap() {
+    qputenv("OLR_FRAME_QUEUE_BACKSTOP_MB", "1");
+
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 640, 480, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+
+    for (int i = 0; i < 3; ++i) {
+        StreamWorker::QueuedFrame queued;
+        queued.frame = makeYuvFrame(640, 480, i * 40);
+        QVERIFY(queued.frame != nullptr);
+        queued.sourcePts = i * 40;
+        worker.m_frameQueue.enqueue(queued);
+    }
+
+    worker.trimFrameQueueBackstopLocked(-1);
+
+    QCOMPARE(worker.m_frameQueue.size(), 2);
+    QCOMPARE(worker.m_frameQueue.at(0).sourcePts, int64_t(40));
+    QCOMPARE(worker.m_frameQueue.at(1).sourcePts, int64_t(80));
+
+    while (!worker.m_frameQueue.isEmpty()) {
+        StreamWorker::QueuedFrame queued = worker.m_frameQueue.dequeue();
+        av_frame_free(&queued.frame);
+    }
 }
 #endif
 
