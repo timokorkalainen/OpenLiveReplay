@@ -135,6 +135,25 @@ if(OLR_PYTHON3_EXECUTABLE)
     set_tests_properties(tst_gpucompositor_static PROPERTIES
         LABELS "unit;ci"
         TIMEOUT 30)
+
+    add_test(NAME tst_ios_ndi_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_ios_ndi_static.py"
+            "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+            "${CMAKE_SOURCE_DIR}/playback/output/ndisink.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/ndiruntimepaths.h"
+            "${CMAKE_SOURCE_DIR}/ios/Info.plist")
+    set_tests_properties(tst_ios_ndi_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_ios_marker_oracle_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_ios_marker_oracle_static.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ios_marker_srt_oracle.py")
+    set_tests_properties(tst_ios_marker_oracle_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
 endif()
 
 add_test(NAME e2e_ndi_output

@@ -719,6 +719,42 @@ if(IOS)
         "-lz" "-lbz2" "-liconv" "-lc++"
     )
 
+    # NDI's Apple SDK ships iOS output support as a static archive. Desktop
+    # builds keep runtime-loading libndi, but iOS must resolve the sender
+    # symbols at link time so PGM NDI can be used as an external device oracle.
+    option(OLR_NDI_IOS_REQUIRED
+        "Fail iOS configure when the NDI SDK for Apple static archive is unavailable"
+        OFF)
+    set(_olr_ndi_ios_default_sdk "")
+    if(EXISTS "/Library/NDI SDK for Apple/lib/iOS/libndi_ios.a")
+        set(_olr_ndi_ios_default_sdk "/Library/NDI SDK for Apple")
+    endif()
+    set(OLR_NDI_IOS_SDK_DIR "${_olr_ndi_ios_default_sdk}" CACHE PATH
+        "Root directory of the NDI SDK for Apple, containing lib/iOS/libndi_ios.a")
+    if(OLR_NDI_IOS_SDK_DIR)
+        find_library(OLR_NDI_IOS_LIBRARY
+            NAMES libndi_ios.a ndi_ios
+            HINTS "${OLR_NDI_IOS_SDK_DIR}/lib/iOS"
+            NO_DEFAULT_PATH
+            NO_CMAKE_FIND_ROOT_PATH)
+    endif()
+    if(OLR_NDI_IOS_LIBRARY)
+        target_compile_definitions(OpenLiveReplay PRIVATE OLR_NDI_STATIC_LINK=1)
+        target_link_libraries(OpenLiveReplay PRIVATE
+            "${OLR_NDI_IOS_LIBRARY}"
+            "-framework Accelerate"
+            "-framework Foundation")
+        message(STATUS "OpenLiveReplay: iOS NDI enabled via ${OLR_NDI_IOS_LIBRARY}")
+    else()
+        set(_olr_ndi_ios_missing_message
+            "OpenLiveReplay: iOS NDI disabled; set OLR_NDI_IOS_SDK_DIR to an NDI SDK for Apple install")
+        if(OLR_NDI_IOS_REQUIRED)
+            message(FATAL_ERROR "${_olr_ndi_ios_missing_message}")
+        else()
+            message(WARNING "${_olr_ndi_ios_missing_message}")
+        endif()
+    endif()
+
     # ==============================================================================
     # 6. EMBED RUNTIME DYLIBS INTO APP BUNDLE
     # ==============================================================================

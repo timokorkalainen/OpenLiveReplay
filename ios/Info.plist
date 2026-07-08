@@ -26,6 +26,12 @@
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>OpenLiveReplay uses the local network to publish NDI programme output for broadcast monitoring and testing.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_ndi._tcp.</string>
+    </array>
     <key>LSApplicationQueriesSchemes</key>
     <array>
         <string>elgato-device-driver</string>

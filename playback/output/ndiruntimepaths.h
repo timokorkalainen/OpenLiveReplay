@@ -33,6 +33,9 @@ inline QStringList runtimeLibraryCandidates() {
             QDir(programFiles)
                 .filePath(QStringLiteral("NDI/NDI 6 Runtime/v6/Processing.NDI.Lib.x64.dll")));
     appendRuntimeCandidate(candidates, QStringLiteral("Processing.NDI.Lib.x64.dll"));
+#elif defined(Q_OS_IOS)
+    // iOS cannot dlopen the desktop NDI runtime. The app links libndi_ios.a
+    // at build time when OLR_NDI_STATIC_LINK is enabled.
 #elif defined(Q_OS_MACOS)
     appendRuntimeCandidate(candidates,
                            QStringLiteral("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib"));

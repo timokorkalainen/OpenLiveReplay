@@ -1,12 +1,14 @@
 #include "playback/output/ndisink.h"
 
 #include <QByteArray>
+#include <QDebug>
 #include <QElapsedTimer>
 #include <QLibrary>
 #include <QVector>
 
 #include "playback/output/ndiabi.h"
 #include "playback/output/ndiruntimepaths.h"
+#include "playback/output/ndistaticlink.h"
 
 #include <cstring>
 
@@ -27,6 +29,21 @@ void applyNdiFrameTiming(const OutputBusFrame& frame, olr::ndi::NDIlib_video_fra
 namespace {
 
 using namespace olr::ndi;
+
+struct NdiRuntimeLeaseState {
+    int refCount = 0;
+    NDIlib_destroy_fn destroy = nullptr;
+};
+
+QMutex& ndiRuntimeLeaseMutex() {
+    static QMutex mutex;
+    return mutex;
+}
+
+NdiRuntimeLeaseState& ndiRuntimeLeaseState() {
+    static NdiRuntimeLeaseState state;
+    return state;
+}
 
 bool copyPlane(const QByteArray& src, int srcStride, int width, int height, char* dst,
                int dstStride) {
@@ -53,11 +70,16 @@ bool hasSendableBroadcastAudio(const MediaAudioFrame& audio) {
     return audio.pcm.size() >= expectedBytes;
 }
 
+bool latencyTraceEnabled() {
+    const QByteArray raw = qgetenv("OLR_E2E_LATENCY_TRACE").trimmed().toLower();
+    return !(raw.isEmpty() || raw == "0" || raw == "false" || raw == "off" || raw == "no");
+}
+
 class NdiDynamicSenderBackend final : public INdiSenderBackend {
 public:
     ~NdiDynamicSenderBackend() override {
         destroySender();
-        if (m_destroy && m_initialized) m_destroy();
+        m_runtimeLease.release();
     }
 
     bool isRuntimeAvailable() const override {
@@ -119,19 +141,37 @@ private:
     bool ensureLoaded() {
         if (m_loaded) return true;
 
+#if defined(OLR_NDI_STATIC_LINK)
+        if (resolveStaticSymbols()) {
+            m_loaded = m_runtimeLease.acquire(m_initialize, m_destroy);
+        }
+        return m_loaded;
+#else
         for (const QString& candidate : runtimeLibraryCandidates()) {
             if (candidate.isEmpty()) continue;
             m_library.setFileName(candidate);
             if (!m_library.load()) continue;
             if (resolveSymbols()) {
-                m_initialized = !m_initialize || m_initialize();
-                m_loaded = m_initialized;
+                m_loaded = m_runtimeLease.acquire(m_initialize, m_destroy);
                 if (m_loaded) return true;
             }
             m_library.unload();
         }
         return false;
+#endif
     }
+
+#if defined(OLR_NDI_STATIC_LINK)
+    bool resolveStaticSymbols() {
+        m_initialize = &NDIlib_initialize;
+        m_destroy = &NDIlib_destroy;
+        m_sendCreate = &NDIlib_send_create;
+        m_sendDestroy = &NDIlib_send_destroy;
+        m_sendVideo = &NDIlib_send_send_video_v2;
+        m_sendAudio = &NDIlib_send_send_audio_v3;
+        return m_sendCreate && m_sendDestroy && m_sendVideo && m_sendAudio;
+    }
+#endif
 
     bool resolveSymbols() {
         m_initialize =
@@ -193,7 +233,7 @@ private:
 
     QLibrary m_library;
     bool m_loaded = false;
-    bool m_initialized = false;
+    NdiRuntimeLease m_runtimeLease;
     NDIlib_send_instance_t m_sender = nullptr;
     QByteArray m_senderNameUtf8;
     FrameRate m_rate;
@@ -209,6 +249,41 @@ private:
 };
 
 } // namespace
+
+NdiRuntimeLease::~NdiRuntimeLease() {
+    release();
+}
+
+bool NdiRuntimeLease::acquire(olr::ndi::NDIlib_initialize_fn initialize,
+                              olr::ndi::NDIlib_destroy_fn destroy) {
+    if (m_held) return true;
+
+    QMutexLocker locker(&ndiRuntimeLeaseMutex());
+    NdiRuntimeLeaseState& state = ndiRuntimeLeaseState();
+    if (state.refCount == 0) {
+        const bool initialized = !initialize || initialize();
+        if (!initialized) return false;
+        state.destroy = destroy;
+    }
+    ++state.refCount;
+    m_held = true;
+    return true;
+}
+
+void NdiRuntimeLease::release() {
+    if (!m_held) return;
+
+    QMutexLocker locker(&ndiRuntimeLeaseMutex());
+    NdiRuntimeLeaseState& state = ndiRuntimeLeaseState();
+    if (state.refCount > 0) {
+        --state.refCount;
+    }
+    if (state.refCount == 0) {
+        if (state.destroy) state.destroy();
+        state.destroy = nullptr;
+    }
+    m_held = false;
+}
 
 NdiOutputSink::NdiOutputSink() : m_ownedBackend(std::make_unique<NdiDynamicSenderBackend>()) {
     m_backend = m_ownedBackend.get();
@@ -272,6 +347,7 @@ void NdiOutputSink::stop() {
 bool NdiOutputSink::submit(const OutputBusFrame& frame) {
     if (!m_active || !m_backend) return false;
 
+    const bool traceLatency = latencyTraceEnabled();
     QElapsedTimer sendTimer;
     sendTimer.start();
     {
@@ -281,35 +357,71 @@ bool NdiOutputSink::submit(const OutputBusFrame& frame) {
         m_status.lastFrameDelivered = false;
     }
     if (!hasSendableBroadcastAudio(frame.audio)) {
+        const qint64 elapsedNs = sendTimer.nsecsElapsed();
         {
             QMutexLocker locker(&m_statusMutex);
             m_status.sendFailures++;
-            m_status.lastSendDurationNs = sendTimer.nsecsElapsed();
+            m_status.lastSendDurationNs = elapsedNs;
             m_status.lastFrameDelivered = false;
             m_status.state = NdiOutputState::SendFailed;
             m_status.message = QStringLiteral("failed to send NDI frame: missing broadcast audio");
         }
+        if (traceLatency) {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "OLR_LATENCY ndi.submit frameIndex=%1 playheadMs=%2 sourcePtsMs=%3 "
+                       "sampledMs=%4 elapsedNs=%5 ok=0 reason=missing-audio")
+                       .arg(frame.outputFrameIndex)
+                       .arg(frame.identity.sampledPlayheadMs)
+                       .arg(frame.identity.sourcePtsMs)
+                       .arg(frame.sampledPlayheadMs)
+                       .arg(elapsedNs);
+        }
         return false;
     }
     if (!m_backend->sendFrame(frame)) {
+        const qint64 elapsedNs = sendTimer.nsecsElapsed();
         {
             QMutexLocker locker(&m_statusMutex);
             m_status.sendFailures++;
-            m_status.lastSendDurationNs = sendTimer.nsecsElapsed();
+            m_status.lastSendDurationNs = elapsedNs;
             m_status.lastFrameDelivered = false;
             m_status.state = NdiOutputState::SendFailed;
             m_status.message = QStringLiteral("failed to send NDI frame");
         }
+        if (traceLatency) {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "OLR_LATENCY ndi.submit frameIndex=%1 playheadMs=%2 sourcePtsMs=%3 "
+                       "sampledMs=%4 elapsedNs=%5 ok=0 reason=send")
+                       .arg(frame.outputFrameIndex)
+                       .arg(frame.identity.sampledPlayheadMs)
+                       .arg(frame.identity.sourcePtsMs)
+                       .arg(frame.sampledPlayheadMs)
+                       .arg(elapsedNs);
+        }
         return false;
     }
+    const qint64 elapsedNs = sendTimer.nsecsElapsed();
     {
         QMutexLocker locker(&m_statusMutex);
         m_status.framesSubmitted++;
-        m_status.lastSendDurationNs = sendTimer.nsecsElapsed();
+        m_status.lastSendDurationNs = elapsedNs;
         m_status.lastFrameDelivered = true;
         m_status.state = NdiOutputState::Active;
         m_status.message =
             QStringLiteral("NDI sender '%1' active").arg(senderNameFor(m_assignment));
+    }
+    if (traceLatency) {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "OLR_LATENCY ndi.submit frameIndex=%1 playheadMs=%2 sourcePtsMs=%3 sampledMs=%4 "
+                   "elapsedNs=%5 ok=1")
+                   .arg(frame.outputFrameIndex)
+                   .arg(frame.identity.sampledPlayheadMs)
+                   .arg(frame.identity.sourcePtsMs)
+                   .arg(frame.sampledPlayheadMs)
+                   .arg(elapsedNs);
     }
     return true;
 }
