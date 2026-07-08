@@ -13,6 +13,9 @@ import sys
 import time
 from pathlib import Path
 
+_APP_PID = None
+_WINDOW_INFO_CACHE = {}
+
 
 class WsClient:
     def __init__(self, host, port, timeout=10.0):
@@ -469,8 +472,12 @@ def frame_index_for_position(position_ms, fps=30):
 
 
 def assert_preview_at_frame(ws, docs_root, marker_probe, timeline, frame_index, label,
-                            timeout=4.0):
+                            workdir=None, timeout=4.0, screen_first=False,
+                            max_screen_elapsed_ms=None):
     expected = expected_marker_for_frame(timeline, frame_index)
+    if workdir and screen_first:
+        assert_screen_preview_at_frame(workdir, marker_probe, expected, label, timeout=timeout,
+                                       max_elapsed_ms=max_screen_elapsed_ms)
     marker, _ = wait_for_stable_marker(
         ws,
         docs_root,
@@ -479,6 +486,9 @@ def assert_preview_at_frame(ws, docs_root, marker_probe, timeline, frame_index, 
         lambda observed: observed == expected,
         timeout=timeout,
     )
+    if workdir and not screen_first:
+        assert_screen_preview_at_frame(workdir, marker_probe, expected, label, timeout=timeout,
+                                       max_elapsed_ms=max_screen_elapsed_ms)
     print(f"APP_ASSERT_FRAME {label} frame={frame_index} marker={marker}")
     return marker
 
@@ -501,37 +511,314 @@ def screenshot(path):
     if not tool:
         print("APP_SCREENSHOT skipped=screencapture-not-found")
         return False
-    result = subprocess.run([tool, "-x", str(path)], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, check=False)
+    window_info = app_window_info(_APP_PID)
+    if not window_info:
+        print("APP_SCREENSHOT skipped=openlivereplay-window-not-found")
+        return False
+    result = subprocess.run([tool, "-x", "-l", str(window_info["id"]), str(path)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            check=False)
     if result.returncode == 0 and Path(path).exists():
-        print(f"APP_SCREENSHOT path={path}")
+        print(
+            "APP_SCREENSHOT "
+            f"path={path} pid={window_info['pid']} windowId={window_info['id']} "
+            f"bounds={window_info['x']},{window_info['y']},"
+            f"{window_info['width']},{window_info['height']}"
+        )
         return True
     else:
         print(f"APP_SCREENSHOT skipped=failed stderr={result.stderr.strip()!r}")
         return False
 
 
-def app_window_bounds():
-    script = (
-        'tell application "System Events"\n'
-        '  tell process "OpenLiveReplay"\n'
-        '    set p to position of window 1\n'
-        '    set s to size of window 1\n'
-        '    return (item 1 of p as text) & "," & (item 2 of p as text) & "," & '
-        '(item 1 of s as text) & "," & (item 2 of s as text)\n'
-        '  end tell\n'
-        'end tell\n'
+def image_dimensions(path):
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe not found")
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
     )
-    result = subprocess.run(["osascript", "-e", script], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, check=False)
     if result.returncode != 0:
-        print(f"APP_WINDOW_BOUNDS skipped stderr={result.stderr.strip()!r}")
+        raise RuntimeError(f"ffprobe failed for {path}: {result.stderr.strip()}")
+    width_text, height_text = result.stdout.strip().split("x", 1)
+    return int(width_text), int(height_text)
+
+
+def app_window_info(pid):
+    global _WINDOW_INFO_CACHE
+    if pid is None:
+        print("APP_WINDOW_INFO skipped=app-pid-not-set")
         return None
-    parts = [int(float(part.strip())) for part in result.stdout.strip().split(",") if part.strip()]
-    if len(parts) != 4:
-        print(f"APP_WINDOW_BOUNDS skipped output={result.stdout.strip()!r}")
+    if pid in _WINDOW_INFO_CACHE:
+        return _WINDOW_INFO_CACHE[pid]
+    swift = shutil.which("swift")
+    if not swift:
+        print("APP_WINDOW_INFO skipped=swift-not-found")
         return None
-    return tuple(parts)
+    script = r'''
+import Foundation
+import CoreGraphics
+
+guard let targetPidText = ProcessInfo.processInfo.environment["OLR_APP_E2E_PID"],
+      let targetPid = Int(targetPidText) else {
+    print("missing target pid")
+    exit(2)
+}
+
+let windows = CGWindowListCopyWindowInfo(
+    [.optionOnScreenOnly, .excludeDesktopElements],
+    kCGNullWindowID
+) as? [[String: Any]] ?? []
+
+var layerZeroRank = 0
+var matches: [String] = []
+for window in windows {
+    let owner = window[kCGWindowOwnerName as String] as? String ?? ""
+    let pid = window[kCGWindowOwnerPID as String] as? Int ?? -1
+    let layer = window[kCGWindowLayer as String] as? Int ?? -1
+    if layer != 0 {
+        continue
+    }
+    let isOnscreen = (window[kCGWindowIsOnscreen as String] as? Bool) ?? false
+    defer { layerZeroRank += 1 }
+    if owner != "OpenLiveReplay" || pid != targetPid || !isOnscreen {
+        continue
+    }
+    guard let number = window[kCGWindowNumber as String] as? Int,
+          let bounds = window[kCGWindowBounds as String] as? [String: Any],
+          let x = bounds["X"] as? Double,
+          let y = bounds["Y"] as? Double,
+          let width = bounds["Width"] as? Double,
+          let height = bounds["Height"] as? Double else {
+        continue
+    }
+    matches.append("\(number) \(Int(x)) \(Int(y)) \(Int(width)) \(Int(height)) \(pid) \(layerZeroRank)")
+}
+
+if matches.count == 1 {
+    print(matches[0])
+    exit(0)
+}
+print("matches=\(matches.count)")
+exit(matches.isEmpty ? 1 : 2)
+'''
+    env = os.environ.copy()
+    env["OLR_APP_E2E_PID"] = str(pid)
+    result = subprocess.run(
+        [swift, "-e", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        print(
+            f"APP_WINDOW_INFO skipped pid={pid} "
+            f"stdout={result.stdout.strip()!r} stderr={result.stderr.strip()!r}"
+        )
+        return None
+    parts = [int(part) for part in result.stdout.strip().split()]
+    if len(parts) != 7:
+        print(f"APP_WINDOW_INFO skipped output={result.stdout.strip()!r}")
+        return None
+    if parts[6] != 0:
+        print(f"APP_WINDOW_INFO skipped pid={pid} frontRank={parts[6]} not-frontmost")
+        return None
+    _WINDOW_INFO_CACHE[pid] = {
+        "id": parts[0],
+        "x": parts[1],
+        "y": parts[2],
+        "width": parts[3],
+        "height": parts[4],
+        "pid": parts[5],
+        "frontRank": parts[6],
+    }
+    print(
+        "APP_WINDOW_INFO "
+        f"pid={parts[5]} id={parts[0]} frontRank={parts[6]} "
+        f"bounds={parts[1]},{parts[2]},{parts[3]},{parts[4]}"
+    )
+    return _WINDOW_INFO_CACHE[pid]
+
+
+def clamp_crop(crop, image_width, image_height):
+    name, x, y, width, height = crop
+    x = max(0, min(int(x), image_width - 2))
+    y = max(0, min(int(y), image_height - 2))
+    width = max(1, min(int(width), image_width - x))
+    height = max(1, min(int(height), image_height - y))
+    if width < 96 or height < 54:
+        return None
+    return name, x, y, width, height
+
+
+def screen_marker_crop_candidates(bounds, image_width, image_height):
+    if bounds:
+        win_x, win_y, win_w, win_h = bounds
+    else:
+        win_x, win_y = 0, 0
+        win_w, win_h = image_width, image_height
+
+    feed_left = win_x + int(win_w * 0.024)
+    feed_top = win_y + int(win_h * 0.134)
+    feed_width = int(win_w * 0.335)
+    feed_height = int(feed_width * 9 / 16)
+    feed_offsets = [
+        ("feed0-video", 0.0, 0.0, 1.0),
+        ("feed0-video-left", -0.01, 0.0, 1.0),
+        ("feed0-video-up", 0.0, -0.012, 1.0),
+        ("feed0-video-wide", -0.01, -0.012, 1.06),
+        ("feed0-video-tight", 0.01, 0.012, 0.94),
+    ]
+
+    rail_free_w = int(win_w * 0.74)
+    toolbar_offsets = [
+        40,
+        44,
+        48,
+        84,
+        88,
+        92,
+        max(36, int(win_h * 0.05)),
+        max(40, int(win_h * 0.08)),
+    ]
+    widths = [
+        rail_free_w,
+        int(rail_free_w * 0.90),
+        int(rail_free_w * 0.78),
+        int(win_w * 0.50),
+        int(win_w * 0.37),
+    ]
+
+    raw = []
+    for name, x_scale, y_scale, size_scale in feed_offsets:
+        width = int(feed_width * size_scale)
+        height = int(width * 9 / 16)
+        raw.append((name,
+                    feed_left + int(feed_width * x_scale),
+                    feed_top + int(feed_height * y_scale),
+                    width,
+                    height))
+
+    for y_offset in toolbar_offsets:
+        for width in widths:
+            height = int(width * 9 / 16)
+            max_stage_h = int(win_h * 0.68)
+            if height > max_stage_h:
+                height = max_stage_h
+            raw.append((f"stage-{width}x{height}+0+{y_offset}",
+                        win_x + 2, win_y + y_offset, width, height))
+
+    # Fallback to the old visibility crop in case accessibility cannot report a
+    # sane app window. It is less precise for marker decoding but useful evidence
+    # in failure logs.
+    raw.append(("legacy-visible",
+                max(0, win_x), max(0, win_y + int(win_h * 0.08)),
+                max(32, int(win_w * 0.35)), max(32, int(win_h * 0.30))))
+
+    candidates = []
+    seen = set()
+    for crop in raw:
+        clamped = clamp_crop(crop, image_width, image_height)
+        if not clamped:
+            continue
+        key = clamped[1:]
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(clamped)
+    return candidates
+
+
+def decode_marker_from_crop(image, marker_probe, crop):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found")
+    name, x, y, width, height = crop
+    vf = f"crop={width}:{height}:{x}:{y},scale=256:144"
+    ff = subprocess.Popen(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(image),
+         "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        stdout=subprocess.PIPE,
+    )
+    probe = subprocess.run(
+        [marker_probe, "256", "144"],
+        stdin=ff.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if ff.stdout:
+        ff.stdout.close()
+    ff_rc = ff.wait()
+    if ff_rc != 0:
+        raise RuntimeError(f"ffmpeg failed decoding screen crop {name}: {ff_rc}")
+    if probe.returncode != 0:
+        raise RuntimeError(f"marker probe failed for screen crop {name}: {probe.stderr.strip()}")
+    marker, line = parse_probe_marker(probe.stdout)
+    return marker, line
+
+
+def decode_marker_from_screen(image, marker_probe, expected_marker):
+    image_width, image_height = image_dimensions(image)
+    bounds = (0, 0, image_width, image_height)
+    attempts = []
+    for crop in screen_marker_crop_candidates(bounds, image_width, image_height):
+        name, x, y, width, height = crop
+        try:
+            marker, line = decode_marker_from_crop(image, marker_probe, crop)
+            attempts.append(f"{name}@{width}x{height}+{x}+{y}:{marker}")
+            if marker == expected_marker:
+                return marker, crop, line, attempts
+        except Exception as exc:
+            attempts.append(f"{name}@{width}x{height}+{x}+{y}:ERR:{exc}")
+    return None, None, "", attempts
+
+
+def assert_screen_preview_at_frame(workdir, marker_probe, expected_marker, label, timeout=4.0,
+                                   max_elapsed_ms=None):
+    started = time.perf_counter()
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    last_attempts = []
+    last_shot = None
+    while time.monotonic() < deadline:
+        attempt += 1
+        shot = Path(workdir) / f"screen-marker-{label}-{attempt}.png"
+        last_shot = shot
+        if not screenshot(shot):
+            raise RuntimeError(f"OS screenshot failed for screen marker {label}")
+        marker, crop, probe_line, attempts = decode_marker_from_screen(
+            shot, marker_probe, expected_marker)
+        last_attempts = attempts
+        if crop:
+            name, x, y, width, height = crop
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            if max_elapsed_ms is not None and elapsed_ms > max_elapsed_ms:
+                raise AssertionError(
+                    "visible app screenshot reached expected marker too slowly "
+                    f"for {label}: expected={expected_marker} elapsedMs={elapsed_ms:.2f} "
+                    f"maxElapsedMs={max_elapsed_ms:.2f} shot={shot}"
+                )
+            print(
+                "APP_SCREEN_MARKER "
+                f"{label} path={shot} marker={marker} expected={expected_marker} "
+                f"elapsedMs={elapsed_ms:.2f} "
+                f"crop={name}@{width}x{height}+{x}+{y} {probe_line}"
+            )
+            return marker
+        time.sleep(0.10)
+    raise AssertionError(
+        "visible app screenshot did not show expected marker "
+        f"for {label}: expected={expected_marker} shot={last_shot} attempts={last_attempts}"
+    )
 
 
 def assert_screen_video_visible(workdir, label):
@@ -541,15 +828,11 @@ def assert_screen_video_visible(workdir, label):
     shot = Path(workdir) / f"screen-{label}.png"
     if not screenshot(shot):
         raise RuntimeError(f"OS screenshot failed for {label}")
-    bounds = app_window_bounds()
-    if bounds:
-        x, y, w, h = bounds
-        crop_x = max(0, x)
-        crop_y = max(0, y + int(h * 0.08))
-        crop_w = max(32, int(w * 0.35))
-        crop_h = max(32, int(h * 0.30))
-    else:
-        crop_x, crop_y, crop_w, crop_h = 0, 40, 680, 520
+    image_width, image_height = image_dimensions(shot)
+    crop_x = 0
+    crop_y = int(image_height * 0.08)
+    crop_w = max(32, int(image_width * 0.35))
+    crop_h = max(32, int(image_height * 0.30))
     vf = f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},scale=256:144"
     raw = subprocess.check_output(
         [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(shot),
@@ -590,6 +873,7 @@ def configure_source(ws, srt_url, save_location):
 
 
 def main():
+    global _APP_PID
     ap = argparse.ArgumentParser()
     ap.add_argument("--app", required=True)
     ap.add_argument("--port", type=int, required=True)
@@ -605,11 +889,13 @@ def main():
     env = os.environ.copy()
     env["OLR_CONTROL_PORT"] = str(args.port)
     env["OLR_DOCUMENTS_ROOT"] = str(docs_root)
+    env["OLR_APP_E2E_FORCE_ACTIVATE"] = "1"
     env["OLR_GPU_PIPELINE"] = "1"
     env.setdefault("QT_LOGGING_RULES", "qt.multimedia.ffmpeg=false")
 
     with app_log.open("w") as log:
         proc = subprocess.Popen([args.app], stdout=log, stderr=subprocess.STDOUT, env=env)
+    _APP_PID = proc.pid
     ws = None
     try:
         wait_for_port(args.port, 20.0)
@@ -640,7 +926,7 @@ def main():
             current_frame = 900
             ws.command("transport.seek", {"positionMs": frame_index_to_ms(current_frame)})
             assert_preview_at_frame(ws, docs_root, args.marker_probe, timeline, current_frame,
-                                    "prime_30s")
+                                    "prime_30s", workdir=args.workdir)
 
             backward_frames = []
             forward_frames = []
@@ -659,7 +945,10 @@ def main():
                         timeline,
                         current_frame,
                         f"{label}_{index + 1}",
+                        workdir=args.workdir,
                         timeout=3.0,
+                        screen_first=True,
+                        max_screen_elapsed_ms=750.0,
                     )
                     time.sleep(delay_s)
 
@@ -675,7 +964,9 @@ def main():
                 ws.command("transport.seek", {"positionMs": frame_index_to_ms(frame)})
                 current_frame = frame
                 assert_preview_at_frame(ws, docs_root, args.marker_probe, timeline, current_frame,
-                                        f"cold_seek_{index + 1}", timeout=3.0)
+                                        f"cold_seek_{index + 1}", workdir=args.workdir,
+                                        timeout=3.0, screen_first=True,
+                                        max_screen_elapsed_ms=750.0)
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 print(f"APP_COLD_SEEK_OBSERVED index={index + 1} frame={frame} clientElapsedMs={elapsed_ms:.2f}")
 

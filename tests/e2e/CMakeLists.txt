@@ -7,6 +7,7 @@ target_link_libraries(record_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
 set(OLR_E2E_BASH bash)
+find_program(OLR_PYTHON3_EXECUTABLE NAMES python3 python)
 set(_olr_windows_tool_env)
 if(WIN32)
     find_program(OLR_GIT_BASH
@@ -107,6 +108,16 @@ if(APPLE AND NOT IOS)
         TIMEOUT 240
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
+endif()
+
+if(OLR_PYTHON3_EXECUTABLE)
+    add_test(NAME tst_macos_app_driver_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_macos_app_driver_static.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/macos_app_driver.py")
+    set_tests_properties(tst_macos_app_driver_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
 endif()
 
 add_test(NAME e2e_ndi_output

@@ -28,7 +28,7 @@ private slots:
     void pausedStepUsesPriorFrameCoverage();
     void coveredSeekCommitsPlayheadBeforeWorkerRuns();
     void coveredSeekPublishesLiveCacheForInstantSnapshot();
-    void pausedCoveredSeekDoesNotResetOutputRuntimeSynchronously();
+    void pausedCoveredSeekDiscardsPendingOutputWithoutRewindingFrameIndex();
     void reuseAtAcceptsSelectedFeedWhenOtherFeedMissing();
     void reuseAtAcceptsPriorFrameCoverageForLowerCadenceInputs();
     void priorFrameAtFrameDurationBoundaryDoesNotCoverSeek();
@@ -94,6 +94,24 @@ const OutputEndpoint* findEndpoint(const QList<OutputEndpoint>& endpoints, Outpu
 const AsyncGpuReadbackSink* asAsyncSink(const OutputEndpoint* endpoint) {
     return endpoint ? dynamic_cast<const AsyncGpuReadbackSink*>(endpoint->sink) : nullptr;
 }
+
+class CountingDiscardSink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        m_active = assignment.enabled && rate.isValid();
+        return m_active;
+    }
+    void stop() override { m_active = false; }
+    bool isActive() const override { return m_active; }
+    bool submit(const OutputBusFrame&) override { return m_active; }
+    void discardPending() override { ++discardPendingCalls; }
+
+    int discardPendingCalls = 0;
+
+private:
+    bool m_active = false;
+};
 
 FrameHandle testVideoFrame(int feed, qint64 ptsMs, uchar y) {
     FrameHandle frame = solidYuv420pHandle(4, 4, y, 128, 128);
@@ -411,7 +429,7 @@ void TestPlaybackWorker::coveredSeekPublishesLiveCacheForInstantSnapshot() {
     QCOMPARE(frame->metadata().key.ptsMs, qint64(1000));
 }
 
-void TestPlaybackWorker::pausedCoveredSeekDoesNotResetOutputRuntimeSynchronously() {
+void TestPlaybackWorker::pausedCoveredSeekDiscardsPendingOutputWithoutRewindingFrameIndex() {
     FrameProvider feed0;
     PlaybackTransport transport;
     transport.setFrameRate(50, 1);
@@ -434,26 +452,35 @@ void TestPlaybackWorker::pausedCoveredSeekDoesNotResetOutputRuntimeSynchronously
         worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 80));
         worker.publishOutputCacheLocked();
     }
+    CountingDiscardSink observedSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
             std::make_unique<OutputRuntime>(FrameRate::fromFraction(50, 1), 1, 4, 4);
+        worker.m_outputRuntime->setEndpoints(
+            {{feedAssignment(OutputTargetKind::QtPreview), &observedSink}});
+        worker.m_outputRuntime->dispatchImmediate();
+        QCOMPARE(worker.m_outputRuntime->dispatcherNextOutputFrameIndex(), qint64(1));
     }
 
     int resetCount = -1;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         resetCount = worker.m_outputRuntime->playEpochResetCountForTest();
+        QCOMPARE(resetCount, 0);
+        QCOMPARE(observedSink.discardPendingCalls, 0);
     }
-    QCOMPARE(resetCount, 0);
 
     worker.seekTo(1000, -1);
 
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime->setEndpoints({});
         resetCount = worker.m_outputRuntime->playEpochResetCountForTest();
+        QCOMPARE(worker.m_outputRuntime->dispatcherNextOutputFrameIndex(), qint64(2));
     }
-    QCOMPARE(resetCount, 0);
+    QCOMPARE(resetCount, 1);
+    QCOMPARE(observedSink.discardPendingCalls, 1);
 }
 
 void TestPlaybackWorker::reuseAtAcceptsSelectedFeedWhenOtherFeedMissing() {

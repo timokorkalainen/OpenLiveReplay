@@ -193,7 +193,7 @@ void PlaybackWorker::seekTo(int64_t timestampMs, int directionHint) {
         committedFromPublishedCache = true;
     }
     const bool playing = m_transport && m_transport->isPlaying();
-    if (committedFromPublishedCache || playing) refreshOutputAfterSeekCommit(playing);
+    if (committedFromPublishedCache || playing) refreshOutputAfterSeekCommit();
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {

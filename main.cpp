@@ -2,6 +2,8 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QTimer>
+#include <QWindow>
 #ifdef Q_OS_IOS
 #include <QtPlugin>
 Q_IMPORT_PLUGIN(OlrStylePlugin)
@@ -17,6 +19,8 @@ Q_IMPORT_PLUGIN(OlrStylePlugin)
 #include "websocket/uimanagercontroladapter.h"
 #if defined(Q_OS_IOS)
 #include "ios/ios_scene.h"
+#elif defined(Q_OS_MACOS)
+#include "macos/macos_window_activation.h"
 #endif
 #include <QHostAddress>
 #include <QDebug>
@@ -31,6 +35,11 @@ int main(int argc, char* argv[]) {
     QGuiApplication app(argc, argv);
 #if defined(Q_OS_IOS)
     installIosGpuLifecycleIfEnabled();
+#elif defined(Q_OS_MACOS)
+    const bool forceVisualE2eActivation = qEnvironmentVariableIsSet("OLR_APP_E2E_FORCE_ACTIVATE");
+    if (forceVisualE2eActivation) {
+        olrPrepareMacWindowActivation();
+    }
 #endif
 
     // Bespoke broadcast-console look: select the OlrStyle custom QQC2 style and fall
@@ -183,6 +192,41 @@ int main(int argc, char* argv[]) {
     // qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
     // qmlEngine.load(QUrl(u":/qt/qml/OpenLiveReplay/Main.qml"_s));
     qmlEngine.load(QUrl(u"qrc:/qt/qml/OpenLiveReplay/Main.qml"_s));
+#if !defined(Q_OS_IOS)
+    const bool visualE2eDebug = qEnvironmentVariableIsSet("OLR_APP_E2E_VISUAL_DEBUG");
+#if !defined(Q_OS_MACOS)
+    const bool forceVisualE2eActivation = false;
+#endif
+    if (visualE2eDebug) {
+        qInfo() << "OLR_APP_WINDOW_DIAG roots" << qmlEngine.rootObjects().size();
+    }
+    for (QObject* root : qmlEngine.rootObjects()) {
+        if (visualE2eDebug) {
+            qInfo() << "OLR_APP_WINDOW_DIAG root" << root->metaObject()->className() << "visible"
+                    << root->property("visible") << "visibility" << root->property("visibility");
+        }
+        if (auto* window = qobject_cast<QWindow*>(root)) {
+            const auto activateWindow = [window]() {
+                window->show();
+                window->raise();
+                window->requestActivate();
+#if defined(Q_OS_MACOS)
+                olrRequestMacWindowActivation(window->winId());
+#endif
+            };
+            if (forceVisualE2eActivation) {
+                activateWindow();
+                QTimer::singleShot(0, window, activateWindow);
+                QTimer::singleShot(250, window, activateWindow);
+            }
+            if (visualE2eDebug) {
+                qInfo() << "OLR_APP_WINDOW_DIAG window"
+                        << "visible" << window->isVisible() << "visibility" << window->visibility()
+                        << "geometry" << window->geometry();
+            }
+        }
+    }
+#endif
 
     return app.exec();
 }

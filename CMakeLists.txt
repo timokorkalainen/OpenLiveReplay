@@ -844,6 +844,11 @@ target_link_libraries(OpenLiveReplay PRIVATE
     olr_warnings
     olr_sanitize
 )
+if(APPLE AND NOT IOS)
+    target_sources(OpenLiveReplay PRIVATE
+        macos/macos_window_activation.h macos/macos_window_activation.mm)
+    target_link_libraries(OpenLiveReplay PRIVATE "-framework AppKit")
+endif()
 if(IOS)
     target_link_libraries(OpenLiveReplay PRIVATE OlrStyleplugin)
 endif()
