@@ -561,7 +561,7 @@ if(OLR_GPU_PIPELINE)
         TIMEOUT 240
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
-        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_QT_PREVIEW_SYNC_FLUSH=1")
 
     add_test(NAME e2e_play_gpu_playlist_jumpstress
         COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist-jumpstress 2 23520)
