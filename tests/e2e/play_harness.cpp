@@ -1403,7 +1403,8 @@ int main(int argc, char** argv) {
                             (long long) err);
                 });
             mon->start(16);
-            const int stressFinishMs = int(qBound<qint64>(3500, durMs / 5, qint64(6000)));
+            const int stressFinishMs =
+                int(qBound<qint64>(qint64(3500), qint64(durMs) / 5, qint64(6000)));
             QTimer::singleShot(stressFinishMs, &app, finish);
 
         } else if (scen == "devicelost") {
