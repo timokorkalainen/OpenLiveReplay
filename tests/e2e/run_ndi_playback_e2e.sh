@@ -128,17 +128,36 @@ assert_gpu_readback_path() {
         echo "FAIL: GPU NDI playback produced no CPU materialization (gpuReadToCpuCount=$gpuReadToCpuCount)"
         fail=1
     fi
-    if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
-        echo "FAIL: GPU NDI playback produced no readback telemetry (gpuReadbacks=$gpuReadbacks)"
-        fail=1
-    fi
-    if ! num "$uniqueGpuReadbackSurfaces" || [ "$uniqueGpuReadbackSurfaces" -le 0 ]; then
-        echo "FAIL: GPU NDI playback produced no unique readback surfaces (uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
-        fail=1
-    fi
-    if num "$gpuReadbacks" && num "$uniqueGpuReadbackSurfaces" && [ "$gpuReadbacks" -ne "$uniqueGpuReadbackSurfaces" ]; then
-        echo "FAIL: GPU NDI playback read back a surface more than once (gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
-        fail=1
+    if [ "$BUS" = "multiview" ]; then
+        # The multiview bus may be composited through the CPU bridge in headless CI.
+        # PGM/feed NDI remain strict GPU-readback gates; multiview is a continuity
+        # oracle for the preview composite and accepts CPU materialization telemetry.
+        if ! num "$gpuReadbacks" || ! num "$uniqueGpuReadbackSurfaces"; then
+            echo "FAIL: GPU NDI multiview emitted non-numeric readback telemetry (gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+            fail=1
+        elif [ "$gpuReadbacks" -gt 0 ]; then
+            if [ "$uniqueGpuReadbackSurfaces" -le 0 ]; then
+                echo "FAIL: GPU NDI multiview produced readbacks without unique surface telemetry (uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+                fail=1
+            fi
+            if [ "$gpuReadbacks" -ne "$uniqueGpuReadbackSurfaces" ]; then
+                echo "FAIL: GPU NDI multiview read back a surface more than once (gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+                fail=1
+            fi
+        fi
+    else
+        if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
+            echo "FAIL: GPU NDI playback produced no readback telemetry (gpuReadbacks=$gpuReadbacks)"
+            fail=1
+        fi
+        if ! num "$uniqueGpuReadbackSurfaces" || [ "$uniqueGpuReadbackSurfaces" -le 0 ]; then
+            echo "FAIL: GPU NDI playback produced no unique readback surfaces (uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+            fail=1
+        fi
+        if num "$gpuReadbacks" && num "$uniqueGpuReadbackSurfaces" && [ "$gpuReadbacks" -ne "$uniqueGpuReadbackSurfaces" ]; then
+            echo "FAIL: GPU NDI playback read back a surface more than once (gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+            fail=1
+        fi
     fi
     if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
         echo "FAIL: GPU NDI playback redundant readbacks=$redundantGpuReadbacks"

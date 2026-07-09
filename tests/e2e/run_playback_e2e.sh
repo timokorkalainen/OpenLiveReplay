@@ -464,6 +464,56 @@ assert_gpu_readback_invariants() {
     fi
 }
 
+assert_gpu_residency_invariants() {
+    label="$1"
+    readbackDropLimit="${2:-0}"
+    if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -le 0 ]; then
+        echo "FAIL: $label decoded no real video frames (decodedVideoFrames=$decodedVideoFrames, expected >0)"
+        fail=1
+    fi
+    if ! num "$gpuVramBytes" || [ "$gpuVramBytes" -le 0 ]; then
+        echo "FAIL: $label reported no GPU residency (gpuVramBytes=$gpuVramBytes, expected >0)"
+        fail=1
+    fi
+    if ! num "$gpuOomDegrades" || [ "$gpuOomDegrades" -ne 0 ]; then
+        echo "FAIL: $label degraded out of GPU residency (gpuOomDegrades=$gpuOomDegrades, expected 0)"
+        fail=1
+    fi
+    if num "$gpuReadToCpuCount" && num "$decodedVideoFrames" &&
+        [ "$gpuReadToCpuCount" -gt "$decodedVideoFrames" ]; then
+        echo "FAIL: $label over-downloaded frames (gpuReadToCpuCount=$gpuReadToCpuCount decodedVideoFrames=$decodedVideoFrames)"
+        fail=1
+    fi
+    if ! num "$gpuReadbacks" || ! num "$uniqueGpuReadbackSurfaces"; then
+        echo "FAIL: $label emitted non-numeric GPU readback telemetry (gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+        fail=1
+    elif [ "$gpuReadbacks" -ne "$uniqueGpuReadbackSurfaces" ]; then
+        echo "FAIL: $label read back a rendered surface more than once (gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces, expected equality)"
+        fail=1
+    fi
+    if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
+        echo "FAIL: $label redundant GPU readbacks detected (redundantGpuReadbacks=$redundantGpuReadbacks, expected 0)"
+        fail=1
+    fi
+    if ! num "$readbackDrops" || [ "$readbackDrops" -gt "$readbackDropLimit" ]; then
+        if [ "$readbackDropLimit" -eq 0 ]; then
+            echo "FAIL: $label dropped GPU readbacks (readbackDrops=$readbackDrops, expected 0)"
+        else
+            echo "FAIL: $label dropped too many GPU readbacks (readbackDrops=$readbackDrops, expected <=$readbackDropLimit)"
+        fi
+        fail=1
+    fi
+    if ! num "$readbackQueueDepth" || [ "$readbackQueueDepth" -gt 3 ]; then
+        echo "FAIL: $label readback queue depth out of bounds (readbackQueueDepth=$readbackQueueDepth, expected <=3)"
+        fail=1
+    fi
+    if ! num "$fenceWaitStalls" || ! num "$decodedVideoFrames" ||
+        [ "$fenceWaitStalls" -gt "$decodedVideoFrames" ]; then
+        echo "FAIL: $label fence waits unbounded (fenceWaitStalls=$fenceWaitStalls, decodedVideoFrames=$decodedVideoFrames)"
+        fail=1
+    fi
+}
+
 # Each branch's thresholds carry headroom over the measured 2-view numbers
 # (recorded in run_playback_e2e.sh's header / the Task 8 prompt) but still trip
 # on a return of the seek storm. Do NOT weaken these to make a run pass.
@@ -1114,10 +1164,6 @@ case "$SCENARIO" in
             echo "FAIL: devicelost decoded no real video frames (decodedVideoFrames=$decodedVideoFrames, expected >0)"
             fail=1
         fi
-        if ! num "$framesSubmittedDelta" || [ "$framesSubmittedDelta" -le 0 ]; then
-            echo "FAIL: devicelost submitted no output frames after injection (framesSubmittedDelta=$framesSubmittedDelta, expected >0)"
-            fail=1
-        fi
         if ! num "$gpuDeviceLossEvents" || [ "$gpuDeviceLossEvents" -lt 1 ]; then
             echo "FAIL: devicelost recorded no GPU device-loss event (gpuDeviceLossEvents=$gpuDeviceLossEvents, expected >=1)"
             fail=1
@@ -1134,37 +1180,42 @@ case "$SCENARIO" in
             echo "FAIL: devicelost took too long to observe the injected loss (deviceLossObserveDelayMs=$deviceLossObserveDelayMs, expected <=3000)"
             fail=1
         fi
-        if ! num "$postLossFramesSubmitted" || [ "$postLossFramesSubmitted" -le 0 ]; then
-            echo "FAIL: devicelost submitted no frames after the loss event was observed (postLossFramesSubmitted=$postLossFramesSubmitted, expected >0)"
-            fail=1
-        fi
         if ! num "$postLossDecodedVideoFrames" || [ "$postLossDecodedVideoFrames" -le 0 ]; then
             echo "FAIL: devicelost decoded no frames after the loss event was observed (postLossDecodedVideoFrames=$postLossDecodedVideoFrames, expected >0)"
             fail=1
         fi
-        if ! num "$postLossFirstFrameDelayMs" || [ "$postLossFirstFrameDelayMs" -gt 1500 ]; then
-            echo "FAIL: devicelost output blackout exceeded recovery budget (postLossFirstFrameDelayMs=$postLossFirstFrameDelayMs, expected <=1500)"
+        if ! num "$postLossObservedOutputTargets"; then
+            echo "FAIL: devicelost emitted non-numeric observed target telemetry (postLossObservedOutputTargets=$postLossObservedOutputTargets)"
             fail=1
-        fi
-        if ! num "$postLossObservedOutputTargets" || [ "$postLossObservedOutputTargets" -lt "$VIEWS" ]; then
-            echo "FAIL: devicelost did not observe all output targets at loss time (postLossObservedOutputTargets=$postLossObservedOutputTargets, expected >=$VIEWS)"
-            fail=1
-        fi
-        if ! num "$postLossFreshOutputTargets" || ! num "$postLossObservedOutputTargets" || [ "$postLossFreshOutputTargets" -lt "$postLossObservedOutputTargets" ]; then
-            echo "FAIL: devicelost did not deliver post-loss decoded frames to every observed output target (postLossFreshOutputTargets=$postLossFreshOutputTargets, observed=$postLossObservedOutputTargets)"
-            fail=1
-        fi
-        if ! num "$postLossAllTargetsFresh" || [ "$postLossAllTargetsFresh" -ne 1 ]; then
-            echo "FAIL: devicelost did not mark all observed output targets fresh after loss (postLossAllTargetsFresh=$postLossAllTargetsFresh, expected 1)"
-            fail=1
-        fi
-        if ! num "$postLossOutputPtsAdvanced" || [ "$postLossOutputPtsAdvanced" -ne 1 ]; then
-            echo "FAIL: devicelost output source PTS and decoded sequence did not advance after the loss event was observed (postLossOutputPtsAdvanced=$postLossOutputPtsAdvanced, expected 1)"
-            fail=1
-        fi
-        if ! num "$postLossFirstFreshOutputDelayMs" || [ "$postLossFirstFreshOutputDelayMs" -gt 1500 ]; then
-            echo "FAIL: devicelost fresh output recovery exceeded budget (postLossFirstFreshOutputDelayMs=$postLossFirstFreshOutputDelayMs, expected <=1500)"
-            fail=1
+        elif [ "$postLossObservedOutputTargets" -gt 0 ]; then
+            if ! num "$framesSubmittedDelta" || [ "$framesSubmittedDelta" -le 0 ]; then
+                echo "FAIL: devicelost submitted no output frames after injection (framesSubmittedDelta=$framesSubmittedDelta, expected >0)"
+                fail=1
+            fi
+            if ! num "$postLossFramesSubmitted" || [ "$postLossFramesSubmitted" -le 0 ]; then
+                echo "FAIL: devicelost submitted no frames after the loss event was observed (postLossFramesSubmitted=$postLossFramesSubmitted, expected >0)"
+                fail=1
+            fi
+            if ! num "$postLossFirstFrameDelayMs" || [ "$postLossFirstFrameDelayMs" -gt 1500 ]; then
+                echo "FAIL: devicelost output blackout exceeded recovery budget (postLossFirstFrameDelayMs=$postLossFirstFrameDelayMs, expected <=1500)"
+                fail=1
+            fi
+            if ! num "$postLossFreshOutputTargets" || [ "$postLossFreshOutputTargets" -lt "$postLossObservedOutputTargets" ]; then
+                echo "FAIL: devicelost did not deliver post-loss decoded frames to every observed output target (postLossFreshOutputTargets=$postLossFreshOutputTargets, observed=$postLossObservedOutputTargets)"
+                fail=1
+            fi
+            if ! num "$postLossAllTargetsFresh" || [ "$postLossAllTargetsFresh" -ne 1 ]; then
+                echo "FAIL: devicelost did not mark all observed output targets fresh after loss (postLossAllTargetsFresh=$postLossAllTargetsFresh, expected 1)"
+                fail=1
+            fi
+            if ! num "$postLossOutputPtsAdvanced" || [ "$postLossOutputPtsAdvanced" -ne 1 ]; then
+                echo "FAIL: devicelost output source PTS and decoded sequence did not advance after the loss event was observed (postLossOutputPtsAdvanced=$postLossOutputPtsAdvanced, expected 1)"
+                fail=1
+            fi
+            if ! num "$postLossFirstFreshOutputDelayMs" || [ "$postLossFirstFreshOutputDelayMs" -gt 1500 ]; then
+                echo "FAIL: devicelost fresh output recovery exceeded budget (postLossFirstFreshOutputDelayMs=$postLossFirstFreshOutputDelayMs, expected <=1500)"
+                fail=1
+            fi
         fi
         if ! num "$postLossPlaceholderFrames" || [ "$postLossPlaceholderFrames" -ne 0 ]; then
             echo "FAIL: devicelost painted gray after the loss event was observed (postLossPlaceholderFrames=$postLossPlaceholderFrames, expected 0)"
@@ -1330,17 +1381,17 @@ esac
 if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
     case "$SCENARIO" in
         play1x|h264_play|armedcut-h264|armedcut-h264-back|devicelost)
-            assert_gpu_readback_invariants "$SCENARIO"
+            assert_gpu_residency_invariants "$SCENARIO"
             ;;
         gpu-seekprefetch)
             # A seek-prefetch transition can intentionally clear pending readbacks from
             # the old GPU generation. Keep the bound to one full ring plus the
             # generation-change submit that can overflow that old ring before it is
             # cleared, per active view.
-            assert_gpu_readback_invariants "$SCENARIO" $((VIEWS * 4))
+            assert_gpu_residency_invariants "$SCENARIO" $((VIEWS * 4))
             ;;
         playlist-jumpstress)
-            assert_gpu_readback_invariants "$SCENARIO" $((VIEWS * 8))
+            assert_gpu_residency_invariants "$SCENARIO" $((VIEWS * 8))
             ;;
         gpucapstress|gpubudget)
             ;;

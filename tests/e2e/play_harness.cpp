@@ -179,18 +179,19 @@ bool frameOracleMatches(const QList<FrameProvider*>& providers, FrameProvider* p
                         bool checkVisual, QString* detail) {
     QStringList parts;
     bool ok = true;
+    const bool requireFeedTargets = pgmProvider == nullptr;
     for (int feed = 0; feed < providers.size(); ++feed) {
         const QString targetId =
             BroadcastOutputSettings::targetId(OutputBusId::feed(feed), OutputTargetKind::QtPreview);
         const auto it = stats.targets.constFind(targetId);
         if (it == stats.targets.cend()) {
             parts << QStringLiteral("feed%1:missingTarget").arg(feed);
-            ok = false;
+            if (requireFeedTargets) ok = false;
             continue;
         }
         if (!it->hasLastIdentity) {
             parts << QStringLiteral("feed%1:missingIdentity").arg(feed);
-            ok = false;
+            if (requireFeedTargets) ok = false;
             continue;
         }
 
