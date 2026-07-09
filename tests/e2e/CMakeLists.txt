@@ -128,6 +128,30 @@ if(OLR_PYTHON3_EXECUTABLE)
         LABELS "unit;ci"
         TIMEOUT 30)
 
+    add_test(NAME tst_playbackworker_live_eof_trim_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_playbackworker_live_eof_trim_static.py"
+            "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
+    set_tests_properties(tst_playbackworker_live_eof_trim_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_videotoolbox_encoder_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_videotoolbox_encoder_static.py"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_videotoolbox.mm")
+    set_tests_properties(tst_videotoolbox_encoder_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_videotoolbox_decoder_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_videotoolbox_decoder_static.py"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_videotoolbox.mm")
+    set_tests_properties(tst_videotoolbox_decoder_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
     add_test(NAME tst_gpucompositor_static
         COMMAND "${OLR_PYTHON3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/test_gpucompositor_static.py"
@@ -152,6 +176,22 @@ if(OLR_PYTHON3_EXECUTABLE)
             "${CMAKE_CURRENT_SOURCE_DIR}/test_ios_marker_oracle_static.py"
             "${CMAKE_CURRENT_SOURCE_DIR}/ios_marker_srt_oracle.py")
     set_tests_properties(tst_ios_marker_oracle_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_control_adapter_wait_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_control_adapter_wait_static.py"
+            "${CMAKE_SOURCE_DIR}/websocket/uimanagercontroladapter.cpp")
+    set_tests_properties(tst_control_adapter_wait_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_pgmstage_videooutput_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_pgmstage_videooutput_static.py"
+            "${CMAKE_SOURCE_DIR}/ui/components/PgmStage.qml")
+    set_tests_properties(tst_pgmstage_videooutput_static PROPERTIES
         LABELS "unit;ci"
         TIMEOUT 30)
 endif()

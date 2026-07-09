@@ -11,11 +11,12 @@ import argparse
 import json
 import os
 import re
-import select
+import queue
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -328,27 +329,52 @@ def restore_config(args, backup):
 def launch_app(args):
     env = {
         "OLR_CONTROL_BIND": "any",
+        "OLR_E2E_LATENCY_TRACE": "1",
         "OLR_PB_TELEMETRY": "1",
     }
     if args.launch_gpu_pipeline:
         env["OLR_GPU_PIPELINE"] = "1"
-    run(
-        [
-            "xcrun",
-            "devicectl",
-            "device",
-            "process",
-            "launch",
-            "--device",
-            args.device,
-            "--terminate-existing",
-            "--environment-variables",
-            json.dumps(env, separators=(",", ":")),
-            args.bundle,
-        ],
-        check=True,
-    )
+    cmd = [
+        "xcrun",
+        "devicectl",
+        "device",
+        "process",
+        "launch",
+        "--device",
+        args.device,
+        "--terminate-existing",
+        "--environment-variables",
+        json.dumps(env, separators=(",", ":")),
+    ]
+    if args.launch_console_log:
+        cmd.append("--console")
+    cmd.append(args.bundle)
+
+    console_proc = None
+    if args.launch_console_log:
+        args.launch_console_log.parent.mkdir(parents=True, exist_ok=True)
+        log = args.launch_console_log.open("w", encoding="utf-8")
+        console_proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+    else:
+        run(cmd, check=True)
     time.sleep(args.launch_wait_seconds)
+    if console_proc and console_proc.poll() is not None:
+        raise RuntimeError(
+            f"console launch exited early with {console_proc.returncode}; "
+            f"see {args.launch_console_log}"
+        )
+    return console_proc
+
+
+def stop_console_launch(proc):
+    if not proc or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=2)
 
 
 def drain(ws, seconds):
@@ -389,6 +415,9 @@ class NdiMarkerWatcher:
         self.started_at = None
         self.last_drained_marker = None
         self.last_drained_frames_decoded = None
+        self._lines = queue.SimpleQueue()
+        self._reader_done = threading.Event()
+        self._reader_thread = None
 
     def start(self):
         self.started_at = time.monotonic()
@@ -407,24 +436,41 @@ class NdiMarkerWatcher:
             bufsize=1,
             env=env,
         )
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            name="olr-ios-ndi-probe-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
 
-    def _read_lines(self, timeout):
+    def _reader_loop(self):
+        try:
+            if not self.proc or not self.proc.stdout:
+                return
+            for raw in self.proc.stdout:
+                arrived_at = time.perf_counter()
+                line = raw.rstrip()
+                self.log.write(line + "\n")
+                self.log.flush()
+                self._lines.put((arrived_at, line))
+        finally:
+            self._reader_done.set()
+
+    def _read_line_samples(self, timeout):
         if not self.proc or not self.proc.stdout:
             raise RuntimeError("NDI marker watcher was not started")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             wait = max(0.0, min(0.1, deadline - time.monotonic()))
-            readable, _, _ = select.select([self.proc.stdout], [], [], wait)
-            if not readable:
+            try:
+                yield self._lines.get(timeout=wait)
+            except queue.Empty:
                 if self.proc.poll() is not None:
                     break
                 continue
-            line = self.proc.stdout.readline()
-            if not line:
-                break
-            line = line.rstrip()
-            self.log.write(line + "\n")
-            self.log.flush()
+
+    def _read_lines(self, timeout):
+        for _, line in self._read_line_samples(timeout):
             yield line
 
     def wait_ready(self, timeout):
@@ -459,10 +505,15 @@ class NdiMarkerWatcher:
         last_marker = None
         last_frames_decoded = None
         while True:
-            lines = list(self._read_lines(0.001))
-            if not lines:
+            samples = []
+            try:
+                while True:
+                    samples.append(self._lines.get_nowait())
+            except queue.Empty:
+                pass
+            if not samples:
                 break
-            for line in lines:
+            for _, line in samples:
                 fields = self._marker_fields(line)
                 if fields:
                     last_marker = int(fields["marker"])
@@ -478,10 +529,11 @@ class NdiMarkerWatcher:
             return 0
         return int((time.monotonic() - self.started_at) * 1000)
 
-    def wait_for_marker(self, expected, label, timeout, *, min_frames_decoded=None):
+    def _wait_for_marker_sample(self, expected, label, timeout, *, min_frames_decoded=None,
+                                latency_started_at=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            for line in self._read_lines(max(0.01, deadline - time.monotonic())):
+            for arrived_at, line in self._read_line_samples(max(0.01, deadline - time.monotonic())):
                 fields = self._marker_fields(line)
                 if not fields:
                     continue
@@ -493,17 +545,50 @@ class NdiMarkerWatcher:
                 if min_frames_decoded is not None and frames_decoded <= min_frames_decoded:
                     continue
                 if marker == expected:
+                    latency_ms = (
+                        (arrived_at - latency_started_at) * 1000.0
+                        if latency_started_at is not None else None
+                    )
                     print(
                         f"NDI_MATCH {label} marker={marker} elapsedMs={elapsed_ms} "
                         f"framesDecoded={frames_decoded}"
                     )
-                    return marker
+                    return {
+                        "marker": marker,
+                        "probeElapsedMs": elapsed_ms,
+                        "framesDecoded": frames_decoded,
+                        "latencyMs": latency_ms,
+                        "line": line,
+                    }
             if self.proc and self.proc.poll() is not None:
                 raise RuntimeError(f"ndi_recv_probe exited while waiting for {label}; see {self.log.name}")
         raise AssertionError(
             f"NDI PGM did not show marker {expected} for {label}; "
             f"recent={self.last_markers} log={self.log.name}"
         )
+
+    def wait_for_marker(self, expected, label, timeout, *, min_frames_decoded=None):
+        return self._wait_for_marker_sample(
+            expected,
+            label,
+            timeout,
+            min_frames_decoded=min_frames_decoded,
+        )["marker"]
+
+    def wait_for_marker_with_latency(self, expected, label, timeout, latency_started_at,
+                                     threshold_ms, *, min_frames_decoded=None):
+        sample = self._wait_for_marker_sample(
+            expected,
+            label,
+            timeout,
+            min_frames_decoded=min_frames_decoded,
+            latency_started_at=latency_started_at,
+        )
+        latency_ms = sample["latencyMs"]
+        if latency_ms is None:
+            raise AssertionError(f"{label}: NDI latency sample missing")
+        sample["thresholdMs"] = threshold_ms
+        return sample
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -513,6 +598,8 @@ class NdiMarkerWatcher:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=2)
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2)
         self.log.close()
 
 
@@ -534,6 +621,72 @@ def require_pgm_transaction(ack, label):
         f"placeholder={identity.get('videoPlaceholder')}"
     )
     return transaction
+
+
+def send_command_for_latency(ws, name, args=None):
+    cmd_id = f"{name}-{int(time.time() * 1000)}-{os.getpid()}-latency"
+    command_args = dict(args or {})
+    if name in ("transport.seek", "transport.stepFrame", "action.jog"):
+        command_args.setdefault("waitForPgm", True)
+    ws.send_json({"type": "command", "id": cmd_id, "name": name, "args": command_args})
+    return cmd_id
+
+
+def wait_for_command_ack(ws, cmd_id, name, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        msg = ws.recv_json(max(0.1, deadline - time.monotonic()))
+        if msg.get("type") == "ack" and msg.get("id") == cmd_id:
+            if not msg.get("ok"):
+                raise RuntimeError(f"{name} failed: {msg}")
+            return msg
+    raise TimeoutError(f"timed out waiting for ack to {name}")
+
+
+def run_command_with_ndi_latency(args, ws, ndi, label, expected_marker, name,
+                                 command_args=None, *, timeout=10.0):
+    if not ndi:
+        return command(ws, name, command_args or {}, timeout=timeout), None
+
+    min_frames_decoded = ndi.drain()
+    started = time.perf_counter()
+    cmd_id = send_command_for_latency(ws, name, command_args or {})
+    sample = ndi.wait_for_marker_with_latency(
+        expected_marker,
+        label,
+        args.ndi_marker_timeout,
+        started,
+        args.latency_threshold_ms,
+        min_frames_decoded=min_frames_decoded,
+    )
+    command_ack = wait_for_command_ack(ws, cmd_id, name, timeout)
+    command_elapsed_ms = (time.perf_counter() - started) * 1000.0
+    transaction = command_ack.get("pgmTransaction") if isinstance(command_ack, dict) else None
+    transaction_elapsed_ns = transaction.get("elapsedNs") if isinstance(transaction, dict) else "?"
+    latency_ms = sample["latencyMs"]
+    if latency_ms > args.latency_threshold_ms:
+        raise AssertionError(
+            "PGM NDI marker latency exceeded threshold "
+            f"label={label} expected={expected_marker} elapsedMs={latency_ms:.2f} "
+            f"max_ndi_latency_ms={args.latency_threshold_ms:.2f} "
+            f"commandElapsedMs={command_elapsed_ms:.2f} "
+            f"pgmTransactionElapsedNs={transaction_elapsed_ns} "
+            f"lastDrainedMarker={ndi.last_drained_marker} "
+            f"lastDrainedFramesDecoded={ndi.last_drained_frames_decoded} "
+            f"line={sample['line']}"
+        )
+    print(
+        "NDI_LATENCY "
+        f"label={label} marker={expected_marker} elapsedMs={latency_ms:.2f} "
+        f"max_ndi_latency_ms={args.latency_threshold_ms:.2f} "
+        f"commandElapsedMs={command_elapsed_ms:.2f} "
+        f"pgmTransactionElapsedNs={transaction_elapsed_ns} "
+        f"framesDecoded={sample['framesDecoded']} "
+        f"lastDrainedMarker={ndi.last_drained_marker} "
+        f"lastDrainedFramesDecoded={ndi.last_drained_frames_decoded}"
+    )
+    sample["commandElapsedMs"] = command_elapsed_ms
+    return command_ack, sample
 
 
 def decode_marker(args, jpeg):
@@ -660,6 +813,7 @@ def run_oracle(args, workdir, srt_url):
     ws = WsClient(args.app_host, args.control_port, timeout=5)
     ndi = None
     results = []
+    ndi_latency_samples = []
     failures = []
     try:
         ws.wait_for(lambda: bool(ws.state), 5, "initial websocket state")
@@ -721,7 +875,12 @@ def run_oracle(args, workdir, srt_url):
 
         command(ws, "transport.pause", timeout=5)
         seek_min_frames = ndi.drain() if ndi else None
-        seek_ack = command(ws, "transport.seek", {"positionMs": args.target_ms}, timeout=10)
+        seek_ack = command(
+            ws,
+            "transport.seek",
+            {"positionMs": args.target_ms, "waitForPgm": True},
+            timeout=10,
+        )
         require_pgm_transaction(seek_ack, "seek_target")
         time.sleep(args.step_delay_seconds)
 
@@ -752,22 +911,27 @@ def run_oracle(args, workdir, srt_url):
         steps = parse_steps(args.steps)
         for index, delta in enumerate(steps, start=1):
             before = int(ws.state.get("transport", {}).get("positionMs", -1))
-            step_min_frames = ndi.drain() if ndi else None
-            step_ack = command(ws, "transport.stepFrame", {"frames": delta}, timeout=10)
             label = f"step_{index:03d}_{'fwd' if delta > 0 else 'back'}"
+            expected = base_marker + cumulative + delta
+            step_ack, ndi_sample = run_command_with_ndi_latency(
+                args,
+                ws,
+                ndi,
+                label,
+                expected,
+                "transport.stepFrame",
+                {"frames": delta},
+                timeout=10,
+            )
             require_pgm_transaction(step_ack, label)
+            if ndi_sample:
+                ndi_latency_samples.append(ndi_sample["latencyMs"])
             time.sleep(args.step_delay_seconds)
             drain(ws, 0.2)
             position = int(ws.state.get("transport", {}).get("positionMs", -1))
             cumulative += delta
-            expected = base_marker + cumulative
             marker, path, probe = capture_marker(args, ws, workdir, label)
-            ndi_marker = ndi.wait_for_marker(
-                expected,
-                label,
-                args.ndi_marker_timeout,
-                min_frames_decoded=step_min_frames,
-            ) if ndi else None
+            ndi_marker = ndi_sample["marker"] if ndi_sample else None
             ok = marker == expected and (ndi_marker is None or ndi_marker == expected)
             row = {
                 "label": label,
@@ -779,6 +943,7 @@ def run_oracle(args, workdir, srt_url):
                 "expectedMarker": expected,
                 "ok": ok,
                 "pgmTransaction": step_ack.get("pgmTransaction"),
+                "ndiLatencyMs": ndi_sample["latencyMs"] if ndi_sample else None,
                 "path": str(path),
                 "probe": probe,
             }
@@ -799,18 +964,23 @@ def run_oracle(args, workdir, srt_url):
             target_ms = frame_index_to_ms(target_frame, args.fps)
             expected = base_marker + (target_frame - base_frame)
             label = f"cold_seek_{index:02d}"
-            cold_min_frames = ndi.drain() if ndi else None
-            cold_ack = command(ws, "transport.seek", {"positionMs": target_ms}, timeout=10)
+            cold_ack, ndi_sample = run_command_with_ndi_latency(
+                args,
+                ws,
+                ndi,
+                label,
+                expected,
+                "transport.seek",
+                {"positionMs": target_ms},
+                timeout=10,
+            )
             require_pgm_transaction(cold_ack, label)
+            if ndi_sample:
+                ndi_latency_samples.append(ndi_sample["latencyMs"])
             time.sleep(args.step_delay_seconds)
             drain(ws, 0.2)
             marker, path, probe = capture_marker(args, ws, workdir, label)
-            ndi_marker = ndi.wait_for_marker(
-                expected,
-                label,
-                args.ndi_marker_timeout,
-                min_frames_decoded=cold_min_frames,
-            ) if ndi else None
+            ndi_marker = ndi_sample["marker"] if ndi_sample else None
             ok = marker == expected and (ndi_marker is None or ndi_marker == expected)
             row = {
                 "label": label,
@@ -822,6 +992,7 @@ def run_oracle(args, workdir, srt_url):
                 "expectedMarker": expected,
                 "ok": ok,
                 "pgmTransaction": cold_ack.get("pgmTransaction"),
+                "ndiLatencyMs": ndi_sample["latencyMs"] if ndi_sample else None,
                 "path": str(path),
                 "probe": probe,
             }
@@ -842,6 +1013,10 @@ def run_oracle(args, workdir, srt_url):
             "coldSeekCount": cold_seek_count,
             "firstMarker": base_marker,
             "lastMarker": results[-1]["marker"],
+            "ndiLatencySamples": len(ndi_latency_samples),
+            "expectedNdiLatencySamples": len(steps) + cold_seek_count if ndi else 0,
+            "maxNdiLatencyMs": max(ndi_latency_samples) if ndi_latency_samples else None,
+            "latencyThresholdMs": args.latency_threshold_ms if ndi else None,
             "srtUrl": srt_url,
         }
         (workdir / "results.json").write_text(
@@ -872,6 +1047,7 @@ def main():
     parser.add_argument("--ndi-marker-timeout", type=float, default=2.5)
     parser.add_argument("--ndi-probe-timeout-ms", type=int, default=900000)
     parser.add_argument("--ndi-find-timeout-ms", type=int, default=30000)
+    parser.add_argument("--latency-threshold-ms", type=float, default=25.0)
     parser.add_argument("--bundle", default=DEFAULT_BUNDLE)
     parser.add_argument("--control-port", type=int, default=8115)
     parser.add_argument("--srt-port", type=int, default=32900)
@@ -895,6 +1071,8 @@ def main():
     parser.add_argument("--launch-app", action="store_true",
                         help="relaunch the iOS app with GPU and WebSocket test env after config push")
     parser.add_argument("--launch-wait-seconds", type=float, default=4.0)
+    parser.add_argument("--launch-console-log", type=Path,
+                        help="capture CoreDevice app console output while the oracle runs")
     parser.add_argument("--launch-without-gpu", dest="launch_gpu_pipeline", action="store_false")
     parser.add_argument("--no-stop-active-recording", dest="stop_active_recording",
                         action="store_false")
@@ -920,6 +1098,7 @@ def main():
 
     producer_processes = []
     producer_logs = []
+    console_process = None
     backup = None
     srt_url = f"srt://{args.mac_host}:{args.srt_port}?transtype=live"
     print(f"IOS_MARKER_ORACLE workdir={workdir} srtUrl={srt_url}")
@@ -931,12 +1110,13 @@ def main():
             print("IOS_MARKER_ORACLE pushed marker config to iOS app container")
         if args.launch_app:
             print("IOS_MARKER_ORACLE relaunching app with OLR_CONTROL_BIND=any")
-            launch_app(args)
+            console_process = launch_app(args)
         elif not args.skip_config_push:
             print("IOS_MARKER_ORACLE relaunch the app after config push if it was already running")
         rc = run_oracle(args, workdir, srt_url)
         return rc
     finally:
+        stop_console_launch(console_process)
         if not args.no_restore_config:
             try:
                 restore_config(args, backup)

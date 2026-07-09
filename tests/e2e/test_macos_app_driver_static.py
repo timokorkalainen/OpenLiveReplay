@@ -113,6 +113,7 @@ def main():
         "ackElapsedMs",
         "commandCompletedBeforeMarker",
         "pgmTransaction",
+        "waitForPgm",
         "ackAfterPgmTransaction",
         "WebSocket ACK missing PGM transaction metadata",
         "postAckElapsedMs",

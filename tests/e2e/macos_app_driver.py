@@ -1584,7 +1584,9 @@ def main():
                         step_label,
                         expected,
                         args.latency_threshold_ms,
-                        lambda: ws.command("transport.stepFrame", {"frames": delta}),
+                        lambda: ws.command(
+                            "transport.stepFrame", {"frames": delta, "waitForPgm": True}
+                        ),
                         expected_timecode=frame_index_to_ms(current_frame) * 10000,
                     )
                     if sample is not None:
@@ -1623,7 +1625,10 @@ def main():
                     f"cold_seek_{index + 1}",
                     expected,
                     args.latency_threshold_ms,
-                    lambda: ws.command("transport.seek", {"positionMs": frame_index_to_ms(frame)}),
+                    lambda: ws.command(
+                        "transport.seek",
+                        {"positionMs": frame_index_to_ms(frame), "waitForPgm": True},
+                    ),
                     expected_timecode=frame_index_to_ms(frame) * 10000,
                 )
                 if sample is not None:

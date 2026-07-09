@@ -51,11 +51,16 @@
 #include <cstdio>
 #include <cstdlib>
 
+extern "C" {
+#include <libavformat/avformat.h>
+}
+
 #include "playback/frameprovider.h"
 #include "playback/playbacktransport.h"
 #include "playback/audioplayer.h"
 #include "playback/playbackworker.h"
 #include "playback/playlistplayout.h"
+#include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/gpureadbacktelemetry.h"
 #include "playback/output/outputdispatcher.h"
 #include "playback/output/outputtargetassignment.h"
@@ -175,7 +180,8 @@ bool frameOracleMatches(const QList<FrameProvider*>& providers, FrameProvider* p
     QStringList parts;
     bool ok = true;
     for (int feed = 0; feed < providers.size(); ++feed) {
-        const QString targetId = QStringLiteral("qt-preview-feed-%1").arg(feed);
+        const QString targetId =
+            BroadcastOutputSettings::targetId(OutputBusId::feed(feed), OutputTargetKind::QtPreview);
         const auto it = stats.targets.constFind(targetId);
         if (it == stats.targets.cend()) {
             parts << QStringLiteral("feed%1:missingTarget").arg(feed);
@@ -210,7 +216,8 @@ bool frameOracleMatches(const QList<FrameProvider*>& providers, FrameProvider* p
         if (!metaOk || !visualOk) ok = false;
     }
     if (pgmProvider) {
-        const QString targetId = QStringLiteral("qt-preview-pgm");
+        const QString targetId =
+            BroadcastOutputSettings::targetId(OutputBusId::pgm(), OutputTargetKind::QtPreview);
         const auto it = stats.targets.constFind(targetId);
         if (it == stats.targets.cend()) {
             parts << QStringLiteral("pgm:missingTarget");
@@ -249,7 +256,8 @@ bool feedOutputsCoverPts(const QList<FrameProvider*>& providers, const OutputDis
     QStringList parts;
     bool ok = true;
     for (int feed = 0; feed < providers.size(); ++feed) {
-        const QString targetId = QStringLiteral("qt-preview-feed-%1").arg(feed);
+        const QString targetId =
+            BroadcastOutputSettings::targetId(OutputBusId::feed(feed), OutputTargetKind::QtPreview);
         const auto it = stats.targets.constFind(targetId);
         if (it == stats.targets.cend() || !it->hasLastIdentity) {
             parts << QStringLiteral("feed%1:missingIdentity").arg(feed);
@@ -284,13 +292,53 @@ QHash<QString, OutputFrameIdentity> activeVideoOutputIdentities(const OutputDisp
 #endif
 
 // Probe the fixture's duration so scenarios that seek "near the end" target a
-// real position. Falls back to a conservative default if ffprobe is missing.
+// real position. Recording duration is wall-clock based, but hardware H.264
+// stress fixtures can contain less media than that when the encoder/ingest path
+// runs slower than realtime.
 int64_t probeDurationMs(const QString& file) {
-    // Best-effort: avoid a hard ffprobe dependency in the binary; the driver
-    // script records a known-length fixture, so a fixed assumption is safe for
-    // the scenarios here (they clamp internally). 25s default matches the
-    // record length in run_playback_e2e.sh for liveedge.
-    Q_UNUSED(file);
+    AVFormatContext* fmt = nullptr;
+    const QByteArray path = file.toUtf8();
+    if (avformat_open_input(&fmt, path.constData(), nullptr, nullptr) < 0) return 25000;
+    avformat_find_stream_info(fmt, nullptr);
+
+    int64_t durationMs = 0;
+    if (fmt->duration != AV_NOPTS_VALUE && fmt->duration > 0)
+        durationMs = av_rescale_q(fmt->duration, AV_TIME_BASE_Q, AVRational{1, 1000});
+
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVStream* stream = fmt->streams[i];
+        if (!stream || !stream->codecpar || stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+            continue;
+        if (stream->duration == AV_NOPTS_VALUE || stream->duration <= 0) continue;
+        durationMs = qMax<int64_t>(
+            durationMs, av_rescale_q(stream->duration, stream->time_base, AVRational{1, 1000}));
+    }
+
+    int64_t packetCoveredMs = 0;
+    AVPacket* pkt = av_packet_alloc();
+    while (pkt && av_read_frame(fmt, pkt) >= 0) {
+        const AVStream* stream =
+            pkt->stream_index >= 0 && unsigned(pkt->stream_index) < fmt->nb_streams
+                ? fmt->streams[pkt->stream_index]
+                : nullptr;
+        if (stream && stream->codecpar && stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            const int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+            if (ts != AV_NOPTS_VALUE) {
+                const int64_t ptsMs = av_rescale_q(ts, stream->time_base, AVRational{1, 1000});
+                const int64_t frameMs =
+                    pkt->duration > 0
+                        ? av_rescale_q(pkt->duration, stream->time_base, AVRational{1, 1000})
+                        : kFrameDurMs;
+                packetCoveredMs = qMax<int64_t>(packetCoveredMs, ptsMs + qMax<int64_t>(1, frameMs));
+            }
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+
+    avformat_close_input(&fmt);
+    if (packetCoveredMs > 0) return packetCoveredMs;
+    if (durationMs > 0) return durationMs;
     return 25000;
 }
 
@@ -372,6 +420,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < views; ++i)
         providers.append(new FrameProvider());
     FrameProvider pgmProvider;
+    QObject pgmPreviewConsumer;
 
     PlaybackTransport transport;
     transport.setFps(30);
@@ -390,9 +439,16 @@ int main(int argc, char** argv) {
     worker.openFile(file);
     worker.setActiveAudioView(0); // route audio for view 0
     if (isFrameOracleScenario(scen)) {
+        worker.setFeedPreviewProvidersEnabled(true);
+    }
+    if (isFrameOracleScenario(scen)) {
         worker.setSelectedOutputFeed(0);
         worker.setRequireAllOutputFeedsForPlayhead(true);
         worker.setBusPreviewProviders(nullptr, &pgmProvider);
+        pgmProvider.addDirectPreviewConsumer(&pgmPreviewConsumer);
+    } else if (scen == "gpucapstress" || scen == "gpubudget") {
+        worker.setBusPreviewProviders(nullptr, &pgmProvider);
+        pgmProvider.addDirectPreviewConsumer(&pgmPreviewConsumer);
     }
     // Tier (b): enable a real NDI output when requested, so the worker's
     // decode->cache->output-bus->NdiOutputSink path is exercised end to end. The output bus is
@@ -1311,7 +1367,7 @@ int main(int argc, char** argv) {
                 const OutputDispatchStats b = worker.outputStats();
                 *basePh = b.placeholderFrames;
                 *baseHeld = b.heldFrames;
-                const int64_t seekTarget = durMs / 3;
+                const int64_t seekTarget = durMs / 4;
                 fprintf(stderr,
                         "### %s basePh=%lld baseHeld=%lld; seek under decode to "
                         "%lldms ###\n",
@@ -1321,7 +1377,7 @@ int main(int argc, char** argv) {
                 worker.seekTo(seekTarget);
             });
             QTimer::singleShot(1600, &app, [&, capCutTarget, scenarioName]() {
-                const int64_t cutTarget = durMs / 2;
+                const int64_t cutTarget = durMs / 3;
                 *capCutTarget = cutTarget;
                 armNextCutArmed = worker.armNextCut(cutTarget) ? 1 : 0;
                 fprintf(stderr, "### %s armNextCut(%lldms) returned %d ###\n",
@@ -1346,7 +1402,8 @@ int main(int argc, char** argv) {
                             (long long) err);
                 });
             mon->start(16);
-            QTimer::singleShot(10000, &app, finish);
+            const int stressFinishMs = int(qBound<qint64>(3500, durMs / 5, qint64(6000)));
+            QTimer::singleShot(stressFinishMs, &app, finish);
 
         } else if (scen == "devicelost") {
 #ifndef OLR_GPU_PIPELINE_BUILD
