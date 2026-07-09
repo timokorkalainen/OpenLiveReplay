@@ -9,6 +9,8 @@ private slots:
     void selectedFeedMustReachFillTarget();
     void multiviewUsesPrimaryReferenceFeed();
     void explicitAllFeedModeWaitsForEveryFeed();
+    void invalidReferenceFeedFallsBackToPrimary();
+    void multiviewModeClearsSelectedFeed();
 };
 
 void TestRepositionFillPolicy::selectedFeedMustReachFillTarget() {
@@ -36,6 +38,21 @@ void TestRepositionFillPolicy::explicitAllFeedModeWaitsForEveryFeed() {
     newest[2] = 120;
     newest[3] = 120;
     QVERIFY(repositionFillReady(newest.size(), -1, true, 80, at));
+}
+
+void TestRepositionFillPolicy::invalidReferenceFeedFallsBackToPrimary() {
+    QCOMPARE(repositionReferenceFeed(4, -1), 0);
+    QCOMPARE(repositionReferenceFeed(4, 0), 0);
+    QCOMPARE(repositionReferenceFeed(4, 2), 2);
+    QCOMPARE(repositionReferenceFeed(4, 4), 0);
+    QCOMPARE(repositionReferenceFeed(4, 999), 0);
+    QCOMPARE(repositionReferenceFeed(0, 0), -1);
+}
+
+void TestRepositionFillPolicy::multiviewModeClearsSelectedFeed() {
+    QCOMPARE(playbackViewReferenceFeed(false, 2), -1);
+    QCOMPARE(playbackViewReferenceFeed(false, -1), -1);
+    QCOMPARE(playbackViewReferenceFeed(true, 2), 2);
 }
 
 QTEST_GUILESS_MAIN(TestRepositionFillPolicy)

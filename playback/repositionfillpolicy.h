@@ -3,6 +3,15 @@
 
 #include <QtGlobal>
 
+inline int repositionReferenceFeed(int feedCount, int selectedFeed) {
+    if (feedCount <= 0) return -1;
+    return selectedFeed >= 0 && selectedFeed < feedCount ? selectedFeed : 0;
+}
+
+inline int playbackViewReferenceFeed(bool singleView, int selectedFeed) {
+    return singleView ? selectedFeed : -1;
+}
+
 template <typename NewestPtsAt>
 bool repositionFillReady(int feedCount, int selectedFeed, bool requireAllFeeds, qint64 fillToMs,
                          NewestPtsAt&& newestPtsAt) {
@@ -15,8 +24,7 @@ bool repositionFillReady(int feedCount, int selectedFeed, bool requireAllFeeds, 
         return true;
     }
 
-    const int referenceFeed =
-        selectedFeed >= 0 && selectedFeed < feedCount ? selectedFeed : 0;
+    const int referenceFeed = repositionReferenceFeed(feedCount, selectedFeed);
     return newestPtsAt(referenceFeed) >= fillToMs;
 }
 

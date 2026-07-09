@@ -898,8 +898,8 @@ bool PlaybackWorker::outputCacheCoversPlayheadLocked(int64_t playheadMs, uint64_
         return true;
     }
 
-    int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
-    if (selected < 0 && m_outputFeedCount > 0) selected = 0;
+    const int selected = repositionReferenceFeed(
+        m_outputFeedCount, m_selectedOutputFeed.load(std::memory_order_relaxed));
     return outputFeedCoversPlayheadLocked(selected, playheadMs, gpuGeneration, mode);
 }
 
@@ -936,8 +936,8 @@ PlaybackWorker::outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
             candidate = qMax(candidate, *feedCandidate);
         }
     } else {
-        int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
-        if (selected < 0 && m_outputFeedCount > 0) selected = 0;
+        const int selected = repositionReferenceFeed(
+            m_outputFeedCount, m_selectedOutputFeed.load(std::memory_order_relaxed));
         const std::optional<qint64> feedCandidate = candidateForFeed(selected);
         if (!feedCandidate.has_value()) return std::nullopt;
         candidate = *feedCandidate;
@@ -954,8 +954,8 @@ PlaybackWorker::outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
             if (!hasFrameAtCandidate(feed)) return std::nullopt;
         }
     } else {
-        int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
-        if (selected < 0 && m_outputFeedCount > 0) selected = 0;
+        const int selected = repositionReferenceFeed(
+            m_outputFeedCount, m_selectedOutputFeed.load(std::memory_order_relaxed));
         if (!hasFrameAtCandidate(selected)) return std::nullopt;
     }
     return candidate;
@@ -1015,8 +1015,8 @@ bool PlaybackWorker::pausedPlayheadNeedsWork(int64_t playheadMs) {
         return false;
     }
 
-    int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
-    if (selected < 0 && m_outputFeedCount > 0) selected = 0;
+    const int selected = repositionReferenceFeed(
+        m_outputFeedCount, m_selectedOutputFeed.load(std::memory_order_relaxed));
     if (!outputFeedCoversPlayheadLocked(selected, playheadMs, gpuGeneration)) return true;
 
     return false;
@@ -1277,8 +1277,8 @@ bool PlaybackWorker::reuseAt(int64_t target) {
             if (!trackCoversTarget(track)) return false;
         }
     } else {
-        int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
-        if (selected < 0) selected = 0;
+        const int selected = repositionReferenceFeed(
+            int(m_decoderBank.size()), m_selectedOutputFeed.load(std::memory_order_relaxed));
         DecoderTrack* selectedTrack = nullptr;
         for (auto* track : m_decoderBank) {
             if (track && track->feedIndex == selected) {
@@ -1303,8 +1303,8 @@ bool PlaybackWorker::reuseAt(int64_t target) {
                     return false;
             }
         } else {
-            int selected = m_selectedOutputFeed.load(std::memory_order_relaxed);
-            if (selected < 0) selected = 0;
+            const int selected = repositionReferenceFeed(
+                m_outputFeedCount, m_selectedOutputFeed.load(std::memory_order_relaxed));
             if (!outputFeedCoversPlayheadLocked(selected, target, gpuGeneration,
                                                 OutputCoverageMode::OperatorSeek))
                 return false;
@@ -2363,9 +2363,8 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     // transport playhead so 1x playback advances every tick; while a reposition
     // for the latest seek is in flight it holds the last committed playhead so
     // the snapshot never reports a new playhead against a not-yet-ready cache.
-    snapshot.state.selectedFeedIndex = m_selectedOutputFeed.load(std::memory_order_relaxed);
-    if (snapshot.state.selectedFeedIndex < 0 && m_outputFeedCount > 0)
-        snapshot.state.selectedFeedIndex = 0;
+    snapshot.state.selectedFeedIndex = repositionReferenceFeed(
+        m_outputFeedCount, m_selectedOutputFeed.load(std::memory_order_relaxed));
 
     const qint64 transportPlayhead = m_transport ? m_transport->currentPos() : 0;
     const bool transportPlaying = m_transport && m_transport->isPlaying();
@@ -3204,7 +3203,7 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     // standalone (no reference-frame priming needed), but a seek does NOT discard
     // frames already DECODED and queued before it: on a BACKWARD seek the first
     // avcodec_receive_frame would otherwise return a stale frame from the old
-    // (forward) position, whose PTS trips the `newestPtsMin() >= fillTo` break
+    // (forward) position, whose PTS can satisfy reference-feed fill readiness
     // below so the fill aborts with the bank still parked forward — the reposition
     // then has to be retried (2-3 reactive backward-jumps) before the stale frames
     // drain. Flushing here makes a single reposition resync the bank deterministically.

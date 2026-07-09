@@ -6,6 +6,7 @@
 #include "playback/livefollowpolicy.h"
 #include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/broadcastoutputstatus.h"
+#include "playback/repositionfillpolicy.h"
 #include "project/projectimportclient.h"
 #include "recorder_engine/timing/timecode.h"
 #include "telemetry/telemetryclient.h"
@@ -1811,7 +1812,8 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
 
     // Route audio for the selected track (or mute in multiview)
     if (m_playbackWorker) {
-        m_playbackWorker->setSelectedOutputFeed(selectedIndex);
+        m_playbackWorker->setSelectedOutputFeed(
+            playbackViewReferenceFeed(singleView, selectedIndex));
         m_playbackWorker->setRequireAllOutputFeedsForPlayhead(false);
         m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
     }
@@ -1905,7 +1907,8 @@ void UIManager::startRecording() {
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
-    m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setSelectedOutputFeed(
+        playbackViewReferenceFeed(m_playbackSingleView, m_playbackSelectedIndex));
     m_playbackWorker->setRequireAllOutputFeedsForPlayhead(false);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     wirePlaybackWorkerCompletion();
@@ -1933,7 +1936,8 @@ void UIManager::restartPlaybackWorker() {
 
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
-    m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setSelectedOutputFeed(
+        playbackViewReferenceFeed(m_playbackSingleView, m_playbackSelectedIndex));
     m_playbackWorker->setRequireAllOutputFeedsForPlayhead(false);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     wirePlaybackWorkerCompletion();
