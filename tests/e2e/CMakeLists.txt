@@ -481,6 +481,12 @@ add_test(NAME e2e_play_livegrow
 add_test(NAME e2e_play_4view
     COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" play1x 4 23476)
+# Four-track cold early seek: force a far reposition first so the 40 ms window
+# is no longer cached, then verify all interleaved feeds can refill without a
+# retry loop when their first packets arrive at different offsets.
+add_test(NAME e2e_play_interleaved_early_seek
+    COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" interleaved-early-seek 4 23526)
 add_test(NAME e2e_play_latency
     COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" latency 2 23478)
@@ -557,7 +563,8 @@ add_test(NAME e2e_play_coldseek_latency
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
-    e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
+    e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_interleaved_early_seek
+    e2e_play_latency
     e2e_play_seekflash e2e_play_farback e2e_play_armedcut e2e_play_armedcut_back
     e2e_play_armedcut_seekrace e2e_play_armedcut_rearm_seek e2e_play_playlist
     e2e_play_playlist_jumpstress e2e_play_frameoracle e2e_play_jogstress_oracle

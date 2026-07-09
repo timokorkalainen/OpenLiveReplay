@@ -577,6 +577,23 @@ case "$SCENARIO" in
             fi
         fi
         ;;
+    interleaved-early-seek)
+        # Two cold seeks must commit: 8s to evict startup frames, then 40ms.
+        # The old fill break repeatedly rewound after only early interleaved feeds
+        # decoded, leaving reposition=1 and cacheGeneration=1 forever.
+        if ! num "$reposition" || [ "$reposition" -lt 2 ] || [ "$reposition" -gt 3 ]; then
+            echo "FAIL: interleaved early seek did not commit two bounded repositions (reposition=$reposition, expected 2..3)"
+            fail=1
+        fi
+        if ! num "$cacheGeneration" || [ "$cacheGeneration" -lt 2 ]; then
+            echo "FAIL: interleaved early seek did not commit both seek generations (cacheGeneration=$cacheGeneration, expected >=2)"
+            fail=1
+        fi
+        if ! num "$decodedVideoFrames" || [ "$decodedVideoFrames" -le 0 ]; then
+            echo "FAIL: interleaved early seek decoded no video frames (decodedVideoFrames=$decodedVideoFrames)"
+            fail=1
+        fi
+        ;;
     stepscrub)
         # 20 paused back-steps. A retained trail window must serve the BULK of steps
         # without a cold reposition (old code = 20 hard seeks). Reuse now surfaces two

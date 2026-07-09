@@ -35,7 +35,8 @@
 // usage: play_harness <file.mkv> <scenario> [viewCount]
 //   scenarios: play1x | seekplay | reverse | stepscrub | sliderscrub | frameoracle |
 //              jogstressoracle | coldseeklatency |
-//              liveedge | livegrow | seekflash | farback | armedcut | armedcut-back |
+//              liveedge | livegrow | interleaved-early-seek | seekflash | farback |
+//              armedcut | armedcut-back |
 //              armedcut-seekrace | armedcut-rearm-seek | playlist | playlist-jumpstress |
 //              gpucapstress |
 //              gpubudget | devicelost | armedcut-h264 | armedcut-h264-back
@@ -611,6 +612,24 @@ int main(int argc, char** argv) {
             worker.seekTo(8000);
             transport.setPlaying(true);
             QTimer::singleShot(10000, &app, finish);
+
+        } else if (scen == "interleaved-early-seek") {
+            // Reproduce the live-start retry: after a far seek trims startup frames,
+            // seek back to 40 ms in explicit all-feed mode. Interleaved tracks reach
+            // the target on different packets, so reposition must keep filling until
+            // every feed is ready instead of repeatedly rewinding after feed 0.
+            worker.setSelectedOutputFeed(-1);
+            worker.setRequireAllOutputFeedsForPlayhead(true);
+            transport.setSpeed(1.0);
+            transport.setPlaying(false);
+            transport.seek(8000);
+            worker.seekTo(8000, 1);
+            QTimer::singleShot(2000, &app, [&]() {
+                fprintf(stderr, "### interleaved early seek to 40ms ###\n");
+                transport.seek(40);
+                worker.seekTo(40, -1);
+            });
+            QTimer::singleShot(7000, &app, finish);
 
         } else if (scen == "reverse") {
             // Play 1x for 2s, then -5x rewind. Tests reverse thrash.
