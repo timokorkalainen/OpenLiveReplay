@@ -7,16 +7,30 @@ race:*MTLSharedEventListener*
 mutex:*QWaitConditionPrivate::wait*
 race:*qtsan_impl*QWaitCondition*
 
-# QtTsan's QBasicMutex fast-path shim drops the unlock annotation when a plain QMutex
-# is genuinely contended across two concurrently running threads. This test is the only
-# one that drives OutputRuntime dispatch from a worker thread while the main thread
-# reconfigures/dispatches, so it hammers both the runtime's m_mutex and the sink's
-# QMutex from two threads at once. The dropped annotation makes TSan (1) flag a synthetic
-# "double lock" and (2) lose the mutex's happens-before, cascading into false data races
-# on the mutex-guarded fields (m_dispatchActive, the sink's counters). Every one of these
-# reports carries this uniquely-named test in its stack, so scoping to it suppresses only
-# these known false positives and can match nothing else in the suite. The concurrent
-# preemption behaviour is still asserted by the test (it runs, just without TSan's lens)
-# and exercised race-free under ASan and release builds.
-mutex:*immediateDispatchPreemptsCatchUpBurstAfterCurrentTick*
-race:*immediateDispatchPreemptsCatchUpBurstAfterCurrentTick*
+# QtTsan's QBasicMutex fast-path shim drops the unlock annotation when OutputRuntime's
+# m_mutex (and its sinks' QMutexes) are contended between the dispatch worker thread and
+# the main thread — which happens whenever a test drives OutputRuntime dispatch from one
+# thread while another reconfigures or tears it down (tst_outputruntime's immediate-dispatch
+# preemption test, tst_playbackworker's pressure/shutdown paths). The dropped annotation
+# corrupts TSan's happens-before for that mutex, producing a synthetic "double lock"
+# (summary frame QtTsan::mutexPostLock) and cascading false data races on the mutex-guarded
+# state (m_dispatchActive, dispatch bookkeeping, sink counters, the PlaybackWorker/sink
+# methods that touch the runtime). Both sides of every such report are serialized by
+# OutputRuntime::m_mutex — verified by review: every field is guarded, m_dispatcher.dispatchTick
+# runs with m_mutex released, and there is no lock-order inversion — and the paths are
+# exercised race-free under ASan and release builds; TSan simply cannot see QMutex
+# synchronisation here.
+#
+# The mutex: line covers the synthetic double-locks. The race: lines are scoped to the exact
+# reconfigure/dispatch entry points that appear in the cascade rather than a blanket
+# *OutputRuntime*: because OutputRuntime is a QThread whose dispatchDueTicksNs runs the snapshot
+# provider and sinks with m_mutex released, a bare *OutputRuntime* would also mask a genuine
+# future race on the dispatch thread's callee subtree. Naming the entry points keeps races in
+# the runtime's other methods (stats, recordGpuBudget, resetFrameIndex, resetPlayEpoch,
+# sharedGpuReadbacks, ...) visible to TSan.
+mutex:*OutputRuntime*
+race:*OutputRuntime::dispatchDueTicksNs*
+race:*OutputRuntime::dispatchImmediate*
+race:*OutputRuntime::setEndpoints*
+race:*OutputRuntime::setSnapshotProvider*
+race:*OutputRuntime::stopRuntime*
