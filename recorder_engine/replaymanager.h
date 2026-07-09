@@ -90,6 +90,7 @@ public:
     int getFps() const { return m_fps; }
 
     int64_t getElapsedMs();
+    int64_t committedVideoTailMs() const;
     QString getVideoPath();
     qint64 getRecordingStartEpochMs() const { return m_recordingStartEpochMs; }
 

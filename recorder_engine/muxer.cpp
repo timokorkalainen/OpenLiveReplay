@@ -5,6 +5,7 @@
 #include <QDebug>
 #include <QRegularExpression>
 
+#include <algorithm>
 #include <limits>
 
 Muxer::Muxer() {}
@@ -55,6 +56,12 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         m_telemetryTrackOffset = 0;
         m_telemetryTrackCount = 0;
     };
+    const auto resetWrittenVideoTail = [this] {
+        m_videoTrackCount = 0;
+        std::lock_guard<std::mutex> lk(m_writtenPtsMutex);
+        m_lastWrittenVideoPtsMs.clear();
+    };
+    resetWrittenVideoTail();
 
     if (width <= 0) width = 1920;
     if (height <= 0) height = 1080;
@@ -121,6 +128,11 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     }
 
     // 2. Pre-allocate Video Tracks
+    m_videoTrackCount = videoTrackCount;
+    {
+        std::lock_guard<std::mutex> lk(m_writtenPtsMutex);
+        m_lastWrittenVideoPtsMs.assign(static_cast<size_t>(std::max(0, videoTrackCount)), -1);
+    }
     for (int i = 0; i < videoTrackCount; i++) {
         AVStream* st = avformat_new_stream(m_outCtx, nullptr);
         st->id = i;
@@ -142,6 +154,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
                 avformat_free_context(m_outCtx);
                 m_outCtx = nullptr;
                 resetTelemetryTracks();
+                resetWrittenVideoTail();
                 return false;
             }
             memcpy(st->codecpar->extradata, videoExtradata.constData(),
@@ -414,6 +427,33 @@ void Muxer::rememberWrittenPacketDts(const AVPacket* pkt) {
     m_lastDts[pkt->stream_index] = pkt->dts;
 }
 
+void Muxer::rememberWrittenPacketPts(const AVPacket* pkt) {
+    if (!pkt || !m_outCtx) return;
+    const int idx = pkt->stream_index;
+    if (idx < 0 || idx >= m_videoTrackCount) return;
+    if (pkt->pts == AV_NOPTS_VALUE) return;
+    if (idx >= static_cast<int>(m_outCtx->nb_streams)) return;
+
+    AVStream* st = m_outCtx->streams[idx];
+    if (!st) return;
+
+    const int64_t ptsMs = av_rescale_q(pkt->pts, st->time_base, AVRational{1, 1000});
+    std::lock_guard<std::mutex> lk(m_writtenPtsMutex);
+    if (idx >= static_cast<int>(m_lastWrittenVideoPtsMs.size())) return;
+    int64_t& last = m_lastWrittenVideoPtsMs[static_cast<size_t>(idx)];
+    last = (last < 0) ? ptsMs : std::max(last, ptsMs);
+}
+
+int64_t Muxer::minWrittenVideoPtsMs() const {
+    std::lock_guard<std::mutex> lk(m_writtenPtsMutex);
+    int64_t minPts = -1;
+    for (const int64_t ptsMs : m_lastWrittenVideoPtsMs) {
+        if (ptsMs < 0) continue;
+        minPts = (minPts < 0) ? ptsMs : std::min(minPts, ptsMs);
+    }
+    return minPts;
+}
+
 void Muxer::recordWriteOutcome(bool failed, const char* errLabel) {
     if (failed) {
         ++m_consecutiveWriteErrors;
@@ -504,6 +544,7 @@ void Muxer::writerLoop() {
             if (queued.onWritten) queued.onWritten(false);
         } else {
             rememberWrittenPacketDts(pkt);
+            rememberWrittenPacketPts(pkt);
             recordWriteOutcome(false, nullptr);
             if (queued.onWritten) queued.onWritten(true);
         }
@@ -635,6 +676,11 @@ void Muxer::close() {
         m_initialized = false;
         m_outCtx = nullptr;
         m_lastDts.clear();
+    }
+    m_videoTrackCount = 0;
+    {
+        std::lock_guard<std::mutex> lk(m_writtenPtsMutex);
+        m_lastWrittenVideoPtsMs.clear();
     }
     // Any header opts not consumed by a header write (e.g. write_header never
     // succeeded) are freed here so they never leak across sessions.

@@ -25,6 +25,7 @@ private slots:
     void telemetryFeedConfigIgnoresEmptyAndKeepsFirstDuplicate();
     void setTelemetryFeedsDuringRecordingDoesNotRemapActiveLayout();
     void recordTelemetryEventWorksFromWorkerThread();
+    void committedVideoTailDefaultsToUnknown();
     void stopRecordingWakesBackpressuredTelemetryWriter();
     void stopRecordingDrainsMuxerBeforeDeletingWorkers();
 
@@ -222,6 +223,11 @@ void TestReplayManagerTelemetry::recordTelemetryEventWorksFromWorkerThread() {
     const QVariantMap event = reader.stateAt(20000).value(QStringLiteral("cam-main")).toMap();
     QCOMPARE(event.value(QStringLiteral("threaded")).toBool(), true);
     QCOMPARE(event.value(QStringLiteral("olrTelemetryDelayMs")).toInt(), 100);
+}
+
+void TestReplayManagerTelemetry::committedVideoTailDefaultsToUnknown() {
+    ReplayManager manager;
+    QCOMPARE(manager.committedVideoTailMs(), qint64(-1));
 }
 
 void TestReplayManagerTelemetry::stopRecordingWakesBackpressuredTelemetryWriter() {

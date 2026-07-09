@@ -45,6 +45,7 @@ private slots:
     void advertisesRationalFrameRate();
     void writePacketCompletionRunsAfterWriterSuccess();
     void writePacketCompletionReportsRejectedPacket();
+    void minWrittenVideoPtsTracksCommittedVideoPackets();
     void beginShutdownDrainWakesBlockedProducer();
     void beginShutdownDrainAcceptsInFlightPacketWhenQueueHasRoom();
     void closeAllowsCallbackSidecarPacketDuringDrain();
@@ -678,6 +679,50 @@ void TestMuxer::writePacketCompletionReportsRejectedPacket() {
     av_packet_free(&pkt);
 
     QCOMPARE(rejected.load(std::memory_order_acquire), 1);
+}
+
+void TestMuxer::minWrittenVideoPtsTracksCommittedVideoPackets() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QStringList names{QStringLiteral("A"), QStringLiteral("B")};
+    QVERIFY(m.init(QStringLiteral("olr_unit_video_tail"), 2, 320, 240, 30, names, 48000, 2,
+                   QStringLiteral("01:02:03:04")));
+
+    auto makeVideoPacket = [](int streamIndex, qint64 ptsMs) {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt) return pkt;
+        if (av_new_packet(pkt, 2) < 0) {
+            av_packet_free(&pkt);
+            return pkt;
+        }
+        pkt->data[0] = char(0x00);
+        pkt->data[1] = char(0x01);
+        pkt->stream_index = streamIndex;
+        pkt->pts = ptsMs;
+        pkt->dts = ptsMs;
+        pkt->duration = 40;
+        pkt->flags |= AV_PKT_FLAG_KEY;
+        return pkt;
+    };
+
+    std::atomic<int> completions{0};
+    AVPacket* a = makeVideoPacket(0, 1200);
+    QVERIFY(a != nullptr);
+    QVERIFY(m.writePacket(a, [&](bool written) {
+        if (written) completions.fetch_add(1, std::memory_order_acq_rel);
+    }));
+    av_packet_free(&a);
+
+    AVPacket* b = makeVideoPacket(1, 1000);
+    QVERIFY(b != nullptr);
+    QVERIFY(m.writePacket(b, [&](bool written) {
+        if (written) completions.fetch_add(1, std::memory_order_acq_rel);
+    }));
+    av_packet_free(&b);
+
+    QTRY_COMPARE_WITH_TIMEOUT(completions.load(std::memory_order_acquire), 2, 2000);
+    QCOMPARE(m.minWrittenVideoPtsMs(), qint64(1000));
+    m.close();
 }
 
 void TestMuxer::beginShutdownDrainWakesBlockedProducer() {

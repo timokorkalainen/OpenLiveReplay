@@ -318,16 +318,10 @@ void attachColorMetadata(CVPixelBufferRef pb, const VuiColorCodePoints& vui) {
 // Copy a CPU YUV420P AVFrame into an I420 CVPixelBuffer.
 CVPixelBufferRef makeI420PixelBuffer(const AVFrame* f, const VuiColorCodePoints& vui) {
     CVPixelBufferRef pb = nullptr;
-    const void* keys[] = {kCVPixelBufferIOSurfacePropertiesKey};
-    const void* vals[] = {(__bridge const void*)@{} };
-    CFDictionaryRef attrs =
-        CFDictionaryCreate(kCFAllocatorDefault, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
-                           &kCFTypeDictionaryValueCallBacks);
     const OSType pixelFormat = vui.fullRange ? kCVPixelFormatType_420YpCbCr8PlanarFullRange
                                              : kCVPixelFormatType_420YpCbCr8Planar;
     const CVReturn r =
-        CVPixelBufferCreate(kCFAllocatorDefault, f->width, f->height, pixelFormat, attrs, &pb);
-    if (attrs) CFRelease(attrs);
+        CVPixelBufferCreate(kCFAllocatorDefault, f->width, f->height, pixelFormat, nullptr, &pb);
     if (r != kCVReturnSuccess || !pb) return nullptr;
     attachColorMetadata(pb, vui);
 

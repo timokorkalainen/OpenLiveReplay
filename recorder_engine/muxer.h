@@ -14,6 +14,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -84,6 +85,7 @@ public:
     int audioTrackOffset() const { return m_audioTrackOffset; }
     int subtitleTrackOffset() const { return m_subtitleTrackOffset; }
     int telemetryTrackOffset() const { return m_telemetryTrackOffset; }
+    int64_t minWrittenVideoPtsMs() const;
 
     QString getVideoPath(QString fileName);
 
@@ -107,6 +109,7 @@ private:
     void recordWriteOutcome(bool failed, const char* errLabel);
     void normalizePacketDts(AVPacket* pkt);
     void rememberWrittenPacketDts(const AVPacket* pkt);
+    void rememberWrittenPacketPts(const AVPacket* pkt);
 
     // Writes the deferred MKV header exactly once, materialising the winning
     // start-timecode candidate into the "timecode" tag (format-level + each video
@@ -178,6 +181,9 @@ private:
     int m_subtitleTrackOffset = 0;  // Index of first subtitle track
     int m_telemetryTrackOffset = 0; // Index of first per-feed telemetry track
     int m_telemetryTrackCount = 0;
+    int m_videoTrackCount = 0;
+    std::vector<int64_t> m_lastWrittenVideoPtsMs;
+    mutable std::mutex m_writtenPtsMutex;
 
     // ─── Dedicated writer thread (decouples callers from the disk) ─────────
     // writePacket() enqueues a cloned packet and returns immediately; the

@@ -301,24 +301,32 @@ private:
     CMVideoFormatDescriptionRef format = nullptr;
     VTDecompressionSessionRef session = nullptr;
     bool lastIOSurfaceBacked = false;
+    bool sessionRequiresIOSurface = false;
 
-    bool ensureSession(const CompressedAccessUnit& unit, QString* error);
+    void resetSession();
+    bool ensureSession(const CompressedAccessUnit& unit, bool requireIOSurface, QString* error);
     bool createFormatDescription(const CompressedAccessUnit& unit, QString* error);
-    bool createSession(QString* error);
+    bool createSession(bool requireIOSurface, QString* error);
 };
 
-void NativeVideoDecoder::Impl::reset() {
+void NativeVideoDecoder::Impl::resetSession() {
     if (session) {
         VTDecompressionSessionInvalidate(session);
         CFRelease(session);
         session = nullptr;
     }
+    sessionRequiresIOSurface = false;
+}
+
+void NativeVideoDecoder::Impl::reset() {
+    resetSession();
     if (format) {
         CFRelease(format);
         format = nullptr;
     }
     codec = NativeVideoCodec::Unknown;
     activeParameterSetKey.clear();
+    lastIOSurfaceBacked = false;
 }
 
 void NativeVideoDecoder::Impl::flushExcessPixelBufferPool() {
@@ -390,7 +398,7 @@ bool NativeVideoDecoder::Impl::createFormatDescription(const CompressedAccessUni
     return true;
 }
 
-bool NativeVideoDecoder::Impl::createSession(QString* error) {
+bool NativeVideoDecoder::Impl::createSession(bool requireIOSurface, QString* error) {
     CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     const OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
@@ -399,11 +407,13 @@ bool NativeVideoDecoder::Impl::createSession(QString* error) {
     CFDictionarySetValue(attributes, kCVPixelBufferPixelFormatTypeKey, pixelFormatNumber);
     CFRelease(pixelFormatNumber);
 
-    CFDictionaryRef ioSurfaceProps =
-        CFDictionaryCreate(kCFAllocatorDefault, nullptr, nullptr, 0, &kCFTypeDictionaryKeyCallBacks,
-                           &kCFTypeDictionaryValueCallBacks);
-    CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey, ioSurfaceProps);
-    CFRelease(ioSurfaceProps);
+    if (requireIOSurface) {
+        CFDictionaryRef ioSurfaceProps =
+            CFDictionaryCreate(kCFAllocatorDefault, nullptr, nullptr, 0,
+                               &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey, ioSurfaceProps);
+        CFRelease(ioSurfaceProps);
+    }
 
     if (width > 0) {
         CFNumberRef widthNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
@@ -430,13 +440,19 @@ bool NativeVideoDecoder::Impl::createSession(QString* error) {
         return false;
     }
 
+    sessionRequiresIOSurface = requireIOSurface;
     return true;
 }
 
-bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, QString* error) {
+bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit,
+                                             bool requireIOSurface, QString* error) {
     const QByteArray nextKey = parameterSetKey(unit.codec, unit.parameterSets);
     if (session && unit.codec == codec && (nextKey.isEmpty() || nextKey == activeParameterSetKey)) {
-        return true;
+        if (sessionRequiresIOSurface == requireIOSurface) {
+            return true;
+        }
+        resetSession();
+        return createSession(requireIOSurface, error);
     }
     if (nextKey.isEmpty()) {
         if (error) {
@@ -450,7 +466,7 @@ bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, Q
     codec = unit.codec;
     activeParameterSetKey = nextKey;
 
-    if (!createFormatDescription(unit, error) || !createSession(error)) {
+    if (!createFormatDescription(unit, error) || !createSession(requireIOSurface, error)) {
         reset();
         return false;
     }
@@ -463,7 +479,7 @@ bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit, FrameCal
         if (error) *error = QStringLiteral("VideoToolbox decode requires a frame callback");
         return false;
     }
-    if (!ensureSession(unit, error)) {
+    if (!ensureSession(unit, false, error)) {
         return false;
     }
 
@@ -540,7 +556,7 @@ bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& uni
         if (error) *error = QStringLiteral("VideoToolbox keep-surface decode requires a callback");
         return false;
     }
-    if (!ensureSession(unit, error)) {
+    if (!ensureSession(unit, true, error)) {
         return false;
     }
 

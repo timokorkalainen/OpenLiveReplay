@@ -875,6 +875,10 @@ int64_t ReplayManager::getElapsedMs() {
     return m_lastKnownDurationMs;
 }
 
+int64_t ReplayManager::committedVideoTailMs() const {
+    return m_muxer ? m_muxer->minWrittenVideoPtsMs() : -1;
+}
+
 QString ReplayManager::getVideoPath() {
     if (!m_sessionFileName.isEmpty()) {
         return m_muxer->getVideoPath(m_sessionFileName);
