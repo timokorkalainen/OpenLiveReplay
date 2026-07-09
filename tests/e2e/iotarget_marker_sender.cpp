@@ -463,6 +463,10 @@ int runIoTargetMarkerSender(const QStringList& arguments) {
             return 4;
         }
     }
+    if (target->wrapReadback && !sink->flush(10000)) {
+        qWarning() << "sink did not flush all readback frames before stop";
+        return 8;
+    }
     sink->stop();
 
     const std::optional<ContinuityReport> report = analyzeFrames(store.frames, markerConfig);

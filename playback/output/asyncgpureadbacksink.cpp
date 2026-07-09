@@ -559,7 +559,7 @@ bool AsyncGpuReadbackSink::flushReadbacks(int timeoutMs) {
                  m_inner->submitAndFlush(frameToDeliver, remainingMs);
         }
         if (ok) rememberDelivered(frameToDeliver);
-        return ok;
+        if (!ok) return false;
     }
 }
 

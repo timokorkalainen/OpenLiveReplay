@@ -13,6 +13,7 @@
 #include "playback/output/yuv420pcompositor.h"
 
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 class TestGpuCompositorStress : public QObject {
@@ -152,10 +153,17 @@ void TestGpuCompositorStress::composeWhileRetiringPriorGpuOutputs() {
 
     std::thread drainer([&] {
         while (!stop.load(std::memory_order_acquire)) {
-            QMutexLocker locker(&retireMutex);
             int localStalls = 0;
-            retireQueue.drain(0, &localStalls, 1);
-            stalls.fetch_add(localStalls, std::memory_order_acq_rel);
+            {
+                QMutexLocker locker(&retireMutex);
+                retireQueue.drain(1, &localStalls, 1);
+            }
+            if (localStalls > 0) {
+                stalls.fetch_add(localStalls, std::memory_order_acq_rel);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } else {
+                std::this_thread::yield();
+            }
         }
     });
 

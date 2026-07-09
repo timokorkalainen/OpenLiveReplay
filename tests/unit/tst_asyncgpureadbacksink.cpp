@@ -346,6 +346,7 @@ private slots:
     void discardPendingForwardsToInnerSink();
     void producerFenceControlsGpuReadbackReadiness();
     void flushDeliversPendingGpuReadbackWithoutFutureSubmit();
+    void flushDrainsAllPendingGpuReadbacksBeforeReturning();
     void flushForwardsToInnerSinkAfterReadbackDelivery();
     void submitAndFlushDoesNotDoubleFlushInnerAfterGpuReadback();
     void cpuSubmitAndFlushStillFlushesAfterDrainingPendingGpuReadback();
@@ -494,8 +495,8 @@ void TestAsyncGpuReadbackSink::prewarmReadbackWarmsSharedCacheWithoutSubmittingI
     QTRY_COMPARE_WITH_TIMEOUT(data->readCount(), 1, 1000);
     QCOMPARE(observed->deliveredCount(), 0);
     CpuPlanes warmed;
-    QVERIFY(sharedReadbacks->find(frame, FramePixelFormat::Yuv420p, &warmed));
-    QVERIFY(warmed.isValid());
+    QTRY_VERIFY_WITH_TIMEOUT(
+        sharedReadbacks->find(frame, FramePixelFormat::Yuv420p, &warmed) && warmed.isValid(), 1000);
 
     QVERIFY(sink.submitAndFlush(frame, 1000));
     QCOMPARE(data->readCount(), 1);
@@ -854,6 +855,35 @@ void TestAsyncGpuReadbackSink::flushDeliversPendingGpuReadbackWithoutFutureSubmi
     QCOMPARE(observed->deliveredAt(0).outputFrameIndex, qint64(1));
     QVERIFY(!observed->gpuBackedAt(0));
     QCOMPARE(data->readCount(), 1);
+    QCOMPARE(sink.readbackQueueDepth(), qint64(0));
+}
+
+void TestAsyncGpuReadbackSink::flushDrainsAllPendingGpuReadbacksBeforeReturning() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<RecordingSink>();
+    RecordingSink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 3, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    auto producerFence = std::make_shared<ManualFence>();
+    QVector<std::shared_ptr<CountingGpuFrameData>> data;
+    for (qint64 index = 0; index < 3; ++index) {
+        data.append(
+            std::make_shared<CountingGpuFrameData>(60 + int(index), index + 1, producerFence));
+        QVERIFY(sink.submit(gpuFrame(index, data.back(), 1)));
+    }
+    QCOMPARE(observed->deliveredCount(), qsizetype(0));
+    QCOMPARE(sink.readbackQueueDepth(), qint64(3));
+
+    producerFence->complete(3);
+    QVERIFY(sink.flush(1000));
+
+    QCOMPARE(observed->deliveredCount(), qsizetype(3));
+    for (qint64 index = 0; index < 3; ++index) {
+        QCOMPARE(observed->deliveredAt(index).outputFrameIndex, index);
+        QCOMPARE(data.at(index)->readCount(), 1);
+    }
     QCOMPARE(sink.readbackQueueDepth(), qint64(0));
 }
 
