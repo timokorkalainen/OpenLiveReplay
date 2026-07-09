@@ -798,7 +798,7 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     QElapsedTimer timer;
     timer.start();
     runtime.dispatchImmediate();
-    const qint64 immediateElapsedMs = timer.elapsed();
+    [[maybe_unused]] const qint64 immediateElapsedMs = timer.elapsed();
 
     catchUpThread.join();
 
@@ -807,10 +807,15 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     // coarse "did not wait for the whole burst" guard. The full non-preempted burst is
     // m_maxCatchUpTicks (8) * SlowSubmitSink 80ms = 640ms, so a value well under that still
     // catches a preemption regression while tolerating CI scheduling jitter (msleep can
-    // overrun under load, which made a tight 250ms bound flaky).
+    // overrun under load, which made a tight 250ms bound flaky). Under ThreadSanitizer the
+    // instrumented handoff and the SlowSubmitSink msleeps dominate and inflate this
+    // wall-clock far past the budget on slower/contended runners (1-2.8 s observed on CI),
+    // so gate the timing guard out under TSan and rely on the timing-free structural check.
+#if !defined(__SANITIZE_THREAD__) && !(defined(__has_feature) && __has_feature(thread_sanitizer))
     QVERIFY2(immediateElapsedMs < 500,
              qPrintable(QStringLiteral("immediate dispatch waited %1 ms behind catch-up")
                             .arg(immediateElapsedMs)));
+#endif
     QVERIFY2(frames.size() <= 4,
              qPrintable(QStringLiteral("immediate dispatch allowed %1 stale catch-up frames")
                             .arg(frames.size())));
