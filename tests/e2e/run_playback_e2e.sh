@@ -325,6 +325,7 @@ echo "[pb-e2e] $COUNTERS"
 get() { printf '%s\n' "$COUNTERS" | sed -n "s/.*[[:space:]]$1=\([0-9]*\).*/\1/p"; }
 reposition="$(get reposition)"
 reuseSeek="$(get reuseSeek)"
+publishedSeek="$(get publishedSeek)"
 reverseChunkSeek="$(get reverseChunkSeek)"
 eofTailSeek="$(get eofTailSeek)"
 skipForward="$(get skipForward)"
@@ -372,6 +373,7 @@ postLossFirstFreshOutputDelayMs="$(get postLossFirstFreshOutputDelayMs)"
 gpuGenerationAdvanced="$(get gpuGenerationAdvanced)"
 [ -n "$reposition" ] || reposition="?"
 [ -n "$reuseSeek" ] || reuseSeek="?"
+[ -n "$publishedSeek" ] || publishedSeek="?"
 [ -n "$reverseChunkSeek" ] || reverseChunkSeek="?"
 [ -n "$eofTailSeek" ] || eofTailSeek="?"
 [ -n "$skipForward" ] || skipForward="?"
@@ -576,15 +578,21 @@ case "$SCENARIO" in
         fi
         ;;
     stepscrub)
-        # 20 paused back-steps. Measured: reposition=6 reuseSeek=17. Most steps
-        # must REUSE the window (old code = 20 hard seeks); allow a few cold
-        # repositions, but the bulk must be reuse-seeks.
+        # 20 paused back-steps. A retained trail window must serve the BULK of steps
+        # without a cold reposition (old code = 20 hard seeks). Reuse now surfaces two
+        # ways: the worker-loop reuse path (reuseSeek) and, when the published output
+        # cache already covers the target, the inline committedFromPublishedCache path
+        # (publishedSeek). A bigger trail shifts most steps to the latter, so the gate
+        # counts reuseSeek+publishedSeek. Guard both: few cold repositions AND the bulk
+        # served by reuse. Reference measurement on this build: reposition=3
+        # reuseSeek=0 publishedSeek=18.
         if ! num "$reposition" || [ "$reposition" -gt 10 ]; then
             echo "FAIL: stepscrub repositioned too much (reposition=$reposition, expected <=10) — seek-per-step"
             fail=1
         fi
-        if ! num "$reuseSeek" || [ "$reuseSeek" -lt 1 ]; then
-            echo "FAIL: stepscrub did not reuse the window (reuseSeek=$reuseSeek, expected >=1)"
+        if ! num "$reuseSeek" || ! num "$publishedSeek" || \
+           [ $(( reuseSeek + publishedSeek )) -lt 10 ]; then
+            echo "FAIL: stepscrub did not reuse the window (reuseSeek=$reuseSeek publishedSeek=$publishedSeek, expected reuseSeek+publishedSeek>=10)"
             fail=1
         fi
         ;;
@@ -1420,7 +1428,7 @@ else
     done
 fi
 
-SUMMARY="reposition=$reposition reuseSeek=$reuseSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped framesSubmittedDelta=$framesSubmittedDelta resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs cutLandingSamples=$cutLandingSamples armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded gpuReadToCpuCount=$gpuReadToCpuCount gpuSeekPrefetchConsults=$gpuSeekPrefetchConsults gpuSeekPrefetchPlannedSurfaces=$gpuSeekPrefetchPlannedSurfaces gpuSeekPrefetchGpuAttempts=$gpuSeekPrefetchGpuAttempts gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces redundantGpuReadbacks=$redundantGpuReadbacks readbackQueueDepth=$readbackQueueDepth readbackDrops=$readbackDrops fenceWaitStalls=$fenceWaitStalls gpuOomDegrades=$gpuOomDegrades gpuDeviceLossEvents=$gpuDeviceLossEvents gpuVramBytes=$gpuVramBytes deviceLossObserved=$deviceLossObserved deviceLossObserveDelayMs=$deviceLossObserveDelayMs postLossFramesSubmitted=$postLossFramesSubmitted postLossDecodedVideoFrames=$postLossDecodedVideoFrames postLossPlaceholderFrames=$postLossPlaceholderFrames postLossHeldFrames=$postLossHeldFrames postLossFirstFrameDelayMs=$postLossFirstFrameDelayMs postLossObservedOutputTargets=$postLossObservedOutputTargets postLossFreshOutputTargets=$postLossFreshOutputTargets postLossAllTargetsFresh=$postLossAllTargetsFresh postLossOutputPtsAdvanced=$postLossOutputPtsAdvanced postLossFirstFreshOutputDelayMs=$postLossFirstFreshOutputDelayMs gpuGenerationAdvanced=$gpuGenerationAdvanced"
+SUMMARY="reposition=$reposition reuseSeek=$reuseSeek publishedSeek=$publishedSeek reverseChunkSeek=$reverseChunkSeek eofTailSeek=$eofTailSeek skipForward=$skipForward audioPushes=$audioPushes framesDropped=$framesDropped framesSubmittedDelta=$framesSubmittedDelta resyncCount=$resyncCount placeholderFramesDelta=$placeholderFramesDelta skippedDuplicateFrames=$skippedDuplicateFrames cacheGeneration=$cacheGeneration heldFramesDelta=$heldFramesDelta maxClockDivergenceMs=$maxClockDivergenceMs cutsFired=$cutsFired cutFollowReposition=$cutFollowReposition maxBoundaryLandingErrMs=$maxBoundaryLandingErrMs cutLandingSamples=$cutLandingSamples armNextCutArmed=$armNextCutArmed decodedVideoFrames=$decodedVideoFrames stagingVideoFramesDecoded=$stagingVideoFramesDecoded gpuReadToCpuCount=$gpuReadToCpuCount gpuSeekPrefetchConsults=$gpuSeekPrefetchConsults gpuSeekPrefetchPlannedSurfaces=$gpuSeekPrefetchPlannedSurfaces gpuSeekPrefetchGpuAttempts=$gpuSeekPrefetchGpuAttempts gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces redundantGpuReadbacks=$redundantGpuReadbacks readbackQueueDepth=$readbackQueueDepth readbackDrops=$readbackDrops fenceWaitStalls=$fenceWaitStalls gpuOomDegrades=$gpuOomDegrades gpuDeviceLossEvents=$gpuDeviceLossEvents gpuVramBytes=$gpuVramBytes deviceLossObserved=$deviceLossObserved deviceLossObserveDelayMs=$deviceLossObserveDelayMs postLossFramesSubmitted=$postLossFramesSubmitted postLossDecodedVideoFrames=$postLossDecodedVideoFrames postLossPlaceholderFrames=$postLossPlaceholderFrames postLossHeldFrames=$postLossHeldFrames postLossFirstFrameDelayMs=$postLossFirstFrameDelayMs postLossObservedOutputTargets=$postLossObservedOutputTargets postLossFreshOutputTargets=$postLossFreshOutputTargets postLossAllTargetsFresh=$postLossAllTargetsFresh postLossOutputPtsAdvanced=$postLossOutputPtsAdvanced postLossFirstFreshOutputDelayMs=$postLossFirstFreshOutputDelayMs gpuGenerationAdvanced=$gpuGenerationAdvanced"
 
 if [ $fail -ne 0 ]; then
     echo "FAIL: $SCENARIO ($VIEWS views) — $SUMMARY"

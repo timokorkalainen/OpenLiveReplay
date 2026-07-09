@@ -257,6 +257,9 @@ PlaybackWorker::SeekRequestResult PlaybackWorker::requestSeekTo(qint64 timestamp
 #endif
             m_committedGeneration.store(result.generation, std::memory_order_release);
             result.committedFromPublishedCache = true;
+            // Window reuse served straight from the published output cache (no worker
+            // reposition, no reuseAt). Counted under m_mutex, same as reuseSeek.
+            m_counters.publishedSeek++;
         } else {
             const bool allowLiveStartupFallback = !registerOperatorTransaction && clamped == 0 &&
                                                   m_transport && m_transport->isPlaying();

@@ -543,48 +543,48 @@ int main(int argc, char** argv) {
         const qint64 postLossHeldFrames = (deviceLoss->heldFramesAtObserve < 0)
                                               ? 0
                                               : (os.heldFrames - deviceLoss->heldFramesAtObserve);
-        printf("COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
-               "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d "
-               "framesSubmittedDelta=%lld resyncCount=%d "
-               "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
-               "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d "
-               "maxBoundaryLandingErrMs=%lld cutLandingSamples=%d armNextCutArmed=%d "
-               "decodedVideoFrames=%lld "
-               "stagingVideoFramesDecoded=%lld gpuReadToCpuCount=%lld "
-               "gpuSeekPrefetchConsults=%lld gpuSeekPrefetchPlannedSurfaces=%lld "
-               "gpuSeekPrefetchGpuAttempts=%lld gpuReadbacks=%lld uniqueGpuReadbackSurfaces=%lld "
-               "redundantGpuReadbacks=%lld "
-               "readbackQueueDepth=%lld readbackDrops=%lld fenceWaitStalls=%lld "
-               "gpuOomDegrades=%lld gpuDeviceLossEvents=%lld gpuVramBytes=%lld "
-               "deviceLossObserved=%lld deviceLossObserveDelayMs=%lld "
-               "postLossFramesSubmitted=%lld postLossDecodedVideoFrames=%lld "
-               "postLossPlaceholderFrames=%lld postLossHeldFrames=%lld "
-               "postLossFirstFrameDelayMs=%lld postLossObservedOutputTargets=%lld "
-               "postLossFreshOutputTargets=%lld postLossAllTargetsFresh=%d "
-               "postLossFirstFreshOutputDelayMs=%lld postLossOutputPtsAdvanced=%d "
-               "gpuGenerationAdvanced=%d\n",
-               c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
-               c.audioPushes, c.framesDropped, (long long) submittedDelta, audio.resyncCount(),
-               (long long) phDelta, (long long) os.skippedDuplicateFrames,
-               (long long) worker.cacheGeneration(), (long long) heldDelta,
-               (long long) os.maxClockDivergenceMs, worker.cutsFired(), c.cutFollowReposition,
-               (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
-               (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
-               (long long) c.gpuReadToCpuCount, (long long) c.gpuSeekPrefetchConsults,
-               (long long) c.gpuSeekPrefetchPlannedSurfaces,
-               (long long) c.gpuSeekPrefetchGpuAttempts, (long long) os.gpuReadbacks,
-               (long long) os.uniqueGpuReadbackSurfaces, (long long) os.redundantGpuReadbacks,
-               (long long) os.readbackQueueDepth, (long long) os.readbackDrops,
-               (long long) os.fenceWaitStalls, (long long) os.gpuOomDegrades,
-               (long long) os.gpuDeviceLossEvents, (long long) os.gpuVramBytes,
-               (long long) deviceLoss->observed, (long long) deviceLoss->observeDelayMs,
-               (long long) postLossFramesSubmitted, (long long) postLossDecodedVideoFrames,
-               (long long) postLossPlaceholderFrames, (long long) postLossHeldFrames,
-               (long long) deviceLoss->firstPostLossFrameDelayMs,
-               (long long) deviceLoss->observedOutputTargets,
-               (long long) deviceLoss->freshOutputTargets, deviceLoss->outputPtsAdvanced ? 1 : 0,
-               (long long) deviceLoss->firstFreshOutputDelayMs,
-               deviceLoss->outputPtsAdvanced ? 1 : 0, deviceLoss->generationAdvanced ? 1 : 0);
+        printf(
+            "COUNTERS reposition=%d reuseSeek=%d reverseChunkSeek=%d "
+            "eofTailSeek=%d skipForward=%d audioPushes=%d framesDropped=%d "
+            "framesSubmittedDelta=%lld resyncCount=%d "
+            "placeholderFramesDelta=%lld skippedDuplicateFrames=%lld cacheGeneration=%lld "
+            "heldFramesDelta=%lld maxClockDivergenceMs=%lld cutsFired=%d cutFollowReposition=%d "
+            "maxBoundaryLandingErrMs=%lld cutLandingSamples=%d armNextCutArmed=%d "
+            "decodedVideoFrames=%lld "
+            "stagingVideoFramesDecoded=%lld gpuReadToCpuCount=%lld "
+            "gpuSeekPrefetchConsults=%lld gpuSeekPrefetchPlannedSurfaces=%lld "
+            "gpuSeekPrefetchGpuAttempts=%lld gpuReadbacks=%lld uniqueGpuReadbackSurfaces=%lld "
+            "redundantGpuReadbacks=%lld "
+            "readbackQueueDepth=%lld readbackDrops=%lld fenceWaitStalls=%lld "
+            "gpuOomDegrades=%lld gpuDeviceLossEvents=%lld gpuVramBytes=%lld "
+            "deviceLossObserved=%lld deviceLossObserveDelayMs=%lld "
+            "postLossFramesSubmitted=%lld postLossDecodedVideoFrames=%lld "
+            "postLossPlaceholderFrames=%lld postLossHeldFrames=%lld "
+            "postLossFirstFrameDelayMs=%lld postLossObservedOutputTargets=%lld "
+            "postLossFreshOutputTargets=%lld postLossAllTargetsFresh=%d "
+            "postLossFirstFreshOutputDelayMs=%lld postLossOutputPtsAdvanced=%d "
+            "gpuGenerationAdvanced=%d publishedSeek=%d\n",
+            c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
+            c.audioPushes, c.framesDropped, (long long) submittedDelta, audio.resyncCount(),
+            (long long) phDelta, (long long) os.skippedDuplicateFrames,
+            (long long) worker.cacheGeneration(), (long long) heldDelta,
+            (long long) os.maxClockDivergenceMs, worker.cutsFired(), c.cutFollowReposition,
+            (long long) *maxLandErr, *cutLandingSamples, armNextCutArmed,
+            (long long) c.decodedVideoFrames, (long long) c.stagingVideoFramesDecoded,
+            (long long) c.gpuReadToCpuCount, (long long) c.gpuSeekPrefetchConsults,
+            (long long) c.gpuSeekPrefetchPlannedSurfaces, (long long) c.gpuSeekPrefetchGpuAttempts,
+            (long long) os.gpuReadbacks, (long long) os.uniqueGpuReadbackSurfaces,
+            (long long) os.redundantGpuReadbacks, (long long) os.readbackQueueDepth,
+            (long long) os.readbackDrops, (long long) os.fenceWaitStalls,
+            (long long) os.gpuOomDegrades, (long long) os.gpuDeviceLossEvents,
+            (long long) os.gpuVramBytes, (long long) deviceLoss->observed,
+            (long long) deviceLoss->observeDelayMs, (long long) postLossFramesSubmitted,
+            (long long) postLossDecodedVideoFrames, (long long) postLossPlaceholderFrames,
+            (long long) postLossHeldFrames, (long long) deviceLoss->firstPostLossFrameDelayMs,
+            (long long) deviceLoss->observedOutputTargets,
+            (long long) deviceLoss->freshOutputTargets, deviceLoss->outputPtsAdvanced ? 1 : 0,
+            (long long) deviceLoss->firstFreshOutputDelayMs, deviceLoss->outputPtsAdvanced ? 1 : 0,
+            deviceLoss->generationAdvanced ? 1 : 0, c.publishedSeek);
         fflush(stdout);
         app.exit(*exitCode);
     };
@@ -1622,7 +1622,8 @@ int main(int argc, char** argv) {
                 "gpuSeekPrefetchGpuAttempts=%lld gpuReadbacks=%lld uniqueGpuReadbackSurfaces=%lld "
                 "redundantGpuReadbacks=%lld "
                 "readbackQueueDepth=%lld readbackDrops=%lld fenceWaitStalls=%lld "
-                "gpuOomDegrades=%lld gpuDeviceLossEvents=%lld gpuVramBytes=%lld\n",
+                "gpuOomDegrades=%lld gpuDeviceLossEvents=%lld gpuVramBytes=%lld "
+                "publishedSeek=%d\n",
                 c.reposition, c.reuseSeek, c.reverseChunkSeek, c.eofTailSeek, c.skipForward,
                 c.audioPushes, c.framesDropped, (long long) submittedDelta, audio.resyncCount(),
                 (long long) phDelta, (long long) os.skippedDuplicateFrames,
@@ -1636,7 +1637,7 @@ int main(int argc, char** argv) {
                 (long long) os.uniqueGpuReadbackSurfaces, (long long) os.redundantGpuReadbacks,
                 (long long) os.readbackQueueDepth, (long long) os.readbackDrops,
                 (long long) os.fenceWaitStalls, (long long) os.gpuOomDegrades,
-                (long long) os.gpuDeviceLossEvents, (long long) os.gpuVramBytes);
+                (long long) os.gpuDeviceLossEvents, (long long) os.gpuVramBytes, c.publishedSeek);
             fflush(stdout);
             ::exit(2);
         }

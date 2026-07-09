@@ -95,6 +95,12 @@ public:
     struct PlaybackCounters {
         int reposition = 0, reuseSeek = 0, reverseChunkSeek = 0, eofTailSeek = 0, skipForward = 0,
             audioPushes = 0, framesDropped = 0;
+        // Operator/manual seeks served inline from the already-published output cache
+        // (requestSeekTo's committedFromPublishedCache fast path). This is window reuse
+        // that never reaches the worker-loop reuseAt path, so reuseSeek does NOT count
+        // it: a retained trail window makes paused stepping resolve here (no reposition,
+        // no re-decode). The stepscrub gate counts reuseSeek+publishedSeek as reuse.
+        int publishedSeek = 0;
         // Repositions issued by the armed-cut decoder-follow (a backward cut's
         // deterministic primary-bank resync). Counted SEPARATELY from reposition
         // so the armed-cut gate keeps reposition==0 (no coarse-seek fallback)
