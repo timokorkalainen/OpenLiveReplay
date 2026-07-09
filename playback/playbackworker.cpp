@@ -850,7 +850,7 @@ PlaybackWorker::outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
         if (const std::optional<qint64> covered =
                 outputFeedCoverageInCache(*m_outputCache, feedIndex, playheadMs, gpuGeneration,
                                           OutputCoverageMode::Displayable)) {
-            return *covered;
+            return covered;
         }
         const std::optional<FrameHandle> future =
             m_outputCache->firstFreshVideoFrameAtOrAfter(feedIndex, playheadMs, gpuGeneration);
@@ -2349,7 +2349,7 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
                 if (const std::optional<qint64> covered = outputFeedCoverageInCache(
                         snapshot.cache, feedIndex, playheadMs, snapshot.state.gpuGeneration,
                         OutputCoverageMode::Displayable)) {
-                    return *covered;
+                    return covered;
                 }
                 const std::optional<FrameHandle> future =
                     snapshot.cache.firstFreshVideoFrameAtOrAfter(feedIndex, playheadMs,
