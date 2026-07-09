@@ -3,6 +3,7 @@ import ast
 import collections
 import importlib.util
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -199,6 +200,34 @@ def main():
     spec = importlib.util.spec_from_file_location("macos_app_driver", driver)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+
+    driver_main = function(tree, "main")
+    driver_main_source = source_segment(source, driver_main)
+    qml_error_check = "assert_no_openlivereplay_qml_errors(app_log)"
+    if qml_error_check not in driver_main_source:
+        raise AssertionError(
+            "macOS app visual e2e must reject OpenLiveReplay QML runtime errors"
+        )
+    if driver_main_source.find(qml_error_check) > driver_main_source.find("APP_E2E_PASS"):
+        raise AssertionError(
+            "macOS app visual e2e must reject QML runtime errors before reporting a pass"
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        app_log = Path(directory) / "app.log"
+        app_log.write_text("normal output\n", encoding="utf-8")
+        module.assert_no_openlivereplay_qml_errors(app_log)
+        app_log.write_text(
+            "qrc:/qt/qml/OpenLiveReplay/ui/components/PgmStage.qml:138: "
+            "TypeError: addVideoSink is not a function\n",
+            encoding="utf-8",
+        )
+        try:
+            module.assert_no_openlivereplay_qml_errors(app_log)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("OpenLiveReplay QML runtime errors must fail the app oracle")
 
     watcher = object.__new__(module.NdiMarkerWatcher)
     watcher.proc = None

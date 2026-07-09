@@ -799,6 +799,19 @@ def dump_debug_state(ws, args, label):
     screenshot(workdir / f"debug-{label}.png")
 
 
+def assert_no_openlivereplay_qml_errors(app_log):
+    diagnostics = []
+    for line in Path(app_log).read_text(encoding="utf-8", errors="replace").splitlines():
+        if "qrc:/qt/qml/OpenLiveReplay/" not in line:
+            continue
+        if any(token in line for token in ("TypeError:", "ReferenceError:", "Binding loop")):
+            diagnostics.append(line)
+    if diagnostics:
+        raise AssertionError(
+            "OpenLiveReplay QML runtime errors:\n" + "\n".join(diagnostics[:20])
+        )
+
+
 def capture_and_decode(ws, docs_root, marker_probe, label, token="PGM"):
     videos = Path(docs_root) / "videos"
     videos.mkdir(parents=True, exist_ok=True)
@@ -1684,6 +1697,7 @@ def main():
 
             assert_screen_video_visible(args.workdir, "final_visible")
             ws.command("recording.stop", timeout=10.0)
+            assert_no_openlivereplay_qml_errors(app_log)
             if (args.require_ndi_latency
                     and len(ndi_latency_samples) != required_ndi_latency_samples):
                 raise AssertionError(
