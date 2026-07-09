@@ -30,8 +30,8 @@ set_tests_properties(tst_statusstrip_onair PROPERTIES
 
 qt_add_executable(tst_pgmstage_mapping tst_pgmstage_mapping_main.cpp)
 target_link_libraries(tst_pgmstage_mapping PRIVATE
-    Qt6::QuickTest Qt6::Qml Qt6::Quick Qt6::Gui Qt6::Test Qt6::QuickControls2
-    OlrTheme OlrStyle olr_warnings)
+    Qt6::QuickTest Qt6::Qml Qt6::Quick Qt6::Gui Qt6::Test Qt6::QuickControls2 Qt6::Multimedia
+    OlrTheme OlrStyle olr_test_playback olr_warnings)
 
 add_test(NAME tst_pgmstage_mapping
     COMMAND tst_pgmstage_mapping -input "${CMAKE_CURRENT_SOURCE_DIR}/tst_pgmstage_mapping.qml")

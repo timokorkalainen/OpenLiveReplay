@@ -9,10 +9,14 @@ def require(text: str, needle: str, message: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        raise SystemExit("usage: test_pgmstage_videooutput_static.py <ui/components/PgmStage.qml>")
+    if len(sys.argv) != 3:
+        raise SystemExit(
+            "usage: test_pgmstage_videooutput_static.py "
+            "<ui/components/PgmStage.qml> <MultiviewWindow.qml>"
+        )
 
     source = Path(sys.argv[1]).read_text(encoding="utf-8")
+    multiview_source = Path(sys.argv[2]).read_text(encoding="utf-8")
 
     require(source, "import QtMultimedia", "PgmStage must use QtMultimedia VideoOutput")
     require(source, "component PreviewVideoOutput", "PgmStage must centralize preview sink attachment")
@@ -26,6 +30,31 @@ def main() -> None:
         raise AssertionError(
             "PgmStage must not use FramePreviewItem; QQuickPaintedItem/toImage is too costly "
             "for the primary iOS playback surface"
+        )
+
+    for name, preview_source in (
+        ("PgmStage", source),
+        ("MultiviewWindow", multiview_source),
+    ):
+        require(
+            preview_source,
+            "property QtObject attachedProvider",
+            f"{name} must null provider references when their C++ QObject is destroyed",
+        )
+        require(
+            preview_source,
+            "var previousProvider =",
+            f"{name} must snapshot its old provider before replacement",
+        )
+        require(
+            preview_source,
+            "attachedProvider = null",
+            f"{name} must clear the old provider before best-effort cleanup",
+        )
+        require(
+            preview_source,
+            'typeof previousProvider.removeVideoSink === "function"',
+            f"{name} must tolerate an already-destroyed old provider",
         )
 
     print("PASS: PgmStage uses VideoOutput preview sinks instead of painted direct previews")

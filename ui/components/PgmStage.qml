@@ -11,8 +11,8 @@ Item {
     property int selectedSourceIndex: -1
     property var visibleStreamIndexes: []
     readonly property int streamCount: visibleStreamIndexes.length
-    property var pgmProvider: ui ? ui.pgmPreviewProvider : null
-    property var multiviewProvider: ui ? ui.multiviewPreviewProvider : null
+    readonly property QtObject pgmProvider: ui ? ui.pgmPreviewProvider : null
+    readonly property QtObject multiviewProvider: ui ? ui.multiviewPreviewProvider : null
     property string viewMode: "multi"
     readonly property int gridColumns: Math.max(1, Math.ceil(Math.sqrt(Math.max(1, streamCount))))
     readonly property int gridRows: Math.ceil(Math.max(1, streamCount) / gridColumns)
@@ -113,9 +113,9 @@ Item {
 
     component PreviewVideoOutput: VideoOutput {
         id: previewOutput
-        property var provider: null
+        property QtObject provider: null
         property bool active: true
-        property var attachedProvider: null
+        property QtObject attachedProvider: null
 
         fillMode: VideoOutput.PreserveAspectFit
 
@@ -128,16 +128,21 @@ Item {
             previewOutput.attachProvider(previewOutput.selectedProvider())
         }
 
+        // qmllint disable missing-property
         function attachProvider(provider) {
             if (previewOutput.attachedProvider === provider) return
-            if (previewOutput.attachedProvider) {
-                previewOutput.attachedProvider.removeVideoSink(videoSink)
+            var previousProvider = previewOutput.attachedProvider
+            previewOutput.attachedProvider = null
+            if (previousProvider
+                    && typeof previousProvider.removeVideoSink === "function") {
+                previousProvider.removeVideoSink(videoSink)
             }
             previewOutput.attachedProvider = provider
             if (previewOutput.attachedProvider) {
                 previewOutput.attachedProvider.addVideoSink(videoSink)
             }
         }
+        // qmllint enable missing-property
 
         onProviderChanged: updateAttachment()
         onActiveChanged: updateAttachment()

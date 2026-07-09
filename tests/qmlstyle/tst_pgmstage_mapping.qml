@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Window
 import QtTest
 import "../../ui/components"
 
@@ -9,6 +10,10 @@ TestCase {
     width: 640
     height: 360
 
+    // qmllint disable unqualified
+    readonly property var previewUiFixture: previewUi
+    // qmllint enable unqualified
+
     QtObject {
         id: mockUi
 
@@ -18,6 +23,8 @@ TestCase {
         property int lastPlaybackIndex: -99
         property bool playbackSingleView: false
         property int playbackSelectedIndex: -1
+        property QtObject multiviewPreviewProvider: null
+        property QtObject pgmPreviewProvider: null
 
         signal playbackProvidersChanged()
         signal streamUrlsChanged()
@@ -40,6 +47,19 @@ TestCase {
         width: tc.width
         height: tc.height
         ui: mockUi
+    }
+
+    Window {
+        id: lifecycleWindow
+        width: 320
+        height: 180
+        visible: true
+
+        PgmStage {
+            id: lifecycleStage
+            anchors.fill: parent
+            ui: tc.previewUiFixture
+        }
     }
 
     function init() {
@@ -99,6 +119,22 @@ TestCase {
         compare(stage.selectedIndex, 0)
         compare(stage.selectedSourceIndex, 1)
         compare(mockUi.lastPlaybackIndex, -99)
+    }
+
+    function test_activeMultiviewReattachesAfterProvidersAreReplaced() {
+        lifecycleStage.resetToMulti()
+
+        tc.previewUiFixture.replacePreviewProviders()
+
+        tryCompare(tc.previewUiFixture, "multiviewHasConsumer", true)
+    }
+
+    function test_pgmAttachesWhenSelectedAfterProvidersAreReplaced() {
+        lifecycleStage.resetToMulti()
+        tc.previewUiFixture.replacePreviewProviders()
+        lifecycleStage.selectViewSlot(0)
+
+        tryCompare(tc.previewUiFixture, "pgmHasConsumer", true)
     }
 
     function test_viewSlotMapChangeRebindsSelectedSourceToNewViewSlot() {
