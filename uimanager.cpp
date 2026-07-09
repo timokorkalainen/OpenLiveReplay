@@ -1812,7 +1812,7 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
     // Route audio for the selected track (or mute in multiview)
     if (m_playbackWorker) {
         m_playbackWorker->setSelectedOutputFeed(selectedIndex);
-        m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!singleView);
+        m_playbackWorker->setRequireAllOutputFeedsForPlayhead(false);
         m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
     }
     if (m_audioPlayer) {
@@ -1906,7 +1906,7 @@ void UIManager::startRecording() {
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
-    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
+    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(false);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     wirePlaybackWorkerCompletion();
 
@@ -1934,7 +1934,7 @@ void UIManager::restartPlaybackWorker() {
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
-    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
+    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(false);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
     wirePlaybackWorkerCompletion();
     m_playbackWorker->openFile(m_replayManager->getVideoPath());

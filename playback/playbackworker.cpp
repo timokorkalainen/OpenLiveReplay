@@ -9,6 +9,7 @@
 #include "playback/output/qtpreviewsink.h"
 #include "playback/output/queuedoutputsink.h"
 #include "playback/output/sinkgpucapability.h"
+#include "playback/repositionfillpolicy.h"
 #include "recorder_engine/ingest/colorvui.h"
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/output/asyncgpureadbacksink.h"
@@ -3283,7 +3284,22 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         }
 
         if (++packets > packetBudget) break; // safety bound
-        if (newestPtsMin() >= fillTo) break; // covered the target
+
+        bool fillReady = false;
+        if (m_outputFeedCount > 0) {
+            QMutexLocker bufferLocker(&m_bufferMutex);
+            fillReady = repositionFillReady(
+                m_outputFeedCount, m_selectedOutputFeed.load(std::memory_order_relaxed),
+                m_requireAllOutputFeedsForPlayhead.load(std::memory_order_acquire), fillTo,
+                [&](int feedIndex) {
+                    for (const DecoderTrack* track : m_decoderBank) {
+                        if (track && track->feedIndex == feedIndex)
+                            return track->buffer.newestPts();
+                    }
+                    return int64_t(-1);
+                });
+        }
+        if ((m_outputFeedCount <= 0 && newestPtsMin() >= fillTo) || fillReady) break;
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
     endGpuSeekPrefetchForReposition();
