@@ -2972,6 +2972,7 @@ void UIManager::refreshProviders() {
 
 int64_t UIManager::recordedDurationMs() {
     // Get this from your Master Clock / Recording Engine
+    if (!m_replayManager) return 0;
     return m_replayManager->getElapsedMs();
 }
 
