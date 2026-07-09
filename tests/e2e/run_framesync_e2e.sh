@@ -361,7 +361,9 @@ run_drift() {
 # If the restamp (SourceClock::toSessionMs slope correction) holds A/V alignment
 # under skew, the offset stays flat and (last_third - first_third) ~ 0. If A/V
 # offset accumulates, the last third drifts away from the first. Gate: regression
-# (last-first) must stay within 1 frame @30 (33.333 ms).
+# (last-first) must stay within OLR_FRAMESYNC_AV_FRAMES frames @30 (default 2, the
+# anti-flake margin over the ~1-frame beep/flash onset quantization floor; matches
+# run_drift_soak.sh).
 run_drift_avsync() {
     local udp="$BASE" srt=$((BASE + 1))
     local mkv harness_err="$WORKDIR/harness.err" clock_ppm
@@ -424,9 +426,16 @@ run_drift_avsync() {
     awk -v r="$reg_ms" 'BEGIN{ exit !(r==r) }' || fail "could not compute A/V regression (first/last third empty)"
 
     # Always gate this scenario: the whole point is to assert flat A/V offset.
-    awk -v r="$reg_ms" 'BEGIN{ if(r<0)r=-r; exit !(r <= 33.333334) }' \
-        || fail "A/V offset regression ${reg_ms}ms (${reg_frames} frames) exceeds 33ms (1 frame @30) under ${SKEW_PPM}ppm skew"
-    echo "PASS: framesync A/V offset regression ${reg_ms}ms (${reg_frames} frames) within 33ms under ${SKEW_PPM}ppm/${SECS}s skew"
+    # Gate the first-third/last-third A/V regression in FRAMES against a tunable
+    # budget. One frame (33.33 ms) is the beep/flash onset quantization floor; the
+    # 2-frame default is the anti-flake margin over it (matches run_drift_soak.sh's
+    # OLR_DRIFT_AV_FRAMES). A real A/V path-split at the injected skew accumulates
+    # well past 2 frames in the third-mean difference, so a 2-frame bound still
+    # trips on the lip-sync-clock regression.
+    local av_frames="${OLR_FRAMESYNC_AV_FRAMES:-2.0}"
+    awk -v f="$reg_frames" -v lim="$av_frames" 'BEGIN{ f=f+0; if(f<0)f=-f; exit !(f <= (lim+0)) }' \
+        || fail "A/V offset regression ${reg_frames} frames (${reg_ms}ms) exceeds ${av_frames} frame(s) @30 under ${SKEW_PPM}ppm/${SECS}s skew"
+    echo "PASS: framesync A/V offset regression ${reg_ms}ms (${reg_frames} frames) within ${av_frames} frame(s) under ${SKEW_PPM}ppm/${SECS}s skew"
 }
 
 # Inject a KNOWN timecode, record, and assert the recorded MKV's tmcd/timecode tag

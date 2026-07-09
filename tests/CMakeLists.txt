@@ -74,6 +74,7 @@ endif()
 
 # --- Lightweight engine sources used by fast unit tests ---------------------
 qt_add_library(olr_test_core STATIC
+    "${CMAKE_SOURCE_DIR}/appenv.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/recordingclock.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/heartbeat.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/driftestimator.cpp"
@@ -90,6 +91,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xaccessunit.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/colorvui.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/codec/colorvui.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeframecopy.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtconnectdiagnostics.h"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtconnectdiagnostics.cpp"
@@ -109,6 +111,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/websocket/controlprotocol.cpp"
     "${CMAKE_SOURCE_DIR}/websocket/controlstate.cpp"
     "${CMAKE_SOURCE_DIR}/websocket/controlwebsocketserver.cpp"
+    "${CMAKE_SOURCE_DIR}/websocket/pendingcommandregistry.cpp"
     "${CMAKE_SOURCE_DIR}/streamdeck/streamdeckmappingstore.cpp"
 )
 target_include_directories(olr_test_core PUBLIC
@@ -174,6 +177,14 @@ target_link_libraries(olr_test_engine
 # never link olr_test_engine, so this define never reaches production code.
 target_compile_definitions(olr_test_engine PUBLIC OLR_UNIT_TEST=1)
 
+if(OLR_GPU_PIPELINE)
+    target_compile_definitions(olr_test_engine PUBLIC OLR_GPU_PIPELINE_BUILD=1)
+    target_sources(olr_test_engine PRIVATE
+        "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/gpudecodedframe.cpp"
+        "${CMAKE_SOURCE_DIR}/recorder_engine/codec/gpuencodepump.cpp")
+    target_link_libraries(olr_test_engine PRIVATE olr_test_playback)
+endif()
+
 if(APPLE)
     target_sources(olr_test_engine PRIVATE
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtingestsession.cpp"
@@ -187,7 +198,7 @@ if(APPLE)
     target_link_directories(olr_test_engine PUBLIC "${OLR_BREW_PREFIX}/opt/srt/lib")
     target_link_libraries(olr_test_engine
         PRIVATE srt "-framework VideoToolbox" "-framework CoreMedia"
-                "-framework CoreFoundation" "-framework CoreVideo")
+                "-framework CoreFoundation" "-framework CoreVideo" "-framework IOSurface")
 elseif(WIN32)
     target_sources(olr_test_engine PRIVATE
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativesrtingestsession.cpp"
@@ -226,17 +237,27 @@ qt_add_library(olr_test_playback STATIC
     "${CMAKE_SOURCE_DIR}/playback/output/outputframecache.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputtargetassignment.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframereadbacktelemetry.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/gpureadbacktelemetry.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/formatcanon.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputdispatcher.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/broadcastoutputstatus.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/outputruntime.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/queuedoutputsink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/asyncgpureadbacksink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/gpureadbackring.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/sinkgpucapability.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/yuv420pcompositor.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/qtpreviewsink.cpp"
     "${CMAKE_SOURCE_DIR}/playback/output/ndiabi.h"
     "${CMAKE_SOURCE_DIR}/playback/output/ndiruntimepaths.h"
     "${CMAKE_SOURCE_DIR}/playback/output/ndisink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/iotargets/sinkcapabilityprobe.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/iotargets/decklinksink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/iotargets/st2110framer.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/iotargets/ajasink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/iotargets/omtsink.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/output/iotargets/iotargetsinkfactory.cpp"
 )
 target_include_directories(olr_test_playback PUBLIC
     "${CMAKE_SOURCE_DIR}"
@@ -253,16 +274,19 @@ target_link_libraries(olr_test_playback
 if(APPLE)
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_apple.mm"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/applegpusurface_apple.mm")
     target_link_libraries(olr_test_playback
-        PRIVATE "-framework CoreFoundation" "-framework CoreVideo" "-framework IOSurface")
+        PRIVATE "-framework CoreFoundation" "-framework CoreVideo" "-framework IOSurface"
+                "-framework Metal")
 else()
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurface_stub.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp")
     if(WIN32)
         target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_win.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3d11gpusurface.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/win/d3dfence.cpp")
@@ -272,6 +296,9 @@ else()
         endif()
         target_link_libraries(olr_test_playback
             PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
+    else()
+        target_sources(olr_test_playback PRIVATE
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp")
     endif()
 endif()
 
@@ -280,27 +307,31 @@ if(OLR_GPU_PIPELINE)
     target_link_libraries(olr_test_playback PRIVATE Qt6::GuiPrivate)
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpubudget.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuseekprefetch.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpulifecyclesink.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosmemoryheadroom.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpupolicy.cpp")
     if(APPLE)
         target_sources(olr_test_playback PRIVATE
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_apple.mm"
-            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_apple.mm"
             "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm")
         target_link_libraries(olr_test_playback
             PRIVATE Qt6::GuiPrivate "-framework Metal" "-framework QuartzCore")
     else()
         target_sources(olr_test_playback PRIVATE
-            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp")
         if(WIN32)
             target_sources(olr_test_playback PRIVATE
-                "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_win.cpp"
-                "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_win.cpp")
+                "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_win.cpp")
         else()
             target_sources(olr_test_playback PRIVATE
                 "${CMAKE_SOURCE_DIR}/playback/gpu/gpurhicontext_stub.cpp")
@@ -310,9 +341,17 @@ if(OLR_GPU_PIPELINE)
     qt_add_library(olr_test_gpu STATIC
         "${CMAKE_SOURCE_DIR}/playback/gpu/olrrhi.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpubudget.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuseekprefetch.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframereadbacktelemetry.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_stub.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpulifecyclesink.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosmemoryheadroom.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpupolicy.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iterator>
+#include <limits>
 
 namespace {
 const int kAacSampleRates[] = {
@@ -302,7 +303,7 @@ QByteArray RtmpChunkWriter::message(int chunkStreamId, int messageType, int mess
     }
 
     const int boundedChunkSize = qMax(1, chunkSize);
-    int offset = 0;
+    qsizetype offset = 0;
     bool first = true;
     while (offset < payload.size() || (first && payload.isEmpty())) {
         const int size =
@@ -534,6 +535,10 @@ bool RtmpChunkParser::push(const QByteArray& bytes, QList<RtmpMessage>* messages
         }
         const qsizetype existingAssemblyBytes = m_assemblies.value(fragment.csid).payload.size();
         const qsizetype projectedPayloadSize = assembly.payload.size() + fragment.fragment.size();
+        if (projectedPayloadSize > std::numeric_limits<int>::max()) {
+            if (error) *error = QStringLiteral("RTMP chunk overflow.");
+            return false;
+        }
         if (projectedPayloadSize < assembly.header.messageLength &&
             assemblyPayloadBytes() - existingAssemblyBytes + projectedPayloadSize >
                 m_maxAssemblyBytes) {
@@ -827,6 +832,9 @@ bool RtmpFlv::parseHevcSequenceHeader(const QByteArray& payload, RtmpHevcConfig*
 
 QByteArray RtmpFlv::lengthPrefixedPayloadToAnnexB(const QByteArray& payload, int nalLengthSize) {
     if (nalLengthSize < 1 || nalLengthSize > 4) {
+        return QByteArray();
+    }
+    if (payload.size() > std::numeric_limits<int>::max()) {
         return QByteArray();
     }
 

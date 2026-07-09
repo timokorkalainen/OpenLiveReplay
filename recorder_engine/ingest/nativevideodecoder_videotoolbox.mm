@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 extern "C" {
@@ -30,29 +31,29 @@ struct DecodeFrameContext {
     bool emittedFrame = false;
     bool copyFailed = false;
     bool ioSurfaceBacked = false;
+    bool surfaceRejected = false;
     OSStatus callbackStatus = noErr;
 };
 
 int startCodeSizeAt(const QByteArray& bytes, int offset) {
-    if (offset + 3 <= bytes.size()
-        && bytes[offset] == char(0)
-        && bytes[offset + 1] == char(0)
-        && bytes[offset + 2] == char(1)) {
+    if (offset + 3 <= bytes.size() && bytes[offset] == char(0) && bytes[offset + 1] == char(0) &&
+        bytes[offset + 2] == char(1)) {
         return 3;
     }
-    if (offset + 4 <= bytes.size()
-        && bytes[offset] == char(0)
-        && bytes[offset + 1] == char(0)
-        && bytes[offset + 2] == char(0)
-        && bytes[offset + 3] == char(1)) {
+    if (offset + 4 <= bytes.size() && bytes[offset] == char(0) && bytes[offset + 1] == char(0) &&
+        bytes[offset + 2] == char(0) && bytes[offset + 3] == char(1)) {
         return 4;
     }
     return 0;
 }
 
 QList<AnnexBNal> splitAnnexBNals(const QByteArray& bytes) {
+    if (bytes.size() > std::numeric_limits<int>::max()) {
+        return {};
+    }
+    const int byteCount = static_cast<int>(bytes.size());
     QList<int> starts;
-    for (int i = 0; i + 3 <= bytes.size();) {
+    for (int i = 0; i + 3 <= byteCount;) {
         const int prefixSize = startCodeSizeAt(bytes, i);
         if (prefixSize > 0) {
             starts.append(i);
@@ -66,8 +67,7 @@ QList<AnnexBNal> splitAnnexBNals(const QByteArray& bytes) {
     for (int i = 0; i < starts.size(); ++i) {
         const int prefixSize = startCodeSizeAt(bytes, starts[i]);
         const int payloadOffset = starts[i] + prefixSize;
-        const int endOffset =
-            (i + 1 < starts.size()) ? starts[i + 1] : static_cast<int>(bytes.size());
+        const int endOffset = (i + 1 < starts.size()) ? starts[i + 1] : byteCount;
         if (prefixSize > 0 && endOffset > payloadOffset) {
             nals.append({payloadOffset, endOffset});
         }
@@ -91,15 +91,20 @@ QByteArray parameterSetKey(NativeVideoCodec codec, const H26xParameterSets& para
     QByteArray key;
     key.append(char(codec == NativeVideoCodec::H264 ? 1 : codec == NativeVideoCodec::Hevc ? 2 : 0));
     if (codec == NativeVideoCodec::H264) {
-        for (const QByteArray& sps : parameterSets.h264Sps) appendParameterSet(&key, sps);
+        for (const QByteArray& sps : parameterSets.h264Sps)
+            appendParameterSet(&key, sps);
         key.append(char(0));
-        for (const QByteArray& pps : parameterSets.h264Pps) appendParameterSet(&key, pps);
+        for (const QByteArray& pps : parameterSets.h264Pps)
+            appendParameterSet(&key, pps);
     } else if (codec == NativeVideoCodec::Hevc) {
-        for (const QByteArray& vps : parameterSets.hevcVps) appendParameterSet(&key, vps);
+        for (const QByteArray& vps : parameterSets.hevcVps)
+            appendParameterSet(&key, vps);
         key.append(char(0));
-        for (const QByteArray& sps : parameterSets.hevcSps) appendParameterSet(&key, sps);
+        for (const QByteArray& sps : parameterSets.hevcSps)
+            appendParameterSet(&key, sps);
         key.append(char(0));
-        for (const QByteArray& pps : parameterSets.hevcPps) appendParameterSet(&key, pps);
+        for (const QByteArray& pps : parameterSets.hevcPps)
+            appendParameterSet(&key, pps);
     }
     return key.size() > 1 ? key : QByteArray();
 }
@@ -123,8 +128,18 @@ QString statusMessage(const QString& action, OSStatus status) {
     return QStringLiteral("%1 (OSStatus %2)").arg(action).arg(status);
 }
 
-void copyRows(const uchar* src, size_t srcStride, uchar* dst, int dstStride,
-              int bytesPerRow, int rows) {
+bool validateDecodedFrameEmitted(const DecodeFrameContext& context, QString* error) {
+    if (context.emittedFrame) {
+        return true;
+    }
+    if (error) {
+        *error = QStringLiteral("VideoToolbox decode produced no frame");
+    }
+    return false;
+}
+
+void copyRows(const uchar* src, size_t srcStride, uchar* dst, int dstStride, int bytesPerRow,
+              int rows) {
     for (int y = 0; y < rows; ++y) {
         memcpy(dst + y * dstStride, src + y * srcStride, size_t(bytesPerRow));
     }
@@ -135,7 +150,8 @@ AVFrame* copyPixelBufferToAvFrame(CVPixelBufferRef pixelBuffer) {
         return nullptr;
     }
 
-    if (CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess) {
+    if (CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly) !=
+        kCVReturnSuccess) {
         return nullptr;
     }
 
@@ -159,8 +175,10 @@ AVFrame* copyPixelBufferToAvFrame(CVPixelBufferRef pixelBuffer) {
 
     const size_t planeCount = CVPixelBufferGetPlaneCount(pixelBuffer);
     if (planeCount == 2) {
-        const auto* ySrc = static_cast<const uchar*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
-        const auto* uvSrc = static_cast<const uchar*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
+        const auto* ySrc =
+            static_cast<const uchar*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
+        const auto* uvSrc =
+            static_cast<const uchar*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
         const size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
         const size_t uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
         const int yRows = std::min(height, int(CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)));
@@ -179,7 +197,8 @@ AVFrame* copyPixelBufferToAvFrame(CVPixelBufferRef pixelBuffer) {
         }
     } else if (planeCount == 3) {
         for (int plane = 0; plane < 3; ++plane) {
-            const auto* src = static_cast<const uchar*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane));
+            const auto* src =
+                static_cast<const uchar*>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane));
             const size_t stride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane);
             const int rows = std::min(plane == 0 ? height : height / 2,
                                       int(CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)));
@@ -194,12 +213,8 @@ AVFrame* copyPixelBufferToAvFrame(CVPixelBufferRef pixelBuffer) {
     return frame;
 }
 
-static void decompressionOutputCallback(void*,
-                                        void* sourceFrameRefCon,
-                                        OSStatus status,
-                                        VTDecodeInfoFlags,
-                                        CVImageBufferRef imageBuffer,
-                                        CMTime,
+static void decompressionOutputCallback(void*, void* sourceFrameRefCon, OSStatus status,
+                                        VTDecodeInfoFlags, CVImageBufferRef imageBuffer, CMTime,
                                         CMTime) {
     auto* context = static_cast<DecodeFrameContext*>(sourceFrameRefCon);
     if (!context) {
@@ -210,18 +225,24 @@ static void decompressionOutputCallback(void*,
         return;
     }
     if (!imageBuffer) {
+        if (context->keepSurface) {
+            context->surfaceRejected = true;
+        }
         return;
     }
 
-    context->ioSurfaceBacked =
-        CVPixelBufferGetIOSurface(CVPixelBufferRef(imageBuffer)) != nullptr;
+    context->ioSurfaceBacked = CVPixelBufferGetIOSurface(CVPixelBufferRef(imageBuffer)) != nullptr;
 
     if (context->keepSurface) {
         if (!context->surfaceCallback) {
             return;
         }
+        const bool accepted = (*context->surfaceCallback)(imageBuffer, context->pts90k);
+        if (!accepted) {
+            context->surfaceRejected = true;
+            return;
+        }
         context->emittedFrame = true;
-        (*context->surfaceCallback)(imageBuffer, context->pts90k);
         return;
     }
 
@@ -242,19 +263,34 @@ static void decompressionOutputCallback(void*,
 
 } // namespace
 
+#ifdef OLR_UNIT_TEST
+bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest() {
+    NativeVideoDecoder::KeepSurfaceCallback callback = [](void*, qint64) { return true; };
+    DecodeFrameContext context;
+    context.keepSurface = true;
+    context.surfaceCallback = &callback;
+    decompressionOutputCallback(nullptr, &context, noErr, 0, nullptr, kCMTimeInvalid,
+                                kCMTimeInvalid);
+    return context.surfaceRejected;
+}
+
+bool nativeVideoDecoderNoFrameRejectedForTest(QString* error) {
+    DecodeFrameContext context;
+    return validateDecodedFrameEmitted(context, error);
+}
+#endif
+
 class NativeVideoDecoder::Impl {
 public:
-    Impl(int outputWidth, int outputHeight)
-        : width(outputWidth)
-        , height(outputHeight) {}
+    Impl(int outputWidth, int outputHeight) : width(outputWidth), height(outputHeight) {}
 
     ~Impl() { reset(); }
 
     bool decode(const CompressedAccessUnit& unit, FrameCallback onFrame, QString* error);
-    bool decodeKeepSurface(const CompressedAccessUnit& unit,
-                           KeepSurfaceCallback onSurface,
+    bool decodeKeepSurface(const CompressedAccessUnit& unit, KeepSurfaceCallback onSurface,
                            QString* error);
     void reset();
+    void flushExcessPixelBufferPool();
     bool lastDecodedWasIOSurfaceBacked() const { return lastIOSurfaceBacked; }
 
 private:
@@ -265,28 +301,51 @@ private:
     CMVideoFormatDescriptionRef format = nullptr;
     VTDecompressionSessionRef session = nullptr;
     bool lastIOSurfaceBacked = false;
+    bool sessionRequiresIOSurface = false;
 
-    bool ensureSession(const CompressedAccessUnit& unit, QString* error);
+    void resetSession();
+    bool ensureSession(const CompressedAccessUnit& unit, bool requireIOSurface, QString* error);
     bool createFormatDescription(const CompressedAccessUnit& unit, QString* error);
-    bool createSession(QString* error);
+    bool createSession(bool requireIOSurface, QString* error);
 };
 
-void NativeVideoDecoder::Impl::reset() {
+void NativeVideoDecoder::Impl::resetSession() {
     if (session) {
         VTDecompressionSessionInvalidate(session);
         CFRelease(session);
         session = nullptr;
     }
+    sessionRequiresIOSurface = false;
+}
+
+void NativeVideoDecoder::Impl::reset() {
+    resetSession();
     if (format) {
         CFRelease(format);
         format = nullptr;
     }
     codec = NativeVideoCodec::Unknown;
     activeParameterSetKey.clear();
+    lastIOSurfaceBacked = false;
+}
+
+void NativeVideoDecoder::Impl::flushExcessPixelBufferPool() {
+    if (!session) return;
+
+    CFTypeRef poolValue = nullptr;
+    const OSStatus status = VTSessionCopyProperty(
+        session, kVTDecompressionPropertyKey_PixelBufferPool, kCFAllocatorDefault, &poolValue);
+    if (status != noErr || !poolValue) return;
+
+    if (CFGetTypeID(poolValue) == CVPixelBufferPoolGetTypeID()) {
+        CVPixelBufferPoolFlush((CVPixelBufferPoolRef)poolValue,
+                               kCVPixelBufferPoolFlushExcessBuffers);
+    }
+    CFRelease(poolValue);
 }
 
 bool NativeVideoDecoder::Impl::createFormatDescription(const CompressedAccessUnit& unit,
-                                                        QString* error) {
+                                                       QString* error) {
     std::vector<const uint8_t*> pointers;
     std::vector<size_t> sizes;
     const auto append = [&](const QList<QByteArray>& nals) {
@@ -308,37 +367,30 @@ bool NativeVideoDecoder::Impl::createFormatDescription(const CompressedAccessUni
         append(unit.parameterSets.h264Sps);
         append(unit.parameterSets.h264Pps);
         status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-            kCFAllocatorDefault,
-            pointers.size(),
-            pointers.data(),
-            sizes.data(),
-            4,
-            &createdFormat);
+            kCFAllocatorDefault, pointers.size(), pointers.data(), sizes.data(), 4, &createdFormat);
     } else if (unit.codec == NativeVideoCodec::Hevc) {
-        if (unit.parameterSets.hevcVps.isEmpty()
-            || unit.parameterSets.hevcSps.isEmpty()
-            || unit.parameterSets.hevcPps.isEmpty()) {
-            if (error) *error = QStringLiteral("VideoToolbox HEVC decode requires VPS, SPS, and PPS");
+        if (unit.parameterSets.hevcVps.isEmpty() || unit.parameterSets.hevcSps.isEmpty() ||
+            unit.parameterSets.hevcPps.isEmpty()) {
+            if (error)
+                *error = QStringLiteral("VideoToolbox HEVC decode requires VPS, SPS, and PPS");
             return false;
         }
         append(unit.parameterSets.hevcVps);
         append(unit.parameterSets.hevcSps);
         append(unit.parameterSets.hevcPps);
         status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
-            kCFAllocatorDefault,
-            pointers.size(),
-            pointers.data(),
-            sizes.data(),
-            4,
-            nullptr,
+            kCFAllocatorDefault, pointers.size(), pointers.data(), sizes.data(), 4, nullptr,
             &createdFormat);
     } else {
-        if (error) *error = QStringLiteral("VideoToolbox decode requires H.264 or HEVC access units");
+        if (error)
+            *error = QStringLiteral("VideoToolbox decode requires H.264 or HEVC access units");
         return false;
     }
 
     if (status != noErr || !createdFormat) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox format description creation failed"), status);
+        if (error)
+            *error = statusMessage(
+                QStringLiteral("VideoToolbox format description creation failed"), status);
         return false;
     }
 
@@ -346,19 +398,22 @@ bool NativeVideoDecoder::Impl::createFormatDescription(const CompressedAccessUni
     return true;
 }
 
-bool NativeVideoDecoder::Impl::createSession(QString* error) {
+bool NativeVideoDecoder::Impl::createSession(bool requireIOSurface, QString* error) {
     CFMutableDictionaryRef attributes = CFDictionaryCreateMutable(
         kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
     const OSType pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    CFNumberRef pixelFormatNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixelFormat);
+    CFNumberRef pixelFormatNumber =
+        CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixelFormat);
     CFDictionarySetValue(attributes, kCVPixelBufferPixelFormatTypeKey, pixelFormatNumber);
     CFRelease(pixelFormatNumber);
 
-    CFDictionaryRef ioSurfaceProps = CFDictionaryCreate(
-        kCFAllocatorDefault, nullptr, nullptr, 0,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey, ioSurfaceProps);
-    CFRelease(ioSurfaceProps);
+    if (requireIOSurface) {
+        CFDictionaryRef ioSurfaceProps =
+            CFDictionaryCreate(kCFAllocatorDefault, nullptr, nullptr, 0,
+                               &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        CFDictionarySetValue(attributes, kCVPixelBufferIOSurfacePropertiesKey, ioSurfaceProps);
+        CFRelease(ioSurfaceProps);
+    }
 
     if (width > 0) {
         CFNumberRef widthNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &width);
@@ -374,26 +429,35 @@ bool NativeVideoDecoder::Impl::createSession(QString* error) {
     VTDecompressionOutputCallbackRecord callback;
     callback.decompressionOutputCallback = decompressionOutputCallback;
     callback.decompressionOutputRefCon = nullptr;
-    const OSStatus status = VTDecompressionSessionCreate(
-        kCFAllocatorDefault, format, nullptr, attributes, &callback, &session);
+    const OSStatus status = VTDecompressionSessionCreate(kCFAllocatorDefault, format, nullptr,
+                                                         attributes, &callback, &session);
     CFRelease(attributes);
 
     if (status != noErr || !session) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox decompression session creation failed"), status);
+        if (error)
+            *error = statusMessage(
+                QStringLiteral("VideoToolbox decompression session creation failed"), status);
         return false;
     }
 
+    sessionRequiresIOSurface = requireIOSurface;
     return true;
 }
 
-bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, QString* error) {
+bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit,
+                                             bool requireIOSurface, QString* error) {
     const QByteArray nextKey = parameterSetKey(unit.codec, unit.parameterSets);
     if (session && unit.codec == codec && (nextKey.isEmpty() || nextKey == activeParameterSetKey)) {
-        return true;
+        if (sessionRequiresIOSurface == requireIOSurface) {
+            return true;
+        }
+        resetSession();
+        return createSession(requireIOSurface, error);
     }
     if (nextKey.isEmpty()) {
         if (error) {
-            *error = QStringLiteral("VideoToolbox needs codec parameter sets before the first frame");
+            *error =
+                QStringLiteral("VideoToolbox needs codec parameter sets before the first frame");
         }
         return false;
     }
@@ -402,21 +466,20 @@ bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, Q
     codec = unit.codec;
     activeParameterSetKey = nextKey;
 
-    if (!createFormatDescription(unit, error) || !createSession(error)) {
+    if (!createFormatDescription(unit, error) || !createSession(requireIOSurface, error)) {
         reset();
         return false;
     }
     return true;
 }
 
-bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
-                                       FrameCallback onFrame,
-                                       QString* error) {
+bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit, FrameCallback onFrame,
+                                      QString* error) {
     if (!onFrame) {
         if (error) *error = QStringLiteral("VideoToolbox decode requires a frame callback");
         return false;
     }
-    if (!ensureSession(unit, error)) {
+    if (!ensureSession(unit, false, error)) {
         return false;
     }
 
@@ -428,17 +491,12 @@ bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
 
     CMBlockBufferRef blockBuffer = nullptr;
     OSStatus status = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault,
-        sampleData.data(),
-        sampleData.size(),
-        kCFAllocatorNull,
-        nullptr,
-        0,
-        sampleData.size(),
-        0,
-        &blockBuffer);
+        kCFAllocatorDefault, sampleData.data(), sampleData.size(), kCFAllocatorNull, nullptr, 0,
+        sampleData.size(), 0, &blockBuffer);
     if (status != noErr || !blockBuffer) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox block buffer creation failed"), status);
+        if (error)
+            *error =
+                statusMessage(QStringLiteral("VideoToolbox block buffer creation failed"), status);
         return false;
     }
 
@@ -451,19 +509,13 @@ bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
     timing.decodeTimeStamp = dts;
 
     CMSampleBufferRef sampleBuffer = nullptr;
-    status = CMSampleBufferCreateReady(
-        kCFAllocatorDefault,
-        blockBuffer,
-        format,
-        1,
-        1,
-        &timing,
-        1,
-        &sampleSize,
-        &sampleBuffer);
+    status = CMSampleBufferCreateReady(kCFAllocatorDefault, blockBuffer, format, 1, 1, &timing, 1,
+                                       &sampleSize, &sampleBuffer);
     CFRelease(blockBuffer);
     if (status != noErr || !sampleBuffer) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox sample buffer creation failed"), status);
+        if (error)
+            *error =
+                statusMessage(QStringLiteral("VideoToolbox sample buffer creation failed"), status);
         return false;
     }
 
@@ -474,31 +526,37 @@ bool NativeVideoDecoder::Impl::decode(const CompressedAccessUnit& unit,
     status = VTDecompressionSessionDecodeFrame(session, sampleBuffer, 0, &context, &infoFlags);
     CFRelease(sampleBuffer);
     if (status != noErr) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox frame decode failed"), status);
+        if (error)
+            *error = statusMessage(QStringLiteral("VideoToolbox frame decode failed"), status);
         return false;
     }
 
     VTDecompressionSessionWaitForAsynchronousFrames(session);
     lastIOSurfaceBacked = context.ioSurfaceBacked;
     if (context.callbackStatus != noErr) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox output callback failed"), context.callbackStatus);
+        if (error)
+            *error = statusMessage(QStringLiteral("VideoToolbox output callback failed"),
+                                   context.callbackStatus);
         return false;
     }
     if (context.copyFailed) {
-        if (error) *error = QStringLiteral("VideoToolbox decoded a frame but pixel buffer copy failed");
+        if (error)
+            *error = QStringLiteral("VideoToolbox decoded a frame but pixel buffer copy failed");
+        return false;
+    }
+    if (!validateDecodedFrameEmitted(context, error)) {
         return false;
     }
     return true;
 }
 
 bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& unit,
-                                                  KeepSurfaceCallback onSurface,
-                                                  QString* error) {
+                                                 KeepSurfaceCallback onSurface, QString* error) {
     if (!onSurface) {
         if (error) *error = QStringLiteral("VideoToolbox keep-surface decode requires a callback");
         return false;
     }
-    if (!ensureSession(unit, error)) {
+    if (!ensureSession(unit, true, error)) {
         return false;
     }
 
@@ -510,17 +568,12 @@ bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& uni
 
     CMBlockBufferRef blockBuffer = nullptr;
     OSStatus status = CMBlockBufferCreateWithMemoryBlock(
-        kCFAllocatorDefault,
-        sampleData.data(),
-        sampleData.size(),
-        kCFAllocatorNull,
-        nullptr,
-        0,
-        sampleData.size(),
-        0,
-        &blockBuffer);
+        kCFAllocatorDefault, sampleData.data(), sampleData.size(), kCFAllocatorNull, nullptr, 0,
+        sampleData.size(), 0, &blockBuffer);
     if (status != noErr || !blockBuffer) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox block buffer creation failed"), status);
+        if (error)
+            *error =
+                statusMessage(QStringLiteral("VideoToolbox block buffer creation failed"), status);
         return false;
     }
 
@@ -533,19 +586,13 @@ bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& uni
     timing.decodeTimeStamp = dts;
 
     CMSampleBufferRef sampleBuffer = nullptr;
-    status = CMSampleBufferCreateReady(
-        kCFAllocatorDefault,
-        blockBuffer,
-        format,
-        1,
-        1,
-        &timing,
-        1,
-        &sampleSize,
-        &sampleBuffer);
+    status = CMSampleBufferCreateReady(kCFAllocatorDefault, blockBuffer, format, 1, 1, &timing, 1,
+                                       &sampleSize, &sampleBuffer);
     CFRelease(blockBuffer);
     if (status != noErr || !sampleBuffer) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox sample buffer creation failed"), status);
+        if (error)
+            *error =
+                statusMessage(QStringLiteral("VideoToolbox sample buffer creation failed"), status);
         return false;
     }
 
@@ -557,14 +604,25 @@ bool NativeVideoDecoder::Impl::decodeKeepSurface(const CompressedAccessUnit& uni
     status = VTDecompressionSessionDecodeFrame(session, sampleBuffer, 0, &context, &infoFlags);
     CFRelease(sampleBuffer);
     if (status != noErr) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox frame decode failed"), status);
+        if (error)
+            *error = statusMessage(QStringLiteral("VideoToolbox frame decode failed"), status);
         return false;
     }
 
     VTDecompressionSessionWaitForAsynchronousFrames(session);
     lastIOSurfaceBacked = context.ioSurfaceBacked;
     if (context.callbackStatus != noErr) {
-        if (error) *error = statusMessage(QStringLiteral("VideoToolbox output callback failed"), context.callbackStatus);
+        if (error)
+            *error = statusMessage(QStringLiteral("VideoToolbox output callback failed"),
+                                   context.callbackStatus);
+        return false;
+    }
+    if (context.surfaceRejected) {
+        if (error)
+            *error = QStringLiteral("VideoToolbox keep-surface callback rejected decoded surface");
+        return false;
+    }
+    if (!validateDecodedFrameEmitted(context, error)) {
         return false;
     }
     return true;
@@ -577,20 +635,22 @@ NativeVideoDecoder::~NativeVideoDecoder() {
     delete m_impl;
 }
 
-bool NativeVideoDecoder::decode(const CompressedAccessUnit& unit,
-                                 FrameCallback onFrame,
-                                 QString* error) {
+bool NativeVideoDecoder::decode(const CompressedAccessUnit& unit, FrameCallback onFrame,
+                                QString* error) {
     return m_impl->decode(unit, std::move(onFrame), error);
 }
 
 bool NativeVideoDecoder::decodeKeepSurface(const CompressedAccessUnit& unit,
-                                           KeepSurfaceCallback onSurface,
-                                           QString* error) {
+                                           KeepSurfaceCallback onSurface, QString* error) {
     return m_impl->decodeKeepSurface(unit, std::move(onSurface), error);
 }
 
 void NativeVideoDecoder::reset() {
     m_impl->reset();
+}
+
+void NativeVideoDecoder::flushExcessPixelBufferPool() {
+    m_impl->flushExcessPixelBufferPool();
 }
 
 bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {

@@ -9,6 +9,12 @@ WinGpuImportCapabilities probeWinGpuImport() {
     return caps;
 }
 
+#ifdef OLR_UNIT_TEST
+bool winGpuImportProbeForcesHardwareDecoderForTest() {
+    return false;
+}
+#endif
+
 struct WinGpuImportEdge::Impl {};
 
 std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
@@ -23,13 +29,27 @@ bool WinGpuImportEdge::isAvailable() const {
     return false;
 }
 
+bool WinGpuImportEdge::deviceLost() const {
+    return false;
+}
+
 std::optional<FrameHandle> WinGpuImportEdge::tryImport(void*, int, qint64, int, int,
                                                        std::shared_ptr<GpuFence>) {
     return std::nullopt;
 }
 
+std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void*, int, int) {
+    return nullptr;
+}
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface>,
+                                                        FrameMetadata, std::shared_ptr<GpuFence>,
+                                                        GpuBudgetCharge) {
+#else
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface>,
                                                         FrameMetadata, std::shared_ptr<GpuFence>) {
+#endif
     return FrameHandle();
 }
 

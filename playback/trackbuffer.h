@@ -4,6 +4,8 @@
 
 #include <QVector>
 #include <cstdint>
+#include <functional>
+#include <optional>
 
 // One video track's decoded-frame window. Frames are kept sorted ascending
 // by PTS and unique by PTS. Pure data structure: no ffmpeg, no threads.
@@ -35,6 +37,10 @@ public:
     int64_t oldestPts() const; // -1 if empty
     bool isEmpty() const { return m_frames.isEmpty(); }
     int size() const { return static_cast<int>(m_frames.size()); }
+    int replaceFrames(const std::function<std::optional<FrameHandle>(const FrameHandle&)>& fn,
+                      EvictedFrames* evictedFrames = nullptr);
+    int removeFramesIf(const std::function<bool(const FrameHandle&)>& predicate,
+                       EvictedFrames* evictedFrames = nullptr);
 
     // Drop frames with PTS < keepFromMs or PTS > keepToMs.
     void trim(int64_t keepFromMs, int64_t keepToMs, EvictedFrames* evictedFrames = nullptr);

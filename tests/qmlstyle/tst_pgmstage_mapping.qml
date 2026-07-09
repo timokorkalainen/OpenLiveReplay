@@ -16,11 +16,14 @@ TestCase {
         property int multiviewCount: 4
         property int lastPlaybackSingle: -1
         property int lastPlaybackIndex: -99
+        property bool playbackSingleView: false
+        property int playbackSelectedIndex: -1
 
         signal playbackProvidersChanged()
         signal streamUrlsChanged()
         signal feedSelectRequested(int index)
         signal multiviewRequested()
+        signal playbackViewStateChanged()
 
         function setPlaybackViewState(singleView, selectedIndex) {
             lastPlaybackSingle = singleView ? 1 : 0
@@ -83,6 +86,18 @@ TestCase {
         compare(stage.viewMode, "multi")
         compare(stage.selectedIndex, -1)
         compare(stage.selectedSourceIndex, -1)
+        compare(mockUi.lastPlaybackIndex, -99)
+    }
+
+    function test_externalPlaybackViewStateDrivesVisibleSingleView() {
+        mockUi.playbackSingleView = true
+        mockUi.playbackSelectedIndex = 0
+
+        mockUi.playbackViewStateChanged()
+
+        compare(stage.viewMode, "single")
+        compare(stage.selectedIndex, 0)
+        compare(stage.selectedSourceIndex, 1)
         compare(mockUi.lastPlaybackIndex, -99)
     }
 

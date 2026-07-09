@@ -11,18 +11,22 @@ private slots:
     void elevatedRetransIsAmber();
     void lightRetransIsGreen();
     void thresholdIsStrict();
+    void decodeFailureIsAmber();
+    void sustainedDecodeFailureIsRed();
     void counterResetIsGreen();
     void noRecvNoAmber();
 };
 
 // helper: build a cumulative snapshot
-static IngestStats snap(qint64 recv, qint64 retrans, qint64 loss, qint64 drop) {
+static IngestStats snap(qint64 recv, qint64 retrans, qint64 loss, qint64 drop,
+                        quint64 decodeFailures = 0) {
     IngestStats s;
     s.kind = IngestStatsKind::Srt;
     s.recvTotal = recv;
     s.retransTotal = retrans;
     s.lossTotal = loss;
     s.dropTotal = drop;
+    s.decodeFailures = decodeFailures;
     return s;
 }
 
@@ -60,6 +64,18 @@ void TestSourceHealth::thresholdIsStrict() {
     const IngestStats a = snap(1000, 0, 0, 0);
     const IngestStats b = snap(2000, 20, 20, 0); // exactly 2% -> NOT amber (strictly >)
     QCOMPARE(srtHealth(a, b, 0.02), SourceHealth::Green);
+}
+
+void TestSourceHealth::decodeFailureIsAmber() {
+    const IngestStats a = snap(1000, 0, 0, 0, 3);
+    const IngestStats b = snap(2000, 0, 0, 0, 4);
+    QCOMPARE(srtHealth(a, b, 0.02), SourceHealth::Amber);
+}
+
+void TestSourceHealth::sustainedDecodeFailureIsRed() {
+    const IngestStats a = snap(2000, 0, 0, 0, 3);
+    const IngestStats b = snap(2000, 0, 0, 0, 8);
+    QCOMPARE(srtHealth(a, b, 0.02), SourceHealth::Red);
 }
 
 void TestSourceHealth::counterResetIsGreen() {

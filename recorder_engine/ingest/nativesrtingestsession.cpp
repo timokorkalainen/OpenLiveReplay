@@ -3,6 +3,7 @@
 #include "nativesrtaddress.h"
 #include "nativesrtconnectdiagnostics.h"
 #include "nativesrturloptions.h"
+#include "gpudecodedframe.h"
 
 #include <QDebug>
 #include <QThread>
@@ -10,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <utility>
 
@@ -36,6 +38,9 @@ constexpr int kMaxAdtsFrameSize = 8191;
 // clock's per-frame millisecond jitter (which would otherwise fragment the
 // sample-contiguous track into clicks). 200 ms @ 48 kHz.
 constexpr int64_t kAudioResyncSamples = 200LL * 48;
+// Match the audio FIFO policy for video: tolerate recovered-clock jitter, but
+// re-anchor on a real gap/seek/reconnect-level jump.
+constexpr int64_t kVideoResyncMs = 200;
 constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
 
 std::mutex srtLibraryMutex;
@@ -242,6 +247,9 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_activeCodec = NativeVideoCodec::Unknown;
     m_splitter.reset();
     m_decoder.reset();
+    m_keepSurfaceDecodeActive = false;
+    m_videoPtsAnchor90k = -1;
+    m_videoPtsAnchorStreamMs = -1;
     m_audioDecoder.reset();
     m_audioRemainder.clear();
     if (!m_externalClock) {
@@ -261,6 +269,7 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_pendingVideoTimecode100ns = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastDecodeErrorLogMs = -1;
+    m_decodeFailures = 0;
     m_statRetrans = -1;
     m_statLossTotal = -1;
     m_statDropTotal = -1;
@@ -314,6 +323,7 @@ void NativeSrtIngestSession::run() {
                         stats.clockQuality = int(m_clock->quality());
                         stats.clockLocked = m_clock->locked();
                         stats.clockOffsetNs = m_clock->anchorOffsetNs();
+                        stats.decodeFailures = m_decodeFailures;
                         m_callbacks.reportStats(stats);
                     }
                 }
@@ -355,6 +365,8 @@ void NativeSrtIngestSession::run() {
             .arg(m_statLossTotal)
             .arg(m_statDropTotal)
             .arg(m_statRecvTotal));
+
+    drainPendingVideoAccessUnits();
 
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(false);
@@ -458,11 +470,18 @@ bool NativeSrtIngestSession::openSocketToAddress(const NativeSrtSockaddr& addres
     }
 
     const QByteArray streamId = streamIdForSocketOption(m_url);
-    if (!streamId.isEmpty() &&
-        !setSrtOption(m_socket, SRTO_STREAMID, streamId.constData(),
-                      static_cast<int>(streamId.size()), error, QStringLiteral("SRTO_STREAMID"))) {
-        closeSocket();
-        return false;
+    if (!streamId.isEmpty()) {
+        if (streamId.size() > std::numeric_limits<int>::max()) {
+            if (error) *error = QStringLiteral("SRT streamid is too large");
+            closeSocket();
+            return false;
+        }
+        if (!setSrtOption(m_socket, SRTO_STREAMID, streamId.constData(),
+                          static_cast<int>(streamId.size()), error,
+                          QStringLiteral("SRTO_STREAMID"))) {
+            closeSocket();
+            return false;
+        }
     }
 
     // Encrypted SRT: set the key length first, then the passphrase (which is what
@@ -712,15 +731,7 @@ void NativeSrtIngestSession::processReceivedBytes(const char* data, int size) {
         // Also clear the per-stream jump trackers so the next unit's jump heuristic
         // doesn't immediately discard the PCR re-anchor (keeps "PCR wins").
         if (tsInfo.discontinuity) {
-            m_clock->reset();
-            m_prevDts90k = -1;
-            m_prevAudioPts90k = -1;
-            m_prevRawPcr90k = -1;
-            m_prevRawVideoDts90k = -1;
-            m_prevRawAudioPts90k = -1;
-            m_pcrWrapOffset90k = 0;
-            m_videoWrapOffset90k = 0;
-            m_audioWrapOffset90k = 0;
+            resetTimingStateForDiscontinuity();
         }
         if (tsInfo.pcr90k >= 0) {
             const int64_t pcr90k = unwrapPcr90k(tsInfo.pcr90k);
@@ -762,18 +773,34 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
     }
 
     if (!m_splitter || m_activeCodec != pes.videoCodec) {
+        drainPendingVideoAccessUnits();
         m_activeCodec = pes.videoCodec;
         m_splitter = std::make_unique<H26xAccessUnitSplitter>(pes.videoCodec);
         m_decoder.reset();
+        m_keepSurfaceDecodeActive = false;
+        m_videoPtsAnchor90k = -1;
+        m_videoPtsAnchorStreamMs = -1;
         m_prevDts90k = -1;
     }
 
     const QList<CompressedAccessUnit> units =
         m_splitter->pushPesPayload(pes.payload, pes.pts90k, pes.dts90k);
+    processVideoAccessUnits(units);
+}
+
+int NativeSrtIngestSession::drainPendingVideoAccessUnits() {
+    if (!m_splitter) {
+        return 0;
+    }
+    const QList<CompressedAccessUnit> units = m_splitter->flush();
+    processVideoAccessUnits(units);
+    return int(units.size());
+}
+
+void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAccessUnit>& units) {
     if (units.isEmpty()) {
         return;
     }
-
     if (!m_decoder) {
         m_decoder = std::make_unique<NativeVideoDecoder>(m_outputWidth, m_outputHeight);
     }
@@ -789,6 +816,53 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
         }
 
         const int64_t timecode100ns = m_pendingVideoTimecode100ns;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+        const bool preferGpuVideoFrames =
+            ingestPrefersGpuVideoFrames(m_callbacks) && m_callbacks.onVideoFrame;
+        if (preferGpuVideoFrames) {
+            m_keepSurfaceDecodeActive = true;
+            QString gpuError;
+            bool gpuSurfaceRejected = false;
+            const bool decodedGpu = m_decoder->decodeKeepSurface(
+                unit,
+                [this, &unit, sourcePtsMs, timecode100ns,
+                 &gpuSurfaceRejected](void* nativeDecodedImage, qint64 /*pts90k*/) {
+                    const FrameMetadata meta =
+                        gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                    ImportedGpuVideoFrame imported;
+                    if (m_callbacks.importGpuVideoFrame) {
+                        imported = m_callbacks.importGpuVideoFrame(nativeDecodedImage, meta);
+                    } else {
+                        imported.frame = makeGpuDecodedFrameHandle(
+                            nativeDecodedImage, unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                    }
+                    FrameHandle gpuFrame = std::move(imported.frame);
+                    if (gpuFrame.isNull()) {
+                        gpuSurfaceRejected = true;
+                        return false;
+                    }
+
+                    DecodedVideoFrame decodedFrame;
+                    decodedFrame.sourcePtsMs = sourcePtsMs;
+                    decodedFrame.sourceTimecode100ns = timecode100ns;
+                    decodedFrame.gpuFrame = std::move(gpuFrame);
+                    decodedFrame.gpuFenceValue = imported.fenceValue;
+                    m_callbacks.onVideoFrame(std::move(decodedFrame));
+                    return true;
+                },
+                &gpuError);
+            if (decodedGpu) {
+                continue;
+            }
+            if (keepSurfaceDecodeNeedsResetBeforeCpuFallback(decodedGpu, gpuSurfaceRejected)) {
+                m_decoder->reset();
+                m_keepSurfaceDecodeActive = false;
+            }
+        } else if (m_keepSurfaceDecodeActive) {
+            m_decoder->reset();
+            m_keepSurfaceDecodeActive = false;
+        }
+#endif
         QString error;
         const bool decoded = m_decoder->decode(
             unit,
@@ -803,13 +877,13 @@ void NativeSrtIngestSession::processPesPacket(const PesPacket& pes) {
 
                 DecodedVideoFrame decodedFrame;
                 decodedFrame.frame = frame;
-                const int64_t decodedPtsMs = m_clock->toSessionMs(frame->pts);
-                decodedFrame.sourcePtsMs = decodedPtsMs >= 0 ? decodedPtsMs : sourcePtsMs;
+                decodedFrame.sourcePtsMs = sourcePtsMs;
                 decodedFrame.sourceTimecode100ns = timecode100ns;
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);
         if (!decoded && !error.isEmpty()) {
+            ++m_decodeFailures;
             const int64_t nowMs = m_monotonic.elapsed();
             if (m_lastDecodeErrorLogMs < 0 || nowMs - m_lastDecodeErrorLogMs >= 5000) {
                 log(error);
@@ -840,7 +914,7 @@ void NativeSrtIngestSession::processAudioPesPacket(const PesPacket& pes) {
         }
     }
 
-    const int remainderSize = static_cast<int>(m_audioRemainder.size());
+    const qsizetype remainderSize = m_audioRemainder.size();
     qint64 basePts90k = pes.pts90k;
     if (remainderSize > 0 && m_audioRemainderPts90k >= 0) {
         basePts90k = m_audioRemainderPts90k;
@@ -965,7 +1039,13 @@ int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& u
 
     const int64_t nowMs = m_callbacks.recordingClockMs ? m_callbacks.recordingClockMs() : -1;
     m_clock->observe(unitDts90k, nowMs, discontinuity, ClockObservationRole::Authority);
-    return m_clock->toSessionMs(unitPts90k);
+    if (discontinuity) {
+        m_videoPtsAnchor90k = -1;
+        m_videoPtsAnchorStreamMs = -1;
+    }
+    const int64_t clockMappedMs = m_clock->toSessionMs(unitPts90k);
+    return advanceVideoFramePtsMs(&m_videoPtsAnchor90k, &m_videoPtsAnchorStreamMs, unitPts90k,
+                                  clockMappedMs, kVideoResyncMs);
 }
 
 void NativeSrtIngestSession::updatePendingVideoTimecode(const CompressedAccessUnit& unit) {
@@ -1012,6 +1092,24 @@ int64_t NativeSrtIngestSession::advanceAudioFifoSample(int64_t* fifoSamplePos,
     return startSample;
 }
 
+int64_t NativeSrtIngestSession::advanceVideoFramePtsMs(int64_t* anchorTs90k,
+                                                       int64_t* anchorStreamMs, qint64 pts90k,
+                                                       int64_t clockMappedMs, int64_t resyncMs) {
+    if (!anchorTs90k || !anchorStreamMs || pts90k < 0 || clockMappedMs < 0) {
+        return -1;
+    }
+
+    const int64_t projectedMs = sourcePtsMsFromAnchor(pts90k, *anchorTs90k, *anchorStreamMs);
+    const bool needAnchor = projectedMs < 0 || std::llabs(clockMappedMs - projectedMs) > resyncMs;
+    if (needAnchor) {
+        *anchorTs90k = pts90k;
+        *anchorStreamMs = clockMappedMs;
+        return clockMappedMs;
+    }
+
+    return projectedMs;
+}
+
 int64_t NativeSrtIngestSession::unwrapPcr90k(int64_t raw90k) {
     return unwrap33Bit90k(raw90k, &m_prevRawPcr90k, &m_pcrWrapOffset90k);
 }
@@ -1022,6 +1120,27 @@ int64_t NativeSrtIngestSession::unwrapVideo90k(int64_t raw90k) {
 
 int64_t NativeSrtIngestSession::unwrapAudio90k(int64_t raw90k) {
     return unwrap33Bit90k(raw90k, &m_prevRawAudioPts90k, &m_audioWrapOffset90k);
+}
+
+void NativeSrtIngestSession::resetTimingStateForDiscontinuity() {
+    m_clock->reset();
+    m_prevDts90k = -1;
+    m_prevAudioPts90k = -1;
+    m_videoPtsAnchor90k = -1;
+    m_videoPtsAnchorStreamMs = -1;
+    m_forceNextPcrObserve = true;
+    m_audioRemainder.clear();
+    m_audioRemainderPts90k = -1;
+    m_audioFifoSamplePos = -1;
+    m_prevRawPcr90k = -1;
+    m_prevRawVideoDts90k = -1;
+    m_prevRawAudioPts90k = -1;
+    m_pcrWrapOffset90k = 0;
+    m_videoWrapOffset90k = 0;
+    m_audioWrapOffset90k = 0;
+    if (m_audioDecoder) {
+        m_audioDecoder->reset();
+    }
 }
 
 int64_t NativeSrtIngestSession::sourcePtsMsForAudio(qint64 pts90k) {

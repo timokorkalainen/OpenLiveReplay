@@ -22,12 +22,14 @@ struct OutputFrameIdentity {
     quint32 videoHash = 0;
     quint32 audioHash = 0;
     uint64_t videoGpuGeneration = 0;
+    qint64 sourceDecodedSequence = 0;
 
     bool samePayloadAs(const OutputFrameIdentity& other) const {
         return bus == other.bus && sourceFeedIndex == other.sourceFeedIndex &&
                sourcePtsMs == other.sourcePtsMs && videoPlaceholder == other.videoPlaceholder &&
                audioSilent == other.audioSilent && videoHash == other.videoHash &&
-               audioHash == other.audioHash && videoGpuGeneration == other.videoGpuGeneration;
+               audioHash == other.audioHash && videoGpuGeneration == other.videoGpuGeneration &&
+               sourceDecodedSequence == other.sourceDecodedSequence;
     }
 
     bool operator==(const OutputFrameIdentity& other) const {
@@ -36,7 +38,8 @@ struct OutputFrameIdentity {
                sourceFeedIndex == other.sourceFeedIndex && sourcePtsMs == other.sourcePtsMs &&
                videoPlaceholder == other.videoPlaceholder && audioSilent == other.audioSilent &&
                videoHash == other.videoHash && audioHash == other.audioHash &&
-               videoGpuGeneration == other.videoGpuGeneration;
+               videoGpuGeneration == other.videoGpuGeneration &&
+               sourceDecodedSequence == other.sourceDecodedSequence;
     }
 };
 
@@ -63,6 +66,16 @@ struct OutputBusFrame {
 
 OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 
+namespace OutputFrameSelection {
+// Container and transport integer-ms rounding can put the intended stepped frame just ahead of
+// the playhead. Keep this window tight so lower-cadence sources still hold the prior frame.
+constexpr qint64 kTimestampRoundingToleranceMs = 2;
+
+inline bool isTimestampRoundingFuture(qint64 deltaMs) {
+    return deltaMs >= 0 && deltaMs <= kTimestampRoundingToleranceMs;
+}
+} // namespace OutputFrameSelection
+
 // Persistent (caller-owned) memo for the multiview compositor. The composited grid depends
 // only on the source frames selected for a tick, so when the exact per-feed source
 // descriptor is unchanged the full-resolution scale can be skipped and the prior planes
@@ -70,7 +83,15 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame);
 // fresh composite — a hash key could collide and emit a stale frame.
 struct MultiviewComposite {
     bool valid = false;
-    QVector<qint64> sourceKeys{}; // 3 entries per feed: present flag, selected pts, GPU generation
+    // Output GPU generation plus 8 entries per feed: presence/timing/source generation plus
+    // color/range dimensions.
+    QVector<qint64> sourceKeys{};
+    FrameHandle video;
+};
+
+struct PgmComposite {
+    bool valid = false;
+    QVector<qint64> sourceKeys{};
     FrameHandle video;
 };
 
@@ -82,7 +103,7 @@ public:
                               const PlaybackStateSnapshot& state,
                               const OutputFrameCache& cache) const;
     OutputBusFrame renderPgm(qint64 outputFrameIndex, const PlaybackStateSnapshot& state,
-                             const OutputFrameCache& cache) const;
+                             const OutputFrameCache& cache, PgmComposite* memo = nullptr) const;
     OutputBusFrame renderMultiview(qint64 outputFrameIndex, const PlaybackStateSnapshot& state,
                                    const OutputFrameCache& cache,
                                    MultiviewComposite* memo = nullptr) const;
@@ -93,7 +114,8 @@ public:
 private:
     OutputBusFrame renderSingleSource(OutputBusId bus, int feedIndex, qint64 outputFrameIndex,
                                       const PlaybackStateSnapshot& state,
-                                      const OutputFrameCache& cache, bool allowAudio) const;
+                                      const OutputFrameCache& cache, bool allowAudio,
+                                      PgmComposite* pgmMemo = nullptr) const;
     MediaAudioFrame renderAudioForFeed(int feedIndex, qint64 outputFrameIndex,
                                        const PlaybackStateSnapshot& state,
                                        const OutputFrameCache& cache, bool allowAudio) const;

@@ -9,6 +9,7 @@
 #     local-only coverage CI does not run
 #   * clang-tidy on changed first-party C++
 #   * the fast unit label (-L ci)
+#   * the GPU async-readback / AV-sync / device-loss / budget / seek-prefetch e2e selector
 # A build / unit / clang-tidy failure blocks the push.
 #
 # A docs-only push -- one whose every changed file (vs merge-base with
@@ -36,15 +37,15 @@
 #   OLR_PREPUSH_SKIP=1 push   -> emergency bypass ONLY (never use git push --no-verify;
 #                                prefer the per-gate SKIP_* flags for platform skipping)
 #   OLR_PREPUSH_LIGHT=1 push  -> delivery matrix ONLY (skip clang-tidy + unit)
-#   SKIP_UNIT=1 / SKIP_TIDY=1  -> skip one default gate
+#   SKIP_UNIT=1 / SKIP_TIDY=1 / SKIP_GPU_E2E=1  -> skip one default gate
 #   OLR_PREPUSH_FULL=1 push   -> ALSO run e2e + ASan/UBSan + TSan + full CTest matrix + iOS
 #                                (skip parts: SKIP_E2E=1 / SKIP_ASAN=1 / SKIP_TSAN=1 /
 #                                 SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
 #
 # Tunables:
 #   OLR_E2E_CLIP_SECONDS  (default 5)               e2e / delivery clip length
-#   QT_HOST_PREFIX        (default ~/Qt/6.10.1/macos)
-#   QT_IOS_PREFIX         (default ~/Qt/6.10.1/ios)  used only by OLR_PREPUSH_FULL
+#   QT_HOST_PREFIX        macOS Qt kit; auto-detected when unset (see below)
+#   QT_IOS_PREFIX         iOS Qt kit; auto-detected when unset  (OLR_PREPUSH_FULL only)
 #
 # Enable the hook once per clone:  git config core.hooksPath .githooks
 set -euo pipefail
@@ -104,8 +105,36 @@ if [ "${OLR_PREPUSH_DOCS_FULL:-0}" != "1" ]; then
     fi
 fi
 
-QT_VERSION="${QT_VERSION:-6.10.1}"
-QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/$QT_VERSION/macos}}"
+QT_VERSION="${QT_VERSION:-6.11.1}"
+
+# Resolve the Qt kit prefixes portably so the gate runs on any machine without a
+# hard-coded home path: an explicit override wins, then the same env vars the build
+# honors (OLR_QT_ROOT / QT_ROOT_DIR), then Homebrew, then the newest online-installer
+# kit, then Qt tools on PATH. Only the final literal is version-pinned (last resort).
+olr_qt_host_prefix() {
+    if [ -n "${QT_HOST_PREFIX:-}" ]; then printf '%s\n' "$QT_HOST_PREFIX"; return 0; fi
+    if [ -n "${OLR_QT_ROOT:-}" ]; then printf '%s\n' "$OLR_QT_ROOT"; return 0; fi
+    if [ -n "${QT_ROOT_DIR:-}" ]; then printf '%s\n' "$QT_ROOT_DIR"; return 0; fi
+    local cand
+    for cand in /opt/homebrew/opt/qt /usr/local/opt/qt; do
+        if [ -d "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
+    done
+    local newest
+    newest="$(ls -d "$HOME"/Qt/6.*/macos 2>/dev/null | sort -V | tail -1 || true)"
+    if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+    local tool prefix
+    for tool in qtpaths6 qtpaths qmake6 qmake; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            case "$tool" in
+                qtpaths*) prefix="$("$tool" --install-prefix 2>/dev/null || true)" ;;
+                *) prefix="$("$tool" -query QT_INSTALL_PREFIX 2>/dev/null || true)" ;;
+            esac
+            if [ -n "$prefix" ] && [ -d "$prefix" ]; then printf '%s\n' "$prefix"; return 0; fi
+        fi
+    done
+    printf '%s\n' "$HOME/Qt/$QT_VERSION/macos"
+}
+QT_HOST_PREFIX="$(olr_qt_host_prefix)"
 CLIP_SECONDS="${OLR_E2E_CLIP_SECONDS:-5}"
 DELIVERY_BUILD_DIR="${OLR_PREPUSH_DELIVERY_BUILD_DIR:-build/prepush-delivery}"
 
@@ -168,11 +197,12 @@ fi
 # macOS build-test CI job used to enforce); the same build dir is reused by the
 # native unit/e2e and clang-tidy gates below.
 echo "[pre-push] Building current-platform host in ${DELIVERY_BUILD_DIR}..."
-cmake -S . -B "$DELIVERY_BUILD_DIR" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
-    -DOLR_WERROR=ON \
-    -DOLR_BUILD_TESTS=ON >/dev/null
+    cmake -S . -B "$DELIVERY_BUILD_DIR" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Debug \
+        -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
+        -DOLR_WERROR=ON \
+        -DOLR_GPU_PIPELINE=ON \
+        -DOLR_BUILD_TESTS=ON >/dev/null
 cmake --build "$DELIVERY_BUILD_DIR"
 
 # --- 3. Sanity: the delivery-gate label must resolve to exactly 4 cells --------
@@ -206,6 +236,7 @@ export QT_QPA_PLATFORM
 
 # Selectors kept verbatim so local == CI.
 UNIT_SELECTOR_LE='sync-report|srt|native-apple-ingest|native-rtmp'
+GPU_E2E_LABELS='async-readback|av-sync|device-loss|gpu-budget|seek-prefetch'
 E2E_REGEX='^(e2e_record_stereo|e2e_record_mono|e2e_record_rational_fps|e2e_record_rational_fps_h264|e2e_play_storm|e2e_play_seekplay|e2e_play_armedcut|e2e_play_playlist)$'
 
 # --- 5. Fast unit label (-L ci) on the build above -- catches the unit failures
@@ -219,7 +250,17 @@ else
     echo "[pre-push] Unit suite OK."
 fi
 
-# --- 6. clang-tidy on changed first-party C++ (was: build-test-macos clang-tidy) -
+# --- 6. GPU regression e2e selector -- mirrors the GitHub GPU gate. -----------
+if [ "${SKIP_GPU_E2E:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_GPU_E2E=1 - skipping GPU regression e2e."
+else
+    echo "[pre-push] Running GPU regression e2e (${GPU_E2E_LABELS})..."
+    ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+        --no-tests=error -L "$GPU_E2E_LABELS"
+    echo "[pre-push] GPU regression e2e OK."
+fi
+
+# --- 7. clang-tidy on changed first-party C++ (was: build-test-macos clang-tidy) -
 # Uses the delivery build's compile_commands.json. Pass 1 = whole changed file
 # (config-driven WarningsAsErrors); Pass 2 = diff-scoped narrowing/widening gate.
 # Skipped with a warning (not fatal) if LLVM clang-tidy is unavailable, matching
@@ -275,7 +316,7 @@ else
     fi
 fi
 
-# --- 7. OPT-IN heavy gates (OLR_PREPUSH_FULL): the e2e + sanitizer + iOS passes
+# --- 8. OPT-IN heavy gates (OLR_PREPUSH_FULL): the e2e + sanitizer + iOS passes
 # that GitHub CI now runs on every PR. Off by default to keep the push fast; run
 # them to reproduce a CI failure locally or before a risky native/threading change.
 if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
@@ -306,6 +347,7 @@ else
     cmake -S . -B "$ASAN_BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Debug \
         -DOLR_BUILD_TESTS=ON \
+        -DOLR_GPU_PIPELINE=ON \
         -DOLR_WERROR=ON \
         -DOLR_SANITIZER="address;undefined" \
         -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" >/dev/null
@@ -333,7 +375,10 @@ else
                   tst_outputruntime tst_commitgate tst_seekcoalescer tst_outputbusengine
                   tst_ndiingest
                   tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence
-                  tst_gpu_sync_stress tst_gpuframedata tst_gpucompositor_stress)
+                  tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring
+                  tst_gpucompositor_stress
+                  tst_asyncgpureadbacksink tst_iotargetsinkfactory
+                  tst_gpuencodepump tst_streamworker_gpuencode tst_playbackworker)
     echo "[pre-push] Building TSan threading targets in ${TSAN_BUILD_DIR}..."
     cmake -S . -B "$TSAN_BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Debug \
@@ -345,7 +390,7 @@ else
     echo "[pre-push] Running threading tests under TSan..."
     TSAN_OPTIONS="halt_on_error=1:suppressions=$PWD/tests/tsan.suppressions.txt" \
         ctest --test-dir "$TSAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
-            -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest|tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpucompositor_stress)$'
+            -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest|tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode|tst_playbackworker)$'
     echo "[pre-push] TSan OK."
 fi
 
@@ -360,6 +405,7 @@ else
     cmake -S . -B "$TEST_BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Debug \
         -DCMAKE_PREFIX_PATH="$QT_HOST_PREFIX" \
+        -DOLR_GPU_PIPELINE=ON \
         -DOLR_BUILD_TESTS=ON >/dev/null
     cmake --build "$TEST_BUILD_DIR"
     ctest --test-dir "$TEST_BUILD_DIR" --output-on-failure \
@@ -373,9 +419,18 @@ if [ "${SKIP_IOS_BUILD:-0}" = "1" ]; then
     exit 0
 fi
 
-# Locate the Qt iOS kit. Override via env if your Qt lives elsewhere, e.g.
-# QT_IOS_PREFIX=~/Qt/6.9.0/ios.
-QT_IOS_PREFIX="${QT_IOS_PREFIX:-$HOME/Qt/6.10.1/ios}"
+# Locate the Qt iOS kit. Override via QT_IOS_PREFIX if your Qt lives elsewhere; by
+# default it sits beside the resolved macOS kit, else the newest installed iOS kit.
+olr_qt_ios_prefix() {
+    if [ -n "${QT_IOS_PREFIX:-}" ]; then printf '%s\n' "$QT_IOS_PREFIX"; return 0; fi
+    local sibling="${QT_HOST_PREFIX%/macos}/ios"
+    if [ -d "$sibling" ]; then printf '%s\n' "$sibling"; return 0; fi
+    local newest
+    newest="$(ls -d "$HOME"/Qt/6.*/ios 2>/dev/null | sort -V | tail -1 || true)"
+    if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+    printf '%s\n' "$HOME/Qt/$QT_VERSION/ios"
+}
+QT_IOS_PREFIX="$(olr_qt_ios_prefix)"
 QT_CMAKE="$QT_IOS_PREFIX/bin/qt-cmake"
 
 if [ ! -x "$QT_CMAKE" ]; then
@@ -387,11 +442,14 @@ fi
 echo "[pre-push] Building iOS (FFmpeg deps cached in ios_build/xcframeworks; first run ~20 min)..."
 BUILD_DIR="build/ios-prepush"
 
-"$QT_CMAKE" -S . -B "$BUILD_DIR" -G Xcode \
+env -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
+    "$QT_CMAKE" -S . -B "$BUILD_DIR" -G Xcode \
     -DQT_HOST_PATH="$QT_HOST_PREFIX" \
-    -DCMAKE_OSX_ARCHITECTURES=arm64 >/dev/null
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    -DOLR_GPU_PIPELINE=ON >/dev/null
 
-if cmake --build "$BUILD_DIR" --config Debug -- \
+if env -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
+        cmake --build "$BUILD_DIR" --config Debug -- \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO; then
     echo "[pre-push] iOS build OK - push proceeding."
 else

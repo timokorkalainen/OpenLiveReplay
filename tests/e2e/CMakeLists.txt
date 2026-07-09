@@ -7,6 +7,7 @@ target_link_libraries(record_harness PRIVATE
     Qt6::Core olr_test_engine olr_warnings olr_sanitize)
 
 set(OLR_E2E_BASH bash)
+find_program(OLR_PYTHON3_EXECUTABLE NAMES python3 python)
 set(_olr_windows_tool_env)
 if(WIN32)
     find_program(OLR_GIT_BASH
@@ -73,6 +74,13 @@ target_include_directories(ndi_output_sender PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(ndi_output_sender PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
 
+qt_add_executable(iotarget_marker_sender
+    iotarget_marker_sender.cpp
+    ndi_output_marker.cpp)
+target_include_directories(iotarget_marker_sender PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(iotarget_marker_sender PRIVATE
+    Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
 # Tier (b): writes the marker as raw YUV420P+S16 for muxing into a playback MKV.
 qt_add_executable(ndi_marker_mkv_source
     ndi_marker_mkv_source.cpp
@@ -89,6 +97,105 @@ qt_add_executable(marker_yuv_probe
 target_include_directories(marker_yuv_probe PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(marker_yuv_probe PRIVATE Qt6::Core olr_warnings olr_sanitize)
 
+if(APPLE AND NOT IOS)
+    add_test(NAME e2e_macos_app_visual
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_macos_app_visual_e2e.sh"
+            "$<TARGET_FILE:OpenLiveReplay>"
+            "$<TARGET_FILE:ndi_marker_mkv_source>"
+            "$<TARGET_FILE:marker_yuv_probe>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_macos_app_visual PROPERTIES
+        LABELS "app-e2e;macos"
+        TIMEOUT 300
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77)
+endif()
+
+if(OLR_PYTHON3_EXECUTABLE)
+    add_test(NAME tst_macos_app_driver_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_macos_app_driver_static.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/macos_app_driver.py")
+    set_tests_properties(tst_macos_app_driver_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_playbackworker_seek_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_playbackworker_seek_static.py"
+            "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
+    set_tests_properties(tst_playbackworker_seek_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_playbackworker_live_eof_trim_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_playbackworker_live_eof_trim_static.py"
+            "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
+    set_tests_properties(tst_playbackworker_live_eof_trim_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_videotoolbox_encoder_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_videotoolbox_encoder_static.py"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_videotoolbox.mm")
+    set_tests_properties(tst_videotoolbox_encoder_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_videotoolbox_decoder_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_videotoolbox_decoder_static.py"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_videotoolbox.mm")
+    set_tests_properties(tst_videotoolbox_decoder_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_gpucompositor_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_gpucompositor_static.py"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp")
+    set_tests_properties(tst_gpucompositor_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_ios_ndi_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_ios_ndi_static.py"
+            "${CMAKE_SOURCE_DIR}/CMakeLists.txt"
+            "${CMAKE_SOURCE_DIR}/playback/output/ndisink.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/ndiruntimepaths.h"
+            "${CMAKE_SOURCE_DIR}/ios/Info.plist")
+    set_tests_properties(tst_ios_ndi_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_ios_marker_oracle_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_ios_marker_oracle_static.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/ios_marker_srt_oracle.py")
+    set_tests_properties(tst_ios_marker_oracle_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_control_adapter_wait_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_control_adapter_wait_static.py"
+            "${CMAKE_SOURCE_DIR}/websocket/uimanagercontroladapter.cpp")
+    set_tests_properties(tst_control_adapter_wait_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+
+    add_test(NAME tst_pgmstage_videooutput_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_pgmstage_videooutput_static.py"
+            "${CMAKE_SOURCE_DIR}/ui/components/PgmStage.qml")
+    set_tests_properties(tst_pgmstage_videooutput_static PROPERTIES
+        LABELS "unit;ci"
+        TIMEOUT 30)
+endif()
+
 add_test(NAME e2e_ndi_output
     COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
         "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
@@ -97,6 +204,17 @@ set_tests_properties(e2e_ndi_output PROPERTIES
     TIMEOUT 120
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+
+foreach(kind aja omt decklink-readback decklink-gpu decklink-st2110-readback decklink-st2110-gpu)
+    add_test(NAME e2e_iotarget_${kind}
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_iotarget_cadence_e2e.sh"
+            "$<TARGET_FILE:iotarget_marker_sender>" "${kind}")
+    set_tests_properties(e2e_iotarget_${kind} PROPERTIES
+        LABELS "ci;iotargets"
+        TIMEOUT 120
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+endforeach()
 
 # Tier (b) feed bus (default) + the pgm and multiview output buses. Each drives the worker's
 # OutputBusEngine render of that bus (renderSingleSource / renderPgm / renderMultiview) through a
@@ -144,6 +262,63 @@ set_tests_properties(e2e_ndi_pipe PROPERTIES
     TIMEOUT 300
     RUN_SERIAL TRUE
     SKIP_RETURN_CODE 77)
+
+if(OLR_GPU_PIPELINE)
+    add_test(NAME e2e_ndi_output_gpu
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_output_e2e.sh"
+            "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_output_gpu PROPERTIES
+        LABELS "ndi-output;gpu-smoke"
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_ndi_playback_gpu
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_playback_gpu PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_ndi_playback_gpu_pgm
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_playback_gpu_pgm PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_NDI_OUTPUT_BUS=pgm")
+
+    add_test(NAME e2e_ndi_playback_gpu_multiview
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_playback_e2e.sh"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_playback_gpu_multiview PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_NDI_OUTPUT_BUS=multiview")
+
+    add_test(NAME e2e_ndi_pipe_gpu
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_ndi_e2e_pipe.sh"
+            "$<TARGET_FILE:ndi_output_sender>" "$<TARGET_FILE:record_harness>"
+            "$<TARGET_FILE:marker_yuv_probe>" "$<TARGET_FILE:play_harness>"
+            "$<TARGET_FILE:ndi_recv_probe>")
+    set_tests_properties(e2e_ndi_pipe_gpu PROPERTIES
+        LABELS "ndi-output;gpu;av-sync;async-readback"
+        TIMEOUT 300
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+endif()
 
 if(APPLE OR WIN32)
     # Native SRT handshake harness: proves NativeSrtIngestSession sets SRTO_STREAMID
@@ -200,6 +375,7 @@ endif()
 
 set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_record_e2e.sh")
 set(_pb_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_playback_e2e.sh")
+set(_frame_oracle_driver "${CMAKE_CURRENT_SOURCE_DIR}/run_frame_oracle_e2e.sh")
 
 # Baseline happy path: stereo input. The driver bridges the ffmpeg producer over
 # UDP->SRT (srt-live-transmit) and records via the native srt:// ingest; the 3rd
@@ -296,6 +472,9 @@ add_test(NAME e2e_play_sliderscrub
 add_test(NAME e2e_play_liveedge
     COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" liveedge 2 23474)
+add_test(NAME e2e_play_livegrow
+    COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" livegrow 2 23524)
 # 4-view multi-track decode path: the "stable" case even under the old code —
 # the new scheduler must also hold it at 0 repositions.
 add_test(NAME e2e_play_4view
@@ -358,16 +537,36 @@ add_test(NAME e2e_play_armedcut_rearm_seek
 add_test(NAME e2e_play_playlist
     COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
         "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist 2 23506)
+add_test(NAME e2e_play_playlist_jumpstress
+    COMMAND "${OLR_E2E_BASH}" "${_pb_driver}"
+        "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist-jumpstress 2 23518)
+
+# Deterministic frame-perfect scrub/jog oracle: generates a marker MKV whose pixels
+# encode frame number N and whose PTS are exact floor(N*1000/30), then verifies paused
+# seek/step output for every feed by both metadata identity and delivered pixels.
+add_test(NAME e2e_play_frameoracle
+    COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2)
+add_test(NAME e2e_play_jogstress_oracle
+    COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 jogstressoracle)
+add_test(NAME e2e_play_coldseek_latency
+    COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+        "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 coldseeklatency)
 
 set_tests_properties(
     e2e_play_storm e2e_play_seekplay e2e_play_stepscrub e2e_play_reverse
     e2e_play_sliderscrub e2e_play_liveedge e2e_play_4view e2e_play_latency
     e2e_play_seekflash e2e_play_farback e2e_play_armedcut e2e_play_armedcut_back
     e2e_play_armedcut_seekrace e2e_play_armedcut_rearm_seek e2e_play_playlist
+    e2e_play_playlist_jumpstress e2e_play_frameoracle e2e_play_jogstress_oracle
+    e2e_play_coldseek_latency
     PROPERTIES
     LABELS "e2e"
-    TIMEOUT 180
+    TIMEOUT 240
     RUN_SERIAL TRUE)
+set_tests_properties(e2e_play_frameoracle e2e_play_jogstress_oracle e2e_play_coldseek_latency
+    PROPERTIES SKIP_RETURN_CODE 77)
 
 # H.264 HW-gated playback gates (SKIP_RETURN_CODE 77 if HW encoder unavailable).
 # Ports 23506/23508/23510 (SRT) and their +1 UDP siblings are clear of all
@@ -394,6 +593,72 @@ set_tests_properties(e2e_play_h264 e2e_play_armedcut_h264 e2e_play_armedcut_h264
     LABELS "e2e;h264" TIMEOUT 180 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 
 if(OLR_GPU_PIPELINE)
+    add_test(NAME e2e_play_gpu_play1x
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" play1x 2 23522)
+    set_tests_properties(e2e_play_gpu_play1x PROPERTIES
+        LABELS "e2e;gpu;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_readback
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" h264_play 2 23514)
+    set_tests_properties(e2e_play_gpu_readback PROPERTIES
+        LABELS "e2e;gpu;async-readback"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_seekprefetch
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" gpu-seekprefetch 2 23516)
+    set_tests_properties(e2e_play_gpu_seekprefetch PROPERTIES
+        LABELS "e2e;gpu;seek-prefetch"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_frameoracle
+        COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2)
+    set_tests_properties(e2e_play_gpu_frameoracle PROPERTIES
+        LABELS "e2e;gpu;frame-oracle;async-readback"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_jogstress_oracle
+        COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 jogstressoracle)
+    set_tests_properties(e2e_play_gpu_jogstress_oracle PROPERTIES
+        LABELS "e2e;gpu;frame-oracle;async-readback"
+        TIMEOUT 300
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
+    add_test(NAME e2e_play_gpu_coldseek_latency
+        COMMAND "${OLR_E2E_BASH}" "${_frame_oracle_driver}"
+            "$<TARGET_FILE:ndi_marker_mkv_source>" "$<TARGET_FILE:play_harness>" 2 coldseeklatency)
+    set_tests_properties(e2e_play_gpu_coldseek_latency PROPERTIES
+        LABELS "e2e;gpu;frame-oracle;async-readback"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_QT_PREVIEW_SYNC_FLUSH=1")
+
+    add_test(NAME e2e_play_gpu_playlist_jumpstress
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" playlist-jumpstress 2 23520)
+    set_tests_properties(e2e_play_gpu_playlist_jumpstress PROPERTIES
+        LABELS "e2e;gpu;async-readback"
+        TIMEOUT 240
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
+
     add_test(NAME e2e_play_gpu_capstress
         COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" gpucapstress 4 23512)
     set_tests_properties(e2e_play_gpu_capstress PROPERTIES
@@ -402,6 +667,24 @@ if(OLR_GPU_PIPELINE)
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
         ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_GPU_FORCE_BUDGET=12")
+
+    add_test(NAME e2e_play_gpubudget
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" gpubudget 4 23518)
+    set_tests_properties(e2e_play_gpubudget PROPERTIES
+        LABELS "e2e;gpu;gpu-budget"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1;OLR_GPU_FORCE_BUDGET=12")
+
+    add_test(NAME e2e_play_devicelost
+        COMMAND "${OLR_E2E_BASH}" "${_pb_driver}" "$<TARGET_FILE:play_harness>" "$<TARGET_FILE:record_harness>" devicelost 2 23520)
+    set_tests_properties(e2e_play_devicelost PROPERTIES
+        LABELS "e2e;gpu;device-loss"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "OLR_GPU_PIPELINE=1")
 endif()
 
 # --- Report-only frame-sync scoreboard (NON-GATING) -------------------------

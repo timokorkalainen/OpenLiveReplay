@@ -2,6 +2,7 @@
 #define PLAYLISTPLAYOUT_H
 
 #include <QVector>
+#include <limits>
 #include <optional>
 
 #include "playback/replayplaylist.h"
@@ -34,7 +35,9 @@ public:
 
     bool active() const { return m_active; }
     int currentIndex() const { return m_index; }
-    int count() const { return static_cast<int>(m_entries.size()); }
+    int count() const {
+        return static_cast<int>(qMin<qsizetype>(m_entries.size(), std::numeric_limits<int>::max()));
+    }
     bool onFinalEntry() const { return m_active && !hasNext(); }
     std::optional<ReplayEntry> entryAt(int index) const;
     std::optional<ReplayEntry> currentEntry() const { return entryAt(m_index); }

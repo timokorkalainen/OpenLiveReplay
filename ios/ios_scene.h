@@ -5,6 +5,7 @@ extern "C" {
 #endif
 
 void requestIosNewScene(void);
+void installIosGpuLifecycleIfEnabled(void);
 
 #ifdef __cplusplus
 }

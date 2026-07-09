@@ -27,12 +27,11 @@ cmake -S . -B build-fuzz -G Ninja -DOLR_BUILD_FUZZERS=ON \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
-# macOS (Homebrew LLVM)
+# macOS (Homebrew LLVM); Qt auto-detected, override with QT_ROOT_DIR if needed
 cmake -S . -B build-fuzz -G Ninja -DOLR_BUILD_FUZZERS=ON \
   -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang \
   -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
-  -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)" \
-  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.10.1/macos"
+  -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)"
 
 cmake --build build-fuzz
 ```

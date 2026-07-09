@@ -9,6 +9,10 @@
 #include <cstdint>
 #include <functional>
 
+#if defined(OLR_GPU_PIPELINE_BUILD)
+#include "playback/output/framehandle.h"
+#endif
+
 extern "C" {
 struct AVFrame;
 }
@@ -39,6 +43,10 @@ struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
     int64_t sourcePtsMs = 0;
     int64_t sourceTimecode100ns = -1;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    FrameHandle gpuFrame;
+    uint64_t gpuFenceValue = 0;
+#endif
 };
 
 struct DecodedAudioChunk {
@@ -46,6 +54,13 @@ struct DecodedAudioChunk {
     int64_t sourceTimecode100ns = -1;
     QByteArray pcmS16Stereo;
 };
+
+#if defined(OLR_GPU_PIPELINE_BUILD)
+struct ImportedGpuVideoFrame {
+    FrameHandle frame;
+    uint64_t fenceValue = 0;
+};
+#endif
 
 constexpr int kDecodedAudioBytesPerSample = 2 * int(sizeof(int16_t));
 
@@ -113,6 +128,12 @@ struct IngestCallbacks {
     std::function<void(const QString&)> logInfo;
     std::function<void(DecodedVideoFrame)> onVideoFrame;
     std::function<void(DecodedAudioChunk)> onAudioChunk;
+    bool preferGpuVideoFrames = false;
+    std::function<bool()> shouldPreferGpuVideoFrames;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    std::function<ImportedGpuVideoFrame(void* nativeDecodedImage, const FrameMetadata& metadata)>
+        importGpuVideoFrame;
+#endif
 };
 
 class IngestSession {
@@ -130,6 +151,8 @@ IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool n
                                                          bool nativeRtmpAvailable,
                                                          bool nativeNdiAvailable = false);
 bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure);
+bool keepSurfaceDecodeNeedsResetBeforeCpuFallback(bool decodedGpu, bool gpuSurfaceRejected);
+bool ingestPrefersGpuVideoFrames(const IngestCallbacks& callbacks);
 
 Q_DECLARE_METATYPE(IngestStats)
 

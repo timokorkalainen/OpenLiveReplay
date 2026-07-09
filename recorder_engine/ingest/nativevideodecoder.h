@@ -21,7 +21,7 @@ struct NativeVideoDecodeCapabilities {
 class NativeVideoDecoder {
 public:
     using FrameCallback = std::function<void(AVFrame*)>;
-    using KeepSurfaceCallback = std::function<void(void* nativeDecodedImage, qint64 pts90k)>;
+    using KeepSurfaceCallback = std::function<bool(void* nativeDecodedImage, qint64 pts90k)>;
 
     NativeVideoDecoder(int outputWidth, int outputHeight);
     ~NativeVideoDecoder();
@@ -42,6 +42,7 @@ public:
     }
 #endif
     void reset();
+    void flushExcessPixelBufferPool();
     // Phase-0 probe (P0.1): true iff the most recently decoded CVPixelBuffer was
     // IOSurface-backed. Always false on non-VideoToolbox builds.
     bool lastDecodedWasIOSurfaceBacked() const;
@@ -52,5 +53,10 @@ private:
 };
 
 NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities();
+
+#ifdef OLR_UNIT_TEST
+bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest();
+bool nativeVideoDecoderNoFrameRejectedForTest(QString* error = nullptr);
+#endif
 
 #endif // NATIVEVIDEODECODER_H

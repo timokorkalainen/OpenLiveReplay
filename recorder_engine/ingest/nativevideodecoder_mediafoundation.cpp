@@ -257,6 +257,7 @@ public:
     bool decodeKeepSurface(const CompressedAccessUnit& unit, KeepSurfaceCallback onSurface,
                            QString* error);
     void reset();
+    void flushExcessPixelBufferPool() {}
 
 private:
     int width = 0;
@@ -937,7 +938,13 @@ bool NativeVideoDecoder::Impl::processOutput(FrameCallback* onFrame, KeepSurface
                 const qint64 framePts = SUCCEEDED(completedSample->GetSampleTime(&sampleTime))
                                             ? mfTimeToPts90k(sampleTime)
                                             : pts90k;
-                (*onSurface)(completedSample.Get(), framePts);
+                if (!(*onSurface)(completedSample.Get(), framePts)) {
+                    if (error) {
+                        *error = QStringLiteral(
+                            "Media Foundation keep-surface callback rejected decoded surface");
+                    }
+                    return false;
+                }
                 return true;
             }
 
@@ -1185,6 +1192,10 @@ bool NativeVideoDecoder::decodeKeepSurface(const CompressedAccessUnit& unit,
 
 void NativeVideoDecoder::reset() {
     m_impl->reset();
+}
+
+void NativeVideoDecoder::flushExcessPixelBufferPool() {
+    m_impl->flushExcessPixelBufferPool();
 }
 
 bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {

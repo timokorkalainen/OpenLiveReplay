@@ -19,15 +19,40 @@ qint64 resolveNdiTimecode(qint64 programmeTimecode100ns);
 void applyNdiFrameTiming(const OutputBusFrame& frame, olr::ndi::NDIlib_video_frame_v2_t& video,
                          olr::ndi::NDIlib_audio_frame_v3_t& audio);
 
+class NdiRuntimeLease final {
+public:
+    NdiRuntimeLease() = default;
+    ~NdiRuntimeLease();
+
+    NdiRuntimeLease(const NdiRuntimeLease&) = delete;
+    NdiRuntimeLease& operator=(const NdiRuntimeLease&) = delete;
+    NdiRuntimeLease(NdiRuntimeLease&&) = delete;
+    NdiRuntimeLease& operator=(NdiRuntimeLease&&) = delete;
+
+    bool acquire(olr::ndi::NDIlib_initialize_fn initialize, olr::ndi::NDIlib_destroy_fn destroy);
+    void release();
+    bool isHeld() const { return m_held; }
+
+private:
+    bool m_held = false;
+};
+
 class INdiSenderBackend {
 public:
     virtual ~INdiSenderBackend() = default;
 
+    struct Clocking {
+        bool clockVideo = true;
+        bool clockAudio = false;
+    };
+
     virtual bool isRuntimeAvailable() const = 0;
-    virtual bool createSender(const QString& senderName, FrameRate rate) = 0;
+    virtual bool createSender(const QString& senderName, FrameRate rate, Clocking clocking) = 0;
     virtual void destroySender() = 0;
     virtual bool sendFrame(const OutputBusFrame& frame) = 0;
 };
+
+using NdiSenderClocking = INdiSenderBackend::Clocking;
 
 enum class NdiOutputState {
     Stopped,

@@ -1,5 +1,8 @@
 #include "recorder_engine/codec/nativevideoencoder.h"
 #include "recorder_engine/codec/avcc.h"
+#include "recorder_engine/codec/colorvui.h"
+#include "playback/gpu/gpusurface.h"
+#include "playback/output/win/d3d11gpusurface.h"
 #include "recorder_engine/mediafoundationruntime.h"
 
 #ifdef _WIN32
@@ -28,6 +31,7 @@
 // coverage is incomplete). Mirrors nativeaacdecoder_mediafoundation.cpp.
 #include <initguid.h>
 #include <codecapi.h>
+#include <d3d11.h>
 #include <wrl/client.h>
 
 #ifdef __CRT_UUID_DECL
@@ -138,6 +142,54 @@ bool containsH264Idr(const QList<QByteArray>& nals) {
     return false;
 }
 
+UINT32 mfPrimariesFor(int code) {
+    switch (code) {
+    case 9:
+        return MFVideoPrimaries_BT2020;
+    case 6:
+        return MFVideoPrimaries_SMPTE170M;
+    default:
+        return MFVideoPrimaries_BT709;
+    }
+}
+
+UINT32 mfTransferFor(int code) {
+    switch (code) {
+    case 14:
+        return MFVideoTransFunc_2020;
+    default:
+        return MFVideoTransFunc_709;
+    }
+}
+
+UINT32 mfMatrixFor(int code) {
+    switch (code) {
+    case 9:
+        return MFVideoTransferMatrix_BT2020_10;
+    case 6:
+        return MFVideoTransferMatrix_BT601;
+    default:
+        return MFVideoTransferMatrix_BT709;
+    }
+}
+
+HRESULT setMfColorAttributes(IMFAttributes* attributes, const ColorMetadata& color) {
+    const VuiColorCodePoints vui = vuiColorCodePointsFor(color);
+    HRESULT hr = attributes->SetUINT32(MF_MT_VIDEO_PRIMARIES, mfPrimariesFor(vui.colourPrimaries));
+    if (SUCCEEDED(hr)) {
+        hr = attributes->SetUINT32(MF_MT_TRANSFER_FUNCTION,
+                                   mfTransferFor(vui.transferCharacteristics));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = attributes->SetUINT32(MF_MT_YUV_MATRIX, mfMatrixFor(vui.matrixCoefficients));
+    }
+    if (SUCCEEDED(hr)) {
+        hr = attributes->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE,
+                                   vui.fullRange ? MFNominalRange_0_255 : MFNominalRange_16_235);
+    }
+    return hr;
+}
+
 void releaseActivations(IMFActivate** activates, UINT32 count) {
     if (!activates) {
         return;
@@ -161,6 +213,8 @@ public:
 
     bool encode(const AVFrame* frame, int64_t ptsTicks, const PacketCallback& onPacket,
                 QString* error) override;
+    bool encodeSurface(GpuSurface* surface, int64_t ptsTicks, const ColorMetadata& color,
+                       const PacketCallback& onPacket, QString* error) override;
     bool flush(const PacketCallback& onPacket, QString* error) override;
     QByteArray avccExtradata() const override;
 
@@ -171,10 +225,13 @@ private:
     bool configureOutputType(QString* error);
     bool configureInputType(QString* error);
     bool configureCodecApi(QString* error);
+    bool configureD3DManagerForSurface(ID3D11Device* device, QString* error);
     bool beginStreaming(QString* error);
 
     bool buildInputSample(const AVFrame* frame, int64_t ptsTicks, ComPtr<IMFSample>* sample,
                           QString* error);
+    bool buildSurfaceSample(GpuSurface* surface, int64_t ptsTicks, const ColorMetadata& color,
+                            ComPtr<IMFSample>* sample, QString* error);
     bool drainOutput(const PacketCallback& onPacket, QString* error);
     bool buildAvccFromSequenceHeader(QString* error);
     bool emitOutputSample(IMFSample* sample, const PacketCallback& onPacket, QString* error);
@@ -196,6 +253,8 @@ private:
     Config m_config;
     ComPtr<IMFTransform> m_transform;
     ComPtr<IMFMediaEventGenerator> m_eventGenerator;
+    ComPtr<IMFDXGIDeviceManager> m_d3dDeviceManager;
+    ComPtr<ID3D11Device> m_d3dManagerDevice;
     QByteArray m_avcc;
     bool m_comInitialized = false;
     bool m_streaming = false;
@@ -220,6 +279,8 @@ MediaFoundationEncoder::~MediaFoundationEncoder() {
         m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
     }
     m_eventGenerator.Reset();
+    m_d3dDeviceManager.Reset();
+    m_d3dManagerDevice.Reset();
     m_transform.Reset();
     shutdownRuntime();
 }
@@ -340,6 +401,9 @@ bool MediaFoundationEncoder::configureOutputType(QString* error) {
         hr = outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
     }
     if (SUCCEEDED(hr)) {
+        hr = setMfColorAttributes(outputType.Get(), m_config.color);
+    }
+    if (SUCCEEDED(hr)) {
         hr = outputType->SetUINT32(MF_MT_AVG_BITRATE, UINT32(m_config.bitrate));
     }
     if (SUCCEEDED(hr)) {
@@ -385,6 +449,9 @@ bool MediaFoundationEncoder::configureInputType(QString* error) {
     }
     if (SUCCEEDED(hr)) {
         hr = inputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = setMfColorAttributes(inputType.Get(), m_config.color);
     }
     if (SUCCEEDED(hr)) {
         hr = inputType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
@@ -485,6 +552,62 @@ bool MediaFoundationEncoder::configureCodecApi(QString* error) {
         }
         return false;
     }
+    return true;
+}
+
+bool MediaFoundationEncoder::configureD3DManagerForSurface(ID3D11Device* device, QString* error) {
+    if (!device) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 device");
+        }
+        return false;
+    }
+    if (m_d3dDeviceManager && m_d3dManagerDevice.Get() == device) return true;
+
+    ComPtr<IMFAttributes> attributes;
+    UINT32 d3dAware = FALSE;
+    if (SUCCEEDED(m_transform->GetAttributes(&attributes)) && attributes) {
+        attributes->GetUINT32(MF_SA_D3D11_AWARE, &d3dAware);
+    }
+    if (!d3dAware) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation H.264 encoder is not D3D11-aware");
+        }
+        return false;
+    }
+
+    ComPtr<IMFDXGIDeviceManager> manager;
+    UINT resetToken = 0;
+    HRESULT hr = MFCreateDXGIDeviceManager(&resetToken, &manager);
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(
+                QStringLiteral("Media Foundation DXGI device manager creation failed"), hr);
+        }
+        return false;
+    }
+
+    hr = manager->ResetDevice(device, resetToken);
+    if (FAILED(hr)) {
+        if (error) {
+            *error =
+                hrMessage(QStringLiteral("Media Foundation DXGI device manager reset failed"), hr);
+        }
+        return false;
+    }
+
+    hr = m_transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER,
+                                     reinterpret_cast<ULONG_PTR>(manager.Get()));
+    if (FAILED(hr)) {
+        if (error) {
+            *error =
+                hrMessage(QStringLiteral("Media Foundation encoder D3D manager setup failed"), hr);
+        }
+        return false;
+    }
+
+    m_d3dDeviceManager = std::move(manager);
+    m_d3dManagerDevice = device;
     return true;
 }
 
@@ -672,6 +795,91 @@ bool MediaFoundationEncoder::buildInputSample(const AVFrame* frame, int64_t ptsT
     return true;
 }
 
+bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t ptsTicks,
+                                                const ColorMetadata& color,
+                                                ComPtr<IMFSample>* sample, QString* error) {
+    if (!surface || !surface->isValid()) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation encodeSurface received an invalid surface");
+        }
+        return false;
+    }
+    const GpuSurfaceDesc desc = surface->desc();
+    if (desc.format != FramePixelFormat::Nv12) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation encodeSurface requires NV12");
+        }
+        return false;
+    }
+    if (desc.width != m_config.width || desc.height != m_config.height) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation encodeSurface size %1x%2 does not match "
+                                    "configured %3x%4")
+                         .arg(desc.width)
+                         .arg(desc.height)
+                         .arg(m_config.width)
+                         .arg(m_config.height);
+        }
+        return false;
+    }
+
+    auto* d3dSurface = dynamic_cast<D3D11GpuSurface*>(surface);
+    if (!d3dSurface || !d3dSurface->texture()) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");
+        }
+        return false;
+    }
+    if (!configureD3DManagerForSurface(d3dSurface->device(), error)) return false;
+
+    ComPtr<IMFMediaBuffer> buffer;
+    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), d3dSurface->texture(),
+                                           d3dSurface->subresource(), FALSE, &buffer);
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(
+                QStringLiteral("Media Foundation DXGI surface buffer creation failed"), hr);
+        }
+        return false;
+    }
+
+    const LONGLONG stampedTime = m_nextSampleTime;
+    ComPtr<IMFSample> createdSample;
+    hr = MFCreateSample(&createdSample);
+    if (SUCCEEDED(hr)) {
+        hr = createdSample->AddBuffer(buffer.Get());
+    }
+    if (SUCCEEDED(hr)) {
+        hr = createdSample->SetSampleTime(stampedTime);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = createdSample->SetSampleDuration(m_sampleDuration);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = setMfColorAttributes(createdSample.Get(), color);
+    }
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(QStringLiteral("Media Foundation surface sample setup failed"), hr);
+        }
+        return false;
+    }
+    m_nextSampleTime += m_sampleDuration;
+    m_ptsByMfTime.insert(stampedTime, ptsTicks);
+
+    constexpr int kMaxInFlight = 64;
+    while (m_ptsByMfTime.size() > kMaxInFlight) {
+        auto minIt = m_ptsByMfTime.begin();
+        for (auto it = m_ptsByMfTime.begin(); it != m_ptsByMfTime.end(); ++it) {
+            if (it.key() < minIt.key()) minIt = it;
+        }
+        m_ptsByMfTime.erase(minIt);
+    }
+
+    *sample = createdSample;
+    return true;
+}
+
 int64_t MediaFoundationEncoder::resolvePtsTicks(LONGLONG sampleTime) {
     const auto it = m_ptsByMfTime.constFind(sampleTime);
     if (it != m_ptsByMfTime.constEnd()) {
@@ -683,7 +891,8 @@ int64_t MediaFoundationEncoder::resolvePtsTicks(LONGLONG sampleTime) {
         for (auto jt = m_ptsByMfTime.constBegin(); jt != m_ptsByMfTime.constEnd(); ++jt) {
             if (jt.key() < sampleTime) stale.append(jt.key());
         }
-        for (LONGLONG k : stale) m_ptsByMfTime.remove(k);
+        for (LONGLONG k : stale)
+            m_ptsByMfTime.remove(k);
         return ticks;
     }
     // No mapping (encoder produced an unexpected timestamp): fall back to the MF
@@ -1167,6 +1376,42 @@ bool MediaFoundationEncoder::encode(const AVFrame* frame, int64_t ptsTicks,
     }
 
     // All-intra + low-latency: drain immediately so each frame yields its packet.
+    return drainOutput(onPacket, error);
+}
+
+bool MediaFoundationEncoder::encodeSurface(GpuSurface* surface, int64_t ptsTicks,
+                                           const ColorMetadata& color,
+                                           const PacketCallback& onPacket, QString* error) {
+    if (!m_transform) {
+        if (error) {
+            *error = QStringLiteral("Media Foundation H.264 encoder is not initialized");
+        }
+        return false;
+    }
+
+    ComPtr<IMFSample> inputSample;
+    if (!buildSurfaceSample(surface, ptsTicks, color, &inputSample, error)) {
+        return false;
+    }
+
+    if (m_asyncTransform) {
+        return encodeAsync(inputSample.Get(), onPacket, error);
+    }
+
+    HRESULT hr = m_transform->ProcessInput(0, inputSample.Get(), 0);
+    if (hr == MF_E_NOTACCEPTING) {
+        if (!drainOutput(onPacket, error)) {
+            return false;
+        }
+        hr = m_transform->ProcessInput(0, inputSample.Get(), 0);
+    }
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(
+                QStringLiteral("Media Foundation H.264 ProcessInput(surface) failed"), hr);
+        }
+        return false;
+    }
     return drainOutput(onPacket, error);
 }
 

@@ -27,6 +27,7 @@ private slots:
     void rtmpIsNativeByDefault();
     void ndiIsNativeByDefaultWhenAvailable();
     void nativeFailureStopsNativeRetryWithoutFfmpegFallback();
+    void failedKeepSurfaceDecodeResetsBeforeCpuFallback();
 #if defined(OLR_NATIVE_RTMP_AVAILABLE)
     void malformedLegacyVideoPacketStaysMalformed();
     void nativeRtmpConnectAdvertisesEnhancedCodecCapabilities();
@@ -47,6 +48,10 @@ private slots:
     void sharedAnchorMapsStreamTime();
     void srtAnchorMapPureCases();
     void nativeSrtUnwrapsThirtyThreeBitTimestampWrap();
+    void nativeSrtDiscontinuityClearsVideoProjectionAnchor();
+    void nativeSrtDiscontinuityClearsAllProjectionState();
+    void nativeSrtDrainsPendingAccessUnitOnSessionBoundary();
+    void nativeSrtCountsDecodeFailures();
     void nativeSrtExtractsSeiTimecodeOntoPendingVideoTimecode();
     void nativeSrtNoSeiTimecodeLeavesNoStaleTimecodeBleed();
 };
@@ -102,6 +107,12 @@ void TestIngestBackendSelector::srtBadEncryptionIsRejected() {
     // pbkeylen without any passphrase is meaningless (encryption needs a key).
     QVERIFY(!NativeSrtIngestSession::supportsUrl(
         QUrl(QStringLiteral("srt://127.0.0.1:9000?pbkeylen=16"))));
+}
+
+void TestIngestBackendSelector::failedKeepSurfaceDecodeResetsBeforeCpuFallback() {
+    QVERIFY(keepSurfaceDecodeNeedsResetBeforeCpuFallback(false, false));
+    QVERIFY(keepSurfaceDecodeNeedsResetBeforeCpuFallback(false, true));
+    QVERIFY(!keepSurfaceDecodeNeedsResetBeforeCpuFallback(true, false));
 }
 
 void TestIngestBackendSelector::srtListenerAndRendezvousAreSupported() {
@@ -404,6 +415,66 @@ void TestIngestBackendSelector::nativeSrtUnwrapsThirtyThreeBitTimestampWrap() {
     QCOMPARE(session.sourcePtsMsForAudio(wrap90k - 90), int64_t(1000));
     clockMs = 99999;
     QCOMPARE(session.sourcePtsMsForAudio(90), int64_t(1002));
+}
+
+void TestIngestBackendSelector::nativeSrtDiscontinuityClearsVideoProjectionAnchor() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+    session.m_videoPtsAnchor90k = 90000;
+    session.m_videoPtsAnchorStreamMs = 1000;
+
+    session.resetTimingStateForDiscontinuity();
+
+    QCOMPARE(session.m_videoPtsAnchor90k, int64_t(-1));
+    QCOMPARE(session.m_videoPtsAnchorStreamMs, int64_t(-1));
+}
+
+void TestIngestBackendSelector::nativeSrtDiscontinuityClearsAllProjectionState() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+    session.m_forceNextPcrObserve = false;
+    session.m_audioFifoSamplePos = 48000;
+    session.m_audioRemainder = QByteArray("partial-adts");
+    session.m_audioRemainderPts90k = 90000;
+    session.m_videoPtsAnchor90k = 90000;
+    session.m_videoPtsAnchorStreamMs = 1000;
+
+    session.resetTimingStateForDiscontinuity();
+
+    QVERIFY(session.m_forceNextPcrObserve);
+    QCOMPARE(session.m_audioFifoSamplePos, int64_t(-1));
+    QVERIFY(session.m_audioRemainder.isEmpty());
+    QCOMPARE(session.m_audioRemainderPts90k, int64_t(-1));
+    QCOMPARE(session.m_videoPtsAnchor90k, int64_t(-1));
+    QCOMPARE(session.m_videoPtsAnchorStreamMs, int64_t(-1));
+}
+
+void TestIngestBackendSelector::nativeSrtDrainsPendingAccessUnitOnSessionBoundary() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+    session.m_activeCodec = NativeVideoCodec::H264;
+    session.m_splitter = std::make_unique<H26xAccessUnitSplitter>(NativeVideoCodec::H264);
+
+    const QByteArray payload = QByteArray::fromHex("0000000167420000000001658884");
+    QVERIFY(session.m_splitter->pushPesPayload(payload, 90000, 81000).isEmpty());
+
+    QCOMPARE(session.drainPendingVideoAccessUnits(), 1);
+    QVERIFY(session.m_splitter->flush().isEmpty());
+}
+
+void TestIngestBackendSelector::nativeSrtCountsDecodeFailures() {
+    NativeSrtIngestSession session(0, 640, 480, nullptr);
+    int64_t clockMs = 1000;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = [&clockMs]() { return clockMs; };
+    session.m_callbacks = callbacks;
+
+    CompressedAccessUnit invalidUnit;
+    invalidUnit.codec = NativeVideoCodec::H264;
+    invalidUnit.pts90k = 90000;
+    invalidUnit.dts90k = 90000;
+    invalidUnit.annexB = QByteArray::fromHex("00000001658884");
+
+    session.processVideoAccessUnits({invalidUnit});
+
+    QCOMPARE(session.m_decodeFailures, quint64(1));
 }
 
 namespace {

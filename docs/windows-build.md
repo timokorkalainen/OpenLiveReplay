@@ -11,7 +11,7 @@ Homebrew's ffmpeg is GPL and ships libx264/libx265).
 Install **Qt 6.x for Windows with the MinGW kit** via the
 [Qt online installer](https://www.qt.io/download-qt-installer). Select:
 
-- `Qt 6.10.x > MinGW 13.1.0 64-bit`
+- `Qt 6.11.x > MinGW 13.1.0 64-bit`
 - `Developer and Designer Tools > MinGW 13.1.0 64-bit`, `CMake`, `Ninja`
 
 That kit bundles the matching `gcc`, `cmake`, and `ninja`; the scripts
@@ -67,7 +67,7 @@ The dependency step and the preset are usable on their own:
 
 ```bash
 ./build-scripts/build_ffmpeg_windows_srt.sh          # build deps once
-export OLR_QT_ROOT=C:/Qt/6.10.2/mingw_64
+export OLR_QT_ROOT=C:/Qt/6.11.1/mingw_64
 export OLR_MINGW_ROOT=C:/Qt/Tools/mingw1310_64
 export OLR_NINJA=C:/Qt/Tools/Ninja/ninja.exe
 export OLR_FFMPEG_ROOT="$PWD/windows_build/dist/ffmpeg"

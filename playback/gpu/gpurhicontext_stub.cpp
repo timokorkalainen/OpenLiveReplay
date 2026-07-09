@@ -2,12 +2,14 @@
 
 #ifndef __APPLE__
 
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
 
 #include <QList>
 #include <QThread>
 #include <rhi/qrhi.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -90,6 +92,7 @@ class GpuRhiContext::Impl {
 public:
     NullRenderThread thread;
     bool valid = false;
+    std::atomic<bool> deviceLost{false};
 };
 
 GpuRhiContext::GpuRhiContext(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
@@ -120,6 +123,16 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
     return nullptr;
 }
 
+#ifdef OLR_UNIT_TEST
+std::shared_ptr<GpuRhiContext> GpuRhiContext::createInvalidForTest() {
+    return std::shared_ptr<GpuRhiContext>(new GpuRhiContext(std::make_unique<Impl>()));
+}
+
+int GpuRhiContext::rhiReadbackCountForTest() const {
+    return 0;
+}
+#endif
+
 bool GpuRhiContext::isValid() const {
     return m_impl && m_impl->valid;
 }
@@ -133,7 +146,26 @@ bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) 
     return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
+void GpuRhiContext::presentOnMainThread(const std::function<void()>& block) {
+    if (block) block();
+}
+
+bool GpuRhiContext::deviceLost() const {
+    return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
+}
+
+void GpuRhiContext::injectDeviceLostForTest() {
+    if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
+}
+
 CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, FramePixelFormat) {
+    if (!m_impl || !m_impl->valid) {
+        return CpuPlanes{};
+    }
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) {
+        GpuDeviceLossMonitor::instance().recordLoss();
+        return CpuPlanes{};
+    }
     return CpuPlanes{};
 }
 

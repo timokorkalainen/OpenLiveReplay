@@ -47,8 +47,15 @@ void TestOutputDispatchGpuStats::newFieldsDefaultZero() {
     QCOMPARE(stats.readbackDrops, qint64(0));
     QCOMPARE(stats.fenceWaitStalls, qint64(0));
     QCOMPARE(stats.gpuOomDegrades, qint64(0));
+    QCOMPARE(stats.gpuDeviceLossEvents, qint64(0));
     QCOMPARE(stats.gpuReadbacks, qint64(0));
+    QCOMPARE(stats.uniqueGpuReadbackSurfaces, qint64(0));
     QCOMPARE(stats.redundantGpuReadbacks, qint64(0));
+    QCOMPARE(stats.gpuBudgetBytes, qint64(0));
+    QCOMPARE(stats.gpuGatedLiveBytes, qint64(0));
+    QVERIFY(!stats.gpuBudgetReportOnly);
+    for (qint64 taggedBytes : stats.gpuLiveBytesByTag)
+        QCOMPARE(taggedBytes, qint64(0));
 }
 
 void TestOutputDispatchGpuStats::cpuPathLeavesGpuCountersZero() {
@@ -74,12 +81,19 @@ void TestOutputDispatchGpuStats::cpuPathLeavesGpuCountersZero() {
 
     const OutputDispatchStats stats = dispatcher.stats();
     QCOMPARE(stats.gpuReadbacks, qint64(0));
+    QCOMPARE(stats.uniqueGpuReadbackSurfaces, qint64(0));
     QCOMPARE(stats.redundantGpuReadbacks, qint64(0));
     QCOMPARE(stats.gpuVramBytes, qint64(0));
     QCOMPARE(stats.readbackQueueDepth, qint64(0));
     QCOMPARE(stats.readbackDrops, qint64(0));
     QCOMPARE(stats.fenceWaitStalls, qint64(0));
     QCOMPARE(stats.gpuOomDegrades, qint64(0));
+    QCOMPARE(stats.gpuDeviceLossEvents, qint64(0));
+    QCOMPARE(stats.gpuBudgetBytes, qint64(0));
+    QCOMPARE(stats.gpuGatedLiveBytes, qint64(0));
+    QVERIFY(!stats.gpuBudgetReportOnly);
+    for (qint64 taggedBytes : stats.gpuLiveBytesByTag)
+        QCOMPARE(taggedBytes, qint64(0));
 }
 
 void TestOutputDispatchGpuStats::redundantReadbackSurfacesThroughStats() {
@@ -93,7 +107,7 @@ void TestOutputDispatchGpuStats::redundantReadbackSurfacesThroughStats() {
     OutputDispatcher dispatcher(FrameRate::fromFraction(25, 1), 1, 4, 4);
     dispatcher.setEndpoints({{feed0, &sink}});
 
-    const GpuReadbackSurfaceKey key{0u, 3, FramePixelFormat::Yuv420p};
+    const GpuReadbackSurfaceKey key{OutputBusId::feed(0), 3, FramePixelFormat::Yuv420p};
     GpuReadbackTelemetry::instance().recordSurface(key);
     GpuReadbackTelemetry::instance().recordGpuReadback(key);
     GpuReadbackTelemetry::instance().recordGpuReadback(key);
@@ -108,6 +122,7 @@ void TestOutputDispatchGpuStats::redundantReadbackSurfacesThroughStats() {
 
     const OutputDispatchStats stats = dispatcher.stats();
     QCOMPARE(stats.gpuReadbacks, qint64(2));
+    QCOMPARE(stats.uniqueGpuReadbackSurfaces, qint64(1));
     QCOMPARE(stats.redundantGpuReadbacks, qint64(1));
 }
 

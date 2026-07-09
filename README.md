@@ -65,7 +65,7 @@ preset and sets the path:
     {
       "name": "macos-debug-local",
       "inherits": "macos-debug",
-      "cacheVariables": { "CMAKE_PREFIX_PATH": "/path/to/Qt/6.10.1/macos" }
+      "cacheVariables": { "CMAKE_PREFIX_PATH": "/path/to/Qt/<version>/macos" }
     }
   ]
 }
@@ -92,10 +92,14 @@ Development (testing, linting, CI)
 Tests are opt-in and headless. Configure with `-DOLR_BUILD_TESTS=ON`, then:
 
 ```bash
-cmake -S . -B build -G Ninja -DOLR_BUILD_TESTS=ON -DCMAKE_PREFIX_PATH=~/Qt/6.10.1/macos
+cmake -S . -B build -G Ninja -DOLR_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure   # unit + smoke + e2e
 ```
+
+Qt is auto-detected (Homebrew `/opt/homebrew/opt/qt` or `~/Qt/6.*/macos`);
+override with `QT_ROOT_DIR`/`OLR_QT_ROOT` or `-DCMAKE_PREFIX_PATH` if it lives
+elsewhere.
 
 - **Unit** tests (Qt Test) cover the recording clock, settings persistence,
   playback transport, and muxer.

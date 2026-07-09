@@ -32,6 +32,35 @@ command -v ffprobe >/dev/null || { echo "SKIP: ffprobe not found"; exit "$SKIP";
 olr_python3_usable || { echo "SKIP: usable python3 not found"; exit "$SKIP"; }
 olr_ffmpeg_has_muxer rawvideo || { echo "SKIP: ffmpeg rawvideo muxer not available"; exit "$SKIP"; }
 
+GPU_RUNTIME_ENABLED=0
+case "${OLR_GPU_PIPELINE:-}" in
+    1|true|TRUE|on|ON) GPU_RUNTIME_ENABLED=1 ;;
+esac
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    "$PLAY_BIN" --probe-gpu-backend >/dev/null || {
+        rc=$?
+        [ "$rc" = "$SKIP" ] && { echo "SKIP: GPU backend unavailable"; exit "$SKIP"; }
+        echo "FAIL: GPU backend probe failed ($rc)"; exit 1
+    }
+    DECODE_CAPS="$("$PLAY_BIN" --probe-native-decode-caps 2>&1)"; rc=$?
+    if [ "$rc" != "0" ]; then
+        echo "FAIL: native decode caps probe failed ($rc)"
+        printf '%s\n' "$DECODE_CAPS"
+        exit 1
+    fi
+    H264_DECODE_AVAIL="$(printf '%s\n' "$DECODE_CAPS" | awk -F= '/^h264=/{print $2}')"
+    [ "$H264_DECODE_AVAIL" = "1" ] || { echo "SKIP: native H.264 decode unavailable for GPU NDI pipe"; exit "$SKIP"; }
+    CAPS="$("$RECORD_BIN" --probe-codec-caps 2>&1)"; rc=$?
+    if [ "$rc" != "0" ]; then
+        [ "$rc" = "$SKIP" ] && { echo "SKIP: recorder codec probe unavailable"; exit "$SKIP"; }
+        echo "FAIL: recorder codec probe failed ($rc)"
+        printf '%s\n' "$CAPS"
+        exit 1
+    fi
+    H264_AVAIL="$(printf '%s\n' "$CAPS" | awk -F= '/^h264=/{print $2}')"
+    [ "$H264_AVAIL" = "1" ] || { echo "SKIP: hardware H.264 recorder unavailable for GPU NDI pipe"; exit "$SKIP"; }
+fi
+
 WORK="$(mktemp -d)"
 SENDER_PID=""; PLAY_PID=""
 cleanup() {
@@ -55,13 +84,22 @@ fi
 # 2. Record the NDI source to an MKV at the marker's native 256x144 (no scaling -> cells survive).
 #    OLR_VIEWS=1 -> a single marker view track.
 ENC="$(SRC_NAME="$SRC_NAME" python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["SRC_NAME"],safe=""))')"
-REC_OUT="$(OLR_VIEWS=1 "$RECORD_BIN" --url "ndi:${ENC}" --name olr_ndi_pipe --outdir "$WORK" \
-            --seconds "$REC_SECS" --width 256 --height 144 --fps 30)"; rc=$?
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    REC_OUT="$(OLR_VIEWS=1 "$RECORD_BIN" --url "ndi:${ENC}" --name olr_ndi_pipe --outdir "$WORK" \
+                --seconds "$REC_SECS" --width 256 --height 144 --fps 30 --codec h264)"; rc=$?
+else
+    REC_OUT="$(OLR_VIEWS=1 "$RECORD_BIN" --url "ndi:${ENC}" --name olr_ndi_pipe --outdir "$WORK" \
+                --seconds "$REC_SECS" --width 256 --height 144 --fps 30)"; rc=$?
+fi
 MKV="$(printf '%s\n' "$REC_OUT" | tail -n1)"
 if [ "$rc" != "0" ] || [ -z "$MKV" ] || [ ! -s "$MKV" ]; then
     echo "FAIL: NDI ingest/record produced no MKV (rc=$rc)"; cat "$WORK/sender.log"; exit 1
 fi
 echo "[ndi-pipe] recorded $MKV"
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$MKV" | head -n1)"
+    [ "$VCODEC" = "h264" ] || { echo "FAIL: GPU NDI pipe recorded codec '$VCODEC', expected h264"; exit 1; }
+fi
 
 # 2b. Pin resolution: a scaled record would corrupt the fixed-cell marker (self-check).
 # ffprobe -of csv=p=0 appends a trailing comma after each field (e.g. "256,144,"); strip it.
@@ -129,24 +167,127 @@ line="$(grep '^NDIRECV ' <<<"$OUT" || true)"
 field() { sed -n "s/.*$1=\\([0-9.-]*\\).*/\\1/p" <<<"$line"; }
 frames=$(field framesReceived); reorders=$(field reorders)
 avsync=$(field avSyncMaxFrames); maxgap=$(field maxGapFrames)
+tcavsync=$(field tcAvMaxFrames)
+vTcChecked=$(field vTcChecked)
+vTcMatches=$(field vTcMatches)
+vTcSynth=$(field vTcSynth)
+aTcSeen=$(field aTcSeen)
+aTcSynth=$(field aTcSynth)
 counters="$(grep '^COUNTERS ' "$WORK/play.log" || true)"
 cfield() { sed -n "s/.*$1=\\([0-9-]*\\).*/\\1/p" <<<"$counters"; }
 reposition=$(cfield reposition); audioPushes=$(cfield audioPushes)
+gpuReadToCpuCount=$(cfield gpuReadToCpuCount)
+gpuReadbacks=$(cfield gpuReadbacks)
+uniqueGpuReadbackSurfaces=$(cfield uniqueGpuReadbackSurfaces)
+redundantGpuReadbacks=$(cfield redundantGpuReadbacks)
+readbackQueueDepth=$(cfield readbackQueueDepth)
+readbackDrops=$(cfield readbackDrops)
+fenceWaitStalls=$(cfield fenceWaitStalls)
+gpuOomDegrades=$(cfield gpuOomDegrades)
+gpuVramBytes=$(cfield gpuVramBytes)
+
+num() { case "${1:-}" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+assert_gpu_readback_path() {
+    if ! num "$gpuReadToCpuCount" || [ "$gpuReadToCpuCount" -le 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe produced no CPU materialization (gpuReadToCpuCount=$gpuReadToCpuCount)"
+        bfail=1
+    fi
+    if ! num "$gpuReadbacks" || [ "$gpuReadbacks" -le 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe produced no readback telemetry (gpuReadbacks=$gpuReadbacks)"
+        bfail=1
+    fi
+    if ! num "$uniqueGpuReadbackSurfaces" || [ "$uniqueGpuReadbackSurfaces" -le 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe produced no unique readback surfaces (uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+        bfail=1
+    fi
+    if num "$gpuReadbacks" && num "$uniqueGpuReadbackSurfaces" && [ "$gpuReadbacks" -ne "$uniqueGpuReadbackSurfaces" ]; then
+        echo "FAIL[B]: GPU NDI pipe read back a surface more than once (gpuReadbacks=$gpuReadbacks uniqueGpuReadbackSurfaces=$uniqueGpuReadbackSurfaces)"
+        bfail=1
+    fi
+    if ! num "$redundantGpuReadbacks" || [ "$redundantGpuReadbacks" -ne 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe redundant readbacks=$redundantGpuReadbacks"
+        bfail=1
+    fi
+    if ! num "$readbackDrops" || [ "$readbackDrops" -ne 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe readbackDrops=$readbackDrops"
+        bfail=1
+    fi
+    if ! num "$readbackQueueDepth" || [ "$readbackQueueDepth" -gt 3 ]; then
+        echo "FAIL[B]: GPU NDI pipe readbackQueueDepth=$readbackQueueDepth > 3"
+        bfail=1
+    fi
+    if ! num "$vTcChecked" || [ "$vTcChecked" -le 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe checked no video content/timecode pairs (vTcChecked=$vTcChecked)"
+        bfail=1
+    fi
+    if ! num "$vTcSynth" || [ "$vTcSynth" -ne 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe video used synthesized timecode (vTcSynth=$vTcSynth)"
+        bfail=1
+    fi
+    if ! num "$aTcSeen" || [ "$aTcSeen" -le 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe observed no audio timecodes (aTcSeen=$aTcSeen)"
+        bfail=1
+    fi
+    if num "$aTcSeen" && num "$frames"; then
+        if [ "$aTcSeen" -lt "$B_FLOOR" ] || [ $(( aTcSeen * 100 )) -lt $(( frames * 80 )) ]; then
+            echo "FAIL[B]: GPU NDI pipe audio timecodes are too sparse (aTcSeen=$aTcSeen frames=$frames floor=$B_FLOOR)"
+            bfail=1
+        fi
+    else
+        echo "FAIL[B]: GPU NDI pipe audio/video timecode counts are not numeric (aTcSeen=$aTcSeen frames=$frames)"
+        bfail=1
+    fi
+    if ! num "$aTcSynth" || [ "$aTcSynth" -ne 0 ]; then
+        echo "FAIL[B]: GPU NDI pipe audio used synthesized timecode (aTcSynth=$aTcSynth)"
+        bfail=1
+    fi
+}
+assert_no_gpu_readback_path() {
+    for gpucnt in gpuReadToCpuCount gpuReadbacks uniqueGpuReadbackSurfaces \
+                  redundantGpuReadbacks readbackQueueDepth readbackDrops fenceWaitStalls \
+                  gpuOomDegrades gpuVramBytes; do
+        eval "gpuval=\$$gpucnt"
+        if ! num "$gpuval" || [ "$gpuval" -ne 0 ]; then
+            echo "FAIL[B]: GPU telemetry counter $gpucnt=$gpuval, expected 0 on the CPU NDI pipe path"
+            bfail=1
+        fi
+    done
+}
 
 B_FLOOR=$(( CAP_SECS * 30 / 2 ))
 bfail=0
 [ "${frames:-0}" -ge "$B_FLOOR" ]    || { echo "FAIL[B]: framesReceived=$frames < $B_FLOOR"; bfail=1; }
 [ "${reorders:-1}" = "0" ]           || { echo "FAIL[B]: reorders=$reorders"; bfail=1; }
-[ "${maxgap:-99}" -le 3 ]            || { echo "FAIL[B]: maxGapFrames=$maxgap > 3"; bfail=1; }
-# A-V sync is REPORTED, not gated, in this tier: ndi_recv_probe pairs the k-th video flash with
-# the k-th audio beep by ORDINAL, which is unreliable for arrival-anchored NDI-recorded MKVs
-# (audio leads video ~1 flashPeriod, so avSyncMaxFrames clusters at multiples of 15 regardless of
-# true sync). Tier (b) gates real A-V sync (avSyncMaxFrames in [0,1]) on its PTS-aligned fixture,
-# where the ordinal pairing is valid. Here we only assert the audio path produced beeps at all.
-echo "[ndi-pipe] (report-only) avSyncMaxFrames=$avsync"
-[ "${avsync:--1}" -ge 0 ] || { echo "FAIL[B]: avSyncMaxFrames=$avsync (no beeps; audio path dead)"; bfail=1; }
+MAX_GAP_B=3
+[ "$GPU_RUNTIME_ENABLED" -eq 0 ] || MAX_GAP_B=2
+[ "${maxgap:-99}" -le "$MAX_GAP_B" ] || { echo "FAIL[B]: maxGapFrames=$maxgap > $MAX_GAP_B"; bfail=1; }
+# CPU NDI pipe beep A/V sync is report-only: ndi_recv_probe pairs the k-th video flash with
+# the k-th audio beep by ordinal, which is unreliable for arrival-anchored NDI-recorded MKVs.
+# The GPU lane hard-gates programme timecode pairing instead; this survives the record/playback
+# pipe even when the marker beep is not reliably recoverable by the receiver probe.
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    echo "[ndi-pipe] GPU readback tcAvMaxFrames=$tcavsync (gate <=2), avSyncMaxFrames=$avsync (report-only), vTcMatches=$vTcMatches/$vTcChecked (epoch-rebased report-only)"
+    # The pipe is rate-matched, not genlocked (see top of file): the receiver pairs the
+    # k-th video and k-th audio timecode by ordinal, so 1-2 frames of A/V-timecode
+    # divergence is inherent jitter, not desync. Gate at <=2 (consistent with maxGap<=2
+    # above and within lip-sync tolerance) so the check is deterministic on slower hosts
+    # and loaded CI instead of flaking on the 1<->2 boundary.
+    [ "${tcavsync:-99}" -ge 0 ] && [ "${tcavsync:-99}" -le 2 ] || {
+        echo "FAIL[B]: GPU readback tcAvMaxFrames=$tcavsync > 2"; bfail=1;
+    }
+else
+    echo "[ndi-pipe] (report-only) avSyncMaxFrames=$avsync"
+    [ "${avsync:--1}" -ge 0 ] || {
+        echo "FAIL[B]: avSyncMaxFrames=$avsync (no beeps; audio path dead)"; bfail=1;
+    }
+fi
 [ "${reposition:-1}" = "0" ]         || { echo "FAIL[B]: worker reposition=$reposition"; bfail=1; }
 [ "${audioPushes:-0}" -gt 0 ]        || { echo "FAIL[B]: audioPushes=$audioPushes (audio path dead)"; bfail=1; }
+if [ "$GPU_RUNTIME_ENABLED" -eq 1 ]; then
+    assert_gpu_readback_path
+else
+    assert_no_gpu_readback_path
+fi
 [ "$bfail" = "0" ] || { echo "STAGE B (record -> NDI out) FAILED"; cat "$WORK/play.log"; exit 1; }
 
 echo "PASS: full NDI pipe reliable — Stage A (ingest+record) and Stage B (playback+output) both green"

@@ -23,7 +23,8 @@ public:
                int height);
 
     GpuSurfaceDesc desc() const override {
-        return GpuSurfaceDesc{FramePixelFormat::Nv12, m_width, m_height};
+        return GpuSurfaceDesc{FramePixelFormat::Nv12, m_width, m_height,
+                              qint64(m_width) * qint64(m_height) * 3 / 2};
     }
     bool isValid() const override { return m_texture != nullptr; }
     void* nativeHandle() const override { return m_texture.Get(); }

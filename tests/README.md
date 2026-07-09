@@ -7,15 +7,18 @@ so it never affects a normal app build.
 ## Quick start
 
 ```bash
-# Configure with tests enabled (adjust the Qt prefix to your install)
+# Configure with tests enabled (Qt is auto-detected; see the note below)
 cmake -S . -B build -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH=~/Qt/6.10.1/macos \
   -DOLR_BUILD_TESTS=ON
 
 cmake --build build                 # build app + tests
 ctest --test-dir build -L ci --output-on-failure
 ```
+
+Qt is auto-detected (Homebrew `/opt/homebrew/opt/qt` or `~/Qt/6.*/macos`);
+override with `QT_ROOT_DIR`/`OLR_QT_ROOT` or `-DCMAKE_PREFIX_PATH` if it lives
+elsewhere.
 
 Run a subset by label: `ctest --test-dir build -L unit` (or `smoke`, `e2e`).
 The `ci` label is the short PR gate and intentionally excludes the expensive
@@ -158,7 +161,6 @@ coverage, not PR CI coverage.
 
 ```bash
 cmake -S . -B build-asan -G Ninja -DOLR_BUILD_TESTS=ON \
-  -DCMAKE_PREFIX_PATH=~/Qt/6.10.1/macos \
   -DOLR_SANITIZER="address;undefined"     # or "thread"
 cmake --build build-asan
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan --output-on-failure
@@ -221,7 +223,7 @@ by hand:
 
 ```bash
 cmake -S . -B build/prepush-tests -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH=~/Qt/6.10.1/macos -DOLR_BUILD_TESTS=ON
+  -DOLR_BUILD_TESTS=ON
 cmake --build build/prepush-tests
 ctest --test-dir build/prepush-tests --output-on-failure \
   --repeat until-pass:2 -LE 'sync-report|srt|native-apple-ingest'
@@ -232,8 +234,10 @@ then cross-build the iOS target (the FFmpeg xcframeworks are cached in
 location with `QT_IOS_PREFIX` / `QT_HOST_PREFIX`):
 
 ```bash
-~/Qt/6.10.1/ios/bin/qt-cmake -S . -B build/ios-prepush -G Xcode \
-  -DQT_HOST_PATH=~/Qt/6.10.1/macos -DCMAKE_OSX_ARCHITECTURES=arm64
+: "${QT_IOS_PREFIX:=$(ls -d "$HOME"/Qt/6.*/ios | sort -V | tail -1)}"
+: "${QT_HOST_PREFIX:=$(ls -d "$HOME"/Qt/6.*/macos | sort -V | tail -1)}"
+"$QT_IOS_PREFIX/bin/qt-cmake" -S . -B build/ios-prepush -G Xcode \
+  -DQT_HOST_PATH="$QT_HOST_PREFIX" -DCMAKE_OSX_ARCHITECTURES=arm64
 cmake --build build/ios-prepush --config Debug -- \
   CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 ```

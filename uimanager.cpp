@@ -1,7 +1,9 @@
 #include "uimanager.h"
+#include "appenv.h"
 #include "playback/audioplayer.h"
 #include "recorder_engine/benchmark/benchmarkcache.h"
 #include "recorder_engine/benchmark/recordgate.h"
+#include "playback/livefollowpolicy.h"
 #include "playback/output/broadcastoutputsettings.h"
 #include "playback/output/broadcastoutputstatus.h"
 #include "project/projectimportclient.h"
@@ -32,8 +34,14 @@
 #include <QSet>
 #include <QVariantMap>
 #include <cstdio>
+#include <limits>
 
 namespace {
+
+int boundedIntCount(qsizetype value) {
+    return static_cast<int>(
+        qMin<qsizetype>(qMax<qsizetype>(value, 0), std::numeric_limits<int>::max()));
+}
 
 QString telemetryValueToString(const QVariant& value) {
     const QJsonValue json = QJsonValue::fromVariant(value);
@@ -578,6 +586,7 @@ UIManager::UIManager(ReplayManager* engine, QObject* parent)
     connect(this, &UIManager::followLiveChanged, this, pushTransportState);
     connect(m_transport, &PlaybackTransport::posChanged, this, [this](int64_t) {
         pushDeckTimecode();
+        emit scrubPositionChanged();
         emit playbackTimecodeChanged();
         m_telemetryVersion++;
         emit telemetryChanged();
@@ -776,8 +785,44 @@ void UIManager::selectFeedExternal(int index) {
     emit feedSelectRequested(index);
 }
 
-void UIManager::jogStep(int delta) {
-    if (!m_transport || delta == 0) return;
+PlaybackWorker::OperatorSeekResult UIManager::jogExternalAndWaitForPgm(int delta, int timeoutMs) {
+    return jogStep(delta, timeoutMs);
+}
+
+UIManager::AsyncSeekTicket UIManager::jogExternalAsyncPgm(int delta) {
+    AsyncSeekTicket ticket;
+    if (!m_transport || delta == 0) {
+        ticket.message =
+            delta == 0 ? QStringLiteral("no-op") : QStringLiteral("transport unavailable");
+        return ticket;
+    }
+    // Same jog preamble as jogStep (below): pause, leave live-follow, step the
+    // transport, clamp forward jogs to the live edge.
+    m_transport->setPlaying(false);
+    cancelFollowLive();
+    m_transport->step(delta);
+    if (delta > 0) {
+        const int64_t liveEdge = recordedDurationMs();
+        if (m_transport->currentPos() > liveEdge) m_transport->seek(liveEdge);
+    }
+    if (!m_playbackWorker) {
+        ticket.message = QStringLiteral("playback worker unavailable");
+        return ticket;
+    }
+    ticket.workerEpoch = m_playbackWorkerEpoch;
+    ticket.generation = m_playbackWorker->seekToWithPgmNotify(m_transport->currentPos(), delta);
+    ticket.accepted = true;
+    return ticket;
+}
+
+PlaybackWorker::OperatorSeekResult UIManager::jogStep(int delta, int timeoutMs) {
+    PlaybackWorker::OperatorSeekResult result;
+    if (!m_transport || delta == 0) {
+        result.completed = delta == 0;
+        result.message =
+            delta == 0 ? QStringLiteral("no-op") : QStringLiteral("transport unavailable");
+        return result;
+    }
 
     m_transport->setPlaying(false);
     cancelFollowLive();
@@ -792,9 +837,19 @@ void UIManager::jogStep(int delta) {
         }
     }
 
-    if (m_playbackWorker) {
-        m_playbackWorker->seekTo(m_transport->currentPos());
+    if (!m_playbackWorker) {
+        result.message = QStringLiteral("playback worker unavailable");
+        return result;
     }
+
+    const qint64 targetMs = m_transport->currentPos();
+    if (timeoutMs > 0) return m_playbackWorker->seekToAndWaitForPgm(targetMs, delta, timeoutMs);
+
+    m_playbackWorker->seekTo(targetMs, delta);
+    result.completed = true;
+    result.targetMs = targetMs;
+    result.message = QStringLiteral("accepted");
+    return result;
 }
 
 void UIManager::setFollowLive(bool on) {
@@ -923,7 +978,7 @@ void UIManager::ensureSourceEnabledSize() {
 
 void UIManager::rebuildSlotMap() {
     const int viewCount = activeViewCount();
-    const int sourceCount = static_cast<int>(m_currentSettings.sources.size());
+    const int sourceCount = boundedIntCount(m_currentSettings.sources.size());
     ensureSourceEnabledSize();
 
     // Preserve existing assignments: a source already in a slot stays there
@@ -1697,9 +1752,9 @@ void UIManager::forward5x() {
 
 void UIManager::stepFrame() {
     if (!m_transport) return;
-    m_transport->step(1);
     m_transport->setPlaying(false);
     cancelFollowLive();
+    m_transport->step(1);
 
     // Clamp the upper bound to the live edge: the transport only clamps >= 0,
     // so stepping forward past the last recorded frame would walk the hidden
@@ -1711,19 +1766,19 @@ void UIManager::stepFrame() {
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->seekTo(targetMs);
+        m_playbackWorker->seekTo(targetMs, 1);
     }
 }
 
 void UIManager::stepFrameBack() {
     if (!m_transport) return;
-    m_transport->step(-1);
     m_transport->setPlaying(false);
     cancelFollowLive();
+    m_transport->step(-1);
 
     if (m_playbackWorker) {
         int64_t targetMs = m_transport->currentPos();
-        m_playbackWorker->seekTo(targetMs);
+        m_playbackWorker->seekTo(targetMs, -1);
     }
 }
 
@@ -1757,6 +1812,7 @@ void UIManager::setPlaybackViewState(bool singleView, int selectedIndex) {
     // Route audio for the selected track (or mute in multiview)
     if (m_playbackWorker) {
         m_playbackWorker->setSelectedOutputFeed(selectedIndex);
+        m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!singleView);
         m_playbackWorker->setActiveAudioView(singleView ? selectedIndex : -1);
     }
     if (m_audioPlayer) {
@@ -1793,7 +1849,7 @@ void UIManager::startRecording() {
         return;
     }
     // Soft warning: configured feeds exceed the benchmarked safe count for the codec.
-    const int configuredFeeds = static_cast<int>(m_replayManager->getSourceUrls().size());
+    const int configuredFeeds = boundedIntCount(m_replayManager->getSourceUrls().size());
     if (feedCountExceedsSafe(configuredFeeds, m_benchmarkSafeFeedsForChosen)) {
         emit recordingWarning(
             QStringLiteral("Recording %1 feeds; this device benchmarked %2 as the safe limit "
@@ -1839,7 +1895,7 @@ void UIManager::startRecording() {
     m_sourceConnected = QList<bool>(m_replayManager->getSourceUrls().size(), false);
     m_sourceConnectionVersion++;
     emit sourceConnectionChanged();
-    resetSourceStats(static_cast<int>(m_replayManager->getSourceUrls().size()));
+    resetSourceStats(boundedIntCount(m_replayManager->getSourceUrls().size()));
 
     // 1. Initialize the Playback Worker with our providers
     if (m_playbackWorker) {
@@ -1850,7 +1906,9 @@ void UIManager::startRecording() {
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
+    wirePlaybackWorkerCompletion();
 
     // 2. Point it to the file being recorded
     // QString filePath = m_replayManager->getOutputDirectory() + "/" +
@@ -1876,12 +1934,31 @@ void UIManager::restartPlaybackWorker() {
     m_playbackWorker = new PlaybackWorker(m_providers, m_transport, m_audioPlayer, this);
     m_playbackWorker->setBusPreviewProviders(m_multiviewPreviewProvider, m_pgmPreviewProvider);
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
+    m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
+    wirePlaybackWorkerCompletion();
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
     m_transport->seek(0);
     m_transport->setPlaying(true);
     setFollowLive(true);
+}
+
+void UIManager::wirePlaybackWorkerCompletion() {
+    // The worker is recreated per playback session; its generation counter restarts,
+    // so completions are keyed by (epoch, generation). The queued relay dies with
+    // each worker and is re-made here; the control adapter connects once to this
+    // stable UIManager signal instead of the transient worker.
+    ++m_playbackWorkerEpoch;
+    emit playbackWorkerEpochChanged(m_playbackWorkerEpoch);
+    if (!m_playbackWorker) return;
+    const quint64 epoch = m_playbackWorkerEpoch;
+    connect(
+        m_playbackWorker, &PlaybackWorker::operatorSeekCompleted, this,
+        [this, epoch](quint64 generation, const PlaybackWorker::OperatorSeekResult& result) {
+            emit operatorSeekCompleted(epoch, generation, result);
+        },
+        Qt::QueuedConnection);
 }
 
 void UIManager::stopRecording() {
@@ -1914,25 +1991,70 @@ void UIManager::seekPlayback(int64_t ms) {
     stopPlaylistPlayout();
     // Disable live-follow on a manual scrub; the user re-enables via "Live".
     setFollowLive(false);
-    // Coalesce a burst of scrub targets: seek immediately on the first move of
-    // a gesture, then commit only the latest target on a single-shot timer.
-    if (m_seekCoalescer.offer(ms)) {
-        if (m_transport) m_transport->seek(ms);
-        if (m_playbackWorker) m_playbackWorker->seekTo(ms);
-    } else {
-        // A seek is already in flight; arm/refresh the coalesce timer. The
-        // worker's own reposition handles audio re-priming (repositionTo clears
-        // + re-primes the AudioPlayer), so no per-move audioPlayer->clear() here.
-        if (!m_scrubCoalesceTimer.isActive()) m_scrubCoalesceTimer.start();
+    // Broadcast scrubbing is a direct manipulation surface: every drag sample
+    // must move the playhead and request the matching frame immediately.
+    m_scrubCoalesceTimer.stop();
+    m_seekCoalescer.reset();
+    const int directionHint = m_transport && ms < m_transport->currentPos() ? -1 : 1;
+    if (m_transport) m_transport->seek(ms);
+    if (m_playbackWorker) m_playbackWorker->seekTo(ms, directionHint);
+}
+
+PlaybackWorker::OperatorSeekResult UIManager::seekPlaybackAndWaitForPgm(int64_t ms, int timeoutMs) {
+    PlaybackWorker::OperatorSeekResult result;
+    result.targetMs = qMax<int64_t>(0, ms);
+    stopPlaylistPlayout();
+    setFollowLive(false);
+    m_scrubCoalesceTimer.stop();
+    m_seekCoalescer.reset();
+    if (!m_transport) {
+        result.message = QStringLiteral("transport unavailable");
+        return result;
     }
+    const int directionHint = ms < m_transport->currentPos() ? -1 : 1;
+    m_transport->seek(ms);
+    if (!m_playbackWorker) {
+        result.message = QStringLiteral("playback worker unavailable");
+        return result;
+    }
+    return m_playbackWorker->seekToAndWaitForPgm(ms, directionHint, timeoutMs);
+}
+
+UIManager::AsyncSeekTicket UIManager::seekPlaybackAsyncPgm(int64_t ms) {
+    AsyncSeekTicket ticket;
+    // Same operator-override preamble as seekPlaybackAndWaitForPgm above.
+    stopPlaylistPlayout();
+    setFollowLive(false);
+    m_scrubCoalesceTimer.stop();
+    m_seekCoalescer.reset();
+    if (!m_transport) {
+        ticket.message = QStringLiteral("transport unavailable");
+        return ticket;
+    }
+    const int directionHint = ms < m_transport->currentPos() ? -1 : 1;
+    m_transport->seek(ms);
+    if (!m_playbackWorker) {
+        ticket.message = QStringLiteral("playback worker unavailable");
+        return ticket;
+    }
+    ticket.workerEpoch = m_playbackWorkerEpoch;
+    ticket.generation = m_playbackWorker->seekToWithPgmNotify(qMax<int64_t>(0, ms), directionHint);
+    ticket.accepted = true;
+    return ticket;
+}
+
+void UIManager::abandonOperatorSeek(quint64 workerEpoch, quint64 generation) {
+    if (workerEpoch != m_playbackWorkerEpoch || !m_playbackWorker) return;
+    m_playbackWorker->abandonOperatorSeekTransaction(generation);
 }
 
 void UIManager::commitPendingScrub() {
     bool has = false;
     const int64_t ms = m_seekCoalescer.takePending(has);
     if (!has) return;
+    const int directionHint = m_transport && ms < m_transport->currentPos() ? -1 : 1;
     if (m_transport) m_transport->seek(ms);
-    if (m_playbackWorker) m_playbackWorker->seekTo(ms);
+    if (m_playbackWorker) m_playbackWorker->seekTo(ms, directionHint);
 }
 
 void UIManager::endScrubGesture() {
@@ -2455,7 +2577,7 @@ void UIManager::applyImportPreview() {
     m_sourceEnabledVersion++;
     m_sourceConnected = QList<bool>(m_currentSettings.sources.size(), false);
     m_sourceConnectionVersion++;
-    resetSourceStats(static_cast<int>(m_currentSettings.sources.size()));
+    resetSourceStats(boundedIntCount(m_currentSettings.sources.size()));
     m_sourceTrimVersion++;
     m_liveTelemetry.clear();
     m_recordingTelemetry.clear();
@@ -2573,6 +2695,68 @@ QVariantMap UIManager::ndiOutputStatus(const QString& targetId) const {
         if (row.value(QStringLiteral("id")).toString() == targetId) return row;
     }
     return QVariantMap{};
+}
+
+QVariantMap UIManager::previewOutputState() const {
+    const OutputDispatchStats stats =
+        m_playbackWorker ? m_playbackWorker->outputStats() : OutputDispatchStats{};
+    const PlaybackWorker::PlaybackCounters workerCounters =
+        m_playbackWorker ? m_playbackWorker->counters() : PlaybackWorker::PlaybackCounters{};
+    const QHash<QString, BroadcastOutputTargetStatus> statuses =
+        BroadcastOutputStatus::fromDispatchStats(stats);
+    const int providerCount = static_cast<int>(m_providers.size());
+    const QList<OutputTargetAssignment> previews = BroadcastOutputSettings::qtPreviewAssignments(
+        providerCount, m_multiviewPreviewProvider != nullptr, m_pgmPreviewProvider != nullptr);
+
+    QVariantMap state;
+    state.insert(QStringLiteral("previewTargets"),
+                 BroadcastOutputSettings::rows(previews, providerCount, OutputTargetKind::QtPreview,
+                                               statuses));
+    state.insert(QStringLiteral("runtimeTicks"), stats.ticks);
+    state.insert(QStringLiteral("runtimeTargetCount"), stats.targets.size());
+    state.insert(QStringLiteral("framesSubmitted"), stats.framesSubmitted);
+    state.insert(QStringLiteral("placeholderFrames"), stats.placeholderFrames);
+    state.insert(QStringLiteral("sinkFailures"), stats.sinkFailures);
+    state.insert(QStringLiteral("heldFrames"), stats.heldFrames);
+    state.insert(QStringLiteral("skippedDuplicateFrames"), stats.skippedDuplicateFrames);
+    state.insert(QStringLiteral("maxClockDivergenceMs"), stats.maxClockDivergenceMs);
+    state.insert(QStringLiteral("readbackQueueDepth"), stats.readbackQueueDepth);
+    state.insert(QStringLiteral("readbackDrops"), stats.readbackDrops);
+    state.insert(QStringLiteral("fenceWaitStalls"), stats.fenceWaitStalls);
+    state.insert(QStringLiteral("gpuOomDegrades"), stats.gpuOomDegrades);
+    QVariantMap worker;
+    worker.insert(QStringLiteral("decodedVideoFrames"), workerCounters.decodedVideoFrames);
+    worker.insert(QStringLiteral("stagingVideoFramesDecoded"),
+                  workerCounters.stagingVideoFramesDecoded);
+    worker.insert(QStringLiteral("framesDropped"), workerCounters.framesDropped);
+    worker.insert(QStringLiteral("eofTailSeek"), workerCounters.eofTailSeek);
+    worker.insert(QStringLiteral("reposition"), workerCounters.reposition);
+    worker.insert(QStringLiteral("reuseSeek"), workerCounters.reuseSeek);
+    worker.insert(QStringLiteral("reverseChunkSeek"), workerCounters.reverseChunkSeek);
+    worker.insert(QStringLiteral("gpuReadToCpuCount"), workerCounters.gpuReadToCpuCount);
+    worker.insert(QStringLiteral("gpuMemoryPressureLevel1"),
+                  workerCounters.gpuMemoryPressureLevel1);
+    worker.insert(QStringLiteral("gpuMemoryPressureLevel2"),
+                  workerCounters.gpuMemoryPressureLevel2);
+    worker.insert(QStringLiteral("transportPlayheadMs"), workerCounters.transportPlayheadMs);
+    worker.insert(QStringLiteral("committedPlayheadMs"), workerCounters.committedPlayheadMs);
+    worker.insert(QStringLiteral("lastVisiblePlayheadMs"), workerCounters.lastVisiblePlayheadMs);
+    worker.insert(QStringLiteral("seekGeneration"),
+                  QVariant::fromValue<qulonglong>(workerCounters.seekGeneration));
+    worker.insert(QStringLiteral("committedGeneration"),
+                  QVariant::fromValue<qulonglong>(workerCounters.committedGeneration));
+    worker.insert(QStringLiteral("committedGpuGeneration"),
+                  QVariant::fromValue<qulonglong>(workerCounters.committedGpuGeneration));
+    worker.insert(QStringLiteral("currentGpuGeneration"),
+                  QVariant::fromValue<qulonglong>(workerCounters.currentGpuGeneration));
+    worker.insert(QStringLiteral("outputPlayheadCacheGuarded"),
+                  workerCounters.outputPlayheadCacheGuarded);
+    worker.insert(QStringLiteral("forceLiveOutputSnapshots"),
+                  workerCounters.forceLiveOutputSnapshots);
+    worker.insert(QStringLiteral("memoryPressureLatched"), workerCounters.memoryPressureLatched);
+    worker.insert(QStringLiteral("gpuPipelineState"), workerCounters.gpuPipelineState);
+    state.insert(QStringLiteral("worker"), worker);
+    return state;
 }
 
 bool UIManager::ndiOutputEnabled(const QString& busKind, int feedIndex) const {
@@ -2791,7 +2975,7 @@ bool UIManager::screensReady() const {
 }
 
 int UIManager::screenCount() const {
-    return static_cast<int>(m_screens.size());
+    return boundedIntCount(m_screens.size());
 }
 
 void UIManager::refreshScreens() {
@@ -2850,8 +3034,8 @@ void UIManager::refreshProviders() {
     m_pgmPreviewProvider = nullptr;
 
     // Create a provider for every stream URL
-    const int count = static_cast<int>(activeStreamUrls().size());
-    for (int i = 0; i < count; ++i) {
+    const qsizetype count = activeStreamUrls().size();
+    for (qsizetype i = 0; i < count; ++i) {
         m_providers.append(new FrameProvider(this));
     }
     m_multiviewPreviewProvider = new FrameProvider(this);
@@ -2861,6 +3045,7 @@ void UIManager::refreshProviders() {
 
 int64_t UIManager::recordedDurationMs() {
     // Get this from your Master Clock / Recording Engine
+    if (!m_replayManager) return 0;
     return m_replayManager->getElapsedMs();
 }
 
@@ -2876,7 +3061,9 @@ int64_t UIManager::scrubPosition() {
 void UIManager::scrubToLive() {
     setFollowLive(true);
     const int64_t liveEdge = recordedDurationMs();
-    const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
+    const int64_t committedTail = m_replayManager ? m_replayManager->committedVideoTailMs() : -1;
+    const int64_t target =
+        qMax<int64_t>(0, liveFollowEffectiveLiveEdgeMs(liveEdge, committedTail) - m_liveBufferMs);
     m_transport->seek(target);
     // Route the jump-to-live-edge through the scheduler too, or the worker
     // sees a position discontinuity with no seek and tail-holds a stale frame.
@@ -2993,10 +3180,27 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
     const QString recTimeOfDay = QDateTime::fromMSecsSinceEpoch(playheadEpochMs).toString("HHmmss");
     const QString playheadTime = formatTimecodeForFile(playheadMs, fps);
 
-    QString outputDir =
-        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation) + "/videos";
+    QString outputDir = appenv::documentsPath(QStringLiteral("videos"));
     QDir dir(outputDir);
     if (!dir.exists()) dir.mkpath(".");
+
+    auto saveImage = [&](FrameProvider* provider, const QString& token) {
+        if (!provider) return;
+
+        QImage image = provider->latestImage();
+        if (image.isNull()) return;
+
+        const QString fileName = QString("%1_%2_%3_%4.jpg")
+                                     .arg(projectName)
+                                     .arg(token)
+                                     .arg(recTimeOfDay)
+                                     .arg(playheadTime);
+
+        const QString fullPath = dir.absoluteFilePath(fileName);
+        QImageWriter writer(fullPath, "jpg");
+        writer.setQuality(95);
+        writer.write(image);
+    };
 
     auto saveImageForView = [&](int viewIndex) {
         if (viewIndex < 0 || viewIndex >= m_providers.size()) return;
@@ -3007,27 +3211,17 @@ void UIManager::captureSnapshot(bool singleView, int selectedIndex, int64_t play
                 ? sanitizeFileToken(m_currentSettings.sources[sourceIndex].name)
                 : QString("VIEW%1").arg(viewIndex + 1);
 
-        QImage image = m_providers[viewIndex]->latestImage();
-        if (image.isNull()) return;
-
-        const QString fileName = QString("%1_%2_%3_%4.jpg")
-                                     .arg(projectName)
-                                     .arg(feedName)
-                                     .arg(recTimeOfDay)
-                                     .arg(playheadTime);
-
-        const QString fullPath = dir.absoluteFilePath(fileName);
-        QImageWriter writer(fullPath, "jpg");
-        writer.setQuality(95);
-        writer.write(image);
+        saveImage(m_providers[viewIndex], feedName);
     };
 
     if (singleView) {
         saveImageForView(selectedIndex);
+        saveImage(m_pgmPreviewProvider, QStringLiteral("PGM"));
     } else {
         for (int i = 0; i < m_providers.size(); ++i) {
             saveImageForView(i);
         }
+        saveImage(m_multiviewPreviewProvider, QStringLiteral("MULTIVIEW"));
     }
 }
 
@@ -3040,30 +3234,29 @@ void UIManager::onRecorderPulse(int64_t frameIndex, int64_t elapsedMs) {
     updateXTouchDisplay();
 
     if (m_followLive && m_transport && m_transport->isPlaying()) {
-        const int64_t liveEdge = recordedDurationMs();
-        const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
-        const int64_t current = m_transport->currentPos();
-        if (qAbs(current - target) > 50) {
-            m_transport->seek(target);
-            // Classify the yank via the scheduler: small in-window corrections
-            // hit the 0-seek reuse path; only a real jump repositions.
-            if (m_playbackWorker) m_playbackWorker->seekTo(target);
+        const FrameRate rate = m_transport->frameRate();
+        const qint64 frameDurationMs =
+            rate.isValid() ? qMax<qint64>(1, rate.frameIndexToMs(1)) : 20;
+        const qint64 committedTail = m_replayManager ? m_replayManager->committedVideoTailMs() : -1;
+        const LiveFollowCorrection correction = planLiveFollowCorrection(
+            m_followLive, m_transport->isPlaying(), recordedDurationMs(), m_liveBufferMs,
+            m_transport->currentPos(), frameDurationMs, committedTail);
+        if (correction.adjustTransport) {
+            m_transport->seek(correction.targetMs);
+            if (m_playbackWorker) {
+                if (correction.seekWorker)
+                    m_playbackWorker->seekTo(correction.targetMs, correction.directionHint);
+                else if (correction.resetOutputClock)
+                    m_playbackWorker->resetOutputPlayEpoch();
+            }
         }
     }
 }
 
 QString UIManager::getSettingsPath(QString fileName) {
-    // 1. Get the Documents directory for your app
-    QString docPath = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
-
-    // 2. Create a subfolder if you want to be organized
-    QDir dir(docPath);
-    if (!dir.exists("settings")) {
-        dir.mkdir("settings");
-    }
-
-    // 3. Construct the full filename
-    return docPath + "/settings/" + fileName;
+    const QString settingsPath = appenv::documentsPath(QStringLiteral("settings"));
+    QDir().mkpath(settingsPath);
+    return QDir(settingsPath).filePath(fileName);
 }
 
 void UIManager::pushStreamDeckMaps() {

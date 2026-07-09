@@ -3,10 +3,13 @@
 #ifdef _WIN32
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpuframereadbacktelemetry.h"
 #include "playback/gpu/gpureadbackretainer.h"
 #include "playback/output/win/d3d11gpusurface.h"
 
+#include "recorder_engine/ingest/h26xaccessunit.h"
 #include "recorder_engine/ingest/nativeframecopy.h"
+#include "recorder_engine/ingest/nativevideodecoder.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +22,7 @@
 #include <QStringList>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <d3d10.h>
@@ -39,6 +43,30 @@ extern "C" {
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+constexpr const char* kMfHardwareDecoderEnv = "OLR_MF_VIDEO_ENABLE_HARDWARE";
+constexpr int kD3DReadbackFenceTimeoutMs = 2000;
+
+class ScopedHardwareDecoderProbeFlag {
+public:
+    ScopedHardwareDecoderProbeFlag()
+        : m_wasSet(qEnvironmentVariableIsSet(kMfHardwareDecoderEnv)),
+          m_previous(qgetenv(kMfHardwareDecoderEnv)) {
+        qputenv(kMfHardwareDecoderEnv, QByteArrayLiteral("1"));
+    }
+
+    ~ScopedHardwareDecoderProbeFlag() {
+        if (m_wasSet) {
+            qputenv(kMfHardwareDecoderEnv, m_previous);
+        } else {
+            qunsetenv(kMfHardwareDecoderEnv);
+        }
+    }
+
+private:
+    bool m_wasSet = false;
+    QByteArray m_previous;
+};
 
 QString hresultString(const char* what, HRESULT hr) {
     return QStringLiteral("%1 failed (0x%2)")
@@ -83,20 +111,78 @@ bool createD3D11(ComPtr<ID3D11Device>* device, ComPtr<IMFDXGIDeviceManager>* man
     return true;
 }
 
+QByteArray byteArrayFromBytes(const unsigned char* bytes, int size) {
+    return QByteArray(reinterpret_cast<const char*>(bytes), size);
+}
+
+CompressedAccessUnit makeProbeH264AccessUnit() {
+    static constexpr unsigned char kAnnexB[] = {
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1e, 0xdd, 0xec, 0x04, 0x40,
+        0x00, 0x00, 0x03, 0x00, 0x40, 0x00, 0x00, 0x03, 0x00, 0xa3, 0xc5, 0x8b,
+        0xe0, 0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x0f, 0xc8, 0x00, 0x00, 0x01,
+        0x65, 0x88, 0x84, 0x3a, 0x26, 0x28, 0x00, 0x09, 0x02, 0xe0,
+    };
+    static constexpr unsigned char kSps[] = {
+        0x67, 0x42, 0xc0, 0x1e, 0xdd, 0xec, 0x04, 0x40, 0x00, 0x00, 0x03,
+        0x00, 0x40, 0x00, 0x00, 0x03, 0x00, 0xa3, 0xc5, 0x8b, 0xe0,
+    };
+    static constexpr unsigned char kPps[] = {0x68, 0xce, 0x0f, 0xc8};
+
+    const QByteArray annexB = byteArrayFromBytes(kAnnexB, int(sizeof(kAnnexB)));
+    H26xAccessUnitSplitter splitter(NativeVideoCodec::H264);
+    const QList<CompressedAccessUnit> units = splitter.pushPesPayload(annexB, 0, 0);
+    if (!units.isEmpty()) return units.first();
+
+    CompressedAccessUnit unit;
+    unit.codec = NativeVideoCodec::H264;
+    unit.pts90k = 0;
+    unit.dts90k = 0;
+    unit.annexB = annexB;
+    unit.parameterSets.h264Sps.append(byteArrayFromBytes(kSps, int(sizeof(kSps))));
+    unit.parameterSets.h264Pps.append(byteArrayFromBytes(kPps, int(sizeof(kPps))));
+    return unit;
+}
+
+bool decodedSampleHasD3DTexture(void* nativeDecodedImage) {
+    if (!nativeDecodedImage) return false;
+
+    auto* sample = static_cast<IMFSample*>(nativeDecodedImage);
+    ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(sample->GetBufferByIndex(0, &buffer)) || !buffer) return false;
+
+    ComPtr<IMFDXGIBuffer> dxgi;
+    if (FAILED(buffer.As(&dxgi)) || !dxgi) return false;
+
+    ComPtr<ID3D11Texture2D> texture;
+    return SUCCEEDED(dxgi->GetResource(IID_PPV_ARGS(&texture))) && texture;
+}
+
 class D3D11IGpuFrameData final : public IFrameData {
 public:
+#ifdef OLR_GPU_PIPELINE_BUILD
+    D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface,
+                       std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge budgetCharge)
+        : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)),
+          m_budgetCharge(std::move(budgetCharge)) {}
+#else
     D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface,
                        std::shared_ptr<GpuFence> renderFence)
         : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)) {}
+#endif
 
     bool isGpuBacked() const override { return true; }
     CpuPlanes readToCpu(FramePixelFormat target) const override;
+    CpuPlanes cachedCpuPlanes(FramePixelFormat target) const override;
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
+    std::shared_ptr<GpuFence> gpuFence() const override { return m_renderFence; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
 
 private:
     std::shared_ptr<D3D11GpuSurface> m_surface;
     std::shared_ptr<GpuFence> m_renderFence;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    GpuBudgetCharge m_budgetCharge;
+#endif
     mutable QMutex m_cacheMutex;
     mutable QHash<int, CpuPlanes> m_cpuCache;
 };
@@ -107,65 +193,62 @@ WinGpuImportCapabilities probeWinGpuImport() {
     WinGpuImportCapabilities caps;
     caps.backend = QString::fromLatin1(kWinRhiBackend);
 
-    const HRESULT coHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool coOwned = SUCCEEDED(coHr);
-    const HRESULT mfHr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-    if (FAILED(mfHr)) {
-        caps.detail = hresultString("MFStartup", mfHr);
-        if (coOwned) CoUninitialize();
+    QString decodeError;
+    bool sawDecodedSample = false;
+    bool importsDecodedSample = false;
+    ScopedHardwareDecoderProbeFlag forceHardwareDecoder;
+    NativeVideoDecoder decoder(/*outputWidth=*/16, /*outputHeight=*/16);
+    const bool decoded = decoder.decodeKeepSurface(
+        makeProbeH264AccessUnit(),
+        [&](void* nativeDecodedImage, qint64) {
+            sawDecodedSample = nativeDecodedImage != nullptr;
+            importsDecodedSample = decodedSampleHasD3DTexture(nativeDecodedImage);
+            return true;
+        },
+        &decodeError);
+    if (!decoded || !sawDecodedSample) {
+        caps.detail =
+            decodeError.isEmpty()
+                ? QStringLiteral("MF H.264 keep-surface probe produced no decoded sample; CPU "
+                                 "fallback")
+                : QStringLiteral("MF H.264 keep-surface probe failed: %1; CPU fallback")
+                      .arg(decodeError);
         return caps;
     }
 
-    ComPtr<ID3D11Device> device;
-    ComPtr<IMFDXGIDeviceManager> manager;
-    UINT resetToken = 0;
-    QString detail;
-    if (!createD3D11(&device, &manager, &resetToken, &detail)) {
-        caps.detail = detail;
-        MFShutdown();
-        if (coOwned) CoUninitialize();
-        return caps;
-    }
-
-    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_H264};
-    IMFActivate** activates = nullptr;
-    UINT32 count = 0;
-    const HRESULT enumHr =
-        MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
-                  MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_LOCALMFT, &input,
-                  nullptr, &activates, &count);
-    bool d3dAware = false;
-    if (SUCCEEDED(enumHr) && count > 0 && activates && activates[0]) {
-        ComPtr<IMFTransform> transform;
-        if (SUCCEEDED(activates[0]->ActivateObject(IID_PPV_ARGS(&transform)))) {
-            ComPtr<IMFAttributes> attrs;
-            UINT32 aware = 0;
-            if (SUCCEEDED(transform->GetAttributes(&attrs)) && attrs &&
-                SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &aware)) && aware) {
-                const HRESULT setHr = transform->ProcessMessage(
-                    MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(manager.Get()));
-                d3dAware = SUCCEEDED(setHr);
-            }
-        }
-    }
-
-    if (activates) {
-        for (UINT32 i = 0; i < count; ++i) {
-            if (activates[i]) activates[i]->Release();
-        }
-        CoTaskMemFree(activates);
-    }
-
-    caps.d3d11KeepTexture = d3dAware;
-    caps.rhiImportable = d3dAware;
-    caps.detail =
-        d3dAware ? QStringLiteral("MF H.264 decoder is D3D11-aware; keep-texture path available")
-                 : QStringLiteral("MF H.264 decoder is not D3D11-aware on this host; CPU fallback");
-
-    MFShutdown();
-    if (coOwned) CoUninitialize();
+    caps.d3d11KeepTexture = importsDecodedSample;
+    caps.rhiImportable = importsDecodedSample;
+    caps.detail = importsDecodedSample
+                      ? QStringLiteral("decoded MF H.264 sample exposes a D3D11 texture; "
+                                       "keep-texture path available")
+                      : QStringLiteral("decoded MF H.264 sample is not DXGI-backed on this host; "
+                                       "CPU fallback");
     return caps;
 }
+
+#ifdef OLR_UNIT_TEST
+bool winGpuImportProbeForcesHardwareDecoderForTest() {
+    const bool wasSet = qEnvironmentVariableIsSet(kMfHardwareDecoderEnv);
+    const QByteArray previous = qgetenv(kMfHardwareDecoderEnv);
+
+    qunsetenv(kMfHardwareDecoderEnv);
+    bool forced = false;
+    bool restored = false;
+    {
+        ScopedHardwareDecoderProbeFlag forceHardwareDecoder;
+        forced = qgetenv(kMfHardwareDecoderEnv) == QByteArrayLiteral("1");
+    }
+    restored = !qEnvironmentVariableIsSet(kMfHardwareDecoderEnv);
+
+    if (wasSet) {
+        qputenv(kMfHardwareDecoderEnv, previous);
+    } else {
+        qunsetenv(kMfHardwareDecoderEnv);
+    }
+
+    return forced && restored;
+}
+#endif
 
 struct WinGpuImportEdge::Impl {
     ComPtr<ID3D11Device> device;
@@ -173,7 +256,17 @@ struct WinGpuImportEdge::Impl {
     UINT resetToken = 0;
     bool coOwned = false;
     bool mfStarted = false;
+    mutable std::atomic<bool> deviceLost{false};
     std::function<void(const FrameHandle&)> importTap;
+
+    bool noteDeviceLostIfRemoved() const {
+        if (!device) return false;
+        if (FAILED(device->GetDeviceRemovedReason())) {
+            deviceLost.store(true, std::memory_order_release);
+            return true;
+        }
+        return false;
+    }
 };
 
 WinGpuImportEdge::WinGpuImportEdge() : m_impl(std::make_unique<Impl>()) {}
@@ -215,31 +308,20 @@ std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
 }
 
 bool WinGpuImportEdge::isAvailable() const {
-    return m_impl && m_impl->device;
+    return m_impl && m_impl->device && !m_impl->deviceLost.load(std::memory_order_acquire);
+}
+
+bool WinGpuImportEdge::deviceLost() const {
+    if (!m_impl) return false;
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    return m_impl->noteDeviceLostIfRemoved();
 }
 
 std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int feedIndex,
                                                        qint64 ptsMs, int width, int height,
                                                        std::shared_ptr<GpuFence> renderFence) {
     if (!renderFence) return std::nullopt;
-    if (!isAvailable() || !mfSampleOpaque || width <= 0 || height <= 0) return std::nullopt;
-
-    auto* sample = static_cast<IMFSample*>(mfSampleOpaque);
-    ComPtr<IMFMediaBuffer> buffer;
-    if (FAILED(sample->GetBufferByIndex(0, &buffer)) || !buffer) return std::nullopt;
-
-    ComPtr<IMFDXGIBuffer> dxgi;
-    if (FAILED(buffer.As(&dxgi)) || !dxgi) return std::nullopt;
-
-    ComPtr<ID3D11Texture2D> texture;
-    UINT subresource = 0;
-    if (FAILED(dxgi->GetResource(IID_PPV_ARGS(&texture))) || !texture) return std::nullopt;
-    dxgi->GetSubresourceIndex(&subresource);
-
-    ComPtr<ID3D11Device> textureDevice;
-    texture->GetDevice(&textureDevice);
-    auto surface = D3D11GpuSurface::createKept(textureDevice ? textureDevice : m_impl->device,
-                                               texture, subresource, width, height);
+    auto surface = tryImportSurface(mfSampleOpaque, width, height);
     if (!surface) return std::nullopt;
 
     FrameMetadata meta;
@@ -251,14 +333,65 @@ std::optional<FrameHandle> WinGpuImportEdge::tryImport(void* mfSampleOpaque, int
     return makeGpuFrameHandleForTest(std::move(surface), meta, std::move(renderFence));
 }
 
+std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void* mfSampleOpaque, int width,
+                                                                    int height) {
+    if (!isAvailable() || !mfSampleOpaque || width <= 0 || height <= 0) return nullptr;
+
+    auto* sample = static_cast<IMFSample*>(mfSampleOpaque);
+    ComPtr<IMFMediaBuffer> buffer;
+    if (FAILED(sample->GetBufferByIndex(0, &buffer)) || !buffer) {
+        if (m_impl) m_impl->noteDeviceLostIfRemoved();
+        return nullptr;
+    }
+
+    ComPtr<IMFDXGIBuffer> dxgi;
+    if (FAILED(buffer.As(&dxgi)) || !dxgi) {
+        if (m_impl) m_impl->noteDeviceLostIfRemoved();
+        return nullptr;
+    }
+
+    ComPtr<ID3D11Texture2D> texture;
+    UINT subresource = 0;
+    if (FAILED(dxgi->GetResource(IID_PPV_ARGS(&texture))) || !texture) {
+        if (m_impl) m_impl->noteDeviceLostIfRemoved();
+        return nullptr;
+    }
+    dxgi->GetSubresourceIndex(&subresource);
+
+    ComPtr<ID3D11Device> textureDevice;
+    texture->GetDevice(&textureDevice);
+    auto surface = D3D11GpuSurface::createKept(textureDevice ? textureDevice : m_impl->device,
+                                               texture, subresource, width, height);
+    if (!surface && m_impl) m_impl->noteDeviceLostIfRemoved();
+    return surface;
+}
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
+                                                        FrameMetadata meta,
+                                                        std::shared_ptr<GpuFence> renderFence,
+                                                        GpuBudgetCharge charge) {
+#else
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                         FrameMetadata meta,
                                                         std::shared_ptr<GpuFence> renderFence) {
+#endif
     if (!surface) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
+    if (renderFence) {
+        const uint64_t fenceValue = renderFence->signal();
+        if (fenceValue != 0) {
+            gpuRetainSurfaceUntilFenceRetired(surface, renderFence, fenceValue);
+        }
+    }
+#ifdef OLR_GPU_PIPELINE_BUILD
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence),
+                                                     std::move(charge));
+#else
     auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence));
+#endif
     return FrameHandle(std::move(data), meta);
 }
 
@@ -297,6 +430,13 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     ID3D11Device* device = m_surface->device();
     ID3D11Texture2D* src = m_surface->texture();
     if (!device || !src) return out;
+
+    const uint64_t pendingFenceValue = m_surface->pendingFenceValue();
+    if (pendingFenceValue != 0) {
+        if (!m_renderFence || !m_renderFence->wait(pendingFenceValue, kD3DReadbackFenceTimeoutMs)) {
+            return out;
+        }
+    }
 
     ComPtr<ID3D11DeviceContext> ctx;
     device->GetImmediateContext(&ctx);
@@ -356,6 +496,7 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
 
     ctx->Unmap(readable.Get(), 0);
     if (out.isValid()) {
+        gpuRecordFrameReadToCpuReadback();
         if (m_renderFence && m_surface) {
             const uint64_t fenceValue = m_renderFence->signal();
             gpuRetainSurfaceUntilFenceRetired(m_surface, m_renderFence, fenceValue);
@@ -363,6 +504,12 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
         m_cpuCache.insert(int(target), out);
     }
     return out;
+}
+
+CpuPlanes D3D11IGpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {
+    QMutexLocker locker(&m_cacheMutex);
+    const auto cached = m_cpuCache.constFind(int(target));
+    return cached == m_cpuCache.cend() ? CpuPlanes{} : cached.value();
 }
 
 #endif // _WIN32

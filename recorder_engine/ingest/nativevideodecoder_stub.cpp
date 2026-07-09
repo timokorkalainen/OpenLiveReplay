@@ -4,6 +4,7 @@
 class NativeVideoDecoder::Impl {
 public:
     Impl(int, int) {}
+    void flushExcessPixelBufferPool() {}
 };
 
 NativeVideoDecoder::NativeVideoDecoder(int outputWidth, int outputHeight)
@@ -21,6 +22,10 @@ bool NativeVideoDecoder::decode(const CompressedAccessUnit&, FrameCallback, QStr
 }
 
 void NativeVideoDecoder::reset() {}
+
+void NativeVideoDecoder::flushExcessPixelBufferPool() {
+    m_impl->flushExcessPixelBufferPool();
+}
 
 bool NativeVideoDecoder::lastDecodedWasIOSurfaceBacked() const {
     return false;

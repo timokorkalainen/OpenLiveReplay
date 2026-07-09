@@ -30,7 +30,7 @@ public:
 
     static ParseResult parseTextMessage(const QByteArray& payload);
     static CommandValidation validateCommand(const ControlCommandMessage& command);
-    static QJsonObject ack(const QString& id);
+    static QJsonObject ack(const QString& id, const QJsonObject& details = QJsonObject{});
     static QJsonObject ackError(const QString& id, const QString& code, const QString& message);
     static QJsonObject error(const QString& code, const QString& message);
     static QByteArray compact(const QJsonObject& object);

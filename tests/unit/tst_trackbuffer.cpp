@@ -19,6 +19,8 @@ private slots:
     void capProtectsFillEdge();
     void insertReportsCapEviction();
     void duplicateInsertReportsReplacedFrame();
+    void replaceFramesKeepsPtsOrderingAndReportsEvicted();
+    void removeFramesIfDropsMatchingFramesAndReportsEvicted();
     void trimReportsRemovedFrames();
     void clearReportsRemovedFrames();
 };
@@ -124,6 +126,62 @@ void TestTrackBuffer::duplicateInsertReportsReplacedFrame() {
     int64_t currentPts = -1;
     QVERIFY(b.frameAt(100, current, currentPts));
     QCOMPARE(uchar(MediaVideoFrameView(current).planeY.at(0)), uchar(90));
+}
+
+void TestTrackBuffer::replaceFramesKeepsPtsOrderingAndReportsEvicted() {
+    TrackBuffer b;
+    b.insert(100, makeFrame(10), 10, 0, 1000);
+    b.insert(200, makeFrame(20), 10, 0, 1000);
+
+    TrackBuffer::EvictedFrames evicted;
+    const int replaced = b.replaceFrames(
+        [](const FrameHandle& frame) -> std::optional<FrameHandle> {
+            FrameHandle replacement = makeFrame(90);
+            replacement.metadata() = frame.metadata();
+            replacement.metadata().key.ptsMs = -1;
+            return replacement;
+        },
+        &evicted);
+
+    QCOMPARE(replaced, 2);
+    QCOMPARE(evicted.size(), 2);
+    QCOMPARE(evicted[0].ptsMs, int64_t(100));
+    QCOMPARE(evicted[1].ptsMs, int64_t(200));
+    QCOMPARE(b.oldestPts(), int64_t(100));
+    QCOMPARE(b.newestPts(), int64_t(200));
+
+    FrameHandle current;
+    int64_t currentPts = -1;
+    QVERIFY(b.frameAt(200, current, currentPts));
+    QCOMPARE(currentPts, int64_t(200));
+    QCOMPARE(current.metadata().key.ptsMs, qint64(200));
+    QCOMPARE(uchar(MediaVideoFrameView(current).planeY.at(0)), uchar(90));
+}
+
+void TestTrackBuffer::removeFramesIfDropsMatchingFramesAndReportsEvicted() {
+    TrackBuffer b;
+    b.insert(100, makeFrame(10), 10, 0, 1000);
+    b.insert(200, makeFrame(20), 10, 0, 1000);
+    b.insert(300, makeFrame(30), 10, 0, 1000);
+
+    TrackBuffer::EvictedFrames evicted;
+    const int removed = b.removeFramesIf(
+        [](const FrameHandle& frame) {
+            return uchar(MediaVideoFrameView(frame).planeY.at(0)) != uchar(20);
+        },
+        &evicted);
+
+    QCOMPARE(removed, 2);
+    QCOMPARE(evicted.size(), 2);
+    QCOMPARE(evicted[0].ptsMs, int64_t(100));
+    QCOMPARE(evicted[1].ptsMs, int64_t(300));
+    QCOMPARE(b.size(), 1);
+
+    FrameHandle current;
+    int64_t currentPts = -1;
+    QVERIFY(b.frameAt(300, current, currentPts));
+    QCOMPARE(currentPts, int64_t(200));
+    QCOMPARE(uchar(MediaVideoFrameView(current).planeY.at(0)), uchar(20));
 }
 
 void TestTrackBuffer::trimReportsRemovedFrames() {

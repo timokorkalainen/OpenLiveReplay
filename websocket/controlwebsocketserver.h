@@ -1,6 +1,7 @@
 #ifndef CONTROLWEBSOCKETSERVER_H
 #define CONTROLWEBSOCKETSERVER_H
 
+#include <QHash>
 #include <QHostAddress>
 #include <QJsonObject>
 #include <QSet>
@@ -35,6 +36,8 @@ private slots:
     void handleTextMessage(const QString& message);
     void handleBinaryMessage(const QByteArray& message);
     void handleSocketDisconnected();
+    void deliverCommandCompleted(const QString& clientId, const QString& commandId,
+                                 const QJsonObject& completion);
 
 private:
     void sendJson(const QJsonObject& message, QWebSocket* socket);
@@ -43,6 +46,8 @@ private:
     ControlApiAdapter* m_adapter;
     QWebSocketServer* m_server;
     QSet<QWebSocket*> m_sockets;
+    QHash<QString, QWebSocket*> m_clientsById;
+    quint64 m_nextClientSerial = 0;
     QTimer m_timecodeTimer;
     QString m_lastError;
 };

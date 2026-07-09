@@ -1,9 +1,13 @@
 #include <QtTest>
 
+#include "playback/output/colormetadatapolicy.h"
 #include "playback/output/outputbusengine.h"
 
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpucompositor.h"
+#include "playback/gpu/gpuframedata.h"
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpurhicontext.h"
 #endif
 
@@ -31,6 +35,18 @@ static FrameHandle video(int feed, qint64 pts, uchar y) {
     FrameHandle f = solidYuv420pHandle(4, 4, y, 128, 128);
     f.metadata().key.feedIndex = feed;
     f.metadata().key.ptsMs = pts;
+    return f;
+}
+
+static FrameHandle videoWithSequence(int feed, qint64 pts, uchar y, qint64 decodedSequence) {
+    FrameHandle f = video(feed, pts, y);
+    f.metadata().decodedSequence = decodedSequence;
+    return f;
+}
+
+static FrameHandle videoWithColor(int feed, qint64 pts, uchar y, ColorMetadata color) {
+    FrameHandle f = video(feed, pts, y);
+    f.metadata().color = color;
     return f;
 }
 
@@ -67,10 +83,26 @@ class TestOutputBusEngine : public QObject {
     Q_OBJECT
 private slots:
     void feedBusUsesOwnVideoAndAudioAtOneX();
+    void feedIdentityCarriesSourceDecodedSequence();
     void pgmFollowsSelectedFeed();
+    void pgmIdentityCarriesSourceDecodedSequence();
     void pgmIsPixelExactCopyOfSelectedFeed();
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void pgmUsesGpuCompositorEvenWhenAlreadyOutputSized();
+    void pgmReusesAlreadyGpuBackedOutputSizedSource();
+    void pgmReusesReadyGpuBackedOutputSizedSourceWithoutProducerFence();
+    void pgmUsesGpuCompositorWhenScalingIsRequired();
+    void pgmMemoReusesGpuCompositeForUnchangedSource();
+#endif
+    void placeholderUsesHeightDefaultColorMetadata();
+    void pgmPreservesSelectedSourceColorMetadata();
     void pausedAudioIsSilenceButVideoRepeats();
     void multiviewComposesFeedsAndCarriesSelectedFeedAudio();
+    void feedUsesNearFutureFrameBeforePlaceholder();
+    void multiviewUsesNearFutureFeedBeforePlaceholder();
+    void feedPrefersTimestampRoundingFutureOverFrameOldPrior();
+    void feedAndPgmPreferNearFutureOverStalePriorFrame();
+    void multiviewChoosesSelectedSourceColorMetadata();
     void ntscAudioUsesRationalSampleBoundaries();
     void ntscAudioSpansStayContiguousAcrossOddPlayEpoch();
     void multiviewVideoIdentityTracksSourceContentNotPlayhead();
@@ -80,12 +112,14 @@ private slots:
     void multiviewUsesCpuCompositorWithoutInjectedGpuCompositor();
 #ifdef OLR_GPU_PIPELINE_BUILD
     void multiviewUsesInjectedGpuCompositorWhenEnabled();
+    void multiviewMemoInvalidatesWhenOutputGpuGenerationChangesWithAbsentSources();
 #endif
     void programmeTimecodeTracksPlayheadOnEveryBus();
     void staleGpuFeedAndPgmFramesArePlaceholders();
     void staleGpuMultiviewSourcesAreComposedAsAbsent();
     void staleNearestGpuFeedFallsBackToOlderFreshFrame();
     void multiviewMemoInvalidatesWhenSourceGenerationChangesAtSamePts();
+    void multiviewMemoInvalidatesWhenSourceDecodedSequenceChangesAtSamePts();
 };
 
 void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
@@ -111,6 +145,21 @@ void TestOutputBusEngine::feedBusUsesOwnVideoAndAudioAtOneX() {
     QCOMPARE(reinterpret_cast<const qint16*>(feed1.audio.pcm.constData())[0], qint16(200));
 }
 
+void TestOutputBusEngine::feedIdentityCarriesSourceDecodedSequence() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoWithSequence(0, 100, 10, 42));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    const auto feed = engine.renderFeed(0, 3, state, cache);
+    QCOMPARE(feed.identity.sourceDecodedSequence, qint64(42));
+}
+
 void TestOutputBusEngine::pgmFollowsSelectedFeed() {
     OutputFrameCache cache(2, 4, 4);
     cache.insertVideoFrame(video(0, 100, 10));
@@ -126,6 +175,22 @@ void TestOutputBusEngine::pgmFollowsSelectedFeed() {
     auto pgm = engine.renderPgm(5, state, cache);
     QCOMPARE(pgm.bus, OutputBusId::pgm());
     QCOMPARE(uchar(MediaVideoFrameView(pgm.video).planeY.at(0)), uchar(30));
+}
+
+void TestOutputBusEngine::pgmIdentityCarriesSourceDecodedSequence() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoWithSequence(0, 100, 10, 42));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 0;
+
+    const auto pgm = engine.renderPgm(3, state, cache);
+    QCOMPARE(pgm.identity.sourceDecodedSequence, qint64(42));
+    QCOMPARE(pgm.video.metadata().decodedSequence, qint64(42));
 }
 
 // PIXEL-EXACT PGM SELECTION: the PGM bus must emit the SELECTED feed's pixels
@@ -176,6 +241,260 @@ void TestOutputBusEngine::pgmIsPixelExactCopyOfSelectedFeed() {
     QCOMPARE(pgm0View.planeV, feed0View.planeV);
 }
 
+#ifdef OLR_GPU_PIPELINE_BUILD
+void TestOutputBusEngine::pgmUsesGpuCompositorEvenWhenAlreadyOutputSized() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    const FrameHandle selected = videoYuv(0, 100, 30, 90, 170);
+    const MediaVideoFrameView selectedView(selected);
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(selected);
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = GpuGenerationCounter::instance().current();
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QVERIFY2(pgm.video.isGpuBacked(),
+             "PGM must stay GPU-backed in GPU mode so future PGM GPU processing remains on-GPU");
+    QCOMPARE(pgm.video.data() == selected.data(), false);
+    QCOMPARE(pgm.video.metadata().key.format, FramePixelFormat::Rgba8);
+    QCOMPARE(pgm.video.metadata().key.width, 4);
+    QCOMPARE(pgm.video.metadata().key.height, 4);
+    QCOMPARE(pgm.video.metadata().gpuGeneration, state.gpuGeneration);
+    QCOMPARE(pgm.video.metadata().key.feedIndex, selected.metadata().key.feedIndex);
+    QCOMPARE(pgm.video.metadata().key.ptsMs, selected.metadata().key.ptsMs);
+    QCOMPARE(pgm.video.metadata().decodedSequence, selected.metadata().decodedSequence);
+
+    const MediaVideoFrameView pgmView(pgm.video);
+    QVERIFY(pgmView.isValid());
+    QCOMPARE(pgmView.width, selectedView.width);
+    QCOMPARE(pgmView.height, selectedView.height);
+#endif
+}
+
+void TestOutputBusEngine::pgmReusesAlreadyGpuBackedOutputSizedSource() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    FrameHandle cpuSource = videoYuv(0, 100, 30, 90, 170);
+    auto sourceSurface = GpuCompositor::uploadFrameToNv12SurfaceForTest(cpuSource, rhi);
+    if (!sourceSurface) QSKIP("local GPU PGM composition unavailable on this host");
+    auto sourceFence = rhi->createFence();
+    if (!sourceFence) QSKIP("local GPU fence unavailable on this host");
+    const uint64_t sourceFenceValue = sourceFence->signal();
+    sourceSurface->retainUntilFenceRetired(sourceFenceValue);
+    FrameMetadata sourceMeta = cpuSource.metadata();
+    sourceMeta.gpuGeneration = GpuGenerationCounter::instance().current();
+    sourceMeta.decodedSequence = 17;
+    FrameHandle source = makeGpuFrameHandle(sourceSurface, rhi, sourceMeta, sourceFence);
+    QVERIFY(source.isGpuBacked());
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(source);
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = GpuGenerationCounter::instance().current();
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QVERIFY(pgm.video.isGpuBacked());
+    QCOMPARE(pgm.video.dataPtr(), source.dataPtr());
+    QCOMPARE(pgm.video.metadata().key.feedIndex, source.metadata().key.feedIndex);
+    QCOMPARE(pgm.video.metadata().key.ptsMs, source.metadata().key.ptsMs);
+    QCOMPARE(pgm.video.metadata().decodedSequence, source.metadata().decodedSequence);
+#endif
+}
+
+void TestOutputBusEngine::pgmReusesReadyGpuBackedOutputSizedSourceWithoutProducerFence() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    FrameHandle cpuSource = videoYuv(0, 100, 30, 90, 170);
+    auto sourceSurface = GpuCompositor::uploadFrameToNv12SurfaceForTest(cpuSource, rhi);
+    if (!sourceSurface) QSKIP("local GPU PGM composition unavailable on this host");
+    QCOMPARE(sourceSurface->pendingFenceValue(), uint64_t(0));
+
+    FrameMetadata sourceMeta = cpuSource.metadata();
+    sourceMeta.gpuGeneration = GpuGenerationCounter::instance().current();
+    sourceMeta.decodedSequence = 18;
+    FrameHandle source = makeGpuFrameHandle(sourceSurface, rhi, sourceMeta, nullptr);
+    QVERIFY(source.isGpuBacked());
+    QVERIFY(!source.data()->gpuFence());
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(source);
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = GpuGenerationCounter::instance().current();
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QVERIFY(pgm.video.isGpuBacked());
+    QCOMPARE(pgm.video.dataPtr(), source.dataPtr());
+    QCOMPARE(pgm.video.metadata().key.format, FramePixelFormat::Nv12);
+    QCOMPARE(pgm.video.metadata().key.feedIndex, source.metadata().key.feedIndex);
+    QCOMPARE(pgm.video.metadata().key.ptsMs, source.metadata().key.ptsMs);
+    QCOMPARE(pgm.video.metadata().decodedSequence, source.metadata().decodedSequence);
+#endif
+}
+
+void TestOutputBusEngine::pgmUsesGpuCompositorWhenScalingIsRequired() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoYuv(0, 100, 30, 90, 170));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 8, 8);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = 12;
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QVERIFY(pgm.video.isGpuBacked());
+    QCOMPARE(pgm.video.metadata().key.format, FramePixelFormat::Rgba8);
+    QCOMPARE(pgm.video.metadata().key.width, 8);
+    QCOMPARE(pgm.video.metadata().key.height, 8);
+#endif
+}
+
+void TestOutputBusEngine::pgmMemoReusesGpuCompositeForUnchangedSource() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoWithSequence(0, 100, 30, 1));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = GpuGenerationCounter::instance().current();
+
+    PgmComposite memo;
+    const auto first = engine.renderPgm(5, state, cache, &memo);
+    QVERIFY(first.video.isGpuBacked());
+
+    cache.insertVideoFrame(videoWithSequence(0, 100, 99, 1));
+    const auto repeat = engine.renderPgm(6, state, cache, &memo);
+    QVERIFY(repeat.video.isGpuBacked());
+    QCOMPARE(repeat.video.dataPtr(), first.video.dataPtr());
+    QCOMPARE(repeat.video.metadata().outputFrameIndex, qint64(6));
+
+    cache.insertVideoFrame(videoWithSequence(0, 133, 77, 2));
+    PlaybackStateSnapshot advanced = state;
+    advanced.playheadMs = 133;
+    const auto advancedPgm = engine.renderPgm(7, advanced, cache, &memo);
+    QVERIFY(advancedPgm.video.isGpuBacked());
+    QVERIFY(advancedPgm.video.dataPtr() != first.video.dataPtr());
+#endif
+}
+#endif
+
+void TestOutputBusEngine::placeholderUsesHeightDefaultColorMetadata() {
+    OutputFrameCache cache(1, 4, 4);
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 640, 480);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    const auto feed = engine.renderFeed(0, 5, state, cache);
+
+    QVERIFY(feed.video.metadata().key.isPlaceholder);
+    QCOMPARE(int(feed.video.metadata().color.matrix), int(ColorMatrix::Bt601));
+    QCOMPARE(int(feed.video.metadata().color.primaries), int(ColorPrimaries::Bt601));
+    QCOMPARE(int(feed.video.metadata().color.transfer), int(ColorTransfer::Bt601));
+}
+
+void TestOutputBusEngine::pgmPreservesSelectedSourceColorMetadata() {
+    ColorMetadata bt601;
+    bt601.matrix = ColorMatrix::Bt601;
+    bt601.primaries = ColorPrimaries::Bt601;
+    bt601.transfer = ColorTransfer::Bt601;
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(videoWithColor(1, 100, 30, bt601));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = true;
+    state.speed = 1.0;
+    state.selectedFeedIndex = 1;
+
+    const auto pgm = engine.renderPgm(5, state, cache);
+
+    QCOMPARE(pgm.video.metadata().color, bt601);
+}
+
 void TestOutputBusEngine::pausedAudioIsSilenceButVideoRepeats() {
     OutputFrameCache cache(1, 4, 4);
     cache.insertVideoFrame(video(0, 100, 40));
@@ -221,6 +540,124 @@ void TestOutputBusEngine::multiviewComposesFeedsAndCarriesSelectedFeedAudio() {
     const auto* pcm = reinterpret_cast<const qint16*>(multiview.audio.pcm.constData());
     QCOMPARE(multiview.audio.feedIndex, 1);
     QCOMPARE(pcm[0], qint16(200));
+}
+
+void TestOutputBusEngine::feedUsesNearFutureFrameBeforePlaceholder() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 20, 44));
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 0;
+    state.playing = false;
+
+    const auto feed = engine.renderFeed(0, 0, state, cache);
+    const MediaVideoFrameView rendered(feed.video);
+
+    QCOMPARE(uchar(rendered.planeY.at(0)), uchar(44));
+    QVERIFY(!feed.identity.videoPlaceholder);
+    QCOMPARE(feed.identity.sourcePtsMs, qint64(20));
+}
+
+void TestOutputBusEngine::multiviewUsesNearFutureFeedBeforePlaceholder() {
+    OutputFrameCache cache(2, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(video(1, 120, 44));
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 2, 8, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    const auto multiview = engine.renderMultiview(5, state, cache);
+    const MediaVideoFrameView multiviewVideo(multiview.video);
+
+    QCOMPARE(uchar(multiviewVideo.planeY.at(0)), uchar(10));
+    QCOMPARE(uchar(multiviewVideo.planeY.at(4)), uchar(44));
+    QVERIFY(!multiview.identity.videoPlaceholder);
+}
+
+void TestOutputBusEngine::feedPrefersTimestampRoundingFutureOverFrameOldPrior() {
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+
+    {
+        OutputFrameCache cache(1, 4, 4);
+        cache.insertVideoFrame(video(0, 29933, 10));
+        cache.insertVideoFrame(video(0, 29967, 20));
+
+        PlaybackStateSnapshot state;
+        state.playheadMs = 29966;
+        state.playing = false;
+        state.selectedFeedIndex = 0;
+
+        const auto feed = engine.renderFeed(0, 0, state, cache);
+
+        QCOMPARE(feed.video.metadata().key.ptsMs, qint64(29967));
+        QCOMPARE(feed.identity.sourcePtsMs, qint64(29967));
+        QCOMPARE(uchar(MediaVideoFrameView(feed.video).planeY.at(0)), uchar(20));
+    }
+
+    {
+        OutputFrameCache cache(1, 4, 4);
+        cache.insertVideoFrame(video(0, 29932, 10));
+        cache.insertVideoFrame(video(0, 29967, 20));
+
+        PlaybackStateSnapshot state;
+        state.playheadMs = 29965;
+        state.playing = false;
+        state.selectedFeedIndex = 0;
+
+        const auto feed = engine.renderFeed(0, 0, state, cache);
+
+        QCOMPARE(feed.video.metadata().key.ptsMs, qint64(29967));
+        QCOMPARE(feed.identity.sourcePtsMs, qint64(29967));
+        QCOMPARE(uchar(MediaVideoFrameView(feed.video).planeY.at(0)), uchar(20));
+    }
+}
+
+void TestOutputBusEngine::feedAndPgmPreferNearFutureOverStalePriorFrame() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 900, 10));
+    cache.insertVideoFrame(video(0, 12000, 80));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 11992;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    const auto feed = engine.renderFeed(0, 0, state, cache);
+    const auto pgm = engine.renderPgm(0, state, cache);
+
+    QCOMPARE(feed.video.metadata().key.ptsMs, qint64(12000));
+    QCOMPARE(feed.identity.sourcePtsMs, qint64(12000));
+    QCOMPARE(uchar(MediaVideoFrameView(feed.video).planeY.at(0)), uchar(80));
+
+    QCOMPARE(pgm.video.metadata().key.ptsMs, qint64(12000));
+    QCOMPARE(pgm.identity.sourcePtsMs, qint64(12000));
+    QCOMPARE(uchar(MediaVideoFrameView(pgm.video).planeY.at(0)), uchar(80));
+}
+
+void TestOutputBusEngine::multiviewChoosesSelectedSourceColorMetadata() {
+    ColorMetadata selectedColor;
+    selectedColor.matrix = ColorMatrix::Bt601;
+    selectedColor.primaries = ColorPrimaries::Bt601;
+    selectedColor.transfer = ColorTransfer::Bt601;
+    OutputFrameCache cache(3, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 10));
+    cache.insertVideoFrame(videoWithColor(1, 100, 20, selectedColor));
+    cache.insertVideoFrame(video(2, 100, 30));
+
+    OutputBusEngine engine(FrameRate::fromFraction(25, 1), 3, 8, 8);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 1;
+
+    const auto multiview = engine.renderMultiview(5, state, cache);
+
+    QCOMPARE(multiview.video.metadata().color, selectedColor);
 }
 
 void TestOutputBusEngine::ntscAudioUsesRationalSampleBoundaries() {
@@ -444,6 +881,46 @@ void TestOutputBusEngine::multiviewUsesInjectedGpuCompositorWhenEnabled() {
     QCOMPARE(rgba.height, 8);
 #endif
 }
+
+void TestOutputBusEngine::
+    multiviewMemoInvalidatesWhenOutputGpuGenerationChangesWithAbsentSources() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no local GPU RHI backend on this host");
+
+    auto compositor = GpuCompositor::create(rhi);
+    if (!compositor) QSKIP("GPU compositor unavailable on this host");
+
+    OutputFrameCache cache(2, 4, 4);
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 2, 8, 8);
+    engine.setGpuCompositor(compositor);
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+    state.gpuGeneration = GpuGenerationCounter::instance().current();
+
+    MultiviewComposite memo;
+    const auto first = engine.renderMultiview(5, state, cache, &memo);
+    QVERIFY(first.video.isGpuBacked());
+    QVERIFY(first.video.metadata().key.isPlaceholder);
+
+    state.gpuGeneration = GpuGenerationCounter::instance().bump();
+    const auto second = engine.renderMultiview(6, state, cache, &memo);
+    QVERIFY(second.video.isGpuBacked());
+    QVERIFY(second.video.metadata().key.isPlaceholder);
+    QCOMPARE(second.video.metadata().gpuGeneration, state.gpuGeneration);
+
+    const CpuPlanes rgba = second.video.readToCpu(FramePixelFormat::Rgba8);
+    QVERIFY2(rgba.isValid(),
+             "memo hit after a GPU-generation bump must not reuse an old-generation surface");
+#endif
+}
 #endif
 
 // Every output bus stamps a programme timecode = playhead position in 100 ns units, so a
@@ -563,6 +1040,28 @@ void TestOutputBusEngine::multiviewMemoInvalidatesWhenSourceGenerationChangesAtS
     cache.insertVideoFrame(gpuVideo(0, 100, 22, 2));
     state.gpuGeneration = 2;
     const auto second = engine.renderMultiview(5, state, cache, &memo);
+    QCOMPARE(uchar(MediaVideoFrameView(second.video).planeY.at(0)), uchar(22));
+    QVERIFY(second.identity.videoHash != first.identity.videoHash);
+}
+
+void TestOutputBusEngine::multiviewMemoInvalidatesWhenSourceDecodedSequenceChangesAtSamePts() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(videoWithSequence(0, 100, 99, 1));
+
+    OutputBusEngine engine(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    PlaybackStateSnapshot state;
+    state.playheadMs = 100;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    MultiviewComposite memo;
+    const auto first = engine.renderMultiview(4, state, cache, &memo);
+    QCOMPARE(first.identity.sourceDecodedSequence, qint64(1));
+    QCOMPARE(uchar(MediaVideoFrameView(first.video).planeY.at(0)), uchar(99));
+
+    cache.insertVideoFrame(videoWithSequence(0, 100, 22, 2));
+    const auto second = engine.renderMultiview(5, state, cache, &memo);
+    QCOMPARE(second.identity.sourceDecodedSequence, qint64(2));
     QCOMPARE(uchar(MediaVideoFrameView(second.video).planeY.at(0)), uchar(22));
     QVERIFY(second.identity.videoHash != first.identity.videoHash);
 }

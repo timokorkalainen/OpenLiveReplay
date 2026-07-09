@@ -37,8 +37,10 @@ fi
 qml_files="$(git diff --cached --name-only --diff-filter=ACM -- '*.qml' || true)"
 if [ -n "$qml_files" ]; then
     QMLLINT=""
-    for c in "${QT_ROOT_DIR:-}/bin/qmllint" "$HOME/Qt/6.10.1/macos/bin/qmllint"; do
-        [ -n "$c" ] && [ -x "$c" ] && { QMLLINT="$c"; break; }
+    for c in "${QT_ROOT_DIR:-}/bin/qmllint" "${OLR_QT_ROOT:-}/bin/qmllint" \
+             "${QT_HOST_PREFIX:-}/bin/qmllint" \
+             /opt/homebrew/opt/qt/bin/qmllint /usr/local/opt/qt/bin/qmllint; do
+        [ -x "$c" ] && { QMLLINT="$c"; break; }
     done
     [ -n "$QMLLINT" ] || QMLLINT="$(command -v qmllint || true)"
     if [ -n "$QMLLINT" ] && [ -x "$QMLLINT" ]; then

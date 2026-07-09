@@ -27,6 +27,16 @@ std::unique_ptr<OlrRhi> OlrRhi::create(Backend backend, QString* error) {
 
 OlrRhi::~OlrRhi() = default;
 
+bool OlrRhi::deviceLost() const {
+    return m_deviceLost.load(std::memory_order_acquire);
+}
+
+void OlrRhi::injectDeviceLostForTest() {
+    // Deterministic device-loss source for CI. The latch mirrors a removed
+    // device: recovery is a fresh OlrRhi::create(), not a clear-in-place.
+    m_deviceLost.store(true, std::memory_order_release);
+}
+
 bool OlrRhi::runOffscreenFrame(const std::function<void(QRhiCommandBuffer*)>& record,
                                QString* error) {
     if (!m_rhi) {

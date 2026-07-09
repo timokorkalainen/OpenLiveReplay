@@ -8,6 +8,8 @@
 
 #include "framepsnr.h"
 
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpucompositor.h"
 #include "playback/gpu/gpurhicontext.h"
@@ -18,6 +20,10 @@
 
 #include <utility>
 
+#ifdef __APPLE__
+#include <atomic>
+#endif
+
 class TestGpuCompositor : public QObject {
     Q_OBJECT
 private slots:
@@ -25,8 +31,10 @@ private slots:
     void gridShadersLoadAndBuildPipeline();
     void compatGridFallsBackToCpuOracleOnNull();
     void compatGridMatchesCpuOracleExactOnWarp();
+    void gpuBackedRhiWithoutOutputSurfaceSupportFallsBackToCpu();
     void compatGridWithinOneLsbOnLocalGpu();
     void composeGridReturnsGpuBackedRgbaOnLocalGpu();
+    void composeGridChargesGpuBudgetOnLocalGpu();
     void swappedQuadrantsDifferFromOracle();
     void pgmSelectFillsOutputFromSingleSource();
     void bilinearScalerMeetsPsnrAgainstBilinearReference();
@@ -37,6 +45,8 @@ private slots:
 #ifdef __APPLE__
     void cpuHandleUploadsToNv12Surface();
     void gpuNv12HandleAliasesExistingSurface();
+    void gpuNv12AliasUsesBoundedFenceWait();
+    void memoHitReusesSameLocalGpuSurface();
 #endif
 };
 
@@ -299,6 +309,30 @@ void compareRgbaWithinOneLsb(const CpuPlanes& actual, const CpuPlanes& expected)
 
 } // namespace
 
+#ifdef __APPLE__
+class PendingNv12Surface final : public GpuSurface {
+public:
+    GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 8}; }
+    bool isValid() const override { return true; }
+    void* nativeHandle() const override { return nullptr; }
+    uint64_t pendingFenceValue() const override { return 1; }
+};
+
+class NeverRetiredFence final : public GpuFence {
+public:
+    uint64_t signal() override { return 1; }
+    bool wait(uint64_t, int timeoutMs) override {
+        waits.fetch_add(1, std::memory_order_acq_rel);
+        lastTimeoutMs.store(timeoutMs, std::memory_order_release);
+        return false;
+    }
+    uint64_t completedValue() const override { return 0; }
+
+    std::atomic<int> waits{0};
+    std::atomic<int> lastTimeoutMs{-2};
+};
+#endif
+
 void TestGpuCompositor::createIsNullOrValidNeverPartial() {
     auto rhi = GpuRhiContext::create();
     if (!rhi) QSKIP("no RHI backend on this host");
@@ -379,6 +413,39 @@ void TestGpuCompositor::compatGridMatchesCpuOracleExactOnWarp() {
     QCOMPARE(gpu.plane[0], oracle.plane[0]);
 }
 
+void TestGpuCompositor::gpuBackedRhiWithoutOutputSurfaceSupportFallsBackToCpu() {
+#ifndef _WIN32
+    QSKIP("D3D11/WARP output-surface support gate is Windows-only");
+#else
+    auto rhi = GpuRhiContext::createWarpForTest();
+    if (!rhi) {
+        if (warpRequiredForTest()) QFAIL("required QRhi WARP/D3D11 backend unavailable");
+        QSKIP("QRhi WARP/D3D11 backend unavailable on this host");
+    }
+    QVERIFY(rhi->isGpuBacked());
+
+    auto comp = GpuCompositor::create(rhi);
+    QVERIFY(comp != nullptr);
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 60, 200),
+        solidYuv420pHandle(4, 4, 160, 90, 170),
+    };
+    ColorMetadata color;
+    const CpuPlanes oracle = formatcanon::referenceComposeGridRgba8(frames, 8, 8, color);
+    QVERIFY(oracle.isValid());
+
+    const FrameHandle composed =
+        comp->composeGrid(frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+    QVERIFY(!composed.isNull());
+    QVERIFY(!composed.isGpuBacked());
+
+    const CpuPlanes rgba = composed.readToCpu(FramePixelFormat::Rgba8);
+    QVERIFY(rgba.isValid());
+    QCOMPARE(rgba.plane[0], oracle.plane[0]);
+#endif
+}
+
 void TestGpuCompositor::compatGridWithinOneLsbOnLocalGpu() {
     auto rhi = GpuRhiContext::create();
     if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
@@ -434,6 +501,46 @@ void TestGpuCompositor::composeGridReturnsGpuBackedRgbaOnLocalGpu() {
     QCOMPARE(yuv.format, FramePixelFormat::Yuv420p);
     QCOMPARE(yuv.width, 8);
     QCOMPARE(yuv.height, 8);
+#endif
+}
+
+void TestGpuCompositor::composeGridChargesGpuBudgetOnLocalGpu() {
+#ifndef __APPLE__
+    QSKIP("GPU-backed compositor output surfaces are Apple-only in this phase");
+#else
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    GpuBudgetConfig cfg;
+    cfg.width = 8;
+    cfg.height = 8;
+    cfg.surfaceFormat = FramePixelFormat::Rgba8;
+    cfg.aggregateDecodeWindow = 4;
+    cfg.activeBusCount = 1;
+    GpuBudget::instance().configure(cfg);
+    GpuBudget::instance().reset();
+
+    qint64 chargedBytes = 0;
+    {
+        QList<FrameHandle> frames{
+            solidYuv420pHandle(4, 4, 40, 60, 200),
+            solidYuv420pHandle(4, 4, 160, 90, 170),
+        };
+        ColorMetadata color;
+        const FrameHandle gpu =
+            comp->composeGrid(frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat);
+        QVERIFY(!gpu.isNull());
+        QVERIFY(gpu.isGpuBacked());
+        QVERIFY(gpu.data()->gpuSurface() != nullptr);
+        chargedBytes = gpuSurfaceBytes(*gpu.data()->gpuSurface());
+        QVERIFY(chargedBytes > 0);
+        QCOMPARE(GpuBudget::instance().liveBytes(), chargedBytes);
+    }
+
+    QCOMPARE(GpuBudget::instance().liveBytes(), qint64(0));
 #endif
 }
 
@@ -639,6 +746,58 @@ void TestGpuCompositor::gpuNv12HandleAliasesExistingSurface() {
 
     auto aliased = GpuCompositor::uploadFrameToNv12SurfaceForTest(gpuFrame, rhi);
     QCOMPARE(aliased.get(), surface.get());
+}
+
+void TestGpuCompositor::gpuNv12AliasUsesBoundedFenceWait() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no RHI backend");
+
+    auto fence = std::make_shared<NeverRetiredFence>();
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 16;
+    meta.key.height = 8;
+    FrameHandle gpuFrame =
+        makeGpuFrameHandle(std::make_shared<PendingNv12Surface>(), rhi, meta, fence);
+
+    auto aliased = GpuCompositor::uploadFrameToNv12SurfaceForTest(gpuFrame, rhi);
+
+    QVERIFY(aliased == nullptr);
+    QCOMPARE(fence->waits.load(std::memory_order_acquire), 1);
+    QVERIFY(fence->lastTimeoutMs.load(std::memory_order_acquire) >= 0);
+}
+
+void TestGpuCompositor::memoHitReusesSameLocalGpuSurface() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 40, 60, 200),
+        solidYuv420pHandle(4, 4, 80, 70, 190),
+    };
+    QVector<qint64> keys{1, 100, 1, 200};
+    MultiviewComposite memo;
+    ColorMetadata color;
+
+    const FrameHandle first = comp->composeGridMemoized(
+        frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat, keys, &memo);
+    QVERIFY(first.isGpuBacked());
+    QVERIFY(first.data()->gpuSurface() != nullptr);
+
+    const FrameHandle hit = comp->composeGridMemoized(
+        frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat, keys, &memo);
+    QVERIFY(hit.isGpuBacked());
+    QCOMPARE(hit.dataPtr(), first.dataPtr());
+    QCOMPARE(hit.data()->gpuSurface(), first.data()->gpuSurface());
+
+    const FrameHandle miss = comp->composeGridMemoized(
+        frames, 8, 8, color, GpuCompositor::ScaleQuality::NearestCompat, {1, 100, 1, 201}, &memo);
+    QVERIFY(miss.isGpuBacked());
+    QVERIFY(miss.dataPtr() != first.dataPtr());
+    QVERIFY(miss.data()->gpuSurface() != first.data()->gpuSurface());
 }
 #endif
 

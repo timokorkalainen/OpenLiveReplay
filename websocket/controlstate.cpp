@@ -91,6 +91,7 @@ QJsonObject ControlState::snapshotMessage(const ControlApiAdapter& adapter) {
     state.insert(QStringLiteral("import"), importObj);
 
     state.insert(QStringLiteral("telemetry"), telemetryObject(adapter));
+    state.insert(QStringLiteral("output"), outputObject(adapter));
 
     QJsonObject msg;
     msg.insert(QStringLiteral("type"), QStringLiteral("state.snapshot"));
@@ -164,4 +165,8 @@ QJsonObject ControlState::telemetryObject(const ControlApiAdapter& adapter) {
     obj.insert(QStringLiteral("rows"), variantListToArray(telemetry.rows));
     obj.insert(QStringLiteral("state"), variantMapToObject(telemetry.state));
     return obj;
+}
+
+QJsonObject ControlState::outputObject(const ControlApiAdapter& adapter) {
+    return variantMapToObject(adapter.outputState());
 }

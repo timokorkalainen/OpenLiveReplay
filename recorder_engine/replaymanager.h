@@ -90,6 +90,7 @@ public:
     int getFps() const { return m_fps; }
 
     int64_t getElapsedMs();
+    int64_t committedVideoTailMs() const;
     QString getVideoPath();
     qint64 getRecordingStartEpochMs() const { return m_recordingStartEpochMs; }
 
@@ -170,6 +171,10 @@ signals:
 
     // Sustained fatal muxer write error (e.g. ENOSPC). Recording is NOT auto-stopped.
     void recordingError(const QString& message);
+
+#ifdef OLR_UNIT_TEST
+    friend class TestReplayManagerTelemetry;
+#endif
 
 private slots:
     void onTimerTick();

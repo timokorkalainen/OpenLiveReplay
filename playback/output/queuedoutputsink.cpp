@@ -1,5 +1,7 @@
 #include "playback/output/queuedoutputsink.h"
 
+#include <QElapsedTimer>
+
 #include <utility>
 
 QueuedOutputSink::QueuedOutputSink(std::unique_ptr<IOutputSink> inner, int capacity)
@@ -20,6 +22,8 @@ bool QueuedOutputSink::start(const OutputTargetAssignment& assignment, FrameRate
         m_queue.clear();
         m_stopRequested = false;
         m_active = true;
+        m_delivering = false;
+        ++m_epoch;
         m_droppedFrames = 0;
         m_droppedFrameIndexes.clear();
         m_asyncAcceptedFrames = 0;
@@ -50,10 +54,17 @@ void QueuedOutputSink::stop() {
         m_stopRequested = true;
         m_queue.clear();
         m_wake.wakeAll();
+        m_drained.wakeAll();
         thread = std::move(m_thread);
     }
 
     if (thread) thread->wait();
+    {
+        QMutexLocker locker(&m_mutex);
+        while (m_delivering) {
+            m_drained.wait(&m_mutex);
+        }
+    }
     if (m_inner) m_inner->stop();
 }
 
@@ -67,7 +78,7 @@ bool QueuedOutputSink::submit(const OutputBusFrame& frame) {
     if (!m_active || m_stopRequested || !m_thread) return false;
     bool dropped = false;
     if (m_queue.size() >= m_capacity) {
-        m_droppedFrameIndexes.append(m_queue.first().outputFrameIndex);
+        m_droppedFrameIndexes.append(m_queue.first().frame.outputFrameIndex);
         // Bound the tracked-drop history. Indexes are normally drained by the next
         // successful delivery; only a persistently-failing inner sink (already reported as
         // Error via the rejection path) lets them accumulate. Forgetting the oldest drop can
@@ -79,7 +90,7 @@ bool QueuedOutputSink::submit(const OutputBusFrame& frame) {
         m_droppedFrames++;
         dropped = true;
     }
-    m_queue.append(frame);
+    m_queue.append(QueuedFrame{frame, m_epoch});
     m_lastQueuedFrameIndex = frame.outputFrameIndex;
     m_hasLastQueuedFrameIndex = true;
     m_maxQueueDepth = qMax<qint64>(m_maxQueueDepth, m_queue.size());
@@ -89,9 +100,89 @@ bool QueuedOutputSink::submit(const OutputBusFrame& frame) {
     return true;
 }
 
+bool QueuedOutputSink::submitAndFlush(const OutputBusFrame& frame, int timeoutMs) {
+    quint64 epoch = 0;
+    bool useQueuedPath = false;
+    {
+        QMutexLocker locker(&m_mutex);
+        if (!m_active || m_stopRequested || !m_thread) return false;
+        useQueuedPath = !m_queue.isEmpty() || m_delivering;
+        if (!useQueuedPath) {
+            epoch = m_epoch;
+            m_lastQueuedFrameIndex = frame.outputFrameIndex;
+            m_hasLastQueuedFrameIndex = true;
+            m_lastSubmitDroppedFrame = false;
+            m_queuePressure = false;
+            m_delivering = true;
+        } else {
+            const qsizetype droppedQueuedFrames = m_queue.size();
+            for (const QueuedFrame& queued : std::as_const(m_queue))
+                m_droppedFrameIndexes.append(queued.frame.outputFrameIndex);
+            m_queue.clear();
+            if (droppedQueuedFrames > 0) {
+                m_droppedFrames += static_cast<int>(droppedQueuedFrames);
+                constexpr int kMaxTrackedDrops = 4096;
+                while (m_droppedFrameIndexes.size() > kMaxTrackedDrops)
+                    m_droppedFrameIndexes.removeFirst();
+            }
+            ++m_epoch;
+            m_queue.append(QueuedFrame{frame, m_epoch});
+            m_lastQueuedFrameIndex = frame.outputFrameIndex;
+            m_hasLastQueuedFrameIndex = true;
+            m_maxQueueDepth = qMax<qint64>(m_maxQueueDepth, m_queue.size());
+            m_lastSubmitDroppedFrame = droppedQueuedFrames > 0;
+            m_queuePressure = false;
+            m_wake.wakeOne();
+        }
+    }
+
+    if (useQueuedPath) return flush(timeoutMs);
+
+    const bool submitted = m_inner && m_inner->submitAndFlush(frame, timeoutMs);
+    {
+        QMutexLocker locker(&m_mutex);
+        recordDeliveryResultLocked(frame, epoch, submitted);
+        m_delivering = false;
+        if (!m_queue.isEmpty()) m_wake.wakeOne();
+        m_drained.wakeAll();
+    }
+    return submitted;
+}
+
 int QueuedOutputSink::droppedFrames() const {
     QMutexLocker locker(&m_mutex);
     return m_droppedFrames;
+}
+
+bool QueuedOutputSink::flush(int timeoutMs) {
+    QElapsedTimer timer;
+    timer.start();
+    QMutexLocker locker(&m_mutex);
+    while (!m_stopRequested && (!m_queue.isEmpty() || m_delivering)) {
+        const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
+        if (remainingMs <= 0) return false;
+        m_drained.wait(&m_mutex, static_cast<unsigned long>(remainingMs));
+    }
+    return !m_stopRequested;
+}
+
+void QueuedOutputSink::discardPending() {
+    {
+        QMutexLocker locker(&m_mutex);
+        m_queue.clear();
+        m_droppedFrameIndexes.clear();
+        m_queuePressure = false;
+        m_lastSubmitDroppedFrame = false;
+        m_lastDeliveryGap = false;
+        m_lastQueuedFrameIndex = -1;
+        m_lastDeliveredFrameIndex = -1;
+        m_hasLastQueuedFrameIndex = false;
+        m_hasLastDeliveredFrameIndex = false;
+        ++m_epoch;
+        m_wake.wakeAll();
+        m_drained.wakeAll();
+    }
+    if (m_inner) m_inner->discardPending();
 }
 
 OutputSinkStatus QueuedOutputSink::outputStatus() const {
@@ -145,52 +236,65 @@ OutputSinkStatus QueuedOutputSink::outputStatus() const {
 
 void QueuedOutputSink::workerLoop() {
     while (true) {
-        OutputBusFrame frame;
+        QueuedFrame queued;
         {
             QMutexLocker locker(&m_mutex);
-            while (!m_stopRequested && m_queue.isEmpty()) {
+            while (!m_stopRequested && (m_queue.isEmpty() || m_delivering)) {
                 m_wake.wait(&m_mutex);
             }
             if (m_stopRequested) return;
-            frame = m_queue.takeFirst();
+            queued = m_queue.takeFirst();
             m_queuePressure = m_queue.size() > 1;
+            m_delivering = true;
         }
+        const OutputBusFrame frame = queued.frame;
         const bool submitted = m_inner && m_inner->submit(frame);
         {
             QMutexLocker locker(&m_mutex);
-            if (submitted) {
-                // Consume the overflow-dropped indexes that precede this delivered frame.
-                // For a real gap (non-first delivery) these are exactly the missing indexes
-                // between the previous and current delivered frame that were dropped. Drops
-                // below the first-ever delivered index bracket no computed gap and are simply
-                // discarded here, scoped by index so they can never carry forward to suppress
-                // a later, independently-caused gap.
-                int droppedInGap = 0;
-                while (!m_droppedFrameIndexes.isEmpty() &&
-                       m_droppedFrameIndexes.first() < frame.outputFrameIndex) {
-                    m_droppedFrameIndexes.removeFirst();
-                    droppedInGap++;
-                }
-                if (m_hasLastDeliveredFrameIndex) {
-                    const qint64 gapSize =
-                        qMax<qint64>(0, frame.outputFrameIndex - m_lastDeliveredFrameIndex - 1);
-                    if (gapSize > 0) {
-                        m_deliveryGaps++;
-                    }
-                    // A gap fully explained by queue-overflow drops is backpressure
-                    // (surfaced as Degraded via lastSubmitDroppedFrame), not a delivery
-                    // failure. Only raise the Error-mapping lastDeliveryGap when missing
-                    // indexes remain unexplained by drops (e.g. an inner-sink rejection).
-                    m_lastDeliveryGap = gapSize > 0 && droppedInGap < gapSize;
-                }
-                m_lastDeliveredFrameIndex = frame.outputFrameIndex;
-                m_hasLastDeliveredFrameIndex = true;
-                m_asyncAcceptedFrames++;
-            } else {
-                m_asyncFailedFrames++;
-            }
-            m_hasLastAsyncResult = true;
-            m_lastAsyncResultSucceeded = submitted;
+            recordDeliveryResultLocked(frame, queued.epoch, submitted);
+            m_delivering = false;
+            if (!m_queue.isEmpty()) m_wake.wakeOne();
+            m_drained.wakeAll();
         }
+    }
+}
+
+void QueuedOutputSink::recordDeliveryResultLocked(const OutputBusFrame& frame, quint64 epoch,
+                                                  bool submitted) {
+    const bool currentEpoch = epoch == m_epoch;
+    if (submitted && currentEpoch) {
+        // Consume the overflow-dropped indexes that precede this delivered frame.
+        // For a real gap (non-first delivery) these are exactly the missing indexes
+        // between the previous and current delivered frame that were dropped. Drops
+        // below the first-ever delivered index bracket no computed gap and are simply
+        // discarded here, scoped by index so they can never carry forward to suppress
+        // a later, independently-caused gap.
+        int droppedInGap = 0;
+        while (!m_droppedFrameIndexes.isEmpty() &&
+               m_droppedFrameIndexes.first() < frame.outputFrameIndex) {
+            m_droppedFrameIndexes.removeFirst();
+            droppedInGap++;
+        }
+        if (m_hasLastDeliveredFrameIndex) {
+            const qint64 gapSize =
+                qMax<qint64>(0, frame.outputFrameIndex - m_lastDeliveredFrameIndex - 1);
+            if (gapSize > 0) {
+                m_deliveryGaps++;
+            }
+            // A gap fully explained by queue-overflow drops is backpressure
+            // (surfaced as Degraded via lastSubmitDroppedFrame), not a delivery
+            // failure. Only raise the Error-mapping lastDeliveryGap when missing
+            // indexes remain unexplained by drops (e.g. an inner-sink rejection).
+            m_lastDeliveryGap = gapSize > 0 && droppedInGap < gapSize;
+        }
+        m_lastDeliveredFrameIndex = frame.outputFrameIndex;
+        m_hasLastDeliveredFrameIndex = true;
+        m_asyncAcceptedFrames++;
+    } else if (!submitted && currentEpoch) {
+        m_asyncFailedFrames++;
+    }
+    if (currentEpoch) {
+        m_hasLastAsyncResult = true;
+        m_lastAsyncResultSucceeded = submitted;
     }
 }

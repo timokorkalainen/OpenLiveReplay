@@ -3,12 +3,15 @@
 
 #include "playback/output/framepixelformat.h"
 
+#include <QtGlobal>
+
 #include <cstdint>
 
 struct GpuSurfaceDesc {
     FramePixelFormat format = FramePixelFormat::Nv12;
     int width = 0;
     int height = 0;
+    qint64 allocationBytes = 0;
 };
 
 // GPU-resident pixel surface behind the opaque GpuSurface forward declaration
@@ -16,7 +19,11 @@ struct GpuSurfaceDesc {
 // types; platform import code downcasts nativeHandle() inside .mm/.cpp files.
 class GpuSurface {
 public:
-    virtual ~GpuSurface();
+    // Defaulted inline so the (abstract) vtable and typeinfo are weak-emitted in
+    // every translation unit that uses GpuSurface. Record-side code (the
+    // VideoToolbox encoder's encodeSurface) references it even in GPU-off builds
+    // that do not link the playback GPU library, so there is no single anchor TU.
+    virtual ~GpuSurface() = default;
 
     virtual GpuSurfaceDesc desc() const = 0;
     virtual bool isValid() const = 0;

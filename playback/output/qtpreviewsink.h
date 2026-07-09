@@ -16,7 +16,7 @@ class QtPreviewSink {
 public:
     explicit QtPreviewSink(FrameProvider* provider);
 
-    bool deliver(const FrameHandle& frame);
+    bool deliver(const FrameHandle& frame, quint64* deliveredSerial = nullptr);
     static QVideoFrame toQVideoFrame(const FrameHandle& frame);
 
 private:
@@ -30,12 +30,14 @@ public:
     OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
     bool start(const OutputTargetAssignment& assignment, FrameRate rate) override;
     void stop() override;
-    bool isActive() const override { return m_active; }
+    bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
+    bool flush(int timeoutMs) override;
 
 private:
     FrameProvider* m_provider = nullptr;
     OutputTargetAssignment m_assignment;
+    quint64 m_lastSubmittedSerial = 0;
     bool m_active = false;
 };
 

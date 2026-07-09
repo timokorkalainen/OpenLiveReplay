@@ -1,5 +1,7 @@
 #include "nativertmpingestsession.h"
 
+#include "gpudecodedframe.h"
+
 #include <QAbstractSocket>
 #include <QDateTime>
 #include <QDebug>
@@ -8,6 +10,8 @@
 #include <QStringList>
 #include <QTcpSocket>
 #include <QThread>
+
+#include <utility>
 
 extern "C" {
 #include <libavutil/frame.h>
@@ -30,6 +34,7 @@ constexpr int kMessageVideo = 9;
 constexpr int kMessageDataAmf3 = 15;
 constexpr int kMessageDataAmf0 = 18;
 constexpr int kMessageCommandAmf0 = 20;
+constexpr int kMaxAdtsAacPayloadSize = 8191 - 7;
 constexpr int kAudioSampleRate = 48000;
 constexpr int64_t kForwardJumpMs = 3000;
 constexpr int64_t kBackwardToleranceMs = -200;
@@ -1002,6 +1007,7 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         if (m_videoDecoder) {
             m_videoDecoder->reset();
         }
+        m_keepSurfaceDecodeActive = false;
         log(QStringLiteral("Native RTMP video codec %1.").arg(codecName(packet.codec)));
         return;
     }
@@ -1069,6 +1075,53 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     // THIS access unit's TC even if m_pendingVideoTimecode100ns is overwritten by a
     // later AU before the callback fires.
     const int64_t timecode100ns = m_pendingVideoTimecode100ns;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    const bool preferGpuVideoFrames =
+        ingestPrefersGpuVideoFrames(m_callbacks) && m_callbacks.onVideoFrame;
+    if (preferGpuVideoFrames) {
+        m_keepSurfaceDecodeActive = true;
+        QString gpuError;
+        bool gpuSurfaceRejected = false;
+        const bool decodedGpu = m_videoDecoder->decodeKeepSurface(
+            unit,
+            [this, &unit, sourcePtsMs, timecode100ns, &gpuSurfaceRejected](void* nativeDecodedImage,
+                                                                           qint64) {
+                const FrameMetadata meta =
+                    gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                ImportedGpuVideoFrame imported;
+                if (m_callbacks.importGpuVideoFrame) {
+                    imported = m_callbacks.importGpuVideoFrame(nativeDecodedImage, meta);
+                } else {
+                    imported.frame = makeGpuDecodedFrameHandle(
+                        nativeDecodedImage, unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                }
+                FrameHandle gpuFrame = std::move(imported.frame);
+                if (gpuFrame.isNull()) {
+                    gpuSurfaceRejected = true;
+                    return false;
+                }
+
+                DecodedVideoFrame decodedFrame;
+                decodedFrame.sourcePtsMs = sourcePtsMs;
+                decodedFrame.sourceTimecode100ns = timecode100ns;
+                decodedFrame.gpuFrame = std::move(gpuFrame);
+                decodedFrame.gpuFenceValue = imported.fenceValue;
+                m_callbacks.onVideoFrame(std::move(decodedFrame));
+                return true;
+            },
+            &gpuError);
+        if (decodedGpu) {
+            return;
+        }
+        if (keepSurfaceDecodeNeedsResetBeforeCpuFallback(decodedGpu, gpuSurfaceRejected)) {
+            m_videoDecoder->reset();
+            m_keepSurfaceDecodeActive = false;
+        }
+    } else if (m_keepSurfaceDecodeActive) {
+        m_videoDecoder->reset();
+        m_keepSurfaceDecodeActive = false;
+    }
+#endif
     QString error;
     const bool decoded = m_videoDecoder->decode(
         unit,
@@ -1098,6 +1151,7 @@ void NativeRtmpIngestSession::resetVideoState() {
     m_videoCodec = NativeVideoCodec::Unknown;
     m_avcConfig = RtmpAvcConfig();
     m_hevcConfig = RtmpHevcConfig();
+    m_keepSurfaceDecodeActive = false;
     if (m_videoDecoder) {
         m_videoDecoder->reset();
     }
@@ -1148,6 +1202,11 @@ void NativeRtmpIngestSession::processAudioMessage(qint64 timestampMs, const QByt
         log(QStringLiteral("Native RTMP audio parse failed: empty AAC payload."));
         return;
     }
+    if (aacPayload.size() > kMaxAdtsAacPayloadSize) {
+        m_lastFailureKind = IngestFailureKind::MalformedStream;
+        log(QStringLiteral("Native RTMP audio parse failed: AAC payload is too large."));
+        return;
+    }
 
     const QByteArray header = RtmpFlv::adtsHeader(m_aacConfig, static_cast<int>(aacPayload.size()));
     if (header.isEmpty()) {
@@ -1192,6 +1251,7 @@ bool NativeRtmpIngestSession::parseAvcSequenceHeader(const QByteArray& payload, 
     if (m_videoDecoder) {
         m_videoDecoder->reset();
     }
+    m_keepSurfaceDecodeActive = false;
     return true;
 }
 

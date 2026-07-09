@@ -6,6 +6,7 @@
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpuframeretirequeue.h"
 #include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/framehandle.h"
@@ -22,10 +23,14 @@ private slots:
     void gpuBackedReportsSurface();
     void completedReadbackRetainReleasesImmediately();
     void waitForPendingFenceUsesProducerFence();
+    void droppingGpuHandleCreditsBudget();
 #ifdef __APPLE__
     void gpuPresentabilityDoesNotReadBack();
     void outputCacheInsertionDoesNotReadBack();
     void readToCpuDownloadsAndCounts();
+    void cpuReadbackCacheChargesRepeatedReadsOnce();
+    void cpuReadbackCacheCreditsWhenHandleIsDestroyed();
+    void appleSurfaceWithoutRhiReadsToCpu();
     void readbackMatchesCpuWithinOneLsb();
     void importVtBufferProducesGpuHandle();
     void readbackStampsSurfacePendingFence();
@@ -62,6 +67,16 @@ public:
 private:
     std::atomic<uint64_t> m_pending{0};
 };
+
+#ifdef __APPLE__
+qint64 cpuPlanePayloadBytes(const CpuPlanes& planes) {
+    qint64 bytes = 0;
+    for (const QByteArray& plane : planes.plane) {
+        bytes += qint64(plane.size());
+    }
+    return bytes;
+}
+#endif
 
 } // namespace
 
@@ -112,6 +127,24 @@ void TestGpuFrameData::waitForPendingFenceUsesProducerFence() {
     QVERIFY(!data.waitForPendingFence(0));
     fence->complete(1);
     QVERIFY(data.waitForPendingFence(0));
+}
+
+void TestGpuFrameData::droppingGpuHandleCreditsBudget() {
+    auto fence = std::make_shared<DeferredFence>();
+    auto surface = std::make_shared<TestSurface>();
+    GpuBudget::instance().reset();
+    const qint64 bytes = gpuSurfaceBytes(*surface);
+
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 48;
+    {
+        FrameHandle handle = makeGpuFrameHandle(surface, std::shared_ptr<GpuRhiContext>{}, meta,
+                                                fence, GpuBudgetCharge(bytes));
+        QCOMPARE(GpuBudget::instance().liveBytes(), bytes);
+    }
+    QCOMPARE(GpuBudget::instance().liveBytes(), qint64(0));
 }
 
 #ifdef __APPLE__
@@ -179,15 +212,18 @@ void TestGpuFrameData::readToCpuDownloadsAndCounts() {
     QVERIFY(data != nullptr);
     QCOMPARE(data->readToCpuCount(), 0);
     QCOMPARE(gpuFrameReadToCpuCount(), qint64(0));
+    QVERIFY(!data->cachedCpuPlanes(FramePixelFormat::Yuv420p).isValid());
     const CpuPlanes planes = handle.readToCpu(FramePixelFormat::Yuv420p);
     QVERIFY(planes.isValid());
     QCOMPARE(planes.width, 64);
     QCOMPARE(planes.height, 48);
     QCOMPARE(data->readToCpuCount(), 1);
     QCOMPARE(gpuFrameReadToCpuCount(), qint64(1));
+    QVERIFY(data->cachedCpuPlanes(FramePixelFormat::Yuv420p).isValid());
 
     const GpuReadbackTelemetrySnapshot once = GpuReadbackTelemetry::instance().snapshot();
-    QCOMPARE(once.gpuReadbacks, qint64(1));
+    QCOMPARE(once.gpuReadbacks, qint64(0));
+    QCOMPARE(once.uniqueSurfaces, qint64(0));
     QCOMPARE(once.redundantReadbacks, qint64(0));
 
     const CpuPlanes second = handle.readToCpu(FramePixelFormat::Yuv420p);
@@ -196,8 +232,90 @@ void TestGpuFrameData::readToCpuDownloadsAndCounts() {
     QCOMPARE(gpuFrameReadToCpuCount(), qint64(1));
 
     const GpuReadbackTelemetrySnapshot twice = GpuReadbackTelemetry::instance().snapshot();
-    QCOMPARE(twice.gpuReadbacks, qint64(1));
+    QCOMPARE(twice.gpuReadbacks, qint64(0));
+    QCOMPARE(twice.uniqueSurfaces, qint64(0));
     QCOMPARE(twice.redundantReadbacks, qint64(0));
+}
+
+void TestGpuFrameData::cpuReadbackCacheChargesRepeatedReadsOnce() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no RHI backend");
+    auto& budget = GpuBudget::instance();
+    budget.reset();
+
+    auto surface = makeAppleNv12Surface(64, 48);
+    QVERIFY(surface != nullptr);
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 48;
+
+    FrameHandle handle = makeGpuFrameHandle(surface, rhi, meta);
+    const auto* data = dynamic_cast<const GpuFrameData*>(handle.data());
+    QVERIFY(data != nullptr);
+
+    const CpuPlanes planes = handle.readToCpu(FramePixelFormat::Yuv420p);
+    QVERIFY(planes.isValid());
+    const qint64 cachedBytes = cpuPlanePayloadBytes(planes);
+    QVERIFY(cachedBytes > 0);
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), cachedBytes);
+    QCOMPARE(budget.gatedLiveBytes(), qint64(0));
+    QCOMPARE(data->readToCpuCount(), 1);
+
+    const CpuPlanes second = handle.readToCpu(FramePixelFormat::Yuv420p);
+    QVERIFY(second.isValid());
+    QCOMPARE(data->readToCpuCount(), 1);
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), cachedBytes);
+    QCOMPARE(budget.gatedLiveBytes(), qint64(0));
+
+    handle = FrameHandle();
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), qint64(0));
+}
+
+void TestGpuFrameData::cpuReadbackCacheCreditsWhenHandleIsDestroyed() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi) QSKIP("no RHI backend");
+    auto& budget = GpuBudget::instance();
+    budget.reset();
+
+    qint64 cachedBytes = 0;
+    {
+        auto surface = makeAppleNv12Surface(64, 48);
+        QVERIFY(surface != nullptr);
+        FrameMetadata meta;
+        meta.key.format = FramePixelFormat::Nv12;
+        meta.key.width = 64;
+        meta.key.height = 48;
+
+        FrameHandle handle = makeGpuFrameHandle(surface, rhi, meta);
+        const CpuPlanes planes = handle.readToCpu(FramePixelFormat::Yuv420p);
+        QVERIFY(planes.isValid());
+        cachedBytes = cpuPlanePayloadBytes(planes);
+        QVERIFY(cachedBytes > 0);
+        QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), cachedBytes);
+    }
+    QCOMPARE(budget.liveBytes(GpuBudgetTag::CpuReadbackCache), qint64(0));
+    QCOMPARE(budget.liveBytes(), qint64(0));
+}
+
+void TestGpuFrameData::appleSurfaceWithoutRhiReadsToCpu() {
+    gpuResetFrameReadToCpuCount();
+
+    auto surface = makeAppleNv12Surface(16, 16);
+    QVERIFY(surface != nullptr);
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 16;
+    meta.key.height = 16;
+
+    FrameHandle handle = makeGpuFrameHandle(surface, nullptr, meta);
+    const CpuPlanes planes = handle.readToCpu(FramePixelFormat::Yuv420p);
+
+    QVERIFY(planes.isValid());
+    QCOMPARE(planes.format, FramePixelFormat::Yuv420p);
+    QCOMPARE(planes.width, 16);
+    QCOMPARE(planes.height, 16);
+    QCOMPARE(gpuFrameReadToCpuCount(), qint64(1));
 }
 
 void TestGpuFrameData::readbackMatchesCpuWithinOneLsb() {

@@ -18,13 +18,25 @@ IngestBackendKind selectIngestBackend(const QUrl& url, const IngestBackendOption
 }
 
 SourceHealth srtHealth(const IngestStats& prev, const IngestStats& cur, double amberRetransRate) {
+    if (cur.recvTotal < prev.recvTotal || cur.retransTotal < prev.retransTotal ||
+        cur.lossTotal < prev.lossTotal || cur.dropTotal < prev.dropTotal ||
+        cur.decodeFailures < prev.decodeFailures) {
+        return SourceHealth::Green; // counters reset on reconnect
+    }
     const qint64 dDrop = cur.dropTotal - prev.dropTotal;
     const qint64 dRetrans = cur.retransTotal - prev.retransTotal;
     const qint64 dRecv = cur.recvTotal - prev.recvTotal;
+    const quint64 dDecodeFailures = cur.decodeFailures - prev.decodeFailures;
     if (dDrop > 0) {
         return SourceHealth::Red;
     }
+    if (dDecodeFailures > 0 && dRecv <= 0) {
+        return SourceHealth::Red;
+    }
     if (dRecv > 0 && double(dRetrans) / double(dRecv) > amberRetransRate) {
+        return SourceHealth::Amber;
+    }
+    if (dDecodeFailures > 0) {
         return SourceHealth::Amber;
     }
     return SourceHealth::Green;
@@ -57,6 +69,15 @@ bool shouldStopNativeRtmpAfterFailure(IngestFailureKind failure) {
     return failure == IngestFailureKind::UnsupportedProfile ||
            failure == IngestFailureKind::DecodeCapability ||
            failure == IngestFailureKind::MalformedStream;
+}
+
+bool keepSurfaceDecodeNeedsResetBeforeCpuFallback(bool decodedGpu, bool gpuSurfaceRejected) {
+    return !decodedGpu || gpuSurfaceRejected;
+}
+
+bool ingestPrefersGpuVideoFrames(const IngestCallbacks& callbacks) {
+    if (callbacks.shouldPreferGpuVideoFrames) return callbacks.shouldPreferGpuVideoFrames();
+    return callbacks.preferGpuVideoFrames;
 }
 
 IngestBackendOptions ingestBackendOptionsFromEnvironment(const QUrl& url, bool nativeSrtAvailable,

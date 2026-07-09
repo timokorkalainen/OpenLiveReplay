@@ -26,8 +26,8 @@ the interactive app. Not for the iOS build (desktop only).
 ## The one hard rule: the probe must match the app's Qt
 
 GammaRay injects a probe whose ABI is keyed to the **target's Qt version**. This
-app is built against **Qt 6.10.1** (`~/Qt/6.10.1/macos`), so GammaRay must be
-built against that same Qt.
+app is built against the project's Qt (auto-detected; `/opt/homebrew/opt/qt` or
+`~/Qt/6.*/macos`), so GammaRay must be built against that same Qt.
 
 > Do **not** `brew install gammaray`. Homebrew's GammaRay is built against
 > Homebrew's Qt (a different minor, e.g. 6.11) and pulls in a second full Qt; a
@@ -138,7 +138,7 @@ introspection works regardless. Quit the app when done.
 
 | Symptom | Cause / fix |
 |---|---|
-| `No probe found for ABI qt6_XX`, or a wrong Qt in `--list-probes` | Probe/Qt mismatch. Rebuild GammaRay against `~/Qt/6.10.1/macos` (see [docs/gammaray.md](../../../docs/gammaray.md)). |
+| `No probe found for ABI qt6_XX`, or a wrong Qt in `--list-probes` | Probe/Qt mismatch. Rebuild GammaRay against the project's Qt (see [docs/gammaray.md](../../../docs/gammaray.md)). |
 | `Library not loaded: @rpath/librtmidi.7.dylib` → `Injector error: Process crashed` | The app **bundle is stale** (library paths baked at an old checkout path), not a GammaRay fault. Use a build configured at the current repo path, or rebuild per `CLAUDE.md`. |
 | `--pid` attach fails on macOS | Use launch mode instead; ensure a local unsigned Debug build. |
 | No GammaRay window over SSH / headless | Use `-i preload --inject-only --listen …` and connect a UI via `--connect`. |

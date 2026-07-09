@@ -7,6 +7,9 @@ class TestNativeVideoDecoder : public QObject {
 private slots:
     void defaultCapabilitiesAreFalse();
     void queryCapabilitiesReportsPlatformBackend();
+    void keepSurfaceNullImageBufferIsRejected();
+    void videoToolboxNoFrameIsRejected();
+    void flushExcessPixelBufferPoolNoOpsWithoutSession();
 };
 
 void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
@@ -34,6 +37,29 @@ void TestNativeVideoDecoder::queryCapabilitiesReportsPlatformBackend() {
     QVERIFY(!caps.detail.isEmpty());
 #endif
 #endif
+}
+
+void TestNativeVideoDecoder::keepSurfaceNullImageBufferIsRejected() {
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS) || defined(Q_OS_TVOS) || defined(Q_OS_WATCHOS)
+    QVERIFY(nativeVideoDecoderKeepSurfaceNullImageRejectedForTest());
+#else
+    QSKIP("VideoToolbox null-image callback seam is Apple-only");
+#endif
+}
+
+void TestNativeVideoDecoder::videoToolboxNoFrameIsRejected() {
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS) || defined(Q_OS_TVOS) || defined(Q_OS_WATCHOS)
+    QString error;
+    QVERIFY(!nativeVideoDecoderNoFrameRejectedForTest(&error));
+    QVERIFY(error.contains(QStringLiteral("produced no frame")));
+#else
+    QSKIP("VideoToolbox no-frame validation seam is Apple-only");
+#endif
+}
+
+void TestNativeVideoDecoder::flushExcessPixelBufferPoolNoOpsWithoutSession() {
+    NativeVideoDecoder decoder(0, 0);
+    decoder.flushExcessPixelBufferPool();
 }
 
 QTEST_GUILESS_MAIN(TestNativeVideoDecoder)

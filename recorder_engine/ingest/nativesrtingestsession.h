@@ -61,6 +61,13 @@ public:
     static int64_t advanceAudioFifoSample(int64_t* fifoSamplePos, int64_t clockStartSample,
                                           int decodedSamples, int64_t resyncSamples);
 
+    // Video equivalent of advanceAudioFifoSample(): anchor to the recovered clock once,
+    // then project regular 90 kHz PTS deltas from that anchor so recovered-clock jitter
+    // does not make video walk against sample-contiguous audio. Re-anchor only when the
+    // projection diverges beyond resyncMs.
+    static int64_t advanceVideoFramePtsMs(int64_t* anchorTs90k, int64_t* anchorStreamMs,
+                                          qint64 pts90k, int64_t clockMappedMs, int64_t resyncMs);
+
     // Nominal fps used only to convert an extracted SMPTE 12M timecode into a 100 ns
     // offset since midnight. The SRT session itself carries no fps (the constructor
     // takes only output width/height). This is an ALIAS of the shared
@@ -84,6 +91,7 @@ private:
     std::unique_ptr<H26xAccessUnitSplitter> m_splitter;
     std::unique_ptr<NativeVideoDecoder> m_decoder;
     std::unique_ptr<NativeAacDecoder> m_audioDecoder;
+    bool m_keepSurfaceDecodeActive = false;
     QByteArray m_tsBuffer;
     QByteArray m_audioRemainder;
     int m_socket = -1;
@@ -103,6 +111,8 @@ private:
     bool m_externalClock = false;
     // Per-stream previous timestamps, for discontinuity (jump) detection only.
     int64_t m_prevDts90k = -1;
+    int64_t m_videoPtsAnchor90k = -1;
+    int64_t m_videoPtsAnchorStreamMs = -1;
     int64_t m_prevAudioPts90k = -1;
     int64_t m_prevRawPcr90k = -1;
     int64_t m_prevRawVideoDts90k = -1;
@@ -123,6 +133,7 @@ private:
     int64_t m_pendingVideoTimecode100ns = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastDecodeErrorLogMs = -1;
+    quint64 m_decodeFailures = 0;
     bool m_loggedLatmUnsupported = false;
 
     bool openSocket(QString* error);
@@ -134,10 +145,13 @@ private:
     void log(const QString& message) const;
     void processReceivedBytes(const char* data, int size);
     void processPesPacket(const PesPacket& pes);
+    int drainPendingVideoAccessUnits();
+    void processVideoAccessUnits(const QList<CompressedAccessUnit>& units);
     void processAudioPesPacket(const PesPacket& pes);
     int64_t unwrapPcr90k(int64_t raw90k);
     int64_t unwrapVideo90k(int64_t raw90k);
     int64_t unwrapAudio90k(int64_t raw90k);
+    void resetTimingStateForDiscontinuity();
     int64_t sourcePtsMsForUnit(const CompressedAccessUnit& unit);
     int64_t sourcePtsMsForAudio(qint64 pts90k);
     // Reset m_pendingVideoTimecode100ns to -1, then (if the access unit carries a

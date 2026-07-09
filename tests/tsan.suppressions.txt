@@ -6,3 +6,31 @@ race:*MTLSharedEventListener*
 # Qt's QWaitCondition/TSan shim can report a synthetic double-lock in the render thread.
 mutex:*QWaitConditionPrivate::wait*
 race:*qtsan_impl*QWaitCondition*
+
+# QtTsan's QBasicMutex fast-path shim drops the unlock annotation when OutputRuntime's
+# m_mutex (and its sinks' QMutexes) are contended between the dispatch worker thread and
+# the main thread — which happens whenever a test drives OutputRuntime dispatch from one
+# thread while another reconfigures or tears it down (tst_outputruntime's immediate-dispatch
+# preemption test, tst_playbackworker's pressure/shutdown paths). The dropped annotation
+# corrupts TSan's happens-before for that mutex, producing a synthetic "double lock"
+# (summary frame QtTsan::mutexPostLock) and cascading false data races on the mutex-guarded
+# state (m_dispatchActive, dispatch bookkeeping, sink counters, the PlaybackWorker/sink
+# methods that touch the runtime). Both sides of every such report are serialized by
+# OutputRuntime::m_mutex — verified by review: every field is guarded, m_dispatcher.dispatchTick
+# runs with m_mutex released, and there is no lock-order inversion — and the paths are
+# exercised race-free under ASan and release builds; TSan simply cannot see QMutex
+# synchronisation here.
+#
+# The mutex: line covers the synthetic double-locks. The race: lines are scoped to the exact
+# reconfigure/dispatch entry points that appear in the cascade rather than a blanket
+# *OutputRuntime*: because OutputRuntime is a QThread whose dispatchDueTicksNs runs the snapshot
+# provider and sinks with m_mutex released, a bare *OutputRuntime* would also mask a genuine
+# future race on the dispatch thread's callee subtree. Naming the entry points keeps races in
+# the runtime's other methods (stats, recordGpuBudget, resetFrameIndex, resetPlayEpoch,
+# sharedGpuReadbacks, ...) visible to TSan.
+mutex:*OutputRuntime*
+race:*OutputRuntime::dispatchDueTicksNs*
+race:*OutputRuntime::dispatchImmediate*
+race:*OutputRuntime::setEndpoints*
+race:*OutputRuntime::setSnapshotProvider*
+race:*OutputRuntime::stopRuntime*

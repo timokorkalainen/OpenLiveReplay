@@ -3,7 +3,9 @@
 // Runtime-loaded (no NDI SDK at build time). Exits 77 (SKIP) if the runtime is absent or no
 // source appears; 1 on a hard capture error; 0 otherwise (the driver decides pass/fail).
 //
-// usage: ndi_recv_probe <source-name-substring> <capture-seconds>
+// usage:
+//   ndi_recv_probe <source-name-substring> <capture-seconds>
+//   ndi_recv_probe --stream-markers <source-name-substring> <timeout-ms>
 // env: OLR_NDI_RUNTIME_LIBRARY (override), OLR_NDI_FIND_TIMEOUT_MS (default 5000)
 #include <QByteArray>
 #include <QCoreApplication>
@@ -23,6 +25,11 @@ using namespace olr::ndi;
 
 namespace {
 constexpr int kSkip = 77;
+
+enum class ProbeMode {
+    Summary,
+    StreamMarkers,
+};
 
 struct Recv {
     QLibrary lib;
@@ -73,16 +80,67 @@ struct Recv {
         return false;
     }
 };
+
+QByteArray extractLumaFromUyvy(const uchar* src, int stride, int width, int height) {
+    QByteArray luma(width * height, '\0');
+    auto* dst = reinterpret_cast<uchar*>(luma.data());
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            // UYVY layout: [U, Y0, V, Y1] per 4 bytes / 2 pixels.
+            dst[row * width + col] = src[row * stride + col * 2 + 1];
+        }
+    }
+    return luma;
+}
+
+qint64 decodeVideoMarker(const NdiOutputMarkerConfig& mk, const NDIlib_video_frame_v2_t& v,
+                         bool* flash = nullptr) {
+    if (!v.p_data || v.xres < mk.width || v.yres < mk.height) return -1;
+    const QByteArray luma = extractLumaFromUyvy(reinterpret_cast<const uchar*>(v.p_data),
+                                                v.line_stride_in_bytes, v.xres, v.yres);
+    const auto* lumaPtr = reinterpret_cast<const uchar*>(luma.constData());
+    if (flash) *flash = ndiMarkerDecodeFlash(mk, lumaPtr, v.xres);
+    return ndiMarkerDecodeIndex(mk, lumaPtr, v.xres);
+}
 } // namespace
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
     if (argc < 3) {
-        fprintf(stderr, "usage: ndi_recv_probe <source-substring> <capture-seconds>\n");
+        fprintf(stderr, "usage: ndi_recv_probe <source-substring> <capture-seconds>\n"
+                        "       ndi_recv_probe --stream-markers <source-substring> <timeout-ms>\n");
         return 2;
     }
-    const QString want = QString::fromUtf8(argv[1]);
-    const double seconds = QString::fromUtf8(argv[2]).toDouble();
+    ProbeMode mode = ProbeMode::Summary;
+    QString want;
+    double seconds = 0.0;
+    qint64 streamTimeoutMs = 0;
+    if (QString::fromUtf8(argv[1]) == QStringLiteral("--stream-markers")) {
+        if (argc != 4) {
+            fprintf(stderr,
+                    "usage: ndi_recv_probe --stream-markers <source-substring> <timeout-ms>\n");
+            return 2;
+        }
+        mode = ProbeMode::StreamMarkers;
+        want = QString::fromUtf8(argv[2]);
+        bool ok = false;
+        streamTimeoutMs = QString::fromUtf8(argv[3]).toLongLong(&ok);
+        if (!ok || streamTimeoutMs <= 0) {
+            fprintf(stderr, "[ndi_recv_probe] --stream-markers timeout must be positive ms\n");
+            return 2;
+        }
+    } else {
+        if (argc != 3) {
+            fprintf(stderr, "usage: ndi_recv_probe <source-substring> <capture-seconds>\n");
+            return 2;
+        }
+        want = QString::fromUtf8(argv[1]);
+        seconds = QString::fromUtf8(argv[2]).toDouble();
+        if (seconds <= 0.0) {
+            fprintf(stderr, "[ndi_recv_probe] capture-seconds must be positive\n");
+            return 2;
+        }
+    }
     const int findTimeoutMs = qEnvironmentVariableIntValue("OLR_NDI_FIND_TIMEOUT_MS") > 0
                                   ? qEnvironmentVariableIntValue("OLR_NDI_FIND_TIMEOUT_MS")
                                   : 5000;
@@ -145,10 +203,43 @@ int main(int argc, char** argv) {
     }
 
     NdiOutputMarkerConfig mk; // must match the sender's config defaults
+    if (mode == ProbeMode::StreamMarkers) {
+        printf("NDIWAIT source=%s ready=1 timeoutMs=%lld\n", want.toUtf8().constData(),
+               (long long) streamTimeoutMs);
+        fflush(stdout);
+        qint64 framesDecoded = 0;
+        QElapsedTimer run;
+        run.start();
+        while (run.elapsed() < streamTimeoutMs) {
+            NDIlib_video_frame_v2_t v;
+            NDIlib_audio_frame_v3_t a;
+            const int type = ndi.recvCapture(recv, &v, &a, nullptr, 50);
+            if (type == FrameTypeVideo) {
+                const qint64 idx = decodeVideoMarker(mk, v);
+                if (idx >= 0) {
+                    ++framesDecoded;
+                    printf("NDIMARKER source=%s marker=%lld elapsedMs=%lld framesDecoded=%lld "
+                           "timecode=%lld\n",
+                           want.toUtf8().constData(), (long long) idx, (long long) run.elapsed(),
+                           (long long) framesDecoded, (long long) v.timecode);
+                    fflush(stdout);
+                }
+                ndi.freeVideo(recv, &v);
+            } else if (type == FrameTypeAudio) {
+                ndi.freeAudio(recv, &a);
+            }
+        }
+        ndi.recvDestroy(recv);
+        if (ndi.destroy) ndi.destroy();
+        return 0;
+    }
+
     std::vector<qint64> indices;
     std::vector<double> arrivals;
     std::vector<qint64> flashes;
     std::vector<qint64> beeps;
+    std::vector<qint64> videoTimecodes;
+    std::vector<qint64> audioTimecodes;
 
     // Map audio to a frame index by counting received audio samples.
     // audioSampleBase is set once the first video frame is received so that the
@@ -167,21 +258,6 @@ int main(int argc, char** argv) {
     qint64 aTcSeen = 0, aTcSynth = 0;
     const int samplesPerFrame = ndiMarkerSamplesPerFrame(mk);
 
-    // Extract the luma plane from a UYVY buffer (the fastest NDI format for I420 sources).
-    // UYVY layout: [U, Y0, V, Y1] per 4 bytes / 2 pixels; Y at odd bytes.
-    // Returns a tight luma buffer (stride = width) for ndiMarkerDecode*.
-    auto extractLumaFromUyvy = [](const uchar* src, int stride, int width, int height) {
-        QByteArray luma(width * height, '\0');
-        auto* dst = reinterpret_cast<uchar*>(luma.data());
-        for (int row = 0; row < height; ++row) {
-            for (int col = 0; col < width; ++col) {
-                // Y byte is at col*2+1 within a UYVY row.
-                dst[row * width + col] = src[row * stride + col * 2 + 1];
-            }
-        }
-        return luma;
-    };
-
     QElapsedTimer run;
     run.start();
     while (run.elapsed() < qint64(seconds * 1000.0)) {
@@ -189,37 +265,32 @@ int main(int argc, char** argv) {
         NDIlib_audio_frame_v3_t a;
         const int type = ndi.recvCapture(recv, &v, &a, nullptr, 200);
         if (type == FrameTypeVideo) {
-            if (v.p_data && v.xres >= mk.width && v.yres >= mk.height) {
-                // NDI delivers UYVY; extract luma before marker decode.
-                const QByteArray luma =
-                    extractLumaFromUyvy(reinterpret_cast<const uchar*>(v.p_data),
-                                        v.line_stride_in_bytes, v.xres, v.yres);
-                const auto* lumaPtr = reinterpret_cast<const uchar*>(luma.constData());
-                const qint64 idx = ndiMarkerDecodeIndex(mk, lumaPtr, v.xres);
-                if (idx >= 0) {
-                    // Anchor the audio baseline to the first received video frame so that
-                    // audio-derived ordinals align with capture-relative video ordinals.
-                    if (audioSampleBase < 0) audioSampleBase = audioSamplePos;
-                    // Verify the programme timecode round-tripped: it must equal the value the
-                    // sender derived from this same decoded index (reorder-immune: each frame's
-                    // timecode is checked against its own index).
-                    const qint64 tc = v.timecode;
-                    if (tc == kTimecodeSynthesize) {
-                        ++vTcSynth;
-                    } else {
-                        if (firstVideoTimecode < 0) firstVideoTimecode = tc;
-                        const qint64 expectedTc = (idx * 1000 * mk.fpsDen / mk.fpsNum) * 10000;
-                        ++vTcChecked;
-                        if (tc == expectedTc) ++vTcMatches;
-                    }
-                    indices.push_back(idx); // absolute index -> continuity (drops/dupes/reorders)
-                    arrivals.push_back(run.elapsed() / 1000.0);
-                    if (ndiMarkerDecodeFlash(mk, lumaPtr, v.xres)) {
-                        // A-V sync: record the video ordinal of each flash. The analysis
-                        // pairs flash[i] with beep[i] and measures jitter relative to the
-                        // median offset (absorbing the constant NDI audio buffer delay).
-                        flashes.push_back(qint64(indices.size()) - 1);
-                    }
+            bool flash = false;
+            const qint64 idx = decodeVideoMarker(mk, v, &flash);
+            if (idx >= 0) {
+                // Anchor the audio baseline to the first received video frame so that
+                // audio-derived ordinals align with capture-relative video ordinals.
+                if (audioSampleBase < 0) audioSampleBase = audioSamplePos;
+                // Verify the programme timecode round-tripped: it must equal the value the
+                // sender derived from this same decoded index (reorder-immune: each frame's
+                // timecode is checked against its own index).
+                const qint64 tc = v.timecode;
+                if (tc == kTimecodeSynthesize) {
+                    ++vTcSynth;
+                } else {
+                    if (firstVideoTimecode < 0) firstVideoTimecode = tc;
+                    videoTimecodes.push_back(tc);
+                    const qint64 expectedTc = (idx * 1000 * mk.fpsDen / mk.fpsNum) * 10000;
+                    ++vTcChecked;
+                    if (tc == expectedTc) ++vTcMatches;
+                }
+                indices.push_back(idx); // absolute index -> continuity (drops/dupes/reorders)
+                arrivals.push_back(run.elapsed() / 1000.0);
+                if (flash) {
+                    // A-V sync: record the video ordinal of each flash. The analysis
+                    // pairs flash[i] with beep[i] and measures jitter relative to the
+                    // median offset (absorbing the constant NDI audio buffer delay).
+                    flashes.push_back(qint64(indices.size()) - 1);
                 }
             }
             ndi.freeVideo(recv, &v);
@@ -228,7 +299,10 @@ int main(int argc, char** argv) {
                 // Audio shares the video tick's programme timecode (applyNdiFrameTiming), so a
                 // received audio frame must not carry the synthesize sentinel.
                 ++aTcSeen;
-                if (a.timecode == kTimecodeSynthesize) ++aTcSynth;
+                if (a.timecode == kTimecodeSynthesize)
+                    ++aTcSynth;
+                else
+                    audioTimecodes.push_back(a.timecode);
                 const double rms =
                     ndiMarkerAudioRmsFltp(reinterpret_cast<const float*>(a.p_data), a.no_samples);
                 // Only count beeps after the audio baseline is anchored to the first video.
@@ -249,16 +323,18 @@ int main(int argc, char** argv) {
 
     const NdiContinuity cont = ndiAnalyzeContinuity(indices);
     const int avSync = ndiAvSyncMaxFrames(flashes, beeps);
+    const int tcAvSync =
+        ndiTimecodeAvSyncMaxFrames(videoTimecodes, audioTimecodes, mk.fpsNum, mk.fpsDen);
     const NdiCadence cad = ndiAnalyzeCadence(arrivals, mk.fpsNum, mk.fpsDen);
 
     printf(
         "NDIRECV source=%s framesReceived=%lld drops=%lld dupes=%lld reorders=%lld "
-        "avSyncMaxFrames=%d maxGapFrames=%d meanRateHz=%.3f "
+        "avSyncMaxFrames=%d tcAvMaxFrames=%d maxGapFrames=%d meanRateHz=%.3f "
         "vTcFirst=%lld vTcChecked=%lld vTcMatches=%lld vTcSynth=%lld aTcSeen=%lld aTcSynth=%lld\n",
         want.toUtf8().constData(), (long long) cont.framesReceived, (long long) cont.drops,
-        (long long) cont.dupes, (long long) cont.reorders, avSync, cad.maxGapFrames, cad.meanRateHz,
-        (long long) firstVideoTimecode, (long long) vTcChecked, (long long) vTcMatches,
-        (long long) vTcSynth, (long long) aTcSeen, (long long) aTcSynth);
+        (long long) cont.dupes, (long long) cont.reorders, avSync, tcAvSync, cad.maxGapFrames,
+        cad.meanRateHz, (long long) firstVideoTimecode, (long long) vTcChecked,
+        (long long) vTcMatches, (long long) vTcSynth, (long long) aTcSeen, (long long) aTcSynth);
     fflush(stdout);
     return 0;
 }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 OutputFrameCache::OutputFrameCache(int feedCount, int placeholderWidth, int placeholderHeight)
     : m_video(qMax(0, feedCount)), m_audio(qMax(0, feedCount)),
@@ -53,6 +54,22 @@ OutputFrameCache::videoFrameAtFreshForGeneration(int feedIndex, qint64 playheadM
     return std::nullopt;
 }
 
+std::optional<FrameHandle>
+OutputFrameCache::firstFreshVideoFrameAtOrAfter(int feedIndex, qint64 playheadMs,
+                                                uint64_t gpuGeneration) const {
+    if (feedIndex < 0 || feedIndex >= m_video.size()) return std::nullopt;
+    const auto& list = m_video[feedIndex];
+    if (list.isEmpty()) return std::nullopt;
+    auto it = std::lower_bound(
+        list.begin(), list.end(), playheadMs,
+        [](const FrameHandle& f, qint64 pts) { return f.metadata().key.ptsMs < pts; });
+    while (it != list.end()) {
+        if (!it->isStaleForGeneration(gpuGeneration)) return *it;
+        ++it;
+    }
+    return std::nullopt;
+}
+
 bool OutputFrameCache::hasFreshVideoFrameAtOrBeforeNear(int feedIndex, qint64 targetMs,
                                                         qint64 toleranceMs,
                                                         uint64_t gpuGeneration) const {
@@ -79,6 +96,40 @@ OutputFrameCache::EvictedVideoFrames OutputFrameCache::videoFramesSnapshot() con
     for (const auto& feedFrames : m_video)
         frames += feedFrames;
     return frames;
+}
+
+int OutputFrameCache::replaceVideoFrames(
+    const std::function<std::optional<FrameHandle>(const FrameHandle&)>& fn,
+    EvictedVideoFrames* evictedFrames) {
+    int replaced = 0;
+    for (auto& feedFrames : m_video) {
+        for (FrameHandle& frame : feedFrames) {
+            std::optional<FrameHandle> replacement = fn(frame);
+            if (!replacement.has_value() || !replacement->isPresentable()) continue;
+            if (evictedFrames) evictedFrames->append(frame);
+            frame = std::move(*replacement);
+            ++replaced;
+        }
+    }
+    return replaced;
+}
+
+int OutputFrameCache::removeVideoFramesIf(const std::function<bool(const FrameHandle&)>& predicate,
+                                          EvictedVideoFrames* evictedFrames) {
+    int removed = 0;
+    for (auto& feedFrames : m_video) {
+        auto it = feedFrames.begin();
+        while (it != feedFrames.end()) {
+            if (!predicate(*it)) {
+                ++it;
+                continue;
+            }
+            if (evictedFrames) evictedFrames->append(*it);
+            it = feedFrames.erase(it);
+            ++removed;
+        }
+    }
+    return removed;
 }
 
 void OutputFrameCache::insertAudioFrame(const MediaAudioFrame& frame) {
@@ -128,8 +179,16 @@ void OutputFrameCache::mergeFrom(const OutputFrameCache& other, EvictedVideoFram
 
 void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSample,
                                   EvictedVideoFrames* evictedFrames) {
+    trimWindow(minVideoPtsMs, std::numeric_limits<qint64>::max(), minAudioStartSample,
+               evictedFrames);
+}
+
+void OutputFrameCache::trimWindow(qint64 minVideoPtsMs, qint64 maxVideoPtsMs,
+                                  qint64 minAudioStartSample, EvictedVideoFrames* evictedFrames) {
+    if (maxVideoPtsMs < minVideoPtsMs) maxVideoPtsMs = minVideoPtsMs;
+
     for (auto& frames : m_video) {
-        int firstAtOrAfter = 0;
+        qsizetype firstAtOrAfter = 0;
         while (firstAtOrAfter < frames.size() &&
                frames[firstAtOrAfter].metadata().key.ptsMs < minVideoPtsMs) {
             ++firstAtOrAfter;
@@ -137,18 +196,31 @@ void OutputFrameCache::trimBefore(qint64 minVideoPtsMs, qint64 minAudioStartSamp
 
         // Keep one frame before the cutoff so output can still hold the nearest
         // previous picture at the retained-window boundary.
-        const int removeCount = qMax(0, firstAtOrAfter - 1);
+        const qsizetype removeCount = qMax<qsizetype>(0, firstAtOrAfter - 1);
         if (removeCount > 0) {
             if (evictedFrames) {
-                for (int i = 0; i < removeCount; ++i)
+                for (qsizetype i = 0; i < removeCount; ++i)
                     evictedFrames->append(frames[i]);
             }
             frames.erase(frames.begin(), frames.begin() + removeCount);
         }
+
+        qsizetype firstAfterWindow = frames.size();
+        while (firstAfterWindow > 0 &&
+               frames[firstAfterWindow - 1].metadata().key.ptsMs > maxVideoPtsMs) {
+            --firstAfterWindow;
+        }
+        if (firstAfterWindow < frames.size()) {
+            if (evictedFrames) {
+                for (qsizetype i = firstAfterWindow; i < frames.size(); ++i)
+                    evictedFrames->append(frames[i]);
+            }
+            frames.erase(frames.begin() + firstAfterWindow, frames.end());
+        }
     }
 
     for (auto& frames : m_audio) {
-        int removeCount = 0;
+        qsizetype removeCount = 0;
         while (removeCount < frames.size() &&
                frames[removeCount].startSample + frames[removeCount].sampleFrames() <=
                    minAudioStartSample) {

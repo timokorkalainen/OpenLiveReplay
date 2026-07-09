@@ -13,6 +13,7 @@ private slots:
     void untaggedShortFrameIsBt601VideoNoOp();
     void vuiOverridesHeightDefault();
     void ffmpegCodesOverrideHeightDefaultWhenNoVui();
+    void ffmpegBt2020TransferCodesMatchVuiParser();
 };
 
 void TestColorMetadataPolicy::heightThresholdMatchesLegacyConstant() {
@@ -62,6 +63,14 @@ void TestColorMetadataPolicy::ffmpegCodesOverrideHeightDefaultWhenNoVui() {
     QCOMPARE(int(m.primaries), int(ColorPrimaries::Bt601));
     QCOMPARE(int(m.transfer), int(ColorTransfer::Bt601));
     QCOMPARE(int(m.range), int(ColorRange::Video));
+}
+
+void TestColorMetadataPolicy::ffmpegBt2020TransferCodesMatchVuiParser() {
+    for (const int transfer : {14, 15, 16}) {
+        const ColorMetadata m = resolveColorMetadata(VuiColorInfo{}, 1080, kUnspecified,
+                                                     kUnspecified, kUnspecified, transfer);
+        QCOMPARE(int(m.transfer), int(ColorTransfer::Bt2020));
+    }
 }
 
 QTEST_GUILESS_MAIN(TestColorMetadataPolicy)

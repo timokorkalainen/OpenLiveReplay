@@ -9,7 +9,9 @@
 #include <QProcessEnvironment>
 #include <QtGlobal>
 
-ReplayManager::ReplayManager(QObject *parent) : QObject(parent) {
+#include <limits>
+
+ReplayManager::ReplayManager(QObject* parent) : QObject(parent) {
     m_muxer = new Muxer();
     m_clock = new RecordingClock();
     m_heartbeat = new QTimer(this);
@@ -22,9 +24,8 @@ ReplayManager::~ReplayManager() {
     delete m_muxer;
 }
 
-void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
-                                      const QStringList &feedNames,
-                                      const QList<int> &telemetryDelaysMs) {
+void ReplayManager::setTelemetryFeeds(const QStringList& feedIds, const QStringList& feedNames,
+                                      const QList<int>& telemetryDelaysMs) {
     QMutexLocker locker(&m_stateMutex);
     if (m_isRecording) {
         return;
@@ -41,6 +42,9 @@ void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
             continue;
         }
 
+        if (m_telemetryFeedIds.size() > std::numeric_limits<int>::max()) {
+            break;
+        }
         const int feedIndex = static_cast<int>(m_telemetryFeedIds.size());
         m_telemetryFeedIndexById.insert(feedId, feedIndex);
         m_telemetryFeedIds.append(feedId);
@@ -49,7 +53,7 @@ void ReplayManager::setTelemetryFeeds(const QStringList &feedIds,
     }
 }
 
-bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObject &payload) {
+bool ReplayManager::recordTelemetryEvent(const QString& feedId, const QJsonObject& payload) {
     QJsonObject recorded;
     int64_t effectiveMs = 0;
     {
@@ -64,9 +68,8 @@ bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObjec
         }
 
         const int feedIndex = feedIt.value();
-        const int configuredDelayMs = feedIndex < m_telemetryDelaysMs.size()
-            ? m_telemetryDelaysMs.at(feedIndex)
-            : 0;
+        const int configuredDelayMs =
+            feedIndex < m_telemetryDelaysMs.size() ? m_telemetryDelaysMs.at(feedIndex) : 0;
         const int delayMs = qBound(0, configuredDelayMs, 10000);
         const int64_t receiveMs = qMax<int64_t>(0, m_clock->elapsedMs());
         effectiveMs = receiveMs + delayMs;
@@ -79,10 +82,10 @@ bool ReplayManager::recordTelemetryEvent(const QString &feedId, const QJsonObjec
         recorded.insert(QStringLiteral("olrEffectiveMs"), static_cast<qint64>(effectiveMs));
         recorded.insert(QStringLiteral("olrTelemetryDelayMs"), delayMs);
 
-        m_muxer->writeTelemetryPacket(
-            feedIndex,
-            effectiveMs,
-            QJsonDocument(recorded).toJson(QJsonDocument::Compact));
+        if (!m_muxer->writeTelemetryPacket(
+                feedIndex, effectiveMs, QJsonDocument(recorded).toJson(QJsonDocument::Compact))) {
+            return false;
+        }
     }
 
     emit telemetryRecorded(feedId, recorded, effectiveMs);
@@ -104,9 +107,12 @@ bool ReplayManager::setupBlueEncoder() {
 
         // Allocate + paint the blue frame (YUV, same as MPEG-2 path).
         m_blueFrame = av_frame_alloc();
-        if (!m_blueFrame) { m_blueNativeEncoder.reset(); return false; }
+        if (!m_blueFrame) {
+            m_blueNativeEncoder.reset();
+            return false;
+        }
         m_blueFrame->format = AV_PIX_FMT_YUV420P;
-        m_blueFrame->width  = m_videoWidth;
+        m_blueFrame->width = m_videoWidth;
         m_blueFrame->height = m_videoHeight;
         if (av_frame_get_buffer(m_blueFrame, 0) < 0) {
             av_frame_free(&m_blueFrame);
@@ -129,8 +135,10 @@ bool ReplayManager::setupBlueEncoder() {
         bool encOk = m_blueNativeEncoder->encode(
             m_blueFrame, 0,
             [&](const QByteArray& data, int64_t /*pts*/, bool /*key*/) {
-                if (av_new_packet(m_cachedBluePkt, static_cast<int>(data.size())) == 0) {
-                    memcpy(m_cachedBluePkt->data, data.constData(), data.size());
+                if (data.size() <= std::numeric_limits<int>::max() &&
+                    av_new_packet(m_cachedBluePkt, static_cast<int>(data.size())) == 0) {
+                    memcpy(m_cachedBluePkt->data, data.constData(),
+                           static_cast<size_t>(data.size()));
                     m_cachedBluePkt->flags |= AV_PKT_FLAG_KEY;
                     gotPkt = true;
                 }
@@ -159,16 +167,16 @@ bool ReplayManager::setupBlueEncoder() {
     m_blueEncCtx = avcodec_alloc_context3(encoder);
     if (!m_blueEncCtx) return false;
 
-    m_blueEncCtx->width     = m_videoWidth;
-    m_blueEncCtx->height    = m_videoHeight;
+    m_blueEncCtx->width = m_videoWidth;
+    m_blueEncCtx->height = m_videoHeight;
     // Integer-fps coding clock so blue video PTS tracks the integer-fps cadence
     // (it is rescaled from this time_base in writeBlueFrames); the true rational
     // rate is carried only by framerate (ES) + the container avg/r_frame_rate.
     m_blueEncCtx->time_base = {1, m_fps};
     m_blueEncCtx->framerate = {m_fpsNum, m_fpsDen};
-    m_blueEncCtx->pix_fmt   = AV_PIX_FMT_YUV420P;
-    m_blueEncCtx->gop_size  = 1;
-    m_blueEncCtx->bit_rate  = 30000000;
+    m_blueEncCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+    m_blueEncCtx->gop_size = 1;
+    m_blueEncCtx->bit_rate = 30000000;
 
     if (avcodec_open2(m_blueEncCtx, encoder, nullptr) < 0) {
         avcodec_free_context(&m_blueEncCtx);
@@ -177,7 +185,7 @@ bool ReplayManager::setupBlueEncoder() {
 
     m_blueFrame = av_frame_alloc();
     m_blueFrame->format = AV_PIX_FMT_YUV420P;
-    m_blueFrame->width  = m_videoWidth;
+    m_blueFrame->width = m_videoWidth;
     m_blueFrame->height = m_videoHeight;
     if (av_frame_get_buffer(m_blueFrame, 0) < 0) {
         av_frame_free(&m_blueFrame);
@@ -231,8 +239,14 @@ void ReplayManager::cleanupBlueEncoder() {
         av_packet_free(&m_cachedBluePkt);
         m_cachedBluePkt = nullptr;
     }
-    if (m_blueFrame) { av_frame_free(&m_blueFrame); m_blueFrame = nullptr; }
-    if (m_blueEncCtx) { avcodec_free_context(&m_blueEncCtx); m_blueEncCtx = nullptr; }
+    if (m_blueFrame) {
+        av_frame_free(&m_blueFrame);
+        m_blueFrame = nullptr;
+    }
+    if (m_blueEncCtx) {
+        avcodec_free_context(&m_blueEncCtx);
+        m_blueEncCtx = nullptr;
+    }
     m_blueNativeEncoder.reset();
     m_videoExtradata.clear();
 }
@@ -319,7 +333,8 @@ void ReplayManager::startRecording() {
                                 m_viewNames, m_telemetryFeedIds, m_telemetryFeedNames, 48000, 2,
                                 m_videoCodec, m_videoExtradata, startTc, m_fpsNum, m_fpsDen);
         if (!muxerReady) {
-            qDebug() << "ReplayManager: Failed to init Muxer (H.264) with base name" << m_sessionFileName;
+            qDebug() << "ReplayManager: Failed to init Muxer (H.264) with base name"
+                     << m_sessionFileName;
             cleanupBlueEncoder();
             return;
         }
@@ -368,12 +383,15 @@ void ReplayManager::startRecording() {
     //    they are currently mapped to (or skip encoding when m_viewTrack == -1).
     m_globalFrameCount = 0;
     m_blueAudioCursor = QVector<int64_t>(m_viewCount, -1);
-    const int sourceCount = static_cast<int>(m_sourceUrls.size());
+    const qsizetype sourceCount = m_sourceUrls.size();
 
-    for (int s = 0; s < sourceCount; ++s) {
+    for (qsizetype s = 0; s < sourceCount; ++s) {
+        if (s > std::numeric_limits<int>::max()) {
+            break;
+        }
         StreamWorker* worker =
-            new StreamWorker(m_sourceUrls[s], s, m_muxer, m_clock, m_videoWidth, m_videoHeight,
-                             m_fps, m_fpsNum, m_fpsDen, m_videoCodec);
+            new StreamWorker(m_sourceUrls[s], static_cast<int>(s), m_muxer, m_clock, m_videoWidth,
+                             m_videoHeight, m_fps, m_fpsNum, m_fpsDen, m_videoCodec);
 
         // Set per-source metadata JSON for the subtitle track
         if (s < m_sourceMetadata.size()) {
@@ -389,8 +407,7 @@ void ReplayManager::startRecording() {
         // thread, and run()/exec() alone does not change it.
         worker->moveToThread(worker);
 
-        connect(this, &ReplayManager::masterPulse,
-                worker, &StreamWorker::onMasterPulse,
+        connect(this, &ReplayManager::masterPulse, worker, &StreamWorker::onMasterPulse,
                 Qt::QueuedConnection);
 
         // Relay the worker's connection-state transitions to the UI. The
@@ -427,14 +444,17 @@ void ReplayManager::startRecording() {
     // 6. Start the master heartbeat
     m_heartbeat->start(kHeartbeatIntervalMs);
     m_isRecording = true;
-    qDebug() << "ReplayManager: Recording started."
-             << sourceCount << "sources," << m_viewCount << "views.";
+    qDebug() << "ReplayManager: Recording started." << sourceCount << "sources," << m_viewCount
+             << "views.";
 }
 
 void ReplayManager::stopRecording() {
+    if (m_muxer) {
+        m_muxer->beginShutdownDrain();
+    }
+
     QMutexLocker locker(&m_stateMutex);
-    if (!m_isRecording)
-        return;
+    if (!m_isRecording) return;
 
     m_heartbeat->stop();
     m_isRecording = false;
@@ -445,11 +465,15 @@ void ReplayManager::stopRecording() {
 
     for (int i = 0; i < m_workers.length(); i++) {
         m_workers[i]->wait();
+    }
+
+    m_muxer->close();
+
+    for (int i = 0; i < m_workers.length(); i++) {
         delete m_workers[i];
     }
     m_workers.clear();
 
-    m_muxer->close();
     cleanupBlueEncoder();
     m_recordingStartEpochMs = 0;
 
@@ -504,7 +528,7 @@ void ReplayManager::updateViewMapping(const QList<int>& viewSlotMap) {
 
     // Build a reverse map: for each source, which view-track is it in?
     // Default is -1 (not assigned to any view).
-    const int sourceCount = static_cast<int>(m_workers.size());
+    const qsizetype sourceCount = m_workers.size();
     QVector<int> sourceToTrack(sourceCount, -1);
 
     for (int v = 0; v < viewSlotMap.size(); ++v) {
@@ -524,7 +548,7 @@ void ReplayManager::updateViewMapping(const QList<int>& viewSlotMap) {
 }
 
 // ─── Source URL change (real FFmpeg reconnect — for user editing a URL) ─
-void ReplayManager::updateSourceUrl(int sourceIndex, const QString &url) {
+void ReplayManager::updateSourceUrl(int sourceIndex, const QString& url) {
     if (sourceIndex >= 0 && sourceIndex < m_sourceUrls.size()) {
         m_sourceUrls[sourceIndex] = url;
         if (m_isRecording && sourceIndex < m_workers.size()) {
@@ -790,8 +814,7 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         AVStream* st = m_muxer->getStream(v);
         if (st) {
             // Use the encoder's time_base for MPEG-2; {1, m_fps} for H.264.
-            const AVRational encTb = m_blueEncCtx ? m_blueEncCtx->time_base
-                                                   : AVRational{1, m_fps};
+            const AVRational encTb = m_blueEncCtx ? m_blueEncCtx->time_base : AVRational{1, m_fps};
             av_packet_rescale_ts(pkt, encTb, st->time_base);
         }
         m_muxer->writePacket(pkt);
@@ -802,14 +825,14 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
         // instead of leaving holes in the PCM track, and the same jitter
         // delay as source audio keeps mapping transitions seamless.
         if (silenceTargetEnd > 0 && v < m_blueAudioCursor.size()) {
-            int64_t &cursor = m_blueAudioCursor[v];
+            int64_t& cursor = m_blueAudioCursor[v];
             if (cursor < 0) {
-                cursor = qMax<int64_t>(0, silenceTargetEnd
-                                          - StreamWorker::kAudioSampleRate / m_fps);
+                cursor =
+                    qMax<int64_t>(0, silenceTargetEnd - StreamWorker::kAudioSampleRate / m_fps);
             }
             if (silenceTargetEnd > cursor) {
-                const int64_t n = qMin<int64_t>(silenceTargetEnd - cursor,
-                                                StreamWorker::kAudioSampleRate);
+                const int64_t n =
+                    qMin<int64_t>(silenceTargetEnd - cursor, StreamWorker::kAudioSampleRate);
                 const int silenceBytes = int(n) * StreamWorker::kAudioBytesPerSample;
                 int audioTrackIdx = m_muxer->audioTrackOffset() + v;
                 AVPacket* aPkt = av_packet_alloc();
@@ -818,11 +841,11 @@ void ReplayManager::writeBlueFrames(int64_t elapsedMs) {
                     aPkt->stream_index = audioTrackIdx;
                     AVStream* aSt = m_muxer->getStream(audioTrackIdx);
                     if (aSt) {
-                        aPkt->pts = av_rescale_q(cursor,
-                            {1, StreamWorker::kAudioSampleRate}, aSt->time_base);
+                        aPkt->pts = av_rescale_q(cursor, {1, StreamWorker::kAudioSampleRate},
+                                                 aSt->time_base);
                         aPkt->dts = aPkt->pts;
-                        aPkt->duration = av_rescale_q(n,
-                            {1, StreamWorker::kAudioSampleRate}, aSt->time_base);
+                        aPkt->duration =
+                            av_rescale_q(n, {1, StreamWorker::kAudioSampleRate}, aSt->time_base);
                     }
                     m_muxer->writePacket(aPkt);
                 }
@@ -850,6 +873,10 @@ int64_t ReplayManager::getElapsedMs() {
     // post-stop this still falls back to the captured duration.
     if (m_clock) return qMax<int64_t>(0, nowSessionMs());
     return m_lastKnownDurationMs;
+}
+
+int64_t ReplayManager::committedVideoTailMs() const {
+    return m_muxer ? m_muxer->minWrittenVideoPtsMs() : -1;
 }
 
 QString ReplayManager::getVideoPath() {

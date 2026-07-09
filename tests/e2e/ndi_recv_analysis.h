@@ -22,6 +22,13 @@ NdiContinuity ndiAnalyzeContinuity(const std::vector<qint64>& decodedIndices);
 int ndiAvSyncMaxFrames(const std::vector<qint64>& videoFlashIndices,
                        const std::vector<qint64>& audioBeepFrameIndices);
 
+// Max absolute frame-index delta between ordinally paired video/audio programme timecodes.
+// Returns -1 when either list is empty or the frame rate is invalid. This is a content-agnostic
+// A/V pairing check for paths where the marker beep cannot be reliably recovered after recording.
+int ndiTimecodeAvSyncMaxFrames(const std::vector<qint64>& videoTimecodes100ns,
+                               const std::vector<qint64>& audioTimecodes100ns, int fpsNum,
+                               int fpsDen);
+
 struct NdiCadence {
     int maxGapFrames = 0;
     double meanRateHz = 0.0;

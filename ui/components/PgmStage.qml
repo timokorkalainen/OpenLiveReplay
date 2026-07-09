@@ -68,6 +68,24 @@ Item {
         }
     }
 
+    function applyPlaybackViewState() {
+        if (!root.hasUi) return
+        if (root.ui.playbackSingleView) {
+            var viewIndex = root.ui.playbackSelectedIndex
+            var sourceIndex = root.sourceForView(viewIndex)
+            if (viewIndex >= 0 && sourceIndex >= 0) {
+                root.selectedIndex = viewIndex
+                root.selectedSourceIndex = sourceIndex
+                root.viewMode = "single"
+                return
+            }
+        }
+        root.selectedIndex = -1
+        root.selectedSourceIndex = -1
+        root.viewMode = "multi"
+        root.updateVisibleStreams()
+    }
+
     function rebindSelectedSource() {
         if (!root.hasUi || root.viewMode !== "single" || root.selectedSourceIndex < 0) return
         var viewIndex = root.viewForSource(root.selectedSourceIndex)
@@ -89,8 +107,43 @@ Item {
     }
 
     function reattachProviders() {
-        singleOutput.attachProvider(root.pgmProvider)
-        multiviewBusOutput.attachProvider(root.multiviewProvider)
+        singleOutput.provider = root.pgmProvider
+        multiviewBusOutput.provider = root.multiviewProvider
+    }
+
+    component PreviewVideoOutput: VideoOutput {
+        id: previewOutput
+        property var provider: null
+        property bool active: true
+        property var attachedProvider: null
+
+        fillMode: VideoOutput.PreserveAspectFit
+
+        function selectedProvider() {
+            return (previewOutput.active && previewOutput.visible && previewOutput.provider)
+                    ? previewOutput.provider : null
+        }
+
+        function updateAttachment() {
+            previewOutput.attachProvider(previewOutput.selectedProvider())
+        }
+
+        function attachProvider(provider) {
+            if (previewOutput.attachedProvider === provider) return
+            if (previewOutput.attachedProvider) {
+                previewOutput.attachedProvider.removeVideoSink(videoSink)
+            }
+            previewOutput.attachedProvider = provider
+            if (previewOutput.attachedProvider) {
+                previewOutput.attachedProvider.addVideoSink(videoSink)
+            }
+        }
+
+        onProviderChanged: updateAttachment()
+        onActiveChanged: updateAttachment()
+        onVisibleChanged: updateAttachment()
+        Component.onCompleted: updateAttachment()
+        Component.onDestruction: attachProvider(null)
     }
 
     Component.onCompleted: {
@@ -98,6 +151,7 @@ Item {
         root.viewMode = "multi"
         root.updateVisibleStreams()
         root.reattachProviders()
+        root.applyPlaybackViewState()
     }
 
     Connections {
@@ -126,6 +180,9 @@ Item {
         function onFeedSelectRequested(index) {
             root.selectSource(index)
         }
+        function onPlaybackViewStateChanged() {
+            root.applyPlaybackViewState()
+        }
         function onMultiviewRequested() {
             root.resetToMulti()
         }
@@ -146,25 +203,11 @@ Item {
         border.width: 2
         visible: root.viewMode === "single" && root.selectedSourceIndex >= 0 && root.pgmProvider !== null
 
-        VideoOutput {
+        PreviewVideoOutput {
             id: singleOutput
             anchors.fill: parent
-            fillMode: VideoOutput.PreserveAspectFit
-            property var attachedProvider: null
-
-            function attachProvider(provider) {
-                if (attachedProvider === provider) return
-                if (attachedProvider) {
-                    attachedProvider.removeVideoSink(videoSink)
-                }
-                attachedProvider = provider
-                if (attachedProvider) {
-                    attachedProvider.addVideoSink(videoSink)
-                }
-            }
-
-            Component.onCompleted: attachProvider(root.pgmProvider)
-            Component.onDestruction: attachProvider(null)
+            provider: root.pgmProvider
+            active: singleView.visible
         }
 
         Rectangle {
@@ -195,27 +238,13 @@ Item {
         }
     }
 
-    VideoOutput {
+    PreviewVideoOutput {
         id: multiviewBusOutput
         anchors.fill: parent
-        fillMode: VideoOutput.PreserveAspectFit
         visible: root.viewMode === "multi" && root.multiviewProvider !== null
         z: 0
-        property var attachedProvider: null
-
-        function attachProvider(provider) {
-            if (attachedProvider === provider) return
-            if (attachedProvider) {
-                attachedProvider.removeVideoSink(videoSink)
-            }
-            attachedProvider = provider
-            if (attachedProvider) {
-                attachedProvider.addVideoSink(videoSink)
-            }
-        }
-
-        Component.onCompleted: attachProvider(root.multiviewProvider)
-        Component.onDestruction: attachProvider(null)
+        provider: root.multiviewProvider
+        active: multiviewBusOutput.visible
     }
 
     GridView {

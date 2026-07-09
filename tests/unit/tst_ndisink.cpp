@@ -37,6 +37,25 @@ OutputBusFrame validFrame(qint64 outputFrameIndex, qint64 playheadMs, uchar y) {
     return frame;
 }
 
+int g_initializeCalls = 0;
+int g_destroyCalls = 0;
+bool g_initializeSucceeds = true;
+
+bool fakeNdiInitialize() {
+    ++g_initializeCalls;
+    return g_initializeSucceeds;
+}
+
+void fakeNdiDestroy() {
+    ++g_destroyCalls;
+}
+
+void resetFakeNdiRuntime() {
+    g_initializeCalls = 0;
+    g_destroyCalls = 0;
+    g_initializeSucceeds = true;
+}
+
 } // namespace
 
 static FrameHandle video(int feed, qint64 pts, uchar y) {
@@ -53,9 +72,11 @@ public:
 
     bool isRuntimeAvailable() const override { return runtimeAvailable; }
 
-    bool createSender(const QString& senderName, FrameRate rate) override {
+    bool createSender(const QString& senderName, FrameRate rate,
+                      NdiSenderClocking clocking) override {
         createdName = senderName;
         createdRate = rate;
+        createdClocking = clocking;
         active = runtimeAvailable && createSucceeds && !senderName.isEmpty() && rate.isValid();
         return active;
     }
@@ -97,6 +118,7 @@ public:
     bool blockSend = false;
     QString createdName;
     FrameRate createdRate;
+    NdiSenderClocking createdClocking;
     QVector<OutputBusFrame> sentFrames;
 
 private:
@@ -113,6 +135,7 @@ private slots:
     void runtimeCandidatesIncludeNdiToolsInstallLocations();
     void unavailableRuntimeFailsCleanly();
     void startUsesConfiguredSenderNameAndSubmitsCleanBusFrames();
+    void startLeavesSdkClockingDisabledForLowLatencyCommands();
     void rejectsFramesWithoutBroadcastAudio();
     void rejectsDisabledOrNonNdiAssignments();
     void reportsCreateFailureAndStoppedStatus();
@@ -121,6 +144,8 @@ private slots:
     void failedSendReportsAttemptedButNotDeliveredFrame();
     void inFlightSendReportsAttemptedButNotDeliveredFrame();
     void ndiFrameTimingStampsSharedProgrammeTimecode();
+    void runtimeLeaseDestroysSdkOnlyAfterLastUserReleases();
+    void runtimeLeaseDoesNotHoldFailedInitialization();
 };
 
 void TestNdiSink::runtimeCandidatesIncludeNdiToolsInstallLocations() {
@@ -195,6 +220,16 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
     QCOMPARE(uchar(MediaVideoFrameView(backend.sentFrames[0].video).planeY.at(0)), uchar(90));
     // The programme timecode survives the submit -> backend path unscaled/unswapped.
     QCOMPARE(backend.sentFrames[0].programmeTimecode100ns, qint64(2000000));
+}
+
+void TestNdiSink::startLeavesSdkClockingDisabledForLowLatencyCommands() {
+    FakeNdiBackend backend(true);
+    NdiOutputSink sink(&backend);
+
+    QVERIFY(sink.start(ndiAssignment(), FrameRate::fromFraction(25, 1)));
+
+    QVERIFY(!backend.createdClocking.clockVideo);
+    QVERIFY(!backend.createdClocking.clockAudio);
 }
 
 void TestNdiSink::rejectsFramesWithoutBroadcastAudio() {
@@ -404,6 +439,46 @@ void TestNdiSink::ndiFrameTimingStampsSharedProgrammeTimecode() {
     applyNdiFrameTiming(unset, video2, audio2);
     QCOMPARE(video2.timecode, olr::ndi::kTimecodeSynthesize);
     QCOMPARE(audio2.timecode, olr::ndi::kTimecodeSynthesize);
+}
+
+void TestNdiSink::runtimeLeaseDestroysSdkOnlyAfterLastUserReleases() {
+    resetFakeNdiRuntime();
+
+    {
+        NdiRuntimeLease first;
+        QVERIFY(first.acquire(&fakeNdiInitialize, &fakeNdiDestroy));
+        QCOMPARE(g_initializeCalls, 1);
+        QCOMPARE(g_destroyCalls, 0);
+
+        {
+            NdiRuntimeLease second;
+            QVERIFY(second.acquire(&fakeNdiInitialize, &fakeNdiDestroy));
+            QCOMPARE(g_initializeCalls, 1);
+            QCOMPARE(g_destroyCalls, 0);
+        }
+
+        QCOMPARE(g_initializeCalls, 1);
+        QCOMPARE(g_destroyCalls, 0);
+    }
+
+    QCOMPARE(g_initializeCalls, 1);
+    QCOMPARE(g_destroyCalls, 1);
+}
+
+void TestNdiSink::runtimeLeaseDoesNotHoldFailedInitialization() {
+    resetFakeNdiRuntime();
+    g_initializeSucceeds = false;
+
+    {
+        NdiRuntimeLease lease;
+        QVERIFY(!lease.acquire(&fakeNdiInitialize, &fakeNdiDestroy));
+        QVERIFY(!lease.isHeld());
+        QCOMPARE(g_initializeCalls, 1);
+        QCOMPARE(g_destroyCalls, 0);
+    }
+
+    QCOMPARE(g_initializeCalls, 1);
+    QCOMPARE(g_destroyCalls, 0);
 }
 
 QTEST_GUILESS_MAIN(TestNdiSink)

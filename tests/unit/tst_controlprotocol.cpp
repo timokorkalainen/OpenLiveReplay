@@ -2,6 +2,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "websocket/controlapiadapter.h"
 #include "websocket/controlprotocol.h"
 
 class TestControlProtocol : public QObject {
@@ -11,6 +12,8 @@ private slots:
     void rejectsMalformedJson();
     void rejectsMissingCommandName();
     void validatesSeekArgs();
+    void validatesSeekWaitForPgmFlag();
+    void rejectsSeekWaitForPgmNonBool();
     void validatesSeekArgsAcceptsLargeInteger();
     void rejectsSeekWithFractionalPosition();
     void rejectsSeekWithoutPosition();
@@ -19,7 +22,14 @@ private slots:
     void validatesActionDispatchDefaultsPressed();
     void rejectsActionDispatchForShuttleId();
     void validatesActionShuttleDelta();
+    void validatesActionJogWaitForPgmFlag();
+    void waitForPgmRequiresCommandId();
+    void acceptedResultShape();
+    void validatesNdiOutputEnabledCommand();
+    void rejectsNdiOutputEnabledWithoutBusKind();
+    void validatesNdiOutputSenderNameCommand();
     void buildsSuccessAck();
+    void buildsSuccessAckWithDetails();
     void buildsFailureAck();
     void buildsErrorWithoutId();
 };
@@ -63,6 +73,30 @@ void TestControlProtocol::validatesSeekArgs() {
 
     QVERIFY(validation.ok);
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("positionMs")).toInt(), 42);
+}
+
+void TestControlProtocol::validatesSeekWaitForPgmFlag() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("seek-wait"), QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 42}, {QStringLiteral("waitForPgm"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("waitForPgm")).toBool(), true);
+}
+
+void TestControlProtocol::rejectsSeekWaitForPgmNonBool() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("seek-wait"), QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 42},
+                    {QStringLiteral("waitForPgm"), QStringLiteral("yes")}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("waitForPgm")));
 }
 
 void TestControlProtocol::validatesSeekArgsAcceptsLargeInteger() {
@@ -158,12 +192,111 @@ void TestControlProtocol::validatesActionShuttleDelta() {
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("delta")).toInt(), -1);
 }
 
+void TestControlProtocol::validatesActionJogWaitForPgmFlag() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("jog-1"), QStringLiteral("action.jog"),
+        QJsonObject{{QStringLiteral("delta"), -1}, {QStringLiteral("waitForPgm"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("waitForPgm")).toBool(), true);
+}
+
+void TestControlProtocol::waitForPgmRequiresCommandId() {
+    ControlCommandMessage command;
+    command.type = QStringLiteral("command");
+    command.name = QStringLiteral("transport.seek");
+    command.args =
+        QJsonObject{{QStringLiteral("positionMs"), 1000}, {QStringLiteral("waitForPgm"), true}};
+    command.id = QString(); // no id -> completion could never be correlated
+    const auto validation = ControlProtocol::validateCommand(command);
+    QVERIFY(!validation.ok);
+
+    command.id = QStringLiteral("cmd-1");
+    QVERIFY(ControlProtocol::validateCommand(command).ok);
+
+    // Without waitForPgm an empty id stays legal (fire-and-forget).
+    command.id = QString();
+    command.args.remove(QStringLiteral("waitForPgm"));
+    QVERIFY(ControlProtocol::validateCommand(command).ok);
+}
+
+void TestControlProtocol::acceptedResultShape() {
+    const CommandResult result = CommandResult::accepted(3, 42);
+    QVERIFY(result.ok);
+    QCOMPARE(result.details.value(QStringLiteral("status")).toString(), QStringLiteral("accepted"));
+    QCOMPARE(result.details.value(QStringLiteral("generation")).toString(), QStringLiteral("42"));
+    QCOMPARE(result.details.value(QStringLiteral("workerEpoch")).toString(), QStringLiteral("3"));
+}
+
+void TestControlProtocol::validatesNdiOutputEnabledCommand() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("ndi-enable"),
+        QStringLiteral("outputs.ndi.setEnabled"),
+        QJsonObject{{QStringLiteral("busKind"), QStringLiteral("pgm")},
+                    {QStringLiteral("feedIndex"), -1},
+                    {QStringLiteral("enabled"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("busKind")).toString(),
+             QStringLiteral("pgm"));
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("feedIndex")).toInt(), -1);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("enabled")).toBool(), true);
+}
+
+void TestControlProtocol::rejectsNdiOutputEnabledWithoutBusKind() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("ndi-enable"),
+        QStringLiteral("outputs.ndi.setEnabled"),
+        QJsonObject{{QStringLiteral("feedIndex"), -1}, {QStringLiteral("enabled"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("busKind")));
+}
+
+void TestControlProtocol::validatesNdiOutputSenderNameCommand() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("ndi-name"),
+        QStringLiteral("outputs.ndi.setSenderName"),
+        QJsonObject{{QStringLiteral("busKind"), QStringLiteral("pgm")},
+                    {QStringLiteral("feedIndex"), -1},
+                    {QStringLiteral("senderName"), QStringLiteral("OLR PGM Latency")}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("senderName")).toString(),
+             QStringLiteral("OLR PGM Latency"));
+}
+
 void TestControlProtocol::buildsSuccessAck() {
     const QJsonObject ack = ControlProtocol::ack(QStringLiteral("abc-1"));
 
     QCOMPARE(ack.value(QStringLiteral("type")).toString(), QStringLiteral("ack"));
     QCOMPARE(ack.value(QStringLiteral("id")).toString(), QStringLiteral("abc-1"));
     QCOMPARE(ack.value(QStringLiteral("ok")).toBool(), true);
+}
+
+void TestControlProtocol::buildsSuccessAckWithDetails() {
+    QJsonObject details;
+    details.insert(
+        QStringLiteral("pgmTransaction"),
+        QJsonObject{{QStringLiteral("completed"), true}, {QStringLiteral("targetMs"), 1000}});
+
+    const QJsonObject ack = ControlProtocol::ack(QStringLiteral("abc-1"), details);
+
+    QCOMPARE(ack.value(QStringLiteral("type")).toString(), QStringLiteral("ack"));
+    QCOMPARE(ack.value(QStringLiteral("id")).toString(), QStringLiteral("abc-1"));
+    QCOMPARE(ack.value(QStringLiteral("ok")).toBool(), true);
+    const QJsonObject transaction = ack.value(QStringLiteral("pgmTransaction")).toObject();
+    QCOMPARE(transaction.value(QStringLiteral("completed")).toBool(), true);
+    QCOMPARE(transaction.value(QStringLiteral("targetMs")).toInt(), 1000);
 }
 
 void TestControlProtocol::buildsFailureAck() {

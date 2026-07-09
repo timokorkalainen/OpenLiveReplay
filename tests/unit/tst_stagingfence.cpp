@@ -18,6 +18,7 @@ private slots:
     void forceDrainDropsUnretiredFramesAfterBoundedFenceFailure();
     void repeatedPublishDoesNotRetireUnchangedSnapshot();
     void windowsGpuImportRequiresBothFences();
+    void markStagingCoveredSignalsFenceForGpuPath();
 };
 
 class ManualFence final : public GpuFence {
@@ -218,6 +219,21 @@ void TestStagingFence::windowsGpuImportRequiresBothFences() {
     PlaybackWorker worker({}, &transport);
 
     QVERIFY(!worker.ensureWindowsGpuImportFencesReadyForDecode(nullptr));
+}
+
+void TestStagingFence::markStagingCoveredSignalsFenceForGpuPath() {
+    ScopedEnv gpuEnabled("OLR_GPU_PIPELINE", "1");
+    PlaybackTransport transport;
+    PlaybackWorker worker({}, &transport);
+    auto fence = std::make_shared<ManualFence>();
+
+    worker.m_stagingFence = fence;
+    worker.m_stagedFenceValue.store(0, std::memory_order_release);
+
+    worker.markStagingCovered();
+
+    QVERIFY(worker.m_stagingCovers.load(std::memory_order_acquire));
+    QCOMPARE(worker.m_stagedFenceValue.load(std::memory_order_acquire), uint64_t(1));
 }
 
 QTEST_GUILESS_MAIN(TestStagingFence)

@@ -10,7 +10,7 @@
 #include "playback/output/formatcanon.h"
 
 #include <CoreVideo/CoreVideo.h>
-#include <IOSurface/IOSurface.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <Metal/Metal.h>
 #include <rhi/qrhi_platform.h>
 
@@ -19,6 +19,8 @@
 
 namespace {
 
+constexpr int kInputAliasFenceTimeoutMs = 100;
+
 qsizetype byteOffset(int row, int stride) {
     return static_cast<qsizetype>(row) * static_cast<qsizetype>(stride);
 }
@@ -26,8 +28,7 @@ qsizetype byteOffset(int row, int stride) {
 bool hasRows(const QByteArray& plane, int stride, int rows, int bytesPerRow) {
     if (rows <= 0) return true;
     if (stride < bytesPerRow || bytesPerRow < 0) return false;
-    const qsizetype lastByte =
-        byteOffset(rows - 1, stride) + static_cast<qsizetype>(bytesPerRow);
+    const qsizetype lastByte = byteOffset(rows - 1, stride) + static_cast<qsizetype>(bytesPerRow);
     return plane.size() >= lastByte;
 }
 
@@ -35,7 +36,7 @@ std::shared_ptr<GpuSurface> aliasGpuNv12Surface(const FrameHandle& frame) {
     if (!frame.isGpuBacked()) return nullptr;
     auto* data = dynamic_cast<const GpuFrameData*>(frame.data());
     if (!data || data->nativeFormat() != FramePixelFormat::Nv12) return nullptr;
-    if (!data->waitForPendingFence(-1)) return nullptr;
+    if (!data->waitForPendingFence(kInputAliasFenceTimeoutMs)) return nullptr;
 
     auto surface = data->surfacePtr();
     if (!surface || !surface->isValid()) return nullptr;
@@ -143,7 +144,7 @@ public:
     QRhiTexture::NativeTexture nativeTexture() const override {
         id<MTLTexture> texture = m_texture ? CVMetalTextureGetTexture(m_texture) : nil;
         return QRhiTexture::NativeTexture{
-            quint64(reinterpret_cast<uintptr_t>((__bridge void*) texture)), 0};
+            quint64(reinterpret_cast<uintptr_t>((__bridge void*)texture)), 0};
     }
 
 private:
@@ -168,13 +169,13 @@ public:
     QRhiTexture::NativeTexture lumaNativeTexture() const override {
         id<MTLTexture> texture = m_luma ? CVMetalTextureGetTexture(m_luma) : nil;
         return QRhiTexture::NativeTexture{
-            quint64(reinterpret_cast<uintptr_t>((__bridge void*) texture)), 0};
+            quint64(reinterpret_cast<uintptr_t>((__bridge void*)texture)), 0};
     }
 
     QRhiTexture::NativeTexture chromaNativeTexture() const override {
         id<MTLTexture> texture = m_chroma ? CVMetalTextureGetTexture(m_chroma) : nil;
         return QRhiTexture::NativeTexture{
-            quint64(reinterpret_cast<uintptr_t>((__bridge void*) texture)), 0};
+            quint64(reinterpret_cast<uintptr_t>((__bridge void*)texture)), 0};
     }
 
 private:
@@ -199,7 +200,7 @@ CVMetalTextureCacheRef makeTextureCache(QRhi* rhi) {
     if (!rhi) return nullptr;
     const auto* nativeHandles = static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles());
     if (!nativeHandles || !nativeHandles->dev) return nullptr;
-    id<MTLDevice> device = (__bridge id<MTLDevice>) nativeHandles->dev;
+    id<MTLDevice> device = (__bridge id<MTLDevice>)nativeHandles->dev;
 
     CVMetalTextureCacheRef cache = nullptr;
     const CVReturn rc =
@@ -209,15 +210,13 @@ CVMetalTextureCacheRef makeTextureCache(QRhi* rhi) {
 
 CFDictionaryRef makeMetalTextureAttributes(MTLTextureUsage usage) {
     uint64_t usageValue = static_cast<uint64_t>(usage);
-    CFNumberRef usageNumber =
-        CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &usageValue);
+    CFNumberRef usageNumber = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &usageValue);
     if (!usageNumber) return nullptr;
 
     const void* keys[] = {kCVMetalTextureUsage};
     const void* values[] = {usageNumber};
     CFDictionaryRef attrs =
-        CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
-                           &kCFTypeDictionaryKeyCallBacks,
+        CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks,
                            &kCFTypeDictionaryValueCallBacks);
     CFRelease(usageNumber);
     return attrs;
@@ -229,6 +228,10 @@ std::shared_ptr<GpuSurface> makeInputNv12Surface(const FrameHandle& frame) {
 
 std::shared_ptr<GpuSurface> makeOutputRgba8Surface(int width, int height) {
     return makeAppleRgba8Surface(width, height);
+}
+
+bool supportsNativeOutputSurfaces() {
+    return true;
 }
 
 std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi* rhi,
@@ -256,9 +259,9 @@ std::unique_ptr<ImportedNv12Source> importNv12Source(QRhi* rhi,
     }
 
     CVMetalTextureRef luma = nullptr;
-    CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(
-        kCFAllocatorDefault, cache, pb, readAttrs, MTLPixelFormatR8Unorm, desc.width, desc.height,
-        0, &luma);
+    CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb,
+                                                            readAttrs, MTLPixelFormatR8Unorm,
+                                                            desc.width, desc.height, 0, &luma);
     if (rc != kCVReturnSuccess || !luma) {
         CFRelease(readAttrs);
         CFRelease(cache);
@@ -311,9 +314,8 @@ importRgbaRenderTarget(QRhi* rhi, const std::shared_ptr<GpuSurface>& surface) {
 
     CVMetalTextureRef texture = nullptr;
     CVReturn rc = CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, cache, pb,
-                                                            renderAttrs,
-                                                            MTLPixelFormatBGRA8Unorm, desc.width,
-                                                            desc.height, 0, &texture);
+                                                            renderAttrs, MTLPixelFormatBGRA8Unorm,
+                                                            desc.width, desc.height, 0, &texture);
     CFRelease(renderAttrs);
     if (rc != kCVReturnSuccess || !texture) {
         CFRelease(cache);

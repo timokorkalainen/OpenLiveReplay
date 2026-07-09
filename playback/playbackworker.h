@@ -9,13 +9,16 @@
 #include <QVector>
 #include <QMutex>
 #include <QList>
+#include <QWaitCondition>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "frameprovider.h"
 #include "playback/commitgate.h"
 #include "playback/frameindex.h"
 #ifdef OLR_GPU_PIPELINE_BUILD
+#include "playback/gpu/gpuseekprefetch.h"
 #include "playback/gpu/gpuframeretirequeue.h"
 #endif
 #include "playback/output/colormetadata.h"
@@ -60,6 +63,7 @@ struct DecoderTrack {
     TrackBuffer buffer;
     int64_t lastDeliveredPtsMs = -1; // last frame released to the provider
     int decimateCounter = 0;         // per-track keep-counter (§6.3 decimation)
+    int nativeDecodeFailureWarnings = 0;
 };
 
 struct AudioDecoderTrack {
@@ -74,11 +78,29 @@ class PlaybackWorker : public QThread {
     Q_OBJECT
 #ifdef OLR_UNIT_TEST
     friend class TestStagingFence;
+    friend class TestPlaybackWorker;
+    friend class TestGpuDeviceLostWorker;
 #endif
 public:
+    struct ResidencyWindowParams {
+        int leadMs = 500;
+        int trailMs = 300;
+        int chunkMs = 500;
+        int slackMs = 200;
+        int audioTrailMs = 500;
+        int globalFrameBudget = 256;
+        int perTrackCapOverride = 0;
+    };
+
     struct PlaybackCounters {
         int reposition = 0, reuseSeek = 0, reverseChunkSeek = 0, eofTailSeek = 0, skipForward = 0,
             audioPushes = 0, framesDropped = 0;
+        // Operator/manual seeks served inline from the already-published output cache
+        // (requestSeekTo's committedFromPublishedCache fast path). This is window reuse
+        // that never reaches the worker-loop reuseAt path, so reuseSeek does NOT count
+        // it: a retained trail window makes paused stepping resolve here (no reposition,
+        // no re-decode). The stepscrub gate counts reuseSeek+publishedSeek as reuse.
+        int publishedSeek = 0;
         // Repositions issued by the armed-cut decoder-follow (a backward cut's
         // deterministic primary-bank resync). Counted SEPARATELY from reposition
         // so the armed-cut gate keeps reposition==0 (no coarse-seek fallback)
@@ -103,14 +125,51 @@ public:
         // Phase-2 macOS GPU playback increments it only when a sink/preview asks
         // a GpuFrameData to read back.
         qint64 gpuReadToCpuCount = 0;
+        qint64 gpuSeekPrefetchConsults = 0;
+        qint64 gpuSeekPrefetchPlannedSurfaces = 0;
+        qint64 gpuSeekPrefetchGpuAttempts = 0;
+        qint64 gpuMemoryPressureLevel1 = 0;
+        qint64 gpuMemoryPressureLevel2 = 0;
+        qint64 transportPlayheadMs = 0;
+        qint64 committedPlayheadMs = 0;
+        qint64 lastVisiblePlayheadMs = 0;
+        uint64_t seekGeneration = 0;
+        uint64_t committedGeneration = 0;
+        uint64_t committedGpuGeneration = 0;
+        uint64_t currentGpuGeneration = 0;
+        bool outputPlayheadCacheGuarded = false;
+        int forceLiveOutputSnapshots = 0;
+        bool memoryPressureLatched = false;
+        int gpuPipelineState = 0;
     };
 
     explicit PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
                             AudioPlayer* audioPlayer = nullptr, QObject* parent = nullptr);
     ~PlaybackWorker();
 
+    struct OperatorSeekResult {
+        bool completed = false;
+        bool submittedPgm = false;
+        bool timedOut = false;
+        qint64 targetMs = 0;
+        uint64_t generation = 0;
+        OutputFrameIdentity pgmIdentity;
+        qint64 elapsedNs = 0;
+        QString message;
+    };
+
     void openFile(const QString& filePath);
-    void seekTo(int64_t timestampMs);
+    void seekTo(int64_t timestampMs, int directionHint = 0);
+    OperatorSeekResult seekToAndWaitForPgm(qint64 timestampMs, int directionHint, int timeoutMs);
+    // Non-blocking transactional seek: registers the operator transaction, performs
+    // the inline cache-hit PGM dispatch when the target is already covered, and
+    // returns the generation. Completion is reported via operatorSeekCompleted.
+    quint64 seekToWithPgmNotify(qint64 timestampMs, int directionHint);
+    // Abandon a still-waiting operator transaction (thread-safe). Mirrors the
+    // blocking wait loop's timeout behavior: the worker will not later complete
+    // it or submit PGM for it. No-op if the generation does not match or the
+    // transaction already completed.
+    void abandonOperatorSeekTransaction(quint64 generation);
     // Tier3 frame-perfect ARMED CUT: arm a scheduled atomic cut to targetMs.
     // UI-thread-safe (atomic stores only, never blocks). The worker pre-rolls
     // [target, target+kStagingSpanMs] into a private staging cache on a SECOND
@@ -138,13 +197,33 @@ public:
     void deliverDueFrames(int64_t P, int dir);
     void setActiveAudioView(int viewIndex);
     void setSelectedOutputFeed(int feedIndex);
+    void setRequireAllOutputFeedsForPlayhead(bool required);
     void setBusPreviewProviders(FrameProvider* multiviewProvider, FrameProvider* pgmProvider);
+    void setFeedPreviewProvidersEnabled(bool enabled);
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
+    void resetOutputPlayEpoch();
+#ifdef OLR_UNIT_TEST
+    void setResidencyWindowParamsForTest(const ResidencyWindowParams& params);
+    static int64_t liveGrowthFileSizeForTest(int64_t avioSize, const QString& filePath);
+    static int64_t liveEofRecoveryAnchorMsForTest(int64_t playheadMs, int64_t newestBeforeEofMs,
+                                                  int64_t trailMs, int64_t frameDurationMs);
+    static bool liveReadDeadlineInterruptsForTest(bool baseInterrupt, int64_t deadlineMs,
+                                                  int64_t nowMs);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void evaluateGpuMemoryPressureForTest(uint64_t availableBytes, bool memoryWarning,
+                                          qint64 nowMs = 0);
+    static int64_t manualSeekCommitFillToForTest(int64_t target, int64_t frameDurationMs,
+                                                 const GpuPrefetchPlan& prefetchPlan);
+#endif
+#endif
     void stop();
 
     PlaybackCounters counters() const;
     OutputDispatchStats outputStats() const;
     uint64_t gpuGeneration() const;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    void injectGpuDeviceLossForTest();
+#endif
     // The committed cache generation (set at repositionTo's tail). >=1 after a
     // real reposition proves a target was decoded and committed to the cache.
     uint64_t cacheGeneration() const {
@@ -156,20 +235,53 @@ public:
     // latest target rather than dropping it.
     int cutsFired() const { return m_cutsFired.load(std::memory_order_acquire); }
 
+signals:
+    // Emitted (queued consumers only — connect with explicit Qt::QueuedConnection,
+    // result passed by value) whenever an operator transaction resolves:
+    //   completed && submittedPgm            -> PGM accepted the committed target
+    //   !submittedPgm, message == "PGM output was not submitted" -> dispatch failed
+    //   !completed, message == "superseded"  -> a newer seek replaced it
+    void operatorSeekCompleted(quint64 generation, PlaybackWorker::OperatorSeekResult result);
+
 protected:
     void run() override;
 
 private:
+    enum class OutputCoverageMode {
+        OperatorSeek,
+        StrictSeek,
+        Displayable,
+    };
+
+    struct SeekRequestResult {
+        qint64 clampedTargetMs = 0;
+        int moveDir = 1;
+        uint64_t generation = 0;
+        bool committedFromPublishedCache = false;
+        qint64 publishNs = 0;
+    };
+
+    struct OperatorSeekCompletionState {
+        uint64_t generation = 0;
+        qint64 targetMs = -1;
+        bool waiting = false;
+        bool completed = false;
+        bool submittedPgm = false;
+        OutputFrameIdentity pgmIdentity;
+        QString message;
+    };
+
     // --- Scheduler constants (spec §3) ------------------------------------
-    static constexpr int kLeadMs = 500;            // video window ahead of P (travel dir)
-    static constexpr int kTrailMs = 300;           // video window behind P
-    static constexpr int kChunkMs = 500;           // reverse backward-fetch chunk size
+    static constexpr int kLeadMs = 500;            // default video window ahead of P
+    static constexpr int kTrailMs = 300;           // default video window behind P
+    static constexpr int kChunkMs = 500;           // default reverse backward-fetch chunk size
     static constexpr int kAudioLeadMs = 200;       // max lead of pushed audio over P
     static constexpr int kAudioQueueMs = 900;      // worker audio-queue span bound
     static constexpr int kSlackMs = 200;           // trim hysteresis beyond the window
     static constexpr int kIdleSleepMs = 3;         // sleep when window full and playing
     static constexpr int kEofSleepMs = 10;         // sleep between EOF re-checks
     static constexpr int kReadErrSleepMs = 20;     // sleep after a non-EOF read error
+    static constexpr int kLiveReadTimeoutMs = 100; // bound av_read_frame on growing local files
     static constexpr int kBackJumpSlackMs = 150;   // P below buffered span by this ⇒ reposition
     static constexpr int kGlobalFrameBudget = 256; // aggregate decoded-frame cap (memory)
     static constexpr double kDecimateAbove = 1.5;  // |speed| above which decimation engages
@@ -187,6 +299,36 @@ private:
     //     bodies are implemented here except repositionTo (stubbed). ---------
     int fps() const;            // m_transport->fps(), clamped >=1
     int64_t frameDurMs() const; // 1000 / fps()
+    int64_t maxPriorCoverageMs() const;
+    std::optional<qint64>
+    outputFeedCoverageInCache(const OutputFrameCache& cache, int feedIndex, int64_t playheadMs,
+                              uint64_t gpuGeneration,
+                              OutputCoverageMode mode = OutputCoverageMode::StrictSeek) const;
+    bool
+    outputFeedCoversPlayheadLocked(int feedIndex, int64_t playheadMs, uint64_t gpuGeneration,
+                                   OutputCoverageMode mode = OutputCoverageMode::StrictSeek) const;
+    bool outputCacheCoversPlayheadLocked(
+        int64_t playheadMs, uint64_t gpuGeneration,
+        OutputCoverageMode mode = OutputCoverageMode::OperatorSeek) const;
+    std::optional<qint64> outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
+                                                               uint64_t gpuGeneration) const;
+    bool outputCacheCoversPlayhead(int64_t playheadMs) const;
+    bool publishOutputCacheIfCoversPlayhead(int64_t playheadMs);
+    bool pausedPlayheadNeedsWork(int64_t playheadMs);
+    SeekRequestResult requestSeekTo(qint64 timestampMs, int directionHint,
+                                    bool registerOperatorTransaction);
+    OutputDispatchReport dispatchPgmAfterSeekCommit(qint64 targetMs);
+    void completeOperatorSeekTransaction(uint64_t generation, qint64 targetMs,
+                                         const OutputDispatchReport& report);
+    bool hasOperatorSeekTransaction(uint64_t generation);
+    bool tryCompleteOperatorSeekFromCurrentOutputCache(qint64 targetMs, uint64_t generation);
+    bool allowDisplayableFallbackForReposition(uint64_t generation);
+    int64_t windowLeadMs() const;
+    int64_t windowTrailMs() const;
+    int64_t windowChunkMs() const;
+    int64_t windowSlackMs() const;
+    int64_t windowAudioTrailMs() const;
+    int64_t liveGrowthFileSize() const;
     int capFrames(int trackCount) const;
     int64_t newestPtsMin() const; // min-newest, staleness-excluded; -1 empty
     int64_t oldestPtsMin() const; // min-oldest, staleness-excluded; -1 empty
@@ -198,7 +340,7 @@ private:
     // already correct; this only resyncs the primary decode engine).
     void repositionTo(int64_t target, int dir, AVPacket* pkt, AVFrame* vf, AVFrame* af,
                       bool cutFollow = false);
-    // True when decoder buffers and the output cache both cover target within frameDurMs/2.
+    // True when decoder buffers and the output cache both cover target for display.
     bool reuseAt(int64_t target);
 
     // Decode one read packet into the bank (video → insert with cap; audio →
@@ -210,20 +352,31 @@ private:
     int64_t decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame* af, int64_t P, int dir,
                                  int trackCount, bool decimate, int decimateStep, bool audioOn,
                                  bool dedupTail);
+    void indexPrimaryVideoPacketForSeek(const DecoderTrack* track, const AVPacket* pkt,
+                                        qint64 framePtsMs);
     // Enqueue a decoded active-view audio frame onto m_audioQueue (format-guarded).
     void enqueueAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void resetDedup(); // lastDeliveredPtsMs = -1 on every track
     void clearDecoderBuffers(bool invalidateGpuGeneration = true);
+    // Seek the primary demuxer/decoder bank near target without clearing the
+    // published output cache. Used for forward playback catch-up and forward
+    // armed-cut primary-bank resyncs; counts as skipForward, not reposition.
+    bool resyncPrimaryDecodeCursorTo(qint64 targetMs);
     // clear every TrackBuffer (holds m_bufferMutex); leaves m_outputCache intact
     void initializeOutputGraph(int feedCount, int width, int height);
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
+    void refreshOutputAfterSeekCommit(bool resetPlayEpoch = true);
+    void refreshPreviewAfterSeekCommit(bool resetPlayEpoch = false);
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();
 #ifdef OLR_GPU_PIPELINE_BUILD
+    enum class GpuPipelineState { Gpu, RebuildPending, CpuFallback };
+    static constexpr int kDeviceLossRebuildBudget = 3;
+
     void collectEvictedGpuFramesLocked(const TrackBuffer::EvictedFrames& evictedFrames);
     void collectEvictedGpuFramesLocked(const OutputFrameCache::EvictedVideoFrames& evictedFrames);
     void collectEvictedGpuFrameLocked(const FrameHandle& frame);
@@ -231,6 +384,37 @@ private:
     void forceDrainEvictedGpuFrames();
     void recordFenceWaitStall();
     bool ensureWindowsGpuImportFencesReadyForDecode(void* d3d11Device);
+    void configureGpuBudget();
+    GpuPipelineState gpuPipelineState() const;
+    bool gpuPathActive() const;
+    bool gpuLifecycleSuspended() const;
+    bool gpuDeviceLossPending() const;
+    bool consumeGpuDeviceLossRebuildBudget();
+    void drainGpuDeviceLossEvents() const;
+    void handleGpuDeviceLoss();
+    void sampleGpuMemoryPressure(qint64 nowMs);
+    void evaluateGpuMemoryPressure(uint64_t availableBytes, bool memoryWarning, qint64 nowMs);
+    qint64 gpuMemoryPressureLevel1ThresholdBytes();
+    bool deriveGpuBudgetFromAvailableMemory(uint64_t availableBytes);
+    void handleGpuMemoryPressureLevel1(qint64 nowMs);
+    void handleGpuMemoryPressureLevel2(qint64 nowMs);
+    void flushNativeDecoderPools();
+    void flushNativeDecoderPoolsThrottled(qint64 nowMs);
+    void resumeDeferredGpuRebuild();
+    void detachOutputEndpointsForDeviceLoss();
+    void sanitizeCacheForDeviceLossLocked(OutputFrameCache* cache, int* recoveredFrames = nullptr,
+                                          int* removedGpuFrames = nullptr);
+    void sanitizeTrackBufferForDeviceLossLocked(TrackBuffer* buffer, int* recoveredFrames = nullptr,
+                                                int* removedGpuFrames = nullptr);
+    std::optional<qint64> recoveredCachePlayheadLocked(qint64 playheadMs,
+                                                       uint64_t gpuGeneration) const;
+    bool rebuildGpuSpine();
+    static int64_t manualSeekCommitFillTo(int64_t target, int64_t frameDurationMs,
+                                          const GpuPrefetchPlan& prefetchPlan);
+    GpuPrefetchPlan planGpuSeekPrefetchForReposition(int64_t target, int dir);
+    GpuPrefetchPlan beginGpuSeekPrefetchForReposition(int64_t target, int dir);
+    void endGpuSeekPrefetchForReposition();
+    bool allowNativeGpuDecodeForCurrentPacket(int64_t packetPtsMs);
 #endif
 
     // --- Tier3 pre-roll / armed-cut (worker-thread internals) -------------
@@ -255,6 +439,7 @@ private:
     void armCutInternal(int64_t targetMs, uint64_t baselineSeekGen, int64_t fireAtPlayheadMs);
     // Store the atomic schedule (output frame index + target ms).
     void scheduleCutAtFrame(qint64 outputFrameIndex, int64_t targetMs);
+    void markStagingCovered();
     bool stagingGpuSurfacesIdle() const;
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
     // staging -> active, republishes, re-bases the transport playhead. MUST be
@@ -263,6 +448,9 @@ private:
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
+    bool shouldInterruptFfmpeg() const;
+    bool liveReadDeadlineExpired(int64_t nowMs) const;
+    int readPrimaryFrame(AVPacket* pkt);
 
     QList<FrameProvider*> m_providers;
     FrameProvider* m_multiviewPreviewProvider = nullptr;
@@ -272,14 +460,20 @@ private:
     AVFormatContext* m_fmtCtx = nullptr;
 
     std::atomic<bool> m_running{false};
+    std::atomic<int64_t> m_liveReadDeadlineSteadyMs{-1};
     int64_t m_seekTargetMs = -1;
+    OperatorSeekCompletionState m_operatorSeekCompletion;
     QString m_currentFilePath;
     PlaybackTransport* m_transport;
     AudioPlayer* m_audioPlayer = nullptr;
     std::atomic<int> m_activeAudioView{-1};
     std::atomic<int> m_selectedOutputFeed{-1};
+    std::atomic<bool> m_requireAllOutputFeedsForPlayhead{false};
+    std::atomic<bool> m_feedPreviewProvidersEnabled{false};
 
-    AudioFrameQueue m_audioQueue;            // worker-thread-only
+    AudioFrameQueue m_audioQueue; // worker-thread-only
+    ResidencyWindowParams m_residencyWindowParams;
+    qint64 m_decodedVideoSequence = 0;       // worker-thread-only decoded frame identity
     std::atomic<bool> m_audioReprime{false}; // set by setActiveAudioView (UI thread)
     std::atomic<int> m_lastMoveDir{1};
     int64_t m_sizeAtLastEof = -1;
@@ -291,11 +485,10 @@ private:
     int64_t m_reverseAnchorMs = INT64_MAX;
 
     // PTS(ms) -> byte-offset index of the primary video stream, appended as
-    // packets are read (worker-thread-only; no mutex). All recordings are
-    // ALL-INTRA, so any indexed offset is a valid standalone decode start; the
-    // full-reposition path avio_seeks straight to nearestAtOrBefore(target)
-    // instead of the coarse av_seek_frame anchor, shortening the forward fill.
-    // Survives clearDecoderBuffers (only the per-track frame buffers are wiped).
+    // packets are read (worker-thread-only; no mutex). Kept for diagnostics and
+    // future format-specific seek acceleration. Matroska reposition must still
+    // enter through avformat/av_seek_frame: raw byte landing can poison demuxer
+    // state even for all-intra recordings.
     FrameIndex m_frameIndex;
 
     // Seek-gate generations (read in makeOutputSnapshot; written in seekTo /
@@ -311,6 +504,7 @@ private:
     // committed. While CommitGate is holding the old cache/playhead during a
     // reposition, output must keep accepting the old generation too.
     std::atomic<uint64_t> m_committedGpuGeneration{1};
+    std::atomic<int> m_gpuPipelineState{static_cast<int>(GpuPipelineState::CpuFallback)};
 #endif
     // Last playhead actually exposed to the output clock while no seek was
     // pending. A later seek holds this recent, cache-covered position instead
@@ -319,6 +513,8 @@ private:
     mutable std::atomic<bool> m_outputPlayheadCacheGuarded{false};
 
     QMutex m_mutex;
+    QWaitCondition m_workerWake;
+    QWaitCondition m_operatorSeekCondition;
     mutable QMutex m_bufferMutex;
     mutable QMutex m_outputRuntimeMutex;
 
@@ -387,6 +583,12 @@ private:
     // cuts leave it unset (the forward-lag skip-forward path resyncs without a
     // reposition). Set on the output thread, consumed on the worker thread; atomic.
     std::atomic<int64_t> m_decoderFollowMs{-1};
+    // Armed-cut forward primary-bank resync. A forward cut promotes the target
+    // output cache and re-bases transport, but the primary demuxer can still be
+    // parked seconds behind. If ordinary forward-lag sees P past the bank's newest
+    // it looks like tail-hold, so the worker consumes this one-shot and performs
+    // an explicit non-clearing skip-forward once it observes the re-based playhead.
+    std::atomic<int64_t> m_forwardCutResyncMs{-1};
     // m_seekGeneration captured when a cut is armed (armCutInternal). A manual
     // seekTo bumps m_seekGeneration; if it differs at fire time the operator
     // issued an explicit seek after arming, so maybeFireScheduledCut ABORTS the
@@ -405,6 +607,8 @@ private:
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
+    int m_outputRuntimeImmediateDispatches = 0;
+    QWaitCondition m_outputRuntimeImmediateDispatchesIdle;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
 #ifdef OLR_GPU_PIPELINE_BUILD
     GpuFrameRetireQueue m_gpuFrameRetireQueue; // guarded by m_bufferMutex
@@ -413,6 +617,21 @@ private:
     std::shared_ptr<DecodeDoneFence> m_decodeFence;
 #ifdef OLR_GPU_PIPELINE_BUILD
     std::shared_ptr<GpuFence> m_renderFence;
+    mutable std::atomic<qint64> m_gpuDeviceLossEvents{0};
+    std::atomic<bool> m_injectGpuDeviceLossForTest{false};
+    std::atomic<bool> m_forceLiveOutputSnapshotsOnNextAttach{false};
+    mutable std::atomic<int> m_forceLiveOutputSnapshots{0};
+    std::atomic<int> m_gpuDeviceLossRebuildsRemaining{kDeviceLossRebuildBudget};
+    std::atomic<bool> m_gpuRebuildDeferredForSuspend{false};
+    std::atomic<bool> m_memoryPressureLatched{false};
+    uint64_t m_lastIosMemoryWarningCount = 0;   // worker-thread-only
+    qint64 m_lastPressureSampleMs = 0;          // worker-thread-only
+    qint64 m_lastPressureWarningMs = -1;        // worker-thread-only
+    qint64 m_lastPressureLevel1Ms = -1;         // worker-thread-only
+    qint64 m_lastNativeDecoderPoolFlushMs = -1; // worker-thread-only
+    bool m_gpuSeekPrefetchActive = false;       // worker-thread-only reposition scope
+    int m_gpuSeekPrefetchRemaining = 0;
+    GpuPrefetchPlan m_gpuSeekPrefetchPlan;
 #endif
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
     std::unique_ptr<WinGpuImportEdge> m_winGpuImportEdge;
@@ -425,5 +644,9 @@ private:
     PlaybackCounters m_counters;
     void emitTelemetry(int64_t P, int64_t newest, double speed);
 };
+
+// Registered so operatorSeekCompleted can be delivered across threads via a
+// queued connection and extracted from QSignalSpy in tests.
+Q_DECLARE_METATYPE(PlaybackWorker::OperatorSeekResult)
 
 #endif // PLAYBACKWORKER_H

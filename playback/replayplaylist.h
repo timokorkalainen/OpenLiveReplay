@@ -4,6 +4,7 @@
 #include <QJsonObject>
 #include <QString>
 #include <QVector>
+#include <limits>
 #include <optional>
 
 struct ReplayEntry {
@@ -24,7 +25,9 @@ public:
     int insertEntry(int index, const ReplayEntry& entry);
     bool moveEntry(int fromIndex, int toIndex);
     bool setEntryRange(int index, qint64 inMs, qint64 outMs);
-    int count() const { return static_cast<int>(m_entries.size()); }
+    int count() const {
+        return static_cast<int>(qMin<qsizetype>(m_entries.size(), std::numeric_limits<int>::max()));
+    }
     QVector<ReplayEntry> entries() const { return m_entries; } // snapshot for playout
     void clear();
 

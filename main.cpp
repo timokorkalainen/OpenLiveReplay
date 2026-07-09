@@ -2,27 +2,46 @@
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickStyle>
+#include <QTimer>
+#include <QWindow>
 #ifdef Q_OS_IOS
 #include <QtPlugin>
 Q_IMPORT_PLUGIN(OlrStylePlugin)
 #endif
+#include "appenv.h"
 #include "recorder_engine/replaymanager.h"
 #include "uimanager.h"
 #include "playback/frameprovider.h"
+#include "playback/framepreviewitem.h"
 #include "playback/playlistentriesmodel.h"
 #include "streamdeck/streamdeckmanager.h"
 #include "websocket/controlstate.h"
 #include "websocket/controlwebsocketserver.h"
 #include "websocket/uimanagercontroladapter.h"
+#if defined(Q_OS_IOS)
+#include "ios/ios_scene.h"
+#elif defined(Q_OS_MACOS)
+#include "macos/macos_window_activation.h"
+#endif
 #include <QHostAddress>
 #include <QDebug>
 
 #include <QString>
 using namespace Qt::StringLiterals;
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char* argv[]) {
+#if defined(OLR_GPU_PIPELINE_FORCE_ON)
+    qputenv("OLR_GPU_PIPELINE", "1");
+#endif
     QGuiApplication app(argc, argv);
+#if defined(Q_OS_IOS)
+    installIosGpuLifecycleIfEnabled();
+#elif defined(Q_OS_MACOS)
+    const bool forceVisualE2eActivation = qEnvironmentVariableIsSet("OLR_APP_E2E_FORCE_ACTIVATE");
+    if (forceVisualE2eActivation) {
+        olrPrepareMacWindowActivation();
+    }
+#endif
 
     // Bespoke broadcast-console look: select the OlrStyle custom QQC2 style and fall
     // back to Basic for any control it doesn't provide. Must be set before the engine
@@ -42,9 +61,19 @@ int main(int argc, char *argv[])
 
     UIManagerControlAdapter controlAdapter(&uiManager);
     ControlWebSocketServer controlServer(&controlAdapter);
-    if (!controlServer.listen(QHostAddress::Any, 8115)) {
-        qWarning() << "WebSocket control API failed to listen on port 8115:"
+    const quint16 controlPort = appenv::controlPort();
+    const QByteArray controlBindEnv = qgetenv("OLR_CONTROL_BIND").trimmed().toLower();
+    const QHostAddress controlBindAddress = controlBindEnv == "localhost" ||
+                                                    controlBindEnv == "loopback" ||
+                                                    controlBindEnv == "127.0.0.1"
+                                                ? QHostAddress::LocalHost
+                                                : QHostAddress::Any;
+    if (!controlServer.listen(controlBindAddress, controlPort)) {
+        qWarning() << "WebSocket control API failed to listen on port" << controlPort << ":"
                    << controlServer.lastError();
+    } else {
+        qInfo() << "WebSocket control API listening on" << controlBindAddress.toString() << "port"
+                << controlServer.serverPort();
     }
 
     auto publishRecording = [&controlServer]() {
@@ -59,6 +88,16 @@ int main(int argc, char *argv[])
     };
     auto publishTelemetry = [&controlServer]() {
         controlServer.publishPatch(QStringLiteral("telemetry"));
+    };
+    auto publishOutput = [&controlServer]() {
+        controlServer.publishPatch(QStringLiteral("output"));
+    };
+    QTimer transportPatchTimer;
+    transportPatchTimer.setSingleShot(true);
+    transportPatchTimer.setInterval(100);
+    QObject::connect(&transportPatchTimer, &QTimer::timeout, &controlServer, publishTransport);
+    auto scheduleTransport = [&transportPatchTimer]() {
+        if (!transportPatchTimer.isActive()) transportPatchTimer.start();
     };
 
     auto publishFullSnapshot = [&controlServer, &controlAdapter]() {
@@ -136,10 +175,12 @@ int main(int argc, char *argv[])
     QObject::connect(&uiManager, &UIManager::streamDeckBindingsChanged, &controlServer,
                      publishStreamDeck);
     QObject::connect(&uiManager, &UIManager::screensChanged, &controlServer, publishScreens);
+    QObject::connect(&uiManager, &UIManager::broadcastOutputStatusChanged, &controlServer,
+                     publishOutput);
 
     if (const auto transport = uiManager.transport()) {
         QObject::connect(transport, &PlaybackTransport::posChanged, &controlServer,
-                         [&controlServer]() { controlServer.scheduleTimecode(); });
+                         scheduleTransport);
         QObject::connect(transport, &PlaybackTransport::playingChanged, &controlServer,
                          publishTransport);
         QObject::connect(transport, &PlaybackTransport::speedChanged, &controlServer,
@@ -149,12 +190,12 @@ int main(int argc, char *argv[])
     }
 
     qmlRegisterType<FrameProvider>("Recorder.Types", 1, 0, "FrameProvider");
+    qmlRegisterType<FramePreviewItem>("Recorder.Types", 1, 0, "FramePreviewItem");
     qmlRegisterType<PlaybackTransport>("Recorder.Types", 1, 0, "PlaybackTransport");
     qmlRegisterUncreatableType<PlaylistEntriesModel>("Recorder.Types", 1, 0, "PlaylistEntriesModel",
                                                      "Owned by UIManager");
-    qmlRegisterUncreatableType<StreamDeckManager>(
-        "Recorder.Types", 1, 0, "StreamDeckManager",
-        "Exposed via uiManager.streamDeck");
+    qmlRegisterUncreatableType<StreamDeckManager>("Recorder.Types", 1, 0, "StreamDeckManager",
+                                                  "Exposed via uiManager.streamDeck");
 
     QQmlApplicationEngine qmlEngine;
     qmlEngine.addImportPath(QCoreApplication::applicationDirPath() + u"/qml"_s);
@@ -163,15 +204,47 @@ int main(int argc, char *argv[])
     qmlEngine.rootContext()->setContextProperty("uiManager", &uiManager);
 
     QObject::connect(
-        &qmlEngine,
-        &QQmlApplicationEngine::objectCreationFailed,
-        &app,
-        []() { QCoreApplication::exit(-1); },
-        Qt::QueuedConnection);
+        &qmlEngine, &QQmlApplicationEngine::objectCreationFailed, &app,
+        []() { QCoreApplication::exit(-1); }, Qt::QueuedConnection);
 
-    //qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
-    //qmlEngine.load(QUrl(u":/qt/qml/OpenLiveReplay/Main.qml"_s));
+    // qmlEngine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
+    // qmlEngine.load(QUrl(u":/qt/qml/OpenLiveReplay/Main.qml"_s));
     qmlEngine.load(QUrl(u"qrc:/qt/qml/OpenLiveReplay/Main.qml"_s));
+#if !defined(Q_OS_IOS)
+    const bool visualE2eDebug = qEnvironmentVariableIsSet("OLR_APP_E2E_VISUAL_DEBUG");
+#if !defined(Q_OS_MACOS)
+    const bool forceVisualE2eActivation = false;
+#endif
+    if (visualE2eDebug) {
+        qInfo() << "OLR_APP_WINDOW_DIAG roots" << qmlEngine.rootObjects().size();
+    }
+    for (QObject* root : qmlEngine.rootObjects()) {
+        if (visualE2eDebug) {
+            qInfo() << "OLR_APP_WINDOW_DIAG root" << root->metaObject()->className() << "visible"
+                    << root->property("visible") << "visibility" << root->property("visibility");
+        }
+        if (auto* window = qobject_cast<QWindow*>(root)) {
+            const auto activateWindow = [window]() {
+                window->show();
+                window->raise();
+                window->requestActivate();
+#if defined(Q_OS_MACOS)
+                olrRequestMacWindowActivation(window->winId());
+#endif
+            };
+            if (forceVisualE2eActivation) {
+                activateWindow();
+                QTimer::singleShot(0, window, activateWindow);
+                QTimer::singleShot(250, window, activateWindow);
+            }
+            if (visualE2eDebug) {
+                qInfo() << "OLR_APP_WINDOW_DIAG window"
+                        << "visible" << window->isVisible() << "visibility" << window->visibility()
+                        << "geometry" << window->geometry();
+            }
+        }
+    }
+#endif
 
     return app.exec();
 }

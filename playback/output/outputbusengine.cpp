@@ -3,7 +3,9 @@
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpucompositor.h"
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpusurface.h"
 #endif
+#include "playback/output/colormetadatapolicy.h"
 #include "playback/output/yuv420pcompositor.h"
 
 #include <QList>
@@ -34,6 +36,7 @@ FrameHandle placeholderVideoFrame(int feedIndex, qint64 playheadMs, int width, i
     placeholder.metadata().key.feedIndex = feedIndex;
     placeholder.metadata().key.ptsMs = playheadMs;
     placeholder.metadata().key.isPlaceholder = true;
+    placeholder.metadata().color = defaultColorMetadataForHeight(height);
     return placeholder;
 }
 
@@ -42,11 +45,36 @@ std::optional<FrameHandle> freshVideoFrameAt(const OutputFrameCache& cache, int 
     return cache.videoFrameAtFreshForGeneration(feedIndex, playheadMs, gpuGeneration);
 }
 
-FrameHandle freshVideoFrameOrPlaceholder(const OutputFrameCache& cache, int feedIndex,
-                                         qint64 playheadMs, int width, int height,
-                                         uint64_t gpuGeneration) {
-    if (std::optional<FrameHandle> frame =
-            freshVideoFrameAt(cache, feedIndex, playheadMs, gpuGeneration)) {
+std::optional<FrameHandle> freshVideoFrameAtOrJustAhead(const OutputFrameCache& cache,
+                                                        int feedIndex, qint64 playheadMs,
+                                                        qint64 aheadToleranceMs,
+                                                        uint64_t gpuGeneration) {
+    std::optional<FrameHandle> prior =
+        freshVideoFrameAt(cache, feedIndex, playheadMs, gpuGeneration);
+
+    std::optional<FrameHandle> next =
+        cache.firstFreshVideoFrameAtOrAfter(feedIndex, playheadMs, gpuGeneration);
+    if (!next.has_value() || next->metadata().key.isPlaceholder) return prior;
+
+    const qint64 delta = next->metadata().key.ptsMs - playheadMs;
+    if (delta >= 0 && delta <= qMax<qint64>(0, aheadToleranceMs)) {
+        if (!prior.has_value()) return next;
+        if (OutputFrameSelection::isTimestampRoundingFuture(delta)) return next;
+        const qint64 priorAgeMs = playheadMs - prior->metadata().key.ptsMs;
+        const qint64 maxLowerCadenceHoldMs =
+            qMax<qint64>(200, qMax<qint64>(1, aheadToleranceMs) * 6);
+        if (priorAgeMs > maxLowerCadenceHoldMs) return next;
+    }
+
+    return prior;
+}
+
+FrameHandle freshVideoFrameAtOrJustAheadOrPlaceholder(const OutputFrameCache& cache, int feedIndex,
+                                                      qint64 playheadMs, qint64 aheadToleranceMs,
+                                                      int width, int height,
+                                                      uint64_t gpuGeneration) {
+    if (std::optional<FrameHandle> frame = freshVideoFrameAtOrJustAhead(
+            cache, feedIndex, playheadMs, aheadToleranceMs, gpuGeneration)) {
         return *frame;
     }
     return placeholderVideoFrame(feedIndex, playheadMs, width, height);
@@ -99,7 +127,8 @@ QDebug operator<<(QDebug debug, const OutputFrameIdentity& identity) {
                     << ", placeholder=" << identity.videoPlaceholder
                     << ", audioSilent=" << identity.audioSilent
                     << ", videoHash=" << identity.videoHash << ", audioHash=" << identity.audioHash
-                    << ", gpuGeneration=" << identity.videoGpuGeneration << ')';
+                    << ", gpuGeneration=" << identity.videoGpuGeneration
+                    << ", decodedSequence=" << identity.sourceDecodedSequence << ')';
     return debug;
 }
 
@@ -116,6 +145,7 @@ OutputFrameIdentity outputFrameIdentityFor(const OutputBusFrame& frame) {
     identity.videoHash = videoHashFor(videoKey);
     identity.audioHash = audioHashFor(frame.audio);
     identity.videoGpuGeneration = frame.video.metadata().gpuGeneration;
+    identity.sourceDecodedSequence = frame.video.metadata().decodedSequence;
     return identity;
 }
 
@@ -140,9 +170,9 @@ OutputBusFrame OutputBusEngine::renderFeed(int feedIndex, qint64 outputFrameInde
 
 OutputBusFrame OutputBusEngine::renderPgm(qint64 outputFrameIndex,
                                           const PlaybackStateSnapshot& state,
-                                          const OutputFrameCache& cache) const {
+                                          const OutputFrameCache& cache, PgmComposite* memo) const {
     return renderSingleSource(OutputBusId::pgm(), state.selectedFeedIndex, outputFrameIndex, state,
-                              cache, true);
+                              cache, true, memo);
 }
 
 OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
@@ -163,29 +193,62 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
     // hash collision only miscounts a stat, never produces wrong pixels).
     quint32 sourceSignature = kFnvOffset;
     QVector<qint64> sourceKeys;
-    sourceKeys.reserve(static_cast<qsizetype>(m_feedCount) * 3);
+    sourceKeys.reserve(1 + static_cast<qsizetype>(m_feedCount) * 8);
+    sourceKeys.append(qint64(state.gpuGeneration));
     QVector<std::optional<FrameHandle>> sources;
     sources.reserve(m_feedCount);
+    const qint64 nearFutureToleranceMs =
+        qMax<qint64>(1, m_clock.frameRate().isValid() ? m_clock.frameRate().frameIndexToMs(1) : 40);
     qint64 sourcePtsMs = 0;
     uint64_t sourceGpuGeneration = 0;
+    qint64 sourceDecodedSequence = 0;
     bool anySourcePresent = false;
     for (int feed = 0; feed < m_feedCount; ++feed) {
-        const std::optional<FrameHandle> src =
-            freshVideoFrameAt(cache, feed, out.sampledPlayheadMs, state.gpuGeneration);
+        const std::optional<FrameHandle> src = freshVideoFrameAtOrJustAhead(
+            cache, feed, out.sampledPlayheadMs, nearFutureToleranceMs, state.gpuGeneration);
         sources.append(src);
         const qint64 pts = src ? src->metadata().key.ptsMs : kAbsentFeedPts;
         const uint64_t generation = src ? src->metadata().gpuGeneration : uint64_t(0);
+        const ColorMetadata color =
+            src ? src->metadata().color : defaultColorMetadataForHeight(m_height);
         sourceKeys.append(src ? 1 : 0);
         sourceKeys.append(pts);
         sourceKeys.append(qint64(generation));
+        sourceKeys.append(src ? src->metadata().decodedSequence : qint64(0));
+        sourceKeys.append(int(color.matrix));
+        sourceKeys.append(int(color.primaries));
+        sourceKeys.append(int(color.transfer));
+        sourceKeys.append(int(color.range));
         sourceSignature = hashInt(sourceSignature, feed);
         sourceSignature = hashInt(sourceSignature, pts);
         sourceSignature = hashInt(sourceSignature, qint64(generation));
+        sourceSignature =
+            hashInt(sourceSignature, src ? src->metadata().decodedSequence : qint64(0));
         sourceSignature = hashInt(sourceSignature, src ? 0 : 1);
+        sourceSignature = hashInt(sourceSignature, int(color.matrix));
+        sourceSignature = hashInt(sourceSignature, int(color.primaries));
+        sourceSignature = hashInt(sourceSignature, int(color.transfer));
+        sourceSignature = hashInt(sourceSignature, int(color.range));
         if (src) {
             anySourcePresent = true;
             sourcePtsMs = qMax(sourcePtsMs, src->metadata().key.ptsMs);
             sourceGpuGeneration = qMax(sourceGpuGeneration, generation);
+            sourceDecodedSequence = qMax(sourceDecodedSequence, src->metadata().decodedSequence);
+        }
+    }
+    ColorMetadata compositeColor = defaultColorMetadataForHeight(m_height);
+    const std::optional<FrameHandle>* selectedSource =
+        (state.selectedFeedIndex >= 0 && state.selectedFeedIndex < sources.size())
+            ? &sources.at(state.selectedFeedIndex)
+            : nullptr;
+    if (selectedSource && selectedSource->has_value()) {
+        compositeColor = (*selectedSource)->metadata().color;
+    } else {
+        for (const std::optional<FrameHandle>& src : sources) {
+            if (src.has_value()) {
+                compositeColor = src->metadata().color;
+                break;
+            }
         }
     }
 
@@ -205,10 +268,9 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
         FrameHandle composed;
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (m_gpuCompositor && m_gpuCompositor->isValid() && gpuPipelineEnabled()) {
-            ColorMetadata color;
             composed = m_gpuCompositor->composeGridMemoizedForGeneration(
-                frames, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear, sourceKeys,
-                memo, state.gpuGeneration);
+                frames, m_width, m_height, compositeColor, GpuCompositor::ScaleQuality::Bilinear,
+                sourceKeys, memo, state.gpuGeneration);
         }
 #endif
         if (composed.isNull()) {
@@ -222,12 +284,14 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
         out.video = composed;
     }
     out.video.metadata().key.isPlaceholder = !anySourcePresent;
+    out.video.metadata().color = compositeColor;
 
     // Identity must reflect the composited source content, not the advancing playhead,
     // so repeated-payload detection works when the underlying feeds are frozen.
     out.video.metadata().key.ptsMs = sourcePtsMs;
     out.video.metadata().gpuGeneration =
         out.video.isGpuBacked() ? state.gpuGeneration : sourceGpuGeneration;
+    out.video.metadata().decodedSequence = sourceDecodedSequence;
     out.video.metadata().outputFrameIndex = outputFrameIndex;
 
     out.audio = renderAudioForFeed(state.selectedFeedIndex, outputFrameIndex, state, cache, true);
@@ -239,8 +303,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
 OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedIndex,
                                                    qint64 outputFrameIndex,
                                                    const PlaybackStateSnapshot& state,
-                                                   const OutputFrameCache& cache,
-                                                   bool allowAudio) const {
+                                                   const OutputFrameCache& cache, bool allowAudio,
+                                                   [[maybe_unused]] PgmComposite* pgmMemo) const {
     OutputBusFrame out;
     out.bus = bus;
     out.outputFrameIndex = outputFrameIndex;
@@ -248,21 +312,71 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
     out.programmeTimecode100ns = programmeTimecode100nsFor(out.sampledPlayheadMs);
 
     if (feedIndex >= 0 && feedIndex < m_feedCount) {
-        out.video = freshVideoFrameOrPlaceholder(cache, feedIndex, out.sampledPlayheadMs, m_width,
-                                                 m_height, state.gpuGeneration);
+        const qint64 nearFutureToleranceMs = qMax<qint64>(
+            1, m_clock.frameRate().isValid() ? m_clock.frameRate().frameIndexToMs(1) : 40);
+        out.video = freshVideoFrameAtOrJustAheadOrPlaceholder(
+            cache, feedIndex, out.sampledPlayheadMs, nearFutureToleranceMs, m_width, m_height,
+            state.gpuGeneration);
 #ifdef OLR_GPU_PIPELINE_BUILD
         if (bus == OutputBusId::pgm() && m_gpuCompositor && m_gpuCompositor->isValid() &&
             gpuPipelineEnabled()) {
-            ColorMetadata color;
             const FrameMetadata sourceMeta = out.video.metadata();
-            FrameHandle gpu = m_gpuCompositor->composePgmForGeneration(
-                out.video, m_width, m_height, color, GpuCompositor::ScaleQuality::Bilinear,
-                state.gpuGeneration);
+            QVector<qint64> sourceKeys;
+            sourceKeys.reserve(14);
+            sourceKeys.append(qint64(state.gpuGeneration));
+            sourceKeys.append(sourceMeta.key.feedIndex);
+            sourceKeys.append(sourceMeta.key.ptsMs);
+            sourceKeys.append(sourceMeta.decodedSequence);
+            sourceKeys.append(sourceMeta.key.isPlaceholder ? 1 : 0);
+            sourceKeys.append(int(sourceMeta.key.format));
+            sourceKeys.append(sourceMeta.key.width);
+            sourceKeys.append(sourceMeta.key.height);
+            sourceKeys.append(m_width);
+            sourceKeys.append(m_height);
+            sourceKeys.append(int(sourceMeta.color.matrix));
+            sourceKeys.append(int(sourceMeta.color.primaries));
+            sourceKeys.append(int(sourceMeta.color.transfer));
+            sourceKeys.append(int(sourceMeta.color.range));
+
+            const IFrameData* sourceData = out.video.data();
+            const GpuSurface* sourceSurface = sourceData ? sourceData->gpuSurface() : nullptr;
+            const uint64_t pendingFenceValue =
+                sourceSurface ? sourceSurface->pendingFenceValue() : uint64_t(0);
+            const bool sourceOrderingKnown =
+                pendingFenceValue == 0 || (sourceData && sourceData->gpuFence());
+            const bool canReuseSource = out.video.isGpuBacked() && out.video.isPresentable() &&
+                                        sourceMeta.gpuGeneration == state.gpuGeneration &&
+                                        !sourceMeta.key.isPlaceholder &&
+                                        sourceMeta.key.width == m_width &&
+                                        sourceMeta.key.height == m_height && sourceOrderingKnown;
+
+            FrameHandle gpu;
+            if (canReuseSource) {
+                gpu = out.video;
+                if (pgmMemo) {
+                    pgmMemo->valid = true;
+                    pgmMemo->sourceKeys = sourceKeys;
+                    pgmMemo->video = gpu;
+                }
+            } else if (pgmMemo && pgmMemo->valid && pgmMemo->sourceKeys == sourceKeys &&
+                       !pgmMemo->video.isNull()) {
+                gpu = pgmMemo->video;
+            } else {
+                gpu = m_gpuCompositor->composePgmForGeneration(
+                    out.video, m_width, m_height, sourceMeta.color,
+                    GpuCompositor::ScaleQuality::Bilinear, state.gpuGeneration);
+                if (!gpu.isNull() && pgmMemo) {
+                    pgmMemo->valid = true;
+                    pgmMemo->sourceKeys = sourceKeys;
+                    pgmMemo->video = gpu;
+                }
+            }
             if (!gpu.isNull()) {
                 gpu.metadata().key.feedIndex = sourceMeta.key.feedIndex;
                 gpu.metadata().key.ptsMs = sourceMeta.key.ptsMs;
                 gpu.metadata().key.isPlaceholder = sourceMeta.key.isPlaceholder;
                 gpu.metadata().gpuGeneration = state.gpuGeneration;
+                gpu.metadata().decodedSequence = sourceMeta.decodedSequence;
                 out.video = gpu;
             }
         }

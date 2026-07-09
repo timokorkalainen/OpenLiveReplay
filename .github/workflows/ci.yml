@@ -29,7 +29,11 @@ permissions:
   contents: read
 
 env:
-  QT_VERSION: 6.10.1
+  QT_VERSION: 6.11.1
+  # Windows-only override: aqtinstall cannot yet resolve 6.11.x on Windows (Qt changed
+  # the 6.11 Windows repo layout), so the Windows lane pins the newest aqt-installable
+  # Windows Qt. Bump back to QT_VERSION once aqt supports 6.11 on Windows.
+  QT_VERSION_WINDOWS: 6.10.2
   CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
@@ -191,10 +195,25 @@ jobs:
           sudo apt-get install -y "clang-format-${LLVM_VER}"
           CF="$(command -v "clang-format-${LLVM_VER}")"
           "$CF" --version
-          # git-clang-format is a standalone python script; fetch the matching one.
-          GCF=/tmp/git-clang-format
-          curl -fsSL "https://raw.githubusercontent.com/llvm/llvm-project/release/${LLVM_VER}.x/clang/tools/clang-format/git-clang-format" -o "$GCF"
-          chmod +x "$GCF"
+          GCF="$(command -v "git-clang-format-${LLVM_VER}" || true)"
+          if [ -z "$GCF" ]; then
+            for candidate in \
+              "/usr/lib/llvm-${LLVM_VER}/share/clang/git-clang-format" \
+              "/usr/lib/llvm-${LLVM_VER}/bin/git-clang-format"; do
+              if [ -x "$candidate" ]; then
+                GCF="$candidate"
+                break
+              fi
+            done
+          fi
+          if [ -z "$GCF" ]; then
+            GCF=/tmp/git-clang-format
+            curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL \
+              "https://raw.githubusercontent.com/llvm/llvm-project/release/${LLVM_VER}.x/clang/tools/clang-format/git-clang-format" \
+              -o "$GCF"
+            chmod +x "$GCF"
+          fi
+          echo "git-clang-format: $GCF"
           base="${{ github.event.pull_request.base.sha }}"
           [ -z "$base" ] && base="${{ github.event.before }}"
           if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
@@ -349,6 +368,14 @@ jobs:
         # below adds worker-level coverage on top of the unit label.
         run: ctest --output-on-failure --repeat until-pass:2 -L ci -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
 
+      - name: Run GPU async-readback, budget, seek-prefetch, and device-loss e2e gates
+        working-directory: build
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ctest --output-on-failure --repeat until-pass:2 --no-tests=error \
+            -L 'async-readback|av-sync|device-loss|gpu-budget|seek-prefetch'
+
       # clang-tidy is a GATE: WarningsAsErrors in .clang-tidy makes any finding in a
       # changed first-party file fatal, using the generated compile_commands.json.
       # The whole first-party tree is tidy-clean, so only regressions in touched
@@ -406,10 +433,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Qt reorganised the Windows online-repository layout in 6.11, and the current
+      # aqtinstall (3.3.0, used by install-qt-action) cannot locate the 6.11.x Windows
+      # metadata ("Failed to locate XML data for Qt version") — reproducible against the
+      # official server, not a mirror flake. macOS/Linux 6.11.x install fine. Until aqt
+      # gains 6.11 Windows support, pin only this lane to the newest aqt-installable
+      # Windows Qt (QT_VERSION_WINDOWS); the rest of the matrix stays on QT_VERSION.
       - name: Install Qt (MinGW) + tools
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ env.QT_VERSION }}
+          version: ${{ env.QT_VERSION_WINDOWS }}
           host: windows
           target: desktop
           arch: win64_mingw
@@ -466,7 +499,7 @@ jobs:
             -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor rhi_d3d_probe
+          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge rhi_d3d_probe
 
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
@@ -512,7 +545,7 @@ jobs:
           srt_root="$(cd windows_build/dist/srt && pwd)"
           export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
           ctest --test-dir build-tests --output-on-failure \
-            -R '^(tst_nativeaacdecoder|tst_gpufence)$'
+            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge)$'
           gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
           if [ ! -x "$gpu_test" ]; then
             echo "::error::tst_gpucompositor executable not found"
@@ -671,7 +704,7 @@ jobs:
           - sanitizer: "thread"
             label: tsan-gpu
             advisory: false
-            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpucompositor_stress"
+            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring tst_gpucompositor_stress tst_asyncgpureadbacksink tst_iotargetsinkfactory tst_gpuencodepump tst_streamworker_gpuencode tst_playbackworker"
           # asan-e2e: only the e2e harness binaries need building — the playback
           # matrix drives play_harness + record_harness; the native SRT smoke
           # drives record_harness. Both link olr_sanitize, so this build is
@@ -795,7 +828,7 @@ jobs:
               -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
           elif [ "${{ matrix.label }}" = "tsan-gpu" ]; then
             ctest --output-on-failure --repeat until-pass:2 \
-              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpucompositor_stress)$'
+              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode|tst_playbackworker)$'
           else
             ctest --output-on-failure --repeat until-pass:2 \
               -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'

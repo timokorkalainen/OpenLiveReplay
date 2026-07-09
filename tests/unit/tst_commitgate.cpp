@@ -1,4 +1,6 @@
 #include <QtTest>
+#include <QFile>
+
 #include "playback/commitgate.h"
 
 class TestCommitGate : public QObject {
@@ -9,9 +11,11 @@ private slots:
     void snapsToLiveOnceCommitGenerationCatchesUp();
     void bookmarkIgnoresUncoveredTransportJump();
     void visiblePlayheadHoldsBookmarkForUncoveredLiveJump();
+    void visiblePlayheadAdvancesWhenBookmarkIsUncovered();
     void repositionCommitRequiresSameSeekGeneration();
     void repositionCommitBodyRunsOnlyForOriginalSeek();
     void gpuGenerationInvalidatesOnlyWhenSeekGateIsHeld();
+    void legacyMediaVideoFrameTypeIsRetired();
 };
 
 // committedGen == seekGen -> no reposition outstanding -> expose the LIVE
@@ -60,16 +64,30 @@ void TestCommitGate::bookmarkIgnoresUncoveredTransportJump() {
 void TestCommitGate::visiblePlayheadHoldsBookmarkForUncoveredLiveJump() {
     QCOMPARE(CommitGate::cacheGuardedVisiblePlayheadMs(
                  /*visiblePlayheadMs*/ 9000, /*bookmarkedPlayheadMs*/ 5000,
-                 /*cacheCovered*/ false, /*committedGen*/ 3, /*seekGen*/ 3),
+                 /*cacheCovered*/ false, /*bookmarkUsable*/ true, /*committedGen*/ 3,
+                 /*seekGen*/ 3),
              int64_t(5000));
     QCOMPARE(CommitGate::cacheGuardedVisiblePlayheadMs(
                  /*visiblePlayheadMs*/ 5040, /*bookmarkedPlayheadMs*/ 5000,
-                 /*cacheCovered*/ true, /*committedGen*/ 3, /*seekGen*/ 3),
+                 /*cacheCovered*/ true, /*bookmarkUsable*/ true, /*committedGen*/ 3,
+                 /*seekGen*/ 3),
              int64_t(5040));
     QCOMPARE(CommitGate::cacheGuardedVisiblePlayheadMs(
                  /*visiblePlayheadMs*/ 5000, /*bookmarkedPlayheadMs*/ 4800,
-                 /*cacheCovered*/ false, /*committedGen*/ 3, /*seekGen*/ 4),
+                 /*cacheCovered*/ false, /*bookmarkUsable*/ true, /*committedGen*/ 3,
+                 /*seekGen*/ 4),
              int64_t(5000));
+}
+
+void TestCommitGate::visiblePlayheadAdvancesWhenBookmarkIsUncovered() {
+    // Live startup can begin before all feeds have cache coverage at 0 ms. Holding
+    // an uncovered bookmark pins output to permanent placeholders even after real
+    // frames arrive near the live playhead.
+    QCOMPARE(CommitGate::cacheGuardedVisiblePlayheadMs(
+                 /*visiblePlayheadMs*/ 9000, /*bookmarkedPlayheadMs*/ 0,
+                 /*cacheCovered*/ false, /*bookmarkUsable*/ false, /*committedGen*/ 3,
+                 /*seekGen*/ 3),
+             int64_t(9000));
 }
 
 void TestCommitGate::repositionCommitRequiresSameSeekGeneration() {
@@ -105,6 +123,15 @@ void TestCommitGate::gpuGenerationInvalidatesOnlyWhenSeekGateIsHeld() {
         /*startedSeekGen*/ 7, /*committedGen*/ 6));
     QVERIFY(!CommitGate::shouldInvalidateGpuGenerationForReposition(
         /*startedSeekGen*/ 7, /*committedGen*/ 7));
+}
+
+void TestCommitGate::legacyMediaVideoFrameTypeIsRetired() {
+    QFile mediaFrame(QStringLiteral(OLR_SOURCE_DIR "/playback/output/mediaframe.h"));
+    QVERIFY2(mediaFrame.open(QIODevice::ReadOnly), qPrintable(mediaFrame.errorString()));
+
+    const QByteArray source = mediaFrame.readAll();
+    QVERIFY2(!source.contains("struct MediaVideoFrame"),
+             "MediaVideoFrame must stay retired; use FrameHandle plus MediaVideoFrameView");
 }
 
 QTEST_MAIN(TestCommitGate)
