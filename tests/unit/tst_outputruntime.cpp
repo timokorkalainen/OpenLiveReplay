@@ -803,7 +803,12 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     catchUpThread.join();
 
     const QVector<OutputBusFrame> frames = sink.frames();
-    QVERIFY2(immediateElapsedMs < 250,
+    // Preemption is proven structurally by the frame count below; this latency bound is a
+    // coarse "did not wait for the whole burst" guard. The full non-preempted burst is
+    // m_maxCatchUpTicks (8) * SlowSubmitSink 80ms = 640ms, so a value well under that still
+    // catches a preemption regression while tolerating CI scheduling jitter (msleep can
+    // overrun under load, which made a tight 250ms bound flaky).
+    QVERIFY2(immediateElapsedMs < 500,
              qPrintable(QStringLiteral("immediate dispatch waited %1 ms behind catch-up")
                             .arg(immediateElapsedMs)));
     QVERIFY2(frames.size() <= 4,

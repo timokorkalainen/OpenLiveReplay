@@ -694,7 +694,7 @@ jobs:
           - sanitizer: "thread"
             label: tsan-gpu
             advisory: false
-            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring tst_gpucompositor_stress tst_asyncgpureadbacksink tst_iotargetsinkfactory tst_gpuencodepump tst_streamworker_gpuencode"
+            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring tst_gpucompositor_stress tst_asyncgpureadbacksink tst_iotargetsinkfactory tst_gpuencodepump tst_streamworker_gpuencode tst_playbackworker"
           # asan-e2e: only the e2e harness binaries need building — the playback
           # matrix drives play_harness + record_harness; the native SRT smoke
           # drives record_harness. Both link olr_sanitize, so this build is
@@ -818,7 +818,7 @@ jobs:
               -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
           elif [ "${{ matrix.label }}" = "tsan-gpu" ]; then
             ctest --output-on-failure --repeat until-pass:2 \
-              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode)$'
+              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode|tst_playbackworker)$'
           else
             ctest --output-on-failure --repeat until-pass:2 \
               -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'

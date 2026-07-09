@@ -601,12 +601,12 @@ private:
     std::atomic<int> m_gpuDeviceLossRebuildsRemaining{kDeviceLossRebuildBudget};
     std::atomic<bool> m_gpuRebuildDeferredForSuspend{false};
     std::atomic<bool> m_memoryPressureLatched{false};
-    uint64_t m_lastIosMemoryWarningCount = 0; // worker-thread-only
-    qint64 m_lastPressureSampleMs = 0;        // worker-thread-only
-    qint64 m_lastPressureWarningMs = -1;      // worker-thread-only
-    qint64 m_lastPressureLevel1Ms = -1;       // worker-thread-only
+    uint64_t m_lastIosMemoryWarningCount = 0;   // worker-thread-only
+    qint64 m_lastPressureSampleMs = 0;          // worker-thread-only
+    qint64 m_lastPressureWarningMs = -1;        // worker-thread-only
+    qint64 m_lastPressureLevel1Ms = -1;         // worker-thread-only
     qint64 m_lastNativeDecoderPoolFlushMs = -1; // worker-thread-only
-    bool m_gpuSeekPrefetchActive = false;     // worker-thread-only reposition scope
+    bool m_gpuSeekPrefetchActive = false;       // worker-thread-only reposition scope
     int m_gpuSeekPrefetchRemaining = 0;
     GpuPrefetchPlan m_gpuSeekPrefetchPlan;
 #endif

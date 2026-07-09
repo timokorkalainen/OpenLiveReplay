@@ -350,7 +350,7 @@ else
                   tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring
                   tst_gpucompositor_stress
                   tst_asyncgpureadbacksink tst_iotargetsinkfactory
-                  tst_gpuencodepump tst_streamworker_gpuencode)
+                  tst_gpuencodepump tst_streamworker_gpuencode tst_playbackworker)
     echo "[pre-push] Building TSan threading targets in ${TSAN_BUILD_DIR}..."
     cmake -S . -B "$TSAN_BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Debug \
@@ -362,7 +362,7 @@ else
     echo "[pre-push] Running threading tests under TSan..."
     TSAN_OPTIONS="halt_on_error=1:suppressions=$PWD/tests/tsan.suppressions.txt" \
         ctest --test-dir "$TSAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
-            -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest|tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode)$'
+            -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest|tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode|tst_playbackworker)$'
     echo "[pre-push] TSan OK."
 fi
 

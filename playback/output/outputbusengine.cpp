@@ -304,7 +304,7 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
                                                    qint64 outputFrameIndex,
                                                    const PlaybackStateSnapshot& state,
                                                    const OutputFrameCache& cache, bool allowAudio,
-                                                   PgmComposite* pgmMemo) const {
+                                                   [[maybe_unused]] PgmComposite* pgmMemo) const {
     OutputBusFrame out;
     out.bus = bus;
     out.outputFrameIndex = outputFrameIndex;
