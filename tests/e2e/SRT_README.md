@@ -26,11 +26,14 @@ native SRT/RTMP stack. Configure against the normal Homebrew FFmpeg (used only
 for muxing/decoding the recorded fixtures) and run the native label:
 
 ```bash
-cmake -S . -B build/native-srt -G Ninja -DOLR_BUILD_TESTS=ON \
-  -DCMAKE_PREFIX_PATH="$HOME/Qt/6.10.1/macos"
+cmake -S . -B build/native-srt -G Ninja -DOLR_BUILD_TESTS=ON
 ninja -C build/native-srt record_harness sync_harness play_harness
 ( cd build/native-srt && ctest -L native-apple-ingest --output-on-failure )
 ```
+
+Qt is auto-detected (Homebrew `/opt/homebrew/opt/qt` or `~/Qt/6.*/macos`);
+override with `QT_ROOT_DIR`/`OLR_QT_ROOT` or `-DCMAKE_PREFIX_PATH` if it lives
+elsewhere.
 
 The migrated udp→SRT gates run under their existing labels/selections:
 

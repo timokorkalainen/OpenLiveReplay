@@ -34,12 +34,13 @@ macOS (Homebrew) defaults — adjust paths for your environment:
 ```sh
 cmake -S <worktree> -B <worktree>/build/c -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_PREFIX_PATH=$HOME/Qt/6.10.1/macos \
   -DOLR_BUILD_TESTS=ON
 cmake --build <worktree>/build/c
 ```
 
-Use a fresh build directory when switching configurations. Ninja, ffmpeg/ffprobe,
+Qt is auto-detected (Homebrew `/opt/homebrew/opt/qt` or `~/Qt/6.*/macos`);
+override with `QT_ROOT_DIR`/`OLR_QT_ROOT` or `-DCMAKE_PREFIX_PATH` if it lives
+elsewhere. Use a fresh build directory when switching configurations. Ninja, ffmpeg/ffprobe,
 and srt-live-transmit come from Homebrew (`/opt/homebrew`).
 
 - Unit tests — run the full suite, since a worker/dispatcher change can affect

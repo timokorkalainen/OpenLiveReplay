@@ -44,8 +44,8 @@
 #
 # Tunables:
 #   OLR_E2E_CLIP_SECONDS  (default 5)               e2e / delivery clip length
-#   QT_HOST_PREFIX        (default ~/Qt/6.10.1/macos)
-#   QT_IOS_PREFIX         (default ~/Qt/6.10.1/ios)  used only by OLR_PREPUSH_FULL
+#   QT_HOST_PREFIX        macOS Qt kit; auto-detected when unset (see below)
+#   QT_IOS_PREFIX         iOS Qt kit; auto-detected when unset  (OLR_PREPUSH_FULL only)
 #
 # Enable the hook once per clone:  git config core.hooksPath .githooks
 set -euo pipefail
@@ -106,7 +106,35 @@ if [ "${OLR_PREPUSH_DOCS_FULL:-0}" != "1" ]; then
 fi
 
 QT_VERSION="${QT_VERSION:-6.10.1}"
-QT_HOST_PREFIX="${QT_HOST_PREFIX:-${QT_ROOT_DIR:-$HOME/Qt/$QT_VERSION/macos}}"
+
+# Resolve the Qt kit prefixes portably so the gate runs on any machine without a
+# hard-coded home path: an explicit override wins, then the same env vars the build
+# honors (OLR_QT_ROOT / QT_ROOT_DIR), then Homebrew, then the newest online-installer
+# kit, then Qt tools on PATH. Only the final literal is version-pinned (last resort).
+olr_qt_host_prefix() {
+    if [ -n "${QT_HOST_PREFIX:-}" ]; then printf '%s\n' "$QT_HOST_PREFIX"; return 0; fi
+    if [ -n "${OLR_QT_ROOT:-}" ]; then printf '%s\n' "$OLR_QT_ROOT"; return 0; fi
+    if [ -n "${QT_ROOT_DIR:-}" ]; then printf '%s\n' "$QT_ROOT_DIR"; return 0; fi
+    local cand
+    for cand in /opt/homebrew/opt/qt /usr/local/opt/qt; do
+        if [ -d "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
+    done
+    local newest
+    newest="$(ls -d "$HOME"/Qt/6.*/macos 2>/dev/null | sort -V | tail -1 || true)"
+    if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+    local tool prefix
+    for tool in qtpaths6 qtpaths qmake6 qmake; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            case "$tool" in
+                qtpaths*) prefix="$("$tool" --install-prefix 2>/dev/null || true)" ;;
+                *) prefix="$("$tool" -query QT_INSTALL_PREFIX 2>/dev/null || true)" ;;
+            esac
+            if [ -n "$prefix" ] && [ -d "$prefix" ]; then printf '%s\n' "$prefix"; return 0; fi
+        fi
+    done
+    printf '%s\n' "$HOME/Qt/$QT_VERSION/macos"
+}
+QT_HOST_PREFIX="$(olr_qt_host_prefix)"
 CLIP_SECONDS="${OLR_E2E_CLIP_SECONDS:-5}"
 DELIVERY_BUILD_DIR="${OLR_PREPUSH_DELIVERY_BUILD_DIR:-build/prepush-delivery}"
 
@@ -391,9 +419,18 @@ if [ "${SKIP_IOS_BUILD:-0}" = "1" ]; then
     exit 0
 fi
 
-# Locate the Qt iOS kit. Override via env if your Qt lives elsewhere, e.g.
-# QT_IOS_PREFIX=~/Qt/6.9.0/ios.
-QT_IOS_PREFIX="${QT_IOS_PREFIX:-$HOME/Qt/6.10.1/ios}"
+# Locate the Qt iOS kit. Override via QT_IOS_PREFIX if your Qt lives elsewhere; by
+# default it sits beside the resolved macOS kit, else the newest installed iOS kit.
+olr_qt_ios_prefix() {
+    if [ -n "${QT_IOS_PREFIX:-}" ]; then printf '%s\n' "$QT_IOS_PREFIX"; return 0; fi
+    local sibling="${QT_HOST_PREFIX%/macos}/ios"
+    if [ -d "$sibling" ]; then printf '%s\n' "$sibling"; return 0; fi
+    local newest
+    newest="$(ls -d "$HOME"/Qt/6.*/ios 2>/dev/null | sort -V | tail -1 || true)"
+    if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
+    printf '%s\n' "$HOME/Qt/$QT_VERSION/ios"
+}
+QT_IOS_PREFIX="$(olr_qt_ios_prefix)"
 QT_CMAKE="$QT_IOS_PREFIX/bin/qt-cmake"
 
 if [ ! -x "$QT_CMAKE" ]; then

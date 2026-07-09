@@ -95,8 +95,8 @@ IOS_MIN_VERSION="13.0"
 if [ -z "${CMAKE_BIN}" ]; then
     if command -v cmake >/dev/null 2>&1; then
         CMAKE_BIN="$(command -v cmake)"
-    elif [ -x "/Users/timo.korkalainen/Qt/Tools/CMake/CMake.app/Contents/bin/cmake" ]; then
-        CMAKE_BIN="/Users/timo.korkalainen/Qt/Tools/CMake/CMake.app/Contents/bin/cmake"
+    elif [ -x "$HOME/Qt/Tools/CMake/CMake.app/Contents/bin/cmake" ]; then
+        CMAKE_BIN="$HOME/Qt/Tools/CMake/CMake.app/Contents/bin/cmake"
     elif [ -x "/opt/homebrew/bin/cmake" ]; then
         CMAKE_BIN="/opt/homebrew/bin/cmake"
     elif [ -x "/usr/local/bin/cmake" ]; then

@@ -26,7 +26,7 @@ gitignored `CMakeUserPresets.json`:
       "name": "macos-debug-local",
       "inherits": "macos-debug",
       "cacheVariables": {
-        "CMAKE_PREFIX_PATH": "/path/to/Qt/6.10.1/macos"
+        "CMAKE_PREFIX_PATH": "/path/to/Qt/<version>/macos"
       }
     }
   ]
@@ -114,9 +114,16 @@ and iOS local SRT marker oracle, see
 iOS remains Xcode-driven. Use a separate build directory because it uses the
 Xcode generator and the iOS Qt kit.
 
+`QT_IOS_PREFIX` and `QT_HOST_PREFIX` point at the installed Qt kits and default
+to the standard installer layout (e.g. `~/Qt/6.*/ios` and `~/Qt/6.*/macos`); set
+them if your Qt lives elsewhere:
+
 ```sh
-$HOME/Qt/6.10.1/ios/bin/qt-cmake -S . -B build/ios-debug -G Xcode \
-  -DQT_HOST_PATH=$HOME/Qt/6.10.1/macos \
+: "${QT_IOS_PREFIX:=$(ls -d "$HOME"/Qt/6.*/ios | sort -V | tail -1)}"
+: "${QT_HOST_PREFIX:=$(ls -d "$HOME"/Qt/6.*/macos | sort -V | tail -1)}"
+
+"$QT_IOS_PREFIX/bin/qt-cmake" -S . -B build/ios-debug -G Xcode \
+  -DQT_HOST_PATH="$QT_HOST_PREFIX" \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DOLR_ENABLE_STREAMDECK=ON \
   -DOLR_GPU_PIPELINE=ON \
@@ -127,8 +134,8 @@ For device validation that uses PGM NDI as the external output oracle, install
 the NDI SDK for Apple and make NDI mandatory at configure time:
 
 ```sh
-$HOME/Qt/6.10.1/ios/bin/qt-cmake -S . -B build/ios-debug -G Xcode \
-  -DQT_HOST_PATH=$HOME/Qt/6.10.1/macos \
+"$QT_IOS_PREFIX/bin/qt-cmake" -S . -B build/ios-debug -G Xcode \
+  -DQT_HOST_PATH="$QT_HOST_PREFIX" \
   -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DOLR_ENABLE_STREAMDECK=ON \
   -DOLR_GPU_PIPELINE=ON \
