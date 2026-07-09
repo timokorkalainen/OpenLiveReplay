@@ -10,6 +10,7 @@
 #include <QMutex>
 #include <QPointer>
 #include <QList>
+#include <QSet>
 #include <QWaitCondition>
 
 class FrameHandle;
@@ -47,7 +48,9 @@ signals:
     void frameChanged(quint64 serial);
 
 private:
-    bool latestFrameForSerial(quint64 serial, QVideoFrame* frame) const;
+    void queueLatestFrameForSink(QVideoSink* sink);
+    bool postLatestFrameForSink(QVideoSink* sink);
+    void applyLatestFrameToSink(QVideoSink* sink);
     qint64 nextDisplayStartUsLocked();
     void markSinkAppliedSerial(QVideoSink* sink, quint64 serial);
     quint64 sinkAppliedSerial(QVideoSink* sink) const;
@@ -58,6 +61,7 @@ private:
 
     QPointer<QVideoSink> m_sink;
     QList<QPointer<QVideoSink>> m_sinks;
+    QSet<QVideoSink*> m_pendingSinkUpdates;
     QHash<QVideoSink*, quint64> m_appliedSerialBySink;
     QHash<QObject*, DirectPreviewConsumerState> m_directPreviewConsumers;
     mutable QMutex m_sinkMutex;

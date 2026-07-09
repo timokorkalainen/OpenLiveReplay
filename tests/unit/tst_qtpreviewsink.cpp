@@ -23,6 +23,7 @@ private slots:
     void frameProviderPresentationTimesTrackDeliveryClock();
     void frameProviderEmitsFrameChangedForDirectPreview();
     void frameProviderCoalescesQueuedVideoSinkUpdatesToLatestFrame();
+    void frameProviderAdvancesBackloggedSinkWhileProducerIsRunning();
     void frameProviderFlushWaitsForSubmittedSerial();
     void frameProviderFlushWaitsForDirectPreviewConsumerSerial();
     void outputSinkFlushDoesNotBlockOnDirectPreviewConsumer();
@@ -172,6 +173,69 @@ void TestQtPreviewSink::frameProviderCoalescesQueuedVideoSinkUpdatesToLatestFram
     QVERIFY(sinkThread.wait(1000));
 
     QCOMPARE(observedFrameChanges, 1);
+}
+
+void TestQtPreviewSink::frameProviderAdvancesBackloggedSinkWhileProducerIsRunning() {
+    FrameProvider provider;
+    QThread sinkThread;
+    auto sink = std::make_unique<QVideoSink>();
+    sink->moveToThread(&sinkThread);
+
+    std::atomic<int> visibleFrameChanges{0};
+    QObject::connect(
+        sink.get(), &QVideoSink::videoFrameChanged, &provider,
+        [&visibleFrameChanges](const QVideoFrame&) {
+            visibleFrameChanges.fetch_add(1, std::memory_order_relaxed);
+        },
+        Qt::DirectConnection);
+
+    sinkThread.start();
+    provider.addVideoSink(sink.get());
+
+    FrameHandle initial = solidYuv420pHandle(4, 4, 20, 128, 128);
+    const quint64 initialSerial = provider.deliverHandle(initial);
+    const bool deliveredInitial = provider.flushVideoSinks(500, initialSerial);
+    const bool queuedBlocker =
+        QMetaObject::invokeMethod(sink.get(), []() { QThread::msleep(50); }, Qt::QueuedConnection);
+
+    bool advancedWhileProducing = false;
+    if (deliveredInitial && queuedBlocker) {
+        std::atomic_bool producing{true};
+        std::thread producer([&]() {
+            int frameNumber = 0;
+            while (producing.load(std::memory_order_relaxed)) {
+                FrameHandle frame =
+                    solidYuv420pHandle(4, 4, quint8(40 + (frameNumber++ % 16) * 8), 128, 128);
+                provider.deliverHandle(frame);
+                QMetaObject::invokeMethod(
+                    sink.get(), []() { QThread::msleep(2); }, Qt::QueuedConnection);
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+            }
+        });
+
+        QElapsedTimer timer;
+        timer.start();
+        while (timer.elapsed() < 150 && visibleFrameChanges.load(std::memory_order_relaxed) <= 1) {
+            QTest::qWait(5);
+        }
+        advancedWhileProducing = visibleFrameChanges.load(std::memory_order_relaxed) > 1;
+        producing.store(false, std::memory_order_relaxed);
+        producer.join();
+    }
+
+    provider.removeVideoSink(sink.get());
+    QVideoSink* rawSink = sink.release();
+    const bool deletedSink = QMetaObject::invokeMethod(
+        rawSink, [rawSink]() { delete rawSink; }, Qt::BlockingQueuedConnection);
+    sinkThread.quit();
+    const bool stoppedSinkThread = sinkThread.wait(2000);
+
+    QVERIFY(deliveredInitial);
+    QVERIFY(queuedBlocker);
+    QVERIFY(deletedSink);
+    QVERIFY(stoppedSinkThread);
+    QVERIFY2(advancedWhileProducing,
+             "backlogged preview sink did not advance until continuous production stopped");
 }
 
 void TestQtPreviewSink::frameProviderFlushWaitsForSubmittedSerial() {
