@@ -63,7 +63,7 @@ The matching probe is present and the macOS injector works:
 
 ```sh
 "$GR" --version            # GammaRay version 3.4.0 ...
-"$GR" --list-probes        # qt6_10-arm64 (Qt 6.10 (release, arm64))   <- must match the app's Qt
+"$GR" --list-probes        # qt6_11-arm64 (Qt 6.11 (release, arm64))   <- must match the app's Qt
 "$GR" --self-test preload  # Injector preload successfully passed its self-test.
 ```
 

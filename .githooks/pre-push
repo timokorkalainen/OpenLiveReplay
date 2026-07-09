@@ -105,7 +105,7 @@ if [ "${OLR_PREPUSH_DOCS_FULL:-0}" != "1" ]; then
     fi
 fi
 
-QT_VERSION="${QT_VERSION:-6.10.1}"
+QT_VERSION="${QT_VERSION:-6.11.1}"
 
 # Resolve the Qt kit prefixes portably so the gate runs on any machine without a
 # hard-coded home path: an explicit override wins, then the same env vars the build

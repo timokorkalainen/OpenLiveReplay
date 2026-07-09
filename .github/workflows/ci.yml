@@ -29,7 +29,7 @@ permissions:
   contents: read
 
 env:
-  QT_VERSION: 6.10.1
+  QT_VERSION: 6.11.1
   CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:

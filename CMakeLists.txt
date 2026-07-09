@@ -141,7 +141,7 @@ if(NOT CMAKE_PREFIX_PATH AND NOT DEFINED ENV{CMAKE_PREFIX_PATH})
         else()
             file(GLOB _olr_qt_candidates "$ENV{HOME}/Qt/6.*/gcc_64")
         endif()
-        # Prefer the newest Qt (natural version order so 6.10 > 6.9).
+        # Prefer the newest Qt (natural version order so 6.11 > 6.9).
         list(SORT _olr_qt_candidates COMPARE NATURAL ORDER DESCENDING)
         foreach(_olr_qt_dir IN LISTS _olr_qt_candidates)
             if(IS_DIRECTORY "${_olr_qt_dir}")
@@ -159,7 +159,7 @@ find_package(Qt6 REQUIRED COMPONENTS Quick Core Multimedia Concurrent QuickContr
 if(OLR_GPU_PIPELINE)
     # RHI lives in Qt6::GuiPrivate (<rhi/qrhi.h> is a semi-public Gui header);
     # qsb / qt_add_shaders come from Qt6::ShaderTools. This path is coupled to
-    # the project's Qt 6.10.x toolchain by design.
+    # the project's Qt 6.11.x toolchain by design.
     find_package(Qt6 REQUIRED COMPONENTS Gui GuiPrivate ShaderTools)
 endif()
 qt_standard_project_setup(REQUIRES 6.8)
