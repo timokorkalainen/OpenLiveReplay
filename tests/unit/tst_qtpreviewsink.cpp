@@ -28,6 +28,7 @@ private slots:
     void outputSinkFlushDoesNotBlockOnDirectPreviewConsumer();
     void deliverBusEngineFrameUpdatesProviderLatestImage();
     void outputSinkEndpointDeliversOnlyWhenStarted();
+    void outputSinkIsInactiveUntilProviderHasConsumer();
     void outputSinkFlushTimesOutWhenVideoSinkCannotDrain();
     void qVideoFrameCarriesPresentationTimeFromFrameMetadata();
     void colorMetadataRoundTripsDecodeToSink();
@@ -308,6 +309,8 @@ void TestQtPreviewSink::outputSinkEndpointDeliversOnlyWhenStarted() {
     assignment.sourceBus = OutputBusId::feed(0);
     assignment.enabled = true;
     QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QObject consumer;
+    provider.addDirectPreviewConsumer(&consumer);
     QVERIFY(sink.submit(busFrame));
     QVERIFY(sink.isActive());
 
@@ -315,6 +318,33 @@ void TestQtPreviewSink::outputSinkEndpointDeliversOnlyWhenStarted() {
     QVERIFY(!image.isNull());
     QCOMPARE(image.width(), 4);
     QCOMPARE(image.height(), 4);
+    provider.removeDirectPreviewConsumer(&consumer);
+}
+
+void TestQtPreviewSink::outputSinkIsInactiveUntilProviderHasConsumer() {
+    FrameProvider provider;
+    QtPreviewOutputSink output(&provider);
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.sourceBus = OutputBusId::pgm();
+    assignment.enabled = true;
+
+    QVERIFY(output.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(!output.isActive());
+
+    QObject consumer;
+    provider.addDirectPreviewConsumer(&consumer);
+    QVERIFY(output.isActive());
+
+    provider.removeDirectPreviewConsumer(&consumer);
+    QVERIFY(!output.isActive());
+
+    QVideoSink videoSink;
+    provider.addVideoSink(&videoSink);
+    QVERIFY(output.isActive());
+
+    provider.removeVideoSink(&videoSink);
+    QVERIFY(!output.isActive());
 }
 
 void TestQtPreviewSink::outputSinkFlushTimesOutWhenVideoSinkCannotDrain() {

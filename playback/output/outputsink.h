@@ -41,6 +41,10 @@ public:
     virtual bool submitAndFlush(const OutputBusFrame& frame, int timeoutMs) {
         return submit(frame) && flush(timeoutMs);
     }
+    virtual bool prewarmReadback(const OutputBusFrame& frame) {
+        (void) frame;
+        return false;
+    }
     virtual void discardPending() {}
     virtual OutputSinkStatus outputStatus() const { return OutputSinkStatus{}; }
     virtual bool needsContinuousCadence() const { return false; }

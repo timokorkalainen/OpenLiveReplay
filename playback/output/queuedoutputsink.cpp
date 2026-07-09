@@ -114,10 +114,29 @@ bool QueuedOutputSink::submitAndFlush(const OutputBusFrame& frame, int timeoutMs
             m_lastSubmitDroppedFrame = false;
             m_queuePressure = false;
             m_delivering = true;
+        } else {
+            const qsizetype droppedQueuedFrames = m_queue.size();
+            for (const QueuedFrame& queued : std::as_const(m_queue))
+                m_droppedFrameIndexes.append(queued.frame.outputFrameIndex);
+            m_queue.clear();
+            if (droppedQueuedFrames > 0) {
+                m_droppedFrames += static_cast<int>(droppedQueuedFrames);
+                constexpr int kMaxTrackedDrops = 4096;
+                while (m_droppedFrameIndexes.size() > kMaxTrackedDrops)
+                    m_droppedFrameIndexes.removeFirst();
+            }
+            ++m_epoch;
+            m_queue.append(QueuedFrame{frame, m_epoch});
+            m_lastQueuedFrameIndex = frame.outputFrameIndex;
+            m_hasLastQueuedFrameIndex = true;
+            m_maxQueueDepth = qMax<qint64>(m_maxQueueDepth, m_queue.size());
+            m_lastSubmitDroppedFrame = droppedQueuedFrames > 0;
+            m_queuePressure = false;
+            m_wake.wakeOne();
         }
     }
 
-    if (useQueuedPath) return IOutputSink::submitAndFlush(frame, timeoutMs);
+    if (useQueuedPath) return flush(timeoutMs);
 
     const bool submitted = m_inner && m_inner->submitAndFlush(frame, timeoutMs);
     {

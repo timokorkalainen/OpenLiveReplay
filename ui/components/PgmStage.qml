@@ -1,10 +1,8 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Layouts
+import QtMultimedia
 import OlrTheme
-// qmllint disable import
-import Recorder.Types
-// qmllint enable import
 
 Item {
     id: root
@@ -113,6 +111,41 @@ Item {
         multiviewBusOutput.provider = root.multiviewProvider
     }
 
+    component PreviewVideoOutput: VideoOutput {
+        id: previewOutput
+        property var provider: null
+        property bool active: true
+        property var attachedProvider: null
+
+        fillMode: VideoOutput.PreserveAspectFit
+
+        function selectedProvider() {
+            return (previewOutput.active && previewOutput.visible && previewOutput.provider)
+                    ? previewOutput.provider : null
+        }
+
+        function updateAttachment() {
+            previewOutput.attachProvider(previewOutput.selectedProvider())
+        }
+
+        function attachProvider(provider) {
+            if (previewOutput.attachedProvider === provider) return
+            if (previewOutput.attachedProvider) {
+                previewOutput.attachedProvider.removeVideoSink(videoSink)
+            }
+            previewOutput.attachedProvider = provider
+            if (previewOutput.attachedProvider) {
+                previewOutput.attachedProvider.addVideoSink(videoSink)
+            }
+        }
+
+        onProviderChanged: updateAttachment()
+        onActiveChanged: updateAttachment()
+        onVisibleChanged: updateAttachment()
+        Component.onCompleted: updateAttachment()
+        Component.onDestruction: attachProvider(null)
+    }
+
     Component.onCompleted: {
         root.selectedIndex = -1
         root.viewMode = "multi"
@@ -170,14 +203,12 @@ Item {
         border.width: 2
         visible: root.viewMode === "single" && root.selectedSourceIndex >= 0 && root.pgmProvider !== null
 
-        // qmllint disable unqualified
-        FramePreviewItem {
+        PreviewVideoOutput {
             id: singleOutput
             anchors.fill: parent
             provider: root.pgmProvider
             active: singleView.visible
         }
-        // qmllint enable unqualified
 
         Rectangle {
             anchors.bottom: parent.bottom
@@ -207,8 +238,7 @@ Item {
         }
     }
 
-    // qmllint disable unqualified
-    FramePreviewItem {
+    PreviewVideoOutput {
         id: multiviewBusOutput
         anchors.fill: parent
         visible: root.viewMode === "multi" && root.multiviewProvider !== null
@@ -216,7 +246,6 @@ Item {
         provider: root.multiviewProvider
         active: multiviewBusOutput.visible
     }
-    // qmllint enable unqualified
 
     GridView {
         id: multiViewGrid

@@ -103,6 +103,17 @@ bool submittedFrameMatchesRequest(const OutputTargetAssignment& assignment,
     return true;
 }
 
+bool endpointMatchesPausedPgmCadence(const OutputEndpoint& endpoint) {
+    return endpoint.assignment.sourceBus == OutputBusId::pgm() &&
+           endpoint.assignment.kind != OutputTargetKind::QtPreview;
+}
+
+int pausedPgmPrewarmOffsetFrames(qint64 outputFrameIndex) {
+    static constexpr int kOffsets[] = {-1, 1, -2, 2};
+    const int slot = int(outputFrameIndex % qint64(std::size(kOffsets)));
+    return kOffsets[slot < 0 ? slot + int(std::size(kOffsets)) : slot];
+}
+
 } // namespace
 
 OutputDispatcher::OutputDispatcher(FrameRate rate, int feedCount, int width, int height,
@@ -130,6 +141,7 @@ void OutputDispatcher::setEndpoints(const QList<OutputEndpoint>& endpoints) {
     }
 
     m_endpoints = endpoints;
+    m_pgmMemo = PgmComposite{};
     m_multiviewMemo = MultiviewComposite{};
     for (auto it = m_stats.targets.begin(); it != m_stats.targets.end(); ++it) {
         it->hasLastIdentity = false;
@@ -187,6 +199,12 @@ OutputDispatchStats OutputDispatcher::dispatchTick(const OutputFrameCache& cache
     return dispatchTickWithReport(cache, state, flushMode).stats;
 }
 
+void OutputDispatcher::advanceClockOnlyTick(const PlaybackStateSnapshot& state) {
+    const qint64 outputFrameIndex = m_nextOutputFrameIndex++;
+    clockedStateForTick(outputFrameIndex, state);
+    m_stats.ticks++;
+}
+
 OutputDispatchReport OutputDispatcher::dispatchTickWithReport(
     const OutputFrameCache& cache, const PlaybackStateSnapshot& state,
     OutputDispatchFlushMode flushMode, const OutputDispatchRequest& request) {
@@ -202,7 +220,13 @@ OutputDispatchReport OutputDispatcher::dispatchTickWithReport(
 
     QList<const OutputEndpoint*> endpointOrder;
     endpointOrder.reserve(m_endpoints.size());
-    if (flushMode == OutputDispatchFlushMode::PausedImmediate) {
+    if (flushMode == OutputDispatchFlushMode::PausedPgmCadence) {
+        for (const OutputEndpoint& endpoint : m_endpoints) {
+            if (endpointMatchesPausedPgmCadence(endpoint) &&
+                endpointMatchesRequest(endpoint, request))
+                endpointOrder.append(&endpoint);
+        }
+    } else if (flushMode == OutputDispatchFlushMode::PausedImmediate) {
         for (const OutputEndpoint& endpoint : m_endpoints) {
             if (endpoint.assignment.kind != OutputTargetKind::QtPreview &&
                 endpointMatchesRequest(endpoint, request))
@@ -219,12 +243,15 @@ OutputDispatchReport OutputDispatcher::dispatchTickWithReport(
         }
     }
 
+    if (flushMode == OutputDispatchFlushMode::PausedPgmCadence && !tickState.playing)
+        prewarmPausedPgmCadenceReadback(cache, tickState, outputFrameIndex, endpointOrder);
+
     for (const OutputEndpoint* endpointPtr : endpointOrder) {
         const OutputEndpoint& endpoint = *endpointPtr;
         if (!endpoint.assignment.enabled || !endpoint.sink || !endpoint.sink->isActive()) continue;
         const bool isQtPreview = endpoint.assignment.kind == OutputTargetKind::QtPreview;
         const bool pausedDefaultTick =
-            !tickState.playing && flushMode != OutputDispatchFlushMode::PausedImmediate;
+            !tickState.playing && flushMode == OutputDispatchFlushMode::Default;
         if (pausedDefaultTick && !isQtPreview) {
             if (traceLatency) {
                 qInfo().noquote()
@@ -286,9 +313,13 @@ OutputDispatchReport OutputDispatcher::dispatchTickWithReport(
         qint64 readbackDrops = 0;
         const bool hasReadbackQueue = endpoint.sink->readbackStats(readbackDepth, readbackDrops);
         Q_UNUSED(readbackDrops);
-        const bool pausedNdiDuplicateMaySkip =
-            !tickState.playing && endpoint.assignment.kind == OutputTargetKind::Ndi &&
-            sinkNeedsContinuousCadence && (!hasReadbackQueue || readbackDepth == 0);
+        const bool pausedPgmCadenceExternal =
+            !tickState.playing && flushMode == OutputDispatchFlushMode::PausedPgmCadence &&
+            !isQtPreview;
+        const bool pausedNdiDuplicateMaySkip = !pausedPgmCadenceExternal && !tickState.playing &&
+                                               endpoint.assignment.kind == OutputTargetKind::Ndi &&
+                                               sinkNeedsContinuousCadence &&
+                                               (!hasReadbackQueue || readbackDepth == 0);
         const bool pausedImmediateExternal =
             !tickState.playing && flushMode == OutputDispatchFlushMode::PausedImmediate &&
             !isQtPreview;
@@ -306,7 +337,7 @@ OutputDispatchReport OutputDispatcher::dispatchTickWithReport(
 
         const bool shouldFlushPausedPreview =
             isQtPreview && flushMode == OutputDispatchFlushMode::PausedImmediate &&
-            pausedQtPreviewFlushEnabled();
+            request.lane != OutputDispatchLane::PgmCritical && pausedQtPreviewFlushEnabled();
         const bool shouldFlushPausedImmediate =
             flushMode == OutputDispatchFlushMode::PausedImmediate && !isQtPreview;
         const bool shouldFlush =
@@ -445,9 +476,9 @@ OutputBusFrame OutputDispatcher::renderBus(OutputBusId bus, qint64 outputFrameIn
     case OutputBusKind::Multiview:
         return engine.renderMultiview(outputFrameIndex, state, cache, &m_multiviewMemo);
     case OutputBusKind::Pgm:
-        return engine.renderPgm(outputFrameIndex, state, cache);
+        return engine.renderPgm(outputFrameIndex, state, cache, &m_pgmMemo);
     }
-    return engine.renderPgm(outputFrameIndex, state, cache);
+    return engine.renderPgm(outputFrameIndex, state, cache, &m_pgmMemo);
 }
 
 void OutputDispatcher::countFrameHealth(const OutputBusFrame& frame) {
@@ -482,6 +513,38 @@ void OutputDispatcher::countTargetAttempt(const OutputTargetAssignment& assignme
         }
         stats.lastIdentity = frame.identity;
         stats.hasLastIdentity = true;
+    }
+}
+
+void OutputDispatcher::prewarmPausedPgmCadenceReadback(
+    const OutputFrameCache& cache, const PlaybackStateSnapshot& state, qint64 outputFrameIndex,
+    const QList<const OutputEndpoint*>& endpoints) {
+    if (!m_rate.isValid()) return;
+    const int offsetFrames = pausedPgmPrewarmOffsetFrames(outputFrameIndex);
+    const qint64 offsetMs = m_rate.frameIndexToMs(qAbs(offsetFrames));
+    if (offsetMs <= 0) return;
+
+    PlaybackStateSnapshot prewarmState = state;
+    prewarmState.playing = false;
+    prewarmState.playheadMs = offsetFrames < 0 ? qMax<qint64>(0, state.playheadMs - offsetMs)
+                                               : state.playheadMs + offsetMs;
+    if (prewarmState.playheadMs == state.playheadMs) return;
+
+    OutputBusEngine engine(m_rate, m_feedCount, m_width, m_height);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    engine.setGpuCompositor(m_gpuCompositor);
+#endif
+    PgmComposite prewarmMemo;
+    const OutputBusFrame frame =
+        engine.renderPgm(outputFrameIndex, prewarmState, cache, &prewarmMemo);
+    if (frame.video.metadata().key.isPlaceholder) return;
+
+    for (const OutputEndpoint* endpoint : endpoints) {
+        if (!endpoint || !endpoint->assignment.enabled || !endpoint->sink ||
+            !endpoint->sink->isActive())
+            continue;
+        if (!endpointMatchesPausedPgmCadence(*endpoint)) continue;
+        endpoint->sink->prewarmReadback(frame);
     }
 }
 

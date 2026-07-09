@@ -72,6 +72,9 @@ private:
     OutputRuntimeSnapshot snapshot() const;
     OutputDispatchStats dispatchDueTicksNs(qint64 wallNowNs);
     OutputDispatchStats statsLocked() const;
+    OutputDispatchStats cachedStatsLocked() const;
+    OutputDispatchStats withRuntimeCountersLocked(OutputDispatchStats stats) const;
+    void refreshCachedStatsLocked() const;
     void recordDispatchTiming(qint64 outputFrameIndex, qint64 scheduledNs, qint64 wallNowNs);
     bool dispatchActiveOnCurrentThreadLocked() const;
     void applyPendingDispatchMutationsLocked();
@@ -82,6 +85,7 @@ private:
     mutable QMutex m_mutex;
     mutable QWaitCondition m_dispatchIdle;
     OutputDispatcher m_dispatcher;
+    mutable OutputDispatchStats m_cachedStats;
     SnapshotProvider m_snapshotProvider;
     qint64 m_wallStartNs = -1;
     bool m_stopRequested = false;

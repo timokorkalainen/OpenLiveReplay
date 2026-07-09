@@ -36,6 +36,7 @@ public:
     Q_INVOKABLE void removeDirectPreviewConsumer(QObject* consumer);
     void markDirectPreviewConsumerPainted(QObject* consumer, quint64 serial);
     bool flushDirectPreviewConsumers(int timeoutMs, quint64 minSerial = 0) const;
+    bool hasPreviewConsumers() const;
 
     // Retrieve the latest frame as an image (for screenshots)
     QImage latestImage() const;

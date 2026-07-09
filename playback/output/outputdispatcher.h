@@ -71,6 +71,7 @@ struct OutputRuntimeDispatchStats {
 enum class OutputDispatchFlushMode {
     Default,
     PausedImmediate,
+    PausedPgmCadence,
 };
 
 enum class OutputDispatchLane {
@@ -157,6 +158,7 @@ public:
     OutputDispatchStats
     dispatchTick(const OutputFrameCache& cache, const PlaybackStateSnapshot& state,
                  OutputDispatchFlushMode flushMode = OutputDispatchFlushMode::Default);
+    void advanceClockOnlyTick(const PlaybackStateSnapshot& state);
     OutputDispatchReport
     dispatchTickWithReport(const OutputFrameCache& cache, const PlaybackStateSnapshot& state,
                            OutputDispatchFlushMode flushMode = OutputDispatchFlushMode::Default,
@@ -178,6 +180,10 @@ private:
     void countTargetStartFailure(const OutputTargetAssignment& assignment);
     void countTargetAttempt(const OutputTargetAssignment& assignment, const OutputBusFrame& frame,
                             bool submitted);
+    void prewarmPausedPgmCadenceReadback(const OutputFrameCache& cache,
+                                         const PlaybackStateSnapshot& state,
+                                         qint64 outputFrameIndex,
+                                         const QList<const OutputEndpoint*>& endpoints);
     void collectReadbackStats(OutputDispatchStats& stats) const;
 
     FrameRate m_rate;
@@ -189,6 +195,7 @@ private:
     bool m_havePlayEpoch = false;
     PlaybackStateSnapshot m_playEpoch;
     OutputDispatchStats m_stats;
+    PgmComposite m_pgmMemo;
     MultiviewComposite m_multiviewMemo;
     std::shared_ptr<SharedGpuReadbackCache> m_sharedReadbacks;
     std::shared_ptr<GpuRhiContext> m_gpuRhi;

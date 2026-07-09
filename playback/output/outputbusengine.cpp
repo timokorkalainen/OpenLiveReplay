@@ -3,6 +3,7 @@
 #ifdef OLR_GPU_PIPELINE_BUILD
 #include "playback/gpu/gpucompositor.h"
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpusurface.h"
 #endif
 #include "playback/output/colormetadatapolicy.h"
 #include "playback/output/yuv420pcompositor.h"
@@ -59,6 +60,10 @@ std::optional<FrameHandle> freshVideoFrameAtOrJustAhead(const OutputFrameCache& 
     if (delta >= 0 && delta <= qMax<qint64>(0, aheadToleranceMs)) {
         if (!prior.has_value()) return next;
         if (OutputFrameSelection::isTimestampRoundingFuture(delta)) return next;
+        const qint64 priorAgeMs = playheadMs - prior->metadata().key.ptsMs;
+        const qint64 maxLowerCadenceHoldMs =
+            qMax<qint64>(200, qMax<qint64>(1, aheadToleranceMs) * 6);
+        if (priorAgeMs > maxLowerCadenceHoldMs) return next;
     }
 
     return prior;
@@ -165,9 +170,9 @@ OutputBusFrame OutputBusEngine::renderFeed(int feedIndex, qint64 outputFrameInde
 
 OutputBusFrame OutputBusEngine::renderPgm(qint64 outputFrameIndex,
                                           const PlaybackStateSnapshot& state,
-                                          const OutputFrameCache& cache) const {
+                                          const OutputFrameCache& cache, PgmComposite* memo) const {
     return renderSingleSource(OutputBusId::pgm(), state.selectedFeedIndex, outputFrameIndex, state,
-                              cache, true);
+                              cache, true, memo);
 }
 
 OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
@@ -298,8 +303,8 @@ OutputBusFrame OutputBusEngine::renderMultiview(qint64 outputFrameIndex,
 OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedIndex,
                                                    qint64 outputFrameIndex,
                                                    const PlaybackStateSnapshot& state,
-                                                   const OutputFrameCache& cache,
-                                                   bool allowAudio) const {
+                                                   const OutputFrameCache& cache, bool allowAudio,
+                                                   PgmComposite* pgmMemo) const {
     OutputBusFrame out;
     out.bus = bus;
     out.outputFrameIndex = outputFrameIndex;
@@ -316,9 +321,56 @@ OutputBusFrame OutputBusEngine::renderSingleSource(OutputBusId bus, int feedInde
         if (bus == OutputBusId::pgm() && m_gpuCompositor && m_gpuCompositor->isValid() &&
             gpuPipelineEnabled()) {
             const FrameMetadata sourceMeta = out.video.metadata();
-            FrameHandle gpu = m_gpuCompositor->composePgmForGeneration(
-                out.video, m_width, m_height, sourceMeta.color,
-                GpuCompositor::ScaleQuality::Bilinear, state.gpuGeneration);
+            QVector<qint64> sourceKeys;
+            sourceKeys.reserve(14);
+            sourceKeys.append(qint64(state.gpuGeneration));
+            sourceKeys.append(sourceMeta.key.feedIndex);
+            sourceKeys.append(sourceMeta.key.ptsMs);
+            sourceKeys.append(sourceMeta.decodedSequence);
+            sourceKeys.append(sourceMeta.key.isPlaceholder ? 1 : 0);
+            sourceKeys.append(int(sourceMeta.key.format));
+            sourceKeys.append(sourceMeta.key.width);
+            sourceKeys.append(sourceMeta.key.height);
+            sourceKeys.append(m_width);
+            sourceKeys.append(m_height);
+            sourceKeys.append(int(sourceMeta.color.matrix));
+            sourceKeys.append(int(sourceMeta.color.primaries));
+            sourceKeys.append(int(sourceMeta.color.transfer));
+            sourceKeys.append(int(sourceMeta.color.range));
+
+            const IFrameData* sourceData = out.video.data();
+            const GpuSurface* sourceSurface = sourceData ? sourceData->gpuSurface() : nullptr;
+            const uint64_t pendingFenceValue =
+                sourceSurface ? sourceSurface->pendingFenceValue() : uint64_t(0);
+            const bool sourceOrderingKnown =
+                pendingFenceValue == 0 || (sourceData && sourceData->gpuFence());
+            const bool canReuseSource = out.video.isGpuBacked() && out.video.isPresentable() &&
+                                        sourceMeta.gpuGeneration == state.gpuGeneration &&
+                                        !sourceMeta.key.isPlaceholder &&
+                                        sourceMeta.key.width == m_width &&
+                                        sourceMeta.key.height == m_height && sourceOrderingKnown;
+
+            FrameHandle gpu;
+            if (canReuseSource) {
+                gpu = out.video;
+                if (pgmMemo) {
+                    pgmMemo->valid = true;
+                    pgmMemo->sourceKeys = sourceKeys;
+                    pgmMemo->video = gpu;
+                }
+            } else if (pgmMemo && pgmMemo->valid && pgmMemo->sourceKeys == sourceKeys &&
+                       !pgmMemo->video.isNull()) {
+                gpu = pgmMemo->video;
+            } else {
+                gpu = m_gpuCompositor->composePgmForGeneration(
+                    out.video, m_width, m_height, sourceMeta.color,
+                    GpuCompositor::ScaleQuality::Bilinear, state.gpuGeneration);
+                if (!gpu.isNull() && pgmMemo) {
+                    pgmMemo->valid = true;
+                    pgmMemo->sourceKeys = sourceKeys;
+                    pgmMemo->video = gpu;
+                }
+            }
             if (!gpu.isNull()) {
                 gpu.metadata().key.feedIndex = sourceMeta.key.feedIndex;
                 gpu.metadata().key.ptsMs = sourceMeta.key.ptsMs;

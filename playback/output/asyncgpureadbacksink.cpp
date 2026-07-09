@@ -192,8 +192,7 @@ bool AsyncGpuReadbackSink::submit(const OutputBusFrame& frame) {
                 m_ring.pushAndTakeReady(frame, fenceValue, std::move(producerFence), m_cpuFormat);
         }
         if (ready.ready) {
-            if (m_sharedReadbacks) m_sharedReadbacks->retain(ready.frame, ready.format);
-            m_jobs.append(QueuedReadbackJob{std::move(ready), m_epoch});
+            queueReadyReadbackJobLocked(std::move(ready));
             m_wake.notify_one();
             return true;
         }
@@ -446,6 +445,47 @@ bool AsyncGpuReadbackSink::submitGpuFrameAndFlush(const OutputBusFrame& frame, i
     return ok;
 }
 
+bool AsyncGpuReadbackSink::prewarmReadback(const OutputBusFrame& frame) {
+    if (!m_inner || !m_sharedReadbacks) return false;
+    const bool gpuRuntimeEnabled =
+        m_readbackEnabled.load(std::memory_order_acquire) && gpuPipelineEnabled();
+    if (!gpuRuntimeEnabled || !frame.video.isGpuBacked()) return false;
+
+    CpuPlanes cached;
+    if (m_sharedReadbacks->find(frame, m_cpuFormat, &cached)) return cached.isValid();
+
+    uint64_t fenceValue = 0;
+    std::shared_ptr<GpuFence> producerFence = m_renderFence;
+    bool hasExplicitProducerFence = false;
+    if (const IFrameData* data = frame.video.data()) {
+        if (GpuSurface* surface = data->gpuSurface()) fenceValue = surface->pendingFenceValue();
+        if (std::shared_ptr<GpuFence> frameFence = data->gpuFence()) {
+            producerFence = std::move(frameFence);
+            hasExplicitProducerFence = true;
+        }
+    }
+    if (fenceValue == 0 && producerFence) fenceValue = producerFence->completedValue();
+    if (fenceValue == 0 && !hasExplicitProducerFence) return false;
+    if (producerFence && fenceValue != 0 && producerFence->completedValue() < fenceValue)
+        return false;
+
+    RingReadbackJob job;
+    job.ready = true;
+    job.frame = frame;
+    job.format = m_cpuFormat;
+
+    {
+        std::lock_guard<std::mutex> locker(m_mutex);
+        if (!m_active.load(std::memory_order_acquire) ||
+            m_stopRequested.load(std::memory_order_acquire))
+            return false;
+        if (m_readbackInFlight || !m_jobs.isEmpty() || m_ring.occupancy() > 0) return false;
+        queueReadyReadbackJobLocked(std::move(job), false);
+        m_wake.notify_one();
+    }
+    return true;
+}
+
 bool AsyncGpuReadbackSink::flush(int timeoutMs) {
     return flushReadbacks(timeoutMs);
 }
@@ -484,6 +524,7 @@ bool AsyncGpuReadbackSink::flushReadbacks(int timeoutMs) {
         RingReadyFrame ready = GpuReadbackRing::readBack(job, m_sharedReadbacks, [this]() {
             return m_cancelReadbacks.load(std::memory_order_acquire);
         });
+        if (m_sharedReadbacks && job.ready) m_sharedReadbacks->release(job.frame, job.format);
 
         OutputBusFrame frameToDeliver;
         bool deliver = false;
@@ -620,13 +661,24 @@ void AsyncGpuReadbackSink::workerLoop() {
                 m_readbackInFlight = false;
                 ++m_asyncReadbackDrops;
                 if (m_capability == SinkGpuCapability::NeedsContinuousCadence &&
-                    m_hasLastDelivered) {
+                    m_hasLastDelivered && queued.deliverToInner) {
                     failedCadenceFrame = m_lastDelivered;
                     submitFailedCadenceFrame = true;
                 }
                 m_wake.notify_all();
                 if (!submitFailedCadenceFrame) continue;
             } else if (!ready.ready) {
+                m_readbackInFlight = false;
+                m_wake.notify_all();
+                continue;
+            }
+            if (usesLatestOnlyPreviewQueue() && !m_jobs.isEmpty()) {
+                m_readbackInFlight = false;
+                ++m_asyncReadbackDrops;
+                m_wake.notify_all();
+                continue;
+            }
+            if (!queued.deliverToInner) {
                 m_readbackInFlight = false;
                 m_wake.notify_all();
                 continue;
@@ -681,10 +733,30 @@ void AsyncGpuReadbackSink::rememberDeliveredLocked(const OutputBusFrame& frame) 
     m_needsReadbackCadence.store(false, std::memory_order_release);
 }
 
+bool AsyncGpuReadbackSink::usesLatestOnlyPreviewQueue() const {
+    return m_kind == OutputTargetKind::QtPreview;
+}
+
+void AsyncGpuReadbackSink::releaseQueuedReadbackJobLocked(const QueuedReadbackJob& queued) {
+    if (m_sharedReadbacks) m_sharedReadbacks->release(queued.job.frame, queued.job.format);
+}
+
+void AsyncGpuReadbackSink::queueReadyReadbackJobLocked(RingReadbackJob&& ready,
+                                                       bool deliverToInner) {
+    if (usesLatestOnlyPreviewQueue()) {
+        while (!m_jobs.isEmpty()) {
+            releaseQueuedReadbackJobLocked(m_jobs.front());
+            m_jobs.removeFirst();
+            ++m_asyncReadbackDrops;
+        }
+    }
+    m_jobs.append(QueuedReadbackJob{std::move(ready), m_epoch, deliverToInner});
+}
+
 void AsyncGpuReadbackSink::clearPendingReadbacksLocked() {
     if (m_sharedReadbacks) {
         for (const QueuedReadbackJob& queued : std::as_const(m_jobs)) {
-            m_sharedReadbacks->release(queued.job.frame, queued.job.format);
+            releaseQueuedReadbackJobLocked(queued);
         }
     }
     m_jobs.clear();

@@ -287,6 +287,25 @@ bool FrameProvider::flushDirectPreviewConsumers(int timeoutMs, quint64 minSerial
     return true;
 }
 
+bool FrameProvider::hasPreviewConsumers() const {
+    {
+        QMutexLocker locker(&m_sinkMutex);
+        for (const auto& sink : m_sinks) {
+            if (sink) return true;
+        }
+    }
+
+    {
+        QMutexLocker locker(&m_directPreviewMutex);
+        for (auto it = m_directPreviewConsumers.constBegin();
+             it != m_directPreviewConsumers.constEnd(); ++it) {
+            if (it.key()) return true;
+        }
+    }
+
+    return false;
+}
+
 QImage FrameProvider::latestImage() const {
     return latestImage(nullptr);
 }

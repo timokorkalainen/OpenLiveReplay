@@ -86,7 +86,7 @@ public:
         return const_cast<NdiDynamicSenderBackend*>(this)->ensureLoaded();
     }
 
-    bool createSender(const QString& senderName, FrameRate rate) override {
+    bool createSender(const QString& senderName, FrameRate rate, Clocking clocking) override {
         destroySender();
         if (!rate.isValid() || senderName.isEmpty() || !ensureLoaded()) return false;
 
@@ -94,8 +94,8 @@ public:
         NDIlib_send_create_t create;
         create.p_ndi_name = m_senderNameUtf8.constData();
         create.p_groups = nullptr;
-        create.clock_video = false;
-        create.clock_audio = false;
+        create.clock_video = clocking.clockVideo;
+        create.clock_audio = clocking.clockAudio;
         m_sender = m_sendCreate(&create);
         m_rate = rate;
         return m_sender != nullptr;
@@ -326,7 +326,8 @@ bool NdiOutputSink::start(const OutputTargetAssignment& assignment, FrameRate ra
         return false;
     }
 
-    if (!m_backend->createSender(senderName, rate)) {
+    const NdiSenderClocking clocking{false, false};
+    if (!m_backend->createSender(senderName, rate, clocking)) {
         setStatus(NdiOutputState::CreateFailed,
                   QStringLiteral("failed to create NDI sender '%1'").arg(senderName));
         return false;

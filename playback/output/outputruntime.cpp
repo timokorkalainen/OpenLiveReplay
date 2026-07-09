@@ -42,6 +42,7 @@ void OutputRuntime::setEndpoints(const QList<OutputEndpoint>& endpoints) {
     waitForDispatchIdleLocked();
     m_dispatcher.setEndpoints(endpoints);
     ++m_configGeneration;
+    refreshCachedStatsLocked();
     m_reconfiguring = false;
     m_dispatchIdle.wakeAll();
 }
@@ -55,6 +56,7 @@ void OutputRuntime::setIdentitySkip(bool enabled) {
     }
     waitForDispatchIdleLocked();
     m_dispatcher.setIdentitySkip(enabled);
+    refreshCachedStatsLocked();
 }
 
 void OutputRuntime::startRuntime() {
@@ -70,6 +72,7 @@ void OutputRuntime::startRuntime() {
         m_stopRequested = false;
         m_wallStartNs = -1;
         m_dispatcher.resetFrameIndex();
+        refreshCachedStatsLocked();
     }
     if (!isRunning()) start();
 }
@@ -91,6 +94,7 @@ void OutputRuntime::stopRuntime() {
         QMutexLocker locker(&m_mutex);
         waitForDispatchIdleLocked();
         m_dispatcher.setEndpoints({});
+        refreshCachedStatsLocked();
     }
 }
 
@@ -104,6 +108,7 @@ void OutputRuntime::resetFrameIndex(qint64 nextOutputFrameIndex) {
     waitForDispatchIdleLocked();
     m_dispatcher.resetFrameIndex(nextOutputFrameIndex);
     m_wallStartNs = -1;
+    refreshCachedStatsLocked();
 }
 
 void OutputRuntime::resetPlayEpoch() {
@@ -117,6 +122,7 @@ void OutputRuntime::resetPlayEpoch() {
     }
     waitForDispatchIdleLocked();
     m_dispatcher.resetPlayEpoch();
+    refreshCachedStatsLocked();
 }
 
 void OutputRuntime::incrementFenceWaitStalls() {
@@ -127,12 +133,14 @@ void OutputRuntime::incrementFenceWaitStalls() {
     }
     waitForDispatchIdleLocked();
     m_dispatcher.incrementFenceWaitStalls();
+    refreshCachedStatsLocked();
 }
 
 void OutputRuntime::setGpuRhiContext(std::shared_ptr<GpuRhiContext> gpuRhi) {
     QMutexLocker locker(&m_mutex);
     waitForDispatchIdleLocked();
     m_dispatcher.setGpuRhiContext(std::move(gpuRhi));
+    refreshCachedStatsLocked();
 }
 
 void OutputRuntime::recordGpuBudget(const GpuBudgetSnapshot& snapshot) {
@@ -248,15 +256,18 @@ OutputRuntime::dispatchImmediateWithReport(const OutputDispatchRequest& request)
                        .arg(dispatchNs)
                        .arg(traceTimer.nsecsElapsed());
         }
-        report.stats = statsLocked();
+        refreshCachedStatsLocked();
+        report.stats = cachedStatsLocked();
         return report;
     }
 }
 
 OutputDispatchStats OutputRuntime::stats() const {
     QMutexLocker locker(&m_mutex);
-    if (!dispatchActiveOnCurrentThreadLocked()) waitForDispatchIdleLocked();
-    return statsLocked();
+    if (m_dispatchActive && !dispatchActiveOnCurrentThreadLocked()) return cachedStatsLocked();
+    waitForDispatchIdleLocked();
+    refreshCachedStatsLocked();
+    return cachedStatsLocked();
 }
 
 std::shared_ptr<SharedGpuReadbackCache> OutputRuntime::sharedGpuReadbacks() const {
@@ -349,6 +360,7 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
         }
 
         OutputRuntimeSnapshot current = snapshot();
+
         {
             QMutexLocker locker(&m_mutex);
             waitForDispatchIdleLocked();
@@ -362,7 +374,10 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             m_dispatchThreadId = QThread::currentThreadId();
         }
 
-        m_dispatcher.dispatchTick(current.cache, current.state);
+        const OutputDispatchFlushMode flushMode = current.state.playing
+                                                      ? OutputDispatchFlushMode::Default
+                                                      : OutputDispatchFlushMode::PausedPgmCadence;
+        m_dispatcher.dispatchTick(current.cache, current.state, flushMode);
         recordDispatchTiming(frameIndex, scheduledNs, elapsedNs);
 
         {
@@ -370,6 +385,7 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             applyPendingDispatchMutationsLocked();
             m_dispatchActive = false;
             m_dispatchThreadId = nullptr;
+            refreshCachedStatsLocked();
             m_dispatchIdle.wakeAll();
         }
         dispatched++;
@@ -391,11 +407,19 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             m_dispatcher.setRuntimeStats(runtime);
         }
     }
-    return statsLocked();
+    refreshCachedStatsLocked();
+    return cachedStatsLocked();
 }
 
 OutputDispatchStats OutputRuntime::statsLocked() const {
-    OutputDispatchStats stats = m_dispatcher.stats();
+    return withRuntimeCountersLocked(m_dispatcher.stats());
+}
+
+OutputDispatchStats OutputRuntime::cachedStatsLocked() const {
+    return withRuntimeCountersLocked(m_cachedStats);
+}
+
+OutputDispatchStats OutputRuntime::withRuntimeCountersLocked(OutputDispatchStats stats) const {
     stats.gpuVramBytes = m_gpuVramBytes;
     stats.gpuBudgetBytes = m_gpuBudgetBytes;
     stats.gpuGatedLiveBytes = m_gpuGatedLiveBytes;
@@ -404,6 +428,10 @@ OutputDispatchStats OutputRuntime::statsLocked() const {
     stats.gpuOomDegrades = m_gpuOomDegrades;
     stats.gpuDeviceLossEvents = m_gpuDeviceLossEvents.load(std::memory_order_acquire);
     return stats;
+}
+
+void OutputRuntime::refreshCachedStatsLocked() const {
+    m_cachedStats = statsLocked();
 }
 
 void OutputRuntime::recordDispatchTiming(qint64 outputFrameIndex, qint64 scheduledNs,

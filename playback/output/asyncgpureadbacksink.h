@@ -31,6 +31,7 @@ public:
     bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
     bool submitAndFlush(const OutputBusFrame& frame, int timeoutMs) override;
+    bool prewarmReadback(const OutputBusFrame& frame) override;
     bool flush(int timeoutMs) override;
     void discardPending() override;
     OutputSinkStatus outputStatus() const override;
@@ -46,6 +47,7 @@ private:
     struct QueuedReadbackJob {
         RingReadbackJob job;
         uint64_t epoch = 0;
+        bool deliverToInner = true;
     };
 
     void workerLoop();
@@ -53,6 +55,9 @@ private:
     bool flushReadbacks(int timeoutMs);
     void rememberDelivered(const OutputBusFrame& frame);
     void rememberDeliveredLocked(const OutputBusFrame& frame);
+    bool usesLatestOnlyPreviewQueue() const;
+    void releaseQueuedReadbackJobLocked(const QueuedReadbackJob& queued);
+    void queueReadyReadbackJobLocked(RingReadbackJob&& ready, bool deliverToInner = true);
     void clearPendingReadbacksLocked();
 
     std::unique_ptr<IOutputSink> m_inner;

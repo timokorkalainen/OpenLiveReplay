@@ -41,11 +41,18 @@ class INdiSenderBackend {
 public:
     virtual ~INdiSenderBackend() = default;
 
+    struct Clocking {
+        bool clockVideo = true;
+        bool clockAudio = false;
+    };
+
     virtual bool isRuntimeAvailable() const = 0;
-    virtual bool createSender(const QString& senderName, FrameRate rate) = 0;
+    virtual bool createSender(const QString& senderName, FrameRate rate, Clocking clocking) = 0;
     virtual void destroySender() = 0;
     virtual bool sendFrame(const OutputBusFrame& frame) = 0;
 };
+
+using NdiSenderClocking = INdiSenderBackend::Clocking;
 
 enum class NdiOutputState {
     Stopped,

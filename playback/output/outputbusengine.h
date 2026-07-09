@@ -89,6 +89,12 @@ struct MultiviewComposite {
     FrameHandle video;
 };
 
+struct PgmComposite {
+    bool valid = false;
+    QVector<qint64> sourceKeys{};
+    FrameHandle video;
+};
+
 class OutputBusEngine {
 public:
     OutputBusEngine(FrameRate rate, int feedCount, int width, int height);
@@ -97,7 +103,7 @@ public:
                               const PlaybackStateSnapshot& state,
                               const OutputFrameCache& cache) const;
     OutputBusFrame renderPgm(qint64 outputFrameIndex, const PlaybackStateSnapshot& state,
-                             const OutputFrameCache& cache) const;
+                             const OutputFrameCache& cache, PgmComposite* memo = nullptr) const;
     OutputBusFrame renderMultiview(qint64 outputFrameIndex, const PlaybackStateSnapshot& state,
                                    const OutputFrameCache& cache,
                                    MultiviewComposite* memo = nullptr) const;
@@ -108,7 +114,8 @@ public:
 private:
     OutputBusFrame renderSingleSource(OutputBusId bus, int feedIndex, qint64 outputFrameIndex,
                                       const PlaybackStateSnapshot& state,
-                                      const OutputFrameCache& cache, bool allowAudio) const;
+                                      const OutputFrameCache& cache, bool allowAudio,
+                                      PgmComposite* pgmMemo = nullptr) const;
     MediaAudioFrame renderAudioForFeed(int feedIndex, qint64 outputFrameIndex,
                                        const PlaybackStateSnapshot& state,
                                        const OutputFrameCache& cache, bool allowAudio) const;

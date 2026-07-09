@@ -15,7 +15,9 @@ namespace {
 
 class RecordingSink final : public IOutputSink {
 public:
-    OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+    explicit RecordingSink(OutputTargetKind kind = OutputTargetKind::Ndi) : m_kind(kind) {}
+
+    OutputTargetKind kind() const override { return m_kind; }
 
     bool start(const OutputTargetAssignment&, FrameRate) override {
         active.store(true, std::memory_order_release);
@@ -52,6 +54,7 @@ public:
     int discardCount() const { return discardCalls.load(std::memory_order_acquire); }
 
 private:
+    OutputTargetKind m_kind = OutputTargetKind::Ndi;
     mutable std::mutex m_mutex;
     QVector<OutputBusFrame> delivered;
     QVector<bool> gpuBackedAtSink;
@@ -329,7 +332,9 @@ private slots:
     void unfencedGpuFrameIsDropped();
     void gpuRingDeliversAudioWithItsVideoFrame();
     void sharedReadbackCacheAvoidsDuplicateReadToCpu();
+    void prewarmReadbackWarmsSharedCacheWithoutSubmittingInner();
     void sharedReadbackCacheKeepsInFlightEntryAcrossTickClear();
+    void sharedReadbackCacheReusesReadyPayloadAcrossTickClear();
     void stopReturnsWhileWaitingForSharedReadbackOwner();
     void sharedReadbackCacheSeparatesBusSurfaces();
     void sharedReadbackCacheSeparatesGpuGenerations();
@@ -347,6 +352,7 @@ private slots:
     void gpuReadbackDoesNotBlockSubmitTick();
     void continuousCadenceResendsLastFrameWhileFencePending();
     void readyReadbackDoesNotDoubleSubmitCadence();
+    void qtPreviewKeepsOnlyLatestQueuedReadback();
     void cpuClearFrameWithZeroGenerationDropsPendingGpuReadbacks();
     void invalidReadbackCountsAsDropAfterCadenceResend();
 };
@@ -470,6 +476,33 @@ void TestAsyncGpuReadbackSink::sharedReadbackCacheAvoidsDuplicateReadToCpu() {
     QVERIFY(!second->deliveredAt(0).video.isGpuBacked());
 }
 
+void TestAsyncGpuReadbackSink::prewarmReadbackWarmsSharedCacheWithoutSubmittingInner() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto sharedReadbacks = std::make_shared<SharedGpuReadbackCache>();
+    auto data = std::make_shared<CountingGpuFrameData>(51);
+    const OutputBusFrame frame = gpuFrame(11, data);
+
+    auto inner = std::make_unique<RecordingSink>();
+    RecordingSink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 1, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::NeedsContinuousCadence, GpuFence::create(),
+                              sharedReadbacks);
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    QVERIFY(sink.prewarmReadback(frame));
+
+    QTRY_COMPARE_WITH_TIMEOUT(data->readCount(), 1, 1000);
+    QCOMPARE(observed->deliveredCount(), 0);
+    CpuPlanes warmed;
+    QVERIFY(sharedReadbacks->find(frame, FramePixelFormat::Yuv420p, &warmed));
+    QVERIFY(warmed.isValid());
+
+    QVERIFY(sink.submitAndFlush(frame, 1000));
+    QCOMPARE(data->readCount(), 1);
+    QCOMPARE(observed->deliveredCount(), 1);
+    QVERIFY(!observed->deliveredAt(0).video.isGpuBacked());
+}
+
 void TestAsyncGpuReadbackSink::sharedReadbackCacheKeepsInFlightEntryAcrossTickClear() {
     qputenv("OLR_GPU_PIPELINE", "1");
     auto sharedReadbacks = std::make_shared<SharedGpuReadbackCache>();
@@ -502,6 +535,44 @@ void TestAsyncGpuReadbackSink::sharedReadbackCacheKeepsInFlightEntryAcrossTickCl
     QTRY_COMPARE_WITH_TIMEOUT(first->deliveredCount(), 1, 1000);
     QTRY_COMPARE_WITH_TIMEOUT(second->deliveredCount(), 1, 1000);
     QCOMPARE(readStarts, 1);
+    QCOMPARE(data->readCount(), 1);
+}
+
+void TestAsyncGpuReadbackSink::sharedReadbackCacheReusesReadyPayloadAcrossTickClear() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    SharedGpuReadbackCache cache;
+    auto data = std::make_shared<CountingGpuFrameData>(49);
+
+    OutputBusFrame first = gpuFrame(100, data);
+    first.bus = OutputBusId::pgm();
+    first.video.metadata().key.feedIndex = 2;
+    first.video.metadata().key.ptsMs = 5000;
+    first.video.metadata().decodedSequence = 77;
+    first.identity.bus = first.bus;
+    first.identity.sourceFeedIndex = 2;
+    first.identity.sourcePtsMs = 5000;
+    first.identity.sourceDecodedSequence = 77;
+    first.identity.videoHash = 0x12345678u;
+    first.identity.videoGpuGeneration = first.video.metadata().gpuGeneration;
+
+    OutputBusFrame repeated = first;
+    repeated.outputFrameIndex = 118;
+    repeated.sampledPlayheadMs = first.sampledPlayheadMs + 288;
+    repeated.video.metadata().outputFrameIndex = repeated.outputFrameIndex;
+    repeated.video.metadata().sampledPlayheadMs = repeated.sampledPlayheadMs;
+    repeated.identity.outputFrameIndex = repeated.outputFrameIndex;
+    repeated.identity.sampledPlayheadMs = repeated.sampledPlayheadMs;
+
+    auto read = [&](const OutputBusFrame& frame) {
+        return frame.video.readToCpu(FramePixelFormat::Yuv420p);
+    };
+
+    QVERIFY(
+        cache.getOrRead(first, FramePixelFormat::Yuv420p, [&]() { return read(first); }).isValid());
+    cache.clear();
+    QVERIFY(cache.getOrRead(repeated, FramePixelFormat::Yuv420p, [&]() { return read(repeated); })
+                .isValid());
+
     QCOMPARE(data->readCount(), 1);
 }
 
@@ -929,6 +1000,36 @@ void TestAsyncGpuReadbackSink::readyReadbackDoesNotDoubleSubmitCadence() {
     QTRY_COMPARE_WITH_TIMEOUT(observed->deliveredCount(), 2, 1000);
     QCOMPARE(observed->deliveredAt(1).outputFrameIndex, qint64(1));
     QCOMPARE(data->readCount(), 1);
+}
+
+void TestAsyncGpuReadbackSink::qtPreviewKeepsOnlyLatestQueuedReadback() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    auto inner = std::make_unique<RecordingSink>(OutputTargetKind::QtPreview);
+    RecordingSink* observed = inner.get();
+    AsyncGpuReadbackSink sink(std::move(inner), 1, FramePixelFormat::Yuv420p,
+                              SinkGpuCapability::AsyncReadbackDedupOk, GpuFence::create());
+
+    QVERIFY(sink.start({}, FrameRate{}));
+    auto blocking = std::make_shared<BlockingGpuFrameData>();
+    QVERIFY(sink.submit(gpuFrame(0, blocking, 1)));
+    QVERIFY2(blocking->waitForReadStart(1000), "readback did not start");
+
+    auto stale1 = std::make_shared<CountingGpuFrameData>(41);
+    auto stale2 = std::make_shared<CountingGpuFrameData>(42);
+    auto latest = std::make_shared<CountingGpuFrameData>(43);
+    QVERIFY(sink.submit(gpuFrame(1, stale1, 1)));
+    QVERIFY(sink.submit(gpuFrame(2, stale2, 1)));
+    QVERIFY(sink.submit(gpuFrame(3, latest, 1)));
+
+    const qint64 queuedDepth = sink.readbackQueueDepth();
+    blocking->releaseReadback();
+    QCOMPARE(queuedDepth, qint64(2)); // one in flight, one latest queued
+
+    QTRY_COMPARE_WITH_TIMEOUT(observed->deliveredCount(), qsizetype(1), 1000);
+    QCOMPARE(observed->deliveredAt(0).outputFrameIndex, qint64(3));
+    QCOMPARE(stale1->readCount(), 0);
+    QCOMPARE(stale2->readCount(), 0);
+    QCOMPARE(latest->readCount(), 1);
 }
 
 void TestAsyncGpuReadbackSink::invalidReadbackCountsAsDropAfterCadenceResend() {

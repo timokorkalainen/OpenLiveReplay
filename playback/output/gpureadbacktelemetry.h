@@ -17,18 +17,25 @@ struct GpuReadbackSurfaceKey {
     int sourceFeedIndex = -1;
     qint64 sourcePtsMs = 0;
     qint64 sourceDecodedSequence = 0;
+    quint32 videoHash = 0;
+    int width = 0;
+    int height = 0;
+    bool placeholder = false;
 
     bool operator==(const GpuReadbackSurfaceKey& other) const {
         return bus == other.bus && outputFrameIndex == other.outputFrameIndex &&
                format == other.format && gpuGeneration == other.gpuGeneration &&
                sourceFeedIndex == other.sourceFeedIndex && sourcePtsMs == other.sourcePtsMs &&
-               sourceDecodedSequence == other.sourceDecodedSequence;
+               sourceDecodedSequence == other.sourceDecodedSequence &&
+               videoHash == other.videoHash && width == other.width && height == other.height &&
+               placeholder == other.placeholder;
     }
 };
 
 inline size_t qHash(const GpuReadbackSurfaceKey& key, size_t seed = 0) noexcept {
     return qHashMulti(seed, key.bus, key.outputFrameIndex, int(key.format), key.gpuGeneration,
-                      key.sourceFeedIndex, key.sourcePtsMs, key.sourceDecodedSequence);
+                      key.sourceFeedIndex, key.sourcePtsMs, key.sourceDecodedSequence,
+                      key.videoHash, key.width, key.height, key.placeholder);
 }
 
 struct GpuReadbackTelemetrySnapshot {

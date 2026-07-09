@@ -6,7 +6,8 @@
 #include <vector>
 
 // PTS(ms) -> byte-offset map, appended incrementally as packets are read.
-// Recordings are ALL-INTRA, so any indexed offset is a valid decode start.
+// The offsets identify known packets, but container demuxers may still require
+// timestamp-based entry points before decoding from those packets.
 class FrameIndex {
 public:
     void append(qint64 ptsMs, qint64 byteOffset);

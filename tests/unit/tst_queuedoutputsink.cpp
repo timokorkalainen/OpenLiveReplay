@@ -131,6 +131,15 @@ public:
         m_releasedChanged.wakeAll();
     }
 
+    QVector<qint64> delivered() const {
+        QMutexLocker locker(&m_mutex);
+        QVector<qint64> out;
+        out.reserve(m_frames.size());
+        for (const OutputBusFrame& frame : m_frames)
+            out.append(frame.outputFrameIndex);
+        return out;
+    }
+
 private:
     mutable QMutex m_mutex;
     mutable QWaitCondition m_enteredChanged;
@@ -246,6 +255,7 @@ private slots:
     void restartResetsDeliveryState();
     void rapidStopAfterBurstDrainsWithoutHang();
     void submitAndFlushDeliversIdleFrameOnCallerThread();
+    void submitAndFlushPreemptsQueuedFramesBehindInFlightDelivery();
 };
 
 void TestQueuedOutputSink::submitReturnsBeforeSlowInnerSinkCompletes() {
@@ -582,6 +592,45 @@ void TestQueuedOutputSink::submitAndFlushDeliversIdleFrameOnCallerThread() {
     QCOMPARE(delivered.front().outputFrameIndex, qint64(70));
     QCOMPARE(observed->submitThread(), callerThread);
     QCOMPARE(sink.outputStatus().lastDeliveredFrameIndex, qint64(70));
+
+    sink.stop();
+}
+
+void TestQueuedOutputSink::submitAndFlushPreemptsQueuedFramesBehindInFlightDelivery() {
+    auto inner = std::make_unique<BlockingInnerSink>();
+    BlockingInnerSink* observed = inner.get();
+    QueuedOutputSink sink(std::move(inner), 3);
+
+    OutputTargetAssignment assignment;
+    assignment.kind = OutputTargetKind::Ndi;
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.enabled = true;
+
+    QVERIFY(sink.start(assignment, FrameRate::fromFraction(25, 1)));
+    QVERIFY(sink.submit(frame(10)));
+    const bool workerBlocked = observed->waitForEnteredSubmits(1, 500);
+    if (!workerBlocked) {
+        observed->release();
+        sink.stop();
+    }
+    QVERIFY2(workerBlocked, "worker must enter the blocking inner sink before queue pressure");
+
+    QVERIFY(sink.submit(frame(11)));
+    QVERIFY(sink.submit(frame(12)));
+
+    bool flushed = false;
+    QThread* flushThread =
+        QThread::create([&]() { flushed = sink.submitAndFlush(frame(99), 1000); });
+    flushThread->start();
+    QTest::qWait(20);
+
+    observed->release();
+    QVERIFY(flushThread->wait(1000));
+    delete flushThread;
+
+    QVERIFY(flushed);
+    QTRY_COMPARE_WITH_TIMEOUT(observed->delivered(), (QVector<qint64>{10, 99}), 500);
+    QCOMPARE(sink.outputStatus().lastDeliveredFrameIndex, qint64(99));
 
     sink.stop();
 }

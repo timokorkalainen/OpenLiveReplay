@@ -142,6 +142,12 @@ void TestGpuReadbackRing::retainedSharedReadbackSurvivesPrunesForDelayedPeer() {
 
     cache.clear();
     QVERIFY(cache.getOrRead(frame, FramePixelFormat::Yuv420p, read).isValid());
+    QCOMPARE(reads, 1);
+
+    qputenv("OLR_GPU_READBACK_CACHE_MB", "0");
+    cache.clear();
+    qunsetenv("OLR_GPU_READBACK_CACHE_MB");
+    QVERIFY(cache.getOrRead(frame, FramePixelFormat::Yuv420p, read).isValid());
     QCOMPARE(reads, 2);
 }
 

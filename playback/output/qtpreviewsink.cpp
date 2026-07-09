@@ -87,8 +87,12 @@ void QtPreviewOutputSink::stop() {
     m_lastSubmittedSerial = 0;
 }
 
+bool QtPreviewOutputSink::isActive() const {
+    return m_active && m_provider && m_provider->hasPreviewConsumers();
+}
+
 bool QtPreviewOutputSink::submit(const OutputBusFrame& frame) {
-    if (!m_active) return false;
+    if (!isActive()) return false;
     QtPreviewSink sink(m_provider);
     quint64 serial = 0;
     const bool delivered = sink.deliver(frame.video, &serial);

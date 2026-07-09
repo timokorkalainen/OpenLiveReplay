@@ -205,6 +205,7 @@ void TestGpuDeviceLostWorker::lostContextRebuildsFreshGpuSpine() {
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
     PlaybackWorker worker({&feedProvider}, &transport);
+    worker.setFeedPreviewProvidersEnabled(true);
     worker.setExternalOutputTargets({ndiFeedAssignment()});
     worker.initializeOutputGraph(1, 64, 48);
     if (worker.gpuPipelineState() != PlaybackWorker::GpuPipelineState::Gpu)
@@ -246,6 +247,7 @@ void TestGpuDeviceLostWorker::rebuildFailureLatchesCpuFallback() {
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
     PlaybackWorker worker({&feedProvider}, &transport);
+    worker.setFeedPreviewProvidersEnabled(true);
     worker.setExternalOutputTargets({ndiFeedAssignment()});
     worker.initializeOutputGraph(1, 64, 48);
     QVERIFY(installTestGpuSpine(worker));

@@ -72,9 +72,11 @@ public:
 
     bool isRuntimeAvailable() const override { return runtimeAvailable; }
 
-    bool createSender(const QString& senderName, FrameRate rate) override {
+    bool createSender(const QString& senderName, FrameRate rate,
+                      NdiSenderClocking clocking) override {
         createdName = senderName;
         createdRate = rate;
+        createdClocking = clocking;
         active = runtimeAvailable && createSucceeds && !senderName.isEmpty() && rate.isValid();
         return active;
     }
@@ -116,6 +118,7 @@ public:
     bool blockSend = false;
     QString createdName;
     FrameRate createdRate;
+    NdiSenderClocking createdClocking;
     QVector<OutputBusFrame> sentFrames;
 
 private:
@@ -132,6 +135,7 @@ private slots:
     void runtimeCandidatesIncludeNdiToolsInstallLocations();
     void unavailableRuntimeFailsCleanly();
     void startUsesConfiguredSenderNameAndSubmitsCleanBusFrames();
+    void startLeavesSdkClockingDisabledForLowLatencyCommands();
     void rejectsFramesWithoutBroadcastAudio();
     void rejectsDisabledOrNonNdiAssignments();
     void reportsCreateFailureAndStoppedStatus();
@@ -216,6 +220,16 @@ void TestNdiSink::startUsesConfiguredSenderNameAndSubmitsCleanBusFrames() {
     QCOMPARE(uchar(MediaVideoFrameView(backend.sentFrames[0].video).planeY.at(0)), uchar(90));
     // The programme timecode survives the submit -> backend path unscaled/unswapped.
     QCOMPARE(backend.sentFrames[0].programmeTimecode100ns, qint64(2000000));
+}
+
+void TestNdiSink::startLeavesSdkClockingDisabledForLowLatencyCommands() {
+    FakeNdiBackend backend(true);
+    NdiOutputSink sink(&backend);
+
+    QVERIFY(sink.start(ndiAssignment(), FrameRate::fromFraction(25, 1)));
+
+    QVERIFY(!backend.createdClocking.clockVideo);
+    QVERIFY(!backend.createdClocking.clockAudio);
 }
 
 void TestNdiSink::rejectsFramesWithoutBroadcastAudio() {

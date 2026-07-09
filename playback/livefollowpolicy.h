@@ -19,14 +19,22 @@ inline qint64 liveFollowWorkerSeekThresholdMs(qint64 frameDurationMs) {
     return qMax<qint64>(250, qMax<qint64>(1, frameDurationMs) * 8);
 }
 
+inline qint64 liveFollowEffectiveLiveEdgeMs(qint64 liveEdgeMs, qint64 committedVideoTailMs) {
+    if (committedVideoTailMs < 0) return liveEdgeMs;
+    return qMin(liveEdgeMs, committedVideoTailMs);
+}
+
 inline LiveFollowCorrection planLiveFollowCorrection(bool followLive, bool playing,
                                                      qint64 liveEdgeMs, qint64 liveBufferMs,
-                                                     qint64 currentMs, qint64 frameDurationMs) {
+                                                     qint64 currentMs, qint64 frameDurationMs,
+                                                     qint64 committedVideoTailMs = -1) {
     LiveFollowCorrection correction;
     if (!followLive || !playing) return correction;
 
-    correction.targetMs = qMax<qint64>(0, liveEdgeMs - qMax<qint64>(0, liveBufferMs));
-    if (correction.targetMs == 0 && liveEdgeMs < liveBufferMs) return correction;
+    const qint64 effectiveLiveEdgeMs =
+        liveFollowEffectiveLiveEdgeMs(liveEdgeMs, committedVideoTailMs);
+    correction.targetMs = qMax<qint64>(0, effectiveLiveEdgeMs - qMax<qint64>(0, liveBufferMs));
+    if (correction.targetMs == 0 && effectiveLiveEdgeMs <= liveBufferMs) return correction;
 
     const qint64 delta = correction.targetMs - currentMs;
     const qint64 absDelta = qAbs(delta);

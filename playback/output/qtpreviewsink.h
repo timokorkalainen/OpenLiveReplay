@@ -30,7 +30,7 @@ public:
     OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
     bool start(const OutputTargetAssignment& assignment, FrameRate rate) override;
     void stop() override;
-    bool isActive() const override { return m_active; }
+    bool isActive() const override;
     bool submit(const OutputBusFrame& frame) override;
     bool flush(int timeoutMs) override;
 

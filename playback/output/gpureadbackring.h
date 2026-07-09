@@ -55,11 +55,18 @@ private:
         bool reading = false;
         int waiters = 0;
         int retainedReaders = 0;
+        qint64 bytes = 0;
+        quint64 lastUsed = 0;
     };
+
+    void eraseEntryLocked(QHash<SharedGpuReadbackKey, Entry>::iterator it);
+    void pruneReadyEntriesLocked();
 
     mutable std::mutex m_mutex;
     std::condition_variable m_wake;
     QHash<SharedGpuReadbackKey, Entry> m_cache;
+    qint64 m_readyBytes = 0;
+    quint64 m_useCounter = 0;
 };
 
 struct RingReadbackJob {
@@ -72,6 +79,12 @@ class GpuReadbackRing {
 public:
     explicit GpuReadbackRing(int depth,
                              std::shared_ptr<SharedGpuReadbackCache> sharedReadbacks = nullptr);
+    ~GpuReadbackRing();
+
+    GpuReadbackRing(const GpuReadbackRing&) = delete;
+    GpuReadbackRing& operator=(const GpuReadbackRing&) = delete;
+    GpuReadbackRing(GpuReadbackRing&& other) noexcept;
+    GpuReadbackRing& operator=(GpuReadbackRing&& other) noexcept;
 
     int depth() const { return m_depth; }
     int occupancy() const;
@@ -93,11 +106,14 @@ private:
         uint64_t fenceValue = 0;
         std::shared_ptr<GpuFence> fence;
         FramePixelFormat format = FramePixelFormat::Yuv420p;
+        bool retainedSharedReadback = false;
     };
 
     RingReadyFrame readBackAndPopOldest();
     RingReadbackJob takeOldest();
     bool oldestReady() const;
+    void releasePendingSharedReadbacks();
+    void releaseSharedReadback(const RingReadbackJob& job) const;
 
     int m_depth = 1;
     qint64 m_drops = 0;

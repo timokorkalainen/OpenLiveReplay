@@ -21,9 +21,14 @@ static uchar yAt(const OutputBusFrame& frame, qsizetype offset) {
     return uchar(MediaVideoFrameView(frame.video).planeY.at(offset));
 }
 
+static qint64 videoPts(const OutputBusFrame& frame) {
+    return frame.video.metadata().key.ptsMs;
+}
+
 class ThreadSafeCollectingSink final : public IOutputSink {
 public:
-    explicit ThreadSafeCollectingSink(OutputTargetKind kind) : m_kind(kind) {}
+    explicit ThreadSafeCollectingSink(OutputTargetKind kind, bool continuousCadence = false)
+        : m_kind(kind), m_continuousCadence(continuousCadence) {}
 
     OutputTargetKind kind() const override { return m_kind; }
 
@@ -50,6 +55,8 @@ public:
         return true;
     }
 
+    bool needsContinuousCadence() const override { return m_continuousCadence; }
+
     int frameCount() const {
         QMutexLocker locker(&m_mutex);
         return m_frames.size();
@@ -64,6 +71,7 @@ private:
     OutputTargetKind m_kind = OutputTargetKind::QtPreview;
     mutable QMutex m_mutex;
     bool m_active = false;
+    bool m_continuousCadence = false;
     QVector<OutputBusFrame> m_frames;
 };
 
@@ -193,9 +201,12 @@ private:
 class TestOutputRuntime : public QObject {
     Q_OBJECT
 private slots:
-    void manualTicksRepeatPausedFrameFromCache();
+    void pausedScheduledTicksAdvanceClockWithoutPreviewSubmit();
     void nanosecondTicksHonorFractionalFrameBoundary();
-    void workerThreadTicksWithoutExternalDispatchCalls();
+    void workerThreadIdlesWhilePausedWithoutExternalDispatchCalls();
+    void pausedScheduledTicksKeepPgmExternalCadenceWithoutPreviewSubmit();
+    void pausedPgmCadenceTicksLeavePgmCriticalImmediateDispatchCommandOwned();
+    void pausedClockOnlyTicksDoNotCreateCatchUpBurstOnResume();
     void runtimeStatsReportNoDeadlineMissForOnTimeTicks();
     void exactlyMaxCatchUpTicksDoesNotReportCapHit();
     void runtimeStatsReportDeadlineMissWhenCatchUpIsCapped();
@@ -209,7 +220,7 @@ private slots:
     void endpointReconfigurationDiscardsPreReconfigSnapshot();
 };
 
-void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
+void TestOutputRuntime::pausedScheduledTicksAdvanceClockWithoutPreviewSubmit() {
     OutputFrameCache cache(1, 4, 4);
     cache.insertVideoFrame(video(0, 100, 40));
 
@@ -233,22 +244,20 @@ void TestOutputRuntime::manualTicksRepeatPausedFrameFromCache() {
         return snapshot;
     });
     runtime.setEndpoints({{assignment, &sink}});
-    // This test asserts a per-tick submit of the SAME paused frame; identity-skip
-    // (default on) would collapse the repeats, so disable it here.
+    // Even with identity-skip disabled, the runtime's background clock must not
+    // churn the same paused preview frame. Operator-owned immediate dispatches
+    // update paused previews and external outputs.
     runtime.setIdentitySkip(false);
 
     runtime.dispatchDueTicksForTest(0);
     runtime.dispatchDueTicksForTest(40);
-    runtime.dispatchDueTicksForTest(80);
+    const OutputDispatchStats stats = runtime.dispatchDueTicksForTest(80);
 
-    const QVector<OutputBusFrame> frames = sink.frames();
-    QCOMPARE(frames.size(), 3);
-    QCOMPARE(frames[0].outputFrameIndex, qint64(0));
-    QCOMPARE(frames[1].outputFrameIndex, qint64(1));
-    QCOMPARE(frames[2].outputFrameIndex, qint64(2));
-    QCOMPARE(frames[0].video.metadata().key.ptsMs, qint64(100));
-    QCOMPARE(frames[2].video.metadata().key.ptsMs, qint64(100));
-    QCOMPARE(yAt(frames[2], 0), uchar(40));
+    QCOMPARE(sink.frameCount(), 0);
+    QCOMPARE(stats.ticks, qint64(3));
+    QCOMPARE(stats.framesSubmitted, qint64(0));
+    QCOMPARE(stats.runtime.lastDispatchedFrameIndex, qint64(2));
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(3));
 }
 
 void TestOutputRuntime::nanosecondTicksHonorFractionalFrameBoundary() {
@@ -278,14 +287,15 @@ void TestOutputRuntime::nanosecondTicksHonorFractionalFrameBoundary() {
 
     runtime.dispatchDueTicksForTestNs(0);
     runtime.dispatchDueTicksForTestNs(33366666);
-    QCOMPARE(sink.frameCount(), 1);
+    QCOMPARE(sink.frameCount(), 0);
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(1));
 
     runtime.dispatchDueTicksForTestNs(33366667);
-    QCOMPARE(sink.frameCount(), 2);
-    QCOMPARE(sink.frames()[1].outputFrameIndex, qint64(1));
+    QCOMPARE(sink.frameCount(), 0);
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(2));
 }
 
-void TestOutputRuntime::workerThreadTicksWithoutExternalDispatchCalls() {
+void TestOutputRuntime::workerThreadIdlesWhilePausedWithoutExternalDispatchCalls() {
     OutputFrameCache cache(1, 4, 4);
     cache.insertVideoFrame(video(0, 100, 55));
 
@@ -309,21 +319,169 @@ void TestOutputRuntime::workerThreadTicksWithoutExternalDispatchCalls() {
         return snapshot;
     });
     runtime.setEndpoints({{assignment, &sink}});
-    // The runtime thread re-ticks the SAME paused frame; identity-skip (default on)
-    // would collapse the repeats to one submit, so disable it for this assertion.
+    // Disable identity-skip to prove the runtime itself suppresses paused
+    // background submits, not just the dispatcher duplicate filter.
     runtime.setIdentitySkip(false);
 
     runtime.startRuntime();
-    QTRY_VERIFY_WITH_TIMEOUT(sink.frameCount() >= 3, 500);
+    QTest::qWait(160);
     runtime.stopRuntime();
 
-    const QVector<OutputBusFrame> frames = sink.frames();
-    QVERIFY(frames.size() >= 3);
-    QCOMPARE(frames[0].outputFrameIndex, qint64(0));
-    QCOMPARE(frames[1].outputFrameIndex, qint64(1));
-    QCOMPARE(frames[2].outputFrameIndex, qint64(2));
-    QCOMPARE(yAt(frames[2], 0), uchar(55));
+    QCOMPARE(sink.frameCount(), 0);
+    QVERIFY(runtime.stats().ticks >= 3);
     QCOMPARE(runtime.stats().runtime.deadlineMisses, qint64(0));
+}
+
+void TestOutputRuntime::pausedScheduledTicksKeepPgmExternalCadenceWithoutPreviewSubmit() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 88));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("pgm-preview");
+    preview.sourceBus = OutputBusId::pgm();
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    ThreadSafeCollectingSink previewSink(OutputTargetKind::QtPreview);
+    ThreadSafeCollectingSink pgmSink(OutputTargetKind::Ndi, true);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{preview, &previewSink}, {pgm, &pgmSink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    runtime.dispatchDueTicksForTest(40);
+    const OutputDispatchStats stats = runtime.dispatchDueTicksForTest(80);
+
+    QCOMPARE(previewSink.frameCount(), 0);
+    QCOMPARE(pgmSink.frameCount(), 3);
+    QCOMPARE(stats.ticks, qint64(3));
+    QCOMPARE(stats.framesSubmitted, qint64(3));
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(3));
+
+    const QVector<OutputBusFrame> frames = pgmSink.frames();
+    QCOMPARE(frames.size(), 3);
+    for (int i = 0; i < frames.size(); ++i) {
+        QCOMPARE(frames.at(i).bus, OutputBusId::pgm());
+        QCOMPARE(frames.at(i).outputFrameIndex, qint64(i));
+        QCOMPARE(frames.at(i).sampledPlayheadMs, qint64(1000));
+        QCOMPARE(videoPts(frames.at(i)), qint64(1000));
+        QVERIFY(!frames.at(i).identity.videoPlaceholder);
+    }
+}
+
+void TestOutputRuntime::pausedPgmCadenceTicksLeavePgmCriticalImmediateDispatchCommandOwned() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 1000, 88));
+
+    PlaybackStateSnapshot state;
+    state.playheadMs = 1000;
+    state.playing = false;
+    state.selectedFeedIndex = 0;
+
+    OutputTargetAssignment preview;
+    preview.id = QStringLiteral("pgm-preview");
+    preview.sourceBus = OutputBusId::pgm();
+    preview.kind = OutputTargetKind::QtPreview;
+    preview.enabled = true;
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    ThreadSafeCollectingSink previewSink(OutputTargetKind::QtPreview);
+    ThreadSafeCollectingSink pgmSink(OutputTargetKind::Ndi, true);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([cache, state]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state = state;
+        return snapshot;
+    });
+    runtime.setEndpoints({{preview, &previewSink}, {pgm, &pgmSink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    runtime.dispatchDueTicksForTest(40);
+    runtime.dispatchDueTicksForTest(80);
+    QCOMPARE(previewSink.frameCount(), 0);
+    QCOMPARE(pgmSink.frameCount(), 3);
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(3));
+
+    OutputDispatchRequest request;
+    request.lane = OutputDispatchLane::PgmCritical;
+    request.requiredBus = OutputBusId::pgm();
+    request.requiredKind = OutputTargetKind::Ndi;
+    request.requiredPlayheadMs = 1000;
+    request.requireNonPlaceholder = true;
+
+    const OutputDispatchReport report = runtime.dispatchImmediateWithReport(request);
+
+    QVERIFY(report.requiredSubmitted);
+    QCOMPARE(report.requiredIdentity.bus, OutputBusId::pgm());
+    QCOMPARE(report.requiredIdentity.sourcePtsMs, qint64(1000));
+    QCOMPARE(pgmSink.frameCount(), 4);
+    QCOMPARE(previewSink.frameCount(), 1);
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(4));
+}
+
+void TestOutputRuntime::pausedClockOnlyTicksDoNotCreateCatchUpBurstOnResume() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 45));
+
+    std::atomic_bool playing{false};
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    ThreadSafeCollectingSink sink(OutputTargetKind::QtPreview);
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    runtime.setSnapshotProvider([&]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state.playheadMs = 100;
+        snapshot.state.playing = playing.load(std::memory_order_acquire);
+        snapshot.state.selectedFeedIndex = 0;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+    runtime.setIdentitySkip(false);
+
+    runtime.dispatchDueTicksForTest(0);
+    const OutputDispatchStats pausedStats = runtime.dispatchDueTicksForTest(320);
+    QCOMPARE(sink.frameCount(), 0);
+    QCOMPARE(pausedStats.ticks, qint64(9));
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(9));
+    QVERIFY(!pausedStats.runtime.lastDispatchDeadlineMiss);
+
+    playing.store(true, std::memory_order_release);
+    const OutputDispatchStats resumedStats = runtime.dispatchDueTicksForTest(360);
+
+    QCOMPARE(sink.frameCount(), 1);
+    QCOMPARE(sink.frames().first().outputFrameIndex, qint64(9));
+    QCOMPARE(runtime.dispatcherNextOutputFrameIndex(), qint64(10));
+    QVERIFY(!resumedStats.runtime.lastDispatchDeadlineMiss);
+    QCOMPARE(resumedStats.runtime.deadlineMisses, qint64(0));
+    QCOMPARE(resumedStats.runtime.catchUpCapHits, qint64(0));
 }
 
 void TestOutputRuntime::runtimeStatsReportNoDeadlineMissForOnTimeTicks() {
@@ -575,7 +733,7 @@ void TestOutputRuntime::dispatchSubmitsWithoutHoldingRuntimeMutex() {
 
     PlaybackStateSnapshot state;
     state.playheadMs = 100;
-    state.playing = false;
+    state.playing = true;
     state.selectedFeedIndex = 0;
 
     OutputTargetAssignment assignment;
@@ -622,7 +780,8 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
         OutputRuntimeSnapshot snapshot;
         snapshot.cache = cache;
         snapshot.state.playheadMs = playheadMs.load(std::memory_order_acquire);
-        snapshot.state.playing = false;
+        snapshot.state.playing = true;
+        snapshot.state.forcePlayEpochReset = true;
         snapshot.state.selectedFeedIndex = 0;
         return snapshot;
     });
@@ -721,7 +880,7 @@ void TestOutputRuntime::endpointReconfigurationDiscardsPreReconfigSnapshot() {
     full.insertVideoFrame(video(0, 100, 91));
     PlaybackStateSnapshot state;
     state.playheadMs = 100;
-    state.playing = false;
+    state.playing = true;
     state.selectedFeedIndex = 0;
 
     int snapshots = 0;
