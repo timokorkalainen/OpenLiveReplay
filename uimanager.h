@@ -330,6 +330,21 @@ public:
     Q_INVOKABLE void seekPlayback(int64_t ms);
     PlaybackWorker::OperatorSeekResult seekPlaybackAndWaitForPgm(int64_t ms, int timeoutMs);
     PlaybackWorker::OperatorSeekResult jogExternalAndWaitForPgm(int delta, int timeoutMs);
+    // Non-blocking counterparts of the two methods above: the transactional seek is
+    // enqueued on the playback worker and the ticket's (workerEpoch, generation) pair
+    // correlates the eventual operatorSeekCompleted signal to this request.
+    struct AsyncSeekTicket {
+        quint64 workerEpoch = 0;
+        quint64 generation = 0;
+        bool accepted = false;
+        QString message; // failure reason when !accepted
+    };
+    AsyncSeekTicket seekPlaybackAsyncPgm(int64_t ms);
+    AsyncSeekTicket jogExternalAsyncPgm(int delta);
+    // Cancels a still-pending async seek so a stale/superseded completion is not
+    // delivered. No-ops if the worker has since been recreated (workerEpoch stale)
+    // or there is no worker.
+    void abandonOperatorSeek(quint64 workerEpoch, quint64 generation);
     Q_INVOKABLE void endScrubGesture();
     // Tier3 replay cue list: capture mark-in/out at the current playhead and
     // recall an entry as a frame-perfect armed cut (pre-rolled, no flash).
@@ -425,6 +440,13 @@ signals:
     // ReplayManager::referenceTierChanged) — drives the sessionReferenceTier property
     // + the sessionReferenceStatus() line.
     void sessionReferenceChanged();
+    // Relays the current playback worker's operatorSeekCompleted, keyed by the
+    // worker's epoch so a completion can be correlated to the async seek that
+    // requested it even across a worker restart (queued relay set up in
+    // wirePlaybackWorkerCompletion()).
+    void operatorSeekCompleted(quint64 workerEpoch, quint64 generation,
+                               PlaybackWorker::OperatorSeekResult result);
+    void playbackWorkerEpochChanged(quint64 workerEpoch);
 
 public slots:
     // Called when the user clicks "Record" in the UI
@@ -464,6 +486,11 @@ private:
     void updateXTouchDisplay();
 
     void restartPlaybackWorker();
+    // Bumps m_playbackWorkerEpoch and, if a worker exists, queues a relay of its
+    // operatorSeekCompleted signal onto UIManager's own stable signal. Called after
+    // every `new PlaybackWorker(...)` construction so the epoch always tracks the
+    // live worker instance.
+    void wirePlaybackWorkerCompletion();
 
     // Shared control-action dispatch used by both MIDI bindings and the
     // Stream Deck. Action ids documented in streamdeck/streamdeckmanager.h.
@@ -479,6 +506,10 @@ private:
     SettingsManager* m_settingsManager;
     QString m_configPath;
     PlaybackWorker* m_playbackWorker = nullptr;
+    // Bumped by wirePlaybackWorkerCompletion() each time the worker is (re)created;
+    // an async seek ticket's workerEpoch must match this for abandonOperatorSeek to
+    // act, guarding against a stale ticket from a worker that no longer exists.
+    quint64 m_playbackWorkerEpoch = 0;
     ReplayPlaylist m_playlist; // Tier3 cue list (markIn/markOut/recall)
     PlaylistEntriesModel* m_playlistModel = nullptr;
     QString m_playlistFilePath;

@@ -11,6 +11,8 @@
 
 #include <utility>
 
+class QObject;
+
 struct RecordingState {
     bool active = false;
     qint64 durationMs = 0;
@@ -110,6 +112,13 @@ struct CommandResult {
         result.details = std::move(resultDetails);
         return result;
     }
+    static CommandResult accepted(quint64 workerEpoch, quint64 generation) {
+        CommandResult result;
+        result.details = QJsonObject{{QStringLiteral("status"), QStringLiteral("accepted")},
+                                     {QStringLiteral("generation"), QString::number(generation)},
+                                     {QStringLiteral("workerEpoch"), QString::number(workerEpoch)}};
+        return result;
+    }
     static CommandResult failure(const QString& failureCode, const QString& failureMessage) {
         CommandResult result;
         result.ok = false;
@@ -136,6 +145,12 @@ public:
     virtual QVariantMap outputState() const = 0;
 
     virtual CommandResult executeCommand(const QString& name, const QJsonObject& args) = 0;
+
+    // Optional completion-delivery hooks for transactional (waitForPgm) commands.
+    // Defaulted so adapters/fakes that don't support async completions are
+    // unaffected: no notifier means no completion event is ever delivered.
+    virtual QObject* completionNotifier() { return nullptr; }
+    virtual void notifyClientDisconnected(const QString&) {}
 };
 
 #endif

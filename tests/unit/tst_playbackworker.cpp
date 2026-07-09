@@ -43,6 +43,12 @@ private slots:
     void operatorSeekTransactionPublishesTargetBeforeLeadWindowFill();
     void operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss();
     void operatorSeekTransactionTimesOutWhenSeekGenerationUncommitted();
+    void operatorSeekTransactionAbandonedOnTimeout();
+    void operatorSeekCompletionEmitsSignal();
+    void seekToWithPgmNotifyCompletesCacheHitInline();
+    void seekToWithPgmNotifyLeavesCacheMissWaiting();
+    void generationBumpEmitsSupersededForWaitingTransaction();
+    void abandonSuppressesLaterCompletion();
     void reuseAtAcceptsSelectedFeedWhenOtherFeedMissing();
     void reuseAtRejectsStalePriorFrameForOperatorSeek();
     void priorFrameAtFrameDurationBoundaryDoesNotCoverSeek();
@@ -896,6 +902,269 @@ void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncomm
     QCOMPARE(result.generation, uint64_t(8));
     QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(7));
     QCOMPARE(pgmSink.frames.size(), 0);
+}
+
+void TestPlaybackWorker::operatorSeekTransactionAbandonedOnTimeout() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(60, 1);
+    transport.seek(5000);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(1000, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(1000, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 88));
+        worker.publishOutputCacheLocked();
+    }
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    TestPgmSink pgmSink;
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(60, 1), 1, 4, 4);
+        worker.m_outputRuntime->setSnapshotProvider(
+            [&worker]() { return worker.makeOutputSnapshot(); });
+        worker.m_outputRuntime->setEndpoints({{pgm, &pgmSink}});
+    }
+
+    const PlaybackWorker::OperatorSeekResult result = worker.seekToAndWaitForPgm(5000, 1, 5);
+    QVERIFY(result.timedOut);
+
+    // A timed-out operator seek must abandon its transaction so the worker thread does
+    // not later complete it and submit PGM for a command the caller already gave up on.
+    QVERIFY(!worker.hasOperatorSeekTransaction(result.generation));
+    QVERIFY(!worker.m_operatorSeekCompletion.waiting);
+
+    // A subsequent reposition-commit completion for the abandoned generation is a no-op.
+    OutputDispatchReport lateReport;
+    lateReport.requiredSubmitted = true;
+    worker.completeOperatorSeekTransaction(result.generation, result.targetMs, lateReport);
+    QVERIFY(!worker.m_operatorSeekCompletion.completed);
+}
+
+void TestPlaybackWorker::operatorSeekCompletionEmitsSignal() {
+    // Harness identical to operatorSeekTransactionTimesOutWhenSeekGenerationUncommitted
+    // (tst_playbackworker.cpp:850) up to the runtime/sink setup, except the cache DOES
+    // cover the target so the blocking path completes inline.
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(60, 1);
+    transport.seek(1000);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 88));
+        worker.publishOutputCacheLocked();
+    }
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    TestPgmSink pgmSink;
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(60, 1), 1, 4, 4);
+        worker.m_outputRuntime->setSnapshotProvider(
+            [&worker]() { return worker.makeOutputSnapshot(); });
+        worker.m_outputRuntime->setEndpoints({{pgm, &pgmSink}});
+    }
+
+    QSignalSpy spy(&worker, &PlaybackWorker::operatorSeekCompleted);
+    const PlaybackWorker::OperatorSeekResult result = worker.seekToAndWaitForPgm(1000, -1, 50);
+    QVERIFY(result.completed);
+
+    QTRY_COMPARE(spy.count(), 1); // queued delivery drains on the test event loop
+    const auto args = spy.takeFirst();
+    QCOMPARE(args.at(0).toULongLong(), quint64(result.generation));
+    const auto emitted = args.at(1).value<PlaybackWorker::OperatorSeekResult>();
+    QVERIFY(emitted.submittedPgm);
+    QCOMPARE(emitted.targetMs, qint64(1000));
+    QCOMPARE(emitted.pgmIdentity.sampledPlayheadMs, result.pgmIdentity.sampledPlayheadMs);
+}
+
+void TestPlaybackWorker::seekToWithPgmNotifyCompletesCacheHitInline() {
+    // Same covered-cache harness as operatorSeekCompletionEmitsSignal, but driven
+    // through the non-blocking entry point: the cache-hit clause must dispatch PGM
+    // and complete the transaction inline (no worker thread running here).
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(60, 1);
+    transport.seek(1000);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 88));
+        worker.publishOutputCacheLocked();
+    }
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    TestPgmSink pgmSink;
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(60, 1), 1, 4, 4);
+        worker.m_outputRuntime->setSnapshotProvider(
+            [&worker]() { return worker.makeOutputSnapshot(); });
+        worker.m_outputRuntime->setEndpoints({{pgm, &pgmSink}});
+    }
+
+    QSignalSpy spy(&worker, &PlaybackWorker::operatorSeekCompleted);
+    const quint64 generation = worker.seekToWithPgmNotify(1000, -1);
+    QVERIFY(generation > 0);
+
+    // The cache-hit clause must dispatch PGM inline (no worker thread running here).
+    QCOMPARE(pgmSink.frames.size(), 1);
+    QCOMPARE(pgmSink.frames.first().sampledPlayheadMs, qint64(1000));
+
+    QTRY_COMPARE(spy.count(), 1);
+    const auto args = spy.takeFirst();
+    QCOMPARE(args.at(0).toULongLong(), generation);
+    QVERIFY(args.at(1).value<PlaybackWorker::OperatorSeekResult>().submittedPgm);
+}
+
+void TestPlaybackWorker::seekToWithPgmNotifyLeavesCacheMissWaiting() {
+    // Same harness, but the cache only covers 1000ms and the target (5000ms) is
+    // uncovered: seekToWithPgmNotify must return immediately without dispatching
+    // PGM, leaving the transaction registered and still waiting.
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(60, 1);
+    transport.seek(1000);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 88));
+        worker.publishOutputCacheLocked();
+    }
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    TestPgmSink pgmSink;
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(60, 1), 1, 4, 4);
+        worker.m_outputRuntime->setSnapshotProvider(
+            [&worker]() { return worker.makeOutputSnapshot(); });
+        worker.m_outputRuntime->setEndpoints({{pgm, &pgmSink}});
+    }
+
+    QSignalSpy spy(&worker, &PlaybackWorker::operatorSeekCompleted);
+    const quint64 generation = worker.seekToWithPgmNotify(5000, 1);
+    QVERIFY(worker.hasOperatorSeekTransaction(generation)); // still waiting — no block
+    QCOMPARE(pgmSink.frames.size(), 0);
+    QCoreApplication::processEvents();
+    QCOMPARE(spy.count(), 0); // nothing resolved yet
+}
+
+void TestPlaybackWorker::generationBumpEmitsSupersededForWaitingTransaction() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(60, 1);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+
+    // Register a transaction the worker never resolves (uncovered target)...
+    const PlaybackWorker::SeekRequestResult first = worker.requestSeekTo(5000, 1, true);
+    QVERIFY(!first.committedFromPublishedCache);
+    QVERIFY(worker.hasOperatorSeekTransaction(first.generation));
+
+    QSignalSpy spy(&worker, &PlaybackWorker::operatorSeekCompleted);
+    // ...then bump the generation WITHOUT registering a transaction (a QML/local seek).
+    const PlaybackWorker::SeekRequestResult second = worker.requestSeekTo(9000, 1, false);
+    QVERIFY(second.generation > first.generation);
+
+    QTRY_COMPARE(spy.count(), 1);
+    const auto args = spy.takeFirst();
+    QCOMPARE(args.at(0).toULongLong(), quint64(first.generation));
+    const auto emitted = args.at(1).value<PlaybackWorker::OperatorSeekResult>();
+    QVERIFY(!emitted.completed);
+    QVERIFY(!emitted.submittedPgm);
+    QCOMPARE(emitted.message, QStringLiteral("superseded"));
+    QVERIFY(!worker.hasOperatorSeekTransaction(first.generation)); // slot cleared
+}
+
+void TestPlaybackWorker::abandonSuppressesLaterCompletion() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(60, 1);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+
+    const PlaybackWorker::SeekRequestResult seek = worker.requestSeekTo(5000, 1, true);
+    QVERIFY(worker.hasOperatorSeekTransaction(seek.generation));
+
+    worker.abandonOperatorSeekTransaction(seek.generation);
+    QVERIFY(!worker.hasOperatorSeekTransaction(seek.generation));
+
+    QSignalSpy spy(&worker, &PlaybackWorker::operatorSeekCompleted);
+    OutputDispatchReport lateReport;
+    lateReport.requiredSubmitted = true;
+    worker.completeOperatorSeekTransaction(seek.generation, seek.clampedTargetMs, lateReport);
+    QCoreApplication::processEvents();
+    QCOMPARE(spy.count(), 0); // abandoned: no completion, no emission
 }
 
 void TestPlaybackWorker::reuseAtAcceptsSelectedFeedWhenOtherFeedMissing() {

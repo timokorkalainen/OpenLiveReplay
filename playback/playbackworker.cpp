@@ -152,6 +152,7 @@ void decodeSurfaceGeometryForGpuBudget(const QList<DecoderTrack*>& decoderBank, 
 PlaybackWorker::PlaybackWorker(const QList<FrameProvider*>& providers, PlaybackTransport* transport,
                                AudioPlayer* audioPlayer, QObject* parent)
     : QThread(parent) {
+    qRegisterMetaType<PlaybackWorker::OperatorSeekResult>("PlaybackWorker::OperatorSeekResult");
     m_transport = transport;
     m_providers = providers;
     m_audioPlayer = audioPlayer;
@@ -225,6 +226,17 @@ PlaybackWorker::SeekRequestResult PlaybackWorker::requestSeekTo(qint64 timestamp
         // bookmark before bumping the generation.
         m_committedPlayheadMs.store(m_lastVisiblePlayheadMs.load(std::memory_order_acquire),
                                     std::memory_order_release);
+        // Any seek that advances the generation supersedes a still-waiting operator
+        // transaction — including local QML scrubs, live-follow and playlist jumps,
+        // which bump the generation without registering transactions. Snapshot the
+        // orphaned command before overwriting so its completion can be reported.
+        quint64 supersededGeneration = 0;
+        qint64 supersededTargetMs = -1;
+        if (m_operatorSeekCompletion.waiting && !m_operatorSeekCompletion.completed) {
+            supersededGeneration = m_operatorSeekCompletion.generation;
+            supersededTargetMs = m_operatorSeekCompletion.targetMs;
+            m_operatorSeekCompletion.waiting = false;
+        }
         // The bump also signals maybeFireScheduledCut to abort an armed cut (manual seek wins).
         result.generation = m_seekGeneration.fetch_add(1, std::memory_order_release) + 1;
         if (registerOperatorTransaction) {
@@ -272,6 +284,16 @@ PlaybackWorker::SeekRequestResult PlaybackWorker::requestSeekTo(qint64 timestamp
             result.publishNs = publishTimer.nsecsElapsed();
         }
         m_workerWake.wakeAll();
+        if (supersededGeneration != 0) {
+            OperatorSeekResult superseded;
+            superseded.completed = false;
+            superseded.submittedPgm = false;
+            superseded.targetMs = supersededTargetMs;
+            superseded.generation = supersededGeneration;
+            superseded.message = QStringLiteral("superseded");
+            // Queued consumers only; emitting under m_mutex posts an event and returns.
+            emit operatorSeekCompleted(supersededGeneration, superseded);
+        }
     }
     return result;
 }
@@ -339,6 +361,12 @@ PlaybackWorker::seekToAndWaitForPgm(qint64 timestampMs, int directionHint, int t
         }
         const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
         if (remainingMs <= 0) {
+            // Abandon the transaction so the worker thread does not later complete it and
+            // submit PGM for a command the caller has already given up on. m_mutex is held.
+            if (m_operatorSeekCompletion.generation == seek.generation &&
+                !m_operatorSeekCompletion.completed) {
+                m_operatorSeekCompletion.waiting = false;
+            }
             result.timedOut = true;
             result.message = QStringLiteral("timed out waiting for PGM output");
             result.elapsedNs = timer.nsecsElapsed();
@@ -346,6 +374,19 @@ PlaybackWorker::seekToAndWaitForPgm(qint64 timestampMs, int directionHint, int t
         }
         m_operatorSeekCondition.wait(&m_mutex, static_cast<unsigned long>(remainingMs));
     }
+}
+
+quint64 PlaybackWorker::seekToWithPgmNotify(qint64 timestampMs, int directionHint) {
+    const SeekRequestResult seek = requestSeekTo(timestampMs, directionHint, true);
+    if (seek.committedFromPublishedCache) {
+        // The worker never repositions for an inline-committed generation
+        // (requestSeekTo cleared m_seekTargetMs), so the PGM dispatch and the
+        // transaction completion are this caller's job — same as the blocking path.
+        const OutputDispatchReport report = dispatchPgmAfterSeekCommit(seek.clampedTargetMs);
+        completeOperatorSeekTransaction(seek.generation, seek.clampedTargetMs, report);
+        refreshPreviewAfterSeekCommit();
+    }
+    return seek.generation;
 }
 
 void PlaybackWorker::setActiveAudioView(int viewIndex) {
@@ -498,12 +539,29 @@ void PlaybackWorker::completeOperatorSeekTransaction(uint64_t generation, qint64
         m_operatorSeekCompletion.message = QStringLiteral("PGM output was not submitted");
     }
     m_operatorSeekCondition.wakeAll();
+
+    OperatorSeekResult emitted;
+    emitted.completed = report.requiredSubmitted;
+    emitted.submittedPgm = report.requiredSubmitted;
+    emitted.targetMs = targetMs;
+    emitted.generation = generation;
+    emitted.pgmIdentity = m_operatorSeekCompletion.pgmIdentity;
+    emitted.message = m_operatorSeekCompletion.message;
+    emit operatorSeekCompleted(generation, emitted);
 }
 
 bool PlaybackWorker::hasOperatorSeekTransaction(uint64_t generation) {
     QMutexLocker locker(&m_mutex);
     return m_operatorSeekCompletion.waiting && m_operatorSeekCompletion.generation == generation &&
            !m_operatorSeekCompletion.completed;
+}
+
+void PlaybackWorker::abandonOperatorSeekTransaction(quint64 generation) {
+    QMutexLocker locker(&m_mutex);
+    if (m_operatorSeekCompletion.generation == generation && m_operatorSeekCompletion.waiting &&
+        !m_operatorSeekCompletion.completed) {
+        m_operatorSeekCompletion.waiting = false;
+    }
 }
 
 bool PlaybackWorker::tryCompleteOperatorSeekFromCurrentOutputCache(qint64 targetMs,

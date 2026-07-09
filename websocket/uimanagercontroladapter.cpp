@@ -11,8 +11,6 @@
 
 namespace {
 
-constexpr int kControlPgmWaitTimeoutMs = 250;
-
 bool controlLatencyTraceEnabled() {
     const QByteArray raw = qgetenv("OLR_E2E_LATENCY_TRACE").trimmed().toLower();
     return raw == "1" || raw == "true" || raw == "on" || raw == "yes";
@@ -47,14 +45,32 @@ QJsonObject pgmTransactionDetails(const PlaybackWorker::OperatorSeekResult& resu
     return QJsonObject{{QStringLiteral("pgmTransaction"), transaction}};
 }
 
-CommandResult resultForOperatorSeek(const QString& commandName,
-                                    const PlaybackWorker::OperatorSeekResult& result) {
+} // namespace
+
+UIManagerControlAdapter::UIManagerControlAdapter(UIManager* uiManager, QObject* parent)
+    : QObject(parent), m_uiManager(uiManager), m_registry(new PendingCommandRegistry(this)) {
+    connect(m_registry, &PendingCommandRegistry::commandCompleted, this,
+            &UIManagerControlAdapter::commandCompleted);
+    connect(m_registry, &PendingCommandRegistry::pendingExpired, this,
+            [this](quint64 epoch, quint64 generation) {
+                // A timed-out command must not trigger a late PGM dispatch.
+                if (m_uiManager) m_uiManager->abandonOperatorSeek(epoch, generation);
+            });
+    if (m_uiManager) {
+        connect(m_uiManager, &UIManager::operatorSeekCompleted, this,
+                &UIManagerControlAdapter::onOperatorSeekCompleted, Qt::QueuedConnection);
+        connect(m_uiManager, &UIManager::playbackWorkerEpochChanged, m_registry,
+                &PendingCommandRegistry::noteWorkerEpoch);
+    }
+}
+
+void UIManagerControlAdapter::onOperatorSeekCompleted(quint64 workerEpoch, quint64 generation,
+                                                      PlaybackWorker::OperatorSeekResult result) {
     if (controlLatencyTraceEnabled()) {
         qInfo().noquote() << QStringLiteral(
-                                 "OLR_LATENCY control.command name=%1 targetMs=%2 generation=%3 "
-                                 "completed=%4 submittedPgm=%5 timedOut=%6 elapsedNs=%7 "
-                                 "sampledMs=%8 sourcePtsMs=%9 placeholder=%10 message=\"%11\"")
-                                 .arg(commandName)
+                                 "OLR_LATENCY control.command targetMs=%1 generation=%2 "
+                                 "completed=%3 submittedPgm=%4 timedOut=%5 elapsedNs=%6 "
+                                 "sampledMs=%7 sourcePtsMs=%8 placeholder=%9 message=\"%10\"")
                                  .arg(result.targetMs)
                                  .arg(static_cast<qulonglong>(result.generation))
                                  .arg(result.completed ? 1 : 0)
@@ -66,23 +82,26 @@ CommandResult resultForOperatorSeek(const QString& commandName,
                                  .arg(result.pgmIdentity.videoPlaceholder ? 1 : 0)
                                  .arg(result.message);
     }
-    if (result.completed && result.submittedPgm) {
-        return CommandResult::success(pgmTransactionDetails(result));
+    QJsonObject completion;
+    const bool done = result.completed && result.submittedPgm;
+    completion.insert(QStringLiteral("done"), done);
+    if (!done) {
+        completion.insert(QStringLiteral("reason"), result.message == QStringLiteral("superseded")
+                                                        ? QStringLiteral("superseded")
+                                                        : QStringLiteral("pgm_not_submitted"));
     }
-    const QString code =
-        result.timedOut ? QStringLiteral("timeout") : QStringLiteral("pgm_not_submitted");
-    const QString detail =
-        result.message.isEmpty() ? QStringLiteral("PGM output was not submitted") : result.message;
-    return CommandResult::failure(code, QStringLiteral("%1 (targetMs=%2 generation=%3)")
-                                            .arg(detail)
-                                            .arg(result.targetMs)
-                                            .arg(static_cast<qulonglong>(result.generation)));
+    completion.insert(QStringLiteral("generation"),
+                      QString::number(static_cast<qulonglong>(generation)));
+    completion.insert(QStringLiteral("targetMs"), static_cast<double>(result.targetMs));
+    const QJsonObject details = pgmTransactionDetails(result);
+    completion.insert(QStringLiteral("pgmTransaction"),
+                      details.value(QStringLiteral("pgmTransaction")));
+    m_registry->resolve(workerEpoch, generation, completion);
 }
 
-} // namespace
-
-UIManagerControlAdapter::UIManagerControlAdapter(UIManager* uiManager, QObject* parent)
-    : QObject(parent), m_uiManager(uiManager) {}
+void UIManagerControlAdapter::notifyClientDisconnected(const QString& clientId) {
+    m_registry->dropClient(clientId);
+}
 
 RecordingState UIManagerControlAdapter::recordingState() const {
     if (!m_uiManager) return {};
@@ -260,15 +279,27 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
     } else if (name == QStringLiteral("transport.stepFrame")) {
         const int frames = args.value(QStringLiteral("frames")).toInt();
         if (wantsPgmWait(args)) {
-            return resultForOperatorSeek(
-                name, m_uiManager->jogExternalAndWaitForPgm(frames, kControlPgmWaitTimeoutMs));
+            const UIManager::AsyncSeekTicket ticket = m_uiManager->jogExternalAsyncPgm(frames);
+            if (!ticket.accepted) {
+                return CommandResult::failure(QStringLiteral("unavailable"), ticket.message);
+            }
+            m_registry->registerPending(ticket.workerEpoch, ticket.generation,
+                                        args.value(QStringLiteral("_clientId")).toString(),
+                                        args.value(QStringLiteral("_commandId")).toString());
+            return CommandResult::accepted(ticket.workerEpoch, ticket.generation);
         }
         m_uiManager->jogExternal(frames);
     } else if (name == QStringLiteral("transport.seek")) {
         const qint64 positionMs = args.value(QStringLiteral("positionMs")).toVariant().toLongLong();
         if (wantsPgmWait(args)) {
-            return resultForOperatorSeek(
-                name, m_uiManager->seekPlaybackAndWaitForPgm(positionMs, kControlPgmWaitTimeoutMs));
+            const UIManager::AsyncSeekTicket ticket = m_uiManager->seekPlaybackAsyncPgm(positionMs);
+            if (!ticket.accepted) {
+                return CommandResult::failure(QStringLiteral("unavailable"), ticket.message);
+            }
+            m_registry->registerPending(ticket.workerEpoch, ticket.generation,
+                                        args.value(QStringLiteral("_clientId")).toString(),
+                                        args.value(QStringLiteral("_commandId")).toString());
+            return CommandResult::accepted(ticket.workerEpoch, ticket.generation);
         }
         m_uiManager->seekPlayback(positionMs);
     } else if (name == QStringLiteral("transport.goLive")) {
@@ -388,8 +419,14 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
     } else if (name == QStringLiteral("action.jog")) {
         const int delta = args.value(QStringLiteral("delta")).toInt();
         if (wantsPgmWait(args)) {
-            return resultForOperatorSeek(
-                name, m_uiManager->jogExternalAndWaitForPgm(delta, kControlPgmWaitTimeoutMs));
+            const UIManager::AsyncSeekTicket ticket = m_uiManager->jogExternalAsyncPgm(delta);
+            if (!ticket.accepted) {
+                return CommandResult::failure(QStringLiteral("unavailable"), ticket.message);
+            }
+            m_registry->registerPending(ticket.workerEpoch, ticket.generation,
+                                        args.value(QStringLiteral("_clientId")).toString(),
+                                        args.value(QStringLiteral("_commandId")).toString());
+            return CommandResult::accepted(ticket.workerEpoch, ticket.generation);
         }
         m_uiManager->jogExternal(delta);
     } else if (name == QStringLiteral("action.shuttle")) {

@@ -155,6 +155,15 @@ public:
     void openFile(const QString& filePath);
     void seekTo(int64_t timestampMs, int directionHint = 0);
     OperatorSeekResult seekToAndWaitForPgm(qint64 timestampMs, int directionHint, int timeoutMs);
+    // Non-blocking transactional seek: registers the operator transaction, performs
+    // the inline cache-hit PGM dispatch when the target is already covered, and
+    // returns the generation. Completion is reported via operatorSeekCompleted.
+    quint64 seekToWithPgmNotify(qint64 timestampMs, int directionHint);
+    // Abandon a still-waiting operator transaction (thread-safe). Mirrors the
+    // blocking wait loop's timeout behavior: the worker will not later complete
+    // it or submit PGM for it. No-op if the generation does not match or the
+    // transaction already completed.
+    void abandonOperatorSeekTransaction(quint64 generation);
     // Tier3 frame-perfect ARMED CUT: arm a scheduled atomic cut to targetMs.
     // UI-thread-safe (atomic stores only, never blocks). The worker pre-rolls
     // [target, target+kStagingSpanMs] into a private staging cache on a SECOND
@@ -219,6 +228,14 @@ public:
     // SECOND fired cut, so this proves the safe re-arm queue actually fired the
     // latest target rather than dropping it.
     int cutsFired() const { return m_cutsFired.load(std::memory_order_acquire); }
+
+signals:
+    // Emitted (queued consumers only — connect with explicit Qt::QueuedConnection,
+    // result passed by value) whenever an operator transaction resolves:
+    //   completed && submittedPgm            -> PGM accepted the committed target
+    //   !submittedPgm, message == "PGM output was not submitted" -> dispatch failed
+    //   !completed, message == "superseded"  -> a newer seek replaced it
+    void operatorSeekCompleted(quint64 generation, PlaybackWorker::OperatorSeekResult result);
 
 protected:
     void run() override;
@@ -621,5 +638,9 @@ private:
     PlaybackCounters m_counters;
     void emitTelemetry(int64_t P, int64_t newest, double speed);
 };
+
+// Registered so operatorSeekCompleted can be delivered across threads via a
+// queued connection and extracted from QSignalSpy in tests.
+Q_DECLARE_METATYPE(PlaybackWorker::OperatorSeekResult)
 
 #endif // PLAYBACKWORKER_H

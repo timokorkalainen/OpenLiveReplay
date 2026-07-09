@@ -23,6 +23,13 @@ ControlWebSocketServer::ControlWebSocketServer(ControlApiAdapter* adapter, QObje
     connect(m_server, &QWebSocketServer::closed, this,
             []() { qInfo() << "WebSocket control API closed"; });
 
+    if (m_adapter) {
+        if (QObject* notifier = m_adapter->completionNotifier()) {
+            connect(notifier, SIGNAL(commandCompleted(QString, QString, QJsonObject)), this,
+                    SLOT(deliverCommandCompleted(QString, QString, QJsonObject)));
+        }
+    }
+
     m_timecodeTimer.setSingleShot(true);
     connect(&m_timecodeTimer, &QTimer::timeout, this, &ControlWebSocketServer::publishTimecodeNow);
 }
@@ -123,8 +130,10 @@ void ControlWebSocketServer::handleNewConnection() {
 
     qInfo() << "WebSocket control API accepted client" << socket->peerAddress().toString()
             << socket->peerPort() << socket->requestUrl().toString();
-    socket->setProperty("controlClientId", QString::number(reinterpret_cast<quintptr>(socket)));
+    const QString clientId = QString::number(++m_nextClientSerial);
+    socket->setProperty("controlClientId", clientId);
     m_sockets.insert(socket);
+    m_clientsById.insert(clientId, socket);
 
     connect(socket, &QWebSocket::textMessageReceived, this,
             &ControlWebSocketServer::handleTextMessage);
@@ -162,6 +171,7 @@ void ControlWebSocketServer::handleTextMessage(const QString& message) {
 
     QJsonObject commandArgs = validated.normalizedArgs;
     commandArgs.insert(QStringLiteral("_clientId"), socket->property("controlClientId").toString());
+    commandArgs.insert(QStringLiteral("_commandId"), parsed.message.id);
 
     const auto result = m_adapter->executeCommand(parsed.message.name, commandArgs);
     sendJson(result.ok ? ControlProtocol::ack(parsed.message.id, result.details)
@@ -182,16 +192,36 @@ void ControlWebSocketServer::handleSocketDisconnected() {
     auto socket = qobject_cast<QWebSocket*>(sender());
     if (!socket) return;
 
+    const QString clientId = socket->property("controlClientId").toString();
+
     if (m_adapter) {
         QJsonObject releaseArgs;
         releaseArgs.insert(QStringLiteral("active"), false);
-        releaseArgs.insert(QStringLiteral("_clientId"),
-                           socket->property("controlClientId").toString());
+        releaseArgs.insert(QStringLiteral("_clientId"), clientId);
         m_adapter->executeCommand(QStringLiteral("transport.holdSpeed"), releaseArgs);
     }
 
+    m_clientsById.remove(clientId);
+    if (m_adapter) m_adapter->notifyClientDisconnected(clientId);
+
     m_sockets.remove(socket);
     socket->deleteLater();
+}
+
+void ControlWebSocketServer::deliverCommandCompleted(const QString& clientId,
+                                                     const QString& commandId,
+                                                     const QJsonObject& completion) {
+    QWebSocket* socket = m_clientsById.value(clientId, nullptr);
+    if (!socket) return; // client departed: drop, never re-route
+
+    QJsonObject data = completion;
+    data.insert(QStringLiteral("id"), commandId);
+
+    QJsonObject event;
+    event.insert(QStringLiteral("type"), QStringLiteral("event"));
+    event.insert(QStringLiteral("name"), QStringLiteral("command.completed"));
+    event.insert(QStringLiteral("data"), data);
+    sendJson(event, socket);
 }
 
 void ControlWebSocketServer::sendJson(const QJsonObject& message, QWebSocket* socket) {

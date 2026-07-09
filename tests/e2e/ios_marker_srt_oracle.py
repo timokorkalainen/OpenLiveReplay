@@ -603,17 +603,17 @@ class NdiMarkerWatcher:
         self.log.close()
 
 
-def require_pgm_transaction(ack, label):
-    transaction = ack.get("pgmTransaction") if isinstance(ack, dict) else None
+def require_pgm_transaction(completion, label):
+    transaction = completion.get("pgmTransaction") if isinstance(completion, dict) else None
     if not isinstance(transaction, dict):
-        raise AssertionError(f"{label}: websocket ACK missing pgmTransaction: {ack}")
+        raise AssertionError(f"{label}: command.completed missing pgmTransaction: {completion}")
     if not transaction.get("completed") or not transaction.get("submittedPgm"):
-        raise AssertionError(f"{label}: websocket ACK did not complete PGM submit: {ack}")
+        raise AssertionError(f"{label}: command.completed did not complete PGM submit: {completion}")
     if transaction.get("timedOut"):
-        raise AssertionError(f"{label}: websocket PGM transaction timed out: {ack}")
+        raise AssertionError(f"{label}: PGM transaction timed out: {completion}")
     identity = transaction.get("identity", {})
     print(
-        "PGM_ACK "
+        "PGM_COMPLETED "
         f"{label} elapsedNs={transaction.get('elapsedNs')} "
         f"targetMs={transaction.get('targetMs')} "
         f"sampledMs={identity.get('sampledPlayheadMs')} "
@@ -643,6 +643,16 @@ def wait_for_command_ack(ws, cmd_id, name, timeout):
     raise TimeoutError(f"timed out waiting for ack to {name}")
 
 
+def wait_for_command_completed(ws, cmd_id, name, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        msg = ws.recv_json(max(0.1, deadline - time.monotonic()))
+        if (msg.get("type") == "event" and msg.get("name") == "command.completed"
+                and msg.get("data", {}).get("id") == cmd_id):
+            return msg["data"]
+    raise TimeoutError(f"timed out waiting for command.completed to {name}")
+
+
 def run_command_with_ndi_latency(args, ws, ndi, label, expected_marker, name,
                                  command_args=None, *, timeout=10.0):
     if not ndi:
@@ -651,6 +661,16 @@ def run_command_with_ndi_latency(args, ws, ndi, label, expected_marker, name,
     min_frames_decoded = ndi.drain()
     started = time.perf_counter()
     cmd_id = send_command_for_latency(ws, name, command_args or {})
+    # Mirror the two-phase contract used elsewhere in this oracle (see
+    # WsClient.send_command_and_wait_completed): the ack is read - and
+    # ack_elapsed_ms is timestamped - as soon as it actually arrives, strictly
+    # before we wait on anything else. That keeps the round-trip measurement
+    # isolated from the NDI marker and command.completed waits below, both of
+    # which are only expected to land once the PGM outcome is ready; reading
+    # completion only after the ack is in hand also rules out the "completion
+    # before its ack" ordering bug the two-phase helper guards against.
+    wait_for_command_ack(ws, cmd_id, name, timeout)
+    ack_elapsed_ms = (time.perf_counter() - started) * 1000.0
     sample = ndi.wait_for_marker_with_latency(
         expected_marker,
         label,
@@ -659,10 +679,21 @@ def run_command_with_ndi_latency(args, ws, ndi, label, expected_marker, name,
         args.latency_threshold_ms,
         min_frames_decoded=min_frames_decoded,
     )
-    command_ack = wait_for_command_ack(ws, cmd_id, name, timeout)
+    command_completion = wait_for_command_completed(ws, cmd_id, name, timeout)
     command_elapsed_ms = (time.perf_counter() - started) * 1000.0
-    transaction = command_ack.get("pgmTransaction") if isinstance(command_ack, dict) else None
+    if ack_elapsed_ms >= 100.0:
+        raise AssertionError(
+            "transactional command ack round-trip exceeded 100 ms "
+            f"label={label} name={name} ackElapsedMs={ack_elapsed_ms:.2f}"
+        )
+    transaction = (
+        command_completion.get("pgmTransaction")
+        if isinstance(command_completion, dict) else None
+    )
     transaction_elapsed_ns = transaction.get("elapsedNs") if isinstance(transaction, dict) else "?"
+    completion_latency_ms = (
+        command_completion.get("latencyMs") if isinstance(command_completion, dict) else "?"
+    )
     latency_ms = sample["latencyMs"]
     if latency_ms > args.latency_threshold_ms:
         raise AssertionError(
@@ -670,6 +701,8 @@ def run_command_with_ndi_latency(args, ws, ndi, label, expected_marker, name,
             f"label={label} expected={expected_marker} elapsedMs={latency_ms:.2f} "
             f"max_ndi_latency_ms={args.latency_threshold_ms:.2f} "
             f"commandElapsedMs={command_elapsed_ms:.2f} "
+            f"ackElapsedMs={ack_elapsed_ms:.2f} "
+            f"completionLatencyMs={completion_latency_ms} "
             f"pgmTransactionElapsedNs={transaction_elapsed_ns} "
             f"lastDrainedMarker={ndi.last_drained_marker} "
             f"lastDrainedFramesDecoded={ndi.last_drained_frames_decoded} "
@@ -680,13 +713,15 @@ def run_command_with_ndi_latency(args, ws, ndi, label, expected_marker, name,
         f"label={label} marker={expected_marker} elapsedMs={latency_ms:.2f} "
         f"max_ndi_latency_ms={args.latency_threshold_ms:.2f} "
         f"commandElapsedMs={command_elapsed_ms:.2f} "
+        f"ackElapsedMs={ack_elapsed_ms:.2f} "
+        f"completionLatencyMs={completion_latency_ms} "
         f"pgmTransactionElapsedNs={transaction_elapsed_ns} "
         f"framesDecoded={sample['framesDecoded']} "
         f"lastDrainedMarker={ndi.last_drained_marker} "
         f"lastDrainedFramesDecoded={ndi.last_drained_frames_decoded}"
     )
     sample["commandElapsedMs"] = command_elapsed_ms
-    return command_ack, sample
+    return command_completion, sample
 
 
 def decode_marker(args, jpeg):
@@ -875,13 +910,17 @@ def run_oracle(args, workdir, srt_url):
 
         command(ws, "transport.pause", timeout=5)
         seek_min_frames = ndi.drain() if ndi else None
-        seek_ack = command(
-            ws,
+        _seek_ack, seek_completion, seek_ack_elapsed_ms = ws.send_command_and_wait_completed(
             "transport.seek",
             {"positionMs": args.target_ms, "waitForPgm": True},
             timeout=10,
         )
-        require_pgm_transaction(seek_ack, "seek_target")
+        if seek_ack_elapsed_ms >= 100.0:
+            raise AssertionError(
+                "transactional command ack round-trip exceeded 100 ms "
+                f"label=seek_target ackElapsedMs={seek_ack_elapsed_ms:.2f}"
+            )
+        require_pgm_transaction(seek_completion, "seek_target")
         time.sleep(args.step_delay_seconds)
 
         base_marker, path, probe = capture_marker(args, ws, workdir, "seek_target")
@@ -899,7 +938,7 @@ def run_oracle(args, workdir, srt_url):
                 "ndiMarker": ndi_marker,
                 "expectedMarker": base_marker,
                 "ok": True,
-                "pgmTransaction": seek_ack.get("pgmTransaction"),
+                "pgmTransaction": seek_completion.get("pgmTransaction"),
                 "path": str(path),
                 "probe": probe,
             }
@@ -913,7 +952,7 @@ def run_oracle(args, workdir, srt_url):
             before = int(ws.state.get("transport", {}).get("positionMs", -1))
             label = f"step_{index:03d}_{'fwd' if delta > 0 else 'back'}"
             expected = base_marker + cumulative + delta
-            step_ack, ndi_sample = run_command_with_ndi_latency(
+            step_completion, ndi_sample = run_command_with_ndi_latency(
                 args,
                 ws,
                 ndi,
@@ -923,7 +962,7 @@ def run_oracle(args, workdir, srt_url):
                 {"frames": delta},
                 timeout=10,
             )
-            require_pgm_transaction(step_ack, label)
+            require_pgm_transaction(step_completion, label)
             if ndi_sample:
                 ndi_latency_samples.append(ndi_sample["latencyMs"])
             time.sleep(args.step_delay_seconds)
@@ -942,7 +981,7 @@ def run_oracle(args, workdir, srt_url):
                 "ndiMarker": ndi_marker,
                 "expectedMarker": expected,
                 "ok": ok,
-                "pgmTransaction": step_ack.get("pgmTransaction"),
+                "pgmTransaction": step_completion.get("pgmTransaction"),
                 "ndiLatencyMs": ndi_sample["latencyMs"] if ndi_sample else None,
                 "path": str(path),
                 "probe": probe,
@@ -964,7 +1003,7 @@ def run_oracle(args, workdir, srt_url):
             target_ms = frame_index_to_ms(target_frame, args.fps)
             expected = base_marker + (target_frame - base_frame)
             label = f"cold_seek_{index:02d}"
-            cold_ack, ndi_sample = run_command_with_ndi_latency(
+            cold_completion, ndi_sample = run_command_with_ndi_latency(
                 args,
                 ws,
                 ndi,
@@ -974,7 +1013,7 @@ def run_oracle(args, workdir, srt_url):
                 {"positionMs": target_ms},
                 timeout=10,
             )
-            require_pgm_transaction(cold_ack, label)
+            require_pgm_transaction(cold_completion, label)
             if ndi_sample:
                 ndi_latency_samples.append(ndi_sample["latencyMs"])
             time.sleep(args.step_delay_seconds)
@@ -991,7 +1030,7 @@ def run_oracle(args, workdir, srt_url):
                 "ndiMarker": ndi_marker,
                 "expectedMarker": expected,
                 "ok": ok,
-                "pgmTransaction": cold_ack.get("pgmTransaction"),
+                "pgmTransaction": cold_completion.get("pgmTransaction"),
                 "ndiLatencyMs": ndi_sample["latencyMs"] if ndi_sample else None,
                 "path": str(path),
                 "probe": probe,

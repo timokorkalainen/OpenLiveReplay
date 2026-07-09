@@ -115,7 +115,7 @@ def main():
         "pgmTransaction",
         "waitForPgm",
         "ackAfterPgmTransaction",
-        "WebSocket ACK missing PGM transaction metadata",
+        "command.completed missing PGM transaction metadata",
         "postAckElapsedMs",
         "threading.Thread",
         "ignoredMarkers",
@@ -247,8 +247,9 @@ def main():
             "held-target",
             168,
             15.0,
-            lambda: {"pgmTransaction": {"completed": True, "submittedPgm": True,
-                                        "timedOut": False}},
+            lambda: ({}, {"done": True,
+                          "pgmTransaction": {"completed": True, "submittedPgm": True,
+                                             "timedOut": False}}, 5.0),
             expected_timecode=40000000,
         )
     except AssertionError as exc:

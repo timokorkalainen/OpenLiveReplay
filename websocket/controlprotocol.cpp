@@ -147,6 +147,14 @@ ControlProtocol::validateCommand(const ControlCommandMessage& command) {
     const QJsonObject args = command.args;
     const QString name = command.name;
 
+    if (args.value(QStringLiteral("waitForPgm")).toBool(false) && command.id.trimmed().isEmpty() &&
+        (name == QStringLiteral("transport.seek") ||
+         name == QStringLiteral("transport.stepFrame") || name == QStringLiteral("action.jog"))) {
+        return invalid(name +
+                       QStringLiteral(" with waitForPgm requires a command id for completion "
+                                      "correlation"));
+    }
+
     if (name == QStringLiteral("transport.playPause") || name == QStringLiteral("transport.play") ||
         name == QStringLiteral("transport.pause") || name == QStringLiteral("transport.goLive") ||
         name == QStringLiteral("transport.cancelFollowLive") ||

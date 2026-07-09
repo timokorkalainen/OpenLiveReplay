@@ -138,6 +138,36 @@ class WsClient:
                 return msg
         raise TimeoutError(f"timed out waiting for ack to {name}")
 
+    def send_command_and_wait_completed(self, name, args=None, timeout=5.0):
+        """Two-phase transactional command: returns (ack, completion, ack_elapsed_ms).
+
+        The ack arrives immediately with status="accepted"; the completion is the
+        correlated command.completed event carrying the PGM outcome.
+        ack_elapsed_ms is measured independently at ack receipt so callers can
+        assert the ack round-trip stays fast even when the completion (the PGM
+        marker) lands later.
+        """
+        cmd_id = f"{name}-{int(time.time() * 1000)}-{os.getpid()}"
+        self.send_json({"type": "command", "id": cmd_id, "name": name, "args": args or {}})
+        started = time.monotonic()
+        ack = None
+        ack_elapsed_ms = None
+        deadline = started + timeout
+        while time.monotonic() < deadline:
+            msg = self.recv_json(max(0.1, deadline - time.monotonic()))
+            if msg.get("type") == "ack" and msg.get("id") == cmd_id:
+                if not msg.get("ok"):
+                    raise AssertionError(f"{name}: command rejected: {msg}")
+                ack = msg
+                ack_elapsed_ms = (time.monotonic() - started) * 1000.0
+                continue
+            if (msg.get("type") == "event" and msg.get("name") == "command.completed"
+                    and msg.get("data", {}).get("id") == cmd_id):
+                if ack is None:
+                    raise AssertionError(f"{name}: completion before ack: {msg}")
+                return ack, msg["data"], ack_elapsed_ms
+        raise TimeoutError(f"timed out waiting for command.completed for {name}")
+
     def wait_for(self, predicate, timeout, label):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -466,14 +496,15 @@ def run_command_with_ndi_latency(watcher, label, expected_marker, threshold_ms, 
     command_error = []
     command_done = threading.Event()
     command_elapsed_ms = None
-    command_ack = None
+    command_completion = None
+    ack_elapsed_ms = None
 
     def run_command():
-        nonlocal command_ack, command_elapsed_ms
+        nonlocal command_completion, command_elapsed_ms, ack_elapsed_ms
         try:
-            maybe_ack = command()
-            if isinstance(maybe_ack, dict):
-                command_ack = maybe_ack
+            result = command()
+            if isinstance(result, tuple) and len(result) == 3:
+                _ack, command_completion, ack_elapsed_ms = result
         except BaseException as exc:
             command_error.append(exc)
         finally:
@@ -501,18 +532,23 @@ def run_command_with_ndi_latency(watcher, label, expected_marker, threshold_ms, 
         command_elapsed_ms = (time.perf_counter() - started) * 1000.0
     if command_error:
         raise command_error[0]
-    ack_elapsed_ms = command_elapsed_ms
-    pgm_transaction = (command_ack or {}).get("pgmTransaction")
-    ack_after_pgm_transaction = (
-        isinstance(pgm_transaction, dict)
-        and pgm_transaction.get("completed") is True
-        and pgm_transaction.get("submittedPgm") is True
-        and pgm_transaction.get("timedOut") is False
-    )
+    pgm_transaction = (command_completion or {}).get("pgmTransaction")
+    completion_done = bool((command_completion or {}).get("done"))
+    ack_after_pgm_transaction = completion_done and isinstance(pgm_transaction, dict)
     if not ack_after_pgm_transaction:
         raise AssertionError(
-            "WebSocket ACK missing PGM transaction metadata "
-            f"label={label} expected={expected_marker} ack={command_ack}"
+            "command.completed missing PGM transaction metadata "
+            f"label={label} expected={expected_marker} completion={command_completion}"
+        )
+    if ack_elapsed_ms is None:
+        raise AssertionError(
+            "transactional command never received an accepted ack "
+            f"label={label} expected={expected_marker}"
+        )
+    if ack_elapsed_ms >= 100.0:
+        raise AssertionError(
+            "transactional command ack round-trip exceeded 100 ms "
+            f"label={label} expected={expected_marker} ackElapsedMs={ack_elapsed_ms:.2f}"
         )
     pgm_transaction_elapsed_ns = pgm_transaction.get("elapsedNs", "?")
     pgm_transaction_target_ms = pgm_transaction.get("targetMs", "?")
@@ -1584,7 +1620,7 @@ def main():
                         step_label,
                         expected,
                         args.latency_threshold_ms,
-                        lambda: ws.command(
+                        lambda: ws.send_command_and_wait_completed(
                             "transport.stepFrame", {"frames": delta, "waitForPgm": True}
                         ),
                         expected_timecode=frame_index_to_ms(current_frame) * 10000,
@@ -1625,7 +1661,7 @@ def main():
                     f"cold_seek_{index + 1}",
                     expected,
                     args.latency_threshold_ms,
-                    lambda: ws.command(
+                    lambda: ws.send_command_and_wait_completed(
                         "transport.seek",
                         {"positionMs": frame_index_to_ms(frame), "waitForPgm": True},
                     ),

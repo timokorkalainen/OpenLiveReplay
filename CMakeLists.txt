@@ -200,6 +200,7 @@ qt_add_qml_module(OpenLiveReplay
         websocket/controlstate.h websocket/controlstate.cpp
         websocket/controlwebsocketserver.h websocket/controlwebsocketserver.cpp
         websocket/uimanagercontroladapter.h websocket/uimanagercontroladapter.cpp
+        websocket/pendingcommandregistry.h websocket/pendingcommandregistry.cpp
         recorder_engine/replaymanager.cpp recorder_engine/replaymanager.h
         recorder_engine/heartbeat.h recorder_engine/heartbeat.cpp
         recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp

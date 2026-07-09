@@ -9,11 +9,20 @@
 #include "websocket/controlstate.h"
 #include "websocket/controlwebsocketserver.h"
 
+class CompletionNotifier : public QObject {
+    Q_OBJECT
+signals:
+    void commandCompleted(const QString& clientId, const QString& commandId,
+                          const QJsonObject& completion);
+};
+
 class ServerFakeAdapter final : public QObject, public ControlApiAdapter {
 public:
     QString lastCommand;
     QJsonObject lastArgs;
     QJsonObject resultDetails;
+    CompletionNotifier notifier;
+    QStringList disconnectedClients;
 
     RecordingState recordingState() const override { return {}; }
 
@@ -53,6 +62,12 @@ public:
         result.details = resultDetails;
         return result;
     }
+
+    QObject* completionNotifier() override { return &notifier; }
+
+    void notifyClientDisconnected(const QString& clientId) override {
+        disconnectedClients.append(clientId);
+    }
 };
 
 class TestControlWebSocketServer : public QObject {
@@ -65,6 +80,7 @@ private slots:
     void publishEventBroadcastsToAllSockets();
     void publishOutputPatchBroadcastsPreviewCounters();
     void rejectsBinaryMessageAsUnsupported();
+    void completionEventReachesOnlyTheOriginatingClient();
 };
 
 void TestControlWebSocketServer::sendsSnapshotAndTimecodeOnConnect() {
@@ -255,6 +271,60 @@ void TestControlWebSocketServer::rejectsBinaryMessageAsUnsupported() {
         QJsonDocument::fromJson(messages.at(2).at(0).toString().toUtf8()).object();
     QCOMPARE(err.value(QStringLiteral("type")).toString(), QStringLiteral("error"));
     QCOMPARE(err.value(QStringLiteral("code")).toString(), QStringLiteral("unsupported_message"));
+}
+
+void TestControlWebSocketServer::completionEventReachesOnlyTheOriginatingClient() {
+    ServerFakeAdapter adapter;
+    adapter.resultDetails = QJsonObject{{QStringLiteral("status"), QStringLiteral("accepted")}};
+    ControlWebSocketServer server(&adapter);
+    QVERIFY(server.listen(QHostAddress::LocalHost, 0));
+
+    QWebSocket clientA;
+    QWebSocket clientB;
+    QSignalSpy aInitialMessages(&clientA, &QWebSocket::textMessageReceived);
+    QSignalSpy bInitialMessages(&clientB, &QWebSocket::textMessageReceived);
+    clientA.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/api/ws").arg(server.serverPort())));
+    clientB.open(QUrl(QStringLiteral("ws://127.0.0.1:%1/api/ws").arg(server.serverPort())));
+
+    QTRY_COMPARE_WITH_TIMEOUT(aInitialMessages.count(), 2, 2000);
+    QTRY_COMPARE_WITH_TIMEOUT(bInitialMessages.count(), 2, 2000);
+
+    // Client A sends a transactional command; capture its ack.
+    clientA.sendTextMessage(
+        QStringLiteral(R"({"type":"command","id":"cmd-1","name":"transport.seek",)"
+                       R"("args":{"positionMs":1000,"waitForPgm":true}})"));
+    QTRY_VERIFY(!adapter.lastArgs.isEmpty());
+    QCOMPARE(adapter.lastArgs.value(QStringLiteral("_commandId")).toString(),
+             QStringLiteral("cmd-1"));
+    const QString clientId = adapter.lastArgs.value(QStringLiteral("_clientId")).toString();
+    QVERIFY(!clientId.isEmpty());
+
+    // Fire the completion through the notifier; only A must receive the event.
+    QSignalSpy aMessages(&clientA, &QWebSocket::textMessageReceived);
+    QSignalSpy bMessages(&clientB, &QWebSocket::textMessageReceived);
+    emit adapter.notifier.commandCompleted(
+        clientId, QStringLiteral("cmd-1"),
+        QJsonObject{{QStringLiteral("done"), true}, {QStringLiteral("latencyMs"), 12.0}});
+
+    QTRY_VERIFY(aMessages.count() >= 1);
+    const QJsonObject event =
+        QJsonDocument::fromJson(aMessages.last().at(0).toString().toUtf8()).object();
+    QCOMPARE(event.value(QStringLiteral("type")).toString(), QStringLiteral("event"));
+    QCOMPARE(event.value(QStringLiteral("name")).toString(), QStringLiteral("command.completed"));
+    const QJsonObject data = event.value(QStringLiteral("data")).toObject();
+    QCOMPARE(data.value(QStringLiteral("id")).toString(), QStringLiteral("cmd-1"));
+    QVERIFY(data.value(QStringLiteral("done")).toBool());
+    QCOMPARE(bMessages.count(), 0);
+
+    // Unknown clientId is silently dropped (no crash, nothing broadcast).
+    emit adapter.notifier.commandCompleted(QStringLiteral("no-such-client"),
+                                           QStringLiteral("cmd-2"), QJsonObject{});
+    QTest::qWait(50);
+    QCOMPARE(bMessages.count(), 0);
+
+    // Disconnect purge notifies the adapter.
+    clientA.close();
+    QTRY_VERIFY(adapter.disconnectedClients.contains(clientId));
 }
 
 QTEST_GUILESS_MAIN(TestControlWebSocketServer)

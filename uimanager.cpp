@@ -789,6 +789,32 @@ PlaybackWorker::OperatorSeekResult UIManager::jogExternalAndWaitForPgm(int delta
     return jogStep(delta, timeoutMs);
 }
 
+UIManager::AsyncSeekTicket UIManager::jogExternalAsyncPgm(int delta) {
+    AsyncSeekTicket ticket;
+    if (!m_transport || delta == 0) {
+        ticket.message =
+            delta == 0 ? QStringLiteral("no-op") : QStringLiteral("transport unavailable");
+        return ticket;
+    }
+    // Same jog preamble as jogStep (below): pause, leave live-follow, step the
+    // transport, clamp forward jogs to the live edge.
+    m_transport->setPlaying(false);
+    cancelFollowLive();
+    m_transport->step(delta);
+    if (delta > 0) {
+        const int64_t liveEdge = recordedDurationMs();
+        if (m_transport->currentPos() > liveEdge) m_transport->seek(liveEdge);
+    }
+    if (!m_playbackWorker) {
+        ticket.message = QStringLiteral("playback worker unavailable");
+        return ticket;
+    }
+    ticket.workerEpoch = m_playbackWorkerEpoch;
+    ticket.generation = m_playbackWorker->seekToWithPgmNotify(m_transport->currentPos(), delta);
+    ticket.accepted = true;
+    return ticket;
+}
+
 PlaybackWorker::OperatorSeekResult UIManager::jogStep(int delta, int timeoutMs) {
     PlaybackWorker::OperatorSeekResult result;
     if (!m_transport || delta == 0) {
@@ -1882,6 +1908,7 @@ void UIManager::startRecording() {
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
     m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
+    wirePlaybackWorkerCompletion();
 
     // 2. Point it to the file being recorded
     // QString filePath = m_replayManager->getOutputDirectory() + "/" +
@@ -1909,11 +1936,29 @@ void UIManager::restartPlaybackWorker() {
     m_playbackWorker->setSelectedOutputFeed(m_playbackSelectedIndex);
     m_playbackWorker->setRequireAllOutputFeedsForPlayhead(!m_playbackSingleView);
     m_playbackWorker->setExternalOutputTargets(m_currentSettings.broadcastOutputs);
+    wirePlaybackWorkerCompletion();
     m_playbackWorker->openFile(m_replayManager->getVideoPath());
     m_playbackWorker->start();
     m_transport->seek(0);
     m_transport->setPlaying(true);
     setFollowLive(true);
+}
+
+void UIManager::wirePlaybackWorkerCompletion() {
+    // The worker is recreated per playback session; its generation counter restarts,
+    // so completions are keyed by (epoch, generation). The queued relay dies with
+    // each worker and is re-made here; the control adapter connects once to this
+    // stable UIManager signal instead of the transient worker.
+    ++m_playbackWorkerEpoch;
+    emit playbackWorkerEpochChanged(m_playbackWorkerEpoch);
+    if (!m_playbackWorker) return;
+    const quint64 epoch = m_playbackWorkerEpoch;
+    connect(
+        m_playbackWorker, &PlaybackWorker::operatorSeekCompleted, this,
+        [this, epoch](quint64 generation, const PlaybackWorker::OperatorSeekResult& result) {
+            emit operatorSeekCompleted(epoch, generation, result);
+        },
+        Qt::QueuedConnection);
 }
 
 void UIManager::stopRecording() {
@@ -1973,6 +2018,34 @@ PlaybackWorker::OperatorSeekResult UIManager::seekPlaybackAndWaitForPgm(int64_t 
         return result;
     }
     return m_playbackWorker->seekToAndWaitForPgm(ms, directionHint, timeoutMs);
+}
+
+UIManager::AsyncSeekTicket UIManager::seekPlaybackAsyncPgm(int64_t ms) {
+    AsyncSeekTicket ticket;
+    // Same operator-override preamble as seekPlaybackAndWaitForPgm above.
+    stopPlaylistPlayout();
+    setFollowLive(false);
+    m_scrubCoalesceTimer.stop();
+    m_seekCoalescer.reset();
+    if (!m_transport) {
+        ticket.message = QStringLiteral("transport unavailable");
+        return ticket;
+    }
+    const int directionHint = ms < m_transport->currentPos() ? -1 : 1;
+    m_transport->seek(ms);
+    if (!m_playbackWorker) {
+        ticket.message = QStringLiteral("playback worker unavailable");
+        return ticket;
+    }
+    ticket.workerEpoch = m_playbackWorkerEpoch;
+    ticket.generation = m_playbackWorker->seekToWithPgmNotify(qMax<int64_t>(0, ms), directionHint);
+    ticket.accepted = true;
+    return ticket;
+}
+
+void UIManager::abandonOperatorSeek(quint64 workerEpoch, quint64 generation) {
+    if (workerEpoch != m_playbackWorkerEpoch || !m_playbackWorker) return;
+    m_playbackWorker->abandonOperatorSeekTransaction(generation);
 }
 
 void UIManager::commitPendingScrub() {

@@ -2,6 +2,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "websocket/controlapiadapter.h"
 #include "websocket/controlprotocol.h"
 
 class TestControlProtocol : public QObject {
@@ -22,6 +23,8 @@ private slots:
     void rejectsActionDispatchForShuttleId();
     void validatesActionShuttleDelta();
     void validatesActionJogWaitForPgmFlag();
+    void waitForPgmRequiresCommandId();
+    void acceptedResultShape();
     void validatesNdiOutputEnabledCommand();
     void rejectsNdiOutputEnabledWithoutBusKind();
     void validatesNdiOutputSenderNameCommand();
@@ -198,6 +201,33 @@ void TestControlProtocol::validatesActionJogWaitForPgmFlag() {
 
     QVERIFY(validation.ok);
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("waitForPgm")).toBool(), true);
+}
+
+void TestControlProtocol::waitForPgmRequiresCommandId() {
+    ControlCommandMessage command;
+    command.type = QStringLiteral("command");
+    command.name = QStringLiteral("transport.seek");
+    command.args =
+        QJsonObject{{QStringLiteral("positionMs"), 1000}, {QStringLiteral("waitForPgm"), true}};
+    command.id = QString(); // no id -> completion could never be correlated
+    const auto validation = ControlProtocol::validateCommand(command);
+    QVERIFY(!validation.ok);
+
+    command.id = QStringLiteral("cmd-1");
+    QVERIFY(ControlProtocol::validateCommand(command).ok);
+
+    // Without waitForPgm an empty id stays legal (fire-and-forget).
+    command.id = QString();
+    command.args.remove(QStringLiteral("waitForPgm"));
+    QVERIFY(ControlProtocol::validateCommand(command).ok);
+}
+
+void TestControlProtocol::acceptedResultShape() {
+    const CommandResult result = CommandResult::accepted(3, 42);
+    QVERIFY(result.ok);
+    QCOMPARE(result.details.value(QStringLiteral("status")).toString(), QStringLiteral("accepted"));
+    QCOMPARE(result.details.value(QStringLiteral("generation")).toString(), QStringLiteral("42"));
+    QCOMPARE(result.details.value(QStringLiteral("workerEpoch")).toString(), QStringLiteral("3"));
 }
 
 void TestControlProtocol::validatesNdiOutputEnabledCommand() {
