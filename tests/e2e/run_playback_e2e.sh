@@ -612,8 +612,10 @@ case "$SCENARIO" in
         # back to repeated full repositions. It is normally 1, but the
         # direction-flip transient on a loaded/slow CI runner can add a few more
         # (observed reposition=4 on busy hosts while reverseChunkSeek held at the
-        # intended ~17). Bound it at 4 — a genuine reverse-thrash regression
-        # produces many more — so the gate stays meaningful without flaking.
+        # intended ~17). Bound it at 6 — clear headroom over the observed busy-host
+        # max (4), consistent with the farback sibling, yet far below a genuine
+        # reverse-thrash regression (many more) — so the gate stays meaningful
+        # without flaking.
         #
         # reverseChunkSeek is a SECONDARY, load-variant bound. By design each
         # chunk-seek fetches kChunkMs(=500ms) of reverse travel, so the count
@@ -630,8 +632,8 @@ case "$SCENARIO" in
             echo "FAIL: reverse chunk-seek storm (reverseChunkSeek=$reverseChunkSeek, expected <=150) — per-frame reverse thrash"
             fail=1
         fi
-        if ! num "$reposition" || [ "$reposition" -gt 4 ]; then
-            echo "FAIL: reverse repositioned too much (reposition=$reposition, expected <=4) — reverse thrash"
+        if ! num "$reposition" || [ "$reposition" -gt 6 ]; then
+            echo "FAIL: reverse repositioned too much (reposition=$reposition, expected <=6) — reverse thrash"
             fail=1
         fi
         ;;
