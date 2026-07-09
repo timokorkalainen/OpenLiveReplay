@@ -36,18 +36,23 @@ Window {
             anchors.fill: parent
             fillMode: VideoOutput.PreserveAspectFit
             z: 0
-            property var attachedProvider: null
+            property QtObject attachedProvider: null
 
+            // qmllint disable missing-property
             function attachProvider(provider) {
                 if (attachedProvider === provider) return
-                if (attachedProvider) {
-                    attachedProvider.removeVideoSink(videoSink)
+                var previousProvider = attachedProvider
+                attachedProvider = null
+                if (previousProvider
+                        && typeof previousProvider.removeVideoSink === "function") {
+                    previousProvider.removeVideoSink(videoSink)
                 }
                 attachedProvider = provider
                 if (attachedProvider) {
                     attachedProvider.addVideoSink(videoSink)
                 }
             }
+            // qmllint enable missing-property
 
             Component.onCompleted: {
                 attachProvider(multiviewWindow.uiManager ? multiviewWindow.uiManager.multiviewPreviewProvider : null)

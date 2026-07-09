@@ -83,20 +83,7 @@ void FrameProvider::addVideoSink(QVideoSink *sink)
             sink->setVideoFrame(lastFrameCopy);
             markSinkAppliedSerial(sink, frameSerial);
         } else {
-            QPointer<FrameProvider> providerPtr = this;
-            QPointer<QVideoSink> sinkPtr = sink;
-            QMetaObject::invokeMethod(
-                sink,
-                [providerPtr, sinkPtr, frameSerial]() mutable {
-                    if (!providerPtr || !sinkPtr) return;
-                    QVideoFrame latest;
-                    if (!providerPtr->latestFrameForSerial(frameSerial, &latest)) return;
-                    if (sinkPtr) {
-                        sinkPtr->setVideoFrame(latest);
-                        providerPtr->markSinkAppliedSerial(sinkPtr, frameSerial);
-                    }
-                },
-                Qt::QueuedConnection);
+            queueLatestFrameForSink(sink);
         }
     }
 }
@@ -111,6 +98,7 @@ void FrameProvider::removeVideoSink(QVideoSink *sink)
             m_sinks.removeAt(i);
         }
     }
+    m_pendingSinkUpdates.remove(sink);
     m_appliedSerialBySink.remove(sink);
 
     if (m_sink == sink) {
@@ -143,20 +131,7 @@ quint64 FrameProvider::deliverFrame(const QVideoFrame& frame) {
             sink->setVideoFrame(displayFrame);
             markSinkAppliedSerial(sink, frameSerial);
         } else {
-            QPointer<FrameProvider> providerPtr = this;
-            QPointer<QVideoSink> sinkPtr = sink;
-            QMetaObject::invokeMethod(
-                sink,
-                [providerPtr, sinkPtr, frameSerial]() mutable {
-                    if (!providerPtr || !sinkPtr) return;
-                    QVideoFrame latest;
-                    if (!providerPtr->latestFrameForSerial(frameSerial, &latest)) return;
-                    if (sinkPtr) {
-                        sinkPtr->setVideoFrame(latest);
-                        providerPtr->markSinkAppliedSerial(sinkPtr, frameSerial);
-                    }
-                },
-                Qt::QueuedConnection);
+            queueLatestFrameForSink(sink);
         }
     }
     return frameSerial;
@@ -320,14 +295,76 @@ QImage FrameProvider::latestImage(quint64* serial) const {
     return img;
 }
 
-bool FrameProvider::latestFrameForSerial(quint64 serial, QVideoFrame* frame) const {
-    if (!frame) return false;
+void FrameProvider::queueLatestFrameForSink(QVideoSink* sink) {
+    if (!sink) return;
 
-    QMutexLocker locker(&m_frameMutex);
-    if (serial != m_frameSerial || !m_lastFrame.isValid()) return false;
+    {
+        QMutexLocker locker(&m_sinkMutex);
+        const bool registered = std::any_of(
+            m_sinks.cbegin(), m_sinks.cend(),
+            [sink](const QPointer<QVideoSink>& candidate) { return candidate == sink; });
+        if (!registered || m_pendingSinkUpdates.contains(sink)) return;
+        m_pendingSinkUpdates.insert(sink);
+    }
 
-    *frame = m_lastFrame;
-    return true;
+    postLatestFrameForSink(sink);
+}
+
+bool FrameProvider::postLatestFrameForSink(QVideoSink* sink) {
+    if (!sink) return false;
+
+    QPointer<FrameProvider> providerPtr = this;
+    QPointer<QVideoSink> sinkPtr = sink;
+    const bool queued = QMetaObject::invokeMethod(
+        sink,
+        [providerPtr, sinkPtr]() {
+            if (providerPtr && sinkPtr) providerPtr->applyLatestFrameToSink(sinkPtr);
+        },
+        Qt::QueuedConnection);
+    if (!queued) {
+        QMutexLocker locker(&m_sinkMutex);
+        m_pendingSinkUpdates.remove(sink);
+    }
+    return queued;
+}
+
+void FrameProvider::applyLatestFrameToSink(QVideoSink* sink) {
+    if (!sink) return;
+
+    {
+        QMutexLocker locker(&m_sinkMutex);
+        const bool registered = std::any_of(
+            m_sinks.cbegin(), m_sinks.cend(),
+            [sink](const QPointer<QVideoSink>& candidate) { return candidate == sink; });
+        if (!registered || !m_pendingSinkUpdates.contains(sink)) {
+            m_pendingSinkUpdates.remove(sink);
+            return;
+        }
+    }
+
+    QVideoFrame frame;
+    quint64 appliedSerial = 0;
+    {
+        QMutexLocker locker(&m_frameMutex);
+        frame = m_lastFrame;
+        appliedSerial = m_frameSerial;
+    }
+    if (frame.isValid()) sink->setVideoFrame(frame);
+
+    bool queueAgain = false;
+    {
+        QMutexLocker sinkLocker(&m_sinkMutex);
+        if (!m_pendingSinkUpdates.contains(sink)) return;
+        if (frame.isValid()) {
+            m_appliedSerialBySink[sink] = qMax(m_appliedSerialBySink.value(sink, 0), appliedSerial);
+        }
+
+        QMutexLocker frameLocker(&m_frameMutex);
+        queueAgain = m_frameSerial > appliedSerial;
+        if (!queueAgain) m_pendingSinkUpdates.remove(sink);
+    }
+
+    if (queueAgain) postLatestFrameForSink(sink);
 }
 
 qint64 FrameProvider::nextDisplayStartUsLocked() {
