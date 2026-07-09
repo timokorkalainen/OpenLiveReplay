@@ -55,9 +55,9 @@ void SharedGpuReadbackCache::clear() {
     std::lock_guard<std::mutex> locker(m_mutex);
     for (auto it = m_cache.begin(); it != m_cache.end();) {
         Entry& entry = it.value();
-        if (entry.reading || entry.waiters > 0 || entry.retainedReaders > 0) {
-            ++it;
-        } else if (entry.ready && entry.planes.isValid()) {
+        const bool keepEntry = entry.reading || entry.waiters > 0 || entry.retainedReaders > 0 ||
+                               (entry.ready && entry.planes.isValid());
+        if (keepEntry) {
             ++it;
         } else {
             eraseEntryLocked(it++);
