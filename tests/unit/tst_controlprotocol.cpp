@@ -11,6 +11,8 @@ private slots:
     void rejectsMalformedJson();
     void rejectsMissingCommandName();
     void validatesSeekArgs();
+    void validatesSeekWaitForPgmFlag();
+    void rejectsSeekWaitForPgmNonBool();
     void validatesSeekArgsAcceptsLargeInteger();
     void rejectsSeekWithFractionalPosition();
     void rejectsSeekWithoutPosition();
@@ -19,6 +21,7 @@ private slots:
     void validatesActionDispatchDefaultsPressed();
     void rejectsActionDispatchForShuttleId();
     void validatesActionShuttleDelta();
+    void validatesActionJogWaitForPgmFlag();
     void validatesNdiOutputEnabledCommand();
     void rejectsNdiOutputEnabledWithoutBusKind();
     void validatesNdiOutputSenderNameCommand();
@@ -67,6 +70,30 @@ void TestControlProtocol::validatesSeekArgs() {
 
     QVERIFY(validation.ok);
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("positionMs")).toInt(), 42);
+}
+
+void TestControlProtocol::validatesSeekWaitForPgmFlag() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("seek-wait"), QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 42}, {QStringLiteral("waitForPgm"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("waitForPgm")).toBool(), true);
+}
+
+void TestControlProtocol::rejectsSeekWaitForPgmNonBool() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("seek-wait"), QStringLiteral("transport.seek"),
+        QJsonObject{{QStringLiteral("positionMs"), 42},
+                    {QStringLiteral("waitForPgm"), QStringLiteral("yes")}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(!validation.ok);
+    QCOMPARE(validation.code, QStringLiteral("invalid_args"));
+    QVERIFY(validation.message.contains(QStringLiteral("waitForPgm")));
 }
 
 void TestControlProtocol::validatesSeekArgsAcceptsLargeInteger() {
@@ -160,6 +187,17 @@ void TestControlProtocol::validatesActionShuttleDelta() {
 
     QVERIFY(validation.ok);
     QCOMPARE(validation.normalizedArgs.value(QStringLiteral("delta")).toInt(), -1);
+}
+
+void TestControlProtocol::validatesActionJogWaitForPgmFlag() {
+    const ControlCommandMessage command{
+        QStringLiteral("command"), QStringLiteral("jog-1"), QStringLiteral("action.jog"),
+        QJsonObject{{QStringLiteral("delta"), -1}, {QStringLiteral("waitForPgm"), true}}};
+
+    const ControlProtocol::CommandValidation validation = ControlProtocol::validateCommand(command);
+
+    QVERIFY(validation.ok);
+    QCOMPARE(validation.normalizedArgs.value(QStringLiteral("waitForPgm")).toBool(), true);
 }
 
 void TestControlProtocol::validatesNdiOutputEnabledCommand() {

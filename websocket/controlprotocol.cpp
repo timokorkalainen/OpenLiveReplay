@@ -56,6 +56,15 @@ ControlProtocol::CommandValidation invalid(const QString& message) {
     return validation;
 }
 
+ControlProtocol::CommandValidation validWithOptionalWaitForPgm(const QJsonObject& args,
+                                                               const QString& name) {
+    if (args.contains(QStringLiteral("waitForPgm")) &&
+        !hasBool(args, QStringLiteral("waitForPgm"))) {
+        return invalid(name + QStringLiteral(" args.waitForPgm must be boolean"));
+    }
+    return valid(args);
+}
+
 } // namespace
 
 ControlProtocol::ParseResult ControlProtocol::parseTextMessage(const QByteArray& payload) {
@@ -151,9 +160,10 @@ ControlProtocol::validateCommand(const ControlCommandMessage& command) {
         return valid(args);
     }
     if (name == QStringLiteral("transport.seek")) {
-        return hasInteger(args, QStringLiteral("positionMs"))
-                   ? valid(args)
-                   : invalid(QStringLiteral("transport.seek requires integer args.positionMs"));
+        if (!hasInteger(args, QStringLiteral("positionMs"))) {
+            return invalid(QStringLiteral("transport.seek requires integer args.positionMs"));
+        }
+        return validWithOptionalWaitForPgm(args, name);
     }
     if (name == QStringLiteral("transport.setSpeed")) {
         if (!hasNumber(args, QStringLiteral("speed"))) {
@@ -179,9 +189,10 @@ ControlProtocol::validateCommand(const ControlCommandMessage& command) {
         return valid(args);
     }
     if (name == QStringLiteral("transport.stepFrame")) {
-        return hasInteger(args, QStringLiteral("frames"))
-                   ? valid(args)
-                   : invalid(QStringLiteral("transport.stepFrame requires integer args.frames"));
+        if (!hasInteger(args, QStringLiteral("frames"))) {
+            return invalid(QStringLiteral("transport.stepFrame requires integer args.frames"));
+        }
+        return validWithOptionalWaitForPgm(args, name);
     }
     if (name == QStringLiteral("view.setPlaybackViewState")) {
         if (!hasBool(args, QStringLiteral("singleView"))) {
@@ -362,7 +373,12 @@ ControlProtocol::validateCommand(const ControlCommandMessage& command) {
         }
         return valid(normalized);
     }
-    if (name == QStringLiteral("action.jog") || name == QStringLiteral("action.shuttle")) {
+    if (name == QStringLiteral("action.jog")) {
+        return hasInteger(args, QStringLiteral("delta"))
+                   ? validWithOptionalWaitForPgm(args, name)
+                   : invalid(name + QStringLiteral(" requires integer args.delta"));
+    }
+    if (name == QStringLiteral("action.shuttle")) {
         return hasInteger(args, QStringLiteral("delta"))
                    ? valid(args)
                    : invalid(name + QStringLiteral(" requires integer args.delta"));

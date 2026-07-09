@@ -468,7 +468,7 @@ private:
     // Shared control-action dispatch used by both MIDI bindings and the
     // Stream Deck. Action ids documented in streamdeck/streamdeckmanager.h.
     void dispatchControlAction(int action, bool isRelease);
-    PlaybackWorker::OperatorSeekResult jogStep(int delta, int timeoutMs = 250);
+    PlaybackWorker::OperatorSeekResult jogStep(int delta, int timeoutMs = 0);
     void setFollowLive(bool on);
     void pushStreamDeckMaps();
     void pushDeckTimecode();

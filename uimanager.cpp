@@ -815,7 +815,15 @@ PlaybackWorker::OperatorSeekResult UIManager::jogStep(int delta, int timeoutMs) 
         result.message = QStringLiteral("playback worker unavailable");
         return result;
     }
-    return m_playbackWorker->seekToAndWaitForPgm(m_transport->currentPos(), delta, timeoutMs);
+
+    const qint64 targetMs = m_transport->currentPos();
+    if (timeoutMs > 0) return m_playbackWorker->seekToAndWaitForPgm(targetMs, delta, timeoutMs);
+
+    m_playbackWorker->seekTo(targetMs, delta);
+    result.completed = true;
+    result.targetMs = targetMs;
+    result.message = QStringLiteral("accepted");
+    return result;
 }
 
 void UIManager::setFollowLive(bool on) {
@@ -2979,7 +2987,9 @@ int64_t UIManager::scrubPosition() {
 void UIManager::scrubToLive() {
     setFollowLive(true);
     const int64_t liveEdge = recordedDurationMs();
-    const int64_t target = qMax<int64_t>(0, liveEdge - m_liveBufferMs);
+    const int64_t committedTail = m_replayManager ? m_replayManager->committedVideoTailMs() : -1;
+    const int64_t target =
+        qMax<int64_t>(0, liveFollowEffectiveLiveEdgeMs(liveEdge, committedTail) - m_liveBufferMs);
     m_transport->seek(target);
     // Route the jump-to-live-edge through the scheduler too, or the worker
     // sees a position discontinuity with no seek and tail-holds a stale frame.
@@ -3153,9 +3163,10 @@ void UIManager::onRecorderPulse(int64_t frameIndex, int64_t elapsedMs) {
         const FrameRate rate = m_transport->frameRate();
         const qint64 frameDurationMs =
             rate.isValid() ? qMax<qint64>(1, rate.frameIndexToMs(1)) : 20;
-        const LiveFollowCorrection correction =
-            planLiveFollowCorrection(m_followLive, m_transport->isPlaying(), recordedDurationMs(),
-                                     m_liveBufferMs, m_transport->currentPos(), frameDurationMs);
+        const qint64 committedTail = m_replayManager ? m_replayManager->committedVideoTailMs() : -1;
+        const LiveFollowCorrection correction = planLiveFollowCorrection(
+            m_followLive, m_transport->isPlaying(), recordedDurationMs(), m_liveBufferMs,
+            m_transport->currentPos(), frameDurationMs, committedTail);
         if (correction.adjustTransport) {
             m_transport->seek(correction.targetMs);
             if (m_playbackWorker) {

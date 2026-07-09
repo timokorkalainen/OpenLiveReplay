@@ -18,6 +18,10 @@ bool controlLatencyTraceEnabled() {
     return raw == "1" || raw == "true" || raw == "on" || raw == "yes";
 }
 
+bool wantsPgmWait(const QJsonObject& args) {
+    return args.value(QStringLiteral("waitForPgm")).toBool(false);
+}
+
 QJsonObject pgmTransactionDetails(const PlaybackWorker::OperatorSeekResult& result) {
     QJsonObject identity;
     identity.insert(QStringLiteral("busKind"), static_cast<int>(result.pgmIdentity.bus.kind));
@@ -254,14 +258,19 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
             }
         }
     } else if (name == QStringLiteral("transport.stepFrame")) {
-        return resultForOperatorSeek(
-            name, m_uiManager->jogExternalAndWaitForPgm(
-                      args.value(QStringLiteral("frames")).toInt(), kControlPgmWaitTimeoutMs));
+        const int frames = args.value(QStringLiteral("frames")).toInt();
+        if (wantsPgmWait(args)) {
+            return resultForOperatorSeek(
+                name, m_uiManager->jogExternalAndWaitForPgm(frames, kControlPgmWaitTimeoutMs));
+        }
+        m_uiManager->jogExternal(frames);
     } else if (name == QStringLiteral("transport.seek")) {
-        return resultForOperatorSeek(
-            name, m_uiManager->seekPlaybackAndWaitForPgm(
-                      args.value(QStringLiteral("positionMs")).toVariant().toLongLong(),
-                      kControlPgmWaitTimeoutMs));
+        const qint64 positionMs = args.value(QStringLiteral("positionMs")).toVariant().toLongLong();
+        if (wantsPgmWait(args)) {
+            return resultForOperatorSeek(
+                name, m_uiManager->seekPlaybackAndWaitForPgm(positionMs, kControlPgmWaitTimeoutMs));
+        }
+        m_uiManager->seekPlayback(positionMs);
     } else if (name == QStringLiteral("transport.goLive")) {
         m_uiManager->goLive();
     } else if (name == QStringLiteral("transport.cancelFollowLive")) {
@@ -377,9 +386,12 @@ CommandResult UIManagerControlAdapter::executeCommand(const QString& name,
         m_uiManager->dispatchExternalAction(args.value(QStringLiteral("actionId")).toInt(),
                                             args.value(QStringLiteral("pressed")).toBool());
     } else if (name == QStringLiteral("action.jog")) {
-        return resultForOperatorSeek(
-            name, m_uiManager->jogExternalAndWaitForPgm(args.value(QStringLiteral("delta")).toInt(),
-                                                        kControlPgmWaitTimeoutMs));
+        const int delta = args.value(QStringLiteral("delta")).toInt();
+        if (wantsPgmWait(args)) {
+            return resultForOperatorSeek(
+                name, m_uiManager->jogExternalAndWaitForPgm(delta, kControlPgmWaitTimeoutMs));
+        }
+        m_uiManager->jogExternal(delta);
     } else if (name == QStringLiteral("action.shuttle")) {
         m_uiManager->shuttleExternal(args.value(QStringLiteral("delta")).toInt());
     } else {

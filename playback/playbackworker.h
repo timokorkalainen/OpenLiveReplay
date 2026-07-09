@@ -184,11 +184,14 @@ public:
     void setSelectedOutputFeed(int feedIndex);
     void setRequireAllOutputFeedsForPlayhead(bool required);
     void setBusPreviewProviders(FrameProvider* multiviewProvider, FrameProvider* pgmProvider);
+    void setFeedPreviewProvidersEnabled(bool enabled);
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
     void resetOutputPlayEpoch();
 #ifdef OLR_UNIT_TEST
     void setResidencyWindowParamsForTest(const ResidencyWindowParams& params);
     static int64_t liveGrowthFileSizeForTest(int64_t avioSize, const QString& filePath);
+    static int64_t liveEofRecoveryAnchorMsForTest(int64_t playheadMs, int64_t newestBeforeEofMs,
+                                                  int64_t trailMs, int64_t frameDurationMs);
     static bool liveReadDeadlineInterruptsForTest(bool baseInterrupt, int64_t deadlineMs,
                                                   int64_t nowMs);
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -333,6 +336,10 @@ private:
     void cacheOutputAudioFrame(AudioDecoderTrack* aTrack, AVFrame* audioFrame, bool dedupTail);
     void resetDedup(); // lastDeliveredPtsMs = -1 on every track
     void clearDecoderBuffers(bool invalidateGpuGeneration = true);
+    // Seek the primary demuxer/decoder bank near target without clearing the
+    // published output cache. Used for forward playback catch-up and forward
+    // armed-cut primary-bank resyncs; counts as skipForward, not reposition.
+    bool resyncPrimaryDecodeCursorTo(qint64 targetMs);
     // clear every TrackBuffer (holds m_bufferMutex); leaves m_outputCache intact
     void initializeOutputGraph(int feedCount, int width, int height);
     void shutdownOutputGraph();
@@ -369,6 +376,7 @@ private:
     void handleGpuMemoryPressureLevel1(qint64 nowMs);
     void handleGpuMemoryPressureLevel2(qint64 nowMs);
     void flushNativeDecoderPools();
+    void flushNativeDecoderPoolsThrottled(qint64 nowMs);
     void resumeDeferredGpuRebuild();
     void detachOutputEndpointsForDeviceLoss();
     void sanitizeCacheForDeviceLossLocked(OutputFrameCache* cache, int* recoveredFrames = nullptr,
@@ -438,6 +446,7 @@ private:
     std::atomic<int> m_activeAudioView{-1};
     std::atomic<int> m_selectedOutputFeed{-1};
     std::atomic<bool> m_requireAllOutputFeedsForPlayhead{false};
+    std::atomic<bool> m_feedPreviewProvidersEnabled{false};
 
     AudioFrameQueue m_audioQueue; // worker-thread-only
     ResidencyWindowParams m_residencyWindowParams;
@@ -453,11 +462,10 @@ private:
     int64_t m_reverseAnchorMs = INT64_MAX;
 
     // PTS(ms) -> byte-offset index of the primary video stream, appended as
-    // packets are read (worker-thread-only; no mutex). All recordings are
-    // ALL-INTRA, so any indexed offset is a valid standalone decode start; the
-    // full-reposition path avio_seeks straight to nearestAtOrBefore(target)
-    // instead of the coarse av_seek_frame anchor, shortening the forward fill.
-    // Survives clearDecoderBuffers (only the per-track frame buffers are wiped).
+    // packets are read (worker-thread-only; no mutex). Kept for diagnostics and
+    // future format-specific seek acceleration. Matroska reposition must still
+    // enter through avformat/av_seek_frame: raw byte landing can poison demuxer
+    // state even for all-intra recordings.
     FrameIndex m_frameIndex;
 
     // Seek-gate generations (read in makeOutputSnapshot; written in seekTo /
@@ -552,6 +560,12 @@ private:
     // cuts leave it unset (the forward-lag skip-forward path resyncs without a
     // reposition). Set on the output thread, consumed on the worker thread; atomic.
     std::atomic<int64_t> m_decoderFollowMs{-1};
+    // Armed-cut forward primary-bank resync. A forward cut promotes the target
+    // output cache and re-bases transport, but the primary demuxer can still be
+    // parked seconds behind. If ordinary forward-lag sees P past the bank's newest
+    // it looks like tail-hold, so the worker consumes this one-shot and performs
+    // an explicit non-clearing skip-forward once it observes the re-based playhead.
+    std::atomic<int64_t> m_forwardCutResyncMs{-1};
     // m_seekGeneration captured when a cut is armed (armCutInternal). A manual
     // seekTo bumps m_seekGeneration; if it differs at fire time the operator
     // issued an explicit seek after arming, so maybeFireScheduledCut ABORTS the
@@ -591,6 +605,7 @@ private:
     qint64 m_lastPressureSampleMs = 0;        // worker-thread-only
     qint64 m_lastPressureWarningMs = -1;      // worker-thread-only
     qint64 m_lastPressureLevel1Ms = -1;       // worker-thread-only
+    qint64 m_lastNativeDecoderPoolFlushMs = -1; // worker-thread-only
     bool m_gpuSeekPrefetchActive = false;     // worker-thread-only reposition scope
     int m_gpuSeekPrefetchRemaining = 0;
     GpuPrefetchPlan m_gpuSeekPrefetchPlan;
