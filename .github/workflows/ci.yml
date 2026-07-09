@@ -30,6 +30,10 @@ permissions:
 
 env:
   QT_VERSION: 6.11.1
+  # Windows-only override: aqtinstall cannot yet resolve 6.11.x on Windows (Qt changed
+  # the 6.11 Windows repo layout), so the Windows lane pins the newest aqt-installable
+  # Windows Qt. Bump back to QT_VERSION once aqt supports 6.11 on Windows.
+  QT_VERSION_WINDOWS: 6.10.2
   CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
@@ -429,43 +433,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # aqt occasionally lands on a mirror whose Qt metadata/checksum is stale
-      # ("Failed to download checksum ... This may happen on unofficial mirrors"),
-      # which is transient and mirror/region-specific and has only been observed on
-      # the Windows runner. Retry the install up to three times (aqt varies its mirror
-      # per invocation) so a single bad mirror does not fail the whole Windows lane.
-      - name: Install Qt (MinGW) + tools (attempt 1)
-        id: qt_install_1
-        continue-on-error: true
+      # Qt reorganised the Windows online-repository layout in 6.11, and the current
+      # aqtinstall (3.3.0, used by install-qt-action) cannot locate the 6.11.x Windows
+      # metadata ("Failed to locate XML data for Qt version") — reproducible against the
+      # official server, not a mirror flake. macOS/Linux 6.11.x install fine. Until aqt
+      # gains 6.11 Windows support, pin only this lane to the newest aqt-installable
+      # Windows Qt (QT_VERSION_WINDOWS); the rest of the matrix stays on QT_VERSION.
+      - name: Install Qt (MinGW) + tools
         uses: jurplel/install-qt-action@v4
         with:
-          version: ${{ env.QT_VERSION }}
-          host: windows
-          target: desktop
-          arch: win64_mingw
-          modules: qtmultimedia qtwebsockets qtshadertools
-          tools: tools_mingw1310 tools_ninja
-          cache: true
-
-      - name: Install Qt (MinGW) + tools (attempt 2)
-        id: qt_install_2
-        if: steps.qt_install_1.outcome == 'failure'
-        continue-on-error: true
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: windows
-          target: desktop
-          arch: win64_mingw
-          modules: qtmultimedia qtwebsockets qtshadertools
-          tools: tools_mingw1310 tools_ninja
-          cache: true
-
-      - name: Install Qt (MinGW) + tools (attempt 3)
-        if: steps.qt_install_1.outcome == 'failure' && steps.qt_install_2.outcome == 'failure'
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{ env.QT_VERSION }}
+          version: ${{ env.QT_VERSION_WINDOWS }}
           host: windows
           target: desktop
           arch: win64_mingw
