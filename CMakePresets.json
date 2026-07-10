@@ -36,11 +36,17 @@
     {
       "name": "linux-release",
       "displayName": "Linux (Release)",
-      "description": "Linux desktop build. FFmpeg from the distro via pkg-config (apt libav*-dev). Qt from the system, QT_ROOT_DIR, OLR_QT_ROOT, or an auto-detected ~/Qt/6.*/gcc_64.",
+      "description": "Linux desktop release build. Uses Task 7 controlled FFmpeg/SRT prefixes through OLR_FFMPEG_ROOT and OLR_SRT_ROOT; Qt comes from OLR_QT_ROOT or QT_ROOT_DIR.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_PREFIX_PATH": "$env{OLR_QT_ROOT}",
+        "OLR_FFMPEG_ROOT": "$env{OLR_FFMPEG_ROOT}",
+        "OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}",
+        "OLR_CONTROLLED_DEPS_REQUIRED": "ON"
+      }
     },
     {
       "name": "dev-debug-base",

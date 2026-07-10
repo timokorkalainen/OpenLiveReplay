@@ -60,6 +60,36 @@ echo "==> macdeployqt (bundling Qt frameworks, QML, dependent dylibs)"
 "$OLR_QT_ROOT/bin/macdeployqt" "$APP" -qmldir="$ROOT_DIR"
 
 mkdir -p "$DIST_DIR"
+echo "==> Preserving controlled FFmpeg and SRT dylibs"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libavformat*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libavutil*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libswresample*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libswscale*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_SRT_ROOT/lib/"libsrt*.dylib "$APP/Contents/Frameworks/"
+
+echo "==> Installing package-local Qt configuration"
+cp "$ROOT_DIR/qt.conf" "$APP/Contents/Resources/qt.conf"
+sed -i '' 's/^Prefix = \.$/Prefix = ../' "$APP/Contents/Resources/qt.conf"
+sed -i '' 's/^Plugins = \.$/Plugins = PlugIns/' "$APP/Contents/Resources/qt.conf"
+sed -i '' 's|^QmlImports = qml$|QmlImports = Resources/qml|' "$APP/Contents/Resources/qt.conf"
+
+echo "==> Removing Qt FFmpeg plugin and plugin-only FFmpeg runtime"
+python "$SCRIPT_DIR/filter_qt_ffmpeg_plugin.py" \
+    --package "$APP" \
+    --platform macos
+
+echo "==> Auditing controlled FFmpeg and SRT runtime"
+EVIDENCE="$DIST_DIR/OpenLiveReplay-macos-evidence.json"
+SPDX="$DIST_DIR/OpenLiveReplay-macos.spdx.json"
+python "$SCRIPT_DIR/audit_single_ffmpeg.py" \
+    --package "$APP" \
+    --platform macos \
+    --controlled-prefix "ffmpeg=$OLR_FFMPEG_ROOT" \
+    --controlled-prefix "srt=$OLR_SRT_ROOT" \
+    --evidence "$EVIDENCE" \
+    --spdx "$SPDX"
+
 ZIP="$DIST_DIR/OpenLiveReplay-macos.zip"
 rm -f "$ZIP"
 # ditto preserves macOS bundle attributes / symlinks.

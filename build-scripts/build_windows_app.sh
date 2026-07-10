@@ -153,6 +153,26 @@ for module in OlrTheme OlrStyle; do
     cp -R "$SRC_MODULE" "$APPDIR/qml/"
 done
 
+echo "==> Installing package-local Qt configuration"
+cp "$ROOT_DIR/qt.conf" "$APPDIR/qt.conf"
+
+echo "==> Removing Qt FFmpeg plugin and plugin-only FFmpeg runtime"
+OLR_OBJDUMP="$OLR_MINGW_ROOT/bin/objdump.exe" \
+    python "$SCRIPT_DIR/filter_qt_ffmpeg_plugin.py" \
+        --package "$APPDIR" \
+        --platform windows
+
+echo "==> Auditing controlled FFmpeg and SRT runtime"
+EVIDENCE="$WORK_DIR/dist/OpenLiveReplay-windows-evidence.json"
+SPDX="$WORK_DIR/dist/OpenLiveReplay-windows.spdx.json"
+python "$SCRIPT_DIR/audit_single_ffmpeg.py" \
+    --package "$APPDIR" \
+    --platform windows \
+    --controlled-prefix "ffmpeg=$WORK_DIR/dist/ffmpeg" \
+    --controlled-prefix "srt=$WORK_DIR/dist/srt" \
+    --evidence "$EVIDENCE" \
+    --spdx "$SPDX"
+
 echo "==> Packaging zip"
 ZIP="$WORK_DIR/dist/OpenLiveReplay-windows.zip"
 rm -f "$ZIP"

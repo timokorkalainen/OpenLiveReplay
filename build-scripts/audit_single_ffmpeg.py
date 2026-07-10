@@ -263,6 +263,8 @@ def _expand_runtime_path(value: str, parent: Path, root: Path) -> Path:
         return parent.parent / value.removeprefix("@loader_path/")
     if value.startswith("@executable_path/"):
         return _app_executable_directory(parent, root) / value.removeprefix("@executable_path/")
+    if value == "$ORIGIN":
+        return parent.parent
     if value.startswith("$ORIGIN/"):
         return parent.parent / value.removeprefix("$ORIGIN/")
     return Path(value)

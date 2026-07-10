@@ -794,6 +794,19 @@ class PolicyAndAuditTests(TemporaryPackage):
             result.errors,
         )
 
+    def test_linux_resolves_controlled_dependency_from_bare_origin_rpath(self) -> None:
+        app = self.binary("usr/bin/OpenLiveReplay", b"\x7fELF")
+        library = self.binary("usr/bin/libavcodec.so.62", b"\x7fELF")
+
+        target = audit._dependency_target(
+            Dependency("libavcodec.so.62", ("$ORIGIN",)),
+            app,
+            self.root,
+            "linux",
+        )
+
+        self.assertEqual(target, library.resolve())
+
     def test_requires_declared_rpath_instead_of_unique_basename_fallback(self) -> None:
         app = self.binary("MacOS/OpenLiveReplay", b"\xfe\xed\xfa\xcf")
         self.binary("Frameworks/libavcodec.62.dylib", b"\xfe\xed\xfa\xcf")

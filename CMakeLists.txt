@@ -14,6 +14,8 @@ option(OLR_BUILD_TESTS "Build the OpenLiveReplay test suite" OFF)
 option(OLR_WERROR "Treat warnings as errors for first-party targets" ON)
 option(OLR_WCONVERSION "Also enable the -Wconversion/-Wsign-conversion family (large backlog; opt-in)" OFF)
 option(OLR_BUILD_FUZZERS "Build libFuzzer harnesses for the input parsers (needs clang+libFuzzer)" OFF)
+option(OLR_CONTROLLED_DEPS_REQUIRED
+    "Require OLR_FFMPEG_ROOT and OLR_SRT_ROOT instead of system dependency discovery" OFF)
 set(_olr_gpu_pipeline_default OFF)
 set(_olr_gpu_pipeline_force_on_default OFF)
 if(IOS)
@@ -856,14 +858,122 @@ elseif(APPLE) # macOS Desktop
     endif()
     target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
     target_link_libraries(OpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
-elseif(UNIX AND NOT APPLE) # Linux desktop (CI second toolchain; system FFmpeg)
-    # FFmpeg from the distro (apt libav*-dev) via pkg-config. Native SRT/RTMP
-    # ingest is not compiled on Linux (cross-platform stubs), so libsrt is not
-    # linked into the app here.
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(OLR_FFMPEG REQUIRED IMPORTED_TARGET
-        libavformat libavcodec libavutil libswscale libswresample)
-    target_link_libraries(OpenLiveReplay PRIVATE PkgConfig::OLR_FFMPEG)
+elseif(UNIX AND NOT APPLE)
+    set(OLR_FFMPEG_ROOT "" CACHE PATH "Root directory of the controlled Linux FFmpeg install")
+    set(OLR_SRT_ROOT "" CACHE PATH "Root directory of the controlled Linux SRT install")
+    if(OLR_CONTROLLED_DEPS_REQUIRED)
+        if(NOT OLR_FFMPEG_ROOT OR NOT OLR_SRT_ROOT)
+            message(FATAL_ERROR
+                "OLR_CONTROLLED_DEPS_REQUIRED=ON requires OLR_FFMPEG_ROOT and OLR_SRT_ROOT")
+        endif()
+
+        # Clear cached discovery from earlier developer configurations before
+        # resolving only inside the controlled release prefixes.
+        foreach(_olr_controlled_dependency
+                OLR_FFMPEG_AVFORMAT_INCLUDE
+                OLR_FFMPEG_AVCODEC_INCLUDE
+                OLR_FFMPEG_AVUTIL_INCLUDE
+                OLR_FFMPEG_SWSCALE_INCLUDE
+                OLR_FFMPEG_SWRESAMPLE_INCLUDE
+                OLR_SRT_INCLUDE_DIR
+                OLR_FFMPEG_AVFORMAT_LIBRARY
+                OLR_FFMPEG_AVCODEC_LIBRARY
+                OLR_FFMPEG_AVUTIL_LIBRARY
+                OLR_FFMPEG_SWSCALE_LIBRARY
+                OLR_FFMPEG_SWRESAMPLE_LIBRARY
+                OLR_SRT_LIBRARY)
+            unset(${_olr_controlled_dependency} CACHE)
+            unset(${_olr_controlled_dependency})
+        endforeach()
+
+        find_path(OLR_FFMPEG_AVFORMAT_INCLUDE
+            NAMES libavformat/avformat.h
+            PATHS "${OLR_FFMPEG_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_path(OLR_FFMPEG_AVCODEC_INCLUDE
+            NAMES libavcodec/avcodec.h
+            PATHS "${OLR_FFMPEG_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_path(OLR_FFMPEG_AVUTIL_INCLUDE
+            NAMES libavutil/avutil.h
+            PATHS "${OLR_FFMPEG_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_path(OLR_FFMPEG_SWSCALE_INCLUDE
+            NAMES libswscale/swscale.h
+            PATHS "${OLR_FFMPEG_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_path(OLR_FFMPEG_SWRESAMPLE_INCLUDE
+            NAMES libswresample/swresample.h
+            PATHS "${OLR_FFMPEG_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_path(OLR_SRT_INCLUDE_DIR
+            NAMES srt/srt.h
+            PATHS "${OLR_SRT_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_AVFORMAT_LIBRARY
+            NAMES avformat
+            PATHS "${OLR_FFMPEG_ROOT}/lib"
+            NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_AVCODEC_LIBRARY
+            NAMES avcodec
+            PATHS "${OLR_FFMPEG_ROOT}/lib"
+            NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_AVUTIL_LIBRARY
+            NAMES avutil
+            PATHS "${OLR_FFMPEG_ROOT}/lib"
+            NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_SWSCALE_LIBRARY
+            NAMES swscale
+            PATHS "${OLR_FFMPEG_ROOT}/lib"
+            NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_SWRESAMPLE_LIBRARY
+            NAMES swresample
+            PATHS "${OLR_FFMPEG_ROOT}/lib"
+            NO_DEFAULT_PATH)
+        find_library(OLR_SRT_LIBRARY
+            NAMES srt
+            PATHS "${OLR_SRT_ROOT}/lib"
+            NO_DEFAULT_PATH)
+        if(NOT OLR_FFMPEG_AVFORMAT_INCLUDE
+                OR NOT OLR_FFMPEG_AVCODEC_INCLUDE
+                OR NOT OLR_FFMPEG_AVUTIL_INCLUDE
+                OR NOT OLR_FFMPEG_SWSCALE_INCLUDE
+                OR NOT OLR_FFMPEG_SWRESAMPLE_INCLUDE
+                OR NOT OLR_SRT_INCLUDE_DIR
+                OR NOT OLR_FFMPEG_AVFORMAT_LIBRARY
+                OR NOT OLR_FFMPEG_AVCODEC_LIBRARY
+                OR NOT OLR_FFMPEG_AVUTIL_LIBRARY
+                OR NOT OLR_FFMPEG_SWSCALE_LIBRARY
+                OR NOT OLR_FFMPEG_SWRESAMPLE_LIBRARY
+                OR NOT OLR_SRT_LIBRARY)
+            message(FATAL_ERROR
+                "Controlled Linux dependencies are incomplete under OLR_FFMPEG_ROOT or OLR_SRT_ROOT")
+        endif()
+        target_include_directories(OpenLiveReplay PRIVATE
+            "${OLR_FFMPEG_AVFORMAT_INCLUDE}"
+            "${OLR_FFMPEG_AVCODEC_INCLUDE}"
+            "${OLR_FFMPEG_AVUTIL_INCLUDE}"
+            "${OLR_FFMPEG_SWSCALE_INCLUDE}"
+            "${OLR_FFMPEG_SWRESAMPLE_INCLUDE}"
+            "${OLR_SRT_INCLUDE_DIR}")
+        target_link_libraries(OpenLiveReplay PRIVATE
+            "${OLR_FFMPEG_AVFORMAT_LIBRARY}"
+            "${OLR_FFMPEG_AVCODEC_LIBRARY}"
+            "${OLR_FFMPEG_AVUTIL_LIBRARY}"
+            "${OLR_FFMPEG_SWSCALE_LIBRARY}"
+            "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
+            "${OLR_SRT_LIBRARY}")
+        set_target_properties(OpenLiveReplay PROPERTIES
+            BUILD_RPATH "$ORIGIN/../lib"
+            INSTALL_RPATH "$ORIGIN/../lib")
+    else()
+        # Developer Linux configurations intentionally use the distribution
+        # pkg-config files. Release packaging must enable the branch above.
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(OLR_FFMPEG REQUIRED IMPORTED_TARGET
+            libavformat libavcodec libavutil libswscale libswresample)
+        target_link_libraries(OpenLiveReplay PRIVATE PkgConfig::OLR_FFMPEG)
+    endif()
 endif()
 
 # 5. Standard Qt Linking

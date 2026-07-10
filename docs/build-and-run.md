@@ -10,8 +10,10 @@ terminal desktop builds, tests, and iOS device builds.
 - Ninja in `PATH`.
 - macOS desktop: Homebrew FFmpeg and SRT, or `OLR_FFMPEG_ROOT` /
   `OLR_SRT_ROOT` for custom builds.
-- Linux desktop: distro FFmpeg development packages discoverable by
-  `pkg-config`.
+- Linux debug desktop: distro FFmpeg development packages discoverable by
+  `pkg-config`. Linux release packages build pinned, shared LGPL FFmpeg 8.1.1
+  and SRT 1.5.4 with `build-scripts/build_ffmpeg_linux_srt.sh`; the packager
+  exports its `linux_build/dist/{ffmpeg,srt}` prefixes automatically.
 - Windows MinGW: build the from-source FFmpeg/SRT dependencies first; see
   [windows-build.md](windows-build.md).
 
@@ -86,6 +88,7 @@ Release packaging scripts remain available for local package checks:
 ```sh
 ./build-scripts/build_macos_app.sh
 ./build-scripts/build_windows_app.sh
+./build-scripts/build_linux_app.sh
 ```
 
 ## Tests
