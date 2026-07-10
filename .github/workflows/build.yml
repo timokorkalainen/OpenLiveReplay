@@ -37,6 +37,14 @@ jobs:
           tools: tools_mingw1310 tools_ninja
           cache: true
 
+      - name: Cache controlled FFmpeg and SRT
+        uses: actions/cache@v4
+        with:
+          path: |
+            windows_build/dist/ffmpeg
+            windows_build/dist/srt
+          key: windows-controlled-ffmpeg-srt-${{ runner.arch }}-${{ hashFiles('build-scripts/build_ffmpeg_windows_srt.sh', 'build-scripts/single_ffmpeg_policy.json') }}
+
       # One command: builds FFmpeg + SRT from pinned source, configures, builds,
       # deploys, and zips windows_build/dist/OpenLiveReplay-windows.zip.
       - name: Build (deps + app + deploy)
@@ -92,9 +100,34 @@ jobs:
             -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target tst_nativeaacdecoder tst_nativevideodecoder
+          cmake --build build-tests --target tst_nativeaacdecoder tst_nativevideodecoder qt_core_media_smoke
           ctest --test-dir build-tests --output-on-failure \
             -R '^(tst_nativeaacdecoder|tst_nativevideodecoder)$'
+
+      - name: Run isolated Qt core-media runtime smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="$(cd windows_build/dist/OpenLiveReplay && pwd)"
+          [ -x build-tests/qt_core_media_smoke.exe ] || {
+            echo "build-tests/qt_core_media_smoke.exe was not built" >&2; exit 1; }
+          mkdir -p windows_build/dist/runtime-evidence
+          python tests/e2e/run_qt_core_media_smoke.py \
+            --package "$package" \
+            --harness build-tests/qt_core_media_smoke.exe \
+            --platform windows \
+            --controlled-prefix "ffmpeg=$(cd windows_build/dist/ffmpeg && pwd)" \
+            --controlled-prefix "srt=$(cd windows_build/dist/srt && pwd)" \
+            --allow-no-audio-device \
+            --evidence-dir windows_build/dist/runtime-evidence
+
+      - name: Upload runtime evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenLiveReplay-windows-runtime-evidence
+          path: windows_build/dist/runtime-evidence
+          if-no-files-found: error
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -124,9 +157,43 @@ jobs:
         # below; only the build tools come from Homebrew.
         run: brew install ninja pkg-config
 
+      - name: Cache controlled FFmpeg and SRT
+        uses: actions/cache@v4
+        with:
+          path: |
+            macos_build/dist/ffmpeg
+            macos_build/dist/srt
+          key: macos-controlled-ffmpeg-srt-${{ runner.arch }}-${{ hashFiles('build-scripts/build_ffmpeg_macos_app_srt.sh', 'build-scripts/single_ffmpeg_policy.json') }}
+
       - name: Build (from-source ffmpeg+srt) + package (.app)
         shell: bash
         run: ./build-scripts/build_macos_app.sh
+
+      - name: Run isolated Qt core-media runtime smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --preset macos-release -DOLR_BUILD_TESTS=ON
+          cmake --build --preset macos-release --target qt_core_media_smoke
+          [ -x build/qt_core_media_smoke ] || {
+            echo "build/qt_core_media_smoke was not built" >&2; exit 1; }
+          mkdir -p macos_build/dist/runtime-evidence
+          python3 tests/e2e/run_qt_core_media_smoke.py \
+            --package build/OpenLiveReplay.app \
+            --harness build/qt_core_media_smoke \
+            --platform macos \
+            --controlled-prefix "ffmpeg=$GITHUB_WORKSPACE/macos_build/dist/ffmpeg" \
+            --controlled-prefix "srt=$GITHUB_WORKSPACE/macos_build/dist/srt" \
+            --allow-no-audio-device \
+            --evidence-dir macos_build/dist/runtime-evidence
+
+      - name: Upload runtime evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenLiveReplay-macos-runtime-evidence
+          path: macos_build/dist/runtime-evidence
+          if-no-files-found: error
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -161,7 +228,7 @@ jobs:
             linux_build/dist/ffmpeg
             linux_build/dist/srt
             linux_build/dist/.ffmpeg-8.1.1-libsrt-lgpl-shared.stamp
-          key: linux-controlled-ffmpeg-srt-${{ runner.arch }}-${{ hashFiles('build-scripts/build_ffmpeg_linux_srt.sh') }}
+          key: linux-controlled-ffmpeg-srt-${{ runner.arch }}-${{ hashFiles('build-scripts/build_ffmpeg_linux_srt.sh', 'build-scripts/single_ffmpeg_policy.json') }}
 
       - name: Build controlled FFmpeg and SRT
         shell: bash
@@ -175,6 +242,32 @@ jobs:
         run: |
           export OLR_QT_ROOT="$QT_ROOT_DIR"
           ./build-scripts/build_linux_app.sh
+
+      - name: Run isolated Qt core-media runtime smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --preset linux-release -DOLR_BUILD_TESTS=ON
+          cmake --build --preset linux-release --target qt_core_media_smoke
+          [ -x build/qt_core_media_smoke ] || {
+            echo "build/qt_core_media_smoke was not built" >&2; exit 1; }
+          mkdir -p linux_build/dist/runtime-evidence
+          python3 tests/e2e/run_qt_core_media_smoke.py \
+            --package linux_build/dist/OpenLiveReplay \
+            --harness build/qt_core_media_smoke \
+            --platform linux \
+            --controlled-prefix "ffmpeg=$OLR_FFMPEG_ROOT" \
+            --controlled-prefix "srt=$OLR_SRT_ROOT" \
+            --allow-no-audio-device \
+            --evidence-dir linux_build/dist/runtime-evidence
+
+      - name: Upload runtime evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenLiveReplay-linux-runtime-evidence
+          path: linux_build/dist/runtime-evidence
+          if-no-files-found: error
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

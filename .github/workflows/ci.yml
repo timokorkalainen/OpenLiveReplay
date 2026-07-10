@@ -566,6 +566,10 @@ jobs:
           fi
           exit "$gpu_rc"
 
+      - name: Run static media/package smoke tests
+        shell: bash
+        run: ctest --test-dir build-tests --output-on-failure --no-tests=error -L smoke
+
   # ---------------------------------------------------------------------------
   # Second toolchain: build the app + tests with GCC on Linux and run the unit
   # suite under ASan+UBSan+LSan. The only leg that exercises GCC's -Werror
@@ -673,6 +677,10 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           QT_QPA_PLATFORM: offscreen
         run: ctest --output-on-failure --repeat until-pass:2 -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+
+      - name: Run static media/package smoke tests
+        working-directory: build
+        run: ctest --output-on-failure --no-tests=error -L smoke
 
   # ---------------------------------------------------------------------------
   # Sanitizer gates (macOS clang). asan-ubsan runs the WHOLE unit label under

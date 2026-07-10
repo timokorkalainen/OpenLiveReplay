@@ -8,6 +8,8 @@ target_link_libraries(record_harness PRIVATE
 
 set(OLR_E2E_BASH bash)
 find_program(OLR_PYTHON3_EXECUTABLE NAMES python3 python)
+set(OLR_RUNTIME_MEDIA_PACKAGE "" CACHE PATH
+    "Optional isolated desktop package used by the Qt core-media runtime smoke")
 set(_olr_windows_tool_env)
 if(WIN32)
     find_program(OLR_GIT_BASH
@@ -35,6 +37,16 @@ target_link_libraries(play_harness PRIVATE
 qt_add_executable(soak_harness soak_harness.cpp)
 target_link_libraries(soak_harness PRIVATE
     Qt6::Core Qt6::Multimedia Qt6::Gui olr_test_playback olr_warnings olr_sanitize)
+
+# Package-level proof that stock Qt still provides raw audio and app-fed video
+# without loading Qt's FFmpeg media backend.
+qt_add_executable(qt_core_media_smoke
+    qt_core_media_smoke.cpp
+    "${CMAKE_SOURCE_DIR}/appenv.cpp")
+target_include_directories(qt_core_media_smoke PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(qt_core_media_smoke PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Multimedia Qt6::Qml Qt6::Quick olr_warnings olr_sanitize)
+set_target_properties(qt_core_media_smoke PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
 add_test(NAME e2e_output_soak
     COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_output_soak.sh" "$<TARGET_FILE:soak_harness>")
@@ -112,6 +124,40 @@ if(APPLE AND NOT IOS)
 endif()
 
 if(OLR_PYTHON3_EXECUTABLE)
+    add_test(NAME tst_qt_core_media_smoke_driver
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_qt_core_media_smoke_driver.py")
+    set_tests_properties(tst_qt_core_media_smoke_driver PROPERTIES
+        LABELS "smoke;ci"
+        TIMEOUT 30)
+
+    if(OLR_RUNTIME_MEDIA_PACKAGE)
+        if(NOT OLR_FFMPEG_ROOT OR NOT OLR_SRT_ROOT)
+            message(FATAL_ERROR
+                "OLR_RUNTIME_MEDIA_PACKAGE requires OLR_FFMPEG_ROOT and OLR_SRT_ROOT")
+        endif()
+        if(WIN32)
+            set(_olr_runtime_media_platform windows)
+        elseif(APPLE)
+            set(_olr_runtime_media_platform macos)
+        else()
+            set(_olr_runtime_media_platform linux)
+        endif()
+        add_test(NAME e2e_qt_core_media_package
+            COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/run_qt_core_media_smoke.py"
+                --package "${OLR_RUNTIME_MEDIA_PACKAGE}"
+                --harness "$<TARGET_FILE:qt_core_media_smoke>"
+                --platform "${_olr_runtime_media_platform}"
+                --controlled-prefix "ffmpeg=${OLR_FFMPEG_ROOT}"
+                --controlled-prefix "srt=${OLR_SRT_ROOT}")
+        set_tests_properties(e2e_qt_core_media_package PROPERTIES
+            LABELS "app-e2e;single-ffmpeg"
+            TIMEOUT 90
+            RUN_SERIAL TRUE)
+        unset(_olr_runtime_media_platform)
+    endif()
+
     add_test(NAME tst_macos_app_driver_static
         COMMAND "${OLR_PYTHON3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/test_macos_app_driver_static.py"

@@ -40,12 +40,14 @@
 #   SKIP_UNIT=1 / SKIP_TIDY=1 / SKIP_GPU_E2E=1  -> skip one default gate
 #   OLR_PREPUSH_FULL=1 push   -> ALSO run e2e + ASan/UBSan + TSan + full CTest matrix + iOS
 #                                (skip parts: SKIP_E2E=1 / SKIP_ASAN=1 / SKIP_TSAN=1 /
-#                                 SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
+#                                 SKIP_FULL_TESTS=1 / SKIP_QT_MEDIA_SMOKE=1 /
+#                                 SKIP_IOS_BUILD=1)
 #
 # Tunables:
 #   OLR_E2E_CLIP_SECONDS  (default 5)               e2e / delivery clip length
 #   QT_HOST_PREFIX        macOS Qt kit; auto-detected when unset (see below)
 #   QT_IOS_PREFIX         iOS Qt kit; auto-detected when unset  (OLR_PREPUSH_FULL only)
+#   OLR_QT_MEDIA_SMOKE_ALLOW_NO_AUDIO=1  permit a headless host with no audio device
 #
 # Enable the hook once per clone:  git config core.hooksPath .githooks
 set -euo pipefail
@@ -373,6 +375,40 @@ if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
     exit 0
 fi
 echo "[pre-push] OLR_PREPUSH_FULL=1 - running e2e + sanitizers + full matrix + iOS."
+
+# --- 8a. Isolated packaged Qt media runtime -----------------------------------
+# The release bundle, not the developer Qt installation, is the contract: audit
+# it first, then prove raw audio and application-fed video work without Qt's
+# FFmpeg plugin. This remains opt-in with the other package/iOS-heavy checks.
+if [ "${SKIP_QT_MEDIA_SMOKE:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_QT_MEDIA_SMOKE=1 - skipping packaged Qt media runtime smoke."
+else
+    RUNTIME_EVIDENCE_DIR="${OLR_QT_MEDIA_SMOKE_EVIDENCE_DIR:-macos_build/dist/runtime-evidence}"
+    RUNTIME_SMOKE_ARGS=()
+    if [ "${OLR_QT_MEDIA_SMOKE_ALLOW_NO_AUDIO:-0}" = "1" ]; then
+        RUNTIME_SMOKE_ARGS+=(--allow-no-audio-device)
+    fi
+    export OLR_QT_ROOT="$QT_HOST_PREFIX"
+    echo "[pre-push] Building and auditing the packaged Qt media runtime..."
+    ./build-scripts/build_macos_app.sh
+    cmake --preset macos-release -DOLR_BUILD_TESTS=ON >/dev/null
+    cmake --build --preset macos-release --target qt_core_media_smoke
+    RUNTIME_HARNESS="$REPO_ROOT/build/qt_core_media_smoke"
+    [ -x "$RUNTIME_HARNESS" ] || {
+        echo "[pre-push] $RUNTIME_HARNESS was not built or is not executable." >&2
+        exit 1
+    }
+    mkdir -p "$RUNTIME_EVIDENCE_DIR"
+    python3 tests/e2e/run_qt_core_media_smoke.py \
+        --package build/OpenLiveReplay.app \
+        --harness "$RUNTIME_HARNESS" \
+        --platform macos \
+        --controlled-prefix "ffmpeg=$REPO_ROOT/macos_build/dist/ffmpeg" \
+        --controlled-prefix "srt=$REPO_ROOT/macos_build/dist/srt" \
+        --evidence-dir "$RUNTIME_EVIDENCE_DIR" \
+        "${RUNTIME_SMOKE_ARGS[@]}"
+    echo "[pre-push] Packaged Qt media runtime smoke OK."
+fi
 
 # --- 7a. playback/record e2e at native speed (the native-timing scheduling run) -
 if [ "${SKIP_E2E:-0}" = "1" ]; then
