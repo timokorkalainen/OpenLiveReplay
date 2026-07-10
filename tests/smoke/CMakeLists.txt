@@ -52,3 +52,21 @@ set_tests_properties(ios_ffmpeg_build_config PROPERTIES LABELS "smoke;ci" TIMEOU
 add_test(NAME ios_gpu_build_config
     COMMAND "${OLR_SMOKE_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_gpu_build_config.sh")
 set_tests_properties(ios_gpu_build_config PROPERTIES LABELS "smoke;ci" TIMEOUT 10)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+add_test(NAME qt_media_api_boundary_unit
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/test_qt_media_api_boundary.py")
+set_tests_properties(qt_media_api_boundary_unit PROPERTIES LABELS "smoke;ci" TIMEOUT 30)
+
+add_test(NAME qt_media_api_boundary_scan
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/check_qt_media_api_boundary.py"
+        --root "${CMAKE_SOURCE_DIR}")
+set_tests_properties(qt_media_api_boundary_scan PROPERTIES LABELS "smoke;ci" TIMEOUT 30)
+
+add_test(NAME audit_single_ffmpeg_unit
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/test_audit_single_ffmpeg.py")
+set_tests_properties(audit_single_ffmpeg_unit PROPERTIES LABELS "smoke;ci" TIMEOUT 30)

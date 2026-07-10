@@ -33,6 +33,7 @@ int main(int argc, char* argv[]) {
 #if defined(OLR_GPU_PIPELINE_FORCE_ON)
     qputenv("OLR_GPU_PIPELINE", "1");
 #endif
+    appenv::configureQtMediaBackend();
     QGuiApplication app(argc, argv);
 #if defined(Q_OS_IOS)
     installIosGpuLifecycleIfEnabled();

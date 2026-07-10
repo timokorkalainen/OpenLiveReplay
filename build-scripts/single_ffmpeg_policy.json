@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "ffmpeg": {
+    "version": "8.1.1",
+    "sha256": "b6863adde98898f42602017462871b5f6333e65aec803fdd7a6308639c52edf3",
+    "abi": {
+      "avcodec": 62,
+      "avformat": 62,
+      "avutil": 60,
+      "swresample": 6,
+      "swscale": 9
+    }
+  },
+  "srt": {
+    "desktop": {
+      "version": "1.5.4",
+      "commit": "a8c6b65520f814c5bd8f801be48c33ceece7c4a6"
+    },
+    "ios": {
+      "version": "1.5.5-rc.0",
+      "commit": "52ceecdf5190885914f0f94d01be32441ccb1f4c",
+      "build_config_id": "ffmpeg-8.1.1-securetransport-no-hevc-no-avfilter",
+      "final_package_sha256_required": true
+    }
+  },
+  "forbidden_qt_ffmpeg_plugins": {
+    "names": [
+      "ffmpegmediaplugin"
+    ],
+    "metadata": [
+      "QFFmpegMediaPlugin"
+    ]
+  },
+  "ios_approved_xcframework_roots": [
+    "ios_build/xcframeworks/libavcodec.xcframework",
+    "ios_build/xcframeworks/libavformat.xcframework",
+    "ios_build/xcframeworks/libavutil.xcframework",
+    "ios_build/xcframeworks/libswresample.xcframework",
+    "ios_build/xcframeworks/libswscale.xcframework",
+    "ios_build/xcframeworks/libsrt.xcframework"
+  ],
+  "ios_controlled_build_root": "ios_build/xcframeworks",
+  "ios_provenance_manifest": {
+    "path": "ios_build/xcframeworks/ffmpeg-provenance.json",
+    "ffmpeg_version": "8.1.1",
+    "build_config_stamp": "ffmpeg-8.1.1-securetransport-no-hevc-no-avfilter",
+    "build_config_stamp_path": "ios_build/xcframeworks/.ffmpeg-8.1.1-securetransport-no-hevc-no-avfilter.stamp"
+  },
+  "controlled_prefixes": {
+    "ffmpeg": [],
+    "srt": []
+  }
+}

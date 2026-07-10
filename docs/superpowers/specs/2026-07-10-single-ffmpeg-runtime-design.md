@@ -1,268 +1,241 @@
 # Single FFmpeg Runtime Design
 
-**Status:** Approved for implementation planning
+**Status:** Approved, revised to use stock Qt without rebuilding Qt components
 
 ## Context
 
-OpenLiveReplay owns a controlled, SRT-enabled FFmpeg 8 build for recording,
-playback demuxing and seeking, audio and fallback codec work, and frame
-conversion. The Qt Online Installer's Qt Multimedia package is built with a
-separate FFmpeg media backend. On platforms where that backend is deployed or
-linked, the application can contain two FFmpeg versions even though
-OpenLiveReplay does not use `QMediaPlayer`, `QMediaRecorder`, or their QML
-counterparts.
+OpenLiveReplay owns a controlled FFmpeg 8 build for recording, playback,
+demuxing, seeking, audio and fallback codecs, SRT integration, and frame
+conversion. Stock Qt Multimedia also ships an FFmpeg media-player backend. If
+that plugin is deployed or statically imported, the process or package can
+contain a second, independently versioned FFmpeg.
 
-OpenLiveReplay uses only Qt Multimedia's core device, audio-output, and video
-sink surfaces:
+OpenLiveReplay does not use Qt's media player, recorder, decoder, camera, or
+capture-session APIs. It uses only:
 
-- `QMediaDevices` and `QAudioSink` for local PCM monitoring;
-- `QVideoSink` through QML `VideoOutput` for frames supplied by the application's
-  own providers.
+- `QMediaDevices` and `QAudioSink` for raw PCM monitoring;
+- `QVideoFrame`, `QVideoSink`, and QML `VideoOutput` for frames produced
+  by OpenLiveReplay's own pipeline.
 
-These surfaces do not require Qt's FFmpeg media-player plugin. Shipping two
-FFmpeg implementations adds package size, startup work, licensing inventory,
-ABI confusion, and another independently versioned media stack without adding
-application functionality.
+Those core audio and video-sink surfaces do not require Qt's FFmpeg media
+backend.
 
 ## Decision
 
-Every supported target must contain exactly one FFmpeg implementation:
-OpenLiveReplay's pinned FFmpeg 8 build. Qt Multimedia will be built from the
-matching Qt source release with its FFmpeg feature disabled.
+Use stock Qt binaries on every supported platform. Do not rebuild Qt or Qt
+Multimedia.
 
-This is a build-time property, not merely a runtime environment preference.
-Backend selection, package audits, runtime smoke tests, and plugin-path
-isolation provide additional enforcement.
+Qt's FFmpeg media backend is excluded at deployment or static-plugin selection.
+OpenLiveReplay's controlled FFmpeg 8 is the only FFmpeg allowed in every
+package and running process.
+
+The guarantee is enforced at four boundaries:
+
+1. source policy prevents introducing Qt APIs that require a media backend;
+2. runtime policy selects a native Qt backend where one exists;
+3. packaging excludes the Qt FFmpeg plugin and its private FFmpeg runtime;
+4. binary, link-map, and loaded-module audits reject a second FFmpeg.
 
 ## Goals
 
-- Ship exactly one FFmpeg implementation on Windows, macOS, desktop Linux, and
-  iOS.
-- Keep OpenLiveReplay's controlled FFmpeg 8 and SRT configuration unchanged in
-  ownership and purpose.
-- Preserve `QAudioSink`, `QMediaDevices`, `QVideoSink`, and QML `VideoOutput`
-  behavior.
-- Make local development and CI deterministic from a versioned Qt base kit.
-- Fail configuration or packaging when a second FFmpeg can enter the product.
-- Keep the shared aqt/Qt installation immutable.
+- Ship exactly one FFmpeg implementation on Windows, macOS, Linux, and iOS.
+- Keep the stock aqt/Qt installation immutable and unmodified.
+- Avoid all Qt source builds and custom Qt binary overlays.
+- Keep OpenLiveReplay's pinned FFmpeg 8 and SRT builds.
+- Preserve raw audio monitoring and application-fed video previews.
+- Fail closed when Qt's FFmpeg plugin or another FFmpeg ABI enters a package.
+- Keep local, CI, and release runtime behavior aligned.
 
 ## Non-Goals
 
-- Adding Qt media playback, recording, camera, or capture-session features.
+- Rebuilding Qt or Qt Multimedia.
+- Making Qt's FFmpeg plugin use OpenLiveReplay's FFmpeg 8.
+- Adding `QMediaPlayer`, `QMediaRecorder`, `QAudioDecoder`, cameras, or
+  capture sessions.
 - Replacing OpenLiveReplay's own FFmpeg pipeline.
-- Making Qt Multimedia use FFmpeg 8 internally.
-- Supporting arbitrary system Qt or system FFmpeg installations in release
-  packaging.
-- Removing native Media Foundation, AVFoundation, CoreAudio, PipeWire, or
-  PulseAudio integration.
-
-## Custom Qt Kit
-
-### Base Kit
-
-Each platform starts from the repository's pinned Qt version installed through
-aqt or the Qt installer. The version, target architecture, compiler, linkage
-mode, and build configuration are inputs to a custom-kit cache key. Qt source
-must have the exact same version as the base kit.
-
-The shared base kit is never modified. A bootstrap script materializes a
-project-local kit under a gitignored dependency cache. It copies the base kit
-while preserving symlinks, framework layout, permissions, and platform metadata.
-The resulting directory is the only Qt prefix used to configure, build, test,
-and deploy OpenLiveReplay.
-
-### Multimedia Rebuild
-
-The bootstrap script downloads the matching `qtmultimedia` source archive,
-verifies a pinned checksum, and performs an out-of-source standalone module
-build using the local kit's `qt-configure-module` tool. The module is configured
-with:
-
-```text
--no-feature-ffmpeg
--nomake examples
--nomake tests
-```
-
-Platform and configuration arguments must match the base kit. The rebuilt
-module is installed into the project-local kit, replacing that kit's original
-Qt Multimedia libraries, QML module, plugins, CMake package metadata, and tools.
-Before the replacement is accepted, the bootstrap script removes the copied
-base kit's Qt FFmpeg media plugins and every FFmpeg binary shipped solely for
-those plugins. It derives the purge set from the original plugin's resolved
-dependency graph instead of hard-coding ABI filenames. The purge runs only
-inside the project-local kit and must not match any non-FFmpeg Qt dependency.
-
-The bootstrap step writes a machine-readable manifest containing:
-
-- Qt version and source checksum;
-- platform, architecture, compiler, and configuration;
-- complete configure arguments;
-- the Qt Multimedia configure summary;
-- hashes of installed Qt Multimedia binaries and plugins;
-- the original Qt FFmpeg plugin dependency set and purge result;
-- an explicit `ffmpegFeature=false` field.
-
-The cache is valid only when every input and installed-file hash matches.
-
-### CMake Selection
-
-Release and CI presets require `OLR_QT_ROOT` to identify the project-local kit.
-CMake must reject a base aqt kit or a custom kit whose manifest is absent,
-invalid, or reports FFmpeg enabled. Qt deployment tools are resolved from the
-same `OLR_QT_ROOT`; mixing build-time and deployment-time Qt prefixes is an
-error.
-
-Developer bootstrap commands may create the custom kit automatically. CMake
-itself does not download or mutate dependencies during normal configuration.
+- Relying on a system FFmpeg for release artifacts.
 
 ## Platform Policy
 
-| Platform | Qt media backend policy | OpenLiveReplay FFmpeg form |
-| --- | --- | --- |
-| Windows | Select the `windows` backend before `QGuiApplication` construction. | Shared FFmpeg 8 DLLs plus `libsrt.dll`. |
-| macOS | Select the `darwin` backend before `QGuiApplication` construction. | Shared FFmpeg 8 dylibs plus SRT, bundled with controlled rpaths. |
-| Linux | Deploy no Qt media-player backend. `QAudioSink` uses PipeWire or PulseAudio; application-fed video sinks remain available. | Pinned shared FFmpeg 8 and SRT libraries built by the repository. |
-| iOS | Select the `darwin` backend. The FFmpeg-disabled Qt Multimedia build contains no Qt FFmpeg static plugin or link requirement. | Existing FFmpeg 8 and SRT XCFramework slices linked statically. |
+### Windows
 
-Backend selection is an application policy and overrides inherited
-`QT_MEDIA_BACKEND` values on Windows and Apple platforms. Linux deliberately has
-no media-player backend because OpenLiveReplay does not consume one.
+- Use the stock Qt Multimedia library.
+- Set `QT_MEDIA_BACKEND=windows` before constructing `QGuiApplication`.
+- Deploy the Windows native media plugin when required by Qt.
+- Exclude `ffmpegmediaplugin.dll` and the FFmpeg DLL family deployed solely
+  for that plugin.
+- Package OpenLiveReplay's FFmpeg 8 DLLs and `libsrt.dll`.
 
-## Linux Dependency Control
+The existing Windows probe demonstrated that `QAudioSink` starts, previews
+remain operational, and only ABI-62 OpenLiveReplay FFmpeg modules load when the
+Windows backend is selected.
 
-Linux release builds currently allow distro FFmpeg through `pkg-config`. That is
-incompatible with the single controlled-runtime guarantee. A Linux dependency
-builder will mirror the Windows, macOS, and iOS source-build policy:
+### macOS
 
-- pin and checksum FFmpeg 8 and SRT sources;
-- use the repository's curated LGPL configuration;
-- install into a project-local prefix;
-- configure OpenLiveReplay exclusively against that prefix;
-- package those libraries with origin-relative runtime search paths.
+- Use the stock Qt Multimedia framework.
+- Set `QT_MEDIA_BACKEND=darwin` before constructing `QGuiApplication`.
+- Retain the Darwin/AVFoundation backend.
+- Exclude the Qt FFmpeg media plugin and its private FFmpeg dylibs from the app
+  bundle.
+- Bundle OpenLiveReplay's controlled FFmpeg 8 and SRT dylibs with
+  origin-relative install names.
 
-System PipeWire or PulseAudio remains the platform audio service and is not part
-of the FFmpeg runtime count.
+### Linux
 
-## Packaging Isolation
+- Use the stock Qt Multimedia library.
+- Deploy no Qt media-player backend.
+- Use Qt's integrated PipeWire or PulseAudio support for `QAudioSink`.
+- Continue using application-fed `QVideoSink` / `VideoOutput`.
+- Build and package OpenLiveReplay's pinned FFmpeg 8 and SRT instead of distro
+  FFmpeg.
 
-All desktop packages contain a package-local `qt.conf` that limits Qt plugin and
-QML lookup to the package. A deployed application must not discover plugins
-from a developer machine's global Qt installation.
+The packaged runtime uses `qt.conf` and package-local plugin paths so the
+stock Qt installation's FFmpeg plugin cannot be discovered. Tests launch from
+that isolated runtime.
 
-Deployment uses the tools from the custom Qt kit. Packaging explicitly rejects:
+### iOS
 
-- any plugin whose name or metadata identifies the Qt FFmpeg media backend;
-- any `libavcodec`, `libavformat`, `libavutil`, `libswscale`, or
-  `libswresample` major other than the expected OpenLiveReplay FFmpeg 8 ABI;
-- any FFmpeg library outside the approved application dependency prefix;
-- unresolved FFmpeg or SRT dependencies;
-- duplicate libraries hidden in frameworks, plugins, QML modules, or nested app
-  bundles.
+- Use the stock Qt Multimedia static libraries.
+- Set `QT_MEDIA_BACKEND=darwin`.
+- Use `qt_import_plugins` to exclude the Qt FFmpeg media plugin and include
+  the Darwin media plugin.
+- Do not call `qt_add_ios_ffmpeg_libraries`.
+- Keep OpenLiveReplay's existing FFmpeg 8 and SRT XCFrameworks.
+- Inspect the final Xcode link map to prove that no Qt FFmpeg plugin or Qt
+  FFmpeg archive objects were linked.
 
-The iOS package audit examines the final link map and application binary rather
-than looking only for files, because FFmpeg is statically linked there.
+If the installed Qt version cannot exclude the static FFmpeg plugin without
+linking Qt's FFmpeg archives, the iOS build fails closed. It does not silently
+introduce a second FFmpeg or switch to an unverified ABI.
+
+## Runtime Backend Policy
+
+`appenv::configureQtMediaBackend()` runs before `QGuiApplication` construction:
+
+- Windows overwrites inherited selection with `windows`;
+- macOS and iOS overwrite inherited selection with `darwin`;
+- Linux clears inherited selection and relies on the isolated package
+  containing no media-player plugin.
+
+Package tests verify that core audio and video-sink APIs operate without Qt's
+FFmpeg backend. Unsupported inherited `QT_MEDIA_BACKEND` values cannot
+override application policy.
+
+## Plugin Isolation
+
+Desktop packages contain a package-local `qt.conf`. Qt plugin and QML lookup
+is restricted to package directories. A release package must not search a
+developer's global Qt installation.
+
+Deployment uses stock Qt tools, followed by deterministic filtering:
+
+- identify the Qt FFmpeg media plugin by plugin filename and metadata;
+- resolve that plugin's complete transitive FFmpeg dependency graph;
+- remove only the plugin and FFmpeg libraries owned solely by it;
+- preserve Qt platform, audio, rendering, image, and native media plugins;
+- run a recursive audit after filtering.
+
+Filtering is package-local. It never modifies the aqt/Qt installation.
+
+## Application FFmpeg Policy
+
+OpenLiveReplay's controlled FFmpeg remains:
+
+- FFmpeg 8 shared DLLs on Windows;
+- FFmpeg 8 shared dylibs on macOS;
+- pinned FFmpeg 8 shared objects on Linux;
+- FFmpeg 8 static XCFrameworks on iOS.
+
+The Linux release path gains a pinned source builder equivalent to the existing
+Windows, macOS, and iOS builders. System FFmpeg remains allowed only for
+explicit non-release developer configurations.
 
 ## API Boundary
 
-The following APIs are allowed:
+Allowed production APIs:
 
-- `QMediaDevices`, `QAudioDevice`, `QAudioSink`, and related raw-audio types;
-- `QVideoFrame`, `QVideoSink`, and QML `VideoOutput` used as application-fed
-  rendering sinks.
+- `QMediaDevices`, `QAudioDevice`, `QAudioSink`, and raw-audio types;
+- `QVideoFrame`, `QVideoSink`, and application-fed QML `VideoOutput`.
 
-The following APIs and QML types are prohibited unless this design is revised:
+Prohibited production APIs:
 
 - `QMediaPlayer` / `MediaPlayer`;
 - `QMediaRecorder` / `MediaRecorder`;
 - `QAudioDecoder`;
-- camera and capture-session APIs that require a media backend.
+- camera and capture-session APIs requiring a media backend.
 
-A source-level CI check guards this boundary. The check is narrow enough to
-ignore documentation and tests that intentionally name prohibited APIs while
-failing production source additions.
+A source-level smoke test enforces the boundary.
 
-## Verification
+## Package Audit
 
-### Configure-Time Gates
+The package audit recursively inspects binaries, frameworks, plugins, QML
+modules, symlinks, and nested bundles.
 
-- Validate the custom-kit manifest and cache key.
-- Validate that Qt Multimedia's configure summary reports FFmpeg disabled.
-- Validate that every dependency recorded in the original Qt FFmpeg purge set
-  is absent from the custom kit.
-- Validate that CMake and deployment tools come from the same custom kit.
-- On Linux, reject system FFmpeg resolution in release configurations.
+Desktop acceptance requires:
 
-### Package-Time Gates
+- no Qt FFmpeg media plugin;
+- no FFmpeg ABI other than OpenLiveReplay's expected FFmpeg 8 ABI;
+- every FFmpeg library resolves inside the package;
+- every FFmpeg library's provenance is the controlled dependency prefix;
+- no system or global Qt plugin path is usable;
+- no unresolved SRT or FFmpeg dependency.
 
-- Recursively scan all binaries and plugin metadata.
-- Resolve transitive dynamic dependencies, not only direct executable imports.
-- Require exactly the expected OpenLiveReplay FFmpeg ABI family on desktop.
-- Require no Qt FFmpeg media plugin.
-- Inspect macOS install names and rpaths.
-- Inspect the iOS link map and linked symbols for a single FFmpeg archive origin.
-- Emit an FFmpeg/SRT SBOM fragment from the approved dependency manifests.
+iOS acceptance requires:
 
-### Runtime Gates
+- no Qt FFmpeg plugin target in the static plugin import source;
+- no Qt-provided FFmpeg archive/object origin in the Xcode link map;
+- all `libav*` symbols originate from OpenLiveReplay's approved FFmpeg 8
+  XCFrameworks.
 
-Desktop smoke tests launch from an isolated package environment and verify:
+The audit emits an FFmpeg/SRT SBOM fragment from locked source and binary
+hashes.
+
+## Runtime Verification
+
+Desktop package smoke tests launch in an isolated environment and verify:
 
 - the process remains responsive;
-- `QAudioSink` opens and accepts PCM;
-- frames injected through each preview provider advance in QML `VideoOutput`;
-- loaded-module inspection finds only the expected FFmpeg ABI;
-- logs contain no media-backend fallback or plugin-load failure.
+- `QAudioSink` accepts 48 kHz stereo PCM, or reports an explicitly allowed
+  headless no-device state;
+- two distinct frames pass through application-fed `VideoOutput`;
+- loaded-module inspection finds only the expected FFmpeg 8 ABI;
+- logs contain no Qt FFmpeg initialization or backend fallback error.
 
-iOS device and simulator smoke tests verify audio startup and preview
-advancement. Static-link provenance is established by the package-time link-map
-gate.
-
-CI runs the gates for Windows, macOS, Linux, iOS device configuration, and iOS
-simulator configuration. A platform that cannot prove the invariant does not
-produce a release artifact.
+iOS device and simulator smoke tests verify raw audio startup and preview
+advancement. Link-map inspection provides static FFmpeg provenance.
 
 ## Failure Handling
 
-Dependency bootstrap, configuration, and packaging fail closed. They do not:
+Build and packaging fail closed. They do not:
 
-- fall back to the unmodified aqt Qt Multimedia module;
-- fall back to a system Qt or FFmpeg;
-- silently omit audio or preview verification;
-- weaken the expected FFmpeg major based on what happens to be installed.
+- rebuild Qt as a fallback;
+- retain Qt's FFmpeg plugin when filtering is uncertain;
+- use system FFmpeg in release mode;
+- weaken the expected ABI based on installed libraries;
+- publish a package without package and runtime audit evidence.
 
-Diagnostics identify the unexpected library or plugin, its dependency parent,
-its resolved path, and the expected custom-kit manifest.
-
-## Performance And Reliability
-
-Removing Qt's unused FFmpeg backend reduces loaded modules, relocations, package
-size, and media-stack initialization. OpenLiveReplay's recording and playback
-hot paths are unchanged. Native platform audio remains responsible for PCM
-output, and application-fed Qt video sinks remain responsible only for display.
-
-The custom kit is built once per cache key. Normal application builds consume
-the cached kit and do not rebuild Qt Multimedia.
+Diagnostics identify the unexpected plugin or library, its dependency parent,
+resolved path, and expected FFmpeg ABI.
 
 ## Migration Sequence
 
-1. Add the custom Qt kit bootstrap and manifest validation.
-2. Add the pinned Linux FFmpeg/SRT dependency build.
-3. Point local and CI presets at the custom kit.
-4. Add deterministic backend selection and the production API boundary check.
-5. Update desktop and iOS packaging to use the custom kit and package-local
-   plugin paths.
-6. Add dependency, link-map, loaded-module, audio, and preview gates.
-7. Remove legacy deployment assumptions that copy Qt's FFmpeg runtime.
-
-Each platform moves only after its audio, preview, and package-provenance gates
-pass. Release artifacts must not mix old and new policies.
+1. Remove the abandoned custom Qt bootstrap and generated custom-kit artifacts.
+2. Add deterministic backend selection and API-boundary tests.
+3. Add the cross-platform package/link-map audit.
+4. Filter Qt's dynamic FFmpeg backend from Windows, macOS, and Linux packages.
+5. Exclude Qt's static FFmpeg plugin on iOS and prove link-map provenance.
+6. Add the pinned Linux FFmpeg 8/SRT build.
+7. Add isolated audio/video/runtime smoke tests to CI and pre-push.
 
 ## Acceptance Criteria
 
+- No Qt component is rebuilt.
 - Every supported release package proves exactly one FFmpeg implementation.
-- That implementation is the repository-pinned OpenLiveReplay FFmpeg 8 build.
-- Qt Multimedia's FFmpeg feature is disabled on every target.
-- Audio monitoring and all preview outputs pass platform smoke tests.
+- That implementation is OpenLiveReplay's controlled FFmpeg 8.
+- Qt's FFmpeg media plugin is absent from dynamic packages and iOS static
+  imports.
+- Audio monitoring and every preview output pass platform smoke tests.
 - Existing recording, replay, seek, and SRT tests remain green.
-- No release build resolves Qt, FFmpeg, or SRT from an uncontrolled system path.
-- CI prevents prohibited Qt media-backend APIs from entering production code.
+- No release build resolves Qt plugins, FFmpeg, or SRT from uncontrolled paths.
+- The source-policy gate prevents future Qt media-backend API dependencies.
+- No commit is created until the user explicitly grants permission.

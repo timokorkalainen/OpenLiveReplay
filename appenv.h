@@ -5,6 +5,7 @@
 
 namespace appenv {
 
+void configureQtMediaBackend();
 quint16 controlPort();
 QString documentsRoot();
 QString documentsPath(const QString& relativePath);
