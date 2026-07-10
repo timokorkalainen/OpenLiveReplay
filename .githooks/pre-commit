@@ -99,6 +99,36 @@ if [ -n "$cpp_staged" ] && [ -x "$CF" ]; then
     fi
 fi
 
+# --- roadmap audit: structural check of the execution-model docs (python-only) -
+# Runs only when the plan or its tooling is staged. Fast (< 1 s); the same audit
+# is the authoritative required "Docs audit" job in CI. Missing python is skipped
+# (not fatal), matching the "partial toolchain does not block" policy above.
+staged_plan="$(git diff --cached --name-only --diff-filter=ACM -- \
+    docs/broadcast-plan tools/roadmap || true)"
+if [ -n "$staged_plan" ] && [ -f tools/roadmap/audit.py ]; then
+    # Resolve a REAL Python 3 by executing a probe -- a bare presence check would
+    # match the Windows Store `python3` stub (which only prints an install message).
+    PY=""
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1 \
+            && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            PY="$c"; break
+        fi
+    done
+    if [ -z "$PY" ] && command -v py >/dev/null 2>&1 \
+        && py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+        PY="py -3"
+    fi
+    if [ -n "$PY" ]; then
+        if ! $PY tools/roadmap/audit.py; then
+            echo "[pre-commit] roadmap audit failed (see docs/broadcast-plan/README.md 'The audit lane')" >&2
+            fail=1
+        fi
+    else
+        echo "[pre-commit] python3 not found - skipping roadmap audit (CI enforces it)" >&2
+    fi
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "[pre-commit] blocked. Bypass with: git commit --no-verify" >&2
     exit 1

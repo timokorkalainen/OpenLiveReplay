@@ -7,6 +7,36 @@ Conventions for AI agents working in this repo.
 > professional and self-contained: no secrets, internal notes, or references to
 > private history; document the present design and flow, not past incidents.
 
+## Autonomous execution model
+
+For long-running, agent-driven development this repo runs a machine-checkable
+roadmap plus a non-stop operating loop:
+[`docs/broadcast-plan/README.md`](docs/broadcast-plan/README.md) is the "what"
+(goal, guardrails, non-goals, quality gates, initiative registry, governance) and
+[`docs/broadcast-plan/operating-loop.md`](docs/broadcast-plan/operating-loop.md)
+is the "how". The human steers **by exception** through
+[`docs/broadcast-plan/directives.md`](docs/broadcast-plan/directives.md); silence
+means continue.
+
+When operating under that loop, its rules govern and **supersede the
+human-in-the-loop assumptions in the rest of this file**:
+
+- **Self-merge is authorized** behind the single required **"CI gate"** check,
+  after an **independent review in a fresh context** by a different agent than the
+  implementer (with a security pass for auth / ingest / I-O / rendering changes),
+  a diff-scope check (the PR touches only its declared Files), and a recorded
+  rollback. Merge with `gh pr merge --merge`; never `--admin` and never
+  `--no-verify`. This replaces any expectation that a human performs the merge.
+- The roadmap is enforced by `python tools/roadmap/audit.py`, wired into the
+  pre-commit and pre-push hooks and the required **"Docs audit"** CI job — never
+  bypass it. `--frontier` prints the ready set to select work from.
+- Reverting a flagged change is always in-policy. Production deploys/migrations,
+  spending, external publishing, deleting evidence, and overriding a failed
+  safety/security gate require an explicit directive.
+
+Outside the loop (a one-off, human-driven change) the conventions below apply as
+written.
+
 ## Worktrees
 
 Do multi-step work in a dedicated git worktree rather than the root checkout, which

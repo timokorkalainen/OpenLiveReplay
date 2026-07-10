@@ -58,6 +58,34 @@ if [ "${OLR_PREPUSH_SKIP:-0}" = "1" ]; then
     exit 0
 fi
 
+# --- Roadmap structural audit (runs for EVERY push, incl. docs-only) ----------
+# The execution-model roadmap (docs/broadcast-plan/) is machine-checkable; a
+# malformed plan must not reach CI. This is fast (python-only, < 1 s) and needs no
+# Qt/ffmpeg, so it runs before the docs-only fast path and the tooling preflight.
+# It is the same audit the required "Docs audit" CI job runs. Missing python is
+# skipped (CI remains authoritative); a real audit failure BLOCKS the push.
+if [ -f tools/roadmap/audit.py ]; then
+    # Resolve a REAL Python 3 by executing a probe (mirrors have_python3 below) so
+    # the Windows Store `python3` stub cannot masquerade as an interpreter.
+    PP_PY=""
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1 \
+            && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            PP_PY="$c"; break
+        fi
+    done
+    if [ -z "$PP_PY" ] && command -v py >/dev/null 2>&1 \
+        && py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+        PP_PY="py -3"
+    fi
+    if [ -n "$PP_PY" ]; then
+        echo "[pre-push] Roadmap audit (docs/broadcast-plan)..."
+        $PP_PY tools/roadmap/audit.py || { echo "[pre-push] roadmap audit FAILED." >&2; exit 1; }
+    else
+        echo "[pre-push] python3 not found - skipping roadmap audit (CI enforces it)." >&2
+    fi
+fi
+
 # --- 0. Docs-only fast path ---------------------------------------------------
 # A push that touches ONLY documentation/legal text cannot affect the build, the
 # delivery matrix, or any test, so the heavy gates below would validate nothing.
