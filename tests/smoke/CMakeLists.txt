@@ -59,6 +59,11 @@ set_tests_properties(linux_ffmpeg_build_config PROPERTIES LABELS "smoke;ci" TIME
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(NAME ios_qt_media_plugins_policy
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_qt_media_plugins.py")
+set_tests_properties(ios_qt_media_plugins_policy PROPERTIES LABELS "smoke;ci" TIMEOUT 10)
+
 add_test(NAME qt_media_api_boundary_unit
     COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/test_qt_media_api_boundary.py")

@@ -999,6 +999,26 @@ if(APPLE AND NOT IOS)
 endif()
 if(IOS)
     target_link_libraries(OpenLiveReplay PRIVATE OlrStyleplugin)
+
+    set(OLR_QT_DARWIN_MEDIA_PLUGIN Qt6::QDarwinMediaPlugin)
+    set(OLR_QT_FFMPEG_MEDIA_PLUGIN Qt6::QFFmpegMediaPlugin)
+    if(NOT TARGET ${OLR_QT_DARWIN_MEDIA_PLUGIN})
+        message(FATAL_ERROR
+            "Qt ${Qt6_VERSION} at ${Qt6_DIR} does not export ${OLR_QT_DARWIN_MEDIA_PLUGIN}; "
+            "cannot select the native iOS Qt Multimedia backend deterministically")
+    endif()
+    if(NOT TARGET ${OLR_QT_FFMPEG_MEDIA_PLUGIN})
+        message(FATAL_ERROR
+            "Qt ${Qt6_VERSION} at ${Qt6_DIR} does not export ${OLR_QT_FFMPEG_MEDIA_PLUGIN}; "
+            "cannot exclude Qt's FFmpeg media backend deterministically")
+    endif()
+    qt_import_plugins(OpenLiveReplay
+        INCLUDE ${OLR_QT_DARWIN_MEDIA_PLUGIN}
+        EXCLUDE ${OLR_QT_FFMPEG_MEDIA_PLUGIN})
+
+    set_target_properties(OpenLiveReplay PROPERTIES
+        XCODE_ATTRIBUTE_LD_GENERATE_MAP_FILE "YES"
+        XCODE_ATTRIBUTE_LD_MAP_FILE_PATH "$(TARGET_TEMP_DIR)/$(PRODUCT_NAME)-LinkMap-$(CURRENT_VARIANT)-$(CURRENT_ARCH).txt")
 endif()
 if(WIN32)
     target_link_libraries(OpenLiveReplay PRIVATE ws2_32)
