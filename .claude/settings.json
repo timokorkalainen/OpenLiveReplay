@@ -1,0 +1,32 @@
+{
+  "//": "Project agent permissions for the autonomous execution loop (docs/broadcast-plan/operating-loop.md). `deny` wins over `allow`. Raw `gh pr merge` is denied so merges go through the review-enforcing merge guard; force/no-verify pushes and gh-api writes are denied as defense-in-depth (GitHub branch protection is the hard backstop). Personal overrides live in the gitignored settings.local.json.",
+  "permissions": {
+    "allow": [
+      "Bash(python tools/roadmap/audit.py:*)",
+      "Bash(python -m unittest:*)",
+      "Bash(bash tools/roadmap/merge_guard.sh:*)",
+      "Bash(git fetch:*)",
+      "Bash(git worktree:*)",
+      "Bash(git push:*)",
+      "Bash(git revert:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr edit:* --add-label:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh run watch:*)",
+      "Bash(cmake:*)",
+      "Bash(ctest:*)",
+      "Bash(ninja:*)"
+    ],
+    "deny": [
+      "Bash(gh pr merge:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --no-verify:*)",
+      "Bash(gh api:*)"
+    ]
+  }
+}

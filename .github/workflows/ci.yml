@@ -1024,6 +1024,25 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
+  # Roadmap structural audit. ALWAYS runs (no `needs: changes`) so it can never be
+  # skipped -- the machine-checkable execution-model plan (docs/broadcast-plan/)
+  # must be well-formed on every PR, INCLUDING docs-only ones. Fast, python-only,
+  # no build. Gated by "CI gate" below (a real failure here fails the merge).
+  # ---------------------------------------------------------------------------
+  docs-audit:
+    name: Docs audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Roadmap structural audit
+        run: python tools/roadmap/audit.py
+      - name: Audit rule tests
+        run: python -m unittest discover -s tools/roadmap -p 'test_*.py' -v
+
+  # ---------------------------------------------------------------------------
   # Single aggregate status for branch protection. Requiring this one check is
   # robust against matrix-name churn and conditional skips: it passes when every
   # required job either succeeded or was skipped (e.g. a docs-only PR), and fails
@@ -1036,7 +1055,7 @@ jobs:
   ci-gate:
     name: CI gate
     runs-on: ubuntu-latest
-    needs: [lint, build-test-macos, build-test-windows, build-test-linux, sanitizers]
+    needs: [lint, build-test-macos, build-test-windows, build-test-linux, sanitizers, docs-audit]
     if: ${{ always() }}
     steps:
       - name: Require all gating jobs to pass (skipped is allowed)
@@ -1046,7 +1065,8 @@ jobs:
             "build-test-macos=${{ needs.build-test-macos.result }}" \
             "build-test-windows=${{ needs.build-test-windows.result }}" \
             "build-test-linux=${{ needs.build-test-linux.result }}" \
-            "sanitizers=${{ needs.sanitizers.result }}"; do
+            "sanitizers=${{ needs.sanitizers.result }}" \
+            "docs-audit=${{ needs.docs-audit.result }}"; do
             name="${r%%=*}"; res="${r#*=}"
             echo "$name: $res"
             if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
@@ -1054,6 +1074,8 @@ jobs:
               fail=1
             fi
           done
+          # docs-audit has no `needs: changes` and no `if:`, so it always runs and
+          # is never 'skipped'; a malformed roadmap therefore fails "CI gate".
           exit "${fail:-0}"
 
 # iOS is the only build intentionally NOT in CI: its from-source

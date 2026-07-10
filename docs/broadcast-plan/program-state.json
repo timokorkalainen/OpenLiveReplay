@@ -1,0 +1,644 @@
+{
+  "arch-dependency-layer-lint": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-engine-library": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-ffmpeg-firewall": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "ing-audio-degrade": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "ing-windows-live-validation": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-latency-budget-harness": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-trace-tooling": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-control-api-hardening": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-ci-gate-failclosed": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-flake-observability": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-qml-lint-format-full": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-windows-ctest-lane": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-output-autorecover": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-telemetry-bus": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "sec-amf0-extract-fuzz": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "sec-control-loopback-default": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "sec-fuzz-ci-continuous": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "sec-h26x-au-cap": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "sec-secrets": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "sec-supply-chain": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "sec-threat-model": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "tc-ptp-hardening": {
+    "phase": 1,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-decoder-backend-spi": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-decompose-playbackworker": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-decompose-uimanager": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-dedup-decoderbank-avcc": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-output-sink-abi-and-registry": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-bounded-backpressure-audit": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-hotpath-scans-and-fences": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-output-cadence-decouple": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-regression-harness-ci": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-rt-scheduling": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "perf-zero-copy-interop": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-crash-safe-mkv": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-degradation-ladder": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-session-restore": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-storage-guardian": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-worker-watchdog": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-control-surface-hub": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "tc-reference-reselection": {
+    "phase": 2,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-color-quality-gate": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-color-scopes": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-colorimetry-convert": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-decode-highbit": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-gpu-highbit-composite": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-hdr-wcg-metadata": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-highbit-encode-mux": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-highbit-frame-model": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-hq-scaling": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-interlace-fields": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-legalizer": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-ndi-highbit": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-output-quality-oracle": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "tc-dropframe-source": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "tc-full-sei": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "tc-output-passthrough": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "tc-rational-recorder": {
+    "phase": 3,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-audio-mixer-monitor": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-clip-export-engine": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-graphics-overlay": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-highlight-package": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-loudness-r128": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-mam-delivery": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-recall-playlist-ui": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-ebu-r128-avsync-gate": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-ux-interaction-tests": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-angle-bank-gang": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-cockpit-layout": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-controller-feedback-parity": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-crossclip-recall": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-cue-metadata": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-hid-jogshuttle-backend": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-keyboard-hotkeys": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-preview-program-bus": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-recall-latency-sla": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rop-supermotion-interp": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-accessibility-wcag": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-alarm-health-center": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-design-system-tokens": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-localization-i18n": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-multiviewer-umd-hud": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-operator-error-prevention": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-qml-test-lint-hardening": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "uiux-sync-confidence-surface": {
+    "phase": 4,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "bvp-st2110-real": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "hwio-capture-half": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "ing-envelope-broaden": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "ing-linux-native-decode": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "ing-udp-file-restore": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-automation-protocols": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-decklink-sdi-backend": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-nmos-control": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-remi-cloud": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-st2110-egress": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "pi-tally-gpi-is07": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-nmos-conformance": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-alerting": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-hot-standby-recorder": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-nmos-observability": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-redundant-source-failover": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "tc-ltc-vitc-anc": {
+    "phase": 5,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "arch-genlock-reference-backend": {
+    "phase": 6,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "ns6-evidence-harness": {
+    "phase": 6,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-soak-chaos-ci": {
+    "phase": 6,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-st2110-ptp-conformance": {
+    "phase": 6,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "qe-two-clock-drift-rig": {
+    "phase": 6,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  },
+  "rel-24x7-soak": {
+    "phase": 6,
+    "status": "discovery",
+    "pr": null,
+    "evidence": null
+  }
+}
