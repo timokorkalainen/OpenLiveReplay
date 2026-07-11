@@ -74,8 +74,9 @@ IOS_XCFRAMEWORK_HEADERS = {
 class TemporaryPackage(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
-        self.root = Path(self.tempdir.name) / "OpenLiveReplay"
-        self.root.mkdir()
+        package = Path(self.tempdir.name) / "OpenLiveReplay"
+        package.mkdir()
+        self.root = package.resolve()
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()

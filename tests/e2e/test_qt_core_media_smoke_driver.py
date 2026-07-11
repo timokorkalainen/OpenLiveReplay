@@ -86,8 +86,9 @@ class DriverPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.package = Path(self.temporary.name) / "OpenLiveReplay"
-        self.package.mkdir()
+        package = Path(self.temporary.name) / "OpenLiveReplay"
+        package.mkdir()
+        self.package = package.resolve()
 
     def module(self, relative: str) -> Path:
         path = self.package / relative
