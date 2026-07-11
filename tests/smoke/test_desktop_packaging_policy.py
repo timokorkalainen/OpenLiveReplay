@@ -156,7 +156,7 @@ class QtFfmpegPluginFilterTests(unittest.TestCase):
                 platform="windows",
                 policy_path=BUILD_SCRIPTS / "single_ffmpeg_policy.json",
                 dependency_reader=lambda path, platform: [audit.Dependency("avcodec-62.dll")]
-                if path == application
+                if path.name == application.name
                 else [],
             )
 
