@@ -52,8 +52,9 @@ QString audioErrorName(QtAudio::Error error) {
 #endif
     case QtAudio::FatalError:
         return QStringLiteral("fatal");
+    default:
+        return QStringLiteral("unknown");
     }
-    return QStringLiteral("unknown");
 }
 
 QVideoFrame solidFrame(uchar value, qint64 startTimeUs) {
