@@ -76,6 +76,17 @@ cmake --build --preset macos-release
 APP="$BUILD_DIR/OpenLiveReplay.app"
 [ -d "$APP" ] || { echo "ERROR: $APP not produced" >&2; exit 1; }
 
+echo "==> Normalizing controlled runtime search paths"
+for library in \
+    "$OLR_FFMPEG_ROOT/lib/"libav*.dylib \
+    "$OLR_FFMPEG_ROOT/lib/"libsw*.dylib \
+    "$OLR_SRT_ROOT/lib/"libsrt*.dylib; do
+    [ -f "$library" ] || continue
+    if ! otool -l "$library" | grep -Fq 'path @loader_path/. ('; then
+        install_name_tool -add_rpath '@loader_path/.' "$library"
+    fi
+done
+
 # ------------------------------------------------------------------ deploy + package
 echo "==> macdeployqt (bundling Qt frameworks, QML, dependent dylibs)"
 "$OLR_QT_ROOT/bin/macdeployqt" "$APP" -qmldir="$ROOT_DIR"
