@@ -1,7 +1,6 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Layouts
-import QtMultimedia
 import OlrTheme
 
 Item {
@@ -111,46 +110,6 @@ Item {
         multiviewBusOutput.provider = root.multiviewProvider
     }
 
-    component PreviewVideoOutput: VideoOutput {
-        id: previewOutput
-        property QtObject provider: null
-        property bool active: true
-        property QtObject attachedProvider: null
-
-        fillMode: VideoOutput.PreserveAspectFit
-
-        function selectedProvider() {
-            return (previewOutput.active && previewOutput.visible && previewOutput.provider)
-                    ? previewOutput.provider : null
-        }
-
-        function updateAttachment() {
-            previewOutput.attachProvider(previewOutput.selectedProvider())
-        }
-
-        // qmllint disable missing-property
-        function attachProvider(provider) {
-            if (previewOutput.attachedProvider === provider) return
-            var previousProvider = previewOutput.attachedProvider
-            previewOutput.attachedProvider = null
-            if (previousProvider
-                    && typeof previousProvider.removeVideoSink === "function") {
-                previousProvider.removeVideoSink(videoSink)
-            }
-            previewOutput.attachedProvider = provider
-            if (previewOutput.attachedProvider) {
-                previewOutput.attachedProvider.addVideoSink(videoSink)
-            }
-        }
-        // qmllint enable missing-property
-
-        onProviderChanged: updateAttachment()
-        onActiveChanged: updateAttachment()
-        onVisibleChanged: updateAttachment()
-        Component.onCompleted: updateAttachment()
-        Component.onDestruction: attachProvider(null)
-    }
-
     Component.onCompleted: {
         root.selectedIndex = -1
         root.viewMode = "multi"
@@ -208,7 +167,7 @@ Item {
         border.width: 2
         visible: root.viewMode === "single" && root.selectedSourceIndex >= 0 && root.pgmProvider !== null
 
-        PreviewVideoOutput {
+        PreviewSurface {
             id: singleOutput
             anchors.fill: parent
             provider: root.pgmProvider
@@ -243,7 +202,7 @@ Item {
         }
     }
 
-    PreviewVideoOutput {
+    PreviewSurface {
         id: multiviewBusOutput
         anchors.fill: parent
         visible: root.viewMode === "multi" && root.multiviewProvider !== null

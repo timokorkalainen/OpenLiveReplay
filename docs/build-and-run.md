@@ -141,12 +141,15 @@ Desktop packages retain the native Qt media backend (`windows` on Windows,
 `darwin` on macOS) while the package scripts remove Qt's FFmpeg media plugin.
 They preserve OpenLiveReplay's controlled FFmpeg 8 and SRT runtime, install a
 package-local `qt.conf`, and write package audits before archiving. Linux clears
-any inherited `QT_MEDIA_BACKEND`, uses Qt's default selection, and fails the
-runtime smoke if a Qt FFmpeg backend/plugin is loaded.
+any inherited `QT_MEDIA_BACKEND`, paints application-fed frames through the
+backend-free direct preview surface, and fails the runtime smoke if a Qt FFmpeg
+backend/plugin is loaded.
 
 Build a release package, then build the smoke harness and run it against that
 package. The command audits an isolated package copy, starts raw Qt audio, feeds
-two application-owned frames to `VideoOutput`, and records runtime audit evidence:
+two application-owned frames through the platform preview path (`VideoOutput`
+on Windows and macOS, direct frame conversion on Linux), and records runtime
+audit evidence:
 
 ```sh
 # macOS

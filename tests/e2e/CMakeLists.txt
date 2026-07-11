@@ -241,7 +241,8 @@ if(OLR_PYTHON3_EXECUTABLE)
         COMMAND "${OLR_PYTHON3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/test_pgmstage_videooutput_static.py"
             "${CMAKE_SOURCE_DIR}/ui/components/PgmStage.qml"
-            "${CMAKE_SOURCE_DIR}/MultiviewWindow.qml")
+            "${CMAKE_SOURCE_DIR}/MultiviewWindow.qml"
+            "${CMAKE_SOURCE_DIR}/ui/components/PreviewSurface.qml")
     set_tests_properties(tst_pgmstage_videooutput_static PROPERTIES
         LABELS "unit;ci"
         TIMEOUT 30)

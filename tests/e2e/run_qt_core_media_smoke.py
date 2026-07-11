@@ -226,6 +226,12 @@ def validate_media_payload(
         raise RuntimeError(
             f"media harness selected backend {payload.get('backend')!r}, expected {expected_backend!r}"
         )
+    expected_video_path = "direct-frame" if platform == "linux" else "native-video-output"
+    if payload.get("videoPath") != expected_video_path:
+        raise RuntimeError(
+            f"media harness selected video path {payload.get('videoPath')!r}, "
+            f"expected {expected_video_path!r}"
+        )
     frames = payload.get("videoFramesObserved")
     if isinstance(frames, bool) or not isinstance(frames, int):
         raise RuntimeError(f"media harness videoFramesObserved is not an integer: {payload}")

@@ -199,9 +199,41 @@ class DriverPolicyTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(RuntimeError, "videoFramesObserved"):
             self.driver.validate_media_payload(
-                {"backend": "windows", "audio": "started", "videoFramesObserved": "bad"},
+                {
+                    "backend": "windows",
+                    "audio": "started",
+                    "videoFramesObserved": "bad",
+                    "videoPath": "native-video-output",
+                },
                 "windows",
                 False,
+            )
+        with self.assertRaisesRegex(RuntimeError, "video path"):
+            self.driver.validate_media_payload(
+                {
+                    "backend": "default",
+                    "audio": "started",
+                    "videoFramesObserved": 2,
+                    "videoPath": "native-video-output",
+                },
+                "linux",
+                False,
+            )
+
+    def test_media_payload_validation_accepts_platform_video_paths(self) -> None:
+        for platform, backend, video_path in (
+            ("linux", "default", "direct-frame"),
+            ("windows", "windows", "native-video-output"),
+            ("macos", "darwin", "native-video-output"),
+        ):
+            payload = {
+                "backend": backend,
+                "audio": "started",
+                "videoFramesObserved": 2,
+                "videoPath": video_path,
+            }
+            self.assertIs(
+                self.driver.validate_media_payload(payload, platform, False), payload
             )
 
     def test_platform_layout_uses_package_local_paths(self) -> None:

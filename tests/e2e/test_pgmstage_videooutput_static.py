@@ -9,32 +9,31 @@ def require(text: str, needle: str, message: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         raise SystemExit(
             "usage: test_pgmstage_videooutput_static.py "
-            "<ui/components/PgmStage.qml> <MultiviewWindow.qml>"
+            "<ui/components/PgmStage.qml> <MultiviewWindow.qml> "
+            "<ui/components/PreviewSurface.qml>"
         )
 
     source = Path(sys.argv[1]).read_text(encoding="utf-8")
     multiview_source = Path(sys.argv[2]).read_text(encoding="utf-8")
+    preview_surface = Path(sys.argv[3]).read_text(encoding="utf-8")
 
-    require(source, "import QtMultimedia", "PgmStage must use QtMultimedia VideoOutput")
-    require(source, "component PreviewVideoOutput", "PgmStage must centralize preview sink attachment")
-    require(source, "VideoOutput", "PgmStage must render provider frames through VideoOutput")
-    require(source, "addVideoSink(videoSink)", "PgmStage VideoOutput must attach provider sinks")
-    require(source, "removeVideoSink(videoSink)", "PgmStage VideoOutput must detach provider sinks")
-    require(source, "property bool active", "PgmStage preview sinks must be explicitly active-gated")
-    require(source, "updateAttachment()", "PgmStage preview sinks must detach when inactive or hidden")
-
-    if "FramePreviewItem" in source:
-        raise AssertionError(
-            "PgmStage must not use FramePreviewItem; QQuickPaintedItem/toImage is too costly "
-            "for the primary iOS playback surface"
-        )
+    require(source, "PreviewSurface", "PgmStage must use the platform preview surface")
+    require(multiview_source, "PreviewSurface", "MultiviewWindow must use the platform preview surface")
+    require(preview_surface, "import QtMultimedia", "PreviewSurface must provide native VideoOutput")
+    require(preview_surface, "import Recorder.Types", "PreviewSurface must provide direct frame painting")
+    require(preview_surface, 'Qt.platform.os === "linux"', "direct preview must be Linux-only")
+    require(preview_surface, "FramePreviewItem", "Linux must render without a Qt media backend")
+    require(preview_surface, "VideoOutput", "non-Linux platforms must retain native VideoOutput")
+    require(preview_surface, "addVideoSink(videoSink)", "native preview must attach provider sinks")
+    require(preview_surface, "removeVideoSink(videoSink)", "native preview must detach provider sinks")
+    require(preview_surface, "property bool active", "preview surfaces must be explicitly active-gated")
+    require(preview_surface, "updateAttachment()", "native preview must detach when inactive or hidden")
 
     for name, preview_source in (
-        ("PgmStage", source),
-        ("MultiviewWindow", multiview_source),
+        ("PreviewSurface", preview_surface),
     ):
         require(
             preview_source,
@@ -57,7 +56,7 @@ def main() -> None:
             f"{name} must tolerate an already-destroyed old provider",
         )
 
-    print("PASS: PgmStage uses VideoOutput preview sinks instead of painted direct previews")
+    print("PASS: previews use direct painting on Linux and native VideoOutput elsewhere")
 
 
 if __name__ == "__main__":

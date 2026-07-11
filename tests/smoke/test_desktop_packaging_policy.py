@@ -126,6 +126,40 @@ class QtFfmpegPluginFilterTests(unittest.TestCase):
                 self.assertEqual(result.deleted, (relative,))
                 self.package.mkdir(exist_ok=True)
 
+    def test_macos_removes_plugin_with_missing_private_ffmpeg_dependency(self) -> None:
+        plugin = self.write(
+            "Contents/PlugIns/multimedia/libffmpegmediaplugin.dylib",
+            b"QFFmpegMediaPlugin",
+        )
+
+        result = filter_plugin.filter_package(
+            package=self.package,
+            platform="macos",
+            policy_path=BUILD_SCRIPTS / "single_ffmpeg_policy.json",
+            dependency_reader=lambda path, platform: [
+                audit.Dependency("@rpath/libavformat.61.dylib")
+            ]
+            if path == plugin
+            else [],
+        )
+
+        self.assertEqual(result.deleted, (plugin.relative_to(self.package).as_posix(),))
+        self.assertFalse(plugin.exists())
+
+    def test_rejects_missing_controlled_dependency_outside_qt_ffmpeg_plugin(self) -> None:
+        self.write("multimedia/ffmpegmediaplugin.dll", b"QFFmpegMediaPlugin")
+        application = self.write("OpenLiveReplay.exe")
+
+        with self.assertRaisesRegex(filter_plugin.FilterFailure, "cannot determine ownership"):
+            filter_plugin.filter_package(
+                package=self.package,
+                platform="windows",
+                policy_path=BUILD_SCRIPTS / "single_ffmpeg_policy.json",
+                dependency_reader=lambda path, platform: [audit.Dependency("avcodec-62.dll")]
+                if path == application
+                else [],
+            )
+
     def test_linux_appdir_filter_removes_plugin_and_solely_owned_dependencies(self) -> None:
         plugin = self.write(
             "usr/plugins/multimedia/libffmpegmediaplugin.so",

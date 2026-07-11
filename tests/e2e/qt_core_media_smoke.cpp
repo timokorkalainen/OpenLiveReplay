@@ -6,6 +6,7 @@
 #include <QCommandLineParser>
 #include <QElapsedTimer>
 #include <QGuiApplication>
+#include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMediaDevices>
@@ -92,6 +93,24 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
+    int observedFrames = 0;
+    const QVideoFrame first = solidFrame(0x24, 0);
+    const QVideoFrame second = solidFrame(0xc8, 40'000);
+    if (!first.isValid() || !second.isValid()) {
+        QTextStream(stderr) << "could not allocate writable video frames\n";
+        return 5;
+    }
+    QString videoPath;
+#if defined(Q_OS_LINUX)
+    const QImage firstImage = first.toImage();
+    const QImage secondImage = second.toImage();
+    if (!firstImage.isNull()) ++observedFrames;
+    if (!firstImage.isNull() && !secondImage.isNull() &&
+        secondImage.pixel(0, 0) != firstImage.pixel(0, 0)) {
+        ++observedFrames;
+    }
+    videoPath = QStringLiteral("direct-frame");
+#else
     QQmlEngine engine;
     QQmlComponent component(&engine);
     component.setData("import QtQuick\nimport QtMultimedia\nVideoOutput {}\n", QUrl());
@@ -107,22 +126,16 @@ int main(int argc, char* argv[]) {
         QTextStream(stderr) << "VideoOutput did not expose a QVideoSink\n";
         return 4;
     }
-
-    int observedFrames = 0;
     QObject::connect(videoSink, &QVideoSink::videoFrameChanged, &application,
                      [&observedFrames](const QVideoFrame& frame) {
                          if (frame.isValid()) ++observedFrames;
                      });
-    const QVideoFrame first = solidFrame(0x24, 0);
-    const QVideoFrame second = solidFrame(0xc8, 40'000);
-    if (!first.isValid() || !second.isValid()) {
-        QTextStream(stderr) << "could not allocate writable video frames\n";
-        return 5;
-    }
     videoSink->setVideoFrame(first);
     application.processEvents(QEventLoop::AllEvents, 50);
     videoSink->setVideoFrame(second);
     application.processEvents(QEventLoop::AllEvents, 50);
+    videoPath = QStringLiteral("native-video-output");
+#endif
 
     QString audioResult = QStringLiteral("failed");
     QString stateName = QStringLiteral("no-device");
@@ -172,6 +185,7 @@ int main(int argc, char* argv[]) {
         {QStringLiteral("backend"), backend},
         {QStringLiteral("pid"), qint64(QCoreApplication::applicationPid())},
         {QStringLiteral("videoFramesObserved"), observedFrames},
+        {QStringLiteral("videoPath"), videoPath},
     };
     QTextStream output(stdout);
     output << QJsonDocument(result).toJson(QJsonDocument::Compact) << '\n';

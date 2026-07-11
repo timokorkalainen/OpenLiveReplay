@@ -4,35 +4,8 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 
+#include "playback/framepreviewitem.h"
 #include "playback/frameprovider.h"
-
-class FramePreviewItemStub : public QQuickItem {
-    Q_OBJECT
-    Q_PROPERTY(QVariant provider READ provider WRITE setProvider NOTIFY providerChanged)
-    Q_PROPERTY(bool active READ active WRITE setActive NOTIFY activeChanged)
-public:
-    QVariant provider() const { return m_provider; }
-    void setProvider(const QVariant& provider) {
-        if (m_provider == provider) return;
-        m_provider = provider;
-        emit providerChanged();
-    }
-
-    bool active() const { return m_active; }
-    void setActive(bool active) {
-        if (m_active == active) return;
-        m_active = active;
-        emit activeChanged();
-    }
-
-signals:
-    void providerChanged();
-    void activeChanged();
-
-private:
-    QVariant m_provider;
-    bool m_active = false;
-};
 
 class PreviewUiStub : public QObject {
     Q_OBJECT
@@ -93,7 +66,7 @@ class PgmStageMappingSetup : public QObject {
     Q_OBJECT
 public slots:
     void applicationAvailable() {
-        qmlRegisterType<FramePreviewItemStub>("Recorder.Types", 1, 0, "FramePreviewItem");
+        qmlRegisterType<FramePreviewItem>("Recorder.Types", 1, 0, "FramePreviewItem");
         qmlRegisterType<FrameProvider>("Recorder.Types", 1, 0, "FrameProvider");
         QQuickStyle::setStyle(QStringLiteral("OlrStyle"));
         QQuickStyle::setFallbackStyle(QStringLiteral("Basic"));

@@ -14,11 +14,12 @@ OpenLiveReplay does not use Qt's media player, recorder, decoder, camera, or
 capture-session APIs. It uses only:
 
 - `QMediaDevices` and `QAudioSink` for raw PCM monitoring;
-- `QVideoFrame`, `QVideoSink`, and QML `VideoOutput` for frames produced
-  by OpenLiveReplay's own pipeline.
+- `QVideoFrame` plus either `QVideoSink` / QML `VideoOutput` or the direct
+  painted preview surface for frames produced by OpenLiveReplay's own pipeline.
 
-Those core audio and video-sink surfaces do not require Qt's FFmpeg media
-backend.
+Raw audio and video-frame conversion do not require Qt's FFmpeg media backend.
+Application-fed `VideoOutput` is used only where stock Qt provides a native
+media backend.
 
 ## Decision
 
@@ -85,7 +86,8 @@ Windows backend is selected.
 - Use the stock Qt Multimedia library.
 - Deploy no Qt media-player backend.
 - Use Qt's integrated PipeWire or PulseAudio support for `QAudioSink`.
-- Continue using application-fed `QVideoSink` / `VideoOutput`.
+- Use `FramePreviewItem` for application-fed previews because stock Qt has no
+  backend-free Linux `VideoOutput` implementation.
 - Build and package OpenLiveReplay's pinned FFmpeg 8 and SRT instead of distro
   FFmpeg.
 
@@ -117,9 +119,9 @@ introduce a second FFmpeg or switch to an unverified ABI.
 - Linux clears inherited selection and relies on the isolated package
   containing no media-player plugin.
 
-Package tests verify that core audio and video-sink APIs operate without Qt's
-FFmpeg backend. Unsupported inherited `QT_MEDIA_BACKEND` values cannot
-override application policy.
+Package tests verify that raw audio and the selected application-fed preview
+path operate without Qt's FFmpeg backend. Unsupported inherited
+`QT_MEDIA_BACKEND` values cannot override application policy.
 
 ## Plugin Isolation
 
@@ -155,7 +157,8 @@ explicit non-release developer configurations.
 Allowed production APIs:
 
 - `QMediaDevices`, `QAudioDevice`, `QAudioSink`, and raw-audio types;
-- `QVideoFrame`, `QVideoSink`, and application-fed QML `VideoOutput`.
+- `QVideoFrame`, `QVideoSink`, application-fed QML `VideoOutput`, and the
+  Linux-only direct `FramePreviewItem` surface.
 
 Prohibited production APIs:
 
@@ -197,7 +200,8 @@ Desktop package smoke tests launch in an isolated environment and verify:
 - the process remains responsive;
 - `QAudioSink` accepts 48 kHz stereo PCM, or reports an explicitly allowed
   headless no-device state;
-- two distinct frames pass through application-fed `VideoOutput`;
+- two distinct frames pass through native application-fed `VideoOutput` on
+  Windows and macOS, or through direct frame conversion on Linux;
 - loaded-module inspection finds only the expected FFmpeg 8 ABI;
 - logs contain no Qt FFmpeg initialization or backend fallback error.
 

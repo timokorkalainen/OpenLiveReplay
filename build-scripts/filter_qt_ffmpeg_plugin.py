@@ -105,7 +105,9 @@ def _dependency_edges(
     package: Path,
     platform: str,
     dependency_reader: Callable[[Path, str], list[audit.Dependency]],
+    unresolved_controlled_allowed_from: set[Path] | None = None,
 ) -> dict[Path, set[Path]]:
+    allowed_unresolved_parents = unresolved_controlled_allowed_from or set()
     edges: dict[Path, set[Path]] = {}
     for binary in binaries:
         parent = binary.resolve()
@@ -121,7 +123,7 @@ def _dependency_edges(
             target = audit._dependency_target(audit.Dependency(dependency.name, rpaths), binary, package, platform)
             controlled = audit._controlled_component(dependency.name) is not None
             if target is None:
-                if controlled:
+                if controlled and parent not in allowed_unresolved_parents:
                     raise FilterFailure(
                         f"cannot determine ownership: {_relative(binary, package)} -> {dependency.name} is unresolved"
                     )
@@ -180,7 +182,13 @@ def filter_package(
         if allow_absent and str(error).startswith("Qt FFmpeg plugin is absent"):
             return FilterResult(())
         raise
-    edges = _dependency_edges(binaries, root, platform, dependency_reader)
+    edges = _dependency_edges(
+        binaries,
+        root,
+        platform,
+        dependency_reader,
+        unresolved_controlled_allowed_from={plugin},
+    )
     plugin_closure = _closure(plugin, edges)
 
     owners: dict[Path, set[Path]] = {}
