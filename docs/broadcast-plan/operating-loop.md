@@ -105,11 +105,16 @@ The self-merge safety rests on layered enforcement, strongest first:
 - **The merge guard (loop-side):** enforces the one thing GitHub cannot — that an
   independent review happened — plus the permission `deny` list that blocks raw
   merge / `--admin` / `--no-verify` / force-push / `gh api` writes.
-- **Recommended human-owner hardening (external gate):** add a `CODEOWNERS` +
-  required-review branch-protection rule so a second *identity* must approve. This
-  is the only way to make the independent review enforced by a party other than the
-  loop itself; it is a one-time setting the human owner applies (it cannot be set
-  from within the repo, so it is tracked as an external gate, not an agent task).
+- **Do NOT enable "required approvals" branch protection on this solo repo — it
+  deadlocks the loop.** GitHub forbids a PR author from approving their own PR, and
+  `enforce_admins` is on, so a single-identity maintainer could never satisfy the
+  check and *nothing* could merge (not even via the UI). Independent-review
+  enforcement here is therefore the **merge guard** (it refuses to merge without the
+  `independent-reviewed` label) layered on the GitHub backstops above — never a
+  required-review toggle. Making review enforceable by a party *other than the loop*
+  would require a **bot / GitHub-App reviewer** wired to the merge guard (a separate,
+  opt-in second identity) — that is the only form of "required review" that does not
+  deadlock a single-identity repo.
 
 ## Revert-first
 
