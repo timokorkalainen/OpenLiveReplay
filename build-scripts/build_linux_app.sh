@@ -29,9 +29,9 @@ done
 QT_PATHS="$OLR_QT_ROOT/bin/qtpaths"
 [ -x "$QT_PATHS" ] || QT_PATHS="$(command -v qtpaths6 || true)"
 [ -n "$QT_PATHS" ] || { echo "ERROR: qtpaths is required from the selected Qt kit" >&2; exit 1; }
-QT_PLUGIN_DIR="$("$QT_PATHS" --plugin-dir)"
-QT_QML_DIR="$("$QT_PATHS" --qml-dir)"
-QT_LIB_DIR="$("$QT_PATHS" --lib-dir)"
+QT_PLUGIN_DIR="$("$QT_PATHS" --query QT_INSTALL_PLUGINS)"
+QT_QML_DIR="$("$QT_PATHS" --query QT_INSTALL_QML)"
+QT_LIB_DIR="$("$QT_PATHS" --query QT_INSTALL_LIBS)"
 
 export OLR_QT_ROOT OLR_FFMPEG_ROOT OLR_SRT_ROOT
 cd "$ROOT_DIR"

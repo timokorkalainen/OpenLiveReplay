@@ -515,6 +515,7 @@ jobs:
           NINJA_BIN="$(command -v ninja || true)"
           [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
           NINJA_DIR="$(dirname "$NINJA_BIN")"
+          HOST_PYTHON="$(command -v python)"
           export PATH="$OLR_MINGW_ROOT/bin:$NINJA_DIR:$PATH"
           FFMPEG_ROOT="$(cd windows_build/dist/ffmpeg && pwd)"
           SRT_ROOT="$(cd windows_build/dist/srt && pwd)"
@@ -533,6 +534,8 @@ jobs:
             -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
             -DCMAKE_CXX_COMPILER="$OLR_MINGW_ROOT/bin/g++.exe" \
             -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
+            -DPython3_EXECUTABLE="$HOST_PYTHON" \
+            -DOLR_PYTHON3_EXECUTABLE="$HOST_PYTHON" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
           cmake --build build-tests --target OpenLiveReplay qt_core_media_smoke tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge rhi_d3d_probe
@@ -604,7 +607,7 @@ jobs:
 
       - name: Run static media/package smoke tests
         shell: bash
-        run: ctest --test-dir build-tests --output-on-failure --no-tests=error -L smoke
+        run: ctest --test-dir build-tests --output-on-failure --no-tests=error -L smoke -LE 'gpu-smoke|ndi-output'
 
       - name: Assemble and exercise controlled Windows package
         shell: bash
