@@ -46,8 +46,10 @@ QString audioErrorName(QtAudio::Error error) {
         return QStringLiteral("open");
     case QtAudio::IOError:
         return QStringLiteral("io");
+#if QT_VERSION < QT_VERSION_CHECK(6, 11, 0)
     case QtAudio::UnderrunError:
         return QStringLiteral("underrun");
+#endif
     case QtAudio::FatalError:
         return QStringLiteral("fatal");
     }
