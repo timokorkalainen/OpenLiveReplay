@@ -128,6 +128,18 @@ class DriverPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Qt FFmpeg"):
             self.driver.validate_loaded_ffmpeg_modules([qt_plugin], self.package, "linux")
 
+    def test_rejects_unapproved_loaded_ffmpeg_family_components(self) -> None:
+        for platform, name in (
+            ("windows", "avdevice-62.dll"),
+            ("linux", "libavfilter.so.11.2"),
+            ("macos", "libpostproc.59.dylib"),
+            ("windows", "libavresample-4.dll"),
+        ):
+            with self.subTest(platform=platform, name=name):
+                module = self.module(f"extras/{platform}/{name}")
+                with self.assertRaisesRegex(RuntimeError, "unapproved FFmpeg module loaded"):
+                    self.driver.validate_loaded_ffmpeg_modules([module], self.package, platform)
+
     def test_rejects_qt_ffmpeg_backend_logs(self) -> None:
         self.driver.reject_qt_ffmpeg_logs("qt.multimedia.symbolsresolver: backend=darwin")
         with self.assertRaisesRegex(RuntimeError, "Qt FFmpeg backend"):
@@ -224,6 +236,63 @@ class DriverPolicyTests(unittest.TestCase):
         self.assertNotIn("global-qt", environment["PATH"])
         self.assertNotIn("global-ffmpeg", environment["PATH"])
         self.assertTrue(environment["PATH"].startswith(str(self.package)))
+
+    def test_linux_environment_replaces_poisoned_loader_and_plugin_paths(self) -> None:
+        layout = self.driver.package_layout(self.package, "linux")
+        poisoned = {
+            "LD_LIBRARY_PATH": "/outside/ffmpeg",
+            "QT_PLUGIN_PATH": "/outside/plugins",
+            "QT_QPA_PLATFORM_PLUGIN_PATH": "/outside/platforms",
+            "QML2_IMPORT_PATH": "/outside/qml2",
+            "QML_IMPORT_PATH": "/outside/qml",
+            "QT_QPA_PLATFORM": "minimal",
+        }
+        with mock.patch.dict(os.environ, poisoned, clear=False):
+            environment = self.driver._isolated_environment(layout, "linux", self.package / "documents")
+        self.assertEqual(environment["LD_LIBRARY_PATH"], str(self.package / "usr/lib"))
+        self.assertEqual(environment["QT_PLUGIN_PATH"], str(self.package / "usr/plugins"))
+        self.assertEqual(environment["QML2_IMPORT_PATH"], str(self.package / "usr/qml"))
+        self.assertNotIn("QT_QPA_PLATFORM_PLUGIN_PATH", environment)
+        self.assertNotIn("/outside", "\n".join(environment.values()))
+        self.assertEqual(environment["QT_QPA_PLATFORM"], "offscreen")
+
+    def test_websocket_health_probe_accepts_101_and_persists_evidence(self) -> None:
+        response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
+        connection = mock.MagicMock()
+        connection.recv.side_effect = [response, b""]
+        process = mock.MagicMock()
+        process.poll.return_value = None
+        evidence = Path(self.temporary.name) / "health.json"
+        with mock.patch.object(self.driver.socket, "create_connection", return_value=connection):
+            payload = self.driver._require_websocket_health(4567, process, 0.1, evidence)
+        self.assertEqual(payload["statusCode"], 101)
+        self.assertEqual(json.loads(evidence.read_text(encoding="utf-8"))["status"], "healthy")
+        self.assertIn(b"Upgrade: websocket", connection.sendall.call_args.args[0])
+
+    def test_websocket_health_probe_rejects_timeout_refusal_and_malformed_response(self) -> None:
+        process = mock.MagicMock()
+        process.poll.return_value = None
+        for error, expected in (
+            (TimeoutError("timed out"), "timed out"),
+            (ConnectionRefusedError("refused"), "refused"),
+        ):
+            with self.subTest(expected=expected):
+                evidence = Path(self.temporary.name) / f"health-{expected}.json"
+                with (
+                    mock.patch.object(self.driver.socket, "create_connection", side_effect=error),
+                    mock.patch.object(self.driver.time, "monotonic", side_effect=[0.0, 1.0]),
+                    mock.patch.object(self.driver.time, "sleep"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        self.driver._require_websocket_health(4567, process, 0.1, evidence)
+                self.assertEqual(json.loads(evidence.read_text(encoding="utf-8"))["status"], "failed")
+        connection = mock.MagicMock()
+        connection.recv.return_value = b"HTTP/1.1 200 OK\r\n\r\n"
+        evidence = Path(self.temporary.name) / "health-malformed.json"
+        with mock.patch.object(self.driver.socket, "create_connection", return_value=connection):
+            with self.assertRaisesRegex(RuntimeError, "expected HTTP 101"):
+                self.driver._require_websocket_health(4567, process, 0.1, evidence)
+        self.assertEqual(json.loads(evidence.read_text(encoding="utf-8"))["status"], "failed")
 
     def test_json_read_timeout_does_not_wait_for_blocked_reader(self) -> None:
         class SlowStream:
@@ -367,6 +436,9 @@ class DriverPolicyTests(unittest.TestCase):
         ffmpeg = self.module("avcodec-62.dll")
         with (
             mock.patch.object(self.driver.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                self.driver, "_require_websocket_health", return_value={"status": "healthy"}
+            ) as health,
             mock.patch.object(self.driver, "loaded_modules", return_value=[ffmpeg]),
             mock.patch.object(self.driver.time, "sleep"),
             mock.patch.object(self.driver.time, "monotonic", side_effect=[0.0, 0.0, 0.0]),
@@ -375,6 +447,7 @@ class DriverPolicyTests(unittest.TestCase):
                 layout, "windows", {}, 0.01, evidence_dir
             )
         self.assertTrue(process.terminated)
+        health.assert_called_once()
         self.assertEqual(observed, {"avcodec": "62"})
         self.assertEqual(paths, [str(ffmpeg)])
         self.assertEqual(
@@ -386,6 +459,47 @@ class DriverPolicyTests(unittest.TestCase):
                 (evidence_dir / "packaged-app-loaded-modules.json").read_text(encoding="utf-8")
             ),
             [str(ffmpeg.resolve())],
+        )
+
+    def test_packaged_app_health_failure_cleans_up_and_persists_evidence(self) -> None:
+        class FakeProcess:
+            pid = 42
+            returncode = None
+
+            def __init__(self) -> None:
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.terminated = True
+                self.returncode = -15
+
+            def communicate(self, timeout=None):
+                del timeout
+                return "startup stdout", "startup stderr"
+
+        process = FakeProcess()
+        connection = mock.MagicMock()
+        connection.recv.return_value = b"HTTP/1.1 200 OK\r\n\r\n"
+        evidence_dir = Path(self.temporary.name) / "failed-health-evidence"
+        layout = self.driver.package_layout(self.package, "windows")
+        with (
+            mock.patch.object(self.driver.subprocess, "Popen", return_value=process),
+            mock.patch.object(self.driver.socket, "create_connection", return_value=connection),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "expected HTTP 101"):
+                self.driver._inspect_packaged_app(layout, "windows", {}, 0.1, evidence_dir)
+        self.assertTrue(process.terminated)
+        health = json.loads(
+            (evidence_dir / "packaged-app-health.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(health["status"], "failed")
+        self.assertIn("HTTP/1.1 200 OK", health["response"])
+        self.assertEqual(
+            (evidence_dir / "packaged-app-stdout.log").read_text(encoding="utf-8"),
+            "startup stdout",
         )
 
     def _minimal_main_inputs(self) -> tuple[Path, Path, Path]:
@@ -490,6 +604,28 @@ class DriverPolicyTests(unittest.TestCase):
         self.assertNotIn("-L smoke", macos_commands)
         self.assertIn("-L smoke", windows_commands)
         self.assertIn("-L smoke", linux_commands)
+        expected = {
+            "macos": (macos_commands, "build-scripts/build_macos_app.sh", "build/OpenLiveReplay.app"),
+            "windows": (windows_commands, "build-scripts/build_windows_app.sh", "windows_build/dist/OpenLiveReplay"),
+            "linux": (linux_commands, "build-scripts/build_linux_app.sh", "linux_build/dist/OpenLiveReplay"),
+        }
+        for platform, (commands, packager, package) in expected.items():
+            with self.subTest(platform=platform):
+                self.assertIn(packager, commands)
+                self.assertIn("run_qt_core_media_smoke.py", commands)
+                self.assertIn(f"--package {package}", commands)
+                self.assertIn(f"--platform {platform}", commands)
+                self.assertIn("--allow-no-audio-device", commands)
+                self.assertIn("--evidence-dir runtime-evidence/", commands)
+                self.assertLess(commands.index("qt_core_media_smoke"), commands.index(packager))
+                self.assertLess(commands.index(packager), commands.index("run_qt_core_media_smoke.py"))
+        self.assertGreaterEqual(ci.count("build-scripts/single_ffmpeg_policy.json"), 3)
+        self.assertGreaterEqual(ci.count("if: always()"), 6)
+        self.assertIn("brew install ninja ffmpeg srt ccache pkg-config", macos_commands)
+        for tool in ("build-essential", "cmake", "curl", "git", "nasm", "xz-utils"):
+            self.assertIn(tool, linux_commands)
+        for platform in expected:
+            self.assertIn(f"runtime-evidence-{platform}", ci)
         comment_only = "  demo:\n    # ctest -L smoke\n    steps:\n      - run: echo test\n"
         self.assertNotIn(
             "-L smoke", yaml_run_commands(yaml_section(comment_only, "demo", 2))

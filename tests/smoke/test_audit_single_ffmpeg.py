@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import shutil
 import subprocess
@@ -751,6 +752,86 @@ class PolicyAndAuditTests(TemporaryPackage):
             "OpenLiveReplay.app/Contents/Frameworks/Helper.dylib -> @executable_path/../Frameworks/libavcodec.62.dylib: controlled dependency is unresolved",
             result.errors,
         )
+
+    def test_macos_framework_directory_and_binary_symlinks_are_scanned_safely(self) -> None:
+        framework = self.root / "OpenLiveReplay.app/Contents/Frameworks/Codec.framework"
+        version = framework / "Versions/A"
+        version.mkdir(parents=True)
+        binary = version / "Codec"
+        binary.write_bytes(b"\xfe\xed\xfa\xcfpayload")
+        try:
+            os.symlink("A", framework / "Versions/Current", target_is_directory=True)
+            os.symlink("Versions/Current/Codec", framework / "Codec")
+        except OSError as error:
+            self.skipTest(f"host cannot create framework symlinks: {error}")
+        inspected: list[Path] = []
+        result = run_audit(
+            package=self.root,
+            platform="macos",
+            policy_path=self.policy(),
+            dependency_reader=lambda path, _platform: inspected.append(path) or [],
+        )
+        self.assertFalse(any("Versions/Current" in error for error in result.errors), result.errors)
+        self.assertIn(binary, inspected)
+        self.assertIn(framework / "Codec", inspected)
+
+    def test_controlled_prefix_rejects_matching_symlink_file_escape(self) -> None:
+        app = self.binary("OpenLiveReplay.exe")
+        packaged = self.binary("avcodec-62.dll", b"matching")
+        approved = self.root.parent / "approved-prefix"
+        approved.mkdir()
+        escaped = self.root.parent / "outside-prefix" / packaged.name
+        escaped.parent.mkdir()
+        escaped.write_bytes(packaged.read_bytes())
+        try:
+            os.symlink(escaped, approved / packaged.name)
+        except OSError as error:
+            self.skipTest(f"host cannot create file symlinks: {error}")
+        result = run_audit(
+            package=self.root,
+            platform="windows",
+            policy_path=self.policy(),
+            dependency_reader=lambda path, _platform: [Dependency(packaged.name)] if path == app else [],
+            controlled_prefixes={"ffmpeg": [approved], "srt": [approved]},
+        )
+        self.assertIn(
+            "approved build output candidate escapes controlled prefix via symlink",
+            "\n".join(result.errors),
+        )
+
+    def test_rejects_unapproved_ffmpeg_family_components_in_package_and_dependencies(self) -> None:
+        forms = {
+            "windows": ("OpenLiveReplay.exe", "avdevice-62.dll"),
+            "linux": ("usr/bin/OpenLiveReplay", "libavfilter.so.11"),
+            "macos": ("OpenLiveReplay.app/Contents/MacOS/OpenLiveReplay", "libpostproc.59.dylib"),
+        }
+        for platform, (app_name, extra_name) in forms.items():
+            with self.subTest(platform=platform):
+                package = self.root / platform
+                package.mkdir()
+                app = package / app_name
+                app.parent.mkdir(parents=True, exist_ok=True)
+                magic = b"MZ" if platform == "windows" else (b"\x7fELF" if platform == "linux" else b"\xfe\xed\xfa\xcf")
+                app.write_bytes(magic)
+                extra = package / extra_name
+                extra.write_bytes(magic + b"extra")
+                result = run_audit(
+                    package=package,
+                    platform=platform,
+                    policy_path=self.policy(),
+                    dependency_reader=lambda path, _platform, app=app, extra_name=extra_name: [Dependency(extra_name)] if path == app else [],
+                    controlled_prefixes={"ffmpeg": [self.root.parent], "srt": [self.root.parent]},
+                )
+                self.assertIn("unapproved FFmpeg shared component", "\n".join(result.errors))
+        legacy = self.binary("avresample-4.dll", b"MZlegacy")
+        result = run_audit(
+            package=self.root,
+            platform="windows",
+            policy_path=self.policy(),
+            dependency_reader=lambda *_: [],
+            controlled_prefixes={"ffmpeg": [self.root.parent], "srt": [self.root.parent]},
+        )
+        self.assertIn(f"{legacy.name}: unapproved FFmpeg shared component avresample", result.errors)
 
     def test_ios_link_map_evidence_does_not_copy_expected_abi_when_header_mismatches(self) -> None:
         header_abi = {**FFMPEG_COMPONENTS, "avcodec": 61}

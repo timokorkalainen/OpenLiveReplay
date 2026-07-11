@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -244,11 +245,51 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
             self.assertIn(directory, script)
         self.assertNotIn("multimedia", script)
 
+    def test_linux_packager_installs_sanitizing_launcher_and_forced_rpaths(self) -> None:
+        script = self.read("build-scripts/build_linux_app.sh")
+        self.assertIn('cp "$BUILD_DIR/bin/OpenLiveReplay" "$APPDIR/usr/bin/OpenLiveReplay.bin"', script)
+        self.assertIn("cat > \"$APPDIR/usr/bin/OpenLiveReplay\"", script)
+        for variable in (
+            "LD_LIBRARY_PATH", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
+            "QML2_IMPORT_PATH", "QML_IMPORT_PATH",
+        ):
+            self.assertIn(variable, script)
+        self.assertIn('exec "$SCRIPT_DIR/OpenLiveReplay.bin" "$@"', script)
+        launcher = script[script.index("cat > \"$APPDIR/usr/bin/OpenLiveReplay\"") : script.index("EOF\n", script.index("cat > \"$APPDIR/usr/bin/OpenLiveReplay\""))]
+        self.assertNotIn("unset QT_QPA_PLATFORM\n", launcher)
+        self.assertIn("patchelf --force-rpath --set-rpath '$ORIGIN/../lib'", script)
+        self.assertIn('find "$APPDIR/usr" -type f -name', script)
+        self.assertIn('os.path.relpath(sys.argv[2], sys.argv[1])', script)
+        self.assertIn('patchelf --force-rpath --set-rpath "$library_rpath"', script)
+
     def test_macos_packager_uses_bundle_local_qt_plugin_configuration(self) -> None:
         script = self.read("build-scripts/build_macos_app.sh")
         self.assertIn('cp "$ROOT_DIR/qt.conf" "$APP/Contents/Resources/qt.conf"', script)
         self.assertIn("Prefix = ../", script)
         self.assertIn("s/^Plugins = \\.$/Plugins = PlugIns/", script)
+
+    def test_macos_release_requires_exact_controlled_dependencies(self) -> None:
+        presets = json.loads(self.read("CMakePresets.json"))
+        release = next(
+            preset for preset in presets["configurePresets"] if preset["name"] == "macos-release"
+        )
+        self.assertEqual(release["cacheVariables"]["OLR_CONTROLLED_DEPS_REQUIRED"], "ON")
+
+        cmake = self.read("CMakeLists.txt")
+        branch = cmake[cmake.index("elseif(APPLE) # macOS Desktop") : cmake.index("elseif(UNIX AND NOT APPLE)")]
+        self.assertIn("if(OLR_CONTROLLED_DEPS_REQUIRED)", branch)
+        self.assertIn("requires OLR_FFMPEG_ROOT and OLR_SRT_ROOT", branch)
+        for variable in (
+            "OLR_FFMPEG_AVFORMAT_LIBRARY", "OLR_FFMPEG_AVCODEC_LIBRARY",
+            "OLR_FFMPEG_AVUTIL_LIBRARY", "OLR_FFMPEG_SWSCALE_LIBRARY",
+            "OLR_FFMPEG_SWRESAMPLE_LIBRARY", "OLR_SRT_LIBRARY",
+        ):
+            self.assertIn(variable, branch)
+            self.assertIn(f'"${{{variable}}}"', branch)
+        self.assertIn("unset(${_olr_controlled_dependency} CACHE)", branch)
+        self.assertGreaterEqual(branch.count("NO_DEFAULT_PATH"), 7)
+        controlled = branch[:branch.index("else()")]
+        self.assertNotIn("OLR_BREW_PREFIX", controlled)
 
     def test_release_workflow_runs_each_desktop_packager(self) -> None:
         workflow = self.read(".github/workflows/build.yml")

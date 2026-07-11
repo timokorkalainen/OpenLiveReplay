@@ -110,9 +110,10 @@ require_in_file "$PRESETS" '"OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}"'
 
 require_in_file "$PACKAGER" 'build_ffmpeg_linux_srt.sh'
 require_in_file "$PACKAGER" 'export OLR_QT_ROOT OLR_FFMPEG_ROOT OLR_SRT_ROOT'
-require_in_file "$PACKAGER" 'cp "$BUILD_DIR/bin/OpenLiveReplay" "$APPDIR/usr/bin/"'
-require_in_file "$PACKAGER" 'patchelf --set-rpath '\''$ORIGIN/../lib'\'''
-require_in_file "$PACKAGER" 'patchelf --set-rpath '\''$ORIGIN'\'''
+require_in_file "$PACKAGER" 'cp "$BUILD_DIR/bin/OpenLiveReplay" "$APPDIR/usr/bin/OpenLiveReplay.bin"'
+require_in_file "$PACKAGER" 'exec "$SCRIPT_DIR/OpenLiveReplay.bin" "$@"'
+require_in_file "$PACKAGER" 'patchelf --force-rpath --set-rpath '\''$ORIGIN/../lib'\'''
+require_in_file "$PACKAGER" 'patchelf --force-rpath --set-rpath "$library_rpath"'
 
 require_in_file "$WORKFLOW" 'actions/cache@v4'
 require_in_file "$WORKFLOW" 'build-scripts/build_ffmpeg_linux_srt.sh'

@@ -30,7 +30,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_PREFIX_PATH": "$env{OLR_QT_ROOT}",
         "OLR_FFMPEG_ROOT": "$env{OLR_FFMPEG_ROOT}",
-        "OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}"
+        "OLR_SRT_ROOT": "$env{OLR_SRT_ROOT}",
+        "OLR_CONTROLLED_DEPS_REQUIRED": "ON"
       }
     },
     {

@@ -28,6 +28,11 @@ EXPECTED_FFMPEG_ABIS = {
     "swresample": "6",
     "swscale": "9",
 }
+UNAPPROVED_FFMPEG_COMPONENTS = ("avdevice", "avfilter", "postproc", "avresample")
+FFMPEG_SHARED_NAME_PATTERN = re.compile(
+    rf"^(?:lib)?({'|'.join((*EXPECTED_FFMPEG_ABIS, *UNAPPROVED_FFMPEG_COMPONENTS))})(?:-\d+\.dll|\.dll|\.so(?:\.\d+(?:\.\d+)*)?|(?:\.\d+(?:\.\d+)*)?\.dylib)$",
+    re.IGNORECASE,
+)
 
 
 class PackageLayout(NamedTuple):
@@ -122,6 +127,11 @@ def _component_abi(name: str, component: str, platform: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _ffmpeg_family_component(name: str) -> str | None:
+    match = FFMPEG_SHARED_NAME_PATTERN.fullmatch(name)
+    return match.group(1).lower() if match else None
+
+
 def validate_loaded_ffmpeg_modules(
     modules: Sequence[Path], package: Path, platform: str, *, require_any: bool = True
 ) -> dict[str, str]:
@@ -130,6 +140,11 @@ def validate_loaded_ffmpeg_modules(
         name = module.name.casefold()
         if "ffmpegmediaplugin" in name or "qt6ffmpegmediapluginimpl" in name:
             raise RuntimeError(f"Qt FFmpeg module loaded: {module}")
+        family_component = _ffmpeg_family_component(module.name)
+        if family_component in UNAPPROVED_FFMPEG_COMPONENTS:
+            raise RuntimeError(
+                f"unapproved FFmpeg module loaded ({family_component}): {module}"
+            )
         for component, expected_abi in EXPECTED_FFMPEG_ABIS.items():
             if component not in name:
                 continue
@@ -392,6 +407,81 @@ def _free_control_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def _require_websocket_health(
+    port: int,
+    process: subprocess.Popen[str],
+    timeout: float,
+    evidence_path: Path,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    last_error: BaseException | None = None
+    response = b""
+    request = (
+        "GET / HTTP/1.1\r\n"
+        f"Host: 127.0.0.1:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode("ascii")
+    try:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"packaged app exited before WebSocket health check (code {process.returncode})"
+                )
+            connection: socket.socket | None = None
+            try:
+                remaining = max(0.01, deadline - time.monotonic())
+                connection = socket.create_connection(
+                    ("127.0.0.1", port), timeout=min(0.25, remaining)
+                )
+                connection.settimeout(min(0.25, remaining))
+                connection.sendall(request)
+                while b"\r\n\r\n" not in response and len(response) < 16384:
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+                status_line = response.split(b"\r\n", 1)[0].decode("ascii", errors="replace")
+                match = re.fullmatch(r"HTTP/\d(?:\.\d)?\s+(\d{3})(?:\s+.*)?", status_line)
+                status_code = int(match.group(1)) if match else None
+                if status_code != 101:
+                    raise RuntimeError(
+                        f"malformed WebSocket health response; expected HTTP 101, got {status_line!r}"
+                    )
+                evidence = {
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "response": response.decode("iso-8859-1", errors="replace"),
+                    "status": "healthy",
+                    "statusCode": status_code,
+                }
+                _write_json(evidence_path, evidence)
+                return evidence
+            except (ConnectionRefusedError, TimeoutError, socket.timeout, OSError) as error:
+                last_error = error
+                response = b""
+                time.sleep(0.05)
+            finally:
+                if connection is not None:
+                    connection.close()
+        detail = str(last_error) if last_error is not None else "startup deadline expired"
+        raise RuntimeError(f"WebSocket health check timed out or was refused: {detail}")
+    except BaseException as error:
+        _write_json(
+            evidence_path,
+            {
+                "error": str(error),
+                "host": "127.0.0.1",
+                "port": port,
+                "response": response.decode("iso-8859-1", errors="replace"),
+                "status": "failed",
+            },
+        )
+        raise
+
+
 def _read_json_while_alive(
     process: subprocess.Popen[str], platform: str, timeout: float
 ) -> tuple[dict[str, object], list[Path], str, str]:
@@ -512,7 +602,8 @@ def _inspect_packaged_app(
     evidence_dir: Path,
 ) -> tuple[dict[str, str], list[str]]:
     app_environment = environment.copy()
-    app_environment["OLR_CONTROL_PORT"] = str(_free_control_port())
+    control_port = _free_control_port()
+    app_environment["OLR_CONTROL_PORT"] = str(control_port)
     _write_process_evidence(evidence_dir, "packaged-app", "", "", [])
     process: subprocess.Popen[str] | None = None
     modules: list[Path] = []
@@ -528,18 +619,12 @@ def _inspect_packaged_app(
             stderr=subprocess.PIPE,
             text=True,
         )
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and process.poll() is None:
-            time.sleep(0.05)
-            if time.monotonic() + 0.5 >= deadline:
-                break
-        if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            communicated = True
-            raise RuntimeError(
-                f"packaged app exited before module inspection ({process.returncode})\n"
-                f"stdout:\n{stdout}\nstderr:\n{stderr}"
-            )
+        _require_websocket_health(
+            control_port,
+            process,
+            timeout,
+            evidence_dir / "packaged-app-health.json",
+        )
         modules = loaded_modules(process.pid, platform)
     finally:
         if process is not None:
@@ -674,6 +759,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "media": media,
                 "packagedAppLoadedModulesEvidence": str(
                     evidence_dir / "packaged-app-loaded-modules.json"
+                ),
+                "packagedAppHealthEvidence": str(
+                    evidence_dir / "packaged-app-health.json"
                 ),
                 "spdx": str(spdx),
             }

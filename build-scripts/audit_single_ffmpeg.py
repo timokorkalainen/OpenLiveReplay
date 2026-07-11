@@ -18,11 +18,17 @@ from typing import Callable, Iterable, Sequence
 
 
 CONTROLLED_COMPONENTS = ("avcodec", "avformat", "avutil", "swresample", "swscale")
+UNAPPROVED_FFMPEG_COMPONENTS = ("avdevice", "avfilter", "postproc", "avresample")
+FFMPEG_FAMILY_COMPONENTS = CONTROLLED_COMPONENTS + UNAPPROVED_FFMPEG_COMPONENTS
 COMPONENT_PATTERN = re.compile(
     r"(?:^|[/\\])(?:lib)?(avcodec|avformat|avutil|swresample|swscale)(?:[-.](\d+)|\.so\.(\d+))",
     re.IGNORECASE,
 )
 COMPONENT_NAME_PATTERN = re.compile(r"(?:^|[/\\])(?:lib)?(avcodec|avformat|avutil|swresample|swscale)(?:[-.]|$)", re.IGNORECASE)
+FFMPEG_SHARED_NAME_PATTERN = re.compile(
+    rf"^(?:lib)?({'|'.join(FFMPEG_FAMILY_COMPONENTS)})(?:-\d+\.dll|\.dll|\.so(?:\.\d+(?:\.\d+)*)?|(?:\.\d+(?:\.\d+)*)?\.dylib)$",
+    re.IGNORECASE,
+)
 WINDOWS_ABSOLUTE_PATTERN = re.compile(r"^[A-Za-z]:[/\\]")
 MACHO_MAGICS = {
     b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
@@ -162,6 +168,12 @@ def _controlled_component(name: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def _ffmpeg_family_component(name: str) -> str | None:
+    basename = re.split(r"[/\\]", name)[-1]
+    match = FFMPEG_SHARED_NAME_PATTERN.fullmatch(basename)
+    return match.group(1).lower() if match else None
+
+
 def _is_srt(name: str) -> bool:
     return bool(re.search(r"(?:^|[/\\])libsrt(?:[-.]|\.so|$)", name, re.IGNORECASE))
 
@@ -209,9 +221,22 @@ def _package_entries(root: Path) -> tuple[list[Path], list[str]]:
         for name in sorted([*directories, *filenames]):
             path = current_path / name
             is_junction = getattr(path, "is_junction", lambda: False)()
-            if (path.is_symlink() or is_junction) and not _inside(path, root):
-                errors.append(f"symlink escapes package: {_relative(path, root)} -> {path.resolve()}")
-            if path.is_file() or path.is_symlink() or is_junction:
+            if path.is_symlink() or is_junction:
+                try:
+                    target = path.resolve(strict=True)
+                except OSError as error:
+                    errors.append(f"cannot inspect broken or unreadable package symlink: {_relative(path, root)}: {error}")
+                    continue
+                if not _inside(target, root):
+                    errors.append(f"symlink escapes package: {_relative(path, root)} -> {target}")
+                    continue
+                if target.is_dir():
+                    continue
+                if not target.is_file():
+                    errors.append(f"cannot inspect unreadable package entry: {_relative(path, root)}")
+                    continue
+                entries.append(path)
+            elif path.is_file():
                 entries.append(path)
     return sorted(entries), errors
 
@@ -438,14 +463,20 @@ def _policy_prefixes(
         values = list(configured.get(group, []))
         if overrides and group in overrides:
             values.extend(str(path) for path in overrides[group])
-        prefixes[group] = [Path(value) for value in values]
-        if platform != "ios" and not prefixes[group]:
+        prefixes[group] = []
+        if platform != "ios" and not values:
             errors.append(f"missing mandatory {group.upper() if group == 'srt' else 'FFmpeg'} controlled prefix")
-        for prefix in prefixes[group]:
+        for value in values:
+            prefix = Path(value)
             if not prefix.is_dir():
                 errors.append(f"controlled prefix does not exist: {prefix}")
                 continue
-            canonical_prefix = prefix.resolve()
+            try:
+                canonical_prefix = prefix.resolve(strict=True)
+            except OSError as error:
+                errors.append(f"cannot canonicalize controlled prefix {prefix}: {error}")
+                continue
+            prefixes[group].append(canonical_prefix)
             if canonical_prefix == root or _inside(canonical_prefix, root) or _inside(root, canonical_prefix):
                 errors.append("controlled prefix must be a canonical build-output root outside the package")
                 if canonical_prefix == root:
@@ -457,7 +488,7 @@ def _approved_prefix(path: Path, group: str, prefixes: dict[str, list[Path]]) ->
     available = [prefix for prefix in prefixes[group] if prefix.is_dir()]
     if not available:
         return None, None
-    candidates = [candidate for prefix in available for candidate in prefix.rglob(path.name) if candidate.is_file()]
+    candidates = [candidate for prefix in available for candidate in prefix.rglob(path.name)]
     if not candidates:
         return None, "controlled binary is absent from approved build output"
     try:
@@ -466,11 +497,26 @@ def _approved_prefix(path: Path, group: str, prefixes: dict[str, list[Path]]) ->
         return None, "cannot inspect unreadable controlled binary"
     for candidate in candidates:
         try:
-            candidate_hash = _sha256(candidate)
+            canonical_candidate = candidate.resolve(strict=True)
+        except OSError:
+            return None, f"cannot inspect unreadable approved build output: {candidate}"
+        approved_prefix = next(
+            (prefix for prefix in available if canonical_candidate.is_relative_to(prefix)),
+            None,
+        )
+        if approved_prefix is None:
+            return None, (
+                "approved build output candidate escapes controlled prefix via symlink: "
+                f"{candidate} -> {canonical_candidate}"
+            )
+        if not canonical_candidate.is_file():
+            return None, f"approved build output candidate is not a regular file: {candidate}"
+        try:
+            candidate_hash = _sha256(canonical_candidate)
         except OSError:
             return None, f"cannot inspect unreadable approved build output: {candidate}"
         if candidate_hash == packaged_hash:
-            return next(prefix for prefix in available if candidate.is_relative_to(prefix)), None
+            return approved_prefix, None
     return None, "controlled binary SHA-256 differs from approved build output"
 
 
@@ -840,6 +886,9 @@ def run_audit(
     plugin_metadata = policy["forbidden_qt_ffmpeg_plugins"]["metadata"]
     for entry in entries:
         relative = _relative(entry, root)
+        family_component = _ffmpeg_family_component(entry.name)
+        if family_component in UNAPPROVED_FFMPEG_COMPONENTS:
+            errors.append(f"{relative}: unapproved FFmpeg shared component {family_component}")
         if any(name in relative.casefold() for name in plugin_names):
             errors.append(f"forbidden Qt FFmpeg plugin path: {relative}")
         try:
@@ -880,6 +929,13 @@ def run_audit(
             errors.append(str(error))
             continue
         for dependency in dependencies:
+            family_component = _ffmpeg_family_component(dependency.name)
+            if family_component in UNAPPROVED_FFMPEG_COMPONENTS:
+                errors.append(
+                    f"{_relative(binary, root)} -> {dependency.name}: "
+                    f"unapproved FFmpeg shared component {family_component}"
+                )
+                continue
             dep_component, dep_abi = _component_and_abi(dependency.name)
             named_dependency_component = _controlled_component(dependency.name)
             controlled = named_dependency_component is not None or _is_srt(dependency.name)

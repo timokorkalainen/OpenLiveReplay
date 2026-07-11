@@ -43,7 +43,18 @@ cmake --build --preset linux-release
 echo "==> Assembling AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins" "$APPDIR/usr/qml"
-cp "$BUILD_DIR/bin/OpenLiveReplay" "$APPDIR/usr/bin/"
+cp "$BUILD_DIR/bin/OpenLiveReplay" "$APPDIR/usr/bin/OpenLiveReplay.bin"
+cat > "$APPDIR/usr/bin/OpenLiveReplay" <<'EOF'
+#!/bin/sh
+unset LD_LIBRARY_PATH
+unset QT_PLUGIN_PATH
+unset QT_QPA_PLATFORM_PLUGIN_PATH
+unset QML2_IMPORT_PATH
+unset QML_IMPORT_PATH
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$SCRIPT_DIR/OpenLiveReplay.bin" "$@"
+EOF
+chmod 0755 "$APPDIR/usr/bin/OpenLiveReplay"
 cp -a "$QT_LIB_DIR/"libQt6*.so* "$APPDIR/usr/lib/"
 for plugin in \
     platforms platforminputcontexts imageformats iconengines tls audio \
@@ -70,10 +81,17 @@ sed -i 's/^Prefix = \.$/Prefix = ../' "$APPDIR/usr/bin/qt.conf"
 sed -i 's/^Plugins = \.$/Plugins = plugins/' "$APPDIR/usr/bin/qt.conf"
 
 echo "==> Setting package-local runtime search paths"
-patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/OpenLiveReplay"
+patchelf --force-rpath --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/OpenLiveReplay.bin"
 while IFS= read -r library; do
-    patchelf --set-rpath '$ORIGIN' "$library"
-done < <(find "$APPDIR/usr/lib" -type f -name '*.so*' | sort)
+    relative_lib="$(python -c 'import os, sys; print(os.path.relpath(sys.argv[2], sys.argv[1]))' \
+        "$(dirname "$library")" "$APPDIR/usr/lib")"
+    if [ "$relative_lib" = "." ]; then
+        library_rpath='$ORIGIN'
+    else
+        library_rpath="\$ORIGIN/$relative_lib"
+    fi
+    patchelf --force-rpath --set-rpath "$library_rpath" "$library"
+done < <(find "$APPDIR/usr" -type f -name '*.so*' | sort)
 
 echo "==> Removing Qt FFmpeg plugin and plugin-only FFmpeg runtime"
 python "$SCRIPT_DIR/filter_qt_ffmpeg_plugin.py" \

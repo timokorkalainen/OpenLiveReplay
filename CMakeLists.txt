@@ -826,7 +826,67 @@ fi
     endif()
 
 elseif(APPLE) # macOS Desktop
-    if(OLR_FFMPEG_ROOT AND OLR_SRT_ROOT)
+    if(OLR_CONTROLLED_DEPS_REQUIRED)
+        if(NOT OLR_FFMPEG_ROOT OR NOT OLR_SRT_ROOT)
+            message(FATAL_ERROR
+                "OLR_CONTROLLED_DEPS_REQUIRED=ON requires OLR_FFMPEG_ROOT and OLR_SRT_ROOT")
+        endif()
+        foreach(_olr_controlled_dependency
+                OLR_FFMPEG_INCLUDE
+                OLR_SRT_INCLUDE_DIR
+                OLR_FFMPEG_AVFORMAT_LIBRARY
+                OLR_FFMPEG_AVCODEC_LIBRARY
+                OLR_FFMPEG_AVUTIL_LIBRARY
+                OLR_FFMPEG_SWSCALE_LIBRARY
+                OLR_FFMPEG_SWRESAMPLE_LIBRARY
+                OLR_SRT_LIBRARY)
+            unset(${_olr_controlled_dependency} CACHE)
+            unset(${_olr_controlled_dependency})
+        endforeach()
+        find_path(OLR_FFMPEG_INCLUDE
+            NAMES libavformat/avformat.h
+            PATHS "${OLR_FFMPEG_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_path(OLR_SRT_INCLUDE_DIR
+            NAMES srt/srt.h
+            PATHS "${OLR_SRT_ROOT}/include"
+            NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_AVFORMAT_LIBRARY
+            NAMES avformat PATHS "${OLR_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_AVCODEC_LIBRARY
+            NAMES avcodec PATHS "${OLR_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_AVUTIL_LIBRARY
+            NAMES avutil PATHS "${OLR_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_SWSCALE_LIBRARY
+            NAMES swscale PATHS "${OLR_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
+        find_library(OLR_FFMPEG_SWRESAMPLE_LIBRARY
+            NAMES swresample PATHS "${OLR_FFMPEG_ROOT}/lib" NO_DEFAULT_PATH)
+        find_library(OLR_SRT_LIBRARY
+            NAMES srt PATHS "${OLR_SRT_ROOT}/lib" NO_DEFAULT_PATH)
+        if(NOT OLR_FFMPEG_INCLUDE
+                OR NOT OLR_SRT_INCLUDE_DIR
+                OR NOT OLR_FFMPEG_AVFORMAT_LIBRARY
+                OR NOT OLR_FFMPEG_AVCODEC_LIBRARY
+                OR NOT OLR_FFMPEG_AVUTIL_LIBRARY
+                OR NOT OLR_FFMPEG_SWSCALE_LIBRARY
+                OR NOT OLR_FFMPEG_SWRESAMPLE_LIBRARY
+                OR NOT OLR_SRT_LIBRARY)
+            message(FATAL_ERROR
+                "Controlled macOS dependencies are incomplete under OLR_FFMPEG_ROOT or OLR_SRT_ROOT")
+        endif()
+        target_include_directories(OpenLiveReplay PRIVATE
+            "${OLR_FFMPEG_INCLUDE}"
+            "${OLR_SRT_INCLUDE_DIR}")
+        target_link_libraries(OpenLiveReplay PRIVATE
+            "${OLR_FFMPEG_AVFORMAT_LIBRARY}"
+            "${OLR_FFMPEG_AVCODEC_LIBRARY}"
+            "${OLR_FFMPEG_AVUTIL_LIBRARY}"
+            "${OLR_FFMPEG_SWSCALE_LIBRARY}"
+            "${OLR_FFMPEG_SWRESAMPLE_LIBRARY}"
+            "${OLR_SRT_LIBRARY}")
+        set_target_properties(OpenLiveReplay PROPERTIES
+            INSTALL_RPATH "${OLR_FFMPEG_ROOT}/lib;${OLR_SRT_ROOT}/lib")
+    elseif(OLR_FFMPEG_ROOT AND OLR_SRT_ROOT)
         # Controlled, LGPL, SRT-enabled ffmpeg built from source
         # (build-scripts/build_ffmpeg_macos_app_srt.sh). Preferred for releases.
         target_include_directories(OpenLiveReplay PRIVATE
@@ -837,6 +897,7 @@ elseif(APPLE) # macOS Desktop
             "${OLR_SRT_ROOT}/lib")
         set_target_properties(OpenLiveReplay PROPERTIES
             INSTALL_RPATH "${OLR_FFMPEG_ROOT}/lib;${OLR_SRT_ROOT}/lib")
+        target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
     else()
         # Fallback: Homebrew, for local dev convenience only. NOTE: brew ffmpeg is
         # --enable-gpl and ships libx264/libx265 — not suitable for redistribution;
@@ -855,8 +916,8 @@ elseif(APPLE) # macOS Desktop
             "${OLR_BREW_PREFIX}/lib"
             "${OLR_BREW_PREFIX}/opt/srt/lib")
         set_target_properties(OpenLiveReplay PROPERTIES INSTALL_RPATH "${OLR_BREW_PREFIX}/lib")
+        target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
     endif()
-    target_link_libraries(OpenLiveReplay PRIVATE avformat avcodec avutil swscale swresample srt)
     target_link_libraries(OpenLiveReplay PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation")
 elseif(UNIX AND NOT APPLE)
     set(OLR_FFMPEG_ROOT "" CACHE PATH "Root directory of the controlled Linux FFmpeg install")
