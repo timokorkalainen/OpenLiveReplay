@@ -328,12 +328,21 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
     def test_macos_packager_replaces_deployed_ffmpeg_with_controlled_runtime(self) -> None:
         script = self.read("build-scripts/build_macos_app.sh")
         clear_runtime = 'rm -f "$APP/Contents/Frameworks/"libav*.dylib'
-        preserve_runtime = 'cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec*.dylib'
+        preserve_runtime = 'cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec.[0-9]*.dylib'
         self.assertIn(clear_runtime, script)
         self.assertIn('rm -f "$APP/Contents/Frameworks/"libsw*.dylib', script)
         self.assert_before(script, "macdeployqt", clear_runtime)
         self.assert_before(script, clear_runtime, preserve_runtime)
         self.assert_before(script, preserve_runtime, "filter_qt_ffmpeg_plugin.py")
+        for component in ("avcodec", "avformat", "avutil", "swresample", "swscale"):
+            self.assertIn(
+                f'cp -R "$OLR_FFMPEG_ROOT/lib/"lib{component}.[0-9]*.dylib',
+                script,
+            )
+            self.assertNotIn(
+                f'cp -R "$OLR_FFMPEG_ROOT/lib/"lib{component}*.dylib',
+                script,
+            )
 
     def test_linux_packager_preserves_audio_and_rendering_plugins_without_multimedia(self) -> None:
         script = self.read("build-scripts/build_linux_app.sh")
@@ -392,7 +401,10 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
     def test_macos_packager_normalizes_controlled_prefix_before_copying_dylibs(self) -> None:
         script = self.read("build-scripts/build_macos_app.sh")
         normalize = "install_name_tool -add_rpath '@loader_path/.' \"$library\""
-        preserve = 'cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec*.dylib "$APP/Contents/Frameworks/"'
+        preserve = (
+            'cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec.[0-9]*.dylib '
+            '"$APP/Contents/Frameworks/"'
+        )
         self.assertIn(normalize, script)
         self.assertIn(preserve, script)
         self.assertLess(script.index(normalize), script.index(preserve))
