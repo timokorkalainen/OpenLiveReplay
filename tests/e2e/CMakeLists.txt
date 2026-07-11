@@ -46,7 +46,11 @@ qt_add_executable(qt_core_media_smoke
 target_include_directories(qt_core_media_smoke PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(qt_core_media_smoke PRIVATE
     Qt6::Core Qt6::Gui Qt6::Multimedia Qt6::Qml Qt6::Quick olr_warnings olr_sanitize)
-set_target_properties(qt_core_media_smoke PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+set_target_properties(qt_core_media_smoke PROPERTIES
+    AUTOMOC OFF
+    AUTOUIC OFF
+    AUTORCC OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 add_test(NAME e2e_output_soak
     COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_output_soak.sh" "$<TARGET_FILE:soak_harness>")
