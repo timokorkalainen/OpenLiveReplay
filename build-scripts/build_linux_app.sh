@@ -36,7 +36,9 @@ QT_LIB_DIR="$("$QT_PATHS" --query QT_INSTALL_LIBS)"
 export OLR_QT_ROOT OLR_FFMPEG_ROOT OLR_SRT_ROOT
 cd "$ROOT_DIR"
 echo "==> Configuring (preset linux-release)"
-cmake --preset linux-release
+# The CI debug build owns GCC warning-cleanliness. Release -O3 can produce
+# false-positive truncation diagnostics in already validated application code.
+cmake --preset linux-release -DOLR_WERROR=OFF
 echo "==> Building"
 cmake --build --preset linux-release
 
