@@ -6,6 +6,7 @@ class TestAppEnv : public QObject {
     Q_OBJECT
 private slots:
     void cleanup();
+    void configureQtMediaBackendUsesPlatformPolicy();
     void controlPortDefaultsToProductionPort();
     void controlPortUsesValidEnvironmentOverride();
     void controlPortIgnoresInvalidEnvironmentOverride();
@@ -15,6 +16,21 @@ private slots:
 void TestAppEnv::cleanup() {
     qunsetenv("OLR_CONTROL_PORT");
     qunsetenv("OLR_DOCUMENTS_ROOT");
+    qunsetenv("QT_MEDIA_BACKEND");
+}
+
+void TestAppEnv::configureQtMediaBackendUsesPlatformPolicy() {
+    qputenv("QT_MEDIA_BACKEND", "ffmpeg");
+
+    appenv::configureQtMediaBackend();
+
+#if defined(Q_OS_WIN)
+    QCOMPARE(qgetenv("QT_MEDIA_BACKEND"), QByteArray("windows"));
+#elif defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+    QCOMPARE(qgetenv("QT_MEDIA_BACKEND"), QByteArray("darwin"));
+#else
+    QVERIFY(!qEnvironmentVariableIsSet("QT_MEDIA_BACKEND"));
+#endif
 }
 
 void TestAppEnv::controlPortDefaultsToProductionPort() {

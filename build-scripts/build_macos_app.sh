@@ -25,12 +25,33 @@ BUILD_DIR="$ROOT_DIR/build"
 WORK_DIR="$ROOT_DIR/macos_build"
 DIST_DIR="$WORK_DIR/dist"
 
-newest() { ls -d "$@" 2>/dev/null | sort -V | tail -1 || true; }
+# Bash 3.2 and macOS's BSD userland lack version sorting and associative arrays,
+# so compare the numeric Qt installer version components directly.
+olr_newest_qt_kit() {
+    local suffix="$1"
+    local kit version major minor patch key
+    local best="" best_key=""
+    for kit in "$HOME"/Qt/6.*/"$suffix"; do
+        [ -d "$kit" ] || continue
+        version="${kit%/$suffix}"
+        version="${version##*/}"
+        IFS=. read -r major minor patch <<< "$version"
+        case "$major" in ''|*[!0-9]*) continue ;; esac
+        case "$minor" in ''|*[!0-9]*) continue ;; esac
+        case "$patch" in ''|*[!0-9]*) continue ;; esac
+        key="$(printf '%09d%09d%09d' "$major" "$minor" "$patch")"
+        if [ -z "$best_key" ] || [ "$key" \> "$best_key" ]; then
+            best="$kit"
+            best_key="$key"
+        fi
+    done
+    printf '%s\n' "$best"
+}
 
 # ------------------------------------------------------------------ toolchain
 # Qt kit: explicit OLR_QT_ROOT, then QT_ROOT_DIR (install-qt-action in CI), then
 # the default Qt-installer layout. No Qt version is hard-coded.
-: "${OLR_QT_ROOT:=${QT_ROOT_DIR:-$(newest "$HOME"/Qt/6.*/macos)}}"
+: "${OLR_QT_ROOT:=${QT_ROOT_DIR:-$(olr_newest_qt_kit macos)}}"
 [ -n "${OLR_QT_ROOT:-}" ] && [ -d "$OLR_QT_ROOT" ] || {
     echo "ERROR: Qt macOS kit not found; set OLR_QT_ROOT or QT_ROOT_DIR" >&2; exit 1; }
 export OLR_QT_ROOT
@@ -55,11 +76,54 @@ cmake --build --preset macos-release
 APP="$BUILD_DIR/OpenLiveReplay.app"
 [ -d "$APP" ] || { echo "ERROR: $APP not produced" >&2; exit 1; }
 
+echo "==> Normalizing controlled runtime search paths"
+for library in \
+    "$OLR_FFMPEG_ROOT/lib/"libav*.dylib \
+    "$OLR_FFMPEG_ROOT/lib/"libsw*.dylib \
+    "$OLR_SRT_ROOT/lib/"libsrt*.dylib; do
+    [ -f "$library" ] || continue
+    if ! otool -l "$library" | grep -Fq 'path @loader_path/. ('; then
+        install_name_tool -add_rpath '@loader_path/.' "$library"
+    fi
+done
+
 # ------------------------------------------------------------------ deploy + package
 echo "==> macdeployqt (bundling Qt frameworks, QML, dependent dylibs)"
 "$OLR_QT_ROOT/bin/macdeployqt" "$APP" -qmldir="$ROOT_DIR"
 
 mkdir -p "$DIST_DIR"
+rm -f "$APP/Contents/Frameworks/"libav*.dylib
+rm -f "$APP/Contents/Frameworks/"libsw*.dylib
+echo "==> Preserving controlled FFmpeg and SRT dylibs"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec.[0-9]*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libavformat.[0-9]*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libavutil.[0-9]*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libswresample.[0-9]*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_FFMPEG_ROOT/lib/"libswscale.[0-9]*.dylib "$APP/Contents/Frameworks/"
+cp -R "$OLR_SRT_ROOT/lib/"libsrt.[0-9]*.dylib "$APP/Contents/Frameworks/"
+
+echo "==> Installing package-local Qt configuration"
+cp "$ROOT_DIR/qt.conf" "$APP/Contents/Resources/qt.conf"
+sed -i '' 's/^Prefix = \.$/Prefix = ../' "$APP/Contents/Resources/qt.conf"
+sed -i '' 's/^Plugins = \.$/Plugins = PlugIns/' "$APP/Contents/Resources/qt.conf"
+sed -i '' 's|^QmlImports = qml$|QmlImports = Resources/qml|' "$APP/Contents/Resources/qt.conf"
+
+echo "==> Removing Qt FFmpeg plugin and plugin-only FFmpeg runtime"
+python "$SCRIPT_DIR/filter_qt_ffmpeg_plugin.py" \
+    --package "$APP" \
+    --platform macos
+
+echo "==> Auditing controlled FFmpeg and SRT runtime"
+EVIDENCE="$DIST_DIR/OpenLiveReplay-macos-evidence.json"
+SPDX="$DIST_DIR/OpenLiveReplay-macos.spdx.json"
+python "$SCRIPT_DIR/audit_single_ffmpeg.py" \
+    --package "$APP" \
+    --platform macos \
+    --controlled-prefix "ffmpeg=$OLR_FFMPEG_ROOT" \
+    --controlled-prefix "srt=$OLR_SRT_ROOT" \
+    --evidence "$EVIDENCE" \
+    --spdx "$SPDX"
+
 ZIP="$DIST_DIR/OpenLiveReplay-macos.zip"
 rm -f "$ZIP"
 # ditto preserves macOS bundle attributes / symlinks.

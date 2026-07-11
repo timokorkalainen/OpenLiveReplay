@@ -17,6 +17,8 @@ Install **Qt 6.x for Windows with the MinGW kit** via the
 That kit bundles the matching `gcc`, `cmake`, and `ninja`; the scripts
 auto-detect them under `C:/Qt`. No MSVC, vcpkg, or MSYS2 is required. You only
 need **Git for Windows** (for Git Bash, used to run the scripts and build FFmpeg).
+Use the installed stock Qt kit as-is: OpenLiveReplay does not rebuild Qt,
+Qt Multimedia, or perform a Qt source build, and Vulkan headers are not required.
 
 ## One command
 
@@ -85,6 +87,31 @@ cmake --build --preset windows-mingw-release --target record_harness
 ctest --test-dir build -R "e2e_native_(srt|rtmp)_smoke" --output-on-failure
 ```
 
+To verify the self-contained release package uses only the controlled FFmpeg 8
+runtime, run the Qt core-media smoke after packaging. It audits an isolated copy
+of the package, starts raw audio through the Windows Qt backend, and submits two
+application-fed frames to `VideoOutput`:
+
+```bash
+cmake --preset windows-mingw-release -DOLR_BUILD_TESTS=ON
+cmake --build --preset windows-mingw-release --target qt_core_media_smoke
+python tests/e2e/run_qt_core_media_smoke.py \
+  --package windows_build/dist/OpenLiveReplay \
+  --harness build/qt_core_media_smoke.exe \
+  --platform windows \
+  --controlled-prefix "ffmpeg=$PWD/windows_build/dist/ffmpeg" \
+  --controlled-prefix "srt=$PWD/windows_build/dist/srt" \
+  --evidence-dir windows_build/dist/runtime-evidence
+```
+
+On an intentional headless run, append `--allow-no-audio-device`; developer
+workstations should require `audio=started`. The package scripts remove Qt's
+FFmpeg media plugin and retain the native Windows backend plus the controlled
+FFmpeg/SRT runtime. On failure, start with `runtime-error.txt`, then inspect
+`harness-loaded-modules.json` for package-local `windowsmediaplugin.dll` and the
+`harness-*` / `packaged-app-*` stdout and stderr logs in the selected evidence
+directory. Audit ABI, path, and plugin details remain in the audit JSON.
+
 Qt Creator / VS Code can use the `windows-mingw-release` preset directly once the
 same `OLR_*` environment variables are set.
 
@@ -106,4 +133,5 @@ same `OLR_*` environment variables are set.
 - **SRT without encryption.** SRT is built with `ENABLE_ENCRYPTION=OFF`; the
   native SRT ingest refuses encrypted URLs and falls back to FFmpeg's own
   `libsrt` for those, so no OpenSSL dependency is pulled in.
-- CI does not build Windows; the macOS leg remains the primary gate.
+- CI builds and smoke-tests the Windows package alongside the macOS and Linux
+  release packages.

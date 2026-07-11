@@ -18,6 +18,16 @@ QString cleanRelativePath(QString relativePath) {
 
 namespace appenv {
 
+void configureQtMediaBackend() {
+#if defined(Q_OS_WIN)
+    qputenv("QT_MEDIA_BACKEND", "windows");
+#elif defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+    qputenv("QT_MEDIA_BACKEND", "darwin");
+#else
+    qunsetenv("QT_MEDIA_BACKEND");
+#endif
+}
+
 quint16 controlPort() {
     bool ok = false;
     const int value = qgetenv("OLR_CONTROL_PORT").trimmed().toInt(&ok);

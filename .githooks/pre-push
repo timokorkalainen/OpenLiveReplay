@@ -40,12 +40,14 @@
 #   SKIP_UNIT=1 / SKIP_TIDY=1 / SKIP_GPU_E2E=1  -> skip one default gate
 #   OLR_PREPUSH_FULL=1 push   -> ALSO run e2e + ASan/UBSan + TSan + full CTest matrix + iOS
 #                                (skip parts: SKIP_E2E=1 / SKIP_ASAN=1 / SKIP_TSAN=1 /
-#                                 SKIP_FULL_TESTS=1 / SKIP_IOS_BUILD=1)
+#                                 SKIP_FULL_TESTS=1 / SKIP_QT_MEDIA_SMOKE=1 /
+#                                 SKIP_IOS_BUILD=1)
 #
 # Tunables:
 #   OLR_E2E_CLIP_SECONDS  (default 5)               e2e / delivery clip length
 #   QT_HOST_PREFIX        macOS Qt kit; auto-detected when unset (see below)
 #   QT_IOS_PREFIX         iOS Qt kit; auto-detected when unset  (OLR_PREPUSH_FULL only)
+#   OLR_QT_MEDIA_SMOKE_ALLOW_NO_AUDIO=1  permit a headless host with no audio device
 #
 # Enable the hook once per clone:  git config core.hooksPath .githooks
 set -euo pipefail
@@ -135,6 +137,28 @@ fi
 
 QT_VERSION="${QT_VERSION:-6.11.1}"
 
+# Bash 3.2 / BSD-userland compatible natural selection for Qt installer kits.
+olr_newest_qt_kit() {
+    local suffix="$1"
+    local kit version major minor patch key
+    local best="" best_key=""
+    for kit in "$HOME"/Qt/6.*/"$suffix"; do
+        [ -d "$kit" ] || continue
+        version="${kit%/$suffix}"
+        version="${version##*/}"
+        IFS=. read -r major minor patch <<< "$version"
+        case "$major" in ''|*[!0-9]*) continue ;; esac
+        case "$minor" in ''|*[!0-9]*) continue ;; esac
+        case "$patch" in ''|*[!0-9]*) continue ;; esac
+        key="$(printf '%09d%09d%09d' "$major" "$minor" "$patch")"
+        if [ -z "$best_key" ] || [ "$key" \> "$best_key" ]; then
+            best="$kit"
+            best_key="$key"
+        fi
+    done
+    printf '%s\n' "$best"
+}
+
 # Resolve the Qt kit prefixes portably so the gate runs on any machine without a
 # hard-coded home path: an explicit override wins, then the same env vars the build
 # honors (OLR_QT_ROOT / QT_ROOT_DIR), then Homebrew, then the newest online-installer
@@ -148,7 +172,7 @@ olr_qt_host_prefix() {
         if [ -d "$cand" ]; then printf '%s\n' "$cand"; return 0; fi
     done
     local newest
-    newest="$(ls -d "$HOME"/Qt/6.*/macos 2>/dev/null | sort -V | tail -1 || true)"
+    newest="$(olr_newest_qt_kit macos)"
     if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
     local tool prefix
     for tool in qtpaths6 qtpaths qmake6 qmake; do
@@ -352,6 +376,45 @@ if [ "${OLR_PREPUSH_FULL:-0}" != "1" ]; then
 fi
 echo "[pre-push] OLR_PREPUSH_FULL=1 - running e2e + sanitizers + full matrix + iOS."
 
+# --- 8a. Isolated packaged Qt media runtime -----------------------------------
+# The release bundle, not the developer Qt installation, is the contract: audit
+# it first, then prove raw audio and application-fed video work without Qt's
+# FFmpeg plugin. This remains opt-in with the other package/iOS-heavy checks.
+if [ "${SKIP_QT_MEDIA_SMOKE:-0}" = "1" ]; then
+    echo "[pre-push] SKIP_QT_MEDIA_SMOKE=1 - skipping packaged Qt media runtime smoke."
+else
+    RUNTIME_EVIDENCE_DIR="${OLR_QT_MEDIA_SMOKE_EVIDENCE_DIR:-macos_build/dist/runtime-evidence}"
+    RUNTIME_SMOKE_ARGS=()
+    if [ "${OLR_QT_MEDIA_SMOKE_ALLOW_NO_AUDIO:-0}" = "1" ]; then
+        RUNTIME_SMOKE_ARGS+=(--allow-no-audio-device)
+    fi
+    export OLR_QT_ROOT="$QT_HOST_PREFIX"
+    echo "[pre-push] Building and auditing the packaged Qt media runtime..."
+    ./build-scripts/build_macos_app.sh
+    # build_macos_app.sh exports the controlled prefixes only inside its own
+    # child shell; re-export them here so the macos-release reconfigure (which
+    # forces OLR_CONTROLLED_DEPS_REQUIRED=ON) does not FATAL_ERROR on empty roots.
+    export OLR_FFMPEG_ROOT="$REPO_ROOT/macos_build/dist/ffmpeg"
+    export OLR_SRT_ROOT="$REPO_ROOT/macos_build/dist/srt"
+    cmake --preset macos-release -DOLR_BUILD_TESTS=ON >/dev/null
+    cmake --build --preset macos-release --target qt_core_media_smoke
+    RUNTIME_HARNESS="$REPO_ROOT/build/qt_core_media_smoke"
+    [ -x "$RUNTIME_HARNESS" ] || {
+        echo "[pre-push] $RUNTIME_HARNESS was not built or is not executable." >&2
+        exit 1
+    }
+    mkdir -p "$RUNTIME_EVIDENCE_DIR"
+    python3 tests/e2e/run_qt_core_media_smoke.py \
+        --package build/OpenLiveReplay.app \
+        --harness "$RUNTIME_HARNESS" \
+        --platform macos \
+        --controlled-prefix "ffmpeg=$REPO_ROOT/macos_build/dist/ffmpeg" \
+        --controlled-prefix "srt=$REPO_ROOT/macos_build/dist/srt" \
+        --evidence-dir "$RUNTIME_EVIDENCE_DIR" \
+        "${RUNTIME_SMOKE_ARGS[@]}"
+    echo "[pre-push] Packaged Qt media runtime smoke OK."
+fi
+
 # --- 7a. playback/record e2e at native speed (the native-timing scheduling run) -
 if [ "${SKIP_E2E:-0}" = "1" ]; then
     echo "[pre-push] SKIP_E2E=1 - skipping native e2e."
@@ -454,7 +517,7 @@ olr_qt_ios_prefix() {
     local sibling="${QT_HOST_PREFIX%/macos}/ios"
     if [ -d "$sibling" ]; then printf '%s\n' "$sibling"; return 0; fi
     local newest
-    newest="$(ls -d "$HOME"/Qt/6.*/ios 2>/dev/null | sort -V | tail -1 || true)"
+    newest="$(olr_newest_qt_kit ios)"
     if [ -n "$newest" ]; then printf '%s\n' "$newest"; return 0; fi
     printf '%s\n' "$HOME/Qt/$QT_VERSION/ios"
 }
@@ -462,13 +525,14 @@ QT_IOS_PREFIX="$(olr_qt_ios_prefix)"
 QT_CMAKE="$QT_IOS_PREFIX/bin/qt-cmake"
 
 if [ ! -x "$QT_CMAKE" ]; then
-    echo "[pre-push] Qt iOS kit not found at $QT_IOS_PREFIX - skipping iOS build."
-    echo "[pre-push] (set QT_IOS_PREFIX/QT_HOST_PREFIX to enable; push allowed.)"
-    exit 0
+    echo "[pre-push] Qt iOS kit not found at $QT_IOS_PREFIX." >&2
+    echo "[pre-push] Set QT_IOS_PREFIX, or use SKIP_IOS_BUILD=1 explicitly." >&2
+    exit 1
 fi
 
 echo "[pre-push] Building iOS (FFmpeg deps cached in ios_build/xcframeworks; first run ~20 min)..."
-BUILD_DIR="build/ios-prepush"
+BUILD_DIR="$REPO_ROOT/build/ios-prepush"
+rm -rf "$BUILD_DIR"
 
 env -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
     "$QT_CMAKE" -S . -B "$BUILD_DIR" -G Xcode \
@@ -476,11 +540,50 @@ env -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT 
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DOLR_GPU_PIPELINE=ON >/dev/null
 
-if env -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
+if ! env -u GIT_CONFIG -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
         cmake --build "$BUILD_DIR" --config Debug -- \
         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO; then
-    echo "[pre-push] iOS build OK - push proceeding."
-else
     echo "[pre-push] iOS build FAILED - push aborted (SKIP_IOS_BUILD=1 to override)." >&2
     exit 1
 fi
+
+APP_BUNDLE_COUNT="$(find "$BUILD_DIR" -type d -name OpenLiveReplay.app -prune | wc -l | tr -d '[:space:]')"
+if [ "$APP_BUNDLE_COUNT" -ne 1 ]; then
+    echo "[pre-push] Expected exactly one iOS OpenLiveReplay.app, found $APP_BUNDLE_COUNT." >&2
+    exit 1
+fi
+APP_BUNDLE="$(find "$BUILD_DIR" -type d -name OpenLiveReplay.app -prune -print -quit)"
+
+LINK_MAP_COUNT="$(find "$BUILD_DIR" -type f -name 'OpenLiveReplay-LinkMap-*-arm64.txt' | wc -l | tr -d '[:space:]')"
+if [ "$LINK_MAP_COUNT" -ne 1 ]; then
+    echo "[pre-push] Expected exactly one iOS OpenLiveReplay link map, found $LINK_MAP_COUNT." >&2
+    exit 1
+fi
+LINK_MAP="$(find "$BUILD_DIR" -type f -name 'OpenLiveReplay-LinkMap-*-arm64.txt' -print -quit)"
+
+IOS_AUDIT_DIR="$REPO_ROOT/ios_build/audit"
+IPA_STAGE="$IOS_AUDIT_DIR/ipa-stage"
+FINAL_IPA="$IOS_AUDIT_DIR/OpenLiveReplay-prepush.ipa"
+rm -rf "$IOS_AUDIT_DIR"
+mkdir -p "$IPA_STAGE/Payload"
+cp -R "$APP_BUNDLE" "$IPA_STAGE/Payload/OpenLiveReplay.app"
+(
+    cd "$IPA_STAGE"
+    zip -qry "$FINAL_IPA" Payload
+)
+
+python3 "$REPO_ROOT/build-scripts/audit_single_ffmpeg.py" \
+    --package "$APP_BUNDLE" \
+    --platform ios \
+    --link-map "$LINK_MAP" \
+    --archive "$REPO_ROOT/ios_build/xcframeworks/libavcodec.xcframework/ios-arm64/libavcodec.a" \
+    --archive "$REPO_ROOT/ios_build/xcframeworks/libavformat.xcframework/ios-arm64/libavformat.a" \
+    --archive "$REPO_ROOT/ios_build/xcframeworks/libavutil.xcframework/ios-arm64/libavutil.a" \
+    --archive "$REPO_ROOT/ios_build/xcframeworks/libswscale.xcframework/ios-arm64/libswscale.a" \
+    --archive "$REPO_ROOT/ios_build/xcframeworks/libswresample.xcframework/ios-arm64/libswresample.a" \
+    --archive "$REPO_ROOT/ios_build/xcframeworks/libsrt.xcframework/ios-arm64/libsrt.a" \
+    --final-package "$FINAL_IPA" \
+    --evidence "$IOS_AUDIT_DIR/OpenLiveReplay-ios-evidence.json" \
+    --spdx "$IOS_AUDIT_DIR/OpenLiveReplay-ios.spdx.json"
+
+echo "[pre-push] iOS build and single-FFmpeg audit OK - push proceeding."

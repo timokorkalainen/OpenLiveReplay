@@ -326,6 +326,19 @@ jobs:
             ${{ runner.os }}-homebrew-build-
             ${{ runner.os }}-homebrew-
 
+      - name: Cache controlled macOS FFmpeg/SRT
+        uses: actions/cache@v4
+        with:
+          path: |
+            macos_build/dist/ffmpeg
+            macos_build/dist/srt
+          # No restore-keys: build_ffmpeg_macos_app_srt.sh skips its rebuild when the
+          # dylibs merely exist, so a prefix-key fallback would restore a stale binary
+          # built from a since-changed script and the package would ship/test it
+          # unbuilt. An exact-key-only cache forces a cold rebuild when any hashed
+          # input changes -- which is exactly when the deps must be rebuilt.
+          key: ${{ runner.os }}-controlled-macos-${{ hashFiles('build-scripts/build_ffmpeg_macos_app_srt.sh', 'build-scripts/build_ffmpeg_macos_srt.sh', 'build-scripts/single_ffmpeg_policy.json') }}
+
       - name: Cache ccache
         uses: actions/cache@v4
         with:
@@ -336,7 +349,7 @@ jobs:
             ${{ runner.os }}-ccache-
 
       - name: Install build deps
-        run: brew install ninja ffmpeg srt ccache
+        run: brew install ninja ffmpeg srt ccache pkg-config
 
       - name: Configure ccache
         run: |
@@ -416,6 +429,30 @@ jobs:
                 -warnings-as-errors='*' -extra-arg=-isysroot -extra-arg="$SDK" || rc=1
           exit "$rc"
 
+      - name: Assemble and exercise controlled macOS package
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/olr-runtime"
+          cp build/qt_core_media_smoke "$RUNNER_TEMP/olr-runtime/qt_core_media_smoke"
+          rm -rf build
+          ./build-scripts/build_macos_app.sh
+          python3 tests/e2e/run_qt_core_media_smoke.py \
+            --package build/OpenLiveReplay.app \
+            --harness "$RUNNER_TEMP/olr-runtime/qt_core_media_smoke" \
+            --platform macos \
+            --controlled-prefix "ffmpeg=$PWD/macos_build/dist/ffmpeg" \
+            --controlled-prefix "srt=$PWD/macos_build/dist/srt" \
+            --allow-no-audio-device \
+            --evidence-dir runtime-evidence/macos
+
+      - name: Upload macOS runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-evidence-macos
+          path: runtime-evidence/macos
+          if-no-files-found: warn
+
   # ---------------------------------------------------------------------------
   # Build the Windows app (MinGW) + run the deterministic Media Foundation unit
   # tests. FFmpeg + SRT are built from pinned source (build_ffmpeg_windows_srt.sh
@@ -453,8 +490,10 @@ jobs:
       - name: Cache Windows FFmpeg/SRT (from-source deps)
         uses: actions/cache@v4
         with:
-          path: windows_build/dist
-          key: ${{ runner.os }}-winffmpeg-srt-${{ hashFiles('build-scripts/build_ffmpeg_windows_srt.sh') }}
+          path: |
+            windows_build/dist/ffmpeg
+            windows_build/dist/srt
+          key: ${{ runner.os }}-winffmpeg-srt-${{ hashFiles('build-scripts/build_ffmpeg_windows_srt.sh', 'build-scripts/single_ffmpeg_policy.json') }}
           restore-keys: |
             ${{ runner.os }}-winffmpeg-srt-
 
@@ -479,6 +518,7 @@ jobs:
           NINJA_BIN="$(command -v ninja || true)"
           [ -n "$NINJA_BIN" ] || NINJA_BIN="$(newest "$QT_TOOLS_DIR"/Ninja/ninja.exe)"
           NINJA_DIR="$(dirname "$NINJA_BIN")"
+          HOST_PYTHON="$(command -v python)"
           export PATH="$OLR_MINGW_ROOT/bin:$NINJA_DIR:$PATH"
           FFMPEG_ROOT="$(cd windows_build/dist/ffmpeg && pwd)"
           SRT_ROOT="$(cd windows_build/dist/srt && pwd)"
@@ -497,9 +537,11 @@ jobs:
             -DCMAKE_C_COMPILER="$OLR_MINGW_ROOT/bin/gcc.exe" \
             -DCMAKE_CXX_COMPILER="$OLR_MINGW_ROOT/bin/g++.exe" \
             -DCMAKE_MAKE_PROGRAM="$NINJA_BIN" \
+            -DPython3_EXECUTABLE="$HOST_PYTHON" \
+            -DOLR_PYTHON3_EXECUTABLE="$HOST_PYTHON" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target OpenLiveReplay tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge rhi_d3d_probe
+          cmake --build build-tests --target OpenLiveReplay qt_core_media_smoke tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge rhi_d3d_probe
 
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
@@ -566,6 +608,34 @@ jobs:
           fi
           exit "$gpu_rc"
 
+      - name: Run static media/package smoke tests
+        shell: bash
+        run: ctest --test-dir build-tests --output-on-failure --no-tests=error -L smoke -LE 'gpu-smoke|ndi-output'
+
+      - name: Assemble and exercise controlled Windows package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/olr-runtime"
+          cp build-tests/qt_core_media_smoke.exe "$RUNNER_TEMP/olr-runtime/qt_core_media_smoke.exe"
+          ./build-scripts/build_windows_app.sh
+          python tests/e2e/run_qt_core_media_smoke.py \
+            --package windows_build/dist/OpenLiveReplay \
+            --harness "$RUNNER_TEMP/olr-runtime/qt_core_media_smoke.exe" \
+            --platform windows \
+            --controlled-prefix "ffmpeg=$PWD/windows_build/dist/ffmpeg" \
+            --controlled-prefix "srt=$PWD/windows_build/dist/srt" \
+            --allow-no-audio-device \
+            --evidence-dir runtime-evidence/windows
+
+      - name: Upload Windows runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-evidence-windows
+          path: runtime-evidence/windows
+          if-no-files-found: warn
+
   # ---------------------------------------------------------------------------
   # Second toolchain: build the app + tests with GCC on Linux and run the unit
   # suite under ASan+UBSan+LSan. The only leg that exercises GCC's -Werror
@@ -595,7 +665,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build ccache pkg-config \
+            build-essential binutils cmake curl git nasm ninja-build ccache pkg-config patchelf xz-utils \
             libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libswresample-dev \
             libsrt-openssl-dev \
             libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev
@@ -608,6 +678,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-ccache-linux-gcc-
             ${{ runner.os }}-ccache-
+
+      - name: Cache controlled Linux FFmpeg/SRT
+        uses: actions/cache@v4
+        with:
+          path: |
+            linux_build/dist/ffmpeg
+            linux_build/dist/srt
+          key: ${{ runner.os }}-controlled-linux-${{ hashFiles('build-scripts/build_ffmpeg_linux_srt.sh', 'build-scripts/single_ffmpeg_policy.json') }}
+          restore-keys: |
+            ${{ runner.os }}-controlled-linux-
 
       - name: Configure ccache
         run: |
@@ -673,6 +753,34 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           QT_QPA_PLATFORM: offscreen
         run: ctest --output-on-failure --repeat until-pass:2 -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'
+
+      - name: Run static media/package smoke tests
+        working-directory: build
+        run: ctest --output-on-failure --no-tests=error -L smoke
+
+      - name: Assemble and exercise controlled Linux package
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/olr-runtime"
+          cp build/qt_core_media_smoke "$RUNNER_TEMP/olr-runtime/qt_core_media_smoke"
+          rm -rf build
+          ./build-scripts/build_linux_app.sh
+          python3 tests/e2e/run_qt_core_media_smoke.py \
+            --package linux_build/dist/OpenLiveReplay \
+            --harness "$RUNNER_TEMP/olr-runtime/qt_core_media_smoke" \
+            --platform linux \
+            --controlled-prefix "ffmpeg=$PWD/linux_build/dist/ffmpeg" \
+            --controlled-prefix "srt=$PWD/linux_build/dist/srt" \
+            --allow-no-audio-device \
+            --evidence-dir runtime-evidence/linux
+
+      - name: Upload Linux runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-evidence-linux
+          path: runtime-evidence/linux
+          if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # Sanitizer gates (macOS clang). asan-ubsan runs the WHOLE unit label under

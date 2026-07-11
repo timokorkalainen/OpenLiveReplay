@@ -470,7 +470,9 @@ void TestIngestBackendSelector::nativeSrtCountsDecodeFailures() {
     invalidUnit.codec = NativeVideoCodec::H264;
     invalidUnit.pts90k = 90000;
     invalidUnit.dts90k = 90000;
-    invalidUnit.annexB = QByteArray::fromHex("00000001658884");
+    // Every native decoder rejects an empty access unit immediately. A malformed
+    // non-empty NAL may be buffered by Media Foundation instead of failing now.
+    invalidUnit.annexB.clear();
 
     session.processVideoAccessUnits({invalidUnit});
 

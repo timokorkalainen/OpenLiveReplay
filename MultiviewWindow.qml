@@ -1,8 +1,8 @@
 pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Window
-import QtMultimedia
 import OlrTheme
+import "ui/components"
 
 Window {
     id: multiviewWindow
@@ -31,40 +31,12 @@ Window {
         anchors.fill: parent
         color: Theme.canvas
 
-        VideoOutput {
+        PreviewSurface {
             id: multiviewBusOutput
             anchors.fill: parent
-            fillMode: VideoOutput.PreserveAspectFit
             z: 0
-            property QtObject attachedProvider: null
-
-            // qmllint disable missing-property
-            function attachProvider(provider) {
-                if (attachedProvider === provider) return
-                var previousProvider = attachedProvider
-                attachedProvider = null
-                if (previousProvider
-                        && typeof previousProvider.removeVideoSink === "function") {
-                    previousProvider.removeVideoSink(videoSink)
-                }
-                attachedProvider = provider
-                if (attachedProvider) {
-                    attachedProvider.addVideoSink(videoSink)
-                }
-            }
-            // qmllint enable missing-property
-
-            Component.onCompleted: {
-                attachProvider(multiviewWindow.uiManager ? multiviewWindow.uiManager.multiviewPreviewProvider : null)
-            }
-            Component.onDestruction: attachProvider(null)
-        }
-
-        Connections {
-            target: multiviewWindow.uiManager
-            function onPlaybackProvidersChanged() {
-                multiviewBusOutput.attachProvider(multiviewWindow.uiManager ? multiviewWindow.uiManager.multiviewPreviewProvider : null)
-            }
+            provider: multiviewWindow.uiManager
+                      ? multiviewWindow.uiManager.multiviewPreviewProvider : null
         }
 
         GridView {
