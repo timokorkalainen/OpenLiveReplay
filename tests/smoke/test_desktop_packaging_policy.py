@@ -176,6 +176,39 @@ class QtFfmpegPluginFilterTests(unittest.TestCase):
         self.assertFalse(plugin.exists())
         self.assertFalse(private_library.exists())
 
+    def test_macos_removes_unversioned_aliases_of_plugin_only_ffmpeg(self) -> None:
+        plugin = self.write(
+            "Contents/PlugIns/multimedia/libffmpegmediaplugin.dylib",
+            b"QFFmpegMediaPlugin",
+        )
+        private_library = self.write("Contents/Frameworks/libavformat.61.dylib")
+        alias = private_library.with_name("libavformat.dylib")
+        try:
+            alias.symlink_to(private_library.name)
+        except OSError as error:
+            self.skipTest(f"host cannot create dylib symlinks: {error}")
+
+        result = filter_plugin.filter_package(
+            package=self.package,
+            platform="macos",
+            policy_path=BUILD_SCRIPTS / "single_ffmpeg_policy.json",
+            dependency_reader=lambda path, platform: [
+                audit.Dependency("@rpath/libavformat.61.dylib")
+            ]
+            if path.name == plugin.name
+            else [],
+        )
+
+        self.assertEqual(
+            set(result.deleted),
+            {
+                plugin.relative_to(self.package).as_posix(),
+                private_library.relative_to(self.package).as_posix(),
+                alias.relative_to(self.package).as_posix(),
+            },
+        )
+        self.assertFalse(alias.exists())
+
     def test_rejects_missing_controlled_dependency_outside_qt_ffmpeg_plugin(self) -> None:
         self.write("multimedia/ffmpegmediaplugin.dll", b"QFFmpegMediaPlugin")
         application = self.write("OpenLiveReplay.exe")
@@ -297,6 +330,8 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
         self.assertIn('"$APPDIR/usr/plugins"', script)
         self.assertIn('"$QT_LIB_DIR"/libicu*.so*', script)
         self.assertIn('"$BUILD_DIR/_deps/rtmidi-build/"librtmidi.so*', script)
+        self.assertIn('"$BUILD_DIR/ui/style/"libOlrStyle.so*', script)
+        self.assertIn('"$BUILD_DIR/ui/theme/"libOlrTheme.so*', script)
         self.assertIn('cp -a "$QT_PLUGIN_DIR/$plugin" "$APPDIR/usr/plugins/"', script)
         self.assertIn(r's/^Plugins = \.$/Plugins = plugins/', script)
         for directory in (

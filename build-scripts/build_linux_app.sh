@@ -65,6 +65,8 @@ EOF
 chmod 0755 "$APPDIR/usr/bin/OpenLiveReplay"
 cp -a "$QT_LIB_DIR/"libQt6*.so* "$APPDIR/usr/lib/"
 cp -a "$BUILD_DIR/_deps/rtmidi-build/"librtmidi.so* "$APPDIR/usr/lib/"
+cp -a "$BUILD_DIR/ui/style/"libOlrStyle.so* "$APPDIR/usr/lib/"
+cp -a "$BUILD_DIR/ui/theme/"libOlrTheme.so* "$APPDIR/usr/lib/"
 for library in "$QT_LIB_DIR"/libicu*.so*; do
     [ -e "$library" ] || continue
     cp -a "$library" "$APPDIR/usr/lib/"

@@ -214,9 +214,9 @@ def filter_package(
             owners.setdefault(target, set()).add(parent)
 
     controlled_paths: dict[Path, list[Path]] = {}
-    for binary in binaries:
-        if audit._controlled_component(binary.name) is not None:
-            controlled_paths.setdefault(binary.resolve(), []).append(binary)
+    for entry in entries:
+        if audit._controlled_component(entry.name) is not None:
+            controlled_paths.setdefault(entry.resolve(), []).append(entry)
 
     removals: list[Path] = [entry for entry in entries if entry.resolve() == plugin]
     for library, package_paths in sorted(controlled_paths.items(), key=lambda item: str(item[0])):
