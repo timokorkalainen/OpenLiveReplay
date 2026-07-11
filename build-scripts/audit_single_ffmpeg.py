@@ -302,6 +302,8 @@ def _dependency_target(dependency: Dependency, parent: Path, root: Path, platfor
     if name.startswith(("@loader_path/", "@executable_path/", "$ORIGIN/")):
         return _existing_candidate(_expand_runtime_path(name, parent, root))
     if name.startswith("@rpath/"):
+        if platform in {"macos", "ios"} and Path(name).name == parent.name:
+            return _existing_candidate(parent)
         suffix = name.removeprefix("@rpath/")
         for rpath in dependency.rpaths:
             candidate = _expand_runtime_path(rpath, parent, root) / suffix

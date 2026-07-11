@@ -756,6 +756,7 @@ class PolicyAndAuditTests(TemporaryPackage):
             result.errors,
         )
 
+    @unittest.skipIf(os.name == "nt", "macOS framework links require POSIX symlink semantics")
     def test_macos_framework_directory_and_binary_symlinks_are_scanned_safely(self) -> None:
         framework = self.root / "OpenLiveReplay.app/Contents/Frameworks/Codec.framework"
         version = framework / "Versions/A"
@@ -777,6 +778,22 @@ class PolicyAndAuditTests(TemporaryPackage):
         self.assertFalse(any("Versions/Current" in error for error in result.errors), result.errors)
         self.assertIn(binary, inspected)
         self.assertIn(framework / "Codec", inspected)
+
+    def test_macos_dylib_install_name_resolves_to_the_binary_itself(self) -> None:
+        library = self.binary("OpenLiveReplay.app/Contents/Frameworks/libavcodec.62.dylib", b"\xfe\xed\xfa\xcf")
+        result = run_audit(
+            package=self.root,
+            platform="macos",
+            policy_path=self.policy(),
+            dependency_reader=lambda path, _platform: [Dependency("@rpath/libavcodec.62.dylib")]
+            if path == library
+            else [],
+        )
+        self.assertNotIn(
+            "OpenLiveReplay.app/Contents/Frameworks/libavcodec.62.dylib -> "
+            "@rpath/libavcodec.62.dylib: controlled dependency is unresolved",
+            result.errors,
+        )
 
     def test_controlled_prefix_rejects_matching_symlink_file_escape(self) -> None:
         app = self.binary("OpenLiveReplay.exe")
