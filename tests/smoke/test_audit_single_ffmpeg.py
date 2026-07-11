@@ -401,6 +401,7 @@ class PolicyAndAuditTests(TemporaryPackage):
         self.assertIn("plugins/multimedia/ffmpegmediaplugin.dll", message)
         self.assertIn("QFFmpegMediaPlugin", message)
 
+    @unittest.skipUnless(os.name == "nt", "Windows junctions require cmd.exe")
     def test_rejects_unresolved_controlled_dependency_and_junction_escape(self) -> None:
         app = self.binary("OpenLiveReplay.exe")
         outside = self.root.parent / "outside"
@@ -739,6 +740,7 @@ class PolicyAndAuditTests(TemporaryPackage):
 
     def test_framework_binary_uses_the_app_bundle_executable_directory(self) -> None:
         framework = self.binary("OpenLiveReplay.app/Contents/Frameworks/Helper.dylib", b"\xfe\xed\xfa\xcf")
+        (self.root / "OpenLiveReplay.app/Contents/MacOS").mkdir()
         self.binary("OpenLiveReplay.app/Contents/Frameworks/libavcodec.62.dylib", b"\xfe\xed\xfa\xcf")
         result = run_audit(
             package=self.root,
