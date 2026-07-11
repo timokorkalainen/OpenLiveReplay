@@ -73,10 +73,15 @@ private:
     // case). Reset per access unit (to the AMF fallback, or -1) so an SEI TC never
     // bleeds across frames; an SEI TC overrides the AMF fallback for its frame.
     int64_t m_pendingVideoTimecode100ns = -1;
+    int64_t m_pendingVideoTcFrames = -1;
+    int32_t m_pendingVideoRateNum = 0;
+    int32_t m_pendingVideoRateDen = 0;
     // AMF onMetaData timecode (100 ns since midnight), -1 = none. A sticky fallback
     // used for frames whose access unit carries no SEI timecode, until the next SEI
     // TC appears. Set best-effort from a malformed-tolerant string parse.
     int64_t m_amfTimecode100ns = -1;
+    int32_t m_amfFrameRateNum = 0;
+    int32_t m_amfFrameRateDen = 0;
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastKeyframeAtMs = -1;

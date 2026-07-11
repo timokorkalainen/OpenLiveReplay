@@ -40,6 +40,8 @@ char* /*caller-owned, 12 bytes*/ format(const Smpte12mTimecode& tc, char out[12]
 // Absolute frame index since 00:00:00:00 at an integer fps (non-drop arithmetic;
 // drop-frame skip is applied when tc.dropFrame and nominalFps is 30 or 60).
 int64_t toFrameCount(const Smpte12mTimecode& tc, int nominalFps);
+int labelRate(int rateNum, int rateDen);
+int64_t labelFrameCount(const Smpte12mTimecode& tc, int rateNum, int rateDen);
 // 100 ns timestamp of this TC since 00:00:00:00 (= toFrameCount * 1e7 / fps).
 int64_t to100ns(const Smpte12mTimecode& tc, int nominalFps);
 // Decode a 100 ns timecode (NDI delivers TC as 100 ns since midnight) -> fields.

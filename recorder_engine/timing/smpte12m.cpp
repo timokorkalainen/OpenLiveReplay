@@ -102,6 +102,20 @@ int64_t toFrameCount(const Smpte12mTimecode& tc, int nominalFps) {
     return frame;
 }
 
+int labelRate(int rateNum, int rateDen) {
+    if (rateNum <= 0 || rateDen <= 0) return 0;
+    // 64-bit intermediate: rateNum/rateDen come from attacker-controlled SPS
+    // timing_info (bounded to <=2e9 by parseSpsFrameRate), so 2*rateNum can exceed
+    // INT_MAX — computing in int would be signed-overflow UB.
+    return int((2LL * rateNum + rateDen) / (2LL * rateDen));
+}
+
+int64_t labelFrameCount(const Smpte12mTimecode& tc, int rateNum, int rateDen) {
+    if (!tc.valid) return -1;
+    const int rate = labelRate(rateNum, rateDen);
+    return rate > 0 ? toFrameCount(tc, rate) : -1;
+}
+
 int64_t to100ns(const Smpte12mTimecode& tc, int nominalFps) {
     if (nominalFps <= 0) {
         return 0;

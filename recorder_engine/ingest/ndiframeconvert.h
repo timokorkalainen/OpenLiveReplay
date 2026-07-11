@@ -27,6 +27,8 @@ struct NdiVideoFrame {
     const uint8_t* data = nullptr;
     int64_t timestamp100ns = 0;
     int64_t timecode100ns = 0;
+    int32_t frameRateNum = 0;
+    int32_t frameRateDen = 0;
 };
 
 struct NdiAudioFrame {

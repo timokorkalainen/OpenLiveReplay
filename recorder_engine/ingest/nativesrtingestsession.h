@@ -131,6 +131,9 @@ private:
     // carries no timecode SEI (the common case). Reset to -1 per access unit so a
     // frame without a TC SEI never inherits a previous frame's timecode.
     int64_t m_pendingVideoTimecode100ns = -1;
+    int64_t m_pendingVideoTcFrames = -1;
+    int32_t m_pendingVideoRateNum = 0;
+    int32_t m_pendingVideoRateDen = 0;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastDecodeErrorLogMs = -1;
     quint64 m_decodeFailures = 0;

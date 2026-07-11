@@ -595,10 +595,11 @@ void ReplayManager::onTimerTick() {
     }
 }
 
-void ReplayManager::onFrameTimecode(int sourceIndex, int64_t sourceTimecode100ns,
+void ReplayManager::onFrameTimecode(int sourceIndex, int64_t tcFrames, int rateNum, int rateDen,
                                     int64_t sessionFrameIndex) {
     // The aligner ignores negative timecodes; the worker only emits valid ones.
-    m_tcAligner.observe(sourceIndex, sourceTimecode100ns, sessionFrameIndex);
+    m_tcAligner.observe(sourceIndex, tcFrames, FrameRateQ{rateNum, rateDen}, sessionFrameIndex,
+                        FrameRateQ{m_fps, 1});
 }
 
 void ReplayManager::onSourceStatsUpdated(int sourceIndex, IngestStats stats) {
@@ -685,8 +686,11 @@ void ReplayManager::recomputeInterCamPhase() {
         ev.clockPpm = cur.clockPpm;
         // FrameAccurate iff this source carries a common timecode whose equal-TC frames
         // coincide with the reference (the reference trivially aligns to itself).
+        const AlignmentOffset offEv = m_tcAligner.offset(m_referenceSource, s);
+        const int64_t tolUs = 1'000'000 / (m_fps > 0 ? m_fps : 30);
+        const int64_t aoff = offEv.offsetUs < 0 ? -offEv.offsetUs : offEv.offsetUs;
         ev.timecodeAlignedToReference =
-            (s == m_referenceSource) || m_tcAligner.sourcesAligned(m_referenceSource, s, 0);
+            (s == m_referenceSource) || (offEv.comparable() && aoff <= tolUs);
         // Phase 5: once an external reference (PTP) is LOCKED, mark every source as
         // disciplined to facility time so the SourceOffsetEstimator promotes those
         // phase-locked to the disciplined session estimate to FrameAccurate. With the
@@ -728,16 +732,15 @@ void ReplayManager::recomputeInterCamPhase() {
             if (servoEligible) {
                 const int64_t cap = kMaxInterCamCorrectionMs;
                 int64_t rawTargetMs;
-                if (m_tcAligner.hasTimecode(s) && m_tcAligner.hasTimecode(m_referenceSource)) {
-                    // Common timecode: lock to the EXACT TC frame offset (frame-
-                    // accurate), not the coarser clock-offset estimate. frameOffset(ref,
-                    // s) is the frame correction to ADD to s's mapping so its equal-TC
-                    // frames coincide with the reference (negative => s is late => shift
-                    // earlier); a negative servo trim pulls newer frames (earlier), so
-                    // the target is frameOffset*ms-per-frame directly. This drives a
-                    // common-TC pair to exact alignment instead of riding clock noise.
-                    const int64_t frames = m_tcAligner.frameOffset(m_referenceSource, s);
-                    rawTargetMs = frames * 1000 / qMax(1, m_fps);
+                const AlignmentOffset off = m_tcAligner.offset(m_referenceSource, s);
+                if (off.comparable()) {
+                    // Comparable common timecode: lock to the EXACT rate-aware
+                    // microsecond offset, not the coarser clock estimate. offset(ref,
+                    // s).offsetUs is the correction to ADD to s so its equal-TC frames
+                    // coincide with the reference (negative => s is late => shift
+                    // earlier); a negative servo trim pulls newer frames (earlier). This
+                    // drives a common-TC pair to exact alignment instead of clock noise.
+                    rawTargetMs = off.offsetUs / 1000;
                 } else {
                     // No common TC: use the bounded clock-offset estimate.
                     // sourcePhaseOffsetMs is POSITIVE for a late source, correction -phase.

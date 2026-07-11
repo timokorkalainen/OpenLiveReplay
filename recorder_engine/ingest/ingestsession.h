@@ -43,6 +43,9 @@ struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
     int64_t sourcePtsMs = 0;
     int64_t sourceTimecode100ns = -1;
+    int64_t sourceTcFrames = -1;
+    int32_t sourceFrameRateNum = 0;
+    int32_t sourceFrameRateDen = 0;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     FrameHandle gpuFrame;
     uint64_t gpuFenceValue = 0;
