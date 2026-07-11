@@ -64,6 +64,10 @@ exec "$SCRIPT_DIR/OpenLiveReplay.bin" "$@"
 EOF
 chmod 0755 "$APPDIR/usr/bin/OpenLiveReplay"
 cp -a "$QT_LIB_DIR/"libQt6*.so* "$APPDIR/usr/lib/"
+for library in "$QT_LIB_DIR"/libicu*.so*; do
+    [ -e "$library" ] || continue
+    cp -a "$library" "$APPDIR/usr/lib/"
+done
 for plugin in \
     platforms platforminputcontexts imageformats iconengines tls audio \
     xcbglintegrations egldeviceintegrations scenegraph \

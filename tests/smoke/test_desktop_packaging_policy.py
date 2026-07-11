@@ -231,6 +231,7 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
     def test_linux_packager_preserves_audio_and_rendering_plugins_without_multimedia(self) -> None:
         script = self.read("build-scripts/build_linux_app.sh")
         self.assertIn('"$APPDIR/usr/plugins"', script)
+        self.assertIn('"$QT_LIB_DIR"/libicu*.so*', script)
         self.assertIn('cp -a "$QT_PLUGIN_DIR/$plugin" "$APPDIR/usr/plugins/"', script)
         self.assertIn(r's/^Plugins = \.$/Plugins = plugins/', script)
         for directory in (
@@ -277,6 +278,14 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
         self.assertIn('cp "$ROOT_DIR/qt.conf" "$APP/Contents/Resources/qt.conf"', script)
         self.assertIn("Prefix = ../", script)
         self.assertIn("s/^Plugins = \\.$/Plugins = PlugIns/", script)
+
+    def test_macos_packager_normalizes_controlled_prefix_before_copying_dylibs(self) -> None:
+        script = self.read("build-scripts/build_macos_app.sh")
+        normalize = "install_name_tool -add_rpath '@loader_path/.' \"$library\""
+        preserve = 'cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec*.dylib "$APP/Contents/Frameworks/"'
+        self.assertIn(normalize, script)
+        self.assertIn(preserve, script)
+        self.assertLess(script.index(normalize), script.index(preserve))
 
     def test_macos_release_requires_exact_controlled_dependencies(self) -> None:
         presets = json.loads(self.read("CMakePresets.json"))
