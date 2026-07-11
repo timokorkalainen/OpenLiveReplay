@@ -332,9 +332,12 @@ jobs:
           path: |
             macos_build/dist/ffmpeg
             macos_build/dist/srt
+          # No restore-keys: build_ffmpeg_macos_app_srt.sh skips its rebuild when the
+          # dylibs merely exist, so a prefix-key fallback would restore a stale binary
+          # built from a since-changed script and the package would ship/test it
+          # unbuilt. An exact-key-only cache forces a cold rebuild when any hashed
+          # input changes -- which is exactly when the deps must be rebuilt.
           key: ${{ runner.os }}-controlled-macos-${{ hashFiles('build-scripts/build_ffmpeg_macos_app_srt.sh', 'build-scripts/build_ffmpeg_macos_srt.sh', 'build-scripts/single_ffmpeg_policy.json') }}
-          restore-keys: |
-            ${{ runner.os }}-controlled-macos-
 
       - name: Cache ccache
         uses: actions/cache@v4

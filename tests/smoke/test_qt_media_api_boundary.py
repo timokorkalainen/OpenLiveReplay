@@ -46,6 +46,25 @@ class QtMediaApiBoundaryTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(result.stdout, "")
 
+    def test_digit_separator_apostrophe_does_not_unmask_following_comment(self):
+        # A C++ digit-separator apostrophe (e.g. 1'000) must not be parsed as an
+        # open-ended char/string literal. If it were, the parser would stay in a
+        # lingering string state and the following // comment would no longer be
+        # masked, so an ordinary English word like "Camera" in that comment would
+        # be flagged -- a false red on compliant code that fails the required gate.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.write_file(
+                root,
+                "timing.cpp",
+                "int timeoutMs = 1'000;  // front-facing Camera preview path\n",
+            )
+
+            result = self.run_scanner(root)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout, "")
+
     def test_reports_every_prohibited_token_with_relative_path_and_line(self):
         forbidden_tokens = [
             "QMediaPlayer",

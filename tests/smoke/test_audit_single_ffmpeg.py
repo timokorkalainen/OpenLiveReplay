@@ -1517,6 +1517,153 @@ class PolicyAndAuditTests(TemporaryPackage):
             },
         )
 
+    def test_desktop_rejects_package_missing_controlled_ffmpeg_components(self) -> None:
+        # A desktop package that ships only a strict subset of the controlled
+        # FFmpeg components (each with the correct ABI and provenance) must still
+        # be rejected by the completeness gate.
+        self.binary("avcodec-62.dll", b"packaged-avcodec")
+        approved = self.root.parent / "approved-ffmpeg"
+        approved.mkdir()
+        (approved / "avcodec-62.dll").write_bytes(b"packaged-avcodec")
+        srt_prefix = self.root.parent / "approved-srt"
+        srt_prefix.mkdir()
+        result = run_audit(
+            package=self.root,
+            platform="windows",
+            policy_path=self.policy(),
+            dependency_reader=lambda *_: [],
+            controlled_prefixes={"ffmpeg": [approved], "srt": [srt_prefix]},
+        )
+        self.assertIn(
+            "missing controlled FFmpeg ABI components: avformat, avutil, swresample, swscale",
+            result.errors,
+        )
+
+    def test_rejects_forbidden_plugin_by_path_without_metadata_marker(self) -> None:
+        # A Qt FFmpeg plugin at the forbidden path whose bytes lack the ASCII
+        # metadata marker must still be rejected by the name/path check alone,
+        # independently of the byte-marker metadata check.
+        self.binary("plugins/multimedia/ffmpegmediaplugin.dll", b"MZ stripped, no marker")
+        result = run_audit(
+            package=self.root,
+            platform="windows",
+            policy_path=self.policy(),
+            dependency_reader=lambda *_: [],
+        )
+        self.assertIn(
+            "forbidden Qt FFmpeg plugin path: plugins/multimedia/ffmpegmediaplugin.dll",
+            result.errors,
+        )
+        self.assertNotIn(
+            "forbidden Qt FFmpeg plugin metadata QFFmpegMediaPlugin: plugins/multimedia/ffmpegmediaplugin.dll",
+            result.errors,
+        )
+
+    def test_desktop_rejects_controlled_binary_absent_from_approved_output(self) -> None:
+        # A packaged controlled binary whose basename is not present anywhere in a
+        # (non-empty) approved prefix must fail closed, not be treated as clean.
+        self.binary("avcodec-62.dll", b"packaged-avcodec")
+        approved = self.root.parent / "approved-ffmpeg"
+        approved.mkdir()
+        (approved / "unrelated-62.dll").write_bytes(b"unrelated")
+        srt_prefix = self.root.parent / "approved-srt"
+        srt_prefix.mkdir()
+        result = run_audit(
+            package=self.root,
+            platform="windows",
+            policy_path=self.policy(),
+            dependency_reader=lambda *_: [],
+            controlled_prefixes={"ffmpeg": [approved], "srt": [srt_prefix]},
+        )
+        self.assertIn(
+            "avcodec-62.dll: controlled binary is absent from approved build output",
+            result.errors,
+        )
+
+    def test_ios_rejects_archive_with_hash_mismatching_provenance_manifest(self) -> None:
+        policy, link_map, archives, controlled_root, _, _, _ = self.controlled_ios_audit_fixture()
+        tampered = controlled_root / "libavcodec.xcframework" / "ios-arm64" / "libavcodec.a"
+        tampered.write_bytes(b"tampered-after-manifest-was-written")
+        result = run_audit(
+            package=self.root,
+            platform="ios",
+            policy_path=policy,
+            link_map_path=link_map,
+            archive_paths=archives[:-1],
+            final_package_path=archives[-1],
+        )
+        self.assertIn(
+            f"iOS provenance manifest SHA-256 does not match archive: {tampered.resolve()}",
+            result.errors,
+        )
+
+    def test_ios_rejects_archive_absent_from_provenance_manifest(self) -> None:
+        policy, link_map, archives, controlled_root, manifest, _, _ = self.controlled_ios_audit_fixture()
+        dropped = (controlled_root / "libavutil.xcframework" / "ios-arm64" / "libavutil.a").resolve()
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        del payload["archives"][str(dropped)]
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        result = run_audit(
+            package=self.root,
+            platform="ios",
+            policy_path=policy,
+            link_map_path=link_map,
+            archive_paths=archives[:-1],
+            final_package_path=archives[-1],
+        )
+        self.assertIn(
+            f"iOS provenance manifest is missing archive hash: {dropped}",
+            result.errors,
+        )
+
+    def test_ios_manifest_missing_source_identities_fails_without_crashing(self) -> None:
+        # A manifest that passes the version/stamp/archive gates but omits the
+        # top-level source_identities key must produce the clean recorded failure
+        # (and written evidence), not an unhandled KeyError traceback.
+        policy, link_map, archives, _, manifest, _, _ = self.controlled_ios_audit_fixture()
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        del payload["source_identities"]
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+        evidence = self.root.parent / "evidence.json"
+        result = run_audit(
+            package=self.root,
+            platform="ios",
+            policy_path=policy,
+            link_map_path=link_map,
+            archive_paths=archives[:-1],
+            final_package_path=archives[-1],
+            evidence_path=evidence,
+        )
+        self.assertIn("iOS provenance manifest source identities are required", result.errors)
+        self.assertTrue(evidence.is_file())
+
+    def test_ios_rejects_dynamic_controlled_library_in_app_bundle(self) -> None:
+        # iOS links the controlled FFmpeg/SRT XCFrameworks statically, so a dynamic
+        # FFmpeg or SRT library in the .app must fail closed even though iOS has no
+        # approved-prefix provenance source to hash it against.
+        policy, link_map, archives, _, _, _, _ = self.controlled_ios_audit_fixture()
+        self.binary("Frameworks/libavcodec.62.dylib", b"\xcf\xfa\xed\xfe rogue avcodec")
+        self.binary("Frameworks/libsrt.1.5.dylib", b"\xcf\xfa\xed\xfe rogue srt")
+        final_package = self.ipa()  # rebuild the .ipa so it matches the tampered .app
+        result = run_audit(
+            package=self.root,
+            platform="ios",
+            policy_path=policy,
+            link_map_path=link_map,
+            archive_paths=archives[:-1],
+            final_package_path=final_package,
+            dependency_reader=lambda *_: [],
+        )
+        message = "\n".join(result.errors)
+        self.assertIn(
+            "Frameworks/libavcodec.62.dylib: dynamic FFmpeg/SRT library is forbidden on iOS",
+            message,
+        )
+        self.assertIn(
+            "Frameworks/libsrt.1.5.dylib: dynamic FFmpeg/SRT library is forbidden on iOS",
+            message,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

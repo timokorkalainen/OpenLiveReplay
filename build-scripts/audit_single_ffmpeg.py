@@ -884,6 +884,21 @@ def run_audit(
     errors.extend(prefix_errors)
     binaries = [path for path in entries if _is_binary(path) and _inside(path, root)]
 
+    # iOS links the controlled FFmpeg/SRT XCFrameworks statically, so no dynamic
+    # FFmpeg or SRT library should ever appear in the .app. The desktop provenance
+    # gate (approved-prefix SHA match) is intentionally absent on iOS, so without
+    # this check a stray dynamic dylib would pass with at most an ABI-major check
+    # (FFmpeg) or entirely unchecked (SRT). Fail closed on any such library.
+    if platform == "ios":
+        for binary in binaries:
+            suffixes = "".join(binary.suffixes).casefold()
+            is_dynamic = binary.name.casefold().endswith(".dylib") or ".so" in suffixes
+            if is_dynamic and (_controlled_component(binary.name) or _is_srt(binary.name)):
+                errors.append(
+                    f"{_relative(binary, root)}: dynamic FFmpeg/SRT library is forbidden on iOS "
+                    "(controlled FFmpeg and SRT are linked statically)"
+                )
+
     plugin_names = [name.casefold() for name in policy["forbidden_qt_ffmpeg_plugins"]["names"]]
     plugin_metadata = policy["forbidden_qt_ffmpeg_plugins"]["metadata"]
     for entry in entries:
@@ -1124,7 +1139,7 @@ def run_audit(
             "build_config_stamp_sha256": _sha256(ios_stamp_path),
             "verified_abi": verified_ios_abi,
             "public_header_hashes": public_header_hashes,
-            "source_identities": ios_manifest["source_identities"],
+            "source_identities": ios_manifest.get("source_identities"),
         }
     result = AuditResult(errors=evidence["errors"], evidence=evidence)
     if evidence_path:

@@ -391,6 +391,11 @@ else
     export OLR_QT_ROOT="$QT_HOST_PREFIX"
     echo "[pre-push] Building and auditing the packaged Qt media runtime..."
     ./build-scripts/build_macos_app.sh
+    # build_macos_app.sh exports the controlled prefixes only inside its own
+    # child shell; re-export them here so the macos-release reconfigure (which
+    # forces OLR_CONTROLLED_DEPS_REQUIRED=ON) does not FATAL_ERROR on empty roots.
+    export OLR_FFMPEG_ROOT="$REPO_ROOT/macos_build/dist/ffmpeg"
+    export OLR_SRT_ROOT="$REPO_ROOT/macos_build/dist/srt"
     cmake --preset macos-release -DOLR_BUILD_TESTS=ON >/dev/null
     cmake --build --preset macos-release --target qt_core_media_smoke
     RUNTIME_HARNESS="$REPO_ROOT/build/qt_core_media_smoke"

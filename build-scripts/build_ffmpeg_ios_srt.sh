@@ -271,7 +271,7 @@ mkdir -p "$SRC_DIR" "$DIST_DIR"
 IOS_MIN_VERSION="13.0"
 
 # CMake (Xcode build environment may not have PATH)
-if [ -z "${CMAKE_BIN}" ]; then
+if [ -z "${CMAKE_BIN:-}" ]; then
     if command -v cmake >/dev/null 2>&1; then
         CMAKE_BIN="$(command -v cmake)"
     elif [ -x "$HOME/Qt/Tools/CMake/CMake.app/Contents/bin/cmake" ]; then
@@ -287,7 +287,7 @@ if [ -z "${CMAKE_BIN}" ]; then
 fi
 
 # pkg-config (Xcode build environment may not have PATH)
-if [ -z "${PKG_CONFIG_BIN}" ]; then
+if [ -z "${PKG_CONFIG_BIN:-}" ]; then
     if command -v pkg-config >/dev/null 2>&1; then
         PKG_CONFIG_BIN="$(command -v pkg-config)"
     elif [ -x "/opt/homebrew/bin/pkg-config" ]; then

@@ -167,7 +167,14 @@ jobs:
 
       - name: Build (from-source ffmpeg+srt) + package (.app)
         shell: bash
-        run: ./build-scripts/build_macos_app.sh
+        run: |
+          set -euo pipefail
+          ./build-scripts/build_macos_app.sh
+          # Bridge the controlled prefixes to later steps: the runtime-smoke step
+          # reconfigures the macos-release preset (OLR_CONTROLLED_DEPS_REQUIRED=ON)
+          # in a fresh shell, and build_macos_app.sh only exports them step-locally.
+          echo "OLR_FFMPEG_ROOT=$GITHUB_WORKSPACE/macos_build/dist/ffmpeg" >> "$GITHUB_ENV"
+          echo "OLR_SRT_ROOT=$GITHUB_WORKSPACE/macos_build/dist/srt" >> "$GITHUB_ENV"
 
       - name: Run isolated Qt core-media runtime smoke
         shell: bash

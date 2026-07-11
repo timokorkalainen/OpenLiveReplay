@@ -23,6 +23,7 @@ PROHIBITED_TOKENS = (
 )
 PROHIBITED_PATTERN = re.compile(r"\b(?:" + "|".join(PROHIBITED_TOKENS) + r")\b")
 RAW_STRING_START_PATTERN = re.compile(r'(?:u8|u|U|L)?R"([^\\()\s]{0,16})\(')
+CHAR_LITERAL_PATTERN = re.compile(r"'(?:\\.|[^\\'\n]){1,16}'")
 
 
 def raw_string_literal_end(source, index):
@@ -36,6 +37,18 @@ def raw_string_literal_end(source, index):
     if terminator_index == -1:
         return None
     return terminator_index + len(terminator)
+
+
+def char_literal_end(source, index):
+    """Return the index after a complete C/C++ char literal, if present.
+
+    Anchored at a `'`. A digit-separator apostrophe (e.g. ``1'000``) has no
+    closing quote on a character boundary, so it does not match and is left in
+    code state -- otherwise it would be treated as an open-ended string and stop
+    the following ``//``/``/*`` from being recognised as comments.
+    """
+    match = CHAR_LITERAL_PATTERN.match(source, index)
+    return match.end() if match else None
 
 
 def strip_comments(source):
@@ -81,10 +94,19 @@ def strip_comments(source):
             continue
 
         raw_string_end = raw_string_literal_end(source, index)
+        char_end = char_literal_end(source, index) if character == "'" else None
         if raw_string_end is not None:
             result.append(source[index:raw_string_end])
             index = raw_string_end
-        elif character in ('"', "'", "`"):
+        elif char_end is not None:
+            # A bounded C/C++ char literal (e.g. '"', '\\', '/'): copy it verbatim
+            # so its body is never mistaken for a string or comment opener. A
+            # digit-separator apostrophe (1'000) has no char-boundary closing
+            # quote, so it does not match and falls through to code state instead
+            # of opening a lingering string that would swallow later comments.
+            result.append(source[index:char_end])
+            index = char_end
+        elif character in ('"', "`"):
             result.append(character)
             quote = character
             state = "string"
