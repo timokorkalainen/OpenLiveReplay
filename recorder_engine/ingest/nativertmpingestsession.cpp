@@ -298,8 +298,8 @@ bool amf0DataMessageNumber(const QByteArray& payload, const QByteArray& key, dou
     needle.append(char(key.size() & 0xff));
     needle.append(key);
     needle.append(char(0x00));
-    const int at = payload.indexOf(needle);
-    const int valueAt = at + needle.size();
+    const qsizetype at = payload.indexOf(needle);
+    const qsizetype valueAt = at + needle.size();
     if (at < 0 || valueAt + 8 > payload.size()) return false;
     uint64_t bits = 0;
     for (int i = 0; i < 8; ++i)

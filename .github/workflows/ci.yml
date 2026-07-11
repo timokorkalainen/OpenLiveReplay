@@ -416,6 +416,7 @@ jobs:
           rc=0
           while IFS= read -r file; do
             [ -n "$file" ] || continue
+            [ -f "$file" ] || continue  # skip deleted files (name-only lists them)
             "$TIDY" -p build --extra-arg=-isysroot --extra-arg="$SDK" "$file" || rc=1
           done <<< "$files"
           # Pass 2 — DIFF-SCOPED integer-coercion gate (NEW occurrences fatal).
