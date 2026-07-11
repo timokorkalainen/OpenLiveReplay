@@ -92,6 +92,8 @@ echo "==> macdeployqt (bundling Qt frameworks, QML, dependent dylibs)"
 "$OLR_QT_ROOT/bin/macdeployqt" "$APP" -qmldir="$ROOT_DIR"
 
 mkdir -p "$DIST_DIR"
+rm -f "$APP/Contents/Frameworks/"libav*.dylib
+rm -f "$APP/Contents/Frameworks/"libsw*.dylib
 echo "==> Preserving controlled FFmpeg and SRT dylibs"
 cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec*.dylib "$APP/Contents/Frameworks/"
 cp -R "$OLR_FFMPEG_ROOT/lib/"libavformat*.dylib "$APP/Contents/Frameworks/"

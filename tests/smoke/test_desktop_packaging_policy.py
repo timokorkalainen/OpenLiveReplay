@@ -325,6 +325,16 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
         self.assertIn("Plugins = .", config)
         self.assertIn("QmlImports = qml", config)
 
+    def test_macos_packager_replaces_deployed_ffmpeg_with_controlled_runtime(self) -> None:
+        script = self.read("build-scripts/build_macos_app.sh")
+        clear_runtime = 'rm -f "$APP/Contents/Frameworks/"libav*.dylib'
+        preserve_runtime = 'cp -R "$OLR_FFMPEG_ROOT/lib/"libavcodec*.dylib'
+        self.assertIn(clear_runtime, script)
+        self.assertIn('rm -f "$APP/Contents/Frameworks/"libsw*.dylib', script)
+        self.assert_before(script, "macdeployqt", clear_runtime)
+        self.assert_before(script, clear_runtime, preserve_runtime)
+        self.assert_before(script, preserve_runtime, "filter_qt_ffmpeg_plugin.py")
+
     def test_linux_packager_preserves_audio_and_rendering_plugins_without_multimedia(self) -> None:
         script = self.read("build-scripts/build_linux_app.sh")
         self.assertIn('"$APPDIR/usr/plugins"', script)
