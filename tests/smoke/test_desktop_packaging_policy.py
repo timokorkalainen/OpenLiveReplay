@@ -146,6 +146,36 @@ class QtFfmpegPluginFilterTests(unittest.TestCase):
         self.assertEqual(result.deleted, (plugin.relative_to(self.package).as_posix(),))
         self.assertFalse(plugin.exists())
 
+    def test_macos_resolves_plugin_only_ffmpeg_by_unique_basename(self) -> None:
+        plugin = self.write(
+            "Contents/PlugIns/multimedia/libffmpegmediaplugin.dylib",
+            b"QFFmpegMediaPlugin",
+        )
+        private_library = self.write("Contents/Frameworks/libavformat.61.dylib")
+
+        result = filter_plugin.filter_package(
+            package=self.package,
+            platform="macos",
+            policy_path=BUILD_SCRIPTS / "single_ffmpeg_policy.json",
+            dependency_reader=lambda path, platform: [
+                audit.Dependency("@rpath/libavformat.61.dylib")
+            ]
+            if path.name == plugin.name
+            else [],
+        )
+
+        self.assertEqual(
+            result.deleted,
+            tuple(
+                sorted(
+                    path.relative_to(self.package).as_posix()
+                    for path in (plugin, private_library)
+                )
+            ),
+        )
+        self.assertFalse(plugin.exists())
+        self.assertFalse(private_library.exists())
+
     def test_rejects_missing_controlled_dependency_outside_qt_ffmpeg_plugin(self) -> None:
         self.write("multimedia/ffmpegmediaplugin.dll", b"QFFmpegMediaPlugin")
         application = self.write("OpenLiveReplay.exe")
@@ -266,6 +296,7 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
         script = self.read("build-scripts/build_linux_app.sh")
         self.assertIn('"$APPDIR/usr/plugins"', script)
         self.assertIn('"$QT_LIB_DIR"/libicu*.so*', script)
+        self.assertIn('"$BUILD_DIR/_deps/rtmidi-build/"librtmidi.so*', script)
         self.assertIn('cp -a "$QT_PLUGIN_DIR/$plugin" "$APPDIR/usr/plugins/"', script)
         self.assertIn(r's/^Plugins = \.$/Plugins = plugins/', script)
         for directory in (

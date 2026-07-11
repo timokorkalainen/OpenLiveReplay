@@ -108,6 +108,9 @@ def _dependency_edges(
     unresolved_controlled_allowed_from: set[Path] | None = None,
 ) -> dict[Path, set[Path]]:
     allowed_unresolved_parents = unresolved_controlled_allowed_from or set()
+    binaries_by_name: dict[str, set[Path]] = {}
+    for binary in binaries:
+        binaries_by_name.setdefault(binary.name.casefold(), set()).add(binary.resolve())
     edges: dict[Path, set[Path]] = {}
     for binary in binaries:
         parent = binary.resolve()
@@ -123,11 +126,25 @@ def _dependency_edges(
             target = audit._dependency_target(audit.Dependency(dependency.name, rpaths), binary, package, platform)
             controlled = audit._controlled_component(dependency.name) is not None
             if target is None:
-                if controlled and parent not in allowed_unresolved_parents:
+                if controlled and parent in allowed_unresolved_parents:
+                    candidates = binaries_by_name.get(Path(dependency.name).name.casefold(), set())
+                    if len(candidates) > 1:
+                        locations = ", ".join(
+                            sorted(_relative(candidate, package) for candidate in candidates)
+                        )
+                        raise FilterFailure(
+                            f"ambiguous ownership for {dependency.name}: {locations}"
+                        )
+                    if candidates:
+                        target = next(iter(candidates))
+                    else:
+                        continue
+                elif controlled:
                     raise FilterFailure(
                         f"cannot determine ownership: {_relative(binary, package)} -> {dependency.name} is unresolved"
                     )
-                continue
+                else:
+                    continue
             if not audit._inside(target, package):
                 if controlled:
                     raise FilterFailure(
