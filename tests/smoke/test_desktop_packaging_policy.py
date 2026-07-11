@@ -262,6 +262,16 @@ class DesktopPackagingScriptPolicyTests(unittest.TestCase):
         self.assertIn('os.path.relpath(sys.argv[2], sys.argv[1])', script)
         self.assertIn('patchelf --force-rpath --set-rpath "$library_rpath"', script)
 
+    def test_linux_packager_normalizes_controlled_prefix_before_copying_runtime_libraries(self) -> None:
+        script = self.read("build-scripts/build_linux_app.sh")
+        normalize = 'patchelf --force-rpath --set-rpath \'$ORIGIN\' "$library"'
+        first_copy = 'cp -a "$OLR_FFMPEG_ROOT/lib/"libav*.so.* "$APPDIR/usr/lib/"'
+        self.assertIn(normalize, script)
+        self.assertIn(first_copy, script)
+        self.assertLess(script.index(normalize), script.index(first_copy))
+        self.assertIn('cp -a "$OLR_FFMPEG_ROOT/lib/"libsw*.so.* "$APPDIR/usr/lib/"', script)
+        self.assertIn('cp -a "$OLR_SRT_ROOT/lib/"libsrt.so.* "$APPDIR/usr/lib/"', script)
+
     def test_macos_packager_uses_bundle_local_qt_plugin_configuration(self) -> None:
         script = self.read("build-scripts/build_macos_app.sh")
         self.assertIn('cp "$ROOT_DIR/qt.conf" "$APP/Contents/Resources/qt.conf"', script)

@@ -42,6 +42,12 @@ cmake --preset linux-release -DOLR_WERROR=OFF
 echo "==> Building"
 cmake --build --preset linux-release
 
+echo "==> Normalizing controlled runtime search paths"
+while IFS= read -r library; do
+    patchelf --force-rpath --set-rpath '$ORIGIN' "$library"
+done < <(find "$OLR_FFMPEG_ROOT/lib" "$OLR_SRT_ROOT/lib" -type f \
+    \( -name 'libav*.so*' -o -name 'libsw*.so*' -o -name 'libsrt.so*' \) | sort)
+
 echo "==> Assembling AppDir"
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins" "$APPDIR/usr/qml"
@@ -73,9 +79,9 @@ for module in OlrTheme OlrStyle; do
     [ -d "$BUILD_DIR/qml/$module" ] || { echo "ERROR: $module QML module is missing" >&2; exit 1; }
     cp -a "$BUILD_DIR/qml/$module" "$APPDIR/usr/qml/"
 done
-cp -a "$OLR_FFMPEG_ROOT/lib/"libav*.so* "$APPDIR/usr/lib/"
-cp -a "$OLR_FFMPEG_ROOT/lib/"libsw*.so* "$APPDIR/usr/lib/"
-cp -a "$OLR_SRT_ROOT/lib/"libsrt.so* "$APPDIR/usr/lib/"
+cp -a "$OLR_FFMPEG_ROOT/lib/"libav*.so.* "$APPDIR/usr/lib/"
+cp -a "$OLR_FFMPEG_ROOT/lib/"libsw*.so.* "$APPDIR/usr/lib/"
+cp -a "$OLR_SRT_ROOT/lib/"libsrt.so.* "$APPDIR/usr/lib/"
 
 echo "==> Installing package-local Qt configuration"
 cp "$ROOT_DIR/qt.conf" "$APPDIR/usr/bin/qt.conf"
@@ -85,6 +91,9 @@ sed -i 's/^Plugins = \.$/Plugins = plugins/' "$APPDIR/usr/bin/qt.conf"
 echo "==> Setting package-local runtime search paths"
 patchelf --force-rpath --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/OpenLiveReplay.bin"
 while IFS= read -r library; do
+    case "$(basename "$library")" in
+        libav*.so.*|libsw*.so.*|libsrt.so.*) continue ;;
+    esac
     relative_lib="$(python -c 'import os, sys; print(os.path.relpath(sys.argv[2], sys.argv[1]))' \
         "$(dirname "$library")" "$APPDIR/usr/lib")"
     if [ "$relative_lib" = "." ]; then
