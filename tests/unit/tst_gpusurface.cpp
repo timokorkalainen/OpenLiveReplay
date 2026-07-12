@@ -85,7 +85,7 @@ void TestGpuSurface::appleSurfaceIsIoSurfaceBacked() {
     QCOMPARE(s->desc().format, FramePixelFormat::Nv12);
     QCOMPARE(s->desc().width, 64);
     QCOMPARE(s->desc().height, 48);
-    QVERIFY(s->nativeHandle() != nullptr);
+    QVERIFY(s->hasNativeBacking());
 }
 
 void TestGpuSurface::appleSurfaceRespectsInjectedAllocFailure() {

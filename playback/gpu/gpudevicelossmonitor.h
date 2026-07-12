@@ -28,6 +28,8 @@ public:
     // wait drain (INJECTED loss, no token). First writer within an epoch wins,
     // mirroring recordLoss(). The injected-loss path calls only recordLoss(), so no
     // token is ever stored for it — the no-wait free can never run on a live device.
+    // A delayed/stale mark is rejected unless its observed generation matches the
+    // currently latched loss epoch.
     void markRealDeviceLoss(const DeadDeviceToken& token);
     std::optional<DeadDeviceToken> realLossToken() const;
 
