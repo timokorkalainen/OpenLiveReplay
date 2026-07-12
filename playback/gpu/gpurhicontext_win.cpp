@@ -4,6 +4,7 @@
 
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpusurfacelease.h"
 
 #include <QList>
 #include <QThread>
@@ -22,6 +23,16 @@
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
+
+// The ONLY definition of the DXGI mint (friend of DeadDeviceToken). Global scope so
+// it matches the friend + namespace-scope declaration in gpusurfacelease.h — an
+// anonymous-namespace copy would be a different, non-friend function. Reached only
+// from the driver-authoritative GetDeviceRemovedReason() failure branch below, so no
+// other TU can construct a DeadDeviceToken from Windows.
+DeadDeviceToken mintDeadDeviceTokenFromDxgi(long failedHr, uint64_t gen) {
+    (void) failedHr; // provenance is the guarantee; the specific HRESULT is diagnostic
+    return DeadDeviceToken(DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, gen);
+}
 
 namespace {
 
@@ -237,10 +248,16 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
                 static_cast<const QRhiD3D11NativeHandles*>(rhi->nativeHandles());
             ID3D11Device* device =
                 nativeHandles ? static_cast<ID3D11Device*>(nativeHandles->dev) : nullptr;
-            if (device && FAILED(device->GetDeviceRemovedReason())) {
+            const HRESULT removedReason = device ? device->GetDeviceRemovedReason() : HRESULT(S_OK);
+            if (device && FAILED(removedReason)) {
                 // LOCK RULE: D3D11 removed-device polling touches no m_bufferMutex.
                 m_impl->deviceLost.store(true, std::memory_order_release);
-                GpuDeviceLossMonitor::instance().recordLoss();
+                // Driver-authoritative loss: mint the provenance-bound token and hand
+                // it to the loss latch so the worker's recovery can free held surfaces
+                // WITHOUT waiting on the (now dead) fences.
+                const uint64_t gen = GpuDeviceLossMonitor::instance().recordLoss();
+                GpuDeviceLossMonitor::instance().markRealDeviceLoss(
+                    mintDeadDeviceTokenFromDxgi(static_cast<long>(removedReason), gen));
             }
         });
         (void) invoked;

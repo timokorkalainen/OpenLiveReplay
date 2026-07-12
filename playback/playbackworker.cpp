@@ -25,6 +25,7 @@
 #include "playback/gpu/gpureadbackretainer.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpuseekprefetch.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/gpu/gpusurfaceallocator.h"
 #ifdef __APPLE__
 #include "playback/gpu/appleiosurface.h"
@@ -1679,6 +1680,23 @@ void PlaybackWorker::handleGpuDeviceLoss() {
         recoveryCommit = commitOutputStateLocked(commit);
     }
     drainGpuDeviceLossEvents();
+
+    // Release the surfaces held for readback. Previously the readback retainer was
+    // left untouched on device loss, so every held surface plus its now-dead fence
+    // leaked forever (the fence's completedValue() can never reach its target once
+    // the device is gone). A REAL loss carries a DeadDeviceToken minted at the
+    // driver-authoritative detection site, so we free without waiting (waiting on a
+    // dead fence would hang). An INJECTED loss (test) has no token, so we drain with
+    // a bounded per-fence wait — safe because the live Null/WARP device's fences do
+    // advance. LOCK RULE: the readback retainer has its own leaf mutex; this takes
+    // no m_bufferMutex, matching the fence resets below.
+    {
+        constexpr int kDeviceLossReadbackDrainMs = 100; // bounded; live-device fences advance
+        if (const auto deadToken = GpuDeviceLossMonitor::instance().realLossToken())
+            gpuAbandonAllReadbackRetains(*deadToken);
+        else
+            gpuDrainReadbackRetainsWithBoundedWait(kDeviceLossReadbackDrainMs);
+    }
 
     // LOCK RULE: this method is entered from the worker decode thread with no
     // m_bufferMutex held. Do not wait old fences here; a removed device may never
