@@ -218,7 +218,7 @@ void TestStagingFence::windowsGpuImportRequiresBothFences() {
     PlaybackTransport transport;
     PlaybackWorker worker({}, &transport);
 
-    QVERIFY(!worker.ensureWindowsGpuImportFencesReadyForDecode(nullptr));
+    QVERIFY(!worker.ensureWindowsGpuImportFencesReadyForDecode());
 }
 
 void TestStagingFence::markStagingCoveredSignalsFenceForGpuPath() {

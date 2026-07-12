@@ -51,6 +51,7 @@ public:
     std::shared_ptr<D3D11GpuSurface> tryImportSurface(void* mfSampleOpaque, int width, int height);
     static std::shared_ptr<GpuFence>
     createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface);
+    std::shared_ptr<GpuFence> createFence() const;
     bool isAvailable() const;
     bool deviceLost() const;
 
@@ -68,7 +69,7 @@ public:
 #endif
 #ifdef _WIN32
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);
-    void* d3d11Device() const;
+    bool acceptsD3D11DeviceForTest(void* device) const;
     bool decodeOneForTest(Microsoft::WRL::ComPtr<ID3D11Device> device,
                           Microsoft::WRL::ComPtr<ID3D11Texture2D> nv12, int width, int height);
 #endif

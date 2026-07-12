@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuretireregistry.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/win/d3d11gpusurface.h"
 #include "playback/output/win/d3dfence.h"
 #include "recorder_engine/ingest/nativeframecopy.h"
@@ -37,6 +38,9 @@ public:
 
     std::atomic<int> waits{0};
     std::atomic<uint64_t> lastValue{0};
+
+protected:
+    bool isCompatibleWithNativeHandle(void*) const override { return true; }
 
 private:
     std::atomic<uint64_t> m_next{0};
@@ -72,6 +76,8 @@ private slots:
     void createConsistentWithProbe();
     void nullSampleYieldsFallbackNullopt();
     void surfaceKeepsTextureAndTracksFence();
+    void edgeRejectsForeignD3D11Device();
+    void frameRejectsForeignFenceTimeline();
     void importedFrameExposesRenderFence();
     void readToCpuDeinterleavesNv12ToI420();
     void readToCpuWaitsForPendingFenceBeforeCopy();
@@ -134,7 +140,7 @@ void TestWinGpuImportEdge::nullSampleYieldsFallbackNullopt() {
     auto edge = WinGpuImportEdge::create(&error);
     if (!edge) QSKIP("no GPU import edge on this host (CPU fallback path)");
 
-    auto renderFence = makeD3D11GpuFence(edge->d3d11Device());
+    auto renderFence = edge->createFence();
     if (!renderFence) QSKIP("no D3D11 fence on this host");
 
     const std::optional<FrameHandle> handle =
@@ -171,10 +177,71 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
     QCOMPARE(surface->desc().height, 720);
     QVERIFY(surface->aliasesTextureForTest(texture.Get()));
 
+    GpuSyncReadScope readScope;
+    const GpuReadLease lease = readScope.read(surface);
+    std::shared_ptr<void> retained = lease.retainNativeHandle();
+    QVERIFY(retained != nullptr);
+    QCOMPARE(static_cast<ID3D11Texture2D*>(retained.get()), texture.Get());
+
     surface->retainUntilFenceRetired(5);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
     surface->retainUntilFenceRetired(3);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
+    surface.reset();
+    QCOMPARE(static_cast<ID3D11Texture2D*>(retained.get()), texture.Get());
+#endif
+}
+
+void TestWinGpuImportEdge::edgeRejectsForeignD3D11Device() {
+#ifndef _WIN32
+    QSKIP("D3D11 device identity is Windows-only");
+#else
+    QString error;
+    auto edge = WinGpuImportEdge::create(&error);
+    if (!edge) QSKIP("no GPU import edge on this host");
+
+    ComPtr<ID3D11Device> foreignDevice;
+    ComPtr<ID3D11DeviceContext> foreignContext;
+    if (!createTestD3D11Device(&foreignDevice, &foreignContext))
+        QSKIP("no second D3D11 test device available");
+    QVERIFY(!edge->acceptsD3D11DeviceForTest(foreignDevice.Get()));
+#endif
+}
+
+void TestWinGpuImportEdge::frameRejectsForeignFenceTimeline() {
+#ifndef _WIN32
+    QSKIP("D3D11 fence identity is Windows-only");
+#else
+    ComPtr<ID3D11Device> surfaceDevice;
+    ComPtr<ID3D11DeviceContext> surfaceContext;
+    ComPtr<ID3D11Device> foreignDevice;
+    ComPtr<ID3D11DeviceContext> foreignContext;
+    if (!createTestD3D11Device(&surfaceDevice, &surfaceContext) ||
+        !createTestD3D11Device(&foreignDevice, &foreignContext)) {
+        QSKIP("two D3D11 devices are unavailable");
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(surfaceDevice->CreateTexture2D(&desc, nullptr, &texture)));
+
+    auto surface = D3D11GpuSurface::createKept(surfaceDevice, texture, 0, 64, 64);
+    auto foreignFence = makeD3D11GpuFence(foreignDevice.Get());
+    if (!foreignFence) QSKIP("D3D11 fence unavailable");
+
+    FrameMetadata meta;
+    meta.key.format = FramePixelFormat::Nv12;
+    meta.key.width = 64;
+    meta.key.height = 64;
+    QVERIFY(WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, foreignFence).isNull());
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(0));
 #endif
 }
 

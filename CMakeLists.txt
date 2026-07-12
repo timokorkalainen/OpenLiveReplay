@@ -521,7 +521,9 @@ elseif(WIN32)
         target_sources(OpenLiveReplay PRIVATE
             playback/gpu/gpureadbackretainer.h playback/gpu/gpureadbackretainer.cpp
             playback/gpu/gpuretireregistry.h playback/gpu/gpuretireregistry.cpp
-            playback/gpu/gpuopscope.h playback/gpu/gpuopscope.cpp)
+            playback/gpu/gpuopscope.h playback/gpu/gpuopscope.cpp
+            playback/gpu/gpudevicelossmonitor.h playback/gpu/gpudevicelossmonitor.cpp
+            playback/gpu/gpugeneration.h playback/gpu/gpugeneration.cpp)
     endif()
     target_compile_definitions(OpenLiveReplay PRIVATE
         OLR_NATIVE_SRT_AVAILABLE=1

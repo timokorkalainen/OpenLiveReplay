@@ -29,15 +29,14 @@ uint64_t GpuDeviceLossMonitor::recordLoss() {
     return generation;
 }
 
-uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance provenance) {
+uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
+                                                     uint64_t observedGeneration) {
     std::lock_guard<std::mutex> lock(m_epochMutex);
     if (m_lost.load(std::memory_order_acquire)) {
         const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
-        if (!m_realLossToken.has_value()) {
-            m_realLossToken = DeadDeviceToken(provenance, generation);
-        }
-        return generation;
+        return m_realLossToken.has_value() ? generation : 0;
     }
+    if (GpuGenerationCounter::instance().current() != observedGeneration) return 0;
 
     const uint64_t generation = GpuGenerationCounter::instance().bump();
     m_lossGeneration.store(generation, std::memory_order_release);
@@ -46,6 +45,13 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
     m_undrained.fetch_add(1, std::memory_order_acq_rel);
     m_lost.store(true, std::memory_order_release);
     return generation;
+}
+
+uint64_t GpuDeviceLossMonitor::recordSubmissionFailure() {
+    // Submission/fence failure requires a rebuild, but is not proof that the
+    // driver declared the device dead. Keep this epoch tokenless so recovery
+    // uses bounded waits rather than the no-wait dead-device release path.
+    return recordLoss();
 }
 
 std::optional<DeadDeviceToken> GpuDeviceLossMonitor::realLossToken() const {

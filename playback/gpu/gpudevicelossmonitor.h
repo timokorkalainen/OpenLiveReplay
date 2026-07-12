@@ -8,8 +8,7 @@
 #include <mutex>
 #include <optional>
 
-struct AppleDeviceLossAuthority;
-struct DxgiDeviceLossAuthority;
+class GpuRhiContext;
 #ifdef OLR_UNIT_TEST
 struct GpuDeviceLossMonitorTestAuthority;
 #endif
@@ -27,6 +26,7 @@ public:
     // Idempotent while the latch is already lost. A fresh loss epoch begins only
     // after clearForRebuild() has cleared the latch following a successful rebuild.
     uint64_t recordLoss();
+    uint64_t recordSubmissionFailure();
 
     // Carries the DeadDeviceToken from the driver-authoritative detection site to
     // the worker's recovery path (handleGpuDeviceLoss), which reads realLossToken()
@@ -44,13 +44,13 @@ public:
 
 private:
     GpuDeviceLossMonitor() = default;
-    friend struct AppleDeviceLossAuthority;
-    friend struct DxgiDeviceLossAuthority;
+    friend class GpuRhiContext;
 #ifdef OLR_UNIT_TEST
     friend struct GpuDeviceLossMonitorTestAuthority;
 #endif
 
-    uint64_t publishRealDeviceLoss(DeadDeviceToken::Provenance provenance);
+    uint64_t publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
+                                   uint64_t observedGeneration);
 
     std::atomic<bool> m_lost{false};
     std::atomic<uint64_t> m_lossCount{0};

@@ -10,6 +10,7 @@
 #include <QtTest>
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpureadbackretainer.h"
 #include "playback/gpu/gpuretireregistry.h"
@@ -76,11 +77,17 @@ public:
         if (m_retireOnWait) m_completed = value;
         return m_completed >= value;
     }
-    uint64_t completedValue() const override { return m_completed; }
+    uint64_t completedValue() const override {
+        m_completedSawUnlockedRetainer = gpuRetireDetail::mutexAvailableForTest();
+        ++m_completedCalls;
+        return m_completed;
+    }
     void setCompleted(uint64_t v) { m_completed = v; }
     void setRetireOnWait(bool retire) { m_retireOnWait = retire; }
     bool waitSawUnlockedRetainer() const { return m_waitSawUnlockedRetainer; }
     int signalCalls() const { return m_signalCalls; }
+    int completedCalls() const { return m_completedCalls; }
+    bool completedSawUnlockedRetainer() const { return m_completedSawUnlockedRetainer; }
 
 private:
     uint64_t m_signalled = 0;
@@ -88,6 +95,8 @@ private:
     bool m_retireOnWait = false;
     bool m_waitSawUnlockedRetainer = false;
     int m_signalCalls = 0;
+    mutable int m_completedCalls = 0;
+    mutable bool m_completedSawUnlockedRetainer = false;
 };
 
 class ZeroSignalFence final : public GpuFence {
@@ -116,8 +125,10 @@ private slots:
     void boundedWaitDrainReleasesOnlyRetired();
     void boundedWaitDoesNotHoldRetainerMutex();
     void registryDiagnosticsTrackHighWaterAndTimeouts();
+    void registryRegistrationDoesNotPollDriver();
     void opScopeSignalsOnceAndRegistersUniqueSurfaces();
     void opScopeCancelsBeforeSubmissionWithoutRetaining();
+    void opScopeRetainsAfterSubmittedError();
     void opScopeQuarantinesOnZeroSignal();
 };
 
@@ -126,9 +137,8 @@ void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
     auto surface = std::make_shared<FakeLeaseSurface>(sentinel, /*valid=*/true);
     {
         GpuSyncReadScope scope;
-        const auto state = scope.read(surface, [](const GpuReadLease& lease) {
-            return std::make_pair(lease.valid(), lease.desc().width);
-        });
+        const GpuReadLease lease = scope.read(surface);
+        const auto state = std::make_pair(lease.valid(), lease.desc().width);
         QVERIFY(state.first);
         QCOMPARE(state.second, 16);
     }
@@ -138,7 +148,7 @@ void TestGpuSurfaceLease::callbackLeaseReportsInvalidSurface() {
     auto surface =
         std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x1), /*valid=*/false);
     GpuSyncReadScope scope;
-    const bool valid = scope.read(surface, [](const GpuReadLease& lease) { return lease.valid(); });
+    const bool valid = scope.read(surface).valid();
     QVERIFY(!valid);
 }
 
@@ -203,7 +213,7 @@ void TestGpuSurfaceLease::opScopeSignalsOnceAndRegistersUniqueSurfaces() {
     QVERIFY(operation.track(first));
     QVERIFY(!operation.track(first));
     QVERIFY(operation.track(second));
-    QVERIFY(operation.submit([] { return true; }));
+    QVERIFY(operation.submit([] { return GpuSubmitOutcome::Submitted; }));
 
     QCOMPARE(fence->signalCalls(), 1);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
@@ -222,7 +232,7 @@ void TestGpuSurfaceLease::opScopeCancelsBeforeSubmissionWithoutRetaining() {
     {
         GpuOpScope operation(fence, registry);
         QVERIFY(operation.track(surface));
-        QVERIFY(!operation.submit([] { return false; }));
+        QVERIFY(!operation.submit([] { return GpuSubmitOutcome::NotSubmitted; }));
     }
 
     QCOMPARE(fence->signalCalls(), 0);
@@ -231,6 +241,7 @@ void TestGpuSurfaceLease::opScopeCancelsBeforeSubmissionWithoutRetaining() {
 }
 
 void TestGpuSurfaceLease::opScopeQuarantinesOnZeroSignal() {
+    GpuDeviceLossMonitor::instance().reset();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     const uint64_t failuresBefore = registry.diagnostics().signalFailureCount;
@@ -239,13 +250,50 @@ void TestGpuSurfaceLease::opScopeQuarantinesOnZeroSignal() {
 
     GpuOpScope operation(fence, registry);
     QVERIFY(operation.track(surface));
-    QVERIFY(!operation.submit([] { return true; }));
+    QVERIFY(!operation.submit([] { return GpuSubmitOutcome::Submitted; }));
     QCOMPARE(fence->signalCalls(), 1);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
     QCOMPARE(registry.diagnostics().signalFailureCount, failuresBefore + 1);
+    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
+    QVERIFY(!GpuDeviceLossMonitor::instance().realLossToken().has_value());
 
     fence->retireQuarantine();
     registry.drainCompleted();
+    GpuDeviceLossMonitor::instance().reset();
+}
+
+void TestGpuSurfaceLease::registryRegistrationDoesNotPollDriver() {
+    GpuRetireRegistry registry;
+    auto fence = std::make_shared<FakeFence>();
+    GpuOpScope operation(fence, registry);
+    for (quintptr value = 1; value <= 4; ++value)
+        QVERIFY(operation.track(
+            std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(value), true)));
+    QVERIFY(operation.submit([] { return GpuSubmitOutcome::Submitted; }));
+    QCOMPARE(fence->completedCalls(), 1);
+    QVERIFY(fence->completedSawUnlockedRetainer());
+    fence->setCompleted(1);
+    registry.drainCompleted();
+}
+
+void TestGpuSurfaceLease::opScopeRetainsAfterSubmittedError() {
+    GpuDeviceLossMonitor::instance().reset();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x9), true);
+    auto fence = std::make_shared<FakeFence>();
+
+    GpuOpScope operation(fence, registry);
+    QVERIFY(operation.track(surface));
+    QVERIFY(!operation.submit([] { return GpuSubmitOutcome::SubmittedWithError; }));
+    QCOMPARE(fence->signalCalls(), 1);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
+    QVERIFY(!GpuDeviceLossMonitor::instance().realLossToken().has_value());
+
+    fence->setCompleted(1);
+    registry.drainCompleted();
+    GpuDeviceLossMonitor::instance().reset();
 }
 
 QTEST_GUILESS_MAIN(TestGpuSurfaceLease)

@@ -52,24 +52,6 @@ extern "C" {
 
 using Microsoft::WRL::ComPtr;
 
-struct D3D11MediaFoundationBackingAccess {
-    static D3D11GpuSurface* surface(const GpuReadLease& lease) {
-        return dynamic_cast<D3D11GpuSurface*>(lease.m_surface);
-    }
-    static ID3D11Texture2D* texture(const GpuReadLease& lease) {
-        auto* d3d = surface(lease);
-        return d3d ? d3d->texture() : nullptr;
-    }
-    static ID3D11Device* device(const GpuReadLease& lease) {
-        auto* d3d = surface(lease);
-        return d3d ? d3d->device() : nullptr;
-    }
-    static UINT subresource(const GpuReadLease& lease) {
-        auto* d3d = surface(lease);
-        return d3d ? d3d->subresource() : 0;
-    }
-};
-
 namespace {
 
 // All-intra, every output sample is a key frame. The MF H.264 encoder emits
@@ -1017,22 +999,24 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
 
     ComPtr<IMFMediaBuffer> buffer;
     GpuSyncReadScope readScope;
-    const bool wrapped = readScope.read(surface, [&](const GpuReadLease& lease) {
-        ID3D11Texture2D* texture = D3D11MediaFoundationBackingAccess::texture(lease);
+    const GpuReadLease lease = readScope.read(surface);
+    const bool wrapped = [&] {
+        const std::shared_ptr<void> retained = lease.retainNativeHandle();
+        auto* texture = static_cast<ID3D11Texture2D*>(retained.get());
         if (!texture) {
             if (error) {
                 *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");
             }
             return false;
         }
-        if (!configureD3DManagerForSurface(D3D11MediaFoundationBackingAccess::device(lease),
-                                           error)) {
+        ComPtr<ID3D11Device> device;
+        texture->GetDevice(&device);
+        if (!configureD3DManagerForSurface(device.Get(), error)) {
             return false;
         }
 
-        const HRESULT wrapHr = MFCreateDXGISurfaceBuffer(
-            __uuidof(ID3D11Texture2D), texture,
-            D3D11MediaFoundationBackingAccess::subresource(lease), FALSE, &buffer);
+        const HRESULT wrapHr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture,
+                                                         lease.nativeSubresource(), FALSE, &buffer);
         if (FAILED(wrapHr)) {
             if (error) {
                 *error = hrMessage(
@@ -1041,7 +1025,7 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
             return false;
         }
         return true;
-    });
+    }();
     if (!wrapped) return false;
 
     const LONGLONG stampedTime = m_nextSampleTime;

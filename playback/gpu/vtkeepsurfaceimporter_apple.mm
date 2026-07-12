@@ -38,7 +38,7 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
         operation.track(surface);
-        if (!operation.submit([] { return true; })) return FrameHandle{};
+        if (!operation.submit([] { return GpuSubmitOutcome::Submitted; })) return FrameHandle{};
     }
     return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence),
                               std::move(*charge));

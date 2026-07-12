@@ -16,6 +16,8 @@ namespace gpuRetireDetail {
 
 void registerRetire(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuFence> fence,
                     uint64_t fenceValue);
+void registerRetireBatch(std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
+                         const std::shared_ptr<GpuFence>& fence, uint64_t fenceValue);
 void drainCompleted();
 qsizetype pendingCount();
 qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice);

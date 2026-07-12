@@ -50,6 +50,7 @@ struct PreparedSource {
 struct RenderGridResult {
     CpuPlanes readback;
     bool rendered = false;
+    bool submissionAttempted = false;
 };
 
 QList<FrameHandle> dropStaleInputs(const QList<FrameHandle>& frames, uint64_t generation) {
@@ -410,6 +411,7 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
         updates->release();
         return {};
     }
+    result.submissionAttempted = true;
 
     cb->beginPass(renderTarget.get(), QColor(0, 0, 0, 255), {1.0f, 0}, updates);
     cb->setGraphicsPipeline(pipeline.get());
@@ -425,7 +427,7 @@ RenderGridResult renderGridWithRhi(QRhi* rhi, const QList<PreparedSource>& sourc
     }
     cb->endPass(afterPassUpdates);
 
-    if (rhi->endOffscreenFrame() != QRhi::FrameOpSuccess) return {};
+    if (rhi->endOffscreenFrame() != QRhi::FrameOpSuccess) return result;
     result.rendered = true;
     if (!outputSurface) {
         if (!afterPassUpdates || readback.format != QRhiTexture::RGBA8 ||
@@ -525,15 +527,20 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         if (!renderFence) return FrameHandle{};
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
+        for (const PreparedSource& source : sources) {
+            if (source.surface) operation.track(source.surface);
+        }
         operation.track(surface);
-        bool rendered = false;
+        RenderGridResult renderResult;
         const bool submitted = operation.submit([&] {
             const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
-                rendered = renderGridWithRhi(rhi, sources, cappedFrameCount(filtered), width,
-                                             height, color, quality, surface)
-                               .rendered;
+                renderResult = renderGridWithRhi(rhi, sources, cappedFrameCount(filtered), width,
+                                                 height, color, quality, surface);
             });
-            return invoked && rendered;
+            if (!invoked || !renderResult.submissionAttempted)
+                return GpuSubmitOutcome::NotSubmitted;
+            return renderResult.rendered ? GpuSubmitOutcome::Submitted
+                                         : GpuSubmitOutcome::SubmittedWithError;
         });
         if (!submitted) return FrameHandle{};
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);

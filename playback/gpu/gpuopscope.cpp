@@ -1,6 +1,7 @@
 #include "playback/gpu/gpuopscope.h"
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpusurface.h"
 
@@ -54,27 +55,29 @@ bool GpuOpScope::cancel() {
     return true;
 }
 
-bool GpuOpScope::finalizeSubmitted() {
+bool GpuOpScope::finalizeSubmitted(GpuSubmitOutcome outcome) {
     if (m_state != State::Open || !m_fence) return false;
     m_state = State::Finalized;
     const uint64_t fenceValue = m_fence->signal();
     m_fenceValue = fenceValue;
     if (fenceValue == 0) {
         m_registry.noteSignalFailure();
+        GpuDeviceLossMonitor::instance().recordSubmissionFailure();
         retireTracked(std::numeric_limits<uint64_t>::max());
         return false;
     }
     retireTracked(fenceValue);
+    if (outcome == GpuSubmitOutcome::SubmittedWithError) {
+        GpuDeviceLossMonitor::instance().recordSubmissionFailure();
+        return false;
+    }
     return true;
 }
 
 void GpuOpScope::retireTracked(uint64_t fenceValue) {
-    for (qsizetype i = 0; i < m_inlineCount; ++i) {
-        m_registry.registerRetire(std::move(m_inline[static_cast<size_t>(i)]), m_fence, fenceValue);
-    }
-    for (auto& surface : m_overflow) {
-        m_registry.registerRetire(std::move(surface), m_fence, fenceValue);
-    }
+    m_registry.registerRetireBatch(m_inline.data(), m_inlineCount, m_fence, fenceValue);
+    if (!m_overflow.isEmpty())
+        m_registry.registerRetireBatch(m_overflow.data(), m_overflow.size(), m_fence, fenceValue);
     m_inlineCount = 0;
     m_overflow.clear();
 }

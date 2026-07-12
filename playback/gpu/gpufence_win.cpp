@@ -8,6 +8,7 @@
 
 #include <d3d11.h>
 #include <memory>
+#include <wrl/client.h>
 
 GpuFence::~GpuFence() = default;
 
@@ -18,6 +19,7 @@ public:
     D3D11GpuFence(std::unique_ptr<D3DFence> fence, ID3D11Device* device)
         : m_fence(std::move(fence)) {
         device->GetImmediateContext(&m_context);
+        device->QueryInterface(IID_PPV_ARGS(&m_deviceIdentity));
     }
 
     ~D3D11GpuFence() override {
@@ -28,9 +30,21 @@ public:
     bool wait(uint64_t value, int timeoutMs) override { return m_fence->wait(value, timeoutMs); }
     uint64_t completedValue() const override { return m_fence->completedValue(); }
 
+protected:
+    bool isCompatibleWithNativeHandle(void* nativeHandle) const override {
+        auto* texture = static_cast<ID3D11Texture2D*>(nativeHandle);
+        if (!texture || !m_deviceIdentity) return false;
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        Microsoft::WRL::ComPtr<IUnknown> identity;
+        texture->GetDevice(&device);
+        return device && SUCCEEDED(device.As(&identity)) &&
+               identity.Get() == m_deviceIdentity.Get();
+    }
+
 private:
     std::unique_ptr<D3DFence> m_fence;
     ID3D11DeviceContext* m_context = nullptr;
+    Microsoft::WRL::ComPtr<IUnknown> m_deviceIdentity;
 };
 
 } // namespace

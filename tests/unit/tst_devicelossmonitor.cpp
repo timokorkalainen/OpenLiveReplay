@@ -12,9 +12,10 @@
 
 #ifdef OLR_UNIT_TEST
 struct GpuDeviceLossMonitorTestAuthority {
-    static uint64_t publish() {
+    static uint64_t
+    publish(uint64_t observedGeneration = GpuGenerationCounter::instance().current()) {
         return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason);
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, observedGeneration);
     }
 };
 #endif
@@ -28,7 +29,7 @@ private slots:
     void clearForRebuildClearsLatchKeepsGeneration();
     void injectedLossRemainsTokenlessAcrossEpochs();
     void realLossPublicationIsAtomicWithEpoch();
-    void concurrentPublishAndClearRemainConsistent();
+    void stalePublicationAfterClearIsRejected();
     void resetReturnsToPristine();
 };
 
@@ -88,7 +89,10 @@ void TestDeviceLossMonitor::clearForRebuildClearsLatchKeepsGeneration() {
 void TestDeviceLossMonitor::injectedLossRemainsTokenlessAcrossEpochs() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
+    const uint64_t observedBeforeInjection = GpuGenerationCounter::instance().current();
     m.recordLoss();
+    QVERIFY(!m.realLossToken().has_value());
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(observedBeforeInjection), uint64_t(0));
     QVERIFY(!m.realLossToken().has_value());
 
     m.clearForRebuild();
@@ -113,20 +117,17 @@ void TestDeviceLossMonitor::realLossPublicationIsAtomicWithEpoch() {
     QCOMPARE(token->observedGeneration(), generation);
 }
 
-void TestDeviceLossMonitor::concurrentPublishAndClearRemainConsistent() {
+void TestDeviceLossMonitor::stalePublicationAfterClearIsRejected() {
     auto& monitor = GpuDeviceLossMonitor::instance();
-    for (int iteration = 0; iteration < 200; ++iteration) {
-        monitor.reset();
-        std::thread publish([] { GpuDeviceLossMonitorTestAuthority::publish(); });
-        std::thread clear([&monitor] { monitor.clearForRebuild(); });
-        publish.join();
-        clear.join();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    const uint64_t oldDeviceGeneration = GpuGenerationCounter::instance().current();
+    monitor.recordLoss();
+    monitor.clearForRebuild();
 
-        const bool lost = monitor.isLost();
-        const auto token = monitor.realLossToken();
-        QCOMPARE(token.has_value(), lost);
-        if (token) QVERIFY(token->observedGeneration() > 0);
-    }
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(oldDeviceGeneration), uint64_t(0));
+    QVERIFY(!monitor.isLost());
+    QVERIFY(!monitor.realLossToken().has_value());
 }
 
 void TestDeviceLossMonitor::resetReturnsToPristine() {
