@@ -14,6 +14,8 @@ class GpuFence;
 class GpuRetireRegistry;
 class GpuSurface;
 
+enum class GpuSubmitOutcome { NotSubmitted, Submitted, SubmittedWithError };
+
 class GpuOpScope final {
 public:
     GpuOpScope(std::shared_ptr<GpuFence> fence, GpuRetireRegistry& registry);
@@ -31,11 +33,12 @@ public:
     template <typename SubmitFn>
     bool submit(SubmitFn&& submitFn) {
         if (m_state != State::Open || !m_fence) return false;
-        if (!static_cast<bool>(std::invoke(std::forward<SubmitFn>(submitFn)))) {
+        const GpuSubmitOutcome outcome = std::invoke(std::forward<SubmitFn>(submitFn));
+        if (outcome == GpuSubmitOutcome::NotSubmitted) {
             cancel();
             return false;
         }
-        return finalizeSubmitted();
+        return finalizeSubmitted(outcome);
     }
 
     static uint64_t spillAllocationCount();
@@ -44,7 +47,7 @@ private:
     enum class State { Open, Canceled, Finalized };
     static constexpr qsizetype kInlineSurfaceCapacity = 4;
 
-    bool finalizeSubmitted();
+    bool finalizeSubmitted(GpuSubmitOutcome outcome);
     bool contains(const GpuSurface* surface) const;
     void retireTracked(uint64_t fenceValue);
     void clearTracked();

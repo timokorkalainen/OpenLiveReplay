@@ -102,7 +102,8 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
                 GpuRetireRegistry registry;
                 GpuOpScope operation(renderFence, registry);
                 operation.track(s);
-                if (!operation.submit([] { return true; })) return FrameHandle{};
+                if (!operation.submit([] { return GpuSubmitOutcome::Submitted; }))
+                    return FrameHandle{};
             }
             return makeGpuFrameHandle(std::move(s), std::move(rhi), m, std::move(renderFence),
                                       std::move(charge));

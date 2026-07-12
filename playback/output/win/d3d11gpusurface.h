@@ -44,15 +44,17 @@ protected:
     // Lease-gated, mirroring the base (gpusurface.h). Kept protected on the
     // derived type too so a D3D11GpuSurface* cannot re-widen handle access.
     void* nativeHandle() const override { return m_texture.Get(); }
+    std::shared_ptr<void> retainNativeHandle() const override {
+        ID3D11Texture2D* texture = m_texture.Get();
+        if (!texture) return {};
+        texture->AddRef();
+        return std::shared_ptr<void>(
+            texture, [](void* value) { static_cast<ID3D11Texture2D*>(value)->Release(); });
+    }
+    uint32_t nativeSubresource() const override { return m_subresource; }
 
 private:
-    friend struct D3D11ImportBackingAccess;
-    friend struct D3D11MediaFoundationBackingAccess;
-
     D3D11GpuSurface() = default;
-    ID3D11Texture2D* texture() const { return m_texture.Get(); }
-    UINT subresource() const { return m_subresource; }
-    ID3D11Device* device() const { return m_device.Get(); }
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_texture;

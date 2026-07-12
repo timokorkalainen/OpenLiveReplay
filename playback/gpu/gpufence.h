@@ -1,6 +1,8 @@
 #ifndef OLR_GPUFENCE_H
 #define OLR_GPUFENCE_H
 
+#include "playback/gpu/gpusurface.h"
+
 #include <cstdint>
 #include <memory>
 
@@ -12,8 +14,16 @@ public:
     // timeoutMs < 0 waits indefinitely.
     virtual bool wait(uint64_t value, int timeoutMs) = 0;
     virtual uint64_t completedValue() const = 0;
+    bool isCompatibleWith(const GpuSurface& surface) const {
+        return isCompatibleWithNativeHandle(surface.nativeHandle());
+    }
 
     static std::shared_ptr<GpuFence> create();
+
+protected:
+    virtual bool isCompatibleWithNativeHandle(void* nativeHandle) const {
+        return nativeHandle == nullptr;
+    }
 };
 
 #ifdef __APPLE__

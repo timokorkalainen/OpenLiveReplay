@@ -111,7 +111,7 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
             GpuRetireRegistry registry;
             GpuOpScope operation(m_renderFence, registry);
             operation.track(surface);
-            (void) operation.submit([] { return true; });
+            (void) operation.submit([] { return GpuSubmitOutcome::Submitted; });
         }
         QMutexLocker locker(&m_cacheMutex);
         const auto cached = m_cpuCache.constFind(int(target));

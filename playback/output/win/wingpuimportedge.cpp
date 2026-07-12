@@ -44,24 +44,6 @@ extern "C" {
 
 using Microsoft::WRL::ComPtr;
 
-struct D3D11ImportBackingAccess {
-    static D3D11GpuSurface* surface(const GpuReadLease& lease) {
-        return dynamic_cast<D3D11GpuSurface*>(lease.m_surface);
-    }
-    static ID3D11Device* device(const GpuReadLease& lease) {
-        auto* d3d = surface(lease);
-        return d3d ? d3d->device() : nullptr;
-    }
-    static ID3D11Texture2D* texture(const GpuReadLease& lease) {
-        auto* d3d = surface(lease);
-        return d3d ? d3d->texture() : nullptr;
-    }
-    static UINT subresource(const GpuReadLease& lease) {
-        auto* d3d = surface(lease);
-        return d3d ? d3d->subresource() : 0;
-    }
-};
-
 namespace {
 
 constexpr const char* kMfHardwareDecoderEnv = "OLR_MF_VIDEO_ENABLE_HARDWARE";
@@ -279,6 +261,14 @@ struct WinGpuImportEdge::Impl {
     mutable std::atomic<bool> deviceLost{false};
     std::function<void(const FrameHandle&)> importTap;
 
+    bool ownsDevice(ID3D11Device* candidate) const {
+        if (!candidate || !device) return false;
+        ComPtr<IUnknown> candidateIdentity;
+        ComPtr<IUnknown> edgeIdentity;
+        return SUCCEEDED(candidate->QueryInterface(IID_PPV_ARGS(&candidateIdentity))) &&
+               SUCCEEDED(device.As(&edgeIdentity)) && candidateIdentity.Get() == edgeIdentity.Get();
+    }
+
     bool noteDeviceLostIfRemoved() const {
         if (!device) return false;
         if (FAILED(device->GetDeviceRemovedReason())) {
@@ -380,8 +370,8 @@ std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void* mfSamp
 
     ComPtr<ID3D11Device> textureDevice;
     texture->GetDevice(&textureDevice);
-    auto surface = D3D11GpuSurface::createKept(textureDevice ? textureDevice : m_impl->device,
-                                               texture, subresource, width, height);
+    if (!m_impl->ownsDevice(textureDevice.Get())) return nullptr;
+    auto surface = D3D11GpuSurface::createKept(textureDevice, texture, subresource, width, height);
     if (!surface && m_impl) m_impl->noteDeviceLostIfRemoved();
     return surface;
 }
@@ -390,9 +380,16 @@ std::shared_ptr<GpuFence>
 WinGpuImportEdge::createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface) {
     if (!surface) return nullptr;
     GpuSyncReadScope scope;
-    return scope.read(surface, [](const GpuReadLease& lease) {
-        return makeD3D11GpuFence(D3D11ImportBackingAccess::device(lease));
-    });
+    const GpuReadLease lease = scope.read(surface);
+    const std::shared_ptr<void> retained = lease.retainNativeHandle();
+    auto* texture = static_cast<ID3D11Texture2D*>(retained.get());
+    ComPtr<ID3D11Device> device;
+    if (texture) texture->GetDevice(&device);
+    return makeD3D11GpuFence(device.Get());
+}
+
+std::shared_ptr<GpuFence> WinGpuImportEdge::createFence() const {
+    return (m_impl && m_impl->device) ? makeD3D11GpuFence(m_impl->device.Get()) : nullptr;
 }
 
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -408,6 +405,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
                                                         uint64_t* submittedFenceValue) {
 #endif
     if (!surface) return FrameHandle();
+    if (renderFence && !renderFence->isCompatibleWith(*surface)) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
@@ -415,7 +413,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
         operation.track(surface);
-        if (!operation.submit([] { return true; })) return FrameHandle{};
+        if (!operation.submit([] { return GpuSubmitOutcome::Submitted; })) return FrameHandle{};
         if (submittedFenceValue) *submittedFenceValue = operation.fenceValue();
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -432,8 +430,8 @@ void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&
     m_impl->importTap = std::move(tap);
 }
 
-void* WinGpuImportEdge::d3d11Device() const {
-    return (m_impl && m_impl->device) ? m_impl->device.Get() : nullptr;
+bool WinGpuImportEdge::acceptsD3D11DeviceForTest(void* device) const {
+    return m_impl && m_impl->ownsDevice(static_cast<ID3D11Device*>(device));
 }
 
 bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device, ComPtr<ID3D11Texture2D> nv12,
@@ -460,9 +458,13 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     if (cached != m_cpuCache.cend()) return cached.value();
 
     GpuSyncReadScope readScope;
-    return readScope.read(m_surface, [&](const GpuReadLease& lease) -> CpuPlanes {
-        ID3D11Device* device = D3D11ImportBackingAccess::device(lease);
-        ID3D11Texture2D* src = D3D11ImportBackingAccess::texture(lease);
+    const GpuReadLease lease = readScope.read(m_surface);
+    {
+        const std::shared_ptr<void> retained = lease.retainNativeHandle();
+        auto* src = static_cast<ID3D11Texture2D*>(retained.get());
+        ComPtr<ID3D11Device> retainedDevice;
+        if (src) src->GetDevice(&retainedDevice);
+        ID3D11Device* device = retainedDevice.Get();
         if (!device || !src) return out;
 
         const uint64_t pendingFenceValue = m_surface->pendingFenceValue();
@@ -489,8 +491,8 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
 
         ComPtr<ID3D11Texture2D> readable;
         if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return out;
-        ctx->CopySubresourceRegion(readable.Get(), 0, 0, 0, 0, src,
-                                   D3D11ImportBackingAccess::subresource(lease), nullptr);
+        ctx->CopySubresourceRegion(readable.Get(), 0, 0, 0, 0, src, lease.nativeSubresource(),
+                                   nullptr);
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return out;
@@ -537,12 +539,12 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
                 GpuRetireRegistry registry;
                 GpuOpScope operation(m_renderFence, registry);
                 operation.track(m_surface);
-                (void) operation.submit([] { return true; });
+                (void) operation.submit([] { return GpuSubmitOutcome::Submitted; });
             }
             m_cpuCache.insert(int(target), out);
         }
         return out;
-    });
+    }
 }
 
 CpuPlanes D3D11IGpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {

@@ -4,16 +4,10 @@
 #include "playback/gpu/gpusurface.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <type_traits>
-#include <utility>
 
 class GpuDeviceLossMonitor;
-struct AppleSurfaceBackingAccess;
-struct D3D11ImportBackingAccess;
-struct D3D11MediaFoundationBackingAccess;
-struct VideoToolboxBackingAccess;
 
 // Proof that a driver-authoritative observation declared the active GPU device dead.
 // Only GpuDeviceLossMonitor can construct it, and only backend-local authority types
@@ -37,9 +31,8 @@ private:
     uint64_t m_generation;
 };
 
-// A non-escapable view used only while GpuSyncReadScope is executing its callback.
-// Ordinary callers can inspect safe metadata but cannot copy, move, or extract the
-// backing. Named platform adapter authorities are defined only in their backend TUs.
+// A self-contained synchronous snapshot. It stores no GpuSurface pointer: metadata
+// is copied and any native backing is independently retained before read() returns.
 class GpuReadLease final {
 public:
     GpuReadLease(const GpuReadLease&) = delete;
@@ -47,52 +40,46 @@ public:
     GpuReadLease(GpuReadLease&&) = delete;
     GpuReadLease& operator=(GpuReadLease&&) = delete;
 
-    GpuSurfaceDesc desc() const { return m_surface ? m_surface->desc() : GpuSurfaceDesc{}; }
-    bool valid() const { return m_surface && m_surface->isValid(); }
+    GpuSurfaceDesc desc() const { return m_desc; }
+    bool valid() const { return m_valid; }
+    std::shared_ptr<void> retainNativeHandle() const { return m_nativeHandle; }
+    uint32_t nativeSubresource() const { return m_nativeSubresource; }
 
 private:
     friend class GpuSyncReadScope;
-    friend struct AppleSurfaceBackingAccess;
-    friend struct D3D11ImportBackingAccess;
-    friend struct D3D11MediaFoundationBackingAccess;
-    friend struct VideoToolboxBackingAccess;
 
-    explicit GpuReadLease(std::shared_ptr<GpuSurface> surface)
-        : m_surface(surface.get()), m_owner(std::move(surface)) {}
-    explicit GpuReadLease(GpuSurface* surface) : m_surface(surface) {}
+    explicit GpuReadLease(const std::shared_ptr<GpuSurface>& surface)
+        : GpuReadLease(surface.get()) {}
+    explicit GpuReadLease(GpuSurface* surface)
+        : m_desc(surface ? surface->desc() : GpuSurfaceDesc{}),
+          m_valid(surface && surface->isValid()),
+          m_nativeHandle(surface ? surface->retainNativeHandle() : std::shared_ptr<void>{}),
+          m_nativeSubresource(surface ? surface->nativeSubresource() : 0) {}
 
-    void* nativeHandleForBackend() const { return m_surface ? m_surface->nativeHandle() : nullptr; }
-
-    GpuSurface* m_surface = nullptr;
-    std::shared_ptr<GpuSurface> m_owner;
+    GpuSurfaceDesc m_desc;
+    bool m_valid = false;
+    std::shared_ptr<void> m_nativeHandle;
+    uint32_t m_nativeSubresource = 0;
 };
 
-// Executes synchronous native access inside an inline callback. Callback return is
-// the completion boundary; exceptions and early returns destroy the lease naturally.
-// No std::function, allocation, or aliasing shared_ptr is introduced for raw owners.
+// Captures a lease snapshot synchronously. The returned value contains no borrowed
+// pointer, including for the raw-surface overload used by the encoder.
 class GpuSyncReadScope final {
 public:
     GpuSyncReadScope() = default;
     GpuSyncReadScope(const GpuSyncReadScope&) = delete;
     GpuSyncReadScope& operator=(const GpuSyncReadScope&) = delete;
 
-    template <typename Fn>
-    decltype(auto) read(std::shared_ptr<GpuSurface> surface, Fn&& fn) const {
-        GpuReadLease lease(std::move(surface));
-        return std::invoke(std::forward<Fn>(fn), static_cast<const GpuReadLease&>(lease));
+    GpuReadLease read(const std::shared_ptr<GpuSurface>& surface) const {
+        return GpuReadLease(surface);
     }
 
-    template <typename Surface, typename Fn,
-              typename = std::enable_if_t<std::is_base_of_v<GpuSurface, Surface>>>
-    decltype(auto) read(const std::shared_ptr<Surface>& surface, Fn&& fn) const {
-        return read(std::static_pointer_cast<GpuSurface>(surface), std::forward<Fn>(fn));
+    template <typename Surface, typename = std::enable_if_t<std::is_base_of_v<GpuSurface, Surface>>>
+    GpuReadLease read(const std::shared_ptr<Surface>& surface) const {
+        return GpuReadLease(std::static_pointer_cast<GpuSurface>(surface));
     }
 
-    template <typename Fn>
-    decltype(auto) read(GpuSurface* surface, Fn&& fn) const {
-        GpuReadLease lease(surface);
-        return std::invoke(std::forward<Fn>(fn), static_cast<const GpuReadLease&>(lease));
-    }
+    GpuReadLease read(GpuSurface* surface) const { return GpuReadLease(surface); }
 };
 
 #endif // OLR_GPUSURFACELEASE_H

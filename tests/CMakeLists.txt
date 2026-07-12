@@ -31,11 +31,16 @@ endfunction()
 olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp)
 olr_expect_compile_failure(gpu_lease_raw_access lease_raw_access.cpp)
 olr_expect_compile_failure(gpu_lease_move lease_move.cpp)
+olr_expect_compile_failure(gpu_lease_return_reference lease_return_reference.cpp)
+olr_expect_compile_failure(gpu_lease_return_pointer lease_return_pointer.cpp)
+olr_expect_compile_failure(gpu_backing_authority_spoof backing_authority_spoof.cpp)
 olr_expect_compile_failure(gpu_token_mint token_mint.cpp)
+olr_expect_compile_failure(gpu_token_authority_spoof token_authority_spoof.cpp)
 if(WIN32)
     olr_expect_compile_failure(gpu_d3d11_texture_access d3d11_texture_access.cpp)
     olr_expect_compile_failure(gpu_d3d11_device_access d3d11_device_access.cpp)
     olr_expect_compile_failure(gpu_d3d11_subresource_access d3d11_subresource_access.cpp)
+    olr_expect_compile_failure(gpu_import_edge_device_escape import_edge_device_escape.cpp)
 endif()
 
 # --- Locate FFmpeg ----------------------------------------------------------
@@ -328,9 +333,10 @@ endif()
 if(NOT OLR_GPU_PIPELINE)
     target_sources(olr_test_playback PRIVATE
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp")
-    target_sources(olr_test_playback PRIVATE
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
 endif()
 
 if(OLR_GPU_PIPELINE)

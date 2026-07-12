@@ -30,6 +30,8 @@ public:
 
 private:
     friend class GpuOpScope;
+    void registerRetireBatch(std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
+                             const std::shared_ptr<GpuFence>& fence, uint64_t fenceValue) const;
     void noteSignalFailure() const;
 };
 

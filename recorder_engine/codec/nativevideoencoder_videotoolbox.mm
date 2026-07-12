@@ -19,12 +19,6 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
-struct VideoToolboxBackingAccess {
-    static IOSurfaceRef ioSurface(const GpuReadLease& lease) {
-        return static_cast<IOSurfaceRef>(lease.nativeHandleForBackend());
-    }
-};
-
 namespace {
 
 struct EncodedPacket {
@@ -430,8 +424,10 @@ public:
             return false;
         }
         GpuSyncReadScope readScope;
-        return readScope.read(surface, [&](const GpuReadLease& lease) {
-            IOSurfaceRef ioSurface = VideoToolboxBackingAccess::ioSurface(lease);
+        const GpuReadLease lease = readScope.read(surface);
+        return [&] {
+            const std::shared_ptr<void> retained = lease.retainNativeHandle();
+            IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(retained.get());
             if (!ioSurface) {
                 if (error) {
                     *error = QStringLiteral("encodeSurface: surface is not IOSurface-backed");
@@ -464,7 +460,7 @@ public:
             const bool ok = encodePixelBuffer(pb, ptsTicks, onPacket, error);
             CVPixelBufferRelease(pb);
             return ok;
-        });
+        }();
     }
 
     bool encodePixelBuffer(CVPixelBufferRef pb, int64_t ptsTicks, const PacketCallback& onPacket,

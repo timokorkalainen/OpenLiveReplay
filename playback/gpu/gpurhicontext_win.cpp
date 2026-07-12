@@ -4,6 +4,7 @@
 
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurfacelease.h"
 
 #include <QList>
@@ -29,14 +30,6 @@ using Microsoft::WRL::ComPtr;
 // anonymous-namespace copy would be a different, non-friend function. Reached only
 // from the driver-authoritative GetDeviceRemovedReason() failure branch below, so no
 // other TU can construct a DeadDeviceToken from Windows.
-struct DxgiDeviceLossAuthority {
-    static uint64_t publish(HRESULT removedReason) {
-        if (SUCCEEDED(removedReason)) return 0;
-        return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason);
-    }
-};
-
 namespace {
 
 enum class D3DDeviceKind { Hardware, Warp };
@@ -245,6 +238,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
         return CpuPlanes{};
     }
 
+    const uint64_t observationGeneration = GpuGenerationCounter::instance().current();
     {
         const bool invoked = m_impl->thread.invoke([&] {
             QRhi* rhi = m_impl->thread.rhi;
@@ -256,11 +250,12 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
             const HRESULT removedReason = device ? device->GetDeviceRemovedReason() : HRESULT(S_OK);
             if (device && FAILED(removedReason)) {
                 // LOCK RULE: D3D11 removed-device polling touches no m_bufferMutex.
-                m_impl->deviceLost.store(true, std::memory_order_release);
                 // Driver-authoritative loss: mint the provenance-bound token and hand
                 // it to the loss latch so the worker's recovery can free held surfaces
                 // WITHOUT waiting on the (now dead) fences.
-                DxgiDeviceLossAuthority::publish(removedReason);
+                GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                    DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, observationGeneration);
+                m_impl->deviceLost.store(true, std::memory_order_release);
             }
         });
         (void) invoked;

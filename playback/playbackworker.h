@@ -383,7 +383,7 @@ private:
     void drainEvictedGpuFrames();
     void forceDrainEvictedGpuFrames();
     void recordFenceWaitStall();
-    bool ensureWindowsGpuImportFencesReadyForDecode(void* d3d11Device);
+    bool ensureWindowsGpuImportFencesReadyForDecode();
     void configureGpuBudget();
     GpuPipelineState gpuPipelineState() const;
     bool gpuPathActive() const;

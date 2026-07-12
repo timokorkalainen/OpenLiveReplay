@@ -31,6 +31,12 @@ GpuRetireDiagnostics GpuRetireRegistry::diagnostics() const {
                                 gpuRetireDetail::signalFailureCount()};
 }
 
+void GpuRetireRegistry::registerRetireBatch(std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
+                                            const std::shared_ptr<GpuFence>& fence,
+                                            uint64_t fenceValue) const {
+    gpuRetireDetail::registerRetireBatch(surfaces, count, fence, fenceValue);
+}
+
 void GpuRetireRegistry::noteSignalFailure() const {
     gpuRetireDetail::noteSignalFailure();
 }

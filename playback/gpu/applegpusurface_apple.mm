@@ -17,12 +17,6 @@
 #include <cstring>
 #include <memory>
 
-struct AppleSurfaceBackingAccess {
-    static IOSurfaceRef ioSurface(const GpuReadLease& lease) {
-        return static_cast<IOSurfaceRef>(lease.nativeHandleForBackend());
-    }
-};
-
 namespace {
 
 void zeroPixelBuffer(CVPixelBufferRef pb) {
@@ -206,6 +200,13 @@ protected:
     void* nativeHandle() const override {
         return m_pixelBuffer ? CVPixelBufferGetIOSurface(m_pixelBuffer) : nullptr;
     }
+    std::shared_ptr<void> retainNativeHandle() const override {
+        IOSurfaceRef surface = m_pixelBuffer ? CVPixelBufferGetIOSurface(m_pixelBuffer) : nullptr;
+        if (!surface) return {};
+        CFRetain(surface);
+        return std::shared_ptr<void>(surface,
+                                     [](void* value) { CFRelease(static_cast<CFTypeRef>(value)); });
+    }
 
 private:
     CVPixelBufferRef m_pixelBuffer = nullptr;
@@ -285,15 +286,15 @@ std::shared_ptr<GpuSurface> wrapAppleImageBuffer(void* cvImageBufferRef) {
 CVPixelBufferRef retainApplePixelBufferWrapper(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface || !surface->isValid()) return nullptr;
     GpuSyncReadScope scope;
-    return scope.read(surface, [](const GpuReadLease& lease) {
-        IOSurfaceRef ioSurface = AppleSurfaceBackingAccess::ioSurface(lease);
-        if (!ioSurface) return static_cast<CVPixelBufferRef>(nullptr);
+    const GpuReadLease lease = scope.read(surface);
+    const std::shared_ptr<void> retained = lease.retainNativeHandle();
+    IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(retained.get());
+    if (!ioSurface) return nullptr;
 
-        CVPixelBufferRef pixelBuffer = nullptr;
-        const CVReturn result =
-            CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
-        return result == kCVReturnSuccess ? pixelBuffer : static_cast<CVPixelBufferRef>(nullptr);
-    });
+    CVPixelBufferRef pixelBuffer = nullptr;
+    const CVReturn result =
+        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+    return result == kCVReturnSuccess ? pixelBuffer : nullptr;
 }
 
 CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, FramePixelFormat target,

@@ -2295,14 +2295,13 @@ void PlaybackWorker::recordFenceWaitStall() {
     if (m_outputRuntime) m_outputRuntime->incrementFenceWaitStalls();
 }
 
-bool PlaybackWorker::ensureWindowsGpuImportFencesReadyForDecode(void* d3d11Device) {
+bool PlaybackWorker::ensureWindowsGpuImportFencesReadyForDecode() {
 #if defined(_WIN32)
-    if (!d3d11Device) return false;
-    if (!m_renderFence) m_renderFence = makeD3D11GpuFence(d3d11Device);
-    if (!m_stagingFence) m_stagingFence = makeD3D11GpuFence(d3d11Device);
+    if (!m_winGpuImportEdge) return false;
+    if (!m_renderFence) m_renderFence = m_winGpuImportEdge->createFence();
+    if (!m_stagingFence) m_stagingFence = m_winGpuImportEdge->createFence();
     return m_renderFence && m_stagingFence;
 #else
-    Q_UNUSED(d3d11Device);
     return false;
 #endif
 }
@@ -2848,8 +2847,7 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                         m_winGpuImportTried = true;
                     }
                     if (m_winGpuImportEdge && m_winGpuImportEdge->isAvailable()) {
-                        const bool fencesReady = ensureWindowsGpuImportFencesReadyForDecode(
-                            m_winGpuImportEdge->d3d11Device());
+                        const bool fencesReady = ensureWindowsGpuImportFencesReadyForDecode();
                         if (!fencesReady) {
                             m_winGpuImportEdge.reset();
                         } else if (allowNativeGpuDecodeForCurrentPacket(packetPtsMs())) {

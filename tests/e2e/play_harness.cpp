@@ -377,8 +377,8 @@ int probeGpuBackend() {
         fprintf(stderr, "SKIP: Windows GPU import edge unavailable: %s\n", qPrintable(error));
         return 77;
     }
-    auto renderFence = makeD3D11GpuFence(edge->d3d11Device());
-    auto stagingFence = makeD3D11GpuFence(edge->d3d11Device());
+    auto renderFence = edge->createFence();
+    auto stagingFence = edge->createFence();
     if (!renderFence || !stagingFence) {
         fprintf(stderr, "SKIP: Windows D3D11 fences unavailable\n");
         return 77;
