@@ -10,6 +10,13 @@
 class GpuFence;
 class QRhi;
 
+#if defined(OLR_UNIT_TEST) && defined(_WIN32)
+struct D3D11RemovalObservationForTest {
+    int64_t hresult = 0;
+    uint64_t generation = 0;
+};
+#endif
+
 // Owns the platform QRhi on a dedicated render thread. QRhi and imported GPU
 // textures are thread-affine, so all RHI work funnels through this context.
 class GpuRhiContext {
@@ -20,6 +27,10 @@ public:
 #ifdef OLR_UNIT_TEST
     static std::shared_ptr<GpuRhiContext> createInvalidForTest();
     int rhiReadbackCountForTest() const;
+#ifdef _WIN32
+    static D3D11RemovalObservationForTest observeD3D11RemovalForTest(void* device,
+                                                                     uint64_t observedGeneration);
+#endif
 #endif
     ~GpuRhiContext();
 

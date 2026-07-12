@@ -277,4 +277,19 @@ std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
     return invoked ? fence : nullptr;
 }
 
+#ifdef OLR_UNIT_TEST
+D3D11RemovalObservationForTest
+GpuRhiContext::observeD3D11RemovalForTest(void* opaqueDevice, uint64_t observedGeneration) {
+    auto* device = static_cast<ID3D11Device*>(opaqueDevice);
+    if (!device) return {};
+    const HRESULT reason = device->GetDeviceRemovedReason();
+    uint64_t generation = 0;
+    if (FAILED(reason)) {
+        generation = GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, observedGeneration);
+    }
+    return D3D11RemovalObservationForTest{int64_t(reason), generation};
+}
+#endif
+
 #endif // _WIN32

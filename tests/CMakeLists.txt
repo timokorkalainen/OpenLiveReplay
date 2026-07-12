@@ -448,6 +448,7 @@ if(OLR_GPU_PIPELINE)
             "${CMAKE_SOURCE_DIR}/playback/gpu/shaders/grid_quality.frag")
 endif()
 
+add_subdirectory(gpu_fault)
 add_subdirectory(unit)
 if(APPLE OR WIN32)  # tst_ingestbackendselector is Apple/Windows-only (native ingest)
     target_link_libraries(tst_ingestbackendselector PRIVATE olr_test_engine)
