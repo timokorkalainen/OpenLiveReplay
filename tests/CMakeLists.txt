@@ -11,6 +11,33 @@
 
 find_package(Qt6 REQUIRED COMPONENTS Test Core Concurrent Network WebSockets)
 
+function(olr_expect_compile_failure name source)
+    set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+    try_compile(${name}_compiled
+        "${CMAKE_BINARY_DIR}/negcompile/${name}"
+        SOURCES "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/${source}"
+        CMAKE_FLAGS
+            "-DCMAKE_CXX_STANDARD=17"
+            "-DCMAKE_CXX_STANDARD_REQUIRED=ON"
+            "-DINCLUDE_DIRECTORIES=${CMAKE_SOURCE_DIR}"
+        LINK_LIBRARIES Qt6::Core
+        OUTPUT_VARIABLE compile_output)
+    if(${name}_compiled)
+        message(FATAL_ERROR
+            "Forbidden GPU capability probe ${name} compiled successfully:\n${compile_output}")
+    endif()
+endfunction()
+
+olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp)
+olr_expect_compile_failure(gpu_lease_raw_access lease_raw_access.cpp)
+olr_expect_compile_failure(gpu_lease_move lease_move.cpp)
+olr_expect_compile_failure(gpu_token_mint token_mint.cpp)
+if(WIN32)
+    olr_expect_compile_failure(gpu_d3d11_texture_access d3d11_texture_access.cpp)
+    olr_expect_compile_failure(gpu_d3d11_device_access d3d11_device_access.cpp)
+    olr_expect_compile_failure(gpu_d3d11_subresource_access d3d11_subresource_access.cpp)
+endif()
+
 # --- Locate FFmpeg ----------------------------------------------------------
 if(WIN32)
     set(OLR_FFMPEG_ROOT "" CACHE PATH "Root directory of the Windows FFmpeg install")
@@ -300,7 +327,10 @@ endif()
 
 if(NOT OLR_GPU_PIPELINE)
     target_sources(olr_test_playback PRIVATE
-        "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp")
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp")
+    target_sources(olr_test_playback PRIVATE
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp")
 endif()
 
 if(OLR_GPU_PIPELINE)
@@ -315,6 +345,8 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpulifecyclesink.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/iosmemoryheadroom.cpp"
@@ -355,6 +387,8 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/iosgpupolicy.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpupipelineconfig.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/decodedonefence_stub.cpp"
         "${CMAKE_SOURCE_DIR}/playback/output/formatcanon.cpp"

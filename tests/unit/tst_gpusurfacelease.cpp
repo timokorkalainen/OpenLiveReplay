@@ -10,12 +10,15 @@
 #include <QtTest>
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/framepixelformat.h"
 
 #include <memory>
+#include <limits>
 #include <type_traits>
 
 namespace {
@@ -40,6 +43,10 @@ static_assert(!std::is_default_constructible<DeadDeviceToken>::value,
               "DeadDeviceToken must not be default-constructible (mint-only).");
 static_assert(!std::is_constructible<DeadDeviceToken, DeadDeviceToken::Provenance, uint64_t>::value,
               "DeadDeviceToken's provenance constructor must be private (driver-mint-only).");
+static_assert(!std::is_copy_constructible<GpuReadLease>::value,
+              "GpuReadLease must not escape a synchronous callback by copy.");
+static_assert(!std::is_move_constructible<GpuReadLease>::value,
+              "GpuReadLease must not escape a synchronous callback by move.");
 
 // A surface whose native handle is a known sentinel. nativeHandle() is protected,
 // mirroring the production surfaces, so the ONLY way the test reads it is via a lease.
@@ -48,7 +55,6 @@ public:
     FakeLeaseSurface(void* handle, bool valid) : m_handle(handle), m_valid(valid) {}
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 16, 0}; }
     bool isValid() const override { return m_valid; }
-    void* expectedHandleForTest() const { return m_valid ? m_handle : nullptr; }
 
 protected:
     void* nativeHandle() const override { return m_valid ? m_handle : nullptr; }
@@ -61,14 +67,43 @@ private:
 // Fence with a test-controllable completed watermark.
 class FakeFence : public GpuFence {
 public:
-    uint64_t signal() override { return ++m_signalled; }
-    bool wait(uint64_t value, int /*timeoutMs*/) override { return m_completed >= value; }
+    uint64_t signal() override {
+        ++m_signalCalls;
+        return ++m_signalled;
+    }
+    bool wait(uint64_t value, int /*timeoutMs*/) override {
+        m_waitSawUnlockedRetainer = gpuRetireDetail::mutexAvailableForTest();
+        if (m_retireOnWait) m_completed = value;
+        return m_completed >= value;
+    }
     uint64_t completedValue() const override { return m_completed; }
     void setCompleted(uint64_t v) { m_completed = v; }
+    void setRetireOnWait(bool retire) { m_retireOnWait = retire; }
+    bool waitSawUnlockedRetainer() const { return m_waitSawUnlockedRetainer; }
+    int signalCalls() const { return m_signalCalls; }
 
 private:
     uint64_t m_signalled = 0;
     uint64_t m_completed = 0;
+    bool m_retireOnWait = false;
+    bool m_waitSawUnlockedRetainer = false;
+    int m_signalCalls = 0;
+};
+
+class ZeroSignalFence final : public GpuFence {
+public:
+    uint64_t signal() override {
+        ++m_signalCalls;
+        return 0;
+    }
+    bool wait(uint64_t value, int) override { return m_completed >= value; }
+    uint64_t completedValue() const override { return m_completed; }
+    void retireQuarantine() { m_completed = std::numeric_limits<uint64_t>::max(); }
+    int signalCalls() const { return m_signalCalls; }
+
+private:
+    uint64_t m_completed = 0;
+    int m_signalCalls = 0;
 };
 
 } // namespace
@@ -76,33 +111,35 @@ private:
 class TestGpuSurfaceLease : public QObject {
     Q_OBJECT
 private slots:
-    void leaseHandsOutTheRealHandle();
-    void leaseOnInvalidSurfaceIsNull();
+    void callbackLeaseExposesMetadataOnly();
+    void callbackLeaseReportsInvalidSurface();
     void boundedWaitDrainReleasesOnlyRetired();
+    void boundedWaitDoesNotHoldRetainerMutex();
+    void registryDiagnosticsTrackHighWaterAndTimeouts();
+    void opScopeSignalsOnceAndRegistersUniqueSurfaces();
+    void opScopeCancelsBeforeSubmissionWithoutRetaining();
+    void opScopeQuarantinesOnZeroSignal();
 };
 
-void TestGpuSurfaceLease::leaseHandsOutTheRealHandle() {
+void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
     auto sentinel = reinterpret_cast<void*>(0xBEEF);
     auto surface = std::make_shared<FakeLeaseSurface>(sentinel, /*valid=*/true);
     {
         GpuSyncReadScope scope;
-        const GpuReadLease lease = scope.read(surface);
-        QVERIFY(lease.valid());
-        QCOMPARE(lease.nativeHandle(), surface->expectedHandleForTest());
-        QCOMPARE(lease.nativeHandle(), sentinel);
-        QCOMPARE(lease.desc().width, 16);
-        scope.complete(); // synchronous read finished; destructor must not assert
+        const auto state = scope.read(surface, [](const GpuReadLease& lease) {
+            return std::make_pair(lease.valid(), lease.desc().width);
+        });
+        QVERIFY(state.first);
+        QCOMPARE(state.second, 16);
     }
 }
 
-void TestGpuSurfaceLease::leaseOnInvalidSurfaceIsNull() {
+void TestGpuSurfaceLease::callbackLeaseReportsInvalidSurface() {
     auto surface =
         std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x1), /*valid=*/false);
     GpuSyncReadScope scope;
-    const GpuReadLease lease = scope.read(surface);
-    QVERIFY(!lease.valid());
-    QCOMPARE(lease.nativeHandle(), nullptr);
-    scope.complete();
+    const bool valid = scope.read(surface, [](const GpuReadLease& lease) { return lease.valid(); });
+    QVERIFY(!valid);
 }
 
 void TestGpuSurfaceLease::boundedWaitDrainReleasesOnlyRetired() {
@@ -112,17 +149,103 @@ void TestGpuSurfaceLease::boundedWaitDrainReleasesOnlyRetired() {
     auto fence = std::make_shared<FakeFence>();
     const long baseline = surface.use_count();
 
-    gpuRetainSurfaceUntilFenceRetired(surface, fence, 5);
+    GpuRetireRegistry registry;
+    registry.registerRetire(surface, fence, 5);
     QVERIFY(surface.use_count() > baseline); // the retainer holds a reference
 
     // Fence has not reached 5 -> bounded wait cannot retire it -> surface stays held.
-    gpuDrainReadbackRetainsWithBoundedWait(1);
+    registry.drainWithBoundedWait(1);
     QVERIFY(surface.use_count() > baseline);
 
     // Fence retires -> the bounded-wait drain releases the surface.
     fence->setCompleted(5);
-    gpuDrainReadbackRetainsWithBoundedWait(1);
+    registry.drainWithBoundedWait(1);
     QCOMPARE(surface.use_count(), baseline);
+}
+
+void TestGpuSurfaceLease::boundedWaitDoesNotHoldRetainerMutex() {
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x3), true);
+    auto fence = std::make_shared<FakeFence>();
+    fence->setRetireOnWait(true);
+    GpuRetireRegistry registry;
+    registry.registerRetire(surface, fence, 9);
+
+    QCOMPARE(registry.drainWithBoundedWait(1), 1);
+    QVERIFY(fence->waitSawUnlockedRetainer());
+}
+
+void TestGpuSurfaceLease::registryDiagnosticsTrackHighWaterAndTimeouts() {
+    GpuRetireRegistry registry;
+    const GpuRetireDiagnostics before = registry.diagnostics();
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x4), true);
+    auto fence = std::make_shared<FakeFence>();
+    registry.registerRetire(surface, fence, 11);
+
+    const GpuRetireDiagnostics registered = registry.diagnostics();
+    QVERIFY(registered.pendingRetains >= 1);
+    QVERIFY(registered.highWaterMark >= registered.pendingRetains);
+    QCOMPARE(registry.drainWithBoundedWait(1), 0);
+    QVERIFY(registry.diagnostics().timeoutCount >= before.timeoutCount + 1);
+
+    fence->setCompleted(11);
+    registry.drainCompleted();
+}
+
+void TestGpuSurfaceLease::opScopeSignalsOnceAndRegistersUniqueSurfaces() {
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    const uint64_t spillsBefore = GpuOpScope::spillAllocationCount();
+    auto first = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5), true);
+    auto second = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x6), true);
+    auto fence = std::make_shared<FakeFence>();
+
+    GpuOpScope operation(fence, registry);
+    QVERIFY(operation.track(first));
+    QVERIFY(!operation.track(first));
+    QVERIFY(operation.track(second));
+    QVERIFY(operation.submit([] { return true; }));
+
+    QCOMPARE(fence->signalCalls(), 1);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+    QCOMPARE(GpuOpScope::spillAllocationCount(), spillsBefore);
+    fence->setCompleted(1);
+    registry.drainCompleted();
+}
+
+void TestGpuSurfaceLease::opScopeCancelsBeforeSubmissionWithoutRetaining() {
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x7), true);
+    const long ownersBefore = surface.use_count();
+    auto fence = std::make_shared<FakeFence>();
+
+    {
+        GpuOpScope operation(fence, registry);
+        QVERIFY(operation.track(surface));
+        QVERIFY(!operation.submit([] { return false; }));
+    }
+
+    QCOMPARE(fence->signalCalls(), 0);
+    QCOMPARE(surface.use_count(), ownersBefore);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuSurfaceLease::opScopeQuarantinesOnZeroSignal() {
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    const uint64_t failuresBefore = registry.diagnostics().signalFailureCount;
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x8), true);
+    auto fence = std::make_shared<ZeroSignalFence>();
+
+    GpuOpScope operation(fence, registry);
+    QVERIFY(operation.track(surface));
+    QVERIFY(!operation.submit([] { return true; }));
+    QCOMPARE(fence->signalCalls(), 1);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QCOMPARE(registry.diagnostics().signalFailureCount, failuresBefore + 1);
+
+    fence->retireQuarantine();
+    registry.drainCompleted();
 }
 
 QTEST_GUILESS_MAIN(TestGpuSurfaceLease)

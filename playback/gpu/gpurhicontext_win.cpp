@@ -29,10 +29,13 @@ using Microsoft::WRL::ComPtr;
 // anonymous-namespace copy would be a different, non-friend function. Reached only
 // from the driver-authoritative GetDeviceRemovedReason() failure branch below, so no
 // other TU can construct a DeadDeviceToken from Windows.
-DeadDeviceToken mintDeadDeviceTokenFromDxgi(long failedHr, uint64_t gen) {
-    (void) failedHr; // provenance is the guarantee; the specific HRESULT is diagnostic
-    return DeadDeviceToken(DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, gen);
-}
+struct DxgiDeviceLossAuthority {
+    static uint64_t publish(HRESULT removedReason) {
+        if (SUCCEEDED(removedReason)) return 0;
+        return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason);
+    }
+};
 
 namespace {
 
@@ -257,9 +260,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
                 // Driver-authoritative loss: mint the provenance-bound token and hand
                 // it to the loss latch so the worker's recovery can free held surfaces
                 // WITHOUT waiting on the (now dead) fences.
-                const uint64_t gen = GpuDeviceLossMonitor::instance().recordLoss();
-                GpuDeviceLossMonitor::instance().markRealDeviceLoss(
-                    mintDeadDeviceTokenFromDxgi(static_cast<long>(removedReason), gen));
+                DxgiDeviceLossAuthority::publish(removedReason);
             }
         });
         (void) invoked;

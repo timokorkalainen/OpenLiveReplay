@@ -29,13 +29,23 @@ uint64_t GpuDeviceLossMonitor::recordLoss() {
     return generation;
 }
 
-void GpuDeviceLossMonitor::markRealDeviceLoss(const DeadDeviceToken& token) {
+uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance provenance) {
     std::lock_guard<std::mutex> lock(m_epochMutex);
-    if (!m_lost.load(std::memory_order_acquire) ||
-        token.observedGeneration() != m_lossGeneration.load(std::memory_order_acquire)) {
-        return;
+    if (m_lost.load(std::memory_order_acquire)) {
+        const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
+        if (!m_realLossToken.has_value()) {
+            m_realLossToken = DeadDeviceToken(provenance, generation);
+        }
+        return generation;
     }
-    if (!m_realLossToken.has_value()) m_realLossToken = token; // first writer wins in-epoch
+
+    const uint64_t generation = GpuGenerationCounter::instance().bump();
+    m_lossGeneration.store(generation, std::memory_order_release);
+    m_realLossToken = DeadDeviceToken(provenance, generation);
+    m_lossCount.fetch_add(1, std::memory_order_acq_rel);
+    m_undrained.fetch_add(1, std::memory_order_acq_rel);
+    m_lost.store(true, std::memory_order_release);
+    return generation;
 }
 
 std::optional<DeadDeviceToken> GpuDeviceLossMonitor::realLossToken() const {

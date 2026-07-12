@@ -17,6 +17,12 @@
 #include <cstring>
 #include <memory>
 
+struct AppleSurfaceBackingAccess {
+    static IOSurfaceRef ioSurface(const GpuReadLease& lease) {
+        return static_cast<IOSurfaceRef>(lease.nativeHandleForBackend());
+    }
+};
+
 namespace {
 
 void zeroPixelBuffer(CVPixelBufferRef pb) {
@@ -276,27 +282,26 @@ std::shared_ptr<GpuSurface> wrapAppleImageBuffer(void* cvImageBufferRef) {
     return surface->isValid() ? surface : nullptr;
 }
 
+CVPixelBufferRef retainApplePixelBufferWrapper(const std::shared_ptr<GpuSurface>& surface) {
+    if (!surface || !surface->isValid()) return nullptr;
+    GpuSyncReadScope scope;
+    return scope.read(surface, [](const GpuReadLease& lease) {
+        IOSurfaceRef ioSurface = AppleSurfaceBackingAccess::ioSurface(lease);
+        if (!ioSurface) return static_cast<CVPixelBufferRef>(nullptr);
+
+        CVPixelBufferRef pixelBuffer = nullptr;
+        const CVReturn result =
+            CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+        return result == kCVReturnSuccess ? pixelBuffer : static_cast<CVPixelBufferRef>(nullptr);
+    });
+}
+
 CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, FramePixelFormat target,
                                 ColorMetadata color) {
     if (!surface || !surface->isValid()) return CpuPlanes{};
     const GpuSurfaceDesc desc = surface->desc();
-    // Synchronous handle access: the CPU download below completes before we return,
-    // and the IOSurface is kept alive by the CVPixelBuffer wrapper for its duration.
-    GpuSyncReadScope readScope;
-    const GpuReadLease lease = readScope.read(surface);
-    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    if (!ioSurface) {
-        readScope.complete();
-        return CpuPlanes{};
-    }
-
-    CVPixelBufferRef pb = nullptr;
-    if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb) !=
-            kCVReturnSuccess ||
-        !pb) {
-        readScope.complete();
-        return CpuPlanes{};
-    }
+    CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
+    if (!pb) return CpuPlanes{};
 
     CpuPlanes result;
     if (desc.format == FramePixelFormat::Nv12) {
@@ -318,7 +323,6 @@ CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, Fram
     }
 
     CVPixelBufferRelease(pb);
-    readScope.complete();
     return result;
 }
 

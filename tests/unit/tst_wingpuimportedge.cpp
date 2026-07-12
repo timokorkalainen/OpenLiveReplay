@@ -3,8 +3,7 @@
 #include "playback/output/win/wingpuimportedge.h"
 #ifdef _WIN32
 #include "playback/gpu/gpufence.h"
-#include "playback/gpu/gpureadbackretainer.h"
-#include "playback/gpu/gpusurfacelease.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/output/win/d3d11gpusurface.h"
 #include "playback/output/win/d3dfence.h"
 #include "recorder_engine/ingest/nativeframecopy.h"
@@ -170,10 +169,7 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
     QCOMPARE(int(surface->desc().format), int(FramePixelFormat::Nv12));
     QCOMPARE(surface->desc().width, 1280);
     QCOMPARE(surface->desc().height, 720);
-    GpuSyncReadScope scope;
-    auto lease = scope.read(surface);
-    QCOMPARE(lease.nativeHandle(), static_cast<void*>(texture.Get()));
-    scope.complete();
+    QVERIFY(surface->aliasesTextureForTest(texture.Get()));
 
     surface->retainUntilFenceRetired(5);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
@@ -218,7 +214,7 @@ void TestWinGpuImportEdge::importedFrameExposesRenderFence() {
     QVERIFY(handle.data()->gpuFence() == renderFence);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
     renderFence->complete(1);
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
 #endif
 }
 
@@ -338,7 +334,7 @@ void TestWinGpuImportEdge::readToCpuWaitsForPendingFenceBeforeCopy() {
     QVERIFY(got.isValid());
     QCOMPARE(fence->waits.load(std::memory_order_acquire), 2);
     fence->complete(2);
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
 #endif
 }
 
@@ -531,10 +527,10 @@ void TestWinGpuImportEdge::surfaceSurvivesInFlightReadback() {
     QVERIFY(handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
     handle = FrameHandle();
     QVERIFY(!weak.expired());
-    QVERIFY(gpuPendingReadbackRetainCount() >= 1);
+    QVERIFY(GpuRetireRegistry{}.pendingRetainCount() >= 1);
 
     renderFence->complete(2);
-    gpuDrainCompletedReadbackRetains();
+    GpuRetireRegistry{}.drainCompleted();
     QVERIFY(weak.expired());
 #endif
 }

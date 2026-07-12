@@ -249,15 +249,16 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForEncode(void* nativeDec
         return imported;
     }
 
-    std::shared_ptr<GpuFence> fence = makeD3D11GpuFence(surface->device());
+    std::shared_ptr<GpuFence> fence = WinGpuImportEdge::createFenceForSurface(surface);
     if (!fence) {
         latchGpuEncodeCpuFallback();
         return imported;
     }
-    const uint64_t fenceValue = fence ? fence->signal() : 0;
+    uint64_t fenceValue = 0;
     const qint64 bytes = gpuSurfaceBytes(*surface);
     imported.frame = WinGpuImportEdge::makeGpuFrameHandleForTest(
-        std::move(surface), metadata, fence, GpuBudgetCharge(bytes, GpuBudgetTag::RecorderWrap));
+        std::move(surface), metadata, fence, GpuBudgetCharge(bytes, GpuBudgetTag::RecorderWrap),
+        &fenceValue);
     imported.fenceValue = fenceValue;
 #else
     Q_UNUSED(nativeDecodedImage);

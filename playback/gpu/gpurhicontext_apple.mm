@@ -2,6 +2,7 @@
 
 #ifdef __APPLE__
 
+#include "playback/gpu/appleiosurface.h"
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpusurfacelease.h"
@@ -32,9 +33,12 @@
 // scope so it matches the friend + namespace-scope declaration in gpusurfacelease.h.
 // Reached only from the FrameOpDeviceLost / isDeviceLost() branches below, so no
 // other TU can construct a DeadDeviceToken from the Apple backend.
-DeadDeviceToken mintDeadDeviceTokenFromFrameOp(uint64_t gen) {
-    return DeadDeviceToken(DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, gen);
-}
+struct AppleDeviceLossAuthority {
+    static uint64_t publish() {
+        return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::RhiFrameOpDeviceLost);
+    }
+};
 
 namespace {
 
@@ -631,24 +635,8 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
     }
     const GpuSurfaceDesc desc = surface->desc();
 
-    // Synchronous handle access: the RHI import+readback below runs to completion on
-    // the render thread (invoke blocks), and the IOSurface stays alive via the
-    // CVPixelBuffer wrapper for that duration.
-    GpuSyncReadScope readScope;
-    const GpuReadLease lease = readScope.read(surface);
-    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    if (!ioSurface) {
-        readScope.complete();
-        return result;
-    }
-
-    CVPixelBufferRef pb = nullptr;
-    if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb) !=
-            kCVReturnSuccess ||
-        !pb) {
-        readScope.complete();
-        return result;
-    }
+    CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
+    if (!pb) return result;
 
     const bool invoked = m_impl->thread.invoke([&] {
         QRhi* rhi = m_impl->thread.rhi;
@@ -664,9 +652,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                     // Driver-authoritative loss: mint the provenance-bound token so
                     // the worker's recovery frees held surfaces without waiting on
                     // the dead device's fences.
-                    const uint64_t gen = GpuDeviceLossMonitor::instance().recordLoss();
-                    GpuDeviceLossMonitor::instance().markRealDeviceLoss(
-                        mintDeadDeviceTokenFromFrameOp(gen));
+                    AppleDeviceLossAuthority::publish();
                     result = CpuPlanes{};
                     return;
                 }
@@ -674,9 +660,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                 if (begin == QRhi::FrameOpDeviceLost || rhi->isDeviceLost()) {
                     // LOCK RULE: this render-thread poll touches no m_bufferMutex.
                     m_impl->deviceLost.store(true, std::memory_order_release);
-                    const uint64_t gen = GpuDeviceLossMonitor::instance().recordLoss();
-                    GpuDeviceLossMonitor::instance().markRealDeviceLoss(
-                        mintDeadDeviceTokenFromFrameOp(gen));
+                    AppleDeviceLossAuthority::publish();
                 }
                 result = CpuPlanes{};
                 return;
@@ -692,7 +676,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
             }
             if (rhi && rhi->isDeviceLost()) {
                 m_impl->deviceLost.store(true, std::memory_order_release);
-                GpuDeviceLossMonitor::instance().recordLoss();
+                AppleDeviceLossAuthority::publish();
                 result = CpuPlanes{};
                 return;
             }
@@ -710,7 +694,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                 }
                 if (rhi && rhi->isDeviceLost()) {
                     m_impl->deviceLost.store(true, std::memory_order_release);
-                    GpuDeviceLossMonitor::instance().recordLoss();
+                    AppleDeviceLossAuthority::publish();
                     result = CpuPlanes{};
                     return;
                 }
@@ -725,7 +709,6 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
         }
     });
     CVPixelBufferRelease(pb);
-    readScope.complete();
     if (!invoked) return CpuPlanes{};
     return result;
 }

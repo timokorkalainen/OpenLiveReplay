@@ -49,6 +49,8 @@ public:
                                          int width, int height,
                                          std::shared_ptr<GpuFence> renderFence = nullptr);
     std::shared_ptr<D3D11GpuSurface> tryImportSurface(void* mfSampleOpaque, int width, int height);
+    static std::shared_ptr<GpuFence>
+    createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface);
     bool isAvailable() const;
     bool deviceLost() const;
 
@@ -56,11 +58,13 @@ public:
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                  FrameMetadata meta,
                                                  std::shared_ptr<GpuFence> renderFence = nullptr,
-                                                 GpuBudgetCharge charge = {});
+                                                 GpuBudgetCharge charge = {},
+                                                 uint64_t* submittedFenceValue = nullptr);
 #else
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                  FrameMetadata meta,
-                                                 std::shared_ptr<GpuFence> renderFence = nullptr);
+                                                 std::shared_ptr<GpuFence> renderFence = nullptr,
+                                                 uint64_t* submittedFenceValue = nullptr);
 #endif
 #ifdef _WIN32
     void setImportTapForTest(std::function<void(const FrameHandle&)> tap);

@@ -4,7 +4,9 @@
 
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframereadbacktelemetry.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuopscope.h"
+#include "playback/gpu/gpuretireregistry.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/win/d3d11gpusurface.h"
 
 #include "recorder_engine/ingest/h26xaccessunit.h"
@@ -41,6 +43,24 @@ extern "C" {
 }
 
 using Microsoft::WRL::ComPtr;
+
+struct D3D11ImportBackingAccess {
+    static D3D11GpuSurface* surface(const GpuReadLease& lease) {
+        return dynamic_cast<D3D11GpuSurface*>(lease.m_surface);
+    }
+    static ID3D11Device* device(const GpuReadLease& lease) {
+        auto* d3d = surface(lease);
+        return d3d ? d3d->device() : nullptr;
+    }
+    static ID3D11Texture2D* texture(const GpuReadLease& lease) {
+        auto* d3d = surface(lease);
+        return d3d ? d3d->texture() : nullptr;
+    }
+    static UINT subresource(const GpuReadLease& lease) {
+        auto* d3d = surface(lease);
+        return d3d ? d3d->subresource() : 0;
+    }
+};
 
 namespace {
 
@@ -366,25 +386,37 @@ std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void* mfSamp
     return surface;
 }
 
+std::shared_ptr<GpuFence>
+WinGpuImportEdge::createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface) {
+    if (!surface) return nullptr;
+    GpuSyncReadScope scope;
+    return scope.read(surface, [](const GpuReadLease& lease) {
+        return makeD3D11GpuFence(D3D11ImportBackingAccess::device(lease));
+    });
+}
+
 #ifdef OLR_GPU_PIPELINE_BUILD
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                         FrameMetadata meta,
                                                         std::shared_ptr<GpuFence> renderFence,
-                                                        GpuBudgetCharge charge) {
+                                                        GpuBudgetCharge charge,
+                                                        uint64_t* submittedFenceValue) {
 #else
 FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                         FrameMetadata meta,
-                                                        std::shared_ptr<GpuFence> renderFence) {
+                                                        std::shared_ptr<GpuFence> renderFence,
+                                                        uint64_t* submittedFenceValue) {
 #endif
     if (!surface) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
     if (renderFence) {
-        const uint64_t fenceValue = renderFence->signal();
-        if (fenceValue != 0) {
-            gpuRetainSurfaceUntilFenceRetired(surface, renderFence, fenceValue);
-        }
+        GpuRetireRegistry registry;
+        GpuOpScope operation(renderFence, registry);
+        operation.track(surface);
+        if (!operation.submit([] { return true; })) return FrameHandle{};
+        if (submittedFenceValue) *submittedFenceValue = operation.fenceValue();
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
     auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence),
@@ -427,83 +459,90 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     const auto cached = m_cpuCache.constFind(int(target));
     if (cached != m_cpuCache.cend()) return cached.value();
 
-    ID3D11Device* device = m_surface->device();
-    ID3D11Texture2D* src = m_surface->texture();
-    if (!device || !src) return out;
+    GpuSyncReadScope readScope;
+    return readScope.read(m_surface, [&](const GpuReadLease& lease) -> CpuPlanes {
+        ID3D11Device* device = D3D11ImportBackingAccess::device(lease);
+        ID3D11Texture2D* src = D3D11ImportBackingAccess::texture(lease);
+        if (!device || !src) return out;
 
-    const uint64_t pendingFenceValue = m_surface->pendingFenceValue();
-    if (pendingFenceValue != 0) {
-        if (!m_renderFence || !m_renderFence->wait(pendingFenceValue, kD3DReadbackFenceTimeoutMs)) {
-            return out;
+        const uint64_t pendingFenceValue = m_surface->pendingFenceValue();
+        if (pendingFenceValue != 0) {
+            if (!m_renderFence ||
+                !m_renderFence->wait(pendingFenceValue, kD3DReadbackFenceTimeoutMs)) {
+                return out;
+            }
         }
-    }
 
-    ComPtr<ID3D11DeviceContext> ctx;
-    device->GetImmediateContext(&ctx);
-    if (!ctx) return out;
+        ComPtr<ID3D11DeviceContext> ctx;
+        device->GetImmediateContext(&ctx);
+        if (!ctx) return out;
 
-    D3D11_TEXTURE2D_DESC desc{};
-    src->GetDesc(&desc);
-    D3D11_TEXTURE2D_DESC staging = desc;
-    staging.Usage = D3D11_USAGE_STAGING;
-    staging.BindFlags = 0;
-    staging.MiscFlags = 0;
-    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    staging.ArraySize = 1;
-    staging.MipLevels = 1;
+        D3D11_TEXTURE2D_DESC desc{};
+        src->GetDesc(&desc);
+        D3D11_TEXTURE2D_DESC staging = desc;
+        staging.Usage = D3D11_USAGE_STAGING;
+        staging.BindFlags = 0;
+        staging.MiscFlags = 0;
+        staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        staging.ArraySize = 1;
+        staging.MipLevels = 1;
 
-    ComPtr<ID3D11Texture2D> readable;
-    if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return out;
-    ctx->CopySubresourceRegion(readable.Get(), 0, 0, 0, 0, src, m_surface->subresource(), nullptr);
+        ComPtr<ID3D11Texture2D> readable;
+        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return out;
+        ctx->CopySubresourceRegion(readable.Get(), 0, 0, 0, 0, src,
+                                   D3D11ImportBackingAccess::subresource(lease), nullptr);
 
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return out;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return out;
 
-    const int w = m_surface->desc().width;
-    const int h = m_surface->desc().height;
-    const int chromaH = (h + 1) / 2;
-    const auto* base = static_cast<const uint8_t*>(mapped.pData);
-    const int pitch = int(mapped.RowPitch);
-    const uint8_t* yPlane = base;
-    const uint8_t* uvPlane = base + size_t(pitch) * h;
+        const int w = m_surface->desc().width;
+        const int h = m_surface->desc().height;
+        const int chromaH = (h + 1) / 2;
+        const auto* base = static_cast<const uint8_t*>(mapped.pData);
+        const int pitch = int(mapped.RowPitch);
+        const uint8_t* yPlane = base;
+        const uint8_t* uvPlane = base + size_t(pitch) * h;
 
-    if (target == FramePixelFormat::Yuv420p) {
-        AVFrame* frame = nativeCopyNv12ToYuv420p(yPlane, pitch, uvPlane, pitch, w, h);
-        if (frame) {
-            out.format = FramePixelFormat::Yuv420p;
+        if (target == FramePixelFormat::Yuv420p) {
+            AVFrame* frame = nativeCopyNv12ToYuv420p(yPlane, pitch, uvPlane, pitch, w, h);
+            if (frame) {
+                out.format = FramePixelFormat::Yuv420p;
+                out.width = w;
+                out.height = h;
+                out.stride[0] = frame->linesize[0];
+                out.stride[1] = frame->linesize[1];
+                out.stride[2] = frame->linesize[2];
+                out.plane[0] = QByteArray(reinterpret_cast<const char*>(frame->data[0]),
+                                          frame->linesize[0] * h);
+                out.plane[1] = QByteArray(reinterpret_cast<const char*>(frame->data[1]),
+                                          frame->linesize[1] * chromaH);
+                out.plane[2] = QByteArray(reinterpret_cast<const char*>(frame->data[2]),
+                                          frame->linesize[2] * chromaH);
+                av_frame_free(&frame);
+            }
+        } else if (target == FramePixelFormat::Nv12) {
+            out.format = FramePixelFormat::Nv12;
             out.width = w;
             out.height = h;
-            out.stride[0] = frame->linesize[0];
-            out.stride[1] = frame->linesize[1];
-            out.stride[2] = frame->linesize[2];
-            out.plane[0] =
-                QByteArray(reinterpret_cast<const char*>(frame->data[0]), frame->linesize[0] * h);
-            out.plane[1] = QByteArray(reinterpret_cast<const char*>(frame->data[1]),
-                                      frame->linesize[1] * chromaH);
-            out.plane[2] = QByteArray(reinterpret_cast<const char*>(frame->data[2]),
-                                      frame->linesize[2] * chromaH);
-            av_frame_free(&frame);
+            out.stride[0] = pitch;
+            out.stride[1] = pitch;
+            out.plane[0] = QByteArray(reinterpret_cast<const char*>(yPlane), pitch * h);
+            out.plane[1] = QByteArray(reinterpret_cast<const char*>(uvPlane), pitch * chromaH);
         }
-    } else if (target == FramePixelFormat::Nv12) {
-        out.format = FramePixelFormat::Nv12;
-        out.width = w;
-        out.height = h;
-        out.stride[0] = pitch;
-        out.stride[1] = pitch;
-        out.plane[0] = QByteArray(reinterpret_cast<const char*>(yPlane), pitch * h);
-        out.plane[1] = QByteArray(reinterpret_cast<const char*>(uvPlane), pitch * chromaH);
-    }
 
-    ctx->Unmap(readable.Get(), 0);
-    if (out.isValid()) {
-        gpuRecordFrameReadToCpuReadback();
-        if (m_renderFence && m_surface) {
-            const uint64_t fenceValue = m_renderFence->signal();
-            gpuRetainSurfaceUntilFenceRetired(m_surface, m_renderFence, fenceValue);
+        ctx->Unmap(readable.Get(), 0);
+        if (out.isValid()) {
+            gpuRecordFrameReadToCpuReadback();
+            if (m_renderFence && m_surface) {
+                GpuRetireRegistry registry;
+                GpuOpScope operation(m_renderFence, registry);
+                operation.track(m_surface);
+                (void) operation.submit([] { return true; });
+            }
+            m_cpuCache.insert(int(target), out);
         }
-        m_cpuCache.insert(int(target), out);
-    }
-    return out;
+        return out;
+    });
 }
 
 CpuPlanes D3D11IGpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {

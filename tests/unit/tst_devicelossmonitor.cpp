@@ -8,6 +8,17 @@
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpugeneration.h"
 
+#include <thread>
+
+#ifdef OLR_UNIT_TEST
+struct GpuDeviceLossMonitorTestAuthority {
+    static uint64_t publish() {
+        return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason);
+    }
+};
+#endif
+
 class TestDeviceLossMonitor : public QObject {
     Q_OBJECT
 private slots:
@@ -15,8 +26,9 @@ private slots:
     void recordLossIsIdempotentUntilRebuildClearsLatch();
     void consumeLossEventDrainsWithoutClearingLatch();
     void clearForRebuildClearsLatchKeepsGeneration();
-    void delayedRealLossMarkCannotCrossEpochBoundary();
-    void realLossMarkRejectsMismatchedGeneration();
+    void injectedLossRemainsTokenlessAcrossEpochs();
+    void realLossPublicationIsAtomicWithEpoch();
+    void concurrentPublishAndClearRemainConsistent();
     void resetReturnsToPristine();
 };
 
@@ -73,57 +85,48 @@ void TestDeviceLossMonitor::clearForRebuildClearsLatchKeepsGeneration() {
              genAfterLoss); // dead surfaces stay stale
 }
 
-void TestDeviceLossMonitor::delayedRealLossMarkCannotCrossEpochBoundary() {
-#if defined(_WIN32) || defined(__APPLE__)
+void TestDeviceLossMonitor::injectedLossRemainsTokenlessAcrossEpochs() {
     auto& m = GpuDeviceLossMonitor::instance();
     m.reset();
-    const uint64_t generation = m.recordLoss();
-#ifdef _WIN32
-    const DeadDeviceToken token = mintDeadDeviceTokenFromDxgi(-1, generation);
-#else
-    const DeadDeviceToken token = mintDeadDeviceTokenFromFrameOp(generation);
-#endif
+    m.recordLoss();
+    QVERIFY(!m.realLossToken().has_value());
 
     m.clearForRebuild();
-    m.markRealDeviceLoss(token);
-
     QVERIFY(!m.isLost());
     QVERIFY(!m.realLossToken().has_value());
 
-    const uint64_t resetGeneration = m.recordLoss();
-#ifdef _WIN32
-    const DeadDeviceToken resetToken = mintDeadDeviceTokenFromDxgi(-1, resetGeneration);
-#else
-    const DeadDeviceToken resetToken = mintDeadDeviceTokenFromFrameOp(resetGeneration);
-#endif
+    m.recordLoss();
+    QVERIFY(!m.realLossToken().has_value());
     m.reset();
-    m.markRealDeviceLoss(resetToken);
-
     QVERIFY(!m.isLost());
     QVERIFY(!m.realLossToken().has_value());
-#else
-    QSKIP("driver-authoritative token mints are backend-local");
-#endif
 }
 
-void TestDeviceLossMonitor::realLossMarkRejectsMismatchedGeneration() {
-#if defined(_WIN32) || defined(__APPLE__)
-    auto& m = GpuDeviceLossMonitor::instance();
-    m.reset();
-    const uint64_t generation = m.recordLoss();
-#ifdef _WIN32
-    const DeadDeviceToken token = mintDeadDeviceTokenFromDxgi(-1, generation + 1);
-#else
-    const DeadDeviceToken token = mintDeadDeviceTokenFromFrameOp(generation + 1);
-#endif
+void TestDeviceLossMonitor::realLossPublicationIsAtomicWithEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish();
 
-    m.markRealDeviceLoss(token);
+    QVERIFY(monitor.isLost());
+    const auto token = monitor.realLossToken();
+    QVERIFY(token.has_value());
+    QCOMPARE(token->observedGeneration(), generation);
+}
 
-    QVERIFY(m.isLost());
-    QVERIFY(!m.realLossToken().has_value());
-#else
-    QSKIP("driver-authoritative token mints are backend-local");
-#endif
+void TestDeviceLossMonitor::concurrentPublishAndClearRemainConsistent() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    for (int iteration = 0; iteration < 200; ++iteration) {
+        monitor.reset();
+        std::thread publish([] { GpuDeviceLossMonitorTestAuthority::publish(); });
+        std::thread clear([&monitor] { monitor.clearForRebuild(); });
+        publish.join();
+        clear.join();
+
+        const bool lost = monitor.isLost();
+        const auto token = monitor.realLossToken();
+        QCOMPARE(token.has_value(), lost);
+        if (token) QVERIFY(token->observedGeneration() > 0);
+    }
 }
 
 void TestDeviceLossMonitor::resetReturnsToPristine() {
