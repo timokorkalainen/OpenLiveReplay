@@ -2,6 +2,7 @@
 #include "recorder_engine/codec/avcc.h"
 #include "recorder_engine/codec/colorvui.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 
 #ifdef __APPLE__
 
@@ -422,7 +423,13 @@ public:
             if (error) *error = QStringLiteral("encodeSurface: null/invalid surface");
             return false;
         }
-        auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+        // Synchronous handle access via the header-only lease (this TU does not link
+        // playback/gpu): the submit below hands VideoToolbox its own retained
+        // CVPixelBuffer, so the IOSurface backing outlives this call independently.
+        GpuSyncReadScope readScope;
+        const GpuReadLease lease = readScope.read(surface);
+        auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
+        readScope.complete();
         if (!ioSurface) {
             if (error) *error = QStringLiteral("encodeSurface: surface is not IOSurface-backed");
             return false;

@@ -7,6 +7,7 @@
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/formatcanon.h"
 
 #include <CoreVideo/CoreVideo.h>
@@ -112,7 +113,11 @@ std::shared_ptr<GpuSurface> uploadFrameToNv12Surface(const FrameHandle& frame) {
     auto surface = makeAppleNv12Surface(nv12.width, nv12.height);
     if (!surface || !surface->isValid()) return nullptr;
 
-    auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    // Synchronous handle access: the CPU->surface copy below completes before return.
+    GpuSyncReadScope readScope;
+    const GpuReadLease lease = readScope.read(surface);
+    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
+    readScope.complete();
     if (!ioSurface) return nullptr;
 
     CVPixelBufferRef pb = nullptr;
@@ -187,7 +192,12 @@ private:
 
 CVPixelBufferRef makePixelBufferWrapper(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface || !surface->isValid()) return nullptr;
-    auto ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    // Synchronous handle access: CVPixelBufferCreateWithIOSurface takes its own ref on
+    // the IOSurface, which then carries the backing forward for the compose render.
+    GpuSyncReadScope readScope;
+    const GpuReadLease lease = readScope.read(surface);
+    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
+    readScope.complete();
     if (!ioSurface) return nullptr;
 
     CVPixelBufferRef pb = nullptr;

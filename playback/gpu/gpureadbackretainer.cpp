@@ -61,3 +61,29 @@ qsizetype gpuPendingReadbackRetainCount() {
     drainCompletedReadbackRetainsLocked();
     return readbackRetains().size();
 }
+
+qsizetype gpuAbandonAllReadbackRetains(const DeadDeviceToken& deadDevice) {
+    (void) deadDevice; // presence is the compile-time proof the device is truly dead
+    QMutexLocker locker(&readbackRetainMutex());
+    const qsizetype dropped = readbackRetains().size();
+    readbackRetains().clear();
+    return dropped;
+}
+
+int gpuDrainReadbackRetainsWithBoundedWait(int perFenceTimeoutMs) {
+    QMutexLocker locker(&readbackRetainMutex());
+    auto& retains = readbackRetains();
+    QVector<ReadbackRetain> pending;
+    int released = 0;
+    for (ReadbackRetain& retain : retains) {
+        bool retired = !retain.surface || !retain.fence || retain.fenceValue == 0 ||
+                       retain.fence->completedValue() >= retain.fenceValue;
+        if (!retired) retired = retain.fence->wait(retain.fenceValue, perFenceTimeoutMs);
+        if (retired)
+            ++released;
+        else
+            pending.append(std::move(retain));
+    }
+    retains = std::move(pending);
+    return released;
+}

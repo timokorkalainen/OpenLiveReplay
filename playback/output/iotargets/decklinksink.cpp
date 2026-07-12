@@ -19,7 +19,7 @@ bool hasValidNativeGpuSurface(const FrameHandle& frame) {
     }
     const IFrameData* data = frame.data();
     GpuSurface* surface = data ? data->gpuSurface() : nullptr;
-    return surface && surface->isValid() && surface->nativeHandle();
+    return surface && surface->isValid() && surface->hasNativeBacking();
 }
 
 bool waitForNativeGpuProducer(const FrameHandle& frame) {
