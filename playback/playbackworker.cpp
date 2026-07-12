@@ -3395,6 +3395,18 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
 #endif
                 m_committedGeneration.store(startedSeekGeneration, std::memory_order_release);
                 if (m_outputCache) publishOutputCacheLocked();
+                // F2 (Challenge 1, H2): reset the play epoch INSIDE this commit's
+                // m_bufferMutex critical section, so no output tick can snapshot the
+                // freshly-committed playhead with the gate open (committedGen ==
+                // seekGen) yet still sample the STALE epoch. makeOutputSnapshot takes
+                // m_bufferMutex, so the output tick cannot run between the commit
+                // stores above and this reset. Deadlock-free on the worker thread:
+                // resetPlayEpoch's waitForDispatchIdle only blocks on dispatchTick,
+                // which runs on the already-captured snapshot without re-taking
+                // m_bufferMutex/m_mutex. Lock order m_mutex -> m_bufferMutex ->
+                // m_outputRuntimeMutex -> OutputRuntime::m_mutex matches the
+                // established device-loss order.
+                resetOutputPlayEpoch();
             }
 
             resetDedup();
@@ -3454,7 +3466,8 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
     if (operatorTransaction)
         refreshPreviewAfterSeekCommit();
     else
-        refreshOutputAfterSeekCommit();
+        // Epoch already reset in-commit (F2); skip the redundant post-commit reset.
+        refreshOutputAfterSeekCommit(/*resetPlayEpoch=*/false);
     const qint64 refreshNs = traceLatency ? refreshTimer.nsecsElapsed() : 0;
 
 #ifdef OLR_GPU_PIPELINE_BUILD
