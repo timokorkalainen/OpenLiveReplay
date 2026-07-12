@@ -3132,6 +3132,16 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         if (!committed) return;
         // Re-anchor and publish after leaving m_mutex: dispatchImmediate snapshots the
         // output cache and must not run under the seek-state lock.
+        //
+        // NOTE (Challenge 1, H2 follow-up): unlike the full reposition commit, this
+        // reuse fast-path commits the playhead/generation under m_mutex ONLY and
+        // re-anchors AFTER the commit (below), so it retains an H2-shaped
+        // commit-to-reset gap (F1's config bump still applies via
+        // refreshOutputAfterSeekCommit, so H1 is covered; only H2 remains). Do NOT
+        // copy the full-path F2 fix by resetting in-commit under m_mutex:
+        // makeOutputSnapshot synchronizes on m_bufferMutex (not m_mutex), so an
+        // m_mutex-only in-commit reset would NOT close the gap. A correct fix must
+        // put the commit stores + epoch reset under m_bufferMutex.
         const bool operatorTransaction = hasOperatorSeekTransaction(startedSeekGeneration);
         if (operatorTransaction) {
             const OutputDispatchReport pgmReport = dispatchPgmAfterSeekCommit(target);
@@ -3403,9 +3413,11 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                 // stores above and this reset. Deadlock-free on the worker thread:
                 // resetPlayEpoch's waitForDispatchIdle only blocks on dispatchTick,
                 // which runs on the already-captured snapshot without re-taking
-                // m_bufferMutex/m_mutex. Lock order m_mutex -> m_bufferMutex ->
-                // m_outputRuntimeMutex -> OutputRuntime::m_mutex matches the
-                // established device-loss order.
+                // m_bufferMutex/m_mutex. The reset-under-m_bufferMutex shape mirrors
+                // the armed-cut fire (maybeFireScheduledCut); the new
+                // m_bufferMutex -> m_outputRuntimeMutex -> OutputRuntime::m_mutex
+                // sub-order has no reverse nesting because makeOutputSnapshot
+                // releases the runtime locks BEFORE it takes m_bufferMutex.
                 resetOutputPlayEpoch();
             }
 
