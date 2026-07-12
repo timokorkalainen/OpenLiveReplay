@@ -221,6 +221,10 @@ bool GpuRhiContext::invokeOnRenderThread(const std::function<void(QRhi*)>& job) 
     return m_impl->thread.invoke([&] { job(m_impl->thread.rhi); });
 }
 
+void GpuRhiContext::presentOnMainThread(const std::function<void()>& block) {
+    if (block) block();
+}
+
 bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
