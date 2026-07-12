@@ -637,13 +637,16 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(surface);
     auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    readScope.complete();
-    if (!ioSurface) return result;
+    if (!ioSurface) {
+        readScope.complete();
+        return result;
+    }
 
     CVPixelBufferRef pb = nullptr;
     if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb) !=
             kCVReturnSuccess ||
         !pb) {
+        readScope.complete();
         return result;
     }
 
@@ -722,6 +725,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
         }
     });
     CVPixelBufferRelease(pb);
+    readScope.complete();
     if (!invoked) return CpuPlanes{};
     return result;
 }

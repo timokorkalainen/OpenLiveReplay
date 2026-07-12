@@ -9,6 +9,7 @@
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "recorder_engine/codec/gpuencodepump.h"
 #include "recorder_engine/ingest/gpudecodedframe.h"
 #include "recorder_engine/streamworker.h"
@@ -363,10 +364,13 @@ void TestStreamWorkerGpuEncode::gpuDecodedFrameHelperWrapsAppleSurface() {
     auto surface = makeAppleNv12Surface(16, 16);
     if (!surface) QSKIP("could not allocate an IOSurface-backed NV12 surface");
 
-    auto* ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    auto* ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
     CVPixelBufferRef pixelBuffer = nullptr;
     const CVReturn rc =
         CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+    scope.complete();
     if (rc != kCVReturnSuccess || !pixelBuffer) {
         QSKIP("could not create a CVPixelBuffer wrapper for IOSurface");
     }
@@ -395,10 +399,13 @@ void TestStreamWorkerGpuEncode::gpuDecodedFrameHelperChargesIngestWrap() {
     if (!surface) QSKIP("could not allocate an IOSurface-backed NV12 surface");
     const qint64 bytes = gpuSurfaceBytes(*surface);
 
-    auto* ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    auto* ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
     CVPixelBufferRef pixelBuffer = nullptr;
     const CVReturn rc =
         CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+    scope.complete();
     if (rc != kCVReturnSuccess || !pixelBuffer) {
         QSKIP("could not create a CVPixelBuffer wrapper for IOSurface");
     }
@@ -427,10 +434,13 @@ void TestStreamWorkerGpuEncode::gpuEncodeImportChargesRecorderWrap() {
     if (!surface) QSKIP("could not allocate an IOSurface-backed NV12 surface");
     const qint64 bytes = gpuSurfaceBytes(*surface);
 
-    auto* ioSurface = static_cast<IOSurfaceRef>(surface->nativeHandle());
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    auto* ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
     CVPixelBufferRef pixelBuffer = nullptr;
     const CVReturn rc =
         CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+    scope.complete();
     if (rc != kCVReturnSuccess || !pixelBuffer) {
         QSKIP("could not create a CVPixelBuffer wrapper for IOSurface");
     }

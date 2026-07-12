@@ -285,13 +285,16 @@ CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, Fram
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(surface);
     auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    readScope.complete();
-    if (!ioSurface) return CpuPlanes{};
+    if (!ioSurface) {
+        readScope.complete();
+        return CpuPlanes{};
+    }
 
     CVPixelBufferRef pb = nullptr;
     if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb) !=
             kCVReturnSuccess ||
         !pb) {
+        readScope.complete();
         return CpuPlanes{};
     }
 
@@ -315,6 +318,7 @@ CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, Fram
     }
 
     CVPixelBufferRelease(pb);
+    readScope.complete();
     return result;
 }
 

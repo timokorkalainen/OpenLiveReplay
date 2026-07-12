@@ -31,6 +31,10 @@ uint64_t GpuDeviceLossMonitor::recordLoss() {
 
 void GpuDeviceLossMonitor::markRealDeviceLoss(const DeadDeviceToken& token) {
     std::lock_guard<std::mutex> lock(m_epochMutex);
+    if (!m_lost.load(std::memory_order_acquire) ||
+        token.observedGeneration() != m_lossGeneration.load(std::memory_order_acquire)) {
+        return;
+    }
     if (!m_realLossToken.has_value()) m_realLossToken = token; // first writer wins in-epoch
 }
 

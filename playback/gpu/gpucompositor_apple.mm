@@ -117,16 +117,22 @@ std::shared_ptr<GpuSurface> uploadFrameToNv12Surface(const FrameHandle& frame) {
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(surface);
     auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    readScope.complete();
-    if (!ioSurface) return nullptr;
+    if (!ioSurface) {
+        readScope.complete();
+        return nullptr;
+    }
 
     CVPixelBufferRef pb = nullptr;
     const CVReturn created =
         CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb);
-    if (created != kCVReturnSuccess || !pb) return nullptr;
+    if (created != kCVReturnSuccess || !pb) {
+        readScope.complete();
+        return nullptr;
+    }
 
     const bool copied = copyNv12ToPixelBuffer(nv12, pb);
     CVPixelBufferRelease(pb);
+    readScope.complete();
     return copied ? surface : nullptr;
 }
 
@@ -197,12 +203,15 @@ CVPixelBufferRef makePixelBufferWrapper(const std::shared_ptr<GpuSurface>& surfa
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(surface);
     auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    readScope.complete();
-    if (!ioSurface) return nullptr;
+    if (!ioSurface) {
+        readScope.complete();
+        return nullptr;
+    }
 
     CVPixelBufferRef pb = nullptr;
     const CVReturn created =
         CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb);
+    readScope.complete();
     return created == kCVReturnSuccess ? pb : nullptr;
 }
 

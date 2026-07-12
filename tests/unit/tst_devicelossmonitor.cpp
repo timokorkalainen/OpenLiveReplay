@@ -15,6 +15,8 @@ private slots:
     void recordLossIsIdempotentUntilRebuildClearsLatch();
     void consumeLossEventDrainsWithoutClearingLatch();
     void clearForRebuildClearsLatchKeepsGeneration();
+    void delayedRealLossMarkCannotCrossEpochBoundary();
+    void realLossMarkRejectsMismatchedGeneration();
     void resetReturnsToPristine();
 };
 
@@ -69,6 +71,59 @@ void TestDeviceLossMonitor::clearForRebuildClearsLatchKeepsGeneration() {
     QVERIFY(!m.isLost()); // GPU path may resume
     QCOMPARE(GpuGenerationCounter::instance().current(),
              genAfterLoss); // dead surfaces stay stale
+}
+
+void TestDeviceLossMonitor::delayedRealLossMarkCannotCrossEpochBoundary() {
+#if defined(_WIN32) || defined(__APPLE__)
+    auto& m = GpuDeviceLossMonitor::instance();
+    m.reset();
+    const uint64_t generation = m.recordLoss();
+#ifdef _WIN32
+    const DeadDeviceToken token = mintDeadDeviceTokenFromDxgi(-1, generation);
+#else
+    const DeadDeviceToken token = mintDeadDeviceTokenFromFrameOp(generation);
+#endif
+
+    m.clearForRebuild();
+    m.markRealDeviceLoss(token);
+
+    QVERIFY(!m.isLost());
+    QVERIFY(!m.realLossToken().has_value());
+
+    const uint64_t resetGeneration = m.recordLoss();
+#ifdef _WIN32
+    const DeadDeviceToken resetToken = mintDeadDeviceTokenFromDxgi(-1, resetGeneration);
+#else
+    const DeadDeviceToken resetToken = mintDeadDeviceTokenFromFrameOp(resetGeneration);
+#endif
+    m.reset();
+    m.markRealDeviceLoss(resetToken);
+
+    QVERIFY(!m.isLost());
+    QVERIFY(!m.realLossToken().has_value());
+#else
+    QSKIP("driver-authoritative token mints are backend-local");
+#endif
+}
+
+void TestDeviceLossMonitor::realLossMarkRejectsMismatchedGeneration() {
+#if defined(_WIN32) || defined(__APPLE__)
+    auto& m = GpuDeviceLossMonitor::instance();
+    m.reset();
+    const uint64_t generation = m.recordLoss();
+#ifdef _WIN32
+    const DeadDeviceToken token = mintDeadDeviceTokenFromDxgi(-1, generation + 1);
+#else
+    const DeadDeviceToken token = mintDeadDeviceTokenFromFrameOp(generation + 1);
+#endif
+
+    m.markRealDeviceLoss(token);
+
+    QVERIFY(m.isLost());
+    QVERIFY(!m.realLossToken().has_value());
+#else
+    QSKIP("driver-authoritative token mints are backend-local");
+#endif
 }
 
 void TestDeviceLossMonitor::resetReturnsToPristine() {
