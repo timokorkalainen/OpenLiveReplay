@@ -8,6 +8,12 @@
 #include <mutex>
 #include <optional>
 
+struct AppleDeviceLossAuthority;
+struct DxgiDeviceLossAuthority;
+#ifdef OLR_UNIT_TEST
+struct GpuDeviceLossMonitorTestAuthority;
+#endif
+
 // Process-wide GPU device-loss latch. A loss is a hard-down for a live tool:
 // recordLoss() bumps GpuGenerationCounter so every FrameHandle stamped under
 // the dead device is stale, and consumeLossEvent() drains telemetry events.
@@ -30,7 +36,6 @@ public:
     // token is ever stored for it — the no-wait free can never run on a live device.
     // A delayed/stale mark is rejected unless its observed generation matches the
     // currently latched loss epoch.
-    void markRealDeviceLoss(const DeadDeviceToken& token);
     std::optional<DeadDeviceToken> realLossToken() const;
 
     bool consumeLossEvent();
@@ -39,6 +44,13 @@ public:
 
 private:
     GpuDeviceLossMonitor() = default;
+    friend struct AppleDeviceLossAuthority;
+    friend struct DxgiDeviceLossAuthority;
+#ifdef OLR_UNIT_TEST
+    friend struct GpuDeviceLossMonitorTestAuthority;
+#endif
+
+    uint64_t publishRealDeviceLoss(DeadDeviceToken::Provenance provenance);
 
     std::atomic<bool> m_lost{false};
     std::atomic<uint64_t> m_lossCount{0};

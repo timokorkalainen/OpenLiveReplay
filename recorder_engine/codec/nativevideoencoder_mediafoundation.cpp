@@ -4,6 +4,7 @@
 #include "recorder_engine/codec/mediafoundationasynclifecycle.h"
 #include "recorder_engine/codec/mediafoundationh264policy.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/win/d3d11gpusurface.h"
 #include "recorder_engine/mediafoundationruntime.h"
 
@@ -50,6 +51,24 @@ extern "C" {
 }
 
 using Microsoft::WRL::ComPtr;
+
+struct D3D11MediaFoundationBackingAccess {
+    static D3D11GpuSurface* surface(const GpuReadLease& lease) {
+        return dynamic_cast<D3D11GpuSurface*>(lease.m_surface);
+    }
+    static ID3D11Texture2D* texture(const GpuReadLease& lease) {
+        auto* d3d = surface(lease);
+        return d3d ? d3d->texture() : nullptr;
+    }
+    static ID3D11Device* device(const GpuReadLease& lease) {
+        auto* d3d = surface(lease);
+        return d3d ? d3d->device() : nullptr;
+    }
+    static UINT subresource(const GpuReadLease& lease) {
+        auto* d3d = surface(lease);
+        return d3d ? d3d->subresource() : 0;
+    }
+};
 
 namespace {
 
@@ -996,29 +1015,38 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
         return false;
     }
 
-    auto* d3dSurface = dynamic_cast<D3D11GpuSurface*>(surface);
-    if (!d3dSurface || !d3dSurface->texture()) {
-        if (error) {
-            *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");
-        }
-        return false;
-    }
-    if (!configureD3DManagerForSurface(d3dSurface->device(), error)) return false;
-
     ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), d3dSurface->texture(),
-                                           d3dSurface->subresource(), FALSE, &buffer);
-    if (FAILED(hr)) {
-        if (error) {
-            *error = hrMessage(
-                QStringLiteral("Media Foundation DXGI surface buffer creation failed"), hr);
+    GpuSyncReadScope readScope;
+    const bool wrapped = readScope.read(surface, [&](const GpuReadLease& lease) {
+        ID3D11Texture2D* texture = D3D11MediaFoundationBackingAccess::texture(lease);
+        if (!texture) {
+            if (error) {
+                *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");
+            }
+            return false;
         }
-        return false;
-    }
+        if (!configureD3DManagerForSurface(D3D11MediaFoundationBackingAccess::device(lease),
+                                           error)) {
+            return false;
+        }
+
+        const HRESULT wrapHr = MFCreateDXGISurfaceBuffer(
+            __uuidof(ID3D11Texture2D), texture,
+            D3D11MediaFoundationBackingAccess::subresource(lease), FALSE, &buffer);
+        if (FAILED(wrapHr)) {
+            if (error) {
+                *error = hrMessage(
+                    QStringLiteral("Media Foundation DXGI surface buffer creation failed"), wrapHr);
+            }
+            return false;
+        }
+        return true;
+    });
+    if (!wrapped) return false;
 
     const LONGLONG stampedTime = m_nextSampleTime;
     ComPtr<IMFSample> createdSample;
-    hr = MFCreateSample(&createdSample);
+    HRESULT hr = MFCreateSample(&createdSample);
     if (SUCCEEDED(hr)) {
         hr = createdSample->AddBuffer(buffer.Get());
     }

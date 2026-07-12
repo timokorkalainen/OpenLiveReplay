@@ -1,118 +1,98 @@
 #ifndef OLR_GPUSURFACELEASE_H
 #define OLR_GPUSURFACELEASE_H
 
-// Type-state protocol that makes "the raw GPU handle is reachable only inside a
-// bounded read scope" UNREPRESENTABLE to break: GpuSurface::nativeHandle() is
-// protected (gpusurface.h) with GpuReadLease as its sole friend, and the ONLY route
-// to a lease is a scope. A new op site that writes surface->nativeHandle() directly
-// no longer compiles (negative-compile test, tests/gpu/negcompile).
-//
-// Shared header, like gpusurface.h: exposes no platform SDK types and is HEADER-ONLY.
-// It is included by BOTH the playback GPU library AND the record-side VideoToolbox
-// encoder, which does NOT link the playback GPU library (see gpusurface.h:22-25), so
-// the encoder can lease a handle with no link dependency.
-//
-// Scope of this file (Challenge 3, part 1): the handle-access gate + the device-loss
-// provenance token. Every production handle access is SYNCHRONOUS (CPU readback
-// returns real pixels; the compositor wraps the IOSurface synchronously; the encoder
-// submit hands VideoToolbox its own retained buffer), so GpuSyncReadScope covers them
-// all and the existing render-keep-alive retains (gpuRetainSurfaceUntilFenceRetired,
-// public) are untouched. A fenced RAII scope that also makes the render keep-alive a
-// compile obligation is a natural follow-up now that these primitives exist.
-
 #include "playback/gpu/gpusurface.h"
 
-#include <cassert>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <type_traits>
 #include <utility>
 
-// Provenance-bound proof that the device is REALLY dead. Constructible ONLY by the
-// two driver-authoritative observation sites (the friend mints, defined only in
-// gpurhicontext_win.cpp / gpurhicontext_apple.mm). The test-injection path cannot
-// mint one, so the no-wait free (gpuAbandonAllReadbackRetains) can never run on a
-// live device. Freely copyable once minted so it can be carried through the loss
-// latch (GpuDeviceLossMonitor) to the recovery site.
+class GpuDeviceLossMonitor;
+struct AppleSurfaceBackingAccess;
+struct D3D11ImportBackingAccess;
+struct D3D11MediaFoundationBackingAccess;
+struct VideoToolboxBackingAccess;
+
+// Proof that a driver-authoritative observation declared the active GPU device dead.
+// Only GpuDeviceLossMonitor can construct it, and only backend-local authority types
+// can ask the monitor to publish one. Injected loss therefore remains tokenless.
 class DeadDeviceToken {
 public:
     enum class Provenance : uint8_t {
-        DxgiDeviceRemovedReason, // Windows: FAILED(GetDeviceRemovedReason())
-        RhiFrameOpDeviceLost,    // Apple/RHI: FrameOpDeviceLost / rhi->isDeviceLost()
+        DxgiDeviceRemovedReason,
+        RhiFrameOpDeviceLost,
     };
-    Provenance provenance() const { return m_p; }
-    uint64_t observedGeneration() const { return m_gen; }
+
+    Provenance provenance() const { return m_provenance; }
+    uint64_t observedGeneration() const { return m_generation; }
 
 private:
-    DeadDeviceToken(Provenance p, uint64_t gen) : m_p(p), m_gen(gen) {}
-    // Defined ONLY at the driver-authoritative detection branch on each backend.
-    friend DeadDeviceToken mintDeadDeviceTokenFromDxgi(long failedHr, uint64_t gen);
-    friend DeadDeviceToken mintDeadDeviceTokenFromFrameOp(uint64_t gen);
-    Provenance m_p;
-    uint64_t m_gen;
+    friend class GpuDeviceLossMonitor;
+    DeadDeviceToken(Provenance provenance, uint64_t generation)
+        : m_provenance(provenance), m_generation(generation) {}
+
+    Provenance m_provenance;
+    uint64_t m_generation;
 };
 
-// Namespace-scope declarations of the two mints (a friend declaration alone is not
-// found by ordinary lookup). DEFINED only in the platform detection TUs:
-// mintDeadDeviceTokenFromDxgi in gpurhicontext_win.cpp, mintDeadDeviceTokenFromFrameOp
-// in gpurhicontext_apple.mm. No other TU can construct a DeadDeviceToken.
-DeadDeviceToken mintDeadDeviceTokenFromDxgi(long failedHr, uint64_t gen);
-DeadDeviceToken mintDeadDeviceTokenFromFrameOp(uint64_t gen);
-
-// Move-only view of a surface's native handle INSIDE one read scope. The ONLY route
-// to nativeHandle() now that GpuSurface makes it protected. A friend of GpuSurface;
-// header-only so record-side code uses it without linking playback/gpu.
-class GpuReadLease {
+// A non-escapable view used only while GpuSyncReadScope is executing its callback.
+// Ordinary callers can inspect safe metadata but cannot copy, move, or extract the
+// backing. Named platform adapter authorities are defined only in their backend TUs.
+class GpuReadLease final {
 public:
-    GpuReadLease(GpuReadLease&&) noexcept = default;
-    GpuReadLease& operator=(GpuReadLease&&) noexcept = default;
     GpuReadLease(const GpuReadLease&) = delete;
     GpuReadLease& operator=(const GpuReadLease&) = delete;
+    GpuReadLease(GpuReadLease&&) = delete;
+    GpuReadLease& operator=(GpuReadLease&&) = delete;
 
-    void* nativeHandle() const { return m_surface ? m_surface->nativeHandle() : nullptr; }
     GpuSurfaceDesc desc() const { return m_surface ? m_surface->desc() : GpuSurfaceDesc{}; }
     bool valid() const { return m_surface && m_surface->isValid(); }
 
 private:
     friend class GpuSyncReadScope;
-    explicit GpuReadLease(std::shared_ptr<GpuSurface> s) : m_surface(std::move(s)) {}
-    std::shared_ptr<GpuSurface> m_surface;
+    friend struct AppleSurfaceBackingAccess;
+    friend struct D3D11ImportBackingAccess;
+    friend struct D3D11MediaFoundationBackingAccess;
+    friend struct VideoToolboxBackingAccess;
+
+    explicit GpuReadLease(std::shared_ptr<GpuSurface> surface)
+        : m_surface(surface.get()), m_owner(std::move(surface)) {}
+    explicit GpuReadLease(GpuSurface* surface) : m_surface(surface) {}
+
+    void* nativeHandleForBackend() const { return m_surface ? m_surface->nativeHandle() : nullptr; }
+
+    GpuSurface* m_surface = nullptr;
+    std::shared_ptr<GpuSurface> m_owner;
 };
 
-// SYNCHRONOUS read scope, typed. For paths whose GPU read provably completes before
-// control returns: the record-side VideoToolbox encodeSurface (submit accepts the
-// IOSurface), the Apple CPU readbacks, and the compositor IOSurface wrapping. No
-// fence — the read is done when the scope ends. The destructor asserts complete() was
-// called for any leased surface (the wrapped helper calls it after the synchronous op
-// returns), so "the read finished before the surface was released" is a checked
-// obligation, not an unwritten assumption.
-class GpuSyncReadScope {
+// Executes synchronous native access inside an inline callback. Callback return is
+// the completion boundary; exceptions and early returns destroy the lease naturally.
+// No std::function, allocation, or aliasing shared_ptr is introduced for raw owners.
+class GpuSyncReadScope final {
 public:
     GpuSyncReadScope() = default;
     GpuSyncReadScope(const GpuSyncReadScope&) = delete;
     GpuSyncReadScope& operator=(const GpuSyncReadScope&) = delete;
-    ~GpuSyncReadScope() {
-        assert((m_leased == 0 || m_completed) &&
-               "GpuSyncReadScope: complete() not called before a leased surface was released");
+
+    template <typename Fn>
+    decltype(auto) read(std::shared_ptr<GpuSurface> surface, Fn&& fn) const {
+        GpuReadLease lease(std::move(surface));
+        return std::invoke(std::forward<Fn>(fn), static_cast<const GpuReadLease&>(lease));
     }
 
-    GpuReadLease read(std::shared_ptr<GpuSurface> s) {
-        ++m_leased;
-        return GpuReadLease(std::move(s));
+    template <typename Surface, typename Fn,
+              typename = std::enable_if_t<std::is_base_of_v<GpuSurface, Surface>>>
+    decltype(auto) read(const std::shared_ptr<Surface>& surface, Fn&& fn) const {
+        return read(std::static_pointer_cast<GpuSurface>(surface), std::forward<Fn>(fn));
     }
-    // Non-owning overload for callers that hold a raw GpuSurface* (the record-side
-    // encoder). Safe because the read is synchronous and the caller owns the surface
-    // for the scope's lifetime; the lease keeps a non-owning alias only.
-    GpuReadLease read(GpuSurface* s) {
-        ++m_leased;
-        return GpuReadLease(std::shared_ptr<GpuSurface>(s, [](GpuSurface*) {}));
-    }
-    // Called by the wrapped synchronous helper once the GPU read has provably
-    // completed (download returned / encode submission accepted the surface).
-    void complete() { m_completed = true; }
 
-private:
-    int m_leased = 0;
-    bool m_completed = false;
+    template <typename Fn>
+    decltype(auto) read(GpuSurface* surface, Fn&& fn) const {
+        GpuReadLease lease(surface);
+        return std::invoke(std::forward<Fn>(fn), static_cast<const GpuReadLease&>(lease));
+    }
 };
 
 #endif // OLR_GPUSURFACELEASE_H

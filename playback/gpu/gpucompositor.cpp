@@ -3,10 +3,11 @@
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpubudget.h"
+#include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpucompositor_platform.h"
 #include "playback/gpu/gpupipelineconfig.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/output/formatcanon.h"
 #include "playback/output/outputbusengine.h"
@@ -520,20 +521,21 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
             return FrameHandle{};
         }
 
-        bool rendered = false;
-        const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
-            rendered = renderGridWithRhi(rhi, sources, cappedFrameCount(filtered), width, height,
-                                         color, quality, surface)
-                           .rendered;
-        });
-        if (!invoked || !rendered) return FrameHandle{};
-
         std::shared_ptr<GpuFence> renderFence = m_impl->rhi->createFence();
-        if (renderFence) {
-            const uint64_t fenceValue = renderFence->signal();
-            surface->retainUntilFenceRetired(fenceValue);
-            gpuRetainSurfaceUntilFenceRetired(surface, renderFence, fenceValue);
-        }
+        if (!renderFence) return FrameHandle{};
+        GpuRetireRegistry registry;
+        GpuOpScope operation(renderFence, registry);
+        operation.track(surface);
+        bool rendered = false;
+        const bool submitted = operation.submit([&] {
+            const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
+                rendered = renderGridWithRhi(rhi, sources, cappedFrameCount(filtered), width,
+                                             height, color, quality, surface)
+                               .rendered;
+            });
+            return invoked && rendered;
+        });
+        if (!submitted) return FrameHandle{};
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);
         meta.color = color;
         return makeGpuFrameHandle(std::move(surface), m_impl->rhi, meta, std::move(renderFence),

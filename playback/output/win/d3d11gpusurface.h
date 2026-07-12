@@ -28,16 +28,17 @@ public:
     }
     bool isValid() const override { return m_texture != nullptr; }
 
-    ID3D11Texture2D* texture() const { return m_texture.Get(); }
-    UINT subresource() const { return m_subresource; }
-    ID3D11Device* device() const { return m_device.Get(); }
-
     void retainUntilFenceRetired(uint64_t fenceValue) override;
     uint64_t pendingFenceValue() const override {
         return m_pendingFence.load(std::memory_order_acquire);
     }
 
     static void setForceAllocFailureForTest(bool force);
+#ifdef OLR_UNIT_TEST
+    bool aliasesTextureForTest(ID3D11Texture2D* texture) const {
+        return m_texture.Get() == texture;
+    }
+#endif
 
 protected:
     // Lease-gated, mirroring the base (gpusurface.h). Kept protected on the
@@ -45,7 +46,13 @@ protected:
     void* nativeHandle() const override { return m_texture.Get(); }
 
 private:
+    friend struct D3D11ImportBackingAccess;
+    friend struct D3D11MediaFoundationBackingAccess;
+
     D3D11GpuSurface() = default;
+    ID3D11Texture2D* texture() const { return m_texture.Get(); }
+    UINT subresource() const { return m_subresource; }
+    ID3D11Device* device() const { return m_device.Get(); }
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_texture;

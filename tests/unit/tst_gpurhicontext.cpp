@@ -57,21 +57,8 @@ std::shared_ptr<GpuRhiContext> testContext() {
 #ifdef __APPLE__
 bool fillRgbaSurfaceBgra(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface) return false;
-    GpuSyncReadScope scope;
-    auto lease = scope.read(surface);
-    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    if (!ioSurface) {
-        scope.complete();
-        return false;
-    }
-
-    CVPixelBufferRef pb = nullptr;
-    const CVReturn rc =
-        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb);
-    scope.complete();
-    if (rc != kCVReturnSuccess || !pb) {
-        return false;
-    }
+    CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
+    if (!pb) return false;
 
     bool ok = false;
     if (CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
@@ -96,21 +83,8 @@ bool fillRgbaSurfaceBgra(const std::shared_ptr<GpuSurface>& surface) {
 
 bool fillNv12Surface(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface) return false;
-    GpuSyncReadScope scope;
-    auto lease = scope.read(surface);
-    auto ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    if (!ioSurface) {
-        scope.complete();
-        return false;
-    }
-
-    CVPixelBufferRef pb = nullptr;
-    const CVReturn rc =
-        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pb);
-    scope.complete();
-    if (rc != kCVReturnSuccess || !pb) {
-        return false;
-    }
+    CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
+    if (!pb) return false;
 
     bool ok = false;
     if (CVPixelBufferLockBaseAddress(pb, 0) == kCVReturnSuccess) {
