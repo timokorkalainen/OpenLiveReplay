@@ -348,7 +348,13 @@ private:
                                                                       uint64_t gpuGeneration) const;
     std::optional<qint64> outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
                                                                uint64_t gpuGeneration) const;
+    std::optional<qint64>
+    validatedOutputCommitPlayheadLocked(const OutputCommit& commit,
+                                        const OutputFrameCache* coverageCache) const;
     OutputCommitResult commitOutputStateLocked(const OutputCommit& commit);
+    OutputCommitResult commitFullRepositionOutputStateLocked(
+        const OutputCommit& commit, std::unique_ptr<OutputFrameCache>& liveSaved, qint64 keepFrom,
+        qint64 keepTo, qint64 keepAudioFromSample, bool sanitizeForDeviceLoss);
     bool outputCacheCoversPlayhead(int64_t playheadMs) const;
     bool pausedPlayheadNeedsWork(int64_t playheadMs);
     SeekRequestResult requestSeekTo(qint64 timestampMs, int directionHint,

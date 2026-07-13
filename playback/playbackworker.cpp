@@ -455,6 +455,33 @@ void PlaybackWorker::resetOutputPlayEpoch() {
     if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
 }
 
+std::optional<qint64>
+PlaybackWorker::validatedOutputCommitPlayheadLocked(const OutputCommit& commit,
+                                                    const OutputFrameCache* coverageCache) const {
+    if (commit.requireCurrentSeek &&
+        !CommitGate::canCommitReposition(commit.seekGeneration,
+                                         m_seekGeneration.load(std::memory_order_acquire),
+                                         m_seekTargetMs >= 0)) {
+        return std::nullopt;
+    }
+
+    qint64 committedPlayheadMs = commit.playheadMs;
+    if (m_outputFeedCount > 0) {
+        if (!coverageCache) return std::nullopt;
+        if (commit.coverageMode == OutputCoverageMode::Displayable) {
+            const std::optional<qint64> displayable = outputCacheDisplayablePlayheadInCacheLocked(
+                *coverageCache, commit.playheadMs, commit.gpuGeneration);
+            if (!displayable.has_value()) return std::nullopt;
+            committedPlayheadMs = *displayable;
+        } else if (!outputCacheCoversPlayheadInCacheLocked(*coverageCache, commit.playheadMs,
+                                                           commit.gpuGeneration,
+                                                           commit.coverageMode)) {
+            return std::nullopt;
+        }
+    }
+    return committedPlayheadMs;
+}
+
 PlaybackWorker::OutputCommitResult
 PlaybackWorker::commitOutputStateLocked(const OutputCommit& commit) {
     // Callers hold m_mutex (when current-seek validation/target clearing is used)
@@ -462,30 +489,12 @@ PlaybackWorker::commitOutputStateLocked(const OutputCommit& commit) {
     // m_outputRuntimeMutex -> OutputRuntime::m_mutex; OutputRuntime::resetPlayEpoch()
     // defers an active-dispatch reset instead of waiting for dispatch completion.
     OutputCommitResult result;
-    if (commit.requireCurrentSeek &&
-        !CommitGate::canCommitReposition(commit.seekGeneration,
-                                         m_seekGeneration.load(std::memory_order_acquire),
-                                         m_seekTargetMs >= 0)) {
-        return result;
-    }
-
     const OutputFrameCache* coverageCache =
         commit.cacheAction == OutputCacheAction::MergeStagingAndPublish ? m_stagingCache.get()
                                                                         : m_outputCache.get();
-    qint64 committedPlayheadMs = commit.playheadMs;
-    if (m_outputFeedCount > 0) {
-        if (!coverageCache) return result;
-        if (commit.coverageMode == OutputCoverageMode::Displayable) {
-            const std::optional<qint64> displayable = outputCacheDisplayablePlayheadInCacheLocked(
-                *coverageCache, commit.playheadMs, commit.gpuGeneration);
-            if (!displayable.has_value()) return result;
-            committedPlayheadMs = *displayable;
-        } else if (!outputCacheCoversPlayheadInCacheLocked(*coverageCache, commit.playheadMs,
-                                                           commit.gpuGeneration,
-                                                           commit.coverageMode)) {
-            return result;
-        }
-    }
+    const std::optional<qint64> committedPlayheadMs =
+        validatedOutputCommitPlayheadLocked(commit, coverageCache);
+    if (!committedPlayheadMs.has_value()) return result;
 
     switch (commit.cacheAction) {
     case OutputCacheAction::Keep:
@@ -509,8 +518,8 @@ PlaybackWorker::commitOutputStateLocked(const OutputCommit& commit) {
         break;
     }
 
-    m_committedPlayheadMs.store(committedPlayheadMs, std::memory_order_relaxed);
-    m_lastVisiblePlayheadMs.store(committedPlayheadMs, std::memory_order_release);
+    m_committedPlayheadMs.store(*committedPlayheadMs, std::memory_order_relaxed);
+    m_lastVisiblePlayheadMs.store(*committedPlayheadMs, std::memory_order_release);
 #ifdef OLR_GPU_PIPELINE_BUILD
     m_committedGpuGeneration.store(commit.gpuGeneration, std::memory_order_release);
 #endif
@@ -520,9 +529,54 @@ PlaybackWorker::commitOutputStateLocked(const OutputCommit& commit) {
     resetOutputPlayEpoch();
 
     result.committed = true;
-    result.committedPlayheadMs = committedPlayheadMs;
+    result.committedPlayheadMs = *committedPlayheadMs;
     result.committedGeneration = commit.seekGeneration;
     result.dispatch = commit.dispatch;
+    return result;
+}
+
+PlaybackWorker::OutputCommitResult PlaybackWorker::commitFullRepositionOutputStateLocked(
+    const OutputCommit& commit, std::unique_ptr<OutputFrameCache>& liveSaved, qint64 keepFrom,
+    qint64 keepTo, qint64 keepAudioFromSample, bool sanitizeForDeviceLoss) {
+    OutputCommitResult result;
+    if (commit.cacheAction != OutputCacheAction::MergeStagingAndPublish || !m_outputCache ||
+        !liveSaved || m_stagingCache) {
+        return result;
+    }
+
+    // The decode fill temporarily owns the staging cache in m_outputCache. Validate
+    // that exact cache before copying, sanitizing, trimming, or swapping the live cache.
+    if (!validatedOutputCommitPlayheadLocked(commit, m_outputCache.get()).has_value())
+        return result;
+
+    std::unique_ptr<OutputFrameCache> stagingSaved = std::move(m_outputCache);
+    m_outputCache = std::make_unique<OutputFrameCache>(*liveSaved);
+    m_stagingCache = std::make_unique<OutputFrameCache>(*stagingSaved);
+
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (sanitizeForDeviceLoss) {
+        sanitizeCacheForDeviceLossLocked(m_outputCache.get());
+        sanitizeCacheForDeviceLossLocked(m_stagingCache.get());
+    }
+#else
+    Q_UNUSED(sanitizeForDeviceLoss);
+#endif
+
+    OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
+    m_outputCache->trimWindow(keepFrom, keepTo, keepAudioFromSample, &evictedCacheFrames);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    collectEvictedGpuFramesLocked(evictedCacheFrames);
+#endif
+
+    result = commitOutputStateLocked(commit);
+    if (result.committed) {
+        liveSaved.reset();
+        return result;
+    }
+
+    m_outputCache.reset();
+    m_stagingCache.reset();
+    m_outputCache = std::move(stagingSaved);
     return result;
 }
 
@@ -620,9 +674,22 @@ OutputDispatchReport PlaybackWorker::dispatchPgmCommitObligation(qint64 targetMs
     OutputDispatchReport report = dispatchPgmAfterSeekCommit(targetMs);
     if (report.requiredSubmitted) return report;
 
+    bool confirmedEpochMismatch = false;
+    for (const OutputSubmittedFrame& submittedFrame : report.submittedFrames) {
+        if (submittedFrame.assignment.sourceBus == OutputBusId::pgm() &&
+            submittedFrame.assignment.kind == OutputTargetKind::Ndi && submittedFrame.submitted &&
+            !submittedFrame.identity.videoPlaceholder &&
+            submittedFrame.identity.sampledPlayheadMs != targetMs) {
+            confirmedEpochMismatch = true;
+            break;
+        }
+    }
+    if (!confirmedEpochMismatch) return report;
+
     // A scheduled tick can advance the freshly-reset epoch before the critical
-    // dispatch runs. Re-anchor only through the commit authority, then carry the
-    // newly returned retry obligation once after releasing worker/cache locks.
+    // dispatch runs. A successfully submitted non-placeholder frame at the wrong
+    // sampled playhead positively identifies that drift. Sink rejection, a missing
+    // endpoint, or ordinary submission failure cannot enter this recommit path.
     OutputCommitResult retryCommit;
     {
         QMutexLocker locker(&m_mutex);
@@ -3496,35 +3563,6 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
         if (canCommit) {
             {
                 QMutexLocker bufferLocker(&m_bufferMutex);
-                // Restore the live cache and trim its stale window before the typed
-                // commit merges the validated staging cache and publishes it.
-                if (liveSaved) {
-                    m_stagingCache = std::move(m_outputCache); // staging back
-                    m_outputCache = std::move(liveSaved);      // live restored (old frames intact)
-#ifdef OLR_GPU_PIPELINE_BUILD
-                    // Only strip GPU-backed frames when the device is actually lost:
-                    // otherwise the freshly decoded seek-prefetch window (pure GPU, not
-                    // yet read back to CPU) would be deleted here on every healthy seek.
-                    if (gpuDeviceLossPending()) {
-                        sanitizeCacheForDeviceLossLocked(m_outputCache.get());
-                        sanitizeCacheForDeviceLossLocked(m_stagingCache.get());
-                    }
-#endif
-                    OutputFrameCache::EvictedVideoFrames evictedCacheFrames;
-                    const qint64 keepFrom =
-                        (dir < 0) ? commitTarget - (windowLeadMs() + windowSlackMs())
-                                  : commitTarget - (windowTrailMs() + windowSlackMs());
-                    const qint64 keepTo = (dir < 0)
-                                              ? commitTarget + (windowTrailMs() + windowSlackMs())
-                                              : commitTarget + (windowLeadMs() + windowSlackMs());
-                    const qint64 keepAudioFromSample =
-                        qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
-                    m_outputCache->trimWindow(keepFrom, keepTo, keepAudioFromSample,
-                                              &evictedCacheFrames);
-#ifdef OLR_GPU_PIPELINE_BUILD
-                    collectEvictedGpuFramesLocked(evictedCacheFrames);
-#endif
-                }
                 uint64_t gpuGeneration = 0;
 #ifdef OLR_GPU_PIPELINE_BUILD
                 if (gpuPipelineEnabled())
@@ -3537,14 +3575,36 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                 commit.playheadMs = commitTarget;
                 commit.seekGeneration = startedSeekGeneration;
                 commit.gpuGeneration = gpuGeneration;
-                commit.cacheAction = OutputCacheAction::MergeStagingAndPublish;
+                commit.cacheAction =
+                    liveSaved ? OutputCacheAction::MergeStagingAndPublish : OutputCacheAction::Keep;
                 commit.coverageMode = commitTarget == target ? OutputCoverageMode::OperatorSeek
                                                              : OutputCoverageMode::Displayable;
                 commit.dispatch = operatorTransactionStillWaiting
                                       ? PostCommitDispatch::PgmCritical
                                       : (operatorPgmCompletedEarly ? PostCommitDispatch::Preview
                                                                    : PostCommitDispatch::Output);
-                outputCommit = commitOutputStateLocked(commit);
+                if (liveSaved) {
+                    const qint64 keepFrom =
+                        (dir < 0) ? commitTarget - (windowLeadMs() + windowSlackMs())
+                                  : commitTarget - (windowTrailMs() + windowSlackMs());
+                    const qint64 keepTo = (dir < 0)
+                                              ? commitTarget + (windowTrailMs() + windowSlackMs())
+                                              : commitTarget + (windowLeadMs() + windowSlackMs());
+                    const qint64 keepAudioFromSample =
+                        qMax<qint64>(0, keepFrom * qint64(48000) / 1000);
+                    bool sanitizeForDeviceLoss = false;
+#ifdef OLR_GPU_PIPELINE_BUILD
+                    // Only strip GPU-backed frames when the device is actually lost:
+                    // otherwise the freshly decoded seek-prefetch window (pure GPU, not
+                    // yet read back to CPU) would be deleted on every healthy seek.
+                    sanitizeForDeviceLoss = gpuDeviceLossPending();
+#endif
+                    outputCommit = commitFullRepositionOutputStateLocked(
+                        commit, liveSaved, keepFrom, keepTo, keepAudioFromSample,
+                        sanitizeForDeviceLoss);
+                } else {
+                    outputCommit = commitOutputStateLocked(commit);
+                }
             }
 
             if (outputCommit.committed) {
