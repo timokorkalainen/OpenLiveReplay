@@ -41,6 +41,16 @@ private:
     uint64_t m_pendingFence = 0;
 };
 
+class TestFence final : public GpuFence {
+public:
+    uint64_t signal() override { return ++m_value; }
+    bool wait(uint64_t value, int) override { return m_value >= value; }
+    uint64_t completedValue() const override { return m_value; }
+
+private:
+    uint64_t m_value = 0;
+};
+
 class ZeroByteSurface final : public GpuSurface {
 public:
     GpuSurfaceDesc desc() const override { return GpuSurfaceDesc{FramePixelFormat::Nv12, 0, 0}; }
@@ -324,7 +334,7 @@ void TestGpuSurfaceAllocator::headroomMintsChargedGpuHandle() {
     b.configure(c);
 
     auto surface = std::make_shared<TestSurface>();
-    auto renderFence = GpuFence::create();
+    auto renderFence = std::make_shared<TestFence>();
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 64;
@@ -355,7 +365,7 @@ void TestGpuSurfaceAllocator::customFactoryReceivesBudgetCharge() {
     b.configure(c);
 
     auto surface = std::make_shared<TestSurface>();
-    auto renderFence = GpuFence::create();
+    auto renderFence = std::make_shared<TestFence>();
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 64;

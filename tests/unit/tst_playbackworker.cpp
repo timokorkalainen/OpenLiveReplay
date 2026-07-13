@@ -1206,12 +1206,12 @@ void TestPlaybackWorker::pausedCoveredSeekDiscardsPendingOutputWithoutRewindingF
 
 void TestPlaybackWorker::operatorSeekTransactionCompletesCoveredSeekWithPgmEvidence() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1372,12 +1372,12 @@ void TestPlaybackWorker::earlyOperatorCommitCannotExposeStaleEpoch() {
 
 void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowFill() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
     transport.seek(1000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1430,12 +1430,12 @@ void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowF
 
 void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
     transport.seek(1000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     pgmSink.rejectSubmits = true;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
@@ -1569,12 +1569,12 @@ void TestPlaybackWorker::decodedPacketsDoNotRepeatMissingPgmObligation() {
 
 void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncommitted() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(5000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1620,12 +1620,12 @@ void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncomm
 
 void TestPlaybackWorker::operatorSeekTransactionAbandonedOnTimeout() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(5000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1678,12 +1678,12 @@ void TestPlaybackWorker::operatorSeekCompletionEmitsSignal() {
     // (tst_playbackworker.cpp:850) up to the runtime/sink setup, except the cache DOES
     // cover the target so the blocking path completes inline.
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1730,12 +1730,12 @@ void TestPlaybackWorker::seekToWithPgmNotifyCompletesCacheHitInline() {
     // through the non-blocking entry point: the cache-hit clause must dispatch PGM
     // and complete the transaction inline (no worker thread running here).
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1783,12 +1783,12 @@ void TestPlaybackWorker::seekToWithPgmNotifyLeavesCacheMissWaiting() {
     // uncovered: seekToWithPgmNotify must return immediately without dispatching
     // PGM, leaving the transaction registered and still waiting.
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
     transport.setPlaying(false);
 
-    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;

@@ -262,8 +262,12 @@ void TestGpuDeviceLostWorker::lostContextRebuildsFreshGpuSpine() {
     QVERIFY(worker.gpuPathActive());
     QVERIFY(worker.m_gpuRhi);
     QVERIFY(worker.m_decodeFence);
-#ifndef _WIN32
-    // Windows creates render/staging fences lazily from the D3D11 import device.
+#ifdef _WIN32
+    // The Windows render/staging fences are created lazily from the Media
+    // Foundation import device, not from the QRhi spine.
+    QVERIFY(!worker.m_renderFence);
+    QVERIFY(!worker.m_stagingFence);
+#else
     QVERIFY(worker.m_renderFence);
     QVERIFY(worker.m_stagingFence);
 #endif
@@ -281,7 +285,10 @@ void TestGpuDeviceLostWorker::lostContextRebuildsFreshGpuSpine() {
     QVERIFY(worker.m_gpuRhi != lostRhi);
     QVERIFY(!worker.m_gpuRhi->deviceLost());
     QVERIFY(worker.m_decodeFence);
-#ifndef _WIN32
+#ifdef _WIN32
+    QVERIFY(!worker.m_renderFence);
+    QVERIFY(!worker.m_stagingFence);
+#else
     QVERIFY(worker.m_renderFence);
     QVERIFY(worker.m_stagingFence);
 #endif

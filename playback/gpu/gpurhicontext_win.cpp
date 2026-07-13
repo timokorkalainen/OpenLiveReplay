@@ -152,6 +152,7 @@ public:
 
     D3DRenderThread thread;
     bool valid = false;
+    uint64_t deviceAuthorityEpoch = 0;
     std::atomic<bool> deviceLost{false};
 };
 
@@ -165,6 +166,7 @@ GpuRhiContext::~GpuRhiContext() {
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
     auto impl = std::make_unique<Impl>(D3DDeviceKind::Hardware);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -181,6 +183,7 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::createNullForTest() {
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::createWarpForTest() {
     auto impl = std::make_unique<Impl>(D3DDeviceKind::Warp);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -236,7 +239,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
         return CpuPlanes{};
     }
 
-    const uint64_t observationGeneration = GpuGenerationCounter::instance().current();
+    const uint64_t deviceAuthorityEpoch = m_impl->deviceAuthorityEpoch;
     {
         const bool invoked = m_impl->thread.invoke([&] {
             QRhi* rhi = m_impl->thread.rhi;
@@ -252,7 +255,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
                 // it to the loss latch so the worker's recovery can free held surfaces
                 // WITHOUT waiting on the (now dead) fences.
                 GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                    DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, observationGeneration);
+                    DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
                 m_impl->deviceLost.store(true, std::memory_order_release);
             }
         });

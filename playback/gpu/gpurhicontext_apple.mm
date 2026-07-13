@@ -525,6 +525,7 @@ public:
     GpuRenderThread thread;
     QRhi::Implementation backend = QRhi::Null;
     bool valid = false;
+    uint64_t deviceAuthorityEpoch = 0;
     std::atomic<bool> deviceLost{false};
 #ifdef OLR_UNIT_TEST
     std::atomic<int> rhiReadbacks{0};
@@ -541,6 +542,7 @@ GpuRhiContext::~GpuRhiContext() {
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
     auto impl = std::make_unique<Impl>(QRhi::Metal);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -553,6 +555,7 @@ std::shared_ptr<GpuRhiContext> GpuRhiContext::create() {
 
 std::shared_ptr<GpuRhiContext> GpuRhiContext::createNullForTest() {
     auto impl = std::make_unique<Impl>(QRhi::Null);
+    impl->deviceAuthorityEpoch = GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     impl->thread.start();
     impl->valid = impl->thread.waitReady();
     if (!impl->valid) {
@@ -632,7 +635,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
     CVPixelBufferRef pb = retainApplePixelBufferWrapper(surface);
     if (!pb) return result;
 
-    const uint64_t observationGeneration = GpuGenerationCounter::instance().current();
+    const uint64_t deviceAuthorityEpoch = m_impl->deviceAuthorityEpoch;
     const bool invoked = m_impl->thread.invoke([&] {
         QRhi* rhi = m_impl->thread.rhi;
         if (rhi) {
@@ -647,7 +650,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                     // the worker's recovery frees held surfaces without waiting on
                     // the dead device's fences.
                     GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, observationGeneration);
+                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
                     m_impl->deviceLost.store(true, std::memory_order_release);
                     result = CpuPlanes{};
                     return;
@@ -656,7 +659,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                 if (begin == QRhi::FrameOpDeviceLost || rhi->isDeviceLost()) {
                     // LOCK RULE: this render-thread poll touches no m_bufferMutex.
                     GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, observationGeneration);
+                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
                     m_impl->deviceLost.store(true, std::memory_order_release);
                 }
                 result = CpuPlanes{};
@@ -673,7 +676,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
             }
             if (rhi && rhi->isDeviceLost()) {
                 GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                    DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, observationGeneration);
+                    DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
                 m_impl->deviceLost.store(true, std::memory_order_release);
                 result = CpuPlanes{};
                 return;
@@ -692,7 +695,7 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                 }
                 if (rhi && rhi->isDeviceLost()) {
                     GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, observationGeneration);
+                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
                     m_impl->deviceLost.store(true, std::memory_order_release);
                     result = CpuPlanes{};
                     return;
