@@ -64,7 +64,7 @@ AlignmentOffset TimecodeAlignerV2::offset(int ia, int ib, int32_t driftPpm) cons
     const int64_t drift =
         int64_t((I128(absI64(tcSkewUs)) * I128(absI64(int64_t(driftPpm)))) / 1'000'000);
     out.boundUs = q + drift;
-    out.kind = AlignmentOffset::Kind::Comparable;
+    out.kind = AlignmentOffset::Kind::Exact;
     return out;
 }
 

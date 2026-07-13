@@ -1,7 +1,58 @@
 #include "smpte12m.h"
+#include "timecodeevidence.h"
 
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <numeric>
+
+namespace {
+
+bool checkedTimecodeMultiplyAdd(int64_t a, int64_t b, int64_t c, int64_t* result) {
+    if (a < 0 || b < 0 || c < 0) return false;
+    if (a != 0 && b > (std::numeric_limits<int64_t>::max() - c) / a) return false;
+    *result = a * b + c;
+    return true;
+}
+
+bool normalizedRateEquals(FrameRateQ rate, int32_t numerator, int32_t denominator) {
+    if (!rate.valid()) return false;
+    const int32_t divisor = std::gcd(rate.num, rate.den);
+    return rate.num / divisor == numerator && rate.den / divisor == denominator;
+}
+
+} // namespace
+
+bool validateTimecodeLabel(const Smpte12mTimecode& tc, FrameRateQ rate) {
+    if (!tc.valid || tc.hours < 0 || tc.hours >= 24 || tc.minutes < 0 || tc.minutes >= 60 ||
+        tc.seconds < 0 || tc.seconds >= 60 || tc.frames < 0)
+        return false;
+    if (!rate.valid()) return false;
+
+    int64_t minimumRate = 0;
+    int64_t maximumRate = 0;
+    const int64_t denominator = rate.den;
+    if (!checkedTimecodeMultiplyAdd(12, denominator, 0, &minimumRate) ||
+        !checkedTimecodeMultiplyAdd(240, denominator, 0, &maximumRate) || rate.num < minimumRate ||
+        rate.num > maximumRate)
+        return false;
+
+    int64_t roundedNumerator = 0;
+    int64_t doubledDenominator = 0;
+    if (!checkedTimecodeMultiplyAdd(2, rate.num, rate.den, &roundedNumerator) ||
+        !checkedTimecodeMultiplyAdd(2, rate.den, 0, &doubledDenominator))
+        return false;
+    const int64_t nominalLabelRate = roundedNumerator / doubledDenominator;
+    if (nominalLabelRate <= 0 || tc.frames >= nominalLabelRate) return false;
+
+    if (!tc.dropFrame) return true;
+    const bool ntsc30 = normalizedRateEquals(rate, 30000, 1001);
+    const bool ntsc60 = normalizedRateEquals(rate, 60000, 1001);
+    if (!ntsc30 && !ntsc60) return false;
+
+    const int droppedLabels = ntsc60 ? 4 : 2;
+    return tc.seconds != 0 || tc.minutes % 10 == 0 || tc.frames >= droppedLabels;
+}
 
 namespace Smpte12m {
 
@@ -117,7 +168,7 @@ int labelRate(int rateNum, int rateDen) {
 }
 
 int64_t labelFrameCount(const Smpte12mTimecode& tc, int rateNum, int rateDen) {
-    if (!tc.valid) return -1;
+    if (!validateTimecodeLabel(tc, FrameRateQ{rateNum, rateDen})) return -1;
     const int rate = labelRate(rateNum, rateDen);
     return rate > 0 ? toFrameCount(tc, rate) : -1;
 }

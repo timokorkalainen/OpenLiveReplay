@@ -1,6 +1,7 @@
 #ifndef TIMECODEALIGNERV2_H
 #define TIMECODEALIGNERV2_H
-#include <cstdint>
+
+#include "timecodeevidence.h"
 
 // Rate-aware inter-source timecode alignment with a typed Incomparable state.
 // Pure (no Qt/FFmpeg). All arithmetic is exact integer (__int128 intermediates),
@@ -15,31 +16,6 @@
 // wrong way. Carrying each side's true rate and comparing in exact microseconds
 // removes the term entirely (see docs/hardest-technical-challenges.md and its
 // machine-checked timecode_alignment_proof.py).
-
-// Exact rational frames/second (e.g. 60000/1001). An invalid rate (num<=0 or
-// den<=0) is the explicit "rate unrecoverable" sentinel: a source anchored with
-// an invalid rate never anchors, so every comparison against it is Incomparable.
-struct FrameRateQ {
-    int32_t num = 0;
-    int32_t den = 1;
-    bool valid() const { return num > 0 && den > 0; }
-};
-
-struct AlignmentOffset {
-    // Comparable  — both sources anchored with valid rates; offsetUs/boundUs hold.
-    // Incomparable — a source lacks an anchor or a recoverable rate; offsetUs is
-    //                meaningless and MUST NOT be used (callers degrade to the
-    //                clock-offset estimate). Never a bare integer.
-    enum class Kind : uint8_t { Comparable, Incomparable };
-    Kind kind = Kind::Incomparable;
-    int64_t offsetUs = 0; // (skewA − skewB): time to ADD to B so equal-TC frames
-                          // coincide with A. Sign matches the old frameOffset:
-                          // B late (larger skew) => negative => shift B earlier.
-    int64_t boundUs = 0;  // proven |measurement error| bound for this pair:
-                          // one session frame (arrival quantization) + drift term.
-
-    bool comparable() const { return kind == Kind::Comparable; }
-};
 
 class TimecodeAlignerV2 {
 public:

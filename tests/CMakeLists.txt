@@ -80,6 +80,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/driftestimator.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/timecode.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/smpte12m.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/timing/timecodeevidence.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/timecodealignerv2.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/spsframerate.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/timing/sourceoffsetestimator.cpp"
