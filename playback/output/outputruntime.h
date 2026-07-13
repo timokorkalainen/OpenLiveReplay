@@ -52,6 +52,7 @@ public:
 #ifdef OLR_UNIT_TEST
     std::shared_ptr<GpuRhiContext> gpuRhiContextForTest() const;
     int playEpochResetCountForTest() const;
+    bool immediateDispatchPendingForTest() const;
 #endif
     // Tier3 atomic cut: the next output frame index the dispatcher will emit,
     // read under m_mutex after any active dispatch tick has finished. SAFE to call
@@ -92,7 +93,7 @@ private:
     bool m_dispatchActive = false;
     Qt::HANDLE m_dispatchThreadId = nullptr;
     bool m_reconfiguring = false;
-    int m_immediateDispatchRequests = 0;
+    std::atomic<int> m_immediateDispatchRequests{0};
     quint64 m_configGeneration = 0;
     bool m_hasPendingEndpoints = false;
     QList<OutputEndpoint> m_pendingEndpoints;

@@ -153,7 +153,9 @@ public:
     void stop() override {
         QMutexLocker locker(&m_mutex);
         m_active = false;
+        m_releaseBlockedSubmit = true;
         m_submitStarted.wakeAll();
+        m_submitReleased.wakeAll();
     }
 
     bool isActive() const override {
@@ -162,15 +164,29 @@ public:
     }
 
     bool submit(const OutputBusFrame& frame) override {
-        {
-            QMutexLocker locker(&m_mutex);
-            if (!m_active) return false;
-            m_frames.append(frame);
-            ++m_submitCount;
-            m_submitStarted.wakeAll();
+        QMutexLocker locker(&m_mutex);
+        if (!m_active) return false;
+        m_frames.append(frame);
+        ++m_submitCount;
+        m_submitStarted.wakeAll();
+        while (m_blockedSubmitCount == m_submitCount && !m_releaseBlockedSubmit) {
+            m_submitReleased.wait(&m_mutex);
         }
+        locker.unlock();
         QThread::msleep(80);
         return true;
+    }
+
+    void blockSubmitCount(int count) {
+        QMutexLocker locker(&m_mutex);
+        m_blockedSubmitCount = count;
+        m_releaseBlockedSubmit = false;
+    }
+
+    void releaseBlockedSubmit() {
+        QMutexLocker locker(&m_mutex);
+        m_releaseBlockedSubmit = true;
+        m_submitReleased.wakeAll();
     }
 
     bool waitForSubmits(int count, int timeoutMs) const {
@@ -193,8 +209,11 @@ public:
 private:
     mutable QMutex m_mutex;
     mutable QWaitCondition m_submitStarted;
+    QWaitCondition m_submitReleased;
     bool m_active = false;
     int m_submitCount = 0;
+    int m_blockedSubmitCount = -1;
+    bool m_releaseBlockedSubmit = false;
     QVector<OutputBusFrame> m_frames;
 };
 
@@ -789,6 +808,7 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     runtime.setIdentitySkip(false);
 
     runtime.dispatchDueTicksForTest(0);
+    sink.blockSubmitCount(2);
 
     std::thread catchUpThread([&]() { runtime.dispatchDueTicksForTest(1000); });
 
@@ -797,10 +817,18 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
 
     QElapsedTimer timer;
     timer.start();
-    runtime.dispatchImmediate();
-    [[maybe_unused]] const qint64 immediateElapsedMs = timer.elapsed();
+    std::thread immediateThread([&]() { runtime.dispatchImmediate(); });
+    QElapsedTimer registrationTimer;
+    registrationTimer.start();
+    while (!runtime.immediateDispatchPendingForTest() && registrationTimer.elapsed() < 1000)
+        QThread::msleep(1);
+    const bool immediateRegistered = runtime.immediateDispatchPendingForTest();
+    sink.releaseBlockedSubmit();
 
+    immediateThread.join();
     catchUpThread.join();
+    [[maybe_unused]] const qint64 immediateElapsedMs = timer.elapsed();
+    QVERIFY2(immediateRegistered, "immediate dispatch request must register before tick release");
 
     const QVector<OutputBusFrame> frames = sink.frames();
     // Preemption is proven structurally by the frame count below; this latency bound is a

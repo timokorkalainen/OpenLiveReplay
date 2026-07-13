@@ -184,15 +184,16 @@ OutputRuntime::dispatchImmediateWithReport(const OutputDispatchRequest& request)
     bool immediateRegistered = false;
     auto clearImmediateRequestLocked = [&]() {
         if (!immediateRegistered) return;
-        if (m_immediateDispatchRequests > 0) --m_immediateDispatchRequests;
+        m_immediateDispatchRequests.fetch_sub(1, std::memory_order_acq_rel);
         immediateRegistered = false;
         m_dispatchIdle.wakeAll();
     };
 
+    m_immediateDispatchRequests.fetch_add(1, std::memory_order_acq_rel);
+    immediateRegistered = true;
+
     {
         QMutexLocker locker(&m_mutex);
-        ++m_immediateDispatchRequests;
-        immediateRegistered = true;
         m_dispatchIdle.wakeAll();
         waitForDispatchIdleLocked();
         while (m_reconfiguring && !m_stopRequested)
@@ -293,6 +294,10 @@ int OutputRuntime::playEpochResetCountForTest() const {
     QMutexLocker locker(&m_mutex);
     return m_playEpochResetCountForTest;
 }
+
+bool OutputRuntime::immediateDispatchPendingForTest() const {
+    return m_immediateDispatchRequests.load(std::memory_order_acquire) > 0;
+}
 #endif
 
 qint64 OutputRuntime::dispatcherNextOutputFrameIndex() const {
@@ -349,7 +354,8 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
-            if (m_immediateDispatchRequests > 0) return statsLocked();
+            if (m_immediateDispatchRequests.load(std::memory_order_acquire) > 0)
+                return statsLocked();
             const FrameRate rate = m_dispatcher.frameRate();
             frameIndex = m_dispatcher.nextOutputFrameIndex();
             scheduledNs = frameIndexToNsCeil(rate, frameIndex);
@@ -367,7 +373,8 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
-            if (m_immediateDispatchRequests > 0) return statsLocked();
+            if (m_immediateDispatchRequests.load(std::memory_order_acquire) > 0)
+                return statsLocked();
             if (m_configGeneration != configGeneration) continue;
             if (m_dispatcher.nextOutputFrameIndex() != frameIndex) continue;
             m_dispatchActive = true;
