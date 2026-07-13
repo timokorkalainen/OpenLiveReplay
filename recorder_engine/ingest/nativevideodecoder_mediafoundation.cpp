@@ -405,9 +405,17 @@ void NativeVideoDecoder::Impl::shutdownRuntime() {
 
 void NativeVideoDecoder::Impl::reset() {
     if (transform) {
-        transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        bool shutdown = false;
+        if (asyncTransform) {
+            ComPtr<IMFShutdown> asyncShutdown;
+            if (SUCCEEDED(transform.As(&asyncShutdown)) && asyncShutdown) {
+                shutdown = SUCCEEDED(asyncShutdown->Shutdown());
+            }
+        }
+        if (!shutdown) {
+            transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
     }
     transform.Reset();
     eventGenerator.Reset();

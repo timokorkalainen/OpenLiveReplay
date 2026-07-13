@@ -269,15 +269,22 @@ private:
 };
 
 MediaFoundationEncoder::~MediaFoundationEncoder() {
-    if (m_transform && m_streaming) {
-        // On an async MFT, FLUSH discards any queued events/samples so the drain
-        // messages below tear down cleanly without us pumping the event queue.
+    if (m_transform) {
+        bool shutdown = false;
         if (m_asyncTransform) {
-            m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            // Async MFTs own an event queue and are required to expose IMFShutdown.
+            // Shut that queue down before releasing the transform; sending drain
+            // notifications without pumping its events races some hardware drivers.
+            ComPtr<IMFShutdown> asyncShutdown;
+            if (SUCCEEDED(m_transform.As(&asyncShutdown)) && asyncShutdown) {
+                shutdown = SUCCEEDED(asyncShutdown->Shutdown());
+            }
         }
-        m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
-        m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        if (!shutdown && m_streaming) {
+            // Destruction abandons queued output, so flush rather than drain.
+            m_transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+            m_transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        }
     }
     m_eventGenerator.Reset();
     m_d3dDeviceManager.Reset();
