@@ -313,7 +313,6 @@ private:
     std::optional<qint64> outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
                                                                uint64_t gpuGeneration) const;
     bool outputCacheCoversPlayhead(int64_t playheadMs) const;
-    bool publishOutputCacheIfCoversPlayhead(int64_t playheadMs);
     bool pausedPlayheadNeedsWork(int64_t playheadMs);
     SeekRequestResult requestSeekTo(qint64 timestampMs, int directionHint,
                                     bool registerOperatorTransaction);
@@ -368,8 +367,8 @@ private:
     void shutdownOutputGraph();
     void rebuildOutputEndpoints();
     OutputRuntimeSnapshot makeOutputSnapshot() const;
-    void refreshOutputAfterSeekCommit(bool resetPlayEpoch = true);
-    void refreshPreviewAfterSeekCommit(bool resetPlayEpoch = false);
+    void refreshOutputAfterSeekCommit();
+    void refreshPreviewAfterSeekCommit();
     // Snapshot m_outputCache into the published immutable slot. Caller must hold
     // m_bufferMutex.
     void publishOutputCacheLocked();

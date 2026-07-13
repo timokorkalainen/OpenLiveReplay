@@ -138,6 +138,47 @@ private:
     std::thread m_setterThread;
 };
 
+class RuntimeResetDuringSubmitSink final : public IOutputSink {
+public:
+    ~RuntimeResetDuringSubmitSink() override { joinResetter(); }
+
+    void setRuntime(OutputRuntime* runtime) { m_runtime = runtime; }
+    OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        m_active = assignment.enabled && rate.isValid();
+        return m_active;
+    }
+    void stop() override { m_active = false; }
+    bool isActive() const override { return m_active; }
+    bool submit(const OutputBusFrame&) override {
+        if (!m_active || !m_runtime) return false;
+        m_resetterThread = std::thread([this]() {
+            m_runtime->resetPlayEpoch();
+            m_resetterReturned.store(true, std::memory_order_release);
+            m_resetterReturnedCv.notify_all();
+        });
+        std::unique_lock<std::mutex> lock(m_resetterReturnedMutex);
+        m_returnedDuringSubmit =
+            m_resetterReturnedCv.wait_for(lock, std::chrono::milliseconds(250), [this]() {
+                return m_resetterReturned.load(std::memory_order_acquire);
+            });
+        return true;
+    }
+    bool returnedDuringSubmit() const { return m_returnedDuringSubmit; }
+    void joinResetter() {
+        if (m_resetterThread.joinable()) m_resetterThread.join();
+    }
+
+private:
+    OutputRuntime* m_runtime = nullptr;
+    bool m_active = false;
+    bool m_returnedDuringSubmit = false;
+    std::atomic<bool> m_resetterReturned{false};
+    std::mutex m_resetterReturnedMutex;
+    std::condition_variable m_resetterReturnedCv;
+    std::thread m_resetterThread;
+};
+
 class SlowSubmitSink final : public IOutputSink {
 public:
     OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
@@ -215,6 +256,7 @@ private slots:
     void recordGpuBudgetSurfacesInStats();
     void injectedGpuRhiContextIsReusedAndReplaceable();
     void dispatchSubmitsWithoutHoldingRuntimeMutex();
+    void playEpochResetDefersWithoutBlockingActiveDispatch();
     void immediateDispatchPreemptsCatchUpBurstAfterCurrentTick();
     void pgmCriticalImmediateDispatchSubmitsPreviewAndReportsPgmIdentity();
     void endpointReconfigurationDiscardsPreReconfigSnapshot();
@@ -759,6 +801,37 @@ void TestOutputRuntime::dispatchSubmitsWithoutHoldingRuntimeMutex() {
     QVERIFY2(sink.setterReturnedDuringSubmit(),
              "sink submission must not run while OutputRuntime::m_mutex is held; GPU readback "
              "sinks can block on fences while submitting");
+}
+
+void TestOutputRuntime::playEpochResetDefersWithoutBlockingActiveDispatch() {
+    OutputFrameCache cache(1, 4, 4);
+    cache.insertVideoFrame(video(0, 100, 105));
+
+    OutputTargetAssignment assignment;
+    assignment.id = QStringLiteral("feed0-preview");
+    assignment.sourceBus = OutputBusId::feed(0);
+    assignment.kind = OutputTargetKind::QtPreview;
+    assignment.enabled = true;
+
+    RuntimeResetDuringSubmitSink sink;
+    OutputRuntime runtime(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    sink.setRuntime(&runtime);
+    runtime.setSnapshotProvider([cache]() {
+        OutputRuntimeSnapshot snapshot;
+        snapshot.cache = cache;
+        snapshot.state.playheadMs = 100;
+        snapshot.state.playing = true;
+        snapshot.state.selectedFeedIndex = 0;
+        return snapshot;
+    });
+    runtime.setEndpoints({{assignment, &sink}});
+
+    runtime.dispatchDueTicksForTest(0);
+    sink.joinResetter();
+
+    QVERIFY2(sink.returnedDuringSubmit(),
+             "resetPlayEpoch must invalidate the active snapshot and defer the epoch clear "
+             "without blocking the seek commit behind sink submission");
 }
 
 void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() {

@@ -2,7 +2,7 @@
 #
 # Runs the exhaustive (bounded) explicit-state model checker for the play-epoch
 # re-anchor protocol in `all` mode. It exits non-zero unless the unedited protocol
-# and both historical bug shapes (head / mutA / mutB) REFUTE the invariant AND the
+# and all modeled bug shapes (head / mutA / mutB / mutReuse) REFUTE the invariant AND the
 # repaired protocol (fixed = F1 + F2) PROVES it over all reachable states — a
 # differential gate a vacuous model cannot pass. So any future edit to the
 # re-anchor protocol that breaks the proof turns this test RED, replacing the

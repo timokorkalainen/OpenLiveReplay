@@ -21,10 +21,10 @@ THE MODEL
     UI thread      requestSeekTo republish (playbackworker.cpp:227) and
                    generation bump (:241) as SEPARATE atomic steps (the output
                    thread reads these atomics without m_mutex), armCut.
-    Worker thread  begin/commit reposition (CommitGate::canCommitReposition,
-                   :3352-3397), then the post-commit pair from
-                   refreshOutputAfterSeekCommit (:459-469): resetPlayEpoch()
-                   and dispatchImmediate() as SEPARATE steps.
+    Worker thread  begin/commit full or cache-reuse reposition
+                   (CommitGate::canCommitReposition), then the post-commit pair from
+                   refreshOutputAfterSeekCommit: resetPlayEpoch() and
+                   dispatchImmediate() as SEPARATE steps in the broken protocol.
     Output thread  background tick split exactly as outputruntime.cpp:
                    snapshot taken OUTSIDE the lock (:362) [which also fires a
                    due armed cut inside makeOutputSnapshot, playbackworker.cpp
@@ -47,6 +47,8 @@ CONFIGURATIONS
           historical far-back counterexample
   mutB    'fixed' minus the armed-cut re-anchor (:4130)  -> expect the
           historical armed-cut counterexample
+  mutReuse 'fixed' minus the reuse-commit re-anchor      -> expect the
+          reuse fast-path H2 counterexample
 
   The two holes 'head' exhibits (both previously unknown):
     H1 swallowed reset: a background snapshot taken pre-commit passes the
@@ -60,14 +62,14 @@ CONFIGURATIONS
   The repair ('fixed'):
     F1 resetPlayEpoch (every site) also bumps m_configGeneration, so any
        in-flight pre-reset snapshot fails the :371 re-check and is discarded.
-    F2 the reposition-commit applies the epoch reset ATOMICALLY inside the
-       commit's m_bufferMutex critical section (exactly as the armed-cut fire
-       already does at :4130), not afterwards from the refresh helper.
+    F2 every reposition commit applies the epoch reset ATOMICALLY inside its
+       m_bufferMutex critical section (exactly as the armed-cut fire already
+       does at :4130), not afterwards from the refresh helper.
 
-  Differential gate (challenge acceptance): fixed MUST prove; head, mutA and
-  mutB MUST each produce a concrete schedule.
+  Differential gate (challenge acceptance): fixed MUST prove; head, mutA,
+  mutB and mutReuse MUST each produce a concrete schedule.
 
-Run:  python docs/hardest-technical-challenges/transport_epoch_modelcheck.py [head|fixed|mutA|mutB|all]
+Run:  python docs/hardest-technical-challenges/transport_epoch_modelcheck.py [head|fixed|mutA|mutB|mutReuse|all]
 """
 
 import sys
@@ -93,6 +95,7 @@ FIELDS = [
     "wtgt",     # worker: reposition target
     "wpost",    # worker post-commit obligation: 0 none, 1 need epoch reset,
                 #   2 need immediate dispatch  (refreshOutputAfterSeekCommit)
+    "reuse",    # scripted worker commit uses the cache-reuse fast path
     "publ", "pubh",   # published output cache coverage [lo, hi]
     "armed",    # m_cutArmed
     "covers",   # m_stagingCovers
@@ -155,7 +158,7 @@ def render(s, vis, cov, gate_open, label):
 # ---------------------------------------------------------------------------
 def actions(s, cfgflags):
     out = []
-    site_a, site_b, fix_bump, fix_atomic = cfgflags
+    site_a, site_b, fix_bump, fix_atomic, fix_reuse_atomic = cfgflags
 
     def epoch_reset(ns):
         ns = put(ns, eh=False)
@@ -194,7 +197,8 @@ def actions(s, cfgflags):
             t = get(s, "wtgt")
             ns = put(s, publ=t - 2, pubh=t + 2, cp=t, lv=t,
                      cg=get(s, "wstart"), tp=t, st=-1, wphase=0)
-            if site_a and fix_atomic:
+            atomic_commit = fix_atomic and (not get(s, "reuse") or fix_reuse_atomic)
+            if site_a and atomic_commit:
                 # F2: epoch reset INSIDE the commit critical section, as the
                 # armed-cut fire already does (:4130).
                 ns = epoch_reset(ns)
@@ -203,8 +207,9 @@ def actions(s, cfgflags):
                 ns = put(ns, wpost=1)   # today: reset is a later, separate step
             else:
                 ns = put(ns, wpost=2)   # mutation A: re-anchor site deleted
-            out.append(("worker.commitReposition(:3389-3397)"
-                        + ("+resetPlayEpoch[F2]" if site_a and fix_atomic else ""),
+            path = "reuse" if get(s, "reuse") else "full"
+            out.append((f"worker.commitReposition[{path}]"
+                        + ("+resetPlayEpoch[F2]" if site_a and atomic_commit else ""),
                         ns, None))
         else:
             out.append(("worker.abortReposition(superseded)",
@@ -293,6 +298,8 @@ def initial(scenario):
             sched=-1, eh=True, ea=20, ef=0)
     if scenario == "seek":
         s = put(s, seekint=1)
+    elif scenario == "reuse":
+        s = put(s, seekint=1, reuse=True)
     elif scenario == "cut":
         s = put(s, armint=1)
     elif scenario == "cut+seek":
@@ -331,7 +338,7 @@ def run(name, cfgflags):
     print(f"=== config: {name} ===")
     total = 0
     worst = None
-    for scenario in ("seek", "cut", "cut+seek"):
+    for scenario in ("seek", "reuse", "cut", "cut+seek"):
         states, trace = explore(scenario, cfgflags)
         total += states
         print(f"  scenario {scenario:9s}: {states:7d} states explored", end="")
@@ -355,11 +362,12 @@ def run(name, cfgflags):
 
 
 CONFIGS = {
-    #          (site_a_reset, site_b_reset, F1_cfg_bump, F2_atomic_commit_reset)
-    "head":  (True,  True,  False, False),
-    "fixed": (True,  True,  True,  True),
-    "mutA":  (False, True,  True,  True),
-    "mutB":  (True,  False, True,  True),
+    #          (site_a, site_b, F1_bump, F2_full_atomic, F2_reuse_atomic)
+    "head":     (True,  True,  False, False, False),
+    "fixed":    (True,  True,  True,  True,  True),
+    "mutA":     (False, True,  True,  True,  True),
+    "mutB":     (True,  False, True,  True,  True),
+    "mutReuse": (True,  True,  True,  True,  False),
 }
 
 if __name__ == "__main__":
@@ -370,7 +378,13 @@ if __name__ == "__main__":
         results[n] = run(n, CONFIGS[n])
     if which == "all":
         print("=== differential gate ===")
-        expected = {"head": False, "fixed": True, "mutA": False, "mutB": False}
+        expected = {
+            "head": False,
+            "fixed": True,
+            "mutA": False,
+            "mutB": False,
+            "mutReuse": False,
+        }
         ok = all(results[n] == expected[n] for n in results)
         for n in results:
             want = "PROOF" if expected[n] else "COUNTEREXAMPLE"

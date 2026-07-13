@@ -9,7 +9,7 @@ faith.
 
 | # | Challenge | Deliverable | Status |
 |---|-----------|-------------|--------|
-| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Exhaustive interleaving model check + differential known-bug gate | **Ran: 2 new protocol holes found; repaired protocol PROVED over 10,280 states** |
+| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Exhaustive interleaving model check + differential known-bug gate | **Ran: 2 new protocol holes found; repaired protocol PROVED over 11,017 states** |
 | 2 | Rate-agnostic timecode alignment with a proven phase-error bound | Falsifier + exact-rational bound sweep + drop-in C++ module | **Ran: shipped code RED (−5000 ms on aligned cameras); replacement 0 violations / 3,969 cells, zero slack** |
 | 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + real-TDR fault-lane design | **Designed: full headers, 6-site migration, harness + mutations** |
 
@@ -71,16 +71,17 @@ python docs/hardest-technical-challenges/transport_epoch_modelcheck.py all
 
 ```
 head   ->  COUNTEREXAMPLE (6-step schedule)
-fixed  ->  PROOF  -- invariant holds over all 10,280 states
+fixed  ->  PROOF  -- invariant holds over all 11,017 states
 mutA   ->  COUNTEREXAMPLE (historical far-back shape, 5 steps)
 mutB   ->  COUNTEREXAMPLE (historical armed-cut shape, 9 steps)
+mutReuse -> COUNTEREXAMPLE (cache-reuse fast-path shape, 6 steps)
 
-differential gate: [OK] head  [OK] fixed  [OK] mutA  [OK] mutB
+differential gate: [OK] head  [OK] fixed  [OK] mutA  [OK] mutB  [OK] mutReuse
 ```
 
 The differential gate discharges model-fidelity: the unedited protocol and
-both historical mutations *must* refute while the repaired protocol *must*
-prove — a vacuous model cannot pass all four.
+all three mutations *must* refute while the repaired protocol *must* prove —
+a vacuous model cannot pass all five.
 
 ### Two previously-unknown protocol holes (the `head` counterexamples)
 
@@ -111,11 +112,14 @@ seconds), rendered with `isPlaceholder=false` and zero errors reported.
    fails the `:371` re-check and is discarded. (~2 lines in
    `outputruntime.cpp`; `dispatchImmediateWithReport` already re-checks the
    same generation, so immediates are covered for free.)
-2. **F2** — the reposition-commit applies the epoch reset **atomically inside
-   the commit's critical section**, exactly as the cut fire already does at
-   `:4130` (the lock-order note there documents why taking the runtime mutex
-   under `m_bufferMutex` is safe). `refreshOutputAfterSeekCommit(bool)` then
-   loses its `resetPlayEpoch` parameter entirely — deleting the
+2. **F2** — every reposition commit, including the cache-reuse fast path,
+   applies the epoch reset **atomically inside the commit's critical section**,
+   exactly as the cut fire already does at `:4130` (the lock-order note there
+   documents why taking the runtime mutex under `m_bufferMutex` is safe).
+   If an output dispatch is already active, the reset is marked pending and
+   returns immediately; the dispatcher applies it before releasing that
+   dispatch lease. `refreshOutputAfterSeekCommit(bool)` then loses its
+   `resetPlayEpoch` parameter entirely — deleting the
    opposite-defaults trap at [`playbackworker.h:371-372`](../playback/playbackworker.h).
 
 Neither repair adds hot-path cost: F1 is one increment under a mutex already
@@ -655,7 +659,7 @@ review.
 Formulated as oracle-grade challenge briefs and then solved against the tree
 at the referenced lines. Machine-checked artifacts:
 [`docs/hardest-technical-challenges/transport_epoch_modelcheck.py`](hardest-technical-challenges/transport_epoch_modelcheck.py)
-(differential verdicts: head/mutA/mutB → counterexamples, fixed → proof) and
+(differential verdicts: head/mutA/mutB/mutReuse → counterexamples, fixed → proof) and
 [`docs/hardest-technical-challenges/timecode_alignment_proof.py`](hardest-technical-challenges/timecode_alignment_proof.py)
 (falsifier + 3,969-cell bound sweep, 0 violations). Line references anchor to
 the working tree at the time of writing; re-verify against HEAD before acting.

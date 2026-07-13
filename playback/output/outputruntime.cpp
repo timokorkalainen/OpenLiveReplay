@@ -125,11 +125,10 @@ void OutputRuntime::resetPlayEpoch() {
 #ifdef OLR_UNIT_TEST
     ++m_playEpochResetCountForTest;
 #endif
-    if (dispatchActiveOnCurrentThreadLocked()) {
+    if (m_dispatchActive) {
         m_pendingPlayEpochReset = true;
         return;
     }
-    waitForDispatchIdleLocked();
     m_dispatcher.resetPlayEpoch();
     refreshCachedStatsLocked();
 }
