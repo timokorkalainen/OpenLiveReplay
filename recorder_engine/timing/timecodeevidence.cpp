@@ -92,17 +92,33 @@ bool TimecodeEvidence::valid() const {
     if (quantizationBoundUs > std::numeric_limits<int64_t>::max() - driftBoundUs) return false;
 
     const int nominalRate = Smpte12m::labelRate(labelRate.num, labelRate.den);
-    int64_t framesPerDay = 0;
-    if (nominalRate <= 0 || !checkedMultiplyAdd(nominalRate, 24 * 60 * 60, 0, &framesPerDay) ||
-        frameOfDay >= framesPerDay)
-        return false;
-
+    int droppedLabelsPerMinute = 0;
     if (dropFrame) {
         const FrameRateQ ntsc30{30000, 1001};
         const FrameRateQ ntsc60{60000, 1001};
-        if (!(labelRate == ntsc30) && !(labelRate == ntsc60)) return false;
+        if (labelRate == ntsc30)
+            droppedLabelsPerMinute = 2;
+        else if (labelRate == ntsc60)
+            droppedLabelsPerMinute = 4;
+        else
+            return false;
     }
-    return true;
+
+    int64_t framesPerDay = 0;
+    if (nominalRate <= 0 || !checkedMultiplyAdd(nominalRate, 24 * 60 * 60, 0, &framesPerDay))
+        return false;
+
+    if (droppedLabelsPerMinute > 0) {
+        constexpr int64_t kMinutesPerDay = 24 * 60;
+        constexpr int64_t kDropMinutesPerDay = kMinutesPerDay - kMinutesPerDay / 10;
+        int64_t droppedLabelsPerDay = 0;
+        if (!checkedMultiplyAdd(droppedLabelsPerMinute, kDropMinutesPerDay, 0,
+                                &droppedLabelsPerDay) ||
+            droppedLabelsPerDay > framesPerDay)
+            return false;
+        framesPerDay -= droppedLabelsPerDay;
+    }
+    return frameOfDay < framesPerDay;
 }
 
 std::optional<FrameRateQ> canonicalFrameRate(double framesPerSecond) {

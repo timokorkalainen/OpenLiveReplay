@@ -209,6 +209,7 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/timing/driftestimator.h recorder_engine/timing/driftestimator.cpp
         recorder_engine/timing/timecode.h recorder_engine/timing/timecode.cpp
         recorder_engine/timing/smpte12m.h recorder_engine/timing/smpte12m.cpp
+        recorder_engine/timing/timecodeevidence.h recorder_engine/timing/timecodeevidence.cpp
         recorder_engine/timing/timecodealignerv2.h recorder_engine/timing/timecodealignerv2.cpp
         recorder_engine/timing/sourceoffsetestimator.h recorder_engine/timing/sourceoffsetestimator.cpp
         recorder_engine/timing/sourceclock.h recorder_engine/timing/sourceclock.cpp

@@ -16,6 +16,8 @@ private slots:
     void rejectsDropFrameAtNonDropRates();
     void rejectsInvalidAndExtremeRationals();
     void rejectsInvalidEvidenceValues();
+    void dropFrameEvidenceUsesLegalFramesPerDay_data();
+    void dropFrameEvidenceUsesLegalFramesPerDay();
     void canonicalizesStandardRates_data();
     void canonicalizesStandardRates();
     void canonicalizesNtscRatesExactly();
@@ -86,6 +88,34 @@ void TestTimecodeEvidence::rejectsInvalidEvidenceValues() {
     QVERIFY(!evidence.valid());
     evidence.quantizationBoundUs = 0;
     evidence.driftBoundUs = std::numeric_limits<int64_t>::min();
+    QVERIFY(!evidence.valid());
+}
+
+void TestTimecodeEvidence::dropFrameEvidenceUsesLegalFramesPerDay_data() {
+    QTest::addColumn<int>("rateNum");
+    QTest::addColumn<int>("rateDen");
+    QTest::addColumn<qint64>("lastLegalFrame");
+    QTest::addColumn<qint64>("firstImpossibleFrame");
+
+    QTest::newRow("29.97") << 30000 << 1001 << qint64(2'589'407) << qint64(2'589'408);
+    QTest::newRow("59.94") << 60000 << 1001 << qint64(5'178'815) << qint64(5'178'816);
+}
+
+void TestTimecodeEvidence::dropFrameEvidenceUsesLegalFramesPerDay() {
+    QFETCH(int, rateNum);
+    QFETCH(int, rateDen);
+    QFETCH(qint64, lastLegalFrame);
+    QFETCH(qint64, firstImpossibleFrame);
+
+    TimecodeEvidence evidence;
+    evidence.frameOfDay = lastLegalFrame;
+    evidence.labelRate = {int32_t(rateNum), int32_t(rateDen)};
+    evidence.dropFrame = true;
+    evidence.arrivalSessionFrame = 0;
+    evidence.sessionRate = {int32_t(rateNum), int32_t(rateDen)};
+    QVERIFY(evidence.valid());
+
+    evidence.frameOfDay = firstImpossibleFrame;
     QVERIFY(!evidence.valid());
 }
 
