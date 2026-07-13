@@ -10,8 +10,10 @@
 #include <QtTest>
 
 #include <QCoreApplication>
+#include <QElapsedTimer>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QThread>
 
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpudevicelossmonitor.h"
@@ -158,11 +160,82 @@ bool isExpectedCheckedContractTermination(QProcess::ExitStatus status, int exitC
 #endif
 }
 
-QString childTerminationDiagnostic(const QProcess& child, const QByteArray& output) {
-    return QStringLiteral("child status=%1 exitCode=%2 output=%3")
-        .arg(int(child.exitStatus()))
-        .arg(child.exitCode())
-        .arg(QString::fromLocal8Bit(output));
+struct ChildProcessResult {
+    bool started = false;
+    bool finishedBeforeTimeout = false;
+    bool timedOut = false;
+    bool reaped = false;
+    QProcess::ExitStatus exitStatus = QProcess::NormalExit;
+    int exitCode = -1;
+    QProcess::ProcessError processError = QProcess::UnknownError;
+    QString errorString;
+    QByteArray output;
+};
+
+ChildProcessResult runChildProcess(const QString& testFunction, const QByteArray& environmentName,
+                                   int timeoutMs, const QByteArray& startupMarker = {}) {
+    QProcess child;
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QString::fromLatin1(environmentName), QStringLiteral("1"));
+    child.setProcessEnvironment(environment);
+    child.setProcessChannelMode(QProcess::MergedChannels);
+    child.start(QCoreApplication::applicationFilePath(), {testFunction});
+
+    ChildProcessResult result;
+    result.started = child.waitForStarted(5000);
+    if (result.started && !startupMarker.isEmpty()) {
+        QElapsedTimer markerWait;
+        markerWait.start();
+        while (!result.output.contains(startupMarker) && child.state() != QProcess::NotRunning &&
+               markerWait.elapsed() < 5000) {
+            (void) child.waitForReadyRead(5000 - int(markerWait.elapsed()));
+            result.output += child.readAll();
+        }
+    }
+    if (result.started) {
+        result.finishedBeforeTimeout = child.waitForFinished(timeoutMs);
+        if (!result.finishedBeforeTimeout) {
+            result.timedOut = true;
+            child.terminate();
+            if (!child.waitForFinished(250)) {
+                child.kill();
+                (void) child.waitForFinished(5000);
+            }
+        }
+    }
+    if (child.state() != QProcess::NotRunning) {
+        child.kill();
+        (void) child.waitForFinished(5000);
+    }
+
+    result.reaped = child.state() == QProcess::NotRunning;
+    result.exitStatus = child.exitStatus();
+    result.exitCode = child.exitCode();
+    result.processError = child.error();
+    result.errorString = child.errorString();
+    result.output += child.readAll();
+    return result;
+}
+
+bool isAcceptedCheckedContractDeath(const ChildProcessResult& result) {
+    return result.started && result.finishedBeforeTimeout && !result.timedOut && result.reaped &&
+           isExpectedCheckedContractTermination(result.exitStatus, result.exitCode);
+}
+
+QString childProcessDiagnostic(const ChildProcessResult& result) {
+    return QStringLiteral("started=%1 finishedBeforeTimeout=%2 timedOut=%3 reaped=%4 "
+                          "exitStatus=%5 exitCodeSigned=%6 exitCodeHex=0x%7 processError=%8 "
+                          "errorString=%9 output=%10")
+        .arg(result.started ? QStringLiteral("true") : QStringLiteral("false"))
+        .arg(result.finishedBeforeTimeout ? QStringLiteral("true") : QStringLiteral("false"))
+        .arg(result.timedOut ? QStringLiteral("true") : QStringLiteral("false"))
+        .arg(result.reaped ? QStringLiteral("true") : QStringLiteral("false"))
+        .arg(int(result.exitStatus))
+        .arg(result.exitCode)
+        .arg(qulonglong(static_cast<quint32>(result.exitCode)), 8, 16, QLatin1Char('0'))
+        .arg(int(result.processError))
+        .arg(result.errorString)
+        .arg(QString::fromLocal8Bit(result.output));
 }
 
 } // namespace
@@ -176,6 +249,7 @@ private slots:
     void withReadCompletesDuringExceptionUnwinding();
     void handleQueryAfterCompletionFailsCheckedContract();
     void checkedContractDeathOracleRejectsUnrelatedExit();
+    void deathControlTimeoutCapturesDiagnosticsAndReaps();
     void surfaceOwnerSurvivesUntilLeaseDestruction();
     void boundedWaitDrainReleasesOnlyRetired();
     void boundedWaitDoesNotHoldRetainerMutex();
@@ -249,20 +323,12 @@ void TestGpuSurfaceLease::withReadCompletesDuringExceptionUnwinding() {
         return;
     }
 
-    QProcess child;
-    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
-    environment.insert(QString::fromLatin1(deathChildEnvironment), QStringLiteral("1"));
-    child.setProcessEnvironment(environment);
-    child.setProcessChannelMode(QProcess::MergedChannels);
-    child.start(QCoreApplication::applicationFilePath(),
-                {QStringLiteral("withReadCompletesDuringExceptionUnwinding")});
-    QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
-    QVERIFY2(child.waitForFinished(10000), qPrintable(child.errorString()));
-    const QByteArray output = child.readAll();
-    QVERIFY2(output.contains(callbackReachedThrowMarker),
-             qPrintable(childTerminationDiagnostic(child, output)));
-    QVERIFY2(isExpectedCheckedContractTermination(child.exitStatus(), child.exitCode()),
-             qPrintable(childTerminationDiagnostic(child, output)));
+    const ChildProcessResult result =
+        runChildProcess(QStringLiteral("withReadCompletesDuringExceptionUnwinding"),
+                        QByteArray(deathChildEnvironment), 10000);
+    const QString diagnostic = childProcessDiagnostic(result);
+    QVERIFY2(result.output.contains(callbackReachedThrowMarker), qPrintable(diagnostic));
+    QVERIFY2(isAcceptedCheckedContractDeath(result), qPrintable(diagnostic));
 #else
     QSKIP("Checked-contract assertions are disabled in this build");
 #endif
@@ -280,18 +346,11 @@ void TestGpuSurfaceLease::handleQueryAfterCompletionFailsCheckedContract() {
         return;
     }
 
-    QProcess child;
-    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
-    environment.insert(QString::fromLatin1(deathChildEnvironment), QStringLiteral("1"));
-    child.setProcessEnvironment(environment);
-    child.setProcessChannelMode(QProcess::MergedChannels);
-    child.start(QCoreApplication::applicationFilePath(),
-                {QStringLiteral("handleQueryAfterCompletionFailsCheckedContract")});
-    QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
-    QVERIFY2(child.waitForFinished(10000), qPrintable(child.errorString()));
-    const QByteArray output = child.readAll();
-    QVERIFY2(isExpectedCheckedContractTermination(child.exitStatus(), child.exitCode()),
-             qPrintable(childTerminationDiagnostic(child, output)));
+    const ChildProcessResult result =
+        runChildProcess(QStringLiteral("handleQueryAfterCompletionFailsCheckedContract"),
+                        QByteArray(deathChildEnvironment), 10000);
+    const QString diagnostic = childProcessDiagnostic(result);
+    QVERIFY2(isAcceptedCheckedContractDeath(result), qPrintable(diagnostic));
 #else
     QSKIP("Checked-contract assertions are disabled in this build");
 #endif
@@ -306,18 +365,47 @@ void TestGpuSurfaceLease::checkedContractDeathOracleRejectsUnrelatedExit() {
         std::exit(7);
     }
 
-    QProcess child;
-    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
-    environment.insert(QString::fromLatin1(unrelatedChildEnvironment), QStringLiteral("1"));
-    child.setProcessEnvironment(environment);
-    child.setProcessChannelMode(QProcess::MergedChannels);
-    child.start(QCoreApplication::applicationFilePath(),
-                {QStringLiteral("checkedContractDeathOracleRejectsUnrelatedExit")});
-    QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
-    QVERIFY2(child.waitForFinished(10000), qPrintable(child.errorString()));
-    const QByteArray output = child.readAll();
-    QVERIFY2(!isExpectedCheckedContractTermination(child.exitStatus(), child.exitCode()),
-             qPrintable(childTerminationDiagnostic(child, output)));
+    const ChildProcessResult result =
+        runChildProcess(QStringLiteral("checkedContractDeathOracleRejectsUnrelatedExit"),
+                        QByteArray(unrelatedChildEnvironment), 10000);
+    const QString diagnostic = childProcessDiagnostic(result);
+    QVERIFY2(result.output.contains("unrelated child failure mutation"), qPrintable(diagnostic));
+    QVERIFY2(result.started && result.finishedBeforeTimeout && !result.timedOut && result.reaped,
+             qPrintable(diagnostic));
+    QVERIFY2(result.exitStatus == QProcess::NormalExit, qPrintable(diagnostic));
+    QVERIFY2(result.exitCode == 7, qPrintable(diagnostic));
+    QVERIFY2(!isAcceptedCheckedContractDeath(result), qPrintable(diagnostic));
+#else
+    QSKIP("Checked-contract assertions are disabled in this build");
+#endif
+}
+
+void TestGpuSurfaceLease::deathControlTimeoutCapturesDiagnosticsAndReaps() {
+#ifndef QT_NO_DEBUG
+    constexpr auto timeoutChildEnvironment = "OLR_GPU_SYNC_READ_TIMEOUT_CHILD";
+    constexpr auto timeoutOutputMarker = "timeout child output marker";
+    if (qEnvironmentVariableIsSet(timeoutChildEnvironment)) {
+        std::fputs("timeout child output marker\n", stderr);
+        std::fflush(stderr);
+        QThread::msleep(5000);
+        std::exit(0);
+    }
+
+    const ChildProcessResult result =
+        runChildProcess(QStringLiteral("deathControlTimeoutCapturesDiagnosticsAndReaps"),
+                        QByteArray(timeoutChildEnvironment), 10, QByteArray(timeoutOutputMarker));
+    QVERIFY(result.started);
+    QVERIFY(result.timedOut);
+    QVERIFY(result.reaped);
+    QVERIFY(result.output.contains(timeoutOutputMarker));
+    QVERIFY(!isAcceptedCheckedContractDeath(result));
+    const QString diagnostic = childProcessDiagnostic(result);
+    QVERIFY(diagnostic.contains(QStringLiteral("timedOut=true")));
+    QVERIFY(diagnostic.contains(QStringLiteral("exitCodeSigned=")));
+    QVERIFY(diagnostic.contains(QStringLiteral("exitCodeHex=0x")));
+    QVERIFY(diagnostic.contains(QStringLiteral("processError=")));
+    QVERIFY(diagnostic.contains(QStringLiteral("errorString=")));
+    QVERIFY(diagnostic.contains(QString::fromLatin1(timeoutOutputMarker)));
 #else
     QSKIP("Checked-contract assertions are disabled in this build");
 #endif
