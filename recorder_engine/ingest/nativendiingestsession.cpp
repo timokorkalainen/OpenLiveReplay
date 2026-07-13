@@ -401,9 +401,9 @@ void NativeNdiIngestSession::run() {
                 // class this change removes.
                 const int ndiLabelRate =
                     Smpte12m::labelRate(video.frameRateNum, video.frameRateDen);
-                if (ndiLabelRate > 0 && decoded.sourceTimecode100ns >= 0) {
-                    decoded.sourceTcFrames =
-                        (decoded.sourceTimecode100ns * ndiLabelRate + 5'000'000) / 10'000'000;
+                decoded.sourceTcFrames = Smpte12m::labelFrameCountFrom100ns(
+                    decoded.sourceTimecode100ns, video.frameRateNum, video.frameRateDen);
+                if (decoded.sourceTcFrames >= 0) {
                     decoded.sourceFrameRateNum = ndiLabelRate;
                     decoded.sourceFrameRateDen = 1;
                 }

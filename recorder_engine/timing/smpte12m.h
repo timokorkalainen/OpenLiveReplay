@@ -42,6 +42,10 @@ char* /*caller-owned, 12 bytes*/ format(const Smpte12mTimecode& tc, char out[12]
 int64_t toFrameCount(const Smpte12mTimecode& tc, int nominalFps);
 int labelRate(int rateNum, int rateDen);
 int64_t labelFrameCount(const Smpte12mTimecode& tc, int rateNum, int rateDen);
+// Convert an NDI-style 100 ns timecode-since-midnight using an untrusted sender
+// rate. Invalid timestamps or rates outside the supported [12, 240] fps range
+// return -1 instead of producing a confident alignment anchor.
+int64_t labelFrameCountFrom100ns(int64_t timecode100ns, int rateNum, int rateDen);
 // 100 ns timestamp of this TC since 00:00:00:00 (= toFrameCount * 1e7 / fps).
 int64_t to100ns(const Smpte12mTimecode& tc, int nominalFps);
 // Decode a 100 ns timecode (NDI delivers TC as 100 ns since midnight) -> fields.
