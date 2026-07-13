@@ -985,10 +985,12 @@ if(APPLE)
         LABELS "native-apple-ingest" TIMEOUT 120 RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
 elseif(WIN32)
     olr_add_native_srt_e2e_tests("native-windows-ingest")
+    set_tests_properties(e2e_native_srt_smoke PROPERTIES
+        LABELS "native-windows-ingest;delivery-gate")
     add_test(NAME e2e_native_srt_hevc_smoke
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_srt_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
     set_tests_properties(e2e_native_srt_hevc_smoke PROPERTIES
-        LABELS "native-windows-hevc"
+        LABELS "native-windows-hevc;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         ENVIRONMENT "${_olr_windows_tool_env}")
@@ -1098,8 +1100,16 @@ if(APPLE)
 elseif(WIN32)
     add_test(NAME e2e_native_rtmp_smoke
         COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_smoke.sh" "$<TARGET_FILE:record_harness>" 23701)
+    add_test(NAME e2e_native_rtmp_hevc_smoke
+        COMMAND "${OLR_E2E_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/run_rtmp_hevc_smoke.sh" "$<TARGET_FILE:record_harness>" 23770)
     set_tests_properties(e2e_native_rtmp_smoke PROPERTIES
-        LABELS "native-rtmp"
+        LABELS "native-rtmp;delivery-gate"
+        TIMEOUT 180
+        RUN_SERIAL TRUE
+        SKIP_RETURN_CODE 77
+        ENVIRONMENT "${_olr_windows_tool_env}")
+    set_tests_properties(e2e_native_rtmp_hevc_smoke PROPERTIES
+        LABELS "native-rtmp;delivery-gate"
         TIMEOUT 180
         RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77
