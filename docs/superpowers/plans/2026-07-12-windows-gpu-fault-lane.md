@@ -4,16 +4,16 @@
 
 **Goal:** Verify fence ordering and application recovery against a genuine driver-observed Windows GPU removal in an opt-in isolated test lane.
 
-**Architecture:** A non-destructive parent harness performs capability checks and starts dedicated child modes for fence ordering and TDR triggering. The child owns the destructive device; the parent watchdog bounds it, captures evidence, and fails closed once an explicitly enabled supported host begins execution.
+**Architecture:** A non-destructive parent harness performs capability checks and starts dedicated child modes for fence ordering and TDR triggering. The destructive child owns a real `PlaybackWorker` and runs the fault shader on that worker's exact D3D11 device. A kill-on-close Job Object and parent watchdog bound the child process tree; the parent captures evidence and fails closed once an explicitly enabled supported host begins execution.
 
-**Tech Stack:** C++17, Qt Core/Test and `QProcess`, D3D11/DXGI, HLSL compute shader, CMake/CTest resource labels, GitHub Actions workflow dispatch.
+**Tech Stack:** C++17, Qt Core/Test and `QProcess`, Windows Job Objects and read-only TDR-policy admission, D3D11/DXGI, HLSL compute shader, CMake/CTest resource labels, GitHub Actions workflow dispatch.
 
 ## Global Constraints
 
-- The lane runs only when `OLR_GPU_FAULT_LANE=1` and never changes Windows TDR registry values.
+- The lane runs only when `OLR_GPU_FAULT_LANE=1` on a runner explicitly declared dedicated. It reads the effective TDR policy and never changes Windows TDR registry values.
 - WARP, Null, remote, virtual, missing-fence, and unsupported-feature environments skip before destructive dispatch with an exact reason.
 - Once supported destructive execution starts, trigger failure, missing observation, timeout, or invalid recovery is a test failure.
-- The watchdog may terminate only its isolated child process.
+- The watchdog may terminate only its isolated child Job Object process tree. Submitted GPU work remains adapter-wide, so the dedicated-runner and recoverable-TDR requirements are separate safety boundaries.
 - Preserve adapter identity, HRESULT, generations, fence values, registry counts, timing, and exit status as artifacts.
 - Stage exact paths only, never bypass hooks, and do not auto-merge.
 
@@ -41,7 +41,7 @@ Return a structure containing `supported`, `destructiveAllowed`, adapter LUID/na
 
 - [ ] **Step 3: Implement bounded parent supervision**
 
-Use `QProcess`, separate stdout/stderr capture, a monotonic deadline, and termination limited to the child PID. Treat child crash, protocol truncation, or deadline expiry as failure after destructive start.
+Use `QProcess`, separate stdout/stderr capture, a monotonic deadline, and a uniquely named kill-on-close Job Object. The child verifies membership before device creation; terminate the Job Object on timeout. Treat child crash, protocol truncation, or deadline expiry as failure after destructive start.
 
 - [ ] **Step 4: Register the opt-in CTest**
 
@@ -94,9 +94,13 @@ Run with `OLR_GPU_FAULT_LANE=1`; expected result is a passing fence probe with o
 
 Reject success HRESULT, injected-loss evidence, unchanged generation, missing epoch-bound token, and any report of waiting on a dead fence.
 
+Bind the worker-cache NV12 surface as a shader resource in the destructive dispatch and read it in
+the immutable-condition loop. Register that same surface against the post-dispatch fence so weak
+release evidence falsifies the actual in-flight lifetime invariant.
+
 - [ ] **Step 2: Implement the destructive child dispatch**
 
-Create the selected hardware adapter device in the child and dispatch a non-terminating/bounded-infinite compute workload sufficient for the host's existing TDR watchdog. Poll only the driver removal status at a bounded interval; emit the exact failed HRESULT when observed.
+Create a real `PlaybackWorker` on the selected adapter in the child and dispatch a non-terminating/bounded-infinite compute workload on that worker's exact D3D11 device. Poll only the driver removal status at a bounded interval; emit the exact failed HRESULT when observed.
 
 - [ ] **Step 3: Route observation through production authority**
 
@@ -124,11 +128,15 @@ Commit `test(gpu): exercise genuine Windows device removal` with shader, harness
 
 - [ ] **Step 1: Add a deterministic evidence stream**
 
-Mark pre-loss frames with a sequence/generation identity and emit output observations around the real removal. Record blackout start/end and fallback/rebuild state.
+Flush a structured destructive checkpoint immediately after removal observation and a separate
+recovery result checkpoint. Merge JSONL records on success; preserve parsed partial evidence plus
+raw stdout/stderr when the child fails after destructive work begins.
+
+Seed the production worker cache with a GPU frame carrying a CPU fallback and a generation identity, then submit it through a real output runtime before removal. Record recovery timing, fallback/rebuild state, and post-loss output.
 
 - [ ] **Step 2: Enforce recovery assertions**
 
-Require generation advance, active-epoch real token, zero dead-fence waits, zero remaining readback/frame retains, no pre-loss frame after recovery boundary, blackout within the documented bound, and coherent CPU fallback or rebuilt GPU output.
+Require generation advance, active-epoch real token, zero dead-fence waits, zero remaining readback/frame retains, rejection of the pre-loss GPU frame, CPU cache recovery, and coherent resumed output within ten seconds.
 
 - [ ] **Step 3: Run the complete opt-in scenario**
 
@@ -172,4 +180,3 @@ Review child containment, watchdog behavior, device-loss lock order, token epoch
 - [ ] **Step 5: Push and open the final dependency PR**
 
 Push through the credential-helper hook, open the PR with hardware evidence and safety model, and stop for the user to merge.
-

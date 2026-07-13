@@ -179,16 +179,15 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
 
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(surface);
-    std::shared_ptr<void> retained = lease.retainNativeHandle();
-    QVERIFY(retained != nullptr);
-    QCOMPARE(static_cast<ID3D11Texture2D*>(retained.get()), texture.Get());
+    QVERIFY(lease.nativeHandle() != nullptr);
+    QCOMPARE(static_cast<ID3D11Texture2D*>(lease.nativeHandle()), texture.Get());
 
     surface->retainUntilFenceRetired(5);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
     surface->retainUntilFenceRetired(3);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
     surface.reset();
-    QCOMPARE(static_cast<ID3D11Texture2D*>(retained.get()), texture.Get());
+    QCOMPARE(static_cast<ID3D11Texture2D*>(lease.nativeHandle()), texture.Get());
 #endif
 }
 

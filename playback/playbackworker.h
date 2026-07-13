@@ -80,6 +80,8 @@ class PlaybackWorker : public QThread {
     friend class TestStagingFence;
     friend class TestPlaybackWorker;
     friend class TestGpuDeviceLostWorker;
+    friend class WinGpuFaultWorkerOracle;
+    std::atomic<qint64> m_gpuLastAbandonedRetainsForTest{0};
 #endif
 public:
     struct ResidencyWindowParams {

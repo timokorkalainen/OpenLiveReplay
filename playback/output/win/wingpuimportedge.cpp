@@ -50,6 +50,13 @@ namespace {
 constexpr const char* kMfHardwareDecoderEnv = "OLR_MF_VIDEO_ENABLE_HARDWARE";
 constexpr int kD3DReadbackFenceTimeoutMs = 2000;
 
+uintptr_t deviceDomainId(ID3D11Device* device) {
+    ComPtr<IUnknown> identity;
+    return device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&identity)))
+               ? reinterpret_cast<uintptr_t>(identity.Get())
+               : 0;
+}
+
 class ScopedHardwareDecoderProbeFlag {
 public:
     ScopedHardwareDecoderProbeFlag()
@@ -179,6 +186,11 @@ public:
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_renderFence; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
+    void seedCpuCacheForTest(CpuPlanes planes) const {
+        if (!planes.isValid()) return;
+        QMutexLocker locker(&m_cacheMutex);
+        m_cpuCache.insert(int(planes.format), std::move(planes));
+    }
 
 private:
     std::shared_ptr<D3D11GpuSurface> m_surface;
@@ -275,7 +287,8 @@ struct WinGpuImportEdge::Impl {
         if (!device) return false;
         const HRESULT reason = device->GetDeviceRemovedReason();
         if (FAILED(reason)) {
-            WinGpuImportEdge::publishDeviceRemovedForMonitor(reason, deviceAuthorityEpoch);
+            WinGpuImportEdge::publishDeviceRemovedForMonitor(reason, deviceAuthorityEpoch,
+                                                             deviceDomainId(device.Get()));
             deviceLost.store(true, std::memory_order_release);
             return true;
         }
@@ -286,10 +299,11 @@ struct WinGpuImportEdge::Impl {
 WinGpuImportEdge::WinGpuImportEdge() : m_impl(std::make_unique<Impl>()) {}
 
 uint64_t WinGpuImportEdge::publishDeviceRemovedForMonitor(HRESULT reason,
-                                                          uint64_t deviceAuthorityEpoch) {
+                                                          uint64_t deviceAuthorityEpoch,
+                                                          uintptr_t domainId) {
     if (SUCCEEDED(reason)) return 0;
     return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch, domainId);
 }
 
 WinGpuImportEdge::~WinGpuImportEdge() {
@@ -394,8 +408,7 @@ WinGpuImportEdge::createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& 
     if (!surface) return nullptr;
     GpuSyncReadScope scope;
     const GpuReadLease lease = scope.read(surface);
-    const std::shared_ptr<void> retained = lease.retainNativeHandle();
-    auto* texture = static_cast<ID3D11Texture2D*>(retained.get());
+    auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
     ComPtr<ID3D11Device> device;
     if (texture) texture->GetDevice(&device);
     return makeD3D11GpuFence(device.Get());
@@ -418,7 +431,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
                                                         uint64_t* submittedFenceValue) {
 #endif
     if (!surface) return FrameHandle();
-    if (renderFence && !renderFence->isCompatibleWith(*surface)) return FrameHandle();
+    if (renderFence && !renderFence->isCompatibleWith(surface)) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
@@ -437,6 +450,20 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
 #endif
     return FrameHandle(std::move(data), meta);
 }
+
+#if defined(OLR_GPU_PIPELINE_BUILD) && defined(OLR_UNIT_TEST)
+FrameHandle WinGpuImportEdge::makeGpuFrameHandleWithCachedCpuForTest(
+    std::shared_ptr<D3D11GpuSurface> surface, FrameMetadata meta,
+    std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge, uint64_t* submittedFenceValue,
+    CpuPlanes cachedCpu) {
+    FrameHandle handle =
+        makeGpuFrameHandleForTest(std::move(surface), std::move(meta), std::move(renderFence),
+                                  std::move(charge), submittedFenceValue);
+    const auto data = std::dynamic_pointer_cast<const D3D11IGpuFrameData>(handle.dataPtr());
+    if (data) data->seedCpuCacheForTest(std::move(cachedCpu));
+    return handle;
+}
+#endif
 
 void WinGpuImportEdge::setImportTapForTest(std::function<void(const FrameHandle&)> tap) {
     if (!m_impl) return;
@@ -473,8 +500,7 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(m_surface);
     {
-        const std::shared_ptr<void> retained = lease.retainNativeHandle();
-        auto* src = static_cast<ID3D11Texture2D*>(retained.get());
+        auto* src = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         ComPtr<ID3D11Device> retainedDevice;
         if (src) src->GetDevice(&retainedDevice);
         ID3D11Device* device = retainedDevice.Get();

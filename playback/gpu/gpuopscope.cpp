@@ -62,13 +62,13 @@ bool GpuOpScope::finalizeSubmitted(GpuSubmitOutcome outcome) {
     m_fenceValue = fenceValue;
     if (fenceValue == 0) {
         m_registry.noteSignalFailure();
-        GpuDeviceLossMonitor::instance().recordSubmissionFailure();
+        GpuDeviceLossMonitor::instance().recordSubmissionFailure(m_fence->deviceDomainId());
         retireTracked(std::numeric_limits<uint64_t>::max());
         return false;
     }
     retireTracked(fenceValue);
     if (outcome == GpuSubmitOutcome::SubmittedWithError) {
-        GpuDeviceLossMonitor::instance().recordSubmissionFailure();
+        GpuDeviceLossMonitor::instance().recordSubmissionFailure(m_fence->deviceDomainId());
         return false;
     }
     return true;

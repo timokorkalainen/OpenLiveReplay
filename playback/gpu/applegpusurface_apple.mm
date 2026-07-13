@@ -200,12 +200,12 @@ protected:
     void* nativeHandle() const override {
         return m_pixelBuffer ? CVPixelBufferGetIOSurface(m_pixelBuffer) : nullptr;
     }
-    std::shared_ptr<void> retainNativeHandle() const override {
+    GpuOwnedNativeHandle retainNativeHandle() const override {
         IOSurfaceRef surface = m_pixelBuffer ? CVPixelBufferGetIOSurface(m_pixelBuffer) : nullptr;
         if (!surface) return {};
         CFRetain(surface);
-        return std::shared_ptr<void>(surface,
-                                     [](void* value) { CFRelease(static_cast<CFTypeRef>(value)); });
+        return GpuOwnedNativeHandle::adopt(
+            surface, [](void* value) { CFRelease(static_cast<CFTypeRef>(value)); });
     }
 
 private:
@@ -287,8 +287,7 @@ CVPixelBufferRef retainApplePixelBufferWrapper(const std::shared_ptr<GpuSurface>
     if (!surface || !surface->isValid()) return nullptr;
     GpuSyncReadScope scope;
     const GpuReadLease lease = scope.read(surface);
-    const std::shared_ptr<void> retained = lease.retainNativeHandle();
-    IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(retained.get());
+    IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
     if (!ioSurface) return nullptr;
 
     CVPixelBufferRef pixelBuffer = nullptr;

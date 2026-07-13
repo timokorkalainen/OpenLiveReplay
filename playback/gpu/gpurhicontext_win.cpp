@@ -34,6 +34,13 @@ namespace {
 
 enum class D3DDeviceKind { Hardware, Warp };
 
+uintptr_t deviceDomainId(ID3D11Device* device) {
+    ComPtr<IUnknown> identity;
+    return device && SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&identity)))
+               ? reinterpret_cast<uintptr_t>(identity.Get())
+               : 0;
+}
+
 bool createD3D11Device(D3DDeviceKind kind, ComPtr<ID3D11Device>* device,
                        ComPtr<ID3D11DeviceContext>* context) {
     if (!device || !context) return false;
@@ -226,6 +233,25 @@ bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
 
+bool GpuRhiContext::pollDeviceLoss() const {
+    if (!m_impl || !m_impl->valid) return false;
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    const uint64_t authority = m_impl->deviceAuthorityEpoch;
+    m_impl->thread.invoke([&] {
+        QRhi* rhi = m_impl->thread.rhi;
+        const auto* handles =
+            rhi ? static_cast<const QRhiD3D11NativeHandles*>(rhi->nativeHandles()) : nullptr;
+        auto* device = handles ? static_cast<ID3D11Device*>(handles->dev) : nullptr;
+        const HRESULT reason = device ? device->GetDeviceRemovedReason() : HRESULT(S_OK);
+        if (!device || !FAILED(reason)) return;
+        if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, authority,
+                deviceDomainId(device)) != 0)
+            m_impl->deviceLost.store(true, std::memory_order_release);
+    });
+    return m_impl->deviceLost.load(std::memory_order_acquire);
+}
+
 void GpuRhiContext::injectDeviceLostForTest() {
     if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
 }
@@ -254,9 +280,10 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>&, F
                 // Driver-authoritative loss: mint the provenance-bound token and hand
                 // it to the loss latch so the worker's recovery can free held surfaces
                 // WITHOUT waiting on the (now dead) fences.
-                GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                    DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
-                m_impl->deviceLost.store(true, std::memory_order_release);
+                if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
+                        deviceDomainId(device)) != 0)
+                    m_impl->deviceLost.store(true, std::memory_order_release);
             }
         });
         (void) invoked;
@@ -279,15 +306,20 @@ std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
 }
 
 #ifdef OLR_UNIT_TEST
+uint64_t GpuRhiContext::captureD3D11RemovalAuthorityForTest() {
+    return GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
+}
+
 D3D11RemovalObservationForTest
-GpuRhiContext::observeD3D11RemovalForTest(void* opaqueDevice, uint64_t observedGeneration) {
+GpuRhiContext::observeD3D11RemovalForTest(void* opaqueDevice, uint64_t deviceAuthorityEpoch) {
     auto* device = static_cast<ID3D11Device*>(opaqueDevice);
     if (!device) return {};
     const HRESULT reason = device->GetDeviceRemovedReason();
     uint64_t generation = 0;
     if (FAILED(reason)) {
         generation = GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, observedGeneration);
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
+            deviceDomainId(device));
     }
     return D3D11RemovalObservationForTest{int64_t(reason), generation};
 }

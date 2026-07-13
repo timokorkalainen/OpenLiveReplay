@@ -105,21 +105,28 @@ Backend-local detection authority owns minting. Ordinary code cannot name or cal
 
 Every authoritative Apple loss observation routes through the same atomic real-loss publication operation. Delayed or mismatched tokens are rejected and cannot cross a clear/reset boundary.
 
-Injected loss remains tokenless and uses bounded live-device draining. Real loss uses token-gated no-wait abandonment and never waits on a dead fence.
+Injected loss remains tokenless and uses one total bounded live-device drain deadline. A submission
+failure records where submission first failed but cannot reject later driver-authoritative proof:
+one adapter reset may kill several owned device domains, so every current-authority dead domain is
+published into the same loss epoch. Real-loss tokens carry device-domain identity, and one
+token-gated registry scan releases only matching entries. Other live-device domains remain subject
+to the bounded drain, which stops traversal and driver calls when its total deadline expires.
 
 ## Windows real-fault lane
 
-The Windows fault lane is an opt-in test program isolated in a child process. It is never part of ordinary application execution and never changes Windows TDR registry settings.
+The Windows fault lane is an opt-in test program isolated in a child process. It is never part of ordinary application execution. It reads TDR registry policy to reject non-recovering or unbounded configurations, but never changes registry settings.
 
 ### Capability gate
 
 The parent records adapter identity and rejects destructive execution unless all conditions hold:
 
 - `OLR_GPU_FAULT_LANE=1` is set;
+- `OLR_GPU_FAULT_DEDICATED_RUNNER=1` explicitly asserts whole-adapter isolation;
 - the backend is a real hardware D3D adapter, not WARP or Null;
 - execution is not under an unsupported remote/virtual session;
 - required D3D feature and fence support are present;
-- the child process and watchdog can be created.
+- TDR is configured for bounded recovery, with Microsoft's defaults used for absent values;
+- a kill-on-close Job Object, child process, and watchdog can be created.
 
 An unsupported environment reports a precise skip reason. Once explicitly enabled on supported hardware, a failed trigger, missing observation, timeout, or incorrect recovery is a test failure.
 
@@ -135,7 +142,7 @@ The child submits bounded long-running GPU work, signals a real fence value, and
 
 ### Genuine device-removal probe
 
-A dedicated child creates its own device on the selected adapter and triggers a bounded GPU hang suitable for the host's existing TDR policy. The parent watchdog bounds total execution and terminates only the isolated child if recovery fails.
+A dedicated child creates a real `PlaybackWorker` on the selected adapter and triggers a bounded GPU hang on that worker's exact D3D11 device. The hang shader reads the exact worker-cache surface whose fenced retain and destruction are observed, rather than an unrelated resource. The child verifies membership in the parent's named kill-on-close Job Object before device creation. The parent watchdog bounds total execution and terminates the contained process tree if recovery fails. The Job Object contains CPU processes, not already-submitted GPU work; the admitted TDR recovery policy and dedicated adapter runner are the GPU-side safety boundary.
 
 The application-side harness must observe a real failed `GetDeviceRemovedReason()` or equivalent authoritative backend result. It then verifies:
 
@@ -146,6 +153,14 @@ The application-side harness must observe a real failed `GetDeviceRemovedReason(
 - output produced no stale pre-loss frame;
 - blackout/recovery stayed within the documented bound;
 - CPU fallback or rebuilt GPU output resumed coherently.
+
+The contained child keeps the real `PlaybackWorker`, hardware QRhi device, cached GPU frame with CPU
+fallback, and output sink alive while it triggers TDR on that same device. The child flushes a
+structured removal checkpoint before recovery and a second recovery result record afterward; the
+parent merges successful JSONL checkpoints and nests any partial checkpoint beside raw stdout and
+stderr on abnormal exit. Recovery evidence is
+therefore taken from production worker orchestration, cache sanitization, generation rejection, and
+post-loss output submission—not inferred from a reset of a separate device on the same adapter.
 
 Logs preserve adapter identity, removal HRESULT, generation transition, fence values, registry counts, recovery timing, and child exit status.
 
@@ -162,6 +177,11 @@ Normal frame processing must add:
 - no `std::function` or other type-erased callback;
 - no duplicate retirement storage;
 - no reference-count churn beyond the lifetime retains required by the existing protocol.
+
+Shared-surface reads use an aliasing `shared_ptr` to the existing surface control block, so they add
+no allocation and no extra native `AddRef`/`CFRetain`. The raw-surface encoder overload takes an
+independently retained native reference because it has no shared surface owner; that retained
+resource is ownership-safe even if a lease value survives its creating expression.
 
 Performance measurements compare the parent commit and implementation commit using repeated runs and medians:
 

@@ -2,11 +2,13 @@
 
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpusurface.h"
+#include "playback/gpu/gpusurfacelease.h"
 
 #include <QMutex>
 #include <QMutexLocker>
 #include <QSet>
 #include <QVector>
+#include <QElapsedTimer>
 
 #include <algorithm>
 #include <utility>
@@ -18,6 +20,7 @@ struct ReadbackRetain {
     std::shared_ptr<GpuSurface> surface;
     std::shared_ptr<GpuFence> fence;
     uint64_t fenceValue = 0;
+    uintptr_t deviceDomainId = 0;
 };
 
 struct RetainerMetrics {
@@ -70,8 +73,8 @@ void registerRetireBatch(std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
     retains.reserve(retains.size() + count);
     for (qsizetype i = 0; i < count; ++i) {
         if (!surfaces[i]) continue;
-        retains.append(
-            ReadbackRetain{nextReadbackRetainId()++, std::move(surfaces[i]), fence, fenceValue});
+        retains.append(ReadbackRetain{nextReadbackRetainId()++, std::move(surfaces[i]), fence,
+                                      fenceValue, fence->deviceDomainId()});
     }
     retainerMetrics().highWaterMark = std::max(retainerMetrics().highWaterMark, retains.size());
 }
@@ -107,14 +110,28 @@ qsizetype pendingCount() {
 }
 
 qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice) {
-    (void) deadDevice;
+    return abandonAllNoWait(std::vector<DeadDeviceToken>{deadDevice});
+}
+
+qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) {
+    if (deadDevices.empty()) return 0;
+    QSet<quintptr> deadDomains;
+    deadDomains.reserve(qsizetype(deadDevices.size()));
+    for (const DeadDeviceToken& token : deadDevices)
+        deadDomains.insert(quintptr(token.deviceDomainId()));
+
     QMutexLocker locker(&readbackRetainMutex());
-    const qsizetype dropped = readbackRetains().size();
-    readbackRetains().clear();
+    auto& retains = readbackRetains();
+    qsizetype dropped = 0;
+    for (qsizetype i = retains.size() - 1; i >= 0; --i) {
+        if (!deadDomains.contains(quintptr(retains.at(i).deviceDomainId))) continue;
+        retains.removeAt(i);
+        ++dropped;
+    }
     return dropped;
 }
 
-int drainWithBoundedWait(int perFenceTimeoutMs) {
+int drainWithBoundedWait(int totalTimeoutMs) {
     QVector<ReadbackRetain> snapshot;
     {
         QMutexLocker locker(&readbackRetainMutex());
@@ -124,10 +141,20 @@ int drainWithBoundedWait(int perFenceTimeoutMs) {
     QSet<uint64_t> retiredIds;
     retiredIds.reserve(snapshot.size());
     uint64_t timedOut = 0;
-    for (const ReadbackRetain& retain : snapshot) {
-        bool retired = !retain.surface || !retain.fence || retain.fenceValue == 0 ||
-                       retain.fence->completedValue() >= retain.fenceValue;
-        if (!retired) retired = retain.fence->wait(retain.fenceValue, perFenceTimeoutMs);
+    QElapsedTimer elapsed;
+    elapsed.start();
+    for (qsizetype i = 0; i < snapshot.size(); ++i) {
+        const ReadbackRetain& retain = snapshot.at(i);
+        bool retired = !retain.surface || !retain.fence || retain.fenceValue == 0;
+        int remainingMs = qMax(0, totalTimeoutMs - int(elapsed.elapsed()));
+        if (!retired && remainingMs <= 0) {
+            timedOut += uint64_t(snapshot.size() - i);
+            break;
+        }
+        if (!retired) retired = retain.fence->completedValue() >= retain.fenceValue;
+        remainingMs = qMax(0, totalTimeoutMs - int(elapsed.elapsed()));
+        if (!retired && remainingMs > 0)
+            retired = retain.fence->wait(retain.fenceValue, remainingMs);
         if (retired)
             retiredIds.insert(retain.id);
         else

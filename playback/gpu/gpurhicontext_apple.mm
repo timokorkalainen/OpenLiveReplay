@@ -36,6 +36,13 @@
 // other TU can construct a DeadDeviceToken from the Apple backend.
 namespace {
 
+uintptr_t metalDeviceDomainId(QRhi* rhi) {
+    const auto* handles =
+        rhi ? static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles()) : nullptr;
+    id<MTLCommandQueue> queue = handles ? static_cast<id<MTLCommandQueue>>(handles->cmdQueue) : nil;
+    return reinterpret_cast<uintptr_t>(queue ? queue.device : nil);
+}
+
 qsizetype planeBytes(int stride, int rows) {
     return static_cast<qsizetype>(stride) * static_cast<qsizetype>(rows);
 }
@@ -613,6 +620,21 @@ bool GpuRhiContext::deviceLost() const {
     return m_impl && m_impl->deviceLost.load(std::memory_order_acquire);
 }
 
+bool GpuRhiContext::pollDeviceLoss() const {
+    if (!m_impl || !m_impl->valid) return false;
+    if (m_impl->deviceLost.load(std::memory_order_acquire)) return true;
+    const uint64_t authority = m_impl->deviceAuthorityEpoch;
+    m_impl->thread.invoke([&] {
+        QRhi* rhi = m_impl->thread.rhi;
+        if (!rhi || !rhi->isDeviceLost()) return;
+        if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, authority,
+                metalDeviceDomainId(rhi)) != 0)
+            m_impl->deviceLost.store(true, std::memory_order_release);
+    });
+    return m_impl->deviceLost.load(std::memory_order_acquire);
+}
+
 void GpuRhiContext::injectDeviceLostForTest() {
     if (m_impl) m_impl->deviceLost.store(true, std::memory_order_release);
 }
@@ -649,18 +671,20 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                     // Driver-authoritative loss: mint the provenance-bound token so
                     // the worker's recovery frees held surfaces without waiting on
                     // the dead device's fences.
-                    GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                    m_impl->deviceLost.store(true, std::memory_order_release);
+                    if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                            DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch,
+                            metalDeviceDomainId(rhi)) != 0)
+                        m_impl->deviceLost.store(true, std::memory_order_release);
                     result = CpuPlanes{};
                     return;
                 }
             } else {
                 if (begin == QRhi::FrameOpDeviceLost || rhi->isDeviceLost()) {
                     // LOCK RULE: this render-thread poll touches no m_bufferMutex.
-                    GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                    m_impl->deviceLost.store(true, std::memory_order_release);
+                    if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                            DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch,
+                            metalDeviceDomainId(rhi)) != 0)
+                        m_impl->deviceLost.store(true, std::memory_order_release);
                 }
                 result = CpuPlanes{};
                 return;
@@ -675,9 +699,10 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                 return;
             }
             if (rhi && rhi->isDeviceLost()) {
-                GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                    DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                m_impl->deviceLost.store(true, std::memory_order_release);
+                if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch,
+                        metalDeviceDomainId(rhi)) != 0)
+                    m_impl->deviceLost.store(true, std::memory_order_release);
                 result = CpuPlanes{};
                 return;
             }
@@ -694,9 +719,10 @@ CpuPlanes GpuRhiContext::importAndReadback(const std::shared_ptr<GpuSurface>& su
                     if (result.isValid()) return;
                 }
                 if (rhi && rhi->isDeviceLost()) {
-                    GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-                        DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch);
-                    m_impl->deviceLost.store(true, std::memory_order_release);
+                    if (GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+                            DeadDeviceToken::Provenance::RhiFrameOpDeviceLost, deviceAuthorityEpoch,
+                            metalDeviceDomainId(rhi)) != 0)
+                        m_impl->deviceLost.store(true, std::memory_order_release);
                     result = CpuPlanes{};
                     return;
                 }

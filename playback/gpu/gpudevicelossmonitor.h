@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 class GpuRhiContext;
 class WinGpuImportEdge;
@@ -27,7 +28,7 @@ public:
     // Idempotent while the latch is already lost. A fresh loss epoch begins only
     // after clearForRebuild() has cleared the latch following a successful rebuild.
     uint64_t recordLoss();
-    uint64_t recordSubmissionFailure();
+    uint64_t recordSubmissionFailure(uintptr_t deviceDomainId);
 
     // Carries the DeadDeviceToken from the driver-authoritative detection site to
     // the worker's recovery path (handleGpuDeviceLoss), which reads realLossToken()
@@ -39,6 +40,7 @@ public:
     // mark is rejected unless its creation-time authority epoch still matches the
     // current rebuild epoch.
     std::optional<DeadDeviceToken> realLossToken() const;
+    std::vector<DeadDeviceToken> realLossTokens() const;
 
     bool consumeLossEvent();
     // Invalidate authorities owned by the old device before constructing its
@@ -58,7 +60,7 @@ private:
 
     uint64_t captureDeviceAuthorityEpoch() const;
     uint64_t publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
-                                   uint64_t deviceAuthorityEpoch);
+                                   uint64_t deviceAuthorityEpoch, uintptr_t deviceDomainId);
 
     std::atomic<bool> m_lost{false};
     std::atomic<uint64_t> m_lossCount{0};
@@ -68,6 +70,7 @@ private:
     uint64_t m_deviceAuthorityEpoch = 1;            // guarded by m_epochMutex
     bool m_rebuildInProgress = false;               // guarded by m_epochMutex
     std::optional<DeadDeviceToken> m_realLossToken; // guarded by m_epochMutex
+    std::vector<DeadDeviceToken> m_realLossTokens;  // guarded by m_epochMutex
 };
 
 #endif // OLR_GPUDEVICELOSSMONITOR_H

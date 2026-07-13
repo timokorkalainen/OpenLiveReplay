@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 class DeadDeviceToken;
 class GpuFence;
@@ -21,7 +22,8 @@ void registerRetireBatch(std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
 void drainCompleted();
 qsizetype pendingCount();
 qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice);
-int drainWithBoundedWait(int perFenceTimeoutMs);
+qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices);
+int drainWithBoundedWait(int totalTimeoutMs);
 qsizetype highWaterMark();
 uint64_t timeoutCount();
 uint64_t signalFailureCount();

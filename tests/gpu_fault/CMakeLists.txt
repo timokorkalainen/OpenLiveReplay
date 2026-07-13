@@ -4,20 +4,28 @@ endif()
 
 qt_add_executable(win_gpu_fault_child
     win_gpu_fault_child.cpp
-    win_gpu_fault_protocol.h)
+    win_gpu_fault_protocol.h
+    win_gpu_fault_safety.h
+    win_gpu_fault_worker_oracle.h
+    win_gpu_fault_worker_oracle.cpp)
 target_include_directories(win_gpu_fault_child PRIVATE "${CMAKE_SOURCE_DIR}")
 target_compile_definitions(win_gpu_fault_child PRIVATE
     OLR_UNIT_TEST=1
     OLR_GPU_FAULT_LANE_BUILD=1
     OLR_GPU_FAULT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(win_gpu_fault_child PRIVATE
-    olr_test_playback Qt6::Core d3d11 dxgi d3dcompiler ole32)
+    olr_test_playback Qt6::Core Qt6::GuiPrivate d3d11 dxgi d3dcompiler ole32 advapi32)
 
 qt_add_executable(win_gpu_fault_parent
     win_gpu_fault_parent.cpp
-    win_gpu_fault_protocol.h)
+    win_gpu_fault_protocol.h
+    win_gpu_fault_safety.h
+    win_gpu_fault_worker_oracle.h
+    win_gpu_fault_worker_oracle.cpp)
 target_include_directories(win_gpu_fault_parent PRIVATE "${CMAKE_SOURCE_DIR}")
-target_link_libraries(win_gpu_fault_parent PRIVATE Qt6::Core)
+target_compile_definitions(win_gpu_fault_parent PRIVATE OLR_UNIT_TEST=1)
+target_link_libraries(win_gpu_fault_parent PRIVATE
+    olr_test_playback Qt6::Core Qt6::GuiPrivate d3d11 dxgi advapi32)
 
 add_test(NAME win_gpu_fault_protocol_selftest
     COMMAND win_gpu_fault_parent --self-test "$<TARGET_FILE:win_gpu_fault_child>")

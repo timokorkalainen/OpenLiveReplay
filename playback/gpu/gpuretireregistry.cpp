@@ -21,8 +21,13 @@ qsizetype GpuRetireRegistry::abandonAllNoWait(const DeadDeviceToken& deadDevice)
     return gpuRetireDetail::abandonAllNoWait(deadDevice);
 }
 
-int GpuRetireRegistry::drainWithBoundedWait(int perFenceTimeoutMs) const {
-    return gpuRetireDetail::drainWithBoundedWait(perFenceTimeoutMs);
+qsizetype
+GpuRetireRegistry::abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) const {
+    return gpuRetireDetail::abandonAllNoWait(deadDevices);
+}
+
+int GpuRetireRegistry::drainWithBoundedWait(int totalTimeoutMs) const {
+    return gpuRetireDetail::drainWithBoundedWait(totalTimeoutMs);
 }
 
 GpuRetireDiagnostics GpuRetireRegistry::diagnostics() const {

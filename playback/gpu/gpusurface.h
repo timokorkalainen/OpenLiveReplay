@@ -7,9 +7,45 @@
 
 #include <cstdint>
 #include <memory>
+#include <utility>
 
 class GpuReadLease;
-class GpuFence;
+
+class GpuOwnedNativeHandle final {
+public:
+    using ReleaseFn = void (*)(void*);
+
+    GpuOwnedNativeHandle() = default;
+    GpuOwnedNativeHandle(const GpuOwnedNativeHandle&) = delete;
+    GpuOwnedNativeHandle& operator=(const GpuOwnedNativeHandle&) = delete;
+    GpuOwnedNativeHandle(GpuOwnedNativeHandle&& other) noexcept
+        : m_handle(std::exchange(other.m_handle, nullptr)),
+          m_release(std::exchange(other.m_release, nullptr)) {}
+    GpuOwnedNativeHandle& operator=(GpuOwnedNativeHandle&& other) noexcept {
+        if (this == &other) return *this;
+        reset();
+        m_handle = std::exchange(other.m_handle, nullptr);
+        m_release = std::exchange(other.m_release, nullptr);
+        return *this;
+    }
+    ~GpuOwnedNativeHandle() { reset(); }
+
+    static GpuOwnedNativeHandle adopt(void* handle, ReleaseFn release) {
+        return GpuOwnedNativeHandle(handle, release);
+    }
+    void* get() const { return m_handle; }
+
+private:
+    GpuOwnedNativeHandle(void* handle, ReleaseFn release) : m_handle(handle), m_release(release) {}
+    void reset() {
+        if (m_handle && m_release) m_release(m_handle);
+        m_handle = nullptr;
+        m_release = nullptr;
+    }
+
+    void* m_handle = nullptr;
+    ReleaseFn m_release = nullptr;
+};
 
 struct GpuSurfaceDesc {
     FramePixelFormat format = FramePixelFormat::Nv12;
@@ -51,13 +87,12 @@ protected:
     // destruction discharges the retire obligation. A new op site that tries
     // surface->nativeHandle() directly no longer compiles (negative-compile test).
     friend class GpuReadLease;
-    friend class GpuFence;
     // IOSurfaceRef on Apple, ID3D11Texture2D* on Windows.
     virtual void* nativeHandle() const = 0;
-    // Backend implementations may return an independently owned reference for
-    // synchronous interop. Unlike nativeHandle(), this object can safely outlive
-    // the lease callback because its deleter releases the platform reference.
-    virtual std::shared_ptr<void> retainNativeHandle() const { return {}; }
+    // Raw-pointer callers cannot contribute a shared GpuSurface owner, so backend
+    // implementations provide a move-only native reference for the lease lifetime.
+    // This is deliberately allocation-free on the interop hot path.
+    virtual GpuOwnedNativeHandle retainNativeHandle() const { return {}; }
     virtual uint32_t nativeSubresource() const { return 0; }
 };
 

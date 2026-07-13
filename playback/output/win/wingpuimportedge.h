@@ -10,6 +10,7 @@
 #include <QString>
 
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -61,6 +62,12 @@ public:
                                                  std::shared_ptr<GpuFence> renderFence = nullptr,
                                                  GpuBudgetCharge charge = {},
                                                  uint64_t* submittedFenceValue = nullptr);
+#ifdef OLR_UNIT_TEST
+    static FrameHandle makeGpuFrameHandleWithCachedCpuForTest(
+        std::shared_ptr<D3D11GpuSurface> surface, FrameMetadata meta,
+        std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge,
+        uint64_t* submittedFenceValue, CpuPlanes cachedCpu);
+#endif
 #else
     static FrameHandle makeGpuFrameHandleForTest(std::shared_ptr<D3D11GpuSurface> surface,
                                                  FrameMetadata meta,
@@ -77,7 +84,8 @@ public:
 private:
     WinGpuImportEdge();
 #ifdef _WIN32
-    static uint64_t publishDeviceRemovedForMonitor(HRESULT reason, uint64_t deviceAuthorityEpoch);
+    static uint64_t publishDeviceRemovedForMonitor(HRESULT reason, uint64_t deviceAuthorityEpoch,
+                                                   uintptr_t deviceDomainId);
 #endif
 
     struct Impl;

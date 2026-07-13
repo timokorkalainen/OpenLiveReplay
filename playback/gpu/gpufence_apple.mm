@@ -79,6 +79,9 @@ public:
     uint64_t completedValue() const override {
         return m_event ? m_event.signaledValue : uint64_t(0);
     }
+    uintptr_t deviceDomainId() const override {
+        return reinterpret_cast<uintptr_t>(m_queue ? m_queue.device : nil);
+    }
 
 private:
     id<MTLSharedEvent> m_event = nil;

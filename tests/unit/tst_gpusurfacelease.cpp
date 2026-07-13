@@ -28,9 +28,11 @@ struct GpuDeviceLossMonitorTestAuthority {
     static uint64_t capture() {
         return GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     }
-    static uint64_t publish(uint64_t deviceAuthorityEpoch = capture()) {
+    static uint64_t publish(uint64_t deviceAuthorityEpoch = capture(),
+                            uintptr_t deviceDomainId = 0) {
         return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
+            deviceDomainId);
     }
 };
 #endif
@@ -57,10 +59,17 @@ static_assert(!std::is_default_constructible<DeadDeviceToken>::value,
               "DeadDeviceToken must not be default-constructible (mint-only).");
 static_assert(!std::is_constructible<DeadDeviceToken, DeadDeviceToken::Provenance, uint64_t>::value,
               "DeadDeviceToken's provenance constructor must be private (driver-mint-only).");
+static_assert(!std::is_constructible<DeadDeviceToken, DeadDeviceToken::Provenance, uint64_t,
+                                     uintptr_t>::value,
+              "DeadDeviceToken's device-scoped constructor must be private (driver-mint-only).");
 static_assert(!std::is_copy_constructible<GpuReadLease>::value,
               "GpuReadLease must not escape a synchronous callback by copy.");
 static_assert(!std::is_move_constructible<GpuReadLease>::value,
               "GpuReadLease must not escape a synchronous callback by move.");
+static_assert(!std::is_copy_constructible<GpuOwnedNativeHandle>::value,
+              "The raw-surface native owner must remain unique.");
+static_assert(std::is_nothrow_move_constructible<GpuOwnedNativeHandle>::value,
+              "The allocation-free native owner must transfer without throwing.");
 
 // A surface whose native handle is a known sentinel. nativeHandle() is protected,
 // mirroring the production surfaces, so the ONLY way the test reads it is via a lease.
@@ -81,6 +90,7 @@ private:
 // Fence with a test-controllable completed watermark.
 class FakeFence : public GpuFence {
 public:
+    explicit FakeFence(uintptr_t deviceDomainId = 0) : m_deviceDomainId(deviceDomainId) {}
     uint64_t signal() override {
         ++m_signalCalls;
         return ++m_signalled;
@@ -95,6 +105,7 @@ public:
         ++m_completedCalls;
         return m_completed;
     }
+    uintptr_t deviceDomainId() const override { return m_deviceDomainId; }
     void setCompleted(uint64_t v) { m_completed = v; }
     void setRetireOnWait(bool retire) { m_retireOnWait = retire; }
     bool waitSawUnlockedRetainer() const { return m_waitSawUnlockedRetainer; }
@@ -110,6 +121,7 @@ private:
     int m_signalCalls = 0;
     mutable int m_completedCalls = 0;
     mutable bool m_completedSawUnlockedRetainer = false;
+    uintptr_t m_deviceDomainId = 0;
 };
 
 class ZeroSignalFence final : public GpuFence {
@@ -144,6 +156,8 @@ private slots:
     void opScopeRetainsAfterSubmittedError();
     void opScopeQuarantinesOnZeroSignal();
     void zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade();
+    void deadTokenAbandonsOnlyMatchingDeviceDomain();
+    void multipleDeadTokensAbandonInOnePass();
 };
 
 void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
@@ -155,6 +169,7 @@ void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
         const auto state = std::make_pair(lease.valid(), lease.desc().width);
         QVERIFY(state.first);
         QCOMPARE(state.second, 16);
+        QCOMPARE(lease.nativeHandle(), sentinel);
     }
 }
 
@@ -301,6 +316,54 @@ void TestGpuSurfaceLease::zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade(
     QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
     QCOMPARE(surface.use_count(), ownersBefore);
+    monitor.reset();
+}
+
+void TestGpuSurfaceLease::deadTokenAbandonsOnlyMatchingDeviceDomain() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    auto deadSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xB), true);
+    auto liveSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xC), true);
+    const long deadOwners = deadSurface.use_count();
+    const long liveOwners = liveSurface.use_count();
+    auto deadFence = std::make_shared<FakeFence>(11);
+    auto liveFence = std::make_shared<FakeFence>(22);
+    GpuRetireRegistry registry;
+    registry.registerRetire(deadSurface, deadFence, 1);
+    registry.registerRetire(liveSurface, liveFence, 1);
+
+    GpuDeviceLossMonitorTestAuthority::publish(authority, 11);
+    const auto token = monitor.realLossToken();
+    QVERIFY(token.has_value());
+    QCOMPARE(token->deviceDomainId(), uintptr_t(11));
+    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    QCOMPARE(deadSurface.use_count(), deadOwners);
+    QVERIFY(liveSurface.use_count() > liveOwners);
+
+    liveFence->setCompleted(1);
+    registry.drainCompleted();
+    QCOMPARE(liveSurface.use_count(), liveOwners);
+    monitor.reset();
+}
+
+void TestGpuSurfaceLease::multipleDeadTokensAbandonInOnePass() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    auto firstSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD), true);
+    auto secondSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xE), true);
+    const long firstOwners = firstSurface.use_count();
+    const long secondOwners = secondSurface.use_count();
+    GpuRetireRegistry registry;
+    registry.registerRetire(firstSurface, std::make_shared<FakeFence>(31), 1);
+    registry.registerRetire(secondSurface, std::make_shared<FakeFence>(32), 1);
+
+    GpuDeviceLossMonitorTestAuthority::publish(authority, 31);
+    GpuDeviceLossMonitorTestAuthority::publish(authority, 32);
+    QCOMPARE(registry.abandonAllNoWait(monitor.realLossTokens()), qsizetype(2));
+    QCOMPARE(firstSurface.use_count(), firstOwners);
+    QCOMPARE(secondSurface.use_count(), secondOwners);
     monitor.reset();
 }
 

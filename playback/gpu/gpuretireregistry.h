@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 class DeadDeviceToken;
 class GpuFence;
@@ -25,7 +26,8 @@ public:
     void drainCompleted() const;
     qsizetype pendingRetainCount() const;
     qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice) const;
-    int drainWithBoundedWait(int perFenceTimeoutMs) const;
+    qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) const;
+    int drainWithBoundedWait(int totalTimeoutMs) const;
     GpuRetireDiagnostics diagnostics() const;
 
 private:

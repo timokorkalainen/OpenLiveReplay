@@ -21,18 +21,21 @@ public:
 
     Provenance provenance() const { return m_provenance; }
     uint64_t observedGeneration() const { return m_generation; }
+    uintptr_t deviceDomainId() const { return m_deviceDomainId; }
 
 private:
     friend class GpuDeviceLossMonitor;
-    DeadDeviceToken(Provenance provenance, uint64_t generation)
-        : m_provenance(provenance), m_generation(generation) {}
+    DeadDeviceToken(Provenance provenance, uint64_t generation, uintptr_t deviceDomainId)
+        : m_provenance(provenance), m_generation(generation), m_deviceDomainId(deviceDomainId) {}
 
     Provenance m_provenance;
     uint64_t m_generation;
+    uintptr_t m_deviceDomainId = 0;
 };
 
-// A self-contained synchronous snapshot. It stores no GpuSurface pointer: metadata
-// is copied and any native backing is independently retained before read() returns.
+// A self-contained synchronous snapshot. Metadata is copied and the native backing
+// stays alive through either the caller's shared surface owner or a move-only native
+// reference acquired for the raw-pointer encoder overload.
 class GpuReadLease final {
 public:
     GpuReadLease(const GpuReadLease&) = delete;
@@ -42,28 +45,34 @@ public:
 
     GpuSurfaceDesc desc() const { return m_desc; }
     bool valid() const { return m_valid; }
-    std::shared_ptr<void> retainNativeHandle() const { return m_nativeHandle; }
+    void* nativeHandle() const { return m_nativeHandle; }
     uint32_t nativeSubresource() const { return m_nativeSubresource; }
 
 private:
     friend class GpuSyncReadScope;
 
     explicit GpuReadLease(const std::shared_ptr<GpuSurface>& surface)
-        : GpuReadLease(surface.get()) {}
+        : m_desc(surface ? surface->desc() : GpuSurfaceDesc{}),
+          m_valid(surface && surface->isValid()), m_surfaceOwner(surface),
+          m_nativeHandle(surface ? surface->nativeHandle() : nullptr),
+          m_nativeSubresource(surface ? surface->nativeSubresource() : 0) {}
     explicit GpuReadLease(GpuSurface* surface)
         : m_desc(surface ? surface->desc() : GpuSurfaceDesc{}),
           m_valid(surface && surface->isValid()),
-          m_nativeHandle(surface ? surface->retainNativeHandle() : std::shared_ptr<void>{}),
+          m_nativeOwner(surface ? surface->retainNativeHandle() : GpuOwnedNativeHandle{}),
+          m_nativeHandle(m_nativeOwner.get()),
           m_nativeSubresource(surface ? surface->nativeSubresource() : 0) {}
 
     GpuSurfaceDesc m_desc;
     bool m_valid = false;
-    std::shared_ptr<void> m_nativeHandle;
+    std::shared_ptr<GpuSurface> m_surfaceOwner;
+    GpuOwnedNativeHandle m_nativeOwner;
+    void* m_nativeHandle = nullptr;
     uint32_t m_nativeSubresource = 0;
 };
 
-// Captures a lease snapshot synchronously. The returned value contains no borrowed
-// pointer, including for the raw-surface overload used by the encoder.
+// Captures a lease snapshot synchronously. Every raw native pointer is backed by an
+// owner stored in the returned lease, including the raw-surface encoder overload.
 class GpuSyncReadScope final {
 public:
     GpuSyncReadScope() = default;

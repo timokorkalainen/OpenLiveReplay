@@ -22,6 +22,7 @@ jobs:
     timeout-minutes: 20
     env:
       OLR_GPU_FAULT_LANE: '1'
+      OLR_GPU_FAULT_DEDICATED_RUNNER: '1'
       OLR_GPU_FAULT_EVIDENCE: '${{ github.workspace }}\windows-gpu-fault-evidence.jsonl'
     steps:
       - uses: actions/checkout@v4

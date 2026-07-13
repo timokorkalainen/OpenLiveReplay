@@ -426,8 +426,7 @@ public:
         GpuSyncReadScope readScope;
         const GpuReadLease lease = readScope.read(surface);
         return [&] {
-            const std::shared_ptr<void> retained = lease.retainNativeHandle();
-            IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(retained.get());
+            IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
             if (!ioSurface) {
                 if (error) {
                     *error = QStringLiteral("encodeSurface: surface is not IOSurface-backed");

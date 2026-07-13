@@ -29,6 +29,9 @@ public:
     uint64_t signal() override { return m_context ? m_fence->signal(m_context) : 0; }
     bool wait(uint64_t value, int timeoutMs) override { return m_fence->wait(value, timeoutMs); }
     uint64_t completedValue() const override { return m_fence->completedValue(); }
+    uintptr_t deviceDomainId() const override {
+        return reinterpret_cast<uintptr_t>(m_deviceIdentity.Get());
+    }
 
 protected:
     bool isCompatibleWithNativeHandle(void* nativeHandle) const override {

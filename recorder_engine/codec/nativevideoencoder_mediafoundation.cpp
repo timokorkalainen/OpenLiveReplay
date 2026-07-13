@@ -828,8 +828,7 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
     GpuSyncReadScope readScope;
     const GpuReadLease lease = readScope.read(surface);
     const bool wrapped = [&] {
-        const std::shared_ptr<void> retained = lease.retainNativeHandle();
-        auto* texture = static_cast<ID3D11Texture2D*>(retained.get());
+        auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         if (!texture) {
             if (error) {
                 *error = QStringLiteral("Media Foundation encodeSurface requires a D3D11 texture");

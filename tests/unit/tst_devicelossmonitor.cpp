@@ -15,9 +15,11 @@ struct GpuDeviceLossMonitorTestAuthority {
     static uint64_t capture() {
         return GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     }
-    static uint64_t publish(uint64_t deviceAuthorityEpoch = capture()) {
+    static uint64_t publish(uint64_t deviceAuthorityEpoch = capture(),
+                            uintptr_t deviceDomainId = 1) {
         return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
-            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
+            deviceDomainId);
     }
 };
 #endif
@@ -30,6 +32,8 @@ private slots:
     void consumeLossEventDrainsWithoutClearingLatch();
     void clearForRebuildClearsLatchKeepsGeneration();
     void tokenlessLossUpgradesFromSameDeviceProof();
+    void tokenlessLossAcceptsAllAuthoritativeDeadDomains();
+    void realLossTracksMultipleDeviceDomains();
     void tokenlessLossStaysTokenlessWithoutDriverProof();
     void realLossPublicationIsAtomicWithEpoch();
     void stalePublicationAfterClearIsRejected();
@@ -95,7 +99,7 @@ void TestDeviceLossMonitor::tokenlessLossUpgradesFromSameDeviceProof() {
     m.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t deviceAuthorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
-    const uint64_t lossGeneration = m.recordSubmissionFailure();
+    const uint64_t lossGeneration = m.recordSubmissionFailure(1);
     QVERIFY(!m.realLossToken().has_value());
 
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(deviceAuthorityEpoch), lossGeneration);
@@ -103,6 +107,37 @@ void TestDeviceLossMonitor::tokenlessLossUpgradesFromSameDeviceProof() {
     QVERIFY(token.has_value());
     QCOMPARE(token->observedGeneration(), lossGeneration);
     QCOMPARE(m.lossCount(), uint64_t(1));
+}
+
+void TestDeviceLossMonitor::tokenlessLossAcceptsAllAuthoritativeDeadDomains() {
+    auto& m = GpuDeviceLossMonitor::instance();
+    m.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t generation = m.recordSubmissionFailure(11);
+    QVERIFY(!m.realLossToken().has_value());
+
+    // Match production poll order when both an RHI device (22) and an import
+    // device (11) died in the same reset after domain 11 failed submission.
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 22), generation);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 11), generation);
+    const auto tokens = m.realLossTokens();
+    QCOMPARE(tokens.size(), size_t(2));
+    QCOMPARE(tokens.at(0).deviceDomainId(), uintptr_t(22));
+    QCOMPARE(tokens.at(1).deviceDomainId(), uintptr_t(11));
+    m.reset();
+}
+
+void TestDeviceLossMonitor::realLossTracksMultipleDeviceDomains() {
+    auto& m = GpuDeviceLossMonitor::instance();
+    m.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, 11);
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 22), generation);
+    const auto tokens = m.realLossTokens();
+    QCOMPARE(tokens.size(), size_t(2));
+    QCOMPARE(tokens.at(0).deviceDomainId(), uintptr_t(11));
+    QCOMPARE(tokens.at(1).deviceDomainId(), uintptr_t(22));
+    m.reset();
 }
 
 void TestDeviceLossMonitor::tokenlessLossStaysTokenlessWithoutDriverProof() {

@@ -28,8 +28,9 @@ public:
     static std::shared_ptr<GpuRhiContext> createInvalidForTest();
     int rhiReadbackCountForTest() const;
 #ifdef _WIN32
+    static uint64_t captureD3D11RemovalAuthorityForTest();
     static D3D11RemovalObservationForTest observeD3D11RemovalForTest(void* device,
-                                                                     uint64_t observedGeneration);
+                                                                     uint64_t deviceAuthorityEpoch);
 #endif
 #endif
     ~GpuRhiContext();
@@ -48,6 +49,9 @@ public:
     // thread. iOS marshals to the main queue; macOS and stubs run inline.
     void presentOnMainThread(const std::function<void()>& block);
     bool deviceLost() const;
+    // Rare-path authoritative poll used to upgrade a tokenless submission
+    // failure before recovery decides whether dead-fence waits are legal.
+    bool pollDeviceLoss() const;
     void injectDeviceLostForTest();
     std::shared_ptr<GpuFence> createFence() const;
 
