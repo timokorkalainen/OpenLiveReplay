@@ -26,8 +26,8 @@ public:
     // with drop-frame renumbering applied) with true rate `tcRate`, observed on
     // session frame `sessionFrame` (the heartbeat tick count, advancing at
     // `sessionRate`). First observation per source wins (immutable anchor). A
-    // negative tcFrames or an invalid rate is ignored -> the source stays
-    // unanchored -> Incomparable, never a guess.
+    // negative tcFrames/sessionFrame or a rate outside [12, 240] fps is ignored
+    // -> the source stays unanchored -> Incomparable, never a guess.
     void observe(int source, int64_t tcFrames, FrameRateQ tcRate, int64_t sessionFrame,
                  FrameRateQ sessionRate);
 
@@ -37,6 +37,7 @@ public:
     // offset(a,b): the alignment of b relative to a. driftPpm (>=0 magnitude) adds
     // |anchorTcSkew|·ppm to the bound (the residual a drifting session clock leaves
     // that the servo cannot remove). Incomparable unless BOTH sources are anchored.
+    // Kind derives from the checked final bound: zero is Exact, positive is Bounded.
     AlignmentOffset offset(int a, int b, int32_t driftPpm = 0) const;
 
     void reset();

@@ -24,12 +24,19 @@ bool fitsInt64(I128 value) {
     return value >= I128(std::numeric_limits<int64_t>::min()) &&
            value <= I128(std::numeric_limits<int64_t>::max());
 }
+
+bool supportedRate(FrameRateQ rate) {
+    if (!rate.valid()) return false;
+    const I128 numerator = rate.num;
+    const I128 denominator = rate.den;
+    return numerator >= I128(12) * denominator && numerator <= I128(240) * denominator;
+}
 } // namespace
 
 void TimecodeAlignerV2::observe(int source, int64_t tcFrames, FrameRateQ tcRate,
                                 int64_t sessionFrame, FrameRateQ sessionRate) {
-    if (source < 0 || source >= kMaxSources || tcFrames < 0) return;
-    if (!tcRate.valid() || !sessionRate.valid()) return;
+    if (source < 0 || source >= kMaxSources || tcFrames < 0 || sessionFrame < 0) return;
+    if (!supportedRate(tcRate) || !supportedRate(sessionRate)) return;
     Anchor& anchor = m_anchors[source];
     if (anchor.set) return;
     anchor = Anchor{true, tcFrames, tcRate, sessionFrame, sessionRate};
@@ -82,9 +89,7 @@ AlignmentOffset TimecodeAlignerV2::offset(int sourceA, int sourceB, int32_t drif
 
     out.offsetUs = int64_t(offsetUs);
     out.boundUs = int64_t(boundUs);
-    out.kind = anchorA.tcRate == anchorB.tcRate && driftPpmMagnitude == 0
-                   ? AlignmentOffset::Kind::Exact
-                   : AlignmentOffset::Kind::Bounded;
+    out.kind = out.boundUs == 0 ? AlignmentOffset::Kind::Exact : AlignmentOffset::Kind::Bounded;
     return out;
 }
 
