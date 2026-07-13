@@ -199,14 +199,17 @@ void TestQtPreviewSink::frameProviderAdvancesBackloggedSinkWhileProducerIsRunnin
         QMetaObject::invokeMethod(sink.get(), []() { QThread::msleep(50); }, Qt::QueuedConnection);
 
     bool advancedWhileProducing = false;
+    bool producerStarted = false;
     if (deliveredInitial && queuedBlocker) {
         std::atomic_bool producing{true};
+        std::atomic<int> producedFrames{0};
         std::thread producer([&]() {
             int frameNumber = 0;
             while (producing.load(std::memory_order_relaxed)) {
                 FrameHandle frame =
                     solidYuv420pHandle(4, 4, quint8(40 + (frameNumber++ % 16) * 8), 128, 128);
                 provider.deliverHandle(frame);
+                producedFrames.fetch_add(1, std::memory_order_release);
                 QMetaObject::invokeMethod(
                     sink.get(), []() { QThread::msleep(2); }, Qt::QueuedConnection);
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
@@ -215,7 +218,12 @@ void TestQtPreviewSink::frameProviderAdvancesBackloggedSinkWhileProducerIsRunnin
 
         QElapsedTimer timer;
         timer.start();
-        while (timer.elapsed() < 150 && visibleFrameChanges.load(std::memory_order_relaxed) <= 1) {
+        while (timer.elapsed() < 1000 && producedFrames.load(std::memory_order_acquire) == 0) {
+            QTest::qWait(1);
+        }
+        producerStarted = producedFrames.load(std::memory_order_acquire) > 0;
+        timer.restart();
+        while (timer.elapsed() < 2000 && visibleFrameChanges.load(std::memory_order_relaxed) <= 1) {
             QTest::qWait(5);
         }
         advancedWhileProducing = visibleFrameChanges.load(std::memory_order_relaxed) > 1;
@@ -232,6 +240,7 @@ void TestQtPreviewSink::frameProviderAdvancesBackloggedSinkWhileProducerIsRunnin
 
     QVERIFY(deliveredInitial);
     QVERIFY(queuedBlocker);
+    QVERIFY2(producerStarted, "continuous preview producer did not start");
     QVERIFY(deletedSink);
     QVERIFY(stoppedSinkThread);
     QVERIFY2(advancedWhileProducing,

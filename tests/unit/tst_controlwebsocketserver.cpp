@@ -299,6 +299,15 @@ void TestControlWebSocketServer::completionEventReachesOnlyTheOriginatingClient(
     const QString clientId = adapter.lastArgs.value(QStringLiteral("_clientId")).toString();
     QVERIFY(!clientId.isEmpty());
 
+    // Adapter dispatch and socket delivery are separate queued operations. Wait
+    // for the command ack before installing the completion-only spy; otherwise a
+    // delayed ack can race the completion signal and be mistaken for its event.
+    QTRY_COMPARE_WITH_TIMEOUT(aInitialMessages.count(), 3, 2000);
+    const QJsonObject ack =
+        QJsonDocument::fromJson(aInitialMessages.at(2).at(0).toString().toUtf8()).object();
+    QCOMPARE(ack.value(QStringLiteral("type")).toString(), QStringLiteral("ack"));
+    QCOMPARE(ack.value(QStringLiteral("id")).toString(), QStringLiteral("cmd-1"));
+
     // Fire the completion through the notifier; only A must receive the event.
     QSignalSpy aMessages(&clientA, &QWebSocket::textMessageReceived);
     QSignalSpy bMessages(&clientB, &QWebSocket::textMessageReceived);
