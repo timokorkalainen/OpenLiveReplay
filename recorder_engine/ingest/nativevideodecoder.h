@@ -57,6 +57,10 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities();
 #ifdef OLR_UNIT_TEST
 bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest();
 bool nativeVideoDecoderNoFrameRejectedForTest(QString* error = nullptr);
+#if defined(_WIN32)
+QByteArray nativeVideoDecoderInputBytesForTest(const CompressedAccessUnit& unit,
+                                               bool prependParameterSets);
+#endif
 #endif
 
 #endif // NATIVEVIDEODECODER_H

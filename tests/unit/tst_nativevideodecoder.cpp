@@ -10,6 +10,7 @@ private slots:
     void keepSurfaceNullImageBufferIsRejected();
     void videoToolboxNoFrameIsRejected();
     void flushExcessPixelBufferPoolNoOpsWithoutSession();
+    void mediaFoundationPrefixesParameterSetsAtSessionStart();
 };
 
 void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
@@ -60,6 +61,26 @@ void TestNativeVideoDecoder::videoToolboxNoFrameIsRejected() {
 void TestNativeVideoDecoder::flushExcessPixelBufferPoolNoOpsWithoutSession() {
     NativeVideoDecoder decoder(0, 0);
     decoder.flushExcessPixelBufferPool();
+}
+
+void TestNativeVideoDecoder::mediaFoundationPrefixesParameterSetsAtSessionStart() {
+#if defined(Q_OS_WIN)
+    CompressedAccessUnit unit;
+    unit.codec = NativeVideoCodec::Hevc;
+    unit.parameterSets.hevcVps = {QByteArray::fromHex("4001")};
+    unit.parameterSets.hevcSps = {QByteArray::fromHex("4201")};
+    unit.parameterSets.hevcPps = {QByteArray::fromHex("4401")};
+    unit.annexB = QByteArray::fromHex("000000012601");
+
+    QCOMPARE(nativeVideoDecoderInputBytesForTest(unit, true),
+             QByteArray::fromHex("000000014001000000014201000000014401000000012601"));
+    QCOMPARE(nativeVideoDecoderInputBytesForTest(unit, false), unit.annexB);
+
+    unit.annexB = QByteArray::fromHex("0000000140010000014201000000014401000000012601");
+    QCOMPARE(nativeVideoDecoderInputBytesForTest(unit, true), unit.annexB);
+#else
+    QSKIP("Media Foundation input assembly is Windows-only");
+#endif
 }
 
 QTEST_GUILESS_MAIN(TestNativeVideoDecoder)

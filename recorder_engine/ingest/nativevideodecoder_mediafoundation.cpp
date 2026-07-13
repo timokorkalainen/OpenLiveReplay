@@ -156,6 +156,73 @@ QByteArray parameterSetKey(NativeVideoCodec codec, const H26xParameterSets& para
     return key.size() > 1 ? key : QByteArray();
 }
 
+void appendAnnexBNal(QByteArray* bytes, const QByteArray& nal) {
+    if (!bytes || nal.isEmpty()) {
+        return;
+    }
+    bytes->append("\x00\x00\x00\x01", 4);
+    bytes->append(nal);
+}
+
+bool containsRequiredParameterSets(NativeVideoCodec codec, const QByteArray& annexB) {
+    bool first = false;
+    bool second = false;
+    bool third = codec != NativeVideoCodec::Hevc;
+    for (qsizetype i = 0; i + 3 < annexB.size(); ++i) {
+        if (annexB.at(i) != '\0' || annexB.at(i + 1) != '\0') {
+            continue;
+        }
+        qsizetype nalOffset = -1;
+        if (annexB.at(i + 2) == '\1') {
+            nalOffset = i + 3;
+        } else if (i + 4 < annexB.size() && annexB.at(i + 2) == '\0' && annexB.at(i + 3) == '\1') {
+            nalOffset = i + 4;
+        }
+        if (nalOffset < 0 || nalOffset >= annexB.size()) {
+            continue;
+        }
+
+        const quint8 header = quint8(annexB.at(nalOffset));
+        if (codec == NativeVideoCodec::H264) {
+            const quint8 type = header & 0x1f;
+            first = first || type == 7;
+            second = second || type == 8;
+        } else if (codec == NativeVideoCodec::Hevc) {
+            const quint8 type = (header >> 1) & 0x3f;
+            first = first || type == 32;
+            second = second || type == 33;
+            third = third || type == 34;
+        }
+        if (first && second && third) {
+            return true;
+        }
+    }
+    return false;
+}
+
+QByteArray inputSampleBytes(const CompressedAccessUnit& unit, bool prependParameterSets) {
+    if (!prependParameterSets || containsRequiredParameterSets(unit.codec, unit.annexB)) {
+        return unit.annexB;
+    }
+
+    QByteArray bytes;
+    const auto append = [&bytes](const QList<QByteArray>& nals) {
+        for (const QByteArray& nal : nals) {
+            appendAnnexBNal(&bytes, nal);
+        }
+    };
+    if (unit.codec == NativeVideoCodec::H264) {
+        append(unit.parameterSets.h264Sps);
+        append(unit.parameterSets.h264Pps);
+    } else if (unit.codec == NativeVideoCodec::Hevc) {
+        append(unit.parameterSets.hevcVps);
+        append(unit.parameterSets.hevcSps);
+        append(unit.parameterSets.hevcPps);
+    }
+    bytes.append(unit.annexB);
+    return bytes;
+}
+
 bool mftAvailable(REFGUID subtype) {
     MFT_REGISTER_TYPE_INFO input{};
     input.guidMajorType = MFMediaType_Video;
@@ -273,6 +340,7 @@ private:
     bool hasSelectedInputSubtype = false;
     bool asyncTransform = false;
     int asyncNeedInputEvents = 0;
+    bool inputNeedsParameterSets = false;
     bool comInitialized = false;
 
     bool ensureRuntime(QString* error);
@@ -350,6 +418,7 @@ void NativeVideoDecoder::Impl::reset() {
     hasSelectedInputSubtype = false;
     asyncTransform = false;
     asyncNeedInputEvents = 0;
+    inputNeedsParameterSets = false;
     codec = NativeVideoCodec::Unknown;
     activeParameterSetKey.clear();
 }
@@ -637,6 +706,7 @@ bool NativeVideoDecoder::Impl::ensureSession(const CompressedAccessUnit& unit, b
 
     codec = unit.codec;
     activeParameterSetKey = nextKey;
+    inputNeedsParameterSets = !nextKey.isEmpty();
     return true;
 }
 
@@ -648,7 +718,8 @@ bool NativeVideoDecoder::Impl::createInputSample(const CompressedAccessUnit& uni
         }
         return false;
     }
-    if (unit.annexB.isEmpty()) {
+    const QByteArray sampleBytes = inputSampleBytes(unit, inputNeedsParameterSets);
+    if (sampleBytes.isEmpty()) {
         if (error) {
             *error =
                 QStringLiteral("Media Foundation native decoder received an empty access unit");
@@ -657,7 +728,7 @@ bool NativeVideoDecoder::Impl::createInputSample(const CompressedAccessUnit& uni
     }
 
     ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = MFCreateMemoryBuffer(DWORD(unit.annexB.size()), &buffer);
+    HRESULT hr = MFCreateMemoryBuffer(DWORD(sampleBytes.size()), &buffer);
     if (FAILED(hr)) {
         if (error) {
             *error = hrMessage(QStringLiteral("Media Foundation input buffer creation failed"), hr);
@@ -673,9 +744,9 @@ bool NativeVideoDecoder::Impl::createInputSample(const CompressedAccessUnit& uni
         }
         return false;
     }
-    memcpy(data, unit.annexB.constData(), size_t(unit.annexB.size()));
+    memcpy(data, sampleBytes.constData(), size_t(sampleBytes.size()));
     buffer->Unlock();
-    hr = buffer->SetCurrentLength(DWORD(unit.annexB.size()));
+    hr = buffer->SetCurrentLength(DWORD(sampleBytes.size()));
     if (FAILED(hr)) {
         if (error) {
             *error =
@@ -712,6 +783,7 @@ bool NativeVideoDecoder::Impl::processInputSample(IMFSample* sample, QString* er
         }
         return false;
     }
+    inputNeedsParameterSets = false;
     return true;
 }
 
@@ -1245,5 +1317,12 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
     }
     return caps;
 }
+
+#ifdef OLR_UNIT_TEST
+QByteArray nativeVideoDecoderInputBytesForTest(const CompressedAccessUnit& unit,
+                                               bool prependParameterSets) {
+    return inputSampleBytes(unit, prependParameterSets);
+}
+#endif
 
 #endif
