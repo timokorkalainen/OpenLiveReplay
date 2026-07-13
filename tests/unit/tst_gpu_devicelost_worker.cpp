@@ -213,8 +213,15 @@ void TestGpuDeviceLostWorker::lostContextRebuildsFreshGpuSpine() {
     QVERIFY(worker.gpuPathActive());
     QVERIFY(worker.m_gpuRhi);
     QVERIFY(worker.m_decodeFence);
+#ifdef _WIN32
+    // The Windows render/staging fences are created lazily from the Media
+    // Foundation import device, not from the QRhi spine.
+    QVERIFY(!worker.m_renderFence);
+    QVERIFY(!worker.m_stagingFence);
+#else
     QVERIFY(worker.m_renderFence);
     QVERIFY(worker.m_stagingFence);
+#endif
 
     auto lostRhi = worker.m_gpuRhi;
     lostRhi->injectDeviceLostForTest();
@@ -229,8 +236,13 @@ void TestGpuDeviceLostWorker::lostContextRebuildsFreshGpuSpine() {
     QVERIFY(worker.m_gpuRhi != lostRhi);
     QVERIFY(!worker.m_gpuRhi->deviceLost());
     QVERIFY(worker.m_decodeFence);
+#ifdef _WIN32
+    QVERIFY(!worker.m_renderFence);
+    QVERIFY(!worker.m_stagingFence);
+#else
     QVERIFY(worker.m_renderFence);
     QVERIFY(worker.m_stagingFence);
+#endif
     QVERIFY(!GpuDeviceLossMonitor::instance().isLost());
     QVERIFY(GpuGenerationCounter::instance().current() > gen0);
     const OutputDispatchStats stats = worker.outputStats();
