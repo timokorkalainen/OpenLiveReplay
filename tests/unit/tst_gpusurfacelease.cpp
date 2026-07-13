@@ -9,6 +9,10 @@
 // only retired surfaces).
 #include <QtTest>
 
+#include <QCoreApplication>
+#include <QProcess>
+#include <QProcessEnvironment>
+
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpugeneration.h"
@@ -147,6 +151,9 @@ class TestGpuSurfaceLease : public QObject {
 private slots:
     void callbackLeaseExposesMetadataOnly();
     void callbackLeaseReportsInvalidSurface();
+    void withReadCompletesScope();
+    void handleQueryAfterCompletionFailsCheckedContract();
+    void surfaceOwnerSurvivesUntilLeaseDestruction();
     void boundedWaitDrainReleasesOnlyRetired();
     void boundedWaitDoesNotHoldRetainerMutex();
     void registryDiagnosticsTrackHighWaterAndTimeouts();
@@ -170,6 +177,7 @@ void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
         QVERIFY(state.first);
         QCOMPARE(state.second, 16);
         QCOMPARE(lease.nativeHandle(), sentinel);
+        scope.complete();
     }
 }
 
@@ -178,7 +186,73 @@ void TestGpuSurfaceLease::callbackLeaseReportsInvalidSurface() {
         std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x1), /*valid=*/false);
     GpuSyncReadScope scope;
     const bool valid = scope.read(surface).valid();
+    scope.complete();
     QVERIFY(!valid);
+}
+
+void TestGpuSurfaceLease::withReadCompletesScope() {
+    auto sentinel = reinterpret_cast<void*>(0xCAFE);
+    auto surface = std::make_shared<FakeLeaseSurface>(sentinel, /*valid=*/true);
+
+    void* observed = nullptr;
+    {
+        GpuSyncReadScope scope;
+        observed =
+            scope.withRead(surface, [](const GpuReadLease& lease) { return lease.nativeHandle(); });
+    }
+
+    QCOMPARE(observed, sentinel);
+}
+
+void TestGpuSurfaceLease::handleQueryAfterCompletionFailsCheckedContract() {
+#ifndef QT_NO_DEBUG
+    constexpr auto deathChildEnvironment = "OLR_GPU_SYNC_READ_LEASE_DEATH_CHILD";
+    if (qEnvironmentVariableIsSet(deathChildEnvironment)) {
+        auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD00D), true);
+        GpuSyncReadScope scope;
+        const GpuReadLease lease = scope.read(surface);
+        scope.complete();
+        (void) lease.nativeHandle();
+        return;
+    }
+
+    QProcess child;
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QString::fromLatin1(deathChildEnvironment), QStringLiteral("1"));
+    child.setProcessEnvironment(environment);
+    child.setProcessChannelMode(QProcess::MergedChannels);
+    child.start(QCoreApplication::applicationFilePath(),
+                {QStringLiteral("handleQueryAfterCompletionFailsCheckedContract")});
+    QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
+    QVERIFY2(child.waitForFinished(10000), qPrintable(child.errorString()));
+    const bool terminatedByContract =
+        child.exitStatus() == QProcess::CrashExit || child.exitCode() != 0;
+    QVERIFY2(terminatedByContract,
+             qPrintable(QStringLiteral("checked-contract child exited normally with code %1")
+                            .arg(child.exitCode())));
+#else
+    QSKIP("Checked-contract assertions are disabled in this build");
+#endif
+}
+
+void TestGpuSurfaceLease::surfaceOwnerSurvivesUntilLeaseDestruction() {
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xABCD), true);
+    std::weak_ptr<FakeLeaseSurface> observer = surface;
+    bool ownerSurvivedBeforeCompletion = false;
+    bool ownerSurvivedAfterCompletion = false;
+
+    GpuSyncReadScope scope;
+    {
+        const GpuReadLease lease = scope.read(surface);
+        surface.reset();
+        ownerSurvivedBeforeCompletion = !observer.expired();
+        scope.complete();
+        ownerSurvivedAfterCompletion = !observer.expired();
+    }
+
+    QVERIFY(ownerSurvivedBeforeCompletion);
+    QVERIFY(ownerSurvivedAfterCompletion);
+    QVERIFY(observer.expired());
 }
 
 void TestGpuSurfaceLease::boundedWaitDrainReleasesOnlyRetired() {

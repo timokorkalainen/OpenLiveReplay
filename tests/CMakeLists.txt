@@ -28,7 +28,27 @@ function(olr_expect_compile_failure name source)
     endif()
 endfunction()
 
+function(olr_add_compile_control name source should_compile)
+    set(target "${name}_compile_control")
+    add_library(${target} STATIC EXCLUDE_FROM_ALL
+        "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/${source}")
+    target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(${target} PRIVATE Qt6::Core)
+
+    add_test(NAME ${name}
+        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}"
+            --target ${target} --config $<CONFIG>)
+    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
+    if(NOT should_compile)
+        set_tests_properties(${name} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endfunction()
+
 olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp)
+olr_add_compile_control(gpu_native_handle_access native_handle_access.cpp FALSE)
+olr_add_compile_control(gpu_native_handle_access_pass native_handle_access_pass.cpp TRUE)
+set_tests_properties(gpu_native_handle_access_pass PROPERTIES
+    DEPENDS gpu_native_handle_access)
 olr_expect_compile_failure(gpu_lease_move lease_move.cpp)
 olr_expect_compile_failure(gpu_backing_authority_spoof backing_authority_spoof.cpp)
 olr_expect_compile_failure(gpu_token_mint token_mint.cpp)

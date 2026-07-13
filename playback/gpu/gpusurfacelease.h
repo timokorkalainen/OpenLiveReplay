@@ -3,11 +3,21 @@
 
 #include "playback/gpu/gpusurface.h"
 
+#include <QtLogging>
+
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 class GpuDeviceLossMonitor;
+
+struct GpuSyncReadState {
+    bool active = true;
+    bool read = false;
+};
 
 // Proof that a driver-authoritative observation declared the active GPU device dead.
 // Only GpuDeviceLossMonitor can construct it, and only backend-local authority types
@@ -45,24 +55,29 @@ public:
 
     GpuSurfaceDesc desc() const { return m_desc; }
     bool valid() const { return m_valid; }
-    void* nativeHandle() const { return m_nativeHandle; }
+    void* nativeHandle() const {
+        Q_ASSERT_X(m_state && m_state->active, "GpuReadLease::nativeHandle",
+                   "native handle access requires an active GpuSyncReadScope");
+        return m_nativeHandle;
+    }
     uint32_t nativeSubresource() const { return m_nativeSubresource; }
 
 private:
     friend class GpuSyncReadScope;
 
-    explicit GpuReadLease(const std::shared_ptr<GpuSurface>& surface)
-        : m_desc(surface ? surface->desc() : GpuSurfaceDesc{}),
+    GpuReadLease(const std::shared_ptr<GpuSurface>& surface, GpuSyncReadState* state)
+        : m_state(state), m_desc(surface ? surface->desc() : GpuSurfaceDesc{}),
           m_valid(surface && surface->isValid()), m_surfaceOwner(surface),
           m_nativeHandle(surface ? surface->nativeHandle() : nullptr),
           m_nativeSubresource(surface ? surface->nativeSubresource() : 0) {}
-    explicit GpuReadLease(GpuSurface* surface)
-        : m_desc(surface ? surface->desc() : GpuSurfaceDesc{}),
+    GpuReadLease(GpuSurface* surface, GpuSyncReadState* state)
+        : m_state(state), m_desc(surface ? surface->desc() : GpuSurfaceDesc{}),
           m_valid(surface && surface->isValid()),
           m_nativeOwner(surface ? surface->retainNativeHandle() : GpuOwnedNativeHandle{}),
           m_nativeHandle(m_nativeOwner.get()),
           m_nativeSubresource(surface ? surface->nativeSubresource() : 0) {}
 
+    GpuSyncReadState* m_state = nullptr;
     GpuSurfaceDesc m_desc;
     bool m_valid = false;
     std::shared_ptr<GpuSurface> m_surfaceOwner;
@@ -78,17 +93,53 @@ public:
     GpuSyncReadScope() = default;
     GpuSyncReadScope(const GpuSyncReadScope&) = delete;
     GpuSyncReadScope& operator=(const GpuSyncReadScope&) = delete;
+    ~GpuSyncReadScope() {
+        if (!m_state.read || !m_state.active) return;
+#ifndef QT_NO_DEBUG
+        Q_ASSERT_X(false, "GpuSyncReadScope::~GpuSyncReadScope",
+                   "complete() must be called after synchronous native handle access");
+#else
+        static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+        if (!reported.test_and_set(std::memory_order_relaxed))
+            qWarning("GpuSyncReadScope destroyed without complete() after a read");
+#endif
+    }
 
-    GpuReadLease read(const std::shared_ptr<GpuSurface>& surface) const {
-        return GpuReadLease(surface);
+    GpuReadLease read(const std::shared_ptr<GpuSurface>& surface) {
+        beginRead();
+        return GpuReadLease(surface, &m_state);
     }
 
     template <typename Surface, typename = std::enable_if_t<std::is_base_of_v<GpuSurface, Surface>>>
-    GpuReadLease read(const std::shared_ptr<Surface>& surface) const {
-        return GpuReadLease(std::static_pointer_cast<GpuSurface>(surface));
+    GpuReadLease read(const std::shared_ptr<Surface>& surface) {
+        return read(std::static_pointer_cast<GpuSurface>(surface));
     }
 
-    GpuReadLease read(GpuSurface* surface) const { return GpuReadLease(surface); }
+    GpuReadLease read(GpuSurface* surface) {
+        beginRead();
+        return GpuReadLease(surface, &m_state);
+    }
+
+    void complete() noexcept { m_state.active = false; }
+
+    template <typename Surface, typename Fn>
+    decltype(auto) withRead(const std::shared_ptr<Surface>& surface, Fn&& fn) {
+        const GpuReadLease lease = read(surface);
+        struct CompleteOnExit {
+            GpuSyncReadScope* scope;
+            ~CompleteOnExit() { scope->complete(); }
+        } completeOnExit{this};
+        return std::invoke(std::forward<Fn>(fn), lease);
+    }
+
+private:
+    void beginRead() {
+        Q_ASSERT_X(m_state.active, "GpuSyncReadScope::read",
+                   "cannot acquire a lease after complete()");
+        m_state.read = true;
+    }
+
+    GpuSyncReadState m_state;
 };
 
 #endif // OLR_GPUSURFACELEASE_H
