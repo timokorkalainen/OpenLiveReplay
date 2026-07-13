@@ -11,6 +11,7 @@
 
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpudevicelossmonitor.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpureadbackretainer.h"
 #include "playback/gpu/gpuretireregistry.h"
@@ -21,6 +22,18 @@
 #include <memory>
 #include <limits>
 #include <type_traits>
+
+#ifdef OLR_UNIT_TEST
+struct GpuDeviceLossMonitorTestAuthority {
+    static uint64_t capture() {
+        return GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
+    }
+    static uint64_t publish(uint64_t deviceAuthorityEpoch = capture()) {
+        return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+    }
+};
+#endif
 
 namespace {
 
@@ -130,6 +143,7 @@ private slots:
     void opScopeCancelsBeforeSubmissionWithoutRetaining();
     void opScopeRetainsAfterSubmittedError();
     void opScopeQuarantinesOnZeroSignal();
+    void zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade();
 };
 
 void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
@@ -260,6 +274,34 @@ void TestGpuSurfaceLease::opScopeQuarantinesOnZeroSignal() {
     fence->retireQuarantine();
     registry.drainCompleted();
     GpuDeviceLossMonitor::instance().reset();
+}
+
+void TestGpuSurfaceLease::zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    const uint64_t deviceAuthorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xA), true);
+    const long ownersBefore = surface.use_count();
+    auto fence = std::make_shared<ZeroSignalFence>();
+
+    GpuOpScope operation(fence, registry);
+    QVERIFY(operation.track(surface));
+    QVERIFY(!operation.submit([] { return GpuSubmitOutcome::Submitted; }));
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    QVERIFY(surface.use_count() > ownersBefore);
+
+    const uint64_t lossGeneration =
+        GpuDeviceLossMonitorTestAuthority::publish(deviceAuthorityEpoch);
+    QVERIFY(lossGeneration != 0);
+    const auto token = monitor.realLossToken();
+    QVERIFY(token.has_value());
+    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QCOMPARE(surface.use_count(), ownersBefore);
+    monitor.reset();
 }
 
 void TestGpuSurfaceLease::registryRegistrationDoesNotPollDriver() {

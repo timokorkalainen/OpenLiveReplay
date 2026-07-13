@@ -1793,6 +1793,10 @@ bool PlaybackWorker::rebuildGpuSpine() {
     if (!gpuPipelineEnabled()) return false;
     if (gpuLifecycleSuspended()) return false;
 
+    // Revoke every old backend's loss-mint authority before a replacement can be
+    // created. A failed rebuild keeps the loss latch set; a later retry begins a
+    // fresh authority epoch again.
+    GpuDeviceLossMonitor::instance().beginRebuild();
     auto rhi = GpuRhiContext::create();
     if (!rhi || !rhi->isValid() || rhi->deviceLost()) return false;
 

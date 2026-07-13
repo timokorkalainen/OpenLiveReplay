@@ -689,6 +689,7 @@ void TestPlaybackWorker::pausedCoveredSeekDiscardsPendingOutputWithoutRewindingF
 
 void TestPlaybackWorker::operatorSeekTransactionCompletesCoveredSeekWithPgmEvidence() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
@@ -717,7 +718,6 @@ void TestPlaybackWorker::operatorSeekTransactionCompletesCoveredSeekWithPgmEvide
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -743,6 +743,7 @@ void TestPlaybackWorker::operatorSeekTransactionCompletesCoveredSeekWithPgmEvide
 
 void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowFill() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
     transport.seek(1000);
@@ -775,7 +776,6 @@ void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowF
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -801,6 +801,7 @@ void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowF
 
 void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(25, 1);
     transport.seek(1000);
@@ -833,7 +834,6 @@ void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() 
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     pgmSink.rejectSubmits = true;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
@@ -855,6 +855,7 @@ void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() 
 
 void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncommitted() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(5000);
@@ -883,7 +884,6 @@ void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncomm
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -906,6 +906,7 @@ void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncomm
 
 void TestPlaybackWorker::operatorSeekTransactionAbandonedOnTimeout() {
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(5000);
@@ -934,7 +935,6 @@ void TestPlaybackWorker::operatorSeekTransactionAbandonedOnTimeout() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -964,6 +964,7 @@ void TestPlaybackWorker::operatorSeekCompletionEmitsSignal() {
     // (tst_playbackworker.cpp:850) up to the runtime/sink setup, except the cache DOES
     // cover the target so the blocking path completes inline.
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
@@ -988,7 +989,6 @@ void TestPlaybackWorker::operatorSeekCompletionEmitsSignal() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -1016,6 +1016,7 @@ void TestPlaybackWorker::seekToWithPgmNotifyCompletesCacheHitInline() {
     // through the non-blocking entry point: the cache-hit clause must dispatch PGM
     // and complete the transaction inline (no worker thread running here).
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
@@ -1040,7 +1041,6 @@ void TestPlaybackWorker::seekToWithPgmNotifyCompletesCacheHitInline() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -1069,6 +1069,7 @@ void TestPlaybackWorker::seekToWithPgmNotifyLeavesCacheMissWaiting() {
     // uncovered: seekToWithPgmNotify must return immediately without dispatching
     // PGM, leaving the transaction registered and still waiting.
     FrameProvider feed0;
+    TestPgmSink pgmSink;
     PlaybackTransport transport;
     transport.setFrameRate(60, 1);
     transport.seek(1000);
@@ -1093,7 +1094,6 @@ void TestPlaybackWorker::seekToWithPgmNotifyLeavesCacheMissWaiting() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =

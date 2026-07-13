@@ -3,6 +3,7 @@
 #ifdef _WIN32
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpuframereadbacktelemetry.h"
 #include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpuretireregistry.h"
@@ -258,6 +259,7 @@ struct WinGpuImportEdge::Impl {
     UINT resetToken = 0;
     bool coOwned = false;
     bool mfStarted = false;
+    uint64_t deviceAuthorityEpoch = 0;
     mutable std::atomic<bool> deviceLost{false};
     std::function<void(const FrameHandle&)> importTap;
 
@@ -271,7 +273,9 @@ struct WinGpuImportEdge::Impl {
 
     bool noteDeviceLostIfRemoved() const {
         if (!device) return false;
-        if (FAILED(device->GetDeviceRemovedReason())) {
+        const HRESULT reason = device->GetDeviceRemovedReason();
+        if (FAILED(reason)) {
+            WinGpuImportEdge::publishDeviceRemovedForMonitor(reason, deviceAuthorityEpoch);
             deviceLost.store(true, std::memory_order_release);
             return true;
         }
@@ -280,6 +284,13 @@ struct WinGpuImportEdge::Impl {
 };
 
 WinGpuImportEdge::WinGpuImportEdge() : m_impl(std::make_unique<Impl>()) {}
+
+uint64_t WinGpuImportEdge::publishDeviceRemovedForMonitor(HRESULT reason,
+                                                          uint64_t deviceAuthorityEpoch) {
+    if (SUCCEEDED(reason)) return 0;
+    return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+        DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch);
+}
 
 WinGpuImportEdge::~WinGpuImportEdge() {
     if (m_impl && m_impl->mfStarted) MFShutdown();
@@ -309,6 +320,8 @@ std::unique_ptr<WinGpuImportEdge> WinGpuImportEdge::create(QString* error) {
     edge->m_impl->mfStarted = true;
 
     QString detail;
+    edge->m_impl->deviceAuthorityEpoch =
+        GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
     if (!createD3D11(&edge->m_impl->device, &edge->m_impl->manager, &edge->m_impl->resetToken,
                      &detail)) {
         if (error) *error = detail;

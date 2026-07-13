@@ -76,6 +76,9 @@ public:
 
 private:
     WinGpuImportEdge();
+#ifdef _WIN32
+    static uint64_t publishDeviceRemovedForMonitor(HRESULT reason, uint64_t deviceAuthorityEpoch);
+#endif
 
     struct Impl;
     std::unique_ptr<Impl> m_impl;
