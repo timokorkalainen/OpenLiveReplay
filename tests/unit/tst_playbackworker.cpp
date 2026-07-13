@@ -40,6 +40,7 @@ private slots:
     void outputRuntimeStatsDoesNotBlockOnActiveDispatch();
     void pausedCoveredSeekDiscardsPendingOutputWithoutRewindingFrameIndex();
     void operatorSeekTransactionCompletesCoveredSeekWithPgmEvidence();
+    void earlyOperatorCommitCannotExposeStaleEpoch();
     void operatorSeekTransactionPublishesTargetBeforeLeadWindowFill();
     void operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss();
     void operatorSeekTransactionTimesOutWhenSeekGenerationUncommitted();
@@ -193,6 +194,58 @@ private:
     bool m_active = false;
     bool m_insideSubmit = false;
     bool m_released = false;
+};
+
+class CommitBarrier final : public PlaybackWorker::OutputCommitBarrierForTest {
+public:
+    void enterAndWait() override {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_inside = true;
+        m_entered.notify_all();
+        m_release.wait(lock, [this] { return m_released; });
+    }
+
+    bool waitUntilEntered(int timeoutMs) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_entered.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                                  [this] { return m_inside; });
+    }
+
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_released = true;
+        }
+        m_release.notify_all();
+    }
+
+private:
+    std::mutex m_mutex;
+    std::condition_variable m_entered;
+    std::condition_variable m_release;
+    bool m_inside = false;
+    bool m_released = false;
+};
+
+class CommitBarrierReleaseGuard final {
+public:
+    explicit CommitBarrierReleaseGuard(CommitBarrier& barrier) : m_barrier(barrier) {}
+    ~CommitBarrierReleaseGuard() { m_barrier.release(); }
+
+private:
+    CommitBarrier& m_barrier;
+};
+
+class OutputCommitBarrierInstallGuard final {
+public:
+    OutputCommitBarrierInstallGuard(PlaybackWorker& worker, CommitBarrier& barrier)
+        : m_worker(worker) {
+        m_worker.setOutputCommitBarrierForTest(&barrier);
+    }
+    ~OutputCommitBarrierInstallGuard() { m_worker.setOutputCommitBarrierForTest(nullptr); }
+
+private:
+    PlaybackWorker& m_worker;
 };
 
 class TestPgmSink final : public IOutputSink {
@@ -739,6 +792,118 @@ void TestPlaybackWorker::operatorSeekTransactionCompletesCoveredSeekWithPgmEvide
     QCOMPARE(result.pgmIdentity.sourcePtsMs, qint64(1000));
     QVERIFY(!result.pgmIdentity.videoPlaceholder);
     QCOMPARE(pgmSink.frames.size(), 1);
+}
+
+void TestPlaybackWorker::earlyOperatorCommitCannotExposeStaleEpoch() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    transport.seek(800);
+    transport.setPlaying(true);
+
+    TestPgmSink pgmSink;
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(7, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(800, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(800, std::memory_order_release);
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 800, 64));
+        worker.publishOutputCacheLocked();
+    }
+
+    OutputTargetAssignment pgm;
+    pgm.id = QStringLiteral("pgm-ndi");
+    pgm.sourceBus = OutputBusId::pgm();
+    pgm.kind = OutputTargetKind::Ndi;
+    pgm.enabled = true;
+
+    OutputRuntime* runtime = nullptr;
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(25, 1), 1, 4, 4);
+        worker.m_outputRuntime->setIdentitySkip(false);
+        worker.m_outputRuntime->setSnapshotProvider(
+            [&worker]() { return worker.makeOutputSnapshot(); });
+        worker.m_outputRuntime->setEndpoints({{pgm, &pgmSink}});
+        runtime = worker.m_outputRuntime.get();
+    }
+
+    runtime->dispatchDueTicksForTest(0);
+    QCOMPARE(pgmSink.frames.size(), 1);
+    QCOMPARE(pgmSink.frames.last().identity.sampledPlayheadMs, qint64(800));
+    QCOMPARE(pgmSink.frames.last().identity.sourcePtsMs, qint64(800));
+
+    transport.seek(1200);
+    CommitBarrier barrier;
+    OutputCommitBarrierInstallGuard barrierInstall(worker, barrier);
+    auto seek =
+        std::async(std::launch::async, [&] { return worker.seekToAndWaitForPgm(1200, 1, 2000); });
+
+    bool transactionRegistered = false;
+    const auto registrationDeadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(2000);
+    while (std::chrono::steady_clock::now() < registrationDeadline) {
+        {
+            QMutexLocker locker(&worker.m_mutex);
+            transactionRegistered = worker.m_operatorSeekCompletion.waiting &&
+                                    worker.m_operatorSeekCompletion.generation == 8 &&
+                                    worker.m_operatorSeekCompletion.targetMs == 1200;
+        }
+        if (transactionRegistered) break;
+        std::this_thread::yield();
+    }
+    QVERIFY2(transactionRegistered, "operator seek transaction was not registered");
+
+    {
+        QMutexLocker locker(&worker.m_mutex);
+        worker.m_seekTargetMs = -1;
+    }
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1200, 96));
+    }
+
+    auto complete = std::async(std::launch::async, [&] {
+        return worker.tryCompleteOperatorSeekFromCurrentOutputCache(1200, 8);
+    });
+    CommitBarrierReleaseGuard releaseGuard(barrier);
+    QVERIFY(barrier.waitUntilEntered(2000));
+
+    const int framesBeforeGapTick = pgmSink.frames.size();
+    runtime->dispatchDueTicksForTest(1200);
+    QVector<OutputFrameIdentity> gapIdentities;
+    for (int i = framesBeforeGapTick; i < pgmSink.frames.size(); ++i)
+        gapIdentities.append(pgmSink.frames.at(i).identity);
+
+    barrier.release();
+    const bool completedFromCache = complete.get();
+    const auto result = seek.get();
+
+    QVERIFY(completedFromCache);
+    QVERIFY(result.submittedPgm);
+    QCOMPARE(pgmSink.frames.last().identity.sampledPlayheadMs, qint64(1200));
+    QCOMPARE(pgmSink.frames.last().identity.sourcePtsMs, qint64(1200));
+    QVERIFY(!pgmSink.frames.last().identity.videoPlaceholder);
+    QVERIFY2(!gapIdentities.isEmpty(), "background output tick did not submit a frame");
+    for (const OutputFrameIdentity& identity : gapIdentities) {
+        const QString diagnostic = QStringLiteral("gap frame sampled=%1 source=%2 placeholder=%3")
+                                       .arg(identity.sampledPlayheadMs)
+                                       .arg(identity.sourcePtsMs)
+                                       .arg(identity.videoPlaceholder ? 1 : 0);
+        QVERIFY2(identity.sampledPlayheadMs >= 1200 && identity.sourcePtsMs == 1200 &&
+                     !identity.videoPlaceholder,
+                 qPrintable(diagnostic));
+    }
 }
 
 void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowFill() {

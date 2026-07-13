@@ -454,6 +454,12 @@ void PlaybackWorker::resetOutputPlayEpoch() {
     if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
 }
 
+#ifdef OLR_UNIT_TEST
+void PlaybackWorker::setOutputCommitBarrierForTest(OutputCommitBarrierForTest* barrier) {
+    m_outputCommitBarrierForTest = barrier;
+}
+#endif
+
 OutputDispatchStats PlaybackWorker::outputStats() const {
     QMutexLocker runtimeLocker(&m_outputRuntimeMutex);
     if (!m_outputRuntime) return OutputDispatchStats{};
@@ -614,6 +620,10 @@ bool PlaybackWorker::tryCompleteOperatorSeekFromCurrentOutputCache(qint64 target
         m_committedGeneration.store(generation, std::memory_order_release);
         publishOutputCacheLocked();
     }
+
+#ifdef OLR_UNIT_TEST
+    if (m_outputCommitBarrierForTest) m_outputCommitBarrierForTest->enterAndWait();
+#endif
 
     const OutputDispatchReport pgmReport = dispatchPgmAfterSeekCommit(targetMs);
     if (pgmReport.requiredSubmitted)

@@ -203,6 +203,13 @@ public:
     void setExternalOutputTargets(const QList<OutputTargetAssignment>& assignments);
     void resetOutputPlayEpoch();
 #ifdef OLR_UNIT_TEST
+    class OutputCommitBarrierForTest {
+    public:
+        virtual ~OutputCommitBarrierForTest() = default;
+        virtual void enterAndWait() = 0;
+    };
+
+    void setOutputCommitBarrierForTest(OutputCommitBarrierForTest* barrier);
     void setResidencyWindowParamsForTest(const ResidencyWindowParams& params);
     static int64_t liveGrowthFileSizeForTest(int64_t avioSize, const QString& filePath);
     static int64_t liveEofRecoveryAnchorMsForTest(int64_t playheadMs, int64_t newestBeforeEofMs,
@@ -606,6 +613,9 @@ private:
     // (replaces the per-tick deep copy in makeOutputSnapshot).
     SharedCacheSlot m_publishedCache;
     std::unique_ptr<OutputRuntime> m_outputRuntime;
+#ifdef OLR_UNIT_TEST
+    OutputCommitBarrierForTest* m_outputCommitBarrierForTest = nullptr;
+#endif
     int m_outputRuntimeImmediateDispatches = 0;
     QWaitCondition m_outputRuntimeImmediateDispatchesIdle;
     std::vector<std::unique_ptr<IOutputSink>> m_outputSinks;
