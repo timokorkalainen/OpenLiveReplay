@@ -39,6 +39,7 @@ constexpr int kAudioSampleRate = 48000;
 constexpr int64_t kForwardJumpMs = 3000;
 constexpr int64_t kBackwardToleranceMs = -200;
 constexpr int64_t kSupportedVideoProbeMs = 5000;
+constexpr qint64 kRtmpTimestampWrap90k = (qint64(1) << 32) * 90;
 constexpr int kMaxAmf0ScanDepth = 64;
 constexpr char kReconnectRequestCode[] = "NetConnection.Connect.ReconnectRequest";
 
@@ -1085,15 +1086,20 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         const bool decodedGpu = m_videoDecoder->decodeKeepSurface(
             unit,
             [this, &unit, sourcePtsMs, timecode100ns, &gpuSurfaceRejected](void* nativeDecodedImage,
-                                                                           qint64) {
-                const FrameMetadata meta =
-                    gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                                                                           qint64 decodedPts90k) {
+                const qint64 decodedSourcePtsMs = nativeVideoDecodedSourcePtsMs(
+                    unit.pts90k, sourcePtsMs, decodedPts90k, kRtmpTimestampWrap90k);
+                const qint64 decodedTimecode100ns = nativeVideoDecodedTimecode100ns(
+                    unit.pts90k, timecode100ns, decodedPts90k, kRtmpTimestampWrap90k);
+                const FrameMetadata meta = gpuDecodedFrameMetadata(
+                    unit, m_outputWidth, m_outputHeight, decodedSourcePtsMs);
                 ImportedGpuVideoFrame imported;
                 if (m_callbacks.importGpuVideoFrame) {
                     imported = m_callbacks.importGpuVideoFrame(nativeDecodedImage, meta);
                 } else {
-                    imported.frame = makeGpuDecodedFrameHandle(
-                        nativeDecodedImage, unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                    imported.frame =
+                        makeGpuDecodedFrameHandle(nativeDecodedImage, unit, m_outputWidth,
+                                                  m_outputHeight, decodedSourcePtsMs);
                 }
                 FrameHandle gpuFrame = std::move(imported.frame);
                 if (gpuFrame.isNull()) {
@@ -1102,8 +1108,8 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
                 }
 
                 DecodedVideoFrame decodedFrame;
-                decodedFrame.sourcePtsMs = sourcePtsMs;
-                decodedFrame.sourceTimecode100ns = timecode100ns;
+                decodedFrame.sourcePtsMs = decodedSourcePtsMs;
+                decodedFrame.sourceTimecode100ns = decodedTimecode100ns;
                 decodedFrame.gpuFrame = std::move(gpuFrame);
                 decodedFrame.gpuFenceValue = imported.fenceValue;
                 m_callbacks.onVideoFrame(std::move(decodedFrame));
@@ -1125,16 +1131,19 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     QString error;
     const bool decoded = m_videoDecoder->decode(
         unit,
-        [this, sourcePtsMs, timecode100ns](AVFrame* frame) {
+        [this, submittedPts90k = unit.pts90k, sourcePtsMs, timecode100ns](AVFrame* frame) {
             if (!frame) return;
             if (!m_callbacks.onVideoFrame) {
                 av_frame_free(&frame);
                 return;
             }
+            const qint64 decodedSourcePtsMs = nativeVideoDecodedSourcePtsMs(
+                submittedPts90k, sourcePtsMs, frame->pts, kRtmpTimestampWrap90k);
             DecodedVideoFrame decodedFrame;
             decodedFrame.frame = frame;
-            decodedFrame.sourcePtsMs = sourcePtsMs;
-            decodedFrame.sourceTimecode100ns = timecode100ns;
+            decodedFrame.sourcePtsMs = decodedSourcePtsMs;
+            decodedFrame.sourceTimecode100ns = nativeVideoDecodedTimecode100ns(
+                submittedPts90k, timecode100ns, frame->pts, kRtmpTimestampWrap90k);
             m_callbacks.onVideoFrame(decodedFrame);
         },
         &error);

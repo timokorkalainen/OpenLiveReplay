@@ -826,15 +826,20 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
             const bool decodedGpu = m_decoder->decodeKeepSurface(
                 unit,
                 [this, &unit, sourcePtsMs, timecode100ns,
-                 &gpuSurfaceRejected](void* nativeDecodedImage, qint64 /*pts90k*/) {
-                    const FrameMetadata meta =
-                        gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                 &gpuSurfaceRejected](void* nativeDecodedImage, qint64 decodedPts90k) {
+                    const qint64 decodedSourcePtsMs =
+                        nativeVideoDecodedSourcePtsMs(unit.pts90k, sourcePtsMs, decodedPts90k);
+                    const qint64 decodedTimecode100ns =
+                        nativeVideoDecodedTimecode100ns(unit.pts90k, timecode100ns, decodedPts90k);
+                    const FrameMetadata meta = gpuDecodedFrameMetadata(
+                        unit, m_outputWidth, m_outputHeight, decodedSourcePtsMs);
                     ImportedGpuVideoFrame imported;
                     if (m_callbacks.importGpuVideoFrame) {
                         imported = m_callbacks.importGpuVideoFrame(nativeDecodedImage, meta);
                     } else {
-                        imported.frame = makeGpuDecodedFrameHandle(
-                            nativeDecodedImage, unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                        imported.frame =
+                            makeGpuDecodedFrameHandle(nativeDecodedImage, unit, m_outputWidth,
+                                                      m_outputHeight, decodedSourcePtsMs);
                     }
                     FrameHandle gpuFrame = std::move(imported.frame);
                     if (gpuFrame.isNull()) {
@@ -843,8 +848,8 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                     }
 
                     DecodedVideoFrame decodedFrame;
-                    decodedFrame.sourcePtsMs = sourcePtsMs;
-                    decodedFrame.sourceTimecode100ns = timecode100ns;
+                    decodedFrame.sourcePtsMs = decodedSourcePtsMs;
+                    decodedFrame.sourceTimecode100ns = decodedTimecode100ns;
                     decodedFrame.gpuFrame = std::move(gpuFrame);
                     decodedFrame.gpuFenceValue = imported.fenceValue;
                     m_callbacks.onVideoFrame(std::move(decodedFrame));
@@ -866,7 +871,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
         QString error;
         const bool decoded = m_decoder->decode(
             unit,
-            [this, sourcePtsMs, timecode100ns](AVFrame* frame) {
+            [this, submittedPts90k = unit.pts90k, sourcePtsMs, timecode100ns](AVFrame* frame) {
                 if (!frame) {
                     return;
                 }
@@ -875,10 +880,13 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                     return;
                 }
 
+                const qint64 decodedSourcePtsMs =
+                    nativeVideoDecodedSourcePtsMs(submittedPts90k, sourcePtsMs, frame->pts);
                 DecodedVideoFrame decodedFrame;
                 decodedFrame.frame = frame;
-                decodedFrame.sourcePtsMs = sourcePtsMs;
-                decodedFrame.sourceTimecode100ns = timecode100ns;
+                decodedFrame.sourcePtsMs = decodedSourcePtsMs;
+                decodedFrame.sourceTimecode100ns =
+                    nativeVideoDecodedTimecode100ns(submittedPts90k, timecode100ns, frame->pts);
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);

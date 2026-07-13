@@ -11,6 +11,7 @@ private slots:
     void videoToolboxNoFrameIsRejected();
     void flushExcessPixelBufferPoolNoOpsWithoutSession();
     void mediaFoundationPrefixesParameterSetsAtSessionStart();
+    void decodedOutputPtsCorrectsBufferedFrameTiming();
 };
 
 void TestNativeVideoDecoder::defaultCapabilitiesAreFalse() {
@@ -81,6 +82,20 @@ void TestNativeVideoDecoder::mediaFoundationPrefixesParameterSetsAtSessionStart(
 #else
     QSKIP("Media Foundation input assembly is Windows-only");
 #endif
+}
+
+void TestNativeVideoDecoder::decodedOutputPtsCorrectsBufferedFrameTiming() {
+    QCOMPARE(nativeVideoDecodedSourcePtsMs(216000, 2400, 180000), qint64(2000));
+    QCOMPARE(nativeVideoDecodedSourcePtsMs(216000, 2400, 216000), qint64(2400));
+
+    constexpr qint64 wrap90k = qint64(1) << 33;
+    QCOMPARE(nativeVideoDecodedSourcePtsMs(4500, 1000, wrap90k - 4500), qint64(900));
+    constexpr qint64 rtmpWrap90k = (qint64(1) << 32) * 90;
+    QCOMPARE(nativeVideoDecodedSourcePtsMs(4500, 1000, rtmpWrap90k - 4500, rtmpWrap90k),
+             qint64(900));
+    QCOMPARE(nativeVideoDecodedSourcePtsMs(-1, 2400, 180000), qint64(2400));
+    QCOMPARE(nativeVideoDecodedTimecode100ns(216000, 100000000, 180000), qint64(96000000));
+    QCOMPARE(nativeVideoDecodedTimecode100ns(9000, 500000, 0), qint64(863999500000));
 }
 
 QTEST_GUILESS_MAIN(TestNativeVideoDecoder)
