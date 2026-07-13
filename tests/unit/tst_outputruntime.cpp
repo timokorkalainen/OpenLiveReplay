@@ -815,8 +815,6 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
     QVERIFY2(sink.waitForSubmits(2, 1000), "scheduled catch-up must enter its first tick");
     playheadMs.store(200, std::memory_order_release);
 
-    QElapsedTimer timer;
-    timer.start();
     std::thread immediateThread([&]() { runtime.dispatchImmediate(); });
     QElapsedTimer registrationTimer;
     registrationTimer.start();
@@ -827,23 +825,11 @@ void TestOutputRuntime::immediateDispatchPreemptsCatchUpBurstAfterCurrentTick() 
 
     immediateThread.join();
     catchUpThread.join();
-    [[maybe_unused]] const qint64 immediateElapsedMs = timer.elapsed();
     QVERIFY2(immediateRegistered, "immediate dispatch request must register before tick release");
 
     const QVector<OutputBusFrame> frames = sink.frames();
-    // Preemption is proven structurally by the frame count below; this latency bound is a
-    // coarse "did not wait for the whole burst" guard. The full non-preempted burst is
-    // m_maxCatchUpTicks (8) * SlowSubmitSink 80ms = 640ms, so a value well under that still
-    // catches a preemption regression while tolerating CI scheduling jitter (msleep can
-    // overrun under load, which made a tight 250ms bound flaky). Under ThreadSanitizer the
-    // instrumented handoff and the SlowSubmitSink msleeps dominate and inflate this
-    // wall-clock far past the budget on slower/contended runners (1-2.8 s observed on CI),
-    // so gate the timing guard out under TSan and rely on the timing-free structural check.
-#if !defined(__SANITIZE_THREAD__) && !(defined(__has_feature) && __has_feature(thread_sanitizer))
-    QVERIFY2(immediateElapsedMs < 500,
-             qPrintable(QStringLiteral("immediate dispatch waited %1 ms behind catch-up")
-                            .arg(immediateElapsedMs)));
-#endif
+    // The barrier makes this timing-free: the immediate request is registered while the
+    // first catch-up submit is blocked, then the frame count proves the burst yielded.
     QVERIFY2(frames.size() <= 4,
              qPrintable(QStringLiteral("immediate dispatch allowed %1 stale catch-up frames")
                             .arg(frames.size())));

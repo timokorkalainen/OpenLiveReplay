@@ -190,6 +190,7 @@ OutputRuntime::dispatchImmediateWithReport(const OutputDispatchRequest& request)
     };
 
     m_immediateDispatchRequests.fetch_add(1, std::memory_order_acq_rel);
+    m_immediateDispatchGeneration.fetch_add(1, std::memory_order_acq_rel);
     immediateRegistered = true;
 
     {
@@ -336,6 +337,10 @@ OutputRuntimeSnapshot OutputRuntime::snapshot() const {
 }
 
 OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
+    const quint64 immediateGenerationAtEntry =
+        m_immediateDispatchGeneration.load(std::memory_order_acquire);
+    const bool immediatePendingAtEntry =
+        m_immediateDispatchRequests.load(std::memory_order_acquire) > 0;
     qint64 elapsedNs = 0;
     {
         QMutexLocker locker(&m_mutex);
@@ -354,7 +359,10 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
-            if (m_immediateDispatchRequests.load(std::memory_order_acquire) > 0)
+            if (immediatePendingAtEntry ||
+                m_immediateDispatchRequests.load(std::memory_order_acquire) > 0 ||
+                m_immediateDispatchGeneration.load(std::memory_order_acquire) !=
+                    immediateGenerationAtEntry)
                 return statsLocked();
             const FrameRate rate = m_dispatcher.frameRate();
             frameIndex = m_dispatcher.nextOutputFrameIndex();
@@ -373,7 +381,10 @@ OutputDispatchStats OutputRuntime::dispatchDueTicksNs(qint64 wallNowNs) {
             while (m_reconfiguring && !m_stopRequested)
                 m_dispatchIdle.wait(&m_mutex);
             if (m_stopRequested) break;
-            if (m_immediateDispatchRequests.load(std::memory_order_acquire) > 0)
+            if (immediatePendingAtEntry ||
+                m_immediateDispatchRequests.load(std::memory_order_acquire) > 0 ||
+                m_immediateDispatchGeneration.load(std::memory_order_acquire) !=
+                    immediateGenerationAtEntry)
                 return statsLocked();
             if (m_configGeneration != configGeneration) continue;
             if (m_dispatcher.nextOutputFrameIndex() != frameIndex) continue;
