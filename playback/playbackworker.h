@@ -260,11 +260,34 @@ private:
         Displayable,
     };
 
+    enum class OutputCacheAction : uint8_t { Keep, Publish, MergeStagingAndPublish };
+    enum class PostCommitDispatch : uint8_t { None, Output, Preview, PgmCritical };
+
+    struct OutputCommit {
+        qint64 playheadMs = 0;
+        uint64_t seekGeneration = 0;
+        uint64_t gpuGeneration = 0;
+        OutputCacheAction cacheAction = OutputCacheAction::Keep;
+        OutputCoverageMode coverageMode = OutputCoverageMode::StrictSeek;
+        bool requireCurrentSeek = true;
+        bool clearSeekTarget = false;
+        bool guardPlayheadCache = false;
+        PostCommitDispatch dispatch = PostCommitDispatch::None;
+    };
+
+    struct OutputCommitResult {
+        bool committed = false;
+        qint64 committedPlayheadMs = 0;
+        uint64_t committedGeneration = 0;
+        PostCommitDispatch dispatch = PostCommitDispatch::None;
+    };
+
     struct SeekRequestResult {
         qint64 clampedTargetMs = 0;
         int moveDir = 1;
         uint64_t generation = 0;
         bool committedFromPublishedCache = false;
+        PostCommitDispatch dispatch = PostCommitDispatch::None;
         qint64 publishNs = 0;
     };
 
@@ -314,16 +337,24 @@ private:
     bool
     outputFeedCoversPlayheadLocked(int feedIndex, int64_t playheadMs, uint64_t gpuGeneration,
                                    OutputCoverageMode mode = OutputCoverageMode::StrictSeek) const;
+    bool outputCacheCoversPlayheadInCacheLocked(const OutputFrameCache& cache, int64_t playheadMs,
+                                                uint64_t gpuGeneration,
+                                                OutputCoverageMode mode) const;
     bool outputCacheCoversPlayheadLocked(
         int64_t playheadMs, uint64_t gpuGeneration,
         OutputCoverageMode mode = OutputCoverageMode::OperatorSeek) const;
+    std::optional<qint64> outputCacheDisplayablePlayheadInCacheLocked(const OutputFrameCache& cache,
+                                                                      qint64 playheadMs,
+                                                                      uint64_t gpuGeneration) const;
     std::optional<qint64> outputCacheDisplayablePlayheadLocked(qint64 playheadMs,
                                                                uint64_t gpuGeneration) const;
+    OutputCommitResult commitOutputStateLocked(const OutputCommit& commit);
     bool outputCacheCoversPlayhead(int64_t playheadMs) const;
     bool pausedPlayheadNeedsWork(int64_t playheadMs);
     SeekRequestResult requestSeekTo(qint64 timestampMs, int directionHint,
                                     bool registerOperatorTransaction);
     OutputDispatchReport dispatchPgmAfterSeekCommit(qint64 targetMs);
+    OutputDispatchReport dispatchPgmCommitObligation(qint64 targetMs, uint64_t generation);
     void completeOperatorSeekTransaction(uint64_t generation, qint64 targetMs,
                                          const OutputDispatchReport& report);
     bool hasOperatorSeekTransaction(uint64_t generation);

@@ -35,6 +35,9 @@ private slots:
     void newIoTargetsShareGpuReadbackCache();
     void selectedFeedCoverageAdvancesPlayheadWhenOtherFeedMissing();
     void pausedStepUsesPriorFrameCoverage();
+    void outputCommitRejectsStaleGenerationWithoutMutation();
+    void outputCommitPublishesTypedStateAndReturnsPgmDispatch();
+    void outputCommitUsesDisplayableFallbackAndReturnsPreviewDispatch();
     void coveredSeekCommitsPlayheadBeforeWorkerRuns();
     void coveredSeekPublishesLiveCacheForInstantSnapshot();
     void outputRuntimeStatsDoesNotBlockOnActiveDispatch();
@@ -587,6 +590,176 @@ void TestPlaybackWorker::pausedStepUsesPriorFrameCoverage() {
     QVERIFY(!snapshot.state.forcePlayEpochReset);
 }
 
+void TestPlaybackWorker::outputCommitRejectsStaleGenerationWithoutMutation() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(8, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(480, std::memory_order_release);
+    worker.m_outputPlayheadCacheGuarded.store(true, std::memory_order_release);
+#ifdef OLR_GPU_PIPELINE_BUILD
+    worker.m_committedGpuGeneration.store(17, std::memory_order_release);
+#endif
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    }
+
+    PlaybackWorker::OutputCommitResult result;
+    {
+        QMutexLocker locker(&worker.m_mutex);
+        worker.m_seekTargetMs = -1;
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1200, 96));
+
+        PlaybackWorker::OutputCommit commit;
+        commit.playheadMs = 1200;
+        commit.seekGeneration = 7;
+        commit.gpuGeneration = 23;
+        commit.cacheAction = PlaybackWorker::OutputCacheAction::Publish;
+        commit.coverageMode = PlaybackWorker::OutputCoverageMode::OperatorSeek;
+        commit.guardPlayheadCache = false;
+        commit.dispatch = PlaybackWorker::PostCommitDispatch::PgmCritical;
+        result = worker.commitOutputStateLocked(commit);
+    }
+
+    QVERIFY(!result.committed);
+    QCOMPARE(result.dispatch, PlaybackWorker::PostCommitDispatch::None);
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(7));
+    QCOMPARE(worker.m_committedPlayheadMs.load(std::memory_order_acquire), qint64(500));
+    QCOMPARE(worker.m_lastVisiblePlayheadMs.load(std::memory_order_acquire), qint64(480));
+    QVERIFY(worker.m_outputPlayheadCacheGuarded.load(std::memory_order_acquire));
+#ifdef OLR_GPU_PIPELINE_BUILD
+    QCOMPARE(worker.m_committedGpuGeneration.load(std::memory_order_acquire), uint64_t(17));
+#endif
+    QVERIFY(!worker.m_publishedCache.load());
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), 0);
+    }
+}
+
+void TestPlaybackWorker::outputCommitPublishesTypedStateAndReturnsPgmDispatch() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(8, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(25, 1), 1, 4, 4);
+    }
+
+    PlaybackWorker::OutputCommitResult result;
+    {
+        QMutexLocker locker(&worker.m_mutex);
+        worker.m_seekTargetMs = -1;
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1200, 96));
+
+        PlaybackWorker::OutputCommit commit;
+        commit.playheadMs = 1200;
+        commit.seekGeneration = 8;
+        commit.gpuGeneration = 23;
+        commit.cacheAction = PlaybackWorker::OutputCacheAction::Publish;
+        commit.coverageMode = PlaybackWorker::OutputCoverageMode::OperatorSeek;
+        commit.guardPlayheadCache = true;
+        commit.dispatch = PlaybackWorker::PostCommitDispatch::PgmCritical;
+        result = worker.commitOutputStateLocked(commit);
+    }
+
+    QVERIFY(result.committed);
+    QCOMPARE(result.committedPlayheadMs, qint64(1200));
+    QCOMPARE(result.committedGeneration, uint64_t(8));
+    QCOMPARE(result.dispatch, PlaybackWorker::PostCommitDispatch::PgmCritical);
+    QCOMPARE(worker.m_committedPlayheadMs.load(std::memory_order_acquire), qint64(1200));
+    QCOMPARE(worker.m_lastVisiblePlayheadMs.load(std::memory_order_acquire), qint64(1200));
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(8));
+    QVERIFY(worker.m_outputPlayheadCacheGuarded.load(std::memory_order_acquire));
+#ifdef OLR_GPU_PIPELINE_BUILD
+    QCOMPARE(worker.m_committedGpuGeneration.load(std::memory_order_acquire), uint64_t(23));
+#endif
+    const std::shared_ptr<const OutputFrameCache> published = worker.m_publishedCache.load();
+    QVERIFY(published);
+    QVERIFY(published->videoFrameAt(0, 1200).has_value());
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), 1);
+    }
+}
+
+void TestPlaybackWorker::outputCommitUsesDisplayableFallbackAndReturnsPreviewDispatch() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(30, 1);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(5, std::memory_order_release);
+    worker.m_committedGeneration.store(4, std::memory_order_release);
+    worker.m_outputPlayheadCacheGuarded.store(true, std::memory_order_release);
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(30, 1), 1, 4, 4);
+    }
+
+    PlaybackWorker::OutputCommitResult result;
+    {
+        QMutexLocker locker(&worker.m_mutex);
+        worker.m_seekTargetMs = 0;
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 832, 80));
+
+        PlaybackWorker::OutputCommit commit;
+        commit.playheadMs = 0;
+        commit.seekGeneration = 5;
+        commit.cacheAction = PlaybackWorker::OutputCacheAction::Publish;
+        commit.coverageMode = PlaybackWorker::OutputCoverageMode::Displayable;
+        commit.requireCurrentSeek = false;
+        commit.clearSeekTarget = true;
+        commit.guardPlayheadCache = false;
+        commit.dispatch = PlaybackWorker::PostCommitDispatch::Preview;
+        result = worker.commitOutputStateLocked(commit);
+    }
+
+    QVERIFY(result.committed);
+    QCOMPARE(result.committedPlayheadMs, qint64(832));
+    QCOMPARE(result.committedGeneration, uint64_t(5));
+    QCOMPARE(result.dispatch, PlaybackWorker::PostCommitDispatch::Preview);
+    QCOMPARE(worker.m_seekTargetMs, qint64(-1));
+    QCOMPARE(worker.m_committedPlayheadMs.load(std::memory_order_acquire), qint64(832));
+    QCOMPARE(worker.m_lastVisiblePlayheadMs.load(std::memory_order_acquire), qint64(832));
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(5));
+    QVERIFY(!worker.m_outputPlayheadCacheGuarded.load(std::memory_order_acquire));
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), 1);
+    }
+}
+
 void TestPlaybackWorker::coveredSeekCommitsPlayheadBeforeWorkerRuns() {
     FrameProvider feed0;
     FrameProvider feed1;
@@ -747,6 +920,7 @@ void TestPlaybackWorker::operatorSeekTransactionCompletesCoveredSeekWithPgmEvide
     transport.seek(1000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -770,7 +944,6 @@ void TestPlaybackWorker::operatorSeekTransactionCompletesCoveredSeekWithPgmEvide
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -913,6 +1086,7 @@ void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowF
     transport.seek(1000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -940,7 +1114,6 @@ void TestPlaybackWorker::operatorSeekTransactionPublishesTargetBeforeLeadWindowF
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -971,6 +1144,8 @@ void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() 
     transport.seek(1000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
+    pgmSink.rejectSubmits = true;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -998,8 +1173,6 @@ void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() 
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
-    pgmSink.rejectSubmits = true;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -1025,6 +1198,7 @@ void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncomm
     transport.seek(5000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1048,7 +1222,6 @@ void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncomm
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -1076,6 +1249,7 @@ void TestPlaybackWorker::operatorSeekTransactionAbandonedOnTimeout() {
     transport.seek(5000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1099,7 +1273,6 @@ void TestPlaybackWorker::operatorSeekTransactionAbandonedOnTimeout() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -1134,6 +1307,7 @@ void TestPlaybackWorker::operatorSeekCompletionEmitsSignal() {
     transport.seek(1000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1153,7 +1327,6 @@ void TestPlaybackWorker::operatorSeekCompletionEmitsSignal() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -1186,6 +1359,7 @@ void TestPlaybackWorker::seekToWithPgmNotifyCompletesCacheHitInline() {
     transport.seek(1000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1205,7 +1379,6 @@ void TestPlaybackWorker::seekToWithPgmNotifyCompletesCacheHitInline() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
@@ -1239,6 +1412,7 @@ void TestPlaybackWorker::seekToWithPgmNotifyLeavesCacheMissWaiting() {
     transport.seek(1000);
     transport.setPlaying(false);
 
+    TestPgmSink pgmSink;
     PlaybackWorker worker({&feed0}, &transport);
     worker.m_outputFeedCount = 1;
     worker.m_outputWidth = 4;
@@ -1258,7 +1432,6 @@ void TestPlaybackWorker::seekToWithPgmNotifyLeavesCacheMissWaiting() {
     pgm.kind = OutputTargetKind::Ndi;
     pgm.enabled = true;
 
-    TestPgmSink pgmSink;
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         worker.m_outputRuntime =
