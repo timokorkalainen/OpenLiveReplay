@@ -81,5 +81,5 @@ void TestFrameIndex::newestTracksGrowth() {
     QCOMPARE(idx.newestPtsMs().value(), qint64(80));
 }
 
-QTEST_MAIN(TestFrameIndex)
+QTEST_GUILESS_MAIN(TestFrameIndex)
 #include "tst_frameindex.moc"

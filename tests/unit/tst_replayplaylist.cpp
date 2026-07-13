@@ -326,5 +326,5 @@ void TestReplayPlaylist::fromJsonRejectsInvalidOpenSentinel() {
     QCOMPARE(b.count(), 0);
 }
 
-QTEST_MAIN(TestReplayPlaylist)
+QTEST_GUILESS_MAIN(TestReplayPlaylist)
 #include "tst_replayplaylist.moc"
