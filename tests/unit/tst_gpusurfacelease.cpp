@@ -25,6 +25,9 @@
 
 #include <memory>
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
 #include <type_traits>
 
 #ifdef OLR_UNIT_TEST
@@ -144,6 +147,24 @@ private:
     int m_signalCalls = 0;
 };
 
+bool isExpectedCheckedContractTermination(QProcess::ExitStatus status, int exitCode) {
+#ifdef Q_OS_WIN
+    constexpr quint32 windowsFailFastAssertionStatus = 0xC0000602u;
+    Q_UNUSED(status);
+    return static_cast<quint32>(exitCode) == windowsFailFastAssertionStatus;
+#else
+    Q_UNUSED(exitCode);
+    return status == QProcess::CrashExit;
+#endif
+}
+
+QString childTerminationDiagnostic(const QProcess& child, const QByteArray& output) {
+    return QStringLiteral("child status=%1 exitCode=%2 output=%3")
+        .arg(int(child.exitStatus()))
+        .arg(child.exitCode())
+        .arg(QString::fromLocal8Bit(output));
+}
+
 } // namespace
 
 class TestGpuSurfaceLease : public QObject {
@@ -152,7 +173,9 @@ private slots:
     void callbackLeaseExposesMetadataOnly();
     void callbackLeaseReportsInvalidSurface();
     void withReadCompletesScope();
+    void withReadCompletesDuringExceptionUnwinding();
     void handleQueryAfterCompletionFailsCheckedContract();
+    void checkedContractDeathOracleRejectsUnrelatedExit();
     void surfaceOwnerSurvivesUntilLeaseDestruction();
     void boundedWaitDrainReleasesOnlyRetired();
     void boundedWaitDoesNotHoldRetainerMutex();
@@ -204,6 +227,47 @@ void TestGpuSurfaceLease::withReadCompletesScope() {
     QCOMPARE(observed, sentinel);
 }
 
+void TestGpuSurfaceLease::withReadCompletesDuringExceptionUnwinding() {
+#ifndef QT_NO_DEBUG
+    constexpr auto deathChildEnvironment = "OLR_GPU_SYNC_READ_THROW_DEATH_CHILD";
+    constexpr auto callbackReachedThrowMarker = "withRead callback reached throw";
+    if (qEnvironmentVariableIsSet(deathChildEnvironment)) {
+        auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xFACE), true);
+        GpuSyncReadScope scope;
+        const GpuReadLease retainedLease = scope.read(surface);
+        try {
+            scope.withRead(surface, [](const GpuReadLease& lease) {
+                (void) lease.nativeHandle();
+                std::fputs("withRead callback reached throw\n", stderr);
+                std::fflush(stderr);
+                throw std::runtime_error("expected callback failure");
+            });
+        } catch (const std::runtime_error&) {
+        }
+        (void) retainedLease.nativeHandle();
+        scope.complete();
+        return;
+    }
+
+    QProcess child;
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QString::fromLatin1(deathChildEnvironment), QStringLiteral("1"));
+    child.setProcessEnvironment(environment);
+    child.setProcessChannelMode(QProcess::MergedChannels);
+    child.start(QCoreApplication::applicationFilePath(),
+                {QStringLiteral("withReadCompletesDuringExceptionUnwinding")});
+    QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
+    QVERIFY2(child.waitForFinished(10000), qPrintable(child.errorString()));
+    const QByteArray output = child.readAll();
+    QVERIFY2(output.contains(callbackReachedThrowMarker),
+             qPrintable(childTerminationDiagnostic(child, output)));
+    QVERIFY2(isExpectedCheckedContractTermination(child.exitStatus(), child.exitCode()),
+             qPrintable(childTerminationDiagnostic(child, output)));
+#else
+    QSKIP("Checked-contract assertions are disabled in this build");
+#endif
+}
+
 void TestGpuSurfaceLease::handleQueryAfterCompletionFailsCheckedContract() {
 #ifndef QT_NO_DEBUG
     constexpr auto deathChildEnvironment = "OLR_GPU_SYNC_READ_LEASE_DEATH_CHILD";
@@ -225,11 +289,35 @@ void TestGpuSurfaceLease::handleQueryAfterCompletionFailsCheckedContract() {
                 {QStringLiteral("handleQueryAfterCompletionFailsCheckedContract")});
     QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
     QVERIFY2(child.waitForFinished(10000), qPrintable(child.errorString()));
-    const bool terminatedByContract =
-        child.exitStatus() == QProcess::CrashExit || child.exitCode() != 0;
-    QVERIFY2(terminatedByContract,
-             qPrintable(QStringLiteral("checked-contract child exited normally with code %1")
-                            .arg(child.exitCode())));
+    const QByteArray output = child.readAll();
+    QVERIFY2(isExpectedCheckedContractTermination(child.exitStatus(), child.exitCode()),
+             qPrintable(childTerminationDiagnostic(child, output)));
+#else
+    QSKIP("Checked-contract assertions are disabled in this build");
+#endif
+}
+
+void TestGpuSurfaceLease::checkedContractDeathOracleRejectsUnrelatedExit() {
+#ifndef QT_NO_DEBUG
+    constexpr auto unrelatedChildEnvironment = "OLR_GPU_SYNC_READ_UNRELATED_FAILURE_CHILD";
+    if (qEnvironmentVariableIsSet(unrelatedChildEnvironment)) {
+        std::fputs("unrelated child failure mutation\n", stderr);
+        std::fflush(stderr);
+        std::exit(7);
+    }
+
+    QProcess child;
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    environment.insert(QString::fromLatin1(unrelatedChildEnvironment), QStringLiteral("1"));
+    child.setProcessEnvironment(environment);
+    child.setProcessChannelMode(QProcess::MergedChannels);
+    child.start(QCoreApplication::applicationFilePath(),
+                {QStringLiteral("checkedContractDeathOracleRejectsUnrelatedExit")});
+    QVERIFY2(child.waitForStarted(), qPrintable(child.errorString()));
+    QVERIFY2(child.waitForFinished(10000), qPrintable(child.errorString()));
+    const QByteArray output = child.readAll();
+    QVERIFY2(!isExpectedCheckedContractTermination(child.exitStatus(), child.exitCode()),
+             qPrintable(childTerminationDiagnostic(child, output)));
 #else
     QSKIP("Checked-contract assertions are disabled in this build");
 #endif

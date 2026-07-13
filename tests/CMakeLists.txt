@@ -26,28 +26,58 @@ function(olr_expect_compile_failure name source)
         message(FATAL_ERROR
             "Forbidden GPU capability probe ${name} compiled successfully:\n${compile_output}")
     endif()
+    foreach(expected_diagnostic IN LISTS ARGN)
+        if(NOT compile_output MATCHES "${expected_diagnostic}")
+            message(FATAL_ERROR
+                "Forbidden GPU capability probe ${name} failed without expected diagnostic "
+                "'${expected_diagnostic}':\n${compile_output}")
+        endif()
+    endforeach()
 endfunction()
 
-function(olr_add_compile_control name source should_compile)
+function(olr_add_compile_control name source expectation)
     set(target "${name}_compile_control")
     add_library(${target} STATIC EXCLUDE_FROM_ALL
         "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/${source}")
     target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}")
     target_link_libraries(${target} PRIVATE Qt6::Core)
 
-    add_test(NAME ${name}
-        COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}"
-            --target ${target} --config $<CONFIG>)
-    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
-    if(NOT should_compile)
-        set_tests_properties(${name} PROPERTIES WILL_FAIL TRUE)
+    set(control_args
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DTARGET=${target}"
+        "-DCONFIG=$<CONFIG>")
+    if(expectation STREQUAL "PASS")
+        list(APPEND control_args "-DEXPECT_COMPILE=TRUE")
+    elseif(expectation STREQUAL "PROTECTED_FAILURE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "REJECT_UNRELATED_FAILURE")
+        list(APPEND control_args
+            "-DVERIFY_REJECTION=TRUE"
+            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    else()
+        message(FATAL_ERROR "Unknown compile-control expectation: ${expectation}")
     endif()
+
+    add_test(NAME ${name}
+        COMMAND ${CMAKE_COMMAND} ${control_args}
+            -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
 endfunction()
 
-olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp)
-olr_add_compile_control(gpu_native_handle_access native_handle_access.cpp FALSE)
-olr_add_compile_control(gpu_native_handle_access_pass native_handle_access_pass.cpp TRUE)
-set_tests_properties(gpu_native_handle_access_pass PROPERTIES
+olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp
+    "nativeHandle" "[Pp]rotected")
+olr_add_compile_control(gpu_native_handle_access native_handle_access.cpp PROTECTED_FAILURE)
+olr_add_compile_control(gpu_native_handle_access_pass native_handle_access_pass.cpp PASS)
+olr_add_compile_control(gpu_native_handle_access_unrelated_error_rejected
+    unrelated_compile_error.cpp REJECT_UNRELATED_FAILURE)
+set_tests_properties(
+    gpu_native_handle_access_pass
+    gpu_native_handle_access_unrelated_error_rejected
+    PROPERTIES
     DEPENDS gpu_native_handle_access)
 olr_expect_compile_failure(gpu_lease_move lease_move.cpp)
 olr_expect_compile_failure(gpu_backing_authority_spoof backing_authority_spoof.cpp)
