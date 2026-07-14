@@ -13,7 +13,6 @@
 #include <array>
 #include <atomic>
 #include <limits>
-#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -21,6 +20,7 @@ namespace {
 
 constexpr size_t kShardCount = 16;
 constexpr size_t kNodesPerShard = 1024;
+constexpr size_t kOwnersPerNode = 5;
 constexpr size_t kFenceGroupsPerShard = kNodesPerShard;
 constexpr size_t kFenceHashBucketCount = kFenceGroupsPerShard * 2;
 constexpr uint16_t kNoNode = std::numeric_limits<uint16_t>::max();
@@ -41,9 +41,9 @@ struct RetireNode {
     RetireNodeState state = RetireNodeState::Free;
     uint64_t reservation = 0;
     GpuFenceIdentity identity;
-    std::shared_ptr<GpuSurface> owner;
-    std::shared_ptr<GpuFence> fence;
-    std::optional<GpuRetirementTicket> ticket;
+    std::array<std::shared_ptr<GpuSurface>, kOwnersPerNode> owners;
+    uint16_t ownerCount = 0;
+    uint64_t fenceValue = 0;
     uint16_t freeNext = kNoNode;
     uint16_t activeNext = kNoNode;
     uint16_t activePrevious = kNoNode;
@@ -75,8 +75,10 @@ struct RetireShard {
     std::array<uint16_t, kFenceHashBucketCount> fenceHashHeads;
     uint16_t freeHead = 0;
     uint16_t activeHead = kNoNode;
+    uint16_t activeNodeCount = 0;
     uint16_t fenceGroupFreeHead = 0;
     uint16_t activeFenceGroupHead = kNoFenceGroup;
+    uint16_t cachedFenceGroup = kNoFenceGroup;
     size_t freeCount = kNodesPerShard;
     qsizetype pendingOwners = 0;
     qsizetype quarantineOwners = 0;
@@ -103,6 +105,13 @@ struct StorageProbeMetrics {
     std::atomic<uint64_t> abandonmentShardVisits{0};
     std::atomic<uint64_t> abandonmentNodesVisited{0};
 };
+
+struct DiagnosticsHookState {
+    GpuRetireDiagnosticsHook hook = nullptr;
+    void* context = nullptr;
+};
+
+thread_local bool storageProbeEnabledForThread = true;
 #endif
 
 class RetireStorage final {
@@ -132,6 +141,18 @@ RetireStorage& storage() {
     return instance;
 }
 
+#ifdef OLR_UNIT_TEST
+DiagnosticsHookState& diagnosticsHookState() {
+    static DiagnosticsHookState state;
+    return state;
+}
+
+void invokeDiagnosticsHookForTest() noexcept {
+    const DiagnosticsHookState state = diagnosticsHookState();
+    if (state.hook) state.hook(state.context);
+}
+#endif
+
 size_t shardIndexForDomain(uintptr_t deviceDomainId) noexcept {
     size_t folded = size_t(deviceDomainId);
     if ((folded & (kShardCount - 1)) == 0) {
@@ -153,19 +174,22 @@ size_t fenceHash(const GpuFenceIdentity& identity) noexcept {
 
 void noteShardLock() noexcept {
 #ifdef OLR_UNIT_TEST
-    storage().probe.shardLockAcquisitions.fetch_add(1, std::memory_order_relaxed);
+    if (storageProbeEnabledForThread)
+        storage().probe.shardLockAcquisitions.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
 void noteActiveVisit() noexcept {
 #ifdef OLR_UNIT_TEST
-    storage().probe.activeNodesVisited.fetch_add(1, std::memory_order_relaxed);
+    if (storageProbeEnabledForThread)
+        storage().probe.activeNodesVisited.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
 void noteFenceGroupVisit() noexcept {
 #ifdef OLR_UNIT_TEST
-    storage().probe.fenceGroupsVisited.fetch_add(1, std::memory_order_relaxed);
+    if (storageProbeEnabledForThread)
+        storage().probe.fenceGroupsVisited.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
@@ -184,6 +208,7 @@ void linkActive(RetireShard& shard, uint16_t index) noexcept {
     node.activeNext = shard.activeHead;
     if (shard.activeHead != kNoNode) shard.nodes[shard.activeHead].activePrevious = index;
     shard.activeHead = index;
+    ++shard.activeNodeCount;
 }
 
 void unlinkActive(RetireShard& shard, uint16_t index) noexcept {
@@ -194,13 +219,15 @@ void unlinkActive(RetireShard& shard, uint16_t index) noexcept {
         shard.nodes[node.activePrevious].activeNext = node.activeNext;
     if (node.activeNext != kNoNode)
         shard.nodes[node.activeNext].activePrevious = node.activePrevious;
+    --shard.activeNodeCount;
 }
 
 uint16_t findFenceGroup(const RetireShard& shard, const GpuFenceIdentity& identity) noexcept {
     uint16_t index = shard.fenceHashHeads[fenceHash(identity)];
     while (index != kNoFenceGroup) {
 #ifdef OLR_UNIT_TEST
-        storage().probe.fenceLookupSteps.fetch_add(1, std::memory_order_relaxed);
+        if (storageProbeEnabledForThread)
+            storage().probe.fenceLookupSteps.fetch_add(1, std::memory_order_relaxed);
 #endif
         const FenceGroup& group = shard.fenceGroups[index];
         if (group.inUse && group.identity == identity) return index;
@@ -211,8 +238,15 @@ uint16_t findFenceGroup(const RetireShard& shard, const GpuFenceIdentity& identi
 
 uint16_t acquireFenceGroup(RetireShard& shard, const GpuFenceIdentity& identity,
                            const std::shared_ptr<GpuFence>& fence) noexcept {
+    if (shard.cachedFenceGroup != kNoFenceGroup) {
+        const FenceGroup& cached = shard.fenceGroups[shard.cachedFenceGroup];
+        if (cached.inUse && cached.identity == identity) return shard.cachedFenceGroup;
+    }
     const uint16_t existing = findFenceGroup(shard, identity);
-    if (existing != kNoFenceGroup) return existing;
+    if (existing != kNoFenceGroup) {
+        shard.cachedFenceGroup = existing;
+        return existing;
+    }
     if (shard.fenceGroupFreeHead == kNoFenceGroup) return kNoFenceGroup;
 
     const uint16_t index = shard.fenceGroupFreeHead;
@@ -233,6 +267,7 @@ uint16_t acquireFenceGroup(RetireShard& shard, const GpuFenceIdentity& identity,
     group.hashNext = shard.fenceHashHeads[bucket];
     shard.fenceHashHeads[bucket] = index;
     group.freeNext = kNoFenceGroup;
+    shard.cachedFenceGroup = index;
     return index;
 }
 
@@ -263,8 +298,9 @@ void deactivateFenceGroup(RetireShard& shard, size_t shardIndex, uint16_t index)
         storage().activeShardMask.fetch_and(~uint32_t(1u << shardIndex), std::memory_order_release);
 }
 
-void releaseFenceGroup(RetireShard& shard, uint16_t index) noexcept {
+std::shared_ptr<GpuFence> releaseFenceGroup(RetireShard& shard, uint16_t index) noexcept {
     FenceGroup& group = shard.fenceGroups[index];
+    if (shard.cachedFenceGroup == index) shard.cachedFenceGroup = kNoFenceGroup;
     const size_t bucket = fenceHash(group.identity);
     uint16_t* link = &shard.fenceHashHeads[bucket];
     while (*link != kNoFenceGroup && *link != index)
@@ -272,11 +308,12 @@ void releaseFenceGroup(RetireShard& shard, uint16_t index) noexcept {
     if (*link == index) *link = group.hashNext;
     group.inUse = false;
     group.identity = {};
-    group.fence.reset();
+    std::shared_ptr<GpuFence> releasedFence = std::move(group.fence);
     group.maximumValue = 0;
     group.hashNext = kNoFenceGroup;
     group.freeNext = shard.fenceGroupFreeHead;
     shard.fenceGroupFreeHead = index;
+    return releasedFence;
 }
 
 void linkSignaledNode(RetireShard& shard, size_t shardIndex, uint16_t nodeIndex) noexcept {
@@ -291,9 +328,10 @@ void linkSignaledNode(RetireShard& shard, size_t shardIndex, uint16_t nodeIndex)
     if (wasEmpty) activateFenceGroup(shard, shardIndex, node.fenceGroup);
 }
 
-void detachNodeFromFenceGroup(RetireShard& shard, size_t shardIndex, uint16_t nodeIndex) noexcept {
+std::shared_ptr<GpuFence> detachNodeFromFenceGroup(RetireShard& shard, size_t shardIndex,
+                                                   uint16_t nodeIndex) noexcept {
     RetireNode& node = shard.nodes[nodeIndex];
-    if (node.fenceGroup == kNoFenceGroup) return;
+    if (node.fenceGroup == kNoFenceGroup) return {};
     const uint16_t groupIndex = node.fenceGroup;
     FenceGroup& group = shard.fenceGroups[groupIndex];
     if (node.state == RetireNodeState::Signaled) {
@@ -310,25 +348,49 @@ void detachNodeFromFenceGroup(RetireShard& shard, size_t shardIndex, uint16_t no
     node.groupPrevious = kNoNode;
     node.fenceGroup = kNoFenceGroup;
     --group.nodeCount;
-    if (group.nodeCount == 0) releaseFenceGroup(shard, groupIndex);
+    if (group.nodeCount == 0) return releaseFenceGroup(shard, groupIndex);
+    return {};
 }
 
 struct DeferredReleases {
-    std::array<std::shared_ptr<GpuSurface>, kNodesPerShard> owners;
+    std::array<std::shared_ptr<GpuSurface>, kNodesPerShard * kOwnersPerNode> owners;
     std::array<std::shared_ptr<GpuFence>, kNodesPerShard> fences;
-    size_t count = 0;
+    size_t ownerCount = 0;
+    size_t fenceCount = 0;
+
+    void clear() noexcept {
+        for (size_t i = 0; i < ownerCount; ++i)
+            owners[i].reset();
+        for (size_t i = 0; i < fenceCount; ++i)
+            fences[i].reset();
+        ownerCount = 0;
+        fenceCount = 0;
+    }
 };
 
-void recycleNode(RetireShard& shard, size_t shardIndex, uint16_t index,
-                 DeferredReleases& releases) noexcept {
+DeferredReleases& deferredReleases() {
+    thread_local DeferredReleases releases;
+    return releases;
+}
+
+void recycleNode(RetireShard& shard, size_t shardIndex, uint16_t index, DeferredReleases& releases,
+                 bool detachFenceGroup = true, bool detachActiveNode = true) noexcept {
     RetireNode& node = shard.nodes[index];
-    const RetireNodeState oldState = node.state;
-    detachNodeFromFenceGroup(shard, shardIndex, index);
-    unlinkActive(shard, index);
-    releases.owners[releases.count] = std::move(node.owner);
-    releases.fences[releases.count] = std::move(node.fence);
-    ++releases.count;
-    node.ticket.reset();
+    const uint16_t oldOwnerCount = node.ownerCount;
+    if (detachFenceGroup) {
+        std::shared_ptr<GpuFence> releasedFence =
+            detachNodeFromFenceGroup(shard, shardIndex, index);
+        if (releasedFence) releases.fences[releases.fenceCount++] = std::move(releasedFence);
+    } else {
+        node.groupNext = kNoNode;
+        node.groupPrevious = kNoNode;
+        node.fenceGroup = kNoFenceGroup;
+    }
+    if (detachActiveNode) unlinkActive(shard, index);
+    for (uint16_t owner = 0; owner < oldOwnerCount; ++owner)
+        releases.owners[releases.ownerCount++] = std::move(node.owners[owner]);
+    node.ownerCount = 0;
+    node.fenceValue = 0;
     node.reservation = 0;
     node.identity = {};
     node.state = RetireNodeState::Free;
@@ -339,14 +401,26 @@ void recycleNode(RetireShard& shard, size_t shardIndex, uint16_t index,
     shard.freeHead = index;
     ++shard.freeCount;
 #ifdef OLR_UNIT_TEST
-    storage().probe.poolNodeReleases.fetch_add(1, std::memory_order_relaxed);
+    if (storageProbeEnabledForThread)
+        storage().probe.poolNodeReleases.fetch_add(1, std::memory_order_relaxed);
 #endif
+}
 
-    if (oldState == RetireNodeState::Signaled || oldState == RetireNodeState::Quarantined) {
-        --shard.pendingOwners;
-        storage().metrics.pendingOwners.fetch_sub(1, std::memory_order_relaxed);
-    }
-    if (oldState == RetireNodeState::Quarantined) --shard.quarantineOwners;
+void recycleWholeShardNode(RetireShard& shard, uint16_t index,
+                           DeferredReleases& releases) noexcept {
+    RetireNode& node = shard.nodes[index];
+    for (uint16_t owner = 0; owner < node.ownerCount; ++owner)
+        releases.owners[releases.ownerCount++] = std::move(node.owners[owner]);
+    node.ownerCount = 0;
+    node.fenceValue = 0;
+    node.state = RetireNodeState::Free;
+    node.freeNext = shard.freeHead;
+    shard.freeHead = index;
+    ++shard.freeCount;
+#ifdef OLR_UNIT_TEST
+    if (storageProbeEnabledForThread)
+        storage().probe.poolNodeReleases.fetch_add(1, std::memory_order_relaxed);
+#endif
 }
 
 bool batchMatches(const RetireShard& shard, const GpuRetirePreparedHandle& prepared,
@@ -370,6 +444,22 @@ struct FenceProbe {
     uint64_t completedValue = 0;
 };
 
+struct FenceProbeWorkspace {
+    std::array<FenceProbe, kFenceGroupsPerShard> values;
+    size_t used = 0;
+
+    void clear() noexcept {
+        for (size_t i = 0; i < used; ++i)
+            values[i].fence.reset();
+        used = 0;
+    }
+};
+
+FenceProbeWorkspace& fenceProbeWorkspace() {
+    thread_local FenceProbeWorkspace workspace;
+    return workspace;
+}
+
 size_t collectFenceGroups(RetireShard& shard, size_t shardIndex,
                           std::array<FenceProbe, kFenceGroupsPerShard>& probes) {
     size_t probeCount = 0;
@@ -390,7 +480,8 @@ size_t collectFenceGroups(RetireShard& shard, size_t shardIndex,
 
 void noteCompletionQuery() noexcept {
 #ifdef OLR_UNIT_TEST
-    storage().probe.completionQueries.fetch_add(1, std::memory_order_relaxed);
+    if (storageProbeEnabledForThread)
+        storage().probe.completionQueries.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 
@@ -426,20 +517,42 @@ releaseCompletedGroups(RetireShard& shard, size_t shardIndex,
         FenceGroup& group = shard.fenceGroups[probe.groupIndex];
         if (!group.inUse || group.serial != probe.groupSerial || group.identity != probe.identity)
             continue;
+        const bool releaseWholeGroup =
+            group.nodeCount == group.signaledCount && probe.completedValue >= group.maximumValue;
+        const bool releaseWholeShard =
+            releaseWholeGroup && shard.activeNodeCount == group.nodeCount;
         uint16_t nodeIndex = group.signaledHead;
         while (nodeIndex != kNoNode) {
             RetireNode& node = shard.nodes[nodeIndex];
             const uint16_t next = node.groupNext;
             noteActiveVisit();
-            if (node.ticket && node.ticket->value() <= probe.completedValue) {
-                recycleNode(shard, shardIndex, nodeIndex, releases);
-                ++result.released;
+            if (node.fenceValue != 0 && node.fenceValue <= probe.completedValue) {
+                const uint16_t ownerCount = node.ownerCount;
+                if (releaseWholeShard)
+                    recycleWholeShardNode(shard, nodeIndex, releases);
+                else
+                    recycleNode(shard, shardIndex, nodeIndex, releases, !releaseWholeGroup);
+                result.released += ownerCount;
             } else {
-                ++result.timedOut;
+                result.timedOut += node.ownerCount;
             }
             nodeIndex = next;
         }
+        if (releaseWholeGroup) {
+            group.signaledHead = kNoNode;
+            group.signaledCount = 0;
+            group.nodeCount = 0;
+            deactivateFenceGroup(shard, shardIndex, probe.groupIndex);
+            std::shared_ptr<GpuFence> releasedFence = releaseFenceGroup(shard, probe.groupIndex);
+            if (releasedFence) releases.fences[releases.fenceCount++] = std::move(releasedFence);
+        }
+        if (releaseWholeShard) {
+            shard.activeHead = kNoNode;
+            shard.activeNodeCount = 0;
+        }
     }
+    shard.pendingOwners -= result.released;
+    storage().metrics.pendingOwners.fetch_sub(result.released, std::memory_order_relaxed);
     return result;
 }
 
@@ -452,30 +565,44 @@ bool domainIsDead(uintptr_t domain, const std::vector<DeadDeviceToken>& deadDevi
 
 qsizetype abandonShardDomains(RetireShard& shard, size_t shardIndex, uintptr_t singleDomain,
                               const std::vector<DeadDeviceToken>* deadDevices) {
-    DeferredReleases releases;
+    DeferredReleases& releases = deferredReleases();
+    releases.clear();
     qsizetype released = 0;
+    qsizetype pendingReleased = 0;
+    qsizetype quarantineReleased = 0;
     {
         QMutexLocker locker(&shard.mutex);
         noteShardLock();
 #ifdef OLR_UNIT_TEST
-        storage().probe.abandonmentShardVisits.fetch_add(1, std::memory_order_relaxed);
+        if (storageProbeEnabledForThread)
+            storage().probe.abandonmentShardVisits.fetch_add(1, std::memory_order_relaxed);
 #endif
         uint16_t index = shard.activeHead;
         while (index != kNoNode) {
             RetireNode& node = shard.nodes[index];
             const uint16_t next = node.activeNext;
 #ifdef OLR_UNIT_TEST
-            storage().probe.abandonmentNodesVisited.fetch_add(1, std::memory_order_relaxed);
+            if (storageProbeEnabledForThread)
+                storage().probe.abandonmentNodesVisited.fetch_add(1, std::memory_order_relaxed);
 #endif
             const bool dead = deadDevices ? domainIsDead(node.identity.deviceDomainId, *deadDevices)
                                           : node.identity.deviceDomainId == singleDomain;
             if (dead) {
+                const uint16_t ownerCount = node.ownerCount;
+                if (node.state == RetireNodeState::Signaled ||
+                    node.state == RetireNodeState::Quarantined)
+                    pendingReleased += ownerCount;
+                if (node.state == RetireNodeState::Quarantined) quarantineReleased += ownerCount;
                 recycleNode(shard, shardIndex, index, releases);
-                ++released;
+                released += ownerCount;
             }
             index = next;
         }
+        shard.pendingOwners -= pendingReleased;
+        shard.quarantineOwners -= quarantineReleased;
+        storage().metrics.pendingOwners.fetch_sub(pendingReleased, std::memory_order_relaxed);
     }
+    releases.clear();
     return released;
 }
 
@@ -485,139 +612,127 @@ GpuRetirePreparedHandle GpuReadbackRetainer::prepare(const std::shared_ptr<GpuSu
                                                      qsizetype count,
                                                      const std::shared_ptr<GpuFence>& fence,
                                                      uint64_t reservation) noexcept {
-    if (!surfaces || count <= 0 || !fence || reservation == 0 || count > qsizetype(kNodesPerShard))
+    if (!surfaces || count <= 0 || !fence || reservation == 0 || count > qsizetype(kOwnersPerNode))
         return {};
 
-    qsizetype uniqueCount = 0;
+    // GpuOpScope is the sole preparation capability and has already rejected
+    // null and duplicate owners. Repeat both checks at this private boundary so
+    // a future friend cannot silently weaken the fixed-node ownership invariant.
     for (qsizetype i = 0; i < count; ++i) {
-        if (!surfaces[i]) continue;
-        bool duplicate = false;
-        for (qsizetype previous = 0; previous < i; ++previous) {
-            if (surfaces[previous].get() == surfaces[i].get()) {
-                duplicate = true;
-                break;
-            }
+        if (!surfaces[i]) return {};
+        for (qsizetype j = 0; j < i; ++j) {
+            if (surfaces[i].get() == surfaces[j].get()) return {};
         }
-        if (!duplicate) ++uniqueCount;
     }
-    if (uniqueCount <= 0) return {};
 
     const GpuFenceIdentity identity = fence->identity();
     const size_t shardIndex = shardIndexForDomain(identity.deviceDomainId);
     RetireShard& shard = storage().shards[shardIndex];
     QMutexLocker locker(&shard.mutex);
     noteShardLock();
-    if (shard.freeCount < size_t(uniqueCount)) {
+    if (shard.freeCount == 0) {
 #ifdef OLR_UNIT_TEST
-        storage().probe.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
+        if (storageProbeEnabledForThread)
+            storage().probe.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
 #endif
         return {};
     }
     const uint16_t groupIndex = acquireFenceGroup(shard, identity, fence);
     if (groupIndex == kNoFenceGroup) {
 #ifdef OLR_UNIT_TEST
-        storage().probe.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
+        if (storageProbeEnabledForThread)
+            storage().probe.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
 #endif
         return {};
     }
-
-    uint16_t batchHead = kNoNode;
-    uint16_t inserted = 0;
+    const uint16_t index = shard.freeHead;
+    RetireNode& node = shard.nodes[index];
+    shard.freeHead = node.freeNext;
+    --shard.freeCount;
+    node.freeNext = kNoNode;
+    node.state = RetireNodeState::Prepared;
+    node.reservation = reservation;
+    node.identity = identity;
+    node.fenceValue = 0;
+    node.batchNext = kNoNode;
+    node.fenceGroup = groupIndex;
+    node.groupNext = kNoNode;
+    node.groupPrevious = kNoNode;
     for (qsizetype i = 0; i < count; ++i) {
-        if (!surfaces[i]) continue;
-        bool duplicate = false;
-        for (qsizetype previous = 0; previous < i; ++previous) {
-            if (surfaces[previous].get() == surfaces[i].get()) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) continue;
-
-        const uint16_t index = shard.freeHead;
-        RetireNode& node = shard.nodes[index];
-        shard.freeHead = node.freeNext;
-        --shard.freeCount;
-        node.freeNext = kNoNode;
-        node.state = RetireNodeState::Prepared;
-        node.reservation = reservation;
-        node.identity = identity;
-        node.owner = surfaces[i];
-        node.fence = fence;
-        node.ticket.reset();
-        node.batchNext = batchHead;
-        node.fenceGroup = groupIndex;
-        node.groupNext = kNoNode;
-        node.groupPrevious = kNoNode;
-        batchHead = index;
-        linkActive(shard, index);
-        ++shard.fenceGroups[groupIndex].nodeCount;
+        node.owners[node.ownerCount++] = surfaces[i];
+    }
+    linkActive(shard, index);
+    ++shard.fenceGroups[groupIndex].nodeCount;
 #ifdef OLR_UNIT_TEST
+    if (storageProbeEnabledForThread)
         storage().probe.poolNodeAcquisitions.fetch_add(1, std::memory_order_relaxed);
 #endif
-        ++inserted;
-    }
-    return GpuRetirePreparedHandle{uint16_t(shardIndex), batchHead, inserted, reservation};
+    return GpuRetirePreparedHandle{uint16_t(shardIndex), index, 1, reservation};
 }
 
 bool GpuReadbackRetainer::publish(const GpuRetirePreparedHandle& prepared,
                                   const GpuRetirementTicket& ticket) noexcept {
-    if (!prepared || prepared.shard >= kShardCount || ticket.identity().deviceDomainId == 0)
+    if (!prepared || prepared.shard >= kShardCount || prepared.count != 1 ||
+        ticket.identity().deviceDomainId == 0)
         return false;
     RetireShard& shard = storage().shards[prepared.shard];
     QMutexLocker locker(&shard.mutex);
     noteShardLock();
-    if (!batchMatches(shard, prepared, RetireNodeState::Prepared)) return false;
-
-    uint16_t index = prepared.head;
-    for (uint16_t visited = 0; visited < prepared.count; ++visited) {
-        const RetireNode& node = shard.nodes[index];
-        if (node.identity != ticket.identity() || node.fenceGroup == kNoFenceGroup) return false;
-        index = node.batchNext;
-    }
-    index = prepared.head;
-    for (uint16_t visited = 0; visited < prepared.count; ++visited) {
-        RetireNode& node = shard.nodes[index];
-        node.ticket.emplace(ticket);
-        node.state = RetireNodeState::Signaled;
-        FenceGroup& group = shard.fenceGroups[node.fenceGroup];
-        group.maximumValue = std::max(group.maximumValue, ticket.value());
-        linkSignaledNode(shard, prepared.shard, index);
-        index = node.batchNext;
-    }
-    shard.pendingOwners += prepared.count;
+    RetireNode& node = shard.nodes[prepared.head];
+    if (node.reservation != prepared.reservation || node.state != RetireNodeState::Prepared ||
+        node.batchNext != kNoNode || node.identity != ticket.identity() ||
+        node.fenceGroup == kNoFenceGroup)
+        return false;
+    node.fenceValue = ticket.value();
+    node.state = RetireNodeState::Signaled;
+    FenceGroup& group = shard.fenceGroups[node.fenceGroup];
+    group.maximumValue = std::max(group.maximumValue, ticket.value());
+    linkSignaledNode(shard, prepared.shard, prepared.head);
+    const qsizetype ownerCount = node.ownerCount;
+    shard.pendingOwners += ownerCount;
     const qsizetype pending =
-        storage().metrics.pendingOwners.fetch_add(prepared.count, std::memory_order_relaxed) +
-        prepared.count;
+        storage().metrics.pendingOwners.fetch_add(ownerCount, std::memory_order_relaxed) +
+        ownerCount;
     updateHighWater(pending);
     return true;
 }
 
 void GpuReadbackRetainer::quarantine(const GpuRetirePreparedHandle& prepared) noexcept {
     if (!prepared || prepared.shard >= kShardCount) return;
+    std::shared_ptr<GpuFence> releasedFence;
     RetireShard& shard = storage().shards[prepared.shard];
-    QMutexLocker locker(&shard.mutex);
-    noteShardLock();
-    if (!batchMatches(shard, prepared, RetireNodeState::Prepared)) return;
+    {
+        QMutexLocker locker(&shard.mutex);
+        noteShardLock();
+        if (!batchMatches(shard, prepared, RetireNodeState::Prepared)) return;
 
-    uint16_t index = prepared.head;
-    for (uint16_t visited = 0; visited < prepared.count; ++visited) {
-        RetireNode& node = shard.nodes[index];
-        detachNodeFromFenceGroup(shard, prepared.shard, index);
-        node.state = RetireNodeState::Quarantined;
-        index = node.batchNext;
+        uint16_t index = prepared.head;
+        for (uint16_t visited = 0; visited < prepared.count; ++visited) {
+            RetireNode& node = shard.nodes[index];
+            releasedFence = detachNodeFromFenceGroup(shard, prepared.shard, index);
+            node.state = RetireNodeState::Quarantined;
+            index = node.batchNext;
+        }
+        qsizetype ownerCount = 0;
+        index = prepared.head;
+        for (uint16_t visited = 0; visited < prepared.count; ++visited) {
+            ownerCount += shard.nodes[index].ownerCount;
+            index = shard.nodes[index].batchNext;
+        }
+        shard.pendingOwners += ownerCount;
+        shard.quarantineOwners += ownerCount;
+        const qsizetype pending =
+            storage().metrics.pendingOwners.fetch_add(ownerCount, std::memory_order_relaxed) +
+            ownerCount;
+        updateHighWater(pending);
     }
-    shard.pendingOwners += prepared.count;
-    shard.quarantineOwners += prepared.count;
-    const qsizetype pending =
-        storage().metrics.pendingOwners.fetch_add(prepared.count, std::memory_order_relaxed) +
-        prepared.count;
-    updateHighWater(pending);
+    releasedFence.reset();
 }
 
 void GpuReadbackRetainer::release(const GpuRetirePreparedHandle& prepared) noexcept {
     if (!prepared || prepared.shard >= kShardCount) return;
-    DeferredReleases releases;
+    DeferredReleases& releases = deferredReleases();
+    releases.clear();
     RetireShard& shard = storage().shards[prepared.shard];
     {
         QMutexLocker locker(&shard.mutex);
@@ -630,6 +745,7 @@ void GpuReadbackRetainer::release(const GpuRetirePreparedHandle& prepared) noexc
             index = next;
         }
     }
+    releases.clear();
 }
 
 void GpuReadbackRetainer::drainCompleted() {
@@ -637,15 +753,21 @@ void GpuReadbackRetainer::drainCompleted() {
     for (size_t shardIndex = 0; shardIndex < kShardCount; ++shardIndex) {
         if ((activeShards & uint32_t(1u << shardIndex)) == 0) continue;
 #ifdef OLR_UNIT_TEST
-        storage().probe.drainShardVisits.fetch_add(1, std::memory_order_relaxed);
+        if (storageProbeEnabledForThread)
+            storage().probe.drainShardVisits.fetch_add(1, std::memory_order_relaxed);
 #endif
         RetireShard& shard = storage().shards[shardIndex];
-        std::array<FenceProbe, kFenceGroupsPerShard> probes;
-        const size_t probeCount = collectFenceGroups(shard, shardIndex, probes);
+        FenceProbeWorkspace& workspace = fenceProbeWorkspace();
+        workspace.clear();
+        const size_t probeCount = collectFenceGroups(shard, shardIndex, workspace.values);
+        workspace.used = probeCount;
         if (probeCount == 0) continue;
-        queryCompleted(probes, probeCount);
-        DeferredReleases releases;
-        (void) releaseCompletedGroups(shard, shardIndex, probes, probeCount, releases);
+        queryCompleted(workspace.values, probeCount);
+        DeferredReleases& releases = deferredReleases();
+        releases.clear();
+        (void) releaseCompletedGroups(shard, shardIndex, workspace.values, probeCount, releases);
+        releases.clear();
+        workspace.clear();
     }
 }
 
@@ -685,31 +807,38 @@ int GpuReadbackRetainer::drainWithBoundedWait(int totalTimeoutMs) {
     for (size_t shardIndex = 0; shardIndex < kShardCount; ++shardIndex) {
         if ((activeShards & uint32_t(1u << shardIndex)) == 0) continue;
 #ifdef OLR_UNIT_TEST
-        storage().probe.drainShardVisits.fetch_add(1, std::memory_order_relaxed);
+        if (storageProbeEnabledForThread)
+            storage().probe.drainShardVisits.fetch_add(1, std::memory_order_relaxed);
 #endif
         RetireShard& shard = storage().shards[shardIndex];
-        std::array<FenceProbe, kFenceGroupsPerShard> probes;
-        const size_t probeCount = collectFenceGroups(shard, shardIndex, probes);
+        FenceProbeWorkspace& workspace = fenceProbeWorkspace();
+        workspace.clear();
+        const size_t probeCount = collectFenceGroups(shard, shardIndex, workspace.values);
+        workspace.used = probeCount;
         if (probeCount == 0) continue;
-        queryCompleted(probes, probeCount);
+        queryCompleted(workspace.values, probeCount);
         for (size_t i = 0; i < probeCount; ++i) {
-            if (probes[i].completedValue >= probes[i].maximumValue) continue;
+            if (workspace.values[i].completedValue >= workspace.values[i].maximumValue) continue;
             const int remainingMs = qMax(0, totalTimeoutMs - int(elapsed.elapsed()));
             if (remainingMs <= 0) continue;
             bool completedMaximum = false;
             try {
-                completedMaximum = probes[i].fence->wait(probes[i].maximumValue, remainingMs);
+                completedMaximum =
+                    workspace.values[i].fence->wait(workspace.values[i].maximumValue, remainingMs);
             } catch (...) {
             }
             if (completedMaximum)
-                probes[i].completedValue = probes[i].maximumValue;
+                workspace.values[i].completedValue = workspace.values[i].maximumValue;
             else
-                probes[i].completedValue = pollCompleted(probes[i].fence);
+                workspace.values[i].completedValue = pollCompleted(workspace.values[i].fence);
         }
 
-        DeferredReleases releases;
+        DeferredReleases& releases = deferredReleases();
+        releases.clear();
         const ReleaseCompletedResult result =
-            releaseCompletedGroups(shard, shardIndex, probes, probeCount, releases);
+            releaseCompletedGroups(shard, shardIndex, workspace.values, probeCount, releases);
+        releases.clear();
+        workspace.clear();
         timedOut += result.timedOut;
         released += result.released;
     }
@@ -719,17 +848,24 @@ int GpuReadbackRetainer::drainWithBoundedWait(int totalTimeoutMs) {
 
 GpuRetireMetricsSnapshot GpuReadbackRetainer::diagnosticsSnapshot() noexcept {
     GpuRetireMetricsSnapshot snapshot;
-    for (RetireShard& shard : storage().shards) {
-        QMutexLocker locker(&shard.mutex);
+    auto& shards = storage().shards;
+    for (RetireShard& shard : shards) {
+        shard.mutex.lock();
         noteShardLock();
+    }
+    for (const RetireShard& shard : shards) {
         snapshot.pendingOwners += shard.pendingOwners;
         snapshot.quarantineOwners += shard.quarantineOwners;
     }
-    snapshot.highWaterMark = std::max(
-        snapshot.pendingOwners, storage().metrics.highWaterMark.load(std::memory_order_relaxed));
+    snapshot.highWaterMark = storage().metrics.highWaterMark.load(std::memory_order_relaxed);
     snapshot.timeoutCount = storage().metrics.timeoutCount.load(std::memory_order_relaxed);
     snapshot.signalFailureCount =
         storage().metrics.signalFailureCount.load(std::memory_order_relaxed);
+    for (size_t i = shards.size(); i > 0; --i)
+        shards[i - 1].mutex.unlock();
+#ifdef OLR_UNIT_TEST
+    invokeDiagnosticsHookForTest();
+#endif
     return snapshot;
 }
 
@@ -786,6 +922,15 @@ GpuRetireStorageSnapshot GpuReadbackRetainer::storageSnapshotForTest() noexcept 
 
 size_t GpuReadbackRetainer::poolCapacityPerShardForTest() noexcept {
     return kNodesPerShard;
+}
+
+void GpuReadbackRetainer::setStorageProbeEnabledForTest(bool enabled) noexcept {
+    storageProbeEnabledForThread = enabled;
+}
+
+void GpuReadbackRetainer::setDiagnosticsHookForTest(GpuRetireDiagnosticsHook hook,
+                                                    void* context) noexcept {
+    diagnosticsHookState() = DiagnosticsHookState{hook, context};
 }
 
 namespace gpuRetireDetail {

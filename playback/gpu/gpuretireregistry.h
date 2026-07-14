@@ -55,6 +55,8 @@ public:
     static void resetStorageProbeForTest() noexcept;
     static GpuRetireStorageSnapshot storageSnapshotForTest() noexcept;
     static size_t poolCapacityPerShardForTest() noexcept;
+    static void setStorageProbeEnabledForTest(bool enabled) noexcept;
+    static void setDiagnosticsHookForTest(GpuRetireDiagnosticsHook hook, void* context) noexcept;
 #endif
 
 private:
@@ -94,6 +96,9 @@ private:
 
     private:
         friend class GpuRetireRegistry;
+#ifdef OLR_UNIT_TEST
+        friend struct GpuRetireRegistryTestAuthority;
+#endif
         PreparedBatch(const GpuRetireRegistry* registry, GpuRetirePreparedHandle handle) noexcept
             : m_registry(registry), m_handle(handle) {}
         void reset() noexcept;

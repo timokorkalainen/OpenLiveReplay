@@ -32,6 +32,8 @@ struct GpuRetireMetricsSnapshot {
 };
 
 #ifdef OLR_UNIT_TEST
+using GpuRetireDiagnosticsHook = void (*)(void*) noexcept;
+
 struct GpuRetireStorageSnapshot {
     uint64_t shardLockAcquisitions = 0;
     uint64_t drainShardVisits = 0;
@@ -77,6 +79,8 @@ private:
     static void resetStorageProbeForTest() noexcept;
     static GpuRetireStorageSnapshot storageSnapshotForTest() noexcept;
     static size_t poolCapacityPerShardForTest() noexcept;
+    static void setStorageProbeEnabledForTest(bool enabled) noexcept;
+    static void setDiagnosticsHookForTest(GpuRetireDiagnosticsHook hook, void* context) noexcept;
 #endif
 };
 

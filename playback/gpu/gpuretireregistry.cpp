@@ -11,6 +11,9 @@
 namespace {
 
 thread_local uint8_t currentAllocationPhase = 0;
+#ifdef OLR_UNIT_TEST
+thread_local bool allocationProbeEnabledForThread = true;
+#endif
 
 #ifdef OLR_UNIT_TEST
 struct AllocationProbeMetrics {
@@ -56,6 +59,7 @@ RetirementMemoryResource& retirementMemoryResource() {
 }
 
 bool exerciseInjectedHeapEvent(uint8_t phase) noexcept {
+    if (!allocationProbeEnabledForThread) return true;
     auto& metrics = allocationProbeMetrics();
     uint8_t expectedPhase = phase;
     const bool injected = metrics.injectPhase.compare_exchange_strong(
@@ -266,5 +270,15 @@ GpuRetireStorageSnapshot GpuRetireRegistry::storageSnapshotForTest() noexcept {
 
 size_t GpuRetireRegistry::poolCapacityPerShardForTest() noexcept {
     return GpuReadbackRetainer::poolCapacityPerShardForTest();
+}
+
+void GpuRetireRegistry::setStorageProbeEnabledForTest(bool enabled) noexcept {
+    allocationProbeEnabledForThread = enabled;
+    GpuReadbackRetainer::setStorageProbeEnabledForTest(enabled);
+}
+
+void GpuRetireRegistry::setDiagnosticsHookForTest(GpuRetireDiagnosticsHook hook,
+                                                  void* context) noexcept {
+    GpuReadbackRetainer::setDiagnosticsHookForTest(hook, context);
 }
 #endif
