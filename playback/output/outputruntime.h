@@ -35,6 +35,8 @@ public:
     void startRuntime();
     void stopRuntime();
     void resetFrameIndex(qint64 nextOutputFrameIndex = 0);
+    // Invalidates captured snapshots immediately and is non-waiting with respect to an active
+    // dispatch; the epoch clear is then applied before that dispatch releases its lease.
     void resetPlayEpoch();
     void incrementFenceWaitStalls();
     void setGpuRhiContext(std::shared_ptr<GpuRhiContext> gpuRhi);
@@ -52,6 +54,7 @@ public:
 #ifdef OLR_UNIT_TEST
     std::shared_ptr<GpuRhiContext> gpuRhiContextForTest() const;
     int playEpochResetCountForTest() const;
+    bool waitForImmediateDispatchRequestsForTest(int requests, int timeoutMs) const;
 #endif
     // Tier3 atomic cut: the next output frame index the dispatcher will emit,
     // read under m_mutex after any active dispatch tick has finished. SAFE to call

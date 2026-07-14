@@ -122,15 +122,15 @@ void OutputRuntime::resetPlayEpoch() {
     // active dispatch already passed its re-check; the next snapshot sees the new
     // generation, and the deferred epoch clear applies before that next tick).
     ++m_configGeneration;
-#ifdef OLR_UNIT_TEST
-    ++m_playEpochResetCountForTest;
-#endif
     if (m_dispatchActive) {
         m_pendingPlayEpochReset = true;
         return;
     }
     m_dispatcher.resetPlayEpoch();
     refreshCachedStatsLocked();
+#ifdef OLR_UNIT_TEST
+    ++m_playEpochResetCountForTest;
+#endif
 }
 
 void OutputRuntime::incrementFenceWaitStalls() {
@@ -300,6 +300,18 @@ std::shared_ptr<GpuRhiContext> OutputRuntime::gpuRhiContextForTest() const {
 int OutputRuntime::playEpochResetCountForTest() const {
     QMutexLocker locker(&m_mutex);
     return m_playEpochResetCountForTest;
+}
+
+bool OutputRuntime::waitForImmediateDispatchRequestsForTest(int requests, int timeoutMs) const {
+    QElapsedTimer timer;
+    timer.start();
+    QMutexLocker locker(&m_mutex);
+    while (m_immediateDispatchRequests < requests) {
+        const qint64 remainingMs = qint64(timeoutMs) - timer.elapsed();
+        if (remainingMs <= 0) return false;
+        if (!m_dispatchIdle.wait(&m_mutex, static_cast<unsigned long>(remainingMs))) return false;
+    }
+    return true;
 }
 #endif
 
@@ -472,6 +484,9 @@ void OutputRuntime::applyPendingDispatchMutationsLocked() {
     if (m_pendingPlayEpochReset) {
         m_dispatcher.resetPlayEpoch();
         m_pendingPlayEpochReset = false;
+#ifdef OLR_UNIT_TEST
+        ++m_playEpochResetCountForTest;
+#endif
     }
     if (m_hasPendingIdentitySkip) {
         m_dispatcher.setIdentitySkip(m_pendingIdentitySkip);
