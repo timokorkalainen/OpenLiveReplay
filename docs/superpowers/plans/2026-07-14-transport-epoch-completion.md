@@ -374,3 +374,24 @@ git -c credential.helper= -c credential.helper='!gh auth git-credential' push -u
 ```
 
 Expected: pre-push succeeds. Update/open the PR with model state count, mutation results, latency evidence, and test matrix, then hand it to the user without auto-merging.
+
+## Fix Wave: Task 4 follower registration barrier
+
+**Review finding:** The deferred-reset helper signaled `followerStarted` before entering
+`dispatchImmediate()`, so the sink could be released and the reset applied before the follower
+registered. The assertions could therefore pass without proving that the follower was queued
+behind the active lease.
+
+- [x] Reproduce the false positive with a deterministic temporary gate that holds the follower
+  before `dispatchImmediate()`; confirm both real-frame and hold-last cases still pass the old
+  started-thread assertion.
+- [x] Replace the started-thread signal with
+  `waitForImmediateDispatchRequestsForTest(2, 2000)`. The completed seed dispatch resets the live
+  request count to zero and the blocked active request supplies the baseline of one, so reaching
+  two proves follower registration before release.
+- [x] Keep the timeout diagnostic-only and release the sink before joining every spawned thread;
+  do not add scheduler sleeps or change production synchronization/lifetime behavior.
+- [x] Run both corrected cases, the complete runtime test 20 times, the selected transport matrix,
+  formatting/diff checks, and a fresh review of `78b4e018..HEAD`.
+- [x] Commit only the test helper and this fix-wave record with the required co-author trailer; do
+  not push.

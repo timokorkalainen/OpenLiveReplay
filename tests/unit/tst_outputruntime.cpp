@@ -233,7 +233,7 @@ private:
 struct DeferredResetScenarioResult {
     bool activeLeaseEntered = false;
     bool resetsReturnedBeforeRelease = false;
-    bool followerStartedBeforeRelease = false;
+    bool followerRegisteredBeforeRelease = false;
     bool sinkObservedResetReturnBeforeRelease = false;
     bool diagnosticTimeout = false;
     int appliedResetsBeforeRelease = -1;
@@ -303,22 +303,11 @@ static DeferredResetScenarioResult runDeferredResetScenario(bool holdLastActiveL
         result.appliedResetsBeforeRelease = runtime.playEpochResetCountForTest();
 
     snapshotStage.store(2, std::memory_order_release);
-    std::mutex followerMutex;
-    std::condition_variable followerStartedCv;
-    bool followerStarted = false;
-    std::thread followerDispatch([&]() {
-        {
-            std::lock_guard<std::mutex> lock(followerMutex);
-            followerStarted = true;
-            followerStartedCv.notify_all();
-        }
-        runtime.dispatchImmediate();
-    });
-    {
-        std::unique_lock<std::mutex> lock(followerMutex);
-        result.followerStartedBeforeRelease = followerStartedCv.wait_for(
-            lock, std::chrono::seconds(2), [&]() { return followerStarted; });
-    }
+    std::thread followerDispatch([&]() { runtime.dispatchImmediate(); });
+    // The synchronous seed request has completed and the blocked active request is the sole
+    // registered baseline. Reaching two therefore proves the follower queued behind that lease.
+    result.followerRegisteredBeforeRelease =
+        runtime.waitForImmediateDispatchRequestsForTest(2, 2000);
 
     sink.release();
     activeDispatch.join();
@@ -1021,8 +1010,9 @@ void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextLease() {
     QVERIFY2(result.activeLeaseEntered, "active real-frame lease did not reach submit barrier");
     QVERIFY2(result.resetsReturnedBeforeRelease,
              "three resets did not return while the real-frame lease remained active");
-    QVERIFY2(result.followerStartedBeforeRelease,
-             "follower dispatch did not start before the active lease was released");
+    QVERIFY2(result.followerRegisteredBeforeRelease,
+             "follower immediate request did not raise the registered count from the active "
+             "real-frame baseline of one to two before release");
     QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
              "sink did not observe reset completion before its release barrier");
     QVERIFY2(!result.diagnosticTimeout, "real-frame lease hit the diagnostic timeout");
@@ -1052,8 +1042,9 @@ void TestOutputRuntime::multiplePlayEpochResetsCoalesceBeforeNextHoldLastLease()
     QVERIFY2(result.activeLeaseEntered, "active hold-last lease did not reach submit barrier");
     QVERIFY2(result.resetsReturnedBeforeRelease,
              "three resets did not return while the hold-last lease remained active");
-    QVERIFY2(result.followerStartedBeforeRelease,
-             "follower dispatch did not start before the hold-last lease was released");
+    QVERIFY2(result.followerRegisteredBeforeRelease,
+             "follower immediate request did not raise the registered count from the active "
+             "hold-last baseline of one to two before release");
     QVERIFY2(result.sinkObservedResetReturnBeforeRelease,
              "hold-last sink did not observe reset completion before release");
     QVERIFY2(!result.diagnosticTimeout, "hold-last lease hit the diagnostic timeout");
