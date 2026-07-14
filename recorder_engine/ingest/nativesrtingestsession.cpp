@@ -4,7 +4,6 @@
 #include "nativesrtconnectdiagnostics.h"
 #include "nativesrturloptions.h"
 #include "gpudecodedframe.h"
-#include "spsframerate.h"
 #include "recorder_engine/timing/smpte12m.h"
 
 #include <QDebug>
@@ -44,6 +43,45 @@ constexpr int64_t kAudioResyncSamples = 200LL * 48;
 // re-anchor on a real gap/seek/reconnect-level jump.
 constexpr int64_t kVideoResyncMs = 200;
 constexpr int64_t kAudioRemainderPtsTolerance90k = 500 * 90;
+
+bool sameParameterSets(const H26xParameterSets& a, const H26xParameterSets& b) {
+    return a.h264Sps == b.h264Sps && a.h264Pps == b.h264Pps && a.hevcVps == b.hevcVps &&
+           a.hevcSps == b.hevcSps && a.hevcPps == b.hevcPps;
+}
+
+int64_t sessionFrameForMs(int64_t sourcePtsMs, FrameRateQ rate) {
+    if (sourcePtsMs < 0 || !rate.valid()) return -1;
+    using I128 = __int128;
+    const I128 numerator = I128(sourcePtsMs) * rate.num;
+    const I128 denominator = I128(1000) * rate.den;
+    const I128 frame = (numerator + denominator / 2) / denominator;
+    return frame <= std::numeric_limits<int64_t>::max() ? int64_t(frame) : -1;
+}
+
+int64_t frameQuantizationBoundUs(FrameRateQ rate) {
+    if (!rate.valid()) return -1;
+    return int64_t((__int128(1'000'000) * rate.den + rate.num - 1) / rate.num);
+}
+
+std::optional<TimecodeEvidence> makeSeiEvidence(const H26xSeiTimecodeResult& parsed,
+                                                uint64_t sourceGeneration,
+                                                uint64_t timingGeneration, int64_t sourcePtsMs) {
+    if (!parsed.timecode.valid || !validateTimecodeLabel(parsed.timecode, parsed.labelRate))
+        return std::nullopt;
+    TimecodeEvidence evidence;
+    evidence.frameOfDay =
+        Smpte12m::labelFrameCount(parsed.timecode, parsed.labelRate.num, parsed.labelRate.den);
+    evidence.labelRate = parsed.labelRate;
+    evidence.sourceGeneration = sourceGeneration;
+    evidence.timingGeneration = timingGeneration;
+    evidence.provenance = parsed.provenance;
+    evidence.dropFrame = parsed.timecode.dropFrame;
+    evidence.discontinuity = parsed.discontinuity;
+    evidence.arrivalSessionFrame = sessionFrameForMs(sourcePtsMs, parsed.labelRate);
+    evidence.sessionRate = parsed.labelRate;
+    evidence.quantizationBoundUs = frameQuantizationBoundUs(parsed.labelRate);
+    return evidence.valid() ? std::optional<TimecodeEvidence>(evidence) : std::nullopt;
+}
 
 std::mutex srtLibraryMutex;
 int srtLibraryRefs = 0;
@@ -269,6 +307,9 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_audioRemainderPts90k = -1;
     m_audioFifoSamplePos = -1;
     m_pendingVideoTimecode100ns = -1;
+    m_pendingTimecodeEvidence.reset();
+    m_timecodeParameterSets = {};
+    m_timecodeState.reset();
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastDecodeErrorLogMs = -1;
     m_decodeFailures = 0;
@@ -284,6 +325,8 @@ bool NativeSrtIngestSession::open(const QUrl& url, const IngestCallbacks& callba
         log(error);
         return false;
     }
+
+    if (m_sourceGeneration != std::numeric_limits<uint64_t>::max()) ++m_sourceGeneration;
 
     if (m_callbacks.setConnected) {
         m_callbacks.setConnected(true);
@@ -808,19 +851,15 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
     }
 
     for (const CompressedAccessUnit& unit : units) {
-        // Extract this AU's SMPTE 12M timecode (if any) before decode. Reset-then-set
-        // per unit so a frame with no TC SEI reports none, never a previous AU's TC.
-        updatePendingVideoTimecode(unit);
-
         const int64_t sourcePtsMs = sourcePtsMsForUnit(unit);
         if (sourcePtsMs < 0) {
             continue;
         }
 
+        updatePendingVideoTimecode(unit, sourcePtsMs);
+
         const int64_t timecode100ns = m_pendingVideoTimecode100ns;
-        const int64_t tcFrames = m_pendingVideoTcFrames;
-        const int32_t rateNum = m_pendingVideoRateNum;
-        const int32_t rateDen = m_pendingVideoRateDen;
+        const std::optional<TimecodeEvidence> timecodeEvidence = m_pendingTimecodeEvidence;
 #if defined(OLR_GPU_PIPELINE_BUILD)
         const bool preferGpuVideoFrames =
             ingestPrefersGpuVideoFrames(m_callbacks) && m_callbacks.onVideoFrame;
@@ -830,7 +869,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
             bool gpuSurfaceRejected = false;
             const bool decodedGpu = m_decoder->decodeKeepSurface(
                 unit,
-                [this, &unit, sourcePtsMs, timecode100ns, tcFrames, rateNum, rateDen,
+                [this, &unit, sourcePtsMs, timecode100ns, timecodeEvidence,
                  &gpuSurfaceRejected](void* nativeDecodedImage, qint64 /*pts90k*/) {
                     const FrameMetadata meta =
                         gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
@@ -850,9 +889,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                     DecodedVideoFrame decodedFrame;
                     decodedFrame.sourcePtsMs = sourcePtsMs;
                     decodedFrame.sourceTimecode100ns = timecode100ns;
-                    decodedFrame.sourceTcFrames = tcFrames;
-                    decodedFrame.sourceFrameRateNum = rateNum;
-                    decodedFrame.sourceFrameRateDen = rateDen;
+                    decodedFrame.timecodeEvidence = timecodeEvidence;
                     decodedFrame.gpuFrame = std::move(gpuFrame);
                     decodedFrame.gpuFenceValue = imported.fenceValue;
                     m_callbacks.onVideoFrame(std::move(decodedFrame));
@@ -874,7 +911,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
         QString error;
         const bool decoded = m_decoder->decode(
             unit,
-            [this, sourcePtsMs, timecode100ns, tcFrames, rateNum, rateDen](AVFrame* frame) {
+            [this, sourcePtsMs, timecode100ns, timecodeEvidence](AVFrame* frame) {
                 if (!frame) {
                     return;
                 }
@@ -887,9 +924,7 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                 decodedFrame.frame = frame;
                 decodedFrame.sourcePtsMs = sourcePtsMs;
                 decodedFrame.sourceTimecode100ns = timecode100ns;
-                decodedFrame.sourceTcFrames = tcFrames;
-                decodedFrame.sourceFrameRateNum = rateNum;
-                decodedFrame.sourceFrameRateDen = rateDen;
+                decodedFrame.timecodeEvidence = timecodeEvidence;
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);
@@ -1059,28 +1094,41 @@ int64_t NativeSrtIngestSession::sourcePtsMsForUnit(const CompressedAccessUnit& u
                                   clockMappedMs, kVideoResyncMs);
 }
 
-void NativeSrtIngestSession::updatePendingVideoTimecode(const CompressedAccessUnit& unit) {
+void NativeSrtIngestSession::updatePendingVideoTimecode(const CompressedAccessUnit& unit,
+                                                        int64_t sourcePtsMs) {
     // Reset first: a frame with no timecode SEI must report none (no stale TC bleed
     // from a previous access unit). Extraction is best-effort and bounds-checked —
     // a garbled/truncated SEI returns {valid=false} and leaves the reset -1, so a bad
     // timecode never disturbs recording.
     m_pendingVideoTimecode100ns = -1;
-    m_pendingVideoTcFrames = -1;
-    m_pendingVideoRateNum = 0;
-    m_pendingVideoRateDen = 0;
-    const Smpte12mTimecode tc = extractH26xSeiTimecode(unit.annexB, unit.codec);
-    if (tc.valid) {
-        m_pendingVideoTimecode100ns = Smpte12m::to100ns(tc, kTimecodeNominalFps);
-        const QByteArray sps = unit.parameterSets.h264Sps.isEmpty()
-                                   ? QByteArray()
-                                   : unit.parameterSets.h264Sps.constFirst();
-        const SpsFrameRate rate = parseSpsFrameRate(unit.codec, sps);
-        if (rate.valid()) {
-            m_pendingVideoTcFrames = Smpte12m::labelFrameCount(tc, rate.num, rate.den);
-            m_pendingVideoRateNum = rate.num;
-            m_pendingVideoRateDen = rate.den;
-        }
+    m_pendingTimecodeEvidence.reset();
+    if (!sameParameterSets(unit.parameterSets, m_timecodeParameterSets)) {
+        const FrameRateQ previousRate = m_timingContext.constantFrameRate();
+        m_timecodeParameterSets = unit.parameterSets;
+        const QList<QByteArray> vps =
+            unit.codec == NativeVideoCodec::Hevc ? unit.parameterSets.hevcVps : QList<QByteArray>{};
+        const QList<QByteArray> sps = unit.codec == NativeVideoCodec::H264
+                                          ? unit.parameterSets.h264Sps
+                                          : unit.parameterSets.hevcSps;
+        m_timingContext.updateParameterSets(unit.codec, vps, sps);
+        m_timecodeState.reset();
+        const FrameRateQ nextRate = m_timingContext.constantFrameRate();
+        if (previousRate.valid() && nextRate.valid() && !(previousRate == nextRate) &&
+            m_sourceGeneration != std::numeric_limits<uint64_t>::max())
+            ++m_sourceGeneration;
     }
+    const H26xSeiOutputOrderKey order{m_sourceGeneration, m_timingContext.generation(), 1, 0,
+                                      unit.pts90k >= 0 ? unit.pts90k : unit.dts90k};
+    const H26xSeiTimecodeResult parsed = extractH26xSeiTimecodeResult(
+        unit.annexB, unit.codec, m_timingContext, m_timecodeState, order);
+    if (!parsed.timecode.valid) return;
+    if (parsed.discontinuity && m_sourceGeneration != std::numeric_limits<uint64_t>::max()) {
+        ++m_sourceGeneration;
+        m_timecodeState.reset();
+    }
+    m_pendingVideoTimecode100ns = Smpte12m::to100ns(parsed.timecode, kTimecodeNominalFps);
+    m_pendingTimecodeEvidence =
+        makeSeiEvidence(parsed, m_sourceGeneration, m_timingContext.generation(), sourcePtsMs);
 }
 
 int64_t NativeSrtIngestSession::sourcePtsMsFromAnchor(qint64 pts90k, int64_t anchorTs90k,
@@ -1146,6 +1194,8 @@ int64_t NativeSrtIngestSession::unwrapAudio90k(int64_t raw90k) {
 }
 
 void NativeSrtIngestSession::resetTimingStateForDiscontinuity() {
+    if (m_sourceGeneration != std::numeric_limits<uint64_t>::max()) ++m_sourceGeneration;
+    m_timecodeState.reset();
     m_clock->reset();
     m_prevDts90k = -1;
     m_prevAudioPts90k = -1;

@@ -6,8 +6,11 @@
 #include <QString>
 #include <QMetaType>
 
+#include "recorder_engine/timing/timecodeevidence.h"
+
 #include <cstdint>
 #include <functional>
+#include <optional>
 
 #if defined(OLR_GPU_PIPELINE_BUILD)
 #include "playback/output/framehandle.h"
@@ -43,9 +46,7 @@ struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
     int64_t sourcePtsMs = 0;
     int64_t sourceTimecode100ns = -1;
-    int64_t sourceTcFrames = -1;
-    int32_t sourceFrameRateNum = 0;
-    int32_t sourceFrameRateDen = 0;
+    std::optional<TimecodeEvidence> timecodeEvidence;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     FrameHandle gpuFrame;
     uint64_t gpuFenceValue = 0;

@@ -75,6 +75,9 @@ private slots:
     void supportsNdiUrls();
     void unavailableRuntimeFailsOpen();
     void fakeBackendDeliversVideoAndAudio();
+    void nearMidnightTimecodeWrapsToNextDay();
+    void invalidSenderRateProducesNoEvidence();
+    void successfulReopenAdvancesSourceGeneration();
     void localRecvCreateStructMatchesSdkShape();
     void macRuntimeCandidatesIncludeOfficialSdkPath();
     void exactSourceMatchWinsBeforeSubstringFallback();
@@ -181,6 +184,116 @@ void TestNdiIngest::fakeBackendDeliversVideoAndAudio() {
     QCOMPARE(statsReports.last().clockOffsetNs, int64_t(4000) * 1000000LL);
     QCOMPARE(backend.freedVideo, 1);
     QCOMPARE(backend.freedAudio, 1);
+}
+
+namespace {
+
+QByteArray ndiTestPixels() {
+    QByteArray pixels;
+    pixels.append(QByteArray(16, char(50)));
+    pixels.append(QByteArray(4, char(60)));
+    pixels.append(QByteArray(4, char(70)));
+    return pixels;
+}
+
+FakeNdiReceiverBackend::Item ndiVideoItem(const QByteArray& pixels, int64_t timecode100ns,
+                                          int32_t rateNum, int32_t rateDen) {
+    FakeNdiReceiverBackend::Item item;
+    item.type = INdiReceiverBackend::Capture::Video;
+    item.video.width = 4;
+    item.video.height = 4;
+    item.video.strideBytes = 4;
+    item.video.fourCc = kNdiFourCcI420;
+    item.video.data = reinterpret_cast<const uint8_t*>(pixels.constData());
+    item.video.timestamp100ns = 1000 * 10000LL;
+    item.video.timecode100ns = timecode100ns;
+    item.video.frameRateNum = rateNum;
+    item.video.frameRateDen = rateDen;
+    return item;
+}
+
+} // namespace
+
+void TestNdiIngest::nearMidnightTimecodeWrapsToNextDay() {
+    constexpr int64_t kTicksPerDay = 24LL * 60 * 60 * 10'000'000;
+    const QByteArray pixels = ndiTestPixels();
+    FakeNdiReceiverBackend backend;
+    backend.items.append(ndiVideoItem(pixels, kTicksPerDay - 1, 60000, 1001));
+
+    std::atomic<bool> running{true};
+    NativeNdiIngestSession session(0, 4, 4, &running, &backend);
+    std::optional<TimecodeEvidence> evidence;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = []() { return int64_t(5000); };
+    callbacks.onVideoFrame = [&evidence, &running](DecodedVideoFrame decoded) {
+        evidence = decoded.timecodeEvidence;
+        av_frame_free(&decoded.frame);
+        running.store(false, std::memory_order_relaxed);
+    };
+
+    QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+    session.run();
+
+    QVERIFY(evidence.has_value());
+    QCOMPARE(evidence->frameOfDay, int64_t(0));
+    QCOMPARE(evidence->labelRate, (FrameRateQ{60000, 1001}));
+    QCOMPARE(evidence->sourceGeneration, uint64_t(1));
+    QCOMPARE(evidence->timingGeneration, uint64_t(1));
+    QCOMPARE(evidence->provenance, TimecodeProvenance::Ndi);
+    QVERIFY(evidence->valid());
+}
+
+void TestNdiIngest::invalidSenderRateProducesNoEvidence() {
+    const QByteArray pixels = ndiTestPixels();
+    FakeNdiReceiverBackend backend;
+    backend.items.append(ndiVideoItem(pixels, 1234567, std::numeric_limits<int32_t>::max(), 1));
+
+    std::atomic<bool> running{true};
+    NativeNdiIngestSession session(0, 4, 4, &running, &backend);
+    bool hadEvidence = true;
+    int64_t sourceTimecode100ns = -1;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = []() { return int64_t(5000); };
+    callbacks.onVideoFrame = [&hadEvidence, &sourceTimecode100ns,
+                              &running](DecodedVideoFrame decoded) {
+        hadEvidence = decoded.timecodeEvidence.has_value();
+        sourceTimecode100ns = decoded.sourceTimecode100ns;
+        av_frame_free(&decoded.frame);
+        running.store(false, std::memory_order_relaxed);
+    };
+
+    QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+    session.run();
+
+    QVERIFY(!hadEvidence);
+    QCOMPARE(sourceTimecode100ns, int64_t(1234567));
+}
+
+void TestNdiIngest::successfulReopenAdvancesSourceGeneration() {
+    const QByteArray pixels = ndiTestPixels();
+    FakeNdiReceiverBackend backend;
+    std::atomic<bool> running{true};
+    NativeNdiIngestSession session(0, 4, 4, &running, &backend);
+    QList<uint64_t> generations;
+    IngestCallbacks callbacks;
+    callbacks.recordingClockMs = []() { return int64_t(5000); };
+    callbacks.onVideoFrame = [&generations, &running](DecodedVideoFrame decoded) {
+        QVERIFY(decoded.timecodeEvidence.has_value());
+        generations.append(decoded.timecodeEvidence->sourceGeneration);
+        av_frame_free(&decoded.frame);
+        running.store(false, std::memory_order_relaxed);
+    };
+
+    backend.items.append(ndiVideoItem(pixels, 0, 25, 1));
+    QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+    session.run();
+
+    running.store(true, std::memory_order_relaxed);
+    backend.items.append(ndiVideoItem(pixels, 0, 25, 1));
+    QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+    session.run();
+
+    QCOMPARE(generations, (QList<uint64_t>{1, 2}));
 }
 
 void TestNdiIngest::localRecvCreateStructMatchesSdkShape() {

@@ -23,6 +23,7 @@ struct NativeSrtSockaddr;
 class NativeSrtIngestSession final : public IngestSession {
 #if defined(QT_TESTLIB_LIB)
     friend class TestIngestBackendSelector;
+    friend class TestIngestTimecodeEvidence;
     friend class TestSrtIngestTeardown;
 #endif
 public:
@@ -126,14 +127,12 @@ private:
     // output samples). -1 until the first audio frame anchors it to the clock; see
     // advanceAudioFifoSample().
     int64_t m_audioFifoSamplePos = -1;
-    // SMPTE 12M timecode (100 ns since midnight) extracted from the current access
-    // unit's SEI, stamped onto the emitted DecodedVideoFrame. -1 = the current AU
-    // carries no timecode SEI (the common case). Reset to -1 per access unit so a
-    // frame without a TC SEI never inherits a previous frame's timecode.
+    uint64_t m_sourceGeneration = 0;
+    H26xTimingContext m_timingContext;
+    H26xSeiTimecodeState m_timecodeState;
+    H26xParameterSets m_timecodeParameterSets;
     int64_t m_pendingVideoTimecode100ns = -1;
-    int64_t m_pendingVideoTcFrames = -1;
-    int32_t m_pendingVideoRateNum = 0;
-    int32_t m_pendingVideoRateDen = 0;
+    std::optional<TimecodeEvidence> m_pendingTimecodeEvidence;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastDecodeErrorLogMs = -1;
     quint64 m_decodeFailures = 0;
@@ -160,7 +159,7 @@ private:
     // Reset m_pendingVideoTimecode100ns to -1, then (if the access unit carries a
     // SMPTE 12M timecode SEI) set it to that TC as 100 ns since midnight. Called once
     // per access unit so timecode never bleeds across frames.
-    void updatePendingVideoTimecode(const CompressedAccessUnit& unit);
+    void updatePendingVideoTimecode(const CompressedAccessUnit& unit, int64_t sourcePtsMs = 0);
 };
 
 #endif // NATIVESRTINGESTSESSION_H

@@ -26,6 +26,44 @@ constexpr int kNdiRecvColorFastest = 100;
 
 using namespace olr::ndi;
 
+int64_t sessionFrameForMs(int64_t sourcePtsMs, FrameRateQ rate) {
+    if (sourcePtsMs < 0 || !rate.valid()) return -1;
+    using I128 = __int128;
+    const I128 numerator = I128(sourcePtsMs) * rate.num;
+    const I128 denominator = I128(1000) * rate.den;
+    const I128 frame = (numerator + denominator / 2) / denominator;
+    return frame <= std::numeric_limits<int64_t>::max() ? int64_t(frame) : -1;
+}
+
+std::optional<TimecodeEvidence> ndiTimecodeEvidence(const NdiVideoFrame& video, int64_t sourcePtsMs,
+                                                    uint64_t sourceGeneration) {
+    constexpr int64_t kTicksPerDay = 24LL * 60 * 60 * 10'000'000;
+    if (video.timecode100ns == kTimecodeSynthesize || video.timecode100ns < 0 ||
+        video.timecode100ns >= kTicksPerDay || video.frameRateNum <= 0 || video.frameRateDen <= 0)
+        return std::nullopt;
+    const std::optional<FrameRateQ> rate =
+        canonicalFrameRate(double(video.frameRateNum) / double(video.frameRateDen));
+    if (!rate.has_value()) return std::nullopt;
+    int64_t frameOfDay =
+        Smpte12m::labelFrameCountFrom100ns(video.timecode100ns, rate->num, rate->den);
+    const int nominalRate = Smpte12m::labelRate(rate->num, rate->den);
+    const int64_t framesPerDay = int64_t(nominalRate) * 24 * 60 * 60;
+    if (frameOfDay < 0 || framesPerDay <= 0) return std::nullopt;
+    frameOfDay %= framesPerDay;
+
+    TimecodeEvidence evidence;
+    evidence.frameOfDay = frameOfDay;
+    evidence.labelRate = *rate;
+    evidence.sourceGeneration = sourceGeneration;
+    evidence.timingGeneration = sourceGeneration;
+    evidence.provenance = TimecodeProvenance::Ndi;
+    evidence.arrivalSessionFrame = sessionFrameForMs(sourcePtsMs, *rate);
+    evidence.sessionRate = *rate;
+    evidence.quantizationBoundUs =
+        int64_t((__int128(1'000'000) * rate->den + rate->num - 1) / rate->num);
+    return evidence.valid() ? std::optional<TimecodeEvidence>(evidence) : std::nullopt;
+}
+
 QStringList ndiRuntimeLibraryCandidates() {
     return runtimeLibraryCandidates();
 }
@@ -350,6 +388,7 @@ bool NativeNdiIngestSession::open(const QUrl& url, const IngestCallbacks& callba
     m_stopRequested.store(false, std::memory_order_relaxed);
     m_lastFailureKind = IngestFailureKind::None;
     m_lastStatsAtMs = -1;
+    m_activeTimecodeRate = {};
     if (!m_externalClock) {
         m_clock->reset();
     }
@@ -362,6 +401,7 @@ bool NativeNdiIngestSession::open(const QUrl& url, const IngestCallbacks& callba
         m_lastFailureKind = IngestFailureKind::TransientNetwork;
         return false;
     }
+    if (m_sourceGeneration != std::numeric_limits<uint64_t>::max()) ++m_sourceGeneration;
     // Baseline the stall clock at connect: run() breaks if no frame arrives
     // within m_stallTimeoutMs of this (or of the last received frame).
     m_lastFrameAtMs = m_monotonic.elapsed();
@@ -392,20 +432,18 @@ void NativeNdiIngestSession::run() {
                 decoded.sourcePtsMs = sourcePtsMs;
                 decoded.sourceTimecode100ns =
                     video.timecode100ns == kTimecodeSynthesize ? -1 : video.timecode100ns;
-                // NDI delivers a REAL-TIME 100 ns timecode (no SMPTE drop-frame
-                // labels), so anchor it at the INTEGER label rate and report THAT same
-                // rate to the aligner: usFor() then divides the count by the exact rate
-                // it was formed with and recovers wall time. Pairing the naive integer
-                // count with the true fractional rate (e.g. 60000/1001) would leave a
-                // rate-proportional skew that grows with anchor separation — the error
-                // class this change removes.
-                const int ndiLabelRate =
-                    Smpte12m::labelRate(video.frameRateNum, video.frameRateDen);
-                decoded.sourceTcFrames = Smpte12m::labelFrameCountFrom100ns(
-                    decoded.sourceTimecode100ns, video.frameRateNum, video.frameRateDen);
-                if (decoded.sourceTcFrames >= 0) {
-                    decoded.sourceFrameRateNum = ndiLabelRate;
-                    decoded.sourceFrameRateDen = 1;
+                // NDI timecode is real-time 100 ns since midnight. Keep the sender's
+                // canonical exact rate in the evidence and wrap rounding at one day.
+                decoded.timecodeEvidence =
+                    ndiTimecodeEvidence(video, sourcePtsMs, m_sourceGeneration);
+                if (decoded.timecodeEvidence.has_value()) {
+                    if (m_activeTimecodeRate.valid() &&
+                        !(m_activeTimecodeRate == decoded.timecodeEvidence->labelRate) &&
+                        m_sourceGeneration != std::numeric_limits<uint64_t>::max())
+                        ++m_sourceGeneration;
+                    m_activeTimecodeRate = decoded.timecodeEvidence->labelRate;
+                    decoded.timecodeEvidence->sourceGeneration = m_sourceGeneration;
+                    decoded.timecodeEvidence->timingGeneration = m_sourceGeneration;
                 }
                 m_callbacks.onVideoFrame(decoded);
             } else if (frame) {

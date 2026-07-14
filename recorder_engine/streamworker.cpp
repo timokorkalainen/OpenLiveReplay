@@ -773,9 +773,11 @@ void StreamWorker::captureLoop() {
             qf.frame = decoded.frame;
             qf.sourcePts = decoded.sourcePtsMs;
             qf.sourceTimecode100ns = decoded.sourceTimecode100ns;
-            qf.sourceTcFrames = decoded.sourceTcFrames;
-            qf.sourceFrameRateNum = decoded.sourceFrameRateNum;
-            qf.sourceFrameRateDen = decoded.sourceFrameRateDen;
+            if (decoded.timecodeEvidence.has_value()) {
+                qf.sourceTcFrames = decoded.timecodeEvidence->frameOfDay;
+                qf.sourceFrameRateNum = decoded.timecodeEvidence->labelRate.num;
+                qf.sourceFrameRateDen = decoded.timecodeEvidence->labelRate.den;
+            }
 #if defined(OLR_GPU_PIPELINE_BUILD)
             qf.gpuFrame = decoded.gpuFrame;
             qf.gpuFenceValue = decoded.gpuFenceValue;
