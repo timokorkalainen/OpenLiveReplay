@@ -52,8 +52,14 @@ public:
     // Test support: snapshot of live endpoint sink chains.
     QList<OutputEndpoint> outputEndpointsForTest() const;
 #ifdef OLR_UNIT_TEST
+    struct PlayEpochStateForTest {
+        quint64 configGeneration = 0;
+        bool pendingReset = false;
+        int appliedResetCount = 0;
+    };
     std::shared_ptr<GpuRhiContext> gpuRhiContextForTest() const;
     int playEpochResetCountForTest() const;
+    PlayEpochStateForTest playEpochStateForTest() const;
     bool waitForImmediateDispatchRequestsForTest(int requests, int timeoutMs) const;
 #endif
     // Tier3 atomic cut: the next output frame index the dispatcher will emit,

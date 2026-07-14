@@ -302,6 +302,12 @@ int OutputRuntime::playEpochResetCountForTest() const {
     return m_playEpochResetCountForTest;
 }
 
+OutputRuntime::PlayEpochStateForTest OutputRuntime::playEpochStateForTest() const {
+    QMutexLocker locker(&m_mutex);
+    return PlayEpochStateForTest{m_configGeneration, m_pendingPlayEpochReset,
+                                 m_playEpochResetCountForTest};
+}
+
 bool OutputRuntime::waitForImmediateDispatchRequestsForTest(int requests, int timeoutMs) const {
     QElapsedTimer timer;
     timer.start();

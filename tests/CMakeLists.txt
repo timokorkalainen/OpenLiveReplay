@@ -673,9 +673,19 @@ if(OLR_GPU_PIPELINE)
     target_link_libraries(transport_epoch_f2_mutant PRIVATE olr_test_gpu)
 endif()
 
+qt_add_executable(transport_epoch_commit_latency_mutant
+    "${CMAKE_SOURCE_DIR}/tests/perf/tst_transportcommit_perf.cpp"
+    $<TARGET_OBJECTS:olr_transport_epoch_f2_mutant>)
+target_link_libraries(transport_epoch_commit_latency_mutant PRIVATE
+    Qt6::Test olr_test_playback olr_warnings olr_sanitize)
+if(OLR_GPU_PIPELINE)
+    target_link_libraries(transport_epoch_commit_latency_mutant PRIVATE olr_test_gpu)
+endif()
+
 if(WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     foreach(epoch_test transport_epoch_f1_baseline transport_epoch_f1_mutant
             transport_epoch_f2_baseline transport_epoch_f2_mutant
+            transport_epoch_commit_latency_mutant
             transport_epoch_production_f1_baseline
             transport_epoch_production_f1_mutant
             transport_epoch_production_f2_baseline
@@ -740,6 +750,19 @@ olr_add_ctest(NAME transport_epoch_mutation_f2
         -P "${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_mutations.cmake")
 set_tests_properties(transport_epoch_mutation_f2 PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+olr_add_ctest(NAME transport_epoch_commit_latency_mutation
+    COMMAND "${CMAKE_COMMAND}"
+        -DMUTANT_NAME=F2_commit_latency_reset
+        -DBASELINE_EXECUTABLE=$<TARGET_FILE:tst_transportcommit_perf>
+        "-DBASELINE_TEST_FUNCTION=blockedSinkDoesNotExtendCommitLatency:cpu-runtime"
+        -DMUTANT_EXECUTABLE=$<TARGET_FILE:transport_epoch_commit_latency_mutant>
+        "-DTEST_FUNCTION=blockedSinkDoesNotExtendCommitLatency:cpu-runtime"
+        "-DEXPECTED_TEST_NAME=TestPlaybackWorker::blockedSinkDoesNotExtendCommitLatency(cpu-runtime)"
+        -DEXPECTED_FAILURE_TOKEN=blockedEpochState.configGeneration
+        -P "${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_mutations.cmake")
+set_tests_properties(transport_epoch_commit_latency_mutation PROPERTIES
+    LABELS "formal;perf;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 olr_add_ctest(NAME transport_epoch_mutation_meta_f1_broken_baseline
     COMMAND "${CMAKE_COMMAND}"

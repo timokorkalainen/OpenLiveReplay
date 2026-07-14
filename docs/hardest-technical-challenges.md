@@ -9,7 +9,7 @@ faith.
 
 | # | Challenge | Deliverable | Status |
 |---|-----------|-------------|--------|
-| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 9 mutations refute** |
+| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 9 model mutations refute; compiled reset-removal control is killed** |
 | 2 | Rate-agnostic timecode alignment with a proven phase-error bound | Falsifier + exact-rational bound sweep + drop-in C++ module | **Ran: shipped code RED (−5000 ms on aligned cameras); replacement 0 violations / 3,969 cells, zero slack** |
 | 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + real-TDR fault-lane design | **Designed: full headers, 6-site migration, harness + mutations** |
 
@@ -111,14 +111,30 @@ fail independently when their load-bearing statements are removed or bypassed.
 ### Latency evidence and commands
 
 [`tst_transportcommit_perf.cpp`](../tests/perf/tst_transportcommit_perf.cpp)
-holds a real PGM sink submission behind a deterministic barrier, commits a
-covered cache generation on another thread, and requires the central commit
-plus epoch reset to return in less than 20 ms while the original submission is
-still blocked. It then queues operator PGM completion, proves both worker/cache
-locks remain available while that completion waits outside them, releases the
-sink, and verifies the committed PGM identity is submitted. The threshold gates
-commit latency only; the separately reported operator completion includes
-sink/lease waiting by design.
+installs a synthetic blocking `IOutputSink` as a PGM/NDI endpoint on the real
+`OutputRuntime` lease path. While that synthetic submission is held at a
+deterministic barrier, another thread performs eleven covered-cache commits.
+The sorted sample at index 9 (the 90th percentile for eleven samples) must stay
+below 20 ms, allowing one scheduler outlier, while every sample remains below a
+100 ms diagnostic ceiling. A separate 500 ms completion barrier still fails a
+real sink-wait regression before the sink is released; a systematic latency
+regression also fails the percentile gate.
+
+Before lease release the test requires every reset to have incremented the
+runtime configuration generation, requires one pending epoch reset, and
+requires no reset application yet. After release it requires that pending state
+to clear and exactly one coalesced reset to be applied. A compiled F2 removal
+control must fail these assertions when `resetOutputPlayEpoch()` is omitted. The
+test then queues operator PGM completion, proves both worker/cache locks remain
+available while that completion waits outside them, releases the synthetic
+sink, and verifies the required PGM identity delivered through the runtime.
+Operator completion includes sink/lease waiting by design and is reported
+separately from commit latency.
+
+GPU-enabled builds execute both authoritative runtime-gate states and assert
+`gpuPipelineEnabled()` is false in the CPU row and true in the GPU row. A build
+compiled with `OLR_GPU_PIPELINE=OFF` registers only the supported CPU row rather
+than claiming GPU-mode coverage it cannot provide.
 
 The local Windows Qt/MinGW 13.1 kit used for this latency gate does not ship
 the GCC sanitizer runtime archives: `g++ -print-file-name=libasan.a`,
