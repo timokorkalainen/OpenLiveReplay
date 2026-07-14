@@ -48,10 +48,15 @@ function(olr_add_compile_control name source expectation)
         "-DCONFIG=$<CONFIG>")
     if(expectation STREQUAL "PASS")
         list(APPEND control_args "-DEXPECT_COMPILE=TRUE")
-    elseif(expectation STREQUAL "PROTECTED_FAILURE")
+    elseif(expectation STREQUAL "BASE_PROTECTED_FAILURE")
         list(APPEND control_args
             "-DEXPECT_COMPILE=FALSE"
-            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_MEMBER=GpuSurface::nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "DERIVED_PROTECTED_FAILURE")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=DerivedSurface::nativeHandle"
             "-DEXPECTED_ACCESS=[Pp]rotected")
     elseif(expectation STREQUAL "REJECT_UNRELATED_FAILURE")
         list(APPEND control_args
@@ -123,9 +128,16 @@ function(olr_add_gpu_submission_compile_control name source expectation)
 endfunction()
 
 olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp
-    "nativeHandle" "[Pp]rotected")
-olr_add_compile_control(gpu_native_handle_access native_handle_access.cpp PROTECTED_FAILURE)
+    "GpuSurface::nativeHandle" "[Pp]rotected")
+olr_add_compile_control(gpu_native_handle_access
+    native_handle_access.cpp BASE_PROTECTED_FAILURE)
 olr_add_compile_control(gpu_native_handle_access_pass native_handle_access_pass.cpp PASS)
+olr_expect_compile_failure(gpu_native_handle_derived_access
+    native_handle_derived_access.cpp "DerivedSurface::nativeHandle" "[Pp]rotected")
+olr_add_compile_control(gpu_native_handle_derived_access
+    native_handle_derived_access.cpp DERIVED_PROTECTED_FAILURE)
+olr_add_compile_control(gpu_native_handle_derived_access_pass
+    native_handle_derived_access_pass.cpp PASS)
 olr_add_compile_control(gpu_native_handle_access_unrelated_error_rejected
     unrelated_compile_error.cpp REJECT_UNRELATED_FAILURE)
 olr_add_gpu_submission_compile_control(gpu_op_track_access gpu_op_track_access.cpp NO_TRACK)
@@ -172,6 +184,8 @@ set_tests_properties(
     gpu_native_handle_access_unrelated_error_rejected
     PROPERTIES
     DEPENDS gpu_native_handle_access)
+set_tests_properties(gpu_native_handle_derived_access_pass PROPERTIES
+    DEPENDS gpu_native_handle_derived_access)
 
 function(olr_add_gpu_compile_control_alias name target expected_member expected_access)
     add_test(NAME ${name}
@@ -199,8 +213,11 @@ endfunction()
 
 # Task 7's matrix names make the locked regex execute every exact capability
 # control. Historical names above stay available to earlier task reports.
-olr_add_gpu_compile_control_alias(gpu_negcompile_native_handle_base_derived
-    gpu_native_handle_access_compile_control nativeHandle "[Pp]rotected")
+olr_add_gpu_compile_control_alias(gpu_negcompile_native_handle_base
+    gpu_native_handle_access_compile_control "GpuSurface::nativeHandle" "[Pp]rotected")
+olr_add_gpu_compile_control_alias(gpu_negcompile_native_handle_derived
+    gpu_native_handle_derived_access_compile_control
+    "DerivedSurface::nativeHandle" "[Pp]rotected")
 olr_add_gpu_compile_control_alias(gpu_negcompile_submission_view_unwrap
     gpu_submission_view_unwrap_compile_control nativeHandle "[Pp]rotected")
 olr_add_gpu_compile_control_alias(gpu_negcompile_submit_without_owner
@@ -215,12 +232,16 @@ olr_add_gpu_compile_control_alias(gpu_negcompile_token_direct_abandon
     "(cannot.convert|no.matching|candidate)")
 olr_add_gpu_compile_control_alias(gpu_negcompile_op_track_access
     gpu_op_track_access_compile_control track "(private|no.member|has.no.member)")
-olr_add_gpu_compile_pass_alias(gpu_compile_pass_native_handle
+olr_add_gpu_compile_pass_alias(gpu_compile_pass_native_handle_base
     gpu_native_handle_access_pass_compile_control)
+olr_add_gpu_compile_pass_alias(gpu_compile_pass_native_handle_derived
+    gpu_native_handle_derived_access_pass_compile_control)
 olr_add_gpu_compile_pass_alias(gpu_compile_pass_submission
     gpu_submission_pass_compile_control)
-set_tests_properties(gpu_compile_pass_native_handle PROPERTIES
-    DEPENDS gpu_negcompile_native_handle_base_derived)
+set_tests_properties(gpu_compile_pass_native_handle_base PROPERTIES
+    DEPENDS gpu_negcompile_native_handle_base)
+set_tests_properties(gpu_compile_pass_native_handle_derived PROPERTIES
+    DEPENDS gpu_negcompile_native_handle_derived)
 set_tests_properties(gpu_compile_pass_submission PROPERTIES
     DEPENDS "gpu_negcompile_submission_view_unwrap;gpu_negcompile_submit_without_owner;gpu_negcompile_registry_pairing;gpu_negcompile_token_construction;gpu_negcompile_token_direct_abandon;gpu_negcompile_op_track_access")
 olr_expect_compile_failure(gpu_lease_move lease_move.cpp)
