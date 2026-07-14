@@ -96,6 +96,11 @@ struct HevcTimeCodeContinuity {
     uint32_t seconds = 0;
     uint32_t minutes = 0;
     uint32_t hours = 0;
+    bool haveFrameSemantics = false;
+    uint32_t frames = 0;
+    FrameRateQ labelRate;
+    uint8_t countingType = 0;
+    bool dropFrame = false;
 };
 
 struct HevcPictureTimingParseResult {

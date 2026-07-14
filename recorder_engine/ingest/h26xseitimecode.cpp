@@ -142,7 +142,11 @@ bool equivalentContinuity(const H26xTimingDetail::HevcTimeCodeContinuity& lhs,
     return lhs.haveSeconds == rhs.haveSeconds && lhs.haveMinutes == rhs.haveMinutes &&
            lhs.haveHours == rhs.haveHours && (!lhs.haveSeconds || lhs.seconds == rhs.seconds) &&
            (!lhs.haveMinutes || lhs.minutes == rhs.minutes) &&
-           (!lhs.haveHours || lhs.hours == rhs.hours);
+           (!lhs.haveHours || lhs.hours == rhs.hours) &&
+           lhs.haveFrameSemantics == rhs.haveFrameSemantics &&
+           (!lhs.haveFrameSemantics ||
+            (lhs.frames == rhs.frames && lhs.labelRate == rhs.labelRate &&
+             lhs.countingType == rhs.countingType && lhs.dropFrame == rhs.dropFrame));
 }
 
 bool equivalentTimecodeResult(const H26xSeiTimecodeResult& lhs,

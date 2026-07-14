@@ -639,10 +639,13 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
         ignored != 0xffffu || !skipHevcProfileTierLevel(reader, maxSubLayersMinus1)) {
         return malformedHevc();
     }
-    Q_UNUSED(baseLayerAvailable);
     // Multilayer VPS extensions change parameter-set inference rules. Do not
     // guess at them in the base-layer ingest parser.
     if (maxLayersMinus1 != 0) return unsupportedHevc();
+    // This parser consumes only the base layer. A conforming VPS may describe
+    // an unavailable base layer, but such timing cannot authorize base-layer
+    // ingest decisions.
+    if (!baseLayerAvailable) return unsupportedHevc();
 
     bool subLayerOrderingInfoPresent = false;
     if (!reader.bit(subLayerOrderingInfoPresent)) return malformedHevc();
@@ -1646,6 +1649,11 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
     uint32_t previousSeconds = havePreviousSeconds ? previous->seconds : 0;
     uint32_t previousMinutes = havePreviousMinutes ? previous->minutes : 0;
     uint32_t previousHours = havePreviousHours ? previous->hours : 0;
+    bool havePreviousFrameSemantics = previous != nullptr && previous->haveFrameSemantics;
+    uint32_t previousFrames = havePreviousFrameSemantics ? previous->frames : 0;
+    FrameRateQ previousRate = havePreviousFrameSemantics ? previous->labelRate : FrameRateQ{};
+    uint8_t previousCountingType = havePreviousFrameSemantics ? previous->countingType : uint8_t(0);
+    bool previousDropFrame = havePreviousFrameSemantics && previous->dropFrame;
 
     for (uint32_t i = 0; i < clockCount; ++i) {
         bool clockTimestampFlag = false;
@@ -1657,6 +1665,7 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
             havePreviousSeconds = false;
             havePreviousMinutes = false;
             havePreviousHours = false;
+            havePreviousFrameSemantics = false;
             continue;
         }
 
@@ -1736,6 +1745,17 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
         const bool complete =
             effectiveSecondsPresent && effectiveMinutesPresent && effectiveHoursPresent;
         if (!complete) unsupportedMapping = true;
+        const bool predecessorFrameSemanticsAvailable = havePreviousFrameSemantics;
+        const uint32_t predecessorFrames = previousFrames;
+        const FrameRateQ predecessorRate = previousRate;
+        const uint8_t predecessorCountingType = previousCountingType;
+        const bool predecessorDropFrame = previousDropFrame;
+        const bool predecessorSecondsPresent = havePreviousSeconds;
+        const bool predecessorMinutesPresent = havePreviousMinutes;
+        const bool predecessorHoursPresent = havePreviousHours;
+        const uint32_t predecessorSeconds = previousSeconds;
+        const uint32_t predecessorMinutes = previousMinutes;
+        const uint32_t predecessorHours = previousHours;
         if (haveSeconds) {
             havePreviousSeconds = true;
             previousSeconds = seconds;
@@ -1766,7 +1786,8 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
             }
             comparable = true;
         }
-        if (sawPresent && previousComparable && comparable && currentClock < previousClock) {
+        if (sawPresent && previousComparable && comparable && currentClock < previousClock &&
+            !discontinuity) {
             result.status = TimecodeParseStatus::Malformed;
             return result;
         }
@@ -1808,6 +1829,19 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
                 return result;
             }
             representable = representable && normalizedRateEquals(rate, 30000, 1001);
+            if (countDropped && !discontinuity) {
+                if (!predecessorFrameSemanticsAvailable || !predecessorSecondsPresent ||
+                    !predecessorMinutesPresent || !predecessorHoursPresent ||
+                    !(predecessorRate == rate) || predecessorCountingType != countingType ||
+                    !predecessorDropFrame) {
+                    unsupportedMapping = true;
+                } else if (predecessorFrames != 29 || predecessorSeconds != 59 ||
+                           predecessorHours != effectiveHours ||
+                           predecessorMinutes + 1 != effectiveMinutes) {
+                    result.status = TimecodeParseStatus::Malformed;
+                    return result;
+                }
+            }
             break;
         case 5:
         case 6:
@@ -1815,6 +1849,13 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
             break;
         }
         if (!representable) unsupportedMapping = true;
+        havePreviousFrameSemantics = complete && rate.valid() && representable;
+        if (havePreviousFrameSemantics) {
+            previousFrames = frames;
+            previousRate = rate;
+            previousCountingType = uint8_t(countingType);
+            previousDropFrame = dropFrame;
+        }
         if (!complete || !representable) continue;
 
         const Smpte12mTimecode timestamp{int(effectiveHours),
@@ -1830,8 +1871,8 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
         if (!firstUsable.valid) {
             firstUsable = timestamp;
             firstRate = rate;
-            firstDiscontinuity = discontinuity;
         }
+        firstDiscontinuity = firstDiscontinuity || discontinuity;
     }
 
     if (!reader.seiPayloadAlignmentBits()) {
@@ -1849,6 +1890,11 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
         next->seconds = previousSeconds;
         next->minutes = previousMinutes;
         next->hours = previousHours;
+        next->haveFrameSemantics = havePreviousFrameSemantics;
+        next->frames = previousFrames;
+        next->labelRate = previousRate;
+        next->countingType = previousCountingType;
+        next->dropFrame = previousDropFrame;
     }
     if (firstUsable.valid) {
         result.status = TimecodeParseStatus::Valid;
