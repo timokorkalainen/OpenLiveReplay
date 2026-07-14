@@ -121,7 +121,9 @@ void OutputRuntime::resetPlayEpoch() {
     // covers the deferred-pending path too (invalidating earlier is safe: the
     // active dispatch already passed its re-check; the next snapshot sees the new
     // generation, and the deferred epoch clear applies before that next tick).
+#ifndef OLR_MUTATE_SKIP_CONFIG_GENERATION
     ++m_configGeneration;
+#endif
     if (m_dispatchActive) {
         m_pendingPlayEpochReset = true;
         return;

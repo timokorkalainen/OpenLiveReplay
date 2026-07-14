@@ -542,7 +542,9 @@ PlaybackWorker::commitOutputStateLocked(const OutputCommit& commit) {
     m_outputPlayheadCacheGuarded.store(commit.guardPlayheadCache, std::memory_order_release);
     if (commit.clearSeekTarget) m_seekTargetMs = -1;
     m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);
+#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET
     resetOutputPlayEpoch();
+#endif
 
     if (commit.dispatch == PostCommitDispatch::PgmCritical && m_operatorSeekCompletion.waiting &&
         !m_operatorSeekCompletion.completed &&

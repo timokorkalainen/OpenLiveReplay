@@ -420,3 +420,81 @@ add_subdirectory(e2e)
 add_subdirectory(qml)
 add_subdirectory(qmlstyle)
 add_subdirectory(formal)
+
+# Compile the two load-bearing transport-epoch statements as real mutants. Direct
+# object inclusion makes each definition override the corresponding object in the
+# normal static test library without changing any production target.
+add_library(olr_transport_epoch_f1_mutant OBJECT
+    "${CMAKE_SOURCE_DIR}/playback/output/outputruntime.cpp")
+set_target_properties(olr_transport_epoch_f1_mutant PROPERTIES AUTOMOC OFF)
+target_include_directories(olr_transport_epoch_f1_mutant PRIVATE "${CMAKE_SOURCE_DIR}")
+target_compile_definitions(olr_transport_epoch_f1_mutant PRIVATE
+    OLR_UNIT_TEST=1 OLR_MUTATE_SKIP_CONFIG_GENERATION=1)
+target_link_libraries(olr_transport_epoch_f1_mutant PRIVATE olr_test_playback)
+
+qt_add_executable(transport_epoch_f1_mutant
+    "${CMAKE_SOURCE_DIR}/tests/unit/tst_outputruntime.cpp"
+    $<TARGET_OBJECTS:olr_transport_epoch_f1_mutant>)
+target_link_libraries(transport_epoch_f1_mutant PRIVATE
+    Qt6::Test olr_test_playback olr_warnings olr_sanitize)
+
+add_library(olr_transport_epoch_f2_mutant OBJECT
+    "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
+set_target_properties(olr_transport_epoch_f2_mutant PROPERTIES AUTOMOC OFF)
+target_include_directories(olr_transport_epoch_f2_mutant PRIVATE "${CMAKE_SOURCE_DIR}")
+target_compile_definitions(olr_transport_epoch_f2_mutant PRIVATE
+    OLR_UNIT_TEST=1 OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET=1)
+target_link_libraries(olr_transport_epoch_f2_mutant PRIVATE olr_test_playback)
+
+qt_add_executable(transport_epoch_f2_mutant
+    "${CMAKE_SOURCE_DIR}/tests/unit/tst_playbackworker.cpp"
+    $<TARGET_OBJECTS:olr_transport_epoch_f2_mutant>)
+target_link_libraries(transport_epoch_f2_mutant PRIVATE
+    Qt6::Test olr_test_playback olr_warnings olr_sanitize)
+if(OLR_GPU_PIPELINE)
+    target_link_libraries(transport_epoch_f2_mutant PRIVATE olr_test_gpu)
+endif()
+
+if(WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    foreach(mutant transport_epoch_f1_mutant transport_epoch_f2_mutant)
+        add_custom_command(TARGET ${mutant} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:${mutant}>
+                $<TARGET_FILE_DIR:${mutant}>
+            COMMAND_EXPAND_LISTS
+            COMMENT "Copying ${mutant} runtime DLLs")
+    endforeach()
+endif()
+
+add_test(NAME transport_epoch_mutation_f1
+    COMMAND "${CMAKE_COMMAND}"
+        -DMUTANT_NAME=F1_config_generation
+        -DMUTANT_EXECUTABLE=$<TARGET_FILE:transport_epoch_f1_mutant>
+        -DTEST_FUNCTION=resetRejectsSnapshotCapturedBeforeLeaseRecheck
+        -DEXPECTED_TEST_NAME=TestOutputRuntime::resetRejectsSnapshotCapturedBeforeLeaseRecheck
+        -DEXPECTED_FAILURE_TOKEN=snapshotCalls.load
+        -P "${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_mutations.cmake")
+set_tests_properties(transport_epoch_mutation_f1 PROPERTIES
+    LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_test(NAME transport_epoch_mutation_f2
+    COMMAND "${CMAKE_COMMAND}"
+        -DMUTANT_NAME=F2_commit_epoch_reset
+        -DMUTANT_EXECUTABLE=$<TARGET_FILE:transport_epoch_f2_mutant>
+        -DTEST_FUNCTION=outputCommitPublishesTypedStateAndReturnsPgmDispatch
+        -DEXPECTED_TEST_NAME=TestPlaybackWorker::outputCommitPublishesTypedStateAndReturnsPgmDispatch
+        -DEXPECTED_FAILURE_TOKEN=playEpochResetCountForTest
+        -P "${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_mutations.cmake")
+set_tests_properties(transport_epoch_mutation_f2 PROPERTIES
+    LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+if(WIN32)
+    get_filename_component(_olr_ffmpeg_libdir "${OLR_FFMPEG_AVFORMAT_LIBRARY}" DIRECTORY)
+    get_filename_component(_olr_ffmpeg_bin "${_olr_ffmpeg_libdir}/../bin" ABSOLUTE)
+    get_filename_component(_olr_srt_libdir "${OLR_SRT_LIBRARY}" DIRECTORY)
+    get_filename_component(_olr_srt_bin "${_olr_srt_libdir}/../bin" ABSOLUTE)
+    set(_olr_mutation_path "${_olr_ffmpeg_bin};${_olr_srt_bin};$ENV{PATH}")
+    string(REPLACE ";" "\\;" _olr_mutation_path "${_olr_mutation_path}")
+    set_tests_properties(transport_epoch_mutation_f1 transport_epoch_mutation_f2 PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PATH=${_olr_mutation_path}")
+endif()
