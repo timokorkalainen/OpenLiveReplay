@@ -379,8 +379,50 @@ def explicitly_permitted_intervening_statement(
     return bool(inert_scope and inert_scope.group(1) == inert_scope.group(3))
 
 
+def audit_load_bearing_macro_definitions(view: LexedSource, path: Path) -> None:
+    """Reject preprocessor rewrites of either side of the F2 hand-off.
+
+    The normal code view deliberately blanks directives before structural
+    matching.  Inspect the comment/string-blanked directive view separately so
+    a production-only function-like macro cannot leave the audited call text in
+    place while compiling it away.  A macro named ``store`` is also forbidden:
+    it can rewrite the member call token even without mentioning the atomic.
+    Harmless macros remain valid.
+    """
+    load_bearing_names = {
+        "m_committedGeneration",
+        "resetOutputPlayEpoch",
+    }
+    load_bearing_macro_names = load_bearing_names | {"store"}
+    directive_pattern = re.compile(
+        r"(?m)^[ \t]*#[ \t]*(define|undef)\b([^\n]*)"
+    )
+    for directive in directive_pattern.finditer(view.comment_code):
+        kind = directive.group(1)
+        tail = directive.group(2)
+        name_match = re.search(r"\b[A-Za-z_]\w*\b", tail)
+        if name_match is None:
+            continue
+        macro_name = name_match.group(0)
+        replacement = tail[name_match.end() :]
+        replacement_names = set(re.findall(r"\b[A-Za-z_]\w*\b", replacement))
+        if macro_name not in load_bearing_macro_names and not (
+            replacement_names & load_bearing_names
+        ):
+            continue
+        macro_offset = directive.start(2) + name_match.start()
+        fail_at(
+            path,
+            view,
+            macro_offset,
+            f"macro {'definition' if kind == 'define' else 'undefinition'} touches "
+            "load-bearing transport epoch identifier",
+        )
+
+
 def audit_playbackworker(source: str, path: Path) -> None:
     view = lexical_source(source)
+    audit_load_bearing_macro_definitions(view, path)
     begin, end = logical_function_span(
         view,
         r"PlaybackWorker::commitOutputStateLocked\s*\([^)]*\)\s*",
@@ -636,14 +678,14 @@ def main() -> int:
     harmless_mentions = worker + (
         "\n// m_committedGeneration.store(98, std::memory_order_release);\n"
         "const char* auditText = \"m_committedGeneration.store(97)\";\n"
-        "#define AUDIT_STORE_DECOY m_committedGeneration.store(96)\n"
+        "#define AUDIT_HARMLESS_DECOY(value) (value)\n"
         "std::atomic<uint64_t> m_committedGeneration;\n"
     )
     require_acceptance(
         audit_playbackworker,
         harmless_mentions,
         worker_path,
-        "comments, strings, macro definitions, and declarations are not stores",
+        "comments, strings, harmless macro definitions, and declarations are not stores",
     )
 
     outside_line = len(worker.splitlines()) + 2
@@ -830,6 +872,62 @@ def main() -> int:
         worker,
         r"PlaybackWorker::commitOutputStateLocked\s*\([^)]*\)\s*",
         worker_path,
+    )
+
+    production_alias = worker[:commit_begin] + (
+        "\n#ifndef OLR_UNIT_TEST\n"
+        "#define resetOutputPlayEpoch() ((void)0)\n"
+        "#endif\n"
+    ) + worker[commit_begin:]
+    production_alias_offset = production_alias.find(
+        "#define resetOutputPlayEpoch", commit_begin
+    )
+    require_rejection(
+        audit_playbackworker,
+        production_alias,
+        worker_path,
+        line_number(production_alias, production_alias_offset),
+        "macro definition touches load-bearing transport epoch identifier",
+    )
+
+    committed_generation_alias = worker[:commit_begin] + (
+        "\n#define COMMITTED_GENERATION_ALIAS m_committedGeneration\n"
+    ) + worker[commit_begin:]
+    committed_generation_alias_offset = committed_generation_alias.find(
+        "#define COMMITTED_GENERATION_ALIAS", commit_begin
+    )
+    require_rejection(
+        audit_playbackworker,
+        committed_generation_alias,
+        worker_path,
+        line_number(committed_generation_alias, committed_generation_alias_offset),
+        "macro definition touches load-bearing transport epoch identifier",
+    )
+
+    store_token_rewrite = worker[:commit_begin] + (
+        "\n#define store(...) loadWithoutPublishing(__VA_ARGS__)\n"
+    ) + worker[commit_begin:]
+    store_token_rewrite_offset = store_token_rewrite.find("#define store", commit_begin)
+    require_rejection(
+        audit_playbackworker,
+        store_token_rewrite,
+        worker_path,
+        line_number(store_token_rewrite, store_token_rewrite_offset),
+        "macro definition touches load-bearing transport epoch identifier",
+    )
+
+    reset_undefinition = worker[:commit_begin] + (
+        "\n#undef resetOutputPlayEpoch\n"
+    ) + worker[commit_begin:]
+    reset_undefinition_offset = reset_undefinition.find(
+        "#undef resetOutputPlayEpoch", commit_begin
+    )
+    require_rejection(
+        audit_playbackworker,
+        reset_undefinition,
+        worker_path,
+        line_number(reset_undefinition, reset_undefinition_offset),
+        "macro undefinition touches load-bearing transport epoch identifier",
     )
 
     preprocessor_store = replace_once_in_span(

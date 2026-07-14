@@ -494,6 +494,64 @@ foreach(production_f1_executable transport_epoch_production_f1_baseline
     endif()
 endforeach()
 
+# Compile F2 against the real PlaybackWorker implementation with OLR_UNIT_TEST
+# explicitly undefined.  The control source is generated in the build tree and
+# inserts the production-only function-like macro bypass that motivated this
+# proof; no mutation hook is added to shipping source.
+set(transport_epoch_production_f2_alias_source
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/transport_epoch_production_f2_alias_control.cpp")
+add_custom_command(
+    OUTPUT "${transport_epoch_production_f2_alias_source}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${CMAKE_COMMAND}"
+        -DINPUT_SOURCE=${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp
+        -DOUTPUT_SOURCE=${transport_epoch_production_f2_alias_source}
+        -P "${CMAKE_SOURCE_DIR}/tests/mutations/generate_transport_epoch_f2_alias_control.cmake"
+    DEPENDS
+        "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp"
+        "${CMAKE_SOURCE_DIR}/tests/mutations/generate_transport_epoch_f2_alias_control.cmake"
+    VERBATIM)
+set_source_files_properties("${transport_epoch_production_f2_alias_source}"
+    PROPERTIES GENERATED TRUE)
+
+add_library(olr_transport_epoch_production_f2_baseline OBJECT
+    "${CMAKE_SOURCE_DIR}/playback/playbackworker.cpp")
+add_library(olr_transport_epoch_production_f2_alias_control OBJECT
+    "${transport_epoch_production_f2_alias_source}")
+foreach(production_f2_object olr_transport_epoch_production_f2_baseline
+        olr_transport_epoch_production_f2_alias_control)
+    set_target_properties(${production_f2_object} PROPERTIES AUTOMOC OFF)
+    target_include_directories(${production_f2_object} PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(${production_f2_object} PRIVATE olr_test_playback)
+    target_compile_options(${production_f2_object} PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UOLR_UNIT_TEST>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UOLR_UNIT_TEST>)
+endforeach()
+
+qt_add_executable(transport_epoch_production_f2_baseline
+    "${CMAKE_SOURCE_DIR}/tests/formal/transport_epoch_production_f2.cpp"
+    $<TARGET_OBJECTS:olr_transport_epoch_production_f2_baseline>
+    $<TARGET_OBJECTS:olr_transport_epoch_production_f1_baseline>)
+qt_add_executable(transport_epoch_production_f2_alias_control
+    "${CMAKE_SOURCE_DIR}/tests/formal/transport_epoch_production_f2.cpp"
+    $<TARGET_OBJECTS:olr_transport_epoch_production_f2_alias_control>
+    $<TARGET_OBJECTS:olr_transport_epoch_production_f1_baseline>)
+foreach(production_f2_executable transport_epoch_production_f2_baseline
+        transport_epoch_production_f2_alias_control)
+    target_include_directories(${production_f2_executable} PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(${production_f2_executable} PRIVATE
+        $<LINK_ONLY:olr_test_playback> Qt6::Core Qt6::Gui Qt6::Multimedia
+        olr_warnings olr_sanitize)
+    target_compile_options(${production_f2_executable} PRIVATE
+        $<$<CXX_COMPILER_ID:MSVC>:/UOLR_UNIT_TEST>
+        $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-UOLR_UNIT_TEST>)
+    if(OLR_GPU_PIPELINE)
+        target_compile_definitions(${production_f2_executable}
+            PRIVATE OLR_GPU_PIPELINE_BUILD=1)
+    endif()
+endforeach()
+
 add_library(olr_transport_epoch_f1_mutant OBJECT
     "${CMAKE_SOURCE_DIR}/playback/output/outputruntime.cpp")
 set_target_properties(olr_transport_epoch_f1_mutant PROPERTIES AUTOMOC OFF)
@@ -545,7 +603,9 @@ if(WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     foreach(epoch_test transport_epoch_f1_baseline transport_epoch_f1_mutant
             transport_epoch_f2_baseline transport_epoch_f2_mutant
             transport_epoch_production_f1_baseline
-            transport_epoch_production_f1_mutant)
+            transport_epoch_production_f1_mutant
+            transport_epoch_production_f2_baseline
+            transport_epoch_production_f2_alias_control)
         add_custom_command(TARGET ${epoch_test} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_RUNTIME_DLLS:${epoch_test}>
@@ -574,6 +634,14 @@ olr_add_ctest(NAME transport_epoch_production_f1
         -DMUTANT_EXECUTABLE=$<TARGET_FILE:transport_epoch_production_f1_mutant>
         -P "${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_production_f1.cmake")
 set_tests_properties(transport_epoch_production_f1 PROPERTIES
+    LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+olr_add_ctest(NAME transport_epoch_production_f2
+    COMMAND "${CMAKE_COMMAND}"
+        -DBASELINE_EXECUTABLE=$<TARGET_FILE:transport_epoch_production_f2_baseline>
+        -DCONTROL_EXECUTABLE=$<TARGET_FILE:transport_epoch_production_f2_alias_control>
+        -P "${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_production_f2.cmake")
+set_tests_properties(transport_epoch_production_f2 PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 olr_add_ctest(NAME transport_epoch_mutation_f2

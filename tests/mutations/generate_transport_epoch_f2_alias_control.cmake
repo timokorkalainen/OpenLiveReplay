@@ -1,0 +1,23 @@
+if(NOT DEFINED INPUT_SOURCE OR NOT DEFINED OUTPUT_SOURCE)
+    message(FATAL_ERROR "INPUT_SOURCE and OUTPUT_SOURCE are required")
+endif()
+
+file(READ "${INPUT_SOURCE}" source)
+set(needle
+    "    m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n    resetOutputPlayEpoch();")
+set(replacement
+    "    m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);\n#ifndef OLR_UNIT_TEST\n#define resetOutputPlayEpoch() ((void)0)\n#endif\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n    resetOutputPlayEpoch();\n#ifndef OLR_UNIT_TEST\n#undef resetOutputPlayEpoch\n#endif")
+string(FIND "${source}" "${needle}" needle_offset)
+if(needle_offset EQUAL -1)
+    message(FATAL_ERROR "transport epoch F2 alteration target was not found")
+endif()
+string(LENGTH "${source}" source_length)
+string(LENGTH "${needle}" needle_length)
+string(REPLACE "${needle}" "" source_without_needle "${source}")
+string(LENGTH "${source_without_needle}" source_without_needle_length)
+math(EXPR removed_length "${source_length} - ${source_without_needle_length}")
+if(NOT removed_length EQUAL needle_length)
+    message(FATAL_ERROR "transport epoch F2 alteration target was not unique")
+endif()
+string(REPLACE "${needle}" "${replacement}" altered "${source}")
+file(WRITE "${OUTPUT_SOURCE}" "${altered}")
