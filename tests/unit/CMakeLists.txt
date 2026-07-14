@@ -187,6 +187,8 @@ olr_add_unit_test(tst_rtmp_health      olr_test_core)
 olr_add_unit_test(tst_videocodecchoice)
 # Header-only test: no olr_test_core link, so add the project root include manually.
 target_include_directories(tst_videocodecchoice PRIVATE "${CMAKE_SOURCE_DIR}")
+olr_add_unit_test(tst_mediafoundationh264policy)
+target_include_directories(tst_mediafoundationh264policy PRIVATE "${CMAKE_SOURCE_DIR}")
 olr_add_unit_test(tst_avcc olr_test_engine)
 olr_add_unit_test(tst_benchmarkplan olr_test_engine)
 olr_add_unit_test(tst_codecbenchmark olr_test_engine)
@@ -208,7 +210,8 @@ elseif(WIN32)
     target_link_directories(olr_test_nativevideoencoder PUBLIC "${OLR_FFMPEG_LIBDIR}")
     target_link_libraries(olr_test_nativevideoencoder
         PUBLIC Qt6::Core olr_test_engine
-        PRIVATE "${OLR_FFMPEG_AVUTIL_LIBRARY}" mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32)
+        PRIVATE "${OLR_FFMPEG_AVUTIL_LIBRARY}" mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi
+                ole32 advapi32 version)
     target_link_libraries(tst_nativevideoencoder PRIVATE olr_test_nativevideoencoder)
 elseif(NOT WIN32)
     add_library(olr_test_nativevideoencoder STATIC
@@ -230,6 +233,10 @@ target_link_libraries(tst_vtiosurface PRIVATE
     olr_test_nativevideodecoder)
 olr_add_unit_test(tst_realcodecbenchmark olr_test_engine)
 target_link_libraries(tst_realcodecbenchmark PRIVATE olr_test_nativevideoencoder olr_test_nativevideodecoder)
+if(WIN32)
+    olr_add_unit_test(tst_mediafoundationasynclifecycle)
+    target_include_directories(tst_mediafoundationasynclifecycle PRIVATE "${CMAKE_SOURCE_DIR}")
+endif()
 olr_add_unit_test(tst_benchmarkcache olr_test_engine)
 olr_add_unit_test(tst_recordgate olr_test_engine)
 olr_add_unit_test(tst_streamworker_gpuencode olr_test_engine)

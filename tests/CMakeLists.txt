@@ -214,7 +214,8 @@ elseif(WIN32)
         OLR_NATIVE_RTMP_AVAILABLE=1)
     target_include_directories(olr_test_engine PUBLIC "${OLR_SRT_INCLUDE_DIR}")
     target_link_libraries(olr_test_engine
-        PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32 ws2_32 "${OLR_SRT_LIBRARY}")
+        PRIVATE mfplat mf mfuuid mfreadwrite strmiids d3d11 dxgi ole32 advapi32 version ws2_32
+                "${OLR_SRT_LIBRARY}")
 elseif(NOT WIN32)
     target_sources(olr_test_engine PRIVATE
         "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativevideodecoder_stub.cpp"
