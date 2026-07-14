@@ -7,7 +7,12 @@ target_link_libraries(tst_qml_codecsettings PRIVATE
 
 add_test(NAME tst_qml_codecsettings
     COMMAND tst_qml_codecsettings -input "${CMAKE_CURRENT_SOURCE_DIR}")
+set(qt_test_path_modifications
+    "QML_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
+    "QML2_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
+    "QT_PLUGIN_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_PLUGINS}")
 set_tests_properties(tst_qml_codecsettings PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_SOURCE_DIR}")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_SOURCE_DIR}"
+    ENVIRONMENT_MODIFICATION "${qt_test_path_modifications}")

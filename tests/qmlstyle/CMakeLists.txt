@@ -91,6 +91,27 @@ set_tests_properties(tst_sourcelistpanel_layout PROPERTIES
     TIMEOUT 60
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
 
+# These tests select the dynamic OlrStyle QQC2 style at runtime. Linking the
+# backing QML module does not make its generated MODULE_LIBRARY a build
+# dependency, so ensure the plugin is present on the existing QML import path.
+set(olr_style_tests
+    tst_olrstyle
+    tst_statusstrip_onair
+    tst_pgmstage_mapping
+    tst_rundownrail_drag
+    tst_scrubtimeline
+    tst_transportdock_layout
+    tst_sourcelistpanel_layout)
+foreach(style_test IN LISTS olr_style_tests)
+    add_dependencies(${style_test} OlrStyleplugin OlrThemeplugin)
+endforeach()
+set(qt_test_path_modifications
+    "QML_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
+    "QML2_IMPORT_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_QML}"
+    "QT_PLUGIN_PATH=path_list_append:${QT6_INSTALL_PREFIX}/${QT6_INSTALL_PLUGINS}")
+set_tests_properties(${olr_style_tests} PROPERTIES
+    ENVIRONMENT_MODIFICATION "${qt_test_path_modifications}")
+
 # Dev-only headless preview renderer (no add_test): renders a QML file under OlrStyle
 # to a PNG for visual review. Links the style modules so it never dlopens a plugin.
 qt_add_executable(uipreview uipreview_main.cpp)
