@@ -4,11 +4,12 @@
 #include "playback/gpu/gpusurface.h"
 
 #include <atomic>
+#include <memory_resource>
+#include <new>
 #include <utility>
 
 namespace {
 
-constexpr qsizetype kInlineOwnerCount = 4;
 thread_local uint8_t currentAllocationPhase = 0;
 
 #ifdef OLR_UNIT_TEST
@@ -17,11 +18,58 @@ struct AllocationProbeMetrics {
     std::atomic<uint64_t> callback{0};
     std::atomic<uint64_t> postAccept{0};
     std::atomic<bool> failNext{false};
+    std::atomic<uint8_t> injectPhase{0};
 };
 
 AllocationProbeMetrics& allocationProbeMetrics() {
     static AllocationProbeMetrics metrics;
     return metrics;
+}
+
+class RetirementMemoryResource final : public std::pmr::memory_resource {
+private:
+    void* do_allocate(size_t bytes, size_t alignment) override {
+        auto& metrics = allocationProbeMetrics();
+        if (metrics.failNext.exchange(false, std::memory_order_relaxed)) throw std::bad_alloc();
+        void* allocation = std::pmr::new_delete_resource()->allocate(bytes, alignment);
+        if (currentAllocationPhase == uint8_t(GpuRetireAllocationPhase::Preparation))
+            metrics.preparation.fetch_add(1, std::memory_order_relaxed);
+        else if (currentAllocationPhase == uint8_t(GpuRetireAllocationPhase::Callback))
+            metrics.callback.fetch_add(1, std::memory_order_relaxed);
+        else if (currentAllocationPhase == uint8_t(GpuRetireAllocationPhase::PostAccept))
+            metrics.postAccept.fetch_add(1, std::memory_order_relaxed);
+        return allocation;
+    }
+
+    void do_deallocate(void* value, size_t bytes, size_t alignment) override {
+        std::pmr::new_delete_resource()->deallocate(value, bytes, alignment);
+    }
+
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+};
+
+RetirementMemoryResource& retirementMemoryResource() {
+    static RetirementMemoryResource resource;
+    return resource;
+}
+
+bool exerciseInjectedHeapEvent(uint8_t phase) noexcept {
+    auto& metrics = allocationProbeMetrics();
+    uint8_t expectedPhase = phase;
+    const bool injected = metrics.injectPhase.compare_exchange_strong(
+        expectedPhase, 0, std::memory_order_relaxed, std::memory_order_relaxed);
+    const bool failingPreparation = phase == uint8_t(GpuRetireAllocationPhase::Preparation) &&
+                                    metrics.failNext.load(std::memory_order_relaxed);
+    if (!injected && !failingPreparation) return true;
+    try {
+        void* allocation = retirementMemoryResource().allocate(64, alignof(std::max_align_t));
+        retirementMemoryResource().deallocate(allocation, 64, alignof(std::max_align_t));
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 #endif
 
@@ -77,10 +125,10 @@ int GpuRetireRegistry::drainWithBoundedWait(int totalTimeoutMs) const {
 
 GpuRetireDiagnostics GpuRetireRegistry::diagnostics() const {
     GpuReadbackRetainer::drainCompleted();
-    return GpuRetireDiagnostics{
-        GpuReadbackRetainer::pendingCount(), GpuReadbackRetainer::highWaterMark(),
-        GpuReadbackRetainer::timeoutCount(), GpuReadbackRetainer::signalFailureCount(),
-        GpuReadbackRetainer::quarantineCount()};
+    const GpuRetireMetricsSnapshot snapshot = GpuReadbackRetainer::diagnosticsSnapshot();
+    return GpuRetireDiagnostics{snapshot.pendingOwners, snapshot.highWaterMark,
+                                snapshot.timeoutCount, snapshot.signalFailureCount,
+                                snapshot.quarantineOwners};
 }
 
 GpuRetireRegistry::PreparedBatch
@@ -89,11 +137,7 @@ GpuRetireRegistry::prepareRetirement(const std::shared_ptr<GpuSurface>* surfaces
     if (!surfaces || count <= 0 || !fence) return {};
 
 #ifdef OLR_UNIT_TEST
-    if (count > kInlineOwnerCount) {
-        auto& metrics = allocationProbeMetrics();
-        if (metrics.failNext.exchange(false, std::memory_order_relaxed)) return {};
-        metrics.preparation.fetch_add(1, std::memory_order_relaxed);
-    }
+    if (!exerciseInjectedHeapEvent(uint8_t(GpuRetireAllocationPhase::Preparation))) return {};
 #endif
 
     const uint64_t reservation = gpuSubmissionDetail::takeMonotonicInstanceId(nextReservation());
@@ -166,10 +210,16 @@ GpuRetireRegistry::AllocationPhaseScope::~AllocationPhaseScope() {
 
 void GpuRetireRegistry::AllocationPhaseScope::enterCallback() noexcept {
     (void) GpuRetireRegistry::exchangeAllocationPhase(2);
+#ifdef OLR_UNIT_TEST
+    (void) exerciseInjectedHeapEvent(uint8_t(GpuRetireAllocationPhase::Callback));
+#endif
 }
 
 void GpuRetireRegistry::AllocationPhaseScope::enterPostAccept() noexcept {
     (void) GpuRetireRegistry::exchangeAllocationPhase(3);
+#ifdef OLR_UNIT_TEST
+    (void) exerciseInjectedHeapEvent(uint8_t(GpuRetireAllocationPhase::PostAccept));
+#endif
 }
 
 GpuRetireRegistry::AllocationPhaseScope GpuRetireRegistry::beginAllocationScope() const noexcept {
@@ -185,12 +235,18 @@ void GpuRetireRegistry::failNextStorageAllocationForTest() noexcept {
     allocationProbeMetrics().failNext.store(true, std::memory_order_relaxed);
 }
 
+void GpuRetireRegistry::injectHeapAllocationForNextPhaseForTest(
+    GpuRetireAllocationPhase phase) noexcept {
+    allocationProbeMetrics().injectPhase.store(uint8_t(phase), std::memory_order_relaxed);
+}
+
 void GpuRetireRegistry::resetAllocationProbeForTest() noexcept {
     auto& metrics = allocationProbeMetrics();
     metrics.preparation.store(0, std::memory_order_relaxed);
     metrics.callback.store(0, std::memory_order_relaxed);
     metrics.postAccept.store(0, std::memory_order_relaxed);
     metrics.failNext.store(false, std::memory_order_relaxed);
+    metrics.injectPhase.store(0, std::memory_order_relaxed);
 }
 
 GpuRetireAllocationSnapshot GpuRetireRegistry::allocationSnapshotForTest() noexcept {

@@ -29,6 +29,8 @@ struct GpuRetireDiagnostics {
 };
 
 #ifdef OLR_UNIT_TEST
+enum class GpuRetireAllocationPhase : uint8_t { Preparation = 1, Callback = 2, PostAccept = 3 };
+
 struct GpuRetireAllocationSnapshot {
     uint64_t preparation = 0;
     uint64_t callback = 0;
@@ -47,6 +49,7 @@ public:
 
 #ifdef OLR_UNIT_TEST
     static void failNextStorageAllocationForTest() noexcept;
+    static void injectHeapAllocationForNextPhaseForTest(GpuRetireAllocationPhase phase) noexcept;
     static void resetAllocationProbeForTest() noexcept;
     static GpuRetireAllocationSnapshot allocationSnapshotForTest() noexcept;
     static void resetStorageProbeForTest() noexcept;

@@ -23,12 +23,24 @@ struct GpuRetirePreparedHandle {
     explicit operator bool() const noexcept { return reservation != 0 && count != 0; }
 };
 
+struct GpuRetireMetricsSnapshot {
+    qsizetype pendingOwners = 0;
+    qsizetype highWaterMark = 0;
+    qsizetype quarantineOwners = 0;
+    uint64_t timeoutCount = 0;
+    uint64_t signalFailureCount = 0;
+};
+
 #ifdef OLR_UNIT_TEST
 struct GpuRetireStorageSnapshot {
-    uint64_t storageAllocations = 0;
     uint64_t shardLockAcquisitions = 0;
+    uint64_t drainShardVisits = 0;
     uint64_t activeNodesVisited = 0;
+    uint64_t fenceGroupsVisited = 0;
+    uint64_t fenceLookupSteps = 0;
     uint64_t completionQueries = 0;
+    uint64_t poolNodeAcquisitions = 0;
+    uint64_t poolNodeReleases = 0;
     uint64_t poolExhaustions = 0;
     uint64_t abandonmentShardVisits = 0;
     uint64_t abandonmentNodesVisited = 0;
@@ -54,6 +66,7 @@ private:
     static qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice);
     static qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices);
     static int drainWithBoundedWait(int totalTimeoutMs);
+    static GpuRetireMetricsSnapshot diagnosticsSnapshot() noexcept;
     static qsizetype highWaterMark() noexcept;
     static uint64_t timeoutCount() noexcept;
     static uint64_t signalFailureCount() noexcept;
