@@ -9,7 +9,7 @@ faith.
 
 | # | Challenge | Deliverable | Status |
 |---|-----------|-------------|--------|
-| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 9 model mutations refute; compiled reset-removal control is killed** |
+| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 10 model mutations refute; compiled reset-removal control is killed** |
 | 2 | Rate-agnostic timecode alignment with a proven phase-error bound | Falsifier + exact-rational bound sweep + drop-in C++ module | **Ran: shipped code RED (−5000 ms on aligned cameras); replacement 0 violations / 3,969 cells, zero slack** |
 | 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + real-TDR fault-lane design | **Designed: full headers, 6-site migration, harness + mutations** |
 
@@ -85,11 +85,18 @@ wall-clock timing, or unrepresented production actors. Its 523 reachable states
 are the sum across eleven independently explored graphs, not one coupled graph.
 
 `fixed` proves the bounded invariant. `mut_f1` deletes configuration-generation
-invalidation, and each of the eight `mut_f2_<actor>` modes deletes that owner's
-atomic epoch reset; all nine mutants emit a concrete counterexample containing
+invalidation, `mut_hold_cache_clear` retains a held frame across the applied play
+epoch reset, and each of the eight `mut_f2_<actor>` modes deletes that owner's
+atomic epoch reset; all ten mutants emit a concrete counterexample containing
 the actor, phase state, sampled and committed playheads, generations, and
 rendered identity. This differential result rejects a vacuous model, but it is
 not by itself a source-level proof of the C++ implementation.
+
+Held video is valid only in the play epoch that selected its source. A reset
+requested during an active lease still lets that validated lease finish; when
+the deferred reset is actually applied, it clears both the clock anchor and the
+held-frame cache before the next lease. Same-epoch placeholder ticks continue to
+use hold-last normally.
 
 ### Coupling the model to compiled production
 
@@ -655,8 +662,9 @@ review.
 Formulated as oracle-grade challenge briefs and then solved against the tree
 at the referenced lines. Machine-checked artifacts:
 [`docs/hardest-technical-challenges/transport_epoch_modelcheck.py`](hardest-technical-challenges/transport_epoch_modelcheck.py)
-(differential verdicts: `mut_f1` and eight owner-specific `mut_f2` modes →
-counterexamples, fixed → bounded proof over 523 aggregate states),
+(differential verdicts: `mut_f1`, `mut_hold_cache_clear`, and eight
+owner-specific `mut_f2` modes → counterexamples, fixed → bounded proof over 523
+aggregate states),
 [`tests/formal/transport_epoch_source_audit.py`](../tests/formal/transport_epoch_source_audit.py)
 (production ownership/order audit), compiled transport-epoch mutation controls,
 and

@@ -390,9 +390,10 @@ def audit_load_bearing_macro_definitions(view: LexedSource, path: Path) -> None:
     load_bearing_names = {
         "m_configGeneration",
         "m_committedGeneration",
+        "m_lastGoodFrame",
         "resetOutputPlayEpoch",
     }
-    load_bearing_macro_names = load_bearing_names | {"store"}
+    load_bearing_macro_names = load_bearing_names | {"clear", "store"}
     directive_pattern = re.compile(
         r"(?m)^[ \t]*#[ \t]*(define|undef)\b([^\n]*)"
     )
@@ -596,6 +597,59 @@ def audit_outputruntime(source: str, path: Path) -> None:
             )
 
 
+def audit_outputdispatcher(source: str, path: Path) -> None:
+    view = lexical_source(source)
+    mutation_switch = re.search(r"\bOLR_MUTATE_[A-Za-z0-9_]*\b", view.comment_code)
+    if mutation_switch:
+        fail_at(
+            path,
+            view,
+            mutation_switch.start(),
+            "shipping source contains a transport mutation switch",
+        )
+    audit_load_bearing_macro_definitions(view, path)
+    begin, end = logical_function_span(
+        view, r"void\s+OutputDispatcher::resetPlayEpoch\s*\(\s*\)\s*", path
+    )
+    clears = list(
+        re.finditer(r"\bm_lastGoodFrame\s*\.\s*clear\s*\(\s*\)\s*;", view.code)
+    )
+    if not clears:
+        fail_at(path, view, begin, "resetPlayEpoch is missing m_lastGoodFrame.clear")
+    if len(clears) != 1:
+        fail_at(path, view, clears[1].start(), "more than one m_lastGoodFrame.clear found")
+    clear_offset = clears[0].start()
+    if not (begin <= clear_offset < end):
+        fail_at(path, view, clear_offset, "m_lastGoodFrame.clear is outside resetPlayEpoch")
+    statements = top_level_statements(view.code, begin, end)
+    _, clear_statement = statement_containing(statements, clear_offset)
+    if clear_statement is None or clear_statement[2] != "m_lastGoodFrame.clear();":
+        fail_at(
+            path,
+            view,
+            clear_offset,
+            "m_lastGoodFrame.clear must be an unconditional top-level statement",
+        )
+    require_production_active(
+        view,
+        clear_offset,
+        path,
+        "m_lastGoodFrame.clear must be production-active",
+    )
+    for statement_span in statements:
+        _, statement_end, _ = statement_span
+        if statement_end > clear_offset:
+            break
+        barrier = production_control_flow_barrier(view, statement_span)
+        if barrier is not None:
+            fail_at(
+                path,
+                view,
+                barrier,
+                "production control-flow barrier precedes m_lastGoodFrame.clear",
+            )
+
+
 def require_rejection(check, source: str, path: Path, expected_line: int, expected: str) -> None:
     try:
         check(source, path)
@@ -633,11 +687,52 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(__file__).resolve().parents[2]
     worker_path = root / "playback" / "playbackworker.cpp"
     runtime_path = root / "playback" / "output" / "outputruntime.cpp"
+    dispatcher_path = root / "playback" / "output" / "outputdispatcher.cpp"
     worker = worker_path.read_text(encoding="utf-8")
     runtime = runtime_path.read_text(encoding="utf-8")
+    dispatcher = dispatcher_path.read_text(encoding="utf-8")
 
     audit_playbackworker(worker, worker_path)
     audit_outputruntime(runtime, runtime_path)
+    audit_outputdispatcher(dispatcher, dispatcher_path)
+
+    dispatcher_reset_begin, dispatcher_reset_end = function_span(
+        dispatcher,
+        r"void\s+OutputDispatcher::resetPlayEpoch\s*\(\s*\)\s*",
+        dispatcher_path,
+    )
+    missing_hold_clear = replace_once_in_span(
+        dispatcher,
+        dispatcher_reset_begin,
+        dispatcher_reset_end,
+        "    m_lastGoodFrame.clear();",
+        "    /* audit removed held-frame cache clear */",
+    )
+    require_rejection(
+        audit_outputdispatcher,
+        missing_hold_clear,
+        dispatcher_path,
+        line_number(missing_hold_clear, dispatcher_reset_begin),
+        "resetPlayEpoch is missing m_lastGoodFrame.clear",
+    )
+
+    conditional_hold_clear = replace_once_in_span(
+        dispatcher,
+        dispatcher_reset_begin,
+        dispatcher_reset_end,
+        "    m_lastGoodFrame.clear();",
+        "    if (false) m_lastGoodFrame.clear();",
+    )
+    conditional_hold_clear_offset = conditional_hold_clear.find(
+        "if (false)", dispatcher_reset_begin
+    )
+    require_rejection(
+        audit_outputdispatcher,
+        conditional_hold_clear,
+        dispatcher_path,
+        line_number(conditional_hold_clear, conditional_hold_clear_offset),
+        "must be an unconditional top-level statement",
+    )
 
     guarded_worker = worker.replace(
         "    resetOutputPlayEpoch();",
@@ -1195,7 +1290,8 @@ def main() -> int:
 
     print(
         "transport epoch source audit: PASS "
-        "(sole committed-generation owner, effective F1/F2 order, adversarial self-tests)"
+        "(sole committed-generation owner, effective F1/F2/cache-clear order, "
+        "adversarial self-tests)"
     )
     return 0
 

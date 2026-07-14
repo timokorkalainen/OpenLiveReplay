@@ -29,6 +29,10 @@ FrameHandle video(qint64 pts, uchar y) {
     return frame;
 }
 
+uchar firstLuma(const OutputBusFrame& frame) {
+    return uchar(MediaVideoFrameView(frame.video).planeY.at(0));
+}
+
 class BlockingSink final : public IOutputSink {
 public:
     OutputTargetKind kind() const override { return OutputTargetKind::QtPreview; }
@@ -241,8 +245,17 @@ int main() {
     const OutputBusFrame& follower = frames.last();
     if (follower.sampledPlayheadMs != 500)
         return fail("follower lease sampled the wrong committed playhead");
+    if (!follower.video.metadata().key.isPlaceholder)
+        return fail("new-epoch empty follower reused prior-epoch hold-last video");
+    if (!follower.identity.videoPlaceholder)
+        return fail("new-epoch empty follower retained prior-epoch video identity");
+    if (firstLuma(follower) == 35 || firstLuma(follower) == 75)
+        return fail("new-epoch empty follower pixels came from a prior-epoch frame");
+    if (firstLuma(follower) != 16)
+        return fail("new-epoch empty follower did not render the deterministic placeholder");
 
     std::cout << "transport epoch active-lease proof: PASS "
-                 "(commit nonblocking, pending reset precedes follower lease)\n";
+                 "(commit nonblocking, pending reset precedes follower lease, "
+                 "prior-epoch hold-last cleared)\n";
     return 0;
 }

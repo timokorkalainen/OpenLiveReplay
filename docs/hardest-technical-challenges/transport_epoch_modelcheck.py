@@ -19,9 +19,10 @@ bumps configuration immediately, coalesces a pending epoch clear, lets the
 already validated lease finish, and applies the clear before opening the next
 lease.
 
-Accepted modes are ``fixed``, ``mut_f1``, one ``mut_f2_<family>`` per commit
-family, and ``all``.  ``all`` succeeds only when fixed proves the bounded
-invariant and every mutant produces a concrete counterexample.
+Accepted modes are ``fixed``, ``mut_f1``, ``mut_hold_cache_clear``, one
+``mut_f2_<family>`` per commit family, and ``all``.  ``all`` succeeds only when
+fixed proves the bounded invariant and every mutant produces a concrete
+counterexample.
 
 Each scenario is explored as an independent graph from the same initial
 state. Reported totals (523 states for ``fixed``) are the aggregate across the
@@ -172,6 +173,9 @@ class State:
     epoch_have: bool = True
     epoch_anchor_playhead: int = 100
     epoch_anchor_frame: int = 0
+    play_epoch: int = 0
+    held_source: int = 80
+    held_source_play_epoch: int = 0
     frame_index: int = 0
     phase: int = 0
     captured_config: int = -1
@@ -179,11 +183,14 @@ class State:
     snapshot_seek_generation: int = -1
     snapshot_identity_generation: int = -1
     snapshot_source: int = -1
+    snapshot_source_play_epoch: int = -1
     selected_playhead: int = -1
     selected_seek_generation: int = -1
     selected_identity_generation: int = -1
     selected_source: int = -1
+    selected_source_play_epoch: int = -1
     selected_hold_last: bool = False
+    selected_placeholder: bool = False
     lease_active: bool = False
     lease_playhead: int = -1
     lease_seek_generation: int = -1
@@ -205,7 +212,7 @@ class Violation:
     reason: str
 
 
-def epoch_reset(state: State, mutate_f1: bool) -> State:
+def epoch_reset(state: State, mutate_f1: bool, mutate_hold_cache_clear: bool) -> State:
     state = replace(
         state,
         config_generation=(
@@ -214,13 +221,29 @@ def epoch_reset(state: State, mutate_f1: bool) -> State:
     )
     if state.lease_active:
         return replace(state, pending_epoch_reset=True)
-    return replace(state, epoch_have=False)
+    return replace(
+        state,
+        epoch_have=False,
+        play_epoch=state.play_epoch + 1,
+        held_source=(state.held_source if mutate_hold_cache_clear else -1),
+        held_source_play_epoch=(
+            state.held_source_play_epoch if mutate_hold_cache_clear else -1
+        ),
+    )
 
 
 def render_identity(state: State) -> str:
-    kind = "hold-last" if state.selected_hold_last else "exact"
+    kind = (
+        "hold-last"
+        if state.selected_hold_last
+        else "placeholder"
+        if state.selected_placeholder
+        else "exact"
+    )
     return (
         f"{kind}(source={state.selected_source},"
+        f"source_epoch={state.selected_source_play_epoch},"
+        f"play_epoch={state.play_epoch},"
         f"seek={state.selected_seek_generation},"
         f"identity={state.selected_identity_generation})"
     )
@@ -236,6 +259,8 @@ def violation_at_completion(state: State, sampled: int, scenario: Scenario) -> O
         reasons.append("selected seek generation is stale")
     if state.selected_identity_generation != state.lease_identity_generation:
         reasons.append("rendered identity generation is stale")
+    if state.selected_source_play_epoch != state.play_epoch:
+        reasons.append("selected source belongs to a prior play epoch")
     if not reasons:
         return None
     return Violation(
@@ -251,18 +276,19 @@ def violation_at_completion(state: State, sampled: int, scenario: Scenario) -> O
     )
 
 
-def mutation_flags(mode: str, scenario: Scenario) -> tuple[bool, bool]:
+def mutation_flags(mode: str, scenario: Scenario) -> tuple[bool, bool, bool]:
     mutate_f1 = mode == "mut_f1"
     mutate_f2 = (
         scenario.f2_owner
         and mode == f"mut_f2_{scenario.actor.key}"
     )
-    return mutate_f1, mutate_f2
+    mutate_hold_cache_clear = mode == "mut_hold_cache_clear"
+    return mutate_f1, mutate_f2, mutate_hold_cache_clear
 
 
 def actions(state: State, scenario: Scenario, mode: str):
     out = []
-    mutate_f1, mutate_f2 = mutation_flags(mode, scenario)
+    mutate_f1, mutate_f2, mutate_hold_cache_clear = mutation_flags(mode, scenario)
 
     # The generation recheck and lease acquisition are distinct modeled phases
     # for observability, but both execute under OutputRuntime::m_mutex. A commit
@@ -279,7 +305,7 @@ def actions(state: State, scenario: Scenario, mode: str):
             committed_identity_generation=scenario.actor.identity_generation,
         )
         if not mutate_f2:
-            committed = epoch_reset(committed, mutate_f1)
+            committed = epoch_reset(committed, mutate_f1, mutate_hold_cache_clear)
         label = (
             f"actor.{scenario.actor.key}.commitOutputStateLocked"
             + (" [F2 RESET OMITTED]" if mutate_f2 else "+resetPlayEpoch")
@@ -296,8 +322,10 @@ def actions(state: State, scenario: Scenario, mode: str):
         )
     elif state.phase == 1:
         source = state.committed_playhead
+        source_play_epoch = state.play_epoch
         if scenario.hold_last:
-            source = state.committed_playhead - 20
+            source = state.held_source
+            source_play_epoch = state.held_source_play_epoch
         out.append(
             (
                 "output.providerCall",
@@ -308,14 +336,18 @@ def actions(state: State, scenario: Scenario, mode: str):
                     snapshot_seek_generation=state.committed_seek_generation,
                     snapshot_identity_generation=state.committed_identity_generation,
                     snapshot_source=source,
+                    snapshot_source_play_epoch=source_play_epoch,
                 ),
                 None,
             )
         )
     elif state.phase == 2:
+        selecting_hold_last = scenario.hold_last and state.snapshot_source >= 0
         out.append(
             (
                 "output.selectIdentity[hold-last]"
+                if selecting_hold_last
+                else "output.selectIdentity[placeholder]"
                 if scenario.hold_last
                 else "output.selectIdentity[exact]",
                 replace(
@@ -324,8 +356,18 @@ def actions(state: State, scenario: Scenario, mode: str):
                     selected_playhead=state.snapshot_playhead,
                     selected_seek_generation=state.snapshot_seek_generation,
                     selected_identity_generation=state.snapshot_identity_generation,
-                    selected_source=state.snapshot_source,
-                    selected_hold_last=scenario.hold_last,
+                    selected_source=(
+                        state.snapshot_source
+                        if selecting_hold_last or not scenario.hold_last
+                        else state.snapshot_playhead
+                    ),
+                    selected_source_play_epoch=(
+                        state.snapshot_source_play_epoch
+                        if selecting_hold_last or not scenario.hold_last
+                        else state.play_epoch
+                    ),
+                    selected_hold_last=selecting_hold_last,
+                    selected_placeholder=scenario.hold_last and not selecting_hold_last,
                 ),
                 None,
             )
@@ -378,12 +420,24 @@ def actions(state: State, scenario: Scenario, mode: str):
         # still true, and only then is the lease/barrier cleared.
         if state.pending_epoch_reset:
             epoch_have = False
+        play_epoch = state.play_epoch + (1 if state.pending_epoch_reset else 0)
+        held_source = state.held_source
+        held_source_play_epoch = state.held_source_play_epoch
+        if not state.selected_hold_last and not state.selected_placeholder:
+            held_source = state.selected_source
+            held_source_play_epoch = state.selected_source_play_epoch
+        if state.pending_epoch_reset and not mutate_hold_cache_clear:
+            held_source = -1
+            held_source_play_epoch = -1
         completed = replace(
             state,
             phase=0,
             lease_active=False,
             pending_epoch_reset=False,
             epoch_have=epoch_have,
+            play_epoch=play_epoch,
+            held_source=held_source,
+            held_source_play_epoch=held_source_play_epoch,
             epoch_anchor_playhead=epoch_anchor_playhead,
             epoch_anchor_frame=epoch_anchor_frame,
             frame_index=state.frame_index + 1,
@@ -458,7 +512,9 @@ def run(mode: str) -> bool:
     return False
 
 
-MUTANTS = ("mut_f1",) + tuple(f"mut_f2_{actor.key}" for actor in ACTORS)
+MUTANTS = ("mut_f1", "mut_hold_cache_clear") + tuple(
+    f"mut_f2_{actor.key}" for actor in ACTORS
+)
 MODES = ("fixed",) + MUTANTS
 
 
