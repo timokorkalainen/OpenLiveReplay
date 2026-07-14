@@ -127,8 +127,11 @@ Windows MinGW, from Git Bash after the Windows dependency setup:
 ```sh
 cmake --preset windows-mingw-debug
 cmake --build --preset windows-mingw-debug --target OpenLiveReplay
-./build/debug/OpenLiveReplay.exe
 ```
+
+Launch the result with the `OpenLiveReplay: Launch (Windows MinGW)` VS Code
+debug configuration. It supplies the controlled Qt, FFmpeg, and SRT runtime
+paths; the build-tree executable is not a supported direct terminal launch.
 
 Release packaging scripts remain available for local package checks:
 

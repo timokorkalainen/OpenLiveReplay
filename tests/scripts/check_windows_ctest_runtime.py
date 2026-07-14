@@ -232,6 +232,10 @@ def check_source_policy(root: Path) -> None:
             root / "tests/e2e/SRT_README.md",
             r"(?m)^\s*ctest\s",
         ),
+        "raw Windows application documentation launch": (
+            root / "docs/build-and-run.md",
+            r"(?mi)^\s*(?:\.{0,2}[/\\])?[^\r\n]*OpenLiveReplay\.exe(?:\s|$)",
+        ),
         "pre-push bypass": (
             root / ".githooks/pre-push",
             r'(?m)^\s*(?!command ctest "\$@"\s*$)'
