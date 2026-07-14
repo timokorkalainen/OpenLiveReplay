@@ -28,11 +28,14 @@
 
 #include <memory>
 #include <array>
+#include <atomic>
 #include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
+#include <vector>
 
 #ifdef OLR_UNIT_TEST
 struct GpuDeviceLossMonitorTestAuthority {
@@ -192,6 +195,51 @@ private:
     int m_waitCalls = 0;
     mutable int m_completedCalls = 0;
     mutable bool m_completedSawUnlockedRetainer = false;
+};
+
+class ConcurrentFence final : public GpuFence {
+public:
+    ConcurrentFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override { return m_signalled.fetch_add(1, std::memory_order_acq_rel) + 1; }
+    bool wait(uint64_t value, int) override {
+        return m_completed.load(std::memory_order_acquire) >= value;
+    }
+    uint64_t completedValue() const override {
+        m_completedCalls.fetch_add(1, std::memory_order_relaxed);
+        return m_completed.load(std::memory_order_acquire);
+    }
+
+    void advanceToSignalled() noexcept {
+        m_completed.store(m_signalled.load(std::memory_order_acquire), std::memory_order_release);
+    }
+    void resetCompletedCalls() noexcept { m_completedCalls.store(0, std::memory_order_relaxed); }
+    int completedCalls() const noexcept { return m_completedCalls.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<uint64_t> m_signalled{0};
+    std::atomic<uint64_t> m_completed{0};
+    mutable std::atomic<int> m_completedCalls{0};
+};
+
+class CountingSurface final : public FakeLeaseSurface {
+public:
+    CountingSurface(void* handle, GpuSurfaceCompatibility compatibility,
+                    std::atomic<int>* destructions)
+        : FakeLeaseSurface(handle, true, compatibility), m_destructions(destructions) {}
+    ~CountingSurface() override { m_destructions->fetch_add(1, std::memory_order_relaxed); }
+
+private:
+    std::atomic<int>* m_destructions = nullptr;
+};
+
+struct ConcurrentBackendAdapter {
+    std::atomic<int>* calls = nullptr;
+    GpuSubmitOutcome operator()() noexcept {
+        calls->fetch_add(1, std::memory_order_relaxed);
+        return GpuSubmitOutcome::Submitted;
+    }
 };
 
 uint64_t registerLegacyRetire(const GpuRetireRegistry& registry,
@@ -422,6 +470,9 @@ private slots:
     void boundedWaitDoesNotHoldRetainerMutex();
     void registryDiagnosticsTrackHighWaterAndTimeouts();
     void registryRegistrationDoesNotPollDriver();
+    void shardedRegistryQueriesEachFenceOncePerDrain();
+    void shardedRegistryConcurrentPublishAndDrainIsExact();
+    void preparedPoolExhaustionRejectsBeforeDriverAcceptance();
     void fusedSubmissionRejectsIncompatibleEvidenceBeforeCallback();
     void fusedSubmissionRejectsThrowingEvidenceBeforeCallback();
     void fusedSubmissionCachesEvidenceBeforeCallback();
@@ -1436,7 +1487,11 @@ void TestGpuSurfaceLease::deadTokenAbandonsOnlyMatchingDeviceDomain() {
     const auto token = monitor.realLossToken();
     QVERIFY(token.has_value());
     QCOMPARE(token->deviceDomainId(), uintptr_t(11));
+    GpuRetireRegistry::resetStorageProbeForTest();
     QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    const GpuRetireStorageSnapshot storage = GpuRetireRegistry::storageSnapshotForTest();
+    QCOMPARE(storage.abandonmentShardVisits, uint64_t(1));
+    QCOMPARE(storage.abandonmentNodesVisited, uint64_t(1));
     QCOMPARE(deadSurface.use_count(), deadOwners);
     QVERIFY(liveSurface.use_count() > liveOwners);
 
@@ -1485,6 +1540,152 @@ void TestGpuSurfaceLease::registryRegistrationDoesNotPollDriver() {
     QVERIFY(fence->completedSawUnlockedRetainer());
     fence->setCompleted(1);
     registry.drainCompleted();
+}
+
+void TestGpuSurfaceLease::shardedRegistryQueriesEachFenceOncePerDrain() {
+    constexpr size_t fenceCount = 16;
+    constexpr size_t recordsPerFence = 4;
+    constexpr uint64_t authorityEpoch = 31;
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    std::array<std::shared_ptr<ConcurrentFence>, fenceCount> fences;
+    for (size_t i = 0; i < fenceCount; ++i)
+        fences[i] = std::make_shared<ConcurrentFence>(0x300 + i, authorityEpoch);
+
+    for (size_t fenceIndex = 0; fenceIndex < fenceCount; ++fenceIndex) {
+        for (size_t record = 0; record < recordsPerFence; ++record) {
+            auto surface = std::make_shared<FakeLeaseSurface>(
+                reinterpret_cast<void*>(0x3000 + fenceIndex * recordsPerFence + record), true,
+                GpuSurfaceCompatibility{0x300 + fenceIndex, authorityEpoch});
+            FakeBackendAdapter adapter;
+            GpuOpScope operation(fences[fenceIndex], registry);
+            const auto result = operation.submit(
+                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+            QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+        }
+    }
+
+    for (const auto& fence : fences)
+        fence->resetCompletedCalls();
+    registry.drainCompleted();
+    for (const auto& fence : fences)
+        QCOMPARE(fence->completedCalls(), 1);
+
+    for (const auto& fence : fences) {
+        fence->advanceToSignalled();
+        fence->resetCompletedCalls();
+    }
+    registry.drainCompleted();
+    for (const auto& fence : fences)
+        QCOMPARE(fence->completedCalls(), 1);
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::shardedRegistryConcurrentPublishAndDrainIsExact() {
+    constexpr int producerCount = 8;
+    constexpr int fenceCount = 16;
+    constexpr int recordsPerProducer = 64;
+    constexpr int totalRecords = producerCount * recordsPerProducer;
+    constexpr uint64_t authorityEpoch = 37;
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    std::array<std::shared_ptr<ConcurrentFence>, fenceCount> fences;
+    for (int i = 0; i < fenceCount; ++i)
+        fences[size_t(i)] = std::make_shared<ConcurrentFence>(0x400 + uintptr_t(i), authorityEpoch);
+
+    std::atomic<int> callbacks{0};
+    std::atomic<int> published{0};
+    std::atomic<int> destroyed{0};
+    std::atomic<int> producersDone{0};
+    std::vector<std::thread> producers;
+    producers.reserve(producerCount);
+    for (int producer = 0; producer < producerCount; ++producer) {
+        producers.emplace_back([&, producer]() {
+            for (int record = 0; record < recordsPerProducer; ++record) {
+                const int fenceIndex = (producer * recordsPerProducer + record) % fenceCount;
+                const uintptr_t domain = 0x400 + uintptr_t(fenceIndex);
+                auto surface = std::make_shared<CountingSurface>(
+                    reinterpret_cast<void*>(
+                        uintptr_t(0x4000 + producer * recordsPerProducer + record)),
+                    GpuSurfaceCompatibility{domain, authorityEpoch}, &destroyed);
+                ConcurrentBackendAdapter adapter{&callbacks};
+                GpuOpScope operation(fences[size_t(fenceIndex)], registry);
+                const auto result = operation.submit(
+                    adapter,
+                    GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+                if (result.retirement == GpuRetirementDisposition::Published)
+                    published.fetch_add(1, std::memory_order_relaxed);
+            }
+            producersDone.fetch_add(1, std::memory_order_release);
+        });
+    }
+
+    std::thread drainer([&]() {
+        do {
+            for (const auto& fence : fences)
+                fence->advanceToSignalled();
+            registry.drainCompleted();
+            std::this_thread::yield();
+        } while (producersDone.load(std::memory_order_acquire) != producerCount ||
+                 registry.diagnostics().pendingRetains != 0);
+    });
+
+    for (auto& producer : producers)
+        producer.join();
+    drainer.join();
+    for (const auto& fence : fences)
+        fence->advanceToSignalled();
+    registry.drainCompleted();
+
+    QCOMPARE(callbacks.load(std::memory_order_relaxed), totalRecords);
+    QCOMPARE(published.load(std::memory_order_relaxed), totalRecords);
+    QCOMPARE(destroyed.load(std::memory_order_relaxed), totalRecords);
+    QCOMPARE(registry.diagnostics().pendingRetains, qsizetype(0));
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::preparedPoolExhaustionRejectsBeforeDriverAcceptance() {
+    constexpr uintptr_t deviceDomain = 0x510;
+    constexpr uint64_t authorityEpoch = 41;
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    auto fence = std::make_shared<ConcurrentFence>(deviceDomain, authorityEpoch);
+    std::atomic<int> callbacks{0};
+    std::atomic<int> destroyed{0};
+    const size_t capacity = GpuRetireRegistry::poolCapacityPerShardForTest();
+    QVERIFY(capacity > 0);
+    GpuRetireRegistry::resetStorageProbeForTest();
+
+    for (size_t i = 0; i < capacity; ++i) {
+        auto surface = std::make_shared<CountingSurface>(
+            reinterpret_cast<void*>(0x5100 + i),
+            GpuSurfaceCompatibility{deviceDomain, authorityEpoch}, &destroyed);
+        ConcurrentBackendAdapter adapter{&callbacks};
+        GpuOpScope operation(fence, registry);
+        const auto result = operation.submit(
+            adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+        QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+    }
+
+    auto overflowSurface = std::make_shared<CountingSurface>(
+        reinterpret_cast<void*>(0x5FFF), GpuSurfaceCompatibility{deviceDomain, authorityEpoch},
+        &destroyed);
+    ConcurrentBackendAdapter overflowAdapter{&callbacks};
+    GpuOpScope overflowOperation(fence, registry);
+    const auto overflowResult = overflowOperation.submit(
+        overflowAdapter,
+        GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{overflowSurface}));
+    QCOMPARE(overflowResult.outcome, GpuSubmitOutcome::NotSubmitted);
+    QCOMPARE(overflowResult.retirement, GpuRetirementDisposition::None);
+    QCOMPARE(callbacks.load(std::memory_order_relaxed), int(capacity));
+    QCOMPARE(GpuRetireRegistry::storageSnapshotForTest().poolExhaustions, uint64_t(1));
+
+    overflowSurface.reset();
+    fence->advanceToSignalled();
+    registry.drainCompleted();
+    QCOMPARE(destroyed.load(std::memory_order_relaxed), int(capacity + 1));
+    QCOMPARE(registry.diagnostics().pendingRetains, qsizetype(0));
+    GpuGenerationCounter::instance().resetForTest();
 }
 
 QTEST_GUILESS_MAIN(TestGpuSurfaceLease)

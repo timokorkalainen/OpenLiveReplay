@@ -3,11 +3,13 @@
 
 #include <QtGlobal>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
 
+#include "playback/gpu/gpureadbackretainer.h"
 #include "playback/gpu/gpusubmission.h"
 
 class DeadDeviceToken;
@@ -47,14 +49,18 @@ public:
     static void failNextStorageAllocationForTest() noexcept;
     static void resetAllocationProbeForTest() noexcept;
     static GpuRetireAllocationSnapshot allocationSnapshotForTest() noexcept;
+    static void resetStorageProbeForTest() noexcept;
+    static GpuRetireStorageSnapshot storageSnapshotForTest() noexcept;
+    static size_t poolCapacityPerShardForTest() noexcept;
 #endif
 
 private:
     friend class GpuOpScope;
+    friend class GpuReadbackRetainer;
 #ifdef OLR_UNIT_TEST
     friend struct GpuRetireRegistryTestAuthority;
-#endif
     void registerRetire(std::shared_ptr<GpuSurface> surface, GpuRetirementTicket ticket) const;
+#endif
     class AllocationPhaseScope final {
     public:
         AllocationPhaseScope(const AllocationPhaseScope&) = delete;
@@ -85,14 +91,12 @@ private:
 
     private:
         friend class GpuRetireRegistry;
-        PreparedBatch(const GpuRetireRegistry* registry, uint16_t slot,
-                      uint64_t reservation) noexcept
-            : m_registry(registry), m_slot(slot), m_reservation(reservation) {}
+        PreparedBatch(const GpuRetireRegistry* registry, GpuRetirePreparedHandle handle) noexcept
+            : m_registry(registry), m_handle(handle) {}
         void reset() noexcept;
 
         const GpuRetireRegistry* m_registry = nullptr;
-        uint16_t m_slot = 0;
-        uint64_t m_reservation = 0;
+        GpuRetirePreparedHandle m_handle;
         bool m_accepted = false;
     };
 
@@ -103,7 +107,7 @@ private:
     bool publishPrepared(PreparedBatch& prepared, GpuRetirementTicket ticket) const noexcept;
     void quarantinePrepared(PreparedBatch& prepared) const noexcept;
     void releasePrepared(PreparedBatch& prepared) const noexcept;
-    void noteSignalFailure() const;
+    void noteSignalFailure() const noexcept;
 };
 
 #endif // OLR_GPU_RETIRE_REGISTRY_H
