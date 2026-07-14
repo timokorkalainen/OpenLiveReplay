@@ -1,5 +1,31 @@
 include_guard(GLOBAL)
 
+function(_olr_prepend_test_environment test_name variable prefix)
+    get_property(_olr_environment TEST "${test_name}" PROPERTY ENVIRONMENT)
+    set(_olr_existing_value "")
+    set(_olr_filtered_environment "")
+    foreach(_olr_entry IN LISTS _olr_environment)
+        if(_olr_entry MATCHES "^${variable}=(.*)$")
+            if(_olr_existing_value STREQUAL "")
+                set(_olr_existing_value "${CMAKE_MATCH_1}")
+            else()
+                string(APPEND _olr_existing_value ";${CMAKE_MATCH_1}")
+            endif()
+        else()
+            list(APPEND _olr_filtered_environment "${_olr_entry}")
+        endif()
+    endforeach()
+
+    set(_olr_value "${prefix}")
+    if(NOT _olr_existing_value STREQUAL "")
+        string(APPEND _olr_value ";${_olr_existing_value}")
+    endif()
+    string(REPLACE ";" "\\;" _olr_value "${_olr_value}")
+    list(APPEND _olr_filtered_environment "${variable}=${_olr_value}")
+    set_property(TEST "${test_name}" PROPERTY ENVIRONMENT
+        "${_olr_filtered_environment}")
+endfunction()
+
 function(_olr_validate_windows_test_runtime)
     get_property(_olr_validated GLOBAL
         PROPERTY OLR_WINDOWS_TEST_RUNTIME_VALIDATED)
@@ -59,6 +85,7 @@ function(olr_configure_windows_test_runtime)
         "${OLR_FFMPEG_ROOT}/lib"
         "${OLR_SRT_ROOT}/bin"
         "${OLR_SRT_ROOT}/lib")
+    set(_olr_qml_dir "$<TARGET_FILE_DIR:Qt6::Core>/../qml")
 
     foreach(test_name IN LISTS ARG_TESTS)
         get_property(_olr_test_environment TEST "${test_name}"
@@ -78,6 +105,11 @@ function(olr_configure_windows_test_runtime)
                     ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:${runtime_dir}")
             endforeach()
+            foreach(_olr_qml_variable IN ITEMS QML_IMPORT_PATH QML2_IMPORT_PATH)
+                set_property(TEST "${test_name}" APPEND PROPERTY
+                    ENVIRONMENT_MODIFICATION
+                    "${_olr_qml_variable}=path_list_prepend:${_olr_qml_dir}")
+            endforeach()
         else()
             list(JOIN _olr_runtime_dirs ";" _olr_runtime_path)
             string(APPEND _olr_runtime_path ";$ENV{PATH}")
@@ -85,6 +117,10 @@ function(olr_configure_windows_test_runtime)
                 "${_olr_runtime_path}")
             set_property(TEST "${test_name}" APPEND PROPERTY ENVIRONMENT
                 "PATH=${_olr_runtime_path}")
+            foreach(_olr_qml_variable IN ITEMS QML_IMPORT_PATH QML2_IMPORT_PATH)
+                _olr_prepend_test_environment(
+                    "${test_name}" "${_olr_qml_variable}" "${_olr_qml_dir}")
+            endforeach()
         endif()
     endforeach()
 endfunction()

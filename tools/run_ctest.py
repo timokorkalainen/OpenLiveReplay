@@ -86,6 +86,7 @@ def prepare_windows_runtime(
         ("SRT libraries", srt_root / "lib"),
     )
     qt_plugins = qt_root / "plugins"
+    qt_qml = qt_root / "qml"
 
     # CMake records the authoritative CTest path in normal build trees. Older
     # caches may omit it, so fall back to the sibling executable beside CMake.
@@ -96,7 +97,11 @@ def prepare_windows_runtime(
         else Path(cache["CMAKE_COMMAND"]).with_name("ctest.exe")
     )
 
-    for label, path in (*runtime_dirs, ("Qt plugins", qt_plugins)):
+    for label, path in (
+        *runtime_dirs,
+        ("Qt plugins", qt_plugins),
+        ("Qt QML imports", qt_qml),
+    ):
         if not path.is_dir():
             raise FileNotFoundError(f"{label} directory does not exist: {path}")
     if not ctest.is_file():
@@ -109,6 +114,11 @@ def prepare_windows_runtime(
     env["PATH"] = os.pathsep.join(path_entries)
     env["QT_PLUGIN_PATH"] = str(qt_plugins)
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    for variable in ("QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
+        qml_entries = [str(qt_qml)]
+        if env.get(variable):
+            qml_entries.append(env[variable])
+        env[variable] = os.pathsep.join(qml_entries)
 
     return env, ctest
 

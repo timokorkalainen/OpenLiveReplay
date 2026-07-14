@@ -1121,6 +1121,14 @@ endif()
 
 if(OLR_BUILD_GPU_PROBES AND NOT IOS)
     add_subdirectory(tests/probes)
+    if(WIN32 AND OLR_BUILD_TESTS)
+        include("${CMAKE_SOURCE_DIR}/cmake/OlrTestRuntime.cmake")
+        add_test(NAME rhi_d3d_probe COMMAND $<TARGET_FILE:rhi_d3d_probe>)
+        set_tests_properties(rhi_d3d_probe PROPERTIES
+            LABELS "gpu-probe"
+            TIMEOUT 30)
+        olr_configure_windows_test_runtime(TESTS rhi_d3d_probe)
+    endif()
 endif()
 
 # libFuzzer harnesses for the untrusted-input parsers (opt-in; needs clang +

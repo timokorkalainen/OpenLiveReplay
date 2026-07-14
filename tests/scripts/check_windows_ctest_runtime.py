@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 
@@ -48,7 +50,7 @@ def normalize_path(value: str | Path) -> str:
 
 def configured_runtime(
     cache: dict[str, str], qt_runtime_dir: Path, qt_plugin_dir: Path
-) -> tuple[tuple[Path, ...], Path]:
+) -> tuple[tuple[Path, ...], Path, Path]:
     compiler = Path(require_cache_value(cache, "CMAKE_CXX_COMPILER"))
     if not compiler.is_file():
         raise SystemExit(f"CMake compiler does not exist: {compiler}")
@@ -69,24 +71,35 @@ def configured_runtime(
         require_directory("SRT libraries", srt_root / "lib"),
     )
     plugins = require_directory("Qt plugins", qt_plugin_dir)
-    return runtime_dirs, plugins
+    qml = require_directory("Qt QML imports", qt_runtime_dir.parent / "qml")
+    return runtime_dirs, plugins, qml
 
 
-def parse_verbose_runtime(output: str) -> tuple[dict[str, str], list[str]]:
+def parse_verbose_runtime(output: str) -> tuple[dict[str, str], dict[str, list[str]]]:
     environment: dict[str, str] = {}
-    modifications: list[str] = []
+    modifications: dict[str, list[str]] = {}
     for line in output.splitlines():
         test_number, separator, detail = line.partition(":")
         if not separator or not test_number.strip().isdigit():
             continue
         entry = detail.strip()
-        modification_prefix = "PATH=path_list_prepend:"
-        if entry.startswith(modification_prefix):
-            modifications.append(entry.removeprefix(modification_prefix))
-            continue
-        key, value_separator, value = entry.partition("=")
-        if value_separator and key in {"PATH", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM"}:
-            environment[key] = value
+        for key in ("PATH", "QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
+            modification_prefix = f"{key}=path_list_prepend:"
+            if entry.startswith(modification_prefix):
+                modifications.setdefault(key, []).append(
+                    entry.removeprefix(modification_prefix)
+                )
+                break
+        else:
+            key, value_separator, value = entry.partition("=")
+            if value_separator and key in {
+                "PATH",
+                "QT_PLUGIN_PATH",
+                "QT_QPA_PLATFORM",
+                "QML_IMPORT_PATH",
+                "QML2_IMPORT_PATH",
+            }:
+                environment[key] = value
     return environment, modifications
 
 
@@ -102,7 +115,9 @@ def require_path_prefix(label: str, value: str, expected: tuple[Path, ...]) -> N
         )
 
 
-def check_effective_environment(runtime_dirs: tuple[Path, ...], plugins: Path) -> None:
+def check_effective_environment(
+    runtime_dirs: tuple[Path, ...], plugins: Path, qml: Path
+) -> None:
     require_path_prefix("effective PATH", os.environ.get("PATH", ""), runtime_dirs)
     actual_plugins = os.environ.get("QT_PLUGIN_PATH", "")
     if not actual_plugins or normalize_path(actual_plugins) != normalize_path(plugins):
@@ -114,63 +129,197 @@ def check_effective_environment(runtime_dirs: tuple[Path, ...], plugins: Path) -
         raise SystemExit(
             f"effective QT_QPA_PLATFORM mismatch: expected offscreen, got {actual_qpa}"
         )
+    require_path_prefix("effective QML_IMPORT_PATH", os.environ.get("QML_IMPORT_PATH", ""), (qml,))
+    require_path_prefix("effective QML2_IMPORT_PATH", os.environ.get("QML2_IMPORT_PATH", ""), (qml,))
 
 
 def check_registration(
-    ctest: Path, build_dir: Path, runtime_dirs: tuple[Path, ...], plugins: Path
+    ctest: Path,
+    build_dir: Path,
+    runtime_dirs: tuple[Path, ...],
+    plugins: Path,
+    qml: Path,
 ) -> None:
-    result = subprocess.run(
-        [
-            str(ctest),
-            "--test-dir",
-            str(build_dir),
-            "-N",
-            "-V",
-            "-R",
-            "^tst_muxer$",
-        ],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    environment, modifications = parse_verbose_runtime(result.stdout)
-
-    if modifications:
-        effective_order: list[str] = []
-        for runtime_dir in modifications:
-            effective_order.insert(0, normalize_path(runtime_dir))
-        expected_order = [normalize_path(path) for path in runtime_dirs]
-        if effective_order != expected_order:
-            raise SystemExit(
-                "registered PATH modification order mismatch:\n"
-                f"expected effective order: {expected_order}\n"
-                f"actual effective order:   {effective_order}"
-            )
-    else:
-        require_path_prefix("registered PATH", environment.get("PATH", ""), runtime_dirs)
-
-    registered_plugins = environment.get("QT_PLUGIN_PATH", "")
-    if not registered_plugins or normalize_path(registered_plugins) != normalize_path(
-        plugins
-    ):
-        raise SystemExit(
-            "registered QT_PLUGIN_PATH mismatch: "
-            f"expected {plugins}, got {registered_plugins}"
+    for test_name in ("tst_muxer", "tst_qml_codecsettings", "tst_olrstyle"):
+        result = subprocess.run(
+            [
+                str(ctest),
+                "--test-dir",
+                str(build_dir),
+                "-N",
+                "-V",
+                "-R",
+                f"^{test_name}$",
+            ],
+            text=True,
+            capture_output=True,
+            check=True,
         )
-    if environment.get("QT_QPA_PLATFORM") != "offscreen":
-        raise SystemExit("registered QT_QPA_PLATFORM is not exactly offscreen")
+        environment, modifications = parse_verbose_runtime(result.stdout)
+
+        if modifications.get("PATH"):
+            effective_order: list[str] = []
+            for runtime_dir in modifications["PATH"]:
+                effective_order.insert(0, normalize_path(runtime_dir))
+            expected_order = [normalize_path(path) for path in runtime_dirs]
+            if effective_order != expected_order:
+                raise SystemExit(
+                    f"{test_name} registered PATH modification order mismatch:\n"
+                    f"expected effective order: {expected_order}\n"
+                    f"actual effective order:   {effective_order}"
+                )
+        else:
+            require_path_prefix(
+                f"{test_name} registered PATH",
+                environment.get("PATH", ""),
+                runtime_dirs,
+            )
+
+        registered_plugins = environment.get("QT_PLUGIN_PATH", "")
+        if not registered_plugins or normalize_path(registered_plugins) != normalize_path(
+            plugins
+        ):
+            raise SystemExit(
+                f"{test_name} registered QT_PLUGIN_PATH mismatch: "
+                f"expected {plugins}, got {registered_plugins}"
+            )
+        if environment.get("QT_QPA_PLATFORM") != "offscreen":
+            raise SystemExit(
+                f"{test_name} registered QT_QPA_PLATFORM is not exactly offscreen"
+            )
+        for variable in ("QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
+            if modifications.get(variable):
+                actual = tuple(Path(value) for value in reversed(modifications[variable]))
+                require_path_prefix(
+                    f"{test_name} registered {variable} modification",
+                    os.pathsep.join(str(path) for path in actual),
+                    (qml,),
+                )
+            else:
+                require_path_prefix(
+                    f"{test_name} registered {variable}",
+                    environment.get(variable, ""),
+                    (qml,),
+                )
+
+
+def scan_policy_violations(
+    checks: dict[str, tuple[Path, str]],
+) -> list[str]:
+    """Return source-policy matches with stable file and line diagnostics."""
+    failures: list[str] = []
+    for label, (path, pattern) in checks.items():
+        candidates = (
+            sorted(candidate for candidate in path.rglob("*") if candidate.is_file())
+            if path.is_dir()
+            else [path]
+        )
+        for candidate in candidates:
+            text = candidate.read_text(encoding="utf-8")
+            for match in re.finditer(pattern, text):
+                line = text.count("\n", 0, match.start()) + 1
+                failures.append(f"{label}: {candidate}:{line}: {match.group(0).strip()}")
+    return failures
+
+
+def check_source_policy(root: Path) -> None:
+    checks = {
+        "raw test executable": (
+            root / "docs/superpowers/plans",
+            r"tst_[A-Za-z0-9_]+\.exe",
+        ),
+        "raw Windows SRT documentation CTest": (
+            root / "tests/e2e/SRT_README.md",
+            r"(?m)^\s*ctest\s",
+        ),
+        "pre-push bypass": (
+            root / ".githooks/pre-push",
+            r'(?m)^\s*(?!command ctest "\$@"\s*$)'
+            r'(?:[A-Za-z_][A-Za-z0-9_]*="\$\()?'
+            r'(?:command\s+)?ctest\s',
+        ),
+    }
+    failures = scan_policy_violations(checks)
+
+    tasks = json.loads((root / ".vscode/tasks.json").read_text(encoding="utf-8"))
+    for task in tasks.get("tasks", []):
+        if task.get("command") != "ctest":
+            continue
+        windows = task.get("windows", {})
+        windows_args = windows.get("args", [])
+        if (
+            task.get("type") != "process"
+            or windows.get("command") != "python"
+            or not any(str(arg).endswith("tools/run_ctest.py") for arg in windows_args)
+        ):
+            failures.append("plain Windows VS Code CTest launch: .vscode/tasks.json")
+
+    workflow_paths = sorted((root / ".github/workflows").glob("*.y*ml"))
+    windows_job_count = 0
+    for workflow_path in workflow_paths:
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for windows_job_match in re.finditer(
+            r"(?ms)^  [A-Za-z0-9_-]+:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            workflow,
+        ):
+            windows_job = windows_job_match.group(1)
+            if not re.search(r"(?m)^\s*runs-on:\s*windows", windows_job):
+                continue
+            windows_job_count += 1
+            raw_launch_pattern = (
+                r"(?m)^\s*(?:(?:run:\s*)?(?:command\s+)?ctest\s|"
+                r'"?\$\{?[A-Za-z_][A-Za-z0-9_]*(?:test|probe|app|exe|binary)'
+                r'[A-Za-z0-9_]*\}?"?(?:\s|$)|'
+                r'(?:[A-Za-z]:)?[/\\][^\s]*(?:tst_|rhi_|OpenLiveReplay)'
+                r"[^\s]*\.exe(?:\s|$))"
+            )
+            for match in re.finditer(raw_launch_pattern, windows_job, re.IGNORECASE):
+                line = (
+                    workflow.count(
+                        "\n", 0, windows_job_match.start(1) + match.start()
+                    )
+                    + 1
+                )
+                failures.append(
+                    "raw Windows CI test/probe launch: "
+                    f"{workflow_path.relative_to(root)}:{line}: "
+                    f"{match.group(0).strip()}"
+                )
+    if not windows_job_count:
+        failures.append("Windows CI job not found: .github/workflows")
+
+    launch_text = (root / ".vscode/launch.json").read_text(encoding="utf-8")
+    launch = json.loads(re.sub(r"(?m)^\s*//.*$", "", launch_text))
+    for configuration in launch.get("configurations", []):
+        if configuration.get("type") == "qml" and configuration.get("request") == "launch":
+            failures.append(
+                "ambient Windows QML app launch: .vscode/launch.json: "
+                f"{configuration.get('name', '<unnamed>')}"
+            )
+
+    if failures:
+        raise SystemExit("\n".join(failures))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--build-dir", type=Path, required=True)
-    parser.add_argument("--qt-runtime-dir", type=Path, required=True)
-    parser.add_argument("--qt-plugin-dir", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--build-dir", type=Path)
+    parser.add_argument("--qt-runtime-dir", type=Path)
+    parser.add_argument("--qt-plugin-dir", type=Path)
     args = parser.parse_args()
+
+    if args.source_root is not None:
+        check_source_policy(args.source_root.resolve())
+        return 0
+    if args.build_dir is None or args.qt_runtime_dir is None or args.qt_plugin_dir is None:
+        parser.error(
+            "runtime mode requires --build-dir, --qt-runtime-dir, and --qt-plugin-dir"
+        )
 
     build_dir = require_directory("CMake build", args.build_dir)
     cache = read_cmake_cache(build_dir / "CMakeCache.txt")
-    runtime_dirs, plugins = configured_runtime(
+    runtime_dirs, plugins, qml = configured_runtime(
         cache, args.qt_runtime_dir, args.qt_plugin_dir
     )
     ctest_value = cache.get("CMAKE_CTEST_COMMAND", "").strip()
@@ -182,8 +331,8 @@ def main() -> int:
     if not ctest.is_file():
         raise SystemExit(f"CTest executable does not exist: {ctest}")
 
-    check_effective_environment(runtime_dirs, plugins)
-    check_registration(ctest, build_dir, runtime_dirs, plugins)
+    check_effective_environment(runtime_dirs, plugins, qml)
+    check_registration(ctest, build_dir, runtime_dirs, plugins, qml)
     return 0
 
 

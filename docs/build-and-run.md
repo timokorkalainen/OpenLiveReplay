@@ -88,9 +88,12 @@ The repo includes committed VS Code configuration in [.vscode](../.vscode):
 - [settings.json](../.vscode/settings.json) forces CMake preset mode and copies
   `compile_commands.json` to the workspace root.
 - [tasks.json](../.vscode/tasks.json) provides the default build task
-  `CMake: build app`, a full build task, and a CTest task.
+  `CMake: build app`, a full build task, and a CTest task. On Windows the test
+  task automatically uses the repository launcher described below.
 - [launch.json](../.vscode/launch.json) provides app-specific C++ and QML debug
-  configurations using the active CMake preset.
+  configurations using the active CMake preset. Its Windows configurations
+  prepend the controlled FFmpeg and SRT runtime directories plus the active Qt
+  runtime directory to `PATH`.
 
 Use it like this:
 
@@ -199,11 +202,28 @@ cmake --build --preset macos-debug
 ctest --preset macos-debug
 ```
 
-Use the matching `linux-debug` or `windows-mingw-debug` preset on those hosts.
+Use the matching `linux-debug` preset on Linux. Windows CTest runs must use the
+repository launcher so tests inherit the compiler, Qt, controlled FFmpeg, and
+controlled SRT runtime directories recorded in the selected build tree. It
+also prepends the configured Qt QML module directory while preserving any
+test-specific QML import paths:
+
+```powershell
+python tools/run_ctest.py --test-dir build/debug --output-on-failure
+```
+
+The launcher accepts ordinary CTest arguments and returns CTest's exact exit
+code. Do not launch a Windows test executable directly. The VS Code
+`CMake: run tests (ctest)` task applies this contract automatically.
+
 For a focused unit-only run:
 
 ```sh
+# macOS / Linux
 ctest --test-dir build/debug -L unit --output-on-failure
+
+# Windows
+python tools/run_ctest.py --test-dir build/debug -L unit --output-on-failure
 ```
 
 For frame-accurate playback, jog, and scrub-preview validation, including the

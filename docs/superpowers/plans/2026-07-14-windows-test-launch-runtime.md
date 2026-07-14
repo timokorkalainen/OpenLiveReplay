@@ -156,13 +156,20 @@
 ### Task 3: Route supported launch paths through the contract
 
 **Files:**
+- Modify: `CMakeLists.txt`
+- Modify: `cmake/OlrTestRuntime.cmake`
+- Modify: `tools/run_ctest.py`
 - Modify: `.vscode/tasks.json`
 - Modify: `.vscode/launch.json`
 - Modify: `.githooks/pre-push`
 - Modify: `.github/workflows/ci.yml`
+- Modify: `.github/workflows/build.yml`
 - Modify: `docs/build-and-run.md`
 - Modify: `docs/windows-build.md`
-- Modify: `docs/superpowers/plans/2026-07-14-transport-epoch-completion.md`
+- Modify: `tests/e2e/SRT_README.md`
+- Modify: `tests/qml/CMakeLists.txt`
+- Modify: `tests/qmlstyle/CMakeLists.txt`
+- Modify: `tests/scripts/test_run_ctest.py`
 
 **Interfaces:**
 - Consumes: `python tools/run_ctest.py <ordinary ctest args>`.
@@ -170,7 +177,7 @@
 
 - [ ] **Step 1: Add a failing source-policy check**
 
-  Extend `tests/scripts/check_windows_ctest_runtime.py` to reject raw `tst_*.exe` commands in current plans, plain Windows VS Code CTest launches, raw Windows CI test/probe launches, and direct pre-push CTest calls that bypass the helper function.
+  Extend `tests/scripts/check_windows_ctest_runtime.py` to reject raw `tst_*.exe` commands in current plans, shell-based or plain Windows VS Code CTest launches, raw test/probe launches in every Windows workflow job, Windows documentation bypasses, ambient QML app launches, and direct pre-push CTest calls that bypass the helper function.
 
   ```python
   checks = {
@@ -186,11 +193,11 @@
 
   Run: `python tests/scripts/check_windows_ctest_runtime.py --source-root .`
 
-  Expected: FAIL on the transport plan's raw `tst_playbackworker.exe`, plain VS Code CTest task, direct pre-push calls, and raw CI probes/tests.
+  Expected: FAIL on any tracked direct test-executable command, the plain VS Code CTest task, direct pre-push calls, and raw CI probes/tests. The transport plan containing the known direct playback-worker launch is absent from this branch and must be corrected on its own branch.
 
 - [ ] **Step 3: Integrate the launcher**
 
-  Add a platform-aware pre-push function that calls the Python launcher on Windows and ordinary CTest elsewhere. Give the VS Code task a Windows override. Replace Windows CI raw test launches with CTest selection through the launcher and make the GPU diagnostic a registered CTest probe or give it a build-derived controlled environment. Add repository-controlled FFmpeg/SRT `bin` paths to Windows app debugging. Replace the raw transport test command and document the supported Windows syntax.
+  Register `rhi_d3d_probe` as a Windows CTest test with the controlled runtime helper. Add a platform-aware pre-push function that calls the Python launcher on Windows and ordinary CTest elsewhere. Make the VS Code task a process task with a Windows launcher override. Replace Windows CI raw test launches with CTest selection through the launcher. Add repository-controlled FFmpeg/SRT `bin` paths to Windows app debugging and remove the redundant ambient QML launch. Propagate the configured Qt QML directory through the Python launcher and registered CTest environments while preserving test-specific imports; apply the helper to all QML unit tests and retain their generated Windows plugins. Replace any tracked raw test command and document the supported Windows syntax. The transport completion plan currently lives only on its feature branch, so update it there with that branch's transport documentation task rather than fabricating an absent file in this branch.
 
   ```bash
   olr_ctest() {
@@ -204,7 +211,7 @@
 
 - [ ] **Step 4: Verify GREEN and full gates**
 
-  Run the source-policy check, Python unit tests, focused contract smoke, a clean-shell FFmpeg-linked unit, full Windows `-L unit`, `python tools/roadmap/audit.py`, `python -m unittest discover -s tools/roadmap/tests -p 'test_*.py'`, JSON parsing for VS Code files, workflow YAML parsing, shell syntax check for pre-push, and `git diff --check`.
+  Run the source-policy check, Python unit tests, focused contract smoke, a clean-shell FFmpeg-linked unit, all QML units through both the launcher and bare contained CTest, full Windows `-L unit`, `python tools/roadmap/audit.py`, the available roadmap tests, JSON parsing for VS Code files, workflow YAML parsing, shell syntax check for pre-push, and `git diff --check`.
 
 - [ ] **Step 5: Independent review and fix loop**
 
@@ -213,6 +220,6 @@
 - [ ] **Step 6: Commit**
 
   ```bash
-  git add .vscode/tasks.json .vscode/launch.json .githooks/pre-push .github/workflows/ci.yml docs/build-and-run.md docs/windows-build.md docs/superpowers/plans/2026-07-14-transport-epoch-completion.md tests/scripts/check_windows_ctest_runtime.py
+  git add CMakeLists.txt cmake/OlrTestRuntime.cmake tools/run_ctest.py .vscode/tasks.json .vscode/launch.json .githooks/pre-push .github/workflows/ci.yml .github/workflows/build.yml docs/build-and-run.md docs/windows-build.md tests/e2e/SRT_README.md tests/qml/CMakeLists.txt tests/qmlstyle/CMakeLists.txt tests/scripts/check_windows_ctest_runtime.py tests/scripts/test_run_ctest.py docs/superpowers/plans/2026-07-14-windows-test-launch-runtime.md
   git commit -m "build: standardize noninteractive Windows test launches"
   ```

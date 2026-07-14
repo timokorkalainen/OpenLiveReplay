@@ -200,21 +200,37 @@ done
 
 # Python 3 SPECIFICALLY (mirror rtmp_lib.sh:rtmp_find_python3) -- a Python-2-only
 # `python`/`py` would pass a bare presence check but make the RTMP cells SKIP.
+PYTHON_BIN=""
+PYTHON_ARGS=()
 have_python3() {
     local c
     for c in python3 python; do
         if command -v "$c" >/dev/null 2>&1 \
             && "$c" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            PYTHON_BIN="$c"
             return 0
         fi
     done
     if command -v py >/dev/null 2>&1 \
         && py -3 -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+        PYTHON_BIN="py"
+        PYTHON_ARGS=(-3)
         return 0
     fi
     return 1
 }
 have_python3 || note_missing "Python 3 not found (needed by the RTMP fixture server)"
+
+olr_ctest() {
+    case "${OSTYPE:-}" in
+        msys*|cygwin*)
+            "$PYTHON_BIN" "${PYTHON_ARGS[@]}" tools/run_ctest.py "$@"
+            ;;
+        *)
+            command ctest "$@"
+            ;;
+    esac
+}
 
 # Encoder checks need ffmpeg itself; skipped (ffmpeg already flagged above) if absent.
 if command -v ffmpeg >/dev/null 2>&1; then
@@ -259,7 +275,7 @@ cmake --build "$DELIVERY_BUILD_DIR"
 
 # --- 3. Sanity: the delivery-gate label must resolve to exactly 4 cells --------
 EXPECTED_CELLS=4
-ACTUAL_CELLS="$(ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate -N \
+ACTUAL_CELLS="$(olr_ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate -N \
     | awk '/Total Tests:/ {print $NF}')"
 if [ "${ACTUAL_CELLS:-0}" -ne "$EXPECTED_CELLS" ]; then
     echo "[pre-push] Delivery gate misconfigured: expected ${EXPECTED_CELLS} cells, found ${ACTUAL_CELLS:-0}." >&2
@@ -269,7 +285,7 @@ fi
 # --- 4. Run the delivery matrix (RTMP/SRT x h264/h265) as a BLOCKING gate ------
 echo "[pre-push] Running delivery matrix (clip=${CLIP_SECONDS}s) -- RTMP/SRT x h264/h265..."
 OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
-    ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate \
+    olr_ctest --test-dir "$DELIVERY_BUILD_DIR" -L delivery-gate \
         --output-on-failure --repeat until-pass:2 --no-tests=error
 echo "[pre-push] Delivery matrix OK."
 
@@ -297,7 +313,7 @@ if [ "${SKIP_UNIT:-0}" = "1" ]; then
     echo "[pre-push] SKIP_UNIT=1 - skipping the unit gate."
 else
     echo "[pre-push] Running unit suite (native, -L ci)..."
-    ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+    olr_ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
         -L ci -LE "$UNIT_SELECTOR_LE"
     echo "[pre-push] Unit suite OK."
 fi
@@ -307,7 +323,7 @@ if [ "${SKIP_GPU_E2E:-0}" = "1" ]; then
     echo "[pre-push] SKIP_GPU_E2E=1 - skipping GPU regression e2e."
 else
     echo "[pre-push] Running GPU regression e2e (${GPU_E2E_LABELS})..."
-    ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+    olr_ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
         --no-tests=error -L "$GPU_E2E_LABELS"
     echo "[pre-push] GPU regression e2e OK."
 fi
@@ -421,7 +437,7 @@ if [ "${SKIP_E2E:-0}" = "1" ]; then
 else
     echo "[pre-push] Running playback e2e (native speed)..."
     OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
-        ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
+        olr_ctest --test-dir "$DELIVERY_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
             --no-tests=error -R "$E2E_REGEX"
     echo "[pre-push] Native e2e OK."
 fi
@@ -446,13 +462,13 @@ else
     echo "[pre-push] Running unit suite under ASan+UBSan..."
     ASAN_OPTIONS="detect_leaks=0:abort_on_error=1" \
     UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
-        ctest --test-dir "$ASAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+        olr_ctest --test-dir "$ASAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
             -L unit -LE "$UNIT_SELECTOR_LE"
     echo "[pre-push] Running playback e2e under ASan+UBSan..."
     ASAN_OPTIONS="detect_leaks=0:abort_on_error=1" \
     UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" \
     OLR_E2E_CLIP_SECONDS="$CLIP_SECONDS" \
-        ctest --test-dir "$ASAN_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
+        olr_ctest --test-dir "$ASAN_BUILD_DIR" --output-on-failure --repeat until-pass:3 \
             --no-tests=error -R "$E2E_REGEX"
     echo "[pre-push] ASan+UBSan OK."
 fi
@@ -480,7 +496,7 @@ else
     cmake --build "$TSAN_BUILD_DIR" --target "${TSAN_TARGETS[@]}"
     echo "[pre-push] Running threading tests under TSan..."
     TSAN_OPTIONS="halt_on_error=1:suppressions=$PWD/tests/tsan.suppressions.txt" \
-        ctest --test-dir "$TSAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
+        olr_ctest --test-dir "$TSAN_BUILD_DIR" --output-on-failure --repeat until-pass:2 \
             -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest|tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode|tst_playbackworker)$'
     echo "[pre-push] TSan OK."
 fi
@@ -499,7 +515,7 @@ else
         -DOLR_GPU_PIPELINE=ON \
         -DOLR_BUILD_TESTS=ON >/dev/null
     cmake --build "$TEST_BUILD_DIR"
-    ctest --test-dir "$TEST_BUILD_DIR" --output-on-failure \
+    olr_ctest --test-dir "$TEST_BUILD_DIR" --output-on-failure \
         --repeat until-pass:2 --parallel "$CTEST_JOBS" \
         -LE 'sync-report|srt|native-apple-ingest|output-soak|ndi-output'
     echo "[pre-push] Full local CTest gate OK."

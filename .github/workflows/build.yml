@@ -101,7 +101,7 @@ jobs:
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
           cmake --build build-tests --target tst_nativeaacdecoder tst_nativevideodecoder qt_core_media_smoke
-          ctest --test-dir build-tests --output-on-failure \
+          python tools/run_ctest.py --test-dir build-tests --output-on-failure \
             -R '^(tst_nativeaacdecoder|tst_nativevideodecoder)$'
 
       - name: Run isolated Qt core-media runtime smoke

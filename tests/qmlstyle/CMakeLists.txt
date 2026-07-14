@@ -3,6 +3,7 @@
 # its -input dir recursively for tst_*.qml — does not try to run it without the style
 # modules linked.
 find_package(Qt6 REQUIRED COMPONENTS QuickTest Qml Quick Gui Test QuickControls2)
+include("${CMAKE_SOURCE_DIR}/cmake/OlrTestRuntime.cmake")
 
 qt_add_executable(tst_olrstyle tst_olrstyle_main.cpp)
 target_link_libraries(tst_olrstyle PRIVATE
@@ -90,6 +91,28 @@ set_tests_properties(tst_sourcelistpanel_layout PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+
+olr_configure_windows_test_runtime(TESTS
+    tst_olrstyle
+    tst_statusstrip_onair
+    tst_pgmstage_mapping
+    tst_rundownrail_drag
+    tst_scrubtimeline
+    tst_transportdock_layout
+    tst_sourcelistpanel_layout)
+
+if(WIN32)
+    foreach(_olr_qmlstyle_test IN ITEMS
+            tst_olrstyle
+            tst_statusstrip_onair
+            tst_pgmstage_mapping
+            tst_rundownrail_drag
+            tst_scrubtimeline
+            tst_transportdock_layout
+            tst_sourcelistpanel_layout)
+        add_dependencies(${_olr_qmlstyle_test} OlrThemeplugin OlrStyleplugin)
+    endforeach()
+endif()
 
 # Dev-only headless preview renderer (no add_test): renders a QML file under OlrStyle
 # to a PNG for visual review. Links the style modules so it never dlopens a plugin.

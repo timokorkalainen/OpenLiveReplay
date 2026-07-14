@@ -546,18 +546,7 @@ jobs:
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
         continue-on-error: true
-        run: |
-          set +e
-          probe="$(find build-tests -type f \( -name rhi_d3d_probe -o -name rhi_d3d_probe.exe \) -print -quit)"
-          if [ ! -x "$probe" ]; then
-            echo "::warning::rhi_d3d_probe executable not found"
-            find build-tests -maxdepth 2 -type f -name '*rhi*d3d*' -print || true
-            exit 0
-          fi
-          "$probe"
-          rc=$?
-          echo "rhi_d3d_probe exit code: $rc"
-          exit "$rc"
+        run: python tools/run_ctest.py --test-dir build-tests --output-on-failure --no-tests=error -R '^rhi_d3d_probe$'
 
       - name: Run Media Foundation + WARP GPU unit tests
         shell: bash
@@ -572,45 +561,12 @@ jobs:
           export OLR_REQUIRE_GPU_FENCE=1
           export OLR_REQUIRE_WARP=1
           export QT_QPA_PLATFORM=offscreen
-          to_msys() {
-            local p="${1//\\//}"
-            case "$p" in
-              [A-Za-z]:/*) p="/$(printf '%s' "${p%%:*}" | tr '[:upper:]' '[:lower:]')${p#*:}" ;;
-            esac
-            printf '%s' "$p"
-          }
-          newest() { find "$@" -maxdepth 0 -type d 2>/dev/null | sort -V | tail -1 || true; }
-          qt_root="$(to_msys "$QT_ROOT_DIR")"
-          qt_tools_dir="$(cd "$qt_root/../.." && pwd)/Tools"
-          mingw_root="$(to_msys "$(newest "$qt_tools_dir"/mingw*_64)")"
-          ffmpeg_root="$(cd windows_build/dist/ffmpeg && pwd)"
-          srt_root="$(cd windows_build/dist/srt && pwd)"
-          export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
-          ctest --test-dir build-tests --output-on-failure \
-            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge)$'
-          gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
-          if [ ! -x "$gpu_test" ]; then
-            echo "::error::tst_gpucompositor executable not found"
-            find build-tests -maxdepth 2 -type f -name '*gpucompositor*' -print || true
-            exit 127
-          fi
-          echo "Running $gpu_test with Qt=$qt_root MinGW=$mingw_root FFmpeg=$ffmpeg_root SRT=$srt_root"
-          gpu_log="$(pwd)/tst_gpucompositor.txt"
-          set +e
-          "$gpu_test" -v1 -o "$gpu_log,txt"
-          gpu_rc=$?
-          set -e
-          echo "tst_gpucompositor exit code: $gpu_rc"
-          if [ -f "$gpu_log" ]; then
-            cat "$gpu_log"
-          else
-            echo "::warning::tst_gpucompositor produced no QtTest log at $gpu_log"
-          fi
-          exit "$gpu_rc"
+          python tools/run_ctest.py --test-dir build-tests --output-on-failure \
+            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge|tst_gpucompositor)$'
 
       - name: Run static media/package smoke tests
         shell: bash
-        run: ctest --test-dir build-tests --output-on-failure --no-tests=error -L smoke -LE 'gpu-smoke|ndi-output'
+        run: python tools/run_ctest.py --test-dir build-tests --output-on-failure --no-tests=error -L smoke -LE 'gpu-smoke|ndi-output'
 
       - name: Assemble and exercise controlled Windows package
         shell: bash

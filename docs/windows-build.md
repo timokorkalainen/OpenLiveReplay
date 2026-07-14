@@ -84,7 +84,20 @@ tools:
 ```bash
 cmake --preset windows-mingw-release -DOLR_BUILD_TESTS=ON
 cmake --build --preset windows-mingw-release --target record_harness
-ctest --test-dir build -R "e2e_native_(srt|rtmp)_smoke" --output-on-failure
+python tools/run_ctest.py --test-dir build \
+  -R "e2e_native_(srt|rtmp)_smoke" --output-on-failure
+```
+
+All Windows tests and diagnostic probes must be selected through CTest via
+`tools/run_ctest.py`; do not launch their executables directly. The launcher
+uses the compiler, Qt, FFmpeg, and SRT paths recorded in `CMakeCache.txt`, sets
+the noninteractive Qt runtime, prepends Qt's QML module directory without
+discarding test-specific imports, suppresses Windows crash dialogs, and
+propagates CTest's exit code. It accepts ordinary CTest arguments, for example:
+
+```bash
+python tools/run_ctest.py --test-dir build -L unit --output-on-failure
+python tools/run_ctest.py --test-dir build -R '^rhi_d3d_probe$' --output-on-failure
 ```
 
 To verify the self-contained release package uses only the controlled FFmpeg 8
@@ -113,7 +126,10 @@ FFmpeg/SRT runtime. On failure, start with `runtime-error.txt`, then inspect
 directory. Audit ABI, path, and plugin details remain in the audit JSON.
 
 Qt Creator / VS Code can use the `windows-mingw-release` preset directly once the
-same `OLR_*` environment variables are set.
+same `OLR_*` environment variables are set. The committed VS Code test task uses
+the Windows CTest launcher, and its Windows app debug configurations prepend the
+repository's `windows_build/dist/{ffmpeg,srt}/bin` directories and active Qt
+runtime directory to `PATH`.
 
 ## Notes
 

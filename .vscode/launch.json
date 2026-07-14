@@ -32,7 +32,7 @@
         "MIMode": "gdb",
         "miDebuggerPath": "${command:qt-cpp.minGWgdb}",
         "environment": [
-          { "name": "PATH", "value": "${env:PATH};${command:qt-cpp.qtDir}" },
+          { "name": "PATH", "value": "${workspaceFolder}/windows_build/dist/ffmpeg/bin;${workspaceFolder}/windows_build/dist/srt/bin;${command:qt-cpp.qtDir};${env:PATH}" },
           { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
           { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
         ],
@@ -76,7 +76,7 @@
         "MIMode": "gdb",
         "miDebuggerPath": "${command:qt-cpp.minGWgdb}",
         "environment": [
-          { "name": "PATH", "value": "${env:PATH};${command:qt-cpp.qtDir}" },
+          { "name": "PATH", "value": "${workspaceFolder}/windows_build/dist/ffmpeg/bin;${workspaceFolder}/windows_build/dist/srt/bin;${command:qt-cpp.qtDir};${env:PATH}" },
           { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
           { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
         ],
@@ -88,13 +88,6 @@
           "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
         }
       }
-    },
-    {
-      "name": "OpenLiveReplay: QML Debugger",
-      "type": "qml",
-      "request": "launch",
-      "program": "${command:cmake.launchTargetPath}",
-      "preLaunchTask": "CMake: build app"
     }
   ]
 }

@@ -20,14 +20,24 @@
       "detail": "Build everything, including the test suite (OLR_BUILD_TESTS)"
     },
     {
-      "type": "shell",
+      "type": "process",
       "label": "CMake: run tests (ctest)",
       "command": "ctest",
       "args": ["--output-on-failure"],
       "options": { "cwd": "${command:cmake.buildDirectory}" },
+      "windows": {
+        "command": "python",
+        "args": [
+          "${workspaceFolder}/tools/run_ctest.py",
+          "--test-dir",
+          "${command:cmake.buildDirectory}",
+          "--output-on-failure"
+        ],
+        "options": { "cwd": "${workspaceFolder}" }
+      },
       "group": { "kind": "test", "isDefault": true },
       "problemMatcher": [],
-      "detail": "Run the CTest suite in the active preset's build directory"
+      "detail": "Run CTest in the active preset's build directory with the controlled Windows runtime"
     }
   ]
 }

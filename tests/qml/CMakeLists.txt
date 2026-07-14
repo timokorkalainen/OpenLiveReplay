@@ -1,5 +1,6 @@
 # QtQuickTest: QML unit tests for app components (controller-injected, no app singleton).
 find_package(Qt6 REQUIRED COMPONENTS QuickTest Qml Quick Gui Test)
+include("${CMAKE_SOURCE_DIR}/cmake/OlrTestRuntime.cmake")
 
 qt_add_executable(tst_qml_codecsettings tst_qml_main.cpp)
 target_link_libraries(tst_qml_codecsettings PRIVATE
@@ -11,3 +12,4 @@ set_tests_properties(tst_qml_codecsettings PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_SOURCE_DIR}")
+olr_configure_windows_test_runtime(TESTS tst_qml_codecsettings)

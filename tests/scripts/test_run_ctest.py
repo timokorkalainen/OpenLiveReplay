@@ -32,6 +32,7 @@ class RunCtestTests(unittest.TestCase):
             self.compiler_bin,
             self.qt_root / "bin",
             self.qt_root / "plugins",
+            self.qt_root / "qml",
             self.ffmpeg_root / "bin",
             self.ffmpeg_root / "lib",
             self.srt_root / "bin",
@@ -164,6 +165,7 @@ class RunCtestTests(unittest.TestCase):
             "compiler runtime": self.compiler_bin,
             "Qt runtime": self.qt_root / "bin",
             "Qt plugins": self.qt_root / "plugins",
+            "Qt QML imports": self.qt_root / "qml",
             "FFmpeg runtime": self.ffmpeg_root / "bin",
             "FFmpeg libraries": self.ffmpeg_root / "lib",
             "SRT runtime": self.srt_root / "bin",
@@ -196,6 +198,27 @@ class RunCtestTests(unittest.TestCase):
         self.assertEqual(env["QT_QPA_PLATFORM"], "offscreen")
         self.assertNotIn("QT_PLUGIN_PATH", inherited)
         self.assertNotIn("QT_QPA_PLATFORM", inherited)
+
+    def test_windows_runtime_prepends_qt_qml_and_preserves_inherited_paths(self):
+        inherited_qml = self.root / "inherited-qml"
+        inherited_qml2 = self.root / "inherited-qml2"
+        inherited = {
+            "QML_IMPORT_PATH": str(inherited_qml),
+            "QML2_IMPORT_PATH": str(inherited_qml2),
+        }
+
+        env, _ = run_ctest.prepare_windows_runtime(self.build_dir, inherited)
+
+        self.assertEqual(
+            env["QML_IMPORT_PATH"].split(os.pathsep),
+            [str(self.qt_root / "qml"), str(inherited_qml)],
+        )
+        self.assertEqual(
+            env["QML2_IMPORT_PATH"].split(os.pathsep),
+            [str(self.qt_root / "qml"), str(inherited_qml2)],
+        )
+        self.assertEqual(inherited["QML_IMPORT_PATH"], str(inherited_qml))
+        self.assertEqual(inherited["QML2_IMPORT_PATH"], str(inherited_qml2))
 
     def test_windows_runtime_preserves_explicit_qpa_platform(self):
         env, _ = run_ctest.prepare_windows_runtime(

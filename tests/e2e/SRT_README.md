@@ -129,8 +129,8 @@ plus separate HEVC coverage as `e2e_native_srt_hevc_smoke` under
 `native-windows-hevc`:
 
 ```powershell
-ctest --test-dir build/windows-native -C Debug -L native-windows-ingest --output-on-failure
-ctest --test-dir build/windows-native -C Debug -L native-windows-hevc   --output-on-failure
+python tools/run_ctest.py --test-dir build/windows-native -C Debug -L native-windows-ingest --output-on-failure
+python tools/run_ctest.py --test-dir build/windows-native -C Debug -L native-windows-hevc   --output-on-failure
 ```
 
 The HEVC producer is capability-gated: the script skips when local `ffmpeg` has no
