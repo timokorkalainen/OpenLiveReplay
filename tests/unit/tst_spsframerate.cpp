@@ -19,6 +19,7 @@ private slots:
     void h264CacheIgnoresVpsBytes();
     void rejectsMalformedEmulationPrevention();
     void reportsMalformedAndUnsupportedContext();
+    void multiSpsStatusIsOrderIndependent();
 };
 
 namespace {
@@ -222,6 +223,14 @@ void TestSpsFrameRate::rejectsMalformedEmulationPrevention() {
     const QByteArray terminalEscape = QByteArray::fromHex("6742001efb9080000003");
     QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {terminalEscape}));
     QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+
+    for (const QByteArray& forbidden :
+         {QByteArray::fromHex("000000"), QByteArray::fromHex("000001"),
+          QByteArray::fromHex("000002")}) {
+        const QByteArray rawSps = makeSps(8, 192) + forbidden;
+        QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {rawSps}));
+        QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+    }
 }
 
 void TestSpsFrameRate::reportsMalformedAndUnsupportedContext() {
@@ -253,6 +262,36 @@ void TestSpsFrameRate::reportsMalformedAndUnsupportedContext() {
     QVERIFY(context.h264() == nullptr);
     QVERIFY(context.hevc() != nullptr);
     QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Unsupported);
+}
+
+void TestSpsFrameRate::multiSpsStatusIsOrderIndependent() {
+    const QByteArray valid25 = makeSps(1, 50);
+    const QByteArray equivalent25 = makeSps(2, 100);
+    const QByteArray malformed = QByteArray::fromHex("6764001fac");
+    QByteArray unsupported = makeSps(1, 50);
+    unsupported[1] = char(1);
+
+    for (const QList<QByteArray>& entries :
+         {QList<QByteArray>{unsupported, malformed}, QList<QByteArray>{malformed, unsupported}}) {
+        H26xTimingContext context;
+        QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, entries));
+        QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+    }
+
+    for (const QList<QByteArray>& entries :
+         {QList<QByteArray>{valid25, equivalent25}, QList<QByteArray>{equivalent25, valid25}}) {
+        H26xTimingContext context;
+        QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, entries));
+        QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Valid);
+        QCOMPARE(context.constantFrameRate(), (FrameRateQ{25, 1}));
+    }
+
+    for (const QList<QByteArray>& entries :
+         {QList<QByteArray>{valid25, unsupported}, QList<QByteArray>{unsupported, valid25}}) {
+        H26xTimingContext context;
+        QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, entries));
+        QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Unsupported);
+    }
 }
 
 QTEST_GUILESS_MAIN(TestSpsFrameRate)

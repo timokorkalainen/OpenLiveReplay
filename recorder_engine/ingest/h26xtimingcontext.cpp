@@ -98,6 +98,22 @@ public:
         return true;
     }
 
+    bool seiPayloadAlignmentBits() {
+        const int64_t bitCount = int64_t(m_bytes.size()) * 8;
+        // Annex D adds bit_equal_to_one/zero only when the payload syntax is
+        // not already byte aligned. At an aligned position, extra bits are data.
+        if (m_bitOffset == bitCount) return true;
+        if ((m_bitOffset & 7) == 0) return false;
+
+        bool marker = false;
+        if (!bit(marker) || !marker) return false;
+        while ((m_bitOffset & 7) != 0) {
+            bool padding = false;
+            if (!bit(padding) || padding) return false;
+        }
+        return m_bitOffset == bitCount;
+    }
+
 private:
     const QByteArray& m_bytes;
     int64_t m_bitOffset = 0;
@@ -383,6 +399,10 @@ bool H26xTimingDetail::unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp)
             zeroCount = 0;
             continue;
         }
+        if (zeroCount >= 2 && value <= 0x02) {
+            rbsp.clear();
+            return false;
+        }
         decoded.append(escaped[i]);
         zeroCount = value == 0 ? zeroCount + 1 : 0;
     }
@@ -409,21 +429,31 @@ bool H26xTimingContext::updateParameterSets(NativeVideoCodec codec, const QList<
     if (codec == NativeVideoCodec::Hevc) return false;
     if (codec != NativeVideoCodec::H264 || sps.isEmpty()) return false;
 
-    H264TimingSyntax active = parseH264Sps(sps.first());
-    if (active.status != H26xTimingSyntaxStatus::Valid) {
-        m_h264 = active;
+    H264TimingSyntax active;
+    bool haveValid = false;
+    bool sawMalformed = false;
+    bool sawUnsupported = false;
+    bool sawConflictingValid = false;
+    for (const QByteArray& parameterSet : sps) {
+        const H264TimingSyntax candidate = parseH264Sps(parameterSet);
+        if (candidate.status == H26xTimingSyntaxStatus::Malformed) {
+            sawMalformed = true;
+        } else if (candidate.status == H26xTimingSyntaxStatus::Unsupported) {
+            sawUnsupported = true;
+        } else if (!haveValid) {
+            active = candidate;
+            haveValid = true;
+        } else if (!equivalentTiming(active, candidate)) {
+            sawConflictingValid = true;
+        }
+    }
+    if (sawMalformed) {
+        m_h264 = malformedH264();
         return false;
     }
-    for (qsizetype i = 1; i < sps.size(); ++i) {
-        const H264TimingSyntax candidate = parseH264Sps(sps[i]);
-        if (candidate.status != H26xTimingSyntaxStatus::Valid) {
-            m_h264 = candidate;
-            return false;
-        }
-        if (!equivalentTiming(active, candidate)) {
-            m_h264 = unsupportedH264();
-            return false;
-        }
+    if (sawUnsupported || sawConflictingValid || !haveValid) {
+        m_h264 = unsupportedH264();
+        return false;
     }
     m_h264 = active;
     return true;
@@ -473,7 +503,7 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         return result;
     }
     if (!syntax.picStructPresent) {
-        if (!reader.rbspTrailingBits()) result.status = TimecodeParseStatus::Malformed;
+        if (!reader.seiPayloadAlignmentBits()) result.status = TimecodeParseStatus::Malformed;
         return result;
     }
 
@@ -489,6 +519,7 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
     }
 
     Smpte12mTimecode firstUsableTimestamp;
+    bool unsupportedCounting = false;
     for (int i = 0; i < timestampCount; ++i) {
         bool timestampFlag = false;
         if (!reader.bit(timestampFlag)) {
@@ -556,12 +587,50 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         Q_UNUSED(ctType);
         Q_UNUSED(nuitFieldBased);
         Q_UNUSED(discontinuity);
-        Q_UNUSED(countDropped);
         Q_UNUSED(timeOffset);
+
+        if (countDropped) {
+            // Annex D counting types 2/3/5/6 do not describe SMPTE drop-frame
+            // labels. Their skipped-count history cannot be recovered from one
+            // payload, so consume and validate the syntax but do not emit a label.
+            switch (countingType) {
+            case 0:
+            case 1:
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            case 2:
+                if (frames != 1) {
+                    result.status = TimecodeParseStatus::Malformed;
+                    return result;
+                }
+                unsupportedCounting = true;
+                break;
+            case 3:
+                if (frames != 0) {
+                    result.status = TimecodeParseStatus::Malformed;
+                    return result;
+                }
+                unsupportedCounting = true;
+                break;
+            case 4:
+                if (frames != 2 || (haveSeconds && seconds != 0) ||
+                    (haveMinutes && minutes % 10 == 0)) {
+                    result.status = TimecodeParseStatus::Malformed;
+                    return result;
+                }
+                if (!haveSeconds || !haveMinutes) unsupportedCounting = true;
+                break;
+            case 5:
+            case 6:
+                unsupportedCounting = true;
+                break;
+            }
+        }
         if (!haveSeconds || !haveMinutes || !haveHours) continue;
 
-        const Smpte12mTimecode timestamp{int(hours),  int(minutes),      int(seconds),
-                                         int(frames), countingType == 4, true};
+        const Smpte12mTimecode timestamp{
+            int(hours), int(minutes), int(seconds), int(frames), countingType == 4 && countDropped,
+            true};
         const bool fieldsInRange = hours < 24 && minutes < 60 && seconds < 60;
         const bool labelValid =
             !syntax.frameRate.valid() || validateTimecodeLabel(timestamp, syntax.frameRate);
@@ -571,8 +640,12 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         }
         if (!firstUsableTimestamp.valid) firstUsableTimestamp = timestamp;
     }
-    if (!reader.rbspTrailingBits()) {
+    if (!reader.seiPayloadAlignmentBits()) {
         result.status = TimecodeParseStatus::Malformed;
+        return result;
+    }
+    if (unsupportedCounting) {
+        result.status = TimecodeParseStatus::Unsupported;
         return result;
     }
     if (firstUsableTimestamp.valid) {

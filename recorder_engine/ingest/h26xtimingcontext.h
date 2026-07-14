@@ -58,8 +58,8 @@ struct TimecodeParseResult {
     Smpte12mTimecode timecode;
 };
 
-// Decode an EBSP into an RBSP while validating emulation-prevention bytes.
-// A prevention byte must have a following byte in the reserved 0x00..0x03 range.
+// Decode an EBSP into an RBSP while validating the NAL escape rules. A prevention
+// byte must precede 0x00..0x03, and raw 00 00 00/01/02 sequences are forbidden.
 bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
 
 // Internal parser seam shared by the public Annex-B extractor. It returns a
