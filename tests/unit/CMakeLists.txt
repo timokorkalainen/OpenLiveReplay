@@ -260,4 +260,128 @@ if(OLR_GPU_PIPELINE)
     olr_add_unit_test(tst_gpucompositor olr_test_gpu)
     olr_add_unit_test(tst_gpucompositor_stress olr_test_gpu)
     target_link_libraries(tst_outputbusengine PRIVATE olr_test_gpu)
+
+    set(gpu_mutation_root "${CMAKE_CURRENT_BINARY_DIR}/gpu-retirement-mutations")
+    function(olr_generate_gpu_mutation output source mutation)
+        add_custom_command(
+            OUTPUT "${output}"
+            COMMAND "${CMAKE_COMMAND}"
+                -DGENERATE_MUTATION=${mutation}
+                -DINPUT_SOURCE=${source}
+                -DOUTPUT_SOURCE=${output}
+                -P "${CMAKE_SOURCE_DIR}/tests/mutations/gpu_retirement_mutations.cmake"
+            DEPENDS
+                "${source}"
+                "${CMAKE_SOURCE_DIR}/tests/mutations/gpu_retirement_mutations.cmake"
+            VERBATIM)
+        set_source_files_properties("${output}" PROPERTIES GENERATED TRUE)
+    endfunction()
+
+    function(olr_configure_gpu_retirement_mutant target mutation_definition)
+        target_compile_definitions(${target} PRIVATE ${mutation_definition} OLR_UNIT_TEST=1)
+        target_link_libraries(${target} PRIVATE
+            Qt6::Test olr_test_playback olr_test_gpu olr_warnings olr_sanitize)
+        if(WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_RUNTIME_DLLS:${target}>
+                    $<TARGET_FILE_DIR:${target}>
+                COMMAND_EXPAND_LISTS
+                COMMENT "Copying ${target} runtime DLLs")
+        endif()
+    endfunction()
+
+    set(gpu_compatibility_overlay "${gpu_mutation_root}/compatibility")
+    set(gpu_compatibility_header
+        "${gpu_compatibility_overlay}/playback/gpu/gpusubmission.h")
+    olr_generate_gpu_mutation("${gpu_compatibility_header}"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpusubmission.h" COMPATIBILITY)
+    qt_add_executable(gpu_retirement_compatibility_mutant
+        "${CMAKE_SOURCE_DIR}/tests/unit/tst_gpusurfacelease.cpp"
+        "${gpu_compatibility_header}")
+    target_include_directories(gpu_retirement_compatibility_mutant BEFORE PRIVATE
+        "${gpu_compatibility_overlay}")
+    olr_configure_gpu_retirement_mutant(gpu_retirement_compatibility_mutant
+        OLR_MUTATE_GPU_COMPATIBILITY=1)
+
+    set(gpu_loss_generation_overlay "${gpu_mutation_root}/loss-generation")
+    set(gpu_loss_generation_header
+        "${gpu_loss_generation_overlay}/playback/gpu/gpudevicelossmonitor.h")
+    olr_generate_gpu_mutation("${gpu_loss_generation_header}"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.h" LOSS_GENERATION)
+    qt_add_executable(gpu_retirement_loss_generation_mutant
+        "${CMAKE_SOURCE_DIR}/tests/unit/tst_devicelossmonitor.cpp"
+        "${gpu_loss_generation_header}")
+    target_include_directories(gpu_retirement_loss_generation_mutant BEFORE PRIVATE
+        "${gpu_loss_generation_overlay}")
+    olr_configure_gpu_retirement_mutant(gpu_retirement_loss_generation_mutant
+        OLR_MUTATE_GPU_LOSS_GENERATION=1)
+
+    set(gpu_publication_source "${gpu_mutation_root}/gpu_retire_publication.cpp")
+    olr_generate_gpu_mutation("${gpu_publication_source}"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp" RETIRE_PUBLICATION)
+    add_library(olr_gpu_retirement_publication_mutant OBJECT "${gpu_publication_source}")
+    set_target_properties(olr_gpu_retirement_publication_mutant PROPERTIES AUTOMOC OFF)
+    target_include_directories(olr_gpu_retirement_publication_mutant PRIVATE
+        "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(olr_gpu_retirement_publication_mutant PRIVATE
+        OLR_MUTATE_GPU_RETIRE_PUBLICATION=1 OLR_UNIT_TEST=1)
+    target_link_libraries(olr_gpu_retirement_publication_mutant PRIVATE olr_test_playback)
+    qt_add_executable(gpu_retirement_publication_mutant
+        "${CMAKE_SOURCE_DIR}/tests/unit/tst_gpusurfacelease.cpp"
+        $<TARGET_OBJECTS:olr_gpu_retirement_publication_mutant>)
+    olr_configure_gpu_retirement_mutant(gpu_retirement_publication_mutant
+        OLR_MUTATE_GPU_RETIRE_PUBLICATION=1)
+
+    set(gpu_quarantine_source "${gpu_mutation_root}/gpu_quarantine_transfer.cpp")
+    olr_generate_gpu_mutation("${gpu_quarantine_source}"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp" QUARANTINE_TRANSFER)
+    add_library(olr_gpu_quarantine_transfer_mutant OBJECT "${gpu_quarantine_source}")
+    set_target_properties(olr_gpu_quarantine_transfer_mutant PROPERTIES AUTOMOC OFF)
+    target_include_directories(olr_gpu_quarantine_transfer_mutant PRIVATE
+        "${CMAKE_SOURCE_DIR}")
+    target_compile_definitions(olr_gpu_quarantine_transfer_mutant PRIVATE
+        OLR_MUTATE_GPU_QUARANTINE_TRANSFER=1 OLR_UNIT_TEST=1)
+    target_link_libraries(olr_gpu_quarantine_transfer_mutant PRIVATE olr_test_playback)
+    qt_add_executable(gpu_retirement_quarantine_mutant
+        "${CMAKE_SOURCE_DIR}/tests/unit/tst_gpusurfacelease.cpp"
+        $<TARGET_OBJECTS:olr_gpu_quarantine_transfer_mutant>)
+    olr_configure_gpu_retirement_mutant(gpu_retirement_quarantine_mutant
+        OLR_MUTATE_GPU_QUARANTINE_TRANSFER=1)
+
+    function(olr_add_gpu_retirement_mutation_test name baseline mutant test_function
+             expected_test_name expected_failure_token)
+        add_test(NAME gpu_retirement_mutation_${name}
+            COMMAND "${CMAKE_COMMAND}"
+                -DMUTANT_NAME=${name}
+                -DBASELINE_EXECUTABLE=$<TARGET_FILE:${baseline}>
+                -DMUTANT_EXECUTABLE=$<TARGET_FILE:${mutant}>
+                -DTEST_FUNCTION=${test_function}
+                -DEXPECTED_TEST_NAME=${expected_test_name}
+                -DEXPECTED_FAILURE_TOKEN=${expected_failure_token}
+                -P "${CMAKE_SOURCE_DIR}/tests/mutations/gpu_retirement_mutations.cmake")
+        set_tests_properties(gpu_retirement_mutation_${name} PROPERTIES
+            LABELS "gpu-capability;unit;ci;mutation"
+            TIMEOUT 60
+            ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    endfunction()
+
+    olr_add_gpu_retirement_mutation_test(compatibility tst_gpusurfacelease
+        gpu_retirement_compatibility_mutant
+        fusedSubmissionRejectsIncompatibleEvidenceBeforeCallback
+        "TestGpuSurfaceLease::fusedSubmissionRejectsIncompatibleEvidenceBeforeCallback()"
+        result.outcome)
+    olr_add_gpu_retirement_mutation_test(loss_generation tst_devicelossmonitor
+        gpu_retirement_loss_generation_mutant
+        validatedRecoveryRejectsMismatchedLossGeneration
+        "TestDeviceLossMonitor::validatedRecoveryRejectsMismatchedLossGeneration()"
+        called)
+    olr_add_gpu_retirement_mutation_test(retire_publication tst_gpusurfacelease
+        gpu_retirement_publication_mutant fusedSubmissionPublishesSubmittedOwners
+        "TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedOwners()"
+        registry.pendingRetainCount)
+    olr_add_gpu_retirement_mutation_test(quarantine_transfer tst_gpusurfacelease
+        gpu_retirement_quarantine_mutant fusedSubmissionQuarantinesZeroSignal
+        "TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal()"
+        registry.pendingRetainCount)
 endif()

@@ -30,6 +30,10 @@ struct GpuDeviceLossMonitorTestAuthority {
         monitor.m_epochMutex.unlock();
         return true;
     }
+    static void replaceLossGeneration(uint64_t generation) {
+        GpuDeviceLossMonitor::instance().m_lossGeneration.store(generation,
+                                                                std::memory_order_release);
+    }
 };
 #endif
 
@@ -50,6 +54,7 @@ private slots:
     void currentAuthorityPublicationTracksGuardedEpoch();
     void validatedRecoveryRunsOnceForConcurrentWorkers();
     void validatedRecoveryCallbackRunsAfterEpochUnlock();
+    void validatedRecoveryRejectsMismatchedLossGeneration();
     void tokenlessRecoveryCallbackRunsAfterEpochUnlock();
     void rebuildInvalidatesUnconsumedRecoveryAuthority();
     void tokenlessEpochCanUpgradeToValidatedRecovery();
@@ -58,6 +63,26 @@ private slots:
     void retiredGenerationsPruneCompletedWithoutErasingActiveOrNewer();
     void resetReturnsToPristine();
 };
+
+void TestDeviceLossMonitor::validatedRecoveryRejectsMismatchedLossGeneration() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA08);
+    QVERIFY(generation != 0);
+    GpuDeviceLossMonitorTestAuthority::replaceLossGeneration(generation + 1);
+
+    bool called = false;
+    const GpuValidatedLossResult result =
+        monitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
+            called = true;
+            return qsizetype(1);
+        });
+
+    QVERIFY(!called);
+    QCOMPARE(result.status, GpuValidatedLossStatus::Rejected);
+    monitor.reset();
+}
 
 void TestDeviceLossMonitor::validatedRecoveryCallbackRunsAfterEpochUnlock() {
     auto& monitor = GpuDeviceLossMonitor::instance();

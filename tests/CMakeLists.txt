@@ -79,8 +79,8 @@ function(olr_add_gpu_submission_compile_control name source expectation)
         "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
         "-DTARGET=${target}"
         "-DCONFIG=$<CONFIG>")
+    target_compile_definitions(${target} PRIVATE ${ARGN})
     if(expectation STREQUAL "PASS")
-        target_compile_definitions(${target} PRIVATE ${ARGN})
         list(APPEND control_args "-DEXPECT_COMPILE=TRUE")
     elseif(expectation STREQUAL "NO_TRACK")
         list(APPEND control_args
@@ -97,6 +97,21 @@ function(olr_add_gpu_submission_compile_control name source expectation)
             "-DEXPECT_COMPILE=FALSE"
             "-DEXPECTED_MEMBER=registerRetire"
             "-DEXPECTED_ACCESS=(no.member|has.no.member|not.a.member|has.not.been.declared|undeclared)")
+    elseif(expectation STREQUAL "VIEW_UNWRAP")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=nativeHandle"
+            "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "TOKEN_CONSTRUCTION")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=DeadDeviceToken"
+            "-DEXPECTED_ACCESS=[Pp]rivate")
+    elseif(expectation STREQUAL "DIRECT_ABANDON")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=abandonAllNoWait"
+            "-DEXPECTED_ACCESS=(cannot.convert|no.matching|candidate)")
     else()
         message(FATAL_ERROR "Unknown GPU submission compile-control expectation: ${expectation}")
     endif()
@@ -119,6 +134,16 @@ olr_add_gpu_submission_compile_control(
 olr_add_gpu_submission_compile_control(
     gpu_registry_pairing gpu_registry_pairing.cpp REGISTRY_PAIRING)
 olr_add_gpu_submission_compile_control(
+    gpu_submission_view_unwrap gpu_submission_view_unwrap.cpp VIEW_UNWRAP)
+olr_add_gpu_submission_compile_control(
+    gpu_token_construction gpu_token_abandon.cpp TOKEN_CONSTRUCTION
+    OLR_NEGCOMPILE_TOKEN_CONSTRUCTION=1)
+olr_add_gpu_submission_compile_control(
+    gpu_token_direct_abandon gpu_token_abandon.cpp DIRECT_ABANDON
+    OLR_NEGCOMPILE_DIRECT_ABANDON=1)
+olr_add_gpu_submission_compile_control(
+    gpu_submission_pass gpu_submission_pass.cpp PASS)
+olr_add_gpu_submission_compile_control(
     gpu_submit_stub_adapter_pass gpu_submit_stub_adapter_pass.cpp PASS)
 if(WIN32)
     olr_add_gpu_submission_compile_control(
@@ -130,6 +155,9 @@ if(APPLE)
         gpu_submit_metal_adapter_pass gpu_submit_metal_adapter_pass.mm PASS
         OLR_GPU_PIPELINE_BUILD=1)
 endif()
+set_tests_properties(
+    gpu_submission_pass
+    PROPERTIES DEPENDS "gpu_submission_view_unwrap;gpu_submit_without_owner;gpu_registry_pairing;gpu_token_construction;gpu_token_direct_abandon")
 set_tests_properties(
     gpu_submit_stub_adapter_pass
     PROPERTIES DEPENDS gpu_submit_without_owner)
@@ -144,10 +172,68 @@ set_tests_properties(
     gpu_native_handle_access_unrelated_error_rejected
     PROPERTIES
     DEPENDS gpu_native_handle_access)
+
+function(olr_add_gpu_compile_control_alias name target expected_member expected_access)
+    add_test(NAME ${name}
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR=${CMAKE_BINARY_DIR}
+            -DTARGET=${target}
+            -DCONFIG=$<CONFIG>
+            -DEXPECT_COMPILE=FALSE
+            -DEXPECTED_MEMBER=${expected_member}
+            -DEXPECTED_ACCESS=${expected_access}
+            -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
+endfunction()
+
+function(olr_add_gpu_compile_pass_alias name target)
+    add_test(NAME ${name}
+        COMMAND ${CMAKE_COMMAND}
+            -DBUILD_DIR=${CMAKE_BINARY_DIR}
+            -DTARGET=${target}
+            -DCONFIG=$<CONFIG>
+            -DEXPECT_COMPILE=TRUE
+            -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
+endfunction()
+
+# Task 7's matrix names make the locked regex execute every exact capability
+# control. Historical names above stay available to earlier task reports.
+olr_add_gpu_compile_control_alias(gpu_negcompile_native_handle_base_derived
+    gpu_native_handle_access_compile_control nativeHandle "[Pp]rotected")
+olr_add_gpu_compile_control_alias(gpu_negcompile_submission_view_unwrap
+    gpu_submission_view_unwrap_compile_control nativeHandle "[Pp]rotected")
+olr_add_gpu_compile_control_alias(gpu_negcompile_submit_without_owner
+    gpu_submit_without_owner_compile_control submit "(no.matching|candidate.expects|requires)")
+olr_add_gpu_compile_control_alias(gpu_negcompile_registry_pairing
+    gpu_registry_pairing_compile_control registerRetire
+    "(no.member|has.no.member|not.a.member|has.not.been.declared|undeclared)")
+olr_add_gpu_compile_control_alias(gpu_negcompile_token_construction
+    gpu_token_construction_compile_control DeadDeviceToken "[Pp]rivate")
+olr_add_gpu_compile_control_alias(gpu_negcompile_token_direct_abandon
+    gpu_token_direct_abandon_compile_control abandonAllNoWait
+    "(cannot.convert|no.matching|candidate)")
+olr_add_gpu_compile_control_alias(gpu_negcompile_op_track_access
+    gpu_op_track_access_compile_control track "(private|no.member|has.no.member)")
+olr_add_gpu_compile_pass_alias(gpu_compile_pass_native_handle
+    gpu_native_handle_access_pass_compile_control)
+olr_add_gpu_compile_pass_alias(gpu_compile_pass_submission
+    gpu_submission_pass_compile_control)
+set_tests_properties(gpu_compile_pass_native_handle PROPERTIES
+    DEPENDS gpu_negcompile_native_handle_base_derived)
+set_tests_properties(gpu_compile_pass_submission PROPERTIES
+    DEPENDS "gpu_negcompile_submission_view_unwrap;gpu_negcompile_submit_without_owner;gpu_negcompile_registry_pairing;gpu_negcompile_token_construction;gpu_negcompile_token_direct_abandon;gpu_negcompile_op_track_access")
 olr_expect_compile_failure(gpu_lease_move lease_move.cpp)
 olr_expect_compile_failure(gpu_backing_authority_spoof backing_authority_spoof.cpp)
-olr_expect_compile_failure(gpu_token_mint token_mint.cpp)
 olr_expect_compile_failure(gpu_token_authority_spoof token_authority_spoof.cpp)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME gpu_capability_source_audit
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tests/gpu/gpu_capability_source_audit.py"
+        --source-root "${CMAKE_SOURCE_DIR}")
+set_tests_properties(gpu_capability_source_audit PROPERTIES
+    LABELS "gpu-capability;ci" TIMEOUT 30)
 if(WIN32)
     olr_expect_compile_failure(gpu_d3d11_texture_access d3d11_texture_access.cpp)
     olr_expect_compile_failure(gpu_d3d11_device_access d3d11_device_access.cpp)
