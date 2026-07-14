@@ -472,11 +472,16 @@ PlaybackWorker::validatedOutputCommitPlayheadLocked(const OutputCommit& commit,
         // are removed. That state is allowed to republish and reset the epoch only
         // while preserving the already committed seek/playhead identity. Real and
         // hold-last commits still have to pass normal generation-aware coverage.
-        const bool placeholderRecoveryCommit =
+        const bool recoveryCommitPreservesIdentity =
             !commit.requireCurrentSeek && commit.cacheAction == OutputCacheAction::Publish &&
-            commit.guardPlayheadCache && coverageCache->videoFramesSnapshot().isEmpty() &&
+            commit.guardPlayheadCache &&
             commit.seekGeneration == m_committedGeneration.load(std::memory_order_acquire) &&
             commit.playheadMs == m_committedPlayheadMs.load(std::memory_order_acquire);
+        const bool placeholderRecoveryCommit =
+            recoveryCommitPreservesIdentity &&
+            !outputCacheDisplayablePlayheadInCacheLocked(*coverageCache, commit.playheadMs,
+                                                         commit.gpuGeneration)
+                 .has_value();
         if (placeholderRecoveryCommit) {
             committedPlayheadMs = commit.playheadMs;
         } else if (commit.coverageMode == OutputCoverageMode::Displayable) {
@@ -1680,6 +1685,10 @@ void PlaybackWorker::handleGpuDeviceLoss() {
             if (m_outputRuntime) m_outputRuntime->setGpuRhiContext(nullptr);
         }
         rebuildOutputEndpoints();
+        if (recoveryCommit.committed && recoveryCommit.dispatch == PostCommitDispatch::Output) {
+            m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
+            refreshOutputAfterSeekCommit();
+        }
         return;
     }
 
@@ -2552,6 +2561,7 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
     uint64_t committedGen = 0;
     uint64_t seekGen = 0;
     bool forceLiveCacheSnapshot = false;
+    PostCommitDispatch postCommitDispatch = PostCommitDispatch::None;
     {
         // Tier 2: read the immutable published snapshot instead of deep-copying
         // the live m_outputCache on every ~1ms tick. The slot's load() takes one
@@ -2564,7 +2574,7 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
         // Fire the scheduled cut (if due) while holding the canonical
         // m_mutex -> m_bufferMutex order, BEFORE reading the published cache so
         // this tick paints the promoted window.
-        mutableThis->maybeFireScheduledCut(dispatcherNextIndex);
+        postCommitDispatch = mutableThis->maybeFireScheduledCut(dispatcherNextIndex);
         workerLocker.unlock();
 #ifdef OLR_GPU_PIPELINE_BUILD
         int forcedLiveSnapshots = m_forceLiveOutputSnapshots.load(std::memory_order_acquire);
@@ -2597,6 +2607,13 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
                     : m_committedGpuGeneration.load(std::memory_order_acquire);
         }
 #endif
+    }
+
+    if (postCommitDispatch == PostCommitDispatch::Output) {
+#ifdef OLR_GPU_PIPELINE_BUILD
+        m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
+#endif
+        const_cast<PlaybackWorker*>(this)->refreshOutputAfterSeekCommit();
     }
 
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -4305,22 +4322,43 @@ bool PlaybackWorker::stagingGpuSurfacesIdle() const {
 //   slot runs synchronously here and none re-enters m_bufferMutex. Lock order is
 //   therefore strictly m_bufferMutex -> transport::m_mutex, and no path takes
 //   transport::m_mutex then m_bufferMutex. No inversion.
-void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
+PlaybackWorker::PostCommitDispatch
+PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     const qint64 scheduled = m_scheduledCutFrame.load();
-    if (scheduled < 0) return; // nothing scheduled — unarmed path unchanged
-    if (!CutSchedule::shouldFireAt(dispatcherNextIndex, scheduled)) return;
-    if (!m_prerollStagingCache) return;
+    if (scheduled < 0) return PostCommitDispatch::None;
+    if (!CutSchedule::shouldFireAt(dispatcherNextIndex, scheduled)) return PostCommitDispatch::None;
+    if (!m_prerollStagingCache) return PostCommitDispatch::None;
     // GPU staging-swap fence: do not promote staging -> live until the staging
     // decoder has finished writing its GPU surfaces. This is a NON-BLOCKING poll
     // because makeOutputSnapshot holds m_bufferMutex while calling this method;
     // a not-yet-idle staging cache simply defers the cut to the next tick.
-    if (!stagingGpuSurfacesIdle()) return;
+    if (!stagingGpuSurfacesIdle()) return PostCommitDispatch::None;
 #ifdef OLR_GPU_PIPELINE_BUILD
     if (gpuDeviceLossPending()) {
         sanitizeCacheForDeviceLossLocked(m_outputCache.get());
         sanitizeCacheForDeviceLossLocked(m_prerollStagingCache.get());
-        if (m_outputCache) publishOutputCacheLocked();
-        return;
+        OutputCommit recoveryCommit;
+        recoveryCommit.playheadMs = m_committedPlayheadMs.load(std::memory_order_acquire);
+        recoveryCommit.seekGeneration = m_committedGeneration.load(std::memory_order_acquire);
+        recoveryCommit.gpuGeneration = GpuGenerationCounter::instance().current();
+        recoveryCommit.cacheAction = OutputCacheAction::Publish;
+        recoveryCommit.coverageMode = OutputCoverageMode::Displayable;
+        recoveryCommit.requireCurrentSeek = false;
+        recoveryCommit.guardPlayheadCache = true;
+        recoveryCommit.dispatch = PostCommitDispatch::Output;
+        const OutputCommitResult result = commitOutputStateLocked(recoveryCommit);
+        if (!result.committed) return PostCommitDispatch::None;
+
+        m_scheduledCutFrame.store(-1);
+        m_stagingCovers.store(false);
+        m_decoderFollowMs.store(-1);
+        m_forwardCutResyncMs.store(-1, std::memory_order_release);
+        m_armedTargetMs.store(-1);
+        m_armedFireAtMs.store(-1);
+        m_prerollSeekPending.store(false);
+        m_stagedFenceValue.store(0, std::memory_order_release);
+        m_cutArmed.store(false, std::memory_order_release);
+        return result.dispatch;
     }
 #endif
     // Manual-seek-vs-in-flight-cut policy: if the operator issued an explicit
@@ -4344,7 +4382,7 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
         m_stagedFenceValue.store(0, std::memory_order_release);
 #endif
         m_cutArmed.store(false, std::memory_order_release);
-        return;
+        return PostCommitDispatch::None;
     }
 
     const int64_t target = m_scheduledCutTargetMs.load();
@@ -4371,7 +4409,7 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     const OutputCommitResult cutCommit = commitOutputStateLocked(commit);
     if (!cutCommit.committed) {
         std::swap(m_outputCache, m_prerollStagingCache);
-        return;
+        return PostCommitDispatch::None;
     }
     // Decoder-follow for a BACKWARD cut: the swap fixed the OUTPUT, but the primary
     // demuxer+decoder bank is still parked AHEAD of the new playhead, so the worker
@@ -4425,6 +4463,7 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     // observes !m_cutArmed, so releasing it after the swap + counter bump above
     // guarantees the worker's next staging fill cannot race this swap.
     m_cutArmed.store(false, std::memory_order_release);
+    return cutCommit.dispatch;
 }
 
 void PlaybackWorker::run() {

@@ -2979,6 +2979,7 @@ void TestPlaybackWorker::gpuPressureRecoveryReanchorsCommittedPlayheadDuringPend
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), resetCountBefore + 1);
+        worker.m_outputRuntime->resetFrameIndex(1000000);
         worker.m_outputRuntime->setIdentitySkip(false);
         worker.m_outputRuntime->setEndpoints({{feedAssignment(OutputTargetKind::Ndi), &sink}});
     }

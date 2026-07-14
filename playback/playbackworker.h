@@ -489,8 +489,8 @@ private:
     bool stagingGpuSurfacesIdle() const;
     // Fire the scheduled cut iff the dispatcher's next index reached it: swaps
     // staging -> active, republishes, re-bases the transport playhead. MUST be
-    // called holding m_bufferMutex (invoked from makeOutputSnapshot).
-    void maybeFireScheduledCut(qint64 dispatcherNextIndex);
+    // called holding m_mutex -> m_bufferMutex (invoked from makeOutputSnapshot).
+    PostCommitDispatch maybeFireScheduledCut(qint64 dispatcherNextIndex);
 
     static int ffmpegInterruptCallback(void* opaque);
     bool shouldInterrupt() const;
