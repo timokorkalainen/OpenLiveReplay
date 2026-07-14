@@ -1133,9 +1133,8 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         m_lastKeyframeAtMs = m_monotonic.elapsed();
     }
 
-    // Capture the timecode into a local (not the member) so an async decode binds
-    // THIS access unit's TC even if m_pendingVideoTimecode100ns is overwritten by a
-    // later AU before the callback fires.
+    // Snapshot this access unit's timing evidence before later parsing overwrites
+    // the pending members; the bounded PTS queue binds it to delayed decoder output.
     const int64_t timecode100ns = m_pendingVideoTimecode100ns;
     const std::optional<TimecodeEvidence> timecodeEvidence = m_pendingTimecodeEvidence;
     const DecodedFrameEvidence submittedEvidence{unit.pts90k, sourcePtsMs, timecode100ns,
@@ -1209,13 +1208,8 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
                 av_frame_free(&frame);
                 return;
             }
-            DecodedVideoFrame decodedFrame;
-            decodedFrame.frame = frame;
-            if (evidence.has_value()) {
-                decodedFrame.sourcePtsMs = evidence->sourcePtsMs;
-                decodedFrame.sourceTimecode100ns = evidence->sourceTimecode100ns;
-                decodedFrame.timecodeEvidence = evidence->timecodeEvidence;
-            }
+            DecodedVideoFrame decodedFrame =
+                decodedCpuVideoFrameForOutput(frame, evidence ? &*evidence : nullptr);
             m_callbacks.onVideoFrame(decodedFrame);
         },
         &error);

@@ -944,13 +944,8 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                     return;
                 }
 
-                DecodedVideoFrame decodedFrame;
-                decodedFrame.frame = frame;
-                if (evidence.has_value()) {
-                    decodedFrame.sourcePtsMs = evidence->sourcePtsMs;
-                    decodedFrame.sourceTimecode100ns = evidence->sourceTimecode100ns;
-                    decodedFrame.timecodeEvidence = evidence->timecodeEvidence;
-                }
+                DecodedVideoFrame decodedFrame =
+                    decodedCpuVideoFrameForOutput(frame, evidence ? &*evidence : nullptr);
                 m_callbacks.onVideoFrame(decodedFrame);
             },
             &error);

@@ -20,6 +20,8 @@ extern "C" {
 struct AVFrame;
 }
 
+struct DecodedFrameEvidence;
+
 enum class IngestBackendKind { NativeSrt, NativeRtmp, NativeNdi, Unsupported };
 
 enum class IngestFailureKind {
@@ -44,7 +46,7 @@ struct IngestBackendOptions {
 
 struct DecodedVideoFrame {
     AVFrame* frame = nullptr;
-    int64_t sourcePtsMs = 0;
+    int64_t sourcePtsMs = -1;
     int64_t sourceTimecode100ns = -1;
     std::optional<TimecodeEvidence> timecodeEvidence;
 #if defined(OLR_GPU_PIPELINE_BUILD)
@@ -52,6 +54,9 @@ struct DecodedVideoFrame {
     uint64_t gpuFenceValue = 0;
 #endif
 };
+
+DecodedVideoFrame decodedCpuVideoFrameForOutput(AVFrame* frame,
+                                                const DecodedFrameEvidence* evidence);
 
 struct DecodedAudioChunk {
     int64_t startSample = -1;

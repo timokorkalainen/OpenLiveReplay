@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <d3d11.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -87,12 +88,31 @@ QString hrMessage(const QString& action, HRESULT hr) {
         .arg(quint32(hr), 8, 16, QLatin1Char('0'));
 }
 
-LONGLONG pts90kToMfTime(qint64 pts90k) {
-    return pts90k * kMfTimePerSecond / kPtsClock;
+bool scaleNearest(qint64 value, qint64 numeratorScale, qint64 denominator, qint64* result) {
+    if (!result || denominator <= 0) return false;
+    using I128 = __int128;
+    const I128 numerator = I128(value) * numeratorScale;
+    const I128 magnitude = numerator < 0 ? -numerator : numerator;
+    const I128 roundedMagnitude = (magnitude + denominator / 2) / denominator;
+    const I128 rounded = numerator < 0 ? -roundedMagnitude : roundedMagnitude;
+    if (rounded < I128(std::numeric_limits<qint64>::min()) ||
+        rounded > I128(std::numeric_limits<qint64>::max()))
+        return false;
+    *result = qint64(rounded);
+    return true;
+}
+
+bool pts90kToMfTime(qint64 pts90k, LONGLONG* time) {
+    qint64 scaled = 0;
+    if (!scaleNearest(pts90k, kMfTimePerSecond, kPtsClock, &scaled)) return false;
+    *time = LONGLONG(scaled);
+    return true;
 }
 
 qint64 mfTimeToPts90k(LONGLONG time) {
-    return time * kPtsClock / kMfTimePerSecond;
+    qint64 pts90k = AV_NOPTS_VALUE;
+    return scaleNearest(qint64(time), kPtsClock, kMfTimePerSecond, &pts90k) ? pts90k
+                                                                            : AV_NOPTS_VALUE;
 }
 
 qint64 outputSamplePts90k(bool hasSampleTime, LONGLONG sampleTime, qint64 fallbackPts90k) {
@@ -268,6 +288,9 @@ public:
                            QString* error);
     void reset();
     void flushExcessPixelBufferPool() {}
+    bool deliverCompletedSample(IMFSample* sample, FrameCallback* onFrame,
+                                KeepSurfaceCallback* onSurface, qint64 fallbackPts90k,
+                                QString* error);
 
 private:
     int width = 0;
@@ -700,7 +723,9 @@ bool NativeVideoDecoder::Impl::createInputSample(const CompressedAccessUnit& uni
         hr = createdSample->AddBuffer(buffer.Get());
     }
     if (SUCCEEDED(hr) && unit.pts90k >= 0) {
-        hr = createdSample->SetSampleTime(pts90kToMfTime(unit.pts90k));
+        LONGLONG sampleTime = 0;
+        hr = pts90kToMfTime(unit.pts90k, &sampleTime) ? createdSample->SetSampleTime(sampleTime)
+                                                      : E_INVALIDARG;
     }
     if (FAILED(hr)) {
         if (error) {
@@ -833,6 +858,27 @@ bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample, qint64 fallb
     return false;
 }
 
+bool NativeVideoDecoder::Impl::deliverCompletedSample(IMFSample* sample, FrameCallback* onFrame,
+                                                      KeepSurfaceCallback* onSurface,
+                                                      qint64 fallbackPts90k, QString* error) {
+    if (onSurface) {
+        const qint64 framePts = outputSamplePts90k(sample, fallbackPts90k);
+        if (!(*onSurface)(sample, framePts)) {
+            if (error) {
+                *error = QStringLiteral(
+                    "Media Foundation keep-surface callback rejected decoded surface");
+            }
+            return false;
+        }
+        return true;
+    }
+
+    AVFrame* frame = nullptr;
+    if (!copySampleToFrame(sample, fallbackPts90k, &frame, error)) return false;
+    (*onFrame)(frame);
+    return true;
+}
+
 bool NativeVideoDecoder::Impl::processOutput(FrameCallback* onFrame, KeepSurfaceCallback* onSurface,
                                              qint64 pts90k, bool allowNeedMoreInput,
                                              bool* needMoreInput, QString* error) {
@@ -941,24 +987,7 @@ bool NativeVideoDecoder::Impl::processOutput(FrameCallback* onFrame, KeepSurface
             }
             releaseOutputEvents(&output);
 
-            if (onSurface) {
-                const qint64 framePts = outputSamplePts90k(completedSample.Get(), pts90k);
-                if (!(*onSurface)(completedSample.Get(), framePts)) {
-                    if (error) {
-                        *error = QStringLiteral(
-                            "Media Foundation keep-surface callback rejected decoded surface");
-                    }
-                    return false;
-                }
-                return true;
-            }
-
-            AVFrame* frame = nullptr;
-            if (!copySampleToFrame(completedSample.Get(), pts90k, &frame, error)) {
-                return false;
-            }
-            (*onFrame)(frame);
-            return true;
+            return deliverCompletedSample(completedSample.Get(), onFrame, onSurface, pts90k, error);
         }
     }
 }
@@ -1252,11 +1281,45 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
 }
 
 #ifdef OLR_UNIT_TEST
-NativeVideoDecoderOutputPtsForTest
-nativeVideoDecoderMediaFoundationOutputPtsForTest(qint64 inputPts90k) {
-    const LONGLONG sampleTime = pts90kToMfTime(inputPts90k);
-    const qint64 outputPts = outputSamplePts90k(true, sampleTime, -1);
-    return {outputPts, outputPts};
+bool nativeVideoDecoderMediaFoundationDeliverOutputForTest(
+    qint64 samplePts90k, qint64 fallbackPts90k, NativeVideoDecoder::FrameCallback onFrame,
+    NativeVideoDecoder::KeepSurfaceCallback onSurface, QString* error) {
+    if (bool(onFrame) == bool(onSurface)) {
+        if (error) *error = QStringLiteral("exactly one Media Foundation callback is required");
+        return false;
+    }
+
+    ComPtr<IMFSample> sample;
+    ComPtr<IMFMediaBuffer> buffer;
+    HRESULT hr = MFCreateSample(&sample);
+    if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(6, &buffer);
+    if (SUCCEEDED(hr)) {
+        BYTE* bytes = nullptr;
+        hr = buffer->Lock(&bytes, nullptr, nullptr);
+        if (SUCCEEDED(hr)) {
+            std::memset(bytes, 0, 6);
+            buffer->Unlock();
+            hr = buffer->SetCurrentLength(6);
+        }
+    }
+    if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
+    if (SUCCEEDED(hr) && samplePts90k != AV_NOPTS_VALUE) {
+        LONGLONG sampleTime = 0;
+        hr = pts90kToMfTime(samplePts90k, &sampleTime) ? sample->SetSampleTime(sampleTime)
+                                                       : E_INVALIDARG;
+    }
+    if (FAILED(hr)) {
+        if (error) {
+            *error = hrMessage(QStringLiteral("Media Foundation callback test setup failed"), hr);
+        }
+        return false;
+    }
+
+    NativeVideoDecoder::Impl impl(2, 2);
+    NativeVideoDecoder::FrameCallback* frameCallback = onFrame ? &onFrame : nullptr;
+    NativeVideoDecoder::KeepSurfaceCallback* surfaceCallback = onSurface ? &onSurface : nullptr;
+    return impl.deliverCompletedSample(sample.Get(), frameCallback, surfaceCallback, fallbackPts90k,
+                                       error);
 }
 #endif
 
