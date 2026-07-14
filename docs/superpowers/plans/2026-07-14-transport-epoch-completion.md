@@ -426,3 +426,21 @@ require an unconditional F2 reset immediately after the committed-generation sto
   `tst_outputruntime` and `tst_playbackworker` targets (2/2), the normal GPU-off
   `tst_outputruntime` target (1/1; GPU-off omits `tst_playbackworker`), all model mutants, Python
   compile checks, roadmap audit, and diff/line-ending checks. Do not push.
+
+## Fix Wave 2: Task 5 production reachability barriers
+
+**Review finding:** The top-level source parser discarded complete braced statements and the F1
+reachability check matched only the exact statement `return;`. A production-only compound return
+could therefore bypass both F1 and F2 while the compiled baselines, built with `OLR_UNIT_TEST`,
+removed the adversarial branch.
+
+- [x] Capture RED evidence for production-only braced returns before F1 and between the F2 store
+  and reset, plus nested `if`/`switch` transfers and `goto`, `throw`, and `co_return` variants.
+- [x] Preserve complete top-level compound/control statements and reject explicit non-fallthrough
+  transfers whenever their preprocessor branch can be active in production. Keep comments,
+  test-only branches, and transfer-free scopes accepted.
+- [x] Add a production-representative baseline that compiles the guarded source without
+  `OLR_UNIT_TEST` and runs the public F1 lease-recheck scenario; retain the paired focused
+  baseline/mutant/meta gates for F1 and F2.
+- [x] Run GPU-on/off proof gates, meta-mutants, source adversarial tests, model checks, full tests,
+  roadmap audits, formatting/diff checks, and a fresh review of `187f72ea..HEAD`. Do not push.

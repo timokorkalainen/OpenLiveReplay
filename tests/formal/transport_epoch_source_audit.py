@@ -173,27 +173,52 @@ def fail_at(path: Path, view: LexedSource, offset: int, reason: str) -> None:
 
 
 def top_level_statements(code: str, begin: int, end: int) -> list[tuple[int, int, str]]:
+    """Return complete statements in the function body's outermost scope.
+
+    A closing compound brace is a statement boundary too. Keeping that span is
+    essential for reachability checks: discarding ``{ return; }`` would make the
+    statements on either side appear adjacent even though production cannot
+    reach the latter statement.
+    """
     statements: list[tuple[int, int, str]] = []
     depth = 1
     parentheses = 0
+    brackets = 0
     start = begin + 1
-    for offset in range(begin + 1, end - 1):
+    offset = begin + 1
+    while offset < end - 1:
         char = code[offset]
         if char == "{":
             depth += 1
         elif char == "}":
             depth -= 1
             if depth == 1:
-                start = offset + 1
+                following = offset + 1
+                while following < end - 1 and code[following].isspace():
+                    following += 1
+                continuation = re.match(r"(?:else|catch|while)\b", code[following:])
+                if not continuation and (
+                    following >= end - 1 or code[following] not in ";,"
+                ):
+                    text = re.sub(r"\s+", "", code[start : offset + 1])
+                    if text:
+                        statements.append((start, offset + 1, text))
+                    start = offset + 1
         elif depth == 1:
             if char == "(":
                 parentheses += 1
             elif char == ")":
                 parentheses = max(0, parentheses - 1)
-            elif char == ";" and parentheses == 0:
+            elif char == "[":
+                brackets += 1
+            elif char == "]":
+                brackets = max(0, brackets - 1)
+            elif char == ";" and parentheses == 0 and brackets == 0:
                 text = re.sub(r"\s+", "", code[start : offset + 1])
-                statements.append((start, offset + 1, text))
+                if text:
+                    statements.append((start, offset + 1, text))
                 start = offset + 1
+        offset += 1
     return statements
 
 
@@ -206,8 +231,78 @@ def statement_containing(
     return None, None
 
 
-def preprocessor_stack_at(view: LexedSource, offset: int) -> list[str]:
-    stack: list[str] = []
+KNOWN_PRODUCTION_MACROS = {
+    "OLR_UNIT_TEST": False,
+    "OLR_MUTATE_SKIP_CONFIG_GENERATION": False,
+    "OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET": False,
+}
+
+
+def production_condition_value(kind: str, expression: str) -> bool | None:
+    """Evaluate the small known part of a production preprocessor condition.
+
+    Unknown build selectors remain indeterminate. That is deliberate: a
+    transfer under an unknown selector may be production-active, while a
+    required operation under it is not unconditionally production-active.
+    """
+    expression = expression.strip()
+    if kind in {"ifdef", "ifndef"}:
+        defined = KNOWN_PRODUCTION_MACROS.get(expression)
+        if defined is None:
+            return None
+        return defined if kind == "ifdef" else not defined
+
+    while expression.startswith("(") and expression.endswith(")"):
+        expression = expression[1:-1].strip()
+    if expression in {"0", "false"}:
+        return False
+    if expression in {"1", "true"}:
+        return True
+    negated_defined = re.fullmatch(
+        r"!\s*defined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|\s+([A-Za-z_]\w*))",
+        expression,
+    )
+    if negated_defined:
+        name = negated_defined.group(1) or negated_defined.group(2)
+        defined = KNOWN_PRODUCTION_MACROS.get(name)
+        return None if defined is None else not defined
+    defined_match = re.fullmatch(
+        r"defined\s*(?:\(\s*([A-Za-z_]\w*)\s*\)|\s+([A-Za-z_]\w*))",
+        expression,
+    )
+    if defined_match:
+        name = defined_match.group(1) or defined_match.group(2)
+        return KNOWN_PRODUCTION_MACROS.get(name)
+    return None
+
+
+@dataclass
+class ProductionConditional:
+    parent_possible: bool
+    parent_guaranteed: bool
+    conditions: list[bool | None]
+    possible: bool
+    guaranteed: bool
+
+
+def set_conditional_branch(frame: ProductionConditional, condition: bool | None) -> None:
+    prior = frame.conditions
+    prior_can_all_be_false = not any(value is True for value in prior)
+    prior_must_all_be_false = all(value is False for value in prior)
+    condition_can_be_true = condition is not False
+    condition_must_be_true = condition is True
+    frame.possible = (
+        frame.parent_possible and prior_can_all_be_false and condition_can_be_true
+    )
+    frame.guaranteed = (
+        frame.parent_guaranteed and prior_must_all_be_false and condition_must_be_true
+    )
+    frame.conditions.append(condition)
+
+
+def production_branch_state(view: LexedSource, offset: int) -> tuple[bool, bool]:
+    """Return whether code may be and is guaranteed to be active in production."""
+    stack: list[ProductionConditional] = []
     cursor = 0
     for line in view.comment_code.splitlines(keepends=True):
         if cursor > offset:
@@ -217,22 +312,51 @@ def preprocessor_stack_at(view: LexedSource, offset: int) -> list[str]:
             kind = directive.group(1)
             expression = directive.group(2).strip()
             if kind in {"if", "ifdef", "ifndef"}:
-                stack.append(f"{kind} {expression}".strip())
-            elif kind in {"elif", "else"} and stack:
-                stack[-1] = f"{kind} {expression}".strip()
+                parent_possible = stack[-1].possible if stack else True
+                parent_guaranteed = stack[-1].guaranteed if stack else True
+                frame = ProductionConditional(
+                    parent_possible,
+                    parent_guaranteed,
+                    [],
+                    parent_possible,
+                    parent_guaranteed,
+                )
+                set_conditional_branch(
+                    frame, production_condition_value(kind, expression)
+                )
+                stack.append(frame)
+            elif kind == "elif" and stack:
+                set_conditional_branch(
+                    stack[-1], production_condition_value("if", expression)
+                )
+            elif kind == "else" and stack:
+                set_conditional_branch(stack[-1], True)
             elif kind == "endif" and stack:
                 stack.pop()
         cursor += len(line)
-    return stack
+    if not stack:
+        return True, True
+    return stack[-1].possible, stack[-1].guaranteed
 
 
 def require_production_active(
-    view: LexedSource, offset: int, mutation_guard: str, path: Path, reason: str
+    view: LexedSource, offset: int, path: Path, reason: str
 ) -> None:
-    stack = preprocessor_stack_at(view, offset)
-    allowed_guard = f"ifndef {mutation_guard}"
-    if stack not in ([], [allowed_guard]):
+    _, guaranteed = production_branch_state(view, offset)
+    if not guaranteed:
         fail_at(path, view, offset, reason)
+
+
+def production_control_flow_barrier(
+    view: LexedSource, statement: tuple[int, int, str]
+) -> int | None:
+    statement_code = view.code[statement[0] : statement[1]]
+    for barrier in re.finditer(r"\b(?:co_return|return|throw|goto)\b", statement_code):
+        barrier_offset = statement[0] + barrier.start()
+        possible, _ = production_branch_state(view, barrier_offset)
+        if possible:
+            return barrier_offset
+    return None
 
 
 def audit_playbackworker(source: str, path: Path) -> None:
@@ -287,6 +411,17 @@ def audit_playbackworker(source: str, path: Path) -> None:
     statements = top_level_statements(view.code, begin, end)
     store_index, store_statement = statement_containing(statements, store.start())
     reset_index, reset_statement = statement_containing(statements, reset_offset)
+    if store_statement is None or not re.fullmatch(
+        r"m_committedGeneration\.store\(commit\.seekGeneration,"
+        r"std::memory_order_release\);",
+        store_statement[2],
+    ):
+        fail_at(
+            path,
+            view,
+            store.start(),
+            "m_committedGeneration.store must be an unconditional top-level statement",
+        )
     if reset_statement is None or reset_statement[2] != "resetOutputPlayEpoch();":
         fail_at(
             path,
@@ -297,17 +432,20 @@ def audit_playbackworker(source: str, path: Path) -> None:
     require_production_active(
         view,
         reset_offset,
-        "OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET",
         path,
         "resetOutputPlayEpoch must be production-active",
     )
-    if store_statement is None or reset_index != store_index + 1:
-        fail_at(
-            path,
-            view,
-            reset_offset,
-            "resetOutputPlayEpoch must immediately follow the committed-generation store",
-        )
+    assert store_index is not None and reset_index is not None
+    for statement in statements[store_index + 1 : reset_index]:
+        barrier = production_control_flow_barrier(view, statement)
+        if barrier is not None:
+            fail_at(
+                path,
+                view,
+                barrier,
+                "production control-flow barrier separates committed-generation store "
+                "from epoch reset",
+            )
 
 
 def audit_outputruntime(source: str, path: Path) -> None:
@@ -344,15 +482,23 @@ def audit_outputruntime(source: str, path: Path) -> None:
     require_production_active(
         view,
         generation_offset,
-        "OLR_MUTATE_SKIP_CONFIG_GENERATION",
         path,
         "++m_configGeneration must be production-active",
     )
-    for _, statement_end, statement in statements:
+    for statement_span in statements:
+        _, statement_end, statement = statement_span
         if statement_end > generation_offset:
             break
-        if statement == "return;":
-            fail_at(path, view, generation_offset, "++m_configGeneration is unreachable")
+        barrier = production_control_flow_barrier(view, statement_span)
+        if barrier is not None:
+            if statement == "return;":
+                fail_at(path, view, generation_offset, "++m_configGeneration is unreachable")
+            fail_at(
+                path,
+                view,
+                barrier,
+                "production control-flow barrier precedes ++m_configGeneration",
+            )
 
 
 def require_rejection(check, source: str, path: Path, expected_line: int, expected: str) -> None:
@@ -548,6 +694,76 @@ def main() -> int:
         "is unreachable",
     )
 
+    production_braced_return = replace_once_in_span(
+        runtime,
+        reset_begin,
+        reset_end,
+        generation,
+        "    #ifndef OLR_UNIT_TEST\n"
+        "    { return; }\n"
+        "    #endif\n"
+        + generation,
+    )
+    production_braced_return_offset = production_braced_return.find(
+        "return;", reset_begin
+    )
+    require_rejection(
+        audit_outputruntime,
+        production_braced_return,
+        runtime_path,
+        line_number(production_braced_return, production_braced_return_offset),
+        "production control-flow barrier precedes ++m_configGeneration",
+    )
+
+    nested_generation_barriers = (
+        (
+            "    if (condition) {\n"
+            "        switch (mode) {\n"
+            "        case 0: return;\n"
+            "        default: break;\n"
+            "        }\n"
+            "    }\n",
+            "return;",
+        ),
+        ("    if (condition) { throw failure; }\n", "throw"),
+        ("    if (condition) { goto afterGeneration; }\n", "goto"),
+        ("    if (condition) co_return;\n", "co_return"),
+    )
+    for barrier, token in nested_generation_barriers:
+        barrier_generation = replace_once_in_span(
+            runtime,
+            reset_begin,
+            reset_end,
+            generation,
+            barrier + generation,
+        )
+        barrier_offset = barrier_generation.find(token, reset_begin)
+        require_rejection(
+            audit_outputruntime,
+            barrier_generation,
+            runtime_path,
+            line_number(barrier_generation, barrier_offset),
+            "production control-flow barrier precedes ++m_configGeneration",
+        )
+
+    harmless_generation_scope = replace_once_in_span(
+        runtime,
+        reset_begin,
+        reset_end,
+        generation,
+        "    { int harmless = 0; (void)harmless; } // return; is only a comment\n"
+        "    #ifdef OLR_UNIT_TEST\n"
+        "    { return; }\n"
+        "    #endif\n"
+        + generation,
+    )
+    require_acceptance(
+        audit_outputruntime,
+        harmless_generation_scope,
+        runtime_path,
+        "transfer-free scopes, comments, and test-only returns before F1",
+    )
+
     preprocessor_generation = replace_once_in_span(
         runtime,
         reset_begin,
@@ -605,6 +821,49 @@ def main() -> int:
         worker_path,
         line_number(conditional_reset, conditional_reset_offset),
         "must be an unconditional top-level statement",
+    )
+
+    production_braced_result_return = replace_once_in_span(
+        worker,
+        commit_begin,
+        commit_end,
+        committed_store + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + epoch_reset,
+        committed_store
+        + "\n#ifndef OLR_UNIT_TEST\n"
+        + "    { return result; }\n"
+        + "#endif\n"
+        + "#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n"
+        + epoch_reset,
+    )
+    production_result_return_offset = production_braced_result_return.find(
+        "return result", store_offset
+    )
+    require_rejection(
+        audit_playbackworker,
+        production_braced_result_return,
+        worker_path,
+        line_number(production_braced_result_return, production_result_return_offset),
+        "production control-flow barrier separates committed-generation store from epoch reset",
+    )
+
+    harmless_reset_scope = replace_once_in_span(
+        worker,
+        commit_begin,
+        commit_end,
+        committed_store + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + epoch_reset,
+        committed_store
+        + "\n    { const bool harmless = true; (void)harmless; } // throw is a comment\n"
+        + "#ifdef OLR_UNIT_TEST\n"
+        + "    { return result; }\n"
+        + "#endif\n"
+        + "#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n"
+        + epoch_reset,
+    )
+    require_acceptance(
+        audit_playbackworker,
+        harmless_reset_scope,
+        worker_path,
+        "transfer-free scopes, comments, and test-only returns between F2 operations",
     )
 
     preprocessor_reset = replace_once_in_span(
