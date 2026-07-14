@@ -1,0 +1,67 @@
+#ifndef H26XTIMINGCONTEXT_H
+#define H26XTIMINGCONTEXT_H
+
+#include "pespacket.h"
+#include "recorder_engine/timing/smpte12m.h"
+#include "recorder_engine/timing/timecodeevidence.h"
+
+#include <QByteArray>
+#include <QList>
+
+#include <cstdint>
+
+enum class H26xTimingSyntaxStatus : uint8_t { Valid, Unsupported, Malformed };
+
+struct H264TimingSyntax {
+    H26xTimingSyntaxStatus status = H26xTimingSyntaxStatus::Malformed;
+    FrameRateQ frameRate;
+    bool fixedFrameRate = false;
+    bool cpbDpbDelaysPresent = false;
+    uint8_t cpbRemovalDelayLength = 0;
+    uint8_t dpbOutputDelayLength = 0;
+    uint8_t timeOffsetLength = 0;
+    bool picStructPresent = false;
+};
+
+// HEVC parsing is intentionally deferred to the next task. The typed placeholder
+// prevents an HEVC parameter set from being mistaken for malformed H.264 syntax.
+struct HevcTimingSyntax {
+    H26xTimingSyntaxStatus status = H26xTimingSyntaxStatus::Unsupported;
+};
+
+class H26xTimingContext {
+public:
+    bool updateParameterSets(NativeVideoCodec codec, const QList<QByteArray>& vps,
+                             const QList<QByteArray>& sps);
+    NativeVideoCodec codec() const;
+    FrameRateQ constantFrameRate() const;
+    bool fixedFrameRate() const;
+    uint64_t generation() const;
+    const H264TimingSyntax* h264() const;
+    const HevcTimingSyntax* hevc() const;
+
+private:
+    NativeVideoCodec m_codec = NativeVideoCodec::Unknown;
+    QList<QByteArray> m_vps;
+    QList<QByteArray> m_sps;
+    uint64_t m_generation = 0;
+    H264TimingSyntax m_h264;
+    HevcTimingSyntax m_hevc;
+};
+
+namespace H26xTimingDetail {
+
+enum class TimecodeParseStatus : uint8_t { Valid, NoTimestamp, Unsupported, Malformed };
+
+struct TimecodeParseResult {
+    TimecodeParseStatus status = TimecodeParseStatus::NoTimestamp;
+    Smpte12mTimecode timecode;
+};
+
+// Internal parser seam shared by the public Annex-B extractor. It returns a
+// typed status so a short/reserved payload can never leak a partially filled label.
+TimecodeParseResult parseH264PicTiming(const QByteArray& payload, const H264TimingSyntax& syntax);
+
+} // namespace H26xTimingDetail
+
+#endif // H26XTIMINGCONTEXT_H

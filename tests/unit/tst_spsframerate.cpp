@@ -1,5 +1,7 @@
 #include <QtTest>
+#include <QFile>
 
+#include "recorder_engine/ingest/h26xtimingcontext.h"
 #include "recorder_engine/ingest/spsframerate.h"
 
 #include <cstdint>
@@ -10,7 +12,11 @@ class TestSpsFrameRate : public QObject {
 private slots:
     void rejectsUnsupportedAndMalformedInput();
     void recoversRateFromVuiTimingInfo();
+    void requiresFixedFrameRateFlag();
+    void skipsHighProfileScalingLists();
     void rejectsImplausibleRate();
+    void cachesTimingContextByParameterSetBytes();
+    void reportsMalformedAndUnsupportedContext();
 };
 
 namespace {
@@ -43,9 +49,22 @@ struct BitWriter {
     }
 };
 
-QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale) {
+QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale, bool fixedFrameRate = true,
+                   bool highProfileScalingList = false) {
     BitWriter w;
     w.ue(0);  // seq_parameter_set_id
+    if (highProfileScalingList) {
+        w.ue(1);  // chroma_format_idc = 4:2:0
+        w.ue(0);  // bit_depth_luma_minus8
+        w.ue(0);  // bit_depth_chroma_minus8
+        w.bit(0); // qpprime_y_zero_transform_bypass_flag
+        w.bit(1); // seq_scaling_matrix_present_flag
+        w.bit(1); // seq_scaling_list_present_flag[0]
+        for (int i = 0; i < 16; ++i)
+            w.ue(0); // delta_scale = se(v) 0
+        for (int i = 1; i < 8; ++i)
+            w.bit(0); // remaining scaling lists use defaults
+    }
     w.ue(0);  // log2_max_frame_num_minus4
     w.ue(0);  // pic_order_cnt_type = 0
     w.ue(0);  //   log2_max_pic_order_cnt_lsb_minus4
@@ -64,12 +83,16 @@ QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale) {
     w.bit(1); // timing_info_present_flag
     w.u(numUnitsInTick, 32);
     w.u(timeScale, 32);
-    w.bit(0); // fixed_frame_rate_flag (parser stops before this; padding only)
+    w.bit(fixedFrameRate ? 1 : 0);
+    w.bit(0); // nal_hrd_parameters_present_flag
+    w.bit(0); // vcl_hrd_parameters_present_flag
+    w.bit(1); // pic_struct_present_flag
+    w.bit(0); // bitstream_restriction_flag
     w.bit(1); // rbsp_stop_one_bit
 
     QByteArray out;
     out.append(char(0x67)); // NAL header: nal_unit_type = 7 (SPS)
-    out.append(char(0x42)); // profile_idc = 66 (Baseline: no high-profile block)
+    out.append(char(highProfileScalingList ? 0x64 : 0x42));
     out.append(char(0x00)); // constraint flags + reserved
     out.append(char(0x1e)); // level_idc = 30
     int zeros = 0;
@@ -82,6 +105,14 @@ QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale) {
         zeros = (b == 0x00) ? zeros + 1 : 0;
     }
     return out;
+}
+
+QByteArray fixture(const char* name) {
+    const QString path =
+        QFINDTESTDATA(QStringLiteral("../fixtures/timecode/") + QString::fromLatin1(name));
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return {};
+    return file.readAll();
 }
 } // namespace
 
@@ -117,11 +148,78 @@ void TestSpsFrameRate::recoversRateFromVuiTimingInfo() {
     QCOMPARE(double(p25.num) / p25.den, 25.0);
 }
 
+void TestSpsFrameRate::requiresFixedFrameRateFlag() {
+    QVERIFY(!parseSpsFrameRate(NativeVideoCodec::H264, makeSps(1001, 60000, false)).valid());
+}
+
+void TestSpsFrameRate::skipsHighProfileScalingLists() {
+    const SpsFrameRate rate =
+        parseSpsFrameRate(NativeVideoCodec::H264, makeSps(1001, 60000, true, true));
+    QVERIFY(rate.valid());
+    QCOMPARE(rate.num, int32_t(30000));
+    QCOMPARE(rate.den, int32_t(1001));
+}
+
 void TestSpsFrameRate::rejectsImplausibleRate() {
     // 1000 fps (2000 / 2) is above the [12,240] guard -> {0,0}.
     QVERIFY(!parseSpsFrameRate(NativeVideoCodec::H264, makeSps(1, 2000)).valid());
     // 1 fps (2 / 2) is below the guard -> {0,0}.
     QVERIFY(!parseSpsFrameRate(NativeVideoCodec::H264, makeSps(1, 2)).valid());
+}
+
+void TestSpsFrameRate::cachesTimingContextByParameterSetBytes() {
+    H26xTimingContext context;
+    const QList<QByteArray> sps{fixture("h264_sps_hrd.bin")};
+    QVERIFY(!sps.first().isEmpty());
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, sps));
+    QCOMPARE(context.codec(), NativeVideoCodec::H264);
+    QCOMPARE(context.generation(), uint64_t(1));
+    QCOMPARE(context.constantFrameRate(), (FrameRateQ{30000, 1001}));
+    QVERIFY(context.fixedFrameRate());
+    QVERIFY(context.h264() != nullptr);
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Valid);
+    QCOMPARE(context.h264()->cpbRemovalDelayLength, uint8_t(10));
+    QCOMPARE(context.h264()->dpbOutputDelayLength, uint8_t(7));
+    QCOMPARE(context.h264()->timeOffsetLength, uint8_t(0));
+    QVERIFY(context.h264()->picStructPresent);
+
+    for (int i = 0; i < 1000; ++i)
+        QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, sps));
+    QCOMPARE(context.generation(), uint64_t(1));
+
+    const QList<QByteArray> changed{makeSps(1, 50)};
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, changed));
+    QCOMPARE(context.generation(), uint64_t(2));
+    QCOMPARE(context.constantFrameRate(), (FrameRateQ{25, 1}));
+    QCOMPARE(context.h264()->cpbRemovalDelayLength, uint8_t(0));
+    QCOMPARE(context.h264()->dpbOutputDelayLength, uint8_t(0));
+}
+
+void TestSpsFrameRate::reportsMalformedAndUnsupportedContext() {
+    H26xTimingContext context;
+    const QList<QByteArray> malformed{QByteArray::fromHex("6764001fac")};
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, malformed));
+    QCOMPARE(context.generation(), uint64_t(1));
+    QVERIFY(context.h264() != nullptr);
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+    QVERIFY(!context.constantFrameRate().valid());
+    QVERIFY(!context.fixedFrameRate());
+
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, malformed));
+    QCOMPARE(context.generation(), uint64_t(1));
+
+    QByteArray unsupported = makeSps(1, 50);
+    unsupported[1] = char(1); // unknown profile_idc: syntax shape cannot be inferred safely
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {unsupported}));
+    QCOMPARE(context.generation(), uint64_t(2));
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Unsupported);
+
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::Hevc, {QByteArray::fromHex("40")},
+                                         {QByteArray::fromHex("42")}));
+    QCOMPARE(context.generation(), uint64_t(3));
+    QVERIFY(context.h264() == nullptr);
+    QVERIFY(context.hevc() != nullptr);
+    QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Unsupported);
 }
 
 QTEST_GUILESS_MAIN(TestSpsFrameRate)

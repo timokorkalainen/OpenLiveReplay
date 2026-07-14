@@ -1,16 +1,24 @@
 #include <QtTest>
+#include <QFile>
 
 #include "recorder_engine/ingest/h26xseitimecode.h"
+#include "recorder_engine/ingest/h26xtimingcontext.h"
 #include "recorder_engine/timing/smpte12m.h"
 
 class TestH26xSeiTimecode : public QObject {
     Q_OBJECT
 
 private slots:
-    void h264PicTimingDecoded();
+    void h264StandardPicTimingIsDecoded();
+    void h264PicTimingWithHrdIsDecoded();
+    void h264LeadingBcdWithoutTimestampIsIgnored();
+    void h264TruncatedClockTimestampIsRejected();
+    void h264TimeOffsetIsBoundsChecked();
+    void h264PartialTimestampIsNotReturned();
+    void h264OutOfRateFrameLabelIsRejected();
+    void h264PicTimingWithoutContextIsRejected();
     void hevcTimeCodeDecoded();
     void hevcSuffixSeiDecoded();
-    void emulationPreventionStripped();
     void noSeiReturnsInvalid();
     void truncatedSeiPayloadReturnsInvalid();
     void truncatedPayloadSizeReturnsInvalid();
@@ -82,19 +90,178 @@ QByteArray hevcVclNal() {
     return QByteArray(kStartCode4, 4) + QByteArray::fromHex("260100"); // IDR_W_RADL slice
 }
 
+QByteArray fixture(const char* name) {
+    const QString path =
+        QFINDTESTDATA(QStringLiteral("../fixtures/timecode/") + QString::fromLatin1(name));
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    return file.readAll();
+}
+
+QByteArray h264SpsFromAnnexB(const QByteArray& annexB) {
+    for (int i = 0; i + 5 <= annexB.size(); ++i) {
+        int prefix = 0;
+        if (annexB.mid(i, 4) == QByteArray::fromHex("00000001")) {
+            prefix = 4;
+        } else if (annexB.mid(i, 3) == QByteArray::fromHex("000001")) {
+            prefix = 3;
+        }
+        if (prefix == 0 || (uchar(annexB[i + prefix]) & 0x1f) != 7) {
+            continue;
+        }
+        int end = annexB.size();
+        for (int j = i + prefix + 1; j + 3 <= annexB.size(); ++j) {
+            if (annexB.mid(j, 3) == QByteArray::fromHex("000001") ||
+                (j + 4 <= annexB.size() && annexB.mid(j, 4) == QByteArray::fromHex("00000001"))) {
+                end = j;
+                break;
+            }
+        }
+        return annexB.mid(i + prefix, end - i - prefix);
+    }
+    return {};
+}
+
+struct BitWriter {
+    QByteArray bytes;
+    int bitPosition = 0;
+
+    void bit(bool value) {
+        if (bitPosition == 0) bytes.append(char(0));
+        if (value) bytes[bytes.size() - 1] = char(uchar(bytes.back()) | (1u << (7 - bitPosition)));
+        bitPosition = (bitPosition + 1) & 7;
+    }
+
+    void bits(uint32_t value, int count) {
+        for (int i = count - 1; i >= 0; --i)
+            bit(((value >> i) & 1u) != 0);
+    }
+};
+
+QByteArray fullTimestampPayload(int hours, int minutes, int seconds, int frames) {
+    BitWriter writer;
+    writer.bits(0, 4); // pic_struct: frame
+    writer.bit(true);  // clock_timestamp_flag[0]
+    writer.bits(0, 2); // ct_type: progressive
+    writer.bit(false); // nuit_field_based_flag
+    writer.bits(0, 5); // counting_type: no frame count dropping
+    writer.bit(true);  // full_timestamp_flag
+    writer.bit(false); // discontinuity_flag
+    writer.bit(false); // cnt_dropped_flag
+    writer.bits(uint32_t(frames), 8);
+    writer.bits(uint32_t(seconds), 6);
+    writer.bits(uint32_t(minutes), 6);
+    writer.bits(uint32_t(hours), 5);
+    return writer.bytes;
+}
+
+QByteArray partialTimestampPayload() {
+    BitWriter writer;
+    writer.bits(0, 4); // pic_struct: frame
+    writer.bit(true);  // clock_timestamp_flag[0]
+    writer.bits(0, 2); // ct_type: progressive
+    writer.bit(false); // nuit_field_based_flag
+    writer.bits(0, 5); // counting_type
+    writer.bit(false); // full_timestamp_flag
+    writer.bit(false); // discontinuity_flag
+    writer.bit(false); // cnt_dropped_flag
+    writer.bits(4, 8); // n_frames
+    writer.bit(true);  // seconds_flag
+    writer.bits(3, 6); // seconds_value
+    writer.bit(false); // minutes_flag: hours are consequently also absent
+    return writer.bytes;
+}
+
 } // namespace
 
-void TestH26xSeiTimecode::h264PicTimingDecoded() {
-    const Smpte12mTimecode want{10, 11, 12, 13, /*drop*/ false, /*valid*/ true};
-    const QByteArray rbsp = seiMessage(/*pic_timing*/ 1, packedWordBytes(want));
-    const QByteArray annexB = h264SeiNal(rbsp) + h264VclNal();
+void TestH26xSeiTimecode::h264StandardPicTimingIsDecoded() {
+    const QByteArray annexB = fixture("h264_pic_timing_no_hrd.264");
+    QVERIFY(!annexB.isEmpty());
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(annexB)}));
+    const Smpte12mTimecode got = extractH26xSeiTimecode(annexB, NativeVideoCodec::H264, context);
+    QVERIFY(got.valid);
+    QCOMPARE(got.hours, 1);
+    QCOMPARE(got.minutes, 2);
+    QCOMPARE(got.seconds, 3);
+    QCOMPARE(got.frames, 4);
+}
 
-    const Smpte12mTimecode got = extractH26xSeiTimecode(annexB, NativeVideoCodec::H264);
+void TestH26xSeiTimecode::h264PicTimingWithHrdIsDecoded() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {fixture("h264_sps_hrd.bin")}));
+    const Smpte12mTimecode got =
+        extractH26xSeiTimecode(fixture("h264_pic_timing_hrd.264"), NativeVideoCodec::H264, context);
     QVERIFY(got.valid);
     QCOMPARE(got.hours, 10);
     QCOMPARE(got.minutes, 11);
     QCOMPARE(got.seconds, 12);
     QCOMPARE(got.frames, 13);
+}
+
+void TestH26xSeiTimecode::h264LeadingBcdWithoutTimestampIsIgnored() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {fixture("h264_sps_hrd.bin")}));
+    const Smpte12mTimecode got = extractH26xSeiTimecode(fixture("h264_bcd_false_positive.264"),
+                                                        NativeVideoCodec::H264, context);
+    QVERIFY(!got.valid);
+}
+
+void TestH26xSeiTimecode::h264TruncatedClockTimestampIsRejected() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {fixture("h264_sps_hrd.bin")}));
+    QByteArray truncated = fixture("h264_pic_timing_hrd.264");
+    truncated.truncate(13); // declared eight-byte pic_timing payload has only six bytes
+    const Smpte12mTimecode got = extractH26xSeiTimecode(truncated, NativeVideoCodec::H264, context);
+    QVERIFY(!got.valid);
+}
+
+void TestH26xSeiTimecode::h264TimeOffsetIsBoundsChecked() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {fixture("h264_sps_hrd.bin")}));
+    H264TimingSyntax constructedSyntax = *context.h264();
+    constructedSyntax.timeOffsetLength = 5;
+    QByteArray payload = QByteArray::fromHex("0441840206985a80");
+    auto parsed = H26xTimingDetail::parseH264PicTiming(payload, constructedSyntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    QVERIFY(parsed.timecode.valid);
+
+    constructedSyntax.timeOffsetLength = 24;
+    parsed = H26xTimingDetail::parseH264PicTiming(payload, constructedSyntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+    QVERIFY(!parsed.timecode.valid);
+}
+
+void TestH26xSeiTimecode::h264PartialTimestampIsNotReturned() {
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+    const QByteArray annexB = h264SeiNal(seiMessage(1, partialTimestampPayload())) + h264VclNal();
+    const Smpte12mTimecode parsed = extractH26xSeiTimecode(annexB, NativeVideoCodec::H264, context);
+    QVERIFY(!parsed.valid);
+}
+
+void TestH26xSeiTimecode::h264OutOfRateFrameLabelIsRejected() {
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+    QCOMPARE(context.constantFrameRate(), (FrameRateQ{25, 1}));
+
+    const QByteArray annexB =
+        h264SeiNal(seiMessage(1, fullTimestampPayload(1, 2, 3, 25))) + h264VclNal();
+    const Smpte12mTimecode parsed = extractH26xSeiTimecode(annexB, NativeVideoCodec::H264, context);
+    QVERIFY(!parsed.valid);
+}
+
+void TestH26xSeiTimecode::h264PicTimingWithoutContextIsRejected() {
+    H26xTimingContext context;
+    const Smpte12mTimecode got = extractH26xSeiTimecode(fixture("h264_pic_timing_no_hrd.264"),
+                                                        NativeVideoCodec::H264, context);
+    QVERIFY(!got.valid);
 }
 
 void TestH26xSeiTimecode::hevcTimeCodeDecoded() {
@@ -121,39 +288,6 @@ void TestH26xSeiTimecode::hevcSuffixSeiDecoded() {
     QCOMPARE(got.minutes, 59);
     QCOMPARE(got.seconds, 58);
     QCOMPARE(got.frames, 24);
-}
-
-void TestH26xSeiTimecode::emulationPreventionStripped() {
-    // Choose a TC whose packed word contains a 00 00 0x sequence so the encoder
-    // would have inserted an emulation-prevention 0x03. 00:00:00:00 packs to the
-    // word 0x00000000, i.e. payload bytes 00 00 00 00 -> emulated as 00 00 03 00
-    // 00 03 00 ... We hand-build the emulated stream and require the extractor to
-    // strip 00 00 03 -> 00 00 before parsing.
-    const Smpte12mTimecode want{0, 0, 0, 0, /*drop*/ false, /*valid*/ true};
-    const QByteArray rbspRaw =
-        seiMessage(1, packedWordBytes(want)); // type=1,size=4,payload=00000000
-
-    // Emulation-prevention encode rbspRaw: insert 0x03 after every 00 00.
-    QByteArray emulated;
-    int zeros = 0;
-    for (char c : rbspRaw) {
-        const uchar v = uchar(c);
-        if (zeros >= 2 && v <= 0x03) {
-            emulated.append(char(0x03));
-            zeros = 0;
-        }
-        emulated.append(c);
-        zeros = (v == 0) ? zeros + 1 : 0;
-    }
-    QVERIFY(emulated.size() > rbspRaw.size()); // emulation bytes really inserted
-
-    const QByteArray annexB = h264SeiNal(emulated) + h264VclNal();
-    const Smpte12mTimecode got = extractH26xSeiTimecode(annexB, NativeVideoCodec::H264);
-    QVERIFY(got.valid);
-    QCOMPARE(got.hours, 0);
-    QCOMPARE(got.minutes, 0);
-    QCOMPARE(got.seconds, 0);
-    QCOMPARE(got.frames, 0);
 }
 
 void TestH26xSeiTimecode::noSeiReturnsInvalid() {
