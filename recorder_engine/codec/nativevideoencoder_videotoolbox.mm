@@ -425,7 +425,7 @@ public:
         }
         GpuSyncReadScope readScope;
         const GpuReadLease lease = readScope.read(surface);
-        return [&] {
+        const bool encoded = [&] {
             IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
             if (!ioSurface) {
                 if (error) {
@@ -460,6 +460,8 @@ public:
             CVPixelBufferRelease(pb);
             return ok;
         }();
+        readScope.complete();
+        return encoded;
     }
 
     bool encodePixelBuffer(CVPixelBufferRef pb, int64_t ptsTicks, const PacketCallback& onPacket,

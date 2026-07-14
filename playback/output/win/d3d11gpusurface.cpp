@@ -2,6 +2,8 @@
 
 #ifdef _WIN32
 
+#include "playback/gpu/gpugeneration.h"
+
 #include <utility>
 
 namespace {
@@ -16,8 +18,10 @@ D3D11GpuSurface::createKept(Microsoft::WRL::ComPtr<ID3D11Device> device,
     if (!device || !texture || width <= 0 || height <= 0) return nullptr;
 
     auto surface = std::shared_ptr<D3D11GpuSurface>(new D3D11GpuSurface());
+    if (FAILED(device.As(&surface->m_deviceIdentity)) || !surface->m_deviceIdentity) return nullptr;
     surface->m_device = std::move(device);
     surface->m_texture = std::move(texture);
+    surface->m_authorityEpoch = GpuGenerationCounter::instance().current();
     surface->m_subresource = subresource;
     surface->m_width = width;
     surface->m_height = height;

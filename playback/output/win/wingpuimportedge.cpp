@@ -171,13 +171,15 @@ class D3D11IGpuFrameData final : public IFrameData {
 public:
 #ifdef OLR_GPU_PIPELINE_BUILD
     D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface,
-                       std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge budgetCharge)
+                       std::shared_ptr<GpuFence> renderFence, uint64_t renderFenceValue,
+                       GpuBudgetCharge budgetCharge)
         : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)),
-          m_budgetCharge(std::move(budgetCharge)) {}
+          m_renderFenceValue(renderFenceValue), m_budgetCharge(std::move(budgetCharge)) {}
 #else
     D3D11IGpuFrameData(std::shared_ptr<D3D11GpuSurface> surface,
-                       std::shared_ptr<GpuFence> renderFence)
-        : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)) {}
+                       std::shared_ptr<GpuFence> renderFence, uint64_t renderFenceValue)
+        : m_surface(std::move(surface)), m_renderFence(std::move(renderFence)),
+          m_renderFenceValue(renderFenceValue) {}
 #endif
 
     bool isGpuBacked() const override { return true; }
@@ -195,6 +197,7 @@ public:
 private:
     std::shared_ptr<D3D11GpuSurface> m_surface;
     std::shared_ptr<GpuFence> m_renderFence;
+    uint64_t m_renderFenceValue = 0;
 #ifdef OLR_GPU_PIPELINE_BUILD
     GpuBudgetCharge m_budgetCharge;
 #endif
@@ -407,11 +410,12 @@ std::shared_ptr<GpuFence>
 WinGpuImportEdge::createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface) {
     if (!surface) return nullptr;
     GpuSyncReadScope scope;
-    const GpuReadLease lease = scope.read(surface);
-    auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
-    ComPtr<ID3D11Device> device;
-    if (texture) texture->GetDevice(&device);
-    return makeD3D11GpuFence(device.Get());
+    return scope.withRead(surface, [](const GpuReadLease& lease) {
+        auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
+        ComPtr<ID3D11Device> device;
+        if (texture) texture->GetDevice(&device);
+        return makeD3D11GpuFence(device.Get());
+    });
 }
 
 std::shared_ptr<GpuFence> WinGpuImportEdge::createFence() const {
@@ -435,6 +439,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
+    uint64_t exactFenceValue = 0;
     if (renderFence) {
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
@@ -442,13 +447,15 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
         const auto result = operation.submit(
             adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
         if (!result.succeeded()) return FrameHandle{};
-        if (submittedFenceValue) *submittedFenceValue = operation.fenceValue();
+        exactFenceValue = result.fenceValue;
+        if (submittedFenceValue) *submittedFenceValue = exactFenceValue;
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
     auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence),
-                                                     std::move(charge));
+                                                     exactFenceValue, std::move(charge));
 #else
-    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence));
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence),
+                                                     exactFenceValue);
 #endif
     return FrameHandle(std::move(data), meta);
 }
@@ -500,25 +507,23 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     if (cached != m_cpuCache.cend()) return cached.value();
 
     GpuSyncReadScope readScope;
-    const GpuReadLease lease = readScope.read(m_surface);
-    {
+    const bool nativeReadComplete = readScope.withRead(m_surface, [&](const GpuReadLease& lease) {
         auto* src = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         ComPtr<ID3D11Device> retainedDevice;
         if (src) src->GetDevice(&retainedDevice);
         ID3D11Device* device = retainedDevice.Get();
-        if (!device || !src) return out;
+        if (!device || !src) return false;
 
-        const uint64_t pendingFenceValue = m_surface->pendingFenceValue();
-        if (pendingFenceValue != 0) {
+        if (m_renderFenceValue != 0) {
             if (!m_renderFence ||
-                !m_renderFence->wait(pendingFenceValue, kD3DReadbackFenceTimeoutMs)) {
-                return out;
+                !m_renderFence->wait(m_renderFenceValue, kD3DReadbackFenceTimeoutMs)) {
+                return false;
             }
         }
 
         ComPtr<ID3D11DeviceContext> ctx;
         device->GetImmediateContext(&ctx);
-        if (!ctx) return out;
+        if (!ctx) return false;
 
         D3D11_TEXTURE2D_DESC desc{};
         src->GetDesc(&desc);
@@ -531,12 +536,12 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
         staging.MipLevels = 1;
 
         ComPtr<ID3D11Texture2D> readable;
-        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return out;
+        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return false;
         ctx->CopySubresourceRegion(readable.Get(), 0, 0, 0, 0, src, lease.nativeSubresource(),
                                    nullptr);
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return out;
+        if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
 
         const int w = m_surface->desc().width;
         const int h = m_surface->desc().height;
@@ -574,20 +579,22 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
         }
 
         ctx->Unmap(readable.Get(), 0);
-        if (out.isValid()) {
-            gpuRecordFrameReadToCpuReadback();
-            if (m_renderFence && m_surface) {
-                GpuRetireRegistry registry;
-                GpuOpScope operation(m_renderFence, registry);
-                auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
-                (void) operation.submit(
-                    adapter,
-                    GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{m_surface}));
-            }
-            m_cpuCache.insert(int(target), out);
+        return true;
+    });
+    if (!nativeReadComplete) return out;
+
+    if (out.isValid()) {
+        gpuRecordFrameReadToCpuReadback();
+        if (m_renderFence && m_surface) {
+            GpuRetireRegistry registry;
+            GpuOpScope operation(m_renderFence, registry);
+            auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+            (void) operation.submit(
+                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{m_surface}));
         }
-        return out;
+        m_cpuCache.insert(int(target), out);
     }
+    return out;
 }
 
 CpuPlanes D3D11IGpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {

@@ -541,7 +541,7 @@ jobs:
             -DOLR_PYTHON3_EXECUTABLE="$HOST_PYTHON" \
             -DOLR_FFMPEG_ROOT="$FFMPEG_ROOT" \
             -DOLR_SRT_ROOT="$SRT_ROOT"
-          cmake --build build-tests --target OpenLiveReplay qt_core_media_smoke tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge rhi_d3d_probe
+          cmake --build build-tests --target OpenLiveReplay qt_core_media_smoke tst_nativeaacdecoder tst_nativevideodecoder tst_gpufence tst_gpucompositor tst_wingpuimportedge tst_gpusurfaceallocator tst_streamworker_gpuencode tst_gpurhicontext tst_gpuretireregistry_perf tst_gpuretireregistry_production_perf rhi_d3d_probe
 
       - name: Run Windows GPU import probe (diagnostic)
         shell: bash
@@ -585,9 +585,11 @@ jobs:
           mingw_root="$(to_msys "$(newest "$qt_tools_dir"/mingw*_64)")"
           ffmpeg_root="$(cd windows_build/dist/ffmpeg && pwd)"
           srt_root="$(cd windows_build/dist/srt && pwd)"
+          mkdir -p "$RUNNER_TEMP/gpu-perf"
+          export OLR_GPU_PERF_EVIDENCE_DIR="$(to_msys "$RUNNER_TEMP/gpu-perf")"
           export PATH="$mingw_root/bin:$qt_root/bin:$ffmpeg_root/bin:$ffmpeg_root/lib:$srt_root/bin:$srt_root/lib:$PATH"
           ctest --test-dir build-tests --output-on-failure \
-            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge)$'
+            -R '^(tst_nativeaacdecoder|tst_gpufence|tst_wingpuimportedge|tst_gpusurfaceallocator|tst_streamworker_gpuencode|tst_gpurhicontext|tst_gpuretireregistry_perf|tst_gpuretireregistry_production_perf)$'
           gpu_test="$(find build-tests -type f \( -name tst_gpucompositor -o -name tst_gpucompositor.exe \) -print -quit)"
           if [ ! -x "$gpu_test" ]; then
             echo "::error::tst_gpucompositor executable not found"
@@ -607,6 +609,14 @@ jobs:
             echo "::warning::tst_gpucompositor produced no QtTest log at $gpu_log"
           fi
           exit "$gpu_rc"
+
+      - name: Upload Windows GPU performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-performance-evidence-windows
+          path: ${{ runner.temp }}/gpu-perf/*.json
+          if-no-files-found: warn
 
       - name: Run static media/package smoke tests
         shell: bash

@@ -7,6 +7,7 @@
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpusurfaceallocator.h"
@@ -31,24 +32,35 @@ namespace {
 
 class TestSurface final : public GpuSurface {
 public:
+    explicit TestSurface(GpuSurfaceCompatibility compatibility = {})
+        : m_compatibility(compatibility) {}
+
     GpuSurfaceDesc desc() const override { return GpuSurfaceDesc{FramePixelFormat::Nv12, 64, 48}; }
     bool isValid() const override { return true; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
     void* nativeHandle() const override { return nullptr; }
     void retainUntilFenceRetired(uint64_t fenceValue) override { m_pendingFence = fenceValue; }
     uint64_t pendingFenceValue() const override { return m_pendingFence; }
 
 private:
+    GpuSurfaceCompatibility m_compatibility;
     uint64_t m_pendingFence = 0;
 };
 
 class TestFence final : public GpuFence {
 public:
+    TestFence(uintptr_t deviceDomainId = 0, uint64_t authorityEpoch = 0)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
     uint64_t signal() override { return ++m_value; }
-    bool wait(uint64_t value, int) override { return m_value >= value; }
-    uint64_t completedValue() const override { return m_value; }
+    bool wait(uint64_t value, int) override { return m_completed >= value; }
+    uint64_t completedValue() const override { return m_completed; }
+    uint64_t lastSignaledValue() const { return m_value; }
+    void complete(uint64_t value) { m_completed = value; }
 
 private:
     uint64_t m_value = 0;
+    uint64_t m_completed = 0;
 };
 
 class ZeroByteSurface final : public GpuSurface {
@@ -333,8 +345,13 @@ void TestGpuSurfaceAllocator::headroomMintsChargedGpuHandle() {
     b.reset();
     b.configure(c);
 
-    auto surface = std::make_shared<TestSurface>();
-    auto renderFence = std::make_shared<TestFence>();
+    constexpr uintptr_t deviceDomain = 0xA110C;
+    constexpr uint64_t authorityEpoch = 1;
+    auto surface =
+        std::make_shared<TestSurface>(GpuSurfaceCompatibility{deviceDomain, authorityEpoch});
+    auto renderFence = std::make_shared<TestFence>(deviceDomain, authorityEpoch);
+    GpuRetireRegistry retireRegistry;
+    const qsizetype pendingBefore = retireRegistry.diagnostics().pendingRetains;
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 64;
@@ -344,8 +361,12 @@ void TestGpuSurfaceAllocator::headroomMintsChargedGpuHandle() {
     QVERIFY(!r.handle.isNull());
     QVERIFY(r.handle.isGpuBacked());
     QVERIFY(!r.degradedToCpu);
-    QVERIFY(surface->pendingFenceValue() > uint64_t(0));
+    QVERIFY(renderFence->lastSignaledValue() > uint64_t(0));
+    QCOMPARE(retireRegistry.diagnostics().pendingRetains, pendingBefore + 1);
     QVERIFY(b.liveBytes() > 0);
+    renderFence->complete(renderFence->lastSignaledValue());
+    retireRegistry.drainCompleted();
+    QCOMPARE(retireRegistry.diagnostics().pendingRetains, pendingBefore);
 }
 
 void TestGpuSurfaceAllocator::customFactoryReceivesBudgetCharge() {

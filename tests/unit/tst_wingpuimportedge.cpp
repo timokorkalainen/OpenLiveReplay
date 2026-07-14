@@ -27,6 +27,9 @@ namespace {
 
 class DeferredFence final : public GpuFence {
 public:
+    explicit DeferredFence(GpuSurfaceCompatibility compatibility)
+        : GpuFence(compatibility.deviceDomainId, compatibility.authorityEpoch) {}
+
     uint64_t signal() override { return m_next.fetch_add(1, std::memory_order_acq_rel) + 1; }
     bool wait(uint64_t value, int) override {
         waits.fetch_add(1, std::memory_order_acq_rel);
@@ -188,6 +191,7 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
     QCOMPARE(surface->pendingFenceValue(), uint64_t(5));
     surface.reset();
     QCOMPARE(static_cast<ID3D11Texture2D*>(lease.nativeHandle()), texture.Get());
+    readScope.complete();
 #endif
 }
 
@@ -266,20 +270,21 @@ void TestWinGpuImportEdge::importedFrameExposesRenderFence() {
 
     auto surface = D3D11GpuSurface::createKept(device, texture, 0, 64, 64);
     QVERIFY(surface != nullptr);
-    auto renderFence = std::make_shared<DeferredFence>();
+    auto renderFence = std::make_shared<DeferredFence>(surface->compatibility());
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 64;
     meta.key.height = 64;
 
-    const FrameHandle handle =
-        WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence);
+    uint64_t submittedFenceValue = 0;
+    const FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(
+        surface, meta, renderFence, {}, &submittedFenceValue);
 
     QVERIFY(handle.isGpuBacked());
     QVERIFY(handle.data() != nullptr);
     QVERIFY(handle.data()->gpuFence() == renderFence);
-    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
-    renderFence->complete(1);
+    QCOMPARE(submittedFenceValue, uint64_t(1));
+    renderFence->complete(submittedFenceValue);
     GpuRetireRegistry{}.drainCompleted();
 #endif
 }
@@ -382,20 +387,22 @@ void TestWinGpuImportEdge::readToCpuWaitsForPendingFenceBeforeCopy() {
 
     auto surface = D3D11GpuSurface::createKept(device, texture, 0, kW, kH);
     QVERIFY(surface != nullptr);
-    auto fence = std::make_shared<DeferredFence>();
+    auto fence = std::make_shared<DeferredFence>(surface->compatibility());
 
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = kW;
     meta.key.height = kH;
-    const FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, fence);
-    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
+    uint64_t submittedFenceValue = 0;
+    const FrameHandle handle =
+        WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, fence, {}, &submittedFenceValue);
+    QCOMPARE(submittedFenceValue, uint64_t(1));
 
     QVERIFY(!handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
     QCOMPARE(fence->waits.load(std::memory_order_acquire), 1);
-    QCOMPARE(fence->lastValue.load(std::memory_order_acquire), uint64_t(1));
+    QCOMPARE(fence->lastValue.load(std::memory_order_acquire), submittedFenceValue);
 
-    fence->complete(1);
+    fence->complete(submittedFenceValue);
     const CpuPlanes got = handle.readToCpu(FramePixelFormat::Yuv420p);
     QVERIFY(got.isValid());
     QCOMPARE(fence->waits.load(std::memory_order_acquire), 2);
@@ -580,16 +587,18 @@ void TestWinGpuImportEdge::surfaceSurvivesInFlightReadback() {
     auto surface = D3D11GpuSurface::createKept(device, texture, 0, kW, kH);
     QVERIFY(surface != nullptr);
     std::weak_ptr<D3D11GpuSurface> weak = surface;
-    auto renderFence = std::make_shared<DeferredFence>();
+    auto renderFence = std::make_shared<DeferredFence>(surface->compatibility());
     FrameMetadata meta;
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = kW;
     meta.key.height = kH;
-    FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence);
-    QCOMPARE(surface->pendingFenceValue(), uint64_t(1));
+    uint64_t submittedFenceValue = 0;
+    FrameHandle handle = WinGpuImportEdge::makeGpuFrameHandleForTest(surface, meta, renderFence, {},
+                                                                     &submittedFenceValue);
+    QCOMPARE(submittedFenceValue, uint64_t(1));
     surface.reset();
     QVERIFY(!weak.expired());
-    renderFence->complete(1);
+    renderFence->complete(submittedFenceValue);
     QVERIFY(handle.readToCpu(FramePixelFormat::Yuv420p).isValid());
     handle = FrameHandle();
     QVERIFY(!weak.expired());

@@ -859,6 +859,7 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
         }
         return true;
     }();
+    readScope.complete();
     if (!wrapped) return false;
 
     const LONGLONG stampedTime = m_nextSampleTime;

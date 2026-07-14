@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <QFile>
+#include <QDir>
 #include <QMutex>
 #include <QMutexLocker>
 
@@ -20,6 +21,17 @@
 #include <vector>
 
 namespace {
+
+void emitMachineMetrics(const QString& fileName, const QString& json) {
+    qInfo().noquote() << QStringLiteral("OLR_GPU_PERF_JSON=") + json;
+    const QString evidenceDir = qEnvironmentVariable("OLR_GPU_PERF_EVIDENCE_DIR");
+    if (evidenceDir.isEmpty()) return;
+    QVERIFY2(QDir().mkpath(evidenceDir), "could not create GPU performance evidence directory");
+    QFile output(QDir(evidenceDir).filePath(fileName));
+    QVERIFY2(output.open(QIODevice::WriteOnly | QIODevice::Truncate),
+             "could not open GPU performance evidence file");
+    QCOMPARE(output.write(json.toUtf8()), qint64(json.toUtf8().size()));
+}
 
 class PerfSurface final : public GpuSurface {
 public:
@@ -45,6 +57,7 @@ public:
     bool wait(uint64_t value, int) override { return mCompleted >= value; }
     uint64_t completedValue() const override { return mCompleted; }
     void complete() noexcept { mCompleted = mSignalled; }
+    uint64_t signalCount() const noexcept { return mSignalled; }
 
     template <typename SubmitFn>
     std::optional<GpuRetirementTicket>
@@ -367,6 +380,10 @@ void TestGpuRetireRegistryPerf::warmedCommonPathUsesPooledShards() {
     QCOMPARE(storageSnapshot.fenceGroupsVisited, uint64_t(sampleCount));
     QCOMPARE(storageSnapshot.activeNodesVisited, uint64_t(sampleCount));
     QCOMPARE(storageSnapshot.completionQueries, uint64_t(sampleCount));
+    QVERIFY(storageSnapshot.shardLockHoldNanoseconds > uint64_t(0));
+    QVERIFY(storageSnapshot.maximumShardLockHoldNanoseconds > uint64_t(0));
+    QVERIFY(storageSnapshot.maximumShardLockHoldNanoseconds <=
+            storageSnapshot.shardLockHoldNanoseconds);
 
     const qint64 median = percentile(samples, 1, 2);
     const qint64 p95 = percentile(samples, 95, 100);
@@ -379,6 +396,28 @@ void TestGpuRetireRegistryPerf::warmedCommonPathUsesPooledShards() {
           static_cast<unsigned long long>(storageSnapshot.fenceGroupsVisited),
           static_cast<unsigned long long>(storageSnapshot.completionQueries),
           static_cast<unsigned long long>(storageSnapshot.activeNodesVisited));
+    const GpuRetireDiagnostics diagnostics = registry.diagnostics();
+    const QString machineMetrics =
+        QStringLiteral("{\"schema\":1,\"case\":\"pooled_one_owner\","
+                       "\"warmups\":1,\"samples\":%1,\"latency_median_ns\":%2,"
+                       "\"latency_p95_ns\":%3,\"alloc_preparation\":%4,"
+                       "\"alloc_callback\":%5,\"alloc_post_accept\":%6,\"signals\":%7,"
+                       "\"shard_lock_acquisitions\":%8,\"pending_after\":%9,"
+                       "\"pending_high_water\":%10,\"shard_lock_hold_total_ns\":%11,"
+                       "\"shard_lock_hold_max_ns\":%12}")
+            .arg(sampleCount)
+            .arg(median)
+            .arg(p95)
+            .arg(allocations.preparation)
+            .arg(allocations.callback)
+            .arg(allocations.postAccept)
+            .arg(fence->signalCount())
+            .arg(storageSnapshot.shardLockAcquisitions)
+            .arg(diagnostics.pendingRetains)
+            .arg(diagnostics.highWaterMark)
+            .arg(storageSnapshot.shardLockHoldNanoseconds)
+            .arg(storageSnapshot.maximumShardLockHoldNanoseconds);
+    emitMachineMetrics(QStringLiteral("gpu-retirement-structural.json"), machineMetrics);
     GpuGenerationCounter::instance().resetForTest();
 }
 

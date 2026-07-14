@@ -4,6 +4,8 @@
 #include <QtTest>
 
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/output/framepixelformat.h"
 #ifdef __APPLE__
@@ -38,6 +40,8 @@ private slots:
     void appleSurfaceIsIoSurfaceBacked();
     void appleSurfaceRespectsInjectedAllocFailure();
     void appleSurfaceTracksPendingFence();
+    void appleSurfaceRejectsReusedDeviceUnderNewAuthorityEpoch();
+    void applePixelBufferWrapperOutlivesSurfaceOwner();
 #endif
 };
 
@@ -106,6 +110,37 @@ void TestGpuSurface::appleSurfaceTracksPendingFence() {
     QCOMPARE(surface->pendingFenceValue(), uint64_t(7));
     surface->retainUntilFenceRetired(9);
     QCOMPARE(surface->pendingFenceValue(), uint64_t(9));
+}
+
+void TestGpuSurface::appleSurfaceRejectsReusedDeviceUnderNewAuthorityEpoch() {
+    GpuGenerationCounter::instance().resetForTest();
+    auto oldSurface = makeAppleNv12Surface(64, 48);
+    auto oldFence = GpuFence::create();
+    if (!oldSurface || !oldFence) QSKIP("no default Metal device/fence on this host");
+    QVERIFY(oldFence->sharesDeviceAuthorityWith(oldSurface));
+
+    GpuGenerationCounter::instance().bump();
+    auto replacementFence = GpuFence::create();
+    auto replacementSurface = makeAppleNv12Surface(64, 48);
+    QVERIFY(replacementFence != nullptr);
+    QVERIFY(replacementSurface != nullptr);
+    QCOMPARE(replacementFence->identity().deviceDomainId, oldFence->identity().deviceDomainId);
+    QVERIFY(replacementFence->identity().authorityEpoch != oldFence->identity().authorityEpoch);
+    QVERIFY(!replacementFence->sharesDeviceAuthorityWith(oldSurface));
+    QVERIFY(replacementFence->sharesDeviceAuthorityWith(replacementSurface));
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurface::applePixelBufferWrapperOutlivesSurfaceOwner() {
+    auto surface = makeAppleNv12Surface(64, 48);
+    if (!surface) QSKIP("could not allocate an IOSurface-backed NV12 surface");
+    CVPixelBufferRef wrapper = retainApplePixelBufferWrapper(surface);
+    QVERIFY(wrapper != nullptr);
+    surface.reset();
+    QCOMPARE(CVPixelBufferGetWidth(wrapper), size_t(64));
+    QCOMPARE(CVPixelBufferGetHeight(wrapper), size_t(48));
+    QVERIFY(CVPixelBufferGetIOSurface(wrapper) != nullptr);
+    CVPixelBufferRelease(wrapper);
 }
 #endif
 

@@ -36,6 +36,8 @@ using GpuRetireDiagnosticsHook = void (*)(void*) noexcept;
 
 struct GpuRetireStorageSnapshot {
     uint64_t shardLockAcquisitions = 0;
+    uint64_t shardLockHoldNanoseconds = 0;
+    uint64_t maximumShardLockHoldNanoseconds = 0;
     uint64_t drainShardVisits = 0;
     uint64_t activeNodesVisited = 0;
     uint64_t fenceGroupsVisited = 0;

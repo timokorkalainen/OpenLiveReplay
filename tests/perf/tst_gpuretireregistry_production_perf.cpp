@@ -1,5 +1,8 @@
 #include <QtTest>
 
+#include <QDir>
+#include <QFile>
+
 #include "saved912gpuopscope.h"
 
 #include "playback/gpu/gpufence.h"
@@ -12,6 +15,7 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <type_traits>
 #include <vector>
 
 #ifdef OLR_UNIT_TEST
@@ -19,6 +23,18 @@
 #endif
 
 namespace {
+
+void emitMachineMetrics(const QString& fileName, const QString& json) {
+    qInfo().noquote() << QStringLiteral("OLR_GPU_PERF_JSON=") + json;
+    const QString evidenceDir = qEnvironmentVariable("OLR_GPU_PERF_EVIDENCE_DIR");
+    if (evidenceDir.isEmpty()) return;
+    QVERIFY2(QDir().mkpath(evidenceDir), "could not create GPU performance evidence directory");
+    QFile output(QDir(evidenceDir).filePath(fileName));
+    QVERIFY2(output.open(QIODevice::WriteOnly | QIODevice::Truncate),
+             "could not open GPU performance evidence file");
+    const QByteArray encoded = json.toUtf8();
+    QCOMPARE(output.write(encoded), qint64(encoded.size()));
+}
 
 class ProductionPerfSurface final : public GpuSurface {
 public:
@@ -43,6 +59,7 @@ public:
     bool wait(uint64_t value, int) override { return m_completed >= value; }
     uint64_t completedValue() const override { return m_completed; }
     void complete() noexcept { m_completed = m_signaled; }
+    uint64_t signalCount() const noexcept { return m_signaled; }
 
     template <typename SubmitFn>
     std::optional<GpuRetirementTicket>
@@ -78,6 +95,8 @@ struct RoundMetrics {
     qint64 registrationP95 = 0;
     qint64 drainMedian = 0;
     qint64 drainP95 = 0;
+    uint64_t signalCalls = 0;
+    qsizetype pendingHighWater = 0;
 };
 
 template <typename Registry, typename OpScope>
@@ -90,6 +109,8 @@ measureRound(const std::array<std::array<std::shared_ptr<GpuSurface>, 4>, 256>& 
     std::vector<qint64> drain;
     registration.reserve(sampleCount);
     drain.reserve(sampleCount);
+    uint64_t signalCalls = 0;
+    qsizetype pendingHighWater = 0;
     for (int sample = 0; sample < sampleCount; ++sample) {
         Registry registry;
         auto fence = std::make_shared<ProductionPerfFence>(domain, authority);
@@ -103,13 +124,20 @@ measureRound(const std::array<std::array<std::shared_ptr<GpuSurface>, 4>, 256>& 
         }
         registration.push_back(elapsedNanoseconds(registrationStarted));
         if (!publishedAll) return {};
+        signalCalls += fence->signalCount();
+        if constexpr (std::is_same_v<Registry, GpuRetireRegistry>)
+            pendingHighWater = std::max(pendingHighWater, registry.diagnostics().highWaterMark);
         fence->complete();
         const auto drainStarted = std::chrono::steady_clock::now();
         registry.drainCompleted();
         drain.push_back(elapsedNanoseconds(drainStarted));
     }
-    return RoundMetrics{percentile(registration, 1, 2), percentile(registration, 95, 100),
-                        percentile(drain, 1, 2), percentile(drain, 95, 100)};
+    return RoundMetrics{percentile(registration, 1, 2),
+                        percentile(registration, 95, 100),
+                        percentile(drain, 1, 2),
+                        percentile(drain, 95, 100),
+                        signalCalls,
+                        pendingHighWater};
 }
 
 } // namespace
@@ -126,7 +154,8 @@ void TestGpuRetireRegistryProductionPerf::preparedSlotsFourOwners() {
     constexpr uint64_t authority = 53;
     constexpr int operationCount = 256;
     constexpr int ownerCount = 4;
-    constexpr int roundCount = 10;
+    constexpr int warmupRoundCount = 3;
+    constexpr int roundCount = 20;
     std::array<std::array<std::shared_ptr<GpuSurface>, ownerCount>, operationCount> fixtures;
     for (int operation = 0; operation < operationCount; ++operation) {
         for (int owner = 0; owner < ownerCount; ++owner) {
@@ -148,6 +177,14 @@ void TestGpuRetireRegistryProductionPerf::preparedSlotsFourOwners() {
     std::vector<qint64> registrationP95Ratios;
     std::vector<qint64> drainMedianRatios;
     std::vector<qint64> drainP95Ratios;
+    for (int warmup = 0; warmup < warmupRoundCount; ++warmup) {
+        (void) measureRound<Saved912PreparedRegistry, Saved912GpuOpScope<ProductionPerfFence>>(
+            fixtures);
+        (void) measureRound<GpuRetireRegistry, GpuOpScope>(fixtures);
+    }
+    uint64_t currentSignals = 0;
+    uint64_t baselineSignals = 0;
+    qsizetype currentPendingHighWater = 0;
     for (int round = 0; round < roundCount; ++round) {
         RoundMetrics current;
         RoundMetrics baseline;
@@ -177,6 +214,9 @@ void TestGpuRetireRegistryProductionPerf::preparedSlotsFourOwners() {
         registrationP95Ratios.push_back(current.registrationP95 * 10000 / baseline.registrationP95);
         drainMedianRatios.push_back(current.drainMedian * 10000 / baseline.drainMedian);
         drainP95Ratios.push_back(current.drainP95 * 10000 / baseline.drainP95);
+        currentSignals += current.signalCalls;
+        baselineSignals += baseline.signalCalls;
+        currentPendingHighWater = std::max(currentPendingHighWater, current.pendingHighWater);
     }
 
     const qint64 registrationMedian = percentile(currentRegistrationMedians, 1, 2);
@@ -193,14 +233,56 @@ void TestGpuRetireRegistryProductionPerf::preparedSlotsFourOwners() {
     const qint64 drainP95Ratio = percentile(drainP95Ratios, 1, 2);
     qInfo("Production GPU retire vs exact 912663be: registration current=%lld/%lld "
           "baseline=%lld/%lld ns; drain current=%lld/%lld baseline=%lld/%lld ns "
-          "(median of 10 round median/p95 values); paired ratios=%lld/%lld and %lld/%lld bp",
+          "(median of %d round median/p95 values); paired ratios=%lld/%lld and %lld/%lld bp",
           static_cast<long long>(registrationMedian), static_cast<long long>(registrationP95),
           static_cast<long long>(saved912RegistrationMedian),
           static_cast<long long>(saved912RegistrationP95), static_cast<long long>(drainMedian),
           static_cast<long long>(drainP95), static_cast<long long>(saved912DrainMedian),
-          static_cast<long long>(saved912DrainP95), static_cast<long long>(registrationMedianRatio),
+          static_cast<long long>(saved912DrainP95), roundCount,
+          static_cast<long long>(registrationMedianRatio),
           static_cast<long long>(registrationP95Ratio), static_cast<long long>(drainMedianRatio),
           static_cast<long long>(drainP95Ratio));
+    const qint64 currentRegistrationThroughput =
+        qint64(operationCount) * 1000000000LL / registrationMedian;
+    const qint64 baselineRegistrationThroughput =
+        qint64(operationCount) * 1000000000LL / saved912RegistrationMedian;
+    const QString machineMetrics =
+        QStringLiteral("{\"schema\":1,\"case\":\"production_four_owner\","
+                       "\"warmup_rounds\":%1,\"paired_rounds\":%2,\"samples_per_round\":200,"
+                       "\"operations_per_sample\":%3,\"owners_per_operation\":4,"
+                       "\"registration_current_median_ns\":%4,"
+                       "\"registration_current_p95_ns\":%5,"
+                       "\"registration_baseline_median_ns\":%6,"
+                       "\"registration_baseline_p95_ns\":%7,"
+                       "\"drain_current_median_ns\":%8,\"drain_current_p95_ns\":%9,"
+                       "\"drain_baseline_median_ns\":%10,\"drain_baseline_p95_ns\":%11,"
+                       "\"registration_median_ratio_bp\":%12,"
+                       "\"registration_p95_ratio_bp\":%13,\"drain_median_ratio_bp\":%14,"
+                       "\"drain_p95_ratio_bp\":%15,\"max_ratio_bp\":10200,"
+                       "\"current_throughput_ops_per_s\":%16,"
+                       "\"baseline_throughput_ops_per_s\":%17,\"current_signals\":%18,"
+                       "\"baseline_signals\":%19,\"current_pending_high_water\":%20}")
+            .arg(warmupRoundCount)
+            .arg(roundCount)
+            .arg(operationCount)
+            .arg(registrationMedian)
+            .arg(registrationP95)
+            .arg(saved912RegistrationMedian)
+            .arg(saved912RegistrationP95)
+            .arg(drainMedian)
+            .arg(drainP95)
+            .arg(saved912DrainMedian)
+            .arg(saved912DrainP95)
+            .arg(registrationMedianRatio)
+            .arg(registrationP95Ratio)
+            .arg(drainMedianRatio)
+            .arg(drainP95Ratio)
+            .arg(currentRegistrationThroughput)
+            .arg(baselineRegistrationThroughput)
+            .arg(currentSignals)
+            .arg(baselineSignals)
+            .arg(currentPendingHighWater);
+    emitMachineMetrics(QStringLiteral("gpu-retirement-production.json"), machineMetrics);
 #ifdef NDEBUG
     QVERIFY2(registrationMedianRatio <= 10200,
              "production registration median regressed by more than 2% against exact 912663be");

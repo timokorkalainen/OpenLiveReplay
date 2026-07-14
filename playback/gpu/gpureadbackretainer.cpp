@@ -95,6 +95,8 @@ struct RetireMetrics {
 #ifdef OLR_UNIT_TEST
 struct StorageProbeMetrics {
     std::atomic<uint64_t> shardLockAcquisitions{0};
+    std::atomic<uint64_t> shardLockHoldNanoseconds{0};
+    std::atomic<uint64_t> maximumShardLockHoldNanoseconds{0};
     std::atomic<uint64_t> drainShardVisits{0};
     std::atomic<uint64_t> activeNodesVisited{0};
     std::atomic<uint64_t> fenceGroupsVisited{0};
@@ -179,6 +181,36 @@ void noteShardLock() noexcept {
         storage().probe.shardLockAcquisitions.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
+
+class RetireMutexLocker final {
+public:
+    explicit RetireMutexLocker(QMutex* mutex) : m_locker(mutex) {
+        noteShardLock();
+#ifdef OLR_UNIT_TEST
+        if (storageProbeEnabledForThread) m_timer.start();
+#endif
+    }
+
+    ~RetireMutexLocker() {
+#ifdef OLR_UNIT_TEST
+        if (!m_timer.isValid()) return;
+        const uint64_t elapsed = uint64_t(std::max<qint64>(0, m_timer.nsecsElapsed()));
+        auto& probe = storage().probe;
+        probe.shardLockHoldNanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
+        uint64_t maximum = probe.maximumShardLockHoldNanoseconds.load(std::memory_order_relaxed);
+        while (elapsed > maximum &&
+               !probe.maximumShardLockHoldNanoseconds.compare_exchange_weak(
+                   maximum, elapsed, std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+#endif
+    }
+
+private:
+    QMutexLocker<QMutex> m_locker;
+#ifdef OLR_UNIT_TEST
+    QElapsedTimer m_timer;
+#endif
+};
 
 void noteActiveVisit() noexcept {
 #ifdef OLR_UNIT_TEST
@@ -464,8 +496,7 @@ FenceProbeWorkspace& fenceProbeWorkspace() {
 size_t collectFenceGroups(RetireShard& shard, size_t shardIndex,
                           std::array<FenceProbe, kFenceGroupsPerShard>& probes) {
     size_t probeCount = 0;
-    QMutexLocker locker(&shard.mutex);
-    noteShardLock();
+    RetireMutexLocker locker(&shard.mutex);
     uint16_t index = shard.activeFenceGroupHead;
     while (index != kNoFenceGroup) {
         const FenceGroup& group = shard.fenceGroups[index];
@@ -510,8 +541,7 @@ releaseCompletedGroups(RetireShard& shard, size_t shardIndex,
                        const std::array<FenceProbe, kFenceGroupsPerShard>& probes,
                        size_t probeCount, DeferredReleases& releases) {
     ReleaseCompletedResult result;
-    QMutexLocker locker(&shard.mutex);
-    noteShardLock();
+    RetireMutexLocker locker(&shard.mutex);
     for (size_t probeIndex = 0; probeIndex < probeCount; ++probeIndex) {
         const FenceProbe& probe = probes[probeIndex];
         if (probe.groupIndex >= kFenceGroupsPerShard) continue;
@@ -572,8 +602,7 @@ qsizetype abandonShardDomains(RetireShard& shard, size_t shardIndex, uintptr_t s
     qsizetype pendingReleased = 0;
     qsizetype quarantineReleased = 0;
     {
-        QMutexLocker locker(&shard.mutex);
-        noteShardLock();
+        RetireMutexLocker locker(&shard.mutex);
 #ifdef OLR_UNIT_TEST
         if (storageProbeEnabledForThread)
             storage().probe.abandonmentShardVisits.fetch_add(1, std::memory_order_relaxed);
@@ -630,8 +659,7 @@ GpuRetirePreparedHandle GpuReadbackRetainer::prepare(const std::shared_ptr<GpuSu
     const GpuFenceIdentity identity = fence->identity();
     const size_t shardIndex = shardIndexForDomain(identity.deviceDomainId);
     RetireShard& shard = storage().shards[shardIndex];
-    QMutexLocker locker(&shard.mutex);
-    noteShardLock();
+    RetireMutexLocker locker(&shard.mutex);
     const uint16_t nodeCount = uint16_t((size_t(count) + kOwnersPerNode - 1) / kOwnersPerNode);
     if (shard.freeCount < nodeCount) {
 #ifdef OLR_UNIT_TEST
@@ -689,8 +717,7 @@ bool GpuReadbackRetainer::publish(const GpuRetirePreparedHandle& prepared,
         ticket.identity().deviceDomainId == 0)
         return false;
     RetireShard& shard = storage().shards[prepared.shard];
-    QMutexLocker locker(&shard.mutex);
-    noteShardLock();
+    RetireMutexLocker locker(&shard.mutex);
     if (!batchMatches(shard, prepared, RetireNodeState::Prepared)) return false;
     const uint16_t groupIndex = shard.nodes[prepared.head].fenceGroup;
     if (groupIndex == kNoFenceGroup) return false;
@@ -726,8 +753,7 @@ void GpuReadbackRetainer::quarantine(const GpuRetirePreparedHandle& prepared) no
     std::shared_ptr<GpuFence> releasedFence;
     RetireShard& shard = storage().shards[prepared.shard];
     {
-        QMutexLocker locker(&shard.mutex);
-        noteShardLock();
+        RetireMutexLocker locker(&shard.mutex);
         if (!batchMatches(shard, prepared, RetireNodeState::Prepared)) return;
 
         uint16_t index = prepared.head;
@@ -759,8 +785,7 @@ void GpuReadbackRetainer::release(const GpuRetirePreparedHandle& prepared) noexc
     releases.clear();
     RetireShard& shard = storage().shards[prepared.shard];
     {
-        QMutexLocker locker(&shard.mutex);
-        noteShardLock();
+        RetireMutexLocker locker(&shard.mutex);
         if (!batchMatches(shard, prepared, RetireNodeState::Prepared)) return;
         uint16_t index = prepared.head;
         for (uint16_t visited = 0; visited < prepared.count; ++visited) {
@@ -917,6 +942,8 @@ void GpuReadbackRetainer::noteSignalFailure() noexcept {
 void GpuReadbackRetainer::resetStorageProbeForTest() noexcept {
     auto& probe = storage().probe;
     probe.shardLockAcquisitions.store(0, std::memory_order_relaxed);
+    probe.shardLockHoldNanoseconds.store(0, std::memory_order_relaxed);
+    probe.maximumShardLockHoldNanoseconds.store(0, std::memory_order_relaxed);
     probe.drainShardVisits.store(0, std::memory_order_relaxed);
     probe.activeNodesVisited.store(0, std::memory_order_relaxed);
     probe.fenceGroupsVisited.store(0, std::memory_order_relaxed);
@@ -931,17 +958,20 @@ void GpuReadbackRetainer::resetStorageProbeForTest() noexcept {
 
 GpuRetireStorageSnapshot GpuReadbackRetainer::storageSnapshotForTest() noexcept {
     const auto& probe = storage().probe;
-    return GpuRetireStorageSnapshot{probe.shardLockAcquisitions.load(std::memory_order_relaxed),
-                                    probe.drainShardVisits.load(std::memory_order_relaxed),
-                                    probe.activeNodesVisited.load(std::memory_order_relaxed),
-                                    probe.fenceGroupsVisited.load(std::memory_order_relaxed),
-                                    probe.fenceLookupSteps.load(std::memory_order_relaxed),
-                                    probe.completionQueries.load(std::memory_order_relaxed),
-                                    probe.poolNodeAcquisitions.load(std::memory_order_relaxed),
-                                    probe.poolNodeReleases.load(std::memory_order_relaxed),
-                                    probe.poolExhaustions.load(std::memory_order_relaxed),
-                                    probe.abandonmentShardVisits.load(std::memory_order_relaxed),
-                                    probe.abandonmentNodesVisited.load(std::memory_order_relaxed)};
+    return GpuRetireStorageSnapshot{
+        probe.shardLockAcquisitions.load(std::memory_order_relaxed),
+        probe.shardLockHoldNanoseconds.load(std::memory_order_relaxed),
+        probe.maximumShardLockHoldNanoseconds.load(std::memory_order_relaxed),
+        probe.drainShardVisits.load(std::memory_order_relaxed),
+        probe.activeNodesVisited.load(std::memory_order_relaxed),
+        probe.fenceGroupsVisited.load(std::memory_order_relaxed),
+        probe.fenceLookupSteps.load(std::memory_order_relaxed),
+        probe.completionQueries.load(std::memory_order_relaxed),
+        probe.poolNodeAcquisitions.load(std::memory_order_relaxed),
+        probe.poolNodeReleases.load(std::memory_order_relaxed),
+        probe.poolExhaustions.load(std::memory_order_relaxed),
+        probe.abandonmentShardVisits.load(std::memory_order_relaxed),
+        probe.abandonmentNodesVisited.load(std::memory_order_relaxed)};
 }
 
 size_t GpuReadbackRetainer::poolCapacityPerShardForTest() noexcept {

@@ -27,6 +27,9 @@ public:
                               qint64(m_width) * qint64(m_height) * 3 / 2};
     }
     bool isValid() const override { return m_texture != nullptr; }
+    GpuSurfaceCompatibility compatibility() const override {
+        return {reinterpret_cast<uintptr_t>(m_deviceIdentity.Get()), m_authorityEpoch};
+    }
 
     void retainUntilFenceRetired(uint64_t fenceValue) override;
     uint64_t pendingFenceValue() const override {
@@ -57,7 +60,9 @@ private:
     D3D11GpuSurface() = default;
 
     Microsoft::WRL::ComPtr<ID3D11Device> m_device;
+    Microsoft::WRL::ComPtr<IUnknown> m_deviceIdentity;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> m_texture;
+    uint64_t m_authorityEpoch = 0;
     UINT m_subresource = 0;
     int m_width = 0;
     int m_height = 0;

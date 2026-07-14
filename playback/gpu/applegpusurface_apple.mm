@@ -3,10 +3,12 @@
 #ifdef __APPLE__
 
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/formatcanon.h"
 
 #include <CoreVideo/CoreVideo.h>
+#include <Metal/Metal.h>
 #if __has_include(<IOSurface/IOSurfaceRef.h>)
 #include <IOSurface/IOSurfaceRef.h>
 #elif __has_include(<IOSurface/IOSurface.h>)
@@ -163,8 +165,13 @@ CpuPlanes lockDownloadRgba8(CVPixelBufferRef pb) {
 class AppleGpuSurface final : public GpuSurface {
 public:
     AppleGpuSurface(CVPixelBufferRef pixelBuffer, FramePixelFormat format)
-        : m_pixelBuffer(pixelBuffer), m_format(format) {}
+        : m_pixelBuffer(pixelBuffer), m_format(format),
+          m_authorityEpoch(GpuGenerationCounter::instance().current()) {
+        m_device = MTLCreateSystemDefaultDevice();
+    }
     ~AppleGpuSurface() override {
+        [m_device release];
+        m_device = nil;
         if (m_pixelBuffer) {
             CVPixelBufferRelease(m_pixelBuffer);
         }
@@ -182,6 +189,9 @@ public:
     }
 
     bool isValid() const override { return m_pixelBuffer != nullptr && nativeHandle() != nullptr; }
+    GpuSurfaceCompatibility compatibility() const override {
+        return {reinterpret_cast<uintptr_t>((__bridge void*)m_device), m_authorityEpoch};
+    }
 
     void retainUntilFenceRetired(uint64_t fenceValue) override {
         uint64_t previous = m_pendingFence.load(std::memory_order_acquire);
@@ -210,7 +220,9 @@ protected:
 
 private:
     CVPixelBufferRef m_pixelBuffer = nullptr;
+    id<MTLDevice> m_device = nil;
     FramePixelFormat m_format = FramePixelFormat::Nv12;
+    uint64_t m_authorityEpoch = 0;
     std::atomic<uint64_t> m_pendingFence{0};
 };
 
@@ -286,14 +298,15 @@ std::shared_ptr<GpuSurface> wrapAppleImageBuffer(void* cvImageBufferRef) {
 CVPixelBufferRef retainApplePixelBufferWrapper(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface || !surface->isValid()) return nullptr;
     GpuSyncReadScope scope;
-    const GpuReadLease lease = scope.read(surface);
-    IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-    if (!ioSurface) return nullptr;
+    return scope.withRead(surface, [](const GpuReadLease& lease) {
+        IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
+        if (!ioSurface) return static_cast<CVPixelBufferRef>(nullptr);
 
-    CVPixelBufferRef pixelBuffer = nullptr;
-    const CVReturn result =
-        CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
-    return result == kCVReturnSuccess ? pixelBuffer : nullptr;
+        CVPixelBufferRef pixelBuffer = nullptr;
+        const CVReturn result =
+            CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
+        return result == kCVReturnSuccess ? pixelBuffer : nullptr;
+    });
 }
 
 CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, FramePixelFormat target,

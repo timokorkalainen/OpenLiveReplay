@@ -194,6 +194,17 @@ if(OLR_PYTHON3_EXECUTABLE)
         LABELS "unit;ci"
         TIMEOUT 30)
 
+    add_test(NAME tst_gpu_scope_completion_static
+        COMMAND "${OLR_PYTHON3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_gpu_scope_completion_static.py"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_videotoolbox.mm"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/applegpusurface_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp")
+    set_tests_properties(tst_gpu_scope_completion_static PROPERTIES
+        LABELS "unit;ci;gpu-capability"
+        TIMEOUT 30)
+
     add_test(NAME tst_videotoolbox_decoder_static
         COMMAND "${OLR_PYTHON3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/test_videotoolbox_decoder_static.py"
