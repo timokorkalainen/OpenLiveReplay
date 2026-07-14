@@ -623,19 +623,46 @@ void TestGpuDeviceLostWorker::armedCutDeviceLossCommitsRecoveryEpochBeforeHoldLa
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         resetCountBefore = worker.m_outputRuntime->playEpochResetCountForTest();
     }
-    const uint64_t recoveryGeneration = GpuDeviceLossMonitor::instance().recordLoss();
+    const uint64_t generationBeforeLoss = GpuGenerationCounter::instance().current();
+    const uint64_t lossCountBefore = GpuDeviceLossMonitor::instance().lossCount();
+    worker.m_gpuRhi->injectDeviceLostForTest();
+    QVERIFY(worker.m_gpuRhi->deviceLost());
+    QVERIFY(!GpuDeviceLossMonitor::instance().isLost());
+    QCOMPARE(GpuGenerationCounter::instance().current(), generationBeforeLoss);
 
     worker.m_outputRuntime->dispatchImmediate();
 
+    const uint64_t recoveryGeneration = GpuGenerationCounter::instance().current();
+    QCOMPARE(recoveryGeneration, generationBeforeLoss + 1);
+    QCOMPARE(GpuDeviceLossMonitor::instance().lossCount(), lossCountBefore + 1);
+    QVERIFY(GpuDeviceLossMonitor::instance().isLost());
     QCOMPARE(worker.m_committedGpuGeneration.load(std::memory_order_acquire), recoveryGeneration);
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
         QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), resetCountBefore + 1);
-        worker.m_outputRuntime->setEndpoints({});
     }
     QCOMPARE(sink.frames.size(), 2);
     QVERIFY(sink.frames.constLast().identity.videoPlaceholder);
+    QVERIFY(!sink.frames.constLast().video.isGpuBacked());
     QVERIFY(sink.frames.constLast().identity.sourceDecodedSequence != qint64(11));
+    QCOMPARE(worker.cutsFired(), 0);
+    QVERIFY(!worker.m_cutArmed.load(std::memory_order_acquire));
+    QCOMPARE(worker.m_scheduledCutFrame.load(std::memory_order_acquire), qint64(-1));
+
+    worker.makeOutputSnapshot();
+    QCOMPARE(GpuGenerationCounter::instance().current(), recoveryGeneration);
+    QCOMPARE(GpuDeviceLossMonitor::instance().lossCount(), lossCountBefore + 1);
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), resetCountBefore + 1);
+    }
+
+    worker.handleGpuDeviceLoss();
+    QCOMPARE(GpuGenerationCounter::instance().current(), recoveryGeneration);
+    QCOMPARE(GpuDeviceLossMonitor::instance().lossCount(), lossCountBefore + 1);
+    QCOMPARE(worker.cutsFired(), 0);
+    QVERIFY(!worker.m_cutArmed.load(std::memory_order_acquire));
+    worker.m_outputRuntime->setEndpoints({});
 }
 
 void TestGpuDeviceLostWorker::pendingSeekDeviceLossPublishesPlaceholderSafeRecovery() {

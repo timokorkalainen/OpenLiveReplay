@@ -4335,12 +4335,13 @@ PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     if (!stagingGpuSurfacesIdle()) return PostCommitDispatch::None;
 #ifdef OLR_GPU_PIPELINE_BUILD
     if (gpuDeviceLossPending()) {
+        const uint64_t recoveryGeneration = GpuDeviceLossMonitor::instance().recordLoss();
         sanitizeCacheForDeviceLossLocked(m_outputCache.get());
         sanitizeCacheForDeviceLossLocked(m_prerollStagingCache.get());
         OutputCommit recoveryCommit;
         recoveryCommit.playheadMs = m_committedPlayheadMs.load(std::memory_order_acquire);
         recoveryCommit.seekGeneration = m_committedGeneration.load(std::memory_order_acquire);
-        recoveryCommit.gpuGeneration = GpuGenerationCounter::instance().current();
+        recoveryCommit.gpuGeneration = recoveryGeneration;
         recoveryCommit.cacheAction = OutputCacheAction::Publish;
         recoveryCommit.coverageMode = OutputCoverageMode::Displayable;
         recoveryCommit.requireCurrentSeek = false;
