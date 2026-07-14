@@ -21,6 +21,9 @@ private slots:
     void h264ConsumesEveryClockTimestamp();
     void h264ClockTimestampsAreNondecreasing_data();
     void h264ClockTimestampsAreNondecreasing();
+    void h264CountingSchemesApplyOffsetsBeforeClassification_data();
+    void h264CountingSchemesApplyOffsetsBeforeClassification();
+    void h264NonCfrTimingIsValidatedBeforeUnsupported();
     void h264SeiMessagesAreFullyValidated();
     void h264SeiMessagesAggregateTypedResults();
     void h264LaterIncompleteClockInheritsUnits_data();
@@ -530,6 +533,83 @@ void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing() {
     QCOMPARE(parsed.timecode.valid,
              expectedStatus == int(H26xTimingDetail::TimecodeParseStatus::Valid));
     if (parsed.timecode.valid) QCOMPARE(parsed.timecode.hours, expectedHours);
+}
+
+void TestH26xSeiTimecode::h264CountingSchemesApplyOffsetsBeforeClassification_data() {
+    QTest::addColumn<int>("countingType");
+    QTest::addColumn<bool>("reversedLabels");
+    QTest::addColumn<int>("firstOffset");
+    QTest::addColumn<int>("secondOffset");
+    QTest::addColumn<int>("expectedStatus");
+
+    using Status = H26xTimingDetail::TimecodeParseStatus;
+    QTest::newRow("type 4 offset compensates reversed 29.97 DF labels")
+        << 4 << true << -2002 << 0 << int(Status::Valid);
+    for (const int countingType : {2, 3, 5, 6}) {
+        QTest::newRow(
+            qPrintable(QStringLiteral("type %1 offset reversal is malformed").arg(countingType)))
+            << countingType << false << 2003 << 0 << int(Status::Malformed);
+    }
+}
+
+void TestH26xSeiTimecode::h264CountingSchemesApplyOffsetsBeforeClassification() {
+    QFETCH(int, countingType);
+    QFETCH(bool, reversedLabels);
+    QFETCH(int, firstOffset);
+    QFETCH(int, secondOffset);
+    QFETCH(int, expectedStatus);
+
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {30000, 1001};
+    syntax.numUnitsInTick = 1001;
+    syntax.timeScale = 60000;
+    syntax.fixedFrameRate = true;
+    syntax.timeOffsetLength = 12;
+    syntax.picStructPresent = true;
+
+    BitWriter writer;
+    writer.bits(3, 4); // pic_struct: top field, bottom field
+    writeFullTimestamp(writer, 0, 0, 0, reversedLabels ? 5 : 0, countingType, false, true,
+                       firstOffset, syntax.timeOffsetLength);
+    writeFullTimestamp(writer, 0, 0, 0, reversedLabels ? 4 : 1, countingType, false, true,
+                       secondOffset, syntax.timeOffsetLength);
+    if (writer.bitPosition != 0) writer.payloadTrailingBits();
+
+    const auto parsed = H26xTimingDetail::parseH264PicTiming(writer.bytes, syntax);
+    QCOMPARE(int(parsed.status), expectedStatus);
+    QCOMPARE(parsed.timecode.valid,
+             expectedStatus == int(H26xTimingDetail::TimecodeParseStatus::Valid));
+    if (parsed.timecode.valid) QVERIFY(parsed.timecode.dropFrame);
+}
+
+void TestH26xSeiTimecode::h264NonCfrTimingIsValidatedBeforeUnsupported() {
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {30000, 1001};
+    syntax.numUnitsInTick = 1001;
+    syntax.timeScale = 60000;
+    syntax.fixedFrameRate = false;
+    syntax.picStructPresent = true;
+
+    auto parsed = H26xTimingDetail::parseH264PicTiming(fullTimestampPayload(1, 2, 3, 4), syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Unsupported);
+    QVERIFY(!parsed.timecode.valid);
+
+    parsed = H26xTimingDetail::parseH264PicTiming(fullTimestampPayload(1, 2, 3, 30), syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+
+    parsed = H26xTimingDetail::parseH264PicTiming(fullTimestampPayload(0, 1, 0, 0, 4, false, true),
+                                                  syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+
+    BitWriter reversedClocks;
+    reversedClocks.bits(3, 4);
+    writeFullTimestamp(reversedClocks, 1, 2, 3, 5);
+    writeFullTimestamp(reversedClocks, 1, 2, 3, 4);
+    if (reversedClocks.bitPosition != 0) reversedClocks.payloadTrailingBits();
+    parsed = H26xTimingDetail::parseH264PicTiming(reversedClocks.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
 }
 
 void TestH26xSeiTimecode::h264LaterIncompleteClockInheritsUnits_data() {

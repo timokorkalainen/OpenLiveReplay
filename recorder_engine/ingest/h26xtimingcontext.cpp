@@ -336,7 +336,7 @@ H264TimingSyntax parseH264Sps(const QByteArray& parameterSet) {
         }
         syntax.numUnitsInTick = numUnitsInTick;
         syntax.timeScale = timeScale;
-        if (syntax.fixedFrameRate) syntax.frameRate = frameRateFromVui(numUnitsInTick, timeScale);
+        syntax.frameRate = frameRateFromVui(numUnitsInTick, timeScale);
     }
 
     bool nalHrdPresent = false;
@@ -688,10 +688,10 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         bool currentTimestampComparable = false;
         int64_t currentClockTimestamp = 0;
         if (effectiveTimestampComplete && syntax.numUnitsInTick != 0 && syntax.timeScale != 0) {
-            // Table D-3 assigns time_offset semantics only to counting_type 1.
-            // For type 0 the bits are present in the syntax but do not adjust
-            // Equation D-1, so they cannot conceal a decreasing clock label.
-            const int32_t orderingTimeOffset = countingType == 1 ? timeOffset : 0;
+            // Equation D-1 suppresses time_offset only for counting_type 0.
+            // Types 1 through 6 all apply the signed offset even when their
+            // label mapping is not representable by Smpte12mTimecode.
+            const int32_t orderingTimeOffset = countingType == 0 ? 0 : timeOffset;
             if (!h264ClockTimestamp(effectiveHours, effectiveMinutes, effectiveSeconds, frames,
                                     nuitFieldBased, orderingTimeOffset, syntax,
                                     currentClockTimestamp)) {
@@ -768,6 +768,10 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         if (!validateTimecodeLabel(timestamp, syntax.frameRate)) {
             result.status = TimecodeParseStatus::Malformed;
             return result;
+        }
+        if (!syntax.fixedFrameRate) {
+            unsupportedMapping = true;
+            continue;
         }
         if (!firstUsableTimestamp.valid) firstUsableTimestamp = timestamp;
     }

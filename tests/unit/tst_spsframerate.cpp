@@ -153,6 +153,16 @@ void TestSpsFrameRate::recoversRateFromVuiTimingInfo() {
 
 void TestSpsFrameRate::requiresFixedFrameRateFlag() {
     QVERIFY(!parseSpsFrameRate(NativeVideoCodec::H264, makeSps(1001, 60000, false)).valid());
+
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {makeSps(1001, 60000, false)}));
+    QVERIFY(context.h264() != nullptr);
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Valid);
+    QCOMPARE(context.h264()->frameRate, (FrameRateQ{30000, 1001}));
+    QCOMPARE(context.h264()->numUnitsInTick, uint32_t(1001));
+    QCOMPARE(context.h264()->timeScale, uint32_t(60000));
+    QVERIFY(!context.fixedFrameRate());
+    QVERIFY(!context.constantFrameRate().valid());
 }
 
 void TestSpsFrameRate::skipsHighProfileScalingLists() {
