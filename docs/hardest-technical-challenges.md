@@ -9,156 +9,136 @@ faith.
 
 | # | Challenge | Deliverable | Status |
 |---|-----------|-------------|--------|
-| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Exhaustive interleaving model check + differential known-bug gate | **Ran: 2 new protocol holes found; repaired protocol PROVED over 11,017 states** |
+| 1 | Prove the playback transport never puts a wrong/stale/gray frame on air | Bounded interleaving model + source/compiled mutation gates + blocked-sink latency gate | **Gated: fixed protocol holds over 523 states aggregated across 11 scenario graphs; all 9 mutations refute** |
 | 2 | Rate-agnostic timecode alignment with a proven phase-error bound | Falsifier + exact-rational bound sweep + drop-in C++ module | **Ran: shipped code RED (−5000 ms on aligned cameras); replacement 0 violations / 3,969 cells, zero slack** |
 | 3 | Type-enforced GPU surface lifetime + real-backend device-loss falsifiability | Type-state protocol (compile-fail on misuse) + real-TDR fault-lane design | **Designed: full headers, 6-site migration, harness + mutations** |
 
 ---
 
-## Challenge 1 — Mechanized proof (or refuting schedule) for transport frame accuracy
+## Challenge 1 — Bounded proof and production gates for transport frame accuracy
 
-### The problem
+### Invariant and commit protocol
 
-The on-air media time is sampled from a play epoch held by the output
-dispatcher ([`outputframeclock.cpp:16-20`](../playback/output/outputframeclock.cpp)),
-decoupled from the CommitGate-visible playhead
-([`commitgate.h:12-16`](../playback/commitgate.h),
-[`playbackworker.cpp:2371-2372`](../playback/playbackworker.cpp)). The two are
-re-coupled across a playhead discontinuity only by a manual
-`resetPlayEpoch()` obligation replicated at 6+ sites
-([`playbackworker.cpp:440,468,487,516,4130,4489`](../playback/playbackworker.cpp))
-whose helpers ship opposite defaults. A missed re-anchor is **not a data race**
-— TSan is structurally blind to it — and the only guard is an observational
-counter ([`outputdispatcher.cpp:299-303`](../playback/output/outputdispatcher.cpp)).
-The class shipped broken twice (far-back seek; armed cut).
+For every output lease that renders a non-placeholder frame while
+`committedGeneration == seekGeneration`, the sampled media time, rendered
+identity, and output-visible committed playhead must describe the same play
+epoch within one frame. Hold-last renders a real prior frame, so it is covered
+by the same invariant. Gate-closed reposition transients are deliberately not
+claimed.
 
-### The artifact
+All output-visible state changes flow through
+[`PlaybackWorker::commitOutputStateLocked`](../playback/playbackworker.cpp).
+While `m_bufferMutex` remains held, it validates the generation and coverage,
+publishes or merges the selected cache, stores the visible playhead and GPU
+generation, release-stores `m_committedGeneration`, and resets the output play
+epoch. It returns only a typed post-lock dispatch obligation. PGM, preview, and
+ordinary immediate dispatch helpers cannot publish a cache or re-anchor the
+epoch.
 
-[`docs/hardest-technical-challenges/transport_epoch_modelcheck.py`](hardest-technical-challenges/transport_epoch_modelcheck.py)
-— an exhaustive (bounded) explicit-state model checker over the real
-synchronization skeleton: UI seek republish/bump as separate atomic steps
-(`:227` / `:241` — the output thread reads these atomics without `m_mutex`),
-worker reposition begin/commit (`CommitGate::canCommitReposition`,
-`:3352-3397`) plus the post-commit `resetPlayEpoch()` / `dispatchImmediate()`
-pair (`:459-469`), and the background tick split exactly as
-[`outputruntime.cpp`](../playback/output/outputruntime.cpp) does it: snapshot
-**outside** the lock (`:362`, which also fires a due armed cut inside
-`makeOutputSnapshot`, `:2322` → `:4042-4150`), then the lease re-check block
-(`:365-375`: `immediateDispatchRequests` / `configGeneration` /
-`nextOutputFrameIndex`) and `dispatchTick` (`:380`).
+The represented commit families are:
 
-**Soundness of the abstraction.** Every shared access in the modeled skeleton
-is either mutex-guarded or a paired release/acquire atomic on exactly the
-variables the invariant reads (the one `relaxed` store of
-`m_committedPlayheadMs` at `:3389` is ordered by the release store of
-`m_committedGeneration` at `:3396`, and the snapshot reads the generation with
-`acquire` at `:2344` *before* acting on the playhead). Sequentially-consistent
-interleaving of whole critical sections is therefore sound for the
-logic-omission bug class this checks. Full weak-memory coverage (e.g. GenMC
-over the extracted `<atomic>` skeleton) is the recommended second stage; it
-cannot *remove* counterexamples found here.
+| Model actor | Production owner |
+|---|---|
+| published reuse | `requestSeekTo` published-cache reuse |
+| live fallback | `requestSeekTo` live-start displayable fallback |
+| reuse reposition | worker reuse reposition |
+| full reposition | full decode/reposition commit |
+| early operator | operator PGM completion from current decoded coverage |
+| armed cut | scheduled staging-cache promotion |
+| device-loss recovery | recovered output-cache publication |
+| memory-pressure recovery | recovered output-cache publication |
 
-**The invariant** (both directions of the challenge property): on every tick
-that renders a non-placeholder frame from a snapshot taken with the gate open
-(`committedGen == seekGen`), `|sampledPlayhead − visiblePlayhead| ≤ 1` frame;
-gate-closed transients are exempt exactly as the production e2e treats them.
+### Locking and active-lease semantics
 
-### Verdicts (run it yourself)
+The commit order is exactly
+`m_mutex -> m_bufferMutex -> m_outputRuntimeMutex -> OutputRuntime::m_mutex`.
+Snapshot construction releases `m_outputRuntimeMutex` before taking
+`m_bufferMutex`, preserving the reverse-path exclusion documented in
+[`makeOutputSnapshot`](../playback/playbackworker.cpp).
 
-```
+[`OutputRuntime::resetPlayEpoch`](../playback/output/outputruntime.cpp) first
+increments `m_configGeneration`. A snapshot captured before the reset therefore
+fails its lease re-check. If a dispatch lease is already active, reset records
+one coalesced pending epoch clear and returns without waiting for the sink. The
+already-validated lease may finish; `applyPendingDispatchMutationsLocked()`
+applies the clear before the active barrier opens, so no later lease can start
+against the pre-reset epoch. This is **non-waiting with respect to an active
+dispatch**, not universally nonblocking: when no lease is active, immediate
+reset application may call a sink's `discardPending()` and take sink-local
+delivery locks.
+
+### Bounded model and mutation verdicts
+
+[`transport_epoch_modelcheck.py`](hardest-technical-challenges/transport_epoch_modelcheck.py)
+splits dispatch in production order: configuration capture, provider execution,
+identity selection (including hold-last), generation re-check, lease acquisition,
+and completion/deferred reset. Its eleven scenarios comprise the eight owner
+actors plus focused F1, active-lease deferred-reset, and hold-last deferred-reset
+graphs.
+
+The bounds are explicit: every scenario starts from the same small initial
+state, uses one feed, unit frame duration/tolerance, speed 1, an exact abstract
+coverage predicate, and at most two completed leases. Critical sections are
+explored as sequentially consistent atomic actions. The checker does not model
+full C++ weak memory, arbitrary cache contents, multiple feeds, other speeds,
+wall-clock timing, or unrepresented production actors. Its 523 reachable states
+are the sum across eleven independently explored graphs, not one coupled graph.
+
+`fixed` proves the bounded invariant. `mut_f1` deletes configuration-generation
+invalidation, and each of the eight `mut_f2_<actor>` modes deletes that owner's
+atomic epoch reset; all nine mutants emit a concrete counterexample containing
+the actor, phase state, sampled and committed playheads, generations, and
+rendered identity. This differential result rejects a vacuous model, but it is
+not by itself a source-level proof of the C++ implementation.
+
+### Coupling the model to compiled production
+
+[`transport_epoch_source_audit.py`](../tests/formal/transport_epoch_source_audit.py)
+requires the sole effective `m_committedGeneration.store` to be the central
+owner and requires the effective F1 increment and F2 reset to be unconditional,
+reachable, production-active, and correctly ordered. Its self-tests cover
+comments, strings, escaped-newline splicing, preprocessor aliases, conditional
+or unreachable statements, and production-only control transfers.
+
+The compiled differential controls build paired unmutated and generated-mutant
+objects from the real runtime/worker sources. Focused baseline selectors must
+pass before an expected mutant assertion failure can count as a kill. Separate
+production-shaped controls compile with `OLR_UNIT_TEST` undefined and exercise
+F1, F2 macro-alias resistance, and the active-lease return barrier. Thus the
+Python abstraction, lexical ownership rule, and compiled synchronization paths
+fail independently when their load-bearing statements are removed or bypassed.
+
+### Latency evidence and commands
+
+[`tst_transportcommit_perf.cpp`](../tests/perf/tst_transportcommit_perf.cpp)
+holds a real PGM sink submission behind a deterministic barrier, commits a
+covered cache generation on another thread, and requires the central commit
+plus epoch reset to return in less than 20 ms while the original submission is
+still blocked. It then queues operator PGM completion, proves both worker/cache
+locks remain available while that completion waits outside them, releases the
+sink, and verifies the committed PGM identity is submitted. The threshold gates
+commit latency only; the separately reported operator completion includes
+sink/lease waiting by design.
+
+The local Windows Qt/MinGW 13.1 kit used for this latency gate does not ship
+the GCC sanitizer runtime archives: `g++ -print-file-name=libasan.a`,
+`libubsan.a`, and `libtsan.a` return only the unresolved library names. Local
+Windows execution therefore covers the normal GPU-on/off targets, while the CI
+sanitizer matrix runs the deterministic worker/runtime pair under GPU-enabled
+Apple Clang ASan+UBSan and TSan without timing skips or new suppressions.
+
+Run the coupled evidence with:
+
+```text
 python docs/hardest-technical-challenges/transport_epoch_modelcheck.py all
+ctest --test-dir build/transport -R '^transport_epoch_' --output-on-failure
+ctest --test-dir build/transport -R '^tst_transportcommit_perf$' --output-on-failure
 ```
 
-```
-head   ->  COUNTEREXAMPLE (6-step schedule)
-fixed  ->  PROOF  -- invariant holds over all 11,017 states
-mutA   ->  COUNTEREXAMPLE (historical far-back shape, 5 steps)
-mutB   ->  COUNTEREXAMPLE (historical armed-cut shape, 9 steps)
-mutReuse -> COUNTEREXAMPLE (cache-reuse fast-path shape, 6 steps)
-
-differential gate: [OK] head  [OK] fixed  [OK] mutA  [OK] mutB  [OK] mutReuse
-```
-
-The differential gate discharges model-fidelity: the unedited protocol and
-all three mutations *must* refute while the repaired protocol *must* prove —
-a vacuous model cannot pass all five.
-
-### Two previously-unknown protocol holes (the `head` counterexamples)
-
-**H1 — swallowed reset.** `resetPlayEpoch()` from the worker with no dispatch
-active applies immediately ([`outputruntime.cpp:114-126`](../playback/output/outputruntime.cpp))
-and bumps **none** of the three values the background loop re-checks at
-`:371-372`. Schedule: BG takes a pre-commit snapshot (`:362`) → worker commits
-and resets the epoch → BG's re-checks all pass → BG dispatches the stale
-snapshot and **re-anchors the freshly-cleared epoch at the pre-seek playhead**.
-Every subsequent tick renders a real frame at the wrong media time.
-
-**H2 — commit-to-reset gap.** The commit (`:3389-3397`) and the epoch reset
-(`refreshOutputAfterSeekCommit`, `:459-469`) are separate steps with no
-barrier between them. Ticks landing in the gap render gate-open frames
-against the stale anchor (the model's 6-step `head` schedule). The armed-cut
-path does **not** have this hole — it resets inside the `m_bufferMutex`
-critical section at `:4130` — which is precisely the repair shape.
-
-Both holes are µs-wide against a ~1 ms tick cadence, which is why the e2e has
-never caught them; a model checker does not care about window width. On a
-far-back seek the divergence magnitude is the jump distance (up to tens of
-seconds), rendered with `isPlaceholder=false` and zero errors reported.
-
-### The repair (proved by the `fixed` config)
-
-1. **F1** — `resetPlayEpoch()` (every site, including the deferred-pending
-   path) also bumps `m_configGeneration`, so any in-flight pre-reset snapshot
-   fails the `:371` re-check and is discarded. (~2 lines in
-   `outputruntime.cpp`; `dispatchImmediateWithReport` already re-checks the
-   same generation, so immediates are covered for free.)
-2. **F2** — every reposition commit, including the cache-reuse fast path,
-   applies the epoch reset **atomically inside the commit's critical section**,
-   exactly as the cut fire already does at `:4130` (the lock-order note there
-   documents why taking the runtime mutex under `m_bufferMutex` is safe).
-   If an output dispatch is already active, the reset is marked pending and
-   returns immediately; the dispatcher applies it before releasing that
-   dispatch lease. `refreshOutputAfterSeekCommit(bool)` then loses its
-   `resetPlayEpoch` parameter entirely — deleting the
-   opposite-defaults trap at [`playbackworker.h:371-372`](../playback/playbackworker.h).
-
-Neither repair adds hot-path cost: F1 is one increment under a mutex already
-held; F2 moves an existing call.
-
-### Fidelity / correspondence table
-
-| Model element | Source | Order / guard |
-|---|---|---|
-| `sg` | `m_seekGeneration` `:241` fetch_add | release / acquire (`:2345`, `:4066`) |
-| `cg` | `m_committedGeneration` `:3396` | release / acquire (`:2344`) |
-| `cp` | `m_committedPlayheadMs` `:227` (release), `:3389` (relaxed, ordered by `:3396`) | acquire (`:2343`) |
-| `ag` | `m_armSeekGen` `:3732` | release / acquire (`:4067`) |
-| `sched` | `m_scheduledCutFrame` `:4006` | seq_cst |
-| `lv` | `m_lastVisiblePlayheadMs` `:227,2489,3390` | release / acquire (multi-writer) |
-| `publ/pubh` | published cache slot `m_publishedCache` `:2338` | slot lock |
-| `eh/ea/ef` | `m_havePlayEpoch`/`m_playEpoch` ([`outputdispatcher.h:195-196`](../playback/output/outputdispatcher.h)) | dispatch lease only (non-atomic) |
-| `cfg`, re-checks | `m_configGeneration`, `:371-372` | `OutputRuntime::m_mutex` |
-| cut fire | `maybeFireScheduledCut` `:4042-4150` | `m_bufferMutex`, on the output thread, **before** the lease (`:362` vs `:373`) |
-| render/sample | `clockedStateForTick` `:443-464`; `samplePlayheadMsForOutputTick` | dispatch lease |
-
-Deliberate abstractions: single feed, exact coverage predicate (the
-bookmark/cache-guard layers are collapsed into "covered"), speed fixed at 1,
-immediate dispatch modeled atomically (its internal optimistic re-check always
-sees its own consistent capture; the H1/H2 interleavings do not depend on
-splitting it), time = dispatched frames (transport and frame index advance in
-lockstep, as they do against wall time in production).
-
-### How to apply
-
-- Land F1+F2 (with the CLAUDE.md-mandated independent concurrency review).
-- Move the checker under `tests/formal/` and wire `transport_epoch_modelcheck.py
-  all` into CTest (fast unit label; it is milliseconds of pure Python) — any
-  future edit to the re-anchor protocol must re-prove the invariant, turning the
-  manual review requirement into a machine gate. (Follow-up PR: the artifacts
-  ship beside this document for now so the change stays docs-only; the CTest
-  wiring should land from a machine where the full pre-push delivery gate runs.)
-- Optional second stage: extract the `<atomic>` skeleton verbatim into a GenMC
-  harness for weak-memory-complete coverage of the same actors.
+The proved claim is limited to actors represented in both the bounded model and
+compiled/source gates. A future commit family must be added to all three before
+the claim can be extended to it; a weak-memory extraction remains a useful
+additional stage.
 
 ---
 
@@ -659,7 +639,11 @@ review.
 Formulated as oracle-grade challenge briefs and then solved against the tree
 at the referenced lines. Machine-checked artifacts:
 [`docs/hardest-technical-challenges/transport_epoch_modelcheck.py`](hardest-technical-challenges/transport_epoch_modelcheck.py)
-(differential verdicts: head/mutA/mutB/mutReuse → counterexamples, fixed → proof) and
+(differential verdicts: `mut_f1` and eight owner-specific `mut_f2` modes →
+counterexamples, fixed → bounded proof over 523 aggregate states),
+[`tests/formal/transport_epoch_source_audit.py`](../tests/formal/transport_epoch_source_audit.py)
+(production ownership/order audit), compiled transport-epoch mutation controls,
+and
 [`docs/hardest-technical-challenges/timecode_alignment_proof.py`](hardest-technical-challenges/timecode_alignment_proof.py)
 (falsifier + 3,969-cell bound sweep, 0 violations). Line references anchor to
 the working tree at the time of writing; re-verify against HEAD before acting.

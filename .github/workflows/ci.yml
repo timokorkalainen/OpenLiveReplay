@@ -801,11 +801,17 @@ jobs:
       matrix:
         include:
           # Empty build_targets => build the whole suite and run the full unit
-          # label; a non-empty list builds only those threading/harness targets.
+          # label; a non-empty list builds only the focused sanitizer targets.
           - sanitizer: "address;undefined"
             label: asan-ubsan
             advisory: false
             build_targets: ""
+          # Production transport protocol with GPU-enabled PlaybackWorker. The
+          # general ASan leg is GPU-off and therefore does not register that test.
+          - sanitizer: "address;undefined"
+            label: asan-transport
+            advisory: false
+            build_targets: "tst_outputruntime tst_playbackworker"
           - sanitizer: "thread"
             label: tsan
             advisory: false
@@ -813,7 +819,7 @@ jobs:
           - sanitizer: "thread"
             label: tsan-gpu
             advisory: false
-            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring tst_gpucompositor_stress tst_asyncgpureadbacksink tst_iotargetsinkfactory tst_gpuencodepump tst_streamworker_gpuencode tst_playbackworker"
+            build_targets: "tst_gpufence tst_gpugeneration tst_evictionguard tst_stagingfence tst_gpu_sync_stress tst_gpuframedata tst_gpureadbackring tst_gpucompositor_stress tst_asyncgpureadbacksink tst_iotargetsinkfactory tst_gpuencodepump tst_streamworker_gpuencode tst_outputruntime tst_playbackworker"
           # asan-e2e: only the e2e harness binaries need building — the playback
           # matrix drives play_harness + record_harness; the native SRT smoke
           # drives record_harness. Both link olr_sanitize, so this build is
@@ -866,7 +872,8 @@ jobs:
       - name: Configure (${{ matrix.label }})
         run: |
           gpu_args=()
-          if [ "${{ matrix.label }}" = "tsan-gpu" ]; then
+          if [ "${{ matrix.label }}" = "tsan-gpu" ] || \
+             [ "${{ matrix.label }}" = "asan-transport" ]; then
             gpu_args+=(-DOLR_GPU_PIPELINE=ON)
           fi
           cmake -S . -B build -G Ninja \
@@ -932,12 +939,20 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1:suppressions=${{ github.workspace }}/tests/tsan.suppressions.txt
         run: |
-          if [ "${{ matrix.label }}" = "tsan" ]; then
+          if [ "${{ matrix.label }}" = "asan-transport" ]; then
+            ctest --output-on-failure --no-tests=error \
+              -R '^(tst_outputruntime|tst_playbackworker)$'
+          elif [ "${{ matrix.label }}" = "tsan" ]; then
+            # The epoch/runtime barrier is deterministic and must pass on its
+            # first attempt; keep retry tolerance only for the legacy stress set.
+            ctest --output-on-failure --no-tests=error -R '^tst_outputruntime$'
             ctest --output-on-failure --repeat until-pass:2 \
-              -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_outputruntime|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
+              -R '^(tst_trackbuffer|tst_audioframequeue|tst_outputdispatcher|tst_commitgate|tst_seekcoalescer|tst_outputbusengine|tst_ndiingest)$'
           elif [ "${{ matrix.label }}" = "tsan-gpu" ]; then
+            ctest --output-on-failure --no-tests=error \
+              -R '^(tst_outputruntime|tst_playbackworker)$'
             ctest --output-on-failure --repeat until-pass:2 \
-              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode|tst_playbackworker)$'
+              -R '^(tst_gpufence|tst_gpugeneration|tst_evictionguard|tst_stagingfence|tst_gpu_sync_stress|tst_gpuframedata|tst_gpureadbackring|tst_gpucompositor_stress|tst_asyncgpureadbacksink|tst_iotargetsinkfactory|tst_gpuencodepump|tst_streamworker_gpuencode)$'
           else
             ctest --output-on-failure --repeat until-pass:2 \
               -L unit -LE 'sync-report|srt|native-apple-ingest|native-rtmp'

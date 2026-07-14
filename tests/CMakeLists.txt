@@ -415,6 +415,7 @@ if(OLR_GPU_PIPELINE)
 endif()
 
 add_subdirectory(unit)
+add_subdirectory(perf)
 if(APPLE OR WIN32)  # tst_ingestbackendselector is Apple/Windows-only (native ingest)
     target_link_libraries(tst_ingestbackendselector PRIVATE olr_test_engine)
 endif()
