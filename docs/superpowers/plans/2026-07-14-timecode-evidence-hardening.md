@@ -2,7 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Turn NDI, H.264, HEVC, registered ATC, and RTMP metadata into validated, generation-bound timecode evidence whose uncertainty is consumed by the alignment servo.
+**Goal:** Turn NDI, H.264, HEVC, and RTMP metadata into validated,
+generation-bound timecode evidence whose uncertainty is consumed by the
+alignment servo, while rejecting unselected registered T.35 bodies.
 
 **Architecture:** Introduce a small value-type evidence model and a cached per-ingest codec timing context. Codec-specific parsers produce validated observations; `TimecodeAlignerV2` unwraps them across midnight and returns exact, bounded, or incomparable offsets; `ReplayManager` resets generations and gates the servo on the returned bound.
 
@@ -26,7 +28,9 @@
 - Create `recorder_engine/timing/timecodeevidence.cpp`: label validation, canonical rate conversion, checked arithmetic, and modulo-day helpers.
 - Create `recorder_engine/ingest/h26xtimingcontext.h`: cached H.264/HEVC VUI/HRD context and parser result API.
 - Create `recorder_engine/ingest/h26xtimingcontext.cpp`: parameter-set parsing and generation management.
-- Modify `recorder_engine/ingest/h26xseitimecode.h` and `recorder_engine/ingest/h26xseitimecode.cpp`: codec-specific SEI and registered ATC parsing against active context.
+- Modify `recorder_engine/ingest/h26xseitimecode.h` and
+  `recorder_engine/ingest/h26xseitimecode.cpp`: codec-specific SEI parsing
+  against active context plus strict registered T.35 envelope validation.
 - Modify `recorder_engine/ingest/spsframerate.h` and `recorder_engine/ingest/spsframerate.cpp`: retain compatibility wrapper while exposing fixed/variable rate status.
 - Modify `recorder_engine/ingest/ingestsession.h`, the three native ingest headers/implementations, `recorder_engine/streamworker.h`, `recorder_engine/streamworker.cpp`, `recorder_engine/replaymanager.h`, and `recorder_engine/replaymanager.cpp`: produce, carry, reset, and consume evidence.
 - Modify `recorder_engine/timing/timecodealignerv2.h`, `recorder_engine/timing/timecodealignerv2.cpp`, `recorder_engine/timing/sourceoffsetestimator.h`, and `recorder_engine/timing/sourceoffsetestimator.cpp`: unwrap, bound, and consume evidence.
@@ -216,14 +220,26 @@ git add recorder_engine/ingest/h26xtimingcontext.h recorder_engine/ingest/h26xti
 git commit -m "fix(ingest): parse standard h264 pic timing" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
 ```
 
-### Task 3: HEVC `time_code` and registered ATC parsing
+### Task 3: HEVC `time_code` and registered T.35 envelope parsing
+
+#### Fix Wave: remove the unspecified registered-ATC assumption
+
+Primary-source review found no published ATC registration matching the
+original generic country/provider/user-id placeholder. ITU-T T.35 delegates
+provider-body semantics to each registration; ATSC `GA94` type 3 is caption
+`cc_data`, while SMPTE ST 334-2 CDP timecode is VANC and is not that SEI
+mapping. Task 3 therefore validates the T.35 envelope and ignores unknown
+registrations, with explicit GA94/CDP false-positive tests. It must not claim
+registered ATC support until a specific published registration and body syntax
+are named. This correction removes a false-support claim; it is not a deferred
+parser implementation.
 
 **Files:**
 - Modify: `recorder_engine/ingest/h26xtimingcontext.cpp`
+- Modify: `recorder_engine/ingest/h26xtimingcontext.h`
 - Modify: `recorder_engine/ingest/h26xseitimecode.cpp`
+- Modify: `recorder_engine/ingest/h26xseitimecode.h`
 - Modify: `tests/unit/tst_h26xseitimecode.cpp`
-- Add: `tests/fixtures/timecode/hevc_time_code.265`
-- Add: `tests/fixtures/timecode/registered_atc_h264.264`
 - Add: `tests/fixtures/timecode/h264_jm_pic_timing.264`
 - Add: `tests/fixtures/timecode/h264_x264_pic_timing.264`
 - Add: `tests/fixtures/timecode/hevc_hm_time_code.265`
@@ -231,18 +247,19 @@ git commit -m "fix(ingest): parse standard h264 pic timing" -m "Co-Authored-By: 
 - Add: `tests/fixtures/timecode/README.md`
 
 **Interfaces:**
-- Produces: complete `H26xSeiTimecodeResult` for HEVC and supported T.35 registrations.
+- Produces: complete `H26xSeiTimecodeResult` for HEVC; validates and safely ignores
+  T.35 registrations without a selected published ATC profile.
 - Consumes: active `H26xTimingContext` and strict label validation from Task 1.
 
 - [ ] **Step 1: Add failing HEVC/T.35 vector tests**
 
-Cover `num_clock_ts` 0/1/3, `clock_timestamp_flag`, units-field presence flags, counting type, drop/discontinuity flags, signed `time_offset`, truncated messages, unknown country/provider/user identifiers, and a supported ATC identifier. Assert unknown registered data is ignored.
+Cover `num_clock_ts` 0/1/3, `clock_timestamp_flag`, units-field presence flags, counting type, drop/discontinuity flags, signed `time_offset`, truncated messages, and unknown country/provider/user identifiers. Assert registered data without a selected published ATC profile is ignored.
 
 - [ ] **Step 2: Verify tests fail against the generic payload decoder**
 
 Run: `cmake --build build/timecode --target tst_h26xseitimecode && ctest --test-dir build/timecode -R '^tst_h26xseitimecode$' --output-on-failure`
 
-Expected: HEVC and registration-specific assertions fail.
+Expected: HEVC and T.35-envelope assertions fail.
 
 - [ ] **Step 3: Implement codec-specific payload dispatch**
 
@@ -252,11 +269,11 @@ Dispatch only these combinations:
 switch (codec) {
 case NativeVideoCodec::H264:
     if (payloadType == 1) return parseH264PicTiming(payload, *context.h264());
-    if (payloadType == 4) return parseRegisteredAtc(payload, context.constantFrameRate());
+    if (payloadType == 4) return validateRegisteredT35Envelope(payload);
     break;
 case NativeVideoCodec::Hevc:
     if (payloadType == 136) return parseHevcTimeCode(payload, *context.hevc());
-    if (payloadType == 4) return parseRegisteredAtc(payload, context.constantFrameRate());
+    if (payloadType == 4) return validateRegisteredT35Envelope(payload);
     break;
 default:
     break;
@@ -264,7 +281,10 @@ default:
 return {};
 ```
 
-Validate T.35 country code, extended country byte, provider code, and user identifier before reading ATC. If the legacy packed payload is retained, require the project-private identifier and never route payload type 1/136 through it.
+Validate the T.35 country code and extension byte; for the well-known US ATSC
+namespace, also validate the provider/user envelope. Return no timestamp
+without a selected published registration body. The legacy packed payload is
+removed and payload types 1/136 are routed only to their standard codec syntax.
 
 Generate and retain small redistributable vectors from the JM/x264 H.264 and HM/SHM HEVC encoder families. `tests/fixtures/timecode/README.md` records encoder version, exact command/config, upstream license, expected message syntax, and SHA-256 for each vector. The constructed bit-level fixtures remain separate so each optional syntax branch is independently falsifiable.
 
@@ -272,13 +292,13 @@ Generate and retain small redistributable vectors from the JM/x264 H.264 and HM/
 
 Run: `cmake --build build/timecode --target tst_h26xseitimecode && ctest --test-dir build/timecode -R '^tst_h26xseitimecode$' --output-on-failure`
 
-Expected: all HEVC, registered ATC, malformed, and unknown-registration cases pass.
+Expected: all HEVC, malformed, T.35-envelope, and unknown-registration cases pass.
 
-- [ ] **Step 5: Commit HEVC/ATC support**
+- [ ] **Step 5: Commit HEVC/T.35 support**
 
 ```powershell
-git add recorder_engine/ingest/h26xtimingcontext.cpp recorder_engine/ingest/h26xseitimecode.cpp tests/unit/tst_h26xseitimecode.cpp tests/fixtures/timecode/hevc_time_code.265 tests/fixtures/timecode/registered_atc_h264.264 tests/fixtures/timecode/h264_jm_pic_timing.264 tests/fixtures/timecode/h264_x264_pic_timing.264 tests/fixtures/timecode/hevc_hm_time_code.265 tests/fixtures/timecode/hevc_shm_time_code.265 tests/fixtures/timecode/README.md
-git commit -m "feat(ingest): parse hevc and registered timecode sei" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
+git add recorder_engine/ingest/h26xtimingcontext.h recorder_engine/ingest/h26xtimingcontext.cpp recorder_engine/ingest/h26xseitimecode.h recorder_engine/ingest/h26xseitimecode.cpp tests/unit/tst_h26xseitimecode.cpp tests/fixtures/timecode/h264_jm_pic_timing.264 tests/fixtures/timecode/h264_x264_pic_timing.264 tests/fixtures/timecode/hevc_hm_time_code.265 tests/fixtures/timecode/hevc_shm_time_code.265 tests/fixtures/timecode/README.md
+git commit -m "feat(ingest): parse standard hevc timecode sei" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
 ```
 
 ### Task 4: Ingest-session evidence production and cached metadata
@@ -447,7 +467,11 @@ git commit -m "fix(timecode): gate alignment servo on evidence bounds" -m "Co-Au
 
 - [ ] **Step 1: Add mutation cases and verify each mutant is detected**
 
-The script must build narrow test variants for: missing rate propagation, missing bound consumption, missing generation reset, missing rollover unwrap, H.264 parser disconnected, HEVC parser disconnected, and registered ATC parser disconnected. Each variant runs one named focused test and succeeds only when that test fails for its intended assertion.
+The script must build narrow test variants for: missing rate propagation,
+missing bound consumption, missing generation reset, missing rollover unwrap,
+H.264 parser disconnected, HEVC parser disconnected, and registered T.35
+envelope validation disconnected. Each variant runs one named focused test and
+succeeds only when that test fails for its intended assertion.
 
 Run: `python tests/mutations/timecode_evidence_mutations.py --build-dir build/timecode`
 

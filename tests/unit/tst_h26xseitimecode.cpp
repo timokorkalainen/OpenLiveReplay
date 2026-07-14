@@ -42,8 +42,19 @@ private slots:
     void rawEbspTrailingZeroBytesRemainStrict();
     void h264MalformedContextIsNotUnsupported();
     void h264PicTimingWithoutContextIsRejected();
+    void h264X264FixtureDoesNotInventTimestamp();
+    void h264JmFixtureDoesNotInventTimestamp();
+    void hevcSpsVuiTimingContextIsParsed();
+    void hevcHmFixtureIsDecoded();
+    void hevcShmFixtureIsDecoded();
     void hevcTimeCodeDecoded();
-    void hevcSuffixSeiDecoded();
+    void hevcClockCountAndFlagsAreValidated();
+    void hevcPartialTimestampInheritsEarlierUnits();
+    void hevcSignedOffsetAndDiscontinuityArePreserved();
+    void hevcCountingAndDropSemanticsAreValidated();
+    void hevcTruncatedTimeCodeIsRejected();
+    void hevcSuffixTimeCodeIsIgnored();
+    void registeredT35UnknownAndCaptionPayloadsAreIgnored();
     void noSeiReturnsInvalid();
     void truncatedSeiPayloadReturnsInvalid();
     void truncatedPayloadSizeReturnsInvalid();
@@ -125,6 +136,15 @@ QByteArray hevcSuffixSeiNal(const QByteArray& rbsp) {
     return seiNal(QByteArray::fromHex("5001"), rbsp);
 }
 
+HevcTimingSyntax hevcTiming(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000) {
+    HevcTimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.numUnitsInTick = numUnitsInTick;
+    syntax.timeScale = timeScale;
+    syntax.timingInfoPresent = true;
+    return syntax;
+}
+
 // A trivial VCL NAL so the buffer looks like a real access unit.
 QByteArray h264VclNal() {
     return QByteArray(kStartCode4, 4) + QByteArray::fromHex("658884"); // IDR slice
@@ -189,6 +209,22 @@ struct BitWriter {
         bits(uint32_t(value) & mask, count);
     }
 
+    void ue(uint32_t value) {
+        const uint64_t codeNum = uint64_t(value) + 1u;
+        int width = 0;
+        for (uint64_t probe = codeNum; probe != 0; probe >>= 1)
+            ++width;
+        for (int i = 0; i < width - 1; ++i)
+            bit(false);
+        bits(uint32_t(codeNum), width);
+    }
+
+    void rbspTrailingBits() {
+        bit(true);
+        while (bitPosition != 0)
+            bit(false);
+    }
+
     void payloadTrailingBits(bool marker = true, bool nonzeroPadding = false) {
         bit(marker);
         bool firstPaddingBit = true;
@@ -199,15 +235,143 @@ struct BitWriter {
     }
 };
 
+QByteArray hevcVps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000) {
+    BitWriter writer;
+    writer.bits(0, 4); // vps_video_parameter_set_id
+    writer.bit(true);  // vps_base_layer_internal_flag
+    writer.bit(true);  // vps_base_layer_available_flag
+    writer.bits(0, 6); // vps_max_layers_minus1
+    writer.bits(0, 3); // vps_max_sub_layers_minus1
+    writer.bit(true);  // vps_temporal_id_nesting_flag
+    writer.bits(0xffff, 16);
+    writer.bits(0, 2);            // general_profile_space
+    writer.bit(false);            // general_tier_flag
+    writer.bits(1, 5);            // Main profile
+    writer.bits(0x80000000u, 32); // Main profile compatibility
+    writer.bit(true);             // progressive_source_flag
+    writer.bit(false);            // interlaced_source_flag
+    writer.bit(false);            // non_packed_constraint_flag
+    writer.bit(true);             // frame_only_constraint_flag
+    writer.bits(0, 32);
+    writer.bits(0, 12);  // reserved_zero_44bits
+    writer.bits(120, 8); // general_level_idc
+    writer.bit(false);   // sub_layer_ordering_info_present_flag
+    writer.ue(0);        // max_dec_pic_buffering_minus1
+    writer.ue(0);        // max_num_reorder_pics
+    writer.ue(0);        // max_latency_increase_plus1
+    writer.bits(0, 6);   // vps_max_layer_id
+    writer.ue(0);        // vps_num_layer_sets_minus1
+    writer.bit(true);    // vps_timing_info_present_flag
+    writer.bits(numUnitsInTick, 32);
+    writer.bits(timeScale, 32);
+    writer.bit(true);  // vps_poc_proportional_to_timing_flag
+    writer.ue(0);      // vps_num_ticks_poc_diff_one_minus1
+    writer.ue(0);      // vps_num_hrd_parameters
+    writer.bit(false); // vps_extension_flag
+    writer.rbspTrailingBits();
+    return QByteArray::fromHex("4001") + escapeRbsp(writer.bytes);
+}
+
+QList<QByteArray> hevcNalsOfType(const QByteArray& annexB, int wantedType) {
+    QList<QByteArray> result;
+    for (int i = 0; i + 5 <= annexB.size();) {
+        int prefix = 0;
+        if (annexB.mid(i, 4) == QByteArray::fromHex("00000001"))
+            prefix = 4;
+        else if (annexB.mid(i, 3) == QByteArray::fromHex("000001"))
+            prefix = 3;
+        if (prefix == 0) {
+            ++i;
+            continue;
+        }
+        const int nalStart = i + prefix;
+        int end = annexB.size();
+        for (int j = nalStart + 2; j + 3 <= annexB.size(); ++j) {
+            if (annexB.mid(j, 3) == QByteArray::fromHex("000001") ||
+                (j + 4 <= annexB.size() && annexB.mid(j, 4) == QByteArray::fromHex("00000001"))) {
+                end = j;
+                break;
+            }
+        }
+        if (((uchar(annexB[nalStart]) >> 1) & 0x3f) == wantedType)
+            result.append(annexB.mid(nalStart, end - nalStart));
+        i = end;
+    }
+    return result;
+}
+
+QByteArray hevcSps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000) {
+    BitWriter writer;
+    writer.bits(0, 4); // sps_video_parameter_set_id
+    writer.bits(0, 3); // sps_max_sub_layers_minus1
+    writer.bit(true);  // sps_temporal_id_nesting_flag
+    writer.bits(0, 2);
+    writer.bit(false);
+    writer.bits(1, 5);
+    writer.bits(0x80000000u, 32);
+    writer.bit(true);
+    writer.bit(false);
+    writer.bit(false);
+    writer.bit(true);
+    writer.bits(0, 32);
+    writer.bits(0, 12);
+    writer.bits(120, 8);
+    writer.ue(0);      // sps_seq_parameter_set_id
+    writer.ue(1);      // chroma_format_idc: 4:2:0
+    writer.ue(64);     // pic_width_in_luma_samples
+    writer.ue(64);     // pic_height_in_luma_samples
+    writer.bit(false); // conformance_window_flag
+    writer.ue(0);      // bit_depth_luma_minus8
+    writer.ue(0);      // bit_depth_chroma_minus8
+    writer.ue(4);      // log2_max_pic_order_cnt_lsb_minus4
+    writer.bit(false); // sub_layer_ordering_info_present_flag
+    writer.ue(0);
+    writer.ue(0);
+    writer.ue(0);
+    writer.ue(0);      // log2_min_luma_coding_block_size_minus3
+    writer.ue(3);      // log2_diff_max_min_luma_coding_block_size
+    writer.ue(0);      // log2_min_luma_transform_block_size_minus2
+    writer.ue(3);      // log2_diff_max_min_luma_transform_block_size
+    writer.ue(0);      // max_transform_hierarchy_depth_inter
+    writer.ue(0);      // max_transform_hierarchy_depth_intra
+    writer.bit(false); // scaling_list_enabled_flag
+    writer.bit(true);  // amp_enabled_flag
+    writer.bit(true);  // sample_adaptive_offset_enabled_flag
+    writer.bit(false); // pcm_enabled_flag
+    writer.ue(0);      // num_short_term_ref_pic_sets
+    writer.bit(false); // long_term_ref_pics_present_flag
+    writer.bit(true);  // sps_temporal_mvp_enabled_flag
+    writer.bit(true);  // strong_intra_smoothing_enabled_flag
+    writer.bit(true);  // vui_parameters_present_flag
+    writer.bit(false); // aspect_ratio_info_present_flag
+    writer.bit(false); // overscan_info_present_flag
+    writer.bit(false); // video_signal_type_present_flag
+    writer.bit(false); // chroma_loc_info_present_flag
+    writer.bit(false); // neutral_chroma_indication_flag
+    writer.bit(false); // field_seq_flag
+    writer.bit(false); // frame_field_info_present_flag
+    writer.bit(false); // default_display_window_flag
+    writer.bit(true);  // vui_timing_info_present_flag
+    writer.bits(numUnitsInTick, 32);
+    writer.bits(timeScale, 32);
+    writer.bit(true);  // vui_poc_proportional_to_timing_flag
+    writer.ue(0);      // vui_num_ticks_poc_diff_one_minus1
+    writer.bit(false); // vui_hrd_parameters_present_flag
+    writer.bit(false); // bitstream_restriction_flag
+    writer.bit(false); // sps_extension_present_flag
+    writer.rbspTrailingBits();
+    return QByteArray::fromHex("4201") + escapeRbsp(writer.bytes);
+}
+
 void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, int frames,
                         int countingType = 0, bool countDropped = false, bool nuitFieldBased = true,
                         int32_t timeOffset = 0, int timeOffsetLength = 0,
                         bool discontinuity = false, int ctType = 0) {
-    writer.bit(true);  // clock_timestamp_flag[0]
+    writer.bit(true); // clock_timestamp_flag[0]
     writer.bits(uint32_t(ctType), 2);
     writer.bit(nuitFieldBased);
     writer.bits(uint32_t(countingType), 5);
-    writer.bit(true);  // full_timestamp_flag
+    writer.bit(true); // full_timestamp_flag
     writer.bit(discontinuity);
     writer.bit(countDropped);
     writer.bits(uint32_t(frames), 8);
@@ -224,6 +388,37 @@ QByteArray fullTimestampPayload(int hours, int minutes, int seconds, int frames,
     writer.bits(0, 4); // pic_struct: frame
     writeFullTimestamp(writer, hours, minutes, seconds, frames, countingType, countDropped,
                        nuitFieldBased);
+    if (writer.bitPosition != 0) writer.payloadTrailingBits();
+    return writer.bytes;
+}
+
+void writeHevcFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, int frames,
+                            int countingType = 0, bool countDropped = false,
+                            bool unitsFieldBased = false, int32_t timeOffset = 0,
+                            int timeOffsetLength = 0, bool discontinuity = false) {
+    writer.bit(true); // clock_timestamp_flag
+    writer.bit(unitsFieldBased);
+    writer.bits(uint32_t(countingType), 5);
+    writer.bit(true); // full_timestamp_flag
+    writer.bit(discontinuity);
+    writer.bit(countDropped);
+    writer.bits(uint32_t(frames), 9);
+    writer.bits(uint32_t(seconds), 6);
+    writer.bits(uint32_t(minutes), 6);
+    writer.bits(uint32_t(hours), 5);
+    writer.bits(uint32_t(timeOffsetLength), 5);
+    writer.signedBits(timeOffset, timeOffsetLength);
+}
+
+QByteArray hevcFullTimestampPayload(int hours, int minutes, int seconds, int frames,
+                                    int countingType = 0, bool countDropped = false,
+                                    bool unitsFieldBased = false, int32_t timeOffset = 0,
+                                    int timeOffsetLength = 0, bool discontinuity = false,
+                                    int clockCount = 1) {
+    BitWriter writer;
+    writer.bits(uint32_t(clockCount), 2);
+    writeHevcFullTimestamp(writer, hours, minutes, seconds, frames, countingType, countDropped,
+                           unitsFieldBased, timeOffset, timeOffsetLength, discontinuity);
     if (writer.bitPosition != 0) writer.payloadTrailingBits();
     return writer.bytes;
 }
@@ -1255,30 +1450,217 @@ void TestH26xSeiTimecode::h264PicTimingWithoutContextIsRejected() {
     QVERIFY(!got.valid);
 }
 
-void TestH26xSeiTimecode::hevcTimeCodeDecoded() {
-    const Smpte12mTimecode want{1, 2, 3, 4, /*drop*/ false, /*valid*/ true};
-    const QByteArray rbsp = seiMessage(/*time_code*/ 136, packedWordBytes(want));
-    const QByteArray annexB = hevcPrefixSeiNal(rbsp) + hevcVclNal();
+void TestH26xSeiTimecode::h264X264FixtureDoesNotInventTimestamp() {
+    const QByteArray bitstream = fixture("h264_x264_pic_timing.264");
+    QVERIFY(!bitstream.isEmpty());
+    const QByteArray sps = h264SpsFromAnnexB(bitstream);
+    QVERIFY(!sps.isEmpty());
 
-    const Smpte12mTimecode got = extractH26xSeiTimecode(annexB, NativeVideoCodec::Hevc);
-    QVERIFY(got.valid);
-    QCOMPARE(got.hours, 1);
-    QCOMPARE(got.minutes, 2);
-    QCOMPARE(got.seconds, 3);
-    QCOMPARE(got.frames, 4);
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {sps}));
+    QVERIFY(context.h264() != nullptr);
+    QVERIFY(context.h264()->picStructPresent);
+    QVERIFY(
+        !extractH26xSeiTimecodeResult(bitstream, NativeVideoCodec::H264, context).timecode.valid);
 }
 
-void TestH26xSeiTimecode::hevcSuffixSeiDecoded() {
-    const Smpte12mTimecode want{23, 59, 58, 24, /*drop*/ false, /*valid*/ true};
-    const QByteArray rbsp = seiMessage(136, packedWordBytes(want));
-    const QByteArray annexB = hevcVclNal() + hevcSuffixSeiNal(rbsp);
+void TestH26xSeiTimecode::h264JmFixtureDoesNotInventTimestamp() {
+    const QByteArray bitstream = fixture("h264_jm_pic_timing.264");
+    QVERIFY(!bitstream.isEmpty());
+    const QByteArray sps = h264SpsFromAnnexB(bitstream);
+    QVERIFY(!sps.isEmpty());
 
-    const Smpte12mTimecode got = extractH26xSeiTimecode(annexB, NativeVideoCodec::Hevc);
-    QVERIFY(got.valid);
-    QCOMPARE(got.hours, 23);
-    QCOMPARE(got.minutes, 59);
-    QCOMPARE(got.seconds, 58);
-    QCOMPARE(got.frames, 24);
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {sps}));
+    QVERIFY(context.h264() != nullptr);
+    QVERIFY(context.h264()->picStructPresent);
+    QVERIFY(
+        !extractH26xSeiTimecodeResult(bitstream, NativeVideoCodec::H264, context).timecode.valid);
+}
+
+void TestH26xSeiTimecode::hevcSpsVuiTimingContextIsParsed() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {hevcSps()}));
+    QVERIFY(context.hevc() != nullptr);
+    QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Valid);
+    QCOMPARE(context.hevc()->numUnitsInTick, uint32_t(1001));
+    QCOMPARE(context.hevc()->timeScale, uint32_t(30000));
+    QVERIFY(context.fixedFrameRate());
+    QCOMPARE(context.constantFrameRate(), (FrameRateQ{30000, 1001}));
+
+    QVERIFY(
+        !context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {hevcSps(1001, 60000)}));
+    QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Unsupported);
+}
+
+void TestH26xSeiTimecode::hevcHmFixtureIsDecoded() {
+    const QByteArray bitstream = fixture("hevc_hm_time_code.265");
+    QVERIFY(!bitstream.isEmpty());
+    const QList<QByteArray> vps = hevcNalsOfType(bitstream, 32);
+    const QList<QByteArray> sps = hevcNalsOfType(bitstream, 33);
+    QVERIFY(!vps.isEmpty());
+    QVERIFY(!sps.isEmpty());
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, vps, sps));
+    QVERIFY(context.hevc()->timingInfoPresent);
+    QCOMPARE(context.hevc()->numUnitsInTick, uint32_t(900900));
+    QCOMPARE(context.hevc()->timeScale, uint32_t(27000000));
+    const auto payload =
+        H26xTimingDetail::parseHevcTimeCode(QByteArray::fromHex("60e06985a8d3c0"), *context.hevc());
+    QCOMPARE(payload.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    const H26xSeiTimecodeResult got =
+        extractH26xSeiTimecodeResult(bitstream, NativeVideoCodec::Hevc, context);
+    QVERIFY(got.timecode.valid);
+    QCOMPARE(got.timecode.hours, 10);
+    QCOMPARE(got.timecode.minutes, 11);
+    QCOMPARE(got.timecode.seconds, 12);
+    QCOMPARE(got.timecode.frames, 13);
+    QCOMPARE(got.labelRate, (FrameRateQ{30000, 1001}));
+    QVERIFY(got.discontinuity);
+    QCOMPARE(got.provenance, TimecodeProvenance::HevcTimeCode);
+}
+
+void TestH26xSeiTimecode::hevcShmFixtureIsDecoded() {
+    const QByteArray bitstream = fixture("hevc_shm_time_code.265");
+    QVERIFY(!bitstream.isEmpty());
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, hevcNalsOfType(bitstream, 32),
+                                        hevcNalsOfType(bitstream, 33)));
+    const H26xSeiTimecodeResult got =
+        extractH26xSeiTimecodeResult(bitstream, NativeVideoCodec::Hevc, context);
+    QVERIFY(got.timecode.valid);
+    QCOMPARE(got.timecode.hours, 1);
+    QCOMPARE(got.timecode.minutes, 2);
+    QCOMPARE(got.timecode.seconds, 3);
+    QCOMPARE(got.timecode.frames, 4);
+    QCOMPARE(got.labelRate, (FrameRateQ{30000, 1001}));
+    QVERIFY(!got.discontinuity);
+    QCOMPARE(got.provenance, TimecodeProvenance::HevcTimeCode);
+}
+
+void TestH26xSeiTimecode::hevcTimeCodeDecoded() {
+    const QByteArray payload = hevcFullTimestampPayload(1, 2, 3, 4);
+    const auto parsed = H26xTimingDetail::parseHevcTimeCode(payload, hevcTiming());
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    QCOMPARE(parsed.labelRate, (FrameRateQ{30000, 1001}));
+    QCOMPARE(parsed.provenance, TimecodeProvenance::HevcTimeCode);
+
+    const QByteArray rbsp = seiMessage(/*time_code*/ 136, payload);
+    const QByteArray annexB = hevcPrefixSeiNal(rbsp) + hevcVclNal();
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {}));
+    const H26xSeiTimecodeResult got =
+        extractH26xSeiTimecodeResult(annexB, NativeVideoCodec::Hevc, context);
+    QVERIFY(got.timecode.valid);
+    QCOMPARE(got.timecode.hours, 1);
+    QCOMPARE(got.timecode.minutes, 2);
+    QCOMPARE(got.timecode.seconds, 3);
+    QCOMPARE(got.timecode.frames, 4);
+    QCOMPARE(got.labelRate, (FrameRateQ{30000, 1001}));
+    QCOMPARE(got.provenance, TimecodeProvenance::HevcTimeCode);
+}
+
+void TestH26xSeiTimecode::hevcClockCountAndFlagsAreValidated() {
+    auto syntax = hevcTiming();
+    BitWriter zero;
+    zero.bits(0, 2);
+    zero.payloadTrailingBits();
+    QCOMPARE(H26xTimingDetail::parseHevcTimeCode(zero.bytes, syntax).status,
+             H26xTimingDetail::TimecodeParseStatus::Malformed);
+
+    BitWriter three;
+    three.bits(3, 2);
+    writeHevcFullTimestamp(three, 1, 2, 3, 4);
+    three.bit(false);
+    writeHevcFullTimestamp(three, 1, 2, 3, 5);
+    if (three.bitPosition != 0) three.payloadTrailingBits();
+    const auto parsed = H26xTimingDetail::parseHevcTimeCode(three.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    QCOMPARE(parsed.timecode.frames, 4);
+}
+
+void TestH26xSeiTimecode::hevcPartialTimestampInheritsEarlierUnits() {
+    BitWriter writer;
+    writer.bits(2, 2);
+    writeHevcFullTimestamp(writer, 7, 8, 9, 10);
+    writer.bit(true);
+    writer.bit(false); // units_field_based_flag
+    writer.bits(0, 5); // counting_type
+    writer.bit(false); // full_timestamp_flag
+    writer.bit(false); // discontinuity_flag
+    writer.bit(false); // cnt_dropped_flag
+    writer.bits(11, 9);
+    writer.bit(false); // seconds_flag: inherit the preceding clock's units
+    writer.bits(0, 5); // time_offset_length
+    if (writer.bitPosition != 0) writer.payloadTrailingBits();
+    const auto parsed = H26xTimingDetail::parseHevcTimeCode(writer.bytes, hevcTiming());
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    QCOMPARE(parsed.timecode.hours, 7);
+    QCOMPARE(parsed.timecode.minutes, 8);
+    QCOMPARE(parsed.timecode.seconds, 9);
+    QCOMPARE(parsed.timecode.frames, 10);
+}
+
+void TestH26xSeiTimecode::hevcSignedOffsetAndDiscontinuityArePreserved() {
+    const auto parsed = H26xTimingDetail::parseHevcTimeCode(
+        hevcFullTimestampPayload(10, 11, 12, 13, 1, false, false, -7, 6, true), hevcTiming());
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    QVERIFY(parsed.discontinuity);
+}
+
+void TestH26xSeiTimecode::hevcCountingAndDropSemanticsAreValidated() {
+    QCOMPARE(H26xTimingDetail::parseHevcTimeCode(hevcFullTimestampPayload(1, 2, 3, 4, 0, true),
+                                                 hevcTiming())
+                 .status,
+             H26xTimingDetail::TimecodeParseStatus::Malformed);
+
+    const auto drop = H26xTimingDetail::parseHevcTimeCode(
+        hevcFullTimestampPayload(1, 1, 0, 2, 4, true), hevcTiming());
+    QCOMPARE(drop.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    QVERIFY(drop.timecode.dropFrame);
+
+    QCOMPARE(H26xTimingDetail::parseHevcTimeCode(hevcFullTimestampPayload(1, 1, 0, 3, 4, true),
+                                                 hevcTiming())
+                 .status,
+             H26xTimingDetail::TimecodeParseStatus::Malformed);
+}
+
+void TestH26xSeiTimecode::hevcTruncatedTimeCodeIsRejected() {
+    QByteArray payload = hevcFullTimestampPayload(1, 2, 3, 4);
+    payload.chop(1);
+    QCOMPARE(H26xTimingDetail::parseHevcTimeCode(payload, hevcTiming()).status,
+             H26xTimingDetail::TimecodeParseStatus::Malformed);
+}
+
+void TestH26xSeiTimecode::hevcSuffixTimeCodeIsIgnored() {
+    const QByteArray rbsp = seiMessage(136, hevcFullTimestampPayload(23, 59, 58, 24));
+    const QByteArray annexB = hevcVclNal() + hevcSuffixSeiNal(rbsp);
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {}));
+    QVERIFY(!extractH26xSeiTimecode(annexB, NativeVideoCodec::Hevc, context).valid);
+}
+
+void TestH26xSeiTimecode::registeredT35UnknownAndCaptionPayloadsAreIgnored() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {}));
+
+    const QList<QByteArray> payloads{
+        QByteArray::fromHex("b500314741393403c0ff"),         // ATSC GA94 type 3: cc_data, not ATC
+        QByteArray::fromHex("b5003147413934037104aabbccdd"), // CDP-like bytes in cc_data
+        QByteArray::fromHex("ff0100904f4c525401020304"),     // extended country, unknown user id
+        QByteArray::fromHex("b500904154432001020304")        // unknown provider-owned user id
+    };
+    for (const QByteArray& payload : payloads) {
+        const QByteArray annexB = hevcPrefixSeiNal(seiMessage(4, payload));
+        QVERIFY(!extractH26xSeiTimecode(annexB, NativeVideoCodec::Hevc, context).valid);
+    }
+
+    const QList<QByteArray> malformed{QByteArray::fromHex("ff"), QByteArray::fromHex("ff01"),
+                                      QByteArray::fromHex("b5"), QByteArray::fromHex("b500")};
+    for (const QByteArray& payload : malformed) {
+        const QByteArray annexB = hevcPrefixSeiNal(seiMessage(4, payload));
+        QVERIFY(!extractH26xSeiTimecode(annexB, NativeVideoCodec::Hevc, context).valid);
+    }
 }
 
 void TestH26xSeiTimecode::noSeiReturnsInvalid() {

@@ -78,7 +78,7 @@ QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale, bool fixedFrameR
             w.bit(0); // remaining scaling lists use defaults
     }
     w.ue(log2MaxFrameNumMinus4);
-    w.ue(0);  // pic_order_cnt_type = 0
+    w.ue(0); // pic_order_cnt_type = 0
     w.ue(log2MaxPicOrderCntLsbMinus4);
     w.ue(0);  // max_num_ref_frames
     w.bit(0); // gaps_in_frame_num_value_allowed_flag
@@ -378,7 +378,7 @@ void TestSpsFrameRate::reportsMalformedAndUnsupportedContext() {
     QCOMPARE(context.generation(), uint64_t(4));
     QVERIFY(context.h264() == nullptr);
     QVERIFY(context.hevc() != nullptr);
-    QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Unsupported);
+    QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Malformed);
 }
 
 void TestSpsFrameRate::multiSpsStatusIsOrderIndependent() {

@@ -25,10 +25,16 @@ struct H264TimingSyntax {
     bool picStructPresent = false;
 };
 
-// HEVC parsing is intentionally deferred to the next task. The typed placeholder
-// prevents an HEVC parameter set from being mistaken for malformed H.264 syntax.
 struct HevcTimingSyntax {
     H26xTimingSyntaxStatus status = H26xTimingSyntaxStatus::Unsupported;
+    FrameRateQ frameRate;
+    uint32_t numUnitsInTick = 0;
+    uint32_t timeScale = 0;
+    uint32_t numTicksPocDiffOne = 0;
+    bool timingInfoPresent = false;
+    bool pocProportionalToTiming = false;
+    bool fieldSeq = false;
+    bool frameFieldInfoPresent = false;
 };
 
 class H26xTimingContext {
@@ -58,6 +64,9 @@ enum class TimecodeParseStatus : uint8_t { Valid, NoTimestamp, Unsupported, Malf
 struct TimecodeParseResult {
     TimecodeParseStatus status = TimecodeParseStatus::NoTimestamp;
     Smpte12mTimecode timecode;
+    FrameRateQ labelRate;
+    TimecodeProvenance provenance = TimecodeProvenance::H264PicTiming;
+    bool discontinuity = false;
 };
 
 // Decode an EBSP into an RBSP while validating the NAL escape rules. A prevention
@@ -67,6 +76,7 @@ bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
 // Internal parser seam shared by the public Annex-B extractor. It returns a
 // typed status so a short/reserved payload can never leak a partially filled label.
 TimecodeParseResult parseH264PicTiming(const QByteArray& payload, const H264TimingSyntax& syntax);
+TimecodeParseResult parseHevcTimeCode(const QByteArray& payload, const HevcTimingSyntax& syntax);
 
 } // namespace H26xTimingDetail
 

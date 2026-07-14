@@ -74,21 +74,45 @@ bool readSeiVarValue(const QByteArray& rbsp, int& pos, int64_t& value) {
     return true;
 }
 
-// Temporary HEVC compatibility for Task 2 only. H.264 never enters this path;
-// Task 3 replaces it with standard HEVC time_code and registered-ATC parsing.
-Smpte12mTimecode decodeLegacyHevcPayload(const QByteArray& rbsp, int payloadStart,
-                                         int payloadSize) {
-    if (payloadSize < 4 || payloadStart < 0 || payloadStart > rbsp.size() - 4) return {};
-    const uint32_t word = (uint32_t(uchar(rbsp[payloadStart])) << 24) |
-                          (uint32_t(uchar(rbsp[payloadStart + 1])) << 16) |
-                          (uint32_t(uchar(rbsp[payloadStart + 2])) << 8) |
-                          uint32_t(uchar(rbsp[payloadStart + 3]));
-    return Smpte12m::fromPackedWord(word);
+H26xTimingDetail::TimecodeParseResult parseRegisteredT35(const QByteArray& payload) {
+    using H26xTimingDetail::TimecodeParseResult;
+    using H26xTimingDetail::TimecodeParseStatus;
+    TimecodeParseResult result;
+    result.provenance = TimecodeProvenance::RegisteredAtc;
+    if (payload.isEmpty()) {
+        result.status = TimecodeParseStatus::Malformed;
+        return result;
+    }
+    int pos = 0;
+    const uint8_t countryCode = uint8_t(payload[pos++]);
+    if (countryCode == 0xff) {
+        if (pos >= payload.size()) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
+        ++pos; // itu_t_t35_country_code_extension_byte
+    }
+
+    // T.35 assigns the remaining syntax to the registered provider. There is
+    // no published ATC profile selected by this project, so no provider-owned
+    // body is decoded. For the well-known US ATSC namespace, validate the
+    // provider and user identifier envelope before deliberately ignoring it.
+    if (countryCode == 0xb5) {
+        if (payload.size() - pos < 6) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
+        pos += 2; // terminal_provider_code
+        pos += 4; // provider_oriented_code / user_identifier
+        Q_UNUSED(pos);
+    }
+    return result; // syntactically valid but no explicitly supported ATC registration
 }
 
 H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
                                                          NativeVideoCodec codec,
-                                                         const H26xTimingContext* context) {
+                                                         const H26xTimingContext* context,
+                                                         bool prefixSei) {
     using H26xTimingDetail::TimecodeParseResult;
     using H26xTimingDetail::TimecodeParseStatus;
 
@@ -113,24 +137,33 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
             return result;
         }
 
+        TimecodeParseResult parsed;
+        bool handled = false;
         if (codec == NativeVideoCodec::H264 && payloadType == 1 && context != nullptr &&
             context->codec() == NativeVideoCodec::H264 && context->h264() != nullptr) {
-            const auto parsed = H26xTimingDetail::parseH264PicTiming(
-                rbsp.mid(pos, int(payloadSize)), *context->h264());
-            const bool validCandidate =
-                parsed.status == TimecodeParseStatus::Valid &&
-                validateTimecodeLabel(parsed.timecode, context->constantFrameRate());
-            if (parsed.status == TimecodeParseStatus::Malformed ||
-                (parsed.status == TimecodeParseStatus::Valid && !validCandidate)) {
-                sawMalformed = true;
-            }
-            if (parsed.status == TimecodeParseStatus::Unsupported) sawUnsupported = true;
-            if (validCandidate && !result.timecode.valid) result.timecode = parsed.timecode;
+            parsed = H26xTimingDetail::parseH264PicTiming(rbsp.mid(pos, int(payloadSize)),
+                                                          *context->h264());
+            handled = true;
         } else if (codec == NativeVideoCodec::H264 && payloadType == 1) {
             sawUnsupported = true;
-        } else if (codec == NativeVideoCodec::Hevc && (payloadType == 136 || payloadType == 4)) {
-            const Smpte12mTimecode timecode = decodeLegacyHevcPayload(rbsp, pos, int(payloadSize));
-            if (timecode.valid && !result.timecode.valid) result.timecode = timecode;
+        } else if (payloadType == 4 &&
+                   (codec == NativeVideoCodec::H264 || codec == NativeVideoCodec::Hevc)) {
+            parsed = parseRegisteredT35(rbsp.mid(pos, int(payloadSize)));
+            handled = true;
+        } else if (codec == NativeVideoCodec::Hevc && payloadType == 136 && prefixSei &&
+                   context != nullptr && context->codec() == NativeVideoCodec::Hevc &&
+                   context->hevc() != nullptr) {
+            parsed = H26xTimingDetail::parseHevcTimeCode(rbsp.mid(pos, int(payloadSize)),
+                                                         *context->hevc());
+            handled = true;
+        } else if (codec == NativeVideoCodec::Hevc && payloadType == 136 && prefixSei) {
+            sawUnsupported = true;
+        }
+        if (handled) {
+            if (parsed.status == TimecodeParseStatus::Malformed) sawMalformed = true;
+            if (parsed.status == TimecodeParseStatus::Unsupported) sawUnsupported = true;
+            if (parsed.status == TimecodeParseStatus::Valid && !result.timecode.valid)
+                result = parsed;
         }
         pos += int(payloadSize);
     }
@@ -146,17 +179,22 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
     return result;
 }
 
-Smpte12mTimecode extract(const QByteArray& annexB, NativeVideoCodec codec,
-                         const H26xTimingContext* context) {
+H26xSeiTimecodeResult extractResult(const QByteArray& annexB, NativeVideoCodec codec,
+                                    const H26xTimingContext* context) {
     if (annexB.isEmpty() || codec == NativeVideoCodec::Unknown) return {};
     using H26xTimingDetail::TimecodeParseStatus;
 
-    Smpte12mTimecode firstUsableTimestamp;
+    H26xSeiTimecodeResult firstUsableTimestamp;
     bool sawUnsupported = false;
     bool sawMalformed = false;
     for (const QByteArray& nal : splitAnnexBNals(annexB)) {
         if (!isSeiNal(nal, codec)) continue;
         if (codec == NativeVideoCodec::H264 && (uchar(nal[0]) & 0xe0u) != 0) {
+            sawMalformed = true;
+            continue;
+        }
+        if (codec == NativeVideoCodec::Hevc &&
+            (((uchar(nal[0]) & 0x80u) != 0) || (uchar(nal[1]) & 0x07u) == 0)) {
             sawMalformed = true;
             continue;
         }
@@ -170,13 +208,19 @@ Smpte12mTimecode extract(const QByteArray& annexB, NativeVideoCodec codec,
             sawMalformed = true;
             continue;
         }
-        const auto parsed = extractFromSeiRbsp(rbsp, codec, context);
+        const bool prefixSei =
+            codec != NativeVideoCodec::Hevc || (((uchar(nal[0]) >> 1) & 0x3f) == 39);
+        const auto parsed = extractFromSeiRbsp(rbsp, codec, context, prefixSei);
         if (parsed.status == TimecodeParseStatus::Malformed) {
             sawMalformed = true;
         } else if (parsed.status == TimecodeParseStatus::Unsupported) {
             sawUnsupported = true;
-        } else if (parsed.status == TimecodeParseStatus::Valid && !firstUsableTimestamp.valid) {
-            firstUsableTimestamp = parsed.timecode;
+        } else if (parsed.status == TimecodeParseStatus::Valid &&
+                   !firstUsableTimestamp.timecode.valid) {
+            firstUsableTimestamp.timecode = parsed.timecode;
+            firstUsableTimestamp.labelRate = parsed.labelRate;
+            firstUsableTimestamp.provenance = parsed.provenance;
+            firstUsableTimestamp.discontinuity = parsed.discontinuity;
         }
     }
     if (sawMalformed || sawUnsupported) return {};
@@ -186,10 +230,15 @@ Smpte12mTimecode extract(const QByteArray& annexB, NativeVideoCodec codec,
 } // namespace
 
 Smpte12mTimecode extractH26xSeiTimecode(const QByteArray& annexB, NativeVideoCodec codec) {
-    return extract(annexB, codec, nullptr);
+    return extractResult(annexB, codec, nullptr).timecode;
 }
 
 Smpte12mTimecode extractH26xSeiTimecode(const QByteArray& annexB, NativeVideoCodec codec,
                                         const H26xTimingContext& context) {
-    return extract(annexB, codec, &context);
+    return extractResult(annexB, codec, &context).timecode;
+}
+
+H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, NativeVideoCodec codec,
+                                                   const H26xTimingContext& context) {
+    return extractResult(annexB, codec, &context);
 }
