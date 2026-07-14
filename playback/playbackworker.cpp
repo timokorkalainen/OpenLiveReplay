@@ -528,6 +528,13 @@ PlaybackWorker::commitOutputStateLocked(const OutputCommit& commit) {
     m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);
     resetOutputPlayEpoch();
 
+    if (commit.dispatch == PostCommitDispatch::PgmCritical && m_operatorSeekCompletion.waiting &&
+        !m_operatorSeekCompletion.completed &&
+        m_operatorSeekCompletion.generation == commit.seekGeneration &&
+        m_operatorSeekCompletion.targetMs == *committedPlayheadMs) {
+        m_operatorSeekCompletion.pgmDispatchAttempted = true;
+    }
+
     result.committed = true;
     result.committedPlayheadMs = *committedPlayheadMs;
     result.committedGeneration = commit.seekGeneration;
@@ -766,7 +773,8 @@ bool PlaybackWorker::tryCompleteOperatorSeekFromCurrentOutputCache(qint64 target
         QMutexLocker locker(&m_mutex);
         if (!m_operatorSeekCompletion.waiting ||
             m_operatorSeekCompletion.generation != generation ||
-            m_operatorSeekCompletion.targetMs != targetMs || m_operatorSeekCompletion.completed) {
+            m_operatorSeekCompletion.targetMs != targetMs || m_operatorSeekCompletion.completed ||
+            m_operatorSeekCompletion.pgmDispatchAttempted) {
             return false;
         }
         if (!CommitGate::canCommitReposition(generation,
@@ -803,6 +811,15 @@ bool PlaybackWorker::tryCompleteOperatorSeekFromCurrentOutputCache(qint64 target
     if (pgmReport.requiredSubmitted)
         completeOperatorSeekTransaction(generation, outputCommit.committedPlayheadMs, pgmReport);
     return pgmReport.requiredSubmitted;
+}
+
+void PlaybackWorker::maybeCompleteOperatorSeekAfterDecodedPacket(qint64 targetMs,
+                                                                 uint64_t generation,
+                                                                 bool& operatorPgmCompletedEarly) {
+    if (!operatorPgmCompletedEarly) {
+        operatorPgmCompletedEarly =
+            tryCompleteOperatorSeekFromCurrentOutputCache(targetMs, generation);
+    }
 }
 
 bool PlaybackWorker::allowDisplayableFallbackForReposition(uint64_t generation) {
@@ -3303,9 +3320,10 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
             if (CommitGate::canCommitReposition(startedSeekGeneration,
                                                 m_seekGeneration.load(std::memory_order_acquire),
                                                 m_seekTargetMs >= 0)) {
-                const bool operatorTransaction =
+                const bool operatorPgmObligationAvailable =
                     m_operatorSeekCompletion.waiting && !m_operatorSeekCompletion.completed &&
-                    m_operatorSeekCompletion.generation == startedSeekGeneration;
+                    m_operatorSeekCompletion.generation == startedSeekGeneration &&
+                    !m_operatorSeekCompletion.pgmDispatchAttempted;
                 {
                     QMutexLocker bufferLocker(&m_bufferMutex);
                     uint64_t gpuGeneration = 0;
@@ -3318,8 +3336,9 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                     commit.seekGeneration = startedSeekGeneration;
                     commit.gpuGeneration = gpuGeneration;
                     commit.coverageMode = OutputCoverageMode::OperatorSeek;
-                    commit.dispatch = operatorTransaction ? PostCommitDispatch::PgmCritical
-                                                          : PostCommitDispatch::Output;
+                    commit.dispatch = operatorPgmObligationAvailable
+                                          ? PostCommitDispatch::PgmCritical
+                                          : PostCommitDispatch::Output;
                     outputCommit = commitOutputStateLocked(commit);
                 }
                 if (outputCommit.committed) {
@@ -3485,10 +3504,8 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                              /*audioOn*/ false, /*dedupTail*/ false);
         av_packet_unref(pkt);
 
-        if (!operatorPgmCompletedEarly) {
-            operatorPgmCompletedEarly =
-                tryCompleteOperatorSeekFromCurrentOutputCache(target, startedSeekGeneration);
-        }
+        maybeCompleteOperatorSeekAfterDecodedPacket(target, startedSeekGeneration,
+                                                    operatorPgmCompletedEarly);
 
         if (++packets > packetBudget) break; // safety bound
         if (newestPtsMin() >= fillTo) break; // covered the target
@@ -3571,6 +3588,9 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                 const bool operatorTransactionStillWaiting =
                     m_operatorSeekCompletion.waiting && !m_operatorSeekCompletion.completed &&
                     m_operatorSeekCompletion.generation == startedSeekGeneration;
+                const bool operatorPgmObligationAvailable =
+                    operatorTransactionStillWaiting &&
+                    !m_operatorSeekCompletion.pgmDispatchAttempted;
                 OutputCommit commit;
                 commit.playheadMs = commitTarget;
                 commit.seekGeneration = startedSeekGeneration;
@@ -3579,10 +3599,12 @@ void PlaybackWorker::repositionTo(int64_t target, int dir, AVPacket* pkt, AVFram
                     liveSaved ? OutputCacheAction::MergeStagingAndPublish : OutputCacheAction::Keep;
                 commit.coverageMode = commitTarget == target ? OutputCoverageMode::OperatorSeek
                                                              : OutputCoverageMode::Displayable;
-                commit.dispatch = operatorTransactionStillWaiting
-                                      ? PostCommitDispatch::PgmCritical
-                                      : (operatorPgmCompletedEarly ? PostCommitDispatch::Preview
-                                                                   : PostCommitDispatch::Output);
+                commit.dispatch =
+                    operatorPgmObligationAvailable
+                        ? PostCommitDispatch::PgmCritical
+                        : ((operatorTransactionStillWaiting || operatorPgmCompletedEarly)
+                               ? PostCommitDispatch::Preview
+                               : PostCommitDispatch::Output);
                 if (liveSaved) {
                     const qint64 keepFrom =
                         (dir < 0) ? commitTarget - (windowLeadMs() + windowSlackMs())

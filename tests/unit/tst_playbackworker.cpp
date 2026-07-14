@@ -47,6 +47,7 @@ private slots:
     void earlyOperatorCommitCannotExposeStaleEpoch();
     void operatorSeekTransactionPublishesTargetBeforeLeadWindowFill();
     void operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss();
+    void decodedPacketsDoNotRepeatMissingPgmObligation();
     void operatorSeekTransactionTimesOutWhenSeekGenerationUncommitted();
     void operatorSeekTransactionAbandonedOnTimeout();
     void operatorSeekCompletionEmitsSignal();
@@ -1265,8 +1266,12 @@ void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() 
         worker.m_outputRuntime->setEndpoints({{pgm, &pgmSink}});
     }
 
-    QVERIFY(!worker.tryCompleteOperatorSeekFromCurrentOutputCache(1000, 8));
+    bool operatorPgmCompletedEarly = false;
+    for (int packet = 0; packet < 5; ++packet) {
+        worker.maybeCompleteOperatorSeekAfterDecodedPacket(1000, 8, operatorPgmCompletedEarly);
+    }
 
+    QVERIFY(!operatorPgmCompletedEarly);
     QCOMPARE(pgmSink.submitAttempts, 2);
     {
         QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
@@ -1275,8 +1280,84 @@ void TestPlaybackWorker::operatorSeekTransactionKeepsWaitingAfterEarlyPgmMiss() 
     QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(8));
     QCOMPARE(worker.m_committedPlayheadMs.load(std::memory_order_acquire), qint64(1000));
     QVERIFY(worker.m_operatorSeekCompletion.waiting);
+    QVERIFY(worker.m_operatorSeekCompletion.pgmDispatchAttempted);
     QVERIFY(!worker.m_operatorSeekCompletion.completed);
     QVERIFY(!worker.m_operatorSeekCompletion.submittedPgm);
+
+    pgmSink.rejectSubmits = false;
+    const PlaybackWorker::OperatorSeekResult nextSeek = worker.seekToAndWaitForPgm(1000, 1, 50);
+
+    const QString nextSeekDiagnostic =
+        QStringLiteral("message=%1 generation=%2 committedGeneration=%3 attempts=%4")
+            .arg(nextSeek.message)
+            .arg(nextSeek.generation)
+            .arg(worker.m_committedGeneration.load(std::memory_order_acquire))
+            .arg(pgmSink.submitAttempts);
+    QVERIFY2(nextSeek.completed, qPrintable(nextSeekDiagnostic));
+    QVERIFY(nextSeek.submittedPgm);
+    QCOMPARE(nextSeek.generation, uint64_t(9));
+    QCOMPARE(nextSeek.targetMs, qint64(1000));
+    QCOMPARE(pgmSink.submitAttempts, 3);
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), 2);
+    }
+}
+
+void TestPlaybackWorker::decodedPacketsDoNotRepeatMissingPgmObligation() {
+    FrameProvider feed0;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    transport.seek(1000);
+    transport.setPlaying(false);
+
+    PlaybackWorker worker({&feed0}, &transport);
+    worker.m_outputFeedCount = 1;
+    worker.m_outputWidth = 4;
+    worker.m_outputHeight = 4;
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(8, std::memory_order_release);
+    worker.m_committedGeneration.store(7, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(500, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(500, std::memory_order_release);
+    worker.m_seekTargetMs = -1;
+    worker.m_operatorSeekCompletion = PlaybackWorker::OperatorSeekCompletionState{};
+    worker.m_operatorSeekCompletion.generation = 8;
+    worker.m_operatorSeekCompletion.targetMs = 1000;
+    worker.m_operatorSeekCompletion.waiting = true;
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
+        worker.m_outputCache->insertVideoFrame(testVideoFrame(0, 1000, 88));
+    }
+
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime =
+            std::make_unique<OutputRuntime>(FrameRate::fromFraction(25, 1), 1, 4, 4);
+        worker.m_outputRuntime->setSnapshotProvider(
+            [&worker]() { return worker.makeOutputSnapshot(); });
+        worker.m_outputRuntime->setEndpoints({});
+    }
+
+    bool operatorPgmCompletedEarly = false;
+    for (int packet = 0; packet < 5; ++packet) {
+        worker.maybeCompleteOperatorSeekAfterDecodedPacket(1000, 8, operatorPgmCompletedEarly);
+    }
+
+    QVERIFY(!operatorPgmCompletedEarly);
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(8));
+    QCOMPARE(worker.m_committedPlayheadMs.load(std::memory_order_acquire), qint64(1000));
+    QVERIFY(worker.m_operatorSeekCompletion.waiting);
+    QVERIFY(worker.m_operatorSeekCompletion.pgmDispatchAttempted);
+    QVERIFY(!worker.m_operatorSeekCompletion.completed);
+    QVERIFY(!worker.m_operatorSeekCompletion.submittedPgm);
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), 1);
+        QCOMPARE(worker.m_outputRuntime->dispatcherNextOutputFrameIndex(), qint64(2));
+    }
 }
 
 void TestPlaybackWorker::operatorSeekTransactionTimesOutWhenSeekGenerationUncommitted() {

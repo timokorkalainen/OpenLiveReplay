@@ -296,6 +296,7 @@ private:
         qint64 targetMs = -1;
         bool waiting = false;
         bool completed = false;
+        bool pgmDispatchAttempted = false;
         bool submittedPgm = false;
         OutputFrameIdentity pgmIdentity;
         QString message;
@@ -365,6 +366,8 @@ private:
                                          const OutputDispatchReport& report);
     bool hasOperatorSeekTransaction(uint64_t generation);
     bool tryCompleteOperatorSeekFromCurrentOutputCache(qint64 targetMs, uint64_t generation);
+    void maybeCompleteOperatorSeekAfterDecodedPacket(qint64 targetMs, uint64_t generation,
+                                                     bool& operatorPgmCompletedEarly);
     bool allowDisplayableFallbackForReposition(uint64_t generation);
     int64_t windowLeadMs() const;
     int64_t windowTrailMs() const;
