@@ -1,5 +1,7 @@
 # Fast Qt Test unit tests. Each is a standalone executable registered with CTest.
 
+include("${CMAKE_SOURCE_DIR}/cmake/OlrTestRuntime.cmake")
+
 function(olr_add_unit_test name)
     qt_add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE Qt6::Test ${ARGN} olr_warnings olr_sanitize)
@@ -17,6 +19,7 @@ function(olr_add_unit_test name)
         LABELS "unit;ci"
         TIMEOUT 60
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    olr_configure_windows_test_runtime(TESTS ${name})
 endfunction()
 
 olr_add_unit_test(tst_recordingclock   olr_test_core)
@@ -172,6 +175,7 @@ set_tests_properties(tst_ndi_runtime_smoke PROPERTIES
     LABELS "ndi-runtime"
     TIMEOUT 420
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QTEST_FUNCTION_TIMEOUT=420000")
+olr_configure_windows_test_runtime(TESTS tst_ndi_runtime_smoke)
 olr_add_unit_test(tst_streamdeckmappingstore olr_test_core)
 olr_add_unit_test(tst_srt_health olr_test_core)
 olr_add_unit_test(tst_rtmp_health      olr_test_core)

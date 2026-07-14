@@ -59,6 +59,16 @@ set_tests_properties(linux_ffmpeg_build_config PROPERTIES LABELS "smoke;ci" TIME
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+if(WIN32)
+    add_test(NAME windows_ctest_runtime_contract
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/tests/scripts/check_windows_ctest_runtime.py"
+            --build-dir "${CMAKE_BINARY_DIR}")
+    set_tests_properties(windows_ctest_runtime_contract PROPERTIES
+        LABELS "smoke;ci"
+        TIMEOUT 30)
+endif()
+
 add_test(NAME ios_qt_media_plugins_policy
     COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/check_ios_qt_media_plugins.py")
