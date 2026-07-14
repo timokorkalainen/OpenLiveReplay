@@ -11,17 +11,18 @@
       "program": "${command:cmake.launchTargetPath}",
       "cwd": "${workspaceFolder}",
       "stopAtEntry": false,
-      "preLaunchTask": "CMake: build app",
       "visualizerFile": "${command:qt-cpp.natvis}",
       "showDisplayString": true,
       "externalConsole": false,
       "osx": {
+        "preLaunchTask": "CMake: build app",
         "MIMode": "lldb",
         "sourceFileMap": {
           "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
         }
       },
       "linux": {
+        "preLaunchTask": "CMake: build app",
         "MIMode": "gdb",
         "miDebuggerPath": "/usr/bin/gdb",
         "sourceFileMap": {
@@ -29,13 +30,10 @@
         }
       },
       "windows": {
+        "request": "attach",
+        "processId": "${command:pickProcess}",
         "MIMode": "gdb",
         "miDebuggerPath": "${command:qt-cpp.minGWgdb}",
-        "environment": [
-          { "name": "PATH", "value": "${workspaceFolder}/windows_build/dist/ffmpeg/bin;${workspaceFolder}/windows_build/dist/srt/bin;${command:qt-cpp.qtDir};${env:PATH}" },
-          { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
-          { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
-        ],
         "sourceFileMap": {
           "Q:/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
           "C:/work/build/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
@@ -52,7 +50,6 @@
       "program": "${command:cmake.launchTargetPath}",
       "cwd": "${workspaceFolder}",
       "stopAtEntry": false,
-      "preLaunchTask": "CMake: build app",
       "visualizerFile": "${command:qt-cpp.natvis}",
       "showDisplayString": true,
       "externalConsole": false,
@@ -60,12 +57,14 @@
         "-qmljsdebugger=host:localhost,port:${command:qt-qml.debugPort},block,services:DebugMessages,QmlDebugger,V8Debugger"
       ],
       "osx": {
+        "preLaunchTask": "CMake: build app",
         "MIMode": "lldb",
         "sourceFileMap": {
           "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
         }
       },
       "linux": {
+        "preLaunchTask": "CMake: build app",
         "MIMode": "gdb",
         "miDebuggerPath": "/usr/bin/gdb",
         "sourceFileMap": {
@@ -73,13 +72,10 @@
         }
       },
       "windows": {
+        "request": "attach",
+        "processId": "${command:pickProcess}",
         "MIMode": "gdb",
         "miDebuggerPath": "${command:qt-cpp.minGWgdb}",
-        "environment": [
-          { "name": "PATH", "value": "${workspaceFolder}/windows_build/dist/ffmpeg/bin;${workspaceFolder}/windows_build/dist/srt/bin;${command:qt-cpp.qtDir};${env:PATH}" },
-          { "name": "QT_QPA_PLATFORM_PLUGIN_PATH", "value": "${command:qt-cpp.QT_QPA_PLATFORM_PLUGIN_PATH}" },
-          { "name": "QML_IMPORT_PATH", "value": "${command:qt-cpp.QML_IMPORT_PATH}" }
-        ],
         "sourceFileMap": {
           "Q:/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
           "C:/work/build/qt5_workdir/w/s": "${command:qt-cpp.sourceDirectory}",
@@ -88,6 +84,22 @@
           "/Users/qt/work/qt": "${command:qt-cpp.sourceDirectory}"
         }
       }
+    },
+    {
+      "name": "OpenLiveReplay: Attach QML",
+      "type": "qml",
+      "request": "attach",
+      "host": "localhost",
+      "port": "${command:qt-qml.debugPort}"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "OpenLiveReplay: Attach C++ and QML (Windows)",
+      "configurations": [
+        "OpenLiveReplay: Debug C++ and QML",
+        "OpenLiveReplay: Attach QML"
+      ]
     }
   ]
 }

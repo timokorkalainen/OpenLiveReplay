@@ -548,6 +548,10 @@ jobs:
         continue-on-error: true
         run: python tools/run_ctest.py --test-dir build-tests --output-on-failure --no-tests=error -R '^rhi_d3d_probe$'
 
+      - name: Enforce Windows launch-source policy
+        shell: bash
+        run: python tools/run_ctest.py --test-dir build-tests --output-on-failure --no-tests=error -R '^windows_source_launch_policy$'
+
       - name: Run Media Foundation + WARP GPU unit tests
         shell: bash
         # tst_nativevideodecoder is BUILT above (Windows compile coverage) but not
@@ -566,7 +570,7 @@ jobs:
 
       - name: Run static media/package smoke tests
         shell: bash
-        run: python tools/run_ctest.py --test-dir build-tests --output-on-failure --no-tests=error -L smoke -LE 'gpu-smoke|ndi-output'
+        run: python tools/run_ctest.py --test-dir build-tests --output-on-failure --no-tests=error -L smoke -LE 'gpu-smoke|ndi-output' -E '^windows_source_launch_policy$'
 
       - name: Assemble and exercise controlled Windows package
         shell: bash

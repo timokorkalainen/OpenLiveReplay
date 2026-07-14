@@ -21,6 +21,13 @@ from pathlib import Path
 from typing import NamedTuple, Sequence
 
 
+TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from windows_error_mode import suppress_windows_error_dialogs
+
+
 EXPECTED_FFMPEG_ABIS = {
     "avcodec": "62",
     "avformat": "62",
@@ -551,14 +558,15 @@ def _run_harness(
     stdout = ""
     stderr = ""
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=layout.executable_dir,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        with suppress_windows_error_dialogs(platform == "windows"):
+            process = subprocess.Popen(
+                command,
+                cwd=layout.executable_dir,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
         payload, modules, stdout, stderr = _read_json_while_alive(process, platform, timeout)
     except BaseException as error:
         stdout = getattr(error, "stdout", "")
@@ -617,14 +625,15 @@ def _inspect_packaged_app(
     stderr = ""
     communicated = False
     try:
-        process = subprocess.Popen(
-            [str(layout.app_executable)],
-            cwd=layout.executable_dir,
-            env=app_environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        with suppress_windows_error_dialogs(platform == "windows"):
+            process = subprocess.Popen(
+                [str(layout.app_executable)],
+                cwd=layout.executable_dir,
+                env=app_environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
         _require_websocket_health(
             control_port,
             process,

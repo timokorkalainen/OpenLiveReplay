@@ -13,6 +13,9 @@ cmake -S . -B build -G Ninja \
   -DOLR_BUILD_TESTS=ON
 
 cmake --build build                 # build app + tests
+# Windows
+python tools/run_ctest.py --test-dir build -L ci --output-on-failure
+# macOS/Linux
 ctest --test-dir build -L ci --output-on-failure
 ```
 
@@ -20,11 +23,16 @@ Qt is auto-detected (Homebrew `/opt/homebrew/opt/qt` or `~/Qt/6.*/macos`);
 override with `QT_ROOT_DIR`/`OLR_QT_ROOT` or `-DCMAKE_PREFIX_PATH` if it lives
 elsewhere.
 
-Run a subset by label: `ctest --test-dir build -L unit` (or `smoke`, `e2e`).
+Run a subset by label on Windows with
+`python tools/run_ctest.py --test-dir build -L unit` (or `smoke`, `e2e`). On
+macOS/Linux use `ctest --test-dir build -L unit`.
 The `ci` label is the short PR gate and intentionally excludes the expensive
 record/playback E2E matrix. Run the full local gate with:
 
 ```bash
+# Windows
+python tools/run_ctest.py --test-dir build --output-on-failure -LE 'sync-report|srt|native-apple-ingest'
+# macOS/Linux
 ctest --test-dir build --output-on-failure -LE 'sync-report|srt|native-apple-ingest'
 ```
 
@@ -51,6 +59,9 @@ delivery smokes with 5-second clips:
 Run the matrix on demand with:
 
 ```bash
+# Windows
+OLR_E2E_CLIP_SECONDS=5 python tools/run_ctest.py --test-dir build -L delivery-gate --output-on-failure
+# macOS/Linux
 OLR_E2E_CLIP_SECONDS=5 ctest --test-dir build -L delivery-gate --output-on-failure
 ```
 

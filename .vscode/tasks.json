@@ -11,6 +11,38 @@
       "detail": "Build the app target with the active CMake preset"
     },
     {
+      "type": "process",
+      "label": "OpenLiveReplay: start controlled Windows app",
+      "command": "python",
+      "args": [
+        "${workspaceFolder}/tools/run_windows_app.py",
+        "--build-dir",
+        "${command:cmake.buildDirectory}",
+        "--executable",
+        "${command:cmake.launchTargetPath}"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "detail": "Start the Windows app with runtime roots from the active CMake cache"
+    },
+    {
+      "type": "process",
+      "label": "OpenLiveReplay: start controlled Windows QML-debug app",
+      "command": "python",
+      "args": [
+        "${workspaceFolder}/tools/run_windows_app.py",
+        "--build-dir",
+        "${command:cmake.buildDirectory}",
+        "--executable",
+        "${command:cmake.launchTargetPath}",
+        "--",
+        "-qmljsdebugger=host:localhost,port:${command:qt-qml.debugPort},block,services:DebugMessages,QmlDebugger,V8Debugger"
+      ],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "detail": "Start the Windows app with cache-derived runtime roots and QML debugging enabled"
+    },
+    {
       "type": "cmake",
       "label": "CMake: build all (incl. tests)",
       "command": "build",

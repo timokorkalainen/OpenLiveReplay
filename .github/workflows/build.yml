@@ -104,6 +104,10 @@ jobs:
           python tools/run_ctest.py --test-dir build-tests --output-on-failure \
             -R '^(tst_nativeaacdecoder|tst_nativevideodecoder)$'
 
+      - name: Enforce Windows launch-source policy
+        shell: bash
+        run: python tools/run_ctest.py --test-dir build-tests --output-on-failure --no-tests=error -R '^windows_source_launch_policy$'
+
       - name: Run isolated Qt core-media runtime smoke
         shell: bash
         run: |

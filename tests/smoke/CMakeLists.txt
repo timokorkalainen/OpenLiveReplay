@@ -62,6 +62,12 @@ set_tests_properties(linux_ffmpeg_build_config PROPERTIES LABELS "smoke;ci" TIME
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 if(WIN32)
+    add_test(NAME windows_source_launch_policy
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/tests/scripts/check_windows_ctest_runtime.py"
+            --source-root "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(windows_source_launch_policy PROPERTIES LABELS "smoke;ci" TIMEOUT 30)
+
     add_test(NAME windows_ctest_runtime_contract
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/tests/scripts/check_windows_ctest_runtime.py"

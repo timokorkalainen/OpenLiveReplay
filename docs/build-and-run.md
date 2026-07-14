@@ -129,9 +129,18 @@ cmake --preset windows-mingw-debug
 cmake --build --preset windows-mingw-debug --target OpenLiveReplay
 ```
 
-Launch the result with the `OpenLiveReplay: Debug` VS Code
-debug configuration. It supplies the controlled Qt, FFmpeg, and SRT runtime
-paths; the build-tree executable is not a supported direct terminal launch.
+Start the result with the `OpenLiveReplay: start controlled Windows app` VS Code
+task. It runs `tools/run_windows_app.py` against the active CMake build directory,
+so the compiler, Qt, FFmpeg, and SRT runtime paths come from that build's
+`CMakeCache.txt`; the build-tree executable is not a supported direct terminal
+launch. While that task is running, select the `OpenLiveReplay: Debug`
+configuration and choose the app process to attach the C++ debugger.
+
+For combined C++/QML debugging, start the
+`OpenLiveReplay: start controlled Windows QML-debug app` task, then select the
+`OpenLiveReplay: Attach C++ and QML (Windows)` compound configuration and choose
+the app process. The QML attach uses the same Qt extension debug port passed to
+the controlled launcher task.
 
 Release packaging scripts remain available for local package checks:
 

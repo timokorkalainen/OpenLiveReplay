@@ -222,6 +222,168 @@ def scan_policy_violations(
     return failures
 
 
+def job_can_run_on_windows(job_body: str) -> bool:
+    """Classify Windows-capable jobs, failing closed for dynamic runners."""
+    match = re.search(r"(?m)^[ \t]*runs-on:[ \t]*(.*?)[ \t]*$", job_body)
+    if not match:
+        return False
+    runner = match.group(1).strip().strip("'\"")
+    if not runner:
+        following = job_body[match.end() :].lstrip("\r\n")
+        sequence = re.match(r"(?m)((?:^[ \t]+-[ \t]*[^\n]+\n?)+)", following)
+        if sequence:
+            tags = sequence.group(1).casefold()
+            if "windows" in tags:
+                return True
+            if "ubuntu" in tags or "linux" in tags or "macos" in tags:
+                return False
+        return True
+    lowered = runner.casefold()
+    if "windows" in lowered:
+        return True
+    matrix_match = re.fullmatch(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}", runner)
+    if matrix_match:
+        key = re.escape(matrix_match.group(1))
+        inline = re.search(rf"(?m)^\s*{key}:\s*\[([^]]*)\]", job_body)
+        if inline:
+            return "windows" in inline.group(1).casefold()
+        block = re.search(
+            rf"(?ms)^\s*{key}:\s*\n((?:\s+-\s*[^\n]+\n?)+)", job_body
+        )
+        if block:
+            return "windows" in block.group(1).casefold()
+        return True
+    if "${{" in runner:
+        return True
+    return not ("ubuntu" in lowered or "linux" in lowered or "macos" in lowered)
+
+
+def find_raw_windows_launches(job_body: str) -> list[tuple[int, str]]:
+    """Return direct Windows CTest/test/app/probe shell launches."""
+    failures: list[tuple[int, str]] = []
+    for line_number, line in enumerate(job_body.splitlines(), start=1):
+        command = line.strip()
+        if command.startswith("run:"):
+            command = command.removeprefix("run:").strip()
+        if not command or command in {"|", ">"} or command.startswith("#"):
+            continue
+        if re.match(r"^(?:command\s+)?ctest\b", command, re.IGNORECASE):
+            failures.append((line_number, command))
+            continue
+        if re.match(
+            r"^(?:&\s*|Start-Process\s+|cmd(?:\.exe)?\s+/c\s+).*(?:tst_|rhi_|OpenLiveReplay|\.exe\b)",
+            command,
+            re.IGNORECASE,
+        ):
+            failures.append((line_number, command))
+            continue
+        if re.match(
+            r'^"?\$(?:\{)?[A-Za-z_][A-Za-z0-9_]*(?:\})?"?(?:\s|$)',
+            command,
+            re.IGNORECASE,
+        ):
+            failures.append((line_number, command))
+            continue
+        if re.match(
+            r'^["\']?(?:\.{1,2}[/\\]|[A-Za-z]:[/\\]|/)[^\s"\']*(?:tst_|rhi_|OpenLiveReplay)[^\s"\']*\.exe(?:["\']|\s|$)',
+            command,
+            re.IGNORECASE,
+        ):
+            failures.append((line_number, command))
+    return failures
+
+
+def validate_vscode_windows_contract(tasks: dict, launch: dict) -> list[str]:
+    """Validate attach-only debug configurations and cache-derived app tasks."""
+    failures: list[str] = []
+    task_by_label = {
+        task.get("label"): task for task in tasks.get("tasks", []) if task.get("label")
+    }
+    required_tasks = {
+        "OpenLiveReplay: start controlled Windows app": False,
+        "OpenLiveReplay: start controlled Windows QML-debug app": True,
+    }
+    for label, requires_qml in required_tasks.items():
+        task = task_by_label.get(label)
+        if task is None:
+            failures.append(f"missing cache-derived Windows app task: {label}")
+            continue
+        args = [str(value) for value in task.get("args", [])]
+        if (
+            task.get("type") != "process"
+            or task.get("command") != "python"
+            or not any(value.endswith("tools/run_windows_app.py") for value in args)
+            or "${command:cmake.buildDirectory}" not in args
+            or "${command:cmake.launchTargetPath}" not in args
+        ):
+            failures.append(f"Windows app task is not cache-derived: {label}")
+        if any("windows_build/dist" in value or "${env:PATH}" in value for value in args):
+            failures.append(f"Windows app task contains ambient/workspace runtime roots: {label}")
+        if requires_qml and not any(
+            "qmljsdebugger" in value and "${command:qt-qml.debugPort}" in value
+            for value in args
+        ):
+            failures.append(f"Windows QML-debug task lacks a controlled debugger port: {label}")
+
+    qml_attach = False
+    for configuration in launch.get("configurations", []):
+        name = configuration.get("name", "<unnamed>")
+        windows = configuration.get("windows")
+        if (
+            configuration.get("type") == "cppdbg"
+            and configuration.get("request") == "launch"
+            and not isinstance(windows, dict)
+        ):
+            failures.append(
+                f"VS Code app launch is not fail-closed on Windows: {name}"
+            )
+        if isinstance(windows, dict):
+            effective_request = windows.get("request", configuration.get("request"))
+            if effective_request != "attach" or windows.get("processId") != "${command:pickProcess}":
+                failures.append(f"Windows VS Code app configuration is not attach-only: {name}")
+            serialized = json.dumps(windows)
+            if (
+                "${env:PATH}" in serialized
+                or "windows_build/dist" in serialized
+                or any(
+                    entry.get("name") == "PATH"
+                    for entry in windows.get("environment", [])
+                    if isinstance(entry, dict)
+                )
+            ):
+                failures.append(f"Windows VS Code configuration has hard-coded or ambient PATH: {name}")
+        if configuration.get("type") == "qml":
+            if configuration.get("request") == "launch":
+                failures.append(f"ambient Windows QML app launch: .vscode/launch.json: {name}")
+            if (
+                configuration.get("request") == "attach"
+                and configuration.get("host") == "localhost"
+                and configuration.get("port") == "${command:qt-qml.debugPort}"
+            ):
+                qml_attach = True
+    if not qml_attach:
+        failures.append("missing real QML debugger attach configuration: .vscode/launch.json")
+    return failures
+
+
+def check_windows_quick_start_docs(text: str) -> list[str]:
+    """Reject bare CTest in the general quick-start section unless non-Windows-qualified."""
+    relevant = text.partition("The gate **hard-fails")[0]
+    failures: list[str] = []
+    previous_nonblank = ""
+    for line_number, line in enumerate(relevant.splitlines(), start=1):
+        if re.search(r"(?:^|[\s`])ctest\s", line) and not re.search(
+            r"macOS/Linux", line, re.IGNORECASE
+        ):
+            if not re.search(r"macOS/Linux", previous_nonblank, re.IGNORECASE):
+                failures.append(
+                    f"bare CTest in Windows-capable test quick start: tests/README.md:{line_number}"
+                )
+        if line.strip():
+            previous_nonblank = line
+    return failures
+
+
 def check_source_policy(root: Path) -> None:
     checks = {
         "raw test executable": (
@@ -258,54 +420,54 @@ def check_source_policy(root: Path) -> None:
         ):
             failures.append("plain Windows VS Code CTest launch: .vscode/tasks.json")
 
+    launch_text = (root / ".vscode/launch.json").read_text(encoding="utf-8")
+    launch = json.loads(re.sub(r"(?m)^\s*//.*$", "", launch_text))
+    failures.extend(validate_vscode_windows_contract(tasks, launch))
+
+    quick_start = (root / "tests/README.md").read_text(encoding="utf-8")
+    failures.extend(check_windows_quick_start_docs(quick_start))
+
     workflow_paths = sorted((root / ".github/workflows").glob("*.y*ml"))
     windows_job_count = 0
     for workflow_path in workflow_paths:
         workflow = workflow_path.read_text(encoding="utf-8")
+        workflow_windows_jobs: list[str] = []
         for windows_job_match in re.finditer(
             r"(?ms)^  [A-Za-z0-9_-]+:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
             workflow,
         ):
             windows_job = windows_job_match.group(1)
-            if not re.search(r"(?m)^\s*runs-on:\s*windows", windows_job):
+            if not job_can_run_on_windows(windows_job):
                 continue
             windows_job_count += 1
-            raw_launch_pattern = (
-                r"(?m)^\s*(?:(?:run:\s*)?(?:command\s+)?ctest\s|"
-                r'"?\$\{?[A-Za-z_][A-Za-z0-9_]*(?:test|probe|app|exe|binary)'
-                r'[A-Za-z0-9_]*\}?"?(?:\s|$)|'
-                r'(?:[A-Za-z]:)?[/\\][^\s]*(?:tst_|rhi_|OpenLiveReplay)'
-                r"[^\s]*\.exe(?:\s|$))"
-            )
-            for match in re.finditer(raw_launch_pattern, windows_job, re.IGNORECASE):
+            workflow_windows_jobs.append(windows_job)
+            for relative_line, command in find_raw_windows_launches(windows_job):
                 line = (
                     workflow.count(
-                        "\n", 0, windows_job_match.start(1) + match.start()
+                        "\n", 0, windows_job_match.start(1)
                     )
-                    + 1
+                    + relative_line
                 )
                 failures.append(
                     "raw Windows CI test/probe launch: "
                     f"{workflow_path.relative_to(root)}:{line}: "
-                    f"{match.group(0).strip()}"
+                    f"{command}"
                 )
+        if workflow_windows_jobs and not any(
+            "windows_source_launch_policy" in job for job in workflow_windows_jobs
+        ):
+            failures.append(
+                "Windows workflow does not explicitly select windows_source_launch_policy: "
+                f"{workflow_path.relative_to(root)}"
+            )
     if not windows_job_count:
         failures.append("Windows CI job not found: .github/workflows")
 
-    launch_text = (root / ".vscode/launch.json").read_text(encoding="utf-8")
-    launch = json.loads(re.sub(r"(?m)^\s*//.*$", "", launch_text))
     launch_names = {
         configuration.get("name")
         for configuration in launch.get("configurations", [])
         if configuration.get("name")
     }
-    for configuration in launch.get("configurations", []):
-        if configuration.get("type") == "qml" and configuration.get("request") == "launch":
-            failures.append(
-                "ambient Windows QML app launch: .vscode/launch.json: "
-                f"{configuration.get('name', '<unnamed>')}"
-            )
-
     build_docs = (root / "docs/build-and-run.md").read_text(encoding="utf-8")
     for match in re.finditer(
         r"Launch the result with the `([^`]+)` VS Code", build_docs
@@ -315,6 +477,28 @@ def check_source_policy(root: Path) -> None:
                 "missing documented Windows VS Code launch configuration: "
                 f"docs/build-and-run.md: {match.group(1)}"
             )
+    for required_claim in (
+        "tools/run_windows_app.py",
+        "OpenLiveReplay: start controlled Windows app",
+        "OpenLiveReplay: start controlled Windows QML-debug app",
+        "OpenLiveReplay: Attach C++ and QML (Windows)",
+    ):
+        if required_claim not in build_docs:
+            failures.append(
+                "controlled Windows app documentation is missing enforced path: "
+                f"{required_claim}"
+            )
+
+    smoke_cmake = (root / "tests/smoke/CMakeLists.txt").read_text(encoding="utf-8")
+    if not re.search(
+        r"add_test\(NAME\s+windows_source_launch_policy\b", smoke_cmake
+    ) or not re.search(
+        r"set_tests_properties\(windows_source_launch_policy\s+PROPERTIES\s+LABELS\s+\"smoke;ci\"",
+        smoke_cmake,
+    ):
+        failures.append(
+            "windows_source_launch_policy is not registered as a Windows smoke;ci CTest"
+        )
 
     if failures:
         raise SystemExit("\n".join(failures))

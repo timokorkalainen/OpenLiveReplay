@@ -223,3 +223,33 @@
   git add CMakeLists.txt cmake/OlrTestRuntime.cmake tools/run_ctest.py .vscode/tasks.json .vscode/launch.json .githooks/pre-push .github/workflows/ci.yml .github/workflows/build.yml docs/build-and-run.md docs/windows-build.md tests/e2e/SRT_README.md tests/qml/CMakeLists.txt tests/qmlstyle/CMakeLists.txt tests/scripts/check_windows_ctest_runtime.py tests/scripts/test_run_ctest.py docs/superpowers/plans/2026-07-14-windows-test-launch-runtime.md
   git commit -m "build: standardize noninteractive Windows test launches"
   ```
+
+### Task 4: Close cache, process-containment, and enforcement gaps
+
+**Files:**
+- Create: `tools/windows_error_mode.py`
+- Create: `tools/run_windows_app.py`
+- Create: `tests/scripts/test_run_windows_app.py`
+- Create: `tests/scripts/test_windows_ctest_runtime_policy.py`
+- Modify: `tests/e2e/run_qt_core_media_smoke.py`
+- Modify: `tests/e2e/test_qt_core_media_smoke_driver.py`
+- Modify: `tests/scripts/check_windows_ctest_runtime.py`
+- Modify: `tests/smoke/CMakeLists.txt`
+- Modify: `.vscode/tasks.json`
+- Modify: `.vscode/launch.json`
+- Modify: `.github/workflows/ci.yml`
+- Modify: `.github/workflows/build.yml`
+- Modify: `tests/README.md`
+- Modify: `docs/build-and-run.md`
+
+**Interfaces:**
+- `python tools/run_windows_app.py --build-dir <active-build> --executable <cmake-target> [-- <app-args>]` launches only an executable inside the selected build tree or a controlled package path recorded by that build.
+- `suppress_windows_error_dialogs(enabled: bool)` sets inherited Windows error mode to exactly `0x8003` for process creation and restores the prior mode on success and failure.
+- Windows VS Code app configurations attach to a process started by cache-derived process tasks; non-Windows configurations retain direct CMake Tools launch behavior.
+
+- [ ] **Step 1: Write launcher, process-containment, policy, registration, workflow, and quick-start documentation regression tests.**
+- [ ] **Step 2: Run the focused Python and source-policy tests and capture failures for missing cache-derived app launch, missing `0x8003` containment, narrow Windows-job classification, unregistered policy enforcement, and bare Windows CTest documentation.**
+- [ ] **Step 3: Implement the minimal shared error-mode context and cache-derived app launcher with exact exit/termination propagation, controlled runtime ordering, and executable containment.**
+- [ ] **Step 4: Convert Windows VS Code configurations to attach-only, add normal and QML-debug process tasks, register/select the policy CTest test, make policy fail closed, and qualify the test quick start by platform.**
+- [ ] **Step 5: Run focused GREEN tests, registered policy/runtime/QML/RHI selectors, package-smoke unit tests, syntax/format/roadmap gates, and independent review until Spec PASS and Quality APPROVE.**
+- [ ] **Step 6: Commit only the declared files with the required co-author trailer and append exact RED/GREEN evidence to `.superpowers/sdd/task-3-report.md`.**

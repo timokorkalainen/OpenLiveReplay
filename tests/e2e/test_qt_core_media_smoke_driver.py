@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -383,8 +384,19 @@ class DriverPolicyTests(unittest.TestCase):
         evidence_dir = Path(self.temporary.name) / "evidence"
         layout = self.driver.package_layout(self.package, "windows")
         plugin = self.module("multimedia/windowsmediaplugin.dll")
+        guard_events: list[str] = []
+
+        @contextmanager
+        def guarded_child():
+            guard_events.append("enter")
+            yield
+            guard_events.append("exit")
+
         with (
             mock.patch.object(self.driver.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                self.driver, "suppress_windows_error_dialogs", side_effect=lambda enabled: guarded_child()
+            ) as suppress_dialogs,
             mock.patch.object(
                 self.driver, "_read_json_while_alive", side_effect=RuntimeError("malformed payload")
             ),
@@ -400,6 +412,8 @@ class DriverPolicyTests(unittest.TestCase):
                     0.1,
                     evidence_dir,
                 )
+        suppress_dialogs.assert_called_once_with(True)
+        self.assertEqual(guard_events, ["enter", "exit"])
         self.assertTrue(process.killed)
         self.assertEqual(
             (evidence_dir / "harness-stdout.log").read_text(encoding="utf-8"),
@@ -467,8 +481,19 @@ class DriverPolicyTests(unittest.TestCase):
         evidence_dir = Path(self.temporary.name) / "evidence"
         layout = self.driver.package_layout(self.package, "windows")
         ffmpeg = self.module("avcodec-62.dll")
+        guard_events: list[str] = []
+
+        @contextmanager
+        def guarded_child():
+            guard_events.append("enter")
+            yield
+            guard_events.append("exit")
+
         with (
             mock.patch.object(self.driver.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                self.driver, "suppress_windows_error_dialogs", side_effect=lambda enabled: guarded_child()
+            ) as suppress_dialogs,
             mock.patch.object(
                 self.driver, "_require_websocket_health", return_value={"status": "healthy"}
             ) as health,
@@ -479,6 +504,8 @@ class DriverPolicyTests(unittest.TestCase):
             observed, paths = self.driver._inspect_packaged_app(
                 layout, "windows", {}, 0.01, evidence_dir
             )
+        suppress_dialogs.assert_called_once_with(True)
+        self.assertEqual(guard_events, ["enter", "exit"])
         self.assertTrue(process.terminated)
         health.assert_called_once()
         self.assertEqual(observed, {"avcodec": "62"})
