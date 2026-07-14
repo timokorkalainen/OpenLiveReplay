@@ -1,6 +1,6 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 21 },
+  "cmakeMinimumRequired": { "major": 3, "minor": 24 },
   "configurePresets": [
     {
       "name": "windows-mingw-release",
