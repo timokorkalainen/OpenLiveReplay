@@ -21,6 +21,8 @@ private slots:
     void h264ConsumesEveryClockTimestamp();
     void h264ClockTimestampsAreNondecreasing_data();
     void h264ClockTimestampsAreNondecreasing();
+    void h264ConsecutiveFieldTimestampsRespectCtType_data();
+    void h264ConsecutiveFieldTimestampsRespectCtType();
     void h264CountingSchemesApplyOffsetsBeforeClassification_data();
     void h264CountingSchemesApplyOffsetsBeforeClassification();
     void h264NonCfrTimingIsValidatedBeforeUnsupported();
@@ -198,9 +200,9 @@ struct BitWriter {
 void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, int frames,
                         int countingType = 0, bool countDropped = false, bool nuitFieldBased = true,
                         int32_t timeOffset = 0, int timeOffsetLength = 0,
-                        bool discontinuity = false) {
+                        bool discontinuity = false, int ctType = 0) {
     writer.bit(true);  // clock_timestamp_flag[0]
-    writer.bits(0, 2); // ct_type: progressive
+    writer.bits(uint32_t(ctType), 2);
     writer.bit(nuitFieldBased);
     writer.bits(uint32_t(countingType), 5);
     writer.bit(true);  // full_timestamp_flag
@@ -400,20 +402,37 @@ void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing_data() {
         writeFullTimestamp(writer, 1, 2, 3, 5);
         writeFullTimestamp(writer, 1, 2, 3, 4);
     }) << 0 << int(Status::Malformed) << -1;
-    QTest::newRow("declared discontinuity permits reversal") << payload(3, [](BitWriter& writer) {
-        writeFullTimestamp(writer, 1, 2, 3, 5);
-        writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
-    }) << 0 << int(Status::Valid) << 1;
-    QTest::newRow("third clock advances from discontinuity") << payload(5, [](BitWriter& writer) {
-        writeFullTimestamp(writer, 1, 2, 3, 8);
-        writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
-        writeFullTimestamp(writer, 1, 2, 3, 5);
-    }) << 0 << int(Status::Valid) << 1;
-    QTest::newRow("third clock reverses from discontinuity") << payload(5, [](BitWriter& writer) {
-        writeFullTimestamp(writer, 1, 2, 3, 8);
-        writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
-        writeFullTimestamp(writer, 1, 2, 3, 3);
-    }) << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("current discontinuity does not permit reversal")
+        << payload(3,
+                   [](BitWriter& writer) {
+                       writeFullTimestamp(writer, 1, 2, 3, 5);
+                       writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
+                   })
+        << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("middle discontinuity does not reset three-clock ordering")
+        << payload(5,
+                   [](BitWriter& writer) {
+                       writeFullTimestamp(writer, 1, 2, 3, 8);
+                       writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
+                       writeFullTimestamp(writer, 1, 2, 3, 5);
+                   })
+        << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("third current discontinuity does not permit reversal")
+        << payload(5,
+                   [](BitWriter& writer) {
+                       writeFullTimestamp(writer, 1, 2, 3, 4);
+                       writeFullTimestamp(writer, 1, 2, 3, 5);
+                       writeFullTimestamp(writer, 1, 2, 3, 3, 0, false, true, 0, 0, true);
+                   })
+        << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("increasing three clocks allow middle discontinuity")
+        << payload(5,
+                   [](BitWriter& writer) {
+                       writeFullTimestamp(writer, 1, 2, 3, 4);
+                       writeFullTimestamp(writer, 1, 2, 3, 5, 0, false, true, 0, 0, true);
+                       writeFullTimestamp(writer, 1, 2, 3, 6);
+                   })
+        << 0 << int(Status::Valid) << 1;
     QTest::newRow("type zero offset cannot compensate reversal")
         << payload(3,
                    [](BitWriter& writer) {
@@ -533,6 +552,65 @@ void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing() {
     QCOMPARE(parsed.timecode.valid,
              expectedStatus == int(H26xTimingDetail::TimecodeParseStatus::Valid));
     if (parsed.timecode.valid) QCOMPARE(parsed.timecode.hours, expectedHours);
+}
+
+void TestH26xSeiTimecode::h264ConsecutiveFieldTimestampsRespectCtType_data() {
+    QTest::addColumn<int>("picStruct");
+    QTest::addColumn<int>("firstCtType");
+    QTest::addColumn<int>("secondCtType");
+    QTest::addColumn<bool>("equalClockTimestamps");
+    QTest::addColumn<int>("expectedStatus");
+
+    using Status = H26xTimingDetail::TimecodeParseStatus;
+    for (const int picStruct : {3, 4, 5, 6}) {
+        const auto row = [picStruct](const char* description, int firstCtType, int secondCtType,
+                                     bool equal, Status status) {
+            QTest::newRow(qPrintable(QStringLiteral("pic_struct %1 %2")
+                                         .arg(picStruct)
+                                         .arg(QString::fromLatin1(description))))
+                << picStruct << firstCtType << secondCtType << equal << int(status);
+        };
+        row("equal progressive", 0, 0, true, Status::Valid);
+        row("equal progressive unknown", 0, 2, true, Status::Valid);
+        row("equal unknown", 2, 2, true, Status::Valid);
+        row("equal second interlaced", 0, 1, true, Status::Malformed);
+        row("equal first interlaced", 1, 0, true, Status::Malformed);
+        row("equal both interlaced", 1, 1, true, Status::Malformed);
+        row("different second interlaced", 0, 1, false, Status::Valid);
+        row("different first interlaced", 1, 0, false, Status::Valid);
+    }
+    QTest::newRow("pic_struct 7 equal interlaced frame timestamps")
+        << 7 << 1 << 1 << true << int(Status::Valid);
+}
+
+void TestH26xSeiTimecode::h264ConsecutiveFieldTimestampsRespectCtType() {
+    QFETCH(int, picStruct);
+    QFETCH(int, firstCtType);
+    QFETCH(int, secondCtType);
+    QFETCH(bool, equalClockTimestamps);
+    QFETCH(int, expectedStatus);
+
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {25, 1};
+    syntax.numUnitsInTick = 1;
+    syntax.timeScale = 50;
+    syntax.fixedFrameRate = true;
+    syntax.picStructPresent = true;
+
+    BitWriter writer;
+    writer.bits(uint32_t(picStruct), 4);
+    writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, false, firstCtType);
+    writeFullTimestamp(writer, 1, 2, 3, equalClockTimestamps ? 4 : 5, 0, false, true, 0, 0, false,
+                       secondCtType);
+    if (picStruct == 5 || picStruct == 6)
+        writeFullTimestamp(writer, 1, 2, 3, equalClockTimestamps ? 5 : 6);
+    if (writer.bitPosition != 0) writer.payloadTrailingBits();
+
+    const auto parsed = H26xTimingDetail::parseH264PicTiming(writer.bytes, syntax);
+    QCOMPARE(int(parsed.status), expectedStatus);
+    QCOMPARE(parsed.timecode.valid,
+             expectedStatus == int(H26xTimingDetail::TimecodeParseStatus::Valid));
 }
 
 void TestH26xSeiTimecode::h264CountingSchemesApplyOffsetsBeforeClassification_data() {

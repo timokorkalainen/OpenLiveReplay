@@ -18,6 +18,8 @@ private slots:
     void cachesTimingContextByParameterSetBytes();
     void h264CacheIgnoresVpsBytes();
     void rejectsMalformedEmulationPrevention();
+    void rejectsBytesAfterRbspTrailingBits_data();
+    void rejectsBytesAfterRbspTrailingBits();
     void reportsMalformedAndUnsupportedContext();
     void multiSpsStatusIsOrderIndependent();
 };
@@ -241,6 +243,40 @@ void TestSpsFrameRate::rejectsMalformedEmulationPrevention() {
         QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {rawSps}));
         QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
     }
+}
+
+void TestSpsFrameRate::rejectsBytesAfterRbspTrailingBits_data() {
+    QTest::addColumn<QByteArray>("prefix");
+    QTest::addColumn<int>("extraZeroBytes");
+    QTest::addColumn<bool>("expectedValid");
+
+    for (const auto& prefix :
+         {QByteArray(), QByteArray::fromHex("000001"), QByteArray::fromHex("00000001")}) {
+        const QString prefixName = prefix.isEmpty()
+                                       ? QStringLiteral("raw")
+                                       : QStringLiteral("prefix-%1-byte").arg(prefix.size());
+        QTest::newRow(qPrintable(prefixName + QStringLiteral(" exact RBSP")))
+            << prefix << 0 << true;
+        for (const int zeroCount : {1, 2}) {
+            QTest::newRow(
+                qPrintable(prefixName + QStringLiteral(" plus %1 zero bytes").arg(zeroCount)))
+                << prefix << zeroCount << false;
+        }
+    }
+}
+
+void TestSpsFrameRate::rejectsBytesAfterRbspTrailingBits() {
+    QFETCH(QByteArray, prefix);
+    QFETCH(int, extraZeroBytes);
+    QFETCH(bool, expectedValid);
+
+    const QByteArray parameterSet = prefix + makeSps(1, 50) + QByteArray(extraZeroBytes, char(0));
+    H26xTimingContext context;
+    QCOMPARE(context.updateParameterSets(NativeVideoCodec::H264, {}, {parameterSet}),
+             expectedValid);
+    QVERIFY(context.h264() != nullptr);
+    QCOMPARE(context.h264()->status,
+             expectedValid ? H26xTimingSyntaxStatus::Valid : H26xTimingSyntaxStatus::Malformed);
 }
 
 void TestSpsFrameRate::reportsMalformedAndUnsupportedContext() {

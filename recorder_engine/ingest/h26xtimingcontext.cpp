@@ -91,11 +91,11 @@ public:
         bool stopBit = false;
         if (!bit(stopBit) || !stopBit) return false;
         const int64_t bitCount = int64_t(m_bytes.size()) * 8;
-        while (m_bitOffset < bitCount) {
+        while ((m_bitOffset & 7) != 0) {
             bool paddingBit = false;
             if (!bit(paddingBit) || paddingBit) return false;
         }
-        return true;
+        return m_bitOffset == bitCount;
     }
 
     bool seiPayloadAlignmentBits() {
@@ -585,6 +585,8 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
     bool sawPresentTimestamp = false;
     bool previousTimestampComparable = false;
     int64_t previousClockTimestamp = 0;
+    int previousTimestampIndex = -1;
+    uint32_t previousCtType = 0;
     bool havePreviousSeconds = false;
     bool havePreviousMinutes = false;
     bool havePreviousHours = false;
@@ -655,7 +657,9 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
             result.status = TimecodeParseStatus::Malformed;
             return result;
         }
-        Q_UNUSED(ctType);
+        // discontinuity_flag governs comparison with the preceding output-order
+        // timestamp; it does not relax ordering among entries in this message.
+        Q_UNUSED(discontinuity);
 
         if ((haveSeconds && seconds >= 60) || (haveMinutes && minutes >= 60) ||
             (haveHours && hours >= 24) || !validH264FrameCount(frames, syntax.frameRate)) {
@@ -700,19 +704,23 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
             }
             currentTimestampComparable = true;
         }
-        // Annex D constrains a clock_timestamp against its predecessor only
-        // when the current entry does not declare a discontinuity. The current
-        // value still becomes the baseline for a following continuous entry.
-        if (sawPresentTimestamp && !discontinuity) {
+        if (sawPresentTimestamp) {
             if (!previousTimestampComparable || !currentTimestampComparable) {
                 orderingUnavailable = true;
             } else if (currentClockTimestamp < previousClockTimestamp) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            } else if (picStruct >= 3 && picStruct <= 6 &&
+                       currentClockTimestamp == previousClockTimestamp &&
+                       i == previousTimestampIndex + 1 && (ctType == 1 || previousCtType == 1)) {
                 result.status = TimecodeParseStatus::Malformed;
                 return result;
             }
         }
         sawPresentTimestamp = true;
         previousTimestampComparable = currentTimestampComparable;
+        previousTimestampIndex = i;
+        previousCtType = ctType;
         if (currentTimestampComparable) previousClockTimestamp = currentClockTimestamp;
 
         bool mappingRepresentable = nuitFieldBased;

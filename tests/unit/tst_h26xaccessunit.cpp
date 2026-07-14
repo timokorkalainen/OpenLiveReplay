@@ -9,6 +9,7 @@ private slots:
     void collectsH264ParameterSets();
     void collectsHevcParameterSets();
     void supportsThreeByteStartCodes();
+    void stripsAnnexBTrailingZeroBytesFromParameterSets();
     void ignoresDuplicateParameterSets();
     void propagatesTimestamps();
     void splitsMultipleAccessUnits();
@@ -74,6 +75,24 @@ void TestH26xAccessUnit::supportsThreeByteStartCodes() {
     QCOMPARE(units.size(), 1);
     QCOMPARE(units.first().parameterSets.h264Sps, QList<QByteArray>{sps});
     QCOMPARE(units.first().parameterSets.h264Pps, QList<QByteArray>{pps});
+}
+
+void TestH26xAccessUnit::stripsAnnexBTrailingZeroBytesFromParameterSets() {
+    const QByteArray sps = QByteArray::fromHex("6742c01e");
+    const QByteArray pps = QByteArray::fromHex("68ce3c80");
+    const QByteArray idr = QByteArray::fromHex("658899");
+    for (const int zeroCount : {1, 2}) {
+        H26xAccessUnitSplitter splitter(NativeVideoCodec::H264);
+        const QByteArray zeros(zeroCount, char(0));
+        const QByteArray payload = QByteArray::fromHex("00000001") + sps + zeros +
+                                   QByteArray::fromHex("00000001") + pps + zeros +
+                                   QByteArray::fromHex("00000001") + idr;
+
+        splitter.pushPesPayload(payload, 123, 100);
+
+        QCOMPARE(splitter.parameterSets().h264Sps, QList<QByteArray>{sps});
+        QCOMPARE(splitter.parameterSets().h264Pps, QList<QByteArray>{pps});
+    }
 }
 
 void TestH26xAccessUnit::ignoresDuplicateParameterSets() {
