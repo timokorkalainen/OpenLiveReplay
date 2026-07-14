@@ -233,8 +233,6 @@ def statement_containing(
 
 KNOWN_PRODUCTION_MACROS = {
     "OLR_UNIT_TEST": False,
-    "OLR_MUTATE_SKIP_CONFIG_GENERATION": False,
-    "OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET": False,
 }
 
 
@@ -422,6 +420,14 @@ def audit_load_bearing_macro_definitions(view: LexedSource, path: Path) -> None:
 
 def audit_playbackworker(source: str, path: Path) -> None:
     view = lexical_source(source)
+    mutation_switch = re.search(r"\bOLR_MUTATE_[A-Za-z0-9_]*\b", view.comment_code)
+    if mutation_switch:
+        fail_at(
+            path,
+            view,
+            mutation_switch.start(),
+            "shipping source contains a transport mutation switch",
+        )
     audit_load_bearing_macro_definitions(view, path)
     begin, end = logical_function_span(
         view,
@@ -529,6 +535,14 @@ def audit_playbackworker(source: str, path: Path) -> None:
 
 def audit_outputruntime(source: str, path: Path) -> None:
     view = lexical_source(source)
+    mutation_switch = re.search(r"\bOLR_MUTATE_[A-Za-z0-9_]*\b", view.comment_code)
+    if mutation_switch:
+        fail_at(
+            path,
+            view,
+            mutation_switch.start(),
+            "shipping source contains a transport mutation switch",
+        )
     begin, end = logical_function_span(
         view, r"void\s+OutputRuntime::resetPlayEpoch\s*\(\s*\)\s*", path
     )
@@ -622,6 +636,47 @@ def main() -> int:
 
     audit_playbackworker(worker, worker_path)
     audit_outputruntime(runtime, runtime_path)
+
+    guarded_worker = worker.replace(
+        "    resetOutputPlayEpoch();",
+        "#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n"
+        "    resetOutputPlayEpoch();\n"
+        "#endif",
+        1,
+    )
+    guarded_worker_offset = guarded_worker.find(
+        "OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET"
+    )
+    require_rejection(
+        audit_playbackworker,
+        guarded_worker,
+        worker_path,
+        line_number(guarded_worker, guarded_worker_offset),
+        "shipping source contains a transport mutation switch",
+    )
+
+    guarded_reset_begin, guarded_reset_end = function_span(
+        runtime,
+        r"void\s+OutputRuntime::resetPlayEpoch\s*\(\s*\)\s*",
+        runtime_path,
+    )
+    guarded_runtime = replace_once_in_span(
+        runtime,
+        guarded_reset_begin,
+        guarded_reset_end,
+        "    ++m_configGeneration;",
+        "#ifndef OLR_MUTATE_SKIP_CONFIG_GENERATION\n"
+        "    ++m_configGeneration;\n"
+        "#endif",
+    )
+    guarded_runtime_offset = guarded_runtime.find("OLR_MUTATE_SKIP_CONFIG_GENERATION")
+    require_rejection(
+        audit_outputruntime,
+        guarded_runtime,
+        runtime_path,
+        line_number(guarded_runtime, guarded_runtime_offset),
+        "shipping source contains a transport mutation switch",
+    )
 
     escaped_store = worker + (
         "\nm_committedGeneration\\\n"
@@ -954,10 +1009,9 @@ def main() -> int:
         worker,
         commit_begin,
         commit_end,
-        committed_store + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + epoch_reset,
+        committed_store + "\n" + epoch_reset,
         committed_store
         + "\n    exposeCommittedGenerationBeforeEpochReset();\n"
-        + "#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n"
         + epoch_reset,
     )
     intervening_call_offset = intervening_call.find(
@@ -1004,12 +1058,11 @@ def main() -> int:
         worker,
         commit_begin,
         commit_end,
-        committed_store + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + epoch_reset,
+        committed_store + "\n" + epoch_reset,
         committed_store
         + "\n#ifndef OLR_UNIT_TEST\n"
         + "    { return result; }\n"
         + "#endif\n"
-        + "#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n"
         + epoch_reset,
     )
     production_result_return_offset = production_braced_result_return.find(
@@ -1027,13 +1080,12 @@ def main() -> int:
         worker,
         commit_begin,
         commit_end,
-        committed_store + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + epoch_reset,
+        committed_store + "\n" + epoch_reset,
         committed_store
         + "\n    { const bool harmless = true; (void)harmless; } // throw is a comment\n"
         + "#ifdef OLR_UNIT_TEST\n"
         + "    { return result; }\n"
         + "#endif\n"
-        + "#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n"
         + epoch_reset,
     )
     require_acceptance(
@@ -1065,8 +1117,8 @@ def main() -> int:
         worker,
         commit_begin,
         commit_end,
-        committed_store + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + epoch_reset,
-        epoch_reset + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + committed_store,
+        committed_store + "\n" + epoch_reset,
+        epoch_reset + "\n" + committed_store,
     )
     moved_reset_offset = reset_before_store.find("resetOutputPlayEpoch", store_offset - 200)
     require_rejection(

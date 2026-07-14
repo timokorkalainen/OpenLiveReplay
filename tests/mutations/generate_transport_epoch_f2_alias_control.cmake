@@ -4,9 +4,9 @@ endif()
 
 file(READ "${INPUT_SOURCE}" source)
 set(needle
-    "    m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n    resetOutputPlayEpoch();")
+    "    m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);\n    resetOutputPlayEpoch();")
 set(replacement
-    "    m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);\n#ifndef OLR_UNIT_TEST\n#define resetOutputPlayEpoch() ((void)0)\n#endif\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n    resetOutputPlayEpoch();\n#ifndef OLR_UNIT_TEST\n#undef resetOutputPlayEpoch\n#endif")
+    "    m_committedGeneration.store(commit.seekGeneration, std::memory_order_release);\n#ifndef OLR_UNIT_TEST\n#define resetOutputPlayEpoch() ((void)0)\n#endif\n    resetOutputPlayEpoch();\n#ifndef OLR_UNIT_TEST\n#undef resetOutputPlayEpoch\n#endif")
 string(FIND "${source}" "${needle}" needle_offset)
 if(needle_offset EQUAL -1)
     message(FATAL_ERROR "transport epoch F2 alteration target was not found")
