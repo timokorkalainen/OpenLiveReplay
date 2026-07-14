@@ -346,8 +346,14 @@ def loaded_modules(pid: int, platform: str) -> list[Path]:
     raise RuntimeError(f"unsupported platform for module inspection: {platform}")
 
 
-def _run_checked(command: Sequence[str], *, env: dict[str, str] | None = None) -> None:
-    completed = subprocess.run(command, env=env, text=True, capture_output=True)
+def _run_checked(
+    command: Sequence[str],
+    *,
+    env: dict[str, str] | None = None,
+    windows: bool = False,
+) -> None:
+    with suppress_windows_error_dialogs(windows):
+        completed = subprocess.run(command, env=env, text=True, capture_output=True)
     if completed.returncode != 0:
         raise RuntimeError(
             f"command failed ({completed.returncode}): {' '.join(command)}\n"
@@ -684,7 +690,7 @@ def _audit_package(
     for prefix in controlled_prefixes:
         command.extend(("--controlled-prefix", prefix))
     command.extend(("--evidence", str(evidence), "--spdx", str(spdx)))
-    _run_checked(command)
+    _run_checked(command, windows=platform == "windows")
     return evidence, spdx
 
 

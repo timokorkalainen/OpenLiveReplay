@@ -90,6 +90,7 @@ platform default or known NDI Tools locations. Set
 five-minute soak.
 
 ```bash
+# macOS/Linux
 OLR_NDI_RUNTIME_SOAK_SECONDS=300 \
 ctest --test-dir build -L ndi-runtime --output-on-failure
 ```
@@ -114,6 +115,7 @@ start a local server for the duration of the test.
 Real-server native RTMP interop:
 
 ```bash
+# macOS/Linux
 OLR_RTMP_INTEROP_PLAY_URL=rtmp://127.0.0.1/live/stream \
 OLR_RTMP_INTEROP_PUBLISH_URL=rtmp://127.0.0.1/live/stream \
 ctest --test-dir build/native-rtmp -R e2e_native_rtmp_interop --output-on-failure
@@ -122,6 +124,7 @@ ctest --test-dir build/native-rtmp -R e2e_native_rtmp_interop --output-on-failur
 For HEVC/E-RTMP:
 
 ```bash
+# macOS/Linux
 OLR_RTMP_INTEROP_CODEC=hevc \
 OLR_RTMP_INTEROP_PLAY_URL=rtmp://127.0.0.1/live/hevc \
 OLR_RTMP_INTEROP_PUBLISH_URL=rtmp://127.0.0.1/live/hevc \
@@ -131,6 +134,7 @@ ctest --test-dir build/native-rtmp -R e2e_native_rtmp_interop --output-on-failur
 The long-run soak gate is separate and opt-in:
 
 ```bash
+# macOS/Linux
 OLR_RTMP_RUN_SOAK=1 OLR_RTMP_SOAK_SECONDS=1800 OLR_RTMP_SOAK_CODEC=avc \
 ctest --test-dir build/native-rtmp -R e2e_native_rtmp_soak --output-on-failure
 ```
@@ -148,6 +152,7 @@ ingest timestamps on arrival, so neither is a clean measure of the injected skew
 or of absolute cross-machine clock accuracy. Opt-in; SKIPs (77) unless enabled:
 
 ```bash
+# macOS/Linux
 OLR_DRIFT_RUN_SOAK=1 OLR_DRIFT_SOAK_SECS=300 OLR_DRIFT_SOAK_PPM=300 \
 ctest --test-dir build/c -R e2e_drift_soak --output-on-failure
 ```
@@ -171,6 +176,7 @@ coverage, not PR CI coverage.
 ## Sanitizers
 
 ```bash
+# macOS/Linux
 cmake -S . -B build-asan -G Ninja -DOLR_BUILD_TESTS=ON \
   -DOLR_SANITIZER="address;undefined"     # or "thread"
 cmake --build build-asan
@@ -233,6 +239,7 @@ runs the full non-local-only CTest matrix and the iOS build. To run that matrix
 by hand:
 
 ```bash
+# macOS/Linux
 cmake -S . -B build/prepush-tests -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DOLR_BUILD_TESTS=ON
 cmake --build build/prepush-tests

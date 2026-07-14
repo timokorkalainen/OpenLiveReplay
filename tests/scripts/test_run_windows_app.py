@@ -49,6 +49,7 @@ class RunWindowsAppTests(unittest.TestCase):
             self.compiler,
             self.qt / "bin",
             self.qt / "plugins",
+            self.qt / "plugins" / "platforms",
             self.qt / "qml",
             self.ffmpeg / "bin",
             self.ffmpeg / "lib",
@@ -74,7 +75,14 @@ class RunWindowsAppTests(unittest.TestCase):
         env = self.launcher.prepare_windows_app_runtime(
             self.build,
             self.app,
-            {"PATH": str(ambient), "SystemRoot": str(system_root)},
+            {
+                "PATH": str(ambient),
+                "SystemRoot": str(system_root),
+                "QT_PLUGIN_PATH": str(self.workspace / "poisoned-plugins"),
+                "QT_QPA_PLATFORM_PLUGIN_PATH": str(self.workspace / "poisoned-platforms"),
+                "QML_IMPORT_PATH": str(self.workspace / "poisoned-qml"),
+                "QML2_IMPORT_PATH": str(self.workspace / "poisoned-qml2"),
+            },
         )
         self.assertEqual(
             env["PATH"].split(os.pathsep),
@@ -91,7 +99,11 @@ class RunWindowsAppTests(unittest.TestCase):
         )
         self.assertNotIn(str(ambient), env["PATH"])
         self.assertEqual(env["QT_PLUGIN_PATH"], str(self.qt / "plugins"))
+        self.assertEqual(
+            env["QT_QPA_PLATFORM_PLUGIN_PATH"], str(self.qt / "plugins" / "platforms")
+        )
         self.assertEqual(env["QML_IMPORT_PATH"], str(self.qt / "qml"))
+        self.assertNotIn("poisoned", "\n".join(env.values()))
 
     def test_rejects_executable_outside_selected_build(self) -> None:
         outside = Path(self.temporary.name) / "outside" / "OpenLiveReplay.exe"
@@ -126,6 +138,7 @@ class RunWindowsAppTests(unittest.TestCase):
             [str(self.app.resolve()), "--value=with spaces", "-qmljsdebugger=test"],
         )
         self.assertEqual(run.call_args.kwargs["env"], {"PATH": "controlled"})
+        self.assertEqual(run.call_args.kwargs["cwd"], self.app.resolve().parent)
         self.assertFalse(run.call_args.kwargs["check"])
         guard.__enter__.assert_called_once()
         guard.__exit__.assert_called_once()

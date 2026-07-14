@@ -52,14 +52,41 @@ class WindowsRuntimePolicyTests(unittest.TestCase):
           Start-Process .\\tst_muxer.exe
           & "$env:BUILD\\rhi_d3d_probe.exe"
           "$probe"
+          FOO=bar ctest --test-dir build
+          powershell -Command .\\tst_muxer.exe
         """
-        self.assertEqual(len(self.policy.find_raw_windows_launches(bad)), 4)
+        self.assertEqual(len(self.policy.find_raw_windows_launches(bad)), 6)
         allowed = """
         run: |
           python tools/run_ctest.py --test-dir build -R '^tst_muxer$'
+          "$HOST_PYTHON" tools/run_ctest.py --test-dir build -R '^tst_muxer$'
           python tests/e2e/run_qt_core_media_smoke.py --harness build/qt_core_media_smoke.exe
         """
         self.assertEqual(self.policy.find_raw_windows_launches(allowed), [])
+
+    def test_policy_selector_requires_an_executed_launcher_command(self) -> None:
+        self.assertFalse(
+            self.policy.has_executed_policy_selector(
+                "name: windows_source_launch_policy\nrun: echo windows_source_launch_policy\n"
+            )
+        )
+        self.assertFalse(
+            self.policy.has_executed_policy_selector(
+                "# python tools/run_ctest.py -R '^windows_source_launch_policy$'\n"
+            )
+        )
+        self.assertTrue(
+            self.policy.has_executed_policy_selector(
+                "run: python tools/run_ctest.py --test-dir build "
+                "-R '^windows_source_launch_policy$'\n"
+            )
+        )
+        self.assertTrue(
+            self.policy.has_executed_policy_selector(
+                'run: "$HOST_PYTHON" tools/run_ctest.py --test-dir build '
+                "-R '^windows_source_launch_policy$'\n"
+            )
+        )
 
     def test_vscode_policy_rejects_hardcoded_or_ambient_windows_launch(self) -> None:
         launch = {
@@ -166,6 +193,18 @@ class WindowsRuntimePolicyTests(unittest.TestCase):
                 "## Quick start\n```bash\n"
                 "# Windows\npython tools/run_ctest.py --test-dir build -L ci\n"
                 "# macOS/Linux\nctest --test-dir build -L ci\n```\n"
+            ),
+            [],
+        )
+        later_failures = self.policy.check_windows_quick_start_docs(
+            "## Quick start\n# Windows\npython tools/run_ctest.py --test-dir build\n"
+            "The gate **hard-fails** on missing tools.\n"
+            "## Later\n```bash\nctest --test-dir build -L unit\n```\n"
+        )
+        self.assertTrue(any("bare CTest" in failure for failure in later_failures))
+        self.assertEqual(
+            self.policy.check_windows_quick_start_docs(
+                "## Later\n```bash\n# macOS/Linux\nctest --test-dir build -L unit\n```\n"
             ),
             [],
         )

@@ -562,6 +562,36 @@ class DriverPolicyTests(unittest.TestCase):
             "startup stdout",
         )
 
+    def test_windows_audit_child_uses_error_mode_guard_and_preserves_failure_output(self) -> None:
+        guard_events: list[str] = []
+
+        @contextmanager
+        def guarded_child():
+            guard_events.append("enter")
+            yield
+            guard_events.append("exit")
+
+        completed = mock.Mock(returncode=17, stdout="audit stdout", stderr="audit stderr")
+        evidence_dir = Path(self.temporary.name) / "audit-evidence"
+        with (
+            mock.patch.object(
+                self.driver, "suppress_windows_error_dialogs", side_effect=lambda enabled: guarded_child()
+            ) as suppress_dialogs,
+            mock.patch.object(self.driver.subprocess, "run", return_value=completed),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit stdout") as raised:
+                self.driver._audit_package(
+                    self.package,
+                    "windows",
+                    [f"ffmpeg={self.package}"],
+                    Path(self.temporary.name) / "audit.py",
+                    Path(self.temporary.name) / "policy.json",
+                    evidence_dir,
+                )
+        suppress_dialogs.assert_called_once_with(True)
+        self.assertEqual(guard_events, ["enter", "exit"])
+        self.assertIn("audit stderr", str(raised.exception))
+
     def _minimal_main_inputs(self) -> tuple[Path, Path, Path]:
         package = Path(self.temporary.name) / "release"
         package.mkdir()

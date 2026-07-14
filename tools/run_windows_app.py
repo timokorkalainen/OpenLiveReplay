@@ -81,6 +81,9 @@ def prepare_windows_app_runtime(
         _require_directory("SRT libraries", srt_root / "lib"),
     )
     qt_plugins = _require_directory("Qt plugins", qt_root / "plugins")
+    qt_platform_plugins = _require_directory(
+        "Qt platform plugins", qt_plugins / "platforms"
+    )
     qt_qml = _require_directory("Qt QML imports", qt_root / "qml")
 
     system_root = Path(inherited_env.get("SystemRoot", "C:/Windows"))
@@ -88,6 +91,7 @@ def prepare_windows_app_runtime(
     env = dict(inherited_env)
     env["PATH"] = os.pathsep.join(str(path) for path in (*runtime_dirs, *system_dirs))
     env["QT_PLUGIN_PATH"] = str(qt_plugins)
+    env["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(qt_platform_plugins)
     env["QML_IMPORT_PATH"] = str(qt_qml)
     env["QML2_IMPORT_PATH"] = str(qt_qml)
     return env
@@ -111,7 +115,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         app_args.pop(0)
     command = [str(executable), *app_args]
     with suppress_windows_error_dialogs(True):
-        return subprocess.run(command, env=env, check=False).returncode
+        return subprocess.run(
+            command, cwd=executable.parent, env=env, check=False
+        ).returncode
 
 
 if __name__ == "__main__":

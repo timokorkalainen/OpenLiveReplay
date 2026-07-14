@@ -267,7 +267,26 @@ def find_raw_windows_launches(job_body: str) -> list[tuple[int, str]]:
             command = command.removeprefix("run:").strip()
         if not command or command in {"|", ">"} or command.startswith("#"):
             continue
-        if re.match(r"^(?:command\s+)?ctest\b", command, re.IGNORECASE):
+        approved_python_wrapper = re.match(
+            r'^(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*'
+            r'(?:python(?:3)?|py(?:\s+-3)?|"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?)\s+'
+            r'(?:\.?[/\\])?(?:tools/run_ctest\.py|tests/e2e/run_qt_core_media_smoke\.py)\b',
+            command,
+            re.IGNORECASE,
+        )
+        if approved_python_wrapper:
+            continue
+        executable_command = re.sub(
+            r"^(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)+", "", command
+        )
+        if re.match(r"^(?:command\s+)?ctest\b", executable_command, re.IGNORECASE):
+            failures.append((line_number, command))
+            continue
+        if re.match(
+            r"^(?:powershell|pwsh)(?:\.exe)?\b.*(?:tst_|rhi_|OpenLiveReplay|\.exe\b)",
+            executable_command,
+            re.IGNORECASE,
+        ):
             failures.append((line_number, command))
             continue
         if re.match(
@@ -291,6 +310,31 @@ def find_raw_windows_launches(job_body: str) -> list[tuple[int, str]]:
         ):
             failures.append((line_number, command))
     return failures
+
+
+def has_executed_policy_selector(job_body: str) -> bool:
+    """Return true only for an executed controlled-launcher policy selection."""
+    for raw_line in job_body.splitlines():
+        command = raw_line.strip()
+        if command.startswith("#"):
+            continue
+        if command.startswith("run:"):
+            command = command.removeprefix("run:").strip()
+        if not command or command in {"|", ">"}:
+            continue
+        if not re.match(
+            r'^(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*'
+            r'(?:python(?:3)?|py(?:\s+-3)?|"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?)\s+'
+            r'(?:\.?[/\\])?tools/run_ctest\.py\b',
+            command,
+            re.IGNORECASE,
+        ):
+            continue
+        if re.search(r"(?:^|\s)-R(?:\s|=)", command) and re.search(
+            r"windows_source_launch_policy", command
+        ):
+            return True
+    return False
 
 
 def validate_vscode_windows_contract(tasks: dict, launch: dict) -> list[str]:
@@ -367,20 +411,28 @@ def validate_vscode_windows_contract(tasks: dict, launch: dict) -> list[str]:
 
 
 def check_windows_quick_start_docs(text: str) -> list[str]:
-    """Reject bare CTest in the general quick-start section unless non-Windows-qualified."""
-    relevant = text.partition("The gate **hard-fails")[0]
+    """Reject bare CTest anywhere unless explicitly non-Windows-qualified."""
     failures: list[str] = []
-    previous_nonblank = ""
-    for line_number, line in enumerate(relevant.splitlines(), start=1):
-        if re.search(r"(?:^|[\s`])ctest\s", line) and not re.search(
-            r"macOS/Linux", line, re.IGNORECASE
-        ):
-            if not re.search(r"macOS/Linux", previous_nonblank, re.IGNORECASE):
-                failures.append(
-                    f"bare CTest in Windows-capable test quick start: tests/README.md:{line_number}"
-                )
-        if line.strip():
-            previous_nonblank = line
+    in_fence = False
+    non_windows_fence = False
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            non_windows_fence = False
+            continue
+        if in_fence and re.search(r"macOS/Linux", line, re.IGNORECASE):
+            non_windows_fence = True
+        if not re.search(r"(?:^|[\s`])ctest\s", line):
+            continue
+        qualified = (
+            non_windows_fence
+            if in_fence
+            else bool(re.search(r"macOS/Linux", line, re.IGNORECASE))
+        )
+        if not qualified:
+            failures.append(
+                f"bare CTest in Windows-capable test quick start: tests/README.md:{line_number}"
+            )
     return failures
 
 
@@ -454,7 +506,7 @@ def check_source_policy(root: Path) -> None:
                     f"{command}"
                 )
         if workflow_windows_jobs and not any(
-            "windows_source_launch_policy" in job for job in workflow_windows_jobs
+            has_executed_policy_selector(job) for job in workflow_windows_jobs
         ):
             failures.append(
                 "Windows workflow does not explicitly select windows_source_launch_policy: "

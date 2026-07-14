@@ -127,9 +127,10 @@ directory. Audit ABI, path, and plugin details remain in the audit JSON.
 
 Qt Creator / VS Code can use the `windows-mingw-release` preset directly once the
 same `OLR_*` environment variables are set. The committed VS Code test task uses
-the Windows CTest launcher, and its Windows app debug configurations prepend the
-repository's `windows_build/dist/{ffmpeg,srt}/bin` directories and active Qt
-runtime directory to `PATH`.
+the Windows CTest launcher. Start the app with the committed controlled Windows
+process task, which derives compiler, Qt, FFmpeg, and SRT runtime directories from
+the active build's `CMakeCache.txt`, then use the attach-only C++ or combined
+C++/QML debug configuration.
 
 ## Notes
 
