@@ -1,11 +1,55 @@
 include_guard(GLOBAL)
 
+function(_olr_validate_windows_test_runtime)
+    get_property(_olr_validated GLOBAL
+        PROPERTY OLR_WINDOWS_TEST_RUNTIME_VALIDATED)
+    if(_olr_validated)
+        return()
+    endif()
+
+    if(NOT CMAKE_CXX_COMPILER)
+        message(FATAL_ERROR
+            "Windows test runtime requires CMAKE_CXX_COMPILER")
+    endif()
+    if(NOT EXISTS "${CMAKE_CXX_COMPILER}" OR
+       IS_DIRECTORY "${CMAKE_CXX_COMPILER}")
+        message(FATAL_ERROR
+            "Windows test runtime compiler does not exist: ${CMAKE_CXX_COMPILER}")
+    endif()
+    get_filename_component(_olr_compiler_runtime_dir
+        "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    if(NOT IS_DIRECTORY "${_olr_compiler_runtime_dir}")
+        message(FATAL_ERROR
+            "Windows test compiler runtime directory does not exist: ${_olr_compiler_runtime_dir}")
+    endif()
+
+    foreach(root_name IN ITEMS OLR_FFMPEG_ROOT OLR_SRT_ROOT)
+        if(NOT DEFINED ${root_name} OR "${${root_name}}" STREQUAL "")
+            message(FATAL_ERROR
+                "Windows test runtime requires ${root_name}")
+        endif()
+        if(NOT IS_DIRECTORY "${${root_name}}")
+            message(FATAL_ERROR
+                "Windows test runtime root does not exist: ${root_name}=${${root_name}}")
+        endif()
+        foreach(runtime_subdir IN ITEMS bin lib)
+            if(NOT IS_DIRECTORY "${${root_name}}/${runtime_subdir}")
+                message(FATAL_ERROR
+                    "Windows test runtime directory does not exist: ${${root_name}}/${runtime_subdir}")
+            endif()
+        endforeach()
+    endforeach()
+
+    set_property(GLOBAL PROPERTY OLR_WINDOWS_TEST_RUNTIME_VALIDATED TRUE)
+endfunction()
+
 function(olr_configure_windows_test_runtime)
     cmake_parse_arguments(ARG "" "" "TESTS" ${ARGN})
     if(NOT WIN32)
         return()
     endif()
 
+    _olr_validate_windows_test_runtime()
     get_filename_component(_olr_compiler_runtime_dir
         "${CMAKE_CXX_COMPILER}" DIRECTORY)
     set(_olr_runtime_dirs
@@ -27,7 +71,9 @@ function(olr_configure_windows_test_runtime)
             "QT_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
 
         if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.22)
-            foreach(runtime_dir IN LISTS _olr_runtime_dirs)
+            set(_olr_runtime_modification_dirs ${_olr_runtime_dirs})
+            list(REVERSE _olr_runtime_modification_dirs)
+            foreach(runtime_dir IN LISTS _olr_runtime_modification_dirs)
                 set_property(TEST "${test_name}" APPEND PROPERTY
                     ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:${runtime_dir}")

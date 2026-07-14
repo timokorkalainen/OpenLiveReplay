@@ -5,6 +5,8 @@
 # layout-positioning misuse) are promoted to errors to make them a real gate;
 # known false positives are suppressed inline with `// qmllint disable`.
 
+include("${CMAKE_SOURCE_DIR}/cmake/OlrTestRuntime.cmake")
+
 get_filename_component(_qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
 find_program(OLR_QMLLINT NAMES qmllint HINTS "${_qt_prefix}/bin")
 
@@ -63,10 +65,13 @@ if(WIN32)
     add_test(NAME windows_ctest_runtime_contract
         COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_SOURCE_DIR}/tests/scripts/check_windows_ctest_runtime.py"
-            --build-dir "${CMAKE_BINARY_DIR}")
+            --build-dir "${CMAKE_BINARY_DIR}"
+            --qt-runtime-dir "$<TARGET_FILE_DIR:Qt6::Core>"
+            --qt-plugin-dir "$<TARGET_FILE_DIR:Qt6::Core>/../plugins")
     set_tests_properties(windows_ctest_runtime_contract PROPERTIES
         LABELS "smoke;ci"
         TIMEOUT 30)
+    olr_configure_windows_test_runtime(TESTS windows_ctest_runtime_contract)
 endif()
 
 add_test(NAME ios_qt_media_plugins_policy
