@@ -141,13 +141,10 @@ int GpuReadbackRetainer::drainWithBoundedWait(int totalTimeoutMs) {
     for (qsizetype i = 0; i < snapshot.size(); ++i) {
         const ReadbackRetain& retain = snapshot.at(i);
         bool retired = !retain.surface || !retain.fence || retain.fenceValue == 0;
-        int remainingMs = qMax(0, totalTimeoutMs - int(elapsed.elapsed()));
-        if (!retired && remainingMs <= 0) {
-            timedOut += uint64_t(snapshot.size() - i);
-            break;
-        }
+        // Deadline exhaustion suppresses only blocking waits; every record still
+        // receives its non-blocking completion poll.
         if (!retired) retired = retain.fence->completedValue() >= retain.fenceValue;
-        remainingMs = qMax(0, totalTimeoutMs - int(elapsed.elapsed()));
+        const int remainingMs = qMax(0, totalTimeoutMs - int(elapsed.elapsed()));
         if (!retired && remainingMs > 0)
             retired = retain.fence->wait(retain.fenceValue, remainingMs);
         if (retired)

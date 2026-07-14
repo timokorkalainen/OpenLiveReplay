@@ -205,6 +205,9 @@ int drainPreparedWithBoundedWait(int totalTimeoutMs) {
     elapsed.start();
     for (size_t i = 0; i < probeCount; ++i) {
         const DrainProbe& probe = probes[i];
+        // Quarantine has no completion ticket. Only matching authoritative
+        // dead-domain abandonment may release these accepted owners.
+        if (probe.state == PreparedState::Quarantined) continue;
         const bool liveCompatible = probe.state == PreparedState::Signaled && probe.fence &&
                                     probe.value != 0 && probe.gpuGeneration != 0 &&
                                     probe.identity == probe.fence->identity();
