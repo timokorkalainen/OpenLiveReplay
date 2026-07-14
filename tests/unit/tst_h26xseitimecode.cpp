@@ -19,8 +19,12 @@ private slots:
     void h264ConsumesEveryClockTimestamp();
     void h264RejectsInvalidTimestampLabels();
     void h264InterpretsCountingTypeAndDroppedFlag();
+    void h264ValidatesPartialTimestampFields_data();
+    void h264ValidatesPartialTimestampFields();
     void h264RejectsInvalidPayloadAlignment();
     void h264RejectsMalformedEmulationPrevention();
+    void h264AnnexBTrailingZeroBytesAreNotNalPayload();
+    void rawEbspTrailingZeroBytesRemainStrict();
     void h264MalformedContextIsNotUnsupported();
     void h264PicTimingWithoutContextIsRejected();
     void hevcTimeCodeDecoded();
@@ -171,10 +175,11 @@ struct BitWriter {
 };
 
 void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, int frames,
-                        int countingType = 0, bool countDropped = false) {
+                        int countingType = 0, bool countDropped = false,
+                        bool nuitFieldBased = true) {
     writer.bit(true);  // clock_timestamp_flag[0]
     writer.bits(0, 2); // ct_type: progressive
-    writer.bit(false); // nuit_field_based_flag
+    writer.bit(nuitFieldBased);
     writer.bits(uint32_t(countingType), 5);
     writer.bit(true);  // full_timestamp_flag
     writer.bit(false); // discontinuity_flag
@@ -186,29 +191,39 @@ void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, 
 }
 
 QByteArray fullTimestampPayload(int hours, int minutes, int seconds, int frames,
-                                int countingType = 0, bool countDropped = false) {
+                                int countingType = 0, bool countDropped = false,
+                                bool nuitFieldBased = true) {
     BitWriter writer;
     writer.bits(0, 4); // pic_struct: frame
-    writeFullTimestamp(writer, hours, minutes, seconds, frames, countingType, countDropped);
-    writer.payloadTrailingBits();
+    writeFullTimestamp(writer, hours, minutes, seconds, frames, countingType, countDropped,
+                       nuitFieldBased);
+    if (writer.bitPosition != 0) writer.payloadTrailingBits();
     return writer.bytes;
 }
 
-QByteArray partialTimestampPayload() {
+QByteArray partialTimestampPayload(int frames = 4, int seconds = 3, int minutes = -1,
+                                   int hours = -1) {
     BitWriter writer;
     writer.bits(0, 4); // pic_struct: frame
     writer.bit(true);  // clock_timestamp_flag[0]
     writer.bits(0, 2); // ct_type: progressive
-    writer.bit(false); // nuit_field_based_flag
+    writer.bit(true);  // nuit_field_based_flag: n_frames has a frame-rate unit
     writer.bits(0, 5); // counting_type
     writer.bit(false); // full_timestamp_flag
     writer.bit(false); // discontinuity_flag
     writer.bit(false); // cnt_dropped_flag
-    writer.bits(4, 8); // n_frames
-    writer.bit(true);  // seconds_flag
-    writer.bits(3, 6); // seconds_value
-    writer.bit(false); // minutes_flag: hours are consequently also absent
-    writer.payloadTrailingBits();
+    writer.bits(uint32_t(frames), 8);
+    writer.bit(seconds >= 0);
+    if (seconds >= 0) {
+        writer.bits(uint32_t(seconds), 6);
+        writer.bit(minutes >= 0);
+        if (minutes >= 0) {
+            writer.bits(uint32_t(minutes), 6);
+            writer.bit(hours >= 0);
+            if (hours >= 0) writer.bits(uint32_t(hours), 5);
+        }
+    }
+    if (writer.bitPosition != 0) writer.payloadTrailingBits();
     return writer.bytes;
 }
 
@@ -261,7 +276,14 @@ void TestH26xSeiTimecode::h264TimeOffsetIsBoundsChecked() {
     QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {fixture("h264_sps_hrd.bin")}));
     H264TimingSyntax constructedSyntax = *context.h264();
     constructedSyntax.timeOffsetLength = 5;
-    QByteArray payload = QByteArray::fromHex("0441840206985a81");
+    BitWriter payloadWriter;
+    payloadWriter.bits(0, constructedSyntax.cpbRemovalDelayLength);
+    payloadWriter.bits(0, constructedSyntax.dpbOutputDelayLength);
+    payloadWriter.bits(0, 4); // pic_struct: frame
+    writeFullTimestamp(payloadWriter, 10, 11, 12, 13);
+    payloadWriter.bits(0, constructedSyntax.timeOffsetLength);
+    if (payloadWriter.bitPosition != 0) payloadWriter.payloadTrailingBits();
+    const QByteArray payload = payloadWriter.bytes;
     auto parsed = H26xTimingDetail::parseH264PicTiming(payload, constructedSyntax);
     QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
     QVERIFY(parsed.timecode.valid);
@@ -357,15 +379,11 @@ void TestH26xSeiTimecode::h264RejectsInvalidTimestampLabels() {
 }
 
 void TestH26xSeiTimecode::h264InterpretsCountingTypeAndDroppedFlag() {
-    H264TimingSyntax syntax;
-    syntax.status = H26xTimingSyntaxStatus::Valid;
-    syntax.frameRate = {30000, 1001};
-    syntax.fixedFrameRate = true;
-    syntax.picStructPresent = true;
-
     struct Case {
+        FrameRateQ rate;
         int countingType;
         bool countDropped;
+        bool nuitFieldBased;
         int minutes;
         int seconds;
         int frames;
@@ -373,33 +391,224 @@ void TestH26xSeiTimecode::h264InterpretsCountingTypeAndDroppedFlag() {
         bool dropFrame;
     };
     const Case cases[] = {
-        {0, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
-        {0, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {1, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
-        {1, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {2, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
-        {2, true, 1, 0, 1, H26xTimingDetail::TimecodeParseStatus::Unsupported, false},
-        {2, true, 1, 0, 2, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {3, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
-        {3, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Unsupported, false},
-        {3, true, 1, 0, 1, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {4, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
-        {4, true, 1, 0, 2, H26xTimingDetail::TimecodeParseStatus::Valid, true},
-        {4, true, 0, 0, 2, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {4, true, 1, 1, 2, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {4, true, 1, 0, 3, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {5, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
-        {5, true, 1, 0, 2, H26xTimingDetail::TimecodeParseStatus::Unsupported, false},
-        {6, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
-        {6, true, 1, 0, 2, H26xTimingDetail::TimecodeParseStatus::Unsupported, false},
-        {7, false, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
-        {31, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
+        {{25, 1}, 0, false, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
+        {{25, 1}, 0, true, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
+        {{25, 1}, 1, false, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Valid, false},
+        {{25, 1}, 1, true, true, 1, 0, 0, H26xTimingDetail::TimecodeParseStatus::Malformed, false},
+        {{25, 1},
+         0,
+         false,
+         false,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         2,
+         false,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         2,
+         true,
+         true,
+         1,
+         0,
+         1,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         2,
+         true,
+         true,
+         1,
+         0,
+         2,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        {{30000, 1001},
+         3,
+         false,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         3,
+         true,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         3,
+         true,
+         true,
+         1,
+         0,
+         1,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        // Type 4 is the NTSC drop-frame scheme even when this timestamp did not skip.
+        {{30000, 1001},
+         4,
+         false,
+         true,
+         1,
+         1,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Valid,
+         true},
+        // The two forbidden minute-boundary labels stay illegal independently of cnt_dropped_flag.
+        {{30000, 1001},
+         4,
+         false,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        {{30000, 1001},
+         4,
+         false,
+         true,
+         1,
+         0,
+         1,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        {{30000, 1001}, 4, true, true, 1, 0, 2, H26xTimingDetail::TimecodeParseStatus::Valid, true},
+        // Tenth-minute boundaries do not skip and frame 00 is legal drop-frame timecode.
+        {{30000, 1001},
+         4,
+         false,
+         true,
+         10,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Valid,
+         true},
+        {{30000, 1001},
+         4,
+         true,
+         true,
+         0,
+         0,
+         2,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        {{30000, 1001},
+         4,
+         true,
+         true,
+         1,
+         1,
+         2,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        {{30000, 1001},
+         4,
+         true,
+         true,
+         1,
+         0,
+         3,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        // The type-4 two-label skip is not SMPTE 59.94 DF's four-label scheme.
+        {{60000, 1001},
+         4,
+         false,
+         true,
+         1,
+         1,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         4,
+         false,
+         false,
+         1,
+         1,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         5,
+         false,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         5,
+         true,
+         true,
+         1,
+         0,
+         2,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         6,
+         false,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         6,
+         true,
+         true,
+         1,
+         0,
+         2,
+         H26xTimingDetail::TimecodeParseStatus::Unsupported,
+         false},
+        {{30000, 1001},
+         7,
+         false,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
+        {{30000, 1001},
+         31,
+         true,
+         true,
+         1,
+         0,
+         0,
+         H26xTimingDetail::TimecodeParseStatus::Malformed,
+         false},
     };
 
     for (const Case& test : cases) {
+        H264TimingSyntax syntax;
+        syntax.status = H26xTimingSyntaxStatus::Valid;
+        syntax.frameRate = test.rate;
+        syntax.fixedFrameRate = true;
+        syntax.picStructPresent = true;
         const auto parsed = H26xTimingDetail::parseH264PicTiming(
             fullTimestampPayload(1, test.minutes, test.seconds, test.frames, test.countingType,
-                                 test.countDropped),
+                                 test.countDropped, test.nuitFieldBased),
             syntax);
         QCOMPARE(parsed.status, test.status);
         QCOMPARE(parsed.timecode.valid,
@@ -407,11 +616,16 @@ void TestH26xSeiTimecode::h264InterpretsCountingTypeAndDroppedFlag() {
         if (parsed.timecode.valid) QCOMPARE(parsed.timecode.dropFrame, test.dropFrame);
     }
 
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {30000, 1001};
+    syntax.fixedFrameRate = true;
+    syntax.picStructPresent = true;
     BitWriter inheritedDropUnits;
     inheritedDropUnits.bits(0, 4);
     inheritedDropUnits.bit(true);  // clock_timestamp_flag
     inheritedDropUnits.bits(0, 2); // ct_type
-    inheritedDropUnits.bit(false); // nuit_field_based_flag
+    inheritedDropUnits.bit(true);  // nuit_field_based_flag
     inheritedDropUnits.bits(4, 5); // counting_type: NTSC two-lowest-count method
     inheritedDropUnits.bit(false); // full_timestamp_flag
     inheritedDropUnits.bit(false); // discontinuity_flag
@@ -422,6 +636,52 @@ void TestH26xSeiTimecode::h264InterpretsCountingTypeAndDroppedFlag() {
     const auto inherited = H26xTimingDetail::parseH264PicTiming(inheritedDropUnits.bytes, syntax);
     QCOMPARE(inherited.status, H26xTimingDetail::TimecodeParseStatus::Unsupported);
     QVERIFY(!inherited.timecode.valid);
+}
+
+void TestH26xSeiTimecode::h264ValidatesPartialTimestampFields_data() {
+    QTest::addColumn<int>("rateNum");
+    QTest::addColumn<int>("rateDen");
+    QTest::addColumn<int>("frames");
+    QTest::addColumn<int>("seconds");
+    QTest::addColumn<int>("minutes");
+    QTest::addColumn<int>("hours");
+    QTest::addColumn<int>("expectedStatus");
+
+    using Status = H26xTimingDetail::TimecodeParseStatus;
+    QTest::newRow("no-units") << 25 << 1 << 4 << -1 << -1 << -1 << int(Status::NoTimestamp);
+    QTest::newRow("seconds-only") << 25 << 1 << 4 << 3 << -1 << -1 << int(Status::NoTimestamp);
+    QTest::newRow("minutes-no-hours") << 25 << 1 << 4 << 3 << 2 << -1 << int(Status::NoTimestamp);
+    QTest::newRow("seconds-out-of-range")
+        << 25 << 1 << 4 << 60 << -1 << -1 << int(Status::Malformed);
+    QTest::newRow("minutes-out-of-range")
+        << 25 << 1 << 4 << 3 << 60 << -1 << int(Status::Malformed);
+    QTest::newRow("hours-out-of-range") << 25 << 1 << 4 << 3 << 2 << 24 << int(Status::Malformed);
+    QTest::newRow("integer-rate-frame-out-of-range")
+        << 25 << 1 << 25 << -1 << -1 << -1 << int(Status::Malformed);
+    QTest::newRow("fractional-rate-last-frame")
+        << 30000 << 1001 << 29 << -1 << -1 << -1 << int(Status::NoTimestamp);
+    QTest::newRow("fractional-rate-frame-out-of-range")
+        << 30000 << 1001 << 30 << -1 << -1 << -1 << int(Status::Malformed);
+}
+
+void TestH26xSeiTimecode::h264ValidatesPartialTimestampFields() {
+    QFETCH(int, rateNum);
+    QFETCH(int, rateDen);
+    QFETCH(int, frames);
+    QFETCH(int, seconds);
+    QFETCH(int, minutes);
+    QFETCH(int, hours);
+    QFETCH(int, expectedStatus);
+
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {rateNum, rateDen};
+    syntax.fixedFrameRate = true;
+    syntax.picStructPresent = true;
+    const auto parsed = H26xTimingDetail::parseH264PicTiming(
+        partialTimestampPayload(frames, seconds, minutes, hours), syntax);
+    QCOMPARE(int(parsed.status), expectedStatus);
+    QVERIFY(!parsed.timecode.valid);
 }
 
 void TestH26xSeiTimecode::h264RejectsInvalidPayloadAlignment() {
@@ -516,6 +776,49 @@ void TestH26xSeiTimecode::h264RejectsMalformedEmulationPrevention() {
     const auto splitResult = extractH26xSeiTimecode(separatedNals, NativeVideoCodec::H264, context);
     QVERIFY(splitResult.valid);
     QCOMPARE(splitResult.frames, 4);
+}
+
+void TestH26xSeiTimecode::h264AnnexBTrailingZeroBytesAreNotNalPayload() {
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+
+    const QByteArray validMessage = seiMessage(1, fullTimestampPayload(1, 2, 3, 4));
+    const QByteArray sei = h264SeiNal(validMessage);
+    for (const int zeroCount : {1, 2, 9}) {
+        const QByteArray zeros(zeroCount, char(0));
+
+        const auto finalNal = extractH26xSeiTimecode(sei + zeros, NativeVideoCodec::H264, context);
+        QVERIFY2(finalNal.valid, qPrintable(QStringLiteral("final zeros=%1").arg(zeroCount)));
+        QCOMPARE(finalNal.frames, 4);
+
+        const auto beforeNext =
+            extractH26xSeiTimecode(sei + zeros + h264VclNal(), NativeVideoCodec::H264, context);
+        QVERIFY2(beforeNext.valid,
+                 qPrintable(QStringLiteral("zeros before next NAL=%1").arg(zeroCount)));
+        QCOMPARE(beforeNext.frames, 4);
+    }
+
+    // Zeros inside a declared payload precede rbsp_trailing_bits and are NAL data,
+    // not Annex-B padding. They must survive splitting and EBSP decoding unchanged.
+    const QByteArray leadingPayloadWithZeros = seiMessage(5, QByteArray::fromHex("120000"));
+    const auto payloadZeros = extractH26xSeiTimecode(
+        h264SeiNal(leadingPayloadWithZeros + validMessage), NativeVideoCodec::H264, context);
+    QVERIFY(payloadZeros.valid);
+    QCOMPARE(payloadZeros.frames, 4);
+}
+
+void TestH26xSeiTimecode::rawEbspTrailingZeroBytesRemainStrict() {
+    QByteArray decoded;
+    QVERIFY(H26xTimingDetail::unescapeRbsp(QByteArray::fromHex("128000"), decoded));
+    QCOMPARE(decoded, QByteArray::fromHex("128000"));
+
+    QVERIFY(H26xTimingDetail::unescapeRbsp(QByteArray::fromHex("12800000"), decoded));
+    QCOMPARE(decoded, QByteArray::fromHex("12800000"));
+
+    QVERIFY(!H26xTimingDetail::unescapeRbsp(QByteArray::fromHex("1280000000"), decoded));
+    QVERIFY(decoded.isEmpty());
 }
 
 void TestH26xSeiTimecode::h264MalformedContextIsNotUnsupported() {

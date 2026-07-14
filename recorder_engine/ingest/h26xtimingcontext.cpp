@@ -383,6 +383,16 @@ int clockTimestampCount(uint32_t picStruct) {
     return picStruct < std::size(counts) ? counts[picStruct] : 0;
 }
 
+bool normalizedRateEquals(FrameRateQ rate, int32_t numerator, int32_t denominator) {
+    return rate.valid() && int64_t(rate.num) * denominator == int64_t(rate.den) * numerator;
+}
+
+bool validH264FrameCount(uint32_t frames, FrameRateQ rate) {
+    if (!rate.valid()) return false;
+    const int64_t maxFps = (int64_t(rate.num) + rate.den - 1) / rate.den;
+    return int64_t(frames) < maxFps;
+}
+
 } // namespace
 
 bool H26xTimingDetail::unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp) {
@@ -519,7 +529,7 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
     }
 
     Smpte12mTimecode firstUsableTimestamp;
-    bool unsupportedCounting = false;
+    bool unsupportedMapping = false;
     for (int i = 0; i < timestampCount; ++i) {
         bool timestampFlag = false;
         if (!reader.bit(timestampFlag)) {
@@ -585,56 +595,65 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
             return result;
         }
         Q_UNUSED(ctType);
-        Q_UNUSED(nuitFieldBased);
         Q_UNUSED(discontinuity);
         Q_UNUSED(timeOffset);
 
-        if (countDropped) {
-            // Annex D counting types 2/3/5/6 do not describe SMPTE drop-frame
-            // labels. Their skipped-count history cannot be recovered from one
-            // payload, so consume and validate the syntax but do not emit a label.
-            switch (countingType) {
-            case 0:
-            case 1:
+        if ((haveSeconds && seconds >= 60) || (haveMinutes && minutes >= 60) ||
+            (haveHours && hours >= 24) || !validH264FrameCount(frames, syntax.frameRate)) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
+
+        bool mappingRepresentable = nuitFieldBased;
+        bool dropFrameScheme = false;
+        switch (countingType) {
+        case 0:
+        case 1:
+            if (countDropped) {
                 result.status = TimecodeParseStatus::Malformed;
                 return result;
-            case 2:
-                if (frames != 1) {
-                    result.status = TimecodeParseStatus::Malformed;
-                    return result;
-                }
-                unsupportedCounting = true;
-                break;
-            case 3:
-                if (frames != 0) {
-                    result.status = TimecodeParseStatus::Malformed;
-                    return result;
-                }
-                unsupportedCounting = true;
-                break;
-            case 4:
-                if (frames != 2 || (haveSeconds && seconds != 0) ||
-                    (haveMinutes && minutes % 10 == 0)) {
-                    result.status = TimecodeParseStatus::Malformed;
-                    return result;
-                }
-                if (!haveSeconds || !haveMinutes) unsupportedCounting = true;
-                break;
-            case 5:
-            case 6:
-                unsupportedCounting = true;
-                break;
             }
+            break;
+        case 2:
+            if (countDropped && frames != 1) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            }
+            mappingRepresentable = false;
+            break;
+        case 3:
+            if (countDropped && frames != 0) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            }
+            mappingRepresentable = false;
+            break;
+        case 4:
+            dropFrameScheme = true;
+            if (countDropped) {
+                if (!haveSeconds || !haveMinutes) {
+                    mappingRepresentable = false;
+                } else if (frames != 2 || seconds != 0 || minutes % 10 == 0) {
+                    result.status = TimecodeParseStatus::Malformed;
+                    return result;
+                }
+            }
+            // Table D-3's two-label skip maps exactly to SMPTE 29.97 DF only.
+            mappingRepresentable =
+                mappingRepresentable && normalizedRateEquals(syntax.frameRate, 30000, 1001);
+            break;
+        case 5:
+        case 6:
+            mappingRepresentable = false;
+            break;
         }
+        if (!mappingRepresentable) unsupportedMapping = true;
         if (!haveSeconds || !haveMinutes || !haveHours) continue;
+        if (!mappingRepresentable) continue;
 
-        const Smpte12mTimecode timestamp{
-            int(hours), int(minutes), int(seconds), int(frames), countingType == 4 && countDropped,
-            true};
-        const bool fieldsInRange = hours < 24 && minutes < 60 && seconds < 60;
-        const bool labelValid =
-            !syntax.frameRate.valid() || validateTimecodeLabel(timestamp, syntax.frameRate);
-        if (!fieldsInRange || !labelValid) {
+        const Smpte12mTimecode timestamp{int(hours),  int(minutes),    int(seconds),
+                                         int(frames), dropFrameScheme, true};
+        if (!validateTimecodeLabel(timestamp, syntax.frameRate)) {
             result.status = TimecodeParseStatus::Malformed;
             return result;
         }
@@ -644,7 +663,7 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         result.status = TimecodeParseStatus::Malformed;
         return result;
     }
-    if (unsupportedCounting) {
+    if (unsupportedMapping) {
         result.status = TimecodeParseStatus::Unsupported;
         return result;
     }

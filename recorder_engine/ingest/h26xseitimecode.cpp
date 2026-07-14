@@ -43,7 +43,9 @@ QList<QByteArray> splitAnnexBNals(const QByteArray& bytes) {
         const int start = starts[i];
         const int prefixSize = startCodeSizeAt(bytes, start);
         const int payloadOffset = start + prefixSize;
-        const int end = i + 1 < starts.size() ? starts[i + 1] : byteCount;
+        int end = i + 1 < starts.size() ? starts[i + 1] : byteCount;
+        while (end > payloadOffset && bytes[end - 1] == char(0))
+            --end; // Annex-B trailing_zero_8bits are not part of nal_unit().
         if (prefixSize != 0 && end > payloadOffset)
             nals.append(bytes.mid(payloadOffset, end - payloadOffset));
     }
