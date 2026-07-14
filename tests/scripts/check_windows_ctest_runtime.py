@@ -268,7 +268,7 @@ def find_raw_windows_launches(job_body: str) -> list[tuple[int, str]]:
         if not command or command in {"|", ">"} or command.startswith("#"):
             continue
         approved_python_wrapper = re.match(
-            r'^(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*'
+            r'^(?:env\s+)?(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)*'
             r'(?:python(?:3)?|py(?:\s+-3)?|"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?)\s+'
             r'(?:\.?[/\\])?(?:tools/run_ctest\.py|tests/e2e/run_qt_core_media_smoke\.py)\b',
             command,
@@ -276,14 +276,21 @@ def find_raw_windows_launches(job_body: str) -> list[tuple[int, str]]:
         )
         if approved_python_wrapper:
             continue
+        if re.match(r"^env\s+", command, re.IGNORECASE):
+            command_without_env = re.sub(r"^env\s+", "", command, flags=re.IGNORECASE)
+        else:
+            command_without_env = command
         executable_command = re.sub(
-            r"^(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)+", "", command
+            r"^(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+)\s+)+",
+            "",
+            command_without_env,
         )
         if re.match(r"^(?:command\s+)?ctest\b", executable_command, re.IGNORECASE):
             failures.append((line_number, command))
             continue
         if re.match(
-            r"^(?:powershell|pwsh)(?:\.exe)?\b.*(?:tst_|rhi_|OpenLiveReplay|\.exe\b)",
+            r"^(?:(?:powershell|pwsh)(?:\.exe)?\b.*(?:-Command\s+)?|cmd(?:\.exe)?\s+/c\s+)"
+            r".*(?:\bctest\b|tst_|rhi_|OpenLiveReplay|\.exe\b)",
             executable_command,
             re.IGNORECASE,
         ):
@@ -296,9 +303,14 @@ def find_raw_windows_launches(job_body: str) -> list[tuple[int, str]]:
         ):
             failures.append((line_number, command))
             continue
-        if re.match(
-            r'^"?\$(?:\{)?[A-Za-z_][A-Za-z0-9_]*(?:\})?"?(?:\s|$)',
+        variable_launch = re.match(
+            r'^"?\$(?:\{)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\})?"?(?:\s|$)',
             command,
+            re.IGNORECASE,
+        )
+        if variable_launch and re.search(
+            r"(?:test|probe|app|exe|binary)",
+            variable_launch.group("name"),
             re.IGNORECASE,
         ):
             failures.append((line_number, command))
@@ -330,10 +342,13 @@ def has_executed_policy_selector(job_body: str) -> bool:
             re.IGNORECASE,
         ):
             continue
-        if re.search(r"(?:^|\s)-R(?:\s|=)", command) and re.search(
-            r"windows_source_launch_policy", command
+        for selector in re.finditer(
+            r"(?:^|\s)-R(?:=|\s+)(?:\"([^\"]*)\"|'([^']*)'|([^\s]+))",
+            command,
         ):
-            return True
+            value = next(group for group in selector.groups() if group is not None)
+            if value == "^windows_source_launch_policy$":
+                return True
     return False
 
 

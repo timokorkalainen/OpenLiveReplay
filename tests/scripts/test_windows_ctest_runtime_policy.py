@@ -54,13 +54,18 @@ class WindowsRuntimePolicyTests(unittest.TestCase):
           "$probe"
           FOO=bar ctest --test-dir build
           powershell -Command .\\tst_muxer.exe
+          env FOO=bar ctest --test-dir build
+          powershell -Command ctest --test-dir build
+          cmd /c ctest --test-dir build
         """
-        self.assertEqual(len(self.policy.find_raw_windows_launches(bad)), 6)
+        self.assertEqual(len(self.policy.find_raw_windows_launches(bad)), 9)
         allowed = """
         run: |
           python tools/run_ctest.py --test-dir build -R '^tst_muxer$'
           "$HOST_PYTHON" tools/run_ctest.py --test-dir build -R '^tst_muxer$'
           python tests/e2e/run_qt_core_media_smoke.py --harness build/qt_core_media_smoke.exe
+          "$HOST_PYTHON" -m unittest tests.scripts.test_run_ctest
+          "$NINJA_BIN" -C build
         """
         self.assertEqual(self.policy.find_raw_windows_launches(allowed), [])
 
@@ -75,6 +80,16 @@ class WindowsRuntimePolicyTests(unittest.TestCase):
                 "# python tools/run_ctest.py -R '^windows_source_launch_policy$'\n"
             )
         )
+        self.assertFalse(
+            self.policy.has_executed_policy_selector(
+                "run: python tools/run_ctest.py -R '^not_windows_source_launch_policy$'\n"
+            )
+        )
+        self.assertFalse(
+            self.policy.has_executed_policy_selector(
+                "run: python tools/run_ctest.py -R windows_source_launch_policy_typo\n"
+            )
+        )
         self.assertTrue(
             self.policy.has_executed_policy_selector(
                 "run: python tools/run_ctest.py --test-dir build "
@@ -85,6 +100,16 @@ class WindowsRuntimePolicyTests(unittest.TestCase):
             self.policy.has_executed_policy_selector(
                 'run: "$HOST_PYTHON" tools/run_ctest.py --test-dir build '
                 "-R '^windows_source_launch_policy$'\n"
+            )
+        )
+        self.assertTrue(
+            self.policy.has_executed_policy_selector(
+                'run: python tools/run_ctest.py -R="^windows_source_launch_policy$"\n'
+            )
+        )
+        self.assertTrue(
+            self.policy.has_executed_policy_selector(
+                "run: python tools/run_ctest.py -R=^windows_source_launch_policy$\n"
             )
         )
 
