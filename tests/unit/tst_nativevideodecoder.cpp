@@ -9,6 +9,7 @@ private slots:
     void queryCapabilitiesReportsPlatformBackend();
     void keepSurfaceNullImageBufferIsRejected();
     void videoToolboxNoFrameIsRejected();
+    void mediaFoundationCallbacksUseInputPtsDomain();
     void flushExcessPixelBufferPoolNoOpsWithoutSession();
 };
 
@@ -54,6 +55,18 @@ void TestNativeVideoDecoder::videoToolboxNoFrameIsRejected() {
     QVERIFY(error.contains(QStringLiteral("produced no frame")));
 #else
     QSKIP("VideoToolbox no-frame validation seam is Apple-only");
+#endif
+}
+
+void TestNativeVideoDecoder::mediaFoundationCallbacksUseInputPtsDomain() {
+#if defined(Q_OS_WIN)
+    constexpr qint64 kInputPts90k = 180'000;
+    const NativeVideoDecoderOutputPtsForTest output =
+        nativeVideoDecoderMediaFoundationOutputPtsForTest(kInputPts90k);
+    QCOMPARE(output.cpuFramePts90k, kInputPts90k);
+    QCOMPARE(output.keepSurfacePts90k, kInputPts90k);
+#else
+    QSKIP("Media Foundation PTS-domain seam is Windows-only");
 #endif
 }
 

@@ -95,6 +95,16 @@ qint64 mfTimeToPts90k(LONGLONG time) {
     return time * kPtsClock / kMfTimePerSecond;
 }
 
+qint64 outputSamplePts90k(bool hasSampleTime, LONGLONG sampleTime, qint64 fallbackPts90k) {
+    return hasSampleTime ? mfTimeToPts90k(sampleTime) : fallbackPts90k;
+}
+
+qint64 outputSamplePts90k(IMFSample* sample, qint64 fallbackPts90k) {
+    LONGLONG sampleTime = 0;
+    const bool hasSampleTime = sample && SUCCEEDED(sample->GetSampleTime(&sampleTime));
+    return outputSamplePts90k(hasSampleTime, sampleTime, fallbackPts90k);
+}
+
 DWORD clampBufferSize(quint64 size) {
     return DWORD(std::min<quint64>(size, kMaxOutputBufferSize));
 }
@@ -762,9 +772,7 @@ bool NativeVideoDecoder::Impl::copySampleToFrame(IMFSample* sample, qint64 fallb
         return false;
     }
 
-    LONGLONG sampleTime = 0;
-    const qint64 framePts =
-        SUCCEEDED(sample->GetSampleTime(&sampleTime)) ? mfTimeToPts90k(sampleTime) : fallbackPts90k;
+    const qint64 framePts = outputSamplePts90k(sample, fallbackPts90k);
 
     ComPtr<IMFMediaBuffer> firstBuffer;
     if (SUCCEEDED(sample->GetBufferByIndex(0, &firstBuffer))) {
@@ -934,10 +942,7 @@ bool NativeVideoDecoder::Impl::processOutput(FrameCallback* onFrame, KeepSurface
             releaseOutputEvents(&output);
 
             if (onSurface) {
-                LONGLONG sampleTime = 0;
-                const qint64 framePts = SUCCEEDED(completedSample->GetSampleTime(&sampleTime))
-                                            ? mfTimeToPts90k(sampleTime)
-                                            : pts90k;
+                const qint64 framePts = outputSamplePts90k(completedSample.Get(), pts90k);
                 if (!(*onSurface)(completedSample.Get(), framePts)) {
                     if (error) {
                         *error = QStringLiteral(
@@ -1245,5 +1250,14 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities() {
     }
     return caps;
 }
+
+#ifdef OLR_UNIT_TEST
+NativeVideoDecoderOutputPtsForTest
+nativeVideoDecoderMediaFoundationOutputPtsForTest(qint64 inputPts90k) {
+    const LONGLONG sampleTime = pts90kToMfTime(inputPts90k);
+    const qint64 outputPts = outputSamplePts90k(true, sampleTime, -1);
+    return {outputPts, outputPts};
+}
+#endif
 
 #endif

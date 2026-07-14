@@ -350,12 +350,14 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_hevcConfig = RtmpHevcConfig();
     m_aacConfig = RtmpAacConfig();
     m_videoCodec = NativeVideoCodec::Unknown;
+    m_activeVideoConfiguration.clear();
     m_streamId = 1;
     if (!m_externalClock) {
         m_clock->reset();
     }
     m_pendingVideoTimecode100ns = -1;
     m_pendingTimecodeEvidence.reset();
+    m_decodedFrameEvidence.clear();
     m_timecodeState.reset();
     m_amfTimecode100ns = -1;
     m_amfFrameOfDay = -1;
@@ -363,6 +365,10 @@ bool NativeRtmpIngestSession::open(const QUrl& url, const IngestCallbacks& callb
     m_amfAnchorPtsMs = -1;
     m_amfLastPtsMs = -1;
     m_amfLastFrameOfDay = -1;
+    m_lastAmfMetadataPayload.clear();
+    m_hasAppliedAmfMetadata = false;
+    m_amfMetadataParseCount = 0;
+    m_amfMetadataApplyCount = 0;
     m_prevAudioPtsMs = -1;
     m_lastPacketAtMs = m_monotonic.elapsed();
     m_lastKeyframeAtMs = -1;
@@ -943,6 +949,10 @@ void NativeRtmpIngestSession::processMessage(const RtmpMessage& message) {
         if (message.type == kMessageDataAmf3 && !amf0.isEmpty()) {
             amf0.remove(0, 1);
         }
+        if (amf0 == m_lastAmfMetadataPayload) return;
+        m_lastAmfMetadataPayload = amf0;
+        if (m_amfMetadataParseCount != std::numeric_limits<uint64_t>::max())
+            ++m_amfMetadataParseCount;
         Amf0MetadataProperties metadata;
         if (decodeAmf0MetadataObject(amf0, &metadata) && metadata.timecode.has_value() &&
             metadata.frameRate.has_value())
@@ -1040,20 +1050,25 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         const H26xParameterSets& parameterSets = packet.codec == NativeVideoCodec::Hevc
                                                      ? m_hevcConfig.parameterSets
                                                      : m_avcConfig.parameterSets;
-        if (!sameParameterSets(previousParameterSets, parameterSets)) {
-            const FrameRateQ previousRate = m_timingContext.constantFrameRate();
+        const bool codecReplacement =
+            m_videoCodec != NativeVideoCodec::Unknown && m_videoCodec != packet.codec;
+        const bool configurationReplacement = m_videoCodec == packet.codec &&
+                                              !m_activeVideoConfiguration.isEmpty() &&
+                                              m_activeVideoConfiguration != packet.codecPayload;
+        if ((codecReplacement || configurationReplacement) &&
+            m_sourceGeneration != std::numeric_limits<uint64_t>::max())
+            ++m_sourceGeneration;
+        m_decodedFrameEvidence.clear();
+        if (codecReplacement || !sameParameterSets(previousParameterSets, parameterSets)) {
             m_timingContext.updateParameterSets(packet.codec, parameterSets.hevcVps,
                                                 packet.codec == NativeVideoCodec::H264
                                                     ? parameterSets.h264Sps
                                                     : parameterSets.hevcSps);
             m_timecodeState.reset();
-            const FrameRateQ nextRate = m_timingContext.constantFrameRate();
-            if (previousRate.valid() && nextRate.valid() && !(previousRate == nextRate) &&
-                m_sourceGeneration != std::numeric_limits<uint64_t>::max())
-                ++m_sourceGeneration;
         }
 
         m_videoCodec = packet.codec;
+        m_activeVideoConfiguration = packet.codecPayload;
         m_seenSupportedVideo = true;
         if (m_videoDecoder) {
             m_videoDecoder->reset();
@@ -1123,6 +1138,9 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
     // later AU before the callback fires.
     const int64_t timecode100ns = m_pendingVideoTimecode100ns;
     const std::optional<TimecodeEvidence> timecodeEvidence = m_pendingTimecodeEvidence;
+    const DecodedFrameEvidence submittedEvidence{unit.pts90k, sourcePtsMs, timecode100ns,
+                                                 timecodeEvidence};
+    uint64_t submissionId = m_decodedFrameEvidence.enqueue(submittedEvidence);
 #if defined(OLR_GPU_PIPELINE_BUILD)
     const bool preferGpuVideoFrames =
         ingestPrefersGpuVideoFrames(m_callbacks) && m_callbacks.onVideoFrame;
@@ -1132,16 +1150,19 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         bool gpuSurfaceRejected = false;
         const bool decodedGpu = m_videoDecoder->decodeKeepSurface(
             unit,
-            [this, &unit, sourcePtsMs, timecode100ns, timecodeEvidence,
-             &gpuSurfaceRejected](void* nativeDecodedImage, qint64) {
+            [this, &unit, &gpuSurfaceRejected](void* nativeDecodedImage, qint64 pts90k) {
+                const std::optional<DecodedFrameEvidence> evidence =
+                    m_decodedFrameEvidence.takeForOutputPts(pts90k);
+                const int64_t outputSourcePtsMs =
+                    evidence.has_value() ? evidence->sourcePtsMs : int64_t(-1);
                 const FrameMetadata meta =
-                    gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                    gpuDecodedFrameMetadata(unit, m_outputWidth, m_outputHeight, outputSourcePtsMs);
                 ImportedGpuVideoFrame imported;
                 if (m_callbacks.importGpuVideoFrame) {
                     imported = m_callbacks.importGpuVideoFrame(nativeDecodedImage, meta);
                 } else {
                     imported.frame = makeGpuDecodedFrameHandle(
-                        nativeDecodedImage, unit, m_outputWidth, m_outputHeight, sourcePtsMs);
+                        nativeDecodedImage, unit, m_outputWidth, m_outputHeight, outputSourcePtsMs);
                 }
                 FrameHandle gpuFrame = std::move(imported.frame);
                 if (gpuFrame.isNull()) {
@@ -1150,9 +1171,11 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
                 }
 
                 DecodedVideoFrame decodedFrame;
-                decodedFrame.sourcePtsMs = sourcePtsMs;
-                decodedFrame.sourceTimecode100ns = timecode100ns;
-                decodedFrame.timecodeEvidence = timecodeEvidence;
+                decodedFrame.sourcePtsMs = outputSourcePtsMs;
+                if (evidence.has_value()) {
+                    decodedFrame.sourceTimecode100ns = evidence->sourceTimecode100ns;
+                    decodedFrame.timecodeEvidence = evidence->timecodeEvidence;
+                }
                 decodedFrame.gpuFrame = std::move(gpuFrame);
                 decodedFrame.gpuFenceValue = imported.fenceValue;
                 m_callbacks.onVideoFrame(std::move(decodedFrame));
@@ -1164,30 +1187,39 @@ void NativeRtmpIngestSession::processVideoMessage(qint64 timestampMs, const QByt
         }
         if (keepSurfaceDecodeNeedsResetBeforeCpuFallback(decodedGpu, gpuSurfaceRejected)) {
             m_videoDecoder->reset();
+            m_decodedFrameEvidence.clear();
+            submissionId = m_decodedFrameEvidence.enqueue(submittedEvidence);
             m_keepSurfaceDecodeActive = false;
         }
     } else if (m_keepSurfaceDecodeActive) {
         m_videoDecoder->reset();
+        m_decodedFrameEvidence.clear();
+        submissionId = m_decodedFrameEvidence.enqueue(submittedEvidence);
         m_keepSurfaceDecodeActive = false;
     }
 #endif
     QString error;
     const bool decoded = m_videoDecoder->decode(
         unit,
-        [this, sourcePtsMs, timecode100ns, timecodeEvidence](AVFrame* frame) {
+        [this](AVFrame* frame) {
             if (!frame) return;
+            const std::optional<DecodedFrameEvidence> evidence =
+                m_decodedFrameEvidence.takeForOutputPts(frame->pts);
             if (!m_callbacks.onVideoFrame) {
                 av_frame_free(&frame);
                 return;
             }
             DecodedVideoFrame decodedFrame;
             decodedFrame.frame = frame;
-            decodedFrame.sourcePtsMs = sourcePtsMs;
-            decodedFrame.sourceTimecode100ns = timecode100ns;
-            decodedFrame.timecodeEvidence = timecodeEvidence;
+            if (evidence.has_value()) {
+                decodedFrame.sourcePtsMs = evidence->sourcePtsMs;
+                decodedFrame.sourceTimecode100ns = evidence->sourceTimecode100ns;
+                decodedFrame.timecodeEvidence = evidence->timecodeEvidence;
+            }
             m_callbacks.onVideoFrame(decodedFrame);
         },
         &error);
+    if (!decoded) m_decodedFrameEvidence.discard(submissionId);
     if (!decoded && !error.isEmpty()) {
         ++m_decodeFailures;
         if (isVideoToolboxDecodeCapabilityFailure(error)) {
@@ -1202,7 +1234,9 @@ void NativeRtmpIngestSession::resetVideoState() {
         m_sourceGeneration != std::numeric_limits<uint64_t>::max())
         ++m_sourceGeneration;
     m_timecodeState.reset();
+    m_decodedFrameEvidence.clear();
     m_videoCodec = NativeVideoCodec::Unknown;
+    m_activeVideoConfiguration.clear();
     m_avcConfig = RtmpAvcConfig();
     m_hevcConfig = RtmpHevcConfig();
     m_keepSurfaceDecodeActive = false;
@@ -1339,6 +1373,7 @@ void NativeRtmpIngestSession::updatePendingVideoTimecode(const QByteArray& annex
         if (parsed.discontinuity && m_sourceGeneration != std::numeric_limits<uint64_t>::max()) {
             ++m_sourceGeneration;
             m_timecodeState.reset();
+            m_decodedFrameEvidence.clear();
         }
         m_pendingVideoTimecode100ns = Smpte12m::to100ns(parsed.timecode, kTimecodeNominalFps);
         const int64_t frameOfDay =
@@ -1379,8 +1414,9 @@ void NativeRtmpIngestSession::updatePendingVideoTimecode(const QByteArray& annex
                      TimecodeProvenance::RtmpMetadata, false, false, sourcePtsMs);
     if (m_pendingTimecodeEvidence.has_value()) {
         using I128 = __int128;
-        const I128 ticks = I128(frameOfDay) * 10'000'000 * m_amfFrameRate.den / m_amfFrameRate.num;
-        if (ticks <= std::numeric_limits<int64_t>::max())
+        const int nominalRate = Smpte12m::labelRate(m_amfFrameRate.num, m_amfFrameRate.den);
+        const I128 ticks = nominalRate > 0 ? I128(frameOfDay) * 10'000'000 / nominalRate : -1;
+        if (ticks >= 0 && ticks <= std::numeric_limits<int64_t>::max())
             m_pendingVideoTimecode100ns = int64_t(ticks);
     }
 }
@@ -1396,22 +1432,34 @@ void NativeRtmpIngestSession::applyAmfTimecodeString(const QString& text) {
     m_amfAnchorPtsMs = -1;
     m_amfLastPtsMs = -1;
     m_amfLastFrameOfDay = -1;
+    m_hasAppliedAmfMetadata = false;
 }
 
 void NativeRtmpIngestSession::applyAmfMetadata(const QString& timecode, double frameRate) {
     const Smpte12mTimecode tc = Smpte12m::parseTimecodeString(timecode.toUtf8().constData());
     const std::optional<FrameRateQ> rate = canonicalFrameRate(frameRate);
     if (!rate.has_value() || !validateTimecodeLabel(tc, *rate)) {
+        const bool changed = m_hasAppliedAmfMetadata || m_amfTimecode100ns >= 0;
         applyAmfTimecodeString(QString());
+        if (changed && m_amfMetadataApplyCount != std::numeric_limits<uint64_t>::max())
+            ++m_amfMetadataApplyCount;
         return;
     }
-    m_amfTimecode100ns = Smpte12m::to100ns(tc, kTimecodeNominalFps);
-    m_amfFrameOfDay = Smpte12m::labelFrameCount(tc, rate->num, rate->den);
+    const int64_t nominalTimecode100ns = Smpte12m::to100ns(tc, kTimecodeNominalFps);
+    const int64_t frameOfDay = Smpte12m::labelFrameCount(tc, rate->num, rate->den);
+    if (m_hasAppliedAmfMetadata && m_amfTimecode100ns == nominalTimecode100ns &&
+        m_amfFrameOfDay == frameOfDay && m_amfFrameRate == *rate)
+        return;
+
+    m_amfTimecode100ns = nominalTimecode100ns;
+    m_amfFrameOfDay = frameOfDay;
     m_amfFrameRate = *rate;
     m_amfAnchorPtsMs = -1;
     m_amfLastPtsMs = -1;
     m_amfLastFrameOfDay = -1;
+    m_hasAppliedAmfMetadata = true;
     if (m_amfTimingGeneration != std::numeric_limits<uint64_t>::max()) ++m_amfTimingGeneration;
+    if (m_amfMetadataApplyCount != std::numeric_limits<uint64_t>::max()) ++m_amfMetadataApplyCount;
 }
 
 int64_t NativeRtmpIngestSession::sourcePtsMsForVideo(qint64 dtsMs, qint64 ptsMs) {

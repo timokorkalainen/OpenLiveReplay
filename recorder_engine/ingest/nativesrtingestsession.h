@@ -2,6 +2,7 @@
 #define NATIVESRTINGESTSESSION_H
 
 #include "nativeaacdecoder.h"
+#include "decodedframeevidencequeue.h"
 #include "h26xaccessunit.h"
 #include "h26xseitimecode.h"
 #include "ingestsession.h"
@@ -133,6 +134,7 @@ private:
     H26xParameterSets m_timecodeParameterSets;
     int64_t m_pendingVideoTimecode100ns = -1;
     std::optional<TimecodeEvidence> m_pendingTimecodeEvidence;
+    DecodedFrameEvidenceQueue m_decodedFrameEvidence;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastDecodeErrorLogMs = -1;
     quint64 m_decodeFailures = 0;

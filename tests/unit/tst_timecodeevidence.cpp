@@ -110,6 +110,7 @@ void TestTimecodeEvidence::dropFrameEvidenceUsesLegalFramesPerDay() {
     TimecodeEvidence evidence;
     evidence.frameOfDay = lastLegalFrame;
     evidence.labelRate = {int32_t(rateNum), int32_t(rateDen)};
+    evidence.provenance = TimecodeProvenance::H264PicTiming;
     evidence.dropFrame = true;
     evidence.arrivalSessionFrame = 0;
     evidence.sessionRate = {int32_t(rateNum), int32_t(rateDen)};

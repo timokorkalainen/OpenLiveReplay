@@ -93,6 +93,7 @@ qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/ingestsession.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/mpegtsparser.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/h26xaccessunit.cpp"
+    "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/decodedframeevidencequeue.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/colorvui.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/codec/colorvui.cpp"
     "${CMAKE_SOURCE_DIR}/recorder_engine/ingest/nativeframecopy.cpp"

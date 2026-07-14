@@ -2,6 +2,7 @@
 #define NATIVERTMPINGESTSESSION_H
 
 #include "nativeaacdecoder.h"
+#include "decodedframeevidencequeue.h"
 #include "h26xaccessunit.h"
 #include "h26xseitimecode.h"
 #include "ingestsession.h"
@@ -63,6 +64,7 @@ private:
     RtmpHevcConfig m_hevcConfig;
     RtmpAacConfig m_aacConfig;
     NativeVideoCodec m_videoCodec = NativeVideoCodec::Unknown;
+    QByteArray m_activeVideoConfiguration;
     bool m_keepSurfaceDecodeActive = false;
     int m_outputChunkSize = 128;
     int m_streamId = 1;
@@ -74,6 +76,7 @@ private:
     H26xSeiTimecodeState m_timecodeState;
     int64_t m_pendingVideoTimecode100ns = -1;
     std::optional<TimecodeEvidence> m_pendingTimecodeEvidence;
+    DecodedFrameEvidenceQueue m_decodedFrameEvidence;
     int64_t m_amfTimecode100ns = -1;
     int64_t m_amfFrameOfDay = -1;
     FrameRateQ m_amfFrameRate;
@@ -81,6 +84,10 @@ private:
     int64_t m_amfAnchorPtsMs = -1;
     int64_t m_amfLastPtsMs = -1;
     int64_t m_amfLastFrameOfDay = -1;
+    QByteArray m_lastAmfMetadataPayload;
+    bool m_hasAppliedAmfMetadata = false;
+    uint64_t m_amfMetadataParseCount = 0;
+    uint64_t m_amfMetadataApplyCount = 0;
     int64_t m_prevAudioPtsMs = -1;
     int64_t m_lastPacketAtMs = -1;
     int64_t m_lastKeyframeAtMs = -1;

@@ -57,6 +57,14 @@ NativeVideoDecodeCapabilities queryNativeVideoDecodeCapabilities();
 #ifdef OLR_UNIT_TEST
 bool nativeVideoDecoderKeepSurfaceNullImageRejectedForTest();
 bool nativeVideoDecoderNoFrameRejectedForTest(QString* error = nullptr);
+#if defined(_WIN32)
+struct NativeVideoDecoderOutputPtsForTest {
+    qint64 cpuFramePts90k = 0;
+    qint64 keepSurfacePts90k = 0;
+};
+NativeVideoDecoderOutputPtsForTest
+nativeVideoDecoderMediaFoundationOutputPtsForTest(qint64 inputPts90k);
+#endif
 #endif
 
 #endif // NATIVEVIDEODECODER_H

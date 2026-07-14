@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <type_traits>
 
 extern "C" {
@@ -41,26 +42,34 @@ std::optional<TimecodeEvidence> ndiTimecodeEvidence(const NdiVideoFrame& video, 
     if (video.timecode100ns == kTimecodeSynthesize || video.timecode100ns < 0 ||
         video.timecode100ns >= kTicksPerDay || video.frameRateNum <= 0 || video.frameRateDen <= 0)
         return std::nullopt;
-    const std::optional<FrameRateQ> rate =
-        canonicalFrameRate(double(video.frameRateNum) / double(video.frameRateDen));
-    if (!rate.has_value()) return std::nullopt;
-    int64_t frameOfDay =
-        Smpte12m::labelFrameCountFrom100ns(video.timecode100ns, rate->num, rate->den);
-    const int nominalRate = Smpte12m::labelRate(rate->num, rate->den);
-    const int64_t framesPerDay = int64_t(nominalRate) * 24 * 60 * 60;
+    const int32_t divisor = std::gcd(video.frameRateNum, video.frameRateDen);
+    const FrameRateQ rate{video.frameRateNum / divisor, video.frameRateDen / divisor};
+    using I128 = __int128;
+    if (I128(rate.num) < I128(12) * rate.den || I128(rate.num) > I128(240) * rate.den)
+        return std::nullopt;
+
+    const I128 tickDenominator = I128(10'000'000) * rate.den;
+    const auto roundedFrameCount = [tickDenominator, rate](int64_t ticks) -> int64_t {
+        const I128 numerator = I128(ticks) * rate.num;
+        const I128 rounded = (numerator + tickDenominator / 2) / tickDenominator;
+        return rounded >= 0 && rounded <= std::numeric_limits<int64_t>::max() ? int64_t(rounded)
+                                                                              : -1;
+    };
+    int64_t frameOfDay = roundedFrameCount(video.timecode100ns);
+    const int64_t framesPerDay = roundedFrameCount(kTicksPerDay);
     if (frameOfDay < 0 || framesPerDay <= 0) return std::nullopt;
     frameOfDay %= framesPerDay;
 
     TimecodeEvidence evidence;
     evidence.frameOfDay = frameOfDay;
-    evidence.labelRate = *rate;
+    evidence.labelRate = rate;
     evidence.sourceGeneration = sourceGeneration;
     evidence.timingGeneration = sourceGeneration;
     evidence.provenance = TimecodeProvenance::Ndi;
-    evidence.arrivalSessionFrame = sessionFrameForMs(sourcePtsMs, *rate);
-    evidence.sessionRate = *rate;
+    evidence.arrivalSessionFrame = sessionFrameForMs(sourcePtsMs, rate);
+    evidence.sessionRate = rate;
     evidence.quantizationBoundUs =
-        int64_t((__int128(1'000'000) * rate->den + rate->num - 1) / rate->num);
+        int64_t((__int128(1'000'000) * rate.den + rate.num - 1) / rate.num);
     return evidence.valid() ? std::optional<TimecodeEvidence>(evidence) : std::nullopt;
 }
 

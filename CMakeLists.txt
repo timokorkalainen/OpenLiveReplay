@@ -241,6 +241,8 @@ qt_add_qml_module(OpenLiveReplay
         recorder_engine/benchmark/recordgate.h recorder_engine/benchmark/recordgate.cpp
         recorder_engine/ingest/h26xtimingcontext.h recorder_engine/ingest/h26xtimingcontext.cpp
         recorder_engine/ingest/h26xseitimecode.h recorder_engine/ingest/h26xseitimecode.cpp
+        recorder_engine/ingest/decodedframeevidencequeue.h
+        recorder_engine/ingest/decodedframeevidencequeue.cpp
         recorder_engine/ingest/rtmpprotocol.h recorder_engine/ingest/rtmpprotocol.cpp
         recorder_engine/ingest/nativeaacdecoder.h
         recorder_engine/ingest/nativeframecopy.h recorder_engine/ingest/nativeframecopy.cpp

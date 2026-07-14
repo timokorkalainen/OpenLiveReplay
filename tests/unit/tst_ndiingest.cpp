@@ -75,7 +75,9 @@ private slots:
     void supportsNdiUrls();
     void unavailableRuntimeFailsOpen();
     void fakeBackendDeliversVideoAndAudio();
+    void exactFractionalRatesMapOneHourInSenderDomain();
     void nearMidnightTimecodeWrapsToNextDay();
+    void exactSenderRateIsReducedWithoutApproximation();
     void invalidSenderRateProducesNoEvidence();
     void successfulReopenAdvancesSourceGeneration();
     void localRecvCreateStructMatchesSdkShape();
@@ -218,7 +220,10 @@ void TestNdiIngest::nearMidnightTimecodeWrapsToNextDay() {
     constexpr int64_t kTicksPerDay = 24LL * 60 * 60 * 10'000'000;
     const QByteArray pixels = ndiTestPixels();
     FakeNdiReceiverBackend backend;
-    backend.items.append(ndiVideoItem(pixels, kTicksPerDay - 1, 60000, 1001));
+    // 8.337 ms before midnight is on opposite sides of the nominal-60 and
+    // exact-60000/1001 rounding boundaries. Exact-domain rounding lands on the
+    // rounded day length and therefore wraps to frame zero.
+    backend.items.append(ndiVideoItem(pixels, kTicksPerDay - 83'370, 60000, 1001));
 
     std::atomic<bool> running{true};
     NativeNdiIngestSession session(0, 4, 4, &running, &backend);
@@ -243,21 +248,52 @@ void TestNdiIngest::nearMidnightTimecodeWrapsToNextDay() {
     QVERIFY(evidence->valid());
 }
 
-void TestNdiIngest::invalidSenderRateProducesNoEvidence() {
+void TestNdiIngest::exactFractionalRatesMapOneHourInSenderDomain() {
+    constexpr int64_t kOneHour100ns = 60LL * 60 * 10'000'000;
+    const QByteArray pixels = ndiTestPixels();
+    const QList<QPair<FrameRateQ, int64_t>> cases = {
+        {{30000, 1001}, 107892},
+        {{60000, 1001}, 215784},
+    };
+
+    for (const auto& testCase : cases) {
+        FakeNdiReceiverBackend backend;
+        backend.items.append(
+            ndiVideoItem(pixels, kOneHour100ns, testCase.first.num, testCase.first.den));
+        std::atomic<bool> running{true};
+        NativeNdiIngestSession session(0, 4, 4, &running, &backend);
+        std::optional<TimecodeEvidence> evidence;
+        IngestCallbacks callbacks;
+        callbacks.recordingClockMs = []() { return int64_t(5000); };
+        callbacks.onVideoFrame = [&evidence, &running](DecodedVideoFrame decoded) {
+            evidence = decoded.timecodeEvidence;
+            av_frame_free(&decoded.frame);
+            running.store(false, std::memory_order_relaxed);
+        };
+
+        QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+        session.run();
+
+        QVERIFY(evidence.has_value());
+        QCOMPARE(evidence->labelRate, testCase.first);
+        QCOMPARE(evidence->frameOfDay, testCase.second);
+    }
+}
+
+void TestNdiIngest::exactSenderRateIsReducedWithoutApproximation() {
     const QByteArray pixels = ndiTestPixels();
     FakeNdiReceiverBackend backend;
-    backend.items.append(ndiVideoItem(pixels, 1234567, std::numeric_limits<int32_t>::max(), 1));
+    // 5994/200 is exactly 29.97. It must reduce to 2997/100, not be approximated
+    // to the nearby broadcast rate 30000/1001.
+    backend.items.append(ndiVideoItem(pixels, 10'000'000, 5994, 200));
 
     std::atomic<bool> running{true};
     NativeNdiIngestSession session(0, 4, 4, &running, &backend);
-    bool hadEvidence = true;
-    int64_t sourceTimecode100ns = -1;
+    std::optional<TimecodeEvidence> evidence;
     IngestCallbacks callbacks;
     callbacks.recordingClockMs = []() { return int64_t(5000); };
-    callbacks.onVideoFrame = [&hadEvidence, &sourceTimecode100ns,
-                              &running](DecodedVideoFrame decoded) {
-        hadEvidence = decoded.timecodeEvidence.has_value();
-        sourceTimecode100ns = decoded.sourceTimecode100ns;
+    callbacks.onVideoFrame = [&evidence, &running](DecodedVideoFrame decoded) {
+        evidence = decoded.timecodeEvidence;
         av_frame_free(&decoded.frame);
         running.store(false, std::memory_order_relaxed);
     };
@@ -265,8 +301,56 @@ void TestNdiIngest::invalidSenderRateProducesNoEvidence() {
     QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
     session.run();
 
-    QVERIFY(!hadEvidence);
-    QCOMPARE(sourceTimecode100ns, int64_t(1234567));
+    QVERIFY(evidence.has_value());
+    QCOMPARE(evidence->labelRate, (FrameRateQ{2997, 100}));
+    QCOMPARE(evidence->frameOfDay, int64_t(30));
+
+    constexpr int64_t kTicksPerDay = 24LL * 60 * 60 * 10'000'000;
+    FakeNdiReceiverBackend lateBackend;
+    lateBackend.items.append(ndiVideoItem(pixels, kTicksPerDay - 4'000'000, 3001, 100));
+    running.store(true, std::memory_order_relaxed);
+    NativeNdiIngestSession lateSession(0, 4, 4, &running, &lateBackend);
+    evidence.reset();
+    QVERIFY(lateSession.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+    lateSession.run();
+
+    QVERIFY(evidence.has_value());
+    QCOMPARE(evidence->labelRate, (FrameRateQ{3001, 100}));
+    QCOMPARE(evidence->frameOfDay, int64_t(2'592'852));
+    QVERIFY(evidence->valid());
+}
+
+void TestNdiIngest::invalidSenderRateProducesNoEvidence() {
+    const QByteArray pixels = ndiTestPixels();
+    const QList<FrameRateQ> invalidRates = {
+        {11, 1},
+        {241, 1},
+        {std::numeric_limits<int32_t>::max(), 1},
+    };
+
+    for (const FrameRateQ rate : invalidRates) {
+        FakeNdiReceiverBackend backend;
+        backend.items.append(ndiVideoItem(pixels, 1234567, rate.num, rate.den));
+        std::atomic<bool> running{true};
+        NativeNdiIngestSession session(0, 4, 4, &running, &backend);
+        bool hadEvidence = true;
+        int64_t sourceTimecode100ns = -1;
+        IngestCallbacks callbacks;
+        callbacks.recordingClockMs = []() { return int64_t(5000); };
+        callbacks.onVideoFrame = [&hadEvidence, &sourceTimecode100ns,
+                                  &running](DecodedVideoFrame decoded) {
+            hadEvidence = decoded.timecodeEvidence.has_value();
+            sourceTimecode100ns = decoded.sourceTimecode100ns;
+            av_frame_free(&decoded.frame);
+            running.store(false, std::memory_order_relaxed);
+        };
+
+        QVERIFY(session.open(QUrl(QStringLiteral("ndi:CAM1")), callbacks));
+        session.run();
+
+        QVERIFY(!hadEvidence);
+        QCOMPARE(sourceTimecode100ns, int64_t(1234567));
+    }
 }
 
 void TestNdiIngest::successfulReopenAdvancesSourceGeneration() {
