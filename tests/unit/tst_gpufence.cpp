@@ -2,6 +2,7 @@
 // interface is uniform; concrete backends use MTLSharedEvent on Apple,
 // ID3D11Fence on Windows, and a deterministic timeline stub elsewhere.
 #include <QtTest>
+#include <QScopeGuard>
 
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
@@ -67,6 +68,9 @@ private slots:
     void concurrentSignalsProduceUniqueMonotonicValues();
     void identityIsStableAndUniquePerFenceInstance();
     void instanceIdExhaustionFailsClosedPermanently();
+#ifdef __APPLE__
+    void defaultFactoryTracksDeviceAuthorityAcrossRebuild();
+#endif
 };
 
 void TestGpuFence::createIsNullOrValidNeverPartial() {
@@ -175,6 +179,27 @@ void TestGpuFence::instanceIdExhaustionFailsClosedPermanently() {
     QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next), uint64_t(0));
     QCOMPARE(next.load(std::memory_order_relaxed), uint64_t(0));
 }
+
+#ifdef __APPLE__
+void TestGpuFence::defaultFactoryTracksDeviceAuthorityAcrossRebuild() {
+    GpuDeviceLossMonitor& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    auto resetMonitor = qScopeGuard([&monitor] { monitor.reset(); });
+
+    const uint64_t initialAuthority = monitor.currentDeviceAuthorityForTest();
+    auto initialFence = GpuFence::create();
+    if (!initialFence) QSKIP("default Metal fence unavailable on this host");
+    QCOMPARE(initialFence->identity().authorityEpoch, initialAuthority);
+
+    monitor.beginRebuild();
+    const uint64_t replacementAuthority = monitor.currentDeviceAuthorityForTest();
+    QVERIFY(replacementAuthority != initialAuthority);
+    auto replacementFence = GpuFence::create();
+    QVERIFY2(replacementFence, "replacement-authority Metal fence creation failed");
+    QCOMPARE(replacementFence->identity().authorityEpoch, replacementAuthority);
+    QCOMPARE(initialFence->identity().authorityEpoch, initialAuthority);
+}
+#endif
 
 QTEST_GUILESS_MAIN(TestGpuFence)
 #include "tst_gpufence.moc"

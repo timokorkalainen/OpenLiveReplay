@@ -133,16 +133,22 @@ std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue, uint64_t au
 }
 
 std::shared_ptr<GpuFence> GpuFence::create() {
+    GpuDeviceLossMonitor& monitor = GpuDeviceLossMonitor::instance();
+    const uint64_t authorityEpoch = monitor.currentDeviceAuthorityEpoch();
+    if (authorityEpoch == 0) return nullptr;
+
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return nullptr;
 
     id<MTLCommandQueue> queue = [device newCommandQueue];
     [device release];
-    if (!queue) {
+    if (!queue) return nullptr;
+    if (!monitor.isCurrentDeviceAuthority(authorityEpoch)) {
+        [queue release];
         return nullptr;
     }
-    auto fence =
-        makeMetalGpuFence(queue, GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch());
+
+    auto fence = makeMetalGpuFence(queue, authorityEpoch);
     [queue release];
     return fence;
 }

@@ -299,8 +299,107 @@ bool probe() {
         raise AssertionError(message)
 
 
+def audit_apple_fence_factory(source, label):
+    factory = function_block(source, "std::shared_ptr<GpuFence> GpuFence::create()")
+    capture = re.search(
+        r"const\s+uint64_t\s+(\w+)\s*=\s*[^;]*"
+        r"currentDeviceAuthorityEpoch\s*\(\s*\)\s*;",
+        factory,
+    )
+    require(capture is not None, f"{label}: authority must be captured explicitly")
+    authority = capture.group(1)
+    require(len(re.findall(r"\bcurrentDeviceAuthorityEpoch\s*\(", factory)) == 1,
+            f"{label}: authority must be read exactly once before native creation")
+
+    device = re.search(r"\bMTLCreateSystemDefaultDevice\s*\(", factory)
+    queue = re.search(r"id\s*<\s*MTLCommandQueue\s*>\s+(\w+)\s*=\s*"
+                      r"\[[^\]]+\s+newCommandQueue\s*\]", factory)
+    require(device is not None and queue is not None,
+            f"{label}: default Metal device and queue creation must remain explicit")
+    require(capture.start() < device.start() < queue.start(),
+            f"{label}: authority capture must precede native device and queue creation")
+    require(re.search(rf"if\s*\(\s*{re.escape(authority)}\s*==\s*0\s*\)\s*"
+                      r"return\s+nullptr\s*;", factory[capture.end():device.start()]),
+            f"{label}: zero authority must fail before native creation")
+
+    queue_name = queue.group(1)
+    validation = re.search(
+        rf"if\s*\(\s*!\s*[^)]*isCurrentDeviceAuthority\s*\(\s*"
+        rf"{re.escape(authority)}\s*\)\s*\)\s*\{{(?P<body>.*?)\}}",
+        factory,
+        re.DOTALL,
+    )
+    require(validation is not None and validation.start() > queue.end(),
+            f"{label}: created queue must be rejected if captured authority changed")
+    require(re.search(rf"\[\s*{re.escape(queue_name)}\s+release\s*\]",
+                      validation.group("body")) and
+            re.search(r"return\s+nullptr\s*;", validation.group("body")),
+            f"{label}: stale queue rejection must release ownership and fail closed")
+
+    factory_call = re.search(rf"makeMetalGpuFence\s*\(\s*{re.escape(queue_name)}\s*,\s*"
+                             rf"{re.escape(authority)}\s*\)", factory)
+    require(factory_call is not None and validation.end() < factory_call.start(),
+            f"{label}: validated captured authority must be passed explicitly to the fence")
+    release_positions = [match.start() for match in re.finditer(
+        rf"\[\s*{re.escape(queue_name)}\s+release\s*\]", factory)]
+    require(any(position > factory_call.end() for position in release_positions),
+            f"{label}: successful queue ownership must be released after fence creation")
+
+
+def apple_fence_factory_mutation_self_tests():
+    safe = """
+std::shared_ptr<GpuFence> GpuFence::create() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    const uint64_t authorityEpoch = monitor.currentDeviceAuthorityEpoch();
+    if (authorityEpoch == 0) return nullptr;
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    [device release];
+    if (!queue) return nullptr;
+    if (!monitor.isCurrentDeviceAuthority(authorityEpoch)) {
+        [queue release];
+        return nullptr;
+    }
+    auto fence = makeMetalGpuFence(queue, authorityEpoch);
+    [queue release];
+    return fence;
+}
+"""
+    audit_apple_fence_factory(safe, "safe Apple fence factory mutation")
+    late_capture = safe.replace(
+        "    const uint64_t authorityEpoch = monitor.currentDeviceAuthorityEpoch();\n"
+        "    if (authorityEpoch == 0) return nullptr;\n",
+        "",
+    ).replace(
+        "    id<MTLCommandQueue> queue = [device newCommandQueue];\n",
+        "    id<MTLCommandQueue> queue = [device newCommandQueue];\n"
+        "    const uint64_t authorityEpoch = monitor.currentDeviceAuthorityEpoch();\n"
+        "    if (authorityEpoch == 0) return nullptr;\n",
+    )
+    missing_validation = re.sub(
+        r"    if \(!monitor\.isCurrentDeviceAuthority\(authorityEpoch\)\) \{\n"
+        r"        \[queue release\];\n        return nullptr;\n    \}\n",
+        "",
+        safe,
+    )
+    late_read = safe.replace(
+        "makeMetalGpuFence(queue, authorityEpoch)",
+        "makeMetalGpuFence(queue, monitor.currentDeviceAuthorityEpoch())",
+    )
+    for mutation, message in (
+        (late_capture, "late authority capture must be rejected"),
+        (missing_validation, "missing post-creation validation must be rejected"),
+        (late_read, "late authority read at fence construction must be rejected"),
+    ):
+        try:
+            audit_apple_fence_factory(mutation, "Apple fence factory mutation")
+        except AssertionError:
+            continue
+        raise AssertionError(message)
+
+
 def main():
-    if len(sys.argv) != 14:
+    if len(sys.argv) != 15:
         raise SystemExit(
             "usage: test_gpu_scope_completion_static.py "
             "<nativevideoencoder_videotoolbox.mm> "
@@ -309,11 +408,12 @@ def main():
             "<gpuframedata.cpp> <gpusurfaceallocator.cpp> "
             "<vtkeepsurfaceimporter_apple.mm> <gpucompositor.cpp> "
             "<asyncgpureadbacksink.cpp> <decklinksink.cpp> <outputbusengine.cpp> "
-            "<gpuframeretirequeue.cpp> <gpuencodepump.cpp>"
+            "<gpuframeretirequeue.cpp> <gpuencodepump.cpp> <gpufence_apple.mm>"
         )
 
     mutation_self_tests()
     exact_synchronization_mutation_self_tests()
+    apple_fence_factory_mutation_self_tests()
     videotoolbox = Path(sys.argv[1]).read_text(encoding="utf-8")
     mediafoundation = Path(sys.argv[2]).read_text(encoding="utf-8")
     apple_surface = Path(sys.argv[3]).read_text(encoding="utf-8")
@@ -327,6 +427,9 @@ def main():
     output_bus = Path(sys.argv[11]).read_text(encoding="utf-8")
     retire_queue = Path(sys.argv[12]).read_text(encoding="utf-8")
     encode_pump = Path(sys.argv[13]).read_text(encoding="utf-8")
+    apple_fence = Path(sys.argv[14]).read_text(encoding="utf-8")
+
+    audit_apple_fence_factory(apple_fence, "Apple default Metal fence factory")
 
     vt_encode, vt_regions = audit_structured_access(
         function_block(videotoolbox, "bool encodeSurface"),

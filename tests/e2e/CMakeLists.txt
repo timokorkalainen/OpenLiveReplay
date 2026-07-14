@@ -209,7 +209,8 @@ if(OLR_PYTHON3_EXECUTABLE)
             "${CMAKE_SOURCE_DIR}/playback/output/iotargets/decklinksink.cpp"
             "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
-            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/gpuencodepump.cpp")
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/gpuencodepump.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpufence_apple.mm")
     set_tests_properties(tst_gpu_scope_completion_static PROPERTIES
         LABELS "unit;ci;gpu-capability"
         TIMEOUT 30)
