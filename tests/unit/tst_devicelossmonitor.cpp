@@ -24,6 +24,12 @@ struct GpuDeviceLossMonitorTestAuthority {
             DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
             deviceDomainId);
     }
+    static bool tryLockEpoch() {
+        auto& monitor = GpuDeviceLossMonitor::instance();
+        if (!monitor.m_epochMutex.try_lock()) return false;
+        monitor.m_epochMutex.unlock();
+        return true;
+    }
 };
 #endif
 
@@ -43,12 +49,86 @@ private slots:
     void rebuildAuthorityRejectsOldDeviceAcceptsReplacement();
     void currentAuthorityPublicationTracksGuardedEpoch();
     void validatedRecoveryRunsOnceForConcurrentWorkers();
+    void validatedRecoveryCallbackRunsAfterEpochUnlock();
+    void tokenlessRecoveryCallbackRunsAfterEpochUnlock();
     void rebuildInvalidatesUnconsumedRecoveryAuthority();
     void tokenlessEpochCanUpgradeToValidatedRecovery();
     void expandedDeadDomainProofRunsNewRecoveryRevision();
     void differentRecoveryKeysCompleteIndependentlyAndRemainCached();
+    void retiredGenerationsPruneCompletedWithoutErasingActiveOrNewer();
     void resetReturnsToPristine();
 };
+
+void TestDeviceLossMonitor::validatedRecoveryCallbackRunsAfterEpochUnlock() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA10) != 0);
+
+    QSemaphore callbackEntered;
+    QSemaphore releaseCallback;
+    GpuValidatedLossResult result;
+    std::thread recovery([&]() {
+        result = monitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
+            callbackEntered.release();
+            releaseCallback.acquire();
+            return qsizetype(1);
+        });
+    });
+    const bool entered = callbackEntered.tryAcquire(1, 5000);
+    std::atomic<bool> epochAvailable{false};
+    std::thread probe;
+    if (entered) {
+        probe = std::thread([&]() {
+            epochAvailable.store(GpuDeviceLossMonitorTestAuthority::tryLockEpoch(),
+                                 std::memory_order_release);
+        });
+        probe.join();
+    }
+    releaseCallback.release();
+    recovery.join();
+
+    QVERIFY(entered);
+    QVERIFY2(epochAvailable.load(std::memory_order_acquire),
+             "validated recovery callback must run after releasing m_epochMutex");
+    QCOMPARE(result.status, GpuValidatedLossStatus::Completed);
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::tokenlessRecoveryCallbackRunsAfterEpochUnlock() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    monitor.recordSubmissionFailure(0xA09);
+
+    QSemaphore callbackEntered;
+    QSemaphore releaseCallback;
+    GpuValidatedLossResult result;
+    std::thread recovery([&]() {
+        result = monitor.withCoordinatedTokenlessRecovery([&]() {
+            callbackEntered.release();
+            releaseCallback.acquire();
+            return qsizetype(0);
+        });
+    });
+    const bool entered = callbackEntered.tryAcquire(1, 5000);
+    std::atomic<bool> epochAvailable{false};
+    std::thread probe;
+    if (entered) {
+        probe = std::thread([&]() {
+            epochAvailable.store(GpuDeviceLossMonitorTestAuthority::tryLockEpoch(),
+                                 std::memory_order_release);
+        });
+        probe.join();
+    }
+    releaseCallback.release();
+    recovery.join();
+
+    QVERIFY(entered);
+    QVERIFY2(epochAvailable.load(std::memory_order_acquire),
+             "tokenless recovery callback must run after releasing m_epochMutex");
+    QCOMPARE(result.status, GpuValidatedLossStatus::Completed);
+    monitor.reset();
+}
 
 void TestDeviceLossMonitor::validatedRecoveryRunsOnceForConcurrentWorkers() {
     auto& monitor = GpuDeviceLossMonitor::instance();
@@ -116,6 +196,8 @@ void TestDeviceLossMonitor::tokenlessEpochCanUpgradeToValidatedRecovery() {
     QVERIFY(!called);
 
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA13), generation);
+    // Publication coordinated the upgraded revision. This read is a follower and
+    // must not rerun its callback.
     QCOMPARE(monitor
                  .withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
                      called = true;
@@ -123,7 +205,7 @@ void TestDeviceLossMonitor::tokenlessEpochCanUpgradeToValidatedRecovery() {
                  })
                  .status,
              GpuValidatedLossStatus::Completed);
-    QVERIFY(called);
+    QVERIFY(!called);
     monitor.reset();
 }
 
@@ -141,14 +223,16 @@ void TestDeviceLossMonitor::expandedDeadDomainProofRunsNewRecoveryRevision() {
                  .abandoned,
              qsizetype(1));
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA15), generation);
+    // The late publisher completed revision 2 with the registry callback. A later
+    // monitor read follows that exact result instead of invoking this callback.
     QCOMPARE(monitor
                  .withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
                      ++callbacks;
                      return qsizetype(callbacks);
                  })
                  .abandoned,
-             qsizetype(2));
-    QCOMPARE(callbacks, 2);
+             qsizetype(0));
+    QCOMPARE(callbacks, 1);
     monitor.reset();
 }
 
@@ -192,6 +276,67 @@ void TestDeviceLossMonitor::differentRecoveryKeysCompleteIndependentlyAndRemainC
     QCOMPARE(newFollower.abandoned, qsizetype(22));
     QCOMPARE(oldCallbacks.load(std::memory_order_acquire), 1);
     QCOMPARE(newCallbacks.load(std::memory_order_acquire), 1);
+    coordinator.resetForTest();
+}
+
+void TestDeviceLossMonitor::retiredGenerationsPruneCompletedWithoutErasingActiveOrNewer() {
+    auto& coordinator = GpuRecoveryCoordinator::instance();
+    coordinator.resetForTest();
+    QCOMPARE(coordinator
+                 .coordinate(0x301, 1,
+                             []() {
+                                 return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
+                                                               qsizetype(11)};
+                             })
+                 .status,
+             GpuValidatedLossStatus::Completed);
+    QCOMPARE(coordinator
+                 .coordinate(0x302, 1,
+                             []() {
+                                 return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
+                                                               qsizetype(22)};
+                             })
+                 .status,
+             GpuValidatedLossStatus::Completed);
+
+    QSemaphore activeEntered;
+    QSemaphore releaseActive;
+    GpuValidatedLossResult activeResult;
+    std::thread active([&]() {
+        activeResult = coordinator.coordinate(0x301, 2, [&]() {
+            activeEntered.release();
+            releaseActive.acquire();
+            return GpuValidatedLossResult{GpuValidatedLossStatus::Completed, qsizetype(33)};
+        });
+    });
+    const bool entered = activeEntered.tryAcquire(1, 5000);
+    if (entered) coordinator.retireGenerationsThrough(0x301);
+
+    int retiredCallbacks = 0;
+    const GpuValidatedLossResult retired = coordinator.coordinate(0x301, 1, [&]() {
+        ++retiredCallbacks;
+        return GpuValidatedLossResult{GpuValidatedLossStatus::Completed, qsizetype(44)};
+    });
+    int newerCallbacks = 0;
+    const GpuValidatedLossResult newer = coordinator.coordinate(0x302, 1, [&]() {
+        ++newerCallbacks;
+        return GpuValidatedLossResult{GpuValidatedLossStatus::Completed, qsizetype(55)};
+    });
+    const size_t cachedWhileActive = coordinator.cachedRecoveryCountForTest();
+    releaseActive.release();
+    active.join();
+
+    QVERIFY(entered);
+    QCOMPARE(retired.status, GpuValidatedLossStatus::Rejected);
+    QCOMPARE(retiredCallbacks, 0);
+    QCOMPARE(newer.status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(newer.abandoned, qsizetype(22));
+    QCOMPARE(newerCallbacks, 0);
+    QCOMPARE(cachedWhileActive, size_t(2));
+    QCOMPARE(activeResult.status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(coordinator.cachedRecoveryCountForTest(), size_t(1));
+    coordinator.retireGenerationsThrough(0x302);
+    QCOMPARE(coordinator.cachedRecoveryCountForTest(), size_t(0));
     coordinator.resetForTest();
 }
 

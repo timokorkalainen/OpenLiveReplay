@@ -12,6 +12,12 @@ GpuDeviceLossMonitor& GpuDeviceLossMonitor::instance() {
     return monitor;
 }
 
+#ifdef OLR_UNIT_TEST
+void GpuDeviceLossMonitor::noteRecoveryAttemptForTest() {
+    if (m_recoveryAttemptingForTest) m_recoveryAttemptingForTest->release();
+}
+#endif
+
 bool GpuDeviceLossMonitor::isLost() const {
     return m_lost.load(std::memory_order_acquire);
 }
@@ -102,11 +108,17 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
     // cold-path handoff.
     if (immediateDeliveryRequired) {
         GpuValidatedDeadDomains deadDomain(acceptedProof);
-        (void) GpuRetireRegistry{}.abandonAllNoWait(deadDomain);
-        std::lock_guard<std::mutex> lock(m_epochMutex);
-        if (m_lossGeneration.load(std::memory_order_acquire) == generation &&
-            m_realLossRevision == acceptedRevision)
-            m_deliveredProofRevision = acceptedRevision;
+        const GpuValidatedLossResult result =
+            GpuRecoveryCoordinator::instance().coordinate(generation, acceptedRevision, [&]() {
+                return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
+                                              GpuRetireRegistry{}.abandonAllNoWait(deadDomain)};
+            });
+        if (result.status == GpuValidatedLossStatus::Completed) {
+            std::lock_guard<std::mutex> lock(m_epochMutex);
+            if (m_lossGeneration.load(std::memory_order_acquire) == generation &&
+                m_realLossRevision == acceptedRevision)
+                m_deliveredProofRevision = acceptedRevision;
+        }
     }
     return generation;
 }
@@ -148,44 +160,59 @@ bool GpuDeviceLossMonitor::consumeLossEvent() {
 
 void GpuDeviceLossMonitor::beginRebuild() {
     std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
-    std::lock_guard<std::mutex> lock(m_epochMutex);
-    if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
-    m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
-    m_rebuildInProgress = true;
+    uint64_t retiredGeneration = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        retiredGeneration = m_lossGeneration.load(std::memory_order_acquire);
+        if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+        m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
+        m_rebuildInProgress = true;
+    }
+    GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
 }
 
 void GpuDeviceLossMonitor::clearForRebuild() {
     std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
-    std::lock_guard<std::mutex> lock(m_epochMutex);
-    // Preserve compatibility with direct clear callers while allowing production
-    // rebuilds to mint replacement-device authority between begin and commit.
-    if (!m_rebuildInProgress && ++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
-    m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
-    m_rebuildInProgress = false;
-    m_lost.store(false, std::memory_order_release);
-    m_lossGeneration.store(0, std::memory_order_release);
-    m_realLossToken.reset();
-    m_realLossTokens.clear();
-    m_realLossRevision = 0;
-    m_deliveredProofRevision = 0;
-    m_tokenlessRecoveryObserved = false;
+    uint64_t retiredGeneration = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        retiredGeneration = m_lossGeneration.load(std::memory_order_acquire);
+        // Preserve compatibility with direct clear callers while allowing production
+        // rebuilds to mint replacement-device authority between begin and commit.
+        if (!m_rebuildInProgress && ++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+        m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
+        m_rebuildInProgress = false;
+        m_lost.store(false, std::memory_order_release);
+        m_lossGeneration.store(0, std::memory_order_release);
+        m_realLossToken.reset();
+        m_realLossTokens.clear();
+        m_realLossRevision = 0;
+        m_deliveredProofRevision = 0;
+        m_tokenlessRecoveryObserved = false;
+    }
+    GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
 }
 
 void GpuDeviceLossMonitor::reset() {
     std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
-    std::lock_guard<std::mutex> lock(m_epochMutex);
-    if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
-    m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
-    m_rebuildInProgress = false;
-    m_lost.store(false, std::memory_order_release);
-    m_lossCount.store(0, std::memory_order_release);
-    m_undrained.store(0, std::memory_order_release);
-    m_lossGeneration.store(0, std::memory_order_release);
-    m_realLossToken.reset();
-    m_realLossTokens.clear();
-    m_realLossRevision = 0;
-    m_deliveredProofRevision = 0;
-    m_tokenlessRecoveryObserved = false;
+    uint64_t retiredGeneration = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        retiredGeneration = m_lossGeneration.load(std::memory_order_acquire);
+        if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+        m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
+        m_rebuildInProgress = false;
+        m_lost.store(false, std::memory_order_release);
+        m_lossCount.store(0, std::memory_order_release);
+        m_undrained.store(0, std::memory_order_release);
+        m_lossGeneration.store(0, std::memory_order_release);
+        m_realLossToken.reset();
+        m_realLossTokens.clear();
+        m_realLossRevision = 0;
+        m_deliveredProofRevision = 0;
+        m_tokenlessRecoveryObserved = false;
+    }
+    GpuRecoveryCoordinator::instance().retireGenerationsThrough(retiredGeneration);
 #ifdef OLR_UNIT_TEST
     GpuRecoveryCoordinator::instance().resetForTest();
 #endif

@@ -90,6 +90,10 @@ public:
 
     template <typename Fn>
     GpuValidatedLossResult withValidatedDeadDomains(Fn&& fn) {
+#ifdef OLR_UNIT_TEST
+        noteRecoveryAttemptForTest();
+#endif
+        std::unique_lock<std::mutex> deliveryLock(m_proofDeliveryMutex);
         std::unique_lock<std::mutex> epochLock(m_epochMutex);
         const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
         if (generation == 0 || !m_lost.load(std::memory_order_acquire) || m_rebuildInProgress)
@@ -103,25 +107,37 @@ public:
                 token.authorityEpoch() != m_deviceAuthorityEpoch)
                 return {};
         }
+        const uint64_t revision = m_realLossRevision;
+        const std::vector<DeadDeviceToken> proof = m_realLossTokens;
+        epochLock.unlock();
         const GpuValidatedLossResult result =
-            GpuRecoveryCoordinator::instance().coordinate(generation, m_realLossRevision, [&]() {
-                GpuValidatedDeadDomains domains(m_realLossTokens);
+            GpuRecoveryCoordinator::instance().coordinate(generation, revision, [&]() {
+                GpuValidatedDeadDomains domains(proof);
                 return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
                                               std::invoke(std::forward<Fn>(fn), domains)};
             });
-        if (result.status == GpuValidatedLossStatus::Completed)
-            m_deliveredProofRevision = m_realLossRevision;
+        if (result.status == GpuValidatedLossStatus::Completed) {
+            epochLock.lock();
+            if (m_lossGeneration.load(std::memory_order_acquire) == generation &&
+                m_realLossRevision == revision)
+                m_deliveredProofRevision = revision;
+        }
         return result;
     }
 
     template <typename Fn>
     GpuValidatedLossResult withCoordinatedTokenlessRecovery(Fn&& fn) {
+#ifdef OLR_UNIT_TEST
+        noteRecoveryAttemptForTest();
+#endif
+        std::unique_lock<std::mutex> deliveryLock(m_proofDeliveryMutex);
         std::unique_lock<std::mutex> epochLock(m_epochMutex);
         const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
         if (generation == 0 || !m_lost.load(std::memory_order_acquire) || m_rebuildInProgress ||
             !m_realLossTokens.empty())
             return {};
         m_tokenlessRecoveryObserved = true;
+        epochLock.unlock();
         return GpuRecoveryCoordinator::instance().coordinate(
             generation, std::numeric_limits<uint64_t>::max(), [&]() {
                 return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
@@ -153,13 +169,16 @@ private:
     uint64_t captureDeviceAuthorityEpoch() const;
     uint64_t publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
                                    uint64_t deviceAuthorityEpoch, uintptr_t deviceDomainId);
+#ifdef OLR_UNIT_TEST
+    void noteRecoveryAttemptForTest();
+#endif
 
     std::atomic<bool> m_lost{false};
     std::atomic<uint64_t> m_lossCount{0};
     std::atomic<uint64_t> m_undrained{0};
     std::atomic<uint64_t> m_lossGeneration{0};
     std::atomic<uint64_t> m_publishedDeviceAuthorityEpoch{1};
-    // Serializes cold-path proof publication through its post-epoch recovery delivery.
+    // Serializes cold-path proof publication and worker recovery through post-epoch delivery.
     std::mutex m_proofDeliveryMutex;
     mutable std::mutex m_epochMutex;
     uint64_t m_deviceAuthorityEpoch = 1;            // guarded by m_epochMutex
@@ -172,6 +191,7 @@ private:
 #ifdef OLR_UNIT_TEST
     QSemaphore* m_proofAcceptedForTest = nullptr;
     QSemaphore* m_continueProofDeliveryForTest = nullptr;
+    QSemaphore* m_recoveryAttemptingForTest = nullptr;
 #endif
 };
 
