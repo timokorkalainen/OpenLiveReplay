@@ -2,6 +2,7 @@
 #define OLR_GPUSURFACE_H
 
 #include "playback/output/framepixelformat.h"
+#include "playback/gpu/gpusubmission.h"
 
 #include <QtGlobal>
 
@@ -67,6 +68,11 @@ public:
 
     virtual GpuSurfaceDesc desc() const = 0;
     virtual bool isValid() const = 0;
+
+    // Allocation-free device/authority evidence for asynchronous submission.
+    // Backend surfaces override this when they participate in a typed GPU
+    // submission path; an empty value is never accepted as exact evidence.
+    virtual GpuSurfaceCompatibility compatibility() const { return {}; }
 
     // Presentability probe: is this surface backed by a real native handle? A
     // capability-free bool that leaks no pointer, so sinks can gate on GPU

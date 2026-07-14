@@ -23,6 +23,7 @@
 #include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpusurfacelease.h"
+#include "playback/gpu/gpusubmission.h"
 #include "playback/output/framepixelformat.h"
 
 #include <memory>
@@ -84,9 +85,11 @@ static_assert(std::is_nothrow_move_constructible<GpuOwnedNativeHandle>::value,
 // mirroring the production surfaces, so the ONLY way the test reads it is via a lease.
 class FakeLeaseSurface : public GpuSurface {
 public:
-    FakeLeaseSurface(void* handle, bool valid) : m_handle(handle), m_valid(valid) {}
+    FakeLeaseSurface(void* handle, bool valid, GpuSurfaceCompatibility compatibility = {})
+        : m_handle(handle), m_valid(valid), m_compatibility(compatibility) {}
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 16, 0}; }
     bool isValid() const override { return m_valid; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
 
 protected:
     void* nativeHandle() const override { return m_valid ? m_handle : nullptr; }
@@ -94,12 +97,14 @@ protected:
 private:
     void* m_handle = nullptr;
     bool m_valid = false;
+    GpuSurfaceCompatibility m_compatibility;
 };
 
 // Fence with a test-controllable completed watermark.
 class FakeFence : public GpuFence {
 public:
-    explicit FakeFence(uintptr_t deviceDomainId = 0) : m_deviceDomainId(deviceDomainId) {}
+    explicit FakeFence(uintptr_t deviceDomainId = 0, uint64_t authorityEpoch = 1)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
     uint64_t signal() override {
         ++m_signalCalls;
         return ++m_signalled;
@@ -114,7 +119,6 @@ public:
         ++m_completedCalls;
         return m_completed;
     }
-    uintptr_t deviceDomainId() const override { return m_deviceDomainId; }
     void setCompleted(uint64_t v) { m_completed = v; }
     void setRetireOnWait(bool retire) { m_retireOnWait = retire; }
     bool waitSawUnlockedRetainer() const { return m_waitSawUnlockedRetainer; }
@@ -130,7 +134,6 @@ private:
     int m_signalCalls = 0;
     mutable int m_completedCalls = 0;
     mutable bool m_completedSawUnlockedRetainer = false;
-    uintptr_t m_deviceDomainId = 0;
 };
 
 class ZeroSignalFence final : public GpuFence {
@@ -262,6 +265,8 @@ private slots:
     void zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade();
     void deadTokenAbandonsOnlyMatchingDeviceDomain();
     void multipleDeadTokensAbandonInOnePass();
+    void retirementEvidenceRejectsWrongFenceInstanceAndDomain();
+    void submissionEvidenceRejectsStaleGenerationAndAuthority();
 };
 
 void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
@@ -285,6 +290,58 @@ void TestGpuSurfaceLease::callbackLeaseReportsInvalidSurface() {
     const bool valid = scope.read(surface).valid();
     scope.complete();
     QVERIFY(!valid);
+}
+
+void TestGpuSurfaceLease::retirementEvidenceRejectsWrongFenceInstanceAndDomain() {
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t preparedDomain = 0xD011;
+    constexpr uintptr_t otherDomain = 0xD022;
+    constexpr uint64_t authorityEpoch = 9;
+    const uint64_t generation = GpuGenerationCounter::instance().current();
+    auto surface =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xBEEF), true,
+                                           GpuSurfaceCompatibility{preparedDomain, authorityEpoch});
+    auto preparedFence = std::make_shared<FakeFence>(preparedDomain, authorityEpoch);
+    auto sameDomainOtherFence = std::make_shared<FakeFence>(preparedDomain, authorityEpoch);
+    auto otherDomainFence = std::make_shared<FakeFence>(otherDomain, authorityEpoch);
+
+    GpuRetirementTicket ticket{preparedFence, preparedFence->identity(), generation, 0};
+    QVERIFY(preparedFence->validatesPreparedSubmission(ticket, surface->compatibility()));
+    QVERIFY(!sameDomainOtherFence->validatesPreparedSubmission(ticket, surface->compatibility()));
+    QVERIFY(!otherDomainFence->validatesPreparedSubmission(ticket, surface->compatibility()));
+
+    const uint64_t preparedValue = preparedFence->signal();
+    QCOMPARE(sameDomainOtherFence->signal(), preparedValue);
+    QCOMPARE(otherDomainFence->signal(), preparedValue);
+    ticket.value = preparedValue;
+
+    QVERIFY(preparedFence->validatesRetirement(ticket, surface->compatibility()));
+    QVERIFY(!sameDomainOtherFence->validatesRetirement(ticket, surface->compatibility()));
+    QVERIFY(!otherDomainFence->validatesRetirement(ticket, surface->compatibility()));
+}
+
+void TestGpuSurfaceLease::submissionEvidenceRejectsStaleGenerationAndAuthority() {
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t reusedDomain = 0xDEC0DE;
+    constexpr uint64_t oldAuthorityEpoch = 41;
+    constexpr uint64_t newAuthorityEpoch = 42;
+    const uint64_t oldGeneration = GpuGenerationCounter::instance().current();
+    const GpuSurfaceCompatibility oldSurface{reusedDomain, oldAuthorityEpoch};
+    auto oldFence = std::make_shared<FakeFence>(reusedDomain, oldAuthorityEpoch);
+
+    QVERIFY(oldFence->acceptsSubmission(oldSurface, oldGeneration));
+    GpuGenerationCounter::instance().bump();
+    QVERIFY(!oldFence->acceptsSubmission(oldSurface, oldGeneration));
+
+    auto replacementFence = std::make_shared<FakeFence>(reusedDomain, newAuthorityEpoch);
+    const uint64_t newGeneration = GpuGenerationCounter::instance().current();
+    QVERIFY(!replacementFence->acceptsSubmission(oldSurface, newGeneration));
+    QVERIFY(replacementFence->acceptsSubmission(
+        GpuSurfaceCompatibility{reusedDomain, newAuthorityEpoch}, newGeneration));
+
+    const GpuRetirementTicket staleTicket{oldFence, oldFence->identity(), oldGeneration, 1};
+    QVERIFY(!oldFence->validatesRetirement(staleTicket, oldSurface));
+    GpuGenerationCounter::instance().resetForTest();
 }
 
 void TestGpuSurfaceLease::withReadCompletesScope() {

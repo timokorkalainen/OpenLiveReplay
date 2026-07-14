@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpusubmission.h"
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +18,19 @@ using Microsoft::WRL::ComPtr;
 #endif
 
 namespace {
+
+class IdentityFence final : public GpuFence {
+public:
+    IdentityFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override { return ++m_value; }
+    bool wait(uint64_t value, int) override { return m_value >= value; }
+    uint64_t completedValue() const override { return m_value; }
+
+private:
+    uint64_t m_value = 0;
+};
 
 bool gpuFenceRequiredForTest() {
     return qEnvironmentVariableIntValue("OLR_REQUIRE_GPU_FENCE") != 0;
@@ -48,6 +62,7 @@ private slots:
     void waitTimesOutBeforeSignal();
     void waitForeverReturnsAfterSignal();
     void concurrentSignalsProduceUniqueMonotonicValues();
+    void identityIsStableAndUniquePerFenceInstance();
 };
 
 void TestGpuFence::createIsNullOrValidNeverPartial() {
@@ -129,6 +144,20 @@ void TestGpuFence::concurrentSignalsProduceUniqueMonotonicValues() {
     for (size_t i = 0; i < values.size(); ++i)
         QCOMPARE(values[i], uint64_t(i + 1));
     QVERIFY(fence->wait(values.back(), 2000));
+}
+
+void TestGpuFence::identityIsStableAndUniquePerFenceInstance() {
+    auto first = std::make_shared<IdentityFence>(0xA11CE, 7);
+    auto second = std::make_shared<IdentityFence>(0xA11CE, 7);
+    auto otherDomain = std::make_shared<IdentityFence>(0xB0B, 7);
+
+    const GpuFenceIdentity firstIdentity = first->identity();
+    QVERIFY(first->identity() == firstIdentity);
+    QVERIFY(firstIdentity.instanceId != 0);
+    QCOMPARE(firstIdentity.deviceDomainId, uintptr_t(0xA11CE));
+    QCOMPARE(firstIdentity.authorityEpoch, uint64_t(7));
+    QVERIFY(firstIdentity != second->identity());
+    QVERIFY(firstIdentity != otherDomain->identity());
 }
 
 QTEST_GUILESS_MAIN(TestGpuFence)
