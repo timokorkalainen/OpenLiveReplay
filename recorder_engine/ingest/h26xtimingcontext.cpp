@@ -229,8 +229,10 @@ H264TimingSyntax unsupportedH264() {
 
 H264TimingSyntax parseH264Sps(const QByteArray& parameterSet) {
     const QByteArray nal = removeAnnexBPrefix(parameterSet);
-    if (nal.size() < 4 || (uchar(nal[0]) & 0x80u) != 0 || (uchar(nal[0]) & 0x1fu) != 7)
+    if (nal.size() < 4 || (uchar(nal[0]) & 0x80u) != 0 || (uchar(nal[0]) & 0x60u) == 0 ||
+        (uchar(nal[0]) & 0x1fu) != 7) {
         return malformedH264();
+    }
 
     QByteArray rbsp;
     if (!H26xTimingDetail::unescapeRbsp(nal.mid(1), rbsp)) return malformedH264();
@@ -239,8 +241,10 @@ H264TimingSyntax parseH264Sps(const QByteArray& parameterSet) {
     uint32_t constraintFlags = 0;
     uint32_t ignored = 0;
     uint32_t chromaFormatIdc = 1;
+    uint32_t sequenceParameterSetId = 0;
     if (!reader.bits(8, profileIdc) || !reader.bits(8, constraintFlags) ||
-        (constraintFlags & 0x03u) != 0 || !reader.bits(8, ignored) || !reader.ue(ignored)) {
+        (constraintFlags & 0x03u) != 0 || !reader.bits(8, ignored) ||
+        !reader.ue(sequenceParameterSetId) || sequenceParameterSetId > 31) {
         return malformedH264();
     }
 
@@ -266,11 +270,16 @@ H264TimingSyntax parseH264Sps(const QByteArray& parameterSet) {
         }
     }
 
+    uint32_t log2MaxFrameNumMinus4 = 0;
     uint32_t picOrderCntType = 0;
-    if (!reader.ue(ignored) || !reader.ue(picOrderCntType) || picOrderCntType > 2)
+    if (!reader.ue(log2MaxFrameNumMinus4) || log2MaxFrameNumMinus4 > 12 ||
+        !reader.ue(picOrderCntType) || picOrderCntType > 2) {
         return malformedH264();
+    }
     if (picOrderCntType == 0) {
-        if (!reader.ue(ignored)) return malformedH264();
+        uint32_t log2MaxPicOrderCntLsbMinus4 = 0;
+        if (!reader.ue(log2MaxPicOrderCntLsbMinus4) || log2MaxPicOrderCntLsbMinus4 > 12)
+            return malformedH264();
     } else if (picOrderCntType == 1) {
         bool flag = false;
         int32_t signedValue = 0;
@@ -301,7 +310,10 @@ H264TimingSyntax parseH264Sps(const QByteArray& parameterSet) {
     if (!reader.bit(vuiPresent)) return malformedH264();
     H264TimingSyntax syntax;
     syntax.status = H26xTimingSyntaxStatus::Valid;
-    if (!vuiPresent) return syntax;
+    if (!vuiPresent) {
+        if (!reader.rbspTrailingBits()) return malformedH264();
+        return syntax;
+    }
 
     bool present = false;
     if (!reader.bit(present)) return malformedH264();

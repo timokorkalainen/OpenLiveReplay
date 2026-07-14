@@ -156,6 +156,10 @@ Smpte12mTimecode extract(const QByteArray& annexB, NativeVideoCodec codec,
     bool sawMalformed = false;
     for (const QByteArray& nal : splitAnnexBNals(annexB)) {
         if (!isSeiNal(nal, codec)) continue;
+        if (codec == NativeVideoCodec::H264 && (uchar(nal[0]) & 0xe0u) != 0) {
+            sawMalformed = true;
+            continue;
+        }
         const int headerBytes = codec == NativeVideoCodec::H264 ? 1 : 2;
         if (nal.size() <= headerBytes) {
             sawMalformed = true;

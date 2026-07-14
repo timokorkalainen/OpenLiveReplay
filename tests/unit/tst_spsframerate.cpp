@@ -18,6 +18,11 @@ private slots:
     void cachesTimingContextByParameterSetBytes();
     void h264CacheIgnoresVpsBytes();
     void rejectsMalformedEmulationPrevention();
+    void rejectsInvalidH264SpsNalHeader();
+    void rejectsOutOfRangeCoreSyntax_data();
+    void rejectsOutOfRangeCoreSyntax();
+    void noVuiStillRequiresCompleteRbsp_data();
+    void noVuiStillRequiresCompleteRbsp();
     void rejectsBytesAfterRbspTrailingBits_data();
     void rejectsBytesAfterRbspTrailingBits();
     void reportsMalformedAndUnsupportedContext();
@@ -55,9 +60,11 @@ struct BitWriter {
 };
 
 QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale, bool fixedFrameRate = true,
-                   bool highProfileScalingList = false) {
+                   bool highProfileScalingList = false, uint32_t sequenceParameterSetId = 0,
+                   uint32_t log2MaxFrameNumMinus4 = 0, uint32_t log2MaxPicOrderCntLsbMinus4 = 0,
+                   bool vuiPresent = true, bool writeTrailingBits = true) {
     BitWriter w;
-    w.ue(0);  // seq_parameter_set_id
+    w.ue(sequenceParameterSetId);
     if (highProfileScalingList) {
         w.ue(1);  // chroma_format_idc = 4:2:0
         w.ue(0);  // bit_depth_luma_minus8
@@ -70,9 +77,9 @@ QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale, bool fixedFrameR
         for (int i = 1; i < 8; ++i)
             w.bit(0); // remaining scaling lists use defaults
     }
-    w.ue(0);  // log2_max_frame_num_minus4
+    w.ue(log2MaxFrameNumMinus4);
     w.ue(0);  // pic_order_cnt_type = 0
-    w.ue(0);  //   log2_max_pic_order_cnt_lsb_minus4
+    w.ue(log2MaxPicOrderCntLsbMinus4);
     w.ue(0);  // max_num_ref_frames
     w.bit(0); // gaps_in_frame_num_value_allowed_flag
     w.ue(0);  // pic_width_in_mbs_minus1
@@ -80,20 +87,22 @@ QByteArray makeSps(uint32_t numUnitsInTick, uint32_t timeScale, bool fixedFrameR
     w.bit(1); // frame_mbs_only_flag
     w.bit(0); // direct_8x8_inference_flag
     w.bit(0); // frame_cropping_flag
-    w.bit(1); // vui_parameters_present_flag
-    w.bit(0); // aspect_ratio_info_present_flag
-    w.bit(0); // overscan_info_present_flag
-    w.bit(0); // video_signal_type_present_flag
-    w.bit(0); // chroma_loc_info_present_flag
-    w.bit(1); // timing_info_present_flag
-    w.u(numUnitsInTick, 32);
-    w.u(timeScale, 32);
-    w.bit(fixedFrameRate ? 1 : 0);
-    w.bit(0); // nal_hrd_parameters_present_flag
-    w.bit(0); // vcl_hrd_parameters_present_flag
-    w.bit(1); // pic_struct_present_flag
-    w.bit(0); // bitstream_restriction_flag
-    w.bit(1); // rbsp_stop_one_bit
+    w.bit(vuiPresent);
+    if (vuiPresent) {
+        w.bit(0); // aspect_ratio_info_present_flag
+        w.bit(0); // overscan_info_present_flag
+        w.bit(0); // video_signal_type_present_flag
+        w.bit(0); // chroma_loc_info_present_flag
+        w.bit(1); // timing_info_present_flag
+        w.u(numUnitsInTick, 32);
+        w.u(timeScale, 32);
+        w.bit(fixedFrameRate ? 1 : 0);
+        w.bit(0); // nal_hrd_parameters_present_flag
+        w.bit(0); // vcl_hrd_parameters_present_flag
+        w.bit(1); // pic_struct_present_flag
+        w.bit(0); // bitstream_restriction_flag
+    }
+    if (writeTrailingBits) w.bit(1); // rbsp_stop_one_bit
 
     QByteArray out;
     out.append(char(0x67)); // NAL header: nal_unit_type = 7 (SPS)
@@ -243,6 +252,68 @@ void TestSpsFrameRate::rejectsMalformedEmulationPrevention() {
         QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {rawSps}));
         QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
     }
+}
+
+void TestSpsFrameRate::rejectsInvalidH264SpsNalHeader() {
+    QByteArray sps = makeSps(1, 50);
+    sps[0] = char(0x07); // nal_ref_idc equal to zero is forbidden for SPS NAL units
+
+    QVERIFY(!parseSpsFrameRate(NativeVideoCodec::H264, sps).valid());
+    H26xTimingContext context;
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {sps}));
+    QVERIFY(context.h264() != nullptr);
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+    QVERIFY(!context.constantFrameRate().valid());
+}
+
+void TestSpsFrameRate::rejectsOutOfRangeCoreSyntax_data() {
+    QTest::addColumn<int>("sequenceParameterSetId");
+    QTest::addColumn<int>("log2MaxFrameNumMinus4");
+    QTest::addColumn<int>("log2MaxPicOrderCntLsbMinus4");
+
+    QTest::newRow("seq_parameter_set_id 32") << 32 << 0 << 0;
+    QTest::newRow("log2_max_frame_num_minus4 13") << 0 << 13 << 0;
+    QTest::newRow("log2_max_pic_order_cnt_lsb_minus4 13") << 0 << 0 << 13;
+}
+
+void TestSpsFrameRate::rejectsOutOfRangeCoreSyntax() {
+    QFETCH(int, sequenceParameterSetId);
+    QFETCH(int, log2MaxFrameNumMinus4);
+    QFETCH(int, log2MaxPicOrderCntLsbMinus4);
+
+    const QByteArray sps =
+        makeSps(1, 50, true, false, uint32_t(sequenceParameterSetId),
+                uint32_t(log2MaxFrameNumMinus4), uint32_t(log2MaxPicOrderCntLsbMinus4));
+    H26xTimingContext context;
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {sps}));
+    QVERIFY(context.h264() != nullptr);
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+    QVERIFY(!context.constantFrameRate().valid());
+}
+
+void TestSpsFrameRate::noVuiStillRequiresCompleteRbsp_data() {
+    QTest::addColumn<bool>("writeTrailingBits");
+    QTest::addColumn<QByteArray>("tail");
+    QTest::addColumn<bool>("expectedValid");
+
+    QTest::newRow("exact no-VUI RBSP") << true << QByteArray() << true;
+    QTest::newRow("missing rbsp_stop_one_bit") << false << QByteArray() << false;
+    QTest::newRow("appended nonzero byte") << true << QByteArray::fromHex("55") << false;
+    QTest::newRow("appended zero byte") << true << QByteArray::fromHex("00") << false;
+}
+
+void TestSpsFrameRate::noVuiStillRequiresCompleteRbsp() {
+    QFETCH(bool, writeTrailingBits);
+    QFETCH(QByteArray, tail);
+    QFETCH(bool, expectedValid);
+
+    const QByteArray sps = makeSps(1, 50, true, false, 0, 0, 0, false, writeTrailingBits) + tail;
+    H26xTimingContext context;
+    QCOMPARE(context.updateParameterSets(NativeVideoCodec::H264, {}, {sps}), expectedValid);
+    QVERIFY(context.h264() != nullptr);
+    QCOMPARE(context.h264()->status,
+             expectedValid ? H26xTimingSyntaxStatus::Valid : H26xTimingSyntaxStatus::Malformed);
+    QVERIFY(!context.constantFrameRate().valid());
 }
 
 void TestSpsFrameRate::rejectsBytesAfterRbspTrailingBits_data() {

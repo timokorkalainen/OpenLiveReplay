@@ -36,6 +36,8 @@ private slots:
     void h264ValidatesPartialTimestampFields();
     void h264RejectsInvalidPayloadAlignment();
     void h264RejectsMalformedEmulationPrevention();
+    void h264RejectsInvalidSeiNalHeaders_data();
+    void h264RejectsInvalidSeiNalHeaders();
     void h264AnnexBTrailingZeroBytesAreNotNalPayload();
     void rawEbspTrailingZeroBytesRemainStrict();
     void h264MalformedContextIsNotUnsupported();
@@ -1161,6 +1163,39 @@ void TestH26xSeiTimecode::h264RejectsMalformedEmulationPrevention() {
     const auto splitResult = extractH26xSeiTimecode(separatedNals, NativeVideoCodec::H264, context);
     QVERIFY(splitResult.valid);
     QCOMPARE(splitResult.frames, 4);
+}
+
+void TestH26xSeiTimecode::h264RejectsInvalidSeiNalHeaders_data() {
+    QTest::addColumn<int>("header");
+    QTest::addColumn<int>("position");
+
+    for (const int header : {0x86, 0x26}) {
+        const QString headerName = QString::number(header, 16);
+        QTest::newRow(qPrintable(QStringLiteral("0x%1 only").arg(headerName))) << header << 0;
+        QTest::newRow(qPrintable(QStringLiteral("0x%1 before valid").arg(headerName)))
+            << header << 1;
+        QTest::newRow(qPrintable(QStringLiteral("0x%1 after valid").arg(headerName)))
+            << header << 2;
+    }
+}
+
+void TestH26xSeiTimecode::h264RejectsInvalidSeiNalHeaders() {
+    QFETCH(int, header);
+    QFETCH(int, position);
+
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+
+    const QByteArray message = seiMessage(1, fullTimestampPayload(1, 2, 3, 4));
+    const QByteArray invalid = seiNal(QByteArray(1, char(header)), message);
+    const QByteArray valid = h264SeiNal(message);
+    QByteArray annexB = invalid;
+    if (position == 1) annexB += valid;
+    if (position == 2) annexB = valid + invalid;
+
+    QVERIFY(!extractH26xSeiTimecode(annexB, NativeVideoCodec::H264, context).valid);
 }
 
 void TestH26xSeiTimecode::h264AnnexBTrailingZeroBytesAreNotNalPayload() {
