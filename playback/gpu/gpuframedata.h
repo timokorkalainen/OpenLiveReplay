@@ -20,7 +20,7 @@ public:
     GpuFrameData(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuRhiContext> rhi,
                  FramePixelFormat nativeFormat, ColorMetadata color = {},
                  std::shared_ptr<GpuFence> renderFence = nullptr, GpuBudgetCharge budgetCharge = {},
-                 uint64_t gpuGeneration = 0);
+                 uint64_t gpuGeneration = 0, uint64_t renderFenceValue = 0);
     ~GpuFrameData() override;
 
     bool isGpuBacked() const override { return true; }
@@ -40,6 +40,7 @@ private:
     std::shared_ptr<GpuSurface> m_surface;
     std::shared_ptr<GpuRhiContext> m_rhi;
     std::shared_ptr<GpuFence> m_renderFence;
+    uint64_t m_renderFenceValue = 0;
     GpuBudgetCharge m_budgetCharge;
     FramePixelFormat m_nativeFormat = FramePixelFormat::Nv12;
     ColorMetadata m_color;
@@ -57,5 +58,9 @@ FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
                                std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge);
+FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
+                               std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
+                               std::shared_ptr<GpuFence> renderFence, uint64_t renderFenceValue,
+                               GpuBudgetCharge charge);
 
 #endif // OLR_GPUFRAMEDATA_H

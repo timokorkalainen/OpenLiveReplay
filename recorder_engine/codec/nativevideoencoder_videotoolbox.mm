@@ -12,6 +12,7 @@
 #include <VideoToolbox/VideoToolbox.h>
 
 #include <QList>
+#include <QScopeGuard>
 #include <vector>
 
 extern "C" {
@@ -424,8 +425,7 @@ public:
             return false;
         }
         GpuSyncReadScope readScope;
-        const GpuReadLease lease = readScope.read(surface);
-        const bool encoded = [&] {
+        return readScope.withRead(surface, [&](const GpuReadLease& lease) {
             IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
             if (!ioSurface) {
                 if (error) {
@@ -455,13 +455,10 @@ public:
                 }
                 return false;
             }
+            const auto releasePixelBuffer = qScopeGuard([pb] { CVPixelBufferRelease(pb); });
             attachColorMetadata(pb, vuiColorCodePointsFor(color));
-            const bool ok = encodePixelBuffer(pb, ptsTicks, onPacket, error);
-            CVPixelBufferRelease(pb);
-            return ok;
-        }();
-        readScope.complete();
-        return encoded;
+            return encodePixelBuffer(pb, ptsTicks, onPacket, error);
+        });
     }
 
     bool encodePixelBuffer(CVPixelBufferRef pb, int64_t ptsTicks, const PacketCallback& onPacket,

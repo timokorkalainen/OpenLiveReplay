@@ -781,8 +781,8 @@ void TestGpuCompositor::gpuNv12AliasUsesBoundedFenceWait() {
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 16;
     meta.key.height = 8;
-    FrameHandle gpuFrame =
-        makeGpuFrameHandle(std::make_shared<PendingNv12Surface>(), rhi, meta, fence);
+    FrameHandle gpuFrame = makeGpuFrameHandle(std::make_shared<PendingNv12Surface>(), rhi, meta,
+                                              fence, 1, GpuBudgetCharge{});
 
     auto aliased = GpuCompositor::uploadFrameToNv12SurfaceForTest(gpuFrame, rhi);
 

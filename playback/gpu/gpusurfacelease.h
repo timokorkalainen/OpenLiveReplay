@@ -132,6 +132,17 @@ public:
         return std::invoke(std::forward<Fn>(fn), lease);
     }
 
+    template <typename Surface, typename Fn,
+              typename = std::enable_if_t<std::is_base_of_v<GpuSurface, Surface>>>
+    decltype(auto) withRead(Surface* surface, Fn&& fn) {
+        const GpuReadLease lease = read(static_cast<GpuSurface*>(surface));
+        struct CompleteOnExit {
+            GpuSyncReadScope* scope;
+            ~CompleteOnExit() { scope->complete(); }
+        } completeOnExit{this};
+        return std::invoke(std::forward<Fn>(fn), lease);
+    }
+
 private:
     void beginRead() {
         Q_ASSERT_X(m_state.active, "GpuSyncReadScope::read",

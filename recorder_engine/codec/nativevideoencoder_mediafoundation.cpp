@@ -833,8 +833,7 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
 
     ComPtr<IMFMediaBuffer> buffer;
     GpuSyncReadScope readScope;
-    const GpuReadLease lease = readScope.read(surface);
-    const bool wrapped = [&] {
+    const bool wrapped = readScope.withRead(surface, [&](const GpuReadLease& lease) {
         auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         if (!texture) {
             if (error) {
@@ -858,8 +857,7 @@ bool MediaFoundationEncoder::buildSurfaceSample(GpuSurface* surface, int64_t pts
             return false;
         }
         return true;
-    }();
-    readScope.complete();
+    });
     if (!wrapped) return false;
 
     const LONGLONG stampedTime = m_nextSampleTime;

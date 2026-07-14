@@ -38,19 +38,18 @@ struct GpuFrameData::CpuCacheEntry {
 GpuFrameData::GpuFrameData(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuRhiContext> rhi,
                            FramePixelFormat nativeFormat, ColorMetadata color,
                            std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge budgetCharge,
-                           uint64_t gpuGeneration)
+                           uint64_t gpuGeneration, uint64_t renderFenceValue)
     : m_surface(std::move(surface)), m_rhi(std::move(rhi)), m_renderFence(std::move(renderFence)),
-      m_budgetCharge(std::move(budgetCharge)), m_nativeFormat(nativeFormat), m_color(color),
-      m_gpuGeneration(gpuGeneration) {}
+      m_renderFenceValue(renderFenceValue), m_budgetCharge(std::move(budgetCharge)),
+      m_nativeFormat(nativeFormat), m_color(color), m_gpuGeneration(gpuGeneration) {}
 
 GpuFrameData::~GpuFrameData() = default;
 
 bool GpuFrameData::waitForPendingFence(int timeoutMs) const {
     if (!m_surface) return false;
-    const uint64_t pendingFence = m_surface->pendingFenceValue();
-    if (pendingFence == 0) return true;
-    if (!m_renderFence) return true;
-    return m_renderFence->wait(pendingFence, timeoutMs);
+    if (m_renderFenceValue == 0) return true;
+    if (!m_renderFence) return false;
+    return m_renderFence->wait(m_renderFenceValue, timeoutMs);
 }
 
 CpuPlanes GpuFrameData::cachedCpuPlanes(FramePixelFormat target) const {
@@ -141,12 +140,20 @@ FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
 FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
                                std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
                                std::shared_ptr<GpuFence> renderFence, GpuBudgetCharge charge) {
+    return makeGpuFrameHandle(std::move(surface), std::move(rhi), std::move(meta),
+                              std::move(renderFence), 0, std::move(charge));
+}
+
+FrameHandle makeGpuFrameHandle(std::shared_ptr<GpuSurface> surface,
+                               std::shared_ptr<GpuRhiContext> rhi, FrameMetadata meta,
+                               std::shared_ptr<GpuFence> renderFence, uint64_t renderFenceValue,
+                               GpuBudgetCharge charge) {
     const GpuSurfaceDesc desc = surface ? surface->desc() : GpuSurfaceDesc{};
     if (meta.key.width <= 0) meta.key.width = desc.width;
     if (meta.key.height <= 0) meta.key.height = desc.height;
     meta.key.format = desc.format;
-    auto data = std::make_shared<GpuFrameData>(std::move(surface), std::move(rhi), meta.key.format,
-                                               meta.color, std::move(renderFence),
-                                               std::move(charge), meta.gpuGeneration);
+    auto data = std::make_shared<GpuFrameData>(
+        std::move(surface), std::move(rhi), meta.key.format, meta.color, std::move(renderFence),
+        std::move(charge), meta.gpuGeneration, renderFenceValue);
     return FrameHandle(std::move(data), meta);
 }

@@ -53,14 +53,19 @@ public:
         : GpuFence(deviceDomainId, authorityEpoch) {}
 
     uint64_t signal() override { return ++m_value; }
-    bool wait(uint64_t value, int) override { return m_completed >= value; }
+    bool wait(uint64_t value, int) override {
+        m_lastWait = value;
+        return m_completed >= value;
+    }
     uint64_t completedValue() const override { return m_completed; }
     uint64_t lastSignaledValue() const { return m_value; }
+    uint64_t lastWaitValue() const { return m_lastWait; }
     void complete(uint64_t value) { m_completed = value; }
 
 private:
     uint64_t m_value = 0;
     uint64_t m_completed = 0;
+    uint64_t m_lastWait = 0;
 };
 
 class ZeroByteSurface final : public GpuSurface {
@@ -362,9 +367,14 @@ void TestGpuSurfaceAllocator::headroomMintsChargedGpuHandle() {
     QVERIFY(r.handle.isGpuBacked());
     QVERIFY(!r.degradedToCpu);
     QVERIFY(renderFence->lastSignaledValue() > uint64_t(0));
+    const auto* frameData = dynamic_cast<const GpuFrameData*>(r.handle.data());
+    QVERIFY(frameData != nullptr);
+    QVERIFY(!frameData->waitForPendingFence(0));
+    QCOMPARE(renderFence->lastWaitValue(), renderFence->lastSignaledValue());
     QCOMPARE(retireRegistry.diagnostics().pendingRetains, pendingBefore + 1);
     QVERIFY(b.liveBytes() > 0);
     renderFence->complete(renderFence->lastSignaledValue());
+    QVERIFY(frameData->waitForPendingFence(0));
     retireRegistry.drainCompleted();
     QCOMPARE(retireRegistry.diagnostics().pendingRetains, pendingBefore);
 }

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
+import re
 import sys
 from pathlib import Path
+
+
+TOKEN_RE = re.compile(r"[A-Za-z_]\w*|::|->|==|!=|&&|\|\||[{}()\[\].,;:&*!<>+=/-]")
 
 
 def require(condition, message):
@@ -8,100 +12,317 @@ def require(condition, message):
         raise AssertionError(message)
 
 
-def block(source, begin, end):
-    start = source.find(begin)
-    require(start >= 0, f"could not locate {begin!r}")
-    stop = source.find(end, start)
-    require(stop >= 0, f"could not locate {end!r} after {begin!r}")
-    return source[start:stop]
+def strip_comments_and_literals(source):
+    """Remove comments and quoted contents while preserving offsets and newlines."""
+    chars = list(source)
+    index = 0
+    state = "code"
+    quote = ""
+    while index < len(chars):
+        current = chars[index]
+        following = chars[index + 1] if index + 1 < len(chars) else ""
+        if state == "code":
+            if current == "/" and following == "/":
+                chars[index] = chars[index + 1] = " "
+                index += 2
+                state = "line_comment"
+                continue
+            if current == "/" and following == "*":
+                chars[index] = chars[index + 1] = " "
+                index += 2
+                state = "block_comment"
+                continue
+            if current in ('"', "'"):
+                quote = current
+                chars[index] = " "
+                index += 1
+                state = "literal"
+                continue
+        elif state == "line_comment":
+            if current == "\n":
+                state = "code"
+            else:
+                chars[index] = " "
+        elif state == "block_comment":
+            if current == "*" and following == "/":
+                chars[index] = chars[index + 1] = " "
+                index += 2
+                state = "code"
+                continue
+            if current != "\n":
+                chars[index] = " "
+        else:
+            if current == "\\":
+                chars[index] = " "
+                if index + 1 < len(chars) and chars[index + 1] != "\n":
+                    chars[index + 1] = " "
+                index += 2
+                continue
+            chars[index] = " " if current != "\n" else "\n"
+            if current == quote:
+                state = "code"
+        index += 1
+    require(state not in ("block_comment", "literal"), "unterminated comment or literal")
+    return "".join(chars)
 
 
-def ordered(source, markers, message):
-    position = -1
-    for marker in markers:
-        position = source.find(marker, position + 1)
-        require(position >= 0, f"{message}: missing or out-of-order {marker!r}")
+def matching_character(source, opening, open_char, close_char):
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == open_char:
+            depth += 1
+        elif source[index] == close_char:
+            depth -= 1
+            if depth == 0:
+                return index
+    raise AssertionError(f"unmatched {open_char!r} at offset {opening}")
+
+
+def function_block(source, signature):
+    cleaned = strip_comments_and_literals(source)
+    start = cleaned.find(signature)
+    require(start >= 0, f"could not locate function {signature!r}")
+    opening = cleaned.find("{", start)
+    require(opening >= 0, f"could not locate body for {signature!r}")
+    closing = matching_character(cleaned, opening, "{", "}")
+    return cleaned[opening:closing + 1]
+
+
+def tokens(source):
+    return [(match.group(0), match.start()) for match in TOKEN_RE.finditer(source)]
+
+
+def token_pairs(items, open_token, close_token):
+    stack = []
+    pairs = {}
+    for index, (token, _) in enumerate(items):
+        if token == open_token:
+            stack.append(index)
+        elif token == close_token:
+            require(stack, f"unmatched token {close_token!r}")
+            opening = stack.pop()
+            pairs[opening] = index
+            pairs[index] = opening
+    require(not stack, f"unmatched token {open_token!r}")
+    return pairs
+
+
+def is_obviously_unreachable(items, call_index, brace_pairs):
+    depth = 0
+    statement_start = 0
+    returned_at_depth = set()
+    for index, (token, _) in enumerate(items[:call_index]):
+        if token == "{":
+            depth += 1
+            statement_start = index + 1
+        elif token == "}":
+            returned_at_depth.discard(depth)
+            depth -= 1
+            statement_start = index + 1
+        elif token == ";":
+            statement = [value for value, _ in items[statement_start:index + 1]]
+            if statement and statement[0] == "return":
+                returned_at_depth.add(depth)
+            statement_start = index + 1
+    if depth in returned_at_depth:
+        return True
+
+    for opening, closing in brace_pairs.items():
+        if opening >= closing or not (opening < call_index < closing):
+            continue
+        prefix = [value for value, _ in items[max(0, opening - 4):opening]]
+        if prefix == ["if", "(", "false", ")"]:
+            return True
+    return False
+
+
+def structured_read_regions(function, label):
+    items = tokens(function)
+    parens = token_pairs(items, "(", ")")
+    braces = token_pairs(items, "{", "}")
+    regions = []
+    for index, (token, _) in enumerate(items):
+        if token != "withRead" or index + 1 >= len(items) or items[index + 1][0] != "(":
+            continue
+        call_close = parens[index + 1]
+        lambda_open = next(
+            (candidate for candidate in range(index + 2, call_close)
+             if items[candidate][0] == "{"),
+            None,
+        )
+        require(lambda_open is not None, f"{label}: withRead has no callback body")
+        lambda_close = braces[lambda_open]
+        require(lambda_close < call_close, f"{label}: callback escapes withRead call")
+        require(not is_obviously_unreachable(items, index, braces),
+                f"{label}: withRead is unreachable")
+        regions.append((items[lambda_open][1], items[lambda_close][1]))
+    require(regions, f"{label}: no reachable withRead callback")
+    return function, regions
+
+
+def in_any_region(position, regions):
+    return any(start < position < stop for start, stop in regions)
+
+
+def audit_structured_access(function, label, required_identifiers=()):
+    function, regions = structured_read_regions(function, label)
+    items = tokens(function)
+    for token, position in items:
+        if token == "nativeHandle":
+            require(in_any_region(position, regions),
+                    f"{label}: nativeHandle access escapes withRead callback")
+        if token in ("read", "complete"):
+            require(False, f"{label}: path-sensitive manual {token} is forbidden")
+    for identifier in required_identifiers:
+        positions = [position for token, position in items if token == identifier]
+        require(positions and all(in_any_region(position, regions) for position in positions),
+                f"{label}: {identifier} must execute inside withRead callback")
+    return function, regions
+
+
+def expect_rejected(source, message):
+    try:
+        audit_structured_access(function_block(source, "bool probe"), "mutation", ("use",))
+    except AssertionError:
+        return
+    raise AssertionError(message)
+
+
+def mutation_self_tests():
+    safe = """
+bool probe() {
+    GpuSyncReadScope scope;
+    return scope.withRead(surface, [&](const GpuReadLease& lease) {
+        use(lease.nativeHandle());
+        return true;
+    });
+}
+"""
+    audit_structured_access(function_block(safe, "bool probe"), "safe mutation", ("use",))
+    expect_rejected("""
+bool probe() {
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    if (failure) return false;
+    use(lease.nativeHandle());
+    scope.complete();
+    return true;
+}
+""", "manual read with an early return must be rejected")
+    expect_rejected("""
+bool probe() {
+    GpuSyncReadScope scope;
+    auto lease = scope.read(surface);
+    use(lease.nativeHandle());
+    // scope.withRead(surface, [&](auto& lease) { use(lease.nativeHandle()); });
+    const char* fake = "scope.withRead nativeHandle use";
+    return false;
+}
+""", "comment/string markers must not satisfy the audit")
+    expect_rejected("""
+bool probe() {
+    return false;
+    GpuSyncReadScope scope;
+    return scope.withRead(surface, [&](const GpuReadLease& lease) {
+        use(lease.nativeHandle());
+        return true;
+    });
+}
+""", "unreachable withRead markers must not satisfy the audit")
 
 
 def main():
-    if len(sys.argv) != 5:
+    if len(sys.argv) != 9:
         raise SystemExit(
             "usage: test_gpu_scope_completion_static.py "
             "<nativevideoencoder_videotoolbox.mm> "
             "<nativevideoencoder_mediafoundation.cpp> "
-            "<applegpusurface_apple.mm> <wingpuimportedge.cpp>"
+            "<applegpusurface_apple.mm> <wingpuimportedge.cpp> "
+            "<gpuframedata.cpp> <gpusurfaceallocator.cpp> "
+            "<vtkeepsurfaceimporter_apple.mm> <gpucompositor.cpp>"
         )
 
+    mutation_self_tests()
     videotoolbox = Path(sys.argv[1]).read_text(encoding="utf-8")
     mediafoundation = Path(sys.argv[2]).read_text(encoding="utf-8")
     apple_surface = Path(sys.argv[3]).read_text(encoding="utf-8")
     win_import = Path(sys.argv[4]).read_text(encoding="utf-8")
+    frame_data = Path(sys.argv[5]).read_text(encoding="utf-8")
+    allocator = Path(sys.argv[6]).read_text(encoding="utf-8")
+    vt_importer = Path(sys.argv[7]).read_text(encoding="utf-8")
+    compositor = Path(sys.argv[8]).read_text(encoding="utf-8")
 
-    vt_encode = block(videotoolbox, "bool encodeSurface", "bool encodePixelBuffer")
-    require(vt_encode.count("readScope.complete();") == 1,
-            "VideoToolbox encodeSurface must complete its read scope exactly once")
-    ordered(vt_encode, [
-        "GpuSyncReadScope readScope;",
-        "readScope.read(surface)",
-        "lease.nativeHandle()",
-        "CVPixelBufferCreateWithIOSurface",
-        "encodePixelBuffer(pb",
-        "CVPixelBufferRelease(pb);",
-        "readScope.complete();",
-        "return encoded;",
-    ], "VideoToolbox encodeSurface must retain native access through the encode call")
+    vt_encode, vt_regions = audit_structured_access(
+        function_block(videotoolbox, "bool encodeSurface"),
+        "VideoToolbox encodeSurface",
+        ("CVPixelBufferCreateWithIOSurface", "qScopeGuard", "encodePixelBuffer"),
+    )
+    vt_tokens = tokens(vt_encode)
+    vt_parens = token_pairs(vt_tokens, "(", ")")
+    vt_braces = token_pairs(vt_tokens, "{", "}")
+    scope_guard_index = next(index for index, (token, _) in enumerate(vt_tokens)
+                             if token == "qScopeGuard")
+    require(vt_tokens[scope_guard_index + 1][0] == "(",
+            "VideoToolbox qScopeGuard must own a release callback")
+    guard_call_close = vt_parens[scope_guard_index + 1]
+    guard_lambda_open = next(index for index in range(scope_guard_index + 2, guard_call_close)
+                             if vt_tokens[index][0] == "{")
+    guard_lambda_close = vt_braces[guard_lambda_open]
+    release_positions = [position for token, position in vt_tokens
+                         if token == "CVPixelBufferRelease"]
+    require(len(release_positions) == 1 and
+            vt_tokens[guard_lambda_open][1] < release_positions[0] <
+            vt_tokens[guard_lambda_close][1],
+            "VideoToolbox CVPixelBuffer release must be owned only by qScopeGuard")
+    positions = {identifier: next(position for token, position in vt_tokens
+                                  if token == identifier)
+                 for identifier in ("CVPixelBufferCreateWithIOSurface", "qScopeGuard",
+                                    "encodePixelBuffer")}
+    require(positions["CVPixelBufferCreateWithIOSurface"] < positions["qScopeGuard"] <
+            positions["encodePixelBuffer"] and
+            all(in_any_region(position, vt_regions) for position in positions.values()),
+            "VideoToolbox pixel-buffer RAII must arm before the throwing callback path")
 
-    mf_sample = block(mediafoundation, "bool MediaFoundationEncoder::buildSurfaceSample",
-                      "int64_t MediaFoundationEncoder::resolvePtsTicks")
-    require(mf_sample.count("readScope.complete();") == 1,
-            "Media Foundation buildSurfaceSample must complete its read scope exactly once")
-    ordered(mf_sample, [
-        "GpuSyncReadScope readScope;",
-        "readScope.read(surface)",
-        "lease.nativeHandle()",
-        "MFCreateDXGISurfaceBuffer",
-        "}();",
-        "readScope.complete();",
-        "if (!wrapped) return false;",
-    ], "Media Foundation must keep the native texture leased until wrapping finishes")
+    audit_structured_access(
+        function_block(mediafoundation, "bool MediaFoundationEncoder::buildSurfaceSample"),
+        "Media Foundation buildSurfaceSample", ("MFCreateDXGISurfaceBuffer",))
+    audit_structured_access(
+        function_block(apple_surface, "CVPixelBufferRef retainApplePixelBufferWrapper"),
+        "Apple wrapper creation", ("CVPixelBufferCreateWithIOSurface",))
+    audit_structured_access(
+        function_block(win_import, "WinGpuImportEdge::createFenceForSurface"),
+        "Windows fence creation", ("makeD3D11GpuFence",))
+    win_readback, win_regions = audit_structured_access(
+        function_block(win_import, "CpuPlanes D3D11IGpuFrameData::readToCpu"),
+        "Windows readback", ("Map", "Unmap"))
+    readback_tokens = tokens(win_readback)
+    map_position = next(position for token, position in readback_tokens if token == "Map")
+    unmap_position = next(position for token, position in readback_tokens if token == "Unmap")
+    require(map_position < unmap_position and in_any_region(unmap_position, win_regions),
+            "Windows readback must unmap before its structured callback completes")
 
-    apple_wrap = block(apple_surface, "CVPixelBufferRef retainApplePixelBufferWrapper",
-                       "CpuPlanes readAppleSurfaceToCpu")
-    require("scope.withRead(surface" in apple_wrap,
-            "Apple wrapper creation must use structured read-scope completion")
-    ordered(apple_wrap, [
-        "scope.withRead(surface",
-        "lease.nativeHandle()",
-        "CVPixelBufferCreateWithIOSurface",
-        "});",
-    ], "Apple wrapper creation must occur inside the structured read callback")
+    exact_wait = function_block(frame_data, "bool GpuFrameData::waitForPendingFence")
+    exact_wait_tokens = [token for token, _ in tokens(exact_wait)]
+    require("pendingFenceValue" not in exact_wait_tokens,
+            "generic GPU frame waits must never consult the shared surface watermark")
+    require(exact_wait_tokens.count("m_renderFenceValue") >= 2 and
+            "m_renderFence" in exact_wait_tokens and "wait" in exact_wait_tokens,
+            "generic GPU frame waits must use their stored exact fence/value pair")
 
-    win_fence = block(win_import, "WinGpuImportEdge::createFenceForSurface",
-                      "std::shared_ptr<GpuFence> WinGpuImportEdge::createFence()")
-    require("scope.withRead(surface" in win_fence,
-            "Windows fence creation must use structured read-scope completion")
-    ordered(win_fence, [
-        "scope.withRead(surface",
-        "lease.nativeHandle()",
-        "makeD3D11GpuFence",
-        "});",
-    ], "Windows fence creation must finish inside the structured read callback")
+    allocator_mint = function_block(allocator, "std::shared_ptr<GpuRhiContext> rhi")
+    require(re.search(r"makeGpuFrameHandle\s*\([^;]*result\s*\.\s*fenceValue", allocator_mint,
+                      re.DOTALL),
+            "allocator mint must carry the exact submission fence value into GpuFrameData")
+    vt_import = function_block(vt_importer, "FrameHandle importVtSurface")
+    require(re.search(r"renderFenceValue\s*=\s*result\s*\.\s*fenceValue", vt_import) and
+            re.search(r"makeGpuFrameHandle\s*\([^;]*renderFenceValue", vt_import, re.DOTALL),
+            "VT import must carry the exact submission fence value into GpuFrameData")
+    composite = function_block(compositor, "FrameHandle GpuCompositor::composeGridForGeneration")
+    require(re.search(r"makeGpuFrameHandle\s*\([^;]*submission\s*\.\s*fenceValue", composite,
+                      re.DOTALL),
+            "compositor output must carry the exact submission fence value into GpuFrameData")
 
-    win_readback = block(win_import, "CpuPlanes D3D11IGpuFrameData::readToCpu",
-                         "CpuPlanes D3D11IGpuFrameData::cachedCpuPlanes")
-    require("readScope.complete();" not in win_readback,
-            "Windows readback must not reintroduce path-sensitive manual completion")
-    ordered(win_readback, [
-        "readScope.withRead(m_surface",
-        "lease.nativeHandle()",
-        "ctx->Map",
-        "ctx->Unmap",
-        "return true;",
-        "});",
-        "if (!nativeReadComplete) return out;",
-    ], "Windows readback must unmap before its structured read callback completes")
-
-    print("PASS: GPU native-handle scopes cover wrapping, encoding, and readback operations")
+    print("PASS: parsed GPU scope and exact-fence contracts are mutation-resistant")
 
 
 if __name__ == "__main__":

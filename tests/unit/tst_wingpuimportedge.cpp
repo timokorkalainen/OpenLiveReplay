@@ -79,6 +79,8 @@ private slots:
     void createConsistentWithProbe();
     void nullSampleYieldsFallbackNullopt();
     void surfaceKeepsTextureAndTracksFence();
+    void surfaceRejectsSuppliedDeviceMismatch();
+    void surfaceRejectsNonNv12Texture();
     void edgeRejectsForeignD3D11Device();
     void frameRejectsForeignFenceTimeline();
     void importedFrameExposesRenderFence();
@@ -172,6 +174,8 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
     ComPtr<ID3D11Texture2D> texture;
     QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
 
+    QVERIFY(D3D11GpuSurface::createKept(device, texture, 0, 1279, 720) == nullptr);
+    QVERIFY(D3D11GpuSurface::createKept(device, texture, 1, 1280, 720) == nullptr);
     auto surface = D3D11GpuSurface::createKept(device, texture, 0, 1280, 720);
     QVERIFY(surface != nullptr);
     QVERIFY(surface->isValid());
@@ -192,6 +196,57 @@ void TestWinGpuImportEdge::surfaceKeepsTextureAndTracksFence() {
     surface.reset();
     QCOMPARE(static_cast<ID3D11Texture2D*>(lease.nativeHandle()), texture.Get());
     readScope.complete();
+#endif
+}
+
+void TestWinGpuImportEdge::surfaceRejectsSuppliedDeviceMismatch() {
+#ifndef _WIN32
+    QSKIP("D3D11GpuSurface is Windows-only");
+#else
+    ComPtr<ID3D11Device> textureDevice;
+    ComPtr<ID3D11DeviceContext> textureContext;
+    ComPtr<ID3D11Device> suppliedDevice;
+    ComPtr<ID3D11DeviceContext> suppliedContext;
+    if (!createTestD3D11Device(&textureDevice, &textureContext) ||
+        !createTestD3D11Device(&suppliedDevice, &suppliedContext)) {
+        QSKIP("two D3D11 devices are unavailable");
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(textureDevice->CreateTexture2D(&desc, nullptr, &texture)));
+
+    QVERIFY(D3D11GpuSurface::createKept(suppliedDevice, texture, 0, 64, 64) == nullptr);
+#endif
+}
+
+void TestWinGpuImportEdge::surfaceRejectsNonNv12Texture() {
+#ifndef _WIN32
+    QSKIP("D3D11GpuSurface is Windows-only");
+#else
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    if (!createTestD3D11Device(&device, &context)) QSKIP("no D3D11 test device available");
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    ComPtr<ID3D11Texture2D> texture;
+    QVERIFY(SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &texture)));
+
+    QVERIFY(D3D11GpuSurface::createKept(device, texture, 0, 64, 64) == nullptr);
 #endif
 }
 

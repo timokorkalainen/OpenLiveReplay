@@ -35,6 +35,7 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
     meta.key.format = FramePixelFormat::Nv12;
     if (meta.key.width <= 0) meta.key.width = desc.width;
     if (meta.key.height <= 0) meta.key.height = desc.height;
+    uint64_t renderFenceValue = 0;
     if (renderFence) {
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
@@ -42,9 +43,10 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
         const auto result = operation.submit(
             adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
         if (!result.succeeded()) return FrameHandle{};
+        renderFenceValue = result.fenceValue;
     }
     return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence),
-                              std::move(*charge));
+                              renderFenceValue, std::move(*charge));
 }
 
 #endif // __APPLE__

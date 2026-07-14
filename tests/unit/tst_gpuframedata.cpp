@@ -25,6 +25,8 @@ private slots:
     void gpuBackedReportsSurface();
     void completedReadbackRetainReleasesImmediately();
     void waitForPendingFenceUsesProducerFence();
+    void exactFenceWaitIgnoresOtherTimelineWatermark();
+    void exactFenceWaitHandlesZeroAndRejectsMissingFence();
     void droppingGpuHandleCreditsBudget();
 #ifdef __APPLE__
     void gpuPresentabilityDoesNotReadBack();
@@ -46,9 +48,16 @@ class DeferredFence final : public GpuFence {
 public:
     DeferredFence() : GpuFence(0xD3F3, 1) {}
     uint64_t signal() override { return m_next.fetch_add(1, std::memory_order_acq_rel) + 1; }
-    bool wait(uint64_t value, int) override { return completedValue() >= value; }
+    bool wait(uint64_t value, int) override {
+        waitCalls.fetch_add(1, std::memory_order_acq_rel);
+        lastWaitValue.store(value, std::memory_order_release);
+        return completedValue() >= value;
+    }
     uint64_t completedValue() const override { return m_completed.load(std::memory_order_acquire); }
     void complete(uint64_t value) { m_completed.store(value, std::memory_order_release); }
+
+    std::atomic<int> waitCalls{0};
+    std::atomic<uint64_t> lastWaitValue{0};
 
 private:
     std::atomic<uint64_t> m_next{0};
@@ -133,10 +142,42 @@ void TestGpuFrameData::waitForPendingFenceUsesProducerFence() {
     auto surface = std::make_shared<TestSurface>();
     surface->retainUntilFenceRetired(1);
 
-    GpuFrameData data(surface, nullptr, FramePixelFormat::Nv12, {}, fence);
+    GpuFrameData data(surface, nullptr, FramePixelFormat::Nv12, {}, fence, {}, 0, 1);
     QVERIFY(!data.waitForPendingFence(0));
     fence->complete(1);
     QVERIFY(data.waitForPendingFence(0));
+    QCOMPARE(fence->lastWaitValue.load(std::memory_order_acquire), uint64_t(1));
+}
+
+void TestGpuFrameData::exactFenceWaitIgnoresOtherTimelineWatermark() {
+    auto producerFence = std::make_shared<DeferredFence>();
+    auto otherFence = std::make_shared<DeferredFence>();
+    auto surface = std::make_shared<TestSurface>();
+    const uint64_t producerFenceValue = producerFence->signal();
+    surface->retainUntilFenceRetired(producerFenceValue);
+    for (int i = 0; i < 4; ++i) {
+        surface->retainUntilFenceRetired(otherFence->signal());
+    }
+    QCOMPARE(surface->pendingFenceValue(), uint64_t(4));
+
+    GpuFrameData data(surface, nullptr, FramePixelFormat::Nv12, {}, producerFence, {}, 0,
+                      producerFenceValue);
+    producerFence->complete(producerFenceValue);
+    QVERIFY(data.waitForPendingFence(0));
+    QCOMPARE(producerFence->lastWaitValue.load(std::memory_order_acquire), producerFenceValue);
+}
+
+void TestGpuFrameData::exactFenceWaitHandlesZeroAndRejectsMissingFence() {
+    auto fence = std::make_shared<DeferredFence>();
+    auto surface = std::make_shared<TestSurface>();
+    surface->retainUntilFenceRetired(9);
+
+    GpuFrameData noSubmission(surface, nullptr, FramePixelFormat::Nv12, {}, fence, {}, 0, 0);
+    QVERIFY(noSubmission.waitForPendingFence(0));
+    QCOMPARE(fence->waitCalls.load(std::memory_order_acquire), 0);
+
+    GpuFrameData mismatchedPair(surface, nullptr, FramePixelFormat::Nv12, {}, nullptr, {}, 0, 1);
+    QVERIFY(!mismatchedPair.waitForPendingFence(0));
 }
 
 void TestGpuFrameData::droppingGpuHandleCreditsBudget() {

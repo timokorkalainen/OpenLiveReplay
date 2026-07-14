@@ -200,7 +200,11 @@ if(OLR_PYTHON3_EXECUTABLE)
             "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_videotoolbox.mm"
             "${CMAKE_SOURCE_DIR}/recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/applegpusurface_apple.mm"
-            "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp")
+            "${CMAKE_SOURCE_DIR}/playback/output/win/wingpuimportedge.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp")
     set_tests_properties(tst_gpu_scope_completion_static PROPERTIES
         LABELS "unit;ci;gpu-capability"
         TIMEOUT 30)
