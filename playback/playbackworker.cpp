@@ -468,7 +468,18 @@ PlaybackWorker::validatedOutputCommitPlayheadLocked(const OutputCommit& commit,
     qint64 committedPlayheadMs = commit.playheadMs;
     if (m_outputFeedCount > 0) {
         if (!coverageCache) return std::nullopt;
-        if (commit.coverageMode == OutputCoverageMode::Displayable) {
+        // Graph/device recovery may have only placeholders after dead GPU frames
+        // are removed. That state is allowed to republish and reset the epoch only
+        // while preserving the already committed seek/playhead identity. Real and
+        // hold-last commits still have to pass normal generation-aware coverage.
+        const bool placeholderRecoveryCommit =
+            !commit.requireCurrentSeek && commit.cacheAction == OutputCacheAction::Publish &&
+            commit.guardPlayheadCache && coverageCache->videoFramesSnapshot().isEmpty() &&
+            commit.seekGeneration == m_committedGeneration.load(std::memory_order_acquire) &&
+            commit.playheadMs == m_committedPlayheadMs.load(std::memory_order_acquire);
+        if (placeholderRecoveryCommit) {
+            committedPlayheadMs = commit.playheadMs;
+        } else if (commit.coverageMode == OutputCoverageMode::Displayable) {
             const std::optional<qint64> displayable = outputCacheDisplayablePlayheadInCacheLocked(
                 *coverageCache, commit.playheadMs, commit.gpuGeneration);
             if (!displayable.has_value()) return std::nullopt;
@@ -1610,10 +1621,11 @@ void PlaybackWorker::handleGpuDeviceLoss() {
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::RebuildPending),
                              std::memory_order_release);
     const uint64_t lossGeneration = GpuDeviceLossMonitor::instance().recordLoss();
-    m_committedGpuGeneration.store(lossGeneration, std::memory_order_release);
     int recoveredFrames = 0;
     int removedGpuFrames = 0;
+    OutputCommitResult recoveryCommit;
     {
+        QMutexLocker locker(&m_mutex);
         QMutexLocker bufferLocker(&m_bufferMutex);
         for (DecoderTrack* track : m_decoderBank)
             if (track)
@@ -1627,25 +1639,23 @@ void PlaybackWorker::handleGpuDeviceLoss() {
         sanitizeCacheForDeviceLossLocked(m_stagingCache.get(), &recoveredFrames, &removedGpuFrames);
         sanitizeCacheForDeviceLossLocked(m_prerollStagingCache.get(), &recoveredFrames,
                                          &removedGpuFrames);
-        if (recoveredFrames > 0 || removedGpuFrames > 0) {
-            publishOutputCacheLocked();
-        }
         m_gpuFrameRetireQueue = GpuFrameRetireQueue();
-    }
-    std::optional<qint64> recoveredPlayhead;
-    {
-        QMutexLocker bufferLocker(&m_bufferMutex);
         const qint64 playhead = m_transport
                                     ? m_transport->currentPos()
                                     : m_lastVisiblePlayheadMs.load(std::memory_order_acquire);
-        recoveredPlayhead = recoveredCachePlayheadLocked(playhead, lossGeneration);
-        if (recoveredPlayhead.has_value()) {
-            m_committedPlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
-            m_lastVisiblePlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
-            m_outputPlayheadCacheGuarded.store(true, std::memory_order_release);
-            publishOutputCacheLocked();
-            resetOutputPlayEpoch();
-        }
+        const std::optional<qint64> recoveredPlayhead =
+            recoveredCachePlayheadLocked(playhead, lossGeneration);
+        OutputCommit commit;
+        commit.playheadMs =
+            recoveredPlayhead.value_or(m_committedPlayheadMs.load(std::memory_order_acquire));
+        commit.seekGeneration = m_committedGeneration.load(std::memory_order_acquire);
+        commit.gpuGeneration = lossGeneration;
+        commit.cacheAction = OutputCacheAction::Publish;
+        commit.coverageMode = OutputCoverageMode::Displayable;
+        commit.requireCurrentSeek = false;
+        commit.guardPlayheadCache = true;
+        commit.dispatch = PostCommitDispatch::Output;
+        recoveryCommit = commitOutputStateLocked(commit);
     }
     drainGpuDeviceLossEvents();
 
@@ -1686,10 +1696,7 @@ void PlaybackWorker::handleGpuDeviceLoss() {
         if (m_outputRuntime) m_outputRuntime->setGpuRhiContext(m_gpuRhi);
     }
     rebuildOutputEndpoints();
-    if (recoveredPlayhead.has_value()) {
-        m_committedPlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
-        m_lastVisiblePlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
-        m_outputPlayheadCacheGuarded.store(true, std::memory_order_release);
+    if (recoveryCommit.committed && recoveryCommit.dispatch == PostCommitDispatch::Output) {
         m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
         refreshOutputAfterSeekCommit();
     }
@@ -1891,7 +1898,6 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
     m_gpuPipelineState.store(static_cast<int>(GpuPipelineState::CpuFallback),
                              std::memory_order_release);
     const uint64_t pressureGeneration = GpuGenerationCounter::instance().bump();
-    m_committedGpuGeneration.store(pressureGeneration, std::memory_order_release);
 
     for (DecoderTrack* track : m_decoderBank)
         if (track && track->nativeDecoder) track->nativeDecoder->reset();
@@ -1900,8 +1906,9 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
 
     int recoveredFrames = 0;
     int removedGpuFrames = 0;
-    std::optional<qint64> recoveredPlayhead;
+    OutputCommitResult recoveryCommit;
     {
+        QMutexLocker locker(&m_mutex);
         QMutexLocker bufferLocker(&m_bufferMutex);
         for (DecoderTrack* track : m_decoderBank)
             if (track)
@@ -1920,16 +1927,19 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
         const qint64 playhead = m_transport
                                     ? m_transport->currentPos()
                                     : m_lastVisiblePlayheadMs.load(std::memory_order_acquire);
-        recoveredPlayhead = recoveredCachePlayheadLocked(playhead, pressureGeneration);
-        if (recoveredFrames > 0 || removedGpuFrames > 0 || recoveredPlayhead.has_value())
-            publishOutputCacheLocked();
-        if (recoveredPlayhead.has_value()) {
-            m_committedPlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
-            m_lastVisiblePlayheadMs.store(*recoveredPlayhead, std::memory_order_release);
-            m_outputPlayheadCacheGuarded.store(true, std::memory_order_release);
-            m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
-            resetOutputPlayEpoch();
-        }
+        const std::optional<qint64> recoveredPlayhead =
+            recoveredCachePlayheadLocked(playhead, pressureGeneration);
+        OutputCommit commit;
+        commit.playheadMs =
+            recoveredPlayhead.value_or(m_committedPlayheadMs.load(std::memory_order_acquire));
+        commit.seekGeneration = m_committedGeneration.load(std::memory_order_acquire);
+        commit.gpuGeneration = pressureGeneration;
+        commit.cacheAction = OutputCacheAction::Publish;
+        commit.coverageMode = OutputCoverageMode::Displayable;
+        commit.requireCurrentSeek = false;
+        commit.guardPlayheadCache = true;
+        commit.dispatch = PostCommitDispatch::Output;
+        recoveryCommit = commitOutputStateLocked(commit);
     }
 
     m_decodeFence.reset();
@@ -1946,7 +1956,8 @@ void PlaybackWorker::handleGpuMemoryPressureLevel2(qint64 nowMs) {
         if (m_outputRuntime) m_outputRuntime->setGpuRhiContext(nullptr);
     }
     rebuildOutputEndpoints();
-    if (recoveredPlayhead.has_value()) {
+    if (recoveryCommit.committed && recoveryCommit.dispatch == PostCommitDispatch::Output) {
+        m_forceLiveOutputSnapshots.store(64, std::memory_order_release);
         refreshOutputAfterSeekCommit();
     }
 }
@@ -2157,6 +2168,7 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
         m_outputHeight = qMax(2, height);
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
+    uint64_t graphGeneration = 0;
     gpuResetFrameReadToCpuCount();
     m_gpuDeviceLossEvents.store(0, std::memory_order_release);
     m_injectGpuDeviceLossForTest.store(false, std::memory_order_release);
@@ -2179,8 +2191,7 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
     m_stagingFence.reset();
     m_stagedFenceValue.store(0, std::memory_order_release);
     if (gpuPipelineEnabled()) {
-        const uint64_t graphGeneration = GpuGenerationCounter::instance().bump();
-        m_committedGpuGeneration.store(graphGeneration, std::memory_order_release);
+        graphGeneration = GpuGenerationCounter::instance().bump();
         rebuildGpuSpine();
     }
     configureGpuBudget();
@@ -2199,6 +2210,22 @@ void PlaybackWorker::initializeOutputGraph(int feedCount, int width, int height)
             m_transport->frameRate(), m_outputFeedCount, m_outputWidth, m_outputHeight, m_gpuRhi);
         m_outputRuntime->setSnapshotProvider([this]() { return makeOutputSnapshot(); });
     }
+#ifdef OLR_GPU_PIPELINE_BUILD
+    if (graphGeneration != 0) {
+        QMutexLocker locker(&m_mutex);
+        QMutexLocker bufferLocker(&m_bufferMutex);
+        OutputCommit commit;
+        commit.playheadMs = m_committedPlayheadMs.load(std::memory_order_acquire);
+        commit.seekGeneration = m_committedGeneration.load(std::memory_order_acquire);
+        commit.gpuGeneration = graphGeneration;
+        commit.cacheAction = OutputCacheAction::Publish;
+        commit.requireCurrentSeek = false;
+        commit.guardPlayheadCache = true;
+        commit.dispatch = PostCommitDispatch::None;
+        const OutputCommitResult graphCommit = commitOutputStateLocked(commit);
+        Q_ASSERT(graphCommit.committed);
+    }
+#endif
     m_outputTargetsDirty.store(true, std::memory_order_relaxed);
     rebuildOutputEndpoints();
     {
@@ -2531,10 +2558,14 @@ OutputRuntimeSnapshot PlaybackWorker::makeOutputSnapshot() const {
         // short lock and returns a shared_ptr to a const cache the worker never
         // mutates again, so the assignment below copies an implicitly-shared
         // (cheap COW) snapshot, not a re-decode of the decoder track buffers.
+        PlaybackWorker* const mutableThis = const_cast<PlaybackWorker*>(this);
+        QMutexLocker workerLocker(&mutableThis->m_mutex);
         QMutexLocker bufferLocker(&m_bufferMutex);
-        // Fire the scheduled cut (if due) while holding m_bufferMutex, BEFORE
-        // reading the published cache so this tick paints the promoted window.
-        const_cast<PlaybackWorker*>(this)->maybeFireScheduledCut(dispatcherNextIndex);
+        // Fire the scheduled cut (if due) while holding the canonical
+        // m_mutex -> m_bufferMutex order, BEFORE reading the published cache so
+        // this tick paints the promoted window.
+        mutableThis->maybeFireScheduledCut(dispatcherNextIndex);
+        workerLocker.unlock();
 #ifdef OLR_GPU_PIPELINE_BUILD
         int forcedLiveSnapshots = m_forceLiveOutputSnapshots.load(std::memory_order_acquire);
         while (forcedLiveSnapshots > 0) {
@@ -4262,12 +4293,12 @@ bool PlaybackWorker::stagingGpuSurfacesIdle() const {
 }
 
 // Fire the scheduled cut iff the dispatcher's next index has reached it. Called
-// from makeOutputSnapshot on the OUTPUT thread, which already holds m_bufferMutex
-// (the caller MUST hold it). dispatcherNextIndex was read by the caller BEFORE
-// locking m_bufferMutex (see makeOutputSnapshot) so this never locks the output
-// runtime's m_mutex while holding m_bufferMutex.
+// from makeOutputSnapshot on the OUTPUT thread, which already holds m_mutex and
+// m_bufferMutex in that order (the caller MUST hold both). dispatcherNextIndex was
+// read before either worker lock. A successful promotion enters the central commit
+// primitive, extending the order through m_outputRuntimeMutex to OutputRuntime::m_mutex.
 //
-// LOCK ORDER (held: m_bufferMutex):
+// LOCK ORDER (held: m_mutex -> m_bufferMutex):
 //   m_transport->fps()/seek() lock the transport's OWN mutex and release it
 //   before emitting posChanged (transport.cpp); posChanged is a QUEUED cross-
 //   thread signal to UIManager/controlServer (different threads) so no connected
@@ -4320,9 +4351,28 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     const int64_t newPlayhead =
         CutSchedule::playheadAfterCut(target, dispatcherNextIndex, scheduled, fps());
     const int64_t prePlayhead = m_transport ? m_transport->currentPos() : newPlayhead;
-    // Atomic promotion: a single pointer swap of the published double-buffer.
+    // Stage the pointer swap, then let the central primitive validate the promoted
+    // cache before publication. Rejection restores both owners while snapshots are
+    // still excluded by m_bufferMutex.
     std::swap(m_outputCache, m_prerollStagingCache);
-    publishOutputCacheLocked();
+    uint64_t gpuGeneration = 0;
+#ifdef OLR_GPU_PIPELINE_BUILD
+    gpuGeneration = GpuGenerationCounter::instance().current();
+#endif
+    OutputCommit commit;
+    commit.playheadMs = newPlayhead;
+    commit.seekGeneration = m_committedGeneration.load(std::memory_order_acquire);
+    commit.gpuGeneration = gpuGeneration;
+    commit.cacheAction = OutputCacheAction::Publish;
+    commit.coverageMode = OutputCoverageMode::Displayable;
+    commit.requireCurrentSeek = false;
+    commit.guardPlayheadCache = true;
+    commit.dispatch = PostCommitDispatch::None;
+    const OutputCommitResult cutCommit = commitOutputStateLocked(commit);
+    if (!cutCommit.committed) {
+        std::swap(m_outputCache, m_prerollStagingCache);
+        return;
+    }
     // Decoder-follow for a BACKWARD cut: the swap fixed the OUTPUT, but the primary
     // demuxer+decoder bank is still parked AHEAD of the new playhead, so the worker
     // would otherwise hit the reactive backward-jump path (run loop §6.1(2)) one or
@@ -4352,17 +4402,10 @@ void PlaybackWorker::maybeFireScheduledCut(qint64 dispatcherNextIndex) {
     // not touch the worker's seek token, so committedGen stays == seekGen and
     // makeOutputSnapshot exposes the LIVE transport playhead (now == target) against
     // the freshly-published target-covering cache — zero placeholder, no fallback.
-    if (m_transport) m_transport->seek(newPlayhead);
-    // Re-anchor the output clock to the new (target) playhead. Without this the
-    // dispatcher's play epoch stays anchored to the PRE-CUT play start, so
-    // sampledPlayheadMs (which drives the cache lookup) diverges from the target
-    // by the cut distance and the output renders the WRONG frame — the cut is not
-    // frame-accurate even though it reports zero placeholder/reposition. (Same
-    // class of bug as the reposition-commit re-anchor.) resetPlayEpoch locks the
-    // output runtime's OWN mutex (independent of the m_bufferMutex held here), and
-    // OutputRuntime::snapshot() invokes this provider OUTSIDE that mutex, so there
-    // is no re-entrancy or lock-order inversion.
-    if (m_outputRuntime) m_outputRuntime->resetPlayEpoch();
+    if (m_transport) m_transport->seek(cutCommit.committedPlayheadMs);
+    // commitOutputStateLocked already re-anchored the output epoch before opening
+    // the unchanged seek-generation gate, so this snapshot cannot combine the
+    // promoted cache with the pre-cut clock identity.
     // Click-free audio transition: de-click + drop the stale pre-cut ring so the
     // monitor re-primes the TARGET audio with a fade-in (AudioPlayer::clear does a
     // fade-out + arms a fade-in — no hard pop). The worker's run loop then re-fills

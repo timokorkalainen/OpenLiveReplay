@@ -31,6 +31,7 @@ private slots:
     void backgroundSuspendDefersGpuRebuildUntilForeground();
     void repeatedBackgroundSuspendResumeDoesNotConsumeDeviceLossBudget();
     void lossSanitizesDecoderTrackBuffers();
+    void lossRecoveryCommitsSubmittedIdentityAndEpoch();
 
 private:
     std::shared_ptr<GpuRhiContext> createTestRhi() const;
@@ -50,7 +51,8 @@ public:
 
 class CachedGpuFrameData final : public IFrameData {
 public:
-    explicit CachedGpuFrameData(CpuPlanes planes) : m_planes(std::move(planes)) {}
+    explicit CachedGpuFrameData(CpuPlanes planes)
+        : m_planes(std::move(planes)), m_surface(std::make_shared<TestGpuSurface>()) {}
 
     bool isGpuBacked() const override { return true; }
     CpuPlanes readToCpu(FramePixelFormat) const override {
@@ -60,13 +62,35 @@ public:
     CpuPlanes cachedCpuPlanes(FramePixelFormat target) const override {
         return target == m_planes.format ? m_planes : CpuPlanes{};
     }
-    GpuSurface* gpuSurface() const override { return nullptr; }
+    GpuSurface* gpuSurface() const override { return m_surface.get(); }
     FramePixelFormat nativeFormat() const override { return m_planes.format; }
     int readToCpuCalls() const { return m_readToCpuCalls; }
 
 private:
     CpuPlanes m_planes;
+    std::shared_ptr<TestGpuSurface> m_surface;
     mutable int m_readToCpuCalls = 0;
+};
+
+class RecordingNdiSink final : public IOutputSink {
+public:
+    OutputTargetKind kind() const override { return OutputTargetKind::Ndi; }
+    bool start(const OutputTargetAssignment& assignment, FrameRate rate) override {
+        m_active = assignment.enabled && assignment.kind == kind() && rate.isValid();
+        return m_active;
+    }
+    void stop() override { m_active = false; }
+    bool isActive() const override { return m_active; }
+    bool submit(const OutputBusFrame& frame) override {
+        if (!m_active) return false;
+        frames.append(frame);
+        return true;
+    }
+
+    QVector<OutputBusFrame> frames;
+
+private:
+    bool m_active = false;
 };
 
 OutputTargetAssignment ndiFeedAssignment() {
@@ -213,8 +237,11 @@ void TestGpuDeviceLostWorker::lostContextRebuildsFreshGpuSpine() {
     QVERIFY(worker.gpuPathActive());
     QVERIFY(worker.m_gpuRhi);
     QVERIFY(worker.m_decodeFence);
+#ifndef _WIN32
+    // Windows creates render/staging fences lazily from the D3D11 import device.
     QVERIFY(worker.m_renderFence);
     QVERIFY(worker.m_stagingFence);
+#endif
 
     auto lostRhi = worker.m_gpuRhi;
     lostRhi->injectDeviceLostForTest();
@@ -229,8 +256,10 @@ void TestGpuDeviceLostWorker::lostContextRebuildsFreshGpuSpine() {
     QVERIFY(worker.m_gpuRhi != lostRhi);
     QVERIFY(!worker.m_gpuRhi->deviceLost());
     QVERIFY(worker.m_decodeFence);
+#ifndef _WIN32
     QVERIFY(worker.m_renderFence);
     QVERIFY(worker.m_stagingFence);
+#endif
     QVERIFY(!GpuDeviceLossMonitor::instance().isLost());
     QVERIFY(GpuGenerationCounter::instance().current() > gen0);
     const OutputDispatchStats stats = worker.outputStats();
@@ -435,6 +464,82 @@ void TestGpuDeviceLostWorker::lossSanitizesDecoderTrackBuffers() {
 
     worker.m_decoderBank.clear();
     delete track;
+}
+
+void TestGpuDeviceLostWorker::lossRecoveryCommitsSubmittedIdentityAndEpoch() {
+    qputenv("OLR_GPU_PIPELINE", "1");
+    GpuGenerationCounter::instance().resetForTest();
+    GpuDeviceLossMonitor::instance().reset();
+
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    transport.seek(100);
+    RecordingNdiSink sink;
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.initializeOutputGraph(1, 64, 48);
+    if (!installTestGpuSpine(worker)) QSKIP("no test RHI backend available");
+    worker.m_selectedOutputFeed.store(0, std::memory_order_relaxed);
+    worker.m_seekGeneration.store(2, std::memory_order_release);
+    worker.m_committedGeneration.store(1, std::memory_order_release);
+    worker.m_committedPlayheadMs.store(0, std::memory_order_release);
+    worker.m_lastVisiblePlayheadMs.store(0, std::memory_order_release);
+
+    FrameMetadata meta;
+    meta.key.feedIndex = 0;
+    meta.key.ptsMs = 100;
+    meta.key.width = 64;
+    meta.key.height = 48;
+    meta.key.format = FramePixelFormat::Yuv420p;
+    meta.gpuGeneration = GpuGenerationCounter::instance().current();
+    meta.decodedSequence = 17;
+    const auto data = std::make_shared<CachedGpuFrameData>(yuvPlanes(64, 48, 72, 90, 110));
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        worker.m_outputCache->insertVideoFrame(FrameHandle(data, meta));
+        worker.publishOutputCacheLocked();
+    }
+    int resetCountBefore = 0;
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        resetCountBefore = worker.m_outputRuntime->playEpochResetCountForTest();
+    }
+
+    worker.m_gpuRhi->injectDeviceLostForTest();
+    worker.handleGpuDeviceLoss();
+
+    {
+        QMutexLocker bufferLocker(&worker.m_bufferMutex);
+        const std::optional<FrameHandle> recovered = worker.m_outputCache->videoFrameAt(0, 100);
+        QVERIFY(recovered.has_value());
+        QVERIFY(!recovered->isGpuBacked());
+        QVERIFY(worker.recoveredCachePlayheadLocked(100, GpuGenerationCounter::instance().current())
+                    .has_value());
+    }
+    QCOMPARE(worker.m_committedPlayheadMs.load(std::memory_order_acquire), qint64(100));
+    QCOMPARE(worker.m_lastVisiblePlayheadMs.load(std::memory_order_acquire), qint64(100));
+    QCOMPARE(worker.m_seekGeneration.load(std::memory_order_acquire), uint64_t(2));
+    QCOMPARE(worker.m_committedGeneration.load(std::memory_order_acquire), uint64_t(1));
+    QCOMPARE(worker.m_committedGpuGeneration.load(std::memory_order_acquire),
+             GpuGenerationCounter::instance().current());
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        QCOMPARE(worker.m_outputRuntime->playEpochResetCountForTest(), resetCountBefore + 1);
+        worker.m_outputRuntime->setIdentitySkip(false);
+        worker.m_outputRuntime->setEndpoints({{ndiFeedAssignment(), &sink}});
+    }
+    worker.m_outputRuntime->dispatchImmediate();
+    QCOMPARE(sink.frames.size(), 1);
+    const OutputFrameIdentity identity = sink.frames.constFirst().identity;
+    QCOMPARE(identity.sampledPlayheadMs, qint64(100));
+    QCOMPARE(identity.sourcePtsMs, qint64(100));
+    QVERIFY(!identity.videoPlaceholder);
+    QCOMPARE(identity.videoGpuGeneration, uint64_t(0));
+    QCOMPARE(identity.sourceDecodedSequence, qint64(17));
+    {
+        QMutexLocker runtimeLocker(&worker.m_outputRuntimeMutex);
+        worker.m_outputRuntime->setEndpoints({});
+    }
 }
 
 QTEST_GUILESS_MAIN(TestGpuDeviceLostWorker)
