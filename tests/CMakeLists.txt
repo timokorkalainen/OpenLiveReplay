@@ -72,6 +72,8 @@ if(WIN32)
     endif()
 endif()
 
+include("${CMAKE_SOURCE_DIR}/tests/cmake/OlrWindowsTestRuntime.cmake")
+
 # --- Lightweight engine sources used by fast unit tests ---------------------
 qt_add_library(olr_test_core STATIC
     "${CMAKE_SOURCE_DIR}/appenv.cpp"
@@ -553,7 +555,7 @@ if(WIN32 AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
     endforeach()
 endif()
 
-add_test(NAME transport_epoch_mutation_f1
+olr_add_ctest(NAME transport_epoch_mutation_f1
     COMMAND "${CMAKE_COMMAND}"
         -DMUTANT_NAME=F1_config_generation
         -DBASELINE_EXECUTABLE=$<TARGET_FILE:transport_epoch_f1_baseline>
@@ -566,7 +568,7 @@ add_test(NAME transport_epoch_mutation_f1
 set_tests_properties(transport_epoch_mutation_f1 PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-add_test(NAME transport_epoch_production_f1
+olr_add_ctest(NAME transport_epoch_production_f1
     COMMAND "${CMAKE_COMMAND}"
         -DBASELINE_EXECUTABLE=$<TARGET_FILE:transport_epoch_production_f1_baseline>
         -DMUTANT_EXECUTABLE=$<TARGET_FILE:transport_epoch_production_f1_mutant>
@@ -574,7 +576,7 @@ add_test(NAME transport_epoch_production_f1
 set_tests_properties(transport_epoch_production_f1 PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-add_test(NAME transport_epoch_mutation_f2
+olr_add_ctest(NAME transport_epoch_mutation_f2
     COMMAND "${CMAKE_COMMAND}"
         -DMUTANT_NAME=F2_commit_epoch_reset
         -DBASELINE_EXECUTABLE=$<TARGET_FILE:transport_epoch_f2_baseline>
@@ -587,7 +589,7 @@ add_test(NAME transport_epoch_mutation_f2
 set_tests_properties(transport_epoch_mutation_f2 PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-add_test(NAME transport_epoch_mutation_meta_f1_broken_baseline
+olr_add_ctest(NAME transport_epoch_mutation_meta_f1_broken_baseline
     COMMAND "${CMAKE_COMMAND}"
         -DMUTATION_WRAPPER=${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_mutations.cmake
         -DMUTANT_NAME=F1_config_generation_meta_broken_baseline
@@ -599,7 +601,7 @@ add_test(NAME transport_epoch_mutation_meta_f1_broken_baseline
 set_tests_properties(transport_epoch_mutation_meta_f1_broken_baseline PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-add_test(NAME transport_epoch_mutation_meta_f2_broken_baseline
+olr_add_ctest(NAME transport_epoch_mutation_meta_f2_broken_baseline
     COMMAND "${CMAKE_COMMAND}"
         -DMUTATION_WRAPPER=${CMAKE_SOURCE_DIR}/tests/mutations/transport_epoch_mutations.cmake
         -DMUTANT_NAME=F2_commit_epoch_reset_meta_broken_baseline
@@ -612,15 +614,14 @@ set_tests_properties(transport_epoch_mutation_meta_f2_broken_baseline PROPERTIES
     LABELS "formal;unit;ci;mutation" TIMEOUT 60 ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 if(WIN32)
-    get_filename_component(_olr_ffmpeg_libdir "${OLR_FFMPEG_AVFORMAT_LIBRARY}" DIRECTORY)
-    get_filename_component(_olr_ffmpeg_bin "${_olr_ffmpeg_libdir}/../bin" ABSOLUTE)
-    get_filename_component(_olr_srt_libdir "${OLR_SRT_LIBRARY}" DIRECTORY)
-    get_filename_component(_olr_srt_bin "${_olr_srt_libdir}/../bin" ABSOLUTE)
-    set(_olr_mutation_path "${_olr_ffmpeg_bin};${_olr_srt_bin};$ENV{PATH}")
-    string(REPLACE ";" "\\;" _olr_mutation_path "${_olr_mutation_path}")
-    set_tests_properties(transport_epoch_mutation_f1 transport_epoch_mutation_f2
-        transport_epoch_production_f1
-        transport_epoch_mutation_meta_f1_broken_baseline
-        transport_epoch_mutation_meta_f2_broken_baseline PROPERTIES
-        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;PATH=${_olr_mutation_path}")
+    add_test(NAME windows_test_runtime_audit
+        COMMAND "${CMAKE_COMMAND}"
+            -DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -DQT_RUNTIME_DIR=$<TARGET_FILE_DIR:Qt6::Core>
+            -DQT_PLUGIN_DIR=${OLR_QT_TEST_PLUGIN_DIR}
+            -DFFMPEG_RUNTIME_DIR=${OLR_FFMPEG_TEST_RUNTIME_DIR}
+            -DSRT_RUNTIME_DIR=${OLR_SRT_TEST_RUNTIME_DIR}
+            -P "${CMAKE_SOURCE_DIR}/tests/cmake/audit_windows_test_runtime.cmake")
+    set_tests_properties(windows_test_runtime_audit PROPERTIES
+        LABELS "formal;ci" TIMEOUT 30)
 endif()

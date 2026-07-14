@@ -11,7 +11,7 @@ function(olr_add_unit_test name)
             COMMAND_EXPAND_LISTS
             COMMENT "Copying ${name} runtime DLLs")
     endif()
-    add_test(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
+    olr_add_ctest(NAME ${name} COMMAND $<TARGET_FILE:${name}>)
     # Headless + deterministic; fail fast rather than hang CI.
     set_tests_properties(${name} PROPERTIES
         LABELS "unit;ci"
