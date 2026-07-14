@@ -132,6 +132,19 @@ bool equivalentTimecodeResult(const H26xTimingDetail::TimecodeParseResult& lhs,
            lhs.provenance == rhs.provenance && lhs.discontinuity == rhs.discontinuity;
 }
 
+bool equivalentParsedTimecodeResult(const H26xTimingDetail::TimecodeParseResult& lhs,
+                                    const H26xTimingDetail::TimecodeParseResult& rhs) {
+    return lhs.status == rhs.status && equivalentTimecodeResult(lhs, rhs);
+}
+
+bool equivalentContinuity(const H26xTimingDetail::HevcTimeCodeContinuity& lhs,
+                          const H26xTimingDetail::HevcTimeCodeContinuity& rhs) {
+    return lhs.haveSeconds == rhs.haveSeconds && lhs.haveMinutes == rhs.haveMinutes &&
+           lhs.haveHours == rhs.haveHours && (!lhs.haveSeconds || lhs.seconds == rhs.seconds) &&
+           (!lhs.haveMinutes || lhs.minutes == rhs.minutes) &&
+           (!lhs.haveHours || lhs.hours == rhs.hours);
+}
+
 bool equivalentTimecodeResult(const H26xSeiTimecodeResult& lhs,
                               const H26xTimingDetail::TimecodeParseResult& rhs) {
     H26xTimingDetail::TimecodeParseResult converted;
@@ -210,10 +223,11 @@ HevcPicStructScanStatus scanHevcAuSeiContext(const QList<QByteArray>& prefixRbsp
                                   : HevcPicStructScanStatus::Unsupported;
 }
 
-H26xTimingDetail::TimecodeParseResult
-extractFromSeiRbsp(const QByteArray& rbsp, NativeVideoCodec codec, const H26xTimingContext* context,
-                   bool prefixSei, H26xTimingDetail::HevcTimeCodeContinuity* hevcContinuity,
-                   int expectedHevcClockCount) {
+H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(
+    const QByteArray& rbsp, NativeVideoCodec codec, const H26xTimingContext* context,
+    bool prefixSei, const H26xTimingDetail::HevcTimeCodeContinuity* hevcPreviousContinuity,
+    H26xTimingDetail::HevcTimeCodeContinuity* hevcNextContinuity, bool* hasHevcNextContinuity,
+    bool* hasHevcTimeCodeMessage, int expectedHevcClockCount) {
     using H26xTimingDetail::TimecodeParseResult;
     using H26xTimingDetail::TimecodeParseStatus;
 
@@ -221,6 +235,10 @@ extractFromSeiRbsp(const QByteArray& rbsp, NativeVideoCodec codec, const H26xTim
     bool sawMalformed = false;
     bool sawUnsupported = false;
     bool sawTrailingBits = false;
+    std::optional<TimecodeParseResult> firstHevcTimeCodeMessage;
+    std::optional<H26xTimingDetail::HevcTimeCodeContinuity> firstHevcContinuityProposal;
+    if (hasHevcNextContinuity != nullptr) *hasHevcNextContinuity = false;
+    if (hasHevcTimeCodeMessage != nullptr) *hasHevcTimeCodeMessage = false;
     int pos = 0;
     while (pos < rbsp.size()) {
         if (pos == rbsp.size() - 1 && uchar(rbsp[pos]) == 0x80) {
@@ -256,11 +274,21 @@ extractFromSeiRbsp(const QByteArray& rbsp, NativeVideoCodec codec, const H26xTim
                    context->hevc() != nullptr) {
             H26xTimingDetail::HevcTimeCodeContinuity updatedContinuity;
             parsed = H26xTimingDetail::parseHevcTimeCode(
-                rbsp.mid(pos, int(payloadSize)), *context->hevc(), hevcContinuity,
+                rbsp.mid(pos, int(payloadSize)), *context->hevc(), hevcPreviousContinuity,
                 &updatedContinuity, expectedHevcClockCount);
-            if (hevcContinuity != nullptr && parsed.status != TimecodeParseStatus::Malformed &&
+            if (hasHevcTimeCodeMessage != nullptr) *hasHevcTimeCodeMessage = true;
+            if (!firstHevcTimeCodeMessage.has_value()) {
+                firstHevcTimeCodeMessage = parsed;
+            } else if (!equivalentParsedTimecodeResult(*firstHevcTimeCodeMessage, parsed)) {
+                sawMalformed = true;
+            }
+            if (parsed.status != TimecodeParseStatus::Malformed &&
                 parsed.status != TimecodeParseStatus::Unsupported) {
-                *hevcContinuity = updatedContinuity;
+                if (!firstHevcContinuityProposal.has_value()) {
+                    firstHevcContinuityProposal = updatedContinuity;
+                } else if (!equivalentContinuity(*firstHevcContinuityProposal, updatedContinuity)) {
+                    sawMalformed = true;
+                }
             }
             handled = true;
         } else if (codec == NativeVideoCodec::Hevc && payloadType == 136 && prefixSei) {
@@ -289,6 +317,12 @@ extractFromSeiRbsp(const QByteArray& rbsp, NativeVideoCodec codec, const H26xTim
     } else if (result.timecode.valid) {
         result.status = TimecodeParseStatus::Valid;
     }
+    if (result.status != TimecodeParseStatus::Malformed &&
+        result.status != TimecodeParseStatus::Unsupported &&
+        firstHevcContinuityProposal.has_value()) {
+        if (hevcNextContinuity != nullptr) *hevcNextContinuity = *firstHevcContinuityProposal;
+        if (hasHevcNextContinuity != nullptr) *hasHevcNextContinuity = true;
+    }
     return result;
 }
 
@@ -308,6 +342,8 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
     H26xSeiTimecodeResult firstUsableTimestamp;
     bool sawUnsupported = false;
     bool sawMalformed = false;
+    std::optional<H26xTimingDetail::TimecodeParseResult> firstHevcTimeCodeMessage;
+    std::optional<H26xTimingDetail::HevcTimeCodeContinuity> firstHevcContinuityProposal;
     QList<SeiNalData> seiNals;
     for (const QByteArray& nal : splitAnnexBNals(annexB)) {
         if (!isSeiNal(nal, codec)) continue;
@@ -357,8 +393,26 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
     }
 
     for (const SeiNalData& nal : seiNals) {
+        H26xTimingDetail::HevcTimeCodeContinuity proposedContinuity;
+        bool hasContinuityProposal = false;
+        bool hasTimeCodeMessage = false;
         const auto parsed = extractFromSeiRbsp(nal.rbsp, codec, context, nal.prefix, hevcContinuity,
-                                               expectedHevcClockCount);
+                                               &proposedContinuity, &hasContinuityProposal,
+                                               &hasTimeCodeMessage, expectedHevcClockCount);
+        if (hasTimeCodeMessage) {
+            if (!firstHevcTimeCodeMessage.has_value()) {
+                firstHevcTimeCodeMessage = parsed;
+            } else if (!equivalentParsedTimecodeResult(*firstHevcTimeCodeMessage, parsed)) {
+                sawMalformed = true;
+            }
+        }
+        if (hasContinuityProposal) {
+            if (!firstHevcContinuityProposal.has_value()) {
+                firstHevcContinuityProposal = proposedContinuity;
+            } else if (!equivalentContinuity(*firstHevcContinuityProposal, proposedContinuity)) {
+                sawMalformed = true;
+            }
+        }
         if (parsed.status == TimecodeParseStatus::Malformed) {
             sawMalformed = true;
         } else if (parsed.status == TimecodeParseStatus::Unsupported) {
@@ -378,6 +432,8 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
         if (accepted != nullptr) *accepted = false;
         return {};
     }
+    if (hevcContinuity != nullptr && firstHevcContinuityProposal.has_value())
+        *hevcContinuity = *firstHevcContinuityProposal;
     return firstUsableTimestamp;
 }
 

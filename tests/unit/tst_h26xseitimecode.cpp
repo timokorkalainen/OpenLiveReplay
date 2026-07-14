@@ -49,6 +49,7 @@ private slots:
     void hevcVpsHrdLayerSetIndexIsValidated();
     void hevcParameterSetsRejectEnhancementLayers();
     void hevcParameterSetsRequireTemporalIdZero();
+    void hevcParameterSetConformanceFlagsAreValidated();
     void hevcSpsStatusPrecedenceIsOrderIndependent();
     void hevcHmFixtureIsDecoded();
     void hevcShmFixtureIsDecoded();
@@ -65,6 +66,7 @@ private slots:
     void hevcTruncatedTimeCodeIsRejected();
     void hevcSuffixTimeCodeIsIgnored();
     void hevcDuplicateTimeCodeMessagesMustAgree();
+    void hevcDuplicateTimeCodeMessagesCannotChainContinuity();
     void hevcEnhancementLayerSeiIsRejected();
     void registeredT35UnknownAndCaptionPayloadsAreIgnored();
     void registeredT35UnknownProviderDoesNotSuppressTimeCode();
@@ -1637,6 +1639,34 @@ void TestH26xSeiTimecode::hevcParameterSetsRequireTemporalIdZero() {
     QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Malformed);
 }
 
+void TestH26xSeiTimecode::hevcParameterSetConformanceFlagsAreValidated() {
+    QByteArray vpsWithoutBaseLayerInternal = hevcVps();
+    QCOMPARE(uchar(vpsWithoutBaseLayerInternal[2]), uchar(0x0c));
+    vpsWithoutBaseLayerInternal[2] = char(0x04);
+
+    QByteArray vpsWithoutTemporalNesting = hevcVps();
+    QCOMPARE(uchar(vpsWithoutTemporalNesting[3]), uchar(0x01));
+    vpsWithoutTemporalNesting[3] = char(0x00);
+
+    QByteArray spsWithoutTemporalNesting = hevcSps();
+    QCOMPARE(uchar(spsWithoutTemporalNesting[2]), uchar(0x01));
+    spsWithoutTemporalNesting[2] = char(0x00);
+
+    for (const QList<QByteArray>& vps : {QList<QByteArray>{vpsWithoutBaseLayerInternal},
+                                         QList<QByteArray>{vpsWithoutTemporalNesting}}) {
+        H26xTimingContext context;
+        QVERIFY(!context.updateParameterSets(NativeVideoCodec::Hevc, vps, {hevcSps()}));
+        QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Malformed);
+        QVERIFY(!context.hevc()->timingInfoPresent);
+    }
+
+    H26xTimingContext context;
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()},
+                                         {spsWithoutTemporalNesting}));
+    QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Malformed);
+    QVERIFY(!context.hevc()->timingInfoPresent);
+}
+
 void TestH26xSeiTimecode::hevcSpsStatusPrecedenceIsOrderIndependent() {
     QByteArray malformed = hevcSps();
     malformed.chop(1);
@@ -1963,6 +1993,23 @@ void TestH26xSeiTimecode::hevcDuplicateTimeCodeMessagesMustAgree() {
 
     QVERIFY(!extractH26xSeiTimecodeResult(hevcPrefixSeiNal(first + conflicting),
                                           NativeVideoCodec::Hevc, context)
+                 .timecode.valid);
+}
+
+void TestH26xSeiTimecode::hevcDuplicateTimeCodeMessagesCannotChainContinuity() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {}));
+    H26xSeiTimecodeState state;
+    const QByteArray full = seiMessage(136, hevcFullTimestampPayload(7, 8, 9, 11));
+    const QByteArray partial = seiMessage(136, hevcNoUnitsTimestampPayload(11));
+
+    QVERIFY(!extractH26xSeiTimecodeResult(hevcPrefixSeiNal(full + partial), NativeVideoCodec::Hevc,
+                                          context, state)
+                 .timecode.valid);
+
+    state.reset();
+    QVERIFY(!extractH26xSeiTimecodeResult(hevcPrefixSeiNal(full) + hevcPrefixSeiNal(partial),
+                                          NativeVideoCodec::Hevc, context, state)
                  .timecode.valid);
 }
 

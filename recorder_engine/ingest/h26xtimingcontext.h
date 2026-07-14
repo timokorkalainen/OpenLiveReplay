@@ -44,6 +44,8 @@ struct HevcTimingSyntax {
     uint8_t dpbOutputDelayLength = 0;
     uint8_t dpbOutputDelayDuLength = 0;
     uint8_t duCpbRemovalDelayIncrementLength = 0;
+    uint8_t maxSubLayersMinus1 = 0;
+    bool temporalIdNesting = false;
     uint8_t vpsId = 0;
     uint8_t referencedVpsId = 0;
     uint8_t spsId = 0;

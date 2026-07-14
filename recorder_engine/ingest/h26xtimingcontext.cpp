@@ -628,13 +628,18 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
     uint32_t vpsId = 0;
     uint32_t maxLayersMinus1 = 0;
     uint32_t maxSubLayersMinus1 = 0;
-    bool flag = false;
-    if (!reader.bits(4, vpsId) || !reader.bit(flag) || !reader.bit(flag) ||
-        !reader.bits(6, maxLayersMinus1) || !reader.bits(3, maxSubLayersMinus1) ||
-        maxSubLayersMinus1 > 6 || !reader.bit(flag) || !reader.bits(16, ignored) ||
+    bool baseLayerInternal = false;
+    bool baseLayerAvailable = false;
+    bool temporalIdNesting = false;
+    if (!reader.bits(4, vpsId) || !reader.bit(baseLayerInternal) ||
+        !reader.bit(baseLayerAvailable) || !reader.bits(6, maxLayersMinus1) ||
+        !reader.bits(3, maxSubLayersMinus1) || maxSubLayersMinus1 > 6 ||
+        !reader.bit(temporalIdNesting) || (!baseLayerInternal && maxLayersMinus1 == 0) ||
+        (maxSubLayersMinus1 == 0 && !temporalIdNesting) || !reader.bits(16, ignored) ||
         ignored != 0xffffu || !skipHevcProfileTierLevel(reader, maxSubLayersMinus1)) {
         return malformedHevc();
     }
+    Q_UNUSED(baseLayerAvailable);
     // Multilayer VPS extensions change parameter-set inference rules. Do not
     // guess at them in the base-layer ingest parser.
     if (maxLayersMinus1 != 0) return unsupportedHevc();
@@ -660,6 +665,8 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
     HevcTimingSyntax syntax;
     syntax.status = H26xTimingSyntaxStatus::Valid;
     syntax.vpsId = uint8_t(vpsId);
+    syntax.maxSubLayersMinus1 = uint8_t(maxSubLayersMinus1);
+    syntax.temporalIdNesting = temporalIdNesting;
     if (!reader.bit(syntax.timingInfoPresent)) return malformedHevc();
     if (syntax.timingInfoPresent) {
         if (!reader.bits(32, syntax.numUnitsInTick) || !reader.bits(32, syntax.timeScale) ||
@@ -770,9 +777,11 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     uint32_t ignored = 0;
     uint32_t referencedVpsId = 0;
     uint32_t maxSubLayersMinus1 = 0;
+    bool temporalIdNesting = false;
     bool flag = false;
     if (!reader.bits(4, referencedVpsId) || !reader.bits(3, maxSubLayersMinus1) ||
-        maxSubLayersMinus1 > 6 || !reader.bit(flag) ||
+        maxSubLayersMinus1 > 6 || !reader.bit(temporalIdNesting) ||
+        (maxSubLayersMinus1 == 0 && !temporalIdNesting) ||
         !skipHevcProfileTierLevel(reader, maxSubLayersMinus1)) {
         return malformedHevc();
     }
@@ -850,6 +859,8 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     syntax.status = H26xTimingSyntaxStatus::Valid;
     syntax.referencedVpsId = uint8_t(referencedVpsId);
     syntax.spsId = uint8_t(spsId);
+    syntax.maxSubLayersMinus1 = uint8_t(maxSubLayersMinus1);
+    syntax.temporalIdNesting = temporalIdNesting;
     if (!vuiPresent) {
         bool extensionPresent = false;
         if (!reader.bit(extensionPresent)) return malformedHevc();
@@ -974,7 +985,9 @@ bool equivalentTiming(const HevcTimingSyntax& lhs, const HevcTimingSyntax& rhs) 
            lhs.auCpbRemovalDelayLength == rhs.auCpbRemovalDelayLength &&
            lhs.dpbOutputDelayLength == rhs.dpbOutputDelayLength &&
            lhs.dpbOutputDelayDuLength == rhs.dpbOutputDelayDuLength &&
-           lhs.duCpbRemovalDelayIncrementLength == rhs.duCpbRemovalDelayIncrementLength;
+           lhs.duCpbRemovalDelayIncrementLength == rhs.duCpbRemovalDelayIncrementLength &&
+           lhs.maxSubLayersMinus1 == rhs.maxSubLayersMinus1 &&
+           lhs.temporalIdNesting == rhs.temporalIdNesting;
 }
 
 FrameRateQ hevcLabelRate(const HevcTimingSyntax& syntax, bool unitsFieldBased) {
@@ -1127,6 +1140,11 @@ bool H26xTimingContext::updateParameterSets(NativeVideoCodec codec, const QList<
             const auto& referencedVps = vpsById[candidate.referencedVpsId];
             if (!referencedVps.has_value()) {
                 m_hevc = unsupportedHevc();
+                return false;
+            }
+            if (candidate.maxSubLayersMinus1 > referencedVps->maxSubLayersMinus1 ||
+                (referencedVps->temporalIdNesting && !candidate.temporalIdNesting)) {
+                m_hevc = malformedHevc();
                 return false;
             }
             auto& retainedReference = spsReferences[candidate.spsId];
