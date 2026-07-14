@@ -35,6 +35,9 @@ struct HevcTimingSyntax {
     bool pocProportionalToTiming = false;
     bool fieldSeq = false;
     bool frameFieldInfoPresent = false;
+    uint8_t vpsId = 0;
+    uint8_t referencedVpsId = 0;
+    uint8_t spsId = 0;
 };
 
 class H26xTimingContext {
@@ -69,6 +72,15 @@ struct TimecodeParseResult {
     bool discontinuity = false;
 };
 
+struct HevcTimeCodeContinuity {
+    bool haveSeconds = false;
+    bool haveMinutes = false;
+    bool haveHours = false;
+    uint32_t seconds = 0;
+    uint32_t minutes = 0;
+    uint32_t hours = 0;
+};
+
 // Decode an EBSP into an RBSP while validating the NAL escape rules. A prevention
 // byte must precede 0x00..0x03, and raw 00 00 00/01/02 sequences are forbidden.
 bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
@@ -76,7 +88,10 @@ bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
 // Internal parser seam shared by the public Annex-B extractor. It returns a
 // typed status so a short/reserved payload can never leak a partially filled label.
 TimecodeParseResult parseH264PicTiming(const QByteArray& payload, const H264TimingSyntax& syntax);
-TimecodeParseResult parseHevcTimeCode(const QByteArray& payload, const HevcTimingSyntax& syntax);
+TimecodeParseResult parseHevcTimeCode(const QByteArray& payload, const HevcTimingSyntax& syntax,
+                                      const HevcTimeCodeContinuity* previous = nullptr,
+                                      HevcTimeCodeContinuity* next = nullptr,
+                                      int expectedClockCount = -1);
 
 } // namespace H26xTimingDetail
 

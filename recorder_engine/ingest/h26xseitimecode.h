@@ -14,6 +14,21 @@ struct H26xSeiTimecodeResult {
     bool discontinuity = false;
 };
 
+class H26xSeiTimecodeState {
+public:
+    void reset();
+
+private:
+    friend H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray&, NativeVideoCodec,
+                                                              const H26xTimingContext&,
+                                                              H26xSeiTimecodeState&);
+
+    bool m_contextBound = false;
+    uint64_t m_contextGeneration = 0;
+    NativeVideoCodec m_codec = NativeVideoCodec::Unknown;
+    H26xTimingDetail::HevcTimeCodeContinuity m_hevcContinuity;
+};
+
 // Scan an Annex-B access unit for an embedded SMPTE 12M timecode SEI. H.264
 // pic_timing and HEVC time_code require the overload with an active timing
 // context and are parsed as their codec-specific standard bit syntax. The
@@ -27,5 +42,8 @@ Smpte12mTimecode extractH26xSeiTimecode(const QByteArray& annexB, NativeVideoCod
                                         const H26xTimingContext& context);
 H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, NativeVideoCodec codec,
                                                    const H26xTimingContext& context);
+H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, NativeVideoCodec codec,
+                                                   const H26xTimingContext& context,
+                                                   H26xSeiTimecodeState& state);
 
 #endif // H26XSEITIMECODE_H

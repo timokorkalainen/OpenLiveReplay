@@ -3,6 +3,7 @@
 #include <QList>
 
 #include <limits>
+#include <optional>
 
 namespace {
 
@@ -109,10 +110,98 @@ H26xTimingDetail::TimecodeParseResult parseRegisteredT35(const QByteArray& paylo
     return result; // syntactically valid but no explicitly supported ATC registration
 }
 
-H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
-                                                         NativeVideoCodec codec,
-                                                         const H26xTimingContext* context,
-                                                         bool prefixSei) {
+bool equivalentTimecodeResult(const H26xTimingDetail::TimecodeParseResult& lhs,
+                              const H26xTimingDetail::TimecodeParseResult& rhs) {
+    return lhs.timecode.valid == rhs.timecode.valid && lhs.timecode.hours == rhs.timecode.hours &&
+           lhs.timecode.minutes == rhs.timecode.minutes &&
+           lhs.timecode.seconds == rhs.timecode.seconds &&
+           lhs.timecode.frames == rhs.timecode.frames &&
+           lhs.timecode.dropFrame == rhs.timecode.dropFrame && lhs.labelRate == rhs.labelRate &&
+           lhs.provenance == rhs.provenance && lhs.discontinuity == rhs.discontinuity;
+}
+
+bool equivalentTimecodeResult(const H26xSeiTimecodeResult& lhs,
+                              const H26xTimingDetail::TimecodeParseResult& rhs) {
+    H26xTimingDetail::TimecodeParseResult converted;
+    converted.timecode = lhs.timecode;
+    converted.labelRate = lhs.labelRate;
+    converted.provenance = lhs.provenance;
+    converted.discontinuity = lhs.discontinuity;
+    return equivalentTimecodeResult(converted, rhs);
+}
+
+int clockCountForHevcPicStruct(int picStruct) {
+    switch (picStruct) {
+    case 0:
+    case 1:
+    case 2:
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+        return 1;
+    case 3:
+    case 4:
+    case 7:
+        return 2;
+    case 5:
+    case 6:
+    case 8:
+        return 3;
+    default:
+        return -1;
+    }
+}
+
+enum class HevcPicStructScanStatus : uint8_t { Valid, Unsupported, Malformed };
+
+HevcPicStructScanStatus scanHevcAuSeiContext(const QList<QByteArray>& prefixRbsps,
+                                             bool& sawTimeCode, int& expectedClockCount) {
+    std::optional<int> picStruct;
+    for (const QByteArray& rbsp : prefixRbsps) {
+        bool sawTrailingBits = false;
+        int pos = 0;
+        while (pos < rbsp.size()) {
+            if (pos == rbsp.size() - 1 && uchar(rbsp[pos]) == 0x80) {
+                sawTrailingBits = true;
+                ++pos;
+                break;
+            }
+            int64_t payloadType = 0;
+            int64_t payloadSize = 0;
+            if (!readSeiVarValue(rbsp, pos, payloadType) ||
+                !readSeiVarValue(rbsp, pos, payloadSize) || payloadSize > rbsp.size() - pos) {
+                return HevcPicStructScanStatus::Malformed;
+            }
+            if (payloadType == 136) sawTimeCode = true;
+            if (payloadType == 1) {
+                if (payloadSize < 1) return HevcPicStructScanStatus::Malformed;
+                const uchar firstByte = uchar(rbsp[pos]);
+                const int candidate = firstByte >> 4;
+                const int sourceScanType = (firstByte >> 2) & 0x03;
+                if (candidate > 12 || sourceScanType == 3 ||
+                    (payloadSize == 1 && (firstByte & 0x01u) == 0)) {
+                    return HevcPicStructScanStatus::Malformed;
+                }
+                if (picStruct.has_value() && *picStruct != candidate)
+                    return HevcPicStructScanStatus::Unsupported;
+                picStruct = candidate;
+            }
+            pos += int(payloadSize);
+        }
+        if (!sawTrailingBits || pos != rbsp.size()) return HevcPicStructScanStatus::Malformed;
+    }
+    if (!sawTimeCode) return HevcPicStructScanStatus::Valid;
+    if (!picStruct.has_value()) return HevcPicStructScanStatus::Unsupported;
+    expectedClockCount = clockCountForHevcPicStruct(*picStruct);
+    return expectedClockCount > 0 ? HevcPicStructScanStatus::Valid
+                                  : HevcPicStructScanStatus::Unsupported;
+}
+
+H26xTimingDetail::TimecodeParseResult
+extractFromSeiRbsp(const QByteArray& rbsp, NativeVideoCodec codec, const H26xTimingContext* context,
+                   bool prefixSei, H26xTimingDetail::HevcTimeCodeContinuity* hevcContinuity,
+                   int expectedHevcClockCount) {
     using H26xTimingDetail::TimecodeParseResult;
     using H26xTimingDetail::TimecodeParseStatus;
 
@@ -153,8 +242,14 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
         } else if (codec == NativeVideoCodec::Hevc && payloadType == 136 && prefixSei &&
                    context != nullptr && context->codec() == NativeVideoCodec::Hevc &&
                    context->hevc() != nullptr) {
-            parsed = H26xTimingDetail::parseHevcTimeCode(rbsp.mid(pos, int(payloadSize)),
-                                                         *context->hevc());
+            H26xTimingDetail::HevcTimeCodeContinuity updatedContinuity;
+            parsed = H26xTimingDetail::parseHevcTimeCode(
+                rbsp.mid(pos, int(payloadSize)), *context->hevc(), hevcContinuity,
+                &updatedContinuity, expectedHevcClockCount);
+            if (hevcContinuity != nullptr && parsed.status != TimecodeParseStatus::Malformed &&
+                parsed.status != TimecodeParseStatus::Unsupported) {
+                *hevcContinuity = updatedContinuity;
+            }
             handled = true;
         } else if (codec == NativeVideoCodec::Hevc && payloadType == 136 && prefixSei) {
             sawUnsupported = true;
@@ -162,8 +257,14 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
         if (handled) {
             if (parsed.status == TimecodeParseStatus::Malformed) sawMalformed = true;
             if (parsed.status == TimecodeParseStatus::Unsupported) sawUnsupported = true;
-            if (parsed.status == TimecodeParseStatus::Valid && !result.timecode.valid)
-                result = parsed;
+            if (parsed.status == TimecodeParseStatus::Valid) {
+                if (!result.timecode.valid) {
+                    result = parsed;
+                } else if (codec == NativeVideoCodec::Hevc &&
+                           !equivalentTimecodeResult(result, parsed)) {
+                    sawMalformed = true;
+                }
+            }
         }
         pos += int(payloadSize);
     }
@@ -179,14 +280,23 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
     return result;
 }
 
-H26xSeiTimecodeResult extractResult(const QByteArray& annexB, NativeVideoCodec codec,
-                                    const H26xTimingContext* context) {
+H26xSeiTimecodeResult
+extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTimingContext* context,
+              H26xTimingDetail::HevcTimeCodeContinuity* hevcContinuity = nullptr,
+              bool* accepted = nullptr) {
+    if (accepted != nullptr) *accepted = true;
     if (annexB.isEmpty() || codec == NativeVideoCodec::Unknown) return {};
     using H26xTimingDetail::TimecodeParseStatus;
+
+    struct SeiNalData {
+        QByteArray rbsp;
+        bool prefix = false;
+    };
 
     H26xSeiTimecodeResult firstUsableTimestamp;
     bool sawUnsupported = false;
     bool sawMalformed = false;
+    QList<SeiNalData> seiNals;
     for (const QByteArray& nal : splitAnnexBNals(annexB)) {
         if (!isSeiNal(nal, codec)) continue;
         if (codec == NativeVideoCodec::H264 && (uchar(nal[0]) & 0xe0u) != 0) {
@@ -197,6 +307,13 @@ H26xSeiTimecodeResult extractResult(const QByteArray& annexB, NativeVideoCodec c
             (((uchar(nal[0]) & 0x80u) != 0) || (uchar(nal[1]) & 0x07u) == 0)) {
             sawMalformed = true;
             continue;
+        }
+        if (codec == NativeVideoCodec::Hevc) {
+            const int layerId = ((uchar(nal[0]) & 0x01u) << 5) | (uchar(nal[1]) >> 3);
+            if (layerId != 0) {
+                sawUnsupported = true;
+                continue;
+            }
         }
         const int headerBytes = codec == NativeVideoCodec::H264 ? 1 : 2;
         if (nal.size() <= headerBytes) {
@@ -210,7 +327,26 @@ H26xSeiTimecodeResult extractResult(const QByteArray& annexB, NativeVideoCodec c
         }
         const bool prefixSei =
             codec != NativeVideoCodec::Hevc || (((uchar(nal[0]) >> 1) & 0x3f) == 39);
-        const auto parsed = extractFromSeiRbsp(rbsp, codec, context, prefixSei);
+        seiNals.append({rbsp, prefixSei});
+    }
+
+    int expectedHevcClockCount = -1;
+    if (codec == NativeVideoCodec::Hevc && context != nullptr && context->hevc() != nullptr &&
+        context->hevc()->frameFieldInfoPresent) {
+        QList<QByteArray> prefixRbsps;
+        for (const SeiNalData& nal : seiNals) {
+            if (nal.prefix) prefixRbsps.append(nal.rbsp);
+        }
+        bool sawTimeCode = false;
+        const HevcPicStructScanStatus status =
+            scanHevcAuSeiContext(prefixRbsps, sawTimeCode, expectedHevcClockCount);
+        if (status == HevcPicStructScanStatus::Malformed) sawMalformed = true;
+        if (status == HevcPicStructScanStatus::Unsupported) sawUnsupported = true;
+    }
+
+    for (const SeiNalData& nal : seiNals) {
+        const auto parsed = extractFromSeiRbsp(nal.rbsp, codec, context, nal.prefix, hevcContinuity,
+                                               expectedHevcClockCount);
         if (parsed.status == TimecodeParseStatus::Malformed) {
             sawMalformed = true;
         } else if (parsed.status == TimecodeParseStatus::Unsupported) {
@@ -221,13 +357,26 @@ H26xSeiTimecodeResult extractResult(const QByteArray& annexB, NativeVideoCodec c
             firstUsableTimestamp.labelRate = parsed.labelRate;
             firstUsableTimestamp.provenance = parsed.provenance;
             firstUsableTimestamp.discontinuity = parsed.discontinuity;
+        } else if (parsed.status == TimecodeParseStatus::Valid && codec == NativeVideoCodec::Hevc &&
+                   !equivalentTimecodeResult(firstUsableTimestamp, parsed)) {
+            sawMalformed = true;
         }
     }
-    if (sawMalformed || sawUnsupported) return {};
+    if (sawMalformed || sawUnsupported) {
+        if (accepted != nullptr) *accepted = false;
+        return {};
+    }
     return firstUsableTimestamp;
 }
 
 } // namespace
+
+void H26xSeiTimecodeState::reset() {
+    m_contextBound = false;
+    m_contextGeneration = 0;
+    m_codec = NativeVideoCodec::Unknown;
+    m_hevcContinuity = {};
+}
 
 Smpte12mTimecode extractH26xSeiTimecode(const QByteArray& annexB, NativeVideoCodec codec) {
     return extractResult(annexB, codec, nullptr).timecode;
@@ -241,4 +390,23 @@ Smpte12mTimecode extractH26xSeiTimecode(const QByteArray& annexB, NativeVideoCod
 H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, NativeVideoCodec codec,
                                                    const H26xTimingContext& context) {
     return extractResult(annexB, codec, &context);
+}
+
+H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, NativeVideoCodec codec,
+                                                   const H26xTimingContext& context,
+                                                   H26xSeiTimecodeState& state) {
+    if (!state.m_contextBound || state.m_contextGeneration != context.generation() ||
+        state.m_codec != codec) {
+        state.reset();
+        state.m_contextBound = true;
+        state.m_contextGeneration = context.generation();
+        state.m_codec = codec;
+    }
+
+    H26xTimingDetail::HevcTimeCodeContinuity workingContinuity = state.m_hevcContinuity;
+    bool accepted = false;
+    const H26xSeiTimecodeResult result =
+        extractResult(annexB, codec, &context, &workingContinuity, &accepted);
+    if (accepted) state.m_hevcContinuity = workingContinuity;
+    return result;
 }
