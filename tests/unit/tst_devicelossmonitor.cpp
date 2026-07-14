@@ -43,7 +43,7 @@ private slots:
     void validatedRecoveryRunsOnceForConcurrentWorkers();
     void rebuildInvalidatesUnconsumedRecoveryAuthority();
     void tokenlessEpochCanUpgradeToValidatedRecovery();
-    void expandedDeadDomainProofRunsNewRecoveryRevision();
+    void expandedDeadDomainProofCompletesNewRecoveryRevision();
     void resetReturnsToPristine();
 };
 
@@ -124,7 +124,7 @@ void TestDeviceLossMonitor::tokenlessEpochCanUpgradeToValidatedRecovery() {
     monitor.reset();
 }
 
-void TestDeviceLossMonitor::expandedDeadDomainProofRunsNewRecoveryRevision() {
+void TestDeviceLossMonitor::expandedDeadDomainProofCompletesNewRecoveryRevision() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
@@ -144,8 +144,8 @@ void TestDeviceLossMonitor::expandedDeadDomainProofRunsNewRecoveryRevision() {
                      return qsizetype(callbacks);
                  })
                  .abandoned,
-             qsizetype(2));
-    QCOMPARE(callbacks, 2);
+             qsizetype(0));
+    QCOMPARE(callbacks, 1);
     monitor.reset();
 }
 

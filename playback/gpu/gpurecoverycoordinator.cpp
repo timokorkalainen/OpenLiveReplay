@@ -52,6 +52,13 @@ GpuRecoveryCoordinator::coordinate(uint64_t lossGeneration, uint64_t proofRevisi
     return result;
 }
 
+bool GpuRecoveryCoordinator::completed(uint64_t lossGeneration, uint64_t proofRevision) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return !m_inProgress && m_completedGeneration == lossGeneration &&
+           m_completedRevision == proofRevision &&
+           m_completedResult.status == GpuValidatedLossStatus::Completed;
+}
+
 #ifdef OLR_UNIT_TEST
 void GpuRecoveryCoordinator::resetForTest() {
     std::lock_guard<std::mutex> lock(m_mutex);

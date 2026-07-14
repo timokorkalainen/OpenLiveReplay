@@ -1,6 +1,7 @@
 #include "playback/gpu/gpudevicelossmonitor.h"
 
 #include "playback/gpu/gpugeneration.h"
+#include "playback/gpu/gpuretireregistry.h"
 
 GpuDeviceLossMonitor& GpuDeviceLossMonitor::instance() {
     static GpuDeviceLossMonitor monitor;
@@ -37,33 +38,63 @@ uint64_t GpuDeviceLossMonitor::captureDeviceAuthorityEpoch() const {
 uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance provenance,
                                                      uint64_t deviceAuthorityEpoch,
                                                      uintptr_t deviceDomainId) {
-    std::lock_guard<std::mutex> lock(m_epochMutex);
-    if (deviceAuthorityEpoch != m_deviceAuthorityEpoch) return 0;
-    if (m_lost.load(std::memory_order_acquire)) {
-        const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
-        for (const DeadDeviceToken& token : m_realLossTokens) {
-            if (token.deviceDomainId() == deviceDomainId) return generation;
+    std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
+    uint64_t generation = 0;
+    uint64_t acceptedRevision = 0;
+    std::vector<DeadDeviceToken> acceptedProof;
+    bool precedingRecoveryCompleted = false;
+    {
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        if (deviceAuthorityEpoch != m_deviceAuthorityEpoch) return 0;
+        if (m_lost.load(std::memory_order_acquire)) {
+            generation = m_lossGeneration.load(std::memory_order_acquire);
+            for (const DeadDeviceToken& token : m_realLossTokens) {
+                if (token.deviceDomainId() == deviceDomainId) return generation;
+            }
+            const uint64_t precedingRevision = m_realLossTokens.empty()
+                                                   ? std::numeric_limits<uint64_t>::max()
+                                                   : m_realLossRevision;
+            precedingRecoveryCompleted =
+                GpuRecoveryCoordinator::instance().completed(generation, precedingRevision);
+            // A single adapter reset can kill more than one device domain. An earlier
+            // tokenless submission failure identifies where submission first failed,
+            // but it is not authority to reject later driver proof from another owned
+            // domain. Accept every current-authority observation in this loss epoch.
+            const DeadDeviceToken token(provenance, generation, deviceDomainId,
+                                        m_deviceAuthorityEpoch);
+            acceptedProof.push_back(token);
+            m_realLossTokens.push_back(token);
+            ++m_realLossRevision;
+            acceptedRevision = m_realLossRevision;
+            if (!m_realLossToken) m_realLossToken = token;
+        } else {
+            generation = GpuGenerationCounter::instance().bump();
+            m_lossGeneration.store(generation, std::memory_order_release);
+            const DeadDeviceToken token(provenance, generation, deviceDomainId,
+                                        m_deviceAuthorityEpoch);
+            acceptedProof.push_back(token);
+            m_realLossToken = token;
+            m_realLossTokens = {token};
+            ++m_realLossRevision;
+            acceptedRevision = m_realLossRevision;
+            m_lossCount.fetch_add(1, std::memory_order_acq_rel);
+            m_undrained.fetch_add(1, std::memory_order_acq_rel);
+            m_lost.store(true, std::memory_order_release);
         }
-        // A single adapter reset can kill more than one device domain. An earlier
-        // tokenless submission failure identifies where submission first failed,
-        // but it is not authority to reject later driver proof from another owned
-        // domain. Accept every current-authority observation in this loss epoch.
-        const DeadDeviceToken token(provenance, generation, deviceDomainId, m_deviceAuthorityEpoch);
-        m_realLossTokens.push_back(token);
-        ++m_realLossRevision;
-        if (!m_realLossToken) m_realLossToken = token;
-        return generation;
     }
 
-    const uint64_t generation = GpuGenerationCounter::instance().bump();
-    m_lossGeneration.store(generation, std::memory_order_release);
-    const DeadDeviceToken token(provenance, generation, deviceDomainId, m_deviceAuthorityEpoch);
-    m_realLossToken = token;
-    m_realLossTokens = {token};
-    ++m_realLossRevision;
-    m_lossCount.fetch_add(1, std::memory_order_acq_rel);
-    m_undrained.fetch_add(1, std::memory_order_acq_rel);
-    m_lost.store(true, std::memory_order_release);
+    // Once the preceding recovery revision completed, publication is the only
+    // production event guaranteed for a later proof while the worker is already
+    // in rebuild-pending or fallback. Carry only that accepted domain out of the
+    // epoch lock and release its dead-device quarantine without waiting. Initial
+    // proof delivery remains owned by the coordinated worker transition.
+    if (precedingRecoveryCompleted) {
+        GpuValidatedDeadDomains deadDomain(acceptedProof);
+        (void) GpuRecoveryCoordinator::instance().coordinate(generation, acceptedRevision, [&]() {
+            return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
+                                          GpuRetireRegistry{}.abandonAllNoWait(deadDomain)};
+        });
+    }
     return generation;
 }
 

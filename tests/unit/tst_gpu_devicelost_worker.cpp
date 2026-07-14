@@ -26,6 +26,19 @@
 #include <QSemaphore>
 #include <QThread>
 
+#ifdef OLR_UNIT_TEST
+struct GpuDeviceLossMonitorTestAuthority {
+    static uint64_t capture() {
+        return GpuDeviceLossMonitor::instance().captureDeviceAuthorityEpoch();
+    }
+    static uint64_t publish(uint64_t deviceAuthorityEpoch, uintptr_t deviceDomainId) {
+        return GpuDeviceLossMonitor::instance().publishRealDeviceLoss(
+            DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
+            deviceDomainId);
+    }
+};
+#endif
+
 class TestGpuDeviceLostWorker : public QObject {
     Q_OBJECT
 private slots:
@@ -40,6 +53,7 @@ private slots:
     void repeatedBackgroundSuspendResumeDoesNotConsumeDeviceLossBudget();
     void lossSanitizesDecoderTrackBuffers();
     void boundedLossWaitDoesNotHoldRecoveryEpochLock();
+    void lateDeadDomainProofReleasesQuarantineAutomatically();
 
 private:
     std::shared_ptr<GpuRhiContext> createTestRhi() const;
@@ -77,6 +91,19 @@ public:
 private:
     uint64_t m_signalled = 0;
     std::atomic<uint64_t> m_completed{0};
+};
+
+class IncompleteLossFence final : public GpuFence {
+public:
+    IncompleteLossFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override { return ++m_signalled; }
+    bool wait(uint64_t, int) override { return false; }
+    uint64_t completedValue() const override { return 0; }
+
+private:
+    uint64_t m_signalled = 0;
 };
 
 class CompatibleLossSurface final : public GpuSurface {
@@ -509,6 +536,52 @@ void TestGpuDeviceLostWorker::boundedLossWaitDoesNotHoldRecoveryEpochLock() {
     QVERIFY2(rebuildReturnedBeforeFenceRelease,
              "bounded fence wait must run after the recovery epoch mutex is released");
     QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
+}
+
+void TestGpuDeviceLostWorker::lateDeadDomainProofReleasesQuarantineAutomatically() {
+    qunsetenv("OLR_GPU_PIPELINE");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t firstDomain = 0xA110;
+    constexpr uintptr_t lateDomain = 0xB220;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto firstFence = std::make_shared<IncompleteLossFence>(firstDomain, authority);
+    auto lateFence = std::make_shared<IncompleteLossFence>(lateDomain, authority);
+    auto firstSurface = std::make_shared<CompatibleLossSurface>(firstDomain, authority);
+    auto lateSurface = std::make_shared<CompatibleLossSurface>(lateDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope firstOperation(firstFence, registry);
+    GpuOpScope lateOperation(lateFence, registry);
+    QCOMPARE(firstOperation
+                 .submit(adapter, GpuSurfacePack<1>(
+                                      std::array<std::shared_ptr<GpuSurface>, 1>{firstSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(lateOperation
+                 .submit(adapter,
+                         GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{lateSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+    worker.handleGpuDeviceLoss();
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, lateDomain) != 0);
+
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
 }
 
 void TestGpuDeviceLostWorker::lossSanitizesDecoderTrackBuffers() {

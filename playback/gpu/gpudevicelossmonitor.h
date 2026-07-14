@@ -150,6 +150,8 @@ private:
     std::atomic<uint64_t> m_undrained{0};
     std::atomic<uint64_t> m_lossGeneration{0};
     std::atomic<uint64_t> m_publishedDeviceAuthorityEpoch{1};
+    // Serializes cold-path proof publication through its post-epoch recovery delivery.
+    std::mutex m_proofDeliveryMutex;
     mutable std::mutex m_epochMutex;
     uint64_t m_deviceAuthorityEpoch = 1;            // guarded by m_epochMutex
     bool m_rebuildInProgress = false;               // guarded by m_epochMutex

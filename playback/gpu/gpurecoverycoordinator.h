@@ -21,6 +21,7 @@ public:
     static GpuRecoveryCoordinator& instance();
     GpuValidatedLossResult coordinate(uint64_t lossGeneration, uint64_t proofRevision,
                                       const std::function<GpuValidatedLossResult()>& leaderWork);
+    bool completed(uint64_t lossGeneration, uint64_t proofRevision);
 #ifdef OLR_UNIT_TEST
     void resetForTest();
 #endif
