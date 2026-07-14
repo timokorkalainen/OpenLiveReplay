@@ -2,8 +2,6 @@
 
 #ifdef _WIN32
 
-#include "playback/gpu/gpugeneration.h"
-
 #include <utility>
 
 namespace {
@@ -13,9 +11,9 @@ std::atomic<bool> g_forceAllocFailure{false};
 std::shared_ptr<D3D11GpuSurface>
 D3D11GpuSurface::createKept(Microsoft::WRL::ComPtr<ID3D11Device> device,
                             Microsoft::WRL::ComPtr<ID3D11Texture2D> texture, UINT subresource,
-                            int width, int height) {
+                            int width, int height, uint64_t authorityEpoch) {
     if (g_forceAllocFailure.load(std::memory_order_acquire)) return nullptr;
-    if (!device || !texture || width <= 0 || height <= 0) return nullptr;
+    if (!device || !texture || width <= 0 || height <= 0 || authorityEpoch == 0) return nullptr;
 
     Microsoft::WRL::ComPtr<ID3D11Device> textureDevice;
     texture->GetDevice(&textureDevice);
@@ -41,7 +39,7 @@ D3D11GpuSurface::createKept(Microsoft::WRL::ComPtr<ID3D11Device> device,
     surface->m_deviceIdentity = std::move(textureDeviceIdentity);
     surface->m_device = std::move(textureDevice);
     surface->m_texture = std::move(texture);
-    surface->m_authorityEpoch = GpuGenerationCounter::instance().current();
+    surface->m_authorityEpoch = authorityEpoch;
     surface->m_subresource = subresource;
     surface->m_width = width;
     surface->m_height = height;

@@ -123,6 +123,7 @@ struct WinGpuFaultWorkerOracle::Impl {
     FrameMetadata expectedMetadata;
     CpuPlanes expectedCpu;
     uint64_t generationBefore = 0;
+    uint64_t deviceAuthorityEpoch = 0;
     ComPtr<ID3D11Device> device;
 };
 
@@ -146,6 +147,7 @@ bool WinGpuFaultWorkerOracle::prepare(const QJsonObject& capability, QString* er
         return false;
     }
     m_impl->preLossRhi = gpuRhi;
+    m_impl->deviceAuthorityEpoch = GpuRhiContext::captureD3D11RemovalAuthorityForTest();
 
     LUID workerLuid{};
     if (!deviceAndLuid(m_impl->preLossRhi, &m_impl->device, &workerLuid)) {
@@ -182,7 +184,8 @@ bool WinGpuFaultWorkerOracle::prepare(const QJsonObject& capability, QString* er
         if (error) *error = QStringLiteral("cannot create worker-oracle NV12 surface");
         return false;
     }
-    m_impl->preLossSurface = D3D11GpuSurface::createKept(m_impl->device, texture, 0, 16, 16);
+    m_impl->preLossSurface = D3D11GpuSurface::createKept(m_impl->device, texture, 0, 16, 16,
+                                                         m_impl->deviceAuthorityEpoch);
     FrameMetadata metadata;
     metadata.key.feedIndex = 0;
     metadata.key.ptsMs = 0;

@@ -3,6 +3,7 @@
 // ID3D11Fence on Windows, and a deterministic timeline stub elsewhere.
 #include <QtTest>
 
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpusubmission.h"
 
@@ -47,7 +48,8 @@ std::shared_ptr<GpuFence> createTestFence() {
                                  D3D11_SDK_VERSION, &device, &level, &context))) {
         return nullptr;
     }
-    return makeD3D11GpuFence(device.Get());
+    return makeD3D11GpuFence(device.Get(),
+                             GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest());
 #else
     return GpuFence::create();
 #endif

@@ -65,6 +65,9 @@ public:
         return authorityEpoch != 0 &&
                m_publishedDeviceAuthorityEpoch.load(std::memory_order_acquire) == authorityEpoch;
     }
+    uint64_t currentDeviceAuthorityEpoch() const noexcept {
+        return m_publishedDeviceAuthorityEpoch.load(std::memory_order_acquire);
+    }
     uint64_t lossCount() const;
 
     // Idempotent while the latch is already lost. A fresh loss epoch begins only
@@ -126,7 +129,7 @@ public:
     void reset();
 #ifdef OLR_UNIT_TEST
     uint64_t currentDeviceAuthorityForTest() const noexcept {
-        return m_publishedDeviceAuthorityEpoch.load(std::memory_order_acquire);
+        return currentDeviceAuthorityEpoch();
     }
 #endif
 

@@ -74,6 +74,7 @@ struct HardwareDevice {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     DXGI_ADAPTER_DESC1 adapter{};
+    uint64_t authorityEpoch = 0;
 };
 
 bool createHardwareDevice(HardwareDevice* out, QString* error) {
@@ -83,6 +84,8 @@ bool createHardwareDevice(HardwareDevice* out, QString* error) {
     }
     D3D_FEATURE_LEVEL created{};
     const D3D_FEATURE_LEVEL levels[]{D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    const uint64_t authorityEpoch =
+        GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest();
     const HRESULT hr =
         D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                           D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
@@ -93,6 +96,7 @@ bool createHardwareDevice(HardwareDevice* out, QString* error) {
                          .arg(quint32(hr), 8, 16, QLatin1Char('0'));
         return false;
     }
+    out->authorityEpoch = authorityEpoch;
 
     ComPtr<IDXGIDevice> dxgiDevice;
     ComPtr<IDXGIAdapter> adapter;
@@ -128,7 +132,10 @@ bool supportsFence(ID3D11Device* device) {
 
 class MeasuredFence final : public GpuFence {
 public:
-    explicit MeasuredFence(std::shared_ptr<GpuFence> inner) : m_inner(std::move(inner)) {}
+    explicit MeasuredFence(std::shared_ptr<GpuFence> inner)
+        : GpuFence(inner ? inner->identity().deviceDomainId : 0,
+                   inner ? inner->identity().authorityEpoch : 0),
+          m_inner(std::move(inner)) {}
 
     uint64_t signal() override {
         ++m_signalCount;
@@ -232,7 +239,7 @@ bool createDispatchResources(HardwareDevice& gpu, ComPtr<ID3D11UnorderedAccessVi
         if (error) *error = QStringLiteral("retirement surface allocation failed");
         return false;
     }
-    *surface = D3D11GpuSurface::createKept(gpu.device, texture, 0, 16, 16);
+    *surface = D3D11GpuSurface::createKept(gpu.device, texture, 0, 16, 16, gpu.authorityEpoch);
     return *surface != nullptr;
 }
 
@@ -297,7 +304,7 @@ int probeFence() {
         std::fprintf(stderr, "%s\n", qPrintable(error));
         return 3;
     }
-    const auto nativeFence = makeD3D11GpuFence(gpu.device.Get());
+    const auto nativeFence = makeD3D11GpuFence(gpu.device.Get(), gpu.authorityEpoch);
     if (!nativeFence) return 4;
     auto fence = std::make_shared<MeasuredFence>(nativeFence);
 
@@ -353,6 +360,8 @@ int triggerTdr(const winGpuFault::TdrPolicySnapshot& policy) {
     }
     gpu.device = static_cast<ID3D11Device*>(workerOracle.d3dDevice());
     if (!gpu.device || !supportsFence(gpu.device.Get())) return 2;
+    const uint64_t deviceAuthorityEpoch = GpuRhiContext::captureD3D11RemovalAuthorityForTest();
+    gpu.authorityEpoch = deviceAuthorityEpoch;
     const auto shader = compileShader(
         gpu.device.Get(), loadShader(QStringLiteral("win_gpu_tdr_dispatch.hlsl"), &error), &error);
     ComPtr<ID3D11UnorderedAccessView> uav;
@@ -360,12 +369,11 @@ int triggerTdr(const winGpuFault::TdrPolicySnapshot& policy) {
         std::fprintf(stderr, "%s\n", qPrintable(error));
         return 3;
     }
-    const auto nativeFence = makeD3D11GpuFence(gpu.device.Get());
+    const auto nativeFence = makeD3D11GpuFence(gpu.device.Get(), gpu.authorityEpoch);
     if (!nativeFence) return 4;
     auto fence = std::make_shared<MeasuredFence>(nativeFence);
 
     auto& monitor = GpuDeviceLossMonitor::instance();
-    const uint64_t deviceAuthorityEpoch = GpuRhiContext::captureD3D11RemovalAuthorityForTest();
     const uint64_t generationBefore = GpuGenerationCounter::instance().current();
     qsizetype pendingInitially = 0;
     const bool dispatched = workerOracle.submitWorkerFaultOperation(

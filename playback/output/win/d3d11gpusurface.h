@@ -20,7 +20,7 @@ public:
     static std::shared_ptr<D3D11GpuSurface>
     createKept(Microsoft::WRL::ComPtr<ID3D11Device> device,
                Microsoft::WRL::ComPtr<ID3D11Texture2D> texture, UINT subresource, int width,
-               int height);
+               int height, uint64_t authorityEpoch);
 
     GpuSurfaceDesc desc() const override {
         return GpuSurfaceDesc{FramePixelFormat::Nv12, m_width, m_height,

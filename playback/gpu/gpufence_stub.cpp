@@ -1,4 +1,5 @@
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpugeneration.h"
 
 #if !defined(__APPLE__) && !defined(_WIN32)
@@ -14,7 +15,9 @@ const int stubDeviceDomain = 0;
 
 class StubGpuFence final : public GpuFence {
 public:
-    StubGpuFence() : GpuFence(reinterpret_cast<uintptr_t>(&stubDeviceDomain)) {}
+    StubGpuFence()
+        : GpuFence(reinterpret_cast<uintptr_t>(&stubDeviceDomain),
+                   GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()) {}
     uint64_t signal() override { return m_value.fetch_add(1, std::memory_order_acq_rel) + 1; }
 
     bool wait(uint64_t value, int timeoutMs) override {
@@ -38,7 +41,9 @@ private:
 
 GpuFence::GpuFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
     : m_identity{gpuSubmissionDetail::takeMonotonicInstanceId(nextFenceInstanceId), deviceDomainId,
-                 authorityEpoch != 0 ? authorityEpoch : GpuGenerationCounter::instance().current()},
+                 authorityEpoch != 0
+                     ? authorityEpoch
+                     : GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()},
       m_ticketAuthorityKey(makeTicketAuthorityKey(m_identity, this)) {}
 
 GpuFence::~GpuFence() = default;

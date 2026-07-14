@@ -4,6 +4,7 @@
 #include <QtTest>
 
 #include "playback/gpu/gpupipelineconfig.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurface.h"
@@ -40,7 +41,7 @@ private slots:
     void appleSurfaceIsIoSurfaceBacked();
     void appleSurfaceRespectsInjectedAllocFailure();
     void appleSurfaceTracksPendingFence();
-    void appleSurfaceRejectsReusedDeviceUnderNewAuthorityEpoch();
+    void appleSurfaceSeparatesFrameGenerationFromDeviceAuthority();
     void applePixelBufferWrapperOutlivesSurfaceOwner();
 #endif
 };
@@ -112,23 +113,38 @@ void TestGpuSurface::appleSurfaceTracksPendingFence() {
     QCOMPARE(surface->pendingFenceValue(), uint64_t(9));
 }
 
-void TestGpuSurface::appleSurfaceRejectsReusedDeviceUnderNewAuthorityEpoch() {
+void TestGpuSurface::appleSurfaceSeparatesFrameGenerationFromDeviceAuthority() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
+    const auto resetState = qScopeGuard([&] {
+        monitor.reset();
+        GpuGenerationCounter::instance().resetForTest();
+    });
     auto oldSurface = makeAppleNv12Surface(64, 48);
     auto oldFence = GpuFence::create();
     if (!oldSurface || !oldFence) QSKIP("no default Metal device/fence on this host");
     QVERIFY(oldFence->sharesDeviceAuthorityWith(oldSurface));
 
     GpuGenerationCounter::instance().bump();
-    auto replacementFence = GpuFence::create();
-    auto replacementSurface = makeAppleNv12Surface(64, 48);
-    QVERIFY(replacementFence != nullptr);
-    QVERIFY(replacementSurface != nullptr);
-    QCOMPARE(replacementFence->identity().deviceDomainId, oldFence->identity().deviceDomainId);
-    QVERIFY(replacementFence->identity().authorityEpoch != oldFence->identity().authorityEpoch);
-    QVERIFY(!replacementFence->sharesDeviceAuthorityWith(oldSurface));
-    QVERIFY(replacementFence->sharesDeviceAuthorityWith(replacementSurface));
-    GpuGenerationCounter::instance().resetForTest();
+    auto postSeekFence = GpuFence::create();
+    auto postSeekSurface = makeAppleNv12Surface(64, 48);
+    QVERIFY(postSeekFence != nullptr);
+    QVERIFY(postSeekSurface != nullptr);
+    QCOMPARE(postSeekFence->identity().deviceDomainId, oldFence->identity().deviceDomainId);
+    QCOMPARE(postSeekFence->identity().authorityEpoch, oldFence->identity().authorityEpoch);
+    QVERIFY(postSeekFence->sharesDeviceAuthorityWith(oldSurface));
+    QVERIFY(postSeekFence->sharesDeviceAuthorityWith(postSeekSurface));
+
+    monitor.beginRebuild();
+    auto rebuiltFence = GpuFence::create();
+    auto rebuiltSurface = makeAppleNv12Surface(64, 48);
+    QVERIFY(rebuiltFence != nullptr);
+    QVERIFY(rebuiltSurface != nullptr);
+    QCOMPARE(rebuiltFence->identity().deviceDomainId, oldFence->identity().deviceDomainId);
+    QVERIFY(rebuiltFence->identity().authorityEpoch != oldFence->identity().authorityEpoch);
+    QVERIFY(!rebuiltFence->sharesDeviceAuthorityWith(oldSurface));
+    QVERIFY(rebuiltFence->sharesDeviceAuthorityWith(rebuiltSurface));
 }
 
 void TestGpuSurface::applePixelBufferWrapperOutlivesSurfaceOwner() {

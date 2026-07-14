@@ -104,11 +104,11 @@ private:
 };
 
 #ifdef __APPLE__
-std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue);
+std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue, uint64_t authorityEpoch);
 #endif
 
 #ifdef _WIN32
-std::shared_ptr<GpuFence> makeD3D11GpuFence(void* d3d11Device);
+std::shared_ptr<GpuFence> makeD3D11GpuFence(void* d3d11Device, uint64_t authorityEpoch);
 #endif
 
 #endif // OLR_GPUFENCE_H

@@ -751,7 +751,9 @@ std::shared_ptr<GpuFence> GpuRhiContext::createFence() const {
         if (!rhi) return;
         const auto* nativeHandles =
             static_cast<const QRhiMetalNativeHandles*>(rhi->nativeHandles());
-        fence = nativeHandles ? makeMetalGpuFence(nativeHandles->cmdQueue) : nullptr;
+        fence = nativeHandles
+                    ? makeMetalGpuFence(nativeHandles->cmdQueue, m_impl->deviceAuthorityEpoch)
+                    : nullptr;
     });
     return invoked ? fence : nullptr;
 }

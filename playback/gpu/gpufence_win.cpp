@@ -2,8 +2,9 @@
 
 #ifdef _WIN32
 
-#include "playback/output/win/d3dfence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpugeneration.h"
+#include "playback/output/win/d3dfence.h"
 
 #include <QString>
 
@@ -24,8 +25,9 @@ uintptr_t d3d11DeviceDomainId(ID3D11Device* device) {
 
 class D3D11GpuFence final : public GpuFence {
 public:
-    D3D11GpuFence(std::unique_ptr<D3DFence> fence, ID3D11Device* device)
-        : GpuFence(d3d11DeviceDomainId(device)), m_fence(std::move(fence)), m_device(device) {
+    D3D11GpuFence(std::unique_ptr<D3DFence> fence, ID3D11Device* device, uint64_t authorityEpoch)
+        : GpuFence(d3d11DeviceDomainId(device), authorityEpoch), m_fence(std::move(fence)),
+          m_device(device) {
         device->GetImmediateContext(&m_context);
         device->QueryInterface(IID_PPV_ARGS(&m_deviceIdentity));
     }
@@ -63,7 +65,9 @@ private:
 
 GpuFence::GpuFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
     : m_identity{gpuSubmissionDetail::takeMonotonicInstanceId(nextFenceInstanceId), deviceDomainId,
-                 authorityEpoch != 0 ? authorityEpoch : GpuGenerationCounter::instance().current()},
+                 authorityEpoch != 0
+                     ? authorityEpoch
+                     : GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()},
       m_ticketAuthorityKey(makeTicketAuthorityKey(m_identity, this)) {}
 
 GpuFence::~GpuFence() = default;
@@ -81,14 +85,14 @@ bool GpuFence::validatesRetirement(const GpuRetirementTicket& ticket,
                sealTicket(ticket.m_identity, ticket.m_gpuGeneration, ticket.m_value);
 }
 
-std::shared_ptr<GpuFence> makeD3D11GpuFence(void* d3d11Device) {
+std::shared_ptr<GpuFence> makeD3D11GpuFence(void* d3d11Device, uint64_t authorityEpoch) {
     auto* device = static_cast<ID3D11Device*>(d3d11Device);
-    if (!device) return nullptr;
+    if (!device || authorityEpoch == 0) return nullptr;
 
     QString error;
     auto fence = D3DFence::create(device, &error);
     if (!fence) return nullptr;
-    return std::make_shared<D3D11GpuFence>(std::move(fence), device);
+    return std::make_shared<D3D11GpuFence>(std::move(fence), device, authorityEpoch);
 }
 
 std::shared_ptr<GpuFence> GpuFence::create() {

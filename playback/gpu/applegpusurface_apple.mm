@@ -2,8 +2,8 @@
 
 #ifdef __APPLE__
 
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpupipelineconfig.h"
-#include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpusurfacelease.h"
 #include "playback/output/formatcanon.h"
 
@@ -166,7 +166,7 @@ class AppleGpuSurface final : public GpuSurface {
 public:
     AppleGpuSurface(CVPixelBufferRef pixelBuffer, FramePixelFormat format)
         : m_pixelBuffer(pixelBuffer), m_format(format),
-          m_authorityEpoch(GpuGenerationCounter::instance().current()) {
+          m_authorityEpoch(GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch()) {
         m_device = MTLCreateSystemDefaultDevice();
     }
     ~AppleGpuSurface() override {

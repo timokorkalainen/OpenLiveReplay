@@ -405,7 +405,8 @@ std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void* mfSamp
     ComPtr<ID3D11Device> textureDevice;
     texture->GetDevice(&textureDevice);
     if (!m_impl->ownsDevice(textureDevice.Get())) return nullptr;
-    auto surface = D3D11GpuSurface::createKept(textureDevice, texture, subresource, width, height);
+    auto surface = D3D11GpuSurface::createKept(textureDevice, texture, subresource, width, height,
+                                               m_impl->deviceAuthorityEpoch);
     if (!surface && m_impl) m_impl->noteDeviceLostIfRemoved();
     return surface;
 }
@@ -413,17 +414,20 @@ std::shared_ptr<D3D11GpuSurface> WinGpuImportEdge::tryImportSurface(void* mfSamp
 std::shared_ptr<GpuFence>
 WinGpuImportEdge::createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface) {
     if (!surface) return nullptr;
+    const uint64_t authorityEpoch = surface->compatibility().authorityEpoch;
     GpuSyncReadScope scope;
-    return scope.withRead(surface, [](const GpuReadLease& lease) {
+    return scope.withRead(surface, [authorityEpoch](const GpuReadLease& lease) {
         auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         ComPtr<ID3D11Device> device;
         if (texture) texture->GetDevice(&device);
-        return makeD3D11GpuFence(device.Get());
+        return makeD3D11GpuFence(device.Get(), authorityEpoch);
     });
 }
 
 std::shared_ptr<GpuFence> WinGpuImportEdge::createFence() const {
-    return (m_impl && m_impl->device) ? makeD3D11GpuFence(m_impl->device.Get()) : nullptr;
+    return (m_impl && m_impl->device)
+               ? makeD3D11GpuFence(m_impl->device.Get(), m_impl->deviceAuthorityEpoch)
+               : nullptr;
 }
 
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -491,8 +495,11 @@ bool WinGpuImportEdge::acceptsD3D11DeviceForTest(void* device) const {
 
 bool WinGpuImportEdge::decodeOneForTest(ComPtr<ID3D11Device> device, ComPtr<ID3D11Texture2D> nv12,
                                         int width, int height) {
-    auto surface =
-        D3D11GpuSurface::createKept(std::move(device), std::move(nv12), 0, width, height);
+    const uint64_t authorityEpoch =
+        m_impl ? m_impl->deviceAuthorityEpoch
+               : GpuDeviceLossMonitor::instance().currentDeviceAuthorityEpoch();
+    auto surface = D3D11GpuSurface::createKept(std::move(device), std::move(nv12), 0, width, height,
+                                               authorityEpoch);
     if (!surface) return false;
 
     FrameMetadata meta;
