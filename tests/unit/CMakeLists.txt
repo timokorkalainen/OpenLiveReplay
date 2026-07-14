@@ -176,7 +176,7 @@ olr_add_unit_test(tst_seekcoalescer olr_test_playback)
 olr_add_unit_test(tst_audioplayer_mutefade olr_test_playback)
 qt_add_executable(tst_ndi_runtime_smoke tst_ndi_runtime_smoke.cpp)
 target_link_libraries(tst_ndi_runtime_smoke PRIVATE Qt6::Test olr_test_playback olr_warnings olr_sanitize)
-add_test(NAME tst_ndi_runtime_smoke COMMAND tst_ndi_runtime_smoke)
+olr_add_ctest(NAME tst_ndi_runtime_smoke COMMAND $<TARGET_FILE:tst_ndi_runtime_smoke>)
 set_tests_properties(tst_ndi_runtime_smoke PROPERTIES
     LABELS "ndi-runtime"
     TIMEOUT 420

@@ -359,6 +359,26 @@ def production_control_flow_barrier(
     return None
 
 
+def explicitly_permitted_intervening_statement(
+    view: LexedSource, statement: tuple[int, int, str]
+) -> bool:
+    """Allow only production-inactive code or a demonstrably inert local scope."""
+    statement_code = view.code[statement[0] : statement[1]]
+    first_code = re.search(r"\S", statement_code)
+    if first_code is None:
+        return True
+    first_offset = statement[0] + first_code.start()
+    possible, _ = production_branch_state(view, first_offset)
+    if not possible:
+        return True
+
+    inert_scope = re.fullmatch(
+        r"\{constbool([A-Za-z_]\w*)=(true|false);\(void\)([A-Za-z_]\w*);\}",
+        statement[2],
+    )
+    return bool(inert_scope and inert_scope.group(1) == inert_scope.group(3))
+
+
 def audit_playbackworker(source: str, path: Path) -> None:
     view = lexical_source(source)
     begin, end = logical_function_span(
@@ -422,6 +442,12 @@ def audit_playbackworker(source: str, path: Path) -> None:
             store.start(),
             "m_committedGeneration.store must be an unconditional top-level statement",
         )
+    require_production_active(
+        view,
+        store.start(),
+        path,
+        "m_committedGeneration.store must be production-active",
+    )
     if reset_statement is None or reset_statement[2] != "resetOutputPlayEpoch();":
         fail_at(
             path,
@@ -445,6 +471,17 @@ def audit_playbackworker(source: str, path: Path) -> None:
                 barrier,
                 "production control-flow barrier separates committed-generation store "
                 "from epoch reset",
+            )
+        if not explicitly_permitted_intervening_statement(view, statement):
+            statement_code = view.code[statement[0] : statement[1]]
+            first_code = re.search(r"\S", statement_code)
+            assert first_code is not None
+            fail_at(
+                path,
+                view,
+                statement[0] + first_code.start(),
+                "only explicitly permitted test-only constructs may separate "
+                "committed-generation store from epoch reset",
             )
 
 
@@ -793,6 +830,48 @@ def main() -> int:
         worker,
         r"PlaybackWorker::commitOutputStateLocked\s*\([^)]*\)\s*",
         worker_path,
+    )
+
+    preprocessor_store = replace_once_in_span(
+        worker,
+        commit_begin,
+        commit_end,
+        committed_store,
+        "    #ifdef OLR_UNIT_TEST\n"
+        + committed_store
+        + "\n    #endif",
+    )
+    preprocessor_store_offset = preprocessor_store.find(
+        "m_committedGeneration.store", commit_begin
+    )
+    require_rejection(
+        audit_playbackworker,
+        preprocessor_store,
+        worker_path,
+        line_number(preprocessor_store, preprocessor_store_offset),
+        "m_committedGeneration.store must be production-active",
+    )
+
+    intervening_call = replace_once_in_span(
+        worker,
+        commit_begin,
+        commit_end,
+        committed_store + "\n#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n" + epoch_reset,
+        committed_store
+        + "\n    exposeCommittedGenerationBeforeEpochReset();\n"
+        + "#ifndef OLR_MUTATE_SKIP_COMMIT_EPOCH_RESET\n"
+        + epoch_reset,
+    )
+    intervening_call_offset = intervening_call.find(
+        "exposeCommittedGenerationBeforeEpochReset", commit_begin
+    )
+    require_rejection(
+        audit_playbackworker,
+        intervening_call,
+        worker_path,
+        line_number(intervening_call, intervening_call_offset),
+        "only explicitly permitted test-only constructs may separate "
+        "committed-generation store from epoch reset",
     )
 
     missing_reset = replace_once_in_span(
