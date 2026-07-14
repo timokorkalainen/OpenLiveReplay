@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -24,13 +25,25 @@ class RunCtestTests(unittest.TestCase):
         self.srt_root = self.root / "srt"
         self.cmake_bin = self.root / "cmake" / "bin"
         self.ambient_bin = self.root / "ambient" / "bin"
+        self.ctest = self.cmake_bin / "ctest.exe"
 
         self.build_dir.mkdir()
-        self.cmake_bin.mkdir(parents=True)
-        (self.cmake_bin / "ctest.exe").touch()
+        for runtime_dir in (
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.qt_root / "plugins",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+            self.cmake_bin,
+        ):
+            runtime_dir.mkdir(parents=True)
+        self.ctest.touch()
         self.cache_values = {
             "CMAKE_CXX_COMPILER": str(self.compiler_bin / "g++.exe"),
             "CMAKE_COMMAND": str(self.cmake_bin / "cmake.exe"),
+            "CMAKE_CTEST_COMMAND": str(self.ctest),
             "Qt6_DIR": str(self.qt_root / "lib" / "cmake" / "Qt6"),
             "OLR_FFMPEG_ROOT": str(self.ffmpeg_root),
             "OLR_SRT_ROOT": str(self.srt_root),
@@ -42,6 +55,18 @@ class RunCtestTests(unittest.TestCase):
         (self.build_dir / "CMakeCache.txt").write_text(
             "\n".join(lines) + "\n", encoding="utf-8"
         )
+
+    def make_fake_ctest(self, exit_code: int) -> Path:
+        if os.name == "nt":
+            fake_ctest = self.cmake_bin / "fake-ctest.cmd"
+            fake_ctest.write_text(f"@exit /b {exit_code}\n", encoding="utf-8")
+        else:
+            fake_ctest = self.cmake_bin / "fake-ctest"
+            fake_ctest.write_text(
+                f"#!/bin/sh\nexit {exit_code}\n", encoding="utf-8"
+            )
+            fake_ctest.chmod(0o755)
+        return fake_ctest
 
     def test_find_build_directory_accepts_split_test_dir(self):
         cwd = self.root / "working"
@@ -55,6 +80,26 @@ class RunCtestTests(unittest.TestCase):
             [f"--test-dir={self.build_dir}", "--output-on-failure"], self.root
         )
         self.assertEqual(actual, self.build_dir.resolve())
+
+    def test_find_build_directory_uses_last_split_or_equals_occurrence(self):
+        actual = run_ctest.find_build_directory(
+            [
+                "--test-dir",
+                "first",
+                "--test-dir=second",
+                "--test-dir",
+                "third",
+            ],
+            self.root,
+        )
+
+        self.assertEqual(actual, (self.root / "third").resolve())
+
+    def test_find_build_directory_rejects_missing_values(self):
+        for args in (["--test-dir"], ["--test-dir="]):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "requires a build directory"):
+                    run_ctest.find_build_directory(args, self.root)
 
     def test_find_build_directory_defaults_to_working_directory(self):
         self.assertEqual(run_ctest.find_build_directory(["-L", "unit"], self.root), self.root)
@@ -95,7 +140,52 @@ class RunCtestTests(unittest.TestCase):
             ],
         )
         self.assertEqual(env["PATH"].split(os.pathsep)[6:], [str(self.ambient_bin)])
-        self.assertEqual(ctest, self.cmake_bin / "ctest.exe")
+        self.assertEqual(ctest, self.ctest)
+
+    def test_windows_runtime_prefers_cached_ctest_command(self):
+        selected_ctest = self.make_fake_ctest(23)
+        self.cache_values["CMAKE_CTEST_COMMAND"] = str(selected_ctest)
+        self.write_cache()
+
+        _, ctest = run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+        self.assertEqual(ctest, selected_ctest)
+
+    def test_windows_runtime_falls_back_to_ctest_beside_cmake(self):
+        del self.cache_values["CMAKE_CTEST_COMMAND"]
+        self.write_cache()
+
+        _, ctest = run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+        self.assertEqual(ctest, self.ctest)
+
+    def test_windows_runtime_rejects_each_missing_runtime_path(self):
+        required_paths = {
+            "compiler runtime": self.compiler_bin,
+            "Qt runtime": self.qt_root / "bin",
+            "Qt plugins": self.qt_root / "plugins",
+            "FFmpeg runtime": self.ffmpeg_root / "bin",
+            "FFmpeg libraries": self.ffmpeg_root / "lib",
+            "SRT runtime": self.srt_root / "bin",
+            "SRT libraries": self.srt_root / "lib",
+            "CTest executable": self.ctest,
+        }
+        for label, path in required_paths.items():
+            with self.subTest(label=label):
+                if path.is_dir():
+                    path.rmdir()
+                else:
+                    path.unlink()
+                try:
+                    with self.assertRaisesRegex(
+                        FileNotFoundError, f"{label}.*{path.name}"
+                    ):
+                        run_ctest.prepare_windows_runtime(self.build_dir, {})
+                finally:
+                    if label == "CTest executable":
+                        path.touch()
+                    else:
+                        path.mkdir(parents=True)
 
     def test_windows_runtime_sets_controlled_qt_defaults(self):
         inherited = {"PATH": str(self.ambient_bin)}
@@ -125,28 +215,40 @@ class RunCtestTests(unittest.TestCase):
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=17)
     @mock.patch("tools.run_ctest.subprocess.run")
-    def test_main_propagates_child_exit_code(
+    def test_main_forces_noninteractive_after_hostile_caller_options(
         self,
         run: mock.Mock,
         set_error_mode: mock.Mock,
         restore_error_mode: mock.Mock,
     ):
-        run.return_value = subprocess.CompletedProcess([], 23)
+        run.return_value = subprocess.CompletedProcess([], 0)
 
-        result = run_ctest.main(["--test-dir", str(self.build_dir), "-L", "unit"])
+        result = run_ctest.main(
+            [
+                "--interactive-debug-mode",
+                "1",
+                "--test-dir",
+                str(self.build_dir),
+                "--interactive-debug-mode=1",
+                "--interactive-debug-mode",
+                "1",
+                "-L",
+                "unit",
+            ]
+        )
 
-        self.assertEqual(result, 23)
+        self.assertEqual(result, 0)
         command = run.call_args.args[0]
         self.assertEqual(
             command,
             [
-                str(self.cmake_bin / "ctest.exe"),
-                "--interactive-debug-mode",
-                "0",
+                str(self.ctest),
                 "--test-dir",
                 str(self.build_dir),
                 "-L",
                 "unit",
+                "--interactive-debug-mode",
+                "0",
             ],
         )
         self.assertFalse(run.call_args.kwargs["check"])
@@ -156,6 +258,52 @@ class RunCtestTests(unittest.TestCase):
         )
         set_error_mode.assert_called_once_with()
         restore_error_mode.assert_called_once_with(17)
+
+    @mock.patch("tools.run_ctest._restore_windows_error_mode")
+    @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=41)
+    def test_main_propagates_real_fake_ctest_exit_code(
+        self, set_error_mode: mock.Mock, restore_error_mode: mock.Mock
+    ):
+        fake_ctest = self.make_fake_ctest(23)
+        self.cache_values["CMAKE_CTEST_COMMAND"] = str(fake_ctest)
+        self.write_cache()
+
+        result = run_ctest.main(["--test-dir", str(self.build_dir)])
+
+        self.assertEqual(result, 23)
+        set_error_mode.assert_called_once_with()
+        restore_error_mode.assert_called_once_with(41)
+
+    @mock.patch("tools.run_ctest._restore_windows_error_mode")
+    @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=29)
+    @mock.patch("tools.run_ctest.subprocess.run", side_effect=OSError("launch failed"))
+    def test_main_restores_error_mode_when_child_launch_raises(
+        self,
+        _run: mock.Mock,
+        set_error_mode: mock.Mock,
+        restore_error_mode: mock.Mock,
+    ):
+        with self.assertRaisesRegex(OSError, "launch failed"):
+            run_ctest.main(["--test-dir", str(self.build_dir)])
+
+        set_error_mode.assert_called_once_with()
+        restore_error_mode.assert_called_once_with(29)
+
+    def test_windows_error_mode_uses_exact_mask_and_restore_value(self):
+        set_error_mode = mock.Mock(return_value=73)
+        windll = SimpleNamespace(
+            kernel32=SimpleNamespace(SetErrorMode=set_error_mode)
+        )
+
+        with mock.patch.object(run_ctest.ctypes, "windll", windll, create=True):
+            old_mode = run_ctest._set_windows_error_mode()
+            run_ctest._restore_windows_error_mode(old_mode)
+
+        self.assertEqual(old_mode, 73)
+        self.assertEqual(
+            set_error_mode.call_args_list,
+            [mock.call(0x8003), mock.call(73)],
+        )
 
 
 if __name__ == "__main__":

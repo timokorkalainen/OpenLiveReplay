@@ -26,20 +26,26 @@ _SEM_NOOPENFILEERRORBOX = 0x8000
 
 def find_build_directory(args: Sequence[str], cwd: Path) -> Path:
     """Return the build directory selected by CTest's ``--test-dir`` option."""
-    for index, arg in enumerate(args):
+    selected: str | None = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
         if arg == "--test-dir":
             if index + 1 >= len(args):
                 raise ValueError("--test-dir requires a build directory")
             value = args[index + 1]
             if not value:
                 raise ValueError("--test-dir requires a build directory")
-            return (cwd / value).resolve()
+            selected = value
+            index += 2
+            continue
         if arg.startswith("--test-dir="):
             value = arg.partition("=")[2]
             if not value:
                 raise ValueError("--test-dir requires a build directory")
-            return (cwd / value).resolve()
-    return cwd.resolve()
+            selected = value
+        index += 1
+    return (cwd / selected).resolve() if selected is not None else cwd.resolve()
 
 
 def read_cmake_cache(path: Path) -> dict[str, str]:
@@ -72,24 +78,57 @@ def prepare_windows_runtime(
     ffmpeg_root = Path(cache["OLR_FFMPEG_ROOT"])
     srt_root = Path(cache["OLR_SRT_ROOT"])
     runtime_dirs = (
-        compiler_bin,
-        qt_root / "bin",
-        ffmpeg_root / "bin",
-        ffmpeg_root / "lib",
-        srt_root / "bin",
-        srt_root / "lib",
+        ("compiler runtime", compiler_bin),
+        ("Qt runtime", qt_root / "bin"),
+        ("FFmpeg runtime", ffmpeg_root / "bin"),
+        ("FFmpeg libraries", ffmpeg_root / "lib"),
+        ("SRT runtime", srt_root / "bin"),
+        ("SRT libraries", srt_root / "lib"),
+    )
+    qt_plugins = qt_root / "plugins"
+
+    # CMake records the authoritative CTest path in normal build trees. Older
+    # caches may omit it, so fall back to the sibling executable beside CMake.
+    ctest_value = cache.get("CMAKE_CTEST_COMMAND")
+    ctest = (
+        Path(ctest_value)
+        if ctest_value
+        else Path(cache["CMAKE_COMMAND"]).with_name("ctest.exe")
     )
 
+    for label, path in (*runtime_dirs, ("Qt plugins", qt_plugins)):
+        if not path.is_dir():
+            raise FileNotFoundError(f"{label} directory does not exist: {path}")
+    if not ctest.is_file():
+        raise FileNotFoundError(f"CTest executable does not exist: {ctest}")
+
     env = dict(inherited_env)
-    path_entries = [str(path) for path in runtime_dirs]
+    path_entries = [str(path) for _label, path in runtime_dirs]
     if env.get("PATH"):
         path_entries.append(env["PATH"])
     env["PATH"] = os.pathsep.join(path_entries)
-    env["QT_PLUGIN_PATH"] = str(qt_root / "plugins")
+    env["QT_PLUGIN_PATH"] = str(qt_plugins)
     env.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-    ctest = Path(cache["CMAKE_COMMAND"]).with_name("ctest.exe")
     return env, ctest
+
+
+def _force_noninteractive(args: Sequence[str]) -> list[str]:
+    sanitized: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--interactive-debug-mode":
+            index += 1
+            if index < len(args) and not args[index].startswith("-"):
+                index += 1
+            continue
+        if arg.startswith("--interactive-debug-mode="):
+            index += 1
+            continue
+        sanitized.append(arg)
+        index += 1
+    return [*sanitized, "--interactive-debug-mode", "0"]
 
 
 def _set_windows_error_mode() -> int:
@@ -109,7 +148,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     build_dir = find_build_directory(args, Path.cwd())
     env, ctest = prepare_windows_runtime(build_dir, os.environ)
-    command = [str(ctest), "--interactive-debug-mode", "0", *args]
+    command = [str(ctest), *_force_noninteractive(args)]
     old_mode = _set_windows_error_mode()
     try:
         return subprocess.run(command, env=env, check=False).returncode
