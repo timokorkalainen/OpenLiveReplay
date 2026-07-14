@@ -47,6 +47,7 @@ private slots:
     void gpuNv12HandleAliasesExistingSurface();
     void gpuNv12AliasUsesBoundedFenceWait();
     void memoHitReusesSameLocalGpuSurface();
+    void composeGridFiveSourcesReturnsGpuBackedFrame();
 #endif
 };
 
@@ -543,6 +544,29 @@ void TestGpuCompositor::composeGridChargesGpuBudgetOnLocalGpu() {
     QCOMPARE(GpuBudget::instance().liveBytes(), qint64(0));
 #endif
 }
+
+#ifdef __APPLE__
+void TestGpuCompositor::composeGridFiveSourcesReturnsGpuBackedFrame() {
+    auto rhi = GpuRhiContext::create();
+    if (!rhi || !rhi->isGpuBacked()) QSKIP("no local GPU backend on this host");
+
+    auto comp = GpuCompositor::create(rhi);
+    if (!comp) QSKIP("compositor unavailable");
+
+    QList<FrameHandle> frames{
+        solidYuv420pHandle(4, 4, 32, 80, 176),   solidYuv420pHandle(4, 4, 64, 88, 168),
+        solidYuv420pHandle(4, 4, 96, 96, 160),   solidYuv420pHandle(4, 4, 128, 104, 152),
+        solidYuv420pHandle(4, 4, 160, 112, 144),
+    };
+    const FrameHandle composed = comp->composeGrid(frames, 12, 8, ColorMetadata{},
+                                                   GpuCompositor::ScaleQuality::NearestCompat);
+
+    QVERIFY(!composed.isNull());
+    QVERIFY(composed.isPresentable());
+    QVERIFY(composed.isGpuBacked());
+    QCOMPARE(composed.metadata().key.format, FramePixelFormat::Rgba8);
+}
+#endif
 
 void TestGpuCompositor::swappedQuadrantsDifferFromOracle() {
     auto rhi = GpuRhiContext::createNullForTest();

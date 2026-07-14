@@ -79,6 +79,14 @@ GpuSubmissionResult submitFour(GpuRetireRegistry& registry, const std::shared_pt
     return operation.submit(adapter, GpuSurfacePack<4>(surfaces));
 }
 
+GpuSubmissionResult submitSeventeen(GpuRetireRegistry& registry,
+                                    const std::shared_ptr<PerfFence>& fence,
+                                    const std::array<std::shared_ptr<GpuSurface>, 17>& surfaces) {
+    PerfAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    return operation.submit(adapter, GpuSurfacePack<17>(surfaces));
+}
+
 // Faithful saved model of the production GpuOpScope/prepared-slot path at
 // 912663be: one mutex, 256 fixed slots, four inline owners, first-free linear
 // preparation, a second publication lock, and one completion query per slot.
@@ -309,6 +317,7 @@ class TestGpuRetireRegistryPerf : public QObject {
 
 private slots:
     void warmedCommonPathUsesPooledShards();
+    void maxOwnerBatchUsesBoundedFourNodePath();
     void drainMeetsSaved912663beMedianAndP95();
     void allocationDetectorSeesInjectedHeapMutation();
     void implementationHasIndexedDrainAndCoherentDiagnostics();
@@ -370,6 +379,57 @@ void TestGpuRetireRegistryPerf::warmedCommonPathUsesPooledShards() {
           static_cast<unsigned long long>(storageSnapshot.fenceGroupsVisited),
           static_cast<unsigned long long>(storageSnapshot.completionQueries),
           static_cast<unsigned long long>(storageSnapshot.activeNodesVisited));
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuRetireRegistryPerf::maxOwnerBatchUsesBoundedFourNodePath() {
+    constexpr uintptr_t deviceDomainId = 0x702;
+    constexpr uint64_t authorityEpoch = 52;
+    constexpr int sampleCount = 256;
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    auto fence = std::make_shared<PerfFence>(deviceDomainId, authorityEpoch);
+    std::array<std::shared_ptr<GpuSurface>, 17> fixtures;
+    for (size_t i = 0; i < fixtures.size(); ++i)
+        fixtures[i] =
+            std::make_shared<PerfSurface>(reinterpret_cast<void*>(uintptr_t(0xA000 + i)),
+                                          GpuSurfaceCompatibility{deviceDomainId, authorityEpoch});
+
+    (void) submitSeventeen(registry, fence, fixtures);
+    fence->complete();
+    registry.drainCompleted();
+    GpuRetireRegistry::resetStorageProbeForTest();
+    GpuRetireRegistry::resetAllocationProbeForTest();
+
+    std::vector<qint64> samples;
+    samples.reserve(sampleCount);
+    for (int sample = 0; sample < sampleCount; ++sample) {
+        const auto started = std::chrono::steady_clock::now();
+        const auto result = submitSeventeen(registry, fence, fixtures);
+        fence->complete();
+        registry.drainCompleted();
+        samples.push_back(elapsedNanoseconds(started));
+        QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+    }
+
+    const auto allocations = GpuRetireRegistry::allocationSnapshotForTest();
+    const auto storageSnapshot = GpuRetireRegistry::storageSnapshotForTest();
+    QCOMPARE(allocations.preparation, uint64_t(0));
+    QCOMPARE(allocations.callback, uint64_t(0));
+    QCOMPARE(allocations.postAccept, uint64_t(0));
+    QCOMPARE(storageSnapshot.poolExhaustions, uint64_t(0));
+    QCOMPARE(storageSnapshot.poolNodeAcquisitions, uint64_t(sampleCount * 4));
+    QCOMPARE(storageSnapshot.poolNodeReleases, uint64_t(sampleCount * 4));
+    QCOMPARE(storageSnapshot.drainShardVisits, uint64_t(sampleCount));
+    QCOMPARE(storageSnapshot.fenceGroupsVisited, uint64_t(sampleCount));
+    QCOMPARE(storageSnapshot.completionQueries, uint64_t(sampleCount));
+    QCOMPARE(storageSnapshot.activeNodesVisited, uint64_t(sampleCount * 4));
+
+    qInfo("GPU retire max-owner bounded path: median=%lld ns p95=%lld ns nodes=%llu queries=%llu",
+          static_cast<long long>(percentile(samples, 1, 2)),
+          static_cast<long long>(percentile(samples, 95, 100)),
+          static_cast<unsigned long long>(storageSnapshot.poolNodeAcquisitions),
+          static_cast<unsigned long long>(storageSnapshot.completionQueries));
     GpuGenerationCounter::instance().resetForTest();
 }
 
@@ -517,11 +577,16 @@ void TestGpuRetireRegistryPerf::implementationHasIndexedDrainAndCoherentDiagnost
     const QByteArray drain = functionBody(retainer, "void GpuReadbackRetainer::drainCompleted()");
     const QByteArray collect = functionBody(retainer, "size_t collectFenceGroups(");
     const QByteArray release = functionBody(retainer, "releaseCompletedGroups(");
+    const QByteArray prepare =
+        functionBody(retainer, "GpuRetirePreparedHandle GpuReadbackRetainer::prepare(");
+    const QByteArray publish = functionBody(retainer, "bool GpuReadbackRetainer::publish(");
     const QByteArray diagnostics =
         functionBody(registry, "GpuRetireDiagnostics GpuRetireRegistry::diagnostics()");
     QVERIFY(!drain.isEmpty());
     QVERIFY(!collect.isEmpty());
     QVERIFY(!release.isEmpty());
+    QVERIFY(!prepare.isEmpty());
+    QVERIFY(!publish.isEmpty());
     QVERIFY(!diagnostics.isEmpty());
     const QByteArray savedBaselineDrain = functionBody(perf, "void drainCompleted()");
     QVERIFY(!savedBaselineDrain.isEmpty());
@@ -539,6 +604,14 @@ void TestGpuRetireRegistryPerf::implementationHasIndexedDrainAndCoherentDiagnost
              "release must traverse only nodes in the matching fence group");
     QVERIFY2(!release.contains("findProbe"),
              "release must not linearly search all fence probes per node");
+    QVERIFY2(prepare.contains("kMaxOwnersPerBatch") &&
+                 prepare.contains("shard.freeCount < nodeCount") && prepare.contains("batchNext"),
+             "multi-node preparation must bound owners and reserve the whole fixed batch first");
+    const qsizetype publishValidation = publish.indexOf("batchMatches");
+    const qsizetype publishMutation = publish.indexOf("node.fenceValue = ticket.value()");
+    QVERIFY2(publishValidation >= 0 && publishMutation > publishValidation &&
+                 publish.contains("visited < prepared.count") && !publish.contains("std::vector"),
+             "multi-node publication must validate the opaque batch before fixed-storage mutation");
     QVERIFY2(diagnostics.contains("diagnosticsSnapshot"),
              "diagnostics must read one invariant-preserving storage snapshot");
     QVERIFY2(retainer.contains("struct FenceGroup") && retainer.contains("groupNext"),

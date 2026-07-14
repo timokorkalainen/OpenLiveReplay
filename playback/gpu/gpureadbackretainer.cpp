@@ -21,6 +21,7 @@ namespace {
 constexpr size_t kShardCount = 16;
 constexpr size_t kNodesPerShard = 1024;
 constexpr size_t kOwnersPerNode = 5;
+constexpr size_t kMaxOwnersPerBatch = 17;
 constexpr size_t kFenceGroupsPerShard = kNodesPerShard;
 constexpr size_t kFenceHashBucketCount = kFenceGroupsPerShard * 2;
 constexpr uint16_t kNoNode = std::numeric_limits<uint16_t>::max();
@@ -612,7 +613,8 @@ GpuRetirePreparedHandle GpuReadbackRetainer::prepare(const std::shared_ptr<GpuSu
                                                      qsizetype count,
                                                      const std::shared_ptr<GpuFence>& fence,
                                                      uint64_t reservation) noexcept {
-    if (!surfaces || count <= 0 || !fence || reservation == 0 || count > qsizetype(kOwnersPerNode))
+    if (!surfaces || count <= 0 || !fence || reservation == 0 ||
+        count > qsizetype(kMaxOwnersPerBatch))
         return {};
 
     // GpuOpScope is the sole preparation capability and has already rejected
@@ -630,7 +632,8 @@ GpuRetirePreparedHandle GpuReadbackRetainer::prepare(const std::shared_ptr<GpuSu
     RetireShard& shard = storage().shards[shardIndex];
     QMutexLocker locker(&shard.mutex);
     noteShardLock();
-    if (shard.freeCount == 0) {
+    const uint16_t nodeCount = uint16_t((size_t(count) + kOwnersPerNode - 1) / kOwnersPerNode);
+    if (shard.freeCount < nodeCount) {
 #ifdef OLR_UNIT_TEST
         if (storageProbeEnabledForThread)
             storage().probe.poolExhaustions.fetch_add(1, std::memory_order_relaxed);
@@ -645,50 +648,71 @@ GpuRetirePreparedHandle GpuReadbackRetainer::prepare(const std::shared_ptr<GpuSu
 #endif
         return {};
     }
-    const uint16_t index = shard.freeHead;
-    RetireNode& node = shard.nodes[index];
-    shard.freeHead = node.freeNext;
-    --shard.freeCount;
-    node.freeNext = kNoNode;
-    node.state = RetireNodeState::Prepared;
-    node.reservation = reservation;
-    node.identity = identity;
-    node.fenceValue = 0;
-    node.batchNext = kNoNode;
-    node.fenceGroup = groupIndex;
-    node.groupNext = kNoNode;
-    node.groupPrevious = kNoNode;
-    for (qsizetype i = 0; i < count; ++i) {
-        node.owners[node.ownerCount++] = surfaces[i];
-    }
-    linkActive(shard, index);
-    ++shard.fenceGroups[groupIndex].nodeCount;
+    uint16_t head = kNoNode;
+    uint16_t previous = kNoNode;
+    qsizetype owner = 0;
+    for (uint16_t nodeOffset = 0; nodeOffset < nodeCount; ++nodeOffset) {
+        const uint16_t index = shard.freeHead;
+        RetireNode& node = shard.nodes[index];
+        shard.freeHead = node.freeNext;
+        --shard.freeCount;
+        node.freeNext = kNoNode;
+        node.state = RetireNodeState::Prepared;
+        node.reservation = reservation;
+        node.identity = identity;
+        node.ownerCount = 0;
+        node.fenceValue = 0;
+        node.batchNext = kNoNode;
+        node.fenceGroup = groupIndex;
+        node.groupNext = kNoNode;
+        node.groupPrevious = kNoNode;
+        while (owner < count && node.ownerCount < kOwnersPerNode)
+            node.owners[node.ownerCount++] = surfaces[owner++];
+        if (previous == kNoNode)
+            head = index;
+        else
+            shard.nodes[previous].batchNext = index;
+        previous = index;
+        linkActive(shard, index);
+        ++shard.fenceGroups[groupIndex].nodeCount;
 #ifdef OLR_UNIT_TEST
-    if (storageProbeEnabledForThread)
-        storage().probe.poolNodeAcquisitions.fetch_add(1, std::memory_order_relaxed);
+        if (storageProbeEnabledForThread)
+            storage().probe.poolNodeAcquisitions.fetch_add(1, std::memory_order_relaxed);
 #endif
-    return GpuRetirePreparedHandle{uint16_t(shardIndex), index, 1, reservation};
+    }
+    return GpuRetirePreparedHandle{uint16_t(shardIndex), head, nodeCount, reservation};
 }
 
 bool GpuReadbackRetainer::publish(const GpuRetirePreparedHandle& prepared,
                                   const GpuRetirementTicket& ticket) noexcept {
-    if (!prepared || prepared.shard >= kShardCount || prepared.count != 1 ||
+    if (!prepared || prepared.shard >= kShardCount || prepared.count > 4 ||
         ticket.identity().deviceDomainId == 0)
         return false;
     RetireShard& shard = storage().shards[prepared.shard];
     QMutexLocker locker(&shard.mutex);
     noteShardLock();
-    RetireNode& node = shard.nodes[prepared.head];
-    if (node.reservation != prepared.reservation || node.state != RetireNodeState::Prepared ||
-        node.batchNext != kNoNode || node.identity != ticket.identity() ||
-        node.fenceGroup == kNoFenceGroup)
-        return false;
-    node.fenceValue = ticket.value();
-    node.state = RetireNodeState::Signaled;
-    FenceGroup& group = shard.fenceGroups[node.fenceGroup];
+    if (!batchMatches(shard, prepared, RetireNodeState::Prepared)) return false;
+    const uint16_t groupIndex = shard.nodes[prepared.head].fenceGroup;
+    if (groupIndex == kNoFenceGroup) return false;
+    uint16_t index = prepared.head;
+    for (uint16_t visited = 0; visited < prepared.count; ++visited) {
+        const RetireNode& node = shard.nodes[index];
+        if (node.identity != ticket.identity() || node.fenceGroup != groupIndex) return false;
+        index = node.batchNext;
+    }
+
+    qsizetype ownerCount = 0;
+    index = prepared.head;
+    for (uint16_t visited = 0; visited < prepared.count; ++visited) {
+        RetireNode& node = shard.nodes[index];
+        node.fenceValue = ticket.value();
+        node.state = RetireNodeState::Signaled;
+        ownerCount += node.ownerCount;
+        linkSignaledNode(shard, prepared.shard, index);
+        index = node.batchNext;
+    }
+    FenceGroup& group = shard.fenceGroups[groupIndex];
     group.maximumValue = std::max(group.maximumValue, ticket.value());
-    linkSignaledNode(shard, prepared.shard, prepared.head);
-    const qsizetype ownerCount = node.ownerCount;
     shard.pendingOwners += ownerCount;
     const qsizetype pending =
         storage().metrics.pendingOwners.fetch_add(ownerCount, std::memory_order_relaxed) +

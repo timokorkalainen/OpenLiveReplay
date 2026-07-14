@@ -38,6 +38,7 @@ public:
 
     template <typename BackendAdapter, size_t N>
     GpuSubmissionResult submit(BackendAdapter& adapter, GpuSurfacePack<N> surfaces) noexcept {
+        static_assert(N <= 17, "A fused GPU submission supports at most 17 surface owners");
         static_assert(std::is_nothrow_invocable_r_v<GpuSubmitOutcome, BackendAdapter&>,
                       "GPU backend adapters must be noexcept and return GpuSubmitOutcome");
 
