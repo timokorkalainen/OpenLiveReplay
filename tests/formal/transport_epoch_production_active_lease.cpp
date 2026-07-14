@@ -19,6 +19,9 @@
 #endif
 
 namespace {
+constexpr auto kCommitCompletionDeadline = std::chrono::seconds(1);
+constexpr auto kSinkReleaseWatchdog = std::chrono::seconds(10);
+
 FrameHandle video(qint64 pts, uchar y) {
     FrameHandle frame = solidYuv420pHandle(4, 4, y, 128, 128);
     frame.metadata().key.feedIndex = 0;
@@ -56,7 +59,7 @@ public:
         if (++m_submitCount != 2) return true;
         m_insideSubmit = true;
         m_entered.notify_all();
-        if (!m_release.wait_for(lock, std::chrono::seconds(2), [this]() { return m_released; })) {
+        if (!m_release.wait_for(lock, kSinkReleaseWatchdog, [this]() { return m_released; })) {
             m_diagnosticTimeout = true;
             return false;
         }
@@ -206,7 +209,7 @@ int main() {
     bool commitReturnedBeforeRelease = false;
     if (activeLeaseEntered) {
         std::unique_lock<std::mutex> lock(commitMutex);
-        commitReturnedBeforeRelease = commitReturnedCv.wait_for(lock, std::chrono::seconds(2),
+        commitReturnedBeforeRelease = commitReturnedCv.wait_for(lock, kCommitCompletionDeadline,
                                                                 [&]() { return commitReturned; });
     }
     const int discardsBeforeRelease = sink.discardPendingCalls();
@@ -217,8 +220,15 @@ int main() {
     activeDispatch.join();
     commitThread.join();
     followerDispatch.join();
+    bool commitReturnedAfterRelease = false;
+    {
+        std::lock_guard<std::mutex> lock(commitMutex);
+        commitReturnedAfterRelease = commitReturned;
+    }
 
     if (!activeLeaseEntered) return fail("active sink submission did not reach lease barrier");
+    if (!commitReturnedAfterRelease)
+        return fail("commit did not complete after active sink release");
     if (!commitReturnedBeforeRelease) return fail("commit blocked behind active sink lease");
     if (!commitResult.committed) return fail("central output commit was rejected");
     if (sink.diagnosticTimeout()) return fail("active sink timed out waiting for release");

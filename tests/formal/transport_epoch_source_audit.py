@@ -378,7 +378,7 @@ def explicitly_permitted_intervening_statement(
 
 
 def audit_load_bearing_macro_definitions(view: LexedSource, path: Path) -> None:
-    """Reject preprocessor rewrites of either side of the F2 hand-off.
+    """Reject preprocessor rewrites of the F1/F2 load-bearing identifiers.
 
     The normal code view deliberately blanks directives before structural
     matching.  Inspect the comment/string-blanked directive view separately so
@@ -388,6 +388,7 @@ def audit_load_bearing_macro_definitions(view: LexedSource, path: Path) -> None:
     Harmless macros remain valid.
     """
     load_bearing_names = {
+        "m_configGeneration",
         "m_committedGeneration",
         "resetOutputPlayEpoch",
     }
@@ -543,6 +544,7 @@ def audit_outputruntime(source: str, path: Path) -> None:
             mutation_switch.start(),
             "shipping source contains a transport mutation switch",
         )
+    audit_load_bearing_macro_definitions(view, path)
     begin, end = logical_function_span(
         view, r"void\s+OutputRuntime::resetPlayEpoch\s*\(\s*\)\s*", path
     )
@@ -660,6 +662,7 @@ def main() -> int:
         r"void\s+OutputRuntime::resetPlayEpoch\s*\(\s*\)\s*",
         runtime_path,
     )
+    guarded_reset_declaration_begin = runtime.rfind("\n", 0, guarded_reset_begin) + 1
     guarded_runtime = replace_once_in_span(
         runtime,
         guarded_reset_begin,
@@ -676,6 +679,67 @@ def main() -> int:
         runtime_path,
         line_number(guarded_runtime, guarded_runtime_offset),
         "shipping source contains a transport mutation switch",
+    )
+
+    selector_guarded_generation_alias = (
+        runtime[:guarded_reset_declaration_begin]
+        + "#ifdef OLR_WITH_DECKLINK_BUILD\n"
+        + "#define m_configGeneration m_gpuVramBytes\n"
+        + "#endif\n"
+        + runtime[guarded_reset_declaration_begin:guarded_reset_end]
+        + "\n#ifdef OLR_WITH_DECKLINK_BUILD\n"
+        + "#undef m_configGeneration\n"
+        + "#endif\n"
+        + runtime[guarded_reset_end:]
+    )
+    selector_guarded_alias_offset = selector_guarded_generation_alias.find(
+        "#define m_configGeneration"
+    )
+    require_rejection(
+        audit_outputruntime,
+        selector_guarded_generation_alias,
+        runtime_path,
+        line_number(selector_guarded_generation_alias, selector_guarded_alias_offset),
+        "macro definition touches load-bearing transport epoch identifier",
+    )
+
+    generation_undefinition = (
+        runtime[:guarded_reset_declaration_begin]
+        + "#undef m_configGeneration\n"
+        + runtime[guarded_reset_declaration_begin:]
+    )
+    generation_undefinition_offset = generation_undefinition.find(
+        "#undef m_configGeneration"
+    )
+    require_rejection(
+        audit_outputruntime,
+        generation_undefinition,
+        runtime_path,
+        line_number(generation_undefinition, generation_undefinition_offset),
+        "macro undefinition touches load-bearing transport epoch identifier",
+    )
+
+    generation_replacement_alias = (
+        runtime[:guarded_reset_declaration_begin]
+        + "#define CONFIG_GENERATION_ALIAS m_configGeneration\n"
+        + runtime[guarded_reset_declaration_begin:]
+    )
+    generation_replacement_alias_offset = generation_replacement_alias.find(
+        "#define CONFIG_GENERATION_ALIAS"
+    )
+    require_rejection(
+        audit_outputruntime,
+        generation_replacement_alias,
+        runtime_path,
+        line_number(generation_replacement_alias, generation_replacement_alias_offset),
+        "macro definition touches load-bearing transport epoch identifier",
+    )
+
+    require_acceptance(
+        audit_outputruntime,
+        runtime + "\n#define OUTPUT_RUNTIME_HARMLESS(value) (value)\n",
+        runtime_path,
+        "unrelated output-runtime macro definition",
     )
 
     escaped_store = worker + (
