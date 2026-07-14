@@ -3,54 +3,46 @@
 
 #include "timecodeevidence.h"
 
-// Rate-aware inter-source timecode alignment with a typed Incomparable state.
-// Pure (no Qt/FFmpeg). All arithmetic is exact integer (__int128 intermediates),
-// so there is no float rounding drift regardless of source/session rate.
-//
-// This replaces the earlier TimecodeAligner, whose bug was dimensional: it
-// counted TC frames at a hardwired nominal 30 fps and differenced them against
-// the session-frame axis (which advances at the real session rate). For two
-// genuinely aligned sources whose anchors are Δt apart that produced a spurious
-// (sessionRate/30 − 1)·(TC-frame difference) term — e.g. two 60p sources 10 s
-// apart reported a −300-frame / −5000 ms offset and drove the phase servo the
-// wrong way. Carrying each side's true rate and comparing in exact microseconds
-// removes the term entirely (see docs/hardest-technical-challenges.md and its
-// machine-checked timecode_alignment_proof.py).
-
+// Rate-aware inter-source timecode alignment with immutable, generation-bound
+// anchors. Per-source observations are unwrapped across at most one adjacent
+// timecode day. Invalid, stale, discontinuous, or arithmetically unsafe state
+// is never guessed: it remains explicitly Incomparable.
 class TimecodeAlignerV2 {
 public:
     static constexpr int kMaxSources = 16;
 
-    // Record that `source` carried the absolute timecode frame count `tcFrames`
-    // (counted AT ITS TRUE LABEL RATE, i.e. Smpte12m::toFrameCount(tc, labelRate)
-    // with drop-frame renumbering applied) with true rate `tcRate`, observed on
-    // session frame `sessionFrame` (the heartbeat tick count, advancing at
-    // `sessionRate`). First observation per source wins (immutable anchor). A
-    // negative tcFrames/sessionFrame or a rate outside [12, 240] fps is ignored
-    // -> the source stays unanchored -> Incomparable, never a guess.
+    // Compatibility adapter for the current ReplayManager producer. Typed
+    // evidence replaces this call site in the end-to-end propagation step.
     void observe(int source, int64_t tcFrames, FrameRateQ tcRate, int64_t sessionFrame,
                  FrameRateQ sessionRate);
+    void observe(int source, const TimecodeEvidence& evidence);
 
-    // Has this source produced at least one usable (valid-rate) anchor?
     bool hasTimecode(int source) const;
 
-    // offset(a,b): the alignment of b relative to a. driftPpm (>=0 magnitude) adds
-    // |anchorTcSkew|·ppm to the bound (the residual a drifting session clock leaves
-    // that the servo cannot remove). Incomparable unless BOTH sources are anchored.
-    // Kind derives from the checked final bound: zero is Exact, positive is Bounded.
-    AlignmentOffset offset(int a, int b, int32_t driftPpm = 0) const;
+    // driftPpm is an optional additional clock-drift magnitude. Its residual
+    // over the selected anchor separation is conservatively rounded upward.
+    AlignmentOffset offset(int sourceA, int sourceB, int32_t driftPpm = 0) const;
 
+    void resetSource(int source);
     void reset();
 
 private:
-    struct Anchor {
-        bool set = false;
-        int64_t tcFrames = 0;
-        FrameRateQ tcRate;
-        int64_t sessionFrame = 0;
-        FrameRateQ sessionRate;
+    struct Observation {
+        TimecodeEvidence evidence;
+        int64_t unwrappedFrame = 0;
     };
-    Anchor m_anchors[kMaxSources];
+
+    struct SourceState {
+        bool generationSet = false;
+        bool invalid = false;
+        bool anchorSet = false;
+        uint64_t sourceGeneration = 0;
+        uint64_t timingGeneration = 0;
+        Observation anchor;
+        Observation previous;
+    };
+
+    SourceState m_sources[kMaxSources];
 };
 
 #endif // TIMECODEALIGNERV2_H
