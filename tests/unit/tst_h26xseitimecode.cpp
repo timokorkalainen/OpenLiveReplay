@@ -1,6 +1,8 @@
 #include <QtTest>
 #include <QFile>
 
+#include <limits>
+
 #include "recorder_engine/ingest/h26xseitimecode.h"
 #include "recorder_engine/ingest/h26xtimingcontext.h"
 #include "recorder_engine/timing/smpte12m.h"
@@ -17,6 +19,10 @@ private slots:
     void h264PartialTimestampIsNotReturned();
     void h264OutOfRateFrameLabelIsRejected();
     void h264ConsumesEveryClockTimestamp();
+    void h264ClockTimestampsAreNondecreasing_data();
+    void h264ClockTimestampsAreNondecreasing();
+    void h264LaterIncompleteClockInheritsUnits_data();
+    void h264LaterIncompleteClockInheritsUnits();
     void h264RejectsInvalidTimestampLabels();
     void h264InterpretsCountingTypeAndDroppedFlag();
     void h264ValidatesPartialTimestampFields_data();
@@ -164,6 +170,12 @@ struct BitWriter {
             bit(((value >> i) & 1u) != 0);
     }
 
+    void signedBits(int32_t value, int count) {
+        const uint32_t mask =
+            count == 32 ? std::numeric_limits<uint32_t>::max() : (uint32_t(1) << count) - 1u;
+        bits(uint32_t(value) & mask, count);
+    }
+
     void payloadTrailingBits(bool marker = true, bool nonzeroPadding = false) {
         bit(marker);
         bool firstPaddingBit = true;
@@ -175,8 +187,8 @@ struct BitWriter {
 };
 
 void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, int frames,
-                        int countingType = 0, bool countDropped = false,
-                        bool nuitFieldBased = true) {
+                        int countingType = 0, bool countDropped = false, bool nuitFieldBased = true,
+                        int32_t timeOffset = 0, int timeOffsetLength = 0) {
     writer.bit(true);  // clock_timestamp_flag[0]
     writer.bits(0, 2); // ct_type: progressive
     writer.bit(nuitFieldBased);
@@ -188,6 +200,7 @@ void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, 
     writer.bits(uint32_t(seconds), 6);
     writer.bits(uint32_t(minutes), 6);
     writer.bits(uint32_t(hours), 5);
+    writer.signedBits(timeOffset, timeOffsetLength);
 }
 
 QByteArray fullTimestampPayload(int hours, int minutes, int seconds, int frames,
@@ -351,6 +364,116 @@ void TestH26xSeiTimecode::h264ConsumesEveryClockTimestamp() {
     parsed = H26xTimingDetail::parseH264PicTiming(malformedThirdClock.bytes, syntax);
     QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
     QVERIFY(!parsed.timecode.valid);
+}
+
+void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing_data() {
+    QTest::addColumn<QByteArray>("payload");
+    QTest::addColumn<int>("timeOffsetLength");
+    QTest::addColumn<int>("expectedStatus");
+    QTest::addColumn<int>("expectedHours");
+
+    using Status = H26xTimingDetail::TimecodeParseStatus;
+    const auto payload = [](int picStruct, auto writeClocks) {
+        BitWriter writer;
+        writer.bits(uint32_t(picStruct), 4);
+        writeClocks(writer);
+        if (writer.bitPosition != 0) writer.payloadTrailingBits();
+        return writer.bytes;
+    };
+
+    QTest::newRow("three clocks equal then increasing") << payload(5, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 1, 2, 3, 4);
+        writeFullTimestamp(writer, 1, 2, 3, 4);
+        writeFullTimestamp(writer, 1, 2, 3, 5);
+    }) << 0 << int(Status::Valid) << 1;
+    QTest::newRow("complete clocks reversed") << payload(3, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 1, 2, 3, 5);
+        writeFullTimestamp(writer, 1, 2, 3, 4);
+    }) << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("signed offsets reverse increasing labels") << payload(3, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 0, 0, 0, 0, 1, false, true, 2, 4);
+        writeFullTimestamp(writer, 0, 0, 0, 1, 1, false, true, -1, 4);
+    }) << 4 << int(Status::Malformed) << -1;
+    QTest::newRow("field basis reverses equal labels") << payload(3, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 0, 0, 0, 1, 1, false, true);
+        writeFullTimestamp(writer, 0, 0, 0, 1, 1, false, false);
+    }) << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("unadjusted day wrap decreases") << payload(3, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 23, 59, 59, 24, 1);
+        writeFullTimestamp(writer, 0, 0, 0, 0, 1);
+    }) << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("day wrap offset remains nondecreasing") << payload(3, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 23, 59, 59, 24, 1, false, true, 0, 24);
+        writeFullTimestamp(writer, 0, 0, 0, 0, 1, false, true, 4'320'000, 24);
+    }) << 24 << int(Status::Valid) << 23;
+}
+
+void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing() {
+    QFETCH(QByteArray, payload);
+    QFETCH(int, timeOffsetLength);
+    QFETCH(int, expectedStatus);
+    QFETCH(int, expectedHours);
+
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+    H264TimingSyntax syntax = *context.h264();
+    syntax.timeOffsetLength = uint8_t(timeOffsetLength);
+
+    const auto parsed = H26xTimingDetail::parseH264PicTiming(payload, syntax);
+    QCOMPARE(int(parsed.status), expectedStatus);
+    QCOMPARE(parsed.timecode.valid,
+             expectedStatus == int(H26xTimingDetail::TimecodeParseStatus::Valid));
+    if (parsed.timecode.valid) QCOMPARE(parsed.timecode.hours, expectedHours);
+}
+
+void TestH26xSeiTimecode::h264LaterIncompleteClockInheritsUnits_data() {
+    QTest::addColumn<int>("seconds");
+    QTest::addColumn<int>("expectedStatus");
+
+    using Status = H26xTimingDetail::TimecodeParseStatus;
+    QTest::newRow("inherits all units and advances frame") << -1 << int(Status::Valid);
+    QTest::newRow("inherits minute and hour but decreases second") << 2 << int(Status::Malformed);
+    QTest::newRow("inherits minute and hour and advances second") << 4 << int(Status::Valid);
+}
+
+void TestH26xSeiTimecode::h264LaterIncompleteClockInheritsUnits() {
+    QFETCH(int, seconds);
+    QFETCH(int, expectedStatus);
+
+    BitWriter writer;
+    writer.bits(3, 4); // pic_struct: top field, bottom field
+    writeFullTimestamp(writer, 1, 2, 3, 4);
+    writer.bit(true);  // clock_timestamp_flag[1]
+    writer.bits(0, 2); // ct_type
+    writer.bit(true);  // nuit_field_based_flag
+    writer.bits(0, 5); // counting_type
+    writer.bit(false); // full_timestamp_flag
+    writer.bit(false); // discontinuity_flag
+    writer.bit(false); // cnt_dropped_flag
+    writer.bits(5, 8); // n_frames
+    writer.bit(seconds >= 0);
+    if (seconds >= 0) {
+        writer.bits(uint32_t(seconds), 6);
+        writer.bit(false); // inherit minutes_value and hours_value
+    }
+    if (writer.bitPosition != 0) writer.payloadTrailingBits();
+
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+    const auto parsed = H26xTimingDetail::parseH264PicTiming(writer.bytes, *context.h264());
+    QCOMPARE(int(parsed.status), expectedStatus);
+    QCOMPARE(parsed.timecode.valid,
+             expectedStatus == int(H26xTimingDetail::TimecodeParseStatus::Valid));
+    if (parsed.timecode.valid) {
+        QCOMPARE(parsed.timecode.hours, 1);
+        QCOMPARE(parsed.timecode.minutes, 2);
+        QCOMPARE(parsed.timecode.seconds, 3);
+        QCOMPARE(parsed.timecode.frames, 4);
+    }
 }
 
 void TestH26xSeiTimecode::h264RejectsInvalidTimestampLabels() {

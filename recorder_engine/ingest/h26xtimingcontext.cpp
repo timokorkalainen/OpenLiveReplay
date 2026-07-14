@@ -334,6 +334,8 @@ H264TimingSyntax parseH264Sps(const QByteArray& parameterSet) {
             !reader.bit(syntax.fixedFrameRate)) {
             return malformedH264();
         }
+        syntax.numUnitsInTick = numUnitsInTick;
+        syntax.timeScale = timeScale;
         if (syntax.fixedFrameRate) syntax.frameRate = frameRateFromVui(numUnitsInTick, timeScale);
     }
 
@@ -369,7 +371,13 @@ H264TimingSyntax parseH264Sps(const QByteArray& parameterSet) {
 }
 
 bool equivalentTiming(const H264TimingSyntax& lhs, const H264TimingSyntax& rhs) {
-    return lhs.status == rhs.status && lhs.frameRate == rhs.frameRate &&
+    // Equal normalized rates preserve Equation D-1 ordering under any positive
+    // common scale when no signed offset is present. With time_offset syntax,
+    // the raw tick scale is semantically significant and must also match.
+    const bool clockScaleEquivalent =
+        (lhs.timeOffsetLength == 0 && rhs.timeOffsetLength == 0) ||
+        (lhs.numUnitsInTick == rhs.numUnitsInTick && lhs.timeScale == rhs.timeScale);
+    return lhs.status == rhs.status && lhs.frameRate == rhs.frameRate && clockScaleEquivalent &&
            lhs.fixedFrameRate == rhs.fixedFrameRate &&
            lhs.cpbDpbDelaysPresent == rhs.cpbDpbDelaysPresent &&
            lhs.cpbRemovalDelayLength == rhs.cpbRemovalDelayLength &&
@@ -391,6 +399,49 @@ bool validH264FrameCount(uint32_t frames, FrameRateQ rate) {
     if (!rate.valid()) return false;
     const int64_t maxFps = (int64_t(rate.num) + rate.den - 1) / rate.den;
     return int64_t(frames) < maxFps;
+}
+
+bool checkedAdd(int64_t lhs, int64_t rhs, int64_t& result) {
+    if ((rhs > 0 && lhs > std::numeric_limits<int64_t>::max() - rhs) ||
+        (rhs < 0 && lhs < std::numeric_limits<int64_t>::min() - rhs)) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+bool checkedMultiplyNonnegative(int64_t lhs, int64_t rhs, int64_t& result) {
+    if (lhs < 0 || rhs < 0 || (rhs != 0 && lhs > std::numeric_limits<int64_t>::max() / rhs)) {
+        return false;
+    }
+    result = lhs * rhs;
+    return true;
+}
+
+bool h264ClockTimestamp(uint32_t hours, uint32_t minutes, uint32_t seconds, uint32_t frames,
+                        bool nuitFieldBased, int32_t timeOffset, const H264TimingSyntax& syntax,
+                        int64_t& result) {
+    if (syntax.numUnitsInTick == 0 || syntax.timeScale == 0) return false;
+
+    int64_t clockTimestamp = 0;
+    if (!checkedMultiplyNonnegative(hours, 60, clockTimestamp) ||
+        !checkedAdd(clockTimestamp, minutes, clockTimestamp) ||
+        !checkedMultiplyNonnegative(clockTimestamp, 60, clockTimestamp) ||
+        !checkedAdd(clockTimestamp, seconds, clockTimestamp) ||
+        !checkedMultiplyNonnegative(clockTimestamp, syntax.timeScale, clockTimestamp)) {
+        return false;
+    }
+
+    int64_t frameTicks = 0;
+    if (!checkedMultiplyNonnegative(syntax.numUnitsInTick, 1 + int64_t(nuitFieldBased),
+                                    frameTicks) ||
+        !checkedMultiplyNonnegative(frames, frameTicks, frameTicks) ||
+        !checkedAdd(clockTimestamp, frameTicks, clockTimestamp) ||
+        !checkedAdd(clockTimestamp, timeOffset, clockTimestamp)) {
+        return false;
+    }
+    result = clockTimestamp;
+    return true;
 }
 
 } // namespace
@@ -530,6 +581,16 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
 
     Smpte12mTimecode firstUsableTimestamp;
     bool unsupportedMapping = false;
+    bool orderingUnavailable = false;
+    bool sawPresentTimestamp = false;
+    bool previousTimestampComparable = false;
+    int64_t previousClockTimestamp = 0;
+    bool havePreviousSeconds = false;
+    bool havePreviousMinutes = false;
+    bool havePreviousHours = false;
+    uint32_t previousSeconds = 0;
+    uint32_t previousMinutes = 0;
+    uint32_t previousHours = 0;
     for (int i = 0; i < timestampCount; ++i) {
         bool timestampFlag = false;
         if (!reader.bit(timestampFlag)) {
@@ -596,13 +657,56 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         }
         Q_UNUSED(ctType);
         Q_UNUSED(discontinuity);
-        Q_UNUSED(timeOffset);
 
         if ((haveSeconds && seconds >= 60) || (haveMinutes && minutes >= 60) ||
             (haveHours && hours >= 24) || !validH264FrameCount(frames, syntax.frameRate)) {
             result.status = TimecodeParseStatus::Malformed;
             return result;
         }
+
+        const bool effectiveSecondsPresent = haveSeconds || havePreviousSeconds;
+        const bool effectiveMinutesPresent = haveMinutes || havePreviousMinutes;
+        const bool effectiveHoursPresent = haveHours || havePreviousHours;
+        const uint32_t effectiveSeconds = haveSeconds ? seconds : previousSeconds;
+        const uint32_t effectiveMinutes = haveMinutes ? minutes : previousMinutes;
+        const uint32_t effectiveHours = haveHours ? hours : previousHours;
+        const bool effectiveTimestampComplete =
+            effectiveSecondsPresent && effectiveMinutesPresent && effectiveHoursPresent;
+
+        if (haveSeconds) {
+            previousSeconds = seconds;
+            havePreviousSeconds = true;
+        }
+        if (haveMinutes) {
+            previousMinutes = minutes;
+            havePreviousMinutes = true;
+        }
+        if (haveHours) {
+            previousHours = hours;
+            havePreviousHours = true;
+        }
+
+        bool currentTimestampComparable = false;
+        int64_t currentClockTimestamp = 0;
+        if (effectiveTimestampComplete && syntax.numUnitsInTick != 0 && syntax.timeScale != 0) {
+            if (!h264ClockTimestamp(effectiveHours, effectiveMinutes, effectiveSeconds, frames,
+                                    nuitFieldBased, timeOffset, syntax, currentClockTimestamp)) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            }
+            currentTimestampComparable = true;
+        }
+        if (sawPresentTimestamp) {
+            if (!previousTimestampComparable || !currentTimestampComparable) {
+                orderingUnavailable = true;
+            } else if (currentClockTimestamp < previousClockTimestamp) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            }
+        }
+        sawPresentTimestamp = true;
+        previousTimestampComparable = currentTimestampComparable;
+        if (currentTimestampComparable) previousClockTimestamp = currentClockTimestamp;
 
         bool mappingRepresentable = nuitFieldBased;
         bool dropFrameScheme = false;
@@ -631,9 +735,9 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         case 4:
             dropFrameScheme = true;
             if (countDropped) {
-                if (!haveSeconds || !haveMinutes) {
+                if (!effectiveSecondsPresent || !effectiveMinutesPresent) {
                     mappingRepresentable = false;
-                } else if (frames != 2 || seconds != 0 || minutes % 10 == 0) {
+                } else if (frames != 2 || effectiveSeconds != 0 || effectiveMinutes % 10 == 0) {
                     result.status = TimecodeParseStatus::Malformed;
                     return result;
                 }
@@ -648,11 +752,12 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
             break;
         }
         if (!mappingRepresentable) unsupportedMapping = true;
-        if (!haveSeconds || !haveMinutes || !haveHours) continue;
+        if (!effectiveTimestampComplete) continue;
         if (!mappingRepresentable) continue;
 
-        const Smpte12mTimecode timestamp{int(hours),  int(minutes),    int(seconds),
-                                         int(frames), dropFrameScheme, true};
+        const Smpte12mTimecode timestamp{int(effectiveHours),   int(effectiveMinutes),
+                                         int(effectiveSeconds), int(frames),
+                                         dropFrameScheme,       true};
         if (!validateTimecodeLabel(timestamp, syntax.frameRate)) {
             result.status = TimecodeParseStatus::Malformed;
             return result;
@@ -663,7 +768,7 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         result.status = TimecodeParseStatus::Malformed;
         return result;
     }
-    if (unsupportedMapping) {
+    if (unsupportedMapping || (orderingUnavailable && firstUsableTimestamp.valid)) {
         result.status = TimecodeParseStatus::Unsupported;
         return result;
     }

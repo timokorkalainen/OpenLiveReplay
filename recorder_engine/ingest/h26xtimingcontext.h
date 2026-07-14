@@ -15,6 +15,8 @@ enum class H26xTimingSyntaxStatus : uint8_t { Valid, Unsupported, Malformed };
 struct H264TimingSyntax {
     H26xTimingSyntaxStatus status = H26xTimingSyntaxStatus::Malformed;
     FrameRateQ frameRate;
+    uint32_t numUnitsInTick = 0;
+    uint32_t timeScale = 0;
     bool fixedFrameRate = false;
     bool cpbDpbDelaysPresent = false;
     uint8_t cpbRemovalDelayLength = 0;
