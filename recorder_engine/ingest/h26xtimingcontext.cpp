@@ -879,6 +879,8 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     syntax.maxSubLayersMinus1 = uint8_t(maxSubLayersMinus1);
     syntax.temporalIdNesting = temporalIdNesting;
     if (!vuiPresent) {
+        syntax.frameFieldInfoPresent =
+            syntax.generalProgressiveSource && syntax.generalInterlacedSource;
         bool extensionPresent = false;
         if (!reader.bit(extensionPresent)) return malformedHevc();
         if (extensionPresent) return unsupportedHevc();
@@ -910,6 +912,10 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     if (present && (!reader.ue(ignored) || !reader.ue(ignored))) return malformedHevc();
     if (!reader.bit(flag) || !reader.bit(syntax.fieldSeq) ||
         !reader.bit(syntax.frameFieldInfoPresent) || !reader.bit(present)) {
+        return malformedHevc();
+    }
+    if (!syntax.frameFieldInfoPresent &&
+        (syntax.fieldSeq || (syntax.generalProgressiveSource && syntax.generalInterlacedSource))) {
         return malformedHevc();
     }
     if (present) {

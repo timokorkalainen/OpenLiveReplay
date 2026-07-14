@@ -56,6 +56,10 @@ private slots:
     void hevcShmFixtureIsDecoded();
     void hevcTimeCodeDecoded();
     void hevcClockCountAndFlagsAreValidated();
+    void hevcFrameFieldInfoIsInferredWithoutVui();
+    void hevcInferredFrameFieldInfoControlsClockCount();
+    void hevcFrameFieldInfoExplicitZeroIsRejected_data();
+    void hevcFrameFieldInfoExplicitZeroIsRejected();
     void hevcFrameFieldInfoRequiresMatchingPictureTiming();
     void hevcPictureTimingSyntaxIsFullyValidated();
     void hevcSourceScanMatchesProfileTierLevel_data();
@@ -347,7 +351,8 @@ QList<QByteArray> hevcNalsOfType(const QByteArray& annexB, int wantedType) {
 QByteArray hevcSps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000,
                    uint32_t referencedVpsId = 0, bool frameFieldInfoPresent = false,
                    bool timingInfoPresent = true, bool fieldSeq = false,
-                   bool progressiveSource = true, bool interlacedSource = false) {
+                   bool progressiveSource = true, bool interlacedSource = false,
+                   bool vuiParametersPresent = true) {
     BitWriter writer;
     writer.bits(referencedVpsId, 4); // sps_video_parameter_set_id
     writer.bits(0, 3); // sps_max_sub_layers_minus1
@@ -389,24 +394,26 @@ QByteArray hevcSps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000,
     writer.bit(false); // long_term_ref_pics_present_flag
     writer.bit(true);  // sps_temporal_mvp_enabled_flag
     writer.bit(true);  // strong_intra_smoothing_enabled_flag
-    writer.bit(true);  // vui_parameters_present_flag
-    writer.bit(false); // aspect_ratio_info_present_flag
-    writer.bit(false); // overscan_info_present_flag
-    writer.bit(false); // video_signal_type_present_flag
-    writer.bit(false); // chroma_loc_info_present_flag
-    writer.bit(false); // neutral_chroma_indication_flag
-    writer.bit(fieldSeq);              // field_seq_flag
-    writer.bit(frameFieldInfoPresent); // frame_field_info_present_flag
-    writer.bit(false); // default_display_window_flag
-    writer.bit(timingInfoPresent); // vui_timing_info_present_flag
-    if (timingInfoPresent) {
-        writer.bits(numUnitsInTick, 32);
-        writer.bits(timeScale, 32);
-        writer.bit(true);  // vui_poc_proportional_to_timing_flag
-        writer.ue(0);      // vui_num_ticks_poc_diff_one_minus1
-        writer.bit(false); // vui_hrd_parameters_present_flag
+    writer.bit(vuiParametersPresent); // vui_parameters_present_flag
+    if (vuiParametersPresent) {
+        writer.bit(false);                 // aspect_ratio_info_present_flag
+        writer.bit(false);                 // overscan_info_present_flag
+        writer.bit(false);                 // video_signal_type_present_flag
+        writer.bit(false);                 // chroma_loc_info_present_flag
+        writer.bit(false);                 // neutral_chroma_indication_flag
+        writer.bit(fieldSeq);              // field_seq_flag
+        writer.bit(frameFieldInfoPresent); // frame_field_info_present_flag
+        writer.bit(false);                 // default_display_window_flag
+        writer.bit(timingInfoPresent);     // vui_timing_info_present_flag
+        if (timingInfoPresent) {
+            writer.bits(numUnitsInTick, 32);
+            writer.bits(timeScale, 32);
+            writer.bit(true);  // vui_poc_proportional_to_timing_flag
+            writer.ue(0);      // vui_num_ticks_poc_diff_one_minus1
+            writer.bit(false); // vui_hrd_parameters_present_flag
+        }
+        writer.bit(false); // bitstream_restriction_flag
     }
-    writer.bit(false); // bitstream_restriction_flag
     writer.bit(false); // sps_extension_present_flag
     writer.rbspTrailingBits();
     return QByteArray::fromHex("4201") + escapeRbsp(writer.bytes);
@@ -1803,6 +1810,59 @@ void TestH26xSeiTimecode::hevcClockCountAndFlagsAreValidated() {
     const auto parsed = H26xTimingDetail::parseHevcTimeCode(three.bytes, syntax);
     QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
     QCOMPARE(parsed.timecode.frames, 4);
+}
+
+void TestH26xSeiTimecode::hevcFrameFieldInfoIsInferredWithoutVui() {
+    H26xTimingContext inferredContext;
+    QVERIFY(inferredContext.updateParameterSets(
+        NativeVideoCodec::Hevc, {hevcVps(1001, 30000, 0, -1, true, true)},
+        {hevcSps(1001, 30000, 0, false, true, false, true, true, false)}));
+    QVERIFY(inferredContext.hevc()->frameFieldInfoPresent);
+
+    H26xTimingContext inferredAbsentContext;
+    QVERIFY(inferredAbsentContext.updateParameterSets(
+        NativeVideoCodec::Hevc, {hevcVps()},
+        {hevcSps(1001, 30000, 0, false, true, false, true, false, false)}));
+    QVERIFY(!inferredAbsentContext.hevc()->frameFieldInfoPresent);
+}
+
+void TestH26xSeiTimecode::hevcInferredFrameFieldInfoControlsClockCount() {
+    H26xTimingContext inferredContext;
+    QVERIFY(inferredContext.updateParameterSets(
+        NativeVideoCodec::Hevc, {hevcVps(1001, 30000, 0, -1, true, true)},
+        {hevcSps(1001, 30000, 0, false, true, false, true, true, false)}));
+
+    const QByteArray twoClockTimeCode = seiMessage(136, hevcClockTimestampPayload(2, 1, 2, 3, 4));
+    const QByteArray twoClockPictureTiming = seiMessage(1, hevcPictureTimingPayload(3));
+    QVERIFY(extractH26xSeiTimecodeResult(hevcPrefixSeiNal(twoClockTimeCode + twoClockPictureTiming),
+                                         NativeVideoCodec::Hevc, inferredContext)
+                .timecode.valid);
+    QVERIFY(!extractH26xSeiTimecodeResult(
+                 hevcPrefixSeiNal(seiMessage(136, hevcFullTimestampPayload(1, 2, 3, 4)) +
+                                  twoClockPictureTiming),
+                 NativeVideoCodec::Hevc, inferredContext)
+                 .timecode.valid);
+}
+
+void TestH26xSeiTimecode::hevcFrameFieldInfoExplicitZeroIsRejected_data() {
+    QTest::addColumn<bool>("fieldSeq");
+    QTest::addColumn<bool>("progressiveSource");
+    QTest::addColumn<bool>("interlacedSource");
+
+    QTest::newRow("field sequence") << true << true << false;
+    QTest::newRow("per-picture source scan") << false << true << true;
+}
+
+void TestH26xSeiTimecode::hevcFrameFieldInfoExplicitZeroIsRejected() {
+    QFETCH(bool, fieldSeq);
+    QFETCH(bool, progressiveSource);
+    QFETCH(bool, interlacedSource);
+
+    H26xTimingContext context;
+    QVERIFY(!context.updateParameterSets(
+        NativeVideoCodec::Hevc, {hevcVps(1001, 30000, 0, -1, progressiveSource, interlacedSource)},
+        {hevcSps(1001, 30000, 0, false, true, fieldSeq, progressiveSource, interlacedSource)}));
+    QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Malformed);
 }
 
 void TestH26xSeiTimecode::hevcFrameFieldInfoRequiresMatchingPictureTiming() {
