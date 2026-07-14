@@ -1473,7 +1473,10 @@ void PlaybackWorker::handleGpuDeviceLoss() {
 #endif
             recovery = lossMonitor.withCoordinatedTokenlessRecovery([&]() { return qsizetype(0); });
         }
-        if (recovery.coordinatorLeader) registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
+        // Exact-key coordination owns only authoritative dead-domain abandonment.
+        // Every worker recovery still owns one bounded pass for unmatched live
+        // domains, even when a proof publisher led the exact-key abandonment.
+        registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
 #ifdef OLR_UNIT_TEST
         m_gpuLastAbandonedRetainsForTest.store(recovery.abandoned, std::memory_order_release);
 #endif

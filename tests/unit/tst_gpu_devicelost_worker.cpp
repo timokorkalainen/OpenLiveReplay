@@ -117,6 +117,28 @@ private:
     uint64_t m_signalled = 0;
 };
 
+class ObservableLossFence final : public GpuFence {
+public:
+    ObservableLossFence(uintptr_t deviceDomainId, uint64_t authorityEpoch, bool completeOnWait)
+        : GpuFence(deviceDomainId, authorityEpoch), m_completeOnWait(completeOnWait) {}
+
+    uint64_t signal() override { return ++m_signalled; }
+    bool wait(uint64_t value, int) override {
+        m_waitCalls.fetch_add(1, std::memory_order_acq_rel);
+        if (!m_completeOnWait) return false;
+        m_completed.store(value, std::memory_order_release);
+        return true;
+    }
+    uint64_t completedValue() const override { return m_completed.load(std::memory_order_acquire); }
+    int waitCalls() const { return m_waitCalls.load(std::memory_order_acquire); }
+
+private:
+    const bool m_completeOnWait;
+    uint64_t m_signalled = 0;
+    std::atomic<uint64_t> m_completed{0};
+    std::atomic<int> m_waitCalls{0};
+};
+
 class CompatibleLossSurface final : public GpuSurface {
 public:
     CompatibleLossSurface(uintptr_t deviceDomainId, uint64_t authorityEpoch)
@@ -601,20 +623,42 @@ void TestGpuDeviceLostWorker::tokenlessUpgradeDuringRecoveryReleasesQuarantineAu
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     constexpr uintptr_t deviceDomain = 0xC330;
+    constexpr uintptr_t completingLiveDomain = 0xC440;
+    constexpr uintptr_t persistentLiveDomain = 0xC550;
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
 
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<IncompleteLossFence>(deviceDomain, authority);
-    auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+    auto deadFence = std::make_shared<IncompleteLossFence>(deviceDomain, authority);
+    auto completingLiveFence =
+        std::make_shared<ObservableLossFence>(completingLiveDomain, authority, true);
+    auto persistentLiveFence =
+        std::make_shared<ObservableLossFence>(persistentLiveDomain, authority, false);
+    auto deadSurface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+    auto completingLiveSurface =
+        std::make_shared<CompatibleLossSurface>(completingLiveDomain, authority);
+    auto persistentLiveSurface =
+        std::make_shared<CompatibleLossSurface>(persistentLiveDomain, authority);
     SubmittedAdapter adapter;
-    GpuOpScope operation(fence, registry);
-    QCOMPARE(
-        operation
-            .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
-            .retirement,
-        GpuRetirementDisposition::Published);
-    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+    GpuOpScope deadOperation(deadFence, registry);
+    GpuOpScope completingLiveOperation(completingLiveFence, registry);
+    GpuOpScope persistentLiveOperation(persistentLiveFence, registry);
+    QCOMPARE(deadOperation
+                 .submit(adapter,
+                         GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{deadSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(completingLiveOperation
+                 .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{
+                                      completingLiveSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(persistentLiveOperation
+                 .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{
+                                      persistentLiveSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 3);
 
     FrameProvider feedProvider;
     PlaybackTransport transport;
@@ -631,15 +675,35 @@ void TestGpuDeviceLostWorker::tokenlessUpgradeDuringRecoveryReleasesQuarantineAu
     const bool reachedUpgradeWindow = beforeTokenless.tryAcquire(1, 5000);
     const bool proofPublished = reachedUpgradeWindow && GpuDeviceLossMonitorTestAuthority::publish(
                                                             authority, deviceDomain) != 0;
+    const qsizetype pendingAfterPublisher = registry.pendingRetainCount();
+    const int completingWaitsAfterPublisher = completingLiveFence->waitCalls();
+    const int persistentWaitsAfterPublisher = persistentLiveFence->waitCalls();
     continueTokenless.release();
     recovery.join();
     worker.m_gpuBeforeTokenlessRecoveryEnteredForTest = nullptr;
     worker.m_gpuContinueTokenlessRecoveryForTest = nullptr;
 
+    const qsizetype pendingAfterWorker = registry.pendingRetainCount();
+    const int completingWaitsAfterWorker = completingLiveFence->waitCalls();
+    const int persistentWaitsAfterWorker = persistentLiveFence->waitCalls();
+    const bool completingCleanupPublished =
+        GpuDeviceLossMonitorTestAuthority::publish(authority, completingLiveDomain) != 0;
+    const bool persistentCleanupPublished =
+        GpuDeviceLossMonitorTestAuthority::publish(authority, persistentLiveDomain) != 0;
+    const qsizetype pendingAfterCleanup = registry.pendingRetainCount();
+
     QVERIFY(reachedUpgradeWindow);
     QVERIFY(proofPublished);
     QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
-    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+    QCOMPARE(pendingAfterPublisher, pendingBefore + 2);
+    QCOMPARE(completingWaitsAfterPublisher, 0);
+    QCOMPARE(persistentWaitsAfterPublisher, 0);
+    QCOMPARE(pendingAfterWorker, pendingBefore + 1);
+    QCOMPARE(completingWaitsAfterWorker, 1);
+    QCOMPARE(persistentWaitsAfterWorker, 1);
+    QVERIFY(completingCleanupPublished);
+    QVERIFY(persistentCleanupPublished);
+    QCOMPARE(pendingAfterCleanup, pendingBefore);
 }
 
 void TestGpuDeviceLostWorker::acceptedProofDeliveryCompletesBeforeRebuildCanClearState() {
