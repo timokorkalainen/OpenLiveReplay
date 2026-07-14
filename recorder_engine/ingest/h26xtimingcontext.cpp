@@ -656,7 +656,6 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
             return result;
         }
         Q_UNUSED(ctType);
-        Q_UNUSED(discontinuity);
 
         if ((haveSeconds && seconds >= 60) || (haveMinutes && minutes >= 60) ||
             (haveHours && hours >= 24) || !validH264FrameCount(frames, syntax.frameRate)) {
@@ -689,14 +688,22 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
         bool currentTimestampComparable = false;
         int64_t currentClockTimestamp = 0;
         if (effectiveTimestampComplete && syntax.numUnitsInTick != 0 && syntax.timeScale != 0) {
+            // Table D-3 assigns time_offset semantics only to counting_type 1.
+            // For type 0 the bits are present in the syntax but do not adjust
+            // Equation D-1, so they cannot conceal a decreasing clock label.
+            const int32_t orderingTimeOffset = countingType == 1 ? timeOffset : 0;
             if (!h264ClockTimestamp(effectiveHours, effectiveMinutes, effectiveSeconds, frames,
-                                    nuitFieldBased, timeOffset, syntax, currentClockTimestamp)) {
+                                    nuitFieldBased, orderingTimeOffset, syntax,
+                                    currentClockTimestamp)) {
                 result.status = TimecodeParseStatus::Malformed;
                 return result;
             }
             currentTimestampComparable = true;
         }
-        if (sawPresentTimestamp) {
+        // Annex D constrains a clock_timestamp against its predecessor only
+        // when the current entry does not declare a discontinuity. The current
+        // value still becomes the baseline for a following continuous entry.
+        if (sawPresentTimestamp && !discontinuity) {
             if (!previousTimestampComparable || !currentTimestampComparable) {
                 orderingUnavailable = true;
             } else if (currentClockTimestamp < previousClockTimestamp) {

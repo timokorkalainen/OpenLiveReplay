@@ -21,6 +21,8 @@ private slots:
     void h264ConsumesEveryClockTimestamp();
     void h264ClockTimestampsAreNondecreasing_data();
     void h264ClockTimestampsAreNondecreasing();
+    void h264SeiMessagesAreFullyValidated();
+    void h264SeiMessagesAggregateTypedResults();
     void h264LaterIncompleteClockInheritsUnits_data();
     void h264LaterIncompleteClockInheritsUnits();
     void h264RejectsInvalidTimestampLabels();
@@ -100,6 +102,10 @@ QByteArray seiNal(const QByteArray& header, const QByteArray& rbsp) {
 
 QByteArray h264SeiNal(const QByteArray& rbsp) {
     return seiNal(QByteArray(1, char(0x06)), rbsp); // nal_type 6
+}
+
+QByteArray rawH264SeiNal(const QByteArray& rbsp) {
+    return QByteArray(kStartCode4, 4) + QByteArray(1, char(0x06)) + escapeRbsp(rbsp);
 }
 
 QByteArray hevcPrefixSeiNal(const QByteArray& rbsp) {
@@ -188,13 +194,14 @@ struct BitWriter {
 
 void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, int frames,
                         int countingType = 0, bool countDropped = false, bool nuitFieldBased = true,
-                        int32_t timeOffset = 0, int timeOffsetLength = 0) {
+                        int32_t timeOffset = 0, int timeOffsetLength = 0,
+                        bool discontinuity = false) {
     writer.bit(true);  // clock_timestamp_flag[0]
     writer.bits(0, 2); // ct_type: progressive
     writer.bit(nuitFieldBased);
     writer.bits(uint32_t(countingType), 5);
     writer.bit(true);  // full_timestamp_flag
-    writer.bit(false); // discontinuity_flag
+    writer.bit(discontinuity);
     writer.bit(countDropped);
     writer.bits(uint32_t(frames), 8);
     writer.bits(uint32_t(seconds), 6);
@@ -390,6 +397,31 @@ void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing_data() {
         writeFullTimestamp(writer, 1, 2, 3, 5);
         writeFullTimestamp(writer, 1, 2, 3, 4);
     }) << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("declared discontinuity permits reversal") << payload(3, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 1, 2, 3, 5);
+        writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
+    }) << 0 << int(Status::Valid) << 1;
+    QTest::newRow("third clock advances from discontinuity") << payload(5, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 1, 2, 3, 8);
+        writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
+        writeFullTimestamp(writer, 1, 2, 3, 5);
+    }) << 0 << int(Status::Valid) << 1;
+    QTest::newRow("third clock reverses from discontinuity") << payload(5, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 1, 2, 3, 8);
+        writeFullTimestamp(writer, 1, 2, 3, 4, 0, false, true, 0, 0, true);
+        writeFullTimestamp(writer, 1, 2, 3, 3);
+    }) << 0 << int(Status::Malformed) << -1;
+    QTest::newRow("type zero offset cannot compensate reversal")
+        << payload(3,
+                   [](BitWriter& writer) {
+                       writeFullTimestamp(writer, 0, 0, 0, 5, 0, false, true, -4, 4);
+                       writeFullTimestamp(writer, 0, 0, 0, 4, 0, false, true, 0, 4);
+                   })
+        << 4 << int(Status::Malformed) << -1;
+    QTest::newRow("type one offset compensates reversal") << payload(3, [](BitWriter& writer) {
+        writeFullTimestamp(writer, 0, 0, 0, 5, 1, false, true, -4, 4);
+        writeFullTimestamp(writer, 0, 0, 0, 4, 1, false, true, 0, 4);
+    }) << 4 << int(Status::Valid) << 0;
     QTest::newRow("signed offsets reverse increasing labels") << payload(3, [](BitWriter& writer) {
         writeFullTimestamp(writer, 0, 0, 0, 0, 1, false, true, 2, 4);
         writeFullTimestamp(writer, 0, 0, 0, 1, 1, false, true, -1, 4);
@@ -406,6 +438,78 @@ void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing_data() {
         writeFullTimestamp(writer, 23, 59, 59, 24, 1, false, true, 0, 24);
         writeFullTimestamp(writer, 0, 0, 0, 0, 1, false, true, 4'320'000, 24);
     }) << 24 << int(Status::Valid) << 23;
+}
+
+void TestH26xSeiTimecode::h264SeiMessagesAreFullyValidated() {
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+
+    const QByteArray valid = seiMessage(1, fullTimestampPayload(1, 2, 3, 4));
+    const QByteArray truncated =
+        valid + seiVarByte(1) + seiVarByte(4) + QByteArray::fromHex("0a0b");
+    QVERIFY(
+        !extractH26xSeiTimecode(rawH264SeiNal(truncated), NativeVideoCodec::H264, context).valid);
+
+    BitWriter reservedCountingType;
+    reservedCountingType.bits(0, 4);
+    writeFullTimestamp(reservedCountingType, 1, 2, 3, 5, 7);
+    reservedCountingType.payloadTrailingBits();
+    const QByteArray malformedType = valid + seiMessage(1, reservedCountingType.bytes);
+    QVERIFY(
+        !extractH26xSeiTimecode(h264SeiNal(malformedType), NativeVideoCodec::H264, context).valid);
+
+    QVERIFY(!extractH26xSeiTimecode(rawH264SeiNal(valid), NativeVideoCodec::H264, context).valid);
+    QVERIFY(!extractH26xSeiTimecode(rawH264SeiNal(valid + QByteArray(1, char(0x81))),
+                                    NativeVideoCodec::H264, context)
+                 .valid);
+
+    const QByteArray validFirstNal = h264SeiNal(valid);
+    QVERIFY(!extractH26xSeiTimecode(validFirstNal + rawH264SeiNal(QByteArray::fromHex("0104aabb")),
+                                    NativeVideoCodec::H264, context)
+                 .valid);
+
+    for (const int zeroCount : {1, 2, 9}) {
+        const auto parsed =
+            extractH26xSeiTimecode(h264SeiNal(valid + seiMessage(5, QByteArray::fromHex("aabb"))) +
+                                       QByteArray(zeroCount, char(0)),
+                                   NativeVideoCodec::H264, context);
+        QVERIFY2(parsed.valid,
+                 qPrintable(QStringLiteral("multi-message trailing zeros=%1").arg(zeroCount)));
+        QCOMPARE(parsed.frames, 4);
+    }
+}
+
+void TestH26xSeiTimecode::h264SeiMessagesAggregateTypedResults() {
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+
+    const QByteArray first = seiMessage(1, fullTimestampPayload(1, 2, 3, 4));
+    const QByteArray later = seiMessage(1, fullTimestampPayload(2, 3, 4, 5));
+    auto parsed =
+        extractH26xSeiTimecode(h264SeiNal(first + later), NativeVideoCodec::H264, context);
+    QVERIFY(parsed.valid);
+    QCOMPARE(parsed.hours, 1);
+    QCOMPARE(parsed.minutes, 2);
+    QCOMPARE(parsed.seconds, 3);
+    QCOMPARE(parsed.frames, 4);
+
+    parsed =
+        extractH26xSeiTimecode(h264SeiNal(first + seiMessage(5, QByteArray::fromHex("aabbcc"))),
+                               NativeVideoCodec::H264, context);
+    QVERIFY(parsed.valid);
+    QCOMPARE(parsed.frames, 4);
+
+    const QByteArray unsupported = seiMessage(1, fullTimestampPayload(1, 2, 3, 5, 5));
+    QVERIFY(
+        !extractH26xSeiTimecode(h264SeiNal(first + unsupported), NativeVideoCodec::H264, context)
+             .valid);
+    QVERIFY(
+        !extractH26xSeiTimecode(h264SeiNal(unsupported + later), NativeVideoCodec::H264, context)
+             .valid);
 }
 
 void TestH26xSeiTimecode::h264ClockTimestampsAreNondecreasing() {
@@ -893,7 +997,7 @@ void TestH26xSeiTimecode::h264RejectsMalformedEmulationPrevention() {
     QVERIFY(escapedResult.valid);
     QCOMPARE(escapedResult.frames, 4);
 
-    const QByteArray separatedNals = QByteArray(kStartCode4, 4) + QByteArray::fromHex("0605") +
+    const QByteArray separatedNals = QByteArray(kStartCode4, 4) + QByteArray::fromHex("06050080") +
                                      QByteArray::fromHex("000001") + QByteArray(1, char(0x06)) +
                                      escapeRbsp(validMessage + QByteArray(1, char(0x80)));
     const auto splitResult = extractH26xSeiTimecode(separatedNals, NativeVideoCodec::H264, context);

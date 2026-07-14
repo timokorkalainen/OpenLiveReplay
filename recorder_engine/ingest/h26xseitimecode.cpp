@@ -86,49 +86,97 @@ Smpte12mTimecode decodeLegacyHevcPayload(const QByteArray& rbsp, int payloadStar
     return Smpte12m::fromPackedWord(word);
 }
 
-Smpte12mTimecode extractFromSeiRbsp(const QByteArray& rbsp, NativeVideoCodec codec,
-                                    const H26xTimingContext* context) {
+H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(const QByteArray& rbsp,
+                                                         NativeVideoCodec codec,
+                                                         const H26xTimingContext* context) {
+    using H26xTimingDetail::TimecodeParseResult;
+    using H26xTimingDetail::TimecodeParseStatus;
+
+    TimecodeParseResult result;
+    bool sawMalformed = false;
+    bool sawUnsupported = false;
+    bool sawTrailingBits = false;
     int pos = 0;
     while (pos < rbsp.size()) {
-        if (uchar(rbsp[pos]) == 0x80) break;
+        if (pos == rbsp.size() - 1 && uchar(rbsp[pos]) == 0x80) {
+            sawTrailingBits = true;
+            ++pos;
+            break;
+        }
 
         int64_t payloadType = 0;
         int64_t payloadSize = 0;
         if (!readSeiVarValue(rbsp, pos, payloadType) || !readSeiVarValue(rbsp, pos, payloadSize) ||
             payloadSize > rbsp.size() - pos) {
-            break;
+            result.status = TimecodeParseStatus::Malformed;
+            result.timecode = {};
+            return result;
         }
 
         if (codec == NativeVideoCodec::H264 && payloadType == 1 && context != nullptr &&
             context->codec() == NativeVideoCodec::H264 && context->h264() != nullptr) {
             const auto parsed = H26xTimingDetail::parseH264PicTiming(
                 rbsp.mid(pos, int(payloadSize)), *context->h264());
-            if (parsed.status == H26xTimingDetail::TimecodeParseStatus::Valid &&
-                validateTimecodeLabel(parsed.timecode, context->constantFrameRate())) {
-                return parsed.timecode;
+            const bool validCandidate =
+                parsed.status == TimecodeParseStatus::Valid &&
+                validateTimecodeLabel(parsed.timecode, context->constantFrameRate());
+            if (parsed.status == TimecodeParseStatus::Malformed ||
+                (parsed.status == TimecodeParseStatus::Valid && !validCandidate)) {
+                sawMalformed = true;
             }
+            if (parsed.status == TimecodeParseStatus::Unsupported) sawUnsupported = true;
+            if (validCandidate && !result.timecode.valid) result.timecode = parsed.timecode;
+        } else if (codec == NativeVideoCodec::H264 && payloadType == 1) {
+            sawUnsupported = true;
         } else if (codec == NativeVideoCodec::Hevc && (payloadType == 136 || payloadType == 4)) {
             const Smpte12mTimecode timecode = decodeLegacyHevcPayload(rbsp, pos, int(payloadSize));
-            if (timecode.valid) return timecode;
+            if (timecode.valid && !result.timecode.valid) result.timecode = timecode;
         }
         pos += int(payloadSize);
     }
-    return {};
+    if (sawMalformed || !sawTrailingBits || pos != rbsp.size()) {
+        result.status = TimecodeParseStatus::Malformed;
+        result.timecode = {};
+    } else if (sawUnsupported) {
+        result.status = TimecodeParseStatus::Unsupported;
+        result.timecode = {};
+    } else if (result.timecode.valid) {
+        result.status = TimecodeParseStatus::Valid;
+    }
+    return result;
 }
 
 Smpte12mTimecode extract(const QByteArray& annexB, NativeVideoCodec codec,
                          const H26xTimingContext* context) {
     if (annexB.isEmpty() || codec == NativeVideoCodec::Unknown) return {};
+    using H26xTimingDetail::TimecodeParseStatus;
+
+    Smpte12mTimecode firstUsableTimestamp;
+    bool sawUnsupported = false;
+    bool sawMalformed = false;
     for (const QByteArray& nal : splitAnnexBNals(annexB)) {
         if (!isSeiNal(nal, codec)) continue;
         const int headerBytes = codec == NativeVideoCodec::H264 ? 1 : 2;
-        if (nal.size() <= headerBytes) continue;
+        if (nal.size() <= headerBytes) {
+            sawMalformed = true;
+            continue;
+        }
         QByteArray rbsp;
-        if (!H26xTimingDetail::unescapeRbsp(nal.mid(headerBytes), rbsp)) continue;
-        const Smpte12mTimecode timecode = extractFromSeiRbsp(rbsp, codec, context);
-        if (timecode.valid) return timecode;
+        if (!H26xTimingDetail::unescapeRbsp(nal.mid(headerBytes), rbsp)) {
+            sawMalformed = true;
+            continue;
+        }
+        const auto parsed = extractFromSeiRbsp(rbsp, codec, context);
+        if (parsed.status == TimecodeParseStatus::Malformed) {
+            sawMalformed = true;
+        } else if (parsed.status == TimecodeParseStatus::Unsupported) {
+            sawUnsupported = true;
+        } else if (parsed.status == TimecodeParseStatus::Valid && !firstUsableTimestamp.valid) {
+            firstUsableTimestamp = parsed.timecode;
+        }
     }
-    return {};
+    if (sawMalformed || sawUnsupported) return {};
+    return firstUsableTimestamp;
 }
 
 } // namespace
