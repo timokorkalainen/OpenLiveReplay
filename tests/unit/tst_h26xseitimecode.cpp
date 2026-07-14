@@ -58,12 +58,18 @@ private slots:
     void hevcClockCountAndFlagsAreValidated();
     void hevcFrameFieldInfoRequiresMatchingPictureTiming();
     void hevcPictureTimingSyntaxIsFullyValidated();
+    void hevcSourceScanMatchesProfileTierLevel_data();
+    void hevcSourceScanMatchesProfileTierLevel();
     void hevcPartialTimestampInheritsEarlierUnits();
     void hevcPartialTimestampInheritsAcrossAccessUnitsPerStream();
+    void hevcOutputOrderIdentityIsRequired();
+    void hevcOutputOrderHandlesReorderDuplicateAndEpoch();
     void hevcAbsentClockClearsPredecessor();
     void hevcStateDoesNotCrossTimingContexts();
     void hevcSignedOffsetAndDiscontinuityArePreserved();
     void hevcCountingAndDropSemanticsAreValidated();
+    void hevcCountingTypesUseNormativeOutputPredecessor_data();
+    void hevcCountingTypesUseNormativeOutputPredecessor();
     void hevcDiscontinuityAllowsClockRegression();
     void hevcDropCountRequiresProvenPredecessor();
     void hevcTruncatedTimeCodeIsRejected();
@@ -167,6 +173,12 @@ HevcTimingSyntax hevcTiming(uint32_t numUnitsInTick = 1001, uint32_t timeScale =
     return syntax;
 }
 
+H26xSeiOutputOrderKey outputOrder(const H26xTimingContext& context, int64_t presentationKey,
+                                  uint64_t sourceGeneration = 1, uint64_t domain = 1,
+                                  uint64_t epoch = 0) {
+    return {sourceGeneration, context.generation(), domain, epoch, presentationKey};
+}
+
 // A trivial VCL NAL so the buffer looks like a real access unit.
 QByteArray h264VclNal() {
     return QByteArray(kStartCode4, 4) + QByteArray::fromHex("658884"); // IDR slice
@@ -258,7 +270,8 @@ struct BitWriter {
 };
 
 QByteArray hevcVps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000, uint32_t vpsId = 0,
-                   int hrdLayerSetIndex = -1) {
+                   int hrdLayerSetIndex = -1, bool progressiveSource = true,
+                   bool interlacedSource = false) {
     BitWriter writer;
     writer.bits(vpsId, 4); // vps_video_parameter_set_id
     writer.bit(true);  // vps_base_layer_internal_flag
@@ -271,8 +284,8 @@ QByteArray hevcVps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000, u
     writer.bit(false);            // general_tier_flag
     writer.bits(1, 5);            // Main profile
     writer.bits(0x80000000u, 32); // Main profile compatibility
-    writer.bit(true);             // progressive_source_flag
-    writer.bit(false);            // interlaced_source_flag
+    writer.bit(progressiveSource); // progressive_source_flag
+    writer.bit(interlacedSource);  // interlaced_source_flag
     writer.bit(false);            // non_packed_constraint_flag
     writer.bit(true);             // frame_only_constraint_flag
     writer.bits(0, 32);
@@ -333,7 +346,8 @@ QList<QByteArray> hevcNalsOfType(const QByteArray& annexB, int wantedType) {
 
 QByteArray hevcSps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000,
                    uint32_t referencedVpsId = 0, bool frameFieldInfoPresent = false,
-                   bool timingInfoPresent = true, bool fieldSeq = false) {
+                   bool timingInfoPresent = true, bool fieldSeq = false,
+                   bool progressiveSource = true, bool interlacedSource = false) {
     BitWriter writer;
     writer.bits(referencedVpsId, 4); // sps_video_parameter_set_id
     writer.bits(0, 3); // sps_max_sub_layers_minus1
@@ -342,8 +356,8 @@ QByteArray hevcSps(uint32_t numUnitsInTick = 1001, uint32_t timeScale = 30000,
     writer.bit(false);
     writer.bits(1, 5);
     writer.bits(0x80000000u, 32);
-    writer.bit(true);
-    writer.bit(false);
+    writer.bit(progressiveSource);
+    writer.bit(interlacedSource);
     writer.bit(false);
     writer.bit(true);
     writer.bits(0, 32);
@@ -469,10 +483,10 @@ QByteArray hevcFullTimestampPayload(int hours, int minutes, int seconds, int fra
     return writer.bytes;
 }
 
-QByteArray hevcPictureTimingPayload(int picStruct) {
+QByteArray hevcPictureTimingPayload(int picStruct, int sourceScanType = 1) {
     BitWriter writer;
     writer.bits(uint32_t(picStruct), 4);
-    writer.bits(0, 2); // source_scan_type: progressive
+    writer.bits(uint32_t(sourceScanType), 2);
     writer.bit(false); // duplicate_flag
     writer.payloadTrailingBits();
     return writer.bytes;
@@ -1869,6 +1883,43 @@ void TestH26xSeiTimecode::hevcPictureTimingSyntaxIsFullyValidated() {
                  .timecode.valid);
 }
 
+void TestH26xSeiTimecode::hevcSourceScanMatchesProfileTierLevel_data() {
+    QTest::addColumn<bool>("progressiveSource");
+    QTest::addColumn<bool>("interlacedSource");
+    QTest::addColumn<int>("sourceScanType");
+    QTest::addColumn<bool>("accepted");
+
+    QTest::newRow("progressive-progressive") << true << false << 1 << true;
+    QTest::newRow("progressive-interlaced") << true << false << 0 << false;
+    QTest::newRow("progressive-unspecified") << true << false << 2 << false;
+    QTest::newRow("interlaced-interlaced") << false << true << 0 << true;
+    QTest::newRow("interlaced-progressive") << false << true << 1 << false;
+    QTest::newRow("interlaced-unspecified") << false << true << 2 << false;
+    QTest::newRow("unspecified-unspecified") << false << false << 2 << true;
+    QTest::newRow("unspecified-interlaced") << false << false << 0 << false;
+    QTest::newRow("unspecified-progressive") << false << false << 1 << false;
+    QTest::newRow("per-picture-interlaced") << true << true << 0 << true;
+    QTest::newRow("per-picture-progressive") << true << true << 1 << true;
+    QTest::newRow("per-picture-unspecified") << true << true << 2 << true;
+}
+
+void TestH26xSeiTimecode::hevcSourceScanMatchesProfileTierLevel() {
+    QFETCH(bool, progressiveSource);
+    QFETCH(bool, interlacedSource);
+    QFETCH(int, sourceScanType);
+    QFETCH(bool, accepted);
+
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(
+        NativeVideoCodec::Hevc, {hevcVps(1001, 30000, 0, -1, progressiveSource, interlacedSource)},
+        {hevcSps(1001, 30000, 0, true, true, false, progressiveSource, interlacedSource)}));
+    const QByteArray annexB =
+        hevcPrefixSeiNal(seiMessage(136, hevcFullTimestampPayload(1, 2, 3, 4)) +
+                         seiMessage(1, hevcPictureTimingPayload(0, sourceScanType)));
+    QCOMPARE(extractH26xSeiTimecodeResult(annexB, NativeVideoCodec::Hevc, context).timecode.valid,
+             accepted);
+}
+
 void TestH26xSeiTimecode::hevcPartialTimestampInheritsEarlierUnits() {
     BitWriter writer;
     writer.bits(2, 2);
@@ -1900,10 +1951,11 @@ void TestH26xSeiTimecode::hevcPartialTimestampInheritsAcrossAccessUnitsPerStream
         hevcPrefixSeiNal(seiMessage(136, hevcFullTimestampPayload(7, 8, 9, 10)));
     const QByteArray partial = hevcPrefixSeiNal(seiMessage(136, hevcNoUnitsTimestampPayload(11)));
 
-    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, context, firstStream)
+    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, context, firstStream,
+                                         outputOrder(context, 100))
                 .timecode.valid);
-    const auto inherited =
-        extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, firstStream);
+    const auto inherited = extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context,
+                                                        firstStream, outputOrder(context, 200));
     QVERIFY(inherited.timecode.valid);
     QCOMPARE(inherited.timecode.hours, 7);
     QCOMPARE(inherited.timecode.minutes, 8);
@@ -1913,22 +1965,27 @@ void TestH26xSeiTimecode::hevcPartialTimestampInheritsAcrossAccessUnitsPerStream
     const QByteArray conflicting =
         hevcPrefixSeiNal(seiMessage(136, hevcFullTimestampPayload(1, 2, 3, 4)) +
                          seiMessage(136, hevcFullTimestampPayload(4, 5, 6, 7)));
-    QVERIFY(!extractH26xSeiTimecodeResult(conflicting, NativeVideoCodec::Hevc, context, firstStream)
+    QVERIFY(!extractH26xSeiTimecodeResult(conflicting, NativeVideoCodec::Hevc, context, firstStream,
+                                          outputOrder(context, 300))
                  .timecode.valid);
-    const auto afterConflict =
-        extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, firstStream);
+    const auto afterConflict = extractH26xSeiTimecodeResult(
+        partial, NativeVideoCodec::Hevc, context, firstStream, outputOrder(context, 400));
     QVERIFY(!afterConflict.timecode.valid);
 
-    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, secondStream)
+    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, secondStream,
+                                          outputOrder(context, 100))
                  .timecode.valid);
     firstStream.reset();
-    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, firstStream)
+    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, firstStream,
+                                          outputOrder(context, 100))
                  .timecode.valid);
 
-    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, context, firstStream)
+    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, context, firstStream,
+                                         outputOrder(context, 200))
                 .timecode.valid);
     QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps(1001, 60000)}, {}));
-    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, firstStream)
+    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, firstStream,
+                                          outputOrder(context, 300))
                  .timecode.valid);
 }
 
@@ -1941,9 +1998,11 @@ void TestH26xSeiTimecode::hevcAbsentClockClearsPredecessor() {
     const QByteArray absentThenPartial =
         hevcPrefixSeiNal(seiMessage(136, hevcAbsentThenNoUnitsTimestampPayload(11)));
 
-    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, context, state)
+    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, context, state,
+                                         outputOrder(context, 100))
                 .timecode.valid);
-    QVERIFY(!extractH26xSeiTimecodeResult(absentThenPartial, NativeVideoCodec::Hevc, context, state)
+    QVERIFY(!extractH26xSeiTimecodeResult(absentThenPartial, NativeVideoCodec::Hevc, context, state,
+                                          outputOrder(context, 200))
                  .timecode.valid);
 }
 
@@ -1958,9 +2017,11 @@ void TestH26xSeiTimecode::hevcStateDoesNotCrossTimingContexts() {
     const QByteArray complete =
         hevcPrefixSeiNal(seiMessage(136, hevcFullTimestampPayload(7, 8, 9, 10)));
     const QByteArray partial = hevcPrefixSeiNal(seiMessage(136, hevcNoUnitsTimestampPayload(11)));
-    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, firstContext, state)
+    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, firstContext, state,
+                                         outputOrder(firstContext, 100))
                 .timecode.valid);
-    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, secondContext, state)
+    QVERIFY(!extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, secondContext, state,
+                                          outputOrder(secondContext, 200))
                  .timecode.valid);
 }
 
@@ -1979,12 +2040,162 @@ void TestH26xSeiTimecode::hevcCountingAndDropSemanticsAreValidated() {
 
     const auto drop = H26xTimingDetail::parseHevcTimeCode(
         hevcFullTimestampPayload(1, 1, 0, 2, 4, true), hevcTiming());
-    QCOMPARE(drop.status, H26xTimingDetail::TimecodeParseStatus::Unsupported);
+    QCOMPARE(drop.status, H26xTimingDetail::TimecodeParseStatus::Valid);
+    QVERIFY(drop.timecode.dropFrame);
 
     QCOMPARE(H26xTimingDetail::parseHevcTimeCode(hevcFullTimestampPayload(1, 1, 0, 3, 4, true),
                                                  hevcTiming())
                  .status,
              H26xTimingDetail::TimecodeParseStatus::Malformed);
+}
+
+void TestH26xSeiTimecode::hevcOutputOrderIdentityIsRequired() {
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {}));
+    H26xSeiTimecodeState state;
+    const QByteArray complete =
+        hevcPrefixSeiNal(seiMessage(136, hevcFullTimestampPayload(7, 8, 9, 10)));
+    const QByteArray partial = hevcPrefixSeiNal(seiMessage(136, hevcNoUnitsTimestampPayload(11)));
+
+    QVERIFY(extractH26xSeiTimecodeResult(complete, NativeVideoCodec::Hevc, context, state)
+                .timecode.valid);
+    const auto missingOrder =
+        extractH26xSeiTimecodeResult(partial, NativeVideoCodec::Hevc, context, state);
+    QCOMPARE(missingOrder.status, H26xTimingDetail::TimecodeParseStatus::Unsupported);
+    QVERIFY(!missingOrder.timecode.valid);
+}
+
+void TestH26xSeiTimecode::hevcOutputOrderHandlesReorderDuplicateAndEpoch() {
+    using Status = H26xTimingDetail::TimecodeParseStatus;
+    H26xTimingContext context;
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::Hevc, {hevcVps()}, {}));
+    H26xSeiTimecodeState state;
+    const auto key = [&context](uint64_t sourceGeneration, uint64_t domain, uint64_t epoch,
+                                int64_t presentationTime) {
+        return H26xSeiOutputOrderKey{sourceGeneration, context.generation(), domain, epoch,
+                                     presentationTime};
+    };
+    const auto au = [](int hours, int minutes, int seconds, int frames,
+                       bool discontinuity = false) {
+        return hevcPrefixSeiNal(
+            seiMessage(136, hevcFullTimestampPayload(hours, minutes, seconds, frames, 0, false,
+                                                     false, 0, 0, discontinuity)));
+    };
+
+    const QByteArray late = au(10, 0, 0, 10);
+    QVERIFY(extractH26xSeiTimecodeResult(late, NativeVideoCodec::Hevc, context, state,
+                                         key(1, 7, 0, 300))
+                .timecode.valid);
+    QVERIFY(extractH26xSeiTimecodeResult(au(10, 0, 0, 0), NativeVideoCodec::Hevc, context, state,
+                                         key(1, 7, 0, 100))
+                .timecode.valid);
+    QVERIFY(extractH26xSeiTimecodeResult(au(10, 0, 0, 5), NativeVideoCodec::Hevc, context, state,
+                                         key(1, 7, 0, 200))
+                .timecode.valid);
+
+    H26xSeiTimecodeState successorState;
+    QVERIFY(extractH26xSeiTimecodeResult(late, NativeVideoCodec::Hevc, context, successorState,
+                                         key(1, 7, 0, 300))
+                .timecode.valid);
+    QCOMPARE(extractH26xSeiTimecodeResult(au(11, 0, 0, 0), NativeVideoCodec::Hevc, context,
+                                          successorState, key(1, 7, 0, 100))
+                 .status,
+             Status::Malformed);
+
+    QVERIFY(extractH26xSeiTimecodeResult(late, NativeVideoCodec::Hevc, context, state,
+                                         key(1, 7, 0, 300))
+                .timecode.valid);
+    QCOMPARE(extractH26xSeiTimecodeResult(au(10, 0, 0, 11), NativeVideoCodec::Hevc, context, state,
+                                          key(1, 7, 0, 300))
+                 .status,
+             Status::Malformed);
+
+    QCOMPARE(extractH26xSeiTimecodeResult(au(9, 0, 0, 0), NativeVideoCodec::Hevc, context, state,
+                                          key(1, 7, 0, 400))
+                 .status,
+             Status::Malformed);
+    QVERIFY(extractH26xSeiTimecodeResult(au(9, 0, 0, 0, true), NativeVideoCodec::Hevc, context,
+                                         state, key(1, 7, 0, 400))
+                .timecode.valid);
+
+    // A higher caller-owned epoch makes a wrapped low presentation key a new order domain.
+    QVERIFY(extractH26xSeiTimecodeResult(au(0, 0, 0, 0), NativeVideoCodec::Hevc, context, state,
+                                         key(1, 7, 1, 3))
+                .timecode.valid);
+    QCOMPARE(extractH26xSeiTimecodeResult(au(23, 59, 59, 29), NativeVideoCodec::Hevc, context,
+                                          state, key(1, 7, 0, (int64_t(1) << 33) - 1))
+                 .status,
+             Status::Unsupported);
+
+    // Timing generation, source generation, and PTS domain are part of the identity contract.
+    QCOMPARE(
+        extractH26xSeiTimecodeResult(au(0, 0, 0, 1), NativeVideoCodec::Hevc, context, state,
+                                     H26xSeiOutputOrderKey{1, context.generation() + 1, 7, 1, 4})
+            .status,
+        Status::Unsupported);
+    QCOMPARE(extractH26xSeiTimecodeResult(au(0, 0, 0, 1), NativeVideoCodec::Hevc, context, state,
+                                          key(1, 8, 1, 4))
+                 .status,
+             Status::Unsupported);
+    QVERIFY(extractH26xSeiTimecodeResult(au(0, 0, 0, 1), NativeVideoCodec::Hevc, context, state,
+                                         key(2, 8, 0, 4))
+                .timecode.valid);
+    QCOMPARE(extractH26xSeiTimecodeResult(au(0, 0, 0, 2), NativeVideoCodec::Hevc, context, state,
+                                          key(1, 7, 1, 5))
+                 .status,
+             Status::Unsupported);
+}
+
+void TestH26xSeiTimecode::hevcCountingTypesUseNormativeOutputPredecessor_data() {
+    using Status = H26xTimingDetail::TimecodeParseStatus;
+    QTest::addColumn<int>("countingType");
+    QTest::addColumn<int>("predecessorFrame");
+    QTest::addColumn<bool>("discontinuity");
+    QTest::addColumn<int>("expectedStatus");
+
+    QTest::newRow("type2-prohibited-zero") << 2 << 0 << false << int(Status::Malformed);
+    QTest::newRow("type2-sparse-predecessor") << 2 << 15 << false << int(Status::Unsupported);
+    QTest::newRow("type2-discontinuity") << 2 << 0 << true << int(Status::Unsupported);
+    QTest::newRow("type3-prohibited-max-minus-one") << 3 << 29 << false << int(Status::Malformed);
+    QTest::newRow("type3-sparse-predecessor") << 3 << 15 << false << int(Status::Unsupported);
+    QTest::newRow("type3-discontinuity") << 3 << 29 << true << int(Status::Unsupported);
+    QTest::newRow("type4-prohibited-zero") << 4 << 0 << false << int(Status::Malformed);
+    QTest::newRow("type4-prohibited-one") << 4 << 1 << false << int(Status::Malformed);
+    QTest::newRow("type4-sparse-predecessor") << 4 << 15 << false << int(Status::Valid);
+    QTest::newRow("type4-discontinuity") << 4 << 0 << true << int(Status::Valid);
+}
+
+void TestH26xSeiTimecode::hevcCountingTypesUseNormativeOutputPredecessor() {
+    QFETCH(int, countingType);
+    QFETCH(int, predecessorFrame);
+    QFETCH(bool, discontinuity);
+    QFETCH(int, expectedStatus);
+
+    H26xTimingDetail::HevcTimeCodeContinuity previous;
+    previous.haveSeconds = true;
+    previous.haveMinutes = true;
+    previous.haveHours = true;
+    previous.seconds = 17;
+    previous.minutes = 42;
+    previous.hours = 6;
+    previous.haveFrameSemantics = true;
+    previous.frames = uint32_t(predecessorFrame);
+    previous.labelRate = FrameRateQ{30000, 1001};
+    previous.countingType = uint8_t(countingType);
+    previous.dropFrame = countingType == 4;
+
+    H26xTimingDetail::HevcTimeCodeOutput previousOutput;
+    previousOutput.present = true;
+    previousOutput.comparable = true;
+    previousOutput.frames = uint32_t(predecessorFrame);
+    previousOutput.maxFps = 30;
+
+    const int currentFrame = countingType == 2 ? 1 : countingType == 3 ? 0 : 2;
+    const auto parsed = H26xTimingDetail::parseHevcTimeCode(
+        hevcFullTimestampPayload(6, 41, 0, currentFrame, countingType, true, false, 0, 0,
+                                 discontinuity),
+        hevcTiming(), &previous, nullptr, -1, &previousOutput);
+    QCOMPARE(int(parsed.status), expectedStatus);
 }
 
 void TestH26xSeiTimecode::hevcDiscontinuityAllowsClockRegression() {
@@ -2007,33 +2218,37 @@ void TestH26xSeiTimecode::hevcDropCountRequiresProvenPredecessor() {
         H26xSeiTimecodeState state;
         const QByteArray predecessor = hevcPrefixSeiNal(
             seiMessage(136, hevcFullTimestampPayload(1, 0, 0, predecessorFrame, 4)));
-        QVERIFY(
-            extractH26xSeiTimecodeResult(predecessor, NativeVideoCodec::Hevc, firstContext, state)
-                .timecode.valid);
-        QVERIFY(!extractH26xSeiTimecodeResult(current, NativeVideoCodec::Hevc, firstContext, state)
+        QVERIFY(extractH26xSeiTimecodeResult(predecessor, NativeVideoCodec::Hevc, firstContext,
+                                             state, outputOrder(firstContext, 100))
+                    .timecode.valid);
+        QVERIFY(!extractH26xSeiTimecodeResult(current, NativeVideoCodec::Hevc, firstContext, state,
+                                              outputOrder(firstContext, 200))
                      .timecode.valid);
     }
 
     H26xSeiTimecodeState state;
     const QByteArray validPredecessor =
         hevcPrefixSeiNal(seiMessage(136, hevcFullTimestampPayload(1, 0, 59, 29, 4)));
-    QVERIFY(
-        extractH26xSeiTimecodeResult(validPredecessor, NativeVideoCodec::Hevc, firstContext, state)
-            .timecode.valid);
-    const auto validDrop =
-        extractH26xSeiTimecodeResult(current, NativeVideoCodec::Hevc, firstContext, state);
+    QVERIFY(extractH26xSeiTimecodeResult(validPredecessor, NativeVideoCodec::Hevc, firstContext,
+                                         state, outputOrder(firstContext, 100))
+                .timecode.valid);
+    const auto validDrop = extractH26xSeiTimecodeResult(
+        current, NativeVideoCodec::Hevc, firstContext, state, outputOrder(firstContext, 200));
     QVERIFY(validDrop.timecode.valid);
     QVERIFY(validDrop.timecode.dropFrame);
 
     state.reset();
-    QVERIFY(!extractH26xSeiTimecodeResult(current, NativeVideoCodec::Hevc, firstContext, state)
-                 .timecode.valid);
+    QVERIFY(extractH26xSeiTimecodeResult(current, NativeVideoCodec::Hevc, firstContext, state,
+                                         outputOrder(firstContext, 100))
+                .timecode.valid);
 
-    QVERIFY(
-        extractH26xSeiTimecodeResult(validPredecessor, NativeVideoCodec::Hevc, firstContext, state)
-            .timecode.valid);
-    QVERIFY(!extractH26xSeiTimecodeResult(current, NativeVideoCodec::Hevc, secondContext, state)
-                 .timecode.valid);
+    state.reset();
+    QVERIFY(extractH26xSeiTimecodeResult(validPredecessor, NativeVideoCodec::Hevc, firstContext,
+                                         state, outputOrder(firstContext, 200))
+                .timecode.valid);
+    QVERIFY(extractH26xSeiTimecodeResult(current, NativeVideoCodec::Hevc, secondContext, state,
+                                         outputOrder(secondContext, 300))
+                .timecode.valid);
 }
 
 void TestH26xSeiTimecode::hevcTruncatedTimeCodeIsRejected() {

@@ -35,6 +35,8 @@ struct HevcTimingSyntax {
     bool pocProportionalToTiming = false;
     bool fieldSeq = false;
     bool frameFieldInfoPresent = false;
+    bool generalProgressiveSource = false;
+    bool generalInterlacedSource = false;
     bool cpbDpbDelaysPresent = false;
     bool subPicHrdParamsPresent = false;
     bool subPicCpbParamsInPicTimingSei = false;
@@ -103,9 +105,25 @@ struct HevcTimeCodeContinuity {
     bool dropFrame = false;
 };
 
+// The fields needed to validate the transition from the previous set of clock
+// timestamp syntax elements in output order (H.265 D.3.27). This is distinct
+// from HevcTimeCodeContinuity, whose omitted clock units inherit in decoding
+// order.
+struct HevcTimeCodeOutput {
+    bool present = false;
+    bool comparable = false;
+    int64_t clockTimestamp = 0;
+    uint32_t frames = 0;
+    uint32_t maxFps = 0;
+    uint8_t countingType = 0;
+    bool countDropped = false;
+    bool discontinuity = false;
+};
+
 struct HevcPictureTimingParseResult {
     TimecodeParseStatus status = TimecodeParseStatus::NoTimestamp;
     int picStruct = -1;
+    int sourceScanType = -1;
 };
 
 // Decode an EBSP into an RBSP while validating the NAL escape rules. A prevention
@@ -120,7 +138,13 @@ HevcPictureTimingParseResult parseHevcPictureTiming(const QByteArray& payload,
 TimecodeParseResult parseHevcTimeCode(const QByteArray& payload, const HevcTimingSyntax& syntax,
                                       const HevcTimeCodeContinuity* previous = nullptr,
                                       HevcTimeCodeContinuity* next = nullptr,
-                                      int expectedClockCount = -1);
+                                      int expectedClockCount = -1,
+                                      const HevcTimeCodeOutput* previousOutput = nullptr,
+                                      HevcTimeCodeOutput* firstOutput = nullptr,
+                                      HevcTimeCodeOutput* lastOutput = nullptr);
+
+TimecodeParseStatus validateHevcOutputTransition(const HevcTimeCodeOutput* previous,
+                                                 const HevcTimeCodeOutput& current);
 
 } // namespace H26xTimingDetail
 

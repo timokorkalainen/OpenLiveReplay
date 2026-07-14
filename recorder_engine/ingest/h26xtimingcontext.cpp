@@ -479,12 +479,19 @@ HevcTimingSyntax unsupportedHevc() {
     return syntax;
 }
 
-bool skipHevcProfileTierLevel(BitReader& reader, uint32_t maxSubLayersMinus1) {
+struct HevcProfileTierLevel {
+    bool progressiveSource = false;
+    bool interlacedSource = false;
+};
+
+bool parseHevcProfileTierLevel(BitReader& reader, uint32_t maxSubLayersMinus1,
+                               HevcProfileTierLevel& syntax) {
     uint32_t ignored = 0;
     bool flag = false;
     if (!reader.bits(2, ignored) || !reader.bit(flag) || !reader.bits(5, ignored) ||
-        !reader.bits(32, ignored) || !reader.bits(4, ignored) || !reader.bits(32, ignored) ||
-        !reader.bits(12, ignored) || !reader.bits(8, ignored)) {
+        !reader.bits(32, ignored) || !reader.bit(syntax.progressiveSource) ||
+        !reader.bit(syntax.interlacedSource) || !reader.bit(flag) || !reader.bit(flag) ||
+        !reader.bits(32, ignored) || !reader.bits(12, ignored) || !reader.bits(8, ignored)) {
         return false;
     }
     bool profilePresent[7]{};
@@ -631,12 +638,14 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
     bool baseLayerInternal = false;
     bool baseLayerAvailable = false;
     bool temporalIdNesting = false;
+    HevcProfileTierLevel profileTierLevel;
     if (!reader.bits(4, vpsId) || !reader.bit(baseLayerInternal) ||
         !reader.bit(baseLayerAvailable) || !reader.bits(6, maxLayersMinus1) ||
         !reader.bits(3, maxSubLayersMinus1) || maxSubLayersMinus1 > 6 ||
         !reader.bit(temporalIdNesting) || (!baseLayerInternal && maxLayersMinus1 == 0) ||
         (maxSubLayersMinus1 == 0 && !temporalIdNesting) || !reader.bits(16, ignored) ||
-        ignored != 0xffffu || !skipHevcProfileTierLevel(reader, maxSubLayersMinus1)) {
+        ignored != 0xffffu ||
+        !parseHevcProfileTierLevel(reader, maxSubLayersMinus1, profileTierLevel)) {
         return malformedHevc();
     }
     // Multilayer VPS extensions change parameter-set inference rules. Do not
@@ -670,6 +679,8 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
     syntax.vpsId = uint8_t(vpsId);
     syntax.maxSubLayersMinus1 = uint8_t(maxSubLayersMinus1);
     syntax.temporalIdNesting = temporalIdNesting;
+    syntax.generalProgressiveSource = profileTierLevel.progressiveSource;
+    syntax.generalInterlacedSource = profileTierLevel.interlacedSource;
     if (!reader.bit(syntax.timingInfoPresent)) return malformedHevc();
     if (syntax.timingInfoPresent) {
         if (!reader.bits(32, syntax.numUnitsInTick) || !reader.bits(32, syntax.timeScale) ||
@@ -782,10 +793,11 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     uint32_t maxSubLayersMinus1 = 0;
     bool temporalIdNesting = false;
     bool flag = false;
+    HevcProfileTierLevel profileTierLevel;
     if (!reader.bits(4, referencedVpsId) || !reader.bits(3, maxSubLayersMinus1) ||
         maxSubLayersMinus1 > 6 || !reader.bit(temporalIdNesting) ||
         (maxSubLayersMinus1 == 0 && !temporalIdNesting) ||
-        !skipHevcProfileTierLevel(reader, maxSubLayersMinus1)) {
+        !parseHevcProfileTierLevel(reader, maxSubLayersMinus1, profileTierLevel)) {
         return malformedHevc();
     }
     uint32_t spsId = 0;
@@ -860,6 +872,8 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     if (!reader.bit(vuiPresent)) return malformedHevc();
     HevcTimingSyntax syntax;
     syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.generalProgressiveSource = profileTierLevel.progressiveSource;
+    syntax.generalInterlacedSource = profileTierLevel.interlacedSource;
     syntax.referencedVpsId = uint8_t(referencedVpsId);
     syntax.spsId = uint8_t(spsId);
     syntax.maxSubLayersMinus1 = uint8_t(maxSubLayersMinus1);
@@ -946,6 +960,10 @@ bool mergeHevcTiming(HevcTimingSyntax& base, const HevcTimingSyntax& sps) {
     if (sps.status != H26xTimingSyntaxStatus::Valid) return false;
     base.fieldSeq = sps.fieldSeq;
     base.frameFieldInfoPresent = sps.frameFieldInfoPresent;
+    // Picture-level source_scan_type is constrained by the profile-tier-level
+    // that applies through the active SPS (H.265 D.3.3).
+    base.generalProgressiveSource = sps.generalProgressiveSource;
+    base.generalInterlacedSource = sps.generalInterlacedSource;
     if (sps.fixedPicRateWithinCvsKnown) {
         base.cpbDpbDelaysPresent = sps.cpbDpbDelaysPresent;
         base.subPicHrdParamsPresent = sps.subPicHrdParamsPresent;
@@ -980,6 +998,8 @@ bool equivalentTiming(const HevcTimingSyntax& lhs, const HevcTimingSyntax& rhs) 
            lhs.timingInfoPresent == rhs.timingInfoPresent &&
            lhs.pocProportionalToTiming == rhs.pocProportionalToTiming &&
            lhs.fieldSeq == rhs.fieldSeq && lhs.frameFieldInfoPresent == rhs.frameFieldInfoPresent &&
+           lhs.generalProgressiveSource == rhs.generalProgressiveSource &&
+           lhs.generalInterlacedSource == rhs.generalInterlacedSource &&
            lhs.cpbDpbDelaysPresent == rhs.cpbDpbDelaysPresent &&
            lhs.subPicHrdParamsPresent == rhs.subPicHrdParamsPresent &&
            lhs.subPicCpbParamsInPicTimingSei == rhs.subPicCpbParamsInPicTimingSei &&
@@ -1281,6 +1301,16 @@ H26xTimingDetail::parseHevcPictureTiming(const QByteArray& payload,
             return result;
         }
         Q_UNUSED(duplicate);
+        const bool sourceScanMatchesProfile =
+            (syntax.generalProgressiveSource && syntax.generalInterlacedSource) ||
+            (syntax.generalProgressiveSource && sourceScanType == 1) ||
+            (syntax.generalInterlacedSource && sourceScanType == 0) ||
+            (!syntax.generalProgressiveSource && !syntax.generalInterlacedSource &&
+             sourceScanType == 2);
+        if (!sourceScanMatchesProfile) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
         const bool fieldPicture = picStruct == 1 || picStruct == 2 || picStruct >= 9;
         if (syntax.fieldSeq != fieldPicture) {
             result.status = TimecodeParseStatus::Malformed;
@@ -1297,6 +1327,7 @@ H26xTimingDetail::parseHevcPictureTiming(const QByteArray& payload,
             }
         }
         result.picStruct = int(picStruct);
+        result.sourceScanType = int(sourceScanType);
     }
 
     if (syntax.cpbDpbDelaysPresent) {
@@ -1602,12 +1633,47 @@ H26xTimingDetail::parseH264PicTiming(const QByteArray& payload, const H264Timing
     return result;
 }
 
-H26xTimingDetail::TimecodeParseResult
-H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingSyntax& syntax,
-                                    const HevcTimeCodeContinuity* previous,
-                                    HevcTimeCodeContinuity* next, int expectedClockCount) {
+H26xTimingDetail::TimecodeParseStatus
+H26xTimingDetail::validateHevcOutputTransition(const HevcTimeCodeOutput* previous,
+                                               const HevcTimeCodeOutput& current) {
+    if (!current.present) return TimecodeParseStatus::NoTimestamp;
+    if (current.discontinuity) return TimecodeParseStatus::Valid;
+
+    if (previous != nullptr && previous->present) {
+        if (!previous->comparable || !current.comparable) return TimecodeParseStatus::Unsupported;
+        if (current.clockTimestamp < previous->clockTimestamp)
+            return TimecodeParseStatus::Malformed;
+    }
+
+    if (!current.countDropped) return TimecodeParseStatus::Valid;
+    // D.3.27 qualifies each predecessor restriction with "when present". A
+    // first set can therefore signal a conforming drop; only a known previous
+    // set can make the transition malformed.
+    if (previous == nullptr || !previous->present) return TimecodeParseStatus::Valid;
+    switch (current.countingType) {
+    case 2:
+        return previous->frames == 0 ? TimecodeParseStatus::Malformed : TimecodeParseStatus::Valid;
+    case 3:
+        return current.maxFps != 0 && previous->frames == current.maxFps - 1
+                   ? TimecodeParseStatus::Malformed
+                   : TimecodeParseStatus::Valid;
+    case 4:
+        return previous->frames == 0 || previous->frames == 1 ? TimecodeParseStatus::Malformed
+                                                              : TimecodeParseStatus::Valid;
+    default:
+        return TimecodeParseStatus::Valid;
+    }
+}
+
+H26xTimingDetail::TimecodeParseResult H26xTimingDetail::parseHevcTimeCode(
+    const QByteArray& payload, const HevcTimingSyntax& syntax,
+    const HevcTimeCodeContinuity* previous, HevcTimeCodeContinuity* next, int expectedClockCount,
+    const HevcTimeCodeOutput* previousOutput, HevcTimeCodeOutput* firstOutput,
+    HevcTimeCodeOutput* lastOutput) {
     TimecodeParseResult result;
     result.provenance = TimecodeProvenance::HevcTimeCode;
+    if (firstOutput != nullptr) *firstOutput = {};
+    if (lastOutput != nullptr) *lastOutput = {};
     if (syntax.status != H26xTimingSyntaxStatus::Valid) {
         result.status = syntax.status == H26xTimingSyntaxStatus::Malformed
                             ? TimecodeParseStatus::Malformed
@@ -1640,9 +1706,8 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
     FrameRateQ firstRate;
     bool firstDiscontinuity = false;
     bool unsupportedMapping = false;
-    bool sawPresent = false;
-    bool previousComparable = false;
-    int64_t previousClock = 0;
+    HevcTimeCodeOutput localPreviousOutput;
+    const HevcTimeCodeOutput* outputPredecessor = previousOutput;
     bool havePreviousSeconds = previous != nullptr && previous->haveSeconds;
     bool havePreviousMinutes = previous != nullptr && previous->haveMinutes;
     bool havePreviousHours = previous != nullptr && previous->haveHours;
@@ -1666,6 +1731,7 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
             havePreviousMinutes = false;
             havePreviousHours = false;
             havePreviousFrameSemantics = false;
+            outputPredecessor = nullptr;
             continue;
         }
 
@@ -1745,17 +1811,6 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
         const bool complete =
             effectiveSecondsPresent && effectiveMinutesPresent && effectiveHoursPresent;
         if (!complete) unsupportedMapping = true;
-        const bool predecessorFrameSemanticsAvailable = havePreviousFrameSemantics;
-        const uint32_t predecessorFrames = previousFrames;
-        const FrameRateQ predecessorRate = previousRate;
-        const uint8_t predecessorCountingType = previousCountingType;
-        const bool predecessorDropFrame = previousDropFrame;
-        const bool predecessorSecondsPresent = havePreviousSeconds;
-        const bool predecessorMinutesPresent = havePreviousMinutes;
-        const bool predecessorHoursPresent = havePreviousHours;
-        const uint32_t predecessorSeconds = previousSeconds;
-        const uint32_t predecessorMinutes = previousMinutes;
-        const uint32_t predecessorHours = previousHours;
         if (haveSeconds) {
             havePreviousSeconds = true;
             previousSeconds = seconds;
@@ -1786,15 +1841,6 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
             }
             comparable = true;
         }
-        if (sawPresent && previousComparable && comparable && currentClock < previousClock &&
-            !discontinuity) {
-            result.status = TimecodeParseStatus::Malformed;
-            return result;
-        }
-        if (sawPresent && (!previousComparable || !comparable)) unsupportedMapping = true;
-        sawPresent = true;
-        previousComparable = comparable;
-        if (comparable) previousClock = currentClock;
 
         bool representable = rate.valid();
         bool dropFrame = false;
@@ -1829,25 +1875,33 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
                 return result;
             }
             representable = representable && normalizedRateEquals(rate, 30000, 1001);
-            if (countDropped && !discontinuity) {
-                if (!predecessorFrameSemanticsAvailable || !predecessorSecondsPresent ||
-                    !predecessorMinutesPresent || !predecessorHoursPresent ||
-                    !(predecessorRate == rate) || predecessorCountingType != countingType ||
-                    !predecessorDropFrame) {
-                    unsupportedMapping = true;
-                } else if (predecessorFrames != 29 || predecessorSeconds != 59 ||
-                           predecessorHours != effectiveHours ||
-                           predecessorMinutes + 1 != effectiveMinutes) {
-                    result.status = TimecodeParseStatus::Malformed;
-                    return result;
-                }
-            }
             break;
         case 5:
         case 6:
             representable = false;
             break;
         }
+        HevcTimeCodeOutput currentOutput;
+        currentOutput.present = true;
+        currentOutput.comparable = comparable;
+        currentOutput.clockTimestamp = currentClock;
+        currentOutput.frames = frames;
+        if (rate.valid())
+            currentOutput.maxFps = uint32_t((int64_t(rate.num) + rate.den - 1) / rate.den);
+        currentOutput.countingType = uint8_t(countingType);
+        currentOutput.countDropped = countDropped;
+        currentOutput.discontinuity = discontinuity;
+        const TimecodeParseStatus transitionStatus =
+            validateHevcOutputTransition(outputPredecessor, currentOutput);
+        if (transitionStatus == TimecodeParseStatus::Malformed) {
+            result.status = transitionStatus;
+            return result;
+        }
+        if (transitionStatus == TimecodeParseStatus::Unsupported) unsupportedMapping = true;
+        if (firstOutput != nullptr && !firstOutput->present) *firstOutput = currentOutput;
+        if (lastOutput != nullptr) *lastOutput = currentOutput;
+        localPreviousOutput = currentOutput;
+        outputPredecessor = &localPreviousOutput;
         if (!representable) unsupportedMapping = true;
         havePreviousFrameSemantics = complete && rate.valid() && representable;
         if (havePreviousFrameSemantics) {

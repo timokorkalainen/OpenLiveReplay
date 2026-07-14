@@ -2,6 +2,7 @@
 
 #include <QList>
 
+#include <algorithm>
 #include <limits>
 #include <optional>
 
@@ -159,6 +160,26 @@ bool equivalentTimecodeResult(const H26xSeiTimecodeResult& lhs,
     return equivalentTimecodeResult(converted, rhs);
 }
 
+bool equivalentTimecodeResult(const H26xSeiTimecodeResult& lhs, const H26xSeiTimecodeResult& rhs) {
+    return lhs.status == rhs.status && lhs.timecode.valid == rhs.timecode.valid &&
+           lhs.timecode.hours == rhs.timecode.hours &&
+           lhs.timecode.minutes == rhs.timecode.minutes &&
+           lhs.timecode.seconds == rhs.timecode.seconds &&
+           lhs.timecode.frames == rhs.timecode.frames &&
+           lhs.timecode.dropFrame == rhs.timecode.dropFrame && lhs.labelRate == rhs.labelRate &&
+           lhs.provenance == rhs.provenance && lhs.discontinuity == rhs.discontinuity;
+}
+
+bool equivalentOutput(const H26xTimingDetail::HevcTimeCodeOutput& lhs,
+                      const H26xTimingDetail::HevcTimeCodeOutput& rhs) {
+    return lhs.present == rhs.present && lhs.comparable == rhs.comparable &&
+           (!lhs.comparable || lhs.clockTimestamp == rhs.clockTimestamp) &&
+           (!lhs.present ||
+            (lhs.frames == rhs.frames && lhs.maxFps == rhs.maxFps &&
+             lhs.countingType == rhs.countingType && lhs.countDropped == rhs.countDropped &&
+             lhs.discontinuity == rhs.discontinuity));
+}
+
 int clockCountForHevcPicStruct(int picStruct) {
     switch (picStruct) {
     case 0:
@@ -231,7 +252,10 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(
     const QByteArray& rbsp, NativeVideoCodec codec, const H26xTimingContext* context,
     bool prefixSei, const H26xTimingDetail::HevcTimeCodeContinuity* hevcPreviousContinuity,
     H26xTimingDetail::HevcTimeCodeContinuity* hevcNextContinuity, bool* hasHevcNextContinuity,
-    bool* hasHevcTimeCodeMessage, int expectedHevcClockCount) {
+    bool* hasHevcTimeCodeMessage, int expectedHevcClockCount,
+    const H26xTimingDetail::HevcTimeCodeOutput* hevcPreviousOutput,
+    H26xTimingDetail::HevcTimeCodeOutput* hevcFirstOutput,
+    H26xTimingDetail::HevcTimeCodeOutput* hevcLastOutput) {
     using H26xTimingDetail::TimecodeParseResult;
     using H26xTimingDetail::TimecodeParseStatus;
 
@@ -241,8 +265,12 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(
     bool sawTrailingBits = false;
     std::optional<TimecodeParseResult> firstHevcTimeCodeMessage;
     std::optional<H26xTimingDetail::HevcTimeCodeContinuity> firstHevcContinuityProposal;
+    std::optional<H26xTimingDetail::HevcTimeCodeOutput> firstHevcFirstOutput;
+    std::optional<H26xTimingDetail::HevcTimeCodeOutput> firstHevcLastOutput;
     if (hasHevcNextContinuity != nullptr) *hasHevcNextContinuity = false;
     if (hasHevcTimeCodeMessage != nullptr) *hasHevcTimeCodeMessage = false;
+    if (hevcFirstOutput != nullptr) *hevcFirstOutput = {};
+    if (hevcLastOutput != nullptr) *hevcLastOutput = {};
     int pos = 0;
     while (pos < rbsp.size()) {
         if (pos == rbsp.size() - 1 && uchar(rbsp[pos]) == 0x80) {
@@ -277,9 +305,12 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(
                    context != nullptr && context->codec() == NativeVideoCodec::Hevc &&
                    context->hevc() != nullptr) {
             H26xTimingDetail::HevcTimeCodeContinuity updatedContinuity;
+            H26xTimingDetail::HevcTimeCodeOutput messageFirstOutput;
+            H26xTimingDetail::HevcTimeCodeOutput messageLastOutput;
             parsed = H26xTimingDetail::parseHevcTimeCode(
                 rbsp.mid(pos, int(payloadSize)), *context->hevc(), hevcPreviousContinuity,
-                &updatedContinuity, expectedHevcClockCount);
+                &updatedContinuity, expectedHevcClockCount, hevcPreviousOutput, &messageFirstOutput,
+                &messageLastOutput);
             if (hasHevcTimeCodeMessage != nullptr) *hasHevcTimeCodeMessage = true;
             if (!firstHevcTimeCodeMessage.has_value()) {
                 firstHevcTimeCodeMessage = parsed;
@@ -291,6 +322,15 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(
                 if (!firstHevcContinuityProposal.has_value()) {
                     firstHevcContinuityProposal = updatedContinuity;
                 } else if (!equivalentContinuity(*firstHevcContinuityProposal, updatedContinuity)) {
+                    sawMalformed = true;
+                }
+            }
+            if (messageFirstOutput.present) {
+                if (!firstHevcFirstOutput.has_value()) {
+                    firstHevcFirstOutput = messageFirstOutput;
+                    firstHevcLastOutput = messageLastOutput;
+                } else if (!equivalentOutput(*firstHevcFirstOutput, messageFirstOutput) ||
+                           !equivalentOutput(*firstHevcLastOutput, messageLastOutput)) {
                     sawMalformed = true;
                 }
             }
@@ -327,13 +367,20 @@ H26xTimingDetail::TimecodeParseResult extractFromSeiRbsp(
         if (hevcNextContinuity != nullptr) *hevcNextContinuity = *firstHevcContinuityProposal;
         if (hasHevcNextContinuity != nullptr) *hasHevcNextContinuity = true;
     }
+    if (firstHevcFirstOutput.has_value()) {
+        if (hevcFirstOutput != nullptr) *hevcFirstOutput = *firstHevcFirstOutput;
+        if (hevcLastOutput != nullptr) *hevcLastOutput = *firstHevcLastOutput;
+    }
     return result;
 }
 
 H26xSeiTimecodeResult
 extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTimingContext* context,
               H26xTimingDetail::HevcTimeCodeContinuity* hevcContinuity = nullptr,
-              bool* accepted = nullptr) {
+              bool* accepted = nullptr,
+              const H26xTimingDetail::HevcTimeCodeOutput* hevcPreviousOutput = nullptr,
+              H26xTimingDetail::HevcTimeCodeOutput* hevcFirstOutput = nullptr,
+              H26xTimingDetail::HevcTimeCodeOutput* hevcLastOutput = nullptr) {
     if (accepted != nullptr) *accepted = true;
     if (annexB.isEmpty() || codec == NativeVideoCodec::Unknown) return {};
     using H26xTimingDetail::TimecodeParseStatus;
@@ -348,6 +395,8 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
     bool sawMalformed = false;
     std::optional<H26xTimingDetail::TimecodeParseResult> firstHevcTimeCodeMessage;
     std::optional<H26xTimingDetail::HevcTimeCodeContinuity> firstHevcContinuityProposal;
+    std::optional<H26xTimingDetail::HevcTimeCodeOutput> firstHevcFirstOutput;
+    std::optional<H26xTimingDetail::HevcTimeCodeOutput> firstHevcLastOutput;
     QList<SeiNalData> seiNals;
     for (const QByteArray& nal : splitAnnexBNals(annexB)) {
         if (!isSeiNal(nal, codec)) continue;
@@ -400,9 +449,12 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
         H26xTimingDetail::HevcTimeCodeContinuity proposedContinuity;
         bool hasContinuityProposal = false;
         bool hasTimeCodeMessage = false;
-        const auto parsed = extractFromSeiRbsp(nal.rbsp, codec, context, nal.prefix, hevcContinuity,
-                                               &proposedContinuity, &hasContinuityProposal,
-                                               &hasTimeCodeMessage, expectedHevcClockCount);
+        H26xTimingDetail::HevcTimeCodeOutput proposedFirstOutput;
+        H26xTimingDetail::HevcTimeCodeOutput proposedLastOutput;
+        const auto parsed = extractFromSeiRbsp(
+            nal.rbsp, codec, context, nal.prefix, hevcContinuity, &proposedContinuity,
+            &hasContinuityProposal, &hasTimeCodeMessage, expectedHevcClockCount, hevcPreviousOutput,
+            &proposedFirstOutput, &proposedLastOutput);
         if (hasTimeCodeMessage) {
             if (!firstHevcTimeCodeMessage.has_value()) {
                 firstHevcTimeCodeMessage = parsed;
@@ -414,6 +466,15 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
             if (!firstHevcContinuityProposal.has_value()) {
                 firstHevcContinuityProposal = proposedContinuity;
             } else if (!equivalentContinuity(*firstHevcContinuityProposal, proposedContinuity)) {
+                sawMalformed = true;
+            }
+        }
+        if (proposedFirstOutput.present) {
+            if (!firstHevcFirstOutput.has_value()) {
+                firstHevcFirstOutput = proposedFirstOutput;
+                firstHevcLastOutput = proposedLastOutput;
+            } else if (!equivalentOutput(*firstHevcFirstOutput, proposedFirstOutput) ||
+                       !equivalentOutput(*firstHevcLastOutput, proposedLastOutput)) {
                 sawMalformed = true;
             }
         }
@@ -434,10 +495,20 @@ extractResult(const QByteArray& annexB, NativeVideoCodec codec, const H26xTiming
     }
     if (sawMalformed || sawUnsupported) {
         if (accepted != nullptr) *accepted = false;
-        return {};
+        H26xSeiTimecodeResult rejected;
+        rejected.status =
+            sawMalformed ? TimecodeParseStatus::Malformed : TimecodeParseStatus::Unsupported;
+        return rejected;
     }
     if (hevcContinuity != nullptr && firstHevcContinuityProposal.has_value())
         *hevcContinuity = *firstHevcContinuityProposal;
+    if (firstHevcFirstOutput.has_value()) {
+        if (hevcFirstOutput != nullptr) *hevcFirstOutput = *firstHevcFirstOutput;
+        if (hevcLastOutput != nullptr) *hevcLastOutput = *firstHevcLastOutput;
+    }
+    firstUsableTimestamp.status = firstUsableTimestamp.timecode.valid
+                                      ? TimecodeParseStatus::Valid
+                                      : TimecodeParseStatus::NoTimestamp;
     return firstUsableTimestamp;
 }
 
@@ -449,6 +520,14 @@ void H26xSeiTimecodeState::reset() {
     m_contextGeneration = 0;
     m_codec = NativeVideoCodec::Unknown;
     m_hevcContinuity = {};
+    m_outputOrderBound = false;
+    m_sourceGeneration = 0;
+    m_timingGeneration = 0;
+    m_outputDomain = 0;
+    m_outputEpoch = 0;
+    m_haveEvictedOutput = false;
+    m_evictedThrough = 0;
+    m_outputEntryCount = 0;
 }
 
 Smpte12mTimecode extractH26xSeiTimecode(const QByteArray& annexB, NativeVideoCodec codec) {
@@ -477,13 +556,154 @@ H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, Nat
         state.m_codec = codec;
     }
 
-    H26xTimingDetail::HevcTimeCodeContinuity workingContinuity = state.m_hevcContinuity;
-    bool accepted = false;
-    const H26xSeiTimecodeResult result =
-        extractResult(annexB, codec, &context, &workingContinuity, &accepted);
-    if (accepted)
-        state.m_hevcContinuity = workingContinuity;
-    else
+    // Without a caller-supplied presentation identity the current AU can be
+    // parsed in isolation, but no decoding/output predecessor is retained or
+    // consumed. Any cross-AU inference therefore fails closed instead of
+    // treating decode-call order as output order.
+    H26xTimingDetail::HevcTimeCodeOutput firstOutput;
+    H26xTimingDetail::HevcTimeCodeOutput lastOutput;
+    H26xSeiTimecodeResult result = extractResult(annexB, codec, &context, nullptr, nullptr, nullptr,
+                                                 &firstOutput, &lastOutput);
+    if (firstOutput.present && firstOutput.countDropped && !firstOutput.discontinuity) {
+        result = {};
+        result.status = H26xTimingDetail::TimecodeParseStatus::Unsupported;
+    }
+    return result;
+}
+
+H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, NativeVideoCodec codec,
+                                                   const H26xTimingContext& context,
+                                                   H26xSeiTimecodeState& state,
+                                                   const H26xSeiOutputOrderKey& outputOrder) {
+    using H26xTimingDetail::TimecodeParseStatus;
+    const auto rejected = [](TimecodeParseStatus status) {
+        H26xSeiTimecodeResult result;
+        result.status = status;
+        return result;
+    };
+
+    if (!state.m_contextBound || state.m_contextIdentity != context.identity() ||
+        state.m_contextGeneration != context.generation() || state.m_codec != codec) {
+        state.reset();
+        state.m_contextBound = true;
+        state.m_contextIdentity = context.identity();
+        state.m_contextGeneration = context.generation();
+        state.m_codec = codec;
+    }
+    if (outputOrder.timingGeneration != context.generation())
+        return rejected(TimecodeParseStatus::Unsupported);
+
+    if (!state.m_outputOrderBound) {
+        state.m_outputOrderBound = true;
+        state.m_sourceGeneration = outputOrder.sourceGeneration;
+        state.m_timingGeneration = outputOrder.timingGeneration;
+        state.m_outputDomain = outputOrder.domain;
+        state.m_outputEpoch = outputOrder.epoch;
+    } else if (outputOrder.sourceGeneration < state.m_sourceGeneration) {
+        return rejected(TimecodeParseStatus::Unsupported);
+    } else if (outputOrder.sourceGeneration > state.m_sourceGeneration) {
+        state.m_sourceGeneration = outputOrder.sourceGeneration;
+        state.m_timingGeneration = outputOrder.timingGeneration;
+        state.m_outputDomain = outputOrder.domain;
+        state.m_outputEpoch = outputOrder.epoch;
         state.m_hevcContinuity = {};
+        state.m_outputEntryCount = 0;
+        state.m_haveEvictedOutput = false;
+    } else {
+        if (outputOrder.domain != state.m_outputDomain ||
+            outputOrder.timingGeneration != state.m_timingGeneration ||
+            outputOrder.epoch < state.m_outputEpoch) {
+            return rejected(TimecodeParseStatus::Unsupported);
+        }
+        if (outputOrder.epoch > state.m_outputEpoch) {
+            state.m_outputEpoch = outputOrder.epoch;
+            state.m_hevcContinuity = {};
+            state.m_outputEntryCount = 0;
+            state.m_haveEvictedOutput = false;
+        }
+    }
+
+    const auto entriesBegin = state.m_outputEntries.begin();
+    const auto entriesEnd = entriesBegin + std::ptrdiff_t(state.m_outputEntryCount);
+    const auto successor =
+        std::lower_bound(entriesBegin, entriesEnd, outputOrder.presentationKey,
+                         [](const H26xSeiTimecodeState::StoredOutputEntry& entry, int64_t key) {
+                             return entry.presentationKey < key;
+                         });
+    const bool duplicate =
+        successor != entriesEnd && successor->presentationKey == outputOrder.presentationKey;
+    if (!duplicate && state.m_outputEntryCount == H26xSeiTimecodeState::kMaxRetainedOutputEntries &&
+        outputOrder.presentationKey < state.m_outputEntries.front().presentationKey) {
+        return rejected(TimecodeParseStatus::Unsupported);
+    }
+    if (state.m_haveEvictedOutput &&
+        (outputOrder.presentationKey <= state.m_evictedThrough ||
+         (state.m_outputEntryCount != 0 &&
+          outputOrder.presentationKey < state.m_outputEntries.front().presentationKey))) {
+        return rejected(TimecodeParseStatus::Unsupported);
+    }
+    const H26xTimingDetail::HevcTimeCodeOutput* previousOutput = nullptr;
+    if (successor != entriesBegin) {
+        previousOutput = &std::prev(successor)->output.last;
+    }
+
+    H26xTimingDetail::HevcTimeCodeContinuity workingContinuity = state.m_hevcContinuity;
+    H26xTimingDetail::HevcTimeCodeOutput firstOutput;
+    H26xTimingDetail::HevcTimeCodeOutput lastOutput;
+    bool accepted = false;
+    H26xSeiTimecodeResult result =
+        extractResult(annexB, codec, &context, &workingContinuity, &accepted, previousOutput,
+                      &firstOutput, &lastOutput);
+    if (!accepted) {
+        state.m_hevcContinuity = {};
+        return result;
+    }
+    if (!firstOutput.present) {
+        state.m_hevcContinuity = workingContinuity;
+        return result;
+    }
+
+    if (duplicate) {
+        const H26xSeiTimecodeState::OutputEntry& retained = successor->output;
+        if (!equivalentOutput(retained.first, firstOutput) ||
+            !equivalentOutput(retained.last, lastOutput) ||
+            !equivalentTimecodeResult(retained.result, result)) {
+            state.m_hevcContinuity = {};
+            return rejected(TimecodeParseStatus::Malformed);
+        }
+        return retained.result;
+    }
+
+    if (successor != entriesEnd) {
+        const TimecodeParseStatus successorStatus =
+            H26xTimingDetail::validateHevcOutputTransition(&lastOutput, successor->output.first);
+        if (successorStatus == TimecodeParseStatus::Malformed) {
+            state.m_hevcContinuity = {};
+            return rejected(successorStatus);
+        }
+        if (successorStatus == TimecodeParseStatus::Unsupported) {
+            state.m_hevcContinuity = {};
+            return rejected(successorStatus);
+        }
+    }
+
+    state.m_hevcContinuity = workingContinuity;
+    if (state.m_outputEntryCount == H26xSeiTimecodeState::kMaxRetainedOutputEntries) {
+        state.m_haveEvictedOutput = true;
+        state.m_evictedThrough = state.m_outputEntries.front().presentationKey;
+        std::move(state.m_outputEntries.begin() + 1, state.m_outputEntries.end(),
+                  state.m_outputEntries.begin());
+        --state.m_outputEntryCount;
+    }
+    const auto insertEnd = state.m_outputEntries.begin() + std::ptrdiff_t(state.m_outputEntryCount);
+    const auto insertAt =
+        std::lower_bound(state.m_outputEntries.begin(), insertEnd, outputOrder.presentationKey,
+                         [](const H26xSeiTimecodeState::StoredOutputEntry& entry, int64_t key) {
+                             return entry.presentationKey < key;
+                         });
+    std::move_backward(insertAt, insertEnd, insertEnd + 1);
+    *insertAt = {outputOrder.presentationKey,
+                 H26xSeiTimecodeState::OutputEntry{firstOutput, lastOutput, result}};
+    ++state.m_outputEntryCount;
     return result;
 }
