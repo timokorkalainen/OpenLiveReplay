@@ -8,9 +8,11 @@
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/gpusubmission.h"
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -25,6 +27,14 @@ public:
     GpuOpScope& operator=(GpuOpScope&&) = delete;
 
     uint64_t fenceValue() const { return m_fenceValue; }
+    // Driver acceptance is irreversible even if signalling later quarantines retirement.
+    bool submitted() const noexcept { return m_driverAccepted; }
+    // Cancellation is only meaningful before the one permitted submission attempt.
+    bool cancel() noexcept {
+        if (m_state != State::Ready) return false;
+        m_state = State::Cancelled;
+        return true;
+    }
 
     template <typename BackendAdapter, size_t N>
     GpuSubmissionResult submit(BackendAdapter& adapter, GpuSurfacePack<N> surfaces) noexcept {
@@ -32,37 +42,51 @@ public:
                       "GPU backend adapters must be noexcept and return GpuSubmitOutcome");
 
         GpuSubmissionResult result;
-        if (m_submitted || !m_fence) return result;
-        m_submitted = true;
+        if (m_state != State::Ready || !m_fence) return result;
+        m_state = State::Consumed;
         auto allocationPhase = m_registry.beginAllocationScope();
 
         const uint64_t generation = GpuGenerationCounter::instance().current();
         const GpuFenceIdentity preparedFence = m_fence->identity();
         std::array<GpuSurfaceCompatibility, N> compatibilities{};
+        std::array<size_t, N> uniqueIndices{};
+        std::optional<std::array<std::shared_ptr<GpuSurface>, N>> coalescedOwners;
+        size_t uniqueCount = 0;
         GpuSurfaceCompatibility firstCompatibility{};
         try {
             for (size_t i = 0; i < N; ++i) {
                 const auto& owner = surfaces.owners()[i];
                 if (!owner) return result;
-                for (size_t previous = 0; previous < i; ++previous) {
-                    if (surfaces.owners()[previous].get() == owner.get()) return result;
+                bool duplicate = false;
+                for (size_t previous = 0; previous < uniqueCount; ++previous) {
+                    if (surfaces.owners()[uniqueIndices[previous]].get() == owner.get()) {
+                        duplicate = true;
+                        break;
+                    }
                 }
-            }
-            for (size_t i = 0; i < N; ++i) {
-                const auto& owner = surfaces.owners()[i];
+                if (duplicate) continue;
                 const GpuSurfaceCompatibility compatibility = owner->compatibility();
                 if (!gpuSubmissionDetail::matchesSurfaceEvidence(
                         compatibility, preparedFence, generation,
                         GpuGenerationCounter::instance().current()))
                     return result;
-                compatibilities[i] = compatibility;
-                if (i == 0) firstCompatibility = compatibility;
+                uniqueIndices[uniqueCount] = i;
+                compatibilities[uniqueCount] = compatibility;
+                if (uniqueCount == 0) firstCompatibility = compatibility;
+                ++uniqueCount;
             }
         } catch (...) {
             return result;
         }
+        const std::shared_ptr<GpuSurface>* retirementOwners = surfaces.owners().data();
+        if (uniqueCount != N) {
+            coalescedOwners.emplace();
+            for (size_t i = 0; i < uniqueCount; ++i)
+                (*coalescedOwners)[i] = surfaces.owners()[uniqueIndices[i]];
+            retirementOwners = coalescedOwners->data();
+        }
         auto prepared =
-            m_registry.prepareRetirement(surfaces.owners().data(), qsizetype(N), m_fence);
+            m_registry.prepareRetirement(retirementOwners, qsizetype(uniqueCount), m_fence);
         if (!prepared) return result;
 
         GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
@@ -72,6 +96,7 @@ public:
                     allocationPhase.enterCallback();
                     outcome = std::invoke(adapter);
                     if (outcome == GpuSubmitOutcome::NotSubmitted) return false;
+                    m_driverAccepted = true;
                     prepared.markAccepted();
                     allocationPhase.enterPostAccept();
                     return true;
@@ -82,9 +107,8 @@ public:
             if (ticket) {
                 const uint64_t ticketValue = ticket->value();
                 bool exact = true;
-                for (size_t i = 0; i < N; ++i) {
-                    if (surfaces.owners()[i] &&
-                        !m_fence->validatesRetirement(*ticket, compatibilities[i])) {
+                for (size_t i = 0; i < uniqueCount; ++i) {
+                    if (!m_fence->validatesRetirement(*ticket, compatibilities[i])) {
                         exact = false;
                         break;
                     }
@@ -126,9 +150,12 @@ public:
     }
 
 private:
+    enum class State : uint8_t { Ready, Cancelled, Consumed };
+
     std::shared_ptr<GpuFence> m_fence;
     GpuRetireRegistry& m_registry;
-    bool m_submitted = false;
+    State m_state = State::Ready;
+    bool m_driverAccepted = false;
     uint64_t m_fenceValue = 0;
 };
 

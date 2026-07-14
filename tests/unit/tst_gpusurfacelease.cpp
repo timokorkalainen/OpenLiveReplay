@@ -563,9 +563,10 @@ private slots:
     void fusedSubmissionRejectsThrowingEvidenceBeforeCallback();
     void fusedSubmissionCachesEvidenceBeforeCallback();
     void fusedSubmissionRejectsNullAtEveryPackPosition();
-    void fusedSubmissionRejectsDuplicateOwners();
+    void fusedSubmissionCoalescesDuplicateOwners();
+    void fusedSubmissionCancellationIsPreSubmitOnly();
     void fusedSubmissionOneToFourSurfacesDoNotAllocate();
-    void fusedSubmissionFiveSurfacesUsesFixedPool();
+    void fusedSubmissionFifthOwnerSpillsToFixedPoolWithoutHeap();
     void allocationProbeCountsRealInjectedHeapEventsByPhase();
     void fusedSubmissionNotSubmittedReleasesPreparedOwners();
     void fusedSubmissionPublishesSubmittedOwners();
@@ -1027,20 +1028,62 @@ void TestGpuSurfaceLease::fusedSubmissionRejectsNullAtEveryPackPosition() {
     GpuGenerationCounter::instance().resetForTest();
 }
 
-void TestGpuSurfaceLease::fusedSubmissionRejectsDuplicateOwners() {
+void TestGpuSurfaceLease::fusedSubmissionCoalescesDuplicateOwners() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
     auto fence = std::make_shared<FakeFence>(0x5C, 5);
-    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C0), true,
-                                                      GpuSurfaceCompatibility{0x5C, 5});
+    auto first = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C0), true,
+                                                    GpuSurfaceCompatibility{0x5C, 5});
+    auto second = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C1), true,
+                                                     GpuSurfaceCompatibility{0x5C, 5});
     FakeBackendAdapter adapter;
     GpuOpScope operation(fence, registry);
     const auto result = operation.submit(
-        adapter, GpuSurfacePack<2>(std::array<std::shared_ptr<GpuSurface>, 2>{surface, surface}));
-    QCOMPARE(result.outcome, GpuSubmitOutcome::NotSubmitted);
-    QCOMPARE(result.retirement, GpuRetirementDisposition::None);
-    QCOMPARE(adapter.calls, 0);
+        adapter,
+        GpuSurfacePack<4>(std::array<std::shared_ptr<GpuSurface>, 4>{first, first, second, first}));
+    QCOMPARE(result.outcome, GpuSubmitOutcome::Submitted);
+    QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+    QCOMPARE(adapter.calls, 1);
+    QCOMPARE(fence->signalCalls(), 1);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+    fence->setCompleted(result.fenceValue);
+    registry.drainCompleted();
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::fusedSubmissionCancellationIsPreSubmitOnly() {
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<FakeFence>(0x5D, 5);
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5D0), true,
+                                                      GpuSurfaceCompatibility{0x5D, 5});
+    FakeBackendAdapter cancelledAdapter;
+    GpuOpScope cancelled(fence, registry);
+
+    QVERIFY(!cancelled.submitted());
+    QVERIFY(cancelled.cancel());
+    QVERIFY(!cancelled.submitted());
+    QVERIFY(!cancelled.cancel());
+    const auto cancelledResult = cancelled.submit(
+        cancelledAdapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    QCOMPARE(cancelledResult.outcome, GpuSubmitOutcome::NotSubmitted);
+    QCOMPARE(cancelledResult.retirement, GpuRetirementDisposition::None);
+    QCOMPARE(cancelledAdapter.calls, 0);
     QCOMPARE(fence->signalCalls(), 0);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+
+    FakeBackendAdapter submittedAdapter;
+    GpuOpScope submitted(fence, registry);
+    const auto submittedResult = submitted.submit(
+        submittedAdapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    QVERIFY(submitted.submitted());
+    QVERIFY(!submitted.cancel());
+    QCOMPARE(submittedResult.retirement, GpuRetirementDisposition::Published);
+    QCOMPARE(fence->signalCalls(), 1);
+    fence->setCompleted(submittedResult.fenceValue);
+    registry.drainCompleted();
     GpuGenerationCounter::instance().resetForTest();
 }
 
@@ -1071,7 +1114,7 @@ void TestGpuSurfaceLease::fusedSubmissionOneToFourSurfacesDoNotAllocate() {
     GpuGenerationCounter::instance().resetForTest();
 }
 
-void TestGpuSurfaceLease::fusedSubmissionFiveSurfacesUsesFixedPool() {
+void TestGpuSurfaceLease::fusedSubmissionFifthOwnerSpillsToFixedPoolWithoutHeap() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     GpuRetireRegistry::resetAllocationProbeForTest();
@@ -1115,6 +1158,8 @@ void TestGpuSurfaceLease::fusedSubmissionNotSubmittedReleasesPreparedOwners() {
 
     QCOMPARE(result.outcome, GpuSubmitOutcome::NotSubmitted);
     QCOMPARE(result.retirement, GpuRetirementDisposition::None);
+    QVERIFY(!operation.submitted());
+    QVERIFY(!operation.cancel());
     QCOMPARE(fence->signalCalls(), 0);
     QCOMPARE(surface.use_count(), ownersBefore);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
@@ -1159,6 +1204,8 @@ void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedWithErrorOwners() {
 
     QCOMPARE(result.outcome, GpuSubmitOutcome::SubmittedWithError);
     QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+    QVERIFY(operation.submitted());
+    QVERIFY(!operation.cancel());
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
     QVERIFY(GpuDeviceLossMonitor::instance().isLost());
     fence->setCompleted(result.fenceValue);
@@ -1184,6 +1231,8 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal() {
 
     QCOMPARE(result.outcome, GpuSubmitOutcome::Submitted);
     QCOMPARE(result.retirement, GpuRetirementDisposition::Quarantined);
+    QVERIFY(operation.submitted());
+    QVERIFY(!operation.cancel());
     QCOMPARE(fence->signalCalls(), 1);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
     QCOMPARE(registry.diagnostics().signalFailureCount, failuresBefore + 1);
@@ -1217,6 +1266,8 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesPostAcceptThrow() {
 
     QCOMPARE(result.outcome, GpuSubmitOutcome::Submitted);
     QCOMPARE(result.retirement, GpuRetirementDisposition::Quarantined);
+    QVERIFY(operation.submitted());
+    QVERIFY(!operation.cancel());
     QVERIFY(surface.use_count() > ownersBefore);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
