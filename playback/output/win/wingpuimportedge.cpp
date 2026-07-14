@@ -431,7 +431,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
                                                         uint64_t* submittedFenceValue) {
 #endif
     if (!surface) return FrameHandle();
-    if (renderFence && !renderFence->isCompatibleWith(surface)) return FrameHandle();
+    if (renderFence && !renderFence->sharesDeviceAuthorityWith(surface)) return FrameHandle();
     if (meta.key.width <= 0) meta.key.width = surface->desc().width;
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;

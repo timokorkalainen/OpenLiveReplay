@@ -45,6 +45,32 @@ struct GpuDeviceLossMonitorTestAuthority {
             deviceDomainId);
     }
 };
+
+struct GpuRetirementTicketTestAuthority {
+    static GpuRetirementTicket withFence(const GpuRetirementTicket& source,
+                                         std::shared_ptr<GpuFence> fence) {
+        GpuRetirementTicket clone(source);
+        clone.m_fence = std::move(fence);
+        return clone;
+    }
+    static GpuRetirementTicket withIdentity(const GpuRetirementTicket& source,
+                                            GpuFenceIdentity identity) {
+        GpuRetirementTicket clone(source);
+        clone.m_identity = identity;
+        return clone;
+    }
+    static GpuRetirementTicket withGeneration(const GpuRetirementTicket& source,
+                                              uint64_t generation) {
+        GpuRetirementTicket clone(source);
+        clone.m_gpuGeneration = generation;
+        return clone;
+    }
+    static GpuRetirementTicket withValue(const GpuRetirementTicket& source, uint64_t value) {
+        GpuRetirementTicket clone(source);
+        clone.m_value = value;
+        return clone;
+    }
+};
 #endif
 
 namespace {
@@ -80,6 +106,19 @@ static_assert(!std::is_copy_constructible<GpuOwnedNativeHandle>::value,
               "The raw-surface native owner must remain unique.");
 static_assert(std::is_nothrow_move_constructible<GpuOwnedNativeHandle>::value,
               "The allocation-free native owner must transfer without throwing.");
+static_assert(!std::is_default_constructible<GpuRetirementTicket>::value,
+              "Retirement tickets must be fence-authority-minted.");
+static_assert(!std::is_aggregate<GpuRetirementTicket>::value,
+              "Retirement ticket fields must not be publicly aggregate-forgeable.");
+static_assert(!std::is_constructible<GpuRetirementTicket, std::shared_ptr<GpuFence>,
+                                     GpuFenceIdentity, uint64_t, uint64_t, uint64_t>::value,
+              "Only fence authority may invoke the retirement-ticket constructor.");
+static_assert(std::is_copy_constructible<GpuRetirementTicket>::value,
+              "Authority tickets may be copied as immutable evidence.");
+static_assert(!std::is_copy_assignable<GpuRetirementTicket>::value,
+              "Copied retirement evidence must not be rewritable.");
+static_assert(!std::is_move_assignable<GpuRetirementTicket>::value,
+              "Moved retirement evidence must not be rewritable.");
 
 // A surface whose native handle is a known sentinel. nativeHandle() is protected,
 // mirroring the production surfaces, so the ONLY way the test reads it is via a lease.
@@ -125,6 +164,14 @@ public:
     int signalCalls() const { return m_signalCalls; }
     int completedCalls() const { return m_completedCalls; }
     bool completedSawUnlockedRetainer() const { return m_completedSawUnlockedRetainer; }
+
+    template <typename SubmitFn>
+    auto submitForTest(const GpuFenceIdentity& preparedFence,
+                       const GpuSurfaceCompatibility& compatibility, uint64_t generation,
+                       SubmitFn&& submitFn) {
+        return submitExactForRetirement(preparedFence, compatibility, generation,
+                                        std::forward<SubmitFn>(submitFn));
+    }
 
 private:
     uint64_t m_signalled = 0;
@@ -265,8 +312,10 @@ private slots:
     void zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade();
     void deadTokenAbandonsOnlyMatchingDeviceDomain();
     void multipleDeadTokensAbandonInOnePass();
-    void retirementEvidenceRejectsWrongFenceInstanceAndDomain();
-    void submissionEvidenceRejectsStaleGenerationAndAuthority();
+    void submissionBoundaryRejectsEachMismatchBeforeCallback();
+    void retirementTicketRejectsEachIsolatedMutation();
+    void retirementTicketCopyIsImmutableAndKeepsAuthority();
+    void forgedOldCompletedValueIsRejected();
 };
 
 void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
@@ -292,55 +341,147 @@ void TestGpuSurfaceLease::callbackLeaseReportsInvalidSurface() {
     QVERIFY(!valid);
 }
 
-void TestGpuSurfaceLease::retirementEvidenceRejectsWrongFenceInstanceAndDomain() {
+void TestGpuSurfaceLease::submissionBoundaryRejectsEachMismatchBeforeCallback() {
     GpuGenerationCounter::instance().resetForTest();
     constexpr uintptr_t preparedDomain = 0xD011;
-    constexpr uintptr_t otherDomain = 0xD022;
     constexpr uint64_t authorityEpoch = 9;
     const uint64_t generation = GpuGenerationCounter::instance().current();
-    auto surface =
-        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xBEEF), true,
-                                           GpuSurfaceCompatibility{preparedDomain, authorityEpoch});
+    const GpuSurfaceCompatibility compatibility{preparedDomain, authorityEpoch};
     auto preparedFence = std::make_shared<FakeFence>(preparedDomain, authorityEpoch);
     auto sameDomainOtherFence = std::make_shared<FakeFence>(preparedDomain, authorityEpoch);
-    auto otherDomainFence = std::make_shared<FakeFence>(otherDomain, authorityEpoch);
+    int callbackCount = 0;
+    auto callback = [&]() noexcept {
+        ++callbackCount;
+        return true;
+    };
 
-    GpuRetirementTicket ticket{preparedFence, preparedFence->identity(), generation, 0};
-    QVERIFY(preparedFence->validatesPreparedSubmission(ticket, surface->compatibility()));
-    QVERIFY(!sameDomainOtherFence->validatesPreparedSubmission(ticket, surface->compatibility()));
-    QVERIFY(!otherDomainFence->validatesPreparedSubmission(ticket, surface->compatibility()));
+    GpuFenceIdentity wrongInstance = preparedFence->identity();
+    ++wrongInstance.instanceId;
+    QVERIFY(!preparedFence->submitForTest(wrongInstance, compatibility, generation, callback));
 
-    const uint64_t preparedValue = preparedFence->signal();
-    QCOMPARE(sameDomainOtherFence->signal(), preparedValue);
-    QCOMPARE(otherDomainFence->signal(), preparedValue);
-    ticket.value = preparedValue;
+    GpuFenceIdentity wrongDomain = preparedFence->identity();
+    ++wrongDomain.deviceDomainId;
+    QVERIFY(!preparedFence->submitForTest(wrongDomain, compatibility, generation, callback));
 
-    QVERIFY(preparedFence->validatesRetirement(ticket, surface->compatibility()));
-    QVERIFY(!sameDomainOtherFence->validatesRetirement(ticket, surface->compatibility()));
-    QVERIFY(!otherDomainFence->validatesRetirement(ticket, surface->compatibility()));
+    GpuFenceIdentity wrongAuthority = preparedFence->identity();
+    ++wrongAuthority.authorityEpoch;
+    QVERIFY(!preparedFence->submitForTest(wrongAuthority, compatibility, generation, callback));
+
+    QVERIFY(!preparedFence->submitForTest(preparedFence->identity(), compatibility, generation + 1,
+                                          callback));
+    QVERIFY(!sameDomainOtherFence->submitForTest(preparedFence->identity(), compatibility,
+                                                 generation, callback));
+    QCOMPARE(callbackCount, 0);
+    QCOMPARE(preparedFence->signalCalls(), 0);
+    QCOMPARE(sameDomainOtherFence->signalCalls(), 0);
+
+    const auto ticket = preparedFence->submitForTest(preparedFence->identity(), compatibility,
+                                                     generation, callback);
+    QVERIFY(ticket.has_value());
+    QCOMPARE(callbackCount, 1);
+    QCOMPARE(preparedFence->signalCalls(), 1);
+    QCOMPARE(ticket->fence().get(), preparedFence.get());
+    QVERIFY(ticket->identity() == preparedFence->identity());
+    QCOMPARE(ticket->gpuGeneration(), generation);
+    QCOMPARE(ticket->value(), uint64_t(1));
+    QVERIFY(preparedFence->validatesRetirement(*ticket, compatibility));
+    GpuGenerationCounter::instance().resetForTest();
 }
 
-void TestGpuSurfaceLease::submissionEvidenceRejectsStaleGenerationAndAuthority() {
+void TestGpuSurfaceLease::retirementTicketRejectsEachIsolatedMutation() {
     GpuGenerationCounter::instance().resetForTest();
-    constexpr uintptr_t reusedDomain = 0xDEC0DE;
-    constexpr uint64_t oldAuthorityEpoch = 41;
-    constexpr uint64_t newAuthorityEpoch = 42;
-    const uint64_t oldGeneration = GpuGenerationCounter::instance().current();
-    const GpuSurfaceCompatibility oldSurface{reusedDomain, oldAuthorityEpoch};
-    auto oldFence = std::make_shared<FakeFence>(reusedDomain, oldAuthorityEpoch);
+    constexpr uintptr_t domain = 0xD044;
+    constexpr uint64_t authorityEpoch = 19;
+    const uint64_t generation = GpuGenerationCounter::instance().current();
+    const GpuSurfaceCompatibility compatibility{domain, authorityEpoch};
+    auto fence = std::make_shared<FakeFence>(domain, authorityEpoch);
+    auto otherFence = std::make_shared<FakeFence>(domain, authorityEpoch);
+    auto accepted = []() noexcept { return true; };
 
-    QVERIFY(oldFence->acceptsSubmission(oldSurface, oldGeneration));
+    const auto oldTicket =
+        fence->submitForTest(fence->identity(), compatibility, generation, accepted);
+    const auto ticket =
+        fence->submitForTest(fence->identity(), compatibility, generation, accepted);
+    QVERIFY(oldTicket.has_value());
+    QVERIFY(ticket.has_value());
+    QVERIFY(fence->validatesRetirement(*ticket, compatibility));
+
+    const auto wrongPointer = GpuRetirementTicketTestAuthority::withFence(*ticket, otherFence);
+    QVERIFY(!fence->validatesRetirement(wrongPointer, compatibility));
+
+    GpuFenceIdentity wrongInstanceIdentity = ticket->identity();
+    ++wrongInstanceIdentity.instanceId;
+    const auto wrongInstance =
+        GpuRetirementTicketTestAuthority::withIdentity(*ticket, wrongInstanceIdentity);
+    QVERIFY(!fence->validatesRetirement(wrongInstance, compatibility));
+
+    GpuFenceIdentity wrongDomainIdentity = ticket->identity();
+    ++wrongDomainIdentity.deviceDomainId;
+    const auto wrongDomain =
+        GpuRetirementTicketTestAuthority::withIdentity(*ticket, wrongDomainIdentity);
+    QVERIFY(!fence->validatesRetirement(wrongDomain, compatibility));
+
+    GpuFenceIdentity wrongAuthorityIdentity = ticket->identity();
+    ++wrongAuthorityIdentity.authorityEpoch;
+    const auto wrongAuthority =
+        GpuRetirementTicketTestAuthority::withIdentity(*ticket, wrongAuthorityIdentity);
+    QVERIFY(!fence->validatesRetirement(wrongAuthority, compatibility));
+
+    const auto wrongGeneration =
+        GpuRetirementTicketTestAuthority::withGeneration(*ticket, generation + 1);
+    QVERIFY(!fence->validatesRetirement(wrongGeneration, compatibility));
+
+    const auto oldCompletedValue =
+        GpuRetirementTicketTestAuthority::withValue(*ticket, oldTicket->value());
+    QVERIFY(!fence->validatesRetirement(oldCompletedValue, compatibility));
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::retirementTicketCopyIsImmutableAndKeepsAuthority() {
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t domain = 0xD055;
+    constexpr uint64_t authorityEpoch = 29;
+    const uint64_t generation = GpuGenerationCounter::instance().current();
+    const GpuSurfaceCompatibility compatibility{domain, authorityEpoch};
+    auto fence = std::make_shared<FakeFence>(domain, authorityEpoch);
+    const auto issued = fence->submitForTest(fence->identity(), compatibility, generation,
+                                             []() noexcept { return true; });
+    QVERIFY(issued.has_value());
+
+    const GpuRetirementTicket copy(*issued);
+    QCOMPARE(copy.fence().get(), issued->fence().get());
+    QVERIFY(copy.identity() == issued->identity());
+    QCOMPARE(copy.gpuGeneration(), issued->gpuGeneration());
+    QCOMPARE(copy.value(), issued->value());
+    QVERIFY(fence->validatesRetirement(copy, compatibility));
+    GpuFenceIdentity detachedIdentity = copy.identity();
+    ++detachedIdentity.instanceId;
+    QVERIFY(copy.identity() == issued->identity());
     GpuGenerationCounter::instance().bump();
-    QVERIFY(!oldFence->acceptsSubmission(oldSurface, oldGeneration));
+    QVERIFY(!fence->validatesRetirement(copy, compatibility));
+    GpuGenerationCounter::instance().resetForTest();
+}
 
-    auto replacementFence = std::make_shared<FakeFence>(reusedDomain, newAuthorityEpoch);
-    const uint64_t newGeneration = GpuGenerationCounter::instance().current();
-    QVERIFY(!replacementFence->acceptsSubmission(oldSurface, newGeneration));
-    QVERIFY(replacementFence->acceptsSubmission(
-        GpuSurfaceCompatibility{reusedDomain, newAuthorityEpoch}, newGeneration));
+void TestGpuSurfaceLease::forgedOldCompletedValueIsRejected() {
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t domain = 0xF0123;
+    constexpr uint64_t authorityEpoch = 71;
+    const uint64_t generation = GpuGenerationCounter::instance().current();
+    const GpuSurfaceCompatibility compatibility{domain, authorityEpoch};
+    auto fence = std::make_shared<FakeFence>(domain, authorityEpoch);
 
-    const GpuRetirementTicket staleTicket{oldFence, oldFence->identity(), oldGeneration, 1};
-    QVERIFY(!oldFence->validatesRetirement(staleTicket, oldSurface));
+    const auto oldTicket = fence->submitForTest(fence->identity(), compatibility, generation,
+                                                []() noexcept { return true; });
+    const auto currentTicket = fence->submitForTest(fence->identity(), compatibility, generation,
+                                                    []() noexcept { return true; });
+    QVERIFY(oldTicket.has_value());
+    QVERIFY(currentTicket.has_value());
+    const uint64_t oldCompletedValue = oldTicket->value();
+    fence->setCompleted(oldCompletedValue);
+    const GpuRetirementTicket forged =
+        GpuRetirementTicketTestAuthority::withValue(*currentTicket, oldCompletedValue);
+
+    QVERIFY(!fence->validatesRetirement(forged, compatibility));
     GpuGenerationCounter::instance().resetForTest();
 }
 

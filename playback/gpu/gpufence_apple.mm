@@ -95,9 +95,9 @@ private:
 } // namespace
 
 GpuFence::GpuFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
-    : m_identity{nextFenceInstanceId.fetch_add(1, std::memory_order_relaxed), deviceDomainId,
-                 authorityEpoch != 0 ? authorityEpoch
-                                     : GpuGenerationCounter::instance().current()} {}
+    : m_identity{gpuSubmissionDetail::takeMonotonicInstanceId(nextFenceInstanceId), deviceDomainId,
+                 authorityEpoch != 0 ? authorityEpoch : GpuGenerationCounter::instance().current()},
+      m_ticketAuthorityKey(makeTicketAuthorityKey(m_identity, this)) {}
 
 GpuFence::~GpuFence() = default;
 
@@ -105,21 +105,13 @@ uint64_t GpuFence::currentGpuGeneration() noexcept {
     return GpuGenerationCounter::instance().current();
 }
 
-bool GpuFence::acceptsSubmission(const GpuSurfaceCompatibility& surface,
-                                 uint64_t gpuGeneration) const noexcept {
-    return gpuSubmissionEvidenceMatches(surface, identity(), gpuGeneration, currentGpuGeneration());
-}
-
-bool GpuFence::validatesPreparedSubmission(const GpuRetirementTicket& ticket,
-                                           const GpuSurfaceCompatibility& surface) const noexcept {
-    return ticket.fence.get() == this && gpuPreparedSubmissionEvidenceMatches(
-                                             ticket, identity(), surface, currentGpuGeneration());
-}
-
 bool GpuFence::validatesRetirement(const GpuRetirementTicket& ticket,
                                    const GpuSurfaceCompatibility& surface) const noexcept {
-    return ticket.fence.get() == this &&
-           gpuRetirementEvidenceMatches(ticket, identity(), surface, currentGpuGeneration());
+    return ticket.m_fence.get() == this && ticket.m_identity == identity() && ticket.m_value != 0 &&
+           gpuSubmissionDetail::matchesSurfaceEvidence(
+               surface, ticket.m_identity, ticket.m_gpuGeneration, currentGpuGeneration()) &&
+           ticket.m_authoritySeal ==
+               sealTicket(ticket.m_identity, ticket.m_gpuGeneration, ticket.m_value);
 }
 
 std::shared_ptr<GpuFence> makeMetalGpuFence(void* metalCommandQueue) {

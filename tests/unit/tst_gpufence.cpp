@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -63,6 +64,7 @@ private slots:
     void waitForeverReturnsAfterSignal();
     void concurrentSignalsProduceUniqueMonotonicValues();
     void identityIsStableAndUniquePerFenceInstance();
+    void instanceIdExhaustionFailsClosedPermanently();
 };
 
 void TestGpuFence::createIsNullOrValidNeverPartial() {
@@ -158,6 +160,18 @@ void TestGpuFence::identityIsStableAndUniquePerFenceInstance() {
     QCOMPARE(firstIdentity.authorityEpoch, uint64_t(7));
     QVERIFY(firstIdentity != second->identity());
     QVERIFY(firstIdentity != otherDomain->identity());
+}
+
+void TestGpuFence::instanceIdExhaustionFailsClosedPermanently() {
+    std::atomic<uint64_t> next{std::numeric_limits<uint64_t>::max() - 1};
+
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next),
+             std::numeric_limits<uint64_t>::max() - 1);
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next),
+             std::numeric_limits<uint64_t>::max());
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next), uint64_t(0));
+    QCOMPARE(gpuSubmissionDetail::takeMonotonicInstanceId(next), uint64_t(0));
+    QCOMPARE(next.load(std::memory_order_relaxed), uint64_t(0));
 }
 
 QTEST_GUILESS_MAIN(TestGpuFence)
