@@ -40,6 +40,9 @@
 #include <QFileInfo>
 #include <QMutexLocker>
 #include <QScopeGuard>
+#ifdef OLR_UNIT_TEST
+#include <QSemaphore>
+#endif
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -1461,6 +1464,13 @@ void PlaybackWorker::handleGpuDeviceLoss() {
                 return registry.abandonAllNoWait(deadDomains);
             });
         if (recovery.status == GpuValidatedLossStatus::Rejected) {
+#ifdef OLR_UNIT_TEST
+            if (m_gpuBeforeTokenlessRecoveryEnteredForTest) {
+                m_gpuBeforeTokenlessRecoveryEnteredForTest->release();
+                if (m_gpuContinueTokenlessRecoveryForTest)
+                    m_gpuContinueTokenlessRecoveryForTest->acquire();
+            }
+#endif
             recovery = lossMonitor.withCoordinatedTokenlessRecovery([&]() { return qsizetype(0); });
         }
         if (recovery.coordinatorLeader) registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);

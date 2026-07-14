@@ -44,6 +44,7 @@ ColorMetadata colorMetadataForAvFrame(const AVFrame* frame);
 class DecodeDoneFence;
 class GpuFence;
 class GpuRhiContext;
+class QSemaphore;
 #if defined(OLR_GPU_PIPELINE_BUILD) && defined(_WIN32)
 class WinGpuImportEdge;
 #endif
@@ -82,6 +83,8 @@ class PlaybackWorker : public QThread {
     friend class TestGpuDeviceLostWorker;
     friend class WinGpuFaultWorkerOracle;
     std::atomic<qint64> m_gpuLastAbandonedRetainsForTest{0};
+    QSemaphore* m_gpuBeforeTokenlessRecoveryEnteredForTest = nullptr;
+    QSemaphore* m_gpuContinueTokenlessRecoveryForTest = nullptr;
 #endif
 public:
     struct ResidencyWindowParams {

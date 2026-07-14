@@ -6,7 +6,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <utility>
 
 enum class GpuValidatedLossStatus : uint8_t { Rejected, Completed };
 
@@ -21,7 +24,6 @@ public:
     static GpuRecoveryCoordinator& instance();
     GpuValidatedLossResult coordinate(uint64_t lossGeneration, uint64_t proofRevision,
                                       const std::function<GpuValidatedLossResult()>& leaderWork);
-    bool completed(uint64_t lossGeneration, uint64_t proofRevision);
 #ifdef OLR_UNIT_TEST
     void resetForTest();
 #endif
@@ -29,14 +31,15 @@ public:
 private:
     GpuRecoveryCoordinator() = default;
 
+    struct RecoveryState {
+        std::condition_variable finished;
+        bool inProgress = false;
+        bool completed = false;
+        GpuValidatedLossResult result;
+    };
+
     std::mutex m_mutex;
-    std::condition_variable m_finished;
-    uint64_t m_activeGeneration = 0;
-    uint64_t m_activeRevision = 0;
-    uint64_t m_completedGeneration = 0;
-    uint64_t m_completedRevision = 0;
-    bool m_inProgress = false;
-    GpuValidatedLossResult m_completedResult;
+    std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<RecoveryState>> m_recoveries;
 };
 
 #endif // OLR_GPURECOVERYCOORDINATOR_H

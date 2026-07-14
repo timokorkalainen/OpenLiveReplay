@@ -49,6 +49,7 @@ private:
 
 class GpuRhiContext;
 class WinGpuImportEdge;
+class QSemaphore;
 #ifdef OLR_UNIT_TEST
 struct GpuDeviceLossMonitorTestAuthority;
 #endif
@@ -93,17 +94,24 @@ public:
         const uint64_t generation = m_lossGeneration.load(std::memory_order_acquire);
         if (generation == 0 || !m_lost.load(std::memory_order_acquire) || m_rebuildInProgress)
             return {};
-        if (m_realLossTokens.empty()) return {};
+        if (m_realLossTokens.empty()) {
+            m_tokenlessRecoveryObserved = true;
+            return {};
+        }
         for (const DeadDeviceToken& token : m_realLossTokens) {
             if (token.observedGeneration() != generation ||
                 token.authorityEpoch() != m_deviceAuthorityEpoch)
                 return {};
         }
-        return GpuRecoveryCoordinator::instance().coordinate(generation, m_realLossRevision, [&]() {
-            GpuValidatedDeadDomains domains(m_realLossTokens);
-            return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
-                                          std::invoke(std::forward<Fn>(fn), domains)};
-        });
+        const GpuValidatedLossResult result =
+            GpuRecoveryCoordinator::instance().coordinate(generation, m_realLossRevision, [&]() {
+                GpuValidatedDeadDomains domains(m_realLossTokens);
+                return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
+                                              std::invoke(std::forward<Fn>(fn), domains)};
+            });
+        if (result.status == GpuValidatedLossStatus::Completed)
+            m_deliveredProofRevision = m_realLossRevision;
+        return result;
     }
 
     template <typename Fn>
@@ -113,6 +121,7 @@ public:
         if (generation == 0 || !m_lost.load(std::memory_order_acquire) || m_rebuildInProgress ||
             !m_realLossTokens.empty())
             return {};
+        m_tokenlessRecoveryObserved = true;
         return GpuRecoveryCoordinator::instance().coordinate(
             generation, std::numeric_limits<uint64_t>::max(), [&]() {
                 return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
@@ -158,6 +167,12 @@ private:
     std::optional<DeadDeviceToken> m_realLossToken; // guarded by m_epochMutex
     std::vector<DeadDeviceToken> m_realLossTokens;  // guarded by m_epochMutex
     uint64_t m_realLossRevision = 0;                // guarded by m_epochMutex
+    uint64_t m_deliveredProofRevision = 0;          // guarded by m_epochMutex
+    bool m_tokenlessRecoveryObserved = false;       // guarded by m_epochMutex
+#ifdef OLR_UNIT_TEST
+    QSemaphore* m_proofAcceptedForTest = nullptr;
+    QSemaphore* m_continueProofDeliveryForTest = nullptr;
+#endif
 };
 
 #endif // OLR_GPUDEVICELOSSMONITOR_H

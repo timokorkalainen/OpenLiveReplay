@@ -36,6 +36,11 @@ struct GpuDeviceLossMonitorTestAuthority {
             DeadDeviceToken::Provenance::DxgiDeviceRemovedReason, deviceAuthorityEpoch,
             deviceDomainId);
     }
+    static void setProofDeliveryGate(QSemaphore* accepted, QSemaphore* proceed) {
+        auto& monitor = GpuDeviceLossMonitor::instance();
+        monitor.m_proofAcceptedForTest = accepted;
+        monitor.m_continueProofDeliveryForTest = proceed;
+    }
 };
 #endif
 
@@ -54,6 +59,8 @@ private slots:
     void lossSanitizesDecoderTrackBuffers();
     void boundedLossWaitDoesNotHoldRecoveryEpochLock();
     void lateDeadDomainProofReleasesQuarantineAutomatically();
+    void tokenlessUpgradeDuringRecoveryReleasesQuarantineAutomatically();
+    void acceptedProofDeliveryCompletesBeforeRebuildCanClearState();
 
 private:
     std::shared_ptr<GpuRhiContext> createTestRhi() const;
@@ -581,6 +588,118 @@ void TestGpuDeviceLostWorker::lateDeadDomainProofReleasesQuarantineAutomatically
 
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, lateDomain) != 0);
 
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::tokenlessUpgradeDuringRecoveryReleasesQuarantineAutomatically() {
+    qunsetenv("OLR_GPU_PIPELINE");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t deviceDomain = 0xC330;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(deviceDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(
+        operation
+            .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+            .retirement,
+        GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+    QSemaphore beforeTokenless;
+    QSemaphore continueTokenless;
+    worker.m_gpuBeforeTokenlessRecoveryEnteredForTest = &beforeTokenless;
+    worker.m_gpuContinueTokenlessRecoveryForTest = &continueTokenless;
+
+    std::thread recovery([&]() { worker.handleGpuDeviceLoss(); });
+    const bool reachedUpgradeWindow = beforeTokenless.tryAcquire(1, 5000);
+    const bool proofPublished = reachedUpgradeWindow && GpuDeviceLossMonitorTestAuthority::publish(
+                                                            authority, deviceDomain) != 0;
+    continueTokenless.release();
+    recovery.join();
+    worker.m_gpuBeforeTokenlessRecoveryEnteredForTest = nullptr;
+    worker.m_gpuContinueTokenlessRecoveryForTest = nullptr;
+
+    QVERIFY(reachedUpgradeWindow);
+    QVERIFY(proofPublished);
+    QCOMPARE(worker.gpuPipelineState(), PlaybackWorker::GpuPipelineState::CpuFallback);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore);
+}
+
+void TestGpuDeviceLostWorker::acceptedProofDeliveryCompletesBeforeRebuildCanClearState() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t firstDomain = 0xD440;
+    constexpr uintptr_t lateDomain = 0xE550;
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    GpuRetireRegistry registry;
+    const qsizetype pendingBefore = registry.pendingRetainCount();
+    auto fence = std::make_shared<IncompleteLossFence>(lateDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(lateDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(
+        operation
+            .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+            .retirement,
+        GpuRetirementDisposition::Published);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, firstDomain) != 0);
+    QCOMPARE(
+        monitor
+            .withValidatedDeadDomains([](const GpuValidatedDeadDomains&) { return qsizetype(0); })
+            .status,
+        GpuValidatedLossStatus::Completed);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
+
+    QSemaphore proofAccepted;
+    QSemaphore continueDelivery;
+    GpuDeviceLossMonitorTestAuthority::setProofDeliveryGate(&proofAccepted, &continueDelivery);
+    std::thread publisher(
+        [&]() { (void) GpuDeviceLossMonitorTestAuthority::publish(authority, lateDomain); });
+    const bool accepted = proofAccepted.tryAcquire(1, 5000);
+    std::atomic<bool> rebuildCleared{false};
+    QSemaphore rebuildAttempting;
+    std::thread rebuild;
+    if (accepted) {
+        rebuild = std::thread([&]() {
+            rebuildAttempting.release();
+            monitor.beginRebuild();
+            monitor.clearForRebuild();
+            rebuildCleared.store(true, std::memory_order_release);
+        });
+    }
+    const bool rebuildReachedBegin = accepted && rebuildAttempting.tryAcquire(1, 5000);
+
+    QElapsedTimer deadline;
+    deadline.start();
+    while (rebuildReachedBegin && !rebuildCleared.load(std::memory_order_acquire) &&
+           deadline.elapsed() < 250)
+        QThread::msleep(1);
+    const bool clearedBeforeDelivery = rebuildCleared.load(std::memory_order_acquire);
+    continueDelivery.release();
+    publisher.join();
+    if (rebuild.joinable()) rebuild.join();
+    GpuDeviceLossMonitorTestAuthority::setProofDeliveryGate(nullptr, nullptr);
+
+    QVERIFY(accepted);
+    QVERIFY(rebuildReachedBegin);
+    QVERIFY2(!clearedBeforeDelivery,
+             "accepted proof must be delivered before rebuild clears state");
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
 }
 

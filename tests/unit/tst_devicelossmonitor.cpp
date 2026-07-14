@@ -8,6 +8,8 @@
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpugeneration.h"
 
+#include <QSemaphore>
+
 #include <thread>
 #include <atomic>
 
@@ -43,7 +45,8 @@ private slots:
     void validatedRecoveryRunsOnceForConcurrentWorkers();
     void rebuildInvalidatesUnconsumedRecoveryAuthority();
     void tokenlessEpochCanUpgradeToValidatedRecovery();
-    void expandedDeadDomainProofCompletesNewRecoveryRevision();
+    void expandedDeadDomainProofRunsNewRecoveryRevision();
+    void differentRecoveryKeysCompleteIndependentlyAndRemainCached();
     void resetReturnsToPristine();
 };
 
@@ -124,7 +127,7 @@ void TestDeviceLossMonitor::tokenlessEpochCanUpgradeToValidatedRecovery() {
     monitor.reset();
 }
 
-void TestDeviceLossMonitor::expandedDeadDomainProofCompletesNewRecoveryRevision() {
+void TestDeviceLossMonitor::expandedDeadDomainProofRunsNewRecoveryRevision() {
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
@@ -144,9 +147,52 @@ void TestDeviceLossMonitor::expandedDeadDomainProofCompletesNewRecoveryRevision(
                      return qsizetype(callbacks);
                  })
                  .abandoned,
-             qsizetype(0));
-    QCOMPARE(callbacks, 1);
+             qsizetype(2));
+    QCOMPARE(callbacks, 2);
     monitor.reset();
+}
+
+void TestDeviceLossMonitor::differentRecoveryKeysCompleteIndependentlyAndRemainCached() {
+    auto& coordinator = GpuRecoveryCoordinator::instance();
+    coordinator.resetForTest();
+    QSemaphore oldEntered;
+    QSemaphore releaseOld;
+    std::atomic<int> oldCallbacks{0};
+    std::atomic<int> newCallbacks{0};
+    GpuValidatedLossResult oldResult;
+    std::thread oldRecovery([&]() {
+        oldResult = coordinator.coordinate(0x101, 1, [&]() {
+            oldCallbacks.fetch_add(1, std::memory_order_acq_rel);
+            oldEntered.release();
+            releaseOld.acquire();
+            return GpuValidatedLossResult{GpuValidatedLossStatus::Completed, qsizetype(11)};
+        });
+    });
+    const bool oldIsActive = oldEntered.tryAcquire(1, 5000);
+
+    GpuValidatedLossResult newResult;
+    if (oldIsActive) {
+        newResult = coordinator.coordinate(0x202, 1, [&]() {
+            newCallbacks.fetch_add(1, std::memory_order_acq_rel);
+            return GpuValidatedLossResult{GpuValidatedLossStatus::Completed, qsizetype(22)};
+        });
+    }
+    releaseOld.release();
+    oldRecovery.join();
+    const GpuValidatedLossResult newFollower = coordinator.coordinate(0x202, 1, [&]() {
+        newCallbacks.fetch_add(1, std::memory_order_acq_rel);
+        return GpuValidatedLossResult{GpuValidatedLossStatus::Completed, qsizetype(33)};
+    });
+
+    QVERIFY(oldIsActive);
+    QCOMPARE(oldResult.status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(newResult.status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(newResult.abandoned, qsizetype(22));
+    QCOMPARE(newFollower.status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(newFollower.abandoned, qsizetype(22));
+    QCOMPARE(oldCallbacks.load(std::memory_order_acquire), 1);
+    QCOMPARE(newCallbacks.load(std::memory_order_acquire), 1);
+    coordinator.resetForTest();
 }
 
 void TestDeviceLossMonitor::recordLossSetsLatchAndBumpsGeneration() {

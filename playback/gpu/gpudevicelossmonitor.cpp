@@ -3,6 +3,10 @@
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpuretireregistry.h"
 
+#ifdef OLR_UNIT_TEST
+#include <QSemaphore>
+#endif
+
 GpuDeviceLossMonitor& GpuDeviceLossMonitor::instance() {
     static GpuDeviceLossMonitor monitor;
     return monitor;
@@ -42,7 +46,7 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
     uint64_t generation = 0;
     uint64_t acceptedRevision = 0;
     std::vector<DeadDeviceToken> acceptedProof;
-    bool precedingRecoveryCompleted = false;
+    bool immediateDeliveryRequired = false;
     {
         std::lock_guard<std::mutex> lock(m_epochMutex);
         if (deviceAuthorityEpoch != m_deviceAuthorityEpoch) return 0;
@@ -54,8 +58,8 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
             const uint64_t precedingRevision = m_realLossTokens.empty()
                                                    ? std::numeric_limits<uint64_t>::max()
                                                    : m_realLossRevision;
-            precedingRecoveryCompleted =
-                GpuRecoveryCoordinator::instance().completed(generation, precedingRevision);
+            immediateDeliveryRequired =
+                m_tokenlessRecoveryObserved || m_deliveredProofRevision == precedingRevision;
             // A single adapter reset can kill more than one device domain. An earlier
             // tokenless submission failure identifies where submission first failed,
             // but it is not authority to reject later driver proof from another owned
@@ -83,17 +87,26 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
         }
     }
 
-    // Once the preceding recovery revision completed, publication is the only
-    // production event guaranteed for a later proof while the worker is already
-    // in rebuild-pending or fallback. Carry only that accepted domain out of the
-    // epoch lock and release its dead-device quarantine without waiting. Initial
-    // proof delivery remains owned by the coordinated worker transition.
-    if (precedingRecoveryCompleted) {
+#ifdef OLR_UNIT_TEST
+    if (m_proofAcceptedForTest) {
+        m_proofAcceptedForTest->release();
+        if (m_continueProofDeliveryForTest) m_continueProofDeliveryForTest->acquire();
+    }
+#endif
+
+    // Initial proof delivery remains worker-owned. Once tokenless recovery has
+    // observed the epoch or a preceding proof revision has been delivered,
+    // publication is the only guaranteed production event for a newly accepted
+    // domain. Carry only that proof out of the epoch lock and release it without
+    // waiting; m_proofDeliveryMutex prevents rebuild/clear from overtaking this
+    // cold-path handoff.
+    if (immediateDeliveryRequired) {
         GpuValidatedDeadDomains deadDomain(acceptedProof);
-        (void) GpuRecoveryCoordinator::instance().coordinate(generation, acceptedRevision, [&]() {
-            return GpuValidatedLossResult{GpuValidatedLossStatus::Completed,
-                                          GpuRetireRegistry{}.abandonAllNoWait(deadDomain)};
-        });
+        (void) GpuRetireRegistry{}.abandonAllNoWait(deadDomain);
+        std::lock_guard<std::mutex> lock(m_epochMutex);
+        if (m_lossGeneration.load(std::memory_order_acquire) == generation &&
+            m_realLossRevision == acceptedRevision)
+            m_deliveredProofRevision = acceptedRevision;
     }
     return generation;
 }
@@ -134,6 +147,7 @@ bool GpuDeviceLossMonitor::consumeLossEvent() {
 }
 
 void GpuDeviceLossMonitor::beginRebuild() {
+    std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
     std::lock_guard<std::mutex> lock(m_epochMutex);
     if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
     m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
@@ -141,6 +155,7 @@ void GpuDeviceLossMonitor::beginRebuild() {
 }
 
 void GpuDeviceLossMonitor::clearForRebuild() {
+    std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
     std::lock_guard<std::mutex> lock(m_epochMutex);
     // Preserve compatibility with direct clear callers while allowing production
     // rebuilds to mint replacement-device authority between begin and commit.
@@ -152,9 +167,12 @@ void GpuDeviceLossMonitor::clearForRebuild() {
     m_realLossToken.reset();
     m_realLossTokens.clear();
     m_realLossRevision = 0;
+    m_deliveredProofRevision = 0;
+    m_tokenlessRecoveryObserved = false;
 }
 
 void GpuDeviceLossMonitor::reset() {
+    std::lock_guard<std::mutex> deliveryLock(m_proofDeliveryMutex);
     std::lock_guard<std::mutex> lock(m_epochMutex);
     if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
     m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
@@ -166,6 +184,8 @@ void GpuDeviceLossMonitor::reset() {
     m_realLossToken.reset();
     m_realLossTokens.clear();
     m_realLossRevision = 0;
+    m_deliveredProofRevision = 0;
+    m_tokenlessRecoveryObserved = false;
 #ifdef OLR_UNIT_TEST
     GpuRecoveryCoordinator::instance().resetForTest();
 #endif
