@@ -16,6 +16,11 @@ private slots:
     void h264TimeOffsetIsBoundsChecked();
     void h264PartialTimestampIsNotReturned();
     void h264OutOfRateFrameLabelIsRejected();
+    void h264ConsumesEveryClockTimestamp();
+    void h264RejectsInvalidTimestampLabels();
+    void h264RejectsInvalidPayloadAlignment();
+    void h264RejectsMalformedEmulationPrevention();
+    void h264MalformedContextIsNotUnsupported();
     void h264PicTimingWithoutContextIsRejected();
     void hevcTimeCodeDecoded();
     void hevcSuffixSeiDecoded();
@@ -61,10 +66,25 @@ QByteArray seiMessage(int payloadType, const QByteArray& payload) {
     return seiVarByte(payloadType) + seiVarByte(payload.size()) + payload;
 }
 
+QByteArray escapeRbsp(const QByteArray& rbsp) {
+    QByteArray escaped;
+    int zeroCount = 0;
+    for (char byte : rbsp) {
+        const uchar value = uchar(byte);
+        if (zeroCount >= 2 && value <= 0x03) {
+            escaped.append(char(0x03));
+            zeroCount = 0;
+        }
+        escaped.append(byte);
+        zeroCount = value == 0 ? zeroCount + 1 : 0;
+    }
+    return escaped;
+}
+
 // Wrap a SEI RBSP (one or more messages) into an Annex-B SEI NAL with the given
 // NAL header bytes, appending the RBSP trailing-bits stop byte (0x80).
 QByteArray seiNal(const QByteArray& header, const QByteArray& rbsp) {
-    return QByteArray(kStartCode4, 4) + header + rbsp + QByteArray(1, char(0x80));
+    return QByteArray(kStartCode4, 4) + header + escapeRbsp(rbsp + QByteArray(1, char(0x80)));
 }
 
 QByteArray h264SeiNal(const QByteArray& rbsp) {
@@ -138,15 +158,23 @@ struct BitWriter {
         for (int i = count - 1; i >= 0; --i)
             bit(((value >> i) & 1u) != 0);
     }
+
+    void payloadTrailingBits(bool marker = true, bool nonzeroPadding = false) {
+        bit(marker);
+        bool firstPaddingBit = true;
+        while (bitPosition != 0) {
+            bit(nonzeroPadding && firstPaddingBit);
+            firstPaddingBit = false;
+        }
+    }
 };
 
-QByteArray fullTimestampPayload(int hours, int minutes, int seconds, int frames) {
-    BitWriter writer;
-    writer.bits(0, 4); // pic_struct: frame
+void writeFullTimestamp(BitWriter& writer, int hours, int minutes, int seconds, int frames,
+                        int countingType = 0) {
     writer.bit(true);  // clock_timestamp_flag[0]
     writer.bits(0, 2); // ct_type: progressive
     writer.bit(false); // nuit_field_based_flag
-    writer.bits(0, 5); // counting_type: no frame count dropping
+    writer.bits(uint32_t(countingType), 5);
     writer.bit(true);  // full_timestamp_flag
     writer.bit(false); // discontinuity_flag
     writer.bit(false); // cnt_dropped_flag
@@ -154,6 +182,14 @@ QByteArray fullTimestampPayload(int hours, int minutes, int seconds, int frames)
     writer.bits(uint32_t(seconds), 6);
     writer.bits(uint32_t(minutes), 6);
     writer.bits(uint32_t(hours), 5);
+}
+
+QByteArray fullTimestampPayload(int hours, int minutes, int seconds, int frames,
+                                int countingType = 0) {
+    BitWriter writer;
+    writer.bits(0, 4); // pic_struct: frame
+    writeFullTimestamp(writer, hours, minutes, seconds, frames, countingType);
+    writer.payloadTrailingBits();
     return writer.bytes;
 }
 
@@ -171,6 +207,7 @@ QByteArray partialTimestampPayload() {
     writer.bit(true);  // seconds_flag
     writer.bits(3, 6); // seconds_value
     writer.bit(false); // minutes_flag: hours are consequently also absent
+    writer.payloadTrailingBits();
     return writer.bytes;
 }
 
@@ -223,7 +260,7 @@ void TestH26xSeiTimecode::h264TimeOffsetIsBoundsChecked() {
     QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {}, {fixture("h264_sps_hrd.bin")}));
     H264TimingSyntax constructedSyntax = *context.h264();
     constructedSyntax.timeOffsetLength = 5;
-    QByteArray payload = QByteArray::fromHex("0441840206985a80");
+    QByteArray payload = QByteArray::fromHex("0441840206985a81");
     auto parsed = H26xTimingDetail::parseH264PicTiming(payload, constructedSyntax);
     QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Valid);
     QVERIFY(parsed.timecode.valid);
@@ -255,6 +292,126 @@ void TestH26xSeiTimecode::h264OutOfRateFrameLabelIsRejected() {
         h264SeiNal(seiMessage(1, fullTimestampPayload(1, 2, 3, 25))) + h264VclNal();
     const Smpte12mTimecode parsed = extractH26xSeiTimecode(annexB, NativeVideoCodec::H264, context);
     QVERIFY(!parsed.valid);
+}
+
+void TestH26xSeiTimecode::h264ConsumesEveryClockTimestamp() {
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {25, 1};
+    syntax.fixedFrameRate = true;
+    syntax.picStructPresent = true;
+
+    BitWriter truncatedLaterClock;
+    truncatedLaterClock.bits(3, 4); // pic_struct: top field, bottom field (two clocks)
+    writeFullTimestamp(truncatedLaterClock, 1, 2, 3, 4);
+    truncatedLaterClock.bit(true);  // clock_timestamp_flag[1]
+    truncatedLaterClock.bits(0, 2); // truncated ct_type only
+    auto parsed = H26xTimingDetail::parseH264PicTiming(truncatedLaterClock.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+    QVERIFY(!parsed.timecode.valid);
+
+    BitWriter malformedLaterClock;
+    malformedLaterClock.bits(3, 4);
+    writeFullTimestamp(malformedLaterClock, 1, 2, 3, 4);
+    writeFullTimestamp(malformedLaterClock, 24, 0, 0, 0);
+    malformedLaterClock.payloadTrailingBits();
+    parsed = H26xTimingDetail::parseH264PicTiming(malformedLaterClock.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+    QVERIFY(!parsed.timecode.valid);
+
+    BitWriter malformedThirdClock;
+    malformedThirdClock.bits(5, 4); // pic_struct: three clock_timestamp_flag entries
+    writeFullTimestamp(malformedThirdClock, 1, 2, 3, 4);
+    malformedThirdClock.bit(false);
+    malformedThirdClock.bit(true);
+    malformedThirdClock.bits(0, 1); // truncated clock_timestamp[2]
+    parsed = H26xTimingDetail::parseH264PicTiming(malformedThirdClock.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+    QVERIFY(!parsed.timecode.valid);
+}
+
+void TestH26xSeiTimecode::h264RejectsInvalidTimestampLabels() {
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {25, 1};
+    syntax.fixedFrameRate = true;
+    syntax.picStructPresent = true;
+
+    const struct {
+        int hours;
+        int minutes;
+        int seconds;
+        int frames;
+        int countingType;
+    } cases[] = {
+        {24, 0, 0, 0, 0}, {0, 60, 0, 0, 0}, {0, 0, 60, 0, 0}, {0, 0, 0, 25, 0}, {0, 0, 0, 0, 7}};
+    for (const auto& test : cases) {
+        const auto parsed = H26xTimingDetail::parseH264PicTiming(
+            fullTimestampPayload(test.hours, test.minutes, test.seconds, test.frames,
+                                 test.countingType),
+            syntax);
+        QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+        QVERIFY(!parsed.timecode.valid);
+    }
+}
+
+void TestH26xSeiTimecode::h264RejectsInvalidPayloadAlignment() {
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Valid;
+    syntax.frameRate = {25, 1};
+    syntax.fixedFrameRate = true;
+    syntax.picStructPresent = true;
+
+    BitWriter missingMarker;
+    missingMarker.bits(0, 4);
+    writeFullTimestamp(missingMarker, 1, 2, 3, 4);
+    missingMarker.payloadTrailingBits(false);
+    auto parsed = H26xTimingDetail::parseH264PicTiming(missingMarker.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+
+    BitWriter nonzeroPadding;
+    nonzeroPadding.bits(0, 4);
+    writeFullTimestamp(nonzeroPadding, 1, 2, 3, 4);
+    nonzeroPadding.payloadTrailingBits(true, true);
+    parsed = H26xTimingDetail::parseH264PicTiming(nonzeroPadding.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+
+    H264TimingSyntax noPicStruct = syntax;
+    noPicStruct.picStructPresent = false;
+    parsed = H26xTimingDetail::parseH264PicTiming(QByteArray::fromHex("00"), noPicStruct);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+    parsed = H26xTimingDetail::parseH264PicTiming(QByteArray::fromHex("80"), noPicStruct);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::NoTimestamp);
+
+    BitWriter reservedPicStruct;
+    reservedPicStruct.bits(9, 4);
+    reservedPicStruct.payloadTrailingBits();
+    parsed = H26xTimingDetail::parseH264PicTiming(reservedPicStruct.bytes, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
+}
+
+void TestH26xSeiTimecode::h264RejectsMalformedEmulationPrevention() {
+    const QByteArray reference = fixture("h264_pic_timing_no_hrd.264");
+    H26xTimingContext context;
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {}, {h264SpsFromAnnexB(reference)}));
+
+    const QByteArray validMessage = seiMessage(1, fullTimestampPayload(1, 2, 3, 4));
+    const QByteArray invalidFollowingByte = QByteArray(kStartCode4, 4) + QByteArray(1, char(0x06)) +
+                                            QByteArray::fromHex("000300000304") + validMessage +
+                                            QByteArray(1, char(0x80));
+    QVERIFY(!extractH26xSeiTimecode(invalidFollowingByte, NativeVideoCodec::H264, context).valid);
+
+    const QByteArray terminalEscape = QByteArray(kStartCode4, 4) + QByteArray(1, char(0x06)) +
+                                      validMessage + QByteArray::fromHex("000003");
+    QVERIFY(!extractH26xSeiTimecode(terminalEscape, NativeVideoCodec::H264, context).valid);
+}
+
+void TestH26xSeiTimecode::h264MalformedContextIsNotUnsupported() {
+    H264TimingSyntax syntax;
+    syntax.status = H26xTimingSyntaxStatus::Malformed;
+    const auto parsed = H26xTimingDetail::parseH264PicTiming({}, syntax);
+    QCOMPARE(parsed.status, H26xTimingDetail::TimecodeParseStatus::Malformed);
 }
 
 void TestH26xSeiTimecode::h264PicTimingWithoutContextIsRejected() {

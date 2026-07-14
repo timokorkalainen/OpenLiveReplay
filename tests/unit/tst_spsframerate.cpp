@@ -16,6 +16,8 @@ private slots:
     void skipsHighProfileScalingLists();
     void rejectsImplausibleRate();
     void cachesTimingContextByParameterSetBytes();
+    void h264CacheIgnoresVpsBytes();
+    void rejectsMalformedEmulationPrevention();
     void reportsMalformedAndUnsupportedContext();
 };
 
@@ -195,6 +197,33 @@ void TestSpsFrameRate::cachesTimingContextByParameterSetBytes() {
     QCOMPARE(context.h264()->dpbOutputDelayLength, uint8_t(0));
 }
 
+void TestSpsFrameRate::h264CacheIgnoresVpsBytes() {
+    H26xTimingContext context;
+    const QList<QByteArray> sps{fixture("h264_sps_hrd.bin")};
+    QVERIFY(context.updateParameterSets(NativeVideoCodec::H264, {QByteArrayLiteral("first")}, sps));
+    QCOMPARE(context.generation(), uint64_t(1));
+
+    QVERIFY(
+        context.updateParameterSets(NativeVideoCodec::H264, {QByteArrayLiteral("changed")}, sps));
+    QCOMPARE(context.generation(), uint64_t(1));
+    QCOMPARE(context.constantFrameRate(), (FrameRateQ{30000, 1001}));
+}
+
+void TestSpsFrameRate::rejectsMalformedEmulationPrevention() {
+    H26xTimingContext context;
+
+    QByteArray invalidFollowingByte = makeSps(8, 192);
+    const int insertionPoint = invalidFollowingByte.indexOf(QByteArray::fromHex("000004"));
+    QVERIFY(insertionPoint >= 0);
+    invalidFollowingByte.insert(insertionPoint + 2, char(0x03));
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {invalidFollowingByte}));
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+
+    const QByteArray terminalEscape = QByteArray::fromHex("6742001efb9080000003");
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {terminalEscape}));
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+}
+
 void TestSpsFrameRate::reportsMalformedAndUnsupportedContext() {
     H26xTimingContext context;
     const QList<QByteArray> malformed{QByteArray::fromHex("6764001fac")};
@@ -208,15 +237,19 @@ void TestSpsFrameRate::reportsMalformedAndUnsupportedContext() {
     QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, malformed));
     QCOMPARE(context.generation(), uint64_t(1));
 
+    const QList<QByteArray> mixed{makeSps(1, 50), malformed.first()};
+    QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, mixed));
+    QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Malformed);
+
     QByteArray unsupported = makeSps(1, 50);
     unsupported[1] = char(1); // unknown profile_idc: syntax shape cannot be inferred safely
     QVERIFY(!context.updateParameterSets(NativeVideoCodec::H264, {}, {unsupported}));
-    QCOMPARE(context.generation(), uint64_t(2));
+    QCOMPARE(context.generation(), uint64_t(3));
     QCOMPARE(context.h264()->status, H26xTimingSyntaxStatus::Unsupported);
 
     QVERIFY(!context.updateParameterSets(NativeVideoCodec::Hevc, {QByteArray::fromHex("40")},
                                          {QByteArray::fromHex("42")}));
-    QCOMPARE(context.generation(), uint64_t(3));
+    QCOMPARE(context.generation(), uint64_t(4));
     QVERIFY(context.h264() == nullptr);
     QVERIFY(context.hevc() != nullptr);
     QCOMPARE(context.hevc()->status, H26xTimingSyntaxStatus::Unsupported);

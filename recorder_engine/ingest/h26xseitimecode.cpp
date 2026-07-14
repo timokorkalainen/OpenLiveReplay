@@ -50,22 +50,6 @@ QList<QByteArray> splitAnnexBNals(const QByteArray& bytes) {
     return nals;
 }
 
-QByteArray rbspFromPayload(const QByteArray& bytes) {
-    QByteArray rbsp;
-    rbsp.reserve(bytes.size());
-    int zeroCount = 0;
-    for (char byte : bytes) {
-        const uchar value = uchar(byte);
-        if (zeroCount >= 2 && value == 0x03) {
-            zeroCount = 0;
-            continue;
-        }
-        rbsp.append(byte);
-        zeroCount = value == 0 ? zeroCount + 1 : 0;
-    }
-    return rbsp;
-}
-
 bool isSeiNal(const QByteArray& nal, NativeVideoCodec codec) {
     if (codec == NativeVideoCodec::H264) return !nal.isEmpty() && (uchar(nal[0]) & 0x1f) == 6;
     if (codec == NativeVideoCodec::Hevc) {
@@ -137,8 +121,9 @@ Smpte12mTimecode extract(const QByteArray& annexB, NativeVideoCodec codec,
         if (!isSeiNal(nal, codec)) continue;
         const int headerBytes = codec == NativeVideoCodec::H264 ? 1 : 2;
         if (nal.size() <= headerBytes) continue;
-        const Smpte12mTimecode timecode =
-            extractFromSeiRbsp(rbspFromPayload(nal.mid(headerBytes)), codec, context);
+        QByteArray rbsp;
+        if (!H26xTimingDetail::unescapeRbsp(nal.mid(headerBytes), rbsp)) continue;
+        const Smpte12mTimecode timecode = extractFromSeiRbsp(rbsp, codec, context);
         if (timecode.valid) return timecode;
     }
     return {};

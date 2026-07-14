@@ -58,6 +58,10 @@ struct TimecodeParseResult {
     Smpte12mTimecode timecode;
 };
 
+// Decode an EBSP into an RBSP while validating emulation-prevention bytes.
+// A prevention byte must have a following byte in the reserved 0x00..0x03 range.
+bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
+
 // Internal parser seam shared by the public Annex-B extractor. It returns a
 // typed status so a short/reserved payload can never leak a partially filled label.
 TimecodeParseResult parseH264PicTiming(const QByteArray& payload, const H264TimingSyntax& syntax);
