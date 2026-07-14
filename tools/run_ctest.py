@@ -113,24 +113,6 @@ def prepare_windows_runtime(
     return env, ctest
 
 
-def _force_noninteractive(args: Sequence[str]) -> list[str]:
-    sanitized: list[str] = []
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--interactive-debug-mode":
-            index += 1
-            if index < len(args) and not args[index].startswith("-"):
-                index += 1
-            continue
-        if arg.startswith("--interactive-debug-mode="):
-            index += 1
-            continue
-        sanitized.append(arg)
-        index += 1
-    return [*sanitized, "--interactive-debug-mode", "0"]
-
-
 def _set_windows_error_mode() -> int:
     flags = (
         _SEM_FAILCRITICALERRORS
@@ -148,7 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     build_dir = find_build_directory(args, Path.cwd())
     env, ctest = prepare_windows_runtime(build_dir, os.environ)
-    command = [str(ctest), *_force_noninteractive(args)]
+    command = [str(ctest), *args, "--interactive-debug-mode", "0"]
     old_mode = _set_windows_error_mode()
     try:
         return subprocess.run(command, env=env, check=False).returncode

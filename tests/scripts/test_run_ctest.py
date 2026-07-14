@@ -215,27 +215,28 @@ class RunCtestTests(unittest.TestCase):
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=17)
     @mock.patch("tools.run_ctest.subprocess.run")
-    def test_main_forces_noninteractive_after_hostile_caller_options(
+    def test_main_preserves_hostile_arguments_and_appends_final_zero(
         self,
         run: mock.Mock,
         set_error_mode: mock.Mock,
         restore_error_mode: mock.Mock,
     ):
         run.return_value = subprocess.CompletedProcess([], 0)
+        caller_args = [
+            "--interactive-debug-mode",
+            "1",
+            "--test-dir",
+            str(self.build_dir),
+            "-R",
+            "--interactive-debug-mode=1",
+            "--interactive-debug-mode=1",
+            "--interactive-debug-mode",
+            "1",
+            "-L",
+            "unit",
+        ]
 
-        result = run_ctest.main(
-            [
-                "--interactive-debug-mode",
-                "1",
-                "--test-dir",
-                str(self.build_dir),
-                "--interactive-debug-mode=1",
-                "--interactive-debug-mode",
-                "1",
-                "-L",
-                "unit",
-            ]
-        )
+        result = run_ctest.main(caller_args)
 
         self.assertEqual(result, 0)
         command = run.call_args.args[0]
@@ -243,10 +244,7 @@ class RunCtestTests(unittest.TestCase):
             command,
             [
                 str(self.ctest),
-                "--test-dir",
-                str(self.build_dir),
-                "-L",
-                "unit",
+                *caller_args,
                 "--interactive-debug-mode",
                 "0",
             ],
@@ -258,6 +256,33 @@ class RunCtestTests(unittest.TestCase):
         )
         set_error_mode.assert_called_once_with()
         restore_error_mode.assert_called_once_with(17)
+
+    @mock.patch("tools.run_ctest._restore_windows_error_mode")
+    @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=13)
+    @mock.patch("tools.run_ctest.subprocess.run")
+    def test_main_preserves_interactive_spelling_as_test_dir_value(
+        self,
+        run: mock.Mock,
+        set_error_mode: mock.Mock,
+        restore_error_mode: mock.Mock,
+    ):
+        run.return_value = subprocess.CompletedProcess([], 0)
+        named_build_dir = self.root / "--interactive-debug-mode=1"
+        named_build_dir.mkdir()
+        self.build_dir = named_build_dir
+        self.write_cache()
+        caller_args = ["--test-dir", "--interactive-debug-mode=1"]
+
+        with mock.patch.object(run_ctest.Path, "cwd", return_value=self.root):
+            result = run_ctest.main(caller_args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(self.ctest), *caller_args, "--interactive-debug-mode", "0"],
+        )
+        set_error_mode.assert_called_once_with()
+        restore_error_mode.assert_called_once_with(13)
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=41)
