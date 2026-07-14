@@ -69,6 +69,7 @@ public:
     }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_fence; }
+    GpuFrameSynchronization gpuSynchronization() const override { return {m_fence, 1, true}; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
     int readbackCount() const { return readCount.load(std::memory_order_acquire); }
 

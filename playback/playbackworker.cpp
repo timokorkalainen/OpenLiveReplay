@@ -1454,17 +1454,19 @@ void PlaybackWorker::handleGpuDeviceLoss() {
 #ifdef _WIN32
         if (m_winGpuImportEdge) (void) m_winGpuImportEdge->deviceLost();
 #endif
-        const auto deadTokens = GpuDeviceLossMonitor::instance().realLossTokens();
+        auto& lossMonitor = GpuDeviceLossMonitor::instance();
+        GpuRetireRegistry registry;
+        GpuValidatedLossResult recovery =
+            lossMonitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains& deadDomains) {
+                return registry.abandonAllNoWait(deadDomains);
+            });
+        if (recovery.status == GpuValidatedLossStatus::Rejected) {
+            recovery = lossMonitor.withCoordinatedTokenlessRecovery([&]() { return qsizetype(0); });
+        }
+        if (recovery.coordinatorLeader) registry.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
 #ifdef OLR_UNIT_TEST
-        const qsizetype abandoned = GpuRetireRegistry{}.abandonAllNoWait(deadTokens);
-        m_gpuLastAbandonedRetainsForTest.store(abandoned, std::memory_order_release);
-#else
-        GpuRetireRegistry{}.abandonAllNoWait(deadTokens);
+        m_gpuLastAbandonedRetainsForTest.store(recovery.abandoned, std::memory_order_release);
 #endif
-        // Other live device domains remain in the registry. Drain those under
-        // one total deadline; the token authorizes no-wait release only for its
-        // matching dead-device domain.
-        GpuRetireRegistry{}.drainWithBoundedWait(kDeviceLossReadbackDrainMs);
     }
 
     // LOCK RULE: this method is entered from the worker decode thread with no
@@ -2259,9 +2261,7 @@ void PlaybackWorker::collectEvictedGpuFramesLocked(
 }
 
 void PlaybackWorker::collectEvictedGpuFrameLocked(const FrameHandle& frame) {
-    const auto renderFence = std::atomic_load_explicit(&m_renderFence, std::memory_order_acquire);
-    if (!renderFence) return;
-    m_gpuFrameRetireQueue.collect(frame, renderFence);
+    m_gpuFrameRetireQueue.collect(frame);
 }
 
 void PlaybackWorker::drainEvictedGpuFrames() {
@@ -2720,8 +2720,8 @@ int64_t PlaybackWorker::decodePacketIntoBank(AVPacket* pkt, AVFrame* vf, AVFrame
                     return cfg.surfaceBytes();
                 };
                 auto collectEvictedGpuFrameForCommit = [&](const FrameHandle& frame) {
-                    if (!retireQueueForCommit || !renderFenceForCommit) return;
-                    retireQueueForCommit->collect(frame, renderFenceForCommit);
+                    if (!retireQueueForCommit) return;
+                    retireQueueForCommit->collect(frame);
                 };
                 auto collectEvictedTrackFramesForCommit =
                     [&](const TrackBuffer::EvictedFrames& evictedFrames) {

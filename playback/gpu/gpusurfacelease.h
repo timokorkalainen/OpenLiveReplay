@@ -31,16 +31,20 @@ public:
 
     Provenance provenance() const { return m_provenance; }
     uint64_t observedGeneration() const { return m_generation; }
+    uint64_t authorityEpoch() const { return m_authorityEpoch; }
     uintptr_t deviceDomainId() const { return m_deviceDomainId; }
 
 private:
     friend class GpuDeviceLossMonitor;
-    DeadDeviceToken(Provenance provenance, uint64_t generation, uintptr_t deviceDomainId)
-        : m_provenance(provenance), m_generation(generation), m_deviceDomainId(deviceDomainId) {}
+    DeadDeviceToken(Provenance provenance, uint64_t generation, uintptr_t deviceDomainId,
+                    uint64_t authorityEpoch)
+        : m_provenance(provenance), m_generation(generation), m_deviceDomainId(deviceDomainId),
+          m_authorityEpoch(authorityEpoch) {}
 
     Provenance m_provenance;
     uint64_t m_generation;
     uintptr_t m_deviceDomainId = 0;
+    uint64_t m_authorityEpoch = 0;
 };
 
 // A self-contained synchronous snapshot. Metadata is copied and the native backing

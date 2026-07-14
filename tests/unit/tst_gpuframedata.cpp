@@ -27,6 +27,7 @@ private slots:
     void waitForPendingFenceUsesProducerFence();
     void exactFenceWaitIgnoresOtherTimelineWatermark();
     void exactFenceWaitHandlesZeroAndRejectsMissingFence();
+    void frameDataExposesOneExactProducerSynchronizationPair();
     void droppingGpuHandleCreditsBudget();
 #ifdef __APPLE__
     void gpuPresentabilityDoesNotReadBack();
@@ -178,6 +179,23 @@ void TestGpuFrameData::exactFenceWaitHandlesZeroAndRejectsMissingFence() {
 
     GpuFrameData mismatchedPair(surface, nullptr, FramePixelFormat::Nv12, {}, nullptr, {}, 0, 1);
     QVERIFY(!mismatchedPair.waitForPendingFence(0));
+}
+
+void TestGpuFrameData::frameDataExposesOneExactProducerSynchronizationPair() {
+    auto firstFence = std::make_shared<DeferredFence>();
+    auto secondFence = std::make_shared<DeferredFence>();
+    auto surface = std::make_shared<TestSurface>();
+    const uint64_t firstValue = firstFence->signal();
+    for (int i = 0; i < 4; ++i)
+        (void) secondFence->signal();
+    surface->retainUntilFenceRetired(4);
+
+    GpuFrameData data(surface, nullptr, FramePixelFormat::Nv12, {}, firstFence, {}, 0, firstValue);
+    const GpuFrameSynchronization synchronization = data.gpuSynchronization();
+    QCOMPARE(synchronization.fence, firstFence);
+    QCOMPARE(synchronization.value, firstValue);
+    QVERIFY(synchronization.isExact());
+    QVERIFY(synchronization.value != surface->pendingFenceValue());
 }
 
 void TestGpuFrameData::droppingGpuHandleCreditsBudget() {
@@ -446,7 +464,7 @@ void TestGpuFrameData::readbackRetainsSurfaceWhenEvictionSawNoPendingFence() {
     surface.reset();
 
     GpuFrameRetireQueue preReadbackRetireQueue;
-    preReadbackRetireQueue.collect(handle, renderFence);
+    preReadbackRetireQueue.collect(handle);
     QCOMPARE(preReadbackRetireQueue.size(), 0);
 
     QVERIFY(handle.readToCpu(FramePixelFormat::Yuv420p).isValid());

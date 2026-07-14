@@ -28,6 +28,10 @@ public:
     CpuPlanes cachedCpuPlanes(FramePixelFormat target) const override;
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_renderFence; }
+    GpuFrameSynchronization gpuSynchronization() const override {
+        if (m_renderFenceValue == 0) return {nullptr, 0, true};
+        return {m_renderFence, m_renderFenceValue, true};
+    }
     FramePixelFormat nativeFormat() const override { return m_nativeFormat; }
     std::shared_ptr<GpuSurface> surfacePtr() const { return m_surface; }
     bool waitForPendingFence(int timeoutMs) const;

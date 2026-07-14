@@ -75,27 +75,31 @@ private:
 
 class RetireFrameData final : public IFrameData {
 public:
-    explicit RetireFrameData(std::shared_ptr<RetireSurface> surface)
-        : m_surface(std::move(surface)) {}
+    RetireFrameData(std::shared_ptr<RetireSurface> surface, std::shared_ptr<GpuFence> fence,
+                    uint64_t value)
+        : m_surface(std::move(surface)), m_synchronization{std::move(fence), value, true} {}
 
     bool isGpuBacked() const override { return true; }
     CpuPlanes readToCpu(FramePixelFormat) const override { return {}; }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
+    GpuFrameSynchronization gpuSynchronization() const override { return m_synchronization; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
 
 private:
     std::shared_ptr<RetireSurface> m_surface;
+    GpuFrameSynchronization m_synchronization;
 };
 
-FrameHandle retireGpuFrame(uint64_t pendingFence) {
+FrameHandle retireGpuFrame(uint64_t pendingFence, const std::shared_ptr<GpuFence>& fence) {
     FrameMetadata meta;
     meta.key.feedIndex = 0;
     meta.key.ptsMs = qint64(pendingFence);
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 4;
     meta.key.height = 4;
-    return FrameHandle(
-        std::make_shared<RetireFrameData>(std::make_shared<RetireSurface>(pendingFence)), meta);
+    return FrameHandle(std::make_shared<RetireFrameData>(
+                           std::make_shared<RetireSurface>(pendingFence), fence, pendingFence),
+                       meta);
 }
 
 class ScopedEnv {
@@ -168,8 +172,8 @@ void TestStagingFence::shutdownForceDrainsGpuRetireQueueBeforeDroppingFence() {
     auto fence = std::make_shared<CompletingFence>();
 
     worker.m_renderFence = fence;
-    worker.m_gpuFrameRetireQueue.collect(retireGpuFrame(1), fence);
-    worker.m_gpuFrameRetireQueue.collect(retireGpuFrame(2), fence);
+    worker.m_gpuFrameRetireQueue.collect(retireGpuFrame(1, fence));
+    worker.m_gpuFrameRetireQueue.collect(retireGpuFrame(2, fence));
     QCOMPARE(worker.m_gpuFrameRetireQueue.size(), 2);
 
     worker.shutdownOutputGraph();
@@ -185,7 +189,7 @@ void TestStagingFence::forceDrainDropsUnretiredFramesAfterBoundedFenceFailure() 
     auto fence = std::make_shared<FailingFence>();
 
     worker.m_renderFence = fence;
-    worker.m_gpuFrameRetireQueue.collect(retireGpuFrame(1), fence);
+    worker.m_gpuFrameRetireQueue.collect(retireGpuFrame(1, fence));
 
     worker.forceDrainEvictedGpuFrames();
 
@@ -200,7 +204,7 @@ void TestStagingFence::repeatedPublishDoesNotRetireUnchangedSnapshot() {
 
     worker.m_renderFence = fence;
     worker.m_outputCache = std::make_unique<OutputFrameCache>(1, 4, 4);
-    worker.m_outputCache->insertVideoFrame(retireGpuFrame(1));
+    worker.m_outputCache->insertVideoFrame(retireGpuFrame(1, fence));
 
     {
         QMutexLocker locker(&worker.m_bufferMutex);

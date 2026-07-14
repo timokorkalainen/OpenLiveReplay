@@ -106,8 +106,9 @@ GpuMintResult mintGpuOrDegrade(std::shared_ptr<GpuSurface> surface,
                 const auto result = operation.submit(
                     adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{s}));
                 if (!result.succeeded()) return FrameHandle{};
-                return makeGpuFrameHandle(std::move(s), std::move(rhi), m, std::move(renderFence),
-                                          result.fenceValue, std::move(charge));
+                return makeGpuFrameHandle(std::move(s), std::move(rhi), m,
+                                          std::move(result.producerFence), result.fenceValue,
+                                          std::move(charge));
             }
             return makeGpuFrameHandle(std::move(s), std::move(rhi), m, std::move(renderFence),
                                       std::move(charge));

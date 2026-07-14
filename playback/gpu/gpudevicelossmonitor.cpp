@@ -48,17 +48,19 @@ uint64_t GpuDeviceLossMonitor::publishRealDeviceLoss(DeadDeviceToken::Provenance
         // tokenless submission failure identifies where submission first failed,
         // but it is not authority to reject later driver proof from another owned
         // domain. Accept every current-authority observation in this loss epoch.
-        const DeadDeviceToken token(provenance, generation, deviceDomainId);
+        const DeadDeviceToken token(provenance, generation, deviceDomainId, m_deviceAuthorityEpoch);
         m_realLossTokens.push_back(token);
+        ++m_realLossRevision;
         if (!m_realLossToken) m_realLossToken = token;
         return generation;
     }
 
     const uint64_t generation = GpuGenerationCounter::instance().bump();
     m_lossGeneration.store(generation, std::memory_order_release);
-    const DeadDeviceToken token(provenance, generation, deviceDomainId);
+    const DeadDeviceToken token(provenance, generation, deviceDomainId, m_deviceAuthorityEpoch);
     m_realLossToken = token;
     m_realLossTokens = {token};
+    ++m_realLossRevision;
     m_lossCount.fetch_add(1, std::memory_order_acq_rel);
     m_undrained.fetch_add(1, std::memory_order_acq_rel);
     m_lost.store(true, std::memory_order_release);
@@ -103,6 +105,7 @@ bool GpuDeviceLossMonitor::consumeLossEvent() {
 void GpuDeviceLossMonitor::beginRebuild() {
     std::lock_guard<std::mutex> lock(m_epochMutex);
     if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+    m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
     m_rebuildInProgress = true;
 }
 
@@ -111,16 +114,19 @@ void GpuDeviceLossMonitor::clearForRebuild() {
     // Preserve compatibility with direct clear callers while allowing production
     // rebuilds to mint replacement-device authority between begin and commit.
     if (!m_rebuildInProgress && ++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+    m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
     m_rebuildInProgress = false;
     m_lost.store(false, std::memory_order_release);
     m_lossGeneration.store(0, std::memory_order_release);
     m_realLossToken.reset();
     m_realLossTokens.clear();
+    m_realLossRevision = 0;
 }
 
 void GpuDeviceLossMonitor::reset() {
     std::lock_guard<std::mutex> lock(m_epochMutex);
     if (++m_deviceAuthorityEpoch == 0) ++m_deviceAuthorityEpoch;
+    m_publishedDeviceAuthorityEpoch.store(m_deviceAuthorityEpoch, std::memory_order_release);
     m_rebuildInProgress = false;
     m_lost.store(false, std::memory_order_release);
     m_lossCount.store(0, std::memory_order_release);
@@ -128,4 +134,8 @@ void GpuDeviceLossMonitor::reset() {
     m_lossGeneration.store(0, std::memory_order_release);
     m_realLossToken.reset();
     m_realLossTokens.clear();
+    m_realLossRevision = 0;
+#ifdef OLR_UNIT_TEST
+    GpuRecoveryCoordinator::instance().resetForTest();
+#endif
 }

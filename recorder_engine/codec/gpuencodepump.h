@@ -23,15 +23,15 @@ public:
     using PacketSink = std::function<void(const QByteArray& data, int64_t ptsTicks, bool keyframe)>;
     using FailureSink = std::function<void()>;
 
-    GpuEncodePump(NativeVideoEncoder* encoder, std::shared_ptr<GpuFence> fence, int maxQueue = 4,
+    GpuEncodePump(NativeVideoEncoder* encoder, int maxQueue = 4,
                   std::mutex* encoderMutex = nullptr);
     ~GpuEncodePump();
 
     GpuEncodePump(const GpuEncodePump&) = delete;
     GpuEncodePump& operator=(const GpuEncodePump&) = delete;
 
-    bool submit(FrameHandle frame, uint64_t fenceValue, int64_t ptsTicks, ColorMetadata color,
-                PacketSink onPacket, FailureSink onFailure = FailureSink{});
+    bool submit(FrameHandle frame, int64_t ptsTicks, ColorMetadata color, PacketSink onPacket,
+                FailureSink onFailure = FailureSink{});
 
     void start();
     void stop();
@@ -43,7 +43,7 @@ public:
 private:
     struct Job {
         FrameHandle frame;
-        uint64_t fenceValue = 0;
+        GpuFrameSynchronization synchronization;
         int64_t ptsTicks = 0;
         ColorMetadata color;
         PacketSink onPacket;
@@ -56,7 +56,6 @@ private:
 
     NativeVideoEncoder* m_encoder = nullptr;
     std::mutex* m_encoderMutex = nullptr;
-    std::shared_ptr<GpuFence> m_fence;
     int m_maxQueue = 4;
     std::thread m_thread;
     mutable std::mutex m_mutex;

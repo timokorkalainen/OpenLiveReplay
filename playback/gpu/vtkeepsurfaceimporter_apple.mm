@@ -36,6 +36,7 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
     if (meta.key.width <= 0) meta.key.width = desc.width;
     if (meta.key.height <= 0) meta.key.height = desc.height;
     uint64_t renderFenceValue = 0;
+    std::shared_ptr<GpuFence> exactRenderFence;
     if (renderFence) {
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
@@ -43,9 +44,10 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
         const auto result = operation.submit(
             adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
         if (!result.succeeded()) return FrameHandle{};
+        exactRenderFence = result.producerFence;
         renderFenceValue = result.fenceValue;
     }
-    return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence),
+    return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(exactRenderFence),
                               renderFenceValue, std::move(*charge));
 }
 

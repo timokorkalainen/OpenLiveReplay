@@ -5,23 +5,17 @@
 
 #include <utility>
 
-void GpuFrameRetireQueue::collect(FrameHandle frame, std::shared_ptr<GpuFence> fence) {
-    if (!fence) return;
+void GpuFrameRetireQueue::collect(FrameHandle frame) {
     if (!frame.isGpuBacked() || !frame.data()) return;
-
-    GpuSurface* surface = frame.data()->gpuSurface();
-    if (!surface) return;
-
-    const uint64_t fenceValue = surface->pendingFenceValue();
-    if (fenceValue == 0) return;
-
-    m_entries.append(Entry{std::move(frame), std::move(fence), fenceValue});
+    GpuFrameSynchronization synchronization = frame.data()->gpuSynchronization();
+    if (!synchronization.isExact() || synchronization.value == 0) return;
+    m_entries.append(
+        Entry{std::move(frame), std::move(synchronization.fence), synchronization.value});
 }
 
-void GpuFrameRetireQueue::collect(const QVector<FrameHandle>& frames,
-                                  std::shared_ptr<GpuFence> fence) {
+void GpuFrameRetireQueue::collect(const QVector<FrameHandle>& frames) {
     for (const FrameHandle& frame : frames)
-        collect(frame, fence);
+        collect(frame);
 }
 
 int GpuFrameRetireQueue::drain(int timeoutMs, int* stalls, int maxWaits) {

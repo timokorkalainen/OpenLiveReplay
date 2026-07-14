@@ -43,6 +43,7 @@ enum class GpuRetirementDisposition : uint8_t { None, Published, Quarantined };
 struct GpuSubmissionResult {
     GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
     GpuRetirementDisposition retirement = GpuRetirementDisposition::None;
+    std::shared_ptr<GpuFence> producerFence;
     uint64_t fenceValue = 0;
 
     bool driverAccepted() const noexcept { return outcome != GpuSubmitOutcome::NotSubmitted; }

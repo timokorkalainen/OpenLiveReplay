@@ -8,7 +8,7 @@
 #include <memory>
 #include <vector>
 
-class DeadDeviceToken;
+class GpuValidatedDeadDomains;
 class GpuFence;
 class GpuRetireRegistry;
 class GpuRetirementTicket;
@@ -67,8 +67,7 @@ private:
     static void release(const GpuRetirePreparedHandle& prepared) noexcept;
     static void drainCompleted();
     static qsizetype pendingCount() noexcept;
-    static qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice);
-    static qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices);
+    static qsizetype abandonAllNoWait(const GpuValidatedDeadDomains& deadDomains);
     static int drainWithBoundedWait(int totalTimeoutMs);
     static GpuRetireMetricsSnapshot diagnosticsSnapshot() noexcept;
     static qsizetype highWaterMark() noexcept;

@@ -27,12 +27,10 @@ bool waitForNativeGpuProducer(const FrameHandle& frame) {
     GpuSurface* surface = data ? data->gpuSurface() : nullptr;
     if (!surface) return false;
 
-    const std::shared_ptr<GpuFence> fence = data->gpuFence();
-    if (!fence) return false;
-
-    const uint64_t pendingFenceValue = surface->pendingFenceValue();
-    if (pendingFenceValue == 0) return false;
-    return fence->wait(pendingFenceValue, kGpuSubmitFenceTimeoutMs);
+    const GpuFrameSynchronization synchronization = data->gpuSynchronization();
+    if (!synchronization.isExact()) return false;
+    if (synchronization.value == 0) return true;
+    return synchronization.fence->wait(synchronization.value, kGpuSubmitFenceTimeoutMs);
 }
 
 QByteArray st2110EssenceForFrame(const OutputBusFrame& frame) {

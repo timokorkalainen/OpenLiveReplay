@@ -13,6 +13,7 @@
 #include "playback/gpu/gpusubmission.h"
 
 class DeadDeviceToken;
+class GpuValidatedDeadDomains;
 class GpuFence;
 class GpuOpScope;
 class GpuSurface;
@@ -42,8 +43,7 @@ class GpuRetireRegistry final {
 public:
     void drainCompleted() const;
     qsizetype pendingRetainCount() const;
-    qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice) const;
-    qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) const;
+    qsizetype abandonAllNoWait(const GpuValidatedDeadDomains& deadDomains) const;
     int drainWithBoundedWait(int totalTimeoutMs) const;
     GpuRetireDiagnostics diagnostics() const;
 

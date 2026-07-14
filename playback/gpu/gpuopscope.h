@@ -43,12 +43,16 @@ public:
                       "GPU backend adapters must be noexcept and return GpuSubmitOutcome");
 
         GpuSubmissionResult result;
-        if (m_state != State::Ready || !m_fence) return result;
+        if (m_state != State::Ready || !m_fence || GpuDeviceLossMonitor::instance().isLost())
+            return result;
         m_state = State::Consumed;
         auto allocationPhase = m_registry.beginAllocationScope();
 
         const uint64_t generation = GpuGenerationCounter::instance().current();
         const GpuFenceIdentity preparedFence = m_fence->identity();
+        if (!GpuDeviceLossMonitor::instance().isCurrentDeviceAuthority(
+                preparedFence.authorityEpoch))
+            return result;
         std::array<GpuSurfaceCompatibility, N> compatibilities{};
         std::array<size_t, N> uniqueIndices{};
         std::optional<std::array<std::shared_ptr<GpuSurface>, N>> coalescedOwners;
@@ -116,6 +120,7 @@ public:
                 }
                 if (exact && m_registry.publishPrepared(prepared, std::move(*ticket))) {
                     result.retirement = GpuRetirementDisposition::Published;
+                    result.producerFence = m_fence;
                     result.fenceValue = m_fenceValue = ticketValue;
                 } else {
                     m_registry.quarantinePrepared(prepared);

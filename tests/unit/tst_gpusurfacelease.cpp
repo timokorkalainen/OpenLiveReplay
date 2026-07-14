@@ -77,6 +77,16 @@ struct GpuRetirementTicketTestAuthority {
 };
 
 struct GpuRetireRegistryTestAuthority {
+    static qsizetype abandon(const GpuRetireRegistry& registry, const DeadDeviceToken& token) {
+        const std::vector<DeadDeviceToken> tokens{token};
+        const GpuValidatedDeadDomains domains(tokens);
+        return registry.abandonAllNoWait(domains);
+    }
+    static qsizetype abandon(const GpuRetireRegistry& registry,
+                             const std::vector<DeadDeviceToken>& tokens) {
+        const GpuValidatedDeadDomains domains(tokens);
+        return registry.abandonAllNoWait(domains);
+    }
     static void registerRetire(const GpuRetireRegistry& registry,
                                std::shared_ptr<GpuSurface> surface, GpuRetirementTicket ticket) {
         registry.registerRetire(std::move(surface), std::move(ticket));
@@ -102,6 +112,10 @@ struct GpuRetireRegistryTestAuthority {
 #endif
 
 namespace {
+
+uint64_t currentDeviceAuthority() {
+    return GpuDeviceLossMonitorTestAuthority::capture();
+}
 
 // SFINAE probe: is `s.nativeHandle()` well-formed from a non-friend context? Access
 // checking is part of substitution (CWG1170), so a protected member yields a soft
@@ -152,7 +166,9 @@ static_assert(!std::is_move_assignable<GpuRetirementTicket>::value,
 // mirroring the production surfaces, so the ONLY way the test reads it is via a lease.
 class FakeLeaseSurface : public GpuSurface {
 public:
-    FakeLeaseSurface(void* handle, bool valid, GpuSurfaceCompatibility compatibility = {})
+    FakeLeaseSurface(void* handle, bool valid,
+                     GpuSurfaceCompatibility compatibility =
+                         GpuSurfaceCompatibility{0xF0, currentDeviceAuthority()})
         : m_handle(handle), m_valid(valid), m_compatibility(compatibility) {}
     GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 16, 0}; }
     bool isValid() const override { return m_valid; }
@@ -170,7 +186,9 @@ private:
 // Fence with a test-controllable completed watermark.
 class FakeFence : public GpuFence {
 public:
-    explicit FakeFence(uintptr_t deviceDomainId = 0xF0, uint64_t authorityEpoch = 1)
+    explicit FakeFence(uintptr_t deviceDomainId = 0xF0)
+        : GpuFence(deviceDomainId, currentDeviceAuthority()) {}
+    FakeFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
         : GpuFence(deviceDomainId, authorityEpoch) {}
     uint64_t signal() override {
         ++m_signalCalls;
@@ -273,7 +291,9 @@ uint64_t registerLegacyRetire(const GpuRetireRegistry& registry,
 
 class ZeroSignalFence final : public GpuFence {
 public:
-    explicit ZeroSignalFence(uintptr_t deviceDomainId = 0, uint64_t authorityEpoch = 1)
+    explicit ZeroSignalFence(uintptr_t deviceDomainId = 0)
+        : GpuFence(deviceDomainId, currentDeviceAuthority()) {}
+    ZeroSignalFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
         : GpuFence(deviceDomainId, authorityEpoch) {}
     uint64_t signal() override {
         ++m_signalCalls;
@@ -417,7 +437,8 @@ struct DiagnosticsShardHandoff {
 
 void handoffQuarantineBetweenShards(void* opaque) noexcept {
     auto& handoff = *static_cast<DiagnosticsShardHandoff*>(opaque);
-    handoff.released = handoff.registry->abandonAllNoWait(*handoff.oldDomainToken);
+    handoff.released =
+        GpuRetireRegistryTestAuthority::abandon(*handoff.registry, *handoff.oldDomainToken);
     FakeBackendAdapter adapter;
     GpuOpScope operation(handoff.newFence, *handoff.registry);
     handoff.submitted = operation.submit(
@@ -580,6 +601,7 @@ QString childProcessDiagnostic(const ChildProcessResult& result) {
 class TestGpuSurfaceLease : public QObject {
     Q_OBJECT
 private slots:
+    void cleanup();
     void callbackLeaseExposesMetadataOnly();
     void callbackLeaseReportsInvalidSurface();
     void withReadCompletesScope();
@@ -595,13 +617,13 @@ private slots:
     void preparedFenceGroupSurvivesDrainCancelAndRejectsStaleToken();
     void multiNodePreparedBatchRejectsStaleAbaToken();
     void duplicateFenceValuesRemainOneExactFenceGroup();
-    void preparedFenceGroupOwnsOneFenceReference();
+    void preparedFenceGroupAndResultOwnExactFenceReferences();
     void shardedRegistryQueriesEachFenceOncePerDrain();
     void fullShardDistinctFencesDrainInLinearOperations();
     void shardedRegistryConcurrentPublishAndDrainIsExact();
     void boundedWaitRePollsPartialProgressAfterTimeout();
     void diagnosticsSnapshotIsExactAcrossDeterministicShardHandoff();
-    void diagnosticsRemainConsistentDuringPublishAndAbandon();
+    void diagnosticsRemainConsistentDuringValidatedAbandon();
     void preparedPoolExhaustionRejectsBeforeDriverAcceptance();
     void multiNodePoolExhaustionIsAllOrNothing();
     void fusedSubmissionRejectsIncompatibleEvidenceBeforeCallback();
@@ -631,11 +653,19 @@ private slots:
     void zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade();
     void deadTokenAbandonsOnlyMatchingDeviceDomain();
     void multipleDeadTokensAbandonInOnePass();
+    void copiedLossEvidenceCannotAbandonSameDomainReplacementAuthority();
+    void authoritativeLossRejectsLateSubmissionAndAbandonsPreLossRecord();
+    void staleCoherentAuthorityIsRejectedAfterRebuild();
     void submissionBoundaryRejectsEachMismatchBeforeCallback();
     void retirementTicketRejectsEachIsolatedMutation();
     void retirementTicketCopyIsImmutableAndKeepsAuthority();
     void forgedOldCompletedValueIsRejected();
 };
+
+void TestGpuSurfaceLease::cleanup() {
+    GpuDeviceLossMonitor::instance().reset();
+    GpuGenerationCounter::instance().resetForTest();
+}
 
 void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
     auto sentinel = reinterpret_cast<void*>(0xBEEF);
@@ -651,6 +681,133 @@ void TestGpuSurfaceLease::callbackLeaseExposesMetadataOnly() {
     }
 }
 
+void TestGpuSurfaceLease::copiedLossEvidenceCannotAbandonSameDomainReplacementAuthority() {
+    constexpr uintptr_t deviceDomain = 0x5A11;
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    GpuRetireRegistry registry;
+    const uint64_t oldAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+
+    auto oldFence = std::make_shared<ZeroSignalFence>(deviceDomain, oldAuthority);
+    auto oldSurface =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5A110), true,
+                                           GpuSurfaceCompatibility{deviceDomain, oldAuthority});
+    FakeBackendAdapter adapter;
+    GpuOpScope oldOperation(oldFence, registry);
+    QCOMPARE(oldOperation
+                 .submit(adapter,
+                         GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{oldSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Quarantined);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(oldAuthority, deviceDomain) != 0);
+    const std::vector<DeadDeviceToken> staleEvidence = monitor.realLossTokens();
+
+    monitor.beginRebuild();
+    const uint64_t replacementAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(replacementAuthority != oldAuthority);
+    monitor.clearForRebuild();
+    auto replacementFence = std::make_shared<ZeroSignalFence>(deviceDomain, replacementAuthority);
+    auto replacementSurface = std::make_shared<FakeLeaseSurface>(
+        reinterpret_cast<void*>(0x5A111), true,
+        GpuSurfaceCompatibility{deviceDomain, replacementAuthority});
+    GpuOpScope replacementOperation(replacementFence, registry);
+    QCOMPARE(replacementOperation
+                 .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{
+                                      replacementSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Quarantined);
+
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, staleEvidence), qsizetype(1));
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(1));
+    QVERIFY(replacementSurface.use_count() > 1);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(replacementAuthority, deviceDomain) != 0);
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, monitor.realLossTokens()),
+             qsizetype(1));
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::authoritativeLossRejectsLateSubmissionAndAbandonsPreLossRecord() {
+    constexpr uintptr_t deviceDomain = 0x5A12;
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    GpuRetireRegistry registry;
+    auto oldFence = std::make_shared<ZeroSignalFence>(deviceDomain, authority);
+    auto oldSurface = std::make_shared<FakeLeaseSurface>(
+        reinterpret_cast<void*>(0x5A120), true, GpuSurfaceCompatibility{deviceDomain, authority});
+    FakeBackendAdapter oldAdapter;
+    GpuOpScope oldOperation(oldFence, registry);
+    QCOMPARE(oldOperation
+                 .submit(oldAdapter,
+                         GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{oldSurface}))
+                 .retirement,
+             GpuRetirementDisposition::Quarantined);
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deviceDomain) != 0);
+
+    auto lateFence = std::make_shared<FakeFence>(deviceDomain, authority);
+    auto lateSurface = std::make_shared<FakeLeaseSurface>(
+        reinterpret_cast<void*>(0x5A121), true, GpuSurfaceCompatibility{deviceDomain, authority});
+    FakeBackendAdapter lateAdapter;
+    GpuOpScope lateOperation(lateFence, registry);
+    const GpuSubmissionResult late = lateOperation.submit(
+        lateAdapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{lateSurface}));
+    QCOMPARE(late.retirement, GpuRetirementDisposition::None);
+    QCOMPARE(lateAdapter.calls, 0);
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(1));
+
+    const GpuValidatedLossResult recovery = monitor.withValidatedDeadDomains(
+        [&](const GpuValidatedDeadDomains& domains) { return registry.abandonAllNoWait(domains); });
+    QCOMPARE(recovery.status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(recovery.abandoned, qsizetype(1));
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+}
+
+void TestGpuSurfaceLease::staleCoherentAuthorityIsRejectedAfterRebuild() {
+    constexpr uintptr_t deviceDomain = 0x5A13;
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    const uint64_t staleAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    monitor.beginRebuild();
+    const uint64_t replacementAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(replacementAuthority != staleAuthority);
+    monitor.clearForRebuild();
+
+    GpuRetireRegistry registry;
+    auto staleFence = std::make_shared<FakeFence>(deviceDomain, staleAuthority);
+    auto staleSurface =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5A130), true,
+                                           GpuSurfaceCompatibility{deviceDomain, staleAuthority});
+    FakeBackendAdapter staleAdapter;
+    GpuOpScope staleOperation(staleFence, registry);
+    const GpuSubmissionResult stale = staleOperation.submit(
+        staleAdapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{staleSurface}));
+    QCOMPARE(stale.retirement, GpuRetirementDisposition::None);
+    QCOMPARE(staleAdapter.calls, 0);
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
+
+    auto replacementFence = std::make_shared<FakeFence>(deviceDomain, replacementAuthority);
+    auto replacementSurface = std::make_shared<FakeLeaseSurface>(
+        reinterpret_cast<void*>(0x5A131), true,
+        GpuSurfaceCompatibility{deviceDomain, replacementAuthority});
+    FakeBackendAdapter replacementAdapter;
+    GpuOpScope replacementOperation(replacementFence, registry);
+    const GpuSubmissionResult replacement = replacementOperation.submit(
+        replacementAdapter,
+        GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{replacementSurface}));
+    QCOMPARE(replacement.retirement, GpuRetirementDisposition::Published);
+    QCOMPARE(replacementAdapter.calls, 1);
+    replacementFence->setCompleted(replacement.fenceValue);
+    registry.drainCompleted();
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
+}
+
 void TestGpuSurfaceLease::callbackLeaseReportsInvalidSurface() {
     auto surface =
         std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x1), /*valid=*/false);
@@ -663,7 +820,7 @@ void TestGpuSurfaceLease::callbackLeaseReportsInvalidSurface() {
 void TestGpuSurfaceLease::submissionBoundaryRejectsEachMismatchBeforeCallback() {
     GpuGenerationCounter::instance().resetForTest();
     constexpr uintptr_t preparedDomain = 0xD011;
-    constexpr uint64_t authorityEpoch = 9;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     const uint64_t generation = GpuGenerationCounter::instance().current();
     const GpuSurfaceCompatibility compatibility{preparedDomain, authorityEpoch};
     auto preparedFence = std::make_shared<FakeFence>(preparedDomain, authorityEpoch);
@@ -710,7 +867,7 @@ void TestGpuSurfaceLease::submissionBoundaryRejectsEachMismatchBeforeCallback() 
 void TestGpuSurfaceLease::retirementTicketRejectsEachIsolatedMutation() {
     GpuGenerationCounter::instance().resetForTest();
     constexpr uintptr_t domain = 0xD044;
-    constexpr uint64_t authorityEpoch = 19;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     const uint64_t generation = GpuGenerationCounter::instance().current();
     const GpuSurfaceCompatibility compatibility{domain, authorityEpoch};
     auto fence = std::make_shared<FakeFence>(domain, authorityEpoch);
@@ -759,7 +916,7 @@ void TestGpuSurfaceLease::retirementTicketRejectsEachIsolatedMutation() {
 void TestGpuSurfaceLease::retirementTicketCopyIsImmutableAndKeepsAuthority() {
     GpuGenerationCounter::instance().resetForTest();
     constexpr uintptr_t domain = 0xD055;
-    constexpr uint64_t authorityEpoch = 29;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     const uint64_t generation = GpuGenerationCounter::instance().current();
     const GpuSurfaceCompatibility compatibility{domain, authorityEpoch};
     auto fence = std::make_shared<FakeFence>(domain, authorityEpoch);
@@ -784,7 +941,7 @@ void TestGpuSurfaceLease::retirementTicketCopyIsImmutableAndKeepsAuthority() {
 void TestGpuSurfaceLease::forgedOldCompletedValueIsRejected() {
     GpuGenerationCounter::instance().resetForTest();
     constexpr uintptr_t domain = 0xF0123;
-    constexpr uint64_t authorityEpoch = 71;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     const uint64_t generation = GpuGenerationCounter::instance().current();
     const GpuSurfaceCompatibility compatibility{domain, authorityEpoch};
     auto fence = std::make_shared<FakeFence>(domain, authorityEpoch);
@@ -951,8 +1108,9 @@ void TestGpuSurfaceLease::surfaceOwnerSurvivesUntilLeaseDestruction() {
 void TestGpuSurfaceLease::boundedWaitDrainReleasesOnlyRetired() {
     // Track our own surface's shared ownership rather than the global count, so other
     // tests' retains cannot perturb the assertions.
-    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x2), /*valid=*/true,
-                                                      GpuSurfaceCompatibility{0xF0, 1});
+    auto surface =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x2), /*valid=*/true,
+                                           GpuSurfaceCompatibility{0xF0, currentDeviceAuthority()});
     auto fence = std::make_shared<FakeFence>();
     const long baseline = surface.use_count();
 
@@ -971,8 +1129,9 @@ void TestGpuSurfaceLease::boundedWaitDrainReleasesOnlyRetired() {
 }
 
 void TestGpuSurfaceLease::boundedWaitDoesNotHoldRetainerMutex() {
-    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x3), true,
-                                                      GpuSurfaceCompatibility{0xF0, 1});
+    auto surface =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x3), true,
+                                           GpuSurfaceCompatibility{0xF0, currentDeviceAuthority()});
     auto fence = std::make_shared<FakeFence>();
     fence->setRetireOnWait(true);
     GpuRetireRegistry registry;
@@ -985,8 +1144,9 @@ void TestGpuSurfaceLease::boundedWaitDoesNotHoldRetainerMutex() {
 void TestGpuSurfaceLease::registryDiagnosticsTrackHighWaterAndTimeouts() {
     GpuRetireRegistry registry;
     const GpuRetireDiagnostics before = registry.diagnostics();
-    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x4), true,
-                                                      GpuSurfaceCompatibility{0xF0, 1});
+    auto surface =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x4), true,
+                                           GpuSurfaceCompatibility{0xF0, currentDeviceAuthority()});
     auto fence = std::make_shared<FakeFence>();
     const uint64_t value = registerLegacyRetire(registry, surface, fence);
 
@@ -1003,9 +1163,10 @@ void TestGpuSurfaceLease::registryDiagnosticsTrackHighWaterAndTimeouts() {
 void TestGpuSurfaceLease::fusedSubmissionRejectsIncompatibleEvidenceBeforeCallback() {
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<FakeFence>(0x51, 5);
-    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5), true,
-                                                      GpuSurfaceCompatibility{0x52, 5});
+    auto fence = std::make_shared<FakeFence>(0x51, currentDeviceAuthority());
+    auto surface =
+        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5), true,
+                                           GpuSurfaceCompatibility{0x52, currentDeviceAuthority()});
     FakeBackendAdapter adapter;
 
     GpuOpScope operation(fence, registry);
@@ -1021,7 +1182,7 @@ void TestGpuSurfaceLease::fusedSubmissionRejectsIncompatibleEvidenceBeforeCallba
 
 void TestGpuSurfaceLease::fusedSubmissionRejectsThrowingEvidenceBeforeCallback() {
     GpuRetireRegistry registry;
-    auto fence = std::make_shared<FakeFence>(0x59, 5);
+    auto fence = std::make_shared<FakeFence>(0x59, currentDeviceAuthority());
     auto surface = std::make_shared<ThrowingEvidenceSurface>();
     FakeBackendAdapter adapter;
 
@@ -1038,8 +1199,9 @@ void TestGpuSurfaceLease::fusedSubmissionRejectsThrowingEvidenceBeforeCallback()
 void TestGpuSurfaceLease::fusedSubmissionCachesEvidenceBeforeCallback() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
-    auto fence = std::make_shared<FakeFence>(0x5A, 5);
-    auto surface = std::make_shared<SingleReadEvidenceSurface>(0x5A, 5);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x5A, authority);
+    auto surface = std::make_shared<SingleReadEvidenceSurface>(0x5A, authority);
     FakeBackendAdapter adapter;
 
     GpuOpScope operation(fence, registry);
@@ -1057,13 +1219,15 @@ void TestGpuSurfaceLease::fusedSubmissionCachesEvidenceBeforeCallback() {
 void TestGpuSurfaceLease::fusedSubmissionRejectsNullAtEveryPackPosition() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
-    auto fence = std::make_shared<FakeFence>(0x5B, 5);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x5B, authority);
     for (size_t nullPosition = 0; nullPosition < 4; ++nullPosition) {
         std::array<std::shared_ptr<GpuSurface>, 4> surfaces;
         for (size_t i = 0; i < surfaces.size(); ++i) {
             if (i != nullPosition)
-                surfaces[i] = std::make_shared<FakeLeaseSurface>(
-                    reinterpret_cast<void*>(0x5B0 + i), true, GpuSurfaceCompatibility{0x5B, 5});
+                surfaces[i] =
+                    std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5B0 + i), true,
+                                                       GpuSurfaceCompatibility{0x5B, authority});
         }
         FakeBackendAdapter adapter;
         GpuOpScope operation(fence, registry);
@@ -1080,11 +1244,12 @@ void TestGpuSurfaceLease::fusedSubmissionCoalescesDuplicateOwners() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<FakeFence>(0x5C, 5);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x5C, authority);
     auto first = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C0), true,
-                                                    GpuSurfaceCompatibility{0x5C, 5});
+                                                    GpuSurfaceCompatibility{0x5C, authority});
     auto second = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5C1), true,
-                                                     GpuSurfaceCompatibility{0x5C, 5});
+                                                     GpuSurfaceCompatibility{0x5C, authority});
     FakeBackendAdapter adapter;
     GpuOpScope operation(fence, registry);
     const auto result = operation.submit(
@@ -1104,9 +1269,10 @@ void TestGpuSurfaceLease::fusedSubmissionCancellationIsPreSubmitOnly() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<FakeFence>(0x5D, 5);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x5D, authority);
     auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x5D0), true,
-                                                      GpuSurfaceCompatibility{0x5D, 5});
+                                                      GpuSurfaceCompatibility{0x5D, authority});
     FakeBackendAdapter cancelledAdapter;
     GpuOpScope cancelled(fence, registry);
 
@@ -1140,11 +1306,12 @@ void TestGpuSurfaceLease::fusedSubmissionOneToFourSurfacesDoNotAllocate() {
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     GpuRetireRegistry::resetAllocationProbeForTest();
-    auto fence = std::make_shared<FakeFence>(0x61, 6);
-    const auto one = submitSurfaceCount<1>(registry, fence, 0x61, 6, 0x610);
-    const auto two = submitSurfaceCount<2>(registry, fence, 0x61, 6, 0x620);
-    const auto three = submitSurfaceCount<3>(registry, fence, 0x61, 6, 0x630);
-    const auto four = submitSurfaceCount<4>(registry, fence, 0x61, 6, 0x640);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x61, authority);
+    const auto one = submitSurfaceCount<1>(registry, fence, 0x61, authority, 0x610);
+    const auto two = submitSurfaceCount<2>(registry, fence, 0x61, authority, 0x620);
+    const auto three = submitSurfaceCount<3>(registry, fence, 0x61, authority, 0x630);
+    const auto four = submitSurfaceCount<4>(registry, fence, 0x61, authority, 0x640);
 
     for (const GpuSubmissionResult& result : {one, two, three, four}) {
         QCOMPARE(result.outcome, GpuSubmitOutcome::Submitted);
@@ -1166,11 +1333,12 @@ void TestGpuSurfaceLease::fusedSubmissionFifthOwnerSpillsToFixedPoolWithoutHeap(
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     GpuRetireRegistry::resetAllocationProbeForTest();
-    auto fence = std::make_shared<FakeFence>(0x71, 7);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x71, authority);
     std::array<std::shared_ptr<GpuSurface>, 5> surfaces;
     for (size_t i = 0; i < surfaces.size(); ++i)
         surfaces[i] = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x70 + i), true,
-                                                         GpuSurfaceCompatibility{0x71, 7});
+                                                         GpuSurfaceCompatibility{0x71, authority});
     FakeBackendAdapter adapter;
 
     GpuOpScope operation(fence, registry);
@@ -1194,10 +1362,11 @@ void TestGpuSurfaceLease::fusedSubmissionSupportsSixAndSeventeenOwnerBatches() {
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     GpuRetireRegistry::resetStorageProbeForTest();
-    auto fence = std::make_shared<FakeFence>(0x72, 7);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x72, authority);
 
-    const auto six = submitSurfaceCount<6>(registry, fence, 0x72, 7, 0x720);
-    const auto seventeen = submitSurfaceCount<17>(registry, fence, 0x72, 7, 0x730);
+    const auto six = submitSurfaceCount<6>(registry, fence, 0x72, authority, 0x720);
+    const auto seventeen = submitSurfaceCount<17>(registry, fence, 0x72, authority, 0x730);
 
     QCOMPARE(six.retirement, GpuRetirementDisposition::Published);
     QCOMPARE(seventeen.retirement, GpuRetirementDisposition::Published);
@@ -1217,11 +1386,13 @@ void TestGpuSurfaceLease::fusedSubmissionCoalescesDuplicatesAcrossNodeBoundaries
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<FakeFence>(0x73, 7);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x73, authority);
     std::array<std::shared_ptr<GpuSurface>, 8> surfaces;
     for (size_t i = 0; i < 6; ++i)
-        surfaces[i] = std::make_shared<FakeLeaseSurface>(
-            reinterpret_cast<void*>(uintptr_t(0x740 + i)), true, GpuSurfaceCompatibility{0x73, 7});
+        surfaces[i] =
+            std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(uintptr_t(0x740 + i)), true,
+                                               GpuSurfaceCompatibility{0x73, authority});
     surfaces[6] = surfaces[0];
     surfaces[7] = surfaces[5];
     FakeBackendAdapter adapter;
@@ -1243,9 +1414,10 @@ void TestGpuSurfaceLease::fusedSubmissionNotSubmittedReleasesPreparedOwners() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<FakeFence>(0x81, 8);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x81, authority);
     auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x81), true,
-                                                      GpuSurfaceCompatibility{0x81, 8});
+                                                      GpuSurfaceCompatibility{0x81, authority});
     const long ownersBefore = surface.use_count();
     FakeBackendAdapter adapter;
     adapter.outcome = GpuSubmitOutcome::NotSubmitted;
@@ -1268,9 +1440,10 @@ void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedOwners() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<FakeFence>(0x91, 9);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0x91, authority);
     auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x91), true,
-                                                      GpuSurfaceCompatibility{0x91, 9});
+                                                      GpuSurfaceCompatibility{0x91, authority});
     FakeBackendAdapter adapter;
 
     GpuOpScope operation(fence, registry);
@@ -1290,9 +1463,10 @@ void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedWithErrorOwners() {
     GpuDeviceLossMonitor::instance().reset();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
-    auto fence = std::make_shared<FakeFence>(0xA1, 10);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0xA1, authority);
     auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xA1), true,
-                                                      GpuSurfaceCompatibility{0xA1, 10});
+                                                      GpuSurfaceCompatibility{0xA1, authority});
     FakeBackendAdapter adapter;
     adapter.outcome = GpuSubmitOutcome::SubmittedWithError;
 
@@ -1315,12 +1489,13 @@ void TestGpuSurfaceLease::fusedSubmissionPublishesSubmittedWithErrorOwners() {
 void TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal() {
     GpuGenerationCounter::instance().resetForTest();
     GpuDeviceLossMonitor::instance().reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     const uint64_t failuresBefore = registry.diagnostics().signalFailureCount;
     auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xB1), true,
-                                                      GpuSurfaceCompatibility{0xB1, 11});
-    auto fence = std::make_shared<ZeroSignalFence>(0xB1, 11);
+                                                      GpuSurfaceCompatibility{0xB1, authority});
+    auto fence = std::make_shared<ZeroSignalFence>(0xB1, authority);
     FakeBackendAdapter adapter;
 
     GpuOpScope operation(fence, registry);
@@ -1338,11 +1513,10 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal() {
     QVERIFY(GpuDeviceLossMonitor::instance().isLost());
     QVERIFY(!GpuDeviceLossMonitor::instance().realLossToken().has_value());
 
-    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     GpuDeviceLossMonitorTestAuthority::publish(authority, 0xB1);
     const auto token = GpuDeviceLossMonitor::instance().realLossToken();
     QVERIFY(token.has_value());
-    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     GpuDeviceLossMonitor::instance().reset();
     GpuGenerationCounter::instance().resetForTest();
 }
@@ -1350,12 +1524,13 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesZeroSignal() {
 void TestGpuSurfaceLease::fusedSubmissionQuarantinesPostAcceptThrow() {
     GpuGenerationCounter::instance().resetForTest();
     GpuDeviceLossMonitor::instance().reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     GpuRetireRegistry registry;
     const qsizetype pendingBefore = registry.pendingRetainCount();
     auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xC1), true,
-                                                      GpuSurfaceCompatibility{0xC1, 12});
+                                                      GpuSurfaceCompatibility{0xC1, authority});
     const long ownersBefore = surface.use_count();
-    auto fence = std::make_shared<ThrowingSignalFence>(0xC1, 12);
+    auto fence = std::make_shared<ThrowingSignalFence>(0xC1, authority);
     FakeBackendAdapter adapter;
 
     GpuOpScope operation(fence, registry);
@@ -1369,11 +1544,10 @@ void TestGpuSurfaceLease::fusedSubmissionQuarantinesPostAcceptThrow() {
     QVERIFY(surface.use_count() > ownersBefore);
     QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
-    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     GpuDeviceLossMonitorTestAuthority::publish(authority, 0xC1);
     const auto token = GpuDeviceLossMonitor::instance().realLossToken();
     QVERIFY(token.has_value());
-    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     QCOMPARE(surface.use_count(), ownersBefore);
     GpuDeviceLossMonitor::instance().reset();
     GpuGenerationCounter::instance().resetForTest();
@@ -1392,11 +1566,13 @@ void TestGpuSurfaceLease::fusedMultiNodeFailureStatesCoverEveryOwner() {
     };
 
     {
-        auto fence = std::make_shared<FakeFence>(0xC2, 12);
+        const uint64_t authority = currentDeviceAuthority();
+        auto fence = std::make_shared<FakeFence>(0xC2, authority);
         FakeBackendAdapter adapter;
         GpuOpScope operation(fence, registry);
         QVERIFY(operation.cancel());
-        const auto result = operation.submit(adapter, GpuSurfacePack<6>(owners(0xC2, 12, 0xC200)));
+        const auto result =
+            operation.submit(adapter, GpuSurfacePack<6>(owners(0xC2, authority, 0xC200)));
         QCOMPARE(result.outcome, GpuSubmitOutcome::NotSubmitted);
         QCOMPARE(adapter.calls, 0);
         QCOMPARE(fence->signalCalls(), 0);
@@ -1404,12 +1580,14 @@ void TestGpuSurfaceLease::fusedMultiNodeFailureStatesCoverEveryOwner() {
 
     monitor.reset();
     {
+        const uint64_t authority = currentDeviceAuthority();
         const qsizetype pendingBefore = registry.pendingRetainCount();
-        auto fence = std::make_shared<FakeFence>(0xC3, 12);
+        auto fence = std::make_shared<FakeFence>(0xC3, authority);
         FakeBackendAdapter adapter;
         adapter.outcome = GpuSubmitOutcome::SubmittedWithError;
         GpuOpScope operation(fence, registry);
-        const auto result = operation.submit(adapter, GpuSurfacePack<6>(owners(0xC3, 12, 0xC300)));
+        const auto result =
+            operation.submit(adapter, GpuSurfacePack<6>(owners(0xC3, authority, 0xC300)));
         QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
         QCOMPARE(registry.pendingRetainCount(), pendingBefore + 6);
         QVERIFY(monitor.isLost());
@@ -1419,34 +1597,36 @@ void TestGpuSurfaceLease::fusedMultiNodeFailureStatesCoverEveryOwner() {
 
     monitor.reset();
     {
+        const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
         const qsizetype pendingBefore = registry.pendingRetainCount();
-        auto fence = std::make_shared<ZeroSignalFence>(0xC4, 12);
+        auto fence = std::make_shared<ZeroSignalFence>(0xC4, authority);
         FakeBackendAdapter adapter;
         GpuOpScope operation(fence, registry);
-        const auto result = operation.submit(adapter, GpuSurfacePack<6>(owners(0xC4, 12, 0xC400)));
+        const auto result =
+            operation.submit(adapter, GpuSurfacePack<6>(owners(0xC4, authority, 0xC400)));
         QCOMPARE(result.retirement, GpuRetirementDisposition::Quarantined);
         QCOMPARE(registry.pendingRetainCount(), pendingBefore + 6);
-        const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
         GpuDeviceLossMonitorTestAuthority::publish(authority, 0xC4);
         const auto token = monitor.realLossToken();
         QVERIFY(token.has_value());
-        QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(6));
+        QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(6));
     }
 
     monitor.reset();
     {
+        const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
         const qsizetype pendingBefore = registry.pendingRetainCount();
-        auto fence = std::make_shared<ThrowingSignalFence>(0xC5, 12);
+        auto fence = std::make_shared<ThrowingSignalFence>(0xC5, authority);
         FakeBackendAdapter adapter;
         GpuOpScope operation(fence, registry);
-        const auto result = operation.submit(adapter, GpuSurfacePack<6>(owners(0xC5, 12, 0xC500)));
+        const auto result =
+            operation.submit(adapter, GpuSurfacePack<6>(owners(0xC5, authority, 0xC500)));
         QCOMPARE(result.retirement, GpuRetirementDisposition::Quarantined);
         QCOMPARE(registry.pendingRetainCount(), pendingBefore + 6);
-        const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
         GpuDeviceLossMonitorTestAuthority::publish(authority, 0xC5);
         const auto token = monitor.realLossToken();
         QVERIFY(token.has_value());
-        QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(6));
+        QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(6));
     }
 
     monitor.reset();
@@ -1457,9 +1637,10 @@ void TestGpuSurfaceLease::fusedMultiNodeFailureStatesCoverEveryOwner() {
 void TestGpuSurfaceLease::fusedSubmissionNeverConsumesPostAcceptAllocationFailure() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
-    auto fence = std::make_shared<FakeFence>(0xD1, 13);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0xD1, authority);
     auto first = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD1), true,
-                                                    GpuSurfaceCompatibility{0xD1, 13});
+                                                    GpuSurfaceCompatibility{0xD1, authority});
     FakeBackendAdapter accepted;
     accepted.injectNextPreparationFailure = true;
 
@@ -1471,7 +1652,7 @@ void TestGpuSurfaceLease::fusedSubmissionNeverConsumesPostAcceptAllocationFailur
     std::array<std::shared_ptr<GpuSurface>, 5> overflow;
     for (size_t i = 0; i < overflow.size(); ++i)
         overflow[i] = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD2 + i), true,
-                                                         GpuSurfaceCompatibility{0xD1, 13});
+                                                         GpuSurfaceCompatibility{0xD1, authority});
     FakeBackendAdapter rejected;
     GpuOpScope rejectedOperation(fence, registry);
     const auto rejectedResult = rejectedOperation.submit(rejected, GpuSurfacePack<5>(overflow));
@@ -1511,7 +1692,7 @@ void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
         if (fenceValue) *fenceValue = result.fenceValue;
     };
 
-    auto submittedFence = std::make_shared<FakeFence>(0xC2, 13);
+    auto submittedFence = std::make_shared<FakeFence>(0xC2, currentDeviceAuthority());
     uint64_t submittedValue = 0;
     verify(submittedFence, 0xC2, GpuSubmitOutcome::Submitted, GpuRetirementDisposition::Published,
            &submittedValue);
@@ -1519,7 +1700,7 @@ void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
     registry.drainCompleted();
 
     GpuDeviceLossMonitor::instance().reset();
-    auto submittedErrorFence = std::make_shared<FakeFence>(0xC3, 13);
+    auto submittedErrorFence = std::make_shared<FakeFence>(0xC3, currentDeviceAuthority());
     uint64_t submittedErrorValue = 0;
     verify(submittedErrorFence, 0xC3, GpuSubmitOutcome::SubmittedWithError,
            GpuRetirementDisposition::Published, &submittedErrorValue);
@@ -1532,7 +1713,8 @@ void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
            GpuSubmitOutcome::Submitted, GpuRetirementDisposition::Quarantined);
     QCOMPARE(registry.drainWithBoundedWait(0), 0);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(zeroAuthority, 0xC4) != 0);
-    QCOMPARE(registry.abandonAllNoWait(*GpuDeviceLossMonitor::instance().realLossToken()),
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(
+                 registry, *GpuDeviceLossMonitor::instance().realLossToken()),
              qsizetype(1));
 
     GpuDeviceLossMonitor::instance().reset();
@@ -1541,7 +1723,8 @@ void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
            GpuSubmitOutcome::Submitted, GpuRetirementDisposition::Quarantined);
     QCOMPARE(registry.drainWithBoundedWait(0), 0);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(throwingAuthority, 0xC5) != 0);
-    QCOMPARE(registry.abandonAllNoWait(*GpuDeviceLossMonitor::instance().realLossToken()),
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(
+                 registry, *GpuDeviceLossMonitor::instance().realLossToken()),
              qsizetype(1));
     GpuDeviceLossMonitor::instance().reset();
     GpuGenerationCounter::instance().resetForTest();
@@ -1550,12 +1733,13 @@ void TestGpuSurfaceLease::fusedSubmissionAllPostAcceptOutcomesDoNotAllocate() {
 void TestGpuSurfaceLease::boundedWaitDrainsTask3CompletedAndThenPendingLiveDomains() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
-    auto completedFence = std::make_shared<FakeFence>(0xD2, 13);
-    auto pendingFence = std::make_shared<FakeFence>(0xD3, 13);
-    auto completedSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD20), true,
-                                                               GpuSurfaceCompatibility{0xD2, 13});
-    auto pendingSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD30), true,
-                                                             GpuSurfaceCompatibility{0xD3, 13});
+    const uint64_t authority = currentDeviceAuthority();
+    auto completedFence = std::make_shared<FakeFence>(0xD2, authority);
+    auto pendingFence = std::make_shared<FakeFence>(0xD3, authority);
+    auto completedSurface = std::make_shared<FakeLeaseSurface>(
+        reinterpret_cast<void*>(0xD20), true, GpuSurfaceCompatibility{0xD2, authority});
+    auto pendingSurface = std::make_shared<FakeLeaseSurface>(
+        reinterpret_cast<void*>(0xD30), true, GpuSurfaceCompatibility{0xD3, authority});
     const long completedOwners = completedSurface.use_count();
     const long pendingOwners = pendingSurface.use_count();
     FakeBackendAdapter completedAdapter;
@@ -1585,7 +1769,7 @@ void TestGpuSurfaceLease::boundedWaitPollsEveryLegacyRecordAfterTask3ExhaustsBud
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     constexpr int timeoutMs = 2;
-    constexpr uint64_t authority = 13;
+    const uint64_t authority = currentDeviceAuthority();
 
     auto task3Fence = std::make_shared<DeadlineConsumingFence>(0xD8, authority);
     auto task3Surface = std::make_shared<FakeLeaseSurface>(
@@ -1647,7 +1831,6 @@ void TestGpuSurfaceLease::boundedWaitSkipsDeadTask3DomainAndWaitsLiveDomain() {
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
-    (void) monitor.recordSubmissionFailure(0xD4);
     GpuRetireRegistry registry;
     auto deadFence = std::make_shared<FakeFence>(0xD4, authority);
     auto liveFence = std::make_shared<FakeFence>(0xD5, authority);
@@ -1667,7 +1850,7 @@ void TestGpuSurfaceLease::boundedWaitSkipsDeadTask3DomainAndWaitsLiveDomain() {
     GpuDeviceLossMonitorTestAuthority::publish(authority, 0xD4);
     const auto token = monitor.realLossToken();
     QVERIFY(token.has_value());
-    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     QCOMPARE(deadFence->waitCalls(), 0);
     QCOMPARE(registry.drainWithBoundedWait(5), 1);
     QCOMPARE(deadFence->waitCalls(), 0);
@@ -1681,10 +1864,11 @@ void TestGpuSurfaceLease::boundedWaitStillWaitsLiveTask3DomainAfterGenerationCha
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
-    auto fence = std::make_shared<FakeFence>(0xD6, 13);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0xD6, authority);
     fence->setRetireOnWait(true);
     auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD60), true,
-                                                      GpuSurfaceCompatibility{0xD6, 13});
+                                                      GpuSurfaceCompatibility{0xD6, authority});
     const long ownersBefore = surface.use_count();
     FakeBackendAdapter adapter;
     GpuOpScope operation(fence, registry);
@@ -1710,37 +1894,25 @@ void TestGpuSurfaceLease::boundedWaitRetainsTask3QuarantineUntilAuthoritativeAba
     constexpr uintptr_t deviceDomain = 0xD7;
     auto zeroSurface = std::make_shared<FakeLeaseSurface>(
         reinterpret_cast<void*>(0xD70), true, GpuSurfaceCompatibility{deviceDomain, authority});
-    auto throwingSurface = std::make_shared<FakeLeaseSurface>(
-        reinterpret_cast<void*>(0xD71), true, GpuSurfaceCompatibility{deviceDomain, authority});
     const long zeroOwners = zeroSurface.use_count();
-    const long throwingOwners = throwingSurface.use_count();
     auto zeroFence = std::make_shared<ZeroSignalFence>(deviceDomain, authority);
-    auto throwingFence = std::make_shared<ThrowingSignalFence>(deviceDomain, authority);
     FakeBackendAdapter zeroAdapter;
-    FakeBackendAdapter throwingAdapter;
     GpuOpScope zeroOperation(zeroFence, registry);
-    GpuOpScope throwingOperation(throwingFence, registry);
     const auto zeroResult = zeroOperation.submit(
         zeroAdapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{zeroSurface}));
-    const auto throwingResult = throwingOperation.submit(
-        throwingAdapter,
-        GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{throwingSurface}));
     QCOMPARE(zeroResult.retirement, GpuRetirementDisposition::Quarantined);
-    QCOMPARE(throwingResult.retirement, GpuRetirementDisposition::Quarantined);
-    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
 
     QCOMPARE(registry.drainWithBoundedWait(2), 0);
-    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 2);
+    QCOMPARE(registry.pendingRetainCount(), pendingBefore + 1);
     QVERIFY(zeroSurface.use_count() > zeroOwners);
-    QVERIFY(throwingSurface.use_count() > throwingOwners);
 
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, deviceDomain) != 0);
     const auto token = monitor.realLossToken();
     QVERIFY(token.has_value());
-    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(2));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
     QCOMPARE(zeroSurface.use_count(), zeroOwners);
-    QCOMPARE(throwingSurface.use_count(), throwingOwners);
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
 }
@@ -1772,7 +1944,7 @@ void TestGpuSurfaceLease::zeroSignalQuarantineReleasesAfterAuthoritativeUpgrade(
     QVERIFY(lossGeneration != 0);
     const auto token = monitor.realLossToken();
     QVERIFY(token.has_value());
-    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     QCOMPARE(registry.pendingRetainCount(), pendingBefore);
     QCOMPARE(surface.use_count(), ownersBefore);
     monitor.reset();
@@ -1783,13 +1955,13 @@ void TestGpuSurfaceLease::deadTokenAbandonsOnlyMatchingDeviceDomain() {
     monitor.reset();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     auto deadSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xB), true,
-                                                          GpuSurfaceCompatibility{11, 1});
+                                                          GpuSurfaceCompatibility{11, authority});
     auto liveSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xC), true,
-                                                          GpuSurfaceCompatibility{22, 1});
+                                                          GpuSurfaceCompatibility{22, authority});
     const long deadOwners = deadSurface.use_count();
     const long liveOwners = liveSurface.use_count();
-    auto deadFence = std::make_shared<FakeFence>(11);
-    auto liveFence = std::make_shared<FakeFence>(22);
+    auto deadFence = std::make_shared<FakeFence>(11, authority);
+    auto liveFence = std::make_shared<FakeFence>(22, authority);
     GpuRetireRegistry registry;
     (void) registerLegacyRetire(registry, deadSurface, deadFence);
     const uint64_t liveValue = registerLegacyRetire(registry, liveSurface, liveFence);
@@ -1799,7 +1971,7 @@ void TestGpuSurfaceLease::deadTokenAbandonsOnlyMatchingDeviceDomain() {
     QVERIFY(token.has_value());
     QCOMPARE(token->deviceDomainId(), uintptr_t(11));
     GpuRetireRegistry::resetStorageProbeForTest();
-    QCOMPARE(registry.abandonAllNoWait(*token), qsizetype(1));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, *token), qsizetype(1));
     const GpuRetireStorageSnapshot storage = GpuRetireRegistry::storageSnapshotForTest();
     QCOMPARE(storage.abandonmentShardVisits, uint64_t(1));
     QCOMPARE(storage.abandonmentNodesVisited, uint64_t(1));
@@ -1817,18 +1989,20 @@ void TestGpuSurfaceLease::multipleDeadTokensAbandonInOnePass() {
     monitor.reset();
     const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
     auto firstSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD), true,
-                                                           GpuSurfaceCompatibility{31, 1});
+                                                           GpuSurfaceCompatibility{31, authority});
     auto secondSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xE), true,
-                                                            GpuSurfaceCompatibility{32, 1});
+                                                            GpuSurfaceCompatibility{32, authority});
     const long firstOwners = firstSurface.use_count();
     const long secondOwners = secondSurface.use_count();
     GpuRetireRegistry registry;
-    (void) registerLegacyRetire(registry, firstSurface, std::make_shared<FakeFence>(31));
-    (void) registerLegacyRetire(registry, secondSurface, std::make_shared<FakeFence>(32));
+    (void) registerLegacyRetire(registry, firstSurface, std::make_shared<FakeFence>(31, authority));
+    (void) registerLegacyRetire(registry, secondSurface,
+                                std::make_shared<FakeFence>(32, authority));
 
     GpuDeviceLossMonitorTestAuthority::publish(authority, 31);
     GpuDeviceLossMonitorTestAuthority::publish(authority, 32);
-    QCOMPARE(registry.abandonAllNoWait(monitor.realLossTokens()), qsizetype(2));
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, monitor.realLossTokens()),
+             qsizetype(2));
     QCOMPARE(firstSurface.use_count(), firstOwners);
     QCOMPARE(secondSurface.use_count(), secondOwners);
     monitor.reset();
@@ -1836,11 +2010,12 @@ void TestGpuSurfaceLease::multipleDeadTokensAbandonInOnePass() {
 
 void TestGpuSurfaceLease::registryRegistrationDoesNotPollDriver() {
     GpuRetireRegistry registry;
-    auto fence = std::make_shared<FakeFence>(0xE1, 14);
+    const uint64_t authority = currentDeviceAuthority();
+    auto fence = std::make_shared<FakeFence>(0xE1, authority);
     std::array<std::shared_ptr<GpuSurface>, 4> surfaces;
     for (quintptr value = 1; value <= 4; ++value)
         surfaces[size_t(value - 1)] = std::make_shared<FakeLeaseSurface>(
-            reinterpret_cast<void*>(value), true, GpuSurfaceCompatibility{0xE1, 14});
+            reinterpret_cast<void*>(value), true, GpuSurfaceCompatibility{0xE1, authority});
     FakeBackendAdapter adapter;
     GpuOpScope operation(fence, registry);
     const auto result = operation.submit(adapter, GpuSurfacePack<4>(surfaces));
@@ -1856,7 +2031,7 @@ void TestGpuSurfaceLease::registryRegistrationDoesNotPollDriver() {
 void TestGpuSurfaceLease::shardedRegistryQueriesEachFenceOncePerDrain() {
     constexpr size_t fenceCount = 16;
     constexpr size_t recordsPerFence = 4;
-    constexpr uint64_t authorityEpoch = 31;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     std::array<std::shared_ptr<ConcurrentFence>, fenceCount> fences;
@@ -1896,11 +2071,12 @@ void TestGpuSurfaceLease::allocationProbeCountsRealInjectedHeapEventsByPhase() {
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto runPhase = [&](GpuRetireAllocationPhase phase, uintptr_t handle) {
+        const uint64_t authority = currentDeviceAuthority();
         GpuRetireRegistry::resetAllocationProbeForTest();
         GpuRetireRegistry::injectHeapAllocationForNextPhaseForTest(phase);
-        auto fence = std::make_shared<FakeFence>(0x72, 7);
+        auto fence = std::make_shared<FakeFence>(0x72, authority);
         auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(handle), true,
-                                                          GpuSurfaceCompatibility{0x72, 7});
+                                                          GpuSurfaceCompatibility{0x72, authority});
         FakeBackendAdapter adapter;
         GpuOpScope operation(fence, registry);
         const auto result = operation.submit(
@@ -1927,7 +2103,7 @@ void TestGpuSurfaceLease::allocationProbeCountsRealInjectedHeapEventsByPhase() {
 
 void TestGpuSurfaceLease::fullShardDistinctFencesDrainInLinearOperations() {
     constexpr uintptr_t deviceDomain = 0x610;
-    constexpr uint64_t authorityEpoch = 43;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     const size_t capacity = GpuRetireRegistry::poolCapacityPerShardForTest();
@@ -1990,7 +2166,7 @@ void TestGpuSurfaceLease::fullShardDistinctFencesDrainInLinearOperations() {
 
 void TestGpuSurfaceLease::boundedWaitRePollsPartialProgressAfterTimeout() {
     constexpr uintptr_t deviceDomain = 0x620;
-    constexpr uint64_t authorityEpoch = 47;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<PartialProgressFence>(deviceDomain, authorityEpoch);
@@ -2024,7 +2200,7 @@ void TestGpuSurfaceLease::boundedWaitRePollsPartialProgressAfterTimeout() {
 
 void TestGpuSurfaceLease::preparedFenceGroupSurvivesDrainCancelAndRejectsStaleToken() {
     constexpr uintptr_t deviceDomain = 0x2F1;
-    constexpr uint64_t authorityEpoch = 23;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<FakeFence>(deviceDomain, authorityEpoch);
@@ -2067,11 +2243,11 @@ void TestGpuSurfaceLease::preparedFenceGroupSurvivesDrainCancelAndRejectsStaleTo
 
 void TestGpuSurfaceLease::multiNodePreparedBatchRejectsStaleAbaToken() {
     constexpr uintptr_t deviceDomain = 0x2F4;
-    constexpr uint64_t authorityEpoch = 26;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<FakeFence>(deviceDomain, authorityEpoch);
-    auto makeOwners = [](uintptr_t base) {
+    auto makeOwners = [deviceDomain, authorityEpoch](uintptr_t base) {
         std::array<std::shared_ptr<GpuSurface>, 6> owners;
         for (size_t i = 0; i < owners.size(); ++i)
             owners[i] = std::make_shared<FakeLeaseSurface>(
@@ -2107,7 +2283,7 @@ void TestGpuSurfaceLease::multiNodePreparedBatchRejectsStaleAbaToken() {
 
 void TestGpuSurfaceLease::duplicateFenceValuesRemainOneExactFenceGroup() {
     constexpr uintptr_t deviceDomain = 0x2F2;
-    constexpr uint64_t authorityEpoch = 24;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<ConstantValueFence>(deviceDomain, authorityEpoch);
@@ -2130,9 +2306,9 @@ void TestGpuSurfaceLease::duplicateFenceValuesRemainOneExactFenceGroup() {
     GpuGenerationCounter::instance().resetForTest();
 }
 
-void TestGpuSurfaceLease::preparedFenceGroupOwnsOneFenceReference() {
+void TestGpuSurfaceLease::preparedFenceGroupAndResultOwnExactFenceReferences() {
     constexpr uintptr_t deviceDomain = 0x2F3;
-    constexpr uint64_t authorityEpoch = 25;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<FakeFence>(deviceDomain, authorityEpoch);
@@ -2152,8 +2328,8 @@ void TestGpuSurfaceLease::preparedFenceGroupOwnsOneFenceReference() {
     QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
     fence->setCompleted(result.fenceValue);
     registry.drainCompleted();
-    QCOMPARE(retainedOwners, ownersBefore + 1);
-    QCOMPARE(fence.use_count(), ownersBefore);
+    QCOMPARE(retainedOwners, ownersBefore + 2);
+    QCOMPARE(fence.use_count(), ownersBefore + 1);
     GpuGenerationCounter::instance().resetForTest();
 }
 
@@ -2175,18 +2351,21 @@ void TestGpuSurfaceLease::diagnosticsSnapshotIsExactAcrossDeterministicShardHand
         adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{oldSurface}));
     QCOMPARE(oldResult.retirement, GpuRetirementDisposition::Quarantined);
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authorityEpoch, oldDomain) != 0);
-    const auto oldToken = monitor.realLossToken();
-    QVERIFY(oldToken.has_value());
+    const std::vector<DeadDeviceToken> deadTokens = monitor.realLossTokens();
+    QCOMPARE(deadTokens.size(), size_t(1));
+    monitor.reset();
+    const uint64_t replacementAuthority = currentDeviceAuthority();
 
     const GpuRetireDiagnostics before = registry.diagnostics();
     QCOMPARE(before.pendingRetains, qsizetype(1));
     QCOMPARE(before.quarantineCount, qsizetype(1));
     DiagnosticsShardHandoff handoff{
         &registry,
-        &*oldToken,
-        std::make_shared<ZeroSignalFence>(newDomain, authorityEpoch),
-        std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0x7010), true,
-                                           GpuSurfaceCompatibility{newDomain, authorityEpoch}),
+        &deadTokens.front(),
+        std::make_shared<ZeroSignalFence>(newDomain, replacementAuthority),
+        std::make_shared<FakeLeaseSurface>(
+            reinterpret_cast<void*>(0x7010), true,
+            GpuSurfaceCompatibility{newDomain, replacementAuthority}),
         0,
         {}};
     GpuRetireRegistry::setDiagnosticsHookForTest(&handoffQuarantineBetweenShards, &handoff);
@@ -2203,54 +2382,64 @@ void TestGpuSurfaceLease::diagnosticsSnapshotIsExactAcrossDeterministicShardHand
     QVERIFY(before.highWaterMark <= during.highWaterMark);
     QVERIFY(during.highWaterMark <= after.highWaterMark);
 
-    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authorityEpoch, newDomain) != 0);
-    QCOMPARE(registry.abandonAllNoWait(monitor.realLossTokens()), qsizetype(1));
-    monitor.reset();
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(replacementAuthority, newDomain) != 0);
+    QCOMPARE(GpuRetireRegistryTestAuthority::abandon(registry, monitor.realLossTokens()),
+             qsizetype(1));
     GpuGenerationCounter::instance().resetForTest();
 }
 
-void TestGpuSurfaceLease::diagnosticsRemainConsistentDuringPublishAndAbandon() {
-    constexpr uintptr_t deviceDomain = 0x630;
+void TestGpuSurfaceLease::diagnosticsRemainConsistentDuringValidatedAbandon() {
+    constexpr uintptr_t firstDeviceDomain = 0x630;
+    constexpr int kDomains = 8;
+    constexpr int kRecords = 256;
     auto& monitor = GpuDeviceLossMonitor::instance();
     monitor.reset();
     GpuGenerationCounter::instance().resetForTest();
     const uint64_t authorityEpoch = GpuDeviceLossMonitorTestAuthority::capture();
-    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authorityEpoch, deviceDomain) != 0);
-    const auto token = monitor.realLossToken();
-    QVERIFY(token.has_value());
     GpuRetireRegistry registry;
-    std::atomic<bool> start{false};
-    std::atomic<bool> publishedAll{false};
-    std::atomic<bool> invariantFailed{false};
+    for (int record = 0; record < kRecords; ++record) {
+        const uintptr_t deviceDomain = firstDeviceDomain + uintptr_t(record % kDomains);
+        auto fence = std::make_shared<FakeFence>(deviceDomain, authorityEpoch);
+        auto surface = std::make_shared<FakeLeaseSurface>(
+            reinterpret_cast<void*>(uintptr_t(0x6300 + record)), true,
+            GpuSurfaceCompatibility{deviceDomain, authorityEpoch});
+        FakeBackendAdapter adapter;
+        GpuOpScope operation(fence, registry);
+        QCOMPARE(operation
+                     .submit(adapter,
+                             GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+                     .retirement,
+                 GpuRetirementDisposition::Published);
+    }
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(kRecords));
+    uint64_t lossGeneration = 0;
+    for (int domain = 0; domain < kDomains; ++domain) {
+        const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(
+            authorityEpoch, firstDeviceDomain + uintptr_t(domain));
+        QVERIFY(generation != 0);
+        if (lossGeneration == 0)
+            lossGeneration = generation;
+        else
+            QCOMPARE(generation, lossGeneration);
+    }
 
-    std::thread publisher([&]() {
-        while (!start.load(std::memory_order_acquire))
-            std::this_thread::yield();
-        int published = 0;
-        while (published < 2000) {
-            auto fence = std::make_shared<ZeroSignalFence>(deviceDomain, authorityEpoch);
-            auto surface = std::make_shared<FakeLeaseSurface>(
-                reinterpret_cast<void*>(uintptr_t(0x6300 + published)), true,
-                GpuSurfaceCompatibility{deviceDomain, authorityEpoch});
-            FakeBackendAdapter adapter;
-            GpuOpScope operation(fence, registry);
-            const auto result = operation.submit(
-                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
-            if (result.retirement == GpuRetirementDisposition::Quarantined)
-                ++published;
-            else
-                std::this_thread::yield();
-        }
-        publishedAll.store(true, std::memory_order_release);
-    });
+    std::atomic<bool> start{false};
+    std::atomic<bool> abandonDone{false};
+    std::atomic<bool> abandonerFailed{false};
+    std::atomic<bool> readerFailed{false};
+    std::atomic<qsizetype> abandoned{0};
+
     std::thread abandoner([&]() {
         while (!start.load(std::memory_order_acquire))
             std::this_thread::yield();
-        while (!publishedAll.load(std::memory_order_acquire) ||
-               registry.pendingRetainCount() != 0) {
-            (void) registry.abandonAllNoWait(*token);
-            std::this_thread::yield();
-        }
+        const GpuValidatedLossResult recovery =
+            monitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains& domains) {
+                return registry.abandonAllNoWait(domains);
+            });
+        if (recovery.status != GpuValidatedLossStatus::Completed)
+            abandonerFailed.store(true, std::memory_order_relaxed);
+        abandoned.store(recovery.abandoned, std::memory_order_release);
+        abandonDone.store(true, std::memory_order_release);
     });
     std::thread reader([&]() {
         start.store(true, std::memory_order_release);
@@ -2258,15 +2447,15 @@ void TestGpuSurfaceLease::diagnosticsRemainConsistentDuringPublishAndAbandon() {
             const GpuRetireDiagnostics snapshot = registry.diagnostics();
             if (snapshot.highWaterMark < snapshot.pendingRetains ||
                 snapshot.quarantineCount > snapshot.pendingRetains)
-                invariantFailed.store(true, std::memory_order_relaxed);
-        } while (!publishedAll.load(std::memory_order_acquire) ||
-                 registry.pendingRetainCount() != 0);
+                readerFailed.store(true, std::memory_order_relaxed);
+        } while (!abandonDone.load(std::memory_order_acquire));
     });
 
-    publisher.join();
     abandoner.join();
     reader.join();
-    QVERIFY(!invariantFailed.load(std::memory_order_relaxed));
+    QVERIFY(!abandonerFailed.load(std::memory_order_relaxed));
+    QVERIFY(!readerFailed.load(std::memory_order_relaxed));
+    QCOMPARE(abandoned.load(std::memory_order_acquire), qsizetype(kRecords));
     const GpuRetireDiagnostics finalSnapshot = registry.diagnostics();
     QCOMPARE(finalSnapshot.pendingRetains, qsizetype(0));
     QCOMPARE(finalSnapshot.quarantineCount, qsizetype(0));
@@ -2280,7 +2469,7 @@ void TestGpuSurfaceLease::shardedRegistryConcurrentPublishAndDrainIsExact() {
     constexpr int fenceCount = 16;
     constexpr int recordsPerProducer = 64;
     constexpr int totalRecords = producerCount * recordsPerProducer;
-    constexpr uint64_t authorityEpoch = 37;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     std::array<std::shared_ptr<ConcurrentFence>, fenceCount> fences;
@@ -2340,7 +2529,7 @@ void TestGpuSurfaceLease::shardedRegistryConcurrentPublishAndDrainIsExact() {
 
 void TestGpuSurfaceLease::preparedPoolExhaustionRejectsBeforeDriverAcceptance() {
     constexpr uintptr_t deviceDomain = 0x510;
-    constexpr uint64_t authorityEpoch = 41;
+    const uint64_t authorityEpoch = currentDeviceAuthority();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<ConcurrentFence>(deviceDomain, authorityEpoch);
@@ -2384,9 +2573,10 @@ void TestGpuSurfaceLease::preparedPoolExhaustionRejectsBeforeDriverAcceptance() 
 
 void TestGpuSurfaceLease::multiNodePoolExhaustionIsAllOrNothing() {
     GpuGenerationCounter::instance().resetForTest();
-    verifyMultiNodePoolExhaustionIsAtomic<6>(0x521, 42);
-    verifyMultiNodePoolExhaustionIsAtomic<11>(0x522, 42);
-    verifyMultiNodePoolExhaustionIsAtomic<16>(0x523, 42);
+    const uint64_t authority = currentDeviceAuthority();
+    verifyMultiNodePoolExhaustionIsAtomic<6>(0x521, authority);
+    verifyMultiNodePoolExhaustionIsAtomic<11>(0x522, authority);
+    verifyMultiNodePoolExhaustionIsAtomic<16>(0x523, authority);
     GpuGenerationCounter::instance().resetForTest();
 }
 

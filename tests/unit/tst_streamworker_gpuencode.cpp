@@ -164,7 +164,6 @@ void TestStreamWorkerGpuEncode::jitterPullCarriesGpuFrameAndClearsOnCpuFrame() {
     QVERIFY(gpuQueued.frame != nullptr);
     gpuQueued.sourcePts = 0;
     gpuQueued.gpuFrame = makeGpuHandle();
-    gpuQueued.gpuFenceValue = 42;
 
     {
         QMutexLocker locker(&worker.m_frameMutex);
@@ -175,7 +174,7 @@ void TestStreamWorkerGpuEncode::jitterPullCarriesGpuFrameAndClearsOnCpuFrame() {
     worker.processEncoderTick(nullptr, 0, 0, 0);
 
     QVERIFY(worker.m_latestGpuFrame.isGpuBacked());
-    QCOMPARE(worker.m_latestGpuFenceValue, uint64_t(42));
+    QVERIFY(worker.m_latestGpuFrame.data()->gpuSynchronization().isExact());
 
     StreamWorker::QueuedFrame cpuQueued;
     cpuQueued.frame = makeYuvFrame(16, 16, 40);
@@ -191,7 +190,6 @@ void TestStreamWorkerGpuEncode::jitterPullCarriesGpuFrameAndClearsOnCpuFrame() {
     worker.processEncoderTick(nullptr, 0, 0, 0);
 
     QVERIFY(worker.m_latestGpuFrame.isNull());
-    QCOMPARE(worker.m_latestGpuFenceValue, uint64_t(0));
 
     av_frame_free(&worker.m_latestFrame);
 }
@@ -202,7 +200,6 @@ void TestStreamWorkerGpuEncode::paintBlueClearsGpuOnlyLatestFrame() {
     StreamWorker worker(QStringLiteral("old-source"), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
                         VideoCodecChoice::H264Hardware);
     worker.m_latestGpuFrame = makeGpuHandle();
-    worker.m_latestGpuFenceValue = 7;
     worker.m_latestGpuFrameTimecode100ns = 5678;
     worker.m_latestFrameTimecode100ns = 1234;
     worker.m_paintBlue = 1;
@@ -210,7 +207,6 @@ void TestStreamWorkerGpuEncode::paintBlueClearsGpuOnlyLatestFrame() {
     worker.processEncoderTick(nullptr, 0, 0, 0);
 
     QVERIFY(worker.m_latestGpuFrame.isNull());
-    QCOMPARE(worker.m_latestGpuFenceValue, uint64_t(0));
     QCOMPARE(worker.m_latestGpuFrameTimecode100ns.load(std::memory_order_acquire), int64_t(-1));
     QCOMPARE(worker.m_latestFrameTimecode100ns.load(std::memory_order_acquire), int64_t(-1));
 }
@@ -328,8 +324,7 @@ void TestStreamWorkerGpuEncode::queuesGpuEncodeWhilePreviousSurfaceEncodeIsInFli
     auto encoder = std::make_unique<BlockingSurfaceEncoder>();
     auto* encoderPtr = encoder.get();
     worker.m_nativeEncoder = std::move(encoder);
-    worker.m_gpuEncodePump =
-        std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), nullptr, 4);
+    worker.m_gpuEncodePump = std::make_unique<GpuEncodePump>(worker.m_nativeEncoder.get(), 4);
     worker.m_gpuEncodePump->start();
     worker.m_latestGpuFrame = makeGpuHandle();
 

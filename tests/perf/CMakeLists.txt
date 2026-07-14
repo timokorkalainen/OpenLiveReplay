@@ -22,6 +22,7 @@ endif()
 
 qt_add_library(olr_production_retire_perf STATIC
     "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+    "${CMAKE_SOURCE_DIR}/playback/gpu/gpurecoverycoordinator.cpp"
     "${CMAKE_SOURCE_DIR}/playback/gpu/gpureadbackretainer.cpp"
     "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp"
     "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp"

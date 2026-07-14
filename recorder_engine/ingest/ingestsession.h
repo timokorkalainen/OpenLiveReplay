@@ -45,7 +45,6 @@ struct DecodedVideoFrame {
     int64_t sourceTimecode100ns = -1;
 #if defined(OLR_GPU_PIPELINE_BUILD)
     FrameHandle gpuFrame;
-    uint64_t gpuFenceValue = 0;
 #endif
 };
 
@@ -58,7 +57,6 @@ struct DecodedAudioChunk {
 #if defined(OLR_GPU_PIPELINE_BUILD)
 struct ImportedGpuVideoFrame {
     FrameHandle frame;
-    uint64_t fenceValue = 0;
 };
 #endif
 

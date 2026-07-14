@@ -31,6 +31,11 @@ public:
     CpuPlanes readToCpu(FramePixelFormat) const override { return CpuPlanes{}; }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_fence; }
+    GpuFrameSynchronization gpuSynchronization() const override {
+        const uint64_t value = m_surface ? m_surface->pendingFenceValue() : 0;
+        if (value == 0) return {};
+        return {m_fence, value, true};
+    }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
 
 private:

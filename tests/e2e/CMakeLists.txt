@@ -204,7 +204,12 @@ if(OLR_PYTHON3_EXECUTABLE)
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
             "${CMAKE_SOURCE_DIR}/playback/gpu/vtkeepsurfaceimporter_apple.mm"
-            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp")
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/asyncgpureadbacksink.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/iotargets/decklinksink.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/output/outputbusengine.cpp"
+            "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframeretirequeue.cpp"
+            "${CMAKE_SOURCE_DIR}/recorder_engine/codec/gpuencodepump.cpp")
     set_tests_properties(tst_gpu_scope_completion_static PROPERTIES
         LABELS "unit;ci;gpu-capability"
         TIMEOUT 30)

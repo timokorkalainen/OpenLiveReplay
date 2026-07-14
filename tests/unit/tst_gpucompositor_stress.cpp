@@ -177,7 +177,7 @@ void TestGpuCompositorStress::composeWhileRetiringPriorGpuOutputs() {
         QVERIFY(rgba.isValid());
         {
             QMutexLocker locker(&retireMutex);
-            retireQueue.collect(gpu, gpu.data() ? gpu.data()->gpuFence() : nullptr);
+            retireQueue.collect(gpu);
         }
         ++composed;
     }

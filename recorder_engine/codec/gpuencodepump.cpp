@@ -19,10 +19,8 @@ struct EncodedPacket {
 };
 } // namespace
 
-GpuEncodePump::GpuEncodePump(NativeVideoEncoder* encoder, std::shared_ptr<GpuFence> fence,
-                             int maxQueue, std::mutex* encoderMutex)
-    : m_encoder(encoder), m_encoderMutex(encoderMutex), m_fence(std::move(fence)),
-      m_maxQueue(maxQueue > 0 ? maxQueue : 1) {}
+GpuEncodePump::GpuEncodePump(NativeVideoEncoder* encoder, int maxQueue, std::mutex* encoderMutex)
+    : m_encoder(encoder), m_encoderMutex(encoderMutex), m_maxQueue(maxQueue > 0 ? maxQueue : 1) {}
 
 GpuEncodePump::~GpuEncodePump() {
     stop();
@@ -34,7 +32,10 @@ void GpuEncodePump::start() {
 }
 
 void GpuEncodePump::stop() {
-    m_running.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_running.store(false, std::memory_order_release);
+    }
     m_cv.notify_all();
     if (m_thread.joinable()) m_thread.join();
 }
@@ -46,9 +47,17 @@ void GpuEncodePump::cancelPending() {
     m_cv.notify_all();
 }
 
-bool GpuEncodePump::submit(FrameHandle frame, uint64_t fenceValue, int64_t ptsTicks,
-                           ColorMetadata color, PacketSink onPacket, FailureSink onFailure) {
-    Job job{std::move(frame),    fenceValue,          ptsTicks, color,
+bool GpuEncodePump::submit(FrameHandle frame, int64_t ptsTicks, ColorMetadata color,
+                           PacketSink onPacket, FailureSink onFailure) {
+    const IFrameData* frameData = frame.data();
+    const GpuFrameSynchronization synchronization =
+        frameData ? frameData->gpuSynchronization() : GpuFrameSynchronization{};
+    if (!frameData || !frameData->isGpuBacked() || !synchronization.isExact()) {
+        m_drops.fetch_add(1, std::memory_order_acq_rel);
+        if (onFailure) onFailure();
+        return false;
+    }
+    Job job{std::move(frame),    synchronization,     ptsTicks, color,
             std::move(onPacket), std::move(onFailure)};
     FailureSink rejectedFailure;
     {
@@ -90,16 +99,14 @@ void GpuEncodePump::run() {
             m_cv.notify_all();
         }
 
-        const IFrameData* frameData = job.frame.data();
-        std::shared_ptr<GpuFence> fence = frameData ? frameData->gpuFence() : nullptr;
-        if (!fence) fence = m_fence;
-
         // FENCE-BEFORE-ENCODE: never read a surface the producer is still writing.
-        if (fence && !fence->wait(job.fenceValue, kFenceTimeoutMs)) {
+        if (job.synchronization.value != 0 &&
+            !job.synchronization.fence->wait(job.synchronization.value, kFenceTimeoutMs)) {
             failJob(job);
             continue;
         }
 
+        const IFrameData* frameData = job.frame.data();
         GpuSurface* surface = frameData ? frameData->gpuSurface() : nullptr;
         if (!surface || !m_encoder) {
             failJob(job);

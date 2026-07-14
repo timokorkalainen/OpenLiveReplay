@@ -6,6 +6,7 @@
 #include <QMutexLocker>
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpugeneration.h"
 #include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpuretireregistry.h"
@@ -338,7 +339,8 @@ private slots:
 
 void TestGpuRetireRegistryPerf::warmedCommonPathUsesPooledShards() {
     constexpr uintptr_t deviceDomainId = 0x701;
-    constexpr uint64_t authorityEpoch = 51;
+    const uint64_t authorityEpoch =
+        GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest();
     constexpr int sampleCount = 512;
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
@@ -423,7 +425,8 @@ void TestGpuRetireRegistryPerf::warmedCommonPathUsesPooledShards() {
 
 void TestGpuRetireRegistryPerf::maxOwnerBatchUsesBoundedFourNodePath() {
     constexpr uintptr_t deviceDomainId = 0x702;
-    constexpr uint64_t authorityEpoch = 52;
+    const uint64_t authorityEpoch =
+        GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest();
     constexpr int sampleCount = 256;
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
@@ -474,7 +477,8 @@ void TestGpuRetireRegistryPerf::maxOwnerBatchUsesBoundedFourNodePath() {
 
 void TestGpuRetireRegistryPerf::drainMeetsSaved912663beMedianAndP95() {
     constexpr uintptr_t deviceDomainId = 0x740;
-    constexpr uint64_t authorityEpoch = 53;
+    const uint64_t authorityEpoch =
+        GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest();
     constexpr int operationCount = 256;
     constexpr int ownersPerOperation = 4;
     constexpr int sampleCount = 200;
@@ -570,7 +574,8 @@ void TestGpuRetireRegistryPerf::drainMeetsSaved912663beMedianAndP95() {
 
 void TestGpuRetireRegistryPerf::allocationDetectorSeesInjectedHeapMutation() {
     constexpr uintptr_t deviceDomainId = 0x721;
-    constexpr uint64_t authorityEpoch = 59;
+    const uint64_t authorityEpoch =
+        GpuDeviceLossMonitor::instance().currentDeviceAuthorityForTest();
     GpuGenerationCounter::instance().resetForTest();
     GpuRetireRegistry registry;
     auto fence = std::make_shared<PerfFence>(deviceDomainId, authorityEpoch);

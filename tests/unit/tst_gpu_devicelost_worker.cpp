@@ -5,6 +5,8 @@
 #include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpugeneration.h"
+#include "playback/gpu/gpuopscope.h"
+#include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
 #include "playback/gpu/iosgpulifecyclesink.h"
@@ -16,7 +18,13 @@
 #include "playback/playbackworker.h"
 
 #include <memory>
+#include <atomic>
+#include <thread>
 #include <utility>
+
+#include <QElapsedTimer>
+#include <QSemaphore>
+#include <QThread>
 
 class TestGpuDeviceLostWorker : public QObject {
     Q_OBJECT
@@ -31,6 +39,7 @@ private slots:
     void backgroundSuspendDefersGpuRebuildUntilForeground();
     void repeatedBackgroundSuspendResumeDoesNotConsumeDeviceLossBudget();
     void lossSanitizesDecoderTrackBuffers();
+    void boundedLossWaitDoesNotHoldRecoveryEpochLock();
 
 private:
     std::shared_ptr<GpuRhiContext> createTestRhi() const;
@@ -46,6 +55,47 @@ public:
     void* nativeHandle() const override { return nullptr; }
     void retainUntilFenceRetired(uint64_t) override {}
     uint64_t pendingFenceValue() const override { return 0; }
+};
+
+class BlockingLossFence final : public GpuFence {
+public:
+    BlockingLossFence(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : GpuFence(deviceDomainId, authorityEpoch) {}
+
+    uint64_t signal() override { return ++m_signalled; }
+    bool wait(uint64_t value, int) override {
+        waitEntered.release();
+        releaseWait.acquire();
+        m_completed.store(value, std::memory_order_release);
+        return true;
+    }
+    uint64_t completedValue() const override { return m_completed.load(std::memory_order_acquire); }
+
+    QSemaphore waitEntered;
+    QSemaphore releaseWait;
+
+private:
+    uint64_t m_signalled = 0;
+    std::atomic<uint64_t> m_completed{0};
+};
+
+class CompatibleLossSurface final : public GpuSurface {
+public:
+    CompatibleLossSurface(uintptr_t deviceDomainId, uint64_t authorityEpoch)
+        : m_compatibility{deviceDomainId, authorityEpoch} {}
+    GpuSurfaceDesc desc() const override { return {FramePixelFormat::Nv12, 16, 16}; }
+    bool isValid() const override { return true; }
+    GpuSurfaceCompatibility compatibility() const override { return m_compatibility; }
+
+protected:
+    void* nativeHandle() const override { return reinterpret_cast<void*>(0xB10C); }
+
+private:
+    GpuSurfaceCompatibility m_compatibility;
+};
+
+struct SubmittedAdapter {
+    GpuSubmitOutcome operator()() noexcept { return GpuSubmitOutcome::Submitted; }
 };
 
 class CachedGpuFrameData final : public IFrameData {
@@ -406,6 +456,59 @@ void TestGpuDeviceLostWorker::repeatedBackgroundSuspendResumeDoesNotConsumeDevic
         QCOMPARE(worker.m_gpuDeviceLossRebuildsRemaining.load(std::memory_order_acquire),
                  PlaybackWorker::kDeviceLossRebuildBudget);
     }
+}
+
+void TestGpuDeviceLostWorker::boundedLossWaitDoesNotHoldRecoveryEpochLock() {
+    qunsetenv("OLR_GPU_PIPELINE");
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    GpuGenerationCounter::instance().resetForTest();
+    constexpr uintptr_t deviceDomain = 0xB10C;
+    const uint64_t authority = monitor.currentDeviceAuthorityForTest();
+
+    GpuRetireRegistry registry;
+    auto fence = std::make_shared<BlockingLossFence>(deviceDomain, authority);
+    auto surface = std::make_shared<CompatibleLossSurface>(deviceDomain, authority);
+    SubmittedAdapter adapter;
+    GpuOpScope operation(fence, registry);
+    QCOMPARE(
+        operation
+            .submit(adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}))
+            .retirement,
+        GpuRetirementDisposition::Published);
+
+    FrameProvider feedProvider;
+    PlaybackTransport transport;
+    transport.setFrameRate(25, 1);
+    PlaybackWorker worker({&feedProvider}, &transport);
+    worker.m_gpuPipelineState.store(static_cast<int>(PlaybackWorker::GpuPipelineState::Gpu),
+                                    std::memory_order_release);
+
+    std::thread recovery([&]() { worker.handleGpuDeviceLoss(); });
+    const bool waitStarted = fence->waitEntered.tryAcquire(1, 5000);
+    std::atomic<bool> rebuildReturned{false};
+    std::thread rebuild;
+    if (waitStarted) {
+        rebuild = std::thread([&]() {
+            monitor.beginRebuild();
+            rebuildReturned.store(true, std::memory_order_release);
+        });
+    }
+
+    QElapsedTimer deadline;
+    deadline.start();
+    while (waitStarted && !rebuildReturned.load(std::memory_order_acquire) &&
+           deadline.elapsed() < 1000)
+        QThread::msleep(1);
+    const bool rebuildReturnedBeforeFenceRelease = rebuildReturned.load(std::memory_order_acquire);
+    fence->releaseWait.release();
+    if (rebuild.joinable()) rebuild.join();
+    recovery.join();
+
+    QVERIFY(waitStarted);
+    QVERIFY2(rebuildReturnedBeforeFenceRelease,
+             "bounded fence wait must run after the recovery epoch mutex is released");
+    QCOMPARE(registry.pendingRetainCount(), qsizetype(0));
 }
 
 void TestGpuDeviceLostWorker::lossSanitizesDecoderTrackBuffers() {

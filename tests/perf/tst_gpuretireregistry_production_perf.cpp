@@ -6,6 +6,7 @@
 #include "saved912gpuopscope.h"
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpusurface.h"
@@ -90,6 +91,14 @@ qint64 percentile(std::vector<qint64> samples, size_t numerator, size_t denomina
     return samples[(samples.size() * numerator) / denominator];
 }
 
+uint64_t currentDeviceAuthority() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    for (uint64_t authority = 1; authority <= 1024; ++authority) {
+        if (monitor.isCurrentDeviceAuthority(authority)) return authority;
+    }
+    return 0;
+}
+
 struct RoundMetrics {
     qint64 registrationMedian = 0;
     qint64 registrationP95 = 0;
@@ -101,10 +110,10 @@ struct RoundMetrics {
 
 template <typename Registry, typename OpScope>
 RoundMetrics
-measureRound(const std::array<std::array<std::shared_ptr<GpuSurface>, 4>, 256>& fixtures) {
+measureRound(const std::array<std::array<std::shared_ptr<GpuSurface>, 4>, 256>& fixtures,
+             uint64_t authority) {
     constexpr int sampleCount = 200;
     constexpr uintptr_t domain = 0x740;
-    constexpr uint64_t authority = 53;
     std::vector<qint64> registration;
     std::vector<qint64> drain;
     registration.reserve(sampleCount);
@@ -151,7 +160,8 @@ private slots:
 
 void TestGpuRetireRegistryProductionPerf::preparedSlotsFourOwners() {
     constexpr uintptr_t domain = 0x740;
-    constexpr uint64_t authority = 53;
+    const uint64_t authority = currentDeviceAuthority();
+    QVERIFY(authority != 0);
     constexpr int operationCount = 256;
     constexpr int ownerCount = 4;
     constexpr int warmupRoundCount = 3;
@@ -179,8 +189,8 @@ void TestGpuRetireRegistryProductionPerf::preparedSlotsFourOwners() {
     std::vector<qint64> drainP95Ratios;
     for (int warmup = 0; warmup < warmupRoundCount; ++warmup) {
         (void) measureRound<Saved912PreparedRegistry, Saved912GpuOpScope<ProductionPerfFence>>(
-            fixtures);
-        (void) measureRound<GpuRetireRegistry, GpuOpScope>(fixtures);
+            fixtures, authority);
+        (void) measureRound<GpuRetireRegistry, GpuOpScope>(fixtures, authority);
     }
     uint64_t currentSignals = 0;
     uint64_t baselineSignals = 0;
@@ -191,13 +201,13 @@ void TestGpuRetireRegistryProductionPerf::preparedSlotsFourOwners() {
         if ((round & 1) == 0) {
             baseline =
                 measureRound<Saved912PreparedRegistry, Saved912GpuOpScope<ProductionPerfFence>>(
-                    fixtures);
-            current = measureRound<GpuRetireRegistry, GpuOpScope>(fixtures);
+                    fixtures, authority);
+            current = measureRound<GpuRetireRegistry, GpuOpScope>(fixtures, authority);
         } else {
-            current = measureRound<GpuRetireRegistry, GpuOpScope>(fixtures);
+            current = measureRound<GpuRetireRegistry, GpuOpScope>(fixtures, authority);
             baseline =
                 measureRound<Saved912PreparedRegistry, Saved912GpuOpScope<ProductionPerfFence>>(
-                    fixtures);
+                    fixtures, authority);
         }
         QVERIFY(current.registrationMedian > 0);
         QVERIFY(baseline.registrationMedian > 0);

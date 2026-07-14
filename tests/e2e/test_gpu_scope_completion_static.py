@@ -231,18 +231,89 @@ bool probe() {
 """, "unreachable withRead markers must not satisfy the audit")
 
 
+def audit_exact_synchronization_flow(function, label, require_derived_pair=False,
+                                     require_pair_fields=True):
+    items = tokens(function)
+    braces = token_pairs(items, "{", "}")
+    sync_indices = [index for index, (token, _) in enumerate(items)
+                    if token == "gpuSynchronization"]
+    require(sync_indices, f"{label}: missing IFrameData exact synchronization evidence")
+    require(any(not is_obviously_unreachable(items, index, braces) for index in sync_indices),
+            f"{label}: exact synchronization evidence is unreachable")
+    item_values = [token for token, _ in items]
+    require("pendingFenceValue" not in item_values,
+            f"{label}: surface-wide pending watermark is forbidden")
+    require("gpuFence" not in item_values,
+            f"{label}: independently selected fence is forbidden")
+    require("isExact" in item_values,
+            f"{label}: exact evidence must be validated before use")
+    if require_pair_fields:
+        require("fence" in item_values and "value" in item_values,
+                f"{label}: exact evidence must consume one fence/value pair")
+    if require_derived_pair:
+        require(re.search(r"fenceValue\s*=\s*synchronization\s*\.\s*value", function),
+                f"{label}: fence value must come from synchronization")
+        require(re.search(r"producerFence\s*=\s*synchronization\s*\.\s*fence", function),
+                f"{label}: producer fence must come from the same synchronization")
+
+
+def exact_synchronization_mutation_self_tests():
+    safe = """
+bool probe() {
+    const GpuFrameSynchronization synchronization = data->gpuSynchronization();
+    const uint64_t fenceValue = synchronization.value;
+    auto producerFence = synchronization.fence;
+    return synchronization.isExact() && producerFence->wait(fenceValue, 1);
+}
+"""
+    audit_exact_synchronization_flow(function_block(safe, "bool probe"), "safe exact mutation",
+                                     True)
+    for source, message in (("""
+bool probe() {
+    const GpuFrameSynchronization synchronization = data->gpuSynchronization();
+    const uint64_t fenceValue = surface->pendingFenceValue();
+    auto producerFence = synchronization.fence;
+    return synchronization.isExact() && producerFence->wait(fenceValue, 1);
+}
+""", "surface watermark fallback must be rejected"), ("""
+bool probe() {
+    const GpuFrameSynchronization synchronization = data->gpuSynchronization();
+    const uint64_t fenceValue = synchronization.value;
+    auto producerFence = unrelatedFence;
+    return synchronization.isExact() && producerFence->wait(fenceValue, 1);
+}
+""", "independent fence/value pairing must be rejected"), ("""
+bool probe() {
+    return false;
+    const GpuFrameSynchronization synchronization = data->gpuSynchronization();
+    const uint64_t fenceValue = synchronization.value;
+    auto producerFence = synchronization.fence;
+    return synchronization.isExact() && producerFence->wait(fenceValue, 1);
+}
+""", "unreachable exact evidence must be rejected")):
+        try:
+            audit_exact_synchronization_flow(function_block(source, "bool probe"), "mutation",
+                                             True)
+        except AssertionError:
+            continue
+        raise AssertionError(message)
+
+
 def main():
-    if len(sys.argv) != 9:
+    if len(sys.argv) != 14:
         raise SystemExit(
             "usage: test_gpu_scope_completion_static.py "
             "<nativevideoencoder_videotoolbox.mm> "
             "<nativevideoencoder_mediafoundation.cpp> "
             "<applegpusurface_apple.mm> <wingpuimportedge.cpp> "
             "<gpuframedata.cpp> <gpusurfaceallocator.cpp> "
-            "<vtkeepsurfaceimporter_apple.mm> <gpucompositor.cpp>"
+            "<vtkeepsurfaceimporter_apple.mm> <gpucompositor.cpp> "
+            "<asyncgpureadbacksink.cpp> <decklinksink.cpp> <outputbusengine.cpp> "
+            "<gpuframeretirequeue.cpp> <gpuencodepump.cpp>"
         )
 
     mutation_self_tests()
+    exact_synchronization_mutation_self_tests()
     videotoolbox = Path(sys.argv[1]).read_text(encoding="utf-8")
     mediafoundation = Path(sys.argv[2]).read_text(encoding="utf-8")
     apple_surface = Path(sys.argv[3]).read_text(encoding="utf-8")
@@ -251,6 +322,11 @@ def main():
     allocator = Path(sys.argv[6]).read_text(encoding="utf-8")
     vt_importer = Path(sys.argv[7]).read_text(encoding="utf-8")
     compositor = Path(sys.argv[8]).read_text(encoding="utf-8")
+    async_readback = Path(sys.argv[9]).read_text(encoding="utf-8")
+    decklink = Path(sys.argv[10]).read_text(encoding="utf-8")
+    output_bus = Path(sys.argv[11]).read_text(encoding="utf-8")
+    retire_queue = Path(sys.argv[12]).read_text(encoding="utf-8")
+    encode_pump = Path(sys.argv[13]).read_text(encoding="utf-8")
 
     vt_encode, vt_regions = audit_structured_access(
         function_block(videotoolbox, "bool encodeSurface"),
@@ -310,17 +386,53 @@ def main():
             "generic GPU frame waits must use their stored exact fence/value pair")
 
     allocator_mint = function_block(allocator, "std::shared_ptr<GpuRhiContext> rhi")
-    require(re.search(r"makeGpuFrameHandle\s*\([^;]*result\s*\.\s*fenceValue", allocator_mint,
+    require(re.search(r"makeGpuFrameHandle\s*\([^;]*result\s*\.\s*producerFence[^;]*"
+                      r"result\s*\.\s*fenceValue", allocator_mint,
                       re.DOTALL),
-            "allocator mint must carry the exact submission fence value into GpuFrameData")
+            "allocator mint must carry the exact submission fence/value pair into GpuFrameData")
     vt_import = function_block(vt_importer, "FrameHandle importVtSurface")
-    require(re.search(r"renderFenceValue\s*=\s*result\s*\.\s*fenceValue", vt_import) and
-            re.search(r"makeGpuFrameHandle\s*\([^;]*renderFenceValue", vt_import, re.DOTALL),
-            "VT import must carry the exact submission fence value into GpuFrameData")
+    require(re.search(r"exactRenderFence\s*=\s*result\s*\.\s*producerFence", vt_import) and
+            re.search(r"renderFenceValue\s*=\s*result\s*\.\s*fenceValue", vt_import) and
+            re.search(r"makeGpuFrameHandle\s*\([^;]*exactRenderFence[^;]*renderFenceValue",
+                      vt_import, re.DOTALL),
+            "VT import must carry the exact submission fence/value pair into GpuFrameData")
     composite = function_block(compositor, "FrameHandle GpuCompositor::composeGridForGeneration")
-    require(re.search(r"makeGpuFrameHandle\s*\([^;]*submission\s*\.\s*fenceValue", composite,
+    require(re.search(r"makeGpuFrameHandle\s*\([^;]*submission\s*\.\s*producerFence[^;]*"
+                      r"submission\s*\.\s*fenceValue", composite,
                       re.DOTALL),
-            "compositor output must carry the exact submission fence value into GpuFrameData")
+            "compositor output must carry the exact submission fence/value pair into GpuFrameData")
+
+    audit_exact_synchronization_flow(
+        function_block(async_readback, "bool AsyncGpuReadbackSink::submit("),
+        "asynchronous readback submit", True)
+    audit_exact_synchronization_flow(
+        function_block(async_readback, "bool AsyncGpuReadbackSink::submitGpuFrameAndFlush"),
+        "asynchronous readback flush", True)
+    audit_exact_synchronization_flow(
+        function_block(async_readback, "bool AsyncGpuReadbackSink::prewarmReadback"),
+        "asynchronous readback prewarm", True)
+    audit_exact_synchronization_flow(
+        function_block(decklink, "bool waitForNativeGpuProducer"), "DeckLink producer wait")
+    audit_exact_synchronization_flow(
+        function_block(output_bus, "OutputBusFrame OutputBusEngine::renderSingleSource"),
+        "output bus reuse", require_pair_fields=False)
+    audit_exact_synchronization_flow(
+        function_block(retire_queue, "void GpuFrameRetireQueue::collect"),
+        "frame retirement queue")
+
+    pump_submit = function_block(encode_pump, "bool GpuEncodePump::submit")
+    audit_exact_synchronization_flow(
+        pump_submit, "GPU encode pump submit", require_pair_fields=False)
+    require(re.search(r"Job\s+job\s*\{[^;]*synchronization", pump_submit, re.DOTALL),
+            "GPU encode pump must store the frame's exact synchronization as one job field")
+    pump_run = function_block(encode_pump, "void GpuEncodePump::run")
+    pump_run_tokens = [token for token, _ in tokens(pump_run)]
+    require("gpuFence" not in pump_run_tokens and "fenceValue" not in pump_run_tokens and
+            "m_fence" not in pump_run_tokens,
+            "GPU encode pump must not reconstruct or fall back from the exact job pair")
+    require(re.search(r"job\s*\.\s*synchronization\s*\.\s*fence\s*->\s*wait\s*\(\s*"
+                      r"job\s*\.\s*synchronization\s*\.\s*value", pump_run),
+            "GPU encode pump must wait on the fence and value from the same job synchronization")
 
     print("PASS: parsed GPU scope and exact-fence contracts are mutation-resistant")
 

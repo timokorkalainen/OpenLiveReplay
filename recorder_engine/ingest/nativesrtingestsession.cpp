@@ -851,7 +851,6 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                     decodedFrame.sourcePtsMs = decodedSourcePtsMs;
                     decodedFrame.sourceTimecode100ns = decodedTimecode100ns;
                     decodedFrame.gpuFrame = std::move(gpuFrame);
-                    decodedFrame.gpuFenceValue = imported.fenceValue;
                     m_callbacks.onVideoFrame(std::move(decodedFrame));
                     return true;
                 },

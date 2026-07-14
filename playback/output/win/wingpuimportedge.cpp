@@ -187,6 +187,10 @@ public:
     CpuPlanes cachedCpuPlanes(FramePixelFormat target) const override;
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
     std::shared_ptr<GpuFence> gpuFence() const override { return m_renderFence; }
+    GpuFrameSynchronization gpuSynchronization() const override {
+        if (m_renderFenceValue == 0) return {nullptr, 0, true};
+        return {m_renderFence, m_renderFenceValue, true};
+    }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
     void seedCpuCacheForTest(CpuPlanes planes) const {
         if (!planes.isValid()) return;
@@ -440,6 +444,7 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
     if (meta.key.height <= 0) meta.key.height = surface->desc().height;
     meta.key.format = FramePixelFormat::Nv12;
     uint64_t exactFenceValue = 0;
+    std::shared_ptr<GpuFence> exactFence;
     if (renderFence) {
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
@@ -447,14 +452,15 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
         const auto result = operation.submit(
             adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
         if (!result.succeeded()) return FrameHandle{};
+        exactFence = result.producerFence;
         exactFenceValue = result.fenceValue;
         if (submittedFenceValue) *submittedFenceValue = exactFenceValue;
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
-    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence),
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(exactFence),
                                                      exactFenceValue, std::move(charge));
 #else
-    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(renderFence),
+    auto data = std::make_shared<D3D11IGpuFrameData>(std::move(surface), std::move(exactFence),
                                                      exactFenceValue);
 #endif
     return FrameHandle(std::move(data), meta);

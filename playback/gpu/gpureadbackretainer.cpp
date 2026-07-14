@@ -1,4 +1,5 @@
 #include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpusurface.h"
@@ -587,15 +588,8 @@ releaseCompletedGroups(RetireShard& shard, size_t shardIndex,
     return result;
 }
 
-bool domainIsDead(uintptr_t domain, const std::vector<DeadDeviceToken>& deadDevices) noexcept {
-    for (const DeadDeviceToken& token : deadDevices) {
-        if (token.deviceDomainId() == domain) return true;
-    }
-    return false;
-}
-
-qsizetype abandonShardDomains(RetireShard& shard, size_t shardIndex, uintptr_t singleDomain,
-                              const std::vector<DeadDeviceToken>* deadDevices) {
+qsizetype abandonShardDomains(RetireShard& shard, size_t shardIndex,
+                              const GpuValidatedDeadDomains& deadDomains) {
     DeferredReleases& releases = deferredReleases();
     releases.clear();
     qsizetype released = 0;
@@ -615,8 +609,8 @@ qsizetype abandonShardDomains(RetireShard& shard, size_t shardIndex, uintptr_t s
             if (storageProbeEnabledForThread)
                 storage().probe.abandonmentNodesVisited.fetch_add(1, std::memory_order_relaxed);
 #endif
-            const bool dead = deadDevices ? domainIsDead(node.identity.deviceDomainId, *deadDevices)
-                                          : node.identity.deviceDomainId == singleDomain;
+            const bool dead =
+                deadDomains.authorizes(node.identity.deviceDomainId, node.identity.authorityEpoch);
             if (dead) {
                 const uint16_t ownerCount = node.ownerCount;
                 if (node.state == RetireNodeState::Signaled ||
@@ -824,25 +818,17 @@ qsizetype GpuReadbackRetainer::pendingCount() noexcept {
     return storage().metrics.pendingOwners.load(std::memory_order_relaxed);
 }
 
-qsizetype GpuReadbackRetainer::abandonAllNoWait(const DeadDeviceToken& deadDevice) {
-    const uintptr_t domain = deadDevice.deviceDomainId();
-    if (domain == 0) return 0;
-    const size_t shardIndex = shardIndexForDomain(domain);
-    return abandonShardDomains(storage().shards[shardIndex], shardIndex, domain, nullptr);
-}
-
-qsizetype GpuReadbackRetainer::abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) {
-    if (deadDevices.empty()) return 0;
+qsizetype GpuReadbackRetainer::abandonAllNoWait(const GpuValidatedDeadDomains& deadDomains) {
+    if (!deadDomains.hasAuthoritativeProof()) return 0;
     std::array<bool, kShardCount> visit{};
-    for (const DeadDeviceToken& token : deadDevices) {
-        if (token.deviceDomainId() != 0) visit[shardIndexForDomain(token.deviceDomainId())] = true;
-    }
+    deadDomains.forEachEvidence([&](uintptr_t domain, uint64_t) {
+        if (domain != 0) visit[shardIndexForDomain(domain)] = true;
+    });
 
     qsizetype released = 0;
     for (size_t shardIndex = 0; shardIndex < kShardCount; ++shardIndex) {
         if (visit[shardIndex])
-            released +=
-                abandonShardDomains(storage().shards[shardIndex], shardIndex, 0, &deadDevices);
+            released += abandonShardDomains(storage().shards[shardIndex], shardIndex, deadDomains);
     }
     return released;
 }

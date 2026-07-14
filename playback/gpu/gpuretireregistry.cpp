@@ -1,6 +1,7 @@
 #include "playback/gpu/gpuretireregistry.h"
 
 #include "playback/gpu/gpufence.h"
+#include "playback/gpu/gpudevicelossmonitor.h"
 #include "playback/gpu/gpusurface.h"
 
 #include <atomic>
@@ -114,13 +115,8 @@ qsizetype GpuRetireRegistry::pendingRetainCount() const {
     return GpuReadbackRetainer::pendingCount();
 }
 
-qsizetype GpuRetireRegistry::abandonAllNoWait(const DeadDeviceToken& deadDevice) const {
-    return GpuReadbackRetainer::abandonAllNoWait(deadDevice);
-}
-
-qsizetype
-GpuRetireRegistry::abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) const {
-    return GpuReadbackRetainer::abandonAllNoWait(deadDevices);
+qsizetype GpuRetireRegistry::abandonAllNoWait(const GpuValidatedDeadDomains& deadDomains) const {
+    return GpuReadbackRetainer::abandonAllNoWait(deadDomains);
 }
 
 int GpuRetireRegistry::drainWithBoundedWait(int totalTimeoutMs) const {
@@ -281,4 +277,5 @@ void GpuRetireRegistry::setDiagnosticsHookForTest(GpuRetireDiagnosticsHook hook,
                                                   void* context) noexcept {
     GpuReadbackRetainer::setDiagnosticsHookForTest(hook, context);
 }
+
 #endif

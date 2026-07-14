@@ -23,16 +23,19 @@ private:
 
 class FakeGpuFrameData final : public IFrameData {
 public:
-    explicit FakeGpuFrameData(std::shared_ptr<FakeGpuSurface> surface)
-        : m_surface(std::move(surface)) {}
+    FakeGpuFrameData(std::shared_ptr<FakeGpuSurface> surface, std::shared_ptr<GpuFence> fence,
+                     uint64_t value)
+        : m_surface(std::move(surface)), m_synchronization{std::move(fence), value, true} {}
 
     bool isGpuBacked() const override { return true; }
     CpuPlanes readToCpu(FramePixelFormat) const override { return {}; }
     GpuSurface* gpuSurface() const override { return m_surface.get(); }
+    GpuFrameSynchronization gpuSynchronization() const override { return m_synchronization; }
     FramePixelFormat nativeFormat() const override { return FramePixelFormat::Nv12; }
 
 private:
     std::shared_ptr<FakeGpuSurface> m_surface;
+    GpuFrameSynchronization m_synchronization;
 };
 
 class FakeFence final : public GpuFence {
@@ -52,7 +55,7 @@ private:
     uint64_t m_completedValue = 0;
 };
 
-static FrameHandle makeGpuFrame(uint64_t pendingFence) {
+static FrameHandle makeGpuFrame(uint64_t pendingFence, const std::shared_ptr<GpuFence>& fence) {
     auto surface = std::make_shared<FakeGpuSurface>(pendingFence);
     FrameMetadata meta;
     meta.key.feedIndex = 0;
@@ -60,7 +63,8 @@ static FrameHandle makeGpuFrame(uint64_t pendingFence) {
     meta.key.format = FramePixelFormat::Nv12;
     meta.key.width = 4;
     meta.key.height = 4;
-    return FrameHandle(std::make_shared<FakeGpuFrameData>(std::move(surface)), meta);
+    return FrameHandle(std::make_shared<FakeGpuFrameData>(std::move(surface), fence, pendingFence),
+                       meta);
 }
 
 class TestEvictionGuard : public QObject {
@@ -76,15 +80,16 @@ void TestEvictionGuard::ignoresCpuAndUnfencedGpuFrames() {
     GpuFrameRetireQueue queue;
     auto fence = std::make_shared<FakeFence>();
 
-    queue.collect(solidYuv420pHandle(4, 4, 16, 128, 128), fence);
-    queue.collect(makeGpuFrame(0), fence);
+    queue.collect(solidYuv420pHandle(4, 4, 16, 128, 128));
+    queue.collect(makeGpuFrame(0, fence));
 
     QCOMPARE(queue.size(), 0);
 }
 
 void TestEvictionGuard::timeoutRetainsFrameAndCountsStall() {
+    auto fence = std::make_shared<FakeFence>();
     auto data = std::static_pointer_cast<const IFrameData>(
-        std::make_shared<FakeGpuFrameData>(std::make_shared<FakeGpuSurface>(7)));
+        std::make_shared<FakeGpuFrameData>(std::make_shared<FakeGpuSurface>(7), fence, 7));
     FrameMetadata meta;
     meta.key.feedIndex = 0;
     meta.key.ptsMs = 7;
@@ -94,8 +99,7 @@ void TestEvictionGuard::timeoutRetainsFrameAndCountsStall() {
     std::weak_ptr<const IFrameData> weakData = data;
 
     GpuFrameRetireQueue queue;
-    auto fence = std::make_shared<FakeFence>();
-    queue.collect(FrameHandle(std::move(data), meta), fence);
+    queue.collect(FrameHandle(std::move(data), meta));
 
     int stalls = 0;
     QCOMPARE(queue.drain(0, &stalls), 0);
@@ -107,8 +111,9 @@ void TestEvictionGuard::timeoutRetainsFrameAndCountsStall() {
 }
 
 void TestEvictionGuard::completedFenceReleasesFrame() {
+    auto fence = std::make_shared<FakeFence>();
     auto data = std::static_pointer_cast<const IFrameData>(
-        std::make_shared<FakeGpuFrameData>(std::make_shared<FakeGpuSurface>(4)));
+        std::make_shared<FakeGpuFrameData>(std::make_shared<FakeGpuSurface>(4), fence, 4));
     FrameMetadata meta;
     meta.key.feedIndex = 0;
     meta.key.ptsMs = 4;
@@ -118,8 +123,7 @@ void TestEvictionGuard::completedFenceReleasesFrame() {
     std::weak_ptr<const IFrameData> weakData = data;
 
     GpuFrameRetireQueue queue;
-    auto fence = std::make_shared<FakeFence>();
-    queue.collect(FrameHandle(std::move(data), meta), fence);
+    queue.collect(FrameHandle(std::move(data), meta));
 
     fence->complete(4);
     int stalls = 0;
@@ -133,8 +137,8 @@ void TestEvictionGuard::completedFenceReleasesFrame() {
 void TestEvictionGuard::drainBudgetLimitsFenceWaitsPerPass() {
     GpuFrameRetireQueue queue;
     auto fence = std::make_shared<FakeFence>();
-    queue.collect(makeGpuFrame(4), fence);
-    queue.collect(makeGpuFrame(5), fence);
+    queue.collect(makeGpuFrame(4, fence));
+    queue.collect(makeGpuFrame(5, fence));
 
     int stalls = 0;
     QCOMPARE(queue.drain(1, &stalls, 1), 0);

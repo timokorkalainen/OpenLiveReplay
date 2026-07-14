@@ -9,6 +9,7 @@
 #include "playback/gpu/gpugeneration.h"
 
 #include <thread>
+#include <atomic>
 
 #ifdef OLR_UNIT_TEST
 struct GpuDeviceLossMonitorTestAuthority {
@@ -38,8 +39,115 @@ private slots:
     void realLossPublicationIsAtomicWithEpoch();
     void stalePublicationAfterClearIsRejected();
     void rebuildAuthorityRejectsOldDeviceAcceptsReplacement();
+    void currentAuthorityPublicationTracksGuardedEpoch();
+    void validatedRecoveryRunsOnceForConcurrentWorkers();
+    void rebuildInvalidatesUnconsumedRecoveryAuthority();
+    void tokenlessEpochCanUpgradeToValidatedRecovery();
+    void expandedDeadDomainProofRunsNewRecoveryRevision();
     void resetReturnsToPristine();
 };
+
+void TestDeviceLossMonitor::validatedRecoveryRunsOnceForConcurrentWorkers() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA11) != 0);
+
+    std::atomic<int> callbacks{0};
+    std::atomic<bool> proofObserved{true};
+    GpuValidatedLossResult results[2];
+    auto recover = [&](int index) {
+        results[index] =
+            monitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains& domains) {
+                callbacks.fetch_add(1, std::memory_order_acq_rel);
+                if (!domains.hasAuthoritativeProof())
+                    proofObserved.store(false, std::memory_order_release);
+                return qsizetype(7);
+            });
+    };
+    std::thread first(recover, 0);
+    std::thread second(recover, 1);
+    first.join();
+    second.join();
+
+    QCOMPARE(callbacks.load(std::memory_order_acquire), 1);
+    QVERIFY(proofObserved.load(std::memory_order_acquire));
+    QCOMPARE(results[0].status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(results[1].status, GpuValidatedLossStatus::Completed);
+    QCOMPARE(results[0].abandoned, qsizetype(7));
+    QCOMPARE(results[1].abandoned, qsizetype(7));
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::rebuildInvalidatesUnconsumedRecoveryAuthority() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA12) != 0);
+    monitor.beginRebuild();
+
+    bool called = false;
+    const GpuValidatedLossResult result =
+        monitor.withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
+            called = true;
+            return qsizetype(1);
+        });
+    QVERIFY(!called);
+    QCOMPARE(result.status, GpuValidatedLossStatus::Rejected);
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::tokenlessEpochCanUpgradeToValidatedRecovery() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t generation = monitor.recordSubmissionFailure(0xA13);
+    bool called = false;
+    QCOMPARE(monitor
+                 .withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
+                     called = true;
+                     return qsizetype(1);
+                 })
+                 .status,
+             GpuValidatedLossStatus::Rejected);
+    QVERIFY(!called);
+
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA13), generation);
+    QCOMPARE(monitor
+                 .withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
+                     called = true;
+                     return qsizetype(1);
+                 })
+                 .status,
+             GpuValidatedLossStatus::Completed);
+    QVERIFY(called);
+    monitor.reset();
+}
+
+void TestDeviceLossMonitor::expandedDeadDomainProofRunsNewRecoveryRevision() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t authority = GpuDeviceLossMonitorTestAuthority::capture();
+    const uint64_t generation = GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA14);
+    int callbacks = 0;
+    QCOMPARE(monitor
+                 .withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
+                     ++callbacks;
+                     return qsizetype(callbacks);
+                 })
+                 .abandoned,
+             qsizetype(1));
+    QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(authority, 0xA15), generation);
+    QCOMPARE(monitor
+                 .withValidatedDeadDomains([&](const GpuValidatedDeadDomains&) {
+                     ++callbacks;
+                     return qsizetype(callbacks);
+                 })
+                 .abandoned,
+             qsizetype(2));
+    QCOMPARE(callbacks, 2);
+    monitor.reset();
+}
 
 void TestDeviceLossMonitor::recordLossSetsLatchAndBumpsGeneration() {
     auto& m = GpuDeviceLossMonitor::instance();
@@ -195,6 +303,28 @@ void TestDeviceLossMonitor::rebuildAuthorityRejectsOldDeviceAcceptsReplacement()
     QCOMPARE(GpuDeviceLossMonitorTestAuthority::publish(oldAuthority), uint64_t(0));
     QVERIFY(GpuDeviceLossMonitorTestAuthority::publish(replacementAuthority) != 0);
     QVERIFY(monitor.realLossToken().has_value());
+}
+
+void TestDeviceLossMonitor::currentAuthorityPublicationTracksGuardedEpoch() {
+    auto& monitor = GpuDeviceLossMonitor::instance();
+    monitor.reset();
+    const uint64_t initialAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(monitor.isCurrentDeviceAuthority(initialAuthority));
+    QVERIFY(!monitor.isCurrentDeviceAuthority(0));
+
+    monitor.beginRebuild();
+    const uint64_t replacementAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(replacementAuthority != initialAuthority);
+    QVERIFY(!monitor.isCurrentDeviceAuthority(initialAuthority));
+    QVERIFY(monitor.isCurrentDeviceAuthority(replacementAuthority));
+
+    monitor.clearForRebuild();
+    QVERIFY(monitor.isCurrentDeviceAuthority(replacementAuthority));
+    monitor.reset();
+    const uint64_t resetAuthority = GpuDeviceLossMonitorTestAuthority::capture();
+    QVERIFY(resetAuthority != replacementAuthority);
+    QVERIFY(!monitor.isCurrentDeviceAuthority(replacementAuthority));
+    QVERIFY(monitor.isCurrentDeviceAuthority(resetAuthority));
 }
 
 void TestDeviceLossMonitor::resetReturnsToPristine() {

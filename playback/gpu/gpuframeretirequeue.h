@@ -11,8 +11,8 @@ class GpuFence;
 
 class GpuFrameRetireQueue {
 public:
-    void collect(FrameHandle frame, std::shared_ptr<GpuFence> fence);
-    void collect(const QVector<FrameHandle>& frames, std::shared_ptr<GpuFence> fence);
+    void collect(FrameHandle frame);
+    void collect(const QVector<FrameHandle>& frames);
     int drain(int timeoutMs, int* stalls = nullptr, int maxWaits = -1);
     void append(GpuFrameRetireQueue&& other);
     void swap(GpuFrameRetireQueue& other) noexcept;

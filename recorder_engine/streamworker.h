@@ -250,7 +250,6 @@ private:
         int64_t sourceTimecode100ns = -1;
 #ifdef OLR_GPU_PIPELINE_BUILD
         FrameHandle gpuFrame;
-        uint64_t gpuFenceValue = 0;
 #endif
     };
 
@@ -265,13 +264,11 @@ private:
 
 #ifdef OLR_GPU_PIPELINE_BUILD
     std::unique_ptr<GpuEncodePump> m_gpuEncodePump;
-    std::shared_ptr<GpuFence> m_gpuEncodeFence;
     std::atomic<bool> m_gpuEncodeCpuFallback{false};
 #if defined(_WIN32)
     std::unique_ptr<WinGpuImportEdge> m_gpuEncodeImportEdge;
 #endif
     FrameHandle m_latestGpuFrame;
-    uint64_t m_latestGpuFenceValue = 0;
     std::atomic<int64_t> m_latestGpuFrameTimecode100ns{-1};
 #endif
 

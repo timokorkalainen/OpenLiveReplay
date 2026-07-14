@@ -448,6 +448,7 @@ if(NOT OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuretireregistry.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuopscope.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurecoverycoordinator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpugeneration.cpp")
 endif()
 
@@ -458,6 +459,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpubudget.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurecoverycoordinator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuseekprefetch.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"
@@ -494,6 +496,7 @@ if(OLR_GPU_PIPELINE)
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpucompositor.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpubudget.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpudevicelossmonitor.cpp"
+        "${CMAKE_SOURCE_DIR}/playback/gpu/gpurecoverycoordinator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuseekprefetch.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpusurfaceallocator.cpp"
         "${CMAKE_SOURCE_DIR}/playback/gpu/gpuframedata.cpp"

@@ -572,8 +572,9 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         if (!submission.succeeded()) return FrameHandle{};
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);
         meta.color = color;
-        return makeGpuFrameHandle(std::move(surface), m_impl->rhi, meta, std::move(renderFence),
-                                  submission.fenceValue, std::move(*budgetCharge));
+        return makeGpuFrameHandle(std::move(surface), m_impl->rhi, meta,
+                                  std::move(submission.producerFence), submission.fenceValue,
+                                  std::move(*budgetCharge));
     }
 
     CpuPlanes rgba =
