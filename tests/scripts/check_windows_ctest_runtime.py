@@ -294,11 +294,26 @@ def check_source_policy(root: Path) -> None:
 
     launch_text = (root / ".vscode/launch.json").read_text(encoding="utf-8")
     launch = json.loads(re.sub(r"(?m)^\s*//.*$", "", launch_text))
+    launch_names = {
+        configuration.get("name")
+        for configuration in launch.get("configurations", [])
+        if configuration.get("name")
+    }
     for configuration in launch.get("configurations", []):
         if configuration.get("type") == "qml" and configuration.get("request") == "launch":
             failures.append(
                 "ambient Windows QML app launch: .vscode/launch.json: "
                 f"{configuration.get('name', '<unnamed>')}"
+            )
+
+    build_docs = (root / "docs/build-and-run.md").read_text(encoding="utf-8")
+    for match in re.finditer(
+        r"Launch the result with the `([^`]+)` VS Code", build_docs
+    ):
+        if match.group(1) not in launch_names:
+            failures.append(
+                "missing documented Windows VS Code launch configuration: "
+                f"docs/build-and-run.md: {match.group(1)}"
             )
 
     if failures:

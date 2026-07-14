@@ -129,7 +129,7 @@ cmake --preset windows-mingw-debug
 cmake --build --preset windows-mingw-debug --target OpenLiveReplay
 ```
 
-Launch the result with the `OpenLiveReplay: Launch (Windows MinGW)` VS Code
+Launch the result with the `OpenLiveReplay: Debug` VS Code
 debug configuration. It supplies the controlled Qt, FFmpeg, and SRT runtime
 paths; the build-tree executable is not a supported direct terminal launch.
 
