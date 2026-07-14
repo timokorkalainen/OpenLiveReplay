@@ -7,6 +7,8 @@
 # contract is a gate a vacuous model cannot pass. So any future edit to the
 # re-anchor protocol that breaks the proof turns this test RED, replacing the
 # manual concurrency-review obligation with a machine gate.
+# State totals are aggregates across eleven independently explored scenario
+# graphs; they do not describe one coupled 523-state graph.
 #
 # The checker is pure stdlib Python (milliseconds), so it carries the fast unit/ci
 # labels. It lives beside the design writeup it substantiates

@@ -22,6 +22,10 @@ lease.
 Accepted modes are ``fixed``, ``mut_f1``, one ``mut_f2_<family>`` per commit
 family, and ``all``.  ``all`` succeeds only when fixed proves the bounded
 invariant and every mutant produces a concrete counterexample.
+
+Each scenario is explored as an independent graph from the same initial
+state. Reported totals (523 states for ``fixed``) are the aggregate across the
+eleven scenario graphs, not the size of one coupled graph.
 """
 
 from __future__ import annotations
@@ -428,7 +432,8 @@ def run(mode: str) -> bool:
 
     if first_counterexample is None:
         print(
-            f"  VERDICT: PROOF -- invariant holds over all {explored} reachable states "
+            f"  VERDICT: PROOF -- invariant holds over {explored} reachable states "
+            f"aggregated across {len(SCENARIOS)} independent scenario graphs "
             f"(bounded to {MAX_COMPLETIONS} completed leases)\n"
         )
         return True

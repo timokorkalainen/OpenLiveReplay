@@ -395,3 +395,34 @@ behind the active lease.
   formatting/diff checks, and a fresh review of `78b4e018..HEAD`.
 - [x] Commit only the test helper and this fix-wave record with the required co-author trailer; do
   not push.
+
+## Fix Wave: Task 5 production-coupled mutation and source audit
+
+**Review findings:** The compiled mutation wrapper accepted a mutant kill without first proving
+the same selector passed against unmutated production. The source audit did not apply C/C++
+escaped-newline splicing, treated any lexically present F1 increment as effective, and did not
+require an unconditional F2 reset immediately after the committed-generation store. The model's
+523-state verdict also did not say that the count was summed across independent scenario graphs.
+
+- [x] Capture RED evidence: the old source audit accepted an escaped-newline direct store outside
+  `commitOutputStateLocked`, and the old mutation wrapper accepted F1 while its paired baseline was
+  meta-mutated with the same omission and remained RED.
+- [x] Compile dedicated unmutated F1/F2 baseline executables and require the focused selector,
+  expected PASS name, and zero-failure QtTest totals before accepting the corresponding mutant
+  kill. Always execute the mutant too so a broken-baseline rejection records whether it still died
+  for the expected assertion.
+- [x] Add F1/F2 meta-mutations that use the compiled mutant as the nominal production baseline;
+  require the outer gate to see both `unmutated baseline failed` and `mutant independently killed`.
+- [x] Normalize LF and CRLF escaped-newline splices with original-offset provenance before lexical
+  matching. Ignore comments, strings, declarations, and preprocessor macro definitions while
+  accepting valid whitespace/comment variants at the central owner.
+- [x] Require F1 to be an unconditional, reachable, production-active top-level increment before
+  the active-dispatch branch. Require exactly one production-active, unconditional F2 reset as the
+  next top-level statement after the sole central committed-generation store; reject absent,
+  conditional, unreachable, duplicate, and misordered forms with the offending source line.
+- [x] Clarify that the fixed model's 523 reachable states are aggregated across eleven independent
+  scenario graphs rather than belonging to one coupled graph.
+- [x] Run GPU-on and GPU-off baseline/mutant/meta/source/model gates (6/6 each), the normal GPU-on
+  `tst_outputruntime` and `tst_playbackworker` targets (2/2), the normal GPU-off
+  `tst_outputruntime` target (1/1; GPU-off omits `tst_playbackworker`), all model mutants, Python
+  compile checks, roadmap audit, and diff/line-ending checks. Do not push.
