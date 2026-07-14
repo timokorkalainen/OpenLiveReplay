@@ -26,6 +26,14 @@ struct GpuRetireDiagnostics {
     qsizetype quarantineCount = 0;
 };
 
+#ifdef OLR_UNIT_TEST
+struct GpuRetireAllocationSnapshot {
+    uint64_t preparation = 0;
+    uint64_t callback = 0;
+    uint64_t postAccept = 0;
+};
+#endif
+
 class GpuRetireRegistry final {
 public:
     void drainCompleted() const;
@@ -36,8 +44,9 @@ public:
     GpuRetireDiagnostics diagnostics() const;
 
 #ifdef OLR_UNIT_TEST
-    static void failNextPreparationAllocationForTest() noexcept;
-    static uint64_t preparationAllocationCountForTest() noexcept;
+    static void failNextStorageAllocationForTest() noexcept;
+    static void resetAllocationProbeForTest() noexcept;
+    static GpuRetireAllocationSnapshot allocationSnapshotForTest() noexcept;
 #endif
 
 private:
@@ -45,8 +54,22 @@ private:
 #ifdef OLR_UNIT_TEST
     friend struct GpuRetireRegistryTestAuthority;
 #endif
-    void registerRetire(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuFence> fence,
-                        uint64_t fenceValue) const;
+    void registerRetire(std::shared_ptr<GpuSurface> surface, GpuRetirementTicket ticket) const;
+    class AllocationPhaseScope final {
+    public:
+        AllocationPhaseScope(const AllocationPhaseScope&) = delete;
+        AllocationPhaseScope& operator=(const AllocationPhaseScope&) = delete;
+        AllocationPhaseScope(AllocationPhaseScope&& other) noexcept;
+        ~AllocationPhaseScope();
+        void enterCallback() noexcept;
+        void enterPostAccept() noexcept;
+
+    private:
+        friend class GpuRetireRegistry;
+        explicit AllocationPhaseScope(uint8_t initialPhase) noexcept;
+        uint8_t m_previousPhase = 0;
+        bool m_active = true;
+    };
     class PreparedBatch final {
     public:
         PreparedBatch() = default;
@@ -75,6 +98,8 @@ private:
 
     PreparedBatch prepareRetirement(const std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
                                     const std::shared_ptr<GpuFence>& fence) const noexcept;
+    AllocationPhaseScope beginAllocationScope() const noexcept;
+    static uint8_t exchangeAllocationPhase(uint8_t phase) noexcept;
     bool publishPrepared(PreparedBatch& prepared, GpuRetirementTicket ticket) const noexcept;
     void quarantinePrepared(PreparedBatch& prepared) const noexcept;
     void releasePrepared(PreparedBatch& prepared) const noexcept;

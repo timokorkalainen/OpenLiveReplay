@@ -28,6 +28,21 @@ namespace {
 
 constexpr int kMaxGridSources = 16;
 
+template <size_t N, size_t Capacity, typename Adapter>
+GpuSubmissionResult submitCompactedOwners(GpuOpScope& operation, Adapter& adapter,
+                                          std::array<std::shared_ptr<GpuSurface>, Capacity>& owners,
+                                          size_t ownerCount) noexcept {
+    if (ownerCount == N) {
+        std::array<std::shared_ptr<GpuSurface>, N> exactOwners;
+        for (size_t i = 0; i < N; ++i)
+            exactOwners[i] = std::move(owners[i]);
+        return operation.submit(adapter, GpuSurfacePack<N>(std::move(exactOwners)));
+    }
+    if constexpr (N < Capacity)
+        return submitCompactedOwners<N + 1>(operation, adapter, owners, ownerCount);
+    return {};
+}
+
 struct GridUniformBlock {
     qint32 matrix = 0;
     qint32 range = 0;
@@ -530,10 +545,17 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         GpuOpScope operation(renderFence, registry);
         std::array<std::shared_ptr<GpuSurface>, kMaxGridSources + 1> retirementOwners;
         size_t retirementOwnerCount = 0;
+        auto appendUniqueOwner = [&](const std::shared_ptr<GpuSurface>& owner) {
+            if (!owner) return;
+            for (size_t i = 0; i < retirementOwnerCount; ++i) {
+                if (retirementOwners[i].get() == owner.get()) return;
+            }
+            retirementOwners[retirementOwnerCount++] = owner;
+        };
         for (const PreparedSource& source : sources) {
-            if (source.surface) retirementOwners[retirementOwnerCount++] = source.surface;
+            appendUniqueOwner(source.surface);
         }
-        retirementOwners[retirementOwnerCount] = surface;
+        appendUniqueOwner(surface);
         RenderGridResult renderResult;
         auto adapter = [&]() noexcept {
             const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
@@ -545,8 +567,8 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
             return renderResult.rendered ? GpuSubmitOutcome::Submitted
                                          : GpuSubmitOutcome::SubmittedWithError;
         };
-        const auto submission = operation.submit(
-            adapter, GpuSurfacePack<kMaxGridSources + 1>(std::move(retirementOwners)));
+        const auto submission =
+            submitCompactedOwners<1>(operation, adapter, retirementOwners, retirementOwnerCount);
         if (!submission.succeeded()) return FrameHandle{};
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);
         meta.color = color;

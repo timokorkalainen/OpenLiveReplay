@@ -80,7 +80,7 @@ function(olr_add_gpu_submission_compile_control name source expectation)
         "-DTARGET=${target}"
         "-DCONFIG=$<CONFIG>")
     if(expectation STREQUAL "PASS")
-        target_compile_definitions(${target} PRIVATE OLR_GPU_SUBMISSION_PASS=1 ${ARGN})
+        target_compile_definitions(${target} PRIVATE ${ARGN})
         list(APPEND control_args "-DEXPECT_COMPILE=TRUE")
     elseif(expectation STREQUAL "NO_TRACK")
         list(APPEND control_args
@@ -92,6 +92,11 @@ function(olr_add_gpu_submission_compile_control name source expectation)
             "-DEXPECT_COMPILE=FALSE"
             "-DEXPECTED_MEMBER=submit"
             "-DEXPECTED_ACCESS=(no.matching|candidate.expects|requires)")
+    elseif(expectation STREQUAL "REGISTRY_PAIRING")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=registerRetire"
+            "-DEXPECTED_ACCESS=(no.member|has.no.member|not.a.member|has.not.been.declared|undeclared)")
     else()
         message(FATAL_ERROR "Unknown GPU submission compile-control expectation: ${expectation}")
     endif()
@@ -112,16 +117,28 @@ olr_add_gpu_submission_compile_control(gpu_op_track_access gpu_op_track_access.c
 olr_add_gpu_submission_compile_control(
     gpu_submit_without_owner gpu_submit_without_owner.cpp OWNER_REQUIRED)
 olr_add_gpu_submission_compile_control(
-    gpu_submit_d3d11_adapter_pass gpu_submit_without_owner.cpp PASS OLR_GPU_ADAPTER_D3D11=1)
+    gpu_registry_pairing gpu_registry_pairing.cpp REGISTRY_PAIRING)
 olr_add_gpu_submission_compile_control(
-    gpu_submit_metal_adapter_pass gpu_submit_without_owner.cpp PASS OLR_GPU_ADAPTER_METAL=1)
-olr_add_gpu_submission_compile_control(
-    gpu_submit_stub_adapter_pass gpu_submit_without_owner.cpp PASS OLR_GPU_ADAPTER_STUB=1)
+    gpu_submit_stub_adapter_pass gpu_submit_stub_adapter_pass.cpp PASS)
+if(WIN32)
+    olr_add_gpu_submission_compile_control(
+        gpu_submit_d3d11_adapter_pass gpu_submit_d3d11_adapter_pass.cpp PASS
+        OLR_GPU_PIPELINE_BUILD=1)
+endif()
+if(APPLE)
+    olr_add_gpu_submission_compile_control(
+        gpu_submit_metal_adapter_pass gpu_submit_metal_adapter_pass.mm PASS
+        OLR_GPU_PIPELINE_BUILD=1)
+endif()
 set_tests_properties(
-    gpu_submit_d3d11_adapter_pass
-    gpu_submit_metal_adapter_pass
     gpu_submit_stub_adapter_pass
     PROPERTIES DEPENDS gpu_submit_without_owner)
+if(WIN32)
+    set_tests_properties(gpu_submit_d3d11_adapter_pass PROPERTIES DEPENDS gpu_submit_without_owner)
+endif()
+if(APPLE)
+    set_tests_properties(gpu_submit_metal_adapter_pass PROPERTIES DEPENDS gpu_submit_without_owner)
+endif()
 set_tests_properties(
     gpu_native_handle_access_pass
     gpu_native_handle_access_unrelated_error_rejected

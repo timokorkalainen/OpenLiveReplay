@@ -5,8 +5,9 @@
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpuframeretirequeue.h"
-#include "playback/gpu/gpureadbackretainer.h"
+#include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpuretireregistry.h"
+#include "playback/gpu/gpusubmission.h"
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpurhicontext.h"
 #include "playback/gpu/gpusurface.h"
@@ -43,6 +44,7 @@ namespace {
 
 class DeferredFence final : public GpuFence {
 public:
+    DeferredFence() : GpuFence(0xD3F3, 1) {}
     uint64_t signal() override { return m_next.fetch_add(1, std::memory_order_acq_rel) + 1; }
     bool wait(uint64_t value, int) override { return completedValue() >= value; }
     uint64_t completedValue() const override { return m_completed.load(std::memory_order_acquire); }
@@ -57,6 +59,7 @@ class TestSurface final : public GpuSurface {
 public:
     GpuSurfaceDesc desc() const override { return GpuSurfaceDesc{FramePixelFormat::Nv12, 64, 48}; }
     bool isValid() const override { return true; }
+    GpuSurfaceCompatibility compatibility() const override { return {0xD3F3, 1}; }
     void* nativeHandle() const override { return nullptr; }
     void retainUntilFenceRetired(uint64_t fenceValue) override {
         m_pending.store(fenceValue, std::memory_order_release);
@@ -110,7 +113,13 @@ void TestGpuFrameData::completedReadbackRetainReleasesImmediately() {
     auto surface = std::make_shared<TestSurface>();
     std::weak_ptr<GpuSurface> weakSurface = surface;
 
-    gpuRetireDetail::registerRetire(surface, fence, 1);
+    GpuRetireRegistry registry;
+    GpuOpScope operation(fence, registry);
+    auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+    const auto result = operation.submit(
+        adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    QCOMPARE(result.retirement, GpuRetirementDisposition::Published);
+    registry.drainCompleted();
     surface.reset();
 
     QVERIFY2(weakSurface.expired(),

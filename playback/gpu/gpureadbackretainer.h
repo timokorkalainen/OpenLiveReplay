@@ -9,30 +9,33 @@
 
 class DeadDeviceToken;
 class GpuFence;
+class GpuRetireRegistry;
+class GpuRetirementTicket;
 class GpuSurface;
 
-// Storage implementation for GpuRetireRegistry. Production call sites use the
-// facade; this namespace exists only to keep the existing single global store.
-namespace gpuRetireDetail {
+// Private legacy-store implementation. Only the registry facade can publish an
+// immutable fence-minted ticket; arbitrary surface/fence/value pairing is not a
+// callable capability outside that authority boundary.
+class GpuReadbackRetainer final {
+private:
+    friend class GpuRetireRegistry;
 
-void registerRetire(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuFence> fence,
-                    uint64_t fenceValue);
-void registerRetireBatch(std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
-                         const std::shared_ptr<GpuFence>& fence, uint64_t fenceValue);
-void drainCompleted();
-qsizetype pendingCount();
-qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice);
-qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices);
-int drainWithBoundedWait(int totalTimeoutMs);
-qsizetype highWaterMark();
-uint64_t timeoutCount();
-uint64_t signalFailureCount();
-void noteSignalFailure();
+    static void registerRetire(std::shared_ptr<GpuSurface> surface, GpuRetirementTicket ticket);
+    static void drainCompleted();
+    static qsizetype pendingCount();
+    static qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice);
+    static qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices);
+    static int drainWithBoundedWait(int totalTimeoutMs);
+    static qsizetype highWaterMark();
+    static uint64_t timeoutCount();
+    static uint64_t signalFailureCount();
+    static void noteSignalFailure();
+};
 
 #ifdef OLR_UNIT_TEST
+namespace gpuRetireDetail {
 bool mutexAvailableForTest();
-#endif
-
 } // namespace gpuRetireDetail
+#endif
 
 #endif // OLR_GPU_READBACK_RETAINER_H

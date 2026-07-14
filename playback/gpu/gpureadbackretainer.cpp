@@ -51,35 +51,30 @@ uint64_t& nextReadbackRetainId() {
 
 } // namespace
 
-namespace gpuRetireDetail {
-
-void registerRetire(std::shared_ptr<GpuSurface> surface, std::shared_ptr<GpuFence> fence,
-                    uint64_t fenceValue) {
-    registerRetireBatch(&surface, 1, fence, fenceValue);
-}
-
-void registerRetireBatch(std::shared_ptr<GpuSurface>* surfaces, qsizetype count,
-                         const std::shared_ptr<GpuFence>& fence, uint64_t fenceValue) {
-    if (!surfaces || count <= 0 || !fence || fenceValue == 0) return;
-    for (qsizetype i = 0; i < count; ++i) {
-        if (surfaces[i]) surfaces[i]->retainUntilFenceRetired(fenceValue);
+void GpuReadbackRetainer::registerRetire(std::shared_ptr<GpuSurface> surface,
+                                         GpuRetirementTicket ticket) {
+    const std::shared_ptr<GpuFence> fence = ticket.fence();
+    const uint64_t fenceValue = ticket.value();
+    if (!surface || !fence || fenceValue == 0) return;
+    try {
+        if (!fence->validatesRetirement(ticket, surface->compatibility())) return;
+    } catch (...) {
+        return;
     }
+    surface->retainUntilFenceRetired(fenceValue);
     // Preserve immediate release for an already-completed operation, but query
     // the driver once per batch and before taking the process-wide registry lock.
     if (fence->completedValue() >= fenceValue) return;
 
     QMutexLocker locker(&readbackRetainMutex());
     auto& retains = readbackRetains();
-    retains.reserve(retains.size() + count);
-    for (qsizetype i = 0; i < count; ++i) {
-        if (!surfaces[i]) continue;
-        retains.append(ReadbackRetain{nextReadbackRetainId()++, std::move(surfaces[i]), fence,
-                                      fenceValue, fence->deviceDomainId()});
-    }
+    retains.reserve(retains.size() + 1);
+    retains.append(ReadbackRetain{nextReadbackRetainId()++, std::move(surface), fence, fenceValue,
+                                  fence->deviceDomainId()});
     retainerMetrics().highWaterMark = std::max(retainerMetrics().highWaterMark, retains.size());
 }
 
-void drainCompleted() {
+void GpuReadbackRetainer::drainCompleted() {
     QVector<ReadbackRetain> snapshot;
     {
         QMutexLocker locker(&readbackRetainMutex());
@@ -103,17 +98,17 @@ void drainCompleted() {
     }
 }
 
-qsizetype pendingCount() {
+qsizetype GpuReadbackRetainer::pendingCount() {
     drainCompleted();
     QMutexLocker locker(&readbackRetainMutex());
     return readbackRetains().size();
 }
 
-qsizetype abandonAllNoWait(const DeadDeviceToken& deadDevice) {
-    return abandonAllNoWait(std::vector<DeadDeviceToken>{deadDevice});
+qsizetype GpuReadbackRetainer::abandonAllNoWait(const DeadDeviceToken& deadDevice) {
+    return GpuReadbackRetainer::abandonAllNoWait(std::vector<DeadDeviceToken>{deadDevice});
 }
 
-qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) {
+qsizetype GpuReadbackRetainer::abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) {
     if (deadDevices.empty()) return 0;
     QSet<quintptr> deadDomains;
     deadDomains.reserve(qsizetype(deadDevices.size()));
@@ -131,7 +126,7 @@ qsizetype abandonAllNoWait(const std::vector<DeadDeviceToken>& deadDevices) {
     return dropped;
 }
 
-int drainWithBoundedWait(int totalTimeoutMs) {
+int GpuReadbackRetainer::drainWithBoundedWait(int totalTimeoutMs) {
     QVector<ReadbackRetain> snapshot;
     {
         QMutexLocker locker(&readbackRetainMutex());
@@ -175,32 +170,32 @@ int drainWithBoundedWait(int totalTimeoutMs) {
     return released;
 }
 
-qsizetype highWaterMark() {
+qsizetype GpuReadbackRetainer::highWaterMark() {
     QMutexLocker locker(&readbackRetainMutex());
     return retainerMetrics().highWaterMark;
 }
 
-uint64_t timeoutCount() {
+uint64_t GpuReadbackRetainer::timeoutCount() {
     QMutexLocker locker(&readbackRetainMutex());
     return retainerMetrics().timeoutCount;
 }
 
-uint64_t signalFailureCount() {
+uint64_t GpuReadbackRetainer::signalFailureCount() {
     QMutexLocker locker(&readbackRetainMutex());
     return retainerMetrics().signalFailureCount;
 }
 
-void noteSignalFailure() {
+void GpuReadbackRetainer::noteSignalFailure() {
     QMutexLocker locker(&readbackRetainMutex());
     ++retainerMetrics().signalFailureCount;
 }
 
 #ifdef OLR_UNIT_TEST
+namespace gpuRetireDetail {
 bool mutexAvailableForTest() {
     if (!readbackRetainMutex().tryLock()) return false;
     readbackRetainMutex().unlock();
     return true;
 }
-#endif
-
 } // namespace gpuRetireDetail
+#endif

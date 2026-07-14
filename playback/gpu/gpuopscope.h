@@ -34,30 +34,33 @@ public:
         GpuSubmissionResult result;
         if (m_submitted || !m_fence) return result;
         m_submitted = true;
+        auto allocationPhase = m_registry.beginAllocationScope();
 
         const uint64_t generation = GpuGenerationCounter::instance().current();
         const GpuFenceIdentity preparedFence = m_fence->identity();
         std::array<GpuSurfaceCompatibility, N> compatibilities{};
         GpuSurfaceCompatibility firstCompatibility{};
-        bool haveOwner = false;
         try {
             for (size_t i = 0; i < N; ++i) {
                 const auto& owner = surfaces.owners()[i];
-                if (!owner) continue;
+                if (!owner) return result;
+                for (size_t previous = 0; previous < i; ++previous) {
+                    if (surfaces.owners()[previous].get() == owner.get()) return result;
+                }
+            }
+            for (size_t i = 0; i < N; ++i) {
+                const auto& owner = surfaces.owners()[i];
                 const GpuSurfaceCompatibility compatibility = owner->compatibility();
                 if (!gpuSubmissionDetail::matchesSurfaceEvidence(
                         compatibility, preparedFence, generation,
                         GpuGenerationCounter::instance().current()))
                     return result;
                 compatibilities[i] = compatibility;
-                if (!haveOwner) firstCompatibility = compatibility;
-                haveOwner = true;
+                if (i == 0) firstCompatibility = compatibility;
             }
         } catch (...) {
             return result;
         }
-        if (!haveOwner) return result;
-
         auto prepared =
             m_registry.prepareRetirement(surfaces.owners().data(), qsizetype(N), m_fence);
         if (!prepared) return result;
@@ -66,9 +69,11 @@ public:
         try {
             auto ticket = m_fence->submitExactForRetirement(
                 preparedFence, firstCompatibility, generation, [&]() noexcept {
+                    allocationPhase.enterCallback();
                     outcome = std::invoke(adapter);
                     if (outcome == GpuSubmitOutcome::NotSubmitted) return false;
                     prepared.markAccepted();
+                    allocationPhase.enterPostAccept();
                     return true;
                 });
             result.outcome = outcome;
