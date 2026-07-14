@@ -618,7 +618,7 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
     const QByteArray nal = removeAnnexBPrefix(parameterSet);
     if (nal.size() < 4 || (uchar(nal[0]) & 0x80u) != 0 || ((uchar(nal[0]) >> 1) & 0x3fu) != 32 ||
         (((uchar(nal[0]) & 0x01u) << 5) | (uchar(nal[1]) >> 3)) != 0 ||
-        (uchar(nal[1]) & 0x07u) == 0) {
+        (uchar(nal[1]) & 0x07u) != 1) {
         return malformedHevc();
     }
     QByteArray rbsp;
@@ -677,14 +677,20 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
         }
         uint32_t hrdCount = 0;
         if (!reader.ue(hrdCount)) return malformedHevc();
-        if (hrdCount > 1024) return malformedHevc();
+        if (hrdCount > uint64_t(layerSetCountMinus1) + 1) return malformedHevc();
         HevcHrdSyntax hrdSyntax;
+        bool sawBaseLayerSetHrd = false;
         for (uint32_t i = 0; i < hrdCount; ++i) {
             bool commonInformationPresent = i == 0;
-            if (!reader.ue(ignored) || (i > 0 && !reader.bit(commonInformationPresent)) ||
+            uint32_t hrdLayerSetIndex = 0;
+            if (!reader.ue(hrdLayerSetIndex) || hrdLayerSetIndex > layerSetCountMinus1 ||
+                (i == 0 && hrdLayerSetIndex != 0) ||
+                (hrdLayerSetIndex == 0 && sawBaseLayerSetHrd) ||
+                (i > 0 && !reader.bit(commonInformationPresent)) ||
                 !skipHevcHrd(reader, commonInformationPresent, maxSubLayersMinus1, hrdSyntax)) {
                 return malformedHevc();
             }
+            if (hrdLayerSetIndex == 0) sawBaseLayerSetHrd = true;
         }
         if (hrdCount != 0) applyHevcHrdSyntax(syntax, hrdSyntax);
     }
@@ -755,7 +761,7 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     const QByteArray nal = removeAnnexBPrefix(parameterSet);
     if (nal.size() < 4 || (uchar(nal[0]) & 0x80u) != 0 || ((uchar(nal[0]) >> 1) & 0x3fu) != 33 ||
         (((uchar(nal[0]) & 0x01u) << 5) | (uchar(nal[1]) >> 3)) != 0 ||
-        (uchar(nal[1]) & 0x07u) == 0) {
+        (uchar(nal[1]) & 0x07u) != 1) {
         return malformedHevc();
     }
     QByteArray rbsp;
@@ -1629,7 +1635,12 @@ H26xTimingDetail::parseHevcTimeCode(const QByteArray& payload, const HevcTimingS
             result.status = TimecodeParseStatus::Malformed;
             return result;
         }
-        if (!clockTimestampFlag) continue;
+        if (!clockTimestampFlag) {
+            havePreviousSeconds = false;
+            havePreviousMinutes = false;
+            havePreviousHours = false;
+            continue;
+        }
 
         bool unitsFieldBased = false;
         uint32_t countingType = 0;

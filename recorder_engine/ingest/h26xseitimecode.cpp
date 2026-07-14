@@ -93,6 +93,10 @@ H26xTimingDetail::TimecodeParseResult parseRegisteredT35(const QByteArray& paylo
         }
         ++pos; // itu_t_t35_country_code_extension_byte
     }
+    if (pos >= payload.size()) {
+        result.status = TimecodeParseStatus::Malformed;
+        return result;
+    }
 
     // T.35 assigns the remaining syntax to the registered provider. There is
     // no published ATC profile selected by this project, so no provider-owned
@@ -417,6 +421,9 @@ H26xSeiTimecodeResult extractH26xSeiTimecodeResult(const QByteArray& annexB, Nat
     bool accepted = false;
     const H26xSeiTimecodeResult result =
         extractResult(annexB, codec, &context, &workingContinuity, &accepted);
-    if (accepted) state.m_hevcContinuity = workingContinuity;
+    if (accepted)
+        state.m_hevcContinuity = workingContinuity;
+    else
+        state.m_hevcContinuity = {};
     return result;
 }
