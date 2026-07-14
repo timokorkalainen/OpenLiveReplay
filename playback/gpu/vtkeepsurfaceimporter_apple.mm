@@ -9,6 +9,7 @@
 #include "playback/gpu/gpuopscope.h"
 #include "playback/gpu/gpuretireregistry.h"
 
+#include <array>
 #include <utility>
 
 FrameHandle importVtImageBuffer(void* cvImageBufferRef, FrameMetadata meta,
@@ -37,8 +38,10 @@ FrameHandle importVtSurface(const std::shared_ptr<GpuSurface>& surface,
     if (renderFence) {
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
-        operation.track(surface);
-        if (!operation.submit([] { return GpuSubmitOutcome::Submitted; })) return FrameHandle{};
+        auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+        const auto result = operation.submit(
+            adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+        if (!result.succeeded()) return FrameHandle{};
     }
     return makeGpuFrameHandle(surface, std::move(rhi), std::move(meta), std::move(renderFence),
                               std::move(*charge));

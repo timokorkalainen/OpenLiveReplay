@@ -438,8 +438,10 @@ FrameHandle WinGpuImportEdge::makeGpuFrameHandleForTest(std::shared_ptr<D3D11Gpu
     if (renderFence) {
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
-        operation.track(surface);
-        if (!operation.submit([] { return GpuSubmitOutcome::Submitted; })) return FrameHandle{};
+        auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+        const auto result = operation.submit(
+            adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+        if (!result.succeeded()) return FrameHandle{};
         if (submittedFenceValue) *submittedFenceValue = operation.fenceValue();
     }
 #ifdef OLR_GPU_PIPELINE_BUILD
@@ -577,8 +579,10 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
             if (m_renderFence && m_surface) {
                 GpuRetireRegistry registry;
                 GpuOpScope operation(m_renderFence, registry);
-                operation.track(m_surface);
-                (void) operation.submit([] { return GpuSubmitOutcome::Submitted; });
+                auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+                (void) operation.submit(
+                    adapter,
+                    GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{m_surface}));
             }
             m_cpuCache.insert(int(target), out);
         }

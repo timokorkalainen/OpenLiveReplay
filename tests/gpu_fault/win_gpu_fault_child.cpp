@@ -24,6 +24,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <cstdio>
 #include <memory>
 
@@ -307,8 +308,10 @@ int probeFence() {
 
     GpuRetireRegistry registry;
     GpuOpScope operation(fence, registry);
-    operation.track(surface);
-    if (!operation.submit([] { return GpuSubmitOutcome::Submitted; })) return 5;
+    auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+    const auto submission = operation.submit(
+        adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
+    if (!submission.succeeded()) return 5;
     const uint64_t signalValue = operation.fenceValue();
     const uint64_t initialCompleted = fence->completedValue();
     const qsizetype pendingInitially = registry.pendingRetainCount();

@@ -19,6 +19,7 @@
 #include <rhi/qshader.h>
 #include <rhi/qrhi.h>
 
+#include <array>
 #include <cmath>
 #include <utility>
 #include <vector>
@@ -527,12 +528,14 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
         if (!renderFence) return FrameHandle{};
         GpuRetireRegistry registry;
         GpuOpScope operation(renderFence, registry);
+        std::array<std::shared_ptr<GpuSurface>, kMaxGridSources + 1> retirementOwners;
+        size_t retirementOwnerCount = 0;
         for (const PreparedSource& source : sources) {
-            if (source.surface) operation.track(source.surface);
+            if (source.surface) retirementOwners[retirementOwnerCount++] = source.surface;
         }
-        operation.track(surface);
+        retirementOwners[retirementOwnerCount] = surface;
         RenderGridResult renderResult;
-        const bool submitted = operation.submit([&] {
+        auto adapter = [&]() noexcept {
             const bool invoked = m_impl->rhi->invokeOnRenderThread([&](QRhi* rhi) {
                 renderResult = renderGridWithRhi(rhi, sources, cappedFrameCount(filtered), width,
                                                  height, color, quality, surface);
@@ -541,8 +544,10 @@ FrameHandle GpuCompositor::composeGridForGeneration(const QList<FrameHandle>& fr
                 return GpuSubmitOutcome::NotSubmitted;
             return renderResult.rendered ? GpuSubmitOutcome::Submitted
                                          : GpuSubmitOutcome::SubmittedWithError;
-        });
-        if (!submitted) return FrameHandle{};
+        };
+        const auto submission = operation.submit(
+            adapter, GpuSurfacePack<kMaxGridSources + 1>(std::move(retirementOwners)));
+        if (!submission.succeeded()) return FrameHandle{};
         FrameMetadata meta = makeCompositeMetadata(width, height, generation);
         meta.color = color;
         return makeGpuFrameHandle(std::move(surface), m_impl->rhi, meta, std::move(renderFence),

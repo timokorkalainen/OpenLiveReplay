@@ -74,6 +74,7 @@ protected:
     }
 
 private:
+    friend class GpuOpScope;
     static uint64_t currentGpuGeneration() noexcept;
     static uint64_t mixAuthorityWord(uint64_t state, uint64_t word) noexcept {
         state ^= word + 0x9e3779b97f4a7c15ULL + (state << 6) + (state >> 2);

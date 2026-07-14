@@ -5,6 +5,7 @@
 #include "playback/gpu/gpufence.h"
 #include "playback/gpu/gpuframedata.h"
 #include "playback/gpu/gpuframeretirequeue.h"
+#include "playback/gpu/gpureadbackretainer.h"
 #include "playback/gpu/gpuretireregistry.h"
 #include "playback/gpu/gpubudget.h"
 #include "playback/gpu/gpurhicontext.h"
@@ -109,7 +110,7 @@ void TestGpuFrameData::completedReadbackRetainReleasesImmediately() {
     auto surface = std::make_shared<TestSurface>();
     std::weak_ptr<GpuSurface> weakSurface = surface;
 
-    GpuRetireRegistry{}.registerRetire(surface, fence, 1);
+    gpuRetireDetail::registerRetire(surface, fence, 1);
     surface.reset();
 
     QVERIFY2(weakSurface.expired(),

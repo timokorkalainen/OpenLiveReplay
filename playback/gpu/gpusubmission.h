@@ -2,11 +2,14 @@
 #define OLR_GPU_SUBMISSION_H
 
 #include <atomic>
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <memory>
 
 class GpuFence;
+class GpuSurface;
 #ifdef OLR_UNIT_TEST
 struct GpuRetirementTicketTestAuthority;
 #endif
@@ -31,6 +34,36 @@ struct GpuFenceIdentity {
 struct GpuSurfaceCompatibility {
     uintptr_t deviceDomainId = 0;
     uint64_t authorityEpoch = 0;
+};
+
+enum class GpuSubmitOutcome : uint8_t { NotSubmitted, Submitted, SubmittedWithError };
+
+enum class GpuRetirementDisposition : uint8_t { None, Published, Quarantined };
+
+struct GpuSubmissionResult {
+    GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
+    GpuRetirementDisposition retirement = GpuRetirementDisposition::None;
+    uint64_t fenceValue = 0;
+
+    bool driverAccepted() const noexcept { return outcome != GpuSubmitOutcome::NotSubmitted; }
+    bool succeeded() const noexcept {
+        return outcome == GpuSubmitOutcome::Submitted &&
+               retirement == GpuRetirementDisposition::Published;
+    }
+};
+
+template <size_t N>
+class GpuSurfacePack final {
+public:
+    static_assert(N > 0, "A fused GPU submission must own at least one surface slot");
+
+    explicit GpuSurfacePack(std::array<std::shared_ptr<GpuSurface>, N> surfaces) noexcept
+        : m_surfaces(std::move(surfaces)) {}
+
+    const std::array<std::shared_ptr<GpuSurface>, N>& owners() const noexcept { return m_surfaces; }
+
+private:
+    std::array<std::shared_ptr<GpuSurface>, N> m_surfaces;
 };
 
 // Immutable proof minted only after the exact fence authority accepts a fused

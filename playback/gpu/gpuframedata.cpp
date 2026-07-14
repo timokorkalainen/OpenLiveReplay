@@ -12,6 +12,7 @@
 
 #include <QMutexLocker>
 
+#include <array>
 #include <utility>
 
 namespace {
@@ -110,8 +111,9 @@ CpuPlanes GpuFrameData::readToCpu(FramePixelFormat target) const {
         if (m_renderFence && surface) {
             GpuRetireRegistry registry;
             GpuOpScope operation(m_renderFence, registry);
-            operation.track(surface);
-            (void) operation.submit([] { return GpuSubmitOutcome::Submitted; });
+            auto adapter = []() noexcept { return GpuSubmitOutcome::Submitted; };
+            (void) operation.submit(
+                adapter, GpuSurfacePack<1>(std::array<std::shared_ptr<GpuSurface>, 1>{surface}));
         }
         QMutexLocker locker(&m_cacheMutex);
         const auto cached = m_cpuCache.constFind(int(target));

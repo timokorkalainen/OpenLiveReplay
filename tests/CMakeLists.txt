@@ -68,12 +68,60 @@ function(olr_add_compile_control name source expectation)
     set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
 endfunction()
 
+function(olr_add_gpu_submission_compile_control name source expectation)
+    set(target "${name}_compile_control")
+    add_library(${target} STATIC EXCLUDE_FROM_ALL
+        "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/${source}")
+    target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(${target} PRIVATE Qt6::Core)
+
+    set(control_args
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DTARGET=${target}"
+        "-DCONFIG=$<CONFIG>")
+    if(expectation STREQUAL "PASS")
+        target_compile_definitions(${target} PRIVATE OLR_GPU_SUBMISSION_PASS=1 ${ARGN})
+        list(APPEND control_args "-DEXPECT_COMPILE=TRUE")
+    elseif(expectation STREQUAL "NO_TRACK")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=track"
+            "-DEXPECTED_ACCESS=(private|no.member|has.no.member)")
+    elseif(expectation STREQUAL "OWNER_REQUIRED")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=submit"
+            "-DEXPECTED_ACCESS=(no.matching|candidate.expects|requires)")
+    else()
+        message(FATAL_ERROR "Unknown GPU submission compile-control expectation: ${expectation}")
+    endif()
+
+    add_test(NAME ${name}
+        COMMAND ${CMAKE_COMMAND} ${control_args}
+            -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+    set_tests_properties(${name} PROPERTIES LABELS "gpu-capability;ci")
+endfunction()
+
 olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp
     "nativeHandle" "[Pp]rotected")
 olr_add_compile_control(gpu_native_handle_access native_handle_access.cpp PROTECTED_FAILURE)
 olr_add_compile_control(gpu_native_handle_access_pass native_handle_access_pass.cpp PASS)
 olr_add_compile_control(gpu_native_handle_access_unrelated_error_rejected
     unrelated_compile_error.cpp REJECT_UNRELATED_FAILURE)
+olr_add_gpu_submission_compile_control(gpu_op_track_access gpu_op_track_access.cpp NO_TRACK)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_without_owner gpu_submit_without_owner.cpp OWNER_REQUIRED)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_d3d11_adapter_pass gpu_submit_without_owner.cpp PASS OLR_GPU_ADAPTER_D3D11=1)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_metal_adapter_pass gpu_submit_without_owner.cpp PASS OLR_GPU_ADAPTER_METAL=1)
+olr_add_gpu_submission_compile_control(
+    gpu_submit_stub_adapter_pass gpu_submit_without_owner.cpp PASS OLR_GPU_ADAPTER_STUB=1)
+set_tests_properties(
+    gpu_submit_d3d11_adapter_pass
+    gpu_submit_metal_adapter_pass
+    gpu_submit_stub_adapter_pass
+    PROPERTIES DEPENDS gpu_submit_without_owner)
 set_tests_properties(
     gpu_native_handle_access_pass
     gpu_native_handle_access_unrelated_error_rejected
