@@ -2,11 +2,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <limits>
 #include <numeric>
 #include <optional>
 
 namespace {
+
+uint64_t nextTimingContextIdentity() {
+    static std::atomic<uint64_t> next{1};
+    uint64_t identity = next.fetch_add(1, std::memory_order_relaxed);
+    if (identity == 0) identity = next.fetch_add(1, std::memory_order_relaxed);
+    return identity;
+}
 
 class BitReader {
 public:
@@ -526,33 +534,69 @@ bool skipHevcSubLayerHrd(BitReader& reader, uint32_t cpbCountMinus1, bool subPic
     return true;
 }
 
-bool skipHevcHrd(BitReader& reader, bool commonInformationPresent, uint32_t maxSubLayersMinus1) {
+struct HevcHrdSyntax {
     bool nalHrdPresent = false;
     bool vclHrdPresent = false;
     bool subPicPresent = false;
-    bool flag = false;
+    bool subPicCpbParamsInPicTimingSei = false;
+    bool fixedPicRateWithinCvsKnown = false;
+    bool fixedPicRateWithinCvs = true;
+    uint8_t auCpbRemovalDelayLength = 0;
+    uint8_t dpbOutputDelayLength = 0;
+    uint8_t dpbOutputDelayDuLength = 0;
+    uint8_t duCpbRemovalDelayIncrementLength = 0;
+};
+
+void applyHevcHrdSyntax(HevcTimingSyntax& syntax, const HevcHrdSyntax& hrd) {
+    syntax.cpbDpbDelaysPresent = hrd.nalHrdPresent || hrd.vclHrdPresent;
+    syntax.subPicHrdParamsPresent = hrd.subPicPresent;
+    syntax.subPicCpbParamsInPicTimingSei = hrd.subPicCpbParamsInPicTimingSei;
+    syntax.fixedPicRateWithinCvsKnown = hrd.fixedPicRateWithinCvsKnown;
+    syntax.fixedPicRateWithinCvs = hrd.fixedPicRateWithinCvs;
+    syntax.auCpbRemovalDelayLength = hrd.auCpbRemovalDelayLength;
+    syntax.dpbOutputDelayLength = hrd.dpbOutputDelayLength;
+    syntax.dpbOutputDelayDuLength = hrd.dpbOutputDelayDuLength;
+    syntax.duCpbRemovalDelayIncrementLength = hrd.duCpbRemovalDelayIncrementLength;
+}
+
+bool skipHevcHrd(BitReader& reader, bool commonInformationPresent, uint32_t maxSubLayersMinus1,
+                 HevcHrdSyntax& syntax) {
     uint32_t ignored = 0;
     if (commonInformationPresent) {
-        if (!reader.bit(nalHrdPresent) || !reader.bit(vclHrdPresent)) return false;
-        if (nalHrdPresent || vclHrdPresent) {
-            if (!reader.bit(subPicPresent)) return false;
-            if (subPicPresent && (!reader.bits(8, ignored) || !reader.bits(5, ignored) ||
-                                  !reader.bit(flag) || !reader.bits(5, ignored))) {
-                return false;
+        syntax = {};
+        if (!reader.bit(syntax.nalHrdPresent) || !reader.bit(syntax.vclHrdPresent)) return false;
+        if (syntax.nalHrdPresent || syntax.vclHrdPresent) {
+            if (!reader.bit(syntax.subPicPresent)) return false;
+            if (syntax.subPicPresent) {
+                uint32_t delayIncrementLengthMinus1 = 0;
+                uint32_t outputDuLengthMinus1 = 0;
+                if (!reader.bits(8, ignored) || !reader.bits(5, delayIncrementLengthMinus1) ||
+                    !reader.bit(syntax.subPicCpbParamsInPicTimingSei) ||
+                    !reader.bits(5, outputDuLengthMinus1)) {
+                    return false;
+                }
+                syntax.duCpbRemovalDelayIncrementLength = uint8_t(delayIncrementLengthMinus1 + 1);
+                syntax.dpbOutputDelayDuLength = uint8_t(outputDuLengthMinus1 + 1);
             }
+            uint32_t auDelayLengthMinus1 = 0;
+            uint32_t dpbDelayLengthMinus1 = 0;
             if (!reader.bits(4, ignored) || !reader.bits(4, ignored) ||
-                (subPicPresent && !reader.bits(4, ignored)) || !reader.bits(5, ignored) ||
-                !reader.bits(5, ignored) || !reader.bits(5, ignored)) {
+                (syntax.subPicPresent && !reader.bits(4, ignored)) || !reader.bits(5, ignored) ||
+                !reader.bits(5, auDelayLengthMinus1) || !reader.bits(5, dpbDelayLengthMinus1)) {
                 return false;
             }
+            syntax.auCpbRemovalDelayLength = uint8_t(auDelayLengthMinus1 + 1);
+            syntax.dpbOutputDelayLength = uint8_t(dpbDelayLengthMinus1 + 1);
         }
     }
+    syntax.fixedPicRateWithinCvsKnown = true;
     for (uint32_t i = 0; i <= maxSubLayersMinus1; ++i) {
         bool fixedGeneral = false;
         bool fixedWithin = true;
         bool lowDelay = false;
         if (!reader.bit(fixedGeneral)) return false;
         if (!fixedGeneral && !reader.bit(fixedWithin)) return false;
+        syntax.fixedPicRateWithinCvs = syntax.fixedPicRateWithinCvs && fixedWithin;
         if (fixedWithin) {
             if (!reader.ue(ignored)) return false;
         } else if (!reader.bit(lowDelay)) {
@@ -560,9 +604,11 @@ bool skipHevcHrd(BitReader& reader, bool commonInformationPresent, uint32_t maxS
         }
         uint32_t cpbCountMinus1 = 0;
         if (!lowDelay && (!reader.ue(cpbCountMinus1) || cpbCountMinus1 > 31)) return false;
-        if (nalHrdPresent && !skipHevcSubLayerHrd(reader, cpbCountMinus1, subPicPresent))
+        if (syntax.nalHrdPresent &&
+            !skipHevcSubLayerHrd(reader, cpbCountMinus1, syntax.subPicPresent))
             return false;
-        if (vclHrdPresent && !skipHevcSubLayerHrd(reader, cpbCountMinus1, subPicPresent))
+        if (syntax.vclHrdPresent &&
+            !skipHevcSubLayerHrd(reader, cpbCountMinus1, syntax.subPicPresent))
             return false;
     }
     return true;
@@ -571,6 +617,7 @@ bool skipHevcHrd(BitReader& reader, bool commonInformationPresent, uint32_t maxS
 HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
     const QByteArray nal = removeAnnexBPrefix(parameterSet);
     if (nal.size() < 4 || (uchar(nal[0]) & 0x80u) != 0 || ((uchar(nal[0]) >> 1) & 0x3fu) != 32 ||
+        (((uchar(nal[0]) & 0x01u) << 5) | (uchar(nal[1]) >> 3)) != 0 ||
         (uchar(nal[1]) & 0x07u) == 0) {
         return malformedHevc();
     }
@@ -631,13 +678,15 @@ HevcTimingSyntax parseHevcVps(const QByteArray& parameterSet) {
         uint32_t hrdCount = 0;
         if (!reader.ue(hrdCount)) return malformedHevc();
         if (hrdCount > 1024) return malformedHevc();
+        HevcHrdSyntax hrdSyntax;
         for (uint32_t i = 0; i < hrdCount; ++i) {
             bool commonInformationPresent = i == 0;
             if (!reader.ue(ignored) || (i > 0 && !reader.bit(commonInformationPresent)) ||
-                !skipHevcHrd(reader, commonInformationPresent, maxSubLayersMinus1)) {
+                !skipHevcHrd(reader, commonInformationPresent, maxSubLayersMinus1, hrdSyntax)) {
                 return malformedHevc();
             }
         }
+        if (hrdCount != 0) applyHevcHrdSyntax(syntax, hrdSyntax);
     }
     bool extensionFlag = false;
     if (!reader.bit(extensionFlag)) return malformedHevc();
@@ -705,6 +754,7 @@ bool skipHevcShortTermRefPicSets(BitReader& reader, uint32_t setCount) {
 HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
     const QByteArray nal = removeAnnexBPrefix(parameterSet);
     if (nal.size() < 4 || (uchar(nal[0]) & 0x80u) != 0 || ((uchar(nal[0]) >> 1) & 0x3fu) != 33 ||
+        (((uchar(nal[0]) & 0x01u) << 5) | (uchar(nal[1]) >> 3)) != 0 ||
         (uchar(nal[1]) & 0x07u) == 0) {
         return malformedHevc();
     }
@@ -850,7 +900,11 @@ HevcTimingSyntax parseHevcSps(const QByteArray& parameterSet) {
         }
         bool hrdPresent = false;
         if (!reader.bit(hrdPresent)) return malformedHevc();
-        if (hrdPresent && !skipHevcHrd(reader, true, maxSubLayersMinus1)) return malformedHevc();
+        if (hrdPresent) {
+            HevcHrdSyntax hrdSyntax;
+            if (!skipHevcHrd(reader, true, maxSubLayersMinus1, hrdSyntax)) return malformedHevc();
+            applyHevcHrdSyntax(syntax, hrdSyntax);
+        }
     }
     bool bitstreamRestriction = false;
     if (!reader.bit(bitstreamRestriction)) return malformedHevc();
@@ -872,6 +926,17 @@ bool mergeHevcTiming(HevcTimingSyntax& base, const HevcTimingSyntax& sps) {
     if (sps.status != H26xTimingSyntaxStatus::Valid) return false;
     base.fieldSeq = sps.fieldSeq;
     base.frameFieldInfoPresent = sps.frameFieldInfoPresent;
+    if (sps.fixedPicRateWithinCvsKnown) {
+        base.cpbDpbDelaysPresent = sps.cpbDpbDelaysPresent;
+        base.subPicHrdParamsPresent = sps.subPicHrdParamsPresent;
+        base.subPicCpbParamsInPicTimingSei = sps.subPicCpbParamsInPicTimingSei;
+        base.fixedPicRateWithinCvsKnown = true;
+        base.fixedPicRateWithinCvs = sps.fixedPicRateWithinCvs;
+        base.auCpbRemovalDelayLength = sps.auCpbRemovalDelayLength;
+        base.dpbOutputDelayLength = sps.dpbOutputDelayLength;
+        base.dpbOutputDelayDuLength = sps.dpbOutputDelayDuLength;
+        base.duCpbRemovalDelayIncrementLength = sps.duCpbRemovalDelayIncrementLength;
+    }
     if (!sps.timingInfoPresent) return true;
     if (base.timingInfoPresent &&
         (base.numUnitsInTick != sps.numUnitsInTick || base.timeScale != sps.timeScale ||
@@ -894,7 +959,16 @@ bool equivalentTiming(const HevcTimingSyntax& lhs, const HevcTimingSyntax& rhs) 
            lhs.numTicksPocDiffOne == rhs.numTicksPocDiffOne &&
            lhs.timingInfoPresent == rhs.timingInfoPresent &&
            lhs.pocProportionalToTiming == rhs.pocProportionalToTiming &&
-           lhs.fieldSeq == rhs.fieldSeq && lhs.frameFieldInfoPresent == rhs.frameFieldInfoPresent;
+           lhs.fieldSeq == rhs.fieldSeq && lhs.frameFieldInfoPresent == rhs.frameFieldInfoPresent &&
+           lhs.cpbDpbDelaysPresent == rhs.cpbDpbDelaysPresent &&
+           lhs.subPicHrdParamsPresent == rhs.subPicHrdParamsPresent &&
+           lhs.subPicCpbParamsInPicTimingSei == rhs.subPicCpbParamsInPicTimingSei &&
+           lhs.fixedPicRateWithinCvsKnown == rhs.fixedPicRateWithinCvsKnown &&
+           lhs.fixedPicRateWithinCvs == rhs.fixedPicRateWithinCvs &&
+           lhs.auCpbRemovalDelayLength == rhs.auCpbRemovalDelayLength &&
+           lhs.dpbOutputDelayLength == rhs.dpbOutputDelayLength &&
+           lhs.dpbOutputDelayDuLength == rhs.dpbOutputDelayDuLength &&
+           lhs.duCpbRemovalDelayIncrementLength == rhs.duCpbRemovalDelayIncrementLength;
 }
 
 FrameRateQ hevcLabelRate(const HevcTimingSyntax& syntax, bool unitsFieldBased) {
@@ -943,6 +1017,8 @@ bool hevcClockTimestamp(uint32_t hours, uint32_t minutes, uint32_t seconds, uint
 }
 
 } // namespace
+
+H26xTimingContext::H26xTimingContext() : m_identity(nextTimingContextIdentity()) {}
 
 bool H26xTimingDetail::unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp) {
     QByteArray decoded;
@@ -1020,16 +1096,28 @@ bool H26xTimingContext::updateParameterSets(NativeVideoCodec codec, const QList<
         bool haveSps = false;
         HevcTimingSyntax firstMerged;
         std::array<std::optional<uint8_t>, 16> spsReferences;
+        QList<HevcTimingSyntax> validSps;
+        bool sawMalformedSps = false;
+        bool sawUnsupportedSps = false;
         for (const QByteArray& parameterSet : sps) {
             const HevcTimingSyntax candidate = parseHevcSps(parameterSet);
             if (candidate.status == H26xTimingSyntaxStatus::Malformed) {
-                m_hevc = malformedHevc();
-                return false;
+                sawMalformedSps = true;
+            } else if (candidate.status == H26xTimingSyntaxStatus::Unsupported) {
+                sawUnsupportedSps = true;
+            } else {
+                validSps.append(candidate);
             }
-            if (candidate.status == H26xTimingSyntaxStatus::Unsupported) {
-                m_hevc = unsupportedHevc();
-                return false;
-            }
+        }
+        if (sawMalformedSps) {
+            m_hevc = malformedHevc();
+            return false;
+        }
+        if (sawUnsupportedSps) {
+            m_hevc = unsupportedHevc();
+            return false;
+        }
+        for (const HevcTimingSyntax& candidate : validSps) {
             const auto& referencedVps = vpsById[candidate.referencedVpsId];
             if (!referencedVps.has_value()) {
                 m_hevc = unsupportedHevc();
@@ -1131,12 +1219,102 @@ uint64_t H26xTimingContext::generation() const {
     return m_generation;
 }
 
+uint64_t H26xTimingContext::identity() const {
+    return m_identity;
+}
+
 const H264TimingSyntax* H26xTimingContext::h264() const {
     return m_codec == NativeVideoCodec::H264 ? &m_h264 : nullptr;
 }
 
 const HevcTimingSyntax* H26xTimingContext::hevc() const {
     return m_codec == NativeVideoCodec::Hevc ? &m_hevc : nullptr;
+}
+
+H26xTimingDetail::HevcPictureTimingParseResult
+H26xTimingDetail::parseHevcPictureTiming(const QByteArray& payload,
+                                         const HevcTimingSyntax& syntax) {
+    HevcPictureTimingParseResult result;
+    if (syntax.status != H26xTimingSyntaxStatus::Valid) {
+        result.status = syntax.status == H26xTimingSyntaxStatus::Malformed
+                            ? TimecodeParseStatus::Malformed
+                            : TimecodeParseStatus::Unsupported;
+        return result;
+    }
+
+    BitReader reader(payload);
+    uint32_t ignored = 0;
+    if (syntax.frameFieldInfoPresent) {
+        uint32_t picStruct = 0;
+        uint32_t sourceScanType = 0;
+        bool duplicate = false;
+        if (!reader.bits(4, picStruct) || !reader.bits(2, sourceScanType) ||
+            !reader.bit(duplicate) || picStruct > 12 || sourceScanType == 3) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
+        Q_UNUSED(duplicate);
+        const bool fieldPicture = picStruct == 1 || picStruct == 2 || picStruct >= 9;
+        if (syntax.fieldSeq != fieldPicture) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
+        if (picStruct == 7 || picStruct == 8) {
+            if (!syntax.fixedPicRateWithinCvsKnown) {
+                result.status = TimecodeParseStatus::Unsupported;
+                return result;
+            }
+            if (!syntax.fixedPicRateWithinCvs) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            }
+        }
+        result.picStruct = int(picStruct);
+    }
+
+    if (syntax.cpbDpbDelaysPresent) {
+        if (syntax.auCpbRemovalDelayLength == 0 || syntax.dpbOutputDelayLength == 0 ||
+            !reader.bits(syntax.auCpbRemovalDelayLength, ignored) ||
+            !reader.bits(syntax.dpbOutputDelayLength, ignored)) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
+        if (syntax.subPicHrdParamsPresent &&
+            (syntax.dpbOutputDelayDuLength == 0 ||
+             !reader.bits(syntax.dpbOutputDelayDuLength, ignored))) {
+            result.status = TimecodeParseStatus::Malformed;
+            return result;
+        }
+        if (syntax.subPicHrdParamsPresent && syntax.subPicCpbParamsInPicTimingSei) {
+            uint32_t decodingUnitsMinus1 = 0;
+            bool commonDelay = false;
+            if (!reader.ue(decodingUnitsMinus1) || decodingUnitsMinus1 > 65535 ||
+                !reader.bit(commonDelay)) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            }
+            if (commonDelay && (syntax.duCpbRemovalDelayIncrementLength == 0 ||
+                                !reader.bits(syntax.duCpbRemovalDelayIncrementLength, ignored))) {
+                result.status = TimecodeParseStatus::Malformed;
+                return result;
+            }
+            for (uint32_t i = 0; i <= decodingUnitsMinus1; ++i) {
+                if (!reader.ue(ignored) ||
+                    (!commonDelay && i < decodingUnitsMinus1 &&
+                     (syntax.duCpbRemovalDelayIncrementLength == 0 ||
+                      !reader.bits(syntax.duCpbRemovalDelayIncrementLength, ignored)))) {
+                    result.status = TimecodeParseStatus::Malformed;
+                    return result;
+                }
+            }
+        }
+    }
+    if (!reader.seiPayloadAlignmentBits()) {
+        result.status = TimecodeParseStatus::Malformed;
+        return result;
+    }
+    result.status = TimecodeParseStatus::Valid;
+    return result;
 }
 
 H26xTimingDetail::TimecodeParseResult

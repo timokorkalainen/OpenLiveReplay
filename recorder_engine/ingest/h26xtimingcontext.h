@@ -35,6 +35,15 @@ struct HevcTimingSyntax {
     bool pocProportionalToTiming = false;
     bool fieldSeq = false;
     bool frameFieldInfoPresent = false;
+    bool cpbDpbDelaysPresent = false;
+    bool subPicHrdParamsPresent = false;
+    bool subPicCpbParamsInPicTimingSei = false;
+    bool fixedPicRateWithinCvsKnown = false;
+    bool fixedPicRateWithinCvs = false;
+    uint8_t auCpbRemovalDelayLength = 0;
+    uint8_t dpbOutputDelayLength = 0;
+    uint8_t dpbOutputDelayDuLength = 0;
+    uint8_t duCpbRemovalDelayIncrementLength = 0;
     uint8_t vpsId = 0;
     uint8_t referencedVpsId = 0;
     uint8_t spsId = 0;
@@ -42,12 +51,17 @@ struct HevcTimingSyntax {
 
 class H26xTimingContext {
 public:
+    H26xTimingContext();
+    H26xTimingContext(const H26xTimingContext&) = delete;
+    H26xTimingContext& operator=(const H26xTimingContext&) = delete;
+
     bool updateParameterSets(NativeVideoCodec codec, const QList<QByteArray>& vps,
                              const QList<QByteArray>& sps);
     NativeVideoCodec codec() const;
     FrameRateQ constantFrameRate() const;
     bool fixedFrameRate() const;
     uint64_t generation() const;
+    uint64_t identity() const;
     const H264TimingSyntax* h264() const;
     const HevcTimingSyntax* hevc() const;
 
@@ -56,6 +70,7 @@ private:
     QList<QByteArray> m_vps;
     QList<QByteArray> m_sps;
     uint64_t m_generation = 0;
+    uint64_t m_identity = 0;
     H264TimingSyntax m_h264;
     HevcTimingSyntax m_hevc;
 };
@@ -81,6 +96,11 @@ struct HevcTimeCodeContinuity {
     uint32_t hours = 0;
 };
 
+struct HevcPictureTimingParseResult {
+    TimecodeParseStatus status = TimecodeParseStatus::NoTimestamp;
+    int picStruct = -1;
+};
+
 // Decode an EBSP into an RBSP while validating the NAL escape rules. A prevention
 // byte must precede 0x00..0x03, and raw 00 00 00/01/02 sequences are forbidden.
 bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
@@ -88,6 +108,8 @@ bool unescapeRbsp(const QByteArray& escaped, QByteArray& rbsp);
 // Internal parser seam shared by the public Annex-B extractor. It returns a
 // typed status so a short/reserved payload can never leak a partially filled label.
 TimecodeParseResult parseH264PicTiming(const QByteArray& payload, const H264TimingSyntax& syntax);
+HevcPictureTimingParseResult parseHevcPictureTiming(const QByteArray& payload,
+                                                    const HevcTimingSyntax& syntax);
 TimecodeParseResult parseHevcTimeCode(const QByteArray& payload, const HevcTimingSyntax& syntax,
                                       const HevcTimeCodeContinuity* previous = nullptr,
                                       HevcTimeCodeContinuity* next = nullptr,

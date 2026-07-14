@@ -24,6 +24,7 @@ private:
                                                               H26xSeiTimecodeState&);
 
     bool m_contextBound = false;
+    uint64_t m_contextIdentity = 0;
     uint64_t m_contextGeneration = 0;
     NativeVideoCodec m_codec = NativeVideoCodec::Unknown;
     H26xTimingDetail::HevcTimeCodeContinuity m_hevcContinuity;
