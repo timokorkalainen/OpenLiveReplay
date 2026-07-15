@@ -20,6 +20,7 @@ try:
     from .windows_job import run_process_tree
     from .windows_runtime_guard import (
         discover_ctest_graph,
+        CMakeArgumentOccurrence,
         parse_cmake_cache,
         require_cache_entries,
         RuntimeAuditLease,
@@ -30,11 +31,15 @@ try:
         set_windows_dll_directory,
         validate_ctest_runtime_properties,
         windows_system_directories,
+        qt_plugin_closure,
+        qt_qml_closure,
+        transitive_runtime_closure,
     )
 except ImportError:
     from windows_job import run_process_tree
     from windows_runtime_guard import (
         discover_ctest_graph,
+        CMakeArgumentOccurrence,
         parse_cmake_cache,
         require_cache_entries,
         RuntimeAuditLease,
@@ -45,6 +50,9 @@ except ImportError:
         set_windows_dll_directory,
         validate_ctest_runtime_properties,
         windows_system_directories,
+        qt_plugin_closure,
+        qt_qml_closure,
+        transitive_runtime_closure,
     )
 
 
@@ -123,31 +131,46 @@ def _rewrite_environment_property(
     return ";".join(rewritten)
 
 
-def _replace_cmake_literal_argument(
-    text: str, original: str, replacement: str
+def _rewrite_cmake_occurrences(
+    text: str,
+    replacements: Sequence[tuple[CMakeArgumentOccurrence, str]],
 ) -> str:
-    """Replace one parsed literal argument without touching larger values."""
-    quoted_original = original.replace("\\", "\\\\").replace('"', '\\"')
-    quoted_replacement = replacement.replace("\\", "\\\\").replace(
-        '"', '\\"'
-    )
-    text = text.replace(
-        f'"{quoted_original}"', f'"{quoted_replacement}"'
-    )
-    bracket_pattern = re.compile(
-        r"\[(?P<eq>=*)\[" + re.escape(original) + r"\](?P=eq)\]"
-    )
-    text = bracket_pattern.sub(lambda _match: _cmake_bracket(replacement), text)
-    bare_pattern = re.compile(
-        r"(?<![^\s(])" + re.escape(original) + r"(?![^\s)])"
-    )
-    return bare_pattern.sub(replacement, text)
+    """Rewrite only parsed role-bearing arguments, from right to left."""
+    unique: dict[tuple[int, int], tuple[CMakeArgumentOccurrence, str]] = {}
+    for occurrence, replacement in replacements:
+        key = (occurrence.start, occurrence.end)
+        prior = unique.get(key)
+        if prior is not None and prior[1] != replacement:
+            raise RuntimeError(
+                f"conflicting CMake rewrite at {occurrence.start}:{occurrence.end}"
+            )
+        unique[key] = (occurrence, replacement)
+
+    def render(occurrence: CMakeArgumentOccurrence, value: str) -> str:
+        if occurrence.style == "quoted":
+            return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        if occurrence.style == "bracket" or any(
+            character.isspace() or character == ")" for character in value
+        ):
+            return _cmake_bracket(value)
+        return value
+
+    for occurrence, replacement in sorted(
+        unique.values(), key=lambda item: item[0].start, reverse=True
+    ):
+        text = (
+            text[: occurrence.start]
+            + render(occurrence, replacement)
+            + text[occurrence.end :]
+        )
+    return text
 
 
 class _QuickTestInput(NamedTuple):
     argument: str
     path: Path
     prefix: str
+    occurrence: CMakeArgumentOccurrence
 
 
 def _quicktest_inputs(
@@ -194,8 +217,14 @@ def _quicktest_inputs(
                     f"QuickTest -input is outside source/build roots: {candidate}"
                 )
             paths.add(canonical)
+            occurrence_index = index + 1 if not prefix else index
             by_test.setdefault(test.name, []).append(
-                _QuickTestInput(prefix + value, canonical, prefix)
+                _QuickTestInput(
+                    prefix + value,
+                    canonical,
+                    prefix,
+                    test.argument_occurrences[occurrence_index],
+                )
             )
     return (
         {name: tuple(inputs) for name, inputs in by_test.items()},
@@ -313,62 +342,151 @@ def _source_snapshot_exclusions(source_root: Path, build_root: Path) -> tuple[Pa
     return tuple(excluded)
 
 
-def _external_tool_closure(executable: Path) -> dict[Path, Path]:
-    """Return an explicit install-relative closure for a non-runtime tool."""
-    root = executable.parent
-    selected: set[Path] = {executable}
-    for adjacent in root.iterdir():
+class _ExternalToolClosure(NamedTuple):
+    root: Path
+    executable_relative: Path
+    entries: dict[Path, Path | bytes | Callable[[Path], bytes]]
+
+
+def _validated_closure_path(path: Path, selected_root: Path | None = None) -> Path:
+    lexical = Path(os.path.abspath(path))
+    if not lexical.exists():
+        raise RuntimeError(f"external tool closure path does not exist: {lexical}")
+    canonical = lexical.resolve()
+    if os.path.normcase(str(lexical)) != os.path.normcase(str(canonical)):
+        raise RuntimeError(
+            f"external tool closure contains a reparse alias: {lexical} -> {canonical}"
+        )
+    if selected_root is not None and not canonical.is_relative_to(
+        selected_root.resolve()
+    ):
+        raise RuntimeError(
+            f"external tool closure escapes its install root: {lexical}"
+        )
+    return canonical
+
+
+def _tree_closure_files(root: Path, selected_root: Path) -> tuple[Path, ...]:
+    root = _validated_closure_path(root, selected_root)
+    if root.is_file():
+        return (root,)
+    files: list[Path] = []
+    for current_text, directory_names, file_names in os.walk(root):
+        current = _validated_closure_path(Path(current_text), selected_root)
+        retained: list[str] = []
+        for name in directory_names:
+            child = _validated_closure_path(current / name, selected_root)
+            retained.append(child.name)
+        directory_names[:] = retained
+        for name in file_names:
+            files.append(_validated_closure_path(current / name, selected_root))
+    return tuple(files)
+
+
+def _python_base_entries(base: Path, prefix: Path) \
+        -> dict[Path, Path | bytes | Callable[[Path], bytes]]:
+    base = _validated_closure_path(base)
+    entries: dict[Path, Path | bytes | Callable[[Path], bytes]] = {}
+    for child in base.iterdir():
+        if child.is_file() and (
+            child.name.casefold().startswith("python")
+            and child.suffix.casefold() in (".dll", ".zip")
+        ):
+            validated = _validated_closure_path(child, base)
+            entries[prefix / validated.relative_to(base)] = validated
+    dlls = base / "DLLs"
+    if dlls.is_dir():
+        for child in _tree_closure_files(dlls, base):
+            entries[prefix / child.relative_to(base)] = child
+    library = base / "Lib"
+    excluded = {
+        "__pycache__", "ensurepip", "idlelib", "site-packages", "test",
+        "tests", "tkinter", "turtledemo",
+    }
+    if library.is_dir():
+        library = _validated_closure_path(library, base)
+        for current_text, directory_names, file_names in os.walk(library):
+            current = _validated_closure_path(Path(current_text), base)
+            directory_names[:] = [
+                name for name in directory_names
+                if name.casefold() not in excluded
+            ]
+            for name in file_names:
+                child = _validated_closure_path(current / name, base)
+                entries[prefix / child.relative_to(base)] = child
+    return entries
+
+
+def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
+    """Return a bounded, explicit install-relative closure for an external tool."""
+    executable = _validated_closure_path(executable)
+    venv_root = executable.parent.parent
+    venv_config = venv_root / "pyvenv.cfg"
+    is_python = executable.stem.casefold().startswith("python")
+    is_venv = (
+        is_python
+        and executable.parent.name.casefold() == "scripts"
+        and venv_config.is_file()
+    )
+    root = _validated_closure_path(venv_root if is_venv else executable.parent)
+    executable_relative = executable.relative_to(root)
+    entries: dict[Path, Path | bytes | Callable[[Path], bytes]] = {
+        executable_relative: executable
+    }
+
+    for adjacent in executable.parent.iterdir():
         if adjacent.is_file() and (
             adjacent.suffix.casefold() == ".dll"
             or adjacent.name.casefold() == (executable.name + ".manifest").casefold()
         ):
-            selected.add(adjacent)
+            validated = _validated_closure_path(adjacent, root)
+            entries[validated.relative_to(root)] = validated
 
-    closure_roots: list[Path] = []
+    if is_python:
+        if is_venv:
+            config = _validated_closure_path(venv_config, root)
+            contents = config.read_text(encoding="utf-8")
+            match = re.search(r"(?im)^\s*home\s*=\s*(.+?)\s*$", contents)
+            if match is None:
+                raise RuntimeError(f"Python venv has no home entry: {config}")
+            base = _validated_closure_path(Path(match.group(1)))
+            entries.update(_python_base_entries(base, Path("base")))
+
+            def rewrite_venv_config(staged: Path, text: str = contents) -> bytes:
+                home = (staged / "base").as_posix()
+                return re.sub(
+                    r"(?im)^(\s*home\s*=\s*).+?$",
+                    lambda found: found.group(1) + home,
+                    text,
+                    count=1,
+                ).encode("utf-8")
+
+            entries[Path("pyvenv.cfg")] = rewrite_venv_config
+        else:
+            entries.update(_python_base_entries(root, Path(".")))
+
     descriptor = executable.with_name(executable.name + ".olr-runtime-files")
     if descriptor.is_file():
-        selected.add(descriptor)
+        descriptor = _validated_closure_path(descriptor, root)
+        entries[descriptor.relative_to(root)] = descriptor
         for line in descriptor.read_text(encoding="utf-8").splitlines():
             value = line.strip()
             if not value or value.startswith("#"):
                 continue
             relative = Path(value)
-            if relative.is_absolute() or ".." in relative.parts:
+            if (
+                relative.is_absolute()
+                or bool(relative.anchor)
+                or bool(relative.drive)
+                or ".." in relative.parts
+            ):
                 raise RuntimeError(
                     f"external tool closure has unsafe path {value!r}: {descriptor}"
                 )
-            closure_roots.append(root / relative)
-    elif executable.stem.casefold().startswith("python"):
-        closure_roots.extend(
-            path for path in (root / "DLLs", root / "Lib") if path.exists()
-        )
-        selected.update(root.glob("python*.zip"))
-        if (root / "pyvenv.cfg").is_file():
-            selected.add(root / "pyvenv.cfg")
-
-    for closure_root in closure_roots:
-        if not closure_root.exists():
-            raise RuntimeError(
-                f"external tool closure path does not exist: {closure_root}"
-            )
-        candidates = (closure_root,) if closure_root.is_file() else closure_root.rglob("*")
-        for candidate in candidates:
-            is_junction = getattr(candidate, "is_junction", lambda: False)()
-            if candidate.is_symlink() or is_junction:
-                raise RuntimeError(
-                    f"external tool closure contains a reparse alias: {candidate}"
-                )
-            if not candidate.is_file():
-                continue
-            canonical = candidate.resolve()
-            if not canonical.is_relative_to(root.resolve()) or os.path.normcase(
-                str(candidate)
-            ) != os.path.normcase(str(canonical)):
-                raise RuntimeError(
-                    f"external tool closure escapes its install root: {candidate}"
-                )
-            selected.add(candidate)
-    return {path.relative_to(root): path for path in selected}
+            closure_root = _validated_closure_path(root / relative, root)
+            for candidate in _tree_closure_files(closure_root, root):
+                entries[candidate.relative_to(root)] = candidate
+    return _ExternalToolClosure(root, executable_relative, entries)
 
 
 def find_build_directory(args: Sequence[str], cwd: Path) -> Path:
@@ -558,27 +676,53 @@ def prepare_windows_runtime(
                 )
             lease.launch_source_directory = launch_source
 
-            launch_plugins = lease.stage_readonly_tree(
-                qt_plugins,
-                entry_limit=16384,
-                byte_limit=512 << 20,
-                included_suffixes=(".dll", ".json"),
+            selected_executables = {
+                executable
+                for test in selected_tests
+                for _argument, executable, _occurrence in test.executable_arguments
+            }
+            qt_payload_names = {
+                "openlivereplay.exe",
+                "qmllint.exe",
+            }
+            needs_project_qml = bool(quicktest_inputs) or any(
+                executable.name.casefold() in qt_payload_names
+                for executable in selected_executables
+            )
+            plugin_families = (
+                (
+                    "iconengines",
+                    "imageformats",
+                    "multimedia",
+                    "networkinformation",
+                    "styles",
+                    "tls",
+                )
+                if needs_project_qml
+                else ()
+            )
+            plugin_files = qt_plugin_closure(qt_plugins, plugin_families)
+            plugin_entries: dict[Path, Path | bytes] = {
+                path.relative_to(qt_plugins): path for path in plugin_files
+            }
+            plugin_entries.setdefault(
+                Path("platforms") / ".closed", b"closed plugin namespace\n"
+            )
+            launch_plugins = lease.stage_readonly_layout(
+                "qt-plugins", plugin_entries, byte_limit=256 << 20
             )
             launch_platform_plugins = launch_plugins / qt_platform_plugins.relative_to(
                 qt_plugins
             )
-            launch_qml = lease.stage_readonly_tree(
-                qt_qml,
-                entry_limit=32768,
-                byte_limit=1 << 30,
-                included_suffixes=(
-                    ".dll",
-                    ".qml",
-                    ".js",
-                    ".mjs",
-                    ".qmltypes",
-                ),
-                included_names=("qmldir",),
+            qml_files = qt_qml_closure(
+                qt_qml, (source_root,) if needs_project_qml else ()
+            )
+            qml_entries: dict[Path, Path | bytes] = {
+                path.relative_to(qt_qml): path for path in qml_files
+            }
+            qml_entries.setdefault(Path(".closed"), b"closed QML namespace\n")
+            launch_qml = lease.stage_readonly_layout(
+                "qt-qml", qml_entries, byte_limit=512 << 20
             )
 
             qml_replacements: list[tuple[Path, Path]] = [
@@ -635,12 +779,26 @@ def prepare_windows_runtime(
                 Path("srt") / "bin",
                 Path("srt") / "lib",
             )
-            selected_executables = {
-                executable
-                for test in selected_tests
-                for _argument, executable in test.executable_arguments
-            }
             runtime_tool_destinations: dict[Path, Path] = {}
+            runtime_directory_set = set(runtime_dirs)
+            adjacent_dependency_seeds = {
+                adjacent
+                for executable in selected_executables
+                if executable.parent not in runtime_directory_set
+                for adjacent in executable.parent.glob("*.dll")
+                if adjacent.is_file()
+            }
+            runtime_closure = set(
+                transitive_runtime_closure(
+                    (
+                        *selected_executables,
+                        *adjacent_dependency_seeds,
+                        *plugin_files,
+                        *(path for path in qml_files if path.suffix.casefold() == ".dll"),
+                    ),
+                    runtime_dirs,
+                )
+            )
             for directory, relative_directory in zip(
                 runtime_dirs, runtime_relative_dirs, strict=True
             ):
@@ -648,7 +806,7 @@ def prepare_windows_runtime(
                     directory.iterdir(), key=lambda path: path.name.casefold()
                 ):
                     if not child.is_file() or (
-                        child.suffix.casefold() != ".dll"
+                        child not in runtime_closure
                         and child not in selected_executables
                     ):
                         continue
@@ -700,15 +858,15 @@ def prepare_windows_runtime(
                             runtime_layout / runtime_destination
                         )
                         continue
-                    external_root = executable.parent
+                    closure = _external_tool_closure(executable)
                     staged_external = lease.stage_readonly_layout(
                         f"external-tool-{len(external_launch_executables)}",
-                        _external_tool_closure(executable),
+                        closure.entries,
                         entry_limit=32768,
                         byte_limit=1 << 30,
                     )
                     external_launch_executables[executable] = (
-                        staged_external / executable.relative_to(external_root)
+                        staged_external / closure.executable_relative
                     )
                     continue
                 build_entries[relative] = executable
@@ -766,7 +924,9 @@ def prepare_windows_runtime(
                             (srt_root, runtime_layout / "srt"),
                         )
                     )
-                    rewritten = original_text
+                    occurrence_replacements: list[
+                        tuple[CMakeArgumentOccurrence, str]
+                    ] = []
                     for path_argument in graph.path_arguments:
                         if path_argument.definition_file != graph_input:
                             continue
@@ -779,27 +939,27 @@ def prepare_windows_runtime(
                             ((path_argument.path, staged_path),),
                         )
                         if replacement != path_argument.argument:
-                            rewritten = _replace_cmake_literal_argument(
-                                rewritten, path_argument.argument, replacement
+                            occurrence_replacements.append(
+                                (path_argument.occurrence, replacement)
                             )
                     for test in selected_tests:
                         if test.definition_file != graph_input:
                             continue
-                        for raw in test.environment_values:
+                        for raw, occurrence in test.environment_values:
                             replacement = _rewrite_environment_property(
                                 raw, replacements, modification=False
                             )
                             if replacement != raw:
-                                rewritten = _replace_cmake_literal_argument(
-                                    rewritten, raw, replacement
+                                occurrence_replacements.append(
+                                    (occurrence, replacement)
                                 )
-                        for raw in test.environment_modification_values:
+                        for raw, occurrence in test.environment_modification_values:
                             replacement = _rewrite_environment_property(
                                 raw, replacements, modification=True
                             )
                             if replacement != raw:
-                                rewritten = _replace_cmake_literal_argument(
-                                    rewritten, raw, replacement
+                                occurrence_replacements.append(
+                                    (occurrence, replacement)
                                 )
                         for quicktest_input in quicktest_inputs_by_test.get(
                             test.name, ()
@@ -808,12 +968,13 @@ def prepare_windows_runtime(
                                 launch_source
                                 / quicktest_input.path.relative_to(source_root)
                             )
-                            rewritten = _replace_cmake_literal_argument(
-                                rewritten,
-                                quicktest_input.argument,
-                                quicktest_input.prefix + staged_input.as_posix(),
+                            occurrence_replacements.append(
+                                (
+                                    quicktest_input.occurrence,
+                                    quicktest_input.prefix + staged_input.as_posix(),
+                                )
                             )
-                        for argument, executable in test.executable_arguments:
+                        for argument, executable, occurrence in test.executable_arguments:
                             candidate = (
                                 argument.partition("=")[2]
                                 if argument.startswith("-") and "=" in argument
@@ -828,11 +989,15 @@ def prepare_windows_runtime(
                                     staged_build
                                     / executable_destinations[executable]
                                 )
-                            rewritten = _replace_cmake_literal_argument(
-                                rewritten,
-                                argument,
-                                prefix + staged_executable.as_posix(),
+                            occurrence_replacements.append(
+                                (
+                                    occurrence,
+                                    prefix + staged_executable.as_posix(),
+                                )
                             )
+                    rewritten = _rewrite_cmake_occurrences(
+                        original_text, occurrence_replacements
+                    )
                     overrides = working_overrides.get(graph_input, ())
                     if overrides:
                         rewritten += (

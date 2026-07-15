@@ -178,12 +178,35 @@ class RunWindowsAppTests(unittest.TestCase):
         self.assertFalse(staged_qml.exists())
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_runtime_stages_windows_and_offscreen_platform_plugins(self) -> None:
+        platforms = self.qt / "plugins" / "platforms"
+        (platforms / "qwindows.dll").write_bytes(b"windows")
+        (platforms / "qoffscreen.dll").write_bytes(b"offscreen")
+
+        with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
+            env = self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=lease
+            )
+            staged = Path(env["QT_QPA_PLATFORM_PLUGIN_PATH"])
+            self.assertEqual((staged / "qwindows.dll").read_bytes(), b"windows")
+            self.assertEqual(
+                (staged / "qoffscreen.dll").read_bytes(), b"offscreen"
+            )
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_external_app_lease_closes_app_and_runtime_namespaces(self) -> None:
         (self.compiler / "runtime-tool.dll").write_bytes(b"compiler")
         (self.qt / "bin" / "runtime-tool.dll").write_bytes(b"qt")
         (self.build / "OpenLiveReplaySupport.dll").write_bytes(b"support")
 
-        with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
+        with (
+            self.launcher.runtime_guard.RuntimeAuditLease() as lease,
+            mock.patch.object(
+                self.launcher.runtime_guard,
+                "transitive_runtime_closure",
+                return_value=(self.compiler / "runtime-tool.dll",),
+            ) as closure,
+        ):
             env = self.launcher.prepare_windows_app_runtime(
                 self.build, self.app, {}, audit_lease=lease
             )
@@ -205,6 +228,10 @@ class RunWindowsAppTests(unittest.TestCase):
             for directory in (loader, *runtime_dirs, staged_app.parent):
                 with self.subTest(directory=directory), self.assertRaises(OSError):
                     (directory / "late-injection.dll").write_bytes(b"poison")
+            self.assertIn(
+                self.build / "OpenLiveReplaySupport.dll",
+                closure.call_args.args[0],
+            )
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_representative_app_snapshot_ignores_nonruntime_payload(self) -> None:
@@ -240,6 +267,56 @@ class RunWindowsAppTests(unittest.TestCase):
             self.assertLess(elapsed, 5.0)
             self.assertLess(file_count, 128)
             self.assertLess(byte_count, 64 << 20)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_actual_qt_app_closure_has_practical_size_time_budgets(self) -> None:
+        candidates = sorted(
+            path
+            for path in Path("C:/Qt").glob("*/mingw_64")
+            if (path / "bin" / "Qt6Core.dll").is_file()
+        )
+        if not candidates:
+            self.skipTest("no installed C:/Qt/*/mingw_64 kit")
+        qt = candidates[-1]
+        project_source = Path(__file__).resolve().parents[2]
+        cache_path = self.build / "CMakeCache.txt"
+        cache = cache_path.read_text(encoding="utf-8")
+        cache = cache.replace(
+            f"Qt6_DIR:PATH={self.qt / 'lib/cmake/Qt6'}",
+            f"Qt6_DIR:PATH={qt / 'lib/cmake/Qt6'}",
+        ).replace(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={self.workspace}",
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={project_source}",
+        )
+        cache_path.write_text(cache, encoding="utf-8")
+
+        runtime_suffixes = {".dll", ".qml", ".js", ".mjs", ".qmltypes"}
+        inventory = [
+            path
+            for root in (qt / "bin", qt / "plugins", qt / "qml")
+            for path in root.rglob("*")
+            if path.is_file()
+            and (
+                path.suffix.casefold() in runtime_suffixes
+                or path.name.casefold() == "qmldir"
+            )
+        ]
+        inventory_bytes = sum(path.stat().st_size for path in inventory)
+
+        started = time.perf_counter()
+        with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
+            env = self.launcher.prepare_windows_app_runtime(
+                self.build,
+                self.app,
+                {"SystemRoot": str(Path(self.temporary.name) / "Windows")},
+                audit_lease=lease,
+            )
+            elapsed = time.perf_counter() - started
+            self.assertNotEqual(Path(env["QT_PLUGIN_PATH"]), qt / "plugins")
+            self.assertNotEqual(Path(env["QML_IMPORT_PATH"]), qt / "qml")
+            self.assertLess(lease.staged_byte_count, inventory_bytes * 0.85)
+            self.assertLess(lease.staged_file_count, len(inventory))
+        self.assertLess(elapsed, 25.0)
 
     def test_cache_rejects_duplicate_wrong_type_and_relative_roots(self) -> None:
         cache = self.build / "CMakeCache.txt"

@@ -241,19 +241,24 @@ late `<executable>.local` file or directory from changing the audited loader
 resolution between verification and process startup.
 
 For each controlled CTest launch, the launcher also creates read/execute-only
-snapshots of the reachable CTest graph, reachable test executables, the minimal
-configured loader closure (runtime DLLs plus selected tools), runtime-bearing Qt
-plugin/QML files, and any QuickTest `-input` source tree. The CTest tool snapshot
+snapshots of the reachable CTest graph, reachable test executables, the
+transitive configured PE-import closure seeded by those executables and their
+selected Qt payload, explicit Qt plugin families and imported QML modules, and
+any QuickTest `-input` source tree. The CTest tool snapshot
 contains only `ctest.exe` and its adjacent runtime files; selecting a Qt `bin`
 tool does not copy the Qt installation prefix. Parsed path tokens are rewritten
-by Windows path identity, without substring replacement, while the original
-CTest arguments, properties, labels, timeouts, and working directories remain
+only at the source span whose parsed argument has that path-bearing role, so an
+equal literal used as ordinary test data is not changed. The original CTest
+arguments, properties, labels, timeouts, and working directories remain
 effective. Relative QML imports therefore resolve inside the same protected
 source snapshot as their `-input`. Missing legacy `subdirs()` edges, dynamic
 graph edges, build-tree QuickTest inputs, reparse aliases, or QML import roots
 outside the configured source/build/Qt trees fail closed before CTest starts.
 Non-runtime external tools can declare required install-relative resources in
 `<tool>.exe.olr-runtime-files`, one safe relative file or directory per line.
+Normal Python tools receive a bounded standard-library and extension-module
+closure; virtual environments retain their `Scripts` layout and a staged base
+runtime selected from `pyvenv.cfg`, without bulk-copying `site-packages`.
 Focused literal selectors fall back to the full safe snapshot when CTest fixture
 properties or fixture-selection flags could expand the executed test set.
 The launcher uses the protected runtime as the inherited `SetDllDirectory`
@@ -261,7 +266,9 @@ value, which removes the mutable current directory from descendant DLL search;
 the child `PATH` contains only that protected runtime and Windows system roots.
 The controlled Windows app launcher applies the same protected runtime,
 plugin/QML, and application-directory policy before starting the staged app
-executable, then removes every temporary snapshot after its process tree exits.
+executable. Its explicit platform closure includes both the normal Windows and
+offscreen backends, and it removes every temporary snapshot after the process
+tree exits.
 
 The same launch audit follows the generated CTest `subdirs()`/`include()`
 graph, validates each test's working directory and loader-related environment,

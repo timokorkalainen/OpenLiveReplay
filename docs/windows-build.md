@@ -100,14 +100,18 @@ python tools/run_ctest.py --test-dir build -L unit --output-on-failure
 python tools/run_ctest.py --test-dir build -R '^rhi_d3d_probe$' --output-on-failure
 ```
 
-The supported launcher snapshots the literal CTest graph, test executables, a
-minimal loader closure (runtime DLLs and selected tools), runtime-bearing Qt
-plugin/module files, and QuickTest source closure into read/execute-only
+The supported launcher snapshots the literal CTest graph, test executables, the
+transitive configured PE-import closure, explicit Qt plugin families and
+imported QML modules, and QuickTest source closure into read/execute-only
 temporary layouts for the child lifetime. It does not copy an entire Qt or
 CMake installation for a selected tool. Parsed path tokens are rewritten by
-Windows path identity and each test's configured working directory is restored.
+Windows path identity only at their role-bearing source occurrence, and each
+test's configured working directory is restored.
 Other external tools declare install-relative resource closure in an adjacent
 `<tool>.exe.olr-runtime-files` file instead of implicitly copying their prefix.
+Python tools use a bounded standard-library closure; virtual environments keep
+their `Scripts` layout plus the `pyvenv.cfg`-selected base runtime without a
+bulk `site-packages` copy.
 Absent `subdirs()` files and unsupported dynamic or external QML inputs are
 errors rather than names that may appear after the audit. Descendants inherit a
 protected `SetDllDirectory` runtime and a system-only tail on `PATH`, so their

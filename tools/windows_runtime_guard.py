@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextlib import nullcontext
 import hashlib
 import os
@@ -1141,12 +1141,170 @@ def pe_imports(path: Path, *, stream: BinaryIO | None = None) -> set[str]:
             stream.seek(previous)
 
 
-def _cmake_command_arguments_with_positions(
+def transitive_runtime_closure(
+    seeds: Iterable[Path], runtime_directories: tuple[Path, ...]
+) -> tuple[Path, ...]:
+    """Resolve the configured PE import closure in launcher PATH order."""
+    runtime_index: dict[str, Path] = {}
+    for directory in runtime_directories:
+        for child in sorted(directory.iterdir(), key=lambda path: path.name.casefold()):
+            if child.is_file() and child.suffix.casefold() == ".dll":
+                runtime_index.setdefault(child.name.casefold(), child.resolve())
+    selected: set[Path] = set()
+    visited: set[Path] = set()
+    pending = [path.resolve() for path in seeds if path.is_file()]
+    while pending:
+        binary = pending.pop()
+        if binary in visited:
+            continue
+        visited.add(binary)
+        try:
+            imports = pe_imports(binary)
+        except ValueError as error:
+            raise RuntimeError(f"cannot resolve PE runtime closure for {binary}: {error}") from error
+        for name in imports:
+            dependency = runtime_index.get(name.casefold())
+            if dependency is None or dependency in selected:
+                continue
+            selected.add(dependency)
+            pending.append(dependency)
+    return tuple(sorted(selected, key=lambda path: str(path).casefold()))
+
+
+def qt_plugin_closure(
+    qt_plugins: Path,
+    families: tuple[str, ...] = (
+        "iconengines",
+        "imageformats",
+        "multimedia",
+        "networkinformation",
+        "styles",
+        "tls",
+    ),
+    *,
+    platforms: tuple[str, ...] = ("qoffscreen.dll",),
+) -> tuple[Path, ...]:
+    """Select the explicit plugin families used by the headless/app launchers."""
+    selected: set[Path] = set()
+    for platform_name in platforms:
+        platform = qt_plugins / "platforms" / platform_name
+        if platform.is_file():
+            selected.add(platform.resolve())
+    for family in families:
+        directory = qt_plugins / family
+        if not directory.is_dir():
+            continue
+        selected.update(
+            child.resolve()
+            for child in directory.iterdir()
+            if child.is_file() and child.suffix.casefold() == ".dll"
+        )
+    return tuple(sorted(selected, key=lambda path: str(path).casefold()))
+
+
+_QML_RUNTIME_SUFFIXES = frozenset(
+    {".dll", ".qml", ".js", ".mjs", ".qmltypes"}
+)
+_QML_IMPORT = re.compile(
+    r"(?m)^\s*import\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
+)
+_QMLDIR_DEPENDENCY = re.compile(
+    r"(?m)^\s*(?:optional\s+)?(?:depends|import)\s+"
+    r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
+)
+
+
+def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ...]:
+    """Resolve Qt module directories imported by project/QuickTest QML sources."""
+    qt_qml = qt_qml.resolve()
+    pending: set[str] = set()
+    excluded_names = {
+        ".claude", ".git", ".venv", "__pycache__", "build", "build-tests",
+        "linux_build", "macos_build", "venv", "windows_build",
+    }
+
+    def imports_from(path: Path) -> set[str]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return set()
+        found = set(_QML_IMPORT.findall(text))
+        if path.name.casefold() == "qmldir":
+            found.update(_QMLDIR_DEPENDENCY.findall(text))
+        return found
+
+    for root in source_roots:
+        if not root.exists():
+            continue
+        candidates: Iterable[Path]
+        if root.is_file():
+            candidates = (root,)
+        else:
+            files: list[Path] = []
+            for current_text, directory_names, file_names in os.walk(root):
+                directory_names[:] = [
+                    name for name in directory_names
+                    if name.casefold() not in excluded_names
+                ]
+                current = Path(current_text)
+                files.extend(
+                    current / name
+                    for name in file_names
+                    if Path(name).suffix.casefold() in (".qml", ".js", ".mjs")
+                    or name.casefold() == "qmldir"
+                )
+            candidates = files
+        for candidate in candidates:
+            pending.update(imports_from(candidate))
+
+    selected: set[Path] = set()
+    for root_file in qt_qml.iterdir():
+        if root_file.is_file() and (
+            root_file.suffix.casefold() in _QML_RUNTIME_SUFFIXES
+            or root_file.name.casefold() == "qmldir"
+        ):
+            selected.add(root_file.resolve())
+
+    visited: set[str] = set()
+    while pending:
+        uri = pending.pop()
+        if uri in visited:
+            continue
+        visited.add(uri)
+        module = qt_qml.joinpath(*uri.split("."))
+        if not module.is_dir():
+            continue
+        for child in module.rglob("*"):
+            if not child.is_file() or (
+                child.suffix.casefold() not in _QML_RUNTIME_SUFFIXES
+                and child.name.casefold() != "qmldir"
+            ):
+                continue
+            canonical = child.resolve()
+            if not canonical.is_relative_to(qt_qml) or os.path.normcase(
+                str(child)
+            ) != os.path.normcase(str(canonical)):
+                raise RuntimeError(
+                    f"Qt QML closure contains a reparse alias: {child} -> {canonical}"
+                )
+            selected.add(canonical)
+            pending.update(imports_from(canonical))
+    return tuple(sorted(selected, key=lambda path: str(path).casefold()))
+
+
+class CMakeArgumentOccurrence(NamedTuple):
+    value: str
+    start: int
+    end: int
+    style: str
+
+
+def _cmake_command_argument_occurrences(
     text: str, command_name: str
-) -> tuple[tuple[int, tuple[str, ...]], ...]:
+) -> tuple[tuple[int, tuple[CMakeArgumentOccurrence, ...]], ...]:
     """Parse literal arguments from generated CMake commands."""
     text = _strip_cmake_comments(text)
-    commands: list[tuple[int, tuple[str, ...]]] = []
+    commands: list[tuple[int, tuple[CMakeArgumentOccurrence, ...]]] = []
     starts: list[int] = []
     scan = 0
     while scan < len(text):
@@ -1183,13 +1341,14 @@ def _cmake_command_arguments_with_positions(
 
     for command_start in starts:
         index = command_start
-        arguments: list[str] = []
+        arguments: list[CMakeArgumentOccurrence] = []
         while index < len(text):
             while index < len(text) and text[index].isspace():
                 index += 1
             if index >= len(text) or text[index] == ")":
                 break
             if text[index] == '"':
+                token_start = index
                 index += 1
                 value: list[str] = []
                 while index < len(text):
@@ -1207,7 +1366,9 @@ def _cmake_command_arguments_with_positions(
                     raise ValueError(
                         f"unterminated quoted {command_name} argument"
                     )
-                arguments.append("".join(value))
+                arguments.append(CMakeArgumentOccurrence(
+                    "".join(value), token_start, index, "quoted"
+                ))
                 continue
             bracket = re.match(r"\[(=*)\[", text[index:])
             if bracket:
@@ -1219,8 +1380,13 @@ def _cmake_command_arguments_with_positions(
                     raise ValueError(
                         f"unterminated bracket {command_name} argument"
                     )
-                arguments.append(text[value_start:value_end])
                 index = value_end + len(closing)
+                arguments.append(CMakeArgumentOccurrence(
+                    text[value_start:value_end],
+                    value_start - len(opening),
+                    index,
+                    "bracket",
+                ))
                 continue
             value_start = index
             while (
@@ -1229,7 +1395,9 @@ def _cmake_command_arguments_with_positions(
                 and text[index] != ")"
             ):
                 index += 1
-            arguments.append(text[value_start:index])
+            arguments.append(CMakeArgumentOccurrence(
+                text[value_start:index], value_start, index, "bare"
+            ))
         else:
             raise ValueError(f"unterminated {command_name} command")
         if index >= len(text) or text[index] != ")":
@@ -1238,23 +1406,48 @@ def _cmake_command_arguments_with_positions(
     return tuple(commands)
 
 
+def _cmake_command_arguments_with_positions(
+    text: str, command_name: str
+) -> tuple[tuple[int, tuple[str, ...]], ...]:
+    return tuple(
+        (position, tuple(argument.value for argument in arguments))
+        for position, arguments in _cmake_command_argument_occurrences(
+            text, command_name
+        )
+    )
+
+
 def _cmake_commands_in_order(
     text: str, command_names: tuple[str, ...]
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
+) -> tuple[
+    tuple[str, tuple[str, ...], tuple[CMakeArgumentOccurrence, ...]], ...
+]:
     commands = [
-        (position, command_name, arguments)
+        (
+            position,
+            command_name,
+            tuple(argument.value for argument in occurrences),
+            occurrences,
+        )
         for command_name in command_names
-        for position, arguments in _cmake_command_arguments_with_positions(
+        for position, occurrences in _cmake_command_argument_occurrences(
             text, command_name
         )
     ]
     commands.sort(key=lambda command: command[0])
-    return tuple((name, arguments) for _position, name, arguments in commands)
+    return tuple(
+        (name, arguments, occurrences)
+        for _position, name, arguments, occurrences in commands
+    )
 
 
 def _strip_cmake_comments(text: str) -> str:
-    """Remove line and bracket comments without altering quoted/bracket arguments."""
+    """Mask comments while preserving argument source offsets."""
     output: list[str] = []
+
+    def masked(value: str) -> str:
+        return "".join(character if character in "\r\n" else " " for character in value)
+
     index = 0
     while index < len(text):
         if text[index] == '"':
@@ -1288,12 +1481,15 @@ def _strip_cmake_comments(text: str) -> str:
                 end = text.find(
                     closing, index + len(bracket_comment.group(0))
                 )
-                index = len(text) if end < 0 else end + len(closing)
+                comment_end = len(text) if end < 0 else end + len(closing)
+                output.append(masked(text[index:comment_end]))
+                index = comment_end
                 continue
             newline = text.find("\n", index)
             if newline < 0:
+                output.append(masked(text[index:]))
                 break
-            output.append("\n")
+            output.append(masked(text[index:newline + 1]))
             index = newline + 1
             continue
         output.append(text[index])
@@ -1322,16 +1518,21 @@ def _executable_argument(argument: str) -> str | None:
 class CTestRecord(NamedTuple):
     name: str
     arguments: tuple[str, ...]
+    argument_occurrences: tuple[CMakeArgumentOccurrence, ...]
     definition_file: Path
     scope_file: Path
-    executable_arguments: tuple[tuple[str, Path], ...]
+    executable_arguments: tuple[
+        tuple[str, Path, CMakeArgumentOccurrence], ...
+    ]
     working_directory: Path
     labels: tuple[str, ...]
     fixtures_setup: tuple[str, ...]
     fixtures_cleanup: tuple[str, ...]
     fixtures_required: tuple[str, ...]
-    environment_values: tuple[str, ...]
-    environment_modification_values: tuple[str, ...]
+    environment_values: tuple[tuple[str, CMakeArgumentOccurrence], ...]
+    environment_modification_values: tuple[
+        tuple[str, CMakeArgumentOccurrence], ...
+    ]
     environment: tuple[str, ...]
     environment_modification: tuple[str, ...]
 
@@ -1340,6 +1541,7 @@ class CTestPathArgument(NamedTuple):
     definition_file: Path
     argument: str
     path: Path
+    occurrence: CMakeArgumentOccurrence
 
 
 class CTestGraph(NamedTuple):
@@ -1352,9 +1554,9 @@ class CTestGraph(NamedTuple):
 
 def _property_assignments_for_command(
     command_name: str, arguments: tuple[str, ...]
-) -> tuple[tuple[tuple[str, ...], str, str, bool, tuple[str, ...]], ...]:
+) -> tuple[tuple[tuple[str, ...], str, str, bool, tuple[int, ...]], ...]:
     assignments: list[
-        tuple[tuple[str, ...], str, str, bool, tuple[str, ...]]
+        tuple[tuple[str, ...], str, str, bool, tuple[int, ...]]
     ] = []
     if command_name == "set_tests_properties":
         try:
@@ -1374,7 +1576,7 @@ def _property_assignments_for_command(
                     properties[offset].casefold(),
                     properties[offset + 1],
                     False,
-                    (properties[offset + 1],),
+                    (index + 2 + offset,),
                 )
             )
     elif command_name == "set_property":
@@ -1408,7 +1610,7 @@ def _property_assignments_for_command(
                 arguments[index + 1].casefold(),
                 ("" if append_string else ";").join(arguments[index + 2 :]),
                 append,
-                tuple(arguments[index + 2 :]),
+                tuple(range(index + 2, len(arguments))),
             )
         )
     return tuple(assignments)
@@ -1444,10 +1646,20 @@ def discover_ctest_graph(
         active_inputs: set[Path] = set()
         inputs: list[Path] = []
         additions: list[
-            tuple[tuple[str, ...], Path, Path, Path, tuple[str, str]]
+            tuple[
+                tuple[str, ...],
+                tuple[CMakeArgumentOccurrence, ...],
+                Path,
+                Path,
+                Path,
+                tuple[str, str],
+            ]
         ] = []
         property_values: dict[tuple[str, str], dict[str, list[str]]] = {}
-        property_tokens: dict[tuple[str, str], dict[str, list[str]]] = {}
+        property_tokens: dict[
+            tuple[str, str],
+            dict[str, list[tuple[str, CMakeArgumentOccurrence]]],
+        ] = {}
         path_arguments: list[CTestPathArgument] = []
 
         def evaluate(
@@ -1509,7 +1721,7 @@ def discover_ctest_graph(
                     ),
                 )
                 scope = os.path.normcase(str(execution_directory))
-                for command_name, arguments in commands:
+                for command_name, arguments, occurrences in commands:
                     if command_name == "discover_tests":
                         raise RuntimeError(
                             f"unsupported dynamic CTest discover_tests command in {canonical}"
@@ -1550,6 +1762,7 @@ def discover_ctest_graph(
                                     if command_name in ("subdirs", "add_subdirectory")
                                     else target
                                 )).resolve(),
+                                occurrences[0],
                             )
                         )
                         continue
@@ -1559,6 +1772,7 @@ def discover_ctest_graph(
                             additions.append(
                                 (
                                     arguments,
+                                    occurrences,
                                     execution_directory,
                                     canonical,
                                     scope_file,
@@ -1566,7 +1780,7 @@ def discover_ctest_graph(
                                 )
                             )
                         continue
-                    for tests, property_name, value, append, tokens in (
+                    for tests, property_name, value, append, token_indices in (
                         _property_assignments_for_command(command_name, arguments)
                     ):
                         for test in tests:
@@ -1580,10 +1794,14 @@ def discover_ctest_graph(
                             token_values = property_tokens.setdefault(
                                 (scope, test), {}
                             )
+                            tokens = [
+                                (arguments[index], occurrences[index])
+                                for index in token_indices
+                            ]
                             if append:
                                 token_values.setdefault(property_name, []).extend(tokens)
                             else:
-                                token_values[property_name] = list(tokens)
+                                token_values[property_name] = tokens
             finally:
                 active_inputs.remove(canonical)
 
@@ -1600,6 +1818,7 @@ def discover_ctest_graph(
         working_directories: set[Path] = set()
         for (
             arguments,
+            argument_occurrences,
             default_working,
             definition_file,
             scope_file,
@@ -1643,8 +1862,12 @@ def discover_ctest_graph(
                 )
             working_directories.add(working)
 
-            executable_arguments: list[tuple[str, Path]] = []
-            for argument in arguments:
+            executable_arguments: list[
+                tuple[str, Path, CMakeArgumentOccurrence]
+            ] = []
+            for argument, occurrence in zip(
+                arguments, argument_occurrences, strict=True
+            ):
                 candidate = _executable_argument(argument)
                 if candidate is None:
                     continue
@@ -1671,7 +1894,7 @@ def discover_ctest_graph(
                         f"{lexical} -> {executable}"
                     )
                 executables.add(executable)
-                executable_arguments.append((argument, executable))
+                executable_arguments.append((argument, executable, occurrence))
 
             environment = tuple(
                 item
@@ -1707,6 +1930,7 @@ def discover_ctest_graph(
                 CTestRecord(
                     name,
                     arguments,
+                    argument_occurrences,
                     definition_file,
                     scope_file,
                     tuple(executable_arguments),
