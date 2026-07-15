@@ -8,12 +8,33 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <utility>
 
 struct DecodedFrameEvidence {
+    struct CarrierSessionIdentity {
+        uint64_t value = 0;
+    };
+    struct CarrierGeneration {
+        uint64_t value = 0;
+    };
+
+    DecodedFrameEvidence(qint64 codecPts, int64_t sourcePts, int64_t sourceTimecode,
+                         std::optional<TimecodeEvidence> timingEvidence)
+        : DecodedFrameEvidence(codecPts, sourcePts, sourceTimecode, std::move(timingEvidence),
+                               CarrierSessionIdentity{}, CarrierGeneration{}) {}
+
+    DecodedFrameEvidence(qint64 codecPts, int64_t sourcePts, int64_t sourceTimecode,
+                         std::optional<TimecodeEvidence> timingEvidence,
+                         CarrierSessionIdentity sessionIdentity, CarrierGeneration generation)
+        : codecPts90k(codecPts), sourcePtsMs(sourcePts), sourceTimecode100ns(sourceTimecode),
+          timecodeEvidence(std::move(timingEvidence)),
+          carrierSessionIdentity(sessionIdentity.value), carrierGeneration(generation.value) {}
+
     qint64 codecPts90k = 0;
     int64_t sourcePtsMs = -1;
     int64_t sourceTimecode100ns = -1;
     std::optional<TimecodeEvidence> timecodeEvidence;
+    uint64_t carrierSessionIdentity = 0;
     uint64_t carrierGeneration = 0;
 };
 

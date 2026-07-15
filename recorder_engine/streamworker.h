@@ -13,6 +13,7 @@
 #include <QByteArray>
 #include <QUrl>
 #include <atomic>
+#include <array>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,7 @@
 #include "recorder_engine/codec/nativevideoencoder.h"
 #if defined(OLR_GPU_PIPELINE_BUILD)
 #include "playback/output/framehandle.h"
+#include "recorder_engine/codec/gpuencodepump.h"
 #endif
 
 class GpuEncodePump;
@@ -134,9 +136,8 @@ public:
 #endif
 
 signals:
-    // Emitted from the capture thread ONLY when the connection state flips
-    // (debounced via setConnected). Cross-thread: relayed to the UI through
-    // ReplayManager with a queued connection.
+    // Drained on this QObject's worker thread only when the capture-side state
+    // flips. ReplayManager receives it through a queued connection.
     void connectionChanged(int sourceIndex, bool connected);
 
     // Emitted ~1/sec from the capture thread with the source's latest ingest stats
@@ -162,7 +163,7 @@ private:
     };
     struct MuxFrameEvidenceSubmission {
         uint64_t id = 0;
-        uint64_t carrierEpoch = 0;
+        SourceCarrierToken carrierToken;
     };
 
     QString m_url;
@@ -238,6 +239,7 @@ private:
     // Atomically update m_connected and emit connectionChanged on a real
     // transition (false<->true). Called from the capture thread.
     void setConnected(bool c);
+    void setConnectedImpl(bool connected, uint64_t requiredSessionIdentity);
     void drainConnectionEmissions();
 
     // Last jitter-pull gate published by the tick thread (file-timeline ms,
@@ -256,6 +258,10 @@ private:
     int64_t m_audioServoTrimSamples = 0;
     int64_t m_audioServoJitterSamples = 0;
     void enqueueAudio(int64_t startSample, const uint8_t* data, int numSamples);
+    void enqueueAudioForSession(uint64_t sessionIdentity, int64_t startSample, const uint8_t* data,
+                                int numSamples);
+    void setConnectedForSession(uint64_t sessionIdentity, bool connected);
+    void reportStatsForSession(uint64_t sessionIdentity, const IngestStats& stats);
     void writeAudioForTick(int64_t recordingTimeMs, int track, int64_t trimMs, int64_t jitterMs);
 
     int m_targetWidth = 1920;
@@ -307,16 +313,95 @@ private:
     bool setupEncoder(AVCodecContext** encCtx);
 #ifdef OLR_GPU_PIPELINE_BUILD
     ImportedGpuVideoFrame importGpuVideoFrameForEncode(void* nativeDecodedImage,
-                                                       const FrameMetadata& metadata);
+                                                       const FrameMetadata& metadata,
+                                                       bool latchFallbackOnFailure = true);
+    ImportedGpuVideoFrame importGpuVideoFrameForSession(uint64_t sessionIdentity,
+                                                        void* nativeDecodedImage,
+                                                        const FrameMetadata& metadata);
     bool ensureGpuEncodePumpStarted();
     bool preferGpuVideoFramesForIngest() const;
     void latchGpuEncodeCpuFallback();
 #endif
-    NativeVideoEncoder::PacketCallback makeMuxerWriteCallback(
-        int track, AVStream* st, bool* havePacket,
-        std::function<void()> beforePacketWrite = std::function<void()>{},
-        std::function<void(bool)> afterPacketWritten = std::function<void(bool)>{},
-        uint64_t expectedCarrierEpoch = 0);
+    static constexpr size_t kSubmissionPoolCapacity = Muxer::kMaxQueuedPackets + 2;
+    static constexpr size_t kMuxCompletionPoolCapacity = Muxer::kMaxQueuedPackets + 2;
+    static constexpr size_t kMaxPacketsPerSubmission = 8;
+    struct BufferedEncodedPacket {
+        QByteArray data;
+        int64_t ptsTicks = 0;
+        bool keyframe = false;
+    };
+    struct EncodeSubmissionSlot {
+        bool active = false;
+        uint32_t generation = 0;
+        bool gpu = false;
+        bool encoderFinished = false;
+        bool evidenceResolved = false;
+        bool sidecarsEmitted = false;
+        bool fallbackTriggered = false;
+        uint32_t pendingWrites = 0;
+        int track = -1;
+        AVStream* stream = nullptr;
+        bool* havePacket = nullptr;
+        SourceCarrierToken carrierToken;
+        uint64_t evidenceSubmissionId = 0;
+        int64_t streamTimeMs = 0;
+        QByteArray metadata;
+        std::array<BufferedEncodedPacket, kMaxPacketsPerSubmission> bufferedPackets;
+        size_t bufferedPacketCount = 0;
+        size_t nextBufferedPacket = 0;
+        bool packetOverflow = false;
+    };
+    struct MuxCompletionSlot {
+        bool active = false;
+        uint32_t generation = 0;
+        SourceCarrierToken carrierToken;
+        uint64_t encodeSubmissionId = 0;
+        std::optional<TimecodeEvidence> evidence;
+    };
+    uint64_t acquireEncodeSubmission(bool gpu, int track, AVStream* stream, bool* havePacket,
+                                     const SourceCarrierToken& carrierToken,
+                                     uint64_t evidenceSubmissionId, int64_t streamTimeMs = 0,
+                                     const QByteArray& metadata = QByteArray());
+    bool setEncodeSubmissionEvidenceId(uint64_t submissionId, uint64_t evidenceSubmissionId);
+    uint64_t reserveMuxCompletion(uint64_t encodeSubmissionId);
+    uint64_t reserveMuxCompletion(uint64_t encodeSubmissionId,
+                                  const SourceCarrierToken& carrierToken);
+    void releaseMuxCompletionReservation(uint64_t completionId);
+    bool populateMuxCompletion(uint64_t completionId, const SourceCarrierToken& carrierToken,
+                               std::optional<TimecodeEvidence> evidence);
+    void finishEncodeSubmission(uint64_t submissionId);
+    void failEncodeSubmission(uint64_t submissionId);
+    void handleEncodedPacket(uint64_t submissionId, const QByteArray& data, int64_t ptsTicks,
+                             bool keyframe);
+    void bufferEncodedPacket(uint64_t submissionId, const QByteArray& data, int64_t ptsTicks,
+                             bool keyframe);
+    bool bufferedSubmissionReady(uint64_t submissionId) const;
+    bool takeBufferedSubmissionPacket(uint64_t submissionId, BufferedEncodedPacket* packet);
+    void completeMuxWrite(uint64_t completionId, bool written);
+    static void encodedPacketThunk(void* context, uint64_t submissionId, const QByteArray& data,
+                                   int64_t ptsTicks, bool keyframe);
+    static void bufferedPacketThunk(void* context, uint64_t submissionId, const QByteArray& data,
+                                    int64_t ptsTicks, bool keyframe);
+    static void encodeFailureThunk(void* context, uint64_t submissionId);
+    static void encodeFinishedThunk(void* context, uint64_t submissionId);
+    static void muxWriteCompletionThunk(void* context, uint64_t completionId, bool written);
+    static bool packetCarrierGuardThunk(void* context, uint64_t sessionIdentity, uint64_t epoch);
+    NativeVideoEncoder::PacketCallback packetCallbackForSubmission(uint64_t submissionId) noexcept;
+    NativeVideoEncoder::PacketCallback
+    bufferedPacketCallbackForSubmission(uint64_t submissionId) noexcept;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    GpuEncodePump::JobCallbacks gpuCallbacksForSubmission(uint64_t submissionId) noexcept;
+#endif
+    Muxer::PacketWriteCallback muxCompletionCallback(uint64_t completionId) noexcept;
+    static uint64_t poolId(size_t index, uint32_t generation) noexcept;
+    static bool decodePoolId(uint64_t id, size_t capacity, size_t* index,
+                             uint32_t* generation) noexcept;
+    void releaseEncodeSubmissionLocked(size_t index);
+    mutable std::mutex m_submissionPoolMutex;
+    std::unique_ptr<EncodeSubmissionSlot[]> m_submissionPool;
+    std::unique_ptr<MuxCompletionSlot[]> m_muxCompletionPool;
+    size_t m_nextSubmissionSlot = 0;
+    size_t m_nextMuxCompletionSlot = 0;
     void enqueueDecodedVideoFrame(DecodedVideoFrame decoded);
     void enqueueDecodedVideoFrameForSession(DecodedVideoFrame decoded, uint64_t sessionIdentity);
     uint64_t beginCaptureSession();
@@ -324,15 +409,29 @@ private:
     std::shared_ptr<const SourceCarrierToken> snapshotActiveCarrierToken() const;
     std::shared_ptr<const SourceCarrierToken>
     snapshotCarrierTokenForSession(uint64_t sessionIdentity) const;
+    std::shared_ptr<const SourceCarrierToken>
+    prepareCarrierTokenForFrameIngress(uint64_t sessionIdentity,
+                                       const std::optional<TimecodeEvidence>& evidence);
+    std::shared_ptr<const SourceCarrierToken>
+    prepareCarrierTokenForFrameIngressLocked(uint64_t sessionIdentity,
+                                             const std::optional<TimecodeEvidence>& evidence);
     void rotateCarrier(bool retainActiveSession);
+    void rotateCarrierLocked(bool retainActiveSession);
     bool carrierTokenIsCurrent(const std::shared_ptr<const SourceCarrierToken>& token) const;
+    bool carrierTokenIsCurrent(const SourceCarrierToken& token) const;
+    bool carrierTokenIsCurrentLocked(const SourceCarrierToken& token) const;
+    Muxer::PacketCarrierGuard packetCarrierGuard(const SourceCarrierToken& token) noexcept;
     std::optional<TimecodeEvidence>
     takeFrameTimecodeEvidenceForMux(std::optional<TimecodeEvidence>& selected,
                                     int64_t sessionFrameIndex) const;
     MuxFrameEvidenceSubmission
     enqueueMuxFrameEvidence(int64_t ptsTicks, int64_t sourceTimecode100ns,
-                            const std::optional<TimecodeEvidence>& evidence);
+                            const std::optional<TimecodeEvidence>& evidence,
+                            const std::shared_ptr<const SourceCarrierToken>& frameToken,
+                            bool allowSyntheticFrame = false);
     std::optional<DecodedFrameEvidence> takeMuxFrameEvidence(int64_t ptsTicks);
+    std::optional<DecodedFrameEvidence>
+    takeMuxFrameEvidence(int64_t ptsTicks, const SourceCarrierToken& expectedToken);
     void discardMuxFrameEvidence(uint64_t submissionId);
     void clearMuxFrameEvidence();
     void resetMuxFrameEvidenceLocked();
@@ -346,9 +445,14 @@ private:
         auto hook = std::move(m_beforeMuxPacketWriteForTest);
         if (hook) hook();
     }
+    void runBeforeMuxEvidenceSubmissionForTest() {
+        auto hook = std::move(m_beforeMuxEvidenceSubmissionForTest);
+        if (hook) hook();
+    }
     std::function<void()> m_beforeMuxPacketWriteForTest;
+    std::function<void()> m_beforeMuxEvidenceSubmissionForTest;
 #endif
-    std::mutex m_muxFrameEvidenceMutex;
+    mutable std::mutex m_muxFrameEvidenceMutex;
     DecodedFrameEvidenceQueue m_muxFrameEvidence{64};
     std::optional<TimecodeEvidence> m_muxFrameEvidenceIdentity;
     void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,

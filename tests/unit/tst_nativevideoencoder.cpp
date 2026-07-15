@@ -55,21 +55,23 @@ void TestNativeVideoEncoder::encodesIntraFramesWhenAvailable() {
 
     int packets = 0;
     bool allKeyframes = true;
+    auto onPacket = [&](const QByteArray& data, int64_t, bool key) {
+        ++packets;
+        if (!key) allKeyframes = false;
+        QVERIFY(!data.isEmpty());
+    };
     for (int i = 0; i < 5; ++i) {
         AVFrame* f = makeGreyFrame(1280, 720);
         QVERIFY2(f != nullptr, "makeGreyFrame: av_frame_get_buffer failed");
-        const bool ok = enc->encode(f, i, [&](const QByteArray& data, int64_t, bool key) {
-            ++packets;
-            if (!key) allKeyframes = false;
-            QVERIFY(!data.isEmpty());
-        }, &err);
+        const bool ok = enc->encode(f, i, NativeVideoEncoder::PacketCallback::bind(onPacket), &err);
         av_frame_free(&f);
         QVERIFY2(ok, qPrintable(err));
     }
-    enc->flush([&](const QByteArray&, int64_t, bool key) {
+    auto onFlushPacket = [&](const QByteArray&, int64_t, bool key) {
         ++packets;
         if (!key) allKeyframes = false;
-    }, &err);
+    };
+    enc->flush(NativeVideoEncoder::PacketCallback::bind(onFlushPacket), &err);
 
     QVERIFY2(packets >= 5, "expected at least one packet per submitted frame");
     if (!allKeyframes) {

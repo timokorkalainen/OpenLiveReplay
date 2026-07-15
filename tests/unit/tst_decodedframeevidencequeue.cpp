@@ -2,6 +2,8 @@
 
 #include "recorder_engine/ingest/decodedframeevidencequeue.h"
 
+#include <type_traits>
+
 extern "C" {
 #include <libavutil/avutil.h>
 }
@@ -11,6 +13,7 @@ class TestDecodedFrameEvidenceQueue : public QObject {
 
 private slots:
     void multipleNoOutputSubmissionsBindByOutputPts();
+    void carrierIdentityAndGenerationStayDistinct();
     void reorderedOutputsMatchTheirOwnInputs();
     void duplicatePtsAreConsumedFifo();
     void invalidAndMissingPtsDoNotConsumeNewerEvidence();
@@ -24,8 +27,16 @@ DecodedFrameEvidence evidence(qint64 pts90k, int64_t sourcePtsMs, int64_t timeco
                               uint64_t generation) {
     TimecodeEvidence timing;
     timing.sourceGeneration = generation;
-    return {pts90k, sourcePtsMs, timecode100ns, timing, generation};
+    return DecodedFrameEvidence{pts90k,
+                                sourcePtsMs,
+                                timecode100ns,
+                                timing,
+                                DecodedFrameEvidence::CarrierSessionIdentity{},
+                                DecodedFrameEvidence::CarrierGeneration{generation}};
 }
+
+static_assert(!std::is_constructible_v<DecodedFrameEvidence, qint64, int64_t, int64_t,
+                                       std::optional<TimecodeEvidence>, uint64_t>);
 
 } // namespace
 
@@ -43,6 +54,18 @@ void TestDecodedFrameEvidenceQueue::multipleNoOutputSubmissionsBindByOutputPts()
     QCOMPARE(output->timecodeEvidence->sourceGeneration, uint64_t(1));
     QCOMPARE(output->carrierGeneration, uint64_t(1));
     QCOMPARE(queue.size(), qsizetype(2));
+}
+
+void TestDecodedFrameEvidenceQueue::carrierIdentityAndGenerationStayDistinct() {
+    const DecodedFrameEvidence value{90'000,
+                                     1000,
+                                     10,
+                                     std::nullopt,
+                                     DecodedFrameEvidence::CarrierSessionIdentity{7},
+                                     DecodedFrameEvidence::CarrierGeneration{11}};
+
+    QCOMPARE(value.carrierSessionIdentity, uint64_t(7));
+    QCOMPARE(value.carrierGeneration, uint64_t(11));
 }
 
 void TestDecodedFrameEvidenceQueue::reorderedOutputsMatchTheirOwnInputs() {

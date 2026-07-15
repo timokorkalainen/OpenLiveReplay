@@ -158,18 +158,16 @@ bool ReplayManager::setupBlueEncoder() {
             return false;
         }
         bool gotPkt = false;
-        bool encOk = m_blueNativeEncoder->encode(
-            m_blueFrame, 0,
-            [&](const QByteArray& data, int64_t /*pts*/, bool /*key*/) {
-                if (data.size() <= std::numeric_limits<int>::max() &&
-                    av_new_packet(m_cachedBluePkt, static_cast<int>(data.size())) == 0) {
-                    memcpy(m_cachedBluePkt->data, data.constData(),
-                           static_cast<size_t>(data.size()));
-                    m_cachedBluePkt->flags |= AV_PKT_FLAG_KEY;
-                    gotPkt = true;
-                }
-            },
-            &err);
+        auto captureBluePacket = [&](const QByteArray& data, int64_t /*pts*/, bool /*key*/) {
+            if (data.size() <= std::numeric_limits<int>::max() &&
+                av_new_packet(m_cachedBluePkt, static_cast<int>(data.size())) == 0) {
+                memcpy(m_cachedBluePkt->data, data.constData(), static_cast<size_t>(data.size()));
+                m_cachedBluePkt->flags |= AV_PKT_FLAG_KEY;
+                gotPkt = true;
+            }
+        };
+        const bool encOk = m_blueNativeEncoder->encode(
+            m_blueFrame, 0, NativeVideoEncoder::PacketCallback::bind(captureBluePacket), &err);
         if (!encOk || !gotPkt) {
             av_packet_free(&m_cachedBluePkt);
             av_frame_free(&m_blueFrame);
@@ -438,10 +436,10 @@ void ReplayManager::startRecording() {
         connect(this, &ReplayManager::masterPulse, worker, &StreamWorker::onMasterPulse,
                 Qt::QueuedConnection);
 
-        // Relay the worker's connection-state transitions to the UI. The
-        // worker emits from its capture thread, so deliver queued onto the
-        // thread ReplayManager lives on (main); UIManager then receives it
-        // there and updates its per-source connected state.
+        // Relay the worker's connection-state transitions to the UI. StreamWorker
+        // drains capture-side transitions on its QObject thread; deliver queued
+        // onto the thread ReplayManager lives on (main), where UIManager updates
+        // its per-source connected state.
         connect(worker, &StreamWorker::connectionChanged, this,
                 &ReplayManager::sourceConnectionChanged, Qt::QueuedConnection);
         // Additive: drop a source's phase-estimation eligibility when it disconnects
@@ -456,9 +454,9 @@ void ReplayManager::startRecording() {
         connect(worker, &StreamWorker::statsUpdated, this, &ReplayManager::onSourceStatsUpdated,
                 Qt::QueuedConnection);
 
-        // Forward each frame's source timecode into the aligner. The worker emits
-        // from its tick thread, so deliver queued onto the thread ReplayManager
-        // lives on (only emitted when the frame actually carried a valid TC).
+        // Forward each committed frame's source timecode into the aligner. Muxer
+        // completion may run on its writer thread, so deliver queued onto the
+        // thread ReplayManager lives on (only emitted for a valid committed TC).
         connect(worker, &StreamWorker::frameTimecode, this, &ReplayManager::onFrameTimecode,
                 Qt::QueuedConnection);
 

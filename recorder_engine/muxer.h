@@ -9,11 +9,13 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifdef __APPLE__
@@ -30,18 +32,54 @@ extern "C" {
 
 class Muxer {
 public:
-    using PacketWriteCallback = std::function<void(bool written)>;
-    struct PacketCarrierGuard {
-        constexpr PacketCarrierGuard(const std::atomic<uint64_t>* currentEpoch = nullptr,
-                                     uint64_t expectedEpoch = 0) noexcept
-            : current(currentEpoch), expected(expectedEpoch) {}
-        const std::atomic<uint64_t>* current;
-        uint64_t expected;
-        bool accepts() const noexcept {
-            return !current || expected == 0 ||
-                   current->load(std::memory_order_acquire) == expected;
+    static constexpr size_t kMaxQueuedPackets = 4096;
+    struct PacketWriteCallback {
+        using Function = void (*)(void* context, uint64_t id, bool written);
+
+        void* context = nullptr;
+        uint64_t id = 0;
+        Function function = nullptr;
+
+        void operator()(bool written) const {
+            if (function) function(context, id, written);
+        }
+        explicit operator bool() const noexcept { return function != nullptr; }
+
+        template <typename Callable>
+        static PacketWriteCallback bind(Callable& callable) noexcept {
+            return PacketWriteCallback{&callable, 0, [](void* context, uint64_t, bool written) {
+                                           (*static_cast<Callable*>(context))(written);
+                                       }};
         }
     };
+    static_assert(std::is_trivially_copyable_v<PacketWriteCallback>);
+    struct PacketCarrierGuard {
+        using Function = bool (*)(void* context, uint64_t sessionIdentity, uint64_t epoch);
+
+        PacketCarrierGuard() noexcept
+            : context(nullptr), sessionIdentity(0), epoch(0), function(nullptr),
+              currentEpoch(nullptr) {}
+        PacketCarrierGuard(const std::atomic<uint64_t>* currentEpoch_,
+                           uint64_t expectedEpoch) noexcept
+            : context(nullptr), sessionIdentity(0), epoch(expectedEpoch), function(nullptr),
+              currentEpoch(currentEpoch_) {}
+        PacketCarrierGuard(void* context_, uint64_t sessionIdentity_, uint64_t epoch_,
+                           Function function_) noexcept
+            : context(context_), sessionIdentity(sessionIdentity_), epoch(epoch_),
+              function(function_), currentEpoch(nullptr) {}
+
+        void* context;
+        uint64_t sessionIdentity;
+        uint64_t epoch;
+        Function function;
+        const std::atomic<uint64_t>* currentEpoch;
+        bool accepts() const noexcept {
+            if (function) return function(context, sessionIdentity, epoch);
+            return !currentEpoch || epoch == 0 ||
+                   currentEpoch->load(std::memory_order_acquire) == epoch;
+        }
+    };
+    static_assert(std::is_trivially_copyable_v<PacketCarrierGuard>);
 
     Muxer();
     ~Muxer();
@@ -74,7 +112,8 @@ public:
               int fpsNum = 0, int fpsDen = 0);
     // Returns true when the packet was accepted into the writer queue. The optional
     // callback still reports the later disk-write result.
-    bool writePacket(AVPacket* pkt, PacketWriteCallback onWritten = PacketWriteCallback{},
+    bool writePacket(AVPacket* pkt,
+                     PacketWriteCallback onWritten = PacketWriteCallback{nullptr, 0, nullptr},
                      const QString& startTimecodeCandidate = QString(),
                      PacketCarrierGuard carrierGuard = PacketCarrierGuard{});
     bool writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
@@ -137,6 +176,8 @@ private:
     // ensureHeaderWritten) m_headerMutex; ensureHeaderWritten never reaches back
     // for m_mutex, so there is no cycle.
     bool ensureHeaderWritten();
+    bool publishStartTimecodeCandidate(const QString& tc, uint64_t publicationId);
+    void undoStartTimecodeCandidatePublication(const QString& tc, uint64_t publicationId);
 
     // True while the header write should be HELD for the first source timecode:
     // unwritten header + no winning candidate yet + grace window still open. The
@@ -173,6 +214,7 @@ private:
     QMutex m_headerMutex;
     bool m_headerWritten = false;
     QString m_startTimecodeCandidate;
+    uint64_t m_startTimecodeCandidatePublicationId = 0;
     // Bounded "wait for the first source TC" grace. A live recording observes no
     // TC at start and emits BLUE/pre-connect packets (TC=-1) before the first real
     // source frame carrying a timecode. Committing the header on that first no-TC
@@ -203,19 +245,28 @@ private:
     // writer thread drains the queue and performs the blocking disk writes,
     // so worker tick threads and the GUI thread never block on a stalled disk
     // (except, by design, when a sustained stall fills the bounded queue).
-    static constexpr size_t kMaxQueued = 4096; // ~ a few seconds of packets
     struct QueuedPacket {
         AVPacket* pkt = nullptr;
         PacketWriteCallback onWritten;
+        PacketCarrierGuard carrierGuard;
+        uint64_t sequence = 0;
+    };
+    struct AcceptedCandidate {
+        QString value;
+        PacketCarrierGuard carrierGuard;
+        uint64_t sequence = 0;
     };
 
     std::thread m_writerThread;
     std::queue<QueuedPacket> m_pktQueue; // owns the cloned packets it holds
+    uint64_t m_nextQueuedPacketSequence = 1;
     std::mutex m_qMutex;
     std::condition_variable m_qCv;
     // First valid candidate attached to a packet actually accepted into m_pktQueue.
     // Guarded by m_qMutex so concurrent producers resolve in queue-acceptance order.
     QString m_acceptedStartTimecodeCandidate;
+    std::deque<AcceptedCandidate> m_acceptedStartTimecodeCandidates;
+    uint64_t m_candidateWindowGeneration = 1;
     bool m_startTimecodeCandidateWindowClosed = false;
     std::atomic<bool> m_writerRunning{false};
     std::atomic<bool> m_blockingWritesAllowed{true};
@@ -232,6 +283,7 @@ private:
 #ifdef OLR_UNIT_TEST
     friend class TestMuxer;
     std::function<void()> m_afterCandidateSnapshotForTest;
+    std::function<void()> m_beforeCandidatePublicationForTest;
 #endif
 };
 

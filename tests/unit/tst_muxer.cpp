@@ -15,9 +15,43 @@
 #include <QScopeGuard>
 
 #include <atomic>
+#include <limits>
 #include <thread>
 
 #include "recorder_engine/muxer.h"
+
+namespace {
+struct ReentrantSidecarProbe {
+    Muxer* muxer = nullptr;
+    std::atomic<int>* videoCompletions = nullptr;
+    std::atomic<int>* sidecarCompletions = nullptr;
+    std::atomic<int>* sidecarRejections = nullptr;
+
+    static void sidecarWritten(void* context, uint64_t, bool written) {
+        auto& probe = *static_cast<ReentrantSidecarProbe*>(context);
+        (written ? *probe.sidecarCompletions : *probe.sidecarRejections)
+            .fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    static void videoWritten(void* context, uint64_t, bool written) {
+        auto& probe = *static_cast<ReentrantSidecarProbe*>(context);
+        if (written) probe.videoCompletions->fetch_add(1, std::memory_order_acq_rel);
+        AVPacket* packet = av_packet_alloc();
+        if (!packet || av_new_packet(packet, 2) < 0) {
+            av_packet_free(&packet);
+            return;
+        }
+        packet->data[0] = '{';
+        packet->data[1] = '}';
+        packet->stream_index = probe.muxer->subtitleTrackOffset();
+        packet->pts = packet->dts = 1;
+        packet->duration = 1;
+        probe.muxer->writePacket(
+            packet, Muxer::PacketWriteCallback{&probe, 0, &ReentrantSidecarProbe::sidecarWritten});
+        av_packet_free(&packet);
+    }
+};
+} // namespace
 
 class TestMuxer : public QObject {
     Q_OBJECT
@@ -45,11 +79,13 @@ private slots:
     void advertisesRationalFrameRate();
     void writePacketCompletionRunsAfterWriterSuccess();
     void writePacketCompletionReportsRejectedPacket();
+    void queueSequenceExhaustionRejectsBeforeCandidateCommit();
     void rejectedPacketCandidateIsIgnored();
     void concurrentCandidateWinnerFollowsQueueAcceptanceOrder();
     void laterAcceptedCandidateWinsWithinHeaderGrace();
     void candidateAcceptedAtGraceBoundarySeedsHeader();
     void staleAdmissionAfterBackpressureCannotSeedCandidate();
+    void queuedCarrierResetRejectsPixelsAndCandidate();
     void minWrittenVideoPtsTracksCommittedVideoPackets();
     void beginShutdownDrainWakesBlockedProducer();
     void beginShutdownDrainAcceptsInFlightPacketWhenQueueHasRoom();
@@ -657,9 +693,10 @@ void TestMuxer::writePacketCompletionRunsAfterWriterSuccess() {
     pkt->duration = 1;
 
     std::atomic<int> completions{0};
-    m.writePacket(pkt, [&](bool written) {
+    auto onWritten = [&](bool written) {
         if (written) completions.fetch_add(1, std::memory_order_acq_rel);
-    });
+    };
+    m.writePacket(pkt, Muxer::PacketWriteCallback::bind(onWritten));
     av_packet_free(&pkt);
 
     QTRY_COMPARE_WITH_TIMEOUT(completions.load(std::memory_order_acquire), 1, 2000);
@@ -678,12 +715,55 @@ void TestMuxer::writePacketCompletionReportsRejectedPacket() {
     pkt->duration = 1;
 
     std::atomic<int> rejected{0};
-    m.writePacket(pkt, [&](bool written) {
+    auto onWritten = [&](bool written) {
         if (!written) rejected.fetch_add(1, std::memory_order_acq_rel);
-    });
+    };
+    m.writePacket(pkt, Muxer::PacketWriteCallback::bind(onWritten));
     av_packet_free(&pkt);
 
     QCOMPARE(rejected.load(std::memory_order_acquire), 1);
+}
+
+void TestMuxer::queueSequenceExhaustionRejectsBeforeCandidateCommit() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    QVERIFY(m.init(QStringLiteral("olr_unit_queue_sequence_exhaustion"), 1, 320, 240, 30,
+                   {QStringLiteral("A")}, 48000, 2, QStringLiteral("01:02:03:04")));
+
+    auto makePacket = [&m](int64_t pts) {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt || av_new_packet(pkt, 2) < 0) {
+            av_packet_free(&pkt);
+            return pkt;
+        }
+        pkt->data[0] = '{';
+        pkt->data[1] = '}';
+        pkt->stream_index = m.subtitleTrackOffset();
+        pkt->pts = pkt->dts = pts;
+        pkt->duration = 1;
+        return pkt;
+    };
+
+    {
+        std::lock_guard<std::mutex> queueLock(m.m_qMutex);
+        m.m_nextQueuedPacketSequence = std::numeric_limits<uint64_t>::max();
+    }
+    AVPacket* last = makePacket(0);
+    QVERIFY(last != nullptr);
+    QVERIFY(m.writePacket(last));
+    av_packet_free(&last);
+
+    AVPacket* exhausted = makePacket(1);
+    QVERIFY(exhausted != nullptr);
+    QVERIFY(!m.writePacket(exhausted, {}, QStringLiteral("05:06:07:08")));
+    av_packet_free(&exhausted);
+
+    {
+        std::lock_guard<std::mutex> queueLock(m.m_qMutex);
+        QCOMPARE(m.m_nextQueuedPacketSequence, uint64_t(0));
+        QVERIFY(m.m_acceptedStartTimecodeCandidate.isEmpty());
+    }
+    m.close();
 }
 
 void TestMuxer::rejectedPacketCandidateIsIgnored() {
@@ -735,7 +815,15 @@ void TestMuxer::concurrentCandidateWinnerFollowsQueueAcceptanceOrder() {
     // qMutex. The writer releases qMutex before taking this header lock, so this
     // also asserts the intended lock order does not deadlock producers.
     m.m_headerMutex.lock();
+    bool headerMutexLocked = true;
+    const auto unlockHeaderMutex = qScopeGuard([&] {
+        if (headerMutexLocked) m.m_headerMutex.unlock();
+    });
     std::unique_lock<std::mutex> queueGate(m.m_qMutex);
+    std::atomic<bool> beforeCandidatePublication{false};
+    m.m_beforeCandidatePublicationForTest = [&] {
+        beforeCandidatePublication.store(true, std::memory_order_release);
+    };
     std::atomic<int> ready{0};
     std::thread producerOne([&] {
         ready.fetch_add(1, std::memory_order_release);
@@ -751,6 +839,7 @@ void TestMuxer::concurrentCandidateWinnerFollowsQueueAcceptanceOrder() {
     producerOne.join();
     producerTwo.join();
 
+    QTRY_VERIFY_WITH_TIMEOUT(beforeCandidatePublication.load(std::memory_order_acquire), 2000);
     {
         std::lock_guard<std::mutex> queueLock(m.m_qMutex);
         QVERIFY(!m.m_pktQueue.empty());
@@ -759,6 +848,7 @@ void TestMuxer::concurrentCandidateWinnerFollowsQueueAcceptanceOrder() {
                  acceptedFirstPts == 1 ? candidateOne : candidateTwo);
     }
     m.m_headerMutex.unlock();
+    headerMutexLocked = false;
 
     av_packet_free(&firstProducerPacket);
     av_packet_free(&secondProducerPacket);
@@ -872,7 +962,7 @@ void TestMuxer::staleAdmissionAfterBackpressureCannotSeedCandidate() {
         pkt->duration = 1;
         return pkt;
     };
-    for (size_t i = 0; i < Muxer::kMaxQueued; ++i) {
+    for (size_t i = 0; i < Muxer::kMaxQueuedPackets; ++i) {
         AVPacket* pkt = makePacket();
         QVERIFY(pkt != nullptr);
         QVERIFY(m.writePacket(pkt));
@@ -911,6 +1001,73 @@ void TestMuxer::staleAdmissionAfterBackpressureCannotSeedCandidate() {
     m.close();
 }
 
+void TestMuxer::queuedCarrierResetRejectsPixelsAndCandidate() {
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "5000");
+    const auto restoreGrace = qScopeGuard([] { qunsetenv("OLR_MUXER_TMCD_GRACE_MS"); });
+
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QString baseName = QStringLiteral("olr_unit_tc_queued_reset");
+    QVERIFY(m.init(baseName, 1, 320, 240, 30, {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto makePacket = [&m](int64_t pts) {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt || av_new_packet(pkt, 2) < 0) {
+            av_packet_free(&pkt);
+            return pkt;
+        }
+        pkt->data[0] = '{';
+        pkt->data[1] = '}';
+        pkt->stream_index = m.subtitleTrackOffset();
+        pkt->pts = pkt->dts = pts;
+        pkt->duration = 1;
+        return pkt;
+    };
+
+    std::atomic<uint64_t> currentEpoch{7};
+    std::atomic<int> staleRejected{0};
+    auto staleCompletion = [&staleRejected](bool written) {
+        if (!written) staleRejected.fetch_add(1, std::memory_order_acq_rel);
+    };
+    std::atomic<bool> beforeCandidatePublication{false};
+    m.m_beforeCandidatePublicationForTest = [&beforeCandidatePublication] {
+        beforeCandidatePublication.store(true, std::memory_order_release);
+    };
+    m.m_headerMutex.lock();
+    bool headerMutexLocked = true;
+    const auto unlockHeaderMutex = qScopeGuard([&] {
+        if (headerMutexLocked) m.m_headerMutex.unlock();
+    });
+    AVPacket* stale = makePacket(0);
+    QVERIFY(stale != nullptr);
+    QVERIFY(m.writePacket(stale, Muxer::PacketWriteCallback::bind(staleCompletion),
+                          QStringLiteral("05:06:07:08"),
+                          Muxer::PacketCarrierGuard{&currentEpoch, 7}));
+    av_packet_free(&stale);
+    QTRY_VERIFY_WITH_TIMEOUT(beforeCandidatePublication.load(std::memory_order_acquire), 2000);
+    currentEpoch.store(8, std::memory_order_release);
+    m.m_headerMutex.unlock();
+    headerMutexLocked = false;
+    QTRY_COMPARE_WITH_TIMEOUT(staleRejected.load(std::memory_order_acquire), 1, 2000);
+
+    const QString currentCandidate = QStringLiteral("06:07:08:09");
+    AVPacket* current = makePacket(1);
+    QVERIFY(current != nullptr);
+    QVERIFY(
+        m.writePacket(current, {}, currentCandidate, Muxer::PacketCarrierGuard{&currentEpoch, 8}));
+    av_packet_free(&current);
+    m.close();
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray path = videoPathFor(baseName).toUtf8();
+    QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+    AVDictionaryEntry* tag = av_dict_get(ctx->metadata, "timecode", nullptr, 0);
+    QVERIFY(tag != nullptr);
+    QCOMPARE(QString::fromUtf8(tag->value), currentCandidate);
+}
+
 void TestMuxer::minWrittenVideoPtsTracksCommittedVideoPackets() {
     Muxer m;
     m.setOutputDirectory(m_home.path());
@@ -936,18 +1093,17 @@ void TestMuxer::minWrittenVideoPtsTracksCommittedVideoPackets() {
     };
 
     std::atomic<int> completions{0};
+    auto onWritten = [&](bool written) {
+        if (written) completions.fetch_add(1, std::memory_order_acq_rel);
+    };
     AVPacket* a = makeVideoPacket(0, 1200);
     QVERIFY(a != nullptr);
-    QVERIFY(m.writePacket(a, [&](bool written) {
-        if (written) completions.fetch_add(1, std::memory_order_acq_rel);
-    }));
+    QVERIFY(m.writePacket(a, Muxer::PacketWriteCallback::bind(onWritten)));
     av_packet_free(&a);
 
     AVPacket* b = makeVideoPacket(1, 1000);
     QVERIFY(b != nullptr);
-    QVERIFY(m.writePacket(b, [&](bool written) {
-        if (written) completions.fetch_add(1, std::memory_order_acq_rel);
-    }));
+    QVERIFY(m.writePacket(b, Muxer::PacketWriteCallback::bind(onWritten)));
     av_packet_free(&b);
 
     QTRY_COMPARE_WITH_TIMEOUT(completions.load(std::memory_order_acquire), 2, 2000);
@@ -979,7 +1135,7 @@ void TestMuxer::beginShutdownDrainWakesBlockedProducer() {
         return pkt;
     };
 
-    for (size_t i = 0; i < Muxer::kMaxQueued; ++i) {
+    for (size_t i = 0; i < Muxer::kMaxQueuedPackets; ++i) {
         AVPacket* pkt = makePacket();
         QVERIFY(pkt != nullptr);
         m.writePacket(pkt);
@@ -994,9 +1150,10 @@ void TestMuxer::beginShutdownDrainWakesBlockedProducer() {
             producerReturned.store(true, std::memory_order_release);
             return;
         }
-        m.writePacket(pkt, [&](bool written) {
+        auto onWritten = [&](bool written) {
             if (!written) producerRejected.store(true, std::memory_order_release);
-        });
+        };
+        m.writePacket(pkt, Muxer::PacketWriteCallback::bind(onWritten));
         av_packet_free(&pkt);
         producerReturned.store(true, std::memory_order_release);
     });
@@ -1032,12 +1189,13 @@ void TestMuxer::beginShutdownDrainAcceptsInFlightPacketWhenQueueHasRoom() {
 
     std::atomic<int> completions{0};
     std::atomic<int> rejections{0};
-    m.writePacket(pkt, [&](bool written) {
+    auto onWritten = [&](bool written) {
         if (written)
             completions.fetch_add(1, std::memory_order_acq_rel);
         else
             rejections.fetch_add(1, std::memory_order_acq_rel);
-    });
+    };
+    m.writePacket(pkt, Muxer::PacketWriteCallback::bind(onWritten));
     av_packet_free(&pkt);
 
     QTRY_COMPARE_WITH_TIMEOUT(completions.load(std::memory_order_acquire), 1, 2000);
@@ -1075,18 +1233,8 @@ void TestMuxer::closeAllowsCallbackSidecarPacketDuringDrain() {
     std::atomic<int> sidecarRejections{0};
     AVPacket* pkt = makePacket(0);
     QVERIFY(pkt != nullptr);
-    m.writePacket(pkt, [&](bool written) {
-        if (written) videoCompletions.fetch_add(1, std::memory_order_acq_rel);
-        AVPacket* sidecar = makePacket(1);
-        if (!sidecar) return;
-        m.writePacket(sidecar, [&](bool sidecarWritten) {
-            if (sidecarWritten)
-                sidecarCompletions.fetch_add(1, std::memory_order_acq_rel);
-            else
-                sidecarRejections.fetch_add(1, std::memory_order_acq_rel);
-        });
-        av_packet_free(&sidecar);
-    });
+    ReentrantSidecarProbe probe{&m, &videoCompletions, &sidecarCompletions, &sidecarRejections};
+    m.writePacket(pkt, Muxer::PacketWriteCallback{&probe, 0, &ReentrantSidecarProbe::videoWritten});
     av_packet_free(&pkt);
 
     m.close();

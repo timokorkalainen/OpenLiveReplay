@@ -327,11 +327,12 @@ void TestReplayManagerTelemetry::stopRecordingDrainsMuxerBeforeDeletingWorkers()
     pkt->dts = 0;
     pkt->duration = 1;
 
-    manager.m_muxer->writePacket(pkt, [&](bool) {
+    auto onWritten = [&](bool) {
         completionSawWorkerAlive.store(!workerDestroyed.load(std::memory_order_acquire),
                                        std::memory_order_release);
         completionRan.store(true, std::memory_order_release);
-    });
+    };
+    manager.m_muxer->writePacket(pkt, Muxer::PacketWriteCallback::bind(onWritten));
     av_packet_free(&pkt);
 
     manager.stopRecording();

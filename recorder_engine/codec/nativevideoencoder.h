@@ -7,8 +7,8 @@
 #include <QString>
 
 #include <cstdint>
-#include <functional>
 #include <memory>
+#include <type_traits>
 
 extern "C" {
 struct AVFrame;
@@ -37,8 +37,29 @@ public:
         int bitrate = 30'000'000;
         ColorMetadata color;
     };
-    using PacketCallback =
-        std::function<void(const QByteArray& data, int64_t ptsTicks, bool keyframe)>;
+    struct PacketCallback {
+        using Function = void (*)(void* context, uint64_t id, const QByteArray& data,
+                                  int64_t ptsTicks, bool keyframe);
+
+        void* context = nullptr;
+        uint64_t id = 0;
+        Function function = nullptr;
+
+        void operator()(const QByteArray& data, int64_t ptsTicks, bool keyframe) const {
+            if (function) function(context, id, data, ptsTicks, keyframe);
+        }
+        explicit operator bool() const noexcept { return function != nullptr; }
+
+        template <typename Callable>
+        static PacketCallback bind(Callable& callable) noexcept {
+            return PacketCallback{&callable, 0,
+                                  [](void* context, uint64_t, const QByteArray& data,
+                                     int64_t ptsTicks, bool keyframe) {
+                                      (*static_cast<Callable*>(context))(data, ptsTicks, keyframe);
+                                  }};
+        }
+    };
+    static_assert(std::is_trivially_copyable_v<PacketCallback>);
 
     // Returns nullptr (and sets *error) if a hardware H.264 encoder cannot be
     // opened. Never returns a software encoder.
