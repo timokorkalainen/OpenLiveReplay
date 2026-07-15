@@ -60,26 +60,67 @@ def _cmake_bracket(value: str) -> str:
     return f"[{equals}[{value}]{equals}]"
 
 
-def _path_spellings(path: Path) -> tuple[str, ...]:
-    values = {str(path), path.as_posix()}
-    return tuple(sorted(values, key=len, reverse=True))
-
-
-def _replace_paths(text: str, replacements: Sequence[tuple[Path, Path]]) -> str:
-    spellings: list[tuple[str, str]] = []
-    for original, replacement in replacements:
-        for spelling in _path_spellings(original):
-            target = (
-                replacement.as_posix()
-                if "/" in spelling
-                else str(replacement)
-            )
-            spellings.append((spelling, target))
+def _rewrite_path_identity(
+    value: str, replacements: Sequence[tuple[Path, Path]]
+) -> str:
+    """Rewrite one complete Windows path token, never a string prefix."""
+    if not value or not Path(value).is_absolute():
+        return value
+    candidate = Path(os.path.abspath(value))
+    candidate_key = os.path.normcase(str(candidate))
     for original, replacement in sorted(
-        spellings, key=lambda item: len(item[0]), reverse=True
+        replacements, key=lambda item: len(str(item[0])), reverse=True
     ):
-        text = text.replace(original, replacement)
-    return text
+        original_key = os.path.normcase(str(Path(os.path.abspath(original))))
+        if candidate_key == original_key:
+            return replacement.as_posix()
+        prefix = original_key.rstrip("\\/") + os.sep
+        if candidate_key.startswith(prefix):
+            relative = Path(candidate_key[len(prefix) :])
+            return (replacement / relative).as_posix()
+    return value
+
+
+def _rewrite_environment_property(
+    raw: str,
+    replacements: Sequence[tuple[Path, Path]],
+    *,
+    modification: bool,
+) -> str:
+    rewritten: list[str] = []
+    for item in raw.split(";"):
+        name, separator, remainder = item.partition("=")
+        if not separator:
+            rewritten.append(item)
+            continue
+        if modification:
+            operation, operation_separator, value = remainder.partition(":")
+            if not operation_separator or name.casefold() not in (
+                "path",
+                "qml_import_path",
+                "qml2_import_path",
+            ):
+                rewritten.append(item)
+                continue
+            replacement = _rewrite_path_identity(value, replacements)
+            rewritten.append(f"{name}={operation}:{replacement}")
+            continue
+        if name.casefold() not in (
+            "qt_plugin_path",
+            "qt_qpa_platform_plugin_path",
+            "qml_import_path",
+            "qml2_import_path",
+            "olr_ffmpeg_root",
+            "olr_srt_root",
+            "olr_mingw_bin",
+            "olr_qt_bin",
+        ):
+            rewritten.append(item)
+            continue
+        rewritten.append(
+            f"{name}={_rewrite_path_identity(remainder, replacements)}"
+        )
+    return ";".join(rewritten)
 
 
 def _replace_cmake_literal_argument(
@@ -183,6 +224,11 @@ def _qml_property_paths(tests) -> tuple[Path, ...]:
 
 def _selected_test_records(graph, args: Sequence[str]):
     """Return a safe superset for common literal CTest positive selectors."""
+    if any(
+        test.fixtures_setup or test.fixtures_cleanup or test.fixtures_required
+        for test in graph.tests
+    ):
+        return graph.tests
     name_values: list[str] = []
     label_values: list[str] = []
     index = 0
@@ -195,7 +241,21 @@ def _selected_test_records(graph, args: Sequence[str]):
             "--union",
             "--rerun-failed",
             "--tests-from-file",
+            "-FA",
+            "-FS",
+            "-FC",
+            "--fixture-exclude-any",
+            "--fixture-exclude-setup",
+            "--fixture-exclude-cleanup",
         ) or argument.startswith(("--tests-information=", "--tests-from-file=")):
+            return graph.tests
+        if argument.startswith(
+            (
+                "--fixture-exclude-any=",
+                "--fixture-exclude-setup=",
+                "--fixture-exclude-cleanup=",
+            )
+        ):
             return graph.tests
         target: list[str] | None = None
         if argument in ("-R", "--tests-regex"):
@@ -251,6 +311,64 @@ def _source_snapshot_exclusions(source_root: Path, build_root: Path) -> tuple[Pa
         if candidate.exists():
             excluded.add(candidate)
     return tuple(excluded)
+
+
+def _external_tool_closure(executable: Path) -> dict[Path, Path]:
+    """Return an explicit install-relative closure for a non-runtime tool."""
+    root = executable.parent
+    selected: set[Path] = {executable}
+    for adjacent in root.iterdir():
+        if adjacent.is_file() and (
+            adjacent.suffix.casefold() == ".dll"
+            or adjacent.name.casefold() == (executable.name + ".manifest").casefold()
+        ):
+            selected.add(adjacent)
+
+    closure_roots: list[Path] = []
+    descriptor = executable.with_name(executable.name + ".olr-runtime-files")
+    if descriptor.is_file():
+        selected.add(descriptor)
+        for line in descriptor.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if not value or value.startswith("#"):
+                continue
+            relative = Path(value)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError(
+                    f"external tool closure has unsafe path {value!r}: {descriptor}"
+                )
+            closure_roots.append(root / relative)
+    elif executable.stem.casefold().startswith("python"):
+        closure_roots.extend(
+            path for path in (root / "DLLs", root / "Lib") if path.exists()
+        )
+        selected.update(root.glob("python*.zip"))
+        if (root / "pyvenv.cfg").is_file():
+            selected.add(root / "pyvenv.cfg")
+
+    for closure_root in closure_roots:
+        if not closure_root.exists():
+            raise RuntimeError(
+                f"external tool closure path does not exist: {closure_root}"
+            )
+        candidates = (closure_root,) if closure_root.is_file() else closure_root.rglob("*")
+        for candidate in candidates:
+            is_junction = getattr(candidate, "is_junction", lambda: False)()
+            if candidate.is_symlink() or is_junction:
+                raise RuntimeError(
+                    f"external tool closure contains a reparse alias: {candidate}"
+                )
+            if not candidate.is_file():
+                continue
+            canonical = candidate.resolve()
+            if not canonical.is_relative_to(root.resolve()) or os.path.normcase(
+                str(candidate)
+            ) != os.path.normcase(str(canonical)):
+                raise RuntimeError(
+                    f"external tool closure escapes its install root: {candidate}"
+                )
+            selected.add(candidate)
+    return {path.relative_to(root): path for path in selected}
 
 
 def find_build_directory(args: Sequence[str], cwd: Path) -> Path:
@@ -377,11 +495,7 @@ def prepare_windows_runtime(
         qt_qml = canonical_directory("Qt QML imports", qt_root / "qml", "Qt6_DIR")
         for directory in (*runtime_dirs, qt_plugins, qt_qml):
             lease.hold_dll_tree(directory)
-        launch_qml = (
-            lease.stage_readonly_tree(qt_qml)
-            if audit_lease is not None
-            else qt_qml
-        )
+        launch_qml = qt_qml
 
         graph = discover_ctest_graph(canonical_build, lease=lease)
         validate_ctest_runtime_properties(
@@ -445,13 +559,26 @@ def prepare_windows_runtime(
             lease.launch_source_directory = launch_source
 
             launch_plugins = lease.stage_readonly_tree(
-                qt_plugins, entry_limit=16384, byte_limit=512 << 20
+                qt_plugins,
+                entry_limit=16384,
+                byte_limit=512 << 20,
+                included_suffixes=(".dll", ".json"),
             )
             launch_platform_plugins = launch_plugins / qt_platform_plugins.relative_to(
                 qt_plugins
             )
             launch_qml = lease.stage_readonly_tree(
-                qt_qml, entry_limit=32768, byte_limit=1 << 30
+                qt_qml,
+                entry_limit=32768,
+                byte_limit=1 << 30,
+                included_suffixes=(
+                    ".dll",
+                    ".qml",
+                    ".js",
+                    ".mjs",
+                    ".qmltypes",
+                ),
+                included_names=("qmldir",),
             )
 
             qml_replacements: list[tuple[Path, Path]] = [
@@ -508,15 +635,27 @@ def prepare_windows_runtime(
                 Path("srt") / "bin",
                 Path("srt") / "lib",
             )
+            selected_executables = {
+                executable
+                for test in selected_tests
+                for _argument, executable in test.executable_arguments
+            }
+            runtime_tool_destinations: dict[Path, Path] = {}
             for directory, relative_directory in zip(
                 runtime_dirs, runtime_relative_dirs, strict=True
             ):
                 for child in sorted(
                     directory.iterdir(), key=lambda path: path.name.casefold()
                 ):
-                    if not child.is_file():
+                    if not child.is_file() or (
+                        child.suffix.casefold() != ".dll"
+                        and child not in selected_executables
+                    ):
                         continue
-                    runtime_entries[relative_directory / child.name] = child
+                    destination = relative_directory / child.name
+                    runtime_entries[destination] = child
+                    if child in selected_executables:
+                        runtime_tool_destinations[child] = destination
             runtime_layout = lease.stage_readonly_layout(
                 "runtime", runtime_entries, byte_limit=2 << 30
             )
@@ -526,11 +665,20 @@ def prepare_windows_runtime(
             )
             lease.launch_runtime_directory = launch_runtime
             lease.launch_runtime_directories = launch_runtime_dirs
-            cmake_root = cmake.parent.parent
-            launch_cmake_root = lease.stage_readonly_tree(
-                cmake_root, entry_limit=32768, byte_limit=1 << 30
+            ctest_entries: dict[Path, Path] = {Path(ctest.name): ctest}
+            for adjacent in sorted(
+                ctest.parent.iterdir(), key=lambda path: path.name.casefold()
+            ):
+                if adjacent == ctest or not adjacent.is_file():
+                    continue
+                if adjacent.suffix.casefold() == ".dll" or adjacent.name.casefold() == (
+                    ctest.name + ".manifest"
+                ).casefold():
+                    ctest_entries[Path(adjacent.name)] = adjacent
+            ctest_layout = lease.stage_readonly_layout(
+                "ctest-tool", ctest_entries, byte_limit=256 << 20
             )
-            launch_ctest = launch_cmake_root / ctest.relative_to(cmake_root)
+            launch_ctest = ctest_layout / ctest.name
 
             build_entries: dict[
                 Path, Path | bytes | Callable[[Path], bytes]
@@ -538,12 +686,6 @@ def prepare_windows_runtime(
             executable_replacements: list[tuple[Path, Path]] = []
             executable_destinations: dict[Path, Path] = {}
             external_launch_executables: dict[Path, Path] = {}
-            external_roots: dict[Path, Path] = {}
-            selected_executables = {
-                executable
-                for test in selected_tests
-                for _argument, executable in test.executable_arguments
-            }
             for executable in sorted(
                 selected_executables, key=lambda path: str(path).casefold()
             ):
@@ -552,19 +694,19 @@ def prepare_windows_runtime(
                 ):
                     relative = executable.relative_to(canonical_build)
                 else:
-                    external_root = (
-                        executable.parent.parent
-                        if executable.parent.name.casefold() == "bin"
-                        else executable.parent
-                    )
-                    staged_external = external_roots.get(external_root)
-                    if staged_external is None:
-                        staged_external = lease.stage_readonly_tree(
-                            external_root,
-                            entry_limit=32768,
-                            byte_limit=1 << 30,
+                    runtime_destination = runtime_tool_destinations.get(executable)
+                    if runtime_destination is not None:
+                        external_launch_executables[executable] = (
+                            runtime_layout / runtime_destination
                         )
-                        external_roots[external_root] = staged_external
+                        continue
+                    external_root = executable.parent
+                    staged_external = lease.stage_readonly_layout(
+                        f"external-tool-{len(external_launch_executables)}",
+                        _external_tool_closure(executable),
+                        entry_limit=32768,
+                        byte_limit=1 << 30,
+                    )
                     external_launch_executables[executable] = (
                         staged_external / executable.relative_to(external_root)
                     )
@@ -624,10 +766,41 @@ def prepare_windows_runtime(
                             (srt_root, runtime_layout / "srt"),
                         )
                     )
-                    rewritten = _replace_paths(original_text, replacements)
+                    rewritten = original_text
+                    for path_argument in graph.path_arguments:
+                        if path_argument.definition_file != graph_input:
+                            continue
+                        staged_path = (
+                            staged_build
+                            / path_argument.path.relative_to(canonical_build)
+                        )
+                        replacement = _rewrite_path_identity(
+                            path_argument.argument,
+                            ((path_argument.path, staged_path),),
+                        )
+                        if replacement != path_argument.argument:
+                            rewritten = _replace_cmake_literal_argument(
+                                rewritten, path_argument.argument, replacement
+                            )
                     for test in selected_tests:
                         if test.definition_file != graph_input:
                             continue
+                        for raw in test.environment_values:
+                            replacement = _rewrite_environment_property(
+                                raw, replacements, modification=False
+                            )
+                            if replacement != raw:
+                                rewritten = _replace_cmake_literal_argument(
+                                    rewritten, raw, replacement
+                                )
+                        for raw in test.environment_modification_values:
+                            replacement = _rewrite_environment_property(
+                                raw, replacements, modification=True
+                            )
+                            if replacement != raw:
+                                rewritten = _replace_cmake_literal_argument(
+                                    rewritten, raw, replacement
+                                )
                         for quicktest_input in quicktest_inputs_by_test.get(
                             test.name, ()
                         ):

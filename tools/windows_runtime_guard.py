@@ -283,6 +283,8 @@ class RuntimeAuditLease:
         self.launch_runtime_directory: Path | None = None
         self.launch_runtime_directories: tuple[Path, ...] = ()
         self.launch_executable: Path | None = None
+        self.staged_file_count = 0
+        self.staged_byte_count = 0
 
     def __enter__(self) -> RuntimeAuditLease:
         return self
@@ -358,6 +360,8 @@ class RuntimeAuditLease:
         entry_limit: int = 4096,
         byte_limit: int = 256 << 20,
         excluded: tuple[Path, ...] = (),
+        included_suffixes: tuple[str, ...] | None = None,
+        included_names: tuple[str, ...] = (),
     ) -> Path:
         """Snapshot a runtime tree and deny mutation for the child lifetime."""
         source = self.canonical_directory(directory)
@@ -377,25 +381,50 @@ class RuntimeAuditLease:
                 for item in excluded_canonical
             )
 
-        entries = sorted(
-            (path for path in source.rglob("*") if not is_excluded(path)),
-            key=lambda path: str(path).casefold(),
+        suffixes = (
+            {suffix.casefold() for suffix in included_suffixes}
+            if included_suffixes is not None
+            else None
         )
+        names = {name.casefold() for name in included_names}
+        entries: list[Path] = []
+        for current_text, directory_names, file_names in os.walk(source):
+            current = Path(current_text)
+            retained_directories: list[str] = []
+            for name in directory_names:
+                child = current / name
+                if is_excluded(child):
+                    continue
+                is_junction = getattr(child, "is_junction", lambda: False)()
+                if child.is_symlink() or is_junction:
+                    raise RuntimeError(
+                        f"protected tree contains a reparse alias: {child}"
+                    )
+                retained_directories.append(name)
+            directory_names[:] = retained_directories
+            for name in file_names:
+                entry = current / name
+                if is_excluded(entry):
+                    continue
+                if suffixes is not None and (
+                    entry.suffix.casefold() not in suffixes
+                    and entry.name.casefold() not in names
+                ):
+                    continue
+                entries.append(entry)
+        entries.sort(key=lambda path: str(path).casefold())
         if len(entries) > entry_limit:
             raise RuntimeError(
                 f"runtime QML tree exceeds {entry_limit} entries: {source}"
             )
         for entry in entries:
-            is_junction = getattr(entry, "is_junction", lambda: False)()
-            if entry.is_symlink() or is_junction:
+            if entry.is_symlink():
                 raise RuntimeError(
-                    f"runtime QML tree contains a reparse alias: {entry}"
+                    f"protected tree contains a reparse alias: {entry}"
                 )
-            if entry.is_dir():
-                continue
             if not entry.is_file():
                 raise RuntimeError(
-                    f"runtime QML tree contains unsupported entry: {entry}"
+                    f"protected tree contains unsupported entry: {entry}"
                 )
 
         temporary = tempfile.TemporaryDirectory(prefix="olr-qml-runtime-")
@@ -406,16 +435,13 @@ class RuntimeAuditLease:
         try:
             for entry in entries:
                 destination = staged / entry.relative_to(source)
-                if entry.is_dir():
-                    destination.mkdir(parents=True, exist_ok=True)
+                destination.parent.mkdir(parents=True, exist_ok=True)
 
             sid = _current_user_sid()
             _set_staged_tree_access(temporary_root, sid, "BUILD")
             locked = True
             total_size = 0
             for entry in entries:
-                if entry.is_dir():
-                    continue
                 destination = staged / entry.relative_to(source)
                 with self._open_read_locked(entry) as stream:
                     final = self._final_path_from_stream(stream, entry)
@@ -439,6 +465,8 @@ class RuntimeAuditLease:
             _set_staged_tree_access(temporary_root, sid, "RX")
             record = _StagedTree(temporary, temporary_root, staged, sid)
             self._staged_trees[source] = record
+            self.staged_file_count += len(entries)
+            self.staged_byte_count += total_size
             self.canonical_directory(temporary_root)
             self.canonical_directory(staged)
             return staged
@@ -538,6 +566,8 @@ class RuntimeAuditLease:
             self._staged_trees[key] = _StagedTree(
                 temporary, temporary_root, staged, sid
             )
+            self.staged_file_count += len(entries)
+            self.staged_byte_count += total_size
             self.canonical_directory(temporary_root)
             self.canonical_directory(staged)
             return staged
@@ -1297,8 +1327,19 @@ class CTestRecord(NamedTuple):
     executable_arguments: tuple[tuple[str, Path], ...]
     working_directory: Path
     labels: tuple[str, ...]
+    fixtures_setup: tuple[str, ...]
+    fixtures_cleanup: tuple[str, ...]
+    fixtures_required: tuple[str, ...]
+    environment_values: tuple[str, ...]
+    environment_modification_values: tuple[str, ...]
     environment: tuple[str, ...]
     environment_modification: tuple[str, ...]
+
+
+class CTestPathArgument(NamedTuple):
+    definition_file: Path
+    argument: str
+    path: Path
 
 
 class CTestGraph(NamedTuple):
@@ -1306,12 +1347,15 @@ class CTestGraph(NamedTuple):
     tests: tuple[CTestRecord, ...]
     executables: tuple[Path, ...]
     working_directories: tuple[Path, ...]
+    path_arguments: tuple[CTestPathArgument, ...]
 
 
 def _property_assignments_for_command(
     command_name: str, arguments: tuple[str, ...]
-) -> tuple[tuple[tuple[str, ...], str, str, bool], ...]:
-    assignments: list[tuple[tuple[str, ...], str, str, bool]] = []
+) -> tuple[tuple[tuple[str, ...], str, str, bool, tuple[str, ...]], ...]:
+    assignments: list[
+        tuple[tuple[str, ...], str, str, bool, tuple[str, ...]]
+    ] = []
     if command_name == "set_tests_properties":
         try:
             index = next(
@@ -1325,7 +1369,13 @@ def _property_assignments_for_command(
         properties = arguments[index + 1 :]
         for offset in range(0, len(properties) - 1, 2):
             assignments.append(
-                (tests, properties[offset].casefold(), properties[offset + 1], False)
+                (
+                    tests,
+                    properties[offset].casefold(),
+                    properties[offset + 1],
+                    False,
+                    (properties[offset + 1],),
+                )
             )
     elif command_name == "set_property":
         if not arguments or arguments[0].casefold() != "test":
@@ -1358,6 +1408,7 @@ def _property_assignments_for_command(
                 arguments[index + 1].casefold(),
                 ("" if append_string else ";").join(arguments[index + 2 :]),
                 append,
+                tuple(arguments[index + 2 :]),
             )
         )
     return tuple(assignments)
@@ -1388,7 +1439,7 @@ def discover_ctest_graph(
             ]
         )
         if not roots:
-            return CTestGraph((), (), (), ())
+            return CTestGraph((), (), (), (), ())
         seen_inputs: set[Path] = set()
         active_inputs: set[Path] = set()
         inputs: list[Path] = []
@@ -1396,6 +1447,8 @@ def discover_ctest_graph(
             tuple[tuple[str, ...], Path, Path, Path, tuple[str, str]]
         ] = []
         property_values: dict[tuple[str, str], dict[str, list[str]]] = {}
+        property_tokens: dict[tuple[str, str], dict[str, list[str]]] = {}
+        path_arguments: list[CTestPathArgument] = []
 
         def evaluate(
             pending_path: Path,
@@ -1488,6 +1541,17 @@ def discover_ctest_graph(
                             next_execution_directory,
                             target if command_name != "include" else scope_file,
                         )
+                        path_arguments.append(
+                            CTestPathArgument(
+                                canonical,
+                                arguments[0],
+                                Path(os.path.abspath(
+                                    subdirectory
+                                    if command_name in ("subdirs", "add_subdirectory")
+                                    else target
+                                )).resolve(),
+                            )
+                        )
                         continue
                     if command_name == "add_test":
                         name = _test_name(arguments)
@@ -1502,7 +1566,7 @@ def discover_ctest_graph(
                                 )
                             )
                         continue
-                    for tests, property_name, value, append in (
+                    for tests, property_name, value, append, tokens in (
                         _property_assignments_for_command(command_name, arguments)
                     ):
                         for test in tests:
@@ -1513,6 +1577,13 @@ def discover_ctest_graph(
                                 properties.setdefault(property_name, []).append(value)
                             else:
                                 properties[property_name] = [value]
+                            token_values = property_tokens.setdefault(
+                                (scope, test), {}
+                            )
+                            if append:
+                                token_values.setdefault(property_name, []).extend(tokens)
+                            else:
+                                token_values[property_name] = list(tokens)
             finally:
                 active_inputs.remove(canonical)
 
@@ -1538,6 +1609,7 @@ def discover_ctest_graph(
             if name is None:
                 continue
             properties = property_values.get(property_key, {})
+            tokens = property_tokens.get(property_key, {})
             configured_working = properties.get("working_directory", [])
             working_value = configured_working[-1] if configured_working else ""
             working_lexical = (
@@ -1616,6 +1688,21 @@ def discover_ctest_graph(
                 for value in properties.get("labels", [])
                 for item in _split_cmake_list(value)
             )
+            fixtures_setup = tuple(
+                item
+                for value in properties.get("fixtures_setup", [])
+                for item in _split_cmake_list(value)
+            )
+            fixtures_cleanup = tuple(
+                item
+                for value in properties.get("fixtures_cleanup", [])
+                for item in _split_cmake_list(value)
+            )
+            fixtures_required = tuple(
+                item
+                for value in properties.get("fixtures_required", [])
+                for item in _split_cmake_list(value)
+            )
             records.append(
                 CTestRecord(
                     name,
@@ -1625,6 +1712,11 @@ def discover_ctest_graph(
                     tuple(executable_arguments),
                     working,
                     labels,
+                    fixtures_setup,
+                    fixtures_cleanup,
+                    fixtures_required,
+                    tuple(tokens.get("environment", [])),
+                    tuple(tokens.get("environment_modification", [])),
                     environment,
                     modifications,
                 )
@@ -1634,6 +1726,7 @@ def discover_ctest_graph(
             tuple(records),
             tuple(sorted(executables, key=lambda path: str(path).casefold())),
             tuple(sorted(working_directories, key=lambda path: str(path).casefold())),
+            tuple(path_arguments),
         )
     finally:
         if owned:

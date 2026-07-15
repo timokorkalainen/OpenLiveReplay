@@ -123,11 +123,7 @@ def prepare_windows_app_runtime(
         qt_qml = canonical_directory("Qt QML imports", qt_root / "qml", "Qt6_DIR")
         for directory in (*runtime_dirs, qt_plugins, qt_qml):
             lease.hold_dll_tree(directory)
-        launch_qml = (
-            lease.stage_readonly_tree(qt_qml)
-            if audit_lease is not None
-            else qt_qml
-        )
+        launch_qml = qt_qml
 
         runtime_guard.reject_runtime_dll_shadowing(
             executable.parent,
@@ -143,13 +139,26 @@ def prepare_windows_app_runtime(
         launch_executable = executable
         if audit_lease is not None and os.name == "nt":
             launch_plugins = lease.stage_readonly_tree(
-                qt_plugins, entry_limit=16384, byte_limit=512 << 20
+                qt_plugins,
+                entry_limit=16384,
+                byte_limit=512 << 20,
+                included_suffixes=(".dll", ".json"),
             )
             launch_platform_plugins = (
                 launch_plugins / qt_platform_plugins.relative_to(qt_plugins)
             )
             launch_qml = lease.stage_readonly_tree(
-                qt_qml, entry_limit=32768, byte_limit=1 << 30
+                qt_qml,
+                entry_limit=32768,
+                byte_limit=1 << 30,
+                included_suffixes=(
+                    ".dll",
+                    ".qml",
+                    ".js",
+                    ".mjs",
+                    ".qmltypes",
+                ),
+                included_names=("qmldir",),
             )
 
             runtime_relative_dirs = (
@@ -169,7 +178,7 @@ def prepare_windows_app_runtime(
                 for child in sorted(
                     directory.iterdir(), key=lambda path: path.name.casefold()
                 ):
-                    if child.is_file():
+                    if child.is_file() and child.suffix.casefold() == ".dll":
                         runtime_entries[relative_directory / child.name] = child
             runtime_layout = lease.stage_readonly_layout(
                 "app-runtime", runtime_entries, byte_limit=2 << 30

@@ -1072,7 +1072,7 @@ class RunCtestTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_protected_launch_snapshot_cost_is_bounded(self):
         commands: list[str] = []
-        for index in range(256):
+        for index in range(64):
             executable = self.build_dir / f"tst_snapshot_{index:03d}.exe"
             _write_manifest_pe_fixture(executable)
             commands.append(
@@ -1081,20 +1081,57 @@ class RunCtestTests(unittest.TestCase):
         (self.build_dir / "CTestTestfile.cmake").write_text(
             "\n".join(commands) + "\n", encoding="utf-8"
         )
+        noise_roots = (
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.qt_root / "plugins" / "documentation",
+            self.qt_root / "qml" / "examples",
+            self.cmake_bin.parent,
+        )
+        for root in noise_roots:
+            root.mkdir(parents=True, exist_ok=True)
+            with (root / "unused-debug-payload.pdb").open("wb") as stream:
+                stream.truncate(64 << 20)
+        for index in range(1024):
+            root = noise_roots[index % len(noise_roots)]
+            (root / f"unused-{index:04d}.txt").write_bytes(b"not runtime")
 
-        started = time.perf_counter()
-        with RuntimeAuditLease() as lease:
-            run_ctest.prepare_windows_runtime(
-                self.build_dir, {}, audit_lease=lease
-            )
-            staged = lease.launch_build_directory
-            self.assertEqual(len(tuple(staged.glob("tst_snapshot_*.exe"))), 256)
-        elapsed = time.perf_counter() - started
+        measurements: list[tuple[str, float, int, int]] = []
+        for label, arguments in (
+            ("full-cold", ()),
+            ("full-warm", ()),
+            ("focused-cold", ("-R", "^snapshot-7$")),
+            ("focused-warm", ("-R", "^snapshot-7$")),
+        ):
+            started = time.perf_counter()
+            with RuntimeAuditLease() as lease:
+                run_ctest.prepare_windows_runtime(
+                    self.build_dir,
+                    {},
+                    audit_lease=lease,
+                    ctest_args=arguments,
+                )
+                staged = lease.launch_build_directory
+                expected = 1 if arguments else 64
+                self.assertEqual(
+                    len(tuple(staged.glob("tst_snapshot_*.exe"))), expected
+                )
+                measurements.append(
+                    (
+                        label,
+                        time.perf_counter() - started,
+                        lease.staged_file_count,
+                        lease.staged_byte_count,
+                    )
+                )
 
-        # Includes 256 PE manifest/provenance checks plus protected copies. Keep
-        # this bounded without making the assertion depend on warm filesystem
-        # or antivirus caches.
-        self.assertLess(elapsed, 10.0)
+        for label, elapsed, file_count, byte_count in measurements:
+            with self.subTest(label=label):
+                self.assertLess(elapsed, 12.0)
+                self.assertLess(file_count, 256)
+                self.assertLess(byte_count, 64 << 20)
+        focused = [item for item in measurements if item[0].startswith("focused")]
+        self.assertTrue(all(item[2] < 64 for item in focused))
 
     def test_windows_runtime_replaces_inherited_path(self):
         env, ctest = run_ctest.prepare_windows_runtime(
@@ -1353,8 +1390,8 @@ class RunCtestTests(unittest.TestCase):
         )
         (self.qt_root / "bin" / "Qt6Core.dll").write_bytes(b"qt")
         (self.ffmpeg_root / "bin" / "ffprobe.exe").write_bytes(b"ffprobe")
-        (self.compiler_bin / "runtime-tool.exe").write_bytes(b"compiler-first")
-        (self.qt_root / "bin" / "runtime-tool.exe").write_bytes(b"qt-second")
+        (self.compiler_bin / "runtime-tool.dll").write_bytes(b"compiler-first")
+        (self.qt_root / "bin" / "runtime-tool.dll").write_bytes(b"qt-second")
 
         with RuntimeAuditLease() as lease:
             env, selected_ctest = run_ctest.prepare_windows_runtime(
@@ -1371,7 +1408,7 @@ class RunCtestTests(unittest.TestCase):
             self.assertNotEqual(selected_ctest, self.ctest)
             self.assertEqual(selected_ctest.name, "ctest.exe")
             self.assertEqual(
-                (runtime_dirs[0] / "runtime-tool.exe").read_bytes(),
+                (runtime_dirs[0] / "runtime-tool.dll").read_bytes(),
                 b"compiler-first",
             )
             self.assertTrue(staged_executable.is_file())
@@ -1428,6 +1465,9 @@ class RunCtestTests(unittest.TestCase):
         resources = external_root / "resources"
         resources.mkdir()
         (resources / "runtime.dat").write_bytes(b"resource")
+        wrapper.with_name(wrapper.name + ".olr-runtime-files").write_text(
+            "resources\n", encoding="utf-8"
+        )
         (self.build_dir / "CTestTestfile.cmake").write_text(
             f'add_test([=[external]=] "{wrapper.as_posix()}")\n',
             encoding="utf-8",
@@ -1498,6 +1538,123 @@ class RunCtestTests(unittest.TestCase):
             staged = lease.launch_build_directory
             self.assertTrue((staged / unit.name).is_file())
             self.assertTrue((staged / e2e.name).is_file())
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_fixture_properties_disable_narrow_snapshot_optimization(self):
+        setup = self.build_dir / "fixture_setup.exe"
+        victim = self.build_dir / "fixture_victim.exe"
+        cleanup = self.build_dir / "fixture_cleanup.exe"
+        for executable in (setup, victim, cleanup):
+            _write_manifest_pe_fixture(executable)
+        setup_qml = self.root / "tests" / "fixture-qml"
+        setup_qml.mkdir(parents=True)
+        (setup_qml / "tst_setup.qml").write_text(
+            "import QtQuick\nItem {}\n", encoding="utf-8"
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[setup]=] "{setup.as_posix()}" "-input" '
+            f'"../{setup_qml.relative_to(self.root).as_posix()}")\n'
+            'set_tests_properties([=[setup]=] PROPERTIES FIXTURES_SETUP "device")\n'
+            f'add_test([=[victim]=] "{victim.as_posix()}")\n'
+            'set_tests_properties([=[victim]=] PROPERTIES FIXTURES_REQUIRED "device")\n'
+            f'add_test([=[cleanup]=] "{cleanup.as_posix()}")\n'
+            'set_tests_properties([=[cleanup]=] PROPERTIES FIXTURES_CLEANUP "device")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^victim$"),
+            )
+            staged = lease.launch_build_directory
+            for executable in (setup, victim, cleanup):
+                self.assertTrue((staged / executable.name).is_file())
+            staged_source = lease.launch_source_directory
+            self.assertNotEqual(staged_source, self.root)
+            graph = (staged / "CTestTestfile.cmake").read_text(encoding="utf-8")
+            self.assertIn(
+                (staged_source / setup_qml.relative_to(self.root)).as_posix(),
+                graph,
+            )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "^victim$", "-FA", "ignored"),
+            )
+            self.assertTrue((lease.launch_build_directory / setup.name).is_file())
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_graph_rewrite_uses_path_identity_without_prefix_corruption(self):
+        executable = self.build_dir / "tst_identity.exe"
+        _write_manifest_pe_fixture(executable)
+        runtime_dirs = (
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+        mixed = tuple(
+            str(path).swapcase().replace("\\", "/") for path in runtime_dirs
+        )
+        near_prefix = f"--output={runtime_dirs[1].as_posix()}-artifacts/result"
+        modifications = ";".join(
+            f"PATH=path_list_prepend:{path}" for path in reversed(mixed)
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[identity]=] "{executable.as_posix()}" "{near_prefix}")\n'
+            'set_tests_properties([=[identity]=] PROPERTIES '
+            f'ENVIRONMENT_MODIFICATION "{modifications}")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            graph = (lease.launch_build_directory / "CTestTestfile.cmake").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(near_prefix, graph)
+            for staged_runtime in lease.launch_runtime_directories:
+                self.assertIn(staged_runtime.as_posix(), graph)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_qt_bin_tool_does_not_snapshot_the_entire_install_prefix(self):
+        tool = self.qt_root / "bin" / "qmllint.exe"
+        _write_manifest_pe_fixture(tool)
+        noise = self.qt_root / "Docs" / "Qt-oversized"
+        noise.mkdir(parents=True)
+        for index in range(512):
+            (noise / f"unused-{index:04d}.dat").write_bytes(b"unused")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[qml-smoke]=] "{tool.as_posix()}")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            graph = (lease.launch_build_directory / "CTestTestfile.cmake").read_text(
+                encoding="utf-8"
+            )
+            staged_tool = next(
+                Path(value)
+                for value in re.findall(r'"([^"]+qmllint\.exe)"', graph)
+                if Path(value) != tool
+            )
+            self.assertTrue(staged_tool.is_file())
+            self.assertFalse(
+                (staged_tool.parent.parent / "Docs" / "Qt-oversized").exists()
+            )
 
     def test_windows_runtime_replaces_explicit_qpa_platform(self):
         env, _ = run_ctest.prepare_windows_runtime(

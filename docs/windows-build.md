@@ -100,16 +100,22 @@ python tools/run_ctest.py --test-dir build -L unit --output-on-failure
 python tools/run_ctest.py --test-dir build -R '^rhi_d3d_probe$' --output-on-failure
 ```
 
-The supported launcher snapshots the literal CTest graph, test executables,
-controlled runtime files, Qt plugin/module trees, and QuickTest source closure
-into read/execute-only temporary layouts for the child lifetime. It rewrites
-only loader/QML paths and restores each test's configured working directory.
+The supported launcher snapshots the literal CTest graph, test executables, a
+minimal loader closure (runtime DLLs and selected tools), runtime-bearing Qt
+plugin/module files, and QuickTest source closure into read/execute-only
+temporary layouts for the child lifetime. It does not copy an entire Qt or
+CMake installation for a selected tool. Parsed path tokens are rewritten by
+Windows path identity and each test's configured working directory is restored.
+Other external tools declare install-relative resource closure in an adjacent
+`<tool>.exe.olr-runtime-files` file instead of implicitly copying their prefix.
 Absent `subdirs()` files and unsupported dynamic or external QML inputs are
 errors rather than names that may appear after the audit. Descendants inherit a
 protected `SetDllDirectory` runtime and a system-only tail on `PATH`, so their
 application, current-directory, and configured-runtime DLL namespaces cannot
 gain a late unaudited DLL. Snapshots are removed after the complete CTest
 process tree exits.
+Fixture-bearing graphs and fixture selector flags disable narrow snapshot
+selection so CTest's implicit setup/cleanup closure remains protected.
 The VS Code controlled app task uses the corresponding protected app/runtime
 layout as well; attach-only debugging therefore observes the same loader policy
 as command-line tests.

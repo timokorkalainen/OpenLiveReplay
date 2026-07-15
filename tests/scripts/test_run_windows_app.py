@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -178,8 +179,8 @@ class RunWindowsAppTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_external_app_lease_closes_app_and_runtime_namespaces(self) -> None:
-        (self.compiler / "runtime-tool.exe").write_bytes(b"compiler")
-        (self.qt / "bin" / "runtime-tool.exe").write_bytes(b"qt")
+        (self.compiler / "runtime-tool.dll").write_bytes(b"compiler")
+        (self.qt / "bin" / "runtime-tool.dll").write_bytes(b"qt")
         (self.build / "OpenLiveReplaySupport.dll").write_bytes(b"support")
 
         with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
@@ -199,11 +200,46 @@ class RunWindowsAppTests(unittest.TestCase):
                 Path(env["PATH"].split(os.pathsep)[0]), runtime_dirs[0]
             )
             self.assertEqual(
-                (runtime_dirs[0] / "runtime-tool.exe").read_bytes(), b"compiler"
+                (runtime_dirs[0] / "runtime-tool.dll").read_bytes(), b"compiler"
             )
             for directory in (loader, *runtime_dirs, staged_app.parent):
                 with self.subTest(directory=directory), self.assertRaises(OSError):
                     (directory / "late-injection.dll").write_bytes(b"poison")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_representative_app_snapshot_ignores_nonruntime_payload(self) -> None:
+        noise_roots = (
+            self.compiler,
+            self.qt / "bin",
+            self.qt / "plugins" / "documentation",
+            self.qt / "qml" / "examples",
+        )
+        for root in noise_roots:
+            root.mkdir(parents=True, exist_ok=True)
+            with (root / "unused-debug-payload.pdb").open("wb") as stream:
+                stream.truncate(64 << 20)
+        for index in range(1024):
+            root = noise_roots[index % len(noise_roots)]
+            (root / f"unused-{index:04d}.txt").write_bytes(b"not runtime")
+
+        measurements: list[tuple[float, int, int]] = []
+        for _temperature in ("cold", "warm"):
+            started = time.perf_counter()
+            with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
+                self.launcher.prepare_windows_app_runtime(
+                    self.build, self.app, {}, audit_lease=lease
+                )
+                measurements.append(
+                    (
+                        time.perf_counter() - started,
+                        lease.staged_file_count,
+                        lease.staged_byte_count,
+                    )
+                )
+        for elapsed, file_count, byte_count in measurements:
+            self.assertLess(elapsed, 5.0)
+            self.assertLess(file_count, 128)
+            self.assertLess(byte_count, 64 << 20)
 
     def test_cache_rejects_duplicate_wrong_type_and_relative_roots(self) -> None:
         cache = self.build / "CMakeCache.txt"

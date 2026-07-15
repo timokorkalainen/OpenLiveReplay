@@ -241,14 +241,21 @@ late `<executable>.local` file or directory from changing the audited loader
 resolution between verification and process startup.
 
 For each controlled CTest launch, the launcher also creates read/execute-only
-snapshots of the reachable CTest graph, reachable test executables, configured
-runtime namespace, Qt plugins/QML modules, and any QuickTest `-input` source
-tree. Generated graph paths are rewritten to those snapshots while the original
+snapshots of the reachable CTest graph, reachable test executables, the minimal
+configured loader closure (runtime DLLs plus selected tools), runtime-bearing Qt
+plugin/QML files, and any QuickTest `-input` source tree. The CTest tool snapshot
+contains only `ctest.exe` and its adjacent runtime files; selecting a Qt `bin`
+tool does not copy the Qt installation prefix. Parsed path tokens are rewritten
+by Windows path identity, without substring replacement, while the original
 CTest arguments, properties, labels, timeouts, and working directories remain
 effective. Relative QML imports therefore resolve inside the same protected
 source snapshot as their `-input`. Missing legacy `subdirs()` edges, dynamic
 graph edges, build-tree QuickTest inputs, reparse aliases, or QML import roots
 outside the configured source/build/Qt trees fail closed before CTest starts.
+Non-runtime external tools can declare required install-relative resources in
+`<tool>.exe.olr-runtime-files`, one safe relative file or directory per line.
+Focused literal selectors fall back to the full safe snapshot when CTest fixture
+properties or fixture-selection flags could expand the executed test set.
 The launcher uses the protected runtime as the inherited `SetDllDirectory`
 value, which removes the mutable current directory from descendant DLL search;
 the child `PATH` contains only that protected runtime and Windows system roots.
