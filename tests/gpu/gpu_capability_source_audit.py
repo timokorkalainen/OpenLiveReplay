@@ -159,6 +159,21 @@ def declaration_block(masked: str, pairs: list[tuple[int, int]],
 MEMBER_CALL = re.compile(r"(?:\.|->|::)\s*(read|withRead|complete|nativeHandle)\s*\(")
 
 
+@dataclass(frozen=True)
+class ScopeBinding:
+    declaration: ScopeDeclaration
+    block: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class HandleBinding:
+    name: str
+    position: int
+    block: tuple[int, int]
+    scope_position: int | None
+    read_position: int | None
+
+
 def receiver_expression(masked: str, call_position: int) -> str:
     """Return the balanced expression immediately left of a member call."""
     index = call_position - 1
@@ -201,82 +216,211 @@ def receiver_expression(masked: str, call_position: int) -> str:
     return masked[index + 1:end]
 
 
+def matching_delimiter(masked: str, opening: int, opener: str, closer: str) -> int | None:
+    depth = 0
+    for index in range(opening, len(masked)):
+        if masked[index] == opener:
+            depth += 1
+        elif masked[index] == closer:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def resolve_scope(scope_bindings: list[ScopeBinding], masked: str,
+                  call: re.Match[str]) -> ScopeBinding | None:
+    receiver = receiver_expression(masked, call.start())
+    candidates = [
+        binding for binding in scope_bindings
+        if binding.declaration.position <= call.start() < binding.block[1]
+        and binding.block[0] < call.start()
+        and re.search(rf"\b{re.escape(binding.declaration.name)}\b", receiver)
+    ]
+    if not candidates:
+        return None
+    return min(candidates,
+               key=lambda binding: (binding.block[1] - binding.block[0],
+                                    -binding.declaration.position))
+
+
+def read_lease_name(masked: str, call_position: int) -> tuple[str, int] | None:
+    boundary = max(masked.rfind(";", 0, call_position),
+                   masked.rfind("{", 0, call_position),
+                   masked.rfind("}", 0, call_position))
+    prefix = masked[boundary + 1:call_position]
+    declaration = re.search(
+        r"\b(?:const\s+)?(?:GpuReadLease|auto)\s*"
+        r"(?:(?:const|volatile)\s+)*[*&]*\s*([A-Za-z_]\w*)\s*=\s*[^;{}]*$",
+        prefix)
+    if declaration is None:
+        return None
+    return declaration.group(1), boundary + 1 + declaration.start(1)
+
+
+def callback_lease_bindings(masked: str, pairs: list[tuple[int, int]],
+                            call: re.Match[str]) -> list[HandleBinding]:
+    opening = call.end() - 1
+    closing = matching_delimiter(masked, opening, "(", ")")
+    if closing is None:
+        return []
+    body = masked[opening + 1:closing]
+    lambda_pattern = re.compile(
+        r"\[[^\]]*\]\s*\(\s*(?:const\s+)?GpuReadLease\s*"
+        r"(?:(?:const|volatile)\s+)*[*&]*\s*([A-Za-z_]\w*)[^)]*\)"
+        r"\s*(?:mutable\s*)?(?:noexcept\s*)?(?:->[^{}]+)?\{")
+    bindings: list[HandleBinding] = []
+    for match in lambda_pattern.finditer(body):
+        body_opening = opening + 1 + match.end() - 1
+        block = next((pair for pair in pairs if pair[0] == body_opening), None)
+        if block is None or block[1] > closing:
+            continue
+        bindings.append(HandleBinding(match.group(1), opening + 1 + match.start(1), block,
+                                      None, None))
+    return bindings
+
+
+def resolve_handle_binding(bindings: list[HandleBinding], masked: str,
+                           call: re.Match[str]) -> HandleBinding | None:
+    receiver = receiver_expression(masked, call.start())
+    candidates = [
+        binding for binding in bindings
+        if binding.position <= call.start() < binding.block[1]
+        and binding.block[0] < call.start()
+        and re.search(rf"\b{re.escape(binding.name)}\b", receiver)
+    ]
+    if not candidates:
+        return None
+    return min(candidates,
+               key=lambda binding: (binding.block[1] - binding.block[0], -binding.position))
+
+
+def handle_binding_is_shadowed(binding: HandleBinding, masked: str,
+                               pairs: list[tuple[int, int]], call_position: int) -> bool:
+    declaration_pattern = re.compile(
+        rf"\b(?:(?:const|volatile)\s+)*(?:auto|[A-Za-z_]\w*(?:::\w+)*"
+        rf"(?:\s*<[^;{{}}()]+>)?)(?:\s+(?:const|volatile))*\s*[*&]*\s+"
+        rf"(?P<name>{re.escape(binding.name)})\s*(?=[=;,{{)])")
+    for declaration in declaration_pattern.finditer(masked, binding.position, call_position):
+        name_position = declaration.start("name")
+        if name_position == binding.position:
+            continue
+        block = enclosing_block(pairs, name_position)
+        if block is not None and block[0] < call_position < block[1]:
+            return True
+    return False
+
+
 def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
     masked = mask_non_code(source)
     pairs = brace_pairs(masked)
     findings: list[Finding] = []
     calls = list(MEMBER_CALL.finditer(masked))
-    valid_scope_blocks: list[tuple[int, int]] = []
-    claimed_reads: set[int] = set()
-    declarations = scope_declarations(masked)
-    for declaration in declarations:
-        block = declaration_block(masked, pairs, declaration)
-        if block is None:
+    scope_bindings: list[ScopeBinding] = []
+    for declaration in scope_declarations(masked):
+        lexical_block = declaration_block(masked, pairs, declaration)
+        if lexical_block is None:
             findings.append(
                 Finding(path, line_number(source, declaration.position), "GpuSyncReadScope",
                         "scope declaration is not inside a lexical block")
             )
             continue
-        block_calls = [call for call in calls if declaration.position <= call.start() < block[1]]
-        scope_calls = [
-            call for call in block_calls
-            if re.search(rf"\b{re.escape(declaration.name)}\b",
-                         receiver_expression(masked, call.start()))
-            or "GpuSyncReadScope" in receiver_expression(masked, call.start())
-        ]
-        direct_reads = [call for call in scope_calls if call.group(1) == "read"]
-        with_reads = [call for call in scope_calls if call.group(1) == "withRead"]
-        completed = [call for call in scope_calls if call.group(1) == "complete"]
-        claimed_reads.update(call.start() for call in direct_reads)
-        if direct_reads and path not in SYNC_READ_ALLOWLIST:
-            read_position = direct_reads[0].start()
-            findings.append(
-                Finding(path, line_number(source, read_position), "GpuSyncReadScope::read()",
-                        "public read() is not in the reviewed synchronous-adapter allowlist")
-            )
-        if direct_reads and not completed:
-            read_position = direct_reads[0].start()
-            findings.append(
-                Finding(path, line_number(source, read_position),
-                        f"{declaration.name}.read()",
-                        "the lexical scope must call complete() or use withRead()")
-            )
-        if with_reads or (direct_reads and completed):
-            valid_scope_blocks.append((declaration.position, block[1]))
+        scope_bindings.append(ScopeBinding(declaration, lexical_block))
 
-    # Catch temporary, parenthesized, qualified, or chained receivers even when
-    # their spelling does not expose a single bare scope identifier to regex.
+    reads_by_scope: dict[int, list[re.Match[str]]] = {}
+    completes_by_scope: dict[int, list[re.Match[str]]] = {}
+    handle_bindings: list[HandleBinding] = []
+    claimed_reads: set[int] = set()
+    for call in calls:
+        if call.group(1) not in {"read", "withRead", "complete"}:
+            continue
+        scope = resolve_scope(scope_bindings, masked, call)
+        if scope is None:
+            continue
+        scope_key = scope.declaration.position
+        if call.group(1) == "read":
+            claimed_reads.add(call.start())
+            reads_by_scope.setdefault(scope_key, []).append(call)
+            lease = read_lease_name(masked, call.start())
+            block = enclosing_block(pairs, call.start())
+            if lease is not None and block is not None:
+                handle_bindings.append(HandleBinding(lease[0], lease[1], block, scope_key,
+                                                     call.start()))
+            if path not in SYNC_READ_ALLOWLIST:
+                findings.append(
+                    Finding(path, line_number(source, call.start()),
+                            "GpuSyncReadScope::read()",
+                            "public read() is not in the reviewed synchronous-adapter allowlist")
+                )
+        elif call.group(1) == "withRead":
+            handle_bindings.extend(callback_lease_bindings(masked, pairs, call))
+        else:
+            completes_by_scope.setdefault(scope_key, []).append(call)
+
+    # A temporary scope has no named binding to resolve, but its type still
+    # identifies read() as the reviewed capability.
     for call in calls:
         if call.group(1) != "read" or call.start() in claimed_reads:
             continue
         receiver = receiver_expression(masked, call.start())
-        known_names = {declaration.name for declaration in declarations}
-        if "GpuSyncReadScope" not in receiver and not any(
-                re.search(rf"\b{re.escape(name)}\b", receiver) for name in known_names):
+        if "GpuSyncReadScope" not in receiver:
             continue
         if path not in SYNC_READ_ALLOWLIST:
             findings.append(
                 Finding(path, line_number(source, call.start()), "GpuSyncReadScope::read()",
                         "public read() is not in the reviewed synchronous-adapter allowlist")
             )
-        block = enclosing_block(pairs, call.start())
-        block_calls = [candidate for candidate in calls
-                       if block and block[0] < candidate.start() < block[1]]
-        if not any(candidate.group(1) in {"complete", "withRead"}
-                   for candidate in block_calls):
-            findings.append(
-                Finding(path, line_number(source, call.start()), "read()",
-                        "the lexical scope must call complete() or use withRead()")
-            )
+        findings.append(
+            Finding(path, line_number(source, call.start()), "read()",
+                    "a temporary read scope cannot call complete() after read/use")
+        )
 
-    if path != LEASE_HEADER:
-        for handle_read in (call for call in calls if call.group(1) == "nativeHandle"):
-            if not any(start <= handle_read.start() <= end for start, end in valid_scope_blocks):
-                findings.append(
-                    Finding(path, line_number(source, handle_read.start()),
-                            "GpuSurface::nativeHandle()",
-                            "native handle reads must be inside a completed GpuSyncReadScope")
-                )
+    native_calls = [call for call in calls if call.group(1) == "nativeHandle"]
+    native_bindings = {call.start(): resolve_handle_binding(handle_bindings, masked, call)
+                       for call in native_calls}
+    for call in native_calls:
+        binding = native_bindings[call.start()]
+        if (binding is not None
+                and handle_binding_is_shadowed(binding, masked, pairs, call.start())):
+            native_bindings[call.start()] = None
+    valid_read_scopes: set[int] = set()
+    for scope_key, reads in reads_by_scope.items():
+        associated_uses = [
+            call.start() for call in native_calls
+            if (binding := native_bindings[call.start()]) is not None
+            and binding.scope_position == scope_key
+        ]
+        required_position = max([call.start() for call in reads] + associated_uses)
+        if any(call.start() > required_position
+               for call in completes_by_scope.get(scope_key, [])):
+            valid_read_scopes.add(scope_key)
+            continue
+        first_read = min(reads, key=lambda call: call.start())
+        scope = next(binding for binding in scope_bindings
+                     if binding.declaration.position == scope_key)
+        findings.append(
+            Finding(path, line_number(source, first_read.start()),
+                    f"{scope.declaration.name}.read()",
+                    "the lexical scope must call complete() after read/use or use withRead()")
+        )
+
+    if path == LEASE_HEADER:
+        return findings
+    for handle_read in native_calls:
+        binding = native_bindings[handle_read.start()]
+        authorized = binding is not None and (
+            binding.scope_position is None
+            or (binding.scope_position in valid_read_scopes
+                and binding.read_position is not None
+                and binding.read_position < handle_read.start())
+        )
+        if not authorized:
+            findings.append(
+                Finding(path, line_number(source, handle_read.start()),
+                        "GpuSurface::nativeHandle()",
+                        "native handle access must use the lease returned by its specific "
+                        "read scope or withRead callback")
+            )
     return findings
 
 
@@ -386,6 +530,41 @@ def mutation_self_tests() -> None:
         (PurePosixPath("playback/bad.cpp"),
          "void bad(GpuSurface& surface) { (void) surface.GpuSurface::nativeHandle(); }",
          "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s, GpuSurface& surface) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); scope.complete(); "
+         "(void) surface.nativeHandle(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s, GpuSurface& surface) { "
+         "GpuSyncReadScope scope; scope.withRead(s, [](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }); (void) surface.nativeHandle(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.complete(); const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& a, "
+         "const std::shared_ptr<GpuSurface>& b) { GpuSyncReadScope first; "
+         "const GpuReadLease firstLease = first.read(a); first.complete(); "
+         "GpuSyncReadScope second; const GpuReadLease secondLease = second.read(b); "
+         "(void) secondLease.nativeHandle(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& a, "
+         "const std::shared_ptr<GpuSurface>& b) { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = scope.read(a); (void) lease.nativeHandle(); "
+         "scope.complete(); { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = scope.read(b); (void) lease.nativeHandle(); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s, GpuSurface& surface) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "{ GpuSurface& lease = surface; (void) lease.nativeHandle(); } scope.complete(); }",
+         "GpuSurface::nativeHandle()"),
     )
     for path, source, expected in cases:
         rendered = "\n".join(finding.render() for finding in audit_capability_uses(path, source))
@@ -413,6 +592,20 @@ def mutation_self_tests() -> None:
     if safe_findings:
         raise AssertionError("withRead pass control was rejected:\n" +
                              "\n".join(finding.render() for finding in safe_findings))
+
+    safe_read = (
+        "void safe(const std::shared_ptr<GpuSurface>& a, "
+        "const std::shared_ptr<GpuSurface>& b) { GpuSyncReadScope scope; "
+        "const GpuReadLease lease = scope.read(a); (void) lease.nativeHandle(); "
+        "scope.complete(); { GpuSyncReadScope scope; "
+        "const GpuReadLease lease = scope.read(b); (void) lease.nativeHandle(); "
+        "scope.complete(); } }"
+    )
+    safe_read_findings = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"), safe_read)
+    if safe_read_findings:
+        raise AssertionError("ordered, shadowed read pass control was rejected:\n" +
+                             "\n".join(finding.render() for finding in safe_read_findings))
 
     safe_syntax = r'''
         void safe(UnrelatedSocket& socket) {

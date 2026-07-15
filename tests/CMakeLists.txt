@@ -51,12 +51,14 @@ function(olr_add_compile_control name source expectation)
     elseif(expectation STREQUAL "BASE_PROTECTED_FAILURE")
         list(APPEND control_args
             "-DEXPECT_COMPILE=FALSE"
-            "-DEXPECTED_MEMBER=GpuSurface::nativeHandle"
+            "-DEXPECTED_CLASS=GpuSurface"
+            "-DEXPECTED_MEMBER=nativeHandle"
             "-DEXPECTED_ACCESS=[Pp]rotected")
     elseif(expectation STREQUAL "DERIVED_PROTECTED_FAILURE")
         list(APPEND control_args
             "-DEXPECT_COMPILE=FALSE"
-            "-DEXPECTED_MEMBER=DerivedSurface::nativeHandle"
+            "-DEXPECTED_CLASS=DerivedSurface"
+            "-DEXPECTED_MEMBER=nativeHandle"
             "-DEXPECTED_ACCESS=[Pp]rotected")
     elseif(expectation STREQUAL "REJECT_UNRELATED_FAILURE")
         list(APPEND control_args
@@ -128,12 +130,12 @@ function(olr_add_gpu_submission_compile_control name source expectation)
 endfunction()
 
 olr_expect_compile_failure(gpu_native_handle_access native_handle_access.cpp
-    "GpuSurface::nativeHandle" "[Pp]rotected")
+    "GpuSurface" "nativeHandle" "[Pp]rotected")
 olr_add_compile_control(gpu_native_handle_access
     native_handle_access.cpp BASE_PROTECTED_FAILURE)
 olr_add_compile_control(gpu_native_handle_access_pass native_handle_access_pass.cpp PASS)
 olr_expect_compile_failure(gpu_native_handle_derived_access
-    native_handle_derived_access.cpp "DerivedSurface::nativeHandle" "[Pp]rotected")
+    native_handle_derived_access.cpp "DerivedSurface" "nativeHandle" "[Pp]rotected")
 olr_add_compile_control(gpu_native_handle_derived_access
     native_handle_derived_access.cpp DERIVED_PROTECTED_FAILURE)
 olr_add_compile_control(gpu_native_handle_derived_access_pass
@@ -194,6 +196,7 @@ function(olr_add_gpu_compile_control_alias name target expected_member expected_
             -DTARGET=${target}
             -DCONFIG=$<CONFIG>
             -DEXPECT_COMPILE=FALSE
+            -DEXPECTED_CLASS=${ARGV4}
             -DEXPECTED_MEMBER=${expected_member}
             -DEXPECTED_ACCESS=${expected_access}
             -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
@@ -214,10 +217,10 @@ endfunction()
 # Task 7's matrix names make the locked regex execute every exact capability
 # control. Historical names above stay available to earlier task reports.
 olr_add_gpu_compile_control_alias(gpu_negcompile_native_handle_base
-    gpu_native_handle_access_compile_control "GpuSurface::nativeHandle" "[Pp]rotected")
+    gpu_native_handle_access_compile_control nativeHandle "[Pp]rotected" GpuSurface)
 olr_add_gpu_compile_control_alias(gpu_negcompile_native_handle_derived
     gpu_native_handle_derived_access_compile_control
-    "DerivedSurface::nativeHandle" "[Pp]rotected")
+    nativeHandle "[Pp]rotected" DerivedSurface)
 olr_add_gpu_compile_control_alias(gpu_negcompile_submission_view_unwrap
     gpu_submission_view_unwrap_compile_control nativeHandle "[Pp]rotected")
 olr_add_gpu_compile_control_alias(gpu_negcompile_submit_without_owner
@@ -255,6 +258,12 @@ add_test(NAME gpu_capability_source_audit
         --source-root "${CMAKE_SOURCE_DIR}")
 set_tests_properties(gpu_capability_source_audit PROPERTIES
     LABELS "gpu-capability;ci" TIMEOUT 30)
+add_test(NAME gpu_compile_pass_diagnostic_fixtures
+    COMMAND ${CMAKE_COMMAND}
+        -DVERIFY_DIAGNOSTIC_FIXTURES=TRUE
+        -P "${CMAKE_SOURCE_DIR}/tests/gpu/negcompile/run_compile_control.cmake")
+set_tests_properties(gpu_compile_pass_diagnostic_fixtures PROPERTIES
+    LABELS "gpu-capability;ci")
 if(WIN32)
     olr_expect_compile_failure(gpu_d3d11_texture_access d3d11_texture_access.cpp)
     olr_expect_compile_failure(gpu_d3d11_device_access d3d11_device_access.cpp)
