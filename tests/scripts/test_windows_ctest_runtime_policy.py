@@ -143,6 +143,43 @@ Run tests with `python tools/run_ctest.py --test-dir build`.
 """
         self.assertEqual(checker(text), [])
 
+    def test_top_level_readme_rejects_status_bar_advice_split_across_list_items(self) -> None:
+        checker = self.policy.check_top_level_readme_windows_contract
+        text = """
+## Windows quick start
+
+Use the VS Code status bar for application actions:
+
+- Click Run there.
+- Debug works there too.
+- The supported task is **OpenLiveReplay: start controlled Windows app**.
+
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        failures = checker(text)
+        self.assertTrue(
+            any("status-bar Run/Debug" in failure for failure in failures),
+            failures,
+        )
+
+    def test_top_level_readme_requires_positive_safe_guidance_in_windows_section(self) -> None:
+        checker = self.policy.check_top_level_readme_windows_contract
+        text = """
+## Windows quick start
+
+Start and test from the IDE.
+
+## Reference
+
+The task is **OpenLiveReplay: start controlled Windows app**.
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        failures = checker(text)
+        self.assertTrue(
+            any("Windows section" in failure for failure in failures),
+            failures,
+        )
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.policy = load_module()

@@ -7,19 +7,116 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from tools import run_ctest
+from tools import run_ctest, windows_runtime_guard
 from tools.windows_runtime_guard import (
     RuntimeRoots,
     pe_imports,
     registered_test_executables,
     reject_runtime_dll_shadowing,
 )
+
+
+def _write_pe_fixture(
+    path: Path,
+    *,
+    magic: int = 0x20B,
+    directory_index: int = 13,
+    attributes: int = 1,
+    directory_size: int = 64,
+    optional_size: int | None = None,
+    directory_rva: int = 0x1100,
+    name_rva: int = 0x1180,
+    raw_size: int = 0x400,
+    overlay_size: int = 0,
+) -> None:
+    pe_offset = 0x80
+    if optional_size is None:
+        optional_size = 0xF0 if magic == 0x20B else 0xE0
+    # VA-form delay descriptors store addresses in DWORD fields, so use a valid
+    # low PE32+ image base as well as the conventional PE32 base.
+    image_base = 0x400000
+    directory_count_offset = 108 if magic == 0x20B else 92
+    directories_offset = 112 if magic == 0x20B else 96
+    optional = bytearray(optional_size)
+    struct.pack_into("<H", optional, 0, magic)
+    if magic == 0x20B and optional_size >= 32:
+        struct.pack_into("<Q", optional, 24, image_base)
+    elif magic == 0x10B and optional_size >= 32:
+        struct.pack_into("<I", optional, 28, image_base)
+    if optional_size >= directory_count_offset + 4:
+        struct.pack_into("<I", optional, directory_count_offset, 16)
+    if optional_size >= directories_offset + (directory_index + 1) * 8:
+        struct.pack_into(
+            "<II",
+            optional,
+            directories_offset + directory_index * 8,
+            directory_rva,
+            directory_size,
+        )
+
+    headers = bytearray(0x200)
+    headers[:2] = b"MZ"
+    struct.pack_into("<I", headers, 0x3C, pe_offset)
+    headers[pe_offset : pe_offset + 4] = b"PE\0\0"
+    struct.pack_into(
+        "<HHIIIHH",
+        headers,
+        pe_offset + 4,
+        0x8664 if magic == 0x20B else 0x14C,
+        1,
+        0,
+        0,
+        0,
+        optional_size,
+        0,
+    )
+    optional_offset = pe_offset + 24
+    headers[optional_offset : optional_offset + optional_size] = optional
+    section = optional_offset + optional_size
+    headers[section : section + 8] = b".rdata\0\0"
+    struct.pack_into("<IIII", headers, section + 8, 0x1000, 0x1000, raw_size, 0x200)
+
+    contents = headers + bytearray(max(raw_size, 0) + overlay_size)
+    descriptor_offset = 0x200 + directory_rva - 0x1000
+    if descriptor_offset >= 0 and descriptor_offset + 32 <= len(contents):
+        if directory_index == 13:
+            name_value = name_rva if attributes & 1 else image_base + name_rva
+            struct.pack_into(
+                "<IIIIIIII",
+                contents,
+                descriptor_offset,
+                attributes,
+                name_value,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        else:
+            struct.pack_into(
+                "<IIIII",
+                contents,
+                descriptor_offset,
+                0,
+                0,
+                0,
+                name_rva,
+                0,
+            )
+    name_offset = 0x200 + name_rva - 0x1000
+    name = b"fixture-runtime.dll\0"
+    if name_offset >= 0 and name_offset + len(name) <= len(contents):
+        contents[name_offset : name_offset + len(name)] = name
+    path.write_bytes(contents)
 
 
 class RunCtestTests(unittest.TestCase):
@@ -137,6 +234,64 @@ class RunCtestTests(unittest.TestCase):
     def test_pe_import_parser_reads_real_windows_executable(self):
         self.assertIn("kernel32.dll", pe_imports(Path(sys.executable)))
 
+    def test_pe_import_parser_reads_delay_import_va_form_for_pe32_and_pe32_plus(self):
+        for magic in (0x10B, 0x20B):
+            with self.subTest(magic=hex(magic)):
+                executable = self.build_dir / f"delay-{magic:x}.exe"
+                _write_pe_fixture(executable, magic=magic, attributes=0)
+                self.assertEqual(pe_imports(executable), {"fixture-runtime.dll"})
+
+    def test_pe_import_parser_rejects_delay_va_below_image_base(self):
+        executable = self.build_dir / "delay-invalid-va.exe"
+        _write_pe_fixture(executable, attributes=0)
+        contents = bytearray(executable.read_bytes())
+        struct.pack_into("<I", contents, 0x300 + 4, 1)
+        executable.write_bytes(contents)
+        with self.assertRaisesRegex(ValueError, "delay-import.*image base"):
+            pe_imports(executable)
+
+    def test_pe_import_parser_rejects_virtual_tail_overlay_rva(self):
+        executable = self.build_dir / "overlay-rva.exe"
+        _write_pe_fixture(
+            executable,
+            directory_index=1,
+            directory_rva=0x1300,
+            name_rva=0x1350,
+            raw_size=0x200,
+            overlay_size=0x200,
+        )
+        with self.assertRaisesRegex(ValueError, "raw section data"):
+            pe_imports(executable)
+
+    def test_pe_import_parser_bounds_data_directories_to_optional_header(self):
+        executable = self.build_dir / "short-optional.exe"
+        _write_pe_fixture(
+            executable,
+            directory_index=1,
+            optional_size=112,
+        )
+        with self.assertRaisesRegex(ValueError, "data directories.*optional header"):
+            pe_imports(executable)
+
+    def test_pe_import_parser_requires_terminator_inside_declared_directory(self):
+        executable = self.build_dir / "unterminated-imports.exe"
+        _write_pe_fixture(
+            executable,
+            directory_index=1,
+            directory_size=20,
+        )
+        with self.assertRaisesRegex(ValueError, "import descriptor.*declared size"):
+            pe_imports(executable)
+
+    def test_pe_import_parser_bounds_delay_descriptors_to_declared_size(self):
+        executable = self.build_dir / "unterminated-delay-imports.exe"
+        _write_pe_fixture(executable, directory_size=32)
+        with self.assertRaisesRegex(
+            ValueError,
+            "delay-import descriptor.*declared size",
+        ):
+            pe_imports(executable)
+
     def test_registered_test_executables_resolve_relative_to_testfile(self):
         nested = self.build_dir / "nested"
         nested.mkdir()
@@ -148,6 +303,30 @@ class RunCtestTests(unittest.TestCase):
         )
 
         self.assertEqual(registered_test_executables(self.build_dir), (executable,))
+
+    def test_registered_test_executables_include_wrapped_executable_arguments(self):
+        nested = self.build_dir / "nested"
+        nested.mkdir()
+        test_executable = nested / "tst_wrapped.exe"
+        helper_executable = nested / "OlrProbe.exe"
+        bracket_executable = nested / "OlrBracket.exe"
+        test_executable.write_bytes(b"pe-fixture")
+        helper_executable.write_bytes(b"pe-fixture")
+        bracket_executable.write_bytes(b"pe-fixture")
+        (nested / "CTestTestfile.cmake").write_text(
+            'add_test([=[bash-wrapped]=] "C:/Program Files/Git/bin/bash.exe" '
+            '"runner.sh" "tst_wrapped.exe" "OlrProbe.exe")\n'
+            'add_test([=[python-wrapped]=] "C:/Python/python.exe" '
+            '"runner.py" "tst_wrapped.exe")\n'
+            'add_test(NAME bracket-wrapped COMMAND [=[C:/Python/python.exe]=]\n'
+            '  runner.py [=[OlrBracket.exe]=])\n',
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            registered_test_executables(self.build_dir),
+            (bracket_executable, helper_executable, test_executable),
+        )
 
     def test_windows_runtime_precedes_inherited_path(self):
         env, ctest = run_ctest.prepare_windows_runtime(
@@ -352,6 +531,123 @@ class RunCtestTests(unittest.TestCase):
             self.assertRaisesRegex(
                 RuntimeError,
                 r"tst_stale_codec\.exe.*avcodec-61\.dll.*OLR_FFMPEG_ROOT.*avcodec-62\.dll",
+            ),
+        ):
+            reject_runtime_dll_shadowing(
+                self.build_dir,
+                roots,
+                executables=(executable,),
+            )
+
+    def test_earlier_non_owner_path_peer_cannot_shadow_authoritative_family(self):
+        qt_peer = self.qt_root / "bin" / "avcodec-62.dll"
+        qt_peer.write_bytes(b"qt-private-ffmpeg")
+        authoritative = self.ffmpeg_root / "bin" / "avcodec-62.dll"
+        authoritative.write_bytes(b"configured-ffmpeg")
+        executable = self.build_dir / "tst_codec.exe"
+        executable.write_bytes(b"pe-fixture")
+        roots = RuntimeRoots(
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+
+        with (
+            mock.patch(
+                "tools.windows_runtime_guard.pe_imports",
+                side_effect=lambda path: (
+                    {"avcodec-62.dll"} if path == executable else set()
+                ),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                rf"avcodec-62\.dll.*{re.escape(str(qt_peer))}.*"
+                rf"{re.escape(str(authoritative))}",
+            ),
+        ):
+            reject_runtime_dll_shadowing(
+                self.build_dir,
+                roots,
+                executables=(executable,),
+            )
+
+    def test_repeated_provenance_checks_hash_each_runtime_peer_once(self):
+        qt_peer = self.qt_root / "bin" / "avcodec-62.dll"
+        qt_peer.write_bytes(b"identical-runtime")
+        authoritative = self.ffmpeg_root / "bin" / "avcodec-62.dll"
+        authoritative.write_bytes(qt_peer.read_bytes())
+        executables = (
+            self.build_dir / "tst_codec_a.exe",
+            self.build_dir / "tst_codec_b.exe",
+        )
+        for executable in executables:
+            executable.write_bytes(b"pe-fixture")
+        roots = RuntimeRoots(
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+        real_sha256 = windows_runtime_guard._sha256
+
+        with (
+            mock.patch(
+                "tools.windows_runtime_guard.pe_imports",
+                side_effect=lambda path: (
+                    {"avcodec-62.dll"} if path in executables else set()
+                ),
+            ),
+            mock.patch(
+                "tools.windows_runtime_guard._sha256",
+                wraps=real_sha256,
+            ) as sha256,
+        ):
+            reject_runtime_dll_shadowing(
+                self.build_dir,
+                roots,
+                executables=executables,
+            )
+
+        hashed = [call.args[0] for call in sha256.call_args_list]
+        self.assertEqual(hashed.count(qt_peer), 1)
+        self.assertEqual(hashed.count(authoritative), 1)
+
+    def test_configured_runtime_dll_import_closure_is_audited(self):
+        codec = self.ffmpeg_root / "bin" / "avcodec-62.dll"
+        codec.write_bytes(b"pe-fixture")
+        active_util = self.ffmpeg_root / "bin" / "avutil-60.dll"
+        active_util.write_bytes(b"pe-fixture")
+        executable = self.build_dir / "tst_codec.exe"
+        executable.write_bytes(b"pe-fixture")
+        roots = RuntimeRoots(
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+
+        def imports(path: Path) -> set[str]:
+            if path == executable:
+                return {"avcodec-62.dll"}
+            if path == codec:
+                return {"avutil-59.dll"}
+            return set()
+
+        with (
+            mock.patch(
+                "tools.windows_runtime_guard.pe_imports",
+                side_effect=imports,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"avcodec-62\.dll.*avutil-59\.dll.*OLR_FFMPEG_ROOT.*avutil-60\.dll",
             ),
         ):
             reject_runtime_dll_shadowing(

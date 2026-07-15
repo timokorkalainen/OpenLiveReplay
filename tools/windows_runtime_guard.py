@@ -156,87 +156,184 @@ def pe_imports(path: Path) -> set[str]:
             section_count = u16(pe_offset + 6)
             optional_size = u16(pe_offset + 20)
             optional = pe_offset + 24
+            optional_end = optional + optional_size
+            if optional_end > file_size:
+                raise ValueError("truncated PE optional header")
+            if optional_size < 2:
+                raise ValueError("truncated PE optional header magic")
             magic = u16(optional)
             if magic == 0x20B:
                 directory_count_offset = optional + 108
                 directories_offset = optional + 112
+                image_base_offset = optional + 24
+                image_base_size = 8
             elif magic == 0x10B:
                 directory_count_offset = optional + 92
                 directories_offset = optional + 96
+                image_base_offset = optional + 28
+                image_base_size = 4
             else:
                 return set()
-            if optional + optional_size > file_size:
-                raise ValueError("truncated PE optional header")
+            if directory_count_offset + 4 > optional_end:
+                raise ValueError("PE data directories exceed optional header")
+            if image_base_offset + image_base_size > optional_end:
+                raise ValueError("PE image base exceeds optional header")
             directory_count = u32(directory_count_offset)
-            sections_offset = optional + optional_size
+            available_directories = max(0, (optional_end - directories_offset) // 8)
+            if directory_count > available_directories:
+                raise ValueError("PE data directories exceed optional header")
+            image_base = (
+                struct.unpack("<Q", read_at(image_base_offset, 8))[0]
+                if image_base_size == 8
+                else u32(image_base_offset)
+            )
+
+            def data_directory(index: int) -> tuple[int, int]:
+                if index >= directory_count:
+                    return 0, 0
+                offset = directories_offset + index * 8
+                if offset + 8 > optional_end:
+                    raise ValueError("PE data directories exceed optional header")
+                return struct.unpack("<II", read_at(offset, 8))
+
+            sections_offset = optional_end
             sections: list[tuple[int, int, int]] = []
             for index in range(section_count):
                 section = sections_offset + index * 40
                 if section + 40 > file_size:
                     raise ValueError("truncated PE section table")
-                virtual_size = u32(section + 8)
                 virtual_address = u32(section + 12)
                 raw_size = u32(section + 16)
                 raw_offset = u32(section + 20)
-                sections.append(
-                    (virtual_address, max(virtual_size, raw_size), raw_offset)
-                )
+                if raw_size and raw_offset + raw_size > file_size:
+                    raise ValueError("truncated PE raw section data")
+                sections.append((virtual_address, raw_size, raw_offset))
 
-            def rva_offset(rva: int) -> int:
-                for virtual_address, span, raw_offset in sections:
-                    if virtual_address <= rva < virtual_address + span:
-                        result = raw_offset + rva - virtual_address
-                        if result >= file_size:
-                            break
-                        return result
-                raise ValueError(f"PE RVA is outside file sections: 0x{rva:x}")
+            def rva_location(rva: int, size: int = 1) -> tuple[int, int]:
+                if rva < 0 or size < 0 or rva + size > 0x100000000:
+                    raise ValueError(f"PE RVA is outside raw section data: 0x{rva:x}")
+                for virtual_address, raw_size, raw_offset in sections:
+                    delta = rva - virtual_address
+                    if 0 <= delta < raw_size and size <= raw_size - delta:
+                        return raw_offset + delta, raw_size - delta
+                raise ValueError(f"PE RVA is outside raw section data: 0x{rva:x}")
 
-            def c_string(offset: int) -> str:
-                value = read_at(offset, min(1025, file_size - offset))
+            def c_string(rva: int) -> str:
+                offset, available = rva_location(rva)
+                value = read_at(offset, min(1025, available))
                 end = value.find(b"\0")
                 if end < 0:
                     raise ValueError("unterminated PE import name")
                 return value[:end].decode("ascii", errors="strict")
 
             imports: set[str] = set()
-            if directory_count > 1:
-                import_rva = u32(directories_offset + 8)
-                if import_rva:
-                    descriptor = rva_offset(import_rva)
-                    for _ in range(65536):
-                        if descriptor + 20 > file_size:
-                            raise ValueError("truncated PE import descriptor")
-                        fields = struct.unpack("<IIIII", read_at(descriptor, 20))
-                        if not any(fields):
-                            break
-                        name_rva = fields[3]
-                        imports.add(c_string(rva_offset(name_rva)).casefold())
-                        descriptor += 20
-                    else:
-                        raise ValueError("excessive PE import descriptor count")
+            import_rva, import_size = data_directory(1)
+            if import_rva or import_size:
+                if not import_rva or import_size < 20:
+                    raise ValueError("malformed PE import descriptor directory")
+                if import_size // 20 > 65536:
+                    raise ValueError("excessive PE import descriptor count")
+                terminated = False
+                for offset in range(0, import_size - 19, 20):
+                    descriptor, _available = rva_location(import_rva + offset, 20)
+                    fields = struct.unpack("<IIIII", read_at(descriptor, 20))
+                    if not any(fields):
+                        terminated = True
+                        break
+                    imports.add(c_string(fields[3]).casefold())
+                if not terminated:
+                    raise ValueError(
+                        "PE import descriptor has no terminator inside declared size"
+                    )
 
-            # Delay import descriptor (data-directory index 13). Attributes bit 0
-            # selects RVAs; old VA-form descriptors are uncommon and intentionally
-            # ignored rather than guessed without the image base.
-            if directory_count > 13:
-                delay_rva = u32(directories_offset + 13 * 8)
-                if delay_rva:
-                    descriptor = rva_offset(delay_rva)
-                    for _ in range(65536):
-                        if descriptor + 32 > file_size:
-                            raise ValueError("truncated PE delay-import descriptor")
-                        fields = struct.unpack("<IIIIIIII", read_at(descriptor, 32))
-                        if not any(fields):
-                            break
-                        attributes, name_rva = fields[0], fields[1]
-                        if attributes & 1:
-                            imports.add(c_string(rva_offset(name_rva)).casefold())
-                        descriptor += 32
+            delay_rva, delay_size = data_directory(13)
+            if delay_rva or delay_size:
+                if not delay_rva or delay_size < 32:
+                    raise ValueError("malformed PE delay-import descriptor directory")
+                if delay_size // 32 > 65536:
+                    raise ValueError("excessive PE delay-import descriptor count")
+                terminated = False
+                for offset in range(0, delay_size - 31, 32):
+                    descriptor, _available = rva_location(delay_rva + offset, 32)
+                    fields = struct.unpack("<IIIIIIII", read_at(descriptor, 32))
+                    if not any(fields):
+                        terminated = True
+                        break
+                    attributes, name_value = fields[0], fields[1]
+                    if attributes & 1:
+                        name_rva = name_value
                     else:
-                        raise ValueError("excessive PE delay-import descriptor count")
+                        if name_value < image_base:
+                            raise ValueError(
+                                "PE delay-import VA is below image base"
+                            )
+                        name_rva = name_value - image_base
+                        if name_rva > 0xFFFFFFFF:
+                            raise ValueError("PE delay-import VA exceeds RVA range")
+                    imports.add(c_string(name_rva).casefold())
+                if not terminated:
+                    raise ValueError(
+                        "PE delay-import descriptor has no terminator inside declared size"
+                    )
             return imports
     except OSError as error:
         raise OSError(f"cannot inspect PE imports for {path}: {error}") from error
+
+
+def _cmake_add_test_arguments(text: str) -> tuple[tuple[str, ...], ...]:
+    """Parse literal arguments from generated ``add_test(...)`` commands."""
+    commands: list[tuple[str, ...]] = []
+    for command_match in re.finditer(r"(?i)\badd_test\s*\(", text):
+        index = command_match.end()
+        arguments: list[str] = []
+        while index < len(text):
+            while index < len(text) and text[index].isspace():
+                index += 1
+            if index >= len(text) or text[index] == ")":
+                break
+            if text[index] == '"':
+                index += 1
+                value: list[str] = []
+                while index < len(text):
+                    character = text[index]
+                    if character == '"':
+                        index += 1
+                        break
+                    if character == "\\" and index + 1 < len(text):
+                        index += 1
+                        value.append(text[index])
+                    else:
+                        value.append(character)
+                    index += 1
+                else:
+                    raise ValueError("unterminated quoted add_test argument")
+                arguments.append("".join(value))
+                continue
+            bracket = re.match(r"\[(=*)\[", text[index:])
+            if bracket:
+                opening = bracket.group(0)
+                closing = "]" + bracket.group(1) + "]"
+                value_start = index + len(opening)
+                value_end = text.find(closing, value_start)
+                if value_end < 0:
+                    raise ValueError("unterminated bracket add_test argument")
+                arguments.append(text[value_start:value_end])
+                index = value_end + len(closing)
+                continue
+            value_start = index
+            while (
+                index < len(text)
+                and not text[index].isspace()
+                and text[index] != ")"
+            ):
+                index += 1
+            arguments.append(text[value_start:index])
+        else:
+            raise ValueError("unterminated add_test command")
+        if index >= len(text) or text[index] != ")":
+            raise ValueError("unterminated add_test command")
+        commands.append(tuple(arguments))
+    return tuple(commands)
 
 
 def registered_test_executables(build_dir: Path) -> tuple[Path, ...]:
@@ -245,19 +342,21 @@ def registered_test_executables(build_dir: Path) -> tuple[Path, ...]:
     executables: set[Path] = set()
     for testfile in build_dir.rglob("CTestTestfile.cmake"):
         text = testfile.read_text(encoding="utf-8", errors="replace")
-        for match in re.finditer(
-            r'(?im)^\s*add_test\([^\r\n]*?"([^"]+\.exe)"', text
-        ):
-            command = Path(match.group(1))
-            executable = (
-                command if command.is_absolute() else testfile.parent / command
-            ).resolve()
-            try:
-                executable.relative_to(build_dir)
-            except ValueError:
-                continue
-            if executable.is_file():
-                executables.add(executable)
+        for arguments in _cmake_add_test_arguments(text):
+            for argument in arguments:
+                candidate = argument.rpartition("=")[2]
+                if not candidate.casefold().endswith(".exe"):
+                    continue
+                command = Path(candidate)
+                executable = (
+                    command if command.is_absolute() else testfile.parent / command
+                ).resolve()
+                try:
+                    executable.relative_to(build_dir)
+                except ValueError:
+                    continue
+                if executable.is_file():
+                    executables.add(executable)
     return tuple(sorted(executables, key=lambda path: str(path).casefold()))
 
 
@@ -314,6 +413,15 @@ def reject_runtime_dll_shadowing(
     configured_dlls = _configured_dlls(roots)
     authoritative = _authoritative_families(roots)
     adjacent_cache: dict[Path, dict[str, Path]] = {}
+    digest_cache: dict[Path, str] = {}
+
+    def digest(path: Path) -> str:
+        key = path.absolute()
+        cached = digest_cache.get(key)
+        if cached is None:
+            cached = _sha256(path)
+            digest_cache[key] = cached
+        return cached
 
     def adjacent_dlls(parent: Path) -> dict[str, Path]:
         parent = parent.resolve()
@@ -343,7 +451,7 @@ def reject_runtime_dll_shadowing(
                 configured = configured_dlls.get(name)
             if configured is None:
                 continue
-            if _sha256(adjacent) != _sha256(configured):
+            if digest(adjacent) != digest(configured):
                 raise RuntimeError(
                     "incompatible runtime DLL shadows the configured Windows runtime: "
                     f"{_describe(adjacent)}; configured peer: {_describe(configured)}. "
@@ -353,26 +461,49 @@ def reject_runtime_dll_shadowing(
 
     adjacent_dlls(directory)
 
-    pending = list(executables)
-    inspected: set[Path] = set()
+    resolved_executables = tuple(executable.resolve() for executable in executables)
+    pending = [(executable, executable.parent) for executable in resolved_executables]
+    inspected: set[tuple[Path, Path]] = set()
     while pending:
-        binary = pending.pop().resolve()
-        if binary in inspected or not binary.is_file():
+        binary, executable_dir = pending.pop()
+        inspection = (binary, executable_dir)
+        if inspection in inspected or not binary.is_file():
             continue
-        inspected.add(binary)
-        binary_adjacent = adjacent_dlls(binary.parent)
+        if len(inspected) >= 4096:
+            raise RuntimeError("Windows runtime import closure exceeds 4096 binaries")
+        inspected.add(inspection)
+        binary_adjacent = adjacent_dlls(executable_dir)
         for imported_name in pe_imports(binary):
             imported_name = imported_name.casefold()
+            resolved = binary_adjacent.get(imported_name)
+            if resolved is None:
+                resolved = configured_dlls.get(imported_name)
             family = _controlled_family(imported_name)
             if family is not None:
                 candidates = authoritative.get(family, {})
-                if imported_name not in candidates:
+                configured = candidates.get(imported_name)
+                if configured is None:
                     raise RuntimeError(
                         f"{binary} imports stale controlled runtime {imported_name}; "
                         f"active {family[0]} family provides "
                         f"{_expected_family_text(candidates)}. Reconfigure and rebuild "
                         "the selected executable."
                     )
-            imported_adjacent = binary_adjacent.get(imported_name)
-            if imported_adjacent is not None and imported_adjacent not in inspected:
-                pending.append(imported_adjacent)
+                if resolved is None:
+                    raise RuntimeError(
+                        f"{binary} imports controlled runtime {imported_name}, but "
+                        "Windows search order resolves no configured peer"
+                    )
+                if (
+                    resolved != configured
+                    and digest(resolved) != digest(configured)
+                ):
+                    raise RuntimeError(
+                        f"{binary} imports {imported_name}, but an earlier Windows "
+                        f"search path resolves incompatible peer {_describe(resolved)}; "
+                        f"authoritative {family[0]} peer: {_describe(configured)}. "
+                        "Reconfigure the dependency roots so authoritative runtime "
+                        "families resolve first."
+                    )
+            if resolved is not None:
+                pending.append((resolved, executable_dir))

@@ -457,8 +457,6 @@ def check_top_level_readme_windows_contract(text: str) -> list[str]:
         f"top-level README bare CTest bypass: {failure}"
         for failure in check_windows_quick_start_docs(text)
     ]
-    windows_heading = False
-    unsafe_windows_status_bar = False
     paragraphs: list[str] = []
     current_block: list[str] = []
     for line in text.splitlines():
@@ -474,39 +472,59 @@ def check_top_level_readme_windows_contract(text: str) -> list[str]:
         current_block.append(line)
     if current_block:
         paragraphs.append("\n".join(current_block))
+
+    sections: list[tuple[str, list[str]]] = [("", [])]
     for paragraph in paragraphs:
-        stripped = paragraph.strip()
-        heading = re.match(r"^#{1,6}\s+(.+)$", stripped)
+        heading = re.match(r"^#{1,6}\s+(.+)$", paragraph.strip())
         if heading:
-            windows_heading = bool(
-                re.search(r"\bWindows\b", heading.group(1), re.IGNORECASE)
-            )
-            continue
-        if not windows_heading and not re.search(
-            r"\bWindows\b", paragraph, re.IGNORECASE
-        ):
-            continue
+            sections.append((heading.group(1), []))
+        else:
+            sections[-1][1].append(paragraph)
+
+    windows_sections = [
+        (heading, blocks)
+        for heading, blocks in sections
+        if re.search(
+            r"\bWindows\b",
+            "\n".join((heading, *blocks)).replace(
+                "OpenLiveReplay: start controlled Windows app", ""
+            ),
+            re.IGNORECASE,
+        )
+    ]
+    unsafe_windows_status_bar = False
+    for heading, blocks in windows_sections:
         unsafe_fragments: list[str] = []
-        for sentence in re.split(
-            r"(?<=[.!?;])\s+", re.sub(r"\s+", " ", paragraph)
-        ):
-            if re.search(r"\b(?:macOS|Linux)(?:/Linux)?\b", sentence, re.IGNORECASE):
-                continue
-            if re.search(
-                r"\b(?:do\s+not|don't|never|avoid|must\s+not|cannot|can't)\b|"
-                r"\bnot\s+(?:use|choose|select|click|start|launch)\b|"
-                r"\brather\s+than\b",
-                sentence,
-                re.IGNORECASE,
+        for block in blocks:
+            for sentence in re.split(
+                r"(?<=[.!?;])\s+", re.sub(r"\s+", " ", block)
             ):
-                continue
-            unsafe_fragments.append(sentence)
+                if re.search(
+                    r"\b(?:macOS|Linux)(?:/Linux)?\b", sentence, re.IGNORECASE
+                ):
+                    continue
+                if re.search(
+                    r"\b(?:do\s+not|don't|never|avoid|must\s+not|cannot|can't|"
+                    r"forbid(?:den)?)\b|"
+                    r"\bnot\s+(?:use|choose|select|click|start|launch)\b|"
+                    r"\brather\s+than\b",
+                    sentence,
+                    re.IGNORECASE,
+                ):
+                    continue
+                if re.search(
+                    r"\bconfigur(?:e|ation)\b.*\b(?:preset|kit|project)\b",
+                    sentence,
+                    re.IGNORECASE,
+                ):
+                    continue
+                unsafe_fragments.append(sentence)
         unsafe_text = " ".join(unsafe_fragments)
         if (
             re.search(r"\bstatus[- ]bar\b", unsafe_text, re.IGNORECASE)
             and re.search(r"\b(?:Run|Debug)\b", unsafe_text)
             and re.search(
-                r"\b(?:use|choose|select|click|start|launch|works?)\b",
+                r"\b(?:use|choose|select|click|press|start|launch|works?|available)\b",
                 unsafe_text,
                 re.IGNORECASE,
             )
@@ -515,6 +533,20 @@ def check_top_level_readme_windows_contract(text: str) -> list[str]:
             break
     if unsafe_windows_status_bar:
         failures.append("top-level README permits status-bar Run/Debug on Windows")
+    if not any(
+        "OpenLiveReplay: start controlled Windows app" in "\n".join(blocks)
+        for _heading, blocks in windows_sections
+    ):
+        failures.append(
+            "top-level README Windows section omits positive controlled app guidance"
+        )
+    if not any(
+        "python tools/run_ctest.py" in "\n".join(blocks)
+        for _heading, blocks in windows_sections
+    ):
+        failures.append(
+            "top-level README Windows section omits positive controlled CTest guidance"
+        )
     if "OpenLiveReplay: start controlled Windows app" not in text:
         failures.append(
             "top-level README permits status-bar Run/Debug without the controlled app task"
