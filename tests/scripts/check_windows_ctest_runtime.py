@@ -457,20 +457,63 @@ def check_top_level_readme_windows_contract(text: str) -> list[str]:
         f"top-level README bare CTest bypass: {failure}"
         for failure in check_windows_quick_start_docs(text)
     ]
-    normalized = re.sub(r"\s+", " ", text)
-    sentences = re.split(r"(?<=[.!?])\s+", normalized)
-    if any(
-        re.search(r"\bon Windows\b", sentence, re.IGNORECASE)
-        and re.search(
-            r"\b(?:use|choose|select|click|start|launch)\b",
-            sentence,
-            re.IGNORECASE,
+    windows_heading = False
+    unsafe_windows_status_bar = False
+    paragraphs: list[str] = []
+    current_block: list[str] = []
+    for line in text.splitlines():
+        starts_block = bool(
+            re.match(r"^\s*(?:#{1,6}\s+|(?:\d+[.)]|[-*+])\s+)", line)
         )
-        and re.search(r"\bRun\b", sentence)
-        and re.search(r"\bDebug\b", sentence)
-        and re.search(r"\bstatus[- ]bar\b", sentence, re.IGNORECASE)
-        for sentence in sentences
-    ):
+        if not line.strip() or starts_block:
+            if current_block:
+                paragraphs.append("\n".join(current_block))
+                current_block = []
+            if not line.strip():
+                continue
+        current_block.append(line)
+    if current_block:
+        paragraphs.append("\n".join(current_block))
+    for paragraph in paragraphs:
+        stripped = paragraph.strip()
+        heading = re.match(r"^#{1,6}\s+(.+)$", stripped)
+        if heading:
+            windows_heading = bool(
+                re.search(r"\bWindows\b", heading.group(1), re.IGNORECASE)
+            )
+            continue
+        if not windows_heading and not re.search(
+            r"\bWindows\b", paragraph, re.IGNORECASE
+        ):
+            continue
+        unsafe_fragments: list[str] = []
+        for sentence in re.split(
+            r"(?<=[.!?;])\s+", re.sub(r"\s+", " ", paragraph)
+        ):
+            if re.search(r"\b(?:macOS|Linux)(?:/Linux)?\b", sentence, re.IGNORECASE):
+                continue
+            if re.search(
+                r"\b(?:do\s+not|don't|never|avoid|must\s+not|cannot|can't)\b|"
+                r"\bnot\s+(?:use|choose|select|click|start|launch)\b|"
+                r"\brather\s+than\b",
+                sentence,
+                re.IGNORECASE,
+            ):
+                continue
+            unsafe_fragments.append(sentence)
+        unsafe_text = " ".join(unsafe_fragments)
+        if (
+            re.search(r"\bstatus[- ]bar\b", unsafe_text, re.IGNORECASE)
+            and re.search(r"\b(?:Run|Debug)\b", unsafe_text)
+            and re.search(
+                r"\b(?:use|choose|select|click|start|launch|works?)\b",
+                unsafe_text,
+                re.IGNORECASE,
+            )
+        ):
+            unsafe_windows_status_bar = True
+            break
+    if unsafe_windows_status_bar:
         failures.append("top-level README permits status-bar Run/Debug on Windows")
     if "OpenLiveReplay: start controlled Windows app" not in text:
         failures.append(
@@ -479,27 +522,6 @@ def check_top_level_readme_windows_contract(text: str) -> list[str]:
     if "python tools/run_ctest.py" not in text:
         failures.append("top-level README omits the controlled Windows CTest launcher")
     return failures
-
-
-def check_app_qml_plugin_dependencies(text: str) -> list[str]:
-    """Require target-only desktop app builds to produce dynamic QML plugins."""
-    dependencies: set[str] = set()
-    for block in re.finditer(
-        r"if\s*\(\s*NOT\s+IOS\s*\)(.*?)endif\s*\(\s*\)",
-        text,
-        re.DOTALL,
-    ):
-        for command in re.finditer(
-            r"add_dependencies\s*\(\s*OpenLiveReplay\s+(.*?)\)",
-            block.group(1),
-            re.DOTALL,
-        ):
-            dependencies.update(command.group(1).split())
-    return [
-        f"OpenLiveReplay desktop target does not build required QML plugin: {plugin}"
-        for plugin in ("OlrStyleplugin", "OlrThemeplugin")
-        if plugin not in dependencies
-    ]
 
 
 def check_source_policy(root: Path) -> None:
@@ -546,8 +568,6 @@ def check_source_policy(root: Path) -> None:
     failures.extend(check_windows_quick_start_docs(quick_start))
     top_level_readme = (root / "README.md").read_text(encoding="utf-8")
     failures.extend(check_top_level_readme_windows_contract(top_level_readme))
-    app_cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
-    failures.extend(check_app_qml_plugin_dependencies(app_cmake))
 
     workflow_paths = sorted((root / ".github/workflows").glob("*.y*ml"))
     windows_job_count = 0

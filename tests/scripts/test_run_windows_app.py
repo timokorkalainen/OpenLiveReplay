@@ -162,6 +162,26 @@ class RunWindowsAppTests(unittest.TestCase):
         self.assertEqual(deployed.read_bytes(), configured.read_bytes())
         self.assertEqual(app_owned.read_bytes(), b"application-owned-runtime")
 
+    def test_selected_app_imports_are_audited(self) -> None:
+        active = self.ffmpeg / "bin" / "avcodec-62.dll"
+        active.write_bytes(b"active-ffmpeg")
+        with (
+            mock.patch.object(
+                self.launcher.runtime_guard,
+                "pe_imports",
+                return_value={"avcodec-61.dll"},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"OpenLiveReplay\.exe.*avcodec-61\.dll.*OLR_FFMPEG_ROOT",
+            ),
+        ):
+            self.launcher.prepare_windows_app_runtime(
+                self.build,
+                self.app,
+                {"SystemRoot": str(Path(self.temporary.name) / "Windows")},
+            )
+
     def test_stale_qt_cache_error_requires_reconfigure_guidance(self) -> None:
         shutil.rmtree(self.qt / "bin")
         with self.assertRaisesRegex(
@@ -175,13 +195,12 @@ class RunWindowsAppTests(unittest.TestCase):
             )
 
     def test_main_preserves_arguments_and_exact_child_exit(self) -> None:
-        completed = mock.Mock(returncode=37)
         guard = mock.MagicMock()
         guard.__enter__.return_value = None
         with (
             mock.patch.object(self.launcher, "prepare_windows_app_runtime", return_value={"PATH": "controlled"}),
             mock.patch.object(self.launcher, "suppress_windows_error_dialogs", return_value=guard),
-            mock.patch.object(self.launcher.subprocess, "run", return_value=completed) as run,
+            mock.patch.object(self.launcher, "run_process_tree", return_value=37) as run,
         ):
             result = self.launcher.main(
                 [
@@ -201,7 +220,7 @@ class RunWindowsAppTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["env"], {"PATH": "controlled"})
         self.assertEqual(run.call_args.kwargs["cwd"], self.app.resolve().parent)
-        self.assertFalse(run.call_args.kwargs["check"])
+        self.assertTrue(run.call_args.kwargs["enabled"])
         guard.__enter__.assert_called_once()
         guard.__exit__.assert_called_once()
 

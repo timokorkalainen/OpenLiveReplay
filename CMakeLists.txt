@@ -1059,6 +1059,10 @@ if(NOT IOS)
     # `cmake --build ... --target OpenLiveReplay` must produce the plugin artifacts
     # referenced by the generated qmldir files, not only their backing libraries.
     add_dependencies(OpenLiveReplay OlrStyleplugin OlrThemeplugin)
+    include("${CMAKE_SOURCE_DIR}/cmake/OlrTargetContracts.cmake")
+    olr_require_target_dependencies(OpenLiveReplay
+        OlrStyleplugin
+        OlrThemeplugin)
 endif()
 if(APPLE AND NOT IOS)
     target_sources(OpenLiveReplay PRIVATE

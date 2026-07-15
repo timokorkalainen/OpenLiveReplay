@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 
@@ -21,30 +23,56 @@ def load_module():
 
 
 class WindowsRuntimePolicyTests(unittest.TestCase):
-    def test_app_target_requires_both_desktop_qml_plugins(self) -> None:
-        checker = getattr(self.policy, "check_app_qml_plugin_dependencies", None)
-        self.assertIsNotNone(
-            checker, "app QML plugin dependency policy is not implemented"
-        )
-        invalid = """
-target_link_libraries(OpenLiveReplay PRIVATE OlrTheme OlrStyle)
-if(IOS)
-    target_link_libraries(OpenLiveReplay PRIVATE OlrStyleplugin)
-endif()
-"""
-        self.assertTrue(
-            any("OlrStyleplugin" in failure for failure in checker(invalid))
-        )
-        self.assertTrue(
-            any("OlrThemeplugin" in failure for failure in checker(invalid))
-        )
+    def test_cmake_graph_contract_rejects_disabled_qml_plugin_dependencies(self) -> None:
+        contract = MODULE_PATH.parents[2] / "cmake" / "OlrTargetContracts.cmake"
+        self.assertTrue(contract.is_file(), "missing generated target-graph contract")
 
-        valid = """
-if(NOT IOS)
-    add_dependencies(OpenLiveReplay OlrStyleplugin OlrThemeplugin)
-endif()
-"""
-        self.assertEqual(checker(valid), [])
+        def configure(enabled: bool) -> subprocess.CompletedProcess[str]:
+            with tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "source"
+                build = Path(temporary) / "build"
+                source.mkdir()
+                (source / "CMakeLists.txt").write_text(
+                    "\n".join(
+                        (
+                            "cmake_minimum_required(VERSION 3.16)",
+                            "project(TargetContract NONE)",
+                            "add_custom_target(OpenLiveReplay)",
+                            "add_custom_target(OlrStyleplugin)",
+                            "add_custom_target(OlrThemeplugin)",
+                            f"if({'TRUE' if enabled else 'FALSE'})",
+                            "  add_dependencies(OpenLiveReplay OlrStyleplugin OlrThemeplugin)",
+                            "endif()",
+                            f'include("{contract.as_posix()}")',
+                            "olr_require_target_dependencies(OpenLiveReplay",
+                            "  OlrStyleplugin OlrThemeplugin)",
+                        )
+                    ),
+                    encoding="utf-8",
+                )
+                return subprocess.run(
+                    [
+                        "cmake",
+                        "-S",
+                        str(source),
+                        "-B",
+                        str(build),
+                        "-G",
+                        "Ninja",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+        enabled = configure(True)
+        self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+        disabled = configure(False)
+        self.assertNotEqual(disabled.returncode, 0)
+        self.assertRegex(
+            disabled.stdout + disabled.stderr,
+            r"(?s)OpenLiveReplay.*OlrStyleplugin.*OlrThemeplugin",
+        )
 
     def test_top_level_readme_rejects_windows_launch_bypasses(self) -> None:
         checker = getattr(
@@ -81,6 +109,39 @@ Run tests with `python tools/run_ctest.py --test-dir build --output-on-failure`.
             checker(valid),
             [],
         )
+
+        split_bypass = """
+Windows users can click the status-bar Run button. Debug works there too.
+Start the supported path with `OpenLiveReplay: start controlled Windows app`.
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        self.assertTrue(
+            any(
+                "status-bar Run/Debug" in failure
+                for failure in checker(split_bypass)
+            )
+        )
+
+        safe_warning = """
+On Windows, never use status-bar Run or Debug; instead use
+`OpenLiveReplay: start controlled Windows app`.
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        self.assertEqual(checker(safe_warning), [])
+
+    def test_top_level_readme_keeps_markdown_list_items_separate(self) -> None:
+        checker = self.policy.check_top_level_readme_windows_contract
+        text = """
+## Quick start
+
+1. Configure the project.
+2. From the CMake Tools status bar, pick the Debug configure preset.
+3. On macOS/Linux, use Build, Run, and Debug from the status bar. On Windows,
+   start the app with **OpenLiveReplay: start controlled Windows app**.
+
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        self.assertEqual(checker(text), [])
 
     @classmethod
     def setUpClass(cls) -> None:

@@ -6,7 +6,6 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
-import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 
@@ -15,7 +14,20 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from windows_runtime_guard import RuntimeRoots, reject_runtime_dll_shadowing
+try:
+    from .windows_job import run_process_tree
+    from .windows_runtime_guard import (
+        RuntimeRoots,
+        registered_test_executables,
+        reject_runtime_dll_shadowing,
+    )
+except ImportError:
+    from windows_job import run_process_tree
+    from windows_runtime_guard import (
+        RuntimeRoots,
+        registered_test_executables,
+        reject_runtime_dll_shadowing,
+    )
 
 
 _REQUIRED_CACHE_KEYS = (
@@ -137,6 +149,7 @@ def prepare_windows_runtime(
             srt_root / "bin",
             srt_root / "lib",
         ),
+        executables=registered_test_executables(build_dir),
     )
 
     env = dict(inherited_env)
@@ -175,7 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = [str(ctest), *args, "--interactive-debug-mode", "0"]
     old_mode = _set_windows_error_mode()
     try:
-        return subprocess.run(command, env=env, check=False).returncode
+        return run_process_tree(command, enabled=os.name == "nt", env=env)
     finally:
         _restore_windows_error_mode(old_mode)
 

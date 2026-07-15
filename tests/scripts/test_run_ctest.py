@@ -7,13 +7,19 @@ import os
 from pathlib import Path
 import re
 import shutil
-import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from tools import run_ctest
+from tools.windows_runtime_guard import (
+    RuntimeRoots,
+    pe_imports,
+    registered_test_executables,
+    reject_runtime_dll_shadowing,
+)
 
 
 class RunCtestTests(unittest.TestCase):
@@ -126,6 +132,22 @@ class RunCtestTests(unittest.TestCase):
                 "OLR_FFMPEG_ROOT": "C:/deps/ffmpeg=controlled",
             },
         )
+
+    @unittest.skipUnless(os.name == "nt", "requires a real PE executable")
+    def test_pe_import_parser_reads_real_windows_executable(self):
+        self.assertIn("kernel32.dll", pe_imports(Path(sys.executable)))
+
+    def test_registered_test_executables_resolve_relative_to_testfile(self):
+        nested = self.build_dir / "nested"
+        nested.mkdir()
+        executable = nested / "tst_relative.exe"
+        executable.write_bytes(b"pe-fixture")
+        (nested / "CTestTestfile.cmake").write_text(
+            'add_test([=[relative]=] "tst_relative.exe")\n',
+            encoding="utf-8",
+        )
+
+        self.assertEqual(registered_test_executables(self.build_dir), (executable,))
 
     def test_windows_runtime_precedes_inherited_path(self):
         env, ctest = run_ctest.prepare_windows_runtime(
@@ -306,6 +328,139 @@ class RunCtestTests(unittest.TestCase):
 
         self.assertNotEqual(adjacent.read_bytes(), configured_lib.read_bytes())
 
+    def test_imported_stale_ffmpeg_abi_is_rejected_by_authoritative_root(self):
+        active = self.ffmpeg_root / "bin" / "avcodec-62.dll"
+        active.write_bytes(b"active-ffmpeg-abi")
+        qt_private = self.qt_root / "bin" / "avcodec-61.dll"
+        qt_private.write_bytes(b"qt-private-ffmpeg-abi")
+        executable = self.build_dir / "tst_stale_codec.exe"
+        executable.write_bytes(b"pe-fixture")
+
+        roots = RuntimeRoots(
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+        with (
+            mock.patch(
+                "tools.windows_runtime_guard.pe_imports",
+                return_value={"avcodec-61.dll"},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"tst_stale_codec\.exe.*avcodec-61\.dll.*OLR_FFMPEG_ROOT.*avcodec-62\.dll",
+            ),
+        ):
+            reject_runtime_dll_shadowing(
+                self.build_dir,
+                roots,
+                executables=(executable,),
+            )
+
+    def test_unrelated_imported_app_dll_remains_allowed(self):
+        executable = self.build_dir / "tst_app_owned.exe"
+        executable.write_bytes(b"pe-fixture")
+        app_owned = self.build_dir / "OpenLiveReplaySupport.dll"
+        app_owned.write_bytes(b"app-owned")
+        roots = RuntimeRoots(
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+
+        with mock.patch(
+            "tools.windows_runtime_guard.pe_imports",
+            side_effect=lambda path: (
+                {"OpenLiveReplaySupport.dll"} if path == executable else set()
+            ),
+        ):
+            reject_runtime_dll_shadowing(
+                self.build_dir,
+                roots,
+                executables=(executable,),
+            )
+
+    def test_nested_test_directory_rejects_stale_adjacent_qt_dll(self):
+        configured = self.qt_root / "bin" / "Qt6Core.dll"
+        configured.write_bytes(b"active-qt")
+        test_dir = self.build_dir / "tests" / "nested"
+        test_dir.mkdir(parents=True)
+        executable = test_dir / "tst_nested.exe"
+        executable.write_bytes(b"pe-fixture")
+        adjacent = test_dir / "Qt6Core.dll"
+        adjacent.write_bytes(b"stale-qt")
+        roots = RuntimeRoots(
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+
+        with (
+            mock.patch(
+                "tools.windows_runtime_guard.pe_imports",
+                return_value={"qt6core.dll"},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                rf"{re.escape(str(adjacent))}.*{re.escape(str(configured))}",
+            ),
+        ):
+            reject_runtime_dll_shadowing(
+                self.build_dir,
+                roots,
+                executables=(executable,),
+            )
+
+    def test_nested_app_owned_import_closure_is_audited(self):
+        active = self.ffmpeg_root / "bin" / "avcodec-62.dll"
+        active.write_bytes(b"active-ffmpeg")
+        test_dir = self.build_dir / "tests" / "nested"
+        test_dir.mkdir(parents=True)
+        executable = test_dir / "tst_nested.exe"
+        executable.write_bytes(b"pe-fixture")
+        support = test_dir / "OpenLiveReplaySupport.dll"
+        support.write_bytes(b"pe-fixture")
+        roots = RuntimeRoots(
+            self.compiler_bin,
+            self.qt_root / "bin",
+            self.ffmpeg_root / "bin",
+            self.ffmpeg_root / "lib",
+            self.srt_root / "bin",
+            self.srt_root / "lib",
+        )
+
+        def imports(path: Path) -> set[str]:
+            if path == executable:
+                return {support.name}
+            if path == support:
+                return {"avcodec-61.dll"}
+            return set()
+
+        with (
+            mock.patch(
+                "tools.windows_runtime_guard.pe_imports",
+                side_effect=imports,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"OpenLiveReplaySupport\.dll.*avcodec-61\.dll.*OLR_FFMPEG_ROOT",
+            ),
+        ):
+            reject_runtime_dll_shadowing(
+                self.build_dir,
+                roots,
+                executables=(executable,),
+            )
+
     def test_windows_runtime_stale_cache_error_requires_reconfigure_guidance(self):
         shutil.rmtree(self.qt_root / "bin")
         with self.assertRaisesRegex(
@@ -316,14 +471,14 @@ class RunCtestTests(unittest.TestCase):
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=17)
-    @mock.patch("tools.run_ctest.subprocess.run")
+    @mock.patch("tools.run_ctest.run_process_tree")
     def test_main_preserves_hostile_arguments_and_appends_final_zero(
         self,
         run: mock.Mock,
         set_error_mode: mock.Mock,
         restore_error_mode: mock.Mock,
     ):
-        run.return_value = subprocess.CompletedProcess([], 0)
+        run.return_value = 0
         caller_args = [
             "--interactive-debug-mode",
             "1",
@@ -351,7 +506,7 @@ class RunCtestTests(unittest.TestCase):
                 "0",
             ],
         )
-        self.assertFalse(run.call_args.kwargs["check"])
+        self.assertTrue(run.call_args.kwargs["enabled"])
         self.assertEqual(
             run.call_args.kwargs["env"]["QT_PLUGIN_PATH"],
             str(self.qt_root / "plugins"),
@@ -361,14 +516,14 @@ class RunCtestTests(unittest.TestCase):
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=13)
-    @mock.patch("tools.run_ctest.subprocess.run")
+    @mock.patch("tools.run_ctest.run_process_tree")
     def test_main_preserves_interactive_spelling_as_test_dir_value(
         self,
         run: mock.Mock,
         set_error_mode: mock.Mock,
         restore_error_mode: mock.Mock,
     ):
-        run.return_value = subprocess.CompletedProcess([], 0)
+        run.return_value = 0
         named_build_dir = self.root / "--interactive-debug-mode=1"
         named_build_dir.mkdir()
         self.build_dir = named_build_dir
@@ -403,7 +558,7 @@ class RunCtestTests(unittest.TestCase):
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=29)
-    @mock.patch("tools.run_ctest.subprocess.run", side_effect=OSError("launch failed"))
+    @mock.patch("tools.run_ctest.run_process_tree", side_effect=OSError("launch failed"))
     def test_main_restores_error_mode_when_child_launch_raises(
         self,
         _run: mock.Mock,

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 
@@ -15,8 +14,14 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from windows_error_mode import suppress_windows_error_dialogs
-from windows_runtime_guard import RuntimeRoots, reject_runtime_dll_shadowing
+try:
+    from .windows_error_mode import suppress_windows_error_dialogs
+    from .windows_job import run_process_tree
+    from . import windows_runtime_guard as runtime_guard
+except ImportError:
+    from windows_error_mode import suppress_windows_error_dialogs
+    from windows_job import run_process_tree
+    import windows_runtime_guard as runtime_guard
 
 
 _REQUIRED_CACHE_KEYS = (
@@ -90,9 +95,9 @@ def prepare_windows_app_runtime(
     )
     qt_qml = _require_directory("Qt QML imports", qt_root / "qml", "Qt6_DIR")
 
-    reject_runtime_dll_shadowing(
+    runtime_guard.reject_runtime_dll_shadowing(
         executable.parent,
-        RuntimeRoots(
+        runtime_guard.RuntimeRoots(
             compiler_bin,
             qt_root / "bin",
             ffmpeg_root / "bin",
@@ -100,6 +105,7 @@ def prepare_windows_app_runtime(
             srt_root / "bin",
             srt_root / "lib",
         ),
+        executables=(executable,),
     )
 
     system_root = Path(inherited_env.get("SystemRoot", "C:/Windows"))
@@ -131,9 +137,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         app_args.pop(0)
     command = [str(executable), *app_args]
     with suppress_windows_error_dialogs(True):
-        return subprocess.run(
-            command, cwd=executable.parent, env=env, check=False
-        ).returncode
+        return run_process_tree(
+            command,
+            enabled=os.name == "nt",
+            cwd=executable.parent,
+            env=env,
+        )
 
 
 if __name__ == "__main__":
