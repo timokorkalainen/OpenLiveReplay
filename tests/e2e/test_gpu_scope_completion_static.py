@@ -22,6 +22,17 @@ def strip_comments_and_literals(source):
         current = chars[index]
         following = chars[index + 1] if index + 1 < len(chars) else ""
         if state == "code":
+            raw = (re.match(r'(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\(', source[index:])
+                   if current in ("L", "R", "U", "u") else None)
+            if raw is not None:
+                terminator = ")" + raw.group(1) + '"'
+                closing = source.find(terminator, index + raw.end())
+                literal_end = len(source) if closing < 0 else closing + len(terminator)
+                for literal_index in range(index, literal_end):
+                    if chars[literal_index] != "\n":
+                        chars[literal_index] = " "
+                index = literal_end
+                continue
             if current == "/" and following == "/":
                 chars[index] = chars[index + 1] = " "
                 index += 2
@@ -191,11 +202,14 @@ def expect_rejected(source, message):
 def mutation_self_tests():
     safe = """
 bool probe() {
+    bool success = false;
     GpuSyncReadScope scope;
-    return scope.withRead(surface, [&](const GpuReadLease& lease) {
-        use(lease.nativeHandle());
-        return true;
+    scope.withRead(surface, [&](const GpuReadLease& lease) {
+        void* handle = lease.nativeHandle();
+        use(handle);
+        success = true;
     });
+    return success;
 }
 """
     audit_structured_access(function_block(safe, "bool probe"), "safe mutation", ("use",))
@@ -223,10 +237,11 @@ bool probe() {
 bool probe() {
     return false;
     GpuSyncReadScope scope;
-    return scope.withRead(surface, [&](const GpuReadLease& lease) {
-        use(lease.nativeHandle());
-        return true;
+    scope.withRead(surface, [&](const GpuReadLease& lease) {
+        void* handle = lease.nativeHandle();
+        use(handle);
     });
+    return true;
 }
 """, "unreachable withRead markers must not satisfy the audit")
 

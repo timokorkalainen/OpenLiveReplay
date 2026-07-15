@@ -415,13 +415,15 @@ std::shared_ptr<GpuFence>
 WinGpuImportEdge::createFenceForSurface(const std::shared_ptr<D3D11GpuSurface>& surface) {
     if (!surface) return nullptr;
     const uint64_t authorityEpoch = surface->compatibility().authorityEpoch;
+    std::shared_ptr<GpuFence> result;
     GpuSyncReadScope scope;
-    return scope.withRead(surface, [authorityEpoch](const GpuReadLease& lease) {
+    scope.withRead(surface, [authorityEpoch, &result](const GpuReadLease& lease) {
         auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         ComPtr<ID3D11Device> device;
         if (texture) texture->GetDevice(&device);
-        return makeD3D11GpuFence(device.Get(), authorityEpoch);
+        result = makeD3D11GpuFence(device.Get(), authorityEpoch);
     });
+    return result;
 }
 
 std::shared_ptr<GpuFence> WinGpuImportEdge::createFence() const {
@@ -519,24 +521,25 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
     const auto cached = m_cpuCache.constFind(int(target));
     if (cached != m_cpuCache.cend()) return cached.value();
 
+    bool nativeReadComplete = false;
     GpuSyncReadScope readScope;
-    const bool nativeReadComplete = readScope.withRead(m_surface, [&](const GpuReadLease& lease) {
+    readScope.withRead(m_surface, [&](const GpuReadLease& lease) {
         auto* src = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
         ComPtr<ID3D11Device> retainedDevice;
         if (src) src->GetDevice(&retainedDevice);
         ID3D11Device* device = retainedDevice.Get();
-        if (!device || !src) return false;
+        if (!device || !src) return;
 
         if (m_renderFenceValue != 0) {
             if (!m_renderFence ||
                 !m_renderFence->wait(m_renderFenceValue, kD3DReadbackFenceTimeoutMs)) {
-                return false;
+                return;
             }
         }
 
         ComPtr<ID3D11DeviceContext> ctx;
         device->GetImmediateContext(&ctx);
-        if (!ctx) return false;
+        if (!ctx) return;
 
         D3D11_TEXTURE2D_DESC desc{};
         src->GetDesc(&desc);
@@ -549,12 +552,12 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
         staging.MipLevels = 1;
 
         ComPtr<ID3D11Texture2D> readable;
-        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return false;
+        if (FAILED(device->CreateTexture2D(&staging, nullptr, &readable))) return;
         ctx->CopySubresourceRegion(readable.Get(), 0, 0, 0, 0, src, lease.nativeSubresource(),
                                    nullptr);
 
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+        if (FAILED(ctx->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
 
         const int w = m_surface->desc().width;
         const int h = m_surface->desc().height;
@@ -592,7 +595,7 @@ CpuPlanes D3D11IGpuFrameData::readToCpu(FramePixelFormat target) const {
         }
 
         ctx->Unmap(readable.Get(), 0);
-        return true;
+        nativeReadComplete = true;
     });
     if (!nativeReadComplete) return out;
 

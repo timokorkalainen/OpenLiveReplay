@@ -44,8 +44,8 @@ public:
     }
 
 protected:
-    bool isCompatibleWithNativeHandle(void* nativeHandle) const override {
-        auto* texture = static_cast<ID3D11Texture2D*>(nativeHandle);
+    bool isCompatibleWithNativeHandle(void* handle) const override {
+        auto* texture = static_cast<ID3D11Texture2D*>(handle);
         if (!texture || !m_deviceIdentity) return false;
         Microsoft::WRL::ComPtr<ID3D11Device> device;
         Microsoft::WRL::ComPtr<IUnknown> identity;

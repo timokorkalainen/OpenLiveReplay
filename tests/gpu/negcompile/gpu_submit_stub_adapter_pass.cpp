@@ -10,11 +10,13 @@ struct StubSubmissionAdapter {
     std::shared_ptr<GpuSurface> surface;
 
     GpuSubmitOutcome operator()() noexcept {
+        GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
         GpuSyncReadScope scope;
-        return scope.withRead(surface, [](const GpuReadLease& lease) noexcept {
+        scope.withRead(surface, [&](const GpuReadLease& lease) noexcept {
             (void) lease.nativeHandle();
-            return GpuSubmitOutcome::NotSubmitted;
+            outcome = GpuSubmitOutcome::NotSubmitted;
         });
+        return outcome;
     }
 };
 

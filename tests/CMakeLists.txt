@@ -65,6 +65,11 @@ function(olr_add_compile_control name source expectation)
             "-DVERIFY_REJECTION=TRUE"
             "-DEXPECTED_MEMBER=nativeHandle"
             "-DEXPECTED_ACCESS=[Pp]rotected")
+    elseif(expectation STREQUAL "WITH_READ_VOID")
+        list(APPEND control_args
+            "-DEXPECT_COMPILE=FALSE"
+            "-DEXPECTED_MEMBER=withRead"
+            "-DEXPECTED_ACCESS=callback.must.return.void")
     else()
         message(FATAL_ERROR "Unknown compile-control expectation: ${expectation}")
     endif()
@@ -142,6 +147,15 @@ olr_add_compile_control(gpu_native_handle_derived_access_pass
     native_handle_derived_access_pass.cpp PASS)
 olr_add_compile_control(gpu_native_handle_access_unrelated_error_rejected
     unrelated_compile_error.cpp REJECT_UNRELATED_FAILURE)
+olr_expect_compile_failure(gpu_withread_return_raw withread_return_raw.cpp)
+olr_expect_compile_failure(gpu_withread_return_integer withread_return_integer.cpp)
+olr_expect_compile_failure(gpu_withread_return_wrapper withread_return_wrapper.cpp)
+olr_add_compile_control(gpu_withread_return_raw
+    withread_return_raw.cpp WITH_READ_VOID)
+olr_add_compile_control(gpu_withread_return_integer
+    withread_return_integer.cpp WITH_READ_VOID)
+olr_add_compile_control(gpu_withread_return_wrapper
+    withread_return_wrapper.cpp WITH_READ_VOID)
 olr_add_gpu_submission_compile_control(gpu_op_track_access gpu_op_track_access.cpp NO_TRACK)
 olr_add_gpu_submission_compile_control(
     gpu_submit_without_owner gpu_submit_without_owner.cpp OWNER_REQUIRED)
@@ -258,6 +272,13 @@ add_test(NAME gpu_capability_source_audit
         --source-root "${CMAKE_SOURCE_DIR}")
 set_tests_properties(gpu_capability_source_audit PROPERTIES
     LABELS "gpu-capability;ci" TIMEOUT 30)
+add_executable(gpu_lease_release_probe EXCLUDE_FROM_ALL
+    "${CMAKE_SOURCE_DIR}/tests/gpu/gpu_lease_release_probe.cpp")
+target_include_directories(gpu_lease_release_probe PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(gpu_lease_release_probe PRIVATE Qt6::Core)
+target_compile_definitions(gpu_lease_release_probe PRIVATE QT_NO_DEBUG)
+add_test(NAME gpu_lease_release_probe COMMAND gpu_lease_release_probe)
+set_tests_properties(gpu_lease_release_probe PROPERTIES LABELS "gpu-capability;ci")
 add_test(NAME gpu_compile_pass_diagnostic_fixtures
     COMMAND ${CMAKE_COMMAND}
         -DVERIFY_DIAGNOSTIC_FIXTURES=TRUE

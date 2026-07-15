@@ -13,13 +13,15 @@ struct MetalSubmissionAdapter {
     std::shared_ptr<GpuSurface> surface;
 
     GpuSubmitOutcome operator()() noexcept {
+        GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
         GpuSyncReadScope scope;
-        return scope.withRead(surface, [](const GpuReadLease& lease) noexcept {
+        scope.withRead(surface, [&](const GpuReadLease& lease) noexcept {
             IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
             id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-            return ioSurface && device ? GpuSubmitOutcome::Submitted
-                                       : GpuSubmitOutcome::NotSubmitted;
+            outcome =
+                ioSurface && device ? GpuSubmitOutcome::Submitted : GpuSubmitOutcome::NotSubmitted;
         });
+        return outcome;
     }
 };
 

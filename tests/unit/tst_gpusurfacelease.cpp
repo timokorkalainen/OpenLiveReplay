@@ -144,6 +144,12 @@ static_assert(!std::is_copy_constructible<GpuReadLease>::value,
               "GpuReadLease must not escape a synchronous callback by copy.");
 static_assert(!std::is_move_constructible<GpuReadLease>::value,
               "GpuReadLease must not escape a synchronous callback by move.");
+static_assert(!std::is_move_assignable<GpuReadLease>::value,
+              "GpuReadLease registration must not be transferable by move assignment.");
+static_assert(!std::is_move_constructible<GpuSyncReadScope>::value,
+              "GpuSyncReadScope must not move while a lease is registered.");
+static_assert(!std::is_move_assignable<GpuSyncReadScope>::value,
+              "GpuSyncReadScope registration storage must have a stable address.");
 static_assert(!std::is_copy_constructible<GpuOwnedNativeHandle>::value,
               "The raw-surface native owner must remain unique.");
 static_assert(std::is_nothrow_move_constructible<GpuOwnedNativeHandle>::value,
@@ -607,6 +613,9 @@ private slots:
     void withReadCompletesScope();
     void withReadCompletesDuringExceptionUnwinding();
     void handleQueryAfterCompletionFailsCheckedContract();
+    void escapedLeaseFailsClosedAfterScopeDestruction();
+    void repeatedAcquisitionFailsClosedInRelease();
+    void leaseDestructionDeregistersBeforeScopeCompletion();
     void checkedContractDeathOracleRejectsUnrelatedExit();
     void deathControlTimeoutCapturesDiagnosticsAndReaps();
     void surfaceOwnerSurvivesUntilLeaseDestruction();
@@ -965,14 +974,15 @@ void TestGpuSurfaceLease::withReadCompletesScope() {
     auto sentinel = reinterpret_cast<void*>(0xCAFE);
     auto surface = std::make_shared<FakeLeaseSurface>(sentinel, /*valid=*/true);
 
-    void* observed = nullptr;
+    bool observed = false;
     {
         GpuSyncReadScope scope;
-        observed =
-            scope.withRead(surface, [](const GpuReadLease& lease) { return lease.nativeHandle(); });
+        scope.withRead(surface, [&](const GpuReadLease& lease) {
+            observed = lease.nativeHandle() == sentinel;
+        });
     }
 
-    QCOMPARE(observed, sentinel);
+    QVERIFY(observed);
 }
 
 void TestGpuSurfaceLease::withReadCompletesDuringExceptionUnwinding() {
@@ -982,7 +992,6 @@ void TestGpuSurfaceLease::withReadCompletesDuringExceptionUnwinding() {
     if (qEnvironmentVariableIsSet(deathChildEnvironment)) {
         auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xFACE), true);
         GpuSyncReadScope scope;
-        const GpuReadLease retainedLease = scope.read(surface);
         try {
             scope.withRead(surface, [](const GpuReadLease& lease) {
                 (void) lease.nativeHandle();
@@ -992,8 +1001,6 @@ void TestGpuSurfaceLease::withReadCompletesDuringExceptionUnwinding() {
             });
         } catch (const std::runtime_error&) {
         }
-        (void) retainedLease.nativeHandle();
-        scope.complete();
         return;
     }
 
@@ -1002,7 +1009,8 @@ void TestGpuSurfaceLease::withReadCompletesDuringExceptionUnwinding() {
                         QByteArray(deathChildEnvironment), 10000);
     const QString diagnostic = childProcessDiagnostic(result);
     QVERIFY2(result.output.contains(callbackReachedThrowMarker), qPrintable(diagnostic));
-    QVERIFY2(isAcceptedCheckedContractDeath(result), qPrintable(diagnostic));
+    QVERIFY2(result.exitStatus == QProcess::NormalExit && result.exitCode == 0,
+             qPrintable(diagnostic));
 #else
     QSKIP("Checked-contract assertions are disabled in this build");
 #endif
@@ -1028,6 +1036,48 @@ void TestGpuSurfaceLease::handleQueryAfterCompletionFailsCheckedContract() {
 #else
     QSKIP("Checked-contract assertions are disabled in this build");
 #endif
+}
+
+void TestGpuSurfaceLease::escapedLeaseFailsClosedAfterScopeDestruction() {
+#ifdef QT_NO_DEBUG
+    auto surface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xD1E), true);
+    const GpuReadLease escaped = [&]() -> GpuReadLease {
+        GpuSyncReadScope scope;
+        return scope.read(surface);
+    }();
+
+    QVERIFY(escaped.valid());
+    QCOMPARE(escaped.nativeHandle(), nullptr);
+#else
+    QSKIP("Release fail-closed behavior is compiled under QT_NO_DEBUG");
+#endif
+}
+
+void TestGpuSurfaceLease::repeatedAcquisitionFailsClosedInRelease() {
+#ifdef QT_NO_DEBUG
+    auto firstSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xA11), true);
+    auto secondSurface = std::make_shared<FakeLeaseSurface>(reinterpret_cast<void*>(0xA12), true);
+    GpuSyncReadScope scope;
+    const GpuReadLease first = scope.read(firstSurface);
+    const GpuReadLease second = scope.read(secondSurface);
+
+    QVERIFY(!second.valid());
+    QCOMPARE(first.nativeHandle(), nullptr);
+    QCOMPARE(second.nativeHandle(), nullptr);
+#else
+    QSKIP("Release fail-closed behavior is compiled under QT_NO_DEBUG");
+#endif
+}
+
+void TestGpuSurfaceLease::leaseDestructionDeregistersBeforeScopeCompletion() {
+    auto sentinel = reinterpret_cast<void*>(0xD3E6);
+    auto surface = std::make_shared<FakeLeaseSurface>(sentinel, true);
+    GpuSyncReadScope scope;
+    {
+        const GpuReadLease lease = scope.read(surface);
+        QCOMPARE(lease.nativeHandle(), sentinel);
+    }
+    scope.complete();
 }
 
 void TestGpuSurfaceLease::checkedContractDeathOracleRejectsUnrelatedExit() {

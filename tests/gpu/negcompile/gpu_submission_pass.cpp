@@ -29,9 +29,11 @@ GpuSubmissionResult allowedOwnedSubmission(std::shared_ptr<GpuFence> fence,
 }
 
 bool allowedScopedSubmissionHandleRead(const std::shared_ptr<SubmissionPassSurface>& surface) {
+    bool hasHandle = false;
     GpuSyncReadScope scope;
-    return scope.withRead(
-        surface, [](const GpuReadLease& lease) { return lease.nativeHandle() != nullptr; });
+    scope.withRead(surface,
+                   [&](const GpuReadLease& lease) { hasHandle = lease.nativeHandle() != nullptr; });
+    return hasHandle;
 }
 
 GpuValidatedLossResult allowedValidatedAbandon(GpuRetireRegistry& registry) {

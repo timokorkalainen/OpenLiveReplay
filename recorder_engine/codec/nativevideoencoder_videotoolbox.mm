@@ -424,26 +424,27 @@ public:
             if (error) *error = QStringLiteral("encodeSurface: null/invalid surface");
             return false;
         }
+        bool encoded = false;
         GpuSyncReadScope readScope;
-        return readScope.withRead(surface, [&](const GpuReadLease& lease) {
+        readScope.withRead(surface, [&](const GpuReadLease& lease) {
             IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
             if (!ioSurface) {
                 if (error) {
                     *error = QStringLiteral("encodeSurface: surface is not IOSurface-backed");
                 }
-                return false;
+                return;
             }
             const GpuSurfaceDesc desc = lease.desc();
             if (desc.format != FramePixelFormat::Nv12) {
                 if (error) *error = QStringLiteral("encodeSurface: expected NV12 surface");
-                return false;
+                return;
             }
             if (desc.width > 0 && desc.height > 0 &&
                 (desc.width != int(IOSurfaceGetWidth(ioSurface)) ||
                  desc.height != int(IOSurfaceGetHeight(ioSurface)))) {
                 if (error)
                     *error = QStringLiteral("encodeSurface: descriptor/native size mismatch");
-                return false;
+                return;
             }
 
             CVPixelBufferRef pb = nullptr;
@@ -453,12 +454,13 @@ public:
                 if (error) {
                     *error = QStringLiteral("CVPixelBufferCreateWithIOSurface failed (%1)").arg(rc);
                 }
-                return false;
+                return;
             }
             const auto releasePixelBuffer = qScopeGuard([pb] { CVPixelBufferRelease(pb); });
             attachColorMetadata(pb, vuiColorCodePointsFor(color));
-            return encodePixelBuffer(pb, ptsTicks, onPacket, error);
+            encoded = encodePixelBuffer(pb, ptsTicks, onPacket, error);
         });
+        return encoded;
     }
 
     bool encodePixelBuffer(CVPixelBufferRef pb, int64_t ptsTicks, const PacketCallback& onPacket,

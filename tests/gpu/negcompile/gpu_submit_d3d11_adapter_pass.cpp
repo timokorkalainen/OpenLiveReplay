@@ -11,11 +11,13 @@ struct D3D11SubmissionAdapter {
     std::shared_ptr<D3D11GpuSurface> surface;
 
     GpuSubmitOutcome operator()() noexcept {
+        GpuSubmitOutcome outcome = GpuSubmitOutcome::NotSubmitted;
         GpuSyncReadScope scope;
-        return scope.withRead(surface, [](const GpuReadLease& lease) noexcept {
+        scope.withRead(surface, [&](const GpuReadLease& lease) noexcept {
             auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());
-            return texture ? GpuSubmitOutcome::Submitted : GpuSubmitOutcome::NotSubmitted;
+            outcome = texture ? GpuSubmitOutcome::Submitted : GpuSubmitOutcome::NotSubmitted;
         });
+        return outcome;
     }
 };
 

@@ -34,10 +34,12 @@ public:
         if (exact.deviceDomainId != 0 || exact.authorityEpoch != 0)
             return gpuSubmissionDetail::matchesSurfaceEvidence(
                 exact, identity(), currentGpuGeneration(), currentGpuGeneration());
+        bool compatible = false;
         GpuSyncReadScope scope;
-        const GpuReadLease lease = scope.read(surface);
-        const bool compatible = isCompatibleWithNativeHandle(lease.nativeHandle());
-        scope.complete();
+        scope.withRead(surface, [&](const GpuReadLease& lease) {
+            void* handle = lease.nativeHandle();
+            compatible = isCompatibleWithNativeHandle(handle);
+        });
         return compatible;
     }
 
@@ -69,9 +71,7 @@ protected:
         return GpuRetirementTicket(std::move(owner), preparedFence, gpuGeneration, value, seal);
     }
 
-    virtual bool isCompatibleWithNativeHandle(void* nativeHandle) const {
-        return nativeHandle == nullptr;
-    }
+    virtual bool isCompatibleWithNativeHandle(void* handle) const { return handle == nullptr; }
 
 private:
     friend class GpuOpScope;

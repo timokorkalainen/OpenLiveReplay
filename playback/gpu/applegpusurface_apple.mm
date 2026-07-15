@@ -297,16 +297,18 @@ std::shared_ptr<GpuSurface> wrapAppleImageBuffer(void* cvImageBufferRef) {
 
 CVPixelBufferRef retainApplePixelBufferWrapper(const std::shared_ptr<GpuSurface>& surface) {
     if (!surface || !surface->isValid()) return nullptr;
+    CVPixelBufferRef result = nullptr;
     GpuSyncReadScope scope;
-    return scope.withRead(surface, [](const GpuReadLease& lease) {
+    scope.withRead(surface, [&](const GpuReadLease& lease) {
         IOSurfaceRef ioSurface = static_cast<IOSurfaceRef>(lease.nativeHandle());
-        if (!ioSurface) return static_cast<CVPixelBufferRef>(nullptr);
+        if (!ioSurface) return;
 
         CVPixelBufferRef pixelBuffer = nullptr;
-        const CVReturn result =
+        const CVReturn createResult =
             CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, ioSurface, nullptr, &pixelBuffer);
-        return result == kCVReturnSuccess ? pixelBuffer : nullptr;
+        if (createResult == kCVReturnSuccess) result = pixelBuffer;
     });
+    return result;
 }
 
 CpuPlanes readAppleSurfaceToCpu(const std::shared_ptr<GpuSurface>& surface, FramePixelFormat target,
