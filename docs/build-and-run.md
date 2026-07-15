@@ -228,6 +228,17 @@ The launcher accepts ordinary CTest arguments and returns CTest's exact exit
 code. Do not launch a Windows test executable directly. The VS Code
 `CMake: run tests (ctest)` task applies this contract automatically.
 
+Windows builds embed application manifest resource ID 1 (`RT_MANIFEST`) in
+every first-party executable. The controlled launchers verify that embedded
+resource while holding each audited PE/DLL read-only through the child process
+lifetime. They also fail closed if either HKLM IFEO registry view enables
+`DevOverrideEnable`, because Microsoft defines that policy as overriding the
+normal rule that an application manifest disables [DotLocal DLL
+redirection](https://learn.microsoft.com/windows/win32/dlls/dynamic-link-library-redirection).
+An external `.manifest` file is not accepted as equivalent. This prevents a
+late `<executable>.local` file or directory from changing the audited loader
+resolution between verification and process startup.
+
 For a focused unit-only run:
 
 ```sh

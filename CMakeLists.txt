@@ -1147,3 +1147,11 @@ endif()
 if(OLR_BUILD_FUZZERS AND NOT IOS)
     add_subdirectory(tests/fuzz)
 endif()
+
+# DotLocal can redirect even absolute LoadLibrary paths. Embed an application
+# manifest in every first-party Windows executable so the controlled launchers
+# can prove that late <executable>.local creation is ignored by the OS loader.
+if(WIN32)
+    include("${CMAKE_SOURCE_DIR}/cmake/OlrWindowsManifest.cmake")
+    olr_embed_all_windows_executables()
+endif()

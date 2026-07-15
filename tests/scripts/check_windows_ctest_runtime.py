@@ -457,101 +457,120 @@ def check_top_level_readme_windows_contract(text: str) -> list[str]:
         f"top-level README bare CTest bypass: {failure}"
         for failure in check_windows_quick_start_docs(text)
     ]
-    paragraphs: list[str] = []
-    current_block: list[str] = []
+    heading_stack: list[tuple[int, str]] = []
+    sections: list[tuple[tuple[str, ...], list[str]]] = [((), [])]
     for line in text.splitlines():
-        starts_block = bool(
-            re.match(r"^\s*(?:#{1,6}\s+|(?:\d+[.)]|[-*+])\s+)", line)
-        )
-        if not line.strip() or starts_block:
-            if current_block:
-                paragraphs.append("\n".join(current_block))
-                current_block = []
-            if not line.strip():
-                continue
-        current_block.append(line)
-    if current_block:
-        paragraphs.append("\n".join(current_block))
-
-    sections: list[tuple[str, list[str]]] = [("", [])]
-    for paragraph in paragraphs:
-        heading = re.match(r"^#{1,6}\s+(.+)$", paragraph.strip())
+        heading = re.match(r"^\s*(#{1,6})\s+(.+?)\s*$", line)
         if heading:
-            sections.append((heading.group(1), []))
+            level = len(heading.group(1))
+            heading_stack = [entry for entry in heading_stack if entry[0] < level]
+            heading_stack.append((level, heading.group(2)))
+            sections.append((tuple(title for _level, title in heading_stack), []))
         else:
-            sections[-1][1].append(paragraph)
+            sections[-1][1].append(line)
 
-    windows_sections = [
-        (heading, blocks)
-        for heading, blocks in sections
-        if re.search(
-            r"\bWindows\b",
-            "\n".join((heading, *blocks)).replace(
-                "OpenLiveReplay: start controlled Windows app", ""
-            ),
-            re.IGNORECASE,
-        )
-    ]
+    platform_marker = re.compile(
+        r"\b(?:on|for)\s+(Windows|macOS(?:/Linux)?|Linux)\b",
+        re.IGNORECASE,
+    )
+    negative = re.compile(
+        r"\b(?:do\s+not|don't|never|avoid|must\s+not|cannot|can't|"
+        r"forbid(?:den)?|unavailable|disabled)\b|"
+        r"\bnot\s+(?:available|use|choose|select|click|start|launch|run)\b|"
+        r"\brather\s+than\b",
+        re.IGNORECASE,
+    )
+    action = re.compile(
+        r"\b(?:use|choose|select|click|press|start|launch|run|invoke|works?)\b",
+        re.IGNORECASE,
+    )
+    app_task = "OpenLiveReplay: start controlled Windows app"
+    ctest_launcher = "python tools/run_ctest.py"
+    positive_app = False
+    positive_ctest = False
     unsafe_windows_status_bar = False
-    for heading, blocks in windows_sections:
-        unsafe_fragments: list[str] = []
-        for block in blocks:
-            for sentence in re.split(
-                r"(?<=[.!?;])\s+", re.sub(r"\s+", " ", block)
-            ):
-                if re.search(
-                    r"\b(?:macOS|Linux)(?:/Linux)?\b", sentence, re.IGNORECASE
-                ):
-                    continue
-                if re.search(
-                    r"\b(?:do\s+not|don't|never|avoid|must\s+not|cannot|can't|"
-                    r"forbid(?:den)?)\b|"
-                    r"\bnot\s+(?:use|choose|select|click|start|launch)\b|"
-                    r"\brather\s+than\b",
-                    sentence,
-                    re.IGNORECASE,
-                ):
-                    continue
-                if re.search(
-                    r"\bconfigur(?:e|ation)\b.*\b(?:preset|kit|project)\b",
-                    sentence,
-                    re.IGNORECASE,
-                ):
-                    continue
-                unsafe_fragments.append(sentence)
-        unsafe_text = " ".join(unsafe_fragments)
-        if (
-            re.search(r"\bstatus[- ]bar\b", unsafe_text, re.IGNORECASE)
-            and re.search(r"\b(?:Run|Debug)\b", unsafe_text)
-            and re.search(
-                r"\b(?:use|choose|select|click|press|start|launch|works?|available)\b",
-                unsafe_text,
+
+    for headings, lines in sections:
+        section_text = "\n".join(lines)
+        inherited_windows = any(
+            re.search(r"\bWindows\b", heading, re.IGNORECASE)
+            for heading in headings
+        )
+        explicitly_windows = bool(
+            re.search(
+                r"\bWindows\b",
+                section_text.replace(app_task, ""),
                 re.IGNORECASE,
             )
-        ):
-            unsafe_windows_status_bar = True
-            break
+        )
+        section_is_windows = inherited_windows or explicitly_windows
+        status_bar_context = False
+        normalized = re.sub(r"\s+", " ", section_text)
+        normalized = re.sub(
+            r"(?i)(?<!^)\s*(?=\b(?:on|for)\s+(?:Windows|macOS(?:/Linux)?|Linux)\b)",
+            "\n",
+            normalized,
+        )
+        clauses = re.split(r"(?<=[.!?;])\s+|;\s*|\n+", normalized)
+        for clause in clauses:
+            clause = clause.strip()
+            if not clause:
+                continue
+            marker = platform_marker.search(clause)
+            clause_is_windows = section_is_windows
+            if marker:
+                clause_is_windows = marker.group(1).casefold() == "windows"
+
+            mentions_status_bar = bool(
+                re.search(r"\bstatus[- ]bar\b", clause, re.IGNORECASE)
+            )
+            if mentions_status_bar:
+                status_bar_context = True
+            if not clause_is_windows:
+                continue
+
+            is_negative = bool(negative.search(clause))
+            configure_only = bool(
+                re.search(
+                    r"\bconfigur(?:e|ation)\b.*\b(?:preset|kit|project)\b",
+                    clause,
+                    re.IGNORECASE,
+                )
+            )
+            if (
+                mentions_status_bar
+                or (
+                    status_bar_context
+                    and re.search(r"\bthere\b", clause, re.IGNORECASE)
+                )
+            ) and (
+                re.search(r"\b(?:Run|Debug)\b", clause)
+                and action.search(clause)
+                and not is_negative
+                and not configure_only
+            ):
+                unsafe_windows_status_bar = True
+
+            if app_task in clause and action.search(clause) and not is_negative:
+                positive_app = True
+            if ctest_launcher in clause and not is_negative:
+                positive_ctest = True
+
     if unsafe_windows_status_bar:
         failures.append("top-level README permits status-bar Run/Debug on Windows")
-    if not any(
-        "OpenLiveReplay: start controlled Windows app" in "\n".join(blocks)
-        for _heading, blocks in windows_sections
-    ):
+    if not positive_app:
         failures.append(
             "top-level README Windows section omits positive controlled app guidance"
         )
-    if not any(
-        "python tools/run_ctest.py" in "\n".join(blocks)
-        for _heading, blocks in windows_sections
-    ):
+    if not positive_ctest:
         failures.append(
             "top-level README Windows section omits positive controlled CTest guidance"
         )
-    if "OpenLiveReplay: start controlled Windows app" not in text:
+    if app_task not in text:
         failures.append(
             "top-level README permits status-bar Run/Debug without the controlled app task"
         )
-    if "python tools/run_ctest.py" not in text:
+    if ctest_launcher not in text:
         failures.append("top-level README omits the controlled Windows CTest launcher")
     return failures
 

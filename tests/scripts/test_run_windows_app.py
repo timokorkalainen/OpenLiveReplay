@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from tests.scripts.test_run_ctest import _write_manifest_pe_fixture
+
 
 MODULE_PATH = Path(__file__).resolve().parents[2] / "tools" / "run_windows_app.py"
 
@@ -41,7 +43,7 @@ class RunWindowsAppTests(unittest.TestCase):
         self.build = self.workspace / "build" / "active"
         self.build.mkdir(parents=True)
         self.app = self.build / "OpenLiveReplay.exe"
-        self.app.write_bytes(b"app")
+        _write_manifest_pe_fixture(self.app)
 
         configured = root / "configured-elsewhere"
         self.compiler = configured / "toolchain" / "bin"
@@ -108,6 +110,18 @@ class RunWindowsAppTests(unittest.TestCase):
         self.assertEqual(env["QML_IMPORT_PATH"], str(self.qt / "qml"))
         self.assertNotIn("poisoned", "\n".join(env.values()))
 
+    def test_runtime_requires_embedded_manifest_for_selected_app(self) -> None:
+        with mock.patch.object(
+            self.launcher.runtime_guard, "reject_runtime_dll_shadowing"
+        ) as audit:
+            self.launcher.prepare_windows_app_runtime(
+                self.build,
+                self.app,
+                {"SystemRoot": str(Path(self.temporary.name) / "Windows")},
+            )
+
+        self.assertTrue(audit.call_args.kwargs["require_embedded_manifests"])
+
     def test_rejects_executable_outside_selected_build(self) -> None:
         outside = Path(self.temporary.name) / "outside" / "OpenLiveReplay.exe"
         outside.parent.mkdir()
@@ -144,7 +158,7 @@ class RunWindowsAppTests(unittest.TestCase):
         package = self.build / "package" / "bin"
         package.mkdir(parents=True)
         packaged_app = package / "OpenLiveReplay.exe"
-        packaged_app.write_bytes(b"packaged-app")
+        _write_manifest_pe_fixture(packaged_app)
         configured = self.qt / "bin" / "Qt6Core.dll"
         configured.write_bytes(b"configured-qt-6.10.3")
         deployed = package / "Qt6Core.dll"
@@ -223,6 +237,34 @@ class RunWindowsAppTests(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["enabled"])
         guard.__enter__.assert_called_once()
         guard.__exit__.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
+    def test_main_holds_audited_app_until_process_tree_returns(self) -> None:
+        replacement = self.build / "replacement.exe"
+        replacement.write_bytes(b"replacement")
+
+        def inspect_held_file(*_args, **_kwargs) -> int:
+            with self.assertRaises(OSError):
+                os.replace(replacement, self.app)
+            return 0
+
+        with mock.patch.object(
+            self.launcher, "run_process_tree", side_effect=inspect_held_file
+        ):
+            self.assertEqual(
+                self.launcher.main(
+                    [
+                        "--build-dir",
+                        str(self.build),
+                        "--executable",
+                        str(self.app),
+                    ]
+                ),
+                0,
+            )
+
+        os.replace(replacement, self.app)
+        self.assertEqual(self.app.read_bytes(), b"replacement")
 
 
 if __name__ == "__main__":

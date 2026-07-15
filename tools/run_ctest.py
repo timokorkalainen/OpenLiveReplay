@@ -17,6 +17,7 @@ if str(TOOLS_DIR) not in sys.path:
 try:
     from .windows_job import run_process_tree
     from .windows_runtime_guard import (
+        RuntimeAuditLease,
         RuntimeRoots,
         registered_test_executables,
         reject_runtime_dll_shadowing,
@@ -24,6 +25,7 @@ try:
 except ImportError:
     from windows_job import run_process_tree
     from windows_runtime_guard import (
+        RuntimeAuditLease,
         RuntimeRoots,
         registered_test_executables,
         reject_runtime_dll_shadowing,
@@ -84,7 +86,10 @@ def read_cmake_cache(path: Path) -> dict[str, str]:
 
 
 def prepare_windows_runtime(
-    build_dir: Path, inherited_env: Mapping[str, str]
+    build_dir: Path,
+    inherited_env: Mapping[str, str],
+    *,
+    audit_lease: RuntimeAuditLease | None = None,
 ) -> tuple[dict[str, str], Path]:
     """Create a child environment using runtime paths recorded by the build."""
     cache = read_cmake_cache(build_dir / "CMakeCache.txt")
@@ -149,7 +154,9 @@ def prepare_windows_runtime(
             srt_root / "bin",
             srt_root / "lib",
         ),
-        executables=registered_test_executables(build_dir),
+        executables=(*registered_test_executables(build_dir), ctest),
+        lease=audit_lease,
+        require_embedded_manifests=os.name == "nt",
     )
 
     env = dict(inherited_env)
@@ -184,13 +191,16 @@ def _restore_windows_error_mode(old_mode: int) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     build_dir = find_build_directory(args, Path.cwd())
-    env, ctest = prepare_windows_runtime(build_dir, os.environ)
-    command = [str(ctest), *args, "--interactive-debug-mode", "0"]
-    old_mode = _set_windows_error_mode()
-    try:
-        return run_process_tree(command, enabled=os.name == "nt", env=env)
-    finally:
-        _restore_windows_error_mode(old_mode)
+    with RuntimeAuditLease() as audit_lease:
+        env, ctest = prepare_windows_runtime(
+            build_dir, os.environ, audit_lease=audit_lease
+        )
+        command = [str(ctest), *args, "--interactive-debug-mode", "0"]
+        old_mode = _set_windows_error_mode()
+        try:
+            return run_process_tree(command, enabled=os.name == "nt", env=env)
+        finally:
+            _restore_windows_error_mode(old_mode)
 
 
 if __name__ == "__main__":

@@ -59,6 +59,8 @@ def prepare_windows_app_runtime(
     build_dir: Path,
     executable: Path,
     inherited_env: Mapping[str, str],
+    *,
+    audit_lease: runtime_guard.RuntimeAuditLease | None = None,
 ) -> dict[str, str]:
     """Return a cache-derived child environment with no ambient DLL search path."""
     build_dir = build_dir.resolve()
@@ -106,6 +108,8 @@ def prepare_windows_app_runtime(
             srt_root / "lib",
         ),
         executables=(executable,),
+        lease=audit_lease,
+        require_embedded_manifests=os.name == "nt",
     )
 
     system_root = Path(inherited_env.get("SystemRoot", "C:/Windows"))
@@ -131,18 +135,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(list(sys.argv[1:] if argv is None else argv))
     build_dir = args.build_dir.resolve()
     executable = args.executable.resolve()
-    env = prepare_windows_app_runtime(build_dir, executable, os.environ)
-    app_args = list(args.app_args)
-    if app_args[:1] == ["--"]:
-        app_args.pop(0)
-    command = [str(executable), *app_args]
-    with suppress_windows_error_dialogs(True):
-        return run_process_tree(
-            command,
-            enabled=os.name == "nt",
-            cwd=executable.parent,
-            env=env,
+    with runtime_guard.RuntimeAuditLease() as audit_lease:
+        env = prepare_windows_app_runtime(
+            build_dir, executable, os.environ, audit_lease=audit_lease
         )
+        app_args = list(args.app_args)
+        if app_args[:1] == ["--"]:
+            app_args.pop(0)
+        command = [str(executable), *app_args]
+        with suppress_windows_error_dialogs(True):
+            return run_process_tree(
+                command,
+                enabled=os.name == "nt",
+                cwd=executable.parent,
+                env=env,
+            )
 
 
 if __name__ == "__main__":

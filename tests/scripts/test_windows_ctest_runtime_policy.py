@@ -180,6 +180,68 @@ Run tests with `python tools/run_ctest.py --test-dir build`.
             failures,
         )
 
+    def test_top_level_readme_scopes_platform_and_negation_by_clause(self) -> None:
+        checker = self.policy.check_top_level_readme_windows_contract
+        mixed_platforms = """
+## Quick start
+
+On macOS/Linux, use Run from the status bar; on Windows, click Debug there.
+On Windows, start with **OpenLiveReplay: start controlled Windows app**.
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        mixed_negation = """
+## Windows
+
+Status-bar Run is unavailable; click Debug there instead.
+Start with **OpenLiveReplay: start controlled Windows app**.
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        for text in (mixed_platforms, mixed_negation):
+            with self.subTest(text=text):
+                failures = checker(text)
+                self.assertTrue(
+                    any("status-bar Run/Debug" in failure for failure in failures),
+                    failures,
+                )
+
+    def test_top_level_readme_allows_disabled_advice_with_affirmative_guidance(self) -> None:
+        checker = self.policy.check_top_level_readme_windows_contract
+        text = """
+## Windows
+
+Status-bar Run and Debug are unavailable on Windows.
+Start with **OpenLiveReplay: start controlled Windows app**.
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        self.assertEqual(checker(text), [])
+
+    def test_top_level_readme_rejects_negated_or_unavailable_launcher_mentions(self) -> None:
+        checker = self.policy.check_top_level_readme_windows_contract
+        text = """
+## Windows
+
+Do not use **OpenLiveReplay: start controlled Windows app** because it is unavailable.
+The command `python tools/run_ctest.py --test-dir build` is disabled.
+"""
+        failures = checker(text)
+        self.assertTrue(any("positive controlled app" in failure for failure in failures))
+        self.assertTrue(any("positive controlled CTest" in failure for failure in failures))
+
+    def test_top_level_readme_preserves_nested_windows_heading_inheritance(self) -> None:
+        checker = self.policy.check_top_level_readme_windows_contract
+        text = """
+## Windows
+
+### Application
+
+Start with **OpenLiveReplay: start controlled Windows app**.
+
+### Tests
+
+Run tests with `python tools/run_ctest.py --test-dir build`.
+"""
+        self.assertEqual(checker(text), [])
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.policy = load_module()
@@ -392,6 +454,25 @@ Run tests with `python tools/run_ctest.py --test-dir build`.
             ),
             [],
         )
+
+    def test_windows_executables_receive_central_embedded_manifest_resource(self) -> None:
+        root = MODULE_PATH.parents[2]
+        module = root / "cmake" / "OlrWindowsManifest.cmake"
+        resource = root / "cmake" / "olr_windows_application_manifest.rc"
+        manifest = root / "cmake" / "olr_windows_application.manifest"
+        self.assertTrue(module.is_file())
+        self.assertTrue(resource.is_file())
+        self.assertTrue(manifest.is_file())
+        module_text = module.read_text(encoding="utf-8")
+        self.assertIn("BUILDSYSTEM_TARGETS", module_text)
+        self.assertIn("SUBDIRECTORIES", module_text)
+        self.assertIn("target_sources", module_text)
+        self.assertRegex(resource.read_text(encoding="utf-8"), r"1\s+RT_MANIFEST")
+        manifest_text = manifest.read_text(encoding="utf-8")
+        self.assertIn('manifestVersion="1.0"', manifest_text)
+        self.assertIn('requestedExecutionLevel level="asInvoker"', manifest_text)
+        root_cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertIn("olr_embed_all_windows_executables", root_cmake)
 
 
 if __name__ == "__main__":
