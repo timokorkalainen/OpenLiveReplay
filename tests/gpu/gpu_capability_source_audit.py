@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import statistics
+import subprocess
 import time
 from typing import Iterable
 
@@ -59,6 +62,17 @@ REVIEWED_NATIVE_HANDLE_MEMBER_SINKS = {
         frozenset({"CopySubresourceRegion"}),
 }
 
+REVIEWED_NATIVE_HANDLE_TYPES = {
+    PurePosixPath("playback/gpu/applegpusurface_apple.mm"):
+        frozenset({"IOSurfaceRef"}),
+    PurePosixPath("recorder_engine/codec/nativevideoencoder_videotoolbox.mm"):
+        frozenset({"IOSurfaceRef"}),
+    PurePosixPath("recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"):
+        frozenset({"ID3D11Texture2D"}),
+    PurePosixPath("playback/output/win/wingpuimportedge.cpp"):
+        frozenset({"ID3D11Texture2D"}),
+}
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -82,6 +96,7 @@ TOKEN_PATTERN = re.compile(
     r"[A-Za-z_]\w*|\d+(?:\.\d+)?|::|->|&&|\|\||==|!=|<=|>=|\+\+|--|"
     r"<<|>>|\+=|-=|\*=|/=|%=|&=|\|=|\^=|\.\.\.|[^\s]"
 )
+RAW_LITERAL_PREFIX = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\(')
 
 
 def cpp_tokens(masked: str, start: int = 0, end: int | None = None) -> list[CppToken]:
@@ -100,11 +115,11 @@ def mask_non_code(source: str) -> str:
         current = source[index]
         following = source[index + 1] if index + 1 < len(source) else ""
         if state == "code":
-            raw = (re.match(r'(?:u8|u|U|L)?R"([^ ()\\\t\r\n]{0,16})\(', source[index:])
+            raw = (RAW_LITERAL_PREFIX.match(source, index)
                    if current in {"L", "R", "U", "u"} else None)
             if raw is not None:
                 terminator = ")" + raw.group(1) + '"'
-                closing = source.find(terminator, index + raw.end())
+                closing = source.find(terminator, raw.end())
                 literal_end = len(source) if closing < 0 else closing + len(terminator)
                 for literal_index in range(index, literal_end):
                     if source[literal_index] != "\n":
@@ -127,6 +142,13 @@ def mask_non_code(source: str) -> str:
                 index += 1
                 continue
         elif state == "line-comment":
+            if current == "\\" and following == "\n":
+                index += 2
+                continue
+            if (current == "\\" and following == "\r"
+                    and index + 2 < len(source) and source[index + 2] == "\n"):
+                index += 3
+                continue
             if current == "\n":
                 state = "code"
             else:
@@ -181,6 +203,104 @@ def normalize_alternative_tokens(masked: str) -> str:
             result[index + offset] = value[offset] if offset < len(value) else " "
         index += len(spelling)
     return "".join(result)
+
+
+@dataclass(frozen=True)
+class TranslationText:
+    original: str
+    text: str
+    masked: str
+    source_lines: tuple[int, ...]
+    splice_boundaries: tuple[int, ...]
+
+    def line_at(self, position: int) -> int:
+        if 0 <= position < len(self.source_lines):
+            return self.source_lines[position]
+        return self.source_lines[-1] if self.source_lines else 1
+
+
+def raw_literal_extents(source: str) -> list[tuple[int, int]]:
+    """Find raw literals from original spelling before phase-two splice removal."""
+    extents: list[tuple[int, int]] = []
+    state = "code"
+    quote = ""
+    index = 0
+    while index < len(source):
+        current = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            raw = (RAW_LITERAL_PREFIX.match(source, index)
+                   if current in {"L", "R", "U", "u"} else None)
+            if raw is not None:
+                terminator = ")" + raw.group(1) + '"'
+                closing = source.find(terminator, raw.end())
+                end = len(source) if closing < 0 else closing + len(terminator)
+                extents.append((index, end))
+                index = end
+                continue
+            if current == "/" and following == "/":
+                state = "line-comment"
+                index += 2
+                continue
+            if current == "/" and following == "*":
+                state = "block-comment"
+                index += 2
+                continue
+            if current in {'"', "'"}:
+                quote = current
+                state = "literal"
+        elif state == "line-comment":
+            if current == "\n":
+                state = "code"
+        elif state == "block-comment":
+            if current == "*" and following == "/":
+                state = "code"
+                index += 2
+                continue
+        elif current == "\\" and following:
+            index += 2
+            continue
+        elif current == quote:
+            state = "code"
+        index += 1
+    return extents
+
+
+def translate_source(source: str) -> TranslationText:
+    """Apply raw-aware phase-two splicing, then lexical masking and token normalization."""
+    raw_extents = raw_literal_extents(source)
+    raw_index = 0
+    normalized_chars: list[str] = []
+    source_lines: list[int] = []
+    splice_boundaries: list[int] = []
+    index = 0
+    current_line = 1
+    while index < len(source):
+        while raw_index < len(raw_extents) and index >= raw_extents[raw_index][1]:
+            raw_index += 1
+        inside_raw = (raw_index < len(raw_extents)
+                      and raw_extents[raw_index][0] <= index < raw_extents[raw_index][1])
+        if not inside_raw and source[index] == "\\" and index + 1 < len(source):
+            if source[index + 1] == "\n":
+                splice_boundaries.append(len(normalized_chars))
+                current_line += 1
+                index += 2
+                continue
+            if (source[index + 1] == "\r" and index + 2 < len(source)
+                    and source[index + 2] == "\n"):
+                splice_boundaries.append(len(normalized_chars))
+                current_line += 1
+                index += 3
+                continue
+        normalized_chars.append(source[index])
+        source_lines.append(current_line)
+        if source[index] == "\n":
+            current_line += 1
+        index += 1
+    text = "".join(normalized_chars)
+    masked = normalize_alternative_tokens(mask_non_code(text))
+    return TranslationText(
+        source, text, masked, tuple(source_lines), tuple(splice_boundaries))
 
 
 def brace_pairs(masked: str) -> list[tuple[int, int]]:
@@ -252,12 +372,14 @@ def declaration_block(masked: str, pairs: list[tuple[int, int]],
 MEMBER_CALL = re.compile(r"(?:\.|->|::)\s*(read|withRead|complete|nativeHandle)\s*\(")
 
 
-def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[Finding]:
+def preprocessor_capability_findings(path: PurePosixPath,
+                                     translated: TranslationText) -> list[Finding]:
     findings: list[Finding] = []
     unique_capability = re.compile(r"\b(?:GpuSyncReadScope|withRead|nativeHandle)\b")
     nonlocal_jump = re.compile(r"\b(?:_longjmp|longjmp|siglongjmp)\b")
     approved_consumers = REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
     approved_methods = REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())
+    approved_types = REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset())
 
     def pasted_guarded_identifier(text: str) -> bool:
         tokens = re.findall(r"[A-Za-z_]\w*|##|\S", text)
@@ -287,21 +409,27 @@ def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[F
         stripped = logical.lstrip()
         if not stripped.startswith("#"):
             return
+        macro_mutation = re.match(r"#\s*(?:define|undef)\b", stripped) is not None
         if "##" in stripped or "%:%:" in stripped:
             findings.append(Finding(
                 path, logical_start, "preprocessor token concatenation",
                 "token concatenation can reconstruct guarded GPU operations or non-local "
                 "control flow"))
-        if any(re.search(rf"\b{re.escape(name)}\b", stripped)
-               for name in approved_consumers):
+        if (macro_mutation and any(re.search(rf"\b{re.escape(name)}\b", stripped)
+                                   for name in approved_consumers)):
             findings.append(Finding(
                 path, logical_start, "approved native-handle consumer cannot be hidden or shadowed",
                 "approved native-handle consumers cannot be replaced by preprocessing"))
-        if any(re.search(rf"\b{re.escape(name)}\b", stripped)
-               for name in approved_methods):
+        if (macro_mutation and any(re.search(rf"\b{re.escape(name)}\b", stripped)
+                                   for name in approved_methods)):
             findings.append(Finding(
                 path, logical_start, "approved native-handle method cannot be hidden or shadowed",
                 "approved native-handle methods cannot be replaced by preprocessing"))
+        if (macro_mutation and any(re.search(rf"\b{re.escape(name)}\b", stripped)
+                                   for name in approved_types)):
+            findings.append(Finding(
+                path, logical_start, "approved native-handle type cannot be hidden or shadowed",
+                "approved native-handle types cannot be replaced by preprocessing"))
         if nonlocal_jump.search(stripped):
             findings.append(Finding(
                 path, logical_start, "non-local jump preprocessor alias",
@@ -311,67 +439,80 @@ def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[F
                 path, logical_start, "GPU capability preprocessor alias",
                 "nativeHandle alias and scope operations cannot be hidden by preprocessing"))
 
-    directive_source = mask_non_code(source)
-    logical = ""
-    logical_start = 1
-    for line, text in enumerate(directive_source.splitlines(keepends=True), 1):
-        if not logical:
-            logical_start = line
-        splice = re.search(r"\\\r?\n$", text)
-        logical += text[:splice.start()] if splice else text
-        if splice:
-            continue
-        audit_logical(logical, logical_start)
-        logical = ""
-    if logical:
-        audit_logical(logical, logical_start)
+    offset = 0
+    for text in translated.masked.splitlines(keepends=True):
+        audit_logical(text, translated.line_at(offset))
+        offset += len(text)
     return findings
 
 
-def guarded_macro_composition_findings(path: PurePosixPath, source: str,
-                                       masked: str) -> list[Finding]:
+def guarded_macro_composition_findings(path: PurePosixPath,
+                                       translated: TranslationText) -> list[Finding]:
     """Reject source-visible macro calls whose identifier pieces form guarded names."""
     guarded = {
         "GpuSyncReadScope", "_longjmp", "complete", "longjmp", "nativeHandle", "read",
         "siglongjmp", "withRead",
     }
-    tokens = cpp_tokens(masked)
+    guarded.update(REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset()))
+    guarded.update(REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset()))
+    guarded.update(REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()))
+    tokens = cpp_tokens(translated.masked)
     findings: list[Finding] = []
-    for index, token in enumerate(tokens[:-1]):
-        if (not re.fullmatch(r"[A-Za-z_]\w*", token.value)
-                or tokens[index + 1].value != "("):
-            continue
+
+    def call_arguments(opening: int, limit: int) -> tuple[list[tuple[int, int]], int] | None:
         depth = 1
-        arguments: list[list[str]] = [[]]
-        closing = None
-        for cursor in range(index + 2, len(tokens)):
+        arguments: list[tuple[int, int]] = []
+        argument_start = opening + 1
+        for cursor in range(opening + 1, limit):
             value = tokens[cursor].value
             if value == "(":
                 depth += 1
             elif value == ")":
                 depth -= 1
                 if depth == 0:
-                    closing = cursor
-                    break
-            if depth == 1 and value == ",":
-                arguments.append([])
-            elif depth >= 1:
-                arguments[-1].append(value)
-        if closing is None or len(arguments) < 2:
+                    arguments.append((argument_start, cursor))
+                    return arguments, cursor
+            elif depth == 1 and value == ",":
+                arguments.append((argument_start, cursor))
+                argument_start = cursor + 1
+        return None
+
+    def composed_value(start: int, end: int) -> str | None:
+        start, end = strip_transparent_parentheses(tokens, start, end)
+        if end - start == 1 and re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value):
+            return tokens[start].value
+        if (end - start < 5 or not re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value)
+                or tokens[start + 1].value != "("):
+            return None
+        parsed = call_arguments(start + 1, end)
+        if parsed is None or parsed[1] != end - 1 or len(parsed[0]) < 2:
+            return None
+        pieces = [composed_value(part_start, part_end)
+                  for part_start, part_end in parsed[0]]
+        if any(piece is None for piece in pieces):
+            return None
+        return "".join(piece for piece in pieces if piece is not None)
+
+    for index, token in enumerate(tokens[:-1]):
+        if (not re.fullmatch(r"[A-Za-z_]\w*", token.value)
+                or tokens[index + 1].value != "("):
             continue
-        if not all(len(argument) == 1
-                   and re.fullmatch(r"[A-Za-z_]\w*", argument[0])
-                   for argument in arguments):
+        parsed = call_arguments(index + 1, len(tokens))
+        if parsed is None or len(parsed[0]) < 2:
             continue
-        if "".join(argument[0] for argument in arguments) not in guarded:
+        pieces = [composed_value(start, end) for start, end in parsed[0]]
+        if any(piece is None for piece in pieces):
+            continue
+        if "".join(piece for piece in pieces if piece is not None) not in guarded:
             continue
         findings.append(Finding(
-            path, line_number(source, token.start), "guarded identifier macro composition",
+            path, translated.line_at(token.start), "guarded identifier macro composition",
             "macro arguments cannot be composed into guarded GPU or non-local control names"))
     return findings
 
 
-def phase_two_capability_findings(path: PurePosixPath, source: str) -> list[Finding]:
+def phase_two_capability_findings(path: PurePosixPath, source: str,
+                                  translated: TranslationText | None = None) -> list[Finding]:
     """Normalize splices once, then reject reconstructed guarded identifiers in O(n)."""
     if "\\\n" not in source and "\\\r\n" not in source:
         return []
@@ -379,62 +520,17 @@ def phase_two_capability_findings(path: PurePosixPath, source: str) -> list[Find
         "GpuSyncReadScope", "_longjmp", "complete", "longjmp", "nativeHandle", "read",
         "siglongjmp", "withRead",
     }
-    normalized_chars: list[str] = []
-    source_lines: list[int] = []
-    splice_boundaries: list[int] = []
-    index = 0
-    current_line = 1
-    while index < len(source):
-        if source[index] == "\\" and index + 1 < len(source):
-            if source[index + 1] == "\n":
-                splice_boundaries.append(len(normalized_chars))
-                current_line += 1
-                index += 2
-                continue
-            if (source[index + 1] == "\r" and index + 2 < len(source)
-                    and source[index + 2] == "\n"):
-                splice_boundaries.append(len(normalized_chars))
-                current_line += 1
-                index += 3
-                continue
-        normalized_chars.append(source[index])
-        source_lines.append(current_line)
-        if source[index] == "\n":
-            current_line += 1
-        index += 1
-
-    normalized = "".join(normalized_chars)
-    masked = normalize_alternative_tokens(mask_non_code(normalized))
+    translated = translate_source(source) if translated is None else translated
+    masked = translated.masked
+    splice_boundaries = translated.splice_boundaries
     pairs = brace_pairs(masked)
     scope_bindings = scope_bindings_linear(masked, pairs)
-
-    def result_receiver_name(call: re.Match[str]) -> str | None:
-        expression = receiver_expression(masked, call.start())
-        tokens = cpp_tokens(expression)
-        start, end = strip_transparent_parentheses(tokens, 0, len(tokens))
-        while start < end:
-            depth = 0
-            comma = None
-            for token_index in range(start, end):
-                value = tokens[token_index].value
-                if value == "(":
-                    depth += 1
-                elif value == ")":
-                    depth -= 1
-                elif depth == 0 and value == ",":
-                    comma = token_index
-            if comma is None:
-                break
-            start, end = strip_transparent_parentheses(tokens, comma + 1, end)
-        if end - start != 1 or not re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value):
-            return None
-        return tokens[start].value
 
     calls_by_receiver: dict[str, list[re.Match[str]]] = {}
     for call in MEMBER_CALL.finditer(masked):
         if call.group(1) not in {"read", "complete"}:
             continue
-        receiver = result_receiver_name(call)
+        receiver = receiver_binding_name(masked, call.start())
         if receiver is not None:
             calls_by_receiver.setdefault(receiver, []).append(call)
 
@@ -493,7 +589,7 @@ def phase_two_capability_findings(path: PurePosixPath, source: str) -> list[Find
         if (token.value in {"read", "complete"}
                 and token.start not in reconstructed_scope_operations):
             continue
-        source_line = source_lines[token.start] if token.start < len(source_lines) else current_line
+        source_line = translated.line_at(token.start)
         findings.append(Finding(
             path, source_line, "phase-two line splice",
             "phase-two line splice reconstructs a guarded GPU capability token"))
@@ -561,9 +657,30 @@ def strip_transparent_parentheses(tokens: list[CppToken], start: int,
     return start, end
 
 
+def lexical_declaration_active(masked: str, pairs: list[tuple[int, int]],
+                               declaration_position: int, use_position: int) -> bool:
+    lexical_block = enclosing_block(pairs, declaration_position)
+    parens = delimiter_pairs(masked, "(", ")")
+    next_nonspace = next_nonspace_indices(masked)
+    opening_blocks = {opening: (opening, closing) for opening, closing in pairs}
+    containing_parens = sorted(
+        (pair for pair in parens if pair[0] < declaration_position < pair[1]),
+        key=lambda pair: pair[1] - pair[0])
+    for _opening, closing in containing_parens:
+        body_start = next_nonspace[min(closing + 1, len(masked))]
+        if body_start in opening_blocks:
+            lexical_block = opening_blocks[body_start]
+            break
+    if lexical_block is None:
+        return declaration_position < use_position
+    return lexical_block[0] < use_position < lexical_block[1]
+
+
 def approved_call_is_unshadowed(tokens: list[CppToken], name_index: int,
                                 allowed_member_calls: frozenset[str],
-                                identity_tokens: list[CppToken] | None = None) -> bool:
+                                identity_tokens: list[CppToken] | None = None,
+                                masked: str | None = None,
+                                pairs: list[tuple[int, int]] | None = None) -> bool:
     name_token = tokens[name_index]
     name = name_token.value
     context = tokens if identity_tokens is None else identity_tokens
@@ -575,15 +692,24 @@ def approved_call_is_unshadowed(tokens: list[CppToken], name_index: int,
         return False
     if context_index and context[context_index - 1].value in {".", "->"}:
         return name in allowed_member_calls
+
+    def active(position: int) -> bool:
+        if masked is None or pairs is None:
+            return True
+        return lexical_declaration_active(
+            masked, pairs, position, name_token.start)
+
     for index, token in enumerate(context[:context_index]):
-        if token.value == name and token_is_declarator_name(context, index):
+        if (token.value == name and token_is_declarator_name(context, index)
+                and active(token.start)):
             return False
         if token.value != name:
             continue
         boundary = index - 1
         while boundary >= 0 and context[boundary].value not in {";", "{", "}"}:
             boundary -= 1
-        if "using" in [item.value for item in context[boundary + 1:index + 1]]:
+        if ("using" in [item.value for item in context[boundary + 1:index + 1]]
+                and active(token.start)):
             return False
     return True
 
@@ -591,13 +717,15 @@ def approved_call_is_unshadowed(tokens: list[CppToken], name_index: int,
 def is_direct_call_argument(tokens: list[CppToken], use_start: int, use_end: int,
                             allowed_calls: frozenset[str],
                             allowed_member_calls: frozenset[str] = frozenset(),
-                            identity_tokens: list[CppToken] | None = None) -> bool:
+                            identity_tokens: list[CppToken] | None = None,
+                            masked: str | None = None,
+                            pairs: list[tuple[int, int]] | None = None) -> bool:
     call = enclosing_call(tokens, use_start)
     if call is None or call[0] not in allowed_calls:
         return False
     _, opening, closing = call
     if not approved_call_is_unshadowed(
-            tokens, opening - 1, allowed_member_calls, identity_tokens):
+            tokens, opening - 1, allowed_member_calls, identity_tokens, masked, pairs):
         return False
     argument_start = opening + 1
     paren_depth = bracket_depth = brace_depth = 0
@@ -737,7 +865,8 @@ def stays_in_synchronous_blocks(masked: str, pairs: list[tuple[int, int]],
     )
 
 
-def type_name_is_source_shadowed(masked: str, type_name: str, position: int) -> bool:
+def type_name_is_source_shadowed(masked: str, pairs: list[tuple[int, int]],
+                                 type_name: str, position: int) -> bool:
     prior_tokens = cpp_tokens(masked, 0, position)
     for index, token in enumerate(prior_tokens):
         if token.value != type_name:
@@ -749,7 +878,8 @@ def type_name_is_source_shadowed(masked: str, type_name: str, position: int) -> 
         if ("using" in statement or "typedef" in statement
                 or any(value in {"class", "enum", "struct", "union"}
                        for value in statement)):
-            return True
+            if lexical_declaration_active(masked, pairs, token.start, position):
+                return True
     return False
 
 
@@ -781,7 +911,8 @@ def local_native_alias(path: PurePosixPath, masked: str, pairs: list[tuple[int, 
     if declaration not in (["void", "*"], ["auto", "*"], ["IOSurfaceRef"]):
         return None
     if (declaration == ["IOSurfaceRef"]
-            and type_name_is_source_shadowed(masked, "IOSurfaceRef", alias.start)):
+            and type_name_is_source_shadowed(
+                masked, pairs, "IOSurfaceRef", alias.start)):
         return None
 
     rhs = values[equals_index + 1:]
@@ -816,7 +947,7 @@ def local_native_alias(path: PurePosixPath, masked: str, pairs: list[tuple[int, 
             expected_cast = ["ID3D11Texture2D", "*"]
         approved_cast = cast_type == expected_cast
         if (approved_cast and cast_type and type_name_is_source_shadowed(
-                masked, cast_type[0], alias.start)):
+                masked, pairs, cast_type[0], alias.start)):
             approved_cast = False
     if not direct and not approved_cast:
         return None
@@ -824,7 +955,8 @@ def local_native_alias(path: PurePosixPath, masked: str, pairs: list[tuple[int, 
 
 
 def native_handle_has_direct_consumer(path: PurePosixPath, masked: str,
-                                      call: re.Match[str], binding: HandleBinding) -> bool:
+                                      pairs: list[tuple[int, int]], call: re.Match[str],
+                                      binding: HandleBinding) -> bool:
     safe_calls = REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
     safe_member_calls = REVIEWED_NATIVE_HANDLE_MEMBER_SINKS.get(path, frozenset())
     if not safe_calls:
@@ -840,7 +972,7 @@ def native_handle_has_direct_consumer(path: PurePosixPath, masked: str,
         return False
     return is_direct_call_argument(
         tokens, native_index - 2, native_index + 3, safe_calls, safe_member_calls,
-        identity_tokens)
+        identity_tokens, masked, pairs)
 
 
 def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
@@ -875,7 +1007,7 @@ def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
             return False, last_use
         if is_direct_call_argument(
                 tokens, index, index + 1, safe_calls, safe_member_calls,
-                identity_tokens):
+                identity_tokens, masked, pairs):
             consumed = True
             continue
         condition = enclosing_call(tokens, index)
@@ -901,26 +1033,48 @@ class ScopeBinding:
 
 def blocks_for_positions(masked: str, pairs: list[tuple[int, int]],
                          positions: list[int]) -> dict[int, tuple[int, int] | None]:
-    """Assign positions to their innermost lexical blocks in one source pass."""
+    """Assign positions to their innermost paired interval in one source pass."""
     if not positions:
         return {}
     opening_pairs = {opening: (opening, closing) for opening, closing in pairs}
+    closing_pairs = {closing: (opening, closing) for opening, closing in pairs}
     ordered = sorted(set(positions))
     assigned: dict[int, tuple[int, int] | None] = {}
     stack: list[tuple[int, int]] = []
     position_index = 0
-    for index, char in enumerate(masked):
+    for index in range(len(masked)):
         while position_index < len(ordered) and ordered[position_index] == index:
             assigned[index] = stack[-1] if stack else None
             position_index += 1
-        if char == "{" and index in opening_pairs:
+        if index in opening_pairs:
             stack.append(opening_pairs[index])
-        elif char == "}" and stack and stack[-1][1] == index:
+        elif index in closing_pairs and stack and stack[-1][1] == index:
             stack.pop()
     while position_index < len(ordered):
         assigned[ordered[position_index]] = stack[-1] if stack else None
         position_index += 1
     return assigned
+
+
+def delimiter_pairs(masked: str, opening: str, closing: str) -> list[tuple[int, int]]:
+    stack: list[int] = []
+    pairs: list[tuple[int, int]] = []
+    for index, char in enumerate(masked):
+        if char == opening:
+            stack.append(index)
+        elif char == closing and stack:
+            pairs.append((stack.pop(), index))
+    return pairs
+
+
+def next_nonspace_indices(masked: str) -> list[int]:
+    following = len(masked)
+    result = [following] * (len(masked) + 1)
+    for index in range(len(masked) - 1, -1, -1):
+        if not masked[index].isspace():
+            following = index
+        result[index] = following
+    return result
 
 
 def scope_bindings_linear(masked: str,
@@ -929,16 +1083,20 @@ def scope_bindings_linear(masked: str,
     assigned = blocks_for_positions(
         masked, pairs, [declaration.position for declaration in declarations])
     opening_pairs = {opening: (opening, closing) for opening, closing in pairs}
+    paren_pairs = delimiter_pairs(masked, "(", ")")
+    declaration_parens = blocks_for_positions(
+        masked, paren_pairs, [declaration.position for declaration in declarations])
+    next_nonspace = next_nonspace_indices(masked)
     bindings: list[ScopeBinding] = []
     for declaration in declarations:
         lexical_block = assigned.get(declaration.position)
-        following = masked[declaration.end:].lstrip()
-        if following.startswith((")", ",")):
-            signature_end = masked.find(")", declaration.end)
-            body_start = masked.find("{", signature_end + 1) if signature_end >= 0 else -1
-            declaration_end = masked.find(";", signature_end + 1) if signature_end >= 0 else -1
-            if (body_start >= 0 and (declaration_end < 0 or body_start < declaration_end)
-                    and body_start in opening_pairs):
+        following_index = next_nonspace[min(declaration.end, len(masked))]
+        following = masked[following_index] if following_index < len(masked) else ""
+        parameter_paren = declaration_parens.get(declaration.position)
+        if following in {")", ","} and parameter_paren is not None:
+            signature_end = parameter_paren[1]
+            body_start = next_nonspace[min(signature_end + 1, len(masked))]
+            if body_start in opening_pairs:
                 lexical_block = opening_pairs[body_start]
         if lexical_block is not None:
             bindings.append(ScopeBinding(declaration, lexical_block))
@@ -961,7 +1119,10 @@ def receiver_expression(masked: str, call_position: int) -> str:
         index -= 1
     end = index + 1
     closing_to_opening = {")": "(", "]": "[", "}": "{"}
-    expression_chars = frozenset("._:->*&")
+    # Include angle brackets so named casts and template-id receivers remain a
+    # single expression. Parenthesized argument lists are consumed as balanced
+    # units, so this does not absorb an earlier relational expression.
+    expression_chars = frozenset("._:<->*&")
     consumed = False
     braced_initializer = False
     while index >= 0:
@@ -994,6 +1155,55 @@ def receiver_expression(masked: str, call_position: int) -> str:
                 continue
         break
     return masked[index + 1:end]
+
+
+def receiver_binding_name(masked: str, call_position: int) -> str | None:
+    """Resolve the object binding selected by a member-call receiver.
+
+    The resolver deliberately models only value-preserving receiver forms used
+    by the capability audit: redundant parentheses, the comma operator's final
+    operand, pointer/reference dereference, named casts, and ``std::as_const``.
+    Unknown calls and operators remain unresolved rather than being guessed
+    from identifiers appearing anywhere in the expression.
+    """
+    tokens = cpp_tokens(receiver_expression(masked, call_position))
+
+    def resolve(start: int, end: int) -> str | None:
+        start, end = strip_transparent_parentheses(tokens, start, end)
+        depth = 0
+        comma = None
+        for token_index in range(start, end):
+            value = tokens[token_index].value
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                depth -= 1
+            elif depth == 0 and value == ",":
+                comma = token_index
+        if comma is not None:
+            return resolve(comma + 1, end)
+        if (end - start == 2 and tokens[start].value in {"*", "&"}
+                and re.fullmatch(r"[A-Za-z_]\w*", tokens[start + 1].value)):
+            return tokens[start + 1].value
+        if (end - start >= 7 and tokens[start].value in {
+                "const_cast", "dynamic_cast", "reinterpret_cast", "static_cast"}
+                and tokens[start + 1].value == "<"):
+            angle_close = next((index for index in range(start + 2, end)
+                                if tokens[index].value == ">"), None)
+            if (angle_close is not None and angle_close + 1 < end
+                    and tokens[angle_close + 1].value == "("):
+                return resolve(angle_close + 1, end)
+        opening = next((index for index in range(start, end)
+                        if tokens[index].value == "("), None)
+        if (opening is not None and tokens[end - 1].value == ")"
+                and tokens[opening - 1].value == "as_const"):
+            return resolve(opening + 1, end - 1)
+        if (end - start == 1
+                and re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value)):
+            return tokens[start].value
+        return None
+
+    return resolve(0, len(tokens))
 
 
 def matching_delimiter(masked: str, opening: int, opener: str, closer: str) -> int | None:
@@ -1277,9 +1487,21 @@ def token_is_declarator_name(tokens: list[CppToken], index: int) -> bool:
     if index == 0 or index + 1 >= len(tokens):
         return False
     following = tokens[index + 1].value
-    if following not in {";", "=", "(", ")", "{", "[", ",", ":"}:
+    if following not in {";", "=", "(", ")", "{", "[", "]", ",", ":"}:
         return False
     previous = tokens[index - 1].value
+    redundant_parentheses = (
+        previous == "(" and following == ")" and index >= 2
+        and re.fullmatch(r"[A-Za-z_]\w*", tokens[index - 2].value) is not None
+        and (index + 2 >= len(tokens)
+             or tokens[index + 2].value in {";", "=", ",", ")", "{"})
+    )
+    structured_binding = (
+        previous in {"[", ","} and following in {"]", ","}
+        and any(token.value == "auto" for token in tokens[max(0, index - 8):index])
+    )
+    if redundant_parentheses or structured_binding:
+        return True
     if previous in {".", "->", "::", "(", "[", "=", ",", "?", ":"}:
         return False
     if following == ")" and previous in {"*", "&", "&&"}:
@@ -1351,8 +1573,14 @@ def name_is_shadowed(name: str, declaration_start: int, declaration_end: int,
                      masked: str, pairs: list[tuple[int, int]], call_position: int) -> bool:
     if lambda_init_capture_shadows(masked, pairs, name, call_position):
         return True
-    tokens = cpp_tokens(masked, declaration_start, call_position)
+    # Keep tokens following the candidate name available to the declarator
+    # classifier.  Truncating at the call's member operator turns an expression
+    # such as ``std::as_const(scope).read()`` into the declaration-shaped tail
+    # ``as_const(scope)``.
+    tokens = cpp_tokens(masked, declaration_start)
     for index, token in enumerate(tokens):
+        if token.start >= call_position:
+            break
         if token.value != name or declaration_start <= token.start <= declaration_end:
             continue
         if not token_is_declarator_name(tokens, index):
@@ -1396,11 +1624,12 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
 
 
 def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
-    masked = normalize_alternative_tokens(mask_non_code(source))
+    translated = translate_source(source)
+    masked = translated.masked
     pairs = brace_pairs(masked)
-    findings = preprocessor_capability_findings(path, source)
-    findings.extend(guarded_macro_composition_findings(path, source, masked))
-    findings.extend(phase_two_capability_findings(path, source))
+    findings = preprocessor_capability_findings(path, translated)
+    findings.extend(guarded_macro_composition_findings(path, translated))
+    findings.extend(phase_two_capability_findings(path, source, translated))
     calls = list(MEMBER_CALL.finditer(masked))
     scope_bindings = scope_bindings_linear(masked, pairs)
     bound_scope_positions = {
@@ -1409,7 +1638,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
     for declaration in scope_declarations(masked):
         if declaration.position not in bound_scope_positions:
             findings.append(
-                Finding(path, line_number(source, declaration.position), "GpuSyncReadScope",
+                Finding(path, translated.line_at(declaration.position), "GpuSyncReadScope",
                         "scope declaration is not inside a lexical block")
             )
 
@@ -1424,11 +1653,11 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         scope = resolve_scope(scope_bindings, masked, pairs, call)
         if scope is None:
             if call.group(1) == "read":
-                receiver = receiver_expression(masked, call.start())
+                receiver_name = receiver_binding_name(masked, call.start())
                 referenced = next((
                     binding for binding in scope_bindings
                     if binding.declaration.position < call.start() < binding.block[1]
-                    and re.search(rf"\b{re.escape(binding.declaration.name)}\b", receiver)
+                    and receiver_name == binding.declaration.name
                     and not name_is_shadowed(binding.declaration.name,
                                              binding.declaration.position,
                                              binding.declaration.end, masked, pairs,
@@ -1438,13 +1667,13 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
                     claimed_reads.add(call.start())
                     if path not in SYNC_READ_ALLOWLIST:
                         findings.append(
-                            Finding(path, line_number(source, call.start()),
+                            Finding(path, translated.line_at(call.start()),
                                     "GpuSyncReadScope::read()",
                                     "public read() is not in the reviewed synchronous-adapter "
                                     "allowlist")
                         )
                     findings.append(
-                        Finding(path, line_number(source, call.start()),
+                        Finding(path, translated.line_at(call.start()),
                                 f"{referenced.declaration.name}.read()",
                                 "read() requires an exact local scope/lease and standalone "
                                 "complete() in the same lexical body")
@@ -1455,7 +1684,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             claimed_reads.add(call.start())
             if path not in SYNC_READ_ALLOWLIST:
                 findings.append(
-                    Finding(path, line_number(source, call.start()),
+                    Finding(path, translated.line_at(call.start()),
                             "GpuSyncReadScope::read()",
                             "public read() is not in the reviewed synchronous-adapter allowlist")
                 )
@@ -1465,7 +1694,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
                          and call_block == scope.block and lease is not None)
             if not canonical:
                 findings.append(
-                    Finding(path, line_number(source, call.start()),
+                    Finding(path, translated.line_at(call.start()),
                             f"{scope.declaration.name}.read()",
                             "read() requires an exact local scope/lease and standalone "
                             "complete() in the same lexical body")
@@ -1483,7 +1712,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
                 callback_block = withread_callback_block(masked, pairs, call)
                 if callback_block is None:
                     findings.append(Finding(
-                        path, line_number(source, call.start()), "GpuSyncReadScope::withRead()",
+                        path, translated.line_at(call.start()), "GpuSyncReadScope::withRead()",
                         "withRead() requires an inline callback body so completion cannot be "
                         "bypassed by hidden control flow"))
                 else:
@@ -1494,7 +1723,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
                     ), None)
                     if nonlocal_jump is not None:
                         findings.append(Finding(
-                            path, line_number(source, nonlocal_jump.start), nonlocal_jump.value,
+                            path, translated.line_at(nonlocal_jump.start), nonlocal_jump.value,
                             "non-local jump cannot bypass withRead() completion"))
         else:
             if canonical_scope_declaration(masked, pairs, scope):
@@ -1510,11 +1739,11 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             continue
         if path not in SYNC_READ_ALLOWLIST:
             findings.append(
-                Finding(path, line_number(source, call.start()), "GpuSyncReadScope::read()",
+                Finding(path, translated.line_at(call.start()), "GpuSyncReadScope::read()",
                         "public read() is not in the reviewed synchronous-adapter allowlist")
             )
         findings.append(
-            Finding(path, line_number(source, call.start()), "read()",
+            Finding(path, translated.line_at(call.start()), "read()",
                     "a temporary read scope cannot call complete() after read/use")
         )
 
@@ -1530,7 +1759,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
     for binding in handle_bindings:
         if not lease_binding_stays_local(masked, pairs, binding):
             findings.append(Finding(
-                path, line_number(source, binding.position), binding.name,
+                path, translated.line_at(binding.position), binding.name,
                 "lease reference must remain inside the immediate callback body"))
 
     all_tokens = cpp_tokens(masked)
@@ -1539,10 +1768,10 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         if token.value != "nativeHandle" or token.start in native_call_names:
             continue
         if native_handle_declaration_or_internal_call(
-                path, source, masked, token, all_tokens, index):
+                path, translated.text, masked, token, all_tokens, index):
             continue
         findings.append(Finding(
-            path, line_number(source, token.start), "nativeHandle reference",
+            path, translated.line_at(token.start), "nativeHandle reference",
             "nativeHandle reference cannot be aliased, passed through preprocessing, or invoked "
             "through a pointer-to-member"))
 
@@ -1550,7 +1779,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         if len(acquisitions) != 1:
             first = min(acquisitions, key=lambda call: call.start())
             findings.append(Finding(
-                path, line_number(source, first.start()), "GpuSyncReadScope acquisition",
+                path, translated.line_at(first.start()), "GpuSyncReadScope acquisition",
                 "a synchronous read scope permits exactly one acquisition total: read() or "
                 "withRead()"))
             continue
@@ -1558,11 +1787,11 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         completions = completes_by_scope.get(scope_key, [])
         if any(call.start() < acquisition.start() for call in completions):
             findings.append(Finding(
-                path, line_number(source, acquisition.start()), "GpuSyncReadScope::complete()",
+                path, translated.line_at(acquisition.start()), "GpuSyncReadScope::complete()",
                 "complete() cannot precede acquisition; complete() after read/use is required"))
         if acquisition.group(1) == "withRead" and completions:
             findings.append(Finding(
-                path, line_number(source, completions[0].start()), "GpuSyncReadScope::complete()",
+                path, translated.line_at(completions[0].start()), "GpuSyncReadScope::complete()",
                 "withRead() owns completion; explicit complete() is forbidden"))
 
     valid_read_scopes: set[int] = set()
@@ -1570,7 +1799,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         if len(reads) != 1:
             first_read = min(reads, key=lambda call: call.start())
             findings.append(
-                Finding(path, line_number(source, first_read.start()), "GpuSyncReadScope::read()",
+                Finding(path, translated.line_at(first_read.start()), "GpuSyncReadScope::read()",
                         "the conservative direct-read form permits exactly one read()")
             )
             continue
@@ -1592,7 +1821,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         earlier = [call for call in all_completions if call.start() < required_position]
         if earlier:
             findings.append(Finding(
-                path, line_number(source, earlier[0].start()), "GpuSyncReadScope::complete()",
+                path, translated.line_at(earlier[0].start()), "GpuSyncReadScope::complete()",
                 "native handle access cannot follow complete(); complete() after read/use is "
                 "required"))
             continue
@@ -1605,7 +1834,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             continue
         first_read = min(reads, key=lambda call: call.start())
         findings.append(
-            Finding(path, line_number(source, first_read.start()),
+            Finding(path, translated.line_at(first_read.start()),
                     f"{scope.declaration.name}.read()",
                     "the lexical scope must call complete() after read/use or use withRead()")
         )
@@ -1622,7 +1851,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         )
         if not authorized:
             findings.append(
-                Finding(path, line_number(source, handle_read.start()),
+                Finding(path, translated.line_at(handle_read.start()),
                         "GpuSurface::nativeHandle()",
                         "native handle access must use the lease returned by its specific "
                         "read scope or withRead callback")
@@ -1630,10 +1859,11 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             continue
         alias = local_native_alias(path, masked, pairs, handle_read)
         if alias is None:
-            if native_handle_has_direct_consumer(path, masked, handle_read, binding):
+            if native_handle_has_direct_consumer(
+                    path, masked, pairs, handle_read, binding):
                 continue
             findings.append(Finding(
-                path, line_number(source, handle_read.start()), "GpuReadLease::nativeHandle()",
+                path, translated.line_at(handle_read.start()), "GpuReadLease::nativeHandle()",
                 "native handle value must initialize a callback-local alias"))
             continue
         synchronous, last_use = native_alias_stays_synchronous(
@@ -1649,7 +1879,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             synchronous = len(completion_positions) == 1 and last_use < completion_positions[0]
         if not synchronous:
             findings.append(Finding(
-                path, line_number(source, handle_read.start()), alias[0],
+                path, translated.line_at(handle_read.start()), alias[0],
                 "native handle value must remain inside its synchronous consumption"))
     return findings
 
@@ -1685,12 +1915,17 @@ def audit_public_member(path: PurePosixPath, source: str, class_name: str,
     return findings
 
 
-def audit_sources(sources: dict[PurePosixPath, str]) -> list[Finding]:
+def audit_sources(sources: dict[PurePosixPath, str],
+                  compiler_macros: dict[PurePosixPath, frozenset[str]] | None = None) \
+        -> list[Finding]:
     findings: list[Finding] = []
     for path, source in sources.items():
         if not is_production_path(path):
             continue
         findings.extend(audit_capability_uses(path, source))
+        if compiler_macros is not None:
+            findings.extend(compiler_macro_findings(
+                path, source, compiler_macros.get(path, frozenset())))
     if REGISTRY_HEADER in sources:
         findings.extend(audit_public_member(REGISTRY_HEADER, sources[REGISTRY_HEADER],
                                             "GpuRetireRegistry", r"\bregisterRetire\s*\(",
@@ -1700,6 +1935,73 @@ def audit_sources(sources: dict[PurePosixPath, str]) -> list[Finding]:
                                             "GpuOpScope", r"\btrack\s*\(",
                                             "GpuOpScope::track()"))
     return findings
+
+
+def compiler_macro_findings(path: PurePosixPath, source: str,
+                            macro_names: frozenset[str]) -> list[Finding]:
+    reviewed: dict[str, str] = {}
+    reviewed.update({name: "approved native-handle consumer"
+                     for name in REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())})
+    reviewed.update({name: "approved native-handle method"
+                     for name in REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())})
+    reviewed.update({name: "approved native-handle type"
+                     for name in REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset())})
+    findings: list[Finding] = []
+    for name, expression in reviewed.items():
+        if name not in macro_names or not re.search(rf"\b{re.escape(name)}\b", source):
+            continue
+        findings.append(Finding(
+            path, line_number(source, re.search(rf"\b{re.escape(name)}\b", source).start()),
+            f"{expression} cannot be hidden or shadowed",
+            "the production compiler reports the reviewed spelling as a macro"))
+    return findings
+
+
+def load_compiler_macro_tables(root: Path, compile_commands: Path | None,
+                               sources: dict[PurePosixPath, str]) \
+        -> dict[PurePosixPath, frozenset[str]]:
+    if compile_commands is None or not compile_commands.is_file():
+        return {}
+    entries = json.loads(compile_commands.read_text(encoding="utf-8"))
+    source_by_absolute = {
+        str((root / path).resolve()).replace("\\", "/").lower(): path
+        for path in sources
+    }
+    tables: dict[PurePosixPath, frozenset[str]] = {}
+    for entry in entries:
+        absolute = str(Path(entry["file"]).resolve()).replace("\\", "/").lower()
+        path = source_by_absolute.get(absolute)
+        if path is None:
+            continue
+        reviewed_names = set(REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()))
+        reviewed_names.update(REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset()))
+        reviewed_names.update(REVIEWED_NATIVE_HANDLE_TYPES.get(path, frozenset()))
+        if not reviewed_names.intersection(re.findall(r"[A-Za-z_]\w*", sources[path])):
+            continue
+        arguments = list(entry.get("arguments") or shlex.split(entry["command"], posix=False))
+        filtered: list[str] = []
+        index = 0
+        while index < len(arguments):
+            value = arguments[index].strip('"')
+            if value in {"-c", "-MD", "-MMD"}:
+                index += 1
+                continue
+            if value in {"-o", "-MF", "-MT", "-MQ"}:
+                index += 2
+                continue
+            filtered.append(value)
+            index += 1
+        command = [filtered[0], "-dM", "-E", *filtered[1:]]
+        completed = subprocess.run(
+            command, cwd=entry["directory"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=20, check=False)
+        if completed.returncode != 0:
+            continue
+        names = frozenset(
+            match.group(1) for match in re.finditer(
+                r"^\s*#\s*define\s+([A-Za-z_]\w*)", completed.stdout, re.MULTILINE))
+        tables[path] = names
+    return tables
 
 
 def is_production_path(path: PurePosixPath) -> bool:
@@ -2351,6 +2653,68 @@ def mutation_self_tests() -> None:
          "static_cast<ID3D11Texture2D*>(lease.nativeHandle()); if (texture) "
          "texture->GetDevice(&device); }); }",
          "approved native-handle method cannot be hidden or shadowed"),
+        (PurePosixPath("playback/output/win/wingpuimportedge.cpp"),
+         "/* comment *" + chr(92) + "\n/ #define GetDevice(out) persist(texture)\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { auto* texture = "
+         "static_cast<ID3D11Texture2D*>(lease.nativeHandle()); if (texture) "
+         "texture->GetDevice(&device); }); }",
+         "approved native-handle method cannot be hidden or shadowed"),
+        (PurePosixPath("playback/output/win/wingpuimportedge.cpp"),
+         "/* comment *" + chr(92) + "\r\n/ #define ID3D11Texture2D HandleSink\r\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { auto* texture = "
+         "static_cast<ID3D11Texture2D*>(lease.nativeHandle()); if (texture) "
+         "texture->GetDevice(&device); }); }",
+         "approved native-handle type cannot be hidden or shadowed"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "#include <vendor_cat.h>\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
+         "lease.CAT(native, CAT(Han, dle))(); "
+         "(void) isCompatibleWithNativeHandle(handle); }); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "#include <vendor_cat.h>\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
+         "lease.CAT(nat" + chr(92) + "\nive, Handle)(); "
+         "(void) isCompatibleWithNativeHandle(handle); }); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "#include <vendor_cat.h>\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); "
+         "CAT(lo" + chr(92) + "\nng, jmp)(env, 1); }); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/output/win/wingpuimportedge.cpp"),
+         "#define ID3D11Texture2D HandleSink\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { auto* texture = "
+         "static_cast<ID3D11Texture2D*>(lease.nativeHandle()); if (texture) "
+         "texture->GetDevice(&device); }); }",
+         "approved native-handle type cannot be hidden or shadowed"),
+        (PurePosixPath("playback/output/win/wingpuimportedge.cpp"),
+         "#include <vendor_cat.h>\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { auto* texture = "
+         "static_cast<CAT(ID3D11, Texture2D)*>(lease.nativeHandle()); if (texture) "
+         "texture->GetDevice(&device); }); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/gpu/applegpusurface_apple.mm"),
+         "#define IOSurfaceRef HandleSink\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { IOSurfaceRef ioSurface = "
+         "static_cast<IOSurfaceRef>(lease.nativeHandle()); "
+         "IOSurfaceGetWidth(ioSurface); }); }",
+         "approved native-handle type cannot be hidden or shadowed"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "template<typename Consumer> void bad(const std::shared_ptr<GpuSurface>& s, "
+         "Consumer (isCompatibleWithNativeHandle)) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [&](const GpuReadLease& lease) { void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must remain inside its synchronous consumption"),
         (PurePosixPath("playback/bad.cpp"),
          "void bad(const GpuReadLease& lease) { (void) lease.nat" + chr(92) +
          "\nive" + chr(92) + "\nHandle(); }",
@@ -2376,6 +2740,21 @@ def mutation_self_tests() -> None:
          chr(92) + "\nad(s); (void) lease.nativeHandle(); scope.complete(); }",
          "phase-two line splice"),
         (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(GpuSyncReadScope* scope, const std::shared_ptr<GpuSurface>& s) { "
+         "const GpuReadLease lease = (*scope).re" + chr(92) +
+         "\nad(s); (void) lease.nativeHandle(); scope->complete(); }",
+         "phase-two line splice"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+         "const GpuReadLease lease = static_cast<GpuSyncReadScope&>(scope).re" +
+         chr(92) + "\nad(s); (void) lease.nativeHandle(); scope.complete(); }",
+         "phase-two line splice"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "template<typename Fn> void bad(GpuSyncReadScope& scope, Fn fn = "
+         "[](int value) { return value; }) { const GpuReadLease lease = scope.re" +
+         chr(92) + "\nad(surface); (void) lease.nativeHandle(); scope.complete(); }",
+         "phase-two line splice"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
          "void jumps(const GpuReadLease&) { longjmp(env, 1); } "
          "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
          "scope.withRead(s, jumps); }",
@@ -2386,6 +2765,16 @@ def mutation_self_tests() -> None:
         if expected not in rendered:
             raise AssertionError(
                 f"source-audit mutation survived ({expected}):\nsource: {source}\n{rendered}")
+
+    compiler_spoof_path = PurePosixPath("playback/output/win/wingpuimportedge.cpp")
+    compiler_spoof_source = (
+        "auto* texture = static_cast<ID3D11Texture2D*>(lease.nativeHandle());")
+    compiler_spoof = compiler_macro_findings(
+        compiler_spoof_path, compiler_spoof_source, frozenset({"ID3D11Texture2D"}))
+    if not compiler_spoof:
+        raise AssertionError("compiler-reported native-handle type macro survived")
+    if compiler_macro_findings(compiler_spoof_path, compiler_spoof_source, frozenset()):
+        raise AssertionError("absent compiler macro produced a spoof finding")
 
     mapped_splice = "// line 1\nlease.nat" + chr(92) + "\nive" + chr(92) + "\nHandle();\n"
     mapped_findings = phase_two_capability_findings(
@@ -2587,6 +2976,18 @@ ad(surface);
             }
             (void) scope;
         }
+        void safeParenthesizedShadow(const std::shared_ptr<GpuSurface>& surface) {
+            GpuSyncReadScope scope;
+            { OtherScope (scope); scope.re\
+ad(surface); }
+            (void) scope;
+        }
+        void safeStructuredShadow(const std::shared_ptr<GpuSurface>& surface) {
+            GpuSyncReadScope scope;
+            { auto [scope] = makeOtherScope(); scope.re\
+ad(surface); }
+            (void) scope;
+        }
         void safeDirectiveText() {
             const char* raw = R"tag(
 #define CAT(left, right) left ## right
@@ -2596,6 +2997,21 @@ ad(surface);
 #define JUMP longjmp
 #define GetDevice(out) persist(out)
             */
+            (void) raw;
+        }
+        void safeSplicedLineComment() {
+            // comment continues across splice \
+#define nativeHandle hidden
+        }
+        void safeSplicedLineCommentCrlf() {
+            // comment continues across splice \
+#define GetDevice(out) hidden
+        }
+        void safeRawFakeTerminator() {
+            const char* raw = R"tag(prefix )tag\
+" still raw
+#define GetDevice(out) persist(out)
+)tag";
             (void) raw;
         }
         void safeReceiver(GpuSyncReadScope* scope, UnrelatedSocket& socket) {
@@ -2619,6 +3035,21 @@ ad(surface);
     if safe_syntax_findings:
         raise AssertionError("comments, strings, or unrelated calls were rejected:\n" +
                              "\n".join(finding.render() for finding in safe_syntax_findings))
+
+    safe_earlier_shadow = (
+        "template<typename Consumer> void earlier(Consumer isCompatibleWithNativeHandle) { "
+        "(void) isCompatibleWithNativeHandle; } "
+        "bool later(const std::shared_ptr<GpuSurface>& surface) { bool compatible = false; "
+        "GpuSyncReadScope scope; scope.withRead(surface, [&](const GpuReadLease& lease) { "
+        "void* handle = lease.nativeHandle(); "
+        "compatible = isCompatibleWithNativeHandle(handle); }); return compatible; }"
+    )
+    earlier_shadow_findings = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"), safe_earlier_shadow)
+    if earlier_shadow_findings:
+        raise AssertionError("out-of-scope consumer shadow was retained:\n" +
+                             "\n".join(finding.render()
+                                       for finding in earlier_shadow_findings))
 
     def phase_two_adversarial_source(count: int) -> str:
         declarations = " ".join(
@@ -2664,12 +3095,14 @@ ad(surface);
                 raise AssertionError("nested phase-two binding control lost findings")
         return statistics.median(samples)
 
-    nested_small = median_nested_runtime(1024)
-    nested_large = median_nested_runtime(2048)
-    if nested_large > nested_small * 3.25:
+    nested_4k = median_nested_runtime(4096)
+    nested_8k = median_nested_runtime(8192)
+    nested_16k = median_nested_runtime(16384)
+    if nested_8k > nested_4k * 2.8 or nested_16k > nested_8k * 2.8:
         raise AssertionError(
             "nested phase-two declaration assignment is not near-linear: "
-            f"1024={nested_small:.4f}s, 2048={nested_large:.4f}s")
+            f"4096={nested_4k:.4f}s, 8192={nested_8k:.4f}s, "
+            f"16384={nested_16k:.4f}s")
 
     ignored_sources = {
         PurePosixPath("tests/gpu/generated_fixture.cpp"):
@@ -2696,11 +3129,14 @@ def load_production_sources(root: Path) -> dict[PurePosixPath, str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--compile-commands", type=Path)
     args = parser.parse_args()
 
     mutation_self_tests()
     root = args.source_root.resolve()
-    findings = audit_sources(load_production_sources(root))
+    sources = load_production_sources(root)
+    compiler_macros = load_compiler_macro_tables(root, args.compile_commands, sources)
+    findings = audit_sources(sources, compiler_macros)
     if findings:
         for finding in sorted(findings, key=lambda item: (str(item.path), item.line, item.expression)):
             print(finding.render())
