@@ -1,6 +1,7 @@
 #ifndef SOURCEOFFSETESTIMATOR_H
 #define SOURCEOFFSETESTIMATOR_H
 #include "sourceclock.h" // ClockQuality
+#include "timecodeevidence.h"
 #include <cstdint>
 
 // Confidence in a source's inter-camera phase alignment, ascending. Surfaced to
@@ -14,6 +15,9 @@ struct SourcePhaseEvidence {
     ClockQuality clockQuality = ClockQuality::Arrival;
     bool clockLocked = false;
     bool timecodeAlignedToReference = false; // TimecodeAligner says equal-TC frames coincide
+    AlignmentOffset::Kind timecodeKind = AlignmentOffset::Kind::Incomparable;
+    int64_t timecodeOffsetUs = 0;
+    int64_t timecodeBoundUs = 0;
     bool externalReference = false;          // a real reference (PTP) is locked (Phase 5)
     double clockPpm = 0.0;                   // from the source's DriftEstimator
     int64_t measuredOffsetMs = 0;            // measured phase vs the reference source

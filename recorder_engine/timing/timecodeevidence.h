@@ -3,6 +3,8 @@
 
 #include "smpte12m.h"
 
+#include <QMetaType>
+
 #include <cstdint>
 #include <optional>
 
@@ -48,5 +50,7 @@ struct AlignmentOffset {
 
 bool validateTimecodeLabel(const Smpte12mTimecode& timecode, FrameRateQ rate);
 std::optional<FrameRateQ> canonicalFrameRate(double framesPerSecond);
+
+Q_DECLARE_METATYPE(TimecodeEvidence)
 
 #endif // TIMECODEEVIDENCE_H

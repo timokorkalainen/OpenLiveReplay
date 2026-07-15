@@ -14,6 +14,8 @@ private slots:
     void externalReferenceWithoutTcOrLockIsFrameAccurate();
     void flvPllBoundIsWiderThanPcr();
     void ppmTermWidensBoundedBound();
+    void boundedTimecodeReportsRoundedUpBound();
+    void frameAccurateBoundedTimecodeKeepsNonzeroBound();
     void outOfRangeAccessorsAreSafe();
 };
 
@@ -121,6 +123,29 @@ void TestSourceOffsetEstimator::ppmTermWidensBoundedBound() {
     skewed.clockPpm = 5000.0; // large residual ppm
     e.update(1, skewed);
     QVERIFY(e.boundMs(1) > e.boundMs(0));
+}
+void TestSourceOffsetEstimator::boundedTimecodeReportsRoundedUpBound() {
+    SourceOffsetEstimator e;
+    SourcePhaseEvidence ev;
+    ev.timecodeKind = AlignmentOffset::Kind::Bounded;
+    ev.timecodeOffsetUs = 1250;
+    ev.timecodeBoundUs = 1001;
+    ev.timecodeAlignedToReference = false;
+    e.update(0, ev);
+    QCOMPARE(e.tier(0), ConfidenceTier::Bounded);
+    QCOMPARE(e.offsetMs(0), int64_t(1));
+    QCOMPARE(e.boundMs(0), 2);
+}
+void TestSourceOffsetEstimator::frameAccurateBoundedTimecodeKeepsNonzeroBound() {
+    SourceOffsetEstimator e;
+    SourcePhaseEvidence ev;
+    ev.timecodeKind = AlignmentOffset::Kind::Bounded;
+    ev.timecodeOffsetUs = 0;
+    ev.timecodeBoundUs = 500;
+    ev.timecodeAlignedToReference = true;
+    e.update(0, ev);
+    QCOMPARE(e.tier(0), ConfidenceTier::FrameAccurate);
+    QCOMPARE(e.boundMs(0), 1);
 }
 void TestSourceOffsetEstimator::outOfRangeAccessorsAreSafe() {
     SourceOffsetEstimator e;

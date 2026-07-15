@@ -18,6 +18,15 @@ private slots:
     void jamSyncedSourcesReportAligned();
     void offsetSourcesReportNotAlignedAndFrameOffset();
     void noTimecodeSourcesAreNotAligned();
+    void streamWorkerCarriesSelectedEvidenceExactlyOnce();
+    void boundedDriftReportsNonzeroUiBound();
+    void overConfidenceTimecodeDoesNotMoveServo();
+    void disconnectClearsTimecodeAnchor();
+    void urlReplacementClearsTimecodeAnchor();
+    void generationAndRateChangesReanchor();
+    void sourceFrameOffsetRoundsSymmetricallyAtHalfFrame();
+    void discontinuityRequiresFreshAnchor();
+    void legalRolloverSurvivesTypedPipeline();
 
     // Phase 4 Task 3: reference-source selection + inter-cam phase estimation.
     void referenceIsHighestClockQualityTieLowestIndex();
@@ -50,11 +59,29 @@ private:
                                       30);
     }
 
+    static TimecodeEvidence evidence(int64_t tc, int64_t frame, int rateNum = 30, int rateDen = 1,
+                                     uint64_t sourceGeneration = 1, uint64_t timingGeneration = 1,
+                                     int64_t quantizationBoundUs = 0) {
+        TimecodeEvidence value;
+        value.frameOfDay = tc;
+        value.labelRate = FrameRateQ{rateNum, rateDen};
+        value.sourceGeneration = sourceGeneration;
+        value.timingGeneration = timingGeneration;
+        value.provenance = TimecodeProvenance::Ndi;
+        value.arrivalSessionFrame = frame;
+        value.sessionRate = FrameRateQ{30, 1};
+        value.quantizationBoundUs = quantizationBoundUs;
+        return value;
+    }
+
+    static bool feedEvidence(ReplayManager& m, int src, const TimecodeEvidence& value) {
+        return QMetaObject::invokeMethod(&m, "onFrameTimecode", Qt::DirectConnection,
+                                         Q_ARG(int, src), Q_ARG(TimecodeEvidence, value));
+    }
+
     static bool feedFrameTimecode(ReplayManager& m, int src, int64_t tc, int64_t frame,
                                   int rateNum = 30, int rateDen = 1) {
-        return QMetaObject::invokeMethod(&m, "onFrameTimecode", Qt::DirectConnection,
-                                         Q_ARG(int, src), Q_ARG(int64_t, tc), Q_ARG(int, rateNum),
-                                         Q_ARG(int, rateDen), Q_ARG(int64_t, frame));
+        return feedEvidence(m, src, evidence(tc, frame, rateNum, rateDen));
     }
 
     // Drives the production seam ReplayManager::onSourceStatsUpdated exactly as the
@@ -102,6 +129,156 @@ void TestReplayManagerTimecode::noTimecodeSourcesAreNotAligned() {
 
     QVERIFY(!manager.sourcesFrameAligned(0, 1));
     QCOMPARE(manager.sourceFrameOffset(0, 1), int64_t(0));
+}
+
+void TestReplayManagerTimecode::streamWorkerCarriesSelectedEvidenceExactlyOnce() {
+    ReplayManager manager;
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1);
+    QVERIFY(QObject::connect(&worker, SIGNAL(frameTimecode(int, TimecodeEvidence)), &manager,
+                             SLOT(onFrameTimecode(int, TimecodeEvidence)), Qt::DirectConnection));
+    QSignalSpy spy(&worker, &StreamWorker::frameTimecode);
+    QVERIFY(spy.isValid());
+
+    DecodedVideoFrame decoded;
+    decoded.frame = av_frame_alloc();
+    QVERIFY(decoded.frame != nullptr);
+    decoded.sourcePtsMs = 123;
+    decoded.timecodeEvidence = evidence(tcFrames(1, 0, 0, 0), 999, 30, 1, 7, 11, 250);
+    worker.enqueueDecodedVideoFrame(std::move(decoded));
+
+    StreamWorker::QueuedFrame selected;
+    {
+        QMutexLocker locker(&worker.m_frameMutex);
+        QCOMPARE(worker.m_frameQueue.size(), 1);
+        selected = worker.m_frameQueue.dequeue();
+    }
+    QVERIFY(selected.timecodeEvidence.has_value());
+    worker.m_latestFrameTimecodeEvidence = std::move(selected.timecodeEvidence);
+    const auto emitted = worker.takeFrameTimecodeEvidenceForMux(
+        worker.m_latestFrameTimecodeEvidence, /*sessionFrameIndex=*/321);
+    const auto repeated = worker.takeFrameTimecodeEvidenceForMux(
+        worker.m_latestFrameTimecodeEvidence, /*sessionFrameIndex=*/322);
+    QVERIFY(emitted.has_value());
+    QVERIFY(!repeated.has_value());
+    QCOMPARE(emitted->sourceGeneration, uint64_t(7));
+    QCOMPARE(emitted->timingGeneration, uint64_t(11));
+    QCOMPARE(emitted->arrivalSessionFrame, int64_t(321));
+    QCOMPARE(emitted->sessionRate, (FrameRateQ{30, 1}));
+    worker.emitFrameTimecodeEvidence(*emitted);
+    QCOMPARE(spy.size(), 1);
+
+    TimecodeEvidence follower = *emitted;
+    QVERIFY(feedEvidence(manager, 1, follower));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
+    av_frame_free(&selected.frame);
+}
+
+void TestReplayManagerTimecode::boundedDriftReportsNonzeroUiBound() {
+    ReplayManager manager;
+    QVERIFY(feedEvidence(manager, 0, evidence(tcFrames(1, 0, 0, 0), 100)));
+    QVERIFY(feedEvidence(manager, 1, evidence(tcFrames(1, 30, 0, 0), 54'103)));
+    QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0, 10.0)));
+    QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 0, -10.0)));
+    QCOMPARE(manager.sourceTier(1), ConfidenceTier::Bounded);
+    QCOMPARE(manager.sourcePhaseOffsetMs(1), int64_t(-100));
+    QVERIFY(manager.sourcePhaseBoundMs(1) >= 45);
+}
+
+void TestReplayManagerTimecode::overConfidenceTimecodeDoesNotMoveServo() {
+    ReplayManager manager;
+    constexpr int64_t kPerSourceBoundUs = 60'001;
+    QVERIFY(feedEvidence(manager, 0,
+                         evidence(tcFrames(1, 0, 0, 0), 100, 30, 1, 1, 1, kPerSourceBoundUs)));
+    QVERIFY(feedEvidence(manager, 1,
+                         evidence(tcFrames(1, 0, 0, 0), 102, 30, 1, 1, 1, kPerSourceBoundUs)));
+    for (int i = 0; i < 40; ++i) {
+        QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+        QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 4'000'000)));
+    }
+    QVERIFY(manager.sourcePhaseBoundMs(1) >
+            int((ReplayManager::kMaxTimecodeCorrectionBoundUs + 999) / 1000));
+    QCOMPARE(manager.sourceServoTrimMs(1), 0);
+}
+
+void TestReplayManagerTimecode::disconnectClearsTimecodeAnchor() {
+    ReplayManager manager;
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
+    QVERIFY(QMetaObject::invokeMethod(&manager, "onSourcePhaseConnectionChanged",
+                                      Qt::DirectConnection, Q_ARG(int, 1), Q_ARG(bool, false)));
+    QVERIFY(!manager.sourcesFrameAligned(0, 1));
+    QVERIFY(QMetaObject::invokeMethod(&manager, "onSourcePhaseConnectionChanged",
+                                      Qt::DirectConnection, Q_ARG(int, 1), Q_ARG(bool, true)));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 103));
+    QCOMPARE(manager.sourceFrameOffset(0, 1), int64_t(-3));
+}
+
+void TestReplayManagerTimecode::urlReplacementClearsTimecodeAnchor() {
+    ReplayManager manager;
+    manager.setSourceUrls({QStringLiteral("ndi://a"), QStringLiteral("ndi://b")});
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
+    manager.updateSourceUrl(1, QStringLiteral("ndi://replacement"));
+    QVERIFY(!manager.sourcesFrameAligned(0, 1));
+}
+
+void TestReplayManagerTimecode::generationAndRateChangesReanchor() {
+    ReplayManager manager;
+    QVERIFY(feedFrameTimecode(manager, 0, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(feedFrameTimecode(manager, 1, tcFrames(1, 0, 0, 0), 100));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
+
+    QVERIFY(feedEvidence(manager, 1, evidence(tcFrames(1, 0, 0, 0), 103, 30, 1, 2, 1)));
+    QCOMPARE(manager.sourceFrameOffset(0, 1), int64_t(-3));
+
+    QVERIFY(feedEvidence(manager, 1, evidence(tcFrames(1, 0, 0, 0) * 2, 100, 60, 1, 2, 1)));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
+
+    QVERIFY(feedEvidence(manager, 1, evidence(tcFrames(1, 0, 0, 0) * 2, 104, 60, 1, 2, 2)));
+    QCOMPARE(manager.sourceFrameOffset(0, 1), int64_t(-4));
+}
+
+void TestReplayManagerTimecode::sourceFrameOffsetRoundsSymmetricallyAtHalfFrame() {
+    const int64_t base30 = tcFrames(1, 0, 0, 0);
+    const int64_t base60 = base30 * 2;
+
+    ReplayManager positive;
+    QVERIFY(feedEvidence(positive, 0, evidence(base30, 100, 30, 1)));
+    QVERIFY(feedEvidence(positive, 1, evidence(base60 + 1, 100, 60, 1)));
+    QCOMPARE(positive.sourceFrameOffset(0, 1), int64_t(1));
+
+    ReplayManager negative;
+    QVERIFY(feedEvidence(negative, 0, evidence(base30, 100, 30, 1)));
+    QVERIFY(feedEvidence(negative, 1, evidence(base60 - 1, 100, 60, 1)));
+    QCOMPARE(negative.sourceFrameOffset(0, 1), int64_t(-1));
+}
+
+void TestReplayManagerTimecode::discontinuityRequiresFreshAnchor() {
+    ReplayManager manager;
+    const int64_t baseTc = tcFrames(1, 0, 0, 0);
+    QVERIFY(feedFrameTimecode(manager, 0, baseTc, 100));
+    QVERIFY(feedFrameTimecode(manager, 1, baseTc, 100));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
+
+    TimecodeEvidence discontinuity = evidence(baseTc + 1, 101);
+    discontinuity.discontinuity = true;
+    QVERIFY(feedEvidence(manager, 1, discontinuity));
+    QVERIFY(!manager.sourcesFrameAligned(0, 1));
+
+    QVERIFY(feedEvidence(manager, 1, evidence(baseTc + 1, 101)));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
+}
+
+void TestReplayManagerTimecode::legalRolloverSurvivesTypedPipeline() {
+    ReplayManager manager;
+    constexpr int64_t kLastFrameOfDay = 30LL * 24 * 60 * 60 - 1;
+    QVERIFY(feedEvidence(manager, 0, evidence(kLastFrameOfDay - 1, 100)));
+    QVERIFY(feedEvidence(manager, 1, evidence(kLastFrameOfDay - 1, 100)));
+    QVERIFY(feedEvidence(manager, 0, evidence(0, 102)));
+    QVERIFY(feedEvidence(manager, 1, evidence(0, 102)));
+    QVERIFY(manager.sourcesFrameAligned(0, 1));
 }
 
 void TestReplayManagerTimecode::referenceIsHighestClockQualityTieLowestIndex() {

@@ -14,13 +14,16 @@
 #include <QUrl>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "recordingclock.h"
 #include "muxer.h"
 #include "ingest/ingestsession.h"
 #include "timing/sourceclock.h"
+#include "timing/timecodeevidence.h"
 
 #include "recorder_engine/codec/videocodecchoice.h"
 #include "recorder_engine/codec/nativevideoencoder.h"
@@ -121,6 +124,7 @@ public:
 
 #ifdef OLR_UNIT_TEST
     friend class TestStreamWorkerGpuEncode;
+    friend class TestReplayManagerTimecode;
     const GpuEncodePump* gpuEncodePumpForTest() const;
     bool preferGpuVideoFramesForIngestForTest() const;
     bool ensureGpuEncodePumpStartedForTest();
@@ -137,13 +141,10 @@ signals:
     // UI through ReplayManager with a queued connection, like connectionChanged.
     void statsUpdated(int sourceIndex, IngestStats stats);
 
-    // Emitted from the tick thread when a frame carrying a valid source timecode is
-    // consumed for this source's assigned view track, with the session frame index
-    // (m_internalFrameCount) it landed on. ONLY emitted when sourceTimecode100ns >= 0
-    // — sources without TC never emit it, so behavior is unchanged when TC is absent.
-    // ReplayManager feeds it into its TimecodeAligner (Qt::QueuedConnection).
-    void frameTimecode(int sourceIndex, int64_t tcFrames, int rateNum, int rateDen,
-                       int64_t sessionFrameIndex);
+    // Emitted after the muxer confirms that the selected frame's packet was written.
+    // The evidence is rebound to the session frame where it was muxed and consumed
+    // one-shot, so held CFR frames cannot report the same observation twice.
+    void frameTimecode(int sourceIndex, TimecodeEvidence evidence);
 
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
@@ -159,12 +160,10 @@ private:
 
     AVFrame* m_latestFrame = nullptr;
     // Source timecode (100 ns since midnight) of the frame currently held in
-    // m_latestFrame, or -1 when none/blue. Tick-thread-only. Travels with the
-    // frame through the jitter pull so the muxed frame's TC can be forwarded.
+    // m_latestFrame, or -1 when none/blue. Retained for the recording start tag;
+    // alignment uses m_latestFrameTimecodeEvidence below.
     std::atomic<int64_t> m_latestFrameTimecode100ns{-1};
-    std::atomic<int64_t> m_latestFrameTcFrames{-1};
-    std::atomic<int32_t> m_latestFrameRateNum{0};
-    std::atomic<int32_t> m_latestFrameRateDen{0};
+    std::optional<TimecodeEvidence> m_latestFrameTimecodeEvidence;
     int64_t m_internalFrameCount;
     RecordingClock* m_sharedClock;
 
@@ -248,13 +247,10 @@ private:
     struct QueuedFrame {
         AVFrame* frame{};
         int64_t sourcePts{};
-        // The frame's own source timecode (100 ns since midnight), or -1 when the
-        // transport carried no TC. Purely additive: never affects A/V sync or the
-        // jitter pull; only forwarded via frameTimecode() when the frame is muxed.
+        // The transport's 100 ns label is retained only for the recording start tag.
+        // Alignment consumes the full typed evidence value alongside the frame.
         int64_t sourceTimecode100ns = -1;
-        int64_t sourceTcFrames = -1;
-        int32_t sourceFrameRateNum = 0;
-        int32_t sourceFrameRateDen = 0;
+        std::optional<TimecodeEvidence> timecodeEvidence;
 #ifdef OLR_GPU_PIPELINE_BUILD
         FrameHandle gpuFrame;
         uint64_t gpuFenceValue = 0;
@@ -280,9 +276,7 @@ private:
     FrameHandle m_latestGpuFrame;
     uint64_t m_latestGpuFenceValue = 0;
     std::atomic<int64_t> m_latestGpuFrameTimecode100ns{-1};
-    std::atomic<int64_t> m_latestGpuFrameTcFrames{-1};
-    std::atomic<int32_t> m_latestGpuFrameRateNum{0};
-    std::atomic<int32_t> m_latestGpuFrameRateDen{0};
+    std::shared_ptr<const TimecodeEvidence> m_latestGpuFrameTimecodeEvidence;
 #endif
 
     // FFmpeg helpers
@@ -298,6 +292,11 @@ private:
         int track, AVStream* st, bool* havePacket,
         std::function<void()> beforePacketWrite = std::function<void()>{},
         std::function<void(bool)> afterPacketWritten = std::function<void(bool)>{});
+    void enqueueDecodedVideoFrame(DecodedVideoFrame decoded);
+    std::optional<TimecodeEvidence>
+    takeFrameTimecodeEvidenceForMux(std::optional<TimecodeEvidence>& selected,
+                                    int64_t sessionFrameIndex) const;
+    void emitFrameTimecodeEvidence(const TimecodeEvidence& evidence);
     void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
                             int64_t jitterMs);
 };
