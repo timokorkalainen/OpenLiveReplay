@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import re
@@ -163,6 +162,27 @@ def mask_non_code(source: str) -> str:
     return "".join(result)
 
 
+def normalize_alternative_tokens(masked: str) -> str:
+    """Normalize C++ alternative preprocessing tokens without changing offsets."""
+    result = list(masked)
+    replacements = (
+        ("%:%:", "##"), ("<:", "["), (":>", "]"), ("<%", "{"), ("%>", "}"),
+        ("%:", "#"),
+    )
+    index = 0
+    while index < len(masked):
+        replacement = next(((spelling, value) for spelling, value in replacements
+                            if masked.startswith(spelling, index)), None)
+        if replacement is None:
+            index += 1
+            continue
+        spelling, value = replacement
+        for offset in range(len(spelling)):
+            result[index + offset] = value[offset] if offset < len(value) else " "
+        index += len(spelling)
+    return "".join(result)
+
+
 def brace_pairs(masked: str) -> list[tuple[int, int]]:
     stack: list[int] = []
     pairs: list[tuple[int, int]] = []
@@ -188,6 +208,7 @@ class ScopeDeclaration:
     name: str
     position: int
     end: int
+    name_position: int
 
 
 def scope_declarations(masked: str) -> list[ScopeDeclaration]:
@@ -202,14 +223,15 @@ def scope_declarations(masked: str) -> list[ScopeDeclaration]:
         prefix = masked[max(0, match.start() - 16):match.start()]
         if re.search(r"\b(?:class|struct)\s*$", prefix):
             continue
-        declarations.append(ScopeDeclaration(match.group(1), match.start(), match.end()))
+        declarations.append(ScopeDeclaration(
+            match.group(1), match.start(), match.end(), match.start(1)))
 
     inferred = re.compile(
         r"\bauto(?:\s+(?:const|volatile))*\s*[*&]?\s+([A-Za-z_]\w*)\s*="
         r"\s*GpuSyncReadScope\b"
     )
     declarations.extend(
-        ScopeDeclaration(match.group(1), match.start(), match.end())
+        ScopeDeclaration(match.group(1), match.start(), match.end(), match.start(1))
         for match in inferred.finditer(masked)
     )
     return sorted(set(declarations), key=lambda declaration: declaration.position)
@@ -235,6 +257,7 @@ def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[F
     unique_capability = re.compile(r"\b(?:GpuSyncReadScope|withRead|nativeHandle)\b")
     nonlocal_jump = re.compile(r"\b(?:_longjmp|longjmp|siglongjmp)\b")
     approved_consumers = REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
+    approved_methods = REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())
 
     def pasted_guarded_identifier(text: str) -> bool:
         tokens = re.findall(r"[A-Za-z_]\w*|##|\S", text)
@@ -274,6 +297,11 @@ def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[F
             findings.append(Finding(
                 path, logical_start, "approved native-handle consumer cannot be hidden or shadowed",
                 "approved native-handle consumers cannot be replaced by preprocessing"))
+        if any(re.search(rf"\b{re.escape(name)}\b", stripped)
+               for name in approved_methods):
+            findings.append(Finding(
+                path, logical_start, "approved native-handle method cannot be hidden or shadowed",
+                "approved native-handle methods cannot be replaced by preprocessing"))
         if nonlocal_jump.search(stripped):
             findings.append(Finding(
                 path, logical_start, "non-local jump preprocessor alias",
@@ -283,9 +311,10 @@ def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[F
                 path, logical_start, "GPU capability preprocessor alias",
                 "nativeHandle alias and scope operations cannot be hidden by preprocessing"))
 
+    directive_source = mask_non_code(source)
     logical = ""
     logical_start = 1
-    for line, text in enumerate(source.splitlines(keepends=True), 1):
+    for line, text in enumerate(directive_source.splitlines(keepends=True), 1):
         if not logical:
             logical_start = line
         splice = re.search(r"\\\r?\n$", text)
@@ -296,6 +325,49 @@ def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[F
         logical = ""
     if logical:
         audit_logical(logical, logical_start)
+    return findings
+
+
+def guarded_macro_composition_findings(path: PurePosixPath, source: str,
+                                       masked: str) -> list[Finding]:
+    """Reject source-visible macro calls whose identifier pieces form guarded names."""
+    guarded = {
+        "GpuSyncReadScope", "_longjmp", "complete", "longjmp", "nativeHandle", "read",
+        "siglongjmp", "withRead",
+    }
+    tokens = cpp_tokens(masked)
+    findings: list[Finding] = []
+    for index, token in enumerate(tokens[:-1]):
+        if (not re.fullmatch(r"[A-Za-z_]\w*", token.value)
+                or tokens[index + 1].value != "("):
+            continue
+        depth = 1
+        arguments: list[list[str]] = [[]]
+        closing = None
+        for cursor in range(index + 2, len(tokens)):
+            value = tokens[cursor].value
+            if value == "(":
+                depth += 1
+            elif value == ")":
+                depth -= 1
+                if depth == 0:
+                    closing = cursor
+                    break
+            if depth == 1 and value == ",":
+                arguments.append([])
+            elif depth >= 1:
+                arguments[-1].append(value)
+        if closing is None or len(arguments) < 2:
+            continue
+        if not all(len(argument) == 1
+                   and re.fullmatch(r"[A-Za-z_]\w*", argument[0])
+                   for argument in arguments):
+            continue
+        if "".join(argument[0] for argument in arguments) not in guarded:
+            continue
+        findings.append(Finding(
+            path, line_number(source, token.start), "guarded identifier macro composition",
+            "macro arguments cannot be composed into guarded GPU or non-local control names"))
     return findings
 
 
@@ -332,56 +404,80 @@ def phase_two_capability_findings(path: PurePosixPath, source: str) -> list[Find
         index += 1
 
     normalized = "".join(normalized_chars)
-    masked = mask_non_code(normalized)
+    masked = normalize_alternative_tokens(mask_non_code(normalized))
     pairs = brace_pairs(masked)
-    scope_bindings: list[ScopeBinding] = []
-    for declaration in scope_declarations(masked):
-        lexical_block = declaration_block(masked, pairs, declaration)
-        if lexical_block is not None:
-            scope_bindings.append(ScopeBinding(declaration, lexical_block))
+    scope_bindings = scope_bindings_linear(masked, pairs)
 
-    scope_intervals: dict[str, list[tuple[int, int]]] = {}
-    for binding in scope_bindings:
-        scope_intervals.setdefault(binding.declaration.name, []).append(
-            (binding.declaration.position, binding.block[1]))
-    scope_interval_index: dict[str, tuple[list[int], list[int]]] = {}
-    for name, intervals in scope_intervals.items():
-        intervals.sort()
-        starts: list[int] = []
-        maximum_ends: list[int] = []
-        maximum_end = -1
-        for start, end in intervals:
-            starts.append(start)
-            maximum_end = max(maximum_end, end)
-            maximum_ends.append(maximum_end)
-        scope_interval_index[name] = (starts, maximum_ends)
-
-    def direct_receiver_name(call: re.Match[str]) -> str | None:
-        index = call.start() - 1
-        while index >= 0 and masked[index].isspace():
-            index -= 1
-        end = index + 1
-        while index >= 0 and (masked[index].isalnum() or masked[index] == "_"):
-            index -= 1
-        if end == index + 1:
+    def result_receiver_name(call: re.Match[str]) -> str | None:
+        expression = receiver_expression(masked, call.start())
+        tokens = cpp_tokens(expression)
+        start, end = strip_transparent_parentheses(tokens, 0, len(tokens))
+        while start < end:
+            depth = 0
+            comma = None
+            for token_index in range(start, end):
+                value = tokens[token_index].value
+                if value == "(":
+                    depth += 1
+                elif value == ")":
+                    depth -= 1
+                elif depth == 0 and value == ",":
+                    comma = token_index
+            if comma is None:
+                break
+            start, end = strip_transparent_parentheses(tokens, comma + 1, end)
+        if end - start != 1 or not re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value):
             return None
-        name = masked[index + 1:end]
-        if not re.fullmatch(r"[A-Za-z_]\w*", name):
-            return None
-        return name
+        return tokens[start].value
 
-    reconstructed_scope_operations: set[int] = set()
+    calls_by_receiver: dict[str, list[re.Match[str]]] = {}
     for call in MEMBER_CALL.finditer(masked):
         if call.group(1) not in {"read", "complete"}:
             continue
-        receiver = direct_receiver_name(call)
-        interval_index = scope_interval_index.get(receiver or "")
-        if interval_index is None:
-            continue
-        starts, maximum_ends = interval_index
-        candidate = bisect_right(starts, call.start()) - 1
-        if candidate >= 0 and maximum_ends[candidate] > call.start():
-            reconstructed_scope_operations.add(call.start(1))
+        receiver = result_receiver_name(call)
+        if receiver is not None:
+            calls_by_receiver.setdefault(receiver, []).append(call)
+
+    gpu_names = {binding.declaration.name for binding in scope_bindings}
+    all_tokens = cpp_tokens(masked)
+    gpu_name_positions: set[int] = set()
+    lexical_bindings: dict[str, list[tuple[int, int, bool]]] = {}
+    for binding in scope_bindings:
+        name_position = binding.declaration.name_position
+        gpu_name_positions.add(name_position)
+        lexical_bindings.setdefault(binding.declaration.name, []).append(
+            (name_position, binding.block[1], True))
+
+    shadow_tokens = [
+        (index, token) for index, token in enumerate(all_tokens)
+        if token.value in gpu_names and token.start not in gpu_name_positions
+        and token_is_declarator_name(all_tokens, index)
+    ]
+    shadow_blocks = blocks_for_positions(
+        masked, pairs, [token.start for _index, token in shadow_tokens])
+    for _index, token in shadow_tokens:
+        block = shadow_blocks.get(token.start)
+        if block is not None:
+            lexical_bindings.setdefault(token.value, []).append(
+                (token.start, block[1], False))
+
+    reconstructed_scope_operations: set[int] = set()
+    for name, receiver_calls in calls_by_receiver.items():
+        bindings = sorted(lexical_bindings.get(name, []))
+        receiver_calls.sort(key=lambda call: call.start())
+        active: list[tuple[int, bool]] = []
+        binding_index = 0
+        for call in receiver_calls:
+            while binding_index < len(bindings) and bindings[binding_index][0] < call.start():
+                start, end, is_gpu = bindings[binding_index]
+                while active and active[-1][0] <= start:
+                    active.pop()
+                active.append((end, is_gpu))
+                binding_index += 1
+            while active and active[-1][0] <= call.start():
+                active.pop()
+            if active and active[-1][1]:
+                reconstructed_scope_operations.add(call.start(1))
 
     findings: list[Finding] = []
     boundary_index = 0
@@ -466,26 +562,42 @@ def strip_transparent_parentheses(tokens: list[CppToken], start: int,
 
 
 def approved_call_is_unshadowed(tokens: list[CppToken], name_index: int,
-                                allowed_member_calls: frozenset[str]) -> bool:
-    name = tokens[name_index].value
-    if name_index and tokens[name_index - 1].value == "::":
+                                allowed_member_calls: frozenset[str],
+                                identity_tokens: list[CppToken] | None = None) -> bool:
+    name_token = tokens[name_index]
+    name = name_token.value
+    context = tokens if identity_tokens is None else identity_tokens
+    context_index = next((index for index, token in enumerate(context)
+                          if token.start == name_token.start), None)
+    if context_index is None:
         return False
-    if name_index and tokens[name_index - 1].value in {".", "->"}:
+    if context_index and context[context_index - 1].value == "::":
+        return False
+    if context_index and context[context_index - 1].value in {".", "->"}:
         return name in allowed_member_calls
-    for index, token in enumerate(tokens[:name_index]):
-        if token.value == name and token_is_declarator_name(tokens, index):
+    for index, token in enumerate(context[:context_index]):
+        if token.value == name and token_is_declarator_name(context, index):
+            return False
+        if token.value != name:
+            continue
+        boundary = index - 1
+        while boundary >= 0 and context[boundary].value not in {";", "{", "}"}:
+            boundary -= 1
+        if "using" in [item.value for item in context[boundary + 1:index + 1]]:
             return False
     return True
 
 
 def is_direct_call_argument(tokens: list[CppToken], use_start: int, use_end: int,
                             allowed_calls: frozenset[str],
-                            allowed_member_calls: frozenset[str] = frozenset()) -> bool:
+                            allowed_member_calls: frozenset[str] = frozenset(),
+                            identity_tokens: list[CppToken] | None = None) -> bool:
     call = enclosing_call(tokens, use_start)
     if call is None or call[0] not in allowed_calls:
         return False
     _, opening, closing = call
-    if not approved_call_is_unshadowed(tokens, opening - 1, allowed_member_calls):
+    if not approved_call_is_unshadowed(
+            tokens, opening - 1, allowed_member_calls, identity_tokens):
         return False
     argument_start = opening + 1
     paren_depth = bracket_depth = brace_depth = 0
@@ -625,7 +737,23 @@ def stays_in_synchronous_blocks(masked: str, pairs: list[tuple[int, int]],
     )
 
 
-def local_native_alias(masked: str, pairs: list[tuple[int, int]],
+def type_name_is_source_shadowed(masked: str, type_name: str, position: int) -> bool:
+    prior_tokens = cpp_tokens(masked, 0, position)
+    for index, token in enumerate(prior_tokens):
+        if token.value != type_name:
+            continue
+        boundary = index - 1
+        while boundary >= 0 and prior_tokens[boundary].value not in {";", "{", "}"}:
+            boundary -= 1
+        statement = [item.value for item in prior_tokens[boundary + 1:index + 2]]
+        if ("using" in statement or "typedef" in statement
+                or any(value in {"class", "enum", "struct", "union"}
+                       for value in statement)):
+            return True
+    return False
+
+
+def local_native_alias(path: PurePosixPath, masked: str, pairs: list[tuple[int, int]],
                        call: re.Match[str]) -> tuple[str, int] | None:
     tokens = statement_tokens(masked, pairs, call.start())
     values = [token.value for token in tokens]
@@ -652,11 +780,15 @@ def local_native_alias(masked: str, pairs: list[tuple[int, int]],
         declaration.pop()
     if declaration not in (["void", "*"], ["auto", "*"], ["IOSurfaceRef"]):
         return None
+    if (declaration == ["IOSurfaceRef"]
+            and type_name_is_source_shadowed(masked, "IOSurfaceRef", alias.start)):
+        return None
 
     rhs = values[equals_index + 1:]
     direct = (len(rhs) == 6 and re.fullmatch(r"[A-Za-z_]\w*", rhs[0])
               and rhs[1:] == [".", "nativeHandle", "(", ")", ";"])
     approved_cast = False
+    cast_type: list[str] = []
     if rhs and rhs[0] in {"const_cast", "dynamic_cast", "reinterpret_cast", "static_cast"}:
         try:
             cast_close = len(rhs) - 1 - rhs[::-1].index(">")
@@ -672,6 +804,20 @@ def local_native_alias(masked: str, pairs: list[tuple[int, int]],
             and all(value not in {"(", ")", "{", "}", "[", "]", "=", ",", "?", ":"}
                     for value in rhs[2:cast_close])
         )
+        cast_type = rhs[2:cast_close]
+    if approved_cast:
+        expected_cast = None
+        if declaration == ["IOSurfaceRef"]:
+            expected_cast = ["IOSurfaceRef"]
+        elif declaration == ["auto", "*"] and path in {
+                PurePosixPath("recorder_engine/codec/nativevideoencoder_mediafoundation.cpp"),
+                PurePosixPath("playback/output/win/wingpuimportedge.cpp"),
+        }:
+            expected_cast = ["ID3D11Texture2D", "*"]
+        approved_cast = cast_type == expected_cast
+        if (approved_cast and cast_type and type_name_is_source_shadowed(
+                masked, cast_type[0], alias.start)):
+            approved_cast = False
     if not direct and not approved_cast:
         return None
     return alias.value, alias.start
@@ -684,6 +830,7 @@ def native_handle_has_direct_consumer(path: PurePosixPath, masked: str,
     if not safe_calls:
         return False
     tokens = cpp_tokens(masked, binding.block[0] + 1, binding.block[1])
+    identity_tokens = cpp_tokens(masked, 0, binding.block[1])
     native_index = next((index for index, token in enumerate(tokens)
                          if token.start == call.start(1)), None)
     if native_index is None or native_index < 2 or native_index + 2 >= len(tokens):
@@ -692,7 +839,8 @@ def native_handle_has_direct_consumer(path: PurePosixPath, masked: str,
             binding.name, ".", "nativeHandle", "(", ")"]:
         return False
     return is_direct_call_argument(
-        tokens, native_index - 2, native_index + 3, safe_calls, safe_member_calls)
+        tokens, native_index - 2, native_index + 3, safe_calls, safe_member_calls,
+        identity_tokens)
 
 
 def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
@@ -708,6 +856,7 @@ def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
     last_use = declaration_position
     consumed = False
     tokens = cpp_tokens(masked, alias_block[0] + 1, alias_block[1])
+    identity_tokens = cpp_tokens(masked, 0, alias_block[1])
     for index, token in enumerate(tokens):
         if token.value != alias or token.start == declaration_position:
             continue
@@ -725,7 +874,8 @@ def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
                 continue
             return False, last_use
         if is_direct_call_argument(
-                tokens, index, index + 1, safe_calls, safe_member_calls):
+                tokens, index, index + 1, safe_calls, safe_member_calls,
+                identity_tokens):
             consumed = True
             continue
         condition = enclosing_call(tokens, index)
@@ -747,6 +897,52 @@ def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
 class ScopeBinding:
     declaration: ScopeDeclaration
     block: tuple[int, int]
+
+
+def blocks_for_positions(masked: str, pairs: list[tuple[int, int]],
+                         positions: list[int]) -> dict[int, tuple[int, int] | None]:
+    """Assign positions to their innermost lexical blocks in one source pass."""
+    if not positions:
+        return {}
+    opening_pairs = {opening: (opening, closing) for opening, closing in pairs}
+    ordered = sorted(set(positions))
+    assigned: dict[int, tuple[int, int] | None] = {}
+    stack: list[tuple[int, int]] = []
+    position_index = 0
+    for index, char in enumerate(masked):
+        while position_index < len(ordered) and ordered[position_index] == index:
+            assigned[index] = stack[-1] if stack else None
+            position_index += 1
+        if char == "{" and index in opening_pairs:
+            stack.append(opening_pairs[index])
+        elif char == "}" and stack and stack[-1][1] == index:
+            stack.pop()
+    while position_index < len(ordered):
+        assigned[ordered[position_index]] = stack[-1] if stack else None
+        position_index += 1
+    return assigned
+
+
+def scope_bindings_linear(masked: str,
+                          pairs: list[tuple[int, int]]) -> list[ScopeBinding]:
+    declarations = scope_declarations(masked)
+    assigned = blocks_for_positions(
+        masked, pairs, [declaration.position for declaration in declarations])
+    opening_pairs = {opening: (opening, closing) for opening, closing in pairs}
+    bindings: list[ScopeBinding] = []
+    for declaration in declarations:
+        lexical_block = assigned.get(declaration.position)
+        following = masked[declaration.end:].lstrip()
+        if following.startswith((")", ",")):
+            signature_end = masked.find(")", declaration.end)
+            body_start = masked.find("{", signature_end + 1) if signature_end >= 0 else -1
+            declaration_end = masked.find(";", signature_end + 1) if signature_end >= 0 else -1
+            if (body_start >= 0 and (declaration_end < 0 or body_start < declaration_end)
+                    and body_start in opening_pairs):
+                lexical_block = opening_pairs[body_start]
+        if lexical_block is not None:
+            bindings.append(ScopeBinding(declaration, lexical_block))
+    return bindings
 
 
 @dataclass(frozen=True)
@@ -1081,11 +1277,17 @@ def token_is_declarator_name(tokens: list[CppToken], index: int) -> bool:
     if index == 0 or index + 1 >= len(tokens):
         return False
     following = tokens[index + 1].value
-    if following not in {";", "=", "(", "{", "[", ",", ":"}:
+    if following not in {";", "=", "(", ")", "{", "[", ",", ":"}:
         return False
     previous = tokens[index - 1].value
     if previous in {".", "->", "::", "(", "[", "=", ",", "?", ":"}:
         return False
+    if following == ")" and previous in {"*", "&", "&&"}:
+        opening = index - 2
+        if (opening < 1 or tokens[opening].value != "("
+                or not (re.fullmatch(r"[A-Za-z_]\w*", tokens[opening - 1].value)
+                        or tokens[opening - 1].value in {">", ")", "*", "&"})):
+            return False
 
     boundary = index - 1
     paren_depth = bracket_depth = 0
@@ -1194,21 +1396,22 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
 
 
 def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
-    masked = mask_non_code(source)
+    masked = normalize_alternative_tokens(mask_non_code(source))
     pairs = brace_pairs(masked)
     findings = preprocessor_capability_findings(path, source)
+    findings.extend(guarded_macro_composition_findings(path, source, masked))
     findings.extend(phase_two_capability_findings(path, source))
     calls = list(MEMBER_CALL.finditer(masked))
-    scope_bindings: list[ScopeBinding] = []
+    scope_bindings = scope_bindings_linear(masked, pairs)
+    bound_scope_positions = {
+        binding.declaration.position for binding in scope_bindings
+    }
     for declaration in scope_declarations(masked):
-        lexical_block = declaration_block(masked, pairs, declaration)
-        if lexical_block is None:
+        if declaration.position not in bound_scope_positions:
             findings.append(
                 Finding(path, line_number(source, declaration.position), "GpuSyncReadScope",
                         "scope declaration is not inside a lexical block")
             )
-            continue
-        scope_bindings.append(ScopeBinding(declaration, lexical_block))
 
     reads_by_scope: dict[int, list[re.Match[str]]] = {}
     acquisitions_by_scope: dict[int, list[re.Match[str]]] = {}
@@ -1425,7 +1628,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
                         "read scope or withRead callback")
             )
             continue
-        alias = local_native_alias(masked, pairs, handle_read)
+        alias = local_native_alias(path, masked, pairs, handle_read)
         if alias is None:
             if native_handle_has_direct_consumer(path, masked, handle_read, binding):
                 continue
@@ -1844,6 +2047,14 @@ def mutation_self_tests() -> None:
          "return isCompatibleWithNativeHandle(handle); }; "
          "(void) later.operator()<int>(); }); }",
          "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "void* handle = lease.nativeHandle(); auto later = <: = :><typename T>() "
+         "constexpr noexcept -> bool requires true { "
+         "return isCompatibleWithNativeHandle(handle); }; "
+         "(void) later.operator()<int>(); }); }",
+         "native handle value must remain inside its synchronous consumption"),
         (PurePosixPath("playback/bad.cpp"),
          "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
          "scope.withRead(s, [](const GpuReadLease& lease) { g_lease = &lease; }); }",
@@ -2071,6 +2282,20 @@ def mutation_self_tests() -> None:
          "(void) isCompatibleWithNativeHandle(handle); CAT(long, jmp)(env, 1); }); }",
          "preprocessor token concatenation"),
         (PurePosixPath("playback/gpu/gpufence.h"),
+         "#include <vendor_cat.h>\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "void* handle = lease.CAT(native, Handle)(); "
+         "(void) isCompatibleWithNativeHandle(handle); }); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "#include <vendor_cat.h>\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "void* handle = lease.nativeHandle(); "
+         "(void) isCompatibleWithNativeHandle(handle); CAT(long, jmp)(env, 1); }); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
          "#define isCompatibleWithNativeHandle(value) persist(value)\n"
          "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
          "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
@@ -2093,6 +2318,39 @@ def mutation_self_tests() -> None:
          "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
          "lease.nativeHandle(); if (handle != HandleSink{}) consume(); }); }",
          "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "template<typename Consumer> void bad(const std::shared_ptr<GpuSurface>& s, "
+         "Consumer isCompatibleWithNativeHandle) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [&](const GpuReadLease& lease) { void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { bool "
+         "(*isCompatibleWithNativeHandle)(void*) = persist; GpuSyncReadScope scope; "
+         "scope.withRead(s, [&](const GpuReadLease& lease) { void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "using evil::isCompatibleWithNativeHandle; void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/applegpusurface_apple.mm"),
+         "struct HandleSink { explicit HandleSink(void*); "
+         "friend bool operator!=(const HandleSink&, decltype(nullptr)); }; "
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { using IOSurfaceRef = HandleSink; "
+         "IOSurfaceRef handle = static_cast<IOSurfaceRef>(lease.nativeHandle()); "
+         "if (handle != nullptr) consume(); }); }",
+         "native handle value must initialize a callback-local alias"),
+        (PurePosixPath("playback/output/win/wingpuimportedge.cpp"),
+         "#define GetDevice(out) GetDevice(out); persist(texture)\n"
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { auto* texture = "
+         "static_cast<ID3D11Texture2D*>(lease.nativeHandle()); if (texture) "
+         "texture->GetDevice(&device); }); }",
+         "approved native-handle method cannot be hidden or shadowed"),
         (PurePosixPath("playback/bad.cpp"),
          "void bad(const GpuReadLease& lease) { (void) lease.nat" + chr(92) +
          "\nive" + chr(92) + "\nHandle(); }",
@@ -2106,6 +2364,16 @@ def mutation_self_tests() -> None:
          "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
          "const GpuReadLease lease = scope.re" + chr(92) +
          "\nad(s); (void) lease.nativeHandle(); scope.complete(); }",
+         "phase-two line splice"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = (scope).re" + chr(92) +
+         "\nad(s); (void) lease.nativeHandle(); scope.complete(); }",
+         "phase-two line splice"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s, OtherScope other) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = (other, scope).re" +
+         chr(92) + "\nad(s); (void) lease.nativeHandle(); scope.complete(); }",
          "phase-two line splice"),
         (PurePosixPath("playback/gpu/gpufence.h"),
          "void jumps(const GpuReadLease&) { longjmp(env, 1); } "
@@ -2310,6 +2578,26 @@ ad();
             (scope, job).com\
 plete();
         }
+        void safeShadowedSplit(const std::shared_ptr<GpuSurface>& surface) {
+            GpuSyncReadScope scope;
+            {
+                OtherScope scope;
+                scope.re\
+ad(surface);
+            }
+            (void) scope;
+        }
+        void safeDirectiveText() {
+            const char* raw = R"tag(
+#define CAT(left, right) left ## right
+#define HANDLE nativeHandle
+)tag";
+            /*
+#define JUMP longjmp
+#define GetDevice(out) persist(out)
+            */
+            (void) raw;
+        }
         void safeReceiver(GpuSyncReadScope* scope, UnrelatedSocket& socket) {
             socket.read();
             if (scope) socket.read();
@@ -2357,6 +2645,31 @@ plete();
         raise AssertionError(
             "phase-two reconstructed scope lookup is not near-linear: "
             f"64={small_runtime:.4f}s, 256={large_runtime:.4f}s")
+
+    def nested_phase_two_source(count: int) -> str:
+        openings = "".join(
+            f"{{ GpuSyncReadScope s{index}; s{index}.re" + chr(92) + "\nad(surface);"
+            for index in range(count))
+        return "void nested() {" + openings + ("}" * count) + "}"
+
+    def median_nested_runtime(count: int) -> float:
+        source = nested_phase_two_source(count)
+        samples: list[float] = []
+        for _ in range(2):
+            started = time.perf_counter()
+            findings = phase_two_capability_findings(
+                PurePosixPath("playback/gpu/gpufence.h"), source)
+            samples.append(time.perf_counter() - started)
+            if len(findings) != count:
+                raise AssertionError("nested phase-two binding control lost findings")
+        return statistics.median(samples)
+
+    nested_small = median_nested_runtime(1024)
+    nested_large = median_nested_runtime(2048)
+    if nested_large > nested_small * 3.25:
+        raise AssertionError(
+            "nested phase-two declaration assignment is not near-linear: "
+            f"1024={nested_small:.4f}s, 2048={nested_large:.4f}s")
 
     ignored_sources = {
         PurePosixPath("tests/gpu/generated_fixture.cpp"):
