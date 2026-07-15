@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +24,61 @@ def load_module():
 
 
 class WindowsRuntimePolicyTests(unittest.TestCase):
+    def test_registration_check_preserves_enclosing_ctest_logs(self) -> None:
+        ctest_value = shutil.which("ctest")
+        self.assertIsNotNone(ctest_value, "CTest is required for the integration test")
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary) / "build"
+            temporary_logs = build / "Testing" / "Temporary"
+            temporary_logs.mkdir(parents=True)
+            sentinels = {
+                temporary_logs / "LastTest.log": b"parent LastTest sentinel\r\n",
+                temporary_logs / "LastTestsFailed.log": b"parent failures sentinel\r\n",
+                temporary_logs / "CTestCostData.txt": b"parent cost sentinel\r\n",
+            }
+            for path, content in sentinels.items():
+                path.write_bytes(content)
+
+            runtime_dirs = tuple(build / "runtime" / str(index) for index in range(6))
+            for path in runtime_dirs:
+                path.mkdir(parents=True)
+            plugins = build / "plugins"
+            qml = build / "qml"
+            plugins.mkdir()
+            qml.mkdir()
+            modifications = [
+                f"PATH=path_list_prepend:{path.as_posix()}"
+                for path in reversed(runtime_dirs)
+            ]
+            modifications.extend(
+                (
+                    f"QML_IMPORT_PATH=path_list_prepend:{qml.as_posix()}",
+                    f"QML2_IMPORT_PATH=path_list_prepend:{qml.as_posix()}",
+                )
+            )
+            tests = ("tst_muxer", "tst_qml_codecsettings", "tst_olrstyle")
+            lines = [f'add_test({name} "missing-{name}.exe")' for name in tests]
+            lines.append(
+                "set_tests_properties("
+                + " ".join(tests)
+                + ' PROPERTIES ENVIRONMENT "QT_PLUGIN_PATH='
+                + plugins.as_posix()
+                + ';QT_QPA_PLATFORM=offscreen" ENVIRONMENT_MODIFICATION "'
+                + ";".join(modifications)
+                + '")'
+            )
+            (build / "CTestTestfile.cmake").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8"
+            )
+
+            self.policy.check_registration(
+                Path(ctest_value), build, runtime_dirs, plugins, qml
+            )
+
+            self.assertEqual(
+                {path: path.read_bytes() for path in sentinels}, sentinels
+            )
+
     def test_cmake_graph_contract_rejects_disabled_qml_plugin_dependencies(self) -> None:
         contract = MODULE_PATH.parents[2] / "cmake" / "OlrTargetContracts.cmake"
         self.assertTrue(contract.is_file(), "missing generated target-graph contract")

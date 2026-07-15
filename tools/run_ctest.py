@@ -17,28 +17,28 @@ if str(TOOLS_DIR) not in sys.path:
 try:
     from .windows_job import run_process_tree
     from .windows_runtime_guard import (
+        discover_ctest_graph,
+        parse_cmake_cache,
+        require_cache_entries,
         RuntimeAuditLease,
         RuntimeRoots,
-        registered_test_executables,
         reject_runtime_dll_shadowing,
+        validate_ctest_runtime_properties,
+        windows_system_directories,
     )
 except ImportError:
     from windows_job import run_process_tree
     from windows_runtime_guard import (
+        discover_ctest_graph,
+        parse_cmake_cache,
+        require_cache_entries,
         RuntimeAuditLease,
         RuntimeRoots,
-        registered_test_executables,
         reject_runtime_dll_shadowing,
+        validate_ctest_runtime_properties,
+        windows_system_directories,
     )
 
-
-_REQUIRED_CACHE_KEYS = (
-    "CMAKE_CXX_COMPILER",
-    "CMAKE_COMMAND",
-    "Qt6_DIR",
-    "OLR_FFMPEG_ROOT",
-    "OLR_SRT_ROOT",
-)
 
 _SEM_FAILCRITICALERRORS = 0x0001
 _SEM_NOGPFAULTERRORBOX = 0x0002
@@ -71,18 +71,7 @@ def find_build_directory(args: Sequence[str], cwd: Path) -> Path:
 
 def read_cmake_cache(path: Path) -> dict[str, str]:
     """Parse typed CMake cache entries as data without evaluating their values."""
-    entries: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith(("#", "//")):
-            continue
-        declaration, separator, value = line.partition("=")
-        if not separator:
-            continue
-        key, type_separator, _cache_type = declaration.partition(":")
-        if not type_separator or not key:
-            continue
-        entries[key] = value
-    return entries
+    return {key: entry.value for key, entry in parse_cmake_cache(path).items()}
 
 
 def prepare_windows_runtime(
@@ -92,87 +81,136 @@ def prepare_windows_runtime(
     audit_lease: RuntimeAuditLease | None = None,
 ) -> tuple[dict[str, str], Path]:
     """Create a child environment using runtime paths recorded by the build."""
-    cache = read_cmake_cache(build_dir / "CMakeCache.txt")
-    for key in _REQUIRED_CACHE_KEYS:
-        if not cache.get(key):
-            raise ValueError(f"CMake cache is missing required entry: {key}")
-
-    compiler_bin = Path(cache["CMAKE_CXX_COMPILER"]).parent
-    qt_root = Path(cache["Qt6_DIR"]).parents[2]
-    ffmpeg_root = Path(cache["OLR_FFMPEG_ROOT"])
-    srt_root = Path(cache["OLR_SRT_ROOT"])
-    runtime_dirs = (
-        ("compiler runtime", compiler_bin),
-        ("Qt runtime", qt_root / "bin"),
-        ("FFmpeg runtime", ffmpeg_root / "bin"),
-        ("FFmpeg libraries", ffmpeg_root / "lib"),
-        ("SRT runtime", srt_root / "bin"),
-        ("SRT libraries", srt_root / "lib"),
-    )
-    qt_plugins = qt_root / "plugins"
-    qt_qml = qt_root / "qml"
-
-    # CMake records the authoritative CTest path in normal build trees. Older
-    # caches may omit it, so fall back to the sibling executable beside CMake.
-    ctest_value = cache.get("CMAKE_CTEST_COMMAND")
-    ctest = (
-        Path(ctest_value)
-        if ctest_value
-        else Path(cache["CMAKE_COMMAND"]).with_name("ctest.exe")
-    )
-
-    for label, path in (
-        *runtime_dirs,
-        ("Qt plugins", qt_plugins),
-        ("Qt QML imports", qt_qml),
-    ):
-        if not path.is_dir():
-            cache_key = {
-                "compiler runtime": "CMAKE_CXX_COMPILER",
-                "Qt runtime": "Qt6_DIR",
-                "Qt plugins": "Qt6_DIR",
-                "Qt QML imports": "Qt6_DIR",
-                "FFmpeg runtime": "OLR_FFMPEG_ROOT",
-                "FFmpeg libraries": "OLR_FFMPEG_ROOT",
-                "SRT runtime": "OLR_SRT_ROOT",
-                "SRT libraries": "OLR_SRT_ROOT",
-            }[label]
-            raise FileNotFoundError(
-                f"{label} directory from {cache_key} does not exist: {path}; "
-                "reconfigure or recreate the selected build directory"
+    owned = audit_lease is None
+    lease = RuntimeAuditLease() if audit_lease is None else audit_lease
+    try:
+        cache_path = build_dir / "CMakeCache.txt"
+        schema = {
+            "CMAKE_CXX_COMPILER": ("FILEPATH", "UNINITIALIZED"),
+            "CMAKE_COMMAND": ("INTERNAL", "FILEPATH"),
+            "Qt6_DIR": ("PATH",),
+            "OLR_FFMPEG_ROOT": ("PATH",),
+            "OLR_SRT_ROOT": ("PATH",),
+            "CMAKE_HOME_DIRECTORY": ("INTERNAL", "PATH"),
+        }
+        cache = require_cache_entries(
+            cache_path, schema, absolute_paths=tuple(schema)
+        )
+        all_entries = parse_cmake_cache(cache_path)
+        ctest_entry = all_entries.get("CMAKE_CTEST_COMMAND")
+        if ctest_entry is not None and ctest_entry.cache_type not in (
+            "INTERNAL",
+            "FILEPATH",
+        ):
+            raise ValueError(
+                "CMake cache entry CMAKE_CTEST_COMMAND has wrong type: "
+                f"{ctest_entry.cache_type}"
             )
-    if not ctest.is_file():
-        raise FileNotFoundError(f"CTest executable does not exist: {ctest}")
+        if ctest_entry is not None and not Path(ctest_entry.value).is_absolute():
+            raise ValueError("CMAKE_CTEST_COMMAND must be an absolute path")
 
-    reject_runtime_dll_shadowing(
-        build_dir,
-        RuntimeRoots(
-            compiler_bin,
-            qt_root / "bin",
-            ffmpeg_root / "bin",
-            ffmpeg_root / "lib",
-            srt_root / "bin",
-            srt_root / "lib",
-        ),
-        executables=(*registered_test_executables(build_dir), ctest),
-        lease=audit_lease,
-        require_embedded_manifests=os.name == "nt",
-    )
+        def canonical_file(label: str, value: Path, cache_key: str) -> Path:
+            try:
+                return lease.canonical_file(value)
+            except OSError as error:
+                raise FileNotFoundError(
+                    f"{label} from {cache_key} does not exist: {value}; "
+                    "reconfigure or recreate the selected build directory"
+                ) from error
 
-    env = dict(inherited_env)
-    path_entries = [str(path) for _label, path in runtime_dirs]
-    if env.get("PATH"):
-        path_entries.append(env["PATH"])
-    env["PATH"] = os.pathsep.join(path_entries)
-    env["QT_PLUGIN_PATH"] = str(qt_plugins)
-    env.setdefault("QT_QPA_PLATFORM", "offscreen")
-    for variable in ("QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
-        qml_entries = [str(qt_qml)]
-        if env.get(variable):
-            qml_entries.append(env[variable])
-        env[variable] = os.pathsep.join(qml_entries)
+        def canonical_directory(label: str, value: Path, cache_key: str) -> Path:
+            try:
+                return lease.canonical_directory(value)
+            except OSError as error:
+                raise FileNotFoundError(
+                    f"{label} directory from {cache_key} does not exist: {value}; "
+                    "reconfigure or recreate the selected build directory"
+                ) from error
 
-    return env, ctest
+        compiler = canonical_file(
+            "compiler runtime executable", Path(cache["CMAKE_CXX_COMPILER"]), "CMAKE_CXX_COMPILER"
+        )
+        cmake = canonical_file(
+            "CMake executable", Path(cache["CMAKE_COMMAND"]), "CMAKE_COMMAND"
+        )
+        qt_config = canonical_directory(
+            "Qt configuration", Path(cache["Qt6_DIR"]), "Qt6_DIR"
+        )
+        qt_root = qt_config.parents[2]
+        ffmpeg_root = canonical_directory(
+            "FFmpeg root", Path(cache["OLR_FFMPEG_ROOT"]), "OLR_FFMPEG_ROOT"
+        )
+        srt_root = canonical_directory(
+            "SRT root", Path(cache["OLR_SRT_ROOT"]), "OLR_SRT_ROOT"
+        )
+        source_root = canonical_directory(
+            "source root", Path(cache["CMAKE_HOME_DIRECTORY"]), "CMAKE_HOME_DIRECTORY"
+        )
+        canonical_build = canonical_directory("build", build_dir, "--test-dir")
+        ctest = canonical_file(
+            "CTest executable",
+            Path(ctest_entry.value) if ctest_entry else cmake.with_name("ctest.exe"),
+            "CMAKE_CTEST_COMMAND",
+        )
+
+        runtime_dirs = (
+            canonical_directory("compiler runtime", compiler.parent, "CMAKE_CXX_COMPILER"),
+            canonical_directory("Qt runtime", qt_root / "bin", "Qt6_DIR"),
+            canonical_directory("FFmpeg runtime", ffmpeg_root / "bin", "OLR_FFMPEG_ROOT"),
+            canonical_directory("FFmpeg libraries", ffmpeg_root / "lib", "OLR_FFMPEG_ROOT"),
+            canonical_directory("SRT runtime", srt_root / "bin", "OLR_SRT_ROOT"),
+            canonical_directory("SRT libraries", srt_root / "lib", "OLR_SRT_ROOT"),
+        )
+        qt_plugins = canonical_directory("Qt plugins", qt_root / "plugins", "Qt6_DIR")
+        qt_platform_plugins = canonical_directory(
+            "Qt platform plugins", qt_plugins / "platforms", "Qt6_DIR"
+        )
+        qt_qml = canonical_directory("Qt QML imports", qt_root / "qml", "Qt6_DIR")
+        for directory in (*runtime_dirs, qt_plugins, qt_qml):
+            lease.hold_dll_tree(directory)
+
+        graph = discover_ctest_graph(canonical_build, lease=lease)
+        validate_ctest_runtime_properties(
+            graph,
+            runtime_dirs=runtime_dirs,
+            qt_plugins=qt_plugins,
+            qt_platform_plugins=qt_platform_plugins,
+            qt_qml=qt_qml,
+            source_root=source_root,
+            build_dir=canonical_build,
+            ffmpeg_root=ffmpeg_root,
+            srt_root=srt_root,
+        )
+        roots = RuntimeRoots(*runtime_dirs)
+        reject_runtime_dll_shadowing(
+            canonical_build,
+            roots,
+            executables=(*graph.executables, ctest),
+            lease=lease,
+            require_embedded_manifests=os.name == "nt",
+        )
+        for working_directory in graph.working_directories:
+            reject_runtime_dll_shadowing(
+                working_directory,
+                roots,
+                lease=lease,
+            )
+
+        system_dir, windows_dir = windows_system_directories()
+        env = dict(inherited_env)
+        env["SystemRoot"] = str(windows_dir)
+        env["PATH"] = os.pathsep.join(
+            str(path) for path in (*runtime_dirs, system_dir, windows_dir)
+        )
+        env["QT_PLUGIN_PATH"] = str(qt_plugins)
+        env["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(qt_platform_plugins)
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        env["QML_IMPORT_PATH"] = str(qt_qml)
+        env["QML2_IMPORT_PATH"] = str(qt_qml)
+        return env, ctest
+    finally:
+        if owned:
+            lease.close()
 
 
 def _set_windows_error_mode() -> int:
@@ -195,10 +233,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         env, ctest = prepare_windows_runtime(
             build_dir, os.environ, audit_lease=audit_lease
         )
-        command = [str(ctest), *args, "--interactive-debug-mode", "0"]
+        build_dir = audit_lease.canonical_directory(build_dir)
+        command = [
+            str(ctest),
+            *args,
+            "--test-dir",
+            str(build_dir),
+            "--interactive-debug-mode",
+            "0",
+        ]
         old_mode = _set_windows_error_mode()
         try:
-            return run_process_tree(command, enabled=os.name == "nt", env=env)
+            return run_process_tree(
+                command,
+                enabled=os.name == "nt",
+                env=env,
+                private_desktop=True,
+            )
         finally:
             _restore_windows_error_mode(old_mode)
 

@@ -89,6 +89,10 @@ class WindowsJobTests(unittest.TestCase):
         job = mock.MagicMock()
         job.__enter__.return_value = job
         job.assign.side_effect = OSError("assign failed")
+        job.close.side_effect = OSError("job close failed")
+        job.__exit__.side_effect = lambda *args: windows_job.KillOnCloseJob.__exit__(
+            job, *args
+        )
         with (
             mock.patch.object(windows_job, "KillOnCloseJob", return_value=job),
             mock.patch.object(windows_job.subprocess, "Popen", return_value=process),
@@ -97,6 +101,71 @@ class WindowsJobTests(unittest.TestCase):
             windows_job.run_process_tree(["child"], enabled=True)
         process.kill.assert_called_once()
         process.wait.assert_called_once()
+
+    def test_assignment_failure_preserves_primary_error_when_cleanup_also_fails(self) -> None:
+        process = mock.Mock(pid=4322)
+        process.kill.side_effect = OSError("kill failed")
+        process.wait.side_effect = OSError("wait failed")
+        job = mock.MagicMock()
+        job.__enter__.return_value = job
+        job.assign.side_effect = OSError("assign failed")
+
+        with (
+            mock.patch.object(windows_job, "KillOnCloseJob", return_value=job),
+            mock.patch.object(windows_job.subprocess, "Popen", return_value=process),
+            self.assertRaisesRegex(OSError, "assign failed"),
+        ):
+            windows_job.run_process_tree(["child"], enabled=True)
+
+        process.kill.assert_called_once()
+        process.wait.assert_called_once()
+        job.__exit__.assert_called_once()
+
+    def test_private_desktop_is_bound_to_startup_and_closed_after_job(self) -> None:
+        events: list[str] = []
+        process = mock.Mock(pid=9876)
+        process.wait.return_value = 0
+        job = mock.MagicMock()
+        job.__enter__.return_value = job
+        job.__exit__.side_effect = lambda *_args: events.append("job-close")
+        desktop = mock.MagicMock()
+        desktop.__enter__.return_value = desktop
+        desktop.__exit__.side_effect = lambda *_args: events.append("desktop-close")
+        desktop.path = "winsta0\\private-test"
+
+        with (
+            mock.patch.object(windows_job, "KillOnCloseJob", return_value=job),
+            mock.patch.object(
+                windows_job, "PrivateDesktop", return_value=desktop, create=True
+            ),
+            mock.patch.object(
+                windows_job,
+                "_popen_private_desktop",
+                return_value=process,
+                create=True,
+            ) as create,
+            mock.patch.object(windows_job, "_resume_process_threads"),
+        ):
+            self.assertEqual(
+                windows_job.run_process_tree(
+                    ["child"], enabled=True, private_desktop=True
+                ),
+                0,
+            )
+
+        self.assertEqual(create.call_args.kwargs["desktop_path"], desktop.path)
+        self.assertEqual(events, ["job-close", "desktop-close"])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows desktop APIs")
+    def test_real_private_desktop_launch_preserves_child_exit(self) -> None:
+        self.assertEqual(
+            windows_job.run_process_tree(
+                [sys.executable, "-c", "raise SystemExit(19)"],
+                enabled=True,
+                private_desktop=True,
+            ),
+            19,
+        )
 
     @unittest.skipUnless(
         os.name == "nt" and os.environ.get("OLR_RUN_WINDOWS_JOB_INTEGRATION") == "1",

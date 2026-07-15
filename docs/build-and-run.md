@@ -239,6 +239,15 @@ An external `.manifest` file is not accepted as equivalent. This prevents a
 late `<executable>.local` file or directory from changing the audited loader
 resolution between verification and process startup.
 
+The same launch audit follows the generated CTest `subdirs()`/`include()`
+graph, validates each test's working directory and loader-related environment,
+and holds the graph plus resolved runtime files until the process tree is
+empty. Cache paths and Windows system directories are resolved from their
+authoritative files or operating-system APIs, not inherited shell aliases.
+Windows GUI launches run on a private desktop owned for the full Job Object
+lifetime, preventing crash UI from reaching the operator desktop while normal
+network and WebSocket behavior remains unchanged.
+
 For a focused unit-only run:
 
 ```sh

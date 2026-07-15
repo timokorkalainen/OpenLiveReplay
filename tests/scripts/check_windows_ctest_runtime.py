@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import tempfile
 
 
 def read_cmake_cache(path: Path) -> dict[str, str]:
@@ -140,67 +142,78 @@ def check_registration(
     plugins: Path,
     qml: Path,
 ) -> None:
-    for test_name in ("tst_muxer", "tst_qml_codecsettings", "tst_olrstyle"):
-        result = subprocess.run(
-            [
-                str(ctest),
-                "--test-dir",
-                str(build_dir),
-                "-N",
-                "-V",
-                "-R",
-                f"^{test_name}$",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        environment, modifications = parse_verbose_runtime(result.stdout)
+    with tempfile.TemporaryDirectory(prefix="olr-ctest-registration-") as temporary:
+        discovery_build = Path(temporary) / "build"
+        for source in build_dir.rglob("*.cmake"):
+            if not source.is_file():
+                continue
+            destination = discovery_build / source.relative_to(build_dir)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
 
-        if modifications.get("PATH"):
-            effective_order: list[str] = []
-            for runtime_dir in modifications["PATH"]:
-                effective_order.insert(0, normalize_path(runtime_dir))
-            expected_order = [normalize_path(path) for path in runtime_dirs]
-            if effective_order != expected_order:
-                raise SystemExit(
-                    f"{test_name} registered PATH modification order mismatch:\n"
-                    f"expected effective order: {expected_order}\n"
-                    f"actual effective order:   {effective_order}"
-                )
-        else:
-            require_path_prefix(
-                f"{test_name} registered PATH",
-                environment.get("PATH", ""),
-                runtime_dirs,
+        for test_name in ("tst_muxer", "tst_qml_codecsettings", "tst_olrstyle"):
+            result = subprocess.run(
+                [
+                    str(ctest),
+                    "--test-dir",
+                    str(discovery_build),
+                    "-N",
+                    "-V",
+                    "-R",
+                    f"^{test_name}$",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
             )
+            environment, modifications = parse_verbose_runtime(result.stdout)
 
-        registered_plugins = environment.get("QT_PLUGIN_PATH", "")
-        if not registered_plugins or normalize_path(registered_plugins) != normalize_path(
-            plugins
-        ):
-            raise SystemExit(
-                f"{test_name} registered QT_PLUGIN_PATH mismatch: "
-                f"expected {plugins}, got {registered_plugins}"
-            )
-        if environment.get("QT_QPA_PLATFORM") != "offscreen":
-            raise SystemExit(
-                f"{test_name} registered QT_QPA_PLATFORM is not exactly offscreen"
-            )
-        for variable in ("QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
-            if modifications.get(variable):
-                actual = tuple(Path(value) for value in reversed(modifications[variable]))
-                require_path_prefix(
-                    f"{test_name} registered {variable} modification",
-                    os.pathsep.join(str(path) for path in actual),
-                    (qml,),
-                )
+            if modifications.get("PATH"):
+                effective_order: list[str] = []
+                for runtime_dir in modifications["PATH"]:
+                    effective_order.insert(0, normalize_path(runtime_dir))
+                expected_order = [normalize_path(path) for path in runtime_dirs]
+                if effective_order != expected_order:
+                    raise SystemExit(
+                        f"{test_name} registered PATH modification order mismatch:\n"
+                        f"expected effective order: {expected_order}\n"
+                        f"actual effective order:   {effective_order}"
+                    )
             else:
                 require_path_prefix(
-                    f"{test_name} registered {variable}",
-                    environment.get(variable, ""),
-                    (qml,),
+                    f"{test_name} registered PATH",
+                    environment.get("PATH", ""),
+                    runtime_dirs,
                 )
+
+            registered_plugins = environment.get("QT_PLUGIN_PATH", "")
+            if not registered_plugins or normalize_path(
+                registered_plugins
+            ) != normalize_path(plugins):
+                raise SystemExit(
+                    f"{test_name} registered QT_PLUGIN_PATH mismatch: "
+                    f"expected {plugins}, got {registered_plugins}"
+                )
+            if environment.get("QT_QPA_PLATFORM") != "offscreen":
+                raise SystemExit(
+                    f"{test_name} registered QT_QPA_PLATFORM is not exactly offscreen"
+                )
+            for variable in ("QML_IMPORT_PATH", "QML2_IMPORT_PATH"):
+                if modifications.get(variable):
+                    actual = tuple(
+                        Path(value) for value in reversed(modifications[variable])
+                    )
+                    require_path_prefix(
+                        f"{test_name} registered {variable} modification",
+                        os.pathsep.join(str(path) for path in actual),
+                        (qml,),
+                    )
+                else:
+                    require_path_prefix(
+                        f"{test_name} registered {variable}",
+                        environment.get(variable, ""),
+                        (qml,),
+                    )
 
 
 def scan_policy_violations(

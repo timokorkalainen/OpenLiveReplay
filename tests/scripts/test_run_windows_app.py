@@ -56,6 +56,7 @@ class RunWindowsAppTests(unittest.TestCase):
             self.qt / "plugins",
             self.qt / "plugins" / "platforms",
             self.qt / "qml",
+            self.qt / "lib" / "cmake" / "Qt6",
             self.ffmpeg / "bin",
             self.ffmpeg / "lib",
             self.srt / "bin",
@@ -64,31 +65,43 @@ class RunWindowsAppTests(unittest.TestCase):
             directory.mkdir(parents=True)
         compiler = self.compiler / "g++.exe"
         compiler.write_bytes(b"compiler")
+        cmake = configured / "cmake" / "bin" / "cmake.exe"
+        cmake.parent.mkdir(parents=True)
+        cmake.write_bytes(b"cmake")
         cache = "\n".join(
             (
                 f"CMAKE_CXX_COMPILER:FILEPATH={compiler}",
+                f"CMAKE_COMMAND:INTERNAL={cmake}",
                 f"Qt6_DIR:PATH={self.qt / 'lib/cmake/Qt6'}",
                 f"OLR_FFMPEG_ROOT:PATH={self.ffmpeg}",
                 f"OLR_SRT_ROOT:PATH={self.srt}",
+                f"CMAKE_HOME_DIRECTORY:INTERNAL={self.workspace}",
             )
         )
         (self.build / "CMakeCache.txt").write_text(cache + "\n", encoding="utf-8")
 
     def test_runtime_uses_active_cache_roots_not_workspace_or_ambient_path(self) -> None:
         ambient = self.workspace / "windows_build" / "dist" / "ffmpeg" / "bin"
-        system_root = Path(self.temporary.name) / "Windows"
-        env = self.launcher.prepare_windows_app_runtime(
-            self.build,
-            self.app,
-            {
-                "PATH": str(ambient),
-                "SystemRoot": str(system_root),
-                "QT_PLUGIN_PATH": str(self.workspace / "poisoned-plugins"),
-                "QT_QPA_PLATFORM_PLUGIN_PATH": str(self.workspace / "poisoned-platforms"),
-                "QML_IMPORT_PATH": str(self.workspace / "poisoned-qml"),
-                "QML2_IMPORT_PATH": str(self.workspace / "poisoned-qml2"),
-            },
-        )
+        windows_dir = self.workspace / "api-windows"
+        system_dir = windows_dir / "System32"
+        with mock.patch.object(
+            self.launcher.runtime_guard,
+            "windows_system_directories",
+            return_value=(system_dir, windows_dir),
+            create=True,
+        ):
+            env = self.launcher.prepare_windows_app_runtime(
+                self.build,
+                self.app,
+                {
+                    "PATH": str(ambient),
+                    "SystemRoot": str(self.workspace / "hostile-windows"),
+                    "QT_PLUGIN_PATH": str(self.workspace / "poisoned-plugins"),
+                    "QT_QPA_PLATFORM_PLUGIN_PATH": str(self.workspace / "poisoned-platforms"),
+                    "QML_IMPORT_PATH": str(self.workspace / "poisoned-qml"),
+                    "QML2_IMPORT_PATH": str(self.workspace / "poisoned-qml2"),
+                },
+            )
         self.assertEqual(
             env["PATH"].split(os.pathsep),
             [
@@ -98,8 +111,8 @@ class RunWindowsAppTests(unittest.TestCase):
                 str(self.ffmpeg / "lib"),
                 str(self.srt / "bin"),
                 str(self.srt / "lib"),
-                str(system_root / "System32"),
-                str(system_root),
+                str(system_dir),
+                str(windows_dir),
             ],
         )
         self.assertNotIn(str(ambient), env["PATH"])
@@ -109,6 +122,29 @@ class RunWindowsAppTests(unittest.TestCase):
         )
         self.assertEqual(env["QML_IMPORT_PATH"], str(self.qt / "qml"))
         self.assertNotIn("poisoned", "\n".join(env.values()))
+
+    def test_cache_rejects_duplicate_wrong_type_and_relative_roots(self) -> None:
+        cache = self.build / "CMakeCache.txt"
+        original = cache.read_text(encoding="utf-8")
+        cases = (
+            (original + f"Qt6_DIR:PATH={self.workspace / 'other'}\n", "duplicate"),
+            (original.replace("Qt6_DIR:PATH=", "Qt6_DIR:STRING="), "type"),
+            (
+                original.replace(
+                    f"OLR_SRT_ROOT:PATH={self.srt}",
+                    "OLR_SRT_ROOT:PATH=relative/srt",
+                ),
+                "absolute",
+            ),
+        )
+        for contents, pattern in cases:
+            with self.subTest(pattern=pattern):
+                cache.write_text(contents, encoding="utf-8")
+                with self.assertRaises(Exception) as raised:
+                    self.launcher.prepare_windows_app_runtime(self.build, self.app, {})
+                self.assertIsInstance(raised.exception, ValueError)
+                self.assertRegex(str(raised.exception), pattern)
+        cache.write_text(original, encoding="utf-8")
 
     def test_runtime_requires_embedded_manifest_for_selected_app(self) -> None:
         with mock.patch.object(
@@ -235,6 +271,7 @@ class RunWindowsAppTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["env"], {"PATH": "controlled"})
         self.assertEqual(run.call_args.kwargs["cwd"], self.app.resolve().parent)
         self.assertTrue(run.call_args.kwargs["enabled"])
+        self.assertTrue(run.call_args.kwargs.get("private_desktop"))
         guard.__enter__.assert_called_once()
         guard.__exit__.assert_called_once()
 
