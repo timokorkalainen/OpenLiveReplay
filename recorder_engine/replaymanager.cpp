@@ -630,8 +630,13 @@ void ReplayManager::resetSourceTimecode(int sourceIndex) {
     m_sourceTimecodeIdentity[sourceIndex] = SourceTimecodeIdentity{};
 }
 
-void ReplayManager::onFrameTimecode(int sourceIndex, TimecodeEvidence evidence) {
+void ReplayManager::onFrameTimecode(int sourceIndex, uint64_t carrierEpoch,
+                                    TimecodeEvidence evidence) {
     if (sourceIndex < 0 || sourceIndex >= TimecodeAlignerV2::kMaxSources) return;
+    if (sourceIndex < m_workers.size() && m_workers[sourceIndex] &&
+        m_workers[sourceIndex]->currentCarrierEpoch() != carrierEpoch) {
+        return;
+    }
     if (evidence.discontinuity) {
         resetSourceTimecode(sourceIndex);
         return;

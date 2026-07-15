@@ -10,6 +10,10 @@
 #include "recorder_engine/timing/sourceoffsetestimator.h"
 #include "recorder_engine/timing/timingreference.h"
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 namespace {
 
 class OneFrameDelayedEncoder final : public NativeVideoEncoder {
@@ -35,6 +39,39 @@ private:
     std::optional<int64_t> m_pendingPts;
 };
 
+AVCodecContext* makeDelayedMpeg2Encoder() {
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
+    if (!codec) return nullptr;
+    AVCodecContext* context = avcodec_alloc_context3(codec);
+    if (!context) return nullptr;
+    context->width = 64;
+    context->height = 64;
+    context->time_base = AVRational{1, 30};
+    context->framerate = AVRational{30, 1};
+    context->pix_fmt = AV_PIX_FMT_YUV420P;
+    context->gop_size = 12;
+    context->max_b_frames = 1;
+    context->bit_rate = 2'000'000;
+    if (avcodec_open2(context, codec, nullptr) < 0) {
+        avcodec_free_context(&context);
+        return nullptr;
+    }
+    return context;
+}
+
+AVFrame* makeSoftwareFrame() {
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) return nullptr;
+    frame->format = AV_PIX_FMT_YUV420P;
+    frame->width = 64;
+    frame->height = 64;
+    if (av_frame_get_buffer(frame, 32) < 0) {
+        av_frame_free(&frame);
+        return nullptr;
+    }
+    return frame;
+}
+
 } // namespace
 
 // Exercises the production seam ReplayManager::onFrameTimecode -> m_tcAligner.observe
@@ -52,8 +89,19 @@ private slots:
     void streamWorkerCarriesSelectedEvidenceExactlyOnce();
     void delayedNativeOutputUsesEvidenceForPacketPts();
     void delayedNativeOutputAcrossGenerationResetDropsOldEvidence();
+    void delayedSoftwareOutputUsesEvidenceForPacketPts();
+    void delayedSoftwareCompletionAfterResetDropsEvidence();
     void completionAfterGenerationResetDropsOldEvidence();
     void sharedNativeGpuMuxCallbackReportsRejectedCompletion();
+    void oldCaptureSessionCannotEnqueueAfterReplacement();
+    void oldSessionEndCannotInvalidateNewSession();
+    void oppositeConnectionTransitionsRemainOrdered();
+    void reentrantConnectionTransitionDoesNotDeadlock();
+    void queuedTimecodeIsRejectedAfterCarrierRotation();
+    void muxSubmissionCapturesCarrierEpochAtomically();
+    void concurrentEvidenceIdentitiesAreLinearized();
+    void concurrentCarrierRotationNeverErasesNewEpochEntry();
+    void unstampedEvidenceCannotEncodeOrSeedTimecode();
     void boundedDriftReportsNonzeroUiBound();
     void overConfidenceTimecodeDoesNotMoveServo();
     void disconnectClearsTimecodeAnchor();
@@ -113,7 +161,8 @@ private:
 
     static bool feedEvidence(ReplayManager& m, int src, const TimecodeEvidence& value) {
         return QMetaObject::invokeMethod(&m, "onFrameTimecode", Qt::DirectConnection,
-                                         Q_ARG(int, src), Q_ARG(TimecodeEvidence, value));
+                                         Q_ARG(int, src), Q_ARG(uint64_t, uint64_t(0)),
+                                         Q_ARG(TimecodeEvidence, value));
     }
 
     static bool feedFrameTimecode(ReplayManager& m, int src, int64_t tc, int64_t frame,
@@ -179,16 +228,17 @@ void TestReplayManagerTimecode::streamWorkerCarriesSelectedEvidenceExactlyOnce()
 
     ReplayManager manager;
     StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1);
+    worker.beginCaptureSession();
+    manager.m_workers.append(&worker);
+    QVERIFY(QObject::connect(&worker, &StreamWorker::frameTimecode, &manager,
+                             &ReplayManager::onFrameTimecode, Qt::QueuedConnection));
     worker.moveToThread(&worker);
-    QVERIFY(QObject::connect(&worker, SIGNAL(frameTimecode(int, TimecodeEvidence)), &manager,
-                             SLOT(onFrameTimecode(int, TimecodeEvidence)), Qt::QueuedConnection));
-
     int deliveryCount = 0;
     TimecodeEvidence delivered;
     QThread* deliveryThread = nullptr;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&](int sourceIndex, TimecodeEvidence value) {
+        [&](int sourceIndex, uint64_t, TimecodeEvidence value) {
             QCOMPARE(sourceIndex, 0);
             ++deliveryCount;
             delivered = value;
@@ -200,6 +250,7 @@ void TestReplayManagerTimecode::streamWorkerCarriesSelectedEvidenceExactlyOnce()
     auto cleanup = qScopeGuard([&] {
         worker.stop();
         worker.wait();
+        manager.m_workers.clear();
         muxer.close();
     });
     QTRY_VERIFY_WITH_TIMEOUT(worker.isRunning(), 2000);
@@ -252,7 +303,9 @@ void TestReplayManagerTimecode::streamWorkerCarriesSelectedEvidenceExactlyOnce()
     QCOMPARE(delivered.timingGeneration, uint64_t(11));
     QCOMPARE(delivered.provenance, TimecodeProvenance::Ndi);
     QCOMPARE(delivered.quantizationBoundUs, int64_t(250));
-    QCOMPARE(delivered.arrivalSessionFrame, int64_t(11));
+    // The encoder delays the packet until the following tick, but evidence remains
+    // bound to the input frame whose PTS the packet actually carries.
+    QCOMPARE(delivered.arrivalSessionFrame, int64_t(10));
     QCOMPARE(delivered.sessionRate, (FrameRateQ{30, 1}));
 
     TimecodeEvidence follower = delivered;
@@ -285,6 +338,7 @@ void TestReplayManagerTimecode::streamWorkerCarriesSelectedEvidenceExactlyOnce()
 
     worker.stop();
     QVERIFY(worker.wait(5000));
+    manager.m_workers.clear();
     muxer.close();
     cleanup.dismiss();
 
@@ -312,11 +366,13 @@ void TestReplayManagerTimecode::delayedNativeOutputUsesEvidenceForPacketPts() {
     worker.m_latestFrame->width = 64;
     worker.m_latestFrame->height = 64;
     QVERIFY(av_frame_get_buffer(worker.m_latestFrame, 32) >= 0);
+    worker.beginCaptureSession();
+    worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
 
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int sourceIndex, TimecodeEvidence value) {
+        [&delivered](int sourceIndex, uint64_t, TimecodeEvidence value) {
             QCOMPARE(sourceIndex, 0);
             delivered.append(value);
         },
@@ -348,6 +404,14 @@ void TestReplayManagerTimecode::delayedNativeOutputUsesEvidenceForPacketPts() {
 void TestReplayManagerTimecode::delayedNativeOutputAcrossGenerationResetDropsOldEvidence() {
     QTemporaryDir output;
     QVERIFY(output.isValid());
+    const QByteArray previousGrace = qgetenv("OLR_MUXER_TMCD_GRACE_MS");
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "0");
+    const auto restoreGrace = qScopeGuard([previousGrace] {
+        if (previousGrace.isNull())
+            qunsetenv("OLR_MUXER_TMCD_GRACE_MS");
+        else
+            qputenv("OLR_MUXER_TMCD_GRACE_MS", previousGrace);
+    });
 
     Muxer muxer;
     muxer.setOutputDirectory(output.path());
@@ -364,11 +428,13 @@ void TestReplayManagerTimecode::delayedNativeOutputAcrossGenerationResetDropsOld
     worker.m_latestFrame->width = 64;
     worker.m_latestFrame->height = 64;
     QVERIFY(av_frame_get_buffer(worker.m_latestFrame, 32) >= 0);
+    worker.beginCaptureSession();
+    worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
 
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, TimecodeEvidence value) { delivered.append(value); },
+        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
 
     const TimecodeEvidence oldGeneration = evidence(tcFrames(1, 0, 0, 0), 20, 30, 1, 7, 11);
@@ -378,13 +444,16 @@ void TestReplayManagerTimecode::delayedNativeOutputAcrossGenerationResetDropsOld
 
     const TimecodeEvidence firstNewGeneration = evidence(tcFrames(2, 0, 0, 0), 21, 30, 1, 8, 12);
     worker.m_latestFrameTimecodeEvidence = firstNewGeneration;
+    worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
     worker.m_internalFrameCount = 21;
     worker.processEncoderTick(nullptr, 700, 0, 0);
     QTest::qWait(100);
     QCOMPARE(delivered.size(), 0);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
 
     const TimecodeEvidence secondNewGeneration = evidence(tcFrames(2, 0, 0, 1), 22, 30, 1, 8, 12);
     worker.m_latestFrameTimecodeEvidence = secondNewGeneration;
+    worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
     worker.m_internalFrameCount = 22;
     worker.processEncoderTick(nullptr, 733, 0, 0);
 
@@ -396,6 +465,131 @@ void TestReplayManagerTimecode::delayedNativeOutputAcrossGenerationResetDropsOld
 
     av_frame_free(&worker.m_latestFrame);
     muxer.close();
+}
+
+void TestReplayManagerTimecode::delayedSoftwareOutputUsesEvidenceForPacketPts() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-delayed-software"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1);
+    worker.setViewTrack(0);
+    worker.m_latestFrame = makeSoftwareFrame();
+    QVERIFY(worker.m_latestFrame != nullptr);
+    worker.beginCaptureSession();
+    worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
+    AVCodecContext* encoder = makeDelayedMpeg2Encoder();
+    QVERIFY(encoder != nullptr);
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int sourceIndex, uint64_t, TimecodeEvidence value) {
+            QCOMPARE(sourceIndex, 0);
+            delivered.append(value);
+        },
+        Qt::QueuedConnection));
+
+    const TimecodeEvidence first = evidence(tcFrames(1, 0, 0, 0), 40, 30, 1, 7, 11);
+    worker.m_latestFrameTimecodeEvidence = first;
+    worker.m_latestFrameTimecode100ns.store(1, std::memory_order_release);
+    worker.m_internalFrameCount = 40;
+    worker.processEncoderTick(encoder, 1333, 0, 0);
+    QCOMPARE(delivered.size(), 0);
+
+    const TimecodeEvidence second = evidence(tcFrames(2, 0, 0, 0), 41, 30, 1, 7, 11);
+    worker.m_latestFrameTimecodeEvidence = second;
+    worker.m_latestFrameTimecode100ns.store(2, std::memory_order_release);
+    worker.m_internalFrameCount = 41;
+    worker.processEncoderTick(encoder, 1366, 0, 0);
+
+    QTRY_COMPARE_WITH_TIMEOUT(delivered.size(), 1, 5000);
+    QCOMPARE(delivered.front().frameOfDay, first.frameOfDay);
+    QCOMPARE(delivered.front().arrivalSessionFrame, int64_t(40));
+
+    avcodec_free_context(&encoder);
+    av_frame_free(&worker.m_latestFrame);
+    muxer.close();
+}
+
+void TestReplayManagerTimecode::delayedSoftwareCompletionAfterResetDropsEvidence() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    const QByteArray previousGrace = qgetenv("OLR_MUXER_TMCD_GRACE_MS");
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "0");
+    const auto restoreGrace = qScopeGuard([previousGrace] {
+        if (previousGrace.isNull())
+            qunsetenv("OLR_MUXER_TMCD_GRACE_MS");
+        else
+            qputenv("OLR_MUXER_TMCD_GRACE_MS", previousGrace);
+    });
+
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    const QString baseName = QStringLiteral("timecode-delayed-software-reset");
+    QVERIFY(muxer.init(baseName, 1, 64, 64, 30, {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1);
+    worker.setViewTrack(0);
+    worker.m_latestFrame = makeSoftwareFrame();
+    QVERIFY(worker.m_latestFrame != nullptr);
+    worker.beginCaptureSession();
+    worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
+    AVCodecContext* encoder = makeDelayedMpeg2Encoder();
+    QVERIFY(encoder != nullptr);
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        Qt::QueuedConnection));
+
+    const TimecodeEvidence first = evidence(tcFrames(1, 0, 0, 0), 50, 30, 1, 7, 11);
+    worker.m_latestFrameTimecodeEvidence = first;
+    worker.m_latestFrameTimecode100ns.store(1, std::memory_order_release);
+    worker.m_internalFrameCount = 50;
+    worker.processEncoderTick(encoder, 1666, 0, 0);
+    QCOMPARE(delivered.size(), 0);
+
+    worker.m_latestFrameTimecodeEvidence.reset();
+    worker.m_internalFrameCount = 51;
+    worker.m_beforeMuxPacketWriteForTest = [&worker] { worker.clearMuxFrameEvidence(); };
+    worker.processEncoderTick(encoder, 1700, 0, 0);
+
+    QTest::qWait(100);
+    QCOMPARE(delivered.size(), 0);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
+
+    // MPEG-2 B-frame order emits post-reset frame 52 next. It is evidence-free but
+    // properly mapped, so it remains valid and becomes the first written packet.
+    worker.m_latestFrameCarrierToken = worker.snapshotActiveCarrierToken();
+    worker.m_internalFrameCount = 52;
+    worker.processEncoderTick(encoder, 1733, 0, 0);
+    QTRY_COMPARE_WITH_TIMEOUT(muxer.minWrittenVideoPtsMs(), int64_t(1733), 5000);
+
+    // The following B-frame output belongs to pre-reset frame 51, whose mapping
+    // was cleared. It must be rejected rather than lowering the written minimum
+    // to 1700 ms as the old epoch-inference behavior did.
+    worker.m_internalFrameCount = 53;
+    worker.processEncoderTick(encoder, 1766, 0, 0);
+    QTest::qWait(100);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(1733));
+
+    avcodec_free_context(&encoder);
+    av_frame_free(&worker.m_latestFrame);
+    muxer.close();
+
+    AVFormatContext* input = nullptr;
+    const QByteArray path = output.filePath(baseName + QStringLiteral(".mkv")).toUtf8();
+    QVERIFY(avformat_open_input(&input, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&input] { avformat_close_input(&input); });
+    QVERIFY(avformat_find_stream_info(input, nullptr) >= 0);
+    QVERIFY2(av_dict_get(input->metadata, "timecode", nullptr, 0) == nullptr,
+             "a stale software completion must not seed the recording timecode tag");
 }
 
 void TestReplayManagerTimecode::completionAfterGenerationResetDropsOldEvidence() {
@@ -413,7 +607,7 @@ void TestReplayManagerTimecode::completionAfterGenerationResetDropsOldEvidence()
     QList<TimecodeEvidence> delivered;
     QVERIFY(QObject::connect(
         &worker, &StreamWorker::frameTimecode, this,
-        [&delivered](int, TimecodeEvidence value) { delivered.append(value); },
+        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
         Qt::QueuedConnection));
 
     const TimecodeEvidence oldGeneration = evidence(tcFrames(1, 0, 0, 0), 30, 30, 1, 7, 11);
@@ -425,9 +619,13 @@ void TestReplayManagerTimecode::completionAfterGenerationResetDropsOldEvidence()
 
     auto callback = worker.makeMuxerWriteCallback(0, stream, nullptr, {}, {});
     callback(QByteArray::fromHex("000001b300100113"), 30, true);
-    QTRY_VERIFY_WITH_TIMEOUT(muxer.minWrittenVideoPtsMs() >= 0, 5000);
     QTest::qWait(100);
     QCOMPARE(delivered.size(), 0);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
+
+    worker.clearMuxFrameEvidence();
+    callback(QByteArray::fromHex("000001b300100113"), 32, true);
+    QTRY_VERIFY_WITH_TIMEOUT(muxer.minWrittenVideoPtsMs() >= 0, 5000);
 
     muxer.close();
 }
@@ -458,6 +656,213 @@ void TestReplayManagerTimecode::sharedNativeGpuMuxCallbackReportsRejectedComplet
     QCOMPARE(completionCount, 1);
     QVERIFY(!completionWritten);
     QVERIFY(!acceptedPacket);
+}
+
+void TestReplayManagerTimecode::oldCaptureSessionCannotEnqueueAfterReplacement() {
+    StreamWorker worker(QStringLiteral("old"), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    const uint64_t oldSession = worker.beginCaptureSession();
+    worker.changeSource(QStringLiteral("new"));
+
+    DecodedVideoFrame late;
+    late.frame = makeSoftwareFrame();
+    QVERIFY(late.frame != nullptr);
+    late.sourcePtsMs = 0;
+    late.timecodeEvidence = evidence(tcFrames(1, 0, 0, 0), 1, 30, 1, 7, 11);
+    worker.enqueueDecodedVideoFrameForSession(std::move(late), oldSession);
+    QCOMPARE(worker.m_frameQueue.size(), 0);
+
+    const uint64_t newSession = worker.beginCaptureSession();
+    DecodedVideoFrame current;
+    current.frame = makeSoftwareFrame();
+    QVERIFY(current.frame != nullptr);
+    current.sourcePtsMs = 0;
+    // Deliberately reuse the same sourceGeneration: session identity, not decoder
+    // generation, is what rejects the late callback.
+    current.timecodeEvidence = evidence(tcFrames(1, 0, 0, 1), 2, 30, 1, 7, 11);
+    worker.enqueueDecodedVideoFrameForSession(std::move(current), newSession);
+    QCOMPARE(worker.m_frameQueue.size(), 1);
+    auto queued = worker.m_frameQueue.dequeue();
+    av_frame_free(&queued.frame);
+}
+
+void TestReplayManagerTimecode::oldSessionEndCannotInvalidateNewSession() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    const uint64_t oldSession = worker.beginCaptureSession();
+    const uint64_t newSession = worker.beginCaptureSession();
+    const uint64_t newEpoch = worker.currentCarrierEpoch();
+
+    worker.endCaptureSession(oldSession);
+
+    QCOMPARE(worker.currentCarrierEpoch(), newEpoch);
+    QVERIFY(worker.snapshotCarrierTokenForSession(newSession) != nullptr);
+}
+
+void TestReplayManagerTimecode::oppositeConnectionTransitionsRemainOrdered() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    std::mutex observedMutex;
+    QList<bool> observed;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::connectionChanged, &worker,
+        [&](int, bool connected) {
+            std::lock_guard<std::mutex> lock(observedMutex);
+            observed.append(connected);
+        },
+        Qt::DirectConnection));
+    worker.setConnected(true);
+
+    for (int iteration = 0; iteration < 50; ++iteration) {
+        std::atomic<bool> go{false};
+        std::thread disconnect([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            worker.setConnected(false);
+        });
+        std::thread reconnect([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            worker.setConnected(true);
+        });
+        go.store(true, std::memory_order_release);
+        disconnect.join();
+        reconnect.join();
+        QCoreApplication::processEvents();
+
+        std::lock_guard<std::mutex> lock(observedMutex);
+        QVERIFY(!observed.isEmpty());
+        QCOMPARE(observed.back(), worker.m_connected.load(std::memory_order_acquire));
+    }
+}
+
+void TestReplayManagerTimecode::reentrantConnectionTransitionDoesNotDeadlock() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    QList<bool> observed;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::connectionChanged, &worker,
+        [&](int, bool connected) {
+            observed.append(connected);
+            if (connected) worker.setConnected(false);
+        },
+        Qt::DirectConnection));
+
+    worker.setConnected(true);
+    QCoreApplication::processEvents();
+
+    QCOMPARE(observed, (QList<bool>{true, false}));
+    QVERIFY(!worker.m_connected.load(std::memory_order_acquire));
+}
+
+void TestReplayManagerTimecode::queuedTimecodeIsRejectedAfterCarrierRotation() {
+    ReplayManager manager;
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    manager.m_workers.append(&worker);
+    QVERIFY(QObject::connect(&worker, &StreamWorker::frameTimecode, &manager,
+                             &ReplayManager::onFrameTimecode, Qt::QueuedConnection));
+
+    const uint64_t postedEpoch = worker.currentCarrierEpoch();
+    worker.frameTimecode(0, postedEpoch, evidence(tcFrames(1, 0, 0, 0), 10));
+    worker.clearMuxFrameEvidence();
+    QCoreApplication::processEvents();
+
+    QVERIFY(!manager.m_tcAligner.hasTimecode(0));
+    manager.m_workers.clear();
+}
+
+void TestReplayManagerTimecode::muxSubmissionCapturesCarrierEpochAtomically() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    worker.beginCaptureSession();
+    const uint64_t originalEpoch = worker.currentCarrierEpoch();
+    const TimecodeEvidence value = evidence(tcFrames(1, 0, 0, 0), 1, 30, 1, 7, 11);
+
+    const auto submission = worker.enqueueMuxFrameEvidence(1, -1, value);
+    QCOMPARE(submission.carrierEpoch, originalEpoch);
+    QVERIFY(submission.id > 0);
+
+    worker.clearMuxFrameEvidence();
+    QVERIFY(worker.currentCarrierEpoch() != submission.carrierEpoch);
+    QVERIFY(!worker.muxFrameEvidenceIsCurrent(submission.carrierEpoch));
+}
+
+void TestReplayManagerTimecode::concurrentEvidenceIdentitiesAreLinearized() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    worker.beginCaptureSession();
+    const TimecodeEvidence identityA = evidence(tcFrames(1, 0, 0, 0), 1, 30, 1, 7, 11);
+    const TimecodeEvidence identityB = evidence(tcFrames(2, 0, 0, 0), 2, 30, 1, 8, 12);
+    std::atomic<bool> go{false};
+    std::thread producerA([&] {
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        worker.enqueueMuxFrameEvidence(1, -1, identityA);
+    });
+    std::thread producerB([&] {
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        worker.enqueueMuxFrameEvidence(2, -1, identityB);
+    });
+    go.store(true, std::memory_order_release);
+    producerA.join();
+    producerB.join();
+
+    QCOMPARE(worker.m_muxFrameEvidence.size(), 1);
+    auto remaining = worker.takeMuxFrameEvidence(1);
+    if (!remaining) remaining = worker.takeMuxFrameEvidence(2);
+    QVERIFY(remaining.has_value());
+    QCOMPARE(remaining->carrierGeneration, worker.currentCarrierEpoch());
+}
+
+void TestReplayManagerTimecode::concurrentCarrierRotationNeverErasesNewEpochEntry() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    worker.beginCaptureSession();
+    const TimecodeEvidence value = evidence(tcFrames(1, 0, 0, 0), 1, 30, 1, 7, 11);
+
+    for (int iteration = 0; iteration < 50; ++iteration) {
+        std::atomic<bool> go{false};
+        const int64_t pts = 100 + iteration;
+        std::thread producer([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            worker.enqueueMuxFrameEvidence(pts, -1, value);
+        });
+        std::thread rotator([&] {
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            worker.clearMuxFrameEvidence();
+        });
+        go.store(true, std::memory_order_release);
+        producer.join();
+        rotator.join();
+
+        auto remaining = worker.takeMuxFrameEvidence(pts);
+        if (remaining) QCOMPARE(remaining->carrierGeneration, worker.currentCarrierEpoch());
+        worker.clearMuxFrameEvidence();
+    }
+}
+
+void TestReplayManagerTimecode::unstampedEvidenceCannotEncodeOrSeedTimecode() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-unstamped"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1);
+    worker.setViewTrack(0);
+    worker.m_latestFrame = makeSoftwareFrame();
+    QVERIFY(worker.m_latestFrame != nullptr);
+    worker.m_latestFrameTimecodeEvidence = evidence(tcFrames(1, 0, 0, 0), 1);
+    worker.m_latestFrameTimecode100ns.store(1, std::memory_order_release);
+    worker.m_latestFrameCarrierToken.reset();
+    AVCodecContext* encoder = makeDelayedMpeg2Encoder();
+    QVERIFY(encoder != nullptr);
+
+    worker.m_internalFrameCount = 1;
+    worker.processEncoderTick(encoder, 33, 0, 0);
+    QTest::qWait(50);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
+
+    avcodec_free_context(&encoder);
+    av_frame_free(&worker.m_latestFrame);
+    muxer.close();
 }
 
 void TestReplayManagerTimecode::boundedDriftReportsNonzeroUiBound() {

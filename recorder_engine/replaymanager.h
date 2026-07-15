@@ -204,7 +204,7 @@ private slots:
 
     // Queued from each StreamWorker::frameTimecode after mux completion. Consumes the
     // typed source identity, rate, uncertainty, and mux-session arrival together.
-    void onFrameTimecode(int sourceIndex, TimecodeEvidence evidence);
+    void onFrameTimecode(int sourceIndex, uint64_t carrierEpoch, TimecodeEvidence evidence);
 
     // Queued from each StreamWorker::statsUpdated (~1/sec). Caches the source's
     // latest IngestStats, re-runs the inter-camera phase estimation, then STAMPS the
@@ -218,6 +218,9 @@ private slots:
     void onSourcePhaseConnectionChanged(int sourceIndex, bool connected);
 
 private:
+#ifdef OLR_UNIT_TEST
+    friend class TestReplayManagerTimecode;
+#endif
     void writeBlueFrames(int64_t elapsedMs);
 
     // Re-pick the reference source (highest ClockQuality among sources that have

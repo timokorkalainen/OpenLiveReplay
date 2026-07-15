@@ -279,15 +279,19 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
     m_fatalWriteError.store(false, std::memory_order_relaxed);
     m_consecutiveWriteErrors = 0;
 
+    {
+        std::lock_guard<std::mutex> queueLock(m_qMutex);
+        m_acceptedStartTimecodeCandidate.clear();
+        m_startTimecodeCandidateWindowClosed = false;
+    }
+
     m_initialized = true;
 
-    // Start the dedicated writer thread. The header has NOT been written yet, but
-    // every write path calls ensureHeaderWritten() before enqueuing a packet, so
-    // by the time the writer thread pops anything the header is in place. From here
-    // until close() joins it, the writer thread is the ONLY thread that calls
-    // av_write_frame/avio_flush on m_outCtx; the header write itself happens on the
-    // ENQUEUEING (caller) thread, before the packet is handed off, so it never
-    // races the writer thread.
+    // Start the dedicated writer thread. The header remains deferred until that
+    // thread is ready to write the first accepted packet, allowing a bounded grace
+    // period for a source timecode candidate. From here until close() joins it, the
+    // writer thread is the ONLY thread that writes the header or calls
+    // av_write_frame/avio_flush on m_outCtx.
     m_blockingWritesAllowed.store(true, std::memory_order_release);
     m_writerRunning = true;
     m_writerThread = std::thread(&Muxer::writerLoop, this);
@@ -348,7 +352,8 @@ void Muxer::setStartTimecodeCandidate(const QString& tc) {
     }
 }
 
-bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten) {
+bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten,
+                        const QString& startTimecodeCandidate, PacketCarrierGuard carrierGuard) {
     // ENQUEUE-ONLY. Clone the caller's packet (the caller still owns theirs,
     // exactly as before) and hand the clone to the writer thread, then return
     // immediately. The DTS-bump, av_write_frame and avio_flush all happen on
@@ -400,6 +405,22 @@ bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten) {
         av_packet_free(&localPkt);
         if (onWritten) onWritten(false);
         return false;
+    }
+    // The caller may have validated an immutable carrier before blocking on
+    // backpressure. Recheck immediately before candidate/queue commit so a reset
+    // during that wait cannot admit stale packet metadata.
+    if (!carrierGuard.accepts()) {
+        lk.unlock();
+        av_packet_free(&localPkt);
+        if (onWritten) onWritten(false);
+        return false;
+    }
+    // Commit only after every rejection point above. This critical section is
+    // also the queue append, so the first accepted valid candidate wins in the
+    // same order that concurrent producers enter the writer queue.
+    if (!m_startTimecodeCandidateWindowClosed && m_acceptedStartTimecodeCandidate.isEmpty() &&
+        isWellFormedTimecode(startTimecodeCandidate)) {
+        m_acceptedStartTimecodeCandidate = startTimecodeCandidate;
     }
     m_pktQueue.push(QueuedPacket{localPkt, std::move(onWritten)});
     lk.unlock();
@@ -496,15 +517,32 @@ void Muxer::writerLoop() {
             // reorder, no drop — and re-loop after a short sleep until the grace
             // resolves (a candidate arrives or the window expires). Only honour the
             // deferral while still running; on shutdown drain immediately so close()
-            // never wedges. Released the q lock first so setStartTimecodeCandidate /
-            // ensureHeaderWritten (both take m_headerMutex) never block the producer.
+            // never wedges. Release qMutex before publishing the candidate or
+            // inspecting header state, since both operations take m_headerMutex.
+            const QString acceptedCandidate = m_acceptedStartTimecodeCandidate;
+            lk.unlock();
+            if (!acceptedCandidate.isEmpty()) setStartTimecodeCandidate(acceptedCandidate);
+#ifdef OLR_UNIT_TEST
+            auto snapshotHook = std::move(m_afterCandidateSnapshotForTest);
+            if (snapshotHook) snapshotHook();
+#endif
             if (m_writerRunning.load(std::memory_order_acquire) && headerWriteDeferred()) {
-                lk.unlock();
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 continue;
             }
+
+            // Grace has resolved. Reacquire qMutex once to include a candidate
+            // accepted after the first snapshot but before this decision, then
+            // close the candidate window. Producers accepted after this point are
+            // ordered after the header boundary and cannot retroactively seed it.
+            lk.lock();
+            const QString finalAcceptedCandidate = m_acceptedStartTimecodeCandidate;
+            m_startTimecodeCandidateWindowClosed = true;
             queued = std::move(m_pktQueue.front());
             m_pktQueue.pop();
+            lk.unlock();
+            if (!finalAcceptedCandidate.isEmpty())
+                setStartTimecodeCandidate(finalAcceptedCandidate);
         }
         // Notify a possibly back-pressured producer that there is now room.
         m_qCv.notify_one();

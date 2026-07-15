@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <deque>
 #include <thread>
 
 #include "recordingclock.h"
@@ -122,6 +123,7 @@ public:
     void stop();
 
     int sourceIndex() const { return m_sourceIndex; }
+    uint64_t currentCarrierEpoch() const { return m_carrierEpoch.load(std::memory_order_acquire); }
 
 #ifdef OLR_UNIT_TEST
     friend class TestStreamWorkerGpuEncode;
@@ -145,7 +147,7 @@ signals:
     // Emitted after the muxer confirms that the selected frame's packet was written.
     // The evidence is rebound to the session frame where it was muxed and consumed
     // one-shot, so held CFR frames cannot report the same observation twice.
-    void frameTimecode(int sourceIndex, TimecodeEvidence evidence);
+    void frameTimecode(int sourceIndex, uint64_t carrierEpoch, TimecodeEvidence evidence);
 
 public slots:
     void onMasterPulse(int64_t frameIndex, int64_t streamTimeMs);
@@ -154,6 +156,15 @@ protected:
     void run() override;
 
 private:
+    struct SourceCarrierToken {
+        uint64_t sessionIdentity = 0;
+        uint64_t epoch = 0;
+    };
+    struct MuxFrameEvidenceSubmission {
+        uint64_t id = 0;
+        uint64_t carrierEpoch = 0;
+    };
+
     QString m_url;
     int m_sourceIndex;            // Fixed: identity of this source
     std::atomic<int> m_viewTrack; // Dynamic: muxer track to write to (-1 = none)
@@ -165,6 +176,7 @@ private:
     // alignment uses m_latestFrameTimecodeEvidence below.
     std::atomic<int64_t> m_latestFrameTimecode100ns{-1};
     std::optional<TimecodeEvidence> m_latestFrameTimecodeEvidence;
+    std::shared_ptr<const SourceCarrierToken> m_latestFrameCarrierToken;
     int64_t m_internalFrameCount;
     RecordingClock* m_sharedClock;
 
@@ -182,6 +194,11 @@ private:
     QMutex m_urlMutex;
     QMutex m_metadataMutex;
     QMutex m_sessionMutex;
+    mutable std::mutex m_epochMutex;
+    uint64_t m_nextCaptureSessionIdentity = 0;
+    uint64_t m_activeCaptureSessionIdentity = 0;
+    std::shared_ptr<const SourceCarrierToken> m_activeCarrierToken;
+    std::atomic<uint64_t> m_carrierEpoch{1};
     QByteArray m_sourceMetadataJson;          // JSON blob for per-frame subtitle track
     IngestSession* m_activeSession = nullptr; // guarded by m_sessionMutex
 
@@ -199,6 +216,9 @@ private:
     std::atomic<int64_t> m_lastFrameEnqueueAtMs{-1};
     int m_stallTimeoutMs = 8000;
     std::atomic<bool> m_connected{false};
+    std::mutex m_connectionTransitionMutex;
+    std::deque<bool> m_pendingConnectionEmissions;
+    bool m_connectionDrainScheduled = false;
     // signed ms (+delay / -advance). Relaxed: standalone value, no associated
     // data to synchronize. Only setTrimOffsetMs() (clamped) writes it.
     std::atomic<int> m_trimOffsetMs{0};
@@ -218,6 +238,7 @@ private:
     // Atomically update m_connected and emit connectionChanged on a real
     // transition (false<->true). Called from the capture thread.
     void setConnected(bool c);
+    void drainConnectionEmissions();
 
     // Last jitter-pull gate published by the tick thread (file-timeline ms,
     // -1 until the first tick).  The capture thread uses it to pre-drain
@@ -252,6 +273,7 @@ private:
         // Alignment consumes the full typed evidence value alongside the frame.
         int64_t sourceTimecode100ns = -1;
         std::optional<TimecodeEvidence> timecodeEvidence;
+        std::shared_ptr<const SourceCarrierToken> carrierToken;
 #ifdef OLR_GPU_PIPELINE_BUILD
         FrameHandle gpuFrame;
         uint64_t gpuFenceValue = 0;
@@ -278,6 +300,7 @@ private:
     uint64_t m_latestGpuFenceValue = 0;
     std::atomic<int64_t> m_latestGpuFrameTimecode100ns{-1};
     std::shared_ptr<const TimecodeEvidence> m_latestGpuFrameTimecodeEvidence;
+    std::shared_ptr<const SourceCarrierToken> m_latestGpuFrameCarrierToken;
 #endif
 
     // FFmpeg helpers
@@ -292,19 +315,29 @@ private:
     NativeVideoEncoder::PacketCallback makeMuxerWriteCallback(
         int track, AVStream* st, bool* havePacket,
         std::function<void()> beforePacketWrite = std::function<void()>{},
-        std::function<void(bool)> afterPacketWritten = std::function<void(bool)>{});
+        std::function<void(bool)> afterPacketWritten = std::function<void(bool)>{},
+        uint64_t expectedCarrierEpoch = 0);
     void enqueueDecodedVideoFrame(DecodedVideoFrame decoded);
+    void enqueueDecodedVideoFrameForSession(DecodedVideoFrame decoded, uint64_t sessionIdentity);
+    uint64_t beginCaptureSession();
+    void endCaptureSession(uint64_t sessionIdentity);
+    std::shared_ptr<const SourceCarrierToken> snapshotActiveCarrierToken() const;
+    std::shared_ptr<const SourceCarrierToken>
+    snapshotCarrierTokenForSession(uint64_t sessionIdentity) const;
+    void rotateCarrier(bool retainActiveSession);
+    bool carrierTokenIsCurrent(const std::shared_ptr<const SourceCarrierToken>& token) const;
     std::optional<TimecodeEvidence>
     takeFrameTimecodeEvidenceForMux(std::optional<TimecodeEvidence>& selected,
                                     int64_t sessionFrameIndex) const;
-    uint64_t enqueueMuxFrameEvidence(int64_t ptsTicks, int64_t sourceTimecode100ns,
-                                     const std::optional<TimecodeEvidence>& evidence);
+    MuxFrameEvidenceSubmission
+    enqueueMuxFrameEvidence(int64_t ptsTicks, int64_t sourceTimecode100ns,
+                            const std::optional<TimecodeEvidence>& evidence);
     std::optional<DecodedFrameEvidence> takeMuxFrameEvidence(int64_t ptsTicks);
     void discardMuxFrameEvidence(uint64_t submissionId);
     void clearMuxFrameEvidence();
     void resetMuxFrameEvidenceLocked();
     bool muxFrameEvidenceIsCurrent(uint64_t epoch) const;
-    void emitFrameTimecodeEvidence(const TimecodeEvidence& evidence);
+    void emitFrameTimecodeEvidence(const TimecodeEvidence& evidence, uint64_t carrierEpoch);
 #ifdef OLR_UNIT_TEST
     // One-shot seam for exercising the real write-rejection branch after frame
     // selection and encoding. Success-path tests leave it empty and use the real
@@ -318,7 +351,6 @@ private:
     std::mutex m_muxFrameEvidenceMutex;
     DecodedFrameEvidenceQueue m_muxFrameEvidence{64};
     std::optional<TimecodeEvidence> m_muxFrameEvidenceIdentity;
-    std::atomic<uint64_t> m_muxFrameEvidenceEpoch{1};
     void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
                             int64_t jitterMs);
 };

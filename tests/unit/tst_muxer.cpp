@@ -45,6 +45,11 @@ private slots:
     void advertisesRationalFrameRate();
     void writePacketCompletionRunsAfterWriterSuccess();
     void writePacketCompletionReportsRejectedPacket();
+    void rejectedPacketCandidateIsIgnored();
+    void concurrentCandidateWinnerFollowsQueueAcceptanceOrder();
+    void laterAcceptedCandidateWinsWithinHeaderGrace();
+    void candidateAcceptedAtGraceBoundarySeedsHeader();
+    void staleAdmissionAfterBackpressureCannotSeedCandidate();
     void minWrittenVideoPtsTracksCommittedVideoPackets();
     void beginShutdownDrainWakesBlockedProducer();
     void beginShutdownDrainAcceptsInFlightPacketWhenQueueHasRoom();
@@ -679,6 +684,231 @@ void TestMuxer::writePacketCompletionReportsRejectedPacket() {
     av_packet_free(&pkt);
 
     QCOMPARE(rejected.load(std::memory_order_acquire), 1);
+}
+
+void TestMuxer::rejectedPacketCandidateIsIgnored() {
+    Muxer m;
+    AVPacket* pkt = av_packet_alloc();
+    QVERIFY(pkt != nullptr);
+    QVERIFY(av_new_packet(pkt, 1) == 0);
+    pkt->stream_index = 0;
+    pkt->pts = pkt->dts = 0;
+
+    QVERIFY(!m.writePacket(pkt, {}, QStringLiteral("01:02:03:04")));
+    av_packet_free(&pkt);
+
+    QMutexLocker headerLock(&m.m_headerMutex);
+    QVERIFY(m.m_startTimecodeCandidate.isEmpty());
+    {
+        std::lock_guard<std::mutex> queueLock(m.m_qMutex);
+        QVERIFY(m.m_acceptedStartTimecodeCandidate.isEmpty());
+    }
+}
+
+void TestMuxer::concurrentCandidateWinnerFollowsQueueAcceptanceOrder() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    QVERIFY(m.init(QStringLiteral("olr_unit_tc_concurrent_order"), 1, 320, 240, 30,
+                   {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto makePacket = [&m](int64_t pts) {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt || av_new_packet(pkt, 1) < 0) {
+            av_packet_free(&pkt);
+            return pkt;
+        }
+        pkt->data[0] = '{';
+        pkt->stream_index = m.subtitleTrackOffset();
+        pkt->pts = pkt->dts = pts;
+        pkt->duration = 1;
+        return pkt;
+    };
+
+    AVPacket* firstProducerPacket = makePacket(1);
+    AVPacket* secondProducerPacket = makePacket(2);
+    QVERIFY(firstProducerPacket != nullptr);
+    QVERIFY(secondProducerPacket != nullptr);
+    const QString candidateOne = QStringLiteral("01:00:00:01");
+    const QString candidateTwo = QStringLiteral("02:00:00:02");
+
+    // Keep the writer from consuming either packet while the producers race for
+    // qMutex. The writer releases qMutex before taking this header lock, so this
+    // also asserts the intended lock order does not deadlock producers.
+    m.m_headerMutex.lock();
+    std::unique_lock<std::mutex> queueGate(m.m_qMutex);
+    std::atomic<int> ready{0};
+    std::thread producerOne([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        m.writePacket(firstProducerPacket, {}, candidateOne);
+    });
+    std::thread producerTwo([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        m.writePacket(secondProducerPacket, {}, candidateTwo);
+    });
+    while (ready.load(std::memory_order_acquire) != 2)
+        std::this_thread::yield();
+    queueGate.unlock();
+    producerOne.join();
+    producerTwo.join();
+
+    {
+        std::lock_guard<std::mutex> queueLock(m.m_qMutex);
+        QVERIFY(!m.m_pktQueue.empty());
+        const int64_t acceptedFirstPts = m.m_pktQueue.front().pkt->pts;
+        QCOMPARE(m.m_acceptedStartTimecodeCandidate,
+                 acceptedFirstPts == 1 ? candidateOne : candidateTwo);
+    }
+    m.m_headerMutex.unlock();
+
+    av_packet_free(&firstProducerPacket);
+    av_packet_free(&secondProducerPacket);
+    m.close();
+}
+
+void TestMuxer::laterAcceptedCandidateWinsWithinHeaderGrace() {
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "5000");
+    const auto restoreGrace = qScopeGuard([] { qunsetenv("OLR_MUXER_TMCD_GRACE_MS"); });
+
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QString baseName = QStringLiteral("olr_unit_tc_later_candidate");
+    QVERIFY(m.init(baseName, 1, 320, 240, 30, {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto writeSubtitle = [&m](int64_t pts, const QString& candidate) {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt || av_new_packet(pkt, 2) < 0) {
+            av_packet_free(&pkt);
+            return false;
+        }
+        pkt->data[0] = '{';
+        pkt->data[1] = '}';
+        pkt->stream_index = m.subtitleTrackOffset();
+        pkt->pts = pkt->dts = pts;
+        pkt->duration = 1;
+        const bool accepted = m.writePacket(pkt, {}, candidate);
+        av_packet_free(&pkt);
+        return accepted;
+    };
+
+    QVERIFY(writeSubtitle(0, QString()));
+    const QString candidate = QStringLiteral("03:04:05:06");
+    QVERIFY(writeSubtitle(1, candidate));
+    m.close();
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray path = videoPathFor(baseName).toUtf8();
+    QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+    AVDictionaryEntry* tag = av_dict_get(ctx->metadata, "timecode", nullptr, 0);
+    QVERIFY(tag != nullptr);
+    QCOMPARE(QString::fromUtf8(tag->value), candidate);
+}
+
+void TestMuxer::candidateAcceptedAtGraceBoundarySeedsHeader() {
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "0");
+    const auto restoreGrace = qScopeGuard([] { qunsetenv("OLR_MUXER_TMCD_GRACE_MS"); });
+
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QString baseName = QStringLiteral("olr_unit_tc_grace_boundary");
+    QVERIFY(m.init(baseName, 1, 320, 240, 30, {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto makeSubtitlePacket = [&m](int64_t pts) {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt || av_new_packet(pkt, 2) < 0) {
+            av_packet_free(&pkt);
+            return pkt;
+        }
+        pkt->data[0] = '{';
+        pkt->data[1] = '}';
+        pkt->stream_index = m.subtitleTrackOffset();
+        pkt->pts = pkt->dts = pts;
+        pkt->duration = 1;
+        return pkt;
+    };
+
+    const QString boundaryCandidate = QStringLiteral("04:05:06:07");
+    m.m_afterCandidateSnapshotForTest = [&m, &makeSubtitlePacket, boundaryCandidate] {
+        AVPacket* candidatePacket = makeSubtitlePacket(1);
+        if (!candidatePacket) return;
+        m.writePacket(candidatePacket, {}, boundaryCandidate);
+        av_packet_free(&candidatePacket);
+    };
+
+    AVPacket* firstPacket = makeSubtitlePacket(0);
+    QVERIFY(firstPacket != nullptr);
+    QVERIFY(m.writePacket(firstPacket));
+    av_packet_free(&firstPacket);
+    m.close();
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray path = videoPathFor(baseName).toUtf8();
+    QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+    AVDictionaryEntry* tag = av_dict_get(ctx->metadata, "timecode", nullptr, 0);
+    QVERIFY(tag != nullptr);
+    QCOMPARE(QString::fromUtf8(tag->value), boundaryCandidate);
+}
+
+void TestMuxer::staleAdmissionAfterBackpressureCannotSeedCandidate() {
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "60000");
+    const auto restoreGrace = qScopeGuard([] { qunsetenv("OLR_MUXER_TMCD_GRACE_MS"); });
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    QVERIFY(m.init(QStringLiteral("olr_unit_tc_stale_backpressure"), 1, 320, 240, 30,
+                   {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto makePacket = [&m]() {
+        AVPacket* pkt = av_packet_alloc();
+        if (!pkt || av_new_packet(pkt, 1) < 0) {
+            av_packet_free(&pkt);
+            return pkt;
+        }
+        pkt->data[0] = '{';
+        pkt->stream_index = m.subtitleTrackOffset();
+        pkt->pts = pkt->dts = 0;
+        pkt->duration = 1;
+        return pkt;
+    };
+    for (size_t i = 0; i < Muxer::kMaxQueued; ++i) {
+        AVPacket* pkt = makePacket();
+        QVERIFY(pkt != nullptr);
+        QVERIFY(m.writePacket(pkt));
+        av_packet_free(&pkt);
+    }
+
+    std::atomic<uint64_t> currentEpoch{7};
+    std::atomic<bool> entered{false};
+    bool accepted = true;
+    AVPacket* stale = makePacket();
+    QVERIFY(stale != nullptr);
+    std::thread producer([&] {
+        entered.store(true, std::memory_order_release);
+        accepted = m.writePacket(stale, {}, QStringLiteral("05:06:07:08"),
+                                 Muxer::PacketCarrierGuard{&currentEpoch, 7});
+    });
+    while (!entered.load(std::memory_order_acquire))
+        std::this_thread::yield();
+    currentEpoch.store(8, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m.m_qMutex);
+        QVERIFY(!m.m_pktQueue.empty());
+        AVPacket* released = m.m_pktQueue.front().pkt;
+        m.m_pktQueue.pop();
+        av_packet_free(&released);
+    }
+    m.m_qCv.notify_all();
+    producer.join();
+    av_packet_free(&stale);
+
+    QVERIFY(!accepted);
+    {
+        std::lock_guard<std::mutex> lock(m.m_qMutex);
+        QVERIFY(m.m_acceptedStartTimecodeCandidate.isEmpty());
+    }
+    m.close();
 }
 
 void TestMuxer::minWrittenVideoPtsTracksCommittedVideoPackets() {

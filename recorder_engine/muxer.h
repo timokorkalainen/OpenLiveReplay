@@ -31,6 +31,17 @@ extern "C" {
 class Muxer {
 public:
     using PacketWriteCallback = std::function<void(bool written)>;
+    struct PacketCarrierGuard {
+        constexpr PacketCarrierGuard(const std::atomic<uint64_t>* currentEpoch = nullptr,
+                                     uint64_t expectedEpoch = 0) noexcept
+            : current(currentEpoch), expected(expectedEpoch) {}
+        const std::atomic<uint64_t>* current;
+        uint64_t expected;
+        bool accepts() const noexcept {
+            return !current || expected == 0 ||
+                   current->load(std::memory_order_acquire) == expected;
+        }
+    };
 
     Muxer();
     ~Muxer();
@@ -63,15 +74,17 @@ public:
               int fpsNum = 0, int fpsDen = 0);
     // Returns true when the packet was accepted into the writer queue. The optional
     // callback still reports the later disk-write result.
-    bool writePacket(AVPacket* pkt, PacketWriteCallback onWritten = PacketWriteCallback{});
+    bool writePacket(AVPacket* pkt, PacketWriteCallback onWritten = PacketWriteCallback{},
+                     const QString& startTimecodeCandidate = QString(),
+                     PacketCarrierGuard carrierGuard = PacketCarrierGuard{});
     bool writeMetadataPacket(int viewTrack, int64_t ptsMs, const QByteArray& jsonData);
     bool writeTelemetryPacket(int feedIndex, int64_t ptsMs, const QByteArray& jsonData);
     void beginShutdownDrain();
-    // Offer a session-start timecode candidate. The header is written on the FIRST
-    // muxed packet (see ensureHeaderWritten); the FIRST well-formed candidate
-    // registered before that wins and becomes the file's "timecode" tag. Empty or
-    // malformed candidates are ignored. Thread-safe: called from every worker tick
-    // thread; guarded by m_headerMutex. A no-op once the header is written.
+    // Publish an already-accepted session-start timecode candidate to the deferred
+    // header. Per-packet producers pass candidates to writePacket(), which chooses
+    // the winner under m_qMutex in queue-acceptance order. This method is retained
+    // for explicit/up-front callers and for the writer's publication step. Empty or
+    // malformed candidates are ignored; m_headerMutex makes it thread-safe.
     void setStartTimecodeCandidate(const QString& tc);
     AVStream* getStream(int index);
     void close();
@@ -118,11 +131,11 @@ private:
     // avformat_write_header failed. Called by the writer thread before draining the
     // first queued packet, and from close() so an empty recording still gets a header.
     //
-    // LOCK ORDERING: m_headerMutex is the FIRST lock taken on any write — it is
-    // never held while acquiring m_qMutex (writePacket releases it implicitly by
-    // returning from ensureHeaderWritten before locking the queue). close() takes
-    // m_mutex, then (via ensureHeaderWritten) m_headerMutex; ensureHeaderWritten
-    // never reaches back for m_mutex, so there is no cycle.
+    // LOCK ORDERING: no path holds m_headerMutex while acquiring m_qMutex. The
+    // writer snapshots accepted candidates under m_qMutex, releases it, and only
+    // then publishes/writes the header. close() takes m_mutex, then (via
+    // ensureHeaderWritten) m_headerMutex; ensureHeaderWritten never reaches back
+    // for m_mutex, so there is no cycle.
     bool ensureHeaderWritten();
 
     // True while the header write should be HELD for the first source timecode:
@@ -154,9 +167,9 @@ private:
     // The MKV header is written on the first muxed packet, not in init(), so the
     // session start timecode (the first muxed frame's TC) can be captured into the
     // "timecode" tag — live recordings observe no TC at start. m_headerMutex guards
-    // all three fields and serialises the one-time avformat_write_header. It is the
-    // FIRST lock on any write path; ensureHeaderWritten never reaches for another
-    // Muxer lock while holding it (see ensureHeaderWritten doc for ordering).
+    // all three fields and serialises the one-time avformat_write_header.
+    // ensureHeaderWritten never reaches for another Muxer lock while holding it
+    // (see ensureHeaderWritten doc for ordering).
     QMutex m_headerMutex;
     bool m_headerWritten = false;
     QString m_startTimecodeCandidate;
@@ -200,6 +213,10 @@ private:
     std::queue<QueuedPacket> m_pktQueue; // owns the cloned packets it holds
     std::mutex m_qMutex;
     std::condition_variable m_qCv;
+    // First valid candidate attached to a packet actually accepted into m_pktQueue.
+    // Guarded by m_qMutex so concurrent producers resolve in queue-acceptance order.
+    QString m_acceptedStartTimecodeCandidate;
+    bool m_startTimecodeCandidateWindowClosed = false;
     std::atomic<bool> m_writerRunning{false};
     std::atomic<bool> m_blockingWritesAllowed{true};
 
@@ -214,6 +231,7 @@ private:
 
 #ifdef OLR_UNIT_TEST
     friend class TestMuxer;
+    std::function<void()> m_afterCandidateSnapshotForTest;
 #endif
 };
 
