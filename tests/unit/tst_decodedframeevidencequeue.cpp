@@ -24,7 +24,7 @@ DecodedFrameEvidence evidence(qint64 pts90k, int64_t sourcePtsMs, int64_t timeco
                               uint64_t generation) {
     TimecodeEvidence timing;
     timing.sourceGeneration = generation;
-    return {pts90k, sourcePtsMs, timecode100ns, timing};
+    return {pts90k, sourcePtsMs, timecode100ns, timing, generation};
 }
 
 } // namespace
@@ -41,6 +41,7 @@ void TestDecodedFrameEvidenceQueue::multipleNoOutputSubmissionsBindByOutputPts()
     QCOMPARE(output->sourceTimecode100ns, int64_t(10));
     QVERIFY(output->timecodeEvidence.has_value());
     QCOMPARE(output->timecodeEvidence->sourceGeneration, uint64_t(1));
+    QCOMPARE(output->carrierGeneration, uint64_t(1));
     QCOMPARE(queue.size(), qsizetype(2));
 }
 

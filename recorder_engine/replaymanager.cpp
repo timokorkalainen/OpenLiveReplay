@@ -727,7 +727,17 @@ void ReplayManager::recomputeInterCamPhase() {
             m_referenceSource = s;
         }
     }
-    if (m_referenceSource < 0) return; // no live source yet
+    if (m_referenceSource < 0) {
+        // With no live source there will be no stats pulse to drive the normal bounded
+        // relaxation. Clear immediately so a reconnect can never inherit a stale phase
+        // correction; this is event-driven and adds no idle timer or hot-path work.
+        for (int s = 0; s < m_servoTrimMs.size(); ++s) {
+            if (m_servoTrimMs[s] == 0) continue;
+            m_servoTrimMs[s] = 0;
+            if (s < m_workers.size() && m_workers[s]) m_workers[s]->setServoTrimOffsetMs(0);
+        }
+        return;
+    }
 
     // 2. Build per-source evidence relative to the reference and feed the estimator.
     const int64_t refOffsetNs = m_lastStats[m_referenceSource].clockOffsetNs;

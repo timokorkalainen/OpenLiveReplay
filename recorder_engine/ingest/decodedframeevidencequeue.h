@@ -14,6 +14,7 @@ struct DecodedFrameEvidence {
     int64_t sourcePtsMs = -1;
     int64_t sourceTimecode100ns = -1;
     std::optional<TimecodeEvidence> timecodeEvidence;
+    uint64_t carrierGeneration = 0;
 };
 
 class DecodedFrameEvidenceQueue {

@@ -69,8 +69,8 @@ class BlockingSurfaceEncoder final : public NativeVideoEncoder {
 public:
     bool encode(const AVFrame*, int64_t, const PacketCallback&, QString*) override { return false; }
 
-    bool encodeSurface(GpuSurface*, int64_t ptsTicks, const ColorMetadata&,
-                       const PacketCallback& onPacket, QString*) override {
+    bool encodeSurface(GpuSurface*, int64_t, const ColorMetadata&, const PacketCallback&,
+                       QString*) override {
         surfaceCalls.fetch_add(1, std::memory_order_acq_rel);
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -80,8 +80,9 @@ public:
 
         std::unique_lock<std::mutex> lock(m_mutex);
         m_cv.wait(lock, [&] { return m_released; });
-        lock.unlock();
-        onPacket(QByteArrayLiteral("pkt"), ptsTicks, true);
+        // This fake only exercises pump queueing. A successful submission that
+        // produces no immediate packet also models a hardware encoder buffering
+        // output for a later call, without involving an uninitialized test Muxer.
         return true;
     }
 

@@ -21,6 +21,7 @@
 
 #include "recordingclock.h"
 #include "muxer.h"
+#include "ingest/decodedframeevidencequeue.h"
 #include "ingest/ingestsession.h"
 #include "timing/sourceclock.h"
 #include "timing/timecodeevidence.h"
@@ -296,6 +297,13 @@ private:
     std::optional<TimecodeEvidence>
     takeFrameTimecodeEvidenceForMux(std::optional<TimecodeEvidence>& selected,
                                     int64_t sessionFrameIndex) const;
+    uint64_t enqueueMuxFrameEvidence(int64_t ptsTicks, int64_t sourceTimecode100ns,
+                                     const std::optional<TimecodeEvidence>& evidence);
+    std::optional<DecodedFrameEvidence> takeMuxFrameEvidence(int64_t ptsTicks);
+    void discardMuxFrameEvidence(uint64_t submissionId);
+    void clearMuxFrameEvidence();
+    void resetMuxFrameEvidenceLocked();
+    bool muxFrameEvidenceIsCurrent(uint64_t epoch) const;
     void emitFrameTimecodeEvidence(const TimecodeEvidence& evidence);
 #ifdef OLR_UNIT_TEST
     // One-shot seam for exercising the real write-rejection branch after frame
@@ -307,6 +315,10 @@ private:
     }
     std::function<void()> m_beforeMuxPacketWriteForTest;
 #endif
+    std::mutex m_muxFrameEvidenceMutex;
+    DecodedFrameEvidenceQueue m_muxFrameEvidence{64};
+    std::optional<TimecodeEvidence> m_muxFrameEvidenceIdentity;
+    std::atomic<uint64_t> m_muxFrameEvidenceEpoch{1};
     void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
                             int64_t jitterMs);
 };

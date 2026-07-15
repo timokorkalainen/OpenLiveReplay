@@ -3,11 +3,39 @@
 #include <QScopeGuard>
 #include <QTemporaryDir>
 
+#include "recorder_engine/codec/nativevideoencoder.h"
 #include "recorder_engine/replaymanager.h"
 #include "recorder_engine/ingest/ingestsession.h"
 #include "recorder_engine/timing/smpte12m.h"
 #include "recorder_engine/timing/sourceoffsetestimator.h"
 #include "recorder_engine/timing/timingreference.h"
+
+namespace {
+
+class OneFrameDelayedEncoder final : public NativeVideoEncoder {
+public:
+    bool encode(const AVFrame*, int64_t ptsTicks, const PacketCallback& onPacket,
+                QString*) override {
+        if (m_pendingPts) {
+            onPacket(QByteArray::fromHex("000001b300100113"), *m_pendingPts, true);
+        }
+        m_pendingPts = ptsTicks;
+        return true;
+    }
+
+    bool encodeSurface(GpuSurface*, int64_t, const ColorMetadata&, const PacketCallback&,
+                       QString*) override {
+        return false;
+    }
+
+    bool flush(const PacketCallback&, QString*) override { return true; }
+    QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
+
+private:
+    std::optional<int64_t> m_pendingPts;
+};
+
+} // namespace
 
 // Exercises the production seam ReplayManager::onFrameTimecode -> m_tcAligner.observe
 // and the public sourcesFrameAligned()/sourceFrameOffset() queries that Phase 4
@@ -22,6 +50,9 @@ private slots:
     void offsetSourcesReportNotAlignedAndFrameOffset();
     void noTimecodeSourcesAreNotAligned();
     void streamWorkerCarriesSelectedEvidenceExactlyOnce();
+    void delayedNativeOutputUsesEvidenceForPacketPts();
+    void delayedNativeOutputAcrossGenerationResetDropsOldEvidence();
+    void completionAfterGenerationResetDropsOldEvidence();
     void sharedNativeGpuMuxCallbackReportsRejectedCompletion();
     void boundedDriftReportsNonzeroUiBound();
     void overConfidenceTimecodeDoesNotMoveServo();
@@ -39,6 +70,7 @@ private slots:
     void arrivalOnlySourceGradesApproximate();
     void referenceSourceHasZeroPhase();
     void disconnectReselectsReferenceAwayFromDeadSource();
+    void allSourcesDisconnectedClearServoBeforeReconnect();
 
     // Phase 4 Task 4: the bounded, gentle phase servo.
     void servoSignPullsLateSourceEarlier();
@@ -261,6 +293,145 @@ void TestReplayManagerTimecode::streamWorkerCarriesSelectedEvidenceExactlyOnce()
     QVERIFY(recording.size() > 0);
 }
 
+void TestReplayManagerTimecode::delayedNativeOutputUsesEvidenceForPacketPts() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-delayed-native"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.m_nativeEncoder = std::make_unique<OneFrameDelayedEncoder>();
+    worker.setViewTrack(0);
+    worker.m_latestFrame = av_frame_alloc();
+    QVERIFY(worker.m_latestFrame != nullptr);
+    worker.m_latestFrame->format = AV_PIX_FMT_YUV420P;
+    worker.m_latestFrame->width = 64;
+    worker.m_latestFrame->height = 64;
+    QVERIFY(av_frame_get_buffer(worker.m_latestFrame, 32) >= 0);
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int sourceIndex, TimecodeEvidence value) {
+            QCOMPARE(sourceIndex, 0);
+            delivered.append(value);
+        },
+        Qt::QueuedConnection));
+
+    const TimecodeEvidence first = evidence(tcFrames(1, 0, 0, 0), 10, 30, 1, 7, 11);
+    worker.m_latestFrameTimecodeEvidence = first;
+    worker.m_latestFrameTimecode100ns.store(1, std::memory_order_release);
+    worker.m_internalFrameCount = 10;
+    worker.processEncoderTick(nullptr, 333, 0, 0);
+    QCOMPARE(delivered.size(), 0);
+
+    const TimecodeEvidence second = evidence(tcFrames(2, 0, 0, 0), 11, 30, 1, 7, 11);
+    worker.m_latestFrameTimecodeEvidence = second;
+    worker.m_latestFrameTimecode100ns.store(2, std::memory_order_release);
+    worker.m_internalFrameCount = 11;
+    worker.processEncoderTick(nullptr, 366, 0, 0);
+
+    QTRY_COMPARE_WITH_TIMEOUT(delivered.size(), 1, 5000);
+    QCOMPARE(delivered.front().frameOfDay, first.frameOfDay);
+    QCOMPARE(delivered.front().sourceGeneration, first.sourceGeneration);
+    QCOMPARE(delivered.front().timingGeneration, first.timingGeneration);
+    QCOMPARE(delivered.front().arrivalSessionFrame, int64_t(10));
+
+    av_frame_free(&worker.m_latestFrame);
+    muxer.close();
+}
+
+void TestReplayManagerTimecode::delayedNativeOutputAcrossGenerationResetDropsOldEvidence() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-delayed-reset"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.m_nativeEncoder = std::make_unique<OneFrameDelayedEncoder>();
+    worker.setViewTrack(0);
+    worker.m_latestFrame = av_frame_alloc();
+    QVERIFY(worker.m_latestFrame != nullptr);
+    worker.m_latestFrame->format = AV_PIX_FMT_YUV420P;
+    worker.m_latestFrame->width = 64;
+    worker.m_latestFrame->height = 64;
+    QVERIFY(av_frame_get_buffer(worker.m_latestFrame, 32) >= 0);
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int, TimecodeEvidence value) { delivered.append(value); },
+        Qt::QueuedConnection));
+
+    const TimecodeEvidence oldGeneration = evidence(tcFrames(1, 0, 0, 0), 20, 30, 1, 7, 11);
+    worker.m_latestFrameTimecodeEvidence = oldGeneration;
+    worker.m_internalFrameCount = 20;
+    worker.processEncoderTick(nullptr, 666, 0, 0);
+
+    const TimecodeEvidence firstNewGeneration = evidence(tcFrames(2, 0, 0, 0), 21, 30, 1, 8, 12);
+    worker.m_latestFrameTimecodeEvidence = firstNewGeneration;
+    worker.m_internalFrameCount = 21;
+    worker.processEncoderTick(nullptr, 700, 0, 0);
+    QTest::qWait(100);
+    QCOMPARE(delivered.size(), 0);
+
+    const TimecodeEvidence secondNewGeneration = evidence(tcFrames(2, 0, 0, 1), 22, 30, 1, 8, 12);
+    worker.m_latestFrameTimecodeEvidence = secondNewGeneration;
+    worker.m_internalFrameCount = 22;
+    worker.processEncoderTick(nullptr, 733, 0, 0);
+
+    QTRY_COMPARE_WITH_TIMEOUT(delivered.size(), 1, 5000);
+    QCOMPARE(delivered.front().frameOfDay, firstNewGeneration.frameOfDay);
+    QCOMPARE(delivered.front().sourceGeneration, uint64_t(8));
+    QCOMPARE(delivered.front().timingGeneration, uint64_t(12));
+    QCOMPARE(delivered.front().arrivalSessionFrame, int64_t(21));
+
+    av_frame_free(&worker.m_latestFrame);
+    muxer.close();
+}
+
+void TestReplayManagerTimecode::completionAfterGenerationResetDropsOldEvidence() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-completion-reset"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+    AVStream* stream = muxer.getStream(0);
+    QVERIFY(stream != nullptr);
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1);
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int, TimecodeEvidence value) { delivered.append(value); },
+        Qt::QueuedConnection));
+
+    const TimecodeEvidence oldGeneration = evidence(tcFrames(1, 0, 0, 0), 30, 30, 1, 7, 11);
+    const TimecodeEvidence newGeneration = evidence(tcFrames(2, 0, 0, 0), 31, 30, 1, 8, 12);
+    worker.enqueueMuxFrameEvidence(30, -1, oldGeneration);
+    worker.m_beforeMuxPacketWriteForTest = [&worker, newGeneration] {
+        worker.enqueueMuxFrameEvidence(31, -1, newGeneration);
+    };
+
+    auto callback = worker.makeMuxerWriteCallback(0, stream, nullptr, {}, {});
+    callback(QByteArray::fromHex("000001b300100113"), 30, true);
+    QTRY_VERIFY_WITH_TIMEOUT(muxer.minWrittenVideoPtsMs() >= 0, 5000);
+    QTest::qWait(100);
+    QCOMPARE(delivered.size(), 0);
+
+    muxer.close();
+}
+
 void TestReplayManagerTimecode::sharedNativeGpuMuxCallbackReportsRejectedCompletion() {
     QTemporaryDir output;
     QVERIFY(output.isValid());
@@ -474,6 +645,32 @@ void TestReplayManagerTimecode::disconnectReselectsReferenceAwayFromDeadSource()
     QVERIFY(QMetaObject::invokeMethod(&manager, "onSourcePhaseConnectionChanged",
                                       Qt::DirectConnection, Q_ARG(int, 1), Q_ARG(bool, false)));
     QCOMPARE(manager.referenceSource(), 0);
+}
+
+void TestReplayManagerTimecode::allSourcesDisconnectedClearServoBeforeReconnect() {
+    ReplayManager manager;
+    for (int i = 0; i < 20; ++i) {
+        QVERIFY(feedStats(manager, 0, clockStats(ClockQuality::Pcr, true, 0)));
+        QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 40'000'000)));
+    }
+    QCOMPARE(manager.sourceServoTrimMs(1), -40);
+
+    QVERIFY(QMetaObject::invokeMethod(&manager, "onSourcePhaseConnectionChanged",
+                                      Qt::DirectConnection, Q_ARG(int, 1), Q_ARG(bool, false)));
+    QVERIFY(manager.sourceServoTrimMs(1) < 0);
+    QVERIFY(QMetaObject::invokeMethod(&manager, "onSourcePhaseConnectionChanged",
+                                      Qt::DirectConnection, Q_ARG(int, 0), Q_ARG(bool, false)));
+
+    QCOMPARE(manager.referenceSource(), -1);
+    QCOMPARE(manager.sourceServoTrimMs(0), 0);
+    QCOMPARE(manager.sourceServoTrimMs(1), 0);
+
+    QVERIFY(QMetaObject::invokeMethod(&manager, "onSourcePhaseConnectionChanged",
+                                      Qt::DirectConnection, Q_ARG(int, 1), Q_ARG(bool, true)));
+    QCOMPARE(manager.sourceServoTrimMs(1), 0);
+    QVERIFY(feedStats(manager, 1, clockStats(ClockQuality::Pcr, true, 40'000'000)));
+    QCOMPARE(manager.referenceSource(), 1);
+    QCOMPARE(manager.sourceServoTrimMs(1), 0);
 }
 
 void TestReplayManagerTimecode::servoSignPullsLateSourceEarlier() {
