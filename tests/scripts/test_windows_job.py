@@ -18,6 +18,10 @@ from tools import windows_job
 
 
 class WindowsJobTests(unittest.TestCase):
+    def test_environment_block_rejects_case_insensitive_duplicates(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate.*PATH"):
+            windows_job._environment_block({"PATH": "controlled", "Path": "poison"})
+
     def test_non_windows_path_preserves_subprocess_behavior(self) -> None:
         completed = subprocess.CompletedProcess(["child"], 23)
         with mock.patch.object(
@@ -121,6 +125,25 @@ class WindowsJobTests(unittest.TestCase):
         process.wait.assert_called_once()
         job.__exit__.assert_called_once()
 
+    def test_created_process_is_terminated_if_native_wrapper_construction_fails(self) -> None:
+        kernel32 = mock.Mock()
+        information = windows_job._ProcessInformation()
+        information.process = 101
+        information.thread = 202
+        with (
+            mock.patch.object(
+                windows_job, "_NativeProcess", side_effect=RuntimeError("wrap failed")
+            ),
+            self.assertRaisesRegex(RuntimeError, "wrap failed"),
+        ):
+            windows_job._adopt_created_process(kernel32, information)
+
+        kernel32.TerminateProcess.assert_called_once_with(101, 1)
+        self.assertEqual(
+            kernel32.CloseHandle.call_args_list,
+            [mock.call(202), mock.call(101)],
+        )
+
     def test_private_desktop_is_bound_to_startup_and_closed_after_job(self) -> None:
         events: list[str] = []
         process = mock.Mock(pid=9876)
@@ -166,6 +189,29 @@ class WindowsJobTests(unittest.TestCase):
             ),
             19,
         )
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows desktop APIs")
+    def test_private_desktop_preserves_redirected_standard_handles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stdout_path = Path(temporary) / "stdout.txt"
+            stderr_path = Path(temporary) / "stderr.txt"
+            with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+                result = windows_job.run_process_tree(
+                    [
+                        sys.executable,
+                        "-c",
+                        'import sys; print("OUT"); print("ERR", file=sys.stderr); '
+                        "raise SystemExit(7)",
+                    ],
+                    enabled=True,
+                    private_desktop=True,
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+
+            self.assertEqual(result, 7)
+            self.assertEqual(stdout_path.read_text(encoding="utf-8").strip(), "OUT")
+            self.assertEqual(stderr_path.read_text(encoding="utf-8").strip(), "ERR")
 
     @unittest.skipUnless(
         os.name == "nt" and os.environ.get("OLR_RUN_WINDOWS_JOB_INTEGRATION") == "1",

@@ -23,6 +23,7 @@ try:
         RuntimeAuditLease,
         RuntimeRoots,
         reject_runtime_dll_shadowing,
+        replace_environment_case_insensitively,
         validate_ctest_runtime_properties,
         windows_system_directories,
     )
@@ -35,6 +36,7 @@ except ImportError:
         RuntimeAuditLease,
         RuntimeRoots,
         reject_runtime_dll_shadowing,
+        replace_environment_case_insensitively,
         validate_ctest_runtime_properties,
         windows_system_directories,
     )
@@ -143,7 +145,7 @@ def prepare_windows_runtime(
         srt_root = canonical_directory(
             "SRT root", Path(cache["OLR_SRT_ROOT"]), "OLR_SRT_ROOT"
         )
-        source_root = canonical_directory(
+        canonical_directory(
             "source root", Path(cache["CMAKE_HOME_DIRECTORY"]), "CMAKE_HOME_DIRECTORY"
         )
         canonical_build = canonical_directory("build", build_dir, "--test-dir")
@@ -168,6 +170,11 @@ def prepare_windows_runtime(
         qt_qml = canonical_directory("Qt QML imports", qt_root / "qml", "Qt6_DIR")
         for directory in (*runtime_dirs, qt_plugins, qt_qml):
             lease.hold_dll_tree(directory)
+        launch_qml = (
+            lease.stage_readonly_tree(qt_qml)
+            if audit_lease is not None
+            else qt_qml
+        )
 
         graph = discover_ctest_graph(canonical_build, lease=lease)
         validate_ctest_runtime_properties(
@@ -175,9 +182,6 @@ def prepare_windows_runtime(
             runtime_dirs=runtime_dirs,
             qt_plugins=qt_plugins,
             qt_platform_plugins=qt_platform_plugins,
-            qt_qml=qt_qml,
-            source_root=source_root,
-            build_dir=canonical_build,
             ffmpeg_root=ffmpeg_root,
             srt_root=srt_root,
         )
@@ -197,16 +201,20 @@ def prepare_windows_runtime(
             )
 
         system_dir, windows_dir = windows_system_directories()
-        env = dict(inherited_env)
-        env["SystemRoot"] = str(windows_dir)
-        env["PATH"] = os.pathsep.join(
-            str(path) for path in (*runtime_dirs, system_dir, windows_dir)
+        env = replace_environment_case_insensitively(
+            inherited_env,
+            {
+                "SystemRoot": str(windows_dir),
+                "PATH": os.pathsep.join(
+                    str(path) for path in (*runtime_dirs, system_dir, windows_dir)
+                ),
+                "QT_PLUGIN_PATH": str(qt_plugins),
+                "QT_QPA_PLATFORM_PLUGIN_PATH": str(qt_platform_plugins),
+                "QT_QPA_PLATFORM": "offscreen",
+                "QML_IMPORT_PATH": str(launch_qml),
+                "QML2_IMPORT_PATH": str(launch_qml),
+            },
         )
-        env["QT_PLUGIN_PATH"] = str(qt_plugins)
-        env["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(qt_platform_plugins)
-        env["QT_QPA_PLATFORM"] = "offscreen"
-        env["QML_IMPORT_PATH"] = str(qt_qml)
-        env["QML2_IMPORT_PATH"] = str(qt_qml)
         return env, ctest
     finally:
         if owned:

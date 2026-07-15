@@ -15,7 +15,7 @@ add_test(NAME tst_olrstyle
 set_tests_properties(tst_olrstyle PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(tst_statusstrip_onair tst_statusstrip_onair_main.cpp)
 target_link_libraries(tst_statusstrip_onair PRIVATE
@@ -27,7 +27,7 @@ add_test(NAME tst_statusstrip_onair
 set_tests_properties(tst_statusstrip_onair PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(tst_pgmstage_mapping
     tst_pgmstage_mapping_main.cpp
@@ -42,7 +42,7 @@ add_test(NAME tst_pgmstage_mapping
 set_tests_properties(tst_pgmstage_mapping PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(tst_rundownrail_drag tst_rundownrail_drag_main.cpp)
 target_link_libraries(tst_rundownrail_drag PRIVATE
@@ -54,7 +54,7 @@ add_test(NAME tst_rundownrail_drag
 set_tests_properties(tst_rundownrail_drag PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(tst_scrubtimeline tst_scrubtimeline_main.cpp)
 target_link_libraries(tst_scrubtimeline PRIVATE
@@ -66,7 +66,7 @@ add_test(NAME tst_scrubtimeline
 set_tests_properties(tst_scrubtimeline PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(tst_transportdock_layout tst_transportdock_layout_main.cpp)
 target_link_libraries(tst_transportdock_layout PRIVATE
@@ -78,7 +78,7 @@ add_test(NAME tst_transportdock_layout
 set_tests_properties(tst_transportdock_layout PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 qt_add_executable(tst_sourcelistpanel_layout tst_sourcelistpanel_layout_main.cpp)
 target_link_libraries(tst_sourcelistpanel_layout PRIVATE
@@ -90,7 +90,7 @@ add_test(NAME tst_sourcelistpanel_layout
 set_tests_properties(tst_sourcelistpanel_layout PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml;QML2_IMPORT_PATH=${CMAKE_BINARY_DIR}/qml")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 olr_configure_windows_test_runtime(TESTS
     tst_olrstyle

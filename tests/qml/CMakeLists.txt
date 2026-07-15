@@ -11,5 +11,5 @@ add_test(NAME tst_qml_codecsettings
 set_tests_properties(tst_qml_codecsettings PROPERTIES
     LABELS "unit;ci"
     TIMEOUT 60
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QML_IMPORT_PATH=${CMAKE_SOURCE_DIR}")
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 olr_configure_windows_test_runtime(TESTS tst_qml_codecsettings)

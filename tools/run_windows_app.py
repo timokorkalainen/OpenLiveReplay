@@ -123,6 +123,11 @@ def prepare_windows_app_runtime(
         qt_qml = canonical_directory("Qt QML imports", qt_root / "qml", "Qt6_DIR")
         for directory in (*runtime_dirs, qt_plugins, qt_qml):
             lease.hold_dll_tree(directory)
+        launch_qml = (
+            lease.stage_readonly_tree(qt_qml)
+            if audit_lease is not None
+            else qt_qml
+        )
 
         runtime_guard.reject_runtime_dll_shadowing(
             executable.parent,
@@ -133,15 +138,19 @@ def prepare_windows_app_runtime(
         )
 
         system_dir, windows_dir = runtime_guard.windows_system_directories()
-        env = dict(inherited_env)
-        env["SystemRoot"] = str(windows_dir)
-        env["PATH"] = os.pathsep.join(
-            str(path) for path in (*runtime_dirs, system_dir, windows_dir)
+        env = runtime_guard.replace_environment_case_insensitively(
+            inherited_env,
+            {
+                "SystemRoot": str(windows_dir),
+                "PATH": os.pathsep.join(
+                    str(path) for path in (*runtime_dirs, system_dir, windows_dir)
+                ),
+                "QT_PLUGIN_PATH": str(qt_plugins),
+                "QT_QPA_PLATFORM_PLUGIN_PATH": str(qt_platform_plugins),
+                "QML_IMPORT_PATH": str(launch_qml),
+                "QML2_IMPORT_PATH": str(launch_qml),
+            },
         )
-        env["QT_PLUGIN_PATH"] = str(qt_plugins)
-        env["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(qt_platform_plugins)
-        env["QML_IMPORT_PATH"] = str(qt_qml)
-        env["QML2_IMPORT_PATH"] = str(qt_qml)
         return env
     finally:
         if owned:

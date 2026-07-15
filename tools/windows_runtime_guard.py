@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
+from collections.abc import Mapping
 from contextlib import nullcontext
 import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
+import tempfile
 from typing import BinaryIO, NamedTuple
 import xml.etree.ElementTree as ET
 
@@ -26,6 +30,132 @@ class RuntimeRoots(NamedTuple):
 class CacheEntry(NamedTuple):
     value: str
     cache_type: str
+
+
+class _StagedTree(NamedTuple):
+    temporary: tempfile.TemporaryDirectory[str]
+    root: Path
+    sid: str
+
+
+def _current_user_sid() -> str:
+    if os.name != "nt":
+        raise OSError("Windows user SID is only available on Windows")
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    token = wintypes.HANDLE()
+    advapi32.OpenProcessToken.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    )
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_wchar_p),
+    )
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        required = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(required))
+        if not required.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_string_buffer(required.value)
+        if not advapi32.GetTokenInformation(
+            token, 1, buffer, len(buffer), ctypes.byref(required)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        sid_pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+        text = ctypes.c_wchar_p()
+        if not advapi32.ConvertSidToStringSidW(sid_pointer, ctypes.byref(text)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return str(text.value)
+        finally:
+            kernel32.LocalFree(text)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _set_staged_tree_access(
+    root: Path, sid: str, permission: str
+) -> None:
+    if os.name != "nt":
+        return
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    descriptor = ctypes.c_void_p()
+    descriptor_size = wintypes.ULONG()
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.ULONG),
+    )
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.SetFileSecurityW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    advapi32.SetFileSecurityW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    if permission == "F":
+        sddl = f"D:P(A;OICI;FA;;;{sid})"
+    elif permission == "BUILD":
+        sddl = f"D:P(A;;FA;;;{sid})(A;OICIIO;GRGX;;;{sid})"
+    else:
+        sddl = f"D:P(A;OICI;GRGX;;;{sid})"
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(descriptor), ctypes.byref(descriptor_size)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        targets = [
+            root,
+            *sorted(
+                (path for path in root.rglob("*") if path.is_dir()),
+                key=lambda path: str(path).casefold(),
+            ),
+        ]
+        if permission != "F":
+            targets.reverse()
+        for target in targets:
+            if not advapi32.SetFileSecurityW(
+                str(target),
+                0x00000004 | 0x80000000,
+                descriptor,
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def replace_environment_case_insensitively(
+    inherited: Mapping[str, str], replacements: Mapping[str, str]
+) -> dict[str, str]:
+    """Replace controlled Windows variables without case-variant duplicates."""
+    controlled = {key.casefold() for key in replacements}
+    environment = {
+        key: value
+        for key, value in inherited.items()
+        if key.casefold() not in controlled
+    }
+    environment.update(replacements)
+    return environment
 
 
 def _is_relative_to(path: Path, parent: Path) -> bool:
@@ -118,6 +248,7 @@ class RuntimeAuditLease:
         self._streams: dict[Path, BinaryIO] = {}
         self._canonical_files: dict[Path, Path] = {}
         self._directory_handles: dict[Path, tuple[object, Path]] = {}
+        self._staged_trees: dict[Path, _StagedTree] = {}
 
     def __enter__(self) -> RuntimeAuditLease:
         return self
@@ -186,14 +317,102 @@ class RuntimeAuditLease:
                         f"runtime DLL subtree contains a reparse alias: {child} -> {final}"
                     )
 
+    def stage_readonly_tree(
+        self, directory: Path, *, entry_limit: int = 4096, byte_limit: int = 256 << 20
+    ) -> Path:
+        """Snapshot a runtime tree and deny mutation for the child lifetime."""
+        source = self.canonical_directory(directory)
+        existing = self._staged_trees.get(source)
+        if existing is not None:
+            return existing.root / "qml"
+        if os.name != "nt":
+            self.hold_dll_tree(source)
+            return source
+
+        entries = sorted(source.rglob("*"), key=lambda path: str(path).casefold())
+        if len(entries) > entry_limit:
+            raise RuntimeError(
+                f"runtime QML tree exceeds {entry_limit} entries: {source}"
+            )
+        for entry in entries:
+            is_junction = getattr(entry, "is_junction", lambda: False)()
+            if entry.is_symlink() or is_junction:
+                raise RuntimeError(
+                    f"runtime QML tree contains a reparse alias: {entry}"
+                )
+            if entry.is_dir():
+                continue
+            if not entry.is_file():
+                raise RuntimeError(
+                    f"runtime QML tree contains unsupported entry: {entry}"
+                )
+
+        temporary = tempfile.TemporaryDirectory(prefix="olr-qml-runtime-")
+        temporary_root = Path(temporary.name)
+        staged = temporary_root / "qml"
+        staged.mkdir()
+        locked = False
+        try:
+            for entry in entries:
+                destination = staged / entry.relative_to(source)
+                if entry.is_dir():
+                    destination.mkdir(parents=True, exist_ok=True)
+
+            sid = _current_user_sid()
+            _set_staged_tree_access(temporary_root, sid, "BUILD")
+            locked = True
+            total_size = 0
+            for entry in entries:
+                if entry.is_dir():
+                    continue
+                destination = staged / entry.relative_to(source)
+                with self._open_read_locked(entry) as stream:
+                    final = self._final_path_from_stream(stream, entry)
+                    if not _is_relative_to(final, source) or os.path.normcase(
+                        str(entry)
+                    ) != os.path.normcase(str(final)):
+                        raise RuntimeError(
+                            "runtime QML tree contains a reparse alias: "
+                            f"{entry} -> {final}"
+                        )
+                    stream.seek(0, os.SEEK_END)
+                    total_size += stream.tell()
+                    if total_size > byte_limit:
+                        raise RuntimeError(
+                            f"runtime QML tree exceeds {byte_limit} bytes: {source}"
+                        )
+                    stream.seek(0)
+                    with destination.open("xb") as output:
+                        shutil.copyfileobj(stream, output)
+
+            _set_staged_tree_access(temporary_root, sid, "RX")
+            record = _StagedTree(temporary, temporary_root, sid)
+            self._staged_trees[source] = record
+            self.canonical_directory(temporary_root)
+            self.canonical_directory(staged)
+            return staged
+        except BaseException:
+            if locked:
+                try:
+                    _set_staged_tree_access(temporary_root, sid, "F")
+                except BaseException:
+                    pass
+            try:
+                temporary.cleanup()
+            except BaseException:
+                pass
+            raise
+
     def close(self) -> None:
         streams = tuple(reversed(tuple(self._streams.values())))
         directory_handles = tuple(
             reversed(tuple(owner for owner, _path in self._directory_handles.values()))
         )
+        staged_trees = tuple(reversed(tuple(self._staged_trees.values())))
         self._streams.clear()
         self._canonical_files.clear()
         self._directory_handles.clear()
+        self._staged_trees.clear()
         first_error: BaseException | None = None
         for stream in streams:
             try:
@@ -204,6 +423,15 @@ class RuntimeAuditLease:
         for owner in directory_handles:
             try:
                 owner.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        for staged in staged_trees:
+            try:
+                _set_staged_tree_access(
+                    staged.root, staged.sid, "F"
+                )
+                staged.temporary.cleanup()
             except BaseException as error:
                 if first_error is None:
                     first_error = error
@@ -728,12 +956,12 @@ def pe_imports(path: Path, *, stream: BinaryIO | None = None) -> set[str]:
             stream.seek(previous)
 
 
-def _cmake_command_arguments(
+def _cmake_command_arguments_with_positions(
     text: str, command_name: str
-) -> tuple[tuple[str, ...], ...]:
+) -> tuple[tuple[int, tuple[str, ...]], ...]:
     """Parse literal arguments from generated CMake commands."""
     text = _strip_cmake_comments(text)
-    commands: list[tuple[str, ...]] = []
+    commands: list[tuple[int, tuple[str, ...]]] = []
     starts: list[int] = []
     scan = 0
     while scan < len(text):
@@ -821,8 +1049,22 @@ def _cmake_command_arguments(
             raise ValueError(f"unterminated {command_name} command")
         if index >= len(text) or text[index] != ")":
             raise ValueError(f"unterminated {command_name} command")
-        commands.append(tuple(arguments))
+        commands.append((command_start, tuple(arguments)))
     return tuple(commands)
+
+
+def _cmake_commands_in_order(
+    text: str, command_names: tuple[str, ...]
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    commands = [
+        (position, command_name, arguments)
+        for command_name in command_names
+        for position, arguments in _cmake_command_arguments_with_positions(
+            text, command_name
+        )
+    ]
+    commands.sort(key=lambda command: command[0])
+    return tuple((name, arguments) for _position, name, arguments in commands)
 
 
 def _strip_cmake_comments(text: str) -> str:
@@ -874,64 +1116,6 @@ def _strip_cmake_comments(text: str) -> str:
     return "".join(output)
 
 
-def _cmake_add_test_arguments(text: str) -> tuple[tuple[str, ...], ...]:
-    """Parse literal arguments from generated ``add_test(...)`` commands."""
-    return _cmake_command_arguments(text, "add_test")
-
-
-def _test_working_directories(text: str, testfile: Path) -> dict[str, Path]:
-    working_directories: dict[str, Path] = {}
-
-    def record(tests: tuple[str, ...], value: str) -> None:
-        configured = Path(value)
-        working = (
-            configured
-            if configured.is_absolute()
-            else testfile.parent / configured
-        )
-        for test in tests:
-            working_directories[test.casefold()] = working
-
-    for arguments in _cmake_command_arguments(text, "set_tests_properties"):
-        try:
-            properties_index = next(
-                index
-                for index, argument in enumerate(arguments)
-                if argument.casefold() == "properties"
-            )
-        except StopIteration:
-            continue
-        tests = arguments[:properties_index]
-        properties = arguments[properties_index + 1 :]
-        for index in range(0, len(properties) - 1, 2):
-            if properties[index].casefold() != "working_directory":
-                continue
-            record(tests, properties[index + 1])
-
-    for arguments in _cmake_command_arguments(text, "set_property"):
-        if not arguments or arguments[0].casefold() != "test":
-            continue
-        try:
-            property_index = next(
-                index
-                for index, argument in enumerate(arguments)
-                if argument.casefold() == "property"
-            )
-        except StopIteration:
-            continue
-        if property_index + 2 >= len(arguments):
-            continue
-        if arguments[property_index + 1].casefold() != "working_directory":
-            continue
-        tests = tuple(
-            argument
-            for argument in arguments[1:property_index]
-            if argument.casefold() not in ("append", "append_string")
-        )
-        record(tests, arguments[property_index + 2])
-    return working_directories
-
-
 def _test_name(arguments: tuple[str, ...]) -> str | None:
     if not arguments:
         return None
@@ -965,11 +1149,11 @@ class CTestGraph(NamedTuple):
     working_directories: tuple[Path, ...]
 
 
-def _property_assignments(
-    text: str,
+def _property_assignments_for_command(
+    command_name: str, arguments: tuple[str, ...]
 ) -> tuple[tuple[tuple[str, ...], str, str, bool], ...]:
     assignments: list[tuple[tuple[str, ...], str, str, bool]] = []
-    for arguments in _cmake_command_arguments(text, "set_tests_properties"):
+    if command_name == "set_tests_properties":
         try:
             index = next(
                 value
@@ -977,16 +1161,16 @@ def _property_assignments(
                 if argument.casefold() == "properties"
             )
         except StopIteration:
-            continue
+            return ()
         tests = arguments[:index]
         properties = arguments[index + 1 :]
         for offset in range(0, len(properties) - 1, 2):
             assignments.append(
                 (tests, properties[offset].casefold(), properties[offset + 1], False)
             )
-    for arguments in _cmake_command_arguments(text, "set_property"):
+    elif command_name == "set_property":
         if not arguments or arguments[0].casefold() != "test":
-            continue
+            return ()
         try:
             index = next(
                 value
@@ -994,9 +1178,9 @@ def _property_assignments(
                 if argument.casefold() == "property"
             )
         except StopIteration:
-            continue
+            return ()
         if index + 2 >= len(arguments):
-            continue
+            return ()
         append = any(
             value.casefold() in ("append", "append_string")
             for value in arguments[1:index]
@@ -1036,22 +1220,25 @@ def discover_ctest_graph(
         lexical_build = Path(os.path.abspath(build_dir))
         canonical_build = active.canonical_directory(lexical_build)
         root = lexical_build / "CTestTestfile.cmake"
-        pending = (
+        roots = (
             [(root, False, root.parent)]
             if root.is_file()
             else [
                 (path, False, path.parent)
-                for path in lexical_build.rglob("CTestTestfile.cmake")
+                for path in sorted(lexical_build.rglob("CTestTestfile.cmake"))
             ]
         )
-        if not pending:
+        if not roots:
             return CTestGraph((), (), (), ())
-        seen: set[Path] = set()
+        seen_inputs: set[Path] = set()
+        active_inputs: set[Path] = set()
         inputs: list[Path] = []
-        additions: list[tuple[tuple[str, ...], Path]] = []
-        property_values: dict[str, dict[str, list[str]]] = {}
-        while pending:
-            pending_path, allow_missing, execution_directory = pending.pop()
+        additions: list[tuple[tuple[str, ...], Path, tuple[str, str]]] = []
+        property_values: dict[tuple[str, str], dict[str, list[str]]] = {}
+
+        def evaluate(
+            pending_path: Path, allow_missing: bool, execution_directory: Path
+        ) -> None:
             lexical = Path(os.path.abspath(pending_path))
             execution_directory = Path(os.path.abspath(execution_directory))
             try:
@@ -1061,7 +1248,7 @@ def discover_ctest_graph(
                     f"CTest graph edge points outside selected build: {lexical}"
                 ) from error
             if not lexical.is_file() and allow_missing:
-                continue
+                return
             if not lexical.is_file():
                 raise RuntimeError(f"CTest graph input does not exist: {lexical}")
             canonical = active.canonical_file(lexical)
@@ -1077,64 +1264,99 @@ def discover_ctest_graph(
                     "CTest graph reparse alias is unsupported because CTest reopens "
                     f"the lexical path: {lexical} -> {canonical}"
                 )
-            if canonical in seen:
-                continue
-            seen.add(canonical)
-            inputs.append(canonical)
-            stream = active.hold(lexical)
-            stream.seek(0)
-            text = _strip_cmake_comments(
-                stream.read().decode("utf-8", errors="replace")
-            )
-
-            for command_name in ("subdirs", "include"):
-                for arguments in _cmake_command_arguments(text, command_name):
-                    if len(arguments) != 1 or any(
-                        marker in arguments[0] for marker in ("${", "$<", ";")
-                    ):
+            if canonical in active_inputs:
+                raise RuntimeError(f"recursive CTest graph include: {canonical}")
+            if canonical not in seen_inputs:
+                seen_inputs.add(canonical)
+                inputs.append(canonical)
+            active_inputs.add(canonical)
+            try:
+                stream = active.hold(lexical)
+                stream.seek(0)
+                text = _strip_cmake_comments(
+                    stream.read().decode("utf-8", errors="replace")
+                )
+                commands = _cmake_commands_in_order(
+                    text,
+                    (
+                        "add_test",
+                        "add_subdirectory",
+                        "discover_tests",
+                        "include",
+                        "set_property",
+                        "set_tests_properties",
+                        "subdirs",
+                    ),
+                )
+                scope = os.path.normcase(str(execution_directory))
+                for command_name, arguments in commands:
+                    if command_name == "discover_tests":
                         raise RuntimeError(
-                            f"unsupported dynamic CTest {command_name} edge in {canonical}"
+                            f"unsupported dynamic CTest discover_tests command in {canonical}"
                         )
-                    edge = Path(arguments[0])
-                    if command_name == "subdirs":
-                        subdirectory = (
-                            edge
-                            if edge.is_absolute()
-                            else execution_directory / edge
-                        )
-                        target = subdirectory / "CTestTestfile.cmake"
-                        next_execution_directory = subdirectory
-                    else:
-                        target = (
-                            edge if edge.is_absolute() else lexical.parent / edge
-                        )
-                        next_execution_directory = execution_directory
-                    pending.append(
-                        (
+                    if command_name in ("subdirs", "add_subdirectory", "include"):
+                        if len(arguments) != 1 or any(
+                            marker in arguments[0] for marker in ("${", "$<", ";")
+                        ):
+                            raise RuntimeError(
+                                f"unsupported dynamic CTest {command_name} edge in {canonical}"
+                            )
+                        edge = Path(arguments[0])
+                        if command_name in ("subdirs", "add_subdirectory"):
+                            subdirectory = (
+                                edge
+                                if edge.is_absolute()
+                                else execution_directory / edge
+                            )
+                            target = subdirectory / "CTestTestfile.cmake"
+                            next_execution_directory = subdirectory
+                        else:
+                            target = (
+                                edge if edge.is_absolute() else lexical.parent / edge
+                            )
+                            next_execution_directory = execution_directory
+                        evaluate(
                             target,
                             command_name == "subdirs",
                             next_execution_directory,
                         )
-                    )
+                        continue
+                    if command_name == "add_test":
+                        name = _test_name(arguments)
+                        if name is not None:
+                            additions.append(
+                                (
+                                    arguments,
+                                    execution_directory,
+                                    (scope, name),
+                                )
+                            )
+                        continue
+                    for tests, property_name, value, append in (
+                        _property_assignments_for_command(command_name, arguments)
+                    ):
+                        for test in tests:
+                            properties = property_values.setdefault(
+                                (scope, test), {}
+                            )
+                            if append:
+                                properties.setdefault(property_name, []).append(value)
+                            else:
+                                properties[property_name] = [value]
+            finally:
+                active_inputs.remove(canonical)
 
-            for arguments in _cmake_add_test_arguments(text):
-                additions.append((arguments, execution_directory))
-            for tests, property_name, value, append in _property_assignments(text):
-                for test in tests:
-                    properties = property_values.setdefault(test.casefold(), {})
-                    if append:
-                        properties.setdefault(property_name, []).append(value)
-                    else:
-                        properties[property_name] = [value]
+        for graph_root, allow_missing, execution_directory in roots:
+            evaluate(graph_root, allow_missing, execution_directory)
 
         records: list[CTestRecord] = []
         executables: set[Path] = set()
         working_directories: set[Path] = set()
-        for arguments, default_working in additions:
+        for arguments, default_working, property_key in additions:
             name = _test_name(arguments)
             if name is None:
                 continue
-            properties = property_values.get(name.casefold(), {})
+            properties = property_values.get(property_key, {})
             configured_working = properties.get("working_directory", [])
             working_value = configured_working[-1] if configured_working else ""
             working_lexical = (
@@ -1232,9 +1454,6 @@ def validate_ctest_runtime_properties(
     runtime_dirs: tuple[Path, ...],
     qt_plugins: Path,
     qt_platform_plugins: Path,
-    qt_qml: Path,
-    source_root: Path,
-    build_dir: Path,
     ffmpeg_root: Path,
     srt_root: Path,
 ) -> None:
@@ -1255,15 +1474,6 @@ def validate_ctest_runtime_properties(
         return (
             os.path.normcase(str(lexical)) == os.path.normcase(str(expected))
             and lexical.resolve() == expected
-        )
-
-    def contained_addition(value: str) -> bool:
-        path = Path(value)
-        if not path.is_absolute():
-            return False
-        resolved = path.resolve()
-        return os.path.normcase(str(path)) == os.path.normcase(str(resolved)) and any(
-            _is_relative_to(resolved, root) for root in (source_root, build_dir)
         )
 
     for test in graph.tests:
@@ -1290,16 +1500,9 @@ def validate_ctest_runtime_properties(
                     )
                 continue
             if folded in ("qml_import_path", "qml2_import_path"):
-                values = tuple(item for item in value.split(os.pathsep) if item)
-                if not values or any(
-                    not same_identity(item, qt_qml)
-                    and not contained_addition(item)
-                    for item in values
-                ):
-                    raise RuntimeError(
-                        f"CTest ENVIRONMENT for {test.name} changes {name}: {value}"
-                    )
-                continue
+                raise RuntimeError(
+                    f"CTest ENVIRONMENT for {test.name} changes {name}: {value}"
+                )
             if folded == "qtest_function_timeout" and value.isdigit():
                 continue
             if folded.startswith("olr_") and "\0" not in value:
@@ -1308,6 +1511,7 @@ def validate_ctest_runtime_properties(
                 f"CTest ENVIRONMENT for {test.name} has unapproved variable {name}"
             )
 
+        path_modifications: list[Path] = []
         for modification in test.environment_modification:
             name, separator, operation_value = modification.partition("=")
             operation, operation_separator, value = operation_value.partition(":")
@@ -1326,19 +1530,21 @@ def validate_ctest_runtime_properties(
                         "CTest ENVIRONMENT_MODIFICATION for "
                         f"{test.name} changes PATH: {modification}"
                     )
+                path_modifications.append(Path(os.path.abspath(value)).resolve())
                 continue
             if folded in ("qml_import_path", "qml2_import_path"):
-                if operation.casefold() != "path_list_prepend" or (
-                    not same_identity(value, qt_qml)
-                ):
-                    raise RuntimeError(
-                        "CTest ENVIRONMENT_MODIFICATION for "
-                        f"{test.name} changes {name}: {modification}"
-                    )
-                continue
+                raise RuntimeError(
+                    "CTest ENVIRONMENT_MODIFICATION for "
+                    f"{test.name} changes {name}: {modification}"
+                )
             raise RuntimeError(
                 "CTest ENVIRONMENT_MODIFICATION for "
                 f"{test.name} has unapproved variable {name}"
+            )
+        if path_modifications and tuple(reversed(path_modifications)) != runtime_dirs:
+            raise RuntimeError(
+                "CTest ENVIRONMENT_MODIFICATION PATH sequence for "
+                f"{test.name} does not preserve controlled runtime order"
             )
 
 

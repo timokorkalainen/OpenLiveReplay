@@ -22,6 +22,10 @@ _CREATE_SUSPENDED = 0x00000004
 _TH32CS_SNAPTHREAD = 0x00000004
 _THREAD_SUSPEND_RESUME = 0x0002
 _CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+_STARTF_USESTDHANDLES = 0x00000100
+_PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
+_DUPLICATE_SAME_ACCESS = 0x00000002
 _WAIT_TIMEOUT = 0x00000102
 _INFINITE = 0xFFFFFFFF
 
@@ -107,6 +111,13 @@ class _StartupInfoW(ctypes.Structure):
         ("stdin", wintypes.HANDLE),
         ("stdout", wintypes.HANDLE),
         ("stderr", wintypes.HANDLE),
+    ]
+
+
+class _StartupInfoExW(ctypes.Structure):
+    _fields_ = [
+        ("startup_info", _StartupInfoW),
+        ("attribute_list", ctypes.c_void_p),
     ]
 
 
@@ -222,11 +233,37 @@ class _NativeProcess:
 def _environment_block(environment: dict[str, str] | None) -> ctypes.Array | None:
     if environment is None:
         return None
+    folded: dict[str, str] = {}
+    for key in environment:
+        existing = folded.get(key.casefold())
+        if existing is not None:
+            raise ValueError(
+                f"duplicate case-insensitive environment variable: {existing}/{key}"
+            )
+        folded[key.casefold()] = key
     entries = sorted(
         (f"{key}={value}" for key, value in environment.items()),
         key=str.casefold,
     )
     return ctypes.create_unicode_buffer("\0".join(entries) + "\0\0")
+
+
+def _adopt_created_process(
+    kernel32: Any, information: _ProcessInformation
+) -> _NativeProcess:
+    """Transfer a new process handle or terminate it if wrapping cannot complete."""
+    process = int(information.process)
+    thread = int(information.thread)
+    try:
+        kernel32.CloseHandle(thread)
+        thread = 0
+        return _NativeProcess(process, int(information.process_id))
+    except BaseException:
+        kernel32.TerminateProcess(process, 1)
+        if thread:
+            kernel32.CloseHandle(thread)
+        kernel32.CloseHandle(process)
+        raise
 
 
 def _popen_private_desktop(
@@ -239,6 +276,10 @@ def _popen_private_desktop(
     **kwargs: Any,
 ) -> _NativeProcess:
     """Create a suspended process with STARTUPINFO.lpDesktop set explicitly."""
+    stdin = kwargs.pop("stdin", None)
+    stdout = kwargs.pop("stdout", None)
+    stderr = kwargs.pop("stderr", None)
+    kwargs.pop("close_fds", None)
     if kwargs:
         raise TypeError(
             "unsupported private-desktop process options: "
@@ -254,35 +295,156 @@ def _popen_private_desktop(
         wintypes.DWORD,
         ctypes.c_void_p,
         wintypes.LPCWSTR,
-        ctypes.POINTER(_StartupInfoW),
+        ctypes.c_void_p,
         ctypes.POINTER(_ProcessInformation),
     )
     kernel32.CreateProcessW.restype = wintypes.BOOL
     kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetStdHandle.argtypes = (wintypes.DWORD,)
+    kernel32.GetStdHandle.restype = wintypes.HANDLE
+    kernel32.DuplicateHandle.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel32.DuplicateHandle.restype = wintypes.BOOL
+    kernel32.InitializeProcThreadAttributeList.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_size_t),
+    )
+    kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+    kernel32.UpdateProcThreadAttribute.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+    kernel32.DeleteProcThreadAttributeList.argtypes = (ctypes.c_void_p,)
 
-    startup = _StartupInfoW()
-    startup.cb = ctypes.sizeof(startup)
-    startup.desktop = desktop_path
-    information = _ProcessInformation()
-    command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(command))
-    environment = _environment_block(env)
-    flags = creationflags | (_CREATE_UNICODE_ENVIRONMENT if environment else 0)
-    if not kernel32.CreateProcessW(
-        str(command[0]),
-        command_line,
-        None,
-        None,
-        False,
-        flags,
-        environment,
-        str(cwd) if cwd is not None else None,
-        ctypes.byref(startup),
-        ctypes.byref(information),
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    kernel32.CloseHandle(information.thread)
-    return _NativeProcess(int(information.process), int(information.process_id))
+    import msvcrt
+
+    owned_files: list[Any] = []
+    duplicated_handles: list[int] = []
+
+    def source_handle(value: Any, standard: int, mode: str) -> int:
+        if value == subprocess.PIPE:
+            raise TypeError(
+                "subprocess.PIPE is unsupported because run_process_tree returns "
+                "only an exit code; pass an opened pipe or file handle"
+            )
+        if value == subprocess.DEVNULL:
+            stream = open(os.devnull, mode)
+            owned_files.append(stream)
+            return int(msvcrt.get_osfhandle(stream.fileno()))
+        if value is None:
+            handle = kernel32.GetStdHandle(ctypes.c_uint32(standard).value)
+            if handle not in (None, 0, ctypes.c_void_p(-1).value):
+                return int(handle)
+            stream = open(os.devnull, mode)
+            owned_files.append(stream)
+            return int(msvcrt.get_osfhandle(stream.fileno()))
+        descriptor = value if isinstance(value, int) else value.fileno()
+        return int(msvcrt.get_osfhandle(descriptor))
+
+    def duplicate(handle: int) -> int:
+        current = kernel32.GetCurrentProcess()
+        inherited = wintypes.HANDLE()
+        if not kernel32.DuplicateHandle(
+            current,
+            wintypes.HANDLE(handle),
+            current,
+            ctypes.byref(inherited),
+            0,
+            True,
+            _DUPLICATE_SAME_ACCESS,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        duplicated_handles.append(int(inherited.value))
+        return int(inherited.value)
+
+    attribute_pointer: ctypes.c_void_p | None = None
+    try:
+        stdin_handle = duplicate(source_handle(stdin, -10, "rb"))
+        stdout_handle = duplicate(source_handle(stdout, -11, "wb"))
+        stderr_handle = (
+            stdout_handle
+            if stderr == subprocess.STDOUT
+            else duplicate(source_handle(stderr, -12, "wb"))
+        )
+        inherited_handles = tuple(dict.fromkeys(duplicated_handles))
+        handle_array = (wintypes.HANDLE * len(inherited_handles))(
+            *inherited_handles
+        )
+        attribute_size = ctypes.c_size_t()
+        kernel32.InitializeProcThreadAttributeList(
+            None, 1, 0, ctypes.byref(attribute_size)
+        )
+        attribute_storage = ctypes.create_string_buffer(attribute_size.value)
+        attribute_pointer = ctypes.cast(attribute_storage, ctypes.c_void_p)
+        if not kernel32.InitializeProcThreadAttributeList(
+            attribute_pointer, 1, 0, ctypes.byref(attribute_size)
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.UpdateProcThreadAttribute(
+            attribute_pointer,
+            0,
+            _PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            ctypes.cast(handle_array, ctypes.c_void_p),
+            ctypes.sizeof(handle_array),
+            None,
+            None,
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        startup = _StartupInfoExW()
+        startup.startup_info.cb = ctypes.sizeof(startup)
+        startup.startup_info.desktop = desktop_path
+        startup.startup_info.flags = _STARTF_USESTDHANDLES
+        startup.startup_info.stdin = wintypes.HANDLE(stdin_handle)
+        startup.startup_info.stdout = wintypes.HANDLE(stdout_handle)
+        startup.startup_info.stderr = wintypes.HANDLE(stderr_handle)
+        startup.attribute_list = attribute_pointer
+        information = _ProcessInformation()
+        command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(command))
+        environment = _environment_block(env)
+        flags = (
+            creationflags
+            | _EXTENDED_STARTUPINFO_PRESENT
+            | (_CREATE_UNICODE_ENVIRONMENT if environment else 0)
+        )
+        if not kernel32.CreateProcessW(
+            str(command[0]),
+            command_line,
+            None,
+            None,
+            True,
+            flags,
+            environment,
+            str(cwd) if cwd is not None else None,
+            ctypes.byref(startup),
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return _adopt_created_process(kernel32, information)
+    finally:
+        if attribute_pointer is not None:
+            kernel32.DeleteProcThreadAttributeList(attribute_pointer)
+        for handle in reversed(duplicated_handles):
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+        for stream in reversed(owned_files):
+            stream.close()
 
 
 class KillOnCloseJob:

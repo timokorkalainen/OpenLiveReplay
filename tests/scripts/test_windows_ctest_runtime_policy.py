@@ -24,6 +24,12 @@ def load_module():
 
 
 class WindowsRuntimePolicyTests(unittest.TestCase):
+    def test_windows_runtime_declares_cmake_322_minimum(self) -> None:
+        helper = MODULE_PATH.parents[2] / "cmake" / "OlrTestRuntime.cmake"
+        text = helper.read_text(encoding="utf-8")
+        self.assertRegex(text, r"CMAKE_VERSION\s+VERSION_LESS\s+3\.22")
+        self.assertRegex(text, r"FATAL_ERROR[\s\S]*3\.22")
+
     def test_registration_check_preserves_enclosing_ctest_logs(self) -> None:
         ctest_value = shutil.which("ctest")
         self.assertIsNotNone(ctest_value, "CTest is required for the integration test")

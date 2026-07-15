@@ -44,7 +44,8 @@ aqt install-qt -O "$HOME/Qt" linux desktop 6.11.1 linux_gcc_64 \
 ```
 
 On Windows, run these commands in PowerShell. The repository uses the Qt MinGW
-kit, not an MSVC kit:
+kit, not an MSVC kit. Controlled Windows test builds require CMake 3.22 or newer
+so CTest can prepend runtime paths without inheriting an ambient `PATH`:
 
 ```powershell
 py -m pip install --user aqtinstall

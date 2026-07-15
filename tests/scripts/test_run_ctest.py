@@ -594,6 +594,65 @@ class RunCtestTests(unittest.TestCase):
 
         self.assertEqual(registered_test_executables(self.build_dir), (executable,))
 
+    def test_ctest_graph_follows_add_subdirectory(self) -> None:
+        child = self.build_dir / "child"
+        child.mkdir()
+        (child / "CTestTestfile.cmake").write_text(
+            'add_test([=[child]=] "runner")\n'
+            'set_tests_properties([=[child]=] PROPERTIES '
+            'ENVIRONMENT "PATH=C:/poison")\n',
+            encoding="utf-8",
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_subdirectory("child")\n', encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ENVIRONMENT.*PATH"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_graph_rejects_discover_tests_command(self) -> None:
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'discover_tests("dynamic")\n', encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "discover_tests"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_include_properties_follow_execution_order(self) -> None:
+        included = self.build_dir / "included-properties.cmake"
+        included.write_text(
+            'set_tests_properties([=[ordered]=] PROPERTIES '
+            'ENVIRONMENT "PATH=C:/poison")\n',
+            encoding="utf-8",
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_test([=[ordered]=] "runner")\n'
+            'include("included-properties.cmake")\n'
+            'set_tests_properties([=[ordered]=] PROPERTIES '
+            'ENVIRONMENT "OLR_SAFE=1")\n',
+            encoding="utf-8",
+        )
+
+        run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_include_cannot_hide_later_unsafe_property(self) -> None:
+        included = self.build_dir / "included-safe-properties.cmake"
+        included.write_text(
+            'set_tests_properties([=[ordered]=] PROPERTIES '
+            'ENVIRONMENT "OLR_SAFE=1")\n',
+            encoding="utf-8",
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_test([=[ordered]=] "runner")\n'
+            'include("included-safe-properties.cmake")\n'
+            'set_tests_properties([=[ordered]=] PROPERTIES '
+            'ENVIRONMENT "PATH=C:/poison")\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ENVIRONMENT.*PATH"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
     def test_ctest_include_preserves_callers_directory_context(self) -> None:
         executable = self.build_dir / "tst_included_context.exe"
         executable.write_bytes(b"pe-fixture")
@@ -743,6 +802,55 @@ class RunCtestTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ENVIRONMENT_MODIFICATION.*PATH"):
             run_ctest.prepare_windows_runtime(self.build_dir, {})
 
+    def test_ctest_rejects_incomplete_path_prepend_sequence(self) -> None:
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_test([=[reorder]=] "runner")\n'
+            'set_tests_properties([=[reorder]=] PROPERTIES '
+            f'ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:{(self.qt_root / "bin").as_posix()}")\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "PATH.*order|sequence"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_properties_are_scoped_to_their_test_directory(self) -> None:
+        safe = self.build_dir / "safe"
+        unsafe = self.build_dir / "unsafe"
+        safe.mkdir()
+        unsafe.mkdir()
+        (safe / "CTestTestfile.cmake").write_text(
+            'add_test([=[duplicate]=] "runner")\n'
+            'set_tests_properties([=[duplicate]=] PROPERTIES '
+            'ENVIRONMENT "OLR_SAFE=1")\n',
+            encoding="utf-8",
+        )
+        (unsafe / "CTestTestfile.cmake").write_text(
+            'add_test([=[duplicate]=] "runner")\n'
+            'set_tests_properties([=[duplicate]=] PROPERTIES '
+            'ENVIRONMENT "PATH=C:/poison")\n',
+            encoding="utf-8",
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'subdirs("safe")\nsubdirs("unsafe")\n', encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ENVIRONMENT.*PATH"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_test_names_remain_case_sensitive(self) -> None:
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_test([=[CaseSensitive]=] "runner")\n'
+            'set_tests_properties([=[CaseSensitive]=] PROPERTIES '
+            'ENVIRONMENT "PATH=C:/poison")\n'
+            'add_test([=[casesensitive]=] "runner")\n'
+            'set_tests_properties([=[casesensitive]=] PROPERTIES '
+            'ENVIRONMENT "OLR_SAFE=1")\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "ENVIRONMENT.*PATH"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
     def test_ctest_rejects_uncontrolled_qt_environment_paths(self) -> None:
         (self.build_dir / "CTestTestfile.cmake").write_text(
             'add_test([=[bad-qt]=] "runner")\n'
@@ -752,6 +860,31 @@ class RunCtestTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(RuntimeError, "QT_PLUGIN_PATH|QT_QPA_PLATFORM"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_rejects_nonexistent_qml_import_addition(self) -> None:
+        missing = (self.build_dir / "missing-qml").as_posix()
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_test([=[bad-qml]=] "runner")\n'
+            'set_tests_properties([=[bad-qml]=] PROPERTIES '
+            f'ENVIRONMENT "QML_IMPORT_PATH={missing}")\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "QML_IMPORT_PATH"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_rejects_additional_qml_import_root(self) -> None:
+        qml = self.build_dir / "qml"
+        qml.mkdir()
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_test([=[qml]=] "runner")\n'
+            'set_tests_properties([=[qml]=] PROPERTIES '
+            f'ENVIRONMENT "QML_IMPORT_PATH={qml.as_posix()}")\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "QML_IMPORT_PATH"):
             run_ctest.prepare_windows_runtime(self.build_dir, {})
 
     def test_ctest_models_every_set_property_environment_value(self) -> None:
@@ -936,6 +1069,31 @@ class RunCtestTests(unittest.TestCase):
         )
         self.assertEqual(ctest, self.ctest)
 
+    def test_windows_runtime_replaces_controlled_environment_case_insensitively(self):
+        inherited = {
+            "Path": str(self.ambient_bin),
+            "SYSTEMROOT": str(self.root / "hostile-windows"),
+            "qt_plugin_path": str(self.root / "hostile-plugins"),
+            "Qt_Qpa_Platform": "windows",
+            "unrelated": "preserved",
+        }
+
+        env, _ = run_ctest.prepare_windows_runtime(self.build_dir, inherited)
+
+        for controlled in (
+            "PATH",
+            "SystemRoot",
+            "QT_PLUGIN_PATH",
+            "QT_QPA_PLATFORM",
+        ):
+            self.assertEqual(
+                sum(key.casefold() == controlled.casefold() for key in env),
+                1,
+                controlled,
+            )
+        self.assertEqual(env["unrelated"], "preserved")
+        self.assertNotIn("hostile", "\n".join(env.values()))
+
     def test_windows_runtime_requires_embedded_manifests_for_selected_processes(self):
         with mock.patch(
             "tools.run_ctest.reject_runtime_dll_shadowing"
@@ -1020,6 +1178,25 @@ class RunCtestTests(unittest.TestCase):
         self.assertEqual(env["QML2_IMPORT_PATH"], str(self.qt_root / "qml"))
         self.assertEqual(inherited["QML_IMPORT_PATH"], str(inherited_qml))
         self.assertEqual(inherited["QML2_IMPORT_PATH"], str(inherited_qml2))
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_windows_runtime_stages_qml_for_external_launch_lease(self):
+        source_qml = self.qt_root / "qml"
+        (source_qml / "Module.qml").write_text("source", encoding="utf-8")
+        lease = RuntimeAuditLease()
+        try:
+            env, _ = run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            staged_qml = Path(env["QML_IMPORT_PATH"])
+            self.assertNotEqual(staged_qml, source_qml)
+            self.assertEqual(env["QML2_IMPORT_PATH"], str(staged_qml))
+            self.assertEqual(
+                (staged_qml / "Module.qml").read_text(encoding="utf-8"), "source"
+            )
+        finally:
+            lease.close()
+        self.assertFalse(staged_qml.exists())
 
     def test_windows_runtime_replaces_explicit_qpa_platform(self):
         env, _ = run_ctest.prepare_windows_runtime(
@@ -1386,6 +1563,37 @@ class RunCtestTests(unittest.TestCase):
 
         os.replace(replacement, adjacent)
         self.assertEqual(adjacent.read_bytes(), b"replacement")
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows ACLs")
+    def test_staged_qml_tree_blocks_replacement_injection_and_retarget(self) -> None:
+        source = self.qt_root / "qml"
+        module = source / "Module.qml"
+        module.write_text("import QtQuick\nItem {}\n", encoding="utf-8")
+        nested = source / "Nested"
+        nested.mkdir()
+        (nested / "Nested.qml").write_text(
+            "import QtQuick\nItem {}\n", encoding="utf-8"
+        )
+        replacement = self.root / "replacement.qml"
+        replacement.write_text("import QtQuick\nQtObject {}\n", encoding="utf-8")
+
+        with RuntimeAuditLease() as lease:
+            staged = lease.stage_readonly_tree(source)
+            staged_module = staged / module.relative_to(source)
+            with self.assertRaises(OSError):
+                staged_module.write_text("poison", encoding="utf-8")
+            with self.assertRaises(OSError):
+                os.replace(replacement, staged_module)
+            with self.assertRaises(OSError):
+                (staged / "Injected.qml").write_text("poison", encoding="utf-8")
+            with self.assertRaises(OSError):
+                (staged / "Nested" / "Injected.qml").write_text(
+                    "poison", encoding="utf-8"
+                )
+            with self.assertRaises(OSError):
+                os.replace(staged, staged.with_name("retargeted-qml"))
+
+        self.assertFalse(staged.parent.exists())
 
     def test_earlier_non_owner_path_peer_cannot_shadow_authoritative_family(self):
         qt_peer = self.qt_root / "bin" / "avcodec-62.dll"

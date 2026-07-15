@@ -123,6 +123,59 @@ class RunWindowsAppTests(unittest.TestCase):
         self.assertEqual(env["QML_IMPORT_PATH"], str(self.qt / "qml"))
         self.assertNotIn("poisoned", "\n".join(env.values()))
 
+    def test_runtime_replaces_controlled_environment_case_insensitively(self) -> None:
+        windows_dir = self.workspace / "api-windows"
+        system_dir = windows_dir / "System32"
+        inherited = {
+            "Path": str(self.workspace / "hostile-bin"),
+            "SYSTEMROOT": str(self.workspace / "hostile-windows"),
+            "qt_plugin_path": str(self.workspace / "hostile-plugins"),
+            "qml_import_path": str(self.workspace / "hostile-qml"),
+            "unrelated": "preserved",
+        }
+        with mock.patch.object(
+            self.launcher.runtime_guard,
+            "windows_system_directories",
+            return_value=(system_dir, windows_dir),
+            create=True,
+        ):
+            env = self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, inherited
+            )
+
+        for controlled in (
+            "PATH",
+            "SystemRoot",
+            "QT_PLUGIN_PATH",
+            "QML_IMPORT_PATH",
+        ):
+            self.assertEqual(
+                sum(key.casefold() == controlled.casefold() for key in env),
+                1,
+                controlled,
+            )
+        self.assertEqual(env["unrelated"], "preserved")
+        self.assertNotIn("hostile", "\n".join(env.values()))
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_runtime_stages_qml_for_external_launch_lease(self) -> None:
+        source_qml = self.qt / "qml"
+        (source_qml / "Module.qml").write_text("source", encoding="utf-8")
+        lease = self.launcher.runtime_guard.RuntimeAuditLease()
+        try:
+            env = self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=lease
+            )
+            staged_qml = Path(env["QML_IMPORT_PATH"])
+            self.assertNotEqual(staged_qml, source_qml)
+            self.assertEqual(env["QML2_IMPORT_PATH"], str(staged_qml))
+            self.assertEqual(
+                (staged_qml / "Module.qml").read_text(encoding="utf-8"), "source"
+            )
+        finally:
+            lease.close()
+        self.assertFalse(staged_qml.exists())
+
     def test_cache_rejects_duplicate_wrong_type_and_relative_roots(self) -> None:
         cache = self.build / "CMakeCache.txt"
         original = cache.read_text(encoding="utf-8")
