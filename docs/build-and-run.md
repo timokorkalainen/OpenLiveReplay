@@ -240,6 +240,22 @@ An external `.manifest` file is not accepted as equivalent. This prevents a
 late `<executable>.local` file or directory from changing the audited loader
 resolution between verification and process startup.
 
+For each controlled CTest launch, the launcher also creates read/execute-only
+snapshots of the reachable CTest graph, reachable test executables, configured
+runtime namespace, Qt plugins/QML modules, and any QuickTest `-input` source
+tree. Generated graph paths are rewritten to those snapshots while the original
+CTest arguments, properties, labels, timeouts, and working directories remain
+effective. Relative QML imports therefore resolve inside the same protected
+source snapshot as their `-input`. Missing legacy `subdirs()` edges, dynamic
+graph edges, build-tree QuickTest inputs, reparse aliases, or QML import roots
+outside the configured source/build/Qt trees fail closed before CTest starts.
+The launcher uses the protected runtime as the inherited `SetDllDirectory`
+value, which removes the mutable current directory from descendant DLL search;
+the child `PATH` contains only that protected runtime and Windows system roots.
+The controlled Windows app launcher applies the same protected runtime,
+plugin/QML, and application-directory policy before starting the staged app
+executable, then removes every temporary snapshot after its process tree exits.
+
 The same launch audit follows the generated CTest `subdirs()`/`include()`
 graph, validates each test's working directory and loader-related environment,
 and holds the graph plus resolved runtime files until the process tree is

@@ -137,16 +137,78 @@ def prepare_windows_app_runtime(
             require_embedded_manifests=os.name == "nt",
         )
 
+        launch_runtime_dirs = runtime_dirs
+        launch_plugins = qt_plugins
+        launch_platform_plugins = qt_platform_plugins
+        launch_executable = executable
+        if audit_lease is not None and os.name == "nt":
+            launch_plugins = lease.stage_readonly_tree(
+                qt_plugins, entry_limit=16384, byte_limit=512 << 20
+            )
+            launch_platform_plugins = (
+                launch_plugins / qt_platform_plugins.relative_to(qt_plugins)
+            )
+            launch_qml = lease.stage_readonly_tree(
+                qt_qml, entry_limit=32768, byte_limit=1 << 30
+            )
+
+            runtime_relative_dirs = (
+                Path("mingw") / "bin",
+                Path("qt") / "bin",
+                Path("ffmpeg") / "bin",
+                Path("ffmpeg") / "lib",
+                Path("srt") / "bin",
+                Path("srt") / "lib",
+            )
+            runtime_entries: dict[Path, Path | bytes] = {
+                Path("loader") / ".closed": b"closed loader namespace\n"
+            }
+            for directory, relative_directory in zip(
+                runtime_dirs, runtime_relative_dirs, strict=True
+            ):
+                for child in sorted(
+                    directory.iterdir(), key=lambda path: path.name.casefold()
+                ):
+                    if child.is_file():
+                        runtime_entries[relative_directory / child.name] = child
+            runtime_layout = lease.stage_readonly_layout(
+                "app-runtime", runtime_entries, byte_limit=2 << 30
+            )
+            loader_directory = runtime_layout / "loader"
+            launch_runtime_dirs = tuple(
+                runtime_layout / path for path in runtime_relative_dirs
+            )
+            lease.launch_runtime_directory = loader_directory
+            lease.launch_runtime_directories = launch_runtime_dirs
+
+            app_entries: dict[Path, Path | bytes] = {
+                Path(executable.name): executable
+            }
+            for adjacent in sorted(
+                executable.parent.iterdir(),
+                key=lambda path: path.name.casefold(),
+            ):
+                if adjacent == executable or not adjacent.is_file():
+                    continue
+                if adjacent.suffix.casefold() == ".dll" or adjacent.name.casefold() == "qt.conf":
+                    app_entries[Path(adjacent.name)] = adjacent
+            app_layout = lease.stage_readonly_layout(
+                "app", app_entries, byte_limit=1 << 30
+            )
+            launch_executable = app_layout / executable.name
+            lease.launch_executable = launch_executable
+
         system_dir, windows_dir = runtime_guard.windows_system_directories()
         env = runtime_guard.replace_environment_case_insensitively(
             inherited_env,
             {
                 "SystemRoot": str(windows_dir),
                 "PATH": os.pathsep.join(
-                    str(path) for path in (*runtime_dirs, system_dir, windows_dir)
+                    str(path)
+                    for path in (*launch_runtime_dirs, system_dir, windows_dir)
                 ),
-                "QT_PLUGIN_PATH": str(qt_plugins),
-                "QT_QPA_PLATFORM_PLUGIN_PATH": str(qt_platform_plugins),
+                "QT_PLUGIN_PATH": str(launch_plugins),
+                "QT_QPA_PLATFORM_PLUGIN_PATH": str(launch_platform_plugins),
                 "QML_IMPORT_PATH": str(launch_qml),
                 "QML2_IMPORT_PATH": str(launch_qml),
             },
@@ -173,19 +235,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = prepare_windows_app_runtime(
             build_dir, executable, os.environ, audit_lease=audit_lease
         )
-        executable = audit_lease.canonical_file(executable)
+        executable = (
+            audit_lease.launch_executable
+            or audit_lease.canonical_file(executable)
+        )
         app_args = list(args.app_args)
         if app_args[:1] == ["--"]:
             app_args.pop(0)
         command = [str(executable), *app_args]
         with suppress_windows_error_dialogs(True):
-            return run_process_tree(
-                command,
-                enabled=os.name == "nt",
-                cwd=executable.parent,
-                env=env,
-                private_desktop=True,
+            runtime_directory = audit_lease.launch_runtime_directory
+            previous = (
+                runtime_guard.set_windows_dll_directory(runtime_directory)
+                if runtime_directory is not None
+                else None
             )
+            try:
+                return run_process_tree(
+                    command,
+                    enabled=os.name == "nt",
+                    cwd=executable.parent,
+                    env=env,
+                    private_desktop=True,
+                )
+            finally:
+                if runtime_directory is not None:
+                    runtime_guard.restore_windows_dll_directory(previous)
 
 
 if __name__ == "__main__":

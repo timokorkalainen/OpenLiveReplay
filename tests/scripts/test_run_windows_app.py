@@ -176,6 +176,35 @@ class RunWindowsAppTests(unittest.TestCase):
             lease.close()
         self.assertFalse(staged_qml.exists())
 
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_external_app_lease_closes_app_and_runtime_namespaces(self) -> None:
+        (self.compiler / "runtime-tool.exe").write_bytes(b"compiler")
+        (self.qt / "bin" / "runtime-tool.exe").write_bytes(b"qt")
+        (self.build / "OpenLiveReplaySupport.dll").write_bytes(b"support")
+
+        with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
+            env = self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=lease
+            )
+            staged_app = lease.launch_executable
+            loader = lease.launch_runtime_directory
+            runtime_dirs = lease.launch_runtime_directories
+            self.assertNotEqual(staged_app, self.app)
+            self.assertEqual(staged_app.read_bytes(), self.app.read_bytes())
+            self.assertEqual(
+                (staged_app.parent / "OpenLiveReplaySupport.dll").read_bytes(),
+                b"support",
+            )
+            self.assertEqual(
+                Path(env["PATH"].split(os.pathsep)[0]), runtime_dirs[0]
+            )
+            self.assertEqual(
+                (runtime_dirs[0] / "runtime-tool.exe").read_bytes(), b"compiler"
+            )
+            for directory in (loader, *runtime_dirs, staged_app.parent):
+                with self.subTest(directory=directory), self.assertRaises(OSError):
+                    (directory / "late-injection.dll").write_bytes(b"poison")
+
     def test_cache_rejects_duplicate_wrong_type_and_relative_roots(self) -> None:
         cache = self.build / "CMakeCache.txt"
         original = cache.read_text(encoding="utf-8")

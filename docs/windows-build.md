@@ -100,6 +100,20 @@ python tools/run_ctest.py --test-dir build -L unit --output-on-failure
 python tools/run_ctest.py --test-dir build -R '^rhi_d3d_probe$' --output-on-failure
 ```
 
+The supported launcher snapshots the literal CTest graph, test executables,
+controlled runtime files, Qt plugin/module trees, and QuickTest source closure
+into read/execute-only temporary layouts for the child lifetime. It rewrites
+only loader/QML paths and restores each test's configured working directory.
+Absent `subdirs()` files and unsupported dynamic or external QML inputs are
+errors rather than names that may appear after the audit. Descendants inherit a
+protected `SetDllDirectory` runtime and a system-only tail on `PATH`, so their
+application, current-directory, and configured-runtime DLL namespaces cannot
+gain a late unaudited DLL. Snapshots are removed after the complete CTest
+process tree exits.
+The VS Code controlled app task uses the corresponding protected app/runtime
+layout as well; attach-only debugging therefore observes the same loader policy
+as command-line tests.
+
 To verify the self-contained release package uses only the controlled FFmpeg 8
 runtime, run the Qt core-media smoke after packaging. It audits an isolated copy
 of the package, starts raw audio through the Windows Qt backend, and submits two

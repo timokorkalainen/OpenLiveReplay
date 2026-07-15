@@ -497,9 +497,16 @@ class RunCtestTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+        expected = {bracket_executable, helper_executable, test_executable}
+        for external in (
+            Path("C:/Program Files/Git/bin/bash.exe"),
+            Path("C:/Python/python.exe"),
+        ):
+            if external.is_file():
+                expected.add(external.resolve())
         self.assertEqual(
             registered_test_executables(self.build_dir),
-            (bracket_executable, helper_executable, test_executable),
+            tuple(sorted(expected, key=lambda path: str(path).casefold())),
         )
 
     def test_registered_test_executables_preserve_literal_equals_in_paths(self):
@@ -609,6 +616,23 @@ class RunCtestTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "ENVIRONMENT.*PATH"):
             run_ctest.prepare_windows_runtime(self.build_dir, {})
+
+    def test_ctest_graph_rejects_missing_legacy_subdirs_edge(self) -> None:
+        missing = self.build_dir / "generated-later"
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'subdirs("generated-later")\n', encoding="utf-8"
+        )
+
+        with RuntimeAuditLease() as lease:
+            with self.assertRaisesRegex(RuntimeError, "subdirs.*does not exist"):
+                run_ctest.prepare_windows_runtime(
+                    self.build_dir, {}, audit_lease=lease
+                )
+            missing.mkdir()
+            (missing / "CTestTestfile.cmake").write_text(
+                'add_test([=[late]=] "runner")\n', encoding="utf-8"
+            )
+            self.assertIsNone(lease.launch_build_directory)
 
     def test_ctest_graph_rejects_discover_tests_command(self) -> None:
         (self.build_dir / "CTestTestfile.cmake").write_text(
@@ -875,8 +899,8 @@ class RunCtestTests(unittest.TestCase):
             run_ctest.prepare_windows_runtime(self.build_dir, {})
 
     def test_ctest_rejects_additional_qml_import_root(self) -> None:
-        qml = self.build_dir / "qml"
-        qml.mkdir()
+        qml = Path(tempfile.mkdtemp(prefix="olr-uncontrolled-qml-"))
+        self.addCleanup(shutil.rmtree, qml, True)
         (self.build_dir / "CTestTestfile.cmake").write_text(
             'add_test([=[qml]=] "runner")\n'
             'set_tests_properties([=[qml]=] PROPERTIES '
@@ -1045,6 +1069,33 @@ class RunCtestTests(unittest.TestCase):
         self.assertEqual(len(executables), 256)
         self.assertLess(elapsed, 5.0)
 
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_protected_launch_snapshot_cost_is_bounded(self):
+        commands: list[str] = []
+        for index in range(256):
+            executable = self.build_dir / f"tst_snapshot_{index:03d}.exe"
+            _write_manifest_pe_fixture(executable)
+            commands.append(
+                f'add_test([=[snapshot-{index}]=] "{executable.as_posix()}")'
+            )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            "\n".join(commands) + "\n", encoding="utf-8"
+        )
+
+        started = time.perf_counter()
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            staged = lease.launch_build_directory
+            self.assertEqual(len(tuple(staged.glob("tst_snapshot_*.exe"))), 256)
+        elapsed = time.perf_counter() - started
+
+        # Includes 256 PE manifest/provenance checks plus protected copies. Keep
+        # this bounded without making the assertion depend on warm filesystem
+        # or antivirus caches.
+        self.assertLess(elapsed, 10.0)
+
     def test_windows_runtime_replaces_inherited_path(self):
         env, ctest = run_ctest.prepare_windows_runtime(
             self.build_dir, {"PATH": str(self.ambient_bin)}
@@ -1197,6 +1248,256 @@ class RunCtestTests(unittest.TestCase):
         finally:
             lease.close()
         self.assertFalse(staged_qml.exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_external_launch_snapshots_quicktest_input_and_relative_imports(self):
+        qml_input = self.root / "tests" / "qml"
+        relative_module = self.root / "ui" / "components"
+        qml_input.mkdir(parents=True)
+        relative_module.mkdir(parents=True)
+        test_qml = qml_input / "tst_snapshot.qml"
+        component = relative_module / "SnapshotComponent.qml"
+        test_qml.write_text(
+            'import QtQuick\nimport "../../ui/components"\nItem {}\n',
+            encoding="utf-8",
+        )
+        component.write_text("import QtQuick\nItem {}\n", encoding="utf-8")
+        source_fixture = self.root / "fixtures" / "input.dat"
+        source_fixture.parent.mkdir()
+        source_fixture.write_bytes(b"source-fixture")
+        build_fixture = self.build_dir / "fixtures" / "generated.dat"
+        build_fixture.parent.mkdir()
+        build_fixture.write_bytes(b"build-fixture")
+        executable = self.build_dir / "tst_snapshot.exe"
+        _write_manifest_pe_fixture(executable)
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph.write_text(
+            f'add_test([=[snapshot]=] "{executable.as_posix()}" '
+            f'"-input" "../{qml_input.relative_to(self.root).as_posix()}" '
+            f'"--source-fixture" "{source_fixture.as_posix()}" '
+            f'"--build-fixture" "{build_fixture.as_posix()}")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            staged_build = lease.launch_build_directory
+            staged_source = lease.launch_source_directory
+            self.assertNotEqual(staged_build, self.build_dir)
+            self.assertNotEqual(staged_source, self.root)
+            staged_graph = staged_build / "CTestTestfile.cmake"
+            staged_text = staged_graph.read_text(encoding="utf-8")
+            staged_input = staged_source / "tests" / "qml"
+            staged_component = (
+                staged_source / "ui" / "components" / component.name
+            )
+            self.assertIn(staged_input.as_posix(), staged_text)
+            self.assertIn(source_fixture.as_posix(), staged_text)
+            self.assertIn(build_fixture.as_posix(), staged_text)
+            self.assertEqual(
+                staged_component.read_text(encoding="utf-8"),
+                "import QtQuick\nItem {}\n",
+            )
+
+            test_qml.write_text("poison", encoding="utf-8")
+            component.write_text("poison", encoding="utf-8")
+            self.assertNotEqual(
+                (staged_input / test_qml.name).read_text(encoding="utf-8"),
+                "poison",
+            )
+            self.assertNotEqual(
+                staged_component.read_text(encoding="utf-8"), "poison"
+            )
+            replacement = self.root / "replacement.qml"
+            replacement.write_text("poison", encoding="utf-8")
+            with self.assertRaises(OSError):
+                (staged_input / test_qml.name).write_text(
+                    "poison", encoding="utf-8"
+                )
+            with self.assertRaises(OSError):
+                os.replace(replacement, staged_input / test_qml.name)
+            with self.assertRaises(OSError):
+                (staged_input / "Injected.qml").write_text(
+                    "poison", encoding="utf-8"
+                )
+            with self.assertRaises(OSError):
+                (staged_component.parent / "NestedInjected.qml").write_text(
+                    "poison", encoding="utf-8"
+                )
+            with self.assertRaises(OSError):
+                os.replace(
+                    staged_source,
+                    staged_source.with_name("retargeted-source"),
+                )
+            with self.assertRaises(OSError):
+                os.replace(
+                    staged_component.parent,
+                    staged_component.parent.with_name("retargeted-components"),
+                )
+
+        self.assertFalse(staged_build.exists())
+        self.assertFalse(staged_source.exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_external_launch_uses_closed_executable_and_path_namespaces(self):
+        executable = self.build_dir / "tst_closed_namespace.exe"
+        _write_manifest_pe_fixture(executable)
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[closed]=] "{executable.as_posix()}")\n'
+            'set_tests_properties([=[closed]=] PROPERTIES ENVIRONMENT '
+            f'"OLR_FFMPEG_ROOT={self.ffmpeg_root.as_posix()};'
+            f'OLR_SRT_ROOT={self.srt_root.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        (self.qt_root / "bin" / "Qt6Core.dll").write_bytes(b"qt")
+        (self.ffmpeg_root / "bin" / "ffprobe.exe").write_bytes(b"ffprobe")
+        (self.compiler_bin / "runtime-tool.exe").write_bytes(b"compiler-first")
+        (self.qt_root / "bin" / "runtime-tool.exe").write_bytes(b"qt-second")
+
+        with RuntimeAuditLease() as lease:
+            env, selected_ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            runtime = lease.launch_runtime_directory
+            runtime_dirs = lease.launch_runtime_directories
+            staged_build = lease.launch_build_directory
+            staged_executable = staged_build / executable.relative_to(self.build_dir)
+            self.assertEqual(
+                Path(env["PATH"].split(os.pathsep)[0]), runtime_dirs[0]
+            )
+            self.assertNotIn(str(self.qt_root / "bin"), env["PATH"])
+            self.assertNotEqual(selected_ctest, self.ctest)
+            self.assertEqual(selected_ctest.name, "ctest.exe")
+            self.assertEqual(
+                (runtime_dirs[0] / "runtime-tool.exe").read_bytes(),
+                b"compiler-first",
+            )
+            self.assertTrue(staged_executable.is_file())
+            self.assertIn(
+                staged_executable.as_posix(),
+                (staged_build / "CTestTestfile.cmake").read_text(encoding="utf-8"),
+            )
+            staged_graph = (staged_build / "CTestTestfile.cmake").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn((runtime.parent / "ffmpeg").as_posix(), staged_graph)
+            self.assertIn((runtime.parent / "srt").as_posix(), staged_graph)
+            for directory in (
+                runtime,
+                *runtime_dirs,
+                selected_ctest.parent,
+                staged_executable.parent,
+            ):
+                with self.subTest(directory=directory), self.assertRaises(OSError):
+                    (directory / "late-injection.dll").write_bytes(b"poison")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_external_launch_rewrites_relative_executable_but_preserves_workdir(self):
+        working = self.build_dir / "relative-workdir"
+        working.mkdir()
+        executable = working / "tst_relative_staged.exe"
+        _write_manifest_pe_fixture(executable)
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'add_test([=[relative-staged]=] "tst_relative_staged.exe")\n'
+            'set_tests_properties([=[relative-staged]=] PROPERTIES '
+            'WORKING_DIRECTORY [=[relative-workdir]=])\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            staged_build = lease.launch_build_directory
+            staged_executable = staged_build / executable.relative_to(self.build_dir)
+            graph = (staged_build / "CTestTestfile.cmake").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(staged_executable.as_posix(), graph)
+            self.assertIn("# Controlled launch preserves", graph)
+            self.assertIn(str(working), graph)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_external_wrapper_keeps_protected_install_relative_resources(self):
+        external_root = self.root / "external-tool"
+        external_root.mkdir()
+        wrapper = external_root / "wrapper.exe"
+        _write_manifest_pe_fixture(wrapper)
+        resources = external_root / "resources"
+        resources.mkdir()
+        (resources / "runtime.dat").write_bytes(b"resource")
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[external]=] "{wrapper.as_posix()}")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=lease
+            )
+            graph = (lease.launch_build_directory / "CTestTestfile.cmake").read_text(
+                encoding="utf-8"
+            )
+            command = Path(re.search(r'add_test\([^\n]+"([^"]+wrapper\.exe)"', graph).group(1))
+            self.assertNotEqual(command, wrapper)
+            self.assertEqual(
+                (command.parent / "resources" / "runtime.dat").read_bytes(),
+                b"resource",
+            )
+            with self.assertRaises(OSError):
+                (command.parent / "late.dll").write_bytes(b"poison")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_literal_ctest_selectors_bound_snapshot_to_safe_superset(self):
+        unit = self.build_dir / "tst_selected.exe"
+        e2e = self.build_dir / "tst_unselected.exe"
+        _write_manifest_pe_fixture(unit)
+        _write_manifest_pe_fixture(e2e)
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[selected]=] "{unit.as_posix()}")\n'
+            'set_tests_properties([=[selected]=] PROPERTIES LABELS "unit;ci")\n'
+            f'add_test([=[unselected]=] "{e2e.as_posix()}")\n'
+            'set_tests_properties([=[unselected]=] PROPERTIES LABELS "e2e;ci")\n',
+            encoding="utf-8",
+        )
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-L", "unit", "-R", "^selected$"),
+            )
+            staged = lease.launch_build_directory
+            self.assertTrue((staged / unit.name).is_file())
+            self.assertFalse((staged / e2e.name).exists())
+            graph = (staged / "CTestTestfile.cmake").read_text(encoding="utf-8")
+            self.assertIn((staged / unit.name).as_posix(), graph)
+            self.assertIn(e2e.as_posix(), graph)
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("-R", "selected|unselected"),
+            )
+            staged = lease.launch_build_directory
+            self.assertTrue((staged / unit.name).is_file())
+            self.assertTrue((staged / e2e.name).is_file())
+
+        with RuntimeAuditLease() as lease:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=lease,
+                ctest_args=("--rerun-failed", "-R", "^selected$"),
+            )
+            staged = lease.launch_build_directory
+            self.assertTrue((staged / unit.name).is_file())
+            self.assertTrue((staged / e2e.name).is_file())
 
     def test_windows_runtime_replaces_explicit_qpa_platform(self):
         env, _ = run_ctest.prepare_windows_runtime(
@@ -1821,6 +2122,8 @@ class RunCtestTests(unittest.TestCase):
         ):
             run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
 
+    @mock.patch("tools.run_ctest._restore_windows_dll_directory")
+    @mock.patch("tools.run_ctest._set_windows_dll_directory", return_value="C:/prior")
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=17)
     @mock.patch("tools.run_ctest.run_process_tree")
@@ -1829,6 +2132,8 @@ class RunCtestTests(unittest.TestCase):
         run: mock.Mock,
         set_error_mode: mock.Mock,
         restore_error_mode: mock.Mock,
+        set_dll_directory: mock.Mock,
+        restore_dll_directory: mock.Mock,
     ):
         run.return_value = 0
         caller_args = [
@@ -1849,25 +2154,27 @@ class RunCtestTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         command = run.call_args.args[0]
+        self.assertEqual(command[1 : 1 + len(caller_args)], caller_args)
         self.assertEqual(
-            command,
-            [
-                str(self.ctest),
-                *caller_args,
-                "--test-dir",
-                str(self.build_dir.resolve()),
-                "--interactive-debug-mode",
-                "0",
-            ],
+            command[-4::2], ["--test-dir", "--interactive-debug-mode"]
         )
+        self.assertEqual(command[-1], "0")
+        self.assertNotEqual(Path(command[0]), self.ctest)
         self.assertTrue(run.call_args.kwargs["enabled"])
         self.assertTrue(run.call_args.kwargs.get("private_desktop"))
+        runtime = set_dll_directory.call_args.args[0]
+        self.assertNotEqual(Path(command[0]).parent, self.ctest.parent)
         self.assertEqual(
-            run.call_args.kwargs["env"]["QT_PLUGIN_PATH"],
-            str(self.qt_root / "plugins"),
+            Path(run.call_args.kwargs["env"]["PATH"].split(os.pathsep)[0]).parents[1],
+            runtime.parent,
+        )
+        self.assertNotEqual(
+            Path(run.call_args.kwargs["env"]["QT_PLUGIN_PATH"]),
+            self.qt_root / "plugins",
         )
         set_error_mode.assert_called_once_with()
         restore_error_mode.assert_called_once_with(17)
+        restore_dll_directory.assert_called_once_with("C:/prior")
 
     @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
@@ -1915,17 +2222,11 @@ class RunCtestTests(unittest.TestCase):
             result = run_ctest.main(caller_args)
 
         self.assertEqual(result, 0)
-        self.assertEqual(
-            run.call_args.args[0],
-            [
-                str(self.ctest),
-                *caller_args,
-                "--test-dir",
-                str(self.build_dir.resolve()),
-                "--interactive-debug-mode",
-                "0",
-            ],
-        )
+        command = run.call_args.args[0]
+        self.assertEqual(command[1 : 1 + len(caller_args)], caller_args)
+        self.assertEqual(command[-4], "--test-dir")
+        self.assertNotEqual(Path(command[-3]), self.build_dir.resolve())
+        self.assertEqual(command[-2:], ["--interactive-debug-mode", "0"])
         set_error_mode.assert_called_once_with()
         restore_error_mode.assert_called_once_with(13)
 

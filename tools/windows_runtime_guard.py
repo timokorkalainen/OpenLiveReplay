@@ -14,7 +14,7 @@ import re
 import shutil
 import struct
 import tempfile
-from typing import BinaryIO, NamedTuple
+from typing import BinaryIO, Callable, NamedTuple
 import xml.etree.ElementTree as ET
 
 
@@ -35,6 +35,7 @@ class CacheEntry(NamedTuple):
 class _StagedTree(NamedTuple):
     temporary: tempfile.TemporaryDirectory[str]
     root: Path
+    staged: Path
     sid: str
 
 
@@ -241,6 +242,34 @@ def windows_system_directories() -> tuple[Path, Path]:
     )
 
 
+def set_windows_dll_directory(directory: Path) -> str | None:
+    """Set the inherited loader directory while preserving the prior value."""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GetDllDirectoryW.argtypes = (
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_wchar),
+    )
+    kernel32.GetDllDirectoryW.restype = ctypes.c_uint32
+    kernel32.SetDllDirectoryW.argtypes = (ctypes.c_wchar_p,)
+    kernel32.SetDllDirectoryW.restype = ctypes.c_int
+    required = int(kernel32.GetDllDirectoryW(0, None))
+    previous: str | None = None
+    if required:
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = int(kernel32.GetDllDirectoryW(len(buffer), buffer))
+        if (not written and required > 1) or written >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        previous = buffer.value
+    if not kernel32.SetDllDirectoryW(str(directory)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return previous
+
+
+def restore_windows_dll_directory(previous: str | None) -> None:
+    if not ctypes.windll.kernel32.SetDllDirectoryW(previous):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 class RuntimeAuditLease:
     """Hold audited binaries read-only until the controlled child exits."""
 
@@ -249,6 +278,11 @@ class RuntimeAuditLease:
         self._canonical_files: dict[Path, Path] = {}
         self._directory_handles: dict[Path, tuple[object, Path]] = {}
         self._staged_trees: dict[Path, _StagedTree] = {}
+        self.launch_build_directory: Path | None = None
+        self.launch_source_directory: Path | None = None
+        self.launch_runtime_directory: Path | None = None
+        self.launch_runtime_directories: tuple[Path, ...] = ()
+        self.launch_executable: Path | None = None
 
     def __enter__(self) -> RuntimeAuditLease:
         return self
@@ -318,18 +352,35 @@ class RuntimeAuditLease:
                     )
 
     def stage_readonly_tree(
-        self, directory: Path, *, entry_limit: int = 4096, byte_limit: int = 256 << 20
+        self,
+        directory: Path,
+        *,
+        entry_limit: int = 4096,
+        byte_limit: int = 256 << 20,
+        excluded: tuple[Path, ...] = (),
     ) -> Path:
         """Snapshot a runtime tree and deny mutation for the child lifetime."""
         source = self.canonical_directory(directory)
         existing = self._staged_trees.get(source)
         if existing is not None:
-            return existing.root / "qml"
+            return existing.staged
         if os.name != "nt":
             self.hold_dll_tree(source)
             return source
 
-        entries = sorted(source.rglob("*"), key=lambda path: str(path).casefold())
+        excluded_canonical = tuple(Path(os.path.abspath(path)) for path in excluded)
+
+        def is_excluded(path: Path) -> bool:
+            absolute = Path(os.path.abspath(path))
+            return any(
+                absolute == item or _is_relative_to(absolute, item)
+                for item in excluded_canonical
+            )
+
+        entries = sorted(
+            (path for path in source.rglob("*") if not is_excluded(path)),
+            key=lambda path: str(path).casefold(),
+        )
         if len(entries) > entry_limit:
             raise RuntimeError(
                 f"runtime QML tree exceeds {entry_limit} entries: {source}"
@@ -349,7 +400,7 @@ class RuntimeAuditLease:
 
         temporary = tempfile.TemporaryDirectory(prefix="olr-qml-runtime-")
         temporary_root = Path(temporary.name)
-        staged = temporary_root / "qml"
+        staged = temporary_root / source.name
         staged.mkdir()
         locked = False
         try:
@@ -386,8 +437,107 @@ class RuntimeAuditLease:
                         shutil.copyfileobj(stream, output)
 
             _set_staged_tree_access(temporary_root, sid, "RX")
-            record = _StagedTree(temporary, temporary_root, sid)
+            record = _StagedTree(temporary, temporary_root, staged, sid)
             self._staged_trees[source] = record
+            self.canonical_directory(temporary_root)
+            self.canonical_directory(staged)
+            return staged
+        except BaseException:
+            if locked:
+                try:
+                    _set_staged_tree_access(temporary_root, sid, "F")
+                except BaseException:
+                    pass
+            try:
+                temporary.cleanup()
+            except BaseException:
+                pass
+            raise
+
+    def stage_readonly_layout(
+        self,
+        name: str,
+        entries: Mapping[Path, Path | bytes | Callable[[Path], bytes]],
+        *,
+        entry_limit: int = 8192,
+        byte_limit: int = 1 << 30,
+    ) -> Path:
+        """Create one protected tree from held files and generated content."""
+        if os.name != "nt":
+            raise OSError("protected launch layouts are only available on Windows")
+        if not name or Path(name).name != name:
+            raise ValueError(f"invalid protected layout name: {name!r}")
+        if len(entries) > entry_limit:
+            raise RuntimeError(
+                f"protected {name} layout exceeds {entry_limit} entries"
+            )
+
+        normalized: dict[Path, Path | bytes | Callable[[Path], bytes]] = {}
+        total_size = 0
+        for relative, source in entries.items():
+            relative = Path(relative)
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                raise RuntimeError(
+                    f"protected {name} layout has unsafe destination: {relative}"
+                )
+            folded = Path(*[part.casefold() for part in relative.parts])
+            if folded in normalized:
+                raise RuntimeError(
+                    f"protected {name} layout has duplicate destination: {relative}"
+                )
+            if isinstance(source, bytes):
+                total_size += len(source)
+            elif callable(source):
+                pass
+            else:
+                stream = self.hold(source)
+                total_size += os.fstat(stream.fileno()).st_size
+            if total_size > byte_limit:
+                raise RuntimeError(
+                    f"protected {name} layout exceeds {byte_limit} bytes"
+                )
+            normalized[folded] = source
+
+        temporary = tempfile.TemporaryDirectory(prefix=f"olr-{name}-")
+        temporary_root = Path(temporary.name)
+        staged = temporary_root / name
+        staged.mkdir()
+        sid = _current_user_sid()
+        locked = False
+        try:
+            directories = {
+                staged / parent
+                for relative in entries
+                for parent in relative.parents
+                if parent != Path(".")
+            }
+            for directory in sorted(
+                directories, key=lambda path: (len(path.parts), str(path).casefold())
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+            _set_staged_tree_access(temporary_root, sid, "BUILD")
+            locked = True
+            for relative, source in entries.items():
+                destination = staged / relative
+                if callable(source):
+                    source = source(staged)
+                    total_size += len(source)
+                    if total_size > byte_limit:
+                        raise RuntimeError(
+                            f"protected {name} layout exceeds {byte_limit} bytes"
+                        )
+                if isinstance(source, bytes):
+                    destination.write_bytes(source)
+                    continue
+                stream = self.hold(source)
+                stream.seek(0)
+                with destination.open("xb") as output:
+                    shutil.copyfileobj(stream, output)
+            _set_staged_tree_access(temporary_root, sid, "RX")
+            key = Path(f"__layout__/{name}/{id(temporary)}")
+            self._staged_trees[key] = _StagedTree(
+                temporary, temporary_root, staged, sid
+            )
             self.canonical_directory(temporary_root)
             self.canonical_directory(staged)
             return staged
@@ -413,6 +563,11 @@ class RuntimeAuditLease:
         self._canonical_files.clear()
         self._directory_handles.clear()
         self._staged_trees.clear()
+        self.launch_build_directory = None
+        self.launch_source_directory = None
+        self.launch_runtime_directory = None
+        self.launch_runtime_directories = ()
+        self.launch_executable = None
         first_error: BaseException | None = None
         for stream in streams:
             try:
@@ -1137,7 +1292,11 @@ def _executable_argument(argument: str) -> str | None:
 class CTestRecord(NamedTuple):
     name: str
     arguments: tuple[str, ...]
+    definition_file: Path
+    scope_file: Path
+    executable_arguments: tuple[tuple[str, Path], ...]
     working_directory: Path
+    labels: tuple[str, ...]
     environment: tuple[str, ...]
     environment_modification: tuple[str, ...]
 
@@ -1233,11 +1392,16 @@ def discover_ctest_graph(
         seen_inputs: set[Path] = set()
         active_inputs: set[Path] = set()
         inputs: list[Path] = []
-        additions: list[tuple[tuple[str, ...], Path, tuple[str, str]]] = []
+        additions: list[
+            tuple[tuple[str, ...], Path, Path, Path, tuple[str, str]]
+        ] = []
         property_values: dict[tuple[str, str], dict[str, list[str]]] = {}
 
         def evaluate(
-            pending_path: Path, allow_missing: bool, execution_directory: Path
+            pending_path: Path,
+            allow_missing: bool,
+            execution_directory: Path,
+            scope_file: Path,
         ) -> None:
             lexical = Path(os.path.abspath(pending_path))
             execution_directory = Path(os.path.abspath(execution_directory))
@@ -1248,7 +1412,10 @@ def discover_ctest_graph(
                     f"CTest graph edge points outside selected build: {lexical}"
                 ) from error
             if not lexical.is_file() and allow_missing:
-                return
+                raise RuntimeError(
+                    "CTest legacy subdirs edge does not exist during the "
+                    f"closed-graph audit: {lexical}"
+                )
             if not lexical.is_file():
                 raise RuntimeError(f"CTest graph input does not exist: {lexical}")
             canonical = active.canonical_file(lexical)
@@ -1319,6 +1486,7 @@ def discover_ctest_graph(
                             target,
                             command_name == "subdirs",
                             next_execution_directory,
+                            target if command_name != "include" else scope_file,
                         )
                         continue
                     if command_name == "add_test":
@@ -1328,6 +1496,8 @@ def discover_ctest_graph(
                                 (
                                     arguments,
                                     execution_directory,
+                                    canonical,
+                                    scope_file,
                                     (scope, name),
                                 )
                             )
@@ -1347,12 +1517,23 @@ def discover_ctest_graph(
                 active_inputs.remove(canonical)
 
         for graph_root, allow_missing, execution_directory in roots:
-            evaluate(graph_root, allow_missing, execution_directory)
+            evaluate(
+                graph_root,
+                allow_missing,
+                execution_directory,
+                graph_root,
+            )
 
         records: list[CTestRecord] = []
         executables: set[Path] = set()
         working_directories: set[Path] = set()
-        for arguments, default_working, property_key in additions:
+        for (
+            arguments,
+            default_working,
+            definition_file,
+            scope_file,
+            property_key,
+        ) in additions:
             name = _test_name(arguments)
             if name is None:
                 continue
@@ -1390,6 +1571,7 @@ def discover_ctest_graph(
                 )
             working_directories.add(working)
 
+            executable_arguments: list[tuple[str, Path]] = []
             for argument in arguments:
                 candidate = _executable_argument(argument)
                 if candidate is None:
@@ -1397,12 +1579,11 @@ def discover_ctest_graph(
                 command = Path(candidate)
                 lexical = command if command.is_absolute() else working_lexical / command
                 lexical = Path(os.path.abspath(lexical))
-                try:
-                    lexical.relative_to(lexical_build)
-                except ValueError:
+                inside_build = _is_relative_to(lexical, lexical_build)
+                if not lexical.is_file():
                     continue
-                if lexical.is_file():
-                    executable = active.canonical_file(lexical)
+                executable = active.canonical_file(lexical)
+                if inside_build:
                     try:
                         executable.relative_to(canonical_build)
                     except ValueError as error:
@@ -1410,14 +1591,15 @@ def discover_ctest_graph(
                             "CTest executable is lexically inside the build tree but "
                             f"resolves outside it: {lexical} -> {executable}"
                         ) from error
-                    if os.path.normcase(str(lexical)) != os.path.normcase(
-                        str(executable)
-                    ):
-                        raise RuntimeError(
-                            "CTest executable reparse alias is unsupported: "
-                            f"{lexical} -> {executable}"
-                        )
-                    executables.add(executable)
+                if os.path.normcase(str(lexical)) != os.path.normcase(
+                    str(executable)
+                ):
+                    raise RuntimeError(
+                        "CTest executable reparse alias is unsupported: "
+                        f"{lexical} -> {executable}"
+                    )
+                executables.add(executable)
+                executable_arguments.append((argument, executable))
 
             environment = tuple(
                 item
@@ -1429,8 +1611,23 @@ def discover_ctest_graph(
                 for value in properties.get("environment_modification", [])
                 for item in _split_cmake_list(value)
             )
+            labels = tuple(
+                item
+                for value in properties.get("labels", [])
+                for item in _split_cmake_list(value)
+            )
             records.append(
-                CTestRecord(name, arguments, working, environment, modifications)
+                CTestRecord(
+                    name,
+                    arguments,
+                    definition_file,
+                    scope_file,
+                    tuple(executable_arguments),
+                    working,
+                    labels,
+                    environment,
+                    modifications,
+                )
             )
         return CTestGraph(
             tuple(inputs),
@@ -1456,6 +1653,9 @@ def validate_ctest_runtime_properties(
     qt_platform_plugins: Path,
     ffmpeg_root: Path,
     srt_root: Path,
+    qt_qml: Path | None = None,
+    source_root: Path | None = None,
+    build_root: Path | None = None,
 ) -> None:
     """Reject per-test loader changes not derived from the selected cache."""
     runtime_values = {str(path).casefold() for path in runtime_dirs}
@@ -1474,6 +1674,22 @@ def validate_ctest_runtime_properties(
         return (
             os.path.normcase(str(lexical)) == os.path.normcase(str(expected))
             and lexical.resolve() == expected
+        )
+
+    def approved_qml_path(value: str) -> bool:
+        if not Path(value).is_absolute():
+            return False
+        lexical = Path(os.path.abspath(value))
+        if not lexical.exists():
+            return False
+        canonical = lexical.resolve()
+        approved = tuple(
+            root for root in (qt_qml, source_root, build_root) if root is not None
+        )
+        return any(
+            (canonical == root or _is_relative_to(canonical, root))
+            and os.path.normcase(str(lexical)) == os.path.normcase(str(canonical))
+            for root in approved
         )
 
     for test in graph.tests:
@@ -1500,6 +1716,8 @@ def validate_ctest_runtime_properties(
                     )
                 continue
             if folded in ("qml_import_path", "qml2_import_path"):
+                if approved_qml_path(value):
+                    continue
                 raise RuntimeError(
                     f"CTest ENVIRONMENT for {test.name} changes {name}: {value}"
                 )
@@ -1533,6 +1751,11 @@ def validate_ctest_runtime_properties(
                 path_modifications.append(Path(os.path.abspath(value)).resolve())
                 continue
             if folded in ("qml_import_path", "qml2_import_path"):
+                if (
+                    operation.casefold() == "path_list_prepend"
+                    and approved_qml_path(value)
+                ):
+                    continue
                 raise RuntimeError(
                     "CTest ENVIRONMENT_MODIFICATION for "
                     f"{test.name} changes {name}: {modification}"
