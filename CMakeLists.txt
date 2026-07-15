@@ -1054,6 +1054,12 @@ target_link_libraries(OpenLiveReplay PRIVATE
     olr_warnings
     olr_sanitize
 )
+if(NOT IOS)
+    # Desktop QML plugins are dynamic modules.  Make the app target self-contained:
+    # `cmake --build ... --target OpenLiveReplay` must produce the plugin artifacts
+    # referenced by the generated qmldir files, not only their backing libraries.
+    add_dependencies(OpenLiveReplay OlrStyleplugin OlrThemeplugin)
+endif()
 if(APPLE AND NOT IOS)
     target_sources(OpenLiveReplay PRIVATE
         macos/macos_window_activation.h macos/macos_window_activation.mm)

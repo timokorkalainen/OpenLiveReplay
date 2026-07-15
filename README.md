@@ -50,8 +50,11 @@ official Qt extensions (`.vscode/`). The detailed playbook is
 1. Open the project folder; install the recommended extensions when prompted.
 2. From the CMake Tools status bar, pick the Debug configure preset for your
    platform (e.g. **macOS (Debug, tests)**).
-3. Use **Build**, **Run**, and **Debug** from the status bar (or
-   `Ctrl`/`Cmd`+`Shift`+`B`); **Run Tests** runs the CTest suite.
+3. On macOS/Linux, use **Build**, **Run**, and **Debug** from the status bar (or
+   `Ctrl`/`Cmd`+`Shift`+`B). On Windows, start the app with the
+   **OpenLiveReplay: start controlled Windows app** task, then use the committed
+   attach configuration; this keeps DLL lookup tied to the active CMake cache.
+   The **Run Tests** task applies the matching controlled CTest launcher.
 
 Qt is auto-detected from the standard installer locations (`~/Qt/6.*/<kit>`) and
 Homebrew, so macOS/Linux need no setup. If your Qt lives elsewhere, either export
@@ -91,7 +94,15 @@ Development (testing, linting, CI)
 ----------------------------------
 Tests are opt-in and headless. Configure with `-DOLR_BUILD_TESTS=ON`, then:
 
+```powershell
+# Windows
+cmake -S . -B build -G Ninja -DOLR_BUILD_TESTS=ON
+cmake --build build
+python tools/run_ctest.py --test-dir build --output-on-failure
+```
+
 ```bash
+# macOS/Linux
 cmake -S . -B build -G Ninja -DOLR_BUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure   # unit + smoke + e2e

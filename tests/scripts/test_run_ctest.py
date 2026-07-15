@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -233,6 +236,82 @@ class RunCtestTests(unittest.TestCase):
         self.write_cache()
 
         with self.assertRaisesRegex(ValueError, "OLR_SRT_ROOT"):
+            run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
+
+    def test_windows_runtime_rejects_stale_qt_dll_beside_tests(self):
+        configured = self.qt_root / "bin" / "Qt6Core.dll"
+        configured_contents = b"configured-qt-6.10.3"
+        configured.write_bytes(configured_contents)
+        adjacent = self.build_dir / "Qt6Core.dll"
+        adjacent_contents = b"stale-qt-6.10.2"
+        adjacent.write_bytes(adjacent_contents)
+
+        with self.assertRaises(RuntimeError) as raised:
+            run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
+        message = str(raised.exception)
+        self.assertRegex(
+            message,
+            rf"{re.escape(str(adjacent))}.*version.*sha256.*"
+            rf"{re.escape(str(configured))}.*version.*sha256",
+        )
+        self.assertIn(hashlib.sha256(adjacent_contents).hexdigest(), message)
+        self.assertIn(hashlib.sha256(configured_contents).hexdigest(), message)
+        self.assertEqual(adjacent.read_bytes(), adjacent_contents)
+        self.assertEqual(configured.read_bytes(), configured_contents)
+
+    def test_windows_runtime_accepts_identical_adjacent_qt_dll(self):
+        configured = self.qt_root / "bin" / "Qt6Core.dll"
+        configured.write_bytes(b"configured-qt-6.10.3")
+        adjacent = self.build_dir / "Qt6Core.dll"
+        adjacent.write_bytes(configured.read_bytes())
+
+        env, _ = run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
+
+        self.assertEqual(env["QT_PLUGIN_PATH"], str(self.qt_root / "plugins"))
+        self.assertEqual(adjacent.read_bytes(), configured.read_bytes())
+
+    def test_windows_runtime_rejects_any_configured_toolchain_dll_shadow(self):
+        configured = self.compiler_bin / "libatomic-1.dll"
+        configured.write_bytes(b"configured-toolchain-runtime")
+        adjacent = self.build_dir / "libatomic-1.dll"
+        adjacent.write_bytes(b"stale-toolchain-runtime")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            rf"{re.escape(str(adjacent))}.*{re.escape(str(configured))}",
+        ):
+            run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
+
+    def test_windows_runtime_rejects_configured_lib_directory_dll_shadow(self):
+        configured = self.ffmpeg_root / "lib" / "runtime-only-in-lib.dll"
+        configured.write_bytes(b"configured-lib-runtime")
+        adjacent = self.build_dir / configured.name
+        adjacent.write_bytes(b"stale-lib-runtime")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            rf"{re.escape(str(adjacent))}.*{re.escape(str(configured))}",
+        ):
+            run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
+
+    def test_windows_runtime_uses_first_path_peer_for_duplicate_dll_name(self):
+        configured_bin = self.ffmpeg_root / "bin" / "duplicate-runtime.dll"
+        configured_bin.write_bytes(b"first-path-runtime")
+        configured_lib = self.ffmpeg_root / "lib" / configured_bin.name
+        configured_lib.write_bytes(b"later-path-runtime")
+        adjacent = self.build_dir / configured_bin.name
+        adjacent.write_bytes(configured_bin.read_bytes())
+
+        run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
+
+        self.assertNotEqual(adjacent.read_bytes(), configured_lib.read_bytes())
+
+    def test_windows_runtime_stale_cache_error_requires_reconfigure_guidance(self):
+        shutil.rmtree(self.qt_root / "bin")
+        with self.assertRaisesRegex(
+            FileNotFoundError,
+            r"Qt runtime.*Qt6_DIR.*reconfigure or recreate",
+        ):
             run_ctest.prepare_windows_runtime(self.build_dir, {"PATH": ""})
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")

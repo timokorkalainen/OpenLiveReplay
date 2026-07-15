@@ -451,6 +451,57 @@ def check_windows_quick_start_docs(text: str) -> list[str]:
     return failures
 
 
+def check_top_level_readme_windows_contract(text: str) -> list[str]:
+    """Require Windows quick starts to use the cache-derived launchers."""
+    failures = [
+        f"top-level README bare CTest bypass: {failure}"
+        for failure in check_windows_quick_start_docs(text)
+    ]
+    normalized = re.sub(r"\s+", " ", text)
+    sentences = re.split(r"(?<=[.!?])\s+", normalized)
+    if any(
+        re.search(r"\bon Windows\b", sentence, re.IGNORECASE)
+        and re.search(
+            r"\b(?:use|choose|select|click|start|launch)\b",
+            sentence,
+            re.IGNORECASE,
+        )
+        and re.search(r"\bRun\b", sentence)
+        and re.search(r"\bDebug\b", sentence)
+        and re.search(r"\bstatus[- ]bar\b", sentence, re.IGNORECASE)
+        for sentence in sentences
+    ):
+        failures.append("top-level README permits status-bar Run/Debug on Windows")
+    if "OpenLiveReplay: start controlled Windows app" not in text:
+        failures.append(
+            "top-level README permits status-bar Run/Debug without the controlled app task"
+        )
+    if "python tools/run_ctest.py" not in text:
+        failures.append("top-level README omits the controlled Windows CTest launcher")
+    return failures
+
+
+def check_app_qml_plugin_dependencies(text: str) -> list[str]:
+    """Require target-only desktop app builds to produce dynamic QML plugins."""
+    dependencies: set[str] = set()
+    for block in re.finditer(
+        r"if\s*\(\s*NOT\s+IOS\s*\)(.*?)endif\s*\(\s*\)",
+        text,
+        re.DOTALL,
+    ):
+        for command in re.finditer(
+            r"add_dependencies\s*\(\s*OpenLiveReplay\s+(.*?)\)",
+            block.group(1),
+            re.DOTALL,
+        ):
+            dependencies.update(command.group(1).split())
+    return [
+        f"OpenLiveReplay desktop target does not build required QML plugin: {plugin}"
+        for plugin in ("OlrStyleplugin", "OlrThemeplugin")
+        if plugin not in dependencies
+    ]
+
+
 def check_source_policy(root: Path) -> None:
     checks = {
         "raw test executable": (
@@ -493,6 +544,10 @@ def check_source_policy(root: Path) -> None:
 
     quick_start = (root / "tests/README.md").read_text(encoding="utf-8")
     failures.extend(check_windows_quick_start_docs(quick_start))
+    top_level_readme = (root / "README.md").read_text(encoding="utf-8")
+    failures.extend(check_top_level_readme_windows_contract(top_level_readme))
+    app_cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
+    failures.extend(check_app_qml_plugin_dependencies(app_cmake))
 
     workflow_paths = sorted((root / ".github/workflows").glob("*.y*ml"))
     windows_job_count = 0

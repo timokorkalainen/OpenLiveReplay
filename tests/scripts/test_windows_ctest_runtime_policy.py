@@ -21,6 +21,67 @@ def load_module():
 
 
 class WindowsRuntimePolicyTests(unittest.TestCase):
+    def test_app_target_requires_both_desktop_qml_plugins(self) -> None:
+        checker = getattr(self.policy, "check_app_qml_plugin_dependencies", None)
+        self.assertIsNotNone(
+            checker, "app QML plugin dependency policy is not implemented"
+        )
+        invalid = """
+target_link_libraries(OpenLiveReplay PRIVATE OlrTheme OlrStyle)
+if(IOS)
+    target_link_libraries(OpenLiveReplay PRIVATE OlrStyleplugin)
+endif()
+"""
+        self.assertTrue(
+            any("OlrStyleplugin" in failure for failure in checker(invalid))
+        )
+        self.assertTrue(
+            any("OlrThemeplugin" in failure for failure in checker(invalid))
+        )
+
+        valid = """
+if(NOT IOS)
+    add_dependencies(OpenLiveReplay OlrStyleplugin OlrThemeplugin)
+endif()
+"""
+        self.assertEqual(checker(valid), [])
+
+    def test_top_level_readme_rejects_windows_launch_bypasses(self) -> None:
+        checker = getattr(
+            self.policy,
+            "check_top_level_readme_windows_contract",
+            None,
+        )
+        self.assertIsNotNone(checker, "top-level README policy is not implemented")
+        invalid = """
+On Windows, use Build, Run, and Debug from the VS Code status bar.
+```bash
+ctest --test-dir build --output-on-failure
+```
+"""
+        failures = checker(invalid)
+        self.assertTrue(any("status-bar Run/Debug" in failure for failure in failures))
+        self.assertTrue(any("bare CTest" in failure for failure in failures))
+
+        mixed = """
+On Windows, use Build, Run, and Debug from the VS Code status bar.
+If that fails, start the app with `OpenLiveReplay: start controlled Windows app`.
+Run tests with `python tools/run_ctest.py --test-dir build --output-on-failure`.
+"""
+        mixed_failures = checker(mixed)
+        self.assertTrue(
+            any("status-bar Run/Debug" in failure for failure in mixed_failures)
+        )
+
+        valid = """
+On Windows, start the app with `OpenLiveReplay: start controlled Windows app`.
+Run tests with `python tools/run_ctest.py --test-dir build --output-on-failure`.
+"""
+        self.assertEqual(
+            checker(valid),
+            [],
+        )
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.policy = load_module()

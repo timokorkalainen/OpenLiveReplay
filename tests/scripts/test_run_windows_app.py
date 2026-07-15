@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import re
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -111,6 +114,65 @@ class RunWindowsAppTests(unittest.TestCase):
         outside.write_bytes(b"outside")
         with self.assertRaisesRegex(ValueError, "selected build directory"):
             self.launcher.prepare_windows_app_runtime(self.build, outside, {})
+
+    def test_rejects_stale_qt_dll_beside_app_with_exact_provenance(self) -> None:
+        configured = self.qt / "bin" / "Qt6Core.dll"
+        configured_contents = b"configured-qt-6.10.3"
+        configured.write_bytes(configured_contents)
+        adjacent = self.build / "Qt6Core.dll"
+        adjacent_contents = b"stale-qt-6.10.2"
+        adjacent.write_bytes(adjacent_contents)
+
+        with self.assertRaises(RuntimeError) as raised:
+            self.launcher.prepare_windows_app_runtime(
+                self.build,
+                self.app,
+                {"SystemRoot": str(Path(self.temporary.name) / "Windows")},
+            )
+        message = str(raised.exception)
+        self.assertRegex(
+            message,
+            rf"{re.escape(str(adjacent))}.*version.*sha256.*"
+            rf"{re.escape(str(configured))}.*version.*sha256",
+        )
+        self.assertIn(hashlib.sha256(adjacent_contents).hexdigest(), message)
+        self.assertIn(hashlib.sha256(configured_contents).hexdigest(), message)
+        self.assertEqual(adjacent.read_bytes(), adjacent_contents)
+        self.assertEqual(configured.read_bytes(), configured_contents)
+
+    def test_accepts_matching_runtime_dll_in_nested_build_package(self) -> None:
+        package = self.build / "package" / "bin"
+        package.mkdir(parents=True)
+        packaged_app = package / "OpenLiveReplay.exe"
+        packaged_app.write_bytes(b"packaged-app")
+        configured = self.qt / "bin" / "Qt6Core.dll"
+        configured.write_bytes(b"configured-qt-6.10.3")
+        deployed = package / "Qt6Core.dll"
+        deployed.write_bytes(configured.read_bytes())
+        app_owned = package / "OpenLiveReplaySupport.dll"
+        app_owned.write_bytes(b"application-owned-runtime")
+
+        env = self.launcher.prepare_windows_app_runtime(
+            self.build,
+            packaged_app,
+            {"SystemRoot": str(Path(self.temporary.name) / "Windows")},
+        )
+
+        self.assertEqual(env["QT_PLUGIN_PATH"], str(self.qt / "plugins"))
+        self.assertEqual(deployed.read_bytes(), configured.read_bytes())
+        self.assertEqual(app_owned.read_bytes(), b"application-owned-runtime")
+
+    def test_stale_qt_cache_error_requires_reconfigure_guidance(self) -> None:
+        shutil.rmtree(self.qt / "bin")
+        with self.assertRaisesRegex(
+            FileNotFoundError,
+            r"Qt runtime.*Qt6_DIR.*reconfigure or recreate",
+        ):
+            self.launcher.prepare_windows_app_runtime(
+                self.build,
+                self.app,
+                {"SystemRoot": str(Path(self.temporary.name) / "Windows")},
+            )
 
     def test_main_preserves_arguments_and_exact_child_exit(self) -> None:
         completed = mock.Mock(returncode=37)

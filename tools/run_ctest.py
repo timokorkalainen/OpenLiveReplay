@@ -11,6 +11,13 @@ import sys
 from collections.abc import Mapping, Sequence
 
 
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from windows_runtime_guard import RuntimeRoots, reject_runtime_dll_shadowing
+
+
 _REQUIRED_CACHE_KEYS = (
     "CMAKE_CXX_COMPILER",
     "CMAKE_COMMAND",
@@ -103,9 +110,34 @@ def prepare_windows_runtime(
         ("Qt QML imports", qt_qml),
     ):
         if not path.is_dir():
-            raise FileNotFoundError(f"{label} directory does not exist: {path}")
+            cache_key = {
+                "compiler runtime": "CMAKE_CXX_COMPILER",
+                "Qt runtime": "Qt6_DIR",
+                "Qt plugins": "Qt6_DIR",
+                "Qt QML imports": "Qt6_DIR",
+                "FFmpeg runtime": "OLR_FFMPEG_ROOT",
+                "FFmpeg libraries": "OLR_FFMPEG_ROOT",
+                "SRT runtime": "OLR_SRT_ROOT",
+                "SRT libraries": "OLR_SRT_ROOT",
+            }[label]
+            raise FileNotFoundError(
+                f"{label} directory from {cache_key} does not exist: {path}; "
+                "reconfigure or recreate the selected build directory"
+            )
     if not ctest.is_file():
         raise FileNotFoundError(f"CTest executable does not exist: {ctest}")
+
+    reject_runtime_dll_shadowing(
+        build_dir,
+        RuntimeRoots(
+            compiler_bin,
+            qt_root / "bin",
+            ffmpeg_root / "bin",
+            ffmpeg_root / "lib",
+            srt_root / "bin",
+            srt_root / "lib",
+        ),
+    )
 
     env = dict(inherited_env)
     path_entries = [str(path) for _label, path in runtime_dirs]
