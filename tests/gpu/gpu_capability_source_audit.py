@@ -647,10 +647,10 @@ def guarded_macro_composition_findings(
                 cursor += 1
                 continue
             if not definition.function_like:
-                expanded.extend(expand_sequence(
-                    definition.replacement, depth + 1, disabled | {value}))
-                cursor += 1
-                continue
+                rescanned = expand_sequence(
+                    definition.replacement + values[cursor + 1:], depth + 1,
+                    disabled | {value})
+                return tuple(expanded) + rescanned
             if cursor + 1 >= len(values) or values[cursor + 1] != "(":
                 expanded.append(value)
                 cursor += 1
@@ -666,7 +666,9 @@ def guarded_macro_composition_findings(
             if replacement is None:
                 expanded.extend(values[cursor:closing + 1])
             else:
-                expanded.extend(replacement)
+                rescanned = expand_sequence(
+                    replacement + values[closing + 1:], depth + 1, disabled)
+                return tuple(expanded) + rescanned
             cursor = closing + 1
         return tuple(expanded)
 
@@ -681,6 +683,7 @@ def guarded_macro_composition_findings(
             event_index += 1
         if (not re.fullmatch(r"[A-Za-z_]\w*", token.value)
                 or tokens[index + 1].value != "("
+                or token.value not in macros
                 or any(start <= token.start < end for start, end in directive_ranges)):
             continue
         parsed = call_arguments(index + 1, len(tokens))
@@ -695,7 +698,8 @@ def guarded_macro_composition_findings(
                 path, translated.line_at(token.start), "macro expansion depth",
                 "macro expansion depth exceeded the bounded audit limit; rejected fail-closed"))
             continue
-        if len(expansion) != 1 or expansion[0] not in guarded:
+        if (not expansion or expansion[0] not in guarded
+                or (len(expansion) > 1 and expansion[1] != "(")):
             continue
         findings.append(Finding(
             path, translated.line_at(token.start), "guarded identifier macro composition",
@@ -1419,14 +1423,24 @@ def receiver_binding_name(masked: str, call_position: int) -> str | None:
 
 def receiver_binding_references(masked: str, call_position: int) -> set[str]:
     """Return unqualified value names conservatively referenced by a receiver."""
-    tokens = cpp_tokens(receiver_expression(masked, call_position))
+    receiver = receiver_expression(masked, call_position)
+    tokens = cpp_tokens(receiver)
+    receiver_start = masked.rfind(receiver, 0, call_position)
+    dependent_member_receiver = (
+        receiver_start >= 0
+        and re.search(r"(?:\.|->|::)\s*template\s*$",
+                      masked[:receiver_start]) is not None)
     references: set[str] = set()
     for index, token in enumerate(tokens):
         if re.fullmatch(r"[A-Za-z_]\w*", token.value) is None:
             continue
         previous = tokens[index - 1].value if index else ""
         following = tokens[index + 1].value if index + 1 < len(tokens) else ""
-        if previous in {".", "->", "::"} or following == "::":
+        dependent_selector = (
+            previous == "template" and index >= 2
+            and tokens[index - 2].value in {".", "->", "::"})
+        if (previous in {".", "->", "::"} or following == "::"
+                or dependent_selector or (dependent_member_receiver and index == 0)):
             continue
         references.add(token.value)
     return references
@@ -3551,6 +3565,26 @@ def mutation_self_tests() -> None:
                for finding in compiler_zero_arg):
         raise AssertionError("compiler zero-argument guarded macro survived")
 
+    compiler_callable_alias = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void bad(const GpuReadLease& lease) { lease.ALIAS(native, Handle)(); }",
+        {
+            "ALIAS": MacroDefinition(False, ("PASTE",)),
+            "PASTE": MacroDefinition(True, ("left", "##", "right"),
+                                     ("left", "right")),
+        })
+    if not any("guarded identifier macro composition" in finding.expression
+               for finding in compiler_callable_alias):
+        raise AssertionError("compiler callable object alias survived rescan")
+
+    compiler_guarded_object_alias = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void bad(const GpuReadLease& lease) { lease.GUARD(); }",
+        {"GUARD": MacroDefinition(False, ("nativeHandle",))})
+    if not any("guarded identifier macro composition" in finding.expression
+               for finding in compiler_guarded_object_alias):
+        raise AssertionError("compiler guarded object alias survived rescan")
+
     compiler_raw_paste = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"),
         "void safe(const GpuReadLease& lease) { lease.CAT(LEFT, RIGHT)(); }",
@@ -3678,7 +3712,10 @@ def mutation_self_tests() -> None:
         "void safe(GpuSyncReadScope& scope, Other& object, "
         "const std::shared_ptr<GpuSurface>& s) { "
         "object.scope().withRead(s, [](const GpuReadLease&) {}); "
-        "ns::scope().withRead(s, [](const GpuReadLease&) {}); (void) scope; }")
+        "ns::scope().withRead(s, [](const GpuReadLease&) {}); "
+        "object.template scope<int>().withRead(s, [](const GpuReadLease&) {}); "
+        "pointer->template scope<int>().withRead(s, [](const GpuReadLease&) {}); "
+        "(void) scope; }")
     qualified_receiver_findings = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"), qualified_receiver_controls)
     if qualified_receiver_findings:
