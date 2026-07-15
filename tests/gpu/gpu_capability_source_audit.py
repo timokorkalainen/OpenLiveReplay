@@ -225,12 +225,42 @@ MEMBER_CALL = re.compile(r"(?:\.|->|::)\s*(read|withRead|complete|nativeHandle)\
 def preprocessor_capability_findings(path: PurePosixPath, source: str) -> list[Finding]:
     findings: list[Finding] = []
     capability = re.compile(r"\b(?:GpuSyncReadScope|read|withRead|complete|nativeHandle)\b|##")
-    for line, text in enumerate(source.splitlines(), 1):
-        stripped = text.lstrip()
+    logical = ""
+    logical_start = 1
+    for line, text in enumerate(source.splitlines(keepends=True), 1):
+        if not logical:
+            logical_start = line
+        splice = re.search(r"\\\r?\n$", text)
+        logical += text[:splice.start()] if splice else text
+        if splice:
+            continue
+        stripped = logical.lstrip()
         if stripped.startswith("#") and capability.search(stripped):
             findings.append(Finding(
-                path, line, "GPU capability preprocessor alias",
+                path, logical_start, "GPU capability preprocessor alias",
                 "nativeHandle alias and scope operations cannot be hidden by preprocessing"))
+        logical = ""
+    if logical:
+        stripped = logical.lstrip()
+        if stripped.startswith("#") and capability.search(stripped):
+            findings.append(Finding(
+                path, logical_start, "GPU capability preprocessor alias",
+                "nativeHandle alias and scope operations cannot be hidden by preprocessing"))
+    return findings
+
+
+def phase_two_capability_findings(path: PurePosixPath, source: str) -> list[Finding]:
+    """Reject only line splices that reconstruct a guarded capability identifier."""
+    guarded = {"GpuSyncReadScope", "complete", "nativeHandle", "read", "withRead"}
+    findings: list[Finding] = []
+    for splice in re.finditer(r"\\\r?\n", source):
+        left = re.search(r"[A-Za-z_]\w*$", source[:splice.start()])
+        right = re.match(r"[A-Za-z_]\w*", source[splice.end():])
+        if left is None or right is None or left.group() + right.group() not in guarded:
+            continue
+        findings.append(Finding(
+            path, line_number(source, splice.start()), "phase-two line splice",
+            "phase-two line splice reconstructs a guarded GPU capability token"))
     return findings
 
 
@@ -269,6 +299,7 @@ def enclosing_call_name(tokens: list[CppToken], use_index: int) -> str | None:
 def local_native_alias(masked: str, pairs: list[tuple[int, int]],
                        call: re.Match[str]) -> tuple[str, int] | None:
     tokens = statement_tokens(masked, pairs, call.start())
+    values = [token.value for token in tokens]
     call_token = next((index for index, token in enumerate(tokens)
                        if token.start == call.start(1)), None)
     if call_token is None:
@@ -276,29 +307,62 @@ def local_native_alias(masked: str, pairs: list[tuple[int, int]],
     equals = [index for index in range(call_token) if tokens[index].value == "="]
     if len(equals) != 1:
         return None
-    lhs = tokens[:equals[0]]
+    equals_index = equals[0]
+    lhs = tokens[:equals_index]
     if len(lhs) < 2 or lhs[0].value in {"return", "co_return"}:
         return None
-    if any(token.value in {".", "->", "::", "[", "]", "("} for token in lhs):
+    if any(token.value in {
+            ".", "->", "[", "]", "(", ")", "{", "}", ",", "?", ":",
+            "static", "thread_local", "extern", "register", "mutable", "constexpr",
+    } for token in lhs):
         return None
-    alias = next((token for token in reversed(lhs)
-                  if re.fullmatch(r"[A-Za-z_]\w*", token.value)), None)
+    alias = lhs[-1]
     if alias is None or alias.value in {"const", "auto", "void"}:
+        return None
+    if not re.fullmatch(r"[A-Za-z_]\w*", alias.value):
+        return None
+    if any(token.value == "auto" for token in lhs[:-1]) \
+            and not any(token.value == "*" for token in lhs[:-1]):
+        return None
+
+    rhs = values[equals_index + 1:]
+    direct = (len(rhs) == 6 and re.fullmatch(r"[A-Za-z_]\w*", rhs[0])
+              and rhs[1:] == [".", "nativeHandle", "(", ")", ";"])
+    approved_cast = False
+    if rhs and rhs[0] in {"const_cast", "dynamic_cast", "reinterpret_cast", "static_cast"}:
+        try:
+            cast_close = len(rhs) - 1 - rhs[::-1].index(">")
+        except ValueError:
+            cast_close = -1
+        approved_cast = (
+            cast_close >= 3
+            and rhs[1] == "<"
+            and len(rhs) == cast_close + 9
+            and rhs[cast_close + 1:] == ["(", rhs[cast_close + 2], ".", "nativeHandle",
+                                         "(", ")", ")", ";"]
+            and re.fullmatch(r"[A-Za-z_]\w*", rhs[cast_close + 2]) is not None
+            and all(value not in {"(", ")", "{", "}", "[", "]", "=", ",", "?", ":"}
+                    for value in rhs[2:cast_close])
+        )
+    if not direct and not approved_cast:
         return None
     return alias.value, alias.start
 
 
 def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
-                                   binding: HandleBinding, alias: str,
+                                   pairs: list[tuple[int, int]], binding: HandleBinding, alias: str,
                                    declaration_position: int) -> tuple[bool, int]:
-    tokens = cpp_tokens(masked, binding.block[0] + 1, binding.block[1])
+    tokens = cpp_tokens(masked, declaration_position, binding.block[1])
     safe_calls = REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())
     safe_methods = REVIEWED_NATIVE_HANDLE_METHODS.get(path, frozenset())
-    boolean_neighbors = {"!", "&&", "||", "?", ":", "==", "!="}
+    boolean_neighbors = {"!", "&&", "||", "==", "!="}
     last_use = declaration_position
+    consumed = False
     for index, token in enumerate(tokens):
         if token.value != alias or token.start == declaration_position:
             continue
+        if immediate_block(pairs, token.start) != binding.block:
+            return False, max(last_use, token.start)
         previous = tokens[index - 1].value if index else ""
         following = tokens[index + 1].value if index + 1 < len(tokens) else ""
         if previous in {".", "->", "::"}:
@@ -306,15 +370,21 @@ def native_alias_stays_synchronous(path: PurePosixPath, masked: str,
         last_use = max(last_use, token.start)
         if following == "->" and index + 2 < len(tokens):
             if tokens[index + 2].value in safe_methods:
+                consumed = True
                 continue
             return False, last_use
         call_name = enclosing_call_name(tokens, index)
         if call_name in {"if", "while"} or call_name in safe_calls:
+            consumed = True
+            continue
+        if following == "?":
+            consumed = True
             continue
         if previous in boolean_neighbors or following in boolean_neighbors:
+            consumed = True
             continue
         return False, last_use
-    return True, last_use
+    return consumed, last_use
 
 
 @dataclass(frozen=True)
@@ -542,6 +612,50 @@ def resolve_scope(scope_bindings: list[ScopeBinding], masked: str,
                                     -binding.declaration.position))
 
 
+def withread_callback_block(masked: str, pairs: list[tuple[int, int]],
+                            call: re.Match[str]) -> tuple[int, int] | None:
+    opening = call.end() - 1
+    closing = matching_delimiter(masked, opening, "(", ")")
+    if closing is None:
+        return None
+
+    separators: list[int] = []
+    paren_depth = bracket_depth = brace_depth = 0
+    for index in range(opening + 1, closing):
+        value = masked[index]
+        if value == "(":
+            paren_depth += 1
+        elif value == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif value == "[":
+            bracket_depth += 1
+        elif value == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif value == "{":
+            brace_depth += 1
+        elif value == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif value == "," and paren_depth == bracket_depth == brace_depth == 0:
+            separators.append(index)
+    if len(separators) != 1:
+        return None
+
+    callback_start = separators[0] + 1
+    body = masked[callback_start:closing]
+    lambda_pattern = re.compile(
+        r"^\s*\[[^\]]*\]\s*\(\s*const\s+GpuReadLease\s*&"
+        r"(?:\s*[A-Za-z_]\w*)?\s*\)\s*(?:mutable\s*)?(?:noexcept\s*)?"
+        r"(?:->[^{}]+)?\{")
+    match = lambda_pattern.search(body)
+    if match is None:
+        return None
+    body_opening = callback_start + match.end() - 1
+    block = next((pair for pair in pairs if pair[0] == body_opening), None)
+    if block is None or block[1] > closing or masked[block[1] + 1:closing].strip():
+        return None
+    return block
+
+
 def callback_lease_bindings(masked: str, pairs: list[tuple[int, int]],
                             call: re.Match[str]) -> list[HandleBinding]:
     opening = call.end() - 1
@@ -698,10 +812,37 @@ def handle_binding_is_shadowed(binding: HandleBinding, masked: str,
                             masked, pairs, call_position)
 
 
+def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
+                              binding: HandleBinding) -> bool:
+    """Keep the lease object itself in its immediate lexical callback/read body."""
+    allowed_methods = {"desc", "nativeHandle", "nativeSubresource", "valid"}
+    tokens = cpp_tokens(masked, binding.position, binding.block[1])
+    for index, token in enumerate(tokens):
+        if token.value != binding.name or token.start == binding.position:
+            continue
+        if token_is_declarator_name(tokens, index):
+            declaration_tokens = statement_tokens(masked, pairs, token.start)
+            if any(item.value == "GpuReadLease" for item in declaration_tokens):
+                continue
+        if name_is_shadowed(binding.name, binding.position, binding.position,
+                            masked, pairs, token.start):
+            continue
+        if immediate_block(pairs, token.start) != binding.block:
+            return False
+        if (index + 3 < len(tokens)
+                and tokens[index + 1].value == "."
+                and tokens[index + 2].value in allowed_methods
+                and tokens[index + 3].value == "("):
+            continue
+        return False
+    return True
+
+
 def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
     masked = mask_non_code(source)
     pairs = brace_pairs(masked)
     findings = preprocessor_capability_findings(path, source)
+    findings.extend(phase_two_capability_findings(path, source))
     calls = list(MEMBER_CALL.finditer(masked))
     scope_bindings: list[ScopeBinding] = []
     for declaration in scope_declarations(masked):
@@ -781,6 +922,22 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
                     and immediate_block(pairs, call.start()) == scope.block):
                 acquisitions_by_scope.setdefault(scope_key, []).append(call)
                 handle_bindings.extend(callback_lease_bindings(masked, pairs, call))
+                callback_block = withread_callback_block(masked, pairs, call)
+                if callback_block is None:
+                    findings.append(Finding(
+                        path, line_number(source, call.start()), "GpuSyncReadScope::withRead()",
+                        "withRead() requires an inline callback body so completion cannot be "
+                        "bypassed by hidden control flow"))
+                else:
+                    nonlocal_jump = next((
+                        token for token in cpp_tokens(masked, callback_block[0] + 1,
+                                                      callback_block[1])
+                        if token.value in {"_longjmp", "longjmp", "siglongjmp"}
+                    ), None)
+                    if nonlocal_jump is not None:
+                        findings.append(Finding(
+                            path, line_number(source, nonlocal_jump.start), nonlocal_jump.value,
+                            "non-local jump cannot bypass withRead() completion"))
         else:
             if canonical_scope_declaration(masked, pairs, scope):
                 completes_by_scope.setdefault(scope_key, []).append(call)
@@ -811,6 +968,12 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         if (binding is not None
                 and handle_binding_is_shadowed(binding, masked, pairs, call.start())):
             native_bindings[call.start()] = None
+
+    for binding in handle_bindings:
+        if not lease_binding_stays_local(masked, pairs, binding):
+            findings.append(Finding(
+                path, line_number(source, binding.position), binding.name,
+                "lease reference must remain inside the immediate callback body"))
 
     all_tokens = cpp_tokens(masked)
     native_call_names = {call.start(1) for call in native_calls}
@@ -914,7 +1077,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
                 "native handle value must initialize a callback-local alias"))
             continue
         synchronous, last_use = native_alias_stays_synchronous(
-            path, masked, binding, alias[0], alias[1])
+            path, masked, pairs, binding, alias[0], alias[1])
         if synchronous and binding.scope_position is not None:
             completion_positions = [
                 call.start() for call in completes_by_scope.get(binding.scope_position, [])
@@ -1273,6 +1436,40 @@ def mutation_self_tests() -> None:
          "const GpuReadLease lease = scope.read(s); const uintptr_t escaped = "
          "reinterpret_cast<uintptr_t>(lease.nativeHandle()); scope.complete(); return escaped; }",
          "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "void* handle = lease.nativeHandle(); auto later = [=] { "
+         "(void) isCompatibleWithNativeHandle(handle); }; later(); }); }",
+         "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "void* handle = lease.nativeHandle(); auto later = [&] { "
+         "(void) isCompatibleWithNativeHandle(handle); }; later(); }); }",
+         "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { g_lease = &lease; }); }",
+         "lease reference must remain inside the immediate callback body"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void C::bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [&](const GpuReadLease& lease) { m_lease = &lease; }); }",
+         "lease reference must remain inside the immediate callback body"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { leases.push_back(&lease); }); }",
+         "lease reference must remain inside the immediate callback body"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { auto later = [&lease] { "
+         "consume(lease.valid()); }; later(); }); }",
+         "lease reference must remain inside the immediate callback body"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "storeGlobally(static_cast<const void*>(&lease)); }); }",
+         "lease reference must remain inside the immediate callback body"),
         (PurePosixPath("playback/bad.cpp"),
          "void bad(const std::shared_ptr<GpuSurface>& s) { void* escaped = nullptr; "
          "GpuSyncReadScope scope; scope.withRead(s, [&](const GpuReadLease& lease) { "
@@ -1293,6 +1490,35 @@ def mutation_self_tests() -> None:
          "return scope.withRead(s, [](const GpuReadLease& lease) { "
          "return NativeBox(lease.nativeHandle()); }); }",
          "native handle value must initialize a callback-local alias"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "void* handle = wrap(lease.nativeHandle()); "
+         "(void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must initialize a callback-local alias"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "void* handle = storeGlobally(lease.nativeHandle()); "
+         "(void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must initialize a callback-local alias"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "static void* handle = lease.nativeHandle(); "
+         "(void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must initialize a callback-local alias"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool enabled, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; scope.withRead(s, [&](const GpuReadLease& lease) { "
+         "void* handle = enabled ? lease.nativeHandle() : nullptr; "
+         "(void) isCompatibleWithNativeHandle(handle); }); }",
+         "native handle value must initialize a callback-local alias"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "NativeBox holder{lease.nativeHandle()}; consume(holder); }); }",
+         "GpuSurface::nativeHandle()"),
         (PurePosixPath("playback/bad.cpp"),
          "void bad(const std::shared_ptr<GpuSurface>& a, "
          "const std::shared_ptr<GpuSurface>& b) { GpuSyncReadScope scope; "
@@ -1321,6 +1547,12 @@ def mutation_self_tests() -> None:
          "const GpuReadLease lease = scope.read(s); void* handle = lease.nativeHandle(); "
          "scope.complete(); return handle != nullptr; }",
          "native handle value must remain inside its synchronous consumption"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { void* escaped = nullptr; "
+         "GpuSyncReadScope scope; scope.withRead(s, [&](const GpuReadLease& lease) { "
+         "void* handle = lease.nativeHandle(); escaped = handle ? handle : nullptr; }); "
+         "consume(escaped); }",
+         "native handle value must remain inside its synchronous consumption"),
         (PurePosixPath("playback/bad.cpp"),
          "void bad(const GpuReadLease& lease) { const char* text = R\"(raw quote \" "
          "tail)\"; (void) text; (void) lease.nativeHandle(); }",
@@ -1333,11 +1565,46 @@ def mutation_self_tests() -> None:
          "void bad(const GpuReadLease& lease) { "
          "auto access = &GpuReadLease::nativeHandle; (void) (lease.*access)(); }",
          "nativeHandle reference"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuReadLease& lease) { (void) lease.native" + chr(92) +
+         "\nHandle(); }",
+         "phase-two line splice"),
+        (PurePosixPath("playback/bad.cpp"),
+         "#define HANDLE native" + chr(92) + "\nHandle\n"
+         "void bad(const GpuReadLease& lease) { (void) lease.HANDLE(); }",
+         "phase-two line splice"),
+        (PurePosixPath("playback/bad.cpp"),
+         "void bad(const GpuReadLease& lease) { auto access = "
+         "&GpuReadLease::native" + chr(92) + "\nHandle; (void) (lease.*access)(); }",
+         "phase-two line splice"),
         (PurePosixPath("playback/gpu/gpufence.h"),
          "void bad(bool stop, const std::shared_ptr<GpuSurface>& s) { "
          "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
          "consume(lease.nativeHandle()); if (stop) longjmp(env, 1); scope.complete(); }",
          "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); "
+         "longjmp(env, 1); }); }",
+         "non-local jump cannot bypass withRead() completion"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); "
+         "_longjmp(env, 1); }); }",
+         "non-local jump cannot bypass withRead() completion"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
+         "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); "
+         "siglongjmp(env, 1); }); }",
+         "non-local jump cannot bypass withRead() completion"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void jumps(const GpuReadLease&) { longjmp(env, 1); } "
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, jumps); }",
+         "withRead() requires an inline callback body"),
     )
     for path, source, expected in cases:
         rendered = "\n".join(finding.render() for finding in audit_capability_uses(path, source))
@@ -1361,6 +1628,8 @@ def mutation_self_tests() -> None:
     safe = (
         "bool safe(const std::shared_ptr<GpuSurface>& s) { bool compatible = false; "
         "GpuSyncReadScope scope; scope.withRead(s, [&](const GpuReadLease& lease) { "
+        "GpuSurfaceDesc desc = lease.desc(); uint32_t subresource = lease.nativeSubresource(); "
+        "bool valid = lease.valid(); (void) desc; (void) subresource; (void) valid; "
         "void* handle = lease.nativeHandle(); "
         "compatible = isCompatibleWithNativeHandle(handle); }); return compatible; }"
     )
@@ -1369,12 +1638,40 @@ def mutation_self_tests() -> None:
         raise AssertionError("withRead pass control was rejected:\n" +
                              "\n".join(finding.render() for finding in safe_findings))
 
+    safe_exception = (
+        "void safe(const std::shared_ptr<GpuSurface>& s) { try { GpuSyncReadScope scope; "
+        "scope.withRead(s, [](const GpuReadLease& lease) { void* handle = "
+        "lease.nativeHandle(); (void) isCompatibleWithNativeHandle(handle); "
+        "throw ExpectedFailure{}; }); } catch (const ExpectedFailure&) {} }"
+    )
+    safe_exception_findings = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"), safe_exception)
+    if safe_exception_findings:
+        raise AssertionError("ordinary exception pass control was rejected:\n" +
+                             "\n".join(finding.render()
+                                       for finding in safe_exception_findings))
+
+    safe_boolean = (
+        "bool safe(const std::shared_ptr<GpuSurface>& s) { bool present = false; "
+        "GpuSyncReadScope scope; scope.withRead(s, [&](const GpuReadLease& lease) { "
+        "void* handle = lease.nativeHandle(); present = handle != nullptr; }); "
+        "return present; }"
+    )
+    safe_boolean_findings = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"), safe_boolean)
+    if safe_boolean_findings:
+        raise AssertionError("boolean result pass control was rejected:\n" +
+                             "\n".join(finding.render()
+                                       for finding in safe_boolean_findings))
+
     safe_read = (
         "void safe(const std::shared_ptr<GpuSurface>& a, "
         "const std::shared_ptr<GpuSurface>& b) { GpuSyncReadScope scope; "
         "const GpuReadLease lease = scope.read(a); void* firstHandle = lease.nativeHandle(); "
+        "bool firstValid = firstHandle != nullptr; (void) firstValid; "
         "scope.complete(); { GpuSyncReadScope scope; "
         "const GpuReadLease lease = scope.read(b); void* secondHandle = lease.nativeHandle(); "
+        "bool secondValid = secondHandle != nullptr; (void) secondValid; "
         "scope.complete(); } }"
     )
     safe_read_findings = audit_capability_uses(
@@ -1387,8 +1684,10 @@ def mutation_self_tests() -> None:
         "void safe(bool enabled, const std::shared_ptr<GpuSurface>& s) { "
         "if (enabled) { GpuSyncReadScope scope; "
         "const GpuReadLease lease = scope.read(s); void* firstHandle = lease.nativeHandle(); "
+        "bool firstValid = firstHandle != nullptr; (void) firstValid; "
         "scope.complete(); } GpuSyncReadScope scope; "
         "const GpuReadLease lease = scope.read(s); void* secondHandle = lease.nativeHandle(); "
+        "bool secondValid = secondHandle != nullptr; (void) secondValid; "
         "scope.complete(); } "
         "void safeConditional(bool enabled, const std::shared_ptr<GpuSurface>& s) { "
         "GpuSyncReadScope scope; if (enabled) scope.withRead(s, "
@@ -1432,6 +1731,8 @@ def mutation_self_tests() -> None:
                                        for finding in safe_owned_fence_findings))
 
     safe_syntax = r'''
+        #define SAFE_SUM(left, right) ((left) + \
+                                       (right))
         void safe(UnrelatedSocket& socket) {
             // GpuSyncReadScope scope; scope.read(surface);
             const char* text = "surface.get()->nativeHandle()";

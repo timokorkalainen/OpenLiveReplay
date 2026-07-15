@@ -272,7 +272,7 @@ add_test(NAME gpu_capability_source_audit
         --source-root "${CMAKE_SOURCE_DIR}")
 set_tests_properties(gpu_capability_source_audit PROPERTIES
     LABELS "gpu-capability;ci" TIMEOUT 30)
-add_executable(gpu_lease_release_probe EXCLUDE_FROM_ALL
+add_executable(gpu_lease_release_probe
     "${CMAKE_SOURCE_DIR}/tests/gpu/gpu_lease_release_probe.cpp")
 target_include_directories(gpu_lease_release_probe PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(gpu_lease_release_probe PRIVATE Qt6::Core)
