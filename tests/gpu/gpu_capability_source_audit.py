@@ -108,6 +108,46 @@ def enclosing_block(pairs: Iterable[tuple[int, int]], position: int) -> tuple[in
     return min(candidates, key=lambda pair: pair[1] - pair[0]) if candidates else None
 
 
+def execution_block_kind(masked: str, opening: int) -> str | None:
+    """Classify braces that introduce a distinct executable lexical body."""
+    boundary = max(masked.rfind(";", 0, opening),
+                   masked.rfind("{", 0, opening),
+                   masked.rfind("}", 0, opening))
+    prefix = masked[boundary + 1:opening].strip()
+    if re.search(
+            r"\[[^\]]*\]\s*(?:\([^{};]*\)\s*)?(?:mutable\s*)?"
+            r"(?:noexcept\s*)?(?:->\s*[^{};]+)?$", prefix):
+        return "lambda"
+    if re.search(r"\b(?:if|for|while|switch|catch)\s*\([^{};]*\)\s*$", prefix):
+        return "control"
+    if re.search(r"\b(?:else|do|try)\s*$", prefix):
+        return "control"
+    if re.search(r"\b(?:class|struct|union|namespace)\b[^;{}]*$", prefix):
+        return "type"
+    if re.search(
+            r"\)\s*(?:(?:const|volatile|override|final|noexcept)\s*)*"
+            r"(?:->\s*[^{};]+)?$", prefix):
+        return "function"
+    return None
+
+
+def execution_block_chain(masked: str, pairs: Iterable[tuple[int, int]],
+                          position: int) -> tuple[tuple[int, int], ...]:
+    """Return lexical bodies whose execution is not implied by ordinary braces."""
+    blocks = [pair for pair in pairs if pair[0] < position < pair[1]
+              and execution_block_kind(masked, pair[0]) is not None]
+    return tuple(sorted(blocks))
+
+
+def completion_shares_execution_block(masked: str, pairs: list[tuple[int, int]],
+                                      required_positions: Iterable[int],
+                                      completion_position: int) -> bool:
+    """Require completion and every read/use to share one executable body."""
+    completion_chain = execution_block_chain(masked, pairs, completion_position)
+    return all(execution_block_chain(masked, pairs, position) == completion_chain
+               for position in required_positions)
+
+
 def line_number(source: str, position: int) -> int:
     return source.count("\n", 0, position) + 1
 
@@ -229,6 +269,7 @@ def matching_delimiter(masked: str, opening: int, opener: str, closer: str) -> i
 
 
 def resolve_scope(scope_bindings: list[ScopeBinding], masked: str,
+                  pairs: list[tuple[int, int]],
                   call: re.Match[str]) -> ScopeBinding | None:
     receiver = receiver_expression(masked, call.start())
     candidates = [
@@ -236,6 +277,8 @@ def resolve_scope(scope_bindings: list[ScopeBinding], masked: str,
         if binding.declaration.position <= call.start() < binding.block[1]
         and binding.block[0] < call.start()
         and re.search(rf"\b{re.escape(binding.declaration.name)}\b", receiver)
+        and not name_is_shadowed(binding.declaration.name, binding.declaration.position,
+                                 binding.declaration.end, masked, pairs, call.start())
     ]
     if not candidates:
         return None
@@ -295,20 +338,26 @@ def resolve_handle_binding(bindings: list[HandleBinding], masked: str,
                key=lambda binding: (binding.block[1] - binding.block[0], -binding.position))
 
 
-def handle_binding_is_shadowed(binding: HandleBinding, masked: str,
-                               pairs: list[tuple[int, int]], call_position: int) -> bool:
+def name_is_shadowed(name: str, declaration_start: int, declaration_end: int,
+                     masked: str, pairs: list[tuple[int, int]], call_position: int) -> bool:
     declaration_pattern = re.compile(
         rf"\b(?:(?:const|volatile)\s+)*(?:auto|[A-Za-z_]\w*(?:::\w+)*"
         rf"(?:\s*<[^;{{}}()]+>)?)(?:\s+(?:const|volatile))*\s*[*&]*\s+"
-        rf"(?P<name>{re.escape(binding.name)})\s*(?=[=;,{{)])")
-    for declaration in declaration_pattern.finditer(masked, binding.position, call_position):
+        rf"(?P<name>{re.escape(name)})\s*(?=[=;,{{)])")
+    for declaration in declaration_pattern.finditer(masked, declaration_start, call_position):
         name_position = declaration.start("name")
-        if name_position == binding.position:
+        if declaration_start <= name_position <= declaration_end:
             continue
         block = enclosing_block(pairs, name_position)
         if block is not None and block[0] < call_position < block[1]:
             return True
     return False
+
+
+def handle_binding_is_shadowed(binding: HandleBinding, masked: str,
+                               pairs: list[tuple[int, int]], call_position: int) -> bool:
+    return name_is_shadowed(binding.name, binding.position, binding.position,
+                            masked, pairs, call_position)
 
 
 def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
@@ -334,7 +383,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
     for call in calls:
         if call.group(1) not in {"read", "withRead", "complete"}:
             continue
-        scope = resolve_scope(scope_bindings, masked, call)
+        scope = resolve_scope(scope_bindings, masked, pairs, call)
         if scope is None:
             continue
         scope_key = scope.declaration.position
@@ -390,8 +439,11 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             if (binding := native_bindings[call.start()]) is not None
             and binding.scope_position == scope_key
         ]
-        required_position = max([call.start() for call in reads] + associated_uses)
+        required_positions = [call.start() for call in reads] + associated_uses
+        required_position = max(required_positions)
         if any(call.start() > required_position
+               and completion_shares_execution_block(masked, pairs, required_positions,
+                                                     call.start())
                for call in completes_by_scope.get(scope_key, [])):
             valid_read_scopes.add(scope_key)
             continue
@@ -565,6 +617,36 @@ def mutation_self_tests() -> None:
          "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
          "{ GpuSurface& lease = surface; (void) lease.nativeHandle(); } scope.complete(); }",
          "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
+         "{ OtherScope scope; scope.complete(); } }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ OtherScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); } scope.complete(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ OtherScope scope; scope.withRead(s, [](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
+         "auto finish = [&]() { scope.complete(); }; (void) finish; }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool finish, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (finish) { scope.complete(); } }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
+         "[&]() { scope.complete(); }(); }",
+         "complete() after read/use"),
     )
     for path, source, expected in cases:
         rendered = "\n".join(finding.render() for finding in audit_capability_uses(path, source))
@@ -607,6 +689,20 @@ def mutation_self_tests() -> None:
         raise AssertionError("ordered, shadowed read pass control was rejected:\n" +
                              "\n".join(finding.render() for finding in safe_read_findings))
 
+    safe_control_flow = (
+        "void safe(bool enabled, const std::shared_ptr<GpuSurface>& s) { "
+        "if (enabled) { GpuSyncReadScope scope; "
+        "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
+        "scope.complete(); } GpuSyncReadScope scope; "
+        "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
+        "{ scope.complete(); } }"
+    )
+    safe_control_findings = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"), safe_control_flow)
+    if safe_control_findings:
+        raise AssertionError("same-flow nested block pass control was rejected:\n" +
+                             "\n".join(finding.render() for finding in safe_control_findings))
+
     safe_syntax = r'''
         void safe(UnrelatedSocket& socket) {
             // GpuSyncReadScope scope; scope.read(surface);
@@ -618,6 +714,13 @@ def mutation_self_tests() -> None:
             socket.read();
             if (scope) socket.read();
             scope->withRead({}, [](const GpuReadLease&) {});
+        }
+        void unrelatedShadow(GpuSyncReadScope& scope) {
+            // OtherScope scope; scope.read(); scope.complete();
+            const char* text = "OtherScope scope; scope.withRead();";
+            { OtherScope scope; scope.read(); scope.withRead(); scope.complete(); }
+            (void) scope;
+            (void) text;
         }
         class DerivedSurface : public GpuSurface {
             void* nativeHandle() const override;
