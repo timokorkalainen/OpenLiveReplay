@@ -667,7 +667,8 @@ def guarded_macro_composition_findings(
                 expanded.extend(values[cursor:closing + 1])
             else:
                 rescanned = expand_sequence(
-                    replacement + values[closing + 1:], depth + 1, disabled)
+                    replacement + values[closing + 1:], depth + 1,
+                    disabled | {value})
                 return tuple(expanded) + rescanned
             cursor = closing + 1
         return tuple(expanded)
@@ -690,6 +691,11 @@ def guarded_macro_composition_findings(
         if parsed is None:
             continue
         closing = parsed[1]
+        while closing + 1 < len(tokens) and tokens[closing + 1].value == "(":
+            postfix = call_arguments(closing + 1, len(tokens))
+            if postfix is None:
+                break
+            closing = postfix[1]
         invocation = tuple(item.value for item in tokens[index:closing + 1])
         try:
             expansion = expand_sequence(invocation)
@@ -3577,6 +3583,19 @@ def mutation_self_tests() -> None:
                for finding in compiler_callable_alias):
         raise AssertionError("compiler callable object alias survived rescan")
 
+    compiler_postfix_callable_alias = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void bad(const GpuReadLease& lease) { "
+        "lease.WRAP()(native, Handle)(); }",
+        {
+            "WRAP": MacroDefinition(True, ("PASTE",), ()),
+            "PASTE": MacroDefinition(True, ("left", "##", "right"),
+                                     ("left", "right")),
+        })
+    if not any("guarded identifier macro composition" in finding.expression
+               for finding in compiler_postfix_callable_alias):
+        raise AssertionError("compiler postfix callable alias survived rescan")
+
     compiler_guarded_object_alias = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"),
         "void bad(const GpuReadLease& lease) { lease.GUARD(); }",
@@ -3613,6 +3632,21 @@ def mutation_self_tests() -> None:
     if not any("macro expansion depth" in finding.reason
                for finding in deep_macro_findings):
         raise AssertionError("deep macro expansion did not fail closed deliberately")
+
+    recursive_macro_controls = (
+        audit_capability_uses(
+            PurePosixPath("playback/gpu/gpufence.h"), "void safe() { F(); }",
+            {"F": MacroDefinition(True, ("F", "(", ")"), ())})
+        + audit_capability_uses(
+            PurePosixPath("playback/gpu/gpufence.h"), "void safe() { F(); }",
+            {
+                "F": MacroDefinition(True, ("G", "(", ")"), ()),
+                "G": MacroDefinition(True, ("F", "(", ")"), ()),
+            }))
+    if recursive_macro_controls:
+        raise AssertionError("benign recursive macro control was rejected:\n" +
+                             "\n".join(
+                                 finding.render() for finding in recursive_macro_controls))
 
     windows_command = (
         '"C:\\Program Files\\ccache\\ccache.exe" --config-path "ccache config.conf" '
