@@ -110,8 +110,12 @@ test's configured working directory is restored.
 Other external tools declare install-relative resource closure in an adjacent
 `<tool>.exe.olr-runtime-files` file instead of implicitly copying their prefix.
 Python tools use a bounded standard-library closure; virtual environments keep
-their `Scripts` layout plus the `pyvenv.cfg`-selected base runtime without a
-bulk `site-packages` copy.
+their `Scripts` layout plus the `pyvenv.cfg`-selected base runtime and its
+transitive base-root DLL imports, without a bulk `site-packages` copy. Selected
+Qt QML modules retain their bounded complete payload, including runtime assets,
+while optional module hints are not treated as unconditional imports. The app
+launcher generates its own `qt.conf` pointing only to protected plugin and QML
+snapshots.
 Absent `subdirs()` files and unsupported dynamic or external QML inputs are
 errors rather than names that may appear after the audit. Descendants inherit a
 protected `SetDllDirectory` runtime and a system-only tail on `PATH`, so their

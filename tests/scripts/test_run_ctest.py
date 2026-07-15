@@ -29,6 +29,7 @@ from tools.windows_runtime_guard import (
 def _write_pe_fixture(
     path: Path,
     *,
+    imported_name: str = "fixture-runtime.dll",
     magic: int = 0x20B,
     directory_index: int = 13,
     attributes: int = 1,
@@ -116,7 +117,7 @@ def _write_pe_fixture(
                 0,
             )
     name_offset = 0x200 + name_rva - 0x1000
-    name = b"fixture-runtime.dll\0"
+    name = imported_name.encode("ascii") + b"\0"
     if name_offset >= 0 and name_offset + len(name) <= len(contents):
         contents[name_offset : name_offset + len(name)] = name
     path.write_bytes(contents)
@@ -1102,6 +1103,44 @@ class RunCtestTests(unittest.TestCase):
         self.assertFalse(any(path.is_relative_to(unused) for path in qml_files))
         self.assertLess(len(qml_files), 8)
 
+    def test_qml_closure_keeps_module_assets_but_not_optional_imports(self) -> None:
+        source = self.root / "qml-assets-source"
+        source.mkdir()
+        (source / "Main.qml").write_text(
+            "import Qt.AssetRoot\nItem {}\n", encoding="utf-8"
+        )
+        qml_root = self.qt_root / "qml"
+        module = qml_root / "Qt" / "AssetRoot"
+        assets = module / "assets"
+        assets.mkdir(parents=True)
+        (module / "qmldir").write_text(
+            "module Qt.AssetRoot\n"
+            "depends Qt.Required 1.0\n"
+            "optional import Qt.Optional 1.0\n",
+            encoding="utf-8",
+        )
+        (module / "Root.qml").write_text("Item {}\n", encoding="utf-8")
+        image = assets / "control.png"
+        font = assets / "control.ttf"
+        shader = assets / "control.qsb"
+        image.write_bytes(b"png")
+        font.write_bytes(b"font")
+        shader.write_bytes(b"shader")
+        required = qml_root / "Qt" / "Required"
+        required.mkdir(parents=True)
+        (required / "Required.qml").write_text("Item {}\n", encoding="utf-8")
+        optional = qml_root / "Qt" / "Optional"
+        optional.mkdir(parents=True)
+        optional_file = optional / "Optional.qml"
+        optional_file.write_text("Item {}\n", encoding="utf-8")
+
+        selected = windows_runtime_guard.qt_qml_closure(qml_root, (source,))
+
+        for asset in (image, font, shader):
+            self.assertIn(asset.resolve(), selected)
+        self.assertIn((required / "Required.qml").resolve(), selected)
+        self.assertNotIn(optional_file.resolve(), selected)
+
     def test_discovery_and_audit_cost_is_bounded_for_focused_launches(self):
         commands: list[str] = []
         for index in range(256):
@@ -1199,7 +1238,7 @@ class RunCtestTests(unittest.TestCase):
         self.assertTrue(all(item[2] < 64 for item in focused))
 
     @unittest.skipUnless(os.name == "nt", "requires installed Windows Qt kit")
-    def test_actual_qt_and_python_closures_have_practical_size_time_budgets(self):
+    def test_actual_qt_focused_full_and_python_closures_have_absolute_budgets(self):
         candidates = sorted(
             path
             for path in Path("C:/Qt").glob("*/mingw_64")
@@ -1214,6 +1253,15 @@ class RunCtestTests(unittest.TestCase):
         qml = windows_runtime_guard.qt_qml_closure(
             qt / "qml", (project_source,)
         )
+        self.assertTrue(
+            any(
+                path.suffix.casefold()
+                not in {".dll", ".qml", ".js", ".mjs", ".qmltypes"}
+                and path.name.casefold() != "qmldir"
+                for path in qml
+            ),
+            "actual selected QML modules must retain runtime assets",
+        )
         runtime = windows_runtime_guard.transitive_runtime_closure(
             (*plugins, *(path for path in qml if path.suffix.casefold() == ".dll")),
             (qt / "bin",),
@@ -1226,26 +1274,14 @@ class RunCtestTests(unittest.TestCase):
         )
         resolved_elapsed = time.perf_counter() - started
 
-        runtime_suffixes = {".dll", ".qml", ".js", ".mjs", ".qmltypes"}
-        inventory = [
-            path
-            for root in (qt / "bin", qt / "plugins", qt / "qml")
-            for path in root.rglob("*")
-            if path.is_file()
-            and (
-                path.suffix.casefold() in runtime_suffixes
-                or path.name.casefold() == "qmldir"
-            )
-        ]
-        inventory_bytes = sum(path.stat().st_size for path in inventory)
         full = (*runtime, *plugins, *qml)
         full_bytes = sum(path.stat().st_size for path in full)
         focused_bytes = sum(
             path.stat().st_size for path in (*focused_runtime, *focused_plugins)
         )
         self.assertLess(resolved_elapsed, 20.0)
-        self.assertLess(full_bytes, inventory_bytes * 0.85)
-        self.assertLess(len(full), len(inventory))
+        self.assertLess(full_bytes, 160 << 20)
+        self.assertLess(len(full), 1800)
         self.assertLess(focused_bytes, 32 << 20)
         self.assertLess(len(focused_runtime) + len(focused_plugins), 16)
 
@@ -1269,6 +1305,27 @@ class RunCtestTests(unittest.TestCase):
             )
             self.assertEqual(lease.staged_byte_count, full_bytes)
         self.assertLess(time.perf_counter() - staged_started, 20.0)
+
+        focused_started = time.perf_counter()
+        with RuntimeAuditLease() as lease:
+            lease.stage_readonly_layout(
+                "actual-focused-runtime",
+                {
+                    Path(str(index)) / path.name: path
+                    for index, path in enumerate(focused_runtime)
+                },
+                byte_limit=64 << 20,
+            )
+            lease.stage_readonly_layout(
+                "actual-focused-plugins",
+                {
+                    path.relative_to(qt / "plugins"): path
+                    for path in focused_plugins
+                },
+                byte_limit=16 << 20,
+            )
+            self.assertEqual(lease.staged_byte_count, focused_bytes)
+        self.assertLess(time.perf_counter() - focused_started, 10.0)
 
         python_closure = run_ctest._external_tool_closure(Path(sys.executable))
         python_bytes = sum(
@@ -1544,7 +1601,9 @@ class RunCtestTests(unittest.TestCase):
             f'OLR_SRT_ROOT={self.srt_root.as_posix()}")\n',
             encoding="utf-8",
         )
-        (self.qt_root / "bin" / "Qt6Core.dll").write_bytes(b"qt")
+        configured_qt = self.qt_root / "bin" / "Qt6Core.dll"
+        configured_qt.write_bytes(b"qt")
+        (self.build_dir / configured_qt.name).write_bytes(configured_qt.read_bytes())
         (self.ffmpeg_root / "bin" / "ffprobe.exe").write_bytes(b"ffprobe")
         (self.compiler_bin / "runtime-tool.dll").write_bytes(b"compiler-first")
         (self.qt_root / "bin" / "runtime-tool.dll").write_bytes(b"qt-second")
@@ -1556,7 +1615,10 @@ class RunCtestTests(unittest.TestCase):
             mock.patch.object(
                 run_ctest,
                 "transitive_runtime_closure",
-                return_value=(self.compiler_bin / "runtime-tool.dll",),
+                return_value=(
+                    self.compiler_bin / "runtime-tool.dll",
+                    configured_qt,
+                ),
             ) as closure,
         ):
             env, selected_ctest = run_ctest.prepare_windows_runtime(
@@ -1576,6 +1638,10 @@ class RunCtestTests(unittest.TestCase):
                 (runtime_dirs[0] / "runtime-tool.dll").read_bytes(),
                 b"compiler-first",
             )
+            self.assertEqual(
+                (runtime_dirs[1] / configured_qt.name).read_bytes(), b"qt"
+            )
+            self.assertFalse((staged_build / configured_qt.name).exists())
             self.assertTrue(staged_executable.is_file())
             self.assertIn(
                 staged_executable.as_posix(),
@@ -1859,6 +1925,50 @@ class RunCtestTests(unittest.TestCase):
                 )
                 self.assertEqual({test.name for test in selected}, {"unit", "other"})
 
+    def test_quicktest_inputs_are_keyed_by_add_test_occurrence(self) -> None:
+        first_scope = self.build_dir / "quick-first"
+        second_scope = self.build_dir / "quick-second"
+        first_scope.mkdir()
+        second_scope.mkdir()
+        first_input = self.root / "tests" / "quick-first"
+        second_input = self.root / "tests" / "quick-second"
+        first_input.mkdir(parents=True)
+        second_input.mkdir(parents=True)
+        (first_input / "tst_first.qml").write_text("Item {}\n", encoding="utf-8")
+        (second_input / "tst_second.qml").write_text("Item {}\n", encoding="utf-8")
+        executable = self.build_dir / "quicktest.exe"
+        executable.write_bytes(b"quicktest")
+        (first_scope / "CTestTestfile.cmake").write_text(
+            f'add_test([=[duplicate]=] "{executable.as_posix()}" '
+            f'"-input" "{first_input.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        (second_scope / "CTestTestfile.cmake").write_text(
+            "# different source offset\n\n"
+            f'add_test([=[duplicate]=] "{executable.as_posix()}" '
+            f'"-input={second_input.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            'subdirs("quick-first")\nsubdirs("quick-second")\n',
+            encoding="utf-8",
+        )
+
+        graph = windows_runtime_guard.discover_ctest_graph(self.build_dir)
+        mapping, paths = run_ctest._quicktest_inputs(
+            graph.tests, self.root, self.build_dir
+        )
+
+        self.assertEqual(len(mapping), 2)
+        self.assertEqual(set(paths), {first_input.resolve(), second_input.resolve()})
+        self.assertNotEqual(
+            graph.tests[0].argument_occurrences[0].start,
+            graph.tests[1].argument_occurrences[0].start,
+        )
+        for record in graph.tests:
+            selected = mapping[run_ctest._quicktest_record_key(record)]
+            self.assertEqual(len(selected), 1)
+
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_qt_bin_tool_does_not_snapshot_the_entire_install_prefix(self):
         tool = self.qt_root / "bin" / "qmllint.exe"
@@ -1893,10 +2003,12 @@ class RunCtestTests(unittest.TestCase):
         root = self.root / "python-normal"
         executable = root / "python.exe"
         executable.parent.mkdir()
-        executable.write_bytes(b"python")
-        (root / "python313.dll").write_bytes(b"runtime")
+        _write_pe_fixture(executable, imported_name="python313.dll")
+        _write_pe_fixture(root / "python313.dll", imported_name="kernel32.dll")
         (root / "DLLs").mkdir()
-        (root / "DLLs" / "_socket.pyd").write_bytes(b"extension")
+        _write_pe_fixture(
+            root / "DLLs" / "_socket.pyd", imported_name="kernel32.dll"
+        )
         (root / "Lib" / "json").mkdir(parents=True)
         (root / "Lib" / "json" / "__init__.py").write_text(
             "", encoding="utf-8"
@@ -1924,13 +2036,17 @@ class RunCtestTests(unittest.TestCase):
             "", encoding="utf-8"
         )
         (base / "DLLs").mkdir()
-        (base / "DLLs" / "_socket.pyd").write_bytes(b"extension")
-        (base / "python313.dll").write_bytes(b"runtime")
+        _write_pe_fixture(
+            base / "DLLs" / "_socket.pyd", imported_name="kernel32.dll"
+        )
+        _write_pe_fixture(
+            base / "python313.dll", imported_name="kernel32.dll"
+        )
         venv = self.root / "venv"
         scripts = venv / "Scripts"
         scripts.mkdir(parents=True)
         executable = scripts / "python.exe"
-        executable.write_bytes(b"python")
+        _write_pe_fixture(executable, imported_name="python313.dll")
         config = venv / "pyvenv.cfg"
         config.write_text(
             f"home = {base}\ninclude-system-site-packages = false\n",
@@ -1949,6 +2065,30 @@ class RunCtestTests(unittest.TestCase):
         self.assertNotIn(Path("Lib/site-packages/poison.py"), closure.entries)
         rendered = closure.entries[Path("pyvenv.cfg")](Path("C:/protected-python"))
         self.assertIn(b"home = C:/protected-python/base", rendered)
+
+    def test_python_venv_closure_follows_base_root_pe_imports(self):
+        base = self.root / "python-import-base"
+        base.mkdir()
+        runtime = base / "python313.dll"
+        compiler_runtime = base / "vcruntime140.dll"
+        _write_pe_fixture(runtime, imported_name=compiler_runtime.name)
+        _write_pe_fixture(compiler_runtime, imported_name="kernel32.dll")
+        (base / "Lib").mkdir()
+
+        venv = self.root / "python-import-venv"
+        scripts = venv / "Scripts"
+        scripts.mkdir(parents=True)
+        executable = scripts / "python.exe"
+        _write_pe_fixture(executable, imported_name=runtime.name)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {base}\ninclude-system-site-packages = false\n",
+            encoding="utf-8",
+        )
+
+        closure = run_ctest._external_tool_closure(executable)
+
+        self.assertIn(Path("base/python313.dll"), closure.entries)
+        self.assertIn(Path("base/vcruntime140.dll"), closure.entries)
 
     def test_external_tool_manifest_rejects_rooted_relative_path(self):
         root = self.root / "external-rooted"
@@ -2025,6 +2165,53 @@ class RunCtestTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(RuntimeError, "reparse alias"):
                     run_ctest._external_tool_closure(executable)
+
+    def test_external_tool_closure_rejects_file_alias_final_path_mismatch(self):
+        real_resolve = Path.resolve
+        for kind in ("descriptor", "adjacent"):
+            with self.subTest(kind=kind):
+                root = self.root / f"external-{kind}-final-path"
+                root.mkdir()
+                executable = root / "wrapper.exe"
+                executable.write_bytes(b"wrapper")
+                target = root / f"{kind}-real"
+                target.write_bytes(b"real")
+                if kind == "descriptor":
+                    alias = executable.with_name(
+                        executable.name + ".olr-runtime-files"
+                    )
+                    alias.write_text("", encoding="utf-8")
+                else:
+                    alias = root / "support.dll"
+                    alias.write_bytes(b"support")
+
+                def resolve(path: Path, *args, **kwargs) -> Path:
+                    if os.path.normcase(str(path)) == os.path.normcase(str(alias)):
+                        return target
+                    return real_resolve(path, *args, **kwargs)
+
+                with (
+                    mock.patch.object(Path, "resolve", resolve),
+                    self.assertRaisesRegex(RuntimeError, "reparse alias"),
+                ):
+                    run_ctest._external_tool_closure(executable)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
+    def test_external_tool_manifest_rejects_junction_resource_root(self) -> None:
+        root = self.root / "external-junction-root"
+        root.mkdir()
+        executable = root / "wrapper.exe"
+        executable.write_bytes(b"wrapper")
+        outside = self.root / "external-junction-target"
+        outside.mkdir()
+        (outside / "data.bin").write_bytes(b"outside")
+        self.make_junction(root / "resources", outside)
+        executable.with_name(executable.name + ".olr-runtime-files").write_text(
+            "resources\n", encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "reparse alias"):
+            run_ctest._external_tool_closure(executable)
 
     def test_windows_runtime_replaces_explicit_qpa_platform(self):
         env, _ = run_ctest.prepare_windows_runtime(

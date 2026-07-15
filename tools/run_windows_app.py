@@ -138,6 +138,12 @@ def prepare_windows_app_runtime(
         launch_platform_plugins = qt_platform_plugins
         launch_executable = executable
         if audit_lease is not None and os.name == "nt":
+            configured_runtime_names = {
+                child.name.casefold()
+                for directory in runtime_dirs
+                for child in directory.iterdir()
+                if child.is_file() and child.suffix.casefold() == ".dll"
+            }
             adjacent_app_dlls = tuple(
                 adjacent
                 for adjacent in sorted(
@@ -147,6 +153,7 @@ def prepare_windows_app_runtime(
                 if adjacent != executable
                 and adjacent.is_file()
                 and adjacent.suffix.casefold() == ".dll"
+                and adjacent.name.casefold() not in configured_runtime_names
             )
             plugin_files = runtime_guard.qt_plugin_closure(
                 qt_plugins,
@@ -214,13 +221,16 @@ def prepare_windows_app_runtime(
             lease.launch_runtime_directories = launch_runtime_dirs
 
             app_entries: dict[Path, Path | bytes] = {
-                Path(executable.name): executable
+                Path(executable.name): executable,
+                Path("qt.conf"): (
+                    "[Paths]\n"
+                    "Prefix = .\n"
+                    f"Plugins = {launch_plugins.as_posix()}\n"
+                    f"QmlImports = {launch_qml.as_posix()}\n"
+                ).encode("utf-8"),
             }
             for adjacent in adjacent_app_dlls:
                 app_entries[Path(adjacent.name)] = adjacent
-            qt_conf = executable.parent / "qt.conf"
-            if qt_conf.is_file():
-                app_entries[Path(qt_conf.name)] = qt_conf
             app_layout = lease.stage_readonly_layout(
                 "app", app_entries, byte_limit=1 << 30
             )

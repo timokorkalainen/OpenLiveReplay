@@ -1209,7 +1209,7 @@ _QML_IMPORT = re.compile(
     r"(?m)^\s*import\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
 )
 _QMLDIR_DEPENDENCY = re.compile(
-    r"(?m)^\s*(?:optional\s+)?(?:depends|import)\s+"
+    r"(?m)^\s*(?:depends|import)\s+"
     r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)"
 )
 
@@ -1224,6 +1224,10 @@ def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ..
     }
 
     def imports_from(path: Path) -> set[str]:
+        if path.suffix.casefold() not in (".qml", ".js", ".mjs") and (
+            path.name.casefold() != "qmldir"
+        ):
+            return set()
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -1275,10 +1279,12 @@ def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ..
         if not module.is_dir():
             continue
         for child in module.rglob("*"):
-            if not child.is_file() or (
-                child.suffix.casefold() not in _QML_RUNTIME_SUFFIXES
-                and child.name.casefold() != "qmldir"
-            ):
+            is_junction = getattr(child, "is_junction", lambda: False)()
+            if child.is_symlink() or is_junction:
+                raise RuntimeError(
+                    f"Qt QML closure contains a reparse alias: {child}"
+                )
+            if not child.is_file():
                 continue
             canonical = child.resolve()
             if not canonical.is_relative_to(qt_qml) or os.path.normcase(

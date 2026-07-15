@@ -258,7 +258,8 @@ Non-runtime external tools can declare required install-relative resources in
 `<tool>.exe.olr-runtime-files`, one safe relative file or directory per line.
 Normal Python tools receive a bounded standard-library and extension-module
 closure; virtual environments retain their `Scripts` layout and a staged base
-runtime selected from `pyvenv.cfg`, without bulk-copying `site-packages`.
+runtime selected from `pyvenv.cfg`, including transitive base-root DLL imports,
+without bulk-copying `site-packages`.
 Focused literal selectors fall back to the full safe snapshot when CTest fixture
 properties or fixture-selection flags could expand the executed test set.
 The launcher uses the protected runtime as the inherited `SetDllDirectory`
@@ -267,8 +268,12 @@ the child `PATH` contains only that protected runtime and Windows system roots.
 The controlled Windows app launcher applies the same protected runtime,
 plugin/QML, and application-directory policy before starting the staged app
 executable. Its explicit platform closure includes both the normal Windows and
-offscreen backends, and it removes every temporary snapshot after the process
-tree exits.
+offscreen backends. It replaces any build-tree `qt.conf` with a launcher-owned
+configuration whose plugin and QML paths name only the protected snapshots.
+Selected QML modules retain their complete bounded contents, including images,
+fonts, and shaders; `optional import` hints are included only when selected by
+an actual source import. The launcher removes every temporary snapshot after
+the process tree exits.
 
 The same launch audit follows the generated CTest `subdirs()`/`include()`
 graph, validates each test's working directory and loader-related environment,

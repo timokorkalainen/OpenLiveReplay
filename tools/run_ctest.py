@@ -173,10 +173,29 @@ class _QuickTestInput(NamedTuple):
     occurrence: CMakeArgumentOccurrence
 
 
+class _QuickTestRecordKey(NamedTuple):
+    definition_file: Path
+    scope_file: Path
+    start: int
+    end: int
+
+
+def _quicktest_record_key(test) -> _QuickTestRecordKey:
+    occurrence = test.argument_occurrences[0]
+    return _QuickTestRecordKey(
+        test.definition_file,
+        test.scope_file,
+        occurrence.start,
+        occurrence.end,
+    )
+
+
 def _quicktest_inputs(
     tests, source_root: Path, build_root: Path
-) -> tuple[dict[str, tuple[_QuickTestInput, ...]], tuple[Path, ...]]:
-    by_test: dict[str, list[_QuickTestInput]] = {}
+) -> tuple[
+    dict[_QuickTestRecordKey, tuple[_QuickTestInput, ...]], tuple[Path, ...]
+]:
+    by_test: dict[_QuickTestRecordKey, list[_QuickTestInput]] = {}
     paths: set[Path] = set()
     for test in tests:
         arguments = test.arguments
@@ -218,7 +237,7 @@ def _quicktest_inputs(
                 )
             paths.add(canonical)
             occurrence_index = index + 1 if not prefix else index
-            by_test.setdefault(test.name, []).append(
+            by_test.setdefault(_quicktest_record_key(test), []).append(
                 _QuickTestInput(
                     prefix + value,
                     canonical,
@@ -383,10 +402,11 @@ def _tree_closure_files(root: Path, selected_root: Path) -> tuple[Path, ...]:
     return tuple(files)
 
 
-def _python_base_entries(base: Path, prefix: Path) \
+def _python_base_entries(base: Path, prefix: Path, seeds: Sequence[Path]) \
         -> dict[Path, Path | bytes | Callable[[Path], bytes]]:
     base = _validated_closure_path(base)
     entries: dict[Path, Path | bytes | Callable[[Path], bytes]] = {}
+    import_seeds = list(seeds)
     for child in base.iterdir():
         if child.is_file() and (
             child.name.casefold().startswith("python")
@@ -394,10 +414,20 @@ def _python_base_entries(base: Path, prefix: Path) \
         ):
             validated = _validated_closure_path(child, base)
             entries[prefix / validated.relative_to(base)] = validated
+            if validated.suffix.casefold() == ".dll":
+                import_seeds.append(validated)
     dlls = base / "DLLs"
+    runtime_directories = [base]
     if dlls.is_dir():
+        runtime_directories.append(_validated_closure_path(dlls, base))
         for child in _tree_closure_files(dlls, base):
             entries[prefix / child.relative_to(base)] = child
+            if child.suffix.casefold() in (".dll", ".exe", ".pyd"):
+                import_seeds.append(child)
+    for dependency in transitive_runtime_closure(
+        import_seeds, tuple(runtime_directories)
+    ):
+        entries[prefix / dependency.relative_to(base)] = dependency
     library = base / "Lib"
     excluded = {
         "__pycache__", "ensurepip", "idlelib", "site-packages", "test",
@@ -450,7 +480,9 @@ def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
             if match is None:
                 raise RuntimeError(f"Python venv has no home entry: {config}")
             base = _validated_closure_path(Path(match.group(1)))
-            entries.update(_python_base_entries(base, Path("base")))
+            entries.update(
+                _python_base_entries(base, Path("base"), (executable,))
+            )
 
             def rewrite_venv_config(staged: Path, text: str = contents) -> bytes:
                 home = (staged / "base").as_posix()
@@ -463,7 +495,9 @@ def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
 
             entries[Path("pyvenv.cfg")] = rewrite_venv_config
         else:
-            entries.update(_python_base_entries(root, Path(".")))
+            entries.update(
+                _python_base_entries(root, Path("."), (executable,))
+            )
 
     descriptor = executable.with_name(executable.name + ".olr-runtime-files")
     if descriptor.is_file():
@@ -781,12 +815,19 @@ def prepare_windows_runtime(
             )
             runtime_tool_destinations: dict[Path, Path] = {}
             runtime_directory_set = set(runtime_dirs)
+            configured_runtime_names = {
+                child.name.casefold()
+                for directory in runtime_dirs
+                for child in directory.iterdir()
+                if child.is_file() and child.suffix.casefold() == ".dll"
+            }
             adjacent_dependency_seeds = {
                 adjacent
                 for executable in selected_executables
                 if executable.parent not in runtime_directory_set
                 for adjacent in executable.parent.glob("*.dll")
                 if adjacent.is_file()
+                and adjacent.name.casefold() not in configured_runtime_names
             }
             runtime_closure = set(
                 transitive_runtime_closure(
@@ -876,6 +917,8 @@ def prepare_windows_runtime(
                     executable.parent.glob("*.dll"),
                     key=lambda path: path.name.casefold(),
                 ):
+                    if adjacent.name.casefold() in configured_runtime_names:
+                        continue
                     destination = relative.parent / adjacent.name
                     build_entries.setdefault(destination, adjacent)
 
@@ -962,7 +1005,7 @@ def prepare_windows_runtime(
                                     (occurrence, replacement)
                                 )
                         for quicktest_input in quicktest_inputs_by_test.get(
-                            test.name, ()
+                            _quicktest_record_key(test), ()
                         ):
                             staged_input = (
                                 launch_source

@@ -194,6 +194,30 @@ class RunWindowsAppTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
+    def test_runtime_replaces_source_qt_conf_with_closed_staged_paths(self) -> None:
+        source_conf = self.build / "qt.conf"
+        source_conf.write_text(
+            "[Paths]\nPlugins=C:/mutable/plugins\nQmlImports=C:/mutable/qml\n",
+            encoding="utf-8",
+        )
+
+        with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
+            env = self.launcher.prepare_windows_app_runtime(
+                self.build, self.app, {}, audit_lease=lease
+            )
+            staged_conf = lease.launch_executable.parent / "qt.conf"
+            rendered = staged_conf.read_text(encoding="utf-8")
+            self.assertNotIn("mutable", rendered)
+            self.assertIn(Path(env["QT_PLUGIN_PATH"]).as_posix(), rendered)
+            self.assertIn(Path(env["QML_IMPORT_PATH"]).as_posix(), rendered)
+            self.assertEqual(
+                source_conf.read_text(encoding="utf-8"),
+                "[Paths]\nPlugins=C:/mutable/plugins\nQmlImports=C:/mutable/qml\n",
+            )
+            with self.assertRaises(OSError):
+                staged_conf.write_text("Plugins=C:/late", encoding="utf-8")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_external_app_lease_closes_app_and_runtime_namespaces(self) -> None:
         (self.compiler / "runtime-tool.dll").write_bytes(b"compiler")
         (self.qt / "bin" / "runtime-tool.dll").write_bytes(b"qt")
@@ -290,19 +314,6 @@ class RunWindowsAppTests(unittest.TestCase):
         )
         cache_path.write_text(cache, encoding="utf-8")
 
-        runtime_suffixes = {".dll", ".qml", ".js", ".mjs", ".qmltypes"}
-        inventory = [
-            path
-            for root in (qt / "bin", qt / "plugins", qt / "qml")
-            for path in root.rglob("*")
-            if path.is_file()
-            and (
-                path.suffix.casefold() in runtime_suffixes
-                or path.name.casefold() == "qmldir"
-            )
-        ]
-        inventory_bytes = sum(path.stat().st_size for path in inventory)
-
         started = time.perf_counter()
         with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
             env = self.launcher.prepare_windows_app_runtime(
@@ -314,9 +325,41 @@ class RunWindowsAppTests(unittest.TestCase):
             elapsed = time.perf_counter() - started
             self.assertNotEqual(Path(env["QT_PLUGIN_PATH"]), qt / "plugins")
             self.assertNotEqual(Path(env["QML_IMPORT_PATH"]), qt / "qml")
-            self.assertLess(lease.staged_byte_count, inventory_bytes * 0.85)
-            self.assertLess(lease.staged_file_count, len(inventory))
+            self.assertLess(lease.staged_byte_count, 160 << 20)
+            self.assertLess(lease.staged_file_count, 1800)
         self.assertLess(elapsed, 25.0)
+
+    @unittest.skipUnless(os.name == "nt", "requires a built Windows app")
+    def test_real_built_app_snapshot_has_absolute_size_time_budgets(self) -> None:
+        project_source = Path(__file__).resolve().parents[2]
+        candidates: list[tuple[float, Path, Path]] = []
+        for app in project_source.glob("build*/**/OpenLiveReplay.exe"):
+            for build in (app.parent, *app.parents):
+                cache = build / "CMakeCache.txt"
+                if cache.is_file():
+                    candidates.append((app.stat().st_mtime, build, app))
+                    break
+                if build == project_source:
+                    break
+        if not candidates:
+            self.fail("actual built OpenLiveReplay.exe with CMakeCache.txt is required")
+        _modified, build, app = max(candidates)
+
+        started = time.perf_counter()
+        with self.launcher.runtime_guard.RuntimeAuditLease() as lease:
+            self.launcher.prepare_windows_app_runtime(
+                build,
+                app,
+                {"SystemRoot": os.environ.get("SystemRoot", "C:/Windows")},
+                audit_lease=lease,
+            )
+            elapsed = time.perf_counter() - started
+            self.assertEqual(lease.launch_executable.read_bytes(), app.read_bytes())
+            # Debug builds contain an ~86 MiB executable; this absolute ceiling
+            # still rejects restaging the verified adjacent Qt runtime peers.
+            self.assertLess(lease.staged_byte_count, 240 << 20)
+            self.assertLess(lease.staged_file_count, 1900)
+        self.assertLess(elapsed, 30.0)
 
     def test_cache_rejects_duplicate_wrong_type_and_relative_roots(self) -> None:
         cache = self.build / "CMakeCache.txt"
