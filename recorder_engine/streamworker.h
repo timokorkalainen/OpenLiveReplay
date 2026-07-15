@@ -297,6 +297,16 @@ private:
     takeFrameTimecodeEvidenceForMux(std::optional<TimecodeEvidence>& selected,
                                     int64_t sessionFrameIndex) const;
     void emitFrameTimecodeEvidence(const TimecodeEvidence& evidence);
+#ifdef OLR_UNIT_TEST
+    // One-shot seam for exercising the real write-rejection branch after frame
+    // selection and encoding. Success-path tests leave it empty and use the real
+    // asynchronous Muxer writer/completion unchanged.
+    void runBeforeMuxPacketWriteForTest() {
+        auto hook = std::move(m_beforeMuxPacketWriteForTest);
+        if (hook) hook();
+    }
+    std::function<void()> m_beforeMuxPacketWriteForTest;
+#endif
     void processEncoderTick(AVCodecContext* encCtx, int64_t streamTimeMs, int64_t trimMs,
                             int64_t jitterMs);
 };

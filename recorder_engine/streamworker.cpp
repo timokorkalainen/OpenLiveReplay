@@ -457,6 +457,9 @@ StreamWorker::makeMuxerWriteCallback(int track, AVStream* st, bool* havePacket,
             pkt->duration = av_rescale_q(1, AVRational{1, m_targetFps}, st->time_base);
             if (keyframe) pkt->flags |= AV_PKT_FLAG_KEY;
             if (hooks->before) hooks->before();
+#ifdef OLR_UNIT_TEST
+            runBeforeMuxPacketWriteForTest();
+#endif
             const bool accepted = m_muxer->writePacket(pkt, std::move(hooks->after));
             if (accepted && havePacket) *havePacket = true;
         }
@@ -720,6 +723,9 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
         if (m_videoCodec != VideoCodecChoice::H264Hardware && encCtx) {
             auto muxEvidence = takeFrameTimecodeEvidenceForMux(m_latestFrameTimecodeEvidence,
                                                                m_internalFrameCount);
+#ifdef OLR_UNIT_TEST
+            runBeforeMuxPacketWriteForTest();
+#endif
             const bool accepted = m_muxer->writePacket(outPkt, [this, muxEvidence](bool written) {
                 if (written && muxEvidence) emitFrameTimecodeEvidence(*muxEvidence);
             });

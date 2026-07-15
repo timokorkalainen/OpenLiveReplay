@@ -804,10 +804,11 @@ void ReplayManager::recomputeInterCamPhase() {
                 const ConfidenceTier tier = m_offsetEstimator.tier(s);
                 const bool servoEligible =
                     m_lastStats[s].clockLocked && tier != ConfidenceTier::Approximate;
-                if (!servoEligible) continue;
-                const int64_t cap = kMaxInterCamCorrectionMs;
-                const int64_t rawTargetMs = -m_offsetEstimator.offsetMs(s);
-                target = int(qBound<int64_t>(-cap, rawTargetMs, cap));
+                if (servoEligible) {
+                    const int64_t cap = kMaxInterCamCorrectionMs;
+                    const int64_t rawTargetMs = -m_offsetEstimator.offsetMs(s);
+                    target = int(qBound<int64_t>(-cap, rawTargetMs, cap));
+                }
             }
         }
         const int current = m_servoTrimMs[s];
