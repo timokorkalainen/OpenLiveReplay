@@ -17,7 +17,10 @@ REGISTRY_HEADER = PurePosixPath("playback/gpu/gpuretireregistry.h")
 OP_SCOPE_HEADER = PurePosixPath("playback/gpu/gpuopscope.h")
 
 # Public read() is retained by the locked design but confined to reviewed,
-# synchronous compatibility adapters. New production code should use withRead().
+# synchronous compatibility adapters. Its deliberately narrow grammar requires
+# one local scope, one local lease, one top-level lexical body, and a standalone
+# completion with no earlier control transfer. New or broader production syntax
+# must use withRead(), whose callback is tied to the exact second call argument.
 SYNC_READ_ALLOWLIST = frozenset({PurePosixPath("playback/gpu/gpufence.h")})
 
 
@@ -30,6 +33,26 @@ class Finding:
 
     def render(self) -> str:
         return f"{self.path}:{self.line}: forbidden expression {self.expression}: {self.reason}"
+
+
+@dataclass(frozen=True)
+class CppToken:
+    value: str
+    start: int
+    end: int
+
+
+TOKEN_PATTERN = re.compile(
+    r"[A-Za-z_]\w*|\d+(?:\.\d+)?|::|->|&&|\|\||==|!=|<=|>=|\+\+|--|"
+    r"<<|>>|\+=|-=|\*=|/=|%=|&=|\|=|\^=|\.\.\.|[^\s]"
+)
+
+
+def cpp_tokens(masked: str, start: int = 0, end: int | None = None) -> list[CppToken]:
+    """Tokenize enough C++ punctuation to enforce a conservative local grammar."""
+    limit = len(masked) if end is None else end
+    return [CppToken(match.group(), match.start(), match.end())
+            for match in TOKEN_PATTERN.finditer(masked, start, limit)]
 
 
 def mask_non_code(source: str) -> str:
@@ -106,46 +129,6 @@ def brace_pairs(masked: str) -> list[tuple[int, int]]:
 def enclosing_block(pairs: Iterable[tuple[int, int]], position: int) -> tuple[int, int] | None:
     candidates = [pair for pair in pairs if pair[0] < position < pair[1]]
     return min(candidates, key=lambda pair: pair[1] - pair[0]) if candidates else None
-
-
-def execution_block_kind(masked: str, opening: int) -> str | None:
-    """Classify braces that introduce a distinct executable lexical body."""
-    boundary = max(masked.rfind(";", 0, opening),
-                   masked.rfind("{", 0, opening),
-                   masked.rfind("}", 0, opening))
-    prefix = masked[boundary + 1:opening].strip()
-    if re.search(
-            r"\[[^\]]*\]\s*(?:\([^{};]*\)\s*)?(?:mutable\s*)?"
-            r"(?:noexcept\s*)?(?:->\s*[^{};]+)?$", prefix):
-        return "lambda"
-    if re.search(r"\b(?:if|for|while|switch|catch)\s*\([^{};]*\)\s*$", prefix):
-        return "control"
-    if re.search(r"\b(?:else|do|try)\s*$", prefix):
-        return "control"
-    if re.search(r"\b(?:class|struct|union|namespace)\b[^;{}]*$", prefix):
-        return "type"
-    if re.search(
-            r"\)\s*(?:(?:const|volatile|override|final|noexcept)\s*)*"
-            r"(?:->\s*[^{};]+)?$", prefix):
-        return "function"
-    return None
-
-
-def execution_block_chain(masked: str, pairs: Iterable[tuple[int, int]],
-                          position: int) -> tuple[tuple[int, int], ...]:
-    """Return lexical bodies whose execution is not implied by ordinary braces."""
-    blocks = [pair for pair in pairs if pair[0] < position < pair[1]
-              and execution_block_kind(masked, pair[0]) is not None]
-    return tuple(sorted(blocks))
-
-
-def completion_shares_execution_block(masked: str, pairs: list[tuple[int, int]],
-                                      required_positions: Iterable[int],
-                                      completion_position: int) -> bool:
-    """Require completion and every read/use to share one executable body."""
-    completion_chain = execution_block_chain(masked, pairs, completion_position)
-    return all(execution_block_chain(masked, pairs, position) == completion_chain
-               for position in required_positions)
 
 
 def line_number(source: str, position: int) -> int:
@@ -268,15 +251,135 @@ def matching_delimiter(masked: str, opening: int, opener: str, closer: str) -> i
     return None
 
 
+def immediate_block(pairs: list[tuple[int, int]], position: int) -> tuple[int, int] | None:
+    return enclosing_block(pairs, position)
+
+
+def statement_tokens(masked: str, pairs: list[tuple[int, int]], position: int) -> list[CppToken]:
+    """Return the semicolon-terminated statement containing position.
+
+    This deliberately only accepts a statement in the call's immediate lexical
+    block. A call hidden in a control statement, lambda, initializer, or nested
+    body therefore retains those surrounding tokens and cannot resemble the
+    canonical capability grammar.
+    """
+    block = immediate_block(pairs, position)
+    if block is None:
+        return []
+    tokens = cpp_tokens(masked, block[0] + 1, block[1])
+    call_index = next((index for index, token in enumerate(tokens)
+                       if token.start <= position < token.end), None)
+    if call_index is None:
+        return []
+
+    start_index = 0
+    paren_depth = 0
+    bracket_depth = 0
+    brace_depth = 0
+    for index in range(call_index):
+        value = tokens[index].value
+        if value == "(":
+            paren_depth += 1
+        elif value == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif value == "[":
+            bracket_depth += 1
+        elif value == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif value == "{":
+            brace_depth += 1
+        elif value == "}":
+            brace_depth = max(0, brace_depth - 1)
+            if paren_depth == bracket_depth == brace_depth == 0:
+                start_index = index + 1
+        elif value == ";" and paren_depth == bracket_depth == brace_depth == 0:
+            start_index = index + 1
+
+    paren_depth = bracket_depth = brace_depth = 0
+    for index in range(start_index, len(tokens)):
+        value = tokens[index].value
+        if value == "(":
+            paren_depth += 1
+        elif value == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif value == "[":
+            bracket_depth += 1
+        elif value == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif value == "{":
+            brace_depth += 1
+        elif value == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif value == ";" and paren_depth == bracket_depth == brace_depth == 0:
+            return tokens[start_index:index + 1]
+    return []
+
+
+def call_closing_token(tokens: list[CppToken], call_name_index: int) -> int | None:
+    opening = call_name_index + 1
+    if opening >= len(tokens) or tokens[opening].value != "(":
+        return None
+    depth = 0
+    for index in range(opening, len(tokens)):
+        if tokens[index].value == "(":
+            depth += 1
+        elif tokens[index].value == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def canonical_scope_declaration(masked: str, pairs: list[tuple[int, int]],
+                                binding: ScopeBinding) -> bool:
+    tokens = statement_tokens(masked, pairs, binding.declaration.position)
+    return [token.value for token in tokens] == [
+        "GpuSyncReadScope", binding.declaration.name, ";"
+    ]
+
+
+def canonical_read_lease(masked: str, pairs: list[tuple[int, int]], call: re.Match[str],
+                         scope_name: str) -> tuple[str, int] | None:
+    tokens = statement_tokens(masked, pairs, call.start())
+    values = [token.value for token in tokens]
+    if len(tokens) < 10 or values[:4] != ["const", "GpuReadLease", values[2], "="]:
+        return None
+    lease_name = values[2]
+    if not re.fullmatch(r"[A-Za-z_]\w*", lease_name):
+        return None
+    if values[4:8] != [scope_name, ".", "read", "("]:
+        return None
+    close = call_closing_token(tokens, 6)
+    if close is None or values[close:] != [")", ";"]:
+        return None
+    return lease_name, tokens[2].start
+
+
+def standalone_completion(masked: str, pairs: list[tuple[int, int]], call: re.Match[str],
+                          scope_name: str) -> bool:
+    return [token.value for token in statement_tokens(masked, pairs, call.start())] == [
+        scope_name, ".", "complete", "(", ")", ";"
+    ]
+
+
+CONTROL_TRANSFER_TOKENS = frozenset({
+    "break", "co_return", "continue", "goto", "return", "throw",
+})
+
+
+def has_intervening_control_transfer(masked: str, start: int, end: int) -> bool:
+    return any(token.value in CONTROL_TRANSFER_TOKENS for token in cpp_tokens(masked, start, end))
+
+
 def resolve_scope(scope_bindings: list[ScopeBinding], masked: str,
                   pairs: list[tuple[int, int]],
                   call: re.Match[str]) -> ScopeBinding | None:
-    receiver = receiver_expression(masked, call.start())
+    receiver = receiver_expression(masked, call.start()).strip()
     candidates = [
         binding for binding in scope_bindings
         if binding.declaration.position <= call.start() < binding.block[1]
         and binding.block[0] < call.start()
-        and re.search(rf"\b{re.escape(binding.declaration.name)}\b", receiver)
+        and receiver == binding.declaration.name
         and not name_is_shadowed(binding.declaration.name, binding.declaration.position,
                                  binding.declaration.end, masked, pairs, call.start())
     ]
@@ -287,50 +390,64 @@ def resolve_scope(scope_bindings: list[ScopeBinding], masked: str,
                                     -binding.declaration.position))
 
 
-def read_lease_name(masked: str, call_position: int) -> tuple[str, int] | None:
-    boundary = max(masked.rfind(";", 0, call_position),
-                   masked.rfind("{", 0, call_position),
-                   masked.rfind("}", 0, call_position))
-    prefix = masked[boundary + 1:call_position]
-    declaration = re.search(
-        r"\b(?:const\s+)?(?:GpuReadLease|auto)\s*"
-        r"(?:(?:const|volatile)\s+)*[*&]*\s*([A-Za-z_]\w*)\s*=\s*[^;{}]*$",
-        prefix)
-    if declaration is None:
-        return None
-    return declaration.group(1), boundary + 1 + declaration.start(1)
-
-
 def callback_lease_bindings(masked: str, pairs: list[tuple[int, int]],
                             call: re.Match[str]) -> list[HandleBinding]:
     opening = call.end() - 1
     closing = matching_delimiter(masked, opening, "(", ")")
     if closing is None:
         return []
-    body = masked[opening + 1:closing]
+
+    separators: list[int] = []
+    paren_depth = bracket_depth = brace_depth = 0
+    for index in range(opening + 1, closing):
+        value = masked[index]
+        if value == "(":
+            paren_depth += 1
+        elif value == ")":
+            paren_depth = max(0, paren_depth - 1)
+        elif value == "[":
+            bracket_depth += 1
+        elif value == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+        elif value == "{":
+            brace_depth += 1
+        elif value == "}":
+            brace_depth = max(0, brace_depth - 1)
+        elif value == "," and paren_depth == bracket_depth == brace_depth == 0:
+            separators.append(index)
+    if len(separators) != 1:
+        return []
+
+    callback_start = separators[0] + 1
+    body = masked[callback_start:closing]
     lambda_pattern = re.compile(
-        r"\[[^\]]*\]\s*\(\s*(?:const\s+)?GpuReadLease\s*"
-        r"(?:(?:const|volatile)\s+)*[*&]*\s*([A-Za-z_]\w*)[^)]*\)"
-        r"\s*(?:mutable\s*)?(?:noexcept\s*)?(?:->[^{}]+)?\{")
+        r"^\s*\[[^\]]*\]\s*\(\s*const\s+GpuReadLease\s*&\s*"
+        r"([A-Za-z_]\w*)\s*\)\s*(?:mutable\s*)?(?:noexcept\s*)?"
+        r"(?:->[^{}]+)?\{")
     bindings: list[HandleBinding] = []
-    for match in lambda_pattern.finditer(body):
-        body_opening = opening + 1 + match.end() - 1
-        block = next((pair for pair in pairs if pair[0] == body_opening), None)
-        if block is None or block[1] > closing:
-            continue
-        bindings.append(HandleBinding(match.group(1), opening + 1 + match.start(1), block,
-                                      None, None))
+    match = lambda_pattern.search(body)
+    if match is None:
+        return bindings
+    body_opening = callback_start + match.end() - 1
+    block = next((pair for pair in pairs if pair[0] == body_opening), None)
+    if block is None or block[1] > closing or masked[block[1] + 1:closing].strip():
+        return bindings
+    bindings.append(HandleBinding(match.group(1), callback_start + match.start(1), block,
+                                  None, None))
     return bindings
 
 
 def resolve_handle_binding(bindings: list[HandleBinding], masked: str,
+                           pairs: list[tuple[int, int]],
                            call: re.Match[str]) -> HandleBinding | None:
-    receiver = receiver_expression(masked, call.start())
+    receiver = receiver_expression(masked, call.start()).strip()
+    call_block = immediate_block(pairs, call.start())
     candidates = [
         binding for binding in bindings
         if binding.position <= call.start() < binding.block[1]
         and binding.block[0] < call.start()
-        and re.search(rf"\b{re.escape(binding.name)}\b", receiver)
+        and receiver == binding.name
+        and call_block == binding.block
     ]
     if not candidates:
         return None
@@ -338,17 +455,86 @@ def resolve_handle_binding(bindings: list[HandleBinding], masked: str,
                key=lambda binding: (binding.block[1] - binding.block[0], -binding.position))
 
 
+def token_is_declarator_name(tokens: list[CppToken], index: int) -> bool:
+    """Conservatively recognize a local/parameter declarator at tokens[index]."""
+    if index == 0 or index + 1 >= len(tokens):
+        return False
+    following = tokens[index + 1].value
+    if following not in {";", "=", "(", "{", "[", ",", ":"}:
+        return False
+    previous = tokens[index - 1].value
+    if previous in {".", "->", "::", "(", "[", "=", ",", "?", ":"}:
+        return False
+
+    boundary = index - 1
+    paren_depth = bracket_depth = 0
+    while boundary >= 0:
+        value = tokens[boundary].value
+        if value == ")":
+            paren_depth += 1
+        elif value == "(":
+            if paren_depth:
+                paren_depth -= 1
+            elif boundary > 0 and tokens[boundary - 1].value not in {"decltype", "sizeof"}:
+                break
+        elif value == "]":
+            bracket_depth += 1
+        elif value == "[":
+            if bracket_depth:
+                bracket_depth -= 1
+            else:
+                break
+        elif paren_depth == bracket_depth == 0 and value in {";", "{", "}"}:
+            break
+        boundary -= 1
+    prefix = [token.value for token in tokens[boundary + 1:index]]
+    if not prefix:
+        return False
+    if prefix[0] in {
+            "break", "case", "continue", "delete", "else", "goto", "if", "new",
+            "return", "switch", "throw", "while"}:
+        return False
+    if any(value in {".", "->", "?", "||", "&&", "+", "-", "/", "%"}
+           for value in prefix):
+        return False
+    if previous == ")" and "decltype" not in prefix:
+        return False
+    return (previous in {"*", "&", "&&", ">", ")"}
+            or bool(re.fullmatch(r"[A-Za-z_]\w*", previous)))
+
+
+def lambda_init_capture_shadows(masked: str, pairs: list[tuple[int, int]], name: str,
+                                call_position: int) -> bool:
+    for opening, closing in pairs:
+        if not (opening < call_position < closing):
+            continue
+        capture_close = masked.rfind("]", 0, opening)
+        capture_open = masked.rfind("[", 0, capture_close) if capture_close >= 0 else -1
+        if capture_open < 0 or capture_close < 0:
+            continue
+        suffix = masked[capture_close + 1:opening]
+        if not re.fullmatch(
+                r"\s*(?:\([^{};]*\)\s*)?(?:mutable\s*)?(?:noexcept\s*)?"
+                r"(?:->\s*[^{};]+)?", suffix):
+            continue
+        capture_tokens = cpp_tokens(masked, capture_open + 1, capture_close)
+        for index, token in enumerate(capture_tokens[:-1]):
+            if token.value == name and capture_tokens[index + 1].value == "=":
+                return True
+    return False
+
+
 def name_is_shadowed(name: str, declaration_start: int, declaration_end: int,
                      masked: str, pairs: list[tuple[int, int]], call_position: int) -> bool:
-    declaration_pattern = re.compile(
-        rf"\b(?:(?:const|volatile)\s+)*(?:auto|[A-Za-z_]\w*(?:::\w+)*"
-        rf"(?:\s*<[^;{{}}()]+>)?)(?:\s+(?:const|volatile))*\s*[*&]*\s+"
-        rf"(?P<name>{re.escape(name)})\s*(?=[=;,{{)])")
-    for declaration in declaration_pattern.finditer(masked, declaration_start, call_position):
-        name_position = declaration.start("name")
-        if declaration_start <= name_position <= declaration_end:
+    if lambda_init_capture_shadows(masked, pairs, name, call_position):
+        return True
+    tokens = cpp_tokens(masked, declaration_start, call_position)
+    for index, token in enumerate(tokens):
+        if token.value != name or declaration_start <= token.start <= declaration_end:
             continue
-        block = enclosing_block(pairs, name_position)
+        if not token_is_declarator_name(tokens, index):
+            continue
+        block = immediate_block(pairs, token.start)
         if block is not None and block[0] < call_position < block[1]:
             return True
     return False
@@ -385,26 +571,64 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             continue
         scope = resolve_scope(scope_bindings, masked, pairs, call)
         if scope is None:
+            if call.group(1) == "read":
+                receiver = receiver_expression(masked, call.start())
+                referenced = next((
+                    binding for binding in scope_bindings
+                    if binding.declaration.position < call.start() < binding.block[1]
+                    and re.search(rf"\b{re.escape(binding.declaration.name)}\b", receiver)
+                    and not name_is_shadowed(binding.declaration.name,
+                                             binding.declaration.position,
+                                             binding.declaration.end, masked, pairs,
+                                             call.start())
+                ), None)
+                if referenced is not None:
+                    claimed_reads.add(call.start())
+                    if path not in SYNC_READ_ALLOWLIST:
+                        findings.append(
+                            Finding(path, line_number(source, call.start()),
+                                    "GpuSyncReadScope::read()",
+                                    "public read() is not in the reviewed synchronous-adapter "
+                                    "allowlist")
+                        )
+                    findings.append(
+                        Finding(path, line_number(source, call.start()),
+                                f"{referenced.declaration.name}.read()",
+                                "read() requires an exact local scope/lease and standalone "
+                                "complete() in the same lexical body")
+                    )
             continue
         scope_key = scope.declaration.position
         if call.group(1) == "read":
             claimed_reads.add(call.start())
-            reads_by_scope.setdefault(scope_key, []).append(call)
-            lease = read_lease_name(masked, call.start())
-            block = enclosing_block(pairs, call.start())
-            if lease is not None and block is not None:
-                handle_bindings.append(HandleBinding(lease[0], lease[1], block, scope_key,
-                                                     call.start()))
             if path not in SYNC_READ_ALLOWLIST:
                 findings.append(
                     Finding(path, line_number(source, call.start()),
                             "GpuSyncReadScope::read()",
                             "public read() is not in the reviewed synchronous-adapter allowlist")
                 )
+            lease = canonical_read_lease(masked, pairs, call, scope.declaration.name)
+            call_block = immediate_block(pairs, call.start())
+            canonical = (canonical_scope_declaration(masked, pairs, scope)
+                         and call_block == scope.block and lease is not None)
+            if not canonical:
+                findings.append(
+                    Finding(path, line_number(source, call.start()),
+                            f"{scope.declaration.name}.read()",
+                            "read() requires an exact local scope/lease and standalone "
+                            "complete() in the same lexical body")
+                )
+                continue
+            reads_by_scope.setdefault(scope_key, []).append(call)
+            handle_bindings.append(HandleBinding(lease[0], lease[1], call_block, scope_key,
+                                                 call.start()))
         elif call.group(1) == "withRead":
-            handle_bindings.extend(callback_lease_bindings(masked, pairs, call))
+            if (canonical_scope_declaration(masked, pairs, scope)
+                    and immediate_block(pairs, call.start()) == scope.block):
+                handle_bindings.extend(callback_lease_bindings(masked, pairs, call))
         else:
-            completes_by_scope.setdefault(scope_key, []).append(call)
+            if canonical_scope_declaration(masked, pairs, scope):
+                completes_by_scope.setdefault(scope_key, []).append(call)
 
     # A temporary scope has no named binding to resolve, but its type still
     # identifies read() as the reviewed capability.
@@ -425,7 +649,7 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         )
 
     native_calls = [call for call in calls if call.group(1) == "nativeHandle"]
-    native_bindings = {call.start(): resolve_handle_binding(handle_bindings, masked, call)
+    native_bindings = {call.start(): resolve_handle_binding(handle_bindings, masked, pairs, call)
                        for call in native_calls}
     for call in native_calls:
         binding = native_bindings[call.start()]
@@ -434,6 +658,13 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
             native_bindings[call.start()] = None
     valid_read_scopes: set[int] = set()
     for scope_key, reads in reads_by_scope.items():
+        if len(reads) != 1:
+            first_read = min(reads, key=lambda call: call.start())
+            findings.append(
+                Finding(path, line_number(source, first_read.start()), "GpuSyncReadScope::read()",
+                        "the conservative direct-read form permits exactly one read()")
+            )
+            continue
         associated_uses = [
             call.start() for call in native_calls
             if (binding := native_bindings[call.start()]) is not None
@@ -441,15 +672,18 @@ def audit_capability_uses(path: PurePosixPath, source: str) -> list[Finding]:
         ]
         required_positions = [call.start() for call in reads] + associated_uses
         required_position = max(required_positions)
+        scope = next(binding for binding in scope_bindings
+                     if binding.declaration.position == scope_key)
         if any(call.start() > required_position
-               and completion_shares_execution_block(masked, pairs, required_positions,
-                                                     call.start())
+               and immediate_block(pairs, call.start()) == scope.block
+               and standalone_completion(masked, pairs, call, scope.declaration.name)
+               and not has_intervening_control_transfer(masked,
+                                                        min(item.start() for item in reads),
+                                                        call.start())
                for call in completes_by_scope.get(scope_key, [])):
             valid_read_scopes.add(scope_key)
             continue
         first_read = min(reads, key=lambda call: call.start())
-        scope = next(binding for binding in scope_bindings
-                     if binding.declaration.position == scope_key)
         findings.append(
             Finding(path, line_number(source, first_read.start()),
                     f"{scope.declaration.name}.read()",
@@ -647,11 +881,150 @@ def mutation_self_tests() -> None:
          "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
          "[&]() { scope.complete(); }(); }",
          "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ OtherScope scope(s); const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); scope.complete(); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ auto scope(makeOtherScope()); const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); scope.complete(); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ auto scope{makeOtherScope()}; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); scope.complete(); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ OtherScope scope[1]; const GpuReadLease lease = scope[0].read(s); "
+         "(void) lease.nativeHandle(); scope[0].complete(); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ decltype(makeOtherScope()) scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); scope.complete(); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "[scope = OtherScope{} , &s]() { const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); scope.complete(); }(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "[scope = OtherScope{}, &s]() { scope.withRead(s, [](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }); }(); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "[&s](OtherScope scope) { scope.withRead(s, [](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }); }(OtherScope{}); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "[&s](auto scope) { scope.withRead(s, [](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }); }(OtherScope{}); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ OtherScope other, scope; scope.withRead(s, [](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "{ auto [scope, ignored] = makeOtherScopes(); "
+         "scope.withRead(s, [](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool enabled, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; if (enabled) { scope.withRead(s, "
+         "[](const GpuReadLease& lease) { (void) lease.nativeHandle(); }); } }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(makeSurface([](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); }), [](const GpuReadLease&) {}); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "scope.withRead(s, wrap([](const GpuReadLease& lease) { "
+         "(void) lease.nativeHandle(); })); }",
+         "GpuSurface::nativeHandle()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool finish, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (finish) scope.complete(); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool finish, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); finish ? scope.complete() : void(); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool finish, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); finish && (scope.complete(), true); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool finish, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); finish || (scope.complete(), true); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool stop, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (stop) return; scope.complete(); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool stop, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (stop) throw Failure{}; scope.complete(); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool stop, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (stop) goto done; scope.complete(); done:; }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
+         "return scope.complete(); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& s) { GpuSyncReadScope scope; "
+         "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
+         "(scope.complete(), other()); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(const std::shared_ptr<GpuSurface>& a, "
+         "const std::shared_ptr<GpuSurface>& b) { GpuSyncReadScope scope; "
+         "const GpuReadLease first = scope.read(a); (void) first.nativeHandle(); "
+         "scope.complete(); const GpuReadLease second = scope.read(b); "
+         "(void) second.nativeHandle(); scope.complete(); }",
+         "exactly one read()"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "task bad(bool stop, const std::shared_ptr<GpuSurface>& s) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (stop) co_return; scope.complete(); }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool stop, const std::shared_ptr<GpuSurface>& s) { while (true) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (stop) break; scope.complete(); } }",
+         "complete() after read/use"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(bool stop, const std::shared_ptr<GpuSurface>& s) { while (true) { "
+         "GpuSyncReadScope scope; const GpuReadLease lease = scope.read(s); "
+         "(void) lease.nativeHandle(); if (stop) continue; scope.complete(); } }",
+         "complete() after read/use"),
     )
     for path, source, expected in cases:
         rendered = "\n".join(finding.render() for finding in audit_capability_uses(path, source))
         if expected not in rendered:
-            raise AssertionError(f"source-audit mutation survived ({expected}):\n{rendered}")
+            raise AssertionError(
+                f"source-audit mutation survived ({expected}):\nsource: {source}\n{rendered}")
 
     registry_public = "class GpuRetireRegistry final { public: void registerRetire(); };"
     registry_findings = audit_public_member(REGISTRY_HEADER, registry_public,
@@ -695,12 +1068,15 @@ def mutation_self_tests() -> None:
         "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
         "scope.complete(); } GpuSyncReadScope scope; "
         "const GpuReadLease lease = scope.read(s); (void) lease.nativeHandle(); "
-        "{ scope.complete(); } }"
+        "scope.complete(); } "
+        "void safeConditional(bool enabled, const std::shared_ptr<GpuSurface>& s) { "
+        "GpuSyncReadScope scope; if (enabled) scope.withRead(s, "
+        "[](const GpuReadLease& lease) { (void) lease.nativeHandle(); }); }"
     )
     safe_control_findings = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"), safe_control_flow)
     if safe_control_findings:
-        raise AssertionError("same-flow nested block pass control was rejected:\n" +
+        raise AssertionError("conservative read/withRead pass control was rejected:\n" +
                              "\n".join(finding.render() for finding in safe_control_findings))
 
     safe_syntax = r'''
