@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
+import ctypes
 from dataclasses import dataclass
 import json
 import os
@@ -454,6 +456,7 @@ def preprocessor_capability_findings(path: PurePosixPath,
 class MacroDefinition:
     function_like: bool
     replacement: tuple[str, ...]
+    parameters: tuple[str, ...] = ()
 
 
 def source_macro_events(masked: str) \
@@ -474,20 +477,27 @@ def source_macro_events(masked: str) \
                 tail = define.group(2).rstrip("\r\n")
                 function_like = tail.startswith("(")
                 replacement = tail
+                parameters: tuple[str, ...] = ()
                 if function_like:
                     closing = matching_delimiter(tail, 0, "(", ")")
+                    if closing is not None:
+                        parameters = tuple(
+                            parameter.strip()
+                            for parameter in tail[1:closing].split(",")
+                            if parameter.strip())
                     replacement = tail[closing + 1:] if closing is not None else ""
                 events.append((
                     offset + len(line), define.group(1),
                     MacroDefinition(function_like, tuple(
-                        token.value for token in cpp_tokens(replacement)))))
+                        token.value for token in cpp_tokens(replacement)), parameters)))
         offset += len(line)
     return events, directives
 
 
 def guarded_macro_composition_findings(
         path: PurePosixPath, translated: TranslationText,
-        compiler_macros: frozenset[str] = frozenset()) -> list[Finding]:
+        compiler_macros: Mapping[str, MacroDefinition] | frozenset[str] = frozenset()
+        ) -> list[Finding]:
     """Reject source-visible macro calls whose identifier pieces form guarded names."""
     guarded = {
         "GpuSyncReadScope", "_longjmp", "complete", "longjmp", "nativeHandle", "read",
@@ -498,7 +508,8 @@ def guarded_macro_composition_findings(
     guarded.update(REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset()))
     tokens = cpp_tokens(translated.masked)
     macro_events, directive_ranges = source_macro_events(translated.masked)
-    macros: dict[str, MacroDefinition] = {}
+    macros: dict[str, MacroDefinition] = (
+        dict(compiler_macros) if isinstance(compiler_macros, Mapping) else {})
     event_index = 0
     findings: list[Finding] = []
 
@@ -533,22 +544,59 @@ def guarded_macro_composition_findings(
             return None
         return expanded_identifier(replacement, seen | {name})
 
-    def active_paste_macro(name: str) -> bool:
+    def expansion_identifier(values: list[str], seen: frozenset[str]) -> str | None:
+        while "##" in values:
+            paste = values.index("##")
+            if (paste == 0 or paste + 1 >= len(values)
+                    or re.fullmatch(r"[A-Za-z_]\w*", values[paste - 1]) is None
+                    or re.fullmatch(r"[A-Za-z_]\w*", values[paste + 1]) is None):
+                return None
+            left = expanded_identifier(values[paste - 1]) or values[paste - 1]
+            right = expanded_identifier(values[paste + 1]) or values[paste + 1]
+            values[paste - 1:paste + 2] = [left + right]
+        if len(values) == 1 and re.fullmatch(r"[A-Za-z_]\w*", values[0]):
+            return expanded_identifier(values[0])
+        if (len(values) >= 3 and re.fullmatch(r"[A-Za-z_]\w*", values[0])
+                and values[1] == "(" and values[-1] == ")"):
+            depth = 1
+            argument_start = 2
+            argument_values: list[list[str]] = []
+            for index in range(2, len(values) - 1):
+                if values[index] == "(":
+                    depth += 1
+                elif values[index] == ")":
+                    depth -= 1
+                elif values[index] == "," and depth == 1:
+                    argument_values.append(values[argument_start:index])
+                    argument_start = index + 1
+            argument_values.append(values[argument_start:-1])
+            pieces = [expansion_identifier(list(argument), seen)
+                      for argument in argument_values]
+            if any(piece is None for piece in pieces):
+                return None
+            return macro_call_identifier(
+                values[0], [piece for piece in pieces if piece is not None], seen)
+        return None
+
+    def macro_call_identifier(name: str, pieces: list[str],
+                              seen: frozenset[str] = frozenset()) -> str | None:
         resolved = expanded_identifier(name)
-        if resolved is None:
-            return False
+        if resolved is None or resolved in seen:
+            return None
         definition = macros.get(resolved)
-        return (resolved in compiler_macros
-                or (definition is not None and definition.function_like
-                    and "##" in definition.replacement))
+        if (definition is None or not definition.function_like
+                or len(definition.parameters) != len(pieces)):
+            return None
+        arguments = dict(zip(definition.parameters, pieces, strict=True))
+        replacement = [arguments.get(value, value) for value in definition.replacement]
+        return expansion_identifier(replacement, seen | {resolved})
 
     def composed_value(start: int, end: int) -> str | None:
         start, end = strip_transparent_parentheses(tokens, start, end)
         if end - start == 1 and re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value):
             return expanded_identifier(tokens[start].value)
-        if (end - start < 5 or not re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value)
-                or tokens[start + 1].value != "("
-                or not active_paste_macro(tokens[start].value)):
+        if (end - start < 3 or not re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value)
+                or tokens[start + 1].value != "("):
             return None
         parsed = call_arguments(start + 1, end)
         if parsed is None or parsed[1] != end - 1 or len(parsed[0]) < 2:
@@ -557,7 +605,8 @@ def guarded_macro_composition_findings(
                   for part_start, part_end in parsed[0]]
         if any(piece is None for piece in pieces):
             return None
-        return "".join(piece for piece in pieces if piece is not None)
+        return macro_call_identifier(
+            tokens[start].value, [piece for piece in pieces if piece is not None])
 
     for index, token in enumerate(tokens[:-1]):
         while (event_index < len(macro_events)
@@ -570,8 +619,7 @@ def guarded_macro_composition_findings(
             event_index += 1
         if (not re.fullmatch(r"[A-Za-z_]\w*", token.value)
                 or tokens[index + 1].value != "("
-                or any(start <= token.start < end for start, end in directive_ranges)
-                or not active_paste_macro(token.value)):
+                or any(start <= token.start < end for start, end in directive_ranges)):
             continue
         parsed = call_arguments(index + 1, len(tokens))
         if parsed is None or len(parsed[0]) < 2:
@@ -579,7 +627,9 @@ def guarded_macro_composition_findings(
         pieces = [composed_value(start, end) for start, end in parsed[0]]
         if any(piece is None for piece in pieces):
             continue
-        if "".join(piece for piece in pieces if piece is not None) not in guarded:
+        composed = macro_call_identifier(
+            token.value, [piece for piece in pieces if piece is not None])
+        if composed not in guarded:
             continue
         findings.append(Finding(
             path, translated.line_at(token.start), "guarded identifier macro composition",
@@ -1241,7 +1291,8 @@ def receiver_binding_name(masked: str, call_position: int) -> str | None:
 
     The resolver deliberately models only value-preserving receiver forms used
     by the capability audit: redundant parentheses, the comma operator's final
-    operand, pointer/reference dereference, named casts, and ``std::as_const``.
+    operand, pointer/reference dereference, named casts, ``std::as_const``,
+    ``std::move``/``std::forward``, and ``std::ref(...).get()``.
     Unknown calls and operators remain unresolved rather than being guessed
     from identifiers appearing anywhere in the expression.
     """
@@ -1272,11 +1323,25 @@ def receiver_binding_name(masked: str, call_position: int) -> str | None:
             if (angle_close is not None and angle_close + 1 < end
                     and tokens[angle_close + 1].value == "("):
                 return resolve(angle_close + 1, end)
+        if (end - start >= 5 and [token.value for token in tokens[end - 4:end]]
+                == [".", "get", "(", ")"]):
+            return resolve(start, end - 4)
         opening = next((index for index in range(start, end)
                         if tokens[index].value == "("), None)
-        if (opening is not None and tokens[end - 1].value == ")"
-                and tokens[opening - 1].value == "as_const"):
-            return resolve(opening + 1, end - 1)
+        if opening is not None and tokens[end - 1].value == ")":
+            function_index = opening - 1
+            if function_index >= start and tokens[function_index].value == ">":
+                depth = 1
+                function_index -= 1
+                while function_index >= start and depth:
+                    if tokens[function_index].value == ">":
+                        depth += 1
+                    elif tokens[function_index].value == "<":
+                        depth -= 1
+                    function_index -= 1
+            if (function_index >= start and tokens[function_index].value in {
+                    "as_const", "cref", "forward", "move", "ref"}):
+                return resolve(opening + 1, end - 1)
         if (end - start == 1
                 and re.fullmatch(r"[A-Za-z_]\w*", tokens[start].value)):
             return tokens[start].value
@@ -1743,7 +1808,8 @@ def lease_binding_stays_local(masked: str, pairs: list[tuple[int, int]],
 
 
 def audit_capability_uses(path: PurePosixPath, source: str,
-                          compiler_macros: frozenset[str] = frozenset()) -> list[Finding]:
+                          compiler_macros: Mapping[str, MacroDefinition] | frozenset[str]
+                          = frozenset()) -> list[Finding]:
     translated = translate_source(source)
     masked = translated.masked
     pairs = brace_pairs(masked)
@@ -1773,18 +1839,24 @@ def audit_capability_uses(path: PurePosixPath, source: str,
             continue
         scope = resolve_scope(scope_bindings, masked, pairs, call)
         if scope is None:
-            if call.group(1) == "read":
-                receiver_name = receiver_binding_name(masked, call.start())
-                referenced = next((
-                    binding for binding in scope_bindings
-                    if binding.declaration.position < call.start() < binding.block[1]
-                    and receiver_name == binding.declaration.name
-                    and not name_is_shadowed(binding.declaration.name,
-                                             binding.declaration.position,
-                                             binding.declaration.end, masked, pairs,
-                                             call.start())
-                ), None)
-                if referenced is not None:
+            receiver_name = receiver_binding_name(masked, call.start())
+            receiver_names = {
+                token.value for token in cpp_tokens(receiver_expression(masked, call.start()))
+                if re.fullmatch(r"[A-Za-z_]\w*", token.value)
+            }
+            referenced = [
+                binding for binding in scope_bindings
+                if binding.declaration.position < call.start() < binding.block[1]
+                and (receiver_name == binding.declaration.name
+                     or (receiver_name is None
+                         and binding.declaration.name in receiver_names))
+                and not name_is_shadowed(binding.declaration.name,
+                                         binding.declaration.position,
+                                         binding.declaration.end, masked, pairs,
+                                         call.start())
+            ]
+            if referenced:
+                if call.group(1) == "read":
                     claimed_reads.add(call.start())
                     if path not in SYNC_READ_ALLOWLIST:
                         findings.append(
@@ -1793,12 +1865,17 @@ def audit_capability_uses(path: PurePosixPath, source: str,
                                     "public read() is not in the reviewed synchronous-adapter "
                                     "allowlist")
                         )
-                    findings.append(
-                        Finding(path, translated.line_at(call.start()),
-                                f"{referenced.declaration.name}.read()",
-                                "read() requires an exact local scope/lease and standalone "
-                                "complete() in the same lexical body")
-                    )
+                    for binding in referenced:
+                        findings.append(
+                            Finding(path, translated.line_at(call.start()),
+                                    f"{binding.declaration.name}.read()",
+                                    "read() requires an exact local scope/lease and standalone "
+                                    "complete() in the same lexical body"))
+                else:
+                    findings.append(Finding(
+                        path, translated.line_at(call.start()),
+                        f"unresolved {call.group(1)}() receiver",
+                        "unresolved capability receiver references an active GPU binding"))
             continue
         scope_key = scope.declaration.position
         if call.group(1) == "read":
@@ -2040,7 +2117,7 @@ def audit_public_member(path: PurePosixPath, source: str, class_name: str,
 
 
 def audit_sources(sources: dict[PurePosixPath, str],
-                  compiler_macros: dict[PurePosixPath, frozenset[str]] | None = None) \
+                  compiler_macros: dict[PurePosixPath, dict[str, MacroDefinition]] | None = None) \
         -> list[Finding]:
     findings: list[Finding] = []
     for path, source in sources.items():
@@ -2064,7 +2141,8 @@ def audit_sources(sources: dict[PurePosixPath, str],
 
 
 def compiler_macro_findings(path: PurePosixPath, source: str,
-                            macro_names: frozenset[str]) -> list[Finding]:
+                            macro_names: Mapping[str, MacroDefinition] | frozenset[str]
+                            ) -> list[Finding]:
     reviewed: dict[str, str] = {}
     reviewed.update({name: "approved native-handle consumer"
                      for name in REVIEWED_NATIVE_HANDLE_SINKS.get(path, frozenset())})
@@ -2105,25 +2183,69 @@ def compile_entry_arguments(entry: dict[str, object]) -> list[str]:
     command = entry.get("command")
     if not isinstance(command, str):
         raise RuntimeError("compile command has neither arguments nor command")
-    parsed = shlex.split(command, posix=os.name != "nt")
-    if os.name == "nt":
-        parsed = [argument[1:-1] if (len(argument) >= 2
-                                    and argument[0] == argument[-1] == '"')
-                  else argument for argument in parsed]
-    return parsed
+    if os.name != "nt":
+        return shlex.split(command, posix=True)
+    argc = ctypes.c_int()
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    argv = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    if not argv:
+        raise OSError(ctypes.get_last_error(), "CommandLineToArgvW failed")
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        kernel32.LocalFree(argv)
+
+
+def compiler_index_after_launchers(arguments: list[str]) -> int:
+    """Locate the compiler while rejecting ambiguous launcher option syntax."""
+    launchers = {"ccache", "distcc", "icecc", "sccache"}
+    ccache_value_options = {
+        "--compiler", "--compiler-check", "--compiler-type", "--config-path", "--dir",
+        "--namespace", "--set-config", "--trim-dir", "-o",
+    }
+    ccache_flag_options = {"--ccache-skip"}
+    index = 0
+    while index < len(arguments) - 1:
+        launcher = Path(arguments[index]).name.lower().removesuffix(".exe")
+        if launcher not in launchers:
+            break
+        index += 1
+        if launcher != "ccache":
+            continue
+        while index < len(arguments):
+            option = arguments[index]
+            if option == "--":
+                index += 1
+                break
+            option_name = option.partition("=")[0]
+            if option_name in ccache_value_options:
+                if "=" in option:
+                    index += 1
+                else:
+                    if index + 1 >= len(arguments):
+                        raise RuntimeError(f"ccache option requires a value: {option}")
+                    index += 2
+                continue
+            if option in ccache_flag_options:
+                index += 1
+                continue
+            if option.startswith("-"):
+                raise RuntimeError(f"unsupported ccache launcher option: {option}")
+            break
+    if index >= len(arguments):
+        raise RuntimeError("compile command has launchers but no compiler")
+    return index
 
 
 def compiler_probe_command(arguments: list[str]) -> list[str]:
     if not arguments:
         raise RuntimeError("compile command has no executable")
-    launchers = {"ccache", "distcc", "icecc", "sccache"}
-    compiler_index = 0
-    while compiler_index < len(arguments) - 1:
-        executable = Path(arguments[compiler_index]).name.lower()
-        executable = executable.removesuffix(".exe")
-        if executable not in launchers:
-            break
-        compiler_index += 1
+    compiler_index = compiler_index_after_launchers(arguments)
 
     compiler = Path(arguments[compiler_index]).name.lower().removesuffix(".exe")
     probe_flags = ["/nologo", "/EP", "/d1PP"] if compiler == "cl" else ["-dM", "-E"]
@@ -2132,6 +2254,10 @@ def compiler_probe_command(arguments: list[str]) -> list[str]:
     while index < len(arguments):
         value = arguments[index]
         lowered = value.lower()
+        if index < compiler_index:
+            filtered.append(value)
+            index += 1
+            continue
         if value in {"-c", "-MD", "-MMD"} or lowered == "/c":
             index += 1
             continue
@@ -2146,6 +2272,20 @@ def compiler_probe_command(arguments: list[str]) -> list[str]:
         index += 1
     insertion = compiler_index + 1
     return [*filtered[:insertion], *probe_flags, *filtered[insertion:]]
+
+
+COMPILER_MACRO_SENTINELS = frozenset({"__cplusplus", "__GNUC__", "__clang__", "_MSC_VER"})
+
+
+def compiler_macro_definitions(output: str) -> dict[str, MacroDefinition]:
+    events, _directives = source_macro_events(output)
+    definitions: dict[str, MacroDefinition] = {}
+    for _position, name, definition in events:
+        if definition is None:
+            definitions.pop(name, None)
+        else:
+            definitions[name] = definition
+    return definitions
 
 
 def source_requires_compile_entry(path: PurePosixPath, all_entry_paths: set[PurePosixPath]) -> bool:
@@ -2166,7 +2306,7 @@ def source_requires_compile_entry(path: PurePosixPath, all_entry_paths: set[Pure
 
 def load_compiler_macro_tables(root: Path, compile_commands: Path | None,
                                sources: dict[PurePosixPath, str]) \
-        -> dict[PurePosixPath, frozenset[str]]:
+        -> dict[PurePosixPath, dict[str, MacroDefinition]]:
     if compile_commands is None:
         return {}
     if not compile_commands.is_file():
@@ -2206,7 +2346,7 @@ def load_compiler_macro_tables(root: Path, compile_commands: Path | None,
             "compile database has no relevant entry for: "
             + ", ".join(str(path) for path in missing))
 
-    tables: dict[PurePosixPath, set[str]] = {}
+    tables: dict[PurePosixPath, dict[str, MacroDefinition]] = {}
     failures: list[str] = []
     for entry, path in resolved_entries:
         if path is None:
@@ -2226,14 +2366,21 @@ def load_compiler_macro_tables(root: Path, compile_commands: Path | None,
                 f"{path} ({completed.returncode}): "
                 + completed.stderr.strip()[-400:])
             continue
-        names = {
-            match.group(1) for match in re.finditer(
-                r"^\s*#\s*define\s+([A-Za-z_]\w*)", completed.stdout, re.MULTILINE)
-        }
-        tables.setdefault(path, set()).update(names)
+        definitions = compiler_macro_definitions(completed.stdout)
+        if not definitions or not COMPILER_MACRO_SENTINELS.intersection(definitions):
+            failures.append(f"{path}: compiler macro dump is empty or lacks a sentinel")
+            continue
+        table = tables.setdefault(path, {})
+        for name, definition in definitions.items():
+            previous = table.get(name)
+            if previous is not None and previous != definition:
+                failures.append(
+                    f"{path}: compiler macro {name} differs between configurations")
+                continue
+            table[name] = definition
     if failures:
         raise RuntimeError("compiler macro probe failed: " + "; ".join(failures))
-    return {path: frozenset(names) for path, names in tables.items()}
+    return tables
 
 
 def is_production_path(path: PurePosixPath) -> bool:
@@ -3010,6 +3157,29 @@ def mutation_self_tests() -> None:
          "non-local jump"),
         (PurePosixPath("playback/gpu/gpufence.h"),
          "void bad(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+         "std::move(scope).withRead(s, [](const GpuReadLease&) { longjmp(env, 1); }); }",
+         "non-local jump"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+         "std::forward<GpuSyncReadScope&>(scope).withRead(s, "
+         "[](const GpuReadLease&) { longjmp(env, 1); }); }",
+         "non-local jump"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+         "std::ref(scope).get().withRead(s, "
+         "[](const GpuReadLease&) { longjmp(env, 1); }); }",
+         "non-local jump"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+         "transform(scope).withRead(s, [](const GpuReadLease&) {}); }",
+         "unresolved capability receiver"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+         "std::mo" + chr(92) + "\nve(scope).withRead(s, "
+         "[](const GpuReadLease&) { longjmp(env, 1); }); }",
+         "non-local jump"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "void bad(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
          "(scope).withRead(s, [](const GpuReadLease&) { longjmp(env, 1); }); }",
          "non-local jump"),
         (PurePosixPath("playback/gpu/gpufence.h"),
@@ -3030,6 +3200,12 @@ def mutation_self_tests() -> None:
          "#define CAT(left, right) left ## right\n#define LEFT native\n"
          "#define RIGHT Handle\nvoid bad(const GpuReadLease& lease) { "
          "lease.CAT(LEFT, RIGHT)(); }",
+         "guarded identifier macro composition"),
+        (PurePosixPath("playback/gpu/gpufence.h"),
+         "#define PASTE(left, right) PASTE_I(left, right)\n"
+         "#define PASTE_I(left, right) left ## right\n"
+         "#define LEFT native\n#define RIGHT Handle\n"
+         "void bad(const GpuReadLease& lease) { lease.PASTE(LEFT, RIGHT)(); }",
          "guarded identifier macro composition"),
         (PurePosixPath("playback/gpu/gpufence.h"),
          "#define CAT(left, right) left ## right\n#define LEFT GpuSync\n"
@@ -3099,6 +3275,7 @@ def mutation_self_tests() -> None:
         fake_compiler.write_text(
             "import sys\n"
             "if '--fail' in sys.argv: raise SystemExit(9)\n"
+            "print('#define __cplusplus 202002L')\n"
             "if '-DCONFIG_A' in sys.argv: print('#define ID3D11Texture2D SpoofA')\n"
             "if '-DCONFIG_B' in sys.argv: print('#define GetDevice SpoofB')\n",
             encoding="utf-8")
@@ -3123,8 +3300,8 @@ def mutation_self_tests() -> None:
         ]), encoding="utf-8")
         loaded = load_compiler_macro_tables(
             fixture_root, compile_database, {compiler_spoof_path: compiler_spoof_source})
-        if loaded.get(compiler_spoof_path) != frozenset({
-                "ID3D11Texture2D", "GetDevice"}):
+        if set(loaded.get(compiler_spoof_path, {})) != {
+                "ID3D11Texture2D", "GetDevice", "__cplusplus"}:
             raise AssertionError(
                 "compiler loader did not resolve ccache, quoted paths, relative files, "
                 f"and duplicate configurations: {loaded}")
@@ -3142,6 +3319,21 @@ def mutation_self_tests() -> None:
             pass
         else:
             raise AssertionError("failed relevant compiler probe did not fail closed")
+
+        empty_compiler = fixture_root / "empty compiler.py"
+        empty_compiler.write_text("raise SystemExit(0)\n", encoding="utf-8")
+        empty_database = fixture_root / "empty_compile_commands.json"
+        empty_database.write_text(json.dumps([{
+            "directory": str(fixture_root), "file": relative_file,
+            "arguments": [str(launcher), str(empty_compiler), "-c", relative_file],
+        }]), encoding="utf-8")
+        try:
+            load_compiler_macro_tables(
+                fixture_root, empty_database, {compiler_spoof_path: compiler_spoof_source})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("empty successful compiler macro probe did not fail closed")
 
         missing_database = fixture_root / "missing_compile_commands.json"
         missing_database.write_text(json.dumps([{
@@ -3164,6 +3356,62 @@ def mutation_self_tests() -> None:
     if ordinary_join:
         raise AssertionError("ordinary identifier arguments were treated as macro paste:\n" +
                              "\n".join(finding.render() for finding in ordinary_join))
+
+    safe_join_macro = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "#define JOIN(a, b) consume(a, b)\n"
+        "void safe() { JOIN(native, Handle); }")
+    if safe_join_macro:
+        raise AssertionError("non-paste function macro was treated as paste:\n" +
+                             "\n".join(finding.render() for finding in safe_join_macro))
+
+    compiler_safe_join = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void safe() { JOIN(native, Handle); }",
+        {"JOIN": MacroDefinition(
+            True, ("consume", "(", "a", ",", "b", ")"), ("a", "b"))})
+    if compiler_safe_join:
+        raise AssertionError("compiler-reported non-paste macro was treated as paste:\n" +
+                             "\n".join(finding.render() for finding in compiler_safe_join))
+
+    compiler_wrapped_paste = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void bad(const GpuReadLease& lease) { lease.PASTE(LEFT, RIGHT)(); }",
+        {
+            "PASTE": MacroDefinition(
+                True, ("PASTE_I", "(", "left", ",", "right", ")"),
+                ("left", "right")),
+            "PASTE_I": MacroDefinition(
+                True, ("left", "##", "right"), ("left", "right")),
+            "LEFT": MacroDefinition(False, ("native",)),
+            "RIGHT": MacroDefinition(False, ("Handle",)),
+        })
+    if not any("guarded identifier macro composition" in finding.expression
+               for finding in compiler_wrapped_paste):
+        raise AssertionError("compiler-reported two-stage paste wrapper survived")
+
+    windows_command = (
+        '"C:\\Program Files\\ccache\\ccache.exe" --config-path "ccache config.conf" '
+        '"C:\\Program Files\\LLVM\\bin\\clang++.exe" '
+        '-I"C:\\SDK Path\\include" -c playback\\gpu\\file.cpp -o file.obj')
+    if os.name == "nt":
+        windows_arguments = compile_entry_arguments({"command": windows_command})
+        if windows_arguments != [
+                r"C:\Program Files\ccache\ccache.exe", "--config-path", "ccache config.conf",
+                r"C:\Program Files\LLVM\bin\clang++.exe", r"-IC:\SDK Path\include",
+                "-c", r"playback\gpu\file.cpp", "-o", "file.obj"]:
+            raise AssertionError(
+                f"Windows compile command was split incorrectly: {windows_arguments}")
+        windows_probe = compiler_probe_command(windows_arguments)
+        if windows_probe[3:6] != [
+                r"C:\Program Files\LLVM\bin\clang++.exe", "-dM", "-E"]:
+            raise AssertionError(
+                f"Windows parsing/launcher pipeline misplaced probe flags: {windows_probe}")
+    optioned_probe = compiler_probe_command([
+        "ccache", "--config-path", "ccache.conf", "g++", "-c", "file.cpp", "-o", "file.o"])
+    if optioned_probe != [
+            "ccache", "--config-path", "ccache.conf", "g++", "-dM", "-E", "file.cpp"]:
+        raise AssertionError(f"ccache options hid the compiler probe insertion: {optioned_probe}")
 
     mapped_splice = "// line 1\nlease.nat" + chr(92) + "\nive" + chr(92) + "\nHandle();\n"
     mapped_findings = phase_two_capability_findings(
@@ -3210,6 +3458,21 @@ def mutation_self_tests() -> None:
         raise AssertionError("ordinary exception pass control was rejected:\n" +
                              "\n".join(finding.render()
                                        for finding in safe_exception_findings))
+
+    preserving_receivers = (
+        "void safe(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+        "std::move(scope).withRead(s, [](const GpuReadLease&) {}); } "
+        "void forwarded(GpuSyncReadScope& scope, "
+        "const std::shared_ptr<GpuSurface>& s) { "
+        "std::forward<GpuSyncReadScope&>(scope).withRead(s, "
+        "[](const GpuReadLease&) {}); } "
+        "void referred(GpuSyncReadScope& scope, const std::shared_ptr<GpuSurface>& s) { "
+        "std::ref(scope).get().withRead(s, [](const GpuReadLease&) {}); }")
+    preserving_findings = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"), preserving_receivers)
+    if preserving_findings:
+        raise AssertionError("value-preserving receiver controls were rejected:\n" +
+                             "\n".join(finding.render() for finding in preserving_findings))
 
     safe_boolean = (
         "bool safe(const std::shared_ptr<GpuSurface>& s) { bool present = false; "
