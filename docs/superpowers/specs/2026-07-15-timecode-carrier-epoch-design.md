@@ -16,6 +16,11 @@ session identity. At each frame entry it may snapshot the current carrier token 
 token still has the captured session identity, so a callback from a replaced or disconnected
 session cannot stamp itself with the new epoch.
 
+Each `captureLoop` session iteration creates a fresh session identity before installing callbacks.
+Disconnect, URL replacement, and stop rotate/deactivate that identity immediately, so a late old
+callback cannot snapshot any later token before a reconnect. Only GPU fallback retains the current
+live session identity while rotating the carrier epoch.
+
 GPU fallback swaps the active token to a new epoch while retaining the live ingest-session identity.
 Subsequent CPU submissions therefore snapshot the new token when they enter StreamWorker's
 queued/latest state; in-flight GPU/native submissions retain their old immutable token and remain
@@ -46,12 +51,13 @@ carry an optional start-timecode candidate. `Muxer::writePacket` clones and capa
 packet first. Only after the packet is accepted does it record the first valid accepted candidate
 under `m_qMutex`, in the same critical section and order as the queue push.
 
-The writer snapshots the first accepted candidate under `m_qMutex`, releases that mutex, and only
-then publishes the candidate under `m_headerMutex`. It also calls `headerWriteDeferred` and
-`ensureHeaderWritten` only while `m_qMutex` is released. The producer never takes
-`m_headerMutex`. This preserves a single lock order and makes an accepted candidate visible before
-the writer can commit the deferred header. Explicit start metadata passed to `init` remains allowed
-to preexist and remains first-wins.
+The writer re-snapshots the first accepted candidate under `m_qMutex` on every header-grace pass,
+releases that mutex, and only then publishes the candidate under `m_headerMutex`. It also calls
+`headerWriteDeferred` and `ensureHeaderWritten` only while `m_qMutex` is released. The producer
+never takes `m_headerMutex`. This preserves a single lock order, makes an accepted candidate visible
+before the writer can commit the deferred header, and lets a later accepted candidate follow an
+earlier candidate-less packet during the grace window. Explicit start metadata passed to `init`
+remains allowed to preexist and remains first-wins.
 
 An earlier rejected packet never touches candidate state. Among accepted candidates, queue
 acceptance order wins. An earlier accepted packet without a candidate does not prevent a later
@@ -75,7 +81,8 @@ Tests must prove:
 - delayed MPEG-2 output binds to its input PTS despite a newer frame and is suppressed by a reset
   after packet/evidence matching;
 - old callbacks/queued/latest carriers are rejected across non-empty URL replacement, disconnect,
-  fallback, and stop, including restarted producer generations;
+  fallback, and stop, including a callback arriving after disconnect but before reconnect and
+  restarted producer generations;
 - a queued `frameTimecode` event is rejected when the worker epoch changes before receipt;
 - a production-shaped `GpuEncodePump` plus real `Muxer` maps delayed old PTS and suppresses in-flight
   output after reset/fallback;
