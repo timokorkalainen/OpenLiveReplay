@@ -272,7 +272,14 @@ add_test(NAME gpu_capability_source_audit
         --source-root "${CMAKE_SOURCE_DIR}"
         --compile-commands "${CMAKE_BINARY_DIR}/compile_commands.json")
 set_tests_properties(gpu_capability_source_audit PROPERTIES
-    LABELS "gpu-capability;ci" TIMEOUT 60)
+    LABELS "gpu-capability;ci" TIMEOUT 90)
+add_test(NAME gpu_capability_source_audit_perf
+    COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tests/gpu/gpu_capability_source_audit.py"
+        --source-root "${CMAKE_SOURCE_DIR}"
+        --performance-only)
+set_tests_properties(gpu_capability_source_audit_perf PROPERTIES
+    LABELS "gpu-capability;ci" RUN_SERIAL TRUE TIMEOUT 180)
 add_executable(gpu_lease_release_probe
     "${CMAKE_SOURCE_DIR}/tests/gpu/gpu_lease_release_probe.cpp")
 target_include_directories(gpu_lease_release_probe PRIVATE "${CMAKE_SOURCE_DIR}")
