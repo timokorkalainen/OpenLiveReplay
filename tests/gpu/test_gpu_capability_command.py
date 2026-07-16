@@ -1292,6 +1292,38 @@ class CommandRewriteTests(unittest.TestCase):
             ):
                 self.rewrite(CompilerFamily.CLANG_CL, arguments)
 
+    def test_clang_cl_mixed_forwarding_channels_share_ordered_operand_state(self):
+        controls = (
+            ("/clang:-Xpreprocessor", "/clang:-include",
+             "-Xpreprocessor", "-P", "file.cpp"),
+            ("/clang:-include", "-Xpreprocessor", "-P", "file.cpp"),
+            ("-Xpreprocessor", "-include", "/clang:-P", "file.cpp"),
+            ("-Xpreprocessor=-include", "/clang:-P", "file.cpp"),
+            ("/clang:-Wp,-include", "/clang:-P", "file.cpp"),
+            ("-Wp,-include", "/clang:-P", "file.cpp"),
+            ("/clang:-include", "-Wp,-P", "file.cpp"),
+        )
+        for arguments in controls:
+            with self.subTest(arguments=arguments):
+                rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+
+    def test_clang_cl_mixed_forwarding_rejects_controls_left_after_operand(self):
+        controls = (
+            (("/clang:-Xpreprocessor", "/clang:-include",
+              "-Xpreprocessor", "-P", "/clang:-P", "file.cpp"), "marker"),
+            (("/clang:-Wp,-include", "/clang:-P",
+              "-Xpreprocessor", "-P", "file.cpp"), "marker"),
+            (("/clang:-include", "-Wp,-P",
+              "/clang:-o", "/clang:hidden.i", "file.cpp"), "output"),
+            (("/clang:-P", "/clang:-Wp,-include", "file.cpp"), "marker"),
+        )
+        for arguments, category in controls:
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                AuditInfrastructureError, f"hidden.*{category}"
+            ):
+                self.rewrite(CompilerFamily.CLANG_CL, arguments)
+
     def test_clang_cl_deep_joined_forwarding_is_iterative(self):
         payload = "-Xpreprocessor=" * 1_100 + "-DKEEP=1"
         arguments = (f"/clang:{payload}", "file.cpp")

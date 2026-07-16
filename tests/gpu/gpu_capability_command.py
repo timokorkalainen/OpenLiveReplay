@@ -17,7 +17,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Iterable, Iterator, Mapping
 
 from gpu_capability_model import (
     AuditInfrastructureError,
@@ -1114,62 +1114,109 @@ def _gnu_forwarded_control(payload: str) -> str | None:
     return None
 
 
-def _gnu_forwarded_sequence_control(payloads: tuple[str, ...]) -> str | None:
-    pending_sequences = [payloads]
-    while pending_sequences:
-        sequence = pending_sequences.pop()
-        index = 0
-        while index < len(sequence):
-            payload = sequence[index]
-            nested_forwarder = next(
-                (
-                    candidate for candidate in _GNU_FORWARDERS
-                    if payload == candidate or payload.startswith(f"{candidate}=")
-                ),
-                None,
-            )
-            if nested_forwarder is not None:
-                nested_payloads: list[str] = []
-                while index < len(sequence):
-                    current = sequence[index]
-                    if not (
-                        current == nested_forwarder
-                        or current.startswith(f"{nested_forwarder}=")
-                    ):
-                        break
-                    if current == nested_forwarder:
-                        if index + 1 >= len(sequence):
-                            raise AuditInfrastructureError(
-                                f"forwarded compiler option requires a value: {current}"
-                            )
-                        nested_payloads.append(sequence[index + 1])
-                        index += 2
-                    else:
-                        nested = current.partition("=")[2]
-                        if not nested:
-                            raise AuditInfrastructureError(
-                                f"forwarded compiler option requires a value: {current}"
-                            )
-                        nested_payloads.append(nested)
-                        index += 1
-                pending_sequences.append(tuple(nested_payloads))
-                continue
-            if payload.casefold().startswith("-wp,"):
-                pending_sequences.append(tuple(payload[4:].split(",")))
-                index += 1
-                continue
-            if payload in _GNU_FORWARDED_VALUE_OPTIONS:
-                if index + 1 >= len(sequence):
+def _gnu_flattened_forwarded_arguments(
+    payloads: Iterable[str],
+) -> Iterator[str]:
+    """Flatten forwarding grammar without changing its left-to-right order."""
+
+    sources = [iter(payloads)]
+
+    def next_argument() -> str:
+        while sources:
+            try:
+                return next(sources[-1])
+            except StopIteration:
+                sources.pop()
+        raise StopIteration
+
+    while sources:
+        try:
+            payload = next_argument()
+        except StopIteration:
+            break
+        nested_forwarder = next(
+            (
+                candidate for candidate in _GNU_FORWARDERS
+                if payload == candidate or payload.startswith(f"{candidate}=")
+            ),
+            None,
+        )
+        if nested_forwarder is not None:
+            if payload == nested_forwarder:
+                try:
+                    nested = next_argument()
+                except StopIteration as error:
+                    raise AuditInfrastructureError(
+                        f"forwarded compiler option requires a value: {payload}"
+                    ) from error
+            else:
+                nested = payload.partition("=")[2]
+                if not nested:
                     raise AuditInfrastructureError(
                         f"forwarded compiler option requires a value: {payload}"
                     )
-                index += 2
-                continue
-            category = _gnu_forwarded_control(payload)
-            if category:
-                return category
-            index += 1
+            sources.append(iter((nested,)))
+            continue
+        if payload.casefold().startswith("-wp,"):
+            sources.append(iter(payload[4:].split(",")))
+            continue
+        yield payload
+
+
+def _gnu_forwarded_sequence_control(payloads: Iterable[str]) -> str | None:
+    pending_value: str | None = None
+    for payload in _gnu_flattened_forwarded_arguments(payloads):
+        if pending_value is not None:
+            pending_value = None
+            continue
+        if payload in _GNU_FORWARDED_VALUE_OPTIONS:
+            pending_value = payload
+            continue
+        category = _gnu_forwarded_control(payload)
+        if category:
+            return category
+    if pending_value is not None:
+        raise AuditInfrastructureError(
+            f"forwarded compiler option requires a value: {pending_value}"
+        )
     return None
+
+
+def _clang_cl_forwarded_arguments(arguments: tuple[str, ...]) -> Iterator[str]:
+    """Yield every clang-cl forwarding channel as one ordered argument stream."""
+
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        option = _msvc_option(value)
+        if option.startswith("/clang:"):
+            payload = value[len(value.partition(":")[0]) + 1 :]
+            if not payload:
+                raise AuditInfrastructureError(
+                    f"compiler option requires a value: {value}"
+                )
+            yield payload
+            index += 1
+            continue
+        if value.casefold().startswith("-wp,"):
+            yield value
+            index += 1
+            continue
+        forwarder = next(
+            (
+                candidate for candidate in _GNU_FORWARDERS
+                if value == candidate or value.startswith(f"{candidate}=")
+            ),
+            None,
+        )
+        if forwarder is not None:
+            current = _gnu_forwarded_argument(arguments, index, forwarder)
+            assert current is not None
+            _, end = current
+            yield from arguments[index:end]
+            index = end
+            continue
+        index += 1
 
 
 def _gnu_forwarded_argument(
@@ -1329,19 +1376,10 @@ def _rewrite_msvc(
 ) -> RewrittenCommand:
     rewritten: list[str] = [str(configuration.compiler)]
     arguments = configuration.arguments
-    clang_payloads: list[str] = []
     if configuration.family is CompilerFamily.CLANG_CL:
-        for value in arguments:
-            option = _msvc_option(value)
-            if not option.startswith("/clang:"):
-                continue
-            payload = value[len(value.partition(":")[0]) + 1 :]
-            if not payload:
-                raise AuditInfrastructureError(
-                    f"compiler option requires a value: {value}"
-                )
-            clang_payloads.append(payload)
-        category = _gnu_forwarded_sequence_control(tuple(clang_payloads))
+        category = _gnu_forwarded_sequence_control(
+            _clang_cl_forwarded_arguments(arguments)
+        )
         if category:
             raise AuditInfrastructureError(
                 f"hidden {category} option is unsupported: /clang:"
@@ -1373,6 +1411,13 @@ def _rewrite_msvc(
             None,
         )
         if forwarder is not None:
+            if configuration.family is CompilerFamily.CLANG_CL:
+                current = _gnu_forwarded_argument(arguments, index, forwarder)
+                assert current is not None
+                _, end = current
+                rewritten.extend(arguments[index:end])
+                index = end
+                continue
             end, category = _gnu_forwarded_span(arguments, index, forwarder)
             if category:
                 raise AuditInfrastructureError(
