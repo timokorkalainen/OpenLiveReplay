@@ -13,7 +13,7 @@ The cache is launcher-only. It does not change production application code,
 packaging, runtime hot paths, test registration, or the requirement to launch
 Windows tests through `tools/run_ctest.py`.
 
-## Security invariants
+## Runtime isolation invariants
 
 Every cache use must satisfy all of these invariants before a child process can
 start:
@@ -41,7 +41,7 @@ start:
    Source `qt.conf` files are never copied. The generated file points only to
    the selected protected plugin and QML cache objects.
 
-The threat boundary is the existing launcher boundary: ordinary same-user
+The mutation boundary is the existing launcher boundary: ordinary same-user
 filesystem mutation and concurrent launcher processes must not change audited
 loader resolution between verification and process completion. An account
 owner can ultimately take ownership and replace ACLs; the launcher detects that
