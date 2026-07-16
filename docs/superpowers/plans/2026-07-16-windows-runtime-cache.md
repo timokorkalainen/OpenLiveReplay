@@ -53,8 +53,9 @@
   - `QtConfPaths(plugins: Path, qml_imports: Path)`
   - `CacheLimits(max_bytes: int = 8 << 30, max_objects: int = 256, max_unused_seconds: int = 14 * 86400, staging_seconds: int = 3600, stamp_seconds: int = 3600, cleanup_seconds: int = 86400)`
   - `CacheStats(logical_files: int = 0, logical_bytes: int = 0, hits: int = 0, misses: int = 0, payload_files: int = 0, payload_bytes: int = 0)`
+  - `LayoutEntries = Sequence[Tuple[Path, LayoutEntry]]`
   - `canonical_json(value: JsonValue) -> bytes`
-  - `layout_key(name: str, entries: Mapping[Path, HeldSource | bytes | GeneratedLayoutEntry], context: Mapping[str, JsonValue], dependency_keys: Sequence[str]) -> tuple[str, dict[str, object]]`
+  - `layout_key(name: str, entries: LayoutEntries, context: Mapping[str, JsonValue], dependency_keys: Sequence[str]) -> tuple[str, dict[str, object]]`
 
 - [ ] **Step 1: Write failing deterministic-key tests**
 
@@ -75,14 +76,14 @@ def held(name: str, payload: bytes, *, inode: int = 1) -> HeldSource:
 
 class CacheKeyTests(unittest.TestCase):
     def test_layout_key_is_order_independent_and_binds_every_identity_field(self) -> None:
-        first = {Path("bin/tool.exe"): held("tool.exe", b"tool"), Path("literal"): b"x"}
-        second = dict(reversed(tuple(first.items())))
+        first = ((Path("bin/tool.exe"), held("tool.exe", b"tool")), (Path("literal"), b"x"))
+        second = tuple(reversed(first))
         key, manifest = layout_key("tool", first, {"purpose": "ctest"}, ("a" * 64,))
         self.assertEqual(layout_key("tool", second, {"purpose": "ctest"}, ("a" * 64,))[0], key)
         self.assertEqual(manifest["schema"], "olr-windows-runtime-cache-v2")
         variants = (
-            {Path("bin/tool.exe"): held("tool.exe", b"tool", inode=2), Path("literal"): b"x"},
-            {Path("bin/tool.exe"): held("tool.exe", b"changed"), Path("literal"): b"x"},
+            ((Path("bin/tool.exe"), held("tool.exe", b"tool", inode=2)), (Path("literal"), b"x")),
+            ((Path("bin/tool.exe"), held("tool.exe", b"changed")), (Path("literal"), b"x")),
         )
         self.assertTrue(all(layout_key("tool", value, {"purpose": "ctest"}, ("a" * 64,))[0] != key for value in variants))
         self.assertNotEqual(layout_key("tool", first, {"purpose": "app"}, ("a" * 64,))[0], key)
@@ -90,11 +91,11 @@ class CacheKeyTests(unittest.TestCase):
 
     def test_layout_key_rejects_unsafe_and_case_colliding_destinations(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "unsafe destination"):
-            layout_key("tool", {Path("../tool.exe"): held("tool.exe", b"x")}, {}, ())
+            layout_key("tool", ((Path("../tool.exe"), held("tool.exe", b"x")),), {}, ())
         with self.assertRaisesRegex(RuntimeError, "duplicate destination"):
             layout_key(
                 "tool",
-                {Path("Bin/tool.exe"): held("one", b"1"), Path("bin/TOOL.exe"): held("two", b"2")},
+                ((Path("Bin/tool.exe"), held("one", b"1")), (Path("bin/TOOL.exe"), held("two", b"2"))),
                 {},
                 (),
             )
@@ -102,14 +103,15 @@ class CacheKeyTests(unittest.TestCase):
     def test_generated_entry_key_binds_policy_inputs_but_not_callable_identity(self) -> None:
         one = GeneratedLayoutEntry("qt-conf-v1", {"plugins": "p", "qml": "q"}, lambda _root: b"one")
         two = GeneratedLayoutEntry("qt-conf-v1", {"qml": "q", "plugins": "p"}, lambda _root: b"two")
-        self.assertEqual(layout_key("app", {Path("qt.conf"): one}, {}, ())[0], layout_key("app", {Path("qt.conf"): two}, {}, ())[0])
+        self.assertEqual(layout_key("app", ((Path("qt.conf"), one),), {}, ())[0], layout_key("app", ((Path("qt.conf"), two),), {}, ())[0])
         changed = GeneratedLayoutEntry("qt-conf-v2", {"plugins": "p", "qml": "q"}, lambda _root: b"one")
-        self.assertNotEqual(layout_key("app", {Path("qt.conf"): changed}, {}, ())[0], layout_key("app", {Path("qt.conf"): one}, {}, ())[0])
+        self.assertNotEqual(layout_key("app", ((Path("qt.conf"), changed),), {}, ())[0], layout_key("app", ((Path("qt.conf"), one),), {}, ())[0])
 
     def test_public_type_aliases_import_and_contain_declared_types(self) -> None:
         self.assertIn(type(None), get_args(JsonScalar))
         self.assertIn(HeldSource, get_args(LayoutEntry))
         self.assertIn(GeneratedLayoutEntry, get_args(LayoutEntry))
+        self.assertTrue(get_args(LayoutEntries))
 ```
 
 Import `get_args` from `typing` in the test module.
@@ -157,6 +159,7 @@ class GeneratedLayoutEntry:
     render: Callable[[Path], bytes] = field(compare=False, repr=False)
 
 LayoutEntry = Union[HeldSource, bytes, GeneratedLayoutEntry]
+LayoutEntries = Sequence[Tuple[Path, LayoutEntry]]
 
 @dataclass(frozen=True)
 class QtConfPaths:
@@ -182,11 +185,11 @@ class CacheStats:
     payload_bytes: int = 0
 ```
 
-Import `List`, `Mapping`, `Tuple`, and `Union` from `typing`. These aliases
+Import `List`, `Mapping`, `Sequence`, `Tuple`, and `Union` from `typing`. These aliases
 evaluate successfully on Python 3.8+, unlike PEP 604 expressions evaluated in
 an assignment.
 
-`canonical_json()` must use `json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")`. `layout_key()` must normalize destinations component-by-component with `casefold()`, reject absolute/anchored/empty/parent paths and collisions, sort dependency keys, encode each held source's final path/device/inode/size/digest, encode literal size/digest, encode generated policy/inputs, and return `sha256(canonical_json(key_input)).hexdigest()` plus that key input.
+`canonical_json()` must use `json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")`. `layout_key()` must consume the ordered pair sequence directly, normalize every destination component-by-component with `casefold()` before constructing any lookup, reject absolute/anchored/empty/parent paths and collisions, sort dependency keys, encode each held source's final path/device/inode/size/digest, encode literal size/digest, encode generated policy/inputs, and return `sha256(canonical_json(key_input)).hexdigest()` plus that key input. Never construct a `Path`-keyed entry dictionary: Windows `Path` hashing can erase an ASCII case collision before validation.
 
 - [ ] **Step 4: Run the focused tests green**
 
@@ -339,7 +342,7 @@ git commit -m "feat: protect Windows runtime cache roots" -m "Co-Authored-By: Cl
 - Consumes: `WindowsRuntimeCache`, `LayoutEntry`, canonical keys, Win32 filesystem primitives.
 - Produces:
   - `CachedLayoutLease(key: str, object_root: Path, layout: Path, logical_files: int, logical_bytes: int, cache_hit: bool, payload_files: int, payload_bytes: int, _owners: tuple[object, ...])`
-  - `WindowsRuntimeCache.materialize(name: str, entries: Mapping[Path, LayoutEntry], *, context: Mapping[str, JsonValue], dependencies: Sequence[CachedLayoutLease] = (), entry_limit: int = 8192, byte_limit: int = 1 << 30) -> CachedLayoutLease`
+  - `WindowsRuntimeCache.materialize(name: str, entries: LayoutEntries, *, context: Mapping[str, JsonValue], dependencies: Sequence[CachedLayoutLease] = (), entry_limit: int = 8192, byte_limit: int = 1 << 30) -> CachedLayoutLease`
   - `CachedLayoutLease.close() -> None`
 
 - [ ] **Step 1: Write publication, validation, and race tests**
@@ -349,7 +352,7 @@ Create `PublicationTests(unittest.TestCase)`. Its methods cover one cold miss fo
 ```python
 @unittest.skipUnless(os.name == "nt", "requires Windows publication semantics")
 def test_cold_publish_then_exact_warm_hit_writes_no_payload(self) -> None:
-    entries = {Path("bin/tool.exe"): self.held_file("tool.exe", b"tool")}
+    entries = ((Path("bin/tool.exe"), self.held_file("tool.exe", b"tool")),)
     first = self.cache.materialize("tool", entries, context={"purpose": "ctest"})
     assert not first.cache_hit
     assert (first.layout / "bin/tool.exe").read_bytes() == b"tool"
@@ -364,13 +367,14 @@ def test_cold_publish_then_exact_warm_hit_writes_no_payload(self) -> None:
 @unittest.skipUnless(os.name == "nt", "requires Windows publication semantics")
 def test_hit_rejects_content_extra_generated_and_acl_mutation(self) -> None:
     generated = GeneratedLayoutEntry("generated-v1", {"value": "ok"}, lambda root: root.as_posix().encode())
-    lease = self.cache.materialize("generated", {Path("value.txt"): generated}, context={})
+    entries = ((Path("value.txt"), generated),)
+    lease = self.cache.materialize("generated", entries, context={})
     object_root = lease.object_root
     lease.close()
     self.force_mutable(object_root)
     (lease.layout / "extra.txt").write_bytes(b"extra")
     with self.assertRaisesRegex(RuntimeError, "exact file set"):
-        self.cache.materialize("generated", {Path("value.txt"): generated}, context={})
+        self.cache.materialize("generated", entries, context={})
 
 
 @unittest.skipUnless(os.name == "nt", "requires Windows publication semantics")
@@ -449,9 +453,9 @@ Create `LifecycleTests(unittest.TestCase)`. Use an injected integer clock and sm
 @unittest.skipUnless(os.name == "nt", "requires Windows sharing and ACL semantics")
 def test_cleanup_skips_active_object_and_publication_fails_at_capacity(self) -> None:
     cache = self.make_cache(limits=CacheLimits(max_bytes=8, max_objects=1), clock=self.clock)
-    active = cache.materialize("one", {Path("one.bin"): self.held_file("one", b"12345678")}, context={})
+    active = cache.materialize("one", ((Path("one.bin"), self.held_file("one", b"12345678")),), context={})
     with self.assertRaisesRegex(RuntimeError, "cache capacity"):
-        cache.materialize("two", {Path("two.bin"): self.held_file("two", b"abcdefgh")}, context={})
+        cache.materialize("two", ((Path("two.bin"), self.held_file("two", b"abcdefgh")),), context={})
     assert active.layout.is_dir()
     active.close()
 
@@ -460,7 +464,7 @@ def test_cleanup_skips_active_object_and_publication_fails_at_capacity(self) -> 
 def test_corrupt_object_is_quarantined_and_rebuilt_under_repair_lock(self) -> None:
     lease = self.publish_and_close("repair", b"before")
     self.corrupt_manifest(lease.object_root)
-    rebuilt = self.cache.materialize("repair", {Path("value.bin"): self.held_file("value", b"before")}, context={})
+    rebuilt = self.cache.materialize("repair", ((Path("value.bin"), self.held_file("value", b"before")),), context={})
     assert not rebuilt.cache_hit
     assert (rebuilt.layout / "value.bin").read_bytes() == b"before"
     assert len(tuple((self.cache_root / "quarantine").iterdir())) == 1
@@ -510,7 +514,7 @@ git commit -m "feat: bound Windows runtime cache lifecycle" -m "Co-Authored-By: 
 - Consumes: `WindowsRuntimeCache.materialize()` and `CachedLayoutLease`.
 - Produces:
   - `RuntimeAuditLease(cache_root: Path | None = None, *, cache_limits: CacheLimits = CacheLimits(), cache_clock: Callable[[], float] = time.time)`
-  - `RuntimeAuditLease.stage_readonly_layout(name: str, entries: Mapping[Path, Path | bytes | GeneratedLayoutEntry], *, context: Mapping[str, JsonValue] | None = None, dependencies: Sequence[Path] = (), qt_paths: QtConfPaths | None = None, entry_limit: int = 8192, byte_limit: int = 1 << 30) -> Path`
+  - `RuntimeAuditLease.stage_readonly_layout(name: str, entries: Sequence[Tuple[Path, Path | bytes | GeneratedLayoutEntry]], *, context: Mapping[str, JsonValue] | None = None, dependencies: Sequence[Path] = (), qt_paths: QtConfPaths | None = None, entry_limit: int = 8192, byte_limit: int = 1 << 30) -> Path`
   - existing `stage_readonly_tree(directory: Path, *, entry_limit: int = 4096, byte_limit: int = 256 << 20, excluded: tuple[Path, ...] = (), included_suffixes: tuple[str, ...] | None = None, included_names: tuple[str, ...] = ()) -> Path`, now cached
   - read-only `RuntimeAuditLease.cached_layout_directories: tuple[Path, ...]`
   - counters `cache_hit_count`, `cache_miss_count`, `payload_written_file_count`, `payload_written_byte_count`; existing `staged_file_count`/`staged_byte_count` remain logical counts.
@@ -523,8 +527,9 @@ Change the existing staged-tree close assertion: published paths remain after cl
 @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
 def test_runtime_audit_lease_reuses_published_layout_and_preserves_logical_counts(self) -> None:
     cache_root = self.root / "cache"
-    entries = {Path("tool.exe"): self.build_dir / "tool.exe"}
-    entries[Path("tool.exe")].write_bytes(b"tool")
+    tool = self.build_dir / "tool.exe"
+    tool.write_bytes(b"tool")
+    entries = ((Path("tool.exe"), tool),)
     with RuntimeAuditLease(cache_root) as first:
         first_path = first.stage_readonly_layout("tool", entries, context={"purpose": "unit"})
         self.assertEqual((first.cache_hit_count, first.cache_miss_count), (0, 1))
@@ -595,11 +600,11 @@ Create `QtConfTests(unittest.TestCase)` in the cache test module. Test nested ex
 @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
 def test_layout_replaces_qt_conf_beside_every_executable(self) -> None:
     qt_paths = QtConfPaths(self.plugin_layout, self.qml_layout)
-    entries = {
-        Path("app.exe"): self.held_file("app.exe", b"app"),
-        Path("qt.conf"): b"Plugins=C:/mutable",
-        Path("tools/qmllint.exe"): self.held_file("qmllint.exe", b"qml"),
-    }
+    entries = (
+        (Path("app.exe"), self.held_file("app.exe", b"app")),
+        (Path("qt.conf"), b"Plugins=C:/mutable"),
+        (Path("tools/qmllint.exe"), self.held_file("qmllint.exe", b"qml")),
+    )
     lease = self.cache.materialize("mixed", entries, context={}, dependencies=self.qt_dependencies, qt_paths=qt_paths)
     for config in (lease.layout / "qt.conf", lease.layout / "tools/qt.conf"):
         rendered = config.read_text(encoding="utf-8")
@@ -637,7 +642,7 @@ def render_qt_conf(paths: QtConfPaths) -> bytes:
     ).encode("utf-8")
 ```
 
-Before keying an executable layout, replace any case-insensitive `qt.conf` in each executable parent with `GeneratedLayoutEntry("qt-conf-v2", {"plugins": paths.plugins.as_posix(), "qml_imports": paths.qml_imports.as_posix()}, lambda _layout: render_qt_conf(paths))`. Require both referenced paths to resolve to registered immutable dependency leases.
+Before keying an executable layout, filter any case-insensitive `qt.conf` pair in each executable parent from the ordered sequence, then append that parent's `GeneratedLayoutEntry("qt-conf-v2", {"plugins": paths.plugins.as_posix(), "qml_imports": paths.qml_imports.as_posix()}, lambda _layout: render_qt_conf(paths))`. Validate all remaining and appended pairs before constructing any destination lookup. Require both referenced paths to resolve to registered immutable dependency leases.
 
 In `prepare_windows_app_runtime()`, pass stable context for plugin family/QML/runtime policy, bind QML/plugin dependencies into runtime, and bind runtime/plugin/QML into the app. Pass `qt_paths=QtConfPaths(launch_plugins, launch_qml)` for executable-bearing runtime and app layouts. Remove the hand-built app `qt.conf` bytes.
 
@@ -710,7 +715,7 @@ Expected: graph callable typing, missing dependency context, or missing executab
 
 - [ ] **Step 3: Replace graph callables and bind every CTest layout**
 
-Change `build_entries` to `dict[Path, Path | bytes | GeneratedLayoutEntry]`. For each graph input, hash the held source stream and create a `GeneratedLayoutEntry` whose declared inputs contain the source identity/digest, sorted selected test names, normalized replacement pairs, occurrence replacements, and working-directory overrides. Keep the existing rewrite body as the renderer, receiving the final build layout path.
+Change `build_entries` to `list[tuple[Path, Path | bytes | GeneratedLayoutEntry]]`, appending pairs without an intermediate `Path`-keyed dictionary. For each graph input, hash the held source stream and create a `GeneratedLayoutEntry` whose declared inputs contain the source identity/digest, sorted selected test names, normalized replacement pairs, occurrence replacements, and working-directory overrides. Keep the existing rewrite body as the renderer, receiving the final build layout path.
 
 Pass exact dependency/context sets:
 

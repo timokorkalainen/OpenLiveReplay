@@ -85,6 +85,13 @@ key is the SHA-256 digest of canonical UTF-8 JSON containing:
 - for generated content: generator policy name/version plus canonical declared
   inputs.
 
+Layout entries cross the cache boundary as an ordered sequence of
+`(Path, LayoutEntry)` pairs, never as a `Path`-keyed mapping. On Windows,
+`Path` hashing is already ASCII case-insensitive, so a mapping could discard
+one of `Bin/tool.exe` and `bin/TOOL.exe` before the cache's component-wise
+`casefold()` collision check sees both destinations. The cache validates every
+pair before constructing any destination lookup.
+
 Destination spelling is also retained in the manifest so the published layout
 preserves the requested case while still rejecting case-insensitive
 collisions. Context binds material choices that may not otherwise appear in a
@@ -189,7 +196,8 @@ policy.
 
 Before an executable-bearing layout is keyed, the launcher inserts one
 generated `qt.conf` into every directory containing a staged `.exe`. Existing
-entries at that name are replaced, not merged. The generated configuration
+entries at that name are removed from the ordered pair sequence before the
+generated entry is appended, not merged. The generated configuration
 uses only the immutable plugin and QML object paths. This applies to the app,
 CTest itself, build-tree tests, selected runtime tools, and external tools,
 including Qt utilities such as `qmllint`.

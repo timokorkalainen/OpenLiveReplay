@@ -9,6 +9,7 @@ from tools.windows_runtime_cache import (
     HeldSource,
     JsonScalar,
     LayoutEntry,
+    LayoutEntries,
     layout_key,
 )
 
@@ -27,11 +28,11 @@ def held(name: str, payload: bytes, *, inode: int = 1) -> HeldSource:
 
 class CacheKeyTests(unittest.TestCase):
     def test_layout_key_is_order_independent_and_binds_every_identity_field(self) -> None:
-        first = {
-            Path("bin/tool.exe"): held("tool.exe", b"tool"),
-            Path("literal"): b"x",
-        }
-        second = dict(reversed(tuple(first.items())))
+        first = (
+            (Path("bin/tool.exe"), held("tool.exe", b"tool")),
+            (Path("literal"), b"x"),
+        )
+        second = tuple(reversed(first))
         key, manifest = layout_key(
             "tool", first, {"purpose": "ctest"}, ("a" * 64,)
         )
@@ -43,14 +44,14 @@ class CacheKeyTests(unittest.TestCase):
         )
         self.assertEqual(manifest["schema"], "olr-windows-runtime-cache-v2")
         variants = (
-            {
-                Path("bin/tool.exe"): held("tool.exe", b"tool", inode=2),
-                Path("literal"): b"x",
-            },
-            {
-                Path("bin/tool.exe"): held("tool.exe", b"changed"),
-                Path("literal"): b"x",
-            },
+            (
+                (Path("bin/tool.exe"), held("tool.exe", b"tool", inode=2)),
+                (Path("literal"), b"x"),
+            ),
+            (
+                (Path("bin/tool.exe"), held("tool.exe", b"changed")),
+                (Path("literal"), b"x"),
+            ),
         )
         self.assertTrue(
             all(
@@ -73,15 +74,15 @@ class CacheKeyTests(unittest.TestCase):
     def test_layout_key_rejects_unsafe_and_case_colliding_destinations(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "unsafe destination"):
             layout_key(
-                "tool", {Path("../tool.exe"): held("tool.exe", b"x")}, {}, ()
+                "tool", ((Path("../tool.exe"), held("tool.exe", b"x")),), {}, ()
             )
         with self.assertRaisesRegex(RuntimeError, "duplicate destination"):
             layout_key(
                 "tool",
-                {
-                    Path("Bin/stra\u00dfe.exe"): held("one", b"1"),
-                    Path("bin/STRASSE.exe"): held("two", b"2"),
-                },
+                (
+                    (Path("Bin/tool.exe"), held("one", b"1")),
+                    (Path("bin/TOOL.exe"), held("two", b"2")),
+                ),
                 {},
                 (),
             )
@@ -100,8 +101,8 @@ class CacheKeyTests(unittest.TestCase):
             lambda _root: b"two",
         )
         self.assertEqual(
-            layout_key("app", {Path("qt.conf"): one}, {}, ())[0],
-            layout_key("app", {Path("qt.conf"): two}, {}, ())[0],
+            layout_key("app", ((Path("qt.conf"), one),), {}, ())[0],
+            layout_key("app", ((Path("qt.conf"), two),), {}, ())[0],
         )
         changed = GeneratedLayoutEntry(
             "qt-conf-v2",
@@ -109,14 +110,15 @@ class CacheKeyTests(unittest.TestCase):
             lambda _root: b"one",
         )
         self.assertNotEqual(
-            layout_key("app", {Path("qt.conf"): changed}, {}, ())[0],
-            layout_key("app", {Path("qt.conf"): one}, {}, ())[0],
+            layout_key("app", ((Path("qt.conf"), changed),), {}, ())[0],
+            layout_key("app", ((Path("qt.conf"), one),), {}, ())[0],
         )
 
     def test_public_type_aliases_import_and_contain_declared_types(self) -> None:
         self.assertIn(type(None), get_args(JsonScalar))
         self.assertIn(HeldSource, get_args(LayoutEntry))
         self.assertIn(GeneratedLayoutEntry, get_args(LayoutEntry))
+        self.assertTrue(get_args(LayoutEntries))
 
 
 if __name__ == "__main__":

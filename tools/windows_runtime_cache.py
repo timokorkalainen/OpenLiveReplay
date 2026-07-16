@@ -40,6 +40,7 @@ class GeneratedLayoutEntry:
 
 
 LayoutEntry = Union[HeldSource, bytes, GeneratedLayoutEntry]
+LayoutEntries = Sequence[Tuple[Path, LayoutEntry]]
 
 
 @dataclass(frozen=True)
@@ -115,13 +116,13 @@ def _entry_key_input(entry: LayoutEntry) -> dict[str, object]:
 
 def layout_key(
     name: str,
-    entries: Mapping[Path, LayoutEntry],
+    entries: LayoutEntries,
     context: Mapping[str, JsonValue],
     dependency_keys: Sequence[str],
 ) -> tuple[str, dict[str, object]]:
     normalized_entries: list[tuple[str, Path, LayoutEntry]] = []
     seen_destinations: set[str] = set()
-    for destination, entry in entries.items():
+    for destination, entry in entries:
         normalized = _normalized_destination(destination)
         if normalized in seen_destinations:
             raise RuntimeError(f"duplicate destination: {destination}")
