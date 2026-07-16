@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from pathlib import Path, PurePosixPath
 from unittest import mock
@@ -1199,11 +1200,11 @@ class CommandRewriteTests(unittest.TestCase):
                 )
                 self.assertEqual(rewritten.dependency_format, "msvc-json")
 
-    def test_msvc_strips_every_paired_output_without_treating_values_as_sources(self):
+    def test_msvc_strips_required_paired_and_optional_attached_outputs(self):
         arguments = (
             "/DKEEP=1", "/Fo", "one.obj", "/Fe", "two.exe",
-            "/Fd", "three.pdb", "/Fa", "assembly.asm", "/Fm", "map.txt",
-            "/FR", "browse.sbr", "/Fi", "preprocessed.i", "file.cpp",
+            "/Fd", "three.pdb", "/Faassembly.asm", "/Fmmap.txt",
+            "/FRbrowse.sbr", "/Fi", "preprocessed.i", "file.cpp",
         )
         for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
             with self.subTest(family=family):
@@ -1216,6 +1217,30 @@ class CommandRewriteTests(unittest.TestCase):
                         "/sourceDependencies", str(self.dependency_output),
                     ),
                 )
+
+    def test_msvc_default_path_outputs_do_not_consume_the_source(self):
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in ("/FA", "/Fa", "/Fm", "/FR", "/Fr",
+                           "-FA", "-Fa", "-Fm", "-FR", "-Fr"):
+                arguments = ("/DKEEP=1", option, "file.cpp")
+                with self.subTest(family=family, option=option):
+                    rewritten = self.rewrite(family, arguments)
+                    self.assertEqual(
+                        rewritten.arguments,
+                        (
+                            str(self.configuration(family, arguments).compiler),
+                            "/DKEEP=1", "file.cpp", "/nologo", "/E",
+                            "/sourceDependencies", str(self.dependency_output),
+                        ),
+                    )
+
+    def test_msvc_optional_output_paths_must_be_attached(self):
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in ("/Fa", "/Fm", "/FR", "/Fr"):
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "multiple source"
+                ):
+                    self.rewrite(family, (option, "output.bin", "file.cpp"))
 
     def test_msvc_preserves_pch_module_external_include_and_forced_source_forms(self):
         arguments = (
@@ -1329,6 +1354,43 @@ class CommandRewriteTests(unittest.TestCase):
         arguments = (f"/clang:{payload}", "file.cpp")
         rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
         self.assertEqual(rewritten.arguments[1:3], arguments)
+
+    def test_deep_joined_forwarding_scales_linearly(self):
+        def elapsed(depth: int) -> float:
+            payload = "-Xpreprocessor=" * depth + "-DKEEP=1"
+            arguments = (f"/clang:{payload}", "file.cpp")
+            started = time.perf_counter()
+            rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
+            self.assertEqual(rewritten.arguments[1:3], arguments)
+            return time.perf_counter() - started
+
+        elapsed(100)
+        small = min(elapsed(1_000) for _ in range(3))
+        large = min(elapsed(16_000) for _ in range(2))
+        self.assertLess(
+            large,
+            small * 40 + 0.02,
+            f"joined forwarding scaled superlinearly: 1k={small:.4f}s 16k={large:.4f}s",
+        )
+
+    def test_four_mib_joined_forwarding_has_bounded_time_and_memory(self):
+        prefix = "-Xpreprocessor="
+        depth = (4 * 1024 * 1024 - len("-P")) // len(prefix)
+        payload = prefix * depth + "-P"
+        arguments = (payload, "file.cpp")
+
+        tracemalloc.start()
+        started = time.perf_counter()
+        try:
+            with self.assertRaisesRegex(AuditInfrastructureError, "hidden marker"):
+                self.rewrite(CompilerFamily.CLANG, arguments)
+            elapsed = time.perf_counter() - started
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertLess(elapsed, 8.0, f"4 MiB forwarding took {elapsed:.3f}s")
+        self.assertLess(peak, 16 * 1024 * 1024, f"4 MiB forwarding peaked at {peak} bytes")
 
     def test_msvc_strips_preprocessor_and_auxiliary_output_controls(self):
         shared = (

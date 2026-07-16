@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Iterator, Mapping
@@ -63,7 +64,7 @@ _GNU_VALUE_OPTIONS = frozenset({
     "--dependency-file",
 })
 _MSVC_VALUE_OPTIONS = frozenset({
-    "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd", "/fa", "/fm", "/fr",
+    "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd",
     "/fp", "/ft", "/yu", "/yc", "/experimental:log",
     "/sourcedependencies", "/external:i", "/ai", "/fu", "/ifcoutput",
     "/reference", "/headerunit", "/scanDependencies".casefold(),
@@ -1062,105 +1063,143 @@ def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
 
 
 def _gnu_forwarded_control(payload: str) -> str | None:
-    pending = [payload]
-    while pending:
-        candidate = pending.pop()
-        lowered = candidate.casefold()
-        if candidate.startswith(("-Xclang=", "-Xpreprocessor=")):
-            nested = candidate.partition("=")[2]
-            if not nested:
-                raise AuditInfrastructureError(
-                    f"forwarded compiler option requires a value: {candidate}"
-                )
-            pending.append(nested)
-            continue
-        if lowered.startswith("-wp,"):
-            pending.extend(reversed(candidate[4:].split(",")))
-            continue
-        if candidate in {"-P", "--no-line-commands"} or lowered.startswith(
-            "-frewrite-includes"
-        ):
-            return "marker"
-        if candidate in {"-c", "-S"} or lowered.startswith(
-            ("-fpreprocessed", "-fdirectives-only")
-        ):
-            return "source-selection"
-        if candidate == "-x" or "cpp-output" in lowered:
-            return "source-selection"
-        if candidate in {
-            "-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ",
-            "-MJ", "-dependency-file", "--dependency-file",
-            "--dependencies", "--user-dependencies", "--write-dependencies",
-            "--write-user-dependencies", "--print-missing-file-dependencies",
-        } or any(
-            candidate.startswith(prefix) and len(candidate) > len(prefix)
-            for prefix in ("-MF", "-MT", "-MQ", "-MJ")
-        ) or lowered.startswith(("-dependency-file=", "--dependency-file=")):
-            return "dependency"
-        if candidate == "-o" or candidate.startswith("-o") and len(candidate) > 2:
-            return "output"
-        if candidate in {"--output", "-d", "-dM", "-dD", "-dN", "-dI", "-dU"}:
-            return "output"
-        if lowered.startswith(("--output=", "--dump=")) or candidate == "--dump":
-            return "output"
-        if lowered.startswith((
-            "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
-            "-fmodule-output", "-serialize-diagnostics", "--serialize-diagnostics",
-            "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
-        )):
-            return "output"
-        if candidate.startswith("@"):
-            return "response"
+    candidate = payload
+    lowered = candidate.casefold()
+    if candidate in {"-P", "--no-line-commands"} or lowered.startswith(
+        "-frewrite-includes"
+    ):
+        return "marker"
+    if candidate in {"-c", "-S"} or lowered.startswith(
+        ("-fpreprocessed", "-fdirectives-only")
+    ):
+        return "source-selection"
+    if candidate == "-x" or "cpp-output" in lowered:
+        return "source-selection"
+    if candidate in {
+        "-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ",
+        "-MJ", "-dependency-file", "--dependency-file",
+        "--dependencies", "--user-dependencies", "--write-dependencies",
+        "--write-user-dependencies", "--print-missing-file-dependencies",
+    } or any(
+        candidate.startswith(prefix) and len(candidate) > len(prefix)
+        for prefix in ("-MF", "-MT", "-MQ", "-MJ")
+    ) or lowered.startswith(("-dependency-file=", "--dependency-file=")):
+        return "dependency"
+    if candidate == "-o" or candidate.startswith("-o") and len(candidate) > 2:
+        return "output"
+    if candidate in {"--output", "-d", "-dM", "-dD", "-dN", "-dI", "-dU"}:
+        return "output"
+    if lowered.startswith(("--output=", "--dump=")) or candidate == "--dump":
+        return "output"
+    if lowered.startswith((
+        "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
+        "-fmodule-output", "-serialize-diagnostics", "--serialize-diagnostics",
+        "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
+    )):
+        return "output"
+    if candidate.startswith("@"):
+        return "response"
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class _ForwardedSpan:
+    text: str
+    start: int
+    stop: int
+
+
+@dataclass(slots=True)
+class _CommaSpanCursor:
+    text: str
+    position: int
+    stop: int
+
+    def next_span(self) -> _ForwardedSpan | None:
+        if self.position > self.stop:
+            return None
+        comma = self.text.find(",", self.position, self.stop)
+        if comma < 0:
+            result = _ForwardedSpan(self.text, self.position, self.stop)
+            self.position = self.stop + 1
+            return result
+        result = _ForwardedSpan(self.text, self.position, comma)
+        self.position = comma + 1
+        return result
+
+
+def _span_equals(span: _ForwardedSpan, value: str) -> bool:
+    return span.stop - span.start == len(value) and span.text.startswith(
+        value, span.start, span.stop
+    )
+
+
+def _span_startswith(span: _ForwardedSpan, value: str) -> bool:
+    return span.text.startswith(value, span.start, span.stop)
 
 
 def _gnu_flattened_forwarded_arguments(
     payloads: Iterable[str],
 ) -> Iterator[str]:
-    """Flatten forwarding grammar without changing its left-to-right order."""
+    """Flatten forwarding grammar in linear time without copying suffixes."""
 
-    sources = [iter(payloads)]
+    source = iter(payloads)
+    pending: deque[_ForwardedSpan | _CommaSpanCursor] = deque()
 
-    def next_argument() -> str:
-        while sources:
-            try:
-                return next(sources[-1])
-            except StopIteration:
-                sources.pop()
-        raise StopIteration
+    def next_span() -> _ForwardedSpan:
+        while pending:
+            current = pending[0]
+            if isinstance(current, _ForwardedSpan):
+                pending.popleft()
+                return current
+            result = current.next_span()
+            if result is not None:
+                return result
+            pending.popleft()
+        value = next(source)
+        return _ForwardedSpan(value, 0, len(value))
 
-    while sources:
+    while True:
         try:
-            payload = next_argument()
+            span = next_span()
         except StopIteration:
             break
-        nested_forwarder = next(
-            (
-                candidate for candidate in _GNU_FORWARDERS
-                if payload == candidate or payload.startswith(f"{candidate}=")
-            ),
-            None,
-        )
-        if nested_forwarder is not None:
-            if payload == nested_forwarder:
-                try:
-                    nested = next_argument()
-                except StopIteration as error:
-                    raise AuditInfrastructureError(
-                        f"forwarded compiler option requires a value: {payload}"
-                    ) from error
-            else:
-                nested = payload.partition("=")[2]
-                if not nested:
-                    raise AuditInfrastructureError(
-                        f"forwarded compiler option requires a value: {payload}"
-                    )
-            sources.append(iter((nested,)))
-            continue
-        if payload.casefold().startswith("-wp,"):
-            sources.append(iter(payload[4:].split(",")))
-            continue
-        yield payload
+        while True:
+            nested_forwarder = next(
+                (
+                    candidate for candidate in _GNU_FORWARDERS
+                    if _span_equals(span, candidate)
+                    or _span_startswith(span, f"{candidate}=")
+                ),
+                None,
+            )
+            if nested_forwarder is not None:
+                if _span_equals(span, nested_forwarder):
+                    try:
+                        span = next_span()
+                    except StopIteration as error:
+                        raise AuditInfrastructureError(
+                            f"forwarded compiler option requires a value: {nested_forwarder}"
+                        ) from error
+                else:
+                    start = span.start + len(nested_forwarder) + 1
+                    if start == span.stop:
+                        value = span.text[span.start:span.stop]
+                        raise AuditInfrastructureError(
+                            f"forwarded compiler option requires a value: {value}"
+                        )
+                    span = _ForwardedSpan(span.text, start, span.stop)
+                continue
+            if (
+                span.stop - span.start >= 4
+                and span.text[span.start:span.start + 4].casefold() == "-wp,"
+            ):
+                pending.appendleft(
+                    _CommaSpanCursor(span.text, span.start + 4, span.stop)
+                )
+                break
+            yield span.text[span.start:span.stop]
+            break
 
 
 def _gnu_forwarded_sequence_control(payloads: Iterable[str]) -> str | None:
@@ -1346,15 +1385,16 @@ _MSVC_REWRITE_REMOVE_FLAGS = frozenset({
     "/pd", "/ph", "/fx", "/doc",
 })
 _MSVC_REWRITE_REMOVE_VALUES = frozenset({
-    "/fo", "/fe", "/fd", "/fa", "/fm", "/fr", "/fi",
+    "/fo", "/fe", "/fd", "/fi",
     "/ft", "/experimental:log",
     "/sourcedependencies", "/scandependencies", "/ifcoutput",
 })
 _MSVC_REWRITE_ATTACHED_VALUES = (
     "/sourcedependencies", "/scandependencies", "/ifcoutput",
     "/experimental:log", "/doc",
-    "/fo", "/fe", "/fd", "/fa", "/fm", "/fr", "/fi", "/ft",
+    "/fo", "/fe", "/fd", "/fi", "/ft",
 )
+_MSVC_REWRITE_OPTIONAL_OUTPUT_PREFIXES = ("/FA", "/Fa", "/Fm", "/FR", "/Fr")
 _MSVC_REWRITE_REJECT_PREFIXES = (
     "/out", "/link", "/yc", "/ld", "/clr:netcore",
 )
@@ -1403,6 +1443,9 @@ def _rewrite_msvc(
             index += 1
             continue
         if configuration.family is CompilerFamily.CLANG_CL and slash_spelling == "/d1PP":
+            index += 1
+            continue
+        if slash_spelling.startswith(_MSVC_REWRITE_OPTIONAL_OUTPUT_PREFIXES):
             index += 1
             continue
         forwarder = next(
