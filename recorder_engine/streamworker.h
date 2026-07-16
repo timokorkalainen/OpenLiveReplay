@@ -459,6 +459,10 @@ private:
     std::function<void()> m_beforeMuxPacketWriteForTest;
     std::function<void()> m_beforeMuxEvidenceSubmissionForTest;
     std::function<void()> m_beforeGpuFallbackTryForTest;
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    std::function<ImportedGpuVideoFrame(void*, const FrameMetadata&)> m_gpuImportForTest;
+    std::function<void()> m_afterGpuImportForTest;
+#endif
 #endif
     mutable std::mutex m_muxFrameEvidenceMutex;
     DecodedFrameEvidenceQueue m_muxFrameEvidence{64};

@@ -179,7 +179,10 @@ private:
     // then publishes/writes the header. close() takes m_mutex, then (via
     // ensureHeaderWritten) m_headerMutex; ensureHeaderWritten never reaches back
     // for m_mutex, so there is no cycle.
+    enum class HeaderCommitStatus { Written, StaleAuthority, Failed };
     bool ensureHeaderWritten();
+    HeaderCommitStatus ensureHeaderWrittenForPacket(const PacketCarrierGuard& packetGuard,
+                                                    const PacketCarrierGuard& candidateGuard);
     bool publishStartTimecodeCandidate(const QString& tc, uint64_t publicationId);
     void undoStartTimecodeCandidatePublication(const QString& tc, uint64_t publicationId);
 
@@ -307,6 +310,7 @@ private:
         m_acceptedStartTimecodeCandidates;
     uint64_t m_candidateWindowGeneration = 1;
     bool m_startTimecodeCandidateWindowClosed = false;
+    bool m_candidateWindowCommitted = false;
     std::atomic<bool> m_writerRunning{false};
     std::atomic<bool> m_blockingWritesAllowed{true};
 
@@ -325,6 +329,7 @@ private:
     std::function<void()> m_afterCandidateSnapshotForTest;
     std::function<void()> m_beforeCandidatePublicationForTest;
     std::function<void()> m_afterCandidatePublicationForTest;
+    std::function<void()> m_beforeHeaderCommitForTest;
 #endif
 };
 

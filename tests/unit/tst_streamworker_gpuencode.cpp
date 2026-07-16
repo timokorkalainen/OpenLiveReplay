@@ -262,6 +262,8 @@ private slots:
     void delayedGpuOutputAfterFallbackDropsOldEvidence();
     void resetBetweenLatestValidationAndGpuSubmissionRejectsFrame();
     void delayedOldSessionGpuFailureDoesNotLatchFallback();
+    void successfulGpuImportRotatedBeforeReturnIsRejected();
+    void importedGpuFrameCannotCrossLaterSameSessionRotation();
     void resetBetweenFallbackCheckAndLatchCannotDisableReplacementCarrier();
     void concurrentFallbackRacersLatchAndRotateExactlyOnce();
     void gpuTwoPacketBatchRejectsBeforePartialCommit();
@@ -685,6 +687,44 @@ void TestStreamWorkerGpuEncode::delayedOldSessionGpuFailureDoesNotLatchFallback(
     QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
     QCOMPARE(worker.currentCarrierEpoch(), replacementEpoch);
     worker.m_gpuEncodePump->stop();
+}
+
+void TestStreamWorkerGpuEncode::successfulGpuImportRotatedBeforeReturnIsRejected() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const uint64_t session = worker.beginCaptureSession();
+    FrameMetadata metadata;
+    metadata.key.format = FramePixelFormat::Nv12;
+    metadata.key.width = 16;
+    metadata.key.height = 16;
+
+    worker.m_gpuImportForTest = [](void*, const FrameMetadata&) {
+        return ImportedGpuVideoFrame{makeGpuHandle(), 17};
+    };
+    worker.m_afterGpuImportForTest = [&worker] { worker.rotateCarrier(true); };
+
+    const ImportedGpuVideoFrame imported =
+        worker.importGpuVideoFrameForSession(session, reinterpret_cast<void*>(1), metadata);
+    QVERIFY(imported.frame.isNull());
+    QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+}
+
+void TestStreamWorkerGpuEncode::importedGpuFrameCannotCrossLaterSameSessionRotation() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const uint64_t session = worker.beginCaptureSession();
+    const auto importedCarrier = worker.snapshotCarrierTokenForSession(session);
+    QVERIFY(importedCarrier);
+
+    DecodedVideoFrame decoded;
+    decoded.gpuFrame = makeGpuHandle();
+    decoded.gpuCarrierSessionIdentity = importedCarrier->sessionIdentity;
+    decoded.gpuCarrierEpoch = importedCarrier->epoch;
+    worker.rotateCarrier(true);
+
+    worker.enqueueDecodedVideoFrameForSession(std::move(decoded), session);
+    QMutexLocker frameLock(&worker.m_frameMutex);
+    QVERIFY(worker.m_frameQueue.isEmpty());
 }
 
 void TestStreamWorkerGpuEncode::resetBetweenFallbackCheckAndLatchCannotDisableReplacementCarrier() {

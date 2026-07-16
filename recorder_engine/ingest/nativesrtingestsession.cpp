@@ -910,6 +910,8 @@ void NativeSrtIngestSession::processVideoAccessUnits(const QList<CompressedAcces
                     }
                     decodedFrame.gpuFrame = std::move(gpuFrame);
                     decodedFrame.gpuFenceValue = imported.fenceValue;
+                    decodedFrame.gpuCarrierSessionIdentity = imported.carrierSessionIdentity;
+                    decodedFrame.gpuCarrierEpoch = imported.carrierEpoch;
                     m_callbacks.onVideoFrame(std::move(decodedFrame));
                     return true;
                 },

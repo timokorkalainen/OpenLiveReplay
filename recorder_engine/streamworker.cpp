@@ -344,6 +344,8 @@ void StreamWorker::enqueueDecodedVideoFrameForSession(DecodedVideoFrame decoded,
 #if defined(OLR_GPU_PIPELINE_BUILD)
     qf.gpuFrame = std::move(decoded.gpuFrame);
     qf.gpuFenceValue = decoded.gpuFenceValue;
+    const uint64_t gpuCarrierSessionIdentity = decoded.gpuCarrierSessionIdentity;
+    const uint64_t gpuCarrierEpoch = decoded.gpuCarrierEpoch;
 #endif
 
     // Carrier identity rotation and frame admission are one ordered ingress
@@ -351,6 +353,17 @@ void StreamWorker::enqueueDecodedVideoFrameForSession(DecodedVideoFrame decoded,
     // callback can neither rotate identity nor insert pixels after replacement.
     std::lock_guard<std::mutex> epochLock(m_epochMutex);
     std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+#if defined(OLR_GPU_PIPELINE_BUILD)
+    if (!qf.gpuFrame.isNull() &&
+        ((gpuCarrierSessionIdentity == 0) != (gpuCarrierEpoch == 0) ||
+         (gpuCarrierEpoch != 0 &&
+          (!m_activeCarrierToken ||
+           m_activeCarrierToken->sessionIdentity != gpuCarrierSessionIdentity ||
+           m_activeCarrierToken->epoch != gpuCarrierEpoch)))) {
+        if (qf.frame) av_frame_free(&qf.frame);
+        return;
+    }
+#endif
     auto token = prepareCarrierTokenForFrameIngressLocked(sessionIdentity, qf.timecodeEvidence);
     if (!token || m_suppressEnqueue.load(std::memory_order_relaxed)) {
         if (qf.frame) av_frame_free(&qf.frame);
@@ -635,13 +648,29 @@ ImportedGpuVideoFrame StreamWorker::importGpuVideoFrameForSession(uint64_t sessi
     // the device operation. Revalidate before publishing the result or latching
     // fallback; the matching onVideoFrame callback revalidates again before its
     // queue mutation.
-    ImportedGpuVideoFrame imported =
-        importGpuVideoFrameForEncode(nativeDecodedImage, metadata, false);
+    ImportedGpuVideoFrame imported;
+#ifdef OLR_UNIT_TEST
+    if (m_gpuImportForTest)
+        imported = m_gpuImportForTest(nativeDecodedImage, metadata);
+    else
+#endif
+        imported = importGpuVideoFrameForEncode(nativeDecodedImage, metadata, false);
+#ifdef OLR_UNIT_TEST
+    auto afterImport = std::move(m_afterGpuImportForTest);
+    if (afterImport) afterImport();
+#endif
     {
         std::lock_guard<std::mutex> epochLock(m_epochMutex);
-        if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity) return {};
+        if (sessionIdentity == 0 || sessionIdentity != m_activeCaptureSessionIdentity ||
+            !carrierTokenIsCurrentLocked(failureCarrier)) {
+            return {};
+        }
     }
     if (imported.frame.isNull()) tryLatchGpuEncodeCpuFallback(failureCarrier);
+    if (!imported.frame.isNull()) {
+        imported.carrierSessionIdentity = failureCarrier.sessionIdentity;
+        imported.carrierEpoch = failureCarrier.epoch;
+    }
     return imported;
 }
 #endif

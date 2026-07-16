@@ -188,6 +188,8 @@ private slots:
     void queuedCarrierResetRejectsPixelsAndCandidate();
     void stalePublishedCandidateReopensWindowAndPreservesCurrentPacket();
     void stalePacketGuardRejectsPacketIndependentlyOfPublishedCandidate();
+    void candidateResetAtHeaderCommitCannotSeedStaleHeader();
+    void replacementCandidateAcceptedDuringTentativeCloseSurvivesAbort();
     void minWrittenVideoPtsTracksCommittedVideoPackets();
     void beginShutdownDrainWakesBlockedProducer();
     void beginShutdownDrainAcceptsInFlightPacketWhenQueueHasRoom();
@@ -363,16 +365,8 @@ void TestMuxer::initBuildsTelemetryTrackLayoutAndMetadata() {
         QStringLiteral("Beta Feed"),
     };
 
-    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_layout"),
-                   2,
-                   640,
-                   480,
-                   30,
-                   names,
-                   feedIds,
-                   feedNames,
-                   48000,
-                   2));
+    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_layout"), 2, 640, 480, 30, names, feedIds,
+                   feedNames, 48000, 2));
 
     QCOMPARE(m.audioTrackOffset(), 2);
     QCOMPARE(m.subtitleTrackOffset(), 4);
@@ -392,9 +386,11 @@ void TestMuxer::initBuildsTelemetryTrackLayoutAndMetadata() {
 
         AVDictionaryEntry* title = av_dict_get(telemetry->metadata, "title", nullptr, 0);
         QVERIFY(title != nullptr);
-        QCOMPARE(QString::fromUtf8(title->value), QStringLiteral("Feed %1 Telemetry").arg(feedIds.at(i)));
+        QCOMPARE(QString::fromUtf8(title->value),
+                 QStringLiteral("Feed %1 Telemetry").arg(feedIds.at(i)));
 
-        AVDictionaryEntry* trackType = av_dict_get(telemetry->metadata, "olr_track_type", nullptr, 0);
+        AVDictionaryEntry* trackType =
+            av_dict_get(telemetry->metadata, "olr_track_type", nullptr, 0);
         QVERIFY(trackType != nullptr);
         QCOMPARE(QString::fromUtf8(trackType->value), QStringLiteral("feed_telemetry"));
 
@@ -418,16 +414,8 @@ void TestMuxer::initFailureResetsTelemetryTrackState() {
     const QStringList feedIds{QStringLiteral("feed-alpha")};
     const QStringList feedNames{QStringLiteral("Alpha Feed")};
 
-    QVERIFY(!m.init(QStringLiteral("missing/olr_unit_telemetry_init_fail"),
-                    1,
-                    320,
-                    240,
-                    30,
-                    names,
-                    feedIds,
-                    feedNames,
-                    48000,
-                    2));
+    QVERIFY(!m.init(QStringLiteral("missing/olr_unit_telemetry_init_fail"), 1, 320, 240, 30, names,
+                    feedIds, feedNames, 48000, 2));
 
     QCOMPARE(m.telemetryTrackOffset(), 0);
     QVERIFY(m.getStream(0) == nullptr);
@@ -442,16 +430,8 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
     const QStringList feedNames{QStringLiteral("Alpha Feed")};
     const QByteArray validPayload = QByteArrayLiteral("{\"speed\":42}");
 
-    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_write"),
-                   1,
-                   320,
-                   240,
-                   30,
-                   names,
-                   feedIds,
-                   feedNames,
-                   48000,
-                   2));
+    QVERIFY(m.init(QStringLiteral("olr_unit_telemetry_write"), 1, 320, 240, 30, names, feedIds,
+                   feedNames, 48000, 2));
 
     m.writeTelemetryPacket(0, 123, validPayload);
     m.writeTelemetryPacket(1, 124, QByteArrayLiteral("{\"ignored\":true}"));
@@ -466,9 +446,7 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
     AVFormatContext* ctx = nullptr;
     const QByteArray filePath = fi.filePath().toUtf8();
     QVERIFY(avformat_open_input(&ctx, filePath.constData(), nullptr, nullptr) >= 0);
-    const auto closeInput = qScopeGuard([&ctx] {
-        avformat_close_input(&ctx);
-    });
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
     QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
 
     int telemetryStreamIndex = -1;
@@ -480,7 +458,8 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
         if (trackType && feedId &&
             QString::fromUtf8(trackType->value) == QStringLiteral("feed_telemetry") &&
             QString::fromUtf8(feedId->value) == QStringLiteral("feed-alpha")) {
-            QVERIFY2(telemetryStreamIndex == -1, "expected exactly one telemetry stream for feed-alpha");
+            QVERIFY2(telemetryStreamIndex == -1,
+                     "expected exactly one telemetry stream for feed-alpha");
             telemetryStreamIndex = static_cast<int>(i);
             telemetryStream = st;
         }
@@ -489,9 +468,7 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
 
     AVPacket* pkt = av_packet_alloc();
     QVERIFY(pkt != nullptr);
-    const auto freePacket = qScopeGuard([&pkt] {
-        av_packet_free(&pkt);
-    });
+    const auto freePacket = qScopeGuard([&pkt] { av_packet_free(&pkt); });
 
     int totalPackets = 0;
     int telemetryPackets = 0;
@@ -502,7 +479,8 @@ void TestMuxer::writeTelemetryPacketAcceptsValidFeedAndIgnoresInvalidFeed() {
             ++telemetryPackets;
             QCOMPARE(pkt->stream_index, telemetryStreamIndex);
             QCOMPARE(pkt->pts, av_rescale_q(123, AVRational{1, 1000}, telemetryStream->time_base));
-            QCOMPARE(av_rescale_q(pkt->pts, telemetryStream->time_base, AVRational{1, 1000}), int64_t(123));
+            QCOMPARE(av_rescale_q(pkt->pts, telemetryStream->time_base, AVRational{1, 1000}),
+                     int64_t(123));
             QCOMPARE(QByteArray(reinterpret_cast<const char*>(pkt->data), pkt->size), validPayload);
         }
         av_packet_unref(pkt);
@@ -517,8 +495,8 @@ void TestMuxer::initFailsForH264WithoutExtradata() {
     m.setOutputDirectory(m_home.path());
     const QStringList names{QStringLiteral("A")};
     // H.264 requires avcC extradata; empty must be rejected, not silently accepted.
-    QVERIFY(!m.init(QStringLiteral("olr_unit_h264_noextradata"), 1, 320, 240, 30, names,
-                    48000, 2, VideoCodecChoice::H264Hardware, QByteArray()));
+    QVERIFY(!m.init(QStringLiteral("olr_unit_h264_noextradata"), 1, 320, 240, 30, names, 48000, 2,
+                    VideoCodecChoice::H264Hardware, QByteArray()));
 }
 
 void TestMuxer::initWritesTimecodeTagWhenStartTimecodeGiven() {
@@ -1359,6 +1337,109 @@ void TestMuxer::stalePacketGuardRejectsPacketIndependentlyOfPublishedCandidate()
     QCOMPARE(staleCompletion.written.load(std::memory_order_acquire), 0);
     QCOMPARE(staleCompletion.rejected.load(std::memory_order_acquire), 1);
     QCOMPARE(currentCompletion.written.load(std::memory_order_acquire), 1);
+}
+
+void TestMuxer::candidateResetAtHeaderCommitCannotSeedStaleHeader() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QString baseName = QStringLiteral("olr_unit_tc_header_commit_reset");
+    QVERIFY(m.init(baseName, 1, 320, 240, 30, {QStringLiteral("A")}, 48000, 2, QString()));
+
+    std::atomic<uint64_t> packetEpoch{1};
+    std::atomic<uint64_t> candidateEpoch{1};
+    m.m_afterCandidateSnapshotForTest = [&] {
+        std::lock_guard<std::mutex> queueLock(m.m_qMutex);
+        m.m_pktQueue.front().carrierGuard = Muxer::PacketCarrierGuard{&packetEpoch, 1};
+        m.m_acceptedStartTimecodeCandidates.front().carrierGuard =
+            Muxer::PacketCarrierGuard{&candidateEpoch, 1};
+    };
+    m.m_beforeHeaderCommitForTest = [&] { candidateEpoch.store(2, std::memory_order_release); };
+
+    PacketCompletionProbe completion;
+    AVPacket* packet = av_packet_alloc();
+    QVERIFY(packet != nullptr);
+    QVERIFY(av_new_packet(packet, 2) >= 0);
+    packet->data[0] = '{';
+    packet->data[1] = '}';
+    packet->stream_index = m.subtitleTrackOffset();
+    packet->pts = packet->dts = 1;
+    packet->duration = 1;
+    QVERIFY(m.writePacket(packet, completion.callback(), QStringLiteral("10:11:12:13")));
+    av_packet_free(&packet);
+    m.close();
+
+    QCOMPARE(completion.written.load(std::memory_order_acquire), 1);
+    AVFormatContext* ctx = nullptr;
+    const QByteArray path = videoPathFor(baseName).toUtf8();
+    QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+    QVERIFY(av_dict_get(ctx->metadata, "timecode", nullptr, 0) == nullptr);
+}
+
+void TestMuxer::replacementCandidateAcceptedDuringTentativeCloseSurvivesAbort() {
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QString baseName = QStringLiteral("olr_unit_tc_tentative_close_replacement");
+    QVERIFY(m.init(baseName, 1, 320, 240, 30, {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto makePacket = [&m](int64_t pts) {
+        AVPacket* packet = av_packet_alloc();
+        if (!packet || av_new_packet(packet, 2) < 0) {
+            av_packet_free(&packet);
+            return packet;
+        }
+        packet->data[0] = '{';
+        packet->data[1] = '}';
+        packet->stream_index = m.subtitleTrackOffset();
+        packet->pts = packet->dts = pts;
+        packet->duration = 1;
+        return packet;
+    };
+
+    std::atomic<uint64_t> packetEpoch{1};
+    std::atomic<uint64_t> candidateEpoch{1};
+    m.m_afterCandidateSnapshotForTest = [&] {
+        std::lock_guard<std::mutex> queueLock(m.m_qMutex);
+        m.m_pktQueue.front().carrierGuard = Muxer::PacketCarrierGuard{&packetEpoch, 1};
+        m.m_acceptedStartTimecodeCandidates.front().carrierGuard =
+            Muxer::PacketCarrierGuard{&candidateEpoch, 1};
+    };
+
+    const QString oldCandidate = QStringLiteral("11:12:13:14");
+    const QString replacementCandidate = QStringLiteral("12:13:14:15");
+    PacketCompletionProbe firstCompletion;
+    PacketCompletionProbe replacementCompletion;
+    std::atomic<bool> replacementAccepted{false};
+    m.m_afterCandidatePublicationForTest = [&] {
+        candidateEpoch.store(2, std::memory_order_release);
+        AVPacket* replacement = makePacket(2);
+        if (replacement) {
+            replacementAccepted.store(m.writePacket(replacement, replacementCompletion.callback(),
+                                                    replacementCandidate,
+                                                    Muxer::PacketCarrierGuard{&candidateEpoch, 2}),
+                                      std::memory_order_release);
+        }
+        av_packet_free(&replacement);
+    };
+
+    AVPacket* first = makePacket(1);
+    QVERIFY(first != nullptr);
+    QVERIFY(m.writePacket(first, firstCompletion.callback(), oldCandidate));
+    av_packet_free(&first);
+    m.close();
+
+    QVERIFY(replacementAccepted.load(std::memory_order_acquire));
+    QCOMPARE(firstCompletion.written.load(std::memory_order_acquire), 1);
+    QCOMPARE(replacementCompletion.written.load(std::memory_order_acquire), 1);
+    AVFormatContext* ctx = nullptr;
+    const QByteArray path = videoPathFor(baseName).toUtf8();
+    QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+    const AVDictionaryEntry* tag = av_dict_get(ctx->metadata, "timecode", nullptr, 0);
+    QVERIFY(tag != nullptr);
+    QCOMPARE(QString::fromUtf8(tag->value), replacementCandidate);
 }
 
 void TestMuxer::minWrittenVideoPtsTracksCommittedVideoPackets() {
