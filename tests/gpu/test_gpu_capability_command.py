@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path, PurePosixPath
 from unittest import mock
@@ -106,6 +108,32 @@ class CompileEntryDecodeTests(unittest.TestCase):
                     windows=False,
                 )
 
+    def test_rejects_attached_posix_shell_operators_but_allows_quoted_literals(self):
+        for command in (
+            "g++ main.cpp ;post-step",
+            "g++ main.cpp &&post-step",
+            "g++ main.cpp ||post-step",
+            "g++ main.cpp -DVALUE>/dev/null",
+        ):
+            with self.subTest(command=command), self.assertRaisesRegex(
+                AuditInfrastructureError, "shell syntax"
+            ):
+                decode_compile_entry(
+                    {"directory": str(self.root), "file": "main.cpp", "command": command},
+                    self.database,
+                    windows=False,
+                )
+        _cwd, arguments = decode_compile_entry(
+            {
+                "directory": str(self.root),
+                "file": "main.cpp",
+                "command": "g++ '-DVALUE=>;&&literal' main.cpp",
+            },
+            self.database,
+            windows=False,
+        )
+        self.assertEqual(arguments[1], "-DVALUE=>;&&literal")
+
     def test_rejects_empty_or_malformed_entries(self):
         entries = (
             {"directory": str(self.root), "file": "file.cpp", "arguments": []},
@@ -131,7 +159,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_ccache_documented_value_and_flag_forms_are_stripped(self):
         options = (
-            "--compiler=g++", "--compiler-check", "content", "--compiler-type", "gcc",
+            "--compiler-check", "content",
             "--config-path=config", "--dir", "cache", "--namespace", "gpu",
             "--set-config", "sloppiness=time_macros", "--trim-dir", "root",
             "-o", "stats.log", "--ccache-skip", "--",
@@ -154,6 +182,19 @@ class LauncherTests(unittest.TestCase):
     def test_unknown_launcher_option_fails(self):
         with self.assertRaisesRegex(AuditInfrastructureError, "unsupported ccache option.*--mystery"):
             strip_launchers(("ccache", "--mystery", "g++", "file.cpp"))
+
+    def test_ccache_compiler_overrides_fail_closed(self):
+        controls = (
+            ("ccache", "compiler=clang++", "g++", "file.cpp"),
+            ("ccache", "compiler_type=clang", "g++", "file.cpp"),
+            ("ccache", "--compiler", "clang++", "g++", "file.cpp"),
+            ("ccache", "--compiler-type=clang", "g++", "file.cpp"),
+        )
+        for arguments in controls:
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                AuditInfrastructureError, "ccache compiler override"
+            ):
+                strip_launchers(arguments)
 
     def test_invalid_assignment_and_missing_values_fail(self):
         controls = (
@@ -245,6 +286,18 @@ class ResponseFileTests(unittest.TestCase):
                         expand_response_files((f"@{response}",), family, self.root, AuditLimits()),
                         expected,
                     )
+
+    def test_msvc_multiline_response_treats_crlf_and_lf_as_argument_boundaries(self):
+        self.write(
+            "multiline.rsp",
+            b'/DOne=1\r\n/DTwo="two words"\n"source file.cpp"\r\n',
+        )
+        self.assertEqual(
+            expand_response_files(
+                ("@multiline.rsp",), CompilerFamily.MSVC, self.root, AuditLimits()
+            ),
+            ("/DOne=1", "/DTwo=two words", "source file.cpp"),
+        )
 
     def test_response_cycle_fails(self):
         self.write("a.rsp", "@b.rsp")
@@ -495,6 +548,21 @@ class ConfigurationTests(unittest.TestCase):
             ):
                 self.make(self.entry(arguments=arguments))
 
+    def test_source_validation_rejects_extensionless_input_under_forced_language(self):
+        entry = self.entry(arguments=[
+            str(self.compiler), "-x", "c++", "../playback/gpu/file.cpp", "extra"
+        ])
+        with self.assertRaisesRegex(AuditInfrastructureError, "multiple source"):
+            self.make(entry)
+
+    def test_split_define_payload_that_looks_like_source_is_not_an_input(self):
+        entry = self.entry(arguments=[
+            str(self.compiler), "-D", "BUILD_FILE=file.cpp", "-c",
+            "../playback/gpu/file.cpp",
+        ])
+        configuration = self.make(entry)
+        self.assertEqual(configuration.source.relative, PurePosixPath("playback/gpu/file.cpp"))
+
     def test_entry_source_outside_production_and_unknown_wrapper_fail(self):
         outside = self.root / "outside.cpp"
         outside.write_text("int x;\n", encoding="utf-8")
@@ -507,6 +575,93 @@ class ConfigurationTests(unittest.TestCase):
                 AuditInfrastructureError, message
             ):
                 self.make(entry)
+
+    def test_ccache_compiler_environment_override_fails_closed(self):
+        entry = self.entry(arguments=[
+            "ccache", str(self.compiler), "../playback/gpu/file.cpp"
+        ])
+        environment = dict(self.environment, CCACHE_COMPILER="clang++")
+        with self.assertRaisesRegex(AuditInfrastructureError, "CCACHE_COMPILER"):
+            self.make(entry, environment=environment)
+
+    def test_ccache_selected_config_rejects_compiler_override_but_allows_benign_config(self):
+        entry_arguments = lambda path: [
+            "ccache", "--config-path", str(path), str(self.compiler),
+            "../playback/gpu/file.cpp",
+        ]
+        bad = self.build / "bad-ccache.conf"
+        bad.write_text("compiler = clang++\n", encoding="utf-8")
+        with self.assertRaisesRegex(AuditInfrastructureError, "ccache config.*compiler"):
+            self.make(self.entry(arguments=entry_arguments(bad)))
+        benign = self.build / "benign-ccache.conf"
+        benign.write_text("compiler_check = content\n", encoding="utf-8")
+        self.make(self.entry(arguments=entry_arguments(benign)))
+        with self.assertRaisesRegex(AuditInfrastructureError, "CCACHE_CC"):
+            self.make(
+                self.entry(arguments=["ccache", str(self.compiler), "../playback/gpu/file.cpp"]),
+                environment=dict(self.environment, CCACHE_CC="clang++"),
+            )
+        with self.assertRaisesRegex(AuditInfrastructureError, "ccache config.*prefix_command_cpp"):
+            bad.write_text("prefix_command_cpp = distcc\n", encoding="utf-8")
+            self.make(
+                self.entry(arguments=["ccache", str(self.compiler), "../playback/gpu/file.cpp"]),
+                environment=dict(self.environment, CCACHE_CONFIGPATH=str(bad)),
+            )
+
+    def test_msvc_cl_environment_arguments_are_merged_before_response_validation(self):
+        compiler = self.compiler.with_name("cl.exe")
+        compiler.write_bytes(self.compiler.read_bytes())
+        response = self.build / "environment.rsp"
+        response.write_text("/DTAIL=1", encoding="utf-8")
+        entry = self.entry(arguments=[str(compiler), "../playback/gpu/file.cpp"])
+        environment = dict(
+            self.environment,
+            CL="/DHEAD=1",
+            _CL_=f"@{response}",
+        )
+        with mock.patch(
+            "gpu_capability_command._probe_compiler_version",
+            return_value=b"Microsoft (R) C/C++ Optimizing Compiler Version 19.44\n",
+        ):
+            configuration = make_configuration(
+                entry, self.database, 3, self.source_root, self.production,
+                environment, AuditLimits()
+            )
+        self.assertEqual(
+            configuration.arguments,
+            ("/DHEAD=1", "../playback/gpu/file.cpp", "/DTAIL=1"),
+        )
+
+        with mock.patch(
+            "gpu_capability_command._probe_compiler_version",
+            return_value=b"Microsoft (R) C/C++ Optimizing Compiler Version 19.44\n",
+        ), self.assertRaisesRegex(AuditInfrastructureError, "multiple source"):
+            make_configuration(
+                entry, self.database, 3, self.source_root, self.production,
+                dict(environment, _CL_="other.cpp"), AuditLimits()
+            )
+
+    def test_clang_driver_and_response_dialect_overrides_fail_closed(self):
+        clang = self.compiler.with_name("clang++.exe")
+        clang.write_bytes(self.compiler.read_bytes())
+        controls = (
+            "--driver-mode=cl",
+            "--driver-mode", "--rsp-quoting=windows", "--rsp-quoting",
+        )
+        for option in controls:
+            arguments = [str(clang), option]
+            if option in {"--driver-mode", "--rsp-quoting"}:
+                arguments.append("cl" if option == "--driver-mode" else "windows")
+            arguments.append("../playback/gpu/file.cpp")
+            entry = self.entry(arguments=arguments)
+            with self.subTest(option=option), mock.patch(
+                "gpu_capability_command._probe_compiler_version",
+                return_value=b"clang version 18.1.3\n",
+            ), self.assertRaisesRegex(AuditInfrastructureError, "driver mode|response.*quoting"):
+                make_configuration(
+                    entry, self.database, 3, self.source_root, self.production,
+                    self.environment, AuditLimits()
+                )
 
     def test_response_expansion_precedes_source_validation(self):
         (self.build / "source.rsp").write_text("other.cpp", encoding="utf-8")
@@ -551,6 +706,110 @@ class ConfigurationTests(unittest.TestCase):
             with self.assertRaisesRegex(AuditInfrastructureError, "version probe timeout"):
                 from gpu_capability_command import _probe_compiler_version
                 _probe_compiler_version(self.compiler, CompilerFamily.GCC, self.build, self.environment)
+
+    def test_msvc_probe_uses_a_temporary_source_and_leaves_no_artifact(self):
+        captured: dict[str, object] = {}
+
+        class FakeProcess:
+            returncode = 0
+
+            def __init__(self, command, *, stderr, **_kwargs):
+                captured["command"] = tuple(command)
+                source = Path(command[-1])
+                captured["source"] = source
+                self.assert_source_exists = source.is_file()
+                stderr.write(
+                    b"Microsoft (R) C/C++ Optimizing Compiler Version 19.44\n"
+                )
+                stderr.flush()
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        with mock.patch("gpu_capability_command.subprocess.Popen", FakeProcess):
+            from gpu_capability_command import _probe_compiler_version
+            output = _probe_compiler_version(
+                self.compiler, CompilerFamily.MSVC, self.build, self.environment
+            )
+        command = captured["command"]
+        self.assertIn("/Bv", command)
+        self.assertIn("/EP", command)
+        self.assertIn("/TP", command)
+        self.assertTrue(command[-1].endswith(".cpp"))
+        self.assertIn(b"Microsoft", output)
+        self.assertFalse(captured["source"].exists())
+
+    def test_version_probe_cleans_descendants_after_parent_exits(self):
+        fixture = self.root / "probe-tree"
+        fixture.mkdir()
+        pid_file = fixture / "child.pid"
+        heartbeat = fixture / "heartbeat.txt"
+        child_code = (
+            "import os,pathlib,time\n"
+            "target=pathlib.Path(os.environ['GPU_PROBE_HEARTBEAT'])\n"
+            "while True:\n"
+            " target.write_text(str(time.monotonic()), encoding='ascii')\n"
+            " time.sleep(0.02)\n"
+        )
+        parent = fixture / "parent.py"
+        parent.write_text(
+            "import os,pathlib,subprocess,sys\n"
+            f"child_code={child_code!r}\n"
+            "child=subprocess.Popen([sys.executable, '-c', child_code], env=os.environ.copy())\n"
+            "pathlib.Path(os.environ['GPU_PROBE_PID']).write_text(str(child.pid), encoding='ascii')\n"
+            "print('gcc (GCC) 13.1.0', flush=True)\n",
+            encoding="utf-8",
+        )
+        environment = dict(
+            os.environ,
+            GPU_PROBE_PID=str(pid_file),
+            GPU_PROBE_HEARTBEAT=str(heartbeat),
+        )
+        from gpu_capability_command import _run_probe_command
+        output = _run_probe_command(
+            [sys.executable, str(parent)], Path(sys.executable), fixture, environment
+        )
+        self.assertIn(b"gcc (GCC)", output)
+        child_pid = int(pid_file.read_text(encoding="ascii"))
+        deadline = time.monotonic() + 2.0
+        while self._pid_is_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        survived = self._pid_is_alive(child_pid)
+        if survived:
+            subprocess.run(
+                ["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+            ) if os.name == "nt" else os.kill(child_pid, 9)
+        self.assertFalse(survived, "probe descendant survived cleanup")
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        if os.name != "nt":
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return False
+            return True
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        process = kernel32.OpenProcess(0x00100000, False, pid)
+        if not process:
+            return False
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        try:
+            return kernel32.WaitForSingleObject(process, 0) == 258
+        finally:
+            kernel32.CloseHandle(process)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,10 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path, PurePosixPath
@@ -37,18 +39,27 @@ _CCACHE_VALUE_OPTIONS = frozenset({
     "-o",
 })
 _CCACHE_FLAG_OPTIONS = frozenset({"--ccache-skip"})
-_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*=(.*)\Z", re.DOTALL)
-_SOURCE_SUFFIXES = frozenset({
-    ".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm", ".ixx", ".cppm"
+_CCACHE_COMPILER_OPTIONS = frozenset({"--compiler", "--compiler-type"})
+_CCACHE_COMPILER_ASSIGNMENTS = frozenset({
+    "compiler", "compiler_type", "prefix_command", "prefix_command_cpp"
 })
+_CCACHE_COMPILER_ENVIRONMENT = frozenset({
+    "ccache_compiler", "ccache_compilertype", "ccache_prefix", "ccache_prefix_cpp",
+    "ccache_cc",
+})
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*=(.*)\Z", re.DOTALL)
 _GNU_VALUE_OPTIONS = frozenset({
-    "-o", "-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros",
+    "-o", "-D", "-U", "-A", "-I", "-isystem", "-iquote", "-idirafter",
+    "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-include", "-imacros",
     "-isysroot", "--sysroot", "-x", "-target", "--target", "-arch", "-MF",
-    "-MT", "-MQ", "-MJ", "-F", "-iframework", "-include-pch",
+    "-MT", "-MQ", "-MJ", "-F", "-iframework", "-include-pch", "-include-pth",
+    "-Xclang", "-Xpreprocessor", "-Xassembler", "-Xlinker", "-B", "-specs",
+    "-wrapper", "-fmodule-file", "-fmodule-map-file",
 })
 _MSVC_VALUE_OPTIONS = frozenset({
-    "/I", "/FI", "/Fo", "/Fe", "/Fd", "/Fp", "/Yu", "/Yc",
-    "/sourceDependencies", "/external:I",
+    "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd", "/fp", "/yu", "/yc",
+    "/sourcedependencies", "/external:i", "/ai", "/fu", "/ifcoutput",
+    "/reference", "/headerunit", "/scanDependencies".casefold(),
 })
 _VERSION_SECONDS = 5.0
 _VERSION_BYTES = 1024 * 1024
@@ -161,6 +172,13 @@ def _validate_arguments(arguments: tuple[str, ...]) -> None:
             raise AuditInfrastructureError(f"unsupported shell syntax: {argument}")
 
 
+def _posix_command_split(command: str) -> tuple[str, ...]:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return tuple(lexer)
+
+
 def decode_compile_entry(
     entry: Mapping[str, object],
     database: Path,
@@ -203,7 +221,7 @@ def decode_compile_entry(
             arguments = (
                 _windows_command_line_split(command)
                 if windows
-                else tuple(shlex.split(command, posix=True))
+                else _posix_command_split(command)
             )
         except (ValueError, OSError) as error:
             raise AuditInfrastructureError("unsupported compile command quoting") from error
@@ -236,6 +254,10 @@ def strip_launchers(
                 break
             option_name = token.partition("=")[0]
             if option_name in _CCACHE_VALUE_OPTIONS:
+                if option_name in _CCACHE_COMPILER_OPTIONS:
+                    raise AuditInfrastructureError(
+                        f"ccache compiler override is unsupported: {token}"
+                    )
                 if "=" in token:
                     if not token.partition("=")[2]:
                         raise AuditInfrastructureError(
@@ -255,6 +277,10 @@ def strip_launchers(
             assignment = _ASSIGNMENT.fullmatch(token)
             if assignment:
                 name, _, value = token.partition("=")
+                if name.casefold().replace("-", "_") in _CCACHE_COMPILER_ASSIGNMENTS:
+                    raise AuditInfrastructureError(
+                        f"ccache compiler override is unsupported: {token}"
+                    )
                 if not value:
                     raise AuditInfrastructureError(f"invalid ccache assignment: {token}")
                 if name in assignments:
@@ -270,6 +296,84 @@ def strip_launchers(
     if index >= len(arguments):
         raise AuditInfrastructureError("compile command has launchers but no compiler")
     return Path(arguments[index]), tuple(arguments[index + 1 :]), assignments
+
+
+def _validate_ccache_config_sources(
+    arguments: tuple[str, ...], cwd: Path, environment: Mapping[str, str]
+) -> None:
+    paths: list[str] = []
+    index = 0
+    while index < len(arguments) and _launcher_name(arguments[index]) in _LAUNCHERS:
+        launcher = _launcher_name(arguments[index])
+        index += 1
+        if launcher != "ccache":
+            continue
+        while index < len(arguments):
+            token = arguments[index]
+            if token == "--":
+                index += 1
+                break
+            option_name, separator, attached = token.partition("=")
+            if option_name in _CCACHE_VALUE_OPTIONS:
+                if separator:
+                    value = attached
+                    index += 1
+                else:
+                    if index + 1 >= len(arguments):
+                        return  # strip_launchers() reports the precise syntax error.
+                    value = arguments[index + 1]
+                    index += 2
+                if option_name == "--config-path":
+                    paths.append(value)
+                if option_name == "--set-config":
+                    _reject_ccache_config_assignment(value, "--set-config")
+                continue
+            if token in _CCACHE_FLAG_OPTIONS or _ASSIGNMENT.fullmatch(token):
+                index += 1
+                continue
+            break
+
+    environment_config: str | None = None
+    for name, value in environment.items():
+        if name.casefold() == "ccache_configpath":
+            environment_config = value
+            break
+    if environment_config:
+        paths.append(environment_config)
+    canonical_paths: list[Path] = []
+    for value in paths:
+        path = Path(value)
+        if not path.is_absolute():
+            path = cwd / path
+        try:
+            canonical = path.resolve(strict=True)
+            metadata = canonical.stat()
+        except OSError as error:
+            raise AuditInfrastructureError(f"ccache config is unreadable: {path}") from error
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+            raise AuditInfrastructureError(f"ccache config is invalid or too large: {canonical}")
+        if canonical not in canonical_paths:
+            canonical_paths.append(canonical)
+    if len(canonical_paths) > 1:
+        raise AuditInfrastructureError("ambiguous ccache config paths")
+    for path in canonical_paths:
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="strict")
+        except (OSError, UnicodeError) as error:
+            raise AuditInfrastructureError(f"ccache config is unreadable: {path}") from error
+        for line in text.splitlines():
+            content = line.split("#", 1)[0].strip()
+            if not content or "=" not in content:
+                continue
+            _reject_ccache_config_assignment(content, str(path))
+
+
+def _reject_ccache_config_assignment(value: str, origin: str) -> None:
+    name = value.partition("=")[0].strip().casefold().replace("-", "_")
+    if name in _CCACHE_COMPILER_ASSIGNMENTS:
+        raise AuditInfrastructureError(
+            f"ccache config {origin} contains compiler override {name}"
+        )
 
 
 def _family_from_name(path: Path) -> CompilerFamily:
@@ -354,9 +458,15 @@ def _response_arguments(text: str, family: CompilerFamily, path: Path) -> tuple[
     try:
         if family in {CompilerFamily.GCC, CompilerFamily.CLANG}:
             return tuple(shlex.split(text, posix=True))
-        # CommandLineToArgvW gives argv[0] special quoting semantics. A response
-        # file contains only driver arguments, so supply and discard a sentinel.
-        return _windows_command_line_split(f'gpu-capability-response {text}')[1:]
+        # CommandLineToArgvW gives argv[0] special quoting semantics and does
+        # not treat CR/LF as whitespace. Driver command files parse each line.
+        result: list[str] = []
+        for line in text.splitlines():
+            if line.strip():
+                result.extend(
+                    _windows_command_line_split(f'gpu-capability-response {line}')[1:]
+                )
+        return tuple(result)
     except (ValueError, OSError, AuditInfrastructureError) as error:
         raise AuditInfrastructureError(f"unsupported response-file quoting: {path}") from error
 
@@ -445,42 +555,81 @@ def _probe_compiler_version(
     cwd: Path,
     environment: Mapping[str, str],
 ) -> bytes:
-    command = [str(compiler), "/Bv"] if family is CompilerFamily.MSVC else [str(compiler), "--version"]
+    probe_directory: tempfile.TemporaryDirectory[str] | None = None
+    if family is CompilerFamily.MSVC:
+        probe_directory = tempfile.TemporaryDirectory(prefix="gpu-capability-cl-probe-")
+        probe_source = Path(probe_directory.name) / "probe.cpp"
+        probe_source.write_bytes(b"\n")
+        command = [str(compiler), "/nologo", "/Bv", "/EP", "/TP", str(probe_source)]
+    else:
+        command = [str(compiler), "--version"]
+    try:
+        return _run_probe_command(command, compiler, cwd, environment)
+    finally:
+        if probe_directory is not None:
+            probe_directory.cleanup()
+
+
+def _run_probe_command(
+    command: list[str],
+    compiler: Path,
+    cwd: Path,
+    environment: Mapping[str, str],
+) -> bytes:
+    containment = _ProbeContainment()
     with tempfile.TemporaryFile(mode="w+b") as stdout_stream, tempfile.TemporaryFile(
         mode="w+b"
     ) as stderr_stream:
+        process: subprocess.Popen[bytes] | None = None
         try:
+            launch_command = containment.prepare_command(command)
             process = subprocess.Popen(
-                command,
+                launch_command,
                 cwd=str(cwd),
                 env=dict(environment),
                 shell=False,
-                stdin=subprocess.DEVNULL,
+                stdin=(subprocess.PIPE if containment.requires_handshake else subprocess.DEVNULL),
                 stdout=stdout_stream,
                 stderr=stderr_stream,
+                **containment.popen_arguments,
             )
+            containment.attach(process)
+            containment.release(process)
         except OSError as error:
+            containment.close()
             raise AuditInfrastructureError(f"compiler version probe failed: {compiler}") from error
-        deadline = time.monotonic() + _VERSION_SECONDS
-        failure: str | None = None
-        while True:
-            observed = os.fstat(stdout_stream.fileno()).st_size + os.fstat(
-                stderr_stream.fileno()
-            ).st_size
-            if observed > _VERSION_BYTES:
-                failure = "compiler version output limit exceeded"
-                break
-            if process.poll() is not None:
-                break
-            if time.monotonic() >= deadline:
-                failure = "compiler version probe timeout"
-                break
-            time.sleep(0.01)
-        if failure is not None:
-            process.kill()
-            process.wait(timeout=1.0)
-            raise AuditInfrastructureError(failure)
-        returncode = process.wait(timeout=1.0)
+        except AuditInfrastructureError:
+            if process is not None:
+                process.kill()
+                process.wait(timeout=1.0)
+            containment.close()
+            raise
+        try:
+            deadline = time.monotonic() + _VERSION_SECONDS
+            failure: str | None = None
+            while True:
+                observed = os.fstat(stdout_stream.fileno()).st_size + os.fstat(
+                    stderr_stream.fileno()
+                ).st_size
+                if observed > _VERSION_BYTES:
+                    failure = "compiler version output limit exceeded"
+                    break
+                if process.poll() is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    failure = "compiler version probe timeout"
+                    break
+                time.sleep(0.01)
+            if failure is not None:
+                containment.terminate()
+                process.kill()
+                process.wait(timeout=1.0)
+                raise AuditInfrastructureError(failure)
+            returncode = process.wait(timeout=1.0)
+        finally:
+            # Closing the Windows job or killing the POSIX process group also
+            # removes descendants after a nominally successful parent exit.
+            containment.close()
         observed = os.fstat(stdout_stream.fileno()).st_size + os.fstat(
             stderr_stream.fileno()
         ).st_size
@@ -501,6 +650,155 @@ def _probe_compiler_version(
     if len(combined) > _VERSION_BYTES:
         raise AuditInfrastructureError("compiler version output limit exceeded")
     return combined
+
+
+class _ProbeContainment:
+    """Own the complete version-probe process tree on every supported host."""
+
+    def __init__(self) -> None:
+        self._pid: int | None = None
+        self._job = _WindowsProbeJob() if os.name == "nt" else None
+
+    @property
+    def popen_arguments(self) -> dict[str, object]:
+        if os.name == "nt":
+            return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"start_new_session": True}
+
+    @property
+    def requires_handshake(self) -> bool:
+        return os.name == "nt"
+
+    def prepare_command(self, command: list[str]) -> list[str]:
+        if os.name != "nt":
+            return command
+        # The trusted helper cannot spawn the real compiler until the parent
+        # assigns it to the kill-on-close job, closing the assignment race.
+        helper = (
+            "import subprocess,sys;"
+            "sys.stdin.buffer.read(1);"
+            "raise SystemExit(subprocess.call(sys.argv[1:]))"
+        )
+        return [sys.executable, "-c", helper, *command]
+
+    def attach(self, process: subprocess.Popen[bytes]) -> None:
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return  # Deterministic unit-test process double.
+        self._pid = pid
+        if self._job is not None:
+            self._job.attach(process)
+
+    def release(self, process: subprocess.Popen[bytes]) -> None:
+        if not self.requires_handshake or self._pid is None:
+            return
+        if process.stdin is None:
+            raise AuditInfrastructureError("compiler probe handshake is unavailable")
+        process.stdin.write(b"1")
+        process.stdin.close()
+
+    def terminate(self) -> None:
+        if self._job is not None:
+            self._job.terminate()
+            return
+        if self._pid is not None:
+            try:
+                os.killpg(self._pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def close(self) -> None:
+        if self._job is not None:
+            self._job.close()
+            return
+        self.terminate()
+
+
+class _WindowsProbeJob:
+    """Kill-on-close Job Object used only by the bounded Windows probe."""
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            self._handle = None
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = tuple(
+                (name, ctypes.c_ulonglong)
+                for name in (
+                    "read_operations", "write_operations", "other_operations",
+                    "read_bytes", "write_bytes", "other_bytes",
+                )
+            )
+
+        class BasicLimits(ctypes.Structure):
+            _fields_ = (
+                ("per_process_user_time", ctypes.c_longlong),
+                ("per_job_user_time", ctypes.c_longlong),
+                ("limit_flags", wintypes.DWORD),
+                ("minimum_working_set", ctypes.c_size_t),
+                ("maximum_working_set", ctypes.c_size_t),
+                ("active_process_limit", wintypes.DWORD),
+                ("affinity", ctypes.c_size_t),
+                ("priority_class", wintypes.DWORD),
+                ("scheduling_class", wintypes.DWORD),
+            )
+
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = (
+                ("basic", BasicLimits),
+                ("io", IoCounters),
+                ("process_memory", ctypes.c_size_t),
+                ("job_memory", ctypes.c_size_t),
+                ("peak_process_memory", ctypes.c_size_t),
+                ("peak_job_memory", ctypes.c_size_t),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD
+        )
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise AuditInfrastructureError("cannot create compiler probe job object")
+        limits = ExtendedLimits()
+        limits.basic.limit_flags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            kernel32.CloseHandle(handle)
+            raise AuditInfrastructureError("cannot configure compiler probe job object")
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    def attach(self, process: subprocess.Popen[bytes]) -> None:
+        if self._handle is None:
+            return
+        raw_handle = getattr(process, "_handle", None)
+        if raw_handle is None or not self._kernel32.AssignProcessToJobObject(
+            self._handle, raw_handle
+        ):
+            raise AuditInfrastructureError("cannot contain compiler probe process tree")
+
+    def terminate(self) -> None:
+        if self._handle is not None:
+            self._kernel32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
 
 
 def _resolve_compiler(
@@ -596,40 +894,110 @@ def _canonical_argument_path(value: str, cwd: Path) -> Path:
     return path.resolve(strict=False)
 
 
-def _source_inputs(arguments: tuple[str, ...], cwd: Path) -> tuple[Path, ...]:
+def _source_inputs(
+    arguments: tuple[str, ...], cwd: Path, family: CompilerFamily
+) -> tuple[Path, ...]:
     sources: list[Path] = []
     index = 0
+    positional_only = False
     while index < len(arguments):
         value = arguments[index]
         if value == "-":
             raise AuditInfrastructureError("stdin cannot be a compile source")
-        if value in _GNU_VALUE_OPTIONS or value in _MSVC_VALUE_OPTIONS:
-            index += 2
+        if value == "--" and family in {
+            CompilerFamily.GCC, CompilerFamily.CLANG, CompilerFamily.CLANG_CL
+        }:
+            positional_only = True
+            index += 1
             continue
         lowered = value.casefold()
-        if lowered.startswith(("/tc", "/tp")) and len(value) > 3:
+        if not positional_only and value in _GNU_VALUE_OPTIONS and family in {
+            CompilerFamily.GCC, CompilerFamily.CLANG, CompilerFamily.CLANG_CL
+        }:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            index += 2
+            continue
+        if not positional_only and lowered in {"/tc", "/tp"} and family in {
+            CompilerFamily.MSVC, CompilerFamily.CLANG_CL
+        }:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a source: {value}")
+            candidate = arguments[index + 1]
+            if candidate == "-":
+                raise AuditInfrastructureError("stdin cannot be a compile source")
+            sources.append(_canonical_argument_path(candidate, cwd))
+            index += 2
+            continue
+        if not positional_only and lowered.startswith(("/tc", "/tp")) and len(value) > 3:
             candidate = value[3:]
             if candidate == "-":
                 raise AuditInfrastructureError("stdin cannot be a compile source")
             sources.append(_canonical_argument_path(candidate, cwd))
             index += 1
             continue
-        attached_prefixes = (
-            "-i", "-d", "-u", "-o", "-mf", "-mt", "-mq", "-mj", "--sysroot=",
-            "--target=", "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd", "/fp",
-            "/yu", "/yc", "/external:i",
-        )
-        if lowered.startswith(attached_prefixes):
+        if not positional_only and lowered in _MSVC_VALUE_OPTIONS and family in {
+            CompilerFamily.MSVC, CompilerFamily.CLANG_CL
+        }:
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            index += 2
+            continue
+        if not positional_only and value.startswith("-"):
             index += 1
             continue
-        if Path(value).suffix.casefold() in _SOURCE_SUFFIXES:
-            sources.append(_canonical_argument_path(value, cwd))
+        if not positional_only and value.startswith("/") and family in {
+            CompilerFamily.MSVC, CompilerFamily.CLANG_CL
+        }:
+            index += 1
+            continue
+        sources.append(_canonical_argument_path(value, cwd))
         index += 1
     return tuple(sources)
 
 
 def _same_path(first: Path, second: Path) -> bool:
     return os.path.normcase(str(first)) == os.path.normcase(str(second))
+
+
+def _reject_driver_dialect_overrides(arguments: tuple[str, ...]) -> None:
+    for value in arguments:
+        lowered = value.casefold()
+        if lowered == "--driver-mode" or lowered.startswith("--driver-mode="):
+            raise AuditInfrastructureError(f"explicit compiler driver mode is unsupported: {value}")
+        if lowered == "--rsp-quoting" or lowered.startswith("--rsp-quoting="):
+            raise AuditInfrastructureError(f"explicit response-file quoting mode is unsupported: {value}")
+        if lowered.startswith("/clang:") and (
+            "--driver-mode" in lowered or "--rsp-quoting" in lowered
+        ):
+            raise AuditInfrastructureError(f"hidden compiler driver/response mode is unsupported: {value}")
+
+
+def _msvc_environment_arguments(
+    environment: Mapping[str, str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    values: dict[str, str] = {}
+    for name, value in environment.items():
+        normalized = name.casefold()
+        if normalized in {"cl", "_cl_"}:
+            if normalized in values:
+                raise AuditInfrastructureError(f"ambiguous MSVC environment command line: {name}")
+            if len(value) > 32 * 1024 or "\0" in value:
+                raise AuditInfrastructureError(f"invalid MSVC environment command line: {name}")
+            values[normalized] = value
+
+    def decode(name: str) -> tuple[str, ...]:
+        value = values.get(name, "")
+        if not value.strip():
+            return ()
+        try:
+            return _windows_command_line_split(f"gpu-capability-environment {value}")[1:]
+        except AuditInfrastructureError as error:
+            raise AuditInfrastructureError(
+                f"unsupported MSVC environment command quoting: {name}"
+            ) from error
+
+    return decode("cl"), decode("_cl_")
 
 
 def make_configuration(
@@ -646,15 +1014,34 @@ def make_configuration(
     if not isinstance(entry_index, int) or isinstance(entry_index, bool) or entry_index < 0:
         raise AuditInfrastructureError("compile database entry index is invalid")
     cwd, decoded = decode_compile_entry(entry, database, windows=os.name == "nt")
+    launcher_names: list[str] = []
+    for value in decoded:
+        name = _launcher_name(value)
+        if name not in _LAUNCHERS:
+            break
+        launcher_names.append(name)
+    if "ccache" in launcher_names:
+        _validate_ccache_config_sources(decoded, cwd, environment)
+        for name in environment:
+            if name.casefold() in _CCACHE_COMPILER_ENVIRONMENT:
+                raise AuditInfrastructureError(
+                    f"ccache compiler environment override is unsupported: {name}"
+                )
     compiler_argument, compiler_arguments, _assignments = strip_launchers(decoded)
+    _reject_driver_dialect_overrides(compiler_arguments)
     family_hint = _family_from_name(compiler_argument)
     compiler = _resolve_compiler(compiler_argument, cwd, environment)
     version_output = _probe_compiler_version(compiler, family_hint, cwd, environment)
     family = identify_compiler(compiler, version_output)
     normalized_version = _normalize_version_output(version_output)
+    if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}:
+        prefix, suffix = _msvc_environment_arguments(environment)
+        compiler_arguments = (*prefix, *compiler_arguments, *suffix)
+        _reject_driver_dialect_overrides(compiler_arguments)
     expanded_arguments = expand_response_files(
         compiler_arguments, family, cwd, limits
     )
+    _reject_driver_dialect_overrides(expanded_arguments)
     _validate_arguments((str(compiler), *expanded_arguments))
 
     file_value = entry.get("file")
@@ -684,7 +1071,7 @@ def make_configuration(
         )
     source = identities[0]
 
-    source_inputs = _source_inputs(expanded_arguments, cwd)
+    source_inputs = _source_inputs(expanded_arguments, cwd, family)
     if len(source_inputs) > 1:
         raise AuditInfrastructureError("compile command has multiple source inputs")
     if not source_inputs:
