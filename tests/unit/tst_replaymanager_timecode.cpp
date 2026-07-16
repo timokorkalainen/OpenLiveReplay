@@ -13,6 +13,7 @@
 #include <atomic>
 #include <array>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <new>
 #include <thread>
@@ -105,6 +106,22 @@ public:
     QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
 };
 
+class TwoPacketNativeEncoder final : public NativeVideoEncoder {
+public:
+    bool encode(const AVFrame*, int64_t ptsTicks, const PacketCallback& onPacket,
+                QString*) override {
+        onPacket(QByteArray::fromHex("000001b300100113"), ptsTicks, true);
+        onPacket(QByteArray::fromHex("000001b300100114"), ptsTicks, false);
+        return true;
+    }
+    bool encodeSurface(GpuSurface*, int64_t, const ColorMetadata&, const PacketCallback&,
+                       QString*) override {
+        return false;
+    }
+    bool flush(const PacketCallback&, QString*) override { return true; }
+    QByteArray avccExtradata() const override { return QByteArrayLiteral("avcc"); }
+};
+
 AVCodecContext* makeDelayedMpeg2Encoder() {
     const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MPEG2VIDEO);
     if (!codec) return nullptr;
@@ -179,6 +196,7 @@ private slots:
     void callbackPoolGenerationRejectsAbaCompletion();
     void callbackDescriptorsAndSlotLifecycleAllocateNothing();
     void nativeFailureAfterPacketDoesNotWritePartialOutput();
+    void nativeTwoPacketBatchRejectsBeforePartialCommit();
     void boundedDriftReportsNonzeroUiBound();
     void overConfidenceTimecodeDoesNotMoveServo();
     void disconnectClearsTimecodeAnchor();
@@ -1207,7 +1225,37 @@ void TestReplayManagerTimecode::callbackPoolGenerationRejectsAbaCompletion() {
              uint32_t(completionGeneration + 1));
 
     worker.releaseMuxCompletionReservation(newCompletion);
+    worker.m_muxCompletionPool[completionIndex].generation = std::numeric_limits<uint32_t>::max();
+    worker.m_nextMuxCompletionSlot = completionIndex;
+    const uint64_t completionAfterExhaustion = worker.reserveMuxCompletion(newSubmission);
+    QVERIFY(completionAfterExhaustion != 0);
+    QVERIFY(completionAfterExhaustion != oldCompletion);
+    size_t completionAfterExhaustionIndex = 0;
+    uint32_t completionAfterExhaustionGeneration = 0;
+    QVERIFY(StreamWorker::decodePoolId(
+        completionAfterExhaustion, StreamWorker::kMuxCompletionPoolCapacity,
+        &completionAfterExhaustionIndex, &completionAfterExhaustionGeneration));
+    QVERIFY(completionAfterExhaustionIndex != completionIndex);
+    worker.completeMuxWrite(oldCompletion, false);
+    QVERIFY(worker.m_muxCompletionPool[completionAfterExhaustionIndex].active);
+    worker.releaseMuxCompletionReservation(completionAfterExhaustion);
+
     worker.finishEncodeSubmission(newSubmission);
+    worker.m_submissionPool[submissionIndex].generation = std::numeric_limits<uint32_t>::max();
+    worker.m_nextSubmissionSlot = submissionIndex;
+    const uint64_t submissionAfterExhaustion =
+        worker.acquireEncodeSubmission(false, 0, nullptr, nullptr, *token, 0);
+    QVERIFY(submissionAfterExhaustion != 0);
+    QVERIFY(submissionAfterExhaustion != oldSubmission);
+    size_t submissionAfterExhaustionIndex = 0;
+    uint32_t submissionAfterExhaustionGeneration = 0;
+    QVERIFY(StreamWorker::decodePoolId(
+        submissionAfterExhaustion, StreamWorker::kSubmissionPoolCapacity,
+        &submissionAfterExhaustionIndex, &submissionAfterExhaustionGeneration));
+    QVERIFY(submissionAfterExhaustionIndex != submissionIndex);
+    worker.failEncodeSubmission(oldSubmission);
+    QVERIFY(worker.m_submissionPool[submissionAfterExhaustionIndex].active);
+    worker.finishEncodeSubmission(submissionAfterExhaustion);
 }
 
 void TestReplayManagerTimecode::callbackDescriptorsAndSlotLifecycleAllocateNothing() {
@@ -1270,6 +1318,44 @@ void TestReplayManagerTimecode::nativeFailureAfterPacketDoesNotWritePartialOutpu
     QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
     QVERIFY(worker.m_latestFrameTimecodeEvidence.has_value());
 
+    av_frame_free(&worker.m_latestFrame);
+    muxer.close();
+}
+
+void TestReplayManagerTimecode::nativeTwoPacketBatchRejectsBeforePartialCommit() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-native-two-packet-capacity"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const uint64_t session = worker.beginCaptureSession();
+    const TimecodeEvidence value = evidence(tcFrames(1, 0, 0, 0), 1, 30, 1, 7, 11);
+    const auto token = worker.prepareCarrierTokenForFrameIngress(session, value);
+    QVERIFY(token);
+    worker.m_nativeEncoder = std::make_unique<TwoPacketNativeEncoder>();
+    worker.setViewTrack(0);
+    worker.m_latestFrame = makeSoftwareFrame();
+    QVERIFY(worker.m_latestFrame);
+    worker.m_latestFrameCarrierToken = token;
+    worker.m_latestFrameTimecodeEvidence = value;
+    worker.m_latestFrameTimecode100ns.store(123, std::memory_order_release);
+
+    std::array<uint64_t, StreamWorker::kMuxCompletionPoolCapacity - 1> heldCompletions{};
+    for (uint64_t& id : heldCompletions) {
+        id = worker.reserveMuxCompletion(0);
+        QVERIFY(id != 0);
+    }
+
+    worker.processEncoderTick(nullptr, 0, 0, 0);
+    QTest::qWait(100);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
+
+    for (uint64_t id : heldCompletions)
+        worker.releaseMuxCompletionReservation(id);
     av_frame_free(&worker.m_latestFrame);
     muxer.close();
 }

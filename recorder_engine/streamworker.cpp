@@ -744,9 +744,10 @@ uint64_t StreamWorker::acquireEncodeSubmission(bool gpu, int track, AVStream* st
     for (size_t offset = 0; offset < kSubmissionPoolCapacity; ++offset) {
         const size_t index = (m_nextSubmissionSlot + offset) % kSubmissionPoolCapacity;
         EncodeSubmissionSlot& slot = m_submissionPool[index];
-        if (slot.active) continue;
-        uint32_t generation = slot.generation + 1;
-        if (generation == 0) generation = 1;
+        // A wrapped generation would make an ancient asynchronous ID valid
+        // again. Permanently retire the fixed slot once its ID space is spent.
+        if (slot.active || slot.generation == std::numeric_limits<uint32_t>::max()) continue;
+        const uint32_t generation = slot.generation + 1;
         slot = EncodeSubmissionSlot{};
         slot.active = true;
         slot.generation = generation;
@@ -800,9 +801,9 @@ uint64_t StreamWorker::reserveMuxCompletion(uint64_t encodeSubmissionId,
     for (size_t offset = 0; offset < kMuxCompletionPoolCapacity; ++offset) {
         const size_t index = (m_nextMuxCompletionSlot + offset) % kMuxCompletionPoolCapacity;
         MuxCompletionSlot& slot = m_muxCompletionPool[index];
-        if (slot.active) continue;
-        uint32_t generation = slot.generation + 1;
-        if (generation == 0) generation = 1;
+        // Fail closed rather than wrap and revalidate an ancient completion.
+        if (slot.active || slot.generation == std::numeric_limits<uint32_t>::max()) continue;
+        const uint32_t generation = slot.generation + 1;
         slot = MuxCompletionSlot{};
         slot.active = true;
         slot.generation = generation;
@@ -879,6 +880,7 @@ void StreamWorker::finishEncodeSubmission(uint64_t submissionId) {
 void StreamWorker::failEncodeSubmission(uint64_t submissionId) {
     uint64_t evidenceSubmissionId = 0;
     bool triggerFallback = false;
+    SourceCarrierToken failureCarrier;
     {
         std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
         size_t index = 0;
@@ -888,6 +890,7 @@ void StreamWorker::failEncodeSubmission(uint64_t submissionId) {
         if (!slot.active || slot.generation != generation) return;
         slot.encoderFinished = true;
         evidenceSubmissionId = slot.evidenceSubmissionId;
+        failureCarrier = slot.carrierToken;
         if (slot.gpu && !slot.fallbackTriggered) {
             slot.fallbackTriggered = true;
             triggerFallback = true;
@@ -896,7 +899,10 @@ void StreamWorker::failEncodeSubmission(uint64_t submissionId) {
     }
     if (evidenceSubmissionId != 0) discardMuxFrameEvidence(evidenceSubmissionId);
 #if defined(OLR_GPU_PIPELINE_BUILD)
-    if (triggerFallback) latchGpuEncodeCpuFallback();
+    // A delayed failure from an invalidated carrier is cleanup, not evidence
+    // that the replacement session's GPU path failed. Authorize the exact
+    // immutable submission carrier before cancelling current work or rotating.
+    if (triggerFallback && carrierTokenIsCurrent(failureCarrier)) latchGpuEncodeCpuFallback();
 #else
     Q_UNUSED(triggerFallback);
 #endif
@@ -1003,6 +1009,170 @@ bool StreamWorker::takeBufferedSubmissionPacket(uint64_t submissionId,
     }
     *packet = std::move(slot.bufferedPackets[slot.nextBufferedPacket++]);
     return true;
+}
+
+void StreamWorker::commitBufferedEncodeSubmission(uint64_t submissionId) {
+    std::array<BufferedEncodedPacket, kMaxPacketsPerSubmission> bufferedPackets;
+    size_t packetCount = 0;
+    int track = -1;
+    AVStream* stream = nullptr;
+    bool* havePacket = nullptr;
+    bool gpu = false;
+    SourceCarrierToken expectedCarrierToken;
+    {
+        std::lock_guard<std::mutex> lock(m_submissionPoolMutex);
+        size_t index = 0;
+        uint32_t generation = 0;
+        if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &index, &generation)) return;
+        EncodeSubmissionSlot& slot = m_submissionPool[index];
+        if (!slot.active || slot.generation != generation || slot.encoderFinished ||
+            slot.packetOverflow) {
+            return;
+        }
+        packetCount = slot.bufferedPacketCount;
+        track = slot.track;
+        stream = slot.stream;
+        havePacket = slot.havePacket;
+        gpu = slot.gpu;
+        expectedCarrierToken = slot.carrierToken;
+        for (size_t i = 0; i < packetCount; ++i)
+            bufferedPackets[i] = std::move(slot.bufferedPackets[i]);
+        slot.nextBufferedPacket = packetCount;
+    }
+
+    if (packetCount == 0) {
+        finishEncodeSubmission(submissionId);
+        return;
+    }
+
+    std::array<AVPacket*, kMaxPacketsPerSubmission> avPackets{};
+    auto freePackets = [&avPackets] {
+        for (AVPacket*& packet : avPackets)
+            av_packet_free(&packet);
+    };
+    for (size_t i = 0; i < packetCount; ++i) {
+        const BufferedEncodedPacket& buffered = bufferedPackets[i];
+        AVPacket*& packet = avPackets[i];
+        packet = av_packet_alloc();
+        if (!packet || buffered.data.size() > std::numeric_limits<int>::max() ||
+            av_new_packet(packet, static_cast<int>(buffered.data.size())) < 0 || !stream ||
+            !m_muxer) {
+            freePackets();
+            failEncodeSubmission(submissionId);
+            return;
+        }
+        memcpy(packet->data, buffered.data.constData(), buffered.data.size());
+        packet->stream_index = track;
+        packet->pts = packet->dts =
+            av_rescale_q(buffered.ptsTicks, AVRational{1, m_targetFps}, stream->time_base);
+        packet->duration = av_rescale_q(1, AVRational{1, m_targetFps}, stream->time_base);
+        if (buffered.keyframe) packet->flags |= AV_PKT_FLAG_KEY;
+    }
+
+    enum class Preparation { Ready, StaleCarrier, Failed };
+    Preparation preparation = Preparation::Failed;
+    std::array<uint64_t, kMaxPacketsPerSubmission> completionIds{};
+    int64_t sourceTimecode100ns = -1;
+    {
+        // Batch authority and completion admission use the established
+        // epoch->evidence->pool lock order. Evidence is consumed only after
+        // every fixed completion slot is known to be available.
+        std::lock_guard<std::mutex> epochLock(m_epochMutex);
+        std::lock_guard<std::mutex> evidenceLock(m_muxFrameEvidenceMutex);
+        std::lock_guard<std::mutex> poolLock(m_submissionPoolMutex);
+        size_t submissionIndex = 0;
+        uint32_t submissionGeneration = 0;
+        if (!decodePoolId(submissionId, kSubmissionPoolCapacity, &submissionIndex,
+                          &submissionGeneration)) {
+            preparation = Preparation::StaleCarrier;
+        } else {
+            EncodeSubmissionSlot& submission = m_submissionPool[submissionIndex];
+            if (!submission.active || submission.generation != submissionGeneration ||
+                !carrierTokenIsCurrentLocked(expectedCarrierToken)) {
+                preparation = Preparation::StaleCarrier;
+            } else {
+                std::array<size_t, kMaxPacketsPerSubmission> completionIndices{};
+                size_t available = 0;
+                for (size_t offset = 0;
+                     offset < kMuxCompletionPoolCapacity && available < packetCount; ++offset) {
+                    const size_t index =
+                        (m_nextMuxCompletionSlot + offset) % kMuxCompletionPoolCapacity;
+                    const MuxCompletionSlot& candidate = m_muxCompletionPool[index];
+                    if (candidate.active ||
+                        candidate.generation == std::numeric_limits<uint32_t>::max()) {
+                        continue;
+                    }
+                    completionIndices[available++] = index;
+                }
+                if (available == packetCount) {
+                    auto frameEvidence =
+                        m_muxFrameEvidence.takeForOutputPts(bufferedPackets[0].ptsTicks);
+                    if (frameEvidence &&
+                        frameEvidence->carrierSessionIdentity ==
+                            expectedCarrierToken.sessionIdentity &&
+                        frameEvidence->carrierGeneration == expectedCarrierToken.epoch) {
+                        sourceTimecode100ns = frameEvidence->sourceTimecode100ns;
+                        for (size_t i = 0; i < packetCount; ++i) {
+                            const size_t completionIndex = completionIndices[i];
+                            MuxCompletionSlot& completion = m_muxCompletionPool[completionIndex];
+                            const uint32_t generation = completion.generation + 1;
+                            completion = MuxCompletionSlot{};
+                            completion.active = true;
+                            completion.generation = generation;
+                            completion.carrierToken = expectedCarrierToken;
+                            completion.encodeSubmissionId = submissionId;
+                            if (i == 0)
+                                completion.evidence = std::move(frameEvidence->timecodeEvidence);
+                            completionIds[i] = poolId(completionIndex, generation);
+                        }
+                        submission.evidenceResolved = true;
+                        submission.pendingWrites += static_cast<uint32_t>(packetCount);
+                        m_nextMuxCompletionSlot =
+                            (completionIndices[packetCount - 1] + 1) % kMuxCompletionPoolCapacity;
+                        preparation = Preparation::Ready;
+                    } else {
+                        // Delayed output can belong to a carrier invalidated before
+                        // this newer submission. Consume only that old mapping;
+                        // preserve the current submission's mapping for its later
+                        // packet and never convert stale output into GPU fallback.
+                        preparation = Preparation::StaleCarrier;
+                    }
+                }
+            }
+        }
+    }
+
+    if (preparation != Preparation::Ready) {
+        freePackets();
+        if (preparation == Preparation::StaleCarrier)
+            finishEncodeSubmission(submissionId);
+        else
+            failEncodeSubmission(submissionId);
+        return;
+    }
+
+    QString startTimecodeCandidate;
+    if (sourceTimecode100ns >= 0) {
+        const Smpte12mTimecode startTc =
+            Smpte12m::from100ns(sourceTimecode100ns, Smpte12m::kTimecodeNominalFps);
+        char buf[12];
+        startTimecodeCandidate = QString::fromLatin1(Smpte12m::format(startTc, buf));
+    }
+    std::array<Muxer::PacketWriteRequest, kMaxPacketsPerSubmission> requests;
+    const Muxer::PacketCarrierGuard guard = packetCarrierGuard(expectedCarrierToken);
+    for (size_t i = 0; i < packetCount; ++i) {
+        requests[i].packet = avPackets[i];
+        requests[i].onWritten = muxCompletionCallback(completionIds[i]);
+        requests[i].carrierGuard = guard;
+        if (i == 0) requests[i].startTimecodeCandidate = startTimecodeCandidate;
+    }
+#ifdef OLR_UNIT_TEST
+    runBeforeMuxPacketWriteForTest();
+#endif
+    const bool accepted = m_muxer->writePacketBatch(requests.data(), packetCount);
+    freePackets();
+    if (accepted && havePacket && !gpu) *havePacket = true;
+    finishEncodeSubmission(submissionId);
 }
 
 void StreamWorker::handleEncodedPacket(uint64_t submissionId, const QByteArray& data,
@@ -1123,6 +1293,10 @@ void StreamWorker::encodeFinishedThunk(void* context, uint64_t submissionId) {
     static_cast<StreamWorker*>(context)->finishEncodeSubmission(submissionId);
 }
 
+void StreamWorker::bufferedEncodeFinishedThunk(void* context, uint64_t submissionId) {
+    static_cast<StreamWorker*>(context)->commitBufferedEncodeSubmission(submissionId);
+}
+
 void StreamWorker::muxWriteCompletionThunk(void* context, uint64_t completionId, bool written) {
     static_cast<StreamWorker*>(context)->completeMuxWrite(completionId, written);
 }
@@ -1142,9 +1316,9 @@ StreamWorker::bufferedPacketCallbackForSubmission(uint64_t submissionId) noexcep
 #if defined(OLR_GPU_PIPELINE_BUILD)
 GpuEncodePump::JobCallbacks
 StreamWorker::gpuCallbacksForSubmission(uint64_t submissionId) noexcept {
-    return GpuEncodePump::JobCallbacks{this, submissionId, &StreamWorker::encodedPacketThunk,
+    return GpuEncodePump::JobCallbacks{this, submissionId, &StreamWorker::bufferedPacketThunk,
                                        &StreamWorker::encodeFailureThunk,
-                                       &StreamWorker::encodeFinishedThunk};
+                                       &StreamWorker::bufferedEncodeFinishedThunk};
 }
 #endif
 
@@ -1333,10 +1507,15 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                         hasSyntheticGpuLatest);
                     if (evidenceSubmission.id == 0 ||
                         !setEncodeSubmissionEvidenceId(submissionId, evidenceSubmission.id)) {
+                        const bool carrierAuthorized =
+                            submissionToken && carrierTokenIsCurrent(*submissionToken);
                         if (evidenceSubmission.id != 0)
                             discardMuxFrameEvidence(evidenceSubmission.id);
                         finishEncodeSubmission(submissionId);
-                        latchGpuEncodeCpuFallback();
+                        // A reset can invalidate the carrier between latest-frame
+                        // validation and evidence insertion. That stale rejection
+                        // must not disable GPU encode for the replacement carrier.
+                        if (carrierAuthorized) latchGpuEncodeCpuFallback();
                     } else {
                         submittedGpuEncode = m_gpuEncodePump->submit(
                             m_latestGpuFrame, m_latestGpuFenceValue, m_internalFrameCount,
@@ -1402,16 +1581,10 @@ void StreamWorker::processEncoderTick(AVCodecContext* encCtx, int64_t streamTime
                     }
                     const bool packetBatchValid = encoded && bufferedSubmissionReady(submissionId);
                     if (packetBatchValid) {
-                        const auto packetCallback = packetCallbackForSubmission(submissionId);
-                        BufferedEncodedPacket packet;
-                        while (takeBufferedSubmissionPacket(submissionId, &packet)) {
-                            packetCallback(packet.data, packet.ptsTicks, packet.keyframe);
-                        }
-                    }
-                    finishEncodeSubmission(submissionId);
-                    if (packetBatchValid) {
+                        commitBufferedEncodeSubmission(submissionId);
                         m_latestFrameTimecode100ns.store(-1, std::memory_order_release);
                     } else {
+                        finishEncodeSubmission(submissionId);
                         if (encoded) qWarning() << "Native encoder exceeded bounded packet batch";
                         discardMuxFrameEvidence(evidenceSubmission.id);
                         if (muxEvidence && !m_latestFrameTimecodeEvidence)

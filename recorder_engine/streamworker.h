@@ -377,6 +377,7 @@ private:
                              bool keyframe);
     bool bufferedSubmissionReady(uint64_t submissionId) const;
     bool takeBufferedSubmissionPacket(uint64_t submissionId, BufferedEncodedPacket* packet);
+    void commitBufferedEncodeSubmission(uint64_t submissionId);
     void completeMuxWrite(uint64_t completionId, bool written);
     static void encodedPacketThunk(void* context, uint64_t submissionId, const QByteArray& data,
                                    int64_t ptsTicks, bool keyframe);
@@ -384,6 +385,7 @@ private:
                                     int64_t ptsTicks, bool keyframe);
     static void encodeFailureThunk(void* context, uint64_t submissionId);
     static void encodeFinishedThunk(void* context, uint64_t submissionId);
+    static void bufferedEncodeFinishedThunk(void* context, uint64_t submissionId);
     static void muxWriteCompletionThunk(void* context, uint64_t completionId, bool written);
     static bool packetCarrierGuardThunk(void* context, uint64_t sessionIdentity, uint64_t epoch);
     NativeVideoEncoder::PacketCallback packetCallbackForSubmission(uint64_t submissionId) noexcept;

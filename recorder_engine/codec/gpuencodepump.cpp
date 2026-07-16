@@ -32,7 +32,10 @@ void GpuEncodePump::start() {
 }
 
 void GpuEncodePump::stop() {
-    m_running.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_running.store(false, std::memory_order_release);
+    }
     m_cv.notify_all();
     if (m_thread.joinable()) m_thread.join();
 }

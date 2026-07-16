@@ -8,7 +8,14 @@
 #include <algorithm>
 #include <limits>
 
-Muxer::Muxer() {}
+Muxer::Muxer() {
+    static_assert(std::is_nothrow_default_constructible_v<QueuedPacket>);
+    static_assert(std::is_nothrow_move_constructible_v<QueuedPacket>);
+    static_assert(std::is_nothrow_move_assignable_v<QueuedPacket>);
+    static_assert(std::is_nothrow_default_constructible_v<AcceptedCandidate>);
+    static_assert(std::is_nothrow_move_constructible_v<AcceptedCandidate>);
+    static_assert(std::is_nothrow_move_assignable_v<AcceptedCandidate>);
+}
 
 Muxer::~Muxer() {
     close();
@@ -376,13 +383,32 @@ void Muxer::undoStartTimecodeCandidatePublication(const QString& tc, uint64_t pu
 
 bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten,
                         const QString& startTimecodeCandidate, PacketCarrierGuard carrierGuard) {
+    PacketWriteRequest request{pkt, onWritten, startTimecodeCandidate, carrierGuard};
+    return writePacketBatch(&request, 1);
+}
+
+bool Muxer::writePacketBatch(const PacketWriteRequest* packets, size_t packetCount) {
     // ENQUEUE-ONLY. Clone the caller's packet (the caller still owns theirs,
     // exactly as before) and hand the clone to the writer thread, then return
     // immediately. The DTS-bump, av_write_frame and avio_flush all happen on
     // the writer thread — so a stalled disk no longer blocks the caller.
     const bool writerThreadDrain = (t_writerMuxer == this);
+    auto rejectAll = [packets, packetCount](std::array<AVPacket*, kMaxPacketBatch>& clones) {
+        for (AVPacket*& clone : clones)
+            av_packet_free(&clone);
+        if (!packets) return;
+        for (size_t i = 0; i < packetCount; ++i) {
+            if (packets[i].onWritten) packets[i].onWritten(false);
+        }
+    };
+    std::array<AVPacket*, kMaxPacketBatch> clones{};
+    if (!packets || packetCount == 0 || packetCount > kMaxPacketBatch ||
+        packetCount > kMaxQueuedPackets) {
+        rejectAll(clones);
+        return false;
+    }
     if (!m_writerRunning.load(std::memory_order_acquire) && !writerThreadDrain) {
-        if (onWritten) onWritten(false);
+        rejectAll(clones);
         return false;
     }
 
@@ -392,15 +418,16 @@ bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten,
     // TC can win the tmcd tag. Enqueue-only here keeps the producer non-blocking
     // and lets the writer hold early no-TC packets without dropping or reordering.
 
-    if (!pkt) {
-        if (onWritten) onWritten(false);
-        return false;
-    }
-
-    AVPacket* localPkt = av_packet_clone(pkt);
-    if (!localPkt) {
-        if (onWritten) onWritten(false);
-        return false;
+    for (size_t i = 0; i < packetCount; ++i) {
+        if (!packets[i].packet) {
+            rejectAll(clones);
+            return false;
+        }
+        clones[i] = av_packet_clone(packets[i].packet);
+        if (!clones[i]) {
+            rejectAll(clones);
+            return false;
+        }
     }
 
     std::unique_lock<std::mutex> lk(m_qMutex);
@@ -410,50 +437,72 @@ bool Muxer::writePacket(AVPacket* pkt, PacketWriteCallback onWritten,
     // literally cannot keep up — but it is still strictly better than blocking
     // on every single packet. During shutdown drain, blocked producers wake and
     // reject if still full; in-flight packets may still enqueue when space exists.
-    m_qCv.wait(lk, [this, writerThreadDrain] {
-        return writerThreadDrain || m_pktQueue.size() < kMaxQueuedPackets ||
+    m_qCv.wait(lk, [this, writerThreadDrain, packetCount] {
+        return writerThreadDrain || m_pktQueue.size() <= kMaxQueuedPackets - packetCount ||
                !m_writerRunning.load(std::memory_order_acquire) ||
                !m_blockingWritesAllowed.load(std::memory_order_acquire);
     });
     if (!m_writerRunning.load(std::memory_order_acquire) && !writerThreadDrain) {
         // Shutting down; do not enqueue (close() is draining/finishing).
         lk.unlock();
-        av_packet_free(&localPkt);
-        if (onWritten) onWritten(false);
+        rejectAll(clones);
         return false;
     }
-    if (!writerThreadDrain && m_pktQueue.size() >= kMaxQueuedPackets) {
+    if (!writerThreadDrain && m_pktQueue.size() > kMaxQueuedPackets - packetCount) {
         lk.unlock();
-        av_packet_free(&localPkt);
-        if (onWritten) onWritten(false);
+        rejectAll(clones);
+        return false;
+    }
+    if (m_pktQueue.size() > m_pktQueue.capacity() - packetCount) {
+        lk.unlock();
+        rejectAll(clones);
         return false;
     }
     // The caller may have validated an immutable carrier before blocking on
     // backpressure. Recheck immediately before candidate/queue commit so a reset
     // during that wait cannot admit stale packet metadata.
-    if (!carrierGuard.accepts()) {
-        lk.unlock();
-        av_packet_free(&localPkt);
-        if (onWritten) onWritten(false);
-        return false;
+    for (size_t i = 0; i < packetCount; ++i) {
+        if (!packets[i].carrierGuard.accepts()) {
+            lk.unlock();
+            rejectAll(clones);
+            return false;
+        }
     }
     // Commit only after every rejection point above. This critical section is
     // also the queue append, so the first accepted valid candidate wins in the
     // same order that concurrent producers enter the writer queue.
-    if (m_nextQueuedPacketSequence == 0) {
+    size_t candidateCount = 0;
+    if (!m_startTimecodeCandidateWindowClosed) {
+        for (size_t i = 0; i < packetCount; ++i) {
+            if (isWellFormedTimecode(packets[i].startTimecodeCandidate)) ++candidateCount;
+        }
+    }
+    if (candidateCount >
+        m_acceptedStartTimecodeCandidates.capacity() - m_acceptedStartTimecodeCandidates.size()) {
         lk.unlock();
-        av_packet_free(&localPkt);
-        if (onWritten) onWritten(false);
+        rejectAll(clones);
         return false;
     }
-    const uint64_t packetSequence = m_nextQueuedPacketSequence++;
-    if (!m_startTimecodeCandidateWindowClosed && isWellFormedTimecode(startTimecodeCandidate)) {
-        m_acceptedStartTimecodeCandidates.push_back(
-            AcceptedCandidate{startTimecodeCandidate, carrierGuard, packetSequence});
-        if (m_acceptedStartTimecodeCandidate.isEmpty())
-            m_acceptedStartTimecodeCandidate = startTimecodeCandidate;
+    if (m_nextQueuedPacketSequence == 0 ||
+        packetCount - 1 > std::numeric_limits<uint64_t>::max() - m_nextQueuedPacketSequence) {
+        lk.unlock();
+        rejectAll(clones);
+        return false;
     }
-    m_pktQueue.push(QueuedPacket{localPkt, std::move(onWritten), carrierGuard, packetSequence});
+    for (size_t i = 0; i < packetCount; ++i) {
+        const uint64_t packetSequence = m_nextQueuedPacketSequence++;
+        const PacketWriteRequest& request = packets[i];
+        if (!m_startTimecodeCandidateWindowClosed &&
+            isWellFormedTimecode(request.startTimecodeCandidate)) {
+            m_acceptedStartTimecodeCandidates.push_back(AcceptedCandidate{
+                request.startTimecodeCandidate, request.carrierGuard, packetSequence});
+            if (m_acceptedStartTimecodeCandidate.isEmpty())
+                m_acceptedStartTimecodeCandidate = request.startTimecodeCandidate;
+        }
+        m_pktQueue.push(
+            QueuedPacket{clones[i], request.onWritten, request.carrierGuard, packetSequence});
+        clones[i] = nullptr;
+    }
     lk.unlock();
     m_qCv.notify_one();
     return true;
