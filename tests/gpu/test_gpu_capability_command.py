@@ -1182,6 +1182,104 @@ class CommandRewriteTests(unittest.TestCase):
                 ):
                     self.rewrite(family, ("-Xpreprocessor", payload, "file.cpp"))
 
+    def test_clang_frontend_dependency_and_action_controls_fail_closed(self):
+        value_controls = (
+            ("-dependency-dot", "hidden.dot", "dependency"),
+            ("-dependency-file", "hidden.d", "dependency"),
+            ("-serialize-diagnostic-file", "hidden.dia", "output"),
+            ("-diagnostic-log-file", "hidden.log", "output"),
+            ("-stats-file", "hidden.stats", "output"),
+            ("-main-file-name", "other.cpp", "source-selection"),
+            ("-plugin", "hidden-plugin", "action"),
+            ("-add-plugin", "hidden-plugin", "action"),
+            ("-load", "hidden-plugin.dll", "action"),
+            ("-code-completion-at", "file.cpp:1:1", "action"),
+        )
+        flag_controls = (
+            ("-dump-tokens", "action"),
+            ("-dump-raw-tokens", "action"),
+            ("-Eonly", "action"),
+            ("-emit-ast", "action"),
+            ("-emit-codegen-only", "action"),
+            ("-emit-llvm-only", "action"),
+            ("-emit-obj", "action"),
+            ("-emit-pch", "action"),
+            ("-emit-module", "action"),
+            ("-rewrite-objc", "action"),
+            ("-rewrite-macros", "action"),
+            ("-ast-dump", "action"),
+            ("-ast-print", "action"),
+            ("-analyze", "action"),
+            ("-fixit", "action"),
+            ("-fixit-recompile", "action"),
+            ("-verify", "action"),
+            ("-syntax-only", "action"),
+        )
+        attached_controls = (
+            ("-dependency-dot=hidden.dot", "dependency"),
+            ("-code-completion-at=file.cpp:1:1", "action"),
+            ("-verify=expected", "action"),
+            ("-ast-dump-filter=GpuSurface", "action"),
+            ("-fmodule-output=hidden.pcm", "output"),
+            ("-unknown-future-action=hidden", "action"),
+            ("-unknown-future-cc1-control", "ambiguous"),
+        )
+
+        for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
+            for option, operand, category in value_controls:
+                arguments = (
+                    ("-Xclang", option, "-Xclang", operand, "file.cpp")
+                    if family is CompilerFamily.CLANG
+                    else (f"/clang:{option}", f"/clang:{operand}", "file.cpp")
+                )
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, f"hidden.*{category}"
+                ):
+                    self.rewrite(family, arguments)
+            for option, category in (*flag_controls, *attached_controls):
+                arguments = (
+                    ("-Xclang", option, "file.cpp")
+                    if family is CompilerFamily.CLANG
+                    else (f"/clang:{option}", "file.cpp")
+                )
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, f"hidden.*{category}"
+                ):
+                    self.rewrite(family, arguments)
+
+    def test_clang_frontend_semantic_preprocessor_target_and_module_controls_survive(self):
+        safe_pairs = (
+            ("-include", "forced.h"),
+            ("-isystem", "SDK Path"),
+            ("-triple", "x86_64-pc-windows-msvc"),
+            ("-target-cpu", "x86-64"),
+            ("-target-feature", "+sse2"),
+            ("-fmodule-map-file", "module.modulemap"),
+            ("-fmodule-file", "Core=Core.pcm"),
+            ("-fmodules-cache-path", "module-cache"),
+        )
+        safe_flags = (
+            "-DKEEP=1", "-UOLD", "-Iinclude", "-std=c++20",
+            "-fmodules", "-fimplicit-module-maps", "-fcxx-exceptions",
+            "-Wno-unknown-warning-option",
+        )
+        for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
+            arguments: list[str] = []
+            for option, operand in safe_pairs:
+                if family is CompilerFamily.CLANG:
+                    arguments.extend(("-Xclang", option, "-Xclang", operand))
+                else:
+                    arguments.extend((f"/clang:{option}", f"/clang:{operand}"))
+            for option in safe_flags:
+                if family is CompilerFamily.CLANG:
+                    arguments.extend(("-Xclang", option))
+                else:
+                    arguments.append(f"/clang:{option}")
+            arguments.append("file.cpp")
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, tuple(arguments))
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], tuple(arguments))
+
     def test_forwarded_semantic_options_preserve_option_looking_operands(self):
         controls = (
             (CompilerFamily.GCC,

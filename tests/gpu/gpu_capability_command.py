@@ -1155,7 +1155,46 @@ _GNU_FORWARDED_VALUE_OPTIONS = frozenset({
     "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-include", "-imacros",
     "-isysroot", "--sysroot", "--define-macro", "--undefine-macro",
     "--include", "--imacros",
+    "-F", "-iframework", "-ivfsoverlay", "-resource-dir", "-std", "-stdlib",
+    "-triple", "-target-cpu", "-target-feature", "-target-abi",
+    "-fmodule-map-file", "-fmodule-file", "-fmodule-name", "-fmodule-format",
+    "-fmodules-cache-path", "-fprebuilt-module-path",
 })
+
+_CLANG_FRONTEND_DEPENDENCY_OPTIONS = frozenset({
+    "-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ", "-MJ",
+    "-dependency-dot", "-dependency-file", "--dependency-file",
+    "--dependencies", "--user-dependencies", "--write-dependencies",
+    "--write-user-dependencies", "--print-missing-file-dependencies",
+    "-sys-header-deps", "-module-file-deps", "-show-includes",
+})
+_CLANG_FRONTEND_OUTPUT_OPTIONS = frozenset({
+    "-o", "--output", "--dump", "-d", "-dM", "-dD", "-dN", "-dI", "-dU",
+    "-serialize-diagnostics", "--serialize-diagnostics",
+    "-serialize-diagnostic-file", "-diagnostic-log-file", "-stats-file",
+})
+_CLANG_FRONTEND_ACTION_PREFIXES = (
+    "-emit-", "-dump-", "-ast-", "-analy", "-plugin", "-add-plugin",
+    "-load", "-fplugin", "-code-completion", "-fixit", "-verify",
+    "-rewrite-", "-print-", "-action", "-execute", "-arcmt-", "-objcmt-",
+    "-migrate", "-index-", "-extract-api",
+)
+_CLANG_FRONTEND_ACTION_OPTIONS = frozenset({
+    "-E", "-Eonly", "-syntax-only", "-fsyntax-only",
+})
+_CLANG_FRONTEND_SAFE_FLAGS = frozenset({
+    "-undef", "-nostdinc", "-nostdinc++", "-nobuiltininc", "-pthread",
+    "-fmodules", "-fimplicit-module-maps", "-fmodules-decluse",
+    "-fmodules-strict-decluse", "-fmodules-local-submodule-visibility",
+    "-fcxx-exceptions", "-fexceptions", "-fno-exceptions", "-frtti", "-fno-rtti",
+    "-fdelayed-template-parsing", "-fblocks", "-fcoroutines", "-fchar8_t",
+    "-fno-char8_t", "-pedantic", "-pedantic-errors",
+})
+_CLANG_FRONTEND_SAFE_PREFIXES = (
+    "-D", "-U", "-I", "-F", "-W", "-R", "-O", "-g", "-m",
+    "-std=", "-stdlib=", "-target-", "-triple=", "-fmodule-", "-fmodules-",
+    "-fprebuilt-module-path=", "-fms-", "-fobjc-",
+)
 
 
 def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
@@ -1175,41 +1214,56 @@ def _gnu_forwarded_control(payload: str) -> str | None:
     if not candidate.startswith(("-", "@")):
         return None
     lowered = candidate.casefold()
+    option_name = candidate.partition("=")[0]
     if candidate in {"-P", "--no-line-commands"} or lowered.startswith(
         "-frewrite-includes"
     ):
         return "marker"
-    if candidate in {"-c", "-S"} or lowered.startswith(
-        ("-fpreprocessed", "-fdirectives-only")
+    if candidate in {"-c", "-S", "-x"} or lowered.startswith(
+        ("-fpreprocessed", "-fdirectives-only", "-main-file-name")
     ):
         return "source-selection"
-    if candidate == "-x" or "cpp-output" in lowered:
+    if "cpp-output" in lowered:
         return "source-selection"
-    if candidate in {
-        "-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ",
-        "-MJ", "-dependency-file", "--dependency-file",
-        "--dependencies", "--user-dependencies", "--write-dependencies",
-        "--write-user-dependencies", "--print-missing-file-dependencies",
-    } or any(
+    if candidate in _CLANG_FRONTEND_DEPENDENCY_OPTIONS or any(
         candidate.startswith(prefix) and len(candidate) > len(prefix)
         for prefix in ("-MF", "-MT", "-MQ", "-MJ")
-    ) or lowered.startswith(("-dependency-file=", "--dependency-file=")):
+    ) or "dependenc" in option_name.casefold():
         return "dependency"
     if candidate == "-o" or candidate.startswith("-o") and len(candidate) > 2:
         return "output"
-    if candidate in {"--output", "-d", "-dM", "-dD", "-dN", "-dI", "-dU"}:
+    if candidate in _CLANG_FRONTEND_OUTPUT_OPTIONS:
         return "output"
     if lowered.startswith(("--output=", "--dump=")) or candidate == "--dump":
         return "output"
     if lowered.startswith((
         "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
         "-fmodule-output", "-serialize-diagnostics", "--serialize-diagnostics",
+        "-serialize-diagnostic-file", "-diagnostic-log-file", "-stats-file",
         "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
     )):
         return "output"
+    if candidate in _CLANG_FRONTEND_ACTION_OPTIONS or option_name.startswith(
+        _CLANG_FRONTEND_ACTION_PREFIXES
+    ):
+        return "action"
+    # cc1 is explicitly unstable. Do not allow a future action selector merely
+    # because its spelling was absent when this audit was authored.
+    if any(
+        fragment in option_name.casefold()
+        for fragment in (
+            "action", "completion", "plugin", "analy", "fixit", "verify",
+            "rewrite", "emit", "dump", "output",
+        )
+    ):
+        return "action"
     if candidate.startswith("@"):
         return "response"
-    return None
+    if candidate in _CLANG_FRONTEND_SAFE_FLAGS or candidate.startswith(
+        _CLANG_FRONTEND_SAFE_PREFIXES
+    ):
+        return None
+    return "ambiguous"
 
 
 @dataclass(frozen=True, slots=True)
