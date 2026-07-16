@@ -1209,6 +1209,95 @@ class PublicationTests(unittest.TestCase):
             first.layout.as_posix().encode("utf-8"),
         )
 
+    def test_warm_hit_holds_object_before_manifest_read_or_generated_render(self) -> None:
+        rendered_at: list[Path] = []
+
+        def render(final_layout: Path) -> bytes:
+            rendered_at.append(final_layout)
+            return b"generated"
+
+        generated = GeneratedLayoutEntry("held-hit-v1", {}, render)
+        entries = ((Path("generated.txt"), generated),)
+        published = self.publish_and_close("held-hit", entries)
+        rendered_at.clear()
+
+        real_object = self.cache.quarantine / "held-hit-real"
+        self.force_mutable(published.object_root)
+        runtime_cache._set_path_acl(self.cache.objects, self.sid, "BUILD")
+        published.object_root.rename(real_object)
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(published.object_root), str(real_object)],
+            check=True,
+            capture_output=True,
+        )
+        try:
+            with mock.patch.object(
+                runtime_cache,
+                "_read_manifest",
+                wraps=runtime_cache._read_manifest,
+            ) as read_manifest:
+                with self.assertRaisesRegex(RuntimeError, "reparse"):
+                    self.cache.materialize("held-hit", entries, context={})
+            self.assertNotIn(
+                published.object_root,
+                [call.args[0] for call in read_manifest.call_args_list],
+            )
+            self.assertEqual(rendered_at, [])
+        finally:
+            if os.path.lexists(published.object_root):
+                os.rmdir(published.object_root)
+
+    def test_race_loser_holds_winner_before_manifest_read_or_generated_render(self) -> None:
+        rendered_at: list[Path] = []
+
+        def render(final_layout: Path) -> bytes:
+            rendered_at.append(final_layout)
+            return b"generated"
+
+        generated = GeneratedLayoutEntry("held-race-v1", {}, render)
+        entries = ((Path("generated.txt"), generated),)
+        published = self.publish_and_close("held-race", entries)
+        rendered_at.clear()
+
+        real_object = self.cache.quarantine / "held-race-real"
+        self.force_mutable(published.object_root)
+        runtime_cache._set_path_acl(self.cache.objects, self.sid, "BUILD")
+        published.object_root.rename(real_object)
+
+        def publish_alias_then_lose(
+            _source: Path, destination: Path, *, sealed=None
+        ) -> None:
+            self.assertIsNotNone(sealed)
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(destination), str(real_object)],
+                check=True,
+                capture_output=True,
+            )
+            raise FileExistsError("simulated concurrent winner")
+
+        try:
+            with mock.patch.object(
+                runtime_cache,
+                "_atomic_move_no_replace",
+                side_effect=publish_alias_then_lose,
+            ), mock.patch.object(
+                runtime_cache,
+                "_read_manifest",
+                wraps=runtime_cache._read_manifest,
+            ) as read_manifest:
+                with self.assertRaisesRegex(RuntimeError, "reparse"):
+                    self.cache.materialize("held-race", entries, context={})
+            self.assertNotIn(
+                published.object_root,
+                [call.args[0] for call in read_manifest.call_args_list],
+            )
+            # One render is required to build the losing staging tree. The
+            # winner alias must be rejected before any second render.
+            self.assertEqual(len(rendered_at), 1)
+        finally:
+            if os.path.lexists(published.object_root):
+                os.rmdir(published.object_root)
+
     def test_manifest_is_written_last_and_only_complete_tree_is_published(self) -> None:
         observed = {"render_before_manifest": False, "sealed_complete": False}
 
@@ -1280,6 +1369,61 @@ class PublicationTests(unittest.TestCase):
                     invoke()
                 self.assertEqual(tuple(self.cache.objects.iterdir()), ())
                 self.assertEqual(tuple(self.cache.staging.iterdir()), ())
+
+    def test_entry_limit_bounds_iteration_before_key_sort_or_encoding(self) -> None:
+        yielded = 0
+
+        def oversized_entries():
+            nonlocal yielded
+            for index in range(4):
+                yielded += 1
+                yield Path(f"value-{index}.bin"), b"x"
+            raise AssertionError("entry iterator consumed past the configured bound")
+
+        with mock.patch.object(
+            runtime_cache, "layout_key", wraps=runtime_cache.layout_key
+        ) as key_builder, mock.patch.object(
+            runtime_cache, "canonical_json", wraps=runtime_cache.canonical_json
+        ) as encoder:
+            with self.assertRaisesRegex(RuntimeError, "entry limit exceeded"):
+                self.cache.materialize(
+                    "bounded-count",
+                    oversized_entries(),
+                    context={},
+                    entry_limit=3,
+                )
+
+        self.assertEqual(yielded, 4)
+        key_builder.assert_not_called()
+        encoder.assert_not_called()
+
+    def test_cheap_entry_validation_and_byte_limits_precede_key_work(self) -> None:
+        cases = (
+            ("destination", (("not-a-path", b"x"),), 1024, "destination"),
+            ("entry-type", ((Path("value.bin"), object()),), 1024, "entry"),
+            ("literal-bytes", ((Path("value.bin"), b"oversized"),), 4, "byte limit"),
+            (
+                "held-bytes",
+                ((Path("value.bin"), self.held_file("oversized.bin", b"oversized")),),
+                4,
+                "byte limit",
+            ),
+        )
+        for name, entries, byte_limit, message in cases:
+            with self.subTest(name=name), mock.patch.object(
+                runtime_cache, "layout_key", wraps=runtime_cache.layout_key
+            ) as key_builder, mock.patch.object(
+                runtime_cache, "canonical_json", wraps=runtime_cache.canonical_json
+            ) as encoder:
+                with self.assertRaisesRegex((RuntimeError, TypeError), message):
+                    self.cache.materialize(
+                        "bounded-entry",
+                        entries,
+                        context={},
+                        byte_limit=byte_limit,
+                    )
+                key_builder.assert_not_called()
+                encoder.assert_not_called()
 
     def test_source_is_revalidated_and_copied_from_the_resolved_held_stream(self) -> None:
         source = self.held_file("held.bin", b"before")

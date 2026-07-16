@@ -1655,6 +1655,90 @@ def _remove_staging_tree(path: Path, sid: str) -> None:
     shutil.rmtree(path)
 
 
+def _bounded_entry_snapshot(
+    entries: LayoutEntries,
+    *,
+    entry_limit: int,
+    byte_limit: int,
+) -> tuple[tuple[Path, LayoutEntry], ...]:
+    """Reject cheap structural/size failures before sorting or hashing keys."""
+    if type(entry_limit) is not int or entry_limit < 0:
+        raise RuntimeError(
+            "runtime cache entry limit must be a nonnegative integer"
+        )
+    if type(byte_limit) is not int or byte_limit < 0:
+        raise RuntimeError(
+            "runtime cache byte limit must be a nonnegative integer"
+        )
+
+    snapshot: list[tuple[Path, LayoutEntry]] = []
+    known_bytes = 0
+    for item in entries:
+        if len(snapshot) >= entry_limit:
+            raise RuntimeError(
+                "runtime cache entry limit exceeded: "
+                f"more than {entry_limit} entries"
+            )
+        try:
+            destination, entry = item
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "runtime cache entry must be a destination/entry pair"
+            ) from error
+        if not isinstance(destination, Path):
+            raise TypeError("runtime cache destination must be a Path")
+        _normalized_destination(destination)
+
+        if isinstance(entry, HeldSource):
+            _normalized_held_final_path(entry.final_path)
+            for field_name in ("device", "inode", "size"):
+                value = getattr(entry, field_name)
+                if type(value) is not int or value < 0:
+                    raise RuntimeError(
+                        f"invalid held source {field_name}: "
+                        "expected nonnegative integer"
+                    )
+            if not isinstance(entry.sha256, str) or not _LOWER_SHA256.fullmatch(
+                entry.sha256
+            ):
+                raise RuntimeError(
+                    "invalid held source sha256: expected lowercase "
+                    "64-character hex"
+                )
+            known_bytes += entry.size
+        elif isinstance(entry, bytes):
+            known_bytes += len(entry)
+        elif isinstance(entry, GeneratedLayoutEntry):
+            if not isinstance(entry.policy, str) or not entry.policy:
+                raise RuntimeError(
+                    "invalid generated policy: expected nonempty string"
+                )
+            if not callable(entry.render):
+                raise RuntimeError("invalid generated render: expected callable")
+        else:
+            raise TypeError(f"unsupported layout entry: {type(entry).__name__}")
+
+        if known_bytes > byte_limit:
+            raise RuntimeError(
+                "runtime cache byte limit exceeded: "
+                f"{known_bytes} > {byte_limit}"
+            )
+        snapshot.append((destination, entry))
+    return tuple(snapshot)
+
+
+def _hold_final_object_root(object_root: Path) -> _OwnedHandle:
+    owner, final = _open_canonical_non_reparse(
+        object_root,
+        object_root.parent,
+        directory=True,
+    )
+    if _path_identity(final) != _path_identity(object_root):
+        owner.close()
+        raise RuntimeError(f"cache object final path mismatch: {object_root}")
+    return owner
+
+
 def _materialize_layout(
     cache: WindowsRuntimeCache,
     name: str,
@@ -1665,7 +1749,11 @@ def _materialize_layout(
     entry_limit: int,
     byte_limit: int,
 ) -> CachedLayoutLease:
-    entry_snapshot = tuple(entries)
+    entry_snapshot = _bounded_entry_snapshot(
+        entries,
+        entry_limit=entry_limit,
+        byte_limit=byte_limit,
+    )
     dependency_keys = tuple(dependency.key for dependency in dependencies)
     # This first key pass performs every spelling, descriptor, dependency, and
     # JSON snapshot validation before resolving sources or mutating cache state.
@@ -1674,18 +1762,6 @@ def _materialize_layout(
     resolved_sources: dict[int, HeldSource] = {}
     rendered_entries: dict[str, bytes] = {}
     try:
-        if (
-            type(entry_limit) is not int
-            or entry_limit < 0
-            or len(entry_snapshot) > entry_limit
-        ):
-            raise RuntimeError(
-                f"runtime cache entry limit exceeded: {len(entry_snapshot)} > {entry_limit}"
-            )
-        if type(byte_limit) is not int or byte_limit < 0:
-            raise RuntimeError(
-                "runtime cache byte limit must be a nonnegative integer"
-            )
         final_object_root = cache.objects / key
         known_bytes = 0
         for index, (destination, entry) in enumerate(entry_snapshot):
@@ -1701,53 +1777,59 @@ def _materialize_layout(
                 )
 
         stored_layout_name = name
-        if os.path.lexists(final_object_root):
-            manifest = _read_manifest(final_object_root)
-            candidate = manifest.get("layout_name")
-            if (
-                not isinstance(candidate, str)
-                or _validate_win32_component(candidate, label="layout name")
-                != key_input.get("name")
-            ):
-                raise RuntimeError(
-                    f"cache manifest layout spelling mismatch: {final_object_root}"
-                )
-            stored_layout_name = candidate
-        final_layout = final_object_root / stored_layout_name
-        non_generated_bytes = known_bytes
-        for destination, entry in entry_snapshot:
-            if isinstance(entry, GeneratedLayoutEntry):
-                payload = entry.render(final_layout)
-                if not isinstance(payload, bytes):
+        existing_owner: Optional[_OwnedHandle] = None
+        try:
+            if os.path.lexists(final_object_root):
+                existing_owner = _hold_final_object_root(final_object_root)
+                manifest = _read_manifest(final_object_root)
+                candidate = manifest.get("layout_name")
+                if (
+                    not isinstance(candidate, str)
+                    or _validate_win32_component(candidate, label="layout name")
+                    != key_input.get("name")
+                ):
                     raise RuntimeError(
-                        f"generated cache entry did not render bytes: {destination}"
+                        f"cache manifest layout spelling mismatch: {final_object_root}"
                     )
-                rendered_entries[_normalized_destination(destination)] = payload
-                known_bytes += len(payload)
-            if known_bytes > byte_limit:
-                raise RuntimeError(
-                    f"runtime cache byte limit exceeded: {known_bytes} > {byte_limit}"
-                )
+                stored_layout_name = candidate
+            final_layout = final_object_root / stored_layout_name
+            non_generated_bytes = known_bytes
+            for destination, entry in entry_snapshot:
+                if isinstance(entry, GeneratedLayoutEntry):
+                    payload = entry.render(final_layout)
+                    if not isinstance(payload, bytes):
+                        raise RuntimeError(
+                            f"generated cache entry did not render bytes: {destination}"
+                        )
+                    rendered_entries[_normalized_destination(destination)] = payload
+                    known_bytes += len(payload)
+                if known_bytes > byte_limit:
+                    raise RuntimeError(
+                        f"runtime cache byte limit exceeded: {known_bytes} > {byte_limit}"
+                    )
 
-        # Recompute after source verification to preserve the specified state
-        # boundary and prove the detached key input remains stable.
-        verified_key, verified_input = layout_key(
-            name, entry_snapshot, context, dependency_keys
-        )
-        if verified_key != key or verified_input != key_input:
-            raise RuntimeError("runtime cache key input changed during validation")
-        if os.path.lexists(final_object_root):
-            return _hold_validated_object(
-                cache,
-                final_object_root,
-                key,
-                key_input,
-                entry_snapshot,
-                cache_hit=True,
-                payload_files=0,
-                payload_bytes=0,
-                rendered_entries=rendered_entries,
+            # Recompute after source verification to preserve the specified state
+            # boundary and prove the detached key input remains stable.
+            verified_key, verified_input = layout_key(
+                name, entry_snapshot, context, dependency_keys
             )
+            if verified_key != key or verified_input != key_input:
+                raise RuntimeError("runtime cache key input changed during validation")
+            if existing_owner is not None:
+                return _hold_validated_object(
+                    cache,
+                    final_object_root,
+                    key,
+                    key_input,
+                    entry_snapshot,
+                    cache_hit=True,
+                    payload_files=0,
+                    payload_bytes=0,
+                    rendered_entries=rendered_entries,
+                )
+        finally:
+            if existing_owner is not None:
+                existing_owner.close()
 
         staging_root = cache.staging / str(uuid.uuid4())
         while not _create_directory_with_acl(
@@ -1829,53 +1911,57 @@ def _materialize_layout(
                 sealed.close()
                 sealed = None
                 _remove_staging_tree(staging_root, cache.sid)
-                winner_manifest = _read_manifest(final_object_root)
-                winner_layout_name = winner_manifest.get("layout_name")
-                if (
-                    not isinstance(winner_layout_name, str)
-                    or _validate_win32_component(
-                        winner_layout_name, label="layout name"
+                winner_owner = _hold_final_object_root(final_object_root)
+                try:
+                    winner_manifest = _read_manifest(final_object_root)
+                    winner_layout_name = winner_manifest.get("layout_name")
+                    if (
+                        not isinstance(winner_layout_name, str)
+                        or _validate_win32_component(
+                            winner_layout_name, label="layout name"
+                        )
+                        != key_input.get("name")
+                    ):
+                        raise RuntimeError(
+                            "cache manifest layout spelling mismatch: "
+                            f"{final_object_root}"
+                        )
+                    winner_layout = final_object_root / winner_layout_name
+                    if winner_layout_name != stored_layout_name:
+                        winner_rendered_entries: dict[str, bytes] = {}
+                        winner_bytes = non_generated_bytes
+                        for destination, entry in entry_snapshot:
+                            if not isinstance(entry, GeneratedLayoutEntry):
+                                continue
+                            payload = entry.render(winner_layout)
+                            if not isinstance(payload, bytes):
+                                raise RuntimeError(
+                                    "generated cache entry did not render bytes: "
+                                    f"{destination}"
+                                )
+                            winner_rendered_entries[
+                                _normalized_destination(destination)
+                            ] = payload
+                            winner_bytes += len(payload)
+                            if winner_bytes > byte_limit:
+                                raise RuntimeError(
+                                    "runtime cache byte limit exceeded: "
+                                    f"{winner_bytes} > {byte_limit}"
+                                )
+                        rendered_entries = winner_rendered_entries
+                    return _hold_validated_object(
+                        cache,
+                        final_object_root,
+                        key,
+                        key_input,
+                        entry_snapshot,
+                        cache_hit=True,
+                        payload_files=len(entry_snapshot),
+                        payload_bytes=payload_bytes,
+                        rendered_entries=rendered_entries,
                     )
-                    != key_input.get("name")
-                ):
-                    raise RuntimeError(
-                        "cache manifest layout spelling mismatch: "
-                        f"{final_object_root}"
-                    )
-                winner_layout = final_object_root / winner_layout_name
-                if winner_layout_name != stored_layout_name:
-                    winner_rendered_entries: dict[str, bytes] = {}
-                    winner_bytes = non_generated_bytes
-                    for destination, entry in entry_snapshot:
-                        if not isinstance(entry, GeneratedLayoutEntry):
-                            continue
-                        payload = entry.render(winner_layout)
-                        if not isinstance(payload, bytes):
-                            raise RuntimeError(
-                                "generated cache entry did not render bytes: "
-                                f"{destination}"
-                            )
-                        winner_rendered_entries[
-                            _normalized_destination(destination)
-                        ] = payload
-                        winner_bytes += len(payload)
-                        if winner_bytes > byte_limit:
-                            raise RuntimeError(
-                                "runtime cache byte limit exceeded: "
-                                f"{winner_bytes} > {byte_limit}"
-                            )
-                    rendered_entries = winner_rendered_entries
-                return _hold_validated_object(
-                    cache,
-                    final_object_root,
-                    key,
-                    key_input,
-                    entry_snapshot,
-                    cache_hit=True,
-                    payload_files=len(entry_snapshot),
-                    payload_bytes=payload_bytes,
-                    rendered_entries=rendered_entries,
-                )
+                finally:
+                    winner_owner.close()
             finally:
                 if sealed is not None:
                     sealed.close()
