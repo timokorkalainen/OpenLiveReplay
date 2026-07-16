@@ -1153,12 +1153,15 @@ _GNU_FORWARDERS = frozenset({"-Xclang", "-Xpreprocessor"})
 _GNU_FORWARDED_VALUE_OPTIONS = frozenset({
     "-D", "-U", "-A", "-I", "-isystem", "-iquote", "-idirafter",
     "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-include", "-imacros",
+    "-include-pch", "-include-pth",
     "-isysroot", "--sysroot", "--define-macro", "--undefine-macro",
     "--include", "--imacros",
     "-F", "-iframework", "-ivfsoverlay", "-resource-dir", "-std", "-stdlib",
-    "-triple", "-target-cpu", "-target-feature", "-target-abi",
+    "-triple", "-aux-triple", "-target-cpu", "-target-feature", "-target-abi",
+    "-target-sdk-version",
     "-fmodule-map-file", "-fmodule-file", "-fmodule-name", "-fmodule-format",
     "-fmodules-cache-path", "-fprebuilt-module-path",
+    "-fmodules-user-build-path", "-fmodule-implementation-of", "-fmodule-feature",
     "-mrelocation-model", "-mthread-model", "-target-linker-version",
     "-fmodules-prune-interval",
 })
@@ -1194,7 +1197,11 @@ _CLANG_FRONTEND_SAFE_FLAGS = frozenset({
     "-O", "-O0", "-O1", "-O2", "-O3", "-O4", "-Og", "-Os", "-Oz",
     "-Ofast", "-g", "-g0", "-g1", "-g2", "-g3", "-gline-tables-only",
     "-gline-directives-only", "-mrelax-all", "-mnoexecstack",
-    "-masm-verbose", "-mconstructor-aliases", "-fms-extensions", "-fobjc-arc",
+    "-masm-verbose", "-mconstructor-aliases", "-msoft-float", "-mstackrealign",
+    "-fmodules-validate-once-per-build-session",
+    "-fmodule-map-file-home-is-cwd", "-disable-llvm-passes",
+    "-fms-extensions", "-fms-compatibility", "-fobjc-arc",
+    "-fobjc-arc-exceptions", "-fobjc-weak",
 })
 _CLANG_FRONTEND_SAFE_PREFIXES = (
     "-D", "-U", "-I", "-F", "-W", "-R",
@@ -1204,8 +1211,10 @@ _CLANG_FRONTEND_SAFE_EQUALS_OPTIONS = frozenset({
     "-target-abi", "-target-linker-version", "-fmodule-map-file",
     "-fmodule-file", "-fmodule-name", "-fmodule-format",
     "-fmodules-cache-path", "-fmodules-prune-interval",
+    "-fmodules-ignore-macro", "-fmodules-prune-after",
     "-fprebuilt-module-path", "-mframe-pointer", "-mrelocation-model",
-    "-mthread-model", "-fms-compatibility-version", "-fobjc-runtime",
+    "-mthread-model", "-mcode-model", "-fms-compatibility-version",
+    "-fobjc-runtime", "-debug-info-kind", "-dwarf-version", "-debugger-tuning",
 })
 
 

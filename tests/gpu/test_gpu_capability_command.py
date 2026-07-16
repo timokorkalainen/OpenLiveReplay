@@ -1260,13 +1260,20 @@ class CommandRewriteTests(unittest.TestCase):
     def test_clang_frontend_semantic_preprocessor_target_and_module_controls_survive(self):
         safe_pairs = (
             ("-include", "forced.h"),
+            ("-include-pch", "prefix.pch"),
+            ("-include-pth", "prefix.pth"),
             ("-isystem", "SDK Path"),
             ("-triple", "x86_64-pc-windows-msvc"),
+            ("-aux-triple", "x86_64-pc-windows-msvc"),
             ("-target-cpu", "x86-64"),
             ("-target-feature", "+sse2"),
+            ("-target-sdk-version", "15.0"),
             ("-fmodule-map-file", "module.modulemap"),
             ("-fmodule-file", "Core=Core.pcm"),
             ("-fmodules-cache-path", "module-cache"),
+            ("-fmodules-user-build-path", "module-user-build"),
+            ("-fmodule-implementation-of", "Core"),
+            ("-fmodule-feature", "cplusplus"),
             ("-mrelocation-model", "pic"),
             ("-mthread-model", "posix"),
             ("-target-linker-version", "14.0"),
@@ -1280,8 +1287,18 @@ class CommandRewriteTests(unittest.TestCase):
             "-mconstructor-aliases", "-mframe-pointer=all",
             "-fmodule-file=Core=Core.pcm",
             "-fmodules-cache-path=module-cache",
+            "-fmodules-ignore-macro=IGNORED",
+            "-fmodules-prune-after=2678400",
+            "-fmodules-validate-once-per-build-session",
+            "-fmodule-map-file-home-is-cwd",
             "-fms-extensions", "-fms-compatibility-version=19.0",
+            "-fms-compatibility",
             "-fobjc-arc", "-fobjc-runtime=macosx-10.12",
+            "-fobjc-arc-exceptions", "-fobjc-weak",
+            "-disable-llvm-passes",
+            "-debug-info-kind=constructor", "-dwarf-version=5",
+            "-debugger-tuning=lldb", "-msoft-float", "-mstackrealign",
+            "-mcode-model=small",
         )
         for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
             arguments: list[str] = []
@@ -1299,6 +1316,28 @@ class CommandRewriteTests(unittest.TestCase):
             with self.subTest(family=family):
                 rewritten = self.rewrite(family, tuple(arguments))
                 self.assertEqual(rewritten.arguments[1:1 + len(arguments)], tuple(arguments))
+
+    def test_clang_frontend_semantic_value_controls_require_exact_forwarded_arity(self):
+        safe_pairs = (
+            "-include", "-include-pch", "-include-pth", "-isystem",
+            "-triple", "-aux-triple", "-target-cpu", "-target-feature",
+            "-target-sdk-version", "-fmodule-map-file", "-fmodule-file",
+            "-fmodules-cache-path", "-fmodules-user-build-path",
+            "-fmodule-implementation-of", "-fmodule-feature",
+            "-mrelocation-model", "-mthread-model", "-target-linker-version",
+            "-fmodules-prune-interval",
+        )
+        for family in (CompilerFamily.CLANG, CompilerFamily.CLANG_CL):
+            for option in safe_pairs:
+                arguments = (
+                    ("-Xclang", option, "file.cpp")
+                    if family is CompilerFamily.CLANG
+                    else (f"/clang:{option}", "file.cpp")
+                )
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "requires a forwarded value|requires a value"
+                ):
+                    self.rewrite(family, arguments)
 
     def test_forwarded_semantic_options_preserve_option_looking_operands(self):
         controls = (
