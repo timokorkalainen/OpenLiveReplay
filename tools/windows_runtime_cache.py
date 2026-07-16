@@ -101,6 +101,7 @@ _OPEN_EXISTING = 3
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
 _GENERIC_WRITE = 0x40000000
+_GENERIC_READ = 0x80000000
 _DELETE = 0x00010000
 _FILE_ADD_FILE = 0x00000002
 _FILE_ADD_SUBDIRECTORY = 0x00000004
@@ -111,7 +112,7 @@ _WRITE_DAC = 0x00040000
 _ERROR_ACCESS_DENIED = 5
 _ERROR_FILE_EXISTS = 80
 _ERROR_ALREADY_EXISTS = 183
-_MOVEFILE_WRITE_THROUGH = 0x00000008
+_FILE_RENAME_INFO_CLASS = 3
 
 _DACL_SECURITY_INFORMATION = 0x00000004
 _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
@@ -126,6 +127,15 @@ class _SecurityAttributes(ctypes.Structure):
     )
 
 
+class _FileRenameInfo(ctypes.Structure):
+    _fields_ = (
+        ("replace_if_exists", ctypes.c_ubyte),
+        ("root_directory", wintypes.HANDLE),
+        ("file_name_length", wintypes.DWORD),
+        ("file_name", wintypes.WCHAR * 1),
+    )
+
+
 class _OwnedHandle:
     def __init__(self, api: object, value: int) -> None:
         self._api = api
@@ -137,6 +147,32 @@ class _OwnedHandle:
             self.value = 0
 
     def __enter__(self) -> "_OwnedHandle":
+        return self
+
+    def __exit__(self, *_unused: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class _SealedTree:
+    """Retain the exact immutable root identity through publication."""
+
+    def __init__(self, root: Path, owner: _OwnedHandle) -> None:
+        self.root = root
+        self._owner = owner
+
+    @property
+    def handle(self) -> int:
+        if not self._owner.value:
+            raise RuntimeError("sealed cache tree handle is closed")
+        return self._owner.value
+
+    def close(self) -> None:
+        self._owner.close()
+
+    def __enter__(self) -> "_SealedTree":
         return self
 
     def __exit__(self, *_unused: object) -> None:
@@ -208,6 +244,7 @@ class WindowsRuntimeCache:
             self.root / "staging",
             sid,
             retained_handles=self._management_handles,
+            leaf_sddl=_managed_namespace_sddl(sid),
         )
         self.quarantine = _ensure_private_directory_tree(
             self.root / "quarantine",
@@ -290,12 +327,13 @@ def _kernel32() -> object:
         wintypes.DWORD,
     )
     kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
-    kernel32.MoveFileExW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
+    kernel32.SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
         wintypes.DWORD,
     )
-    kernel32.MoveFileExW.restype = wintypes.BOOL
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
     kernel32.CreateDirectoryW.argtypes = (
         wintypes.LPCWSTR,
         ctypes.POINTER(_SecurityAttributes),
@@ -495,6 +533,13 @@ def _managed_namespace_sddl(sid: str) -> str:
     return f"D:P(A;OICI;0x1f01bf;;;{sid})"
 
 
+def _frozen_build_namespace_sddl(sid: str) -> str:
+    # Transitional BUILD access without child insertion or parent-authorized
+    # child deletion. Existing payload handles remain readable/writable only
+    # until each exact descendant has been opened and retained below.
+    return f"D:P(A;OICI;0x1f01b9;;;{sid})"
+
+
 def _security_descriptor_from_sddl(sddl: str) -> tuple[ctypes.c_void_p, object]:
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = _kernel32()
@@ -617,65 +662,162 @@ def _set_path_acl(path: Path, sid: str, mode: _AclMode) -> None:
         owner.close()
 
 
-def _set_tree_acl(path: Path, sid: str, mode: _AclMode) -> None:
-    """Apply a protected DACL, recursively for immutable/delete conversions."""
-    root = _absolute_lexical(path)
-    if mode not in ("RX", "DELETE"):
-        _set_path_acl(root, sid, mode)
-        return
+@dataclass
+class _HeldTreeNode:
+    path: Path
+    owner: _OwnedHandle
+    directory: bool
+    digest: Optional[str]
 
-    def convert_file(target: Path) -> None:
+
+def _sha256_file_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _tree_entry_set(root: Path) -> set[tuple[str, bool]]:
+    result: set[tuple[str, bool]] = set()
+
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as scanned:
+            entries = sorted(scanned, key=lambda entry: entry.name.casefold())
+        for entry in entries:
+            target = Path(entry.path)
+            stat_result = entry.stat(follow_symlinks=False)
+            if (
+                getattr(stat_result, "st_file_attributes", 0)
+                & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise RuntimeError(
+                    f"cache ACL tree contains a reparse point: {target}"
+                )
+            directory_entry = entry.is_dir(follow_symlinks=False)
+            result.add((target.relative_to(root).as_posix(), directory_entry))
+            if directory_entry:
+                visit(target)
+
+    visit(root)
+    return result
+
+
+def _seal_tree_acl(path: Path, sid: str, mode: _AclMode = "RX") -> _SealedTree:
+    """Freeze, verify, and retain one exact immutable tree identity."""
+    if mode != "RX":
+        raise ValueError("only RX trees can be sealed for publication")
+    root = _absolute_lexical(path)
+    nodes: list[_HeldTreeNode] = []
+
+    def hold_node(target: Path, directory: bool) -> None:
+        desired_access = _FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC
+        if target == root:
+            desired_access |= _DELETE
+        if not directory:
+            desired_access |= _GENERIC_READ
         owner, _canonical = _open_canonical_non_reparse(
             target,
             target.parent,
-            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC,
+            desired_access=desired_access,
             share_mode=_FILE_SHARE_READ,
-            directory=False,
+            directory=directory,
         )
-        try:
-            _set_handle_acl(owner.value, sid, mode)
+        node = _HeldTreeNode(target, owner, directory, None)
+        nodes.append(node)
+        if directory:
+            # Freeze this exact namespace before looking below it. Protected
+            # descendants cannot inherit this transition, so their own handles
+            # are retained before any final RX conversion occurs.
+            _set_handle_acl_sddl(owner.value, _frozen_build_namespace_sddl(sid))
             _assert_handle_still_names(owner.value, target)
-        finally:
-            owner.close()
-
-    def convert_directory(directory: Path) -> None:
-        owner, _canonical = _open_canonical_non_reparse(
-            directory,
-            directory.parent,
-            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC,
-            share_mode=_FILE_SHARE_READ,
-            directory=True,
-        )
-        try:
-            if mode == "RX":
-                # Close this namespace before observing its members. Once RX is
-                # applied, no late child can appear and existing children cannot
-                # be renamed while their handle-bound conversion proceeds.
-                _set_handle_acl(owner.value, sid, mode)
-                _assert_handle_still_names(owner.value, directory)
-            with os.scandir(directory) as scanned:
+            with os.scandir(target) as scanned:
                 entries = sorted(scanned, key=lambda entry: entry.name.casefold())
             for entry in entries:
-                target = Path(entry.path)
                 stat_result = entry.stat(follow_symlinks=False)
+                child = Path(entry.path)
                 if (
                     getattr(stat_result, "st_file_attributes", 0)
                     & _FILE_ATTRIBUTE_REPARSE_POINT
                 ):
                     raise RuntimeError(
-                        f"cache ACL tree contains a reparse point: {target}"
+                        f"cache ACL tree contains a reparse point: {child}"
                     )
-                if entry.is_dir(follow_symlinks=False):
-                    convert_directory(target)
-                else:
-                    convert_file(target)
-            if mode == "DELETE":
-                _set_handle_acl(owner.value, sid, mode)
-            _assert_handle_still_names(owner.value, directory)
+                hold_node(child, entry.is_dir(follow_symlinks=False))
+        else:
+            node.digest = _sha256_file_path(target)
+
+    try:
+        hold_node(root, True)
+        expected_entries = {
+            (node.path.relative_to(root).as_posix(), node.directory)
+            for node in nodes
+            if node.path != root
+        }
+        for node in nodes:
+            _set_handle_acl(node.owner.value, sid, "RX")
+            _assert_handle_still_names(node.owner.value, node.path)
+        for node in nodes:
+            _assert_handle_still_names(node.owner.value, node.path)
+            if not node.directory and _sha256_file_path(node.path) != node.digest:
+                raise RuntimeError(
+                    f"cache file changed during immutable conversion: {node.path}"
+                )
+        if _tree_entry_set(root) != expected_entries:
+            raise RuntimeError("cache tree changed during immutable conversion")
+
+        root_owner = nodes[0].owner
+        for node in nodes[1:]:
+            node.owner.close()
+        return _SealedTree(root, root_owner)
+    except BaseException:
+        for node in nodes:
+            node.owner.close()
+        raise
+
+
+def _set_tree_acl(path: Path, sid: str, mode: _AclMode) -> None:
+    """Apply a protected DACL, recursively for immutable/delete conversions."""
+    root = _absolute_lexical(path)
+    if mode == "RX":
+        with _seal_tree_acl(root, sid):
+            return
+    if mode != "DELETE":
+        _set_path_acl(root, sid, mode)
+        return
+
+    def convert_delete(target: Path, directory: bool) -> None:
+        owner, _canonical = _open_canonical_non_reparse(
+            target,
+            target.parent,
+            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC,
+            share_mode=_FILE_SHARE_READ,
+            directory=directory,
+        )
+        try:
+            if directory:
+                with os.scandir(target) as scanned:
+                    entries = sorted(scanned, key=lambda entry: entry.name.casefold())
+                for entry in entries:
+                    child = Path(entry.path)
+                    stat_result = entry.stat(follow_symlinks=False)
+                    if (
+                        getattr(stat_result, "st_file_attributes", 0)
+                        & _FILE_ATTRIBUTE_REPARSE_POINT
+                    ):
+                        raise RuntimeError(
+                            f"cache ACL tree contains a reparse point: {child}"
+                        )
+                    convert_delete(child, entry.is_dir(follow_symlinks=False))
+            _set_handle_acl(owner.value, sid, "DELETE")
+            _assert_handle_still_names(owner.value, target)
         finally:
             owner.close()
 
-    convert_directory(root)
+    convert_delete(root, True)
 
 
 def _assert_mutation_denied(path: Path, *, directory: bool) -> None:
@@ -706,17 +848,56 @@ def _assert_mutation_denied(path: Path, *, directory: bool) -> None:
         raise OSError(error, f"cache mutation probe failed unexpectedly: {path}")
 
 
-def _atomic_move_no_replace(source: Path, destination: Path) -> None:
-    """Atomically publish a tree without replacing an existing creator winner."""
+def _atomic_move_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    sealed: Optional[_SealedTree] = None,
+) -> None:
+    """Atomically publish the retained immutable identity without replacement."""
     if os.name != "nt":
         raise OSError("Windows atomic publication requires Windows")
+    if sealed is None:
+        raise RuntimeError("cache publication requires a retained sealed tree")
+    source = _absolute_lexical(source)
+    destination = _absolute_lexical(destination)
+    if _path_identity(source) != _path_identity(sealed.root):
+        raise RuntimeError("sealed cache tree does not match publication source")
     kernel32 = _kernel32()
-    if kernel32.MoveFileExW(
-        str(source), str(destination), _MOVEFILE_WRITE_THROUGH
+    final = _final_path_from_handle(kernel32, sealed.handle)
+    if _path_identity(final) != _path_identity(source):
+        raise RuntimeError(f"sealed cache tree moved before publication: {source} -> {final}")
+
+    encoded_destination = str(destination).encode("utf-16-le")
+    name_offset = _FileRenameInfo.file_name.offset
+    buffer = ctypes.create_string_buffer(
+        name_offset + len(encoded_destination) + ctypes.sizeof(wintypes.WCHAR)
+    )
+    information = ctypes.cast(buffer, ctypes.POINTER(_FileRenameInfo)).contents
+    information.replace_if_exists = 0
+    information.root_directory = None
+    information.file_name_length = len(encoded_destination)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + name_offset,
+        encoded_destination,
+        len(encoded_destination),
+    )
+    if kernel32.SetFileInformationByHandle(
+        sealed.handle,
+        _FILE_RENAME_INFO_CLASS,
+        buffer,
+        len(buffer),
     ):
+        renamed = _final_path_from_handle(kernel32, sealed.handle)
+        if _path_identity(renamed) != _path_identity(destination):
+            raise RuntimeError(
+                f"cache publication final path mismatch: {destination} -> {renamed}"
+            )
         return
     error = ctypes.get_last_error()
-    if error in (_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS):
+    if error in (_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS) or (
+        error == _ERROR_ACCESS_DENIED and os.path.lexists(destination)
+    ):
         raise FileExistsError(
             error,
             f"cache publication destination already exists: {destination}",

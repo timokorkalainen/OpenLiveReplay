@@ -554,19 +554,24 @@ class WindowsFilesystemTests(unittest.TestCase):
         source = self.root / "source"
         source.mkdir()
         (source / "payload").write_bytes(b"source")
+        sealed = runtime_cache._seal_tree_acl(source, self.sid, "RX")
         destination = self.root / "destination"
         destination.mkdir()
         (destination / "payload").write_bytes(b"destination")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "retained sealed tree"):
+                _atomic_move_no_replace(source, destination)
+            with self.assertRaises(FileExistsError):
+                _atomic_move_no_replace(source, destination, sealed=sealed)
+            self.assertEqual((source / "payload").read_bytes(), b"source")
+            self.assertEqual((destination / "payload").read_bytes(), b"destination")
 
-        with self.assertRaises(FileExistsError):
-            _atomic_move_no_replace(source, destination)
-        self.assertEqual((source / "payload").read_bytes(), b"source")
-        self.assertEqual((destination / "payload").read_bytes(), b"destination")
-
-        shutil.rmtree(destination)
-        _atomic_move_no_replace(source, destination)
-        self.assertFalse(source.exists())
-        self.assertEqual((destination / "payload").read_bytes(), b"source")
+            shutil.rmtree(destination)
+            _atomic_move_no_replace(source, destination, sealed=sealed)
+            self.assertFalse(source.exists())
+            self.assertEqual((destination / "payload").read_bytes(), b"source")
+        finally:
+            sealed.close()
 
     def test_rx_conversion_denies_late_insertion_before_descendant_walk(self) -> None:
         tree = self.root / "race"
@@ -618,23 +623,94 @@ class WindowsFilesystemTests(unittest.TestCase):
         source = cache.staging / "creator"
         source.mkdir()
         (source / "payload.dll").write_bytes(b"payload")
-        _set_tree_acl(source, self.sid, "RX")
+        sealed = runtime_cache._seal_tree_acl(source, self.sid, "RX")
         destination = cache.objects / ("c" * 64)
+        try:
+            _atomic_move_no_replace(source, destination, sealed=sealed)
 
-        _atomic_move_no_replace(source, destination)
-
-        self.assertFalse(source.exists())
-        self.assertEqual((destination / "payload.dll").read_bytes(), b"payload")
-        with self.assertRaises(OSError):
-            destination.rename(cache.objects / ("d" * 64))
+            self.assertFalse(source.exists())
+            self.assertEqual((destination / "payload.dll").read_bytes(), b"payload")
+            with self.assertRaises(OSError):
+                destination.rename(cache.objects / ("d" * 64))
+        finally:
+            sealed.close()
 
         loser = cache.staging / "loser"
         loser.mkdir()
         (loser / "payload.dll").write_bytes(b"loser")
-        _set_tree_acl(loser, self.sid, "RX")
-        with self.assertRaises(FileExistsError):
-            _atomic_move_no_replace(loser, destination)
-        self.assertTrue(loser.exists())
+        loser_sealed = runtime_cache._seal_tree_acl(loser, self.sid, "RX")
+        try:
+            with self.assertRaises(FileExistsError):
+                _atomic_move_no_replace(loser, destination, sealed=loser_sealed)
+            self.assertTrue(loser.exists())
+        finally:
+            loser_sealed.close()
+
+    def test_staging_publication_cannot_publish_a_path_replacement(self) -> None:
+        cache = self.make_cache(self.root / "identity-bound-publish")
+        source = cache.staging / "creator"
+        source.mkdir()
+        (source / "payload.dll").write_bytes(b"immutable")
+        sealed = runtime_cache._seal_tree_acl(source, self.sid, "RX")
+        destination = cache.objects / ("e" * 64)
+        escaped = cache.staging / "escaped"
+        try:
+            with self.assertRaises(OSError):
+                source.rename(escaped)
+
+            replacement = cache.staging / "replacement"
+            replacement.mkdir()
+            (replacement / "payload.dll").write_bytes(b"writable replacement")
+            with self.assertRaisesRegex(RuntimeError, "does not match publication source"):
+                _atomic_move_no_replace(replacement, destination, sealed=sealed)
+            self.assertFalse(destination.exists())
+
+            _atomic_move_no_replace(source, destination, sealed=sealed)
+            self.assertFalse(source.exists())
+            self.assertEqual((destination / "payload.dll").read_bytes(), b"immutable")
+            with self.assertRaises(OSError):
+                (destination / "payload.dll").write_bytes(b"changed")
+        finally:
+            sealed.close()
+
+    def test_rx_conversion_holds_protected_descendants_against_mutation(self) -> None:
+        tree = self.root / "protected-descendants"
+        tree.mkdir()
+        _set_tree_acl(tree, self.sid, "BUILD")
+        rename_target = tree / "rename.dll"
+        mutate_target = tree / "mutate.dll"
+        rename_target.write_bytes(b"rename-original")
+        mutate_target.write_bytes(b"mutate-original")
+        runtime_cache._set_path_acl(rename_target, self.sid, "BUILD")
+        runtime_cache._set_path_acl(mutate_target, self.sid, "BUILD")
+        escaped = self.root / "escaped.dll"
+        real_set_handle_acl = runtime_cache._set_handle_acl
+        attempted = False
+
+        def attack_after_root_rx(handle: int, sid: str, mode: str) -> None:
+            nonlocal attempted
+            real_set_handle_acl(handle, sid, mode)
+            final = runtime_cache._final_path_from_handle(
+                runtime_cache._kernel32(), handle
+            )
+            if mode == "RX" and final == tree:
+                attempted = True
+                with self.assertRaises(OSError):
+                    rename_target.rename(escaped)
+                with self.assertRaises(OSError):
+                    mutate_target.write_bytes(b"mutated")
+
+        with mock.patch.object(
+            runtime_cache, "_set_handle_acl", side_effect=attack_after_root_rx
+        ):
+            _set_tree_acl(tree, self.sid, "RX")
+
+        self.assertTrue(attempted)
+        self.assertFalse(escaped.exists())
+        self.assertEqual(rename_target.read_bytes(), b"rename-original")
+        self.assertEqual(mutate_target.read_bytes(), b"mutate-original")
+        _assert_mutation_denied(rename_target, directory=False)
+        _assert_mutation_denied(mutate_target, directory=False)
 
     def test_existing_cache_root_swap_is_detected_during_handle_bound_acl_update(
         self,
