@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 from pathlib import Path
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -25,6 +26,8 @@ try:
         require_cache_entries,
         RuntimeAuditLease,
         RuntimeRoots,
+        GeneratedLayoutEntry,
+        QtConfPaths,
         reject_runtime_dll_shadowing,
         replace_environment_case_insensitively,
         restore_windows_dll_directory,
@@ -44,6 +47,8 @@ except ImportError:
         require_cache_entries,
         RuntimeAuditLease,
         RuntimeRoots,
+        GeneratedLayoutEntry,
+        QtConfPaths,
         reject_runtime_dll_shadowing,
         replace_environment_case_insensitively,
         restore_windows_dll_directory,
@@ -364,10 +369,15 @@ def _source_snapshot_exclusions(source_root: Path, build_root: Path) -> tuple[Pa
 class _ExternalToolClosure(NamedTuple):
     root: Path
     executable_relative: Path
-    entries: dict[Path, Path | bytes | Callable[[Path], bytes]]
+    entries: dict[Path, Path | bytes | GeneratedLayoutEntry]
 
 
-def _validated_closure_path(path: Path, selected_root: Path | None = None) -> Path:
+def _validated_closure_path(
+    path: Path,
+    selected_root: Path | None = None,
+    *,
+    lease: RuntimeAuditLease | None = None,
+) -> Path:
     lexical = Path(os.path.abspath(path))
     if not lexical.exists():
         raise RuntimeError(f"external tool closure path does not exist: {lexical}")
@@ -382,45 +392,77 @@ def _validated_closure_path(path: Path, selected_root: Path | None = None) -> Pa
         raise RuntimeError(
             f"external tool closure escapes its install root: {lexical}"
         )
+    if lease is not None:
+        held = (
+            lease.canonical_directory(lexical)
+            if lexical.is_dir()
+            else lease.canonical_file(lexical)
+        )
+        if os.path.normcase(str(lexical)) != os.path.normcase(str(held)):
+            raise RuntimeError(
+                f"external tool closure contains a reparse alias: {lexical} -> {held}"
+            )
+        canonical = held
     return canonical
 
 
-def _tree_closure_files(root: Path, selected_root: Path) -> tuple[Path, ...]:
-    root = _validated_closure_path(root, selected_root)
+def _tree_closure_files(
+    root: Path,
+    selected_root: Path,
+    *,
+    lease: RuntimeAuditLease | None = None,
+) -> tuple[Path, ...]:
+    root = _validated_closure_path(root, selected_root, lease=lease)
     if root.is_file():
         return (root,)
     files: list[Path] = []
     for current_text, directory_names, file_names in os.walk(root):
-        current = _validated_closure_path(Path(current_text), selected_root)
+        current = _validated_closure_path(
+            Path(current_text), selected_root, lease=lease
+        )
         retained: list[str] = []
         for name in directory_names:
-            child = _validated_closure_path(current / name, selected_root)
+            child = _validated_closure_path(
+                current / name, selected_root, lease=lease
+            )
             retained.append(child.name)
         directory_names[:] = retained
         for name in file_names:
-            files.append(_validated_closure_path(current / name, selected_root))
+            files.append(
+                _validated_closure_path(
+                    current / name, selected_root, lease=lease
+                )
+            )
     return tuple(files)
 
 
-def _python_base_entries(base: Path, prefix: Path, seeds: Sequence[Path]) \
-        -> dict[Path, Path | bytes | Callable[[Path], bytes]]:
-    base = _validated_closure_path(base)
-    entries: dict[Path, Path | bytes | Callable[[Path], bytes]] = {}
+def _python_base_entries(
+    base: Path,
+    prefix: Path,
+    seeds: Sequence[Path],
+    *,
+    lease: RuntimeAuditLease | None = None,
+) \
+        -> dict[Path, Path | bytes | GeneratedLayoutEntry]:
+    base = _validated_closure_path(base, lease=lease)
+    entries: dict[Path, Path | bytes | GeneratedLayoutEntry] = {}
     import_seeds = list(seeds)
     for child in base.iterdir():
         if child.is_file() and (
             child.name.casefold().startswith("python")
             and child.suffix.casefold() in (".dll", ".zip")
         ):
-            validated = _validated_closure_path(child, base)
+            validated = _validated_closure_path(child, base, lease=lease)
             entries[prefix / validated.relative_to(base)] = validated
             if validated.suffix.casefold() == ".dll":
                 import_seeds.append(validated)
     dlls = base / "DLLs"
     runtime_directories = [base]
     if dlls.is_dir():
-        runtime_directories.append(_validated_closure_path(dlls, base))
-        for child in _tree_closure_files(dlls, base):
+        runtime_directories.append(
+            _validated_closure_path(dlls, base, lease=lease)
+        )
+        for child in _tree_closure_files(dlls, base, lease=lease):
             entries[prefix / child.relative_to(base)] = child
             if child.suffix.casefold() in (".dll", ".exe", ".pyd"):
                 import_seeds.append(child)
@@ -434,22 +476,36 @@ def _python_base_entries(base: Path, prefix: Path, seeds: Sequence[Path]) \
         "tests", "tkinter", "turtledemo",
     }
     if library.is_dir():
-        library = _validated_closure_path(library, base)
+        library = _validated_closure_path(library, base, lease=lease)
         for current_text, directory_names, file_names in os.walk(library):
-            current = _validated_closure_path(Path(current_text), base)
-            directory_names[:] = [
-                name for name in directory_names
-                if name.casefold() not in excluded
-            ]
+            current = _validated_closure_path(
+                Path(current_text), base, lease=lease
+            )
+            retained_directories: list[str] = []
+            for name in directory_names:
+                if name.casefold() in excluded:
+                    continue
+                retained_directories.append(
+                    _validated_closure_path(
+                        current / name, base, lease=lease
+                    ).name
+                )
+            directory_names[:] = retained_directories
             for name in file_names:
-                child = _validated_closure_path(current / name, base)
+                child = _validated_closure_path(
+                    current / name, base, lease=lease
+                )
                 entries[prefix / child.relative_to(base)] = child
     return entries
 
 
-def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
+def _external_tool_closure(
+    executable: Path,
+    *,
+    lease: RuntimeAuditLease | None = None,
+) -> _ExternalToolClosure:
     """Return a bounded, explicit install-relative closure for an external tool."""
-    executable = _validated_closure_path(executable)
+    executable = _validated_closure_path(executable, lease=lease)
     venv_root = executable.parent.parent
     venv_config = venv_root / "pyvenv.cfg"
     is_python = executable.stem.casefold().startswith("python")
@@ -458,9 +514,11 @@ def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
         and executable.parent.name.casefold() == "scripts"
         and venv_config.is_file()
     )
-    root = _validated_closure_path(venv_root if is_venv else executable.parent)
+    root = _validated_closure_path(
+        venv_root if is_venv else executable.parent, lease=lease
+    )
     executable_relative = executable.relative_to(root)
-    entries: dict[Path, Path | bytes | Callable[[Path], bytes]] = {
+    entries: dict[Path, Path | bytes | GeneratedLayoutEntry] = {
         executable_relative: executable
     }
 
@@ -469,19 +527,30 @@ def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
             adjacent.suffix.casefold() == ".dll"
             or adjacent.name.casefold() == (executable.name + ".manifest").casefold()
         ):
-            validated = _validated_closure_path(adjacent, root)
+            validated = _validated_closure_path(adjacent, root, lease=lease)
             entries[validated.relative_to(root)] = validated
 
     if is_python:
         if is_venv:
-            config = _validated_closure_path(venv_config, root)
-            contents = config.read_text(encoding="utf-8")
+            config = _validated_closure_path(venv_config, root, lease=lease)
+            if lease is None:
+                encoded_config = config.read_bytes()
+                config_identity = config
+            else:
+                stream = lease.hold(config)
+                stream.seek(0)
+                encoded_config = stream.read()
+                stream.seek(0)
+                config_identity = lease.canonical_file(config)
+            contents = encoded_config.decode("utf-8")
             match = re.search(r"(?im)^\s*home\s*=\s*(.+?)\s*$", contents)
             if match is None:
                 raise RuntimeError(f"Python venv has no home entry: {config}")
-            base = _validated_closure_path(Path(match.group(1)))
+            base = _validated_closure_path(Path(match.group(1)), lease=lease)
             entries.update(
-                _python_base_entries(base, Path("base"), (executable,))
+                _python_base_entries(
+                    base, Path("base"), (executable,), lease=lease
+                )
             )
 
             def rewrite_venv_config(staged: Path, text: str = contents) -> bytes:
@@ -493,15 +562,24 @@ def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
                     count=1,
                 ).encode("utf-8")
 
-            entries[Path("pyvenv.cfg")] = rewrite_venv_config
+            entries[Path("pyvenv.cfg")] = GeneratedLayoutEntry(
+                "python-venv-config-rewrite-v2",
+                {
+                    "source_final_path": config_identity.as_posix(),
+                    "source_sha256": hashlib.sha256(encoded_config).hexdigest(),
+                },
+                rewrite_venv_config,
+            )
         else:
             entries.update(
-                _python_base_entries(root, Path("."), (executable,))
+                _python_base_entries(
+                    root, Path("."), (executable,), lease=lease
+                )
             )
 
     descriptor = executable.with_name(executable.name + ".olr-runtime-files")
     if descriptor.is_file():
-        descriptor = _validated_closure_path(descriptor, root)
+        descriptor = _validated_closure_path(descriptor, root, lease=lease)
         entries[descriptor.relative_to(root)] = descriptor
         for line in descriptor.read_text(encoding="utf-8").splitlines():
             value = line.strip()
@@ -517,8 +595,12 @@ def _external_tool_closure(executable: Path) -> _ExternalToolClosure:
                 raise RuntimeError(
                     f"external tool closure has unsafe path {value!r}: {descriptor}"
                 )
-            closure_root = _validated_closure_path(root / relative, root)
-            for candidate in _tree_closure_files(closure_root, root):
+            closure_root = _validated_closure_path(
+                root / relative, root, lease=lease
+            )
+            for candidate in _tree_closure_files(
+                closure_root, root, lease=lease
+            ):
                 entries[candidate.relative_to(root)] = candidate
     return _ExternalToolClosure(root, executable_relative, entries)
 
@@ -699,6 +781,7 @@ def prepare_windows_runtime(
                 )
 
             launch_source = source_root
+            source_dependencies: list[Path] = []
             if quicktest_inputs:
                 launch_source = lease.stage_readonly_tree(
                     source_root,
@@ -708,6 +791,7 @@ def prepare_windows_runtime(
                         source_root, canonical_build
                     ),
                 )
+                source_dependencies.append(launch_source)
             lease.launch_source_directory = launch_source
 
             selected_executables = {
@@ -745,7 +829,14 @@ def prepare_windows_runtime(
                 Path("platforms") / ".closed", b"closed plugin namespace\n"
             )
             launch_plugins = lease.stage_readonly_layout(
-                "qt-plugins", plugin_entries, byte_limit=256 << 20
+                "qt-plugins",
+                plugin_entries,
+                context={
+                    "policy": "ctest-qt-plugins-v2",
+                    "families": plugin_families,
+                    "platform_policy": ("qwindows.dll", "qoffscreen.dll"),
+                },
+                byte_limit=256 << 20,
             )
             launch_platform_plugins = launch_plugins / qt_platform_plugins.relative_to(
                 qt_plugins
@@ -760,7 +851,14 @@ def prepare_windows_runtime(
             }
             qml_entries.setdefault(Path(".closed"), b"closed QML namespace\n")
             launch_qml = lease.stage_readonly_layout(
-                "qt-qml", qml_entries, byte_limit=512 << 20
+                "qt-qml",
+                qml_entries,
+                context={
+                    "policy": "ctest-qt-qml-v2",
+                    "source_root": source_root.as_posix(),
+                    "project_qml": needs_project_qml,
+                },
+                byte_limit=512 << 20,
             )
 
             qml_replacements: list[tuple[Path, Path]] = [
@@ -800,6 +898,7 @@ def prepare_windows_runtime(
                         entry_limit=16384,
                         byte_limit=512 << 20,
                     )
+                    source_dependencies.append(staged_qml_path)
                     qml_replacements.append((qml_path, staged_qml_path))
                     continue
                 raise RuntimeError(
@@ -860,7 +959,23 @@ def prepare_windows_runtime(
                     if child in selected_executables:
                         runtime_tool_destinations[child] = destination
             runtime_layout = lease.stage_readonly_layout(
-                "runtime", runtime_entries, byte_limit=2 << 30
+                "runtime",
+                runtime_entries,
+                context={
+                    "policy": "ctest-runtime-v2",
+                    "runtime_roots": tuple(
+                        directory.as_posix() for directory in runtime_dirs
+                    ),
+                    "relative_directories": tuple(
+                        path.as_posix() for path in runtime_relative_dirs
+                    ),
+                    "selected_executables": tuple(
+                        sorted(path.as_posix() for path in selected_executables)
+                    ),
+                },
+                dependencies=(launch_plugins, launch_qml),
+                qt_paths=QtConfPaths(launch_plugins, launch_qml),
+                byte_limit=2 << 30,
             )
             launch_runtime = runtime_layout / "loader"
             launch_runtime_dirs = tuple(
@@ -879,16 +994,58 @@ def prepare_windows_runtime(
                 ).casefold():
                     ctest_entries[Path(adjacent.name)] = adjacent
             ctest_layout = lease.stage_readonly_layout(
-                "ctest-tool", ctest_entries, byte_limit=256 << 20
+                "ctest-tool",
+                ctest_entries,
+                context={
+                    "policy": "ctest-tool-v2",
+                    "ctest": ctest.as_posix(),
+                },
+                dependencies=(runtime_layout, launch_plugins, launch_qml),
+                qt_paths=QtConfPaths(launch_plugins, launch_qml),
+                byte_limit=256 << 20,
             )
             launch_ctest = ctest_layout / ctest.name
 
-            build_entries: dict[
-                Path, Path | bytes | Callable[[Path], bytes]
-            ] = {}
+            build_entries: list[
+                tuple[Path, Path | bytes | GeneratedLayoutEntry]
+            ] = []
+            build_destinations: set[str] = set()
+
+            def append_build_entry(
+                destination: Path,
+                entry: Path | bytes | GeneratedLayoutEntry,
+                *,
+                if_absent: bool = False,
+            ) -> None:
+                identity = os.path.normcase(str(destination))
+                if identity in build_destinations:
+                    if if_absent:
+                        return
+                    raise RuntimeError(
+                        f"duplicate CTest build layout destination: {destination}"
+                    )
+                build_destinations.add(identity)
+                build_entries.append((destination, entry))
+
             executable_replacements: list[tuple[Path, Path]] = []
             executable_destinations: dict[Path, Path] = {}
             external_launch_executables: dict[Path, Path] = {}
+            external_dependencies: list[Path] = []
+
+            def external_entry_identity(
+                destination: Path,
+                source: Path | bytes | GeneratedLayoutEntry,
+            ) -> tuple[str, str, str]:
+                if isinstance(source, Path):
+                    return (destination.as_posix(), "source", source.as_posix())
+                if isinstance(source, bytes):
+                    return (
+                        destination.as_posix(),
+                        "literal",
+                        hashlib.sha256(source).hexdigest(),
+                    )
+                return (destination.as_posix(), "generated", source.policy)
+
             for executable in sorted(
                 selected_executables, key=lambda path: str(path).casefold()
             ):
@@ -903,18 +1060,32 @@ def prepare_windows_runtime(
                             runtime_layout / runtime_destination
                         )
                         continue
-                    closure = _external_tool_closure(executable)
+                    closure = _external_tool_closure(executable, lease=lease)
                     staged_external = lease.stage_readonly_layout(
                         f"external-tool-{len(external_launch_executables)}",
                         closure.entries,
+                        context={
+                            "policy": "ctest-external-tool-v2",
+                            "root": closure.root.as_posix(),
+                            "executable_relative": closure.executable_relative.as_posix(),
+                            "entries": tuple(
+                                sorted(
+                                    external_entry_identity(destination, source)
+                                    for destination, source in closure.entries.items()
+                                )
+                            ),
+                        },
+                        dependencies=(runtime_layout, launch_plugins, launch_qml),
+                        qt_paths=QtConfPaths(launch_plugins, launch_qml),
                         entry_limit=32768,
                         byte_limit=1 << 30,
                     )
+                    external_dependencies.append(staged_external)
                     external_launch_executables[executable] = (
                         staged_external / closure.executable_relative
                     )
                     continue
-                build_entries[relative] = executable
+                append_build_entry(relative, executable)
                 executable_replacements.append((executable, relative))
                 executable_destinations[executable] = relative
                 for adjacent in sorted(
@@ -924,14 +1095,18 @@ def prepare_windows_runtime(
                     if adjacent.name.casefold() in configured_runtime_names:
                         continue
                     destination = relative.parent / adjacent.name
-                    build_entries.setdefault(destination, adjacent)
+                    append_build_entry(destination, adjacent, if_absent=True)
 
-            graph_texts: dict[Path, str] = {}
+            graph_texts: dict[Path, tuple[str, str, str]] = {}
             for path in graph.inputs:
                 stream = lease.hold(path)
                 stream.seek(0)
-                graph_texts[path] = stream.read().decode(
-                    "utf-8", errors="replace"
+                payload = stream.read()
+                stream.seek(0)
+                graph_texts[path] = (
+                    payload.decode("utf-8", errors="replace"),
+                    lease.canonical_file(path).as_posix(),
+                    hashlib.sha256(payload).hexdigest(),
                 )
             working_overrides: dict[Path, list[str]] = {}
             for test in selected_tests:
@@ -941,8 +1116,90 @@ def prepare_windows_runtime(
                     f"{_cmake_bracket(str(test.working_directory))})"
                 )
 
-            for graph_input, original_text in graph_texts.items():
+            selected_test_names = tuple(sorted(test.name for test in selected_tests))
+            for graph_input, graph_source in graph_texts.items():
+                original_text, source_final_path, source_sha256 = graph_source
                 relative = graph_input.relative_to(canonical_build)
+
+                declared_replacements = [
+                    (source.as_posix(), destination.as_posix())
+                    for source, destination in qml_replacements
+                ]
+                declared_replacements.extend(
+                    (source.as_posix(), f"$BUILD/{destination.as_posix()}")
+                    for source, destination in executable_replacements
+                )
+                declared_replacements.extend(
+                    (source.as_posix(), destination.as_posix())
+                    for source, destination in external_launch_executables.items()
+                )
+                declared_replacements.extend(
+                    (
+                        source.as_posix(),
+                        f"$BUILD/{source.relative_to(canonical_build).as_posix()}",
+                    )
+                    for source in graph.inputs
+                )
+                declared_replacements.extend(
+                    (source.as_posix(), destination.as_posix())
+                    for source, destination in zip(
+                        runtime_dirs, launch_runtime_dirs, strict=True
+                    )
+                )
+                declared_replacements.extend(
+                    (
+                        (ffmpeg_root.as_posix(), (runtime_layout / "ffmpeg").as_posix()),
+                        (srt_root.as_posix(), (runtime_layout / "srt").as_posix()),
+                    )
+                )
+                declared_replacements = sorted(
+                    declared_replacements,
+                    key=lambda pair: (pair[0].casefold(), pair[1].casefold()),
+                )
+
+                declared_occurrences: list[tuple[int, int, str]] = []
+                for path_argument in graph.path_arguments:
+                    if path_argument.definition_file == graph_input:
+                        declared_occurrences.append(
+                            (
+                                path_argument.occurrence.start,
+                                path_argument.occurrence.end,
+                                f"$BUILD/{path_argument.path.relative_to(canonical_build).as_posix()}",
+                            )
+                        )
+                for test in selected_tests:
+                    if test.definition_file != graph_input:
+                        continue
+                    for _raw, occurrence in (
+                        *test.environment_values,
+                        *test.environment_modification_values,
+                    ):
+                        declared_occurrences.append(
+                            (occurrence.start, occurrence.end, "environment-rewrite")
+                        )
+                    for quicktest_input in quicktest_inputs_by_test.get(
+                        _quicktest_record_key(test), ()
+                    ):
+                        declared_occurrences.append(
+                            (
+                                quicktest_input.occurrence.start,
+                                quicktest_input.occurrence.end,
+                                "quicktest-input-rewrite",
+                            )
+                        )
+                    for _argument, executable, occurrence in test.executable_arguments:
+                        destination = external_launch_executables.get(executable)
+                        declared_destination = (
+                            destination.as_posix()
+                            if destination is not None
+                            else "$BUILD/"
+                            + executable_destinations[executable].as_posix()
+                        )
+                        declared_occurrences.append(
+                            (occurrence.start, occurrence.end, declared_destination)
+                        )
+                declared_occurrences.sort()
+                declared_overrides = tuple(sorted(working_overrides.get(graph_input, ())))
 
                 def rewrite_graph(
                     staged_build: Path,
@@ -1054,11 +1311,38 @@ def prepare_windows_runtime(
                         rewritten += "\n".join(overrides) + "\n"
                     return rewritten.encode("utf-8")
 
-                build_entries[relative] = rewrite_graph
+                append_build_entry(
+                    relative,
+                    GeneratedLayoutEntry(
+                        "ctest-graph-rewrite-v2",
+                        {
+                            "source_final_path": source_final_path,
+                            "source_sha256": source_sha256,
+                            "selected_test_names": selected_test_names,
+                            "replacement_paths": tuple(declared_replacements),
+                            "occurrence_replacements": tuple(declared_occurrences),
+                            "working_overrides": declared_overrides,
+                        },
+                        rewrite_graph,
+                    ),
+                )
 
             launch_build = lease.stage_readonly_layout(
                 "ctest-build",
                 build_entries,
+                context={
+                    "policy": "ctest-build-v2",
+                    "graph_policy": "ctest-graph-rewrite-v2",
+                    "selected_tests": selected_test_names,
+                },
+                dependencies=(
+                    runtime_layout,
+                    launch_plugins,
+                    launch_qml,
+                    *source_dependencies,
+                    *external_dependencies,
+                ),
+                qt_paths=QtConfPaths(launch_plugins, launch_qml),
                 entry_limit=16384,
                 byte_limit=2 << 30,
             )

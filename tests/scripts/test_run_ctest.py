@@ -251,6 +251,224 @@ class RunCtestTests(unittest.TestCase):
             "\n".join(lines) + "\n", encoding="utf-8"
         )
 
+    def write_cacheable_ctest_graph(self, *names: str) -> tuple[Path, ...]:
+        executables: list[Path] = []
+        commands: list[str] = []
+        for name in names:
+            executable = self.build_dir / f"tst_{name}.exe"
+            _write_manifest_pe_fixture(executable)
+            executables.append(executable)
+            commands.append(f'add_test([=[{name}]=] "{executable.as_posix()}")')
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            "\n".join(commands) + "\n", encoding="utf-8"
+        )
+        return tuple(executables)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_ctest_warm_cache_and_every_executable_has_protected_qt_conf(self) -> None:
+        self.write_cacheable_ctest_graph("unit")
+        cache_root = self.root / "ctest-warm-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        arguments = ("-R", "^unit$")
+
+        with RuntimeAuditLease(cache_root) as cold:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=cold, ctest_args=arguments
+            )
+            self.assertGreater(cold.cache_miss_count, 0)
+
+        with RuntimeAuditLease(cache_root) as warm:
+            env, warm_ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=warm, ctest_args=arguments
+            )
+            self.assertEqual(
+                (
+                    warm.cache_miss_count,
+                    warm.payload_written_file_count,
+                    warm.payload_written_byte_count,
+                ),
+                (0, 0, 0),
+            )
+            executable_paths = {
+                executable
+                for layout in warm.cached_layout_directories
+                for executable in layout.rglob("*.exe")
+            }
+            executable_paths.add(warm_ctest)
+            self.assertGreater(len(executable_paths), 1)
+            for executable in executable_paths:
+                with self.subTest(executable=executable):
+                    rendered = (executable.parent / "qt.conf").read_text(
+                        encoding="utf-8"
+                    )
+                    self.assertIn(Path(env["QT_PLUGIN_PATH"]).as_posix(), rendered)
+                    self.assertIn(Path(env["QML_IMPORT_PATH"]).as_posix(), rendered)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_ctest_graph_uses_declared_provenance_and_source_change_misses(self) -> None:
+        self.write_cacheable_ctest_graph("unit", "other")
+        cache_root = self.root / "ctest-graph-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        arguments = ("-R", "^unit$")
+        captured: list[windows_runtime_cache.GeneratedLayoutEntry] = []
+        original = RuntimeAuditLease.stage_readonly_layout
+
+        def record_entries(lease, name, entries, **kwargs):
+            pairs = tuple(entries.items()) if isinstance(entries, dict) else tuple(entries)
+            if name == "ctest-build":
+                captured.extend(
+                    entry
+                    for _destination, entry in pairs
+                    if isinstance(entry, windows_runtime_cache.GeneratedLayoutEntry)
+                )
+            return original(lease, name, pairs, **kwargs)
+
+        with mock.patch.object(
+            RuntimeAuditLease, "stage_readonly_layout", new=record_entries
+        ):
+            with RuntimeAuditLease(cache_root) as cold:
+                run_ctest.prepare_windows_runtime(
+                    self.build_dir, {}, audit_lease=cold, ctest_args=arguments
+                )
+            with RuntimeAuditLease(cache_root) as warm:
+                run_ctest.prepare_windows_runtime(
+                    self.build_dir, {}, audit_lease=warm, ctest_args=arguments
+                )
+                self.assertEqual(warm.cache_miss_count, 0)
+
+        self.assertGreater(len(captured), 0)
+        for generated in captured:
+            self.assertEqual(generated.policy, "ctest-graph-rewrite-v2")
+            self.assertEqual(generated.inputs["selected_test_names"], ("unit",))
+            self.assertEqual(
+                set(generated.inputs),
+                {
+                    "source_final_path",
+                    "source_sha256",
+                    "selected_test_names",
+                    "replacement_paths",
+                    "occurrence_replacements",
+                    "working_overrides",
+                },
+            )
+
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph.write_text(graph.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
+        with RuntimeAuditLease(cache_root) as changed:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=changed, ctest_args=arguments
+            )
+            self.assertGreater(changed.cache_miss_count, 0)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_ctest_selection_and_source_snapshot_keys_are_stable_and_exact(self) -> None:
+        executable, other = self.write_cacheable_ctest_graph("unit", "other")
+        qml_input = self.root / "tests" / "cacheable-qml"
+        qml_input.mkdir(parents=True)
+        (qml_input / "tst_cacheable.qml").write_text(
+            "import QtQuick\nItem {}\n", encoding="utf-8"
+        )
+        graph = self.build_dir / "CTestTestfile.cmake"
+        graph.write_text(
+            f'add_test([=[unit]=] "{executable.as_posix()}" "-input" '
+            f'"{qml_input.as_posix()}")\n'
+            f'add_test([=[other]=] "{other.as_posix()}")\n',
+            encoding="utf-8",
+        )
+        cache_parent = Path(tempfile.mkdtemp(prefix="olr-ctest-source-cache-"))
+        self.addCleanup(shutil.rmtree, cache_parent, True)
+        cache_root = cache_parent / "cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as cold:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=cold,
+                ctest_args=("-R", "^unit$"),
+            )
+            cold_build = cold.launch_build_directory
+            cold_source = cold.launch_source_directory
+        with RuntimeAuditLease(cache_root) as warm:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=warm,
+                ctest_args=("-R", "^unit$"),
+            )
+            self.assertEqual(warm.cache_miss_count, 0)
+            self.assertEqual(warm.payload_written_file_count, 0)
+            self.assertEqual(warm.launch_build_directory, cold_build)
+            self.assertEqual(warm.launch_source_directory, cold_source)
+        with RuntimeAuditLease(cache_root) as changed_selection:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir,
+                {},
+                audit_lease=changed_selection,
+                ctest_args=("-R", "^other$"),
+            )
+            self.assertGreater(changed_selection.cache_miss_count, 0)
+            self.assertNotEqual(changed_selection.launch_build_directory, cold_build)
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_external_python_generated_closure_is_warm_cacheable_and_configured(self) -> None:
+        base = self.root / "python-base"
+        (base / "Lib").mkdir(parents=True)
+        (base / "Lib" / "os.py").write_text("# fixture\n", encoding="utf-8")
+        (base / "python313.dll").write_bytes(b"python-runtime")
+        venv = self.root / "venv"
+        scripts = venv / "Scripts"
+        scripts.mkdir(parents=True)
+        python = scripts / "python.exe"
+        _write_manifest_pe_fixture(python)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {base.as_posix()}\n", encoding="utf-8"
+        )
+        (self.build_dir / "CTestTestfile.cmake").write_text(
+            f'add_test([=[python]=] "{python.as_posix()}" "-c" "pass")\n',
+            encoding="utf-8",
+        )
+        cache_root = self.root / "external-python-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+
+        with RuntimeAuditLease(cache_root) as cold:
+            run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=cold
+            )
+            replacement = self.root / "replacement-pyvenv.cfg"
+            replacement.write_text("home = C:/poison\n", encoding="utf-8")
+            with self.assertRaises(OSError):
+                os.replace(replacement, venv / "pyvenv.cfg")
+        with RuntimeAuditLease(cache_root) as warm:
+            env, _ctest = run_ctest.prepare_windows_runtime(
+                self.build_dir, {}, audit_lease=warm
+            )
+            self.assertEqual(
+                (
+                    warm.cache_miss_count,
+                    warm.payload_written_file_count,
+                    warm.payload_written_byte_count,
+                ),
+                (0, 0, 0),
+            )
+            rewritten = (
+                warm.launch_build_directory / "CTestTestfile.cmake"
+            ).read_text(encoding="utf-8")
+            staged_python = next(
+                Path(value)
+                for value in re.findall(r'"([^\"]+python\.exe)"', rewritten)
+                if Path(value) != python
+            )
+            rendered = (staged_python.parent / "qt.conf").read_text(encoding="utf-8")
+            self.assertIn(Path(env["QT_PLUGIN_PATH"]).as_posix(), rendered)
+            self.assertIn(Path(env["QML_IMPORT_PATH"]).as_posix(), rendered)
+            self.assertIn(
+                (staged_python.parent.parent / "base").as_posix(),
+                (staged_python.parent.parent / "pyvenv.cfg").read_text(
+                    encoding="utf-8"
+                ),
+            )
+
     def make_junction(self, link: Path, target: Path) -> None:
         completed = subprocess.run(
             ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
@@ -2113,7 +2331,7 @@ class RunCtestTests(unittest.TestCase):
         )
 
         with RuntimeAuditLease() as lease:
-            run_ctest.prepare_windows_runtime(
+            env, _ctest = run_ctest.prepare_windows_runtime(
                 self.build_dir, {}, audit_lease=lease
             )
             graph = (lease.launch_build_directory / "CTestTestfile.cmake").read_text(
@@ -2125,6 +2343,9 @@ class RunCtestTests(unittest.TestCase):
                 if Path(value) != tool
             )
             self.assertTrue(staged_tool.is_file())
+            rendered = (staged_tool.parent / "qt.conf").read_text(encoding="utf-8")
+            self.assertIn(Path(env["QT_PLUGIN_PATH"]).as_posix(), rendered)
+            self.assertIn(Path(env["QML_IMPORT_PATH"]).as_posix(), rendered)
             self.assertFalse(
                 (staged_tool.parent.parent / "Docs" / "Qt-oversized").exists()
             )
@@ -2193,7 +2414,9 @@ class RunCtestTests(unittest.TestCase):
         self.assertEqual(closure.executable_relative, Path("Scripts/python.exe"))
         self.assertIn(Path("base/Lib/encodings/__init__.py"), closure.entries)
         self.assertNotIn(Path("Lib/site-packages/poison.py"), closure.entries)
-        rendered = closure.entries[Path("pyvenv.cfg")](Path("C:/protected-python"))
+        generated = closure.entries[Path("pyvenv.cfg")]
+        self.assertIsInstance(generated, windows_runtime_cache.GeneratedLayoutEntry)
+        rendered = generated.render(Path("C:/protected-python"))
         self.assertIn(b"home = C:/protected-python/base", rendered)
 
     def test_python_venv_closure_follows_base_root_pe_imports(self):
@@ -2247,9 +2470,9 @@ class RunCtestTests(unittest.TestCase):
         real_validate = run_ctest._validated_closure_path
         validated: list[Path] = []
 
-        def record(path: Path, selected_root: Path | None = None) -> Path:
+        def record(path: Path, selected_root: Path | None = None, **kwargs) -> Path:
             validated.append(path)
-            return real_validate(path, selected_root)
+            return real_validate(path, selected_root, **kwargs)
 
         with mock.patch.object(
             run_ctest, "_validated_closure_path", side_effect=record
@@ -2325,6 +2548,27 @@ class RunCtestTests(unittest.TestCase):
                     self.assertRaisesRegex(RuntimeError, "reparse alias"),
                 ):
                     run_ctest._external_tool_closure(executable)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows directory handles")
+    def test_external_tool_closure_holds_every_traversed_directory(self) -> None:
+        root = self.root / "external-held-traversal"
+        resources = root / "resources"
+        nested = resources / "nested"
+        nested.mkdir(parents=True)
+        executable = root / "wrapper.exe"
+        executable.write_bytes(b"wrapper")
+        (nested / "data.bin").write_bytes(b"data")
+        executable.with_name(executable.name + ".olr-runtime-files").write_text(
+            "resources\n", encoding="utf-8"
+        )
+
+        with RuntimeAuditLease() as lease:
+            closure = run_ctest._external_tool_closure(executable, lease=lease)
+            self.assertIn(Path("resources/nested/data.bin"), closure.entries)
+            with self.assertRaises(OSError):
+                nested.rename(nested.with_name("retargeted-nested"))
+            with self.assertRaises(OSError):
+                resources.rename(resources.with_name("retargeted-resources"))
 
     @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
     def test_external_tool_manifest_rejects_junction_resource_root(self) -> None:
