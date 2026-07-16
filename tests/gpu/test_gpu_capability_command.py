@@ -1098,6 +1098,9 @@ class CommandRewriteTests(unittest.TestCase):
         controls = (
             (("/clang:-o", "/clang:hidden.obj", "file.cpp"), "hidden.*output"),
             (("/clang:-MF", "/clang:hidden.d", "file.cpp"), "hidden.*dependency"),
+            (("/clang:-dependency-file", "/clang:hidden.d", "file.cpp"),
+             "hidden.*dependency"),
+            (("/clang:-Wp,-MD,hidden.d", "file.cpp"), "hidden.*dependency"),
             (("/clang:-P", "file.cpp"), "hidden.*marker"),
             (("/clang:-c", "file.cpp"), "hidden.*source-selection"),
             (("/clang:-x", "/clang:c++-cpp-output", "file.cpp"), "hidden.*source-selection"),
@@ -1108,6 +1111,24 @@ class CommandRewriteTests(unittest.TestCase):
                 AuditInfrastructureError, message
             ):
                 self.rewrite(CompilerFamily.CLANG_CL, arguments)
+
+    def test_msvc_and_clang_cl_strip_directives_mode_dependency_output(self):
+        arguments = (
+            "/DKEEP=1", "/sourceDependencies:directives", "old.json", "file.cpp",
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, arguments)
+                self.assertEqual(
+                    rewritten.arguments,
+                    (
+                        str(self.configuration(family, arguments).compiler),
+                        "/DKEEP=1", "file.cpp", "/nologo", "/E",
+                        "/sourceDependencies", str(self.dependency_output),
+                    ),
+                )
+                self.assertEqual(rewritten.arguments.count("file.cpp"), 1)
+                self.assertNotIn("old.json", rewritten.arguments)
 
     def test_msvc_and_clang_cl_reject_multiple_sources_and_unknown_outputs(self):
         controls = (

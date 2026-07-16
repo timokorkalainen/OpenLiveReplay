@@ -949,6 +949,15 @@ def _source_inputs(
             and len(lowered) > 1
             else lowered
         )
+        if (
+            not positional_only
+            and msvc_lowered == "/sourcedependencies:directives"
+            and family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
+        ):
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            index += 2
+            continue
         if not positional_only and msvc_lowered in {"/tc", "/tp"} and family in {
             CompilerFamily.MSVC, CompilerFamily.CLANG_CL
         }:
@@ -1030,30 +1039,39 @@ def _validate_rewrite_source(configuration: PreprocessConfiguration) -> None:
 
 
 def _gnu_forwarded_control(payload: str) -> str | None:
-    lowered = payload.casefold()
-    if payload == "-P" or lowered.startswith(("-wp,-p", "-frewrite-includes")):
-        return "marker"
-    if payload in {"-c", "-S"} or lowered.startswith(
-        ("-fpreprocessed", "-fdirectives-only")
-    ):
-        return "source-selection"
-    if payload == "-x" or "cpp-output" in lowered:
-        return "source-selection"
-    if payload in {"-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ", "-MJ"}:
-        return "dependency"
-    if payload == "-o" or any(
-        payload.startswith(prefix) and len(payload) > len(prefix)
-        for prefix in _GNU_REWRITE_ATTACHED_VALUES
-    ):
-        return "output"
-    if lowered.startswith((
-        "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
-        "-fmodule-output", "-serialize-diagnostics", "--serialize-diagnostics",
-        "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
-    )):
-        return "output"
-    if payload.startswith("@"):
-        return "response"
+    pending = [payload]
+    while pending:
+        candidate = pending.pop()
+        lowered = candidate.casefold()
+        if lowered.startswith("-wp,"):
+            pending.extend(reversed(candidate[4:].split(",")))
+            continue
+        if candidate == "-P" or lowered.startswith("-frewrite-includes"):
+            return "marker"
+        if candidate in {"-c", "-S"} or lowered.startswith(
+            ("-fpreprocessed", "-fdirectives-only")
+        ):
+            return "source-selection"
+        if candidate == "-x" or "cpp-output" in lowered:
+            return "source-selection"
+        if candidate in {
+            "-MD", "-MMD", "-M", "-MM", "-MG", "-MP", "-MF", "-MT", "-MQ",
+            "-MJ", "-dependency-file", "--dependency-file",
+        } or any(
+            candidate.startswith(prefix) and len(candidate) > len(prefix)
+            for prefix in ("-MF", "-MT", "-MQ", "-MJ")
+        ) or lowered.startswith(("-dependency-file=", "--dependency-file=")):
+            return "dependency"
+        if candidate == "-o" or candidate.startswith("-o") and len(candidate) > 2:
+            return "output"
+        if lowered.startswith((
+            "-save-temps", "--save-temps", "-dumpbase", "-dumpdir",
+            "-fmodule-output", "-serialize-diagnostics", "--serialize-diagnostics",
+            "-fdiagnostics-file=", "-fdiagnostics-serialization-file=",
+        )):
+            return "output"
+        if candidate.startswith("@"):
+            return "response"
     return None
 
 
@@ -1174,6 +1192,11 @@ def _rewrite_msvc(
         if slash_spelling.startswith("/FI"):
             rewritten.append(value)
             index += 1
+            continue
+        if option == "/sourcedependencies:directives":
+            if index + 1 >= len(arguments):
+                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
+            index += 2
             continue
         if option.startswith("/clang:"):
             payload = value[len(value.partition(":")[0]) + 1 :]
