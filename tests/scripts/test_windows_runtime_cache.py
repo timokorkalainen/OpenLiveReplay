@@ -1,9 +1,12 @@
 import hashlib
 import io
+import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +16,7 @@ from unittest import mock
 
 import tools.windows_runtime_cache as runtime_cache
 from tools.windows_runtime_cache import (
+    CachedLayoutLease,
     GeneratedLayoutEntry,
     HeldSource,
     JsonScalar,
@@ -39,6 +43,75 @@ def held(name: str, payload: bytes, *, inode: int = 1) -> HeldSource:
         sha256=hashlib.sha256(payload).hexdigest(),
         stream=io.BytesIO(payload),
     )
+
+
+def _resolved_source(path: Path) -> HeldSource:
+    stream = path.open("rb")
+    stat_result = os.fstat(stream.fileno())
+    final_path = runtime_cache._final_path_from_handle(
+        runtime_cache._kernel32(),
+        __import__("msvcrt").get_osfhandle(stream.fileno()),
+    )
+    digest = hashlib.sha256(stream.read()).hexdigest()
+    stream.seek(0)
+    return HeldSource(
+        source=path,
+        final_path=final_path,
+        device=int(stat_result.st_dev),
+        inode=int(stat_result.st_ino),
+        size=int(stat_result.st_size),
+        sha256=digest,
+        stream=stream,
+    )
+
+
+def _publication_worker(
+    cache_root: str,
+    source_path: str,
+    ready_path: str,
+    peer_ready_path: str,
+    start_path: str,
+) -> None:
+    sid = _current_user_sid()
+    cache = WindowsRuntimeCache(
+        Path(cache_root),
+        sid,
+        _resolved_source,
+        lambda path: runtime_cache._open_canonical_non_reparse(
+            path, path.parent, directory=True
+        ),
+    )
+    descriptor = _resolved_source(Path(source_path))
+    Path(ready_path).write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 30
+    while not Path(start_path).exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("publication worker start barrier timed out")
+        time.sleep(0.01)
+
+    real_move = runtime_cache._atomic_move_no_replace
+
+    def synchronized_move(source: Path, destination: Path, *, sealed=None) -> None:
+        Path(ready_path + ".move").write_text("ready", encoding="utf-8")
+        while not Path(peer_ready_path + ".move").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("publication worker move barrier timed out")
+            time.sleep(0.01)
+        real_move(source, destination, sealed=sealed)
+
+    try:
+        with mock.patch.object(
+            runtime_cache, "_atomic_move_no_replace", side_effect=synchronized_move
+        ):
+            lease = cache.materialize(
+                "race",
+                ((Path("bin/tool.exe"), descriptor),),
+                context={"purpose": "concurrent-test"},
+            )
+        print(json.dumps({"key": lease.key, "cache_hit": lease.cache_hit}))
+        lease.close()
+    finally:
+        descriptor.stream.close()
 
 
 class CacheKeyTests(unittest.TestCase):
@@ -866,6 +939,353 @@ class WindowsFilesystemTests(unittest.TestCase):
 
         self.assertIn(cache_root, created)
         self.assertIn(cache.objects, created)
+
+
+@unittest.skipUnless(os.name == "nt", "requires Windows publication semantics")
+class PublicationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.cache_root = self.root / "cache"
+        self.sources = self.root / "sources"
+        self.sources.mkdir()
+        self.sid = _current_user_sid()
+        self.leases: list[CachedLayoutLease] = []
+        self.descriptors: list[HeldSource] = []
+        self.cache = self.make_cache()
+
+    def tearDown(self) -> None:
+        for lease in reversed(self.leases):
+            lease.close()
+        for descriptor in reversed(self.descriptors):
+            descriptor.stream.close()
+        for owner in self.cache._management_handles:
+            owner.close()
+        if self.root.exists():
+            _set_tree_acl(self.root, self.sid, "DELETE")
+            shutil.rmtree(self.root, ignore_errors=True)
+        self.temporary.cleanup()
+
+    def make_cache(self) -> WindowsRuntimeCache:
+        return WindowsRuntimeCache(
+            self.cache_root,
+            self.sid,
+            _resolved_source,
+            lambda path: runtime_cache._open_canonical_non_reparse(
+                path, path.parent, directory=True
+            ),
+        )
+
+    def held_file(self, name: str, payload: bytes) -> HeldSource:
+        path = self.sources / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        descriptor = _resolved_source(path)
+        self.descriptors.append(descriptor)
+        return descriptor
+
+    def remember(self, lease: CachedLayoutLease) -> CachedLayoutLease:
+        self.leases.append(lease)
+        return lease
+
+    def close(self, lease: CachedLayoutLease) -> None:
+        lease.close()
+        self.leases.remove(lease)
+
+    def force_mutable(self, object_root: Path) -> None:
+        _set_tree_acl(object_root, self.sid, "DELETE")
+
+    def assert_warm_zero(self, lease: CachedLayoutLease) -> None:
+        self.assertTrue(lease.cache_hit)
+        self.assertEqual((lease.payload_files, lease.payload_bytes), (0, 0))
+
+    def publish_and_close(
+        self,
+        name: str,
+        entries: LayoutEntries,
+        *,
+        context=None,
+    ) -> CachedLayoutLease:
+        lease = self.cache.materialize(name, entries, context=context or {})
+        self.close(self.remember(lease))
+        return lease
+
+    def test_cold_publish_then_exact_warm_hit_writes_no_payload(self) -> None:
+        entries = ((Path("bin/tool.exe"), self.held_file("tool.exe", b"tool")),)
+        first = self.remember(
+            self.cache.materialize("tool", entries, context={"purpose": "ctest"})
+        )
+        self.assertFalse(first.cache_hit)
+        self.assertEqual((first.logical_files, first.logical_bytes), (1, 4))
+        self.assertEqual((first.payload_files, first.payload_bytes), (1, 4))
+        self.assertEqual((first.layout / "bin/tool.exe").read_bytes(), b"tool")
+        self.assertTrue(first._owners)
+        first_root = first.object_root
+        self.close(first)
+
+        second = self.remember(
+            self.cache.materialize("tool", entries, context={"purpose": "ctest"})
+        )
+        self.assert_warm_zero(second)
+        self.assertEqual(second.object_root, first_root)
+        self.assertEqual((second.logical_files, second.logical_bytes), (1, 4))
+
+    def test_case_only_destination_and_layout_spelling_reuses_stored_spelling(self) -> None:
+        source = self.held_file("tool.exe", b"tool")
+        first = self.publish_and_close(
+            "Tool", ((Path("Bin/Tool.exe"), source),), context={}
+        )
+        second = self.remember(
+            self.cache.materialize(
+                "tool", ((Path("bin/tool.exe"), source),), context={}
+            )
+        )
+        self.assert_warm_zero(second)
+        self.assertEqual(second.key, first.key)
+        self.assertEqual(second.layout.name, "Tool")
+        self.assertTrue((second.layout / "Bin/Tool.exe").is_file())
+        manifest = json.loads((second.object_root / "manifest.json").read_text("utf-8"))
+        self.assertEqual(manifest["layout_name"], "Tool")
+        self.assertEqual(manifest["files"][0]["destination"], "Bin/Tool.exe")
+
+    def test_manifest_is_written_last_and_only_complete_tree_is_published(self) -> None:
+        observed = {"render_before_manifest": False, "sealed_complete": False}
+
+        def render(final_layout: Path) -> bytes:
+            if not observed["render_before_manifest"]:
+                staging_roots = tuple(self.cache.staging.iterdir())
+                self.assertEqual(len(staging_roots), 1)
+                self.assertFalse((staging_roots[0] / "manifest.json").exists())
+            self.assertEqual(final_layout.parent, self.cache.objects / expected_key)
+            observed["render_before_manifest"] = True
+            return final_layout.as_posix().encode("utf-8")
+
+        source = self.held_file("payload.bin", b"payload")
+        generated = GeneratedLayoutEntry("generated-v1", {}, render)
+        entries = ((Path("payload.bin"), source), (Path("generated.txt"), generated))
+        expected_key = layout_key("complete", entries, {}, ())[0]
+        real_seal = runtime_cache._seal_tree_acl
+
+        def inspect_seal(path: Path, sid: str, mode: str = "RX"):
+            self.assertTrue((path / "manifest.json").is_file())
+            self.assertEqual((path / "complete/payload.bin").read_bytes(), b"payload")
+            self.assertTrue((path / "complete/generated.txt").is_file())
+            observed["sealed_complete"] = True
+            return real_seal(path, sid, mode)
+
+        with mock.patch.object(runtime_cache, "_seal_tree_acl", side_effect=inspect_seal):
+            lease = self.remember(self.cache.materialize("complete", entries, context={}))
+
+        self.assertEqual(observed, {"render_before_manifest": True, "sealed_complete": True})
+        self.assertFalse((self.cache.staging / expected_key).exists())
+        self.assertTrue((self.cache.objects / expected_key / "manifest.json").is_file())
+        manifest = json.loads((lease.object_root / "manifest.json").read_text("utf-8"))
+        self.assertEqual(manifest["object_key"], lease.key)
+        self.assertEqual(manifest["key_input"], layout_key("complete", entries, {}, ())[1])
+        self.assertEqual({item["kind"] for item in manifest["files"]}, {"held-source", "generated"})
+
+    def test_invalid_input_source_mismatch_and_limits_leave_cache_unmodified(self) -> None:
+        source = self.held_file("value.bin", b"value")
+        cases = (
+            lambda: self.cache.materialize("bad/name", ((Path("value"), source),), context={}),
+            lambda: self.cache.materialize("safe", ((Path("../value"), source),), context={}),
+            lambda: self.cache.materialize("safe", ((Path("value"), replace(source, inode=source.inode + 1)),), context={}),
+            lambda: self.cache.materialize("safe", ((Path("value"), source),), context={}, entry_limit=0),
+            lambda: self.cache.materialize("safe", ((Path("value"), source),), context={}, byte_limit=4),
+        )
+        for invoke in cases:
+            with self.subTest(invoke=invoke):
+                with self.assertRaises(RuntimeError):
+                    invoke()
+                self.assertEqual(tuple(self.cache.objects.iterdir()), ())
+                self.assertEqual(tuple(self.cache.staging.iterdir()), ())
+
+    def test_source_is_revalidated_and_copied_from_the_resolved_held_stream(self) -> None:
+        source = self.held_file("held.bin", b"before")
+        source.stream.close()
+        (self.sources / "held.bin").write_bytes(b"after")
+        with self.assertRaisesRegex(RuntimeError, "held source"):
+            self.cache.materialize("held", ((Path("held.bin"), source),), context={})
+        self.assertEqual(tuple(self.cache.objects.iterdir()), ())
+        self.assertEqual(tuple(self.cache.staging.iterdir()), ())
+
+    def test_source_identity_and_content_changes_publish_distinct_misses(self) -> None:
+        first_source = self.held_file("one.bin", b"same")
+        first = self.publish_and_close("source", ((Path("value.bin"), first_source),))
+        identity_source = self.held_file("two.bin", b"same")
+        identity = self.remember(
+            self.cache.materialize("source", ((Path("value.bin"), identity_source),), context={})
+        )
+        self.assertFalse(identity.cache_hit)
+        self.assertNotEqual(identity.key, first.key)
+        self.close(identity)
+        content_source = self.held_file("three.bin", b"changed")
+        content = self.remember(
+            self.cache.materialize("source", ((Path("value.bin"), content_source),), context={})
+        )
+        self.assertFalse(content.cache_hit)
+        self.assertNotIn(content.key, (first.key, identity.key))
+        self.assertEqual(len(tuple(self.cache.objects.iterdir())), 3)
+
+    def test_hit_rejects_extra_and_missing_files(self) -> None:
+        entries = ((Path("value.bin"), self.held_file("value.bin", b"value")),)
+        for mutation, message in (("extra", "exact file set"), ("missing", "exact file set")):
+            with self.subTest(mutation=mutation):
+                cache = self.make_cache()
+                lease = cache.materialize("exact-" + mutation, entries, context={})
+                lease.close()
+                self.force_mutable(lease.object_root)
+                if mutation == "extra":
+                    (lease.layout / "extra.bin").write_bytes(b"extra")
+                else:
+                    (lease.layout / "value.bin").unlink()
+                with self.assertRaisesRegex(RuntimeError, message):
+                    cache.materialize("exact-" + mutation, entries, context={})
+
+    def test_hit_rejects_payload_and_manifest_tampering(self) -> None:
+        entries = ((Path("value.bin"), self.held_file("value.bin", b"value")),)
+        for mutation, message in (("payload", "digest"), ("manifest", "manifest")):
+            with self.subTest(mutation=mutation):
+                cache = self.make_cache()
+                lease = cache.materialize("tamper-" + mutation, entries, context={})
+                lease.close()
+                self.force_mutable(lease.object_root)
+                if mutation == "payload":
+                    (lease.layout / "value.bin").write_bytes(b"other")
+                else:
+                    (lease.object_root / "manifest.json").write_text("{}", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, message):
+                    cache.materialize("tamper-" + mutation, entries, context={})
+
+    def test_hit_rejects_file_alias_replacement_with_the_same_bytes(self) -> None:
+        source = self.held_file("alias.bin", b"same")
+        entries = ((Path("one.bin"), source), (Path("two.bin"), source))
+        lease = self.publish_and_close("alias", entries)
+        self.force_mutable(lease.object_root)
+        one = lease.layout / "one.bin"
+        two = lease.layout / "two.bin"
+        two.unlink()
+        os.link(one, two)
+        with self.assertRaisesRegex(RuntimeError, "alias"):
+            self.cache.materialize("alias", entries, context={})
+
+    def test_hit_rejects_changed_generated_bytes(self) -> None:
+        rendered = [b"one"]
+        generated = GeneratedLayoutEntry("generated-v1", {"stable": True}, lambda _root: rendered[0])
+        entries = ((Path("value.txt"), generated),)
+        self.publish_and_close("generated", entries)
+        rendered[0] = b"two"
+        with self.assertRaisesRegex(RuntimeError, "generated"):
+            self.cache.materialize("generated", entries, context={})
+
+    def test_hit_rejects_loosened_file_and_directory_acl(self) -> None:
+        entries = ((Path("nested/value.bin"), self.held_file("acl.bin", b"value")),)
+        for target_kind in ("file", "directory"):
+            with self.subTest(target_kind=target_kind):
+                cache = self.make_cache()
+                lease = cache.materialize("acl-" + target_kind, entries, context={})
+                lease.close()
+                target = lease.layout / ("nested/value.bin" if target_kind == "file" else "nested")
+                runtime_cache._set_path_acl(target, self.sid, "BUILD")
+                with self.assertRaisesRegex(RuntimeError, "mutation"):
+                    cache.materialize("acl-" + target_kind, entries, context={})
+
+    def test_hit_rejects_object_retargeted_between_validation_and_hold(self) -> None:
+        entries = ((Path("value.bin"), self.held_file("retarget.bin", b"value")),)
+        published = self.publish_and_close("retarget", entries)
+        replacement = self.cache.staging / "replacement"
+        self.force_mutable(published.object_root)
+        shutil.copytree(published.object_root, replacement)
+        _set_tree_acl(published.object_root, self.sid, "RX")
+        _set_tree_acl(replacement, self.sid, "RX")
+        displaced = self.cache.quarantine / "displaced"
+        real_validate = runtime_cache._validate_object_contents
+        retargeted = False
+
+        def retarget_after_validation(*args, **kwargs):
+            nonlocal retargeted
+            result = real_validate(*args, **kwargs)
+            if kwargs.get("require_acl") and not retargeted:
+                retargeted = True
+                runtime_cache._set_path_acl(self.cache.objects, self.sid, "BUILD")
+                runtime_cache._set_path_acl(published.object_root, self.sid, "DELETE")
+                published.object_root.rename(displaced)
+                runtime_cache._set_path_acl(replacement, self.sid, "DELETE")
+                replacement.rename(published.object_root)
+                _set_tree_acl(published.object_root, self.sid, "RX")
+            return result
+
+        with mock.patch.object(
+            runtime_cache,
+            "_validate_object_contents",
+            side_effect=retarget_after_validation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "changed|identity"):
+                self.cache.materialize("retarget", entries, context={})
+        self.assertTrue(retargeted)
+
+    def test_interrupted_staging_is_ignored_and_never_treated_as_an_object(self) -> None:
+        interrupted = self.cache.staging / "interrupted"
+        interrupted.mkdir()
+        (interrupted / "manifest.json").write_text("{}", encoding="utf-8")
+        entries = ((Path("value.bin"), self.held_file("interrupted.bin", b"value")),)
+        cold = self.publish_and_close("interrupted", entries)
+        self.assertFalse(cold.cache_hit)
+        self.assertTrue(interrupted.is_dir())
+        warm = self.remember(self.cache.materialize("interrupted", entries, context={}))
+        self.assert_warm_zero(warm)
+        self.assertNotEqual(interrupted, warm.object_root)
+
+    def test_concurrent_creators_publish_one_complete_object(self) -> None:
+        source = self.sources / "race.bin"
+        source.write_bytes(b"concurrent publication")
+        start = self.root / "start"
+        ready = (self.root / "worker-one", self.root / "worker-two")
+        processes = []
+        for index in range(2):
+            code = (
+                "from tests.scripts.test_windows_runtime_cache import _publication_worker; "
+                f"_publication_worker({str(self.cache_root)!r}, {str(source)!r}, "
+                f"{str(ready[index])!r}, {str(ready[1 - index])!r}, {str(start)!r})"
+            )
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", code],
+                    cwd=str(Path(__file__).parents[2]),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            )
+        deadline = time.monotonic() + 30
+        while not all(path.exists() for path in ready):
+            self.assertLess(time.monotonic(), deadline, "workers did not reach start barrier")
+            time.sleep(0.01)
+        start.write_text("start", encoding="utf-8")
+        results = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, stderr)
+            results.append(json.loads(stdout.strip()))
+        self.assertEqual(results[0]["key"], results[1]["key"])
+        self.assertEqual(sorted(result["cache_hit"] for result in results), [False, True])
+        objects = tuple(self.cache.objects.iterdir())
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(tuple(path for path in self.cache.staging.iterdir() if path.name != "interrupted"), ())
+        descriptor = self.held_file("race-parent.bin", b"concurrent publication")
+        # The worker source identity is part of the key, so validate the winner
+        # using the same source path rather than the parent helper's new file.
+        descriptor.stream.close()
+        actual = _resolved_source(source)
+        self.descriptors.append(actual)
+        warm = self.remember(
+            self.cache.materialize(
+                "race",
+                ((Path("bin/tool.exe"), actual),),
+                context={"purpose": "concurrent-test"},
+            )
+        )
+        self.assert_warm_zero(warm)
 
 
 if __name__ == "__main__":

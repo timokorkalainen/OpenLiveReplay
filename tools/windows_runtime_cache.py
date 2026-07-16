@@ -9,6 +9,7 @@ import math
 import ntpath
 import os
 import re
+import shutil
 import time
 import uuid
 from ctypes import wintypes
@@ -85,6 +86,35 @@ class CacheStats:
     misses: int = 0
     payload_files: int = 0
     payload_bytes: int = 0
+
+
+@dataclass
+class CachedLayoutLease:
+    key: str
+    object_root: Path
+    layout: Path
+    logical_files: int
+    logical_bytes: int
+    cache_hit: bool
+    payload_files: int
+    payload_bytes: int
+    _owners: tuple[object, ...]
+
+    def close(self) -> None:
+        owners, self._owners = self._owners, ()
+        for owner in reversed(owners):
+            close = getattr(owner, "close", None)
+            if callable(close):
+                close()
+
+    def __enter__(self) -> "CachedLayoutLease":
+        return self
+
+    def __exit__(self, *_unused: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 _AclMode = Literal["PRIVATE", "BUILD", "RX", "DELETE"]
@@ -284,6 +314,26 @@ class WindowsRuntimeCache:
             self.root / "locks",
             sid,
             retained_handles=self._management_handles,
+        )
+
+    def materialize(
+        self,
+        name: str,
+        entries: LayoutEntries,
+        *,
+        context: Mapping[str, JsonValue],
+        dependencies: Sequence[CachedLayoutLease] = (),
+        entry_limit: int = 8192,
+        byte_limit: int = 1 << 30,
+    ) -> CachedLayoutLease:
+        return _materialize_layout(
+            self,
+            name,
+            entries,
+            context=context,
+            dependencies=dependencies,
+            entry_limit=entry_limit,
+            byte_limit=byte_limit,
         )
 
 
@@ -1199,6 +1249,591 @@ def _atomic_move_no_replace(
             finally:
                 source_parent_owner.close()
                 destination_parent_owner.close()
+
+
+def _stream_sha256(stream: BinaryIO) -> str:
+    stream.seek(0)
+    digest = hashlib.sha256()
+    try:
+        while True:
+            payload = stream.read(1024 * 1024)
+            if not payload:
+                return digest.hexdigest()
+            digest.update(payload)
+    finally:
+        stream.seek(0)
+
+
+def _revalidate_held_source(
+    cache: WindowsRuntimeCache, descriptor: HeldSource
+) -> HeldSource:
+    resolved = cache.source_resolver(descriptor.source)
+    try:
+        if not isinstance(resolved, HeldSource):
+            raise RuntimeError("held source resolver returned an invalid descriptor")
+        _entry_key_input(resolved)
+        try:
+            import msvcrt
+
+            os_handle = msvcrt.get_osfhandle(resolved.stream.fileno())
+        except (AttributeError, OSError, ValueError) as error:
+            raise RuntimeError(
+                f"held source stream is not an open file: {descriptor.source}"
+            ) from error
+        handle_final_path = _final_path_from_handle(_kernel32(), os_handle)
+        expected_final = _normalized_held_final_path(descriptor.final_path)
+        if (
+            _normalized_held_final_path(resolved.final_path) != expected_final
+            or _normalized_held_final_path(handle_final_path) != expected_final
+        ):
+            raise RuntimeError(
+                f"held source final path changed: {descriptor.source}"
+            )
+        stat_result = os.fstat(resolved.stream.fileno())
+        actual_identity = (
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+        )
+        expected_identity = (descriptor.device, descriptor.inode, descriptor.size)
+        if actual_identity != expected_identity:
+            raise RuntimeError(
+                f"held source filesystem identity changed: {descriptor.source}"
+            )
+        if (
+            (resolved.device, resolved.inode, resolved.size) != expected_identity
+            or resolved.sha256 != descriptor.sha256
+        ):
+            raise RuntimeError(
+                f"held source descriptor changed: {descriptor.source}"
+            )
+        if _stream_sha256(resolved.stream) != descriptor.sha256:
+            raise RuntimeError(f"held source content changed: {descriptor.source}")
+        return resolved
+    except BaseException:
+        if resolved.stream is not descriptor.stream:
+            resolved.stream.close()
+        raise
+
+
+def _entry_kind(entry: LayoutEntry) -> str:
+    if isinstance(entry, HeldSource):
+        return "held-source"
+    if isinstance(entry, bytes):
+        return "literal-bytes"
+    if isinstance(entry, GeneratedLayoutEntry):
+        return "generated"
+    raise TypeError(f"unsupported layout entry: {type(entry).__name__}")
+
+
+def _enumerate_tree(root: Path) -> tuple[set[str], set[str]]:
+    directories: set[str] = set()
+    files: set[str] = set()
+
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as scanned:
+            entries = sorted(scanned, key=lambda item: ntpath.normcase(item.name))
+        for scanned_entry in entries:
+            target = Path(scanned_entry.path)
+            stat_result = scanned_entry.stat(follow_symlinks=False)
+            if (
+                getattr(stat_result, "st_file_attributes", 0)
+                & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise RuntimeError(
+                    f"cache object contains a reparse point: {target}"
+                )
+            relative = target.relative_to(root).as_posix()
+            if scanned_entry.is_dir(follow_symlinks=False):
+                directories.add(relative)
+                visit(target)
+            elif scanned_entry.is_file(follow_symlinks=False):
+                link_count = int(
+                    getattr(os.stat(target, follow_symlinks=False), "st_nlink", 1)
+                )
+                if link_count != 1:
+                    raise RuntimeError(f"cache object contains a file alias: {target}")
+                files.add(relative)
+            else:
+                raise RuntimeError(f"cache object contains an invalid entry: {target}")
+
+    visit(root)
+    return directories, files
+
+
+def _read_manifest(object_root: Path) -> dict[str, object]:
+    manifest_path = object_root / "manifest.json"
+    try:
+        encoded = manifest_path.read_bytes()
+        decoded = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid cache manifest: {manifest_path}") from error
+    if not isinstance(decoded, dict):
+        raise RuntimeError(f"invalid cache manifest: {manifest_path}")
+    try:
+        canonical = canonical_json(decoded)
+    except RuntimeError as error:
+        raise RuntimeError(f"invalid cache manifest: {manifest_path}") from error
+    if encoded != canonical:
+        raise RuntimeError(f"cache manifest is not canonical: {manifest_path}")
+    return decoded
+
+
+def _expected_tree_sets(
+    layout_name: str, file_records: Sequence[Mapping[str, object]]
+) -> tuple[set[str], set[str]]:
+    directories = {layout_name}
+    files = {"manifest.json"}
+    for record in file_records:
+        destination = record["destination"]
+        assert isinstance(destination, str)
+        relative = Path(layout_name) / Path(destination)
+        files.add(relative.as_posix())
+        parent = relative.parent
+        while parent != Path("."):
+            directories.add(parent.as_posix())
+            parent = parent.parent
+    return directories, files
+
+
+def _validate_object_contents(
+    object_root: Path,
+    final_object_root: Path,
+    key: str,
+    key_input: Mapping[str, object],
+    requested_entries: Sequence[Tuple[Path, LayoutEntry]],
+    *,
+    require_acl: bool,
+) -> tuple[Path, int, tuple[Path, ...], tuple[Path, ...]]:
+    if object_root.name != key and object_root == final_object_root:
+        raise RuntimeError(f"cache object path does not match key: {object_root}")
+    manifest = _read_manifest(object_root)
+    if set(manifest) != {
+        "schema",
+        "closure_policy",
+        "key_input",
+        "object_key",
+        "layout_name",
+        "created",
+        "files",
+    }:
+        raise RuntimeError(f"invalid cache manifest fields: {object_root}")
+    if (
+        manifest.get("schema") != SCHEMA_VERSION
+        or manifest.get("closure_policy") != CLOSURE_POLICY_VERSION
+        or manifest.get("object_key") != key
+        or manifest.get("key_input") != key_input
+    ):
+        raise RuntimeError(f"cache manifest key or policy mismatch: {object_root}")
+    if hashlib.sha256(canonical_json(manifest["key_input"])).hexdigest() != key:
+        raise RuntimeError(f"cache manifest key digest mismatch: {object_root}")
+    created = manifest.get("created")
+    if not isinstance(created, (int, float)) or isinstance(created, bool) or not math.isfinite(created):
+        raise RuntimeError(f"invalid cache manifest creation time: {object_root}")
+
+    stored_layout_name = manifest.get("layout_name")
+    if not isinstance(stored_layout_name, str):
+        raise RuntimeError(f"invalid cache manifest layout spelling: {object_root}")
+    if _validate_win32_component(stored_layout_name, label="layout name") != key_input.get("name"):
+        raise RuntimeError(f"cache manifest layout spelling mismatch: {object_root}")
+    layout = final_object_root / stored_layout_name
+
+    records_value = manifest.get("files")
+    if not isinstance(records_value, list):
+        raise RuntimeError(f"invalid cache manifest file records: {object_root}")
+    requested_by_normalized = {
+        _normalized_destination(destination): entry
+        for destination, entry in requested_entries
+    }
+    key_entries_value = key_input.get("entries")
+    if not isinstance(key_entries_value, list):
+        raise RuntimeError(f"invalid cache manifest key entries: {object_root}")
+    key_entries = {
+        item["normalized_destination"]: item["entry"]
+        for item in key_entries_value
+        if isinstance(item, dict)
+        and isinstance(item.get("normalized_destination"), str)
+        and isinstance(item.get("entry"), dict)
+    }
+    if len(key_entries) != len(key_entries_value):
+        raise RuntimeError(f"invalid cache manifest key entries: {object_root}")
+
+    records: list[Mapping[str, object]] = []
+    seen: set[str] = set()
+    logical_bytes = 0
+    for value in records_value:
+        if not isinstance(value, dict):
+            raise RuntimeError(f"invalid cache manifest file record: {object_root}")
+        destination = value.get("destination")
+        if not isinstance(destination, str):
+            raise RuntimeError(f"invalid cache manifest destination: {object_root}")
+        normalized = _normalized_destination(Path(destination))
+        if normalized in seen:
+            raise RuntimeError(f"duplicate cache manifest destination: {destination}")
+        seen.add(normalized)
+        if normalized not in requested_by_normalized or normalized not in key_entries:
+            raise RuntimeError(f"cache manifest destination identity mismatch: {destination}")
+        entry = requested_by_normalized[normalized]
+        if value.get("kind") != _entry_kind(entry):
+            raise RuntimeError(f"cache manifest entry kind mismatch: {destination}")
+        expected_record_fields = {"destination", "kind", "size", "sha256"}
+        if isinstance(entry, HeldSource):
+            expected_record_fields.add("source_final_path")
+        if set(value) != expected_record_fields:
+            raise RuntimeError(f"invalid cache manifest file record: {destination}")
+        size = value.get("size")
+        digest = value.get("sha256")
+        if type(size) is not int or size < 0 or not isinstance(digest, str) or not _LOWER_SHA256.fullmatch(digest):
+            raise RuntimeError(f"invalid cache manifest file metadata: {destination}")
+        target = object_root / stored_layout_name / Path(destination)
+        try:
+            payload = target.read_bytes()
+        except OSError as error:
+            raise RuntimeError(f"cache exact file set mismatch: {object_root}") from error
+        if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+            raise RuntimeError(f"cache file digest mismatch: {target}")
+        if isinstance(entry, GeneratedLayoutEntry):
+            rendered = entry.render(layout)
+            if not isinstance(rendered, bytes) or rendered != payload:
+                raise RuntimeError(f"cache generated entry mismatch: {target}")
+        if isinstance(entry, HeldSource):
+            source_final = value.get("source_final_path")
+            key_entry = key_entries[normalized]
+            if (
+                not isinstance(source_final, str)
+                or not isinstance(key_entry, dict)
+                or _normalized_held_final_path(Path(source_final))
+                != key_entry.get("final_path")
+            ):
+                raise RuntimeError(f"cache manifest source identity mismatch: {target}")
+        logical_bytes += size
+        records.append(value)
+    if seen != set(requested_by_normalized) or seen != set(key_entries):
+        raise RuntimeError(f"cache manifest exact file set mismatch: {object_root}")
+
+    expected_directories, expected_files = _expected_tree_sets(
+        stored_layout_name, records
+    )
+    actual_directories, actual_files = _enumerate_tree(object_root)
+    if actual_directories != expected_directories or actual_files != expected_files:
+        raise RuntimeError(f"cache exact file set mismatch: {object_root}")
+
+    directory_paths = tuple(
+        object_root / Path(relative)
+        for relative in sorted(actual_directories, key=lambda item: (item.count("/"), ntpath.normcase(item)))
+    )
+    file_paths = tuple(
+        object_root / Path(relative)
+        for relative in sorted(actual_files, key=ntpath.normcase)
+    )
+    if require_acl:
+        _assert_mutation_denied(object_root, directory=True)
+        for directory in directory_paths:
+            _assert_mutation_denied(directory, directory=True)
+        for file_path in file_paths:
+            _assert_mutation_denied(file_path, directory=False)
+    return final_object_root / stored_layout_name, logical_bytes, directory_paths, file_paths
+
+
+def _hold_validated_object(
+    cache: WindowsRuntimeCache,
+    object_root: Path,
+    key: str,
+    key_input: Mapping[str, object],
+    entries: Sequence[Tuple[Path, LayoutEntry]],
+    *,
+    cache_hit: bool,
+    payload_files: int,
+    payload_bytes: int,
+) -> CachedLayoutLease:
+    validation_owner, root_final = _open_canonical_non_reparse(
+        object_root,
+        object_root.parent,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        directory=True,
+    )
+    protected_owner: Optional[_OwnedHandle] = None
+    try:
+        if _path_identity(root_final) != _path_identity(object_root):
+            raise RuntimeError(f"cache object final path mismatch: {object_root}")
+        validation_identity = _snapshot_handle(
+            validation_owner.value,
+            Path("."),
+            expected_directory=True,
+        ).identity
+        layout, logical_bytes, directories, files = _validate_object_contents(
+            object_root,
+            object_root,
+            key,
+            key_input,
+            entries,
+            require_acl=True,
+        )
+        protected_owner, protected_final = _open_canonical_non_reparse(
+            object_root,
+            object_root.parent,
+            directory=True,
+        )
+        protected_identity = _snapshot_handle(
+            protected_owner.value,
+            Path("."),
+            expected_directory=True,
+        ).identity
+        if (
+            _path_identity(protected_final) != _path_identity(object_root)
+            or protected_identity != validation_identity
+        ):
+            raise RuntimeError(
+                f"cache object identity changed during validation: {object_root}"
+            )
+        _assert_handle_still_names(validation_owner.value, object_root)
+    except BaseException:
+        if protected_owner is not None:
+            protected_owner.close()
+        raise
+    finally:
+        validation_owner.close()
+
+    owners: list[object] = [protected_owner]
+    try:
+        for directory in (object_root,) + directories:
+            owner, final = cache.directory_holder(directory)
+            if _path_identity(final) != _path_identity(directory):
+                close = getattr(owner, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError(f"cache directory final path mismatch: {directory}")
+            owners.append(owner)
+        for file_path in files:
+            owner, _final = _open_canonical_non_reparse(
+                file_path,
+                file_path.parent,
+                desired_access=_FILE_READ_ATTRIBUTES | _GENERIC_READ,
+                share_mode=_FILE_SHARE_READ,
+                directory=False,
+            )
+            owners.append(owner)
+        # Recheck the complete namespace and bytes after all lifetime owners
+        # are acquired. ACL probes ran before those handles could mask access.
+        second_layout, second_bytes, _directories, _files = _validate_object_contents(
+            object_root,
+            object_root,
+            key,
+            key_input,
+            entries,
+            require_acl=False,
+        )
+        if second_layout != layout or second_bytes != logical_bytes:
+            raise RuntimeError(f"cache object changed while acquiring owners: {object_root}")
+        return CachedLayoutLease(
+            key=key,
+            object_root=object_root,
+            layout=layout,
+            logical_files=len(entries),
+            logical_bytes=logical_bytes,
+            cache_hit=cache_hit,
+            payload_files=payload_files,
+            payload_bytes=payload_bytes,
+            _owners=tuple(owners),
+        )
+    except BaseException:
+        for owner in reversed(owners):
+            close = getattr(owner, "close", None)
+            if callable(close):
+                close()
+        raise
+
+
+def _remove_staging_tree(path: Path, sid: str) -> None:
+    if not os.path.lexists(path):
+        return
+    _set_tree_acl(path, sid, "DELETE")
+    shutil.rmtree(path)
+
+
+def _materialize_layout(
+    cache: WindowsRuntimeCache,
+    name: str,
+    entries: LayoutEntries,
+    *,
+    context: Mapping[str, JsonValue],
+    dependencies: Sequence[CachedLayoutLease],
+    entry_limit: int,
+    byte_limit: int,
+) -> CachedLayoutLease:
+    entry_snapshot = tuple(entries)
+    dependency_keys = tuple(dependency.key for dependency in dependencies)
+    # This first key pass performs every spelling, descriptor, dependency, and
+    # JSON snapshot validation before resolving sources or mutating cache state.
+    key, key_input = layout_key(name, entry_snapshot, context, dependency_keys)
+
+    resolved_sources: dict[int, HeldSource] = {}
+    resolved_to_close: list[HeldSource] = []
+    try:
+        known_bytes = 0
+        for index, (_destination, entry) in enumerate(entry_snapshot):
+            if isinstance(entry, HeldSource):
+                resolved = _revalidate_held_source(cache, entry)
+                resolved_sources[index] = resolved
+                if resolved.stream is not entry.stream:
+                    resolved_to_close.append(resolved)
+                known_bytes += resolved.size
+            elif isinstance(entry, bytes):
+                known_bytes += len(entry)
+        if (
+            type(entry_limit) is not int
+            or entry_limit < 0
+            or len(entry_snapshot) > entry_limit
+        ):
+            raise RuntimeError(
+                f"runtime cache entry limit exceeded: {len(entry_snapshot)} > {entry_limit}"
+            )
+        if type(byte_limit) is not int or byte_limit < 0:
+            raise RuntimeError(
+                "runtime cache byte limit must be a nonnegative integer"
+            )
+        if known_bytes > byte_limit:
+            raise RuntimeError(
+                f"runtime cache byte limit exceeded: {known_bytes} > {byte_limit}"
+            )
+
+        # Recompute after source verification to preserve the specified state
+        # boundary and prove the detached key input remains stable.
+        verified_key, verified_input = layout_key(
+            name, entry_snapshot, context, dependency_keys
+        )
+        if verified_key != key or verified_input != key_input:
+            raise RuntimeError("runtime cache key input changed during validation")
+        final_object_root = cache.objects / key
+        if os.path.lexists(final_object_root):
+            return _hold_validated_object(
+                cache,
+                final_object_root,
+                key,
+                key_input,
+                entry_snapshot,
+                cache_hit=True,
+                payload_files=0,
+                payload_bytes=0,
+            )
+
+        staging_root = cache.staging / str(uuid.uuid4())
+        while not _create_directory_with_acl(
+            staging_root, cache.sid, _acl_sddl(cache.sid, "BUILD")
+        ):
+            staging_root = cache.staging / str(uuid.uuid4())
+        sealed: Optional[_SealedTree] = None
+        published = False
+        try:
+            staging_layout = staging_root / name
+            staging_layout.mkdir()
+            final_layout = final_object_root / name
+            file_records: list[dict[str, object]] = []
+            payload_bytes = 0
+            for index, (destination, entry) in enumerate(entry_snapshot):
+                target = staging_layout / destination
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if isinstance(entry, HeldSource):
+                    resolved = resolved_sources[index]
+                    resolved.stream.seek(0)
+                    with target.open("wb") as output:
+                        shutil.copyfileobj(resolved.stream, output, 1024 * 1024)
+                    resolved.stream.seek(0)
+                    payload = target.read_bytes()
+                    source_final_path: Optional[str] = str(resolved.final_path)
+                elif isinstance(entry, bytes):
+                    payload = entry
+                    target.write_bytes(payload)
+                    source_final_path = None
+                else:
+                    payload = entry.render(final_layout)
+                    if not isinstance(payload, bytes):
+                        raise RuntimeError(
+                            f"generated cache entry did not render bytes: {destination}"
+                        )
+                    target.write_bytes(payload)
+                    source_final_path = None
+                payload_bytes += len(payload)
+                if payload_bytes > byte_limit:
+                    raise RuntimeError(
+                        f"runtime cache byte limit exceeded: {payload_bytes} > {byte_limit}"
+                    )
+                record: dict[str, object] = {
+                    "destination": destination.as_posix(),
+                    "kind": _entry_kind(entry),
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+                if source_final_path is not None:
+                    record["source_final_path"] = source_final_path
+                file_records.append(record)
+            file_records.sort(
+                key=lambda record: _normalized_destination(
+                    Path(str(record["destination"]))
+                )
+            )
+            manifest: dict[str, object] = {
+                "schema": SCHEMA_VERSION,
+                "closure_policy": CLOSURE_POLICY_VERSION,
+                "key_input": key_input,
+                "object_key": key,
+                "layout_name": name,
+                "created": cache.clock(),
+                "files": file_records,
+            }
+            # Completion marker: this is deliberately the final staging write.
+            (staging_root / "manifest.json").write_bytes(canonical_json(manifest))
+            _validate_object_contents(
+                staging_root,
+                final_object_root,
+                key,
+                key_input,
+                entry_snapshot,
+                require_acl=False,
+            )
+            sealed = _seal_tree_acl(staging_root, cache.sid, "RX")
+            try:
+                _atomic_move_no_replace(
+                    staging_root, final_object_root, sealed=sealed
+                )
+                published = True
+            except FileExistsError:
+                sealed.close()
+                sealed = None
+                _remove_staging_tree(staging_root, cache.sid)
+                return _hold_validated_object(
+                    cache,
+                    final_object_root,
+                    key,
+                    key_input,
+                    entry_snapshot,
+                    cache_hit=True,
+                    payload_files=0,
+                    payload_bytes=0,
+                )
+            finally:
+                if sealed is not None:
+                    sealed.close()
+                    sealed = None
+            return _hold_validated_object(
+                cache,
+                final_object_root,
+                key,
+                key_input,
+                entry_snapshot,
+                cache_hit=False,
+                payload_files=len(entry_snapshot),
+                payload_bytes=payload_bytes,
+            )
+        except BaseException:
+            if sealed is not None:
+                sealed.close()
+            if not published and os.path.lexists(staging_root):
+                _remove_staging_tree(staging_root, cache.sid)
+            raise
+    finally:
+        for resolved in resolved_to_close:
+            resolved.stream.close()
 
 
 def canonical_json(value: JsonValue) -> bytes:
