@@ -131,7 +131,20 @@ class ModelTests(unittest.TestCase):
         sequence = self.sequence()
         columns = sequence._packed_columns()
         self.assertEqual(len(columns), 4)
-        self.assertTrue(all(isinstance(column, memoryview) for column in columns))
+        storage = tuple(
+            object.__getattribute__(sequence, name)
+            for name in (
+                "_spelling_ids",
+                "_identity_ids",
+                "_inclusion_ids",
+                "_original_lines",
+            )
+        )
+        self.assertTrue(all(isinstance(column, array) for column in storage))
+        self.assertTrue(all(column.typecode == "I" for column in storage))
+        self.assertTrue(
+            all(not isinstance(column, (array, memoryview)) for column in columns)
+        )
         self.assertTrue(all(column.readonly for column in columns))
         self.assertTrue(all(column.format == "I" for column in columns))
         self.assertTrue(all(column.itemsize == 4 for column in columns))
@@ -166,8 +179,69 @@ class ModelTests(unittest.TestCase):
         for column in sequence._packed_columns():
             with self.assertRaises(TypeError):
                 column[0] = 0
+            with self.assertRaises(AttributeError):
+                column.release()
+        self.assertEqual(sequence[0], token)
         with self.assertRaises(AttributeError):
             sequence._spelling_ids = array("I", (0,))
+        with self.assertRaises(AttributeError):
+            del sequence._spelling_ids
+        with self.assertRaises(AttributeError):
+            sequence._frozen = False
+        with self.assertRaises(AttributeError):
+            del sequence._frozen
+        self.assertEqual(sequence[0], token)
+
+    def test_compact_sequence_rejects_copy_before_crossing_memory_bounds(self):
+        configuration = self.configuration()
+        fields = dict(
+            spellings=(b"lease",),
+            identities=(configuration.source,),
+            spelling_ids=array("I", (0, 0)),
+            identity_ids=array("I", (0, 0)),
+            inclusion_ids=array("I", (7, 7)),
+            original_lines=array("I", (19, 19)),
+        )
+        packed_bytes = 2 * 4 * 4
+        exact_limits = dataclasses.replace(
+            AuditLimits(),
+            retained_token_bytes=packed_bytes,
+            rss_bytes=1000,
+        )
+        sequence = CompactTokenSequence._from_packed(
+            configuration,
+            **fields,
+            limits=exact_limits,
+            rss_reader=lambda: 1000 - packed_bytes,
+        )
+        self.assertEqual(sequence.packed_bytes, packed_bytes)
+
+        with mock.patch(
+            "gpu_capability_model._copy_packed_column", create=True
+        ) as copy_column:
+            with self.assertRaisesRegex(
+                AuditInfrastructureError, "coordinator RSS limit"
+            ):
+                CompactTokenSequence._from_packed(
+                    configuration,
+                    **fields,
+                    limits=exact_limits,
+                    rss_reader=lambda: 1000 - packed_bytes + 1,
+                )
+            copy_column.assert_not_called()
+
+        retained_too_small = dataclasses.replace(
+            exact_limits, retained_token_bytes=packed_bytes - 1
+        )
+        with self.assertRaisesRegex(
+            AuditInfrastructureError, "retained packed token limit"
+        ):
+            CompactTokenSequence._from_packed(
+                configuration,
+                **fields,
+                limits=retained_too_small,
+                rss_reader=lambda: 0,
+            )
 
     def test_compact_sequence_materializes_views_only_on_demand(self):
         sequence = self.sequence()
@@ -370,6 +444,28 @@ class ProductionIdentityTests(unittest.TestCase):
                     AuditInfrastructureError, "source root.*reparse"
                 ):
                     enumerate_production_identities(alias)
+            finally:
+                if alias.exists():
+                    os.rmdir(alias)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows directory junctions")
+    def test_rejects_junction_ancestor_of_source_root_before_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            real_parent = parent / "real"
+            real_root = real_parent / "repo"
+            self.write(real_root, "playback/a.cpp", b"int x;\n")
+            alias = parent / "alias"
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias), str(real_parent)],
+                check=True,
+                capture_output=True,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "source root.*reparse"
+                ):
+                    enumerate_production_identities(alias / "repo")
             finally:
                 if alias.exists():
                     os.rmdir(alias)

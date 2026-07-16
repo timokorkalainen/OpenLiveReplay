@@ -5,11 +5,12 @@ from __future__ import annotations
 import enum
 import os
 import stat
+import sys
 from array import array
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import overload
+from typing import Callable, overload
 
 
 UINT32_MAX = (1 << 32) - 1
@@ -109,6 +110,97 @@ def _validate_uint32(value: int, label: str) -> int:
     return value
 
 
+def _current_process_rss_bytes() -> int:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        class _ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = (
+                ("cb", wintypes.DWORD),
+                ("page_fault_count", wintypes.DWORD),
+                ("peak_working_set_size", ctypes.c_size_t),
+                ("working_set_size", ctypes.c_size_t),
+                ("quota_peak_paged_pool_usage", ctypes.c_size_t),
+                ("quota_paged_pool_usage", ctypes.c_size_t),
+                ("quota_peak_non_paged_pool_usage", ctypes.c_size_t),
+                ("quota_non_paged_pool_usage", ctypes.c_size_t),
+                ("pagefile_usage", ctypes.c_size_t),
+                ("peak_pagefile_usage", ctypes.c_size_t),
+            )
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = ()
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(_ProcessMemoryCounters),
+            wintypes.DWORD,
+        )
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(),
+            ctypes.byref(counters),
+            counters.cb,
+        ):
+            raise AuditInfrastructureError("cannot sample coordinator RSS")
+        return int(counters.working_set_size)
+
+    proc_statm = Path("/proc/self/statm")
+    if proc_statm.is_file():
+        try:
+            resident_pages = int(proc_statm.read_text(encoding="ascii").split()[1])
+            return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError) as error:
+            raise AuditInfrastructureError("cannot sample coordinator RSS") from error
+
+    try:
+        import resource
+
+        maximum_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (ImportError, OSError, ValueError) as error:
+        raise AuditInfrastructureError("cannot sample coordinator RSS") from error
+    return maximum_rss if sys.platform == "darwin" else maximum_rss * 1024
+
+
+def _copy_packed_column(column: array) -> array:
+    return array("I", column)
+
+
+class _ReadOnlyPackedColumn(Sequence[int]):
+    """Fresh non-buffer access to one private packed column."""
+
+    __slots__ = ("_owner", "_slot")
+    itemsize = 4
+    format = "I"
+    readonly = True
+
+    def __init__(self, owner: "CompactTokenSequence", slot: str) -> None:
+        object.__setattr__(self, "_owner", owner)
+        object.__setattr__(self, "_slot", slot)
+
+    def __len__(self) -> int:
+        column = object.__getattribute__(self._owner, self._slot)
+        return len(column)
+
+    @overload
+    def __getitem__(self, index: int) -> int:
+        ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[int, ...]:
+        ...
+
+    def __getitem__(self, index: int | slice) -> int | tuple[int, ...]:
+        column = object.__getattribute__(self._owner, self._slot)
+        if isinstance(index, slice):
+            return tuple(column[index])
+        return int(column[index])
+
+
 class CompactTokenSequence(Sequence[PreprocessedToken]):
     """Packed token columns with immutable token views materialized on demand."""
 
@@ -120,13 +212,13 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         "_identity_ids",
         "_inclusion_ids",
         "_original_lines",
-        "_frozen",
     )
 
     def __setattr__(self, name: str, value: object) -> None:
-        if getattr(self, "_frozen", False):
-            raise AttributeError("CompactTokenSequence is immutable")
-        object.__setattr__(self, name, value)
+        raise AttributeError("CompactTokenSequence is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("CompactTokenSequence is immutable")
 
     def __init__(
         self,
@@ -137,8 +229,16 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         identity_ids: array,
         inclusion_ids: array,
         original_lines: array,
+        *,
+        limits: AuditLimits = AuditLimits(),
+        rss_reader: Callable[[], int] = _current_process_rss_bytes,
     ) -> None:
-        supplied_columns = (spelling_ids, identity_ids, inclusion_ids, original_lines)
+        supplied_columns = (
+            spelling_ids,
+            identity_ids,
+            inclusion_ids,
+            original_lines,
+        )
         if any(
             not isinstance(column, array) or column.typecode != "I"
             for column in supplied_columns
@@ -147,11 +247,10 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         if array("I").itemsize != 4 or any(
             column.itemsize != 4 for column in supplied_columns
         ):
-            raise AuditInfrastructureError("packed token columns require four-byte array('I') items")
-        columns = tuple(
-            memoryview(column.tobytes()).cast("I") for column in supplied_columns
-        )
-        lengths = {len(column) for column in columns}
+            raise AuditInfrastructureError(
+                "packed token columns require four-byte array('I') items"
+            )
+        lengths = {len(column) for column in supplied_columns}
         if len(lengths) != 1:
             raise AuditInfrastructureError("packed token columns have different lengths")
         if any(not isinstance(spelling, bytes) for spelling in spellings):
@@ -162,19 +261,40 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
             raise AuditInfrastructureError("token identity table is not interned")
         if len(spellings) > UINT32_MAX + 1 or len(identities) > UINT32_MAX + 1:
             raise AuditInfrastructureError("token intern table exceeds unsigned 32-bit IDs")
-        if any(spelling_id >= len(spellings) for spelling_id in spelling_ids):
-            raise AuditInfrastructureError("packed spelling ID does not exist in the spelling table")
-        if any(identity_id >= len(identities) for identity_id in identity_ids):
-            raise AuditInfrastructureError("packed identity ID does not exist in the identity table")
+        if any(spelling_id >= len(spellings) for spelling_id in supplied_columns[0]):
+            raise AuditInfrastructureError(
+                "packed spelling ID does not exist in the spelling table"
+            )
+        if any(identity_id >= len(identities) for identity_id in supplied_columns[1]):
+            raise AuditInfrastructureError(
+                "packed identity ID does not exist in the identity table"
+            )
 
-        self._configuration = configuration
-        self._spellings = spellings
-        self._identities = identities
-        self._spelling_ids = columns[0]
-        self._identity_ids = columns[1]
-        self._inclusion_ids = columns[2]
-        self._original_lines = columns[3]
-        self._frozen = True
+        retained_bytes = sum(
+            len(column) * column.itemsize for column in supplied_columns
+        )
+        if retained_bytes > limits.retained_token_bytes:
+            raise AuditInfrastructureError("retained packed token limit exceeded")
+        rss_before_copy = rss_reader()
+        if (
+            not isinstance(rss_before_copy, int)
+            or isinstance(rss_before_copy, bool)
+            or rss_before_copy < 0
+        ):
+            raise AuditInfrastructureError("coordinator RSS sample is invalid")
+        if rss_before_copy + retained_bytes > limits.rss_bytes:
+            raise AuditInfrastructureError(
+                "coordinator RSS limit exceeded before packed copy"
+            )
+
+        columns = tuple(_copy_packed_column(column) for column in supplied_columns)
+        object.__setattr__(self, "_configuration", configuration)
+        object.__setattr__(self, "_spellings", spellings)
+        object.__setattr__(self, "_identities", identities)
+        object.__setattr__(self, "_spelling_ids", columns[0])
+        object.__setattr__(self, "_identity_ids", columns[1])
+        object.__setattr__(self, "_inclusion_ids", columns[2])
+        object.__setattr__(self, "_original_lines", columns[3])
 
     @classmethod
     def empty(cls, configuration: PreprocessConfiguration) -> "CompactTokenSequence":
@@ -199,6 +319,8 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         identity_ids: array,
         inclusion_ids: array,
         original_lines: array,
+        limits: AuditLimits = AuditLimits(),
+        rss_reader: Callable[[], int] = _current_process_rss_bytes,
     ) -> "CompactTokenSequence":
         return cls(
             configuration,
@@ -208,6 +330,8 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
             identity_ids,
             inclusion_ids,
             original_lines,
+            limits=limits,
+            rss_reader=rss_reader,
         )
 
     @classmethod
@@ -289,7 +413,16 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
 
     @property
     def packed_bytes(self) -> int:
-        return sum(len(column) * column.itemsize for column in self._packed_columns())
+        return sum(
+            len(object.__getattribute__(self, slot))
+            * object.__getattribute__(self, slot).itemsize
+            for slot in (
+                "_spelling_ids",
+                "_identity_ids",
+                "_inclusion_ids",
+                "_original_lines",
+            )
+        )
 
     def spelling_id_at(self, index: int) -> int:
         return self._spelling_ids[self._normalize_index(index)]
@@ -330,12 +463,20 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
 
     def _packed_columns(
         self,
-    ) -> tuple[memoryview, memoryview, memoryview, memoryview]:
-        return (
-            self._spelling_ids,
-            self._identity_ids,
-            self._inclusion_ids,
-            self._original_lines,
+    ) -> tuple[
+        _ReadOnlyPackedColumn,
+        _ReadOnlyPackedColumn,
+        _ReadOnlyPackedColumn,
+        _ReadOnlyPackedColumn,
+    ]:
+        return tuple(
+            _ReadOnlyPackedColumn(self, slot)
+            for slot in (
+                "_spelling_ids",
+                "_identity_ids",
+                "_inclusion_ids",
+                "_original_lines",
+            )
         )
 
 
@@ -424,22 +565,27 @@ def enumerate_production_identities(root: Path) -> dict[PurePosixPath, FileIdent
     """Enumerate unambiguous canonical identities under the two production roots."""
 
     lexical_root = Path(root).absolute()
-    try:
-        root_metadata = lexical_root.lstat()
-    except OSError as error:
-        raise AuditInfrastructureError(
-            f"{lexical_root}: source root cannot be inspected: {error}"
-        ) from error
-    if lexical_root.is_symlink():
-        raise AuditInfrastructureError(
-            f"{lexical_root}: source root crosses a symlink"
-        )
-    if _is_reparse(root_metadata):
-        raise AuditInfrastructureError(
-            f"{lexical_root}: source root crosses a reparse point"
-        )
-    if not stat.S_ISDIR(root_metadata.st_mode):
-        raise AuditInfrastructureError(f"{lexical_root}: source root is not a directory")
+    current = Path(lexical_root.anchor)
+    for component in lexical_root.parts[1:]:
+        current /= component
+        try:
+            component_metadata = current.lstat()
+        except OSError as error:
+            raise AuditInfrastructureError(
+                f"{lexical_root}: source root cannot be inspected at {current}: {error}"
+            ) from error
+        if stat.S_ISLNK(component_metadata.st_mode):
+            raise AuditInfrastructureError(
+                f"{lexical_root}: source root crosses a symlink at {current}"
+            )
+        if _is_reparse(component_metadata):
+            raise AuditInfrastructureError(
+                f"{lexical_root}: source root crosses a reparse point at {current}"
+            )
+        if not stat.S_ISDIR(component_metadata.st_mode):
+            raise AuditInfrastructureError(
+                f"{lexical_root}: source root component is not a directory: {current}"
+            )
     try:
         canonical_root = lexical_root.resolve(strict=True)
     except OSError as error:
