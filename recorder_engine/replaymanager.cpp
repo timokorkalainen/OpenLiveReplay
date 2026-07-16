@@ -631,8 +631,10 @@ void ReplayManager::resetSourceTimecode(int sourceIndex) {
 void ReplayManager::onFrameTimecode(int sourceIndex, uint64_t carrierEpoch,
                                     TimecodeEvidence evidence) {
     if (sourceIndex < 0 || sourceIndex >= TimecodeAlignerV2::kMaxSources) return;
-    if (sourceIndex < m_workers.size() && m_workers[sourceIndex] &&
-        m_workers[sourceIndex]->currentCarrierEpoch() != carrierEpoch) {
+    const bool hasWorker = sourceIndex < m_workers.size() && m_workers[sourceIndex];
+    if (carrierEpoch == 0) {
+        if (hasWorker) return;
+    } else if (!hasWorker || m_workers[sourceIndex]->currentCarrierEpoch() != carrierEpoch) {
         return;
     }
     if (evidence.discontinuity) {

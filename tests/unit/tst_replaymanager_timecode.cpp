@@ -187,6 +187,7 @@ private slots:
     void oppositeConnectionTransitionsRemainOrdered();
     void reentrantConnectionTransitionDoesNotDeadlock();
     void queuedTimecodeIsRejectedAfterCarrierRotation();
+    void queuedTimecodeIsRejectedAfterWorkerRemoval();
     void muxSubmissionCapturesCarrierEpochAtomically();
     void concurrentOldCarrierCannotCreateCurrentEntry();
     void concurrentCarrierRotationNeverErasesNewEpochEntry();
@@ -1004,6 +1005,20 @@ void TestReplayManagerTimecode::queuedTimecodeIsRejectedAfterCarrierRotation() {
 
     QVERIFY(!manager.m_tcAligner.hasTimecode(0));
     manager.m_workers.clear();
+}
+
+void TestReplayManagerTimecode::queuedTimecodeIsRejectedAfterWorkerRemoval() {
+    ReplayManager manager;
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 64, 64, 30, 30, 1);
+    manager.m_workers.append(&worker);
+    QVERIFY(QObject::connect(&worker, &StreamWorker::frameTimecode, &manager,
+                             &ReplayManager::onFrameTimecode, Qt::QueuedConnection));
+
+    worker.frameTimecode(0, worker.currentCarrierEpoch(), evidence(tcFrames(1, 0, 0, 0), 10));
+    manager.m_workers.clear();
+    QCoreApplication::processEvents();
+
+    QVERIFY(!manager.m_tcAligner.hasTimecode(0));
 }
 
 void TestReplayManagerTimecode::muxSubmissionCapturesCarrierEpochAtomically() {
