@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -206,6 +207,44 @@ def _generated_case_publication_worker(
 
 
 class CacheKeyTests(unittest.TestCase):
+    def test_parallel_map_drains_running_jobs_before_raising(self) -> None:
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        slow_finished = threading.Event()
+        outcome: list[BaseException] = []
+
+        def work(item: str) -> str:
+            if item == "slow":
+                slow_started.set()
+                release_slow.wait(5)
+                slow_finished.set()
+                return item
+            self.assertTrue(slow_started.wait(5))
+            raise RuntimeError("parallel failure")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            def invoke() -> None:
+                try:
+                    runtime_cache._draining_map(
+                        executor, work, ("fail", "slow")
+                    )
+                except BaseException as error:
+                    outcome.append(error)
+
+            caller = threading.Thread(target=invoke)
+            caller.start()
+            self.assertTrue(slow_started.wait(5))
+            time.sleep(0.05)
+            self.assertTrue(caller.is_alive())
+            self.assertEqual(outcome, [])
+            release_slow.set()
+            caller.join(5)
+
+        self.assertFalse(caller.is_alive())
+        self.assertTrue(slow_finished.is_set())
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], RuntimeError)
+
     def test_layout_key_is_order_independent_and_binds_every_identity_field(self) -> None:
         first = (
             (Path("bin/tool.exe"), held("tool.exe", b"tool")),

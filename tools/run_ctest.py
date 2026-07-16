@@ -749,7 +749,9 @@ def prepare_windows_runtime(
                 qt_plugins
             )
             qml_files = qt_qml_closure(
-                qt_qml, (source_root,) if needs_project_qml else ()
+                qt_qml,
+                (source_root,) if needs_project_qml else (),
+                lease=lease,
             )
             qml_entries: dict[Path, Path | bytes] = {
                 path.relative_to(qt_qml): path for path in qml_files

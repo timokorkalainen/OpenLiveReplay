@@ -177,7 +177,9 @@ def prepare_windows_app_runtime(
             launch_platform_plugins = (
                 launch_plugins / qt_platform_plugins.relative_to(qt_plugins)
             )
-            qml_files = runtime_guard.qt_qml_closure(qt_qml, (source_root,))
+            qml_files = runtime_guard.qt_qml_closure(
+                qt_qml, (source_root,), lease=lease
+            )
             qml_entries: dict[Path, Path | bytes] = {
                 path.relative_to(qt_qml): path for path in qml_files
             }

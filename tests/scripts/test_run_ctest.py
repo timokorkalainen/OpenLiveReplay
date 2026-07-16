@@ -1103,9 +1103,10 @@ class RunCtestTests(unittest.TestCase):
         for index in range(676):
             (unused / f"Unused{index:03d}.qml").write_bytes(b"unused")
 
-        qml_files = windows_runtime_guard.qt_qml_closure(
-            self.qt_root / "qml", (source,)
-        )
+        with RuntimeAuditLease() as lease:
+            qml_files = windows_runtime_guard.qt_qml_closure(
+                self.qt_root / "qml", (source,), lease=lease
+            )
         self.assertIn((controls / "qmldir").resolve(), qml_files)
         self.assertIn((qtqml / "qmldir").resolve(), qml_files)
         self.assertFalse(any(path.is_relative_to(unused) for path in qml_files))
@@ -1142,12 +1143,69 @@ class RunCtestTests(unittest.TestCase):
         optional_file = optional / "Optional.qml"
         optional_file.write_text("Item {}\n", encoding="utf-8")
 
-        selected = windows_runtime_guard.qt_qml_closure(qml_root, (source,))
+        with RuntimeAuditLease() as lease:
+            selected = windows_runtime_guard.qt_qml_closure(
+                qml_root, (source,), lease=lease
+            )
 
         for asset in (image, font, shader):
             self.assertIn(asset.resolve(), selected)
         self.assertIn((required / "Required.qml").resolve(), selected)
         self.assertNotIn(optional_file.resolve(), selected)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
+    def test_qml_closure_holds_final_paths_against_junction_swap(self) -> None:
+        qml_root = self.root / "qml-race"
+        module = qml_root / "Foo"
+        module.mkdir(parents=True)
+        (module / "asset.qml").write_text("internal", encoding="utf-8")
+        original_module = qml_root / "Foo-original"
+        external = self.root / "qml-race-external"
+        external.mkdir()
+        (external / "asset.qml").write_text("external", encoding="utf-8")
+        source = self.root / "qml-race-source.qml"
+        source.write_text("import Foo\n", encoding="utf-8")
+        original_scandir = os.scandir
+        swapped = False
+        test_case = self
+
+        class RacingScandir:
+            def __init__(self, directory: Path) -> None:
+                self.directory = Path(directory)
+                self.inner = original_scandir(directory)
+
+            def __enter__(self):
+                return self.inner.__enter__()
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                nonlocal swapped
+                result = self.inner.__exit__(exc_type, exc_value, traceback)
+                if (
+                    not swapped
+                    and os.path.normcase(str(self.directory))
+                    == os.path.normcase(str(module))
+                ):
+                    module.rename(original_module)
+                    test_case.make_junction(module, external)
+                    swapped = True
+                return result
+
+        with RuntimeAuditLease() as lease:
+            lease.canonical_directory(qml_root)
+            with (
+                mock.patch.object(
+                    windows_runtime_guard.os,
+                    "scandir",
+                    side_effect=lambda path: RacingScandir(Path(path)),
+                ),
+                self.assertRaisesRegex(RuntimeError, "reparse alias"),
+            ):
+                windows_runtime_guard.qt_qml_closure(
+                    qml_root,
+                    (source,),
+                    lease=lease,
+                )
+        self.assertTrue(swapped)
 
     def test_discovery_and_audit_cost_is_bounded_for_focused_launches(self):
         commands: list[str] = []
@@ -1258,9 +1316,10 @@ class RunCtestTests(unittest.TestCase):
         project_source = Path(__file__).resolve().parents[2]
         started = time.perf_counter()
         plugins = windows_runtime_guard.qt_plugin_closure(qt / "plugins")
-        qml = windows_runtime_guard.qt_qml_closure(
-            qt / "qml", (project_source,)
-        )
+        with RuntimeAuditLease() as lease:
+            qml = windows_runtime_guard.qt_qml_closure(
+                qt / "qml", (project_source,), lease=lease
+            )
         self.assertTrue(
             any(
                 path.suffix.casefold()

@@ -30,6 +30,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypeVar,
     Union,
 )
 
@@ -46,6 +47,8 @@ SCHEMA_VERSION = "olr-windows-runtime-cache-v2"
 CLOSURE_POLICY_VERSION = "closed-launch-layout-v2"
 _HASH_BUFFER_BYTES = 1024 * 1024
 _hash_buffer_local = threading.local()
+_MapInput = TypeVar("_MapInput")
+_MapOutput = TypeVar("_MapOutput")
 
 
 @lru_cache(maxsize=1)
@@ -55,6 +58,26 @@ def _parallel_executor() -> ThreadPoolExecutor:
         max_workers=min(16, max(1, os.cpu_count() or 1)),
         thread_name_prefix="olr-runtime-cache",
     )
+
+
+def _draining_map(
+    executor: ThreadPoolExecutor,
+    function: Callable[[_MapInput], _MapOutput],
+    values: Sequence[_MapInput],
+) -> tuple[_MapOutput, ...]:
+    """Wait for every submitted job before propagating the first failure."""
+    futures = tuple(executor.submit(function, value) for value in values)
+    results: list[_MapOutput] = []
+    first_error: BaseException | None = None
+    for future in futures:
+        try:
+            results.append(future.result())
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
+    return tuple(results)
 
 
 class _CacheObjectValidationError(RuntimeError):
@@ -1842,7 +1865,9 @@ def _validate_object_contents(
 
     def run_payload_checks() -> tuple[str | None, ...]:
         if len(payload_checks) >= 32:
-            return tuple(_parallel_executor().map(validate_payload, payload_checks))
+            return _draining_map(
+                _parallel_executor(), validate_payload, payload_checks
+            )
         return tuple(map(validate_payload, payload_checks))
 
     if require_acl:

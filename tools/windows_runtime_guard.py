@@ -26,6 +26,7 @@ from tools.windows_runtime_cache import (
     JsonValue,
     QtConfPaths,
     WindowsRuntimeCache,
+    _draining_map,
     _parallel_executor,
 )
 
@@ -392,8 +393,8 @@ class RuntimeAuditLease:
         for path in unique:
             self.hold(path)
         if len(unique) >= 32:
-            resolved = tuple(
-                _parallel_executor().map(self._describe_held_source, unique)
+            resolved = _draining_map(
+                _parallel_executor(), self._describe_held_source, unique
             )
         else:
             resolved = tuple(self._describe_held_source(path) for path in unique)
@@ -1243,9 +1244,21 @@ _QMLDIR_DEPENDENCY = re.compile(
 )
 
 
-def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ...]:
+def qt_qml_closure(
+    qt_qml: Path,
+    source_roots: Iterable[Path],
+    *,
+    lease: RuntimeAuditLease | None = None,
+) -> tuple[Path, ...]:
     """Resolve Qt module directories imported by project/QuickTest QML sources."""
-    qt_qml = qt_qml.resolve()
+    if os.name == "nt" and lease is None:
+        raise RuntimeError("Qt QML closure requires a runtime audit lease")
+    lexical_qt_qml = Path(os.path.abspath(qt_qml))
+    qt_qml = (
+        lease.canonical_directory(lexical_qt_qml)
+        if lease is not None
+        else lexical_qt_qml.resolve()
+    )
     pending: set[str] = set()
     excluded_names = {
         ".claude", ".git", ".venv", "__pycache__", "build", "build-tests",
@@ -1304,6 +1317,40 @@ def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ..
                 f"Qt QML closure contains a reparse alias: {entry.path}"
             )
 
+    def held_directory(path: Path) -> Path:
+        lexical = Path(os.path.abspath(path))
+        canonical = (
+            lease.canonical_directory(lexical)
+            if lease is not None
+            else lexical.resolve()
+        )
+        if (
+            not canonical.is_relative_to(qt_qml)
+            or os.path.normcase(str(lexical))
+            != os.path.normcase(str(canonical))
+        ):
+            raise RuntimeError(
+                f"Qt QML closure contains a reparse alias: {lexical} -> {canonical}"
+            )
+        return canonical
+
+    def held_file(path: Path) -> Path:
+        lexical = Path(os.path.abspath(path))
+        canonical = (
+            lease.canonical_file(lexical)
+            if lease is not None
+            else lexical.resolve()
+        )
+        if (
+            not canonical.is_relative_to(qt_qml)
+            or os.path.normcase(str(lexical))
+            != os.path.normcase(str(canonical))
+        ):
+            raise RuntimeError(
+                f"Qt QML closure contains a reparse alias: {lexical} -> {canonical}"
+            )
+        return canonical
+
     selected: set[Path] = set()
     for root_entry in scandir_entries(qt_qml):
         reject_reparse(root_entry)
@@ -1313,7 +1360,7 @@ def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ..
                 root_file.suffix.casefold() in _QML_RUNTIME_SUFFIXES
                 or root_file.name.casefold() == "qmldir"
             ):
-                selected.add(root_file)
+                selected.add(held_file(root_file))
 
     visited: set[str] = set()
     while pending:
@@ -1324,17 +1371,18 @@ def qt_qml_closure(qt_qml: Path, source_roots: Iterable[Path]) -> tuple[Path, ..
         module = qt_qml.joinpath(*uri.split("."))
         if not module.is_dir():
             continue
-        directories = [module]
+        directories = [held_directory(module)]
         while directories:
             directory = directories.pop()
             for child_entry in scandir_entries(directory):
                 reject_reparse(child_entry)
                 child = Path(child_entry.path)
                 if child_entry.is_dir(follow_symlinks=False):
-                    directories.append(child)
+                    directories.append(held_directory(child))
                 elif child_entry.is_file(follow_symlinks=False):
-                    selected.add(child)
-                    pending.update(imports_from(child))
+                    canonical_child = held_file(child)
+                    selected.add(canonical_child)
+                    pending.update(imports_from(canonical_child))
                 else:
                     raise RuntimeError(
                         f"Qt QML closure contains an invalid entry: {child}"
