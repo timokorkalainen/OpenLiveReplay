@@ -609,6 +609,29 @@ class ConfigurationTests(unittest.TestCase):
                         ((self.build / "main.cpp").resolve(),),
                     )
 
+    def test_msvc_global_language_flags_do_not_consume_the_next_argument(self):
+        from gpu_capability_command import _source_inputs
+
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in ("/TP", "/TC", "-TP", "-TC"):
+                arguments = (option, "/D", "BUILD_FILE=file.cpp", "main.cpp")
+                with self.subTest(family=family, option=option):
+                    self.assertEqual(
+                        _source_inputs(arguments, self.build, family),
+                        ((self.build / "main.cpp").resolve(),),
+                    )
+
+    def test_msvc_per_file_language_flags_keep_case_sensitive_source_arity(self):
+        from gpu_capability_command import _source_inputs
+
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in ("/Tp", "/Tc", "-Tp", "-Tc"):
+                with self.subTest(family=family, option=option):
+                    self.assertEqual(
+                        _source_inputs((option, "main.cpp"), self.build, family),
+                        ((self.build / "main.cpp").resolve(),),
+                    )
+
     def test_entry_source_outside_production_and_unknown_wrapper_fail(self):
         outside = self.root / "outside.cpp"
         outside.write_text("int x;\n", encoding="utf-8")
@@ -1205,6 +1228,14 @@ class CommandRewriteTests(unittest.TestCase):
                 rewritten = self.rewrite(family, arguments)
                 self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
 
+    def test_msvc_preserves_global_language_flags_without_consuming_semantics(self):
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in ("/TP", "/TC", "-TP", "-TC"):
+                arguments = (option, "/D", "KEEP=1", "file.cpp")
+                with self.subTest(family=family, option=option):
+                    rewritten = self.rewrite(family, arguments)
+                    self.assertEqual(rewritten.arguments[1:5], arguments)
+
     def test_msvc_preserves_option_looking_operands_of_paired_semantic_options(self):
         arguments = (
             "/FI", "/P", "/I", "/Fo", "/D", "/showIncludes",
@@ -1234,6 +1265,77 @@ class CommandRewriteTests(unittest.TestCase):
                 AuditInfrastructureError, message
             ):
                 self.rewrite(CompilerFamily.CLANG_CL, arguments)
+
+    def test_clang_cl_nested_forwarding_is_classified_as_one_stateful_stream(self):
+        controls = (
+            ("/clang:-Wp,-include,-P",),
+            ("/clang:-Xpreprocessor=-include", "/clang:-Xpreprocessor=-P"),
+            ("/clang:-Xclang=-include", "/clang:-Xclang=-P"),
+            ("/clang:-Xpreprocessor", "/clang:-include",
+             "/clang:-Xpreprocessor", "/clang:-P"),
+        )
+        for forwarded in controls:
+            arguments = (*forwarded, "file.cpp")
+            with self.subTest(arguments=arguments):
+                rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
+                self.assertEqual(rewritten.arguments[1:1 + len(arguments)], arguments)
+
+    def test_clang_cl_nested_forwarding_still_rejects_unconsumed_controls(self):
+        controls = (
+            (("/clang:-Xpreprocessor=-P", "file.cpp"), "marker"),
+            (("/clang:-Xclang=-MFhidden.d", "file.cpp"), "dependency"),
+            (("/clang:-Wp,-include,forced.h,-P", "file.cpp"), "marker"),
+        )
+        for arguments, category in controls:
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(
+                AuditInfrastructureError, f"hidden.*{category}"
+            ):
+                self.rewrite(CompilerFamily.CLANG_CL, arguments)
+
+    def test_clang_cl_deep_joined_forwarding_is_iterative(self):
+        payload = "-Xpreprocessor=" * 1_100 + "-DKEEP=1"
+        arguments = (f"/clang:{payload}", "file.cpp")
+        rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
+        self.assertEqual(rewritten.arguments[1:3], arguments)
+
+    def test_msvc_strips_preprocessor_and_auxiliary_output_controls(self):
+        shared = (
+            "/PD", "/PH", "/Fx", "/doc", "/docattached.xdc",
+            "/Ft", "import-headers",
+            "/Ftattached-headers", "/experimental:log", "audit.sarif",
+            "/experimental:logattached.sarif", "file.cpp",
+        )
+        expected = (
+            str(self.configuration(CompilerFamily.MSVC, shared).compiler),
+            "file.cpp", "/nologo", "/E", "/sourceDependencies",
+            str(self.dependency_output),
+        )
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            with self.subTest(family=family):
+                rewritten = self.rewrite(family, shared)
+                self.assertEqual(
+                    rewritten.arguments,
+                    (str(self.configuration(family, shared).compiler), *expected[1:]),
+                )
+
+    def test_clang_cl_strips_d1pp_without_weakening_fp_or_forced_include(self):
+        arguments = (
+            "/d1PP", "/Fp", "prefix.pch", "/Fpprefix-2.pch",
+            "/FI", "forced.h", "/FIforced-2.h", "file.cpp",
+        )
+        rewritten = self.rewrite(CompilerFamily.CLANG_CL, arguments)
+        self.assertEqual(
+            rewritten.arguments[1:8],
+            arguments[1:],
+        )
+
+    def test_msvc_output_controls_with_missing_values_fail_closed(self):
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            for option in ("/Ft", "/experimental:log"):
+                with self.subTest(family=family, option=option), self.assertRaisesRegex(
+                    AuditInfrastructureError, "requires a value"
+                ):
+                    self.rewrite(family, ("file.cpp", option))
 
     def test_msvc_and_clang_cl_strip_directives_mode_dependency_output(self):
         arguments = (

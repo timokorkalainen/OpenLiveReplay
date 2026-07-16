@@ -64,7 +64,7 @@ _GNU_VALUE_OPTIONS = frozenset({
 })
 _MSVC_VALUE_OPTIONS = frozenset({
     "/d", "/u", "/i", "/fi", "/fo", "/fe", "/fd", "/fa", "/fm", "/fr",
-    "/fp", "/yu", "/yc",
+    "/fp", "/ft", "/yu", "/yc", "/experimental:log",
     "/sourcedependencies", "/external:i", "/ai", "/fu", "/ifcoutput",
     "/reference", "/headerunit", "/scanDependencies".casefold(),
 })
@@ -960,7 +960,18 @@ def _source_inputs(
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
             index += 2
             continue
-        if not positional_only and msvc_lowered in {"/tc", "/tp"} and family in {
+        slash_spelling = (
+            f"/{value[1:]}"
+            if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
+            and value.startswith(("-", "/"))
+            else value
+        )
+        if not positional_only and slash_spelling in {"/TC", "/TP"} and family in {
+            CompilerFamily.MSVC, CompilerFamily.CLANG_CL
+        }:
+            index += 1
+            continue
+        if not positional_only and slash_spelling in {"/Tc", "/Tp"} and family in {
             CompilerFamily.MSVC, CompilerFamily.CLANG_CL
         }:
             if index + 1 >= len(arguments):
@@ -973,7 +984,7 @@ def _source_inputs(
             continue
         if (
             not positional_only
-            and msvc_lowered.startswith(("/tc", "/tp"))
+            and slash_spelling.startswith(("/Tc", "/Tp"))
             and len(value) > 3
         ):
             candidate = value[3:]
@@ -1104,20 +1115,60 @@ def _gnu_forwarded_control(payload: str) -> str | None:
 
 
 def _gnu_forwarded_sequence_control(payloads: tuple[str, ...]) -> str | None:
-    index = 0
-    while index < len(payloads):
-        payload = payloads[index]
-        if payload in _GNU_FORWARDED_VALUE_OPTIONS:
-            if index + 1 >= len(payloads):
-                raise AuditInfrastructureError(
-                    f"forwarded compiler option requires a value: {payload}"
-                )
-            index += 2
-            continue
-        category = _gnu_forwarded_control(payload)
-        if category:
-            return category
-        index += 1
+    pending_sequences = [payloads]
+    while pending_sequences:
+        sequence = pending_sequences.pop()
+        index = 0
+        while index < len(sequence):
+            payload = sequence[index]
+            nested_forwarder = next(
+                (
+                    candidate for candidate in _GNU_FORWARDERS
+                    if payload == candidate or payload.startswith(f"{candidate}=")
+                ),
+                None,
+            )
+            if nested_forwarder is not None:
+                nested_payloads: list[str] = []
+                while index < len(sequence):
+                    current = sequence[index]
+                    if not (
+                        current == nested_forwarder
+                        or current.startswith(f"{nested_forwarder}=")
+                    ):
+                        break
+                    if current == nested_forwarder:
+                        if index + 1 >= len(sequence):
+                            raise AuditInfrastructureError(
+                                f"forwarded compiler option requires a value: {current}"
+                            )
+                        nested_payloads.append(sequence[index + 1])
+                        index += 2
+                    else:
+                        nested = current.partition("=")[2]
+                        if not nested:
+                            raise AuditInfrastructureError(
+                                f"forwarded compiler option requires a value: {current}"
+                            )
+                        nested_payloads.append(nested)
+                        index += 1
+                pending_sequences.append(tuple(nested_payloads))
+                continue
+            if payload.casefold().startswith("-wp,"):
+                pending_sequences.append(tuple(payload[4:].split(",")))
+                index += 1
+                continue
+            if payload in _GNU_FORWARDED_VALUE_OPTIONS:
+                if index + 1 >= len(sequence):
+                    raise AuditInfrastructureError(
+                        f"forwarded compiler option requires a value: {payload}"
+                    )
+                index += 2
+                continue
+            category = _gnu_forwarded_control(payload)
+            if category:
+                return category
+            index += 1
     return None
 
 
@@ -1145,7 +1196,7 @@ def _gnu_forwarded_span(
         return None
     payload, end = current
     if payload not in _GNU_FORWARDED_VALUE_OPTIONS:
-        return end, _gnu_forwarded_control(payload)
+        return end, _gnu_forwarded_sequence_control((payload,))
     if end >= len(arguments):
         raise AuditInfrastructureError(
             f"forwarded compiler option requires a value: {payload}"
@@ -1245,14 +1296,17 @@ def _rewrite_gnu(
 
 _MSVC_REWRITE_REMOVE_FLAGS = frozenset({
     "/c", "/nologo", "/e", "/p", "/ep", "/showincludes",
+    "/pd", "/ph", "/fx", "/doc",
 })
 _MSVC_REWRITE_REMOVE_VALUES = frozenset({
     "/fo", "/fe", "/fd", "/fa", "/fm", "/fr", "/fi",
+    "/ft", "/experimental:log",
     "/sourcedependencies", "/scandependencies", "/ifcoutput",
 })
 _MSVC_REWRITE_ATTACHED_VALUES = (
     "/sourcedependencies", "/scandependencies", "/ifcoutput",
-    "/fo", "/fe", "/fd", "/fa", "/fm", "/fr", "/fi",
+    "/experimental:log", "/doc",
+    "/fo", "/fe", "/fd", "/fa", "/fm", "/fr", "/fi", "/ft",
 )
 _MSVC_REWRITE_REJECT_PREFIXES = (
     "/out", "/link", "/yc", "/ld", "/clr:netcore",
@@ -1275,6 +1329,23 @@ def _rewrite_msvc(
 ) -> RewrittenCommand:
     rewritten: list[str] = [str(configuration.compiler)]
     arguments = configuration.arguments
+    clang_payloads: list[str] = []
+    if configuration.family is CompilerFamily.CLANG_CL:
+        for value in arguments:
+            option = _msvc_option(value)
+            if not option.startswith("/clang:"):
+                continue
+            payload = value[len(value.partition(":")[0]) + 1 :]
+            if not payload:
+                raise AuditInfrastructureError(
+                    f"compiler option requires a value: {value}"
+                )
+            clang_payloads.append(payload)
+        category = _gnu_forwarded_sequence_control(tuple(clang_payloads))
+        if category:
+            raise AuditInfrastructureError(
+                f"hidden {category} option is unsupported: /clang:"
+            )
     index = 0
     while index < len(arguments):
         value = arguments[index]
@@ -1291,6 +1362,9 @@ def _rewrite_msvc(
             continue
         if slash_spelling.startswith("/FI"):
             rewritten.append(value)
+            index += 1
+            continue
+        if configuration.family is CompilerFamily.CLANG_CL and slash_spelling == "/d1PP":
             index += 1
             continue
         forwarder = next(
@@ -1313,28 +1387,6 @@ def _rewrite_msvc(
             index += 2
             continue
         if option.startswith("/clang:"):
-            payload = value[len(value.partition(":")[0]) + 1 :]
-            if not payload:
-                raise AuditInfrastructureError(f"compiler option requires a value: {value}")
-            if payload in _GNU_FORWARDED_VALUE_OPTIONS:
-                if index + 1 >= len(arguments) or not _msvc_option(
-                    arguments[index + 1]
-                ).startswith("/clang:"):
-                    raise AuditInfrastructureError(
-                        f"forwarded compiler option requires a forwarded value: {payload}"
-                    )
-                if not arguments[index + 1].partition(":")[2]:
-                    raise AuditInfrastructureError(
-                        f"forwarded compiler option requires a value: {payload}"
-                    )
-                rewritten.extend((value, arguments[index + 1]))
-                index += 2
-                continue
-            category = _gnu_forwarded_control(payload)
-            if category:
-                raise AuditInfrastructureError(
-                    f"hidden {category} option is unsupported: {value}"
-                )
             rewritten.append(value)
             index += 1
             continue
