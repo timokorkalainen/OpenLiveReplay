@@ -1,6 +1,7 @@
 import dataclasses
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -130,10 +131,43 @@ class ModelTests(unittest.TestCase):
         sequence = self.sequence()
         columns = sequence._packed_columns()
         self.assertEqual(len(columns), 4)
-        self.assertTrue(all(isinstance(column, array) for column in columns))
-        self.assertTrue(all(column.typecode == "I" for column in columns))
+        self.assertTrue(all(isinstance(column, memoryview) for column in columns))
+        self.assertTrue(all(column.readonly for column in columns))
+        self.assertTrue(all(column.format == "I" for column in columns))
         self.assertTrue(all(column.itemsize == 4 for column in columns))
         self.assertEqual(sequence.packed_bytes, len(sequence) * 4 * 4)
+
+    def test_compact_sequence_owns_read_only_packed_storage(self):
+        configuration = self.configuration()
+        spelling_ids = array("I", (0,))
+        identity_ids = array("I", (0,))
+        inclusion_ids = array("I", (7,))
+        original_lines = array("I", (19,))
+        sequence = CompactTokenSequence._from_packed(
+            configuration,
+            spellings=(b"lease", b"nativeHandle"),
+            identities=(configuration.source, None),
+            spelling_ids=spelling_ids,
+            identity_ids=identity_ids,
+            inclusion_ids=inclusion_ids,
+            original_lines=original_lines,
+        )
+
+        spelling_ids[0] = 1
+        identity_ids[0] = 1
+        inclusion_ids[0] = 99
+        original_lines[0] = 99
+
+        token = sequence[0]
+        self.assertEqual(token.spelling, b"lease")
+        self.assertEqual(token.location.identity, configuration.source)
+        self.assertEqual(token.location.inclusion_instance, 7)
+        self.assertEqual(token.location.line, 19)
+        for column in sequence._packed_columns():
+            with self.assertRaises(TypeError):
+                column[0] = 0
+        with self.assertRaises(AttributeError):
+            sequence._spelling_ids = array("I", (0,))
 
     def test_compact_sequence_materializes_views_only_on_demand(self):
         sequence = self.sequence()
@@ -304,6 +338,41 @@ class ProductionIdentityTests(unittest.TestCase):
             with mock.patch.object(Path, "exists", return_value=False):
                 identities = enumerate_production_identities(root)
             self.assertIn(PurePosixPath("playback/a.cpp"), identities)
+
+    def test_rejects_source_root_symlink_before_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            real_root = parent / "real"
+            self.write(real_root, "playback/a.cpp", b"int x;\n")
+            alias = parent / "alias"
+            try:
+                alias.symlink_to(real_root, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory symlinks unavailable: {error}")
+
+            with self.assertRaisesRegex(AuditInfrastructureError, "source root.*symlink"):
+                enumerate_production_identities(alias)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows directory junctions")
+    def test_rejects_source_root_junction_before_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            real_root = parent / "real"
+            self.write(real_root, "playback/a.cpp", b"int x;\n")
+            alias = parent / "alias"
+            subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias), str(real_root)],
+                check=True,
+                capture_output=True,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    AuditInfrastructureError, "source root.*reparse"
+                ):
+                    enumerate_production_identities(alias)
+            finally:
+                if alias.exists():
+                    os.rmdir(alias)
 
     def test_rejects_unreadable_utf8_with_relative_path(self):
         with tempfile.TemporaryDirectory() as directory:

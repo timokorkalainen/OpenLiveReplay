@@ -120,7 +120,13 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         "_identity_ids",
         "_inclusion_ids",
         "_original_lines",
+        "_frozen",
     )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError("CompactTokenSequence is immutable")
+        object.__setattr__(self, name, value)
 
     def __init__(
         self,
@@ -132,11 +138,19 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         inclusion_ids: array,
         original_lines: array,
     ) -> None:
-        columns = (spelling_ids, identity_ids, inclusion_ids, original_lines)
-        if any(not isinstance(column, array) or column.typecode != "I" for column in columns):
+        supplied_columns = (spelling_ids, identity_ids, inclusion_ids, original_lines)
+        if any(
+            not isinstance(column, array) or column.typecode != "I"
+            for column in supplied_columns
+        ):
             raise AuditInfrastructureError("packed token columns must use array('I')")
-        if array("I").itemsize != 4 or any(column.itemsize != 4 for column in columns):
+        if array("I").itemsize != 4 or any(
+            column.itemsize != 4 for column in supplied_columns
+        ):
             raise AuditInfrastructureError("packed token columns require four-byte array('I') items")
+        columns = tuple(
+            memoryview(column.tobytes()).cast("I") for column in supplied_columns
+        )
         lengths = {len(column) for column in columns}
         if len(lengths) != 1:
             raise AuditInfrastructureError("packed token columns have different lengths")
@@ -156,10 +170,11 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
         self._configuration = configuration
         self._spellings = spellings
         self._identities = identities
-        self._spelling_ids = spelling_ids
-        self._identity_ids = identity_ids
-        self._inclusion_ids = inclusion_ids
-        self._original_lines = original_lines
+        self._spelling_ids = columns[0]
+        self._identity_ids = columns[1]
+        self._inclusion_ids = columns[2]
+        self._original_lines = columns[3]
+        self._frozen = True
 
     @classmethod
     def empty(cls, configuration: PreprocessConfiguration) -> "CompactTokenSequence":
@@ -313,7 +328,9 @@ class CompactTokenSequence(Sequence[PreprocessedToken]):
             )
             start = stop
 
-    def _packed_columns(self) -> tuple[array, array, array, array]:
+    def _packed_columns(
+        self,
+    ) -> tuple[memoryview, memoryview, memoryview, memoryview]:
         return (
             self._spelling_ids,
             self._identity_ids,
@@ -408,12 +425,25 @@ def enumerate_production_identities(root: Path) -> dict[PurePosixPath, FileIdent
 
     lexical_root = Path(root).absolute()
     try:
+        root_metadata = lexical_root.lstat()
+    except OSError as error:
+        raise AuditInfrastructureError(
+            f"{lexical_root}: source root cannot be inspected: {error}"
+        ) from error
+    if lexical_root.is_symlink():
+        raise AuditInfrastructureError(
+            f"{lexical_root}: source root crosses a symlink"
+        )
+    if _is_reparse(root_metadata):
+        raise AuditInfrastructureError(
+            f"{lexical_root}: source root crosses a reparse point"
+        )
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        raise AuditInfrastructureError(f"{lexical_root}: source root is not a directory")
+    try:
         canonical_root = lexical_root.resolve(strict=True)
     except OSError as error:
         raise AuditInfrastructureError(f"{lexical_root}: source root cannot be resolved: {error}") from error
-    if not canonical_root.is_dir():
-        raise AuditInfrastructureError(f"{lexical_root}: source root is not a directory")
-
     identities: dict[PurePosixPath, FileIdentity] = {}
     casefolded: dict[str, PurePosixPath] = {}
     filesystem_ids: dict[tuple[int, int], PurePosixPath] = {}
