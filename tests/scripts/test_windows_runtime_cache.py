@@ -1054,8 +1054,7 @@ class PublicationTests(unittest.TestCase):
         def render(final_layout: Path) -> bytes:
             if not observed["render_before_manifest"]:
                 staging_roots = tuple(self.cache.staging.iterdir())
-                self.assertEqual(len(staging_roots), 1)
-                self.assertFalse((staging_roots[0] / "manifest.json").exists())
+                self.assertEqual(staging_roots, ())
             self.assertEqual(final_layout.parent, self.cache.objects / expected_key)
             observed["render_before_manifest"] = True
             return final_layout.as_posix().encode("utf-8")
@@ -1084,6 +1083,27 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(manifest["key_input"], layout_key("complete", entries, {}, ())[1])
         self.assertEqual({item["kind"] for item in manifest["files"]}, {"held-source", "generated"})
 
+    def test_generated_output_is_rendered_once_and_retained_for_publication(self) -> None:
+        rendered_at: list[Path] = []
+
+        def render(final_layout: Path) -> bytes:
+            rendered_at.append(final_layout)
+            return b"generated once"
+
+        generated = GeneratedLayoutEntry("generated-v1", {}, render)
+        lease = self.remember(
+            self.cache.materialize(
+                "render-once",
+                ((Path("generated.bin"), generated),),
+                context={},
+            )
+        )
+        self.assertEqual(rendered_at, [lease.layout])
+        self.assertEqual(
+            (lease.layout / "generated.bin").read_bytes(),
+            b"generated once",
+        )
+
     def test_invalid_input_source_mismatch_and_limits_leave_cache_unmodified(self) -> None:
         source = self.held_file("value.bin", b"value")
         cases = (
@@ -1108,6 +1128,73 @@ class PublicationTests(unittest.TestCase):
             self.cache.materialize("held", ((Path("held.bin"), source),), context={})
         self.assertEqual(tuple(self.cache.objects.iterdir()), ())
         self.assertEqual(tuple(self.cache.staging.iterdir()), ())
+
+    def test_source_validation_never_reopens_the_held_path(self) -> None:
+        source = self.held_file("held-direct.bin", b"held bytes")
+        resolver = self.cache.source_resolver
+        with mock.patch.object(
+            self.cache,
+            "source_resolver",
+            wraps=resolver,
+        ) as reopened:
+            lease = self.remember(
+                self.cache.materialize(
+                    "held-direct",
+                    ((Path("held.bin"), source),),
+                    context={},
+                )
+            )
+        reopened.assert_not_called()
+        self.assertEqual((lease.layout / "held.bin").read_bytes(), b"held bytes")
+
+    def test_closed_or_mismatched_held_stream_is_rejected_without_cache_mutation(self) -> None:
+        closed = self.held_file("closed.bin", b"closed")
+        closed.stream.close()
+        other = self.held_file("other.bin", b"closed")
+        mismatched = replace(closed, stream=other.stream)
+        for name, descriptor in (("closed", closed), ("mismatched", mismatched)):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "held source"):
+                    self.cache.materialize(
+                        name,
+                        ((Path("value.bin"), descriptor),),
+                        context={},
+                    )
+                self.assertEqual(tuple(self.cache.objects.iterdir()), ())
+                self.assertEqual(tuple(self.cache.staging.iterdir()), ())
+
+    def test_generated_validation_and_limits_precede_staging_creation(self) -> None:
+        cases = (
+            (
+                "invalid-type",
+                GeneratedLayoutEntry("generated-v1", {}, lambda _root: "not bytes"),
+                1024,
+                "did not render bytes",
+            ),
+            (
+                "oversized",
+                GeneratedLayoutEntry("generated-v1", {}, lambda _root: b"too large"),
+                4,
+                "byte limit exceeded",
+            ),
+        )
+        for name, generated, byte_limit, message in cases:
+            with self.subTest(name=name):
+                with mock.patch.object(
+                    runtime_cache,
+                    "_create_directory_with_acl",
+                    wraps=runtime_cache._create_directory_with_acl,
+                ) as create_staging:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        self.cache.materialize(
+                            name,
+                            ((Path("generated.bin"), generated),),
+                            context={},
+                            byte_limit=byte_limit,
+                        )
+                create_staging.assert_not_called()
+                self.assertEqual(tuple(self.cache.objects.iterdir()), ())
+                self.assertEqual(tuple(self.cache.staging.iterdir()), ())
 
     def test_source_identity_and_content_changes_publish_distinct_misses(self) -> None:
         first_source = self.held_file("one.bin", b"same")
@@ -1156,6 +1243,38 @@ class PublicationTests(unittest.TestCase):
                     (lease.object_root / "manifest.json").write_text("{}", encoding="utf-8")
                 with self.assertRaisesRegex(RuntimeError, message):
                     cache.materialize("tamper-" + mutation, entries, context={})
+
+    def test_hit_rejects_coordinated_payload_and_manifest_tampering(self) -> None:
+        held_entry = self.held_file("coordinated-held.bin", b"original")
+        cases: tuple[tuple[str, LayoutEntry], ...] = (
+            ("held", held_entry),
+            ("literal", b"original"),
+        )
+        for name, entry in cases:
+            with self.subTest(name=name):
+                cache = self.make_cache()
+                entries = ((Path("value.bin"), entry),)
+                lease = cache.materialize("coordinated-" + name, entries, context={})
+                lease.close()
+                self.force_mutable(lease.object_root)
+                replacement = b"rewritten payload"
+                (lease.layout / "value.bin").write_bytes(replacement)
+                manifest_path = lease.object_root / "manifest.json"
+                manifest = json.loads(manifest_path.read_text("utf-8"))
+                manifest["files"][0]["size"] = len(replacement)
+                manifest["files"][0]["sha256"] = hashlib.sha256(
+                    replacement
+                ).hexdigest()
+                manifest_path.write_bytes(canonical_json(manifest))
+                _set_tree_acl(lease.object_root, self.sid, "RX")
+                with self.assertRaisesRegex(RuntimeError, "key entry|metadata"):
+                    self.remember(
+                        cache.materialize(
+                            "coordinated-" + name,
+                            entries,
+                            context={},
+                        )
+                    )
 
     def test_hit_rejects_file_alias_replacement_with_the_same_bytes(self) -> None:
         source = self.held_file("alias.bin", b"same")

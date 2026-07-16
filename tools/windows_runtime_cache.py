@@ -1264,56 +1264,35 @@ def _stream_sha256(stream: BinaryIO) -> str:
         stream.seek(0)
 
 
-def _revalidate_held_source(
-    cache: WindowsRuntimeCache, descriptor: HeldSource
-) -> HeldSource:
-    resolved = cache.source_resolver(descriptor.source)
+def _revalidate_held_source(descriptor: HeldSource) -> HeldSource:
+    _entry_key_input(descriptor)
     try:
-        if not isinstance(resolved, HeldSource):
-            raise RuntimeError("held source resolver returned an invalid descriptor")
-        _entry_key_input(resolved)
-        try:
-            import msvcrt
+        import msvcrt
 
-            os_handle = msvcrt.get_osfhandle(resolved.stream.fileno())
-        except (AttributeError, OSError, ValueError) as error:
-            raise RuntimeError(
-                f"held source stream is not an open file: {descriptor.source}"
-            ) from error
-        handle_final_path = _final_path_from_handle(_kernel32(), os_handle)
-        expected_final = _normalized_held_final_path(descriptor.final_path)
-        if (
-            _normalized_held_final_path(resolved.final_path) != expected_final
-            or _normalized_held_final_path(handle_final_path) != expected_final
-        ):
-            raise RuntimeError(
-                f"held source final path changed: {descriptor.source}"
-            )
-        stat_result = os.fstat(resolved.stream.fileno())
-        actual_identity = (
-            int(stat_result.st_dev),
-            int(stat_result.st_ino),
-            int(stat_result.st_size),
+        descriptor_fd = descriptor.stream.fileno()
+        os_handle = msvcrt.get_osfhandle(descriptor_fd)
+    except (AttributeError, OSError, ValueError) as error:
+        raise RuntimeError(
+            f"held source stream is not an open file: {descriptor.source}"
+        ) from error
+    handle_final_path = _final_path_from_handle(_kernel32(), os_handle)
+    expected_final = _normalized_held_final_path(descriptor.final_path)
+    if _normalized_held_final_path(handle_final_path) != expected_final:
+        raise RuntimeError(f"held source final path changed: {descriptor.source}")
+    stat_result = os.fstat(descriptor_fd)
+    actual_identity = (
+        int(stat_result.st_dev),
+        int(stat_result.st_ino),
+        int(stat_result.st_size),
+    )
+    expected_identity = (descriptor.device, descriptor.inode, descriptor.size)
+    if actual_identity != expected_identity:
+        raise RuntimeError(
+            f"held source filesystem identity changed: {descriptor.source}"
         )
-        expected_identity = (descriptor.device, descriptor.inode, descriptor.size)
-        if actual_identity != expected_identity:
-            raise RuntimeError(
-                f"held source filesystem identity changed: {descriptor.source}"
-            )
-        if (
-            (resolved.device, resolved.inode, resolved.size) != expected_identity
-            or resolved.sha256 != descriptor.sha256
-        ):
-            raise RuntimeError(
-                f"held source descriptor changed: {descriptor.source}"
-            )
-        if _stream_sha256(resolved.stream) != descriptor.sha256:
-            raise RuntimeError(f"held source content changed: {descriptor.source}")
-        return resolved
-    except BaseException:
-        if resolved.stream is not descriptor.stream:
-            resolved.stream.close()
-        raise
+    if _stream_sha256(descriptor.stream) != descriptor.sha256:
+        raise RuntimeError(f"held source content changed: {descriptor.source}")
+    return descriptor
 
 
 def _entry_kind(entry: LayoutEntry) -> str:
@@ -1404,6 +1383,7 @@ def _validate_object_contents(
     requested_entries: Sequence[Tuple[Path, LayoutEntry]],
     *,
     require_acl: bool,
+    rendered_entries: Mapping[str, bytes],
 ) -> tuple[Path, int, tuple[Path, ...], tuple[Path, ...]]:
     if object_root.name != key and object_root == final_object_root:
         raise RuntimeError(f"cache object path does not match key: {object_root}")
@@ -1474,7 +1454,13 @@ def _validate_object_contents(
         if normalized not in requested_by_normalized or normalized not in key_entries:
             raise RuntimeError(f"cache manifest destination identity mismatch: {destination}")
         entry = requested_by_normalized[normalized]
-        if value.get("kind") != _entry_kind(entry):
+        key_entry = key_entries[normalized]
+        if key_entry != _entry_key_input(entry):
+            raise RuntimeError(f"cache key entry identity mismatch: {destination}")
+        if (
+            value.get("kind") != _entry_kind(entry)
+            or value.get("kind") != key_entry.get("kind")
+        ):
             raise RuntimeError(f"cache manifest entry kind mismatch: {destination}")
         expected_record_fields = {"destination", "kind", "size", "sha256"}
         if isinstance(entry, HeldSource):
@@ -1485,6 +1471,10 @@ def _validate_object_contents(
         digest = value.get("sha256")
         if type(size) is not int or size < 0 or not isinstance(digest, str) or not _LOWER_SHA256.fullmatch(digest):
             raise RuntimeError(f"invalid cache manifest file metadata: {destination}")
+        if "size" in key_entry and size != key_entry.get("size"):
+            raise RuntimeError(f"cache manifest key entry metadata mismatch: {destination}")
+        if "sha256" in key_entry and digest != key_entry.get("sha256"):
+            raise RuntimeError(f"cache manifest key entry metadata mismatch: {destination}")
         target = object_root / stored_layout_name / Path(destination)
         try:
             payload = target.read_bytes()
@@ -1493,12 +1483,10 @@ def _validate_object_contents(
         if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
             raise RuntimeError(f"cache file digest mismatch: {target}")
         if isinstance(entry, GeneratedLayoutEntry):
-            rendered = entry.render(layout)
-            if not isinstance(rendered, bytes) or rendered != payload:
+            if normalized not in rendered_entries or rendered_entries[normalized] != payload:
                 raise RuntimeError(f"cache generated entry mismatch: {target}")
         if isinstance(entry, HeldSource):
             source_final = value.get("source_final_path")
-            key_entry = key_entries[normalized]
             if (
                 not isinstance(source_final, str)
                 or not isinstance(key_entry, dict)
@@ -1545,6 +1533,7 @@ def _hold_validated_object(
     cache_hit: bool,
     payload_files: int,
     payload_bytes: int,
+    rendered_entries: Mapping[str, bytes],
 ) -> CachedLayoutLease:
     validation_owner, root_final = _open_canonical_non_reparse(
         object_root,
@@ -1568,6 +1557,7 @@ def _hold_validated_object(
             key_input,
             entries,
             require_acl=True,
+            rendered_entries=rendered_entries,
         )
         protected_owner, protected_final = _open_canonical_non_reparse(
             object_root,
@@ -1622,6 +1612,7 @@ def _hold_validated_object(
             key_input,
             entries,
             require_acl=False,
+            rendered_entries=rendered_entries,
         )
         if second_layout != layout or second_bytes != logical_bytes:
             raise RuntimeError(f"cache object changed while acquiring owners: {object_root}")
@@ -1668,18 +1659,8 @@ def _materialize_layout(
     key, key_input = layout_key(name, entry_snapshot, context, dependency_keys)
 
     resolved_sources: dict[int, HeldSource] = {}
-    resolved_to_close: list[HeldSource] = []
+    rendered_entries: dict[str, bytes] = {}
     try:
-        known_bytes = 0
-        for index, (_destination, entry) in enumerate(entry_snapshot):
-            if isinstance(entry, HeldSource):
-                resolved = _revalidate_held_source(cache, entry)
-                resolved_sources[index] = resolved
-                if resolved.stream is not entry.stream:
-                    resolved_to_close.append(resolved)
-                known_bytes += resolved.size
-            elif isinstance(entry, bytes):
-                known_bytes += len(entry)
         if (
             type(entry_limit) is not int
             or entry_limit < 0
@@ -1692,10 +1673,28 @@ def _materialize_layout(
             raise RuntimeError(
                 "runtime cache byte limit must be a nonnegative integer"
             )
-        if known_bytes > byte_limit:
-            raise RuntimeError(
-                f"runtime cache byte limit exceeded: {known_bytes} > {byte_limit}"
-            )
+        final_object_root = cache.objects / key
+        final_layout = final_object_root / name
+        known_bytes = 0
+        for index, (destination, entry) in enumerate(entry_snapshot):
+            if isinstance(entry, HeldSource):
+                resolved = _revalidate_held_source(entry)
+                resolved_sources[index] = resolved
+                known_bytes += resolved.size
+            elif isinstance(entry, bytes):
+                known_bytes += len(entry)
+            else:
+                payload = entry.render(final_layout)
+                if not isinstance(payload, bytes):
+                    raise RuntimeError(
+                        f"generated cache entry did not render bytes: {destination}"
+                    )
+                rendered_entries[_normalized_destination(destination)] = payload
+                known_bytes += len(payload)
+            if known_bytes > byte_limit:
+                raise RuntimeError(
+                    f"runtime cache byte limit exceeded: {known_bytes} > {byte_limit}"
+                )
 
         # Recompute after source verification to preserve the specified state
         # boundary and prove the detached key input remains stable.
@@ -1704,7 +1703,6 @@ def _materialize_layout(
         )
         if verified_key != key or verified_input != key_input:
             raise RuntimeError("runtime cache key input changed during validation")
-        final_object_root = cache.objects / key
         if os.path.lexists(final_object_root):
             return _hold_validated_object(
                 cache,
@@ -1715,6 +1713,7 @@ def _materialize_layout(
                 cache_hit=True,
                 payload_files=0,
                 payload_bytes=0,
+                rendered_entries=rendered_entries,
             )
 
         staging_root = cache.staging / str(uuid.uuid4())
@@ -1727,7 +1726,6 @@ def _materialize_layout(
         try:
             staging_layout = staging_root / name
             staging_layout.mkdir()
-            final_layout = final_object_root / name
             file_records: list[dict[str, object]] = []
             payload_bytes = 0
             for index, (destination, entry) in enumerate(entry_snapshot):
@@ -1746,11 +1744,7 @@ def _materialize_layout(
                     target.write_bytes(payload)
                     source_final_path = None
                 else:
-                    payload = entry.render(final_layout)
-                    if not isinstance(payload, bytes):
-                        raise RuntimeError(
-                            f"generated cache entry did not render bytes: {destination}"
-                        )
+                    payload = rendered_entries[_normalized_destination(destination)]
                     target.write_bytes(payload)
                     source_final_path = None
                 payload_bytes += len(payload)
@@ -1790,6 +1784,7 @@ def _materialize_layout(
                 key_input,
                 entry_snapshot,
                 require_acl=False,
+                rendered_entries=rendered_entries,
             )
             sealed = _seal_tree_acl(staging_root, cache.sid, "RX")
             try:
@@ -1810,6 +1805,7 @@ def _materialize_layout(
                     cache_hit=True,
                     payload_files=0,
                     payload_bytes=0,
+                    rendered_entries=rendered_entries,
                 )
             finally:
                 if sealed is not None:
@@ -1824,6 +1820,7 @@ def _materialize_layout(
                 cache_hit=False,
                 payload_files=len(entry_snapshot),
                 payload_bytes=payload_bytes,
+                rendered_entries=rendered_entries,
             )
         except BaseException:
             if sealed is not None:
@@ -1832,8 +1829,7 @@ def _materialize_layout(
                 _remove_staging_tree(staging_root, cache.sid)
             raise
     finally:
-        for resolved in resolved_to_close:
-            resolved.stream.close()
+        rendered_entries.clear()
 
 
 def canonical_json(value: JsonValue) -> bytes:
