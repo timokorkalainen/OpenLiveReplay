@@ -524,36 +524,24 @@ def guarded_macro_composition_findings(
     event_index = 0
     findings: list[Finding] = []
 
-    def call_arguments(opening: int, limit: int) -> tuple[list[tuple[int, int]], int] | None:
-        depth = 1
-        arguments: list[tuple[int, int]] = []
-        argument_start = opening + 1
-        for cursor in range(opening + 1, limit):
-            value = tokens[cursor].value
-            if value == "(":
-                depth += 1
-            elif value == ")":
-                depth -= 1
-                if depth == 0:
-                    arguments.append((argument_start, cursor))
-                    return arguments, cursor
-            elif depth == 1 and value == ",":
-                arguments.append((argument_start, cursor))
-                argument_start = cursor + 1
-        return None
-
     class ExpansionDepthExceeded(RuntimeError):
         pass
 
-    maximum_expansion_depth = 96
+    @dataclass(frozen=True)
+    class ExpansionToken:
+        value: str
+        hidden: frozenset[str] = frozenset()
 
-    def value_call_arguments(values: tuple[str, ...], opening: int) \
-            -> tuple[list[tuple[str, ...]], int] | None:
+    maximum_expansion_depth = 96
+    maximum_continuous_macro_tokens = 256
+
+    def value_call_arguments(values: tuple[ExpansionToken, ...], opening: int) \
+            -> tuple[list[tuple[ExpansionToken, ...]], int] | None:
         depth = 1
         argument_start = opening + 1
-        arguments: list[tuple[str, ...]] = []
+        arguments: list[tuple[ExpansionToken, ...]] = []
         for cursor in range(opening + 1, len(values)):
-            value = values[cursor]
+            value = values[cursor].value
             if value == "(":
                 depth += 1
             elif value == ")":
@@ -567,19 +555,28 @@ def guarded_macro_composition_findings(
                 argument_start = cursor + 1
         return None
 
-    def join_variadic(arguments: list[tuple[str, ...]]) -> tuple[str, ...]:
-        joined: list[str] = []
+    def with_hidden(values: tuple[ExpansionToken, ...], hidden: frozenset[str]) \
+            -> tuple[ExpansionToken, ...]:
+        return tuple(
+            ExpansionToken(value.value, value.hidden | hidden) for value in values)
+
+    def join_variadic(arguments: list[tuple[ExpansionToken, ...]],
+                      hidden: frozenset[str]) -> tuple[ExpansionToken, ...]:
+        joined: list[ExpansionToken] = []
         for index, argument in enumerate(arguments):
             if index:
-                joined.append(",")
+                joined.append(ExpansionToken(",", hidden))
             joined.extend(argument)
         return tuple(joined)
 
     def expand_function(name: str, definition: MacroDefinition,
-                        supplied: list[tuple[str, ...]], depth: int,
-                        disabled: frozenset[str]) -> tuple[str, ...] | None:
+                        supplied: list[tuple[ExpansionToken, ...]], depth: int,
+                        inherited_hidden: frozenset[str]) \
+            -> tuple[ExpansionToken, ...] | None:
         if depth > maximum_expansion_depth:
             raise ExpansionDepthExceeded
+        replacement_hidden = inherited_hidden | {name}
+        argument_hidden = frozenset({name})
         fixed_count = len(definition.parameters)
         variadic = definition.variadic
         if not supplied and fixed_count:
@@ -591,25 +588,28 @@ def guarded_macro_composition_findings(
         fixed_parameters = definition.parameters[:fixed_count]
         raw_arguments = dict(zip(fixed_parameters, supplied[:fixed_count], strict=True))
         prescanned_arguments = {
-            parameter: expand_sequence(argument, depth + 1, disabled)
+            parameter: expand_sequence(
+                with_hidden(argument, argument_hidden), depth + 1)
             for parameter, argument in raw_arguments.items()
         }
         if variadic is not None:
             raw_variadic = supplied[fixed_count:]
-            raw_arguments[variadic] = join_variadic(raw_variadic)
+            raw_arguments[variadic] = join_variadic(raw_variadic, argument_hidden)
             prescanned_arguments[variadic] = join_variadic([
-                expand_sequence(argument, depth + 1, disabled)
+                expand_sequence(
+                    with_hidden(argument, argument_hidden), depth + 1)
                 for argument in raw_variadic
-            ])
+            ], argument_hidden)
 
         replacement = definition.replacement
-        substituted: list[str] = []
+        substituted: list[ExpansionToken] = []
         cursor = 0
         while cursor < len(replacement):
             value = replacement[cursor]
             if (value == "#" and cursor + 1 < len(replacement)
                     and replacement[cursor + 1] in raw_arguments):
-                substituted.append("__macro_string_literal__")
+                substituted.append(ExpansionToken(
+                    "__macro_string_literal__", replacement_hidden))
                 cursor += 2
                 continue
             if value in raw_arguments:
@@ -617,42 +617,51 @@ def guarded_macro_composition_findings(
                     (cursor and replacement[cursor - 1] == "##")
                     or (cursor + 1 < len(replacement)
                         and replacement[cursor + 1] == "##"))
-                substituted.extend(
-                    raw_arguments[value] if adjacent_to_paste
-                    else prescanned_arguments[value])
+                selected = (raw_arguments[value] if adjacent_to_paste
+                            else prescanned_arguments[value])
+                substituted.extend(with_hidden(selected, argument_hidden))
             else:
-                substituted.append(value)
+                substituted.append(ExpansionToken(value, replacement_hidden))
             cursor += 1
 
-        while "##" in substituted:
-            paste = substituted.index("##")
+        while any(token.value == "##" for token in substituted):
+            paste = next(index for index, token in enumerate(substituted)
+                         if token.value == "##")
             if paste == 0 or paste + 1 >= len(substituted):
                 return None
+            left = substituted[paste - 1]
+            right = substituted[paste + 1]
             substituted[paste - 1:paste + 2] = [
-                substituted[paste - 1] + substituted[paste + 1]
+                ExpansionToken(left.value + right.value,
+                               left.hidden | right.hidden | replacement_hidden)
             ]
-        return expand_sequence(tuple(substituted), depth + 1, disabled | {name})
+        return expand_sequence(tuple(substituted), depth + 1)
 
-    def expand_sequence(values: tuple[str, ...], depth: int = 0,
-                        disabled: frozenset[str] = frozenset()) -> tuple[str, ...]:
+    def expand_sequence(values: tuple[ExpansionToken, ...], depth: int = 0) \
+            -> tuple[ExpansionToken, ...]:
         if depth > maximum_expansion_depth:
             raise ExpansionDepthExceeded
-        expanded: list[str] = []
+        expanded: list[ExpansionToken] = []
         cursor = 0
         while cursor < len(values):
-            value = values[cursor]
+            token = values[cursor]
+            value = token.value
             definition = macros.get(value)
-            if definition is None or value in disabled:
-                expanded.append(value)
+            if definition is None or value in token.hidden:
+                expanded.append(token)
                 cursor += 1
                 continue
             if not definition.function_like:
+                replacement_hidden = token.hidden | {value}
+                replacement = tuple(
+                    ExpansionToken(item, replacement_hidden)
+                    for item in definition.replacement)
                 rescanned = expand_sequence(
-                    definition.replacement + values[cursor + 1:], depth + 1,
-                    disabled | {value})
+                    replacement + values[cursor + 1:], depth + 1)
                 return tuple(expanded) + rescanned
-            if cursor + 1 >= len(values) or values[cursor + 1] != "(":
-                expanded.append(value)
+            if (cursor + 1 >= len(values)
+                    or values[cursor + 1].value != "("):
+                expanded.append(token)
                 cursor += 1
                 continue
             parsed = value_call_arguments(values, cursor + 1)
@@ -662,16 +671,25 @@ def guarded_macro_composition_findings(
                 continue
             arguments, closing = parsed
             replacement = expand_function(
-                value, definition, arguments, depth + 1, disabled | {value})
+                value, definition, arguments, depth + 1,
+                token.hidden)
             if replacement is None:
                 expanded.extend(values[cursor:closing + 1])
             else:
                 rescanned = expand_sequence(
-                    replacement + values[closing + 1:], depth + 1,
-                    disabled | {value})
+                    replacement + values[closing + 1:], depth + 1)
                 return tuple(expanded) + rescanned
             cursor = closing + 1
         return tuple(expanded)
+
+    paren_stack: list[int] = []
+    paren_closings: dict[int, int] = {}
+    for token_index, token in enumerate(tokens):
+        if token.value == "(":
+            paren_stack.append(token_index)
+        elif token.value == ")" and paren_stack:
+            paren_closings[paren_stack.pop()] = token_index
+    reported_postfix_complexity_lines: set[int] = set()
 
     for index, token in enumerate(tokens[:-1]):
         while (event_index < len(macro_events)
@@ -687,16 +705,29 @@ def guarded_macro_composition_findings(
                 or token.value not in macros
                 or any(start <= token.start < end for start, end in directive_ranges)):
             continue
-        parsed = call_arguments(index + 1, len(tokens))
-        if parsed is None:
+        closing = paren_closings.get(index + 1)
+        if closing is None:
             continue
-        closing = parsed[1]
+        too_complex = closing - index + 1 > maximum_continuous_macro_tokens
         while closing + 1 < len(tokens) and tokens[closing + 1].value == "(":
-            postfix = call_arguments(closing + 1, len(tokens))
-            if postfix is None:
+            postfix_closing = paren_closings.get(closing + 1)
+            if postfix_closing is None:
                 break
-            closing = postfix[1]
-        invocation = tuple(item.value for item in tokens[index:closing + 1])
+            if postfix_closing - index + 1 > maximum_continuous_macro_tokens:
+                too_complex = True
+                break
+            closing = postfix_closing
+        if too_complex:
+            line = translated.line_at(token.start)
+            if line not in reported_postfix_complexity_lines:
+                reported_postfix_complexity_lines.add(line)
+                findings.append(Finding(
+                    path, line, "macro postfix complexity",
+                    "macro postfix complexity exceeds the bounded audit limit; "
+                    "rejected fail-closed"))
+            continue
+        invocation = tuple(
+            ExpansionToken(item.value) for item in tokens[index:closing + 1])
         try:
             expansion = expand_sequence(invocation)
         except ExpansionDepthExceeded:
@@ -704,8 +735,8 @@ def guarded_macro_composition_findings(
                 path, translated.line_at(token.start), "macro expansion depth",
                 "macro expansion depth exceeded the bounded audit limit; rejected fail-closed"))
             continue
-        if (not expansion or expansion[0] not in guarded
-                or (len(expansion) > 1 and expansion[1] != "(")):
+        if (not expansion or expansion[0].value not in guarded
+                or (len(expansion) > 1 and expansion[1].value != "(")):
             continue
         findings.append(Finding(
             path, translated.line_at(token.start), "guarded identifier macro composition",
@@ -3596,6 +3627,25 @@ def mutation_self_tests() -> None:
                for finding in compiler_postfix_callable_alias):
         raise AssertionError("compiler postfix callable alias survived rescan")
 
+    compiler_token_origin_alias = audit_capability_uses(
+        PurePosixPath("playback/gpu/gpufence.h"),
+        "void bad(const GpuReadLease& lease) { "
+        "lease.F(call)(F(native), Handle)(); }",
+        {
+            "F": MacroDefinition(True, ("F_I", "(", "value", ")"), ("value",)),
+            "F_I": MacroDefinition(True, ("F_", "##", "value"), ("value",)),
+            "F_call": MacroDefinition(False, ("PASTE",)),
+            "F_native": MacroDefinition(False, ("native",)),
+            "PASTE": MacroDefinition(
+                True, ("PASTE_I", "(", "left", ",", "right", ")"),
+                ("left", "right")),
+            "PASTE_I": MacroDefinition(
+                True, ("left", "##", "right"), ("left", "right")),
+        })
+    if not any("guarded identifier macro composition" in finding.expression
+               for finding in compiler_token_origin_alias):
+        raise AssertionError("original postfix macro was hidden by replacement state")
+
     compiler_guarded_object_alias = audit_capability_uses(
         PurePosixPath("playback/gpu/gpufence.h"),
         "void bad(const GpuReadLease& lease) { lease.GUARD(); }",
@@ -4011,6 +4061,10 @@ def nested_phase_two_source(count: int) -> str:
     return "void nested() {" + openings + ("}" * count) + "}"
 
 
+def nested_macro_postfix_source(count: int) -> str:
+    return "void nested() { " + ("M()(" * count) + "value" + (")" * count) + "; }"
+
+
 def performance_self_tests() -> str:
     """Run the noisy scaling check independently from functional mutations."""
     path = PurePosixPath("playback/gpu/gpufence.h")
@@ -4051,9 +4105,47 @@ def performance_self_tests() -> str:
                 + "/".join(f"{sample:.4f}" for sample in samples[count])
                 for count in counts)
             + f", ratios={adjacent[0]:.3f}/{adjacent[1]:.3f}/{aggregate:.3f}")
+
+    postfix_sources = {
+        count: translate_source(nested_macro_postfix_source(count))
+        for count in counts
+    }
+    postfix_macros = {"M": MacroDefinition(True, ("safe",), ())}
+    postfix_samples: dict[int, list[float]] = {count: [] for count in counts}
+    for order in (counts, tuple(reversed(counts)), (8192, 16384, 4096)):
+        for count in order:
+            started = time.perf_counter()
+            findings = guarded_macro_composition_findings(
+                path, postfix_sources[count], postfix_macros)
+            postfix_samples[count].append(time.perf_counter() - started)
+            if not any("macro postfix complexity" in finding.reason
+                       for finding in findings):
+                raise AssertionError(
+                    f"nested macro postfix control did not fail closed at {count}")
+    postfix_scores = {
+        count: min(postfix_samples[count]) for count in counts
+    }
+    postfix_adjacent = (
+        postfix_scores[8192] / postfix_scores[4096],
+        postfix_scores[16384] / postfix_scores[8192],
+    )
+    postfix_aggregate = postfix_scores[16384] / postfix_scores[4096]
+    if max(postfix_adjacent) > 3.25 or postfix_aggregate > 5.75:
+        raise AssertionError(
+            "nested macro postfix audit is not near-linear: "
+            + ", ".join(
+                f"{count}={postfix_scores[count]:.4f}s samples="
+                + "/".join(f"{sample:.4f}" for sample in postfix_samples[count])
+                for count in counts)
+            + f", ratios={postfix_adjacent[0]:.3f}/"
+            f"{postfix_adjacent[1]:.3f}/{postfix_aggregate:.3f}")
     return (
         ", ".join(f"{count}={scores[count]:.4f}s" for count in counts)
-        + f", ratios={adjacent[0]:.3f}/{adjacent[1]:.3f}/{aggregate:.3f}")
+        + f", ratios={adjacent[0]:.3f}/{adjacent[1]:.3f}/{aggregate:.3f}; "
+        + "postfix "
+        + ", ".join(f"{count}={postfix_scores[count]:.4f}s" for count in counts)
+        + f", ratios={postfix_adjacent[0]:.3f}/"
+        f"{postfix_adjacent[1]:.3f}/{postfix_aggregate:.3f}")
 
 
 def load_production_sources(root: Path) -> dict[PurePosixPath, str]:
