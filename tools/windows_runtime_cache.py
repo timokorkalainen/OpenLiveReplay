@@ -609,6 +609,16 @@ def _windows_api_path(path: Path) -> str:
     return "\\\\?\\" + value
 
 
+def _windows_recursive_api_path(path: Path) -> str:
+    """Keep every descendant addressable during recursive Win32 operations."""
+    value = str(_absolute_lexical(path))
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
 def _scandir(path: Path) -> os.ScandirIterator[str]:
     return os.scandir(_windows_api_path(path))
 
@@ -2022,7 +2032,7 @@ def _remove_staging_tree(path: Path, sid: str) -> None:
     if not os.path.lexists(path):
         return
     _set_tree_acl(path, sid, "DELETE")
-    shutil.rmtree(path)
+    shutil.rmtree(_windows_recursive_api_path(path))
 
 
 def _bounded_entry_snapshot(
@@ -2363,7 +2373,7 @@ def _remove_cache_tree(
         guards = guards[:1]
         try:
             if quarantine_to is None:
-                shutil.rmtree(path)
+                shutil.rmtree(_windows_recursive_api_path(path))
             else:
                 _move_file_no_replace_write_through(path, quarantine_to)
         except OSError as error:

@@ -725,6 +725,25 @@ class WindowsFilesystemTests(unittest.TestCase):
         finally:
             remove_long_tree()
 
+    def test_staging_cleanup_supports_extended_length_paths(self) -> None:
+        tree = self.root / "long-staging"
+        tree.mkdir()
+        leaf = tree
+        for index in range(7):
+            leaf /= f"segment-{index:02d}-" + "x" * 24
+            os.mkdir(runtime_cache._windows_api_path(leaf))
+        payload = leaf / "payload.bin"
+        with open(runtime_cache._windows_api_path(payload), "wb") as stream:
+            stream.write(b"payload")
+        self.assertGreater(len(str(payload)), 260)
+
+        try:
+            runtime_cache._remove_staging_tree(tree, self.sid)
+
+            self.assertFalse(tree.exists())
+        finally:
+            shutil.rmtree("\\\\?\\" + str(tree), ignore_errors=True)
+
     def test_win32_api_bindings_are_initialized_once(self) -> None:
         runtime_cache._kernel32.cache_clear()
         runtime_cache._advapi32.cache_clear()
@@ -2358,6 +2377,29 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertEqual(tuple(self.cache.staging.iterdir()), ())
         self.assertEqual(tuple(self.cache.quarantine.iterdir()), ())
+
+    def test_cleanup_removes_extended_length_quarantine_tree(self) -> None:
+        candidate = self.cache.quarantine / ("q" * 100)
+        candidate.mkdir()
+        leaf = candidate
+        for index in range(5):
+            leaf /= f"segment-{index}-" + "x" * 32
+            os.mkdir(runtime_cache._windows_api_path(leaf))
+        payload = leaf / "payload.bin"
+        with open(runtime_cache._windows_api_path(payload), "wb") as stream:
+            stream.write(b"payload")
+        self.assertGreater(len(str(payload)), 260)
+        self.backdate(candidate, self.cache.limits.staging_seconds + 1)
+
+        try:
+            self.cache.cleanup(force=True)
+
+            self.assertFalse(candidate.exists())
+        finally:
+            shutil.rmtree(
+                "\\\\?\\" + str(candidate),
+                ignore_errors=True,
+            )
 
     def test_cleanup_removes_objects_unused_for_fourteen_days(self) -> None:
         lease = self.publish_and_close("unused", b"old")
