@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from tools import run_ctest, windows_runtime_guard
+from tools import run_ctest, windows_runtime_cache, windows_runtime_guard
 from tools.windows_runtime_guard import (
     RuntimeAuditLease,
     RuntimeRoots,
@@ -260,6 +260,14 @@ class RunCtestTests(unittest.TestCase):
         )
         if completed.returncode != 0:
             self.skipTest(f"cannot create test junction: {completed.stderr}")
+
+    def remove_test_runtime_cache(self, cache_root: Path) -> None:
+        if not cache_root.exists():
+            return
+        windows_runtime_cache._set_tree_acl(
+            cache_root, windows_runtime_guard._current_user_sid(), "DELETE"
+        )
+        shutil.rmtree(cache_root)
 
     def test_find_build_directory_accepts_split_test_dir(self):
         cwd = self.root / "working"
@@ -1285,8 +1293,10 @@ class RunCtestTests(unittest.TestCase):
         self.assertLess(focused_bytes, 32 << 20)
         self.assertLess(len(focused_runtime) + len(focused_plugins), 16)
 
+        cache_root = self.root / "actual-qt-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
         staged_started = time.perf_counter()
-        with RuntimeAuditLease() as lease:
+        with RuntimeAuditLease(cache_root) as lease:
             lease.stage_readonly_layout(
                 "actual-qt-runtime",
                 {Path(str(index)) / path.name: path for index, path in enumerate(runtime)},
@@ -1304,7 +1314,34 @@ class RunCtestTests(unittest.TestCase):
                 byte_limit=1 << 30,
             )
             self.assertEqual(lease.staged_byte_count, full_bytes)
-        self.assertLess(time.perf_counter() - staged_started, 20.0)
+            self.assertGreater(lease.cache_miss_count, 0)
+        self.assertLess(time.perf_counter() - staged_started, 60.0)
+
+        warm_started = time.perf_counter()
+        with RuntimeAuditLease(cache_root) as warm:
+            warm.stage_readonly_layout(
+                "actual-qt-runtime",
+                {Path(str(index)) / path.name: path for index, path in enumerate(runtime)},
+                byte_limit=1 << 30,
+            )
+            warm.stage_readonly_layout(
+                "actual-qt-plugins",
+                {path.relative_to(qt / "plugins"): path for path in plugins},
+                byte_limit=1 << 30,
+            )
+            warm.stage_readonly_layout(
+                "actual-qt-qml",
+                {path.relative_to(qt / "qml"): path for path in qml},
+                entry_limit=32768,
+                byte_limit=1 << 30,
+            )
+            self.assertEqual(warm.cache_miss_count, 0)
+            self.assertEqual(warm.cache_hit_count, 3)
+            self.assertEqual(
+                (warm.payload_written_file_count, warm.payload_written_byte_count),
+                (0, 0),
+            )
+        self.assertLess(time.perf_counter() - warm_started, 20.0)
 
         focused_started = time.perf_counter()
         with RuntimeAuditLease() as lease:
@@ -1497,7 +1534,9 @@ class RunCtestTests(unittest.TestCase):
             )
         finally:
             lease.close()
-        self.assertFalse(staged_qml.exists())
+        self.assertTrue(staged_qml.is_dir())
+        with self.assertRaises(OSError):
+            (staged_qml / "Injected.qml").write_text("poison", encoding="utf-8")
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_external_launch_snapshots_quicktest_input_and_relative_imports(self):
@@ -1551,15 +1590,14 @@ class RunCtestTests(unittest.TestCase):
                 "import QtQuick\nItem {}\n",
             )
 
-            test_qml.write_text("poison", encoding="utf-8")
-            component.write_text("poison", encoding="utf-8")
-            self.assertNotEqual(
-                (staged_input / test_qml.name).read_text(encoding="utf-8"),
-                "poison",
+            with self.assertRaises(OSError):
+                test_qml.write_text("poison", encoding="utf-8")
+            with self.assertRaises(OSError):
+                component.write_text("poison", encoding="utf-8")
+            self.assertIn(
+                "../../ui/components", test_qml.read_text(encoding="utf-8")
             )
-            self.assertNotEqual(
-                staged_component.read_text(encoding="utf-8"), "poison"
-            )
+            self.assertIn("Item", staged_component.read_text(encoding="utf-8"))
             replacement = self.root / "replacement.qml"
             replacement.write_text("poison", encoding="utf-8")
             with self.assertRaises(OSError):
@@ -1587,8 +1625,12 @@ class RunCtestTests(unittest.TestCase):
                     staged_component.parent.with_name("retargeted-components"),
                 )
 
-        self.assertFalse(staged_build.exists())
-        self.assertFalse(staged_source.exists())
+        self.assertTrue(staged_build.is_dir())
+        self.assertTrue(staged_source.is_dir())
+        with self.assertRaises(OSError):
+            (staged_build / "late.exe").write_bytes(b"poison")
+        with self.assertRaises(OSError):
+            (staged_source / "late.qml").write_text("poison", encoding="utf-8")
 
     @unittest.skipUnless(os.name == "nt", "requires protected Windows staging")
     def test_external_launch_uses_closed_executable_and_path_namespaces(self):
@@ -2489,6 +2531,193 @@ class RunCtestTests(unittest.TestCase):
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
 
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_runtime_audit_lease_reuses_published_layout_and_preserves_logical_counts(
+        self,
+    ) -> None:
+        cache_root = self.root / "layout-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        tool = self.build_dir / "tool.exe"
+        tool.write_bytes(b"tool")
+        entries = ((Path("tool.exe"), tool),)
+
+        with RuntimeAuditLease(cache_root) as first:
+            first_path = first.stage_readonly_layout(
+                "tool", entries, context={"purpose": "unit"}
+            )
+            self.assertEqual((first.cache_hit_count, first.cache_miss_count), (0, 1))
+            self.assertEqual((first.staged_file_count, first.staged_byte_count), (1, 4))
+            self.assertEqual(
+                (
+                    first.payload_written_file_count,
+                    first.payload_written_byte_count,
+                ),
+                (1, 4),
+            )
+
+        with RuntimeAuditLease(cache_root) as second:
+            second_path = second.stage_readonly_layout(
+                "tool", entries, context={"purpose": "unit"}
+            )
+            self.assertEqual(first_path, second_path)
+            self.assertEqual((second.cache_hit_count, second.cache_miss_count), (1, 0))
+            self.assertEqual((second.staged_file_count, second.staged_byte_count), (1, 4))
+            self.assertEqual(
+                (
+                    second.payload_written_file_count,
+                    second.payload_written_byte_count,
+                ),
+                (0, 0),
+            )
+            self.assertEqual(second.cached_layout_directories, (second_path,))
+
+        self.assertTrue(second_path.is_dir())
+        with self.assertRaises(OSError):
+            (second_path / "late.dll").write_bytes(b"late")
+
+        tool.write_bytes(b"tools")
+        with RuntimeAuditLease(cache_root) as changed:
+            changed_path = changed.stage_readonly_layout(
+                "tool", entries, context={"purpose": "unit"}
+            )
+            self.assertNotEqual(changed_path, second_path)
+            self.assertEqual((changed.cache_hit_count, changed.cache_miss_count), (0, 1))
+            self.assertEqual((changed.staged_file_count, changed.staged_byte_count), (1, 5))
+        self.assertEqual((second_path / "tool.exe").read_bytes(), b"tool")
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_runtime_audit_lease_caches_filtered_tree_with_stable_context(self) -> None:
+        cache_root = self.root / "tree-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        source = self.root / "tree-source"
+        source.mkdir()
+        (source / "Module.qml").write_bytes(b"qml")
+        (source / "qmldir").write_bytes(b"dir")
+        (source / "ignored.txt").write_bytes(b"ignored")
+        excluded = source / "excluded"
+        excluded.mkdir()
+        (excluded / "Hidden.qml").write_bytes(b"hidden")
+
+        options = {
+            "excluded": (excluded,),
+            "included_suffixes": (".qml",),
+            "included_names": ("qmldir",),
+        }
+        with RuntimeAuditLease(cache_root) as cold:
+            cold_path = cold.stage_readonly_tree(source, **options)
+            self.assertEqual((cold.cache_hit_count, cold.cache_miss_count), (0, 1))
+            self.assertEqual((cold.staged_file_count, cold.staged_byte_count), (2, 6))
+        with RuntimeAuditLease(cache_root) as warm:
+            warm_path = warm.stage_readonly_tree(source, **options)
+            self.assertEqual(warm_path, cold_path)
+            self.assertEqual((warm.cache_hit_count, warm.cache_miss_count), (1, 0))
+            self.assertEqual(
+                (warm.payload_written_file_count, warm.payload_written_byte_count),
+                (0, 0),
+            )
+        self.assertEqual(
+            sorted(path.name for path in warm_path.iterdir()),
+            ["Module.qml", "qmldir"],
+        )
+        with RuntimeAuditLease(cache_root) as changed_filter:
+            changed_path = changed_filter.stage_readonly_tree(
+                source,
+                excluded=(excluded,),
+            )
+            self.assertNotEqual(changed_path, warm_path)
+            self.assertEqual(
+                (changed_filter.cache_hit_count, changed_filter.cache_miss_count),
+                (0, 1),
+            )
+            self.assertTrue((changed_path / "ignored.txt").is_file())
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_runtime_audit_lease_binds_dependencies_to_exact_cached_layouts(self) -> None:
+        cache_root = self.root / "dependency-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        dependency_source = self.build_dir / "dependency.dll"
+        dependency_source.write_bytes(b"dependency")
+
+        with RuntimeAuditLease(cache_root) as lease:
+            dependency = lease.stage_readonly_layout(
+                "dependency",
+                ((Path("dependency.dll"), dependency_source),),
+                context={"kind": "dependency"},
+            )
+            child = lease.stage_readonly_layout(
+                "child",
+                ((Path("child.txt"), b"child"),),
+                context={"kind": "child"},
+                dependencies=(dependency,),
+            )
+            self.assertTrue(child.is_dir())
+            self.assertEqual(
+                lease.cached_layout_directories,
+                (dependency, child),
+            )
+            with self.assertRaisesRegex(RuntimeError, "registered cached layout"):
+                lease.stage_readonly_layout(
+                    "invalid-child",
+                    ((Path("child.txt"), b"child"),),
+                    context={},
+                    dependencies=(self.root / "not-cached",),
+                )
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_runtime_audit_lease_failed_layout_does_not_increment_counters(self) -> None:
+        cache_root = self.root / "failure-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        source = self.build_dir / "oversized.bin"
+        source.write_bytes(b"too-large")
+
+        with RuntimeAuditLease(cache_root) as lease, mock.patch.object(
+            lease,
+            "_describe_held_source",
+            wraps=lease._describe_held_source,
+        ) as describe:
+            with self.assertRaisesRegex(RuntimeError, "byte limit"):
+                lease.stage_readonly_layout(
+                    "oversized",
+                    ((Path("oversized.bin"), source),),
+                    context={},
+                    byte_limit=1,
+                )
+            self.assertEqual(lease.cached_layout_directories, ())
+            self.assertEqual(
+                (
+                    lease.cache_hit_count,
+                    lease.cache_miss_count,
+                    lease.staged_file_count,
+                    lease.staged_byte_count,
+                    lease.payload_written_file_count,
+                    lease.payload_written_byte_count,
+                ),
+                (0, 0, 0, 0, 0, 0),
+            )
+            describe.assert_not_called()
+            self.assertFalse(cache_root.exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires protected Windows caching")
+    def test_runtime_audit_lease_tree_limit_stops_before_hashing_extra_files(
+        self,
+    ) -> None:
+        cache_root = self.root / "bounded-tree-cache"
+        self.addCleanup(self.remove_test_runtime_cache, cache_root)
+        source = self.root / "bounded-tree"
+        source.mkdir()
+        (source / "first.qml").write_bytes(b"first")
+        (source / "second.qml").write_bytes(b"second")
+
+        with RuntimeAuditLease(cache_root) as lease, mock.patch.object(
+            lease,
+            "_describe_held_source",
+            wraps=lease._describe_held_source,
+        ) as describe:
+            with self.assertRaisesRegex(RuntimeError, "entry limit"):
+                lease.stage_readonly_tree(source, entry_limit=1)
+            self.assertEqual(describe.call_count, 1)
+            self.assertEqual(lease.cached_layout_directories, ())
+
     @unittest.skipUnless(os.name == "nt", "requires Windows sharing semantics")
     def test_mid_audit_runtime_peer_replacements_are_blocked_not_cached(self):
         configured = self.qt_root / "bin" / "Qt6Core.dll"
@@ -2608,7 +2837,9 @@ class RunCtestTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 os.replace(staged, staged.with_name("retargeted-qml"))
 
-        self.assertFalse(staged.parent.exists())
+        self.assertTrue(staged.is_dir())
+        with self.assertRaises(OSError):
+            (staged / "late.qml").write_text("poison", encoding="utf-8")
 
     def test_earlier_non_owner_path_peer_cannot_shadow_authoritative_family(self):
         qt_peer = self.qt_root / "bin" / "avcodec-62.dll"
@@ -2906,15 +3137,12 @@ class RunCtestTests(unittest.TestCase):
         self.assertEqual(run_ctest.main(["--test-dir", str(alias)]), 0)
 
         command = run.call_args.args[0]
-        self.assertEqual(
-            command[-4:],
-            [
-                "--test-dir",
-                str(self.build_dir.resolve()),
-                "--interactive-debug-mode",
-                "0",
-            ],
-        )
+        self.assertEqual(command[-4], "--test-dir")
+        staged_build = Path(command[-3])
+        self.assertNotEqual(staged_build, self.build_dir.resolve())
+        self.assertNotEqual(staged_build, alias)
+        self.assertTrue(staged_build.is_dir())
+        self.assertEqual(command[-2:], ["--interactive-debug-mode", "0"])
 
     @mock.patch("tools.run_ctest._restore_windows_error_mode")
     @mock.patch("tools.run_ctest._set_windows_error_mode", return_value=13)

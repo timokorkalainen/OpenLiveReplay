@@ -363,6 +363,19 @@ class WindowsRuntimeCache:
     def _touch_access(self, key: str) -> None:
         _touch_cache_access(self, key)
 
+    def close(self) -> None:
+        """Release cache-management handles without removing published objects."""
+        owners, self._management_handles = self._management_handles, []
+        first_error: Optional[BaseException] = None
+        for owner in reversed(owners):
+            try:
+                owner.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
 
 def local_app_data_cache_root() -> Path:
     """Return the known-folder cache root without consulting inherited variables."""

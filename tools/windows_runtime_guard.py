@@ -5,17 +5,27 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
 import hashlib
 import os
 from pathlib import Path
 import re
-import shutil
 import struct
-import tempfile
+import time
+import uuid
 from typing import BinaryIO, Callable, NamedTuple
 import xml.etree.ElementTree as ET
+
+from tools.windows_runtime_cache import (
+    CacheLimits,
+    CachedLayoutLease,
+    GeneratedLayoutEntry,
+    HeldSource,
+    JsonValue,
+    QtConfPaths,
+    WindowsRuntimeCache,
+)
 
 
 class RuntimeRoots(NamedTuple):
@@ -30,13 +40,6 @@ class RuntimeRoots(NamedTuple):
 class CacheEntry(NamedTuple):
     value: str
     cache_type: str
-
-
-class _StagedTree(NamedTuple):
-    temporary: tempfile.TemporaryDirectory[str]
-    root: Path
-    staged: Path
-    sid: str
 
 
 def _current_user_sid() -> str:
@@ -89,60 +92,6 @@ def _current_user_sid() -> str:
             kernel32.LocalFree(text)
     finally:
         kernel32.CloseHandle(token)
-
-
-def _set_staged_tree_access(
-    root: Path, sid: str, permission: str
-) -> None:
-    if os.name != "nt":
-        return
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    descriptor = ctypes.c_void_p()
-    descriptor_size = wintypes.ULONG()
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(wintypes.ULONG),
-    )
-    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
-    advapi32.SetFileSecurityW.argtypes = (
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-    )
-    advapi32.SetFileSecurityW.restype = wintypes.BOOL
-    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
-    if permission == "F":
-        sddl = f"D:P(A;OICI;FA;;;{sid})"
-    elif permission == "BUILD":
-        sddl = f"D:P(A;;FA;;;{sid})(A;OICIIO;GRGX;;;{sid})"
-    else:
-        sddl = f"D:P(A;OICI;GRGX;;;{sid})"
-    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        sddl, 1, ctypes.byref(descriptor), ctypes.byref(descriptor_size)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    try:
-        targets = [
-            root,
-            *sorted(
-                (path for path in root.rglob("*") if path.is_dir()),
-                key=lambda path: str(path).casefold(),
-            ),
-        ]
-        if permission != "F":
-            targets.reverse()
-        for target in targets:
-            if not advapi32.SetFileSecurityW(
-                str(target),
-                0x00000004 | 0x80000000,
-                descriptor,
-            ):
-                raise ctypes.WinError(ctypes.get_last_error())
-    finally:
-        kernel32.LocalFree(descriptor)
 
 
 def replace_environment_case_insensitively(
@@ -273,11 +222,23 @@ def restore_windows_dll_directory(previous: str | None) -> None:
 class RuntimeAuditLease:
     """Hold audited binaries read-only until the controlled child exits."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        cache_root: Path | None = None,
+        *,
+        cache_limits: CacheLimits = CacheLimits(),
+        cache_clock: Callable[[], float] = time.time,
+    ) -> None:
         self._streams: dict[Path, BinaryIO] = {}
         self._canonical_files: dict[Path, Path] = {}
         self._directory_handles: dict[Path, tuple[object, Path]] = {}
-        self._staged_trees: dict[Path, _StagedTree] = {}
+        self._cache_root = cache_root
+        self._cache_limits = cache_limits
+        self._cache_clock = cache_clock
+        self._legacy_render_nonce = uuid.uuid4().hex
+        self._cache: WindowsRuntimeCache | None = None
+        self._cached_layout_leases: list[CachedLayoutLease] = []
+        self._cached_layout_by_path: dict[str, CachedLayoutLease] = {}
         self.launch_build_directory: Path | None = None
         self.launch_source_directory: Path | None = None
         self.launch_runtime_directory: Path | None = None
@@ -285,6 +246,14 @@ class RuntimeAuditLease:
         self.launch_executable: Path | None = None
         self.staged_file_count = 0
         self.staged_byte_count = 0
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
+        self.payload_written_file_count = 0
+        self.payload_written_byte_count = 0
+
+    @property
+    def cached_layout_directories(self) -> tuple[Path, ...]:
+        return tuple(lease.layout for lease in self._cached_layout_leases)
 
     def __enter__(self) -> RuntimeAuditLease:
         return self
@@ -353,6 +322,59 @@ class RuntimeAuditLease:
                         f"runtime DLL subtree contains a reparse alias: {child} -> {final}"
                     )
 
+    def _runtime_cache(self) -> WindowsRuntimeCache:
+        if os.name != "nt":
+            raise OSError("protected launch layouts are only available on Windows")
+        if self._cache is None:
+            self._cache = WindowsRuntimeCache(
+                self._cache_root,
+                _current_user_sid(),
+                self._describe_held_source,
+                self._open_directory_locked,
+                limits=self._cache_limits,
+                clock=self._cache_clock,
+            )
+        return self._cache
+
+    def _describe_held_source(self, path: Path) -> HeldSource:
+        source = path.absolute()
+        stream = self.hold(source)
+        stat_result = os.fstat(stream.fileno())
+        stream.seek(0)
+        digest = hashlib.sha256()
+        try:
+            while True:
+                payload = stream.read(1024 * 1024)
+                if not payload:
+                    break
+                digest.update(payload)
+        finally:
+            stream.seek(0)
+        return HeldSource(
+            source=source,
+            final_path=self._canonical_files[source],
+            device=int(stat_result.st_dev),
+            inode=int(stat_result.st_ino),
+            size=int(stat_result.st_size),
+            sha256=digest.hexdigest(),
+            stream=stream,
+        )
+
+    @staticmethod
+    def _layout_path_key(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    def _record_cached_layout(self, lease: CachedLayoutLease) -> Path:
+        self._cached_layout_leases.append(lease)
+        self._cached_layout_by_path[self._layout_path_key(lease.layout)] = lease
+        self.staged_file_count += lease.logical_files
+        self.staged_byte_count += lease.logical_bytes
+        self.cache_hit_count += int(lease.cache_hit)
+        self.cache_miss_count += int(not lease.cache_hit)
+        self.payload_written_file_count += lease.payload_files
+        self.payload_written_byte_count += lease.payload_bytes
+        return lease.layout
+
     def stage_readonly_tree(
         self,
         directory: Path,
@@ -365,12 +387,17 @@ class RuntimeAuditLease:
     ) -> Path:
         """Snapshot a runtime tree and deny mutation for the child lifetime."""
         source = self.canonical_directory(directory)
-        existing = self._staged_trees.get(source)
-        if existing is not None:
-            return existing.staged
         if os.name != "nt":
             self.hold_dll_tree(source)
             return source
+        if type(entry_limit) is not int or entry_limit < 0:
+            raise RuntimeError(
+                "runtime cache entry limit must be a nonnegative integer"
+            )
+        if type(byte_limit) is not int or byte_limit < 0:
+            raise RuntimeError(
+                "runtime cache byte limit must be a nonnegative integer"
+            )
 
         excluded_canonical = tuple(Path(os.path.abspath(path)) for path in excluded)
 
@@ -387,7 +414,8 @@ class RuntimeAuditLease:
             else None
         )
         names = {name.casefold() for name in included_names}
-        entries: list[Path] = []
+        entries: list[tuple[Path, HeldSource]] = []
+        total_size = 0
         for current_text, directory_names, file_names in os.walk(source):
             current = Path(current_text)
             retained_directories: list[str] = []
@@ -411,194 +439,195 @@ class RuntimeAuditLease:
                     and entry.name.casefold() not in names
                 ):
                     continue
-                entries.append(entry)
-        entries.sort(key=lambda path: str(path).casefold())
-        if len(entries) > entry_limit:
-            raise RuntimeError(
-                f"runtime QML tree exceeds {entry_limit} entries: {source}"
-            )
-        for entry in entries:
-            if entry.is_symlink():
-                raise RuntimeError(
-                    f"protected tree contains a reparse alias: {entry}"
-                )
-            if not entry.is_file():
-                raise RuntimeError(
-                    f"protected tree contains unsupported entry: {entry}"
-                )
+                if entry.is_symlink():
+                    raise RuntimeError(
+                        f"protected tree contains a reparse alias: {entry}"
+                    )
+                if not entry.is_file():
+                    raise RuntimeError(
+                        f"protected tree contains unsupported entry: {entry}"
+                    )
+                if len(entries) >= entry_limit:
+                    raise RuntimeError(
+                        "runtime cache entry limit exceeded: "
+                        f"more than {entry_limit} entries"
+                    )
+                stream = self.hold(entry)
+                total_size += int(os.fstat(stream.fileno()).st_size)
+                if total_size > byte_limit:
+                    raise RuntimeError(
+                        "runtime cache byte limit exceeded: "
+                        f"{total_size} > {byte_limit}"
+                    )
+                descriptor = self._describe_held_source(entry)
+                final = descriptor.final_path
+                if not _is_relative_to(final, source) or os.path.normcase(
+                    str(entry)
+                ) != os.path.normcase(str(final)):
+                    raise RuntimeError(
+                        "runtime QML tree contains a reparse alias: "
+                        f"{entry} -> {final}"
+                    )
+                entries.append((entry.relative_to(source), descriptor))
+        entries.sort(key=lambda pair: str(pair[0]).casefold())
 
-        temporary = tempfile.TemporaryDirectory(prefix="olr-qml-runtime-")
-        temporary_root = Path(temporary.name)
-        staged = temporary_root / source.name
-        staged.mkdir()
-        locked = False
-        try:
-            for entry in entries:
-                destination = staged / entry.relative_to(source)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-
-            sid = _current_user_sid()
-            _set_staged_tree_access(temporary_root, sid, "BUILD")
-            locked = True
-            total_size = 0
-            for entry in entries:
-                destination = staged / entry.relative_to(source)
-                with self._open_read_locked(entry) as stream:
-                    final = self._final_path_from_stream(stream, entry)
-                    if not _is_relative_to(final, source) or os.path.normcase(
-                        str(entry)
-                    ) != os.path.normcase(str(final)):
-                        raise RuntimeError(
-                            "runtime QML tree contains a reparse alias: "
-                            f"{entry} -> {final}"
-                        )
-                    stream.seek(0, os.SEEK_END)
-                    total_size += stream.tell()
-                    if total_size > byte_limit:
-                        raise RuntimeError(
-                            f"runtime QML tree exceeds {byte_limit} bytes: {source}"
-                        )
-                    stream.seek(0)
-                    with destination.open("xb") as output:
-                        shutil.copyfileobj(stream, output)
-
-            _set_staged_tree_access(temporary_root, sid, "RX")
-            record = _StagedTree(temporary, temporary_root, staged, sid)
-            self._staged_trees[source] = record
-            self.staged_file_count += len(entries)
-            self.staged_byte_count += total_size
-            self.canonical_directory(temporary_root)
-            self.canonical_directory(staged)
-            return staged
-        except BaseException:
-            if locked:
-                try:
-                    _set_staged_tree_access(temporary_root, sid, "F")
-                except BaseException:
-                    pass
-            try:
-                temporary.cleanup()
-            except BaseException:
-                pass
-            raise
+        context: dict[str, JsonValue] = {
+            "policy": "readonly-tree-cache-v1",
+            "source_final_path": source.as_posix(),
+            "excluded": tuple(
+                sorted(path.as_posix() for path in excluded_canonical)
+            ),
+            "included_suffixes": (
+                None if suffixes is None else tuple(sorted(suffixes))
+            ),
+            "included_names": tuple(sorted(names)),
+            "entry_limit": entry_limit,
+            "byte_limit": byte_limit,
+        }
+        lease = self._runtime_cache().materialize(
+            source.name,
+            tuple(entries),
+            context=context,
+            entry_limit=entry_limit,
+            byte_limit=byte_limit,
+        )
+        return self._record_cached_layout(lease)
 
     def stage_readonly_layout(
         self,
         name: str,
-        entries: Mapping[Path, Path | bytes | Callable[[Path], bytes]],
+        entries: (
+            Mapping[Path, Path | bytes | Callable[[Path], bytes] | GeneratedLayoutEntry]
+            | Sequence[
+                tuple[Path, Path | bytes | Callable[[Path], bytes] | GeneratedLayoutEntry]
+            ]
+        ),
         *,
+        context: Mapping[str, JsonValue] | None = None,
+        dependencies: Sequence[Path] = (),
+        qt_paths: QtConfPaths | None = None,
         entry_limit: int = 8192,
         byte_limit: int = 1 << 30,
     ) -> Path:
-        """Create one protected tree from held files and generated content."""
+        """Materialize one immutable cached tree from held source descriptors."""
         if os.name != "nt":
             raise OSError("protected launch layouts are only available on Windows")
-        if not name or Path(name).name != name:
-            raise ValueError(f"invalid protected layout name: {name!r}")
+        if type(entry_limit) is not int or entry_limit < 0:
+            raise RuntimeError(
+                "runtime cache entry limit must be a nonnegative integer"
+            )
+        if type(byte_limit) is not int or byte_limit < 0:
+            raise RuntimeError(
+                "runtime cache byte limit must be a nonnegative integer"
+            )
         if len(entries) > entry_limit:
             raise RuntimeError(
-                f"protected {name} layout exceeds {entry_limit} entries"
+                "runtime cache entry limit exceeded: "
+                f"more than {entry_limit} entries"
             )
 
-        normalized: dict[Path, Path | bytes | Callable[[Path], bytes]] = {}
-        total_size = 0
-        for relative, source in entries.items():
-            relative = Path(relative)
-            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-                raise RuntimeError(
-                    f"protected {name} layout has unsafe destination: {relative}"
+        pairs = tuple(entries.items()) if isinstance(entries, Mapping) else tuple(entries)
+        described: list[tuple[Path, HeldSource | bytes | GeneratedLayoutEntry]] = []
+        known_bytes = 0
+        for relative, source in pairs:
+            if isinstance(source, Path):
+                stream = self.hold(source)
+                known_bytes += int(os.fstat(stream.fileno()).st_size)
+                if known_bytes > byte_limit:
+                    raise RuntimeError(
+                        "runtime cache byte limit exceeded: "
+                        f"{known_bytes} > {byte_limit}"
+                    )
+                entry: HeldSource | bytes | GeneratedLayoutEntry = (
+                    self._describe_held_source(source)
                 )
-            folded = Path(*[part.casefold() for part in relative.parts])
-            if folded in normalized:
-                raise RuntimeError(
-                    f"protected {name} layout has duplicate destination: {relative}"
-                )
-            if isinstance(source, bytes):
-                total_size += len(source)
+            elif isinstance(source, bytes):
+                known_bytes += len(source)
+                if known_bytes > byte_limit:
+                    raise RuntimeError(
+                        "runtime cache byte limit exceeded: "
+                        f"{known_bytes} > {byte_limit}"
+                    )
+                entry = source
+            elif isinstance(source, GeneratedLayoutEntry):
+                entry = source
             elif callable(source):
-                pass
-            else:
-                stream = self.hold(source)
-                total_size += os.fstat(stream.fileno()).st_size
-            if total_size > byte_limit:
-                raise RuntimeError(
-                    f"protected {name} layout exceeds {byte_limit} bytes"
+                entry = GeneratedLayoutEntry(
+                    "legacy-layout-render-v1",
+                    {
+                        "destination": Path(relative).as_posix(),
+                        "lease_nonce": self._legacy_render_nonce,
+                    },
+                    source,
                 )
-            normalized[folded] = source
+            else:
+                raise RuntimeError(
+                    "protected layout contains unsupported source: "
+                    f"{type(source).__name__}"
+                )
+            described.append((Path(relative), entry))
 
-        temporary = tempfile.TemporaryDirectory(prefix=f"olr-{name}-")
-        temporary_root = Path(temporary.name)
-        staged = temporary_root / name
-        staged.mkdir()
-        sid = _current_user_sid()
-        locked = False
-        try:
-            directories = {
-                staged / parent
-                for relative in entries
-                for parent in relative.parents
-                if parent != Path(".")
-            }
-            for directory in sorted(
-                directories, key=lambda path: (len(path.parts), str(path).casefold())
-            ):
-                directory.mkdir(parents=True, exist_ok=True)
-            _set_staged_tree_access(temporary_root, sid, "BUILD")
-            locked = True
-            for relative, source in entries.items():
-                destination = staged / relative
-                if callable(source):
-                    source = source(staged)
-                    total_size += len(source)
-                    if total_size > byte_limit:
-                        raise RuntimeError(
-                            f"protected {name} layout exceeds {byte_limit} bytes"
-                        )
-                if isinstance(source, bytes):
-                    destination.write_bytes(source)
-                    continue
-                stream = self.hold(source)
-                stream.seek(0)
-                with destination.open("xb") as output:
-                    shutil.copyfileobj(stream, output)
-            _set_staged_tree_access(temporary_root, sid, "RX")
-            key = Path(f"__layout__/{name}/{id(temporary)}")
-            self._staged_trees[key] = _StagedTree(
-                temporary, temporary_root, staged, sid
+        dependency_leases: list[CachedLayoutLease] = []
+        for dependency in dependencies:
+            dependency_lease = self._cached_layout_by_path.get(
+                self._layout_path_key(dependency)
             )
-            self.staged_file_count += len(entries)
-            self.staged_byte_count += total_size
-            self.canonical_directory(temporary_root)
-            self.canonical_directory(staged)
-            return staged
-        except BaseException:
-            if locked:
-                try:
-                    _set_staged_tree_access(temporary_root, sid, "F")
-                except BaseException:
-                    pass
-            try:
-                temporary.cleanup()
-            except BaseException:
-                pass
-            raise
+            if dependency_lease is None:
+                raise RuntimeError(
+                    "protected layout dependency is not a registered cached layout: "
+                    f"{dependency}"
+                )
+            dependency_leases.append(dependency_lease)
+
+        effective_context: Mapping[str, JsonValue]
+        if qt_paths is None:
+            effective_context = {} if context is None else context
+        else:
+            if not isinstance(qt_paths, QtConfPaths):
+                raise TypeError("qt_paths must be a QtConfPaths value")
+            effective_context = {
+                "context": {} if context is None else context,
+                "qt_paths": {
+                    "plugins": qt_paths.plugins.as_posix(),
+                    "qml_imports": qt_paths.qml_imports.as_posix(),
+                },
+            }
+
+        lease = self._runtime_cache().materialize(
+            name,
+            tuple(described),
+            context=effective_context,
+            dependencies=tuple(dependency_leases),
+            entry_limit=entry_limit,
+            byte_limit=byte_limit,
+        )
+        return self._record_cached_layout(lease)
 
     def close(self) -> None:
         streams = tuple(reversed(tuple(self._streams.values())))
         directory_handles = tuple(
             reversed(tuple(owner for owner, _path in self._directory_handles.values()))
         )
-        staged_trees = tuple(reversed(tuple(self._staged_trees.values())))
+        cached_layouts = tuple(reversed(tuple(self._cached_layout_leases)))
+        cache = self._cache
         self._streams.clear()
         self._canonical_files.clear()
         self._directory_handles.clear()
-        self._staged_trees.clear()
+        self._cached_layout_leases.clear()
+        self._cached_layout_by_path.clear()
+        self._cache = None
         self.launch_build_directory = None
         self.launch_source_directory = None
         self.launch_runtime_directory = None
         self.launch_runtime_directories = ()
         self.launch_executable = None
         first_error: BaseException | None = None
+        for cached_layout in cached_layouts:
+            try:
+                cached_layout.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         for stream in streams:
             try:
                 stream.close()
@@ -611,12 +640,9 @@ class RuntimeAuditLease:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
-        for staged in staged_trees:
+        if cache is not None:
             try:
-                _set_staged_tree_access(
-                    staged.root, staged.sid, "F"
-                )
-                staged.temporary.cleanup()
+                cache.close()
             except BaseException as error:
                 if first_error is None:
                     first_error = error

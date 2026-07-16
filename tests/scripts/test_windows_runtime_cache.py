@@ -649,6 +649,20 @@ class WindowsFilesystemTests(unittest.TestCase):
             lambda path: (object(), path),
         )
 
+    def test_close_releases_management_handles_without_removing_objects(self) -> None:
+        cache = self.make_cache(self.root / "close-cache")
+        published = cache.objects / "published"
+        published.mkdir()
+        owners = tuple(cache._management_handles)
+
+        cache.close()
+        cache.close()
+
+        self.assertTrue(published.is_dir())
+        self.assertTrue(owners)
+        self.assertTrue(all(owner.value == 0 for owner in owners))
+        self.assertEqual(cache._management_handles, [])
+
     def test_known_folder_root_ignores_environment_and_rejects_reparse_parent(
         self,
     ) -> None:
