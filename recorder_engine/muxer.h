@@ -308,9 +308,13 @@ private:
     QString m_acceptedStartTimecodeCandidate;
     FixedQueue<AcceptedCandidate, kMaxQueuedPackets + kMaxPacketBatch>
         m_acceptedStartTimecodeCandidates;
+    // Candidate admission and the writer's final boundary snapshot share
+    // m_qMutex. An empty boundary closes admission before the writer releases
+    // that mutex; a non-empty tentative selection still admits replacements so
+    // they survive if the selected carrier becomes stale before header commit.
+    enum class CandidateWindowState { Open, TentativeEmptyClosed, TentativeCandidate, Committed };
     uint64_t m_candidateWindowGeneration = 1;
-    bool m_startTimecodeCandidateWindowClosed = false;
-    bool m_candidateWindowCommitted = false;
+    CandidateWindowState m_candidateWindowState = CandidateWindowState::Open;
     std::atomic<bool> m_writerRunning{false};
     std::atomic<bool> m_blockingWritesAllowed{true};
 

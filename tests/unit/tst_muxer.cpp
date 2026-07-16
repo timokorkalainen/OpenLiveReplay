@@ -189,6 +189,7 @@ private slots:
     void stalePublishedCandidateReopensWindowAndPreservesCurrentPacket();
     void stalePacketGuardRejectsPacketIndependentlyOfPublishedCandidate();
     void candidateResetAtHeaderCommitCannotSeedStaleHeader();
+    void candidateAcceptedAfterEmptyBoundaryCannotSeedCommittedHeader();
     void replacementCandidateAcceptedDuringTentativeCloseSurvivesAbort();
     void minWrittenVideoPtsTracksCommittedVideoPackets();
     void beginShutdownDrainWakesBlockedProducer();
@@ -1369,6 +1370,67 @@ void TestMuxer::candidateResetAtHeaderCommitCannotSeedStaleHeader() {
     m.close();
 
     QCOMPARE(completion.written.load(std::memory_order_acquire), 1);
+    AVFormatContext* ctx = nullptr;
+    const QByteArray path = videoPathFor(baseName).toUtf8();
+    QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+    QVERIFY(av_dict_get(ctx->metadata, "timecode", nullptr, 0) == nullptr);
+}
+
+void TestMuxer::candidateAcceptedAfterEmptyBoundaryCannotSeedCommittedHeader() {
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "0");
+    const auto restoreGrace = qScopeGuard([] { qunsetenv("OLR_MUXER_TMCD_GRACE_MS"); });
+
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QString baseName = QStringLiteral("olr_unit_tc_empty_boundary_late_candidate");
+    QVERIFY(m.init(baseName, 1, 320, 240, 30, {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto makePacket = [&m](int64_t pts) {
+        AVPacket* packet = av_packet_alloc();
+        if (!packet || av_new_packet(packet, 2) < 0) {
+            av_packet_free(&packet);
+            return packet;
+        }
+        packet->data[0] = '{';
+        packet->data[1] = '}';
+        packet->stream_index = m.subtitleTrackOffset();
+        packet->pts = packet->dts = pts;
+        packet->duration = 1;
+        return packet;
+    };
+
+    PacketCompletionProbe boundaryCompletion;
+    PacketCompletionProbe lateCompletion;
+    std::atomic<bool> lateAccepted{false};
+    std::atomic<bool> lateCandidateRecorded{false};
+    m.m_beforeCandidatePublicationForTest = [&] {
+        AVPacket* late = makePacket(2);
+        if (late) {
+            lateAccepted.store(
+                m.writePacket(late, lateCompletion.callback(), QStringLiteral("13:14:15:16")),
+                std::memory_order_release);
+        }
+        av_packet_free(&late);
+        std::lock_guard<std::mutex> queueLock(m.m_qMutex);
+        lateCandidateRecorded.store(!m.m_acceptedStartTimecodeCandidates.empty(),
+                                    std::memory_order_release);
+    };
+
+    AVPacket* boundary = makePacket(1);
+    QVERIFY(boundary != nullptr);
+    QVERIFY(m.writePacket(boundary, boundaryCompletion.callback()));
+    av_packet_free(&boundary);
+    m.close();
+
+    QVERIFY(lateAccepted.load(std::memory_order_acquire));
+    QVERIFY(!lateCandidateRecorded.load(std::memory_order_acquire));
+    QCOMPARE(boundaryCompletion.written.load(std::memory_order_acquire), 1);
+    QCOMPARE(boundaryCompletion.rejected.load(std::memory_order_acquire), 0);
+    QCOMPARE(lateCompletion.written.load(std::memory_order_acquire), 1);
+    QCOMPARE(lateCompletion.rejected.load(std::memory_order_acquire), 0);
+
     AVFormatContext* ctx = nullptr;
     const QByteArray path = videoPathFor(baseName).toUtf8();
     QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);

@@ -292,8 +292,7 @@ bool Muxer::init(const QString& filename, int videoTrackCount, int width, int he
         m_acceptedStartTimecodeCandidate.clear();
         m_acceptedStartTimecodeCandidates.clear();
         m_candidateWindowGeneration = 1;
-        m_startTimecodeCandidateWindowClosed = false;
-        m_candidateWindowCommitted = false;
+        m_candidateWindowState = CandidateWindowState::Open;
     }
 
     m_initialized = true;
@@ -490,7 +489,10 @@ bool Muxer::writePacketBatch(const PacketWriteRequest* packets, size_t packetCou
     // also the queue append, so the first accepted valid candidate wins in the
     // same order that concurrent producers enter the writer queue.
     size_t candidateCount = 0;
-    if (!m_candidateWindowCommitted) {
+    const bool candidateAdmissionOpen =
+        m_candidateWindowState == CandidateWindowState::Open ||
+        m_candidateWindowState == CandidateWindowState::TentativeCandidate;
+    if (candidateAdmissionOpen) {
         for (size_t i = 0; i < packetCount; ++i) {
             if (isWellFormedTimecode(packets[i].startTimecodeCandidate)) ++candidateCount;
         }
@@ -510,7 +512,7 @@ bool Muxer::writePacketBatch(const PacketWriteRequest* packets, size_t packetCou
     for (size_t i = 0; i < packetCount; ++i) {
         const uint64_t packetSequence = m_nextQueuedPacketSequence++;
         const PacketWriteRequest& request = packets[i];
-        if (!m_candidateWindowCommitted && isWellFormedTimecode(request.startTimecodeCandidate)) {
+        if (candidateAdmissionOpen && isWellFormedTimecode(request.startTimecodeCandidate)) {
             m_acceptedStartTimecodeCandidates.push_back(AcceptedCandidate{
                 request.startTimecodeCandidate, request.carrierGuard, packetSequence});
             if (m_acceptedStartTimecodeCandidate.isEmpty())
@@ -689,6 +691,14 @@ void Muxer::writerLoop() {
             const uint64_t candidateWindowGeneration = m_candidateWindowGeneration;
             packetSequence = m_pktQueue.front().sequence;
             boundaryPacketGuard = m_pktQueue.front().carrierGuard;
+            // This is the empty-boundary admission linearization point. Once an
+            // empty final snapshot is selected, later packet candidates are
+            // ordered after the header boundary and cannot seed this header. A
+            // non-empty tentative selection deliberately remains replaceable if
+            // its carrier becomes stale before the irreversible write.
+            m_candidateWindowState = finalAcceptedCandidate.isEmpty()
+                                         ? CandidateWindowState::TentativeEmptyClosed
+                                         : CandidateWindowState::TentativeCandidate;
             lk.unlock();
 #ifdef OLR_UNIT_TEST
             auto publicationHook = std::move(m_beforeCandidatePublicationForTest);
@@ -707,8 +717,11 @@ void Muxer::writerLoop() {
             const bool packetCarrierCurrent =
                 samePacket && m_pktQueue.front().carrierGuard.accepts();
             const bool candidateSelectionCurrent =
-                finalAcceptedCandidate.isEmpty() ||
-                (m_candidateWindowGeneration == candidateWindowGeneration &&
+                (finalAcceptedCandidate.isEmpty() &&
+                 m_candidateWindowState == CandidateWindowState::TentativeEmptyClosed) ||
+                (!finalAcceptedCandidate.isEmpty() &&
+                 m_candidateWindowState == CandidateWindowState::TentativeCandidate &&
+                 m_candidateWindowGeneration == candidateWindowGeneration &&
                  !m_acceptedStartTimecodeCandidates.empty() &&
                  m_acceptedStartTimecodeCandidates.front().sequence == finalCandidateSequence &&
                  finalCandidateGuard.accepts());
@@ -725,7 +738,7 @@ void Muxer::writerLoop() {
                     m_acceptedStartTimecodeCandidates.empty()
                         ? QString()
                         : m_acceptedStartTimecodeCandidates.front().value;
-                m_startTimecodeCandidateWindowClosed = false;
+                m_candidateWindowState = CandidateWindowState::Open;
                 ++m_candidateWindowGeneration;
                 if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
                 if (samePacket && !packetCarrierCurrent) {
@@ -743,7 +756,6 @@ void Muxer::writerLoop() {
                 }
                 continue;
             }
-            m_startTimecodeCandidateWindowClosed = true;
             boundaryCandidate = finalAcceptedCandidate;
             boundaryCandidateGuard = finalCandidateGuard;
             boundaryCandidateSequence = finalCandidateSequence;
@@ -777,7 +789,7 @@ void Muxer::writerLoop() {
                     m_acceptedStartTimecodeCandidates.empty()
                         ? QString()
                         : m_acceptedStartTimecodeCandidates.front().value;
-                m_startTimecodeCandidateWindowClosed = false;
+                m_candidateWindowState = CandidateWindowState::Open;
                 ++m_candidateWindowGeneration;
                 if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
                 if (!m_pktQueue.empty() && m_pktQueue.front().sequence == packetSequence &&
@@ -807,6 +819,7 @@ void Muxer::writerLoop() {
                 undoStartTimecodeCandidatePublication(boundaryCandidate, boundaryCandidateSequence);
             {
                 std::lock_guard<std::mutex> queueLock(m_qMutex);
+                m_candidateWindowState = CandidateWindowState::Open;
                 const bool samePacket =
                     !m_pktQueue.empty() && m_pktQueue.front().sequence == packetSequence;
                 const bool packetCurrent = samePacket && m_pktQueue.front().carrierGuard.accepts();
@@ -821,7 +834,6 @@ void Muxer::writerLoop() {
                         m_acceptedStartTimecodeCandidates.empty()
                             ? QString()
                             : m_acceptedStartTimecodeCandidates.front().value;
-                    m_startTimecodeCandidateWindowClosed = false;
                     ++m_candidateWindowGeneration;
                     if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
                 }
@@ -844,7 +856,7 @@ void Muxer::writerLoop() {
             queued = std::move(m_pktQueue.front());
             m_pktQueue.pop();
             if (headerStatus == HeaderCommitStatus::Written) {
-                m_candidateWindowCommitted = true;
+                m_candidateWindowState = CandidateWindowState::Committed;
                 m_acceptedStartTimecodeCandidates.clear();
             }
         }
