@@ -190,6 +190,7 @@ private slots:
     void stalePacketGuardRejectsPacketIndependentlyOfPublishedCandidate();
     void candidateResetAtHeaderCommitCannotSeedStaleHeader();
     void candidateAcceptedAfterEmptyBoundaryCannotSeedCommittedHeader();
+    void candidateAcceptedAfterAbortedEmptyBoundarySeedsRetry();
     void replacementCandidateAcceptedDuringTentativeCloseSurvivesAbort();
     void minWrittenVideoPtsTracksCommittedVideoPackets();
     void beginShutdownDrainWakesBlockedProducer();
@@ -1404,7 +1405,7 @@ void TestMuxer::candidateAcceptedAfterEmptyBoundaryCannotSeedCommittedHeader() {
     PacketCompletionProbe boundaryCompletion;
     PacketCompletionProbe lateCompletion;
     std::atomic<bool> lateAccepted{false};
-    std::atomic<bool> lateCandidateRecorded{false};
+    std::atomic<bool> lateCandidateRetained{false};
     m.m_beforeCandidatePublicationForTest = [&] {
         AVPacket* late = makePacket(2);
         if (late) {
@@ -1414,7 +1415,7 @@ void TestMuxer::candidateAcceptedAfterEmptyBoundaryCannotSeedCommittedHeader() {
         }
         av_packet_free(&late);
         std::lock_guard<std::mutex> queueLock(m.m_qMutex);
-        lateCandidateRecorded.store(!m.m_acceptedStartTimecodeCandidates.empty(),
+        lateCandidateRetained.store(!m.m_acceptedStartTimecodeCandidates.empty(),
                                     std::memory_order_release);
     };
 
@@ -1425,7 +1426,7 @@ void TestMuxer::candidateAcceptedAfterEmptyBoundaryCannotSeedCommittedHeader() {
     m.close();
 
     QVERIFY(lateAccepted.load(std::memory_order_acquire));
-    QVERIFY(!lateCandidateRecorded.load(std::memory_order_acquire));
+    QVERIFY(lateCandidateRetained.load(std::memory_order_acquire));
     QCOMPARE(boundaryCompletion.written.load(std::memory_order_acquire), 1);
     QCOMPARE(boundaryCompletion.rejected.load(std::memory_order_acquire), 0);
     QCOMPARE(lateCompletion.written.load(std::memory_order_acquire), 1);
@@ -1437,6 +1438,69 @@ void TestMuxer::candidateAcceptedAfterEmptyBoundaryCannotSeedCommittedHeader() {
     const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
     QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
     QVERIFY(av_dict_get(ctx->metadata, "timecode", nullptr, 0) == nullptr);
+}
+
+void TestMuxer::candidateAcceptedAfterAbortedEmptyBoundarySeedsRetry() {
+    qputenv("OLR_MUXER_TMCD_GRACE_MS", "0");
+    const auto restoreGrace = qScopeGuard([] { qunsetenv("OLR_MUXER_TMCD_GRACE_MS"); });
+
+    Muxer m;
+    m.setOutputDirectory(m_home.path());
+    const QString baseName = QStringLiteral("olr_unit_tc_empty_boundary_abort_retry");
+    QVERIFY(m.init(baseName, 1, 320, 240, 30, {QStringLiteral("A")}, 48000, 2, QString()));
+
+    auto makePacket = [&m](int64_t pts) {
+        AVPacket* packet = av_packet_alloc();
+        if (!packet || av_new_packet(packet, 2) < 0) {
+            av_packet_free(&packet);
+            return packet;
+        }
+        packet->data[0] = '{';
+        packet->data[1] = '}';
+        packet->stream_index = m.subtitleTrackOffset();
+        packet->pts = packet->dts = pts;
+        packet->duration = 1;
+        return packet;
+    };
+
+    std::atomic<uint64_t> epoch{1};
+    PacketCompletionProbe staleCompletion;
+    PacketCompletionProbe replacementCompletion;
+    const QString replacementCandidate = QStringLiteral("14:15:16:17");
+    std::atomic<bool> replacementAccepted{false};
+    m.m_beforeCandidatePublicationForTest = [&] {
+        epoch.store(2, std::memory_order_release);
+        AVPacket* replacement = makePacket(2);
+        if (replacement) {
+            replacementAccepted.store(m.writePacket(replacement, replacementCompletion.callback(),
+                                                    replacementCandidate,
+                                                    Muxer::PacketCarrierGuard{&epoch, 2}),
+                                      std::memory_order_release);
+        }
+        av_packet_free(&replacement);
+    };
+
+    AVPacket* stale = makePacket(1);
+    QVERIFY(stale != nullptr);
+    QVERIFY(m.writePacket(stale, staleCompletion.callback(), QString(),
+                          Muxer::PacketCarrierGuard{&epoch, 1}));
+    av_packet_free(&stale);
+    m.close();
+
+    QVERIFY(replacementAccepted.load(std::memory_order_acquire));
+    QCOMPARE(staleCompletion.written.load(std::memory_order_acquire), 0);
+    QCOMPARE(staleCompletion.rejected.load(std::memory_order_acquire), 1);
+    QCOMPARE(replacementCompletion.written.load(std::memory_order_acquire), 1);
+    QCOMPARE(replacementCompletion.rejected.load(std::memory_order_acquire), 0);
+
+    AVFormatContext* ctx = nullptr;
+    const QByteArray path = videoPathFor(baseName).toUtf8();
+    QVERIFY(avformat_open_input(&ctx, path.constData(), nullptr, nullptr) >= 0);
+    const auto closeInput = qScopeGuard([&ctx] { avformat_close_input(&ctx); });
+    QVERIFY(avformat_find_stream_info(ctx, nullptr) >= 0);
+    AVDictionaryEntry* tag = av_dict_get(ctx->metadata, "timecode", nullptr, 0);
+    QVERIFY(tag != nullptr);
+    QCOMPARE(QString::fromUtf8(tag->value), replacementCandidate);
 }
 
 void TestMuxer::replacementCandidateAcceptedDuringTentativeCloseSurvivesAbort() {

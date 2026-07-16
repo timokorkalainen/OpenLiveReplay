@@ -489,9 +489,11 @@ bool Muxer::writePacketBatch(const PacketWriteRequest* packets, size_t packetCou
     // also the queue append, so the first accepted valid candidate wins in the
     // same order that concurrent producers enter the writer queue.
     size_t candidateCount = 0;
-    const bool candidateAdmissionOpen =
-        m_candidateWindowState == CandidateWindowState::Open ||
-        m_candidateWindowState == CandidateWindowState::TentativeCandidate;
+    // A candidate arriving after an empty boundary is ordered after that
+    // tentative selection: it cannot affect a successful header commit, but it
+    // must remain queued in case the boundary packet becomes stale and the
+    // header attempt is retried.
+    const bool candidateAdmissionOpen = m_candidateWindowState != CandidateWindowState::Committed;
     if (candidateAdmissionOpen) {
         for (size_t i = 0; i < packetCount; ++i) {
             if (isWellFormedTimecode(packets[i].startTimecodeCandidate)) ++candidateCount;
@@ -858,6 +860,7 @@ void Muxer::writerLoop() {
             if (headerStatus == HeaderCommitStatus::Written) {
                 m_candidateWindowState = CandidateWindowState::Committed;
                 m_acceptedStartTimecodeCandidates.clear();
+                m_acceptedStartTimecodeCandidate.clear();
             }
         }
         m_qCv.notify_one();
