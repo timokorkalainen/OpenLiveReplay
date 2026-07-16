@@ -40,9 +40,17 @@ struct DecodedFrameEvidence {
 
 class DecodedFrameEvidenceQueue {
 public:
+    struct Match {
+        uint64_t submissionId = 0;
+        uint64_t carrierSessionIdentity = 0;
+        uint64_t carrierGeneration = 0;
+    };
+
     explicit DecodedFrameEvidenceQueue(qsizetype maximumEntries = 64);
 
     uint64_t enqueue(DecodedFrameEvidence evidence);
+    std::optional<Match> findForOutputPts(qint64 outputPts90k) const;
+    std::optional<DecodedFrameEvidence> takeBySubmissionId(uint64_t submissionId);
     std::optional<DecodedFrameEvidence> takeForOutputPts(qint64 outputPts90k);
     bool discard(uint64_t submissionId);
     void clear();

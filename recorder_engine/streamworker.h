@@ -320,6 +320,7 @@ private:
                                                         const FrameMetadata& metadata);
     bool ensureGpuEncodePumpStarted();
     bool preferGpuVideoFramesForIngest() const;
+    bool tryLatchGpuEncodeCpuFallback(const SourceCarrierToken& failureCarrier);
     void latchGpuEncodeCpuFallback();
 #endif
     static constexpr size_t kSubmissionPoolCapacity = Muxer::kMaxQueuedPackets + 2;
@@ -451,8 +452,13 @@ private:
         auto hook = std::move(m_beforeMuxEvidenceSubmissionForTest);
         if (hook) hook();
     }
+    void runBeforeGpuFallbackTryForTest() {
+        auto hook = std::move(m_beforeGpuFallbackTryForTest);
+        if (hook) hook();
+    }
     std::function<void()> m_beforeMuxPacketWriteForTest;
     std::function<void()> m_beforeMuxEvidenceSubmissionForTest;
+    std::function<void()> m_beforeGpuFallbackTryForTest;
 #endif
     mutable std::mutex m_muxFrameEvidenceMutex;
     DecodedFrameEvidenceQueue m_muxFrameEvidence{64};

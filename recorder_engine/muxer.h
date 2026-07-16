@@ -324,6 +324,7 @@ private:
     friend class TestStreamWorkerGpuEncode;
     std::function<void()> m_afterCandidateSnapshotForTest;
     std::function<void()> m_beforeCandidatePublicationForTest;
+    std::function<void()> m_afterCandidatePublicationForTest;
 #endif
 };
 

@@ -197,6 +197,9 @@ private slots:
     void callbackDescriptorsAndSlotLifecycleAllocateNothing();
     void nativeFailureAfterPacketDoesNotWritePartialOutput();
     void nativeTwoPacketBatchRejectsBeforePartialCommit();
+    void nativeMultiPtsBatchConsumesEveryDistinctEvidenceMapping();
+    void nativeDuplicatePtsBatchSharesOneEvidenceMapping();
+    void nativeMultiPtsBatchMissingEvidenceConsumesNothingAndCommitsNothing();
     void boundedDriftReportsNonzeroUiBound();
     void overConfidenceTimecodeDoesNotMoveServo();
     void disconnectClearsTimecodeAnchor();
@@ -1358,6 +1361,117 @@ void TestReplayManagerTimecode::nativeTwoPacketBatchRejectsBeforePartialCommit()
         worker.releaseMuxCompletionReservation(id);
     av_frame_free(&worker.m_latestFrame);
     muxer.close();
+}
+
+void TestReplayManagerTimecode::nativeMultiPtsBatchConsumesEveryDistinctEvidenceMapping() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-native-multi-pts"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const auto closeMuxer = qScopeGuard([&muxer] { muxer.close(); });
+    const uint64_t session = worker.beginCaptureSession();
+    const auto token = worker.snapshotCarrierTokenForSession(session);
+    QVERIFY(token);
+    const TimecodeEvidence previous = evidence(tcFrames(1, 0, 0, 0), 10, 30, 1, 7, 11);
+    const TimecodeEvidence current = evidence(tcFrames(1, 0, 0, 1), 11, 30, 1, 7, 11);
+    const auto previousMapping = worker.enqueueMuxFrameEvidence(10, 100, previous, token);
+    const auto currentMapping = worker.enqueueMuxFrameEvidence(11, 200, current, token);
+    QVERIFY(previousMapping.id != 0);
+    QVERIFY(currentMapping.id != 0);
+    bool havePacket = false;
+    const uint64_t submission = worker.acquireEncodeSubmission(
+        false, 0, muxer.getStream(0), &havePacket, *token, currentMapping.id);
+    QVERIFY(submission != 0);
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int, uint64_t, TimecodeEvidence value) { delivered.append(value); },
+        Qt::QueuedConnection));
+    worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100113"), 10, true);
+    worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100114"), 11, true);
+    worker.commitBufferedEncodeSubmission(submission);
+
+    QTRY_COMPARE_WITH_TIMEOUT(delivered.size(), 2, 2000);
+    QCOMPARE(delivered[0].arrivalSessionFrame, int64_t(10));
+    QCOMPARE(delivered[1].arrivalSessionFrame, int64_t(11));
+    QCOMPARE(worker.m_muxFrameEvidence.size(), qsizetype(0));
+    QVERIFY(havePacket);
+}
+
+void TestReplayManagerTimecode::nativeDuplicatePtsBatchSharesOneEvidenceMapping() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-native-duplicate-pts"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const auto closeMuxer = qScopeGuard([&muxer] { muxer.close(); });
+    const uint64_t session = worker.beginCaptureSession();
+    const auto token = worker.snapshotCarrierTokenForSession(session);
+    QVERIFY(token);
+    const TimecodeEvidence value = evidence(tcFrames(1, 0, 0, 2), 20, 30, 1, 7, 11);
+    const auto mapping = worker.enqueueMuxFrameEvidence(20, 300, value, token);
+    QVERIFY(mapping.id != 0);
+    bool havePacket = false;
+    const uint64_t submission = worker.acquireEncodeSubmission(false, 0, muxer.getStream(0),
+                                                               &havePacket, *token, mapping.id);
+    QVERIFY(submission != 0);
+
+    QList<TimecodeEvidence> delivered;
+    QVERIFY(QObject::connect(
+        &worker, &StreamWorker::frameTimecode, this,
+        [&delivered](int, uint64_t, TimecodeEvidence observed) { delivered.append(observed); },
+        Qt::QueuedConnection));
+    worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100113"), 20, true);
+    worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100114"), 20, false);
+    worker.commitBufferedEncodeSubmission(submission);
+
+    QTRY_COMPARE_WITH_TIMEOUT(delivered.size(), 1, 2000);
+    QCOMPARE(delivered.front().arrivalSessionFrame, int64_t(20));
+    QCOMPARE(worker.m_muxFrameEvidence.size(), qsizetype(0));
+    QVERIFY(havePacket);
+}
+
+void TestReplayManagerTimecode::
+    nativeMultiPtsBatchMissingEvidenceConsumesNothingAndCommitsNothing() {
+    QTemporaryDir output;
+    QVERIFY(output.isValid());
+    Muxer muxer;
+    muxer.setOutputDirectory(output.path());
+    QVERIFY(muxer.init(QStringLiteral("timecode-native-missing-batch-evidence"), 1, 64, 64, 30,
+                       {QStringLiteral("Program")}, 48000, 2));
+    StreamWorker worker(QString(), 0, &muxer, nullptr, 64, 64, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    const auto closeMuxer = qScopeGuard([&muxer] { muxer.close(); });
+    const uint64_t session = worker.beginCaptureSession();
+    const auto token = worker.snapshotCarrierTokenForSession(session);
+    QVERIFY(token);
+    const TimecodeEvidence value = evidence(tcFrames(1, 0, 0, 3), 30, 30, 1, 7, 11);
+    const auto mapping = worker.enqueueMuxFrameEvidence(30, 400, value, token);
+    QVERIFY(mapping.id != 0);
+    bool havePacket = false;
+    const uint64_t submission = worker.acquireEncodeSubmission(false, 0, muxer.getStream(0),
+                                                               &havePacket, *token, mapping.id);
+    QVERIFY(submission != 0);
+
+    worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100113"), 30, true);
+    worker.bufferEncodedPacket(submission, QByteArray::fromHex("000001b300100114"), 31, true);
+    worker.commitBufferedEncodeSubmission(submission);
+
+    QCOMPARE(worker.m_muxFrameEvidence.size(), qsizetype(1));
+    const auto preserved = worker.takeMuxFrameEvidence(30, *token);
+    QVERIFY(preserved.has_value());
+    QCOMPARE(preserved->sourceTimecode100ns, int64_t(400));
+    QVERIFY(!havePacket);
+    QTest::qWait(100);
+    QCOMPARE(muxer.minWrittenVideoPtsMs(), int64_t(-1));
 }
 
 void TestReplayManagerTimecode::boundedDriftReportsNonzeroUiBound() {

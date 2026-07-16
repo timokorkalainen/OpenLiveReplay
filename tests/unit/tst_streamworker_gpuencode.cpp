@@ -262,6 +262,8 @@ private slots:
     void delayedGpuOutputAfterFallbackDropsOldEvidence();
     void resetBetweenLatestValidationAndGpuSubmissionRejectsFrame();
     void delayedOldSessionGpuFailureDoesNotLatchFallback();
+    void resetBetweenFallbackCheckAndLatchCannotDisableReplacementCarrier();
+    void concurrentFallbackRacersLatchAndRotateExactlyOnce();
     void gpuTwoPacketBatchRejectsBeforePartialCommit();
     void gpuEncodeFallbackDisablesGpuFrameIngestPreference();
     void gpuFallbackRotatesTokenButRetainsLiveSession();
@@ -683,6 +685,63 @@ void TestStreamWorkerGpuEncode::delayedOldSessionGpuFailureDoesNotLatchFallback(
     QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
     QCOMPARE(worker.currentCarrierEpoch(), replacementEpoch);
     worker.m_gpuEncodePump->stop();
+}
+
+void TestStreamWorkerGpuEncode::resetBetweenFallbackCheckAndLatchCannotDisableReplacementCarrier() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.beginCaptureSession();
+    const auto failureCarrier = worker.snapshotActiveCarrierToken();
+    QVERIFY(failureCarrier);
+    const uint64_t submissionId =
+        worker.acquireEncodeSubmission(true, 0, nullptr, nullptr, *failureCarrier, 0);
+    QVERIFY(submissionId != 0);
+    const uint64_t epochBeforeReset = worker.currentCarrierEpoch();
+
+    worker.m_beforeGpuFallbackTryForTest = [&worker] { worker.rotateCarrier(true); };
+    worker.failEncodeSubmission(submissionId);
+
+    QVERIFY(!worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+    QCOMPARE(worker.currentCarrierEpoch(), epochBeforeReset + 1);
+}
+
+void TestStreamWorkerGpuEncode::concurrentFallbackRacersLatchAndRotateExactlyOnce() {
+    StreamWorker worker(QString(), 0, nullptr, nullptr, 16, 16, 30, 30, 1,
+                        VideoCodecChoice::H264Hardware);
+    worker.beginCaptureSession();
+    const auto failureCarrier = worker.snapshotActiveCarrierToken();
+    QVERIFY(failureCarrier);
+    const uint64_t epochBeforeFallback = worker.currentCarrierEpoch();
+
+    std::mutex gateMutex;
+    std::condition_variable gateCv;
+    int ready = 0;
+    bool race = false;
+    std::atomic<int> winners{0};
+    auto racer = [&] {
+        {
+            std::unique_lock<std::mutex> lock(gateMutex);
+            ++ready;
+            gateCv.notify_all();
+            gateCv.wait(lock, [&] { return race; });
+        }
+        if (worker.tryLatchGpuEncodeCpuFallback(*failureCarrier))
+            winners.fetch_add(1, std::memory_order_acq_rel);
+    };
+    std::thread first(racer);
+    std::thread second(racer);
+    {
+        std::unique_lock<std::mutex> lock(gateMutex);
+        QVERIFY(gateCv.wait_for(lock, std::chrono::seconds(1), [&] { return ready == 2; }));
+        race = true;
+    }
+    gateCv.notify_all();
+    first.join();
+    second.join();
+
+    QCOMPARE(winners.load(std::memory_order_acquire), 1);
+    QVERIFY(worker.m_gpuEncodeCpuFallback.load(std::memory_order_acquire));
+    QCOMPARE(worker.currentCarrierEpoch(), epochBeforeFallback + 1);
 }
 
 void TestStreamWorkerGpuEncode::gpuTwoPacketBatchRejectsBeforePartialCommit() {

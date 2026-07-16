@@ -580,6 +580,10 @@ void Muxer::writerLoop() {
     for (;;) {
         QueuedPacket queued;
         uint64_t packetSequence = 0;
+        QString boundaryCandidate;
+        PacketCarrierGuard boundaryCandidateGuard;
+        uint64_t boundaryCandidateSequence = 0;
+        uint64_t boundaryCandidateGeneration = 0;
         {
             std::unique_lock<std::mutex> lk(m_qMutex);
             // Wait for work, or for shutdown. Keep draining while the queue is
@@ -721,16 +725,65 @@ void Muxer::writerLoop() {
                 continue;
             }
             m_startTimecodeCandidateWindowClosed = true;
-            queued = std::move(m_pktQueue.front());
-            m_pktQueue.pop();
+            boundaryCandidate = finalAcceptedCandidate;
+            boundaryCandidateGuard = finalCandidateGuard;
+            boundaryCandidateSequence = finalCandidateSequence;
+            boundaryCandidateGeneration = candidateWindowGeneration;
             lk.unlock();
         }
-        // Notify a possibly back-pressured producer that there is now room.
+#ifdef OLR_UNIT_TEST
+        auto afterPublicationHook = std::move(m_afterCandidatePublicationForTest);
+        if (afterPublicationHook) afterPublicationHook();
+#endif
+
+        // Publication and the queue pop are not the commit boundary. A reset can
+        // independently stale the packet carrier or the accepted candidate while
+        // the header mutex is released. Revalidate both here, immediately before
+        // ensureHeaderWritten() can make either irreversible.
+        const bool candidateCarrierCurrent =
+            boundaryCandidate.isEmpty() || boundaryCandidateGuard.accepts();
+        if (!candidateCarrierCurrent) {
+            // Undo only the exact publication selected above. A configured or
+            // replacement candidate has a different publication id and survives.
+            undoStartTimecodeCandidatePublication(boundaryCandidate, boundaryCandidateSequence);
+            {
+                std::lock_guard<std::mutex> queueLock(m_qMutex);
+                if (m_candidateWindowGeneration == boundaryCandidateGeneration &&
+                    !m_acceptedStartTimecodeCandidates.empty() &&
+                    m_acceptedStartTimecodeCandidates.front().sequence ==
+                        boundaryCandidateSequence) {
+                    m_acceptedStartTimecodeCandidates.pop_front();
+                }
+                m_acceptedStartTimecodeCandidate =
+                    m_acceptedStartTimecodeCandidates.empty()
+                        ? QString()
+                        : m_acceptedStartTimecodeCandidates.front().value;
+                m_startTimecodeCandidateWindowClosed = false;
+                ++m_candidateWindowGeneration;
+                if (m_candidateWindowGeneration == 0) m_candidateWindowGeneration = 1;
+                if (!m_pktQueue.empty() && m_pktQueue.front().sequence == packetSequence &&
+                    !m_pktQueue.front().carrierGuard.accepts()) {
+                    queued = std::move(m_pktQueue.front());
+                    m_pktQueue.pop();
+                }
+            }
+            if (queued.pkt) {
+                m_qCv.notify_one();
+                if (queued.onWritten) queued.onWritten(false);
+                av_packet_free(&queued.pkt);
+            }
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> queueLock(m_qMutex);
+            if (m_pktQueue.empty() || m_pktQueue.front().sequence != packetSequence) continue;
+            queued = std::move(m_pktQueue.front());
+            m_pktQueue.pop();
+        }
         m_qCv.notify_one();
 
-        // A reset can occur after queue acceptance while the writer is waiting
-        // for header grace or disk. Revalidate at the writer boundary so stale
-        // pixels and their completion cannot cross the reset barrier.
+        // Revalidate the exact popped guard at the final irreversible boundary.
         if (!queued.carrierGuard.accepts()) {
             if (queued.onWritten) queued.onWritten(false);
             av_packet_free(&queued.pkt);
