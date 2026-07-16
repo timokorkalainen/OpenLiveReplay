@@ -132,6 +132,17 @@ exactly 64 lowercase hexadecimal characters. These structural checks happen
 before a descriptor enters canonical JSON; Task 3 then verifies that the held
 stream still matches every descriptor field.
 
+Held final paths are canonical cache identities, not arbitrary Windows path
+spellings. Extended/device/NT namespace inputs (`\\?\`, `\\.\`, `\??\`,
+and equivalent variants) are rejected at the key boundary. After an ordinary
+drive or UNC anchor, every component—including UNC server and share—passes the
+same strict Win32 component rules as a destination, rejecting parent/dot
+components, trailing dot/space, ADS/colon, forbidden/control characters, and
+all reserved DOS/console/superscript device names. The key stores the
+Windows ordinal-normalized drive/UNC path, so case-only final-path spelling
+changes share one identity. Verified actual spelling may be retained only as
+separate manifest source metadata.
+
 JSON strings and mapping keys are recursively scanned for Unicode surrogate
 code points. Lone high or low surrogates are rejected with a located
 `RuntimeError` before `ensure_ascii=False` output is encoded as UTF-8.
@@ -174,10 +185,11 @@ CTest graph files, and launcher-owned `qt.conf` without circular content keys.
 Publication follows this sequence:
 
 1. Validate the strict layout name and every ordered destination pair, snapshot
-   JSON inputs, hold and hash all sources, revalidate every stream's final
-   path/filesystem identity/size/SHA-256 against its descriptor, validate
-   limits, and compute the object key before creating or changing cache
-   filesystem state.
+   JSON inputs, hold and hash all sources, strip only the resolver's recognized
+   final-path prefix, validate and ordinal-normalize that canonical drive/UNC
+   path, and revalidate every stream's canonical path/filesystem identity/size/
+   SHA-256 against its descriptor. Then validate limits and compute the object
+   key before creating or changing cache filesystem state.
 2. If `objects/<key>` exists, hold and fully validate it.
 3. Otherwise create a unique `staging/<uuid>` tree, apply the build ACL, create
    directories, copy held sources, render generated entries for the final

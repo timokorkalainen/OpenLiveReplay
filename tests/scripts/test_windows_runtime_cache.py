@@ -341,6 +341,33 @@ class CacheKeyTests(unittest.TestCase):
             replace(source, final_path=Path("relative/tool.exe")),
             replace(source, final_path=Path("C:relative\\tool.exe")),
             replace(source, final_path=Path("/rooted/tool.exe")),
+            replace(source, final_path=Path("C:/held/../tool.exe")),
+            replace(source, final_path=Path("C:/held/component./tool.exe")),
+            replace(source, final_path=Path("C:/held/component /tool.exe")),
+            replace(source, final_path=Path("C:/held/name:stream")),
+            replace(source, final_path=Path("C:/held/bad<name/tool.exe")),
+            replace(source, final_path=Path("C:/held/\x01name/tool.exe")),
+            replace(source, final_path=Path("C:/held/AUX.txt/tool.exe")),
+            replace(source, final_path=Path("C:/held/CONIN$.txt/tool.exe")),
+            replace(source, final_path=Path("C:/held/COM¹.txt/tool.exe")),
+            replace(source, final_path=Path(r"\\?\C:\held\tool.exe")),
+            replace(
+                source,
+                final_path=Path(r"\\?\UNC\server\share\tool.exe"),
+            ),
+            replace(source, final_path=Path(r"\\.\C:\held\tool.exe")),
+            replace(source, final_path=Path(r"\??\C:\held\tool.exe")),
+            replace(source, final_path=Path(r"\\??\C:\held\tool.exe")),
+            replace(
+                source,
+                final_path=Path(r"\Device\HarddiskVolume1\tool.exe"),
+            ),
+            replace(
+                source,
+                final_path=Path(r"\\Device\HarddiskVolume1\tool.exe"),
+            ),
+            replace(source, final_path=Path("//CON/share/tool.exe")),
+            replace(source, final_path=Path("//server/AUX/tool.exe")),
             replace(source, device=True),
             replace(source, device=-1),
             replace(source, inode=False),
@@ -359,11 +386,31 @@ class CacheKeyTests(unittest.TestCase):
                         "tool", ((Path("tool.exe"), descriptor),), {}, ()
                     )
 
-        unc = replace(source, final_path=Path("//server/share/tool.exe"))
-        key, _key_input = layout_key(
-            "tool", ((Path("tool.exe"), unc),), {}, ()
+        drive_upper = replace(source, final_path=Path("C:/Held/Tool.exe"))
+        drive_lower = replace(source, final_path=Path("c:/held/tool.exe"))
+        drive_upper_key, drive_upper_input = layout_key(
+            "tool", ((Path("tool.exe"), drive_upper),), {}, ()
         )
-        self.assertEqual(len(key), 64)
+        drive_lower_key, drive_lower_input = layout_key(
+            "tool", ((Path("tool.exe"), drive_lower),), {}, ()
+        )
+        self.assertEqual(drive_upper_key, drive_lower_key)
+        self.assertEqual(drive_upper_input, drive_lower_input)
+
+        unc_upper = replace(
+            source, final_path=Path("//Server/Share$/Held/Tool.exe")
+        )
+        unc_lower = replace(
+            source, final_path=Path("//server/share$/held/tool.exe")
+        )
+        unc_upper_key, unc_upper_input = layout_key(
+            "tool", ((Path("tool.exe"), unc_upper),), {}, ()
+        )
+        unc_lower_key, unc_lower_input = layout_key(
+            "tool", ((Path("tool.exe"), unc_lower),), {}, ()
+        )
+        self.assertEqual(unc_upper_key, unc_lower_key)
+        self.assertEqual(unc_upper_input, unc_lower_input)
 
     def test_layout_key_rejects_invalid_generated_policy(self) -> None:
         for policy in ("", 7, object()):

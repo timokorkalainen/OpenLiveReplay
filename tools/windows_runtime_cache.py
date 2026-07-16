@@ -169,6 +169,14 @@ _RESERVED_DOS_BASENAME = re.compile(
     r"COM[1-9¹²³]|LPT[1-9¹²³])$"
 )
 _LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_FORBIDDEN_FINAL_PATH_PREFIXES = (
+    "\\\\?\\",
+    "\\\\.\\",
+    "\\??\\",
+    "\\\\??\\",
+    "\\device\\",
+    "\\\\device\\",
+)
 
 
 def _validate_win32_component(component: object, *, label: str) -> str:
@@ -204,15 +212,57 @@ def _normalized_destination(destination: Path) -> str:
     )
 
 
+def _normalized_held_final_path(value: object) -> str:
+    if not isinstance(value, Path):
+        raise RuntimeError("invalid held source final_path: expected Path")
+
+    raw_path = str(value).replace("/", "\\")
+    normalized_raw_path = ntpath.normcase(raw_path)
+    if normalized_raw_path.startswith(_FORBIDDEN_FINAL_PATH_PREFIXES):
+        raise RuntimeError("invalid held source final_path: namespace prefix")
+
+    final_path = PureWindowsPath(raw_path)
+    if not final_path.is_absolute() or final_path.root != "\\":
+        raise RuntimeError(
+            "invalid held source final_path: expected drive-rooted or UNC path"
+        )
+
+    def validated_component(component: str) -> str:
+        try:
+            return _validate_win32_component(
+                component, label="held source final_path component"
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"invalid held source final_path component: {error}"
+            ) from None
+
+    drive = final_path.drive
+    if re.fullmatch(r"[A-Za-z]:", drive):
+        normalized_anchor = ntpath.normcase(drive)
+    elif drive.startswith("\\\\"):
+        unc_parts = drive[2:].split("\\")
+        if len(unc_parts) != 2:
+            raise RuntimeError("invalid held source final_path: malformed UNC anchor")
+        server, share = (
+            validated_component(component) for component in unc_parts
+        )
+        normalized_anchor = f"//{server}/{share}"
+    else:
+        raise RuntimeError("invalid held source final_path: unsupported anchor")
+
+    components = final_path.parts[1:]
+    if not components:
+        raise RuntimeError("invalid held source final_path: missing file component")
+    normalized_components = [
+        validated_component(component) for component in components
+    ]
+    return f"{normalized_anchor}/{'/'.join(normalized_components)}"
+
+
 def _entry_key_input(entry: LayoutEntry) -> dict[str, object]:
     if isinstance(entry, HeldSource):
-        if not isinstance(entry.final_path, Path):
-            raise RuntimeError("invalid held source final_path: expected Path")
-        final_path = PureWindowsPath(entry.final_path)
-        if not final_path.is_absolute():
-            raise RuntimeError(
-                "invalid held source final_path: expected drive-rooted or UNC path"
-            )
+        final_path = _normalized_held_final_path(entry.final_path)
         for field_name in ("device", "inode", "size"):
             value = getattr(entry, field_name)
             if type(value) is not int or value < 0:
@@ -227,7 +277,7 @@ def _entry_key_input(entry: LayoutEntry) -> dict[str, object]:
             )
         return {
             "kind": "held-source",
-            "final_path": final_path.as_posix(),
+            "final_path": final_path,
             "device": entry.device,
             "inode": entry.inode,
             "size": entry.size,
