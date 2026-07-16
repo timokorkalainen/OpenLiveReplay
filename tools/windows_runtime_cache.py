@@ -595,6 +595,24 @@ def _absolute_lexical(path: Path) -> Path:
     return Path(os.path.abspath(str(path)))
 
 
+def _windows_api_path(path: Path) -> str:
+    """Return an absolute Win32 path that remains valid past MAX_PATH."""
+    value = str(_absolute_lexical(path))
+    if (
+        os.name != "nt"
+        or value.startswith("\\\\?\\")
+        or len(value) < 248
+    ):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+def _scandir(path: Path) -> os.ScandirIterator[str]:
+    return os.scandir(_windows_api_path(path))
+
+
 def _path_identity(path: Path) -> str:
     return ntpath.normcase(ntpath.normpath(str(path)))
 
@@ -643,7 +661,7 @@ def _open_canonical_non_reparse(
 
     kernel32 = _kernel32()
     handle = kernel32.CreateFileW(
-        str(lexical),
+        _windows_api_path(lexical),
         desired_access,
         share_mode,
         None,
@@ -692,7 +710,7 @@ def _open_non_reparse_under_held_tree(
     """Open a leaf whose canonical ancestor handles already prevent renames."""
     kernel32 = _kernel32()
     handle = kernel32.CreateFileW(
-        str(_absolute_lexical(path)),
+        _windows_api_path(path),
         desired_access,
         _FILE_SHARE_READ,
         None,
@@ -986,7 +1004,9 @@ def _create_directory_with_acl(path: Path, sid: str, sddl: str) -> bool:
         ctypes.sizeof(_SecurityAttributes), descriptor, False
     )
     try:
-        if kernel32.CreateDirectoryW(str(path), ctypes.byref(attributes)):
+        if kernel32.CreateDirectoryW(
+            _windows_api_path(path), ctypes.byref(attributes)
+        ):
             return True
         error = ctypes.get_last_error()
         if error in (_ERROR_FILE_EXISTS, _ERROR_ALREADY_EXISTS):
@@ -1074,10 +1094,10 @@ def _tree_entry_set(root: Path) -> set[tuple[str, bool]]:
     result: set[tuple[str, bool]] = set()
 
     def visit(directory: Path) -> None:
-        with os.scandir(directory) as scanned:
+        with _scandir(directory) as scanned:
             entries = sorted(scanned, key=lambda entry: entry.name.casefold())
         for entry in entries:
-            target = Path(entry.path)
+            target = directory / entry.name
             stat_result = entry.stat(follow_symlinks=False)
             if (
                 getattr(stat_result, "st_file_attributes", 0)
@@ -1128,11 +1148,11 @@ def _seal_tree_acl(path: Path, sid: str, mode: _AclMode = "RX") -> _SealedTree:
         node = _HeldTreeNode(target, owner, entry)
         nodes.append(node)
         if directory:
-            with os.scandir(target) as scanned:
+            with _scandir(target) as scanned:
                 entries = sorted(scanned, key=lambda entry: entry.name.casefold())
             for entry in entries:
                 stat_result = entry.stat(follow_symlinks=False)
-                child = Path(entry.path)
+                child = target / entry.name
                 if (
                     getattr(stat_result, "st_file_attributes", 0)
                     & _FILE_ATTRIBUTE_REPARSE_POINT
@@ -1237,10 +1257,10 @@ def _set_tree_acl(path: Path, sid: str, mode: _AclMode) -> None:
         )
         try:
             if directory:
-                with os.scandir(target) as scanned:
+                with _scandir(target) as scanned:
                     entries = sorted(scanned, key=lambda entry: entry.name.casefold())
                 for entry in entries:
-                    child = Path(entry.path)
+                    child = target / entry.name
                     stat_result = entry.stat(follow_symlinks=False)
                     if (
                         getattr(stat_result, "st_file_attributes", 0)
@@ -1277,7 +1297,7 @@ def _assert_mutation_denied(path: Path, *, directory: bool) -> None:
     flags = _FILE_FLAG_BACKUP_SEMANTICS if directory else 0
     for desired_access in desired_accesses:
         handle = kernel32.CreateFileW(
-            str(path),
+            _windows_api_path(path),
             desired_access,
             _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
             None,
@@ -1596,10 +1616,10 @@ def _enumerate_tree(root: Path) -> tuple[set[str], set[str]]:
     files: set[str] = set()
 
     def visit(directory: Path, relative_parent: str) -> None:
-        with os.scandir(directory) as scanned:
+        with _scandir(directory) as scanned:
             entries = sorted(scanned, key=lambda item: ntpath.normcase(item.name))
         for scanned_entry in entries:
-            target = Path(scanned_entry.path)
+            target = directory / scanned_entry.name
             stat_result = scanned_entry.stat(follow_symlinks=False)
             if (
                 getattr(stat_result, "st_file_attributes", 0)
@@ -1618,7 +1638,13 @@ def _enumerate_tree(root: Path) -> tuple[set[str], set[str]]:
                 visit(target, relative)
             elif scanned_entry.is_file(follow_symlinks=False):
                 link_count = int(
-                    getattr(os.stat(target, follow_symlinks=False), "st_nlink", 1)
+                    getattr(
+                        os.stat(
+                            _windows_api_path(target), follow_symlinks=False
+                        ),
+                        "st_nlink",
+                        1,
+                    )
                 )
                 if link_count != 1:
                     raise RuntimeError(f"cache object contains a file alias: {target}")
@@ -2256,13 +2282,13 @@ def _acquire_removal_guards(
                 _RemovalGuard(target, directory, control, delete, original_sddl)
             )
             if directory:
-                with os.scandir(target) as scanned:
+                with _scandir(target) as scanned:
                     entries = sorted(
                         scanned,
                         key=lambda entry: ntpath.normcase(entry.name),
                     )
                 for entry in entries:
-                    child = Path(entry.path)
+                    child = target / entry.name
                     stat_result = entry.stat(follow_symlinks=False)
                     if (
                         getattr(stat_result, "st_file_attributes", 0)
@@ -2441,10 +2467,10 @@ def _remove_old_namespace_entries(
     parent: Path,
     now: float,
 ) -> None:
-    with os.scandir(parent) as scanned:
+    with _scandir(parent) as scanned:
         entries = sorted(scanned, key=lambda entry: ntpath.normcase(entry.name))
     for entry in entries:
-        path = Path(entry.path)
+        path = parent / entry.name
         if not entry.is_dir(follow_symlinks=False):
             raise RuntimeError(f"invalid cache lifecycle entry: {path}")
         if now - entry.stat(follow_symlinks=False).st_mtime < cache.limits.staging_seconds:
@@ -2463,10 +2489,10 @@ def _cleanup_cache_contents(
 
     candidates: list[tuple[float, str, Path, Path, int]] = []
     total_bytes = 0
-    with os.scandir(cache.objects) as scanned:
+    with _scandir(cache.objects) as scanned:
         object_entries = sorted(scanned, key=lambda entry: ntpath.normcase(entry.name))
     for entry in object_entries:
-        object_root = Path(entry.path)
+        object_root = cache.objects / entry.name
         if not entry.is_dir(follow_symlinks=False):
             raise RuntimeError(f"invalid cache object entry: {object_root}")
         key = entry.name

@@ -735,7 +735,9 @@ def prepare_windows_runtime(
                 if needs_project_qml
                 else ()
             )
-            plugin_files = qt_plugin_closure(qt_plugins, plugin_families)
+            plugin_files = qt_plugin_closure(
+                qt_plugins, plugin_families, lease=lease
+            )
             plugin_entries: dict[Path, Path | bytes] = {
                 path.relative_to(qt_plugins): path for path in plugin_files
             }

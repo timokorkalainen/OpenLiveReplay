@@ -689,6 +689,42 @@ class WindowsFilesystemTests(unittest.TestCase):
             lambda path: (object(), path),
         )
 
+    def test_exact_tree_enumeration_supports_extended_length_paths(self) -> None:
+        tree = self.root / "long-tree"
+        tree.mkdir()
+        segments = tuple(
+            f"segment-{index:02d}-" + "x" * 24 for index in range(8)
+        )
+        created_directories: list[Path] = []
+        leaf = tree
+        for segment in segments:
+            leaf /= segment
+            os.mkdir("\\\\?\\" + str(leaf))
+            created_directories.append(leaf)
+        payload = leaf / "payload.bin"
+        with open("\\\\?\\" + str(payload), "wb") as stream:
+            stream.write(b"payload")
+
+        def remove_long_tree() -> None:
+            try:
+                os.unlink("\\\\?\\" + str(payload))
+            except FileNotFoundError:
+                pass
+            for directory in reversed(created_directories):
+                try:
+                    os.rmdir("\\\\?\\" + str(directory))
+                except FileNotFoundError:
+                    pass
+
+        self.assertGreater(len(str(payload)), 260)
+        try:
+            directories, files = runtime_cache._enumerate_tree(tree)
+
+            self.assertIn(payload.relative_to(tree).as_posix(), files)
+            self.assertIn(leaf.relative_to(tree).as_posix(), directories)
+        finally:
+            remove_long_tree()
+
     def test_win32_api_bindings_are_initialized_once(self) -> None:
         runtime_cache._kernel32.cache_clear()
         runtime_cache._advapi32.cache_clear()

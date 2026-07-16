@@ -1212,22 +1212,77 @@ def qt_plugin_closure(
     ),
     *,
     platforms: tuple[str, ...] = ("qoffscreen.dll",),
+    lease: RuntimeAuditLease | None = None,
 ) -> tuple[Path, ...]:
     """Select the explicit plugin families used by the headless/app launchers."""
+    if os.name == "nt" and lease is None:
+        raise RuntimeError("Qt plugin closure requires a runtime audit lease")
+    lexical_plugins = Path(os.path.abspath(qt_plugins))
+    qt_plugins = (
+        lease.canonical_directory(lexical_plugins)
+        if lease is not None
+        else lexical_plugins.resolve()
+    )
+
+    def held_directory(path: Path) -> Path:
+        lexical = Path(os.path.abspath(path))
+        canonical = (
+            lease.canonical_directory(lexical)
+            if lease is not None
+            else lexical.resolve()
+        )
+        if (
+            not canonical.is_relative_to(qt_plugins)
+            or os.path.normcase(str(lexical))
+            != os.path.normcase(str(canonical))
+        ):
+            raise RuntimeError(
+                f"Qt plugin closure contains a reparse alias: {lexical} -> {canonical}"
+            )
+        return canonical
+
+    def held_file(path: Path) -> Path:
+        lexical = Path(os.path.abspath(path))
+        canonical = (
+            lease.canonical_file(lexical)
+            if lease is not None
+            else lexical.resolve()
+        )
+        if (
+            not canonical.is_relative_to(qt_plugins)
+            or os.path.normcase(str(lexical))
+            != os.path.normcase(str(canonical))
+        ):
+            raise RuntimeError(
+                f"Qt plugin closure contains a reparse alias: {lexical} -> {canonical}"
+            )
+        return canonical
+
     selected: set[Path] = set()
     for platform_name in platforms:
         platform = qt_plugins / "platforms" / platform_name
         if platform.is_file():
-            selected.add(platform.resolve())
+            selected.add(held_file(platform))
     for family in families:
         directory = qt_plugins / family
         if not directory.is_dir():
             continue
-        selected.update(
-            child.resolve()
-            for child in directory.iterdir()
-            if child.is_file() and child.suffix.casefold() == ".dll"
-        )
+        directory = held_directory(directory)
+        with os.scandir(directory) as scanned:
+            entries = tuple(scanned)
+        for entry in entries:
+            stat_result = entry.stat(follow_symlinks=False)
+            if (
+                getattr(stat_result, "st_file_attributes", 0)
+                & _FILE_ATTRIBUTE_REPARSE_POINT
+            ):
+                raise RuntimeError(
+                    f"Qt plugin closure contains a reparse alias: {entry.path}"
+                )
+            if entry.is_file(follow_symlinks=False) and Path(
+                entry.name
+            ).suffix.casefold() == ".dll":
+                selected.add(held_file(Path(entry.path)))
     return tuple(sorted(selected, key=lambda path: str(path).casefold()))
 
 

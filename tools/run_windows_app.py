@@ -158,6 +158,7 @@ def prepare_windows_app_runtime(
             plugin_files = runtime_guard.qt_plugin_closure(
                 qt_plugins,
                 platforms=("qwindows.dll", "qoffscreen.dll"),
+                lease=lease,
             )
             plugin_entries: dict[Path, Path | bytes] = {
                 path.relative_to(qt_plugins): path for path in plugin_files

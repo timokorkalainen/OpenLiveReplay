@@ -1081,7 +1081,10 @@ class RunCtestTests(unittest.TestCase):
         for path in (offscreen, jpeg, designer):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(path.name.encode())
-        plugin_files = windows_runtime_guard.qt_plugin_closure(plugins)
+        with RuntimeAuditLease() as lease:
+            plugin_files = windows_runtime_guard.qt_plugin_closure(
+                plugins, lease=lease
+            )
         self.assertIn(offscreen.resolve(), plugin_files)
         self.assertIn(jpeg.resolve(), plugin_files)
         self.assertNotIn(designer.resolve(), plugin_files)
@@ -1111,6 +1114,28 @@ class RunCtestTests(unittest.TestCase):
         self.assertIn((qtqml / "qmldir").resolve(), qml_files)
         self.assertFalse(any(path.is_relative_to(unused) for path in qml_files))
         self.assertLess(len(qml_files), 8)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows junctions")
+    def test_plugin_closure_holds_family_against_junction_retarget(self) -> None:
+        plugins = self.root / "plugin-race"
+        family = plugins / "imageformats"
+        family.mkdir(parents=True)
+        original_family = plugins / "imageformats-original"
+        external = self.root / "plugin-race-external"
+        external.mkdir()
+        (external / "qpoison.dll").write_bytes(b"poison")
+
+        with RuntimeAuditLease() as lease:
+            lease.hold_dll_tree(plugins)
+            family.rename(original_family)
+            self.make_junction(family, external)
+            with self.assertRaisesRegex(RuntimeError, "reparse alias"):
+                windows_runtime_guard.qt_plugin_closure(
+                    plugins,
+                    ("imageformats",),
+                    platforms=(),
+                    lease=lease,
+                )
 
     def test_qml_closure_keeps_module_assets_but_not_optional_imports(self) -> None:
         source = self.root / "qml-assets-source"
@@ -1315,7 +1340,10 @@ class RunCtestTests(unittest.TestCase):
         qt = candidates[-1]
         project_source = Path(__file__).resolve().parents[2]
         started = time.perf_counter()
-        plugins = windows_runtime_guard.qt_plugin_closure(qt / "plugins")
+        with RuntimeAuditLease() as lease:
+            plugins = windows_runtime_guard.qt_plugin_closure(
+                qt / "plugins", lease=lease
+            )
         with RuntimeAuditLease() as lease:
             qml = windows_runtime_guard.qt_qml_closure(
                 qt / "qml", (project_source,), lease=lease
@@ -1333,9 +1361,10 @@ class RunCtestTests(unittest.TestCase):
             (*plugins, *(path for path in qml if path.suffix.casefold() == ".dll")),
             (qt / "bin",),
         )
-        focused_plugins = windows_runtime_guard.qt_plugin_closure(
-            qt / "plugins", ()
-        )
+        with RuntimeAuditLease() as lease:
+            focused_plugins = windows_runtime_guard.qt_plugin_closure(
+                qt / "plugins", (), lease=lease
+            )
         focused_runtime = windows_runtime_guard.transitive_runtime_closure(
             focused_plugins, (qt / "bin",)
         )
