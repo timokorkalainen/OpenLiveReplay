@@ -100,8 +100,14 @@ strict Win32 naming rules before a key is returned or cache state can be
 mutated. Empty, parent, absolute, anchored, multi-component layout names,
 trailing-dot/space names, ASCII controls 0–31, `<>:"/\\|?*`, alternate data
 stream syntax, and DOS device basenames `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
-and `LPT1`–`LPT9` are rejected case-insensitively even when a device basename
-has an extension.
+`LPT1`–`LPT9`, `CONIN$`, `CONOUT$`, `CLOCK$`, and the Windows-recognized
+superscript forms `COM¹`–`COM³` and `LPT¹`–`LPT³` are rejected
+case-insensitively even when a device basename has an extension. The key uses
+the normalized layout name so case-only spelling changes share one identity;
+the requested spelling remains separate manifest metadata for publication. A
+hit accepts that stored spelling only when strict validation and
+`ntpath.normcase()` reproduce the requested normalized identity, and returns
+the stored-spelling layout path.
 
 Launcher context and every `GeneratedLayoutEntry.inputs` mapping are
 recursively validated and copied into a detached plain JSON tree before
@@ -110,6 +116,10 @@ are accepted; mappings must have string keys, tuples become JSON arrays, and
 unsupported objects, cycles, NaN, and infinities are rejected. The returned
 key input never retains caller-owned containers, so later caller mutation
 cannot change the meaning of an already returned key.
+
+Dependency object keys are copied, required to be strings, and sorted before
+keying. Generated-entry policy identifiers are required to be nonempty stable
+strings before either their inputs or renderer can participate in a key.
 
 Destination spelling is also retained in the manifest so the published layout
 preserves the requested case while still rejecting case-insensitive

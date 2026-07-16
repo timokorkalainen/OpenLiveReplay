@@ -170,6 +170,16 @@ class CacheKeyTests(unittest.TestCase):
             f"{prefix}{index}"
             for prefix in ("COM", "LPT")
             for index in range(1, 10)
+        ) + (
+            "CONIN$",
+            "CONOUT$",
+            "CLOCK$",
+            "COM¹",
+            "COM²",
+            "COM³",
+            "LPT¹",
+            "LPT²",
+            "LPT³",
         )
         unsafe = (
             Path("foo/foo."),
@@ -212,6 +222,14 @@ class CacheKeyTests(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaisesRegex(RuntimeError, "unsafe layout name"):
                     layout_key(name, ((Path("value"), b"x"),), {}, ())
+
+    def test_layout_key_normalizes_layout_name_identity_for_windows(self) -> None:
+        entries = ((Path("value"), b"x"),)
+        lower_key, lower_input = layout_key("tool", entries, {}, ())
+        upper_key, upper_input = layout_key("TOOL", entries, {}, ())
+        self.assertEqual(lower_key, upper_key)
+        self.assertEqual(lower_input["name"], "tool")
+        self.assertEqual(upper_input["name"], "tool")
 
     def test_layout_key_snapshots_nested_mapping_context_and_generated_inputs(self) -> None:
         nested_context = {"values": [1, {"enabled": True}]}
@@ -263,6 +281,24 @@ class CacheKeyTests(unittest.TestCase):
         cyclic.append(cyclic)
         with self.assertRaisesRegex(RuntimeError, "invalid JSON value"):
             layout_key("tool", ((Path("value"), b"x"),), {"cycle": cyclic}, ())
+
+    def test_layout_key_validates_and_snapshots_dependency_keys(self) -> None:
+        dependencies = ["b" * 64, "a" * 64]
+        key, key_input = layout_key(
+            "tool", ((Path("value"), b"x"),), {}, dependencies
+        )
+        dependencies.append("c" * 64)
+        self.assertEqual(len(key), 64)
+        self.assertEqual(key_input["dependency_keys"], ["a" * 64, "b" * 64])
+        with self.assertRaisesRegex(RuntimeError, "invalid dependency key"):
+            layout_key("tool", ((Path("value"), b"x"),), {}, (7,))
+
+    def test_layout_key_rejects_invalid_generated_policy(self) -> None:
+        for policy in ("", 7, object()):
+            with self.subTest(policy=policy):
+                entry = GeneratedLayoutEntry(policy, {}, lambda _root: b"x")
+                with self.assertRaisesRegex(RuntimeError, "invalid generated policy"):
+                    layout_key("tool", ((Path("value"), entry),), {}, ())
 
     def test_generated_entry_key_binds_policy_inputs_but_not_callable_identity(
         self,

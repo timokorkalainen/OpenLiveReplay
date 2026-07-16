@@ -154,7 +154,10 @@ def _json_mapping_snapshot(value: object, *, location: str) -> dict[str, object]
 
 
 _INVALID_WIN32_COMPONENT_CHARACTERS = frozenset('<>:"/\\|?*')
-_RESERVED_DOS_BASENAME = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$")
+_RESERVED_DOS_BASENAME = re.compile(
+    r"^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|"
+    r"COM[1-9¹²³]|LPT[1-9¹²³])$"
+)
 
 
 def _validate_win32_component(component: object, *, label: str) -> str:
@@ -207,9 +210,11 @@ def _entry_key_input(entry: LayoutEntry) -> dict[str, object]:
             "sha256": hashlib.sha256(entry).hexdigest(),
         }
     if isinstance(entry, GeneratedLayoutEntry):
+        if not isinstance(entry.policy, str) or not entry.policy:
+            raise RuntimeError("invalid generated policy: expected nonempty string")
         return {
             "kind": "generated",
-            "policy": entry.policy,
+            "policy": str(entry.policy),
             "inputs": _json_mapping_snapshot(
                 entry.inputs, location="generated entry inputs"
             ),
@@ -223,8 +228,14 @@ def layout_key(
     context: Mapping[str, JsonValue],
     dependency_keys: Sequence[str],
 ) -> tuple[str, dict[str, object]]:
-    _validate_win32_component(name, label="layout name")
+    normalized_name = _validate_win32_component(name, label="layout name")
     context_snapshot = _json_mapping_snapshot(context, location="context")
+    normalized_dependency_keys: list[str] = []
+    for dependency_key in dependency_keys:
+        if not isinstance(dependency_key, str):
+            raise RuntimeError("invalid dependency key: expected string")
+        normalized_dependency_keys.append(str(dependency_key))
+    normalized_dependency_keys.sort()
     normalized_entries: list[tuple[str, Path, LayoutEntry]] = []
     seen_destinations: set[str] = set()
     for destination, entry in entries:
@@ -249,9 +260,9 @@ def layout_key(
     key_input: dict[str, object] = {
         "schema": SCHEMA_VERSION,
         "closure_policy": CLOSURE_POLICY_VERSION,
-        "name": name,
+        "name": normalized_name,
         "context": context_snapshot,
-        "dependency_keys": sorted(dependency_keys),
+        "dependency_keys": normalized_dependency_keys,
         "entries": encoded_entries,
     }
     digest = hashlib.sha256(canonical_json(key_input)).hexdigest()
