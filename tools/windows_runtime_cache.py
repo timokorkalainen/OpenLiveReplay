@@ -1788,23 +1788,6 @@ def _stamp_is_fresh(path: Path, now: float, interval: int) -> bool:
         owner.close()
 
 
-def _validated_stamp_exists(path: Path) -> bool:
-    if not os.path.lexists(path):
-        return False
-    owner, _canonical = _open_canonical_non_reparse(
-        path,
-        path.parent,
-        desired_access=_FILE_READ_ATTRIBUTES,
-        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
-        directory=False,
-    )
-    try:
-        _assert_handle_still_names(owner.value, path)
-        return True
-    finally:
-        owner.close()
-
-
 def _write_stamp_no_replace(parent: Path, stamp: Path, now: float) -> None:
     temporary = parent / f".{stamp.name}.{uuid.uuid4()}.tmp"
     try:
@@ -2245,23 +2228,84 @@ def _rollback_published_object(
     _remove_stamp(cache.access / f"{key}.stamp")
 
 
+def _publication_marker_path(cache: WindowsRuntimeCache, key: str) -> Path:
+    if not _LOWER_SHA256.fullmatch(key):
+        raise RuntimeError(f"invalid cache publication key: {key}")
+    return cache.locks / f"publish-{key}"
+
+
+def _publication_marker_exists(cache: WindowsRuntimeCache, key: str) -> bool:
+    marker = _publication_marker_path(cache, key)
+    if not os.path.lexists(marker):
+        return False
+    try:
+        owner, _canonical = _open_canonical_non_reparse(
+            marker,
+            cache.locks,
+            desired_access=_FILE_READ_ATTRIBUTES,
+            share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            directory=True,
+        )
+    except FileNotFoundError:
+        return False
+    try:
+        _assert_handle_still_names(owner.value, marker)
+        return True
+    finally:
+        owner.close()
+
+
 def _await_publication_finalization(
     cache: WindowsRuntimeCache,
     key: str,
+    *,
+    deadline: Optional[float] = None,
 ) -> None:
-    stamp = cache.access / f"{key}.stamp"
-    deadline = time.monotonic() + _REPAIR_WAIT_SECONDS
-    while not _validated_stamp_exists(stamp):
+    if deadline is None:
+        deadline = time.monotonic() + _REPAIR_WAIT_SECONDS
+    while _publication_marker_exists(cache, key):
         if time.monotonic() >= deadline:
-            _cleanup_cache(
-                cache,
-                force=True,
-                protected_key=key,
-                require_lock=True,
-            )
-            cache._touch_access(key)
+            _recover_stale_publication(cache, key)
             return
         time.sleep(_REPAIR_POLL_SECONDS)
+
+
+def _acquire_publication_marker(
+    cache: WindowsRuntimeCache,
+    key: str,
+) -> tuple[Path, _OwnedHandle]:
+    marker = _publication_marker_path(cache, key)
+    deadline = time.monotonic() + _REPAIR_WAIT_SECONDS
+    while True:
+        owner = _try_create_lock(cache, marker)
+        if owner is not None:
+            return marker, owner
+        _await_publication_finalization(cache, key, deadline=deadline)
+
+
+def _hold_finalized_object_root(
+    cache: WindowsRuntimeCache,
+    object_root: Path,
+    key: str,
+) -> Optional[_OwnedHandle]:
+    deadline: Optional[float] = None
+    while True:
+        if _publication_marker_exists(cache, key):
+            if deadline is None:
+                deadline = time.monotonic() + _REPAIR_WAIT_SECONDS
+            _await_publication_finalization(cache, key, deadline=deadline)
+            continue
+        if not os.path.lexists(object_root):
+            return None
+        if _publication_marker_exists(cache, key):
+            continue
+        try:
+            owner = _hold_final_object_root(object_root)
+        except FileNotFoundError:
+            continue
+        if not _publication_marker_exists(cache, key):
+            return owner
+        owner.close()
 
 
 def _recover_stale_lock(
@@ -2316,6 +2360,55 @@ def _acquire_repair_lock(
         if time.monotonic() >= deadline:
             raise RuntimeError(f"runtime cache repair lock timeout: {key}")
         time.sleep(_REPAIR_POLL_SECONDS)
+
+
+def _recover_stale_publication(
+    cache: WindowsRuntimeCache,
+    key: str,
+) -> None:
+    marker = _publication_marker_path(cache, key)
+    repair_lock, repair_owner = _acquire_repair_lock(cache, key)
+    try:
+        if not _publication_marker_exists(cache, key):
+            return
+        marker_owner, _canonical = _open_canonical_non_reparse(
+            marker,
+            cache.locks,
+            desired_access=_FILE_READ_ATTRIBUTES,
+            share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            directory=True,
+        )
+        try:
+            _assert_handle_still_names(marker_owner.value, marker)
+            age = cache.clock() - _stamp_time(marker)
+        finally:
+            marker_owner.close()
+        if age < _REPAIR_STALE_SECONDS:
+            raise RuntimeError(f"runtime cache publication timeout: {key}")
+
+        object_root = cache.objects / key
+        capacity_error: Optional[BaseException] = None
+        if os.path.lexists(object_root):
+            try:
+                _cleanup_cache(
+                    cache,
+                    force=True,
+                    protected_key=key,
+                    require_lock=True,
+                )
+                cache._touch_access(key)
+            except BaseException as error:
+                capacity_error = error
+                _rollback_published_object(cache, key, object_root)
+
+        if not _remove_cache_tree(cache, marker, cache.locks):
+            raise RuntimeError(
+                f"runtime cache publication is still active: {key}"
+            )
+        if capacity_error is not None:
+            raise capacity_error
+    finally:
+        _release_lock(cache, repair_lock, repair_owner)
 
 
 def _repair_cache_object(
@@ -2406,10 +2499,13 @@ def _materialize_layout(
                 )
 
         stored_layout_name = name
-        existing_owner: Optional[_OwnedHandle] = None
+        existing_owner = _hold_finalized_object_root(
+            cache,
+            final_object_root,
+            key,
+        )
         try:
-            if os.path.lexists(final_object_root):
-                existing_owner = _hold_final_object_root(final_object_root)
+            if existing_owner is not None:
                 try:
                     manifest = _read_manifest(final_object_root)
                     candidate = manifest.get("layout_name")
@@ -2499,6 +2595,8 @@ def _materialize_layout(
         ):
             staging_root = cache.staging / str(uuid.uuid4())
         sealed: Optional[_SealedTree] = None
+        publication_marker: Optional[Path] = None
+        publication_owner: Optional[_OwnedHandle] = None
         published = False
         try:
             staging_layout = staging_root / name
@@ -2565,15 +2663,44 @@ def _materialize_layout(
             )
             sealed = _seal_tree_acl(staging_root, cache.sid, "RX")
             try:
-                _atomic_move_no_replace(
-                    staging_root, final_object_root, sealed=sealed
+                publication_marker, publication_owner = (
+                    _acquire_publication_marker(cache, key)
                 )
-                published = True
-            except FileExistsError:
+                lost_publication = os.path.lexists(final_object_root)
+                if not lost_publication:
+                    try:
+                        _atomic_move_no_replace(
+                            staging_root, final_object_root, sealed=sealed
+                        )
+                        published = True
+                    except FileExistsError:
+                        lost_publication = True
+                if not lost_publication:
+                    sealed.close()
+                    sealed = None
+                else:
+                    _release_lock(
+                        cache,
+                        publication_marker,
+                        publication_owner,
+                    )
+                    publication_marker = None
+                    publication_owner = None
+            except BaseException:
                 sealed.close()
                 sealed = None
+                raise
+            if not published:
                 _remove_staging_tree(staging_root, cache.sid)
-                winner_owner = _hold_final_object_root(final_object_root)
+                winner_owner = _hold_finalized_object_root(
+                    cache,
+                    final_object_root,
+                    key,
+                )
+                if winner_owner is None:
+                    raise RuntimeError(
+                        f"runtime cache publication was rolled back: {key}"
+                    )
                 try:
                     winner_manifest = _read_manifest(final_object_root)
                     winner_layout_name = winner_manifest.get("layout_name")
@@ -2623,7 +2750,6 @@ def _materialize_layout(
                         rendered_entries=rendered_entries,
                     )
                     try:
-                        _await_publication_finalization(cache, key)
                         cache._touch_access(key)
                         cache.cleanup()
                         return lease
@@ -2632,10 +2758,7 @@ def _materialize_layout(
                         raise
                 finally:
                     winner_owner.close()
-            finally:
-                if sealed is not None:
-                    sealed.close()
-                    sealed = None
+            lease: Optional[CachedLayoutLease] = None
             try:
                 _cleanup_cache(
                     cache,
@@ -2655,13 +2778,24 @@ def _materialize_layout(
                     payload_bytes=payload_bytes,
                     rendered_entries=rendered_entries,
                 )
+                _release_lock(
+                    cache,
+                    publication_marker,
+                    publication_owner,
+                )
+                publication_marker = None
+                publication_owner = None
                 return lease
             except BaseException:
+                if lease is not None:
+                    lease.close()
                 _rollback_published_object(cache, key, final_object_root)
                 raise
         except BaseException:
             if sealed is not None:
                 sealed.close()
+            if publication_owner is not None and publication_marker is not None:
+                _release_lock(cache, publication_marker, publication_owner)
             if not published and os.path.lexists(staging_root):
                 _remove_staging_tree(staging_root, cache.sid)
             raise

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from dataclasses import replace
@@ -105,19 +106,21 @@ def _publication_worker(
             raise RuntimeError("publication worker start barrier timed out")
         time.sleep(0.01)
 
-    real_move = runtime_cache._atomic_move_no_replace
+    real_acquire = runtime_cache._acquire_publication_marker
 
-    def synchronized_move(source: Path, destination: Path, *, sealed=None) -> None:
+    def synchronized_acquire(target_cache, key):
         Path(ready_path + ".move").write_text("ready", encoding="utf-8")
         while not Path(peer_ready_path + ".move").exists():
             if time.monotonic() >= deadline:
-                raise RuntimeError("publication worker move barrier timed out")
+                raise RuntimeError("publication worker marker barrier timed out")
             time.sleep(0.01)
-        real_move(source, destination, sealed=sealed)
+        return real_acquire(target_cache, key)
 
     try:
         with mock.patch.object(
-            runtime_cache, "_atomic_move_no_replace", side_effect=synchronized_move
+            runtime_cache,
+            "_acquire_publication_marker",
+            side_effect=synchronized_acquire,
         ):
             lease = cache.materialize(
                 "race",
@@ -165,18 +168,20 @@ def _generated_case_publication_worker(
             raise RuntimeError("publication worker start barrier timed out")
         time.sleep(0.01)
 
-    real_move = runtime_cache._atomic_move_no_replace
+    real_acquire = runtime_cache._acquire_publication_marker
 
-    def synchronized_move(source: Path, destination: Path, *, sealed=None) -> None:
+    def synchronized_acquire(target_cache, key):
         Path(ready_path + ".move").write_text("ready", encoding="utf-8")
         while not Path(peer_ready_path + ".move").exists():
             if time.monotonic() >= deadline:
-                raise RuntimeError("publication worker move barrier timed out")
+                raise RuntimeError("publication worker marker barrier timed out")
             time.sleep(0.01)
-        real_move(source, destination, sealed=sealed)
+        return real_acquire(target_cache, key)
 
     with mock.patch.object(
-        runtime_cache, "_atomic_move_no_replace", side_effect=synchronized_move
+        runtime_cache,
+        "_acquire_publication_marker",
+        side_effect=synchronized_acquire,
     ):
         lease = cache.materialize(
             layout_name,
@@ -2047,6 +2052,190 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertTrue(active.layout.is_dir())
         self.assertFalse((cache.objects / second_key).exists())
+
+    def test_unfinalized_publication_cannot_be_leased_before_capacity_rollback(
+        self,
+    ) -> None:
+        cache = self.make_cache(limits=CacheLimits(max_bytes=16, max_objects=1))
+        active = self.remember(
+            cache.materialize(
+                "active",
+                ((Path("active.bin"), self.held_file("active", b"12345678")),),
+                context={},
+            )
+        )
+        source_path = self.sources / "publication-race.bin"
+        source_path.write_bytes(b"abcdefgh")
+        publisher_source = _resolved_source(source_path)
+        reader_source = _resolved_source(source_path)
+        self.descriptors.extend((publisher_source, reader_source))
+        publisher_entries = ((Path("value.bin"), publisher_source),)
+        reader_entries = ((Path("value.bin"), reader_source),)
+        key = layout_key("pending", publisher_entries, {}, ())[0]
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+        reader_started = threading.Event()
+        reader_done = threading.Event()
+        publisher_errors: list[BaseException] = []
+        reader_results: list[CachedLayoutLease] = []
+        reader_errors: list[BaseException] = []
+        real_cleanup = runtime_cache._cleanup_cache
+
+        def paused_cleanup(*args, **kwargs) -> None:
+            if (
+                threading.current_thread().name == "publisher"
+                and kwargs.get("force") is True
+                and kwargs.get("protected_key") == key
+            ):
+                cleanup_entered.set()
+                if not release_cleanup.wait(5):
+                    raise RuntimeError("publication cleanup test barrier timed out")
+            real_cleanup(*args, **kwargs)
+
+        def publish() -> None:
+            try:
+                cache.materialize("pending", publisher_entries, context={})
+            except BaseException as error:
+                publisher_errors.append(error)
+
+        def read() -> None:
+            reader_started.set()
+            try:
+                reader_results.append(
+                    cache.materialize("pending", reader_entries, context={})
+                )
+            except BaseException as error:
+                reader_errors.append(error)
+            finally:
+                reader_done.set()
+
+        with mock.patch.object(
+            runtime_cache, "_cleanup_cache", side_effect=paused_cleanup
+        ):
+            publisher = threading.Thread(target=publish, name="publisher")
+            publisher.start()
+            self.assertTrue(cleanup_entered.wait(5))
+            self.assertTrue((cache.objects / key).is_dir())
+
+            reader = threading.Thread(target=read, name="reader")
+            reader.start()
+            self.assertTrue(reader_started.wait(5))
+            self.assertFalse(
+                reader_done.wait(0.25),
+                "reader leased an object before publication capacity finalized",
+            )
+
+            release_cleanup.set()
+            publisher.join(5)
+            reader.join(5)
+
+        self.assertFalse(publisher.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(reader_results, [])
+        self.assertTrue(publisher_errors)
+        self.assertTrue(reader_errors)
+        self.assertRegex(str(publisher_errors[0]), "cache capacity")
+        self.assertRegex(str(reader_errors[0]), "cache capacity")
+        self.assertTrue(active.layout.is_dir())
+        self.assertFalse((cache.objects / key).exists())
+        self.assertEqual(len(tuple(cache.objects.iterdir())), 1)
+
+    def test_abandoned_post_rename_publication_is_finalized_after_stale_timeout(
+        self,
+    ) -> None:
+        source = self.held_file("abandoned", b"value")
+        entries = ((Path("value.bin"), source),)
+        published = self.cache.materialize("abandoned", entries, context={})
+        published.close()
+        key = published.key
+        marker = runtime_cache._publication_marker_path(self.cache, key)
+        owner = runtime_cache._try_create_lock(self.cache, marker)
+        self.assertIsNotNone(owner)
+        owner.close()
+        self.backdate(marker, runtime_cache._REPAIR_STALE_SECONDS)
+        stamp = self.cache.access / f"{key}.stamp"
+        stamp.unlink()
+
+        with mock.patch.object(runtime_cache, "_REPAIR_WAIT_SECONDS", 0.0):
+            recovered = self.remember(
+                self.cache.materialize("abandoned", entries, context={})
+            )
+
+        self.assertTrue(recovered.cache_hit)
+        self.assertFalse(marker.exists())
+        self.assertTrue(stamp.is_file())
+        self.assertEqual((recovered.layout / "value.bin").read_bytes(), b"value")
+
+    def test_live_publication_marker_has_a_bounded_competing_creator_wait(
+        self,
+    ) -> None:
+        source = self.held_file("contended", b"value")
+        entries = ((Path("value.bin"), source),)
+        key = layout_key("contended", entries, {}, ())[0]
+        marker = runtime_cache._publication_marker_path(self.cache, key)
+        owner = runtime_cache._try_create_lock(self.cache, marker)
+        self.assertIsNotNone(owner)
+        try:
+            with mock.patch.object(runtime_cache, "_REPAIR_WAIT_SECONDS", 0.0):
+                with self.assertRaisesRegex(RuntimeError, "publication timeout"):
+                    self.cache.materialize("contended", entries, context={})
+        finally:
+            runtime_cache._release_lock(self.cache, marker, owner)
+
+        self.assertFalse((self.cache.objects / key).exists())
+        self.assertEqual(tuple(self.cache.staging.iterdir()), ())
+
+    def test_stale_publication_marker_with_live_owner_is_not_recovered(self) -> None:
+        source = self.held_file("live-stale", b"value")
+        entries = ((Path("value.bin"), source),)
+        key = layout_key("live-stale", entries, {}, ())[0]
+        marker = runtime_cache._publication_marker_path(self.cache, key)
+        owner = runtime_cache._try_create_lock(self.cache, marker)
+        self.assertIsNotNone(owner)
+        self.backdate(marker, runtime_cache._REPAIR_STALE_SECONDS)
+        try:
+            with mock.patch.object(runtime_cache, "_REPAIR_WAIT_SECONDS", 0.0):
+                with self.assertRaisesRegex(RuntimeError, "still active"):
+                    self.cache.materialize("live-stale", entries, context={})
+        finally:
+            runtime_cache._release_lock(self.cache, marker, owner)
+
+        self.assertFalse((self.cache.objects / key).exists())
+        self.assertEqual(tuple(self.cache.staging.iterdir()), ())
+
+    def test_finalized_warm_hit_uses_constant_publication_state_probes(self) -> None:
+        source_path = self.sources / "warm-probe.bin"
+        source_path.write_bytes(b"value")
+        cold_source = _resolved_source(source_path)
+        warm_source = _resolved_source(source_path)
+        self.descriptors.extend((cold_source, warm_source))
+        cold = self.cache.materialize(
+            "warm-probe",
+            ((Path("value.bin"), cold_source),),
+            context={},
+        )
+        cold.close()
+
+        with mock.patch.object(
+            runtime_cache,
+            "_publication_marker_exists",
+            wraps=runtime_cache._publication_marker_exists,
+        ) as marker_exists, mock.patch.object(
+            runtime_cache,
+            "_cleanup_cache_contents",
+            wraps=runtime_cache._cleanup_cache_contents,
+        ) as cleanup_contents:
+            warm = self.remember(
+                self.cache.materialize(
+                    "warm-probe",
+                    ((Path("value.bin"), warm_source),),
+                    context={},
+                )
+            )
+
+        self.assertTrue(warm.cache_hit)
+        self.assertLessEqual(marker_exists.call_count, 3)
+        cleanup_contents.assert_not_called()
 
     def test_cleanup_skips_active_unused_object(self) -> None:
         active = self.remember(
