@@ -105,7 +105,14 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(layout_key("app", {Path("qt.conf"): one}, {}, ())[0], layout_key("app", {Path("qt.conf"): two}, {}, ())[0])
         changed = GeneratedLayoutEntry("qt-conf-v2", {"plugins": "p", "qml": "q"}, lambda _root: b"one")
         self.assertNotEqual(layout_key("app", {Path("qt.conf"): changed}, {}, ())[0], layout_key("app", {Path("qt.conf"): one}, {}, ())[0])
+
+    def test_public_type_aliases_import_and_contain_declared_types(self) -> None:
+        self.assertIn(type(None), get_args(JsonScalar))
+        self.assertIn(HeldSource, get_args(LayoutEntry))
+        self.assertIn(GeneratedLayoutEntry, get_args(LayoutEntry))
 ```
+
+Import `get_args` from `typing` in the test module.
 
 - [ ] **Step 2: Run the tests and confirm the red state**
 
@@ -122,9 +129,13 @@ Expected: import failure for `tools.windows_runtime_cache` because the module do
 Use these exact public declarations; keep manifest construction private except for `layout_key`.
 
 ```python
-JsonScalar = None | bool | int | float | str
-JsonValue = JsonScalar | tuple["JsonValue", ...] | list["JsonValue"] | Mapping[str, "JsonValue"]
-LayoutEntry = HeldSource | bytes | GeneratedLayoutEntry
+JsonScalar = Union[type(None), bool, int, float, str]
+JsonValue = Union[
+    JsonScalar,
+    Tuple["JsonValue", ...],
+    List["JsonValue"],
+    Mapping[str, "JsonValue"],
+]
 
 SCHEMA_VERSION = "olr-windows-runtime-cache-v2"
 CLOSURE_POLICY_VERSION = "closed-launch-layout-v2"
@@ -144,6 +155,8 @@ class GeneratedLayoutEntry:
     policy: str
     inputs: Mapping[str, JsonValue]
     render: Callable[[Path], bytes] = field(compare=False, repr=False)
+
+LayoutEntry = Union[HeldSource, bytes, GeneratedLayoutEntry]
 
 @dataclass(frozen=True)
 class QtConfPaths:
@@ -168,6 +181,10 @@ class CacheStats:
     payload_files: int = 0
     payload_bytes: int = 0
 ```
+
+Import `List`, `Mapping`, `Tuple`, and `Union` from `typing`. These aliases
+evaluate successfully on Python 3.8+, unlike PEP 604 expressions evaluated in
+an assignment.
 
 `canonical_json()` must use `json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")`. `layout_key()` must normalize destinations component-by-component with `casefold()`, reject absolute/anchored/empty/parent paths and collisions, sort dependency keys, encode each held source's final path/device/inode/size/digest, encode literal size/digest, encode generated policy/inputs, and return `sha256(canonical_json(key_input)).hexdigest()` plus that key input.
 
@@ -206,7 +223,7 @@ git commit -m "test: define Windows runtime cache keys" -m "Co-Authored-By: Clau
 
 - [ ] **Step 1: Write failing Windows root and ACL tests**
 
-Create `WindowsFilesystemTests(unittest.TestCase)` and add the following Windows-only methods. Patch `local_app_data_cache_root()` only when constructing a cache test fixture. Assert that production discovery ignores `LOCALAPPDATA`, that a junction in any cache parent is rejected, that `RX` files reject `GENERIC_WRITE | DELETE`, and that `RX` directories reject `FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD`.
+Create `WindowsFilesystemTests(unittest.TestCase)` and add the following Windows-only methods. Patch `local_app_data_cache_root()` only when constructing a cache test fixture. Assert that production discovery ignores `LOCALAPPDATA`, that a junction in any cache parent is rejected, that BUILD permits nested payload and manifest creation, that recursive RX conversion then denies changes to those files, that `RX` files reject `GENERIC_WRITE | DELETE`, and that `RX` directories reject `FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD`.
 
 ```python
 @unittest.skipUnless(os.name == "nt", "requires Windows known folders and ACLs")
@@ -228,6 +245,31 @@ def test_rx_tree_denies_file_and_directory_mutation_access(self) -> None:
     _set_tree_acl(tree, self.sid, "RX")
     _assert_mutation_denied(tree, directory=True)
     _assert_mutation_denied(tree / "payload.dll", directory=False)
+
+
+@unittest.skipUnless(os.name == "nt", "requires Windows ACLs")
+def test_build_acl_allows_nested_payload_and_manifest_then_recursive_rx_denies_writes(self) -> None:
+    tree = self.root / "staging"
+    tree.mkdir()
+    _set_tree_acl(tree, self.sid, "BUILD")
+    nested = tree / "layout" / "plugins" / "imageformats"
+    nested.mkdir(parents=True)
+    payload = nested / "qjpeg.dll"
+    manifest = tree / "manifest.json"
+    payload.write_bytes(b"plugin")
+    manifest.write_text('{"complete":true}\n', encoding="utf-8")
+
+    _set_tree_acl(tree, self.sid, "RX")
+
+    self.assertEqual(payload.read_bytes(), b"plugin")
+    self.assertEqual(manifest.read_text(encoding="utf-8"), '{"complete":true}\n')
+    for target in (payload, manifest):
+        _assert_mutation_denied(target, directory=False)
+        with self.assertRaises(OSError):
+            target.write_bytes(b"changed")
+    _assert_mutation_denied(nested, directory=True)
+    with self.assertRaises(OSError):
+        (nested / "late.dll").write_bytes(b"late")
 ```
 
 - [ ] **Step 2: Run the focused tests and confirm failure**
@@ -249,13 +291,25 @@ Use protected DACLs with these modes:
 ```python
 acl_sddl = {
     "PRIVATE": f"D:P(A;OICI;FA;;;{sid})",
-    "BUILD": f"D:P(A;;FA;;;{sid})(A;OICIIO;GRGX;;;{sid})",
+    "BUILD": f"D:P(A;OICI;FA;;;{sid})",
     "RX": f"D:P(A;OICI;GRGX;;;{sid})",
     "DELETE": f"D:P(A;OICI;FA;;;{sid})",
 }
 ```
 
-Mutation probes must call `CreateFileW` with `GENERIC_WRITE | DELETE` for files and `FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | DELETE` plus `FILE_FLAG_BACKUP_SEMANTICS` for directories; success is an invariant failure and `ERROR_ACCESS_DENIED` is the only accepted denial. Implement no-replace publication with `MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH)` and treat `ERROR_ALREADY_EXISTS`/`ERROR_FILE_EXISTS` as a creator-race result.
+BUILD is applied before any staging descendant is created, so every new
+directory and file inherits full access for the current SID while payloads and
+`manifest.json` are written. `_set_tree_acl(path, sid, "RX")` must enumerate
+the root and every non-reparse descendant and explicitly apply the RX DACL to
+each file and directory before publication; changing only the root is not
+sufficient. File mutation probes call `CreateFileW` with
+`GENERIC_WRITE | DELETE`. Directory probes use
+`FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_DELETE_CHILD | DELETE` and
+`FILE_FLAG_BACKUP_SEMANTICS`. Success is an
+invariant failure and `ERROR_ACCESS_DENIED` is the only accepted denial.
+Implement no-replace publication with
+`MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH)` and treat
+`ERROR_ALREADY_EXISTS`/`ERROR_FILE_EXISTS` as a creator-race result.
 
 - [ ] **Step 4: Run the Windows primitive tests green**
 
@@ -265,7 +319,8 @@ Run:
 python -m unittest tests.scripts.test_windows_runtime_cache.WindowsFilesystemTests -v
 ```
 
-Expected: all root, reparse, ACL, denial-probe, and no-replace tests pass.
+Expected: all root, reparse, BUILD-write, recursive-RX, denial-probe, and
+no-replace tests pass.
 
 - [ ] **Step 5: Commit the filesystem boundary**
 
