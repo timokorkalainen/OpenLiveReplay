@@ -40,6 +40,10 @@ SCHEMA_VERSION = "olr-windows-runtime-cache-v2"
 CLOSURE_POLICY_VERSION = "closed-launch-layout-v2"
 
 
+class _CacheObjectValidationError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class HeldSource:
     source: Path
@@ -143,6 +147,7 @@ _READ_CONTROL = 0x00020000
 _WRITE_DAC = 0x00040000
 
 _ERROR_ACCESS_DENIED = 5
+_ERROR_SHARING_VIOLATION = 32
 _ERROR_FILE_EXISTS = 80
 _ERROR_ALREADY_EXISTS = 183
 _MOVEFILE_WRITE_THROUGH = 0x00000008
@@ -151,6 +156,10 @@ _FILE_BEGIN = 0
 _DACL_SECURITY_INFORMATION = 0x00000004
 _PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
 _SE_FILE_OBJECT = 1
+
+_REPAIR_WAIT_SECONDS = 10.0
+_REPAIR_POLL_SECONDS = 0.05
+_REPAIR_STALE_SECONDS = 600
 
 
 class _SecurityAttributes(ctypes.Structure):
@@ -338,6 +347,21 @@ class WindowsRuntimeCache:
             entry_limit=entry_limit,
             byte_limit=byte_limit,
         )
+
+    def cleanup(self, *, force: bool = False) -> None:
+        if type(force) is not bool:
+            raise TypeError("cache cleanup force must be a bool")
+        _cleanup_cache(self, force=force)
+
+    def _repair(
+        self,
+        key: str,
+        build: Callable[[], CachedLayoutLease],
+    ) -> CachedLayoutLease:
+        return _repair_cache_object(self, key, build)
+
+    def _touch_access(self, key: str) -> None:
+        _touch_cache_access(self, key)
 
 
 def local_app_data_cache_root() -> Path:
@@ -1739,6 +1763,594 @@ def _hold_final_object_root(object_root: Path) -> _OwnedHandle:
     return owner
 
 
+def _stamp_time(path: Path) -> float:
+    try:
+        return path.stat(follow_symlinks=False).st_mtime
+    except OSError as error:
+        raise RuntimeError(f"invalid cache lifecycle stamp: {path}") from error
+
+
+def _stamp_is_fresh(path: Path, now: float, interval: int) -> bool:
+    if not os.path.lexists(path):
+        return False
+    owner, _canonical = _open_canonical_non_reparse(
+        path,
+        path.parent,
+        desired_access=_FILE_READ_ATTRIBUTES,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        directory=False,
+    )
+    try:
+        _assert_handle_still_names(owner.value, path)
+        age = now - _stamp_time(path)
+        return 0 <= age < interval
+    finally:
+        owner.close()
+
+
+def _validated_stamp_exists(path: Path) -> bool:
+    if not os.path.lexists(path):
+        return False
+    owner, _canonical = _open_canonical_non_reparse(
+        path,
+        path.parent,
+        desired_access=_FILE_READ_ATTRIBUTES,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        directory=False,
+    )
+    try:
+        _assert_handle_still_names(owner.value, path)
+        return True
+    finally:
+        owner.close()
+
+
+def _write_stamp_no_replace(parent: Path, stamp: Path, now: float) -> None:
+    temporary = parent / f".{stamp.name}.{uuid.uuid4()}.tmp"
+    try:
+        with temporary.open("xb") as output:
+            output.write(f"{now:.9f}\n".encode("ascii"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.utime(temporary, (now, now))
+        _move_file_no_replace_write_through(temporary, stamp)
+    finally:
+        if os.path.lexists(temporary):
+            temporary.unlink()
+
+
+def _remove_stamp(path: Path) -> None:
+    if not os.path.lexists(path):
+        return
+    owner, _canonical = _open_canonical_non_reparse(
+        path,
+        path.parent,
+        desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        directory=False,
+    )
+    try:
+        _assert_handle_still_names(owner.value, path)
+        path.unlink()
+    finally:
+        owner.close()
+
+
+def _try_create_lock(cache: WindowsRuntimeCache, path: Path) -> Optional[_OwnedHandle]:
+    if not _create_directory_with_acl(
+        path,
+        cache.sid,
+        _acl_sddl(cache.sid, "PRIVATE"),
+    ):
+        return None
+    try:
+        now = cache.clock()
+        os.utime(path, (now, now))
+        owner, _canonical = _open_canonical_non_reparse(
+            path,
+            cache.locks,
+            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC | _DELETE,
+            share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            directory=True,
+        )
+        _assert_handle_still_names(owner.value, path)
+        return owner
+    except BaseException:
+        if os.path.lexists(path):
+            _set_tree_acl(path, cache.sid, "DELETE")
+            path.rmdir()
+        raise
+
+
+def _release_lock(cache: WindowsRuntimeCache, path: Path, owner: _OwnedHandle) -> None:
+    try:
+        _assert_handle_still_names(owner.value, path)
+        _set_handle_acl(owner.value, cache.sid, "DELETE")
+    finally:
+        owner.close()
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        pass
+
+
+def _touch_cache_access(cache: WindowsRuntimeCache, key: str) -> None:
+    if not _LOWER_SHA256.fullmatch(key):
+        raise RuntimeError(f"invalid cache access key: {key}")
+    now = cache.clock()
+    stamp = cache.access / f"{key}.stamp"
+    if _stamp_is_fresh(stamp, now, cache.limits.stamp_seconds):
+        return
+
+    lock = cache.locks / f"access-{key}"
+    owner = _try_create_lock(cache, lock)
+    if owner is None and _recover_stale_lock(
+        cache,
+        lock,
+        cache.limits.stamp_seconds,
+    ):
+        owner = _try_create_lock(cache, lock)
+    if owner is None:
+        return
+    try:
+        if _stamp_is_fresh(stamp, now, cache.limits.stamp_seconds):
+            return
+        if os.path.lexists(stamp):
+            _remove_stamp(stamp)
+        try:
+            _write_stamp_no_replace(cache.access, stamp, now)
+        except FileExistsError:
+            pass
+    finally:
+        _release_lock(cache, lock, owner)
+
+
+@dataclass
+class _RemovalGuard:
+    path: Path
+    directory: bool
+    control: _OwnedHandle
+    delete: _OwnedHandle
+    original_sddl: str
+
+
+def _acquire_removal_guards(
+    cache: WindowsRuntimeCache,
+    path: Path,
+    parent: Path,
+) -> list[_RemovalGuard]:
+    guards: list[_RemovalGuard] = []
+
+    def guard(target: Path, target_parent: Path, directory: bool) -> None:
+        control, _canonical = _open_canonical_non_reparse(
+            target,
+            target_parent,
+            desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC,
+            share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            directory=directory,
+        )
+        delete: Optional[_OwnedHandle] = None
+        original_sddl = ""
+        try:
+            _assert_handle_still_names(control.value, target)
+            original_sddl = _get_handle_acl_sddl(control.value)
+            _set_handle_acl_sddl(
+                control.value,
+                _publication_root_sddl(cache.sid),
+            )
+            delete, _canonical = _open_canonical_non_reparse(
+                target,
+                target_parent,
+                desired_access=_FILE_READ_ATTRIBUTES | _DELETE,
+                share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+                directory=directory,
+            )
+            _assert_handle_still_names(delete.value, target)
+            guards.append(
+                _RemovalGuard(target, directory, control, delete, original_sddl)
+            )
+            if directory:
+                with os.scandir(target) as scanned:
+                    entries = sorted(
+                        scanned,
+                        key=lambda entry: ntpath.normcase(entry.name),
+                    )
+                for entry in entries:
+                    child = Path(entry.path)
+                    stat_result = entry.stat(follow_symlinks=False)
+                    if (
+                        getattr(stat_result, "st_file_attributes", 0)
+                        & _FILE_ATTRIBUTE_REPARSE_POINT
+                    ):
+                        raise RuntimeError(
+                            "cache lifecycle tree contains a reparse point: "
+                            f"{child}"
+                        )
+                    guard(
+                        child,
+                        target,
+                        entry.is_dir(follow_symlinks=False),
+                    )
+        except BaseException:
+            if delete is not None and not any(
+                item.delete is delete for item in guards
+            ):
+                delete.close()
+            if not any(item.control is control for item in guards):
+                if original_sddl:
+                    _set_handle_acl_sddl(control.value, original_sddl)
+                control.close()
+            raise
+
+    try:
+        guard(path, parent, True)
+        return guards
+    except BaseException:
+        for item in reversed(guards):
+            try:
+                _set_handle_acl_sddl(item.control.value, item.original_sddl)
+                _assert_handle_still_names(item.control.value, item.path)
+            finally:
+                item.delete.close()
+                item.control.close()
+        raise
+
+
+def _remove_cache_tree(
+    cache: WindowsRuntimeCache,
+    path: Path,
+    parent: Path,
+    *,
+    quarantine_to: Optional[Path] = None,
+) -> bool:
+    if not os.path.lexists(path):
+        return True
+    try:
+        guards = _acquire_removal_guards(cache, path, parent)
+    except OSError as error:
+        if getattr(error, "winerror", None) in (
+            _ERROR_ACCESS_DENIED,
+            _ERROR_SHARING_VIOLATION,
+        ):
+            return False
+        raise
+    original_acls = tuple(
+        (item.path, item.directory, item.original_sddl) for item in guards
+    )
+    try:
+        for item in reversed(guards):
+            _set_handle_acl(item.control.value, cache.sid, "DELETE")
+            _assert_handle_still_names(item.control.value, item.path)
+        # The root DELETE handle prevents a new protected lease from entering.
+        # Close descendants after the all-or-nothing sharing preflight because
+        # Windows cannot rename a directory while descendants remain open,
+        # even when those handles opted into delete sharing.
+        for item in reversed(guards[1:]):
+            item.delete.close()
+            item.control.close()
+        guards = guards[:1]
+        try:
+            if quarantine_to is None:
+                shutil.rmtree(path)
+            else:
+                _move_file_no_replace_write_through(path, quarantine_to)
+        except OSError as error:
+            if getattr(error, "winerror", None) not in (
+                _ERROR_ACCESS_DENIED,
+                _ERROR_SHARING_VIOLATION,
+            ):
+                raise
+            for target, directory, sddl in reversed(original_acls):
+                if not os.path.lexists(target):
+                    raise RuntimeError(
+                        f"cache lifecycle removal was partial: {path}"
+                    ) from error
+                restore, _canonical = _open_canonical_non_reparse(
+                    target,
+                    target.parent,
+                    desired_access=(
+                        _FILE_READ_ATTRIBUTES | _READ_CONTROL | _WRITE_DAC
+                    ),
+                    share_mode=(
+                        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
+                    ),
+                    directory=directory,
+                )
+                try:
+                    _set_handle_acl_sddl(restore.value, sddl)
+                    _assert_handle_still_names(restore.value, target)
+                finally:
+                    restore.close()
+            return False
+        return True
+    finally:
+        for item in reversed(guards):
+            item.delete.close()
+            item.control.close()
+
+
+def _object_logical_size(
+    cache: WindowsRuntimeCache,
+    object_root: Path,
+    key: str,
+) -> tuple[int, float]:
+    if not _LOWER_SHA256.fullmatch(key):
+        raise RuntimeError(f"invalid cache object name: {object_root}")
+    owner, _canonical = _open_canonical_non_reparse(
+        object_root,
+        object_root.parent,
+        desired_access=_FILE_READ_ATTRIBUTES | _READ_CONTROL,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        directory=True,
+    )
+    try:
+        _assert_handle_still_names(owner.value, object_root)
+        actual_sddl = _get_handle_acl_sddl(owner.value)
+        expected_sddls = {
+            _acl_sddl(cache.sid, "RX"),
+            (
+                "D:PAI"
+                f"(A;;0x1200a9;;;{cache.sid})"
+                f"(A;OICIIO;GXGR;;;{cache.sid})"
+            ),
+            (
+                "D:PAI"
+                f"(A;;0x1200a9;;;{cache.sid})"
+                f"(A;OICIIO;GRGX;;;{cache.sid})"
+            ),
+        }
+        if actual_sddl not in expected_sddls:
+            raise RuntimeError(
+                f"cache object ACL mismatch: {object_root}: "
+                f"{actual_sddl!r}"
+            )
+        manifest = _read_manifest(object_root)
+    finally:
+        owner.close()
+    if manifest.get("object_key") != key:
+        raise RuntimeError(f"cache manifest object key mismatch: {object_root}")
+    records = manifest.get("files")
+    if not isinstance(records, list):
+        raise RuntimeError(f"invalid cache manifest file records: {object_root}")
+    logical_bytes = 0
+    for record in records:
+        if not isinstance(record, dict) or type(record.get("size")) is not int:
+            raise RuntimeError(f"invalid cache manifest file record: {object_root}")
+        size = record["size"]
+        if size < 0:
+            raise RuntimeError(f"invalid cache manifest file size: {object_root}")
+        logical_bytes += size
+    created = manifest.get("created")
+    if (
+        not isinstance(created, (int, float))
+        or isinstance(created, bool)
+        or not math.isfinite(created)
+    ):
+        raise RuntimeError(f"invalid cache manifest creation time: {object_root}")
+    return logical_bytes, float(created)
+
+
+def _remove_old_namespace_entries(
+    cache: WindowsRuntimeCache,
+    parent: Path,
+    now: float,
+) -> None:
+    with os.scandir(parent) as scanned:
+        entries = sorted(scanned, key=lambda entry: ntpath.normcase(entry.name))
+    for entry in entries:
+        path = Path(entry.path)
+        if not entry.is_dir(follow_symlinks=False):
+            raise RuntimeError(f"invalid cache lifecycle entry: {path}")
+        if now - entry.stat(follow_symlinks=False).st_mtime < cache.limits.staging_seconds:
+            continue
+        _remove_cache_tree(cache, path, parent)
+
+
+def _cleanup_cache_contents(
+    cache: WindowsRuntimeCache,
+    *,
+    protected_key: Optional[str] = None,
+) -> None:
+    now = cache.clock()
+    _remove_old_namespace_entries(cache, cache.staging, now)
+    _remove_old_namespace_entries(cache, cache.quarantine, now)
+
+    candidates: list[tuple[float, str, Path, Path, int]] = []
+    total_bytes = 0
+    with os.scandir(cache.objects) as scanned:
+        object_entries = sorted(scanned, key=lambda entry: ntpath.normcase(entry.name))
+    for entry in object_entries:
+        object_root = Path(entry.path)
+        if not entry.is_dir(follow_symlinks=False):
+            raise RuntimeError(f"invalid cache object entry: {object_root}")
+        key = entry.name
+        logical_bytes, created = _object_logical_size(cache, object_root, key)
+        stamp = cache.access / f"{key}.stamp"
+        accessed = _stamp_time(stamp) if os.path.lexists(stamp) else created
+        candidates.append((accessed, key, object_root, stamp, logical_bytes))
+        total_bytes += logical_bytes
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    remaining_objects = len(candidates)
+    for accessed, key, object_root, stamp, logical_bytes in candidates:
+        unused = now - accessed >= cache.limits.max_unused_seconds
+        over_capacity = (
+            total_bytes > cache.limits.max_bytes
+            or remaining_objects > cache.limits.max_objects
+        )
+        if not unused and not over_capacity:
+            continue
+        if key == protected_key:
+            continue
+        if not _remove_cache_tree(cache, object_root, cache.objects):
+            continue
+        _remove_stamp(stamp)
+        total_bytes -= logical_bytes
+        remaining_objects -= 1
+
+    if (
+        total_bytes > cache.limits.max_bytes
+        or remaining_objects > cache.limits.max_objects
+    ):
+        raise RuntimeError(
+            "runtime cache capacity cannot be reached while objects are active"
+        )
+
+
+def _cleanup_cache(
+    cache: WindowsRuntimeCache,
+    *,
+    force: bool,
+    protected_key: Optional[str] = None,
+    require_lock: bool = False,
+) -> None:
+    now = cache.clock()
+    marker = cache.access / "cleanup.stamp"
+    if not force and _stamp_is_fresh(marker, now, cache.limits.cleanup_seconds):
+        return
+    lock = cache.locks / "cleanup"
+    owner = _try_create_lock(cache, lock)
+    if owner is None and _recover_stale_lock(
+        cache,
+        lock,
+        cache.limits.cleanup_seconds,
+    ):
+        owner = _try_create_lock(cache, lock)
+    if owner is None:
+        if require_lock:
+            raise RuntimeError("runtime cache capacity cleanup is contended")
+        return
+    try:
+        if not force and _stamp_is_fresh(marker, now, cache.limits.cleanup_seconds):
+            return
+        _cleanup_cache_contents(cache, protected_key=protected_key)
+        if os.path.lexists(marker):
+            _remove_stamp(marker)
+        _write_stamp_no_replace(cache.access, marker, now)
+    finally:
+        _release_lock(cache, lock, owner)
+
+
+def _rollback_published_object(
+    cache: WindowsRuntimeCache,
+    key: str,
+    object_root: Path,
+) -> None:
+    if os.path.lexists(object_root) and not _remove_cache_tree(
+        cache, object_root, cache.objects
+    ):
+        raise RuntimeError(
+            f"failed to roll back published cache object: {object_root}"
+        )
+    _remove_stamp(cache.access / f"{key}.stamp")
+
+
+def _await_publication_finalization(
+    cache: WindowsRuntimeCache,
+    key: str,
+) -> None:
+    stamp = cache.access / f"{key}.stamp"
+    deadline = time.monotonic() + _REPAIR_WAIT_SECONDS
+    while not _validated_stamp_exists(stamp):
+        if time.monotonic() >= deadline:
+            _cleanup_cache(
+                cache,
+                force=True,
+                protected_key=key,
+                require_lock=True,
+            )
+            cache._touch_access(key)
+            return
+        time.sleep(_REPAIR_POLL_SECONDS)
+
+
+def _recover_stale_lock(
+    cache: WindowsRuntimeCache,
+    lock: Path,
+    stale_seconds: int,
+) -> bool:
+    if not os.path.lexists(lock):
+        return False
+    owner, _canonical = _open_canonical_non_reparse(
+        lock,
+        cache.locks,
+        desired_access=_FILE_READ_ATTRIBUTES,
+        share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        directory=True,
+    )
+    try:
+        _assert_handle_still_names(owner.value, lock)
+        age = cache.clock() - _stamp_time(lock)
+    finally:
+        owner.close()
+    if age < stale_seconds:
+        return False
+    return _remove_cache_tree(cache, lock, cache.locks)
+
+
+def _acquire_repair_lock(
+    cache: WindowsRuntimeCache,
+    key: str,
+) -> tuple[Path, _OwnedHandle]:
+    lock = cache.locks / f"repair-{key}"
+    deadline = time.monotonic() + _REPAIR_WAIT_SECONDS
+    while True:
+        owner = _try_create_lock(cache, lock)
+        if owner is not None:
+            return lock, owner
+        if os.path.lexists(lock):
+            lock_owner, _canonical = _open_canonical_non_reparse(
+                lock,
+                cache.locks,
+                desired_access=_FILE_READ_ATTRIBUTES,
+                share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+                directory=True,
+            )
+            try:
+                _assert_handle_still_names(lock_owner.value, lock)
+                stale = cache.clock() - _stamp_time(lock) >= _REPAIR_STALE_SECONDS
+            finally:
+                lock_owner.close()
+            if stale and _remove_cache_tree(cache, lock, cache.locks):
+                continue
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"runtime cache repair lock timeout: {key}")
+        time.sleep(_REPAIR_POLL_SECONDS)
+
+
+def _repair_cache_object(
+    cache: WindowsRuntimeCache,
+    key: str,
+    build: Callable[[], CachedLayoutLease],
+) -> CachedLayoutLease:
+    if not _LOWER_SHA256.fullmatch(key):
+        raise RuntimeError(f"invalid cache repair key: {key}")
+    lock, owner = _acquire_repair_lock(cache, key)
+    try:
+        try:
+            return build()
+        except _CacheObjectValidationError as validation_error:
+            object_root = cache.objects / key
+            if not os.path.lexists(object_root):
+                raise
+            quarantine = cache.quarantine / f"{key}-{uuid.uuid4()}"
+            if not _remove_cache_tree(
+                cache,
+                object_root,
+                cache.objects,
+                quarantine_to=quarantine,
+            ):
+                raise RuntimeError(
+                    f"cache object is active and cannot be repaired: {object_root}"
+                ) from validation_error
+            quarantined_at = cache.clock()
+            os.utime(quarantine, (quarantined_at, quarantined_at))
+            _remove_stamp(cache.access / f"{key}.stamp")
+        return build()
+    finally:
+        _release_lock(cache, lock, owner)
+
+
 def _materialize_layout(
     cache: WindowsRuntimeCache,
     name: str,
@@ -1748,6 +2360,8 @@ def _materialize_layout(
     dependencies: Sequence[CachedLayoutLease],
     entry_limit: int,
     byte_limit: int,
+    _repairing: bool = False,
+    _expected_key: Optional[str] = None,
 ) -> CachedLayoutLease:
     entry_snapshot = _bounded_entry_snapshot(
         entries,
@@ -1758,6 +2372,21 @@ def _materialize_layout(
     # This first key pass performs every spelling, descriptor, dependency, and
     # JSON snapshot validation before resolving sources or mutating cache state.
     key, key_input = layout_key(name, entry_snapshot, context, dependency_keys)
+    if _expected_key is not None and key != _expected_key:
+        raise RuntimeError("runtime cache key input changed during repair")
+
+    def retry_under_repair() -> CachedLayoutLease:
+        return _materialize_layout(
+            cache,
+            name,
+            entry_snapshot,
+            context=key_input["context"],
+            dependencies=dependencies,
+            entry_limit=entry_limit,
+            byte_limit=byte_limit,
+            _repairing=True,
+            _expected_key=key,
+        )
 
     resolved_sources: dict[int, HeldSource] = {}
     rendered_entries: dict[str, bytes] = {}
@@ -1781,16 +2410,31 @@ def _materialize_layout(
         try:
             if os.path.lexists(final_object_root):
                 existing_owner = _hold_final_object_root(final_object_root)
-                manifest = _read_manifest(final_object_root)
-                candidate = manifest.get("layout_name")
-                if (
-                    not isinstance(candidate, str)
-                    or _validate_win32_component(candidate, label="layout name")
-                    != key_input.get("name")
-                ):
-                    raise RuntimeError(
-                        f"cache manifest layout spelling mismatch: {final_object_root}"
+                try:
+                    manifest = _read_manifest(final_object_root)
+                    candidate = manifest.get("layout_name")
+                    if (
+                        not isinstance(candidate, str)
+                        or _validate_win32_component(
+                            candidate,
+                            label="layout name",
+                        )
+                        != key_input.get("name")
+                    ):
+                        raise RuntimeError(
+                            "cache manifest layout spelling mismatch: "
+                            f"{final_object_root}"
+                        )
+                except RuntimeError as error:
+                    if _repairing:
+                        raise _CacheObjectValidationError(str(error)) from error
+                    _assert_handle_still_names(
+                        existing_owner.value,
+                        final_object_root,
                     )
+                    existing_owner.close()
+                    existing_owner = None
+                    return cache._repair(key, retry_under_repair)
                 stored_layout_name = candidate
             final_layout = final_object_root / stored_layout_name
             non_generated_bytes = known_bytes
@@ -1816,17 +2460,35 @@ def _materialize_layout(
             if verified_key != key or verified_input != key_input:
                 raise RuntimeError("runtime cache key input changed during validation")
             if existing_owner is not None:
-                return _hold_validated_object(
-                    cache,
-                    final_object_root,
-                    key,
-                    key_input,
-                    entry_snapshot,
-                    cache_hit=True,
-                    payload_files=0,
-                    payload_bytes=0,
-                    rendered_entries=rendered_entries,
-                )
+                try:
+                    lease = _hold_validated_object(
+                        cache,
+                        final_object_root,
+                        key,
+                        key_input,
+                        entry_snapshot,
+                        cache_hit=True,
+                        payload_files=0,
+                        payload_bytes=0,
+                        rendered_entries=rendered_entries,
+                    )
+                except RuntimeError as error:
+                    if _repairing:
+                        raise _CacheObjectValidationError(str(error)) from error
+                    _assert_handle_still_names(
+                        existing_owner.value,
+                        final_object_root,
+                    )
+                    existing_owner.close()
+                    existing_owner = None
+                    return cache._repair(key, retry_under_repair)
+                try:
+                    cache._touch_access(key)
+                    cache.cleanup()
+                    return lease
+                except BaseException:
+                    lease.close()
+                    raise
         finally:
             if existing_owner is not None:
                 existing_owner.close()
@@ -1949,7 +2611,7 @@ def _materialize_layout(
                                     f"{winner_bytes} > {byte_limit}"
                                 )
                         rendered_entries = winner_rendered_entries
-                    return _hold_validated_object(
+                    lease = _hold_validated_object(
                         cache,
                         final_object_root,
                         key,
@@ -1960,23 +2622,43 @@ def _materialize_layout(
                         payload_bytes=payload_bytes,
                         rendered_entries=rendered_entries,
                     )
+                    try:
+                        _await_publication_finalization(cache, key)
+                        cache._touch_access(key)
+                        cache.cleanup()
+                        return lease
+                    except BaseException:
+                        lease.close()
+                        raise
                 finally:
                     winner_owner.close()
             finally:
                 if sealed is not None:
                     sealed.close()
                     sealed = None
-            return _hold_validated_object(
-                cache,
-                final_object_root,
-                key,
-                key_input,
-                entry_snapshot,
-                cache_hit=False,
-                payload_files=len(entry_snapshot),
-                payload_bytes=payload_bytes,
-                rendered_entries=rendered_entries,
-            )
+            try:
+                _cleanup_cache(
+                    cache,
+                    force=True,
+                    protected_key=key,
+                    require_lock=True,
+                )
+                cache._touch_access(key)
+                lease = _hold_validated_object(
+                    cache,
+                    final_object_root,
+                    key,
+                    key_input,
+                    entry_snapshot,
+                    cache_hit=False,
+                    payload_files=len(entry_snapshot),
+                    payload_bytes=payload_bytes,
+                    rendered_entries=rendered_entries,
+                )
+                return lease
+            except BaseException:
+                _rollback_published_object(cache, key, final_object_root)
+                raise
         except BaseException:
             if sealed is not None:
                 sealed.close()
