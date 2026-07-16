@@ -563,6 +563,26 @@ class ConfigurationTests(unittest.TestCase):
         configuration = self.make(entry)
         self.assertEqual(configuration.source.relative, PurePosixPath("playback/gpu/file.cpp"))
 
+    def test_msvc_dash_options_preserve_source_and_value_semantics(self):
+        from gpu_capability_command import _source_inputs
+
+        for family in (CompilerFamily.MSVC, CompilerFamily.CLANG_CL):
+            with self.subTest(family=family, option="-Tpother"):
+                self.assertEqual(
+                    len(_source_inputs(("main.cpp", "-Tpother"), self.build, family)),
+                    2,
+                )
+            for option in ("-D", "-FI"):
+                with self.subTest(family=family, option=option):
+                    self.assertEqual(
+                        _source_inputs(
+                            (option, "BUILD_FILE=file.cpp", "main.cpp"),
+                            self.build,
+                            family,
+                        ),
+                        ((self.build / "main.cpp").resolve(),),
+                    )
+
     def test_entry_source_outside_production_and_unknown_wrapper_fail(self):
         outside = self.root / "outside.cpp"
         outside.write_text("int x;\n", encoding="utf-8")

@@ -918,7 +918,14 @@ def _source_inputs(
                 raise AuditInfrastructureError(f"compiler option requires a value: {value}")
             index += 2
             continue
-        if not positional_only and lowered in {"/tc", "/tp"} and family in {
+        msvc_lowered = (
+            f"/{lowered[1:]}"
+            if family in {CompilerFamily.MSVC, CompilerFamily.CLANG_CL}
+            and lowered.startswith("-")
+            and len(lowered) > 1
+            else lowered
+        )
+        if not positional_only and msvc_lowered in {"/tc", "/tp"} and family in {
             CompilerFamily.MSVC, CompilerFamily.CLANG_CL
         }:
             if index + 1 >= len(arguments):
@@ -929,14 +936,18 @@ def _source_inputs(
             sources.append(_canonical_argument_path(candidate, cwd))
             index += 2
             continue
-        if not positional_only and lowered.startswith(("/tc", "/tp")) and len(value) > 3:
+        if (
+            not positional_only
+            and msvc_lowered.startswith(("/tc", "/tp"))
+            and len(value) > 3
+        ):
             candidate = value[3:]
             if candidate == "-":
                 raise AuditInfrastructureError("stdin cannot be a compile source")
             sources.append(_canonical_argument_path(candidate, cwd))
             index += 1
             continue
-        if not positional_only and lowered in _MSVC_VALUE_OPTIONS and family in {
+        if not positional_only and msvc_lowered in _MSVC_VALUE_OPTIONS and family in {
             CompilerFamily.MSVC, CompilerFamily.CLANG_CL
         }:
             if index + 1 >= len(arguments):
