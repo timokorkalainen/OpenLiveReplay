@@ -65,6 +65,21 @@ def _resolved_source(path: Path) -> HeldSource:
     )
 
 
+def _hold_path_and_set_acl_sddl(path: Path, sddl: str):
+    owner, _canonical = runtime_cache._open_canonical_non_reparse(
+        path,
+        path.parent,
+        desired_access=(
+            runtime_cache._FILE_READ_ATTRIBUTES
+            | runtime_cache._READ_CONTROL
+            | runtime_cache._WRITE_DAC
+        ),
+        directory=path.is_dir(),
+    )
+    runtime_cache._set_handle_acl_sddl(owner.value, sddl)
+    return owner
+
+
 def _publication_worker(
     cache_root: str,
     source_path: str,
@@ -108,10 +123,79 @@ def _publication_worker(
                 ((Path("bin/tool.exe"), descriptor),),
                 context={"purpose": "concurrent-test"},
             )
-        print(json.dumps({"key": lease.key, "cache_hit": lease.cache_hit}))
+        print(
+            json.dumps(
+                {
+                    "key": lease.key,
+                    "cache_hit": lease.cache_hit,
+                    "payload_files": lease.payload_files,
+                    "payload_bytes": lease.payload_bytes,
+                }
+            )
+        )
         lease.close()
     finally:
         descriptor.stream.close()
+
+
+def _generated_case_publication_worker(
+    cache_root: str,
+    layout_name: str,
+    ready_path: str,
+    peer_ready_path: str,
+    start_path: str,
+) -> None:
+    sid = _current_user_sid()
+    cache = WindowsRuntimeCache(
+        Path(cache_root),
+        sid,
+        _resolved_source,
+        lambda path: runtime_cache._open_canonical_non_reparse(
+            path, path.parent, directory=True
+        ),
+    )
+    generated = GeneratedLayoutEntry(
+        "case-race-v1", {}, lambda final_layout: final_layout.as_posix().encode("utf-8")
+    )
+    Path(ready_path).write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 30
+    while not Path(start_path).exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("publication worker start barrier timed out")
+        time.sleep(0.01)
+
+    real_move = runtime_cache._atomic_move_no_replace
+
+    def synchronized_move(source: Path, destination: Path, *, sealed=None) -> None:
+        Path(ready_path + ".move").write_text("ready", encoding="utf-8")
+        while not Path(peer_ready_path + ".move").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("publication worker move barrier timed out")
+            time.sleep(0.01)
+        real_move(source, destination, sealed=sealed)
+
+    with mock.patch.object(
+        runtime_cache, "_atomic_move_no_replace", side_effect=synchronized_move
+    ):
+        lease = cache.materialize(
+            layout_name,
+            ((Path("Bin/generated.txt"), generated),),
+            context={"purpose": "generated-case-race"},
+        )
+    try:
+        print(
+            json.dumps(
+                {
+                    "key": lease.key,
+                    "cache_hit": lease.cache_hit,
+                    "layout": lease.layout.name,
+                    "payload_files": lease.payload_files,
+                    "payload_bytes": lease.payload_bytes,
+                }
+            )
+        )
+    finally:
+        lease.close()
 
 
 class CacheKeyTests(unittest.TestCase):
@@ -586,7 +670,8 @@ class WindowsFilesystemTests(unittest.TestCase):
                 os.rmdir(alias)
 
     def test_rx_tree_denies_file_and_directory_mutation_access(self) -> None:
-        tree = self.root / "tree"
+        cache = self.make_cache(self.root / "rx-cache")
+        tree = cache.objects / "tree"
         tree.mkdir()
         payload = tree / "payload.dll"
         payload.write_bytes(b"payload")
@@ -595,6 +680,53 @@ class WindowsFilesystemTests(unittest.TestCase):
 
         _assert_mutation_denied(tree, directory=True)
         _assert_mutation_denied(payload, directory=False)
+
+    def test_mutation_probe_rejects_each_individually_permitted_right(self) -> None:
+        cache = self.make_cache(self.root / "individual-rights-cache")
+        tree = cache.objects / "individual-rights"
+        tree.mkdir()
+        payload = tree / "payload.dll"
+        payload.write_bytes(b"payload")
+        read_execute = "GRGX"
+
+        directory_rights = (
+            runtime_cache._FILE_ADD_FILE,
+            runtime_cache._FILE_ADD_SUBDIRECTORY,
+            runtime_cache._FILE_DELETE_CHILD,
+            runtime_cache._DELETE,
+        )
+        for right in directory_rights:
+            with self.subTest(kind="directory", right=right):
+                owner = _hold_path_and_set_acl_sddl(
+                    tree,
+                    f"D:P(A;;{read_execute};;;{self.sid})(A;;0x{right:x};;;{self.sid})",
+                )
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "mutation access"):
+                        _assert_mutation_denied(tree, directory=True)
+                finally:
+                    runtime_cache._set_handle_acl(owner.value, self.sid, "BUILD")
+                    owner.close()
+
+        file_rights = (
+            runtime_cache._FILE_WRITE_DATA,
+            runtime_cache._FILE_APPEND_DATA,
+            runtime_cache._FILE_WRITE_EA,
+            runtime_cache._FILE_WRITE_ATTRIBUTES,
+            runtime_cache._DELETE,
+        )
+        for right in file_rights:
+            with self.subTest(kind="file", right=right):
+                owner = _hold_path_and_set_acl_sddl(
+                    payload,
+                    f"D:P(A;;{read_execute};;;{self.sid})(A;;0x{right:x};;;{self.sid})",
+                )
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "mutation access"):
+                        _assert_mutation_denied(payload, directory=False)
+                finally:
+                    runtime_cache._set_handle_acl(owner.value, self.sid, "BUILD")
+                    owner.close()
 
     def test_build_acl_allows_nested_payload_and_manifest_then_recursive_rx_denies_writes(
         self,
@@ -1048,6 +1180,35 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(manifest["layout_name"], "Tool")
         self.assertEqual(manifest["files"][0]["destination"], "Bin/Tool.exe")
 
+    def test_case_only_generated_hit_renders_and_returns_stored_layout(self) -> None:
+        rendered_at: list[Path] = []
+
+        def render(final_layout: Path) -> bytes:
+            rendered_at.append(final_layout)
+            return final_layout.as_posix().encode("utf-8")
+
+        generated = GeneratedLayoutEntry("case-layout-v1", {}, render)
+        first = self.publish_and_close(
+            "Tool", ((Path("Bin/generated.txt"), generated),), context={}
+        )
+        rendered_at.clear()
+
+        second = self.remember(
+            self.cache.materialize(
+                "tool", ((Path("bin/GENERATED.txt"), generated),), context={}
+            )
+        )
+
+        self.assert_warm_zero(second)
+        self.assertEqual(second.key, first.key)
+        self.assertEqual(second.layout, first.layout)
+        self.assertEqual(second.layout.name, "Tool")
+        self.assertEqual(rendered_at, [first.layout])
+        self.assertEqual(
+            (second.layout / "Bin/generated.txt").read_bytes(),
+            first.layout.as_posix().encode("utf-8"),
+        )
+
     def test_manifest_is_written_last_and_only_complete_tree_is_published(self) -> None:
         observed = {"render_before_manifest": False, "sealed_complete": False}
 
@@ -1309,6 +1470,21 @@ class PublicationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "mutation"):
                     cache.materialize("acl-" + target_kind, entries, context={})
 
+    def test_hit_rejects_directory_acl_permitting_only_file_insertion(self) -> None:
+        entries = ((Path("nested/value.bin"), self.held_file("add-file.bin", b"value")),)
+        lease = self.publish_and_close("add-file", entries)
+        nested = lease.layout / "nested"
+        owner = _hold_path_and_set_acl_sddl(
+            nested,
+            f"D:P(A;;GRGX;;;{self.sid})(A;;0x{runtime_cache._FILE_ADD_FILE:x};;;{self.sid})",
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "mutation access"):
+                self.cache.materialize("add-file", entries, context={})
+        finally:
+            runtime_cache._set_handle_acl(owner.value, self.sid, "RX")
+            owner.close()
+
     def test_hit_rejects_object_retargeted_between_validation_and_hold(self) -> None:
         entries = ((Path("value.bin"), self.held_file("retarget.bin", b"value")),)
         published = self.publish_and_close("retarget", entries)
@@ -1388,6 +1564,10 @@ class PublicationTests(unittest.TestCase):
             results.append(json.loads(stdout.strip()))
         self.assertEqual(results[0]["key"], results[1]["key"])
         self.assertEqual(sorted(result["cache_hit"] for result in results), [False, True])
+        self.assertEqual(
+            [(result["payload_files"], result["payload_bytes"]) for result in results],
+            [(1, len(b"concurrent publication"))] * 2,
+        )
         objects = tuple(self.cache.objects.iterdir())
         self.assertEqual(len(objects), 1)
         self.assertEqual(tuple(path for path in self.cache.staging.iterdir() if path.name != "interrupted"), ())
@@ -1405,6 +1585,44 @@ class PublicationTests(unittest.TestCase):
             )
         )
         self.assert_warm_zero(warm)
+
+    def test_concurrent_case_only_generated_creators_use_winner_spelling(self) -> None:
+        start = self.root / "case-start"
+        ready = (self.root / "case-worker-one", self.root / "case-worker-two")
+        processes = []
+        for index, layout_name in enumerate(("Tool", "tool")):
+            code = (
+                "from tests.scripts.test_windows_runtime_cache import "
+                "_generated_case_publication_worker; "
+                f"_generated_case_publication_worker({str(self.cache_root)!r}, "
+                f"{layout_name!r}, {str(ready[index])!r}, "
+                f"{str(ready[1 - index])!r}, {str(start)!r})"
+            )
+            processes.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", code],
+                    cwd=str(Path(__file__).parents[2]),
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            )
+        deadline = time.monotonic() + 30
+        while not all(path.exists() for path in ready):
+            self.assertLess(time.monotonic(), deadline, "workers did not reach start barrier")
+            time.sleep(0.01)
+        start.write_text("start", encoding="utf-8")
+        results = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, stderr)
+            results.append(json.loads(stdout.strip()))
+
+        self.assertEqual(results[0]["key"], results[1]["key"])
+        self.assertEqual(sorted(result["cache_hit"] for result in results), [False, True])
+        self.assertEqual(results[0]["layout"], results[1]["layout"])
+        self.assertEqual([result["payload_files"] for result in results], [1, 1])
+        self.assertTrue(all(result["payload_bytes"] > 0 for result in results))
 
 
 if __name__ == "__main__":

@@ -130,12 +130,15 @@ _FILE_SHARE_DELETE = 0x00000004
 _OPEN_EXISTING = 3
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-_GENERIC_WRITE = 0x40000000
 _GENERIC_READ = 0x80000000
 _DELETE = 0x00010000
 _FILE_ADD_FILE = 0x00000002
 _FILE_ADD_SUBDIRECTORY = 0x00000004
 _FILE_DELETE_CHILD = 0x00000040
+_FILE_WRITE_DATA = 0x00000002
+_FILE_APPEND_DATA = 0x00000004
+_FILE_WRITE_EA = 0x00000010
+_FILE_WRITE_ATTRIBUTES = 0x00000100
 _READ_CONTROL = 0x00020000
 _WRITE_DAC = 0x00040000
 
@@ -1070,31 +1073,41 @@ def _set_tree_acl(path: Path, sid: str, mode: _AclMode) -> None:
 
 
 def _assert_mutation_denied(path: Path, *, directory: bool) -> None:
-    """Require the immutable ACL to deny the exact mutation access mask."""
+    """Require the immutable ACL to deny every individual mutation right."""
     if os.name != "nt":
         raise OSError("Windows mutation probes require Windows")
     kernel32 = _kernel32()
-    desired_access = (
-        _FILE_ADD_FILE | _FILE_ADD_SUBDIRECTORY | _FILE_DELETE_CHILD | _DELETE
+    desired_accesses = (
+        (_FILE_ADD_FILE, _FILE_ADD_SUBDIRECTORY, _FILE_DELETE_CHILD, _DELETE)
         if directory
-        else _GENERIC_WRITE | _DELETE
+        else (
+            _FILE_WRITE_DATA,
+            _FILE_APPEND_DATA,
+            _FILE_WRITE_EA,
+            _FILE_WRITE_ATTRIBUTES,
+            _DELETE,
+        )
     )
     flags = _FILE_FLAG_BACKUP_SEMANTICS if directory else 0
-    handle = kernel32.CreateFileW(
-        str(path),
-        desired_access,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
-        None,
-        _OPEN_EXISTING,
-        flags,
-        None,
-    )
-    if handle != _INVALID_HANDLE_VALUE:
-        kernel32.CloseHandle(handle)
-        raise RuntimeError(f"cache mutation access unexpectedly permitted: {path}")
-    error = ctypes.get_last_error()
-    if error != _ERROR_ACCESS_DENIED:
-        raise OSError(error, f"cache mutation probe failed unexpectedly: {path}")
+    for desired_access in desired_accesses:
+        handle = kernel32.CreateFileW(
+            str(path),
+            desired_access,
+            _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+            None,
+            _OPEN_EXISTING,
+            flags,
+            None,
+        )
+        if handle != _INVALID_HANDLE_VALUE:
+            kernel32.CloseHandle(handle)
+            raise RuntimeError(
+                f"cache mutation access unexpectedly permitted: {path} "
+                f"(0x{desired_access:x})"
+            )
+        error = ctypes.get_last_error()
+        if error != _ERROR_ACCESS_DENIED:
+            raise OSError(error, f"cache mutation probe failed unexpectedly: {path}")
 
 
 def _validate_sealed_tree_at(sealed: _SealedTree, root: Path) -> None:
@@ -1674,7 +1687,6 @@ def _materialize_layout(
                 "runtime cache byte limit must be a nonnegative integer"
             )
         final_object_root = cache.objects / key
-        final_layout = final_object_root / name
         known_bytes = 0
         for index, (destination, entry) in enumerate(entry_snapshot):
             if isinstance(entry, HeldSource):
@@ -1683,7 +1695,28 @@ def _materialize_layout(
                 known_bytes += resolved.size
             elif isinstance(entry, bytes):
                 known_bytes += len(entry)
-            else:
+            if known_bytes > byte_limit:
+                raise RuntimeError(
+                    f"runtime cache byte limit exceeded: {known_bytes} > {byte_limit}"
+                )
+
+        stored_layout_name = name
+        if os.path.lexists(final_object_root):
+            manifest = _read_manifest(final_object_root)
+            candidate = manifest.get("layout_name")
+            if (
+                not isinstance(candidate, str)
+                or _validate_win32_component(candidate, label="layout name")
+                != key_input.get("name")
+            ):
+                raise RuntimeError(
+                    f"cache manifest layout spelling mismatch: {final_object_root}"
+                )
+            stored_layout_name = candidate
+        final_layout = final_object_root / stored_layout_name
+        non_generated_bytes = known_bytes
+        for destination, entry in entry_snapshot:
+            if isinstance(entry, GeneratedLayoutEntry):
                 payload = entry.render(final_layout)
                 if not isinstance(payload, bytes):
                     raise RuntimeError(
@@ -1796,6 +1829,42 @@ def _materialize_layout(
                 sealed.close()
                 sealed = None
                 _remove_staging_tree(staging_root, cache.sid)
+                winner_manifest = _read_manifest(final_object_root)
+                winner_layout_name = winner_manifest.get("layout_name")
+                if (
+                    not isinstance(winner_layout_name, str)
+                    or _validate_win32_component(
+                        winner_layout_name, label="layout name"
+                    )
+                    != key_input.get("name")
+                ):
+                    raise RuntimeError(
+                        "cache manifest layout spelling mismatch: "
+                        f"{final_object_root}"
+                    )
+                winner_layout = final_object_root / winner_layout_name
+                if winner_layout_name != stored_layout_name:
+                    winner_rendered_entries: dict[str, bytes] = {}
+                    winner_bytes = non_generated_bytes
+                    for destination, entry in entry_snapshot:
+                        if not isinstance(entry, GeneratedLayoutEntry):
+                            continue
+                        payload = entry.render(winner_layout)
+                        if not isinstance(payload, bytes):
+                            raise RuntimeError(
+                                "generated cache entry did not render bytes: "
+                                f"{destination}"
+                            )
+                        winner_rendered_entries[
+                            _normalized_destination(destination)
+                        ] = payload
+                        winner_bytes += len(payload)
+                        if winner_bytes > byte_limit:
+                            raise RuntimeError(
+                                "runtime cache byte limit exceeded: "
+                                f"{winner_bytes} > {byte_limit}"
+                            )
+                    rendered_entries = winner_rendered_entries
                 return _hold_validated_object(
                     cache,
                     final_object_root,
@@ -1803,8 +1872,8 @@ def _materialize_layout(
                     key_input,
                     entry_snapshot,
                     cache_hit=True,
-                    payload_files=0,
-                    payload_bytes=0,
+                    payload_files=len(entry_snapshot),
+                    payload_bytes=payload_bytes,
                     rendered_entries=rendered_entries,
                 )
             finally:
